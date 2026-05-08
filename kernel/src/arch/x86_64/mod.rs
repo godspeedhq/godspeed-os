@@ -9,7 +9,7 @@ pub mod context_switch;
 pub mod interrupts;
 pub mod page_tables;
 
-use limine::request::{MemmapRequest, MpRequest};
+use limine::request::{HhdmRequest, MemmapRequest, MpRequest};
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 
 // ---------------------------------------------------------------------------
@@ -27,6 +27,10 @@ static BASE_REVISION: BaseRevision = BaseRevision::new();
 #[used]
 #[link_section = ".requests"]
 static MEMMAP_REQUEST: MemmapRequest = MemmapRequest::new();
+
+#[used]
+#[link_section = ".requests"]
+static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 
 #[used]
 #[link_section = ".requests"]
@@ -66,14 +70,46 @@ extern "C" fn _start() -> ! {
 }
 
 fn collect_boot_info() -> BootInfo {
-    // Milestone 1: minimal stubs — empty slices are valid for &'static [T].
-    // Milestone 2 will fill memory_map from MEMMAP_REQUEST.
+    // Static buffer: memory map entries are written here once and referenced
+    // for the kernel's lifetime.  64 slots is far more than any real system
+    // returns (typical count is 10–20).
+    const MAX_REGIONS: usize = 64;
+    static mut MAP_BUF: [MemoryRegion; MAX_REGIONS] = [MemoryRegion {
+        base: 0,
+        len: 0,
+        kind: MemoryKind::Reserved,
+    }; MAX_REGIONS];
+
+    let mut count = 0usize;
+
+    if let Some(resp) = MEMMAP_REQUEST.response() {
+        for entry in resp.entries().iter().take(MAX_REGIONS) {
+            let kind = match entry.type_ {
+                limine::memmap::MEMMAP_USABLE             => MemoryKind::Usable,
+                limine::memmap::MEMMAP_ACPI_RECLAIMABLE   => MemoryKind::AcpiReclaimable,
+                limine::memmap::MEMMAP_EXECUTABLE_AND_MODULES => MemoryKind::KernelImage,
+                _ => MemoryKind::Reserved,
+            };
+            // SAFETY: single-threaded boot path; no concurrent access.
+            unsafe {
+                MAP_BUF[count] = MemoryRegion { base: entry.base, len: entry.length, kind };
+            }
+            count += 1;
+        }
+    }
+
+    let hhdm_offset = HHDM_REQUEST
+        .response()
+        .map(|r| r.offset)
+        .unwrap_or(0);
+
     // Milestone 6 will fill ap_ids from SMP_REQUEST.
     BootInfo {
-        memory_map: &[],
+        memory_map: unsafe { &MAP_BUF[..count] },
         ap_ids: &[],
         kernel_phys_start: 0,
         kernel_phys_end: 0,
+        hhdm_offset,
     }
 }
 
@@ -88,6 +124,9 @@ pub struct BootInfo {
     pub ap_ids: &'static [u32],
     pub kernel_phys_start: u64,
     pub kernel_phys_end: u64,
+    /// Base virtual address of Limine's higher-half direct map (HHDM).
+    /// Physical address P is accessible at virtual address `hhdm_offset + P`.
+    pub hhdm_offset: u64,
 }
 
 #[repr(C)]
