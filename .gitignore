@@ -17,3 +17,6 @@ Thumbs.db
 
 # Windows
 desktop.ini
+
+build/
+tools/

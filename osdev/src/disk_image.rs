@@ -16,11 +16,11 @@ const IMAGE_SIZE: u64 = 64 * 1024 * 1024; // 64 MiB
 const SECTOR_SIZE: u64 = 512;
 const PART_START_LBA: u32 = 2048; // 1 MiB aligned
 
-const LIMINE_CONF: &str = r#"timeout=0
+const LIMINE_CONF: &str = r#"timeout: -1
 
 /GodspeedOS
-    protocol=limine
-    kernel_path=boot():/kernel.elf
+    protocol: limine
+    kernel_path: boot():/kernel.elf
 "#;
 
 /// Build `build/os.img`: partition table + FAT32 + files.

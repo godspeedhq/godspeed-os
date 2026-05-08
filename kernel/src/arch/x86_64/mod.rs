@@ -48,8 +48,13 @@ static _REQUESTS_END: RequestsEndMarker = RequestsEndMarker::new();
 /// calls produce output, then build BootInfo and hand off to kernel_main.
 #[no_mangle]
 extern "C" fn _start() -> ! {
+    // SAFETY: port 0xe9 is QEMU's debug console — no init required.
+    unsafe { outb(0xe9, b'S') }; // 'S' = _Start reached
+
     // SAFETY: called once at boot; no concurrent serial access yet.
     unsafe { serial_init() };
+
+    unsafe { outb(0xe9, b'I') }; // 'I' = serial_Init done
 
     assert!(BASE_REVISION.is_supported(), "unsupported Limine protocol revision");
 

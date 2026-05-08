@@ -1,7 +1,7 @@
 [target.x86_64-unknown-none]
 rustflags = [
     "-C", "link-arg=-Tkernel/kernel.ld",
-    "-C", "link-arg=--nmagic",
+    "-C", "relocation-model=static",
 ]
 
 # Build the kernel and services with:

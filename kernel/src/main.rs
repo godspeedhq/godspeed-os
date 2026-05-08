@@ -27,7 +27,14 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     // SAFETY: bootloader guarantees boot_info_ptr is valid and aligned.
     let boot_info = unsafe { &*boot_info_ptr };
 
+    // SAFETY: debug probe — port 0xe9 is QEMU debug console.
+    unsafe { core::arch::asm!("out 0xe9, al", in("al") b'M', options(nostack, nomem)) };
+
     arch::x86_64::init(boot_info);
+
+    // SAFETY: debug probe — reached after init_bsp.
+    unsafe { core::arch::asm!("out 0xe9, al", in("al") b'G', options(nostack, nomem)) };
+
     memory::init(boot_info);
     capability::init();
     ipc::init();

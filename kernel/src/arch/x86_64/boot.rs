@@ -21,6 +21,10 @@ use super::BootInfo;
 // Kernel code: G=1, L=1 (64-bit), DPL=0 → 0x00AF_9A00_0000_FFFF
 // Kernel data: G=1, D=1, DPL=0       → 0x00CF_9200_0000_FFFF
 
+// x86 sets the Accessed bit in GDT descriptors when segment registers are
+// loaded, which is a hardware write to the GDT.  It must live in .data (rw-),
+// not .rodata (r--), or the CPU will fault with a write-protection violation.
+#[link_section = ".data"]
 static GDT: [u64; 3] = [
     0x0000_0000_0000_0000, // null descriptor
     0x00AF_9A00_0000_FFFF, // kernel code: 64-bit, ring 0, execute/read
@@ -103,7 +107,7 @@ pub(super) unsafe fn init_gdt() {
         limit: (core::mem::size_of_val(&GDT) - 1) as u16,
         base:  GDT.as_ptr() as u64,
     };
-    // SAFETY: GDT lives in .rodata; desc is valid for the duration of lgdt.
+    // SAFETY: GDT lives in .data (writable); desc is valid for the duration of lgdt.
     unsafe {
         core::arch::asm!(
             "lgdt [{desc}]",
