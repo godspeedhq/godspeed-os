@@ -1,0 +1,37 @@
+//! GodspeedOS service SDK.
+//!
+//! All userspace services link against this crate. It provides the typed
+//! wrappers around kernel syscalls so service code never issues raw syscalls.
+
+#![no_std]
+
+pub mod capability;
+pub mod ipc;
+pub mod service_context;
+
+pub use capability::{CapHandle, CapError};
+pub use ipc::{Message, IpcError};
+pub use service_context::ServiceContext;
+
+pub type Result<T> = core::result::Result<T, Error>;
+
+#[derive(Debug)]
+pub enum Error {
+    Cap(CapError),
+    Ipc(IpcError),
+    NotFound,
+    InvalidArgument,
+}
+
+impl From<CapError> for Error {
+    fn from(e: CapError) -> Self { Error::Cap(e) }
+}
+
+impl From<IpcError> for Error {
+    fn from(e: IpcError) -> Self { Error::Ipc(e) }
+}
+
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {}
+}

@@ -1,0 +1,14 @@
+name    = "block-driver"
+version = "0.1.0"
+
+[resources.memory]
+request = "8MiB"
+limit   = "16MiB"
+
+[capabilities]
+# virtio-blk MMIO base + size (QEMU default).
+hw_mmio      = ["0x10001000+0x1000"]
+hw_interrupt = [11]
+ipc_receive  = ["block-driver"]
+ipc_send     = ["registry"]
+log_write    = true

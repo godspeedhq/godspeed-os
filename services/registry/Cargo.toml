@@ -1,0 +1,11 @@
+[package]
+name = "registry"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "registry"
+path = "src/main.rs"
+
+[dependencies]
+godspeed-sdk = { path = "../../sdk/rust" }

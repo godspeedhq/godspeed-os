@@ -1,0 +1,13 @@
+[target.x86_64-unknown-none]
+rustflags = [
+    "-C", "link-arg=-Tkernel/kernel.ld",
+    "-C", "link-arg=--nmagic",
+]
+
+# Build the kernel and services with:
+#   cargo build -p kernel --target x86_64-unknown-none
+#   cargo build -p godspeed-sdk --target x86_64-unknown-none
+#   cargo build -p init --target x86_64-unknown-none
+#
+# Build the host tool with:
+#   cargo build -p osdev

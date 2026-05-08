@@ -1,0 +1,11 @@
+name    = "fs"
+version = "0.1.0"
+
+[resources.memory]
+request = "16MiB"
+limit   = "32MiB"
+
+[capabilities]
+ipc_receive = ["fs"]
+ipc_send    = ["block-driver", "registry"]
+log_write   = true

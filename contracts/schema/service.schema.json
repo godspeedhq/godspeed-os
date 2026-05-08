@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://godspeed.os/schemas/service/v1",
+  "title": "ServiceContract",
+  "description": "Structural schema for a GodspeedOS service contract (service.toml). See §13.",
+  "type": "object",
+  "required": ["name", "version", "resources", "capabilities"],
+  "additionalProperties": false,
+  "properties": {
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$",
+      "description": "Service name. Stable identifier; used as the registry key."
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "description": "SemVer version string."
+    },
+    "resources": {
+      "type": "object",
+      "required": ["memory"],
+      "additionalProperties": false,
+      "properties": {
+        "memory": {
+          "type": "object",
+          "required": ["request", "limit"],
+          "additionalProperties": false,
+          "properties": {
+            "request": { "$ref": "#/$defs/memorySize" },
+            "limit":   { "$ref": "#/$defs/memorySize" }
+          }
+        }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ipc_send": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+          "description": "Services this service may send IPC messages to."
+        },
+        "ipc_receive": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+          "description": "Endpoint names this service owns and may receive on."
+        },
+        "log_write": {
+          "type": "boolean",
+          "description": "Permission to send log messages to the logger service."
+        },
+        "service_control": {
+          "type": "boolean",
+          "description": "Supervisor-only: authority to kill and restart services."
+        },
+        "spawn": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "init-only: list of services init may spawn."
+        },
+        "hw_interrupt": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0, "maximum": 255 },
+          "description": "IRQ lines the service is allowed to receive."
+        },
+        "hw_mmio": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^0x[0-9a-fA-F]+\\+0x[0-9a-fA-F]+$" },
+          "description": "MMIO regions: base+size in hex."
+        }
+      }
+    },
+    "placement": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "core": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 15,
+          "description": "Required core ID (§9.2). Omit for round-robin."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "memorySize": {
+      "type": "string",
+      "pattern": "^\\d+(KiB|MiB|GiB)$",
+      "description": "Memory size with unit, e.g. 32MiB."
+    }
+  }
+}

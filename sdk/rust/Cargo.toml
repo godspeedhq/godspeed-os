@@ -1,0 +1,8 @@
+[package]
+name = "godspeed-sdk"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "godspeed_sdk"
+path = "src/lib.rs"

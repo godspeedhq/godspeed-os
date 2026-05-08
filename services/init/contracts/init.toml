@@ -1,0 +1,14 @@
+name    = "init"
+version = "0.1.0"
+
+[resources.memory]
+request = "4MiB"
+limit   = "8MiB"
+
+[capabilities]
+# init only needs to spawn the three listed services; supervisor handles the rest.
+spawn = ["supervisor", "registry", "logger"]
+log_write = true
+
+[placement]
+core = 0

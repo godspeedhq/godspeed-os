@@ -1,0 +1,19 @@
+# Build output
+target/
+
+# Claude Code session data (local to each developer)
+.claude/
+
+# OS-generated
+.DS_Store
+Thumbs.db
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Windows
+desktop.ini

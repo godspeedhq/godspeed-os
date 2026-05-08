@@ -1,0 +1,14 @@
+name    = "pong"
+version = "0.1.0"
+
+[resources.memory]
+request = "32MiB"
+limit   = "64MiB"
+
+[capabilities]
+ipc_receive = ["pong"]
+ipc_send    = ["registry"]
+log_write   = true
+
+# No [placement] block: supervisor assigns via round-robin.
+# pong may land on any available core, including a different one after restart.

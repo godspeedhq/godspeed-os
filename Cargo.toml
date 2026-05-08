@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "kernel",
+    "services/init",
+    "services/supervisor",
+    "services/registry",
+    "services/logger",
+    "services/block-driver",
+    "services/fs",
+    "sdk/rust",
+    "osdev",
+    "examples/ping",
+    "examples/pong",
+]
+
+# kernel and all services/examples build for the bare-metal target;
+# osdev builds for the host. Use `cargo build -p osdev` for the host tool,
+# and `cargo build -p kernel --target x86_64-unknown-none` for the kernel.
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+panic = "abort"

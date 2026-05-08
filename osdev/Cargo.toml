@@ -1,0 +1,18 @@
+[package]
+name = "osdev"
+version = "0.1.0"
+edition = "2021"
+
+# osdev is a HOST tool — it builds for the developer's machine, not the kernel target.
+# Build with: cargo build -p osdev  (no --target flag needed)
+
+[[bin]]
+name = "osdev"
+path = "src/main.rs"
+
+[dependencies]
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml       = "0.8"
+jsonschema = "0.18"
+clap       = { version = "4", features = ["derive"] }

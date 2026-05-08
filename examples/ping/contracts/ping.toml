@@ -1,0 +1,14 @@
+name    = "ping"
+version = "0.1.0"
+
+[resources.memory]
+request = "32MiB"
+limit   = "64MiB"
+
+[capabilities]
+ipc_send    = ["pong", "registry"]
+ipc_receive = ["ping"]
+log_write   = true
+
+[placement]
+core = 0
