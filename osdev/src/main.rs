@@ -11,6 +11,8 @@
 //!   osdev caps <service>    — show held capabilities
 //!   osdev test identity     — run §22 identity test suite
 
+mod disk_image;
+mod qemu;
 mod validator;
 
 use clap::{Parser, Subcommand};
@@ -71,14 +73,30 @@ fn cmd_new(name: &str) {
 }
 
 fn cmd_build() {
-    todo!("cargo build --target x86_64-unknown-none for kernel + services; cargo build for osdev")
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .status()
+        .expect("failed to run cargo build");
+    if !status.success() {
+        eprintln!("kernel build failed");
+        std::process::exit(1);
+    }
+    println!("build: kernel OK");
 }
 
 fn cmd_run(smp: u32) {
-    todo!(
-        "invoke qemu-system-x86_64 with -kernel, -smp {smp}, -serial stdio, \
-         -drive virtio-blk; stream serial output"
-    )
+    cmd_build();
+
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() {
+        eprintln!("kernel ELF not found at {}", kernel_elf.display());
+        std::process::exit(1);
+    }
+
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    qemu::run(&image_path, smp);
 }
 
 fn cmd_publish(service: Option<&str>) {

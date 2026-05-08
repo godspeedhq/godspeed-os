@@ -18,6 +18,11 @@ const TRAMPOLINE_PHYS: u64 = 0x8000;
 /// # Safety
 /// Must be called after BSP APIC init, before any AP-targeted syscall.
 pub unsafe fn start_all_aps(boot_info: &super::BootInfo) -> u32 {
+    // Milestone 6: real-mode trampoline + INIT/SIPI sequence.
+    // For Milestone 1 ap_ids is empty (single BSP), so skip entirely.
+    if boot_info.ap_ids.is_empty() {
+        return 0;
+    }
     // SAFETY: caller guarantees APIC is initialised.
     unsafe {
         install_trampoline();

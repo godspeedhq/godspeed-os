@@ -42,8 +42,9 @@ impl BitmapAllocator {
         Self { initialized: false }
     }
 
-    unsafe fn init_from_map(&mut self, boot_info: &BootInfo) {
-        todo!("build free-list bitmap from boot_info.memory_map; mark kernel image as used")
+    unsafe fn init_from_map(&mut self, _boot_info: &BootInfo) {
+        // Milestone 2: build free-list bitmap from boot_info.memory_map.
+        self.initialized = true;
     }
 
     unsafe fn alloc(&mut self) -> Option<Frame> {

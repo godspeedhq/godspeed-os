@@ -42,7 +42,8 @@ pub fn block_on_send(endpoint: crate::ipc::endpoint::EndpointId) {
 }
 
 fn pick_next() -> Option<TaskId> {
-    todo!("round-robin over Ready tasks on this core's run queue")
+    // Milestone 3: round-robin over Ready tasks on this core's run queue.
+    None
 }
 
 fn switch_to(task_id: TaskId) {

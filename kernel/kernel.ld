@@ -1,12 +1,20 @@
-ENTRY(kernel_main)
+ENTRY(_start)
 
 SECTIONS {
-    /* Load at 1 MiB — standard multiboot2 load address */
+    /* Limine loads the kernel at the physical address of its ELF LOAD segments.
+       0x100000 (1 MiB) keeps us above the real-mode IVT and BIOS data areas. */
     . = 0x100000;
 
+    /* Limine request structs — must be in a named section so KEEP preserves them.
+       RequestsStartMarker and RequestsEndMarker bracket the requests region. */
+    .requests : {
+        KEEP(*(.requests_start))
+        KEEP(*(.requests .requests.*))
+        KEEP(*(.requests_end))
+    }
+
     .text : {
-        KEEP(*(.text.kernel_main))
-        KEEP(*(.text.ap_main))
+        KEEP(*(.text._start))
         *(.text .text.*)
     }
 
@@ -25,7 +33,6 @@ SECTIONS {
         __bss_end = .;
     }
 
-    /* Discard metadata sections that cause linker warnings on bare metal */
     /DISCARD/ : {
         *(.eh_frame)
         *(.note .note.*)
