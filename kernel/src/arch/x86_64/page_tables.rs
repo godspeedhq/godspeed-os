@@ -20,6 +20,16 @@ pub const PAGE_SIZE: usize = 4096;
 
 static mut HHDM_OFFSET: u64 = 0;
 
+/// Read the HHDM offset set during memory init.
+///
+/// # Safety
+/// Returns 0 if called before `set_hhdm_offset`.
+#[inline]
+pub fn get_hhdm_offset() -> u64 {
+    // SAFETY: written once before any caller can observe it; read-only after.
+    unsafe { HHDM_OFFSET }
+}
+
 /// Store the HHDM base address provided by Limine.
 ///
 /// # Safety
@@ -180,6 +190,45 @@ impl PageTable {
     /// Physical address of PML4 root for loading into CR3.
     pub fn cr3_value(&self) -> u64 {
         self.root.phys_addr().0
+    }
+}
+
+/// Add a single 4 KiB mapping to the CURRENTLY ACTIVE page table (i.e. the
+/// one pointed to by CR3), walking or allocating intermediate levels as needed.
+///
+/// Designed for boot-time kernel MMIO mappings (e.g. APIC) that must exist
+/// in Limine's tables before our per-task `PageTable`s are created.  Because
+/// `PageTable::new()` copies PML4 entries 256–511, any mapping added here at
+/// a kernel virtual address automatically propagates to future address spaces.
+///
+/// If the target PTE is already present this is a no-op (returns `Ok`).
+///
+/// `flags` — raw PTE flag bits (e.g. PRESENT | WRITABLE | PCD | PWT for MMIO).
+///
+/// # Safety
+/// Must be called after `set_hhdm_offset`; `virt` and `phys` must be
+/// page-aligned; no TLB flush is issued (caller must invalidate if needed).
+pub unsafe fn map_in_active_tables(virt: u64, phys: u64, flags: u64) -> Result<(), MapError> {
+    let cr3: u64;
+    // SAFETY: RDMSR of CR3 is always valid in ring 0.
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem)) };
+    let pml4 = cr3 & !0xFFF;
+
+    let user_bit = if virt < (1u64 << 47) { PageFlags::USER.bits() } else { 0 };
+    let inter    = PageFlags::PRESENT.bits() | PageFlags::WRITABLE.bits() | user_bit;
+
+    // SAFETY: pml4 is the live CR3-referenced table; HHDM lets us write entries.
+    unsafe {
+        let pdpt = walk_or_alloc(pml4,  pml4_idx(virt), inter)?;
+        let pd   = walk_or_alloc(pdpt,  pdpt_idx(virt), inter)?;
+        let pt   = walk_or_alloc(pd,    pd_idx(virt),   inter)?;
+        let idx  = pt_idx(virt);
+
+        let existing = read_entry(pt, idx);
+        if !entry_present(existing) {
+            write_entry(pt, idx, (phys & !0xFFF) | flags);
+        }
+        Ok(())
     }
 }
 

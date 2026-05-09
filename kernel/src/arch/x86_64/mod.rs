@@ -156,6 +156,13 @@ pub fn init(boot_info: &BootInfo) {
     unsafe { boot::init_bsp(boot_info) };
 }
 
+/// Program the local APIC timer on the calling core (§9.1).
+/// Must be called after `memory::init` so the HHDM offset is available.
+pub fn init_timer() {
+    // SAFETY: called after memory::init; HHDM offset is set.
+    unsafe { boot::init_local_apic() };
+}
+
 /// Per-AP hardware initialisation called from `ap_main`.
 pub fn ap_init(core_id: u32) {
     // SAFETY: called once per AP from ap_main after long-mode entry.

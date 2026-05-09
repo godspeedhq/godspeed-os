@@ -17,6 +17,47 @@ pub struct ExceptionFrame {
     pub ss: u64,
 }
 
+// ---------------------------------------------------------------------------
+// Timer ISR (vector 32) — §9.1 preemption quantum.
+// ---------------------------------------------------------------------------
+
+/// Naked ISR stub for the APIC timer (vector 32).
+///
+/// Saves all caller-saved registers, calls `timer_tick_from_irq`, restores,
+/// then returns from interrupt.  The scheduler's `switch_context` may change
+/// RSP inside `timer_tick_from_irq`; that is intentional — see §9.1.
+#[no_mangle]
+#[unsafe(naked)]
+pub unsafe extern "C" fn timer_isr_stub() {
+    // SAFETY: raw interrupt entry; all register saves are explicit.
+    core::arch::naked_asm!(
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rdi",
+        "push rsi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "call timer_tick_from_irq",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rsi",
+        "pop rdi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "iretq",
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch helpers.
+// ---------------------------------------------------------------------------
+
 /// Dispatch a hardware IRQ to the userspace driver registered for it (§12.2).
 ///
 /// # Safety

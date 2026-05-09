@@ -42,9 +42,9 @@ pub unsafe fn broadcast_tlb_shootdown(virt_addr: u64) {
 /// Called from raw interrupt context with interrupts disabled.
 pub unsafe extern "C" fn ipi_handler(vector: u8) {
     match vector {
-        vectors::WAKE_RECEIVER  => crate::task::scheduler::timer_tick(),
+        vectors::WAKE_RECEIVER  => crate::task::scheduler::yield_current(),
         vectors::TLB_SHOOTDOWN  => handle_tlb_shootdown(),
-        vectors::SCHEDULER_TICK => crate::task::scheduler::timer_tick(),
+        vectors::SCHEDULER_TICK => crate::task::scheduler::yield_current(),
         _ => {}
     }
     // SAFETY: EOI write to APIC.

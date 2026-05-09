@@ -40,7 +40,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::Send as u64    => handle_send(arg0, arg1, arg2),
         n if n == SyscallNumber::Recv as u64    => handle_recv(arg0),
         n if n == SyscallNumber::TrySend as u64 => handle_try_send(arg0, arg1, arg2),
-        n if n == SyscallNumber::Yield as u64   => { crate::task::scheduler::timer_tick(); 0 }
+        n if n == SyscallNumber::Yield as u64   => { crate::task::scheduler::yield_current(); 0 }
         _ => -1, // Unknown syscall.
     }
 }
