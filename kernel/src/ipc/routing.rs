@@ -4,8 +4,11 @@
 //! generation and liveness before touching the queue. The generation here must
 //! match the cap generation or the send returns `EndpointDead` (§8.7).
 //!
-//! v1: a simple linear-scan table of up to MAX_ENDPOINTS entries, protected
-//! by IF=0 (syscall path) on the same core. SMP locking is Milestone 6.
+//! SMP note (§7.8): a global spinlock serialises all routing table operations.
+//! This is the "single global RwLock" approach approved for v1. The lock is
+//! never held across a `block_and_reschedule` call.
+
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::capability::generation::Generation;
 use crate::ipc::endpoint::EndpointId;
@@ -13,13 +16,30 @@ use crate::ipc::message::{IpcError, Message};
 use crate::ipc::queue::MessageQueue;
 
 // ---------------------------------------------------------------------------
+// Spinlock — protects TABLE against concurrent access from multiple cores.
+// ---------------------------------------------------------------------------
+
+static ROUTE_LOCKED: AtomicBool = AtomicBool::new(false);
+
+fn lock() {
+    while ROUTE_LOCKED
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+}
+
+fn unlock() {
+    ROUTE_LOCKED.store(false, Ordering::Release);
+}
+
+// ---------------------------------------------------------------------------
 // Entry layout.
 // ---------------------------------------------------------------------------
 
 const MAX_ENDPOINTS: usize = 16;
 
-/// Per-endpoint liveness (distinct from the global cap-table Liveness, which
-/// tracks the resource registration; this tracks the queue's own state).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EndpointLiveness {
     Alive,
@@ -38,12 +58,11 @@ struct RoutingEntry {
     generation: Generation,
     liveness: EndpointLiveness,
     queue: MessageQueue,
-    /// Task-slot of the task blocked on `recv` (waiting for a message to arrive).
+    /// Task-slot of the task blocked on `recv` (waiting for a message).
     blocked_receiver: Option<usize>,
     /// Task-slot of the task blocked on `send` (queue was full).
     blocked_sender: Option<usize>,
-    /// The message the blocked sender wants to deliver; held until a dequeue
-    /// frees space and the sender is woken.
+    /// Message the blocked sender wants to deliver.
     pending_send: Option<Message>,
 }
 
@@ -63,8 +82,7 @@ impl RoutingEntry {
     }
 }
 
-// SAFETY: TABLE is accessed exclusively from syscall context (IF=0, same core)
-// in v1. No concurrent modification from other cores in Milestone 5.
+// SAFETY: TABLE is protected by ROUTE_LOCKED spinlock for all multi-core access.
 static mut TABLE: [RoutingEntry; MAX_ENDPOINTS] = {
     const E: RoutingEntry = RoutingEntry::empty();
     [E; MAX_ENDPOINTS]
@@ -80,7 +98,8 @@ pub fn init() {
 
 /// Register a newly-created endpoint in the routing table.
 pub fn register(id: EndpointId, core_id: u32, generation: Generation) {
-    // SAFETY: called before scheduling starts (single-core, IF=0 context).
+    lock();
+    // SAFETY: lock held; single-writer.
     unsafe {
         for entry in TABLE.iter_mut() {
             if !entry.valid {
@@ -89,137 +108,137 @@ pub fn register(id: EndpointId, core_id: u32, generation: Generation) {
                 entry.core_id    = core_id;
                 entry.generation = generation;
                 entry.liveness   = EndpointLiveness::Alive;
+                unlock();
                 return;
             }
         }
-        panic!("routing: endpoint table full (MAX_ENDPOINTS={})", MAX_ENDPOINTS);
     }
+    unlock();
+    panic!("routing: endpoint table full (MAX_ENDPOINTS={})", MAX_ENDPOINTS);
 }
 
-/// Try to enqueue `msg` on `endpoint`, checking `cap_gen` against the stored
-/// generation.
+/// Try to enqueue `msg` on `endpoint`.
+///
+/// `blocked_sender_slot`: if `Some(slot)`, this is a blocking `send` — if the
+/// queue is full the sender is atomically recorded as blocked (under the same
+/// lock), and the caller must immediately call `block_and_reschedule`.
+/// If `None`, behaves like `try_send`: returns `Err(QueueFull)` directly.
 ///
 /// Returns:
-/// - `Ok(Some(receiver_slot))` — a task was blocked on `recv`; caller must
-///   wake it via `scheduler::wake_by_slot`.
+/// - `Ok(Some(rx))` — blocked receiver woken; caller must call `wake_by_slot`.
 /// - `Ok(None)` — message queued; no blocked receiver.
-/// - `Err(QueueFull)` — queue is full; caller should record itself as a
-///   blocked sender (§8.9) and call `scheduler::block_and_reschedule`.
-/// - `Err(EndpointDead)` — endpoint is dead or generation mismatch.
+/// - `Err(QueueFull)` — queue full; if `blocked_sender_slot` was `Some`, the
+///   sender is now recorded as blocked and must call `block_and_reschedule`.
+/// - `Err(EndpointDead)` — dead endpoint or generation mismatch.
 pub fn enqueue(
     endpoint: EndpointId,
     msg: Message,
     cap_gen: Generation,
+    blocked_sender_slot: Option<usize>,
 ) -> Result<Option<usize>, IpcError> {
-    // SAFETY: IF=0 in syscall context.
-    unsafe {
-        let idx = find_index(endpoint).ok_or(IpcError::EndpointDead)?;
-        check_live(&TABLE[idx], cap_gen)?;
-
-        // If a receiver is already blocked, deliver directly into the queue
-        // (queue was empty — receiver was waiting for exactly this).
-        if let Some(slot) = TABLE[idx].blocked_receiver.take() {
-            // Queue must be empty when a receiver is blocked, so enqueue is
-            // infallible here.
-            TABLE[idx].queue.enqueue(msg).ok();
-            return Ok(Some(slot));
-        }
-
-        match TABLE[idx].queue.enqueue(msg) {
-            Ok(()) => Ok(None),
-            Err(_) => Err(IpcError::QueueFull),
-        }
-    }
+    lock();
+    let result = unsafe { enqueue_locked(endpoint, msg, cap_gen, blocked_sender_slot) };
+    unlock();
+    result
 }
 
-/// Record that `slot` is blocked trying to deliver `msg` (queue was full).
-///
-/// Called after `enqueue` returns `Err(QueueFull)` and before
-/// `block_and_reschedule`. Interrupts must be disabled by the caller to prevent
-/// a concurrent dequeue from missing the wakeup.
-pub fn record_blocked_sender(
+unsafe fn enqueue_locked(
     endpoint: EndpointId,
-    slot: usize,
     msg: Message,
-) -> Result<(), IpcError> {
-    // SAFETY: IF=0 (caller ensures this).
-    unsafe {
-        let idx = find_index(endpoint).ok_or(IpcError::EndpointDead)?;
-        if TABLE[idx].liveness == EndpointLiveness::Dead {
-            return Err(IpcError::EndpointDead);
+    cap_gen: Generation,
+    blocked_sender_slot: Option<usize>,
+) -> Result<Option<usize>, IpcError> {
+    let idx = find_index(endpoint).ok_or(IpcError::EndpointDead)?;
+    check_live(&TABLE[idx], cap_gen)?;
+
+    if let Some(slot) = TABLE[idx].blocked_receiver.take() {
+        // Queue was empty; a receiver was waiting — deliver directly.
+        TABLE[idx].queue.enqueue(msg).ok();
+        return Ok(Some(slot));
+    }
+
+    match TABLE[idx].queue.enqueue(msg) {
+        Ok(()) => Ok(None),
+        Err(_) => {
+            // Queue full.
+            if let Some(slot) = blocked_sender_slot {
+                // Atomically record the sender as blocked under the same lock,
+                // preventing a concurrent dequeue from missing the wakeup.
+                TABLE[idx].blocked_sender = Some(slot);
+                TABLE[idx].pending_send   = Some(msg);
+            }
+            Err(IpcError::QueueFull)
         }
-        TABLE[idx].blocked_sender  = Some(slot);
-        TABLE[idx].pending_send    = Some(msg);
-        Ok(())
     }
 }
 
-/// Record that `slot` is blocked waiting for a message (queue was empty).
+/// Try to dequeue the oldest message from `endpoint`.
 ///
-/// Interrupts must be disabled by the caller to prevent a concurrent enqueue
-/// from missing the wakeup.
-pub fn record_blocked_receiver(endpoint: EndpointId, slot: usize) -> Result<(), IpcError> {
-    // SAFETY: IF=0 (caller ensures this).
-    unsafe {
-        let idx = find_index(endpoint).ok_or(IpcError::EndpointDead)?;
-        if TABLE[idx].liveness == EndpointLiveness::Dead {
-            return Err(IpcError::EndpointDead);
-        }
-        TABLE[idx].blocked_receiver = Some(slot);
-        Ok(())
-    }
-}
-
-/// Dequeue the oldest message from `endpoint`, checking `cap_gen`.
+/// `blocked_receiver_slot`: if `Some(slot)`, this is a blocking `recv` — if
+/// the queue is empty the receiver is atomically recorded as blocked (under
+/// the same lock), and the caller must immediately call `block_and_reschedule`.
+/// If `None`, returns `Err(QueueEmpty)` directly.
 ///
 /// Returns:
-/// - `Ok((msg, Some(sender_slot)))` — message dequeued; a sender was blocked.
-///   Caller must wake it via `scheduler::wake_by_slot` and the sender's
-///   pending message is now in the queue.
+/// - `Ok((msg, Some(tx)))` — message dequeued; blocked sender to wake.
 /// - `Ok((msg, None))` — message dequeued; no blocked sender.
-/// - `Err(QueueEmpty)` — queue empty; caller should record itself as a
-///   blocked receiver and call `scheduler::block_and_reschedule`.
-/// - `Err(EndpointDead)` — endpoint dead or generation mismatch.
+/// - `Err(QueueEmpty)` — queue empty; if `blocked_receiver_slot` was `Some`,
+///   the receiver is now recorded and must call `block_and_reschedule`.
+/// - `Err(EndpointDead)` — dead endpoint or generation mismatch.
 pub fn dequeue(
     endpoint: EndpointId,
     cap_gen: Generation,
+    blocked_receiver_slot: Option<usize>,
 ) -> Result<(Message, Option<usize>), IpcError> {
-    // SAFETY: IF=0 in syscall context.
-    unsafe {
-        let idx = find_index(endpoint).ok_or(IpcError::EndpointDead)?;
-        check_live(&TABLE[idx], cap_gen)?;
-
-        let msg = match TABLE[idx].queue.dequeue() {
-            Some(m) => m,
-            None    => return Err(IpcError::QueueEmpty),
-        };
-
-        // If a sender was blocked waiting for space, move its pending message
-        // into the now-freed slot and return the sender slot to wake.
-        let sender_slot = if let Some(slot) = TABLE[idx].blocked_sender.take() {
-            if let Some(pending) = TABLE[idx].pending_send.take() {
-                // Space just freed; enqueue can't fail.
-                TABLE[idx].queue.enqueue(pending).ok();
-            }
-            Some(slot)
-        } else {
-            None
-        };
-
-        Ok((msg, sender_slot))
-    }
+    lock();
+    let result = unsafe { dequeue_locked(endpoint, cap_gen, blocked_receiver_slot) };
+    unlock();
+    result
 }
 
-/// Mark the endpoint dead: bump generation, drain queue, clear blocked tasks.
+unsafe fn dequeue_locked(
+    endpoint: EndpointId,
+    cap_gen: Generation,
+    blocked_receiver_slot: Option<usize>,
+) -> Result<(Message, Option<usize>), IpcError> {
+    let idx = find_index(endpoint).ok_or(IpcError::EndpointDead)?;
+    check_live(&TABLE[idx], cap_gen)?;
+
+    let msg = match TABLE[idx].queue.dequeue() {
+        Some(m) => m,
+        None => {
+            // Queue empty.
+            if let Some(slot) = blocked_receiver_slot {
+                // Atomically record the receiver as blocked under the same lock.
+                TABLE[idx].blocked_receiver = Some(slot);
+            }
+            return Err(IpcError::QueueEmpty);
+        }
+    };
+
+    // If a sender was blocked, move its pending message into the freed slot.
+    let sender_slot = if let Some(slot) = TABLE[idx].blocked_sender.take() {
+        if let Some(pending) = TABLE[idx].pending_send.take() {
+            TABLE[idx].queue.enqueue(pending).ok();
+        }
+        Some(slot)
+    } else {
+        None
+    };
+
+    Ok((msg, sender_slot))
+}
+
+/// Mark the endpoint dead: bump generation, drain queue, return blocked slots.
 ///
 /// Returns `(blocked_receiver_slot, blocked_sender_slot)` — the caller must
 /// wake both (if `Some`) with `EndpointDead` via `scheduler::wake_by_slot`.
 pub fn kill_endpoint(endpoint: EndpointId) -> (Option<usize>, Option<usize>) {
-    // SAFETY: IF=0.
-    unsafe {
+    lock();
+    let result = unsafe {
         let idx = match find_index(endpoint) {
             Some(i) => i,
-            None    => return (None, None),
+            None    => { unlock(); return (None, None); }
         };
         TABLE[idx].liveness   = EndpointLiveness::Dead;
         TABLE[idx].generation = TABLE[idx].generation.bump();
@@ -228,7 +247,9 @@ pub fn kill_endpoint(endpoint: EndpointId) -> (Option<usize>, Option<usize>) {
         let tx = TABLE[idx].blocked_sender.take();
         TABLE[idx].pending_send = None;
         (rx, tx)
-    }
+    };
+    unlock();
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +257,7 @@ pub fn kill_endpoint(endpoint: EndpointId) -> (Option<usize>, Option<usize>) {
 // ---------------------------------------------------------------------------
 
 /// Linear scan to find the index of a valid entry with the given id.
+/// Caller must hold `ROUTE_LOCKED`.
 unsafe fn find_index(id: EndpointId) -> Option<usize> {
     for (i, entry) in unsafe { TABLE.iter().enumerate() } {
         if entry.valid && entry.id == id {

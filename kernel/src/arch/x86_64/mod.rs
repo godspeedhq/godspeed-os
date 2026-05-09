@@ -52,13 +52,8 @@ static _REQUESTS_END: RequestsEndMarker = RequestsEndMarker::new();
 /// calls produce output, then build BootInfo and hand off to kernel_main.
 #[no_mangle]
 extern "C" fn _start() -> ! {
-    // SAFETY: port 0xe9 is QEMU's debug console — no init required.
-    unsafe { outb(0xe9, b'S') }; // 'S' = _Start reached
-
     // SAFETY: called once at boot; no concurrent serial access yet.
     unsafe { serial_init() };
-
-    unsafe { outb(0xe9, b'I') }; // 'I' = serial_Init done
 
     assert!(BASE_REVISION.is_supported(), "unsupported Limine protocol revision");
 
@@ -103,10 +98,25 @@ fn collect_boot_info() -> BootInfo {
         .map(|r| r.offset)
         .unwrap_or(0);
 
-    // Milestone 6 will fill ap_ids from SMP_REQUEST.
+    // Collect non-BSP LAPIC IDs from the SMP response.
+    const MAX_AP_IDS: usize = 16;
+    static mut AP_ID_BUF: [u32; MAX_AP_IDS] = [0u32; MAX_AP_IDS];
+    let mut ap_count = 0usize;
+
+    if let Some(mp) = SMP_REQUEST.response() {
+        let bsp_lapic = mp.bsp_lapic_id;
+        for cpu in mp.cpus() {
+            if cpu.lapic_id != bsp_lapic && ap_count < MAX_AP_IDS {
+                // SAFETY: single-threaded boot path.
+                unsafe { AP_ID_BUF[ap_count] = cpu.lapic_id; }
+                ap_count += 1;
+            }
+        }
+    }
+
     BootInfo {
         memory_map: unsafe { &MAP_BUF[..count] },
-        ap_ids: &[],
+        ap_ids: unsafe { &AP_ID_BUF[..ap_count] },
         kernel_phys_start: 0,
         kernel_phys_end: 0,
         hhdm_offset,
@@ -165,13 +175,13 @@ pub fn init_timer() {
 
 /// Per-AP hardware initialisation called from `ap_main`.
 pub fn ap_init(core_id: u32) {
+    let _ = core_id;
     // SAFETY: called once per AP from ap_main after long-mode entry.
     unsafe {
         boot::init_gdt();
         boot::init_idt();
         boot::init_local_apic();
     }
-    crate::kprintln!("smp: core {} ready", core_id);
 }
 
 /// Halt this core. Disables interrupts and loops on hlt.
@@ -191,6 +201,11 @@ pub fn halt_all_cores() -> ! {
 
 const COM1: u16 = 0x3F8;
 
+// Spinlock protecting all COM1 port I/O. Prevents concurrent UART access
+// from multiple cores from corrupting the THRE poll / TX FIFO state.
+static SERIAL_LOCK: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Initialise COM1 at 115200 baud, 8N1.
 ///
 /// # Safety
@@ -209,15 +224,27 @@ pub unsafe fn serial_init() {
 
 /// Write one byte to COM1. Spins until the transmit holding register is empty.
 ///
+/// Thread-safe: serialized through `SERIAL_LOCK` so concurrent calls from
+/// multiple cores cannot interleave THRE polls with TX writes.
+///
 /// # Safety
-/// `serial_init` must have been called. Not thread-safe until a spinlock
-/// is added (Milestone 3).
+/// `serial_init` must have been called before the first call.
 pub fn serial_write_byte(b: u8) {
+    use core::sync::atomic::Ordering;
+    // SAFETY: SERIAL_LOCK is a boolean spinlock; we hold it only for the
+    // duration of one THRE poll + one outb, then release it unconditionally.
+    while SERIAL_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
     // SAFETY: port I/O to COM1; initialised before first use in _start.
     unsafe {
         while (inb(COM1 + 5) & 0x20) == 0 {}  // wait: THR empty (LSR bit 5)
         outb(COM1, b);
     }
+    SERIAL_LOCK.store(false, Ordering::Release);
 }
 
 // ---------------------------------------------------------------------------

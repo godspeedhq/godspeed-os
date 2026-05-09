@@ -1,7 +1,7 @@
 # CLAUDE.md
 ## Capability-Based Microkernel OS
 
-**Status:** v3.6 — SMP-Integrated Spec, Reviewed (Restart Placement Clarified)
+**Status:** v3.7 — SMP-Integrated Spec, Reviewed, with Forward-Looking Appendices
 **Scope:** v1 milestone (multi-core kernel, two services, cross-core IPC, supervisor restart with core reassignment)
 **Audience:** Contributors, reviewers, future maintainers
 
@@ -35,6 +35,13 @@
 24. [Glossary](#24-glossary)
 25. [Final Principles](#25-final-principles)
 
+**Appendices (forward-looking, mostly non-normative):**
+
+- [Appendix A: Bootloader Choice (Limine)](#appendix-a-bootloader-choice-limine)
+- [Appendix B: Userspace Posture](#appendix-b-userspace-posture)
+- [Appendix C: Forward-Looking Vision (Non-Normative)](#appendix-c-forward-looking-vision-non-normative)
+- [Appendix D: Shell, Scripting, and Utility Ecosystem (Non-Normative, Far Future)](#appendix-d-shell-scripting-and-utility-ecosystem-non-normative-far-future)
+
 ---
 
 ## 1. Purpose of This Document
@@ -51,6 +58,8 @@ It exists to:
 - Resolve future arguments by appeal to written law rather than memory.
 
 When this document and the code disagree, the document wins and the code is wrong. When this document and reality disagree, the document is amended and the change is recorded.
+
+The appendices at the end of this document collect forward-looking design notes. Appendix A documents a v1 commitment (the bootloader choice). Appendices B, C, and D are explicitly non-normative — they record design intent and discussion, not commitments. Their content does not amend the constitution.
 
 ---
 
@@ -255,6 +264,7 @@ os/
     capability.md
     restart.md
     smp.md
+    bootloader.md          # Limine integration notes
     unsafe-audit.md
 
   tests/
@@ -613,7 +623,7 @@ When a page is unmapped (service killed, memory reclaimed), the kernel issues a 
 
 ```mermaid
 sequenceDiagram
-    participant BL as Bootloader
+    participant BL as Limine (Bootloader)
     participant K as Kernel (BSP)
     participant APs as APs (Cores 1..N)
     participant I as init (Core 0)
@@ -621,7 +631,8 @@ sequenceDiagram
     participant R as registry (Core 0)
     participant Svc as Other services
 
-    BL->>K: load image, jump (BSP only)
+    BL->>K: load kernel image, jump (BSP only)
+    Note over BL,K: Limine supplies memory map,<br/>framebuffer info, SMP topology
     K->>K: paging, IDT, GDT
     K->>K: frame allocator, cap subsystem
     K->>APs: start APs (real-mode trampoline → long mode)
@@ -636,10 +647,14 @@ sequenceDiagram
     Note over BL,Svc: System reaches multi-core steady state
 ```
 
+The bootloader is **Limine**, accessed via the Limine Boot Protocol. Limine is responsible for loading the kernel image, supplying the physical memory map, the framebuffer descriptor, kernel relocation info, and the SMP topology (APIC IDs of all available cores). See Appendix A for the bootloader rationale and installation story.
+
 ### 11.2 BSP and APs
 
 - **BSP (Bootstrap Processor)** — the first core to execute kernel code. Responsible for kernel init and bringing APs online.
 - **APs (Application Processors)** — secondary cores. Brought up via real-mode trampoline (`arch/x86_64/ap_boot.rs`), then jump to long-mode kernel code, then enter idle.
+
+Because Limine supplies APIC IDs directly, the kernel does not need to probe ACPI/MADT for SMP topology. This removes a non-trivial subsystem from `arch/x86_64/ap_boot.rs`.
 
 ### 11.3 Failure During Bootstrap
 
@@ -1381,6 +1396,7 @@ Filesystem persistence beyond the trusted block driver, network stack, work-stea
 - **Grant** — The right to transfer a capability via IPC.
 - **Identity test** — A test that pins a constitutional decision (§22).
 - **IPI** — Inter-Processor Interrupt. Mechanism for a core to wake another core.
+- **Limine** — The bootloader used in v1. See Appendix A.
 - **Placement** — Strict assignment of a service to a specific core at spawn time. Re-evaluated from scratch on every spawn, including post-restart spawns; the previous core is not remembered.
 - **PlacementInvalid** — Error returned when a contracted core is unavailable; spawn rejected, supervisor logs and skips.
 - **Quantum** — The 10 ms time slice after which the per-core scheduler preempts.
@@ -1405,3 +1421,289 @@ Filesystem persistence beyond the trusted block driver, network stack, work-stea
 > **Identity is stable. Location is not. Movement is invisible. Death is visible.**
 
 > **Failures are loud, never silent.**
+
+---
+---
+
+# Appendix A: Bootloader Choice (Limine)
+
+> **Status:** v1 commitment. This appendix documents and justifies a concrete decision; it is part of the v1 spec, not aspirational.
+
+## A.1 Decision
+
+The v1 bootloader is **Limine**, accessed by the kernel via the **Limine Boot Protocol**.
+
+## A.2 What Limine Provides to the Kernel
+
+At handoff, Limine supplies the kernel with:
+
+- **Physical memory map** — usable, reserved, ACPI, framebuffer regions all classified.
+- **Framebuffer descriptor** — base address, dimensions, pixel format. Avoids ever needing VGA text mode.
+- **Kernel relocation info** — physical and virtual base addresses of where the kernel was loaded.
+- **SMP topology** — APIC IDs of all available processors, used by `kernel/smp` and `arch/x86_64/ap_boot.rs`. This removes the need to probe ACPI/MADT in v1.
+- **Higher-half direct map** — physical memory pre-mapped at a known high-half virtual address, available immediately.
+- **Boot-time module list** — ability to load additional binaries (e.g., the initial service manifest) alongside the kernel.
+
+## A.3 Why Limine for v1
+
+| Reason | Detail |
+|--------|--------|
+| **Tight Rust integration** | The `limine` crate (crates.io) provides type-safe bindings to the boot protocol. Request structures are declared as Rust statics; responses are read back with strong typing. No hand-rolled parsing of bootloader-supplied tables. |
+| **SMP topology supplied** | APIC IDs come pre-discovered. `arch/x86_64/ap_boot.rs` does not need an ACPI parser to enumerate cores. |
+| **BIOS + UEFI from one bootloader** | Limine supports both firmware modes with the same protocol. The kernel does not need to care which firmware booted it. |
+| **Good QEMU support** | Critical for `osdev run` (§17). The whole identity test suite runs under QEMU; the bootloader must work there reliably. |
+| **Active maintenance** | Limine is currently maintained and the protocol is stable but evolving. Pin a specific protocol version in `Cargo.toml` and treat updates as deliberate. |
+
+## A.4 Installation Story
+
+GodspeedOS ships with Limine. Users do not install or pre-install Limine separately.
+
+**UEFI systems:**
+
+- The OS image places `BOOTX64.EFI` (the Limine UEFI loader) at `/EFI/BOOT/BOOTX64.EFI` on the EFI System Partition.
+- The kernel binary is placed where `limine.conf` references it.
+- Firmware → `BOOTX64.EFI` → Limine → kernel.
+
+**BIOS systems:**
+
+- The installer runs `limine bios-install` to write Limine's stage-1 to the MBR (or VBR).
+- Stages 2 and 3 of Limine live on disk alongside the kernel; loaded by the stage-1.
+- Firmware → MBR → Limine → kernel.
+
+In both cases the Limine binaries are part of the OS image. The end user installs the OS; Limine arrives with it.
+
+## A.5 Dual-Boot Support
+
+Out of scope for v1. If pursued later, Limine supports chainloading other bootloaders, which is the cleanest path. v1 assumes a dedicated machine or VM.
+
+## A.6 Alternatives Considered
+
+| Option | Why Not |
+|--------|---------|
+| GRUB / Multiboot2 | Older protocol, clunkier Rust integration, no built-in SMP topology surface, much larger surface area to depend on. |
+| Custom bootloader | A project unto itself. Distracts from the actual goal (a capability microkernel). |
+| Bootboot, stivale (predecessor to Limine) | Stivale is deprecated in favor of Limine Boot Protocol. Bootboot is reasonable but has a smaller community and worse Rust tooling than Limine today. |
+
+## A.7 Implementation Notes
+
+- The integration code lives in `kernel/src/arch/x86_64/boot.rs`.
+- The Limine protocol version used is pinned in the workspace `Cargo.toml`. Protocol version bumps are PR-reviewed.
+- A short narrative of the boot handoff (Limine → kernel main) lives in `docs/bootloader.md`.
+
+---
+
+# Appendix B: Userspace Posture
+
+> **Status:** Non-normative. Records the v1 stance on userspace languages and the design intent for early services. Does not amend the constitution.
+
+## B.1 Primary Language: Rust
+
+All v1 userspace services are written in Rust against `sdk/rust/`.
+
+Reasons:
+
+- The kernel is Rust; sharing a toolchain dramatically simplifies the build and CI pipeline.
+- Capability handles in `sdk/rust/capability.rs` are typed Rust structures. C or other-language equivalents would need parallel SDKs.
+- Contract validation in `osdev` is Rust; reusing the same JSON Schema crate end-to-end avoids drift.
+- Borrow-check discipline meshes naturally with the no-shared-mutable-state invariant.
+
+## B.2 Other Languages
+
+The syscall ABI follows System V AMD64. Any language that can produce a freestanding ELF binary and call via that ABI can run as a service.
+
+Plausible second-fits:
+
+- **C** — would need a `sdk/c/` of thin syscall wrappers. Capability handles become opaque integers; the type-safety of the Rust SDK is lost.
+- **Zig** — bare-metal-capable, no runtime, comparable ergonomics to C with better safety. A `sdk/zig/` is a future possibility.
+
+Out of scope:
+
+- **Languages with substantial runtimes** (Go, Python, JavaScript, Java) — would require porting their runtime as a GodspeedOS service. Each is a multi-month project on its own.
+
+## B.3 Shell ≠ Unix Shell
+
+The traditional Unix shell relies on fork, exec, file-descriptor inheritance, ambient stdin/stdout/stderr, environment-variable inheritance, and anonymous pipe sharing. None of those primitives exist in GodspeedOS.
+
+A "shell" in this system is a capability-broker service. It:
+
+- Holds a capability to a console service (keyboard input + display output).
+- Holds the authority to ask the supervisor to spawn other services (via a cap to invoke `supervisor.spawn`).
+- Reads commands and constructs spawn requests, including the explicit caps each child should receive.
+
+This means there is no `stdin`, only an IPC endpoint to a console service. There is no `fork`, only an authenticated request to the supervisor. There is no inherited environment, only the caps the parent explicitly granted.
+
+The full mechanics of how Unix-style scripting maps onto this model — pipes as capability-mediated endpoints, redirection as cap minting, etc. — are explored in Appendix D.
+
+## B.4 Open Question for Later
+
+When real userspace work begins, the first user-facing design decision is **how Unix-flavored the interface should feel** — Genode-style superficial familiarity (`ls /data` works, even though `ls` is a capability-bearing service) versus a fully fresh vocabulary. Either is defensible. Picking deliberately matters because retrofitting later is painful.
+
+Not a v1 decision.
+
+---
+
+# Appendix C: Forward-Looking Vision (Non-Normative)
+
+> **Status:** Non-normative. Records design intent for post-v1 directions. Items may be deferred indefinitely, redesigned, or rejected when their time comes. This appendix does not amend the constitution.
+
+## C.1 `observe` — Native Top/Htop Equivalent
+
+**Tentative timeline:** v2 candidate.
+
+A native introspection tool, distinct from any third-party utility, that surfaces what the system is doing.
+
+The architecture makes this easier than the equivalent on Unix. Per-service state is already structured: caps held, assigned core, memory request/limit, current allocation, IPC queue depths, generation, liveness. The supervisor already knows about every service. The kernel already tracks per-task state.
+
+`observe` would be a service holding capabilities to query the supervisor and a kernel-provided introspection endpoint, formatting the result for display. There is no need to parse a `/proc`-style text interface — the data is already structured.
+
+## C.2 Native Metrics Emission
+
+**Tentative timeline:** v2 / v3 candidate.
+
+The system should emit metrics by default, without requiring third-party agents.
+
+Architectural intent: the kernel emits structured events (IPC volume, cap denials, scheduler statistics, restart events) on a known endpoint. This is a publication, not a feature baked into kernel logic — the kernel does not know what format consumers want. A separate metrics service holds the consuming capability and exports in whatever format is appropriate (Prometheus exposition, OpenTelemetry, statsd, custom).
+
+Constraint: this must not pollute kernel scope. The kernel publishes; the metrics service interprets.
+
+## C.3 Cluster Mode (Single-System-Image)
+
+**Tentative timeline:** multi-year research direction. Not a milestone commitment for any specific version.
+
+The ambition: multiple GodspeedOS instances, possibly identified by a shared token, joining together to act as a single system. Conceptually similar to what k8s does for containers, but at the OS layer: services on any node, IPC across nodes, single namespace.
+
+**Why this is unusually feasible architecturally:**
+
+- Invariant 11 ("identity is stable; location is not") is the design primitive distributed systems are built on.
+- The routing table generalizes cleanly: `EndpointId → CoreId` becomes `EndpointId → (NodeId, CoreId)`.
+- The generation-number mechanism for cross-core revocation extends to cross-node revocation.
+- The absence of POSIX, fork, shared memory, and ambient authority means none of the impossible-to-distribute primitives are baked in. Linux clustering attempts (OpenSSI, MOSIX) all foundered on `mmap`, signals, and inherited file descriptors.
+
+**Why it is still a multi-year project, not a v2 weekend:**
+
+- Synchronous IPC does not survive network latency. Either remote IPC must be a different primitive (loses transparency), or "blocking send" must mean something different cross-node (semantic fork in the API).
+- Cluster membership, leader election, and consensus are real distributed-systems problems (Raft / Paxos territory).
+- Cryptographic capability transfer over a network — caps must remain unforgeable when crossing the wire.
+- Cross-node TCB definition: does the supervisor on node A have authority over services on node B? If yes, a compromised supervisor compromises the cluster. If no, what coordinates restarts?
+- Failure semantics expand: not just node crashes, but network partitions, split-brain, and partial failures.
+
+**Reference points:**
+
+- Plan 9 from Bell Labs achieved network-transparent files and processes 30+ years ago.
+- Barrelfish (Microsoft Research) explored "the OS as a distributed system" via the multikernel model.
+- MOSIX, OpenSSI, LOCUS — Linux/Unix attempts at SSI; useful for understanding what didn't work and why.
+
+The architectural primitives in this constitution are unusually well-suited for revisiting these ideas. Whether and when to attempt it is open.
+
+---
+
+# Appendix D: Shell, Scripting, and Utility Ecosystem (Non-Normative, Far Future)
+
+> **Status:** Non-normative, far-future. Records the design intent for what shell scripting could look like on GodspeedOS, and what porting Unix-style utilities would actually require. This appendix does not amend the constitution.
+
+## D.1 Why This Is Possible
+
+The capability constraints in the constitution do not forbid shell scripting. They reshape what scripting *is* under the hood.
+
+The fundamental abstraction of a shell script is "compose a sequence of commands and feed data between them." Nothing in the constitution forbids that. What changes is how composition happens.
+
+## D.2 Walking Through Bash Primitives
+
+| Bash primitive               | GodspeedOS mapping                                                  |
+|------------------------------|---------------------------------------------------------------------|
+| Sequential (`cmd1; cmd2`)    | Shell calls `supervisor.spawn(cmd1)`, waits, then spawns `cmd2`. Unchanged. |
+| Variables, `if`, `while`     | Entirely shell-internal; never touch the OS. Unchanged.             |
+| Pipes (`cmd1 \| cmd2`)        | Capability-mediated. See D.3.                                       |
+| Redirection (`cmd > file`)   | Shell creates the file via FS, mints a `WRITE` cap, grants to `cmd`. Same UX, different mechanism. |
+| Substitution (`x=$(cmd)`)    | Shell sets up `cmd` with a `SEND` cap to a shell-owned endpoint, captures the output, binds the variable. |
+| Background (`cmd &`)         | Spawn without waiting. Trivial.                                     |
+
+## D.3 The Pipe Pattern
+
+The interesting case is the pipe, because Unix pipes rely on fork and inherited file descriptors — neither of which exists.
+
+In GodspeedOS, `cmd1 | cmd2` becomes:
+
+1. Shell creates a fresh IPC endpoint.
+2. Shell grants `cmd1` a `SEND` cap to that endpoint, via its spawn contract.
+3. Shell grants `cmd2` a `RECV` cap to the same endpoint, via its spawn contract.
+4. `cmd1`'s "stdout" is "send to the cap I was granted."
+5. `cmd2`'s "stdin" is "recv from the cap I was granted."
+
+Pipes still exist. They are capability-mediated rather than fd-mediated.
+
+The user-facing syntax can look exactly familiar:
+
+```
+ls /data | grep .txt > files.list
+```
+
+The shell does more capability brokerage than bash; the user sees the same thing.
+
+## D.4 The Security Upside
+
+Capability-mediated scripting is meaningfully safer than POSIX shell *by construction*.
+
+`rm -rf /` cannot exist on GodspeedOS unless the user (via the shell) explicitly grants the `rm` service a `WRITE` cap to `/`. The shell becomes the deliberate place where authority is decided. It can refuse dangerous compositions, ask for confirmation, or apply policy.
+
+There is no equivalent of "ambient authority leaked through fork-exec and now the wrong process deleted everything."
+
+## D.5 Language Design — Open Question
+
+The script language syntax does not fall out of the architecture. Three plausible directions:
+
+| Direction              | Trade-offs                                                          |
+|------------------------|---------------------------------------------------------------------|
+| POSIX-flavored         | Familiar muscle memory; inherits 50 years of warts (word-splitting, quoting rules, `[` vs `[[`). |
+| Modern shell           | (fish, nushell, oil-inspired) Structured data, better composition, fewer footguns. |
+| Embedded language      | Shell hosts a real language (Lua, Rhai, custom DSL); scripts are programs in that language. |
+
+Likely lean: modern-shell-inspired. POSIX-shell quirks exist for historical reasons that don't apply here.
+
+## D.6 What "Porting" GNU Utilities Would Actually Mean
+
+A common assumption is that supporting Unix-style utilities means "port GNU coreutils." This is misleading.
+
+**It is not a port. It is a rewrite.** GNU coreutils is hundreds of thousands of lines of POSIX-specific C. You cannot recompile it against a new libc and expect it to work, because the underlying primitives don't exist:
+
+- No `fork` / `exec`.
+- No `errno`.
+- No POSIX signals (no `SIGPIPE`, `SIGINT`, `SIGTERM` handlers).
+- No inherited file descriptors.
+- No environment-variable inheritance.
+- No process groups, sessions, or terminal control as POSIX defines them.
+
+Each utility has to be **rewritten** in Rust (or whatever) against the GodspeedOS SDK. Contract per utility. Capabilities for everything it touches. IPC for what it produces and consumes.
+
+**The rewrite is genuinely simpler per-utility, however,** because the OS handles the plumbing that POSIX utilities have to handle themselves:
+
+| GNU `cat` worries about              | GodspeedOS equivalent              |
+|--------------------------------------|------------------------------------|
+| `errno` translation                  | Typed `Result<>` from the SDK      |
+| Signal handlers                      | None needed                        |
+| Permission checks                    | Either you have the cap or you don't |
+| Symlinks, special files              | FS service handles; utility doesn't see them |
+| getopt edge cases                    | Rust argument-parsing crate       |
+| Cross-platform abstraction layers    | Single platform                    |
+| Memory safety                        | Free with Rust                     |
+
+A `cat`-equivalent in GodspeedOS is on the order of 30 lines of Rust. GNU `cat` is hundreds of lines, mostly handling POSIX corner cases that GodspeedOS doesn't have.
+
+## D.7 Realistic Expectations
+
+The GNU community is heavily invested in POSIX. Existing GNU code is unlikely to be ported by its existing maintainers; the architectural mismatch is too large.
+
+A more realistic scenario is a fresh community building a coreutils-equivalent for GodspeedOS from scratch in Rust, motivated by the architecture rather than by carrying forward existing code. The friendliness this appendix describes is friendliness *to the rewrite*, not friendliness to existing C source.
+
+Bash compatibility is explicitly **not on offer**. A shell language that resembles bash superficially but is its own thing underneath is fine; pretending bash scripts will run unmodified would be a lie that bites users later.
+
+## D.8 Why This Belongs in Far-Future Scope
+
+None of this is v1, v2, or v3 work. It is what becomes possible once:
+
+- The kernel and TCB are stable.
+- A real userspace exists (logger, fs, network).
+- A supervisor API for service-initiated spawn (with cap delegation) exists — currently `supervisor.spawn` is supervisor-internal.
+- The userspace community has formed enough to have opinions on what shell language to design.
+
+This appendix exists so that, when that time comes, the design intent is on record and the architectural reasoning is preserved.

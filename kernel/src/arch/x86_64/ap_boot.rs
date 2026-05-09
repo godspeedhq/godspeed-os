@@ -1,44 +1,77 @@
 //! AP (Application Processor) startup — §11.1, §11.2.
 //!
-//! x86 APs start in real mode. The BSP copies a 16-bit trampoline to a
-//! page below 1 MiB and sends INIT+SIPI IPIs. Each AP executes:
-//!   real mode → protected mode → long mode → ap_main(core_id)
-//!
-//! The trampoline page is reclaimed once all APs have called ap_main.
+//! Limine has already run each AP through real mode → long mode and left them
+//! spinning on their `goto_addr` field.  We simply write the entry function
+//! address via `MpInfo::bootstrap` — no INIT+SIPI trampoline required.
 
-/// Page-aligned physical address for the real-mode trampoline (below 1 MiB).
-const TRAMPOLINE_PHYS: u64 = 0x8000;
+use limine::mp::{MpGotoFunction, MpInfo};
 
-/// Send INIT+SIPI IPIs to all non-BSP local APIC IDs.
+/// Start all non-BSP cores and wait for them to reach `mark_ready`.
 ///
-/// Returns the number of APs that successfully called `ap_main` within
-/// the timeout window. If any AP fails to respond, a warning is logged
-/// and startup continues with the available cores (§11.3).
+/// Returns the number of APs that responded within the timeout.
 ///
 /// # Safety
-/// Must be called after BSP APIC init, before any AP-targeted syscall.
+/// Must be called after BSP APIC init, before the BSP enters the scheduler.
 pub unsafe fn start_all_aps(boot_info: &super::BootInfo) -> u32 {
-    // Milestone 6: real-mode trampoline + INIT/SIPI sequence.
-    // For Milestone 1 ap_ids is empty (single BSP), so skip entirely.
     if boot_info.ap_ids.is_empty() {
         return 0;
     }
-    // SAFETY: caller guarantees APIC is initialised.
-    unsafe {
-        install_trampoline();
-        let ap_count = send_sipi_sequence(boot_info);
-        wait_for_aps(ap_count)
+
+    let resp = match super::SMP_REQUEST.response() {
+        Some(r) => r,
+        None => {
+            crate::kprintln!("smp: no SMP response from bootloader");
+            return 0;
+        }
+    };
+
+    let bsp_lapic = resp.bsp_lapic_id;
+
+    // Store BSP's LAPIC ID for core 0.
+    crate::smp::core::set_core_lapic_id(0, bsp_lapic);
+
+    // Assign sequential core IDs to APs (BSP = 0, first AP = 1, …).
+    let mut core_idx: u32 = 1;
+    for cpu in resp.cpus() {
+        if cpu.lapic_id == bsp_lapic {
+            continue;
+        }
+        // Record this AP's LAPIC ID before starting it so `lapic_to_core_id`
+        // works as soon as the AP reads its own LAPIC register.
+        crate::smp::core::set_core_lapic_id(core_idx, cpu.lapic_id);
+        // Pass the assigned core_id via Limine's extra_argument field.
+        // SAFETY: we have exclusive access to the response at this point; APs
+        //         are still spinning and have not read extra_argument yet.
+        cpu.bootstrap(ap_limine_entry as MpGotoFunction, core_idx as u64);
+        core_idx += 1;
     }
+
+    // Wait for all APs to call mark_ready (or timeout after ~200 ms).
+    let expected_ready = boot_info.ap_ids.len() as u32 + 1; // +1 for BSP
+    let mut spins: u64 = 0;
+    while crate::smp::core::ready_count() < expected_ready && spins < 200_000_000 {
+        core::hint::spin_loop();
+        spins += 1;
+    }
+
+    let actual = crate::smp::core::ready_count().saturating_sub(1); // exclude BSP
+    let expected = boot_info.ap_ids.len() as u32;
+    if actual < expected {
+        crate::kprintln!("smp: warning — only {}/{} APs responded", actual, expected);
+    }
+    actual
 }
 
-unsafe fn install_trampoline() {
-    todo!("copy 16-bit trampoline blob to TRAMPOLINE_PHYS; patch in long-mode GDT ptr and ap_main address")
-}
-
-unsafe fn send_sipi_sequence(boot_info: &super::BootInfo) -> u32 {
-    todo!("for each AP APIC ID in boot_info.ap_ids: send INIT, delay, send SIPI twice")
-}
-
-unsafe fn wait_for_aps(expected: u32) -> u32 {
-    todo!("spin until smp::core::ready_count() == expected or 200 ms timeout; log warning for missing APs")
+/// Entry function Limine calls on each AP after long-mode setup.
+///
+/// Limine passes the `MpInfo` pointer for this CPU; we read back the
+/// `core_id` we stored in `extra_argument` before calling `bootstrap`.
+///
+/// # Safety
+/// Called by Limine on each AP; runs before any kernel state is set up
+/// for that core (no stack protection, no IDT, no APIC yet).
+unsafe extern "C" fn ap_limine_entry(info: &MpInfo) -> ! {
+    let core_id = info.extra_argument() as u32;
+    // SAFETY: core_id is valid; this is the standard AP entry path.
+    unsafe { crate::ap_main(core_id) }
 }
