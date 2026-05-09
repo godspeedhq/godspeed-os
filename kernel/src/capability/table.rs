@@ -30,17 +30,32 @@ impl CapTable {
     }
 
     /// Look up and validate a capability by slot index.
-    pub fn get(&self, slot: usize, required_right: Rights) -> Result<&Capability, CapError> {
+    ///
+    /// Returns `Err(CapNotHeld)` if the slot is empty, `Err(EndpointDead)` or
+    /// `Err(CapRevoked)` on a generation mismatch (distinguished by liveness),
+    /// and `Err(CapInsufficientRights)` if the right is absent.
+    pub fn get(&self, slot: usize, required_right: Rights) -> Result<Capability, CapError> {
         let cap = self.slots.get(slot)
             .and_then(|s| s.as_ref())
             .ok_or(CapError::CapNotHeld)?;
 
         // SAFETY: GLOBAL_RESOURCES read under the cap subsystem lock.
-        let current_gen = unsafe { GLOBAL_RESOURCES.current_generation(cap.resource_id) }
+        let record = unsafe { GLOBAL_RESOURCES.get_record(cap.resource_id) }
             .ok_or(CapError::CapNotHeld)?;
 
-        cap.validate(required_right, current_gen)?;
-        Ok(cap)
+        if !cap.generation.matches(record.generation) {
+            return Err(match record.liveness {
+                Liveness::Dead    => CapError::EndpointDead,
+                Liveness::Revoked => CapError::CapRevoked,
+                Liveness::Alive   => CapError::CapRevoked, // gen mismatch with live resource
+            });
+        }
+
+        if !cap.rights.contains(required_right) {
+            return Err(CapError::CapInsufficientRights);
+        }
+
+        Ok(*cap)
     }
 
     /// Insert a capability into the first free slot. Returns the slot index.
@@ -69,6 +84,9 @@ pub struct ResourceRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Liveness {
     Alive,
+    /// Explicitly revoked by the supervisor; returns `CapRevoked` on next use.
+    Revoked,
+    /// Endpoint/service died; returns `EndpointDead` on next use.
     Dead,
 }
 
@@ -87,23 +105,26 @@ impl GlobalResourceTable {
         Self { entries: [EMPTY_ENTRY; 512], len: 0 }
     }
 
-    fn current_generation(&self, id: ResourceId) -> Option<Generation> {
+    fn get_record(&self, id: ResourceId) -> Option<ResourceRecord> {
         self.entries[..self.len]
             .iter()
             .find(|(rid, _)| *rid == id)
-            .map(|(_, r)| r.generation)
+            .map(|(_, r)| *r)
     }
 
-    fn bump_generation(&mut self, id: ResourceId) {
+    fn bump_generation(&mut self, id: ResourceId, liveness: Liveness) {
         if let Some((_, r)) = self.entries[..self.len].iter_mut().find(|(rid, _)| *rid == id) {
             r.generation = r.generation.bump();
-            r.liveness = Liveness::Dead;
+            r.liveness = liveness;
         }
     }
 
     fn register(&mut self, id: ResourceId) {
         assert!(self.len < self.entries.len());
-        self.entries[self.len] = (id, ResourceRecord { generation: Generation::INITIAL, liveness: Liveness::Alive });
+        self.entries[self.len] = (id, ResourceRecord {
+            generation: Generation::INITIAL,
+            liveness: Liveness::Alive,
+        });
         self.len += 1;
     }
 }
@@ -115,12 +136,34 @@ pub fn init_global() {
     // Nothing to do for the placeholder; real init zeros the table.
 }
 
+/// Register a new resource in the global table with generation 0 and liveness Alive.
 pub fn register_resource(id: ResourceId) {
     // SAFETY: serialized by the cap subsystem lock.
     unsafe { GLOBAL_RESOURCES.register(id) }
 }
 
-pub fn bump_resource_generation(id: ResourceId) {
+/// Mint a capability for `id` with the given rights at its current generation.
+/// Panics if the resource is not registered.
+pub fn mint_cap(id: ResourceId, rights: Rights) -> Capability {
+    // SAFETY: read-only path.
+    let record = unsafe { GLOBAL_RESOURCES.get_record(id) }
+        .expect("mint_cap: resource not registered");
+    Capability { resource_id: id, rights, generation: record.generation }
+}
+
+/// Bump generation and mark as Dead (endpoint/service terminated → `EndpointDead`).
+pub fn mark_dead_resource(id: ResourceId) {
     // SAFETY: serialized by the cap subsystem lock.
-    unsafe { GLOBAL_RESOURCES.bump_generation(id) }
+    unsafe { GLOBAL_RESOURCES.bump_generation(id, Liveness::Dead) }
+}
+
+/// Bump generation and mark as Revoked (explicit supervisor revocation → `CapRevoked`).
+pub fn revoke_resource(id: ResourceId) {
+    // SAFETY: serialized by the cap subsystem lock.
+    unsafe { GLOBAL_RESOURCES.bump_generation(id, Liveness::Revoked) }
+}
+
+/// Legacy alias; use `mark_dead_resource` or `revoke_resource` for new code.
+pub fn bump_resource_generation(id: ResourceId) {
+    mark_dead_resource(id)
 }

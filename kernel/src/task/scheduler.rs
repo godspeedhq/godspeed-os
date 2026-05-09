@@ -12,6 +12,9 @@
 use core::mem::MaybeUninit;
 
 use crate::arch::x86_64::context_switch::{switch_context, TaskContext};
+use crate::capability::cap::{CapError, Capability};
+use crate::capability::rights::Rights;
+use crate::capability::table::CapTable;
 use crate::task::state::TaskState;
 
 // ---------------------------------------------------------------------------
@@ -26,6 +29,8 @@ const IDLE: usize = MAX_TASKS;
 // Split into parallel arrays so we can take a raw pointer to one context
 // without conflicting with a mutable borrow on another.
 static mut TASK_CTX:   [MaybeUninit<TaskContext>; MAX_TASKS] =
+    [const { MaybeUninit::uninit() }; MAX_TASKS];
+static mut TASK_CAP:   [MaybeUninit<CapTable>; MAX_TASKS] =
     [const { MaybeUninit::uninit() }; MAX_TASKS];
 static mut TASK_STATE: [TaskState; MAX_TASKS]  = [TaskState::Dead; MAX_TASKS];
 static mut TASK_NAME:  [&str; MAX_TASKS]       = [""; MAX_TASKS];
@@ -46,12 +51,13 @@ static mut SCHED_CTX: TaskContext = TaskContext {
 // ---------------------------------------------------------------------------
 
 /// Add a task to the run queue.  Called before preemption is enabled.
-pub fn enqueue(name: &'static str, ctx: TaskContext) {
+pub fn enqueue(name: &'static str, ctx: TaskContext, caps: CapTable) {
     // SAFETY: single-core, called before timer is armed.
     unsafe {
         for i in 0..MAX_TASKS {
             if !TASK_VALID[i] {
                 TASK_CTX[i].write(ctx);
+                TASK_CAP[i].write(caps);
                 TASK_STATE[i] = TaskState::Ready;
                 TASK_NAME[i]  = name;
                 TASK_VALID[i] = true;
@@ -60,6 +66,47 @@ pub fn enqueue(name: &'static str, ctx: TaskContext) {
             }
         }
         panic!("scheduler: run queue full");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-task capability access — used by syscall dispatch (§8.2, §7.5).
+// ---------------------------------------------------------------------------
+
+/// Validate and return a copy of the capability at `slot` in the current
+/// task's table. Returns the appropriate `CapError` on any failure.
+pub fn current_task_lookup_cap(slot: usize, right: Rights) -> Result<Capability, CapError> {
+    // SAFETY: IF=0 in syscall context; CURRENT is stable for this core.
+    unsafe {
+        if CURRENT < MAX_TASKS && TASK_VALID[CURRENT] {
+            TASK_CAP[CURRENT].assume_init_ref().get(slot, right)
+        } else {
+            Err(CapError::CapNotHeld)
+        }
+    }
+}
+
+/// Remove the capability at `slot` from the current task's table (GRANT transfer).
+pub fn current_task_remove_cap(slot: usize) -> Option<Capability> {
+    // SAFETY: IF=0; CURRENT stable.
+    unsafe {
+        if CURRENT < MAX_TASKS && TASK_VALID[CURRENT] {
+            TASK_CAP[CURRENT].assume_init_mut().remove(slot)
+        } else {
+            None
+        }
+    }
+}
+
+/// Insert a capability into the current task's table (incoming GRANT).
+pub fn current_task_insert_cap(cap: Capability) -> Result<usize, CapError> {
+    // SAFETY: IF=0; CURRENT stable.
+    unsafe {
+        if CURRENT < MAX_TASKS && TASK_VALID[CURRENT] {
+            TASK_CAP[CURRENT].assume_init_mut().insert(cap)
+        } else {
+            Err(CapError::CapNotHeld)
+        }
     }
 }
 

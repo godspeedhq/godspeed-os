@@ -8,14 +8,14 @@
 //! Only the supervisor holds the `REVOKE` right (§7.4).
 
 use super::cap::ResourceId;
-use super::table::bump_resource_generation;
+use super::table::revoke_resource;
 
 /// Revoke all outstanding capabilities to `resource`.
 ///
-/// The operation is a single generation bump. Outstanding caps are not
-/// deleted from remote tasks' tables — they become stale and fail on
-/// next use. This is intentional: lazy invalidation avoids cross-core
-/// table writes and is safe because the generation check is atomic.
+/// Bumps the generation and marks liveness as `Revoked` so that the next
+/// use of any stale cap returns `CapRevoked` (not `EndpointDead`).
+/// Outstanding caps are not deleted from remote tasks' tables — lazy
+/// invalidation is safe because the generation check is atomic (§7.5).
 pub fn revoke(resource: ResourceId) {
-    bump_resource_generation(resource);
+    revoke_resource(resource);
 }

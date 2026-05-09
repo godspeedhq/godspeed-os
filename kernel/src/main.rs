@@ -26,7 +26,7 @@ struct KernelStack([u8; 16 * 1024]);
 static mut STACK_A: KernelStack = KernelStack([0; 16 * 1024]);
 static mut STACK_B: KernelStack = KernelStack([0; 16 * 1024]);
 
-/// Demo task A: counts iterations and prints every ~1 M loops.
+/// Demo task A: counts iterations and prints every ~5 M loops.
 unsafe extern "C" fn task_a() -> ! {
     let mut n: u64 = 0;
     loop {
@@ -37,7 +37,7 @@ unsafe extern "C" fn task_a() -> ! {
     }
 }
 
-/// Demo task B: counts iterations and prints every ~1 M loops.
+/// Demo task B: counts iterations and prints every ~5 M loops.
 unsafe extern "C" fn task_b() -> ! {
     let mut n: u64 = 0;
     loop {
@@ -46,6 +46,112 @@ unsafe extern "C" fn task_b() -> ! {
             kprintln!("task-b: {}", n / 5_000_000);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Capability enforcement demo — Milestone 4.
+// ---------------------------------------------------------------------------
+
+/// Demonstrate and validate the capability enforcement machinery (§22 Test 2).
+///
+/// Runs synchronously before the scheduler starts so the assertions fire
+/// loudly and early if the invariants are broken.
+fn test_cap_enforcement() {
+    use capability::{
+        CapError, Rights, LOG_WRITE_RESOURCE,
+        mint_cap, mark_dead_resource, revoke_resource, register_resource, ResourceId,
+    };
+    use capability::table::CapTable;
+
+    kprintln!("cap-test: starting capability enforcement tests");
+
+    // --- Test 2A: task with cap can validate it ---------------------
+    let mut tbl = CapTable::empty();
+    let cap = mint_cap(LOG_WRITE_RESOURCE, Rights::WRITE);
+    let slot = tbl.insert(cap).expect("insert");
+
+    match tbl.get(slot, Rights::WRITE) {
+        Ok(c) => {
+            assert_eq!(c.resource_id, LOG_WRITE_RESOURCE);
+            kprintln!("cap-test: 2A pass — held cap validates OK");
+        }
+        Err(e) => panic!("cap-test: 2A FAIL — expected Ok, got {:?}", e),
+    }
+
+    // --- Test 2B: task without cap returns CapNotHeld ---------------
+    let empty = CapTable::empty();
+    match empty.get(0, Rights::WRITE) {
+        Err(CapError::CapNotHeld) =>
+            kprintln!("cap-test: 2B pass — no cap returns CapNotHeld"),
+        other =>
+            panic!("cap-test: 2B FAIL — expected CapNotHeld, got {:?}", other),
+    }
+
+    // --- Test 2C: insufficient rights returns CapInsufficientRights -
+    let read_only_cap = mint_cap(LOG_WRITE_RESOURCE, Rights::READ);
+    let mut tbl2 = CapTable::empty();
+    let slot2 = tbl2.insert(read_only_cap).expect("insert");
+    match tbl2.get(slot2, Rights::WRITE) {
+        Err(CapError::CapInsufficientRights) =>
+            kprintln!("cap-test: 2C pass — wrong right returns CapInsufficientRights"),
+        other =>
+            panic!("cap-test: 2C FAIL — expected CapInsufficientRights, got {:?}", other),
+    }
+
+    // --- Test: generation bump → CapRevoked -------------------------
+    // Use a fresh resource so we don't disturb LOG_WRITE_RESOURCE (gen 0 forever).
+    let tmp_res = ResourceId(0xDEAD);
+    register_resource(tmp_res);
+    let tmp_cap = mint_cap(tmp_res, Rights::WRITE);
+    let mut tbl3 = CapTable::empty();
+    let slot3 = tbl3.insert(tmp_cap).expect("insert");
+
+    // Validate OK before bump.
+    assert!(tbl3.get(slot3, Rights::WRITE).is_ok(), "pre-bump should succeed");
+
+    // Explicit revocation → CapRevoked.
+    revoke_resource(tmp_res);
+    match tbl3.get(slot3, Rights::WRITE) {
+        Err(CapError::CapRevoked) =>
+            kprintln!("cap-test: revoke pass — stale cap returns CapRevoked"),
+        other =>
+            panic!("cap-test: revoke FAIL — expected CapRevoked, got {:?}", other),
+    }
+
+    // --- Test: endpoint death → EndpointDead ------------------------
+    let dead_res = ResourceId(0xDEAF);
+    register_resource(dead_res);
+    let dead_cap = mint_cap(dead_res, Rights::SEND);
+    let mut tbl4 = CapTable::empty();
+    let slot4 = tbl4.insert(dead_cap).expect("insert");
+
+    mark_dead_resource(dead_res);
+    match tbl4.get(slot4, Rights::SEND) {
+        Err(CapError::EndpointDead) =>
+            kprintln!("cap-test: endpoint-dead pass — dead endpoint returns EndpointDead"),
+        other =>
+            panic!("cap-test: endpoint-dead FAIL — expected EndpointDead, got {:?}", other),
+    }
+
+    // --- Test: GRANT transfer moves cap exactly once ----------------
+    let grant_res = ResourceId(0xABCD);
+    register_resource(grant_res);
+    let grantable = mint_cap(grant_res, Rights::READ | Rights::GRANT);
+    let mut sender = CapTable::empty();
+    let s_slot = sender.insert(grantable).expect("insert");
+
+    // Remove from sender (simulating the GRANT transfer).
+    let transferred = sender.remove(s_slot).expect("remove");
+    assert_eq!(sender.get(s_slot, Rights::READ), Err(CapError::CapNotHeld),
+               "cap must be gone from sender after transfer");
+
+    let mut receiver = CapTable::empty();
+    let r_slot = receiver.insert(transferred).expect("insert into receiver");
+    assert!(receiver.get(r_slot, Rights::READ).is_ok(),
+            "cap must be valid in receiver after transfer");
+    kprintln!("cap-test: grant pass — cap moved exactly once, sender empty");
+
+    kprintln!("cap-test: all tests passed");
 }
 
 // ---------------------------------------------------------------------------
@@ -76,6 +182,9 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
 
     kprintln!("kernel: all cores ready");
 
+    // Run the synchronous capability enforcement test before scheduling starts.
+    test_cap_enforcement();
+
     // Enqueue two demo tasks that prove round-robin preemption works (§22 Test 8).
     let cr3: u64;
     // SAFETY: reading CR3 is always valid in ring 0.
@@ -96,8 +205,14 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
         )
     };
 
-    task::scheduler::enqueue("task-a", ctx_a);
-    task::scheduler::enqueue("task-b", ctx_b);
+    // task-a gets a log_write cap; task-b gets an empty table.
+    // This directly encodes §22 Test 2 (cap enforcement) at the task level.
+    let mut caps_a = capability::CapTable::empty();
+    let log_cap = capability::mint_cap(capability::LOG_WRITE_RESOURCE, capability::Rights::WRITE);
+    caps_a.insert(log_cap).expect("enqueue caps_a");
+
+    task::scheduler::enqueue("task-a", ctx_a, caps_a);
+    task::scheduler::enqueue("task-b", ctx_b, capability::CapTable::empty());
 
     kprintln!("scheduler: task-a and task-b enqueued");
 
