@@ -71,6 +71,7 @@ struct TableDescriptor {
 static mut APIC_VIRT_BASE: u64 = 0;
 
 // APIC register offsets (xAPIC MMIO, 32-bit accesses).
+const APIC_ID:           u64 = 0x020;
 const APIC_EOI:          u64 = 0x0B0;
 const APIC_SPURIOUS:     u64 = 0x0F0;
 const APIC_LVT_TIMER:    u64 = 0x320;
@@ -158,6 +159,27 @@ pub unsafe fn init_local_apic() {
 pub unsafe fn apic_send_eoi() {
     // SAFETY: APIC_VIRT_BASE is valid after init_local_apic; write 0 to EOI reg.
     unsafe { write_apic(APIC_VIRT_BASE, APIC_EOI, 0) };
+}
+
+/// Return the virtual base address of this core's local APIC.
+///
+/// # Safety
+/// Valid only after `init_local_apic` has been called on this core.
+pub unsafe fn get_apic_virt_base() -> u64 {
+    // SAFETY: APIC_VIRT_BASE is set in init_local_apic before any use.
+    unsafe { APIC_VIRT_BASE }
+}
+
+/// Read the local APIC ID register and return the ID (bits 31:24).
+///
+/// # Safety
+/// Valid only after `init_local_apic` has been called on this core.
+pub unsafe fn get_lapic_id() -> u32 {
+    // SAFETY: APIC_VIRT_BASE is set in init_local_apic; read_volatile is safe for MMIO.
+    unsafe {
+        let val = ((APIC_VIRT_BASE + APIC_ID) as *const u32).read_volatile();
+        (val >> 24) & 0xFF
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -255,7 +277,12 @@ pub(super) unsafe fn init_gdt() {
 /// Install ISR stubs in all 256 IDT slots, then load the IDT.
 ///
 /// - All vectors default to `exception_halt`.
-/// - Vector 32 is overridden with `timer_isr_stub` (§9.1 preemption timer).
+/// - Vector 13  → GPF diagnostic handler (prints error + RIP, halts).
+/// - Vector 14  → Page-fault diagnostic handler (prints CR2 + error, halts).
+/// - Vector 32  → APIC timer preemption (§9.1).
+/// - Vector 0xF0 → WAKE_RECEIVER IPI.
+/// - Vector 0xF1 → TLB_SHOOTDOWN IPI.
+/// - Vector 0xF2 → SCHEDULER_TICK IPI.
 ///
 /// # Safety
 /// Must be called after `init_gdt` (entries reference the kernel CS = 0x08).
@@ -268,7 +295,12 @@ pub(super) unsafe fn init_idt() {
         for entry in IDT.iter_mut() {
             *entry = IdtEntry::new(halt);
         }
-        IDT[32] = IdtEntry::new(timer);  // APIC timer → preemption
+        IDT[13]   = IdtEntry::new(gpf_stub  as u64);
+        IDT[14]   = IdtEntry::new(pf_stub   as u64);
+        IDT[32]   = IdtEntry::new(timer);
+        IDT[0xF0] = IdtEntry::new(ipi_wake_stub   as u64);
+        IDT[0xF1] = IdtEntry::new(ipi_tlb_stub    as u64);
+        IDT[0xF2] = IdtEntry::new(ipi_tick_stub   as u64);
 
         let desc = TableDescriptor {
             limit: (core::mem::size_of_val(&IDT) - 1) as u16,
@@ -282,8 +314,126 @@ pub(super) unsafe fn init_idt() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// IPI ISR stubs (§9.4) — one naked stub per vector.
+// ---------------------------------------------------------------------------
+
+/// Dispatch target called from all three IPI stubs with the vector number.
+///
+/// # Safety
+/// Called from raw interrupt context (IF=0).
+#[no_mangle]
+unsafe extern "C" fn ipi_dispatch(vector: u64) {
+    // SAFETY: called from raw ISR with IF=0; ipi_handler is safe to call here.
+    unsafe { crate::smp::ipi::ipi_handler(vector as u8) }
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn ipi_wake_stub() {
+    core::arch::naked_asm!(
+        "push rax", "push rcx", "push rdx",
+        "push rdi", "push rsi", "push r8",
+        "push r9",  "push r10", "push r11",
+        "mov rdi, 0xF0",
+        "call ipi_dispatch",
+        "pop r11", "pop r10", "pop r9",
+        "pop r8",  "pop rsi", "pop rdi",
+        "pop rdx", "pop rcx", "pop rax",
+        "iretq",
+    )
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn ipi_tlb_stub() {
+    core::arch::naked_asm!(
+        "push rax", "push rcx", "push rdx",
+        "push rdi", "push rsi", "push r8",
+        "push r9",  "push r10", "push r11",
+        "mov rdi, 0xF1",
+        "call ipi_dispatch",
+        "pop r11", "pop r10", "pop r9",
+        "pop r8",  "pop rsi", "pop rdi",
+        "pop rdx", "pop rcx", "pop rax",
+        "iretq",
+    )
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn ipi_tick_stub() {
+    core::arch::naked_asm!(
+        "push rax", "push rcx", "push rdx",
+        "push rdi", "push rsi", "push r8",
+        "push r9",  "push r10", "push r11",
+        "mov rdi, 0xF2",
+        "call ipi_dispatch",
+        "pop r11", "pop r10", "pop r9",
+        "pop r8",  "pop rsi", "pop rdi",
+        "pop rdx", "pop rcx", "pop rax",
+        "iretq",
+    )
+}
+
 /// No-op: Limine sets up identity-mapped paging before calling _start.
 unsafe fn init_paging(_boot_info: &BootInfo) {}
+
+// ---------------------------------------------------------------------------
+// Diagnostic exception stubs — vectors 13 (GPF) and 14 (#PF).
+//
+// Both exceptions push an error code before RIP on the stack, so on entry:
+//   [RSP+0]  = error_code
+//   [RSP+8]  = saved RIP (fault address)
+//   [RSP+16] = saved CS
+//   ...
+// ---------------------------------------------------------------------------
+
+/// GPF stub: read error code + RIP, call diagnostic handler.
+#[unsafe(naked)]
+unsafe extern "C" fn gpf_stub() -> ! {
+    // SAFETY: vector 13 pushes error_code then RIP; reads are before any RSP change.
+    core::arch::naked_asm!(
+        "mov rdi, [rsp]",      // error_code → first arg
+        "mov rsi, [rsp + 8]",  // saved RIP  → second arg
+        "call gpf_handler",
+        "2: hlt",
+        "jmp 2b",
+    )
+}
+
+/// Page-fault stub: read error code + RIP, call diagnostic handler.
+#[unsafe(naked)]
+unsafe extern "C" fn pf_stub() -> ! {
+    // SAFETY: vector 14 pushes error_code then RIP.
+    core::arch::naked_asm!(
+        "mov rdi, [rsp]",      // error_code → first arg
+        "mov rsi, [rsp + 8]",  // saved RIP  → second arg
+        "call pf_handler",
+        "2: hlt",
+        "jmp 2b",
+    )
+}
+
+/// Print GPF info and halt all cores.
+#[no_mangle]
+unsafe extern "C" fn gpf_handler(error_code: u64, fault_rip: u64) -> ! {
+    crate::kprintln!(
+        "KERNEL GPF: error_code={:#x} rip={:#x}",
+        error_code, fault_rip
+    );
+    crate::arch::x86_64::halt_all_cores()
+}
+
+/// Print page-fault info and halt all cores.
+#[no_mangle]
+unsafe extern "C" fn pf_handler(error_code: u64, fault_rip: u64) -> ! {
+    let cr2: u64;
+    // SAFETY: reading CR2 in ring 0 is always valid.
+    unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem)) };
+    crate::kprintln!(
+        "KERNEL PF: fault_addr={:#x} error_code={:#x} rip={:#x}",
+        cr2, error_code, fault_rip
+    );
+    crate::arch::x86_64::halt_all_cores()
+}
 
 // ---------------------------------------------------------------------------
 // Exception stub — all unhandled vectors point here.

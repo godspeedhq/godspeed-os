@@ -19,11 +19,13 @@ use core::panic::PanicInfo;
 // in Milestone 7.
 // ---------------------------------------------------------------------------
 
+// 64 KiB per task: Message is 4208 bytes; a single recv loop iteration puts
+// ~5 KiB on the stack (Message copy + call chain), so 16 KiB overflows.
 #[repr(C, align(16))]
-struct KernelStack([u8; 16 * 1024]);
+struct KernelStack([u8; 64 * 1024]);
 
-static mut STACK_PING: KernelStack = KernelStack([0; 16 * 1024]);
-static mut STACK_PONG: KernelStack = KernelStack([0; 16 * 1024]);
+static mut STACK_PING: KernelStack = KernelStack([0; 64 * 1024]);
+static mut STACK_PONG: KernelStack = KernelStack([0; 64 * 1024]);
 
 // ---------------------------------------------------------------------------
 // IPC demo endpoint constants — Milestone 5.
@@ -40,31 +42,33 @@ const IPC_CAP_SLOT: u64 = 1;
 // IPC demo tasks — Milestone 5.
 // ---------------------------------------------------------------------------
 
-/// Sender: builds an 8-byte counter message and calls `send` every iteration.
+/// Sender: loops, building an 8-byte counter message and calling `send`.
+/// Prints every 100th send so the log remains readable without flooding.
 unsafe extern "C" fn task_ping() -> ! {
     let mut n: u64 = 0;
     loop {
         n = n.wrapping_add(1);
         let bytes = n.to_le_bytes();
         let r = crate::syscall::dispatch::syscall_handler(
-            1,                       // SyscallNumber::Send
-            IPC_CAP_SLOT,            // cap_slot = 1 (SEND cap)
+            1,            // SyscallNumber::Send
+            IPC_CAP_SLOT,
             bytes.as_ptr() as u64,
             8,
         );
-        if r == 0 {
+        if r == 0 && n % 100 == 0 {
             kprintln!("ping: sent {}", n);
         }
-        // On error (shouldn't occur in normal operation), just keep trying.
     }
 }
 
-/// Receiver: calls `recv` (blocking) and prints each message counter.
+/// Receiver: calls `recv` (blocking) and prints every 100th received counter.
 unsafe extern "C" fn task_pong() -> ! {
+    kprintln!("pong: task started");
+    let mut count: u64 = 0;
     loop {
         let r = crate::syscall::dispatch::syscall_handler(
-            2,           // SyscallNumber::Recv
-            IPC_CAP_SLOT, // cap_slot = 1 (RECV cap)
+            2,            // SyscallNumber::Recv
+            IPC_CAP_SLOT,
             0, 0,
         );
         if r == 0 {
@@ -73,7 +77,10 @@ unsafe extern "C" fn task_pong() -> ! {
                     let mut arr = [0u8; 8];
                     arr.copy_from_slice(&msg.payload[..8]);
                     let n = u64::from_le_bytes(arr);
-                    kprintln!("pong: received {}", n);
+                    count = count.wrapping_add(1);
+                    if count % 100 == 0 {
+                        kprintln!("pong: received {} (total {})", n, count);
+                    }
                 }
             }
         }
@@ -98,13 +105,13 @@ fn test_ipc_routing() {
 
     // --- enqueue on empty queue returns Ok(None) (no blocked receiver) ----
     let msg = ipc::Message::new(b"hello").expect("msg");
-    match ipc::routing::enqueue(ep, msg, Generation::INITIAL) {
+    match ipc::routing::enqueue(ep, msg, Generation::INITIAL, None) {
         Ok(None) => kprintln!("ipc-test: enqueue ok — message queued"),
         other    => panic!("ipc-test: enqueue unexpected: {:?}", other),
     }
 
     // --- dequeue returns the message ----------------------------------------
-    match ipc::routing::dequeue(ep, Generation::INITIAL) {
+    match ipc::routing::dequeue(ep, Generation::INITIAL, None) {
         Ok((m, None)) => {
             assert_eq!(m.payload_bytes(), b"hello", "payload mismatch");
             kprintln!("ipc-test: dequeue ok — received 'hello'");
@@ -113,7 +120,7 @@ fn test_ipc_routing() {
     }
 
     // --- dequeue on empty queue returns QueueEmpty --------------------------
-    match ipc::routing::dequeue(ep, Generation::INITIAL) {
+    match ipc::routing::dequeue(ep, Generation::INITIAL, None) {
         Err(IpcError::QueueEmpty) => kprintln!("ipc-test: queue-empty ok"),
         other => panic!("ipc-test: expected QueueEmpty, got: {:?}", other),
     }
@@ -121,10 +128,10 @@ fn test_ipc_routing() {
     // --- fill to capacity (16 messages) then assert QueueFull ---------------
     for i in 0u8..16 {
         let m = ipc::Message::new(&[i]).expect("fill");
-        ipc::routing::enqueue(ep, m, Generation::INITIAL).expect("fill enqueue");
+        ipc::routing::enqueue(ep, m, Generation::INITIAL, None).expect("fill enqueue");
     }
     let overflow = ipc::Message::new(b"overflow").expect("overflow");
-    match ipc::routing::enqueue(ep, overflow, Generation::INITIAL) {
+    match ipc::routing::enqueue(ep, overflow, Generation::INITIAL, None) {
         Err(IpcError::QueueFull) =>
             kprintln!("ipc-test: queue-full ok — QueueFull after 16 msgs"),
         other => panic!("ipc-test: expected QueueFull, got: {:?}", other),
@@ -135,7 +142,7 @@ fn test_ipc_routing() {
     ipc::routing::register(ep2, 0, Generation::INITIAL);
     ipc::routing::kill_endpoint(ep2);
     let m2 = ipc::Message::new(b"dead").expect("m2");
-    match ipc::routing::enqueue(ep2, m2, Generation::INITIAL) {
+    match ipc::routing::enqueue(ep2, m2, Generation::INITIAL, None) {
         Err(IpcError::EndpointDead) =>
             kprintln!("ipc-test: endpoint-dead ok — EndpointDead after kill"),
         other => panic!("ipc-test: expected EndpointDead, got: {:?}", other),
@@ -260,13 +267,7 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     // SAFETY: bootloader guarantees boot_info_ptr is valid and aligned.
     let boot_info = unsafe { &*boot_info_ptr };
 
-    // SAFETY: debug probe — port 0xe9 is QEMU debug console.
-    unsafe { core::arch::asm!("out 0xe9, al", in("al") b'M', options(nostack, nomem)) };
-
     arch::x86_64::init(boot_info);
-
-    unsafe { core::arch::asm!("out 0xe9, al", in("al") b'G', options(nostack, nomem)) };
-
     memory::init(boot_info);
 
     // Program the APIC timer now that HHDM offset is available (§9.1).
@@ -274,21 +275,19 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
 
     capability::init();
     ipc::init();
-    smp::init(boot_info);
 
-    kprintln!("kernel: all cores ready");
-
-    // Synchronous tests (no scheduler running yet).
+    // Synchronous tests (no scheduler running yet, single-core still).
     test_cap_enforcement();
     test_ipc_routing();
 
-    // --- Set up the IPC demo endpoint (Milestone 5) -------------------------
+    // --- Set up the IPC demo endpoint (Milestone 6) -------------------------
     // Register the endpoint resource in the cap subsystem so caps can be minted.
     capability::register_resource(PONG_RESOURCE_ID);
-    // Register the endpoint in the routing table on core 0.
+    // pong lives on core 1 — register the endpoint there so the routing table
+    // routes cross-core sends to the right queue.
     ipc::routing::register(
         PONG_ENDPOINT_ID,
-        0,
+        1,
         capability::generation::Generation::INITIAL,
     );
 
@@ -328,13 +327,19 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
         )
     };
 
-    task::scheduler::enqueue("ping", ctx_ping, caps_ping);
-    task::scheduler::enqueue("pong", ctx_pong, caps_pong);
+    // ping on core 0 (BSP), pong on core 1 (first AP) — cross-core IPC demo.
+    task::scheduler::enqueue("ping", ctx_ping, caps_ping, 0);
+    task::scheduler::enqueue("pong", ctx_pong, caps_pong, 1);
 
-    kprintln!("scheduler: ping and pong enqueued");
+    kprintln!("scheduler: ping (core 0) and pong (core 1) enqueued");
 
-    // BSP enters the scheduler; never returns.
-    task::scheduler::run()
+    // Start APs after tasks are enqueued so each AP finds its tasks immediately.
+    smp::init(boot_info);
+
+    kprintln!("kernel: {} cores ready", smp::core::ready_count());
+
+    // BSP enters the per-core scheduler on core 0; never returns.
+    task::scheduler::run(0)
 }
 
 /// AP entry point — called by each secondary core after long-mode setup.
@@ -342,7 +347,7 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
 pub extern "C" fn ap_main(core_id: u32) -> ! {
     arch::x86_64::ap_init(core_id);
     smp::core::mark_ready(core_id);
-    task::scheduler::run()
+    task::scheduler::run(core_id)
 }
 
 #[panic_handler]
