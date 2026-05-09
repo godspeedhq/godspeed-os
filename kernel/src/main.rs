@@ -15,37 +15,133 @@ mod task;
 use core::panic::PanicInfo;
 
 // ---------------------------------------------------------------------------
-// Demo task stacks — Milestone 3.
-// 16-byte aligned wrappers so the initial RSP is properly aligned.
-// Replaced by frame-allocator stacks in Milestone 7.
+// Kernel-task stacks — 16-byte aligned; replaced by frame-allocator stacks
+// in Milestone 7.
 // ---------------------------------------------------------------------------
 
 #[repr(C, align(16))]
 struct KernelStack([u8; 16 * 1024]);
 
-static mut STACK_A: KernelStack = KernelStack([0; 16 * 1024]);
-static mut STACK_B: KernelStack = KernelStack([0; 16 * 1024]);
+static mut STACK_PING: KernelStack = KernelStack([0; 16 * 1024]);
+static mut STACK_PONG: KernelStack = KernelStack([0; 16 * 1024]);
 
-/// Demo task A: counts iterations and prints every ~5 M loops.
-unsafe extern "C" fn task_a() -> ! {
+// ---------------------------------------------------------------------------
+// IPC demo endpoint constants — Milestone 5.
+// ---------------------------------------------------------------------------
+
+/// ResourceId / EndpointId shared value for the ping→pong endpoint.
+/// Must not overlap with LOG_WRITE_RESOURCE (1) or any test resource.
+const PONG_RESOURCE_ID: capability::cap::ResourceId = capability::cap::ResourceId(200);
+const PONG_ENDPOINT_ID: ipc::endpoint::EndpointId   = ipc::endpoint::EndpointId(200);
+/// Cap-table slot for the IPC endpoint cap (slot 0 = log_write).
+const IPC_CAP_SLOT: u64 = 1;
+
+// ---------------------------------------------------------------------------
+// IPC demo tasks — Milestone 5.
+// ---------------------------------------------------------------------------
+
+/// Sender: builds an 8-byte counter message and calls `send` every iteration.
+unsafe extern "C" fn task_ping() -> ! {
     let mut n: u64 = 0;
     loop {
         n = n.wrapping_add(1);
-        if n % 5_000_000 == 0 {
-            kprintln!("task-a: {}", n / 5_000_000);
+        let bytes = n.to_le_bytes();
+        let r = crate::syscall::dispatch::syscall_handler(
+            1,                       // SyscallNumber::Send
+            IPC_CAP_SLOT,            // cap_slot = 1 (SEND cap)
+            bytes.as_ptr() as u64,
+            8,
+        );
+        if r == 0 {
+            kprintln!("ping: sent {}", n);
+        }
+        // On error (shouldn't occur in normal operation), just keep trying.
+    }
+}
+
+/// Receiver: calls `recv` (blocking) and prints each message counter.
+unsafe extern "C" fn task_pong() -> ! {
+    loop {
+        let r = crate::syscall::dispatch::syscall_handler(
+            2,           // SyscallNumber::Recv
+            IPC_CAP_SLOT, // cap_slot = 1 (RECV cap)
+            0, 0,
+        );
+        if r == 0 {
+            if let Some(msg) = crate::task::scheduler::take_recv_message() {
+                if msg.payload_len == 8 {
+                    let mut arr = [0u8; 8];
+                    arr.copy_from_slice(&msg.payload[..8]);
+                    let n = u64::from_le_bytes(arr);
+                    kprintln!("pong: received {}", n);
+                }
+            }
         }
     }
 }
 
-/// Demo task B: counts iterations and prints every ~5 M loops.
-unsafe extern "C" fn task_b() -> ! {
-    let mut n: u64 = 0;
-    loop {
-        n = n.wrapping_add(1);
-        if n % 5_000_000 == 0 {
-            kprintln!("task-b: {}", n / 5_000_000);
-        }
+// ---------------------------------------------------------------------------
+// IPC routing table tests — Milestone 5 (synchronous, before scheduler).
+// Tests the routing mechanics without blocking (no tasks yet).
+// ---------------------------------------------------------------------------
+
+fn test_ipc_routing() {
+    use ipc::endpoint::EndpointId;
+    use ipc::message::IpcError;
+    use capability::generation::Generation;
+
+    kprintln!("ipc-test: starting routing table tests");
+
+    // Use a scratch endpoint that won't interfere with the demo endpoint (200).
+    let ep = EndpointId(999);
+    ipc::routing::register(ep, 0, Generation::INITIAL);
+
+    // --- enqueue on empty queue returns Ok(None) (no blocked receiver) ----
+    let msg = ipc::Message::new(b"hello").expect("msg");
+    match ipc::routing::enqueue(ep, msg, Generation::INITIAL) {
+        Ok(None) => kprintln!("ipc-test: enqueue ok — message queued"),
+        other    => panic!("ipc-test: enqueue unexpected: {:?}", other),
     }
+
+    // --- dequeue returns the message ----------------------------------------
+    match ipc::routing::dequeue(ep, Generation::INITIAL) {
+        Ok((m, None)) => {
+            assert_eq!(m.payload_bytes(), b"hello", "payload mismatch");
+            kprintln!("ipc-test: dequeue ok — received 'hello'");
+        }
+        other => panic!("ipc-test: dequeue unexpected: {:?}", other),
+    }
+
+    // --- dequeue on empty queue returns QueueEmpty --------------------------
+    match ipc::routing::dequeue(ep, Generation::INITIAL) {
+        Err(IpcError::QueueEmpty) => kprintln!("ipc-test: queue-empty ok"),
+        other => panic!("ipc-test: expected QueueEmpty, got: {:?}", other),
+    }
+
+    // --- fill to capacity (16 messages) then assert QueueFull ---------------
+    for i in 0u8..16 {
+        let m = ipc::Message::new(&[i]).expect("fill");
+        ipc::routing::enqueue(ep, m, Generation::INITIAL).expect("fill enqueue");
+    }
+    let overflow = ipc::Message::new(b"overflow").expect("overflow");
+    match ipc::routing::enqueue(ep, overflow, Generation::INITIAL) {
+        Err(IpcError::QueueFull) =>
+            kprintln!("ipc-test: queue-full ok — QueueFull after 16 msgs"),
+        other => panic!("ipc-test: expected QueueFull, got: {:?}", other),
+    }
+
+    // --- kill_endpoint → EndpointDead on next send --------------------------
+    let ep2 = EndpointId(998);
+    ipc::routing::register(ep2, 0, Generation::INITIAL);
+    ipc::routing::kill_endpoint(ep2);
+    let m2 = ipc::Message::new(b"dead").expect("m2");
+    match ipc::routing::enqueue(ep2, m2, Generation::INITIAL) {
+        Err(IpcError::EndpointDead) =>
+            kprintln!("ipc-test: endpoint-dead ok — EndpointDead after kill"),
+        other => panic!("ipc-test: expected EndpointDead, got: {:?}", other),
+    }
+
+    kprintln!("ipc-test: all routing tests passed");
 }
 
 // ---------------------------------------------------------------------------
@@ -182,39 +278,60 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
 
     kprintln!("kernel: all cores ready");
 
-    // Run the synchronous capability enforcement test before scheduling starts.
+    // Synchronous tests (no scheduler running yet).
     test_cap_enforcement();
+    test_ipc_routing();
 
-    // Enqueue two demo tasks that prove round-robin preemption works (§22 Test 8).
-    let cr3: u64;
+    // --- Set up the IPC demo endpoint (Milestone 5) -------------------------
+    // Register the endpoint resource in the cap subsystem so caps can be minted.
+    capability::register_resource(PONG_RESOURCE_ID);
+    // Register the endpoint in the routing table on core 0.
+    ipc::routing::register(
+        PONG_ENDPOINT_ID,
+        0,
+        capability::generation::Generation::INITIAL,
+    );
+
     // SAFETY: reading CR3 is always valid in ring 0.
+    let cr3: u64;
     unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem)) };
 
-    let ctx_a = unsafe {
-        arch::x86_64::context_switch::TaskContext::new_kernel(
-            task_a,
-            STACK_A.0.as_mut_ptr().add(STACK_A.0.len()),
-            cr3,
-        )
-    };
-    let ctx_b = unsafe {
-        arch::x86_64::context_switch::TaskContext::new_kernel(
-            task_b,
-            STACK_B.0.as_mut_ptr().add(STACK_B.0.len()),
-            cr3,
-        )
-    };
-
-    // task-a gets a log_write cap; task-b gets an empty table.
-    // This directly encodes §22 Test 2 (cap enforcement) at the task level.
-    let mut caps_a = capability::CapTable::empty();
+    // Build capability tables.
+    // Slot 0: log_write (both tasks), Slot 1: SEND (ping) or RECV (pong).
+    let mut caps_ping = capability::CapTable::empty();
     let log_cap = capability::mint_cap(capability::LOG_WRITE_RESOURCE, capability::Rights::WRITE);
-    caps_a.insert(log_cap).expect("enqueue caps_a");
+    caps_ping.insert(log_cap).expect("ping log cap");
+    let send_cap = capability::mint_cap(PONG_RESOURCE_ID, capability::Rights::SEND);
+    let s = caps_ping.insert(send_cap).expect("ping send cap");
+    assert_eq!(s, 1, "SEND cap must land in slot 1");
 
-    task::scheduler::enqueue("task-a", ctx_a, caps_a);
-    task::scheduler::enqueue("task-b", ctx_b, capability::CapTable::empty());
+    let mut caps_pong = capability::CapTable::empty();
+    let log_cap2 = capability::mint_cap(capability::LOG_WRITE_RESOURCE, capability::Rights::WRITE);
+    caps_pong.insert(log_cap2).expect("pong log cap");
+    let recv_cap = capability::mint_cap(PONG_RESOURCE_ID, capability::Rights::RECV);
+    let r = caps_pong.insert(recv_cap).expect("pong recv cap");
+    assert_eq!(r, 1, "RECV cap must land in slot 1");
 
-    kprintln!("scheduler: task-a and task-b enqueued");
+    // Build initial task contexts.
+    let ctx_ping = unsafe {
+        arch::x86_64::context_switch::TaskContext::new_kernel(
+            task_ping,
+            STACK_PING.0.as_mut_ptr().add(STACK_PING.0.len()),
+            cr3,
+        )
+    };
+    let ctx_pong = unsafe {
+        arch::x86_64::context_switch::TaskContext::new_kernel(
+            task_pong,
+            STACK_PONG.0.as_mut_ptr().add(STACK_PONG.0.len()),
+            cr3,
+        )
+    };
+
+    task::scheduler::enqueue("ping", ctx_ping, caps_ping);
+    task::scheduler::enqueue("pong", ctx_pong, caps_pong);
+
+    kprintln!("scheduler: ping and pong enqueued");
 
     // BSP enters the scheduler; never returns.
     task::scheduler::run()

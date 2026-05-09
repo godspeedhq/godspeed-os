@@ -11,6 +11,11 @@ use crate::ipc::message::Message;
 pub const QUEUE_DEPTH: usize = 16;
 
 /// A fixed-depth FIFO queue of IPC messages.
+///
+/// Derives Copy so that `RoutingEntry` (which embeds one) can be used in a
+/// const-initialised static array. Copying a queue is only done at static
+/// init time (all fields are zeroed); never copy a live queue.
+#[derive(Copy, Clone)]
 pub struct MessageQueue {
     slots: [Option<Message>; QUEUE_DEPTH],
     head: usize,

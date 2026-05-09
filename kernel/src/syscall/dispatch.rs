@@ -6,11 +6,12 @@
 //! Syscall numbers are fixed; adding a syscall requires a new number and a
 //! capability that authorises it.
 
-use crate::capability::cap::{CapError, ResourceId};
+use crate::capability::cap::CapError;
 use crate::capability::rights::Rights;
-use crate::ipc::message::{IpcError, Message};
 use crate::ipc::endpoint::EndpointId;
+use crate::ipc::message::{IpcError, Message, MAX_MESSAGE_SIZE};
 use crate::task::scheduler;
+use crate::task::state::TaskState;
 
 /// Syscall numbers. Stable ABI.
 #[repr(u64)]
@@ -88,35 +89,138 @@ unsafe fn handle_log(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 // ---------------------------------------------------------------------------
 
 unsafe fn handle_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
-    todo!(
-        "1. validate cap (SEND right + generation) from current task's cap table; \
-         2. copy msg_len bytes from user msg_ptr into a kernel Message; \
-         3. call ipc::routing::enqueue; \
-         4. if cross-core, send IPI via smp::ipi; \
-         5. if queue full, block task via scheduler::block_on_send"
-    )
+    let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::SEND) {
+        Ok(c)  => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    let endpoint_id = EndpointId(cap.resource_id.0);
+
+    let msg = match build_message(msg_ptr, msg_len) {
+        Ok(m)  => m,
+        Err(e) => return e,
+    };
+
+    match crate::ipc::routing::enqueue(endpoint_id, msg, cap.generation) {
+        Ok(Some(receiver_slot)) => {
+            scheduler::wake_by_slot(receiver_slot, 0);
+            0
+        }
+        Ok(None) => 0,
+        Err(IpcError::QueueFull) => {
+            // Atomically record the blocked-send state and block.  CLI ensures
+            // no dequeue (and its corresponding wake) races between record and
+            // block_and_reschedule (§8.9).
+            unsafe { core::arch::asm!("cli", options(nostack, nomem)); }
+            let my_slot = scheduler::current_task_slot();
+            match crate::ipc::routing::record_blocked_sender(endpoint_id, my_slot, msg) {
+                Ok(()) => {
+                    // block_and_reschedule re-enables interrupts on resume.
+                    // Returns 0 when the receiver moves our pending_send into
+                    // the queue, or EndpointDead if the endpoint is killed.
+                    scheduler::block_and_reschedule(TaskState::BlockedOnSend)
+                }
+                Err(e) => {
+                    unsafe { core::arch::asm!("sti", options(nostack, nomem)); }
+                    ipc_err_to_i64(e)
+                }
+            }
+        }
+        Err(e) => ipc_err_to_i64(e),
+    }
 }
 
 unsafe fn handle_recv(cap_slot: u64) -> i64 {
-    todo!(
-        "1. validate cap (RECV right + generation); \
-         2. dequeue from endpoint queue; \
-         3. if empty, block via scheduler::block_on_recv; \
-         4. copy message to user buffer"
-    )
+    let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::RECV) {
+        Ok(c)  => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    let endpoint_id = EndpointId(cap.resource_id.0);
+
+    loop {
+        match crate::ipc::routing::dequeue(endpoint_id, cap.generation) {
+            Ok((msg, sender_to_wake)) => {
+                if let Some(slot) = sender_to_wake {
+                    scheduler::wake_by_slot(slot, 0);
+                }
+                scheduler::store_recv_message(msg);
+                return 0;
+            }
+            Err(IpcError::QueueEmpty) => {
+                // Atomically record blocked state and block.  CLI prevents
+                // a concurrent enqueue from seeing blocked_receiver = None
+                // and missing the wakeup.
+                unsafe { core::arch::asm!("cli", options(nostack, nomem)); }
+                let my_slot = scheduler::current_task_slot();
+                match crate::ipc::routing::record_blocked_receiver(endpoint_id, my_slot) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        unsafe { core::arch::asm!("sti", options(nostack, nomem)); }
+                        return ipc_err_to_i64(e);
+                    }
+                }
+                // block_and_reschedule re-enables interrupts on resume.
+                let err = scheduler::block_and_reschedule(TaskState::BlockedOnRecv);
+                if err != 0 {
+                    return err;
+                }
+                // The sender enqueued a message and woke us; loop to dequeue it.
+            }
+            Err(e) => return ipc_err_to_i64(e),
+        }
+    }
 }
 
 unsafe fn handle_try_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
-    todo!("same as handle_send but returns QueueFull immediately instead of blocking")
+    let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::SEND) {
+        Ok(c)  => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    let endpoint_id = EndpointId(cap.resource_id.0);
+
+    let msg = match build_message(msg_ptr, msg_len) {
+        Ok(m)  => m,
+        Err(e) => return e,
+    };
+
+    match crate::ipc::routing::enqueue(endpoint_id, msg, cap.generation) {
+        Ok(Some(receiver_slot)) => { scheduler::wake_by_slot(receiver_slot, 0); 0 }
+        Ok(None) => 0,
+        Err(e)   => ipc_err_to_i64(e), // QueueFull returned directly (no blocking)
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers.
 // ---------------------------------------------------------------------------
 
+/// Build a kernel `Message` from a (kernel-task) pointer + length.
+///
+/// # Safety
+/// `msg_ptr` must point to at least `msg_len` readable bytes. In Milestone 5
+/// this is always satisfied because the callers are ring-0 kernel tasks.
+unsafe fn build_message(msg_ptr: u64, msg_len: u64) -> Result<Message, i64> {
+    let len = msg_len as usize;
+    if len > MAX_MESSAGE_SIZE {
+        return Err(ipc_err_to_i64(IpcError::MessageTooLarge));
+    }
+    // SAFETY: kernel-task pointer; ring-3 validation deferred to Milestone 7.
+    let bytes = unsafe { core::slice::from_raw_parts(msg_ptr as *const u8, len) };
+    Message::new(bytes).map_err(|e| ipc_err_to_i64(e))
+}
+
+fn ipc_err_to_i64(e: IpcError) -> i64 {
+    match e {
+        IpcError::EndpointDead    => -7,
+        IpcError::QueueFull       => -8,
+        IpcError::QueueEmpty      => -9,
+        IpcError::MessageTooLarge => -10,
+        IpcError::Cap(ce)         => cap_err_to_i64(ce),
+    }
+}
+
 fn cap_err_to_i64(e: CapError) -> i64 {
     match e {
-        CapError::CapNotHeld           => -2,
+        CapError::CapNotHeld            => -2,
         CapError::CapInsufficientRights => -3,
         CapError::CapNotGrantable       => -4,
         CapError::CapWrongScope         => -5,

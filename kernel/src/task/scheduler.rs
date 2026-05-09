@@ -15,6 +15,7 @@ use crate::arch::x86_64::context_switch::{switch_context, TaskContext};
 use crate::capability::cap::{CapError, Capability};
 use crate::capability::rights::Rights;
 use crate::capability::table::CapTable;
+use crate::ipc::message::Message;
 use crate::task::state::TaskState;
 
 // ---------------------------------------------------------------------------
@@ -28,14 +29,22 @@ const IDLE: usize = MAX_TASKS;
 
 // Split into parallel arrays so we can take a raw pointer to one context
 // without conflicting with a mutable borrow on another.
-static mut TASK_CTX:   [MaybeUninit<TaskContext>; MAX_TASKS] =
+static mut TASK_CTX:      [MaybeUninit<TaskContext>; MAX_TASKS] =
     [const { MaybeUninit::uninit() }; MAX_TASKS];
-static mut TASK_CAP:   [MaybeUninit<CapTable>; MAX_TASKS] =
+static mut TASK_CAP:      [MaybeUninit<CapTable>; MAX_TASKS] =
     [const { MaybeUninit::uninit() }; MAX_TASKS];
-static mut TASK_STATE: [TaskState; MAX_TASKS]  = [TaskState::Dead; MAX_TASKS];
-static mut TASK_NAME:  [&str; MAX_TASKS]       = [""; MAX_TASKS];
-static mut TASK_VALID: [bool; MAX_TASKS]       = [false; MAX_TASKS];
-static mut TASK_COUNT: usize = 0;
+static mut TASK_STATE:    [TaskState; MAX_TASKS]  = [TaskState::Dead; MAX_TASKS];
+static mut TASK_NAME:     [&str; MAX_TASKS]       = [""; MAX_TASKS];
+static mut TASK_VALID:    [bool; MAX_TASKS]       = [false; MAX_TASKS];
+static mut TASK_COUNT:    usize                   = 0;
+/// Error code written by `wake_by_slot`; returned to the blocked task when it
+/// resumes from `block_and_reschedule`. 0 = success, negative = IpcError code.
+static mut TASK_WAKEUP_ERR: [i64; MAX_TASKS]     = [0i64; MAX_TASKS];
+/// Last message received by each task (kernel-task IPC demo, Milestone 5).
+/// Filled by `handle_recv` on successful dequeue; consumed by the task via
+/// `take_recv_message`.
+static mut TASK_RECV_BUF:  [Option<Message>; MAX_TASKS] =
+    [const { None }; MAX_TASKS];
 
 /// Index of the currently Running task; IDLE when the scheduler loop is active.
 static mut CURRENT: usize = IDLE;
@@ -250,27 +259,98 @@ pub fn yield_current() {
     }
 }
 
-/// Wake a task that was blocked on recv (called after IPC enqueue).
-pub fn wake(task_id: crate::task::task::TaskId) {
-    // SAFETY: single-core; called with IF=0 from IPC path.
+/// Return the slot index of the currently-running task.
+///
+/// Returns `IDLE` (== MAX_TASKS) if the scheduler loop is active.
+pub fn current_task_slot() -> usize {
+    // SAFETY: read-only; stable within a syscall (IF=0).
+    unsafe { CURRENT }
+}
+
+/// Wake the task at `slot` with the given result code.
+///
+/// Called from the IPC path (IF=0) after a message is delivered or an
+/// endpoint dies. The task's next `block_and_reschedule` return will be
+/// this `result`.
+pub fn wake_by_slot(slot: usize, result: i64) {
+    // SAFETY: IF=0 from IPC/syscall path.
     unsafe {
-        for i in 0..MAX_TASKS {
-            if TASK_VALID[i] {
-                // Milestone 5: match by task_id stored in each slot.
-                let _ = task_id;
-                if TASK_STATE[i] == TaskState::BlockedOnRecv {
-                    TASK_STATE[i] = TaskState::Ready;
-                    return;
-                }
-            }
+        if slot < MAX_TASKS && TASK_VALID[slot] {
+            TASK_WAKEUP_ERR[slot] = result;
+            TASK_STATE[slot]      = TaskState::Ready;
         }
     }
 }
 
-/// Block the currently-running task on a send (queue full).
-pub fn block_on_send(_endpoint: crate::ipc::endpoint::EndpointId) {
-    // Milestone 5: transition current task Running → BlockedOnSend, reschedule.
-    todo!("block_on_send: Milestone 5")
+/// Block the currently-running task, switch to the next ready task (or the
+/// scheduler loop if none), and return the wakeup result code.
+///
+/// The caller must have called `cli` and recorded the blocking reason in the
+/// routing table *before* calling this function, so no wakeup is missed.
+/// Interrupts are re-enabled when this function returns.
+pub fn block_and_reschedule(state: TaskState) -> i64 {
+    // SAFETY: IF=0 (caller ensures this; double-cli is a no-op).
+    unsafe {
+        core::arch::asm!("cli", options(nostack, nomem));
+
+        let slot = CURRENT;
+        assert!(slot < MAX_TASKS && TASK_VALID[slot],
+                "block_and_reschedule: no running task");
+
+        TASK_STATE[slot] = state;
+
+        let current_ctx = TASK_CTX[slot].assume_init_mut() as *mut TaskContext;
+
+        match pick_next() {
+            Some(next) => {
+                TASK_STATE[next] = TaskState::Running;
+                CURRENT = next;
+                let next_ctx = TASK_CTX[next].assume_init_ref() as *const TaskContext;
+                // Save our context, jump to next task.  Returns here when we
+                // are rescheduled by a future timer tick or wake_by_slot.
+                switch_context(current_ctx, next_ctx);
+            }
+            None => {
+                // No ready tasks: yield back to the scheduler loop (which will
+                // hlt until the timer fires and a task becomes ready).
+                CURRENT = IDLE;
+                let sched = &raw mut SCHED_CTX;
+                switch_context(current_ctx, sched);
+            }
+        }
+
+        // We are running again.  Re-enable interrupts and return the wakeup
+        // result that was written by `wake_by_slot`.
+        core::arch::asm!("sti", options(nostack, nomem));
+        TASK_WAKEUP_ERR[slot]
+    }
+}
+
+/// Store `msg` as the last received message for the current task.
+///
+/// Called by `handle_recv` immediately after a successful dequeue; the task
+/// retrieves it with `take_recv_message`.
+pub fn store_recv_message(msg: Message) {
+    // SAFETY: IF=0 in syscall context; CURRENT is stable.
+    unsafe {
+        if CURRENT < MAX_TASKS {
+            TASK_RECV_BUF[CURRENT] = Some(msg);
+        }
+    }
+}
+
+/// Take (consume) the last received message for the current task.
+///
+/// Returns `None` if no message has been stored since the last call.
+pub fn take_recv_message() -> Option<Message> {
+    // SAFETY: CURRENT is stable for this core; no concurrent access.
+    unsafe {
+        if CURRENT < MAX_TASKS {
+            TASK_RECV_BUF[CURRENT].take()
+        } else {
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

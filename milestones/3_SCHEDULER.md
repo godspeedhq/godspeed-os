@@ -22,35 +22,35 @@ task-a: 3
 
 ## Task Structure
 
-- [x] `Task` struct: `TaskContext`, stack, state (`Ready`/`Running`/`Blocked`/`Dead`)
-- [x] Stack allocation per task (static `KernelStack` wrappers, 16-byte aligned)
-- [x] Initial `TaskContext` set up via `new_kernel` with entry-trampoline so first
+- ✅ `Task` struct: `TaskContext`, stack, state (`Ready`/`Running`/`Blocked`/`Dead`)
+- ✅ Stack allocation per task (static `KernelStack` wrappers, 16-byte aligned)
+- ✅ Initial `TaskContext` set up via `new_kernel` with entry-trampoline so first
       `switch_context` jumps to `task_entry_trampoline` → `sti` → real entry
 
 ## Run Queue
 
-- [x] Per-core `RunQueue`: round-robin over `Ready` tasks (parallel static arrays,
+- ✅ Per-core `RunQueue`: round-robin over `Ready` tasks (parallel static arrays,
       max 8 slots, `IDLE` sentinel)
-- [x] `enqueue(name, ctx)` / `pick_next()` (round-robin from CURRENT+1)
-- [x] `scheduler::run()` loop: CLI, pick next task, switch_context; idle-HLTs when empty
+- ✅ `enqueue(name, ctx)` / `pick_next()` (round-robin from CURRENT+1)
+- ✅ `scheduler::run()` loop: CLI, pick next task, switch_context; idle-HLTs when empty
 
 ## Context Switch
 
-- [x] `switch_context` saves/restores callee-saved registers (rbx/rbp/r12–r15) + RSP + CR3
-- [x] RSP field at offset 0x38 (layout verified against struct)
-- [x] Verified: switching between two tasks executes both
+- ✅ `switch_context` saves/restores callee-saved registers (rbx/rbp/r12–r15) + RSP + CR3
+- ✅ RSP field at offset 0x38 (layout verified against struct)
+- ✅ Verified: switching between two tasks executes both
 
 ## Preemption
 
-- [x] Legacy 8259 PIC remapped (IRQ0–7 → vectors 32–39) and fully masked before IDT live
-- [x] Local APIC timer: periodic mode, vector 32, ÷16, 625,000 ticks (~10 ms at 1 GHz bus)
-- [x] APIC MMIO mapped explicitly via `map_in_active_tables` with PCD+PWT (Limine HHDM
+- ✅ Legacy 8259 PIC remapped (IRQ0–7 → vectors 32–39) and fully masked before IDT live
+- ✅ Local APIC timer: periodic mode, vector 32, ÷16, 625,000 ticks (~10 ms at 1 GHz bus)
+- ✅ APIC MMIO mapped explicitly via `map_in_active_tables` with PCD+PWT (Limine HHDM
       covers RAM only, not MMIO at 0xFEE00000)
-- [x] `init_local_apic` called after `memory::init` so HHDM offset is set
-- [x] Timer ISR stub (`timer_isr_stub`) saves/restores caller-saved regs, calls
+- ✅ `init_local_apic` called after `memory::init` so HHDM offset is set
+- ✅ Timer ISR stub (`timer_isr_stub`) saves/restores caller-saved regs, calls
       `timer_tick_from_irq`, iretq
-- [x] `timer_tick_from_irq` sends EOI, transitions prev task Ready, picks next, switches
-- [x] A tight-loop task does not starve another task on the same core
+- ✅ `timer_tick_from_irq` sends EOI, transitions prev task Ready, picks next, switches
+- ✅ A tight-loop task does not starve another task on the same core
 
 ## Key bugs fixed
 
@@ -65,6 +65,6 @@ task-a: 3
 
 ## Acceptance
 
-- [x] Two tasks on core 0 both make progress (serial output from each) over a 1 s window
-- [x] Removing explicit yields does not stop the second task from running
-- [x] No kernel panic on SMP=1 or SMP=4
+- ✅ Two tasks on core 0 both make progress (serial output from each) over a 1 s window
+- ✅ Removing explicit yields does not stop the second task from running
+- ✅ No kernel panic on SMP=1 or SMP=4

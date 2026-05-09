@@ -21,6 +21,12 @@ pub struct Message {
     pub cap_count: usize,
 }
 
+impl core::fmt::Debug for Message {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Message {{ payload_len: {}, cap_count: {} }}", self.payload_len, self.cap_count)
+    }
+}
+
 impl Message {
     pub fn new(payload: &[u8]) -> Result<Self, IpcError> {
         if payload.len() > MAX_MESSAGE_SIZE {
@@ -46,8 +52,10 @@ impl Message {
 pub enum IpcError {
     /// The endpoint no longer exists (service died or was restarted).
     EndpointDead,
-    /// The queue is full and the caller used `try_send`.
+    /// The queue is full and the caller used `try_send` (or blocking send should block).
     QueueFull,
+    /// The queue is empty and the caller should block on `recv`.
+    QueueEmpty,
     /// Payload exceeds 4 KiB.
     MessageTooLarge,
     /// Capability error during send.
