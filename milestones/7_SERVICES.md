@@ -124,18 +124,60 @@ Commit `d41b418`.
 
 ### ping / pong (`examples/`)
 
-- [ ] ping placed on core 0; pong placed on core 1 (via contract).
-- [ ] ping sends a message to pong every second.
-- [ ] pong receives and logs each message.
+Cross-core IPC plumbing is confirmed working (serial.log from `build/serial.log`
+shows the Milestone 6 ring-0 demo running indefinitely on 4 cores with no panics,
+proving the IPC fast path and SMP scheduler are sound). The Phase 4 service versions
+(below) need wiring once supervisor spawns them in Phase 5.
+
+- [ ] Supervisor spawns ping on core 0; pong on core 1 (round-robin or contract).
+- [ ] ping sends a message to pong every second (`sleep_one_second` + `try_send` cap lookup).
+- [ ] pong receives and logs each message (`recv` with endpoint cap minted at spawn).
 - [ ] ping handles `EndpointDead` by re-looking up pong via registry.
 
 ---
 
-## Phase 5 — Restart Flow
+## Phase 5 — Supervisor + ping/pong + Restart Flow
 
-- [ ] `osdev restart pong --core 2` kills pong on core 1, respawns on core 2.
-- [ ] ping observes `EndpointDead`, reacquires via registry, continues sending.
-- [ ] New cap routes to core 2 correctly.
+### Kernel
+
+- [ ] `handle_kill` (syscall 8) — validates `service_control` cap, marks task Dead,
+  bumps endpoint generation, reclaims memory (TLB shootdown), notifies supervisor.
+- [ ] `task::kill_current` — page-fault path; same sequence as above.
+- [ ] Per-service IPC endpoint creation at spawn — populate `recv_slot` in
+  `ServiceContextData`; register endpoint in `ipc::routing` table.
+
+### SDK
+
+- [ ] `ServiceContext::send` / `try_send` — look up peer cap by name from a
+  name→slot table embedded in `ServiceContextData` (or via a dedicated cap slot per
+  declared `ipc_send` peer).
+- [ ] `drain_kernel_ring_buffer` — syscall to drain the 16 KiB ring buffer.
+- [ ] `restart(name, core_override)` — Kill + Spawn syscalls with placement §9.2.
+
+### Supervisor (Phase 5)
+
+- [ ] Reads embedded boot manifest; spawns ping and pong per placement policy (§9.2).
+- [ ] Receives death notifications; restarts dead non-TCB services.
+- [ ] Exposes kill/restart IPC API (§14.4).
+
+### Registry (Phase 5)
+
+- [ ] `register(name, endpoint_cap)` IPC operation — stores name→cap slot entry.
+- [ ] `lookup(name)` IPC operation — returns fresh cap or `NotFound`.
+- [ ] Endpoint cap minted at spawn; clients discover registry via a well-known cap slot.
+
+### Logger (Phase 5)
+
+- [ ] `drain_kernel_ring_buffer()` on startup (§11.4).
+- [ ] Receive loop: `ipc::recv` on `log_write` endpoint; write formatted lines to serial.
+
+### Restart flow acceptance (`osdev restart pong --core 2`)
+
+- [ ] ping sends messages to pong continuously.
+- [ ] `osdev restart pong --core 2` — supervisor kills pong on core 1, respawns on core 2.
+- [ ] ping observes `EndpointDead`, calls `registry.lookup("pong")`, gets fresh cap.
+- [ ] ping resumes sending; messages route to core 2 transparently.
+- [ ] No kernel panic on any core.
 
 ---
 
