@@ -16,12 +16,29 @@ use crate::task::state::TaskState;
 /// Syscall numbers. Stable ABI.
 #[repr(u64)]
 pub enum SyscallNumber {
-    Send    = 1,
-    Recv    = 2,
-    TrySend = 3,
-    Yield   = 4,
-    Log     = 5,
+    Send     = 1,
+    Recv     = 2,
+    TrySend  = 3,
+    Yield    = 4,
+    Log      = 5,
     AllocMem = 6,
+    Spawn    = 7,
+    Kill     = 8,
+}
+
+/// Validate that `[ptr, ptr+len)` lies entirely within user-space.
+///
+/// Returns `true` iff the range is non-empty, non-null, and does not
+/// extend into the kernel's upper-half address space (≥ 0x0000_8000_0000_0000).
+#[inline]
+fn validate_user_slice(ptr: u64, len: usize) -> bool {
+    const USER_END: u64 = 0x0000_8000_0000_0000;
+    if ptr == 0 || len == 0 { return false; }
+    if ptr >= USER_END { return false; }
+    match ptr.checked_add(len as u64) {
+        Some(end) => end <= USER_END,
+        None => false,
+    }
 }
 
 /// Raw syscall dispatcher — called from the SYSCALL/SYSENTER IDT stub.
@@ -47,6 +64,8 @@ pub unsafe extern "C" fn syscall_handler(
             0
         }
         n if n == SyscallNumber::Log     as u64 => handle_log(arg0, arg1, arg2),
+        n if n == SyscallNumber::Spawn   as u64 => handle_spawn(arg0, arg1),
+        n if n == SyscallNumber::Kill    as u64 => handle_kill(arg0),
         _ => -1, // Unknown syscall.
     }
 }
@@ -58,8 +77,6 @@ pub unsafe extern "C" fn syscall_handler(
 /// arg0 = cap_slot, arg1 = pointer to UTF-8 bytes, arg2 = byte length.
 ///
 /// Requires `Rights::WRITE` on `LOG_WRITE_RESOURCE`.
-/// v1 note: msg_ptr is trusted (kernel tasks only); userspace validation
-/// happens in Milestone 7 when ring-3 tasks are introduced.
 unsafe fn handle_log(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::WRITE) {
         Ok(c) => c,
@@ -75,8 +92,12 @@ unsafe fn handle_log(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
         return -1;
     }
 
-    // SAFETY: v1 kernel tasks pass a valid kernel pointer; ring-3 validation
-    // deferred to Milestone 7.
+    if !validate_user_slice(msg_ptr, len) {
+        return -1;
+    }
+
+    // SAFETY: validate_user_slice guarantees ptr is in user-space (< 0x8000_0000_0000_0000)
+    // and the range doesn't overflow; user-space and kernel-space are disjoint address ranges.
     let bytes = unsafe { core::slice::from_raw_parts(msg_ptr as *const u8, len) };
     match core::str::from_utf8(bytes) {
         Ok(s) => { crate::kprintln!("{}", s); 0 }
@@ -176,19 +197,37 @@ unsafe fn handle_try_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 // Helpers.
 // ---------------------------------------------------------------------------
 
-/// Build a kernel `Message` from a (kernel-task) pointer + length.
+/// Build a kernel `Message` from a user-space pointer + length.
 ///
 /// # Safety
-/// `msg_ptr` must point to at least `msg_len` readable bytes. In Milestone 5/6
-/// this is always satisfied because the callers are ring-0 kernel tasks.
+/// `msg_ptr` must be a valid user-space address (validated before calling).
 unsafe fn build_message(msg_ptr: u64, msg_len: u64) -> Result<Message, i64> {
     let len = msg_len as usize;
     if len > MAX_MESSAGE_SIZE {
         return Err(ipc_err_to_i64(IpcError::MessageTooLarge));
     }
-    // SAFETY: kernel-task pointer; ring-3 validation deferred to Milestone 7.
+    if !validate_user_slice(msg_ptr, len) {
+        return Err(-1);
+    }
+    // SAFETY: validate_user_slice confirms the range is in user-space and in bounds.
     let bytes = unsafe { core::slice::from_raw_parts(msg_ptr as *const u8, len) };
     Message::new(bytes).map_err(|e| ipc_err_to_i64(e))
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: Spawn (7) / Kill (8) — Phase 3 stubs; full impl in Phase 4.
+// ---------------------------------------------------------------------------
+
+/// arg0 = name_ptr, arg1 = name_len. Capability required: spawn right (Phase 4).
+unsafe fn handle_spawn(_name_ptr: u64, _name_len: u64) -> i64 {
+    // Phase 4: validate spawn cap, look up service by name, call task::spawn_service.
+    -1
+}
+
+/// arg0 = task identifier (name or slot). Capability required: service_control (Phase 4).
+unsafe fn handle_kill(_target: u64) -> i64 {
+    // Phase 4: validate kill cap, call task::kill_by_id.
+    -1
 }
 
 fn ipc_err_to_i64(e: IpcError) -> i64 {

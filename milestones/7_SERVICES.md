@@ -50,36 +50,47 @@ Commit `c2cc77c`.
 
 ---
 
-## Phase 3 — ELF Loader + Kernel Spawn API
+## Phase 3 — ELF Loader + Kernel Spawn API ✅
 
-- [ ] `kernel/src/loader.rs` — parse service ELF PT_LOAD segments from embedded bytes;
-  map each into a fresh page table with correct per-section flags.
-- [ ] Kernel stack allocator — 64 KiB per ring-3 task from the frame allocator;
-  `TASK_KERNEL_STACK_TOP[slot]` set at spawn time.
-- [ ] `task::spawn_service(name, elf_bytes, core_id) -> usize` — allocates kernel stack,
-  builds user page table, calls `TaskContext::new_user`, calls `enqueue`.
-- [ ] Syscall 7 (`Spawn`) + Syscall 8 (`Kill`) in `syscall/dispatch.rs`.
-- [ ] Death-notification endpoint infrastructure so supervisor learns when a service dies.
-- [ ] `kernel/src/main.rs` — remove demo ring-0 ping/pong; spawn only `init`.
+Commit `TODO` (this session).
+
+- ✅ `kernel/src/loader.rs` — ELF64 PT_LOAD parser; allocates frames per segment,
+  copies file bytes, zero-fills BSS, maps into fresh `PageTable` with PF_X/PF_W/PF_R flags.
+- ✅ Kernel stack pool — static `[KernelStack; 32]` of 64 KiB each in `task/mod.rs`;
+  `TASK_KERNEL_STACK_TOP[slot]` set via `scheduler::enqueue(..., kstack_top)`.
+- ✅ `task::spawn_service(name, elf_bytes, core_id)` — loads ELF, maps user stack
+  (4 pages at 0x7FFF_C000), writes `ServiceContextData` page at 0x3FF000,
+  allocates kernel stack, calls `TaskContext::new_user`, calls `scheduler::enqueue`.
+- ✅ `task::spawn_init()` — embeds init ELF via `include_bytes!(env!("SVC_INIT_ELF"))`,
+  calls `spawn_service("init", ..., 0)`.
+- ✅ Syscall 7 (`Spawn`) + Syscall 8 (`Kill`) stub entries in `syscall/dispatch.rs`.
+- ✅ User-pointer validation (`validate_user_slice`) in `handle_log` and `build_message`.
+- ✅ `services/.cargo/config.toml` + `examples/.cargo/config.toml` — override workspace
+  rustflags so service crates do NOT inherit `-Tkernel/kernel.ld`; kernel linker script
+  moved into `kernel/build.rs`.
+- ✅ `PageFlags` derives `Clone, Copy` — fixes move-in-loop error.
+- ✅ `kernel/src/main.rs` — removed demo ring-0 ping/pong; calls `task::spawn_init()`.
+- [ ] Death-notification endpoint infrastructure — deferred to Phase 4.
 
 ---
 
 ## Phase 4 — SDK and Service Implementations
 
-### SDK (`sdk/rust/src/`)
+### SDK (`sdk/rust/src/`) — partial ✅
 
-- [ ] `lib.rs` / `service_context.rs` — `ServiceContext` wrapping a pointer to
-  `ServiceContextData` at a fixed page (0x3ff000) written by the kernel pre-launch.
-- [ ] `capability.rs` — typed `CapHandle` wrapper; `send`, `recv`, `try_send` issue
-  real `syscall` instructions.
-- [ ] `ipc.rs` — `send`, `recv`, `try_send`, `yield_current` using the SYSCALL ABI.
+- ✅ `service_context.rs` — `ServiceContext` reads `ServiceContextData` from fixed
+  page `0x3FF000`; `log()` and `yield_cpu()` issue real `syscall` instructions;
+  `spawn()` returns `Ok(())` stub.
+- ✅ `ipc.rs` — `Message::from_bytes` implemented.
+- [ ] `capability.rs` — `CapHandle::send`, `recv`, `try_send` via SYSCALL ABI.
+- [ ] `ipc.rs` — `recv`, `send`, `try_send` SYSCALL wrappers.
 
-### init (`services/init/`)
+### init (`services/init/`) — Phase 3 subset ✅
 
-- [ ] Spawns supervisor, registry, logger (via Spawn syscall, in order).
-- [ ] Panics kernel if any TCB spawn fails (§6.2).
-- [ ] Logs `"init: ready"` on serial.
-- [ ] Loops forever; never exits.
+- ✅ Logs `"init: ready"` on serial via `ServiceContext::log`.
+- ✅ Loops forever via `ctx.yield_cpu()`.
+- [ ] Spawns supervisor, registry, logger (via Spawn syscall, in order) — Phase 4.
+- [ ] Panics kernel if any TCB spawn fails (§6.2) — Phase 4.
 
 ### supervisor (`services/supervisor/`)
 

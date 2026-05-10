@@ -1,0 +1,9 @@
+# examples/.cargo/config.toml
+#
+# Overrides the workspace-root config for example service crates (ping, pong).
+# Examples use user.ld (from their build.rs) and must NOT use kernel.ld.
+
+[target.x86_64-unknown-none]
+rustflags = [
+    "-C", "relocation-model=static",
+]

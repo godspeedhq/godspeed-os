@@ -191,6 +191,20 @@ impl PageTable {
     pub fn cr3_value(&self) -> u64 {
         self.root.phys_addr().0
     }
+
+    /// Consume this `PageTable` and return its raw CR3 value.
+    ///
+    /// The caller takes ownership of all allocated page-table frames and is
+    /// responsible for freeing them at task death (§10.5).  `Frame` has no
+    /// `Drop` impl, so the frames remain allocated after this call.
+    pub fn into_cr3(self) -> u64 {
+        let cr3 = self.root.phys_addr().0;
+        // SAFETY: PageTable has no Drop impl and Frame has no Drop impl, so
+        // forgetting self is a no-op at the allocator level.  The frames
+        // remain allocated and are now owned by whoever loaded them into CR3.
+        core::mem::forget(self);
+        cr3
+    }
 }
 
 /// Add a single 4 KiB mapping to the CURRENTLY ACTIVE page table (i.e. the
@@ -278,6 +292,7 @@ fn walk_or_alloc(table_phys: u64, idx: usize, flags: u64) -> Result<u64, MapErro
 pub struct VirtAddr(pub u64);
 
 bitflags::bitflags! {
+    #[derive(Clone, Copy, PartialEq, Eq)]
     pub struct PageFlags: u64 {
         const PRESENT   = 1 << 0;
         const WRITABLE  = 1 << 1;

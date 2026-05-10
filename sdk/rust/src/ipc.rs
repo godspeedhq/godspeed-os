@@ -18,7 +18,15 @@ pub struct Message {
 
 impl Message {
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        todo!("copy bytes into payload field, zero caps")
+        let len = bytes.len().min(MAX_PAYLOAD);
+        let mut payload = [0u8; MAX_PAYLOAD];
+        payload[..len].copy_from_slice(&bytes[..len]);
+        Self {
+            payload,
+            payload_len: len,
+            caps: [None; 4],
+            cap_count: 0,
+        }
     }
 
     pub fn payload_bytes(&self) -> &[u8] {

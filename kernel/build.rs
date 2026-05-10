@@ -5,6 +5,11 @@
 fn main() {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let workspace = std::path::Path::new(&manifest).parent().unwrap();
+
+    // Apply the kernel linker script only to the kernel crate.
+    let kernel_ld = workspace.join("kernel").join("kernel.ld");
+    println!("cargo:rustc-link-arg=-T{}", kernel_ld.display());
+    println!("cargo:rerun-if-changed={}", kernel_ld.display());
     let profile   = std::env::var("PROFILE").unwrap(); // "debug" or "release"
 
     let target_dir = workspace
