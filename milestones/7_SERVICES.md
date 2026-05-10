@@ -76,7 +76,7 @@ Commit `3e53a1c`.
 
 ## Phase 4 — SDK and Service Implementations ✅
 
-Commit `TBD`.
+Commit `d41b418`.
 
 ### SDK (`sdk/rust/src/`)
 
