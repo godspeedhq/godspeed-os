@@ -52,7 +52,7 @@ Commit `c2cc77c`.
 
 ## Phase 3 — ELF Loader + Kernel Spawn API ✅
 
-Commit `TODO` (this session).
+Commit `3e53a1c`.
 
 - ✅ `kernel/src/loader.rs` — ELF64 PT_LOAD parser; allocates frames per segment,
   copies file bytes, zero-fills BSS, maps into fresh `PageTable` with PF_X/PF_W/PF_R flags.
