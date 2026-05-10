@@ -10,7 +10,7 @@ use crate::arch::x86_64::context_switch::TaskContext;
 use crate::arch::x86_64::page_tables::{
     get_hhdm_offset, PageFlags, VirtAddr, PAGE_SIZE,
 };
-use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE};
+use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE};
 use crate::capability::table::CapTable;
 use crate::memory::allocator::alloc_frame;
 use crate::memory::frame::PhysAddr;
@@ -71,7 +71,7 @@ struct ServiceContextData {
     magic:          u32,
     log_write_slot: u32,  // cap slot for LOG_WRITE; u32::MAX = not held
     recv_slot:      u32,  // cap slot for primary recv endpoint; u32::MAX = not held
-    _pad:           u32,
+    spawn_slot:     u32,  // cap slot for SPAWN authority; u32::MAX = not held
 }
 
 // ---------------------------------------------------------------------------
@@ -95,6 +95,7 @@ pub enum SpawnError {
     NoMemory,
     MapFailed,
     CapTableFull,
+    NotFound,
 }
 
 impl From<crate::loader::LoadError> for SpawnError {
@@ -161,8 +162,8 @@ pub fn spawn_service(
             let data = &mut *(virt as *mut ServiceContextData);
             data.magic          = SERVICE_CTX_MAGIC;
             data.log_write_slot = 0;        // slot 0 = log_write (always)
-            data.recv_slot      = u32::MAX; // not held in Phase 3
-            data._pad           = 0;
+            data.recv_slot      = u32::MAX; // not held yet; populated when endpoint is created
+            data.spawn_slot     = 1;        // slot 1 = spawn (every service in v1)
         }
         // Map read-only (the service only reads this page).
         let ctx_flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::NO_EXEC;
@@ -176,6 +177,9 @@ pub fn spawn_service(
     let mut caps = CapTable::empty();
     // Slot 0: log_write (every service gets this in v1).
     caps.insert(mint_cap(LOG_WRITE_RESOURCE, Rights::WRITE))
+        .map_err(|_| SpawnError::CapTableFull)?;
+    // Slot 1: spawn (every service gets this in v1; tighten in Phase 5).
+    caps.insert(mint_cap(SPAWN_RESOURCE, Rights::WRITE))
         .map_err(|_| SpawnError::CapTableFull)?;
 
     // 5. Allocate kernel stack from the static pool.
@@ -205,6 +209,35 @@ pub fn spawn_init() {
     match spawn_service("init", elf_bytes, 0) {
         Ok(()) => crate::kprintln!("task: init spawned on core 0"),
         Err(e) => panic!("task: failed to spawn init: {:?}", e),
+    }
+}
+
+/// Look up a service by name and spawn it.
+///
+/// Used by the Spawn syscall (§8.2) so services can ask the kernel to start
+/// a named peer. The kernel has all service ELFs embedded at compile time
+/// (kernel/build.rs emits SVC_*_ELF env vars).
+///
+/// In Phase 4 the target core is always 0.  Phase 5 will add the placement
+/// rules from §9.2 once the supervisor reads the boot manifest.
+pub fn spawn_service_by_name(name: &str, core_id: u32) -> Result<(), SpawnError> {
+    // static_info returns (&'static str, &'static [u8]) from the compiled-in ELF table.
+    let (static_name, elf_bytes) = service_elf_table(name).ok_or(SpawnError::NotFound)?;
+    spawn_service(static_name, elf_bytes, core_id)
+}
+
+/// Map a service name to its (static_name, elf_bytes) pair.
+///
+/// All six service ELFs are embedded into the kernel binary by `kernel/build.rs`.
+/// Adding a new service here requires a matching entry in build.rs.
+fn service_elf_table(name: &str) -> Option<(&'static str, &'static [u8])> {
+    match name {
+        "supervisor" => Some(("supervisor", include_bytes!(env!("SVC_SUPERVISOR_ELF")))),
+        "registry"   => Some(("registry",   include_bytes!(env!("SVC_REGISTRY_ELF")))),
+        "logger"     => Some(("logger",     include_bytes!(env!("SVC_LOGGER_ELF")))),
+        "ping"       => Some(("ping",       include_bytes!(env!("SVC_PING_ELF")))),
+        "pong"       => Some(("pong",       include_bytes!(env!("SVC_PONG_ELF")))),
+        _ => None,
     }
 }
 

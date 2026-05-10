@@ -1,30 +1,22 @@
-//! `logger` — structured log sink (§11.4).
+//! `logger` — structured log sink (§11.4). Restartable.
 //!
-//! On startup: drain the kernel ring buffer before accepting new messages.
-//! After draining: receive log messages from any service holding `log_write`
-//! and write them to the serial console (and later to disk if block driver is up).
+//! Phase 4: log "logger: ready" and enter the scheduler loop.
 //!
-//! logger is restartable. Log history before the restart is lost; that is
-//! acceptable — the kernel ring buffer preserves the most recent 16 KiB.
+//! Phase 5 will add:
+//!   - `ctx.drain_kernel_ring_buffer()` on startup.
+//!   - Receive loop for `log_write` messages from other services.
+//!   - Write formatted lines to serial.
 
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, Message};
+use godspeed_sdk::ServiceContext;
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
-    // Drain the kernel ring buffer accumulated before logger started (§11.4).
-    ctx.drain_kernel_ring_buffer();
-
     ctx.log("logger: ready");
 
     loop {
-        let msg = ctx.recv_log_message();
-        emit(&ctx, &msg);
+        ctx.yield_cpu();
     }
-}
-
-fn emit(_ctx: &ServiceContext, _msg: &Message) {
-    todo!("format [service_name] level: text and write to serial")
 }

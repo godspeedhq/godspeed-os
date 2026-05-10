@@ -8,6 +8,7 @@
 pub mod capability;
 pub mod ipc;
 pub mod service_context;
+pub(crate) mod syscall;
 
 pub use capability::{CapHandle, CapError};
 pub use ipc::{Message, IpcError};

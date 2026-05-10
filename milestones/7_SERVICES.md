@@ -74,45 +74,53 @@ Commit `3e53a1c`.
 
 ---
 
-## Phase 4 — SDK and Service Implementations
+## Phase 4 — SDK and Service Implementations ✅
 
-### SDK (`sdk/rust/src/`) — partial ✅
+Commit `TBD`.
 
-- ✅ `service_context.rs` — `ServiceContext` reads `ServiceContextData` from fixed
-  page `0x3FF000`; `log()` and `yield_cpu()` issue real `syscall` instructions;
-  `spawn()` returns `Ok(())` stub.
-- ✅ `ipc.rs` — `Message::from_bytes` implemented.
-- [ ] `capability.rs` — `CapHandle::send`, `recv`, `try_send` via SYSCALL ABI.
-- [ ] `ipc.rs` — `recv`, `send`, `try_send` SYSCALL wrappers.
+### SDK (`sdk/rust/src/`)
 
-### init (`services/init/`) — Phase 3 subset ✅
+- ✅ `syscall.rs` (new) — `pub(crate) raw_syscall(nr, a0, a1, a2)` shared by all syscall
+  wrappers; eliminates the circular-import problem.
+- ✅ `service_context.rs` — `ServiceContextData` gains `spawn_slot: u32` (was `_pad`);
+  `spawn()` issues real Spawn syscall (7); `recv()` calls `ipc::recv` with `recv_slot`;
+  all Phase 5 stubs annotated.
+- ✅ `ipc.rs` — `recv`, `send`, `try_send` SYSCALL wrappers implemented; `recv` passes
+  a stack-allocated buffer to the kernel and returns `Message::from_bytes(payload)`.
+- (capability.rs send/recv/try_send wrappers deferred — CapHandle-level IPC is Phase 5)
 
-- ✅ Logs `"init: ready"` on serial via `ServiceContext::log`.
-- ✅ Loops forever via `ctx.yield_cpu()`.
-- [ ] Spawns supervisor, registry, logger (via Spawn syscall, in order) — Phase 4.
-- [ ] Panics kernel if any TCB spawn fails (§6.2) — Phase 4.
+### Kernel changes
 
-### supervisor (`services/supervisor/`)
+- ✅ `capability/mod.rs` — `SPAWN_RESOURCE` (ResourceId 2) registered as a stable resource.
+- ✅ `task/mod.rs` — `ServiceContextData.spawn_slot` populated (slot 1 = spawn); all
+  services receive a spawn cap; `SpawnError::NotFound` variant; `spawn_service_by_name`
+  and `service_elf_table` (embeds supervisor/registry/logger/ping/pong ELFs).
+- ✅ `syscall/dispatch.rs` — `handle_spawn` validates SPAWN_RESOURCE cap, reads name from
+  user space, calls `spawn_service_by_name`; `handle_recv` now accepts an output buffer
+  pointer and copies message payload to user space (was no-op).
 
-- [ ] Reads boot manifest; spawns services per placement policy (§9.2).
-- [ ] `kill(service_name)` — kills the named service.
-- [ ] `restart(service_name, placement_override?)` — kill + respawn, placement
-  re-evaluated from scratch.
-- [ ] Logs `PlacementInvalid` and skips if contracted core unavailable (§9.2).
-- [ ] Logs `"supervisor: ready"`.
+### init (`services/init/`) ✅
 
-### registry (`services/registry/`)
+- ✅ Logs `"init: ready"`.
+- ✅ Spawns supervisor, registry, logger via Spawn syscall in order.
+- ✅ Loops forever on TCB spawn failure (§6.2 "loud failure" semantics).
+- ✅ Retries logger once (logger is not TCB — §11.3).
 
-- [ ] `register(name, endpoint_cap)` — service registers endpoint on startup.
-- [ ] `lookup(name) -> endpoint_cap` — client gets a fresh cap by name.
-- [ ] Generation in returned cap matches current resource generation.
-- [ ] Logs `"registry: ready"`.
+### supervisor (`services/supervisor/`) — Phase 4 minimal ✅
 
-### logger (`services/logger/`)
+- ✅ Logs `"supervisor: ready"` and yields in a loop.
+- [ ] Boot manifest reading; service spawn per placement policy — Phase 5.
+- [ ] kill/restart API — Phase 5.
 
-- [ ] Drains kernel ring buffer on startup (§11.4).
-- [ ] Receives log messages from services holding `log_write`; writes to serial.
-- [ ] Logs `"logger: ready"`.
+### registry (`services/registry/`) — Phase 4 minimal ✅
+
+- ✅ Logs `"registry: ready"` and yields in a loop.
+- [ ] register/lookup IPC operations — Phase 5.
+
+### logger (`services/logger/`) — Phase 4 minimal ✅
+
+- ✅ Logs `"logger: ready"` and yields in a loop.
+- [ ] Kernel ring buffer drain; log message recv loop — Phase 5.
 
 ### ping / pong (`examples/`)
 

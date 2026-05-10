@@ -57,14 +57,14 @@ pub unsafe extern "C" fn syscall_handler(
 ) -> i64 {
     match number {
         n if n == SyscallNumber::Send    as u64 => handle_send(arg0, arg1, arg2),
-        n if n == SyscallNumber::Recv    as u64 => handle_recv(arg0),
+        n if n == SyscallNumber::Recv    as u64 => handle_recv(arg0, arg1, arg2),
         n if n == SyscallNumber::TrySend as u64 => handle_try_send(arg0, arg1, arg2),
         n if n == SyscallNumber::Yield   as u64 => {
             crate::task::scheduler::yield_current();
             0
         }
         n if n == SyscallNumber::Log     as u64 => handle_log(arg0, arg1, arg2),
-        n if n == SyscallNumber::Spawn   as u64 => handle_spawn(arg0, arg1),
+        n if n == SyscallNumber::Spawn   as u64 => handle_spawn(arg0, arg1, arg2),
         n if n == SyscallNumber::Kill    as u64 => handle_kill(arg0),
         _ => -1, // Unknown syscall.
     }
@@ -141,32 +141,54 @@ unsafe fn handle_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     }
 }
 
-unsafe fn handle_recv(cap_slot: u64) -> i64 {
+/// arg0 = cap_slot, arg1 = out_buf_ptr (user VA), arg2 = out_buf_len.
+///
+/// Blocks until a message is dequeued from the endpoint, then copies the
+/// payload into the caller-supplied buffer.  Returns the number of bytes
+/// written on success, or a negative error code.
+unsafe fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
     let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::RECV) {
         Ok(c)  => c,
         Err(e) => return cap_err_to_i64(e),
     };
     let endpoint_id = EndpointId(cap.resource_id.0);
 
+    let buf_len = out_len as usize;
+    if buf_len == 0 || buf_len > MAX_MESSAGE_SIZE {
+        return -1;
+    }
+    if !validate_user_slice(out_buf, buf_len) {
+        return -1;
+    }
+
     let my_slot = scheduler::current_task_slot();
 
     loop {
-        // dequeue atomically records us as a blocked receiver if QueueEmpty.
         match crate::ipc::routing::dequeue(endpoint_id, cap.generation, Some(my_slot)) {
             Ok((msg, sender_to_wake)) => {
                 if let Some(slot) = sender_to_wake {
                     scheduler::wake_by_slot(slot, 0);
                 }
-                scheduler::store_recv_message(msg);
-                return 0;
+                // Copy payload to the caller's user-space buffer.
+                let payload  = msg.payload_bytes();
+                let copy_len = payload.len().min(buf_len);
+                // SAFETY: validate_user_slice confirmed [out_buf, out_buf+buf_len) is
+                // in user space and non-overlapping with kernel memory.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        payload.as_ptr(),
+                        out_buf as *mut u8,
+                        copy_len,
+                    );
+                }
+                return copy_len as i64;
             }
             Err(IpcError::QueueEmpty) => {
-                // We are now recorded in the routing table as a blocked receiver.
                 let err = scheduler::block_and_reschedule(TaskState::BlockedOnRecv);
                 if err != 0 {
                     return err;
                 }
-                // Sender enqueued a message and woke us; loop to dequeue it.
+                // Sender woke us; loop to dequeue the message.
             }
             Err(e) => return ipc_err_to_i64(e),
         }
@@ -215,18 +237,45 @@ unsafe fn build_message(msg_ptr: u64, msg_len: u64) -> Result<Message, i64> {
 }
 
 // ---------------------------------------------------------------------------
-// Syscall: Spawn (7) / Kill (8) — Phase 3 stubs; full impl in Phase 4.
+// Syscall: Spawn (7) / Kill (8).
 // ---------------------------------------------------------------------------
 
-/// arg0 = name_ptr, arg1 = name_len. Capability required: spawn right (Phase 4).
-unsafe fn handle_spawn(_name_ptr: u64, _name_len: u64) -> i64 {
-    // Phase 4: validate spawn cap, look up service by name, call task::spawn_service.
-    -1
+/// arg0 = spawn_cap_slot, arg1 = name_ptr (user VA), arg2 = name_len.
+///
+/// Validates the spawn capability, reads the service name from user space,
+/// then calls `task::spawn_service_by_name`.  Phase 4 always spawns on core 0;
+/// Phase 5 will add the §9.2 placement rules once the supervisor reads the manifest.
+unsafe fn handle_spawn(spawn_cap_slot: u64, name_ptr: u64, name_len: u64) -> i64 {
+    // Validate spawn capability.
+    let cap = match scheduler::current_task_lookup_cap(spawn_cap_slot as usize, Rights::WRITE) {
+        Ok(c)  => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    if cap.resource_id != crate::capability::SPAWN_RESOURCE {
+        return cap_err_to_i64(CapError::CapWrongScope);
+    }
+
+    // Read service name from user space.
+    let len = name_len as usize;
+    if len == 0 || len > 64 { return -1; }
+    if !validate_user_slice(name_ptr, len) { return -1; }
+    // SAFETY: validate_user_slice confirmed [name_ptr, name_ptr+len) is in user space.
+    let name_bytes = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, len) };
+    let name = match core::str::from_utf8(name_bytes) {
+        Ok(s)  => s,
+        Err(_) => return -1,
+    };
+
+    // Spawn on core 0 (Phase 4 default; Phase 5 adds placement from §9.2).
+    match crate::task::spawn_service_by_name(name, 0) {
+        Ok(())  => 0,
+        Err(_)  => -1,
+    }
 }
 
-/// arg0 = task identifier (name or slot). Capability required: service_control (Phase 4).
+/// arg0 = task identifier (name or slot). Capability required: service_control.
 unsafe fn handle_kill(_target: u64) -> i64 {
-    // Phase 4: validate kill cap, call task::kill_by_id.
+    // Phase 5: validate service_control cap, call task::kill_by_id.
     -1
 }
 

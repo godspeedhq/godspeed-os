@@ -11,13 +11,14 @@
 
 use crate::capability::{CapError, CapHandle};
 use crate::ipc::{IpcError, Message};
+use crate::syscall::raw_syscall;
 
 // ---------------------------------------------------------------------------
 // ServiceContextData page layout.
 // MUST match `ServiceContextData` in `kernel/src/task/mod.rs`.
 // ---------------------------------------------------------------------------
 
-const SERVICE_CTX_ADDR: u64 = 0x3ff000;
+const SERVICE_CTX_ADDR:  u64 = 0x3ff000;
 const SERVICE_CTX_MAGIC: u32 = 0xD0_5D_EA_D5;
 
 /// Layout of the kernel-written page at SERVICE_CTX_ADDR.
@@ -26,7 +27,7 @@ struct ServiceContextData {
     magic:          u32,
     log_write_slot: u32,  // u32::MAX = not held
     recv_slot:      u32,  // u32::MAX = not held
-    _pad:           u32,
+    spawn_slot:     u32,  // u32::MAX = not held
 }
 
 // ---------------------------------------------------------------------------
@@ -54,35 +55,44 @@ impl ServiceContext {
 
     /// Look up a named capability from this service's cap table.
     ///
-    /// Name format matches the contract key: `"log_write"`, `"ipc_send.pong"`, etc.
+    /// Name format matches the contract key: `"log_write"`, `"spawn"`, etc.
     pub fn capability(&self, name: &str) -> Result<CapHandle, CapError> {
         let data = Self::ctx();
         if data.magic != SERVICE_CTX_MAGIC { return Err(CapError::CapNotHeld); }
         match name {
             "log_write" if data.log_write_slot != u32::MAX =>
                 Ok(CapHandle(data.log_write_slot)),
+            "spawn" if data.spawn_slot != u32::MAX =>
+                Ok(CapHandle(data.spawn_slot)),
             _ => Err(CapError::CapNotHeld),
         }
     }
 
-    /// Block until a message arrives on this service's receive endpoint.
+    /// Block until a message arrives on this service's primary receive endpoint.
     pub fn recv(&self) -> Message {
-        todo!("Phase 4: call ipc::recv on this service's primary receive endpoint")
+        let data = Self::ctx();
+        if data.magic != SERVICE_CTX_MAGIC { loop {} }
+        let slot = data.recv_slot;
+        if slot == u32::MAX { loop {} } // no recv endpoint configured
+        match crate::ipc::recv(CapHandle(slot)) {
+            Ok(msg) => msg,
+            Err(_) => loop {},
+        }
     }
 
     /// Send to a named peer declared in `ipc_send`.
     pub fn send(&self, peer: &str, msg: &Message) -> Result<(), IpcError> {
-        todo!("Phase 4: look up peer cap, call ipc::send")
+        todo!("Phase 5: look up peer cap by name, call ipc::send — peer={}", peer)
     }
 
-    /// Non-blocking send; returns QueueFull immediately.
+    /// Non-blocking send; returns `QueueFull` immediately.
     pub fn try_send(&self, peer: &str, msg: &Message) -> Result<(), IpcError> {
-        todo!("Phase 4: look up peer cap, call ipc::try_send")
+        todo!("Phase 5: look up peer cap by name, call ipc::try_send — peer={}", peer)
     }
 
     /// Advisory yield (§9.3).
     pub fn yield_cpu(&self) {
-        // SAFETY: syscall instruction is always valid from ring-3.
+        // SAFETY: syscall(4) = Yield; always valid from ring-3.
         unsafe { raw_syscall(4, 0, 0, 0); }
     }
 
@@ -97,20 +107,14 @@ impl ServiceContext {
         let len   = bytes.len();
         if len == 0 || len > 256 { return; }
 
-        // SAFETY: syscall instruction is valid from ring-3; bytes is a valid slice.
+        // SAFETY: syscall(5) = Log; bytes is a valid slice within user space.
         unsafe {
-            raw_syscall(
-                5,
-                slot as u64,
-                bytes.as_ptr() as u64,
-                len as u64,
-            );
+            raw_syscall(5, slot as u64, bytes.as_ptr() as u64, len as u64);
         }
     }
 
     /// Log a formatted message.
     pub fn log_fmt(&self, args: core::fmt::Arguments) {
-        // Stack-allocate a small buffer for formatting.
         let mut buf = [0u8; 256];
         let mut cursor = 0usize;
         let _ = core::fmt::write(
@@ -124,74 +128,57 @@ impl ServiceContext {
 
     /// Drain the kernel ring buffer. Called once by logger at startup (§11.4).
     pub fn drain_kernel_ring_buffer(&self) {
-        todo!("Phase 4: syscall to drain kernel ring buffer")
+        todo!("Phase 5: syscall to drain kernel ring buffer")
     }
 
-    /// Spawn a service by name (init only — §11.1).
-    pub fn spawn(&self, _name: &str) -> Result<(), crate::Error> {
-        // Phase 4: syscall Spawn with name ptr+len; returns Ok on success.
-        // Phase 3 stub returns Ok so init's spawn calls succeed harmlessly.
-        Ok(())
+    /// Spawn a service by name via the Spawn syscall (syscall 7).
+    ///
+    /// Requires this service to hold a spawn capability.
+    /// The kernel looks up the service ELF by name and spawns on core 0.
+    pub fn spawn(&self, name: &str) -> Result<(), crate::Error> {
+        let data = Self::ctx();
+        if data.magic != SERVICE_CTX_MAGIC {
+            return Err(crate::Error::InvalidArgument);
+        }
+        let slot = data.spawn_slot;
+        if slot == u32::MAX {
+            return Err(crate::Error::Cap(CapError::CapNotHeld));
+        }
+        let bytes = name.as_bytes();
+        // SAFETY: syscall(7) = Spawn; slot is from kernel-written page; bytes is valid.
+        let ret = unsafe {
+            raw_syscall(7, slot as u64, bytes.as_ptr() as u64, bytes.len() as u64)
+        };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(crate::Error::InvalidArgument)
+        }
     }
 
     /// Spawn a service from a full descriptor (supervisor only — §14.1).
     pub fn spawn_service(&self, service: &ServiceDescriptor) -> Result<(), crate::Error> {
-        todo!("Phase 4: syscall Spawn from binary + contract")
+        todo!("Phase 5: syscall Spawn from binary + contract")
     }
 
     /// Restart a service with optional core override (supervisor only — §14.4).
     pub fn restart(&self, name: &str, core_override: Option<u32>) -> Result<(), crate::Error> {
-        todo!("Phase 4: syscall Kill then Spawn per §9.2 placement rules")
+        todo!("Phase 5: syscall Kill then Spawn per §9.2 placement rules")
     }
 
     /// Receive a service death notification (supervisor only).
     pub fn recv_death_notification(&self) -> Option<&str> {
-        todo!("Phase 4: block on the supervisor's death-notification endpoint")
+        todo!("Phase 5: block on the supervisor's death-notification endpoint")
     }
 
     /// Read the boot manifest (supervisor only — §11.1).
     pub fn read_boot_manifest(&self) -> BootManifest {
-        todo!("Phase 4: read the manifest embedded in the kernel image")
+        todo!("Phase 5: read the manifest embedded in the kernel image")
     }
 
     pub fn recv_log_message(&self) -> Message {
         self.recv()
     }
-}
-
-// ---------------------------------------------------------------------------
-// Raw syscall wrapper.
-// ---------------------------------------------------------------------------
-
-/// Issue a three-argument syscall.
-///
-/// Calling convention (matches `syscall_entry.rs` stub):
-///   rax = syscall number
-///   rdi = arg0, rsi = arg1, rdx = arg2
-/// Return value in rax.
-///
-/// SYSCALL clobbers rcx (saves user RIP) and r11 (saves user RFLAGS);
-/// SYSRETQ restores them from the kernel-pushed values.
-///
-/// # Safety
-/// The caller is responsible for passing valid arguments for the given syscall.
-#[inline]
-unsafe fn raw_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
-    let ret: i64;
-    // SAFETY: SYSCALL transitions to ring-0 and back; valid from ring-3 at any time.
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inout("rax") nr => ret,
-            in("rdi") a0,
-            in("rsi") a1,
-            in("rdx") a2,
-            out("rcx") _,   // clobbered: SYSCALL stores user RIP here
-            out("r11") _,   // clobbered: SYSCALL stores user RFLAGS here
-            options(nostack),
-        );
-    }
-    ret
 }
 
 // ---------------------------------------------------------------------------
@@ -215,7 +202,7 @@ impl<'a> core::fmt::Write for StackWriter<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// Placeholder types (Phase 4).
+// Placeholder types (Phase 5).
 // ---------------------------------------------------------------------------
 
 pub struct ServiceDescriptor;
