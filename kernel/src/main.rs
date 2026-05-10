@@ -328,8 +328,9 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     };
 
     // ping on core 0 (BSP), pong on core 1 (first AP) — cross-core IPC demo.
-    task::scheduler::enqueue("ping", ctx_ping, caps_ping, 0);
-    task::scheduler::enqueue("pong", ctx_pong, caps_pong, 1);
+    // Ring-0 kernel tasks: is_user=false, kernel_stack_top=0.
+    task::scheduler::enqueue("ping", ctx_ping, caps_ping, 0, false, 0);
+    task::scheduler::enqueue("pong", ctx_pong, caps_pong, 1, false, 0);
 
     kprintln!("scheduler: ping (core 0) and pong (core 1) enqueued");
 

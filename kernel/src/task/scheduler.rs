@@ -45,6 +45,12 @@ static mut TASK_WAKEUP_ERR: [i64; MAX_TASKS]  = [0i64; MAX_TASKS];
 /// Last message received by each task (filled by `store_recv_message`).
 static mut TASK_RECV_BUF: [Option<Message>; MAX_TASKS] =
     [const { None }; MAX_TASKS];
+/// Whether each task runs in ring-3 (true) or ring-0 (false).
+static mut TASK_IS_USER: [bool; MAX_TASKS] = [false; MAX_TASKS];
+/// Top of each ring-3 task's kernel stack (used to set TSS.rsp0 and
+/// PER_CORE_SYSCALL.kernel_rsp before every switch to that task).
+/// Zero for ring-0 tasks.
+static mut TASK_KERNEL_STACK_TOP: [u64; MAX_TASKS] = [0u64; MAX_TASKS];
 
 
 // ---------------------------------------------------------------------------
@@ -78,8 +84,20 @@ fn current_core_id() -> usize {
 // ---------------------------------------------------------------------------
 
 /// Add a task to the run queue, pinned to `core_id`.
+///
+/// `is_user`          — true for ring-3 tasks (uses SYSCALL/SYSRETQ).
+/// `kernel_stack_top` — top of the task's kernel stack; must be 16-byte
+///                      aligned and non-zero for ring-3 tasks, zero for ring-0.
+///
 /// Called before preemption is enabled (single-threaded context).
-pub fn enqueue(name: &'static str, ctx: TaskContext, caps: CapTable, core_id: u32) {
+pub fn enqueue(
+    name:             &'static str,
+    ctx:              TaskContext,
+    caps:             CapTable,
+    core_id:          u32,
+    is_user:          bool,
+    kernel_stack_top: u64,
+) {
     // SAFETY: called from BSP before any AP scheduler starts.
     unsafe {
         for i in 0..MAX_TASKS {
@@ -87,9 +105,11 @@ pub fn enqueue(name: &'static str, ctx: TaskContext, caps: CapTable, core_id: u3
                 TASK_CTX[i].write(ctx);
                 TASK_CAP[i].write(caps);
                 TASK_STATE[i].store(TaskState::Ready as u8, Ordering::Relaxed);
-                TASK_NAME[i]  = name;
-                TASK_VALID[i] = true;
-                TASK_CORE[i]  = core_id;
+                TASK_NAME[i]              = name;
+                TASK_VALID[i]             = true;
+                TASK_CORE[i]              = core_id;
+                TASK_IS_USER[i]           = is_user;
+                TASK_KERNEL_STACK_TOP[i]  = kernel_stack_top;
                 return;
             }
         }
@@ -142,6 +162,31 @@ pub fn current_task_insert_cap(cap: Capability) -> Result<usize, CapError> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Ring-3 switch preparation.
+// ---------------------------------------------------------------------------
+
+/// Update per-core SYSCALL data and TSS.rsp0 before switching to a ring-3 task.
+///
+/// Must be called (with IF=0) immediately before every `switch_context` whose
+/// incoming task is a ring-3 task.  This ensures:
+///   • `PER_CORE_SYSCALL[cid].kernel_rsp` → correct kernel stack for SYSCALL.
+///   • `TSS[cid].rsp0`                   → correct kernel stack for hardware
+///                                          interrupts that hit ring-3 code.
+///
+/// # Safety
+/// IF must be 0.  `slot` must be a valid ring-3 task slot.
+unsafe fn prepare_ring3_switch(core_id: usize, slot: usize) {
+    // SAFETY: TASK_KERNEL_STACK_TOP[slot] is set at enqueue; we have IF=0.
+    let ksp = unsafe { TASK_KERNEL_STACK_TOP[slot] };
+    // SAFETY: PER_CORE_SYSCALL lives in .data; single writer (this core).
+    unsafe {
+        crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[core_id].kernel_rsp = ksp;
+    }
+    // SAFETY: set_tss_rsp0 writes only to TSS_PER_CORE[core_id].rsp0.
+    unsafe { crate::arch::x86_64::boot::set_tss_rsp0(core_id, ksp) };
+}
+
 /// Enter the scheduler loop on the calling core. Never returns.
 pub fn run(core_id: u32) -> ! {
     let cid = core_id as usize;
@@ -172,6 +217,9 @@ pub fn run(core_id: u32) -> ! {
                     core::arch::asm!("cli", options(nostack, nomem));
                     TASK_STATE[next].store(TaskState::Running as u8, Ordering::Relaxed);
                     CORE_CURRENT[cid] = next;
+                    if TASK_IS_USER[next] {
+                        prepare_ring3_switch(cid, next);
+                    }
                     let sched    = &raw mut CORE_SCHED_CTX[cid];
                     let next_ctx = TASK_CTX[next].assume_init_ref() as *const TaskContext;
                     switch_context(sched, next_ctx);
@@ -241,6 +289,10 @@ pub extern "C" fn timer_tick_from_irq() {
         TASK_STATE[next].store(TaskState::Running as u8, Ordering::Relaxed);
         CORE_CURRENT[cid] = next;
 
+        if TASK_IS_USER[next] {
+            prepare_ring3_switch(cid, next);
+        }
+
         let current_ctx: *mut TaskContext = if prev < MAX_TASKS && TASK_VALID[prev] {
             TASK_CTX[prev].assume_init_mut() as *mut TaskContext
         } else {
@@ -289,6 +341,10 @@ pub fn yield_current() {
 
         TASK_STATE[next].store(TaskState::Running as u8, Ordering::Relaxed);
         CORE_CURRENT[cid] = next;
+
+        if TASK_IS_USER[next] {
+            prepare_ring3_switch(cid, next);
+        }
 
         let current_ctx: *mut TaskContext = if prev < MAX_TASKS && TASK_VALID[prev] {
             TASK_CTX[prev].assume_init_mut() as *mut TaskContext
@@ -384,6 +440,9 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
             Some(next) => {
                 TASK_STATE[next].store(TaskState::Running as u8, Ordering::Relaxed);
                 CORE_CURRENT[cid] = next;
+                if TASK_IS_USER[next] {
+                    prepare_ring3_switch(cid, next);
+                }
                 let next_ctx = TASK_CTX[next].assume_init_ref() as *const TaskContext;
                 switch_context(current_ctx, next_ctx);
             }

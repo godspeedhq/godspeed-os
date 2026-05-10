@@ -2,19 +2,73 @@
 
 use super::BootInfo;
 
+const MAX_CORES: usize = crate::smp::core::MAX_CORES;
+
 // ---------------------------------------------------------------------------
-// GDT — three 64-bit descriptors: null, kernel code (0x08), kernel data (0x10).
-// ---------------------------------------------------------------------------
+// GDT — eight 64-bit descriptors (per core).
 //
-// x86 sets the Accessed bit in GDT descriptors when segment registers are
-// loaded, which is a hardware write to the GDT.  It must live in .data (rw-),
-// not .rodata (r--), or the CPU will fault with a write-protection violation.
-#[link_section = ".data"]
-static GDT: [u64; 3] = [
-    0x0000_0000_0000_0000, // null descriptor
-    0x00AF_9A00_0000_FFFF, // kernel code: 64-bit, ring 0, execute/read
-    0x00CF_9200_0000_FFFF, // kernel data: ring 0, read/write
+// Slot  Selector  Descriptor
+//   0    0x00      null
+//   1    0x08      kernel code: 64-bit, ring-0, execute/read
+//   2    0x10      kernel data: ring-0, read/write
+//   3    0x18      placeholder — SYSRETQ needs the 0x18 base to derive
+//                  user SS (0x18+8=0x20) and CS (0x18+16=0x28)
+//   4    0x20      user data:   ring-3, read/write
+//   5    0x28      user code:   64-bit, ring-3, execute/read
+//   6    0x30  ]   TSS descriptor (16-byte system descriptor = 2 slots)
+//   7    0x38  ]
+//
+// STAR MSR encodes kernel CS at [47:32]=0x08 and SYSRETQ base at [63:48]=0x18.
+//
+// The CPU writes the Accessed bit into segment descriptors, and `ltr` writes
+// the "busy" bit into the TSS descriptor — both require .data (writable).
+// ---------------------------------------------------------------------------
+
+const GDT_TEMPLATE: [u64; 8] = [
+    0x0000_0000_0000_0000, // null
+    0x00AF_9A00_0000_FFFF, // kernel code  (0x08): 64-bit, ring-0, X/R
+    0x00CF_9200_0000_FFFF, // kernel data  (0x10): ring-0, R/W
+    0x0000_0000_0000_0000, // placeholder  (0x18): required for SYSRETQ alignment
+    0x00CF_F200_0000_FFFF, // user data    (0x20): ring-3, R/W
+    0x00AF_FA00_0000_FFFF, // user code    (0x28): 64-bit, ring-3, X/R
+    0x0000_0000_0000_0000, // TSS low      (0x30): filled by init_gdt(core_id)
+    0x0000_0000_0000_0000, // TSS high     (0x38): filled by init_gdt(core_id)
 ];
+
+#[link_section = ".data"]
+static mut GDT_PER_CORE: [[u64; 8]; MAX_CORES] = [GDT_TEMPLATE; MAX_CORES];
+
+// ---------------------------------------------------------------------------
+// TSS (Task State Segment) — one per core.
+//
+// The CPU uses TSS.rsp0 when a ring-3 task is interrupted (hardware switches
+// to ring-0 and pushes the interrupt frame starting at rsp0).  We update rsp0
+// before every switch to a ring-3 task so each task has its own kernel stack.
+// ---------------------------------------------------------------------------
+
+#[repr(C, packed)]
+struct Tss {
+    _res0:       u32,        // offset   0
+    rsp0:        u64,        // offset   4  ← ring-0 stack on ring-3 interrupt
+    rsp1:        u64,        // offset  12  (unused)
+    rsp2:        u64,        // offset  20  (unused)
+    _res1:       u64,        // offset  28
+    ist:         [u64; 7],   // offset  36..92  (IST stacks, unused in v1)
+    _res2:       u64,        // offset  92
+    _res3:       u16,        // offset 100
+    io_map_base: u16,        // offset 102  (104 = past limit → no IOPB → ring-3 I/O faults)
+}
+
+// io_map_base = 104: the IOPB base is past the TSS limit (103), so the CPU
+// denies all port I/O from ring-3 (services must use MMIO caps instead).
+#[link_section = ".data"]
+static mut TSS_PER_CORE: [Tss; MAX_CORES] = [const {
+    Tss {
+        _res0: 0, rsp0: 0, rsp1: 0, rsp2: 0,
+        _res1: 0, ist: [0; 7], _res2: 0, _res3: 0,
+        io_map_base: 104,
+    }
+}; MAX_CORES];
 
 // ---------------------------------------------------------------------------
 // IDT — 256 interrupt gates.
@@ -82,7 +136,7 @@ const APIC_TIMER_DIVIDE: u64 = 0x3E0;
 // Public init surface.
 // ---------------------------------------------------------------------------
 
-/// BSP-only initialisation: GDT, IDT (with timer stub), paging stub.
+/// BSP-only initialisation: GDT, TSS, IDT, paging, SYSCALL MSRs.
 /// APIC timer is programmed separately via `init_local_apic` after memory init.
 ///
 /// # Safety
@@ -90,9 +144,10 @@ const APIC_TIMER_DIVIDE: u64 = 0x3E0;
 pub unsafe fn init_bsp(boot_info: &BootInfo) {
     unsafe {
         mask_pic();   // silence 8259 before IDT is live; avoids vector-8 collision
-        init_gdt();
+        init_gdt(0);
         init_idt();
         init_paging(boot_info);
+        init_syscall(0);
     }
 }
 
@@ -235,22 +290,74 @@ unsafe fn write_apic(base: u64, reg: u64, val: u32) {
     unsafe { ((base + reg) as *mut u32).write_volatile(val) };
 }
 
-/// Load our 64-bit GDT and reload all segment registers.
+/// Build a 16-byte TSS descriptor (two 8-byte GDT slots) for `tss_ptr`.
+///
+/// Returns `(low_qword, high_qword)` to be stored at GDT[6..=7].
+fn make_tss_descriptor(tss_ptr: *const Tss) -> (u64, u64) {
+    let base  = tss_ptr as u64;
+    let limit = (core::mem::size_of::<Tss>() - 1) as u64; // 103 = 0x67
+
+    // Low qword bit fields (Intel manual vol.3 §3.4.5, §7.2.3):
+    //   [15:0]   limit[15:0]
+    //   [31:16]  base[15:0]
+    //   [39:32]  base[23:16]
+    //   [47:40]  type/dpl/present: 0x89 = P=1, DPL=0, S=0, type=9 (64-bit avail TSS)
+    //   [51:48]  limit[19:16]       (0 for a 104-byte TSS)
+    //   [55:52]  flags              (G=0, D=0, L=0, AVL=0)
+    //   [63:56]  base[31:24]
+    let lo: u64 = (limit & 0xFFFF)
+        | ((base & 0xFFFF) << 16)
+        | (((base >> 16) & 0xFF) << 32)
+        | (0x89u64 << 40)
+        | (((limit >> 16) & 0xF) << 48)
+        | (((base >> 24) & 0xFF) << 56);
+
+    // High qword: base[63:32] in the low 32 bits; upper 32 bits reserved = 0.
+    let hi: u64 = base >> 32;
+
+    (lo, hi)
+}
+
+/// Load the per-core GDT (with TSS descriptor), reload segment registers,
+/// and install the TSS via `ltr`.
 ///
 /// # Safety
-/// Must be called with a valid stack; invalidates the current CS/DS/ES/SS.
-pub(super) unsafe fn init_gdt() {
+/// Called once per core (BSP from `init_bsp`, APs from `ap_init`) with a
+/// valid stack. Invalidates the current CS/DS/ES/SS until they are reloaded.
+pub(super) unsafe fn init_gdt(core_id: u32) {
+    let cid = core_id as usize;
+
+    // Fill the TSS descriptor into slots 6 and 7 of this core's GDT.
+    // SAFETY: GDT_PER_CORE and TSS_PER_CORE live in .data; single writer per
+    // core (only this core touches its own slot during init).
+    unsafe {
+        let tss_ptr = &raw const TSS_PER_CORE[cid];
+        let (lo, hi) = make_tss_descriptor(tss_ptr);
+        GDT_PER_CORE[cid][6] = lo;
+        GDT_PER_CORE[cid][7] = hi;
+    }
+
     let desc = TableDescriptor {
-        limit: (core::mem::size_of_val(&GDT) - 1) as u16,
-        base:  GDT.as_ptr() as u64,
+        limit: (core::mem::size_of::<[u64; 8]>() - 1) as u16,
+        base:  unsafe { GDT_PER_CORE[cid].as_ptr() } as u64,
     };
-    // SAFETY: GDT lives in .data (writable); desc is valid for the duration of lgdt.
+
+    // SAFETY: GDT_PER_CORE[cid] is valid .data memory; desc outlives the lgdt.
     unsafe {
         core::arch::asm!(
             "lgdt [{desc}]",
             desc = in(reg) &desc as *const TableDescriptor as u64,
             options(nostack, readonly)
         );
+
+        // Load TSS: selector 0x30 = index 6 * 8 (GDT, RPL=0).
+        // ltr marks the TSS descriptor as "busy" in the per-core GDT.
+        core::arch::asm!(
+            "ltr ax",
+            in("ax") 0x30u16,
+            options(nostack, nomem),
+        );
+
         core::arch::asm!(
             "mov ds, ax",
             "mov es, ax",
@@ -260,7 +367,8 @@ pub(super) unsafe fn init_gdt() {
             in("ax") 0x10u16,
             options(nostack)
         );
-        // Reload CS via far return: push [CS, RIP], retfq pops RIP then CS.
+        // Reload CS via far return: push [new CS selector, next RIP]; retfq pops
+        // RIP then CS — the only way to change CS in 64-bit mode.
         core::arch::asm!(
             "push {sel}",
             "lea {tmp}, [rip + 99f]",
@@ -271,6 +379,103 @@ pub(super) unsafe fn init_gdt() {
             tmp = lateout(reg) _,
             options(nostack)
         );
+    }
+}
+
+/// Enable SYSCALL/SYSRETQ and configure the SYSCALL entry MSRs for this core.
+///
+/// MSRs written:
+///   EFER.SCE   — enables SYSCALL/SYSRETQ instructions.
+///   STAR        — kernel CS (0x08) and SYSRETQ user-segment base (0x18).
+///   LSTAR       — address of `syscall_entry` (our SYSCALL handler).
+///   SFMASK      — RFLAGS bits to clear on SYSCALL entry (clears IF = bit 9).
+///
+/// Also writes `IA32_KERNEL_GS_BASE` via `init_per_core_syscall` so the entry
+/// stub can access per-core data via `swapgs`.
+///
+/// # Safety
+/// Called once per core after `init_gdt` (requires GDT and segment registers
+/// to be valid so that SYSCALL/SYSRETQ can use the configured selectors).
+pub(super) unsafe fn init_syscall(core_id: u32) {
+    // STAR: bits [47:32] = kernel CS on SYSCALL (0x08) → SS = 0x08+8 = 0x10.
+    //       bits [63:48] = SYSRETQ base (0x18) → user CS = 0x18+16 = 0x28,
+    //                                             user SS = 0x18+8  = 0x20.
+    const STAR: u64 = (0x0018u64 << 48) | (0x0008u64 << 32);
+
+    // SFMASK: clear IF (bit 9) on SYSCALL so the stub always runs with IF=0.
+    const SFMASK: u64 = 1 << 9;
+
+    // SAFETY: all WRMSR/RDMSR in ring-0 are always valid on x86_64.
+    unsafe {
+        // Enable SYSCALL/SYSRETQ in EFER (bit 0 = SCE).
+        let (efer_lo, efer_hi): (u32, u32);
+        core::arch::asm!(
+            "rdmsr",
+            in("ecx")  0xC000_0080u32,
+            out("eax") efer_lo,
+            out("edx") efer_hi,
+            options(nostack, nomem),
+        );
+        let efer = ((efer_hi as u64) << 32) | (efer_lo as u64) | 1u64;
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") 0xC000_0080u32,
+            in("eax") efer as u32,
+            in("edx") (efer >> 32) as u32,
+            options(nostack, nomem),
+        );
+
+        // STAR MSR.
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") 0xC000_0081u32,
+            in("eax") STAR as u32,
+            in("edx") (STAR >> 32) as u32,
+            options(nostack, nomem),
+        );
+
+        // LSTAR MSR — address of the SYSCALL entry point.
+        let lstar = super::syscall_entry::syscall_entry as u64;
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") 0xC000_0082u32,
+            in("eax") lstar as u32,
+            in("edx") (lstar >> 32) as u32,
+            options(nostack, nomem),
+        );
+
+        // SFMASK MSR.
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") 0xC000_0084u32,
+            in("eax") SFMASK as u32,
+            in("edx") (SFMASK >> 32) as u32,
+            options(nostack, nomem),
+        );
+    }
+
+    // Set IA32_KERNEL_GS_BASE for this core's SYSCALL stub (§8.2).
+    // SAFETY: called during init, before any ring-3 task runs.
+    unsafe { super::syscall_entry::init_per_core_syscall(core_id as usize) };
+}
+
+/// Update TSS.rsp0 for `core_id` to `rsp`.
+///
+/// Called by the scheduler before every context switch TO a ring-3 task so
+/// that hardware interrupts hitting ring-3 code push their frame onto the
+/// correct per-task kernel stack (§9.2, §14.1).
+///
+/// # Safety
+/// Caller must ensure `core_id < MAX_CORES` and `rsp` is a valid kernel stack
+/// top for the incoming ring-3 task.
+pub unsafe fn set_tss_rsp0(core_id: usize, rsp: u64) {
+    // SAFETY: TSS_PER_CORE lives in .data; rsp0 is at byte offset 4 of the
+    // packed struct. write_unaligned is used because packed structs have
+    // alignment 1 — taking a &mut reference would be UB.
+    unsafe {
+        let tss = &raw mut TSS_PER_CORE[core_id];
+        let rsp0_ptr = core::ptr::addr_of_mut!((*tss).rsp0);
+        rsp0_ptr.write_unaligned(rsp);
     }
 }
 

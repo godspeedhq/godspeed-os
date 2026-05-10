@@ -73,12 +73,30 @@ fn cmd_new(name: &str) {
 }
 
 fn cmd_build() {
+    // Services must be compiled before the kernel — kernel/build.rs embeds
+    // the service ELF bytes via include_bytes!(env!("SVC_*_ELF")).
+    let service_crates = [
+        "init", "supervisor", "registry", "logger", "ping", "pong",
+    ];
+    for crate_name in &service_crates {
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--release", "-p", crate_name,
+                   "--target", "x86_64-unknown-none"])
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run cargo build for {}: {}", crate_name, e));
+        if !status.success() {
+            eprintln!("build: {} FAILED", crate_name);
+            std::process::exit(1);
+        }
+        println!("build: {} OK", crate_name);
+    }
+
     let status = std::process::Command::new("cargo")
         .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
         .status()
-        .expect("failed to run cargo build");
+        .expect("failed to run cargo build for kernel");
     if !status.success() {
-        eprintln!("kernel build failed");
+        eprintln!("build: kernel FAILED");
         std::process::exit(1);
     }
     println!("build: kernel OK");

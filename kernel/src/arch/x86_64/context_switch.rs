@@ -42,6 +42,28 @@ unsafe extern "C" fn task_entry_trampoline() -> ! {
     )
 }
 
+/// First-entry trampoline for new ring-3 tasks.
+///
+/// On entry (via `switch_context`'s `ret`), the kernel stack contains:
+///   [RSP+0]  user_rip   — ring-3 entry point
+///   [RSP+8]  user_rsp   — initial user-space stack pointer
+///
+/// Pops both, sets R11=0x202 (RFLAGS: IF=1, reserved bit 1), then executes
+/// SYSRETQ to enter ring-3.  The `cli` from `switch_context` is in effect
+/// throughout, so no interrupt fires while RSP holds a user-space address.
+#[unsafe(naked)]
+unsafe extern "C" fn ring3_entry_trampoline() -> ! {
+    // SAFETY: stack layout guaranteed by `new_user`.  SYSRETQ uses
+    // RCX as the new RIP and R11 as the new RFLAGS; it restores the
+    // ring-3 selector pair from STAR, setting CPL=3 atomically.
+    core::arch::naked_asm!(
+        "pop rcx",          // user_rip → rcx (SYSRETQ new RIP)
+        "pop rsp",          // user_rsp → rsp (switches to user stack; still ring-0)
+        "mov r11, 0x202",   // RFLAGS: IF=1 (bit 9) + reserved bit 1; SYSRETQ restores
+        "sysretq",          // → ring-3 at rcx, rsp=user_rsp, rflags=0x202
+    )
+}
+
 impl TaskContext {
     /// Build the initial context for a kernel task.
     ///
@@ -78,6 +100,58 @@ impl TaskContext {
         TaskContext {
             rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0,
             rip: entry as u64,
+            rsp: sp as u64,
+            cr3,
+        }
+    }
+
+    /// Build the initial context for a ring-3 task.
+    ///
+    /// `kernel_stack_top` — one-past-end of the **kernel** stack for this task
+    ///                       (16-byte aligned; used for SYSCALL and hardware interrupts).
+    /// `user_entry`       — ring-3 entry point virtual address.
+    /// `user_stack_top`   — initial user-space RSP (one-past-end of user stack).
+    /// `cr3`              — user page-table root.
+    ///
+    /// # Safety
+    /// `kernel_stack_top` must point to writable kernel memory with at least
+    /// 32 bytes available below it.  `user_entry` and `user_stack_top` must be
+    /// valid addresses in the user address space mapped by `cr3`.
+    pub unsafe fn new_user(
+        kernel_stack_top: *mut u8,
+        user_entry:       u64,
+        user_stack_top:   u64,
+        cr3:              u64,
+    ) -> Self {
+        // Kernel-stack layout built here (high → low addresses):
+        //   [kernel_stack_top -  8]: alignment padding (0)
+        //   [kernel_stack_top - 16]: user_rsp  ← ring3_entry_trampoline pops this into RSP
+        //   [kernel_stack_top - 24]: user_rip  ← ring3_entry_trampoline pops this into RCX
+        //   [kernel_stack_top - 32]: ring3_entry_trampoline addr ← switch_context `ret` target
+        //
+        // switch_context `ret` with RSP = kernel_stack_top-32:
+        //   → RIP = ring3_entry_trampoline, RSP = kernel_stack_top-24
+        //
+        // ring3_entry_trampoline:
+        //   pop rcx  → rcx = user_rip,  RSP = kernel_stack_top-16
+        //   pop rsp  → rsp = user_rsp   (switches to user stack)
+        //   sysretq  → ring-3 at user_rip with rsp=user_rsp, rflags=0x202
+        //
+        // SAFETY: caller guarantees kernel_stack_top is valid and writable.
+        let sp = unsafe {
+            let sp = (kernel_stack_top as *mut u64).sub(1);
+            sp.write(0u64);                                  // alignment padding
+            let sp = sp.sub(1);
+            sp.write(user_stack_top);                        // user_rsp
+            let sp = sp.sub(1);
+            sp.write(user_entry);                            // user_rip
+            let sp = sp.sub(1);
+            sp.write(ring3_entry_trampoline as u64);         // first ret target
+            sp
+        };
+        TaskContext {
+            rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0,
+            rip: user_entry,
             rsp: sp as u64,
             cr3,
         }

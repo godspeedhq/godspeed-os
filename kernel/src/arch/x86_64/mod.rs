@@ -8,6 +8,7 @@ pub mod boot;
 pub mod context_switch;
 pub mod interrupts;
 pub mod page_tables;
+pub mod syscall_entry;
 
 use limine::request::{HhdmRequest, MemmapRequest, MpRequest};
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
@@ -175,12 +176,12 @@ pub fn init_timer() {
 
 /// Per-AP hardware initialisation called from `ap_main`.
 pub fn ap_init(core_id: u32) {
-    let _ = core_id;
     // SAFETY: called once per AP from ap_main after long-mode entry.
     unsafe {
-        boot::init_gdt();
+        boot::init_gdt(core_id);
         boot::init_idt();
         boot::init_local_apic();
+        boot::init_syscall(core_id);
     }
 }
 
