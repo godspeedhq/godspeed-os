@@ -1651,6 +1651,48 @@ The routing table field (`node_id: u32`) is a one-line addition. The substantial
 
 Adding `node_id` to the routing table now is a free and correct step. It does not meaningfully reduce the clustering work because the hard parts are in the items listed above, not in the field itself.
 
+### Developer experience with `send_remote`
+
+An application that communicates cross-node is written explicitly cluster-aware — but only at the boundary it crosses. Everything else is unchanged.
+
+**Contract declaration:**
+
+```toml
+[capabilities]
+ipc_send        = ["pong"]     # local — same-node send, current semantics
+ipc_send_remote = ["ledger"]   # explicit cross-node send, different failure domain
+```
+
+**SDK call sites:**
+
+```rust
+// Local service — identical to today
+let pong = ctx.send_cap("pong")?;
+pong.send(msg)?;
+
+// Remote service — developer explicitly opts into a different failure domain
+let ledger = ctx.remote_send_cap("ledger")?;
+ledger.send_remote(msg, Duration::from_millis(500))?;
+```
+
+The call site is honest about what domain it is in. `RemoteSendCap` is a distinct type from `LocalSendCap` — the compiler prevents accidentally calling `send()` on a remote endpoint. That is "explicit authority" applied to distributed systems: the capability reflects the contract it carries.
+
+**The registry is the cluster-aware component, not the application.**
+
+When the app calls `ctx.remote_send_cap("ledger")`, the SDK queries the registry, which resolves `"ledger"` to `(NodeId=2, CoreId=0, EndpointId=7, Generation=3)`. The application receives a cap. It does not know or care which node — only that it is remote and must provide a timeout. The registry abstracts node topology; the application sees a name.
+
+**Mobility still works the same way.**
+
+If `ledger` restarts on node 3, the client receives `RemoteEndpointDead`, queries the registry, and gets a new `RemoteSendCap` pointing to the new location. The reacquire pattern is identical to the current local restart flow. No new error-handling logic is required — the application was already written to handle endpoint death because it knew it was talking cross-node.
+
+**What does not change.**
+
+An application that never declares `ipc_send_remote` in its contract is entirely local. It compiles and runs identically whether or not the machine is part of a cluster. Cluster semantics do not leak into local services. The boundary is the contract: you opt into distributed behavior explicitly, not through runtime discovery.
+
+**The same-node optimisation.**
+
+If `ledger` is declared `ipc_send_remote` but happens to be running on the same node as the caller, the kernel can optimise the path internally. The developer never sees this — they always use `send_remote` with a timeout, and the kernel routes efficiently. Correctness does not depend on the optimisation.
+
 ---
 
 # Appendix D: Shell, Scripting, and Utility Ecosystem (Non-Normative, Far Future)
