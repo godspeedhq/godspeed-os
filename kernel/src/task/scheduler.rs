@@ -571,8 +571,33 @@ pub fn kill_task_by_slot(slot: usize) {
             crate::capability::table::mark_dead_resource(resource_id);
         }
 
-        // Note: memory reclaim (TLB shootdown, frame free) is deferred.
-        // For Phase 5 the page table leaks on kill; full reclaim is Phase 6.
+        // Reclaim all user-space frames: walk the page table, flush all TLBs,
+        // then return each frame to the allocator (§10.5).
+        if TASK_IS_USER[slot] {
+            let cr3 = TASK_CTX[slot].assume_init_ref().cr3;
+            if cr3 != 0 {
+                // SAFETY: cr3 is the task's PML4 set at spawn and immutable
+                // until now.  Task is Dead; no core will schedule it.
+                let buf = crate::arch::x86_64::page_tables::reclaim_user_frames(cr3);
+                // SAFETY: APIC is initialised; broadcast_full_tlb_flush manages
+                // its own interrupt-flag save/restore.
+                crate::smp::ipi::broadcast_full_tlb_flush();
+                for &phys_addr in buf.as_slice() {
+                    // SAFETY: phys_addr came from this task's page table, so it
+                    // was allocated from the frame allocator and is now ours to free.
+                    let frame = crate::memory::frame::Frame::from_phys(
+                        crate::memory::frame::PhysAddr(phys_addr)
+                    );
+                    crate::memory::allocator::free_frame(frame);
+                }
+                crate::kprintln!(
+                    "kill_task: slot={} reclaimed {} frames", slot, buf.as_slice().len()
+                );
+            }
+        }
+
+        // Release the slot so reserve_task_slot can reuse it.
+        TASK_VALID[slot] = false;
     }
 }
 

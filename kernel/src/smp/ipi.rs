@@ -99,12 +99,84 @@ pub unsafe fn ipi_handler(vector: u8) {
     unsafe { crate::arch::x86_64::boot::apic_send_eoi() }
 }
 
+/// Broadcast a full TLB flush to all other cores and flush locally (§10.5).
+///
+/// Used when an entire address space is torn down (task death) so that all
+/// non-global TLB entries are invalidated on every core before the backing
+/// frames are returned to the allocator.
+///
+/// Saves and restores the caller's interrupt flag, so this may be called
+/// with interrupts either enabled or disabled.
+///
+/// # Safety
+/// The local APIC must be initialised.
+pub unsafe fn broadcast_full_tlb_flush() {
+    // Save interrupt flag and disable interrupts for the shootdown protocol.
+    // SAFETY: pushfq/cli are always valid in ring 0.
+    let rflags: u64;
+    unsafe {
+        core::arch::asm!("pushfq; pop {}", out(reg) rflags, options(nostack));
+        core::arch::asm!("cli", options(nostack, nomem));
+    }
+
+    // Flush locally: reload CR3 invalidates all non-global TLB entries on this core.
+    // SAFETY: CR3 reload with the same value is always valid in ring 0.
+    unsafe {
+        let cr3: u64;
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem));
+        core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, nomem));
+    }
+
+    let ncores = crate::smp::core::ready_count();
+    if ncores > 1 {
+        // !0u64 is the sentinel that tells remote handlers to do a full CR3
+        // reload rather than a single-page invlpg.
+        // SAFETY: single writer; IF=0 prevents a racing per-page shootdown from
+        // overwriting TLB_SHOOTDOWN_ADDR between our write and the remote reads.
+        unsafe { TLB_SHOOTDOWN_ADDR = !0u64; }
+        TLB_ACK.store(0, Ordering::SeqCst);
+
+        let apic_base = unsafe { crate::arch::x86_64::boot::get_apic_virt_base() };
+
+        // All-excluding-self broadcast, fixed delivery, edge trigger, assert (bit 14).
+        // SAFETY: APIC mapped; IF=0.
+        unsafe {
+            write_apic_reg(apic_base + APIC_ICR_HIGH, 0);
+            write_apic_reg(
+                apic_base + APIC_ICR_LOW,
+                (vectors::TLB_SHOOTDOWN as u32) | (1 << 14) | (0b11 << 18),
+            );
+        }
+
+        let expected = ncores - 1;
+        while TLB_ACK.load(Ordering::SeqCst) < expected {
+            core::hint::spin_loop();
+        }
+    }
+
+    // Restore the caller's interrupt flag.
+    // SAFETY: push/popfq restores exactly the flags in effect on entry.
+    unsafe {
+        core::arch::asm!("push {}; popfq", in(reg) rflags, options(nostack));
+    }
+}
+
 fn handle_tlb_shootdown() {
     // SAFETY: TLB_SHOOTDOWN_ADDR is written before the broadcast and read-only
     // until TLB_ACK reaches the expected count.
     let addr = unsafe { TLB_SHOOTDOWN_ADDR };
-    // SAFETY: invlpg is always safe in ring 0; addr is a virtual address.
-    unsafe { core::arch::asm!("invlpg [{addr}]", addr = in(reg) addr, options(nostack)); }
+    if addr == !0u64 {
+        // Full-flush sentinel: reload CR3 to invalidate all non-global TLB entries.
+        // SAFETY: CR3 reload with the same value is always valid in ring 0.
+        unsafe {
+            let cr3: u64;
+            core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem));
+            core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, nomem));
+        }
+    } else {
+        // SAFETY: invlpg is always safe in ring 0; addr is a virtual address.
+        unsafe { core::arch::asm!("invlpg [{addr}]", addr = in(reg) addr, options(nostack)); }
+    }
     TLB_ACK.fetch_add(1, Ordering::SeqCst);
 }
 

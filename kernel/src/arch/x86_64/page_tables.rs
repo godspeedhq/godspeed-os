@@ -307,3 +307,81 @@ pub enum MapError {
     AlreadyMapped,
     NotMapped,
 }
+
+// ---------------------------------------------------------------------------
+// Frame reclaim — used at task death (§10.5).
+// ---------------------------------------------------------------------------
+
+/// A bounded collection of physical addresses gathered during page-table teardown.
+pub struct ReclaimBuffer {
+    addrs: [u64; 512],
+    len:   usize,
+}
+
+impl ReclaimBuffer {
+    fn new() -> Self {
+        Self { addrs: [0u64; 512], len: 0 }
+    }
+
+    fn push(&mut self, phys: u64) {
+        if self.len < self.addrs.len() {
+            self.addrs[self.len] = phys;
+            self.len += 1;
+        }
+        // Silent drop if buffer is full; caller sees a shorter slice and logs.
+    }
+
+    /// Collected physical addresses to free.
+    pub fn as_slice(&self) -> &[u64] {
+        &self.addrs[..self.len]
+    }
+}
+
+/// Walk the user half (PML4 entries 0–255) of the address space rooted at
+/// `cr3` and collect every physical frame address into a `ReclaimBuffer` —
+/// both leaf data frames and intermediate page-table frames.
+///
+/// The kernel half (entries 256–511) is shared across all address spaces and
+/// is NOT collected.
+///
+/// The caller must issue a full TLB flush on all cores before freeing the
+/// returned frames (§10.5).
+///
+/// # Safety
+/// - `cr3` must be the root PML4 of a task already marked Dead.
+/// - HHDM must be initialised.
+pub unsafe fn reclaim_user_frames(cr3: u64) -> ReclaimBuffer {
+    let mut buf   = ReclaimBuffer::new();
+    let pml4_phys = cr3 & !0xFFFu64;
+
+    for pml4_i in 0..256usize {
+        let pdpt_phys = match walk(pml4_phys, pml4_i) {
+            Some(p) => p,
+            None    => continue,
+        };
+        for pdpt_i in 0..512usize {
+            let pd_phys = match walk(pdpt_phys, pdpt_i) {
+                Some(p) => p,
+                None    => continue,
+            };
+            for pd_i in 0..512usize {
+                let pt_phys = match walk(pd_phys, pd_i) {
+                    Some(p) => p,
+                    None    => continue,
+                };
+                for pt_i in 0..512usize {
+                    // SAFETY: pt_phys is a valid page-table frame; HHDM covers it.
+                    let pte = unsafe { read_entry(pt_phys, pt_i) };
+                    if entry_present(pte) {
+                        buf.push(entry_phys(pte));   // leaf data frame
+                    }
+                }
+                buf.push(pt_phys);   // PT frame itself
+            }
+            buf.push(pd_phys);       // PD frame
+        }
+        buf.push(pdpt_phys);         // PDPT frame
+    }
+    buf.push(pml4_phys);             // PML4 root frame
+    buf
+}
