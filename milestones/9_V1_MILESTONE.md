@@ -2,7 +2,7 @@
 
 > All §23.2 acceptance criteria met. The system is done.
 
-Completed at commit `TBD` — tagged `v1.0`.
+Completed at commit `2e0dc13` — tagged `v1.0`.
 
 ---
 
