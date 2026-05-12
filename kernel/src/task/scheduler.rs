@@ -270,16 +270,6 @@ unsafe fn prepare_ring3_switch(core_id: usize, slot: usize) {
     // SAFETY: TASK_KERNEL_STACK_TOP[slot] is set at enqueue; we have IF=0.
     let ksp = unsafe { TASK_KERNEL_STACK_TOP[slot] };
 
-    // Diagnostic: warn when user_rsp looks suspicious (0 = never ran or
-    // never did a syscall; 0x80000000 = stack top leaked in as a saved RSP).
-    let dbg_ursp = unsafe { TASK_USER_RSP[slot] };
-    if dbg_ursp == 0 || dbg_ursp >= 0x7FFF_0000 {
-        crate::kprintln!(
-            "diag: prepare_ring3 core={} slot={} '{}' user_rsp={:#x} ksp={:#x}",
-            core_id, slot, unsafe { TASK_NAME[slot] }, dbg_ursp, ksp
-        );
-    }
-
     // SYSCALL entry must start 512 bytes below K0T, NOT at K0T.
     //
     // Both the timer ISR (via TSS.rsp0 → K0T) and SYSCALL entry would otherwise
@@ -377,6 +367,12 @@ pub extern "C" fn timer_tick_from_irq() {
     // SAFETY: IF=0 throughout (interrupt gate clears IF on entry).
     unsafe {
         crate::arch::x86_64::boot::apic_send_eoi();
+
+        // Poll the COM2 control channel on every core-0 timer tick (§17).
+        // The idle branch can't be relied on when core 0 always has ready tasks.
+        if cid == 0 {
+            crate::control::process_pending();
+        }
 
         let prev = CORE_CURRENT[cid];
 

@@ -56,7 +56,6 @@ pub unsafe extern "C" fn syscall_handler(
     arg1: u64,
     arg2: u64,
 ) -> i64 {
-    crate::kprintln!("syscall: nr={} a0={:#x} a1={:#x} a2={:#x}", number, arg0, arg1, arg2);
     match number {
         n if n == SyscallNumber::Send           as u64 => handle_send(arg0, arg1, arg2),
         n if n == SyscallNumber::Recv           as u64 => handle_recv(arg0, arg1, arg2),
@@ -81,16 +80,6 @@ pub unsafe extern "C" fn syscall_handler(
 ///
 /// Requires `Rights::WRITE` on `LOG_WRITE_RESOURCE`.
 unsafe fn handle_log(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
-    // Diagnostic: print the saved user RSP at syscall entry so we can detect
-    // corruption before SYSRETQ loads it.
-    {
-        let cid = crate::task::scheduler::current_core();
-        // SAFETY: GS.base = &PER_CORE_SYSCALL[cid] in ring-0; user_rsp at offset 0.
-        let saved_ursp: u64 = unsafe {
-            crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[cid].user_rsp
-        };
-        crate::kprintln!("diag: Log syscall core={} user_rsp_saved={:#x}", cid, saved_ursp);
-    }
     let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::WRITE) {
         Ok(c) => c,
         Err(e) => return cap_err_to_i64(e),
