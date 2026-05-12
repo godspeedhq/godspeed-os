@@ -1602,7 +1602,7 @@ The routing table generalizes from `EndpointId → CoreId` to `EndpointId → (N
 
 The remote IPC API uses a distinct call surface (`send_remote` with explicit timeout) rather than transparent routing. The existing constitution invariants settle this: a successful local `send` guarantees queue delivery on this machine; a successful remote `send` guarantees handoff to a transport. These are different contracts with different durability and failure obligations, and pretending otherwise is the architectural mistake transparent-clustering systems have historically made. The network boundary is visible at three layers: contract (`ipc_send_remote`), type system (`RemoteSendCap` vs `LocalSendCap`), and call site. Applications that never declare `ipc_send_remote` are entirely unaffected by cluster membership.
 
-Three questions must be resolved before cluster mode can be designed in detail: the transport protocol (shapes failure semantics and ordering guarantees), the registry consistency model (distributed name resolution is the largest single piece of work, comparable to most of v1), and cross-node TCB authority (whether a supervisor on node A governs services on node B is the central security question; cluster mode cannot ship without a resolved answer).
+Three questions must be resolved before cluster mode can ship: the transport protocol (shapes failure semantics and ordering guarantees), the registry consistency model (distributed name resolution is the largest single piece of work, comparable to most of v1), and cross-node TCB authority (whether a supervisor on node A governs services on node B is the central security question; cluster mode cannot ship without a resolved answer).
 
 ---
 
