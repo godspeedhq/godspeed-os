@@ -12,6 +12,7 @@ members = [
     "osdev",
     "examples/ping",
     "examples/pong",
+    "services/probe",
 ]
 
 # kernel and all services/examples build for the bare-metal target;

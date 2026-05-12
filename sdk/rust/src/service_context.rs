@@ -34,7 +34,8 @@ struct ServiceContextData {
     spawn_slot:      u32,
     send_peer_count: u32,
     core_id:         u32,
-    _pad:            [u32; 2],
+    probe_mode:      u32,
+    _pad:            u32,
     send_peers:      [SendPeerEntry; MAX_SEND_PEERS],
 }
 
@@ -152,6 +153,26 @@ impl ServiceContext {
         }
 
         Ok(CapHandle(new_slot))
+    }
+
+    /// Return the probe mode written by the kernel at spawn (0 for all production services).
+    pub fn probe_mode(&self) -> u32 { Self::ctx().probe_mode }
+
+    /// Return the recv cap handle for direct-handle use (e.g. wrong-right test probing).
+    pub fn recv_handle(&self) -> Option<crate::capability::CapHandle> {
+        let slot = Self::ctx().recv_slot;
+        if slot == u32::MAX { None } else { Some(crate::capability::CapHandle(slot)) }
+    }
+
+    /// Send to a specific cap handle directly, bypassing peer-name lookup.
+    ///
+    /// Used by the probe service to test kernel cap enforcement (§22 Tests 3B, 9B).
+    pub fn try_send_by_handle(
+        &self,
+        handle: crate::capability::CapHandle,
+        msg:    &crate::ipc::Message,
+    ) -> Result<(), crate::ipc::IpcError> {
+        crate::ipc::try_send(handle, msg)
     }
 
     /// Return the core this service was spawned on.

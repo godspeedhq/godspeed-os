@@ -25,6 +25,7 @@ fn main() {
         ("LOGGER",     "logger"),
         ("PING",       "ping"),
         ("PONG",       "pong"),
+        ("PROBE",      "probe"),
     ];
 
     for (env_name, bin_name) in services {

@@ -91,3 +91,10 @@ macro_rules! kprintln {
         $crate::log::write_fmt(format_args!("{}\n", format_args!($($arg)*)))
     };
 }
+
+#[macro_export]
+macro_rules! kprint {
+    ($($arg:tt)*) => {
+        $crate::log::write_fmt(format_args!($($arg)*))
+    };
+}

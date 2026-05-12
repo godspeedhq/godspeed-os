@@ -49,7 +49,29 @@ fn alloc_kstack() -> Option<*mut u8> {
             return Some(top);
         }
     }
+    crate::kprintln!("alloc_kstack: pool exhausted (all {} slots used)", TASK_KSTACK_MAX);
     None
+}
+
+/// Return a kstack to the pool.
+///
+/// `kstack_top` is the value previously returned by `alloc_kstack`
+/// (the virtual address of the byte one-past the top of the kstack).
+/// A value of 0 means the task had no kstack (ring-0 task) and is
+/// silently ignored.
+pub fn free_kstack(kstack_top: u64) {
+    if kstack_top == 0 { return; }
+    // SAFETY: KSTACK_STORAGE is a stable static; pointer arithmetic is within bounds.
+    let base = unsafe { KSTACK_STORAGE.data.as_ptr() as u64 };
+    // top = base + (idx + 1) * KSTACK_SIZE  →  idx = (top - base) / KSTACK_SIZE - 1
+    if kstack_top <= base { return; }
+    let offset = kstack_top - base;
+    if offset % KSTACK_SIZE as u64 != 0 { return; } // misaligned top — ignore
+    let idx_plus_one = offset / KSTACK_SIZE as u64;
+    if idx_plus_one == 0 || idx_plus_one > TASK_KSTACK_MAX as u64 { return; }
+    let idx = (idx_plus_one - 1) as usize;
+    // SAFETY: idx is within [0, TASK_KSTACK_MAX); single-writer kill path (IF=0).
+    unsafe { KSTACK_USED[idx] = false; }
 }
 
 // ---------------------------------------------------------------------------
@@ -84,7 +106,8 @@ struct ServiceContextData {
     spawn_slot:      u32,
     send_peer_count: u32,
     core_id:         u32,
-    _pad:            [u32; 2],
+    probe_mode:      u32,
+    _pad:            u32,
     send_peers:      [SendPeerEntry; MAX_SEND_PEERS],
 }
 
@@ -126,6 +149,8 @@ struct ServiceConfig {
     send_peers:        &'static [&'static str],
     /// Preferred core; u32::MAX = round-robin.
     preferred_core:    u32,
+    /// Written into ServiceContextData.probe_mode at spawn. 0 for all non-test services.
+    probe_mode:        u32,
 }
 
 fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
@@ -135,30 +160,111 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_recv_endpoint: false,
             send_peers:        &[],
             preferred_core:    0,
+            probe_mode:        0,
         })),
         "registry" => Some(("registry", ServiceConfig {
             elf:               include_bytes!(env!("SVC_REGISTRY_ELF")),
             has_recv_endpoint: true,
             send_peers:        &[],
             preferred_core:    0,
+            probe_mode:        0,
         })),
         "logger" => Some(("logger", ServiceConfig {
             elf:               include_bytes!(env!("SVC_LOGGER_ELF")),
             has_recv_endpoint: true,
             send_peers:        &[],
             preferred_core:    0,
+            probe_mode:        0,
         })),
         "ping" => Some(("ping", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PING_ELF")),
             has_recv_endpoint: true,
             send_peers:        &["pong", "registry"],
             preferred_core:    0,
+            probe_mode:        0,
         })),
         "pong" => Some(("pong", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PONG_ELF")),
             has_recv_endpoint: true,
             send_peers:        &[],
             preferred_core:    1,
+            probe_mode:        0,
+        })),
+        // ----------------------------------------------------------------
+        // Probe services — §22 Group A identity tests.
+        // All use the same probe ELF; probe_mode selects the test behaviour.
+        // Spawn ordering in supervisor: recv-endpoint services first, then
+        // senders that need SEND caps wired to them.
+        // ----------------------------------------------------------------
+        "probe-recv" => Some(("probe-recv", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            preferred_core:    0,
+            probe_mode:        1, // MODE_ECHO_RECV — Test 3A
+        })),
+        "probe-victim" => Some(("probe-victim", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            preferred_core:    0,
+            probe_mode:        0, // MODE_PASSIVE — killed by probe-4a in Test 4A
+        })),
+        "probe-4b-recv" => Some(("probe-4b-recv", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            preferred_core:    0,
+            probe_mode:        0, // MODE_PASSIVE — killed by harness in Test 4B
+        })),
+        "probe-3b" => Some(("probe-3b", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            preferred_core:    0,
+            probe_mode:        3, // MODE_NO_SEND_RIGHT — Test 3B
+        })),
+        "probe-sender" => Some(("probe-sender", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &["probe-recv"],
+            preferred_core:    0,
+            probe_mode:        2, // MODE_ECHO_SEND — Test 3A
+        })),
+        "probe-4a" => Some(("probe-4a", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &["probe-victim"],
+            preferred_core:    0,
+            probe_mode:        4, // MODE_SEND_AFTER_KILL — Test 4A
+        })),
+        "probe-4b-send" => Some(("probe-4b-send", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &["probe-4b-recv"],
+            preferred_core:    0,
+            probe_mode:        5, // MODE_FILL_AND_BLOCK — Test 4B
+        })),
+        "probe-yielder" => Some(("probe-yielder", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            preferred_core:    0,
+            probe_mode:        6, // MODE_YIELD_LOGGER — Test 8A
+        })),
+        "probe-hog" => Some(("probe-hog", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            preferred_core:    0,
+            probe_mode:        7, // MODE_HOG — Test 8B (preemption proven via ping)
+        })),
+        "probe-9b" => Some(("probe-9b", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            preferred_core:    0,
+            probe_mode:        8, // MODE_CAP_FORGE — Test 9B
         })),
         _ => None,
     }
@@ -191,8 +297,12 @@ pub fn spawn_service_by_name(name: &str, core_override: Option<u32>) -> Result<(
         None => cfg.preferred_core,
     };
 
-    spawn_service_with_config(static_name, cfg.elf, core_id,
-                              cfg.has_recv_endpoint, cfg.send_peers)
+    let result = spawn_service_with_config(static_name, cfg.elf, core_id,
+                              cfg.has_recv_endpoint, cfg.send_peers, cfg.probe_mode);
+    if let Err(ref e) = result {
+        crate::kprintln!("task: spawn '{}' failed: {:?}", name, e);
+    }
+    result
 }
 
 /// Low-level spawn: load ELF, wire caps, enqueue on `core_id`.
@@ -202,6 +312,7 @@ fn spawn_service_with_config(
     core_id:           u32,
     has_recv_endpoint: bool,
     send_peers:        &[&str],
+    probe_mode:        u32,
 ) -> Result<(), SpawnError> {
     // 1. Parse ELF.
     let crate::loader::LoadedElf { mut page_table, entry_va } =
@@ -232,8 +343,7 @@ fn spawn_service_with_config(
     }
 
     // 3. Reserve a task slot and initialise its CapTable directly in BSS.
-    let task_slot = scheduler::reserve_task_slot(core_id)
-        .ok_or(SpawnError::NoMemory)?;
+    let task_slot = scheduler::reserve_task_slot(core_id).ok_or(SpawnError::NoMemory)?;
     // SAFETY: task_slot was just reserved; IF=0 in syscall context.
     let caps = unsafe { scheduler::task_cap_init_empty(task_slot) };
 
@@ -317,6 +427,7 @@ fn spawn_service_with_config(
             data.spawn_slot      = 1;
             data.send_peer_count = peer_count as u32;
             data.core_id         = core_id;
+            data.probe_mode      = probe_mode;
             for i in 0..peer_count {
                 data.send_peers[i].slot     = peer_data[i].0;
                 data.send_peers[i].name_len = peer_data[i].1;
@@ -347,13 +458,14 @@ fn spawn_service_with_config(
         scheduler::commit_task(task_slot, name, ctx, true, kstack_top as u64, own_endpoint);
     }
 
+    crate::kprintln!("task: '{}' spawned OK on core {} (slot {})", name, core_id, task_slot);
     Ok(())
 }
 
 /// Spawn `init` on Core 0. Called once by `kernel_main` (§11.1).
 pub fn spawn_init() {
     let elf_bytes = include_bytes!(env!("SVC_INIT_ELF"));
-    match spawn_service_with_config("init", elf_bytes, 0, false, &[]) {
+    match spawn_service_with_config("init", elf_bytes, 0, false, &[], 0) {
         Ok(()) => crate::kprintln!("task: init spawned on core 0"),
         Err(e) => panic!("task: failed to spawn init: {:?}", e),
     }

@@ -91,30 +91,36 @@ static TESTS: &[TestSpec] = &[
     },
     TestSpec {
         id: "3A", name: "ipc_same_core_positive", spec_ref: "§22 Test 3A",
-        kind: TestKind::Blocked {
-            reason: "requires a dedicated test service — \
-                     not implemented; will be implemented when a test requires it",
+        kind: TestKind::WatchSerial {
+            expect:       &["probe: 3A recv OK", "probe: 3A send OK"],
+            fail_on:      &["KERNEL PANIC"],
+            timeout_secs: 30,
         },
     },
     TestSpec {
         id: "3B", name: "ipc_no_send_right", spec_ref: "§22 Test 3B",
-        kind: TestKind::Blocked {
-            reason: "requires a dedicated test service — \
-                     not implemented; will be implemented when a test requires it",
+        kind: TestKind::WatchSerial {
+            expect:       &["probe: 3B pass"],
+            fail_on:      &["KERNEL PANIC", "probe: 3B FAIL"],
+            timeout_secs: 30,
         },
     },
     TestSpec {
         id: "4A", name: "endpoint_death_send_returns_dead", spec_ref: "§22 Test 4A",
-        kind: TestKind::Blocked {
-            reason: "requires a dedicated test service — \
-                     not implemented; will be implemented when a test requires it",
+        kind: TestKind::WatchSerial {
+            expect:       &["probe: 4A pass"],
+            fail_on:      &["KERNEL PANIC", "probe: 4A FAIL"],
+            timeout_secs: 30,
         },
     },
     TestSpec {
         id: "4B", name: "blocked_sender_wakes_on_endpoint_death", spec_ref: "§22 Test 4B",
-        kind: TestKind::Blocked {
-            reason: "requires a dedicated test service — \
-                     not implemented; will be implemented when a test requires it",
+        kind: TestKind::WithRestart {
+            wait_for:     "probe: 4B sender blocked",
+            restart_cmd:  "KILL probe-4b-recv",
+            expect_after: &["probe: 4B pass"],
+            fail_on:      &["KERNEL PANIC", "probe: 4B FAIL"],
+            timeout_secs: 30,
         },
     },
     TestSpec {
@@ -170,16 +176,18 @@ static TESTS: &[TestSpec] = &[
     },
     TestSpec {
         id: "8A", name: "yield_advisory_works", spec_ref: "§22 Test 8A",
-        kind: TestKind::Blocked {
-            reason: "requires a dedicated test service — \
-                     not implemented; will be implemented when a test requires it",
+        kind: TestKind::WatchSerial {
+            expect:       &["probe: 8A yielder ticked"],
+            fail_on:      &["KERNEL PANIC"],
+            timeout_secs: 30,
         },
     },
     TestSpec {
         id: "8B", name: "non_yielding_service_preempted", spec_ref: "§22 Test 8B",
-        kind: TestKind::Blocked {
-            reason: "requires a dedicated test service — \
-                     not implemented; will be implemented when a test requires it",
+        kind: TestKind::WatchSerial {
+            expect:       &["ping: sent 100 messages"],
+            fail_on:      &["KERNEL PANIC"],
+            timeout_secs: 30,
         },
     },
     TestSpec {
@@ -192,9 +200,10 @@ static TESTS: &[TestSpec] = &[
     },
     TestSpec {
         id: "9B", name: "cross_core_no_authority_leak", spec_ref: "§22 Test 9B",
-        kind: TestKind::Blocked {
-            reason: "requires a dedicated test service — \
-                     not implemented; will be implemented when a test requires it",
+        kind: TestKind::WatchSerial {
+            expect:       &["probe: 9B pass"],
+            fail_on:      &["KERNEL PANIC", "probe: 9B FAIL"],
+            timeout_secs: 30,
         },
     },
     TestSpec {

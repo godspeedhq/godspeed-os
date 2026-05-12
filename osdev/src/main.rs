@@ -81,7 +81,7 @@ pub fn cmd_build() {
     // Services must be compiled before the kernel — kernel/build.rs embeds
     // the service ELF bytes via include_bytes!(env!("SVC_*_ELF")).
     let service_crates = [
-        "init", "supervisor", "registry", "logger", "ping", "pong",
+        "init", "supervisor", "registry", "logger", "ping", "pong", "probe",
     ];
     for crate_name in &service_crates {
         let status = std::process::Command::new("cargo")

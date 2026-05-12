@@ -70,6 +70,18 @@ fn execute_command(cmd: &str) {
                 Err(e) => crate::kprintln!("control: restart failed: {:?}", e),
             }
         }
+        Some("KILL") => {
+            let name = match parts.next() {
+                Some(n) => n,
+                None    => { crate::kprintln!("control: KILL missing name"); return; }
+            };
+            crate::kprintln!("control: KILL {}", name);
+            if crate::task::kill_by_name(name) {
+                crate::kprintln!("control: {} killed", name);
+            } else {
+                crate::kprintln!("control: {} not found", name);
+            }
+        }
         Some(other) => crate::kprintln!("control: unknown command '{}'", other),
         None => {}
     }

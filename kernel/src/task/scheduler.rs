@@ -596,6 +596,11 @@ pub fn kill_task_by_slot(slot: usize) {
             }
         }
 
+        // Free the kernel stack back to the pool so it can be reused.
+        if TASK_IS_USER[slot] {
+            super::free_kstack(TASK_KERNEL_STACK_TOP[slot]);
+        }
+
         // Release the slot so reserve_task_slot can reuse it.
         TASK_VALID[slot] = false;
     }
