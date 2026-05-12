@@ -117,21 +117,22 @@ Commit `d41b418`.
 - ✅ kill/restart authority — exercised via the `osdev restart` → COM2 → `control.rs`
   path rather than a supervisor IPC API. `control.rs` calls `kill_by_name` +
   `spawn_service_by_name` directly in the kernel. A supervisor-facing IPC API is
-  not implemented. Evidence: `kernel/src/control.rs`.
+  not implemented; will be implemented when a test requires it. Evidence: `kernel/src/control.rs`.
 
 ### registry (`services/registry/`) — Phase 4 minimal ✅
 
 - ✅ Logs `"registry: ready"` and yields in a loop.
 - ✅ Name resolution — done at the kernel level via `ipc::names` (new file
   `kernel/src/ipc/names.rs`) and syscall 10 (`AcquireSendCap`). Service-to-service
-  IPC for a userspace registry protocol is not implemented; it was not needed for M7 because
-  the kernel registry is sufficient for post-restart cap rebinding.
+  IPC for a userspace registry protocol is not implemented; will be implemented when a
+  test requires it. The kernel registry is sufficient for post-restart cap rebinding in M7.
 
 ### logger (`services/logger/`) — Phase 4 minimal ✅
 
 - ✅ Logs `"logger: ready"` and yields in a loop.
-- [ ] Kernel ring buffer drain; log message recv loop — not implemented.
-  `kprintln!` already mirrors all output to serial (§11.4) so this blocks nothing in M7.
+- [ ] Kernel ring buffer drain; log message recv loop — not implemented; will be
+  implemented when a test requires it. `kprintln!` already mirrors all output to
+  serial (§11.4) so this blocks nothing in M7.
 
 ### ping / pong (`examples/`)
 
@@ -185,8 +186,9 @@ proving the IPC fast path and SMP scheduler are sound). The Phase 4 service vers
   at spawn (if pong is already registered). Evidence: `task/mod.rs:272–302`.
 - ✅ COM2 initialised — `com2_init()` called from `kernel_main` before scheduler starts;
   `com2_try_read_byte()` polled in Core 0 idle loop. Evidence: `kernel/src/main.rs:199`.
-- [ ] Memory reclaim on kill (TLB shootdown, frame free) — not implemented.
-  Page table leaks on kill; noted in `kill_task_by_slot` comment.
+- [ ] Memory reclaim on kill (TLB shootdown, frame free) — not implemented; will be
+  implemented when a test requires it. Page table leaks on kill; noted in
+  `kill_task_by_slot` comment.
 
 ### SDK
 
@@ -204,7 +206,8 @@ proving the IPC fast path and SMP scheduler are sound). The Phase 4 service vers
   buffer) so services can format messages without a heap allocator.
   Evidence: `service_context.rs:180–190, 292–305`.
 - ✅ `drain_kernel_ring_buffer` — no-op stub; ring buffer is already mirrored to serial
-  at all times (§11.4). Full drain syscall not implemented.
+  at all times (§11.4). Full drain syscall not implemented; will be implemented when
+  a test requires it.
 
 ### Supervisor ✅
 
@@ -213,19 +216,22 @@ proving the IPC fast path and SMP scheduler are sound). The Phase 4 service vers
   Evidence: `services/supervisor/src/main.rs:21–23`.
 - ✅ Spawns ping on core 0. Evidence: `services/supervisor/src/main.rs:25–28`.
 - ✅ Logs `"supervisor: ready"`. Evidence: `services/supervisor/src/main.rs:30`.
-- [ ] Death-notification restart loop (auto-restart on crash) — not implemented.
-  Restart is triggered externally via `osdev restart` → control channel → kernel.
+- [ ] Death-notification restart loop (auto-restart on crash) — not implemented; will be
+  implemented when a test requires it. Restart is triggered externally via
+  `osdev restart` → control channel → kernel.
 
-### Registry — Phase 4 minimal (IPC API not implemented)
+### Registry — Phase 4 minimal (IPC API not implemented; will be implemented when a test requires it)
 
 - ✅ Logs `"registry: ready"` and yields. The M7 restart flow is served by the kernel
   name registry (`ipc::names`) directly — `AcquireSendCap` bypasses the registry
-  service. Full service-to-service IPC registry protocol is not implemented.
+  service. Full service-to-service IPC registry protocol is not implemented; will be
+  implemented when a test requires it.
 
-### Logger — Phase 4 minimal (recv loop not implemented)
+### Logger — Phase 4 minimal (recv loop not implemented; will be implemented when a test requires it)
 
 - ✅ Logs `"logger: ready"` and yields. `kprintln!` output is already mirrored to
-  serial (§11.4); IPC log forwarding from other services is not implemented.
+  serial (§11.4); IPC log forwarding from other services is not implemented; will be
+  implemented when a test requires it.
 
 ### ping ✅
 
