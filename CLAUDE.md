@@ -1574,8 +1574,7 @@ The ambition: multiple GodspeedOS instances, possibly identified by a shared tok
 
 **Why this is unusually feasible architecturally:**
 
-- Invariant 11 ("identity is stable; location is not") is the design primitive distributed systems are built on.
-- The routing table generalizes cleanly: `EndpointId → CoreId` becomes `EndpointId → (NodeId, CoreId)`.
+- Invariant 11 ("identity is stable; location is not") is the design primitive distributed systems are built on. The routing table generalizes cleanly: `EndpointId → CoreId` becomes `EndpointId → (NodeId, CoreId)`. SMP already separated identity from execution location; cluster mode extends "location" from a core to a (node, core) pair without changing the philosophy.
 - The generation-number mechanism for cross-core revocation extends to cross-node revocation.
 - The absence of POSIX, fork, shared memory, and ambient authority means none of the impossible-to-distribute primitives are baked in. Linux clustering attempts (OpenSSI, MOSIX) all foundered on `mmap`, signals, and inherited file descriptors.
 
@@ -1595,103 +1594,15 @@ The ambition: multiple GodspeedOS instances, possibly identified by a shared tok
 
 The architectural primitives in this constitution are unusually well-suited for revisiting these ideas. Whether and when to attempt it is open.
 
-## C.4 Cluster Routing: Architecture and API Questions
+## C.4 Cluster Routing: Architecture and API
 
-> This section records the design reasoning behind how routing would extend to cluster mode and why the API surface for remote IPC should be distinct from local IPC. It does not commit to a timeline or implementation.
+> Full design notes, failure semantics, flow control, ordering, registry scope, transport options, and TCB authority model live in `docs/cluster-design.md`. This section records the headline conclusions.
 
-### Routing table generalization
+The routing table generalizes from `EndpointId → CoreId` to `EndpointId → (NodeId, CoreId)`. The invariant "identity is stable; location is not" already encodes this — cluster mode extends the definition of location without changing the philosophy. The generation mechanism handles cross-node service mobility identically to how it handles cross-core restarts today.
 
-Current GodspeedOS routing resolves:
+The remote IPC API uses a distinct call surface (`send_remote` with explicit timeout) rather than transparent routing. The existing constitution invariants settle this: a successful local `send` guarantees queue delivery on this machine; a successful remote `send` guarantees handoff to a transport. These are different contracts with different durability and failure obligations, and pretending otherwise is the architectural mistake transparent-clustering systems have historically made. The network boundary is visible at three layers: contract (`ipc_send_remote`), type system (`RemoteSendCap` vs `LocalSendCap`), and call site. Applications that never declare `ipc_send_remote` are entirely unaffected by cluster membership.
 
-```
-EndpointId → CoreId
-```
-
-In a clustered model, the routing table generalizes to:
-
-```
-EndpointId → (NodeId, CoreId)
-```
-
-This extends "location" from a core to a (node, core) pair while leaving everything else — EndpointId, generation, liveness, capability structure — unchanged. The invariant "identity is stable; location is not" already encodes this: SMP taught the system that identity and execution location are separate concepts. Cluster mode extends the definition of location; it does not change the philosophy.
-
-The generation mechanism already handles service mobility across nodes correctly. When a service moves to a new node, its endpoint generation is bumped. Clients receive `EndpointDead` on their next send, look up the new endpoint via the registry, and resume with a new cap that routes to `(NodeId=2, CoreId=0)` instead of `(NodeId=0, CoreId=1)`. Client code does not change — the pattern is identical to the existing cross-core restart flow demonstrated by `restart_changes_core_transparently` (§22 Test 10).
-
-### Why the API for remote IPC should be distinct
-
-Two options exist for the developer-facing API:
-
-**Option A — Explicit remote semantics:**
-```rust
-send_remote(endpoint_cap, msg, timeout) -> Result<(), RemoteIpcError>
-```
-Makes network boundaries visible. Callers explicitly opt into different latency, retry, and failure semantics.
-
-**Option B — Transparent routing:**
-```rust
-send(endpoint_cap, msg)  // kernel resolves (NodeId, CoreId) internally
-```
-Preserves location transparency. Callers see no difference between local and remote sends.
-
-The existing invariants answer this question without needing to argue about it independently. "Loud failures, never silent" and "bounded behavior" (§3) rule out Option B on their own terms: transparent routing would mean `send()` silently paying network latency and returning errors with semantics the caller was not written to handle. That is a silent fallback — exactly what the constitution forbids.
-
-The deeper reason is what "Ok" means. A successful local `send` guarantees delivery to a queue on this machine. A successful remote `send` guarantees handoff to a transport. These are different contracts — not just different performance, but different durability, different failure domains, and different recovery obligations. Pretending they are the same primitive is the architectural mistake transparent clustering has historically made.
-
-**Tentative conclusion:** local IPC remains synchronous with its current semantics. Cross-node IPC uses a distinct API surface with explicit timeout and failure handling. This is not a retreat from the "identity over location" principle — it is an honest representation of a different failure domain using the same capability model.
-
-### What actually needs to change for cluster mode
-
-The routing table field (`node_id: u32`) is a one-line addition. The substantial work is elsewhere:
-
-- The registry must become cluster-aware: it must resolve `name → endpoint` across nodes.
-- The send path must branch on `node_id == LOCAL` vs `node_id != LOCAL`.
-- Remote sends require a transport layer with its own failure and timeout semantics.
-- `blocked_receiver` in the routing entry is currently a local task-slot index — meaningless cross-node. The wakeup mechanism for remote receivers requires a different primitive (a network acknowledgment, not a local IPI).
-- Cross-node TCB authority: does a supervisor on node A govern services on node B? This is an open question with significant security implications.
-
-Adding `node_id` to the routing table now is a free and correct step. It does not meaningfully reduce the clustering work because the hard parts are in the items listed above, not in the field itself.
-
-### Developer experience with `send_remote`
-
-An application that communicates cross-node is written explicitly cluster-aware — but only at the boundary it crosses. Everything else is unchanged.
-
-**Contract declaration:**
-
-```toml
-[capabilities]
-ipc_send        = ["pong"]     # local — same-node send, current semantics
-ipc_send_remote = ["ledger"]   # explicit cross-node send, different failure domain
-```
-
-**SDK call sites:**
-
-```rust
-// Local service — identical to today
-let pong = ctx.send_cap("pong")?;
-pong.send(msg)?;
-
-// Remote service — developer explicitly opts into a different failure domain
-let ledger = ctx.remote_send_cap("ledger")?;
-ledger.send_remote(msg, Duration::from_millis(500))?;
-```
-
-The call site is honest about what domain it is in. `RemoteSendCap` is a distinct type from `LocalSendCap` — the compiler prevents accidentally calling `send()` on a remote endpoint. That is "explicit authority" applied to distributed systems: the capability reflects the contract it carries.
-
-**The registry is the cluster-aware component, not the application.**
-
-When the app calls `ctx.remote_send_cap("ledger")`, the SDK queries the registry, which resolves `"ledger"` to `(NodeId=2, CoreId=0, EndpointId=7, Generation=3)`. The application receives a cap. It does not know or care which node — only that it is remote and must provide a timeout. The registry abstracts node topology; the application sees a name.
-
-**Mobility still works the same way.**
-
-If `ledger` restarts on node 3, the client receives `RemoteEndpointDead`, queries the registry, and gets a new `RemoteSendCap` pointing to the new location. The reacquire pattern is identical to the current local restart flow. No new error-handling logic is required — the application was already written to handle endpoint death because it knew it was talking cross-node.
-
-**What does not change.**
-
-An application that never declares `ipc_send_remote` in its contract is entirely local. It compiles and runs identically whether or not the machine is part of a cluster. Cluster semantics do not leak into local services. The boundary is the contract: you opt into distributed behavior explicitly, not through runtime discovery.
-
-**The same-node optimisation.**
-
-If `ledger` is declared `ipc_send_remote` but happens to be running on the same node as the caller, the kernel can optimise the path internally. The developer never sees this — they always use `send_remote` with a timeout, and the kernel routes efficiently. Correctness does not depend on the optimisation.
+Three questions must be resolved before cluster mode can be designed in detail: the transport protocol (shapes failure semantics and ordering guarantees), the registry consistency model (distributed name resolution is the largest single piece of work, comparable to most of v1), and cross-node TCB authority (whether a supervisor on node A governs services on node B is the central security question; cluster mode cannot ship without a resolved answer).
 
 ---
 
