@@ -10,7 +10,7 @@ use godspeed_sdk::ServiceContext;
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
-    ctx.log("pong: ready");
+    ctx.log_fmt(format_args!("pong: ready on core {}", ctx.core_id()));
 
     loop {
         let msg = ctx.recv();

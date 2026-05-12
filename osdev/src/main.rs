@@ -77,7 +77,7 @@ fn cmd_new(name: &str) {
     todo!("scaffold service directory, Cargo.toml, src/main.rs, contracts/{name}.toml from template")
 }
 
-fn cmd_build() {
+pub fn cmd_build() {
     // Services must be compiled before the kernel — kernel/build.rs embeds
     // the service ELF bytes via include_bytes!(env!("SVC_*_ELF")).
     let service_crates = [

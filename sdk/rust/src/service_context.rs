@@ -33,7 +33,8 @@ struct ServiceContextData {
     recv_slot:       u32,
     spawn_slot:      u32,
     send_peer_count: u32,
-    _pad:            [u32; 3],
+    core_id:         u32,
+    _pad:            [u32; 2],
     send_peers:      [SendPeerEntry; MAX_SEND_PEERS],
 }
 
@@ -152,6 +153,9 @@ impl ServiceContext {
 
         Ok(CapHandle(new_slot))
     }
+
+    /// Return the core this service was spawned on.
+    pub fn core_id(&self) -> u32 { Self::ctx().core_id }
 
     /// Advisory yield (§9.3).
     pub fn yield_cpu(&self) {

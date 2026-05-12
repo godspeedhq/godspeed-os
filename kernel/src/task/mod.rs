@@ -83,7 +83,8 @@ struct ServiceContextData {
     recv_slot:       u32,
     spawn_slot:      u32,
     send_peer_count: u32,
-    _pad:            [u32; 3],
+    core_id:         u32,
+    _pad:            [u32; 2],
     send_peers:      [SendPeerEntry; MAX_SEND_PEERS],
 }
 
@@ -315,6 +316,7 @@ fn spawn_service_with_config(
             data.recv_slot       = recv_slot_u32;
             data.spawn_slot      = 1;
             data.send_peer_count = peer_count as u32;
+            data.core_id         = core_id;
             for i in 0..peer_count {
                 data.send_peers[i].slot     = peer_data[i].0;
                 data.send_peers[i].name_len = peer_data[i].1;
