@@ -317,6 +317,8 @@ fn run_one(test: &TestSpec, image: &Path) -> TestOutcome {
 
         TestKind::WatchSerial { expect, fail_on, timeout_secs } => {
             let serial = serial_path(test);
+            // Truncate so poll_serial doesn't match stale content from a previous run.
+            let _ = std::fs::write(&serial, b"");
             let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
             let result = poll_serial(&serial, expect, fail_on,
                                      Instant::now() + Duration::from_secs(*timeout_secs));
@@ -326,6 +328,8 @@ fn run_one(test: &TestSpec, image: &Path) -> TestOutcome {
 
         TestKind::WithRestart { wait_for, restart_cmd, expect_after, fail_on, timeout_secs } => {
             let serial   = serial_path(test);
+            // Truncate so poll_serial doesn't match stale content from a previous run.
+            let _ = std::fs::write(&serial, b"");
             let deadline = Instant::now() + Duration::from_secs(*timeout_secs);
             let qemu     = crate::qemu::spawn_for_test(image, 4, &serial,
                                                         Some(TEST_CONTROL_PORT));
@@ -340,10 +344,13 @@ fn run_one(test: &TestSpec, image: &Path) -> TestOutcome {
             std::thread::sleep(Duration::from_millis(500));
 
             // Send restart command over COM2.
+            // Leading '\n' flushes any partial byte the UART FIFO may hold
+            // from the TCP connection setup on a freshly booted QEMU instance.
             let addr = format!("127.0.0.1:{TEST_CONTROL_PORT}");
             match std::net::TcpStream::connect(&addr) {
                 Ok(mut s) => {
-                    let _ = s.write_all(format!("{restart_cmd}\n").as_bytes());
+                    std::thread::sleep(Duration::from_millis(50));
+                    let _ = s.write_all(format!("\n{restart_cmd}\n").as_bytes());
                 }
                 Err(e) => {
                     qemu.kill();

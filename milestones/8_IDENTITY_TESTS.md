@@ -17,7 +17,7 @@ with an explicit reason.
 
 ## Phase 1 — Harness + passing tests ✅
 
-Commit `TBD`.
+Commit `e5abfa2`.
 
 ### Harness (`osdev/src/`)
 
@@ -37,7 +37,39 @@ Commit `TBD`.
 - ✅ `examples/pong/src/main.rs` — logs `"pong: ready on core N"` so
   test 10A can assert the correct core was used after restart.
 
-### Test results (Phase 1 target)
+---
+
+## Phase 2 — Fix 6B / 10B (stale log + kill-all) ✅
+
+Tests 6B and 10B were recorded as PASS in Phase 1 but were actually failing.
+Two bugs caused both to report the wrong result:
+
+### Bug 1 — Stale serial log (test harness)
+
+`-serial file:path` in QEMU **appends** to the file; previous runs accumulated
+87 k lines. `poll_serial` found `"pong: received"` in old content and
+immediately sent the `RESTART` command while the fresh QEMU was still in early
+boot (line 34 of 87 k — right after `"kernel: 4 cores ready"`). At that
+point `kill_by_name("pong")` found no task, so `spawn_service_by_name` created
+a spurious early-boot pong before the normal service stack had started.
+
+**Fix:** `osdev/src/validator.rs` — truncate the per-test log file to zero
+bytes before calling `spawn_for_test`, in both `WatchSerial` and `WithRestart`
+arms of `run_one`.
+
+### Bug 2 — `kill_by_name` only killed the first match (kernel)
+
+Because of Bug 1, two pong instances were alive simultaneously: the early-boot
+spurious one and the supervisor-spawned one. The test's actual `RESTART` command
+killed only the first task found by `find_task_by_name`, leaving the
+supervisor-spawned pong (the one ping held a cap to) alive. Ping's `try_send`
+kept succeeding; `EndpointDead` was never seen.
+
+**Fix:** `kernel/src/task/mod.rs` — `kill_by_name` now loops until
+`find_task_by_name` returns `None`, killing every live task with the given
+name before returning.
+
+### Test results (Phase 2 target)
 
 | ID  | Test name                           | Result  | Blocked reason (if any) |
 |-----|-------------------------------------|---------|--------------------------|

@@ -40,10 +40,23 @@ impl CapTable {
             .ok_or(CapError::CapNotHeld)?;
 
         // SAFETY: GLOBAL_RESOURCES read under the cap subsystem lock.
-        let record = unsafe { GLOBAL_RESOURCES.get_record(cap.resource_id) }
-            .ok_or(CapError::CapNotHeld)?;
+        let record = match unsafe { GLOBAL_RESOURCES.get_record(cap.resource_id) } {
+            Some(r) => r,
+            None => {
+                if cap.resource_id.0 >= 100 {
+                    crate::kprintln!("cap::get: ResourceId({}) not found in GLOBAL_RESOURCES",
+                        cap.resource_id.0);
+                }
+                return Err(CapError::CapNotHeld);
+            }
+        };
 
         if !cap.generation.matches(record.generation) {
+            // Only log for endpoint resources (id>=100) to avoid startup test noise.
+            if cap.resource_id.0 >= 100 {
+                crate::kprintln!("cap::get: ResourceId({}) gen mismatch cap={} rec={} liveness={:?}",
+                    cap.resource_id.0, cap.generation.0, record.generation.0, record.liveness);
+            }
             return Err(match record.liveness {
                 Liveness::Dead    => CapError::EndpointDead,
                 Liveness::Revoked => CapError::CapRevoked,

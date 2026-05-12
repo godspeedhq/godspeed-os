@@ -552,6 +552,9 @@ pub fn kill_task_by_slot(slot: usize) {
     unsafe {
         if slot >= MAX_TASKS || !TASK_VALID[slot] { return; }
 
+        crate::kprintln!("kill_task: slot={} name='{}' endpoint={:?}",
+            slot, TASK_NAME[slot], TASK_ENDPOINT[slot]);
+
         // Mark Dead atomically — this stops the scheduler from picking it.
         TASK_STATE[slot].store(TaskState::Dead as u8, Ordering::Release);
 
@@ -563,9 +566,9 @@ pub fn kill_task_by_slot(slot: usize) {
             if let Some(s) = tx_slot { wake_by_slot(s, -7); }
 
             // Mark resource dead in global cap table so generation check fails.
-            crate::capability::table::mark_dead_resource(
-                crate::capability::cap::ResourceId::from(ep_id)
-            );
+            let resource_id = crate::capability::cap::ResourceId::from(ep_id);
+            crate::kprintln!("kill_task: marking ResourceId({}) dead", resource_id.0);
+            crate::capability::table::mark_dead_resource(resource_id);
         }
 
         // Note: memory reclaim (TLB shootdown, frame free) is deferred.

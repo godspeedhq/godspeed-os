@@ -359,17 +359,18 @@ pub fn spawn_init() {
     }
 }
 
-/// Kill a running task by name.
+/// Kill all running tasks with the given name.
 ///
-/// Marks the task Dead, kills its endpoint (bumps generation, wakes blocked
-/// tasks), and marks the resource dead in the capability table.
+/// Loops until no live task with `name` remains, so duplicate instances
+/// (e.g. from a spurious early-boot spawn) are all killed before respawn.
+/// Marks each task Dead, kills its endpoint, and marks the resource dead.
 pub fn kill_by_name(name: &str) -> bool {
-    if let Some(slot) = scheduler::find_task_by_name(name) {
+    let mut found = false;
+    while let Some(slot) = scheduler::find_task_by_name(name) {
         scheduler::kill_task_by_slot(slot);
-        true
-    } else {
-        false
+        found = true;
     }
+    found
 }
 
 /// Kill the currently-running task (called from page-fault handler — §10.3).
