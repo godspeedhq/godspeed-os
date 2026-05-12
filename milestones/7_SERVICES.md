@@ -250,9 +250,17 @@ osdev restart pong --core 2
   ping: try_send via new slot → routes to core 2
 ```
 
-- [ ] Serial log confirmation that all six ready lines appear within 5 s of boot.
-- [ ] Serial log confirmation that `osdev restart pong --core 2` triggers the above
-  sequence with no kernel panic.
+- ✅ Serial log confirms all six ready lines appear within 5 s of boot.
+- ✅ Serial log confirms `osdev restart pong --core 2` triggers the full sequence
+  with no kernel panic. Observed output (commit `654b374`):
+  ```
+  control: RESTART pong core=Some(2)
+  control: pong restarted
+  ping: pong endpoint dead, reacquiring via kernel registry
+  ping: pong cap reacquired, resuming
+  pong: ready
+  ```
+  ping resumed; 626,000+ messages received post-restart. No panic.
 
 ---
 
