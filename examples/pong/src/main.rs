@@ -1,8 +1,7 @@
-//! `pong` — demonstration service. Receives messages from `ping`.
+//! `pong` — receives messages from `ping` and logs them.
 //!
 //! No contract-specified placement → supervisor places via round-robin.
-//! May land on Core 1 initially; may land on a different core after restart.
-//! Logs every received message so `osdev logs pong` shows cross-core IPC working.
+//! Initially on Core 1; after `osdev restart pong --core 2`, may land elsewhere.
 
 #![no_std]
 #![no_main]

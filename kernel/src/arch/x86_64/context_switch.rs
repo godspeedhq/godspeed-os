@@ -48,15 +48,21 @@ unsafe extern "C" fn task_entry_trampoline() -> ! {
 ///   [RSP+0]  user_rip   — ring-3 entry point
 ///   [RSP+8]  user_rsp   — initial user-space stack pointer
 ///
-/// Pops both, sets R11=0x202 (RFLAGS: IF=1, reserved bit 1), then executes
-/// SYSRETQ to enter ring-3.  The `cli` from `switch_context` is in effect
-/// throughout, so no interrupt fires while RSP holds a user-space address.
+/// GS invariant: this function always runs in ring-0 with GS.base = kernel ptr.
+/// `swapgs` restores the user's GS (0) into GS.base before SYSRETQ, so that the
+/// ring-3 task sees GS.base=0 and its first SYSCALL's `swapgs` correctly loads
+/// the kernel ptr back into GS.base.
+///
+/// The `cli` from `switch_context` is in effect throughout, so no interrupt fires
+/// while RSP holds a user-space address.
 #[unsafe(naked)]
 unsafe extern "C" fn ring3_entry_trampoline() -> ! {
-    // SAFETY: stack layout guaranteed by `new_user`.  SYSRETQ uses
-    // RCX as the new RIP and R11 as the new RFLAGS; it restores the
+    // SAFETY: stack layout guaranteed by `new_user`.  GS invariant: ring-0 holds
+    // GS.base=kernel_ptr; `swapgs` exchanges it with KERNEL_GS_BASE=0 (user GS).
+    // SYSRETQ uses RCX as the new RIP and R11 as the new RFLAGS; it restores the
     // ring-3 selector pair from STAR, setting CPL=3 atomically.
     core::arch::naked_asm!(
+        "swapgs",           // GS.base: kernel_ptr → 0 (user); KERNEL_GS_BASE: 0 → kernel_ptr
         "pop rcx",          // user_rip → rcx (SYSRETQ new RIP)
         "pop rsp",          // user_rsp → rsp (switches to user stack; still ring-0)
         "mov r11, 0x202",   // RFLAGS: IF=1 (bit 9) + reserved bit 1; SYSRETQ restores
@@ -115,7 +121,7 @@ impl TaskContext {
     ///
     /// # Safety
     /// `kernel_stack_top` must point to writable kernel memory with at least
-    /// 32 bytes available below it.  `user_entry` and `user_stack_top` must be
+    /// 512 bytes available below it.  `user_entry` and `user_stack_top` must be
     /// valid addresses in the user address space mapped by `cr3`.
     pub unsafe fn new_user(
         kernel_stack_top: *mut u8,
@@ -123,29 +129,51 @@ impl TaskContext {
         user_stack_top:   u64,
         cr3:              u64,
     ) -> Self {
-        // Kernel-stack layout built here (high → low addresses):
-        //   [kernel_stack_top -  8]: alignment padding (0)
-        //   [kernel_stack_top - 16]: user_rsp  ← ring3_entry_trampoline pops this into RSP
-        //   [kernel_stack_top - 24]: user_rip  ← ring3_entry_trampoline pops this into RCX
-        //   [kernel_stack_top - 32]: ring3_entry_trampoline addr ← switch_context `ret` target
+        // Kernel-stack layout built here (high → low addresses, K0T = kernel_stack_top):
         //
-        // switch_context `ret` with RSP = kernel_stack_top-32:
-        //   → RIP = ring3_entry_trampoline, RSP = kernel_stack_top-24
+        //   [K0T-368]: user_rsp  — ring3_entry_trampoline's `pop rsp` target
+        //   [K0T-376]: user_rip  — ring3_entry_trampoline's `pop rcx` target
+        //   [K0T-384]: ring3_entry_trampoline — switch_context `ret` target; ctx.rsp
+        //
+        // WHY K0T-384, not the obvious K0T-32:
+        //
+        // When the timer fires from ring-3 the CPU uses TSS.rsp0 = K0T and pushes
+        // the interrupt frame (SS, RSP, RFLAGS, CS, RIP), placing CS = 0x2b at
+        // exactly [K0T-32].  The ISR stub then saves 9 caller-saved registers
+        // ([K0T-40]..[K0T-112]) and calls timer_tick_from_irq, whose own frame
+        // reaches approximately K0T-260 on the early-return path (no context switch).
+        //
+        // Placing ring3_entry_trampoline at K0T-32 puts it in the CPU interrupt
+        // frame's CS slot: the very first timer tick from ring-3 overwrites it with
+        // 0x2b, and any subsequent zero-init in the kernel stack clobbers it to 0x0,
+        // causing the scheduler's next `ret` to jump to rip=0 → page fault → crash.
+        //
+        // K0T-384 is:
+        //   • Below the early-return ISR depth (~K0T-260) — the timer ISR on the
+        //     no-switch path cannot reach it, so [K0T-384] is never overwritten
+        //     before the first real context switch updates TASK_CTX[slot].rsp.
+        //   • Above the SYSCALL kernel_rsp (K0T-512) — SYSCALL grows downward
+        //     from K0T-512, so it can never write upward to K0T-384.
+        //   • After the first real context switch, switch_context saves the current
+        //     RSP (inside the ISR frame, ~K0T-200) into TASK_CTX[slot].rsp, making
+        //     [K0T-384] dead data that is never consulted again.
+        //
+        // switch_context `ret` with RSP = K0T-384:
+        //   → RIP = ring3_entry_trampoline, RSP = K0T-376
         //
         // ring3_entry_trampoline:
-        //   pop rcx  → rcx = user_rip,  RSP = kernel_stack_top-16
+        //   swapgs
+        //   pop rcx  → rcx = user_rip,  RSP = K0T-368
         //   pop rsp  → rsp = user_rsp   (switches to user stack)
-        //   sysretq  → ring-3 at user_rip with rsp=user_rsp, rflags=0x202
+        //   sysretq  → ring-3 at user_rip, rsp=user_rsp, rflags=0x202
         //
         // SAFETY: caller guarantees kernel_stack_top is valid and writable.
         let sp = unsafe {
-            let sp = (kernel_stack_top as *mut u64).sub(1);
-            sp.write(0u64);                                  // alignment padding
-            let sp = sp.sub(1);
+            let sp = (kernel_stack_top as *mut u64).sub(46); // K0T-368
             sp.write(user_stack_top);                        // user_rsp
-            let sp = sp.sub(1);
+            let sp = sp.sub(1);                              // K0T-376
             sp.write(user_entry);                            // user_rip
-            let sp = sp.sub(1);
+            let sp = sp.sub(1);                              // K0T-384
             sp.write(ring3_entry_trampoline as u64);         // first ret target
             sp
         };

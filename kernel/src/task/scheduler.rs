@@ -15,6 +15,7 @@ use crate::arch::x86_64::context_switch::{switch_context, TaskContext};
 use crate::capability::cap::{CapError, Capability};
 use crate::capability::rights::Rights;
 use crate::capability::table::CapTable;
+use crate::ipc::endpoint::EndpointId;
 use crate::ipc::message::Message;
 use crate::task::state::TaskState;
 
@@ -22,7 +23,7 @@ use crate::task::state::TaskState;
 // Flat task table (all cores share one array; tasks are pinned by TASK_CORE).
 // ---------------------------------------------------------------------------
 
-const MAX_TASKS: usize = 32;
+pub const MAX_TASKS: usize = 32;
 const MAX_CORES: usize = crate::smp::core::MAX_CORES;
 
 /// Sentinel meaning "no task running" (scheduler idle loop active).
@@ -51,6 +52,14 @@ static mut TASK_IS_USER: [bool; MAX_TASKS] = [false; MAX_TASKS];
 /// PER_CORE_SYSCALL.kernel_rsp before every switch to that task).
 /// Zero for ring-0 tasks.
 static mut TASK_KERNEL_STACK_TOP: [u64; MAX_TASKS] = [0u64; MAX_TASKS];
+/// The recv endpoint owned by each task (None if the task has no endpoint).
+static mut TASK_ENDPOINT: [Option<EndpointId>; MAX_TASKS] =
+    [const { None }; MAX_TASKS];
+
+/// Saved user-space RSP for each ring-3 task.  Updated whenever the task is
+/// switched away from mid-SYSCALL so the SYSRETQ exit path sees the correct
+/// per-task RSP instead of another task's value written to PER_CORE_SYSCALL.
+static mut TASK_USER_RSP: [u64; MAX_TASKS] = [0u64; MAX_TASKS];
 
 
 // ---------------------------------------------------------------------------
@@ -83,13 +92,92 @@ fn current_core_id() -> usize {
 // Public API.
 // ---------------------------------------------------------------------------
 
+/// Return the calling core's ID (0-based).
+pub fn current_core() -> usize { current_core_id() }
+
+/// Reserve a free task slot, pinned to `core_id`.
+///
+/// Marks the slot VALID (but state remains Dead) so subsequent calls to
+/// `task_cap_init_empty` and `commit_task` can use it.  The slot will not
+/// be scheduled until `commit_task` sets its state to Ready.
+///
+/// Returns `None` if all slots are occupied.
+pub fn reserve_task_slot(core_id: u32) -> Option<usize> {
+    // SAFETY: IF=0 in syscall context; single writer for this core.
+    unsafe {
+        for i in 0..MAX_TASKS {
+            if !TASK_VALID[i] {
+                TASK_VALID[i] = true;
+                TASK_CORE[i]  = core_id;
+                return Some(i);
+            }
+        }
+        None
+    }
+}
+
+/// Initialise the CapTable for a reserved slot **in-place in BSS** and return
+/// a mutable reference to it.
+///
+/// Using `write_bytes(0)` avoids placing a 1 536-byte `CapTable` on the
+/// caller's kernel stack (which would corrupt the timer-interrupt return
+/// address saved at K0T-200 — the rip=0 root cause).
+///
+/// # Safety
+/// * `slot` must have been reserved via `reserve_task_slot`.
+/// * IF=0 (syscall context).
+/// * `Option<Capability>` None is represented as all-zero bytes in Rust's
+///   enum layout for variants without niches; this is verified by the existing
+///   diagnostic that confirmed the corruption IS a zero-write.
+pub unsafe fn task_cap_init_empty(slot: usize) -> &'static mut CapTable {
+    // SAFETY: slot is reserved; write_bytes zeros all Option<Capability> discriminants
+    // to 0 (= None) with no intermediate kstack allocation.
+    unsafe {
+        core::ptr::write_bytes(
+            TASK_CAP[slot].as_mut_ptr() as *mut u8,
+            0,
+            core::mem::size_of::<CapTable>(),
+        );
+        TASK_CAP[slot].assume_init_mut()
+    }
+}
+
+/// Release a previously-reserved slot without committing (called on spawn error).
+pub fn release_task_slot(slot: usize) {
+    // SAFETY: IF=0; slot was reserved by this core.
+    unsafe { TASK_VALID[slot] = false; }
+}
+
+/// Finalise a reserved task slot: write context + metadata and mark Ready.
+///
+/// # Safety
+/// * `slot` must have been reserved and its CapTable initialised.
+/// * IF=0 (syscall context).
+pub unsafe fn commit_task(
+    slot:             usize,
+    name:             &'static str,
+    ctx:              TaskContext,
+    is_user:          bool,
+    kernel_stack_top: u64,
+    endpoint_id:      Option<EndpointId>,
+) {
+    // SAFETY: slot is reserved; IF=0 prevents concurrent modification.
+    unsafe {
+        TASK_CTX[slot].write(ctx);
+        TASK_STATE[slot].store(TaskState::Ready as u8, Ordering::Relaxed);
+        TASK_NAME[slot]             = name;
+        TASK_IS_USER[slot]          = is_user;
+        TASK_KERNEL_STACK_TOP[slot] = kernel_stack_top;
+        TASK_ENDPOINT[slot]         = endpoint_id;
+    }
+}
+
 /// Add a task to the run queue, pinned to `core_id`.
 ///
-/// `is_user`          — true for ring-3 tasks (uses SYSCALL/SYSRETQ).
-/// `kernel_stack_top` — top of the task's kernel stack; must be 16-byte
-///                      aligned and non-zero for ring-3 tasks, zero for ring-0.
-///
-/// Called before preemption is enabled (single-threaded context).
+/// Legacy single-call path kept for kernel-internal use.  New spawn code
+/// should use `reserve_task_slot` + `task_cap_init_empty` + `commit_task`
+/// to avoid a 1 536-byte `CapTable` on the kernel stack.
+#[allow(dead_code)]
 pub fn enqueue(
     name:             &'static str,
     ctx:              TaskContext,
@@ -97,6 +185,7 @@ pub fn enqueue(
     core_id:          u32,
     is_user:          bool,
     kernel_stack_top: u64,
+    endpoint_id:      Option<EndpointId>,
 ) {
     // SAFETY: called from BSP before any AP scheduler starts.
     unsafe {
@@ -105,11 +194,12 @@ pub fn enqueue(
                 TASK_CTX[i].write(ctx);
                 TASK_CAP[i].write(caps);
                 TASK_STATE[i].store(TaskState::Ready as u8, Ordering::Relaxed);
-                TASK_NAME[i]              = name;
-                TASK_VALID[i]             = true;
-                TASK_CORE[i]              = core_id;
-                TASK_IS_USER[i]           = is_user;
-                TASK_KERNEL_STACK_TOP[i]  = kernel_stack_top;
+                TASK_NAME[i]             = name;
+                TASK_VALID[i]            = true;
+                TASK_CORE[i]             = core_id;
+                TASK_IS_USER[i]          = is_user;
+                TASK_KERNEL_STACK_TOP[i] = kernel_stack_top;
+                TASK_ENDPOINT[i]         = endpoint_id;
                 return;
             }
         }
@@ -179,10 +269,40 @@ pub fn current_task_insert_cap(cap: Capability) -> Result<usize, CapError> {
 unsafe fn prepare_ring3_switch(core_id: usize, slot: usize) {
     // SAFETY: TASK_KERNEL_STACK_TOP[slot] is set at enqueue; we have IF=0.
     let ksp = unsafe { TASK_KERNEL_STACK_TOP[slot] };
+
+    // Diagnostic: warn when user_rsp looks suspicious (0 = never ran or
+    // never did a syscall; 0x80000000 = stack top leaked in as a saved RSP).
+    let dbg_ursp = unsafe { TASK_USER_RSP[slot] };
+    if dbg_ursp == 0 || dbg_ursp >= 0x7FFF_0000 {
+        crate::kprintln!(
+            "diag: prepare_ring3 core={} slot={} '{}' user_rsp={:#x} ksp={:#x}",
+            core_id, slot, unsafe { TASK_NAME[slot] }, dbg_ursp, ksp
+        );
+    }
+
+    // SYSCALL entry must start 512 bytes below K0T, NOT at K0T.
+    //
+    // Both the timer ISR (via TSS.rsp0 → K0T) and SYSCALL entry would otherwise
+    // start from the same K0T, making their stack frames overlap.  The timer ISR
+    // saves switch_context's return address at K0T-200; spawn_service_with_config's
+    // frame (which starts around K0T-192 for the SYSCALL path) covers K0T-200 and
+    // any zero-init within the frame writes 0 there — corrupting the saved return
+    // address and causing the rip=0 crash on the next resume.
+    //
+    // By starting SYSCALL at K0T-512, all SYSCALL frames live below K0T-512.
+    // K0T-200 (the timer ISR's deepest save point) is above K0T-512 and is
+    // therefore never touched by any SYSCALL frame.
+    let syscall_rsp = ksp - 512;
+
     // SAFETY: PER_CORE_SYSCALL lives in .data; single writer (this core).
     unsafe {
-        crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[core_id].kernel_rsp = ksp;
+        crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[core_id].kernel_rsp = syscall_rsp;
+        // Restore per-task user RSP so SYSRETQ loads the correct stack pointer for
+        // this task, not the value left by the last task that ran on this core.
+        crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[core_id].user_rsp =
+            TASK_USER_RSP[slot];
     }
+    // TSS.rsp0 stays at K0T so hardware interrupts (timer ISR) still enter at the top.
     // SAFETY: set_tss_rsp0 writes only to TSS_PER_CORE[core_id].rsp0.
     unsafe { crate::arch::x86_64::boot::set_tss_rsp0(core_id, ksp) };
 }
@@ -230,6 +350,10 @@ pub fn run(core_id: u32) -> ! {
                 }
             }
             None => {
+                // Core 0 drains the COM2 control channel when idle (§17).
+                if cid == 0 {
+                    crate::control::process_pending();
+                }
                 // No ready tasks for this core; sleep until the next interrupt.
                 // SAFETY: `sti; hlt` atomically enables interrupts and halts;
                 //         the next interrupt (timer or IPI) will wake the core.
@@ -289,6 +413,13 @@ pub extern "C" fn timer_tick_from_irq() {
         TASK_STATE[next].store(TaskState::Running as u8, Ordering::Relaxed);
         CORE_CURRENT[cid] = next;
 
+        // Save BEFORE prepare_ring3_switch so we capture the value from the last
+        // SYSCALL entry for `prev`, not the value prepare_ring3_switch writes for `next`.
+        if prev < MAX_TASKS && TASK_VALID[prev] && TASK_IS_USER[prev] {
+            TASK_USER_RSP[prev] =
+                crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[cid].user_rsp;
+        }
+
         if TASK_IS_USER[next] {
             prepare_ring3_switch(cid, next);
         }
@@ -341,6 +472,13 @@ pub fn yield_current() {
 
         TASK_STATE[next].store(TaskState::Running as u8, Ordering::Relaxed);
         CORE_CURRENT[cid] = next;
+
+        // Save BEFORE prepare_ring3_switch so we capture the value from SYSCALL
+        // entry, not the value prepare_ring3_switch is about to write for `next`.
+        if prev < MAX_TASKS && TASK_VALID[prev] && TASK_IS_USER[prev] {
+            TASK_USER_RSP[prev] =
+                crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[cid].user_rsp;
+        }
 
         if TASK_IS_USER[next] {
             prepare_ring3_switch(cid, next);
@@ -396,6 +534,49 @@ pub fn wake_by_slot(slot: usize, result: i64) {
     }
 }
 
+/// Find the slot of a live task by name. Returns `None` if not found or dead.
+pub fn find_task_by_name(name: &str) -> Option<usize> {
+    // SAFETY: read-only scan; caller holds no locks.
+    unsafe {
+        for i in 0..MAX_TASKS {
+            if TASK_VALID[i]
+                && TASK_NAME[i] == name
+                && TaskState::from(TASK_STATE[i].load(Ordering::Acquire)) != TaskState::Dead
+            {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// Kill a task by slot: mark Dead, kill its endpoint (if any), notify blocked tasks.
+pub fn kill_task_by_slot(slot: usize) {
+    // SAFETY: IF=0 or lock-free path; TASK_VALID[slot] checked by caller.
+    unsafe {
+        if slot >= MAX_TASKS || !TASK_VALID[slot] { return; }
+
+        // Mark Dead atomically — this stops the scheduler from picking it.
+        TASK_STATE[slot].store(TaskState::Dead as u8, Ordering::Release);
+
+        // Kill the task's endpoint if it has one.
+        if let Some(ep_id) = TASK_ENDPOINT[slot] {
+            // Bump generation in routing table and wake any blocked tasks.
+            let (rx_slot, tx_slot) = crate::ipc::routing::kill_endpoint(ep_id);
+            if let Some(s) = rx_slot { wake_by_slot(s, -7); } // -7 = EndpointDead
+            if let Some(s) = tx_slot { wake_by_slot(s, -7); }
+
+            // Mark resource dead in global cap table so generation check fails.
+            crate::capability::table::mark_dead_resource(
+                crate::capability::cap::ResourceId::from(ep_id)
+            );
+        }
+
+        // Note: memory reclaim (TLB shootdown, frame free) is deferred.
+        // For Phase 5 the page table leaks on kill; full reclaim is Phase 6.
+    }
+}
+
 /// Block the currently-running task and switch to the next ready task.
 ///
 /// Returns the wakeup result code (0 = success, negative = IpcError).
@@ -435,6 +616,13 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
         }
 
         let current_ctx = TASK_CTX[slot].assume_init_mut() as *mut TaskContext;
+
+        // Save user_rsp before switching away: the SYSRETQ exit on resume must
+        // load this task's RSP, not the value another task wrote to PER_CORE_SYSCALL.
+        if TASK_IS_USER[slot] {
+            TASK_USER_RSP[slot] =
+                crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[cid].user_rsp;
+        }
 
         match pick_next(cid) {
             Some(next) => {

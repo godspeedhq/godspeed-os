@@ -26,11 +26,28 @@ pub struct ExceptionFrame {
 /// Saves all caller-saved registers, calls `timer_tick_from_irq`, restores,
 /// then returns from interrupt.  The scheduler's `switch_context` may change
 /// RSP inside `timer_tick_from_irq`; that is intentional — see §9.1.
+///
+/// GS invariant (§8.2): ring-0 code always runs with GS.base = kernel ptr;
+/// ring-3 code runs with GS.base = 0.  An interrupt from ring-3 arrives with
+/// GS.base = 0 (the user's GS), so we must `swapgs` to load the kernel ptr
+/// before any `gs:`-relative access, and undo it before `iretq`.
+/// Interrupts from ring-0 arrive with GS.base = kernel ptr and need no swap.
+///
+/// After a context switch inside `timer_tick_from_irq`, the interrupt frame
+/// at RSP belongs to the newly scheduled task; its CS tells us whether to
+/// swapgs before that task resumes.
 #[no_mangle]
 #[unsafe(naked)]
 pub unsafe extern "C" fn timer_isr_stub() {
     // SAFETY: raw interrupt entry; all register saves are explicit.
+    // CPU-pushed interrupt frame: [rsp]=RIP, [rsp+8]=CS, [rsp+16]=RFLAGS
+    // (+RSP, SS if from ring-3).  CS low 2 bits = CPL.
     core::arch::naked_asm!(
+        // If CPL == 0 the interrupt came from ring-0; GS already holds kernel ptr.
+        "test byte ptr [rsp + 8], 3",
+        "jz 1f",
+        "swapgs",           // ring-3 → ring-0: load kernel ptr into GS.base
+        "1:",
         "push rax",
         "push rcx",
         "push rdx",
@@ -50,6 +67,11 @@ pub unsafe extern "C" fn timer_isr_stub() {
         "pop rdx",
         "pop rcx",
         "pop rax",
+        // RSP is back at the interrupt frame (possibly the new task's after a switch).
+        "test byte ptr [rsp + 8], 3",
+        "jz 2f",
+        "swapgs",           // returning to ring-3: restore user GS (0)
+        "2:",
         "iretq",
     )
 }

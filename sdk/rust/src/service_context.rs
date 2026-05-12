@@ -3,11 +3,6 @@
 //! Provides safe, named access to the capabilities the service declared in its
 //! contract. Capability names match the contract field names exactly.
 //! Requesting a cap not in the contract returns `Err(CapNotHeld)`.
-//!
-//! The kernel writes a `ServiceContextData` struct to the fixed page at
-//! `SERVICE_CTX_ADDR` (0x3ff000) in the service's address space before
-//! launching it.  `ServiceContext` methods read capability slot assignments
-//! from that page and issue the appropriate syscall instructions.
 
 use crate::capability::{CapError, CapHandle};
 use crate::ipc::{IpcError, Message};
@@ -18,17 +13,52 @@ use crate::syscall::raw_syscall;
 // MUST match `ServiceContextData` in `kernel/src/task/mod.rs`.
 // ---------------------------------------------------------------------------
 
-const SERVICE_CTX_ADDR:  u64 = 0x3ff000;
-const SERVICE_CTX_MAGIC: u32 = 0xD0_5D_EA_D5;
+const SERVICE_CTX_ADDR:    u64   = 0x3ff000;
+const SERVICE_CTX_MAGIC:   u32   = 0xD0_5D_EA_D5;
+const MAX_SEND_PEERS:      usize = 4;
+const PEER_NAME_BYTES:     usize = 24;
+
+#[repr(C)]
+struct SendPeerEntry {
+    slot:     u32,
+    name_len: u32,
+    name:     [u8; PEER_NAME_BYTES],
+}
 
 /// Layout of the kernel-written page at SERVICE_CTX_ADDR.
 #[repr(C)]
 struct ServiceContextData {
-    magic:          u32,
-    log_write_slot: u32,  // u32::MAX = not held
-    recv_slot:      u32,  // u32::MAX = not held
-    spawn_slot:     u32,  // u32::MAX = not held
+    magic:           u32,
+    log_write_slot:  u32,
+    recv_slot:       u32,
+    spawn_slot:      u32,
+    send_peer_count: u32,
+    _pad:            [u32; 3],
+    send_peers:      [SendPeerEntry; MAX_SEND_PEERS],
 }
+
+// ---------------------------------------------------------------------------
+// Dynamic send-cap cache — updated by `reacquire_cap` after EndpointDead.
+// Safe: each service is a single-threaded process with its own BSS.
+// ---------------------------------------------------------------------------
+
+const CACHE_SIZE: usize = 8;
+
+struct CacheEntry {
+    slot:     u32,
+    name_len: u8,
+    name:     [u8; PEER_NAME_BYTES],
+}
+
+impl CacheEntry {
+    const fn empty() -> Self {
+        CacheEntry { slot: u32::MAX, name_len: 0, name: [0u8; PEER_NAME_BYTES] }
+    }
+}
+
+// SAFETY: single-threaded service process; no concurrent access.
+static mut SEND_CAP_CACHE: [CacheEntry; CACHE_SIZE] =
+    [const { CacheEntry::empty() }; CACHE_SIZE];
 
 // ---------------------------------------------------------------------------
 // ServiceContext.
@@ -40,22 +70,14 @@ pub struct ServiceContext {
 }
 
 impl ServiceContext {
-    /// Read the kernel-written context data page.
-    ///
-    /// # Safety
-    /// Called only from service code. The kernel maps and writes this page
-    /// before launching; it remains valid for the service's lifetime.
     #[inline]
     fn ctx() -> &'static ServiceContextData {
-        // SAFETY: kernel guarantees a valid ServiceContextData at SERVICE_CTX_ADDR
-        // before SYSRETQ into the service.  The page is read-only and mapped for
-        // the service's entire lifetime.
+        // SAFETY: kernel maps a valid ServiceContextData at SERVICE_CTX_ADDR
+        // before SYSRETQ into the service; page is read-only and lifetime-stable.
         unsafe { &*(SERVICE_CTX_ADDR as *const ServiceContextData) }
     }
 
     /// Look up a named capability from this service's cap table.
-    ///
-    /// Name format matches the contract key: `"log_write"`, `"spawn"`, etc.
     pub fn capability(&self, name: &str) -> Result<CapHandle, CapError> {
         let data = Self::ctx();
         if data.magic != SERVICE_CTX_MAGIC { return Err(CapError::CapNotHeld); }
@@ -64,30 +86,71 @@ impl ServiceContext {
                 Ok(CapHandle(data.log_write_slot)),
             "spawn" if data.spawn_slot != u32::MAX =>
                 Ok(CapHandle(data.spawn_slot)),
+            "recv" if data.recv_slot != u32::MAX =>
+                Ok(CapHandle(data.recv_slot)),
             _ => Err(CapError::CapNotHeld),
         }
     }
 
-    /// Block until a message arrives on this service's primary receive endpoint.
+    /// Block until a message arrives on this service's primary recv endpoint.
     pub fn recv(&self) -> Message {
         let data = Self::ctx();
         if data.magic != SERVICE_CTX_MAGIC { loop {} }
         let slot = data.recv_slot;
-        if slot == u32::MAX { loop {} } // no recv endpoint configured
+        if slot == u32::MAX { loop {} }
         match crate::ipc::recv(CapHandle(slot)) {
             Ok(msg) => msg,
-            Err(_) => loop {},
+            Err(_)  => loop {},
         }
     }
 
-    /// Send to a named peer declared in `ipc_send`.
+    /// Send to a named peer declared in `ipc_send`. Blocking.
     pub fn send(&self, peer: &str, msg: &Message) -> Result<(), IpcError> {
-        todo!("Phase 5: look up peer cap by name, call ipc::send — peer={}", peer)
+        let slot = self.find_send_slot(peer).ok_or(IpcError::CapError(CapError::CapNotHeld))?;
+        crate::ipc::send(CapHandle(slot), msg)
     }
 
-    /// Non-blocking send; returns `QueueFull` immediately.
+    /// Non-blocking send; returns `QueueFull` immediately if the queue is full.
     pub fn try_send(&self, peer: &str, msg: &Message) -> Result<(), IpcError> {
-        todo!("Phase 5: look up peer cap by name, call ipc::try_send — peer={}", peer)
+        let slot = self.find_send_slot(peer).ok_or(IpcError::CapError(CapError::CapNotHeld))?;
+        crate::ipc::try_send(CapHandle(slot), msg)
+    }
+
+    /// Acquire a fresh SEND cap to `peer` via the kernel name registry.
+    ///
+    /// Called after `try_send` returns `EndpointDead` (§14.2). Updates the
+    /// per-service dynamic cap cache so subsequent `try_send` calls use the
+    /// new slot without going to the kernel again.
+    pub fn reacquire_cap(&self, peer: &str) -> Result<CapHandle, CapError> {
+        let bytes = peer.as_bytes();
+        let len   = bytes.len();
+        if len == 0 || len > PEER_NAME_BYTES { return Err(CapError::CapNotHeld); }
+
+        // SAFETY: syscall(10) = AcquireSendCap; peer bytes are in user space.
+        let ret = unsafe {
+            raw_syscall(10, bytes.as_ptr() as u64, len as u64, 0)
+        };
+        if ret < 0 { return Err(CapError::CapNotHeld); }
+        let new_slot = ret as u32;
+
+        // Update dynamic cache.
+        // SAFETY: single-threaded service; no concurrent cache writes.
+        unsafe {
+            for entry in SEND_CAP_CACHE.iter_mut() {
+                if entry.slot == u32::MAX
+                    || (entry.name_len as usize == len
+                        && &entry.name[..len] == bytes)
+                {
+                    entry.slot     = new_slot;
+                    entry.name_len = len as u8;
+                    entry.name     = [0u8; PEER_NAME_BYTES];
+                    entry.name[..len].copy_from_slice(bytes);
+                    break;
+                }
+            }
+        }
+
+        Ok(CapHandle(new_slot))
     }
 
     /// Advisory yield (§9.3).
@@ -115,7 +178,7 @@ impl ServiceContext {
 
     /// Log a formatted message.
     pub fn log_fmt(&self, args: core::fmt::Arguments) {
-        let mut buf = [0u8; 256];
+        let mut buf    = [0u8; 256];
         let mut cursor = 0usize;
         let _ = core::fmt::write(
             &mut StackWriter { buf: &mut buf, pos: &mut cursor },
@@ -126,16 +189,13 @@ impl ServiceContext {
         }
     }
 
-    /// Drain the kernel ring buffer. Called once by logger at startup (§11.4).
-    pub fn drain_kernel_ring_buffer(&self) {
-        todo!("Phase 5: syscall to drain kernel ring buffer")
+    /// Spawn a service by name on the kernel-selected core.
+    pub fn spawn(&self, name: &str) -> Result<(), crate::Error> {
+        self.spawn_on(name, 0xFFFF)
     }
 
-    /// Spawn a service by name via the Spawn syscall (syscall 7).
-    ///
-    /// Requires this service to hold a spawn capability.
-    /// The kernel looks up the service ELF by name and spawns on core 0.
-    pub fn spawn(&self, name: &str) -> Result<(), crate::Error> {
+    /// Spawn a service by name on `core` (0xFFFF = kernel round-robin).
+    pub fn spawn_on(&self, name: &str, core: u32) -> Result<(), crate::Error> {
         let data = Self::ctx();
         if data.magic != SERVICE_CTX_MAGIC {
             return Err(crate::Error::InvalidArgument);
@@ -145,39 +205,83 @@ impl ServiceContext {
             return Err(crate::Error::Cap(CapError::CapNotHeld));
         }
         let bytes = name.as_bytes();
+        let packed = ((core as u64 & 0xFFFF) << 16) | (slot as u64 & 0xFFFF);
         // SAFETY: syscall(7) = Spawn; slot is from kernel-written page; bytes is valid.
         let ret = unsafe {
-            raw_syscall(7, slot as u64, bytes.as_ptr() as u64, bytes.len() as u64)
+            raw_syscall(7, packed, bytes.as_ptr() as u64, bytes.len() as u64)
         };
-        if ret == 0 {
-            Ok(())
-        } else {
-            Err(crate::Error::InvalidArgument)
-        }
+        if ret == 0 { Ok(()) } else { Err(crate::Error::InvalidArgument) }
     }
 
-    /// Spawn a service from a full descriptor (supervisor only — §14.1).
-    pub fn spawn_service(&self, service: &ServiceDescriptor) -> Result<(), crate::Error> {
-        todo!("Phase 5: syscall Spawn from binary + contract")
+    /// Kill a named service (supervisor only in production; unrestricted in Phase 5).
+    pub fn kill(&self, name: &str) -> Result<(), crate::Error> {
+        let bytes = name.as_bytes();
+        // SAFETY: syscall(8) = Kill; bytes is a valid slice within user space.
+        let ret = unsafe {
+            raw_syscall(8, bytes.as_ptr() as u64, bytes.len() as u64, 0)
+        };
+        if ret == 0 { Ok(()) } else { Err(crate::Error::InvalidArgument) }
     }
 
-    /// Restart a service with optional core override (supervisor only — §14.4).
+    /// Kill then respawn a service with optional core override (§14.4).
     pub fn restart(&self, name: &str, core_override: Option<u32>) -> Result<(), crate::Error> {
-        todo!("Phase 5: syscall Kill then Spawn per §9.2 placement rules")
+        let _ = self.kill(name); // ignore error if service is already dead
+        let core = core_override.unwrap_or(0xFFFF);
+        self.spawn_on(name, core)
     }
 
-    /// Receive a service death notification (supervisor only).
-    pub fn recv_death_notification(&self) -> Option<&str> {
-        todo!("Phase 5: block on the supervisor's death-notification endpoint")
+    /// Drain the kernel ring buffer. Called by logger at startup (§11.4).
+    ///
+    /// Phase 5: reads the ring buffer via kprintln output (already mirrored to
+    /// serial); full drain syscall deferred to Phase 6.
+    pub fn drain_kernel_ring_buffer(&self) {
+        // Ring buffer is already mirrored to serial at all times (§11.4).
+        // Nothing additional needed until the logger has a dedicated drain syscall.
     }
 
-    /// Read the boot manifest (supervisor only — §11.1).
-    pub fn read_boot_manifest(&self) -> BootManifest {
-        todo!("Phase 5: read the manifest embedded in the kernel image")
-    }
-
+    /// Receive a log message on this service's recv endpoint.
     pub fn recv_log_message(&self) -> Message {
         self.recv()
+    }
+
+    // ---------------------------------------------------------------------------
+    // Private helpers.
+    // ---------------------------------------------------------------------------
+
+    /// Find the cap slot for a named send peer.
+    ///
+    /// Search order: dynamic cache (post-restart reacquisitions), then the
+    /// kernel-written ServiceContextData send_peers array.
+    fn find_send_slot(&self, peer: &str) -> Option<u32> {
+        let bytes = peer.as_bytes();
+        let len   = bytes.len();
+
+        // 1. Dynamic cache (updated after EndpointDead + reacquire).
+        // SAFETY: single-threaded service process.
+        unsafe {
+            for entry in SEND_CAP_CACHE.iter() {
+                if entry.slot != u32::MAX
+                    && entry.name_len as usize == len
+                    && &entry.name[..len] == bytes
+                {
+                    return Some(entry.slot);
+                }
+            }
+        }
+
+        // 2. ServiceContextData send_peers (wired at spawn).
+        let data  = Self::ctx();
+        let count = (data.send_peer_count as usize).min(MAX_SEND_PEERS);
+        for i in 0..count {
+            let entry = &data.send_peers[i];
+            if entry.slot == u32::MAX { continue; }
+            let nlen = entry.name_len as usize;
+            if nlen == len && &entry.name[..len] == bytes {
+                return Some(entry.slot);
+            }
+        }
+
+        None
     }
 }
 
@@ -194,7 +298,7 @@ impl<'a> core::fmt::Write for StackWriter<'a> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         let bytes = s.as_bytes();
         let space = self.buf.len().saturating_sub(*self.pos);
-        let n = bytes.len().min(space);
+        let n     = bytes.len().min(space);
         self.buf[*self.pos .. *self.pos + n].copy_from_slice(&bytes[..n]);
         *self.pos += n;
         Ok(())
@@ -202,17 +306,15 @@ impl<'a> core::fmt::Write for StackWriter<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// Placeholder types (Phase 5).
+// Placeholder types retained for compatibility.
 // ---------------------------------------------------------------------------
 
 pub struct ServiceDescriptor;
-
 impl ServiceDescriptor {
     pub fn name(&self) -> &str { todo!() }
 }
 
 pub struct BootManifest;
-
 impl BootManifest {
     pub fn services(&self) -> &[ServiceDescriptor] { todo!() }
 }

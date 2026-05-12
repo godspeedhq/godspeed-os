@@ -20,3 +20,5 @@ desktop.ini
 
 build/
 tools/
+
+serial*.log

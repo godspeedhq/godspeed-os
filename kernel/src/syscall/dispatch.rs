@@ -16,14 +16,15 @@ use crate::task::state::TaskState;
 /// Syscall numbers. Stable ABI.
 #[repr(u64)]
 pub enum SyscallNumber {
-    Send     = 1,
-    Recv     = 2,
-    TrySend  = 3,
-    Yield    = 4,
-    Log      = 5,
-    AllocMem = 6,
-    Spawn    = 7,
-    Kill     = 8,
+    Send           = 1,
+    Recv           = 2,
+    TrySend        = 3,
+    Yield          = 4,
+    Log            = 5,
+    AllocMem       = 6,
+    Spawn          = 7,
+    Kill           = 8,
+    AcquireSendCap = 10,
 }
 
 /// Validate that `[ptr, ptr+len)` lies entirely within user-space.
@@ -55,17 +56,19 @@ pub unsafe extern "C" fn syscall_handler(
     arg1: u64,
     arg2: u64,
 ) -> i64 {
+    crate::kprintln!("syscall: nr={} a0={:#x} a1={:#x} a2={:#x}", number, arg0, arg1, arg2);
     match number {
-        n if n == SyscallNumber::Send    as u64 => handle_send(arg0, arg1, arg2),
-        n if n == SyscallNumber::Recv    as u64 => handle_recv(arg0, arg1, arg2),
-        n if n == SyscallNumber::TrySend as u64 => handle_try_send(arg0, arg1, arg2),
-        n if n == SyscallNumber::Yield   as u64 => {
+        n if n == SyscallNumber::Send           as u64 => handle_send(arg0, arg1, arg2),
+        n if n == SyscallNumber::Recv           as u64 => handle_recv(arg0, arg1, arg2),
+        n if n == SyscallNumber::TrySend        as u64 => handle_try_send(arg0, arg1, arg2),
+        n if n == SyscallNumber::Yield          as u64 => {
             crate::task::scheduler::yield_current();
             0
         }
-        n if n == SyscallNumber::Log     as u64 => handle_log(arg0, arg1, arg2),
-        n if n == SyscallNumber::Spawn   as u64 => handle_spawn(arg0, arg1, arg2),
-        n if n == SyscallNumber::Kill    as u64 => handle_kill(arg0),
+        n if n == SyscallNumber::Log            as u64 => handle_log(arg0, arg1, arg2),
+        n if n == SyscallNumber::Spawn          as u64 => handle_spawn(arg0, arg1, arg2),
+        n if n == SyscallNumber::Kill           as u64 => handle_kill(arg0, arg1),
+        n if n == SyscallNumber::AcquireSendCap as u64 => handle_acquire_send_cap(arg0, arg1),
         _ => -1, // Unknown syscall.
     }
 }
@@ -78,6 +81,16 @@ pub unsafe extern "C" fn syscall_handler(
 ///
 /// Requires `Rights::WRITE` on `LOG_WRITE_RESOURCE`.
 unsafe fn handle_log(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
+    // Diagnostic: print the saved user RSP at syscall entry so we can detect
+    // corruption before SYSRETQ loads it.
+    {
+        let cid = crate::task::scheduler::current_core();
+        // SAFETY: GS.base = &PER_CORE_SYSCALL[cid] in ring-0; user_rsp at offset 0.
+        let saved_ursp: u64 = unsafe {
+            crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[cid].user_rsp
+        };
+        crate::kprintln!("diag: Log syscall core={} user_rsp_saved={:#x}", cid, saved_ursp);
+    }
     let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::WRITE) {
         Ok(c) => c,
         Err(e) => return cap_err_to_i64(e),
@@ -237,17 +250,24 @@ unsafe fn build_message(msg_ptr: u64, msg_len: u64) -> Result<Message, i64> {
 }
 
 // ---------------------------------------------------------------------------
-// Syscall: Spawn (7) / Kill (8).
+// Syscall: Spawn (7) / Kill (8) / AcquireSendCap (10).
 // ---------------------------------------------------------------------------
 
-/// arg0 = spawn_cap_slot, arg1 = name_ptr (user VA), arg2 = name_len.
+/// arg0 = (core_id << 16) | spawn_cap_slot, arg1 = name_ptr, arg2 = name_len.
 ///
 /// Validates the spawn capability, reads the service name from user space,
-/// then calls `task::spawn_service_by_name`.  Phase 4 always spawns on core 0;
-/// Phase 5 will add the §9.2 placement rules once the supervisor reads the manifest.
-unsafe fn handle_spawn(spawn_cap_slot: u64, name_ptr: u64, name_len: u64) -> i64 {
+/// then calls `task::spawn_service_by_name`.
+///
+/// core_id encoding:
+///   - 0x0000 = core 0, 0x0001 = core 1, …
+///   - 0xFFFF = let the kernel choose (preferred_core from service_config).
+unsafe fn handle_spawn(packed_arg0: u64, name_ptr: u64, name_len: u64) -> i64 {
+    let spawn_cap_slot = (packed_arg0 & 0xFFFF) as usize;
+    let core_raw       = ((packed_arg0 >> 16) & 0xFFFF) as u32;
+    let core_override  = if core_raw == 0xFFFF { None } else { Some(core_raw) };
+
     // Validate spawn capability.
-    let cap = match scheduler::current_task_lookup_cap(spawn_cap_slot as usize, Rights::WRITE) {
+    let cap = match scheduler::current_task_lookup_cap(spawn_cap_slot, Rights::WRITE) {
         Ok(c)  => c,
         Err(e) => return cap_err_to_i64(e),
     };
@@ -257,7 +277,9 @@ unsafe fn handle_spawn(spawn_cap_slot: u64, name_ptr: u64, name_len: u64) -> i64
 
     // Read service name from user space.
     let len = name_len as usize;
-    if len == 0 || len > 64 { return -1; }
+    if len == 0 || len > 64 {
+        return -1;
+    }
     if !validate_user_slice(name_ptr, len) { return -1; }
     // SAFETY: validate_user_slice confirmed [name_ptr, name_ptr+len) is in user space.
     let name_bytes = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, len) };
@@ -266,17 +288,59 @@ unsafe fn handle_spawn(spawn_cap_slot: u64, name_ptr: u64, name_len: u64) -> i64
         Err(_) => return -1,
     };
 
-    // Spawn on core 0 (Phase 4 default; Phase 5 adds placement from §9.2).
-    match crate::task::spawn_service_by_name(name, 0) {
-        Ok(())  => 0,
-        Err(_)  => -1,
+    match crate::task::spawn_service_by_name(name, core_override) {
+        Ok(()) => 0,
+        Err(_) => -1,
     }
 }
 
-/// arg0 = task identifier (name or slot). Capability required: service_control.
-unsafe fn handle_kill(_target: u64) -> i64 {
-    // Phase 5: validate service_control cap, call task::kill_by_id.
-    -1
+/// arg0 = name_ptr, arg1 = name_len.
+///
+/// Kills the named running task: marks Dead, kills endpoint, wakes blocked tasks.
+/// Phase 5: no capability check (cap check added in Phase 6 when service_control
+/// is fully wired).
+unsafe fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
+    let len = name_len as usize;
+    if len == 0 || len > 64 { return -1; }
+    if !validate_user_slice(name_ptr, len) { return -1; }
+    // SAFETY: validate_user_slice confirmed range is in user space.
+    let name_bytes = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, len) };
+    let name = match core::str::from_utf8(name_bytes) {
+        Ok(s)  => s,
+        Err(_) => return -1,
+    };
+    if crate::task::kill_by_name(name) { 0 } else { -1 }
+}
+
+/// arg0 = name_ptr, arg1 = name_len.
+///
+/// Looks up `name` in the kernel name registry, mints a SEND cap to that
+/// endpoint in the calling task's cap table, and returns the slot index.
+///
+/// Used by services to reacquire a fresh SEND cap after `EndpointDead` (§14.2).
+unsafe fn handle_acquire_send_cap(name_ptr: u64, name_len: u64) -> i64 {
+    let len = name_len as usize;
+    if len == 0 || len > 64 { return -1; }
+    if !validate_user_slice(name_ptr, len) { return -1; }
+    // SAFETY: validate_user_slice confirmed range is in user space.
+    let name_bytes = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, len) };
+    let name = match core::str::from_utf8(name_bytes) {
+        Ok(s)  => s,
+        Err(_) => return -1,
+    };
+
+    let ep_id = match crate::ipc::names::lookup(name) {
+        Some(id) => id,
+        None     => return -1, // service not registered
+    };
+
+    let resource_id = crate::capability::cap::ResourceId::from(ep_id);
+    let send_cap    = crate::capability::mint_cap(resource_id, crate::capability::Rights::SEND);
+
+    match scheduler::current_task_insert_cap(send_cap) {
+        Ok(slot) => slot as i64,
+        Err(_)   => -1, // cap table full
+    }
 }
 
 fn ipc_err_to_i64(e: IpcError) -> i64 {

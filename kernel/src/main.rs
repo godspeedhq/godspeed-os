@@ -3,6 +3,7 @@
 
 mod arch;
 mod capability;
+mod control;
 mod interrupt;
 mod invariants;
 mod ipc;
@@ -163,8 +164,30 @@ fn test_ipc_routing() {
 // Kernel entry point.
 // ---------------------------------------------------------------------------
 
+// 512 KiB BSP kernel stack — Limine's boot stack is one page (4 KiB), which
+// overflows when pre-scheduler tests pass 4 KiB Message objects by value.
+// The linker places this in .bss, so it costs nothing in the image.
+static mut BSP_BOOT_STACK: [u8; 512 * 1024] = [0u8; 512 * 1024];
+
 #[no_mangle]
 pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> ! {
+    // Switch from Limine's tiny boot stack to our own 512 KiB stack before
+    // any locals are allocated.  boot_info_ptr is in RDI (a register) so it
+    // survives the RSP change.
+    //
+    // SAFETY: BSP_BOOT_STACK is a static 512 KiB buffer; top pointer is
+    // 16-byte aligned.  boot_info_ptr remains valid — it points to data in
+    // Limine's boot-time memory, not on the old stack.
+    unsafe {
+        let top = BSP_BOOT_STACK.as_mut_ptr().add(512 * 1024);
+        let top_aligned = (top as usize & !15) as u64;
+        core::arch::asm!(
+            "mov rsp, {0}",
+            in(reg) top_aligned,
+            options(nostack),
+        );
+    }
+
     // SAFETY: bootloader guarantees boot_info_ptr is valid and aligned.
     let boot_info = unsafe { &*boot_info_ptr };
 
@@ -172,6 +195,8 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     memory::init(boot_info);
 
     arch::x86_64::init_timer();
+    // SAFETY: COM2 initialised once before the scheduler starts.
+    unsafe { arch::x86_64::com2_init() };
 
     capability::init();
     ipc::init();

@@ -7,4 +7,5 @@ fn main() {
     let ld = workspace.join("services").join("user.ld");
     println!("cargo:rustc-link-arg=-T{}", ld.display());
     println!("cargo:rerun-if-changed={}", ld.display());
+    println!("cargo:rustc-link-arg=--entry=service_main");
 }

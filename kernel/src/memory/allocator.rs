@@ -11,6 +11,34 @@ use crate::arch::x86_64::{BootInfo, MemoryKind};
 use crate::memory::frame::{Frame, PhysAddr, FRAME_SIZE};
 
 // ---------------------------------------------------------------------------
+// Kernel-range guard — fires if alloc_frame ever returns a kernel-image frame.
+// ---------------------------------------------------------------------------
+
+static mut GUARD_START: u64 = 0;
+static mut GUARD_END:   u64 = 0;
+
+#[inline(never)]
+fn guard_bugcheck(phys: u64) {
+    // Write directly to COM1 — no lock, no allocator, no stack growth.
+    #[inline(always)]
+    fn putb(b: u8) { crate::arch::x86_64::serial_write_byte(b); }
+    fn puts(s: &[u8]) { for &b in s { putb(b); } }
+    fn puthex(v: u64) {
+        puts(b"0x");
+        for i in (0..16).rev() { let n = ((v >> (i*4)) & 0xf) as u8; putb(if n < 10 { b'0'+n } else { b'a'+n-10 }); }
+    }
+    puts(b"\nBUG: alloc_frame returned kernel-range frame phys=");
+    puthex(phys);
+    puts(b" guard=[");
+    // SAFETY: guard statics written once during init, read-only here.
+    puthex(unsafe { GUARD_START });
+    puts(b",");
+    puthex(unsafe { GUARD_END });
+    puts(b")\n");
+    panic!("alloc_frame: kernel-range frame returned");
+}
+
+// ---------------------------------------------------------------------------
 // Bitmap — lives in .bss (zero-init = every frame starts as "used").
 // ---------------------------------------------------------------------------
 
@@ -37,6 +65,9 @@ impl BitmapAllocator {
     }
 
     unsafe fn init_from_map(&mut self, boot_info: &BootInfo) {
+        let kstart = boot_info.kernel_phys_start;
+        let kend   = boot_info.kernel_phys_end;
+
         for region in boot_info.memory_map {
             if !matches!(region.kind, MemoryKind::Usable) {
                 continue;
@@ -51,6 +82,15 @@ impl BitmapAllocator {
 
             for idx in first..last {
                 if idx >= MAX_FRAMES { break; }
+                // Skip frames that back the kernel image (text, data, BSS).
+                // Kernel stacks (KSTACK_STORAGE) live in BSS; handing those
+                // frames to a service loader would zero live kernel stacks.
+                if kend > kstart {
+                    let frame_phys = idx as u64 * FRAME_SIZE;
+                    if frame_phys >= kstart && frame_phys < kend {
+                        continue;
+                    }
+                }
                 // SAFETY: idx within BITMAP bounds; single-threaded init.
                 unsafe { bitmap_set_free(idx) };
                 self.free_frames += 1;
@@ -71,7 +111,16 @@ impl BitmapAllocator {
         self.free_frames -= 1;
         self.next_byte = (idx / 8 + 1).min(BITMAP_BYTES - 1);
 
-        let phys = PhysAddr(idx as u64 * FRAME_SIZE);
+        let phys_addr = idx as u64 * FRAME_SIZE;
+        // Guard: panic if we're about to hand out a kernel-image frame.
+        // SAFETY: statics written once during init; any read racing with init
+        // is fine because alloc cannot be called before init completes.
+        let gs = unsafe { GUARD_START };
+        let ge = unsafe { GUARD_END };
+        if ge > gs && phys_addr >= gs && phys_addr < ge {
+            guard_bugcheck(phys_addr);
+        }
+        let phys = PhysAddr(phys_addr);
         // SAFETY: idx from free bitmap → page-aligned; now exclusively owned.
         Some(unsafe { Frame::from_phys(phys) })
     }
@@ -125,7 +174,11 @@ static mut ALLOCATOR: BitmapAllocator = BitmapAllocator::new();
 
 pub fn init(boot_info: &BootInfo) {
     // SAFETY: called once by BSP during memory::init, before any allocation.
-    unsafe { ALLOCATOR.init_from_map(boot_info) };
+    unsafe {
+        GUARD_START = boot_info.kernel_phys_start;
+        GUARD_END   = boot_info.kernel_phys_end;
+        ALLOCATOR.init_from_map(boot_info)
+    };
 }
 
 /// Allocate one physical frame. Returns `None` if memory is exhausted.

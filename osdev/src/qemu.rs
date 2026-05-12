@@ -30,8 +30,12 @@ pub fn run(image_path: &Path, smp: u32) {
             &smp.to_string(),
             "-m",
             "512M",
+            // COM1 → serial log file (kernel kprintln output).
             "-serial",
             &format!("file:{SERIAL_LOG}"),
+            // COM2 → TCP server on port 5555 (`osdev restart` control channel).
+            "-serial",
+            "tcp::5555,server,nowait",
             "-debugcon",
             &format!("file:{DEBUGCON_LOG}"),
             "-display",

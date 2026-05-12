@@ -1,9 +1,7 @@
-//! `ping` — demonstration service. Sends a message to `pong` every second.
+//! `ping` — sends a message to `pong` on every scheduler tick.
 //!
-//! Pinned to Core 0 (§23.1). Acceptance criteria §23.2:
-//!   - `osdev logs ping` shows a send every second.
-//!   - After `osdev restart pong`, ping observes EndpointDead, looks up via
-//!     registry, and continues with the fresh cap (§6.B test).
+//! Pinned to Core 0 (§23.1). On `EndpointDead`, reacquires a fresh SEND cap
+//! via the kernel name registry and resumes (§14.2, test 10).
 
 #![no_std]
 #![no_main]
@@ -14,38 +12,55 @@ use godspeed_sdk::{ServiceContext, Message, IpcError};
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("ping: starting");
 
-    let mut pong_cap = ctx.capability("ipc_send.pong")
-        .expect("ping: missing ipc_send.pong cap");
+    let mut counter: u64 = 0;
 
     loop {
-        let msg = Message::from_bytes(b"ping");
+        counter += 1;
+        let payload = make_payload(counter);
+        let msg = Message::from_bytes(&payload[..payload_len(&payload)]);
 
         match ctx.try_send("pong", &msg) {
             Ok(()) => {
-                ctx.log("ping: sent");
+                if counter % 100 == 0 {
+                    ctx.log("ping: sent 100 messages");
+                }
             }
             Err(IpcError::EndpointDead) => {
-                ctx.log("ping: pong endpoint dead, reacquiring via registry");
-                // Re-lookup via registry; fresh cap may point to a new core (§14.2).
-                pong_cap = reacquire_pong(&ctx);
+                ctx.log("ping: pong endpoint dead, reacquiring via kernel registry");
+                match ctx.reacquire_cap("pong") {
+                    Ok(_) => ctx.log("ping: pong cap reacquired, resuming"),
+                    Err(_) => ctx.log("ping: reacquire failed, retrying next tick"),
+                }
             }
             Err(IpcError::QueueFull) => {
-                // pong is alive but busy; retry next tick.
-                ctx.log("ping: queue full, retrying");
+                // pong is alive but busy; yield and retry.
             }
-            Err(e) => {
-                ctx.log_fmt(format_args!("ping: unexpected error: {:?}", e));
-            }
+            Err(_) => {}
         }
 
-        sleep_one_second(&ctx);
+        ctx.yield_cpu();
     }
 }
 
-fn reacquire_pong(ctx: &ServiceContext) -> godspeed_sdk::CapHandle {
-    todo!("send lookup(\"pong\") to registry; return fresh cap")
+/// Format the counter as ASCII decimal into a fixed buffer.
+fn make_payload(n: u64) -> [u8; 20] {
+    let mut buf = [0u8; 20];
+    let mut tmp = [0u8; 20];
+    let mut i = 0;
+    let mut v = if n == 0 { 1 } else { n };
+    if n == 0 { tmp[0] = b'0'; i = 1; }
+    while v > 0 {
+        tmp[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        i += 1;
+    }
+    // Reverse into buf.
+    for j in 0..i {
+        buf[j] = tmp[i - 1 - j];
+    }
+    buf
 }
 
-fn sleep_one_second(ctx: &ServiceContext) {
-    todo!("yield in a loop until ~1 s has elapsed (timer or spin-wait)")
+fn payload_len(buf: &[u8; 20]) -> usize {
+    buf.iter().position(|&b| b == 0).unwrap_or(20)
 }

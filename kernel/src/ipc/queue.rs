@@ -69,4 +69,15 @@ impl MessageQueue {
     pub fn drain(&mut self) {
         while self.dequeue().is_some() {}
     }
+
+    /// Reset to empty in-place, without creating a large stack temporary.
+    ///
+    /// Call this instead of `queue = MessageQueue::new()` when re-initialising
+    /// an existing entry: the new() form constructs a ~67 KiB temporary on the
+    /// caller's stack, which overflows the 64 KiB SYSCALL kernel stack.
+    /// After drain() all slots are already None; we only need to reset indices.
+    pub fn reset(&mut self) {
+        self.head = 0;
+        self.len  = 0;
+    }
 }

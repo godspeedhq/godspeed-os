@@ -97,17 +97,24 @@ pub fn init() {
 }
 
 /// Register a newly-created endpoint in the routing table.
+///
+/// Dead entries are recycled, so kill + respawn of a service does not exhaust
+/// the table.
 pub fn register(id: EndpointId, core_id: u32, generation: Generation) {
     lock();
     // SAFETY: lock held; single-writer.
     unsafe {
         for entry in TABLE.iter_mut() {
-            if !entry.valid {
-                entry.valid      = true;
-                entry.id         = id;
-                entry.core_id    = core_id;
-                entry.generation = generation;
-                entry.liveness   = EndpointLiveness::Alive;
+            if !entry.valid || entry.liveness == EndpointLiveness::Dead {
+                entry.valid            = true;
+                entry.id               = id;
+                entry.core_id          = core_id;
+                entry.generation       = generation;
+                entry.liveness         = EndpointLiveness::Alive;
+                entry.queue.reset();
+                entry.blocked_receiver = None;
+                entry.blocked_sender   = None;
+                entry.pending_send     = None;
                 unlock();
                 return;
             }

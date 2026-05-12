@@ -37,8 +37,13 @@ enum Commands {
     },
     /// Package and publish a service update.
     Publish { service: Option<String> },
-    /// Restart a running service.
-    Restart { service: String },
+    /// Restart a running service (sends command to OS via control serial port).
+    Restart {
+        service: String,
+        /// Core to restart the service on (§9.2).  Omit for kernel round-robin.
+        #[arg(long)]
+        core: Option<u32>,
+    },
     /// Tail log output for a service.
     Logs { service: String },
     /// Show service state and assigned core.
@@ -58,8 +63,8 @@ fn main() {
         Commands::New { name }       => cmd_new(&name),
         Commands::Build              => cmd_build(),
         Commands::Run { smp }        => cmd_run(smp),
-        Commands::Publish { service} => cmd_publish(service.as_deref()),
-        Commands::Restart { service} => cmd_restart(&service),
+        Commands::Publish { service}        => cmd_publish(service.as_deref()),
+        Commands::Restart { service, core } => cmd_restart(&service, core),
         Commands::Logs { service }   => cmd_logs(&service),
         Commands::Status { service } => cmd_status(&service),
         Commands::Caps { service }   => cmd_caps(&service),
@@ -121,8 +126,36 @@ fn cmd_publish(service: Option<&str>) {
     todo!("build service binary, validate contract, package for osdev restart delivery")
 }
 
-fn cmd_restart(service: &str) {
-    todo!("connect to running OS control socket; send restart command for service")
+/// Connect to the OS control serial port (TCP port 5555) and send a RESTART command.
+///
+/// The kernel listens on COM2 (mapped to `tcp::5555` by QEMU) and processes
+/// `RESTART <service> [<core>]\n` in its scheduler idle loop.
+fn cmd_restart(service: &str, core: Option<u32>) {
+    use std::io::Write;
+
+    let addr = "127.0.0.1:5555";
+
+    let mut stream = match std::net::TcpStream::connect(addr) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("restart: could not connect to OS control port at {}: {}", addr, e);
+            eprintln!("restart: is the OS running? (`osdev run` must be active)");
+            std::process::exit(1);
+        }
+    };
+
+    let cmd = match core {
+        Some(c) => format!("RESTART {} {}\n", service, c),
+        None    => format!("RESTART {}\n", service),
+    };
+
+    if let Err(e) = stream.write_all(cmd.as_bytes()) {
+        eprintln!("restart: failed to send command: {}", e);
+        std::process::exit(1);
+    }
+
+    println!("restart: sent '{}' to OS", cmd.trim());
+    println!("restart: watch build/serial.log for confirmation");
 }
 
 fn cmd_logs(service: &str) {

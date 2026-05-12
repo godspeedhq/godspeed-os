@@ -241,6 +241,51 @@ pub unsafe fn get_lapic_id() -> u32 {
 // Private helpers.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Lock-free serial helpers — used in fault handlers where LOG_LOCK may
+// already be held (nested kprintln → deadlock with IF=0).
+// ---------------------------------------------------------------------------
+
+#[inline]
+unsafe fn serial_poll_thre() {
+    // SAFETY: port I/O in ring-0; 0x3FD is COM1 LSR.
+    unsafe {
+        loop {
+            let lsr: u8;
+            core::arch::asm!(
+                "in al, dx",
+                out("al") lsr,
+                in("dx") 0x3FDu16,
+                options(nostack, nomem),
+            );
+            if lsr & 0x20 != 0 { break; }
+        }
+    }
+}
+
+#[inline]
+unsafe fn serial_putc_nolck(c: u8) {
+    unsafe {
+        serial_poll_thre();
+        outb(0x3F8, c);
+    }
+}
+
+unsafe fn serial_puts_nolck(s: &[u8]) {
+    for &c in s { unsafe { serial_putc_nolck(c) }; }
+}
+
+unsafe fn serial_hex64_nolck(val: u64) {
+    let mut buf = [0u8; 18];
+    buf[0] = b'0';
+    buf[1] = b'x';
+    for i in 0..16 {
+        let nibble = ((val >> ((15 - i) * 4)) & 0xF) as u8;
+        buf[2 + i] = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+    }
+    unsafe { serial_puts_nolck(&buf) };
+}
+
 /// Write a byte to an x86 I/O port.
 #[inline]
 unsafe fn outb(port: u16, val: u8) {
@@ -457,6 +502,36 @@ pub(super) unsafe fn init_syscall(core_id: u32) {
     // Set IA32_KERNEL_GS_BASE for this core's SYSCALL stub (§8.2).
     // SAFETY: called during init, before any ring-3 task runs.
     unsafe { super::syscall_entry::init_per_core_syscall(core_id as usize) };
+
+    // Diagnostic: read back IA32_KERNEL_GS_BASE and IA32_GS_BASE to verify.
+    unsafe {
+        let (kgs_lo, kgs_hi): (u32, u32);
+        let (gs_lo, gs_hi): (u32, u32);
+        core::arch::asm!("rdmsr",
+            in("ecx") 0xC000_0102u32, out("eax") kgs_lo, out("edx") kgs_hi,
+            options(nostack, nomem));
+        core::arch::asm!("rdmsr",
+            in("ecx") 0xC000_0101u32, out("eax") gs_lo, out("edx") gs_hi,
+            options(nostack, nomem));
+        let kgs = ((kgs_hi as u64) << 32) | (kgs_lo as u64);
+        let gs  = ((gs_hi  as u64) << 32) | (gs_lo  as u64);
+        crate::kprintln!("init_syscall: core={} GS.base={:#x} KERNEL_GS_BASE={:#x}", core_id, gs, kgs);
+    }
+}
+
+/// Read TSS.rsp0 for `core_id`.
+///
+/// # Safety
+/// Caller must ensure `core_id < MAX_CORES`.
+pub unsafe fn get_tss_rsp0(core_id: usize) -> u64 {
+    // SAFETY: TSS_PER_CORE lives in .data; rsp0 is at byte offset 4 of the
+    // packed struct. read_unaligned is used because packed structs have
+    // alignment 1.
+    unsafe {
+        let tss = &raw const TSS_PER_CORE[core_id];
+        let rsp0_ptr = core::ptr::addr_of!((*tss).rsp0);
+        rsp0_ptr.read_unaligned()
+    }
 }
 
 /// Update TSS.rsp0 for `core_id` to `rsp`.
@@ -607,10 +682,27 @@ unsafe extern "C" fn gpf_stub() -> ! {
 /// Page-fault stub: read error code + RIP, call diagnostic handler.
 #[unsafe(naked)]
 unsafe extern "C" fn pf_stub() -> ! {
-    // SAFETY: vector 14 pushes error_code then RIP.
+    // SAFETY: vector 14 pushes error_code before the standard frame:
+    //   [RSP+0]  error_code
+    //   [RSP+8]  saved RIP
+    //   [RSP+16] saved CS  (bits 1:0 = CPL)
+    //   [RSP+24] saved RFLAGS
+    //   [RSP+32] saved RSP  (user RSP; only present on ring-3 → ring-0 transition)
+    //   [RSP+40] saved SS   (only on ring-3 → ring-0 transition)
+    // Interrupt gates clear IF; GS is NOT swapped by the CPU.  We must
+    // swapgs manually when coming from ring-3 so pf_handler (and any
+    // kernel code it calls, including kill_current/switch_context) can
+    // access per-core data via gs:[...].  A kernel fault (CPL=0) means
+    // GS.base is already the kernel pointer — skip swapgs.
     core::arch::naked_asm!(
-        "mov rdi, [rsp]",      // error_code → first arg
-        "mov rsi, [rsp + 8]",  // saved RIP  → second arg
+        "xor edx, edx",                // hw_user_rsp = 0 for kernel faults (3rd arg)
+        "test byte ptr [rsp + 16], 3", // CPL in saved CS: non-zero = ring-3
+        "jz 1f",                       // kernel fault → skip swapgs + rsp load
+        "swapgs",                      // ring-3 fault → install kernel GS
+        "mov rdx, [rsp + 32]",         // hw-saved user RSP from interrupt frame
+        "1:",
+        "mov rdi, [rsp]",              // error_code → first arg
+        "mov rsi, [rsp + 8]",          // saved RIP  → second arg
         "call pf_handler",
         "2: hlt",
         "jmp 2b",
@@ -627,16 +719,66 @@ unsafe extern "C" fn gpf_handler(error_code: u64, fault_rip: u64) -> ! {
     crate::arch::x86_64::halt_all_cores()
 }
 
-/// Print page-fault info and halt all cores.
+/// Print page-fault info and halt all cores (or kill the faulting task).
+///
+/// `hw_user_rsp` is the hardware-saved user RSP from the interrupt frame
+/// ([rsp+32] on ring-3 faults); 0 for kernel faults.
 #[no_mangle]
-unsafe extern "C" fn pf_handler(error_code: u64, fault_rip: u64) -> ! {
+unsafe extern "C" fn pf_handler(error_code: u64, fault_rip: u64, hw_user_rsp: u64) -> ! {
     let cr2: u64;
-    // SAFETY: reading CR2 in ring 0 is always valid.
-    unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem)) };
-    crate::kprintln!(
-        "KERNEL PF: fault_addr={:#x} error_code={:#x} rip={:#x}",
-        cr2, error_code, fault_rip
-    );
+    let (gs_lo, gs_hi): (u32, u32);
+    let (kgs_lo, kgs_hi): (u32, u32);
+    // SAFETY: reading CR2 and MSRs in ring 0 is always valid.
+    unsafe {
+        core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem));
+        core::arch::asm!("rdmsr",
+            in("ecx")  0xC000_0101u32,
+            out("eax") gs_lo,
+            out("edx") gs_hi,
+            options(nostack, nomem));
+        core::arch::asm!("rdmsr",
+            in("ecx")  0xC000_0102u32,
+            out("eax") kgs_lo,
+            out("edx") kgs_hi,
+            options(nostack, nomem));
+    }
+    let gs_base  = ((gs_hi  as u64) << 32) | (gs_lo  as u64);
+    let kgs_base = ((kgs_hi as u64) << 32) | (kgs_lo as u64);
+    // Read PER_CORE_SYSCALL[0].user_rsp directly for diagnostics.
+    // SAFETY: GS.base is the kernel ptr (swapgs done in pf_stub for ring-3 faults;
+    //         unchanged for kernel faults).  user_rsp is at GS offset 0.
+    let per_core_ursp: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {}, gs:[0]",
+            out(reg) per_core_ursp,
+            options(nostack, nomem),
+        );
+    }
+    // Use lock-free serial to avoid a deadlock if LOG_LOCK is already held
+    // by the kprintln that was interrupted (interrupt gate: IF=0).
+    unsafe {
+        serial_puts_nolck(b"KERNEL PF: fault_addr=");
+        serial_hex64_nolck(cr2);
+        serial_puts_nolck(b" error_code=");
+        serial_hex64_nolck(error_code);
+        serial_puts_nolck(b" rip=");
+        serial_hex64_nolck(fault_rip);
+        serial_puts_nolck(b" hw_user_rsp=");
+        serial_hex64_nolck(hw_user_rsp);
+        serial_puts_nolck(b" per_core_ursp=");
+        serial_hex64_nolck(per_core_ursp);
+        serial_puts_nolck(b" GS.base=");
+        serial_hex64_nolck(gs_base);
+        serial_puts_nolck(b" KERNEL_GS=");
+        serial_hex64_nolck(kgs_base);
+        serial_puts_nolck(b"\n");
+    }
+    // Bit 2 of error_code is the user/supervisor flag: 1 = fault from ring 3.
+    // User-mode faults kill the task (§10.3); kernel faults are fatal panics.
+    if error_code & (1 << 2) != 0 {
+        crate::task::kill_current();
+    }
     crate::arch::x86_64::halt_all_cores()
 }
 

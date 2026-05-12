@@ -10,8 +10,15 @@ pub mod interrupts;
 pub mod page_tables;
 pub mod syscall_entry;
 
-use limine::request::{HhdmRequest, MemmapRequest, MpRequest};
+use limine::request::{ExecutableAddressRequest, HhdmRequest, MemmapRequest, MpRequest};
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
+
+// Kernel virtual extent from the linker script (kernel.ld).
+// Used to compute the physical range to exclude from the frame allocator.
+extern "C" {
+    // SAFETY: linker symbol; valid virtual address marking the end of .bss.
+    static __bss_end: u8;
+}
 
 // ---------------------------------------------------------------------------
 // Limine protocol — requests must survive to link time via #[used] + KEEP().
@@ -36,6 +43,10 @@ static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 #[used]
 #[link_section = ".requests"]
 static SMP_REQUEST: MpRequest = MpRequest::new(0);
+
+#[used]
+#[link_section = ".requests"]
+static KERNEL_ADDRESS_REQUEST: ExecutableAddressRequest = ExecutableAddressRequest::new();
 
 #[used]
 #[link_section = ".requests_end"]
@@ -115,11 +126,31 @@ fn collect_boot_info() -> BootInfo {
         }
     }
 
+    // Compute the physical range of the kernel image so the frame allocator
+    // can exclude it. BSS (including KSTACK_STORAGE) lives past the file-backed
+    // sections; we use __bss_end to cover the full loaded extent.
+    let (kernel_phys_start, kernel_phys_end) = KERNEL_ADDRESS_REQUEST
+        .response()
+        .map(|r| {
+            let phys_base = r.physical_base;
+            let virt_base = r.virtual_base;
+            // SAFETY: __bss_end is a linker symbol; its address is the first
+            // virtual byte past the kernel's .bss section.
+            let virt_end = unsafe { core::ptr::addr_of!(__bss_end) as u64 };
+            let kernel_size = virt_end.saturating_sub(virt_base);
+            // Round up to the next page boundary.
+            let phys_end = phys_base
+                .saturating_add(kernel_size)
+                .saturating_add(0xFFF) & !0xFFF_u64;
+            (phys_base, phys_end)
+        })
+        .unwrap_or((0, 0));
+
     BootInfo {
         memory_map: unsafe { &MAP_BUF[..count] },
         ap_ids: unsafe { &AP_ID_BUF[..ap_count] },
-        kernel_phys_start: 0,
-        kernel_phys_end: 0,
+        kernel_phys_start,
+        kernel_phys_end,
         hhdm_offset,
     }
 }
@@ -246,6 +277,41 @@ pub fn serial_write_byte(b: u8) {
         outb(COM1, b);
     }
     SERIAL_LOCK.store(false, Ordering::Release);
+}
+
+// ---------------------------------------------------------------------------
+// Serial (COM2) — control channel for `osdev restart` (§17).
+// ---------------------------------------------------------------------------
+
+const COM2: u16 = 0x2F8;
+
+/// Initialise COM2 at 115200 baud, 8N1. Receive-only (no TX interrupts).
+///
+/// # Safety
+/// Must be called once before `com2_try_read_byte`.
+pub unsafe fn com2_init() {
+    // SAFETY: COM2 I/O ports; initialised once at boot.
+    unsafe {
+        outb(COM2 + 1, 0x00); // Disable UART interrupts
+        outb(COM2 + 3, 0x80); // DLAB on
+        outb(COM2 + 0, 0x01); // 115200 baud divisor lo
+        outb(COM2 + 1, 0x00); // divisor hi
+        outb(COM2 + 3, 0x03); // 8N1
+        outb(COM2 + 2, 0xC7); // FIFO on, clear
+        outb(COM2 + 4, 0x0B); // RTS + DTR
+    }
+}
+
+/// Read one byte from COM2 if the receive data register is non-empty.
+pub fn com2_try_read_byte() -> Option<u8> {
+    // SAFETY: COM2 port reads; initialised before first use.
+    unsafe {
+        if inb(COM2 + 5) & 0x01 != 0 {
+            Some(inb(COM2))
+        } else {
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
