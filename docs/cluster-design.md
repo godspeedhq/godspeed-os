@@ -6,6 +6,8 @@
 
 ## 1. Routing table generalization
 
+> *Expands on the routing-table bullet in Appendix C.3 and the headline in C.4 of CLAUDE.md.*
+
 Current GodspeedOS routing resolves:
 
 ```
@@ -25,6 +27,8 @@ The generation mechanism already handles service mobility across nodes correctly
 ---
 
 ## 2. Why the remote IPC API should be distinct
+
+> *Expands on the API choice in Appendix C.4 of CLAUDE.md.*
 
 Two options exist for the developer-facing API:
 
@@ -109,7 +113,12 @@ Local IPC has 16-message bounded queues; a blocking `send` waits at capacity unt
 
 **Proposed v1 cluster semantics:** the `timeout` parameter covers the full call, including any waiting for remote queue space. If the remote queue is full and the timeout expires before a slot opens, `send_remote` returns `Err(RemoteTimeout)` — delivery state is definitively not delivered (no handoff occurred). This is consistent with the failure table above and requires no new primitives.
 
-**What this does not address:** sustained asymmetric load where a fast sender floods a slow remote receiver. Without a backpressure signal that the sender can act on before the timeout fires, the only tool the sender has is reducing its send rate. Whether a dedicated `RemoteBackpressure` error is useful — signaling "queue full, back off" without starting the timeout clock — is an open question for the protocol design phase.
+**What this does not address:** sustained asymmetric load where a fast sender floods a slow remote receiver. Without a backpressure signal, applications in this scenario have two options:
+
+- **(a) Use timeouts as backpressure.** The `send_remote` call blocks until the timeout fires on a full queue, then the caller retries at a reduced rate. This works but is wasteful: each failed call burns a full timeout duration before the caller learns the queue is congested.
+- **(b) Build application-level rate limiting.** The caller throttles its own send rate before the queue fills, avoiding timeouts entirely. This works but pushes flow-control design onto every application that talks cross-node under load.
+
+Neither is wrong. Both impose protocol design work that a dedicated `RemoteBackpressure` error — signaling "queue full, back off" immediately, without consuming the timeout budget — would eliminate. The deferral is recorded honestly here: absent `RemoteBackpressure`, applications requiring sustained high throughput must solve flow control themselves. That cost should be weighed when the API is finalized.
 
 ---
 
@@ -144,21 +153,41 @@ Making the registry cluster-aware is likely the largest single piece of work in 
 
 ## 8. Transport layer
 
-The remote IPC path requires a transport layer. This is an open design decision. Candidate options:
+The remote IPC path requires a transport layer. The choice is deferred, but the candidates are not equivalent and the decision should be made before any cluster implementation begins — it directly determines the ordering guarantees (§6) and shapes the failure semantics table (§4).
 
-| Transport | Ordering | Reliability | Overhead | Notes |
-|-----------|----------|-------------|----------|-------|
-| TCP | FIFO | At-least-once (with retries) | Connection setup cost | Simple; well-understood failure modes |
-| QUIC | FIFO per stream | At-least-once | Low reconnect latency | Better for mobile nodes; more complex |
-| Custom UDP + retries | Not guaranteed | Best-effort (caller handles) | Minimal | Maximum control; most implementation work |
+**Option 1 — TCP.**
+- Pro: simple; FIFO guaranteed per connection; well-understood failure modes; lowest implementation complexity.
+- Pro: the right v1 cluster starting point — solves the problem without introducing new unknowns.
+- Con: connection-oriented setup cost; head-of-line blocking on packet loss; reconnect latency on node failures can be hundreds of milliseconds.
 
-All candidates should require **mutual TLS (mTLS)** to authenticate both endpoints before any message is exchanged. Without mTLS, a node joining the cluster can forge capability sends — the unforgeability guarantee of the capability system depends on the kernel, but the kernel's identity must be authenticated at the transport layer when the boundary crosses a network.
+**Option 2 — QUIC.**
+- Pro: multiplexed streams with low reconnect latency; better suited to node churn (restarts, mobile nodes).
+- Pro: likely the right long-term choice if connection setup or reconnect cost proves significant in practice.
+- Con: more complex to implement; per-stream FIFO only — stream selection becomes a protocol concern if multiple endpoints share a connection.
 
-The transport choice directly determines the answers to the ordering question (§6) and shapes part of the failure semantics table (§4). This decision should be made before any cluster implementation begins, not deferred to implementation time.
+**Option 3 — Custom UDP + retries.**
+- Pro: minimal overhead; full control over retry and ordering policy.
+- Con: most implementation work; effectively reinventing TCP or QUIC without decades of hardening. Adds complexity without proportional benefit given the other unsolved problems in this document.
+
+**Tentative lean:** TCP as the starting point — simplest, FIFO guaranteed, failure modes well-understood. Migrate to QUIC if reconnect cost proves material. Custom UDP has no compelling advantage and should not be the first choice.
+
+### 8.1 Cluster membership and certificate trust
+
+All transport candidates should require **mutual TLS (mTLS)** to authenticate both endpoints before any message is exchanged. Without mTLS, a node joining the cluster can forge capability sends — the unforgeability guarantee of the capability system holds within a machine but must be enforced at the transport layer when the boundary crosses a network.
+
+However, mTLS solves authentication between two endpoints, not cluster membership. These are different problems:
+
+1. **Certificate issuance.** Who is the Certificate Authority for the cluster? A central CA is a single point of failure and administrative burden. Per-node self-signed certs require pre-sharing trust anchors at join time. Neither is free.
+2. **Certificate revocation.** When a node is compromised or decommissioned, its certificate must be revoked and that revocation must propagate to all peers. Standard revocation (OCSP, CRL) has latency; during the propagation window a revoked cert remains valid.
+3. **Former members with valid certs.** A node that has been removed from the cluster may still hold certificates that pass mTLS validation until they expire. mTLS alone does not prevent a decommissioned node from re-authenticating — cluster membership must be checked at the application layer as well.
+
+These three problems interact directly with §7 (the registry controls which nodes are legitimate sources of name registrations) and §9 (TCB authority defines which nodes can issue restarts). Certificate trust, name authority, and restart authority are the same trust system viewed from three angles. They cannot be designed in isolation from each other.
 
 ---
 
 ## 9. TCB authority across nodes
+
+> *Expands on the TCB authority question in Appendix C.4 of CLAUDE.md.*
 
 The current spec raises "cross-node TCB definition" as an open question. It deserves more weight: **this is the central security question for cluster mode, and cluster mode cannot ship without a resolved answer.**
 
@@ -188,13 +217,14 @@ No option is obviously correct. The choice shapes the entire cluster security mo
 
 ## 10. Summary of open questions
 
-Before cluster mode can be designed in detail, the following questions must be answered:
-
 | Question | Where addressed | Blocking? |
 |----------|----------------|-----------|
 | Transport protocol choice | §8 | Yes — shapes failure semantics and ordering |
+| Cluster membership and cert trust model | §8.1 | Yes — mTLS alone is insufficient; membership check needed |
 | Registry consistency model | §7 | Yes — defines what `remote_send_cap("name")` can guarantee |
 | TCB authority model across nodes | §9 | Yes — cannot ship without this resolved |
-| Flow control / backpressure primitive | §5 | No — can defer, but shapes protocol ergonomics |
-| Ordering guarantee level | §6 | No — can be "transport-dependent" with documentation |
+| Flow control / backpressure primitive | §5 | No — deferral forces app-level rate limiting; tradeoff stated |
+| Ordering guarantee level | §6 | No — "transport-dependent" with documentation is acceptable |
 | Delivery acknowledgment semantics | §4 | No — "Unknown" is a valid stated answer |
+
+The three blocking questions (transport, registry, TCB authority) are interdependent: the cert trust model in §8.1 connects all three. They cannot be resolved independently and should be addressed together in a dedicated threat-model exercise before any cluster implementation begins.
