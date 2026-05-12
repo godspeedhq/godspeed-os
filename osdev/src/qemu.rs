@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-const SERIAL_LOG: &str = "build/serial.log";
+pub const SERIAL_LOG: &str = "build/serial.log";
 const DEBUGCON_LOG: &str = "build/debugcon.txt";
 const QEMU_DEBUG_LOG: &str = "build/qemu-debug.log";
 

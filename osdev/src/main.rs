@@ -159,7 +159,46 @@ fn cmd_restart(service: &str, core: Option<u32>) {
 }
 
 fn cmd_logs(service: &str) {
-    todo!("tail serial output filtered to lines tagged with service name")
+    use std::io::{BufRead, Seek, SeekFrom};
+
+    let path = std::path::Path::new(crate::qemu::SERIAL_LOG);
+
+    let mut file = match std::fs::File::open(path) {
+        Ok(f)  => f,
+        Err(_) => {
+            eprintln!("logs: serial log not found at {} — is `osdev run` active?", path.display());
+            std::process::exit(1);
+        }
+    };
+
+    // Seek to end so we only tail new output (like `tail -f`).
+    let _ = file.seek(SeekFrom::End(0));
+
+    println!("logs: tailing {} for '{}' (Ctrl-C to stop)", path.display(), service);
+
+    let prefix = format!("{service}:");
+    let mut reader = std::io::BufReader::new(file);
+    let mut line   = String::new();
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                // No new data yet; wait briefly and retry.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Ok(_) => {
+                let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+                if trimmed.contains(&prefix) {
+                    println!("{trimmed}");
+                }
+            }
+            Err(e) => {
+                eprintln!("logs: read error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 }
 
 fn cmd_status(service: &str) {
