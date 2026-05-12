@@ -1595,6 +1595,62 @@ The ambition: multiple GodspeedOS instances, possibly identified by a shared tok
 
 The architectural primitives in this constitution are unusually well-suited for revisiting these ideas. Whether and when to attempt it is open.
 
+## C.4 Cluster Routing: Architecture and API Questions
+
+> This section records the design reasoning behind how routing would extend to cluster mode and why the API surface for remote IPC should be distinct from local IPC. It does not commit to a timeline or implementation.
+
+### Routing table generalization
+
+Current GodspeedOS routing resolves:
+
+```
+EndpointId → CoreId
+```
+
+In a clustered model, the routing table generalizes to:
+
+```
+EndpointId → (NodeId, CoreId)
+```
+
+This extends "location" from a core to a (node, core) pair while leaving everything else — EndpointId, generation, liveness, capability structure — unchanged. The invariant "identity is stable; location is not" already encodes this: SMP taught the system that identity and execution location are separate concepts. Cluster mode extends the definition of location; it does not change the philosophy.
+
+The generation mechanism already handles service mobility across nodes correctly. When a service moves to a new node, its endpoint generation is bumped. Clients receive `EndpointDead` on their next send, look up the new endpoint via the registry, and resume with a new cap that routes to `(NodeId=2, CoreId=0)` instead of `(NodeId=0, CoreId=1)`. Client code does not change — the pattern is identical to the existing cross-core restart flow demonstrated by `restart_changes_core_transparently` (§22 Test 10).
+
+### Why the API for remote IPC should be distinct
+
+Two options exist for the developer-facing API:
+
+**Option A — Explicit remote semantics:**
+```rust
+send_remote(endpoint_cap, msg, timeout) -> Result<(), RemoteIpcError>
+```
+Makes network boundaries visible. Callers explicitly opt into different latency, retry, and failure semantics.
+
+**Option B — Transparent routing:**
+```rust
+send(endpoint_cap, msg)  // kernel resolves (NodeId, CoreId) internally
+```
+Preserves location transparency. Callers see no difference between local and remote sends.
+
+The existing invariants answer this question without needing to argue about it independently. "Loud failures, never silent" and "bounded behavior" (§3) rule out Option B on their own terms: transparent routing would mean `send()` silently paying network latency and returning errors with semantics the caller was not written to handle. That is a silent fallback — exactly what the constitution forbids.
+
+The deeper reason is what "Ok" means. A successful local `send` guarantees delivery to a queue on this machine. A successful remote `send` guarantees handoff to a transport. These are different contracts — not just different performance, but different durability, different failure domains, and different recovery obligations. Pretending they are the same primitive is the architectural mistake transparent clustering has historically made.
+
+**Tentative conclusion:** local IPC remains synchronous with its current semantics. Cross-node IPC uses a distinct API surface with explicit timeout and failure handling. This is not a retreat from the "identity over location" principle — it is an honest representation of a different failure domain using the same capability model.
+
+### What actually needs to change for cluster mode
+
+The routing table field (`node_id: u32`) is a one-line addition. The substantial work is elsewhere:
+
+- The registry must become cluster-aware: it must resolve `name → endpoint` across nodes.
+- The send path must branch on `node_id == LOCAL` vs `node_id != LOCAL`.
+- Remote sends require a transport layer with its own failure and timeout semantics.
+- `blocked_receiver` in the routing entry is currently a local task-slot index — meaningless cross-node. The wakeup mechanism for remote receivers requires a different primitive (a network acknowledgment, not a local IPI).
+- Cross-node TCB authority: does a supervisor on node A govern services on node B? This is an open question with significant security implications.
+
+Adding `node_id` to the routing table now is a free and correct step. It does not meaningfully reduce the clustering work because the hard parts are in the items listed above, not in the field itself.
+
 ---
 
 # Appendix D: Shell, Scripting, and Utility Ecosystem (Non-Normative, Far Future)
