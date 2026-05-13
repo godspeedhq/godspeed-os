@@ -34,6 +34,7 @@
 23. [First Milestone](#23-first-milestone)
 24. [Glossary](#24-glossary)
 25. [Final Principles](#25-final-principles)
+26. [Architectural Discipline](#26-architectural-discipline)
 
 **Appendices (forward-looking, mostly non-normative):**
 
