@@ -157,6 +157,18 @@ impl From<crate::loader::LoadError> for SpawnError {
 // Service configuration table.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Registry ELF — conditionally replaced for §22 Test 1B.
+// When the kernel is built with --features test-bad-registry, the registry
+// binary is two garbage bytes that will fail ELF loading, causing init to
+// observe a spawn error and call Abort (syscall 9) → kernel panic (§6.2).
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "test-bad-registry")]
+const REGISTRY_ELF: &[u8] = b"\xDE\xAD"; // invalid ELF, triggers LoadFailed
+#[cfg(not(feature = "test-bad-registry"))]
+const REGISTRY_ELF: &[u8] = include_bytes!(env!("SVC_REGISTRY_ELF"));
+
 struct ServiceConfig {
     elf:               &'static [u8],
     has_recv_endpoint: bool,
@@ -168,6 +180,8 @@ struct ServiceConfig {
     preferred_core:    u32,
     /// Written into ServiceContextData.probe_mode at spawn. 0 for all non-test services.
     probe_mode:        u32,
+    /// Maximum bytes the task may allocate via AllocMem (§10.2).
+    memory_limit:      u64,
 }
 
 fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
@@ -179,14 +193,16 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        0,
+            memory_limit:      64 * 1024 * 1024,
         })),
         "registry" => Some(("registry", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_REGISTRY_ELF")),
+            elf:               REGISTRY_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        0,
+            memory_limit:      64 * 1024 * 1024,
         })),
         "logger" => Some(("logger", ServiceConfig {
             elf:               include_bytes!(env!("SVC_LOGGER_ELF")),
@@ -195,6 +211,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        0,
+            memory_limit:      64 * 1024 * 1024,
         })),
         "ping" => Some(("ping", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PING_ELF")),
@@ -203,6 +220,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        0,
+            memory_limit:      64 * 1024 * 1024,
         })),
         "pong" => Some(("pong", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PONG_ELF")),
@@ -211,6 +229,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  false,
             preferred_core:    1,
             probe_mode:        0,
+            memory_limit:      64 * 1024 * 1024,
         })),
         // ----------------------------------------------------------------
         // Probe services — §22 Group A identity tests.
@@ -225,6 +244,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        1, // MODE_ECHO_RECV — Test 3A
+            memory_limit:      64 * 1024 * 1024,
         })),
         "probe-victim" => Some(("probe-victim", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -233,6 +253,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        0, // MODE_PASSIVE — killed by probe-4a in Test 4A
+            memory_limit:      64 * 1024 * 1024,
         })),
         "probe-4b-recv" => Some(("probe-4b-recv", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -241,6 +262,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        0, // MODE_PASSIVE — killed by harness in Test 4B
+            memory_limit:      64 * 1024 * 1024,
         })),
         "probe-3b" => Some(("probe-3b", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -249,6 +271,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        3, // MODE_NO_SEND_RIGHT — Test 3B
+            memory_limit:      64 * 1024 * 1024,
         })),
         "probe-sender" => Some(("probe-sender", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -257,6 +280,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        2, // MODE_ECHO_SEND — Test 3A
+            memory_limit:      64 * 1024 * 1024,
         })),
         "probe-4a" => Some(("probe-4a", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -265,6 +289,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        4, // MODE_SEND_AFTER_KILL — Test 4A
+            memory_limit:      64 * 1024 * 1024,
         })),
         "probe-4b-send" => Some(("probe-4b-send", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -273,6 +298,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        5, // MODE_FILL_AND_BLOCK — Test 4B
+            memory_limit:      64 * 1024 * 1024,
         })),
         "probe-yielder" => Some(("probe-yielder", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -281,6 +307,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        6, // MODE_YIELD_LOGGER — Test 8A
+            memory_limit:      64 * 1024 * 1024,
         })),
         "probe-hog" => Some(("probe-hog", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -289,6 +316,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        7, // MODE_HOG — Test 8B (preemption proven via ping)
+            memory_limit:      64 * 1024 * 1024,
         })),
         "probe-9b" => Some(("probe-9b", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -297,6 +325,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        8, // MODE_CAP_FORGE — Test 9B
+            memory_limit:      64 * 1024 * 1024,
         })),
         // ----------------------------------------------------------------
         // Cap-transfer probes — §22 Tests 5A and 5B.
@@ -310,6 +339,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        9, // MODE_GRANT_RECV — Test 5A receiver
+            memory_limit:      64 * 1024 * 1024,
         })),
         "probe-5a-send" => Some(("probe-5a-send", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -318,6 +348,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  true,  // mints SEND|GRANT cap to probe-5a-recv
             preferred_core:    0,
             probe_mode:        10, // MODE_GRANT_SEND — Test 5A sender
+            memory_limit:      64 * 1024 * 1024,
         })),
         "probe-5b-send" => Some(("probe-5b-send", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -326,6 +357,28 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  false, // SEND only — no GRANT right; should return CapNotGrantable
             preferred_core:    0,
             probe_mode:        11, // MODE_NO_GRANT_SEND — Test 5B negative
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // ----------------------------------------------------------------
+        // Memory-limit probes — §22 Tests 7A and 7B.
+        // ----------------------------------------------------------------
+        "probe-7a" => Some(("probe-7a", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    0,
+            probe_mode:        12, // MODE_ALLOC_OK — Test 7A
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "probe-7b" => Some(("probe-7b", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    0,
+            probe_mode:        13, // MODE_ALLOC_LIMIT — Test 7B
+            memory_limit:      64 * 1024 * 1024,
         })),
         _ => None,
     }
@@ -360,7 +413,7 @@ pub fn spawn_service_by_name(name: &str, core_override: Option<u32>) -> Result<(
 
     let result = spawn_service_with_config(static_name, cfg.elf, core_id,
                               cfg.has_recv_endpoint, cfg.send_peers, cfg.probe_mode,
-                              cfg.send_peers_grant);
+                              cfg.send_peers_grant, cfg.memory_limit);
     if let Err(ref e) = result {
         crate::kprintln!("task: spawn '{}' failed: {:?}", name, e);
     }
@@ -376,6 +429,7 @@ fn spawn_service_with_config(
     send_peers:        &[&str],
     probe_mode:        u32,
     send_peers_grant:  bool,
+    memory_limit:      u64,
 ) -> Result<(), SpawnError> {
     // 1. Parse ELF.
     let crate::loader::LoadedElf { mut page_table, entry_va } =
@@ -526,6 +580,9 @@ fn spawn_service_with_config(
         scheduler::commit_task(task_slot, name, ctx, true, kstack_top as u64, own_endpoint);
     }
 
+    // 10. Initialise the memory budget for this task (§10.3).
+    scheduler::set_task_memory_budget(task_slot, memory_limit);
+
     crate::kprintln!("task: '{}' spawned OK on core {} (slot {})", name, core_id, task_slot);
     Ok(())
 }
@@ -533,7 +590,7 @@ fn spawn_service_with_config(
 /// Spawn `init` on Core 0. Called once by `kernel_main` (§11.1).
 pub fn spawn_init() {
     let elf_bytes = include_bytes!(env!("SVC_INIT_ELF"));
-    match spawn_service_with_config("init", elf_bytes, 0, false, &[], 0, false) {
+    match spawn_service_with_config("init", elf_bytes, 0, false, &[], 0, false, 64 * 1024 * 1024) {
         Ok(()) => crate::kprintln!("task: init spawned on core 0"),
         Err(e) => panic!("task: failed to spawn init: {:?}", e),
     }

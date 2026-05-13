@@ -14,15 +14,16 @@ use godspeed_sdk::ServiceContext;
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("init: ready");
 
-    // Spawn TCB services in order; kernel panic semantics if any fail (§6.2).
+    // Spawn TCB services in order; Abort syscall (9) triggers kernel panic on
+    // failure (§6.2).  The panic handler emits "KERNEL PANIC" + reason to serial.
     if ctx.spawn("supervisor").is_err() {
         ctx.log("init: FATAL: failed to spawn supervisor");
-        loop {}
+        ctx.abort("supervisor spawn failed");
     }
 
     if ctx.spawn("registry").is_err() {
         ctx.log("init: FATAL: failed to spawn registry");
-        loop {}
+        ctx.abort("registry spawn failed");
     }
 
     // logger is not TCB (§11.3); retry once on failure and continue without it.

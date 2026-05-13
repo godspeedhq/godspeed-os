@@ -23,29 +23,27 @@ const LIMINE_CONF: &str = r#"timeout: -1
     kernel_path: boot():/kernel.elf
 "#;
 
-/// Build `build/os.img`: partition table + FAT32 + files.
-/// Returns the path to the created image.
-pub fn create(kernel_elf: &Path, limine_dir: &Path) -> PathBuf {
-    std::fs::create_dir_all("build").expect("failed to create build/");
-    let image_path = PathBuf::from("build/os.img");
+/// Build a bootable disk image at `image_path`.
+///
+/// Lower-level version of `create`; used when a non-default image path is
+/// needed (e.g. the bad-registry test image for §22 Test 1B).
+pub fn create_at(kernel_elf: &Path, limine_dir: &Path, image_path: &Path) -> PathBuf {
+    if let Some(parent) = image_path.parent() {
+        std::fs::create_dir_all(parent).expect("failed to create image parent dir");
+    }
+    let image_path = image_path.to_path_buf();
 
     let total_sectors = (IMAGE_SIZE / SECTOR_SIZE) as u32;
     let part_sectors = total_sectors - PART_START_LBA;
 
-    // Create and size the image file.
     let img = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
+        .read(true).write(true).create(true).truncate(true)
         .open(&image_path)
-        .expect("failed to create build/os.img");
+        .unwrap_or_else(|e| panic!("failed to create {}: {}", image_path.display(), e));
     img.set_len(IMAGE_SIZE).expect("failed to set image size");
 
-    // Write the MBR partition table.
     write_mbr(&img, PART_START_LBA, part_sectors);
 
-    // Format the partition as FAT32 and populate it.
     let part_offset = PART_START_LBA as u64 * SECTOR_SIZE;
     let part_size = part_sectors as u64 * SECTOR_SIZE;
     {
@@ -53,35 +51,30 @@ pub fn create(kernel_elf: &Path, limine_dir: &Path) -> PathBuf {
         fatfs::format_volume(
             partition,
             fatfs::FormatVolumeOptions::new().volume_label(*b"GODSPEEDOS "),
-        )
-        .expect("failed to format FAT32 partition");
+        ).expect("failed to format FAT32 partition");
     }
 
-    // Re-open to populate the filesystem (fatfs takes ownership).
-    let img2 = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&image_path)
+    let img2 = std::fs::OpenOptions::new().read(true).write(true).open(&image_path)
         .expect("failed to re-open image");
     let partition = OffsetFile::new(img2, part_offset, part_size);
     let fs = fatfs::FileSystem::new(partition, fatfs::FsOptions::new())
         .expect("failed to open FAT32 filesystem");
     {
         let root = fs.root_dir();
-
-        // limine-bios.sys must be at the root for Limine's BIOS boot.
         copy_into_fat(&root, &limine_dir.join("limine-bios.sys"), "limine-bios.sys");
-
-        // Boot configuration.
         let mut conf = root.create_file("limine.conf").expect("create limine.conf");
         conf.write_all(LIMINE_CONF.as_bytes()).expect("write limine.conf");
-
-        // Kernel binary.
         copy_into_fat(&root, kernel_elf, "kernel.elf");
     }
 
     println!("run: image created at {}", image_path.display());
     image_path
+}
+
+/// Build `build/os.img`: partition table + FAT32 + files.
+/// Returns the path to the created image.
+pub fn create(kernel_elf: &Path, limine_dir: &Path) -> PathBuf {
+    create_at(kernel_elf, limine_dir, Path::new("build/os.img"))
 }
 
 /// Install the Limine BIOS bootloader into the MBR of the disk image.

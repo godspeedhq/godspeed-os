@@ -68,6 +68,22 @@ static mut TASK_PENDING_RECV_CAPS: [[u32; MAX_PENDING_RECV_CAPS]; MAX_TASKS] =
     [[0u32; MAX_PENDING_RECV_CAPS]; MAX_TASKS];
 static mut TASK_PENDING_RECV_CAP_COUNT: [usize; MAX_TASKS] = [0; MAX_TASKS];
 
+// ---------------------------------------------------------------------------
+// Per-task memory budget (§10.3, §22 Tests 7A/7B).
+// ---------------------------------------------------------------------------
+
+/// Base virtual address for task-requested dynamic allocations (AllocMem syscall).
+/// Placed well above the ELF load region (~2 MiB), user stack (≤ 0x8000_0000),
+/// and ServiceContextData page (0x3ff000) to avoid collisions.
+pub const TASK_HEAP_VA_START: u64 = 0x1_0000_0000; // 4 GiB
+
+/// Bytes dynamically allocated so far by each task (via AllocMem).
+static mut TASK_ALLOC_BYTES:   [u64; MAX_TASKS] = [0u64; MAX_TASKS];
+/// Maximum bytes each task may allocate (set from contract at spawn).
+static mut TASK_LIMIT_BYTES:   [u64; MAX_TASKS] = [0u64; MAX_TASKS];
+/// Next virtual address available for dynamic allocation in each task's space.
+static mut TASK_NEXT_ALLOC_VA: [u64; MAX_TASKS] = [0u64; MAX_TASKS];
+
 
 // ---------------------------------------------------------------------------
 // Per-core scheduler state.
@@ -285,6 +301,49 @@ pub fn pop_pending_recv_cap() -> Option<u32> {
             }
         }
         None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Memory budget API (§10.3, §22 Tests 7A/7B).
+// ---------------------------------------------------------------------------
+
+/// Set the memory budget for `slot` at spawn time.
+///
+/// Resets alloc_bytes to 0 and seeds the first heap VA.
+pub fn set_task_memory_budget(slot: usize, limit: u64) {
+    if slot >= MAX_TASKS { return; }
+    // SAFETY: called from spawn path with IF=0; single writer for this slot.
+    unsafe {
+        TASK_ALLOC_BYTES[slot]   = 0;
+        TASK_LIMIT_BYTES[slot]   = limit;
+        TASK_NEXT_ALLOC_VA[slot] = TASK_HEAP_VA_START;
+    }
+}
+
+/// Reserve `size` bytes from the current task's memory budget.
+///
+/// Returns the virtual address at which the caller should map the new pages,
+/// or `None` if the allocation would exceed the task's limit (AllocDenied).
+///
+/// `size` is rounded up to a 4 KiB page boundary before the budget check so
+/// that the VA region is always page-aligned.
+pub fn current_task_claim_alloc(size: u64) -> Option<u64> {
+    let cid = current_core_id();
+    // SAFETY: IF=0 in syscall context; single core writer.
+    unsafe {
+        let cur = CORE_CURRENT[cid];
+        if cur >= MAX_TASKS || !TASK_VALID[cur] { return None; }
+
+        let aligned = (size + 4095) & !4095;
+        let already = TASK_ALLOC_BYTES[cur];
+        let limit   = TASK_LIMIT_BYTES[cur];
+        if already.saturating_add(aligned) > limit { return None; }
+
+        let va = TASK_NEXT_ALLOC_VA[cur];
+        TASK_ALLOC_BYTES[cur]   = already + aligned;
+        TASK_NEXT_ALLOC_VA[cur] = va + aligned;
+        Some(va)
     }
 }
 

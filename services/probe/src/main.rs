@@ -17,11 +17,13 @@
 //!   9 = GRANT_RECV      — recv then take_pending_cap; log pass                    (Test 5A)
 //!  10 = GRANT_SEND      — send_with_cap to probe-5a-recv; log pass                (Test 5A)
 //!  11 = NO_GRANT_SEND   — send_with_cap without GRANT right → CapNotGrantable     (Test 5B)
+//!  12 = ALLOC_OK        — alloc within limit twice; both succeed                   (Test 7A)
+//!  13 = ALLOC_LIMIT     — alloc 60 MiB, then 20 MiB → AllocDenied, then 2 MiB → Ok (Test 7B)
 
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{CapError, CapHandle, IpcError, Message, ServiceContext};
+use godspeed_sdk::{service_context::AllocError, CapError, CapHandle, IpcError, Message, ServiceContext};
 
 #[allow(dead_code)]
 const MODE_PASSIVE:         u32 = 0;
@@ -36,6 +38,8 @@ const MODE_CAP_FORGE:       u32 = 8;
 const MODE_GRANT_RECV:      u32 = 9;
 const MODE_GRANT_SEND:      u32 = 10;
 const MODE_NO_GRANT_SEND:   u32 = 11;
+const MODE_ALLOC_OK:        u32 = 12;
+const MODE_ALLOC_LIMIT:     u32 = 13;
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
@@ -51,6 +55,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         MODE_GRANT_RECV      => mode_grant_recv(&ctx),
         MODE_GRANT_SEND      => mode_grant_send(&ctx),
         MODE_NO_GRANT_SEND   => mode_no_grant_send(&ctx),
+        MODE_ALLOC_OK        => mode_alloc_ok(&ctx),
+        MODE_ALLOC_LIMIT     => mode_alloc_limit(&ctx),
         _                    => idle(&ctx),
     }
 }
@@ -167,6 +173,38 @@ fn mode_no_grant_send(ctx: &ServiceContext) -> ! {
         Err(IpcError::CapError(CapError::CapNotGrantable)) =>
             ctx.log("probe: 5B pass — CapNotGrantable"),
         _ => ctx.log("probe: 5B FAIL"),
+    }
+    idle(ctx)
+}
+
+fn mode_alloc_ok(ctx: &ServiceContext) -> ! {
+    // Test 7A: allocate 32 MiB then 20 MiB; both must succeed within the 64 MiB limit.
+    let ok1 = ctx.alloc_mem(32 * 1024 * 1024);
+    let ok2 = ctx.alloc_mem(20 * 1024 * 1024);
+    match (ok1, ok2) {
+        (Ok(_), Ok(_)) => ctx.log("probe: 7A pass"),
+        _              => ctx.log("probe: 7A FAIL"),
+    }
+    idle(ctx)
+}
+
+fn mode_alloc_limit(ctx: &ServiceContext) -> ! {
+    // Test 7B: fill 60 MiB, then verify AllocDenied for 20 MiB (60+20>64),
+    // then verify recovery still allows 2 MiB (60+2=62<64).
+    let first = ctx.alloc_mem(60 * 1024 * 1024);
+    if first.is_err() {
+        ctx.log("probe: 7B FAIL — initial 60 MiB alloc failed");
+        idle(ctx);
+    }
+    let denied = ctx.alloc_mem(20 * 1024 * 1024);
+    if denied != Err(AllocError::Denied) {
+        ctx.log("probe: 7B FAIL — expected AllocDenied for 20 MiB over limit");
+        idle(ctx);
+    }
+    let recover = ctx.alloc_mem(2 * 1024 * 1024);
+    match recover {
+        Ok(_) => ctx.log("probe: 7B pass"),
+        Err(_) => ctx.log("probe: 7B FAIL — recovery alloc failed"),
     }
     idle(ctx)
 }

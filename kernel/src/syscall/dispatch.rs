@@ -6,10 +6,12 @@
 //! Syscall numbers are fixed; adding a syscall requires a new number and a
 //! capability that authorises it.
 
+use crate::arch::x86_64::page_tables::{map_in_active_tables, MapError, PageFlags};
 use crate::capability::cap::CapError;
 use crate::capability::rights::Rights;
 use crate::ipc::endpoint::EndpointId;
 use crate::ipc::message::{IpcError, Message, MAX_MESSAGE_SIZE};
+use crate::memory::allocator::alloc_frame;
 use crate::task::scheduler;
 use crate::task::state::TaskState;
 
@@ -24,6 +26,8 @@ pub enum SyscallNumber {
     AllocMem       = 6,
     Spawn          = 7,
     Kill           = 8,
+    AllocMem       = 6,
+    Abort          = 9,
     AcquireSendCap = 10,
     SendWithCap    = 11,
     TakePendingCap = 12,
@@ -67,8 +71,10 @@ pub unsafe extern "C" fn syscall_handler(
             0
         }
         n if n == SyscallNumber::Log            as u64 => handle_log(arg0, arg1, arg2),
+        n if n == SyscallNumber::AllocMem       as u64 => handle_alloc_mem(arg0),
         n if n == SyscallNumber::Spawn          as u64 => handle_spawn(arg0, arg1, arg2),
         n if n == SyscallNumber::Kill           as u64 => handle_kill(arg0, arg1),
+        n if n == SyscallNumber::Abort          as u64 => handle_abort(arg0, arg1),
         n if n == SyscallNumber::AcquireSendCap as u64 => handle_acquire_send_cap(arg0, arg1),
         n if n == SyscallNumber::SendWithCap    as u64 => handle_send_with_cap(arg0, arg1, arg2),
         n if n == SyscallNumber::TakePendingCap as u64 => handle_take_pending_cap(),
@@ -429,6 +435,76 @@ unsafe fn handle_take_pending_cap() -> i64 {
         Some(slot) => slot as i64,
         None       => -1,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: AllocMem (6) — dynamic page allocation within the task's budget.
+// ---------------------------------------------------------------------------
+
+/// arg0 = size in bytes to allocate (must be > 0).
+///
+/// No capability required — the task's budget is implicitly granted at spawn
+/// from the memory limit in its contract (§10.2, implicit authority).
+///
+/// Returns the virtual address of the newly-mapped region on success, or a
+/// negative error code:
+///   -11  AllocDenied — request would exceed the task's memory limit.
+///   -1   other failure (physical memory exhausted; partial allocation left mapped).
+unsafe fn handle_alloc_mem(size: u64) -> i64 {
+    if size == 0 { return -1; }
+
+    // Reserve budget and obtain the base virtual address to map from.
+    let base_va = match scheduler::current_task_claim_alloc(size) {
+        Some(va) => va,
+        None     => return -11, // AllocDenied
+    };
+
+    let pages = (size + 4095) / 4096;
+    // User-space read/write pages, not executable.
+    let flags = (PageFlags::PRESENT | PageFlags::WRITABLE
+                 | PageFlags::USER   | PageFlags::NO_EXEC).bits();
+
+    for i in 0..pages {
+        let va = base_va + i * 4096;
+        let frame = match alloc_frame() {
+            Some(f) => f,
+            None    => return -1, // physical memory exhausted; budget already updated
+        };
+        let phys = frame.phys_addr().0;
+        // SAFETY: va is in the task heap range (0x1_0000_0000+); phys is from the
+        // allocator; the task's page table is the active CR3 during this syscall.
+        if unsafe { map_in_active_tables(va, phys, flags) }.is_err() {
+            core::mem::forget(frame);
+            return -1;
+        }
+        // Transfer frame ownership to the page table (freed when task dies).
+        core::mem::forget(frame);
+    }
+
+    base_va as i64
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: Abort (9) — TCB service reports a fatal failure; causes kernel panic.
+// ---------------------------------------------------------------------------
+
+/// arg0 = msg_ptr (user VA), arg1 = msg_len.
+///
+/// Prints "KERNEL PANIC" immediately (so the harness sees it even on minimal
+/// serial buffering), then panics with "reason: {msg}" (§6.2, §22 Test 1B).
+/// Does not return.
+unsafe fn handle_abort(msg_ptr: u64, msg_len: u64) -> i64 {
+    let len = msg_len as usize;
+    if len > 0 && len <= 128 && validate_user_slice(msg_ptr, len) {
+        // SAFETY: validate_user_slice confirmed range is in user space.
+        let bytes = unsafe { core::slice::from_raw_parts(msg_ptr as *const u8, len) };
+        if let Ok(s) = core::str::from_utf8(bytes) {
+            crate::kprintln!("KERNEL PANIC");
+            panic!("reason: {}", s);
+        }
+    }
+    crate::kprintln!("KERNEL PANIC");
+    panic!("reason: (init abort — no message)");
 }
 
 fn ipc_err_to_i64(e: IpcError) -> i64 {

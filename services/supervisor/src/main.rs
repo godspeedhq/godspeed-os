@@ -35,6 +35,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let _ = ctx.spawn("probe-yielder"); // Test 8A
     let _ = ctx.spawn("probe-hog");     // Test 8B (tight loop; preemption via ping)
     let _ = ctx.spawn("probe-9b");      // Test 9B
+    // Memory-limit probes — Tests 7A and 7B.
+    let _ = ctx.spawn("probe-7a");
+    let _ = ctx.spawn("probe-7b");
 
     // --- Original ping/pong services ---
     // Spawn pong first so the kernel registers "pong" in its name table before

@@ -63,6 +63,19 @@ static mut SEND_CAP_CACHE: [CacheEntry; CACHE_SIZE] =
     [const { CacheEntry::empty() }; CACHE_SIZE];
 
 // ---------------------------------------------------------------------------
+// AllocError — returned by ServiceContext::alloc_mem.
+// ---------------------------------------------------------------------------
+
+/// Error from the AllocMem syscall (6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocError {
+    /// Allocation would exceed the task's memory limit (§10.3).
+    Denied,
+    /// Physical memory exhausted or other kernel-side failure.
+    Failed,
+}
+
+// ---------------------------------------------------------------------------
 // ServiceContext.
 // ---------------------------------------------------------------------------
 
@@ -207,6 +220,34 @@ impl ServiceContext {
 
     /// Return the core this service was spawned on.
     pub fn core_id(&self) -> u32 { Self::ctx().core_id }
+
+    /// Allocate `size` bytes of read/write memory within this task's budget.
+    ///
+    /// Returns the virtual address of the mapping on success, or `AllocError`
+    /// if the allocation would exceed the contract memory limit (AllocDenied)
+    /// or physical memory is exhausted.
+    pub fn alloc_mem(&self, size: usize) -> Result<u64, AllocError> {
+        // SAFETY: syscall(6) = AllocMem; no user pointers passed.
+        let ret = unsafe { raw_syscall(6, size as u64, 0, 0) };
+        if ret >= 0 {
+            Ok(ret as u64)
+        } else if ret == -11 {
+            Err(AllocError::Denied)
+        } else {
+            Err(AllocError::Failed)
+        }
+    }
+
+    /// Trigger a kernel panic with `reason` as the message.
+    ///
+    /// Called by TCB services (init) when a required service fails to spawn
+    /// (§6.2).  Does not return.
+    pub fn abort(&self, reason: &str) -> ! {
+        let bytes = reason.as_bytes();
+        // SAFETY: syscall(9) = Abort; bytes is a valid slice in user space.
+        unsafe { raw_syscall(9, bytes.as_ptr() as u64, bytes.len() as u64, 0) };
+        loop {} // unreachable; abort does not return
+    }
 
     /// Advisory yield (§9.3).
     pub fn yield_cpu(&self) {

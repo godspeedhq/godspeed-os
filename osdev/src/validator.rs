@@ -39,6 +39,13 @@ enum TestKind {
         fail_on:      &'static [&'static str],
         timeout_secs: u64,
     },
+    /// Build kernel with `test-bad-registry` feature, create a separate
+    /// image, boot QEMU with it, and watch for `expect` lines (e.g. a panic).
+    WithBadTcb {
+        expect:       &'static [&'static str],
+        fail_on:      &'static [&'static str],
+        timeout_secs: u64,
+    },
     /// Not implemented. Print reason; do not boot QEMU.
     Blocked {
         reason: &'static str,
@@ -65,9 +72,10 @@ static TESTS: &[TestSpec] = &[
     },
     TestSpec {
         id: "1B", name: "bootstrap_tcb_failure_panics", spec_ref: "§22 Test 1B",
-        kind: TestKind::Blocked {
-            reason: "requires kernel build with corrupted TCB binary — \
-                     not implemented; will be implemented when a test requires it",
+        kind: TestKind::WithBadTcb {
+            expect:       &["KERNEL PANIC", "reason: registry spawn failed"],
+            fail_on:      &["supervisor: ready"],
+            timeout_secs: 30,
         },
     },
     TestSpec {
@@ -164,16 +172,18 @@ static TESTS: &[TestSpec] = &[
     },
     TestSpec {
         id: "7A", name: "memory_alloc_within_limit", spec_ref: "§22 Test 7A",
-        kind: TestKind::Blocked {
-            reason: "AllocMem syscall (6) not implemented; \
-                     will be implemented when a test requires it",
+        kind: TestKind::WatchSerial {
+            expect:       &["probe: 7A pass"],
+            fail_on:      &["KERNEL PANIC", "probe: 7A FAIL"],
+            timeout_secs: 30,
         },
     },
     TestSpec {
         id: "7B", name: "memory_beyond_limit", spec_ref: "§22 Test 7B",
-        kind: TestKind::Blocked {
-            reason: "AllocMem syscall (6) not implemented; \
-                     will be implemented when a test requires it",
+        kind: TestKind::WatchSerial {
+            expect:       &["probe: 7B pass"],
+            fail_on:      &["KERNEL PANIC", "probe: 7B FAIL"],
+            timeout_secs: 30,
         },
     },
     TestSpec {
@@ -325,6 +335,37 @@ pub fn run_identity_tests() {
 fn run_one(test: &TestSpec, image: &Path) -> TestOutcome {
     match &test.kind {
         TestKind::Blocked { reason } => TestOutcome::Blocked(reason),
+
+        TestKind::WithBadTcb { expect, fail_on, timeout_secs } => {
+            // Build kernel with the test-bad-registry feature (invalid registry ELF).
+            let status = std::process::Command::new("cargo")
+                .args([
+                    "build", "--release", "-p", "kernel",
+                    "--target", "x86_64-unknown-none",
+                    "--features", "kernel/test-bad-registry",
+                ])
+                .status()
+                .expect("failed to build kernel with test-bad-registry");
+            if !status.success() {
+                return TestOutcome::Fail(
+                    "kernel build with test-bad-registry feature failed".to_string()
+                );
+            }
+
+            let kernel_elf = Path::new("target/x86_64-unknown-none/release/kernel");
+            let limine_dir = Path::new("tools/limine");
+            let bad_img    = Path::new("build/tests/1B-bad-tcb.img");
+            let bad_image  = crate::disk_image::create_at(kernel_elf, limine_dir, bad_img);
+            crate::disk_image::install_bootloader(limine_dir, &bad_image);
+
+            let serial = serial_path(test);
+            let _ = std::fs::write(&serial, b"");
+            let qemu   = crate::qemu::spawn_for_test(&bad_image, 4, &serial, None);
+            let result = poll_serial(&serial, expect, fail_on,
+                                     Instant::now() + Duration::from_secs(*timeout_secs));
+            qemu.kill();
+            result
+        }
 
         TestKind::WatchSerial { expect, fail_on, timeout_secs } => {
             let serial = serial_path(test);

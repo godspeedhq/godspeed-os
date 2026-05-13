@@ -14,5 +14,10 @@ limine = "0.6"
 [profile.dev]
 panic = "abort"
 
+[features]
+# Build the kernel with a deliberately invalid registry ELF to trigger the TCB
+# failure path in init (§6.2, §22 Test 1B).  Only used by `osdev test identity`.
+test-bad-registry = []
+
 [profile.release]
 panic = "abort"
