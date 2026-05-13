@@ -957,14 +957,164 @@ They are the executable form of the constitution. If you change the spec in a wa
 
 ### 22.2 Categorization
 
-| Category   | Purpose                                  | Status     |
-|------------|------------------------------------------|------------|
-| Identity   | Pin constitutional decisions             | **§22**    |
-| Property   | Invariants under random inputs           | Deferred   |
-| Fuzz       | Crash resistance on malformed inputs     | Deferred   |
-| Performance| Benchmarks for IPC and syscall paths     | Deferred   |
+The test suite is layered. Each layer answers a different question about kernel correctness. A pass on one layer is necessary but not sufficient. Battle-hardening requires passing all layers.
 
-Identity tests live in `tests/qemu/identity/`. The harness boots the OS with a configurable `-smp N` value; multi-core tests assert on N ≥ 2.
+| Category    | Purpose                                              | Bar (what failure means)                          | Status |
+|-------------|------------------------------------------------------|---------------------------------------------------|--------|
+| Identity    | Pin constitutional decisions; existence proof        | Constitutional invariant violated                 | §22 (20/20) |
+| Property    | Universal invariants under random inputs             | A claim the spec makes does not hold              | Active |
+| Fuzz        | Crash resistance under adversarial inputs            | Kernel panics on user-controllable input          | Active |
+| Stress      | Survival under sustained load                        | Drift, leaks, or corruption appear over time      | Active |
+| Performance | Latency / throughput benchmarks                      | A measured number regressed                       | Active |
+| Adversarial | Capability isolation under attack                    | An attack succeeds where the spec says it fails   | Active |
+| Chaos       | Graceful degradation under partial failures          | A defined failure mode is not handled cleanly     | Active |
+
+Tests live under `tests/qemu/`, organized by category:
+
+```
+tests/qemu/
+  identity/      # §22.5–§22.6 (complete)
+  property/      # see Property Tests below
+  fuzz/          # see Fuzz Tests below
+  stress/        # see Stress Tests below
+  perf/          # see Performance Benchmarks below
+  adversarial/   # see Adversarial / Red-Team Tests below
+  chaos/         # see Chaos Tests below
+  harness/       # shared infrastructure
+```
+
+The base harness (§22.3) boots the OS with a configurable `-smp N` value; multi-core tests assert on N ≥ 2. The battle-hardening categories extend it with longer timeouts (stress, perf), metric collection (perf), and fault injection (chaos).
+
+The bar across every category is the same as identity: **no FAIL, no BLOCKED with a vague reason**. A failure means a real bug — fix it, add a regression test to the appropriate suite, then move on.
+
+---
+
+#### Identity (§22) — Complete
+
+20/20 passing. No regressions allowed. Any failure here is a constitutional violation that requires either a kernel fix or a CLAUDE.md amendment.
+
+---
+
+#### Property Tests
+
+Property tests assert *universal* claims over randomized inputs. Identity tests prove the system *can* satisfy each invariant; property tests prove it *always* does. Each test runs thousands of iterations with QuickCheck-style generators.
+
+| ID  | Property                                                                       | Pins                  |
+|-----|--------------------------------------------------------------------------------|-----------------------|
+| P1  | Random bytes → `CapNotHeld` or `CapInvalid`; never accepted as a cap           | §7.3 (unforgeable)    |
+| P2  | Generation per service is strictly monotonic across its lifetime               | §7.5                  |
+| P3  | Cap rights never widen during transfer                                         | §7.3 (non-escalating) |
+| P4  | ∑ `task_alloc_bytes` ≡ pages mapped, after any sequence of alloc/free          | §10.3                 |
+| P5  | Every live endpoint has exactly one owning task                                | §8.3                  |
+| P6  | Queue head ≤ tail ≤ head + 16; count consistent with both                      | §8.5                  |
+| P7  | After unmap + TLB shootdown, the page is unreadable from every core            | §10.5                 |
+| P8  | After restart, name resolves to a task with the same name and higher generation | §14.2                 |
+| P9  | Generation bump invalidates ALL holders, not just some                         | §7.5                  |
+| P10 | Every `send` returns exactly one of {Ok, defined error} — never both, never neither | §8.6              |
+
+Bar: any property failure is a logic bug. Kernel must be fixed before any other work proceeds.
+
+---
+
+#### Fuzz Tests
+
+Fuzz tests find the inputs that crash the kernel that no one would write by hand. The bar is binary and absolute: **the kernel must never panic on user-controllable input.**
+
+| ID  | Surface                          | Generator                                                                         |
+|-----|----------------------------------|-----------------------------------------------------------------------------------|
+| F1  | Syscall args (each × 1M iters)   | Random u64 in `a0/a1/a2`; including kernel addresses, unmapped pointers, misaligned values |
+| F2  | Syscall numbers                  | Random u64 as `nr`; must return `UnknownSyscall`, never crash                     |
+| F3  | ELF binaries                     | Bit-flip mutations of known-good ELFs handed to the spawner                       |
+| F4  | Service contracts                | Malformed TOML; JSON Schema-invalid structures                                    |
+| F5  | IPC message bodies               | Random bytes, random sizes up to 4 KiB                                            |
+| F6  | Embedded caps in messages        | Messages claiming to carry caps with random structure                             |
+| F7  | Cap generation field             | Random u64 as generation in cap usage; must return `CapRevoked` or `EndpointDead` |
+| F8  | Memory request values            | Random sizes including > total RAM, `0`, and `u64::MAX`                           |
+
+Any panic discovered by F1–F8 is a kernel bug. The fix is mandatory and includes a regression test added to the relevant identity or property suite.
+
+---
+
+#### Stress Tests
+
+Stress tests find the bugs that only appear under sustained load. Identity tests prove correctness for individual operations; stress tests prove the system does not drift, leak, or corrupt over hours of operation.
+
+| ID  | Scenario                                                | Duration       |
+|-----|---------------------------------------------------------|----------------|
+| S1  | IPC saturation: sustained `try_send` on a full queue    | 1 hour         |
+| S2  | Restart storm: 100k kill/respawn cycles of one service  | until complete |
+| S3  | Cross-core thrash: 4 cores × all-to-all IPC             | 10 min         |
+| S4  | Cap table churn: 100k random create/destroy             | until complete |
+| S5  | Generation overflow: force counter to wrap, observe wraparound semantics | until wrap + 1k operations |
+| S6  | Long-running stability: ping/pong + introspection       | 24 hours       |
+| S7  | Memory pressure: alloc-to-limit + free, 10k cycles      | until complete |
+| S8  | Idle stability: boot, no workload, observe              | 24 hours       |
+| S9  | Interrupt storm: high-frequency timer + IPI cross-fire  | 1 hour         |
+| S10 | Cascading revocation: kill a service held by many; observe propagation | until propagated |
+
+Bar: at the end of each test, the kernel has not panicked, memory accounting is consistent, all services are in a defined state, and no resource is leaked.
+
+---
+
+#### Performance Benchmarks
+
+Performance benchmarks lock in numbers so regressions are detected commit-to-commit. Absolute values matter less than the deltas.
+
+| ID  | Metric                                                |
+|-----|-------------------------------------------------------|
+| B1  | IPC same-core round-trip latency: p50, p99, p99.9     |
+| B2  | IPC cross-core round-trip latency: p50, p99, p99.9    |
+| B3  | Syscall floor: `yield` round trip                     |
+| B4  | Cap validation cost: one cap + generation check       |
+| B5  | Spawn cost: `supervisor.spawn` → service "ready"      |
+| B6  | Restart cost: kill + spawn                            |
+| B7  | Cap table contention: throughput at 1, 2, 4 cores     |
+| B8  | Allocator throughput: pages/sec under contention      |
+| B9  | Message copy cost: 4 KiB upper-bound copy             |
+| B10 | Scheduler decision cost: time to pick next task       |
+
+Results are committed to `tests/qemu/perf/baseline.json`. CI compares each run against baseline and flags regressions ≥ 10%. The §7.8 single global `RwLock` will surface most visibly in B7 — record the number now so the v2 sharded/RCU migration has a target.
+
+---
+
+#### Adversarial / Red-Team Tests
+
+Adversarial tests verify capability isolation holds under direct attack. The system claims a capability model with no ambient authority; these tests run services that try to break that claim.
+
+| ID  | Attack                                                                              |
+|-----|-------------------------------------------------------------------------------------|
+| A1  | Service crafts random u64 values and tries to use them as caps                      |
+| A2  | Service brute-forces endpoint IDs across the u32 space                              |
+| A3  | Service attempts to allocate beyond its contract memory limit through every syscall path |
+| A4  | Service receives a cap with limited rights and attempts to use rights it lacks      |
+| A5  | TOCTOU: service races a syscall with revocation of the cap it is about to use       |
+| A6  | Service tries to fill the cap table to denial-of-service the kernel                 |
+| A7  | Service tries to detect IPC partner identity via timing                             |
+| A8  | Service tries to monopolize a core via a tight loop without yielding                |
+| A9  | Service tries to spawn another service directly, bypassing the supervisor           |
+| A10 | Service passes kernel addresses as syscall arguments                                |
+
+Bar: every attack returns a defined error. Any attack that succeeds is a security hole; any attack that panics the kernel is a kernel bug. Both are mandatory fixes.
+
+---
+
+#### Chaos Tests
+
+Chaos tests verify graceful degradation when something the kernel depends on fails partially. Total failures (kernel panic, TCB death) are covered by §6.2 and Test 1B. Chaos tests cover the *between* cases.
+
+| ID  | Failure injected                                                          |
+|-----|---------------------------------------------------------------------------|
+| C1  | One or more APs fail to come up during boot                               |
+| C2  | A service in the boot manifest has a corrupted ELF (non-TCB)              |
+| C3  | Allocator forced to return `AllocFailed` at random syscall entry points    |
+| C4  | Bootloader provides degraded environment (minimal RAM, no framebuffer)    |
+| C5  | Kernel stack approaches exhaustion under deeply nested syscall            |
+| C6  | One core's timer interrupt is dropped for an extended period              |
+| C7  | TLB shootdown IPI delivery is delayed across cores                        |
+
+Bar: the system either continues correctly with degraded capacity, or panics loudly with a defined reason. Silent corruption is never acceptable. Per invariant 12 (§3): failures are loud, never silent.
+
+---
 
 ### 22.3 Test Harness
 
