@@ -38,6 +38,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Memory-limit probes — Tests 7A and 7B.
     let _ = ctx.spawn("probe-7a");
     let _ = ctx.spawn("probe-7b");
+    // Property-test probes — Milestone 9 Phase 1.
+    // prop-p9-victim must register its endpoint before prop-p9 is spawned
+    // (SEND caps to prop-p9-victim are wired at prop-p9 spawn time).
+    let _ = ctx.spawn("prop-p9-victim");
+    let _ = ctx.spawn("prop-p9");
+    let _ = ctx.spawn("prop-p1");
+    let _ = ctx.spawn("prop-p10");
 
     // --- Original ping/pong services ---
     // Spawn pong first so the kernel registers "pong" in its name table before

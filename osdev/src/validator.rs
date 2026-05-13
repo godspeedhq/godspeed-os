@@ -55,6 +55,37 @@ enum TestKind {
 /// COM2 TCP port used by restart tests (distinct from interactive `osdev run` port 5555).
 const TEST_CONTROL_PORT: u16 = 5556;
 
+// ---------------------------------------------------------------------------
+// Property test definitions (Milestone 9 Phase 1).
+// ---------------------------------------------------------------------------
+
+static PROPERTY_TESTS: &[TestSpec] = &[
+    TestSpec {
+        id: "P1", name: "cap_unforgeable", spec_ref: "§7.3 §3.1",
+        kind: TestKind::WatchSerial {
+            expect:       &["prop: P1 pass (10000/10000)"],
+            fail_on:      &["KERNEL PANIC", "prop: P1 FAIL"],
+            timeout_secs: 60,
+        },
+    },
+    TestSpec {
+        id: "P9", name: "generation_invalidates_all_holders", spec_ref: "§7.5",
+        kind: TestKind::WatchSerial {
+            expect:       &["prop: P9 pass"],
+            fail_on:      &["KERNEL PANIC", "prop: P9 FAIL"],
+            timeout_secs: 60,
+        },
+    },
+    TestSpec {
+        id: "P10", name: "send_returns_defined_outcome", spec_ref: "§8.6",
+        kind: TestKind::WatchSerial {
+            expect:       &["prop: P10 pass (10000/10000)"],
+            fail_on:      &["KERNEL PANIC", "prop: P10 FAIL"],
+            timeout_secs: 60,
+        },
+    },
+];
+
 static TESTS: &[TestSpec] = &[
     TestSpec {
         id: "1A", name: "bootstrap_steady_state_positive", spec_ref: "§22 Test 1A",
@@ -297,7 +328,7 @@ pub fn run_identity_tests() {
     let image_path = crate::disk_image::create(kernel_elf, limine_dir);
     crate::disk_image::install_bootloader(limine_dir, &image_path);
 
-    std::fs::create_dir_all("build/tests").expect("create build/tests/");
+    std::fs::create_dir_all("build/tests/1_IDENTITY").expect("create build/tests/1_IDENTITY/");
 
     println!("\nidentity: running {} tests\n", TESTS.len());
 
@@ -324,6 +355,53 @@ pub fn run_identity_tests() {
     let blocked = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Blocked(_))).count();
 
     println!("\n  {passed} passed  {failed} failed  {blocked} blocked");
+
+    if failed > 0 { std::process::exit(1); }
+}
+
+/// Boot the OS in QEMU and assert the Milestone 9 property test suite.
+pub fn run_property_tests() {
+    println!("property: stopping any running QEMU instances...");
+    kill_existing_qemu();
+
+    println!("property: building...");
+    crate::cmd_build();
+
+    let kernel_elf = Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() {
+        eprintln!("property: kernel ELF not found at {}", kernel_elf.display());
+        std::process::exit(1);
+    }
+
+    let limine_dir = Path::new("tools/limine");
+    let image_path = crate::disk_image::create(kernel_elf, limine_dir);
+    crate::disk_image::install_bootloader(limine_dir, &image_path);
+
+    std::fs::create_dir_all("build/tests/2_PROPERTY").expect("create build/tests/2_PROPERTY/");
+
+    println!("\nproperty: running {} tests\n", PROPERTY_TESTS.len());
+
+    let mut results: Vec<(&TestSpec, TestOutcome)> = Vec::new();
+
+    for test in PROPERTY_TESTS {
+        print!("  [{:>3}]  {:45}  ({})  … ", test.id, test.name, test.spec_ref);
+        let _ = std::io::stdout().flush();
+
+        let outcome = run_property_one(test, &image_path);
+
+        match &outcome {
+            TestOutcome::Pass       => println!("PASS"),
+            TestOutcome::Fail(r)    => println!("FAIL\n         → {r}"),
+            TestOutcome::Blocked(r) => println!("BLOCKED\n         → {r}"),
+        }
+
+        results.push((test, outcome));
+    }
+
+    let passed = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Pass)).count();
+    let failed = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Fail(_))).count();
+
+    println!("\n  {passed} passed  {failed} failed");
 
     if failed > 0 { std::process::exit(1); }
 }
@@ -464,8 +542,27 @@ fn poll_serial(
     }
 }
 
+fn run_property_one(test: &TestSpec, image: &Path) -> TestOutcome {
+    match &test.kind {
+        TestKind::WatchSerial { expect, fail_on, timeout_secs } => {
+            let serial = property_serial_path(test);
+            let _ = std::fs::write(&serial, b"");
+            let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
+            let result = poll_serial(&serial, expect, fail_on,
+                                     Instant::now() + Duration::from_secs(*timeout_secs));
+            qemu.kill();
+            result
+        }
+        _ => TestOutcome::Blocked("property tests only use WatchSerial"),
+    }
+}
+
 fn serial_path(test: &TestSpec) -> PathBuf {
-    PathBuf::from(format!("build/tests/{}-{}.log", test.id, test.name))
+    PathBuf::from(format!("build/tests/1_IDENTITY/{}-{}.log", test.id, test.name))
+}
+
+fn property_serial_path(test: &TestSpec) -> PathBuf {
+    PathBuf::from(format!("build/tests/2_PROPERTY/{}-{}.log", test.id, test.name))
 }
 
 // ---------------------------------------------------------------------------

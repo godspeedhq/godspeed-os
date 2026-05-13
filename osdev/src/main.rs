@@ -212,6 +212,7 @@ fn cmd_caps(service: &str) {
 fn cmd_test(suite: &str) {
     match suite {
         "identity" => crate::validator::run_identity_tests(),
+        "property" => crate::validator::run_property_tests(),
         other => eprintln!("unknown test suite: {}", other),
     }
 }

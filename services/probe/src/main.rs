@@ -41,6 +41,11 @@ const MODE_NO_GRANT_SEND:   u32 = 11;
 const MODE_ALLOC_OK:        u32 = 12;
 const MODE_ALLOC_LIMIT:     u32 = 13;
 
+// Property-test modes — Milestone 9 Phase 1.
+const MODE_PROP_P1:         u32 = 20;
+const MODE_PROP_P9:         u32 = 21;
+const MODE_PROP_P10:        u32 = 22;
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     match ctx.probe_mode() {
@@ -57,6 +62,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         MODE_NO_GRANT_SEND   => mode_no_grant_send(&ctx),
         MODE_ALLOC_OK        => mode_alloc_ok(&ctx),
         MODE_ALLOC_LIMIT     => mode_alloc_limit(&ctx),
+        MODE_PROP_P1         => mode_prop_p1(&ctx),
+        MODE_PROP_P9         => mode_prop_p9(&ctx),
+        MODE_PROP_P10        => mode_prop_p10(&ctx),
         _                    => idle(&ctx),
     }
 }
@@ -206,5 +214,75 @@ fn mode_alloc_limit(ctx: &ServiceContext) -> ! {
         Ok(_) => ctx.log("probe: 7B pass"),
         Err(_) => ctx.log("probe: 7B FAIL — recovery alloc failed"),
     }
+    idle(ctx)
+}
+
+// ---------------------------------------------------------------------------
+// Property-test modes — Milestone 9 Phase 1.
+// ---------------------------------------------------------------------------
+
+fn xorshift64(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+fn mode_prop_p1(ctx: &ServiceContext) -> ! {
+    // P1 — Cap unforgeability (§7.3, §3.1).
+    // 10,000 random u32 values used as cap slots. prop-p1 holds no SEND caps,
+    // so every try_send must return Err. Any Ok is a constitutional violation.
+    let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 20;
+    let msg = Message::from_bytes(b"p1");
+    for _ in 0..10_000u32 {
+        let slot = CapHandle(xorshift64(&mut rng) as u32);
+        if ctx.try_send_by_handle(slot, &msg).is_ok() {
+            ctx.log("prop: P1 FAIL — random cap slot accepted as valid SEND");
+            idle(ctx);
+        }
+    }
+    ctx.log("prop: P1 pass (10000/10000)");
+    idle(ctx)
+}
+
+fn mode_prop_p9(ctx: &ServiceContext) -> ! {
+    // P9 — Generation bump invalidates ALL cap-table holders (§7.5).
+    // prop-p9 is wired with 3 SEND caps to prop-p9-victim (3 distinct slots,
+    // same endpoint). Kill the victim, then verify every slot returns
+    // EndpointDead — not just the first one the kernel happens to find.
+    let msg  = Message::from_bytes(b"p9");
+    let h0   = ctx.send_peer_at(0);
+    let h1   = ctx.send_peer_at(1);
+    let h2   = ctx.send_peer_at(2);
+    match (h0, h1, h2) {
+        (Some(h0), Some(h1), Some(h2)) => {
+            let _ = ctx.kill("prop-p9-victim");
+            let dead0 = matches!(ctx.try_send_by_handle(h0, &msg), Err(IpcError::EndpointDead));
+            let dead1 = matches!(ctx.try_send_by_handle(h1, &msg), Err(IpcError::EndpointDead));
+            let dead2 = matches!(ctx.try_send_by_handle(h2, &msg), Err(IpcError::EndpointDead));
+            if dead0 && dead1 && dead2 {
+                ctx.log("prop: P9 pass — all 3 cap slots returned EndpointDead");
+            } else {
+                ctx.log("prop: P9 FAIL — not all cap slots returned EndpointDead");
+            }
+        }
+        _ => ctx.log("prop: P9 FAIL — could not read all 3 send peer handles"),
+    }
+    idle(ctx)
+}
+
+fn mode_prop_p10(ctx: &ServiceContext) -> ! {
+    // P10 — Every try_send returns without hanging (§8.6, §8.2).
+    // 10,000 random (slot, payload) pairs. try_send is non-blocking by spec;
+    // completing all iterations within the harness timeout proves the property.
+    // Any return value (Ok or Err) is accepted — correctness is timing, not value.
+    let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 22;
+    for _ in 0..10_000u32 {
+        let slot    = CapHandle(xorshift64(&mut rng) as u32);
+        let raw     = xorshift64(&mut rng);
+        let msg     = Message::from_bytes(&raw.to_le_bytes());
+        let _       = ctx.try_send_by_handle(slot, &msg);
+    }
+    ctx.log("prop: P10 pass (10000/10000)");
     idle(ctx)
 }

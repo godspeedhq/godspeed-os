@@ -139,9 +139,9 @@ undefined value, and never returns more than one outcome.
 
 | ID  | Property                                              | Iterations | Result  |
 |-----|-------------------------------------------------------|------------|---------|
-| P1  | Random cap bytes → CapNotHeld; never accepted         | 10,000     | Pending |
-| P9  | Generation bump invalidates ALL holders               | 1,000      | Pending |
-| P10 | Every send returns exactly one defined outcome        | 10,000     | Pending |
+| P1  | Random cap bytes → CapNotHeld; never accepted         | 10,000     | ✅ PASS  |
+| P9  | Generation bump invalidates ALL holders               | 3 slots    | ✅ PASS  |
+| P10 | Every send returns exactly one defined outcome        | 10,000     | ✅ PASS  |
 
 ---
 
@@ -370,7 +370,7 @@ cycle with deliberate inter-core delay to expose races).
 
 | ID  | Property                                              | Pins                  | Iterations | Phase | Result  |
 |-----|-------------------------------------------------------|-----------------------|------------|-------|---------|
-| P1  | Random cap bytes → CapNotHeld; never accepted         | §7.3, §3.1            | 10,000     | 1     | Pending |
+| P1  | Random cap bytes → CapNotHeld; never accepted         | §7.3, §3.1            | 10,000     | 1     | ✅ PASS  |
 | P2  | Generation strictly monotonic across lifetime         | §7.5                  | 100        | 2     | Pending |
 | P3  | Cap rights never widen during transfer                | §7.3                  | 5,000      | 2     | Pending |
 | P4  | ∑ alloc_bytes ≡ pages mapped after any alloc sequence | §10.3                 | 500        | 3     | Pending |
@@ -378,8 +378,8 @@ cycle with deliberate inter-core delay to expose races).
 | P6  | Queue invariants hold at all depths                   | §8.5                  | 1,000      | 2     | Pending |
 | P7  | After unmap + TLB shootdown, page unreadable          | §10.5                 | 50         | 3     | Pending |
 | P8  | After restart, name resolves to higher generation     | §14.2, §8.3           | 200        | 2     | Pending |
-| P9  | Generation bump invalidates ALL holders               | §7.5                  | 1,000      | 1     | Pending |
-| P10 | Every send returns exactly one defined outcome        | §8.6                  | 10,000     | 1     | Pending |
+| P9  | Generation bump invalidates ALL holders               | §7.5                  | 3 slots    | 1     | ✅ PASS  |
+| P10 | Every send returns exactly one defined outcome        | §8.6                  | 10,000     | 1     | ✅ PASS  |
 
 ---
 

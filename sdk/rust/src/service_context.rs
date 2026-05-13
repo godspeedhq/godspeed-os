@@ -177,6 +177,18 @@ impl ServiceContext {
         if slot == u32::MAX { None } else { Some(crate::capability::CapHandle(slot)) }
     }
 
+    /// Return the cap handle for the Nth send-peer entry (0-indexed).
+    ///
+    /// Used by property-test probes (P9) to access multiple cap slots wired to
+    /// the same endpoint, verifying all are invalidated on endpoint death (§7.5).
+    pub fn send_peer_at(&self, idx: usize) -> Option<crate::capability::CapHandle> {
+        let data  = Self::ctx();
+        let count = (data.send_peer_count as usize).min(MAX_SEND_PEERS);
+        if idx >= count { return None; }
+        let slot = data.send_peers[idx].slot;
+        if slot == u32::MAX { None } else { Some(crate::capability::CapHandle(slot)) }
+    }
+
     /// Send to a specific cap handle directly, bypassing peer-name lookup.
     ///
     /// Used by the probe service to test kernel cap enforcement (§22 Tests 3B, 9B).

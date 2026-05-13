@@ -380,6 +380,49 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        13, // MODE_ALLOC_LIMIT — Test 7B
             memory_limit:      64 * 1024 * 1024,
         })),
+        // ----------------------------------------------------------------
+        // Property-test probes — Milestone 9 Phase 1.
+        // prop-p9-victim must be listed (and spawned) before prop-p9 so its
+        // endpoint is in the name registry when prop-p9's SEND caps are wired.
+        // ----------------------------------------------------------------
+        "prop-p9-victim" => Some(("prop-p9-victim", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    0,
+            probe_mode:        0,  // MODE_PASSIVE — killed by prop-p9
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "prop-p1" => Some(("prop-p1", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    0,
+            probe_mode:        20, // MODE_PROP_P1
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "prop-p9" => Some(("prop-p9", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            // Three SEND caps to the same endpoint — proves all cap slots are
+            // invalidated on endpoint death, not just the first (§7.5).
+            send_peers:        &["prop-p9-victim", "prop-p9-victim", "prop-p9-victim"],
+            send_peers_grant:  false,
+            preferred_core:    0,
+            probe_mode:        21, // MODE_PROP_P9
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "prop-p10" => Some(("prop-p10", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    0,
+            probe_mode:        22, // MODE_PROP_P10
+            memory_limit:      64 * 1024 * 1024,
+        })),
         _ => None,
     }
 }
