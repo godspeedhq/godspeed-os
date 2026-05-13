@@ -1716,3 +1716,348 @@ None of this is v1, v2, or v3 work. It is what becomes possible once:
 - The userspace community has formed enough to have opinions on what shell language to design.
 
 This appendix exists so that, when that time comes, the design intent is on record and the architectural reasoning is preserved.
+
+---
+
+# 26. Architectural Discipline
+
+> The architecture survives only if the discipline survives.
+
+The greatest long-term risk to this system is not memory corruption, race conditions, or hardware failure.
+
+The greatest risk is gradual architectural erosion:
+- hidden complexity;
+- convenience abstractions;
+- implicit behavior;
+- speculative extensibility;
+- silent fallback paths;
+- and features that weaken the model in exchange for short-term ergonomics.
+
+This section exists to preserve the architectural mindset that produced the system.
+
+---
+
+## 26.1 The Model Is The Product
+
+GodspeedOS is not merely a collection of kernel features.
+
+The value of the system is the coherence of the model:
+- explicit authority;
+- bounded behavior;
+- visible failure;
+- typed capabilities;
+- restartability;
+- and identity separated from execution location.
+
+A feature that weakens the model weakens the system, even if the feature appears useful.
+
+The architecture itself is the product.
+
+---
+
+## 26.2 Features Must Be Pulled Into Existence
+
+Features are added because:
+- a constitutional invariant requires them;
+- an identity test requires them;
+- a real operational problem requires them;
+- or a demonstrated implementation limitation requires them.
+
+Features are not added because:
+- they may be useful later;
+- other systems have them;
+- they feel incomplete without them;
+- or they might support hypothetical future flexibility.
+
+Speculative abstraction is architectural debt.
+
+The preferred state of an unneeded feature is:
+
+```text
+not implemented; will be implemented when a test requires it
+```
+
+Deferral is a design decision, not a weakness.
+
+---
+
+## 26.3 Identity Tests Define System Identity
+
+Identity tests are not implementation tests.
+
+They are executable constitutional invariants.
+
+A passing identity test means:
+- the implementation still matches the model;
+- the guarantees in this document still hold;
+- the architectural invariants still compose correctly;
+- and the system is still the system this document describes.
+
+A failing identity test is evidence of architectural drift.
+
+If an identity test fails:
+- either the implementation is wrong;
+- or the constitution has changed.
+
+There is no third category.
+
+---
+
+## 26.4 No Silent Complexity
+
+Complexity must remain visible.
+
+Reject:
+- hidden retries;
+- invisible caching layers;
+- implicit authority escalation;
+- silent transport substitution;
+- transparent distributed semantics;
+- automatic fallback behavior;
+- convenience APIs that weaken guarantees;
+- or abstractions that obscure ownership or failure.
+
+The system should always make it possible to answer:
+- where authority came from;
+- where state lives;
+- who owns the state;
+- what failed;
+- what guarantees exist;
+- what the timeout boundary is;
+- and what recovery obligations now exist.
+
+If those questions become difficult to answer, the abstraction is too opaque.
+
+---
+
+## 26.5 Explicitness Over Magic
+
+The system intentionally prefers explicit operations over implicit convenience.
+
+Examples:
+- explicit capability passing instead of ambient authority;
+- explicit restart instead of live mutation;
+- explicit remote IPC instead of transparent clustering;
+- explicit reacquisition instead of silent rebinding;
+- explicit queue limits instead of elastic growth;
+- explicit contracts instead of inferred permissions.
+
+This is not accidental minimalism.
+
+It is how the system preserves mechanical honesty.
+
+---
+
+## 26.6 Bounded Behavior Over Optimistic Behavior
+
+Every subsystem should have:
+- bounded memory usage;
+- bounded queue growth;
+- bounded retry behavior;
+- bounded authority;
+- bounded execution scope;
+- and bounded failure semantics.
+
+Unbounded behavior eventually becomes undefined behavior under load.
+
+If a subsystem cannot explain:
+- its limits;
+- saturation behavior;
+- failure mode;
+- and recovery strategy;
+
+then the subsystem is incomplete.
+
+---
+
+## 26.7 Loud Failure Over Hidden Recovery
+
+The system must prefer visible failure over ambiguous state.
+
+A loud crash is preferable to silent corruption.
+
+A rejected operation is preferable to undefined semantics.
+
+A restart is preferable to hidden mutation.
+
+A visible timeout is preferable to indefinite waiting.
+
+The developer must never be forced to guess whether:
+- an operation succeeded;
+- a message was delivered;
+- authority still exists;
+- or the system silently degraded behavior.
+
+The kernel boundary must remain semantically honest.
+
+---
+
+## 26.8 Identity Over Location
+
+Services are identities, not placements.
+
+Core assignment is an execution detail.
+
+Node assignment is an execution detail.
+
+The location of execution may change across restart boundaries without changing system identity.
+
+The architecture must continue to separate:
+- who a service is;
+- from where a service currently executes.
+
+Location is mutable.
+Identity is stable.
+
+---
+
+## 26.9 Authority Must Remain Visible
+
+Authority should always be inspectable and traceable.
+
+A reviewer should be able to determine:
+- what a service can do;
+- where the authority came from;
+- which capability granted it;
+- and whether the authority can be revoked.
+
+No subsystem may gain authority through:
+- process ancestry;
+- ambient inheritance;
+- hidden globals;
+- implicit trust;
+- or side effects.
+
+Authority is granted deliberately or not at all.
+
+---
+
+## 26.10 The Kernel Is Mechanism, Not Policy
+
+The kernel exists to enforce invariants, not interpret intent.
+
+The kernel provides:
+- isolation;
+- scheduling;
+- capability enforcement;
+- IPC routing;
+- memory protection;
+- interrupt routing;
+- and bounded primitives.
+
+The kernel does not:
+- guess developer intent;
+- silently reinterpret contracts;
+- optimize correctness away;
+- or make policy decisions on behalf of services.
+
+Policy belongs in services.
+
+Mechanism belongs in the kernel.
+
+---
+
+## 26.11 Understandability Is A Hard Requirement
+
+The system must remain understandable by a single engineer.
+
+The "30-minute whiteboard rule" is mandatory:
+- a contributor should be able to explain the architecture,
+- the capability flow,
+- the restart model,
+- the IPC semantics,
+- and the failure model
+
+on a whiteboard in roughly 30 minutes.
+
+If understanding requires:
+- tribal knowledge;
+- hidden runtime behavior;
+- undocumented interactions;
+- or layered abstractions across dozens of components;
+
+then the system has exceeded its acceptable complexity budget.
+
+---
+
+## 26.12 Correctness Before Performance
+
+Performance matters.
+
+Correctness matters more.
+
+Predictability matters more than peak throughput.
+
+The system intentionally accepts:
+- extra copies;
+- extra validation;
+- explicit synchronization;
+- and visible restart boundaries
+
+when they preserve architectural clarity and bounded correctness.
+
+Optimization is permitted only when:
+- invariants remain visible;
+- failure semantics remain unchanged;
+- observability is preserved;
+- and the resulting system is no harder to reason about.
+
+---
+
+## 26.13 Discipline Over Cleverness
+
+Clever code is not an achievement if it weakens the model.
+
+The preferred implementation is:
+- boring;
+- explicit;
+- inspectable;
+- testable;
+- restartable;
+- and mechanically honest.
+
+The system should resist:
+- abstraction for its own sake;
+- framework-style indirection;
+- meta-programming layers;
+- hidden runtime behavior;
+- and architecture driven by novelty.
+
+A smaller coherent system is preferred over a larger impressive one.
+
+---
+
+## 26.14 Preserve The Invariants
+
+Every contributor is responsible for preserving:
+- identity over location;
+- explicit authority;
+- bounded behavior;
+- typed capabilities;
+- failure visibility;
+- restartability;
+- and no silent fallback.
+
+If a proposal weakens those principles, the burden of proof is on the proposal.
+
+The default answer to architectural uncertainty is:
+- simplify;
+- reduce scope;
+- make the behavior explicit;
+- and preserve the invariants.
+
+---
+
+## 26.15 Final Reminder
+
+The system is allowed to evolve.
+
+The model is not allowed to rot.
+
+Every feature, abstraction, optimization, and subsystem must justify its existence against the constitution.
+
+If the implementation becomes easier to extend but harder to reason about, the system has regressed.
+
+Correctness is not enough.
+
+The architecture must remain coherent.
