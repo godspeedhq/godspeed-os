@@ -26,7 +26,6 @@ pub enum SyscallNumber {
     AllocMem       = 6,
     Spawn          = 7,
     Kill           = 8,
-    AllocMem       = 6,
     Abort          = 9,
     AcquireSendCap = 10,
     SendWithCap    = 11,
