@@ -25,6 +25,8 @@ pub enum SyscallNumber {
     Spawn          = 7,
     Kill           = 8,
     AcquireSendCap = 10,
+    SendWithCap    = 11,
+    TakePendingCap = 12,
 }
 
 /// Validate that `[ptr, ptr+len)` lies entirely within user-space.
@@ -68,6 +70,8 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::Spawn          as u64 => handle_spawn(arg0, arg1, arg2),
         n if n == SyscallNumber::Kill           as u64 => handle_kill(arg0, arg1),
         n if n == SyscallNumber::AcquireSendCap as u64 => handle_acquire_send_cap(arg0, arg1),
+        n if n == SyscallNumber::SendWithCap    as u64 => handle_send_with_cap(arg0, arg1, arg2),
+        n if n == SyscallNumber::TakePendingCap as u64 => handle_take_pending_cap(),
         _ => -1, // Unknown syscall.
     }
 }
@@ -170,6 +174,17 @@ unsafe fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
             Ok((msg, sender_to_wake)) => {
                 if let Some(slot) = sender_to_wake {
                     scheduler::wake_by_slot(slot, 0);
+                }
+                // Install any embedded capabilities into the receiver's cap table
+                // and push their slot indices into the pending-recv-cap buffer so
+                // the receiver can retrieve them via syscall 12 (TakePendingCap).
+                let n_caps = msg.cap_count.min(msg.caps.len());
+                for i in 0..n_caps {
+                    if let Some(embedded_cap) = msg.caps[i] {
+                        if let Ok(new_slot) = scheduler::current_task_insert_cap(embedded_cap) {
+                            scheduler::push_pending_recv_cap(new_slot as u32);
+                        }
+                    }
                 }
                 // Copy payload to the caller's user-space buffer.
                 let payload  = msg.payload_bytes();
@@ -329,6 +344,90 @@ unsafe fn handle_acquire_send_cap(name_ptr: u64, name_len: u64) -> i64 {
     match scheduler::current_task_insert_cap(send_cap) {
         Ok(slot) => slot as i64,
         Err(_)   => -1, // cap table full
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: SendWithCap (11) — send a message with an embedded capability.
+// ---------------------------------------------------------------------------
+
+/// arg0 = (grant_slot << 16) | endpoint_slot
+/// arg1 = msg_ptr (user VA)
+/// arg2 = msg_len
+///
+/// Validates SEND on the endpoint cap and GRANT on the cap to transfer.
+/// Embeds the cap in the message, enqueues, then removes the cap from the
+/// sender's table (§7.6 — cap moved exactly once).
+///
+/// Returns `CapNotGrantable` (-4) if the grant cap lacks the GRANT right, so
+/// the sender knows the cap was NOT transferred (it remains in their table).
+unsafe fn handle_send_with_cap(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
+    let endpoint_slot = (packed & 0xFFFF) as usize;
+    let grant_slot    = ((packed >> 16) & 0xFFFF) as usize;
+
+    // 1. Validate endpoint cap (SEND right required).
+    let endpoint_cap = match scheduler::current_task_lookup_cap(endpoint_slot, Rights::SEND) {
+        Ok(c)  => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    let endpoint_id = EndpointId(endpoint_cap.resource_id.0);
+
+    // 2. Validate grant cap (GRANT right required).
+    //    CapInsufficientRights → CapNotGrantable so the caller gets the exact
+    //    error code from §7.7 rather than the generic rights-failure code.
+    let cap_to_grant = match scheduler::current_task_lookup_cap(grant_slot, Rights::GRANT) {
+        Ok(c)  => c,
+        Err(crate::capability::cap::CapError::CapInsufficientRights) =>
+            return cap_err_to_i64(crate::capability::cap::CapError::CapNotGrantable),
+        Err(e) => return cap_err_to_i64(e),
+    };
+
+    // 3. Build message with embedded cap.
+    let mut msg = match build_message(msg_ptr, msg_len) {
+        Ok(m)  => m,
+        Err(e) => return e,
+    };
+    msg.caps[0]   = Some(cap_to_grant);
+    msg.cap_count = 1;
+
+    let my_slot = scheduler::current_task_slot();
+
+    // 4. Enqueue; remove cap from sender on success (cap is now in the message).
+    //    On QueueFull the message (with cap) is stored in the routing table as
+    //    a blocked-sender record; remove the cap from the sender's table so it
+    //    is not duplicated.
+    match crate::ipc::routing::enqueue(endpoint_id, msg, endpoint_cap.generation, Some(my_slot)) {
+        Ok(Some(receiver_slot)) => {
+            scheduler::current_task_remove_cap(grant_slot);
+            scheduler::wake_by_slot(receiver_slot, 0);
+            0
+        }
+        Ok(None) => {
+            scheduler::current_task_remove_cap(grant_slot);
+            0
+        }
+        Err(IpcError::QueueFull) => {
+            // Cap is now embedded in the message held by the routing table.
+            scheduler::current_task_remove_cap(grant_slot);
+            scheduler::block_and_reschedule(TaskState::BlockedOnSend)
+        }
+        Err(e) => ipc_err_to_i64(e), // failure before delivery — cap stays
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: TakePendingCap (12) — retrieve the next received cap slot.
+// ---------------------------------------------------------------------------
+
+/// No arguments.
+///
+/// Returns the next pending received cap slot as a non-negative i64, or -1 if
+/// no pending caps remain.  The slot is into the calling task's own cap table;
+/// it was inserted by handle_recv when it processed an embedded cap.
+unsafe fn handle_take_pending_cap() -> i64 {
+    match scheduler::pop_pending_recv_cap() {
+        Some(slot) => slot as i64,
+        None       => -1,
     }
 }
 

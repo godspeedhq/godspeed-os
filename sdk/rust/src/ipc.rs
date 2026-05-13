@@ -103,10 +103,11 @@ pub fn try_send(endpoint: CapHandle, msg: &Message) -> Result<(), IpcError> {
 // Error conversion.
 // ---------------------------------------------------------------------------
 
-fn i64_to_ipc_error(code: i64) -> IpcError {
+pub(crate) fn i64_to_ipc_error(code: i64) -> IpcError {
     match code {
         -2  => IpcError::CapError(crate::capability::CapError::CapNotHeld),
         -3  => IpcError::CapError(crate::capability::CapError::CapInsufficientRights),
+        -4  => IpcError::CapError(crate::capability::CapError::CapNotGrantable),
         -7  => IpcError::EndpointDead,
         -8  => IpcError::QueueFull,
         -9  => IpcError::QueueFull, // QueueEmpty on caller side == retry

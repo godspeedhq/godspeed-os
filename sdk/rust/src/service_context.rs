@@ -175,6 +175,36 @@ impl ServiceContext {
         crate::ipc::try_send(handle, msg)
     }
 
+    /// Send a message to a named peer WITH an embedded capability grant.
+    ///
+    /// The send-peer cap (which must carry the `GRANT` right) is transferred to
+    /// the receiver. On success the calling service loses that cap (§7.6).
+    /// Returns `CapNotGrantable` if the cap lacks `GRANT` — the cap is kept.
+    pub fn send_with_cap(&self, peer: &str, msg: &crate::ipc::Message) -> Result<(), crate::ipc::IpcError> {
+        let slot = self.find_send_slot(peer)
+            .ok_or(crate::ipc::IpcError::CapError(crate::capability::CapError::CapNotHeld))?;
+        // syscall 11 = SendWithCap
+        // arg0 = (grant_slot << 16) | endpoint_slot — same slot holds both SEND and GRANT.
+        let packed  = ((slot as u64) << 16) | (slot as u64);
+        let payload = msg.payload_bytes();
+        // SAFETY: syscall(11) = SendWithCap; packed and payload are from user space.
+        let ret = unsafe {
+            raw_syscall(11, packed, payload.as_ptr() as u64, payload.len() as u64)
+        };
+        if ret == 0 { Ok(()) } else { Err(crate::ipc::i64_to_ipc_error(ret)) }
+    }
+
+    /// Take the next pending received capability, if any.
+    ///
+    /// After `recv()` delivers a message containing an embedded cap, the kernel
+    /// installs the cap into this task's table and queues the slot index. Call
+    /// this once per embedded cap to retrieve each one.
+    pub fn take_pending_cap(&self) -> Option<CapHandle> {
+        // SAFETY: syscall(12) = TakePendingCap; no args.
+        let ret = unsafe { raw_syscall(12, 0, 0, 0) };
+        if ret >= 0 { Some(CapHandle(ret as u32)) } else { None }
+    }
+
     /// Return the core this service was spawned on.
     pub fn core_id(&self) -> u32 { Self::ctx().core_id }
 

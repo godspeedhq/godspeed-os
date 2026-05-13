@@ -125,16 +125,18 @@ static TESTS: &[TestSpec] = &[
     },
     TestSpec {
         id: "5A", name: "cap_transfer_positive", spec_ref: "§22 Test 5A",
-        kind: TestKind::Blocked {
-            reason: "cap embedding in IPC messages not implemented; \
-                     will be implemented when a test requires it",
+        kind: TestKind::WatchSerial {
+            expect:       &["probe: 5A send OK", "probe: 5A recv OK"],
+            fail_on:      &["KERNEL PANIC", "probe: 5A send FAIL", "probe: 5A recv FAIL"],
+            timeout_secs: 30,
         },
     },
     TestSpec {
         id: "5B", name: "cap_transfer_negative", spec_ref: "§22 Test 5B",
-        kind: TestKind::Blocked {
-            reason: "cap embedding in IPC messages not implemented; \
-                     will be implemented when a test requires it",
+        kind: TestKind::WatchSerial {
+            expect:       &["probe: 5B pass"],
+            fail_on:      &["KERNEL PANIC", "probe: 5B FAIL"],
+            timeout_secs: 30,
         },
     },
     TestSpec {

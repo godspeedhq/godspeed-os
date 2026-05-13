@@ -24,6 +24,14 @@ use crate::memory::frame::PhysAddr;
 const TASK_KSTACK_MAX: usize = 32;
 const KSTACK_SIZE:     usize = 64 * 1024;
 
+// Magic value written at the BOTTOM of each kstack slot (byte offset 0 within
+// the slot) when it is in use.  Stacks grow downward from the slot's top, so
+// the bottom bytes are never touched by normal execution.
+//
+// This replaces a separate KSTACK_USED: [bool; 32] array, which was colliding
+// with another BSS static and becoming corrupted at runtime.
+const KSTACK_MAGIC_USED: u32 = 0xCA11_CA11;
+
 #[repr(C, align(16))]
 struct KernelStackStorage {
     data: [u8; KSTACK_SIZE * TASK_KSTACK_MAX],
@@ -32,14 +40,21 @@ struct KernelStackStorage {
 static mut KSTACK_STORAGE: KernelStackStorage =
     KernelStackStorage { data: [0u8; KSTACK_SIZE * TASK_KSTACK_MAX] };
 
-static mut KSTACK_USED: [bool; TASK_KSTACK_MAX] = [false; TASK_KSTACK_MAX];
+/// Read the in-use marker stored at the bottom of kstack slot `i`.
+#[inline]
+unsafe fn kstack_marker(i: usize) -> *mut u32 {
+    // SAFETY: i < TASK_KSTACK_MAX; first 4 bytes of each slot are the marker.
+    unsafe { KSTACK_STORAGE.data.as_mut_ptr().add(i * KSTACK_SIZE) as *mut u32 }
+}
 
 fn alloc_kstack() -> Option<*mut u8> {
     for i in 0..TASK_KSTACK_MAX {
-        // SAFETY: single-core at spawn time; no concurrent modifications.
-        if !unsafe { KSTACK_USED[i] } {
-            unsafe { KSTACK_USED[i] = true; }
-            // SAFETY: i < TASK_KSTACK_MAX; base + KSTACK_SIZE within the array.
+        // SAFETY: marker pointer is within KSTACK_STORAGE; single-writer.
+        if unsafe { kstack_marker(i).read_volatile() } != KSTACK_MAGIC_USED {
+            // SAFETY: same as above.
+            unsafe { kstack_marker(i).write_volatile(KSTACK_MAGIC_USED); }
+            // Return pointer to the TOP of this slot (stacks grow down).
+            // SAFETY: i < TASK_KSTACK_MAX; offset is within the array bounds.
             let top = unsafe {
                 KSTACK_STORAGE
                     .data
@@ -71,7 +86,7 @@ pub fn free_kstack(kstack_top: u64) {
     if idx_plus_one == 0 || idx_plus_one > TASK_KSTACK_MAX as u64 { return; }
     let idx = (idx_plus_one - 1) as usize;
     // SAFETY: idx is within [0, TASK_KSTACK_MAX); single-writer kill path (IF=0).
-    unsafe { KSTACK_USED[idx] = false; }
+    unsafe { kstack_marker(idx).write_volatile(0); }
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +162,8 @@ struct ServiceConfig {
     has_recv_endpoint: bool,
     /// Names of services this one needs to send to.
     send_peers:        &'static [&'static str],
+    /// If true, mint SEND|GRANT caps for send_peers (cap-transfer tests, §22 Test 5A).
+    send_peers_grant:  bool,
     /// Preferred core; u32::MAX = round-robin.
     preferred_core:    u32,
     /// Written into ServiceContextData.probe_mode at spawn. 0 for all non-test services.
@@ -159,6 +176,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             elf:               include_bytes!(env!("SVC_SUPERVISOR_ELF")),
             has_recv_endpoint: false,
             send_peers:        &[],
+            send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        0,
         })),
@@ -166,6 +184,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             elf:               include_bytes!(env!("SVC_REGISTRY_ELF")),
             has_recv_endpoint: true,
             send_peers:        &[],
+            send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        0,
         })),
@@ -173,6 +192,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             elf:               include_bytes!(env!("SVC_LOGGER_ELF")),
             has_recv_endpoint: true,
             send_peers:        &[],
+            send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        0,
         })),
@@ -180,6 +200,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             elf:               include_bytes!(env!("SVC_PING_ELF")),
             has_recv_endpoint: true,
             send_peers:        &["pong", "registry"],
+            send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        0,
         })),
@@ -187,6 +208,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             elf:               include_bytes!(env!("SVC_PONG_ELF")),
             has_recv_endpoint: true,
             send_peers:        &[],
+            send_peers_grant:  false,
             preferred_core:    1,
             probe_mode:        0,
         })),
@@ -200,6 +222,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
             has_recv_endpoint: true,
             send_peers:        &[],
+            send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        1, // MODE_ECHO_RECV — Test 3A
         })),
@@ -207,6 +230,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
             has_recv_endpoint: true,
             send_peers:        &[],
+            send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        0, // MODE_PASSIVE — killed by probe-4a in Test 4A
         })),
@@ -214,6 +238,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
             has_recv_endpoint: true,
             send_peers:        &[],
+            send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        0, // MODE_PASSIVE — killed by harness in Test 4B
         })),
@@ -221,6 +246,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
             has_recv_endpoint: true,
             send_peers:        &[],
+            send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        3, // MODE_NO_SEND_RIGHT — Test 3B
         })),
@@ -228,6 +254,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
             has_recv_endpoint: false,
             send_peers:        &["probe-recv"],
+            send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        2, // MODE_ECHO_SEND — Test 3A
         })),
@@ -235,6 +262,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
             has_recv_endpoint: false,
             send_peers:        &["probe-victim"],
+            send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        4, // MODE_SEND_AFTER_KILL — Test 4A
         })),
@@ -242,6 +270,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
             has_recv_endpoint: false,
             send_peers:        &["probe-4b-recv"],
+            send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        5, // MODE_FILL_AND_BLOCK — Test 4B
         })),
@@ -249,6 +278,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
             has_recv_endpoint: false,
             send_peers:        &[],
+            send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        6, // MODE_YIELD_LOGGER — Test 8A
         })),
@@ -256,6 +286,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
             has_recv_endpoint: false,
             send_peers:        &[],
+            send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        7, // MODE_HOG — Test 8B (preemption proven via ping)
         })),
@@ -263,8 +294,38 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
             has_recv_endpoint: false,
             send_peers:        &[],
+            send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        8, // MODE_CAP_FORGE — Test 9B
+        })),
+        // ----------------------------------------------------------------
+        // Cap-transfer probes — §22 Tests 5A and 5B.
+        // probe-5a-recv must be spawned before probe-5a-send and probe-5b-send
+        // so its endpoint is registered before sender caps are wired.
+        // ----------------------------------------------------------------
+        "probe-5a-recv" => Some(("probe-5a-recv", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    0,
+            probe_mode:        9, // MODE_GRANT_RECV — Test 5A receiver
+        })),
+        "probe-5a-send" => Some(("probe-5a-send", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &["probe-5a-recv"],
+            send_peers_grant:  true,  // mints SEND|GRANT cap to probe-5a-recv
+            preferred_core:    0,
+            probe_mode:        10, // MODE_GRANT_SEND — Test 5A sender
+        })),
+        "probe-5b-send" => Some(("probe-5b-send", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &["probe-5a-recv"],
+            send_peers_grant:  false, // SEND only — no GRANT right; should return CapNotGrantable
+            preferred_core:    0,
+            probe_mode:        11, // MODE_NO_GRANT_SEND — Test 5B negative
         })),
         _ => None,
     }
@@ -298,7 +359,8 @@ pub fn spawn_service_by_name(name: &str, core_override: Option<u32>) -> Result<(
     };
 
     let result = spawn_service_with_config(static_name, cfg.elf, core_id,
-                              cfg.has_recv_endpoint, cfg.send_peers, cfg.probe_mode);
+                              cfg.has_recv_endpoint, cfg.send_peers, cfg.probe_mode,
+                              cfg.send_peers_grant);
     if let Err(ref e) = result {
         crate::kprintln!("task: spawn '{}' failed: {:?}", name, e);
     }
@@ -313,6 +375,7 @@ fn spawn_service_with_config(
     has_recv_endpoint: bool,
     send_peers:        &[&str],
     probe_mode:        u32,
+    send_peers_grant:  bool,
 ) -> Result<(), SpawnError> {
     // 1. Parse ELF.
     let crate::loader::LoadedElf { mut page_table, entry_va } =
@@ -389,7 +452,12 @@ fn spawn_service_with_config(
 
         if let Some(peer_ep_id) = crate::ipc::names::lookup(peer_name) {
             let peer_resource_id = ResourceId::from(peer_ep_id);
-            let send_cap         = mint_cap(peer_resource_id, Rights::SEND);
+            let peer_rights = if send_peers_grant {
+                Rights::SEND | Rights::GRANT
+            } else {
+                Rights::SEND
+            };
+            let send_cap = mint_cap(peer_resource_id, peer_rights);
             match caps.insert(send_cap) {
                 Ok(cap_slot) => {
                     let nb  = peer_name.as_bytes();
@@ -465,7 +533,7 @@ fn spawn_service_with_config(
 /// Spawn `init` on Core 0. Called once by `kernel_main` (§11.1).
 pub fn spawn_init() {
     let elf_bytes = include_bytes!(env!("SVC_INIT_ELF"));
-    match spawn_service_with_config("init", elf_bytes, 0, false, &[], 0) {
+    match spawn_service_with_config("init", elf_bytes, 0, false, &[], 0, false) {
         Ok(()) => crate::kprintln!("task: init spawned on core 0"),
         Err(e) => panic!("task: failed to spawn init: {:?}", e),
     }

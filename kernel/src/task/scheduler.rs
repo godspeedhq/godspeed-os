@@ -61,6 +61,13 @@ static mut TASK_ENDPOINT: [Option<EndpointId>; MAX_TASKS] =
 /// per-task RSP instead of another task's value written to PER_CORE_SYSCALL.
 static mut TASK_USER_RSP: [u64; MAX_TASKS] = [0u64; MAX_TASKS];
 
+/// Pending received cap slots for each task, filled when handle_recv
+/// processes a message that contained embedded capabilities (§7.6, §8.5).
+const MAX_PENDING_RECV_CAPS: usize = 4;
+static mut TASK_PENDING_RECV_CAPS: [[u32; MAX_PENDING_RECV_CAPS]; MAX_TASKS] =
+    [[0u32; MAX_PENDING_RECV_CAPS]; MAX_TASKS];
+static mut TASK_PENDING_RECV_CAP_COUNT: [usize; MAX_TASKS] = [0; MAX_TASKS];
+
 
 // ---------------------------------------------------------------------------
 // Per-core scheduler state.
@@ -236,6 +243,48 @@ pub fn current_task_remove_cap(slot: usize) -> Option<Capability> {
         } else {
             None
         }
+    }
+}
+
+/// Push a cap slot into the current task's pending-received-caps buffer.
+///
+/// Called by handle_recv when it installs an embedded cap into the receiver's
+/// table. The slot is retrieved by the service via syscall 12 (TakePendingCap).
+pub fn push_pending_recv_cap(cap_slot: u32) {
+    let cid = current_core_id();
+    // SAFETY: IF=0 in syscall context; single core writer.
+    unsafe {
+        let cur = CORE_CURRENT[cid];
+        if cur < MAX_TASKS {
+            let count = TASK_PENDING_RECV_CAP_COUNT[cur];
+            if count < MAX_PENDING_RECV_CAPS {
+                TASK_PENDING_RECV_CAPS[cur][count] = cap_slot;
+                TASK_PENDING_RECV_CAP_COUNT[cur]   = count + 1;
+            }
+        }
+    }
+}
+
+/// Pop the next pending cap slot from the current task's buffer.
+/// Returns `None` if no pending caps remain.
+pub fn pop_pending_recv_cap() -> Option<u32> {
+    let cid = current_core_id();
+    // SAFETY: IF=0 in syscall context; single core writer.
+    unsafe {
+        let cur = CORE_CURRENT[cid];
+        if cur < MAX_TASKS {
+            let count = TASK_PENDING_RECV_CAP_COUNT[cur];
+            if count > 0 {
+                let slot = TASK_PENDING_RECV_CAPS[cur][0];
+                // Shift remaining entries left.
+                for i in 0..count - 1 {
+                    TASK_PENDING_RECV_CAPS[cur][i] = TASK_PENDING_RECV_CAPS[cur][i + 1];
+                }
+                TASK_PENDING_RECV_CAP_COUNT[cur] = count - 1;
+                return Some(slot);
+            }
+        }
+        None
     }
 }
 

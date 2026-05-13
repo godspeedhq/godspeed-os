@@ -6,14 +6,17 @@
 //!
 //! Modes:
 //!   0 = PASSIVE         — idle; exists only to be a kill target
-//!   1 = ECHO_RECV       — recv one message; log "probe: 3A recv OK"         (Test 3A)
-//!   2 = ECHO_SEND       — send to probe-recv; log "probe: 3A send OK"       (Test 3A)
-//!   3 = NO_SEND_RIGHT   — try_send via recv-slot cap → CapInsufficientRights (Test 3B)
-//!   4 = SEND_AFTER_KILL — kill probe-victim then try_send → EndpointDead     (Test 4A)
-//!   5 = FILL_AND_BLOCK  — fill 16-slot queue + blocking send; woken by KILL  (Test 4B)
-//!   6 = YIELD_LOGGER    — yield then log; proves preemption/yield path        (Test 8A)
-//!   7 = HOG             — tight loop; proves preemption via ping output       (Test 8B)
-//!   8 = CAP_FORGE       — try_send on slot 99 (out of range) → CapNotHeld    (Test 9B)
+//!   1 = ECHO_RECV       — recv one message; log "probe: 3A recv OK"              (Test 3A)
+//!   2 = ECHO_SEND       — send to probe-recv; log "probe: 3A send OK"            (Test 3A)
+//!   3 = NO_SEND_RIGHT   — try_send via recv-slot cap → CapInsufficientRights      (Test 3B)
+//!   4 = SEND_AFTER_KILL — kill probe-victim then try_send → EndpointDead          (Test 4A)
+//!   5 = FILL_AND_BLOCK  — fill 16-slot queue + blocking send; woken by KILL       (Test 4B)
+//!   6 = YIELD_LOGGER    — yield then log; proves preemption/yield path             (Test 8A)
+//!   7 = HOG             — tight loop; proves preemption via ping output            (Test 8B)
+//!   8 = CAP_FORGE       — try_send on slot 99 (out of range) → CapNotHeld         (Test 9B)
+//!   9 = GRANT_RECV      — recv then take_pending_cap; log pass                    (Test 5A)
+//!  10 = GRANT_SEND      — send_with_cap to probe-5a-recv; log pass                (Test 5A)
+//!  11 = NO_GRANT_SEND   — send_with_cap without GRANT right → CapNotGrantable     (Test 5B)
 
 #![no_std]
 #![no_main]
@@ -30,6 +33,9 @@ const MODE_FILL_AND_BLOCK:  u32 = 5;
 const MODE_YIELD_LOGGER:    u32 = 6;
 const MODE_HOG:             u32 = 7;
 const MODE_CAP_FORGE:       u32 = 8;
+const MODE_GRANT_RECV:      u32 = 9;
+const MODE_GRANT_SEND:      u32 = 10;
+const MODE_NO_GRANT_SEND:   u32 = 11;
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
@@ -42,6 +48,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         MODE_YIELD_LOGGER    => mode_yield_logger(&ctx),
         MODE_HOG             => loop {},
         MODE_CAP_FORGE       => mode_cap_forge(&ctx),
+        MODE_GRANT_RECV      => mode_grant_recv(&ctx),
+        MODE_GRANT_SEND      => mode_grant_send(&ctx),
+        MODE_NO_GRANT_SEND   => mode_no_grant_send(&ctx),
         _                    => idle(&ctx),
     }
 }
@@ -124,6 +133,40 @@ fn mode_cap_forge(ctx: &ServiceContext) -> ! {
         Err(IpcError::CapError(CapError::CapNotHeld)) =>
             ctx.log("probe: 9B pass — cap forgery rejected"),
         _ => ctx.log("probe: 9B FAIL"),
+    }
+    idle(ctx)
+}
+
+fn mode_grant_recv(ctx: &ServiceContext) -> ! {
+    // Test 5A receiver: wait for the message from probe-5a-send, then verify
+    // that an embedded cap arrived via take_pending_cap.
+    ctx.recv();
+    match ctx.take_pending_cap() {
+        Some(_) => ctx.log("probe: 5A recv OK"),
+        None    => ctx.log("probe: 5A recv FAIL — no pending cap"),
+    }
+    idle(ctx)
+}
+
+fn mode_grant_send(ctx: &ServiceContext) -> ! {
+    // Test 5A sender: send_with_cap to probe-5a-recv.  The send-peer cap has
+    // SEND|GRANT, so the transfer is authorised.  On success the cap is gone.
+    let msg = Message::from_bytes(b"grant-test");
+    match ctx.send_with_cap("probe-5a-recv", &msg) {
+        Ok(())  => ctx.log("probe: 5A send OK"),
+        Err(_)  => ctx.log("probe: 5A send FAIL"),
+    }
+    idle(ctx)
+}
+
+fn mode_no_grant_send(ctx: &ServiceContext) -> ! {
+    // Test 5B negative: the send-peer cap has SEND only (no GRANT).
+    // send_with_cap must return CapNotGrantable and leave the cap intact.
+    let msg = Message::from_bytes(b"no-grant-test");
+    match ctx.send_with_cap("probe-5a-recv", &msg) {
+        Err(IpcError::CapError(CapError::CapNotGrantable)) =>
+            ctx.log("probe: 5B pass — CapNotGrantable"),
+        _ => ctx.log("probe: 5B FAIL"),
     }
     idle(ctx)
 }

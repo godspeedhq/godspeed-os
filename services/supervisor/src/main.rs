@@ -26,6 +26,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let _ = ctx.spawn("probe-sender");  // Test 3A sender; SEND cap to probe-recv
     let _ = ctx.spawn("probe-4a");      // Test 4A; SEND cap to probe-victim
     let _ = ctx.spawn("probe-4b-send"); // Test 4B; SEND cap to probe-4b-recv
+    // Cap-transfer probes (Tests 5A and 5B) — receiver first so its endpoint
+    // is registered before the senders' SEND|GRANT caps are wired.
+    let _ = ctx.spawn("probe-5a-recv"); // Test 5A/5B receiver
+    let _ = ctx.spawn("probe-5a-send"); // Test 5A sender (SEND|GRANT cap)
+    let _ = ctx.spawn("probe-5b-send"); // Test 5B negative (SEND-only cap)
     // Probes with no send peers.
     let _ = ctx.spawn("probe-yielder"); // Test 8A
     let _ = ctx.spawn("probe-hog");     // Test 8B (tight loop; preemption via ping)
