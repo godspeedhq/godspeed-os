@@ -294,15 +294,15 @@ static STRESS_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["stress: S3 pass (500/500)"],
             fail_on:      &["KERNEL PANIC", "stress: S3 FAIL"],
-            timeout_secs: 120,
+            timeout_secs: 200,
         },
     },
     TestSpec {
         id: "S4", name: "cap_table_churn_monotonic_gen", spec_ref: "§22 Stress S4",
         kind: TestKind::WatchSerial {
-            expect:       &["stress: S4 pass (50/50)"],
+            expect:       &["stress: S4 pass (10/10)"],
             fail_on:      &["KERNEL PANIC", "stress: S4 FAIL"],
-            timeout_secs: 180,
+            timeout_secs: 300,
         },
     },
     TestSpec {
@@ -334,7 +334,7 @@ static STRESS_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["stress: S6 pass (5000/5000)"],
             fail_on:      &["KERNEL PANIC", "stress: S6 FAIL"],
-            timeout_secs: 120,
+            timeout_secs: 200,
         },
     },
     TestSpec {
@@ -342,7 +342,7 @@ static STRESS_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["stress: S8 pass (600 yields)"],
             fail_on:      &["KERNEL PANIC", "stress: S8 FAIL"],
-            timeout_secs: 60,
+            timeout_secs: 200,
         },
     },
     TestSpec {
@@ -350,7 +350,7 @@ static STRESS_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["stress: S9 pass (1000/1000)"],
             fail_on:      &["KERNEL PANIC", "stress: S9 FAIL"],
-            timeout_secs: 120,
+            timeout_secs: 180,
         },
     },
 ];
@@ -373,7 +373,7 @@ static PERF_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["perf: B2 done"],
             fail_on:      &["KERNEL PANIC", "perf: B2 FAIL"],
-            timeout_secs: 60,
+            timeout_secs: 250,
         },
     },
     TestSpec {

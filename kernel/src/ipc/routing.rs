@@ -38,7 +38,7 @@ fn unlock() {
 // Entry layout.
 // ---------------------------------------------------------------------------
 
-const MAX_ENDPOINTS: usize = 32;
+const MAX_ENDPOINTS: usize = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EndpointLiveness {

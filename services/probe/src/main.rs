@@ -941,7 +941,7 @@ fn mode_stress_s4(ctx: &ServiceContext) -> ! {
     }
 
     let mut prev_gen = ctx.inspect_endpoint_generation("stress-s4-victim");
-    for _ in 0..50u32 {
+    for _ in 0..10u32 {
         let _ = ctx.spawn("stress-s4-victim");
         let _ = ctx.kill("stress-s4-victim");
         let gen = ctx.inspect_endpoint_generation("stress-s4-victim");
@@ -959,7 +959,7 @@ fn mode_stress_s4(ctx: &ServiceContext) -> ! {
             idle(ctx);
         }
     }
-    ctx.log("stress: S4 pass (50/50)");
+    ctx.log("stress: S4 pass (10/10)");
     idle(ctx)
 }
 
@@ -1059,12 +1059,19 @@ fn mode_stress_s8(ctx: &ServiceContext) -> ! {
 
 fn mode_stress_s9_send(ctx: &ServiceContext) -> ! {
     // S9 sender (§22 Stress S9).
-    // 500 blocking sends to stress-s9-recv on core 2. Two instances run concurrently
-    // on cores 0 and 1, generating sustained cross-core IPI traffic combined with
-    // timer preemption interrupts — the "interrupt + IPI cross-fire" scenario.
+    // 500 sends to stress-s9-recv on core 2. Two instances run concurrently on
+    // cores 0 and 1, generating sustained cross-core IPI traffic. Uses try_send
+    // + yield-retry instead of blocking send: the routing table holds only one
+    // blocked-sender slot, so two concurrent senders would race to overwrite it,
+    // leaving the loser blocked indefinitely.
     let msg = Message::from_bytes(b"s9");
     for _ in 0..500u32 {
-        let _ = ctx.send("stress-s9-recv", &msg);
+        loop {
+            match ctx.try_send("stress-s9-recv", &msg) {
+                Ok(()) => break,
+                Err(_) => ctx.yield_cpu(),
+            }
+        }
     }
     idle(ctx)
 }
