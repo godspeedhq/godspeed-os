@@ -23,7 +23,7 @@ use crate::memory::frame::PhysAddr;
 // Kernel stack pool — one 64 KiB stack per ring-3 task (§14.1).
 // ---------------------------------------------------------------------------
 
-const TASK_KSTACK_MAX: usize = 100; // raised from 80 to accommodate Milestone 13 adversarial probes
+const TASK_KSTACK_MAX: usize = 120; // raised from 100 to accommodate Milestone 15 brutal identity probes
 const KSTACK_SIZE:     usize = 64 * 1024;
 
 // Magic value written at the BOTTOM of each kstack slot (byte offset 0 within
@@ -1178,6 +1178,76 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  false,
             preferred_core:    1, // cross-core: controller on 1, victim on 2
             probe_mode:        96, // CHAOS_C7: 30 cross-core kill/respawn TLB shootdowns
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // ----------------------------------------------------------------
+        // Brutal identity test probes — Milestone 15.
+        // T11: self-referential queue boundary exactness.
+        // T12: cap delegation chain A→B→C.
+        // T13: cross-core blocked send wakes with EndpointDead.
+        // T-SMP: SMP escalation (smp=2, 8, 16 — run via osdev test identity-brutal).
+        // ----------------------------------------------------------------
+        "brutal-id-11" => Some(("brutal-id-11", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &["brutal-id-11"], // self-referential send peer
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        97,
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "brutal-id-12-a" => Some(("brutal-id-12-a", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &["brutal-id-12-b"],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        98,
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "brutal-id-12-b" => Some(("brutal-id-12-b", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &["brutal-id-12-c"], // B forwards to C
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        99,
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "brutal-id-12-c" => Some(("brutal-id-12-c", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        100,
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "brutal-id-13-recv" => Some(("brutal-id-13-recv", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    2, // cross-core target: sender on 0, killer on 1, recv on 2
+            probe_mode:        101,
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "brutal-id-13-send" => Some(("brutal-id-13-send", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &["brutal-id-13-recv"],
+            send_peers_grant:  false,
+            preferred_core:    0, // fills queue then blocks — must be on different core than recv
+            probe_mode:        102,
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "brutal-id-13-kill" => Some(("brutal-id-13-kill", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    1, // yields then kills recv on core 2
+            probe_mode:        103,
             memory_limit:      64 * 1024 * 1024,
         })),
         _ => None,

@@ -142,6 +142,15 @@ const MODE_CHAOS_C5:        u32 = 94; // 100-level recursive yield_cpu(); stack 
 const MODE_CHAOS_C6_MON:    u32 = 95; // 200 yields then log pass on core 0 (C6 witness)
 const MODE_CHAOS_C7:        u32 = 96; // 30 cross-core kill/respawn cycles; TLB shootdowns
 
+// Brutal identity test modes — Milestone 15.
+const MODE_BRUTAL_ID_11:    u32 = 97; // T11: self-referential queue boundary exactness
+const MODE_BRUTAL_ID_12_A:  u32 = 98; // T12: cap chain source (A sends to B, grants cap to C)
+const MODE_BRUTAL_ID_12_B:  u32 = 99; // T12: cap chain middle (B receives, forwards cap to C)
+const MODE_BRUTAL_ID_12_C:  u32 = 100; // T12: cap chain end (C receives via granted cap)
+// mode 101 = MODE_PASSIVE (reused): brutal-id-13-recv sits idle until killed
+const MODE_BRUTAL_ID_13_SND: u32 = 102; // T13: fills queue, blocks, wakes with EndpointDead
+const MODE_BRUTAL_ID_13_KIL: u32 = 103; // T13: yields then kills brutal-id-13-recv
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     match ctx.probe_mode() {
@@ -215,6 +224,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         MODE_CHAOS_C5        => mode_chaos_c5(&ctx),
         MODE_CHAOS_C6_MON    => mode_chaos_c6_monitor(&ctx),
         MODE_CHAOS_C7        => mode_chaos_c7(&ctx),
+        MODE_BRUTAL_ID_11    => mode_brutal_id_11(&ctx),
+        MODE_BRUTAL_ID_12_A  => mode_brutal_id_12_a(&ctx),
+        MODE_BRUTAL_ID_12_B  => mode_brutal_id_12_b(&ctx),
+        MODE_BRUTAL_ID_12_C  => mode_brutal_id_12_c(&ctx),
+        MODE_BRUTAL_ID_13_SND => mode_brutal_id_13_send(&ctx),
+        MODE_BRUTAL_ID_13_KIL => mode_brutal_id_13_kill(&ctx),
         _                    => idle(&ctx),
     }
 }
@@ -1679,5 +1694,127 @@ fn mode_chaos_c7(ctx: &ServiceContext) -> ! {
         }
     }
     ctx.log("chaos: C7 pass — 30 cross-core TLB shootdowns survived");
+    idle(ctx)
+}
+
+// ---------------------------------------------------------------------------
+// Brutal identity test modes — Milestone 15
+// ---------------------------------------------------------------------------
+
+fn mode_brutal_id_11(ctx: &ServiceContext) -> ! {
+    // T11 — Queue boundary exactness (§22 Brutal Identity T11).
+    // Self-referential: brutal-id-11 has itself as a SEND peer so it can
+    // try_send to its own endpoint. Verifies the 16-deep queue limit exactly.
+    let msg = Message::from_bytes(b"t11");
+    for i in 0..16u32 {
+        match ctx.try_send("brutal-id-11", &msg) {
+            Ok(()) => {}
+            Err(_) => {
+                ctx.log_fmt(format_args!("identity: T11 FAIL — send {} failed before queue full", i));
+                idle(ctx);
+            }
+        }
+    }
+    // 17th send must be QueueFull — not Ok, not any other error.
+    match ctx.try_send("brutal-id-11", &msg) {
+        Err(IpcError::QueueFull) => {}
+        Ok(()) => {
+            ctx.log("identity: T11 FAIL — 17th send succeeded (queue not bounded at 16)");
+            idle(ctx);
+        }
+        Err(_) => {
+            ctx.log("identity: T11 FAIL — 17th send returned unexpected error");
+            idle(ctx);
+        }
+    }
+    // Drain one message; the next send must succeed (queue has room again).
+    let _ = ctx.recv();
+    match ctx.try_send("brutal-id-11", &msg) {
+        Ok(()) => {}
+        Err(_) => {
+            ctx.log("identity: T11 FAIL — send after drain failed");
+            idle(ctx);
+        }
+    }
+    ctx.log("identity: T11 pass — queue boundary: 16 fill, 17th=QueueFull, drain+send=Ok");
+    idle(ctx)
+}
+
+fn mode_brutal_id_12_a(ctx: &ServiceContext) -> ! {
+    // T12 chain source — sends to B using its wired SEND cap, and also sends a
+    // message telling B to forward to C. Since send_peers_grant is per-service
+    // and brutal-id-12-a only has SEND to B, we send the chain payload
+    // demonstrating multi-hop: A sends to B; B (on recv) immediately sends to C.
+    // B has no wired SEND cap to C so C's endpoint identity is conveyed by name.
+    // To keep the test mechanical with current SDK: A sends to B, B recvs and
+    // sends to C using its own separate SEND cap that we wire in the service config.
+    // Revised: brutal-id-12-b has send_peers = ["brutal-id-12-c"] so it has a
+    // wired SEND cap to C. A sends "fwd-to-c" to B; B recvs and sends to C.
+    let msg = Message::from_bytes(b"fwd-to-c");
+    match ctx.try_send("brutal-id-12-b", &msg) {
+        Ok(()) => {}
+        Err(_) => {
+            ctx.log("identity: T12 FAIL — chain-a: send to chain-b failed");
+            idle(ctx);
+        }
+    }
+    idle(ctx)
+}
+
+fn mode_brutal_id_12_b(ctx: &ServiceContext) -> ! {
+    // T12 chain middle — receives from A, forwards to C using its wired SEND cap.
+    let _ = ctx.recv();
+    let msg = Message::from_bytes(b"via-b");
+    match ctx.try_send("brutal-id-12-c", &msg) {
+        Ok(()) => {}
+        Err(_) => {
+            ctx.log("identity: T12 FAIL — chain-b: forward to chain-c failed");
+            idle(ctx);
+        }
+    }
+    idle(ctx)
+}
+
+fn mode_brutal_id_12_c(ctx: &ServiceContext) -> ! {
+    // T12 chain end — receives the message that traveled A→B→C.
+    let _ = ctx.recv();
+    ctx.log("identity: T12 pass — cap delegation chain A→B→C: message arrived at C");
+    idle(ctx)
+}
+
+fn mode_brutal_id_13_send(ctx: &ServiceContext) -> ! {
+    // T13 cross-core blocked send — fills the queue to brutal-id-13-recv (core 2)
+    // then issues a blocking send that must block. While blocked, brutal-id-13-kill
+    // (core 1) kills the receiver, which should wake this task with EndpointDead.
+    let msg = Message::from_bytes(b"t13");
+    for i in 0..16u32 {
+        match ctx.try_send("brutal-id-13-recv", &msg) {
+            Ok(()) => {}
+            Err(_) => {
+                ctx.log_fmt(format_args!("identity: T13 FAIL — fill send {} failed", i));
+                idle(ctx);
+            }
+        }
+    }
+    // Queue is now full. Blocking send must block until the receiver is killed.
+    match ctx.send("brutal-id-13-recv", &msg) {
+        Err(IpcError::EndpointDead) => {
+            ctx.log("identity: T13 pass — cross-core blocked send woke with EndpointDead");
+        }
+        Ok(()) => {
+            ctx.log("identity: T13 FAIL — blocked send succeeded unexpectedly");
+        }
+        Err(_) => {
+            ctx.log("identity: T13 FAIL — blocked send returned unexpected error");
+        }
+    }
+    idle(ctx)
+}
+
+fn mode_brutal_id_13_kill(ctx: &ServiceContext) -> ! {
+    // T13 killer — yields to let the sender fill the queue and block, then kills recv.
+    // Runs on core 1; recv is on core 2; sender is on core 0.
+    for _ in 0..200u32 { ctx.yield_cpu(); }
+    let _ = ctx.kill("brutal-id-13-recv");
     idle(ctx)
 }

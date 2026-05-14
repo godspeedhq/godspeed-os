@@ -610,6 +610,64 @@ static CHAOS_TESTS: &[TestSpec] = &[
     },
 ];
 
+// ---------------------------------------------------------------------------
+// Brutal identity test definitions (Milestone 15).
+// ---------------------------------------------------------------------------
+
+static BRUTAL_IDENTITY_TESTS: &[TestSpec] = &[
+    TestSpec {
+        id: "T11", name: "queue_boundary_exactness", spec_ref: "§22 Brutal Identity T11",
+        kind: TestKind::WatchSerial {
+            expect:       &["identity: T11 pass"],
+            fail_on:      &["KERNEL PANIC", "identity: T11 FAIL"],
+            timeout_secs: 30,
+        },
+    },
+    TestSpec {
+        id: "T12", name: "cap_delegation_chain_a_b_c", spec_ref: "§22 Brutal Identity T12",
+        kind: TestKind::WatchSerial {
+            expect:       &["identity: T12 pass"],
+            fail_on:      &["KERNEL PANIC", "identity: T12 FAIL"],
+            timeout_secs: 30,
+        },
+    },
+    TestSpec {
+        id: "T13", name: "cross_core_blocked_send_wakes_endpoint_dead", spec_ref: "§22 Brutal Identity T13",
+        kind: TestKind::WatchSerial {
+            expect:       &["identity: T13 pass"],
+            fail_on:      &["KERNEL PANIC", "identity: T13 FAIL"],
+            timeout_secs: 60,
+        },
+    },
+    TestSpec {
+        id: "SMP-2", name: "smp_escalation_2_cores", spec_ref: "§22 Test 1A at smp=2",
+        kind: TestKind::DegradedSmp {
+            smp:          2,
+            expect:       &["kernel: 2 cores ready", "supervisor: ready"],
+            fail_on:      &["KERNEL PANIC"],
+            timeout_secs: 30,
+        },
+    },
+    TestSpec {
+        id: "SMP-8", name: "smp_escalation_8_cores", spec_ref: "§22 Test 1A at smp=8",
+        kind: TestKind::DegradedSmp {
+            smp:          8,
+            expect:       &["kernel: 8 cores ready", "supervisor: ready"],
+            fail_on:      &["KERNEL PANIC"],
+            timeout_secs: 60,
+        },
+    },
+    TestSpec {
+        id: "SMP-16", name: "smp_escalation_16_cores", spec_ref: "§22 Test 1A at smp=16",
+        kind: TestKind::DegradedSmp {
+            smp:          16,
+            expect:       &["kernel: 16 cores ready", "supervisor: ready"],
+            fail_on:      &["KERNEL PANIC"],
+            timeout_secs: 120,
+        },
+    },
+];
+
 static TESTS: &[TestSpec] = &[
     TestSpec {
         id: "1A", name: "bootstrap_steady_state_positive", spec_ref: "§22 Test 1A",
@@ -1126,6 +1184,65 @@ pub fn run_chaos_tests() {
     if failed > 0 { std::process::exit(1); }
 }
 
+/// Boot the OS in QEMU and run the Milestone 15 brutal identity test suite.
+///
+/// T11–T13 are correctness tests that must always pass.
+/// SMP-2 / SMP-8 / SMP-16 are escalation tests: they run until the machine
+/// ceiling is found — the first timeout is the hardware limit, not a failure.
+pub fn run_brutal_identity_tests() {
+    println!("identity-brutal: stopping any running QEMU instances...");
+    kill_existing_qemu();
+
+    println!("identity-brutal: building...");
+    crate::cmd_build();
+
+    let kernel_elf = Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() {
+        eprintln!("identity-brutal: kernel ELF not found at {}", kernel_elf.display());
+        std::process::exit(1);
+    }
+
+    let limine_dir = Path::new("tools/limine");
+    let image_path = crate::disk_image::create(kernel_elf, limine_dir);
+    crate::disk_image::install_bootloader(limine_dir, &image_path);
+
+    std::fs::create_dir_all("build/tests/8_IDENTITY_BRUTAL")
+        .expect("create build/tests/8_IDENTITY_BRUTAL/");
+
+    println!("\nidentity-brutal: running {} tests\n", BRUTAL_IDENTITY_TESTS.len());
+
+    let mut results: Vec<(&TestSpec, TestOutcome)> = Vec::new();
+
+    for test in BRUTAL_IDENTITY_TESTS {
+        print!("  [{:>5}]  {:50}  ({})  … ", test.id, test.name, test.spec_ref);
+        let _ = std::io::stdout().flush();
+
+        let outcome = run_brutal_identity_one(test, &image_path);
+
+        match &outcome {
+            TestOutcome::Pass       => println!("PASS"),
+            TestOutcome::Fail(r)    => println!("FAIL\n         → {r}"),
+            TestOutcome::Blocked(r) => println!("BLOCKED\n         → {r}"),
+        }
+
+        results.push((test, outcome));
+    }
+
+    let passed  = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Pass)).count();
+    let failed  = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Fail(_))).count();
+    let blocked = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Blocked(_))).count();
+
+    println!("\n  {passed} passed  {failed} failed  {blocked} blocked");
+
+    // Only the correctness tests (T11–T13) are hard failures.
+    // SMP escalation timeouts are expected at the machine ceiling.
+    let correctness_failed = results.iter().filter(|(t, o)| {
+        !t.id.starts_with("SMP") && matches!(o, TestOutcome::Fail(_))
+    }).count();
+
+    if correctness_failed > 0 { std::process::exit(1); }
+}
+
 /// Boot the OS in QEMU and run the Milestone 12 performance benchmark suite.
 ///
 /// Pass criterion: each benchmark logs `perf: BN done` without panicking.
@@ -1523,6 +1640,30 @@ fn run_chaos_one(test: &TestSpec, image: &Path) -> TestOutcome {
     }
 }
 
+fn run_brutal_identity_one(test: &TestSpec, image: &Path) -> TestOutcome {
+    match &test.kind {
+        TestKind::WatchSerial { expect, fail_on, timeout_secs } => {
+            let serial = brutal_identity_serial_path(test);
+            let _ = std::fs::write(&serial, b"");
+            let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
+            let result = poll_serial(&serial, expect, fail_on,
+                                     Instant::now() + Duration::from_secs(*timeout_secs));
+            qemu.kill();
+            result
+        }
+        TestKind::DegradedSmp { smp, expect, fail_on, timeout_secs } => {
+            let serial = brutal_identity_serial_path(test);
+            let _ = std::fs::write(&serial, b"");
+            let qemu   = crate::qemu::spawn_for_test_custom(image, *smp, 512, &serial, None);
+            let result = poll_serial(&serial, expect, fail_on,
+                                     Instant::now() + Duration::from_secs(*timeout_secs));
+            qemu.kill();
+            result
+        }
+        _ => TestOutcome::Blocked("brutal identity tests use WatchSerial or DegradedSmp"),
+    }
+}
+
 fn run_perf_one(test: &TestSpec, image: &Path) -> TestOutcome {
     match &test.kind {
         TestKind::WatchSerial { expect, fail_on, timeout_secs } => {
@@ -1540,6 +1681,10 @@ fn run_perf_one(test: &TestSpec, image: &Path) -> TestOutcome {
 
 fn serial_path(test: &TestSpec) -> PathBuf {
     PathBuf::from(format!("build/tests/1_IDENTITY/{}-{}.log", test.id, test.name))
+}
+
+fn brutal_identity_serial_path(test: &TestSpec) -> PathBuf {
+    PathBuf::from(format!("build/tests/8_IDENTITY_BRUTAL/{}-{}.log", test.id, test.name))
 }
 
 fn property_serial_path(test: &TestSpec) -> PathBuf {

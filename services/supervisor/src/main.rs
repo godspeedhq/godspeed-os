@@ -151,6 +151,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let _ = ctx.spawn("perf-b9");
     let _ = ctx.spawn("perf-b10");
 
+    // --- Brutal identity test probes — Milestone 15 ---
+    // T12 chain: spawn C and B (recv-endpoint) before A (sender), so their
+    // endpoints are registered when A's SEND cap to B is wired at spawn time.
+    let _ = ctx.spawn("brutal-id-12-c"); // chain endpoint: registered first
+    let _ = ctx.spawn("brutal-id-12-b"); // chain middle: registered before 12-a's SEND cap
+    let _ = ctx.spawn("brutal-id-12-a"); // chain source: acquires cap to 12-c, sends to 12-b
+    // T13 cross-core blocked send: recv must exist before sender's SEND cap is wired.
+    // Kill runs independently on core 1 and yields before killing.
+    let _ = ctx.spawn("brutal-id-13-recv"); // passive target on core 2
+    let _ = ctx.spawn("brutal-id-13-kill"); // kills recv after brief delay on core 1
+    let _ = ctx.spawn("brutal-id-13-send"); // fills queue then blocks on core 0
+    // T11 self-referential queue: brutal-id-11 sends to itself; any spawn order.
+    let _ = ctx.spawn("brutal-id-11");
+
     // --- Original ping/pong services ---
     // Spawn pong first so the kernel registers "pong" in its name table before
     // ping is spawned (ping needs a SEND cap to pong at spawn time — §5 in

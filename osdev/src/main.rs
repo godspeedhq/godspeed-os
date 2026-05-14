@@ -9,7 +9,8 @@
 //!   osdev logs <service>    — tail service logs
 //!   osdev status <service>  — show state + assigned core
 //!   osdev caps <service>    — show held capabilities
-//!   osdev test identity     — run §22 identity test suite
+//!   osdev test identity         — run §22 identity test suite (20 tests)
+//!   osdev test identity-brutal  — run brutal identity tests + SMP escalation (Milestone 15)
 //!   osdev test property     — run §22 property test suite
 //!   osdev test fuzz         — run §22 fuzz test suite (Milestone 10)
 //!   osdev test stress       — run §22 stress test suite (Milestone 11)
@@ -217,7 +218,8 @@ fn cmd_caps(service: &str) {
 
 fn cmd_test(suite: &str) {
     match suite {
-        "identity" => crate::validator::run_identity_tests(),
+        "identity"        => crate::validator::run_identity_tests(),
+        "identity-brutal" => crate::validator::run_brutal_identity_tests(),
         "property" => crate::validator::run_property_tests(),
         "fuzz"     => crate::validator::run_fuzz_tests(),
         "stress"   => crate::validator::run_stress_tests(),
