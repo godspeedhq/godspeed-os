@@ -205,16 +205,19 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     test_cap_enforcement();
     test_ipc_routing();
 
-    // Spawn init on Core 0.  Services must be pre-built (`osdev build`).
-    task::spawn_init();
+    // ELF-loader fuzz mode (§22 Fuzz F3): run 77 malformed-ELF inputs and halt.
+    // Never reaches the normal boot path when this feature is enabled.
+    #[cfg(feature = "test-bad-elf")]
+    loader::run_elf_fuzz();
 
-    // Bring up APs after init is enqueued so each AP's scheduler finds tasks.
-    smp::init(boot_info);
-
-    kprintln!("kernel: {} cores ready", smp::core::ready_count());
-
-    // BSP enters the per-core scheduler on core 0; never returns.
-    task::scheduler::run(0)
+    // Normal boot: spawn init, bring up APs, enter per-core scheduler (never returns).
+    #[cfg(not(feature = "test-bad-elf"))]
+    {
+        task::spawn_init();
+        smp::init(boot_info);
+        kprintln!("kernel: {} cores ready", smp::core::ready_count());
+        task::scheduler::run(0)
+    }
 }
 
 #[no_mangle]

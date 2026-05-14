@@ -46,6 +46,19 @@ enum TestKind {
         fail_on:      &'static [&'static str],
         timeout_secs: u64,
     },
+    /// Build kernel with `test-bad-elf` feature, create a separate image,
+    /// boot QEMU, and watch for the pass string (§22 Fuzz F3).
+    WithBadElf {
+        expect:       &'static [&'static str],
+        fail_on:      &'static [&'static str],
+        timeout_secs: u64,
+    },
+    /// Host-side contract validation fuzz (§22 Fuzz F4): runs inline without QEMU.
+    /// `ok` inputs must pass schema validation; `bad` inputs must not cause a panic.
+    ContractFuzz {
+        ok:  &'static [&'static str],
+        bad: &'static [&'static [u8]],
+    },
     /// Not implemented. Print reason; do not boot QEMU.
     Blocked {
         reason: &'static str,
@@ -106,6 +119,64 @@ static FUZZ_TESTS: &[TestSpec] = &[
             expect:       &["fuzz: F8 pass"],
             fail_on:      &["KERNEL PANIC", "fuzz: F8 FAIL"],
             timeout_secs: 60,
+        },
+    },
+    TestSpec {
+        id: "F3", name: "elf_loader_no_panic", spec_ref: "§22 Fuzz F3",
+        kind: TestKind::WithBadElf {
+            expect:       &["fuzz: F3 pass (77/77)"],
+            fail_on:      &["KERNEL PANIC"],
+            timeout_secs: 30,
+        },
+    },
+    TestSpec {
+        id: "F4", name: "contract_validator_no_panic", spec_ref: "§22 Fuzz F4",
+        kind: TestKind::ContractFuzz {
+            ok: &[
+                concat!(
+                    "name = \"ping\"\nversion = \"0.1.0\"\n\n",
+                    "[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n\n",
+                    "[capabilities]\nlog_write = true",
+                ),
+                concat!(
+                    "name = \"pong\"\nversion = \"0.2.0\"\n\n",
+                    "[resources.memory]\nrequest = \"16MiB\"\nlimit = \"32MiB\"\n\n",
+                    "[capabilities]\nipc_send = [\"ping\"]\nipc_receive = [\"pong\"]\nlog_write = true",
+                ),
+                concat!(
+                    "name = \"probe\"\nversion = \"0.1.0\"\n\n",
+                    "[resources.memory]\nrequest = \"4MiB\"\nlimit = \"8MiB\"\n\n",
+                    "[capabilities]\nlog_write = true\n\n",
+                    "[placement]\ncore = 0",
+                ),
+            ],
+            bad: &[
+                b"",                          // empty — missing required fields
+                b"\xFF\xFE",                  // non-UTF-8
+                b"[unclosed",                 // invalid TOML
+                // missing name
+                b"version = \"0.1.0\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n[capabilities]\nlog_write = true",
+                // missing version
+                b"name = \"ping\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n[capabilities]\nlog_write = true",
+                // missing resources
+                b"name = \"ping\"\nversion = \"0.1.0\"\n[capabilities]\nlog_write = true",
+                // missing capabilities
+                b"name = \"ping\"\nversion = \"0.1.0\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"",
+                // name wrong type (integer)
+                b"name = 42\nversion = \"0.1.0\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n[capabilities]\nlog_write = true",
+                // bad name pattern (uppercase)
+                b"name = \"Ping\"\nversion = \"0.1.0\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n[capabilities]\nlog_write = true",
+                // bad version (not semver)
+                b"name = \"ping\"\nversion = \"not-semver\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n[capabilities]\nlog_write = true",
+                // extra top-level field (additionalProperties: false)
+                b"name = \"ping\"\nversion = \"0.1.0\"\nextra = true\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n[capabilities]\nlog_write = true",
+                // bad memory unit (MB instead of MiB)
+                b"name = \"ping\"\nversion = \"0.1.0\"\n[resources.memory]\nrequest = \"32MB\"\nlimit = \"64MB\"\n[capabilities]\nlog_write = true",
+                // placement.core out of range (max 15)
+                b"name = \"ping\"\nversion = \"0.1.0\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n[capabilities]\nlog_write = true\n[placement]\ncore = 100",
+                // log_write wrong type (string instead of boolean)
+                b"name = \"ping\"\nversion = \"0.1.0\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n[capabilities]\nlog_write = \"yes\"",
+            ],
         },
     },
 ];
@@ -571,6 +642,8 @@ pub fn run_fuzz_tests() {
 fn run_one(test: &TestSpec, image: &Path) -> TestOutcome {
     match &test.kind {
         TestKind::Blocked { reason } => TestOutcome::Blocked(reason),
+        TestKind::WithBadElf { .. } => TestOutcome::Blocked("WithBadElf only runs via osdev test fuzz"),
+        TestKind::ContractFuzz { .. } => TestOutcome::Blocked("ContractFuzz only runs via osdev test fuzz"),
 
         TestKind::WithBadTcb { expect, fail_on, timeout_secs } => {
             // Build kernel with the test-bad-registry feature (invalid registry ELF).
@@ -726,7 +799,67 @@ fn run_fuzz_one(test: &TestSpec, image: &Path) -> TestOutcome {
             qemu.kill();
             result
         }
-        _ => TestOutcome::Blocked("fuzz tests only use WatchSerial"),
+
+        TestKind::WithBadElf { expect, fail_on, timeout_secs } => {
+            let status = std::process::Command::new("cargo")
+                .args([
+                    "build", "--release", "-p", "kernel",
+                    "--target", "x86_64-unknown-none",
+                    "--features", "kernel/test-bad-elf",
+                ])
+                .status()
+                .expect("failed to invoke cargo");
+            if !status.success() {
+                return TestOutcome::Fail(
+                    "kernel build with test-bad-elf feature failed".to_string()
+                );
+            }
+
+            let kernel_elf = Path::new("target/x86_64-unknown-none/release/kernel");
+            let limine_dir = Path::new("tools/limine");
+            let bad_img    = Path::new("build/tests/3_FUZZ/F3-bad-elf.img");
+            let bad_image  = crate::disk_image::create_at(kernel_elf, limine_dir, bad_img);
+            crate::disk_image::install_bootloader(limine_dir, &bad_image);
+
+            let serial = fuzz_serial_path(test);
+            let _ = std::fs::write(&serial, b"");
+            let qemu   = crate::qemu::spawn_for_test(&bad_image, 4, &serial, None);
+            let result = poll_serial(&serial, expect, fail_on,
+                                     Instant::now() + Duration::from_secs(*timeout_secs));
+            qemu.kill();
+            result
+        }
+
+        TestKind::ContractFuzz { ok, bad } => {
+            let schema_path = Path::new("contracts/schema/service.schema.json");
+            let schema = load_schema(schema_path);
+
+            for (i, &src) in ok.iter().enumerate() {
+                match validate_contract_source(&schema, src.as_bytes()) {
+                    Ok(()) => {}
+                    Err(e) => return TestOutcome::Fail(
+                        format!("ok[{i}] unexpectedly rejected by schema: {e}")
+                    ),
+                }
+            }
+
+            for (i, &src) in bad.iter().enumerate() {
+                let s = schema.clone();
+                let b = src.to_vec();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    validate_contract_source(&s, &b)
+                }));
+                if result.is_err() {
+                    return TestOutcome::Fail(format!(
+                        "bad[{i}] caused a panic in validate_contract_source"
+                    ));
+                }
+            }
+
+            TestOutcome::Pass
+        }
+
+        _ => TestOutcome::Blocked("unexpected test kind in fuzz suite"),
     }
 }
 
@@ -775,12 +908,55 @@ fn load_schema(path: &Path) -> serde_json::Value {
 }
 
 fn find_contracts() -> Vec<PathBuf> {
-    todo!("walk the repo for all files matching */contracts/*.toml")
+    let mut out = Vec::new();
+    collect_contract_files(Path::new("."), &mut out, 0);
+    out
+}
+
+fn collect_contract_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+    if depth > 5 { return; }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if path.is_dir() {
+            // Skip directories that can't contain service contracts.
+            if name.starts_with('.') || name == "target" || name == "build" { continue; }
+            if name == "contracts" {
+                // Collect .toml files directly inside this contracts/ dir.
+                if let Ok(inner) = std::fs::read_dir(&path) {
+                    for f in inner.flatten() {
+                        let fp = f.path();
+                        if fp.is_file() && fp.extension().map_or(false, |e| e == "toml") {
+                            out.push(fp);
+                        }
+                    }
+                }
+            } else {
+                collect_contract_files(&path, out, depth + 1);
+            }
+        }
+    }
 }
 
 fn validate_contract(schema: &serde_json::Value, path: &Path) -> Result<(), String> {
-    todo!(
-        "parse TOML → JSON, validate against schema using jsonschema crate, \
-         return Ok or the first validation error"
-    )
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    validate_contract_source(schema, &bytes)
+}
+
+fn validate_contract_source(schema: &serde_json::Value, bytes: &[u8]) -> Result<(), String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|e| format!("invalid UTF-8: {e}"))?;
+    let toml_val: toml::Value = toml::from_str(text)
+        .map_err(|e| format!("TOML parse error: {e}"))?;
+    let json_str = serde_json::to_string(&toml_val)
+        .map_err(|e| format!("JSON serialize error: {e}"))?;
+    let json_val: serde_json::Value = serde_json::from_str(&json_str)
+        .map_err(|e| format!("JSON deserialize error: {e}"))?;
+    if jsonschema::is_valid(schema, &json_val) {
+        Ok(())
+    } else {
+        Err("contract does not conform to schema".to_string())
+    }
 }

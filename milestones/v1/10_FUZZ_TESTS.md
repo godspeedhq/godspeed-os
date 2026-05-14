@@ -15,7 +15,7 @@ CLAUDE.md §22 Fuzz Tests.
 | Phase | Tests | Status |
 |-------|-------|--------|
 | Phase 1 | F1, F2, F5, F6, F7, F8 | ✅ 6/6 PASS |
-| Phase 2 | F3, F4 | 🔲 DEFERRED |
+| Phase 2 | F3, F4 | ✅ 2/2 PASS |
 
 ---
 
@@ -124,27 +124,29 @@ Fuzz tests reuse the probe service binary (`services/probe`) with new probe mode
 
 ---
 
-## Phase 2: F3, F4 (Deferred)
+## Phase 2: F3, F4
 
 ### F3 — ELF mutation
 
 **Surface:** The kernel's ELF loader (`kernel/src/loader.rs`), called at spawn time.
 
-**Plan:** Build variant kernel images with bit-flipped, truncated, or header-corrupted probe ELF bytes embedded via a `kernel/test-bad-elf` Cargo feature (analogous to `test-bad-registry`). The kernel must either reject the spawn with a `LoadError` or execute the service in isolation — it must NOT panic, regardless of ELF content.
+**Implementation:** `kernel/test-bad-elf` Cargo feature (analogous to `test-bad-registry`). When enabled, `kernel_main` calls `loader::run_elf_fuzz() -> !` immediately after the pre-scheduler tests and before `spawn_init`. The function exercises 77 inputs:
+- 13 specific bad cases (empty, truncated, all-zero, all-0xFF, ELFCLASS32, big-endian, ET_DYN, EM_386, bad phentsize, phoff overflow, phdr OOB, p_filesz > p_memsz, segment out-of-bounds)
+- 64 single-byte-flip variants of the base valid header
 
-**Implementation:** Harness-side ELF mutation + new `WithBadElf` test kind in the harness.
+After running all 77 inputs through `load()` with `let _ = load(...)`, prints `fuzz: F3 pass (77/77)` and halts. The `WithBadElf` test kind in the harness builds the test-bad-elf kernel, creates a separate image, and watches for the pass string.
 
-**Deferred because:** Requires changes to the ELF loader, a new kernel feature flag, and harness infrastructure for generating bit-flipped ELF variants. Phase 1 covers the higher-impact kernel boundary (syscall dispatch, IPC, memory). ELF loading is also tested structurally by Test 1B.
+**Pass:** `fuzz: F3 pass (77/77)` seen on serial.
+**Timeout:** 30 s.
 
 ### F4 — Service contracts
 
 **Surface:** `osdev validate` (the host-side JSON Schema validator in `osdev/src/validator.rs`).
 
-**Plan:** Generate malformed TOML files (missing required fields, wrong types, extra fields, non-UTF-8 bytes) and run them through `validate_all_contracts`. The validator must return a structured error, never panic (`unwrap` / `expect` / stack overflow).
+**Implementation:** `validate_contract_source()` implements UTF-8 check → TOML parse → JSON serialize → JSON validate against schema. `find_contracts()` walks the repo for `*/contracts/*.toml` files. `validate_contract()` reads a file and calls `validate_contract_source()`. The `ContractFuzz` test kind is host-side only (no QEMU): 3 valid TOML inputs must return Ok; 14 invalid inputs (empty, non-UTF-8, invalid TOML, missing fields, wrong types, bad patterns, extra fields, out-of-range core) are wrapped in `catch_unwind` — a panic is a FAIL, any other result (Ok or Err) is acceptable.
 
-**Implementation:** A set of known-bad contract files in `tests/qemu/fuzz/contracts/` + a host-side test loop in `run_fuzz_tests` that calls `validate_contract` on each.
-
-**Deferred because:** `validate_all_contracts` is currently a `todo!()`. Once the contract validator is implemented (a pre-requisite for `osdev validate` to work), F4 can be added with minimal harness overhead.
+**Pass:** All 3 good inputs return Ok; all 14 bad inputs complete without panicking.
+**Timeout:** N/A (host-side, no QEMU).
 
 ---
 
@@ -167,11 +169,11 @@ The margin is tight on task slots. If further probes are added for later milesto
 osdev test fuzz
 ```
 
-Builds once, then boots QEMU fresh for each of the 6 Phase 1 tests. Logs are written to `build/tests/3_FUZZ/<id>-<name>.log`.
+Builds once, then runs all 8 tests. F1/F2/F5/F6/F7/F8 boot QEMU with the standard image. F3 rebuilds the kernel with `test-bad-elf` and boots a separate image. F4 runs inline (host-side, no QEMU). Logs are written to `build/tests/3_FUZZ/<id>-<name>.log`.
 
 ---
 
-## Phase 1 results
+## Results
 
 | ID | Name | Result | Notes |
 |----|------|--------|-------|
@@ -181,6 +183,8 @@ Builds once, then boots QEMU fresh for each of the 6 Phase 1 tests. Logs are wri
 | F6 | embedded_cap_slots_no_panic | ✅ PASS | 1,000 random send_with_cap slot pairs |
 | F7 | stale_cap_generation_no_panic | ✅ PASS | 50 kill/respawn cycles; stale caps → EndpointDead |
 | F8 | memory_request_sizes_no_panic | ✅ PASS | 10 edge cases + 1,000 random sizes |
+| F3 | elf_loader_no_panic | ✅ PASS | 13 specific bad inputs + 64 byte-flip variants (77 total) |
+| F4 | contract_validator_no_panic | ✅ PASS | 3 valid inputs accepted; 14 bad inputs completed without panic |
 
 ---
 

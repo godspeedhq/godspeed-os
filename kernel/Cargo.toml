@@ -19,5 +19,10 @@ panic = "abort"
 # failure path in init (§6.2, §22 Test 1B).  Only used by `osdev test identity`.
 test-bad-registry = []
 
+# Build the kernel in ELF-loader fuzz mode (§22 Fuzz F3).  Calls loader::run_elf_fuzz()
+# on 77 malformed ELF byte sequences early in BSP init, prints "fuzz: F3 pass",
+# then halts.  Only used by `osdev test fuzz`.
+test-bad-elf = []
+
 [profile.release]
 panic = "abort"

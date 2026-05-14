@@ -222,3 +222,116 @@ pub fn load(bytes: &[u8]) -> Result<LoadedElf, LoadError> {
 
     Ok(LoadedElf { page_table: pt, entry_va: e_entry })
 }
+
+// ---------------------------------------------------------------------------
+// ELF-loader fuzz — §22 Fuzz F3.  Compiled only with `--features test-bad-elf`.
+// ---------------------------------------------------------------------------
+
+/// Run 77 malformed-ELF inputs through `load()`, assert no kernel panic,
+/// print the pass string, and halt.  Called once from `kernel_main` before
+/// any services are spawned.
+#[cfg(feature = "test-bad-elf")]
+pub fn run_elf_fuzz() -> ! {
+    // Base valid ELF64 header, 64 bytes, e_phnum=0.
+    // Passes every check in load() and produces an empty LoadedElf.
+    // Used as the mutation seed for the 64 single-byte-flip cases.
+    let base: [u8; 64] = [
+        // e_ident[16]
+        0x7f, b'E', b'L', b'F',     // magic
+        2, 1, 1, 0,                  // ELFCLASS64, ELFDATA2LSB, ABI=SysV, v1
+        0, 0, 0, 0, 0, 0, 0, 0,     // padding
+        // e_type[2], e_machine[2], e_version[4]
+        2, 0,                        // ET_EXEC
+        0x3e, 0,                     // EM_X86_64 = 62
+        1, 0, 0, 0,                  // EV_CURRENT
+        // e_entry[8]
+        0, 0, 0, 0, 0, 0, 0, 0,
+        // e_phoff[8]
+        0, 0, 0, 0, 0, 0, 0, 0,
+        // e_shoff[8]
+        0, 0, 0, 0, 0, 0, 0, 0,
+        // e_flags[4]
+        0, 0, 0, 0,
+        // e_ehsize[2], e_phentsize[2], e_phnum[2], e_shentsize[2], e_shnum[2], e_shstrndx[2]
+        64, 0,  // e_ehsize  = 64
+        56, 0,  // e_phentsize = sizeof(Elf64Phdr)
+        0, 0,   // e_phnum  = 0
+        64, 0,  // e_shentsize
+        0, 0,   // e_shnum
+        0, 0,   // e_shstrndx
+    ];
+
+    let mut n: u32 = 0;
+
+    // ── Specific bad-input cases (13) ────────────────────────────────────────
+
+    let _ = load(&[]);                                            n += 1; // 1: empty → TooSmall
+    let _ = load(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0]); n += 1; // 2: 10 B → TooSmall
+    let _ = load(&[0u8; 64]);                                    n += 1; // 3: all-zero → BadMagic
+    let _ = load(&[0xffu8; 64]);                                  n += 1; // 4: all-0xFF → BadMagic
+
+    let mut b = base; b[4] = 1;
+    let _ = load(&b); n += 1;              // 5: ELFCLASS32 → NotElf64
+
+    let mut b = base; b[5] = 2;
+    let _ = load(&b); n += 1;              // 6: big-endian → NotElf64
+
+    let mut b = base; b[16] = 3;
+    let _ = load(&b); n += 1;              // 7: ET_DYN → NotExecutable
+
+    let mut b = base; b[18] = 3; b[19] = 0;
+    let _ = load(&b); n += 1;              // 8: EM_386 → WrongArch
+
+    // 9: e_phentsize=32 with e_phnum=1 → BadProgramHeader (fires before PageTable::new)
+    let mut b = base; b[54] = 32; b[56] = 1;
+    let _ = load(&b); n += 1;
+
+    // 10: e_phnum=1, e_phoff=u64::MAX → phdr offset overflow → BadProgramHeader
+    let mut b = base; b[56] = 1;
+    b[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+    let _ = load(&b); n += 1;
+
+    // 11: e_phnum=1, e_phoff=64, file is only 64 bytes → phdr OOB → BadProgramHeader
+    let mut b = base; b[56] = 1; b[32] = 64;
+    let _ = load(&b); n += 1;
+
+    // 12: PT_LOAD with p_filesz(10) > p_memsz(5) → BadProgramHeader
+    {
+        let mut buf = [0u8; 120];
+        buf[..64].copy_from_slice(&base);
+        buf[32] = 64;   // e_phoff = 64 (Elf64Phdr follows the header)
+        buf[56] = 1;    // e_phnum = 1
+        // Elf64Phdr layout at buf[64]: p_type[4] p_flags[4] p_offset[8]
+        //   p_vaddr[8] p_paddr[8] p_filesz[8] p_memsz[8] p_align[8]
+        buf[64] = 1;    // p_type  = PT_LOAD
+        buf[68] = 4;    // p_flags = PF_R
+        buf[96] = 10;   // p_filesz (phdr+32) = 10
+        buf[104] = 5;   // p_memsz  (phdr+40) = 5 → filesz > memsz
+        let _ = load(&buf); n += 1;
+    }
+
+    // 13: PT_LOAD, p_offset(60)+p_filesz(100)=160 > file_len(120) → SegmentOutOfBounds
+    {
+        let mut buf = [0u8; 120];
+        buf[..64].copy_from_slice(&base);
+        buf[32] = 64;   // e_phoff = 64
+        buf[56] = 1;    // e_phnum = 1
+        buf[64] = 1;    // p_type  = PT_LOAD
+        buf[68] = 4;    // p_flags = PF_R
+        buf[72] = 60;   // p_offset (phdr+8)  = 60
+        buf[96] = 100;  // p_filesz (phdr+32) = 100 → 60+100=160 > 120
+        buf[104] = 100; // p_memsz  (phdr+40) = 100
+        let _ = load(&buf); n += 1;
+    }
+
+    // ── Byte-flip cases (64): flip each byte of the base header once ─────────
+    for i in 0..64usize {
+        let mut b = base;
+        b[i] = !b[i];
+        let _ = load(&b);
+        n += 1;
+    }
+
+    crate::kprintln!("fuzz: F3 pass ({}/{})", n, n);
+    crate::arch::x86_64::halt_all_cores()
+}
