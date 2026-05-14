@@ -288,6 +288,24 @@ impl ServiceContext {
         if ret < 0 { 0 } else { ret as u32 }
     }
 
+    /// Read the hardware TSC (Time Stamp Counter) via the kernel.
+    ///
+    /// Returns RDTSC cycle count. Useful for measuring kernel operation latencies
+    /// in benchmark probes (§22 Perf B1–B10). Not comparable across hosts.
+    pub fn read_tsc(&self) -> u64 {
+        // SAFETY: syscall(13) = InspectKernel; query_id=3 = read TSC.
+        let ret = unsafe { raw_syscall(13, 3, 0, 0) };
+        if ret < 0 { 0 } else { ret as u64 }
+    }
+
+    /// Send a message via an explicit cap handle (blocking).
+    ///
+    /// Used by benchmark probes that dynamically acquire send caps rather than
+    /// using named peer slots, avoiding repeated name-lookup overhead.
+    pub fn send_by_handle(&self, handle: CapHandle, msg: &Message) -> Result<(), IpcError> {
+        crate::ipc::send(handle, msg)
+    }
+
     /// Query the rights bitfield of the cap at `handle`.
     ///
     /// Returns the rights byte as a u64, or `None` if the slot is empty.

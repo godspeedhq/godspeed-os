@@ -1,0 +1,16 @@
+{
+  "note": "QEMU TCG RDTSC cycle counts — not comparable across hosts or QEMU versions; useful for detecting large regressions within one environment",
+  "regression_threshold_pct": 10,
+  "metrics": {
+    "B1":  { "p50": 0, "p99": 0 },
+    "B2":  { "p50": 0, "p99": 0 },
+    "B3":  { "mean": 0 },
+    "B4":  { "mean": 0 },
+    "B5":  { "spawn_mean": 0 },
+    "B6":  { "restart_mean": 0 },
+    "B7":  { "mean": 0 },
+    "B8":  { "n": 0, "mean": 0 },
+    "B9":  { "mean": 0 },
+    "B10": { "mean": 0 }
+  }
+}

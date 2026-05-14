@@ -833,6 +833,138 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        50, // STRESS_S9_SEND: 500 blocking sends to s9-recv
             memory_limit:      64 * 1024 * 1024,
         })),
+        // ----------------------------------------------------------------
+        // Performance-benchmark probes — Milestone 12.
+        // Sender services are spawned before their echo/recv partners so
+        // their endpoints are registered when echo partners wire SEND caps.
+        // ----------------------------------------------------------------
+        // B1: same-core IPC roundtrip. Sender acquires cap dynamically.
+        "perf-b1" => Some(("perf-b1", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    0,
+            probe_mode:        60, // PERF_B1: same-core roundtrip sender
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "perf-b1-echo" => Some(("perf-b1-echo", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &["perf-b1"],
+            send_peers_grant:  false,
+            preferred_core:    0, // same core as perf-b1
+            probe_mode:        61, // PERF_B1_ECHO: echo messages back
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // B2: cross-core IPC roundtrip. Sender on core 0, echo on core 1.
+        "perf-b2" => Some(("perf-b2", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    0,
+            probe_mode:        62, // PERF_B2: cross-core roundtrip sender
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "perf-b2-echo" => Some(("perf-b2-echo", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &["perf-b2"],
+            send_peers_grant:  false,
+            preferred_core:    1, // cross-core: sender on 0, echo on 1
+            probe_mode:        63, // PERF_B2_ECHO: echo messages back
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // B3: yield floor. No peers needed.
+        "perf-b3" => Some(("perf-b3", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        64, // PERF_B3: syscall yield floor
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // B4: cap validation throughput. Needs recv endpoint to have a cap to query.
+        "perf-b4" => Some(("perf-b4", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        65, // PERF_B4: cap + generation check throughput
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // B5/B6: spawn and restart cost. Victim spawned first so perf-b5 can kill/respawn it.
+        "perf-b5-victim" => Some(("perf-b5-victim", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0, // PASSIVE — killed/respawned by perf-b5
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "perf-b5" => Some(("perf-b5", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        66, // PERF_B5: spawn + restart cost (covers B5 and B6)
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // B7: cap table insert/remove throughput. Self-referential (acquires SEND cap to self).
+        "perf-b7" => Some(("perf-b7", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        67, // PERF_B7: cap insert/remove throughput
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // B8: allocator throughput. No peers needed.
+        "perf-b8" => Some(("perf-b8", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        68, // PERF_B8: alloc-4kib throughput
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // B9: 4 KiB message copy. Both on core 0 to isolate copy from cross-core routing.
+        // Recv partner must be registered before sender's SEND cap is wired.
+        "perf-b9-recv" => Some(("perf-b9-recv", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    0,
+            probe_mode:        70, // PERF_B9_RECV: drain large messages
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "perf-b9" => Some(("perf-b9", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &["perf-b9-recv"],
+            send_peers_grant:  false,
+            preferred_core:    0,
+            probe_mode:        69, // PERF_B9: 4 KiB message sender
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // B10: scheduler pick-next cost. No peers needed.
+        "perf-b10" => Some(("perf-b10", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        71, // PERF_B10: scheduler pick-next cost
+            memory_limit:      64 * 1024 * 1024,
+        })),
         _ => None,
     }
 }

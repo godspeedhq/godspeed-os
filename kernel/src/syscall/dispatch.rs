@@ -532,6 +532,14 @@ unsafe fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     match query_id {
         0 => scheduler::current_task_alloc_bytes() as i64,
         1 => crate::ipc::routing::count_live_endpoints() as i64,
+        3 => {
+            // Read the hardware TSC for benchmarking probes (§22 Perf B1–B10).
+            // SAFETY: RDTSC is unconditionally available on x86_64 in ring 0;
+            // it reads a monotonically increasing cycle counter with no side effects
+            // and does not expose a kernel pointer or modify kernel state.
+            let tsc = unsafe { core::arch::x86_64::_rdtsc() };
+            tsc as i64
+        }
         2 => {
             // Endpoint generation by name.
             let len = arg2 as usize;

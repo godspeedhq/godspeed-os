@@ -355,6 +355,93 @@ static STRESS_TESTS: &[TestSpec] = &[
     },
 ];
 
+// ---------------------------------------------------------------------------
+// Performance benchmark definitions (Milestone 12).
+// ---------------------------------------------------------------------------
+
+static PERF_TESTS: &[TestSpec] = &[
+    TestSpec {
+        id: "B1", name: "ipc_same_core_roundtrip_latency", spec_ref: "§22 Perf B1",
+        kind: TestKind::WatchSerial {
+            expect:       &["perf: B1 done"],
+            fail_on:      &["KERNEL PANIC", "perf: B1 FAIL"],
+            timeout_secs: 60,
+        },
+    },
+    TestSpec {
+        id: "B2", name: "ipc_cross_core_roundtrip_latency", spec_ref: "§22 Perf B2",
+        kind: TestKind::WatchSerial {
+            expect:       &["perf: B2 done"],
+            fail_on:      &["KERNEL PANIC", "perf: B2 FAIL"],
+            timeout_secs: 60,
+        },
+    },
+    TestSpec {
+        id: "B3", name: "syscall_yield_floor", spec_ref: "§22 Perf B3",
+        kind: TestKind::WatchSerial {
+            expect:       &["perf: B3 done"],
+            fail_on:      &["KERNEL PANIC", "perf: B3 FAIL"],
+            timeout_secs: 30,
+        },
+    },
+    TestSpec {
+        id: "B4", name: "cap_validation_throughput", spec_ref: "§22 Perf B4",
+        kind: TestKind::WatchSerial {
+            expect:       &["perf: B4 done"],
+            fail_on:      &["KERNEL PANIC", "perf: B4 FAIL"],
+            timeout_secs: 30,
+        },
+    },
+    TestSpec {
+        id: "B5", name: "spawn_syscall_cost", spec_ref: "§22 Perf B5",
+        kind: TestKind::WatchSerial {
+            expect:       &["perf: B5 done"],
+            fail_on:      &["KERNEL PANIC", "perf: B5 FAIL"],
+            timeout_secs: 60,
+        },
+    },
+    TestSpec {
+        id: "B6", name: "restart_kill_plus_spawn_cost", spec_ref: "§22 Perf B6",
+        kind: TestKind::WatchSerial {
+            expect:       &["perf: B6 done"],
+            fail_on:      &["KERNEL PANIC", "perf: B6 FAIL"],
+            timeout_secs: 60,
+        },
+    },
+    TestSpec {
+        id: "B7", name: "cap_table_throughput", spec_ref: "§22 Perf B7",
+        kind: TestKind::WatchSerial {
+            expect:       &["perf: B7 done"],
+            fail_on:      &["KERNEL PANIC", "perf: B7 FAIL"],
+            timeout_secs: 30,
+        },
+    },
+    TestSpec {
+        id: "B8", name: "allocator_throughput", spec_ref: "§22 Perf B8",
+        kind: TestKind::WatchSerial {
+            expect:       &["perf: B8 done"],
+            fail_on:      &["KERNEL PANIC", "perf: B8 FAIL"],
+            timeout_secs: 60,
+        },
+    },
+    TestSpec {
+        id: "B9", name: "message_copy_4kib", spec_ref: "§22 Perf B9",
+        kind: TestKind::WatchSerial {
+            expect:       &["perf: B9 done"],
+            fail_on:      &["KERNEL PANIC", "perf: B9 FAIL"],
+            timeout_secs: 60,
+        },
+    },
+    TestSpec {
+        id: "B10", name: "scheduler_decision_cost", spec_ref: "§22 Perf B10",
+        kind: TestKind::WatchSerial {
+            expect:       &["perf: B10 done"],
+            fail_on:      &["KERNEL PANIC", "perf: B10 FAIL"],
+            timeout_secs: 30,
+        },
+    },
+];
+
 static TESTS: &[TestSpec] = &[
     TestSpec {
         id: "1A", name: "bootstrap_steady_state_positive", spec_ref: "§22 Test 1A",
@@ -770,6 +857,106 @@ pub fn run_stress_tests() {
     if failed > 0 { std::process::exit(1); }
 }
 
+/// Boot the OS in QEMU and run the Milestone 12 performance benchmark suite.
+///
+/// Pass criterion: each benchmark logs `perf: BN done` without panicking.
+/// After all benchmarks pass, extracted RDTSC metrics are written to
+/// `tests/qemu/perf/baseline.json` for future regression comparisons.
+pub fn run_perf_tests() {
+    println!("perf: stopping any running QEMU instances...");
+    kill_existing_qemu();
+
+    println!("perf: building...");
+    crate::cmd_build();
+
+    let kernel_elf = Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() {
+        eprintln!("perf: kernel ELF not found at {}", kernel_elf.display());
+        std::process::exit(1);
+    }
+
+    let limine_dir = Path::new("tools/limine");
+    let image_path = crate::disk_image::create(kernel_elf, limine_dir);
+    crate::disk_image::install_bootloader(limine_dir, &image_path);
+
+    std::fs::create_dir_all("build/tests/5_PERFORMANCE")
+        .expect("create build/tests/5_PERFORMANCE/");
+
+    println!("\nperf: running {} benchmarks\n", PERF_TESTS.len());
+
+    let mut results: Vec<(&TestSpec, TestOutcome)> = Vec::new();
+
+    for test in PERF_TESTS {
+        print!("  [{:>3}]  {:45}  ({})  … ", test.id, test.name, test.spec_ref);
+        let _ = std::io::stdout().flush();
+
+        let outcome = run_perf_one(test, &image_path);
+
+        match &outcome {
+            TestOutcome::Pass       => println!("PASS"),
+            TestOutcome::Fail(r)    => println!("FAIL\n         → {r}"),
+            TestOutcome::Blocked(r) => println!("BLOCKED\n         → {r}"),
+        }
+
+        results.push((test, outcome));
+    }
+
+    let passed = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Pass)).count();
+    let failed = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Fail(_))).count();
+
+    println!("\n  {passed} passed  {failed} failed");
+
+    if passed > 0 {
+        collect_perf_baseline(&results);
+    }
+
+    if failed > 0 { std::process::exit(1); }
+}
+
+/// Extract metric values from each test's serial log and write baseline.json.
+///
+/// Parses lines matching `perf: BN key=value` and emits a JSON map.
+/// Absolute RDTSC values are not comparable across QEMU hosts or versions;
+/// the file is useful for detecting large regressions within one environment.
+fn collect_perf_baseline(results: &[(&TestSpec, TestOutcome)]) {
+    let mut metrics = serde_json::Map::new();
+
+    for (test, outcome) in results {
+        if !matches!(outcome, TestOutcome::Pass) { continue; }
+        let serial = perf_serial_path(test);
+        let content = std::fs::read_to_string(&serial).unwrap_or_default();
+        let prefix  = format!("perf: {} ", test.id);
+        for line in content.lines() {
+            if line.contains(&prefix) && !line.contains("done") && !line.contains("FAIL") {
+                let mut obj = serde_json::Map::new();
+                for token in line.split_whitespace() {
+                    if let Some((k, v)) = token.split_once('=') {
+                        if let Ok(n) = v.parse::<u64>() {
+                            obj.insert(k.to_string(), serde_json::Value::Number(n.into()));
+                        }
+                    }
+                }
+                if !obj.is_empty() {
+                    metrics.insert(test.id.to_string(), serde_json::Value::Object(obj));
+                }
+            }
+        }
+    }
+
+    let baseline = serde_json::json!({
+        "note": "QEMU TCG RDTSC cycle counts — not comparable across hosts or QEMU versions; useful for detecting large regressions within one environment",
+        "regression_threshold_pct": 10,
+        "metrics": metrics,
+    });
+
+    std::fs::create_dir_all("tests/qemu/perf").ok();
+    let out = serde_json::to_string_pretty(&baseline).unwrap_or_default();
+    match std::fs::write("tests/qemu/perf/baseline.json", &out) {
+        Ok(()) => println!("perf: baseline written to tests/qemu/perf/baseline.json"),
+        Err(e) => eprintln!("perf: could not write baseline.json: {e}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-test runner.
 // ---------------------------------------------------------------------------
@@ -1014,6 +1201,21 @@ fn run_stress_one(test: &TestSpec, image: &Path) -> TestOutcome {
     }
 }
 
+fn run_perf_one(test: &TestSpec, image: &Path) -> TestOutcome {
+    match &test.kind {
+        TestKind::WatchSerial { expect, fail_on, timeout_secs } => {
+            let serial = perf_serial_path(test);
+            let _ = std::fs::write(&serial, b"");
+            let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
+            let result = poll_serial(&serial, expect, fail_on,
+                                     Instant::now() + Duration::from_secs(*timeout_secs));
+            qemu.kill();
+            result
+        }
+        _ => TestOutcome::Blocked("perf tests only use WatchSerial"),
+    }
+}
+
 fn serial_path(test: &TestSpec) -> PathBuf {
     PathBuf::from(format!("build/tests/1_IDENTITY/{}-{}.log", test.id, test.name))
 }
@@ -1028,6 +1230,10 @@ fn fuzz_serial_path(test: &TestSpec) -> PathBuf {
 
 fn stress_serial_path(test: &TestSpec) -> PathBuf {
     PathBuf::from(format!("build/tests/4_STRESS/{}-{}.log", test.id, test.name))
+}
+
+fn perf_serial_path(test: &TestSpec) -> PathBuf {
+    PathBuf::from(format!("build/tests/5_PERFORMANCE/{}-{}.log", test.id, test.name))
 }
 
 // ---------------------------------------------------------------------------

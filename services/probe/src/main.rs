@@ -86,6 +86,20 @@ const MODE_STRESS_S8:       u32 = 49;
 const MODE_STRESS_S9_SEND:  u32 = 50;
 const MODE_STRESS_S9_RECV:  u32 = 51;
 
+// Performance-benchmark modes — Milestone 12.
+const MODE_PERF_B1:         u32 = 60; // same-core IPC roundtrip sender
+const MODE_PERF_B1_ECHO:    u32 = 61; // same-core IPC roundtrip echo
+const MODE_PERF_B2:         u32 = 62; // cross-core IPC roundtrip sender
+const MODE_PERF_B2_ECHO:    u32 = 63; // cross-core IPC roundtrip echo
+const MODE_PERF_B3:         u32 = 64; // syscall yield floor
+const MODE_PERF_B4:         u32 = 65; // cap validation throughput
+const MODE_PERF_B5:         u32 = 66; // spawn + restart cost (covers B5 and B6)
+const MODE_PERF_B7:         u32 = 67; // cap table insert/remove throughput
+const MODE_PERF_B8:         u32 = 68; // allocator throughput
+const MODE_PERF_B9:         u32 = 69; // 4 KiB message copy sender
+const MODE_PERF_B9_RECV:    u32 = 70; // 4 KiB message copy receiver
+const MODE_PERF_B10:        u32 = 71; // scheduler pick-next cost
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     match ctx.probe_mode() {
@@ -130,6 +144,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         MODE_STRESS_S8       => mode_stress_s8(&ctx),
         MODE_STRESS_S9_SEND  => mode_stress_s9_send(&ctx),
         MODE_STRESS_S9_RECV  => mode_stress_s9_recv(&ctx),
+        MODE_PERF_B1         => mode_perf_b1(&ctx),
+        MODE_PERF_B1_ECHO    => mode_perf_b1_echo(&ctx),
+        MODE_PERF_B2         => mode_perf_b2(&ctx),
+        MODE_PERF_B2_ECHO    => mode_perf_b2_echo(&ctx),
+        MODE_PERF_B3         => mode_perf_b3(&ctx),
+        MODE_PERF_B4         => mode_perf_b4(&ctx),
+        MODE_PERF_B5         => mode_perf_b5(&ctx),
+        MODE_PERF_B7         => mode_perf_b7(&ctx),
+        MODE_PERF_B8         => mode_perf_b8(&ctx),
+        MODE_PERF_B9         => mode_perf_b9(&ctx),
+        MODE_PERF_B9_RECV    => mode_perf_b9_recv(&ctx),
+        MODE_PERF_B10        => mode_perf_b10(&ctx),
         _                    => idle(&ctx),
     }
 }
@@ -1109,5 +1135,230 @@ fn mode_stress_s10(ctx: &ServiceContext) -> ! {
     } else {
         ctx.log("stress: S10 FAIL — not all caps returned EndpointDead");
     }
+    idle(ctx)
+}
+
+// ---------------------------------------------------------------------------
+// Performance-benchmark modes — Milestone 12.
+// ---------------------------------------------------------------------------
+
+/// Insertion sort for u64 slices (no_std; O(n²) fine for N ≤ 200).
+fn sort_u64(arr: &mut [u64]) {
+    let n = arr.len();
+    for i in 1..n {
+        let key = arr[i];
+        let mut j = i;
+        while j > 0 && arr[j - 1] > key {
+            arr[j] = arr[j - 1];
+            j -= 1;
+        }
+        arr[j] = key;
+    }
+}
+
+fn mode_perf_b1(ctx: &ServiceContext) -> ! {
+    // B1: same-core IPC round-trip latency (§22 Perf B1).
+    // Dynamically acquire a SEND cap to the echo partner (which registered after us).
+    let echo_cap = loop {
+        if let Some(cap) = ctx.acquire_send_cap("perf-b1-echo") { break cap; }
+        ctx.yield_cpu();
+    };
+
+    let msg = Message::from_bytes(b"b1");
+    const N: usize = 200;
+    let mut samples = [0u64; N];
+
+    for i in 0..N {
+        let t0 = ctx.read_tsc();
+        let _ = ctx.send_by_handle(echo_cap, &msg);
+        ctx.recv();
+        let t1 = ctx.read_tsc();
+        samples[i] = t1.wrapping_sub(t0);
+    }
+
+    sort_u64(&mut samples);
+    let p50 = samples[N / 2];
+    let p99 = samples[N * 99 / 100];
+    ctx.log_fmt(format_args!("perf: B1 p50={p50} p99={p99} cycles/roundtrip"));
+    ctx.log("perf: B1 done");
+    idle(ctx)
+}
+
+fn mode_perf_b1_echo(ctx: &ServiceContext) -> ! {
+    // B1 echo: recv message, send it back (same core, no measurement).
+    let msg = Message::from_bytes(b"b1e");
+    loop {
+        ctx.recv();
+        let _ = ctx.send("perf-b1", &msg);
+    }
+}
+
+fn mode_perf_b2(ctx: &ServiceContext) -> ! {
+    // B2: cross-core IPC round-trip latency (§22 Perf B2).
+    // Same structure as B1 but echo lives on a different core.
+    let echo_cap = loop {
+        if let Some(cap) = ctx.acquire_send_cap("perf-b2-echo") { break cap; }
+        ctx.yield_cpu();
+    };
+
+    let msg = Message::from_bytes(b"b2");
+    const N: usize = 200;
+    let mut samples = [0u64; N];
+
+    for i in 0..N {
+        let t0 = ctx.read_tsc();
+        let _ = ctx.send_by_handle(echo_cap, &msg);
+        ctx.recv();
+        let t1 = ctx.read_tsc();
+        samples[i] = t1.wrapping_sub(t0);
+    }
+
+    sort_u64(&mut samples);
+    let p50 = samples[N / 2];
+    let p99 = samples[N * 99 / 100];
+    ctx.log_fmt(format_args!("perf: B2 p50={p50} p99={p99} cycles/roundtrip"));
+    ctx.log("perf: B2 done");
+    idle(ctx)
+}
+
+fn mode_perf_b2_echo(ctx: &ServiceContext) -> ! {
+    // B2 echo: recv message, send it back (cross-core, no measurement).
+    let msg = Message::from_bytes(b"b2e");
+    loop {
+        ctx.recv();
+        let _ = ctx.send("perf-b2", &msg);
+    }
+}
+
+fn mode_perf_b3(ctx: &ServiceContext) -> ! {
+    // B3: syscall yield floor — round-trip time for advisory yield (§22 Perf B3).
+    const N: u64 = 1_000;
+    let t0 = ctx.read_tsc();
+    for _ in 0..N { ctx.yield_cpu(); }
+    let t1 = ctx.read_tsc();
+    let mean = t1.wrapping_sub(t0) / N;
+    ctx.log_fmt(format_args!("perf: B3 mean={mean} cycles/yield"));
+    ctx.log("perf: B3 done");
+    idle(ctx)
+}
+
+fn mode_perf_b4(ctx: &ServiceContext) -> ! {
+    // B4: cap validation throughput — QueryCapRights invokes cap + gen check (§22 Perf B4).
+    let handle = match ctx.recv_handle() {
+        Some(h) => h,
+        None    => { ctx.log("perf: B4 FAIL — no recv cap"); idle(ctx); }
+    };
+    const N: u64 = 10_000;
+    let t0 = ctx.read_tsc();
+    for _ in 0..N { ctx.query_cap_rights(handle); }
+    let t1 = ctx.read_tsc();
+    let mean = t1.wrapping_sub(t0) / N;
+    ctx.log_fmt(format_args!("perf: B4 mean={mean} cycles/cap-check"));
+    ctx.log("perf: B4 done");
+    idle(ctx)
+}
+
+fn mode_perf_b5(ctx: &ServiceContext) -> ! {
+    // B5/B6: spawn cost and restart (kill+spawn) cost (§22 Perf B5, B6).
+    // Victim is pre-spawned by supervisor; kill it first then cycle.
+    const N: u32 = 10;
+
+    // B5: spawn-only cost.
+    let _ = ctx.kill("perf-b5-victim"); // kill initially-running victim
+    let mut total_spawn: u64 = 0;
+    for _ in 0..N {
+        let t0 = ctx.read_tsc();
+        let _ = ctx.spawn("perf-b5-victim");
+        let t1 = ctx.read_tsc();
+        total_spawn += t1.wrapping_sub(t0);
+        let _ = ctx.kill("perf-b5-victim");
+    }
+    let spawn_mean = total_spawn / N as u64;
+    ctx.log_fmt(format_args!("perf: B5 spawn_mean={spawn_mean} cycles/spawn"));
+    ctx.log("perf: B5 done");
+
+    // B6: kill+spawn (restart) cost.
+    let _ = ctx.spawn("perf-b5-victim"); // ensure alive before cycling
+    let mut total_restart: u64 = 0;
+    for _ in 0..N {
+        let t0 = ctx.read_tsc();
+        let _ = ctx.kill("perf-b5-victim");
+        let _ = ctx.spawn("perf-b5-victim");
+        let t1 = ctx.read_tsc();
+        total_restart += t1.wrapping_sub(t0);
+    }
+    let restart_mean = total_restart / N as u64;
+    ctx.log_fmt(format_args!("perf: B6 restart_mean={restart_mean} cycles/restart"));
+    ctx.log("perf: B6 done");
+    idle(ctx)
+}
+
+fn mode_perf_b7(ctx: &ServiceContext) -> ! {
+    // B7: cap table insert/remove throughput — acquire SEND cap to self then remove (§22 Perf B7).
+    const N: u64 = 1_000;
+    let t0 = ctx.read_tsc();
+    for _ in 0..N {
+        if let Some(cap) = ctx.acquire_send_cap("perf-b7") {
+            ctx.remove_cap(cap);
+        }
+    }
+    let t1 = ctx.read_tsc();
+    let mean = t1.wrapping_sub(t0) / N;
+    ctx.log_fmt(format_args!("perf: B7 mean={mean} cycles/cap-insert-remove"));
+    ctx.log("perf: B7 done");
+    idle(ctx)
+}
+
+fn mode_perf_b8(ctx: &ServiceContext) -> ! {
+    // B8: allocator throughput — alloc 4 KiB pages until memory limit (§22 Perf B8).
+    let mut n_alloc: u64 = 0;
+    let t0 = ctx.read_tsc();
+    loop {
+        match ctx.alloc_mem(4096) {
+            Ok(_)                   => n_alloc += 1,
+            Err(AllocError::Denied) => break,
+            Err(_)                  => break,
+        }
+    }
+    let t1 = ctx.read_tsc();
+    let mean = if n_alloc > 0 { t1.wrapping_sub(t0) / n_alloc } else { 0 };
+    ctx.log_fmt(format_args!("perf: B8 n={n_alloc} mean={mean} cycles/alloc-4kib"));
+    ctx.log("perf: B8 done");
+    idle(ctx)
+}
+
+fn mode_perf_b9(ctx: &ServiceContext) -> ! {
+    // B9: 4 KiB message copy cost — send max-size messages to receiver (§22 Perf B9).
+    let mut msg = Message::from_bytes(&[]);
+    for b in msg.payload.iter_mut() { *b = 0xAB; }
+    msg.payload_len = 4096;
+
+    const N: u64 = 200;
+    let t0 = ctx.read_tsc();
+    for _ in 0..N {
+        let _ = ctx.send("perf-b9-recv", &msg);
+    }
+    let t1 = ctx.read_tsc();
+    let mean = t1.wrapping_sub(t0) / N;
+    ctx.log_fmt(format_args!("perf: B9 mean={mean} cycles/4kib-send"));
+    ctx.log("perf: B9 done");
+    idle(ctx)
+}
+
+fn mode_perf_b9_recv(ctx: &ServiceContext) -> ! {
+    // B9 receiver: drain all incoming messages so sender never permanently blocks.
+    loop { ctx.recv(); }
+}
+
+fn mode_perf_b10(ctx: &ServiceContext) -> ! {
+    // B10: scheduler pick-next cost — same as B3 but labelled separately for
+    // baseline tracking (§22 Perf B10).
+    const N: u64 = 1_000;
+    let t0 = ctx.read_tsc();
+    for _ in 0..N { ctx.yield_cpu(); }
+    let t1 = ctx.read_tsc();
+    let mean = t1.wrapping_sub(t0) / N;
+    ctx.log_fmt(format_args!("perf: B10 mean={mean} cycles/yield"));
+    ctx.log("perf: B10 done");
     idle(ctx)
 }

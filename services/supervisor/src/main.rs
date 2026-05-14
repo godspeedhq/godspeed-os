@@ -104,6 +104,24 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let _ = ctx.spawn("stress-s9-send-a"); // core 0 → core 2
     let _ = ctx.spawn("stress-s9-send-b"); // core 1 → core 2
 
+    // --- Performance-benchmark probes — Milestone 12 ---
+    // Spawn sender/controller probes BEFORE their echo/recv partners so the
+    // sender's endpoint is registered when the echo partner wires its SEND cap.
+    // perf-b5-victim must be registered before perf-b5 starts cycling.
+    let _ = ctx.spawn("perf-b1");         // B1 sender (core 0) — registers endpoint first
+    let _ = ctx.spawn("perf-b1-echo");    // B1 echo (core 0)   — wires SEND cap to perf-b1
+    let _ = ctx.spawn("perf-b2");         // B2 sender (core 0) — registers endpoint first
+    let _ = ctx.spawn("perf-b2-echo");    // B2 echo  (core 1)  — wires SEND cap to perf-b2
+    let _ = ctx.spawn("perf-b3");
+    let _ = ctx.spawn("perf-b4");
+    let _ = ctx.spawn("perf-b5-victim");  // spawned before perf-b5 so it exists to be killed
+    let _ = ctx.spawn("perf-b5");
+    let _ = ctx.spawn("perf-b7");
+    let _ = ctx.spawn("perf-b8");
+    let _ = ctx.spawn("perf-b9-recv");    // recv partner registered before sender is wired
+    let _ = ctx.spawn("perf-b9");
+    let _ = ctx.spawn("perf-b10");
+
     // --- Original ping/pong services ---
     // Spawn pong first so the kernel registers "pong" in its name table before
     // ping is spawned (ping needs a SEND cap to pong at spawn time — §5 in
