@@ -1,6 +1,6 @@
 # Milestone 12 — Performance Benchmarks
 
-**Status:** ✅ 10/10 implemented  
+**Status:** ✅ 10/10 implemented — all pass, baseline committed  
 **Spec ref:** §22 Performance Benchmarks  
 **Command:** `osdev test perf`
 
@@ -157,22 +157,21 @@ runs compare against baseline and flag regressions ≥ 10%.
 
 ## Baseline results
 
-Run `osdev test perf` to populate `tests/qemu/perf/baseline.json` with RDTSC values
-from the current QEMU environment. Commit the updated file to lock in the baseline for
-future regression detection.
+`tests/qemu/perf/baseline.json` is committed. Regression threshold: ≥ 10% change flags a failure.
+All values are QEMU TCG RDTSC cycle counts — not comparable across hosts or QEMU versions.
 
 | ID  | Metric           | Baseline (cycles) | Notes                        |
 |-----|------------------|-------------------|------------------------------|
-| B1  | p50 roundtrip    | TBD (run perf)    | same-core                    |
-| B1  | p99 roundtrip    | TBD               | same-core                    |
-| B2  | p50 roundtrip    | TBD               | cross-core; includes IPI     |
-| B2  | p99 roundtrip    | TBD               | cross-core                   |
-| B3  | mean yield       | TBD               | includes scheduler + tasks   |
-| B4  | mean cap check   | TBD               | ring-0 lookup + gen check    |
-| B5  | mean spawn       | TBD               | spawn syscall only           |
-| B6  | mean restart     | TBD               | kill+spawn syscalls          |
-| B7  | mean cap I/R     | TBD               | insert + remove cap slot     |
-| B8  | mean alloc       | TBD               | 4 KiB page allocation        |
-| B8  | n allocs         | TBD               | total before AllocDenied     |
-| B9  | mean send        | TBD               | 4 KiB copy + IPC enqueue     |
-| B10 | mean pick-next   | TBD               | yield round-trip             |
+| B1  | p50 roundtrip    | 51,330,536        | same-core                    |
+| B1  | p99 roundtrip    | 104,634,106       | same-core                    |
+| B2  | p50 roundtrip    | 28,077,512        | cross-core; includes IPI     |
+| B2  | p99 roundtrip    | 181,409,927       | cross-core                   |
+| B3  | mean yield       | 3,505,831         | includes scheduler + tasks   |
+| B4  | mean cap check   | 88,611            | ring-0 lookup + gen check    |
+| B5  | mean spawn       | 3,446,155         | spawn syscall only           |
+| B6  | mean restart     | 31,098,700        | kill+spawn syscalls          |
+| B7  | mean cap I/R     | 61,935            | insert + remove cap slot     |
+| B8  | mean alloc       | 57,919            | 4 KiB page allocation        |
+| B8  | n allocs         | 16,384            | total before AllocDenied     |
+| B9  | mean send        | 5,010,740         | 4 KiB copy + IPC enqueue     |
+| B10 | mean pick-next   | 6,269,961         | yield round-trip             |
