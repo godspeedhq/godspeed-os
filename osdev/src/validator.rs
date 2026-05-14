@@ -59,6 +59,21 @@ enum TestKind {
         ok:  &'static [&'static str],
         bad: &'static [&'static [u8]],
     },
+    /// Boot QEMU with a reduced SMP count (chaos C1). `smp` cores instead of 4.
+    DegradedSmp {
+        smp:          u32,
+        expect:       &'static [&'static str],
+        fail_on:      &'static [&'static str],
+        timeout_secs: u64,
+    },
+    /// Boot QEMU with both a reduced SMP count and reduced RAM (chaos C4).
+    DegradedEnv {
+        smp:          u32,
+        ram_mib:      u32,
+        expect:       &'static [&'static str],
+        fail_on:      &'static [&'static str],
+        timeout_secs: u64,
+    },
     /// Not implemented. Print reason; do not boot QEMU.
     Blocked {
         reason: &'static str,
@@ -529,6 +544,72 @@ static ADV_TESTS: &[TestSpec] = &[
     },
 ];
 
+// ---------------------------------------------------------------------------
+// Chaos test definitions (Milestone 14).
+// ---------------------------------------------------------------------------
+
+static CHAOS_TESTS: &[TestSpec] = &[
+    TestSpec {
+        id: "C1", name: "degraded_smp_boot", spec_ref: "§22 Chaos C1",
+        kind: TestKind::DegradedSmp {
+            smp:          2,
+            expect:       &["kernel: 2 cores ready", "supervisor: ready"],
+            fail_on:      &["KERNEL PANIC"],
+            timeout_secs: 30,
+        },
+    },
+    TestSpec {
+        id: "C2", name: "non_tcb_fault_system_continues", spec_ref: "§22 Chaos C2",
+        kind: TestKind::WatchSerial {
+            expect:       &["chaos: C2 pass"],
+            fail_on:      &["KERNEL PANIC"],
+            timeout_secs: 30,
+        },
+    },
+    TestSpec {
+        id: "C3", name: "alloc_pressure_no_panic", spec_ref: "§22 Chaos C3",
+        kind: TestKind::WatchSerial {
+            expect:       &["chaos: C3 pass"],
+            fail_on:      &["KERNEL PANIC", "chaos: C3 FAIL"],
+            timeout_secs: 30,
+        },
+    },
+    TestSpec {
+        id: "C4", name: "degraded_env_minimal_ram", spec_ref: "§22 Chaos C4",
+        kind: TestKind::DegradedEnv {
+            smp:          4,
+            ram_mib:      192,
+            expect:       &["kernel: 4 cores ready", "supervisor: ready"],
+            fail_on:      &["KERNEL PANIC"],
+            timeout_secs: 30,
+        },
+    },
+    TestSpec {
+        id: "C5", name: "kernel_stack_probe_recursive_syscalls", spec_ref: "§22 Chaos C5",
+        kind: TestKind::WatchSerial {
+            expect:       &["chaos: C5 pass"],
+            fail_on:      &["KERNEL PANIC", "chaos: C5 FAIL"],
+            timeout_secs: 30,
+        },
+    },
+    TestSpec {
+        id: "C6", name: "starved_core_others_unaffected", spec_ref: "§22 Chaos C6",
+        kind: TestKind::WatchSerial {
+            expect:       &["chaos: C6 pass"],
+            fail_on:      &["KERNEL PANIC", "chaos: C6 FAIL"],
+            timeout_secs: 30,
+        },
+    },
+    TestSpec {
+        id: "C7", name: "tlb_shootdown_under_load_no_corruption", spec_ref: "§22 Chaos C7",
+        kind: TestKind::WatchSerial {
+            expect:       &["chaos: C7 pass"],
+            fail_on:      &["KERNEL PANIC", "chaos: C7 FAIL"],
+            timeout_secs: 120,
+        },
+    },
+];
+
 static TESTS: &[TestSpec] = &[
     TestSpec {
         id: "1A", name: "bootstrap_steady_state_positive", spec_ref: "§22 Test 1A",
@@ -994,6 +1075,57 @@ pub fn run_adv_tests() {
     if failed > 0 { std::process::exit(1); }
 }
 
+/// Boot the OS in QEMU and run the Milestone 14 chaos test suite.
+///
+/// C1 and C4 use degraded QEMU environments (fewer cores, less RAM).
+/// C2–C3, C5–C7 use the standard 4-core 512M image.
+/// Pass criterion: each scenario logs its `chaos: CN pass` marker without a kernel panic.
+pub fn run_chaos_tests() {
+    println!("chaos: stopping any running QEMU instances...");
+    kill_existing_qemu();
+
+    println!("chaos: building...");
+    crate::cmd_build();
+
+    let kernel_elf = Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() {
+        eprintln!("chaos: kernel ELF not found at {}", kernel_elf.display());
+        std::process::exit(1);
+    }
+
+    let limine_dir = Path::new("tools/limine");
+    let image_path = crate::disk_image::create(kernel_elf, limine_dir);
+    crate::disk_image::install_bootloader(limine_dir, &image_path);
+
+    std::fs::create_dir_all("build/tests/7_CHAOS").expect("create build/tests/7_CHAOS/");
+
+    println!("\nchaos: running {} tests\n", CHAOS_TESTS.len());
+
+    let mut results: Vec<(&TestSpec, TestOutcome)> = Vec::new();
+
+    for test in CHAOS_TESTS {
+        print!("  [{:>2}]  {:45}  ({})  … ", test.id, test.name, test.spec_ref);
+        let _ = std::io::stdout().flush();
+
+        let outcome = run_chaos_one(test, &image_path);
+
+        match &outcome {
+            TestOutcome::Pass       => println!("PASS"),
+            TestOutcome::Fail(r)    => println!("FAIL\n         → {r}"),
+            TestOutcome::Blocked(r) => println!("BLOCKED\n         → {r}"),
+        }
+
+        results.push((test, outcome));
+    }
+
+    let passed = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Pass)).count();
+    let failed = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Fail(_))).count();
+
+    println!("\n  {passed} passed  {failed} failed");
+
+    if failed > 0 { std::process::exit(1); }
+}
+
 /// Boot the OS in QEMU and run the Milestone 12 performance benchmark suite.
 ///
 /// Pass criterion: each benchmark logs `perf: BN done` without panicking.
@@ -1134,6 +1266,11 @@ fn run_one(test: &TestSpec, image: &Path) -> TestOutcome {
             qemu.kill();
             result
         }
+
+        TestKind::DegradedSmp { .. } =>
+            TestOutcome::Blocked("DegradedSmp only runs via osdev test chaos"),
+        TestKind::DegradedEnv { .. } =>
+            TestOutcome::Blocked("DegradedEnv only runs via osdev test chaos"),
 
         TestKind::WatchSerial { expect, fail_on, timeout_secs } => {
             let serial = serial_path(test);
@@ -1353,6 +1490,39 @@ fn run_adv_one(test: &TestSpec, image: &Path) -> TestOutcome {
     }
 }
 
+fn run_chaos_one(test: &TestSpec, image: &Path) -> TestOutcome {
+    match &test.kind {
+        TestKind::WatchSerial { expect, fail_on, timeout_secs } => {
+            let serial = chaos_serial_path(test);
+            let _ = std::fs::write(&serial, b"");
+            let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
+            let result = poll_serial(&serial, expect, fail_on,
+                                     Instant::now() + Duration::from_secs(*timeout_secs));
+            qemu.kill();
+            result
+        }
+        TestKind::DegradedSmp { smp, expect, fail_on, timeout_secs } => {
+            let serial = chaos_serial_path(test);
+            let _ = std::fs::write(&serial, b"");
+            let qemu   = crate::qemu::spawn_for_test_custom(image, *smp, 512, &serial, None);
+            let result = poll_serial(&serial, expect, fail_on,
+                                     Instant::now() + Duration::from_secs(*timeout_secs));
+            qemu.kill();
+            result
+        }
+        TestKind::DegradedEnv { smp, ram_mib, expect, fail_on, timeout_secs } => {
+            let serial = chaos_serial_path(test);
+            let _ = std::fs::write(&serial, b"");
+            let qemu   = crate::qemu::spawn_for_test_custom(image, *smp, *ram_mib, &serial, None);
+            let result = poll_serial(&serial, expect, fail_on,
+                                     Instant::now() + Duration::from_secs(*timeout_secs));
+            qemu.kill();
+            result
+        }
+        _ => TestOutcome::Blocked("chaos tests use WatchSerial, DegradedSmp, or DegradedEnv"),
+    }
+}
+
 fn run_perf_one(test: &TestSpec, image: &Path) -> TestOutcome {
     match &test.kind {
         TestKind::WatchSerial { expect, fail_on, timeout_secs } => {
@@ -1390,6 +1560,10 @@ fn perf_serial_path(test: &TestSpec) -> PathBuf {
 
 fn adv_serial_path(test: &TestSpec) -> PathBuf {
     PathBuf::from(format!("build/tests/6_ADVERSARIAL/{}-{}.log", test.id, test.name))
+}
+
+fn chaos_serial_path(test: &TestSpec) -> PathBuf {
+    PathBuf::from(format!("build/tests/7_CHAOS/{}-{}.log", test.id, test.name))
 }
 
 // ---------------------------------------------------------------------------

@@ -147,6 +147,43 @@ pub fn spawn_for_test(
     QemuTestInstance { child, serial_path: serial_path.to_owned() }
 }
 
+/// Like `spawn_for_test` but with configurable SMP count and RAM size.
+/// Used by chaos tests that need degraded boot environments (C1, C4).
+pub fn spawn_for_test_custom(
+    image_path:   &Path,
+    smp:          u32,
+    ram_mib:      u32,
+    serial_path:  &Path,
+    control_port: Option<u16>,
+) -> QemuTestInstance {
+    let qemu       = qemu_binary();
+    let image_str  = image_path.to_string_lossy().replace('\\', "/");
+    let serial_str = format!("file:{}", serial_path.to_string_lossy().replace('\\', "/"));
+    let com2_str   = match control_port {
+        Some(p) => format!("tcp::{p},server,nowait"),
+        None    => "null".to_string(),
+    };
+
+    let child = std::process::Command::new(&qemu)
+        .args([
+            "-drive",   &format!("format=raw,file={image_str},if=ide"),
+            "-smp",     &smp.to_string(),
+            "-m",       &format!("{ram_mib}M"),
+            "-serial",  &serial_str,
+            "-serial",  &com2_str,
+            "-display", "none",
+            "-no-reboot",
+            "-no-shutdown",
+        ])
+        .spawn()
+        .unwrap_or_else(|e| {
+            eprintln!("chaos: failed to launch QEMU at {}: {}", qemu, e);
+            std::process::exit(1);
+        });
+
+    QemuTestInstance { child, serial_path: serial_path.to_owned() }
+}
+
 fn qemu_binary() -> String {
     if cfg!(windows) {
         let default = r"C:\Program Files\qemu\qemu-system-x86_64.exe";

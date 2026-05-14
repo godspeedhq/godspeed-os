@@ -104,6 +104,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let _ = ctx.spawn("stress-s9-send-a"); // core 0 → core 2
     let _ = ctx.spawn("stress-s9-send-b"); // core 1 → core 2
 
+    // --- Chaos-test probes — Milestone 14 ---
+    // c7-victim must be registered on core 2 before chaos-c7 is spawned on core 1
+    // so its endpoint exists when chaos-c7's SEND cap is wired at spawn time.
+    let _ = ctx.spawn("chaos-c2");
+    let _ = ctx.spawn("chaos-c2-monitor");
+    let _ = ctx.spawn("chaos-c3");
+    let _ = ctx.spawn("chaos-c5");
+    let _ = ctx.spawn("chaos-c6-hog");
+    let _ = ctx.spawn("chaos-c6-monitor");
+    let _ = ctx.spawn("chaos-c7-victim"); // passive recv target — spawned before controller
+    let _ = ctx.spawn("chaos-c7");
+
     // --- Adversarial-test probes — Milestone 13 ---
     // Passive/victim services must be spawned before their attackers so their
     // endpoints are registered when the attackers' SEND caps are wired.

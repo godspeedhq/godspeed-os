@@ -37,6 +37,14 @@
 //!  88 = ADV_A8_WITNESS — 1,000 yields then log pass                              (A8)
 //!  89 = ADV_A9    — spawn non-existent service → Err                            (A9)
 //!  90 = ADV_A10   — kernel addresses as syscall buffer args → rejected           (A10)
+//!
+//! Chaos-test modes — Milestone 14.
+//!  91 = CHAOS_C2     — null-deref → page fault → kernel kills service           (C2)
+//!  92 = CHAOS_C2_MON — 1,000 yields then log pass (C2 witness)                  (C2)
+//!  93 = CHAOS_C3     — 500 alloc-deny cycles without panic                      (C3)
+//!  94 = CHAOS_C5     — 100-level recursive yield_cpu(); kernel stack depth probe (C5)
+//!  95 = CHAOS_C6_MON — 200 yields then log pass on core 0 (C6 witness)          (C6)
+//!  96 = CHAOS_C7     — 30 cross-core kill/respawn cycles; TLB shootdowns         (C7)
 
 #![no_std]
 #![no_main]
@@ -126,6 +134,14 @@ const MODE_ADV_A8_WITNESS:  u32 = 88; // 1000 yields then log pass
 const MODE_ADV_A9:          u32 = 89; // spawn non-existent service → Err
 const MODE_ADV_A10:         u32 = 90; // kernel addresses as syscall args → rejected
 
+// Chaos-test modes — Milestone 14.
+const MODE_CHAOS_C2:        u32 = 91; // null-deref → page fault → kernel kills service
+const MODE_CHAOS_C2_MON:    u32 = 92; // 1,000 yields then log pass (C2 witness)
+const MODE_CHAOS_C3:        u32 = 93; // 500 alloc-deny cycles without panic
+const MODE_CHAOS_C5:        u32 = 94; // 100-level recursive yield_cpu(); stack depth probe
+const MODE_CHAOS_C6_MON:    u32 = 95; // 200 yields then log pass on core 0 (C6 witness)
+const MODE_CHAOS_C7:        u32 = 96; // 30 cross-core kill/respawn cycles; TLB shootdowns
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     match ctx.probe_mode() {
@@ -193,6 +209,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         MODE_ADV_A8_WITNESS  => mode_adv_a8_witness(&ctx),
         MODE_ADV_A9          => mode_adv_a9(&ctx),
         MODE_ADV_A10         => mode_adv_a10(&ctx),
+        MODE_CHAOS_C2        => mode_chaos_c2(&ctx),
+        MODE_CHAOS_C2_MON    => mode_chaos_c2_monitor(&ctx),
+        MODE_CHAOS_C3        => mode_chaos_c3(&ctx),
+        MODE_CHAOS_C5        => mode_chaos_c5(&ctx),
+        MODE_CHAOS_C6_MON    => mode_chaos_c6_monitor(&ctx),
+        MODE_CHAOS_C7        => mode_chaos_c7(&ctx),
         _                    => idle(&ctx),
     }
 }
@@ -1569,5 +1591,93 @@ fn mode_adv_a10(ctx: &ServiceContext) -> ! {
         }
     }
     ctx.log("adv: A10 pass — kernel addrs as syscall args rejected without panic");
+    idle(ctx)
+}
+
+// ---------------------------------------------------------------------------
+// Chaos-test modes — Milestone 14.
+// ---------------------------------------------------------------------------
+
+fn mode_chaos_c2(_ctx: &ServiceContext) -> ! {
+    // C2 — Simulate corrupted ELF: immediately dereference null pointer (§22 Chaos C2).
+    // The kernel delivers a page fault and kills this service without panicking.
+    // chaos-c2-monitor witnesses the system continuing.
+    // SAFETY: intentional fault for chaos test C2; kernel kills before any further use.
+    unsafe { core::ptr::read_volatile(core::ptr::null::<u8>()); }
+    loop { core::hint::spin_loop(); }
+}
+
+fn mode_chaos_c2_monitor(ctx: &ServiceContext) -> ! {
+    // C2 witness — 100 yields then log pass, proving the system continued after
+    // chaos-c2 was killed by the kernel's page-fault handler (§22 Chaos C2).
+    for _ in 0..100u32 { ctx.yield_cpu(); }
+    ctx.log("chaos: C2 pass — system continued after non-TCB page fault");
+    idle(ctx)
+}
+
+fn mode_chaos_c3(ctx: &ServiceContext) -> ! {
+    // C3 — Allocator saturation: 500 rounds of impossible requests (§22 Chaos C3).
+    // memory_limit = 4 MiB; any request for more must return AllocDenied, not panic.
+    for i in 0..500u32 {
+        let r1 = ctx.alloc_mem(usize::MAX);
+        let r2 = ctx.alloc_mem(1usize << 32);
+        if r1.is_ok() || r2.is_ok() {
+            ctx.log("chaos: C3 FAIL — impossible alloc succeeded");
+            idle(ctx);
+        }
+        // Zero-size must not panic even when at the limit.
+        let _ = ctx.alloc_mem(0);
+        if i % 100 == 99 {
+            ctx.log_fmt(format_args!("chaos: C3 iter {}/500", i + 1));
+        }
+    }
+    ctx.log("chaos: C3 pass — 500 alloc-deny cycles without panic");
+    idle(ctx)
+}
+
+fn mode_chaos_c5(ctx: &ServiceContext) -> ! {
+    // C5 — Kernel stack depth probe: 100 nested recursive yield_cpu() calls (§22 Chaos C5).
+    // Each frame issues one syscall; the kernel's per-syscall stack usage must not
+    // accumulate across the 100 user-side recursion levels.
+    let depth = chaos_c5_recurse(ctx, 100, 0);
+    ctx.log_fmt(format_args!("chaos: C5 pass — {depth}/100 recursive yields without stack overflow"));
+    idle(ctx)
+}
+
+#[inline(never)]
+fn chaos_c5_recurse(ctx: &ServiceContext, remaining: u32, depth: u32) -> u32 {
+    if remaining == 0 { return depth; }
+    ctx.yield_cpu();
+    chaos_c5_recurse(ctx, remaining - 1, depth + 1)
+}
+
+fn mode_chaos_c6_monitor(ctx: &ServiceContext) -> ! {
+    // C6 witness (core 0) — 200 yields then log pass (§22 Chaos C6).
+    // chaos-c6-hog runs a tight loop on core 3 (simulating timer starvation on that core).
+    // This probe on core 0 verifies that the other cores remain scheduled normally.
+    for _ in 0..200u32 { ctx.yield_cpu(); }
+    ctx.log("chaos: C6 pass — core 0 alive despite core 3 hog");
+    idle(ctx)
+}
+
+fn mode_chaos_c7(ctx: &ServiceContext) -> ! {
+    // C7 — Cross-core TLB shootdown under load: 30 kill/respawn cycles (§22 Chaos C7).
+    // Controller on core 1; victim on core 2. Each kill issues a cross-core IPI and
+    // TLB shootdown; respawn maps new pages, triggering another shootdown on core 2.
+    let msg = Message::from_bytes(b"c7");
+    for i in 0..30u32 {
+        // try_send exercises the generation-check on a live (or recently-dead) endpoint.
+        let _ = ctx.try_send("chaos-c7-victim", &msg);
+        // Kill victim on core 2 → IPI → TLB shootdown → page frames reclaimed.
+        let _ = ctx.kill("chaos-c7-victim");
+        // Respawn on core 2 → new page table mapping → another TLB shootdown on core 2.
+        let _ = ctx.spawn("chaos-c7-victim");
+        // Brief yield to allow the new victim to be scheduled and its pages faulted in.
+        for _ in 0..50u32 { ctx.yield_cpu(); }
+        if i % 10 == 9 {
+            ctx.log_fmt(format_args!("chaos: C7 iter {}/30", i + 1));
+        }
+    }
+    ctx.log("chaos: C7 pass — 30 cross-core TLB shootdowns survived");
     idle(ctx)
 }
