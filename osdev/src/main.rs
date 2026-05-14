@@ -12,6 +12,7 @@
 //!   osdev test identity     — run §22 identity test suite
 //!   osdev test property     — run §22 property test suite
 //!   osdev test fuzz         — run §22 fuzz test suite (Milestone 10)
+//!   osdev test stress       — run §22 stress test suite (Milestone 11)
 
 mod disk_image;
 mod qemu;
@@ -216,6 +217,7 @@ fn cmd_test(suite: &str) {
         "identity" => crate::validator::run_identity_tests(),
         "property" => crate::validator::run_property_tests(),
         "fuzz"     => crate::validator::run_fuzz_tests(),
+        "stress"   => crate::validator::run_stress_tests(),
         other => eprintln!("unknown test suite: {}", other),
     }
 }

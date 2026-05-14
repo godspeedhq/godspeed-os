@@ -268,6 +268,93 @@ static PROPERTY_TESTS: &[TestSpec] = &[
     },
 ];
 
+// ---------------------------------------------------------------------------
+// Stress test definitions (Milestone 11 Phase 1).
+// ---------------------------------------------------------------------------
+
+static STRESS_TESTS: &[TestSpec] = &[
+    TestSpec {
+        id: "S1", name: "ipc_saturation", spec_ref: "§22 Stress S1",
+        kind: TestKind::WatchSerial {
+            expect:       &["stress: S1 pass (10000/10000)"],
+            fail_on:      &["KERNEL PANIC", "stress: S1 FAIL"],
+            timeout_secs: 90,
+        },
+    },
+    TestSpec {
+        id: "S2", name: "restart_storm_kstack_pool", spec_ref: "§22 Stress S2",
+        kind: TestKind::WatchSerial {
+            expect:       &["stress: S2 pass (50/50)"],
+            fail_on:      &["KERNEL PANIC", "stress: S2 FAIL"],
+            timeout_secs: 120,
+        },
+    },
+    TestSpec {
+        id: "S3", name: "cross_core_ipc_thrash", spec_ref: "§22 Stress S3",
+        kind: TestKind::WatchSerial {
+            expect:       &["stress: S3 pass (500/500)"],
+            fail_on:      &["KERNEL PANIC", "stress: S3 FAIL"],
+            timeout_secs: 120,
+        },
+    },
+    TestSpec {
+        id: "S4", name: "cap_table_churn_monotonic_gen", spec_ref: "§22 Stress S4",
+        kind: TestKind::WatchSerial {
+            expect:       &["stress: S4 pass (50/50)"],
+            fail_on:      &["KERNEL PANIC", "stress: S4 FAIL"],
+            timeout_secs: 180,
+        },
+    },
+    TestSpec {
+        id: "S7", name: "memory_pressure_alloc_cycle", spec_ref: "§22 Stress S7",
+        kind: TestKind::WatchSerial {
+            expect:       &["stress: S7 pass (100/100)"],
+            fail_on:      &["KERNEL PANIC", "stress: S7 FAIL"],
+            timeout_secs: 60,
+        },
+    },
+    TestSpec {
+        id: "S10", name: "cascading_revocation_cross_core", spec_ref: "§22 Stress S10",
+        kind: TestKind::WatchSerial {
+            expect:       &["stress: S10 pass (3/3 caps dead)"],
+            fail_on:      &["KERNEL PANIC", "stress: S10 FAIL"],
+            timeout_secs: 30,
+        },
+    },
+    TestSpec {
+        id: "S5", name: "generation_monotonic_1000_cycles", spec_ref: "§22 Stress S5",
+        kind: TestKind::WatchSerial {
+            expect:       &["stress: S5 pass (1000/1000)"],
+            fail_on:      &["KERNEL PANIC", "stress: S5 FAIL"],
+            timeout_secs: 120,
+        },
+    },
+    TestSpec {
+        id: "S6", name: "ipc_self_ping_stability", spec_ref: "§22 Stress S6",
+        kind: TestKind::WatchSerial {
+            expect:       &["stress: S6 pass (5000/5000)"],
+            fail_on:      &["KERNEL PANIC", "stress: S6 FAIL"],
+            timeout_secs: 120,
+        },
+    },
+    TestSpec {
+        id: "S8", name: "idle_scheduler_heartbeat", spec_ref: "§22 Stress S8",
+        kind: TestKind::WatchSerial {
+            expect:       &["stress: S8 pass (600 yields)"],
+            fail_on:      &["KERNEL PANIC", "stress: S8 FAIL"],
+            timeout_secs: 60,
+        },
+    },
+    TestSpec {
+        id: "S9", name: "cross_core_ipi_storm", spec_ref: "§22 Stress S9",
+        kind: TestKind::WatchSerial {
+            expect:       &["stress: S9 pass (1000/1000)"],
+            fail_on:      &["KERNEL PANIC", "stress: S9 FAIL"],
+            timeout_secs: 120,
+        },
+    },
+];
+
 static TESTS: &[TestSpec] = &[
     TestSpec {
         id: "1A", name: "bootstrap_steady_state_positive", spec_ref: "§22 Test 1A",
@@ -635,6 +722,54 @@ pub fn run_fuzz_tests() {
     if failed > 0 { std::process::exit(1); }
 }
 
+/// Boot the OS in QEMU and assert the Milestone 11 stress test suite.
+pub fn run_stress_tests() {
+    println!("stress: stopping any running QEMU instances...");
+    kill_existing_qemu();
+
+    println!("stress: building...");
+    crate::cmd_build();
+
+    let kernel_elf = Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() {
+        eprintln!("stress: kernel ELF not found at {}", kernel_elf.display());
+        std::process::exit(1);
+    }
+
+    let limine_dir = Path::new("tools/limine");
+    let image_path = crate::disk_image::create(kernel_elf, limine_dir);
+    crate::disk_image::install_bootloader(limine_dir, &image_path);
+
+    std::fs::create_dir_all("build/tests/4_STRESS").expect("create build/tests/4_STRESS/");
+
+    println!("\nstress: running {} tests\n", STRESS_TESTS.len());
+
+    let mut results: Vec<(&TestSpec, TestOutcome)> = Vec::new();
+
+    for test in STRESS_TESTS {
+        print!("  [{:>3}]  {:45}  ({})  … ", test.id, test.name, test.spec_ref);
+        let _ = std::io::stdout().flush();
+
+        let outcome = run_stress_one(test, &image_path);
+
+        match &outcome {
+            TestOutcome::Pass       => println!("PASS"),
+            TestOutcome::Fail(r)    => println!("FAIL\n         → {r}"),
+            TestOutcome::Blocked(r) => println!("BLOCKED\n         → {r}"),
+        }
+
+        results.push((test, outcome));
+    }
+
+    let passed  = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Pass)).count();
+    let failed  = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Fail(_))).count();
+    let blocked = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Blocked(_))).count();
+
+    println!("\n  {passed} passed  {failed} failed  {blocked} blocked");
+
+    if failed > 0 { std::process::exit(1); }
+}
+
 // ---------------------------------------------------------------------------
 // Per-test runner.
 // ---------------------------------------------------------------------------
@@ -863,6 +998,22 @@ fn run_fuzz_one(test: &TestSpec, image: &Path) -> TestOutcome {
     }
 }
 
+fn run_stress_one(test: &TestSpec, image: &Path) -> TestOutcome {
+    match &test.kind {
+        TestKind::Blocked { reason } => TestOutcome::Blocked(reason),
+        TestKind::WatchSerial { expect, fail_on, timeout_secs } => {
+            let serial = stress_serial_path(test);
+            let _ = std::fs::write(&serial, b"");
+            let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
+            let result = poll_serial(&serial, expect, fail_on,
+                                     Instant::now() + Duration::from_secs(*timeout_secs));
+            qemu.kill();
+            result
+        }
+        _ => TestOutcome::Blocked("stress tests only use WatchSerial or Blocked"),
+    }
+}
+
 fn serial_path(test: &TestSpec) -> PathBuf {
     PathBuf::from(format!("build/tests/1_IDENTITY/{}-{}.log", test.id, test.name))
 }
@@ -873,6 +1024,10 @@ fn property_serial_path(test: &TestSpec) -> PathBuf {
 
 fn fuzz_serial_path(test: &TestSpec) -> PathBuf {
     PathBuf::from(format!("build/tests/3_FUZZ/{}-{}.log", test.id, test.name))
+}
+
+fn stress_serial_path(test: &TestSpec) -> PathBuf {
+    PathBuf::from(format!("build/tests/4_STRESS/{}-{}.log", test.id, test.name))
 }
 
 // ---------------------------------------------------------------------------

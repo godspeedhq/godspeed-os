@@ -79,6 +79,31 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let _ = ctx.spawn("fuzz-f7");
     let _ = ctx.spawn("fuzz-f8");
 
+    // --- Stress-test probes — Milestone 11 Phase 1 ---
+    // Recv-endpoint victims must be spawned before their controllers so their
+    // endpoints are registered before the controllers' SEND caps are wired.
+    let _ = ctx.spawn("stress-s1-recv");
+    let _ = ctx.spawn("stress-s1");
+    let _ = ctx.spawn("stress-s2-victim");
+    let _ = ctx.spawn("stress-s2");
+    let _ = ctx.spawn("stress-s3-recv");   // core 1 — cross-core thrash receiver
+    let _ = ctx.spawn("stress-s3-send");   // core 0 — cross-core thrash sender
+    let _ = ctx.spawn("stress-s4-victim");
+    let _ = ctx.spawn("stress-s4");
+    let _ = ctx.spawn("stress-s7");
+    let _ = ctx.spawn("stress-s10-victim"); // core 1 — cascading revocation target
+    let _ = ctx.spawn("stress-s10");        // core 0 — kills victim cross-core
+    // Stress Phase 2 — S5, S6, S8, S9.
+    // s5-victim must register before s5 starts cycling.
+    // s9-recv must register before s9-send-a/b are wired with SEND caps.
+    let _ = ctx.spawn("stress-s5-victim");
+    let _ = ctx.spawn("stress-s5");
+    let _ = ctx.spawn("stress-s6");        // self-referential; endpoint registered at spawn time
+    let _ = ctx.spawn("stress-s8");
+    let _ = ctx.spawn("stress-s9-recv");   // core 2 — concurrent IPI storm receiver
+    let _ = ctx.spawn("stress-s9-send-a"); // core 0 → core 2
+    let _ = ctx.spawn("stress-s9-send-b"); // core 1 → core 2
+
     // --- Original ping/pong services ---
     // Spawn pong first so the kernel registers "pong" in its name table before
     // ping is spawned (ping needs a SEND cap to pong at spawn time — §5 in
