@@ -442,6 +442,93 @@ static PERF_TESTS: &[TestSpec] = &[
     },
 ];
 
+// ---------------------------------------------------------------------------
+// Adversarial test definitions (Milestone 13).
+// ---------------------------------------------------------------------------
+
+static ADV_TESTS: &[TestSpec] = &[
+    TestSpec {
+        id: "A1", name: "random_cap_slots_no_panic", spec_ref: "§22 Adversarial A1",
+        kind: TestKind::WatchSerial {
+            expect:       &["adv: A1 pass (10000/10000)"],
+            fail_on:      &["KERNEL PANIC", "adv: A1 FAIL"],
+            timeout_secs: 60,
+        },
+    },
+    TestSpec {
+        id: "A2", name: "endpoint_id_brute_force_no_panic", spec_ref: "§22 Adversarial A2",
+        kind: TestKind::WatchSerial {
+            expect:       &["adv: A2 pass"],
+            fail_on:      &["KERNEL PANIC", "adv: A2 FAIL"],
+            timeout_secs: 30,
+        },
+    },
+    TestSpec {
+        id: "A3", name: "alloc_beyond_limit_no_panic", spec_ref: "§22 Adversarial A3",
+        kind: TestKind::WatchSerial {
+            expect:       &["adv: A3 pass"],
+            fail_on:      &["KERNEL PANIC", "adv: A3 FAIL"],
+            timeout_secs: 30,
+        },
+    },
+    TestSpec {
+        id: "A4", name: "recv_cap_as_send_cap_insufficient_rights", spec_ref: "§22 Adversarial A4",
+        kind: TestKind::WatchSerial {
+            expect:       &["adv: A4 pass"],
+            fail_on:      &["KERNEL PANIC", "adv: A4 FAIL"],
+            timeout_secs: 30,
+        },
+    },
+    TestSpec {
+        id: "A5", name: "toctou_kill_then_send_endpoint_dead", spec_ref: "§22 Adversarial A5",
+        kind: TestKind::WatchSerial {
+            expect:       &["adv: A5 pass"],
+            fail_on:      &["KERNEL PANIC", "adv: A5 FAIL"],
+            timeout_secs: 30,
+        },
+    },
+    TestSpec {
+        id: "A6", name: "cap_table_fill_no_panic", spec_ref: "§22 Adversarial A6",
+        kind: TestKind::WatchSerial {
+            expect:       &["adv: A6 pass"],
+            fail_on:      &["KERNEL PANIC", "adv: A6 FAIL"],
+            timeout_secs: 30,
+        },
+    },
+    TestSpec {
+        id: "A7", name: "ipc_timing_no_panic", spec_ref: "§22 Adversarial A7",
+        kind: TestKind::WatchSerial {
+            expect:       &["adv: A7 pass"],
+            fail_on:      &["KERNEL PANIC", "adv: A7 FAIL"],
+            timeout_secs: 30,
+        },
+    },
+    TestSpec {
+        id: "A8", name: "preemption_prevents_monopoly", spec_ref: "§22 Adversarial A8",
+        kind: TestKind::WatchSerial {
+            expect:       &["adv: A8 pass"],
+            fail_on:      &["KERNEL PANIC", "adv: A8 FAIL"],
+            timeout_secs: 60,
+        },
+    },
+    TestSpec {
+        id: "A9", name: "direct_spawn_bypasses_supervisor", spec_ref: "§22 Adversarial A9",
+        kind: TestKind::WatchSerial {
+            expect:       &["adv: A9 pass"],
+            fail_on:      &["KERNEL PANIC", "adv: A9 FAIL"],
+            timeout_secs: 30,
+        },
+    },
+    TestSpec {
+        id: "A10", name: "kernel_addr_as_syscall_arg_no_panic", spec_ref: "§22 Adversarial A10",
+        kind: TestKind::WatchSerial {
+            expect:       &["adv: A10 pass"],
+            fail_on:      &["KERNEL PANIC", "adv: A10 FAIL"],
+            timeout_secs: 30,
+        },
+    },
+];
+
 static TESTS: &[TestSpec] = &[
     TestSpec {
         id: "1A", name: "bootstrap_steady_state_positive", spec_ref: "§22 Test 1A",
@@ -857,6 +944,56 @@ pub fn run_stress_tests() {
     if failed > 0 { std::process::exit(1); }
 }
 
+/// Boot the OS in QEMU and run the Milestone 13 adversarial / red-team test suite.
+///
+/// Pass criterion: each attack logs `adv: AN pass` without a kernel panic.
+pub fn run_adv_tests() {
+    println!("adv: stopping any running QEMU instances...");
+    kill_existing_qemu();
+
+    println!("adv: building...");
+    crate::cmd_build();
+
+    let kernel_elf = Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() {
+        eprintln!("adv: kernel ELF not found at {}", kernel_elf.display());
+        std::process::exit(1);
+    }
+
+    let limine_dir = Path::new("tools/limine");
+    let image_path = crate::disk_image::create(kernel_elf, limine_dir);
+    crate::disk_image::install_bootloader(limine_dir, &image_path);
+
+    std::fs::create_dir_all("build/tests/6_ADVERSARIAL")
+        .expect("create build/tests/6_ADVERSARIAL/");
+
+    println!("\nadv: running {} attacks\n", ADV_TESTS.len());
+
+    let mut results: Vec<(&TestSpec, TestOutcome)> = Vec::new();
+
+    for test in ADV_TESTS {
+        print!("  [{:>3}]  {:45}  ({})  … ", test.id, test.name, test.spec_ref);
+        let _ = std::io::stdout().flush();
+
+        let outcome = run_adv_one(test, &image_path);
+
+        match &outcome {
+            TestOutcome::Pass       => println!("PASS"),
+            TestOutcome::Fail(r)    => println!("FAIL\n         → {r}"),
+            TestOutcome::Blocked(r) => println!("BLOCKED\n         → {r}"),
+        }
+
+        results.push((test, outcome));
+    }
+
+    let passed = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Pass)).count();
+    let failed = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Fail(_))).count();
+
+    println!("\n  {passed} passed  {failed} failed");
+
+    if failed > 0 { std::process::exit(1); }
+}
+
 /// Boot the OS in QEMU and run the Milestone 12 performance benchmark suite.
 ///
 /// Pass criterion: each benchmark logs `perf: BN done` without panicking.
@@ -1201,6 +1338,21 @@ fn run_stress_one(test: &TestSpec, image: &Path) -> TestOutcome {
     }
 }
 
+fn run_adv_one(test: &TestSpec, image: &Path) -> TestOutcome {
+    match &test.kind {
+        TestKind::WatchSerial { expect, fail_on, timeout_secs } => {
+            let serial = adv_serial_path(test);
+            let _ = std::fs::write(&serial, b"");
+            let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
+            let result = poll_serial(&serial, expect, fail_on,
+                                     Instant::now() + Duration::from_secs(*timeout_secs));
+            qemu.kill();
+            result
+        }
+        _ => TestOutcome::Blocked("adv tests only use WatchSerial"),
+    }
+}
+
 fn run_perf_one(test: &TestSpec, image: &Path) -> TestOutcome {
     match &test.kind {
         TestKind::WatchSerial { expect, fail_on, timeout_secs } => {
@@ -1234,6 +1386,10 @@ fn stress_serial_path(test: &TestSpec) -> PathBuf {
 
 fn perf_serial_path(test: &TestSpec) -> PathBuf {
     PathBuf::from(format!("build/tests/5_PERFORMANCE/{}-{}.log", test.id, test.name))
+}
+
+fn adv_serial_path(test: &TestSpec) -> PathBuf {
+    PathBuf::from(format!("build/tests/6_ADVERSARIAL/{}-{}.log", test.id, test.name))
 }
 
 // ---------------------------------------------------------------------------

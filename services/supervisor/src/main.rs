@@ -104,6 +104,23 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let _ = ctx.spawn("stress-s9-send-a"); // core 0 → core 2
     let _ = ctx.spawn("stress-s9-send-b"); // core 1 → core 2
 
+    // --- Adversarial-test probes — Milestone 13 ---
+    // Passive/victim services must be spawned before their attackers so their
+    // endpoints are registered when the attackers' SEND caps are wired.
+    let _ = ctx.spawn("adv-a1");
+    let _ = ctx.spawn("adv-a2");
+    let _ = ctx.spawn("adv-a3");
+    let _ = ctx.spawn("adv-a4");
+    let _ = ctx.spawn("adv-a5-victim"); // passive — killed by adv-a5
+    let _ = ctx.spawn("adv-a5");
+    let _ = ctx.spawn("adv-a6");
+    let _ = ctx.spawn("adv-a7-recv");   // passive — recv target before sender wired
+    let _ = ctx.spawn("adv-a7");
+    let _ = ctx.spawn("adv-a8");
+    let _ = ctx.spawn("adv-a8-witness");
+    let _ = ctx.spawn("adv-a9");
+    let _ = ctx.spawn("adv-a10");
+
     // --- Performance-benchmark probes — Milestone 12 ---
     // Spawn sender/controller probes BEFORE their echo/recv partners so the
     // sender's endpoint is registered when the echo partner wires its SEND cap.

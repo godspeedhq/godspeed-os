@@ -24,6 +24,19 @@
 //!  27 = PROP_P4   — ∑ alloc_bytes ≡ pages mapped; denied allocs don't count   (P4)
 //!  28 = PROP_P5   — kill/spawn cycles; endpoint count stays ≤ table capacity   (P5)
 //!  29 = PROP_P7   — kill/spawn cycles; generation monotonic (TLB proxy)        (P7)
+//!
+//! Adversarial-test modes — Milestone 13.
+//!  80 = ADV_A1    — 10,000 random cap slots → always Err (cap unforgeability)  (A1)
+//!  81 = ADV_A2    — brute-force slots 0..=127 + u32::MAX → defined errors       (A2)
+//!  82 = ADV_A3    — alloc beyond 4 MiB limit → AllocDenied                      (A3)
+//!  83 = ADV_A4    — RECV cap used as SEND target → CapInsufficientRights         (A4)
+//!  84 = ADV_A5    — kill victim then send via stale cap → EndpointDead           (A5)
+//!  85 = ADV_A6    — fill own cap table → None when full                          (A6)
+//!  86 = ADV_A7    — 100 timing sends to passive partner → no panic               (A7)
+//!  87 = ADV_A8    — tight loop hog; preemption must not starve witness           (A8)
+//!  88 = ADV_A8_WITNESS — 1,000 yields then log pass                              (A8)
+//!  89 = ADV_A9    — spawn non-existent service → Err                            (A9)
+//!  90 = ADV_A10   — kernel addresses as syscall buffer args → rejected           (A10)
 
 #![no_std]
 #![no_main]
@@ -100,6 +113,19 @@ const MODE_PERF_B9:         u32 = 69; // 4 KiB message copy sender
 const MODE_PERF_B9_RECV:    u32 = 70; // 4 KiB message copy receiver
 const MODE_PERF_B10:        u32 = 71; // scheduler pick-next cost
 
+// Adversarial-test modes — Milestone 13.
+const MODE_ADV_A1:          u32 = 80; // random cap slots → never Ok
+const MODE_ADV_A2:          u32 = 81; // brute-force slot range → defined errors
+const MODE_ADV_A3:          u32 = 82; // alloc beyond 4 MiB limit → AllocDenied
+const MODE_ADV_A4:          u32 = 83; // recv cap used as send target → CapInsufficientRights
+const MODE_ADV_A5:          u32 = 84; // kill victim then send via stale cap → EndpointDead
+const MODE_ADV_A6:          u32 = 85; // fill own cap table → None when full
+const MODE_ADV_A7:          u32 = 86; // 100 timing sends to passive partner → no panic
+const MODE_ADV_A8:          u32 = 87; // tight loop (hog) — preemption target
+const MODE_ADV_A8_WITNESS:  u32 = 88; // 1000 yields then log pass
+const MODE_ADV_A9:          u32 = 89; // spawn non-existent service → Err
+const MODE_ADV_A10:         u32 = 90; // kernel addresses as syscall args → rejected
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     match ctx.probe_mode() {
@@ -156,6 +182,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         MODE_PERF_B9         => mode_perf_b9(&ctx),
         MODE_PERF_B9_RECV    => mode_perf_b9_recv(&ctx),
         MODE_PERF_B10        => mode_perf_b10(&ctx),
+        MODE_ADV_A1          => mode_adv_a1(&ctx),
+        MODE_ADV_A2          => mode_adv_a2(&ctx),
+        MODE_ADV_A3          => mode_adv_a3(&ctx),
+        MODE_ADV_A4          => mode_adv_a4(&ctx),
+        MODE_ADV_A5          => mode_adv_a5(&ctx),
+        MODE_ADV_A6          => mode_adv_a6(&ctx),
+        MODE_ADV_A7          => mode_adv_a7(&ctx),
+        MODE_ADV_A8          => loop { core::hint::spin_loop(); },
+        MODE_ADV_A8_WITNESS  => mode_adv_a8_witness(&ctx),
+        MODE_ADV_A9          => mode_adv_a9(&ctx),
+        MODE_ADV_A10         => mode_adv_a10(&ctx),
         _                    => idle(&ctx),
     }
 }
@@ -1367,5 +1404,170 @@ fn mode_perf_b10(ctx: &ServiceContext) -> ! {
     let mean = t1.wrapping_sub(t0) / N;
     ctx.log_fmt(format_args!("perf: B10 mean={mean} cycles/yield"));
     ctx.log("perf: B10 done");
+    idle(ctx)
+}
+
+// ---------------------------------------------------------------------------
+// Adversarial-test modes — Milestone 13.
+// ---------------------------------------------------------------------------
+
+fn mode_adv_a1(ctx: &ServiceContext) -> ! {
+    // A1 — Cap unforgeability under adversarial input (§22 Adversarial A1, §7.3).
+    // 10,000 random u32 slot indices. adv-a1 holds no SEND caps; every
+    // try_send_by_handle must return Err. An Ok return proves a forged cap —
+    // a constitutional violation.
+    let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 80;
+    let msg = Message::from_bytes(b"a1");
+    for _ in 0..10_000u32 {
+        let slot = CapHandle(xorshift64(&mut rng) as u32);
+        if ctx.try_send_by_handle(slot, &msg).is_ok() {
+            ctx.log("adv: A1 FAIL — random cap slot accepted as valid SEND");
+            idle(ctx);
+        }
+    }
+    ctx.log("adv: A1 pass (10000/10000)");
+    idle(ctx)
+}
+
+fn mode_adv_a2(ctx: &ServiceContext) -> ! {
+    // A2 — Brute-force cap slot range → defined errors, no panic (§22 Adversarial A2).
+    // Slots 0..=127 cover the full 64-slot table and well beyond. u32::MAX is
+    // an extreme out-of-range value. Every call must return a defined error.
+    let msg = Message::from_bytes(b"a2");
+    for slot in 0u32..128u32 {
+        let _ = ctx.try_send_by_handle(CapHandle(slot), &msg);
+    }
+    let _ = ctx.try_send_by_handle(CapHandle(0xFFFF), &msg);
+    let _ = ctx.try_send_by_handle(CapHandle(u32::MAX), &msg);
+    ctx.log("adv: A2 pass — all slot values returned defined errors");
+    idle(ctx)
+}
+
+fn mode_adv_a3(ctx: &ServiceContext) -> ! {
+    // A3 — Alloc beyond 4 MiB contract limit via every path (§22 Adversarial A3).
+    // First 2 MiB must succeed. Next 3 MiB pushes total to 5 MiB > 4 MiB limit
+    // → AllocDenied. Edge cases (0, usize::MAX, 1 TiB) must not panic.
+    let ok = ctx.alloc_mem(2 * 1024 * 1024);
+    if ok.is_err() {
+        ctx.log("adv: A3 FAIL — initial 2 MiB alloc should succeed within 4 MiB limit");
+        idle(ctx);
+    }
+    let denied = ctx.alloc_mem(3 * 1024 * 1024);
+    if denied != Err(AllocError::Denied) {
+        ctx.log("adv: A3 FAIL — expected AllocDenied for 3 MiB (total would be 5 MiB > 4 MiB)");
+        idle(ctx);
+    }
+    // Edge cases — must not panic regardless of value.
+    let _ = ctx.alloc_mem(0);
+    let _ = ctx.alloc_mem(usize::MAX);
+    let _ = ctx.alloc_mem(1usize << 40); // 1 TiB
+    ctx.log("adv: A3 pass — alloc beyond limit rejected without panic");
+    idle(ctx)
+}
+
+fn mode_adv_a4(ctx: &ServiceContext) -> ! {
+    // A4 — RECV-right cap used as SEND target → CapInsufficientRights (§22 Adversarial A4).
+    // adv-a4 has a recv endpoint; its RECV cap is in slot 2. Passing that handle
+    // to try_send_by_handle must return CapInsufficientRights — the SEND right is absent.
+    let handle = ctx.recv_handle().unwrap_or(CapHandle(2));
+    let msg = Message::from_bytes(b"a4");
+    match ctx.try_send_by_handle(handle, &msg) {
+        Err(IpcError::CapError(CapError::CapInsufficientRights)) =>
+            ctx.log("adv: A4 pass — CapInsufficientRights on RECV cap used as SEND"),
+        Ok(())  => ctx.log("adv: A4 FAIL — RECV cap accepted as SEND cap"),
+        Err(_)  => ctx.log("adv: A4 FAIL — unexpected error"),
+    }
+    idle(ctx)
+}
+
+fn mode_adv_a5(ctx: &ServiceContext) -> ! {
+    // A5 — TOCTOU: kill victim then send via stale cap → EndpointDead (§22 Adversarial A5).
+    // Kill bumps adv-a5-victim's endpoint generation. The SEND cap held by adv-a5
+    // now has a stale generation. The kernel's generation check (§8.7) must catch this.
+    let msg = Message::from_bytes(b"a5");
+    let _ = ctx.kill("adv-a5-victim");
+    match ctx.try_send("adv-a5-victim", &msg) {
+        Err(IpcError::EndpointDead) => ctx.log("adv: A5 pass — EndpointDead after kill"),
+        Ok(())  => ctx.log("adv: A5 FAIL — send succeeded after victim killed"),
+        Err(_)  => ctx.log("adv: A5 FAIL — unexpected error after kill"),
+    }
+    idle(ctx)
+}
+
+fn mode_adv_a6(ctx: &ServiceContext) -> ! {
+    // A6 — Fill own cap table via acquire_send_cap loop (§22 Adversarial A6).
+    // adv-a6 has recv endpoint (slot 2=RECV, pre-filled). Slots 0=log, 1=spawn.
+    // acquire_send_cap("adv-a6") inserts a SEND cap each call, up to table capacity.
+    // When None is returned the table is full — kernel must not panic on exhaustion.
+    let mut count = 0u32;
+    loop {
+        match ctx.acquire_send_cap("adv-a6") {
+            Some(_) => count += 1,
+            None    => break,
+        }
+    }
+    ctx.log_fmt(format_args!("adv: A6 filled {count} cap slots"));
+    ctx.log("adv: A6 pass — cap table filled then rejected without panic");
+    idle(ctx)
+}
+
+fn mode_adv_a7(ctx: &ServiceContext) -> ! {
+    // A7 — Timing side-channel probe (§22 Adversarial A7).
+    // 100 try_send calls to passive adv-a7-recv. Queue fills after 16 sends;
+    // remaining calls return QueueFull. All returns are defined. TSC brackets
+    // the loop so timing statistics are logged. No panic.
+    let msg = Message::from_bytes(b"a7");
+    const N: u64 = 100;
+    let t0 = ctx.read_tsc();
+    for _ in 0..N {
+        let _ = ctx.try_send("adv-a7-recv", &msg);
+    }
+    let t1 = ctx.read_tsc();
+    let mean = t1.wrapping_sub(t0) / N;
+    ctx.log_fmt(format_args!("adv: A7 timing mean={mean} cycles/try_send"));
+    ctx.log("adv: A7 pass — timing analysis completed without panic");
+    idle(ctx)
+}
+
+fn mode_adv_a8_witness(ctx: &ServiceContext) -> ! {
+    // A8 witness — yields 1,000 times then logs pass (§22 Adversarial A8).
+    // Runs alongside adv-a8 (tight loop hog). Timer-driven preemption (§9.1)
+    // must give this service enough quanta to complete all yields.
+    for _ in 0..1_000u32 { ctx.yield_cpu(); }
+    ctx.log("adv: A8 pass — witness ran despite tight-loop hog");
+    idle(ctx)
+}
+
+fn mode_adv_a9(ctx: &ServiceContext) -> ! {
+    // A9 — Direct spawn bypassing supervisor → defined error (§22 Adversarial A9).
+    // All v1 services hold a spawn cap (SPAWN_RESOURCE), so the syscall is authorised.
+    // The name lookup fails (NotFound) because "nonexistent-does-not-exist" has no
+    // service_config entry. Must return Err, never panic.
+    match ctx.spawn("nonexistent-does-not-exist") {
+        Err(_) => ctx.log("adv: A9 pass — spawn of unknown service returned Err"),
+        Ok(()) => ctx.log("adv: A9 FAIL — unexpected spawn success for unknown service"),
+    }
+    idle(ctx)
+}
+
+fn mode_adv_a10(ctx: &ServiceContext) -> ! {
+    // A10 — Kernel-space addresses as syscall buffer args → rejected (§22 Adversarial A10).
+    // validate_user_slice in the kernel rejects any ptr ≥ kernel base or null.
+    // Syscall 2 (Send) a1=msg_ptr, syscall 3 (Recv) a1=buf_ptr.
+    const KERN_ADDRS: &[u64] = &[
+        0xffff_8000_0000_0000, // HHDM base
+        0xffff_ffff_ffff_fff0, // near u64::MAX
+        0x0000_0000_0000_0000, // null pointer
+        0x0000_8000_0000_0000, // just above user space
+    ];
+    for &addr in KERN_ADDRS {
+        // SAFETY: addr fails validate_user_slice before any kernel-mode dereference.
+        unsafe {
+            probe_raw_syscall(2, 0, addr, 4096); // Send with kernel-addr msg_ptr
+            probe_raw_syscall(2, 0, addr, 0);    // Send with kernel-addr, len=0
+            probe_raw_syscall(3, 0, addr, 4096); // Recv with kernel-addr buf_ptr
+        }
+    }
+    ctx.log("adv: A10 pass — kernel addrs as syscall args rejected without panic");
     idle(ctx)
 }

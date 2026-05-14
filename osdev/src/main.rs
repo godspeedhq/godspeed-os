@@ -14,6 +14,7 @@
 //!   osdev test fuzz         — run §22 fuzz test suite (Milestone 10)
 //!   osdev test stress       — run §22 stress test suite (Milestone 11)
 //!   osdev test perf         — run §22 performance benchmark suite (Milestone 12)
+//!   osdev test adv          — run §22 adversarial / red-team test suite (Milestone 13)
 
 mod disk_image;
 mod qemu;
@@ -220,6 +221,7 @@ fn cmd_test(suite: &str) {
         "fuzz"     => crate::validator::run_fuzz_tests(),
         "stress"   => crate::validator::run_stress_tests(),
         "perf"     => crate::validator::run_perf_tests(),
+        "adv"      => crate::validator::run_adv_tests(),
         other => eprintln!("unknown test suite: {}", other),
     }
 }
