@@ -30,6 +30,9 @@ pub enum SyscallNumber {
     AcquireSendCap = 10,
     SendWithCap    = 11,
     TakePendingCap = 12,
+    InspectKernel  = 13,
+    QueryCapRights = 14,
+    RemoveCap      = 15,
 }
 
 /// Validate that `[ptr, ptr+len)` lies entirely within user-space.
@@ -74,9 +77,12 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::Spawn          as u64 => handle_spawn(arg0, arg1, arg2),
         n if n == SyscallNumber::Kill           as u64 => handle_kill(arg0, arg1),
         n if n == SyscallNumber::Abort          as u64 => handle_abort(arg0, arg1),
-        n if n == SyscallNumber::AcquireSendCap as u64 => handle_acquire_send_cap(arg0, arg1),
+        n if n == SyscallNumber::AcquireSendCap as u64 => handle_acquire_send_cap(arg0, arg1, arg2),
         n if n == SyscallNumber::SendWithCap    as u64 => handle_send_with_cap(arg0, arg1, arg2),
         n if n == SyscallNumber::TakePendingCap as u64 => handle_take_pending_cap(),
+        n if n == SyscallNumber::InspectKernel  as u64 => handle_inspect_kernel(arg0, arg1, arg2),
+        n if n == SyscallNumber::QueryCapRights as u64 => handle_query_cap_rights(arg0),
+        n if n == SyscallNumber::RemoveCap      as u64 => handle_remove_cap(arg0),
         _ => -1, // Unknown syscall.
     }
 }
@@ -321,13 +327,14 @@ unsafe fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
     if crate::task::kill_by_name(name) { 0 } else { -1 }
 }
 
-/// arg0 = name_ptr, arg1 = name_len.
+/// arg0 = name_ptr, arg1 = name_len, arg2 = include_grant (0 = SEND only, 1 = SEND|GRANT).
 ///
-/// Looks up `name` in the kernel name registry, mints a SEND cap to that
-/// endpoint in the calling task's cap table, and returns the slot index.
+/// Looks up `name` in the kernel name registry, mints a SEND (or SEND|GRANT)
+/// cap to that endpoint in the calling task's cap table, and returns the slot.
 ///
-/// Used by services to reacquire a fresh SEND cap after `EndpointDead` (§14.2).
-unsafe fn handle_acquire_send_cap(name_ptr: u64, name_len: u64) -> i64 {
+/// Used by services to reacquire a fresh SEND cap after `EndpointDead` (§14.2)
+/// and by property-test probes that need to transfer caps (P3 — arg2=1).
+unsafe fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> i64 {
     let len = name_len as usize;
     if len == 0 || len > 64 { return -1; }
     if !validate_user_slice(name_ptr, len) { return -1; }
@@ -344,9 +351,14 @@ unsafe fn handle_acquire_send_cap(name_ptr: u64, name_len: u64) -> i64 {
     };
 
     let resource_id = crate::capability::cap::ResourceId::from(ep_id);
-    let send_cap    = crate::capability::mint_cap(resource_id, crate::capability::Rights::SEND);
+    let rights = if include_grant != 0 {
+        crate::capability::Rights::SEND | crate::capability::Rights::GRANT
+    } else {
+        crate::capability::Rights::SEND
+    };
+    let cap = crate::capability::mint_cap(resource_id, rights);
 
-    match scheduler::current_task_insert_cap(send_cap) {
+    match scheduler::current_task_insert_cap(cap) {
         Ok(slot) => slot as i64,
         Err(_)   => -1, // cap table full
     }
@@ -504,6 +516,68 @@ unsafe fn handle_abort(msg_ptr: u64, msg_len: u64) -> i64 {
     }
     crate::kprintln!("KERNEL PANIC");
     panic!("reason: (init abort — no message)");
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: InspectKernel (13) — structured kernel state queries.
+// ---------------------------------------------------------------------------
+
+/// arg0 = query_id, arg1/arg2 = query-specific args.
+///
+/// query_id = 2: endpoint generation by name.
+///   arg1 = name_ptr (user VA), arg2 = name_len.
+///   Returns the current generation of the named endpoint as a non-negative
+///   i64, or -1 if the name is not registered.
+unsafe fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
+    match query_id {
+        2 => {
+            // Endpoint generation by name.
+            let len = arg2 as usize;
+            if len == 0 || len > 64 { return -1; }
+            if !validate_user_slice(arg1, len) { return -1; }
+            // SAFETY: validate_user_slice confirmed range is in user space.
+            let name_bytes = unsafe { core::slice::from_raw_parts(arg1 as *const u8, len) };
+            let name = match core::str::from_utf8(name_bytes) {
+                Ok(s)  => s,
+                Err(_) => return -1,
+            };
+            let ep_id = match crate::ipc::names::lookup(name) {
+                Some(id) => id,
+                None     => return -1,
+            };
+            let gen = crate::ipc::routing::get_generation(ep_id);
+            gen.0 as i64
+        }
+        _ => -1,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: QueryCapRights (14) — read the rights bitfield of a cap slot.
+// ---------------------------------------------------------------------------
+
+/// arg0 = cap_slot.
+///
+/// Returns the `Rights` byte of the cap at `slot` as a non-negative i64, or
+/// -2 (`CapNotHeld`) if the slot is empty or out of range.
+unsafe fn handle_query_cap_rights(slot: u64) -> i64 {
+    match scheduler::current_task_read_cap_rights(slot as usize) {
+        Some(rights) => rights.0 as i64,
+        None         => cap_err_to_i64(CapError::CapNotHeld),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: RemoveCap (15) — remove a cap slot from the calling task's table.
+// ---------------------------------------------------------------------------
+
+/// arg0 = cap_slot.
+///
+/// Clears the cap at `slot`. Always returns 0; out-of-range slots are silently
+/// ignored (idempotent — the slot is already empty).
+unsafe fn handle_remove_cap(slot: u64) -> i64 {
+    scheduler::current_task_remove_cap(slot as usize);
+    0
 }
 
 fn ipc_err_to_i64(e: IpcError) -> i64 {

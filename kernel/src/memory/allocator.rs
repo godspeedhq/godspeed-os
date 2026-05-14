@@ -4,8 +4,10 @@
 //! Covers up to 4 GiB of physical address space (128 KiB of bitmap in .bss).
 //! All frames start marked used; `init_from_map` opens the usable regions.
 //!
-//! v1 uses a single global protected by the single-core boot invariant.
-//! A spinlock replaces the raw `static mut` when SMP goes live (Milestone 6).
+//! SMP-safe: ALLOC_LOCKED spinlock serialises alloc_frame / free_frame across
+//! all cores. Lock is never held across a blocking operation.
+
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::arch::x86_64::{BootInfo, MemoryKind};
 use crate::memory::frame::{Frame, PhysAddr, FRAME_SIZE};
@@ -167,6 +169,27 @@ fn frame_align_down(addr: u64) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// SMP spinlock.
+// ---------------------------------------------------------------------------
+
+static ALLOC_LOCKED: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+fn alloc_lock() {
+    while ALLOC_LOCKED
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+}
+
+#[inline]
+fn alloc_unlock() {
+    ALLOC_LOCKED.store(false, Ordering::Release);
+}
+
+// ---------------------------------------------------------------------------
 // Global instance + public API.
 // ---------------------------------------------------------------------------
 
@@ -183,8 +206,11 @@ pub fn init(boot_info: &BootInfo) {
 
 /// Allocate one physical frame. Returns `None` if memory is exhausted.
 pub fn alloc_frame() -> Option<Frame> {
-    // SAFETY: single-core until Milestone 6 adds the spinlock.
-    unsafe { ALLOCATOR.alloc() }
+    alloc_lock();
+    // SAFETY: lock held; single writer across all cores.
+    let frame = unsafe { ALLOCATOR.alloc() };
+    alloc_unlock();
+    frame
 }
 
 /// Return a frame to the allocator.
@@ -193,12 +219,14 @@ pub fn alloc_frame() -> Option<Frame> {
 /// The frame must have been obtained from `alloc_frame` and must not be used
 /// after this call.
 pub unsafe fn free_frame(frame: Frame) {
-    // SAFETY: caller guarantees exclusive ownership and post-free non-use.
+    alloc_lock();
+    // SAFETY: lock held; caller guarantees exclusive ownership.
     unsafe { ALLOCATOR.free(frame) }
+    alloc_unlock();
 }
 
 /// Total free frames available (used for diagnostic output in memory::init).
 pub fn free_frame_count() -> usize {
-    // SAFETY: read-only; single-core until Milestone 6.
+    // SAFETY: read-only; racing reads are harmless for diagnostic use.
     unsafe { ALLOCATOR.free_frames() }
 }

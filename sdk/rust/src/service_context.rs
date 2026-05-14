@@ -230,6 +230,85 @@ impl ServiceContext {
         if ret >= 0 { Some(CapHandle(ret as u32)) } else { None }
     }
 
+    /// Acquire a fresh SEND|GRANT cap to `peer` via the kernel name registry.
+    ///
+    /// Used by property-test probes that need to transfer capabilities (P3).
+    /// Returns `None` if the service is not registered or the cap table is full.
+    pub fn acquire_send_grant_cap(&self, peer: &str) -> Option<CapHandle> {
+        let bytes = peer.as_bytes();
+        let len   = bytes.len();
+        if len == 0 || len > PEER_NAME_BYTES { return None; }
+        // SAFETY: syscall(10) = AcquireSendCap; arg2=1 requests SEND|GRANT.
+        let ret = unsafe { raw_syscall(10, bytes.as_ptr() as u64, len as u64, 1) };
+        if ret < 0 { None } else { Some(CapHandle(ret as u32)) }
+    }
+
+    /// Acquire a fresh SEND cap to `peer` via the kernel name registry.
+    ///
+    /// Returns the new cap handle, or `None` if the name is not registered.
+    pub fn acquire_send_cap(&self, peer: &str) -> Option<CapHandle> {
+        let bytes = peer.as_bytes();
+        let len   = bytes.len();
+        if len == 0 || len > PEER_NAME_BYTES { return None; }
+        // SAFETY: syscall(10) = AcquireSendCap; arg2=0 = SEND only.
+        let ret = unsafe { raw_syscall(10, bytes.as_ptr() as u64, len as u64, 0) };
+        if ret < 0 { None } else { Some(CapHandle(ret as u32)) }
+    }
+
+    /// Query the current generation of the named endpoint.
+    ///
+    /// Returns the generation counter as a u64, or 0 if the name is not
+    /// registered. Used by property tests P2 and P8 (§7.5, §14.2).
+    pub fn inspect_endpoint_generation(&self, name: &str) -> u64 {
+        let bytes = name.as_bytes();
+        let len   = bytes.len();
+        if len == 0 || len > PEER_NAME_BYTES { return 0; }
+        // SAFETY: syscall(13) = InspectKernel; query_id=2 = endpoint generation by name.
+        let ret = unsafe {
+            raw_syscall(13, 2, bytes.as_ptr() as u64, len as u64)
+        };
+        if ret < 0 { 0 } else { ret as u64 }
+    }
+
+    /// Query the rights bitfield of the cap at `handle`.
+    ///
+    /// Returns the rights byte as a u64, or `None` if the slot is empty.
+    /// Used by property test P3 to verify rights do not widen on transfer (§7.3).
+    pub fn query_cap_rights(&self, handle: CapHandle) -> Option<u64> {
+        // SAFETY: syscall(14) = QueryCapRights; slot is a cap table index.
+        let ret = unsafe { raw_syscall(14, handle.0 as u64, 0, 0) };
+        if ret < 0 { None } else { Some(ret as u64) }
+    }
+
+    /// Remove the cap at `handle` from this task's cap table.
+    ///
+    /// Idempotent: removing an already-empty slot is a no-op.
+    pub fn remove_cap(&self, handle: CapHandle) {
+        // SAFETY: syscall(15) = RemoveCap; slot is a cap table index.
+        unsafe { raw_syscall(15, handle.0 as u64, 0, 0); }
+    }
+
+    /// Send a message to `endpoint` with cap `grant` embedded.
+    ///
+    /// Unlike `send_with_cap` (which looks up a peer by name), this takes
+    /// explicit handles — used by P3 where the endpoint and grant slot are
+    /// the same (self-referential cap transfer).  On success the grant cap is
+    /// removed from the caller's table (§7.6).
+    pub fn send_with_cap_by_handle(
+        &self,
+        endpoint: CapHandle,
+        grant:    CapHandle,
+        msg:      &crate::ipc::Message,
+    ) -> Result<(), crate::ipc::IpcError> {
+        let packed  = ((grant.0 as u64) << 16) | (endpoint.0 as u64);
+        let payload = msg.payload_bytes();
+        // SAFETY: syscall(11) = SendWithCap; packed and payload are from user space.
+        let ret = unsafe {
+            raw_syscall(11, packed, payload.as_ptr() as u64, payload.len() as u64)
+        };
+        if ret == 0 { Ok(()) } else { Err(crate::ipc::i64_to_ipc_error(ret)) }
+    }
+
     /// Return the core this service was spawned on.
     pub fn core_id(&self) -> u32 { Self::ctx().core_id }
 

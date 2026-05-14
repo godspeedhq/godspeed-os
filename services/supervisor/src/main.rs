@@ -45,6 +45,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let _ = ctx.spawn("prop-p9");
     let _ = ctx.spawn("prop-p1");
     let _ = ctx.spawn("prop-p10");
+    // Property-test probes — Milestone 9 Phase 2.
+    // P3 and P6 are spawned BEFORE the kill/respawn controllers (P2, P8) so they
+    // are already running by the time P2 and P8 begin their kill/respawn loops.
+    // P2 and P8 each do rapid kill/respawn cycles that compete for kernel resources;
+    // spawning the self-contained probes first prevents CPU starvation of P3/P6.
+    let _ = ctx.spawn("prop-p3");        // P3: self-referential cap bounce (no victims)
+    let _ = ctx.spawn("prop-p6");        // P6: self-referential queue depth test (no victims)
+    // Kill/respawn victims must be registered before their controller probes start.
+    let _ = ctx.spawn("prop-p2-victim"); // P2: kill/respawn generation target
+    let _ = ctx.spawn("prop-p2");        // P2 controller — starts cycling immediately
+    let _ = ctx.spawn("prop-p8-victim"); // P8: kill/respawn generation target
+    let _ = ctx.spawn("prop-p8");        // P8 controller — starts cycling immediately
 
     // --- Original ping/pong services ---
     // Spawn pong first so the kernel registers "pong" in its name table before

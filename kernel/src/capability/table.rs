@@ -103,42 +103,81 @@ pub enum Liveness {
     Dead,
 }
 
-const EMPTY_ENTRY: (ResourceId, ResourceRecord) = (
-    ResourceId(0),
-    ResourceRecord { generation: Generation::INITIAL, liveness: Liveness::Alive },
-);
+// IDs below this threshold are stored in a direct-indexed array for O(1) lookup.
+// All endpoint ResourceIds (monotonically allocated from ~100) and well-known
+// kernel resource IDs (LOG_WRITE, SPAWN, etc., all < 100) fall within this range.
+// P2 adds ~1000 entries, P8 adds ~2500 — both fit comfortably within 8192.
+const DIRECT_CAP: usize = 8192;
+// Large IDs (e.g. cap-subsystem self-test resources like 57005, 57007) are rare
+// and handled by a small linear-scan overflow table.
+const OVERFLOW_CAP: usize = 32;
+
+const EMPTY_RECORD: ResourceRecord =
+    ResourceRecord { generation: Generation::INITIAL, liveness: Liveness::Alive };
+const EMPTY_OVERFLOW: (ResourceId, ResourceRecord) =
+    (ResourceId(0), EMPTY_RECORD);
 
 struct GlobalResourceTable {
-    entries: [(ResourceId, ResourceRecord); 512],
-    len: usize,
+    // Direct-indexed by ResourceId.0 for IDs in [0, DIRECT_CAP).
+    records:      [ResourceRecord; DIRECT_CAP],
+    present:      [bool; DIRECT_CAP],
+    // Linear scan for ResourceId.0 >= DIRECT_CAP (cap-test special resources only).
+    overflow:     [(ResourceId, ResourceRecord); OVERFLOW_CAP],
+    overflow_len: usize,
 }
 
 impl GlobalResourceTable {
     const fn new() -> Self {
-        Self { entries: [EMPTY_ENTRY; 512], len: 0 }
+        Self {
+            records:      [EMPTY_RECORD; DIRECT_CAP],
+            present:      [false; DIRECT_CAP],
+            overflow:     [EMPTY_OVERFLOW; OVERFLOW_CAP],
+            overflow_len: 0,
+        }
     }
 
     fn get_record(&self, id: ResourceId) -> Option<ResourceRecord> {
-        self.entries[..self.len]
-            .iter()
-            .find(|(rid, _)| *rid == id)
-            .map(|(_, r)| *r)
+        let i = id.0 as usize;
+        if i < DIRECT_CAP {
+            if self.present[i] { Some(self.records[i]) } else { None }
+        } else {
+            self.overflow[..self.overflow_len]
+                .iter()
+                .find(|(rid, _)| *rid == id)
+                .map(|(_, r)| *r)
+        }
     }
 
     fn bump_generation(&mut self, id: ResourceId, liveness: Liveness) {
-        if let Some((_, r)) = self.entries[..self.len].iter_mut().find(|(rid, _)| *rid == id) {
+        let i = id.0 as usize;
+        if i < DIRECT_CAP {
+            if self.present[i] {
+                self.records[i].generation = self.records[i].generation.bump();
+                self.records[i].liveness   = liveness;
+            }
+        } else if let Some((_, r)) = self.overflow[..self.overflow_len]
+                .iter_mut().find(|(rid, _)| *rid == id) {
             r.generation = r.generation.bump();
-            r.liveness = liveness;
+            r.liveness   = liveness;
         }
     }
 
     fn register(&mut self, id: ResourceId) {
-        assert!(self.len < self.entries.len());
-        self.entries[self.len] = (id, ResourceRecord {
-            generation: Generation::INITIAL,
-            liveness: Liveness::Alive,
-        });
-        self.len += 1;
+        self.register_at_gen(id, Generation::INITIAL);
+    }
+
+    fn register_at_gen(&mut self, id: ResourceId, gen: Generation) {
+        let i = id.0 as usize;
+        if i < DIRECT_CAP {
+            self.records[i] = ResourceRecord { generation: gen, liveness: Liveness::Alive };
+            self.present[i] = true;
+        } else {
+            assert!(self.overflow_len < OVERFLOW_CAP,
+                "GlobalResourceTable overflow full — increase OVERFLOW_CAP");
+            self.overflow[self.overflow_len] =
+                (id, ResourceRecord { generation: gen, liveness: Liveness::Alive });
+            self.overflow_len += 1;
+        }
     }
 }
 
@@ -153,6 +192,25 @@ pub fn init_global() {
 pub fn register_resource(id: ResourceId) {
     // SAFETY: serialized by the cap subsystem lock.
     unsafe { GLOBAL_RESOURCES.register(id) }
+}
+
+/// Register a new resource starting at a specific generation (used on respawn — §7.5 P2/P8).
+pub fn register_resource_at_gen(id: ResourceId, gen: Generation) {
+    // SAFETY: serialized by the cap subsystem lock.
+    unsafe { GLOBAL_RESOURCES.register_at_gen(id, gen) }
+}
+
+/// Return the current generation of a registered resource, or None if not found.
+pub fn get_resource_generation(id: ResourceId) -> Option<Generation> {
+    // SAFETY: read-only path.
+    unsafe { GLOBAL_RESOURCES.get_record(id).map(|r| r.generation) }
+}
+
+/// Return the rights of the cap in `slot`, without validating the generation.
+///
+/// Used by the `QueryCapRights` syscall (§9 Phase 2 P3).
+pub fn cap_read_rights(slots: &CapTable, slot: usize) -> Option<super::rights::Rights> {
+    slots.slots.get(slot)?.as_ref().map(|c| c.rights)
 }
 
 /// Mint a capability for `id` with the given rights at its current generation.

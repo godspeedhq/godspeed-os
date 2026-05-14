@@ -124,6 +124,20 @@ pub fn register(id: EndpointId, core_id: u32, generation: Generation) {
     panic!("routing: endpoint table full (MAX_ENDPOINTS={})", MAX_ENDPOINTS);
 }
 
+/// Return the current generation of `id` in the routing table, or INITIAL if not found.
+///
+/// Used by `spawn_service_with_config` to seed the new endpoint's generation from the
+/// killed endpoint's bumped generation, ensuring monotonicity across kill/respawn (P2, §7.5).
+pub fn get_generation(id: EndpointId) -> Generation {
+    lock();
+    // SAFETY: lock held; read-only.
+    let gen = unsafe {
+        TABLE.iter().find(|e| e.valid && e.id == id).map(|e| e.generation)
+    };
+    unlock();
+    gen.unwrap_or(Generation::INITIAL)
+}
+
 /// Try to enqueue `msg` on `endpoint`.
 ///
 /// `blocked_sender_slot`: if `Some(slot)`, this is a blocking `send` — if the

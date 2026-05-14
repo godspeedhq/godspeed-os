@@ -65,7 +65,39 @@ static PROPERTY_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["prop: P1 pass (10000/10000)"],
             fail_on:      &["KERNEL PANIC", "prop: P1 FAIL"],
+            timeout_secs: 90,
+        },
+    },
+    TestSpec {
+        id: "P2", name: "generation_monotonic_across_lifetime", spec_ref: "§7.5",
+        kind: TestKind::WatchSerial {
+            expect:       &["prop: P2 pass (3 iter x 2 cycles)"],
+            fail_on:      &["KERNEL PANIC", "prop: P2 FAIL"],
+            timeout_secs: 120,
+        },
+    },
+    TestSpec {
+        id: "P3", name: "cap_rights_never_widen_on_transfer", spec_ref: "§7.3",
+        kind: TestKind::WatchSerial {
+            expect:       &["prop: P3 pass (5000/5000)"],
+            fail_on:      &["KERNEL PANIC", "prop: P3 FAIL"],
             timeout_secs: 60,
+        },
+    },
+    TestSpec {
+        id: "P6", name: "queue_depth_invariant", spec_ref: "§8.5",
+        kind: TestKind::WatchSerial {
+            expect:       &["prop: P6 pass (500/500)"],
+            fail_on:      &["KERNEL PANIC", "prop: P6 FAIL"],
+            timeout_secs: 120,
+        },
+    },
+    TestSpec {
+        id: "P8", name: "restart_resolves_higher_generation", spec_ref: "§14.2",
+        kind: TestKind::WatchSerial {
+            expect:       &["prop: P8 pass (5 iter)"],
+            fail_on:      &["KERNEL PANIC", "prop: P8 FAIL"],
+            timeout_secs: 120,
         },
     },
     TestSpec {
@@ -73,7 +105,7 @@ static PROPERTY_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["prop: P9 pass"],
             fail_on:      &["KERNEL PANIC", "prop: P9 FAIL"],
-            timeout_secs: 60,
+            timeout_secs: 90,
         },
     },
     TestSpec {

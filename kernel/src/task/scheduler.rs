@@ -9,7 +9,7 @@
 //! IPI when the target task lives on a different core.
 
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::arch::x86_64::context_switch::{switch_context, TaskContext};
 use crate::capability::cap::{CapError, Capability};
@@ -23,7 +23,7 @@ use crate::task::state::TaskState;
 // Flat task table (all cores share one array; tasks are pinned by TASK_CORE).
 // ---------------------------------------------------------------------------
 
-pub const MAX_TASKS: usize = 32;
+pub const MAX_TASKS: usize = 48;
 const MAX_CORES: usize = crate::smp::core::MAX_CORES;
 
 /// Sentinel meaning "no task running" (scheduler idle loop active).
@@ -118,6 +118,26 @@ fn current_core_id() -> usize {
 /// Return the calling core's ID (0-based).
 pub fn current_core() -> usize { current_core_id() }
 
+// SMP spinlock for the task-slot table — concurrent spawns on different cores
+// (e.g. supervisor on Core 0 and a prop-p2 respawn on Core 3) both scan
+// TASK_VALID; the scan-and-set must be atomic across cores.
+static TASK_SLOT_LOCKED: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+fn task_slot_lock() {
+    while TASK_SLOT_LOCKED
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+}
+
+#[inline]
+fn task_slot_unlock() {
+    TASK_SLOT_LOCKED.store(false, Ordering::Release);
+}
+
 /// Reserve a free task slot, pinned to `core_id`.
 ///
 /// Marks the slot VALID (but state remains Dead) so subsequent calls to
@@ -126,17 +146,22 @@ pub fn current_core() -> usize { current_core_id() }
 ///
 /// Returns `None` if all slots are occupied.
 pub fn reserve_task_slot(core_id: u32) -> Option<usize> {
-    // SAFETY: IF=0 in syscall context; single writer for this core.
-    unsafe {
+    task_slot_lock();
+    // SAFETY: lock held; exclusive access to TASK_VALID/TASK_CORE across all cores.
+    let result = unsafe {
+        let mut found = None;
         for i in 0..MAX_TASKS {
             if !TASK_VALID[i] {
                 TASK_VALID[i] = true;
                 TASK_CORE[i]  = core_id;
-                return Some(i);
+                found = Some(i);
+                break;
             }
         }
-        None
-    }
+        found
+    };
+    task_slot_unlock();
+    result
 }
 
 /// Initialise the CapTable for a reserved slot **in-place in BSS** and return
@@ -167,8 +192,10 @@ pub unsafe fn task_cap_init_empty(slot: usize) -> &'static mut CapTable {
 
 /// Release a previously-reserved slot without committing (called on spawn error).
 pub fn release_task_slot(slot: usize) {
-    // SAFETY: IF=0; slot was reserved by this core.
+    task_slot_lock();
+    // SAFETY: lock held; slot was reserved by this core.
     unsafe { TASK_VALID[slot] = false; }
+    task_slot_unlock();
 }
 
 /// Finalise a reserved task slot: write context + metadata and mark Ready.
@@ -256,6 +283,21 @@ pub fn current_task_remove_cap(slot: usize) -> Option<Capability> {
         let cur = CORE_CURRENT[cid];
         if cur < MAX_TASKS && TASK_VALID[cur] {
             TASK_CAP[cur].assume_init_mut().remove(slot)
+        } else {
+            None
+        }
+    }
+}
+
+/// Read the rights of the cap at `slot` without validating the generation.
+///
+/// Used by `QueryCapRights` (syscall 14) — read-only, no side effects.
+pub fn current_task_read_cap_rights(slot: usize) -> Option<Rights> {
+    let cid = current_core_id();
+    unsafe {
+        let cur = CORE_CURRENT[cid];
+        if cur < MAX_TASKS && TASK_VALID[cur] {
+            crate::capability::cap_read_rights(TASK_CAP[cur].assume_init_ref(), slot)
         } else {
             None
         }
@@ -679,17 +721,53 @@ pub fn kill_task_by_slot(slot: usize) {
             crate::capability::table::mark_dead_resource(resource_id);
         }
 
-        // Reclaim all user-space frames: walk the page table, flush all TLBs,
-        // then return each frame to the allocator (§10.5).
+        // SMP safety: spin until no other core has CORE_CURRENT[c] == slot.
+        //
+        // A core may have selected this slot from pick_next (observing STATE=Ready)
+        // before our STATE=Dead store propagated.  That core has set
+        // CORE_CURRENT[c]=slot and is about to call switch_context, loading this
+        // task's cr3.  We must not free the page-table frames until that core has
+        // moved on (CORE_CURRENT[c] changes to a different task), because after
+        // switch_context the core is in kernel mode with the shared higher-half
+        // mappings — it will load the new cr3 next, and kernel code does not
+        // touch user-half frames.  Bounded by one preemption quantum (~10 ms).
+        //
+        // We skip the calling core: either it holds a different slot (the common
+        // cross-core kill path), or this is kill_current where the caller switches
+        // away immediately after returning — in both cases the skip is safe.
+        {
+            let my_core = current_core_id();
+            for cid in 0..MAX_CORES {
+                if cid == my_core { continue; }
+                loop {
+                    // Compiler + hardware barrier: reload CORE_CURRENT[cid] from
+                    // memory on every iteration; do not use a cached register value.
+                    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                    if CORE_CURRENT[cid] != slot { break; }
+                    core::hint::spin_loop();
+                }
+            }
+        }
+
+        // Reclaim all user-space frames: walk the page table and return each
+        // frame to the allocator (§10.5).
+        //
+        // TLB coherence: the spin-wait above guarantees every other core has
+        // loaded a *different* CR3 since last running this task.  A CR3 reload
+        // flushes all non-global TLB entries, so no core retains stale
+        // translations for this task's virtual addresses.  A separate TLB
+        // shootdown IPI would therefore be redundant — and dangerous: if a
+        // remote core is mid-syscall with IF=0 (e.g. loading an ELF for a
+        // concurrent spawn), it cannot ACK the IPI, causing the caller to spin
+        // indefinitely (deadlock).  We skip the broadcast and rely solely on
+        // the spin-wait guarantee.
         if TASK_IS_USER[slot] {
             let cr3 = TASK_CTX[slot].assume_init_ref().cr3;
             if cr3 != 0 {
                 // SAFETY: cr3 is the task's PML4 set at spawn and immutable
-                // until now.  Task is Dead; no core will schedule it.
+                // until now.  Task is Dead; all other cores have moved past this
+                // slot (spin-wait above); no core will load this cr3 hereafter.
                 let buf = crate::arch::x86_64::page_tables::reclaim_user_frames(cr3);
-                // SAFETY: APIC is initialised; broadcast_full_tlb_flush manages
-                // its own interrupt-flag save/restore.
-                crate::smp::ipi::broadcast_full_tlb_flush();
                 for &phys_addr in buf.as_slice() {
                     // SAFETY: phys_addr came from this task's page table, so it
                     // was allocated from the frame allocator and is now ours to free.

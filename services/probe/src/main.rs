@@ -46,6 +46,12 @@ const MODE_PROP_P1:         u32 = 20;
 const MODE_PROP_P9:         u32 = 21;
 const MODE_PROP_P10:        u32 = 22;
 
+// Property-test modes — Milestone 9 Phase 2.
+const MODE_PROP_P2:         u32 = 23;
+const MODE_PROP_P3:         u32 = 24;
+const MODE_PROP_P6:         u32 = 25;
+const MODE_PROP_P8:         u32 = 26;
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     match ctx.probe_mode() {
@@ -65,6 +71,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         MODE_PROP_P1         => mode_prop_p1(&ctx),
         MODE_PROP_P9         => mode_prop_p9(&ctx),
         MODE_PROP_P10        => mode_prop_p10(&ctx),
+        MODE_PROP_P2         => mode_prop_p2(&ctx),
+        MODE_PROP_P3         => mode_prop_p3(&ctx),
+        MODE_PROP_P6         => mode_prop_p6(&ctx),
+        MODE_PROP_P8         => mode_prop_p8(&ctx),
         _                    => idle(&ctx),
     }
 }
@@ -284,5 +294,164 @@ fn mode_prop_p10(ctx: &ServiceContext) -> ! {
         let _       = ctx.try_send_by_handle(slot, &msg);
     }
     ctx.log("prop: P10 pass (10000/10000)");
+    idle(ctx)
+}
+
+// ---------------------------------------------------------------------------
+// Property-test modes — Milestone 9 Phase 2.
+// ---------------------------------------------------------------------------
+
+fn mode_prop_p2(ctx: &ServiceContext) -> ! {
+    // P2 — Generation is strictly monotonic across kill/respawn cycles (§7.5).
+    // 3 iterations × 2 kill/respawn cycles = 6 total operations.
+    // More cycles here push prop-p8-victim's initial ELF load later in the boot,
+    // giving prop-p1/p9/p10 (all Core 0) more uncontested CPU time before the
+    // supervisor's 6s ELF load monopolises Core 0.
+    let mut prev_gen: u64 = 0;
+    for _iter in 0..3u32 {
+        for _cycle in 0..2u32 {
+            let _ = ctx.kill("prop-p2-victim");
+            let _ = ctx.spawn("prop-p2-victim");
+            let gen = ctx.inspect_endpoint_generation("prop-p2-victim");
+            if gen <= prev_gen {
+                ctx.log("prop: P2 FAIL — generation not strictly monotonic after kill/respawn");
+                idle(ctx);
+            }
+            prev_gen = gen;
+        }
+    }
+    ctx.log("prop: P2 pass (3 iter x 2 cycles)");
+    idle(ctx)
+}
+
+fn mode_prop_p3(ctx: &ServiceContext) -> ! {
+    // P3 — Cap rights never widen during transfer (§7.3).
+    // Self-referential: prop-p3 bounces a SEND|GRANT cap through its own queue
+    // 5000 times. After each recv, the received cap's rights must be exactly
+    // SEND|GRANT (= 4 | 16 = 20) — no widening, no bit-flipping.
+    const SEND_GRANT: u64 = (1 << 2) | (1 << 4); // Rights::SEND | Rights::GRANT = 20
+
+    let mut cap_handle = match ctx.acquire_send_grant_cap("prop-p3") {
+        Some(h) => h,
+        None => {
+            ctx.log("prop: P3 FAIL — could not acquire SEND|GRANT cap to self");
+            idle(ctx);
+        }
+    };
+
+    let msg = Message::from_bytes(b"p3");
+
+    for _iter in 0..5000u32 {
+        match ctx.send_with_cap_by_handle(cap_handle, cap_handle, &msg) {
+            Ok(()) => {}
+            Err(_) => {
+                ctx.log("prop: P3 FAIL — send_with_cap_by_handle failed");
+                idle(ctx);
+            }
+        }
+        ctx.recv();
+        let new_handle = match ctx.take_pending_cap() {
+            Some(h) => h,
+            None => {
+                ctx.log("prop: P3 FAIL — no pending cap after recv");
+                idle(ctx);
+            }
+        };
+        let rights = match ctx.query_cap_rights(new_handle) {
+            Some(r) => r,
+            None => {
+                ctx.log("prop: P3 FAIL — cap slot empty after transfer");
+                idle(ctx);
+            }
+        };
+        if rights != SEND_GRANT {
+            ctx.log("prop: P3 FAIL — cap rights changed during transfer");
+            idle(ctx);
+        }
+        cap_handle = new_handle;
+    }
+    ctx.log("prop: P3 pass (5000/5000)");
+    idle(ctx)
+}
+
+fn mode_prop_p6(ctx: &ServiceContext) -> ! {
+    // P6 — Queue depth invariant: D messages enqueued → D messages dequeued (§8.5).
+    // prop-p6 has a SEND cap to its own recv endpoint (send_peers=["prop-p6"]).
+    // 500 iterations cycle through depths 0..=16. For depth=16, the 17th
+    // try_send must return QueueFull. For depth<16, all sends succeed. After
+    // each fill phase, exactly `depth` messages are drained.
+    ctx.log("prop: P6 starting");
+    const QUEUE_DEPTH: u32 = 16;
+    let msg = Message::from_bytes(b"p6");
+    let recv_h = match ctx.recv_handle() {
+        Some(h) => h,
+        None => { ctx.log("prop: P6 FAIL — no recv endpoint"); idle(ctx); }
+    };
+
+    for iter in 0..500u32 {
+        let depth = (iter % (QUEUE_DEPTH + 1)) as u8;
+
+        for _ in 0..depth {
+            match ctx.try_send("prop-p6", &msg) {
+                Ok(()) => {}
+                Err(_) => {
+                    ctx.log("prop: P6 FAIL — try_send failed before expected queue depth");
+                    idle(ctx);
+                }
+            }
+        }
+
+        if depth == QUEUE_DEPTH as u8 {
+            match ctx.try_send("prop-p6", &msg) {
+                Err(IpcError::QueueFull) => {}
+                Ok(()) => {
+                    ctx.log("prop: P6 FAIL — queue accepted more than 16 messages");
+                    idle(ctx);
+                }
+                Err(_) => {
+                    ctx.log("prop: P6 FAIL — unexpected error on full-queue try_send");
+                    idle(ctx);
+                }
+            }
+        }
+
+        for _ in 0..depth {
+            match godspeed_sdk::ipc::recv(recv_h) {
+                Ok(_) => {}
+                Err(_) => {
+                    ctx.log("prop: P6 FAIL — recv returned error");
+                    idle(ctx);
+                }
+            }
+        }
+
+    }
+    ctx.log("prop: P6 pass (500/500)");
+    idle(ctx)
+}
+
+fn mode_prop_p8(ctx: &ServiceContext) -> ! {
+    // P8 — After restart, name resolves to a higher-generation endpoint (§14.2).
+    // 5 iterations with rng-varied cycles (1–2 per iter, ~7–8 total).
+    // Together with P2's 6 cycles (~13 total kill/spawn ops) these delay
+    // prop-p8-victim's initial ELF load late enough that prop-p1/p9/p10 get
+    // sufficient Core 0 time to complete their 10,000-iteration loops before
+    // the supervisor's 6s ELF load monopolises Core 0.
+    let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 28;
+    let mut prev_gen: u64 = 0;
+    for _iter in 0..5u32 {
+        let n_cycles = 1 + (xorshift64(&mut rng) % 2) as u32;
+        for _cycle in 0..n_cycles {
+            let _ = ctx.kill("prop-p8-victim");
+            let _ = ctx.spawn("prop-p8-victim");
+            let gen = ctx.inspect_endpoint_generation("prop-p8-victim");
+            if gen <= prev_gen {
+                ctx.log("prop: P8 FAIL — generation not monotonic after restart");
+                idle(ctx);
+            }
+            prev_gen = gen;
+        }
+    }
+    ctx.log("prop: P8 pass (5 iter)");
     idle(ctx)
 }

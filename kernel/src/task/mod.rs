@@ -6,6 +6,8 @@ pub mod task;
 
 pub use task::{Task, TaskId};
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use crate::arch::x86_64::context_switch::TaskContext;
 use crate::arch::x86_64::page_tables::{
     get_hhdm_offset, PageFlags, VirtAddr, PAGE_SIZE,
@@ -47,11 +49,31 @@ unsafe fn kstack_marker(i: usize) -> *mut u32 {
     unsafe { KSTACK_STORAGE.data.as_mut_ptr().add(i * KSTACK_SIZE) as *mut u32 }
 }
 
+// SMP spinlock for the kstack pool — concurrent spawns on different cores
+// both call alloc_kstack; the read-modify-write on each slot marker must be atomic.
+static KSTACK_LOCKED: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+fn kstack_lock() {
+    while KSTACK_LOCKED
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+}
+
+#[inline]
+fn kstack_unlock() {
+    KSTACK_LOCKED.store(false, Ordering::Release);
+}
+
 fn alloc_kstack() -> Option<*mut u8> {
+    kstack_lock();
     for i in 0..TASK_KSTACK_MAX {
-        // SAFETY: marker pointer is within KSTACK_STORAGE; single-writer.
+        // SAFETY: lock held; marker pointer is within KSTACK_STORAGE.
         if unsafe { kstack_marker(i).read_volatile() } != KSTACK_MAGIC_USED {
-            // SAFETY: same as above.
+            // SAFETY: lock held; exclusive access to this slot confirmed.
             unsafe { kstack_marker(i).write_volatile(KSTACK_MAGIC_USED); }
             // Return pointer to the TOP of this slot (stacks grow down).
             // SAFETY: i < TASK_KSTACK_MAX; offset is within the array bounds.
@@ -61,9 +83,11 @@ fn alloc_kstack() -> Option<*mut u8> {
                     .as_mut_ptr()
                     .add(i * KSTACK_SIZE + KSTACK_SIZE)
             };
+            kstack_unlock();
             return Some(top);
         }
     }
+    kstack_unlock();
     crate::kprintln!("alloc_kstack: pool exhausted (all {} slots used)", TASK_KSTACK_MAX);
     None
 }
@@ -85,8 +109,10 @@ pub fn free_kstack(kstack_top: u64) {
     let idx_plus_one = offset / KSTACK_SIZE as u64;
     if idx_plus_one == 0 || idx_plus_one > TASK_KSTACK_MAX as u64 { return; }
     let idx = (idx_plus_one - 1) as usize;
-    // SAFETY: idx is within [0, TASK_KSTACK_MAX); single-writer kill path (IF=0).
+    kstack_lock();
+    // SAFETY: lock held; idx is within [0, TASK_KSTACK_MAX).
     unsafe { kstack_marker(idx).write_volatile(0); }
+    kstack_unlock();
 }
 
 // ---------------------------------------------------------------------------
@@ -423,6 +449,72 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        22, // MODE_PROP_P10
             memory_limit:      64 * 1024 * 1024,
         })),
+        // ----------------------------------------------------------------
+        // Property-test probes — Milestone 9 Phase 2.
+        // ----------------------------------------------------------------
+        // P2: generation monotonic. prop-p2-victim must be listed before prop-p2.
+        // prop-p2 pinned to Core 3 — away from P8 (Core 1) and P6 (Core 2).
+        "prop-p2-victim" => Some(("prop-p2-victim", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0,  // MODE_PASSIVE — killed/respawned by prop-p2
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "prop-p2" => Some(("prop-p2", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    3,
+            probe_mode:        23, // MODE_PROP_P2
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // P3: cap rights non-widening. Self-referential: sends cap to own endpoint.
+        "prop-p3" => Some(("prop-p3", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        24, // MODE_PROP_P3
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // P6: queue invariants. Self-referential: sends to own endpoint.
+        // Pinned to Core 2 — away from the P2 (Core 3) and P8 (Core 1) kill/spawn
+        // controllers whose long spawn syscalls would starve P6 of CPU time.
+        "prop-p6" => Some(("prop-p6", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &["prop-p6"],
+            send_peers_grant:  false,
+            preferred_core:    2,
+            probe_mode:        25, // MODE_PROP_P6
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // P8: name resolves to higher generation + liveness. prop-p8-victim before prop-p8.
+        // Pinned to Core 1 so P8's kill/spawn loop doesn't share a core with P6 (Core 2)
+        // or P2 (Core 3).
+        "prop-p8-victim" => Some(("prop-p8-victim", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0,  // MODE_PASSIVE — killed/respawned by prop-p8
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "prop-p8" => Some(("prop-p8", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    1,
+            probe_mode:        26, // MODE_PROP_P8
+            memory_limit:      64 * 1024 * 1024,
+        })),
         _ => None,
     }
 }
@@ -522,11 +614,28 @@ fn spawn_service_with_config(
         let ep_id       = crate::ipc::alloc_endpoint_id();
         let resource_id = ResourceId::from(ep_id);
 
-        // Register in global cap table (generation 0).
-        crate::capability::table::register_resource(resource_id);
+        // For respawns: inherit the old (killed) endpoint's generation so the new
+        // endpoint's generation is strictly greater than any previously-issued cap
+        // generation for this name — making generation monotonic across kill/respawn (§7.5 P2).
+        //
+        // We read from GLOBAL_RESOURCES (capability table) rather than the routing
+        // table because routing entries are recycled by concurrent spawns: by the
+        // time this spawn runs, another service may have claimed the old dead routing
+        // slot and overwritten its generation.  GLOBAL_RESOURCES entries are
+        // persistent (append-only) so the old dead entry with the bumped generation
+        // remains visible until GLOBAL_RESOURCES fills up (capacity: 4096).
+        let start_gen = crate::ipc::names::lookup(name)
+            .and_then(|old_ep| {
+                let old_rid = crate::capability::cap::ResourceId::from(old_ep);
+                crate::capability::get_resource_generation(old_rid)
+            })
+            .unwrap_or(Generation::INITIAL);
 
-        // Register in routing table.
-        crate::ipc::routing::register(ep_id, core_id, Generation::INITIAL);
+        // Register in global cap table at the inherited generation.
+        crate::capability::register_resource_at_gen(resource_id, start_gen);
+
+        // Register in routing table at the same generation.
+        crate::ipc::routing::register(ep_id, core_id, start_gen);
 
         // Publish name → endpoint mapping for peer cap resolution.
         crate::ipc::names::register(name, ep_id);

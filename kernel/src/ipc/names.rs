@@ -9,7 +9,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::capability::generation::Generation;
 use crate::ipc::endpoint::EndpointId;
 
-const MAX_ENTRIES: usize = 16;
+const MAX_ENTRIES: usize = 32;
 const NAME_MAX:    usize = 32;
 
 static NAMES_LOCKED: AtomicBool = AtomicBool::new(false);
