@@ -143,15 +143,15 @@ runs compare against baseline and flag regressions ≥ 10%.
 
 ## Implementation checklist
 
-- [x] `kernel/src/syscall/dispatch.rs` — `InspectKernel` query 3 reads RDTSC
-- [x] `sdk/rust/src/service_context.rs` — `ctx.read_tsc()`, `ctx.send_by_handle()`
-- [x] `services/probe/src/main.rs` — modes 60–71 (12 modes across 10 benchmarks)
-- [x] `kernel/src/task/mod.rs` — 13 perf service configs
-- [x] `services/supervisor/src/main.rs` — perf service spawns
-- [x] `osdev/src/validator.rs` — `PERF_TESTS`, `run_perf_tests()`, `run_perf_one()`, `perf_serial_path()`, `collect_perf_baseline()`
-- [x] `osdev/src/main.rs` — `"perf"` branch in `cmd_test`
-- [x] `build/tests/5_PERFORMANCE/.gitkeep`
-- [x] `tests/qemu/perf/baseline.json` — placeholder; updated by harness after first run
+- ✅ `kernel/src/syscall/dispatch.rs` — `InspectKernel` query 3 reads RDTSC
+- ✅ `sdk/rust/src/service_context.rs` — `ctx.read_tsc()`, `ctx.send_by_handle()`
+- ✅ `services/probe/src/main.rs` — modes 60–71 (12 modes across 10 benchmarks)
+- ✅ `kernel/src/task/mod.rs` — 13 perf service configs
+- ✅ `services/supervisor/src/main.rs` — perf service spawns
+- ✅ `osdev/src/validator.rs` — `PERF_TESTS`, `run_perf_tests()`, `run_perf_one()`, `perf_serial_path()`, `collect_perf_baseline()`
+- ✅ `osdev/src/main.rs` — `"perf"` branch in `cmd_test`
+- ✅ `build/tests/5_PERFORMANCE/.gitkeep`
+- ✅ `tests/qemu/perf/baseline.json` — placeholder; updated by harness after first run
 
 ---
 
