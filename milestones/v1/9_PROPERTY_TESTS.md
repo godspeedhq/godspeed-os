@@ -241,12 +241,12 @@ restart, and (c) routes to a live task.
 
 ### Phase 2 results
 
-| ID  | Property                                              | Iterations | Result  |
-|-----|-------------------------------------------------------|------------|---------|
-| P2  | Generation strictly monotonic across lifetime         | 100        | Pending |
-| P3  | Cap rights never widen during transfer                | 5,000      | Pending |
-| P6  | Queue invariants hold at all depths                   | 1,000      | Pending |
-| P8  | After restart, name resolves to higher generation     | 200        | Pending |
+| ID  | Property                                              | Iterations     | Result  |
+|-----|-------------------------------------------------------|----------------|---------|
+| P2  | Generation strictly monotonic across lifetime         | 3 × 2 cycles   | ✅ PASS  |
+| P3  | Cap rights never widen during transfer                | 5,000          | ✅ PASS  |
+| P6  | Queue invariants hold at all depths                   | 500            | ✅ PASS  |
+| P8  | After restart, name resolves to higher generation     | 5 cycles       | ✅ PASS  |
 
 ---
 
@@ -368,18 +368,18 @@ cycle with deliberate inter-core delay to expose races).
 
 ## Full property table
 
-| ID  | Property                                              | Pins                  | Iterations | Phase | Result  |
-|-----|-------------------------------------------------------|-----------------------|------------|-------|---------|
-| P1  | Random cap bytes → CapNotHeld; never accepted         | §7.3, §3.1            | 10,000     | 1     | ✅ PASS  |
-| P2  | Generation strictly monotonic across lifetime         | §7.5                  | 100        | 2     | Pending |
-| P3  | Cap rights never widen during transfer                | §7.3                  | 5,000      | 2     | Pending |
-| P4  | ∑ alloc_bytes ≡ pages mapped after any alloc sequence | §10.3                 | 500        | 3     | Pending |
-| P5  | Every live endpoint has exactly one owning task       | §8.3                  | 200        | 3     | Pending |
-| P6  | Queue invariants hold at all depths                   | §8.5                  | 1,000      | 2     | Pending |
-| P7  | After unmap + TLB shootdown, page unreadable          | §10.5                 | 50         | 3     | Pending |
-| P8  | After restart, name resolves to higher generation     | §14.2, §8.3           | 200        | 2     | Pending |
-| P9  | Generation bump invalidates ALL holders               | §7.5                  | 3 slots    | 1     | ✅ PASS  |
-| P10 | Every send returns exactly one defined outcome        | §8.6                  | 10,000     | 1     | ✅ PASS  |
+| ID  | Property                                              | Pins                  | Iterations     | Phase | Result  |
+|-----|-------------------------------------------------------|-----------------------|----------------|-------|---------|
+| P1  | Random cap bytes → CapNotHeld; never accepted         | §7.3, §3.1            | 10,000         | 1     | ✅ PASS  |
+| P2  | Generation strictly monotonic across lifetime         | §7.5                  | 3 × 2 cycles   | 2     | ✅ PASS  |
+| P3  | Cap rights never widen during transfer                | §7.3                  | 5,000          | 2     | ✅ PASS  |
+| P4  | ∑ alloc_bytes ≡ pages mapped after any alloc sequence | §10.3                 | 500            | 3     | Pending |
+| P5  | Every live endpoint has exactly one owning task       | §8.3                  | 200            | 3     | Pending |
+| P6  | Queue invariants hold at all depths                   | §8.5                  | 500            | 2     | ✅ PASS  |
+| P7  | After unmap + TLB shootdown, page unreadable          | §10.5                 | 50             | 3     | Pending |
+| P8  | After restart, name resolves to higher generation     | §14.2, §8.3           | 5 cycles       | 2     | ✅ PASS  |
+| P9  | Generation bump invalidates ALL holders               | §7.5                  | 3 slots        | 1     | ✅ PASS  |
+| P10 | Every send returns exactly one defined outcome        | §8.6                  | 10,000         | 1     | ✅ PASS  |
 
 ---
 
