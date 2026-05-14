@@ -23,7 +23,7 @@ use crate::memory::frame::PhysAddr;
 // Kernel stack pool — one 64 KiB stack per ring-3 task (§14.1).
 // ---------------------------------------------------------------------------
 
-const TASK_KSTACK_MAX: usize = 32;
+const TASK_KSTACK_MAX: usize = 48;
 const KSTACK_SIZE:     usize = 64 * 1024;
 
 // Magic value written at the BOTTOM of each kstack slot (byte offset 0 within
@@ -513,6 +513,57 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  false,
             preferred_core:    1,
             probe_mode:        26, // MODE_PROP_P8
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // ----------------------------------------------------------------
+        // Property-test probes — Milestone 9 Phase 3.
+        // ----------------------------------------------------------------
+        // P4: memory accounting. No victim needed.
+        "prop-p4" => Some(("prop-p4", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        27, // MODE_PROP_P4
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // P5: endpoint ownership. Victim must be listed before controller.
+        "prop-p5-victim" => Some(("prop-p5-victim", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0,  // MODE_PASSIVE — killed/respawned by prop-p5
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "prop-p5" => Some(("prop-p5", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        28, // MODE_PROP_P5
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // P7: TLB shootdown proxy. Victim must be listed before controller.
+        "prop-p7-victim" => Some(("prop-p7-victim", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0,  // MODE_PASSIVE — killed/respawned by prop-p7
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "prop-p7" => Some(("prop-p7", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        29, // MODE_PROP_P7
             memory_limit:      64 * 1024 * 1024,
         })),
         _ => None,

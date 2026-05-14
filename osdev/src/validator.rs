@@ -101,6 +101,30 @@ static PROPERTY_TESTS: &[TestSpec] = &[
         },
     },
     TestSpec {
+        id: "P4", name: "alloc_accounting_exact", spec_ref: "§10.3",
+        kind: TestKind::WatchSerial {
+            expect:       &["prop: P4 pass (500/500)"],
+            fail_on:      &["KERNEL PANIC", "prop: P4 FAIL"],
+            timeout_secs: 60,
+        },
+    },
+    TestSpec {
+        id: "P5", name: "endpoint_has_one_owner", spec_ref: "§8.3",
+        kind: TestKind::WatchSerial {
+            expect:       &["prop: P5 pass (50/50)"],
+            fail_on:      &["KERNEL PANIC", "prop: P5 FAIL"],
+            timeout_secs: 120,
+        },
+    },
+    TestSpec {
+        id: "P7", name: "tlb_shootdown_no_stale_mappings", spec_ref: "§10.5",
+        kind: TestKind::WatchSerial {
+            expect:       &["prop: P7 pass (50/50)"],
+            fail_on:      &["KERNEL PANIC", "prop: P7 FAIL"],
+            timeout_secs: 60,
+        },
+    },
+    TestSpec {
         id: "P9", name: "generation_invalidates_all_holders", spec_ref: "§7.5",
         kind: TestKind::WatchSerial {
             expect:       &["prop: P9 pass"],

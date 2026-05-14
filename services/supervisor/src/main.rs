@@ -58,6 +58,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let _ = ctx.spawn("prop-p8-victim"); // P8: kill/respawn generation target
     let _ = ctx.spawn("prop-p8");        // P8 controller — starts cycling immediately
 
+    // Property-test probes — Milestone 9 Phase 3.
+    // P4 has no victim. P5 and P7 victims must be registered before their
+    // controllers so endpoints exist when the controllers start cycling.
+    let _ = ctx.spawn("prop-p4");
+    let _ = ctx.spawn("prop-p5-victim");
+    let _ = ctx.spawn("prop-p5");
+    let _ = ctx.spawn("prop-p7-victim");
+    let _ = ctx.spawn("prop-p7");
+
     // --- Original ping/pong services ---
     // Spawn pong first so the kernel registers "pong" in its name table before
     // ping is spawned (ping needs a SEND cap to pong at spawn time — §5 in

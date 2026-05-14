@@ -38,7 +38,7 @@ fn unlock() {
 // Entry layout.
 // ---------------------------------------------------------------------------
 
-const MAX_ENDPOINTS: usize = 16;
+const MAX_ENDPOINTS: usize = 32;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EndpointLiveness {
@@ -122,6 +122,21 @@ pub fn register(id: EndpointId, core_id: u32, generation: Generation) {
     }
     unlock();
     panic!("routing: endpoint table full (MAX_ENDPOINTS={})", MAX_ENDPOINTS);
+}
+
+/// Return the number of endpoints currently alive in the routing table.
+///
+/// Used by InspectKernel query 1 (P5 property test — §8.3).
+pub fn count_live_endpoints() -> u32 {
+    lock();
+    // SAFETY: lock held; read-only scan.
+    let count = unsafe {
+        TABLE.iter()
+            .filter(|e| e.valid && e.liveness == EndpointLiveness::Alive)
+            .count() as u32
+    };
+    unlock();
+    count
 }
 
 /// Return the current generation of `id` in the routing table, or INITIAL if not found.

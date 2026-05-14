@@ -270,6 +270,24 @@ impl ServiceContext {
         if ret < 0 { 0 } else { ret as u64 }
     }
 
+    /// Return the bytes dynamically allocated by this task so far.
+    ///
+    /// Wraps InspectKernel query 0. Used by property test P4 (§10.3).
+    pub fn inspect_kernel_alloc_bytes(&self) -> u64 {
+        // SAFETY: syscall(13) = InspectKernel; query_id=0 = task alloc bytes.
+        let ret = unsafe { raw_syscall(13, 0, 0, 0) };
+        if ret < 0 { 0 } else { ret as u64 }
+    }
+
+    /// Return the count of live endpoints in the kernel routing table.
+    ///
+    /// Wraps InspectKernel query 1. Used by property test P5 (§8.3).
+    pub fn inspect_kernel_endpoint_count(&self) -> u32 {
+        // SAFETY: syscall(13) = InspectKernel; query_id=1 = live endpoint count.
+        let ret = unsafe { raw_syscall(13, 1, 0, 0) };
+        if ret < 0 { 0 } else { ret as u32 }
+    }
+
     /// Query the rights bitfield of the cap at `handle`.
     ///
     /// Returns the rights byte as a u64, or `None` if the slot is empty.

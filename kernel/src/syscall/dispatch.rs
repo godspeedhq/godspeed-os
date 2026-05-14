@@ -530,6 +530,8 @@ unsafe fn handle_abort(msg_ptr: u64, msg_len: u64) -> i64 {
 ///   i64, or -1 if the name is not registered.
 unsafe fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     match query_id {
+        0 => scheduler::current_task_alloc_bytes() as i64,
+        1 => crate::ipc::routing::count_live_endpoints() as i64,
         2 => {
             // Endpoint generation by name.
             let len = arg2 as usize;
@@ -545,7 +547,13 @@ unsafe fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
                 Some(id) => id,
                 None     => return -1,
             };
-            let gen = crate::ipc::routing::get_generation(ep_id);
+            // Use the persistent capability table (append-only GLOBAL_RESOURCES)
+            // rather than the routing table, which recycles dead slots under
+            // concurrent respawns — reading routing::get_generation after a kill
+            // can race with another service's register() overwriting that slot.
+            let rid = crate::capability::cap::ResourceId::from(ep_id);
+            let gen = crate::capability::get_resource_generation(rid)
+                .unwrap_or(crate::capability::generation::Generation::INITIAL);
             gen.0 as i64
         }
         _ => -1,
