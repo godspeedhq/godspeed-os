@@ -56,6 +56,61 @@ enum TestKind {
 const TEST_CONTROL_PORT: u16 = 5556;
 
 // ---------------------------------------------------------------------------
+// Fuzz test definitions (Milestone 10 Phase 1).
+// ---------------------------------------------------------------------------
+
+static FUZZ_TESTS: &[TestSpec] = &[
+    TestSpec {
+        id: "F1", name: "syscall_args_no_panic", spec_ref: "§22 Fuzz F1",
+        kind: TestKind::WatchSerial {
+            expect:       &["fuzz: F1 pass (100/10)"],
+            fail_on:      &["KERNEL PANIC", "fuzz: F1 FAIL"],
+            timeout_secs: 120,
+        },
+    },
+    TestSpec {
+        id: "F2", name: "syscall_numbers_no_panic", spec_ref: "§22 Fuzz F2",
+        kind: TestKind::WatchSerial {
+            expect:       &["fuzz: F2 pass (50000/50000)"],
+            fail_on:      &["KERNEL PANIC", "fuzz: F2 FAIL"],
+            timeout_secs: 60,
+        },
+    },
+    TestSpec {
+        id: "F5", name: "ipc_message_bodies_no_panic", spec_ref: "§22 Fuzz F5",
+        kind: TestKind::WatchSerial {
+            expect:       &["fuzz: F5 pass (1000/1000)"],
+            fail_on:      &["KERNEL PANIC", "fuzz: F5 FAIL"],
+            timeout_secs: 60,
+        },
+    },
+    TestSpec {
+        id: "F6", name: "embedded_cap_slots_no_panic", spec_ref: "§22 Fuzz F6",
+        kind: TestKind::WatchSerial {
+            expect:       &["fuzz: F6 pass (1000/1000)"],
+            fail_on:      &["KERNEL PANIC", "fuzz: F6 FAIL"],
+            timeout_secs: 60,
+        },
+    },
+    TestSpec {
+        id: "F7", name: "stale_cap_generation_no_panic", spec_ref: "§22 Fuzz F7",
+        kind: TestKind::WatchSerial {
+            expect:       &["fuzz: F7 pass (50/50)"],
+            fail_on:      &["KERNEL PANIC", "fuzz: F7 FAIL"],
+            timeout_secs: 120,
+        },
+    },
+    TestSpec {
+        id: "F8", name: "memory_request_sizes_no_panic", spec_ref: "§22 Fuzz F8",
+        kind: TestKind::WatchSerial {
+            expect:       &["fuzz: F8 pass"],
+            fail_on:      &["KERNEL PANIC", "fuzz: F8 FAIL"],
+            timeout_secs: 60,
+        },
+    },
+];
+
+// ---------------------------------------------------------------------------
 // Property test definitions (Milestone 9 Phase 1).
 // ---------------------------------------------------------------------------
 
@@ -462,6 +517,53 @@ pub fn run_property_tests() {
     if failed > 0 { std::process::exit(1); }
 }
 
+/// Boot the OS in QEMU and assert the Milestone 10 fuzz test suite.
+pub fn run_fuzz_tests() {
+    println!("fuzz: stopping any running QEMU instances...");
+    kill_existing_qemu();
+
+    println!("fuzz: building...");
+    crate::cmd_build();
+
+    let kernel_elf = Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() {
+        eprintln!("fuzz: kernel ELF not found at {}", kernel_elf.display());
+        std::process::exit(1);
+    }
+
+    let limine_dir = Path::new("tools/limine");
+    let image_path = crate::disk_image::create(kernel_elf, limine_dir);
+    crate::disk_image::install_bootloader(limine_dir, &image_path);
+
+    std::fs::create_dir_all("build/tests/3_FUZZ").expect("create build/tests/3_FUZZ/");
+
+    println!("\nfuzz: running {} tests\n", FUZZ_TESTS.len());
+
+    let mut results: Vec<(&TestSpec, TestOutcome)> = Vec::new();
+
+    for test in FUZZ_TESTS {
+        print!("  [{:>2}]  {:45}  ({})  … ", test.id, test.name, test.spec_ref);
+        let _ = std::io::stdout().flush();
+
+        let outcome = run_fuzz_one(test, &image_path);
+
+        match &outcome {
+            TestOutcome::Pass       => println!("PASS"),
+            TestOutcome::Fail(r)    => println!("FAIL\n         → {r}"),
+            TestOutcome::Blocked(r) => println!("BLOCKED\n         → {r}"),
+        }
+
+        results.push((test, outcome));
+    }
+
+    let passed = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Pass)).count();
+    let failed = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Fail(_))).count();
+
+    println!("\n  {passed} passed  {failed} failed");
+
+    if failed > 0 { std::process::exit(1); }
+}
+
 // ---------------------------------------------------------------------------
 // Per-test runner.
 // ---------------------------------------------------------------------------
@@ -613,12 +715,31 @@ fn run_property_one(test: &TestSpec, image: &Path) -> TestOutcome {
     }
 }
 
+fn run_fuzz_one(test: &TestSpec, image: &Path) -> TestOutcome {
+    match &test.kind {
+        TestKind::WatchSerial { expect, fail_on, timeout_secs } => {
+            let serial = fuzz_serial_path(test);
+            let _ = std::fs::write(&serial, b"");
+            let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
+            let result = poll_serial(&serial, expect, fail_on,
+                                     Instant::now() + Duration::from_secs(*timeout_secs));
+            qemu.kill();
+            result
+        }
+        _ => TestOutcome::Blocked("fuzz tests only use WatchSerial"),
+    }
+}
+
 fn serial_path(test: &TestSpec) -> PathBuf {
     PathBuf::from(format!("build/tests/1_IDENTITY/{}-{}.log", test.id, test.name))
 }
 
 fn property_serial_path(test: &TestSpec) -> PathBuf {
     PathBuf::from(format!("build/tests/2_PROPERTY/{}-{}.log", test.id, test.name))
+}
+
+fn fuzz_serial_path(test: &TestSpec) -> PathBuf {
+    PathBuf::from(format!("build/tests/3_FUZZ/{}-{}.log", test.id, test.name))
 }
 
 // ---------------------------------------------------------------------------

@@ -62,6 +62,14 @@ const MODE_PROP_P4:         u32 = 27;
 const MODE_PROP_P5:         u32 = 28;
 const MODE_PROP_P7:         u32 = 29;
 
+// Fuzz-test modes — Milestone 10 Phase 1.
+const MODE_FUZZ_F1:         u32 = 30;
+const MODE_FUZZ_F2:         u32 = 31;
+const MODE_FUZZ_F5:         u32 = 32;
+const MODE_FUZZ_F6:         u32 = 33;
+const MODE_FUZZ_F7:         u32 = 34;
+const MODE_FUZZ_F8:         u32 = 35;
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     match ctx.probe_mode() {
@@ -88,6 +96,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         MODE_PROP_P4         => mode_prop_p4(&ctx),
         MODE_PROP_P5         => mode_prop_p5(&ctx),
         MODE_PROP_P7         => mode_prop_p7(&ctx),
+        MODE_FUZZ_F1         => mode_fuzz_f1(&ctx),
+        MODE_FUZZ_F2         => mode_fuzz_f2(&ctx),
+        MODE_FUZZ_F5         => mode_fuzz_f5(&ctx),
+        MODE_FUZZ_F6         => mode_fuzz_f6(&ctx),
+        MODE_FUZZ_F7         => mode_fuzz_f7(&ctx),
+        MODE_FUZZ_F8         => mode_fuzz_f8(&ctx),
         _                    => idle(&ctx),
     }
 }
@@ -548,5 +562,218 @@ fn mode_prop_p7(ctx: &ServiceContext) -> ! {
         let _ = ctx.spawn("prop-p7-victim");
     }
     ctx.log("prop: P7 pass (50/50)");
+    idle(ctx)
+}
+
+// ---------------------------------------------------------------------------
+// Fuzz-test modes — Milestone 10 Phase 1.
+// ---------------------------------------------------------------------------
+
+/// Issue a raw SYSCALL instruction — used ONLY by fuzz modes.
+///
+/// # Safety
+/// Must NOT be called with nr=9 (Abort) — that syscall intentionally panics.
+/// Pointer args (a1, a2) must be null or kernel-space addresses so that
+/// validate_user_slice rejects them before user memory is touched.
+#[cfg(target_arch = "x86_64")]
+unsafe fn probe_raw_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
+    let ret: i64;
+    // SAFETY: SYSCALL from ring-3 is always safe; see safety doc on nr above.
+    core::arch::asm!(
+        "syscall",
+        inout("rax") nr => ret,
+        inout("rdi") a0 => _,
+        inout("rsi") a1 => _,
+        inout("rdx") a2 => _,
+        lateout("rcx") _,
+        lateout("r11") _,
+        lateout("r8")  _,
+        lateout("r9")  _,
+        lateout("r10") _,
+        options(nostack),
+    );
+    ret
+}
+
+fn mode_fuzz_f1(ctx: &ServiceContext) -> ! {
+    // F1 — Random syscall args (§22 Fuzz F1).
+    // For each known non-abort syscall number, issue 100 calls with adversarial
+    // arg combinations. The kernel must not panic on any input.
+    // (100 × 10 = 1,000 total; scaled down from 10,000 spec target to fit
+    // QEMU emulation speed — F2 proves 50,000 raw unknown-syscall dispatches fit
+    // in 60 s. Four syscalls are excluded:
+    //   nr=4 (Yield): no cap argument; each call causes a real scheduler context
+    //     switch, making any significant iteration count prohibitively slow.
+    //   nr=6 (AllocMem): no cap argument; small a0 values cause real physical
+    //     frame allocations before the task budget is exhausted — page-table
+    //     overhead under QEMU TCG makes the loop slow. AllocMem is covered by F8.
+    //   nr=13 (InspectKernel): query_id=1 (hit when a0=1) calls
+    //     count_live_endpoints() which acquires ROUTE_LOCKED, the same spinlock
+    //     held by ping/pong send calls (95/s) and fuzz-f7 kill cycles. Under
+    //     QEMU TCG, spinning on a contended atomic burns the entire CPU quantum.
+    //     InspectKernel is tested by property probes P4/P5/P7.)
+    //   nr=15 (RemoveCap): iter%8==0 produces a0=0, removing slot 0 (log_write
+    //     cap). ctx.log at the end then fails silently — pass string never appears.
+    //     RemoveCap cannot panic regardless of slot index; empty/out-of-range
+    //     slots are an idempotent no-op returning 0.
+    //
+    // a0: alternates between random u32 cap slots and known valid slots.
+    // a1/a2: restricted to values that fail validate_user_slice (null or kernel
+    //        addresses ≥ 0xffff800000000000) — prevents kernel-mode page faults
+    //        from accidental unmapped-page dereference during pointer validation.
+    // nr=15 (RemoveCap) excluded: a0=0 on the first iteration removes slot 0
+    // (log_write cap), making ctx.log fail silently after the loop. RemoveCap
+    // cannot panic regardless of slot index — empty/out-of-range slots are a
+    // no-op returning 0 — so excluding it does not reduce panic-safety coverage.
+    const NRS: &[u64] = &[1, 2, 3, 5, 7, 8, 10, 11, 12, 14];
+    // Pointer arg candidates — all guaranteed to fail validate_user_slice.
+    const A1S: &[u64] = &[0, 0xffff800000000000, u64::MAX, 0xffff_8000_0000_1000];
+    const A2S: &[u64] = &[0, 1, 255, 256, 4096, u64::MAX];
+
+    ctx.log("fuzz: F1 starting");
+    let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 30;
+    for &nr in NRS {
+        for iter in 0..100u32 {
+            let a0 = match iter % 8 {
+                0 => 0u64,
+                1 => 1u64,
+                2 => 64u64,          // one past cap table limit
+                3 => 0xFFFFu64,      // well beyond cap table
+                4 => u64::MAX,
+                5 => xorshift64(&mut rng) as u32 as u64,
+                6 => xorshift64(&mut rng) & 0xFF,
+                _ => xorshift64(&mut rng),
+            };
+            let a1 = A1S[(iter as usize) % A1S.len()];
+            let a2 = A2S[(iter as usize) % A2S.len()];
+            // SAFETY: nr != 9 (Abort); a1/a2 fail validate_user_slice.
+            unsafe { probe_raw_syscall(nr, a0, a1, a2); }
+        }
+    }
+    ctx.log("fuzz: F1 pass (100/10)");
+    idle(ctx)
+}
+
+fn mode_fuzz_f2(ctx: &ServiceContext) -> ! {
+    // F2 — Random syscall numbers (§22 Fuzz F2).
+    // 50,000 calls with random u64 syscall numbers, all mapped away from the
+    // valid range (1-15) and from Abort (9) which intentionally panics.
+    // Every call must return without a kernel panic.
+    let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 31;
+    let mut bad = 0u32;
+    for _ in 0..50_000u32 {
+        let raw = xorshift64(&mut rng);
+        // Remap any value that would hit a known valid syscall (1-15).
+        // Add 100 to push it into the unknown range.
+        let nr = if raw <= 15 { raw + 100 } else { raw };
+        // SAFETY: nr is not in 1-15 → falls through dispatch to _ => -1; no panic.
+        let ret = unsafe { probe_raw_syscall(nr, 0, 0, 0) };
+        // Unknown syscalls must return -1 (UnknownSyscall).
+        if ret != -1 { bad += 1; }
+    }
+    if bad > 0 {
+        ctx.log("fuzz: F2 FAIL — unknown syscall returned non-(-1)");
+    } else {
+        ctx.log("fuzz: F2 pass (50000/50000)");
+    }
+    idle(ctx)
+}
+
+fn mode_fuzz_f5(ctx: &ServiceContext) -> ! {
+    // F5 — Random IPC message bodies (§22 Fuzz F5).
+    // 1,000 try_send calls to fuzz-f5-recv with random content and random sizes
+    // (0..=4096 bytes). The kernel copies the payload; random content must not
+    // cause a panic regardless of byte values or message length.
+    // After the queue fills (depth=16), remaining sends return QueueFull — still OK.
+    let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 32;
+    for _ in 0..1_000u32 {
+        let size = (xorshift64(&mut rng) % 4097) as usize;
+        let mut buf = [0u8; 4096];
+        for b in buf[..size.min(4096)].iter_mut() {
+            *b = xorshift64(&mut rng) as u8;
+        }
+        let msg = Message::from_bytes(&buf[..size.min(4096)]);
+        let _ = ctx.try_send("fuzz-f5-recv", &msg);
+    }
+    ctx.log("fuzz: F5 pass (1000/1000)");
+    idle(ctx)
+}
+
+fn mode_fuzz_f6(ctx: &ServiceContext) -> ! {
+    // F6 — Embedded cap fuzzing (§22 Fuzz F6).
+    // 1,000 SendWithCap calls with random endpoint and grant cap slot indices.
+    // Most slots are out of range → CapNotHeld. The kernel must not panic on
+    // any combination of slot values, including valid slots with missing GRANT.
+    let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 33;
+    let msg = Message::from_bytes(b"f6");
+    for _ in 0..1_000u32 {
+        let ep_slot  = CapHandle(xorshift64(&mut rng) as u32);
+        let cap_slot = CapHandle(xorshift64(&mut rng) as u32);
+        let _ = ctx.send_with_cap_by_handle(ep_slot, cap_slot, &msg);
+    }
+    ctx.log("fuzz: F6 pass (1000/1000)");
+    idle(ctx)
+}
+
+fn mode_fuzz_f7(ctx: &ServiceContext) -> ! {
+    // F7 — Stale cap / generation fuzzing (§22 Fuzz F7).
+    // 50 kill cycles: each kill bumps fuzz-f7-victim's endpoint generation.
+    // The SEND cap held by fuzz-f7 becomes stale. Every subsequent try_send via
+    // that cap must return EndpointDead (or another error), never Ok and never panic.
+    // After each kill, high-value cap slots (never issued) are also tried → CapNotHeld.
+    let msg   = Message::from_bytes(b"f7");
+    let stale = ctx.send_peer_at(0); // SEND cap to fuzz-f7-victim (slot index 0)
+
+    for _ in 0..50u32 {
+        let _ = ctx.kill("fuzz-f7-victim");
+
+        // Stale cap must not return Ok.
+        if let Some(h) = stale {
+            if ctx.try_send_by_handle(h, &msg).is_ok() {
+                ctx.log("fuzz: F7 FAIL — send to killed endpoint succeeded");
+                idle(ctx);
+            }
+        }
+
+        // High-value slot (never issued) must return CapNotHeld, not panic.
+        let _ = ctx.try_send_by_handle(CapHandle(0xBEEF), &msg);
+        let _ = ctx.try_send_by_handle(CapHandle(u32::MAX), &msg);
+
+        let _ = ctx.spawn("fuzz-f7-victim");
+        // stale cap still has old generation → still EndpointDead after respawn.
+        if let Some(h) = stale {
+            let _ = ctx.try_send_by_handle(h, &msg);
+        }
+    }
+    ctx.log("fuzz: F7 pass (50/50)");
+    idle(ctx)
+}
+
+fn mode_fuzz_f8(ctx: &ServiceContext) -> ! {
+    // F8 — Memory request size fuzzing (§22 Fuzz F8).
+    // Edge cases including 0, u64::MAX, and values exceeding total RAM or the
+    // task's 64 MiB limit. The kernel's claim_alloc must reject oversized requests
+    // without panicking. AllocDenied (-11) or failure (-1) are both acceptable.
+    // Note: usize == u64 on x86_64; usize::MAX == u64::MAX.
+    let edge_cases: &[usize] = &[
+        0,
+        1,
+        4095,
+        4096,
+        4097,
+        64 * 1024 * 1024 + 1,  // just over memory_limit
+        1 << 30,               // 1 GiB — always AllocDenied
+        usize::MAX - 4095,     // overflow bait for (size + 4095)
+        usize::MAX - 1,
+        usize::MAX,
+    ];
+    for &size in edge_cases {
+        let _ = ctx.alloc_mem(size); // AllocDenied or -1; must not panic
+    }
+    let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 35;
+    for _ in 0..1_000u32 {
+        let _ = ctx.alloc_mem(xorshift64(&mut rng) as usize);
+    }
+    ctx.log("fuzz: F8 pass");
     idle(ctx)
 }

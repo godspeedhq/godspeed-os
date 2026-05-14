@@ -10,6 +10,8 @@
 //!   osdev status <service>  — show state + assigned core
 //!   osdev caps <service>    — show held capabilities
 //!   osdev test identity     — run §22 identity test suite
+//!   osdev test property     — run §22 property test suite
+//!   osdev test fuzz         — run §22 fuzz test suite (Milestone 10)
 
 mod disk_image;
 mod qemu;
@@ -213,6 +215,7 @@ fn cmd_test(suite: &str) {
     match suite {
         "identity" => crate::validator::run_identity_tests(),
         "property" => crate::validator::run_property_tests(),
+        "fuzz"     => crate::validator::run_fuzz_tests(),
         other => eprintln!("unknown test suite: {}", other),
     }
 }

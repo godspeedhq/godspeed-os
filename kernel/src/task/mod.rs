@@ -566,6 +566,95 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        29, // MODE_PROP_P7
             memory_limit:      64 * 1024 * 1024,
         })),
+        // ----------------------------------------------------------------
+        // Fuzz-test probes — Milestone 10.
+        // Recv-endpoint victims must be listed before their fuzz controllers.
+        // ----------------------------------------------------------------
+        "fuzz-f1" => Some(("fuzz-f1", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        30, // FUZZ_F1: random syscall args
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "fuzz-f2" => Some(("fuzz-f2", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        31, // FUZZ_F2: random syscall numbers
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // F5: IPC message body fuzzing — recv target first.
+        "fuzz-f5-recv" => Some(("fuzz-f5-recv", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0, // PASSIVE — soaks up random messages
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "fuzz-f5" => Some(("fuzz-f5", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &["fuzz-f5-recv"],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        32, // FUZZ_F5: random IPC message bodies
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // F6: embedded cap fuzzing — recv target first.
+        "fuzz-f6-recv" => Some(("fuzz-f6-recv", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0, // PASSIVE — receives (or rejects) cap-embedded messages
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "fuzz-f6" => Some(("fuzz-f6", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &["fuzz-f6-recv"],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        33, // FUZZ_F6: random embedded cap slot indices
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // F7: stale cap / generation fuzzing — victim first.
+        "fuzz-f7-victim" => Some(("fuzz-f7-victim", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0, // PASSIVE — killed/respawned by fuzz-f7
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "fuzz-f7" => Some(("fuzz-f7", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &["fuzz-f7-victim"],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        34, // FUZZ_F7: stale-cap sends after kill
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // F8: memory request size fuzzing — no peers needed.
+        "fuzz-f8" => Some(("fuzz-f8", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        35, // FUZZ_F8: edge-case + random memory request sizes
+            memory_limit:      64 * 1024 * 1024,
+        })),
         _ => None,
     }
 }

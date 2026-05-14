@@ -67,6 +67,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let _ = ctx.spawn("prop-p7-victim");
     let _ = ctx.spawn("prop-p7");
 
+    // --- Fuzz-test probes — Milestone 10 Phase 1 ---
+    // Recv-endpoint victims/targets must be spawned before their controllers.
+    let _ = ctx.spawn("fuzz-f1");
+    let _ = ctx.spawn("fuzz-f2");
+    let _ = ctx.spawn("fuzz-f5-recv");
+    let _ = ctx.spawn("fuzz-f5");
+    let _ = ctx.spawn("fuzz-f6-recv");
+    let _ = ctx.spawn("fuzz-f6");
+    let _ = ctx.spawn("fuzz-f7-victim");
+    let _ = ctx.spawn("fuzz-f7");
+    let _ = ctx.spawn("fuzz-f8");
+
     // --- Original ping/pong services ---
     // Spawn pong first so the kernel registers "pong" in its name table before
     // ping is spawned (ping needs a SEND cap to pong at spawn time — §5 in

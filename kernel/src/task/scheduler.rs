@@ -377,14 +377,16 @@ pub fn current_task_claim_alloc(size: u64) -> Option<u64> {
         let cur = CORE_CURRENT[cid];
         if cur >= MAX_TASKS || !TASK_VALID[cur] { return None; }
 
-        let aligned = (size + 4095) & !4095;
+        // Overflow guard: (size + 4095) wraps for very large values (e.g. u64::MAX).
+        // saturating to u64::MAX guarantees the budget check rejects the request.
+        let aligned = size.checked_add(4095).map(|v| v & !4095).unwrap_or(u64::MAX);
         let already = TASK_ALLOC_BYTES[cur];
         let limit   = TASK_LIMIT_BYTES[cur];
         if already.saturating_add(aligned) > limit { return None; }
 
         let va = TASK_NEXT_ALLOC_VA[cur];
-        TASK_ALLOC_BYTES[cur]   = already + aligned;
-        TASK_NEXT_ALLOC_VA[cur] = va + aligned;
+        TASK_ALLOC_BYTES[cur]   = already.saturating_add(aligned);
+        TASK_NEXT_ALLOC_VA[cur] = va.saturating_add(aligned);
         Some(va)
     }
 }
