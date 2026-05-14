@@ -196,10 +196,10 @@ never acceptable.
 
 ## Implementation Checklist
 
-- [x] `milestones/v1/14_CHAOS_TESTS.md` — this file
-- [x] `services/probe/src/main.rs` — modes 91–96, dispatch arms, implementations
-- [x] `kernel/src/task/mod.rs` — 8 new service configs (chaos-c2 through chaos-c7)
-- [x] `services/supervisor/src/main.rs` — chaos probe spawns (victim-before-controller)
-- [x] `osdev/src/validator.rs` — `CHAOS_TESTS`, `run_chaos_tests()`, `run_chaos_one()`, `DegradedSmp`/`DegradedEnv` test kinds
-- [x] `osdev/src/qemu.rs` — `spawn_for_test_custom()` (custom smp + ram_mib)
-- [x] `osdev/src/main.rs` — `"chaos" => run_chaos_tests()`, docstring
+- ✅ `milestones/v1/14_CHAOS_TESTS.md` — this file
+- ✅ `services/probe/src/main.rs` — modes 91–96, dispatch arms, implementations
+- ✅ `kernel/src/task/mod.rs` — 8 new service configs (chaos-c2 through chaos-c7)
+- ✅ `services/supervisor/src/main.rs` — chaos probe spawns (victim-before-controller)
+- ✅ `osdev/src/validator.rs` — `CHAOS_TESTS`, `run_chaos_tests()`, `run_chaos_one()`, `DegradedSmp`/`DegradedEnv` test kinds
+- ✅ `osdev/src/qemu.rs` — `spawn_for_test_custom()` (custom smp + ram_mib)
+- ✅ `osdev/src/main.rs` — `"chaos" => run_chaos_tests()`, docstring

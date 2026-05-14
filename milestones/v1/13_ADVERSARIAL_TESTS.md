@@ -1,7 +1,7 @@
 # Milestone 13 — Adversarial / Red-Team Tests
 
-**Status:** ✅ 10/10 implemented — all pass  
-**Spec ref:** §22 Adversarial / Red-Team Tests  
+**Status:** ✅ 10/10 implemented — all pass
+**Spec ref:** §22 Adversarial / Red-Team Test
 **Command:** `osdev test adv`
 
 ---
@@ -135,7 +135,7 @@ panic.
 Each attack logs `adv: AN pass` on success. The harness passes if all 10 "pass" lines
 appear within their timeout without a `KERNEL PANIC`.
 
-**No attack must succeed where the spec says it fails.**  
+**No attack must succeed where the spec says it fails.**
 **No attack must panic the kernel.**
 
 ---
