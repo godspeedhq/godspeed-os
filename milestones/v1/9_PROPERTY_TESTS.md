@@ -358,11 +358,31 @@ cycle with deliberate inter-core delay to expose races).
 
 ### Phase 3 results
 
+Two kernel bugs were found and fixed during Phase 3 implementation:
+
+**Bug 1: Task re-animation via `wake_by_slot` on killed slot.**
+When `kill_task_by_slot(slot)` called `kill_endpoint`, the endpoint's
+`blocked_receiver` was often the killed slot itself (the task was blocked on
+recv of its own endpoint). `wake_by_slot(slot, -7)` then overwrote `Dead`
+with `Ready`, re-animating the dying task with freed page tables. The fix:
+skip `wake_by_slot` when `s == slot`; force `TASK_STATE[slot] = Dead` as the
+final write before `TASK_VALID[slot] = false`. This eliminated a cascade:
+user-mode PF at −7 → second kill of the reused slot → kernel PF when
+`reclaim_user_frames` tried to access a phantom physical address via HHDM.
+
+**Bug 2: Phantom frame poisoning the allocator.**
+`reclaim_user_frames` can encounter PTEs with physical addresses beyond actual
+RAM if the page table is corrupted (a consequence of Bug 1). `free_frame`
+accepted these phantom addresses and set bits in the bitmap, making
+`alloc_frame` hand them out. The fix: `BitmapAllocator` tracks
+`max_valid_frame` (the highest frame ever marked usable during `init_from_map`)
+and `free` silently discards any frame index at or above that value.
+
 | ID  | Property                                              | Iterations | Result  |
 |-----|-------------------------------------------------------|------------|---------|
-| P4  | ∑ alloc_bytes ≡ pages mapped after any alloc sequence | 500        | Pending |
-| P5  | Every live endpoint has exactly one owning task       | 200        | Pending |
-| P7  | After unmap + TLB shootdown, page unreadable          | 50         | Pending |
+| P4  | ∑ alloc_bytes ≡ pages mapped after any alloc sequence | 500        | ✅ PASS  |
+| P5  | Every live endpoint has exactly one owning task       | 200        | ✅ PASS  |
+| P7  | After unmap + TLB shootdown, page unreadable          | 50         | ✅ PASS  |
 
 ---
 
@@ -373,10 +393,10 @@ cycle with deliberate inter-core delay to expose races).
 | P1  | Random cap bytes → CapNotHeld; never accepted         | §7.3, §3.1            | 10,000         | 1     | ✅ PASS  |
 | P2  | Generation strictly monotonic across lifetime         | §7.5                  | 3 × 2 cycles   | 2     | ✅ PASS  |
 | P3  | Cap rights never widen during transfer                | §7.3                  | 5,000          | 2     | ✅ PASS  |
-| P4  | ∑ alloc_bytes ≡ pages mapped after any alloc sequence | §10.3                 | 500            | 3     | Pending |
-| P5  | Every live endpoint has exactly one owning task       | §8.3                  | 200            | 3     | Pending |
+| P4  | ∑ alloc_bytes ≡ pages mapped after any alloc sequence | §10.3                 | 500            | 3     | ✅ PASS  |
+| P5  | Every live endpoint has exactly one owning task       | §8.3                  | 200            | 3     | ✅ PASS  |
 | P6  | Queue invariants hold at all depths                   | §8.5                  | 500            | 2     | ✅ PASS  |
-| P7  | After unmap + TLB shootdown, page unreadable          | §10.5                 | 50             | 3     | Pending |
+| P7  | After unmap + TLB shootdown, page unreadable          | §10.5                 | 50             | 3     | ✅ PASS  |
 | P8  | After restart, name resolves to higher generation     | §14.2, §8.3           | 5 cycles       | 2     | ✅ PASS  |
 | P9  | Generation bump invalidates ALL holders               | §7.5                  | 3 slots        | 1     | ✅ PASS  |
 | P10 | Every send returns exactly one defined outcome        | §8.6                  | 10,000         | 1     | ✅ PASS  |

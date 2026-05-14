@@ -59,11 +59,15 @@ struct BitmapAllocator {
     free_frames: usize,
     /// Byte-index scan hint — avoids rescanning from 0 on every alloc.
     next_byte: usize,
+    /// Highest frame index (exclusive) that was ever marked usable.
+    /// Any frame index at or above this value was never handed out by the
+    /// allocator and must not be accepted by `free`.
+    max_valid_frame: usize,
 }
 
 impl BitmapAllocator {
     const fn new() -> Self {
-        Self { free_frames: 0, next_byte: 0 }
+        Self { free_frames: 0, next_byte: 0, max_valid_frame: 0 }
     }
 
     unsafe fn init_from_map(&mut self, boot_info: &BootInfo) {
@@ -81,6 +85,12 @@ impl BitmapAllocator {
 
             let first = (start / FRAME_SIZE) as usize;
             let last  = (end   / FRAME_SIZE) as usize; // exclusive
+
+            // Track the highest valid frame so free_frame can reject phantom
+            // addresses (page-table entries from corrupted/reanimated tasks).
+            if last > self.max_valid_frame {
+                self.max_valid_frame = last;
+            }
 
             for idx in first..last {
                 if idx >= MAX_FRAMES { break; }
@@ -129,6 +139,18 @@ impl BitmapAllocator {
 
     unsafe fn free(&mut self, frame: Frame) {
         let idx = frame.frame_number() as usize;
+        // Reject phantom frames: addresses that were never in the usable RAM
+        // range.  These arise when a corrupt or stale page-table entry (from a
+        // re-animated dead task) is walked and freed.  Setting a bit for an
+        // out-of-range frame would allow alloc to return a phantom address,
+        // which would then fault the kernel on its next HHDM access.
+        if idx >= self.max_valid_frame {
+            crate::kprintln!(
+                "free_frame: IGNORED phantom frame idx={} (max_valid={})",
+                idx, self.max_valid_frame
+            );
+            return;
+        }
         debug_assert!(idx < MAX_FRAMES, "free_frame: address out of range");
         // SAFETY: idx within bounds; caller guarantees exclusive ownership.
         unsafe { bitmap_set_free(idx) };

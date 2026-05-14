@@ -389,6 +389,19 @@ pub fn current_task_claim_alloc(size: u64) -> Option<u64> {
     }
 }
 
+/// Return the bytes dynamically allocated so far by the current task.
+///
+/// Used by InspectKernel query 0 (P4 property test — §10.3).
+pub fn current_task_alloc_bytes() -> u64 {
+    let cid = current_core_id();
+    // SAFETY: IF=0 in syscall context; single core reader for this slot.
+    unsafe {
+        let cur = CORE_CURRENT[cid];
+        if cur >= MAX_TASKS || !TASK_VALID[cur] { return 0; }
+        TASK_ALLOC_BYTES[cur]
+    }
+}
+
 /// Insert a capability into the current task's table (incoming GRANT).
 pub fn current_task_insert_cap(cap: Capability) -> Result<usize, CapError> {
     let cid = current_core_id();
@@ -712,8 +725,13 @@ pub fn kill_task_by_slot(slot: usize) {
         if let Some(ep_id) = TASK_ENDPOINT[slot] {
             // Bump generation in routing table and wake any blocked tasks.
             let (rx_slot, tx_slot) = crate::ipc::routing::kill_endpoint(ep_id);
-            if let Some(s) = rx_slot { wake_by_slot(s, -7); } // -7 = EndpointDead
-            if let Some(s) = tx_slot { wake_by_slot(s, -7); }
+            // Skip waking `slot` itself: the killed task's rx/tx slot is often
+            // its own slot (the task was blocked on recv of its own endpoint).
+            // Calling wake_by_slot(slot, -7) would overwrite the Dead state with
+            // Ready, causing the scheduler to re-animate the dying task with its
+            // freed page tables — the root cause of the use-after-free cascade.
+            if let Some(s) = rx_slot { if s != slot { wake_by_slot(s, -7); } }
+            if let Some(s) = tx_slot { if s != slot { wake_by_slot(s, -7); } }
 
             // Mark resource dead in global cap table so generation check fails.
             let resource_id = crate::capability::cap::ResourceId::from(ep_id);
@@ -787,7 +805,13 @@ pub fn kill_task_by_slot(slot: usize) {
             super::free_kstack(TASK_KERNEL_STACK_TOP[slot]);
         }
 
-        // Release the slot so reserve_task_slot can reuse it.
+        // Final state reset: force Dead before releasing the slot.
+        // This guards against any code path (e.g. a concurrent wake_by_slot on
+        // a different endpoint) that may have set the state to Ready between the
+        // initial Dead store and now.  reserve_task_slot sets TASK_VALID=true
+        // before commit_task sets state=Ready; if state were Ready here, the
+        // scheduler could pick up the slot with the old stale context.
+        TASK_STATE[slot].store(TaskState::Dead as u8, Ordering::Release);
         TASK_VALID[slot] = false;
     }
 }
