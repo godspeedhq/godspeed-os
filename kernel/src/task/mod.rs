@@ -23,7 +23,7 @@ use crate::memory::frame::PhysAddr;
 // Kernel stack pool — one 64 KiB stack per ring-3 task (§14.1).
 // ---------------------------------------------------------------------------
 
-const TASK_KSTACK_MAX: usize = 160; // raised from 140 to accommodate Milestone 17 brutal fuzz probes
+const TASK_KSTACK_MAX: usize = 192; // raised from 160 to accommodate Milestone 18 brutal stress probes
 const KSTACK_SIZE:     usize = 64 * 1024;
 
 // Magic value written at the BOTTOM of each kstack slot (byte offset 0 within
@@ -1066,6 +1066,182 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  false,
             preferred_core:    1, // cross-core: 1 → 2
             probe_mode:        50, // STRESS_S9_SEND: 500 blocking sends to s9-recv
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // ----------------------------------------------------------------
+        // Brutal stress-test probes — Milestone 18.
+        // Ordering: recv-endpoint victims before controllers; receivers before senders.
+        // ----------------------------------------------------------------
+        // BS1: IPC saturation, 5× S1.
+        "stress-bs1-recv" => Some(("stress-bs1-recv", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0, // PASSIVE — queue fills; bs1 measures saturation
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "stress-bs1" => Some(("stress-bs1", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &["stress-bs1-recv"],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        120, // STRESS_BS1: 50k try_send
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BS2: restart storm, 4× S2.
+        "stress-bs2-victim" => Some(("stress-bs2-victim", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0, // PASSIVE
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "stress-bs2" => Some(("stress-bs2", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &["stress-bs2-victim"],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        121, // STRESS_BS2: 200 kill/respawn cycles
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BS3: cross-core thrash, 4× S3. Receiver on core 1, sender on core 0.
+        "stress-bs3-recv" => Some(("stress-bs3-recv", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    1,
+            probe_mode:        123, // STRESS_BS3_RECV: drain 2000 cross-core messages
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "stress-bs3-send" => Some(("stress-bs3-send", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &["stress-bs3-recv"],
+            send_peers_grant:  false,
+            preferred_core:    0,
+            probe_mode:        122, // STRESS_BS3_SEND: 2000 blocking sends
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BS4: cap table churn, 5× S4. Victim before controller; 2 send_peers slots.
+        "stress-bs4-victim" => Some(("stress-bs4-victim", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0, // PASSIVE
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "stress-bs4" => Some(("stress-bs4", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &["stress-bs4-victim", "stress-bs4-victim"],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        124, // STRESS_BS4: 50 churn cycles; 2 cap slots
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BS5: generation integrity, 5× S5. Victim before controller.
+        "stress-bs5-victim" => Some(("stress-bs5-victim", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0, // PASSIVE
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "stress-bs5" => Some(("stress-bs5", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        125, // STRESS_BS5: 5000 kill/respawn; generation monotonic
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BS6: self-ping stability, 4× S6. Self-referential send_peers.
+        "stress-bs6" => Some(("stress-bs6", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &["stress-bs6"],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        126, // STRESS_BS6: 20000 self-ping rounds
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BS7: memory pressure, 5× S7.
+        "stress-bs7" => Some(("stress-bs7", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        127, // STRESS_BS7: 500 alloc passes
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BS8: scheduler heartbeat, 5× S8.
+        "stress-bs8" => Some(("stress-bs8", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        128, // STRESS_BS8: 3000 yields
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BS9: IPI storm, 5× S9. Receiver on core 2; two senders on cores 0, 1.
+        "stress-bs9-recv" => Some(("stress-bs9-recv", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    2,
+            probe_mode:        130, // STRESS_BS9_RECV: drain 5000 msgs
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "stress-bs9-send-a" => Some(("stress-bs9-send-a", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &["stress-bs9-recv"],
+            send_peers_grant:  false,
+            preferred_core:    0,
+            probe_mode:        129, // STRESS_BS9_SEND: 2500 sends
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "stress-bs9-send-b" => Some(("stress-bs9-send-b", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &["stress-bs9-recv"],
+            send_peers_grant:  false,
+            preferred_core:    1,
+            probe_mode:        129, // STRESS_BS9_SEND: 2500 sends
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BS10: cascading revocation, 50 cycles. Victim on core 1; controller on core 0.
+        "stress-bs10-victim" => Some(("stress-bs10-victim", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    1,
+            probe_mode:        0, // PASSIVE
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "stress-bs10" => Some(("stress-bs10", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &["stress-bs10-victim", "stress-bs10-victim", "stress-bs10-victim"],
+            send_peers_grant:  false,
+            preferred_core:    0,
+            probe_mode:        131, // STRESS_BS10: 50 kill/respawn cycles; 3 cap slots
             memory_limit:      64 * 1024 * 1024,
         })),
         // ----------------------------------------------------------------

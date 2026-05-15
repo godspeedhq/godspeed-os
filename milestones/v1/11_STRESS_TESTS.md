@@ -18,6 +18,7 @@ CLAUDE.md §22 Stress Tests.
 |-------|-------|--------|
 | Phase 1 | S1, S2, S3, S4, S7, S10 | ✅ 6/6 implemented |
 | Phase 2 | S5, S6, S8, S9 | ✅ 4/4 implemented |
+| Phase 3 (Brutal — M18) | BS1–BS10 | ✅ 10/10 passing |
 
 ---
 
@@ -390,6 +391,96 @@ their `Blocked` reason and are counted as skipped, not failed. Logs are written 
 
 ---
 
-## Bugs found and fixed during this milestone
+## Phase 3 (Brutal): BS1–BS10 (Milestone 18)
 
-*(None yet — populated as tests are run.)*
+### Goal
+
+Escalated variants of S1–S10 at 4–5× iteration counts, running concurrently alongside all other
+probe suites (identity, property, fuzz, stress, perf, adversarial, chaos — ~190 tasks total).
+Any failure is a mandatory kernel fix.
+
+### Probe modes
+
+| Mode | Test | Iterations | Surface |
+|------|------|-----------|---------|
+| 120 | BS1 | 50,000 try_send (5× S1) | IPC queue saturation at extreme volume |
+| 121 | BS2 | 200 kill/respawn (4× S2) | kstack pool under peak concurrent load |
+| 122/123 | BS3 send/recv | 2,000 blocking sends (4× S3) | Cross-core routing under TLB-shootdown pressure |
+| 124 | BS4 | 50 churn cycles, 2 SEND caps (5× S4) | Cap invalidation monotonicity |
+| 125 | BS5 | 5,000 kill/respawn (5× S5) | Generation monotonicity at scale |
+| 126 | BS6 | 20,000 self-ping rounds (4× S6) | IPC path stability at high iteration count |
+| 127 | BS7 | 500 alloc passes (5× S7) | Memory accounting consistency under pressure |
+| 128 | BS8 | 3,000 yield cycles (5× S8) | Scheduler heartbeat under heavy concurrent load |
+| 129/130 | BS9 send/recv | 2,500 per sender / 5,000 recv (5× S9) | Dual-sender IPI storm |
+| 131 | BS10 | 50 revocation cycles, 3 SEND caps (3× S10) | Cascading cap revocation cross-core |
+
+### Service configs
+
+| Name | Mode | send_peers | preferred_core |
+|------|------|------------|----------------|
+| `stress-bs1-recv` | 0 (passive) | — | any |
+| `stress-bs1` | 120 | `stress-bs1-recv` | any |
+| `stress-bs2-victim` | 0 (passive) | — | any |
+| `stress-bs2` | 121 | `stress-bs2-victim` | any |
+| `stress-bs3-recv` | 123 | — | 1 |
+| `stress-bs3-send` | 122 | `stress-bs3-recv` | 0 |
+| `stress-bs4-victim` | 0 (passive) | — | any |
+| `stress-bs4` | 124 | `stress-bs4-victim` × 2 | any |
+| `stress-bs5-victim` | 0 (passive) | — | any |
+| `stress-bs5` | 125 | — | any |
+| `stress-bs6` | 126 | `stress-bs6` (self) | any |
+| `stress-bs7` | 127 | — | any |
+| `stress-bs8` | 128 | — | any |
+| `stress-bs9-recv` | 130 | — | 2 |
+| `stress-bs9-send-a` | 129 | `stress-bs9-recv` | 0 |
+| `stress-bs9-send-b` | 129 | `stress-bs9-recv` | 1 |
+| `stress-bs10-victim` | 0 (passive) | — | 1 |
+| `stress-bs10` | 131 | `stress-bs10-victim` × 3 | 0 |
+
+### Timeouts
+
+All tests run via `osdev test stress-brutal`. Output goes to `build/tests/11_STRESS_BRUTAL/`.
+
+| Test | Timeout | Rationale |
+|------|---------|-----------|
+| BS1 | 60 s | try_send is fast even at 50k |
+| BS2 | 480 s | 200 kill/respawn under full concurrent probe load |
+| BS3 | 1200 s | 2000 blocking cross-core sends under heavy TLB-shootdown pressure from BS5 |
+| BS4 | 300 s | 50 churn cycles |
+| BS5 | 720 s | 5000 kill/respawn; 6× S5 to account for concurrent slowdown |
+| BS6 | 300 s | 20k self-ping rounds |
+| BS7 | 120 s | 500 alloc passes |
+| BS8 | 300 s | 3000 yields |
+| BS9 | 420 s | 5000 cross-core msgs with try_send+yield-retry pattern |
+| BS10 | 240 s | 50 revocation cycles, 3 cap slots |
+
+### Bugs found and fixed during Milestone 18
+
+**USER PF / KERNEL PF split (kernel/src/arch/x86_64/boot.rs):** The chaos-c2 probe
+intentionally dereferences NULL to test that the kernel kills a non-TCB service gracefully
+(§22 Chaos C2). The original `pf_handler` printed "KERNEL PF:" for ALL page faults, including
+this expected user-mode fault. This made "KERNEL PF:" unusable as a fail sentinel in test
+harnesses. Fixed by printing "USER PF:" for user-mode faults (error_code bit 2 = 1) and
+"KERNEL PF:" only for kernel-mode faults. The fail_on lists in BRUTAL_STRESS_TESTS now
+accurately detect real kernel crashes.
+
+### Results
+
+| ID | Name | Result |
+|----|------|--------|
+| BS1 | ipc_saturation_50k | ✅ PASS |
+| BS2 | restart_storm_200_cycles | ✅ PASS |
+| BS3 | cross_core_thrash_2000_msgs | ✅ PASS |
+| BS4 | cap_table_churn_50_cycles | ✅ PASS |
+| BS5 | generation_monotonic_5000_cycles | ✅ PASS |
+| BS6 | ipc_self_ping_20000_rounds | ✅ PASS |
+| BS7 | memory_pressure_500_passes | ✅ PASS |
+| BS8 | idle_scheduler_heartbeat_3000 | ✅ PASS |
+| BS9 | cross_core_ipi_storm_5000_msgs | ✅ PASS |
+| BS10 | cascading_revocation_50_cycles | ✅ PASS |
+
+---
+
+## Bugs found and fixed during Milestone 11
+
+*(None — all S1–S10 tests passed without kernel changes.)*

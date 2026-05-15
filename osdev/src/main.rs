@@ -16,6 +16,7 @@
 //!   osdev test fuzz         — run §22 fuzz test suite (Milestone 10)
 //!   osdev test fuzz-brutal  — run brutal fuzz tests BF1–BF8 (Milestone 17)
 //!   osdev test stress       — run §22 stress test suite (Milestone 11)
+//!   osdev test stress-brutal — run brutal stress tests BS1–BS10 (Milestone 18)
 //!   osdev test perf         — run §22 performance benchmark suite (Milestone 12)
 //!   osdev test adv          — run §22 adversarial / red-team test suite (Milestone 13)
 //!   osdev test chaos        — run §22 chaos / graceful-degradation test suite (Milestone 14)
@@ -226,7 +227,8 @@ fn cmd_test(suite: &str) {
         "property-brutal" => crate::validator::run_brutal_property_tests(),
         "fuzz"        => crate::validator::run_fuzz_tests(),
         "fuzz-brutal" => crate::validator::run_brutal_fuzz_tests(),
-        "stress"   => crate::validator::run_stress_tests(),
+        "stress"      => crate::validator::run_stress_tests(),
+        "stress-brutal" => crate::validator::run_brutal_stress_tests(),
         "perf"     => crate::validator::run_perf_tests(),
         "adv"      => crate::validator::run_adv_tests(),
         "chaos"    => crate::validator::run_chaos_tests(),

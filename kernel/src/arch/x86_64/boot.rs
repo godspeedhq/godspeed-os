@@ -757,8 +757,15 @@ unsafe extern "C" fn pf_handler(error_code: u64, fault_rip: u64, hw_user_rsp: u6
     }
     // Use lock-free serial to avoid a deadlock if LOG_LOCK is already held
     // by the kprintln that was interrupted (interrupt gate: IF=0).
+    // Bit 2 of error_code is the user/supervisor flag: 1 = fault from ring 3.
+    // Use different prefixes so monitors can distinguish: USER PF is graceful
+    // (service killed, system continues); KERNEL PF is a fatal crash.
     unsafe {
-        serial_puts_nolck(b"KERNEL PF: fault_addr=");
+        if error_code & (1 << 2) != 0 {
+            serial_puts_nolck(b"USER PF: fault_addr=");
+        } else {
+            serial_puts_nolck(b"KERNEL PF: fault_addr=");
+        }
         serial_hex64_nolck(cr2);
         serial_puts_nolck(b" error_code=");
         serial_hex64_nolck(error_code);
@@ -774,7 +781,6 @@ unsafe extern "C" fn pf_handler(error_code: u64, fault_rip: u64, hw_user_rsp: u6
         serial_hex64_nolck(kgs_base);
         serial_puts_nolck(b"\n");
     }
-    // Bit 2 of error_code is the user/supervisor flag: 1 = fault from ring 3.
     // User-mode faults kill the task (§10.3); kernel faults are fatal panics.
     if error_code & (1 << 2) != 0 {
         crate::task::kill_current();

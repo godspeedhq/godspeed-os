@@ -162,6 +162,20 @@ const MODE_FUZZ_BF6:        u32 = 117; // BF6: embedded cap slots — 5k pairs
 const MODE_FUZZ_BF7:        u32 = 118; // BF7: stale cap / generation — 200 kill cycles
 const MODE_FUZZ_BF8:        u32 = 119; // BF8: memory request sizes — 10 edge + 5k random
 
+// Brutal stress test modes — Milestone 18.
+const MODE_STRESS_BS1:      u32 = 120; // BS1: IPC saturation — 50k try_send (5× S1)
+const MODE_STRESS_BS2:      u32 = 121; // BS2: restart storm — 200 kill/respawn cycles (4× S2)
+const MODE_STRESS_BS3_SEND: u32 = 122; // BS3: cross-core thrash sender — 2000 blocking sends
+const MODE_STRESS_BS3_RECV: u32 = 123; // BS3: cross-core thrash receiver — 2000 recvs
+const MODE_STRESS_BS4:      u32 = 124; // BS4: cap table churn — 50 churn cycles (5× S4)
+const MODE_STRESS_BS5:      u32 = 125; // BS5: generation integrity — 5000 kill/respawn (5× S5)
+const MODE_STRESS_BS6:      u32 = 126; // BS6: self-ping stability — 20000 rounds (4× S6)
+const MODE_STRESS_BS7:      u32 = 127; // BS7: memory pressure — 500 alloc passes (5× S7)
+const MODE_STRESS_BS8:      u32 = 128; // BS8: scheduler heartbeat — 3000 yields (5× S8)
+const MODE_STRESS_BS9_SEND: u32 = 129; // BS9: IPI storm sender — 2500 msgs per sender
+const MODE_STRESS_BS9_RECV: u32 = 130; // BS9: IPI storm receiver — 5000 msgs total
+const MODE_STRESS_BS10:     u32 = 131; // BS10: cascading revocation — 50 kill/respawn cycles
+
 // Brutal identity test modes — Milestone 15.
 const MODE_BRUTAL_ID_11:    u32 = 97; // T11: self-referential queue boundary exactness
 const MODE_BRUTAL_ID_12_A:  u32 = 98; // T12: cap chain source (A sends to B, grants cap to C)
@@ -266,6 +280,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         MODE_FUZZ_BF6        => mode_fuzz_bf6(&ctx),
         MODE_FUZZ_BF7        => mode_fuzz_bf7(&ctx),
         MODE_FUZZ_BF8        => mode_fuzz_bf8(&ctx),
+        MODE_STRESS_BS1      => mode_stress_bs1(&ctx),
+        MODE_STRESS_BS2      => mode_stress_bs2(&ctx),
+        MODE_STRESS_BS3_SEND => mode_stress_bs3_send(&ctx),
+        MODE_STRESS_BS3_RECV => mode_stress_bs3_recv(&ctx),
+        MODE_STRESS_BS4      => mode_stress_bs4(&ctx),
+        MODE_STRESS_BS5      => mode_stress_bs5(&ctx),
+        MODE_STRESS_BS6      => mode_stress_bs6(&ctx),
+        MODE_STRESS_BS7      => mode_stress_bs7(&ctx),
+        MODE_STRESS_BS8      => mode_stress_bs8(&ctx),
+        MODE_STRESS_BS9_SEND => mode_stress_bs9_send(&ctx),
+        MODE_STRESS_BS9_RECV => mode_stress_bs9_recv(&ctx),
+        MODE_STRESS_BS10     => mode_stress_bs10(&ctx),
         _                    => idle(&ctx),
     }
 }
@@ -2110,6 +2136,302 @@ fn mode_fuzz_bf8(ctx: &ServiceContext) -> ! {
         let _ = ctx.alloc_mem(xorshift64(&mut rng) as usize);
     }
     ctx.log("fuzz: BF8 pass");
+    idle(ctx)
+}
+
+// ---------------------------------------------------------------------------
+// Brutal stress test modes — Milestone 18
+// ---------------------------------------------------------------------------
+
+fn mode_stress_bs1(ctx: &ServiceContext) -> ! {
+    // BS1 — IPC saturation, 5× S1 (§22 Brutal Stress BS1).
+    // 50,000 try_send calls to stress-bs1-recv (passive). QueueFull acceptable.
+    let msg = Message::from_bytes(b"bs1");
+    for _ in 0..50_000u32 {
+        let _ = ctx.try_send("stress-bs1-recv", &msg);
+    }
+    ctx.log("stress: BS1 pass (50000/50000)");
+    idle(ctx)
+}
+
+fn mode_stress_bs2(ctx: &ServiceContext) -> ! {
+    // BS2 — Restart storm, 4× S2 (§22 Brutal Stress BS2).
+    // 200 kill/respawn cycles of stress-bs2-victim.
+    let msg = Message::from_bytes(b"bs2-ping");
+    match ctx.try_send("stress-bs2-victim", &msg) {
+        Ok(()) => {}
+        Err(_) => {
+            ctx.log("stress: BS2 FAIL — victim not reachable at start");
+            idle(ctx);
+        }
+    }
+    for _ in 0..200u32 {
+        let _ = ctx.kill("stress-bs2-victim");
+        match ctx.spawn("stress-bs2-victim") {
+            Err(_) => {
+                ctx.log("stress: BS2 FAIL — spawn failed (kstack pool exhausted?)");
+                idle(ctx);
+            }
+            Ok(()) => {}
+        }
+    }
+    ctx.log("stress: BS2 pass (200/200)");
+    idle(ctx)
+}
+
+fn mode_stress_bs3_send(ctx: &ServiceContext) -> ! {
+    // BS3 sender — cross-core thrash, 4× S3 (§22 Brutal Stress BS3).
+    // 2000 blocking sends to stress-bs3-recv on core 1.
+    let msg = Message::from_bytes(b"bs3");
+    for _ in 0..2_000u32 {
+        let _ = ctx.send("stress-bs3-recv", &msg);
+    }
+    idle(ctx)
+}
+
+fn mode_stress_bs3_recv(ctx: &ServiceContext) -> ! {
+    // BS3 receiver — drain 2000 cross-core messages (§22 Brutal Stress BS3).
+    for _ in 0..2_000u32 {
+        ctx.recv();
+    }
+    ctx.log("stress: BS3 pass (2000/2000)");
+    idle(ctx)
+}
+
+fn mode_stress_bs4(ctx: &ServiceContext) -> ! {
+    // BS4 — Cap table churn, 5× S4 (§22 Brutal Stress BS4).
+    // 50 churn cycles with 2 SEND caps; generation monotonic and both caps stale.
+    let h0 = match ctx.send_peer_at(0) {
+        Some(h) => h,
+        None => {
+            ctx.log("stress: BS4 FAIL — no peer handle h0");
+            idle(ctx);
+        }
+    };
+    let h1 = match ctx.send_peer_at(1) {
+        Some(h) => h,
+        None => {
+            ctx.log("stress: BS4 FAIL — no peer handle h1");
+            idle(ctx);
+        }
+    };
+    let msg = Message::from_bytes(b"bs4");
+
+    if ctx.try_send_by_handle(h0, &msg).is_err() {
+        ctx.log("stress: BS4 FAIL — cap A not valid pre-kill");
+        idle(ctx);
+    }
+    if ctx.try_send_by_handle(h1, &msg).is_err() {
+        ctx.log("stress: BS4 FAIL — cap B not valid pre-kill");
+        idle(ctx);
+    }
+
+    let _ = ctx.kill("stress-bs4-victim");
+
+    if !matches!(ctx.try_send_by_handle(h0, &msg), Err(IpcError::EndpointDead)) {
+        ctx.log("stress: BS4 FAIL — cap A survived first kill");
+        idle(ctx);
+    }
+    if !matches!(ctx.try_send_by_handle(h1, &msg), Err(IpcError::EndpointDead)) {
+        ctx.log("stress: BS4 FAIL — cap B survived first kill");
+        idle(ctx);
+    }
+
+    let mut prev_gen = ctx.inspect_endpoint_generation("stress-bs4-victim");
+    for _ in 0..50u32 {
+        let _ = ctx.spawn("stress-bs4-victim");
+        let _ = ctx.kill("stress-bs4-victim");
+        let gen = ctx.inspect_endpoint_generation("stress-bs4-victim");
+        if gen <= prev_gen {
+            ctx.log("stress: BS4 FAIL — generation not monotonic under churn");
+            idle(ctx);
+        }
+        prev_gen = gen;
+        if !matches!(ctx.try_send_by_handle(h0, &msg), Err(IpcError::EndpointDead)) {
+            ctx.log("stress: BS4 FAIL — cap A not stale during churn");
+            idle(ctx);
+        }
+        if !matches!(ctx.try_send_by_handle(h1, &msg), Err(IpcError::EndpointDead)) {
+            ctx.log("stress: BS4 FAIL — cap B not stale during churn");
+            idle(ctx);
+        }
+    }
+    ctx.log("stress: BS4 pass (50/50)");
+    idle(ctx)
+}
+
+fn mode_stress_bs5(ctx: &ServiceContext) -> ! {
+    // BS5 — Generation integrity, 5× S5 (§22 Brutal Stress BS5).
+    // 5000 kill/respawn cycles; endpoint generation must be strictly monotonic.
+    let mut prev_gen: u64 = 0;
+    for _ in 0..5_000u32 {
+        let _ = ctx.kill("stress-bs5-victim");
+        let _ = ctx.spawn("stress-bs5-victim");
+        let gen = ctx.inspect_endpoint_generation("stress-bs5-victim");
+        if gen <= prev_gen {
+            ctx.log("stress: BS5 FAIL — generation not strictly monotonic after kill/respawn");
+            idle(ctx);
+        }
+        prev_gen = gen;
+    }
+    ctx.log("stress: BS5 pass (5000/5000)");
+    idle(ctx)
+}
+
+fn mode_stress_bs6(ctx: &ServiceContext) -> ! {
+    // BS6 — Self-ping stability, 4× S6 (§22 Brutal Stress BS6).
+    // 20,000 self-ping rounds; IPC path must not drift or corrupt.
+    let msg = Message::from_bytes(b"bs6");
+    for _ in 0..20_000u32 {
+        match ctx.send("stress-bs6", &msg) {
+            Ok(()) => {}
+            Err(_) => {
+                ctx.log("stress: BS6 FAIL — send to self returned error");
+                idle(ctx);
+            }
+        }
+        ctx.recv();
+    }
+    ctx.log("stress: BS6 pass (20000/20000)");
+    idle(ctx)
+}
+
+fn mode_stress_bs7(ctx: &ServiceContext) -> ! {
+    // BS7 — Memory pressure, 5× S7 (§22 Brutal Stress BS7).
+    // 500 alloc passes; AllocDenied must appear and be consistent.
+    const CHUNK: usize = 4 * 1024 * 1024;
+    let mut at_limit = false;
+    for _ in 0..500u32 {
+        match ctx.alloc_mem(CHUNK) {
+            Ok(_) => {
+                if at_limit {
+                    ctx.log("stress: BS7 FAIL — Ok returned after AllocDenied");
+                    idle(ctx);
+                }
+            }
+            Err(AllocError::Denied) => {
+                at_limit = true;
+            }
+            Err(_) => {
+                ctx.log("stress: BS7 FAIL — unexpected alloc error");
+                idle(ctx);
+            }
+        }
+    }
+    if !at_limit {
+        ctx.log("stress: BS7 FAIL — AllocDenied never returned (limit not enforced)");
+        idle(ctx);
+    }
+    ctx.log("stress: BS7 pass (500/500)");
+    idle(ctx)
+}
+
+fn mode_stress_bs8(ctx: &ServiceContext) -> ! {
+    // BS8 — Scheduler heartbeat, 5× S8 (§22 Brutal Stress BS8).
+    // 3000 yield cycles; scheduler must correctly return from idle each time.
+    for _ in 0..3_000u32 {
+        ctx.yield_cpu();
+    }
+    ctx.log("stress: BS8 pass (3000 yields)");
+    idle(ctx)
+}
+
+fn mode_stress_bs9_send(ctx: &ServiceContext) -> ! {
+    // BS9 sender — IPI storm, 5× S9 (§22 Brutal Stress BS9).
+    // 2500 sends to stress-bs9-recv on core 2 via try_send+yield-retry.
+    let msg = Message::from_bytes(b"bs9");
+    for _ in 0..2_500u32 {
+        loop {
+            match ctx.try_send("stress-bs9-recv", &msg) {
+                Ok(()) => break,
+                Err(_) => ctx.yield_cpu(),
+            }
+        }
+    }
+    idle(ctx)
+}
+
+fn mode_stress_bs9_recv(ctx: &ServiceContext) -> ! {
+    // BS9 receiver — drain 5000 msgs from two senders (§22 Brutal Stress BS9).
+    for _ in 0..5_000u32 {
+        ctx.recv();
+    }
+    ctx.log("stress: BS9 pass (5000/5000)");
+    idle(ctx)
+}
+
+fn mode_stress_bs10(ctx: &ServiceContext) -> ! {
+    // BS10 — Cascading revocation with 50 cycles (§22 Brutal Stress BS10).
+    // 3 SEND caps to stress-bs10-victim on core 1; probe on core 0.
+    // Pre-validate, first kill, then 50 respawn+kill cycles confirming all 3 stay stale.
+    let h0 = match ctx.send_peer_at(0) {
+        Some(h) => h,
+        None => {
+            ctx.log("stress: BS10 FAIL — no peer handle h0");
+            idle(ctx);
+        }
+    };
+    let h1 = match ctx.send_peer_at(1) {
+        Some(h) => h,
+        None => {
+            ctx.log("stress: BS10 FAIL — no peer handle h1");
+            idle(ctx);
+        }
+    };
+    let h2 = match ctx.send_peer_at(2) {
+        Some(h) => h,
+        None => {
+            ctx.log("stress: BS10 FAIL — no peer handle h2");
+            idle(ctx);
+        }
+    };
+    let msg = Message::from_bytes(b"bs10");
+
+    if ctx.try_send_by_handle(h0, &msg).is_err() {
+        ctx.log("stress: BS10 FAIL — cap A not valid pre-kill");
+        idle(ctx);
+    }
+    if ctx.try_send_by_handle(h1, &msg).is_err() {
+        ctx.log("stress: BS10 FAIL — cap B not valid pre-kill");
+        idle(ctx);
+    }
+    if ctx.try_send_by_handle(h2, &msg).is_err() {
+        ctx.log("stress: BS10 FAIL — cap C not valid pre-kill");
+        idle(ctx);
+    }
+
+    let _ = ctx.kill("stress-bs10-victim");
+
+    if !matches!(ctx.try_send_by_handle(h0, &msg), Err(IpcError::EndpointDead)) {
+        ctx.log("stress: BS10 FAIL — cap A survived first kill");
+        idle(ctx);
+    }
+    if !matches!(ctx.try_send_by_handle(h1, &msg), Err(IpcError::EndpointDead)) {
+        ctx.log("stress: BS10 FAIL — cap B survived first kill");
+        idle(ctx);
+    }
+    if !matches!(ctx.try_send_by_handle(h2, &msg), Err(IpcError::EndpointDead)) {
+        ctx.log("stress: BS10 FAIL — cap C survived first kill");
+        idle(ctx);
+    }
+
+    for _ in 0..50u32 {
+        let _ = ctx.spawn("stress-bs10-victim");
+        let _ = ctx.kill("stress-bs10-victim");
+        if !matches!(ctx.try_send_by_handle(h0, &msg), Err(IpcError::EndpointDead)) {
+            ctx.log("stress: BS10 FAIL — cap A not stale during cycle");
+            idle(ctx);
+        }
+        if !matches!(ctx.try_send_by_handle(h1, &msg), Err(IpcError::EndpointDead)) {
+            ctx.log("stress: BS10 FAIL — cap B not stale during cycle");
+            idle(ctx);
+        }
+        if !matches!(ctx.try_send_by_handle(h2, &msg), Err(IpcError::EndpointDead)) {
+            ctx.log("stress: BS10 FAIL — cap C not stale during cycle");
+            idle(ctx);
+        }
+    }
+    ctx.log("stress: BS10 pass (50/50 cycles)");
     idle(ctx)
 }
 

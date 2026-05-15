@@ -136,6 +136,27 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let _ = ctx.spawn("stress-s9-send-a"); // core 0 → core 2
     let _ = ctx.spawn("stress-s9-send-b"); // core 1 → core 2
 
+    // --- Brutal stress-test probes — Milestone 18 ---
+    // Ordering: recv-endpoint victims before their controllers.
+    let _ = ctx.spawn("stress-bs1-recv");   // passive saturation target
+    let _ = ctx.spawn("stress-bs1");        // 50k try_send
+    let _ = ctx.spawn("stress-bs2-victim"); // passive restart victim
+    let _ = ctx.spawn("stress-bs2");        // 200 kill/respawn cycles
+    let _ = ctx.spawn("stress-bs3-recv");   // core 1 — cross-core thrash receiver
+    let _ = ctx.spawn("stress-bs3-send");   // core 0 — 2000 blocking sends
+    let _ = ctx.spawn("stress-bs4-victim"); // passive churn victim
+    let _ = ctx.spawn("stress-bs4");        // 50 churn cycles; 2 cap slots
+    let _ = ctx.spawn("stress-bs5-victim"); // passive generation victim
+    let _ = ctx.spawn("stress-bs5");        // 5000 kill/respawn; generation monotonic
+    let _ = ctx.spawn("stress-bs6");        // self-referential; 20000 self-ping rounds
+    let _ = ctx.spawn("stress-bs7");        // 500 alloc passes
+    let _ = ctx.spawn("stress-bs8");        // 3000 yields
+    let _ = ctx.spawn("stress-bs9-recv");   // core 2 — IPI storm receiver
+    let _ = ctx.spawn("stress-bs9-send-a"); // core 0 → core 2; 2500 sends
+    let _ = ctx.spawn("stress-bs9-send-b"); // core 1 → core 2; 2500 sends
+    let _ = ctx.spawn("stress-bs10-victim"); // core 1 — cascading revocation victim
+    let _ = ctx.spawn("stress-bs10");        // core 0; 50 cycles; 3 cap slots
+
     // --- Chaos-test probes — Milestone 14 ---
     // c7-victim must be registered on core 2 before chaos-c7 is spawned on core 1
     // so its endpoint exists when chaos-c7's SEND cap is wired at spawn time.

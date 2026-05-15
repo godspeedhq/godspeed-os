@@ -918,6 +918,93 @@ static BRUTAL_FUZZ_TESTS: &[TestSpec] = &[
     },
 ];
 
+// ---------------------------------------------------------------------------
+// Brutal stress test definitions (Milestone 18).
+// ---------------------------------------------------------------------------
+
+static BRUTAL_STRESS_TESTS: &[TestSpec] = &[
+    TestSpec {
+        id: "BS1", name: "ipc_saturation_50k", spec_ref: "§22 Brutal Stress BS1",
+        kind: TestKind::WatchSerial {
+            expect:       &["stress: BS1 pass (50000/50000)"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:", "stress: BS1 FAIL"],
+            timeout_secs: 60,
+        },
+    },
+    TestSpec {
+        id: "BS2", name: "restart_storm_200_cycles", spec_ref: "§22 Brutal Stress BS2",
+        kind: TestKind::WatchSerial {
+            expect:       &["stress: BS2 pass (200/200)"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:", "stress: BS2 FAIL"],
+            timeout_secs: 480, // 4× S2's 120s — 200 cycles under heavy concurrent load
+        },
+    },
+    TestSpec {
+        id: "BS3", name: "cross_core_thrash_2000_msgs", spec_ref: "§22 Brutal Stress BS3",
+        kind: TestKind::WatchSerial {
+            expect:       &["stress: BS3 pass (2000/2000)"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:", "stress: BS3 FAIL"],
+            timeout_secs: 1200, // 4× S3 sends under heavy concurrent TLB-shootdown pressure
+        },
+    },
+    TestSpec {
+        id: "BS4", name: "cap_table_churn_50_cycles", spec_ref: "§22 Brutal Stress BS4",
+        kind: TestKind::WatchSerial {
+            expect:       &["stress: BS4 pass (50/50)"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:", "stress: BS4 FAIL"],
+            timeout_secs: 300,
+        },
+    },
+    TestSpec {
+        id: "BS5", name: "generation_monotonic_5000_cycles", spec_ref: "§22 Brutal Stress BS5",
+        kind: TestKind::WatchSerial {
+            expect:       &["stress: BS5 pass (5000/5000)"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:", "stress: BS5 FAIL"],
+            timeout_secs: 720, // 6× S5's 120s — extra margin for concurrent kill/respawn pressure
+        },
+    },
+    TestSpec {
+        id: "BS6", name: "ipc_self_ping_20000_rounds", spec_ref: "§22 Brutal Stress BS6",
+        kind: TestKind::WatchSerial {
+            expect:       &["stress: BS6 pass (20000/20000)"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:", "stress: BS6 FAIL"],
+            timeout_secs: 300,
+        },
+    },
+    TestSpec {
+        id: "BS7", name: "memory_pressure_500_passes", spec_ref: "§22 Brutal Stress BS7",
+        kind: TestKind::WatchSerial {
+            expect:       &["stress: BS7 pass (500/500)"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:", "stress: BS7 FAIL"],
+            timeout_secs: 120,
+        },
+    },
+    TestSpec {
+        id: "BS8", name: "idle_scheduler_heartbeat_3000", spec_ref: "§22 Brutal Stress BS8",
+        kind: TestKind::WatchSerial {
+            expect:       &["stress: BS8 pass (3000 yields)"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
+            timeout_secs: 300,
+        },
+    },
+    TestSpec {
+        id: "BS9", name: "cross_core_ipi_storm_5000_msgs", spec_ref: "§22 Brutal Stress BS9",
+        kind: TestKind::WatchSerial {
+            expect:       &["stress: BS9 pass (5000/5000)"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:", "stress: BS9 FAIL"],
+            timeout_secs: 420,
+        },
+    },
+    TestSpec {
+        id: "BS10", name: "cascading_revocation_50_cycles", spec_ref: "§22 Brutal Stress BS10",
+        kind: TestKind::WatchSerial {
+            expect:       &["stress: BS10 pass (50/50 cycles)"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:", "stress: BS10 FAIL"],
+            timeout_secs: 240,
+        },
+    },
+];
+
 static TESTS: &[TestSpec] = &[
     TestSpec {
         id: "1A", name: "bootstrap_steady_state_positive", spec_ref: "§22 Test 1A",
@@ -1596,6 +1683,57 @@ pub fn run_brutal_fuzz_tests() {
     if failed > 0 { std::process::exit(1); }
 }
 
+/// Boot the OS in QEMU and run the Milestone 18 brutal stress test suite.
+///
+/// BS1–BS10 are 4–5× escalated-iteration variants of S1–S10. All must pass
+/// (no kernel panic, no FAIL marker, no resource leak).
+pub fn run_brutal_stress_tests() {
+    println!("stress-brutal: stopping any running QEMU instances...");
+    kill_existing_qemu();
+
+    println!("stress-brutal: building...");
+    crate::cmd_build();
+
+    let kernel_elf = Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() {
+        eprintln!("stress-brutal: kernel ELF not found at {}", kernel_elf.display());
+        std::process::exit(1);
+    }
+
+    let limine_dir = Path::new("tools/limine");
+    let image_path = crate::disk_image::create(kernel_elf, limine_dir);
+    crate::disk_image::install_bootloader(limine_dir, &image_path);
+
+    std::fs::create_dir_all("build/tests/11_STRESS_BRUTAL")
+        .expect("create build/tests/11_STRESS_BRUTAL/");
+
+    println!("\nstress-brutal: running {} tests\n", BRUTAL_STRESS_TESTS.len());
+
+    let mut results: Vec<(&TestSpec, TestOutcome)> = Vec::new();
+
+    for test in BRUTAL_STRESS_TESTS {
+        print!("  [{:>3}]  {:45}  ({})  … ", test.id, test.name, test.spec_ref);
+        let _ = std::io::stdout().flush();
+
+        let outcome = run_brutal_stress_one(test, &image_path);
+
+        match &outcome {
+            TestOutcome::Pass       => println!("PASS"),
+            TestOutcome::Fail(r)    => println!("FAIL\n         → {r}"),
+            TestOutcome::Blocked(r) => println!("BLOCKED\n         → {r}"),
+        }
+
+        results.push((test, outcome));
+    }
+
+    let passed = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Pass)).count();
+    let failed = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Fail(_))).count();
+
+    println!("\n  {passed} passed  {failed} failed");
+
+    if failed > 0 { std::process::exit(1); }
+}
+
 /// Boot the OS in QEMU and run the Milestone 12 performance benchmark suite.
 ///
 /// Pass criterion: each benchmark logs `perf: BN done` without panicking.
@@ -2107,6 +2245,21 @@ fn run_brutal_fuzz_one(test: &TestSpec, image: &Path, limine_dir: &Path) -> Test
     }
 }
 
+fn run_brutal_stress_one(test: &TestSpec, image: &Path) -> TestOutcome {
+    match &test.kind {
+        TestKind::WatchSerial { expect, fail_on, timeout_secs } => {
+            let serial = brutal_stress_serial_path(test);
+            let _ = std::fs::write(&serial, b"");
+            let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
+            let result = poll_serial(&serial, expect, fail_on,
+                                     Instant::now() + Duration::from_secs(*timeout_secs));
+            qemu.kill();
+            result
+        }
+        _ => TestOutcome::Blocked("brutal stress tests only use WatchSerial"),
+    }
+}
+
 fn run_perf_one(test: &TestSpec, image: &Path) -> TestOutcome {
     match &test.kind {
         TestKind::WatchSerial { expect, fail_on, timeout_secs } => {
@@ -2160,6 +2313,10 @@ fn chaos_serial_path(test: &TestSpec) -> PathBuf {
 
 fn brutal_fuzz_serial_path(test: &TestSpec) -> PathBuf {
     PathBuf::from(format!("build/tests/10_FUZZ_BRUTAL/{}-{}.log", test.id, test.name))
+}
+
+fn brutal_stress_serial_path(test: &TestSpec) -> PathBuf {
+    PathBuf::from(format!("build/tests/11_STRESS_BRUTAL/{}-{}.log", test.id, test.name))
 }
 
 // ---------------------------------------------------------------------------

@@ -23,7 +23,7 @@ use crate::task::state::TaskState;
 // Flat task table (all cores share one array; tasks are pinned by TASK_CORE).
 // ---------------------------------------------------------------------------
 
-pub const MAX_TASKS: usize = 160;
+pub const MAX_TASKS: usize = 192;
 const MAX_CORES: usize = crate::smp::core::MAX_CORES;
 
 /// Sentinel meaning "no task running" (scheduler idle loop active).
