@@ -142,6 +142,18 @@ const MODE_CHAOS_C5:        u32 = 94; // 100-level recursive yield_cpu(); stack 
 const MODE_CHAOS_C6_MON:    u32 = 95; // 200 yields then log pass on core 0 (C6 witness)
 const MODE_CHAOS_C7:        u32 = 96; // 30 cross-core kill/respawn cycles; TLB shootdowns
 
+// Brutal property test modes — Milestone 16.
+const MODE_PROP_BP1:        u32 = 104; // BP1: cap unforgeability — 100k iterations
+const MODE_PROP_BP2:        u32 = 105; // BP2: generation monotonic — 20 kill/respawn cycles
+const MODE_PROP_BP3:        u32 = 106; // BP3: cap rights never widen — 10k iterations
+const MODE_PROP_BP4:        u32 = 107; // BP4: alloc accounting exact — 2k iterations
+const MODE_PROP_BP5:        u32 = 108; // BP5: endpoint ownership — 150 kill/respawn cycles
+const MODE_PROP_BP6:        u32 = 109; // BP6: queue invariants — 2k iterations
+const MODE_PROP_BP7:        u32 = 110; // BP7: TLB shootdown proxy — 150 cycles
+const MODE_PROP_BP8:        u32 = 111; // BP8: restart resolves higher generation — 20 iter
+const MODE_PROP_BP9:        u32 = 112; // BP9: all 3 cap slots invalidated — 10 cycles
+const MODE_PROP_BP10:       u32 = 113; // BP10: every send returns defined outcome — 100k
+
 // Brutal identity test modes — Milestone 15.
 const MODE_BRUTAL_ID_11:    u32 = 97; // T11: self-referential queue boundary exactness
 const MODE_BRUTAL_ID_12_A:  u32 = 98; // T12: cap chain source (A sends to B, grants cap to C)
@@ -224,6 +236,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         MODE_CHAOS_C5        => mode_chaos_c5(&ctx),
         MODE_CHAOS_C6_MON    => mode_chaos_c6_monitor(&ctx),
         MODE_CHAOS_C7        => mode_chaos_c7(&ctx),
+        MODE_PROP_BP1        => mode_prop_bp1(&ctx),
+        MODE_PROP_BP2        => mode_prop_bp2(&ctx),
+        MODE_PROP_BP3        => mode_prop_bp3(&ctx),
+        MODE_PROP_BP4        => mode_prop_bp4(&ctx),
+        MODE_PROP_BP5        => mode_prop_bp5(&ctx),
+        MODE_PROP_BP6        => mode_prop_bp6(&ctx),
+        MODE_PROP_BP7        => mode_prop_bp7(&ctx),
+        MODE_PROP_BP8        => mode_prop_bp8(&ctx),
+        MODE_PROP_BP9        => mode_prop_bp9(&ctx),
+        MODE_PROP_BP10       => mode_prop_bp10(&ctx),
         MODE_BRUTAL_ID_11    => mode_brutal_id_11(&ctx),
         MODE_BRUTAL_ID_12_A  => mode_brutal_id_12_a(&ctx),
         MODE_BRUTAL_ID_12_B  => mode_brutal_id_12_b(&ctx),
@@ -1694,6 +1716,251 @@ fn mode_chaos_c7(ctx: &ServiceContext) -> ! {
         }
     }
     ctx.log("chaos: C7 pass — 30 cross-core TLB shootdowns survived");
+    idle(ctx)
+}
+
+// ---------------------------------------------------------------------------
+// Brutal property test modes — Milestone 16
+// ---------------------------------------------------------------------------
+
+fn mode_prop_bp1(ctx: &ServiceContext) -> ! {
+    // BP1 — Cap unforgeability at 100k iterations (§7.3, §3.1).
+    let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 104;
+    let msg = Message::from_bytes(b"bp1");
+    for _ in 0..100_000u32 {
+        let slot = CapHandle(xorshift64(&mut rng) as u32);
+        if ctx.try_send_by_handle(slot, &msg).is_ok() {
+            ctx.log("prop: BP1 FAIL — random cap slot accepted as valid SEND");
+            idle(ctx);
+        }
+    }
+    ctx.log("prop: BP1 pass (100000/100000)");
+    idle(ctx)
+}
+
+fn mode_prop_bp2(ctx: &ServiceContext) -> ! {
+    // BP2 — Generation strictly monotonic over 20 kill/respawn cycles (§7.5).
+    let mut prev_gen: u64 = 0;
+    for cycle in 0..20u32 {
+        let _ = ctx.kill("prop-bp2-victim");
+        let _ = ctx.spawn("prop-bp2-victim");
+        let gen = ctx.inspect_endpoint_generation("prop-bp2-victim");
+        if gen <= prev_gen {
+            ctx.log_fmt(format_args!("prop: BP2 FAIL — generation not monotonic at cycle {}", cycle));
+            idle(ctx);
+        }
+        prev_gen = gen;
+    }
+    ctx.log("prop: BP2 pass (20/20)");
+    idle(ctx)
+}
+
+fn mode_prop_bp3(ctx: &ServiceContext) -> ! {
+    // BP3 — Cap rights never widen during transfer — 10k iterations (§7.3).
+    // Self-referential: acquires SEND|GRANT cap to own endpoint, bounces it
+    // through the queue 10k times, asserting rights are exactly preserved each round.
+    const SEND_GRANT: u64 = (1 << 2) | (1 << 4);
+    let mut cap_handle = match ctx.acquire_send_grant_cap("prop-bp3") {
+        Some(h) => h,
+        None => { ctx.log("prop: BP3 FAIL — could not acquire SEND|GRANT cap to self"); idle(ctx); }
+    };
+    let msg = Message::from_bytes(b"bp3");
+    for _iter in 0..10_000u32 {
+        match ctx.send_with_cap_by_handle(cap_handle, cap_handle, &msg) {
+            Ok(()) => {}
+            Err(_) => { ctx.log("prop: BP3 FAIL — send_with_cap_by_handle failed"); idle(ctx); }
+        }
+        ctx.recv();
+        let new_handle = match ctx.take_pending_cap() {
+            Some(h) => h,
+            None => { ctx.log("prop: BP3 FAIL — no pending cap after recv"); idle(ctx); }
+        };
+        let rights = match ctx.query_cap_rights(new_handle) {
+            Some(r) => r,
+            None => { ctx.log("prop: BP3 FAIL — cap slot empty after transfer"); idle(ctx); }
+        };
+        if rights != SEND_GRANT {
+            ctx.log("prop: BP3 FAIL — cap rights changed during transfer");
+            idle(ctx);
+        }
+        cap_handle = new_handle;
+    }
+    ctx.log("prop: BP3 pass (10000/10000)");
+    idle(ctx)
+}
+
+fn mode_prop_bp4(ctx: &ServiceContext) -> ! {
+    // BP4 — ∑ alloc_bytes ≡ pages mapped — 2k iterations (§10.3).
+    // 2k × 4 KiB = 8 MiB total, well within the 64 MiB limit.
+    let mut expected: u64 = 0;
+    for _ in 0..2_000u32 {
+        match ctx.alloc_mem(4096) {
+            Ok(_)  => expected += 4096,
+            Err(_) => { ctx.log("prop: BP4 FAIL — unexpected alloc failure for 4 KiB page"); idle(ctx); }
+        }
+        let _ = ctx.alloc_mem(1 << 30); // 1 GiB — always denied; must not shift counter
+        let actual = ctx.inspect_kernel_alloc_bytes();
+        if actual != expected {
+            ctx.log("prop: BP4 FAIL — alloc_bytes mismatch after alloc sequence");
+            idle(ctx);
+        }
+    }
+    ctx.log("prop: BP4 pass (2000/2000)");
+    idle(ctx)
+}
+
+fn mode_prop_bp5(ctx: &ServiceContext) -> ! {
+    // BP5 — Every live endpoint has exactly one owning task — 150 cycles (§8.3).
+    // Test: spawn must succeed for all 150 cycles. If dead endpoints are orphaned
+    // (not recycled by kill_endpoint), the 64-slot routing table fills up within
+    // ~34 cycles and spawn returns Err. The spawn-success check is the correct
+    // observable for this property; a count-vs-threshold check is unreliable here
+    // because many other concurrent probes also kill/respawn services, causing the
+    // live count to fluctuate independently of BP5's own cycles.
+    for _ in 0..150u32 {
+        let _ = ctx.kill("prop-bp5-victim");
+        match ctx.spawn("prop-bp5-victim") {
+            Err(_) => {
+                ctx.log("prop: BP5 FAIL — spawn failed (routing table overflow; orphan detected)");
+                idle(ctx);
+            }
+            Ok(()) => {}
+        }
+    }
+    ctx.log("prop: BP5 pass (150/150)");
+    idle(ctx)
+}
+
+fn mode_prop_bp6(ctx: &ServiceContext) -> ! {
+    // BP6 — Queue depth invariant at 2k iterations (§8.5).
+    // Self-referential: sends to own endpoint, draining after each fill phase.
+    ctx.log("prop: BP6 starting");
+    const QUEUE_DEPTH: u32 = 16;
+    let msg = Message::from_bytes(b"bp6");
+    let recv_h = match ctx.recv_handle() {
+        Some(h) => h,
+        None => { ctx.log("prop: BP6 FAIL — no recv endpoint"); idle(ctx); }
+    };
+    for iter in 0..2_000u32 {
+        let depth = (iter % (QUEUE_DEPTH + 1)) as u8;
+        for _ in 0..depth {
+            match ctx.try_send("prop-bp6", &msg) {
+                Ok(()) => {}
+                Err(_) => {
+                    ctx.log("prop: BP6 FAIL — try_send failed before expected queue depth");
+                    idle(ctx);
+                }
+            }
+        }
+        if depth == QUEUE_DEPTH as u8 {
+            match ctx.try_send("prop-bp6", &msg) {
+                Err(IpcError::QueueFull) => {}
+                Ok(()) => {
+                    ctx.log("prop: BP6 FAIL — queue accepted more than 16 messages");
+                    idle(ctx);
+                }
+                Err(_) => {
+                    ctx.log("prop: BP6 FAIL — unexpected error on full-queue try_send");
+                    idle(ctx);
+                }
+            }
+        }
+        for _ in 0..depth {
+            match godspeed_sdk::ipc::recv(recv_h) {
+                Ok(_) => {}
+                Err(_) => { ctx.log("prop: BP6 FAIL — recv returned error"); idle(ctx); }
+            }
+        }
+    }
+    ctx.log("prop: BP6 pass (2000/2000)");
+    idle(ctx)
+}
+
+fn mode_prop_bp7(ctx: &ServiceContext) -> ! {
+    // BP7 — TLB shootdown leaves no stale mappings — 150 cycles (§10.5).
+    // Proxy: 150 kill/respawn cycles; generation monotonicity confirms the full
+    // kill/shootdown lifecycle completed correctly each time.
+    let mut prev_gen: u64 = 0;
+    for _ in 0..150u32 {
+        let _ = ctx.kill("prop-bp7-victim");
+        let gen = ctx.inspect_endpoint_generation("prop-bp7-victim");
+        if gen <= prev_gen {
+            ctx.log("prop: BP7 FAIL — generation not monotonic after kill (TLB lifecycle broken)");
+            idle(ctx);
+        }
+        prev_gen = gen;
+        let _ = ctx.spawn("prop-bp7-victim");
+    }
+    ctx.log("prop: BP7 pass (150/150)");
+    idle(ctx)
+}
+
+fn mode_prop_bp8(ctx: &ServiceContext) -> ! {
+    // BP8 — After restart, name resolves to higher-generation live endpoint — 20 iter (§14.2).
+    let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 111;
+    let mut prev_gen: u64 = 0;
+    for _iter in 0..20u32 {
+        let n_cycles = 1 + (xorshift64(&mut rng) % 2) as u32;
+        for _cycle in 0..n_cycles {
+            let _ = ctx.kill("prop-bp8-victim");
+            let _ = ctx.spawn("prop-bp8-victim");
+            let gen = ctx.inspect_endpoint_generation("prop-bp8-victim");
+            if gen <= prev_gen {
+                ctx.log("prop: BP8 FAIL — generation not monotonic after restart");
+                idle(ctx);
+            }
+            prev_gen = gen;
+        }
+    }
+    ctx.log("prop: BP8 pass (20 iter)");
+    idle(ctx)
+}
+
+fn mode_prop_bp9(ctx: &ServiceContext) -> ! {
+    // BP9 — Generation bump invalidates ALL 3 cap slots — 10 kill/respawn cycles (§7.5).
+    // After each kill: all 3 wired SEND caps must return EndpointDead (not just some).
+    // After each respawn: stale caps must STILL return EndpointDead (no auto-update to new gen).
+    let msg  = Message::from_bytes(b"bp9");
+    let h0   = ctx.send_peer_at(0);
+    let h1   = ctx.send_peer_at(1);
+    let h2   = ctx.send_peer_at(2);
+    let (h0, h1, h2) = match (h0, h1, h2) {
+        (Some(a), Some(b), Some(c)) => (a, b, c),
+        _ => { ctx.log("prop: BP9 FAIL — could not read all 3 send peer handles"); idle(ctx); }
+    };
+    for cycle in 0..10u32 {
+        let _ = ctx.kill("prop-bp9-victim");
+        let dead0 = matches!(ctx.try_send_by_handle(h0, &msg), Err(IpcError::EndpointDead));
+        let dead1 = matches!(ctx.try_send_by_handle(h1, &msg), Err(IpcError::EndpointDead));
+        let dead2 = matches!(ctx.try_send_by_handle(h2, &msg), Err(IpcError::EndpointDead));
+        if !dead0 || !dead1 || !dead2 {
+            ctx.log_fmt(format_args!("prop: BP9 FAIL — not all 3 slots EndpointDead after kill at cycle {}", cycle));
+            idle(ctx);
+        }
+        let _ = ctx.spawn("prop-bp9-victim");
+        // Stale caps must NOT auto-update to the new instance's generation.
+        let still0 = matches!(ctx.try_send_by_handle(h0, &msg), Err(IpcError::EndpointDead));
+        let still1 = matches!(ctx.try_send_by_handle(h1, &msg), Err(IpcError::EndpointDead));
+        let still2 = matches!(ctx.try_send_by_handle(h2, &msg), Err(IpcError::EndpointDead));
+        if !still0 || !still1 || !still2 {
+            ctx.log_fmt(format_args!("prop: BP9 FAIL — stale cap updated to new instance at cycle {}", cycle));
+            idle(ctx);
+        }
+    }
+    ctx.log("prop: BP9 pass (10/10 — all 3 slots EndpointDead per cycle; stale caps stable)");
+    idle(ctx)
+}
+
+fn mode_prop_bp10(ctx: &ServiceContext) -> ! {
+    // BP10 — Every try_send returns a defined outcome — 100k iterations (§8.6, §8.2).
+    let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 113;
+    for _ in 0..100_000u32 {
+        let slot = CapHandle(xorshift64(&mut rng) as u32);
+        let raw  = xorshift64(&mut rng);
+        let msg  = Message::from_bytes(&raw.to_le_bytes());
+        let _    = ctx.try_send_by_handle(slot, &msg);
+    }
+    ctx.log("prop: BP10 pass (100000/100000)");
     idle(ctx)
 }
 

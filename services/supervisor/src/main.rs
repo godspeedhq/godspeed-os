@@ -67,6 +67,25 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let _ = ctx.spawn("prop-p7-victim");
     let _ = ctx.spawn("prop-p7");
 
+    // --- Brutal property test probes — Milestone 16 ---
+    // Victims before controllers within each pair.
+    // Self-referential probes (BP3, BP6) can go in any order.
+    let _ = ctx.spawn("prop-bp1");
+    let _ = ctx.spawn("prop-bp2-victim");
+    let _ = ctx.spawn("prop-bp2");
+    let _ = ctx.spawn("prop-bp3");       // self-referential
+    let _ = ctx.spawn("prop-bp4");
+    let _ = ctx.spawn("prop-bp5-victim");
+    let _ = ctx.spawn("prop-bp5");
+    let _ = ctx.spawn("prop-bp6");       // self-referential
+    let _ = ctx.spawn("prop-bp7-victim");
+    let _ = ctx.spawn("prop-bp7");
+    let _ = ctx.spawn("prop-bp8-victim");
+    let _ = ctx.spawn("prop-bp8");
+    let _ = ctx.spawn("prop-bp9-victim");
+    let _ = ctx.spawn("prop-bp9");
+    let _ = ctx.spawn("prop-bp10");
+
     // --- Fuzz-test probes — Milestone 10 Phase 1 ---
     // Recv-endpoint victims/targets must be spawned before their controllers.
     let _ = ctx.spawn("fuzz-f1");

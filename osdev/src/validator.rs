@@ -668,6 +668,93 @@ static BRUTAL_IDENTITY_TESTS: &[TestSpec] = &[
     },
 ];
 
+// ---------------------------------------------------------------------------
+// Brutal property test definitions (Milestone 16).
+// ---------------------------------------------------------------------------
+
+static BRUTAL_PROPERTY_TESTS: &[TestSpec] = &[
+    TestSpec {
+        id: "BP1", name: "cap_unforgeability_100k", spec_ref: "§22 Brutal Property BP1",
+        kind: TestKind::WatchSerial {
+            expect:       &["prop: BP1 pass (100000/100000)"],
+            fail_on:      &["KERNEL PANIC", "prop: BP1 FAIL"],
+            timeout_secs: 180,
+        },
+    },
+    TestSpec {
+        id: "BP2", name: "generation_monotonic_20_cycles", spec_ref: "§22 Brutal Property BP2",
+        kind: TestKind::WatchSerial {
+            expect:       &["prop: BP2 pass (20/20)"],
+            fail_on:      &["KERNEL PANIC", "prop: BP2 FAIL"],
+            timeout_secs: 180,
+        },
+    },
+    TestSpec {
+        id: "BP3", name: "cap_rights_never_widen_10k", spec_ref: "§22 Brutal Property BP3",
+        kind: TestKind::WatchSerial {
+            expect:       &["prop: BP3 pass (10000/10000)"],
+            fail_on:      &["KERNEL PANIC", "prop: BP3 FAIL"],
+            timeout_secs: 180,
+        },
+    },
+    TestSpec {
+        id: "BP4", name: "alloc_accounting_2k", spec_ref: "§22 Brutal Property BP4",
+        kind: TestKind::WatchSerial {
+            expect:       &["prop: BP4 pass (2000/2000)"],
+            fail_on:      &["KERNEL PANIC", "prop: BP4 FAIL"],
+            timeout_secs: 180,
+        },
+    },
+    TestSpec {
+        id: "BP5", name: "endpoint_ownership_150_cycles", spec_ref: "§22 Brutal Property BP5",
+        kind: TestKind::WatchSerial {
+            expect:       &["prop: BP5 pass (150/150)"],
+            fail_on:      &["KERNEL PANIC", "prop: BP5 FAIL"],
+            timeout_secs: 180,
+        },
+    },
+    TestSpec {
+        id: "BP6", name: "queue_invariants_2k", spec_ref: "§22 Brutal Property BP6",
+        kind: TestKind::WatchSerial {
+            expect:       &["prop: BP6 pass (2000/2000)"],
+            fail_on:      &["KERNEL PANIC", "prop: BP6 FAIL"],
+            timeout_secs: 180,
+        },
+    },
+    TestSpec {
+        id: "BP7", name: "tlb_shootdown_150_cycles", spec_ref: "§22 Brutal Property BP7",
+        kind: TestKind::WatchSerial {
+            expect:       &["prop: BP7 pass (150/150)"],
+            fail_on:      &["KERNEL PANIC", "prop: BP7 FAIL"],
+            timeout_secs: 180,
+        },
+    },
+    TestSpec {
+        id: "BP8", name: "restart_higher_gen_20_iter", spec_ref: "§22 Brutal Property BP8",
+        kind: TestKind::WatchSerial {
+            expect:       &["prop: BP8 pass (20 iter)"],
+            fail_on:      &["KERNEL PANIC", "prop: BP8 FAIL"],
+            timeout_secs: 180,
+        },
+    },
+    TestSpec {
+        id: "BP9", name: "all_3_slots_invalidated_10_cycles", spec_ref: "§22 Brutal Property BP9",
+        kind: TestKind::WatchSerial {
+            expect:       &["prop: BP9 pass (10/10"],
+            fail_on:      &["KERNEL PANIC", "prop: BP9 FAIL"],
+            timeout_secs: 180,
+        },
+    },
+    TestSpec {
+        id: "BP10", name: "send_defined_outcome_100k", spec_ref: "§22 Brutal Property BP10",
+        kind: TestKind::WatchSerial {
+            expect:       &["prop: BP10 pass (100000/100000)"],
+            fail_on:      &["KERNEL PANIC", "prop: BP10 FAIL"],
+            timeout_secs: 180,
+        },
+    },
+];
+
 static TESTS: &[TestSpec] = &[
     TestSpec {
         id: "1A", name: "bootstrap_steady_state_positive", spec_ref: "§22 Test 1A",
@@ -1243,6 +1330,56 @@ pub fn run_brutal_identity_tests() {
     if correctness_failed > 0 { std::process::exit(1); }
 }
 
+/// Boot the OS in QEMU and run the Milestone 16 brutal property test suite.
+///
+/// BP1–BP10 are 5–10× escalated-iteration variants of P1–P10. All must pass.
+pub fn run_brutal_property_tests() {
+    println!("property-brutal: stopping any running QEMU instances...");
+    kill_existing_qemu();
+
+    println!("property-brutal: building...");
+    crate::cmd_build();
+
+    let kernel_elf = Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() {
+        eprintln!("property-brutal: kernel ELF not found at {}", kernel_elf.display());
+        std::process::exit(1);
+    }
+
+    let limine_dir = Path::new("tools/limine");
+    let image_path = crate::disk_image::create(kernel_elf, limine_dir);
+    crate::disk_image::install_bootloader(limine_dir, &image_path);
+
+    std::fs::create_dir_all("build/tests/9_PROPERTY_BRUTAL")
+        .expect("create build/tests/9_PROPERTY_BRUTAL/");
+
+    println!("\nproperty-brutal: running {} tests\n", BRUTAL_PROPERTY_TESTS.len());
+
+    let mut results: Vec<(&TestSpec, TestOutcome)> = Vec::new();
+
+    for test in BRUTAL_PROPERTY_TESTS {
+        print!("  [{:>3}]  {:45}  ({})  … ", test.id, test.name, test.spec_ref);
+        let _ = std::io::stdout().flush();
+
+        let outcome = run_brutal_property_one(test, &image_path);
+
+        match &outcome {
+            TestOutcome::Pass       => println!("PASS"),
+            TestOutcome::Fail(r)    => println!("FAIL\n         → {r}"),
+            TestOutcome::Blocked(r) => println!("BLOCKED\n         → {r}"),
+        }
+
+        results.push((test, outcome));
+    }
+
+    let passed = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Pass)).count();
+    let failed = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Fail(_))).count();
+
+    println!("\n  {passed} passed  {failed} failed");
+
+    if failed > 0 { std::process::exit(1); }
+}
+
 /// Boot the OS in QEMU and run the Milestone 12 performance benchmark suite.
 ///
 /// Pass criterion: each benchmark logs `perf: BN done` without panicking.
@@ -1640,6 +1777,21 @@ fn run_chaos_one(test: &TestSpec, image: &Path) -> TestOutcome {
     }
 }
 
+fn run_brutal_property_one(test: &TestSpec, image: &Path) -> TestOutcome {
+    match &test.kind {
+        TestKind::WatchSerial { expect, fail_on, timeout_secs } => {
+            let serial = brutal_property_serial_path(test);
+            let _ = std::fs::write(&serial, b"");
+            let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
+            let result = poll_serial(&serial, expect, fail_on,
+                                     Instant::now() + Duration::from_secs(*timeout_secs));
+            qemu.kill();
+            result
+        }
+        _ => TestOutcome::Blocked("brutal property tests only use WatchSerial"),
+    }
+}
+
 fn run_brutal_identity_one(test: &TestSpec, image: &Path) -> TestOutcome {
     match &test.kind {
         TestKind::WatchSerial { expect, fail_on, timeout_secs } => {
@@ -1681,6 +1833,10 @@ fn run_perf_one(test: &TestSpec, image: &Path) -> TestOutcome {
 
 fn serial_path(test: &TestSpec) -> PathBuf {
     PathBuf::from(format!("build/tests/1_IDENTITY/{}-{}.log", test.id, test.name))
+}
+
+fn brutal_property_serial_path(test: &TestSpec) -> PathBuf {
+    PathBuf::from(format!("build/tests/9_PROPERTY_BRUTAL/{}-{}.log", test.id, test.name))
 }
 
 fn brutal_identity_serial_path(test: &TestSpec) -> PathBuf {

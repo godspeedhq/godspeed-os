@@ -23,7 +23,7 @@ use crate::memory::frame::PhysAddr;
 // Kernel stack pool — one 64 KiB stack per ring-3 task (§14.1).
 // ---------------------------------------------------------------------------
 
-const TASK_KSTACK_MAX: usize = 120; // raised from 100 to accommodate Milestone 15 brutal identity probes
+const TASK_KSTACK_MAX: usize = 140; // raised from 120 to accommodate Milestone 16 brutal property probes
 const KSTACK_SIZE:     usize = 64 * 1024;
 
 // Magic value written at the BOTTOM of each kstack slot (byte offset 0 within
@@ -564,6 +564,156 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
             probe_mode:        29, // MODE_PROP_P7
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // ----------------------------------------------------------------
+        // Brutal property test probes — Milestone 16.
+        // 10 escalated-iteration variants of P1–P10, each with its own victim
+        // where the original property needed one.  Victims before controllers.
+        // ----------------------------------------------------------------
+        // BP1: cap unforgeability at 100k iterations.
+        "prop-bp1" => Some(("prop-bp1", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        104,
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BP2: generation monotonic over 20 kill/respawn cycles.
+        "prop-bp2-victim" => Some(("prop-bp2-victim", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0,
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "prop-bp2" => Some(("prop-bp2", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        105,
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BP3: cap rights never widen — 10k iterations (self-referential, like P3).
+        "prop-bp3" => Some(("prop-bp3", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        106,
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BP4: alloc accounting exact — 2k iterations.
+        "prop-bp4" => Some(("prop-bp4", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        107,
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BP5: endpoint ownership — 150 kill/respawn cycles.
+        "prop-bp5-victim" => Some(("prop-bp5-victim", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0,
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "prop-bp5" => Some(("prop-bp5", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        108,
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BP6: queue invariants — 2k iterations (self-referential, like P6).
+        "prop-bp6" => Some(("prop-bp6", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &["prop-bp6"],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        109,
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BP7: TLB shootdown proxy — 150 kill/respawn cycles.
+        "prop-bp7-victim" => Some(("prop-bp7-victim", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0,
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "prop-bp7" => Some(("prop-bp7", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        110,
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BP8: restart + higher-generation liveness — 20 iterations.
+        "prop-bp8-victim" => Some(("prop-bp8-victim", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0,
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "prop-bp8" => Some(("prop-bp8", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        111,
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BP9: generation invalidates ALL 3 slots, over 10 kill/respawn cycles.
+        "prop-bp9-victim" => Some(("prop-bp9-victim", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0,
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "prop-bp9" => Some(("prop-bp9", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &["prop-bp9-victim", "prop-bp9-victim", "prop-bp9-victim"],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        112,
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BP10: every send returns a defined outcome — 100k iterations.
+        "prop-bp10" => Some(("prop-bp10", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        113,
             memory_limit:      64 * 1024 * 1024,
         })),
         // ----------------------------------------------------------------
