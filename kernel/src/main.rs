@@ -210,8 +210,13 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     #[cfg(feature = "test-bad-elf")]
     loader::run_elf_fuzz();
 
+    // ELF-loader brutal fuzz (§22 Fuzz BF3): 263 inputs (13 specific + 200 random
+    // single-byte + 50 multi-byte mutations). Never reaches normal boot.
+    #[cfg(feature = "test-bad-elf-brutal")]
+    loader::run_elf_fuzz_brutal();
+
     // Normal boot: spawn init, bring up APs, enter per-core scheduler (never returns).
-    #[cfg(not(feature = "test-bad-elf"))]
+    #[cfg(not(any(feature = "test-bad-elf", feature = "test-bad-elf-brutal")))]
     {
         task::spawn_init();
         smp::init(boot_info);

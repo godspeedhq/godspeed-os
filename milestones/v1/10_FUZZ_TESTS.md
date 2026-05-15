@@ -16,6 +16,7 @@ CLAUDE.md §22 Fuzz Tests.
 |-------|-------|--------|
 | Phase 1 | F1, F2, F5, F6, F7, F8 | ✅ 6/6 PASS |
 | Phase 2 | F3, F4 | ✅ 2/2 PASS |
+| Phase 3 (Brutal) | BF1–BF8 | ✅ 8/8 PASS |
 
 ---
 
@@ -163,13 +164,69 @@ The margin is tight on task slots. If further probes are added for later milesto
 
 ---
 
+---
+
+## Phase 3: Brutal Fuzz Tests (Milestone 17)
+
+BF1–BF8 are 4–5× escalated-iteration variants of F1–F8. All must pass with no panic and no FAIL marker.
+
+### New probe modes (Milestone 17)
+
+| Mode | Test | Surface | Iterations |
+|------|------|---------|------------|
+| 114 | BF1 | Syscall args (same exclusions as F1) | 500 × 10 = 5,000 total |
+| 115 | BF2 | Random syscall numbers | 200,000 (4× F2) |
+| 116 | BF5 | Random IPC message bodies | 5,000 try_send (5× F5) |
+| 117 | BF6 | Embedded cap slot pairs | 5,000 SendWithCap (5× F6) |
+| 118 | BF7 | Stale-cap / generation | 200 kill cycles (4× F7) |
+| 119 | BF8 | Memory request sizes | 10 edge cases + 5,000 random (5× F8) |
+
+BF3 uses `kernel/test-bad-elf-brutal` feature: 263 inputs (13 specific + 200 xorshift single-byte + 50 multi-byte mutations). BF4 is host-side contract fuzz with 5 valid inputs and 31 bad inputs.
+
+### New service configs (kernel/src/task/mod.rs)
+
+| Name | Mode | has_recv | send_peers |
+|------|------|----------|------------|
+| fuzz-bf5-recv | 0 (passive) | yes | — |
+| fuzz-bf5 | 116 | no | fuzz-bf5-recv |
+| fuzz-bf6-recv | 0 (passive) | yes | — |
+| fuzz-bf6 | 117 | no | fuzz-bf6-recv |
+| fuzz-bf7-victim | 0 (passive) | yes | — |
+| fuzz-bf7 | 118 | no | fuzz-bf7-victim |
+| fuzz-bf1 | 114 | no | — |
+| fuzz-bf2 | 115 | no | — |
+| fuzz-bf8 | 119 | no | — |
+
+`TASK_KSTACK_MAX` and `MAX_TASKS` raised from 140 → 160 to accommodate new probes.
+
+### Results
+
+| ID | Name | Result | Notes |
+|----|------|--------|-------|
+| BF1 | syscall_args_500_rounds | ✅ PASS | 500 rounds × 10 syscalls |
+| BF2 | syscall_numbers_200k | ✅ PASS | 200,000 unknown syscall numbers |
+| BF3 | elf_loader_263_inputs | ✅ PASS | 13 specific + 200 single-byte + 50 multi-byte mutations |
+| BF4 | contract_validator_extended | ✅ PASS | 5 valid inputs; 31 bad inputs without panic |
+| BF5 | ipc_message_bodies_5k | ✅ PASS | 5,000 random-content try_send calls |
+| BF6 | embedded_cap_slots_5k | ✅ PASS | 5,000 random send_with_cap slot pairs |
+| BF7 | stale_cap_generation_200_cycles | ✅ PASS | 200 kill/respawn cycles; stale caps → EndpointDead |
+| BF8 | memory_request_5k_random | ✅ PASS | 10 edge cases + 5,000 random sizes |
+
+---
+
 ## Running
 
 ```
 osdev test fuzz
 ```
 
-Builds once, then runs all 8 tests. F1/F2/F5/F6/F7/F8 boot QEMU with the standard image. F3 rebuilds the kernel with `test-bad-elf` and boots a separate image. F4 runs inline (host-side, no QEMU). Logs are written to `build/tests/3_FUZZ/<id>-<name>.log`.
+Builds once, then runs all 8 F-tests. F1/F2/F5/F6/F7/F8 boot QEMU with the standard image. F3 rebuilds the kernel with `test-bad-elf` and boots a separate image. F4 runs inline (host-side, no QEMU). Logs are written to `build/tests/3_FUZZ/<id>-<name>.log`.
+
+```
+osdev test fuzz-brutal
+```
+
+Runs BF1–BF8. BF1/BF2/BF5–BF8 boot QEMU with the standard image. BF3 rebuilds the kernel with `test-bad-elf-brutal` and boots a separate image. BF4 runs inline. Logs are written to `build/tests/10_FUZZ_BRUTAL/<id>-<name>.log`.
 
 ---
 

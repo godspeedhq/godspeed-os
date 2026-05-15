@@ -335,3 +335,73 @@ pub fn run_elf_fuzz() -> ! {
     crate::kprintln!("fuzz: F3 pass ({}/{})", n, n);
     crate::arch::x86_64::halt_all_cores()
 }
+
+/// Brutal ELF loader fuzz — Milestone 17 BF3.
+///
+/// Runs the same 13 specific bad-input cases as `run_elf_fuzz`, then adds
+/// 200 xorshift-random single-byte mutations (vs. 64 sequential flips) and
+/// 50 random multi-byte corruption cases (2–4 bytes flipped per variant).
+/// Total: 13 + 200 + 50 = 263 inputs.
+#[cfg(feature = "test-bad-elf-brutal")]
+pub fn run_elf_fuzz_brutal() -> ! {
+    let base: [u8; 64] = [
+        0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        2, 0, 0x3e, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 64, 0, 56, 0, 0, 0, 64, 0, 0, 0, 0, 0,
+    ];
+
+    let mut n: u32 = 0;
+
+    // ── Same 13 specific bad-input cases as F3 ───────────────────────────────
+    let _ = load(&[]);                                            n += 1;
+    let _ = load(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0]); n += 1;
+    let _ = load(&[0u8; 64]);                                    n += 1;
+    let _ = load(&[0xffu8; 64]);                                  n += 1;
+    let mut b = base; b[4] = 1;  let _ = load(&b); n += 1;
+    let mut b = base; b[5] = 2;  let _ = load(&b); n += 1;
+    let mut b = base; b[16] = 3; let _ = load(&b); n += 1;
+    let mut b = base; b[18] = 3; b[19] = 0; let _ = load(&b); n += 1;
+    let mut b = base; b[54] = 32; b[56] = 1; let _ = load(&b); n += 1;
+    let mut b = base; b[56] = 1;
+    b[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+    let _ = load(&b); n += 1;
+    let mut b = base; b[56] = 1; b[32] = 64; let _ = load(&b); n += 1;
+    {
+        let mut buf = [0u8; 120]; buf[..64].copy_from_slice(&base);
+        buf[32] = 64; buf[56] = 1; buf[64] = 1; buf[68] = 4;
+        buf[96] = 10; buf[104] = 5; let _ = load(&buf); n += 1;
+    }
+    {
+        let mut buf = [0u8; 120]; buf[..64].copy_from_slice(&base);
+        buf[32] = 64; buf[56] = 1; buf[64] = 1; buf[68] = 4;
+        buf[72] = 60; buf[96] = 100; buf[104] = 100;
+        let _ = load(&buf); n += 1;
+    }
+
+    // ── 200 xorshift random single-byte mutations ─────────────────────────────
+    let mut rng: u64 = 0xBF3_FEED_u64;
+    for _ in 0..200usize {
+        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+        let idx = (rng >> 32) as usize % 64;
+        let val = rng as u8;
+        let mut b = base; b[idx] = val;
+        let _ = load(&b); n += 1;
+    }
+
+    // ── 50 random multi-byte (2–4 byte) mutations ─────────────────────────────
+    for _ in 0..50usize {
+        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+        let count = 2 + (rng % 3) as usize; // 2, 3, or 4 bytes
+        let mut b = base;
+        for k in 0..count {
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            let idx = ((rng >> 32) as usize + k * 17) % 64;
+            b[idx] = rng as u8;
+        }
+        let _ = load(&b); n += 1;
+    }
+
+    crate::kprintln!("fuzz: BF3 pass ({}/{})", n, n);
+    crate::arch::x86_64::halt_all_cores()
+}

@@ -53,6 +53,12 @@ enum TestKind {
         fail_on:      &'static [&'static str],
         timeout_secs: u64,
     },
+    /// Build kernel with `test-bad-elf-brutal` feature, boot QEMU, watch for pass (BF3).
+    WithBadElfBrutal {
+        expect:       &'static [&'static str],
+        fail_on:      &'static [&'static str],
+        timeout_secs: u64,
+    },
     /// Host-side contract validation fuzz (§22 Fuzz F4): runs inline without QEMU.
     /// `ok` inputs must pass schema validation; `bad` inputs must not cause a panic.
     ContractFuzz {
@@ -755,6 +761,163 @@ static BRUTAL_PROPERTY_TESTS: &[TestSpec] = &[
     },
 ];
 
+// ---------------------------------------------------------------------------
+// Brutal fuzz test definitions (Milestone 17).
+// ---------------------------------------------------------------------------
+
+static BRUTAL_FUZZ_TESTS: &[TestSpec] = &[
+    TestSpec {
+        id: "BF1", name: "syscall_args_500_rounds", spec_ref: "§22 Brutal Fuzz BF1",
+        kind: TestKind::WatchSerial {
+            expect:       &["fuzz: BF1 pass (500/10)"],
+            fail_on:      &["KERNEL PANIC", "fuzz: BF1 FAIL"],
+            timeout_secs: 180,
+        },
+    },
+    TestSpec {
+        id: "BF2", name: "syscall_numbers_200k", spec_ref: "§22 Brutal Fuzz BF2",
+        kind: TestKind::WatchSerial {
+            expect:       &["fuzz: BF2 pass (200000/200000)"],
+            fail_on:      &["KERNEL PANIC", "fuzz: BF2 FAIL"],
+            timeout_secs: 120,
+        },
+    },
+    TestSpec {
+        id: "BF3", name: "elf_loader_263_inputs", spec_ref: "§22 Brutal Fuzz BF3",
+        kind: TestKind::WithBadElfBrutal {
+            expect:       &["fuzz: BF3 pass (263/263)"],
+            fail_on:      &["KERNEL PANIC"],
+            timeout_secs: 60,
+        },
+    },
+    TestSpec {
+        id: "BF4", name: "contract_validator_extended", spec_ref: "§22 Brutal Fuzz BF4",
+        kind: TestKind::ContractFuzz {
+            ok: &[
+                concat!(
+                    "name = \"ping\"\nversion = \"0.1.0\"\n\n",
+                    "[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n\n",
+                    "[capabilities]\nlog_write = true",
+                ),
+                concat!(
+                    "name = \"pong\"\nversion = \"0.2.0\"\n\n",
+                    "[resources.memory]\nrequest = \"16MiB\"\nlimit = \"32MiB\"\n\n",
+                    "[capabilities]\nipc_send = [\"ping\"]\nipc_receive = [\"pong\"]\nlog_write = true",
+                ),
+                concat!(
+                    "name = \"probe\"\nversion = \"0.1.0\"\n\n",
+                    "[resources.memory]\nrequest = \"4MiB\"\nlimit = \"8MiB\"\n\n",
+                    "[capabilities]\nlog_write = true\n\n",
+                    "[placement]\ncore = 0",
+                ),
+                concat!(
+                    "name = \"logger\"\nversion = \"1.0.0\"\n\n",
+                    "[resources.memory]\nrequest = \"8MiB\"\nlimit = \"16MiB\"\n\n",
+                    "[capabilities]\nlog_write = true\nipc_receive = [\"logger\"]",
+                ),
+                concat!(
+                    "name = \"block-driver\"\nversion = \"0.3.0\"\n\n",
+                    "[resources.memory]\nrequest = \"64MiB\"\nlimit = \"128MiB\"\n\n",
+                    "[capabilities]\nlog_write = true\nipc_send = [\"fs\"]\nipc_receive = [\"block-driver\"]",
+                ),
+            ],
+            bad: &[
+                b"",                          // empty
+                b"\xFF\xFE",                  // non-UTF-8
+                b"[unclosed",                 // invalid TOML
+                // missing name
+                b"version = \"0.1.0\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n[capabilities]\nlog_write = true",
+                // missing version
+                b"name = \"ping\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n[capabilities]\nlog_write = true",
+                // missing resources
+                b"name = \"ping\"\nversion = \"0.1.0\"\n[capabilities]\nlog_write = true",
+                // missing capabilities
+                b"name = \"ping\"\nversion = \"0.1.0\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"",
+                // name wrong type (integer)
+                b"name = 42\nversion = \"0.1.0\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n[capabilities]\nlog_write = true",
+                // bad name pattern (uppercase)
+                b"name = \"Ping\"\nversion = \"0.1.0\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n[capabilities]\nlog_write = true",
+                // bad version (not semver)
+                b"name = \"ping\"\nversion = \"not-semver\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n[capabilities]\nlog_write = true",
+                // extra top-level field (additionalProperties: false)
+                b"name = \"ping\"\nversion = \"0.1.0\"\nextra = true\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n[capabilities]\nlog_write = true",
+                // bad memory unit (MB instead of MiB)
+                b"name = \"ping\"\nversion = \"0.1.0\"\n[resources.memory]\nrequest = \"32MB\"\nlimit = \"64MB\"\n[capabilities]\nlog_write = true",
+                // placement.core out of range (max 15)
+                b"name = \"ping\"\nversion = \"0.1.0\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n[capabilities]\nlog_write = true\n[placement]\ncore = 100",
+                // log_write wrong type (string instead of boolean)
+                b"name = \"ping\"\nversion = \"0.1.0\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n[capabilities]\nlog_write = \"yes\"",
+                // name with spaces
+                b"name = \"my service\"\nversion = \"0.1.0\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n[capabilities]\nlog_write = true",
+                // name with slash
+                b"name = \"ping/pong\"\nversion = \"0.1.0\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n[capabilities]\nlog_write = true",
+                // version with only major (no minor.patch)
+                b"name = \"ping\"\nversion = \"1\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n[capabilities]\nlog_write = true",
+                // version with four parts
+                b"name = \"ping\"\nversion = \"1.0.0.0\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n[capabilities]\nlog_write = true",
+                // memory.request missing but limit present
+                b"name = \"ping\"\nversion = \"0.1.0\"\n[resources.memory]\nlimit = \"64MiB\"\n[capabilities]\nlog_write = true",
+                // memory.limit missing but request present
+                b"name = \"ping\"\nversion = \"0.1.0\"\n[resources.memory]\nrequest = \"32MiB\"\n[capabilities]\nlog_write = true",
+                // ipc_send wrong type (string, not array)
+                b"name = \"ping\"\nversion = \"0.1.0\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n[capabilities]\nipc_send = \"pong\"",
+                // ipc_receive wrong type (boolean)
+                b"name = \"ping\"\nversion = \"0.1.0\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n[capabilities]\nipc_receive = true",
+                // placement.core wrong type (string)
+                b"name = \"ping\"\nversion = \"0.1.0\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n[capabilities]\nlog_write = true\n[placement]\ncore = \"zero\"",
+                // placement.core negative
+                b"name = \"ping\"\nversion = \"0.1.0\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n[capabilities]\nlog_write = true\n[placement]\ncore = -1",
+                // extra field inside capabilities
+                b"name = \"ping\"\nversion = \"0.1.0\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n[capabilities]\nlog_write = true\nunknown_cap = true",
+                // extra field inside resources.memory
+                b"name = \"ping\"\nversion = \"0.1.0\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\nextra = 1\n[capabilities]\nlog_write = true",
+                // null bytes (not valid UTF-8)
+                b"\x00\x00\x00",
+                // single null byte
+                b"\x00",
+                // only whitespace
+                b"   \n\t\n   ",
+                // very long name (>64 chars)
+                b"name = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\nversion = \"0.1.0\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n[capabilities]\nlog_write = true",
+                // name empty string
+                b"name = \"\"\nversion = \"0.1.0\"\n[resources.memory]\nrequest = \"32MiB\"\nlimit = \"64MiB\"\n[capabilities]\nlog_write = true",
+            ],
+        },
+    },
+    TestSpec {
+        id: "BF5", name: "ipc_message_bodies_5k", spec_ref: "§22 Brutal Fuzz BF5",
+        kind: TestKind::WatchSerial {
+            expect:       &["fuzz: BF5 pass (5000/5000)"],
+            fail_on:      &["KERNEL PANIC", "fuzz: BF5 FAIL"],
+            timeout_secs: 120,
+        },
+    },
+    TestSpec {
+        id: "BF6", name: "embedded_cap_slots_5k", spec_ref: "§22 Brutal Fuzz BF6",
+        kind: TestKind::WatchSerial {
+            expect:       &["fuzz: BF6 pass (5000/5000)"],
+            fail_on:      &["KERNEL PANIC", "fuzz: BF6 FAIL"],
+            timeout_secs: 120,
+        },
+    },
+    TestSpec {
+        id: "BF7", name: "stale_cap_generation_200_cycles", spec_ref: "§22 Brutal Fuzz BF7",
+        kind: TestKind::WatchSerial {
+            expect:       &["fuzz: BF7 pass (200/200)"],
+            fail_on:      &["KERNEL PANIC", "fuzz: BF7 FAIL"],
+            timeout_secs: 180,
+        },
+    },
+    TestSpec {
+        id: "BF8", name: "memory_request_5k_random", spec_ref: "§22 Brutal Fuzz BF8",
+        kind: TestKind::WatchSerial {
+            expect:       &["fuzz: BF8 pass"],
+            fail_on:      &["KERNEL PANIC", "fuzz: BF8 FAIL"],
+            timeout_secs: 120,
+        },
+    },
+];
+
 static TESTS: &[TestSpec] = &[
     TestSpec {
         id: "1A", name: "bootstrap_steady_state_positive", spec_ref: "§22 Test 1A",
@@ -1380,6 +1543,59 @@ pub fn run_brutal_property_tests() {
     if failed > 0 { std::process::exit(1); }
 }
 
+/// Boot the OS in QEMU and run the Milestone 17 brutal fuzz test suite.
+///
+/// BF1/BF2/BF5–BF8 are QEMU-based fuzz probes (5–10× iteration escalation).
+/// BF3 builds with `test-bad-elf-brutal` and halts after 263 inputs.
+/// BF4 is host-side contract validator fuzz with 30+ bad inputs.
+/// All must pass (no kernel panic, no FAIL marker).
+pub fn run_brutal_fuzz_tests() {
+    println!("fuzz-brutal: stopping any running QEMU instances...");
+    kill_existing_qemu();
+
+    println!("fuzz-brutal: building...");
+    crate::cmd_build();
+
+    let kernel_elf = Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() {
+        eprintln!("fuzz-brutal: kernel ELF not found at {}", kernel_elf.display());
+        std::process::exit(1);
+    }
+
+    let limine_dir = Path::new("tools/limine");
+    let image_path = crate::disk_image::create(kernel_elf, limine_dir);
+    crate::disk_image::install_bootloader(limine_dir, &image_path);
+
+    std::fs::create_dir_all("build/tests/10_FUZZ_BRUTAL")
+        .expect("create build/tests/10_FUZZ_BRUTAL/");
+
+    println!("\nfuzz-brutal: running {} tests\n", BRUTAL_FUZZ_TESTS.len());
+
+    let mut results: Vec<(&TestSpec, TestOutcome)> = Vec::new();
+
+    for test in BRUTAL_FUZZ_TESTS {
+        print!("  [{:>3}]  {:45}  ({})  … ", test.id, test.name, test.spec_ref);
+        let _ = std::io::stdout().flush();
+
+        let outcome = run_brutal_fuzz_one(test, &image_path, limine_dir);
+
+        match &outcome {
+            TestOutcome::Pass       => println!("PASS"),
+            TestOutcome::Fail(r)    => println!("FAIL\n         → {r}"),
+            TestOutcome::Blocked(r) => println!("BLOCKED\n         → {r}"),
+        }
+
+        results.push((test, outcome));
+    }
+
+    let passed = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Pass)).count();
+    let failed = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Fail(_))).count();
+
+    println!("\n  {passed} passed  {failed} failed");
+
+    if failed > 0 { std::process::exit(1); }
+}
+
 /// Boot the OS in QEMU and run the Milestone 12 performance benchmark suite.
 ///
 /// Pass criterion: each benchmark logs `perf: BN done` without panicking.
@@ -1488,7 +1704,8 @@ fn run_one(test: &TestSpec, image: &Path) -> TestOutcome {
     match &test.kind {
         TestKind::Blocked { reason } => TestOutcome::Blocked(reason),
         TestKind::WithBadElf { .. } => TestOutcome::Blocked("WithBadElf only runs via osdev test fuzz"),
-        TestKind::ContractFuzz { .. } => TestOutcome::Blocked("ContractFuzz only runs via osdev test fuzz"),
+        TestKind::WithBadElfBrutal { .. } => TestOutcome::Blocked("WithBadElfBrutal only runs via osdev test fuzz-brutal"),
+        TestKind::ContractFuzz { .. } => TestOutcome::Blocked("ContractFuzz only runs via osdev test fuzz or fuzz-brutal"),
 
         TestKind::WithBadTcb { expect, fail_on, timeout_secs } => {
             // Build kernel with the test-bad-registry feature (invalid registry ELF).
@@ -1816,6 +2033,80 @@ fn run_brutal_identity_one(test: &TestSpec, image: &Path) -> TestOutcome {
     }
 }
 
+fn run_brutal_fuzz_one(test: &TestSpec, image: &Path, limine_dir: &Path) -> TestOutcome {
+    match &test.kind {
+        TestKind::WatchSerial { expect, fail_on, timeout_secs } => {
+            let serial = brutal_fuzz_serial_path(test);
+            let _ = std::fs::write(&serial, b"");
+            let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
+            let result = poll_serial(&serial, expect, fail_on,
+                                     Instant::now() + Duration::from_secs(*timeout_secs));
+            qemu.kill();
+            result
+        }
+
+        TestKind::WithBadElfBrutal { expect, fail_on, timeout_secs } => {
+            let status = std::process::Command::new("cargo")
+                .args([
+                    "build", "--release", "-p", "kernel",
+                    "--target", "x86_64-unknown-none",
+                    "--features", "kernel/test-bad-elf-brutal",
+                ])
+                .status()
+                .expect("failed to invoke cargo");
+            if !status.success() {
+                return TestOutcome::Fail(
+                    "kernel build with test-bad-elf-brutal feature failed".to_string()
+                );
+            }
+
+            let kernel_elf = Path::new("target/x86_64-unknown-none/release/kernel");
+            let bad_img    = Path::new("build/tests/10_FUZZ_BRUTAL/BF3-bad-elf-brutal.img");
+            let bad_image  = crate::disk_image::create_at(kernel_elf, limine_dir, bad_img);
+            crate::disk_image::install_bootloader(limine_dir, &bad_image);
+
+            let serial = brutal_fuzz_serial_path(test);
+            let _ = std::fs::write(&serial, b"");
+            let qemu   = crate::qemu::spawn_for_test(&bad_image, 4, &serial, None);
+            let result = poll_serial(&serial, expect, fail_on,
+                                     Instant::now() + Duration::from_secs(*timeout_secs));
+            qemu.kill();
+            result
+        }
+
+        TestKind::ContractFuzz { ok, bad } => {
+            let schema_path = Path::new("contracts/schema/service.schema.json");
+            let schema = load_schema(schema_path);
+
+            for (i, &src) in ok.iter().enumerate() {
+                match validate_contract_source(&schema, src.as_bytes()) {
+                    Ok(()) => {}
+                    Err(e) => return TestOutcome::Fail(
+                        format!("ok[{i}] unexpectedly rejected by schema: {e}")
+                    ),
+                }
+            }
+
+            for (i, &src) in bad.iter().enumerate() {
+                let s = schema.clone();
+                let b = src.to_vec();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    validate_contract_source(&s, &b)
+                }));
+                if result.is_err() {
+                    return TestOutcome::Fail(format!(
+                        "bad[{i}] caused a panic in validate_contract_source"
+                    ));
+                }
+            }
+
+            TestOutcome::Pass
+        }
+
+        _ => TestOutcome::Blocked("brutal fuzz tests use WatchSerial, WithBadElfBrutal, or ContractFuzz"),
+    }
+}
+
 fn run_perf_one(test: &TestSpec, image: &Path) -> TestOutcome {
     match &test.kind {
         TestKind::WatchSerial { expect, fail_on, timeout_secs } => {
@@ -1865,6 +2156,10 @@ fn adv_serial_path(test: &TestSpec) -> PathBuf {
 
 fn chaos_serial_path(test: &TestSpec) -> PathBuf {
     PathBuf::from(format!("build/tests/7_CHAOS/{}-{}.log", test.id, test.name))
+}
+
+fn brutal_fuzz_serial_path(test: &TestSpec) -> PathBuf {
+    PathBuf::from(format!("build/tests/10_FUZZ_BRUTAL/{}-{}.log", test.id, test.name))
 }
 
 // ---------------------------------------------------------------------------

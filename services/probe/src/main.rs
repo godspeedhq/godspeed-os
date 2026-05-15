@@ -154,6 +154,14 @@ const MODE_PROP_BP8:        u32 = 111; // BP8: restart resolves higher generatio
 const MODE_PROP_BP9:        u32 = 112; // BP9: all 3 cap slots invalidated — 10 cycles
 const MODE_PROP_BP10:       u32 = 113; // BP10: every send returns defined outcome — 100k
 
+// Brutal fuzz test modes — Milestone 17.
+const MODE_FUZZ_BF1:        u32 = 114; // BF1: syscall args — 500 × 10 syscalls
+const MODE_FUZZ_BF2:        u32 = 115; // BF2: syscall numbers — 200k random
+const MODE_FUZZ_BF5:        u32 = 116; // BF5: IPC message bodies — 5k sends
+const MODE_FUZZ_BF6:        u32 = 117; // BF6: embedded cap slots — 5k pairs
+const MODE_FUZZ_BF7:        u32 = 118; // BF7: stale cap / generation — 200 kill cycles
+const MODE_FUZZ_BF8:        u32 = 119; // BF8: memory request sizes — 10 edge + 5k random
+
 // Brutal identity test modes — Milestone 15.
 const MODE_BRUTAL_ID_11:    u32 = 97; // T11: self-referential queue boundary exactness
 const MODE_BRUTAL_ID_12_A:  u32 = 98; // T12: cap chain source (A sends to B, grants cap to C)
@@ -252,6 +260,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         MODE_BRUTAL_ID_12_C  => mode_brutal_id_12_c(&ctx),
         MODE_BRUTAL_ID_13_SND => mode_brutal_id_13_send(&ctx),
         MODE_BRUTAL_ID_13_KIL => mode_brutal_id_13_kill(&ctx),
+        MODE_FUZZ_BF1        => mode_fuzz_bf1(&ctx),
+        MODE_FUZZ_BF2        => mode_fuzz_bf2(&ctx),
+        MODE_FUZZ_BF5        => mode_fuzz_bf5(&ctx),
+        MODE_FUZZ_BF6        => mode_fuzz_bf6(&ctx),
+        MODE_FUZZ_BF7        => mode_fuzz_bf7(&ctx),
+        MODE_FUZZ_BF8        => mode_fuzz_bf8(&ctx),
         _                    => idle(&ctx),
     }
 }
@@ -1961,6 +1975,141 @@ fn mode_prop_bp10(ctx: &ServiceContext) -> ! {
         let _    = ctx.try_send_by_handle(slot, &msg);
     }
     ctx.log("prop: BP10 pass (100000/100000)");
+    idle(ctx)
+}
+
+// ---------------------------------------------------------------------------
+// Brutal fuzz test modes — Milestone 17
+// ---------------------------------------------------------------------------
+
+fn mode_fuzz_bf1(ctx: &ServiceContext) -> ! {
+    // BF1 — Random syscall args (§22 Fuzz BF1).
+    // 500 × 10 syscalls = 5,000 total (5× F1). Same exclusions as F1.
+    const NRS: &[u64] = &[1, 2, 3, 5, 7, 8, 10, 11, 12, 14];
+    const A1S: &[u64] = &[0, 0xffff800000000000, u64::MAX, 0xffff_8000_0000_1000];
+    const A2S: &[u64] = &[0, 1, 255, 256, 4096, u64::MAX];
+
+    ctx.log("fuzz: BF1 starting");
+    let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 114;
+    for &nr in NRS {
+        for iter in 0..500u32 {
+            let a0 = match iter % 8 {
+                0 => 0u64,
+                1 => 1u64,
+                2 => 64u64,
+                3 => 0xFFFFu64,
+                4 => u64::MAX,
+                5 => xorshift64(&mut rng) as u32 as u64,
+                6 => xorshift64(&mut rng) & 0xFF,
+                _ => xorshift64(&mut rng),
+            };
+            let a1 = A1S[(iter as usize) % A1S.len()];
+            let a2 = A2S[(iter as usize) % A2S.len()];
+            // SAFETY: nr != 9 (Abort); a1/a2 fail validate_user_slice.
+            unsafe { probe_raw_syscall(nr, a0, a1, a2); }
+        }
+    }
+    ctx.log("fuzz: BF1 pass (500/10)");
+    idle(ctx)
+}
+
+fn mode_fuzz_bf2(ctx: &ServiceContext) -> ! {
+    // BF2 — Random syscall numbers (§22 Fuzz BF2). 200,000 random u64 numbers (4× F2).
+    let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 115;
+    let mut bad = 0u32;
+    for _ in 0..200_000u32 {
+        let raw = xorshift64(&mut rng);
+        let nr = if raw <= 15 { raw + 100 } else { raw };
+        // SAFETY: nr > 15 → dispatch _ arm → returns -1; no panic.
+        let ret = unsafe { probe_raw_syscall(nr, 0, 0, 0) };
+        if ret != -1 { bad += 1; }
+    }
+    if bad > 0 {
+        ctx.log("fuzz: BF2 FAIL — unknown syscall returned non-(-1)");
+    } else {
+        ctx.log("fuzz: BF2 pass (200000/200000)");
+    }
+    idle(ctx)
+}
+
+fn mode_fuzz_bf5(ctx: &ServiceContext) -> ! {
+    // BF5 — Random IPC message bodies (§22 Fuzz BF5). 5,000 try_send calls (5× F5).
+    let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 116;
+    for _ in 0..5_000u32 {
+        let size = (xorshift64(&mut rng) % 4097) as usize;
+        let mut buf = [0u8; 4096];
+        for b in buf[..size.min(4096)].iter_mut() {
+            *b = xorshift64(&mut rng) as u8;
+        }
+        let msg = Message::from_bytes(&buf[..size.min(4096)]);
+        let _ = ctx.try_send("fuzz-bf5-recv", &msg);
+    }
+    ctx.log("fuzz: BF5 pass (5000/5000)");
+    idle(ctx)
+}
+
+fn mode_fuzz_bf6(ctx: &ServiceContext) -> ! {
+    // BF6 — Embedded cap slot fuzzing (§22 Fuzz BF6). 5,000 SendWithCap calls (5× F6).
+    let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 117;
+    let msg = Message::from_bytes(b"bf6");
+    for _ in 0..5_000u32 {
+        let ep_slot  = CapHandle(xorshift64(&mut rng) as u32);
+        let cap_slot = CapHandle(xorshift64(&mut rng) as u32);
+        let _ = ctx.send_with_cap_by_handle(ep_slot, cap_slot, &msg);
+    }
+    ctx.log("fuzz: BF6 pass (5000/5000)");
+    idle(ctx)
+}
+
+fn mode_fuzz_bf7(ctx: &ServiceContext) -> ! {
+    // BF7 — Stale cap / generation fuzzing (§22 Fuzz BF7). 200 kill cycles (4× F7).
+    let msg   = Message::from_bytes(b"bf7");
+    let stale = ctx.send_peer_at(0); // SEND cap to fuzz-bf7-victim
+
+    for _ in 0..200u32 {
+        let _ = ctx.kill("fuzz-bf7-victim");
+
+        if let Some(h) = stale {
+            if ctx.try_send_by_handle(h, &msg).is_ok() {
+                ctx.log("fuzz: BF7 FAIL — send to killed endpoint succeeded");
+                idle(ctx);
+            }
+        }
+
+        let _ = ctx.try_send_by_handle(CapHandle(0xBEEF), &msg);
+        let _ = ctx.try_send_by_handle(CapHandle(u32::MAX), &msg);
+
+        let _ = ctx.spawn("fuzz-bf7-victim");
+        if let Some(h) = stale {
+            let _ = ctx.try_send_by_handle(h, &msg);
+        }
+    }
+    ctx.log("fuzz: BF7 pass (200/200)");
+    idle(ctx)
+}
+
+fn mode_fuzz_bf8(ctx: &ServiceContext) -> ! {
+    // BF8 — Memory request sizes (§22 Fuzz BF8). 10 edge cases + 5,000 random (5× F8).
+    let edge_cases: &[usize] = &[
+        0,
+        1,
+        4095,
+        4096,
+        4097,
+        64 * 1024 * 1024 + 1,
+        1 << 30,
+        usize::MAX - 4095,
+        usize::MAX - 1,
+        usize::MAX,
+    ];
+    for &size in edge_cases {
+        let _ = ctx.alloc_mem(size);
+    }
+    let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 119;
+    for _ in 0..5_000u32 {
+        let _ = ctx.alloc_mem(xorshift64(&mut rng) as usize);
+    }
+    ctx.log("fuzz: BF8 pass");
     idle(ctx)
 }
 

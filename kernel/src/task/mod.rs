@@ -23,7 +23,7 @@ use crate::memory::frame::PhysAddr;
 // Kernel stack pool — one 64 KiB stack per ring-3 task (§14.1).
 // ---------------------------------------------------------------------------
 
-const TASK_KSTACK_MAX: usize = 140; // raised from 120 to accommodate Milestone 16 brutal property probes
+const TASK_KSTACK_MAX: usize = 160; // raised from 140 to accommodate Milestone 17 brutal fuzz probes
 const KSTACK_SIZE:     usize = 64 * 1024;
 
 // Magic value written at the BOTTOM of each kstack slot (byte offset 0 within
@@ -803,6 +803,91 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
             probe_mode:        35, // FUZZ_F8: edge-case + random memory request sizes
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // ----------------------------------------------------------------
+        // Brutal fuzz test probes — Milestone 17.
+        // Victims/recv-endpoints before controllers.
+        // ----------------------------------------------------------------
+        "fuzz-bf5-recv" => Some(("fuzz-bf5-recv", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0, // passive recv sink
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "fuzz-bf5" => Some(("fuzz-bf5", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &["fuzz-bf5-recv"],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        116, // FUZZ_BF5: random IPC bodies — 5k sends
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "fuzz-bf6-recv" => Some(("fuzz-bf6-recv", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0, // passive recv sink
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "fuzz-bf6" => Some(("fuzz-bf6", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &["fuzz-bf6-recv"],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        117, // FUZZ_BF6: random cap slots — 5k SendWithCap
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "fuzz-bf7-victim" => Some(("fuzz-bf7-victim", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0, // passive recv — killed/respawned by fuzz-bf7
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "fuzz-bf7" => Some(("fuzz-bf7", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &["fuzz-bf7-victim"],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        118, // FUZZ_BF7: stale cap — 200 kill/respawn cycles
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "fuzz-bf1" => Some(("fuzz-bf1", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        114, // FUZZ_BF1: syscall args — 500 × 10 calls
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "fuzz-bf2" => Some(("fuzz-bf2", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        115, // FUZZ_BF2: syscall numbers — 200k random
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "fuzz-bf8" => Some(("fuzz-bf8", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        119, // FUZZ_BF8: memory sizes — 10 edge + 5k random
             memory_limit:      64 * 1024 * 1024,
         })),
         // ----------------------------------------------------------------

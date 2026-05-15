@@ -24,5 +24,10 @@ test-bad-registry = []
 # then halts.  Only used by `osdev test fuzz`.
 test-bad-elf = []
 
+# Build the kernel in brutal ELF-loader fuzz mode (§22 Fuzz BF3).  Calls
+# loader::run_elf_fuzz_brutal() on 263 malformed inputs (13 specific + 200
+# random single-byte + 50 multi-byte mutations).  Only used by `osdev test fuzz-brutal`.
+test-bad-elf-brutal = []
+
 [profile.release]
 panic = "abort"

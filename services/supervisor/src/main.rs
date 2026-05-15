@@ -98,6 +98,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let _ = ctx.spawn("fuzz-f7");
     let _ = ctx.spawn("fuzz-f8");
 
+    // --- Brutal fuzz test probes — Milestone 17 ---
+    // Recv-endpoint victims must be spawned before controllers so their
+    // endpoints are registered when the controllers' SEND caps are wired.
+    let _ = ctx.spawn("fuzz-bf5-recv");
+    let _ = ctx.spawn("fuzz-bf5");
+    let _ = ctx.spawn("fuzz-bf6-recv");
+    let _ = ctx.spawn("fuzz-bf6");
+    let _ = ctx.spawn("fuzz-bf7-victim");
+    let _ = ctx.spawn("fuzz-bf7");
+    let _ = ctx.spawn("fuzz-bf1");
+    let _ = ctx.spawn("fuzz-bf2");
+    let _ = ctx.spawn("fuzz-bf8");
+
     // --- Stress-test probes — Milestone 11 Phase 1 ---
     // Recv-endpoint victims must be spawned before their controllers so their
     // endpoints are registered before the controllers' SEND caps are wired.
