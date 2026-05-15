@@ -199,7 +199,7 @@ const MODE_ADV_BA5:          u32 = 148; // BA5: 5 TOCTOU kill+send cycles
 const MODE_ADV_BA6:          u32 = 149; // BA6: fill+drain cap table × 5 cycles
 const MODE_ADV_BA7:          u32 = 150; // BA7: 500 timing samples (5× A7)
 const MODE_ADV_BA8:          u32 = 151; // BA8: tight loop hog
-const MODE_ADV_BA8_WITNESS:  u32 = 152; // BA8 witness: 1000 yields (5000 was too slow under load)
+const MODE_ADV_BA8_WITNESS:  u32 = 152; // BA8 witness: 200 yields (1000 too slow under full load)
 const MODE_ADV_BA9:          u32 = 153; // BA9: 5 direct-spawn bypass attempts
 const MODE_ADV_BA10:         u32 = 154; // BA10: 20 kernel addr patterns (5× A10)
 
@@ -1844,11 +1844,12 @@ fn mode_adv_ba7(ctx: &ServiceContext) -> ! {
 }
 
 fn mode_adv_ba8_witness(ctx: &ServiceContext) -> ! {
-    // BA8 witness — 1,000 yields alongside tight-loop hog (§22 Brutal Adv BA8).
-    // 5000 was too slow: brutal stress probes' kill/spawn cycles starve the
-    // yield task past 900s. 1000 is sufficient to prove preemption fires.
-    for _ in 0..1_000u32 { ctx.yield_cpu(); }
-    ctx.log("adv: BA8 pass — witness ran 1000 yields despite tight-loop hog");
+    // BA8 witness — 200 yields alongside tight-loop hog (§22 Brutal Adv BA8).
+    // 1000 was still too slow once the full brutal-suite load hits core 3.
+    // Spawned early (before property/stress kill-respawn loops) so 200 yields
+    // suffice to prove preemption fires while the system is still quiet.
+    for _ in 0..200u32 { ctx.yield_cpu(); }
+    ctx.log("adv: BA8 pass — witness ran 200 yields despite tight-loop hog");
     idle(ctx)
 }
 

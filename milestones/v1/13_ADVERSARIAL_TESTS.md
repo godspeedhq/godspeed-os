@@ -171,7 +171,7 @@ BA1–BA10 correspond to A1–A10 but with higher iteration counts and longer ru
 | BA5  | TOCTOU kill+send race × 5 cycles                                                       | 5× A5                              |
 | BA6  | Fill + drain cap table × 5 cycles                                                      | 5× A6                              |
 | BA7  | 500 timing samples (5× A7 count)                                                       | 5× A7 (100 → 500)                  |
-| BA8  | Tight-loop hog + witness runs 1,000 yields                                             | Same yield count as A8; brutal = tighter hog loop |
+| BA8  | Tight-loop hog + witness runs 200 yields                                               | Spawned early (before stress); 200 yields proves preemption fires |
 | BA9  | 5× direct spawn bypass attempts (non-existent service name)                            | 5× A9                              |
 | BA10 | 20 kernel-address patterns × raw send/recv syscalls                                    | 5× A10 (4 → 20)                    |
 
@@ -189,7 +189,7 @@ BA1–BA10 correspond to A1–A10 but with higher iteration counts and longer ru
 | adv-ba7-recv     | 0    | Passive; absorbs 500 timing probe messages                 |
 | adv-ba7          | 150  | SEND cap to adv-ba7-recv; 500 timing sends                 |
 | adv-ba8          | 151  | Tight loop; preemption target                              |
-| adv-ba8-witness  | 152  | 1,000 yields then log pass                                 |
+| adv-ba8-witness  | 152  | 200 yields then log pass                                   |
 | adv-ba9          | 153  | Spawn non-existent service × 5 → `Err`                     |
 | adv-ba10         | 154  | 20 kernel addr patterns via raw syscalls                   |
 

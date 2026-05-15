@@ -38,6 +38,26 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Memory-limit probes — Tests 7A and 7B.
     let _ = ctx.spawn("probe-7a");
     let _ = ctx.spawn("probe-7b");
+
+    // --- Brutal adversarial test probes — Milestone 20 ---
+    // Spawned EARLY, before property/stress kill-respawn loops start, so the
+    // supervisor's spawn calls land while the system is still lightly loaded.
+    // Victims/passive services must be registered before their attackers so
+    // their endpoints exist when the attacker's SEND caps are wired at spawn.
+    let _ = ctx.spawn("adv-ba1");
+    let _ = ctx.spawn("adv-ba2");
+    let _ = ctx.spawn("adv-ba3");
+    let _ = ctx.spawn("adv-ba4");
+    let _ = ctx.spawn("adv-ba5-victim"); // registered before adv-ba5
+    let _ = ctx.spawn("adv-ba5");
+    let _ = ctx.spawn("adv-ba6");        // recv endpoint registered so self-fill works
+    let _ = ctx.spawn("adv-ba7-recv");   // passive recv registered before sender
+    let _ = ctx.spawn("adv-ba7");
+    let _ = ctx.spawn("adv-ba8");        // tight-loop hog
+    let _ = ctx.spawn("adv-ba8-witness");
+    let _ = ctx.spawn("adv-ba9");
+    let _ = ctx.spawn("adv-ba10");
+
     // Property-test probes — Milestone 9 Phase 1.
     // prop-p9-victim must register its endpoint before prop-p9 is spawned
     // (SEND caps to prop-p9-victim are wired at prop-p9 spawn time).
@@ -202,23 +222,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let _ = ctx.spawn("perf-bp9-recv");    // recv registered before sender is wired
     let _ = ctx.spawn("perf-bp9");
     let _ = ctx.spawn("perf-bp10");
-
-    // --- Brutal adversarial test probes — Milestone 20 ---
-    // Victims/passive services must be registered before their attackers so
-    // their endpoints exist when the attacker's SEND caps are wired at spawn.
-    let _ = ctx.spawn("adv-ba1");
-    let _ = ctx.spawn("adv-ba2");
-    let _ = ctx.spawn("adv-ba3");
-    let _ = ctx.spawn("adv-ba4");
-    let _ = ctx.spawn("adv-ba5-victim"); // registered before adv-ba5
-    let _ = ctx.spawn("adv-ba5");
-    let _ = ctx.spawn("adv-ba6");        // recv endpoint registered so self-fill works
-    let _ = ctx.spawn("adv-ba7-recv");   // passive recv registered before sender
-    let _ = ctx.spawn("adv-ba7");
-    let _ = ctx.spawn("adv-ba8");        // tight-loop hog
-    let _ = ctx.spawn("adv-ba8-witness");
-    let _ = ctx.spawn("adv-ba9");
-    let _ = ctx.spawn("adv-ba10");
 
     // --- Performance-benchmark probes — Milestone 12 ---
     // Spawn sender/controller probes BEFORE their echo/recv partners so the

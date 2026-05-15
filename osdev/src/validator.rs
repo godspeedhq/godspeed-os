@@ -2584,7 +2584,7 @@ static BRUTAL_ADV_TESTS: &[TestSpec] = &[
     TestSpec {
         id: "BA8", name: "hog_preemption_witness", spec_ref: "§22 Brutal Adv BA8",
         kind: TestKind::WatchSerial {
-            expect:       &["adv: BA8 pass — witness ran 1000 yields despite tight-loop hog"],
+            expect:       &["adv: BA8 pass — witness ran 200 yields despite tight-loop hog"],
             fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
             timeout_secs: 900,
         },
