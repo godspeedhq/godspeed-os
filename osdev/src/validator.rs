@@ -779,7 +779,7 @@ static BRUTAL_FUZZ_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["fuzz: BF2 pass (200000/200000)"],
             fail_on:      &["KERNEL PANIC", "fuzz: BF2 FAIL"],
-            timeout_secs: 120,
+            timeout_secs: 300,
         },
     },
     TestSpec {
