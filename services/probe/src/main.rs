@@ -45,6 +45,20 @@
 //!  94 = CHAOS_C5     — 100-level recursive yield_cpu(); kernel stack depth probe (C5)
 //!  95 = CHAOS_C6_MON — 200 yields then log pass on core 0 (C6 witness)          (C6)
 //!  96 = CHAOS_C7     — 30 cross-core kill/respawn cycles; TLB shootdowns         (C7)
+//!
+//! Brutal performance-benchmark modes — Milestone 19.
+//! 132 = PERF_BP1      — same-core IPC roundtrip, 1000 samples (5× B1)
+//! 133 = PERF_BP1_ECHO — B1 echo (core 0)
+//! 134 = PERF_BP2      — cross-core IPC roundtrip, 1000 samples (5× B2)
+//! 135 = PERF_BP2_ECHO — B2 echo (core 1)
+//! 136 = PERF_BP3      — yield floor, 5000 yields (5× B3)
+//! 137 = PERF_BP4      — cap validation, 50000 checks (5× B4)
+//! 138 = PERF_BP5      — spawn+restart cost, 50 cycles (5× B5/B6)
+//! 139 = PERF_BP7      — cap I/R throughput, 5000 cycles (5× B7)
+//! 140 = PERF_BP8      — allocator throughput, alloc to limit
+//! 141 = PERF_BP9      — 4 KiB message copy sender, 1000 sends (5× B9)
+//! 142 = PERF_BP9_RECV — B9 recv
+//! 143 = PERF_BP10     — scheduler pick-next, 5000 yields (5× B10)
 
 #![no_std]
 #![no_main]
@@ -161,6 +175,20 @@ const MODE_FUZZ_BF5:        u32 = 116; // BF5: IPC message bodies — 5k sends
 const MODE_FUZZ_BF6:        u32 = 117; // BF6: embedded cap slots — 5k pairs
 const MODE_FUZZ_BF7:        u32 = 118; // BF7: stale cap / generation — 200 kill cycles
 const MODE_FUZZ_BF8:        u32 = 119; // BF8: memory request sizes — 10 edge + 5k random
+
+// Brutal performance-benchmark modes — Milestone 19.
+const MODE_PERF_BP1:        u32 = 132; // BP1: same-core IPC roundtrip — 1000 samples (5× B1)
+const MODE_PERF_BP1_ECHO:   u32 = 133; // BP1 echo (core 0)
+const MODE_PERF_BP2:        u32 = 134; // BP2: cross-core IPC roundtrip — 1000 samples (5× B2)
+const MODE_PERF_BP2_ECHO:   u32 = 135; // BP2 echo (core 1)
+const MODE_PERF_BP3:        u32 = 136; // BP3: yield floor — 5000 yields (5× B3)
+const MODE_PERF_BP4:        u32 = 137; // BP4: cap validation — 50000 checks (5× B4)
+const MODE_PERF_BP5:        u32 = 138; // BP5/BP6: spawn+restart — 50 cycles (5× B5/B6)
+const MODE_PERF_BP7:        u32 = 139; // BP7: cap I/R throughput — 5000 cycles (5× B7)
+const MODE_PERF_BP8:        u32 = 140; // BP8: allocator throughput — alloc to limit
+const MODE_PERF_BP9:        u32 = 141; // BP9: 4 KiB message copy sender — 1000 sends (5× B9)
+const MODE_PERF_BP9_RECV:   u32 = 142; // BP9 recv
+const MODE_PERF_BP10:       u32 = 143; // BP10: scheduler pick-next — 5000 yields (5× B10)
 
 // Brutal stress test modes — Milestone 18.
 const MODE_STRESS_BS1:      u32 = 120; // BS1: IPC saturation — 50k try_send (5× S1)
@@ -292,6 +320,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         MODE_STRESS_BS9_SEND => mode_stress_bs9_send(&ctx),
         MODE_STRESS_BS9_RECV => mode_stress_bs9_recv(&ctx),
         MODE_STRESS_BS10     => mode_stress_bs10(&ctx),
+        MODE_PERF_BP1        => mode_perf_bp1(&ctx),
+        MODE_PERF_BP1_ECHO   => mode_perf_bp1_echo(&ctx),
+        MODE_PERF_BP2        => mode_perf_bp2(&ctx),
+        MODE_PERF_BP2_ECHO   => mode_perf_bp2_echo(&ctx),
+        MODE_PERF_BP3        => mode_perf_bp3(&ctx),
+        MODE_PERF_BP4        => mode_perf_bp4(&ctx),
+        MODE_PERF_BP5        => mode_perf_bp5(&ctx),
+        MODE_PERF_BP7        => mode_perf_bp7(&ctx),
+        MODE_PERF_BP8        => mode_perf_bp8(&ctx),
+        MODE_PERF_BP9        => mode_perf_bp9(&ctx),
+        MODE_PERF_BP9_RECV   => mode_perf_bp9_recv(&ctx),
+        MODE_PERF_BP10       => mode_perf_bp10(&ctx),
         _                    => idle(&ctx),
     }
 }
@@ -2554,5 +2594,211 @@ fn mode_brutal_id_13_kill(ctx: &ServiceContext) -> ! {
     // Runs on core 1; recv is on core 2; sender is on core 0.
     for _ in 0..200u32 { ctx.yield_cpu(); }
     let _ = ctx.kill("brutal-id-13-recv");
+    idle(ctx)
+}
+
+// ---------------------------------------------------------------------------
+// Brutal performance-benchmark modes — Milestone 19.
+// ---------------------------------------------------------------------------
+
+fn mode_perf_bp1(ctx: &ServiceContext) -> ! {
+    // BP1: same-core IPC roundtrip latency — 1000 samples (5× B1) (§22 Brutal Perf BP1).
+    let echo_cap = loop {
+        if let Some(cap) = ctx.acquire_send_cap("perf-bp1-echo") { break cap; }
+        ctx.yield_cpu();
+    };
+
+    let msg = Message::from_bytes(b"bp1");
+    const N: usize = 1000;
+    let mut samples = [0u64; N];
+
+    for i in 0..N {
+        let t0 = ctx.read_tsc();
+        let _ = ctx.send_by_handle(echo_cap, &msg);
+        ctx.recv();
+        let t1 = ctx.read_tsc();
+        samples[i] = t1.wrapping_sub(t0);
+    }
+
+    sort_u64(&mut samples);
+    let p50  = samples[N / 2];
+    let p99  = samples[N * 99 / 100];
+    let p999 = samples[N * 999 / 1000];
+    ctx.log_fmt(format_args!("perf: BP1 p50={p50} p99={p99} p999={p999} cycles/roundtrip"));
+    ctx.log("perf: BP1 done");
+    idle(ctx)
+}
+
+fn mode_perf_bp1_echo(ctx: &ServiceContext) -> ! {
+    let msg = Message::from_bytes(b"bp1e");
+    loop {
+        ctx.recv();
+        let _ = ctx.send("perf-bp1", &msg);
+    }
+}
+
+fn mode_perf_bp2(ctx: &ServiceContext) -> ! {
+    // BP2: cross-core IPC roundtrip latency — 1000 samples (5× B2) (§22 Brutal Perf BP2).
+    let echo_cap = loop {
+        if let Some(cap) = ctx.acquire_send_cap("perf-bp2-echo") { break cap; }
+        ctx.yield_cpu();
+    };
+
+    let msg = Message::from_bytes(b"bp2");
+    const N: usize = 1000;
+    let mut samples = [0u64; N];
+
+    for i in 0..N {
+        let t0 = ctx.read_tsc();
+        let _ = ctx.send_by_handle(echo_cap, &msg);
+        ctx.recv();
+        let t1 = ctx.read_tsc();
+        samples[i] = t1.wrapping_sub(t0);
+    }
+
+    sort_u64(&mut samples);
+    let p50  = samples[N / 2];
+    let p99  = samples[N * 99 / 100];
+    let p999 = samples[N * 999 / 1000];
+    ctx.log_fmt(format_args!("perf: BP2 p50={p50} p99={p99} p999={p999} cycles/roundtrip"));
+    ctx.log("perf: BP2 done");
+    idle(ctx)
+}
+
+fn mode_perf_bp2_echo(ctx: &ServiceContext) -> ! {
+    let msg = Message::from_bytes(b"bp2e");
+    loop {
+        ctx.recv();
+        let _ = ctx.send("perf-bp2", &msg);
+    }
+}
+
+fn mode_perf_bp3(ctx: &ServiceContext) -> ! {
+    // BP3: syscall yield floor — 5000 yields (5× B3) (§22 Brutal Perf BP3).
+    const N: u64 = 5_000;
+    let t0 = ctx.read_tsc();
+    for _ in 0..N { ctx.yield_cpu(); }
+    let t1 = ctx.read_tsc();
+    let mean = t1.wrapping_sub(t0) / N;
+    ctx.log_fmt(format_args!("perf: BP3 mean={mean} cycles/yield"));
+    ctx.log("perf: BP3 done");
+    idle(ctx)
+}
+
+fn mode_perf_bp4(ctx: &ServiceContext) -> ! {
+    // BP4: cap validation throughput — 50000 checks (5× B4) (§22 Brutal Perf BP4).
+    let handle = match ctx.recv_handle() {
+        Some(h) => h,
+        None    => { ctx.log("perf: BP4 FAIL — no recv cap"); idle(ctx); }
+    };
+    const N: u64 = 50_000;
+    let t0 = ctx.read_tsc();
+    for _ in 0..N { ctx.query_cap_rights(handle); }
+    let t1 = ctx.read_tsc();
+    let mean = t1.wrapping_sub(t0) / N;
+    ctx.log_fmt(format_args!("perf: BP4 mean={mean} cycles/cap-check"));
+    ctx.log("perf: BP4 done");
+    idle(ctx)
+}
+
+fn mode_perf_bp5(ctx: &ServiceContext) -> ! {
+    // BP5/BP6: spawn and restart cost — 50 cycles (5× B5/B6) (§22 Brutal Perf BP5, BP6).
+    const N: u32 = 50;
+
+    // BP5: spawn-only cost.
+    let _ = ctx.kill("perf-bp5-victim");
+    let mut total_spawn: u64 = 0;
+    for _ in 0..N {
+        let t0 = ctx.read_tsc();
+        let _ = ctx.spawn("perf-bp5-victim");
+        let t1 = ctx.read_tsc();
+        total_spawn += t1.wrapping_sub(t0);
+        let _ = ctx.kill("perf-bp5-victim");
+    }
+    let spawn_mean = total_spawn / N as u64;
+    ctx.log_fmt(format_args!("perf: BP5 spawn_mean={spawn_mean} cycles/spawn"));
+    ctx.log("perf: BP5 done");
+
+    // BP6: kill+spawn (restart) cost.
+    let _ = ctx.spawn("perf-bp5-victim");
+    let mut total_restart: u64 = 0;
+    for _ in 0..N {
+        let t0 = ctx.read_tsc();
+        let _ = ctx.kill("perf-bp5-victim");
+        let _ = ctx.spawn("perf-bp5-victim");
+        let t1 = ctx.read_tsc();
+        total_restart += t1.wrapping_sub(t0);
+    }
+    let restart_mean = total_restart / N as u64;
+    ctx.log_fmt(format_args!("perf: BP6 restart_mean={restart_mean} cycles/restart"));
+    ctx.log("perf: BP6 done");
+    idle(ctx)
+}
+
+fn mode_perf_bp7(ctx: &ServiceContext) -> ! {
+    // BP7: cap table insert/remove — 5000 cycles (5× B7) (§22 Brutal Perf BP7).
+    const N: u64 = 5_000;
+    let t0 = ctx.read_tsc();
+    for _ in 0..N {
+        if let Some(cap) = ctx.acquire_send_cap("perf-bp7") {
+            ctx.remove_cap(cap);
+        }
+    }
+    let t1 = ctx.read_tsc();
+    let mean = t1.wrapping_sub(t0) / N;
+    ctx.log_fmt(format_args!("perf: BP7 mean={mean} cycles/cap-insert-remove"));
+    ctx.log("perf: BP7 done");
+    idle(ctx)
+}
+
+fn mode_perf_bp8(ctx: &ServiceContext) -> ! {
+    // BP8: allocator throughput — alloc to limit (same bound as B8) (§22 Brutal Perf BP8).
+    let mut n_alloc: u64 = 0;
+    let t0 = ctx.read_tsc();
+    loop {
+        match ctx.alloc_mem(4096) {
+            Ok(_)                   => n_alloc += 1,
+            Err(AllocError::Denied) => break,
+            Err(_)                  => break,
+        }
+    }
+    let t1 = ctx.read_tsc();
+    let mean = if n_alloc > 0 { t1.wrapping_sub(t0) / n_alloc } else { 0 };
+    ctx.log_fmt(format_args!("perf: BP8 n={n_alloc} mean={mean} cycles/alloc-4kib"));
+    ctx.log("perf: BP8 done");
+    idle(ctx)
+}
+
+fn mode_perf_bp9(ctx: &ServiceContext) -> ! {
+    // BP9: 4 KiB message copy — 1000 sends (5× B9) (§22 Brutal Perf BP9).
+    let mut msg = Message::from_bytes(&[]);
+    for b in msg.payload.iter_mut() { *b = 0xAB; }
+    msg.payload_len = 4096;
+
+    const N: u64 = 1_000;
+    let t0 = ctx.read_tsc();
+    for _ in 0..N {
+        let _ = ctx.send("perf-bp9-recv", &msg);
+    }
+    let t1 = ctx.read_tsc();
+    let mean = t1.wrapping_sub(t0) / N;
+    ctx.log_fmt(format_args!("perf: BP9 mean={mean} cycles/4kib-send"));
+    ctx.log("perf: BP9 done");
+    idle(ctx)
+}
+
+fn mode_perf_bp9_recv(ctx: &ServiceContext) -> ! {
+    loop { ctx.recv(); }
+}
+
+fn mode_perf_bp10(ctx: &ServiceContext) -> ! {
+    // BP10: scheduler pick-next — 5000 yields (5× B10) (§22 Brutal Perf BP10).
+    const N: u64 = 5_000;
+    let t0 = ctx.read_tsc();
+    for _ in 0..N { ctx.yield_cpu(); }
+    let t1 = ctx.read_tsc();
+    let mean = t1.wrapping_sub(t0) / N;
+    ctx.log_fmt(format_args!("perf: BP10 mean={mean} cycles/yield"));
+    ctx.log("perf: BP10 done");
     idle(ctx)
 }

@@ -23,7 +23,7 @@ use crate::memory::frame::PhysAddr;
 // Kernel stack pool — one 64 KiB stack per ring-3 task (§14.1).
 // ---------------------------------------------------------------------------
 
-const TASK_KSTACK_MAX: usize = 192; // raised from 160 to accommodate Milestone 18 brutal stress probes
+const TASK_KSTACK_MAX: usize = 208; // raised from 192 to accommodate Milestone 19 brutal perf probes
 const KSTACK_SIZE:     usize = 64 * 1024;
 
 // Magic value written at the BOTTOM of each kstack slot (byte offset 0 within
@@ -1374,6 +1374,135 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
             probe_mode:        71, // PERF_B10: scheduler pick-next cost
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // ----------------------------------------------------------------
+        // Brutal performance-benchmark probes — Milestone 19 (5× iteration counts).
+        // Sender/controller spawned before echo/recv so endpoints register first.
+        // ----------------------------------------------------------------
+        "perf-bp1" => Some(("perf-bp1", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    0,
+            probe_mode:        132, // PERF_BP1: same-core roundtrip sender, 1000 samples
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "perf-bp1-echo" => Some(("perf-bp1-echo", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &["perf-bp1"],
+            send_peers_grant:  false,
+            preferred_core:    0, // same core as perf-bp1
+            probe_mode:        133, // PERF_BP1_ECHO
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BP2: cross-core roundtrip. Sender on core 0, echo on core 1.
+        "perf-bp2" => Some(("perf-bp2", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    0,
+            probe_mode:        134, // PERF_BP2: cross-core roundtrip sender, 1000 samples
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "perf-bp2-echo" => Some(("perf-bp2-echo", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &["perf-bp2"],
+            send_peers_grant:  false,
+            preferred_core:    1, // cross-core: sender on 0, echo on 1
+            probe_mode:        135, // PERF_BP2_ECHO
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BP3: yield floor. No peers.
+        "perf-bp3" => Some(("perf-bp3", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        136, // PERF_BP3: yield floor, 5000 yields
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BP4: cap validation. Needs recv endpoint to have a cap to query.
+        "perf-bp4" => Some(("perf-bp4", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        137, // PERF_BP4: cap + generation check, 50000 checks
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BP5/BP6: spawn and restart cost. Victim spawned first.
+        "perf-bp5-victim" => Some(("perf-bp5-victim", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0, // PASSIVE — killed/respawned by perf-bp5
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "perf-bp5" => Some(("perf-bp5", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        138, // PERF_BP5: spawn + restart cost, 50 cycles
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BP7: cap table insert/remove. Self-referential.
+        "perf-bp7" => Some(("perf-bp7", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        139, // PERF_BP7: cap insert/remove, 5000 cycles
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BP8: allocator throughput. No peers.
+        "perf-bp8" => Some(("perf-bp8", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        140, // PERF_BP8: alloc-4kib throughput
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BP9: 4 KiB message copy. Both on core 0 to isolate copy from routing overhead.
+        "perf-bp9-recv" => Some(("perf-bp9-recv", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    0,
+            probe_mode:        142, // PERF_BP9_RECV: drain 4 KiB messages
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "perf-bp9" => Some(("perf-bp9", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &["perf-bp9-recv"],
+            send_peers_grant:  false,
+            preferred_core:    0,
+            probe_mode:        141, // PERF_BP9: 4 KiB message sender, 1000 sends
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BP10: scheduler pick-next cost. No peers.
+        "perf-bp10" => Some(("perf-bp10", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        143, // PERF_BP10: scheduler pick-next, 5000 yields
             memory_limit:      64 * 1024 * 1024,
         })),
         // ----------------------------------------------------------------

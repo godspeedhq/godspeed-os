@@ -919,6 +919,93 @@ static BRUTAL_FUZZ_TESTS: &[TestSpec] = &[
 ];
 
 // ---------------------------------------------------------------------------
+// Brutal performance benchmark definitions (Milestone 19).
+// ---------------------------------------------------------------------------
+
+static BRUTAL_PERF_TESTS: &[TestSpec] = &[
+    TestSpec {
+        id: "BP1", name: "ipc_same_core_roundtrip_1000", spec_ref: "§22 Brutal Perf BP1",
+        kind: TestKind::WatchSerial {
+            expect:       &["perf: BP1 done"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:", "perf: BP1 FAIL"],
+            timeout_secs: 600, // same ceiling as BP2 — QEMU TCG variance under 200-task load
+        },
+    },
+    TestSpec {
+        id: "BP2", name: "ipc_cross_core_roundtrip_1000", spec_ref: "§22 Brutal Perf BP2",
+        kind: TestKind::WatchSerial {
+            expect:       &["perf: BP2 done"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:", "perf: BP2 FAIL"],
+            timeout_secs: 600, // 2.4× B2's 250s — 5× samples + IPI overhead under load
+        },
+    },
+    TestSpec {
+        id: "BP3", name: "yield_floor_5000", spec_ref: "§22 Brutal Perf BP3",
+        kind: TestKind::WatchSerial {
+            expect:       &["perf: BP3 done"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
+            timeout_secs: 600, // raised: 300s insufficient under 200-task QEMU TCG scheduling load
+        },
+    },
+    TestSpec {
+        id: "BP4", name: "cap_validation_50000", spec_ref: "§22 Brutal Perf BP4",
+        kind: TestKind::WatchSerial {
+            expect:       &["perf: BP4 done"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:", "perf: BP4 FAIL"],
+            timeout_secs: 120,
+        },
+    },
+    TestSpec {
+        id: "BP5", name: "spawn_cost_50_cycles", spec_ref: "§22 Brutal Perf BP5",
+        kind: TestKind::WatchSerial {
+            expect:       &["perf: BP5 done"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
+            timeout_secs: 360,
+        },
+    },
+    TestSpec {
+        id: "BP6", name: "restart_cost_50_cycles", spec_ref: "§22 Brutal Perf BP6",
+        kind: TestKind::WatchSerial {
+            expect:       &["perf: BP6 done"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
+            timeout_secs: 360,
+        },
+    },
+    TestSpec {
+        id: "BP7", name: "cap_ir_throughput_5000", spec_ref: "§22 Brutal Perf BP7",
+        kind: TestKind::WatchSerial {
+            expect:       &["perf: BP7 done"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
+            timeout_secs: 300, // 10× B7's 30s — 5× cycles × concurrent load factor
+        },
+    },
+    TestSpec {
+        id: "BP8", name: "alloc_throughput_to_limit", spec_ref: "§22 Brutal Perf BP8",
+        kind: TestKind::WatchSerial {
+            expect:       &["perf: BP8 done"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
+            timeout_secs: 120,
+        },
+    },
+    TestSpec {
+        id: "BP9", name: "message_copy_4kib_1000", spec_ref: "§22 Brutal Perf BP9",
+        kind: TestKind::WatchSerial {
+            expect:       &["perf: BP9 done"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
+            timeout_secs: 600,
+        },
+    },
+    TestSpec {
+        id: "BP10", name: "scheduler_pick_next_5000", spec_ref: "§22 Brutal Perf BP10",
+        kind: TestKind::WatchSerial {
+            expect:       &["perf: BP10 done"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
+            timeout_secs: 600, // raised: 300s insufficient under 200-task QEMU TCG scheduling load
+        },
+    },
+];
+
+// ---------------------------------------------------------------------------
 // Brutal stress test definitions (Milestone 18).
 // ---------------------------------------------------------------------------
 
@@ -1734,6 +1821,62 @@ pub fn run_brutal_stress_tests() {
     if failed > 0 { std::process::exit(1); }
 }
 
+/// Boot the OS in QEMU and run the Milestone 19 brutal performance benchmark suite.
+///
+/// Pass criterion: each benchmark logs `perf: BPN done` without panicking.
+/// After all benchmarks pass, extracted RDTSC metrics are written to
+/// `build/tests/12_PERFORMANCE_BRUTAL/baseline.json`.
+pub fn run_brutal_perf_tests() {
+    println!("perf-brutal: stopping any running QEMU instances...");
+    kill_existing_qemu();
+
+    println!("perf-brutal: building...");
+    crate::cmd_build();
+
+    let kernel_elf = Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() {
+        eprintln!("perf-brutal: kernel ELF not found at {}", kernel_elf.display());
+        std::process::exit(1);
+    }
+
+    let limine_dir = Path::new("tools/limine");
+    let image_path = crate::disk_image::create(kernel_elf, limine_dir);
+    crate::disk_image::install_bootloader(limine_dir, &image_path);
+
+    std::fs::create_dir_all("build/tests/12_PERFORMANCE_BRUTAL")
+        .expect("create build/tests/12_PERFORMANCE_BRUTAL/");
+
+    println!("\nperf-brutal: running {} benchmarks\n", BRUTAL_PERF_TESTS.len());
+
+    let mut results: Vec<(&TestSpec, TestOutcome)> = Vec::new();
+
+    for test in BRUTAL_PERF_TESTS {
+        print!("  [{:>4}]  {:45}  ({})  … ", test.id, test.name, test.spec_ref);
+        let _ = std::io::stdout().flush();
+
+        let outcome = run_brutal_perf_one(test, &image_path);
+
+        match &outcome {
+            TestOutcome::Pass       => println!("PASS"),
+            TestOutcome::Fail(r)    => println!("FAIL\n          → {r}"),
+            TestOutcome::Blocked(r) => println!("BLOCKED\n          → {r}"),
+        }
+
+        results.push((test, outcome));
+    }
+
+    let passed = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Pass)).count();
+    let failed = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Fail(_))).count();
+
+    println!("\n  {passed} passed  {failed} failed");
+
+    if passed > 0 {
+        collect_brutal_perf_baseline(&results);
+    }
+
+    if failed > 0 { std::process::exit(1); }
+}
+
 /// Boot the OS in QEMU and run the Milestone 12 performance benchmark suite.
 ///
 /// Pass criterion: each benchmark logs `perf: BN done` without panicking.
@@ -2317,6 +2460,64 @@ fn brutal_fuzz_serial_path(test: &TestSpec) -> PathBuf {
 
 fn brutal_stress_serial_path(test: &TestSpec) -> PathBuf {
     PathBuf::from(format!("build/tests/11_STRESS_BRUTAL/{}-{}.log", test.id, test.name))
+}
+
+fn brutal_perf_serial_path(test: &TestSpec) -> PathBuf {
+    PathBuf::from(format!("build/tests/12_PERFORMANCE_BRUTAL/{}-{}.log", test.id, test.name))
+}
+
+fn run_brutal_perf_one(test: &TestSpec, image: &Path) -> TestOutcome {
+    match &test.kind {
+        TestKind::WatchSerial { expect, fail_on, timeout_secs } => {
+            let serial = brutal_perf_serial_path(test);
+            let _ = std::fs::write(&serial, b"");
+            let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
+            let result = poll_serial(&serial, expect, fail_on,
+                                     Instant::now() + Duration::from_secs(*timeout_secs));
+            qemu.kill();
+            result
+        }
+        _ => TestOutcome::Blocked("brutal perf tests only use WatchSerial"),
+    }
+}
+
+fn collect_brutal_perf_baseline(results: &[(&TestSpec, TestOutcome)]) {
+    let mut metrics = serde_json::Map::new();
+
+    for (test, outcome) in results {
+        if !matches!(outcome, TestOutcome::Pass) { continue; }
+        let serial  = brutal_perf_serial_path(test);
+        let content = std::fs::read_to_string(&serial).unwrap_or_default();
+        let prefix  = format!("perf: {} ", test.id);
+        for line in content.lines() {
+            if line.contains(&prefix) && !line.contains("done") && !line.contains("FAIL") {
+                let mut obj = serde_json::Map::new();
+                for token in line.split_whitespace() {
+                    if let Some((k, v)) = token.split_once('=') {
+                        if let Ok(n) = v.parse::<u64>() {
+                            obj.insert(k.to_string(), serde_json::Value::Number(n.into()));
+                        }
+                    }
+                }
+                if !obj.is_empty() {
+                    metrics.insert(test.id.to_string(), serde_json::Value::Object(obj));
+                }
+            }
+        }
+    }
+
+    let baseline = serde_json::json!({
+        "note": "Brutal perf — QEMU TCG RDTSC cycle counts at 5× iteration counts; not comparable across hosts",
+        "regression_threshold_pct": 10,
+        "metrics": metrics,
+    });
+
+    let out = serde_json::to_string_pretty(&baseline).unwrap_or_default();
+    let path = "build/tests/12_PERFORMANCE_BRUTAL/baseline.json";
+    match std::fs::write(path, &out) {
+        Ok(()) => println!("perf-brutal: baseline written to {path}"),
+        Err(e) => eprintln!("perf-brutal: could not write baseline.json: {e}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

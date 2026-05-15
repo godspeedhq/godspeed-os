@@ -186,6 +186,23 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let _ = ctx.spawn("adv-a9");
     let _ = ctx.spawn("adv-a10");
 
+    // --- Brutal performance-benchmark probes — Milestone 19 ---
+    // Sender/controller BEFORE echo/recv so endpoints register first.
+    // bp5-victim before bp5; bp9-recv before bp9.
+    let _ = ctx.spawn("perf-bp1");         // BP1 sender (core 0) — registers endpoint first
+    let _ = ctx.spawn("perf-bp1-echo");    // BP1 echo (core 0)
+    let _ = ctx.spawn("perf-bp2");         // BP2 sender (core 0)
+    let _ = ctx.spawn("perf-bp2-echo");    // BP2 echo (core 1)
+    let _ = ctx.spawn("perf-bp3");
+    let _ = ctx.spawn("perf-bp4");
+    let _ = ctx.spawn("perf-bp5-victim");  // spawned before perf-bp5 so it exists to be killed
+    let _ = ctx.spawn("perf-bp5");
+    let _ = ctx.spawn("perf-bp7");
+    let _ = ctx.spawn("perf-bp8");
+    let _ = ctx.spawn("perf-bp9-recv");    // recv registered before sender is wired
+    let _ = ctx.spawn("perf-bp9");
+    let _ = ctx.spawn("perf-bp10");
+
     // --- Performance-benchmark probes — Milestone 12 ---
     // Spawn sender/controller probes BEFORE their echo/recv partners so the
     // sender's endpoint is registered when the echo partner wires its SEND cap.

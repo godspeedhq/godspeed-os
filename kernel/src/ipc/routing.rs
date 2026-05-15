@@ -38,7 +38,7 @@ fn unlock() {
 // Entry layout.
 // ---------------------------------------------------------------------------
 
-const MAX_ENDPOINTS: usize = 64;
+const MAX_ENDPOINTS: usize = 96; // raised from 64; 70 services hold recv endpoints at peak
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EndpointLiveness {
