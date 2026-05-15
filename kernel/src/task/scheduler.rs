@@ -23,7 +23,7 @@ use crate::task::state::TaskState;
 // Flat task table (all cores share one array; tasks are pinned by TASK_CORE).
 // ---------------------------------------------------------------------------
 
-pub const MAX_TASKS: usize = 208;
+pub const MAX_TASKS: usize = 224;
 const MAX_CORES: usize = crate::smp::core::MAX_CORES;
 
 /// Sentinel meaning "no task running" (scheduler idle loop active).
@@ -214,11 +214,17 @@ pub unsafe fn commit_task(
     // SAFETY: slot is reserved; IF=0 prevents concurrent modification.
     unsafe {
         TASK_CTX[slot].write(ctx);
-        TASK_STATE[slot].store(TaskState::Ready as u8, Ordering::Relaxed);
         TASK_NAME[slot]             = name;
         TASK_IS_USER[slot]          = is_user;
         TASK_KERNEL_STACK_TOP[slot] = kernel_stack_top;
         TASK_ENDPOINT[slot]         = endpoint_id;
+        // TASK_STATE must be last: once Ready is visible to other cores, every
+        // other field in this slot must already be correctly set.  A concurrent
+        // kill_task_by_slot that observes Ready will immediately read
+        // TASK_IS_USER and TASK_KERNEL_STACK_TOP; if those still hold the
+        // previous occupant's values the kill frees the wrong kernel stack.
+        // Release ordering publishes all preceding stores before this one.
+        TASK_STATE[slot].store(TaskState::Ready as u8, Ordering::Release);
     }
 }
 
@@ -675,10 +681,29 @@ pub fn wake_by_slot(slot: usize, result: i64) {
     // SAFETY: IF=0 from IPC/syscall path.
     unsafe {
         if slot < MAX_TASKS && TASK_VALID[slot] {
+            // Do not revive a task that kill_task_by_slot has already marked Dead.
+            // If we overwrite Dead with Ready, the scheduler re-animates a task
+            // whose kernel stack may already be freed — KERNEL PF on next entry.
+            // Use CAS so that a concurrent Dead-store (from kill_task_by_slot
+            // under the slot lock) wins rather than being silently overwritten.
+            // We must read current state first; if it's already Dead, bail.
+            let current = TASK_STATE[slot].load(Ordering::Acquire);
+            if current == TaskState::Dead as u8 { return; }
             TASK_WAKEUP_ERR[slot] = result;
-            // Release ordering: ensures TASK_WAKEUP_ERR is visible to any
-            // core that subsequently reads this state with Acquire.
-            TASK_STATE[slot].store(TaskState::Ready as u8, Ordering::Release);
+            // CAS: only transition to Ready from the observed non-Dead state.
+            // If kill raced and set Dead between our load and here, the CAS
+            // fails and we correctly leave the task Dead.
+            if TASK_STATE[slot]
+                .compare_exchange(
+                    current,
+                    TaskState::Ready as u8,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+            {
+                return;
+            }
 
             let task_core = TASK_CORE[slot] as usize;
             let my_core   = current_core_id();
@@ -713,15 +738,42 @@ pub fn find_task_by_name(name: &str) -> Option<usize> {
 
 /// Kill a task by slot: mark Dead, kill its endpoint (if any), notify blocked tasks.
 pub fn kill_task_by_slot(slot: usize) {
-    // SAFETY: IF=0 or lock-free path; TASK_VALID[slot] checked by caller.
+    // Serialize the TASK_VALID check against concurrent kills and spawns.
+    // Two cores calling kill_task_by_slot(slot) simultaneously would otherwise
+    // both pass the !TASK_VALID guard, both reach free_kstack, and double-free
+    // the kernel stack.  The slot can also be claimed by reserve_task_slot between
+    // free_kstack (line ~807) and TASK_VALID=false (line ~817), causing the second
+    // killer to free a live kernel stack → KERNEL PF.
+    //
+    // Fix: hold task_slot_lock while checking TASK_VALID and while atomically
+    // claiming the kill (TASK_STATE=Dead).  Release the lock before the long
+    // cleanup so spawn on other cores can proceed concurrently.
+    task_slot_lock();
+    // SAFETY: lock held; exclusive access to TASK_VALID/TASK_STATE across all cores.
+    let already_dead = unsafe {
+        if slot >= MAX_TASKS || !TASK_VALID[slot] {
+            task_slot_unlock();
+            return;
+        }
+        let s = TASK_STATE[slot].load(Ordering::Acquire);
+        if s == TaskState::Dead as u8 {
+            // Another core is already killing this slot — bail.
+            task_slot_unlock();
+            return;
+        }
+        // Atomically claim this kill: set Dead under the lock so no concurrent
+        // call can also proceed past this point for the same slot.
+        TASK_STATE[slot].store(TaskState::Dead as u8, Ordering::Release);
+        false
+    };
+    task_slot_unlock();
+    let _ = already_dead; // always false here; kept for clarity
+
+    // SAFETY: IF=0 or lock-free path; TASK_VALID[slot] and Dead state claimed above.
     unsafe {
-        if slot >= MAX_TASKS || !TASK_VALID[slot] { return; }
 
         crate::kprintln!("kill_task: slot={} name='{}' endpoint={:?}",
             slot, TASK_NAME[slot], TASK_ENDPOINT[slot]);
-
-        // Mark Dead atomically — this stops the scheduler from picking it.
-        TASK_STATE[slot].store(TaskState::Dead as u8, Ordering::Release);
 
         // Kill the task's endpoint if it has one.
         if let Some(ep_id) = TASK_ENDPOINT[slot] {
@@ -807,14 +859,16 @@ pub fn kill_task_by_slot(slot: usize) {
             super::free_kstack(TASK_KERNEL_STACK_TOP[slot]);
         }
 
-        // Final state reset: force Dead before releasing the slot.
-        // This guards against any code path (e.g. a concurrent wake_by_slot on
-        // a different endpoint) that may have set the state to Ready between the
-        // initial Dead store and now.  reserve_task_slot sets TASK_VALID=true
-        // before commit_task sets state=Ready; if state were Ready here, the
-        // scheduler could pick up the slot with the old stale context.
+        // Release the slot back to the pool under the lock so reserve_task_slot
+        // cannot claim it until the slot is fully cleaned up.
+        task_slot_lock();
+        // TASK_STATE was already set to Dead under the lock at the top; store it
+        // again to guard against a concurrent wake_by_slot (e.g. a cross-endpoint
+        // wakeup) that may have set state=Ready between the top-of-function store
+        // and now.
         TASK_STATE[slot].store(TaskState::Dead as u8, Ordering::Release);
         TASK_VALID[slot] = false;
+        task_slot_unlock();
     }
 }
 

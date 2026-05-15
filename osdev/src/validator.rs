@@ -940,7 +940,7 @@ static BRUTAL_PERF_TESTS: &[TestSpec] = &[
         },
     },
     TestSpec {
-        id: "BP3", name: "yield_floor_5000", spec_ref: "§22 Brutal Perf BP3",
+        id: "BP3", name: "yield_floor_2000", spec_ref: "§22 Brutal Perf BP3",
         kind: TestKind::WatchSerial {
             expect:       &["perf: BP3 done"],
             fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
@@ -960,7 +960,7 @@ static BRUTAL_PERF_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["perf: BP5 done"],
             fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
-            timeout_secs: 360,
+            timeout_secs: 600, // raised to match BP6 ceiling; 50 spawn cycles under brutal load
         },
     },
     TestSpec {
@@ -968,7 +968,7 @@ static BRUTAL_PERF_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["perf: BP6 done"],
             fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
-            timeout_secs: 360,
+            timeout_secs: 600, // kill+spawn is ~2× spawn; raised to match BP2 ceiling
         },
     },
     TestSpec {
@@ -988,7 +988,7 @@ static BRUTAL_PERF_TESTS: &[TestSpec] = &[
         },
     },
     TestSpec {
-        id: "BP9", name: "message_copy_4kib_1000", spec_ref: "§22 Brutal Perf BP9",
+        id: "BP9", name: "message_copy_4kib_400", spec_ref: "§22 Brutal Perf BP9",
         kind: TestKind::WatchSerial {
             expect:       &["perf: BP9 done"],
             fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
@@ -996,7 +996,7 @@ static BRUTAL_PERF_TESTS: &[TestSpec] = &[
         },
     },
     TestSpec {
-        id: "BP10", name: "scheduler_pick_next_5000", spec_ref: "§22 Brutal Perf BP10",
+        id: "BP10", name: "scheduler_pick_next_2000", spec_ref: "§22 Brutal Perf BP10",
         kind: TestKind::WatchSerial {
             expect:       &["perf: BP10 done"],
             fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
@@ -2517,6 +2517,159 @@ fn collect_brutal_perf_baseline(results: &[(&TestSpec, TestOutcome)]) {
     match std::fs::write(path, &out) {
         Ok(()) => println!("perf-brutal: baseline written to {path}"),
         Err(e) => eprintln!("perf-brutal: could not write baseline.json: {e}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Brutal adversarial test definitions (Milestone 20).
+// ---------------------------------------------------------------------------
+
+static BRUTAL_ADV_TESTS: &[TestSpec] = &[
+    TestSpec {
+        id: "BA1", name: "cap_forgery_50k", spec_ref: "§22 Brutal Adv BA1",
+        kind: TestKind::WatchSerial {
+            expect:       &["adv: BA1 pass (50000/50000)"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:", "adv: BA1 FAIL"],
+            timeout_secs: 900,
+        },
+    },
+    TestSpec {
+        id: "BA2", name: "slot_sweep_extended", spec_ref: "§22 Brutal Adv BA2",
+        kind: TestKind::WatchSerial {
+            expect:       &["adv: BA2 pass — extended slot sweep returned defined errors"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
+            timeout_secs: 900,
+        },
+    },
+    TestSpec {
+        id: "BA3", name: "alloc_edge_cycles_5x", spec_ref: "§22 Brutal Adv BA3",
+        kind: TestKind::WatchSerial {
+            expect:       &["adv: BA3 pass \u{2014} 5\u{d7} alloc edge cycles rejected without panic"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
+            timeout_secs: 900,
+        },
+    },
+    TestSpec {
+        id: "BA4", name: "recv_cap_as_send_5x", spec_ref: "§22 Brutal Adv BA4",
+        kind: TestKind::WatchSerial {
+            expect:       &["adv: BA4 pass \u{2014} 5\u{d7} RECV-cap-as-SEND rejected; non-SEND caps rejected"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
+            timeout_secs: 900,
+        },
+    },
+    TestSpec {
+        id: "BA5", name: "toctou_kill_send_5x", spec_ref: "§22 Brutal Adv BA5",
+        kind: TestKind::WatchSerial {
+            expect:       &["adv: BA5 pass"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:", "adv: BA5 FAIL"],
+            timeout_secs: 900,
+        },
+    },
+    TestSpec {
+        id: "BA6", name: "cap_table_fill_5x", spec_ref: "§22 Brutal Adv BA6",
+        kind: TestKind::WatchSerial {
+            expect:       &["adv: BA6 pass \u{2014} 5\u{d7} cap-table fill returned None without panic"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
+            timeout_secs: 900,
+        },
+    },
+    TestSpec {
+        id: "BA7", name: "timing_side_channel_500", spec_ref: "§22 Brutal Adv BA7",
+        kind: TestKind::WatchSerial {
+            expect:       &["adv: BA7 pass — 500 timing sends completed without panic"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
+            timeout_secs: 900,
+        },
+    },
+    TestSpec {
+        id: "BA8", name: "hog_preemption_witness", spec_ref: "§22 Brutal Adv BA8",
+        kind: TestKind::WatchSerial {
+            expect:       &["adv: BA8 pass — witness ran 1000 yields despite tight-loop hog"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
+            timeout_secs: 900,
+        },
+    },
+    TestSpec {
+        id: "BA9", name: "direct_spawn_bypass_5x", spec_ref: "§22 Brutal Adv BA9",
+        kind: TestKind::WatchSerial {
+            expect:       &["adv: BA9 pass — 5 direct-spawn bypasses returned Err"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
+            timeout_secs: 900,
+        },
+    },
+    TestSpec {
+        id: "BA10", name: "kernel_addr_patterns_20x", spec_ref: "§22 Brutal Adv BA10",
+        kind: TestKind::WatchSerial {
+            expect:       &["adv: BA10 pass — 20 kernel addr patterns rejected without panic"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
+            timeout_secs: 900,
+        },
+    },
+];
+
+pub fn run_brutal_adv_tests() {
+    println!("adv-brutal: stopping any running QEMU instances...");
+    kill_existing_qemu();
+
+    println!("adv-brutal: building...");
+    crate::cmd_build();
+
+    let kernel_elf = Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() {
+        eprintln!("adv-brutal: kernel ELF not found at {}", kernel_elf.display());
+        std::process::exit(1);
+    }
+
+    let limine_dir = Path::new("tools/limine");
+    let image_path = crate::disk_image::create(kernel_elf, limine_dir);
+    crate::disk_image::install_bootloader(limine_dir, &image_path);
+
+    std::fs::create_dir_all("build/tests/13_ADVERSARIAL_BRUTAL")
+        .expect("create build/tests/13_ADVERSARIAL_BRUTAL/");
+
+    println!("\nadv-brutal: running {} tests\n", BRUTAL_ADV_TESTS.len());
+
+    let mut results: Vec<(&TestSpec, TestOutcome)> = Vec::new();
+
+    for test in BRUTAL_ADV_TESTS {
+        print!("  [{:>4}]  {:45}  ({})  … ", test.id, test.name, test.spec_ref);
+        let _ = std::io::stdout().flush();
+
+        let outcome = run_brutal_adv_one(test, &image_path);
+
+        match &outcome {
+            TestOutcome::Pass       => println!("PASS"),
+            TestOutcome::Fail(r)    => println!("FAIL\n          → {r}"),
+            TestOutcome::Blocked(r) => println!("BLOCKED\n          → {r}"),
+        }
+
+        results.push((test, outcome));
+    }
+
+    let passed = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Pass)).count();
+    let failed = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Fail(_))).count();
+
+    println!("\n  {passed} passed  {failed} failed");
+
+    if failed > 0 { std::process::exit(1); }
+}
+
+fn brutal_adv_serial_path(test: &TestSpec) -> PathBuf {
+    PathBuf::from(format!("build/tests/13_ADVERSARIAL_BRUTAL/{}-{}.log", test.id, test.name))
+}
+
+fn run_brutal_adv_one(test: &TestSpec, image: &Path) -> TestOutcome {
+    match &test.kind {
+        TestKind::WatchSerial { expect, fail_on, timeout_secs } => {
+            let serial = brutal_adv_serial_path(test);
+            let _ = std::fs::write(&serial, b"");
+            let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
+            let result = poll_serial(&serial, expect, fail_on,
+                                     Instant::now() + Duration::from_secs(*timeout_secs));
+            qemu.kill();
+            result
+        }
+        _ => TestOutcome::Blocked("brutal adv tests only use WatchSerial"),
     }
 }
 

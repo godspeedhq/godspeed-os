@@ -23,7 +23,7 @@ use crate::memory::frame::PhysAddr;
 // Kernel stack pool — one 64 KiB stack per ring-3 task (§14.1).
 // ---------------------------------------------------------------------------
 
-const TASK_KSTACK_MAX: usize = 208; // raised from 192 to accommodate Milestone 19 brutal perf probes
+const TASK_KSTACK_MAX: usize = 224; // raised from 208 to accommodate Milestone 20 brutal adversarial probes
 const KSTACK_SIZE:     usize = 64 * 1024;
 
 // Magic value written at the BOTTOM of each kstack slot (byte offset 0 within
@@ -1788,6 +1788,139 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  false,
             preferred_core:    1, // yields then kills recv on core 2
             probe_mode:        103,
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // ----------------------------------------------------------------
+        // Brutal adversarial test probes — Milestone 20.
+        // Victim/passive services must be listed before their attackers so
+        // their endpoints are registered when the attacker's SEND caps are wired.
+        // ----------------------------------------------------------------
+        // BA1: 50k random cap forgery attempts (5× A1). No caps needed.
+        "adv-ba1" => Some(("adv-ba1", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        144, // MODE_ADV_BA1: 50k random slot → Err
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BA2: extended brute-force slots 0..=511 + 4 extreme values.
+        "adv-ba2" => Some(("adv-ba2", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        145, // MODE_ADV_BA2: 512 + extreme slot sweep
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BA3: 5× alloc edge-case cycles. Tight 4 MiB limit so impossible requests fail fast.
+        "adv-ba3" => Some(("adv-ba3", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        146, // MODE_ADV_BA3: 5× alloc edge cycles
+            memory_limit:      4 * 1024 * 1024,
+        })),
+        // BA4: RECV cap used as SEND target × 5. Needs own recv endpoint.
+        "adv-ba4" => Some(("adv-ba4", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        147, // MODE_ADV_BA4: RECV-cap-as-SEND → CapInsufficientRights
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BA5: 5 TOCTOU kill+send cycles. Victim registered before attacker.
+        "adv-ba5-victim" => Some(("adv-ba5-victim", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0, // MODE_PASSIVE — killed/re-killed by adv-ba5
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "adv-ba5" => Some(("adv-ba5", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &["adv-ba5-victim"],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        148, // MODE_ADV_BA5: 5× kill+try_send → EndpointDead
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BA6: fill own cap table × 5 cycles. Needs recv endpoint so acquire_send_cap("adv-ba6") works.
+        "adv-ba6" => Some(("adv-ba6", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        149, // MODE_ADV_BA6: 5× cap-table fill → None without panic
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BA7: 500 timing samples (5× A7). Passive recv registered before sender.
+        "adv-ba7-recv" => Some(("adv-ba7-recv", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0, // MODE_PASSIVE — absorbs timing probe messages
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "adv-ba7" => Some(("adv-ba7", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &["adv-ba7-recv"],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        150, // MODE_ADV_BA7: 500 timing sends to passive partner
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BA8: tight-loop hog + witness (5× A8). Pinned to core 3 to avoid
+        // starving IPC/yield probes on cores 0-2 under QEMU TCG.
+        "adv-ba8" => Some(("adv-ba8", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    3,
+            probe_mode:        151, // MODE_ADV_BA8: tight loop hog
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "adv-ba8-witness" => Some(("adv-ba8-witness", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    3,
+            probe_mode:        152, // MODE_ADV_BA8_WITNESS: 5000 yields alongside hog
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BA9: 5 direct-spawn bypass attempts with bogus names → Err.
+        "adv-ba9" => Some(("adv-ba9", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        153, // MODE_ADV_BA9: spawn unknown → Err
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BA10: 20 kernel-space address patterns as syscall args (5× A10). No caps needed.
+        "adv-ba10" => Some(("adv-ba10", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        154, // MODE_ADV_BA10: kernel addr syscall args → rejected
             memory_limit:      64 * 1024 * 1024,
         })),
         _ => None,

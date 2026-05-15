@@ -20,6 +20,9 @@ pub fn init(boot_info: &BootInfo) {
         boot_info.hhdm_offset,
     );
     allocator::init(boot_info);
+    // Protect Limine's intermediate page-table frames for the kernel BSS
+    // mapping from being handed out by alloc_frame (BA2 fix — see allocator.rs).
+    allocator::protect_kernel_page_table_frames();
     let free_mib = allocator::free_frame_count() * 4096 / (1024 * 1024);
     crate::kprintln!("memory: frame allocator ready ({} MiB free)", free_mib);
 }

@@ -203,6 +203,23 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let _ = ctx.spawn("perf-bp9");
     let _ = ctx.spawn("perf-bp10");
 
+    // --- Brutal adversarial test probes — Milestone 20 ---
+    // Victims/passive services must be registered before their attackers so
+    // their endpoints exist when the attacker's SEND caps are wired at spawn.
+    let _ = ctx.spawn("adv-ba1");
+    let _ = ctx.spawn("adv-ba2");
+    let _ = ctx.spawn("adv-ba3");
+    let _ = ctx.spawn("adv-ba4");
+    let _ = ctx.spawn("adv-ba5-victim"); // registered before adv-ba5
+    let _ = ctx.spawn("adv-ba5");
+    let _ = ctx.spawn("adv-ba6");        // recv endpoint registered so self-fill works
+    let _ = ctx.spawn("adv-ba7-recv");   // passive recv registered before sender
+    let _ = ctx.spawn("adv-ba7");
+    let _ = ctx.spawn("adv-ba8");        // tight-loop hog
+    let _ = ctx.spawn("adv-ba8-witness");
+    let _ = ctx.spawn("adv-ba9");
+    let _ = ctx.spawn("adv-ba10");
+
     // --- Performance-benchmark probes — Milestone 12 ---
     // Spawn sender/controller probes BEFORE their echo/recv partners so the
     // sender's endpoint is registered when the echo partner wires its SEND cap.

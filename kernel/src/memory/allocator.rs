@@ -51,6 +51,10 @@ const BITMAP_BYTES: usize = MAX_FRAMES / 8; // 128 KiB
 // 0 = used, 1 = free; zero-init means all used at startup.
 static mut BITMAP: [u8; BITMAP_BYTES] = [0u8; BITMAP_BYTES];
 
+// 1 = permanently protected kernel PT frame; free_frame will refuse to free these.
+// Set by protect_kernel_page_table_frames(); never cleared.
+static mut KERNEL_PT_PROTECTED: [u8; BITMAP_BYTES] = [0u8; BITMAP_BYTES];
+
 // ---------------------------------------------------------------------------
 // Allocator.
 // ---------------------------------------------------------------------------
@@ -152,6 +156,21 @@ impl BitmapAllocator {
             return;
         }
         debug_assert!(idx < MAX_FRAMES, "free_frame: address out of range");
+        // Defense-in-depth: refuse to free a frame that was marked as a kernel
+        // intermediate page-table frame by protect_kernel_page_table_frames().
+        // If such a frame ever appears in a reclaim buffer, freeing it would
+        // re-open it for alloc → walk_or_alloc zeros it → KERNEL PF on the
+        // next access to the kernel virtual region it was mapping.
+        // SAFETY: KERNEL_PT_PROTECTED is written once at init; read-only here.
+        let byte = idx / 8;
+        let bit  = idx % 8;
+        if unsafe { KERNEL_PT_PROTECTED[byte] } & (1u8 << bit) != 0 {
+            crate::kprintln!(
+                "free_frame: REFUSED to free kernel PT frame idx={} phys={:#x}",
+                idx, idx as u64 * FRAME_SIZE
+            );
+            return;
+        }
         // SAFETY: idx within bounds; caller guarantees exclusive ownership.
         unsafe { bitmap_set_free(idx) };
         self.free_frames += 1;
@@ -251,4 +270,99 @@ pub unsafe fn free_frame(frame: Frame) {
 pub fn free_frame_count() -> usize {
     // SAFETY: read-only; racing reads are harmless for diagnostic use.
     unsafe { ALLOCATOR.free_frames() }
+}
+
+/// Walk the kernel half of the live PML4 (entries 256–511) and mark every
+/// PDPT / PD / PT / PML4 frame as "used" in the bitmap allocator.
+///
+/// Root cause this closes (BA2):
+///   Limine allocates intermediate page-table frames for the kernel BSS mapping
+///   from physical pages that appear as `Usable` in its memory map but lie below
+///   the kernel image guard range [kstart, kend).  `init_from_map` opens those
+///   frames in the bitmap; `alloc_frame` then returns them; `walk_or_alloc` /
+///   `PageTable::new` zero them, destroying the kernel's PTE for the BSS page
+///   being accessed — causing a KERNEL PF on the first write (BA2: write to
+///   kstack_marker(90) at 0xffffffff80e09260 after many spawn/kill cycles).
+///
+/// Must be called after `allocator::init` (bitmap populated) and after
+/// `set_hhdm_offset` (physical↔virtual translation live).
+pub fn protect_kernel_page_table_frames() {
+    let hhdm = crate::arch::x86_64::page_tables::get_hhdm_offset();
+    if hhdm == 0 {
+        return; // HHDM not initialised — cannot walk tables safely.
+    }
+
+    // SAFETY: CR3 is always valid after Limine hands control to the kernel.
+    let cr3: u64;
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem)) };
+    let pml4_phys = cr3 & !0xFFF_u64;
+
+    alloc_lock();
+    // SAFETY: lock held; BITMAP and ALLOCATOR.free_frames may be mutated.
+    unsafe {
+        mark_pt_frame_used(pml4_phys);
+        for pml4_i in 256..512usize {
+            let pml4e = pt_read(hhdm, pml4_phys, pml4_i);
+            if pml4e & 1 == 0 { continue; }
+            let pdpt_phys = pml4e & 0x000F_FFFF_FFFF_F000;
+            mark_pt_frame_used(pdpt_phys);
+            for pdpt_i in 0..512usize {
+                let pdpte = pt_read(hhdm, pdpt_phys, pdpt_i);
+                if pdpte & 1 == 0 { continue; }
+                if pdpte & (1 << 7) != 0 { continue; } // 1 GiB huge — no PD below
+                let pd_phys = pdpte & 0x000F_FFFF_FFFF_F000;
+                mark_pt_frame_used(pd_phys);
+                for pd_i in 0..512usize {
+                    let pde = pt_read(hhdm, pd_phys, pd_i);
+                    if pde & 1 == 0 { continue; }
+                    if pde & (1 << 7) != 0 { continue; } // 2 MiB huge — no PT below
+                    let pt_phys = pde & 0x000F_FFFF_FFFF_F000;
+                    mark_pt_frame_used(pt_phys);
+                    // PT entries are leaf mappings — the data frames they point
+                    // to are either already in the kernel guard range or are
+                    // owned by tasks.  We do not mark them here.
+                }
+            }
+        }
+    }
+    alloc_unlock();
+}
+
+/// Read one 64-bit entry from the page table at `table_phys`, slot `idx`.
+///
+/// # Safety
+/// HHDM must be initialised; `table_phys` must be a live, HHDM-accessible
+/// page-table frame.
+#[inline]
+unsafe fn pt_read(hhdm: u64, table_phys: u64, idx: usize) -> u64 {
+    // SAFETY: caller guarantees table_phys + hhdm maps a valid PT page.
+    unsafe { ((hhdm + table_phys) as *const u64).add(idx).read_volatile() }
+}
+
+/// Clear the free bit for the frame at `phys` if it is currently marked free,
+/// and permanently mark it in `KERNEL_PT_PROTECTED` so `free_frame` can never
+/// reclaim it.  `alloc_lock` must be held.
+///
+/// # Safety
+/// `ALLOC_LOCKED` must be held; this mutates `BITMAP`, `ALLOCATOR`, and
+/// `KERNEL_PT_PROTECTED`.
+#[inline]
+unsafe fn mark_pt_frame_used(phys: u64) {
+    let idx = (phys / FRAME_SIZE) as usize;
+    if idx >= MAX_FRAMES {
+        return;
+    }
+    let byte = idx / 8;
+    let bit  = idx % 8;
+    // SAFETY: idx < MAX_FRAMES; lock held.
+    let currently_free = unsafe { BITMAP[byte] } & (1u8 << bit) != 0;
+    if currently_free {
+        unsafe { BITMAP[byte] &= !(1u8 << bit) };
+        // SAFETY: free_frames was > 0 because the bit was set.
+        unsafe { ALLOCATOR.free_frames -= 1 };
+    }
+    // Mark as permanently protected: free_frame will refuse to release this
+    // frame regardless of how it ends up in a caller's reclaim buffer.
+    // SAFETY: idx < MAX_FRAMES; lock held.
+    unsafe { KERNEL_PT_PROTECTED[byte] |= 1u8 << bit };
 }

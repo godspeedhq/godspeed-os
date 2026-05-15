@@ -1,6 +1,6 @@
 # Milestone 13 — Adversarial / Red-Team Tests
 
-**Status:** ✅ 10/10 implemented — all pass
+**Status:** [x] 10/10 implemented — all pass
 **Spec ref:** §22 Adversarial / Red-Team Test
 **Command:** `osdev test adv`
 
@@ -148,3 +148,57 @@ appear within their timeout without a `KERNEL PANIC`.
 - ✅ `osdev/src/validator.rs` — `ADV_TESTS`, `run_adv_tests()`, `run_adv_one()`, `adv_serial_path()`
 - ✅ `osdev/src/main.rs` — `"adv"` branch in `cmd_test`
 - ✅ `build/tests/6_ADVERSARIAL/.gitkeep`
+
+---
+
+## Brutal Adversarial Phase (adv-brutal)
+
+**Status:** [x] 10/10 implemented — all pass
+**Command:** `osdev test adv-brutal`
+
+The brutal phase repeats each adversarial attack at 5–50× intensity, combined with the
+full brutal stress suite (BS1–BS8) running concurrently in the same QEMU session.
+BA1–BA10 correspond to A1–A10 but with higher iteration counts and longer running times.
+
+### Attacks
+
+| ID   | Attack                                                                                 | Intensity vs A-series              |
+|------|----------------------------------------------------------------------------------------|------------------------------------|
+| BA1  | 50,000 cap forgery attempts (random u64 slot values)                                   | 5× A1 (10 k → 50 k)               |
+| BA2  | Extended slot sweep 0..=511 + extreme values                                           | Wider range than A2 (0..=127)      |
+| BA3  | 5× alloc-beyond-limit attack cycles (request, over-limit, free, repeat)                | 5× A3                              |
+| BA4  | RECV cap used as SEND target × 5 cap types (RECV, WRITE, GRANT, zero, random)         | 5× A4, multi-rights variants       |
+| BA5  | TOCTOU kill+send race × 5 cycles                                                       | 5× A5                              |
+| BA6  | Fill + drain cap table × 5 cycles                                                      | 5× A6                              |
+| BA7  | 500 timing samples (5× A7 count)                                                       | 5× A7 (100 → 500)                  |
+| BA8  | Tight-loop hog + witness runs 1,000 yields                                             | Same yield count as A8; brutal = tighter hog loop |
+| BA9  | 5× direct spawn bypass attempts (non-existent service name)                            | 5× A9                              |
+| BA10 | 20 kernel-address patterns × raw send/recv syscalls                                    | 5× A10 (4 → 20)                    |
+
+### Probe services
+
+| Service          | Mode | Notes                                                      |
+|------------------|------|------------------------------------------------------------|
+| adv-ba1          | 144  | No caps; 50 k random slot → always `Err`                   |
+| adv-ba2          | 145  | Brute-force slots 0..=511 + `u32::MAX`                     |
+| adv-ba3          | 146  | 4 MiB limit; 5× alloc edge cycles                          |
+| adv-ba4          | 147  | Has recv endpoint; uses RECV cap as SEND × 5 variants      |
+| adv-ba5-victim   | 0    | Passive; killed × 5 by adv-ba5                             |
+| adv-ba5          | 148  | SEND cap to victim; 5× kill-then-send TOCTOU               |
+| adv-ba6          | 149  | Has recv endpoint; fills own cap table × 5 drain cycles    |
+| adv-ba7-recv     | 0    | Passive; absorbs 500 timing probe messages                 |
+| adv-ba7          | 150  | SEND cap to adv-ba7-recv; 500 timing sends                 |
+| adv-ba8          | 151  | Tight loop; preemption target                              |
+| adv-ba8-witness  | 152  | 1,000 yields then log pass                                 |
+| adv-ba9          | 153  | Spawn non-existent service × 5 → `Err`                     |
+| adv-ba10         | 154  | 20 kernel addr patterns via raw syscalls                   |
+
+### Implementation checklist
+
+- ✅ `services/probe/src/main.rs` — modes 144–154 (11 modes across 10 attacks)
+- ✅ `kernel/src/task/mod.rs` — 14 brutal adversarial service configs
+- ✅ `services/supervisor/src/main.rs` — brutal adversarial probe spawns
+- ✅ `osdev/src/validator.rs` — `ADV_BRUTAL_TESTS`, timeouts 900 s for BA4/BA5/BA8/BA9
+- ✅ `build/tests/13_ADVERSARIAL_BRUTAL/.gitkeep`
+- ✅ `kernel/src/memory/allocator.rs` — `KERNEL_PT_PROTECTED` bitmap prevents kernel PT
+  frame theft under sustained stress; `protect_kernel_page_table_frames()` called at boot
