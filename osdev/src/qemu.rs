@@ -50,7 +50,7 @@ pub fn run(image_path: &Path, smp: u32) {
         QEMU_DEBUG_LOG,
     ]);
     if kvm_available() {
-        cmd.args(["-enable-kvm", "-cpu", "host"]);
+        cmd.arg("-enable-kvm");
     }
     let status = cmd
         .status()
@@ -143,7 +143,7 @@ pub fn spawn_for_test(
         "-no-shutdown",
     ]);
     if kvm_available() {
-        cmd.args(["-enable-kvm", "-cpu", "host"]);
+        cmd.arg("-enable-kvm");
     }
     let child = cmd.spawn().unwrap_or_else(|e| {
         eprintln!("identity: failed to launch QEMU at {}: {}", qemu, e);
@@ -182,7 +182,7 @@ pub fn spawn_for_test_custom(
         "-no-shutdown",
     ]);
     if kvm_available() {
-        cmd.args(["-enable-kvm", "-cpu", "host"]);
+        cmd.arg("-enable-kvm");
     }
     let child = cmd.spawn().unwrap_or_else(|e| {
         eprintln!("chaos: failed to launch QEMU at {}: {}", qemu, e);
