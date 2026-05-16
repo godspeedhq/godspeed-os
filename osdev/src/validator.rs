@@ -617,6 +617,72 @@ static CHAOS_TESTS: &[TestSpec] = &[
 ];
 
 // ---------------------------------------------------------------------------
+// Brutal chaos test definitions (Milestone 21).
+// ---------------------------------------------------------------------------
+
+static BRUTAL_CHAOS_TESTS: &[TestSpec] = &[
+    TestSpec {
+        id: "BC1", name: "degraded_smp_1_core", spec_ref: "§22 Brutal Chaos BC1",
+        kind: TestKind::DegradedSmp {
+            smp:          1,
+            expect:       &["kernel: 1 cores ready", "supervisor: ready"],
+            fail_on:      &["KERNEL PANIC"],
+            timeout_secs: 30,
+        },
+    },
+    TestSpec {
+        id: "BC2", name: "five_simultaneous_faults_survive", spec_ref: "§22 Brutal Chaos BC2",
+        kind: TestKind::WatchSerial {
+            expect:       &["chaos: BC2 pass — 5 simultaneous non-TCB faults; system survived"],
+            fail_on:      &["KERNEL PANIC", "chaos: BC2 FAIL"],
+            timeout_secs: 120,
+        },
+    },
+    TestSpec {
+        id: "BC3", name: "alloc_deny_2500_cycles", spec_ref: "§22 Brutal Chaos BC3",
+        kind: TestKind::WatchSerial {
+            expect:       &["chaos: BC3 pass — 2500 alloc-deny cycles without panic"],
+            fail_on:      &["KERNEL PANIC", "chaos: BC3 FAIL"],
+            timeout_secs: 120,
+        },
+    },
+    TestSpec {
+        id: "BC4", name: "degraded_env_96mib_ram", spec_ref: "§22 Brutal Chaos BC4",
+        kind: TestKind::DegradedEnv {
+            smp:          4,
+            ram_mib:      96,
+            expect:       &["kernel: 4 cores ready", "supervisor: ready"],
+            fail_on:      &["KERNEL PANIC"],
+            timeout_secs: 30,
+        },
+    },
+    TestSpec {
+        id: "BC5", name: "kernel_stack_500_recursive_syscalls", spec_ref: "§22 Brutal Chaos BC5",
+        kind: TestKind::WatchSerial {
+            expect:       &["chaos: BC5 pass"],
+            fail_on:      &["KERNEL PANIC", "chaos: BC5 FAIL"],
+            timeout_secs: 600,
+        },
+    },
+    TestSpec {
+        id: "BC6", name: "two_hog_cores_others_unaffected", spec_ref: "§22 Brutal Chaos BC6",
+        kind: TestKind::WatchSerial {
+            expect:       &["chaos: BC6 pass — 2-core hog starvation; core 0 still alive"],
+            fail_on:      &["KERNEL PANIC", "chaos: BC6 FAIL"],
+            timeout_secs: 600,
+        },
+    },
+    TestSpec {
+        id: "BC7", name: "tlb_shootdown_15_cycles", spec_ref: "§22 Brutal Chaos BC7",
+        kind: TestKind::WatchSerial {
+            expect:       &["chaos: BC7 pass — 15 cross-core TLB shootdowns survived"],
+            fail_on:      &["KERNEL PANIC", "chaos: BC7 FAIL"],
+            timeout_secs: 900,
+        },
+    },
+];
+
+// ---------------------------------------------------------------------------
 // Brutal identity test definitions (Milestone 15).
 // ---------------------------------------------------------------------------
 
@@ -1608,6 +1674,58 @@ pub fn run_chaos_tests() {
     if failed > 0 { std::process::exit(1); }
 }
 
+/// Boot the OS in QEMU and run the Milestone 21 brutal chaos test suite.
+///
+/// BC1 and BC4 use degraded QEMU environments (fewer cores, less RAM).
+/// BC2–BC3, BC5–BC7 use the standard 4-core image.
+/// Pass criterion: each scenario logs its `chaos: BCN pass` marker without a kernel panic.
+pub fn run_chaos_brutal_tests() {
+    println!("chaos-brutal: stopping any running QEMU instances...");
+    kill_existing_qemu();
+
+    println!("chaos-brutal: building...");
+    crate::cmd_build();
+
+    let kernel_elf = Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() {
+        eprintln!("chaos-brutal: kernel ELF not found at {}", kernel_elf.display());
+        std::process::exit(1);
+    }
+
+    let limine_dir = Path::new("tools/limine");
+    let image_path = crate::disk_image::create(kernel_elf, limine_dir);
+    crate::disk_image::install_bootloader(limine_dir, &image_path);
+
+    std::fs::create_dir_all("build/tests/14_CHAOS_BRUTAL")
+        .expect("create build/tests/14_CHAOS_BRUTAL/");
+
+    println!("\nchaos-brutal: running {} tests\n", BRUTAL_CHAOS_TESTS.len());
+
+    let mut results: Vec<(&TestSpec, TestOutcome)> = Vec::new();
+
+    for test in BRUTAL_CHAOS_TESTS {
+        print!("  [{:>3}]  {:45}  ({})  … ", test.id, test.name, test.spec_ref);
+        let _ = std::io::stdout().flush();
+
+        let outcome = run_chaos_brutal_one(test, &image_path);
+
+        match &outcome {
+            TestOutcome::Pass       => println!("PASS"),
+            TestOutcome::Fail(r)    => println!("FAIL\n         → {r}"),
+            TestOutcome::Blocked(r) => println!("BLOCKED\n         → {r}"),
+        }
+
+        results.push((test, outcome));
+    }
+
+    let passed = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Pass)).count();
+    let failed = results.iter().filter(|(_, o)| matches!(o, TestOutcome::Fail(_))).count();
+
+    println!("\n  {passed} passed  {failed} failed");
+
+    if failed > 0 { std::process::exit(1); }
+}
+
 /// Boot the OS in QEMU and run the Milestone 15 brutal identity test suite.
 ///
 /// T11–T13 are correctness tests that must always pass.
@@ -2452,6 +2570,43 @@ fn adv_serial_path(test: &TestSpec) -> PathBuf {
 
 fn chaos_serial_path(test: &TestSpec) -> PathBuf {
     PathBuf::from(format!("build/tests/7_CHAOS/{}-{}.log", test.id, test.name))
+}
+
+fn chaos_brutal_serial_path(test: &TestSpec) -> PathBuf {
+    PathBuf::from(format!("build/tests/14_CHAOS_BRUTAL/{}-{}.log", test.id, test.name))
+}
+
+fn run_chaos_brutal_one(test: &TestSpec, image: &Path) -> TestOutcome {
+    match &test.kind {
+        TestKind::WatchSerial { expect, fail_on, timeout_secs } => {
+            let serial = chaos_brutal_serial_path(test);
+            let _ = std::fs::write(&serial, b"");
+            let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
+            let result = poll_serial(&serial, expect, fail_on,
+                                     Instant::now() + Duration::from_secs(*timeout_secs));
+            qemu.kill();
+            result
+        }
+        TestKind::DegradedSmp { smp, expect, fail_on, timeout_secs } => {
+            let serial = chaos_brutal_serial_path(test);
+            let _ = std::fs::write(&serial, b"");
+            let qemu   = crate::qemu::spawn_for_test_custom(image, *smp, 512, &serial, None);
+            let result = poll_serial(&serial, expect, fail_on,
+                                     Instant::now() + Duration::from_secs(*timeout_secs));
+            qemu.kill();
+            result
+        }
+        TestKind::DegradedEnv { smp, ram_mib, expect, fail_on, timeout_secs } => {
+            let serial = chaos_brutal_serial_path(test);
+            let _ = std::fs::write(&serial, b"");
+            let qemu   = crate::qemu::spawn_for_test_custom(image, *smp, *ram_mib, &serial, None);
+            let result = poll_serial(&serial, expect, fail_on,
+                                     Instant::now() + Duration::from_secs(*timeout_secs));
+            qemu.kill();
+            result
+        }
+        _ => TestOutcome::Blocked("brutal chaos tests use WatchSerial, DegradedSmp, or DegradedEnv"),
+    }
 }
 
 fn brutal_fuzz_serial_path(test: &TestSpec) -> PathBuf {

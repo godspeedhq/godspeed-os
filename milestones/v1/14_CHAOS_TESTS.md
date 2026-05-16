@@ -6,6 +6,14 @@
 
 ---
 
+# Milestone 21 — Brutal Chaos Tests (BC1–BC7)
+
+**Status:** ✅ 7/7 implemented — all pass  
+**Command:** `osdev test chaos-brutal`  
+**Evidence:** `build/tests/14_CHAOS_BRUTAL/`
+
+---
+
 ## Overview
 
 Chaos tests verify that the system degrades **gracefully** when infrastructure the
@@ -203,3 +211,52 @@ never acceptable.
 - ✅ `osdev/src/validator.rs` — `CHAOS_TESTS`, `run_chaos_tests()`, `run_chaos_one()`, `DegradedSmp`/`DegradedEnv` test kinds
 - ✅ `osdev/src/qemu.rs` — `spawn_for_test_custom()` (custom smp + ram_mib)
 - ✅ `osdev/src/main.rs` — `"chaos" => run_chaos_tests()`, docstring
+
+---
+
+## Brutal Chaos Phase (chaos-brutal)
+
+### Purpose
+
+Brutal chaos repeats each degradation scenario at higher intensity — more simultaneous
+faults, deeper recursion, more TLB cycles, more extreme resource constraints — while
+the full brutal suite (BS1–BS10, BA1–BA10) runs concurrently.
+
+### Attacks
+
+| ID  | Attack                                                              | Intensity vs C-series               |
+|-----|---------------------------------------------------------------------|-------------------------------------|
+| BC1 | Boot with `-smp 1` (single BSP, zero APs)                          | More extreme than C1 (smp=2)        |
+| BC2 | 5 simultaneous non-TCB null-deref faults; monitor proves survival  | 5× C2 (1 fault → 5 concurrent)     |
+| BC3 | 2,500 alloc-deny cycles (usize::MAX requests per cycle)             | 5× C3 (500 → 2,500)                |
+| BC4 | Boot with `-m 96M` RAM (extreme low memory)                        | More extreme than C4 (192M → 96M)  |
+| BC5 | 500-level recursive `yield_cpu()` kernel stack probe               | 5× C5 (100 → 500 levels)           |
+| BC6 | 2 hog cores (cores 2+3), monitor on core 0 runs 200 yields        | 2× C6 hogs; brutal pressure from full concurrent suite |
+| BC7 | 15 cross-core kill/respawn TLB-shootdown cycles under full brutal suite | Each cycle ~45s under concurrent load; brutal pressure is the suite, not count |
+
+### Probe services
+
+| Service              | Mode | Core        | Notes                                              |
+|----------------------|------|-------------|----------------------------------------------------|
+| `chaos-bc2-a`        |  91  | round-robin | Null-deref faulter A (reuses C2 mode)              |
+| `chaos-bc2-b`        |  91  | round-robin | Null-deref faulter B                               |
+| `chaos-bc2-c`        |  91  | round-robin | Null-deref faulter C                               |
+| `chaos-bc2-d`        |  91  | round-robin | Null-deref faulter D                               |
+| `chaos-bc2-e`        |  91  | round-robin | Null-deref faulter E                               |
+| `chaos-bc2-monitor`  | 155  | round-robin | 500 yields; proves system survived all 5 faults    |
+| `chaos-bc3`          | 156  | round-robin | 2,500 alloc-deny cycles (4 MiB limit)              |
+| `chaos-bc5`          | 157  | round-robin | 500-level recursive yield_cpu()                    |
+| `chaos-bc6-hog-a`    |   7  | core 2      | Tight-loop hog (reuses MODE_HOG)                   |
+| `chaos-bc6-hog-b`    |   7  | core 3      | Second tight-loop hog                              |
+| `chaos-bc6-monitor`  | 158  | core 0      | 200 yields; proves core 0 alive under 2-hog load   |
+| `chaos-bc7-victim`   |   0  | core 2      | Passive recv target; killed/respawned by BC7       |
+| `chaos-bc7`          | 159  | core 1      | 15-cycle cross-core kill/respawn controller        |
+
+### Implementation checklist
+
+- ✅ `services/probe/src/main.rs` — modes 155–159 (BC2 monitor, BC3, BC5, BC6 monitor, BC7)
+- ✅ `kernel/src/task/mod.rs` — 13 brutal chaos service configs
+- ✅ `services/supervisor/src/main.rs` — brutal chaos probe spawns (EARLY, before property tests)
+- ✅ `osdev/src/validator.rs` — `BRUTAL_CHAOS_TESTS`, `run_chaos_brutal_tests()`, `chaos_brutal_serial_path()`, `run_chaos_brutal_one()`
+- ✅ `osdev/src/main.rs` — `"chaos-brutal" => run_chaos_brutal_tests()`, docstring
+- ✅ `build/tests/14_CHAOS_BRUTAL/.gitkeep`

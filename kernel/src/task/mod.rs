@@ -1923,6 +1923,132 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        154, // MODE_ADV_BA10: kernel addr syscall args → rejected
             memory_limit:      64 * 1024 * 1024,
         })),
+        // ----------------------------------------------------------------
+        // Brutal chaos-test services — Milestone 21.
+        // BC2: 5 simultaneous null-deref faulters + 1 monitor proving system survival.
+        // ----------------------------------------------------------------
+        "chaos-bc2-a" => Some(("chaos-bc2-a", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        91, // MODE_CHAOS_C2: null-deref → page fault → killed
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "chaos-bc2-b" => Some(("chaos-bc2-b", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        91, // MODE_CHAOS_C2: null-deref → page fault → killed
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "chaos-bc2-c" => Some(("chaos-bc2-c", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        91, // MODE_CHAOS_C2: null-deref → page fault → killed
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "chaos-bc2-d" => Some(("chaos-bc2-d", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        91, // MODE_CHAOS_C2: null-deref → page fault → killed
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "chaos-bc2-e" => Some(("chaos-bc2-e", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        91, // MODE_CHAOS_C2: null-deref → page fault → killed
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "chaos-bc2-monitor" => Some(("chaos-bc2-monitor", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        155, // MODE_CHAOS_BC2_MON: 500 yields then log pass
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BC3: 2,500 alloc-deny cycles. Tight 4 MiB limit so impossible requests fail fast.
+        "chaos-bc3" => Some(("chaos-bc3", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        156, // MODE_CHAOS_BC3: 2,500 alloc-deny cycles
+            memory_limit:      4 * 1024 * 1024,
+        })),
+        // BC5: 500-level recursive yield_cpu() stack depth probe.
+        "chaos-bc5" => Some(("chaos-bc5", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        157, // MODE_CHAOS_BC5: 500-level recursive yield
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BC6: 2 hogs on cores 2+3, monitor on core 0 runs 1,000 yields.
+        "chaos-bc6-hog-a" => Some(("chaos-bc6-hog-a", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    2, // tight-loop hog on core 2
+            probe_mode:        7, // MODE_HOG: tight loop (reused)
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "chaos-bc6-hog-b" => Some(("chaos-bc6-hog-b", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    3, // tight-loop hog on core 3
+            probe_mode:        7, // MODE_HOG: tight loop (reused)
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "chaos-bc6-monitor" => Some(("chaos-bc6-monitor", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    0, // core 0 — cross-core witness
+            probe_mode:        158, // MODE_CHAOS_BC6_MON: 1,000 yields then log pass
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        // BC7: 150 cross-core kill/respawn TLB-shootdown cycles.
+        // Victim on core 2 must be registered before controller on core 1 gets SEND cap.
+        "chaos-bc7-victim" => Some(("chaos-bc7-victim", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    2, // cross-core: controller on 1 kills victim on 2
+            probe_mode:        0, // MODE_PASSIVE — killed/respawned by chaos-bc7
+            memory_limit:      64 * 1024 * 1024,
+        })),
+        "chaos-bc7" => Some(("chaos-bc7", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &["chaos-bc7-victim"],
+            send_peers_grant:  false,
+            preferred_core:    1, // cross-core: controller on 1, victim on 2
+            probe_mode:        159, // MODE_CHAOS_BC7: 150 cross-core kill/respawn cycles
+            memory_limit:      64 * 1024 * 1024,
+        })),
         _ => None,
     }
 }

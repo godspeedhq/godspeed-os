@@ -22,6 +22,7 @@
 //!   osdev test adv          — run §22 adversarial / red-team test suite (Milestone 13)
 //!   osdev test adv-brutal   — run brutal adversarial tests BA1–BA10 (Milestone 20)
 //!   osdev test chaos        — run §22 chaos / graceful-degradation test suite (Milestone 14)
+//!   osdev test chaos-brutal — run brutal chaos tests BC1–BC7 (Milestone 21)
 
 mod disk_image;
 mod qemu;
@@ -235,7 +236,8 @@ fn cmd_test(suite: &str) {
         "perf-brutal"   => crate::validator::run_brutal_perf_tests(),
         "adv"        => crate::validator::run_adv_tests(),
         "adv-brutal" => crate::validator::run_brutal_adv_tests(),
-        "chaos"    => crate::validator::run_chaos_tests(),
+        "chaos"        => crate::validator::run_chaos_tests(),
+        "chaos-brutal" => crate::validator::run_chaos_brutal_tests(),
         other => eprintln!("unknown test suite: {}", other),
     }
 }

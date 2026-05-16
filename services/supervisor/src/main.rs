@@ -58,6 +58,26 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let _ = ctx.spawn("adv-ba9");
     let _ = ctx.spawn("adv-ba10");
 
+    // --- Brutal chaos-test probes — Milestone 21 ---
+    // Spawned EARLY before property/stress kill-respawn loops start.
+    // BC2: 5 simultaneous faulters registered before the monitor so all 5
+    // fault concurrently before the monitor starts counting yields.
+    // BC7: victim registered before controller so its endpoint exists when
+    // the controller's SEND cap is wired at spawn time.
+    let _ = ctx.spawn("chaos-bc2-a");
+    let _ = ctx.spawn("chaos-bc2-b");
+    let _ = ctx.spawn("chaos-bc2-c");
+    let _ = ctx.spawn("chaos-bc2-d");
+    let _ = ctx.spawn("chaos-bc2-e");
+    let _ = ctx.spawn("chaos-bc2-monitor");
+    let _ = ctx.spawn("chaos-bc3");
+    let _ = ctx.spawn("chaos-bc5");
+    let _ = ctx.spawn("chaos-bc6-hog-a"); // hog on core 2
+    let _ = ctx.spawn("chaos-bc6-hog-b"); // hog on core 3
+    let _ = ctx.spawn("chaos-bc6-monitor"); // witness on core 0
+    let _ = ctx.spawn("chaos-bc7-victim"); // passive target on core 2
+    let _ = ctx.spawn("chaos-bc7");        // controller on core 1
+
     // Property-test probes — Milestone 9 Phase 1.
     // prop-p9-victim must register its endpoint before prop-p9 is spawned
     // (SEND caps to prop-p9-victim are wired at prop-p9 spawn time).
