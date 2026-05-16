@@ -14,16 +14,25 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show
 
-      - name: Build (bare-metal)
-        run: cargo build --target x86_64-unknown-none --workspace --exclude osdev
+      # Services must be built before the kernel: kernel/build.rs embeds service
+      # ELF bytes via include_bytes!(env!("SVC_*_ELF")), so the service binaries
+      # must exist in target/ before the kernel crate compiles.
+      - name: Build services (bare-metal)
+        run: cargo build --target x86_64-unknown-none --workspace --exclude osdev --exclude kernel
+
+      - name: Build kernel (bare-metal)
+        run: cargo build --target x86_64-unknown-none -p kernel
 
       - name: Build osdev (host)
         run: cargo build -p osdev
 
-      - name: Clippy (bare-metal)
-        run: cargo clippy --target x86_64-unknown-none --workspace --exclude osdev
+      - name: Clippy services (bare-metal)
+        run: cargo clippy --target x86_64-unknown-none --workspace --exclude osdev --exclude kernel
 
-      - name: Clippy (host)
+      - name: Clippy kernel (bare-metal)
+        run: cargo clippy --target x86_64-unknown-none -p kernel
+
+      - name: Clippy osdev (host)
         run: cargo clippy -p osdev
 
       - name: Validate service contracts
