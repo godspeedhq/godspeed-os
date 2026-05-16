@@ -38,5 +38,8 @@ jobs:
       - name: Validate service contracts
         run: cargo run -p osdev -- validate
 
+      - name: Unsafe audit check
+        run: python3 scripts/unsafe_check.py
+
       - name: Unit tests (kernel pure-logic)
         run: python3 scripts/test_report.py
