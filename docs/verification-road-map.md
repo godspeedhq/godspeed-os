@@ -3,6 +3,8 @@
 > **Status:** Non-normative. Records the verification work that follows the 130-test suite (§22 of CLAUDE.md). Not a replacement for the constitution; a sequence of concrete activities that raise rigor without bolting on certification overhead.
 >
 > **Context:** GodspeedOS v1 shipped with all 130 tests passing across seven categories (identity, property, fuzz, stress, performance, adversarial, chaos), each with brutal variants. The kernel is correct against its spec. The work below sharpens what is already there: finding what the tests miss, what QEMU hides, and what only emerges over time.
+>
+> **Progress (2026-05-16):** Items 1, 3–6 complete. Item 2 and items 7–9 deferred pending hardware arrival.
 
 ---
 
@@ -10,15 +12,15 @@
 
 The list is in priority order for a solo developer. Each item compounds with the previous one. Don't skip ahead.
 
-1. [Code coverage](#1-code-coverage)
-2. [Real hardware boot](#2-real-hardware-boot) — *deferred pending USB-to-serial adapter*
-3. [Unsafe audit](#3-unsafe-audit)
-4. [Static analysis](#4-static-analysis)
-5. [Mutation testing](#5-mutation-testing)
-6. [Subsystem-level property tests](#6-subsystem-level-property-tests)
-7. [Long-running soak](#7-long-running-soak)
-8. [External documentation pass](#8-external-documentation-pass)
-9. [Formal subset analysis](#9-formal-subset-analysis)
+1. [Code coverage](#1-code-coverage) ✅
+2. [Real hardware boot](#2-real-hardware-boot) — *deferred pending hardware*
+3. [Unsafe audit](#3-unsafe-audit) ✅
+4. [Static analysis](#4-static-analysis) ✅
+5. [Mutation testing](#5-mutation-testing) ✅
+6. [Subsystem-level property tests](#6-subsystem-level-property-tests) ✅
+7. [Long-running soak](#7-long-running-soak) — *deferred pending hardware*
+8. [External documentation pass](#8-external-documentation-pass) — *deferred*
+9. [Formal subset analysis](#9-formal-subset-analysis) — *deferred*
 
 ---
 
@@ -55,7 +57,7 @@ The list is in priority order for a solo developer. Each item compounds with the
 
 ## 2. Real Hardware Boot
 
-> **Status:** Deferred pending USB-to-serial adapter. Section preserved for when the cable arrives.
+> **Status:** Deferred. Hardware ordered (2026-05-16); resume when it arrives.
 
 **Intent.** Find the bugs QEMU TCG hides. There will be at least one. Probably two.
 
@@ -248,6 +250,8 @@ Properties to assert with `proptest` (single-threaded model first, then a concur
 
 ## 7. Long-Running Soak
 
+> **Status:** Deferred pending hardware arrival (2026-05-16). Requires real silicon for meaningful results; QEMU soak is not a substitute.
+
 **Intent.** Find leaks, drift, and "works for a week, breaks at three" bugs that no fixed-duration test will catch.
 
 **Setup.**
@@ -281,6 +285,8 @@ Properties to assert with `proptest` (single-threaded model first, then a concur
 
 ## 8. External Documentation Pass
 
+> **Status:** Deferred (2026-05-16).
+
 **Intent.** Write the kernel down for someone who has never seen it. Force every invariant out of your head and onto the page.
 
 **Why.** Solo developers compensate for missing peer review by writing for an imaginary collaborator. Every implicit invariant you discover during this exercise is a future bug that didn't happen.
@@ -304,6 +310,8 @@ Properties to assert with `proptest` (single-threaded model first, then a concur
 ---
 
 ## 9. Formal Subset Analysis
+
+> **Status:** Deferred (2026-05-16).
 
 **Intent.** Pick one small kernel module and prove its invariants formally, not behaviorally. **Not the whole kernel. One module.**
 
