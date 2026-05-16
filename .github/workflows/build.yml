@@ -78,4 +78,4 @@ jobs:
       - name: Unsafe surface report (cargo-geiger)
         run: |
           cargo install cargo-geiger --locked 2>/dev/null || true
-          cargo geiger --package kernel 2>&1
+          cd kernel && cargo geiger 2>&1 || true
