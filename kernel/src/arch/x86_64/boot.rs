@@ -29,7 +29,7 @@ const GDT_TEMPLATE: [u64; 8] = [
     0x00AF_9A00_0000_FFFF, // kernel code  (0x08): 64-bit, ring-0, X/R
     0x00CF_9200_0000_FFFF, // kernel data  (0x10): ring-0, R/W
     0x0000_0000_0000_0000, // placeholder  (0x18): required for SYSRETQ alignment
-    0x00CF_F300_0000_FFFF, // user data    (0x20): ring-3, R/W (accessed bit set; required by VMX VMCS validation)
+    0x008F_F300_0000_FFFF, // user data    (0x20): ring-3, R/W; D/B=0 required by VMX (SS.D/B must be 0 in 64-bit guest mode)
     0x00AF_FA00_0000_FFFF, // user code    (0x28): 64-bit, ring-3, X/R
     0x0000_0000_0000_0000, // TSS low      (0x30): filled by init_gdt(core_id)
     0x0000_0000_0000_0000, // TSS high     (0x38): filled by init_gdt(core_id)
