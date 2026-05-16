@@ -9,27 +9,30 @@
 #
 # Test command: cargo test -p kernel --lib
 # Approximate run time: ~5–10 min (50–100 mutations × ~3 s each).
+#
+# NOTE: cargo-mutants matches exclude_globs against workspace-root-relative
+# paths (kernel/src/...), so all patterns must use the kernel/src/ prefix.
 
 timeout_multiplier = 5.0
 
 exclude_globs = [
-    "src/arch/**",
-    "src/memory/**",
-    "src/smp/**",
-    "src/task/**",
-    "src/syscall/**",
-    "src/interrupt/**",
-    "src/invariants/**",
-    "src/ipc/endpoint.rs",
-    "src/ipc/routing.rs",
-    "src/ipc/names.rs",
-    "src/ipc/mod.rs",
-    "src/capability/table.rs",
-    "src/capability/revoke.rs",
-    "src/capability/mod.rs",
-    "src/log.rs",
-    "src/main.rs",
-    "src/lib.rs",
-    "src/loader.rs",
-    "src/control.rs",
+    "kernel/src/arch/**",
+    "kernel/src/memory/**",
+    "kernel/src/smp/**",
+    "kernel/src/task/**",
+    "kernel/src/syscall/**",
+    "kernel/src/interrupt/**",
+    "kernel/src/invariants/**",
+    "kernel/src/ipc/endpoint.rs",
+    "kernel/src/ipc/routing.rs",
+    "kernel/src/ipc/names.rs",
+    "kernel/src/ipc/mod.rs",
+    "kernel/src/capability/table.rs",
+    "kernel/src/capability/revoke.rs",
+    "kernel/src/capability/mod.rs",
+    "kernel/src/log.rs",
+    "kernel/src/main.rs",
+    "kernel/src/lib.rs",
+    "kernel/src/loader.rs",
+    "kernel/src/control.rs",
 ]

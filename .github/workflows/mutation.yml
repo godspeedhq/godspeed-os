@@ -32,7 +32,10 @@ jobs:
       # regardless and upload it as an artefact.  Once the baseline kill rate
       # has been triaged and accepted, remove the `|| true` to make CI strict.
       - name: Run mutation tests
-        run: cargo mutants --package kernel -- --lib 2>&1 | tee mutation-report.txt || true
+        # --config kernel/mutants.toml: exclude_globs use kernel/src/ prefix
+        # (workspace-root-relative paths). Without --config the file is not
+        # found and all 2000+ mutations run instead of the intended ~120.
+        run: cargo mutants --package kernel --config kernel/mutants.toml -- --lib 2>&1 | tee mutation-report.txt || true
 
       - name: Upload mutation report
         if: always()
