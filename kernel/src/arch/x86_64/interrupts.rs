@@ -89,6 +89,32 @@ pub unsafe fn dispatch_irq(irq: u8) {
     crate::interrupt::route::deliver(irq);
 }
 
+/// Enable hardware interrupts on the current core.
+#[inline]
+pub fn enable_interrupts() {
+    // SAFETY: STI is always safe to execute in ring-0; caller controls timing.
+    unsafe { core::arch::asm!("sti", options(nostack, nomem)) }
+}
+
+/// Disable hardware interrupts on the current core.
+#[inline]
+pub fn disable_interrupts() {
+    // SAFETY: CLI is always safe to execute in ring-0.
+    unsafe { core::arch::asm!("cli", options(nostack, nomem)) }
+}
+
+/// Enable interrupts and halt until the next interrupt fires, then return.
+///
+/// Used in the idle loop. Interrupts are re-disabled by the interrupt handler
+/// before this function's continuation executes.
+#[inline]
+pub fn wait_for_interrupt() {
+    // SAFETY: STI+HLT pair in idle loop; interrupts were previously disabled
+    // by the caller (scheduler). The processor atomically enables interrupts
+    // and halts, preventing a missed-wakeup race.
+    unsafe { core::arch::asm!("sti; hlt", options(nostack)) }
+}
+
 /// Page-fault handler — kills the faulting task (§10.3).
 ///
 /// # Safety

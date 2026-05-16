@@ -6,45 +6,46 @@
 //! The `process_pending` function is called from Core 0's scheduler idle loop.
 //! It drains COM2 bytes into a line buffer and processes complete commands.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use crate::smp::SpinLock;
 
 const BUF_SIZE: usize = 128;
 
-/// Per-core lock ensures only Core 0 calls `process_pending`.
-static CTRL_LOCKED: AtomicBool = AtomicBool::new(false);
+struct LineBuf {
+    buf: [u8; BUF_SIZE],
+    len: usize,
+}
 
-/// Command line buffer (written only from Core 0).
-static mut LINE_BUF: [u8; BUF_SIZE] = [0u8; BUF_SIZE];
-static mut LINE_LEN: usize = 0;
+impl LineBuf {
+    const fn new() -> Self {
+        Self { buf: [0u8; BUF_SIZE], len: 0 }
+    }
+}
+
+/// Per-core try-lock ensures only one caller processes pending bytes at a time.
+static LINE: SpinLock<LineBuf> = SpinLock::new(LineBuf::new());
 
 /// Drain COM2 and process any complete `\n`-terminated commands.
 ///
 /// Called from Core 0's scheduler idle loop only — never from interrupt context.
 pub fn process_pending() {
-    if CTRL_LOCKED
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        return;
-    }
+    let mut state = match LINE.try_lock() {
+        Some(g) => g,
+        None    => return,
+    };
 
-    // SAFETY: only called from Core 0 under CTRL_LOCKED; single-writer.
-    unsafe {
-        while let Some(b) = crate::arch::x86_64::com2_try_read_byte() {
-            if b == b'\n' || b == b'\r' {
-                if LINE_LEN > 0 {
-                    let line = core::str::from_utf8(&LINE_BUF[..LINE_LEN]).unwrap_or("");
-                    execute_command(line);
-                    LINE_LEN = 0;
-                }
-            } else if LINE_LEN < BUF_SIZE - 1 {
-                LINE_BUF[LINE_LEN] = b;
-                LINE_LEN += 1;
+    while let Some(b) = crate::arch::x86_64::com2_try_read_byte() {
+        if b == b'\n' || b == b'\r' {
+            if state.len > 0 {
+                let line = core::str::from_utf8(&state.buf[..state.len]).unwrap_or("");
+                execute_command(line);
+                state.len = 0;
             }
+        } else if state.len < BUF_SIZE - 1 {
+            let idx = state.len;
+            state.buf[idx] = b;
+            state.len += 1;
         }
     }
-
-    CTRL_LOCKED.store(false, Ordering::Release);
 }
 
 /// Parse and execute a single control command.

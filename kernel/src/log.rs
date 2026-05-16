@@ -4,11 +4,12 @@
 //! drained by the logger service on startup. Also mirrors to the serial
 //! console at all times so panics are always visible.
 //!
-//! Unsafe boundary: none. The ring buffer is protected by a spinlock.
+//! Unsafe boundary: none. The ring buffer is protected by a SpinLock.
 
 use core::fmt;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, Ordering};
+
+use crate::smp::SpinLock;
 
 const RING_SIZE: usize = 16 * 1024;
 
@@ -55,34 +56,15 @@ impl fmt::Write for RingBuffer {
     }
 }
 
-static LOG_LOCK: AtomicBool = AtomicBool::new(false);
-static mut RING: RingBuffer = RingBuffer::new();
-
-/// Acquire LOG_LOCK, execute `f`, then release.
-fn with_lock(f: impl FnOnce()) {
-    while LOG_LOCK
-        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        core::hint::spin_loop();
-    }
-    f();
-    LOG_LOCK.store(false, Ordering::Release);
-}
+static RING: SpinLock<RingBuffer> = SpinLock::new(RingBuffer::new());
 
 pub fn write_fmt(args: fmt::Arguments) {
-    with_lock(|| {
-        // SAFETY: LOG_LOCK held; single writer at a time.
-        let _ = unsafe { RING.write_fmt(args) };
-    });
+    let _ = RING.lock().write_fmt(args);
 }
 
 /// Drain the ring buffer into the logger service endpoint once it is ready.
 pub fn drain_to_logger(send: impl FnMut(u8)) {
-    with_lock(|| {
-        // SAFETY: LOG_LOCK held; single writer at a time.
-        unsafe { RING.drain(send) };
-    });
+    RING.lock().drain(send);
 }
 
 #[macro_export]

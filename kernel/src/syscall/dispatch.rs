@@ -6,7 +6,8 @@
 //! Syscall numbers are fixed; adding a syscall requires a new number and a
 //! capability that authorises it.
 
-use crate::arch::x86_64::page_tables::{map_in_active_tables, MapError, PageFlags};
+use crate::arch::x86_64::{read_user_bytes, validate_user_ptr, write_user_bytes, read_cycle_counter};
+use crate::arch::x86_64::page_tables::{map_in_active_tables, PageFlags};
 use crate::capability::cap::CapError;
 use crate::capability::rights::Rights;
 use crate::ipc::endpoint::EndpointId;
@@ -33,21 +34,6 @@ pub enum SyscallNumber {
     InspectKernel  = 13,
     QueryCapRights = 14,
     RemoveCap      = 15,
-}
-
-/// Validate that `[ptr, ptr+len)` lies entirely within user-space.
-///
-/// Returns `true` iff the range is non-empty, non-null, and does not
-/// extend into the kernel's upper-half address space (≥ 0x0000_8000_0000_0000).
-#[inline]
-fn validate_user_slice(ptr: u64, len: usize) -> bool {
-    const USER_END: u64 = 0x0000_8000_0000_0000;
-    if ptr == 0 || len == 0 { return false; }
-    if ptr >= USER_END { return false; }
-    match ptr.checked_add(len as u64) {
-        Some(end) => end <= USER_END,
-        None => false,
-    }
 }
 
 /// Raw syscall dispatcher — called from the SYSCALL/SYSENTER IDT stub.
@@ -94,8 +80,7 @@ pub unsafe extern "C" fn syscall_handler(
 /// arg0 = cap_slot, arg1 = pointer to UTF-8 bytes, arg2 = byte length.
 ///
 /// Requires `Rights::WRITE` on `LOG_WRITE_RESOURCE`.
-// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; args are untrusted user register values.
-unsafe fn handle_log(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
+fn handle_log(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::WRITE) {
         Ok(c) => c,
         Err(e) => return cap_err_to_i64(e),
@@ -106,17 +91,12 @@ unsafe fn handle_log(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     }
 
     let len = msg_len as usize;
-    if len == 0 || len > 256 {
-        return -1;
-    }
+    if len == 0 || len > 256 { return -1; }
 
-    if !validate_user_slice(msg_ptr, len) {
-        return -1;
-    }
-
-    // SAFETY: validate_user_slice guarantees ptr is in user-space (< 0x8000_0000_0000_0000)
-    // and the range doesn't overflow; user-space and kernel-space are disjoint address ranges.
-    let bytes = unsafe { core::slice::from_raw_parts(msg_ptr as *const u8, len) };
+    let bytes = match read_user_bytes(msg_ptr, len) {
+        Some(b) => b,
+        None    => return -1,
+    };
     match core::str::from_utf8(bytes) {
         Ok(s) => { crate::kprintln!("{}", s); 0 }
         Err(_) => -1,
@@ -127,8 +107,7 @@ unsafe fn handle_log(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 // Syscall: Send / Recv / TrySend (1, 2, 3) — Milestone 5/6.
 // ---------------------------------------------------------------------------
 
-// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; args are untrusted user register values.
-unsafe fn handle_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
+fn handle_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::SEND) {
         Ok(c)  => c,
         Err(e) => return cap_err_to_i64(e),
@@ -165,8 +144,7 @@ unsafe fn handle_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 /// Blocks until a message is dequeued from the endpoint, then copies the
 /// payload into the caller-supplied buffer.  Returns the number of bytes
 /// written on success, or a negative error code.
-// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; args are untrusted user register values.
-unsafe fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
+fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
     let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::RECV) {
         Ok(c)  => c,
         Err(e) => return cap_err_to_i64(e),
@@ -174,12 +152,8 @@ unsafe fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
     let endpoint_id = EndpointId(cap.resource_id.0);
 
     let buf_len = out_len as usize;
-    if buf_len == 0 || buf_len > MAX_MESSAGE_SIZE {
-        return -1;
-    }
-    if !validate_user_slice(out_buf, buf_len) {
-        return -1;
-    }
+    if buf_len == 0 || buf_len > MAX_MESSAGE_SIZE { return -1; }
+    if !validate_user_ptr(out_buf, buf_len) { return -1; }
 
     let my_slot = scheduler::current_task_slot();
 
@@ -203,22 +177,14 @@ unsafe fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
                 // Copy payload to the caller's user-space buffer.
                 let payload  = msg.payload_bytes();
                 let copy_len = payload.len().min(buf_len);
-                // SAFETY: validate_user_slice confirmed [out_buf, out_buf+buf_len) is
-                // in user space and non-overlapping with kernel memory.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        payload.as_ptr(),
-                        out_buf as *mut u8,
-                        copy_len,
-                    );
+                if !write_user_bytes(out_buf, &payload[..copy_len]) {
+                    return -1;
                 }
                 return copy_len as i64;
             }
             Err(IpcError::QueueEmpty) => {
                 let err = scheduler::block_and_reschedule(TaskState::BlockedOnRecv);
-                if err != 0 {
-                    return err;
-                }
+                if err != 0 { return err; }
                 // Sender woke us; loop to dequeue the message.
             }
             Err(e) => return ipc_err_to_i64(e),
@@ -226,8 +192,7 @@ unsafe fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
     }
 }
 
-// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; args are untrusted user register values.
-unsafe fn handle_try_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
+fn handle_try_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::SEND) {
         Ok(c)  => c,
         Err(e) => return cap_err_to_i64(e),
@@ -252,19 +217,15 @@ unsafe fn handle_try_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 // ---------------------------------------------------------------------------
 
 /// Build a kernel `Message` from a user-space pointer + length.
-///
-/// # Safety
-/// `msg_ptr` must be a valid user-space address (validated before calling).
-unsafe fn build_message(msg_ptr: u64, msg_len: u64) -> Result<Message, i64> {
+fn build_message(msg_ptr: u64, msg_len: u64) -> Result<Message, i64> {
     let len = msg_len as usize;
     if len > MAX_MESSAGE_SIZE {
         return Err(ipc_err_to_i64(IpcError::MessageTooLarge));
     }
-    if !validate_user_slice(msg_ptr, len) {
-        return Err(-1);
-    }
-    // SAFETY: validate_user_slice confirms the range is in user-space and in bounds.
-    let bytes = unsafe { core::slice::from_raw_parts(msg_ptr as *const u8, len) };
+    let bytes = match read_user_bytes(msg_ptr, len) {
+        Some(b) => b,
+        None    => return Err(-1),
+    };
     Message::new(bytes).map_err(|e| ipc_err_to_i64(e))
 }
 
@@ -280,8 +241,7 @@ unsafe fn build_message(msg_ptr: u64, msg_len: u64) -> Result<Message, i64> {
 /// core_id encoding:
 ///   - 0x0000 = core 0, 0x0001 = core 1, …
 ///   - 0xFFFF = let the kernel choose (preferred_core from service_config).
-// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; args are untrusted user register values.
-unsafe fn handle_spawn(packed_arg0: u64, name_ptr: u64, name_len: u64) -> i64 {
+fn handle_spawn(packed_arg0: u64, name_ptr: u64, name_len: u64) -> i64 {
     let spawn_cap_slot = (packed_arg0 & 0xFFFF) as usize;
     let core_raw       = ((packed_arg0 >> 16) & 0xFFFF) as u32;
     let core_override  = if core_raw == 0xFFFF { None } else { Some(core_raw) };
@@ -295,14 +255,12 @@ unsafe fn handle_spawn(packed_arg0: u64, name_ptr: u64, name_len: u64) -> i64 {
         return cap_err_to_i64(CapError::CapWrongScope);
     }
 
-    // Read service name from user space.
     let len = name_len as usize;
-    if len == 0 || len > 64 {
-        return -1;
-    }
-    if !validate_user_slice(name_ptr, len) { return -1; }
-    // SAFETY: validate_user_slice confirmed [name_ptr, name_ptr+len) is in user space.
-    let name_bytes = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, len) };
+    if len == 0 || len > 64 { return -1; }
+    let name_bytes = match read_user_bytes(name_ptr, len) {
+        Some(b) => b,
+        None    => return -1,
+    };
     let name = match core::str::from_utf8(name_bytes) {
         Ok(s)  => s,
         Err(_) => return -1,
@@ -319,13 +277,13 @@ unsafe fn handle_spawn(packed_arg0: u64, name_ptr: u64, name_len: u64) -> i64 {
 /// Kills the named running task: marks Dead, kills endpoint, wakes blocked tasks.
 /// Phase 5: no capability check (cap check added in Phase 6 when service_control
 /// is fully wired).
-// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; args are untrusted user register values.
-unsafe fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
+fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
     let len = name_len as usize;
     if len == 0 || len > 64 { return -1; }
-    if !validate_user_slice(name_ptr, len) { return -1; }
-    // SAFETY: validate_user_slice confirmed range is in user space.
-    let name_bytes = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, len) };
+    let name_bytes = match read_user_bytes(name_ptr, len) {
+        Some(b) => b,
+        None    => return -1,
+    };
     let name = match core::str::from_utf8(name_bytes) {
         Ok(s)  => s,
         Err(_) => return -1,
@@ -340,13 +298,13 @@ unsafe fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
 ///
 /// Used by services to reacquire a fresh SEND cap after `EndpointDead` (§14.2)
 /// and by property-test probes that need to transfer caps (P3 — arg2=1).
-// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; args are untrusted user register values.
-unsafe fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> i64 {
+fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> i64 {
     let len = name_len as usize;
     if len == 0 || len > 64 { return -1; }
-    if !validate_user_slice(name_ptr, len) { return -1; }
-    // SAFETY: validate_user_slice confirmed range is in user space.
-    let name_bytes = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, len) };
+    let name_bytes = match read_user_bytes(name_ptr, len) {
+        Some(b) => b,
+        None    => return -1,
+    };
     let name = match core::str::from_utf8(name_bytes) {
         Ok(s)  => s,
         Err(_) => return -1,
@@ -385,8 +343,7 @@ unsafe fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u
 ///
 /// Returns `CapNotGrantable` (-4) if the grant cap lacks the GRANT right, so
 /// the sender knows the cap was NOT transferred (it remains in their table).
-// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; args are untrusted user register values.
-unsafe fn handle_send_with_cap(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
+fn handle_send_with_cap(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let endpoint_slot = (packed & 0xFFFF) as usize;
     let grant_slot    = ((packed >> 16) & 0xFFFF) as usize;
 
@@ -449,8 +406,7 @@ unsafe fn handle_send_with_cap(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 /// Returns the next pending received cap slot as a non-negative i64, or -1 if
 /// no pending caps remain.  The slot is into the calling task's own cap table;
 /// it was inserted by handle_recv when it processed an embedded cap.
-// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; no pointer arguments.
-unsafe fn handle_take_pending_cap() -> i64 {
+fn handle_take_pending_cap() -> i64 {
     match scheduler::pop_pending_recv_cap() {
         Some(slot) => slot as i64,
         None       => -1,
@@ -470,8 +426,7 @@ unsafe fn handle_take_pending_cap() -> i64 {
 /// negative error code:
 ///   -11  AllocDenied — request would exceed the task's memory limit.
 ///   -1   other failure (physical memory exhausted; partial allocation left mapped).
-// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; args are untrusted user register values.
-unsafe fn handle_alloc_mem(size: u64) -> i64 {
+fn handle_alloc_mem(size: u64) -> i64 {
     if size == 0 { return -1; }
 
     // Reserve budget and obtain the base virtual address to map from.
@@ -514,15 +469,14 @@ unsafe fn handle_alloc_mem(size: u64) -> i64 {
 /// Prints "KERNEL PANIC" immediately (so the harness sees it even on minimal
 /// serial buffering), then panics with "reason: {msg}" (§6.2, §22 Test 1B).
 /// Does not return.
-// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; args are untrusted user register values.
-unsafe fn handle_abort(msg_ptr: u64, msg_len: u64) -> i64 {
+fn handle_abort(msg_ptr: u64, msg_len: u64) -> i64 {
     let len = msg_len as usize;
-    if len > 0 && len <= 128 && validate_user_slice(msg_ptr, len) {
-        // SAFETY: validate_user_slice confirmed range is in user space.
-        let bytes = unsafe { core::slice::from_raw_parts(msg_ptr as *const u8, len) };
-        if let Ok(s) = core::str::from_utf8(bytes) {
-            crate::kprintln!("KERNEL PANIC");
-            panic!("reason: {}", s);
+    if len > 0 && len <= 128 {
+        if let Some(bytes) = read_user_bytes(msg_ptr, len) {
+            if let Ok(s) = core::str::from_utf8(bytes) {
+                crate::kprintln!("KERNEL PANIC");
+                panic!("reason: {}", s);
+            }
         }
     }
     crate::kprintln!("KERNEL PANIC");
@@ -539,26 +493,19 @@ unsafe fn handle_abort(msg_ptr: u64, msg_len: u64) -> i64 {
 ///   arg1 = name_ptr (user VA), arg2 = name_len.
 ///   Returns the current generation of the named endpoint as a non-negative
 ///   i64, or -1 if the name is not registered.
-// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; args are untrusted user register values.
-unsafe fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
+fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     match query_id {
         0 => scheduler::current_task_alloc_bytes() as i64,
         1 => crate::ipc::routing::count_live_endpoints() as i64,
-        3 => {
-            // Read the hardware TSC for benchmarking probes (§22 Perf B1–B10).
-            // SAFETY: RDTSC is unconditionally available on x86_64 in ring 0;
-            // it reads a monotonically increasing cycle counter with no side effects
-            // and does not expose a kernel pointer or modify kernel state.
-            let tsc = unsafe { core::arch::x86_64::_rdtsc() };
-            tsc as i64
-        }
+        3 => read_cycle_counter() as i64,
         2 => {
             // Endpoint generation by name.
             let len = arg2 as usize;
             if len == 0 || len > 64 { return -1; }
-            if !validate_user_slice(arg1, len) { return -1; }
-            // SAFETY: validate_user_slice confirmed range is in user space.
-            let name_bytes = unsafe { core::slice::from_raw_parts(arg1 as *const u8, len) };
+            let name_bytes = match read_user_bytes(arg1, len) {
+                Some(b) => b,
+                None    => return -1,
+            };
             let name = match core::str::from_utf8(name_bytes) {
                 Ok(s)  => s,
                 Err(_) => return -1,
@@ -588,8 +535,7 @@ unsafe fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
 ///
 /// Returns the `Rights` byte of the cap at `slot` as a non-negative i64, or
 /// -2 (`CapNotHeld`) if the slot is empty or out of range.
-// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; arg is an untrusted user register value.
-unsafe fn handle_query_cap_rights(slot: u64) -> i64 {
+fn handle_query_cap_rights(slot: u64) -> i64 {
     match scheduler::current_task_read_cap_rights(slot as usize) {
         Some(rights) => rights.0 as i64,
         None         => cap_err_to_i64(CapError::CapNotHeld),
@@ -604,8 +550,7 @@ unsafe fn handle_query_cap_rights(slot: u64) -> i64 {
 ///
 /// Clears the cap at `slot`. Always returns 0; out-of-range slots are silently
 /// ignored (idempotent — the slot is already empty).
-// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; arg is an untrusted user register value.
-unsafe fn handle_remove_cap(slot: u64) -> i64 {
+fn handle_remove_cap(slot: u64) -> i64 {
     scheduler::current_task_remove_cap(slot as usize);
     0
 }

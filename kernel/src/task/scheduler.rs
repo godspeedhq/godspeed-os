@@ -517,13 +517,12 @@ pub fn run(core_id: u32) -> ! {
                     crate::control::process_pending();
                 }
                 // No ready tasks for this core; sleep until the next interrupt.
-                // SAFETY: `sti; hlt` atomically enables interrupts and halts;
-                //         the next interrupt (timer or IPI) will wake the core.
-                // `options(nostack)` only — omitting `nomem` so the compiler
-                // treats this asm as a memory clobber.  After hlt returns, the
-                // IPI handler will have written TASK_STATE; the compiler must
-                // not cache the previous None result across this boundary.
-                unsafe { core::arch::asm!("sti; hlt", options(nostack)) };
+                // `wait_for_interrupt` atomically enables interrupts and halts;
+                // the next interrupt (timer or IPI) will wake the core.  The
+                // function is a memory clobber: after hlt returns the IPI handler
+                // will have written TASK_STATE; the compiler must not cache the
+                // previous None result across this boundary.
+                crate::arch::x86_64::wait_for_interrupt();
             }
         }
     }
@@ -608,8 +607,7 @@ pub extern "C" fn timer_tick_from_irq() {
 /// Advisory yield: mark the current task Ready and reschedule.
 /// Also called from the IPI handler for cross-core WAKE_RECEIVER (§9.4).
 pub fn yield_current() {
-    // SAFETY: cli disables interrupts; no memory access; required before inspecting CORE_CURRENT.
-    unsafe { core::arch::asm!("cli", options(nostack, nomem)) };
+    crate::arch::x86_64::disable_interrupts();
 
     let cid = current_core_id();
 

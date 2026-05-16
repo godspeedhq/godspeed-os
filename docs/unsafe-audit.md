@@ -44,10 +44,10 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | arch/x86_64/ap_boot.rs | 3 | permitted |
 | arch/x86_64/boot.rs | 60 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |
-| arch/x86_64/interrupts.rs | 5 | permitted |
+| arch/x86_64/interrupts.rs | 8 | permitted |
 | arch/x86_64/mod.rs | 22 | permitted |
 | arch/x86_64/page_tables.rs | 25 | permitted |
-| arch/x86_64/syscall_entry.rs | 13 | permitted |
+| arch/x86_64/syscall_entry.rs | 16 | permitted |
 | capability/table.rs | 7 | permitted |
 | memory/allocator.rs | 28 | permitted |
 | memory/frame.rs | 1 | permitted |
@@ -57,21 +57,18 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | smp/ipi.rs | 21 | permitted |
 | smp/mod.rs | 1 | permitted |
 | smp/placement.rs | 1 | permitted |
-| control.rs | 1 | grandfathered |
-| interrupt/route.rs | 3 | grandfathered |
-| ipc/names.rs | 2 | grandfathered |
-| ipc/routing.rs | 10 | grandfathered |
+| smp/spinlock.rs | 4 | permitted |
+| interrupt/route.rs | 1 | grandfathered |
 | loader.rs | 16 | grandfathered |
-| log.rs | 2 | grandfathered |
 | main.rs | 3 | grandfathered |
-| syscall/dispatch.rs | 26 | grandfathered |
+| syscall/dispatch.rs | 2 | grandfathered |
 | task/mod.rs | 12 | grandfathered |
-| task/scheduler.rs | 38 | grandfathered |
+| task/scheduler.rs | 36 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 206 lines across 16 files  
-**Grandfathered total:** 113 lines across 10 files  
-**Grand total:** 319 lines across 26 files
+**Permitted total:** 216 lines across 17 files  
+**Grandfathered total:** 70 lines across 6 files  
+**Grand total:** 286 lines across 23 files
 
 ---
 
@@ -120,6 +117,12 @@ IRQ dispatch and CR2 read on page fault. Sound because the IRQ handler runs at
 known IDT vector; CR2 is only read inside the page-fault handler where it is
 valid.
 
+Three additional `unsafe {}` blocks (count +3): `enable_interrupts` (STI),
+`disable_interrupts` (CLI), and `wait_for_interrupt` (STI+HLT). All three are
+ring-0 privileged instructions with no memory effects; the callers are
+responsible for the context invariants (e.g., interrupts were disabled before
+calling `wait_for_interrupt`). `// SAFETY:` comments present in source.
+
 ---
 
 ### arch/x86_64/mod.rs
@@ -150,6 +153,14 @@ Serial output helpers (`ser_putc`, `ser_puts`, `ser_hex64`) and per-core SYSCALL
 MSR setup. Sound because serial helpers are guarded by the kernel's serial
 spinlock; SYSCALL MSR setup runs once during per-core init before the core
 enters the scheduler.
+
+Three additional `unsafe {}` blocks (count +3): `read_user_bytes`
+(`from_raw_parts`), `write_user_bytes` (`copy_nonoverlapping`), and
+`read_cycle_counter` (`_rdtsc`). All three are sound because the pointer/length
+pair is validated by `validate_user_ptr` before the unsafe call, ensuring the
+range lies in user-space (below `USER_END`) and cannot overlap kernel memory;
+`_rdtsc` is a read-only counter with no side effects. `// SAFETY:` comments
+present in source.
 
 ---
 
@@ -229,42 +240,31 @@ core 0 ready before spawning init). `// SAFETY:` comment present in source.
 
 ---
 
-### control.rs *(grandfathered)*
+### smp/spinlock.rs
 
-One unsafe block: stack switch at kernel entry using inline ASM. This is the
-same pattern as `main.rs` below. Sound because the new stack pointer targets
-the top of `BSP_BOOT_STACK`, a 512 KiB static buffer; the alignment is
-enforced by the `& !15` mask. `// SAFETY:` comment present in source.
+`SpinLock<T>` interior-mutable spinlock. Four unsafe constructs:
+- `unsafe impl Send for SpinLock<T>`: sound because the atomic spinlock
+  serialises all access to `T`; `T: Send` is required.
+- `unsafe impl Sync for SpinLock<T>`: same reasoning — mutual exclusion is
+  enforced by the atomic before any shared reference is handed out.
+- `unsafe { &*self.lock.data.get() }` in `Deref`: sound because the lock is
+  held (we have a `SpinLockGuard`); no other reference to the inner data can
+  exist simultaneously.
+- `unsafe { &mut *self.lock.data.get() }` in `DerefMut`: same reasoning for
+  mutable access.
+
+`// SAFETY:` comments present in source for all four.
 
 ---
 
 ### interrupt/route.rs *(grandfathered)*
 
-IRQ routing table (`IRQ_TABLE`) is a static array protected by an
-`InterruptLock`. Three unsafe blocks: `register` (writes the table), `deliver`
-(reads the table), and the inner read inside `deliver`. Sound because interrupt
-delivery runs with interrupts disabled (CLI in the IDT stub); the lock prevents
-concurrent registration.
-*(One SAFETY comment missing in source — needs back-fill.)*
-
----
-
-### ipc/names.rs *(grandfathered)*
-
-Endpoint name table (`NAMES`) — static array protected by a `SpinLock`. Two
-unsafe blocks access the table under the lock. Sound because the lock ensures
-mutual exclusion; indices are bounds-checked. `// SAFETY:` comments present in
-source.
-
----
-
-### ipc/routing.rs *(grandfathered)*
-
-IPC routing table (`TABLE`) — static array protected by a `SpinLock`. Ten unsafe
-blocks: `register`, `find_index`, `enqueue_locked`, `dequeue_locked`, and
-`kill_endpoint`. Sound because all paths hold the routing lock before accessing
-the table; liveness flags are set atomically with generation bumps.
-*(Several SAFETY comments missing in source — needs back-fill.)*
+`pub unsafe fn deliver(irq: u8)` — called from the IDT stub with IF=0.
+One unsafe line remaining (the `unsafe fn` declaration).
+`IRQ_TABLE` is now protected by `SpinLock`; registration and delivery are safe
+with respect to the lock. The `unsafe` on `deliver` reflects the interrupt-context
+calling convention (must only be called from the IDT with IF=0).
+`// SAFETY:` comment present in source.
 
 ---
 
@@ -277,15 +277,6 @@ the correct way to access packed ELF structs; segment bounds are validated
 against the input slice before any copy; `map_in_active_tables` holds the frame
 lock for each mapping.
 *(Most SAFETY comments missing in source — needs back-fill.)*
-
----
-
-### log.rs *(grandfathered)*
-
-Ring buffer write and drain: two unsafe calls into a static `RingBuffer`
-protected by a `SpinLock`. Sound because both paths hold the lock; the ring
-buffer is never accessed from interrupt context without disabling interrupts
-first. `// SAFETY:` comments present in source.
 
 ---
 
@@ -302,13 +293,18 @@ source for two of the three.
 
 ### syscall/dispatch.rs *(grandfathered)*
 
-26 unsafe lines covering all syscall handlers. Common pattern: read a user-space
-pointer as a `&[u8]` via `core::slice::from_raw_parts`. Sound in each case
-because: (a) the syscall entry point validates that the pointer and length fit
-within the user address space before dispatch; (b) the kernel holds no reference
-to user memory after the syscall returns. Cap table access goes through the
-capability lock.
-*(Most SAFETY comments missing in source — needs back-fill.)*
+2 unsafe lines remaining (reduced from 26):
+- `pub unsafe extern "C" fn syscall_handler`: the raw ring-3 → ring-0 entry
+  point installed as the LSTAR target; must remain `unsafe` because it
+  processes untrusted register values from user space.
+- `unsafe { map_in_active_tables(va, phys, flags) }` inside `handle_alloc_mem`:
+  sound because `va` is in the task heap region (above `0x1_0000_0000`);
+  `phys` is a freshly allocated frame from the bitmap allocator; the active
+  page table is the calling task's own CR3. `// SAFETY:` comment present in source.
+
+All other handlers were converted from `unsafe fn` to `fn` — their user-pointer
+accesses moved to `arch/x86_64::read_user_bytes` / `write_user_bytes` which
+encapsulate the unsafe in the permitted arch layer.
 
 ---
 
@@ -324,11 +320,12 @@ double-alloc. `// SAFETY:` comments present in source for most blocks.
 
 ### task/scheduler.rs *(grandfathered)*
 
-Largest grandfathered file (38 unsafe lines). Covers: per-core current-task
-arrays, run-queue manipulation, `prepare_ring3_switch` (context frame write),
-`task_cap_init_empty`, `commit_task`, memory-budget arrays, and `cli`/`sti`
-in the idle loop. Sound in aggregate because: all arrays are indexed by slot or
-core_id with bounds checked at their call sites; ring3 switch is called only
-from the scheduler with interrupts disabled; cap init runs before the task is
-visible to other cores.
+36 unsafe lines (reduced from 38 — two standalone `asm!` blocks replaced by
+`arch::x86_64::disable_interrupts()` and `arch::x86_64::wait_for_interrupt()`).
+Covers: per-core current-task arrays, run-queue manipulation,
+`prepare_ring3_switch` (context frame write), `task_cap_init_empty`,
+`commit_task`, and memory-budget arrays. Sound in aggregate because: all arrays
+are indexed by slot or core_id with bounds checked at their call sites; ring3
+switch is called only from the scheduler with interrupts disabled; cap init
+runs before the task is visible to other cores.
 *(~10 SAFETY comments missing in source — needs back-fill.)*

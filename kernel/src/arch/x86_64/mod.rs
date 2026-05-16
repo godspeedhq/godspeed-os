@@ -218,6 +218,9 @@ pub fn ap_init(core_id: u32) {
     }
 }
 
+pub use interrupts::{disable_interrupts, enable_interrupts, wait_for_interrupt};
+pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes};
+
 /// Halt this core. Disables interrupts and loops on hlt.
 /// Milestone 6: broadcast NMI IPI to other cores before halting.
 pub fn halt_all_cores() -> ! {

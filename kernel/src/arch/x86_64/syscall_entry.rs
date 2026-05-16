@@ -144,6 +144,56 @@ pub unsafe fn init_per_core_syscall(core_id: usize) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Safe user-pointer wrappers (arch permitted layer).
+// ---------------------------------------------------------------------------
+
+/// The highest valid user virtual address (exclusive) — top of the lower half.
+const USER_END: u64 = 0x0000_8000_0000_0000;
+
+/// Return `true` iff the byte range `[ptr, ptr+len)` lies entirely within the
+/// user address space and does not wrap.
+#[inline]
+pub fn validate_user_ptr(ptr: u64, len: usize) -> bool {
+    if ptr == 0 || len == 0 { return false; }
+    if ptr >= USER_END { return false; }
+    match ptr.checked_add(len as u64) {
+        Some(end) => end <= USER_END,
+        None => false,
+    }
+}
+
+/// Borrow a user-space byte slice.  Returns `None` if the range is invalid.
+///
+/// The returned slice is valid for the current syscall frame lifetime; the
+/// caller must not retain it across a reschedule point.
+#[inline]
+pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> {
+    if !validate_user_ptr(ptr, len) { return None; }
+    // SAFETY: range validated above; lies in user-space VA (below USER_END),
+    // which is disjoint from all kernel mappings.  Caller is in syscall
+    // context (IF=0); no task migration can occur.
+    Some(unsafe { core::slice::from_raw_parts(ptr as *const u8, len) })
+}
+
+/// Copy `src` into the user-space address `dst`.  Returns `false` if the
+/// destination range is invalid; the copy is a no-op in that case.
+#[inline]
+pub fn write_user_bytes(dst: u64, src: &[u8]) -> bool {
+    if !validate_user_ptr(dst, src.len()) { return false; }
+    // SAFETY: range validated above; user-space VA disjoint from kernel.
+    unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst as *mut u8, src.len()) };
+    true
+}
+
+/// Read the processor's time-stamp counter.
+#[inline]
+pub fn read_cycle_counter() -> u64 {
+    // SAFETY: RDTSC is always available on x86_64 in ring-0 and has no
+    // side effects other than reading the counter.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
 /// SYSCALL entry point — installed as the LSTAR MSR target.
 ///
 /// On hardware SYSCALL entry:

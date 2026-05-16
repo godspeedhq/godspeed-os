@@ -6,6 +6,9 @@
 pub mod core;
 pub mod ipi;
 pub mod placement;
+pub mod spinlock;
+
+pub use spinlock::SpinLock;
 
 use crate::arch::x86_64::BootInfo;
 

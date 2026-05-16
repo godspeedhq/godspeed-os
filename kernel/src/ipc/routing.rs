@@ -8,31 +8,11 @@
 //! This is the "single global RwLock" approach approved for v1. The lock is
 //! never held across a `block_and_reschedule` call.
 
-use core::sync::atomic::{AtomicBool, Ordering};
-
 use crate::capability::generation::Generation;
 use crate::ipc::endpoint::EndpointId;
 use crate::ipc::message::{IpcError, Message};
 use crate::ipc::queue::MessageQueue;
-
-// ---------------------------------------------------------------------------
-// Spinlock — protects TABLE against concurrent access from multiple cores.
-// ---------------------------------------------------------------------------
-
-static ROUTE_LOCKED: AtomicBool = AtomicBool::new(false);
-
-fn lock() {
-    while ROUTE_LOCKED
-        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        core::hint::spin_loop();
-    }
-}
-
-fn unlock() {
-    ROUTE_LOCKED.store(false, Ordering::Release);
-}
+use crate::smp::SpinLock;
 
 // ---------------------------------------------------------------------------
 // Entry layout.
@@ -82,10 +62,9 @@ impl RoutingEntry {
     }
 }
 
-// SAFETY: TABLE is protected by ROUTE_LOCKED spinlock for all multi-core access.
-static mut TABLE: [RoutingEntry; MAX_ENDPOINTS] = {
+static TABLE: SpinLock<[RoutingEntry; MAX_ENDPOINTS]> = {
     const E: RoutingEntry = RoutingEntry::empty();
-    [E; MAX_ENDPOINTS]
+    SpinLock::new([E; MAX_ENDPOINTS])
 };
 
 // ---------------------------------------------------------------------------
@@ -101,26 +80,21 @@ pub fn init() {
 /// Dead entries are recycled, so kill + respawn of a service does not exhaust
 /// the table.
 pub fn register(id: EndpointId, core_id: u32, generation: Generation) {
-    lock();
-    // SAFETY: lock held; single-writer.
-    unsafe {
-        for entry in TABLE.iter_mut() {
-            if !entry.valid || entry.liveness == EndpointLiveness::Dead {
-                entry.valid            = true;
-                entry.id               = id;
-                entry.core_id          = core_id;
-                entry.generation       = generation;
-                entry.liveness         = EndpointLiveness::Alive;
-                entry.queue.reset();
-                entry.blocked_receiver = None;
-                entry.blocked_sender   = None;
-                entry.pending_send     = None;
-                unlock();
-                return;
-            }
+    let mut table = TABLE.lock();
+    for entry in table.iter_mut() {
+        if !entry.valid || entry.liveness == EndpointLiveness::Dead {
+            entry.valid            = true;
+            entry.id               = id;
+            entry.core_id          = core_id;
+            entry.generation       = generation;
+            entry.liveness         = EndpointLiveness::Alive;
+            entry.queue.reset();
+            entry.blocked_receiver = None;
+            entry.blocked_sender   = None;
+            entry.pending_send     = None;
+            return;
         }
     }
-    unlock();
     panic!("routing: endpoint table full (MAX_ENDPOINTS={})", MAX_ENDPOINTS);
 }
 
@@ -128,15 +102,10 @@ pub fn register(id: EndpointId, core_id: u32, generation: Generation) {
 ///
 /// Used by InspectKernel query 1 (P5 property test — §8.3).
 pub fn count_live_endpoints() -> u32 {
-    lock();
-    // SAFETY: lock held; read-only scan.
-    let count = unsafe {
-        TABLE.iter()
-            .filter(|e| e.valid && e.liveness == EndpointLiveness::Alive)
-            .count() as u32
-    };
-    unlock();
-    count
+    let table = TABLE.lock();
+    table.iter()
+        .filter(|e| e.valid && e.liveness == EndpointLiveness::Alive)
+        .count() as u32
 }
 
 /// Return the current generation of `id` in the routing table, or INITIAL if not found.
@@ -144,13 +113,11 @@ pub fn count_live_endpoints() -> u32 {
 /// Used by `spawn_service_with_config` to seed the new endpoint's generation from the
 /// killed endpoint's bumped generation, ensuring monotonicity across kill/respawn (P2, §7.5).
 pub fn get_generation(id: EndpointId) -> Generation {
-    lock();
-    // SAFETY: lock held; read-only.
-    let gen = unsafe {
-        TABLE.iter().find(|e| e.valid && e.id == id).map(|e| e.generation)
-    };
-    unlock();
-    gen.unwrap_or(Generation::INITIAL)
+    let table = TABLE.lock();
+    table.iter()
+        .find(|e| e.valid && e.id == id)
+        .map(|e| e.generation)
+        .unwrap_or(Generation::INITIAL)
 }
 
 /// Try to enqueue `msg` on `endpoint`.
@@ -172,38 +139,35 @@ pub fn enqueue(
     cap_gen: Generation,
     blocked_sender_slot: Option<usize>,
 ) -> Result<Option<usize>, IpcError> {
-    lock();
-    // SAFETY: ROUTE_LOCKED held; exclusive mutable access to TABLE guaranteed.
-    let result = unsafe { enqueue_locked(endpoint, msg, cap_gen, blocked_sender_slot) };
-    unlock();
-    result
+    let mut table = TABLE.lock();
+    enqueue_locked(&mut *table, endpoint, msg, cap_gen, blocked_sender_slot)
 }
 
-// SAFETY: caller must hold ROUTE_LOCKED; TABLE is exclusively accessible under the lock.
-unsafe fn enqueue_locked(
+fn enqueue_locked(
+    table: &mut [RoutingEntry; MAX_ENDPOINTS],
     endpoint: EndpointId,
     msg: Message,
     cap_gen: Generation,
     blocked_sender_slot: Option<usize>,
 ) -> Result<Option<usize>, IpcError> {
-    let idx = find_index(endpoint).ok_or(IpcError::EndpointDead)?;
-    check_live(&TABLE[idx], cap_gen)?;
+    let idx = find_index(table, endpoint).ok_or(IpcError::EndpointDead)?;
+    check_live(&table[idx], cap_gen)?;
 
-    if let Some(slot) = TABLE[idx].blocked_receiver.take() {
+    if let Some(slot) = table[idx].blocked_receiver.take() {
         // Queue was empty; a receiver was waiting — deliver directly.
-        TABLE[idx].queue.enqueue(msg).ok();
+        table[idx].queue.enqueue(msg).ok();
         return Ok(Some(slot));
     }
 
-    match TABLE[idx].queue.enqueue(msg) {
+    match table[idx].queue.enqueue(msg) {
         Ok(()) => Ok(None),
         Err(_) => {
             // Queue full.
             if let Some(slot) = blocked_sender_slot {
                 // Atomically record the sender as blocked under the same lock,
                 // preventing a concurrent dequeue from missing the wakeup.
-                TABLE[idx].blocked_sender = Some(slot);
-                TABLE[idx].pending_send   = Some(msg);
+                table[idx].blocked_sender = Some(slot);
+                table[idx].pending_send   = Some(msg);
             }
             Err(IpcError::QueueFull)
         }
@@ -228,38 +192,35 @@ pub fn dequeue(
     cap_gen: Generation,
     blocked_receiver_slot: Option<usize>,
 ) -> Result<(Message, Option<usize>), IpcError> {
-    lock();
-    // SAFETY: ROUTE_LOCKED held; exclusive mutable access to TABLE guaranteed.
-    let result = unsafe { dequeue_locked(endpoint, cap_gen, blocked_receiver_slot) };
-    unlock();
-    result
+    let mut table = TABLE.lock();
+    dequeue_locked(&mut *table, endpoint, cap_gen, blocked_receiver_slot)
 }
 
-// SAFETY: caller must hold ROUTE_LOCKED; TABLE is exclusively accessible under the lock.
-unsafe fn dequeue_locked(
+fn dequeue_locked(
+    table: &mut [RoutingEntry; MAX_ENDPOINTS],
     endpoint: EndpointId,
     cap_gen: Generation,
     blocked_receiver_slot: Option<usize>,
 ) -> Result<(Message, Option<usize>), IpcError> {
-    let idx = find_index(endpoint).ok_or(IpcError::EndpointDead)?;
-    check_live(&TABLE[idx], cap_gen)?;
+    let idx = find_index(table, endpoint).ok_or(IpcError::EndpointDead)?;
+    check_live(&table[idx], cap_gen)?;
 
-    let msg = match TABLE[idx].queue.dequeue() {
+    let msg = match table[idx].queue.dequeue() {
         Some(m) => m,
         None => {
             // Queue empty.
             if let Some(slot) = blocked_receiver_slot {
                 // Atomically record the receiver as blocked under the same lock.
-                TABLE[idx].blocked_receiver = Some(slot);
+                table[idx].blocked_receiver = Some(slot);
             }
             return Err(IpcError::QueueEmpty);
         }
     };
 
     // If a sender was blocked, move its pending message into the freed slot.
-    let sender_slot = if let Some(slot) = TABLE[idx].blocked_sender.take() {
-        if let Some(pending) = TABLE[idx].pending_send.take() {
-            TABLE[idx].queue.enqueue(pending).ok();
+    let sender_slot = if let Some(slot) = table[idx].blocked_sender.take() {
+        if let Some(pending) = table[idx].pending_send.take() {
+            table[idx].queue.enqueue(pending).ok();
         }
         Some(slot)
     } else {
@@ -274,23 +235,18 @@ unsafe fn dequeue_locked(
 /// Returns `(blocked_receiver_slot, blocked_sender_slot)` — the caller must
 /// wake both (if `Some`) with `EndpointDead` via `scheduler::wake_by_slot`.
 pub fn kill_endpoint(endpoint: EndpointId) -> (Option<usize>, Option<usize>) {
-    lock();
-    // SAFETY: ROUTE_LOCKED held; TABLE is exclusively accessible.
-    let result = unsafe {
-        let idx = match find_index(endpoint) {
-            Some(i) => i,
-            None    => { unlock(); return (None, None); }
-        };
-        TABLE[idx].liveness   = EndpointLiveness::Dead;
-        TABLE[idx].generation = TABLE[idx].generation.bump();
-        TABLE[idx].queue.drain();
-        let rx = TABLE[idx].blocked_receiver.take();
-        let tx = TABLE[idx].blocked_sender.take();
-        TABLE[idx].pending_send = None;
-        (rx, tx)
+    let mut table = TABLE.lock();
+    let idx = match find_index(&*table, endpoint) {
+        Some(i) => i,
+        None    => return (None, None),
     };
-    unlock();
-    result
+    table[idx].liveness   = EndpointLiveness::Dead;
+    table[idx].generation = table[idx].generation.bump();
+    table[idx].queue.drain();
+    let rx = table[idx].blocked_receiver.take();
+    let tx = table[idx].blocked_sender.take();
+    table[idx].pending_send = None;
+    (rx, tx)
 }
 
 // ---------------------------------------------------------------------------
@@ -298,11 +254,8 @@ pub fn kill_endpoint(endpoint: EndpointId) -> (Option<usize>, Option<usize>) {
 // ---------------------------------------------------------------------------
 
 /// Linear scan to find the index of a valid entry with the given id.
-/// Caller must hold `ROUTE_LOCKED`.
-// SAFETY: caller must hold ROUTE_LOCKED; TABLE access is exclusive under the lock.
-unsafe fn find_index(id: EndpointId) -> Option<usize> {
-    // SAFETY: TABLE is a static array; ROUTE_LOCKED is held; no concurrent mutation.
-    for (i, entry) in unsafe { TABLE.iter().enumerate() } {
+fn find_index(table: &[RoutingEntry; MAX_ENDPOINTS], id: EndpointId) -> Option<usize> {
+    for (i, entry) in table.iter().enumerate() {
         if entry.valid && entry.id == id {
             return Some(i);
         }
