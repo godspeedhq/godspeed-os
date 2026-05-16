@@ -10,13 +10,30 @@
 // else that touches hardware.
 #![cfg_attr(not(test), no_std)]
 
+// capability/table.rs emits diagnostic messages via crate::kprintln!.
+// The binary target defines the real kprintln! in log.rs; the lib (host)
+// target provides this no-op stub so table.rs compiles without hardware.
+#[cfg(test)]
+#[macro_export]
+macro_rules! kprintln {
+    ($($args:tt)*) => { let _ = format_args!($($args)*); };
+}
+
 pub mod capability {
     pub mod cap;
     pub mod generation;
     pub mod rights;
+    pub mod table;
 }
 
 pub mod ipc {
     pub mod message;
     pub mod queue;
+}
+
+// Bitmap allocator model — compiled only in test mode.
+// memory/bitmap.rs has no hardware dependencies and uses std (Vec, HashSet).
+#[cfg(test)]
+mod memory {
+    pub mod bitmap;
 }

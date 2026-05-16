@@ -238,3 +238,132 @@ pub fn revoke_resource(id: ResourceId) {
 pub fn bump_resource_generation(id: ResourceId) {
     mark_dead_resource(id)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{CapTable, GlobalResourceTable, Liveness, MAX_CAPS_PER_TASK, DIRECT_CAP};
+    use crate::capability::cap::{Capability, ResourceId, CapError};
+    use crate::capability::generation::Generation;
+    use crate::capability::rights::Rights;
+    use proptest::prelude::*;
+
+    fn make_cap(id: u64, rights_bits: u8, gen: u32) -> Capability {
+        Capability {
+            resource_id: ResourceId(id),
+            rights: Rights(rights_bits & 0b0011_1111),
+            generation: Generation(gen),
+        }
+    }
+
+    // --- GlobalResourceTable properties (§7.5, §22 P2, P8) -----------------
+    // Each test creates a fresh LOCAL instance; no global state is touched.
+    // Box avoids placing the ~73 KiB struct on the test stack.
+
+    proptest! {
+        /// After register(id), get_record(id) is Some with generation 0 and Alive.
+        #[test]
+        fn registered_resource_is_findable_at_gen_zero(
+            id in 0u64..(DIRECT_CAP as u64),
+        ) {
+            let mut t = Box::new(GlobalResourceTable::new());
+            t.register(ResourceId(id));
+            let rec = t.get_record(ResourceId(id));
+            prop_assert!(rec.is_some());
+            prop_assert_eq!(rec.unwrap().generation.0, 0);
+            prop_assert_eq!(rec.unwrap().liveness, Liveness::Alive);
+        }
+
+        /// Before register, get_record returns None.
+        #[test]
+        fn unregistered_resource_not_found(
+            id in 0u64..(DIRECT_CAP as u64),
+        ) {
+            let t = Box::new(GlobalResourceTable::new());
+            prop_assert!(t.get_record(ResourceId(id)).is_none());
+        }
+
+        /// bump_generation is strictly monotonic per resource (§7.5 P2).
+        #[test]
+        fn bump_generation_is_strictly_monotonic(
+            id    in 0u64..(DIRECT_CAP as u64),
+            bumps in 1usize..=8,
+        ) {
+            let mut t = Box::new(GlobalResourceTable::new());
+            t.register(ResourceId(id));
+            let mut prev = t.get_record(ResourceId(id)).unwrap().generation;
+            for _ in 0..bumps {
+                t.bump_generation(ResourceId(id), Liveness::Dead);
+                let next = t.get_record(ResourceId(id)).unwrap().generation;
+                prop_assert!(next.0 > prev.0, "gen did not increase: {} -> {}", prev.0, next.0);
+                prev = next;
+            }
+        }
+
+        /// After bump_generation with Dead liveness, get_record returns Dead.
+        #[test]
+        fn bump_to_dead_sets_liveness_dead(id in 0u64..(DIRECT_CAP as u64)) {
+            let mut t = Box::new(GlobalResourceTable::new());
+            t.register(ResourceId(id));
+            t.bump_generation(ResourceId(id), Liveness::Dead);
+            prop_assert_eq!(t.get_record(ResourceId(id)).unwrap().liveness, Liveness::Dead);
+        }
+
+        /// After bump_generation with Revoked liveness, get_record returns Revoked.
+        #[test]
+        fn bump_to_revoked_sets_liveness_revoked(id in 0u64..(DIRECT_CAP as u64)) {
+            let mut t = Box::new(GlobalResourceTable::new());
+            t.register(ResourceId(id));
+            t.bump_generation(ResourceId(id), Liveness::Revoked);
+            prop_assert_eq!(t.get_record(ResourceId(id)).unwrap().liveness, Liveness::Revoked);
+        }
+    }
+
+    // --- CapTable properties ------------------------------------------------
+    // insert/remove do not touch GLOBAL_RESOURCES — entirely local state.
+
+    proptest! {
+        /// Inserting n caps (n ≤ MAX_CAPS_PER_TASK) always succeeds.
+        #[test]
+        fn cap_table_insert_within_capacity(n in 0usize..=MAX_CAPS_PER_TASK) {
+            let mut ct = CapTable::empty();
+            for i in 0..n {
+                prop_assert!(ct.insert(make_cap(i as u64, 0b0000_0100, 0)).is_ok());
+            }
+        }
+
+        /// After inserting MAX_CAPS_PER_TASK caps the table is full; next insert fails.
+        #[test]
+        fn cap_table_full_rejects_next_insert(_seed in any::<u8>()) {
+            let mut ct = CapTable::empty();
+            for i in 0..MAX_CAPS_PER_TASK {
+                ct.insert(make_cap(i as u64, 0b0000_0100, 0)).unwrap();
+            }
+            prop_assert!(ct.insert(make_cap(9999, 0b0000_0100, 0)).is_err());
+        }
+
+        /// Every inserted cap can be removed exactly once; second remove returns None.
+        #[test]
+        fn remove_is_idempotent_after_first_call(n in 1usize..=MAX_CAPS_PER_TASK) {
+            let mut ct = CapTable::empty();
+            let mut slots = Vec::new();
+            for i in 0..n {
+                let slot = ct.insert(make_cap(i as u64, 0b0000_0100, 0)).unwrap();
+                slots.push(slot);
+            }
+            for &slot in &slots {
+                prop_assert!(ct.remove(slot).is_some(), "first remove returned None");
+                prop_assert!(ct.remove(slot).is_none(), "second remove should be None");
+            }
+        }
+
+        /// Slots returned by insert are always < MAX_CAPS_PER_TASK.
+        #[test]
+        fn inserted_slot_is_within_bounds(n in 1usize..=MAX_CAPS_PER_TASK) {
+            let mut ct = CapTable::empty();
+            for i in 0..n {
+                let slot = ct.insert(make_cap(i as u64, 0b0000_0100, 0)).unwrap();
+                prop_assert!(slot < MAX_CAPS_PER_TASK);
+            }
+        }
+    }
+}
