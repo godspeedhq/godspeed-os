@@ -28,3 +28,6 @@ jobs:
 
       - name: Validate service contracts
         run: cargo run -p osdev -- validate
+
+      - name: Unit tests (kernel pure-logic)
+        run: cargo test -p kernel

@@ -6,10 +6,15 @@ fn main() {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let workspace = std::path::Path::new(&manifest).parent().unwrap();
 
-    // Apply the kernel linker script only to the kernel crate.
+    // Apply the kernel linker script only when building the bare-metal binary.
+    // Host builds (cargo test, cargo llvm-cov) use the default linker and do
+    // not understand the GNU -T flag.
+    let target = std::env::var("TARGET").unwrap_or_default();
     let kernel_ld = workspace.join("kernel").join("kernel.ld");
-    println!("cargo:rustc-link-arg=-T{}", kernel_ld.display());
     println!("cargo:rerun-if-changed={}", kernel_ld.display());
+    if target == "x86_64-unknown-none" {
+        println!("cargo:rustc-link-arg=-T{}", kernel_ld.display());
+    }
     let profile   = std::env::var("PROFILE").unwrap(); // "debug" or "release"
 
     let target_dir = workspace

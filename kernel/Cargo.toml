@@ -6,6 +6,13 @@ edition = "2021"
 [[bin]]
 name = "kernel"
 path = "src/main.rs"
+# Do not attempt to compile the no_std binary for cargo test — only the lib
+# target (pure-logic modules, host-compiled) is unit-testable.
+test = false
+
+[lib]
+name = "kernel"
+path = "src/lib.rs"
 
 [dependencies]
 bitflags = { version = "2", default-features = false }

@@ -36,3 +36,77 @@ impl core::ops::BitOr for Rights {
     type Output = Self;
     fn bitor(self, rhs: Self) -> Self { Rights(self.0 | rhs.0) }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contains_single_right() {
+        let r = Rights::SEND;
+        assert!(r.contains(Rights::SEND));
+        assert!(!r.contains(Rights::RECV));
+    }
+
+    #[test]
+    fn contains_subset() {
+        let r = Rights::READ | Rights::WRITE | Rights::SEND;
+        assert!(r.contains(Rights::READ));
+        assert!(r.contains(Rights::WRITE));
+        assert!(r.contains(Rights::SEND));
+        assert!(!r.contains(Rights::GRANT));
+    }
+
+    #[test]
+    fn contains_all_is_superset_of_everything() {
+        let all = Rights::all();
+        for bit in [Rights::READ, Rights::WRITE, Rights::SEND,
+                    Rights::RECV, Rights::GRANT, Rights::REVOKE] {
+            assert!(all.contains(bit));
+        }
+    }
+
+    #[test]
+    fn narrow_never_widens() {
+        let r = Rights::READ | Rights::WRITE;
+        let narrowed = r.narrow(Rights::READ);
+        assert!(narrowed.contains(Rights::READ));
+        assert!(!narrowed.contains(Rights::WRITE));
+    }
+
+    #[test]
+    fn narrow_to_empty_yields_empty() {
+        assert!(!(Rights::all().narrow(Rights::empty()).contains(Rights::READ)));
+    }
+
+    #[test]
+    fn narrow_is_idempotent() {
+        let r = Rights::READ | Rights::SEND;
+        assert_eq!(r.narrow(r).0, r.0);
+    }
+
+    #[test]
+    fn union_is_superset() {
+        let a = Rights::READ;
+        let b = Rights::WRITE;
+        let u = a.union(b);
+        assert!(u.contains(Rights::READ));
+        assert!(u.contains(Rights::WRITE));
+    }
+
+    #[test]
+    fn bitor_operator_matches_union() {
+        let a = Rights::SEND;
+        let b = Rights::RECV;
+        assert_eq!((a | b).0, a.union(b).0);
+    }
+
+    #[test]
+    fn empty_contains_nothing() {
+        let e = Rights::empty();
+        for bit in [Rights::READ, Rights::WRITE, Rights::SEND,
+                    Rights::RECV, Rights::GRANT, Rights::REVOKE] {
+            assert!(!e.contains(bit));
+        }
+    }
+}

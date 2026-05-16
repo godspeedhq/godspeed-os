@@ -53,6 +53,71 @@ impl Capability {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_cap(rights: Rights, gen: u32) -> Capability {
+        Capability {
+            resource_id: ResourceId(1),
+            rights,
+            generation: Generation(gen),
+        }
+    }
+
+    #[test]
+    fn validate_ok_with_matching_gen_and_right() {
+        let cap = make_cap(Rights::SEND, 3);
+        assert!(cap.validate(Rights::SEND, Generation(3)).is_ok());
+    }
+
+    #[test]
+    fn validate_fails_on_generation_mismatch() {
+        let cap = make_cap(Rights::SEND, 1);
+        let err = cap.validate(Rights::SEND, Generation(2)).unwrap_err();
+        assert_eq!(err, CapError::GenerationMismatch);
+    }
+
+    #[test]
+    fn validate_fails_on_insufficient_rights() {
+        let cap = make_cap(Rights::READ, 0);
+        let err = cap.validate(Rights::WRITE, Generation(0)).unwrap_err();
+        assert_eq!(err, CapError::CapInsufficientRights);
+    }
+
+    #[test]
+    fn validate_checks_gen_before_rights() {
+        // If both gen mismatch and wrong right, gen mismatch is returned first.
+        let cap = make_cap(Rights::READ, 1);
+        let err = cap.validate(Rights::WRITE, Generation(99)).unwrap_err();
+        assert_eq!(err, CapError::GenerationMismatch);
+    }
+
+    #[test]
+    fn narrow_for_grant_reduces_rights() {
+        let cap = make_cap(Rights::READ | Rights::WRITE | Rights::GRANT, 0);
+        let narrowed = cap.narrow_for_grant(Rights::READ);
+        assert!(narrowed.rights.contains(Rights::READ));
+        assert!(!narrowed.rights.contains(Rights::WRITE));
+        assert!(!narrowed.rights.contains(Rights::GRANT));
+    }
+
+    #[test]
+    fn narrow_for_grant_preserves_resource_and_gen() {
+        let cap = make_cap(Rights::READ | Rights::WRITE, 7);
+        let narrowed = cap.narrow_for_grant(Rights::READ);
+        assert_eq!(narrowed.resource_id, cap.resource_id);
+        assert_eq!(narrowed.generation, cap.generation);
+    }
+
+    #[test]
+    fn validate_subset_right_passes() {
+        // Cap has READ|WRITE; validate requires only READ — should pass.
+        let cap = make_cap(Rights::READ | Rights::WRITE, 0);
+        assert!(cap.validate(Rights::READ, Generation(0)).is_ok());
+    }
+}
+
 /// Errors returned by capability validation (§7.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapError {

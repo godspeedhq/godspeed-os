@@ -1,0 +1,35 @@
+name: coverage
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  coverage:
+    name: Code coverage (kernel pure-logic)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+
+      - name: Generate coverage report
+        run: |
+          cargo llvm-cov --package kernel \
+            --lcov --output-path build/coverage.lcov
+          cargo llvm-cov --package kernel \
+            --html --output-dir build/coverage-html
+
+      - name: Upload HTML report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: build/coverage-html/
+
+      - name: Print coverage summary
+        run: cargo llvm-cov --package kernel --summary-only
