@@ -51,6 +51,7 @@ impl TestBitmapAllocator {
     pub fn is_all_free(&self)  -> bool { self.live_count == 0 }
 
     /// Snapshot the set of currently-live (allocated) frame indices.
+    #[allow(dead_code)]
     pub fn live_frames(&self) -> HashSet<usize> {
         (0..self.max_frames).filter(|&i| !self.free[i]).collect()
     }

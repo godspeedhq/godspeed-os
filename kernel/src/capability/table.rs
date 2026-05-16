@@ -242,7 +242,7 @@ pub fn bump_resource_generation(id: ResourceId) {
 #[cfg(test)]
 mod tests {
     use super::{CapTable, GlobalResourceTable, Liveness, MAX_CAPS_PER_TASK, DIRECT_CAP};
-    use crate::capability::cap::{Capability, ResourceId, CapError};
+    use crate::capability::cap::{Capability, ResourceId};
     use crate::capability::generation::Generation;
     use crate::capability::rights::Rights;
     use proptest::prelude::*;
