@@ -65,6 +65,10 @@ jobs:
           cargo audit
 
       - name: Miri — kernel pure-logic
+        env:
+          # proptest's FileFailurePersistence calls getcwd; disable Miri's
+          # filesystem isolation so it can resolve the path without aborting.
+          MIRIFLAGS: -Zmiri-disable-isolation
         run: cargo miri test -p kernel --lib
 
       - name: Unsafe surface report (cargo-geiger)
