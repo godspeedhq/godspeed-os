@@ -62,13 +62,13 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | loader.rs | 4 | grandfathered |
 | main.rs | 2 | grandfathered |
 | syscall/dispatch.rs | 2 | grandfathered |
-| task/mod.rs | 12 | grandfathered |
+| task/mod.rs | 7 | grandfathered |
 | task/scheduler.rs | 36 | grandfathered |
 <!-- unsafe-inventory-end -->
 
 **Permitted total:** 215 lines across 17 files  
-**Grandfathered total:** 57 lines across 6 files  
-**Grand total:** 272 lines across 23 files
+**Grandfathered total:** 52 lines across 6 files  
+**Grand total:** 267 lines across 23 files
 
 ---
 
@@ -310,11 +310,17 @@ encapsulate the unsafe in the permitted arch layer.
 
 ### task/mod.rs *(grandfathered)*
 
-Kernel stack allocator: `kstack_marker` reads/writes the first word of a stack
-slot to track liveness; `alloc_kstack` / `free_kstack` manage the pool;
-`spawn_task` calls into `scheduler.rs`. Sound because stack slot indices are
-bounded by `TASK_KSTACK_MAX`; the magic-word liveness check prevents
-double-alloc. `// SAFETY:` comments present in source for most blocks.
+Seven unsafe blocks: two in the kstack pool (`as_mut_ptr().add(...)` in
+`alloc_kstack` and `as_ptr() as u64` in `free_kstack` — necessary HHDM pointer
+arithmetic to locate the per-slot buffer); five in the spawn path
+(`write_bytes` for stack zeroing, `task_cap_init_empty`, `write_bytes` +
+`*mut ServiceContextData` cast for ctx page, `TaskContext::new_user`, and
+`commit_task`). All are bounded by prior bounds checks or scheduler-layer
+invariants. `// SAFETY:` comments present in source for all blocks.
+
+The previous magic-word liveness scheme (`KSTACK_MAGIC_USED` volatile
+reads/writes at slot offset 0) was replaced by `SpinLock<[bool; TASK_KSTACK_MAX]>`,
+removing 5 unsafe lines.
 
 ---
 

@@ -31,11 +31,11 @@ not in the audit fail CI unconditionally.
 
 | Metric | Initial | After reduction |
 |---|---|---|
-| Non-comment lines with `unsafe` keyword | 319 | 272 |
+| Non-comment lines with `unsafe` keyword | 319 | 267 |
 | Total files with `unsafe` | 26 | 23 |
 | Lines in permitted layers (§18.1) | 206 | 215 |
 | — Files in permitted layers | 16 | 17 |
-| Lines outside permitted layers (grandfathered) | 113 | 57 |
+| Lines outside permitted layers (grandfathered) | 113 | 52 |
 | — Files outside permitted layers | 10 | 6 |
 
 See [Grandfathered reduction](#grandfathered-reduction) below for the full
@@ -64,12 +64,12 @@ account of what changed and why.
 | smp/spinlock.rs | 4 |
 | **Total** | **215** |
 
-### Grandfathered (current, 57 keyword lines)
+### Grandfathered (current, 52 keyword lines)
 
 | File | Count | Why it remains |
 |---|---|---|
 | task/scheduler.rs | 36 | Per-core arrays, ring3 context switch |
-| task/mod.rs | 12 | Kernel stack allocator magic-word tracking |
+| task/mod.rs | 7 | kstack pointer arithmetic + spawn path arch calls |
 | loader.rs | 4 | Segment copy (`write_bytes` + `copy_nonoverlapping`) |
 | syscall/dispatch.rs | 2 | `syscall_handler` entry point + `map_in_active_tables` |
 | main.rs | 2 | BSP stack switch + boot_info deref |
@@ -196,12 +196,33 @@ is now unsafe-free.
 Net: −12 grandfathered lines (loader 16 → 4, main 3 → 2) and −1 permitted line
 (mod.rs 22 → 21 after `unsafe fn com2_init` became `fn com2_init`).
 
+### Group 5 — kstack magic-word tracking → `SpinLock<[bool; TASK_KSTACK_MAX]>`
+
+`task/mod.rs` previously tracked liveness by writing a magic constant
+(`0xCA11_CA11`) to the first 4 bytes of each 64 KiB stack slot via
+`read_volatile` / `write_volatile`, plus a manual `AtomicBool` spinlock.
+This was replaced by:
+
+```rust
+static KSTACK_USED: SpinLock<[bool; TASK_KSTACK_MAX]> =
+    SpinLock::new([false; TASK_KSTACK_MAX]);
+```
+
+The `kstack_marker()` helper (`unsafe fn`), three volatile reads/writes, and
+the manual `kstack_lock` / `kstack_unlock` functions were all removed.  The
+two remaining unsafe lines in the kstack functions are unavoidable pointer
+arithmetic: one `as_mut_ptr().add(...)` to locate the top of an allocated slot,
+and one `as_ptr() as u64` to compute the base address needed by `free_kstack`
+to reverse the slot index from a stack-top pointer.
+
+Net: −5 grandfathered lines (task/mod.rs 12 → 7).
+
 ### What remains and why
 
 | File | Count | Reason not reducible |
 |---|---|---|
 | `task/scheduler.rs` | 36 | Per-core `static mut` arrays indexed by slot/core_id; large refactor needed to replace with `SpinLock` or per-core ownership type |
-| `task/mod.rs` | 12 | Kernel stack allocator: magic-word reads/writes; tight coupling to stack layout |
+| `task/mod.rs` | 7 | 2 kstack pointer-arithmetic lines; 5 spawn-path arch calls (`write_bytes`, `task_cap_init_empty`, ctx-page cast, `TaskContext::new_user`, `commit_task`) |
 | `loader.rs` | 4 | `write_bytes` (BSS zeroing) + `copy_nonoverlapping` (segment copy) — inherently unsafe HHDM pointer arithmetic |
 | `syscall/dispatch.rs` | 2 | `syscall_handler` (ring-3 entry point, must be `unsafe extern "C"`) + one `map_in_active_tables` call |
 | `main.rs` | 2 | BSP stack switch ASM (unavoidable), `boot_info_ptr` deref (Limine contract) |
@@ -241,7 +262,7 @@ both steps 1–4 AND a CLAUDE.md §18 amendment with a written rationale.
 ## Implementation checklist
 
 - ✅ `scripts/unsafe_check.py` — count-based audit script
-- ✅ `docs/unsafe-audit.md` — full inventory (23 files, 272 lines), SAFETY
+- ✅ `docs/unsafe-audit.md` — full inventory (23 files, 267 lines), SAFETY
   arguments for every file, grandfathered list with rationale
 - ✅ `.github/workflows/build.yml` — `Unsafe audit check` step added before
   unit tests; runs on every push and PR
@@ -249,6 +270,7 @@ both steps 1–4 AND a CLAUDE.md §18 amendment with a written rationale.
 - ✅ `smp/spinlock.rs` — `SpinLock<T>` eliminates `static mut` in 5 files
 - ✅ `arch/x86_64/interrupts.rs` — `disable_interrupts()` / `wait_for_interrupt()` wrappers
 - ✅ `arch/x86_64/syscall_entry.rs` — `read_user_bytes()` / `write_user_bytes()` / `read_cycle_counter()` wrappers
-- ✅ Grandfathered reduced: 113 → 57 lines, 10 → 6 files
+- ✅ Grandfathered reduced: 113 → 52 lines, 10 → 6 files
 - ✅ `loader.rs` — `read_ehdr`/`read_phdr` helpers consolidate 14 scattered `read_unaligned` calls into 2 (16 → 4 lines)
 - ✅ `main.rs` — `com2_init` made safe; one unsafe call site removed (3 → 2 lines)
+- ✅ `task/mod.rs` — kstack magic-word volatile tracking replaced by `SpinLock<[bool; TASK_KSTACK_MAX]>` (12 → 7 lines)

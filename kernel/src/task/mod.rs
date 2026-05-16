@@ -6,7 +6,7 @@ pub mod task;
 
 pub use task::{Task, TaskId};
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use crate::smp::SpinLock;
 
 use crate::arch::x86_64::context_switch::TaskContext;
 use crate::arch::x86_64::page_tables::{
@@ -26,14 +26,6 @@ use crate::memory::frame::PhysAddr;
 const TASK_KSTACK_MAX: usize = 224; // raised from 208 to accommodate Milestone 20 brutal adversarial probes
 const KSTACK_SIZE:     usize = 64 * 1024;
 
-// Magic value written at the BOTTOM of each kstack slot (byte offset 0 within
-// the slot) when it is in use.  Stacks grow downward from the slot's top, so
-// the bottom bytes are never touched by normal execution.
-//
-// This replaces a separate KSTACK_USED: [bool; 32] array, which was colliding
-// with another BSS static and becoming corrupted at runtime.
-const KSTACK_MAGIC_USED: u32 = 0xCA11_CA11;
-
 #[repr(C, align(16))]
 struct KernelStackStorage {
     data: [u8; KSTACK_SIZE * TASK_KSTACK_MAX],
@@ -42,52 +34,23 @@ struct KernelStackStorage {
 static mut KSTACK_STORAGE: KernelStackStorage =
     KernelStackStorage { data: [0u8; KSTACK_SIZE * TASK_KSTACK_MAX] };
 
-/// Read the in-use marker stored at the bottom of kstack slot `i`.
-#[inline]
-unsafe fn kstack_marker(i: usize) -> *mut u32 {
-    // SAFETY: i < TASK_KSTACK_MAX; first 4 bytes of each slot are the marker.
-    unsafe { KSTACK_STORAGE.data.as_mut_ptr().add(i * KSTACK_SIZE) as *mut u32 }
-}
-
-// SMP spinlock for the kstack pool — concurrent spawns on different cores
-// both call alloc_kstack; the read-modify-write on each slot marker must be atomic.
-static KSTACK_LOCKED: AtomicBool = AtomicBool::new(false);
-
-#[inline]
-fn kstack_lock() {
-    while KSTACK_LOCKED
-        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        core::hint::spin_loop();
-    }
-}
-
-#[inline]
-fn kstack_unlock() {
-    KSTACK_LOCKED.store(false, Ordering::Release);
-}
+// Boolean liveness flags for each kstack slot. Protected by SpinLock so
+// concurrent alloc/free on different cores are atomic without volatile tricks.
+static KSTACK_USED: SpinLock<[bool; TASK_KSTACK_MAX]> =
+    SpinLock::new([false; TASK_KSTACK_MAX]);
 
 fn alloc_kstack() -> Option<*mut u8> {
-    kstack_lock();
+    let mut used = KSTACK_USED.lock();
     for i in 0..TASK_KSTACK_MAX {
-        // SAFETY: lock held; marker pointer is within KSTACK_STORAGE.
-        if unsafe { kstack_marker(i).read_volatile() } != KSTACK_MAGIC_USED {
-            // SAFETY: lock held; exclusive access to this slot confirmed.
-            unsafe { kstack_marker(i).write_volatile(KSTACK_MAGIC_USED); }
-            // Return pointer to the TOP of this slot (stacks grow down).
-            // SAFETY: i < TASK_KSTACK_MAX; offset is within the array bounds.
+        if !used[i] {
+            used[i] = true;
+            // SAFETY: i < TASK_KSTACK_MAX; offset is within KSTACK_STORAGE bounds.
             let top = unsafe {
-                KSTACK_STORAGE
-                    .data
-                    .as_mut_ptr()
-                    .add(i * KSTACK_SIZE + KSTACK_SIZE)
+                KSTACK_STORAGE.data.as_mut_ptr().add(i * KSTACK_SIZE + KSTACK_SIZE)
             };
-            kstack_unlock();
             return Some(top);
         }
     }
-    kstack_unlock();
     crate::kprintln!("alloc_kstack: pool exhausted (all {} slots used)", TASK_KSTACK_MAX);
     None
 }
@@ -109,10 +72,7 @@ pub fn free_kstack(kstack_top: u64) {
     let idx_plus_one = offset / KSTACK_SIZE as u64;
     if idx_plus_one == 0 || idx_plus_one > TASK_KSTACK_MAX as u64 { return; }
     let idx = (idx_plus_one - 1) as usize;
-    kstack_lock();
-    // SAFETY: lock held; idx is within [0, TASK_KSTACK_MAX).
-    unsafe { kstack_marker(idx).write_volatile(0); }
-    kstack_unlock();
+    KSTACK_USED.lock()[idx] = false;
 }
 
 // ---------------------------------------------------------------------------
