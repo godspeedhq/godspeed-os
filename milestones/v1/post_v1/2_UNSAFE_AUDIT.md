@@ -22,12 +22,20 @@ not in the audit fail CI unconditionally.
 
 ## What was found
 
-At the time of this audit the kernel had **319 non-comment unsafe lines across
-26 files**. Of those, 113 lines across 10 files are **outside the four permitted
-layers** defined in §18.1 — a pre-existing policy violation from the rapid v1
-development phase.
+> **Note on counting:** The CI script counts *lines* containing the `unsafe`
+> keyword (excluding comment-only lines). This is not the same as counting
+> unsafe blocks. A single `unsafe { }` expression = 1 line. An `unsafe fn`
+> declaration = 1 line. A nested `unsafe { unsafe { } }` = 2 lines. The line
+> count is used because it is stable and grep-reproducible; the block count is
+> documented separately below.
 
-### Permitted layers (in-policy, 206 lines)
+At the time of this audit the kernel had **319 non-comment lines containing
+`unsafe` across 26 files**, corresponding to **291 distinct unsafe constructs**
+(216 `unsafe { }` blocks + 75 `unsafe fn` declarations). Of those, 113 keyword
+lines across 10 files are **outside the four permitted layers** defined in §18.1
+— a pre-existing policy violation from the rapid v1 development phase.
+
+### Permitted layers (in-policy, 206 keyword lines)
 
 | File | Count |
 |---|---|
@@ -48,7 +56,7 @@ development phase.
 | smp/mod.rs | 1 |
 | smp/placement.rs | 1 |
 
-### Grandfathered (outside policy, 113 lines — frozen)
+### Grandfathered (outside policy, 113 keyword lines — frozen)
 
 | File | Count | Why it exists |
 |---|---|---|
@@ -66,6 +74,18 @@ development phase.
 Grandfathered counts are frozen. They may decrease (cleanup welcome) but
 cannot increase. Any increase to a grandfathered file also requires a policy
 amendment to CLAUDE.md §18 before CI will accept it.
+
+### Totals at audit time
+
+| Metric | Count |
+|---|---|
+| `unsafe { }` blocks | 216 |
+| `unsafe fn` declarations | 75 |
+| **Total distinct unsafe constructs** | **291** |
+| Keyword lines counted by CI | 319 |
+| Files with unsafe | 26 |
+| — in permitted layers | 16 |
+| — grandfathered (outside policy) | 10 |
 
 ---
 
