@@ -31,17 +31,17 @@ not in the audit fail CI unconditionally.
 
 | Metric | Initial | After reduction |
 |---|---|---|
-| Non-comment lines with `unsafe` keyword | 319 | 286 |
+| Non-comment lines with `unsafe` keyword | 319 | 272 |
 | Total files with `unsafe` | 26 | 23 |
-| Lines in permitted layers (§18.1) | 206 | 216 |
+| Lines in permitted layers (§18.1) | 206 | 215 |
 | — Files in permitted layers | 16 | 17 |
-| Lines outside permitted layers (grandfathered) | 113 | 70 |
+| Lines outside permitted layers (grandfathered) | 113 | 57 |
 | — Files outside permitted layers | 10 | 6 |
 
 See [Grandfathered reduction](#grandfathered-reduction) below for the full
 account of what changed and why.
 
-### Permitted layers (current, 216 keyword lines)
+### Permitted layers (current, 215 keyword lines)
 
 | File | Count |
 |---|---|
@@ -49,7 +49,7 @@ account of what changed and why.
 | arch/x86_64/boot.rs | 60 |
 | arch/x86_64/context_switch.rs | 11 |
 | arch/x86_64/interrupts.rs | 8 |
-| arch/x86_64/mod.rs | 22 |
+| arch/x86_64/mod.rs | 21 |
 | arch/x86_64/page_tables.rs | 25 |
 | arch/x86_64/syscall_entry.rs | 16 |
 | capability/table.rs | 7 |
@@ -62,17 +62,17 @@ account of what changed and why.
 | smp/mod.rs | 1 |
 | smp/placement.rs | 1 |
 | smp/spinlock.rs | 4 |
-| **Total** | **216** |
+| **Total** | **215** |
 
-### Grandfathered (current, 70 keyword lines)
+### Grandfathered (current, 57 keyword lines)
 
 | File | Count | Why it remains |
 |---|---|---|
 | task/scheduler.rs | 36 | Per-core arrays, ring3 context switch |
-| loader.rs | 16 | ELF `read_unaligned` + segment mapping |
 | task/mod.rs | 12 | Kernel stack allocator magic-word tracking |
-| main.rs | 3 | BSP stack switch + boot_info deref + COM2 init |
+| loader.rs | 4 | Segment copy (`write_bytes` + `copy_nonoverlapping`) |
 | syscall/dispatch.rs | 2 | `syscall_handler` entry point + `map_in_active_tables` |
+| main.rs | 2 | BSP stack switch + boot_info deref |
 | interrupt/route.rs | 1 | `pub unsafe fn deliver` — IDT calling convention |
 
 Grandfathered counts are frozen. They may decrease (cleanup welcome) but
@@ -171,15 +171,40 @@ pub fn read_cycle_counter() -> u64
 
 Net: −24 grandfathered lines. Permitted layer gains +3 for the new wrappers.
 
+### Group 4 — ELF header/program-header reads → `read_ehdr` / `read_phdr` helpers
+
+`loader.rs` previously had 14 individual `addr_of!((*ptr).field).read_unaligned()`
+calls scattered through `load()` — one per accessed field.  These were
+consolidated into two private helpers:
+
+```rust
+fn read_ehdr(bytes: &[u8]) -> Elf64Ehdr { unsafe { (bytes.as_ptr() as *const Elf64Ehdr).read_unaligned() } }
+fn read_phdr(bytes: &[u8], off: usize) -> Elf64Phdr { unsafe { (bytes.as_ptr().add(off) as *const Elf64Phdr).read_unaligned() } }
+```
+
+Each helper copies the entire packed struct into a local value in one
+`read_unaligned` call.  All field accesses in `load()` then go through safe
+local copies — zero unsafe at the call site.  The two segment-copy blocks
+(`write_bytes` for BSS zeroing, `copy_nonoverlapping` for file data) remain
+because they are inherently unsafe arch calls with bounds that cannot be
+checked at compile time.
+
+`com2_init` in `arch/x86_64/mod.rs` was also made a safe function (inner
+`outb` calls stay unsafe in the permitted arch layer); the call in `main.rs`
+is now unsafe-free.
+
+Net: −12 grandfathered lines (loader 16 → 4, main 3 → 2) and −1 permitted line
+(mod.rs 22 → 21 after `unsafe fn com2_init` became `fn com2_init`).
+
 ### What remains and why
 
 | File | Count | Reason not reducible |
 |---|---|---|
 | `task/scheduler.rs` | 36 | Per-core `static mut` arrays indexed by slot/core_id; large refactor needed to replace with `SpinLock` or per-core ownership type |
-| `loader.rs` | 16 | ELF `read_unaligned` + `map_in_active_tables` + `copy_nonoverlapping`; arch calls that belong in arch wrappers but ELF parsing is not arch-specific |
 | `task/mod.rs` | 12 | Kernel stack allocator: magic-word reads/writes; tight coupling to stack layout |
-| `main.rs` | 3 | BSP stack switch ASM (unavoidable), `boot_info_ptr` deref (Limine contract), COM2 init call (already in arch) |
+| `loader.rs` | 4 | `write_bytes` (BSS zeroing) + `copy_nonoverlapping` (segment copy) — inherently unsafe HHDM pointer arithmetic |
 | `syscall/dispatch.rs` | 2 | `syscall_handler` (ring-3 entry point, must be `unsafe extern "C"`) + one `map_in_active_tables` call |
+| `main.rs` | 2 | BSP stack switch ASM (unavoidable), `boot_info_ptr` deref (Limine contract) |
 | `interrupt/route.rs` | 1 | `pub unsafe fn deliver` — called from IDT with IF=0; the `unsafe` communicates the calling-convention constraint |
 
 ---
@@ -216,7 +241,7 @@ both steps 1–4 AND a CLAUDE.md §18 amendment with a written rationale.
 ## Implementation checklist
 
 - ✅ `scripts/unsafe_check.py` — count-based audit script
-- ✅ `docs/unsafe-audit.md` — full inventory (23 files, 286 lines), SAFETY
+- ✅ `docs/unsafe-audit.md` — full inventory (23 files, 272 lines), SAFETY
   arguments for every file, grandfathered list with rationale
 - ✅ `.github/workflows/build.yml` — `Unsafe audit check` step added before
   unit tests; runs on every push and PR
@@ -224,4 +249,6 @@ both steps 1–4 AND a CLAUDE.md §18 amendment with a written rationale.
 - ✅ `smp/spinlock.rs` — `SpinLock<T>` eliminates `static mut` in 5 files
 - ✅ `arch/x86_64/interrupts.rs` — `disable_interrupts()` / `wait_for_interrupt()` wrappers
 - ✅ `arch/x86_64/syscall_entry.rs` — `read_user_bytes()` / `write_user_bytes()` / `read_cycle_counter()` wrappers
-- ✅ Grandfathered reduced: 113 → 70 lines, 10 → 6 files
+- ✅ Grandfathered reduced: 113 → 57 lines, 10 → 6 files
+- ✅ `loader.rs` — `read_ehdr`/`read_phdr` helpers consolidate 14 scattered `read_unaligned` calls into 2 (16 → 4 lines)
+- ✅ `main.rs` — `com2_init` made safe; one unsafe call site removed (3 → 2 lines)

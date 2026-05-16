@@ -45,7 +45,7 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | arch/x86_64/boot.rs | 60 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |
 | arch/x86_64/interrupts.rs | 8 | permitted |
-| arch/x86_64/mod.rs | 22 | permitted |
+| arch/x86_64/mod.rs | 21 | permitted |
 | arch/x86_64/page_tables.rs | 25 | permitted |
 | arch/x86_64/syscall_entry.rs | 16 | permitted |
 | capability/table.rs | 7 | permitted |
@@ -59,16 +59,16 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | smp/placement.rs | 1 | permitted |
 | smp/spinlock.rs | 4 | permitted |
 | interrupt/route.rs | 1 | grandfathered |
-| loader.rs | 16 | grandfathered |
-| main.rs | 3 | grandfathered |
+| loader.rs | 4 | grandfathered |
+| main.rs | 2 | grandfathered |
 | syscall/dispatch.rs | 2 | grandfathered |
 | task/mod.rs | 12 | grandfathered |
 | task/scheduler.rs | 36 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 216 lines across 17 files  
-**Grandfathered total:** 70 lines across 6 files  
-**Grand total:** 286 lines across 23 files
+**Permitted total:** 215 lines across 17 files  
+**Grandfathered total:** 57 lines across 6 files  
+**Grand total:** 272 lines across 23 files
 
 ---
 
@@ -270,24 +270,24 @@ calling convention (must only be called from the IDT with IF=0).
 
 ### loader.rs *(grandfathered)*
 
-ELF loader: reads ELF header and program header fields via `read_unaligned`
-(ELF structs have no alignment guarantee), then calls `map_in_active_tables`
-and `copy_nonoverlapping` to load segments. Sound because: unaligned reads are
-the correct way to access packed ELF structs; segment bounds are validated
-against the input slice before any copy; `map_in_active_tables` holds the frame
-lock for each mapping.
-*(Most SAFETY comments missing in source — needs back-fill.)*
+ELF loader: two private helpers (`read_ehdr`, `read_phdr`) each contain one
+`read_unaligned` call that copies the entire packed ELF struct into a local
+value; all field accesses in `load()` then go through safe local copies with no
+unsafe at the call site. The remaining two unsafe blocks are `write_bytes` (BSS
+zeroing) and `copy_nonoverlapping` (segment copy); both are bounded by bounds
+checks performed above them. `// SAFETY:` comments present in source for all
+four blocks.
 
 ---
 
 ### main.rs *(grandfathered)*
 
-Three unsafe blocks: (1) BSP stack switch via inline ASM — sound because
+Two unsafe blocks: (1) BSP stack switch via inline ASM — sound because
 `BSP_BOOT_STACK` is a 512 KiB static buffer and the pointer arithmetic is
 bounded; (2) deref of `boot_info_ptr` — sound because the Limine bootloader
-guarantees alignment and validity; (3) COM2 init call — sound because it runs
-once on the BSP before the scheduler starts. `// SAFETY:` comments present in
-source for two of the three.
+guarantees alignment and validity. The third block (COM2 init) was removed when
+`com2_init` was made a safe function. `// SAFETY:` comments present in source
+for both remaining blocks.
 
 ---
 

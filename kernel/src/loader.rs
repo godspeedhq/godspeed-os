@@ -29,10 +29,11 @@ const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 
 // ---------------------------------------------------------------------------
-// ELF64 header and program header (packed; fields read via addr_of!).
+// ELF64 header and program header.
 // ---------------------------------------------------------------------------
 
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 struct Elf64Ehdr {
     e_ident:     [u8; 16],
     e_type:      u16,
@@ -51,6 +52,7 @@ struct Elf64Ehdr {
 }
 
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 struct Elf64Phdr {
     p_type:   u32,
     p_flags:  u32,
@@ -60,6 +62,26 @@ struct Elf64Phdr {
     p_filesz: u64,
     p_memsz:  u64,
     p_align:  u64,
+}
+
+/// Copy `size_of::<Elf64Ehdr>()` bytes from the start of `bytes` into a local
+/// `Elf64Ehdr`.  After this call every field access is a safe copy out of a
+/// local value — no unaligned pointer dereferences at the call site.
+///
+/// Caller must guarantee `bytes.len() >= size_of::<Elf64Ehdr>()`.
+fn read_ehdr(bytes: &[u8]) -> Elf64Ehdr {
+    // SAFETY: length pre-checked by caller; Elf64Ehdr is repr(C, packed) so any
+    // byte sequence is a valid bit-pattern; read_unaligned requires no alignment.
+    unsafe { (bytes.as_ptr() as *const Elf64Ehdr).read_unaligned() }
+}
+
+/// Copy `size_of::<Elf64Phdr>()` bytes from `bytes[off..]` into a local
+/// `Elf64Phdr`.
+///
+/// Caller must guarantee `off + size_of::<Elf64Phdr>() <= bytes.len()`.
+fn read_phdr(bytes: &[u8], off: usize) -> Elf64Phdr {
+    // SAFETY: bounds pre-checked by caller; same reasoning as read_ehdr.
+    unsafe { (bytes.as_ptr().add(off) as *const Elf64Phdr).read_unaligned() }
 }
 
 // ---------------------------------------------------------------------------
@@ -107,35 +129,23 @@ pub fn load(bytes: &[u8]) -> Result<LoadedElf, LoadError> {
         return Err(LoadError::TooSmall);
     }
 
-    // SAFETY: length checked; Elf64Ehdr is packed so no alignment constraint.
-    let ehdr = bytes.as_ptr() as *const Elf64Ehdr;
+    let ehdr = read_ehdr(bytes);
 
-    // Read packed fields without creating unaligned references (§18.3).
-    // SAFETY: all addr_of! targets are within the bounds-checked ehdr.
-    let e_ident = unsafe { core::ptr::addr_of!((*ehdr).e_ident).read_unaligned() };
-    if &e_ident[..4] != ELF_MAGIC { return Err(LoadError::BadMagic);     }
-    if e_ident[4]   != ELFCLASS64 { return Err(LoadError::NotElf64);     }
-    if e_ident[5]  != ELFDATA2LSB { return Err(LoadError::NotElf64);     }
+    if &ehdr.e_ident[..4] != ELF_MAGIC { return Err(LoadError::BadMagic);     }
+    if ehdr.e_ident[4]   != ELFCLASS64 { return Err(LoadError::NotElf64);     }
+    if ehdr.e_ident[5]  != ELFDATA2LSB { return Err(LoadError::NotElf64);     }
+    if ehdr.e_type    != ET_EXEC   { return Err(LoadError::NotExecutable); }
+    if ehdr.e_machine != EM_X86_64 { return Err(LoadError::WrongArch);    }
 
-    let e_type    = unsafe { core::ptr::addr_of!((*ehdr).e_type).read_unaligned()    };
-    let e_machine = unsafe { core::ptr::addr_of!((*ehdr).e_machine).read_unaligned() };
-    if e_type    != ET_EXEC   { return Err(LoadError::NotExecutable); }
-    if e_machine != EM_X86_64 { return Err(LoadError::WrongArch);    }
-
-    let e_entry     = unsafe { core::ptr::addr_of!((*ehdr).e_entry).read_unaligned()     };
-    let e_phoff     = unsafe { core::ptr::addr_of!((*ehdr).e_phoff).read_unaligned()     };
-    let e_phentsize = unsafe { core::ptr::addr_of!((*ehdr).e_phentsize).read_unaligned() };
-    let e_phnum     = unsafe { core::ptr::addr_of!((*ehdr).e_phnum).read_unaligned()     };
-
-    if (e_phentsize as usize) < core::mem::size_of::<Elf64Phdr>() {
+    if (ehdr.e_phentsize as usize) < core::mem::size_of::<Elf64Phdr>() {
         return Err(LoadError::BadProgramHeader);
     }
 
     let mut pt = PageTable::new()?;
 
-    let ph_base  = e_phoff as usize;
-    let ph_step  = e_phentsize as usize;
-    let ph_count = e_phnum as usize;
+    let ph_base  = ehdr.e_phoff as usize;
+    let ph_step  = ehdr.e_phentsize as usize;
+    let ph_count = ehdr.e_phnum as usize;
 
     for i in 0..ph_count {
         let off = ph_base
@@ -148,17 +158,15 @@ pub fn load(bytes: &[u8]) -> Result<LoadedElf, LoadError> {
             return Err(LoadError::BadProgramHeader);
         }
 
-        // SAFETY: bounds checked above; packed struct.
-        let phdr = unsafe { bytes.as_ptr().add(off) as *const Elf64Phdr };
+        let phdr = read_phdr(bytes, off);
 
-        let p_type = unsafe { core::ptr::addr_of!((*phdr).p_type).read_unaligned() };
-        if p_type != PT_LOAD { continue; }
+        if phdr.p_type != PT_LOAD { continue; }
 
-        let p_flags  = unsafe { core::ptr::addr_of!((*phdr).p_flags).read_unaligned()  };
-        let p_offset = unsafe { core::ptr::addr_of!((*phdr).p_offset).read_unaligned() } as usize;
-        let p_vaddr  = unsafe { core::ptr::addr_of!((*phdr).p_vaddr).read_unaligned()  };
-        let p_filesz = unsafe { core::ptr::addr_of!((*phdr).p_filesz).read_unaligned() } as usize;
-        let p_memsz  = unsafe { core::ptr::addr_of!((*phdr).p_memsz).read_unaligned()  } as usize;
+        let p_flags  = phdr.p_flags;
+        let p_offset = phdr.p_offset as usize;
+        let p_vaddr  = phdr.p_vaddr;
+        let p_filesz = phdr.p_filesz as usize;
+        let p_memsz  = phdr.p_memsz as usize;
 
         if p_filesz > p_memsz {
             return Err(LoadError::BadProgramHeader);
@@ -220,7 +228,7 @@ pub fn load(bytes: &[u8]) -> Result<LoadedElf, LoadError> {
         }
     }
 
-    Ok(LoadedElf { page_table: pt, entry_va: e_entry })
+    Ok(LoadedElf { page_table: pt, entry_va: ehdr.e_entry })
 }
 
 // ---------------------------------------------------------------------------

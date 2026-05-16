@@ -292,10 +292,9 @@ const COM2: u16 = 0x2F8;
 
 /// Initialise COM2 at 115200 baud, 8N1. Receive-only (no TX interrupts).
 ///
-/// # Safety
-/// Must be called once before `com2_try_read_byte`.
-pub unsafe fn com2_init() {
-    // SAFETY: COM2 I/O ports; initialised once at boot.
+/// Idempotent: re-initialising reinitialises the port to the same settings.
+pub fn com2_init() {
+    // SAFETY: COM2 I/O ports; standard UART register layout; ring-0 port I/O is always permitted.
     unsafe {
         outb(COM2 + 1, 0x00); // Disable UART interrupts
         outb(COM2 + 3, 0x80); // DLAB on

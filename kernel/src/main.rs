@@ -199,8 +199,7 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     memory::init(boot_info);
 
     arch::x86_64::init_timer();
-    // SAFETY: COM2 initialised once before the scheduler starts.
-    unsafe { arch::x86_64::com2_init() };
+    arch::x86_64::com2_init();
 
     capability::init();
     ipc::init();
