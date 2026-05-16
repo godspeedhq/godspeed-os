@@ -147,7 +147,9 @@ fn collect_boot_info() -> BootInfo {
         .unwrap_or((0, 0));
 
     BootInfo {
+        // SAFETY: MAP_BUF written above in single-threaded boot; slice is valid for kernel lifetime.
         memory_map: unsafe { &MAP_BUF[..count] },
+        // SAFETY: AP_ID_BUF written above in single-threaded boot; slice is valid for kernel lifetime.
         ap_ids: unsafe { &AP_ID_BUF[..ap_count] },
         kernel_phys_start,
         kernel_phys_end,

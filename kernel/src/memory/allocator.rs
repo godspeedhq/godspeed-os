@@ -74,6 +74,7 @@ impl BitmapAllocator {
         Self { free_frames: 0, next_byte: 0, max_valid_frame: 0 }
     }
 
+    // SAFETY: caller must guarantee single-threaded access; called once by BSP during memory::init.
     unsafe fn init_from_map(&mut self, boot_info: &BootInfo) {
         let kstart = boot_info.kernel_phys_start;
         let kend   = boot_info.kernel_phys_end;
@@ -114,6 +115,7 @@ impl BitmapAllocator {
         }
     }
 
+    // SAFETY: caller must hold ALLOC_LOCKED; BITMAP and ALLOCATOR are exclusively accessible under the lock.
     unsafe fn alloc(&mut self) -> Option<Frame> {
         // SAFETY: exclusive access guaranteed by single-core invariant (v1).
         let bitmap = unsafe { &mut BITMAP };
@@ -141,6 +143,7 @@ impl BitmapAllocator {
         Some(unsafe { Frame::from_phys(phys) })
     }
 
+    // SAFETY: caller must hold ALLOC_LOCKED and have exclusive ownership of `frame`.
     unsafe fn free(&mut self, frame: Frame) {
         let idx = frame.frame_number() as usize;
         // Reject phantom frames: addresses that were never in the usable RAM

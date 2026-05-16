@@ -94,6 +94,7 @@ pub unsafe extern "C" fn syscall_handler(
 /// arg0 = cap_slot, arg1 = pointer to UTF-8 bytes, arg2 = byte length.
 ///
 /// Requires `Rights::WRITE` on `LOG_WRITE_RESOURCE`.
+// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; args are untrusted user register values.
 unsafe fn handle_log(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::WRITE) {
         Ok(c) => c,
@@ -126,6 +127,7 @@ unsafe fn handle_log(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 // Syscall: Send / Recv / TrySend (1, 2, 3) — Milestone 5/6.
 // ---------------------------------------------------------------------------
 
+// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; args are untrusted user register values.
 unsafe fn handle_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::SEND) {
         Ok(c)  => c,
@@ -163,6 +165,7 @@ unsafe fn handle_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 /// Blocks until a message is dequeued from the endpoint, then copies the
 /// payload into the caller-supplied buffer.  Returns the number of bytes
 /// written on success, or a negative error code.
+// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; args are untrusted user register values.
 unsafe fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
     let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::RECV) {
         Ok(c)  => c,
@@ -223,6 +226,7 @@ unsafe fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
     }
 }
 
+// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; args are untrusted user register values.
 unsafe fn handle_try_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::SEND) {
         Ok(c)  => c,
@@ -276,6 +280,7 @@ unsafe fn build_message(msg_ptr: u64, msg_len: u64) -> Result<Message, i64> {
 /// core_id encoding:
 ///   - 0x0000 = core 0, 0x0001 = core 1, …
 ///   - 0xFFFF = let the kernel choose (preferred_core from service_config).
+// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; args are untrusted user register values.
 unsafe fn handle_spawn(packed_arg0: u64, name_ptr: u64, name_len: u64) -> i64 {
     let spawn_cap_slot = (packed_arg0 & 0xFFFF) as usize;
     let core_raw       = ((packed_arg0 >> 16) & 0xFFFF) as u32;
@@ -314,6 +319,7 @@ unsafe fn handle_spawn(packed_arg0: u64, name_ptr: u64, name_len: u64) -> i64 {
 /// Kills the named running task: marks Dead, kills endpoint, wakes blocked tasks.
 /// Phase 5: no capability check (cap check added in Phase 6 when service_control
 /// is fully wired).
+// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; args are untrusted user register values.
 unsafe fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
     let len = name_len as usize;
     if len == 0 || len > 64 { return -1; }
@@ -334,6 +340,7 @@ unsafe fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
 ///
 /// Used by services to reacquire a fresh SEND cap after `EndpointDead` (§14.2)
 /// and by property-test probes that need to transfer caps (P3 — arg2=1).
+// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; args are untrusted user register values.
 unsafe fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> i64 {
     let len = name_len as usize;
     if len == 0 || len > 64 { return -1; }
@@ -378,6 +385,7 @@ unsafe fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u
 ///
 /// Returns `CapNotGrantable` (-4) if the grant cap lacks the GRANT right, so
 /// the sender knows the cap was NOT transferred (it remains in their table).
+// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; args are untrusted user register values.
 unsafe fn handle_send_with_cap(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let endpoint_slot = (packed & 0xFFFF) as usize;
     let grant_slot    = ((packed >> 16) & 0xFFFF) as usize;
@@ -441,6 +449,7 @@ unsafe fn handle_send_with_cap(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 /// Returns the next pending received cap slot as a non-negative i64, or -1 if
 /// no pending caps remain.  The slot is into the calling task's own cap table;
 /// it was inserted by handle_recv when it processed an embedded cap.
+// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; no pointer arguments.
 unsafe fn handle_take_pending_cap() -> i64 {
     match scheduler::pop_pending_recv_cap() {
         Some(slot) => slot as i64,
@@ -461,6 +470,7 @@ unsafe fn handle_take_pending_cap() -> i64 {
 /// negative error code:
 ///   -11  AllocDenied — request would exceed the task's memory limit.
 ///   -1   other failure (physical memory exhausted; partial allocation left mapped).
+// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; args are untrusted user register values.
 unsafe fn handle_alloc_mem(size: u64) -> i64 {
     if size == 0 { return -1; }
 
@@ -504,6 +514,7 @@ unsafe fn handle_alloc_mem(size: u64) -> i64 {
 /// Prints "KERNEL PANIC" immediately (so the harness sees it even on minimal
 /// serial buffering), then panics with "reason: {msg}" (§6.2, §22 Test 1B).
 /// Does not return.
+// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; args are untrusted user register values.
 unsafe fn handle_abort(msg_ptr: u64, msg_len: u64) -> i64 {
     let len = msg_len as usize;
     if len > 0 && len <= 128 && validate_user_slice(msg_ptr, len) {
@@ -528,6 +539,7 @@ unsafe fn handle_abort(msg_ptr: u64, msg_len: u64) -> i64 {
 ///   arg1 = name_ptr (user VA), arg2 = name_len.
 ///   Returns the current generation of the named endpoint as a non-negative
 ///   i64, or -1 if the name is not registered.
+// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; args are untrusted user register values.
 unsafe fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     match query_id {
         0 => scheduler::current_task_alloc_bytes() as i64,
@@ -576,6 +588,7 @@ unsafe fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
 ///
 /// Returns the `Rights` byte of the cap at `slot` as a non-negative i64, or
 /// -2 (`CapNotHeld`) if the slot is empty or out of range.
+// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; arg is an untrusted user register value.
 unsafe fn handle_query_cap_rights(slot: u64) -> i64 {
     match scheduler::current_task_read_cap_rights(slot as usize) {
         Some(rights) => rights.0 as i64,
@@ -591,6 +604,7 @@ unsafe fn handle_query_cap_rights(slot: u64) -> i64 {
 ///
 /// Clears the cap at `slot`. Always returns 0; out-of-range slots are silently
 /// ignored (idempotent — the slot is already empty).
+// SAFETY: called only from syscall_handler; IF=0 at ring-0/ring-3 boundary; arg is an untrusted user register value.
 unsafe fn handle_remove_cap(slot: u64) -> i64 {
     scheduler::current_task_remove_cap(slot as usize);
     0

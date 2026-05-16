@@ -51,7 +51,10 @@ unsafe fn ser_putc(c: u8) {
 
 #[inline]
 unsafe fn ser_puts(s: &[u8]) {
-    for &c in s { unsafe { ser_putc(c) }; }
+    for &c in s {
+        // SAFETY: called within an unsafe fn; serial port exclusively owned in early-boot context.
+        unsafe { ser_putc(c) };
+    }
 }
 
 #[inline]
@@ -63,6 +66,7 @@ unsafe fn ser_hex64(val: u64) {
         let nibble = ((val >> ((15 - i) * 4)) & 0xF) as u8;
         buf[2 + i] = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
     }
+    // SAFETY: called within an unsafe fn; serial port exclusively owned in early-boot context.
     unsafe { ser_puts(&buf) };
 }
 
@@ -70,7 +74,11 @@ unsafe fn ser_hex64(val: u64) {
 unsafe fn ser_u8_dec(val: u8) {
     let h = val / 10;
     let l = val % 10;
-    if h > 0 { unsafe { ser_putc(b'0' + h) }; }
+    if h > 0 {
+        // SAFETY: called within an unsafe fn; serial port exclusively owned in early-boot context.
+        unsafe { ser_putc(b'0' + h) };
+    }
+    // SAFETY: called within an unsafe fn; serial port exclusively owned in early-boot context.
     unsafe { ser_putc(b'0' + l) };
 }
 

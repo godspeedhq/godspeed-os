@@ -476,6 +476,7 @@ pub fn run(core_id: u32) -> ! {
     // never saves CR3 (only loads it), so without this, switching back to the
     // scheduler context after `block_and_reschedule` would load CR3=0 and
     // triple-fault on the next instruction fetch.
+    // SAFETY: run() is called once per core before any task switch; CORE_SCHED_CTX[cid] exclusively accessible.
     unsafe {
         let cr3: u64;
         core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem));
@@ -607,6 +608,7 @@ pub extern "C" fn timer_tick_from_irq() {
 /// Advisory yield: mark the current task Ready and reschedule.
 /// Also called from the IPI handler for cross-core WAKE_RECEIVER (§9.4).
 pub fn yield_current() {
+    // SAFETY: cli disables interrupts; no memory access; required before inspecting CORE_CURRENT.
     unsafe { core::arch::asm!("cli", options(nostack, nomem)) };
 
     let cid = current_core_id();
@@ -944,6 +946,7 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
 /// Store `msg` as the last received message for the current task.
 pub fn store_recv_message(msg: Message) {
     let cid = current_core_id();
+    // SAFETY: CORE_CURRENT[cid] and TASK_RECV_BUF are written only by this core's scheduler path.
     unsafe {
         let cur = CORE_CURRENT[cid];
         if cur < MAX_TASKS {
@@ -955,6 +958,7 @@ pub fn store_recv_message(msg: Message) {
 /// Take (consume) the last received message for the current task.
 pub fn take_recv_message() -> Option<Message> {
     let cid = current_core_id();
+    // SAFETY: CORE_CURRENT[cid] and TASK_RECV_BUF are written only by this core's scheduler path.
     unsafe {
         let cur = CORE_CURRENT[cid];
         if cur < MAX_TASKS {
@@ -971,11 +975,13 @@ pub fn take_recv_message() -> Option<Message> {
 
 /// Round-robin scan for the next Ready task pinned to `core_id`.
 fn pick_next(core_id: usize) -> Option<usize> {
+    // SAFETY: CORE_CURRENT[core_id] is written only by this core's scheduler; no cross-core mutation.
     let current = unsafe { CORE_CURRENT[core_id] };
     let start = if current < MAX_TASKS { (current + 1) % MAX_TASKS } else { 0 };
     for i in 0..MAX_TASKS {
         let idx = (start + i) % MAX_TASKS;
         // Acquire: sees the Ready write from wake_by_slot's Release store.
+        // SAFETY: TASK_VALID, TASK_STATE, TASK_CORE are static arrays; idx < MAX_TASKS; read access is safe.
         let ready = unsafe {
             TASK_VALID[idx]
                 && TaskState::from(TASK_STATE[idx].load(Ordering::Acquire)) == TaskState::Ready

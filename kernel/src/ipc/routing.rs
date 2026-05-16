@@ -173,11 +173,13 @@ pub fn enqueue(
     blocked_sender_slot: Option<usize>,
 ) -> Result<Option<usize>, IpcError> {
     lock();
+    // SAFETY: ROUTE_LOCKED held; exclusive mutable access to TABLE guaranteed.
     let result = unsafe { enqueue_locked(endpoint, msg, cap_gen, blocked_sender_slot) };
     unlock();
     result
 }
 
+// SAFETY: caller must hold ROUTE_LOCKED; TABLE is exclusively accessible under the lock.
 unsafe fn enqueue_locked(
     endpoint: EndpointId,
     msg: Message,
@@ -227,11 +229,13 @@ pub fn dequeue(
     blocked_receiver_slot: Option<usize>,
 ) -> Result<(Message, Option<usize>), IpcError> {
     lock();
+    // SAFETY: ROUTE_LOCKED held; exclusive mutable access to TABLE guaranteed.
     let result = unsafe { dequeue_locked(endpoint, cap_gen, blocked_receiver_slot) };
     unlock();
     result
 }
 
+// SAFETY: caller must hold ROUTE_LOCKED; TABLE is exclusively accessible under the lock.
 unsafe fn dequeue_locked(
     endpoint: EndpointId,
     cap_gen: Generation,
@@ -271,6 +275,7 @@ unsafe fn dequeue_locked(
 /// wake both (if `Some`) with `EndpointDead` via `scheduler::wake_by_slot`.
 pub fn kill_endpoint(endpoint: EndpointId) -> (Option<usize>, Option<usize>) {
     lock();
+    // SAFETY: ROUTE_LOCKED held; TABLE is exclusively accessible.
     let result = unsafe {
         let idx = match find_index(endpoint) {
             Some(i) => i,
@@ -294,7 +299,9 @@ pub fn kill_endpoint(endpoint: EndpointId) -> (Option<usize>, Option<usize>) {
 
 /// Linear scan to find the index of a valid entry with the given id.
 /// Caller must hold `ROUTE_LOCKED`.
+// SAFETY: caller must hold ROUTE_LOCKED; TABLE access is exclusive under the lock.
 unsafe fn find_index(id: EndpointId) -> Option<usize> {
+    // SAFETY: TABLE is a static array; ROUTE_LOCKED is held; no concurrent mutation.
     for (i, entry) in unsafe { TABLE.iter().enumerate() } {
         if entry.valid && entry.id == id {
             return Some(i);

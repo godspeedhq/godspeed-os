@@ -265,6 +265,7 @@ unsafe fn serial_poll_thre() {
 
 #[inline]
 unsafe fn serial_putc_nolck(c: u8) {
+    // SAFETY: called from panic/fault path; interrupts disabled; serial port exclusively owned by kernel.
     unsafe {
         serial_poll_thre();
         outb(0x3F8, c);
@@ -272,7 +273,10 @@ unsafe fn serial_putc_nolck(c: u8) {
 }
 
 unsafe fn serial_puts_nolck(s: &[u8]) {
-    for &c in s { unsafe { serial_putc_nolck(c) }; }
+    for &c in s {
+        // SAFETY: called within an unsafe fn; caller has guaranteed serial port exclusive ownership.
+        unsafe { serial_putc_nolck(c) };
+    }
 }
 
 unsafe fn serial_hex64_nolck(val: u64) {
@@ -283,6 +287,7 @@ unsafe fn serial_hex64_nolck(val: u64) {
         let nibble = ((val >> ((15 - i) * 4)) & 0xF) as u8;
         buf[2 + i] = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
     }
+    // SAFETY: called within an unsafe fn; caller has guaranteed serial port exclusive ownership.
     unsafe { serial_puts_nolck(&buf) };
 }
 

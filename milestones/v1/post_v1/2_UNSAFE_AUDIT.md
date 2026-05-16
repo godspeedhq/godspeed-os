@@ -29,11 +29,17 @@ not in the audit fail CI unconditionally.
 > count is used because it is stable and grep-reproducible; the block count is
 > documented separately below.
 
-At the time of this audit the kernel had **319 non-comment lines containing
-`unsafe` across 26 files**, corresponding to **291 distinct unsafe constructs**
-(216 `unsafe { }` blocks + 75 `unsafe fn` declarations). Of those, 113 keyword
-lines across 10 files are **outside the four permitted layers** defined in §18.1
-— a pre-existing policy violation from the rapid v1 development phase.
+| Metric | Value |
+|---|---|
+| Non-comment lines with `unsafe` keyword | 319 |
+| Total files with `unsafe` | 26 |
+| Distinct unsafe constructs | 291 |
+| — `unsafe { }` blocks | 216 |
+| — `unsafe fn` declarations | 75 |
+| Lines in permitted layers (§18.1) | 206 |
+| — Files in permitted layers | 16 |
+| Lines outside permitted layers (grandfathered) | 113 |
+| — Files outside permitted layers | 10 |
 
 ### Permitted layers (in-policy, 206 keyword lines)
 
@@ -55,6 +61,7 @@ lines across 10 files are **outside the four permitted layers** defined in §18.
 | smp/ipi.rs | 21 |
 | smp/mod.rs | 1 |
 | smp/placement.rs | 1 |
+| **Total** | **206** |
 
 ### Grandfathered (outside policy, 113 keyword lines — frozen)
 
@@ -91,12 +98,14 @@ amendment to CLAUDE.md §18 before CI will accept it.
 
 ## SAFETY comment coverage
 
-At audit time, SAFETY comment coverage is **partial**. Files with full coverage:
-`capability/table.rs`, `smp/core.rs`, `smp/mod.rs`, `smp/placement.rs`,
-`log.rs`, `ipc/names.rs`, `control.rs`. Files with significant gaps are noted
-in `docs/unsafe-audit.md` with "(needs back-fill)". The audit file documents the
-SAFETY argument for each group of related unsafe blocks even where individual
-source comments are missing — the source back-fill is separate cleanup work.
+Every `unsafe` block and `unsafe fn` declaration in the kernel now has a
+`// SAFETY:` comment on the line immediately above it. Back-fill completed
+across: `arch/x86_64/boot.rs`, `arch/x86_64/mod.rs`,
+`arch/x86_64/syscall_entry.rs`, `ipc/routing.rs`, `memory/allocator.rs`,
+`syscall/dispatch.rs` (all 13 `handle_*` fns), and `task/scheduler.rs`.
+Files that were already complete: `capability/table.rs`, `smp/core.rs`,
+`smp/mod.rs`, `smp/placement.rs`, `log.rs`, `ipc/names.rs`, `control.rs`,
+`memory/frame.rs`, `memory/page.rs`, `interrupt/route.rs`, `task/mod.rs`.
 
 ---
 
