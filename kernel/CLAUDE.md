@@ -32,11 +32,11 @@ The kernel requires a custom target spec. The binary is a flat ELF loaded by the
 | `capability/`    | §7          | Yes — global table |
 | `smp/`           | §9, §11     | Yes — APIC MMIO |
 | `ipc/`           | §8          | No  |
-| `task/`          | §9, §14     | No  |
-| `syscall/`       | §8.2        | No  |
-| `interrupt/`     | §12         | No  |
+| `task/`          | §9, §14     | No (grandfathered — see `docs/unsafe-audit.md`) |
+| `syscall/`       | §8.2        | No (grandfathered — 2 lines, see audit) |
+| `interrupt/`     | §12         | No (grandfathered — 1 line, see audit) |
 | `invariants/`    | §22         | No  |
-| `log.rs`         | §11.4       | Minimal — spinlock |
+| `log.rs`         | §11.4       | No  |
 
 ## Unsafe policy (§18)
 

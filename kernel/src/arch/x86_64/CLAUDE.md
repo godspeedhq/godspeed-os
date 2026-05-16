@@ -13,6 +13,21 @@ The unsafe hardware boundary (§18.1). All direct hardware access in the kernel 
 | `context_switch.rs` | Naked function: save/restore callee-saved registers + CR3 (§9) |
 | `page_tables.rs`    | Four-level page table manipulation: map/unmap, CR3 values (§10) |
 
+## Safe wrappers (call these instead of writing new unsafe blocks)
+
+These functions in `arch::x86_64` expose hardware operations as a safe API. If you need one of these operations outside the arch layer, use the wrapper — do not write a new `unsafe` block.
+
+| Function | What it wraps |
+|---|---|
+| `disable_interrupts()` | `cli` |
+| `enable_interrupts()` | `sti` |
+| `wait_for_interrupt()` | `sti; hlt` (atomic enable + halt for idle loop) |
+| `validate_user_ptr(ptr, len)` | Range check: ptr..ptr+len must be below `USER_END` (0x0000_8000_0000_0000) |
+| `read_user_bytes(ptr, len)` | Validated `from_raw_parts` into user VA |
+| `write_user_bytes(dst, src)` | Validated `copy_nonoverlapping` to user VA |
+| `read_cycle_counter()` | `RDTSC` |
+| `com2_init()` | COM2 UART init (safe — inner `outb` stays unsafe in arch) |
+
 ## Invariants
 
 - `init()` is called exactly once, by the BSP, before any other kernel subsystem.

@@ -10,7 +10,8 @@ Synchronous message-passing IPC (§8). No unsafe code lives here; physical memor
 | `message.rs`   | `Message` (4 KiB max payload, ≤4 embedded caps), `IpcError` |
 | `queue.rs`     | `MessageQueue`: fixed-depth FIFO, 16 messages, `enqueue`/`dequeue`/`drain` |
 | `endpoint.rs`  | `Endpoint`: owner, core pin, queue, blocked-receiver field |
-| `routing.rs`   | `RoutingTable`: `EndpointId → (CoreId, Generation, Liveness)`; `enqueue`, `kill_endpoint` |
+| `routing.rs`   | `RoutingTable`: `EndpointId → (CoreId, Generation, Liveness)`; `enqueue`, `kill_endpoint`. Protected by `SpinLock<[RoutingEntry; MAX_ENDPOINTS]>`. |
+| `names.rs`     | Name → `EndpointId` registry. `register(name, ep)`, `lookup(name)`. Protected by `SpinLock<[NameEntry; MAX_ENTRIES]>`. |
 
 ## Message size and queue depth (§8.5)
 

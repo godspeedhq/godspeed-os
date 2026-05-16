@@ -10,6 +10,19 @@ Multi-core coordination (§9, §11). Unsafe boundary: APIC MMIO writes in `ipi.r
 | `core.rs`       | `CoreState` per core; `mark_ready(core_id)`, `ready_count()`, `is_ready(core_id)` |
 | `ipi.rs`        | `send_ipi(core_id, vector)`, `broadcast_tlb_shootdown(virt)`, `ipi_handler(vector)` |
 | `placement.rs`  | `resolve(contract_core)` → `Ok(core_id)` or `Err(PlacementInvalid)` |
+| `spinlock.rs`   | `SpinLock<T>` / `SpinLockGuard<T>` — RAII spinlock for safe mutable statics throughout the kernel |
+
+## SpinLock usage
+
+`SpinLock<T>` is the standard way to protect mutable kernel globals outside the permitted unsafe layers. All unsafe code lives in `spinlock.rs` itself (4 lines: `unsafe impl Send`, `unsafe impl Sync`, two `UnsafeCell::get()` deref calls in `Deref`/`DerefMut`). Call sites are entirely unsafe-free:
+
+```rust
+static FOO: SpinLock<[T; N]> = SpinLock::new([...]);
+let mut guard = FOO.lock();   // RAII; releases on drop
+guard[i] = value;
+```
+
+`try_lock()` is available for non-blocking acquisition (returns `Option<SpinLockGuard>`).
 
 ## Core lifecycle (§9.5)
 

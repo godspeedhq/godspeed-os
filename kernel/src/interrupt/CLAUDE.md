@@ -22,6 +22,8 @@ Hardware interrupt routing to userspace driver services (§12).
 
 `register(irq, endpoint)` is called from the spawn path when the kernel processes a `hw_interrupt` capability (§12.3). It is called exactly once per IRQ line per system lifetime (drivers are non-restartable only if they are in the TCB; otherwise restart re-registers).
 
+`IRQ_TABLE` is a `SpinLock<[Option<EndpointId>; 256]>`. `register()` is a safe function. `deliver()` is `pub unsafe fn` because it is called from the IDT with IF=0 — the `unsafe` communicates the interrupt-context calling convention, not a memory-safety obligation.
+
 ## If no driver is registered
 
 `deliver` discards the IRQ with no log message and no panic. The kernel cannot know whether a driver will register later (AP timing during boot). The driver will start receiving queued interrupts once it registers.

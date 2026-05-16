@@ -19,6 +19,10 @@ A task's `core_id` is set at spawn and never changes. Mid-execution migration is
 
 The 10 ms quantum is enforced by the local APIC timer. `timer_tick()` is called from the timer ISR on every core independently. `yield()` is advisory — it calls `timer_tick()` immediately but preemption happens regardless of whether the service yields.
 
+## Kernel stack pool
+
+224 slots × 64 KiB = 14 MiB of static BSS. Liveness is tracked by `SpinLock<[bool; TASK_KSTACK_MAX]>` — a boolean flag per slot, locked for the duration of alloc/free. `alloc_kstack()` returns the top pointer; `free_kstack(kstack_top)` reverse-computes the slot index from the pointer and clears the flag. The pool uses two unavoidable unsafe lines: one pointer-arithmetic `as_mut_ptr().add(...)` to locate the slot top, and one `as_ptr() as u64` to compute the base address for reverse-index in `free_kstack`.
+
 ## Spawn flow (§14.1)
 
 `spawn_init()` is the only direct spawn from kernel code. All other spawns go through supervisor → syscall → kernel. The kernel side of spawn:

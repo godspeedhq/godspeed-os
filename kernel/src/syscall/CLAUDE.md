@@ -26,6 +26,8 @@ If you are adding a syscall:
 - Always validate length fields before copying user memory.
 - Always validate cap slots are within `0..MAX_CAPS_PER_TASK`.
 
+User-pointer operations go through `arch::x86_64::read_user_bytes(ptr, len)` and `write_user_bytes(dst, src)`, which validate the pointer range before touching memory. Do not use `from_raw_parts` or `copy_nonoverlapping` directly in handler functions — use those wrappers instead.
+
 ## Syscall table (v1)
 
 | Number | Name       | Required cap right |
