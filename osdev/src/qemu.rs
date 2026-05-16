@@ -22,33 +22,37 @@ pub fn run(image_path: &Path, smp: u32) {
 
     let image_str = image_path.to_string_lossy().replace('\\', "/");
 
-    let status = std::process::Command::new(&qemu)
-        .args([
-            "-drive",
-            &format!("format=raw,file={image_str},if=ide"),
-            "-smp",
-            &smp.to_string(),
-            "-m",
-            "512M",
-            // COM1 → serial log file (kernel kprintln output).
-            "-serial",
-            &format!("file:{SERIAL_LOG}"),
-            // COM2 → TCP server on port 5555 (`osdev restart` control channel).
-            "-serial",
-            "tcp::5555,server,nowait",
-            "-debugcon",
-            &format!("file:{DEBUGCON_LOG}"),
-            "-display",
-            "none",
-            "-monitor",
-            "telnet::4444,server,nowait",
-            "-no-reboot",
-            "-no-shutdown",
-            "-d",
-            "int,cpu_reset",
-            "-D",
-            QEMU_DEBUG_LOG,
-        ])
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",
+        &format!("format=raw,file={image_str},if=ide"),
+        "-smp",
+        &smp.to_string(),
+        "-m",
+        "512M",
+        // COM1 → serial log file (kernel kprintln output).
+        "-serial",
+        &format!("file:{SERIAL_LOG}"),
+        // COM2 → TCP server on port 5555 (`osdev restart` control channel).
+        "-serial",
+        "tcp::5555,server,nowait",
+        "-debugcon",
+        &format!("file:{DEBUGCON_LOG}"),
+        "-display",
+        "none",
+        "-monitor",
+        "telnet::4444,server,nowait",
+        "-no-reboot",
+        "-no-shutdown",
+        "-d",
+        "int,cpu_reset",
+        "-D",
+        QEMU_DEBUG_LOG,
+    ]);
+    if kvm_available() {
+        cmd.args(["-enable-kvm", "-cpu", "host"]);
+    }
+    let status = cmd
         .status()
         .unwrap_or_else(|e| {
             eprintln!("failed to launch QEMU at {}: {}", qemu, e);
@@ -127,22 +131,24 @@ pub fn spawn_for_test(
         None    => "null".to_string(),
     };
 
-    let child = std::process::Command::new(&qemu)
-        .args([
-            "-drive",   &format!("format=raw,file={image_str},if=ide"),
-            "-smp",     &smp.to_string(),
-            "-m",       "512M",
-            "-serial",  &serial_str,
-            "-serial",  &com2_str,
-            "-display", "none",
-            "-no-reboot",
-            "-no-shutdown",
-        ])
-        .spawn()
-        .unwrap_or_else(|e| {
-            eprintln!("identity: failed to launch QEMU at {}: {}", qemu, e);
-            std::process::exit(1);
-        });
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-smp",     &smp.to_string(),
+        "-m",       "512M",
+        "-serial",  &serial_str,
+        "-serial",  &com2_str,
+        "-display", "none",
+        "-no-reboot",
+        "-no-shutdown",
+    ]);
+    if kvm_available() {
+        cmd.args(["-enable-kvm", "-cpu", "host"]);
+    }
+    let child = cmd.spawn().unwrap_or_else(|e| {
+        eprintln!("identity: failed to launch QEMU at {}: {}", qemu, e);
+        std::process::exit(1);
+    });
 
     QemuTestInstance { child, serial_path: serial_path.to_owned() }
 }
@@ -164,22 +170,24 @@ pub fn spawn_for_test_custom(
         None    => "null".to_string(),
     };
 
-    let child = std::process::Command::new(&qemu)
-        .args([
-            "-drive",   &format!("format=raw,file={image_str},if=ide"),
-            "-smp",     &smp.to_string(),
-            "-m",       &format!("{ram_mib}M"),
-            "-serial",  &serial_str,
-            "-serial",  &com2_str,
-            "-display", "none",
-            "-no-reboot",
-            "-no-shutdown",
-        ])
-        .spawn()
-        .unwrap_or_else(|e| {
-            eprintln!("chaos: failed to launch QEMU at {}: {}", qemu, e);
-            std::process::exit(1);
-        });
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-smp",     &smp.to_string(),
+        "-m",       &format!("{ram_mib}M"),
+        "-serial",  &serial_str,
+        "-serial",  &com2_str,
+        "-display", "none",
+        "-no-reboot",
+        "-no-shutdown",
+    ]);
+    if kvm_available() {
+        cmd.args(["-enable-kvm", "-cpu", "host"]);
+    }
+    let child = cmd.spawn().unwrap_or_else(|e| {
+        eprintln!("chaos: failed to launch QEMU at {}: {}", qemu, e);
+        std::process::exit(1);
+    });
 
     QemuTestInstance { child, serial_path: serial_path.to_owned() }
 }
@@ -192,4 +200,10 @@ fn qemu_binary() -> String {
         }
     }
     "qemu-system-x86_64".to_string()
+}
+
+/// Returns true when `/dev/kvm` is accessible (Linux + KVM available).
+/// Enables hardware-accelerated QEMU; falls back to TCG otherwise.
+fn kvm_available() -> bool {
+    std::fs::metadata("/dev/kvm").is_ok()
 }
