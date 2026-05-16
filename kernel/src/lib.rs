@@ -23,6 +23,10 @@ pub mod capability {
     pub mod cap;
     pub mod generation;
     pub mod rights;
+    // table.rs uses crate::kprintln! which only exists in test mode (stub in lib.rs)
+    // and in the bin target (real impl in log.rs). Gate here so the bare-metal lib
+    // build doesn't try to compile it without the macro.
+    #[cfg(test)]
     pub mod table;
 }
 

@@ -249,7 +249,8 @@ mod tests {
             let mut q = MessageQueue::new();
             for &b in &items { q.enqueue(msg(b)).unwrap(); }
             for &b in &items {
-                prop_assert_eq!(q.dequeue().unwrap().payload_bytes(), &[b]);
+                let msg = q.dequeue().unwrap();
+                prop_assert_eq!(msg.payload_bytes(), &[b]);
             }
         }
 
