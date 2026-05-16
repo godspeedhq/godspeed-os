@@ -1,0 +1,35 @@
+# cargo-mutants configuration — kernel crate.
+#
+# Only the five pure-logic modules in the lib target are mutated.
+# Everything else either requires the no_std/hardware environment or
+# is the bin entry point that cannot compile for the host.
+#
+# Mutated: capability/cap.rs, capability/generation.rs, capability/rights.rs,
+#          ipc/message.rs, ipc/queue.rs
+#
+# Test command: cargo test -p kernel --lib
+# Approximate run time: ~5–10 min (50–100 mutations × ~3 s each).
+
+timeout_multiplier = 5.0
+
+exclude_globs = [
+    "src/arch/**",
+    "src/memory/**",
+    "src/smp/**",
+    "src/task/**",
+    "src/syscall/**",
+    "src/interrupt/**",
+    "src/invariants/**",
+    "src/ipc/endpoint.rs",
+    "src/ipc/routing.rs",
+    "src/ipc/names.rs",
+    "src/ipc/mod.rs",
+    "src/capability/table.rs",
+    "src/capability/revoke.rs",
+    "src/capability/mod.rs",
+    "src/log.rs",
+    "src/main.rs",
+    "src/lib.rs",
+    "src/loader.rs",
+    "src/control.rs",
+]

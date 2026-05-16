@@ -33,6 +33,7 @@ impl Generation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn initial_is_zero() {
@@ -75,6 +76,30 @@ mod tests {
             let next = g.bump();
             assert!(next.0 > g.0);
             g = next;
+        }
+    }
+
+    // --- property tests (§22 P2) -------------------------------------------
+
+    proptest! {
+        /// For any non-max value, bump increments by exactly 1 (§7.5 monotonic).
+        #[test]
+        fn bump_increments_by_one(v in 0u32..u32::MAX) {
+            let g = Generation(v);
+            prop_assert_eq!(g.bump().0, v + 1);
+        }
+
+        /// matches is true iff the two values are equal.
+        #[test]
+        fn matches_iff_values_equal(a in any::<u32>(), b in any::<u32>()) {
+            prop_assert_eq!(Generation(a).matches(Generation(b)), a == b);
+        }
+
+        /// A cap minted at generation v is always stale after one bump (§7.5).
+        #[test]
+        fn stale_cap_always_rejected_after_bump(v in 0u32..u32::MAX) {
+            let live = Generation(v);
+            prop_assert!(!live.matches(live.bump()));
         }
     }
 }

@@ -40,6 +40,7 @@ impl core::ops::BitOr for Rights {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn contains_single_right() {
@@ -107,6 +108,52 @@ mod tests {
         for bit in [Rights::READ, Rights::WRITE, Rights::SEND,
                     Rights::RECV, Rights::GRANT, Rights::REVOKE] {
             assert!(!e.contains(bit));
+        }
+    }
+
+    // --- property tests (§22 P3) -------------------------------------------
+    // Only the lower 6 bits are used; generate values in that range.
+
+    proptest! {
+        /// narrow(a, b) == a & b: never sets bits absent from either operand (§7.3 non-escalating).
+        #[test]
+        fn narrow_result_equals_bitwise_and(
+            a in 0u8..=0b0011_1111u8,
+            b in 0u8..=0b0011_1111u8,
+        ) {
+            prop_assert_eq!(Rights(a).narrow(Rights(b)).0, a & b);
+        }
+
+        /// contains(a, b) iff every bit in b is also in a.
+        #[test]
+        fn contains_is_bitwise_subset(
+            a in 0u8..=0b0011_1111u8,
+            b in 0u8..=0b0011_1111u8,
+        ) {
+            prop_assert_eq!(Rights(a).contains(Rights(b)), (a & b) == b);
+        }
+
+        /// union(a, b) is a superset of both operands.
+        #[test]
+        fn union_is_superset_of_both_operands(
+            a in 0u8..=0b0011_1111u8,
+            b in 0u8..=0b0011_1111u8,
+        ) {
+            let u = Rights(a).union(Rights(b));
+            prop_assert!(u.contains(Rights(a)));
+            prop_assert!(u.contains(Rights(b)));
+        }
+
+        /// Rights::all() contains every valid single-bit right.
+        #[test]
+        fn all_contains_every_valid_right(r in 0u8..=0b0011_1111u8) {
+            prop_assert!(Rights::all().contains(Rights(r)));
+        }
+
+        /// Rights::empty() never contains any non-zero right.
+        #[test]
+        fn empty_never_contains_nonzero_right(r in 1u8..=0b0011_1111u8) {
+            prop_assert!(!Rights::empty().contains(Rights(r)));
         }
     }
 }

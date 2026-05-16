@@ -56,6 +56,7 @@ impl Capability {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn make_cap(rights: Rights, gen: u32) -> Capability {
         Capability {
@@ -115,6 +116,49 @@ mod tests {
         // Cap has READ|WRITE; validate requires only READ — should pass.
         let cap = make_cap(Rights::READ | Rights::WRITE, 0);
         assert!(cap.validate(Rights::READ, Generation(0)).is_ok());
+    }
+
+    // --- property tests (§22 P1, P3, P9) ------------------------------------
+
+    proptest! {
+        /// Any generation mismatch returns GenerationMismatch, regardless of rights (§7.5, P9).
+        #[test]
+        fn gen_mismatch_always_returns_error(
+            cap_gen    in any::<u32>(),
+            current    in any::<u32>(),
+            rights_bits in 0u8..=0b0011_1111u8,
+        ) {
+            prop_assume!(cap_gen != current);
+            let cap = make_cap(Rights(rights_bits), cap_gen);
+            let err = cap.validate(Rights(rights_bits), Generation(current)).unwrap_err();
+            prop_assert_eq!(err, CapError::GenerationMismatch);
+        }
+
+        /// Matching gen + held right always succeeds (positive path, P1).
+        #[test]
+        fn matching_gen_and_held_right_passes(
+            gen        in any::<u32>(),
+            rights_bits in 1u8..=0b0011_1111u8,
+        ) {
+            // required = lowest set bit in rights_bits (always a strict subset)
+            let required = Rights(rights_bits & rights_bits.wrapping_neg());
+            let cap = make_cap(Rights(rights_bits), gen);
+            prop_assert!(cap.validate(required, Generation(gen)).is_ok());
+        }
+
+        /// narrow_for_grant never widens rights — result is always a subset of original (P3).
+        #[test]
+        fn narrow_for_grant_never_widens(
+            rights_bits in 0u8..=0b0011_1111u8,
+            mask_extra  in 0u8..=0b0011_1111u8,
+        ) {
+            // Constrain mask to bits already held so the non-escalation debug_assert passes.
+            let mask = Rights(mask_extra & rights_bits);
+            let cap  = make_cap(Rights(rights_bits), 0);
+            let narrowed = cap.narrow_for_grant(mask);
+            prop_assert_eq!(narrowed.rights.0, mask_extra & rights_bits,
+                "narrowed={:06b} original={:06b}", narrowed.rights.0, rights_bits);
+        }
     }
 }
 

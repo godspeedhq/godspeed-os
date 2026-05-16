@@ -43,3 +43,31 @@ jobs:
 
       - name: Unit tests (kernel pure-logic)
         run: python3 scripts/test_report.py
+
+  static-analysis:
+    name: Static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          key: cargo-tools-${{ runner.os }}-v1
+
+      - name: Security audit (cargo-audit)
+        run: |
+          cargo install cargo-audit --locked 2>/dev/null || true
+          cargo audit
+
+      - name: Miri — kernel pure-logic
+        run: cargo miri test -p kernel --lib
+
+      - name: Unsafe surface report (cargo-geiger)
+        run: |
+          cargo install cargo-geiger --locked 2>/dev/null || true
+          cargo geiger --package kernel 2>&1

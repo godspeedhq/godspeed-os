@@ -67,3 +67,36 @@ impl From<CapError> for IpcError {
         IpcError::Cap(e)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    // --- property tests (§8.5 size enforcement) -----------------------------
+
+    proptest! {
+        /// Any payload at or below MAX_MESSAGE_SIZE is accepted (§8.5).
+        #[test]
+        fn new_accepts_any_payload_within_limit(len in 0usize..=MAX_MESSAGE_SIZE) {
+            let payload = vec![0u8; len];
+            prop_assert!(Message::new(&payload).is_ok());
+        }
+
+        /// Any payload exceeding MAX_MESSAGE_SIZE is rejected (§8.5).
+        #[test]
+        fn new_rejects_oversized_payload(extra in 1usize..=MAX_MESSAGE_SIZE) {
+            let payload = vec![0u8; MAX_MESSAGE_SIZE + extra];
+            prop_assert!(Message::new(&payload).is_err());
+        }
+
+        /// payload_bytes round-trips arbitrary data without corruption.
+        #[test]
+        fn payload_bytes_round_trips(
+            data in proptest::collection::vec(any::<u8>(), 0..=64usize),
+        ) {
+            let msg = Message::new(&data).unwrap();
+            prop_assert_eq!(msg.payload_bytes(), data.as_slice());
+        }
+    }
+}

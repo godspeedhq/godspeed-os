@@ -86,6 +86,7 @@ impl MessageQueue {
 mod tests {
     use super::*;
     use crate::ipc::message::Message;
+    use proptest::prelude::*;
 
     fn msg(byte: u8) -> Message {
         Message::new(&[byte]).unwrap()
@@ -194,5 +195,72 @@ mod tests {
         // Re-use after reset works correctly.
         q.enqueue(msg(77)).unwrap();
         assert_eq!(q.dequeue().unwrap().payload_bytes(), &[77]);
+    }
+
+    // --- property tests (§22 P6) --------------------------------------------
+
+    #[derive(Debug, Clone)]
+    enum Op { Enq(u8), Deq }
+
+    fn ops() -> impl Strategy<Value = Vec<Op>> {
+        proptest::collection::vec(
+            prop_oneof![
+                any::<u8>().prop_map(Op::Enq),
+                Just(Op::Deq),
+            ],
+            0..64,
+        )
+    }
+
+    fn apply(q: &mut MessageQueue, op: &Op) {
+        match op {
+            Op::Enq(b) => { let _ = q.enqueue(msg(*b)); }
+            Op::Deq    => { let _ = q.dequeue(); }
+        }
+    }
+
+    proptest! {
+        /// depth never exceeds QUEUE_DEPTH under any enqueue/dequeue sequence (§8.5, P6).
+        #[test]
+        fn depth_never_exceeds_capacity(sequence in ops()) {
+            let mut q = MessageQueue::new();
+            for op in &sequence {
+                apply(&mut q, op);
+                prop_assert!(q.depth() <= QUEUE_DEPTH);
+            }
+        }
+
+        /// is_full and is_empty are always consistent with depth (§8.5, P6).
+        #[test]
+        fn full_and_empty_flags_consistent_with_depth(sequence in ops()) {
+            let mut q = MessageQueue::new();
+            for op in &sequence {
+                apply(&mut q, op);
+                prop_assert_eq!(q.is_full(),  q.depth() == QUEUE_DEPTH);
+                prop_assert_eq!(q.is_empty(), q.depth() == 0);
+            }
+        }
+
+        /// FIFO order is preserved for any partial fill up to capacity (§8.1).
+        #[test]
+        fn fifo_order_preserved_for_any_fill(
+            items in proptest::collection::vec(any::<u8>(), 1..=QUEUE_DEPTH),
+        ) {
+            let mut q = MessageQueue::new();
+            for &b in &items { q.enqueue(msg(b)).unwrap(); }
+            for &b in &items {
+                prop_assert_eq!(q.dequeue().unwrap().payload_bytes(), &[b]);
+            }
+        }
+
+        /// drain always yields an empty queue regardless of prior state (§8.6).
+        #[test]
+        fn drain_always_yields_empty(sequence in ops()) {
+            let mut q = MessageQueue::new();
+            for op in &sequence { apply(&mut q, op); }
+            q.drain();
+            prop_assert!(q.is_empty());
+            prop_assert_eq!(q.depth(), 0);
+        }
     }
 }

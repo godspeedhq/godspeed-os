@@ -1,0 +1,44 @@
+name: mutation
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Weekly, Sunday 02:00 UTC — run overnight, not on every PR.
+    - cron: '0 2 * * 0'
+
+jobs:
+  mutation:
+    name: Mutation testing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          key: cargo-tools-${{ runner.os }}-mutants-v1
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked 2>/dev/null || true
+
+      # Run mutations against the kernel lib target only.
+      # kernel/mutants.toml scopes mutations to the five pure-logic modules.
+      # Exit code is non-zero if any mutant survives; we capture the report
+      # regardless and upload it as an artefact.  Once the baseline kill rate
+      # has been triaged and accepted, remove the `|| true` to make CI strict.
+      - name: Run mutation tests
+        run: cargo mutants --package kernel -- --lib 2>&1 | tee mutation-report.txt || true
+
+      - name: Upload mutation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-report-${{ github.sha }}
+          path: |
+            mutation-report.txt
+            mutants.out/

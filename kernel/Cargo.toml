@@ -18,6 +18,11 @@ path = "src/lib.rs"
 bitflags = { version = "2", default-features = false }
 limine = "0.6"
 
+[dev-dependencies]
+# Only used by the lib target (host-compiled, std available).
+# The bare-metal bin target has test = false so proptest never touches no_std builds.
+proptest = "1"
+
 [profile.dev]
 panic = "abort"
 
