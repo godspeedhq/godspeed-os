@@ -26,10 +26,7 @@ jobs:
           mkdir -p tools/limine
           curl -fsSL \
             https://github.com/limine-bootloader/limine/releases/download/v12.2.0/limine-binary.tar.gz \
-            | tar -xz --strip-components=1 -C tools/limine \
-                limine-binary/limine-bios.sys \
-                limine-binary/limine.c \
-                limine-binary/Makefile
+            | tar -xz --strip-components=1 -C tools/limine
           make -C tools/limine limine
           chmod +x tools/limine/limine
 

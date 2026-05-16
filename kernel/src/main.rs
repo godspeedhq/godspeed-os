@@ -170,6 +170,10 @@ fn test_ipc_routing() {
 static mut BSP_BOOT_STACK: [u8; 512 * 1024] = [0u8; 512 * 1024];
 
 #[no_mangle]
+// Called from Limine assembly; safety is enforced by the bootloader contract,
+// not by Rust's type system. The function cannot be `unsafe fn` because Limine
+// requires a specific extern "C" signature.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> ! {
     // Switch from Limine's tiny boot stack to our own 512 KiB stack before
     // any locals are allocated.  boot_info_ptr is in RDI (a register) so it
