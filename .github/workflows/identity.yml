@@ -1,0 +1,37 @@
+name: identity
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  identity:
+    name: Identity test suite (§22)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Install QEMU and build tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y qemu-system-x86 gcc
+
+      - name: Download and set up Limine
+        run: |
+          mkdir -p tools/limine
+          curl -fsSL \
+            https://github.com/limine-bootloader/limine/releases/download/v12.2.0/limine-binary.tar.gz \
+            | tar -xz --strip-components=1 -C tools/limine \
+                limine-binary/limine-bios.sys \
+                limine-binary/limine.c \
+                limine-binary/Makefile
+          make -C tools/limine limine
+          chmod +x tools/limine/limine
+
+      - name: Run identity tests
+        run: cargo run -p osdev -- test identity
