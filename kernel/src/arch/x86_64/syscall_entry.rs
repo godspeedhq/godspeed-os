@@ -94,8 +94,8 @@ unsafe fn ser_u8_dec(val: u8) {
 ///
 /// `swapgs` on SYSCALL entry: GS.base(0) ↔ KERNEL_GS_BASE(kernel_ptr) → kernel ptr in GS.base ✓
 /// `swapgs` on SYSRETQ exit:  GS.base(kernel_ptr) ↔ KERNEL_GS_BASE(0) → 0 in GS.base ✓
-/// ring3_entry_trampoline also does `swapgs` to restore user GS before SYSRETQ.
-/// timer_isr_stub does conditional `swapgs` when interrupting ring-3.
+/// ring3_entry_trampoline and syscall_entry both do `swapgs` before IRETQ to
+/// restore user GS.  timer_isr_stub does conditional `swapgs` when interrupting ring-3.
 ///
 /// # Safety
 /// Called once per core during init, before any ring-3 task runs.
@@ -197,10 +197,17 @@ pub fn read_cycle_counter() -> u64 {
 /// SYSCALL entry point — installed as the LSTAR MSR target.
 ///
 /// On hardware SYSCALL entry:
-///   RCX = saved user RIP (return address for SYSRETQ)
+///   RCX = saved user RIP (return address for ring-3 resume)
 ///   R11 = saved user RFLAGS
 ///   RSP = user RSP (CPU does NOT change it)
 ///   RFLAGS masked by SFMASK (IF cleared by our SFMASK = 0x200)
+///
+/// We return to ring-3 via IRETQ (not SYSRETQ) because on KVM with AMD host
+/// CPUs, SYSRETQ sets SS = STAR+8 = 0x20 (RPL=0) instead of 0x23 (RPL=3).
+/// The next hardware interrupt from ring-3 then pushes SS=0x20 into the
+/// interrupt frame; the IRETQ in the timer ISR sees SS.RPL(0) ≠ SS.DPL(3)
+/// and faults with #GP(0x20).  An explicit IRETQ frame hard-codes SS=0x23,
+/// bypassing SYSRETQ's AMD-specific SS behaviour entirely.
 ///
 /// # Safety
 /// Called at the ring-3 → ring-0 SYSCALL boundary. Interrupts disabled
@@ -210,8 +217,23 @@ pub unsafe extern "C" fn syscall_entry() {
     // SAFETY: swapgs exchanges GS.base ↔ IA32_KERNEL_GS_BASE, making our
     // per-core PerCoreSyscallData pointer live in GS.  We save user RSP to
     // gs:[0] and load the kernel RSP from gs:[8].  cli before the exit
-    // sequence ensures no interrupt fires while RSP points into user space
-    // (prevents writing kernel interrupt frames into user memory).
+    // sequence ensures no interrupt fires while we build the IRETQ frame.
+    //
+    // Exit register roles:
+    //   rcx  = user RIP  (saved by hardware on SYSCALL; restored from kstack)
+    //   r11  = user RFLAGS (saved by hardware on SYSCALL; restored from kstack)
+    //   r10  = user RSP   (read from PER_CORE_SYSCALL.user_rsp before swapgs)
+    //   rax  = syscall return value (untouched so ring-3 sees the result)
+    //
+    // IRETQ frame built on kernel stack (high → low):
+    //   [RSP+32] SS    = 0x23  (user data, DPL=3, RPL=3)
+    //   [RSP+24] RSP   = user_rsp
+    //   [RSP+16] RFLAGS = user_rflags (IF=1 → re-enables interrupts atomically)
+    //   [RSP+8]  CS    = 0x2b  (user code, DPL=3, RPL=3, L=1)
+    //   [RSP+0]  RIP   = user_rip
+    //
+    // GS invariant: swapgs before iretq sets GS.base=0 (user) and
+    // KERNEL_GS_BASE=kernel_ptr, so the next SYSCALL's swapgs restores it.
     core::arch::naked_asm!(
         "swapgs",
         "mov gs:[0], rsp",      // save user RSP → PER_CORE_SYSCALL.user_rsp
@@ -227,14 +249,18 @@ pub unsafe extern "C" fn syscall_entry() {
         "mov rsi, rdi",         // a0 → 2nd param (rsi)
         "mov rdi, rax",         // nr → 1st param (rdi)
         "call syscall_handler",
-        // Restore ring-3 state.  cli prevents an interrupt from firing
-        // between loading user RSP and SYSRETQ (Meltdown-class safety).
+        // Build IRETQ frame to restore ring-3.  cli ensures no interrupt fires
+        // while the frame is partially built on the kernel stack.
         "cli",
-        "pop rcx",              // user RIP → rcx (SYSRETQ uses this as new RIP)
-        "pop r11",              // user RFLAGS → r11 (SYSRETQ restores; IF bit re-enables
-                                //                    interrupts in ring-3)
-        "mov rsp, gs:[0]",      // restore user RSP
-        "swapgs",               // restore user GS.base
-        "sysretq",
+        "pop rcx",              // user RIP → rcx
+        "pop r11",              // user RFLAGS → r11 (IF=1; iretq re-enables atomically)
+        "mov r10, gs:[0]",      // user RSP → r10 (must read while kernel GS is live)
+        "swapgs",               // GS.base: kernel_ptr → 0 (user); KERNEL_GS_BASE: 0 → kernel_ptr
+        "push 0x23",            // SS  = 0x23 (user data, DPL=3, RPL=3)
+        "push r10",             // RSP = user_rsp
+        "push r11",             // RFLAGS (IF=1)
+        "push 0x2b",            // CS  = 0x2b (user code, DPL=3, RPL=3, L=1)
+        "push rcx",             // RIP = user_rip
+        "iretq",                // → ring-3: RIP=user_rip, CS=0x2b, RFLAGS, RSP=user_rsp, SS=0x23
     )
 }
