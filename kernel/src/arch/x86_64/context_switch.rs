@@ -49,24 +49,50 @@ unsafe extern "C" fn task_entry_trampoline() -> ! {
 ///   [RSP+8]  user_rsp   — initial user-space stack pointer
 ///
 /// GS invariant: this function always runs in ring-0 with GS.base = kernel ptr.
-/// `swapgs` restores the user's GS (0) into GS.base before SYSRETQ, so that the
+/// `swapgs` restores the user's GS (0) into GS.base before IRETQ, so that the
 /// ring-3 task sees GS.base=0 and its first SYSCALL's `swapgs` correctly loads
 /// the kernel ptr back into GS.base.
 ///
+/// We use IRETQ (not SYSRETQ) to enter ring-3 so that SS is explicitly loaded
+/// from a kernel-constructed frame with SS=0x23 (RPL=3).  SYSRETQ derives SS
+/// from the STAR MSR and ORs with 3 per spec, but on certain KVM configurations
+/// (especially with AMD host CPUs) the resulting SS can have RPL=0 rather than
+/// RPL=3, causing every subsequent IRETQ from a timer ISR to fault with #GP(0x20)
+/// because SS.RPL ≠ SS.DPL.  An explicit IRETQ frame bypasses this entirely.
+///
 /// The `cli` from `switch_context` is in effect throughout, so no interrupt fires
-/// while RSP holds a user-space address.
+/// while we are building the IRETQ frame or after IRETQ until RFLAGS.IF is set.
 #[unsafe(naked)]
 unsafe extern "C" fn ring3_entry_trampoline() -> ! {
-    // SAFETY: stack layout guaranteed by `new_user`.  GS invariant: ring-0 holds
-    // GS.base=kernel_ptr; `swapgs` exchanges it with KERNEL_GS_BASE=0 (user GS).
-    // SYSRETQ uses RCX as the new RIP and R11 as the new RFLAGS; it restores the
-    // ring-3 selector pair from STAR, setting CPL=3 atomically.
+    // SAFETY: stack layout guaranteed by `new_user`.  Interrupts are disabled
+    // (cli from switch_context); IRETQ atomically enables them via RFLAGS=0x202.
+    // GS invariant: `swapgs` before IRETQ swaps GS.base (kernel ptr → 0) and
+    // KERNEL_GS_BASE (0 → kernel ptr), so ring-3 sees GS.base=0.
+    //
+    // Stack layout built here (RSP starts at K0T-376 after switch_context's ret):
+    //   pop rax → user_rip from [K0T-376], RSP = K0T-368
+    //   pop rbx → user_rsp from [K0T-368], RSP = K0T-360
+    //   push 0x23  → [K0T-368] = SS;    RSP = K0T-368
+    //   push rbx   → [K0T-376] = RSP;   RSP = K0T-376
+    //   push 0x202 → [K0T-384] = RFLAGS; RSP = K0T-384
+    //   push 0x2b  → [K0T-392] = CS;    RSP = K0T-392
+    //   push rax   → [K0T-400] = RIP;   RSP = K0T-400
+    //
+    // IRETQ at RSP=K0T-400 pops RIP, CS=0x2b, RFLAGS=0x202, RSP=user_rsp, SS=0x23.
+    // After IRETQ: CPL=3, SS=0x23 (explicit, not derived from STAR).
     core::arch::naked_asm!(
-        "swapgs",           // GS.base: kernel_ptr → 0 (user); KERNEL_GS_BASE: 0 → kernel_ptr
-        "pop rcx",          // user_rip → rcx (SYSRETQ new RIP)
-        "pop rsp",          // user_rsp → rsp (switches to user stack; still ring-0)
-        "mov r11, 0x202",   // RFLAGS: IF=1 (bit 9) + reserved bit 1; SYSRETQ restores
-        "sysretq",          // → ring-3 at rcx, rsp=user_rsp, rflags=0x202
+        "pop rax",           // user_rip → rax;  RSP = K0T-368
+        "pop rbx",           // user_rsp → rbx;  RSP = K0T-360
+        "mov rcx, 0x23",
+        "push rcx",          // SS  = 0x23  (user data, DPL=3, RPL=3)
+        "push rbx",          // RSP = user_rsp
+        "mov rcx, 0x202",
+        "push rcx",          // RFLAGS = IF=1 | reserved bit 1
+        "mov rcx, 0x2b",
+        "push rcx",          // CS  = 0x2b  (user code, DPL=3, RPL=3)
+        "push rax",          // RIP = user_rip
+        "swapgs",            // GS.base: kernel_ptr → 0 (user); KERNEL_GS_BASE: 0 → kernel_ptr
+        "iretq",             // → ring-3 at user_rip, rsp=user_rsp, rflags=0x202, ss=0x23
     )
 }
 
