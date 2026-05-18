@@ -277,13 +277,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // --- Original ping/pong services ---
     // Spawn pong first so the kernel registers "pong" in its name table before
-    // ping is spawned (ping needs a SEND cap to pong at spawn time — §5 in
-    // task/mod.rs service_config).
+    // ping is spawned (ping needs a SEND cap to pong at spawn time).
     if ctx.spawn_on("pong", 1).is_err() {
         ctx.log("supervisor: WARN: failed to spawn pong on core 1, trying core 0");
         let _ = ctx.spawn_on("pong", 0);
     }
-
     if ctx.spawn_on("ping", 0).is_err() {
         ctx.log("supervisor: WARN: failed to spawn ping");
     }

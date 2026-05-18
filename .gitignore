@@ -22,3 +22,6 @@ build/
 tools/
 
 serial*.log
+identity-serial-logs-6fd71106d3a50e02a039b5f83ac397eafc76b65e
+*.diff
+mutants.out/

@@ -16,6 +16,7 @@
 use super::cap::{CapError, Capability, ResourceId};
 use super::generation::Generation;
 use super::rights::Rights;
+use crate::smp::SpinLock;
 
 const MAX_CAPS_PER_TASK: usize = 64;
 
@@ -39,8 +40,7 @@ impl CapTable {
             .and_then(|s| s.as_ref())
             .ok_or(CapError::CapNotHeld)?;
 
-        // SAFETY: GLOBAL_RESOURCES read under the cap subsystem lock.
-        let record = match unsafe { GLOBAL_RESOURCES.get_record(cap.resource_id) } {
+        let record = match GLOBAL_RESOURCES.lock().get_record(cap.resource_id) {
             Some(r) => r,
             None => {
                 if cap.resource_id.0 >= 100 {
@@ -181,29 +181,26 @@ impl GlobalResourceTable {
     }
 }
 
-// Placeholder; real impl needs a spinlock wrapper.
-static mut GLOBAL_RESOURCES: GlobalResourceTable = GlobalResourceTable::new();
+static GLOBAL_RESOURCES: SpinLock<GlobalResourceTable> =
+    SpinLock::new(GlobalResourceTable::new());
 
 pub fn init_global() {
-    // Nothing to do for the placeholder; real init zeros the table.
+    // SpinLock<GlobalResourceTable> is self-initializing; nothing to do.
 }
 
 /// Register a new resource in the global table with generation 0 and liveness Alive.
 pub fn register_resource(id: ResourceId) {
-    // SAFETY: serialized by the cap subsystem lock.
-    unsafe { GLOBAL_RESOURCES.register(id) }
+    GLOBAL_RESOURCES.lock().register(id);
 }
 
 /// Register a new resource starting at a specific generation (used on respawn — §7.5 P2/P8).
 pub fn register_resource_at_gen(id: ResourceId, gen: Generation) {
-    // SAFETY: serialized by the cap subsystem lock.
-    unsafe { GLOBAL_RESOURCES.register_at_gen(id, gen) }
+    GLOBAL_RESOURCES.lock().register_at_gen(id, gen);
 }
 
 /// Return the current generation of a registered resource, or None if not found.
 pub fn get_resource_generation(id: ResourceId) -> Option<Generation> {
-    // SAFETY: read-only path.
-    unsafe { GLOBAL_RESOURCES.get_record(id).map(|r| r.generation) }
+    GLOBAL_RESOURCES.lock().get_record(id).map(|r| r.generation)
 }
 
 /// Return the rights of the cap in `slot`, without validating the generation.
@@ -216,22 +213,19 @@ pub fn cap_read_rights(slots: &CapTable, slot: usize) -> Option<super::rights::R
 /// Mint a capability for `id` with the given rights at its current generation.
 /// Panics if the resource is not registered.
 pub fn mint_cap(id: ResourceId, rights: Rights) -> Capability {
-    // SAFETY: read-only path.
-    let record = unsafe { GLOBAL_RESOURCES.get_record(id) }
+    let record = GLOBAL_RESOURCES.lock().get_record(id)
         .expect("mint_cap: resource not registered");
     Capability { resource_id: id, rights, generation: record.generation }
 }
 
 /// Bump generation and mark as Dead (endpoint/service terminated → `EndpointDead`).
 pub fn mark_dead_resource(id: ResourceId) {
-    // SAFETY: serialized by the cap subsystem lock.
-    unsafe { GLOBAL_RESOURCES.bump_generation(id, Liveness::Dead) }
+    GLOBAL_RESOURCES.lock().bump_generation(id, Liveness::Dead);
 }
 
 /// Bump generation and mark as Revoked (explicit supervisor revocation → `CapRevoked`).
 pub fn revoke_resource(id: ResourceId) {
-    // SAFETY: serialized by the cap subsystem lock.
-    unsafe { GLOBAL_RESOURCES.bump_generation(id, Liveness::Revoked) }
+    GLOBAL_RESOURCES.lock().bump_generation(id, Liveness::Revoked);
 }
 
 /// Legacy alias; use `mark_dead_resource` or `revoke_resource` for new code.

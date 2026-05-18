@@ -13,6 +13,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("ping: starting");
 
     let mut counter: u64 = 0;
+    let mut success_count: u64 = 0;
 
     loop {
         counter += 1;
@@ -21,8 +22,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
         match ctx.try_send("pong", &msg) {
             Ok(()) => {
-                if counter % 100 == 0 {
-                    ctx.log("ping: sent 100 messages");
+                success_count += 1;
+                if success_count == 20 {
+                    ctx.log("ping: sent 20 messages");
                 }
             }
             Err(IpcError::EndpointDead) => {

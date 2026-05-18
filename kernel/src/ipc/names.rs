@@ -7,7 +7,7 @@
 use crate::ipc::endpoint::EndpointId;
 use crate::smp::SpinLock;
 
-const MAX_ENTRIES: usize = 64;
+const MAX_ENTRIES: usize = 128;
 const NAME_MAX:    usize = 32;
 
 #[derive(Clone, Copy)]
@@ -68,6 +68,22 @@ pub fn register(name: &str, endpoint_id: EndpointId) {
     }
     drop(names);
     crate::kprintln!("ipc::names: table full, cannot register '{}'", name);
+}
+
+/// Remove the entry for `name`, freeing its slot for future registrations.
+pub fn unregister(name: &str) {
+    let bytes = name.as_bytes();
+    if bytes.len() > NAME_MAX { return; }
+    let len = bytes.len() as u8;
+    let mut names = NAMES.lock();
+    for entry in names.iter_mut() {
+        if entry.valid && entry.name_len == len
+            && &entry.name[..len as usize] == bytes
+        {
+            entry.valid = false;
+            return;
+        }
+    }
 }
 
 /// Look up an endpoint ID by service name.

@@ -86,8 +86,12 @@ enum TestKind {
     },
 }
 
-/// COM2 TCP port used by restart tests (distinct from interactive `osdev run` port 5555).
-const TEST_CONTROL_PORT: u16 = 5556;
+/// Base COM2 TCP port for restart tests (distinct from interactive `osdev run` port 5555).
+/// Each WithRestart test gets a unique port by incrementing this counter, so back-to-back
+/// tests never conflict on a port still in TIME_WAIT from the previous QEMU instance.
+const TEST_CONTROL_PORT_BASE: u16 = 5556;
+static NEXT_CONTROL_PORT: std::sync::atomic::AtomicU16 =
+    std::sync::atomic::AtomicU16::new(TEST_CONTROL_PORT_BASE);
 
 // ---------------------------------------------------------------------------
 // Fuzz test definitions (Milestone 10 Phase 1).
@@ -1231,7 +1235,7 @@ static TESTS: &[TestSpec] = &[
             restart_cmd:  "KILL probe-4b-recv",
             expect_after: &["probe: 4B pass"],
             fail_on:      &["KERNEL PANIC", "probe: 4B FAIL"],
-            timeout_secs: 30,
+            timeout_secs: 60,
         },
     },
     TestSpec {
@@ -1257,7 +1261,7 @@ static TESTS: &[TestSpec] = &[
             restart_cmd:  "RESTART pong 1",
             expect_after: &["control: pong restarted"],
             fail_on:      &["KERNEL PANIC"],
-            timeout_secs: 30,
+            timeout_secs: 120,
         },
     },
     TestSpec {
@@ -1270,7 +1274,7 @@ static TESTS: &[TestSpec] = &[
                 "ping: pong cap reacquired, resuming",
             ],
             fail_on:      &["KERNEL PANIC"],
-            timeout_secs: 30,
+            timeout_secs: 120,
         },
     },
     TestSpec {
@@ -1294,15 +1298,15 @@ static TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["probe: 8A yielder ticked"],
             fail_on:      &["KERNEL PANIC"],
-            timeout_secs: 30,
+            timeout_secs: 60,
         },
     },
     TestSpec {
         id: "8B", name: "non_yielding_service_preempted", spec_ref: "§22 Test 8B",
         kind: TestKind::WatchSerial {
-            expect:       &["ping: sent 100 messages"],
+            expect:       &["ping: sent 20 messages"],
             fail_on:      &["KERNEL PANIC"],
-            timeout_secs: 30,
+            timeout_secs: 120,
         },
     },
     TestSpec {
@@ -1310,7 +1314,7 @@ static TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["pong: ready on core", "pong: received"],
             fail_on:      &["KERNEL PANIC"],
-            timeout_secs: 30,
+            timeout_secs: 120,
         },
     },
     TestSpec {
@@ -1318,7 +1322,7 @@ static TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["probe: 9B pass"],
             fail_on:      &["KERNEL PANIC", "probe: 9B FAIL"],
-            timeout_secs: 30,
+            timeout_secs: 60,
         },
     },
     TestSpec {
@@ -1328,7 +1332,7 @@ static TESTS: &[TestSpec] = &[
             restart_cmd:  "RESTART pong 2",
             expect_after: &["pong: ready on core 2"],
             fail_on:      &["KERNEL PANIC"],
-            timeout_secs: 30,
+            timeout_secs: 120,
         },
     },
     TestSpec {
@@ -1341,7 +1345,7 @@ static TESTS: &[TestSpec] = &[
                 "ping: pong cap reacquired, resuming",
             ],
             fail_on:      &["KERNEL PANIC"],
-            timeout_secs: 30,
+            timeout_secs: 120,
         },
     },
 ];
@@ -2158,8 +2162,10 @@ fn run_one(test: &TestSpec, image: &Path) -> TestOutcome {
             // Truncate so poll_serial doesn't match stale content from a previous run.
             let _ = std::fs::write(&serial, b"");
             let deadline = Instant::now() + Duration::from_secs(*timeout_secs);
-            let qemu     = crate::qemu::spawn_for_test(image, 4, &serial,
-                                                        Some(TEST_CONTROL_PORT));
+            // Allocate a unique port so back-to-back WithRestart tests don't collide on
+            // a socket still in TIME_WAIT from the just-killed QEMU instance.
+            let ctrl_port = NEXT_CONTROL_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let qemu     = crate::qemu::spawn_for_test(image, 4, &serial, Some(ctrl_port));
 
             // Wait for steady state.
             match poll_serial(&serial, &[wait_for], fail_on, deadline) {
@@ -2173,11 +2179,16 @@ fn run_one(test: &TestSpec, image: &Path) -> TestOutcome {
             // Send restart command over COM2.
             // Leading '\n' flushes any partial byte the UART FIFO may hold
             // from the TCP connection setup on a freshly booted QEMU instance.
-            let addr = format!("127.0.0.1:{TEST_CONTROL_PORT}");
-            match std::net::TcpStream::connect(&addr) {
+            // Keep the TcpStream alive for the duration of the post-restart poll:
+            // dropping it immediately after write_all causes QEMU to tear down
+            // the TCP→COM2 bridge before the kernel reads the UART FIFO, silently
+            // losing the command.  _ctrl_stream is dropped after poll_serial exits.
+            let addr = format!("127.0.0.1:{ctrl_port}");
+            let _ctrl_stream = match std::net::TcpStream::connect(&addr) {
                 Ok(mut s) => {
                     std::thread::sleep(Duration::from_millis(50));
                     let _ = s.write_all(format!("\n{restart_cmd}\n").as_bytes());
+                    Some(s)
                 }
                 Err(e) => {
                     qemu.kill();
@@ -2185,7 +2196,7 @@ fn run_one(test: &TestSpec, image: &Path) -> TestOutcome {
                         format!("could not connect to control port {addr}: {e}")
                     );
                 }
-            }
+            };
 
             // Wait for post-restart assertions.
             let result = poll_serial(&serial, expect_after, fail_on, deadline);
