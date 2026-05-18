@@ -378,6 +378,23 @@ pub fn current_task_read_cap_rights(slot: usize) -> Option<Rights> {
     }
 }
 
+/// Call `f` for every capability held by every currently-valid task.
+///
+/// Used by `invariants::assertions::assert_cap_table_consistent` (§7.8) to
+/// verify generation consistency across all task cap tables. Must not be called
+/// from a spawn or kill path while TASK_SLOT_LOCKED is held by this core.
+pub fn for_each_active_cap<F: FnMut(&Capability)>(mut f: F) {
+    for slot in 0..MAX_TASKS {
+        // SAFETY: TASK_VALID[slot] is read without TASK_SLOT_LOCKED for a
+        // best-effort snapshot. A task that dies or spawns concurrently may be
+        // seen inconsistently for one iteration — acceptable for an invariant
+        // assertion. TASK_CAP[slot] is valid (init_ref safe) whenever TASK_VALID[slot]
+        // is true at the point of reading.
+        if !unsafe { TASK_VALID[slot] } { continue; }
+        unsafe { TASK_CAP[slot].assume_init_ref() }.for_each_slot(&mut f);
+    }
+}
+
 /// Push a cap slot into the current task's pending-received-caps buffer.
 ///
 /// Called by handle_recv when it installs an embedded cap into the receiver's

@@ -26,12 +26,21 @@ pub fn register(irq: u8, endpoint: EndpointId) {
 /// Deliver IRQ `irq` to the registered driver as an IPC message.
 ///
 /// # Safety
-/// Called from interrupt context with IF=0.
+/// Called from interrupt context with IF=0. The APIC EOI is sent unconditionally
+/// at the end; missing the EOI would leave the IRQ line permanently masked.
 pub unsafe fn deliver(irq: u8) {
     let endpoint = IRQ_TABLE.lock()[irq as usize];
     if let Some(ep) = endpoint {
-        todo!("build an IPC interrupt-event message; call ipc::routing::enqueue(ep, msg)")
+        let msg = crate::ipc::message::Message::interrupt_event(irq);
+        if let Some(receiver_slot) = crate::ipc::routing::enqueue_from_interrupt(ep, msg) {
+            // wake_by_slot marks the receiver Ready and sends a WAKE_RECEIVER IPI
+            // to its core if it lives on a different core than the one handling
+            // this IRQ (§12.2 cross-core delivery path).
+            crate::task::scheduler::wake_by_slot(receiver_slot, 0);
+        }
+        // If queue full: interrupt silently discarded; driver is overloaded (§12).
     }
-    // If no driver is registered, discard the interrupt. No panic — a driver
-    // may not have started yet during early boot.
+    // EOI must fire unconditionally — even on discard and even on full queue.
+    // If the APIC is not re-armed here, the IRQ line stays masked and the system hangs.
+    crate::arch::x86_64::interrupts::send_eoi();
 }

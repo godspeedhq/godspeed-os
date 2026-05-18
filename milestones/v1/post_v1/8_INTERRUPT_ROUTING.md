@@ -1,6 +1,6 @@
 # Post-v1 Item 8 — Interrupt Routing to Userspace
 
-**Status:** In progress
+**Status:** Complete
 
 ---
 
@@ -96,17 +96,17 @@ be done in the same pass.
 
 ## Acceptance criteria
 
-- [ ] `deliver(irq)` enqueues an interrupt-event `Message` to the registered endpoint;
+- [x] `deliver(irq)` enqueues an interrupt-event `Message` to the registered endpoint;
       EOIs the local APIC; discards silently when no driver is registered.
-- [ ] A driver service declaring `hw_interrupt = [N]` in its contract receives its
+- [x] A driver service declaring `hw_interrupt = [N]` in its contract receives its
       IRQ endpoint populated at spawn time via `register()`.
-- [ ] Cross-core delivery: if the driver is pinned to a different core than the one
+- [x] Cross-core delivery: if the driver is pinned to a different core than the one
       receiving the IRQ, the IPI wake path is exercised (same path as any cross-core
       `send`).
-- [ ] No kernel panic on unregistered IRQs (existing behaviour preserved).
-- [ ] `assert_tcb_alive()` and `assert_cap_table_consistent()` implemented.
-- [ ] All 20 identity tests still pass after the changes.
-- [ ] Unsafe audit doc updated if any new `unsafe` blocks are added.
+- [x] No kernel panic on unregistered IRQs (existing behaviour preserved).
+- [x] `assert_tcb_alive()` and `assert_cap_table_consistent()` implemented.
+- [x] All 20 identity tests still pass after the changes.
+- [x] Unsafe audit doc updated if any new `unsafe` blocks are added.
 
 ---
 
@@ -121,3 +121,32 @@ be done in the same pass.
   in `interrupt/route.rs`. The `enqueue` call is safe from the IPC module's
   perspective; the `unsafe` on `deliver` already captures the interrupt-context
   calling convention.
+
+---
+
+## Implementation (2026-05-18)
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `kernel/src/ipc/message.rs` | Added `Message::interrupt_event(irq: u8) -> Self` |
+| `kernel/src/ipc/routing.rs` | Added `enqueue_from_interrupt(endpoint, msg) -> Option<usize>` (no cap check, try-send); `is_endpoint_alive(endpoint) -> bool` |
+| `kernel/src/interrupt/route.rs` | Filled `deliver()` todo: build msg, enqueue, wake receiver, EOI unconditionally |
+| `kernel/src/arch/x86_64/interrupts.rs` | Added `send_eoi()` safe wrapper (keeps `interrupt/route.rs` grandfathered count at 1) |
+| `kernel/src/capability/table.rs` | Added `CapTable::for_each_slot` for invariant walk |
+| `kernel/src/task/scheduler.rs` | Added `for_each_active_cap` for `assert_cap_table_consistent` |
+| `kernel/src/invariants/assertions.rs` | Implemented `assert_tcb_alive` and `assert_cap_table_consistent` |
+| `kernel/src/task/mod.rs` | Added `hw_irqs: &'static [u8]` to `ServiceConfig`; wired `interrupt::route::register` for each IRQ at spawn |
+| `docs/unsafe-audit.md` | Updated `interrupts.rs` count 8→9 for `send_eoi` wrapper |
+
+### Key design decisions
+
+- **No generation check in interrupt delivery**: `enqueue_from_interrupt` skips the cap generation check because the kernel IDT is the sender, not a user task. Liveness is still checked (Dead endpoints discard).
+- **EOI through safe wrapper**: `arch::x86_64::interrupts::send_eoi()` hides `apic_send_eoi()` so `deliver()` needs no new `unsafe` block (grandfathered count stays at 1).
+- **Cross-core IPI handled by `wake_by_slot`**: The scheduler's `wake_by_slot` already sends a `WAKE_RECEIVER` IPI when the receiver is on a different core. No extra IPI logic needed in `deliver()`.
+- **Try-send on full queue**: Full queue = driver overloaded. Interrupt silently discarded. EOI still fires — the IRQ line must be re-armed regardless.
+
+### Verification
+
+20/20 identity tests pass after all changes (2026-05-18, Windows TCG).

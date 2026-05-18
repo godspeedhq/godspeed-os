@@ -115,6 +115,19 @@ pub fn wait_for_interrupt() {
     unsafe { core::arch::asm!("sti; hlt", options(nostack)) }
 }
 
+/// Signal End-Of-Interrupt to the local APIC so the interrupt line is re-armed.
+///
+/// Must be called at the end of every hardware IRQ handler (timer, device IRQs,
+/// IPIs). Calling it while interrupts are enabled is safe — it only writes
+/// the APIC EOI register, which has no effect on the current interrupt state.
+#[inline]
+pub fn send_eoi() {
+    // SAFETY: apic_send_eoi writes only the local APIC EOI register, which is
+    // idempotent and has no memory-safety implications; APIC is mapped before
+    // any IRQ fires.
+    unsafe { crate::arch::x86_64::boot::apic_send_eoi() }
+}
+
 /// Page-fault handler — kills the faulting task (§10.3).
 ///
 /// # Safety

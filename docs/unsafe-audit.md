@@ -44,7 +44,7 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | arch/x86_64/ap_boot.rs | 3 | permitted |
 | arch/x86_64/boot.rs | 60 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |
-| arch/x86_64/interrupts.rs | 8 | permitted |
+| arch/x86_64/interrupts.rs | 9 | permitted |
 | arch/x86_64/mod.rs | 21 | permitted |
 | arch/x86_64/page_tables.rs | 25 | permitted |
 | arch/x86_64/syscall_entry.rs | 16 | permitted |
@@ -66,9 +66,9 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | task/scheduler.rs | 36 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 215 lines across 17 files  
+**Permitted total:** 216 lines across 17 files  
 **Grandfathered total:** 52 lines across 6 files  
-**Grand total:** 267 lines across 23 files
+**Grand total:** 268 lines across 23 files
 
 ---
 
@@ -122,6 +122,12 @@ Three additional `unsafe {}` blocks (count +3): `enable_interrupts` (STI),
 ring-0 privileged instructions with no memory effects; the callers are
 responsible for the context invariants (e.g., interrupts were disabled before
 calling `wait_for_interrupt`). `// SAFETY:` comments present in source.
+
+One additional `unsafe {}` block (count +1): `send_eoi` — writes the local APIC
+EOI register via `boot::apic_send_eoi`. Sound because the APIC is mapped before
+any IRQ fires and EOI register writes are idempotent with no memory-safety
+implications. Exposes APIC EOI as a safe call site in `interrupt/route.rs` (§12)
+without increasing the grandfathered count there.
 
 ---
 

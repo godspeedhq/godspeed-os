@@ -45,6 +45,21 @@ impl Message {
     pub fn payload_bytes(&self) -> &[u8] {
         &self.payload[..self.payload_len]
     }
+
+    /// Build an interrupt-event message carrying the IRQ number (§12.2).
+    ///
+    /// Used exclusively by the kernel IDT routing path. No capability is
+    /// involved — the kernel is the sender. Payload is one byte: the IRQ number.
+    pub fn interrupt_event(irq: u8) -> Self {
+        let mut msg = Self {
+            payload:     [0u8; MAX_MESSAGE_SIZE],
+            payload_len: 1,
+            caps:        [None; MAX_EMBEDDED_CAPS],
+            cap_count:   0,
+        };
+        msg.payload[0] = irq;
+        msg
+    }
 }
 
 /// Errors returned by IPC syscalls — §8.6.

@@ -230,6 +230,39 @@ fn dequeue_locked(
     Ok((msg, sender_slot))
 }
 
+/// Kernel-internal interrupt delivery path. No capability or generation check —
+/// the caller is the kernel IDT, not a user task holding a capability.
+///
+/// Try-send semantics: if the queue is full the interrupt is silently discarded
+/// (driver overloaded; the APIC EOI still fires unconditionally in the caller).
+///
+/// Returns the blocked receiver slot if a task was waiting on `recv`, so the
+/// caller can call `scheduler::wake_by_slot` (which handles the cross-core IPI).
+pub fn enqueue_from_interrupt(endpoint: EndpointId, msg: Message) -> Option<usize> {
+    let mut table = TABLE.lock();
+    let idx = find_index(&*table, endpoint)?;
+
+    if table[idx].liveness == EndpointLiveness::Dead {
+        return None;
+    }
+
+    if let Some(slot) = table[idx].blocked_receiver.take() {
+        table[idx].queue.enqueue(msg).ok();
+        return Some(slot);
+    }
+
+    table[idx].queue.enqueue(msg).ok();
+    None
+}
+
+/// Returns `true` if `endpoint` is registered and alive in the routing table.
+///
+/// Used by `invariants::assertions::assert_tcb_alive` (§6.2).
+pub fn is_endpoint_alive(endpoint: EndpointId) -> bool {
+    let table = TABLE.lock();
+    table.iter().any(|e| e.valid && e.id == endpoint && e.liveness == EndpointLiveness::Alive)
+}
+
 /// Mark the endpoint dead: bump generation, drain queue, return blocked slots.
 ///
 /// Returns `(blocked_receiver_slot, blocked_sender_slot)` — the caller must

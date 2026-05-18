@@ -84,6 +84,17 @@ impl CapTable {
     pub fn remove(&mut self, slot: usize) -> Option<Capability> {
         self.slots.get_mut(slot)?.take()
     }
+
+    /// Iterate over all held capabilities in this table.
+    ///
+    /// Used by `invariants::assertions::assert_cap_table_consistent` (§7.8).
+    pub fn for_each_slot<F: FnMut(&Capability)>(&self, mut f: F) {
+        for slot in &self.slots {
+            if let Some(cap) = slot {
+                f(cap);
+            }
+        }
+    }
 }
 
 // ---
