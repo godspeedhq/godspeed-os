@@ -63,12 +63,12 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | main.rs | 2 | grandfathered |
 | syscall/dispatch.rs | 2 | grandfathered |
 | task/mod.rs | 7 | grandfathered |
-| task/scheduler.rs | 36 | grandfathered |
+| task/scheduler.rs | 45 | grandfathered |
 <!-- unsafe-inventory-end -->
 
 **Permitted total:** 215 lines across 17 files  
-**Grandfathered total:** 52 lines across 6 files  
-**Grand total:** 267 lines across 23 files
+**Grandfathered total:** 61 lines across 6 files  
+**Grand total:** 276 lines across 23 files
 
 ---
 
@@ -326,12 +326,28 @@ removing 5 unsafe lines.
 
 ### task/scheduler.rs *(grandfathered)*
 
-36 unsafe lines (reduced from 38 — two standalone `asm!` blocks replaced by
-`arch::x86_64::disable_interrupts()` and `arch::x86_64::wait_for_interrupt()`).
+45 unsafe lines (was 36; +9 from the deferred-PML4 self-kill fix).
 Covers: per-core current-task arrays, run-queue manipulation,
 `prepare_ring3_switch` (context frame write), `task_cap_init_empty`,
-`commit_task`, and memory-budget arrays. Sound in aggregate because: all arrays
-are indexed by slot or core_id with bounds checked at their call sites; ring3
-switch is called only from the scheduler with interrupts disabled; cap init
-runs before the task is visible to other cores.
-*(~10 SAFETY comments missing in source — needs back-fill.)*
+`commit_task`, memory-budget arrays, and the deferred PML4 free path.
+
+The 9 new lines are in `drain_pending_kstack` and `kill_task_by_slot`:
+- Reading `CORE_PENDING_PML4[cid]` and clearing it after drain.
+- `Frame::from_phys(PhysAddr(pml4_phys))` — sound because `pml4_phys` was
+  this task's own PML4 root, allocated from the frame allocator at spawn and
+  not freed in the reclaim loop; by the time `drain_pending_kstack` runs, CR3
+  has been switched to a different page table on this core.
+- `crate::memory::allocator::free_frame(frame)` — the frame is ours to free
+  (same invariant as above).
+- `CORE_CURRENT[my_core]` read and `is_self_kill` detection — bounded by
+  `my_core < MAX_CORES`; read under syscall context with IF=0.
+- `CORE_PENDING_PML4[my_core] = pml4_phys` store — single writer (this core).
+- `crate::smp::ipi::send_ipi(...)` call for cross-core IPI — APIC is
+  mapped before the scheduler starts; core index bounded by `MAX_CORES`.
+- Inner nested `unsafe {}` block forwarding the IPI call.
+
+Sound in aggregate because: all arrays are indexed by slot or core_id with
+bounds checked at their call sites; ring3 switch is called only from the
+scheduler with interrupts disabled; cap init runs before the task is visible
+to other cores; deferred PML4 free runs only after CR3 switch.
+`// SAFETY:` comments present in source for all new blocks.
