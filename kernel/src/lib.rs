@@ -35,6 +35,13 @@ pub mod ipc {
     pub mod queue;
 }
 
+// SpinLock is used by capability/table.rs (GLOBAL_RESOURCES).
+// spinlock.rs uses only core primitives so it compiles fine in std test mode.
+pub mod smp {
+    pub mod spinlock;
+    pub use spinlock::SpinLock;
+}
+
 // Bitmap allocator model — compiled only in test mode.
 // memory/bitmap.rs has no hardware dependencies and uses std (Vec, HashSet).
 #[cfg(test)]
