@@ -166,3 +166,30 @@ Previous best was 197/200 (1–2% failure rate under extreme load). Now fully de
 | Back-to-back 10-run score | 196–197/200 | 200/200 |
 | WithRestart test margin | ~0–40 s | ~237 s |
 | Per-test isolation | none | 500 ms OS reclaim pause |
+
+### Session 6 — timeout cleanup and documentation
+
+**Context:** session 5 fixed the root cause (identity-only supervisor). The inflated timeouts from sessions 3–4 were compensation for a problem that no longer exists. Session 6 trimmed them to reflect actual operation and recorded the verified deterministic result.
+
+**Timeout reductions (`osdev/src/validator.rs`):**
+
+| Test | Session 5 value | Session 6 value | Rationale |
+|------|----------------|----------------|-----------|
+| 4A   | 60s            | 30s            | identity-only; no probe contention |
+| 6A   | 240s           | 60s            | supervisor: ready ~3s; restart phase ~5s; 60s is ~6× margin |
+| 6B   | 240s           | 60s            | same as 6A |
+| 10A  | 300s           | 60s            | same as 6A + core-2 ready ~5s |
+| 10B  | 300s           | 60s            | same as 10A |
+
+**Verification:** 200/200 across 10 consecutive back-to-back runs with reduced timeouts (2026-05-18, Windows TCG).
+
+| Run | Passed | Failed |
+|-----|--------|--------|
+| 1–10 (each) | 20 | 0 |
+| **Total** | **200** | **0** |
+
+**Documentation updates:**
+
+- **`tests/qemu/identity/CLAUDE.md`** — updated timeout rationale section to reference `identity-only` build, corrected timeout table, added 10-run consecutive pass record.
+- **`CLAUDE.md` (root)** — replaced all 14 mermaid diagram blocks with ASCII art `text` blocks (renders in any viewer); removed ping/pong from §4.1 architectural layered view (they are demo services in `examples/`, not architectural components); clarified §15 note on stateless services.
+- **`README.md`** — full refactor: ASCII architecture diagram (no ping/pong), concise principle and test-suite tables, trimmed philosophy prose.
