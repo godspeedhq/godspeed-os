@@ -9,7 +9,7 @@
 //! IPI when the target task lives on a different core.
 
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 use crate::arch::x86_64::context_switch::{switch_context, TaskContext};
 use crate::capability::cap::{CapError, Capability};
@@ -137,7 +137,12 @@ static mut CORE_PENDING_KSTACK_LEN: [usize;                      MAX_CORES] = [0
 /// Fix: skip freeing the PML4 frame during the reclaim loop for self-kills;
 /// store it here and release it in drain_pending_pml4, which is called from
 /// the scheduler loop and timer tick — both run with a different CR3.
-static mut CORE_PENDING_PML4: [u64; MAX_CORES] = [0u64; MAX_CORES];
+///
+/// AtomicU64 (not static mut) so reads and writes at call sites are safe.
+/// The value is always written by one core and read by the same core, so
+/// Relaxed/Release/Acquire ordering is sufficient.
+static CORE_PENDING_PML4: [AtomicU64; MAX_CORES] =
+    [const { AtomicU64::new(0) }; MAX_CORES];
 
 /// Per-core save area for dead task context during self-kill.
 ///
@@ -889,16 +894,18 @@ fn drain_pending_kstack(cid: usize) {
     // Free any deferred PML4 frame from a prior self-kill.  By the time this
     // runs the core has switched to a different CR3, so freeing the old PML4
     // frame no longer risks a concurrent zeroing race (see CORE_PENDING_PML4).
-    // SAFETY: CORE_PENDING_PML4[cid] is written only by this core.
-    let pml4_phys = unsafe { CORE_PENDING_PML4[cid] };
+    // AtomicU64 load/store: no unsafe needed here.
+    let pml4_phys = CORE_PENDING_PML4[cid].load(Ordering::Acquire);
     if pml4_phys != 0 {
-        unsafe { CORE_PENDING_PML4[cid] = 0; }
+        CORE_PENDING_PML4[cid].store(0, Ordering::Relaxed);
         // SAFETY: pml4_phys was the task's own PML4 frame; CR3 has since been
         // switched away so no core's page-walker will read from it.
-        let frame = unsafe { crate::memory::frame::Frame::from_phys(
-            crate::memory::frame::PhysAddr(pml4_phys)
-        ) };
-        unsafe { crate::memory::allocator::free_frame(frame) };
+        unsafe {
+            let frame = crate::memory::frame::Frame::from_phys(
+                crate::memory::frame::PhysAddr(pml4_phys)
+            );
+            crate::memory::allocator::free_frame(frame);
+        }
     }
 }
 
@@ -1062,7 +1069,7 @@ pub fn kill_task_by_slot(slot: usize) {
                     crate::memory::allocator::free_frame(frame);
                 }
                 if is_self_kill && pml4_phys != 0 {
-                    CORE_PENDING_PML4[my_core] = pml4_phys;
+                    CORE_PENDING_PML4[my_core].store(pml4_phys, Ordering::Release);
                 }
                 freed_frames = buf.as_slice().len();
             } else {
