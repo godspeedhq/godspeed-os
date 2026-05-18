@@ -135,70 +135,42 @@ These are the laws that bound every design choice. Any change that violates an i
 
 ### 4.1 Layered View
 
-```mermaid
-flowchart TB
-    subgraph App["Application Services (replaceable)"]
-        ping
-        pong
-    end
-    subgraph Sys["System Services"]
-        logger
-        block["block-driver"]
-        fs
-    end
-    subgraph TCB["Trusted Root (non-restartable)"]
-        init
-        supervisor
-        registry
-    end
-    subgraph Kernel["Kernel (mechanism, not policy)"]
-        memory
-        scheduler
-        ipc
-        capability
-        syscall
-        interrupts
-        smp["smp / routing"]
-    end
-    subgraph Arch["Architecture Layer (unsafe boundary)"]
-        x86["arch/x86_64"]
-    end
-    HW[Hardware - multi-core]
-
-    App --> Sys
-    Sys --> TCB
-    TCB --> Kernel
-    Kernel --> Arch
-    Arch --> HW
+```text
+  ┌──────────────────────────────────────────────────┐
+  │  Application Services  (replaceable)             │
+  ├──────────────────────────────────────────────────┤
+  │  System Services                                 │
+  │  logger  ·  block-driver  ·  fs                  │
+  ├──────────────────────────────────────────────────┤
+  │  Trusted Root  (non-restartable)                 │
+  │  init  ·  supervisor  ·  registry                │
+  ├──────────────────────────────────────────────────┤
+  │  Kernel  (mechanism, not policy)                 │
+  │  memory · scheduler · ipc · capability           │
+  │  syscall · interrupts · smp/routing              │
+  ├──────────────────────────────────────────────────┤
+  │  Architecture Layer  (unsafe boundary)           │
+  │  arch/x86_64                                     │
+  ├──────────────────────────────────────────────────┤
+  │  Hardware  (multi-core)                          │
+  └──────────────────────────────────────────────────┘
 ```
 
 ### 4.2 SMP View (Per-Core)
 
-```mermaid
-flowchart LR
-    subgraph K["Kernel - shared, concurrent"]
-        RT["Routing Table<br/>(EndpointId → CoreId)"]
-        CT["Capability Table"]
-    end
-    subgraph C0["Core 0"]
-        RQ0["Run Queue"]
-        S0["Services pinned to Core 0<br/>(e.g. init, supervisor, ping)"]
-    end
-    subgraph C1["Core 1"]
-        RQ1["Run Queue"]
-        S1["Services pinned to Core 1<br/>(e.g. pong)"]
-    end
-    subgraph C2["Core 2"]
-        RQ2["Run Queue"]
-        S2["Services pinned to Core 2"]
-    end
-
-    S0 -->|syscall| K
-    S1 -->|syscall| K
-    S2 -->|syscall| K
-    K -.->|IPI| RQ0
-    K -.->|IPI| RQ1
-    K -.->|IPI| RQ2
+```text
+  Kernel (shared, concurrent)
+  ┌────────────────────────────────────────────────┐
+  │  Routing Table: EndpointId → CoreId            │
+  │  Capability Table                              │
+  └─────────────┬──────────────┬───────────────┬───┘
+            IPI │          IPI │           IPI │
+  ┌─────────────▼──┐  ┌────────▼───┐  ┌────────▼───┐
+  │    Core 0      │  │   Core 1   │  │   Core 2   │
+  │   Run Queue    │  │  Run Queue │  │  Run Queue │
+  │   Services     │  │  Services  │  │  Services  │
+  └────────────────┘  └────────────┘  └────────────┘
+    ▲ syscall             ▲ syscall       ▲ syscall
 ```
 
 ### 4.3 Kernel Scope (Strict)
@@ -365,33 +337,39 @@ syscall(cap, action, args):
     perform action
 ```
 
-```mermaid
-flowchart TD
-    SC[Syscall arrives with cap + action]
-    SC --> L{cap.resource_id<br/>in kernel table?}
-    L -->|no| CNH[Return CapNotHeld]
-    L -->|yes| G{cap.generation ==<br/>kernel_table generation?}
-    G -->|no — resource destroyed| ED[Return EndpointDead]
-    G -->|no — explicitly revoked| CR[Return CapRevoked]
-    G -->|yes| R{action in<br/>cap.rights?}
-    R -->|no| CIR[Return CapInsufficientRights]
-    R -->|yes| ACT[Perform action → Ok]
+```text
+  syscall(cap, action, args)
+    │
+    ├─ cap.resource_id in kernel table?
+    │       No  ──▶  CapNotHeld
+    │       Yes ↓
+    ├─ cap.generation == table generation?
+    │       No (destroyed)  ──▶  EndpointDead
+    │       No (revoked)    ──▶  CapRevoked
+    │       Yes ↓
+    └─ action in cap.rights?
+            No  ──▶  CapInsufficientRights
+            Yes ──▶  perform action  ──▶  Ok
 ```
 
 The generation check is one atomic comparison. It is the v1 mechanism for cross-core revocation: bumping the generation on one core makes every cap on every other core stale, with no synchronous notification required.
 
 ### 7.6 Lifecycle
 
-```mermaid
-stateDiagram-v2
-    [*] --> Created: kernel mints with current gen
-    Created --> Held: inserted into cap table
-    Held --> Used: syscall + rights + gen check
-    Used --> Held: action complete
-    Held --> Transferred: send w/ GRANT
-    Transferred --> Held: in receiver's table
-    Held --> Stale: kernel bumps resource gen
-    Stale --> [*]: next use returns CapRevoked / EndpointDead
+```text
+  [kernel mints cap with current generation]
+           │
+        Created
+           │  inserted into cap table
+         Held ◀────── action complete ──────┐
+           │  syscall + rights + gen check   │
+          Used ────────────────────────────▶─┘
+           │
+           ├── send with GRANT ──▶  Transferred ──▶  Held (receiver's table)
+           │
+           └── kernel bumps resource gen ──▶  Stale
+                                                 │
+                                    next use: CapRevoked / EndpointDead
 ```
 
 ### 7.7 Error Codes
@@ -467,28 +445,25 @@ On every send, the kernel:
 
 ### 8.4 Send Flow
 
-```mermaid
-sequenceDiagram
-    participant A as Service A (Core 0)
-    participant K as Kernel
-    participant B as Service B (Core 1)
-
-    A->>K: send(endpoint_cap, message)
-    K->>K: validate cap (rights + generation)
-    alt cap invalid
-        K-->>A: CapNotHeld / CapInsufficientRights
-    else generation mismatch (revoked)
-        K-->>A: CapRevoked
-    else generation mismatch (endpoint dead)
-        K-->>A: EndpointDead
-    else queue full (blocking send)
-        K->>K: block A in routing table
-        Note over A,B: A waits for queue space on Core 1
-    else queue has space
-        K->>K: copy message into B's queue (on Core 1)
-        K-->>A: Ok
-        K->>B: IPI Core 1, wake B if blocked on recv
-    end
+```text
+  Service A (Core 0)           Kernel                  Service B (Core 1)
+       │                          │                            │
+       │── send(endpoint_cap, ───▶│                            │
+       │        message)          │ validate cap               │
+       │                          │ (rights + generation)      │
+       │◀── CapNotHeld ───────────│  cap not in table          │
+       │◀── CapRevoked ───────────│  gen mismatch (revoked)    │
+       │◀── EndpointDead ─────────│  gen mismatch (dead)       │
+       │                          │                            │
+       │   [queue full]           │                            │
+       │   A blocked ─────────────│────────────────────────────│
+       │   in routing table       │  (waiting for queue space) │
+       │                          │                            │
+       │   [queue has space]      │                            │
+       │                          │── copy msg into B's queue ─│
+       │◀── Ok ───────────────────│                            │
+       │                          │── IPI Core 1 ─────────────▶│
+       │                          │   wake B if blocked        │
 ```
 
 ### 8.5 Message and Queue Format
@@ -545,17 +520,27 @@ The classic deadlock — A and B both call `send` to a full queue — is the dev
 - **Static placement.** Services are pinned at spawn; they never migrate.
 - **10 ms preemption quantum**, per core, enforced by each core's local timer.
 
-```mermaid
-stateDiagram-v2
-    [*] --> Ready: spawn completes
-    Ready --> Running: scheduler selects
-    Running --> Ready: timer preemption (10ms) / yield()
-    Running --> BlockedOnRecv: recv() — queue empty
-    Running --> BlockedOnSend: send() — queue full
-    BlockedOnRecv --> Ready: message arrives (IPI wake from sender)
-    BlockedOnSend --> Ready: queue drains (IPI wake) or EndpointDead
-    Running --> Dead: page fault / supervisor kill
-    Dead --> [*]: frames reclaimed, generation bumped
+```text
+  spawn ──▶  Ready
+               │  scheduler selects
+               ▼
+            Running ◀──────────────────────────────────────────┐
+               │                                                │
+               ├── timer preemption (10 ms) / yield() ─────────┘
+               │
+               ├── recv() on empty queue ──▶  BlockedOnRecv
+               │                                   │
+               │                   message arrives │
+               │                   (IPI wake) ─────┘
+               │
+               ├── send() on full queue ──▶  BlockedOnSend
+               │                                   │
+               │               queue drains (IPI) ─┤
+               │               or EndpointDead ─────┘
+               │
+               └── page fault / supervisor kill ──▶  Dead
+                                                        │
+                                            frames reclaimed, generation bumped
 ```
 
 ### 9.2 Placement (Strict)
@@ -620,16 +605,16 @@ limit   = "64MiB"   # maximum permitted
 
 ### 10.3 Enforcement
 
-```mermaid
-flowchart TD
-    Start[Service memory action]
-    Start --> Type{Action type}
-    Type -->|alloc within limit| Ok[Memory returned]
-    Type -->|alloc beyond limit| AD[AllocDenied returned]
-    Type -->|access outside mapped region| Fault[Page fault]
-    AD --> Cont[Service continues, may degrade]
-    Fault --> Kill[Service killed]
-    Kill --> Sup[Supervisor decides restart]
+```text
+  Service memory action
+    │
+    ├── alloc within limit ─────────────▶  Memory returned  ──▶  Continue
+    │
+    ├── alloc beyond limit ─────────────▶  AllocDenied  ──▶  Service continues (may degrade)
+    │
+    └── access outside mapped region ──▶  Page fault  ──▶  Service killed
+                                                                  │
+                                                    Supervisor decides restart
 ```
 
 ### 10.4 Two Failure Modes
@@ -648,30 +633,29 @@ When a page is unmapped (service killed, memory reclaimed), the kernel issues a 
 
 ### 11.1 Sequence
 
-```mermaid
-sequenceDiagram
-    participant BL as Limine (Bootloader)
-    participant K as Kernel (BSP)
-    participant APs as APs (Cores 1..N)
-    participant I as init (Core 0)
-    participant S as supervisor (Core 0)
-    participant R as registry (Core 0)
-    participant Svc as Other services
+```text
+  Limine (Bootloader)
+    ── loads kernel image, hands off to BSP
+    ── supplies: physical memory map, framebuffer, SMP topology, HHDM
 
-    BL->>K: load kernel image, jump (BSP only)
-    Note over BL,K: Limine supplies memory map,<br/>framebuffer info, SMP topology
-    K->>K: paging, IDT, GDT
-    K->>K: frame allocator, cap subsystem
-    K->>APs: start APs (real-mode trampoline → long mode)
-    APs->>APs: enter idle scheduler loop
-    K->>K: mark all available cores ready
-    K->>I: spawn init on Core 0
-    I->>S: spawn supervisor on Core 0
-    I->>R: spawn registry on Core 0
-    I->>I: spawn logger on Core 0
-    S->>S: read boot manifest
-    S->>Svc: spawn services per placement policy (§9.2)
-    Note over BL,Svc: System reaches multi-core steady state
+  Kernel BSP
+    ── paging, IDT, GDT
+    ── frame allocator, capability subsystem
+    ── start APs (real-mode trampoline → long mode)
+         APs: enter idle scheduler loop
+    ── mark all available cores ready
+    ── spawn init on Core 0
+
+  init (Core 0)
+    ── spawn supervisor on Core 0
+    ── spawn registry on Core 0
+    ── spawn logger on Core 0
+
+  supervisor (Core 0)
+    ── read boot manifest
+    ── spawn services per placement policy (§9.2)
+
+  ── System reaches multi-core steady state ──
 ```
 
 The bootloader is **Limine**, accessed via the Limine Boot Protocol. Limine is responsible for loading the kernel image, supplying the physical memory map, the framebuffer descriptor, kernel relocation info, and the SMP topology (APIC IDs of all available cores). See Appendix A for the bootloader rationale and installation story.
@@ -711,18 +695,19 @@ Kernel routes interrupts. Drivers are user-space services. Essential drivers (bl
 
 ### 12.2 Routing
 
-```mermaid
-sequenceDiagram
-    participant HW as Hardware
-    participant K as Kernel IDT
-    participant Route as Interrupt Router
-    participant Drv as Driver Service
-
-    HW->>K: IRQ N (on some core)
-    K->>Route: dispatch by IRQ number
-    Route->>Drv: IPC message to interrupt endpoint
-    Drv->>Drv: recv() returns interrupt event
-    Drv->>HW: handle device via MMIO cap
+```text
+  Hardware IRQ N (arrives on some core)
+    │
+    ▼
+  Kernel IDT handles interrupt
+    │
+    ▼
+  Interrupt Router dispatches by IRQ number
+    │
+    ▼  IPC message to driver's interrupt endpoint
+  Driver Service
+    ── recv() returns interrupt event
+    ── handles device via MMIO capability
 ```
 
 If the driver runs on a different core than the one receiving the IRQ, routing crosses cores via the same IPC mechanism as any other cross-core send.
@@ -804,53 +789,46 @@ Every syscall checks the calling task's capability table, populated *from* the c
 7. Service registers any owned endpoints with registry.
 8. Service enters main loop on its assigned core.
 
-```mermaid
-sequenceDiagram
-    participant Sup as Supervisor
-    participant K as Kernel
-    participant R as Registry
-    participant Svc as New Service
-
-    Sup->>K: spawn syscall (name, contract)
-    K->>K: resolve placement — contract core or round-robin (§9.2)
-    alt PlacementInvalid
-        K-->>Sup: Err(PlacementInvalid)
-    else core available
-        K->>K: allocate Task + CapTable from contract
-        K->>K: map binary into new address space
-        K->>K: enqueue task on target core run queue
-        K-->>Sup: Ok(task_id)
-        Svc->>R: register endpoint (name → cap)
-        R-->>Svc: Ok
-        Svc->>Svc: service_main() — enters work loop
-    end
+```text
+  Supervisor ─── spawn(name, contract) ──▶  Kernel
+                                               │
+                              resolve placement (§9.2):
+                              contract core or round-robin
+                                               │
+                        Err(PlacementInvalid) ◀─┤  (core unavailable: stop here)
+                                               │
+                              allocate Task + CapTable from contract
+                              map binary into new address space
+                              enqueue task on target core run queue
+                                               │
+  Supervisor ◀── Ok(task_id) ────────────────┘
+                                               │
+  New Service:                      enters execution
+    ── registers endpoint with registry
+    ── service_main() ── enters work loop
 ```
 
 ### 14.2 Restart and Cap Rebinding (Possibly Cross-Core)
 
-```mermaid
-sequenceDiagram
-    participant A as Service A (Core 0)
-    participant Sup as Supervisor (Core 0)
-    participant K as Kernel
-    participant B_old as Service B gen=4 (Core 1)
-    participant B_new as Service B gen=5 (Core 2)
-    participant R as Registry
+```text
+  Steady state: Service A (Core 0) holds cap to Service B gen=4 (Core 1)
 
-    Note over A,B_old: Steady state — A holds cap to B (gen=4)
-    Sup->>K: kill(B)
-    K->>K: close B's endpoints, drop queued
-    K->>K: bump B's resource generation (4 → 5)
-    K->>K: reclaim B's memory (TLB shootdown)
-    A->>K: send via gen=4 cap
-    K-->>A: EndpointDead (gen mismatch)
-    Sup->>K: spawn B on Core 2 (round-robin or override)
-    K->>B_new: start, cap table populated with gen=5
-    B_new->>R: register endpoint
-    A->>R: lookup("B")
-    R-->>A: fresh cap (gen=5, points to Core 2)
-    A->>K: send via fresh cap
-    K-->>A: Ok (routes to Core 2)
+  Step 1 — Supervisor kills B:
+    Kernel closes B's endpoints, drains queues
+    Kernel bumps B's generation: 4 → 5
+    Kernel reclaims B's memory (TLB shootdown on all cores)
+
+  Step 2 — A tries to send via stale cap:
+    A ── send(gen=4 cap) ──▶ Kernel ── EndpointDead ──▶ A
+                              (gen mismatch: held=4, current=5)
+
+  Step 3 — Supervisor spawns B on Core 2:
+    Kernel starts B with fresh cap table (gen=5)
+    B registers endpoint with registry
+
+  Step 4 — A reacquires:
+    A ── registry.lookup("B") ──▶ fresh cap (gen=5, Core 2)
+    A ── send(gen=5 cap) ──▶ Ok  (routes to Core 2)
 ```
 
 **Key principle:** the new instance may run on a different core than the old one. Clients never know — they see only `EndpointDead`, look up via registry, and resume.
@@ -886,21 +864,22 @@ State belongs to services, not the kernel. Services that need to survive restart
 
 The filesystem service is the externalization mechanism for everyone else and cannot persist *to itself*. Resolution: the block driver holds a direct hardware capability and stores fs metadata. In v1, both block-driver and fs are non-restartable. v2 will give fs transactional metadata recovery.
 
-Stateless services (logger in v1, ping, pong) restart trivially.
+Stateless services (logger in v1) restart trivially. Example application services (ping, pong) are also stateless and restart trivially — but they are demonstration services in `examples/`, not permanent architectural components.
 
 ---
 
 ## 16. Update Model
 
-```mermaid
-flowchart LR
-    Pkg[Update package] --> Sig{Signature valid?}
-    Sig -->|no| Reject[Reject]
-    Sig -->|yes| Schema{Contract valid?}
-    Schema -->|no| Reject
-    Schema -->|yes| Policy{Policy allows?}
-    Policy -->|no| Reject
-    Policy -->|yes| Restart[Supervisor restarts service with new binary]
+```text
+  Update package
+    │
+    ├── Signature valid?   No  ──▶  Reject
+    │       Yes ↓
+    ├── Contract valid?    No  ──▶  Reject
+    │       Yes ↓
+    └── Policy allows?     No  ──▶  Reject
+            Yes ↓
+    Supervisor restarts service with new binary
 ```
 
 Push vs pull is irrelevant — verification is the security property. Live code update is permanently rejected (§2.5); the only update mechanism is restart-with-new-binary.
@@ -1017,29 +996,34 @@ The test suite is layered. Each layer answers a different question about kernel 
 | Adversarial | Capability isolation under attack                    | An attack succeeds where the spec says it fails   | Active |
 | Chaos       | Graceful degradation under partial failures          | A defined failure mode is not handled cleanly     | Active |
 
-```mermaid
-graph LR
-    subgraph Foundation["Foundation — must pass before anything else"]
-        I["Identity (§22)<br/>20 tests — 20/20 ✅<br/>Constitutional invariants"]
-    end
-    subgraph Coverage["Correctness coverage"]
-        P["Property<br/>Universal invariants<br/>under random inputs"]
-        F["Fuzz<br/>Crash resistance<br/>on adversarial inputs"]
-    end
-    subgraph Endurance["Endurance"]
-        S["Stress<br/>No drift, leak, or<br/>corruption over time"]
-        A["Adversarial<br/>Cap isolation<br/>under attack"]
-    end
-    subgraph Measurement["Measurement"]
-        B["Performance<br/>Latency/throughput<br/>baselines"]
-        C["Chaos<br/>Graceful degradation<br/>under partial failures"]
-    end
-    I --> P
-    I --> F
-    P --> S
-    F --> A
-    S --> B
-    A --> C
+```text
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  Foundation — must pass before anything else                        │
+  │  Identity (§22) — 20 tests — 20/20 ✅ — Constitutional invariants  │
+  └──────────────────────┬──────────────────────────────────────────────┘
+          ┌──────────────┴─────────────────┐
+          ▼                                ▼
+  ┌───────────────────┐          ┌───────────────────┐
+  │  Property         │          │  Fuzz             │
+  │  Universal invs.  │          │  Crash resistance │
+  │  under random     │          │  on adversarial   │
+  │  inputs           │          │  inputs           │
+  └───────┬───────────┘          └──────────┬────────┘
+          ▼                                 ▼
+  ┌───────────────────┐          ┌───────────────────┐
+  │  Stress           │          │  Adversarial      │
+  │  No drift, leak,  │          │  Cap isolation    │
+  │  or corruption    │          │  under attack     │
+  └───────┬───────────┘          └──────────┬────────┘
+          └─────────────┬────────────────────┘
+                ┌───────┴────────┐
+                ▼                ▼
+      ┌──────────────────┐  ┌──────────────────┐
+      │  Performance     │  │  Chaos           │
+      │  Latency /       │  │  Graceful        │
+      │  throughput      │  │  degradation     │
+      │  baselines       │  │  under failures  │
+      └──────────────────┘  └──────────────────┘
 ```
 
 Tests live under `tests/qemu/`, organized by category:
@@ -1191,17 +1175,23 @@ Bar: the system either continues correctly with degraded capacity, or panics lou
 
 ### 22.3 Test Harness
 
-```mermaid
-flowchart TD
-    A[osdev test identity] --> B[Build kernel + test service]
-    B --> C[Boot OS in QEMU with -smp N]
-    C --> D[Test service runs scenario]
-    D --> E[Harness reads serial console]
-    E --> F{Match expected output?}
-    F -->|yes| Pass[PASS]
-    F -->|no| Fail[FAIL with diff]
-    C --> G{Timeout 30s?}
-    G -->|yes| Fail
+```text
+  osdev test identity
+    │
+    ├── build: identity-only supervisor + kernel
+    ├── create disk image, install bootloader
+    │
+    └── for each test:
+           │
+           ├── boot QEMU (-smp N; + -enable-kvm when /dev/kvm available)
+           ├── test service runs scenario
+           ├── harness reads serial console line by line
+           │
+           ├── expected output matched?  ──▶  PASS
+           ├── fail_on string seen?      ──▶  FAIL
+           ├── timeout fires?            ──▶  FAIL
+           │
+           └── 500 ms isolation pause (OS reclaims QEMU pages)
 ```
 
 ### 22.4 Sequencing Note
