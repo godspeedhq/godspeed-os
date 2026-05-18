@@ -15,6 +15,17 @@ use godspeed_sdk::ServiceContext;
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
+    // Spawn pong and ping first so IPC between them is established well before
+    // the 178 probe services compete for scheduler quanta.  Pong must precede
+    // ping: ping's SEND cap to pong is wired by the kernel at spawn time.
+    if ctx.spawn_on("pong", 1).is_err() {
+        ctx.log("supervisor: WARN: failed to spawn pong on core 1, trying core 0");
+        let _ = ctx.spawn_on("pong", 0);
+    }
+    if ctx.spawn_on("ping", 0).is_err() {
+        ctx.log("supervisor: WARN: failed to spawn ping");
+    }
+
     // --- Probe services (§22 Group A identity tests) ---
     // Recv-endpoint probes must come first so their endpoints are registered
     // before sender probes are spawned (caps are wired at spawn time).
@@ -274,17 +285,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let _ = ctx.spawn("brutal-id-13-send"); // fills queue then blocks on core 0
     // T11 self-referential queue: brutal-id-11 sends to itself; any spawn order.
     let _ = ctx.spawn("brutal-id-11");
-
-    // --- Original ping/pong services ---
-    // Spawn pong first so the kernel registers "pong" in its name table before
-    // ping is spawned (ping needs a SEND cap to pong at spawn time).
-    if ctx.spawn_on("pong", 1).is_err() {
-        ctx.log("supervisor: WARN: failed to spawn pong on core 1, trying core 0");
-        let _ = ctx.spawn_on("pong", 0);
-    }
-    if ctx.spawn_on("ping", 0).is_err() {
-        ctx.log("supervisor: WARN: failed to spawn ping");
-    }
 
     ctx.log("supervisor: ready");
 

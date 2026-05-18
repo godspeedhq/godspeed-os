@@ -42,7 +42,7 @@ With KVM, boot takes ~3–5 s, well within the 30 s per-test timeout.
 
 ## Status
 
-✅ **Complete** — 20/20 identity tests passing locally and in CI.
+✅ **Complete** — 20/20 identity tests passing locally (Windows TCG, 3/3 consecutive rounds) and in CI (Linux KVM).
 
 ### Additional fixes (session 2)
 
@@ -57,3 +57,74 @@ call (timer tick or scheduler idle) when a different CR3 is already loaded.
 
 **`osdev/src/validator.rs`** — Fixed test 10B `timeout_secs` 60 → 120. Pong spawns at ~70 s
 in the test sequence, making the 60 s deadline unreachable.
+
+### Additional fixes (session 3 — Windows TCG determinism)
+
+Root cause of remaining flakiness: supervisor spawns 100+ probe services before pong/ping,
+consuming ~25–30 s on Windows TCG. Tests with `timeout_secs: 120` that depended on
+`"pong: received"` could see that string appear at t=80–100 s, leaving too little margin for
+the `WithRestart` expect_after phase (another 30–40 s for kill + spawn + reacquisition on TCG).
+
+Confirmed failing patterns from diagnostic runs:
+- 6A: `wait_for` satisfied but `"control: pong restarted"` not seen before deadline
+- 6B: `wait_for` satisfied but ping reacquisition strings not seen before deadline
+- 10A: `"pong: received"` itself timed out on a slow TCG run
+
+**`osdev/src/validator.rs`** — Increased timeouts for all pong-communication-dependent tests:
+
+| Test | Old | Final | Reason |
+|------|-----|-------|--------|
+| 1A   | 30s | 120s  | supervisor spawns 178 probes before "ready"; loop takes up to 90s on loaded TCG |
+| 7A   | 30s |  60s  | competing probe services delayed probe service output |
+| 7B   | 30s |  60s  | same |
+| 8A   | 60s | 120s  | yielder competes with 100+ probes for scheduler quanta |
+| 8B   | 120s| 240s  | ping blocks on send when pong queue fills; unblocks only when pong spawns |
+| 6A   | 120s| 300s  | WithRestart: 178 probes before pong; pong receive can appear at t≈175-180s, leaving <5s for restart phase |
+| 6B   | 120s| 300s  | same + reacquisition phase (ping EndpointDead → registry lookup → cap reacquired) |
+| 9A   | 120s| 300s  | WatchSerial: pong first receive at t≈175-180s on slow TCG runs |
+| 10A  | 120s| 300s  | WithRestart: same as 6A |
+| 10B  | 120s| 300s  | same as 6B |
+
+Root cause: supervisor spawns 178 probe services before pong/ping on a sequential loop. Each
+spawn takes ~100ms wall on TCG; 178 × 100ms = 17.8s for spawns, plus scheduling contention
+after spawning means pong's first receive can occur anywhere from t=40s to t=180s depending on
+system load. The 300s ceiling covers all observed cases with substantial margin.
+
+KVM (CI): tests complete in <30s each; the 300s ceiling is never reached.
+Windows TCG: generous ceiling covers variance without impacting fast runs.
+
+### Additional fixes (session 4 — structural fix)
+
+Root cause of back-to-back run failures: even with 300s timeouts, 3+ consecutive full suite runs
+accumulate system load (60 QEMU instances) that could push `"pong: received"` to t≈175-180s, leaving
+only ~120s for the restart phase of `WithRestart` tests. Occasionally the restart phase itself took
+>120s under extreme load, causing 1–4 failures per batch on run 1.
+
+**Structural fix applied:**
+
+**`services/supervisor/src/main.rs`** — Moved pong/ping spawns to the **beginning** of `service_main`,
+before all 178 probe spawns. `"supervisor: ready"` remains logged after all probes complete.
+- Before: pong and ping spawned at lines 281-287 (after 178 probe spawns)
+- After: pong and ping spawned first (lines 17-27), `"supervisor: ready"` still after all probes
+
+With this change, `"pong: received"` appears at t≈5-10s instead of t≈40-180s on any load level.
+
+**`osdev/src/validator.rs`** — `WithRestart` tests changed to trigger restart on `"supervisor: ready"`
+(after probe-spawn loop ends, supervisor safely in yield loop) instead of `"pong: received"` (could
+fire mid-spawn-loop). Timeouts cut significantly:
+
+| Test | Session 3 | Session 4 | Change |
+|------|-----------|-----------|--------|
+| 6A   | 300s      | 180s      | `wait_for` → `"supervisor: ready"`; restart phase ≤30s; total ≤150s |
+| 6B   | 300s      | 180s      | same |
+| 8B   | 240s      | 120s      | pong ready before ping starts; no queue-full stall |
+| 9A   | 300s      |  60s      | `"pong: received"` at t≈5-10s; no probe contention |
+| 10A  | 300s      | 180s      | `wait_for` → `"supervisor: ready"` |
+| 10B  | 300s      | 180s      | same |
+
+**Why `"supervisor: ready"` as the trigger (not `"pong: received"`):** if restart fires while supervisor is
+still in spawn loop (mid-`ctx.spawn()` sequence), the supervisor can re-encounter pong's name during
+a subsequent probe spawn. Using `"supervisor: ready"` as the gate guarantees supervisor is in its
+`loop { ctx.yield_cpu(); }` idle path — no spawns in flight, no possible ordering conflict.
+
+Total per-run wall time on Windows TCG (fresh system): drops from ~2100s to ~1200s.

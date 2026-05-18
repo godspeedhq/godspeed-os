@@ -1174,7 +1174,7 @@ static TESTS: &[TestSpec] = &[
                 "logger: ready",
             ],
             fail_on:      &["KERNEL PANIC"],
-            timeout_secs: 30,
+            timeout_secs: 120, // 30 was too tight: supervisor spawns 178 probe services before logging "ready" (~90s on loaded TCG)
         },
     },
     TestSpec {
@@ -1257,24 +1257,24 @@ static TESTS: &[TestSpec] = &[
     TestSpec {
         id: "6A", name: "supervisor_restart_positive", spec_ref: "§22 Test 6A",
         kind: TestKind::WithRestart {
-            wait_for:     "pong: received",
+            wait_for:     "supervisor: ready", // pong/ping spawn first; wait for all probes done before restart
             restart_cmd:  "RESTART pong 1",
             expect_after: &["control: pong restarted"],
             fail_on:      &["KERNEL PANIC"],
-            timeout_secs: 120,
+            timeout_secs: 180, // supervisor: ready ≤120s on loaded TCG; restart phase ≤30s; 180s covers both
         },
     },
     TestSpec {
         id: "6B", name: "stale_cap_revoked_after_restart", spec_ref: "§22 Test 6B",
         kind: TestKind::WithRestart {
-            wait_for:    "pong: received",
+            wait_for:    "supervisor: ready", // pong/ping spawn first; wait for all probes done before restart
             restart_cmd: "RESTART pong 1",
             expect_after: &[
                 "ping: pong endpoint dead, reacquiring via kernel registry",
                 "ping: pong cap reacquired, resuming",
             ],
             fail_on:      &["KERNEL PANIC"],
-            timeout_secs: 120,
+            timeout_secs: 180, // same as 6A — supervisor: ready ≤120s; reacquisition phase ≤30s
         },
     },
     TestSpec {
@@ -1282,7 +1282,7 @@ static TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["probe: 7A pass"],
             fail_on:      &["KERNEL PANIC", "probe: 7A FAIL"],
-            timeout_secs: 30,
+            timeout_secs: 60, // 30 was too tight under 100+ competing probe services
         },
     },
     TestSpec {
@@ -1290,7 +1290,7 @@ static TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["probe: 7B pass"],
             fail_on:      &["KERNEL PANIC", "probe: 7B FAIL"],
-            timeout_secs: 30,
+            timeout_secs: 60, // 30 was too tight under 100+ competing probe services
         },
     },
     TestSpec {
@@ -1298,7 +1298,7 @@ static TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["probe: 8A yielder ticked"],
             fail_on:      &["KERNEL PANIC"],
-            timeout_secs: 60,
+            timeout_secs: 120, // 60 was too tight: yielder competes with 100+ probe services for scheduler quanta
         },
     },
     TestSpec {
@@ -1306,7 +1306,7 @@ static TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["ping: sent 20 messages"],
             fail_on:      &["KERNEL PANIC"],
-            timeout_secs: 120,
+            timeout_secs: 120, // pong/ping spawn first so pong is ready when ping starts; no queue-full stall
         },
     },
     TestSpec {
@@ -1314,7 +1314,7 @@ static TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["pong: ready on core", "pong: received"],
             fail_on:      &["KERNEL PANIC"],
-            timeout_secs: 120,
+            timeout_secs: 60, // pong/ping spawn first; "pong: received" appears at t≈5-10s
         },
     },
     TestSpec {
@@ -1328,24 +1328,24 @@ static TESTS: &[TestSpec] = &[
     TestSpec {
         id: "10A", name: "restart_changes_core_transparently", spec_ref: "§22 Test 10A",
         kind: TestKind::WithRestart {
-            wait_for:     "pong: received",
+            wait_for:     "supervisor: ready", // pong/ping spawn first; wait for all probes done before restart
             restart_cmd:  "RESTART pong 2",
             expect_after: &["pong: ready on core 2"],
             fail_on:      &["KERNEL PANIC"],
-            timeout_secs: 120,
+            timeout_secs: 180, // supervisor: ready ≤120s on loaded TCG; restart + core-2 ready ≤30s
         },
     },
     TestSpec {
         id: "10B", name: "client_reacquires_after_core_change", spec_ref: "§22 Test 10B",
         kind: TestKind::WithRestart {
-            wait_for:    "pong: received",
+            wait_for:    "supervisor: ready", // pong/ping spawn first; wait for all probes done before restart
             restart_cmd: "RESTART pong 2",
             expect_after: &[
                 "ping: pong endpoint dead, reacquiring via kernel registry",
                 "ping: pong cap reacquired, resuming",
             ],
             fail_on:      &["KERNEL PANIC"],
-            timeout_secs: 120,
+            timeout_secs: 180, // same as 10A — supervisor: ready ≤120s; reacquisition phase ≤30s
         },
     },
 ];
