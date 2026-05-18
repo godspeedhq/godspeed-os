@@ -1225,7 +1225,7 @@ static TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["probe: 4A pass"],
             fail_on:      &["KERNEL PANIC", "probe: 4A FAIL"],
-            timeout_secs: 60,
+            timeout_secs: 30,
         },
     },
     TestSpec {
@@ -1261,7 +1261,7 @@ static TESTS: &[TestSpec] = &[
             restart_cmd:  "RESTART pong 1",
             expect_after: &["control: pong restarted"],
             fail_on:      &["KERNEL PANIC"],
-            timeout_secs: 240, // supervisor: ready ≤120s on loaded TCG; restart phase ≤30s; 240s covers both with margin
+            timeout_secs: 60, // identity-only supervisor: ready ~3s; restart phase ~5s; 60s is ~6× margin
         },
     },
     TestSpec {
@@ -1274,7 +1274,7 @@ static TESTS: &[TestSpec] = &[
                 "ping: pong cap reacquired, resuming",
             ],
             fail_on:      &["KERNEL PANIC"],
-            timeout_secs: 240, // same as 6A — supervisor: ready ≤120s; reacquisition phase ≤30s; 240s covers both with margin
+            timeout_secs: 60, // identity-only supervisor: ready ~3s; reacquisition phase ~5s; 60s is ~6× margin
         },
     },
     TestSpec {
@@ -1332,7 +1332,7 @@ static TESTS: &[TestSpec] = &[
             restart_cmd:  "RESTART pong 2",
             expect_after: &["pong: ready on core 2"],
             fail_on:      &["KERNEL PANIC"],
-            timeout_secs: 300, // supervisor: ready ≤120s on loaded TCG; restart + core-2 ready ≤30s; 300s covers both with margin
+            timeout_secs: 60, // identity-only supervisor: ready ~3s; restart + core-2 ready ~5s; 60s is ~6× margin
         },
     },
     TestSpec {
@@ -1345,7 +1345,7 @@ static TESTS: &[TestSpec] = &[
                 "ping: pong cap reacquired, resuming",
             ],
             fail_on:      &["KERNEL PANIC"],
-            timeout_secs: 300, // same as 10A — supervisor: ready ≤120s; reacquisition phase ≤30s; 300s covers both with margin
+            timeout_secs: 60, // identity-only supervisor: ready ~3s; reacquisition phase ~5s; 60s is ~6× margin
         },
     },
 ];
