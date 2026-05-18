@@ -63,12 +63,12 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | main.rs | 2 | grandfathered |
 | syscall/dispatch.rs | 2 | grandfathered |
 | task/mod.rs | 7 | grandfathered |
-| task/scheduler.rs | 42 | grandfathered |
+| task/scheduler.rs | 36 | grandfathered |
 <!-- unsafe-inventory-end -->
 
 **Permitted total:** 215 lines across 17 files  
-**Grandfathered total:** 58 lines across 6 files  
-**Grand total:** 273 lines across 23 files
+**Grandfathered total:** 52 lines across 6 files  
+**Grand total:** 267 lines across 23 files
 
 ---
 
@@ -326,25 +326,25 @@ removing 5 unsafe lines.
 
 ### task/scheduler.rs *(grandfathered)*
 
-42 unsafe lines (was 36; +6 net from the deferred-PML4 self-kill fix).
-`CORE_PENDING_PML4` is `AtomicU64` so its load/store sites are safe — only
-the inherently-unsafe `Frame::from_phys` + `free_frame` pair and the
-`send_ipi` call needed new unsafe blocks.
+36 unsafe lines. Four formerly-`static mut` arrays converted to atomic types,
+removing six standalone `unsafe {}` blocks (the previous count was 42, reduced
+back to the 36 baseline):
 
-New unsafe lines relative to the 36 baseline:
-- One `unsafe {}` block in `drain_pending_kstack` combining `Frame::from_phys`
-  and `free_frame`. Sound because `pml4_phys` was this task's own PML4 root;
-  by the time `drain_pending_kstack` runs, CR3 has been switched to a different
-  page table on this core so no page-walker touches the frame.
-- `CORE_CURRENT[my_core]` read for `is_self_kill` detection — inside the
-  existing large `unsafe {}` block in `kill_task_by_slot`; bounded by
-  `my_core < MAX_CORES`, read with IF=0.
-- `crate::smp::ipi::send_ipi(...)` call — APIC is mapped before the scheduler
-  starts; core index bounded by `MAX_CORES`.
-- Inner nested `unsafe {}` forwarding the IPI call.
+- `CORE_CURRENT` → `[AtomicUsize; MAX_CORES]`: removes the standalone `unsafe`
+  in `current_task_slot()`; all other accesses are syntactically updated to
+  `.load()`/`.store()` inside existing large `unsafe` blocks.
+- `CORE_RR_SLOT` → `[AtomicUsize; MAX_CORES]`: removes both standalone `unsafe`
+  blocks in `pick_next()`.
+- `CORE_PENDING_KSTACK_LEN` → `[AtomicUsize; MAX_CORES]`: removes both
+  standalone `unsafe` blocks in `drain_pending_kstack()`.
+- `TASK_KERNEL_STACK_TOP` → `[AtomicU64; MAX_TASKS]`: removes the standalone
+  `unsafe` in `prepare_ring3_switch()`.
+- `CORE_PENDING_PML4` is `AtomicU64` so its load/store sites are safe — only
+  the inherently-unsafe `Frame::from_phys` + `free_frame` pair and the
+  `send_ipi` call needed `unsafe` blocks.
 
 Sound in aggregate: all arrays are indexed by slot or core_id with bounds
 checked at their call sites; ring3 switch is called only from the scheduler
 with interrupts disabled; cap init runs before the task is visible to other
 cores; deferred PML4 free runs only after CR3 switch.
-`// SAFETY:` comments present in source for all blocks.
+`// SAFETY:` comments present in source for all remaining blocks.

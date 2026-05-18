@@ -9,7 +9,7 @@
 //! IPI when the target task lives on a different core.
 
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use crate::arch::x86_64::context_switch::{switch_context, TaskContext};
 use crate::capability::cap::{CapError, Capability};
@@ -51,7 +51,8 @@ static mut TASK_IS_USER: [bool; MAX_TASKS] = [false; MAX_TASKS];
 /// Top of each ring-3 task's kernel stack (used to set TSS.rsp0 and
 /// PER_CORE_SYSCALL.kernel_rsp before every switch to that task).
 /// Zero for ring-0 tasks.
-static mut TASK_KERNEL_STACK_TOP: [u64; MAX_TASKS] = [0u64; MAX_TASKS];
+static TASK_KERNEL_STACK_TOP: [AtomicU64; MAX_TASKS] =
+    [const { AtomicU64::new(0) }; MAX_TASKS];
 /// The recv endpoint owned by each task (None if the task has no endpoint).
 static mut TASK_ENDPOINT: [Option<EndpointId>; MAX_TASKS] =
     [const { None }; MAX_TASKS];
@@ -90,7 +91,8 @@ static mut TASK_NEXT_ALLOC_VA: [u64; MAX_TASKS] = [0u64; MAX_TASKS];
 // ---------------------------------------------------------------------------
 
 /// Index of the task currently running on each core (IDLE if none).
-static mut CORE_CURRENT: [usize; MAX_CORES] = [IDLE; MAX_CORES];
+static CORE_CURRENT: [AtomicUsize; MAX_CORES] =
+    [const { AtomicUsize::new(IDLE) }; MAX_CORES];
 
 /// Sticky round-robin scan pointer per core (§9.1, §9.3).
 ///
@@ -100,7 +102,8 @@ static mut CORE_CURRENT: [usize; MAX_CORES] = [IDLE; MAX_CORES];
 /// before the pointer wraps back to an earlier slot, preventing high-numbered
 /// task slots (e.g. ping at slot 185) from being permanently starved by a
 /// dense band of ready tasks at lower slots (the root cause of 8B flakiness).
-static mut CORE_RR_SLOT: [usize; MAX_CORES] = [0usize; MAX_CORES];
+static CORE_RR_SLOT: [AtomicUsize; MAX_CORES] =
+    [const { AtomicUsize::new(0) }; MAX_CORES];
 
 /// Per-core queue of kernel stack tops awaiting deferred free after a self-kill.
 ///
@@ -122,7 +125,8 @@ static mut CORE_RR_SLOT: [usize; MAX_CORES] = [0usize; MAX_CORES];
 /// ISR can only fire after that point, by which time RSP is not on K_a.
 const PENDING_KSTACK_CAP: usize = 8;
 static mut CORE_PENDING_KSTACK:     [[u64; PENDING_KSTACK_CAP]; MAX_CORES] = [[0u64; PENDING_KSTACK_CAP]; MAX_CORES];
-static mut CORE_PENDING_KSTACK_LEN: [usize;                      MAX_CORES] = [0;                         MAX_CORES];
+static CORE_PENDING_KSTACK_LEN: [AtomicUsize; MAX_CORES] =
+    [const { AtomicUsize::new(0) }; MAX_CORES];
 
 /// Per-core PML4 frame (physical address) awaiting deferred free after a self-kill.
 ///
@@ -280,7 +284,7 @@ pub unsafe fn commit_task(
         TASK_CTX[slot].write(ctx);
         TASK_NAME[slot]             = name;
         TASK_IS_USER[slot]          = is_user;
-        TASK_KERNEL_STACK_TOP[slot] = kernel_stack_top;
+        TASK_KERNEL_STACK_TOP[slot].store(kernel_stack_top, Ordering::Relaxed);
         TASK_ENDPOINT[slot]         = endpoint_id;
         // TASK_STATE must be last: once Ready is visible to other cores, every
         // other field in this slot must already be correctly set.  A concurrent
@@ -318,7 +322,7 @@ pub fn enqueue(
                 TASK_VALID[i]            = true;
                 TASK_CORE[i]             = core_id;
                 TASK_IS_USER[i]          = is_user;
-                TASK_KERNEL_STACK_TOP[i] = kernel_stack_top;
+                TASK_KERNEL_STACK_TOP[i].store(kernel_stack_top, Ordering::Relaxed);
                 TASK_ENDPOINT[i]         = endpoint_id;
                 return;
             }
@@ -337,7 +341,7 @@ pub fn current_task_lookup_cap(slot: usize, right: Rights) -> Result<Capability,
     let cid  = current_core_id();
     // SAFETY: IF=0 in syscall context; CORE_CURRENT is stable for this core.
     unsafe {
-        let cur = CORE_CURRENT[cid];
+        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
         if cur < MAX_TASKS && TASK_VALID[cur] {
             TASK_CAP[cur].assume_init_ref().get(slot, right)
         } else {
@@ -350,7 +354,7 @@ pub fn current_task_lookup_cap(slot: usize, right: Rights) -> Result<Capability,
 pub fn current_task_remove_cap(slot: usize) -> Option<Capability> {
     let cid = current_core_id();
     unsafe {
-        let cur = CORE_CURRENT[cid];
+        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
         if cur < MAX_TASKS && TASK_VALID[cur] {
             TASK_CAP[cur].assume_init_mut().remove(slot)
         } else {
@@ -365,7 +369,7 @@ pub fn current_task_remove_cap(slot: usize) -> Option<Capability> {
 pub fn current_task_read_cap_rights(slot: usize) -> Option<Rights> {
     let cid = current_core_id();
     unsafe {
-        let cur = CORE_CURRENT[cid];
+        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
         if cur < MAX_TASKS && TASK_VALID[cur] {
             crate::capability::cap_read_rights(TASK_CAP[cur].assume_init_ref(), slot)
         } else {
@@ -382,7 +386,7 @@ pub fn push_pending_recv_cap(cap_slot: u32) {
     let cid = current_core_id();
     // SAFETY: IF=0 in syscall context; single core writer.
     unsafe {
-        let cur = CORE_CURRENT[cid];
+        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
         if cur < MAX_TASKS {
             let count = TASK_PENDING_RECV_CAP_COUNT[cur];
             if count < MAX_PENDING_RECV_CAPS {
@@ -399,7 +403,7 @@ pub fn pop_pending_recv_cap() -> Option<u32> {
     let cid = current_core_id();
     // SAFETY: IF=0 in syscall context; single core writer.
     unsafe {
-        let cur = CORE_CURRENT[cid];
+        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
         if cur < MAX_TASKS {
             let count = TASK_PENDING_RECV_CAP_COUNT[cur];
             if count > 0 {
@@ -444,7 +448,7 @@ pub fn current_task_claim_alloc(size: u64) -> Option<u64> {
     let cid = current_core_id();
     // SAFETY: IF=0 in syscall context; single core writer.
     unsafe {
-        let cur = CORE_CURRENT[cid];
+        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
         if cur >= MAX_TASKS || !TASK_VALID[cur] { return None; }
 
         // Overflow guard: (size + 4095) wraps for very large values (e.g. u64::MAX).
@@ -468,7 +472,7 @@ pub fn current_task_alloc_bytes() -> u64 {
     let cid = current_core_id();
     // SAFETY: IF=0 in syscall context; single core reader for this slot.
     unsafe {
-        let cur = CORE_CURRENT[cid];
+        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
         if cur >= MAX_TASKS || !TASK_VALID[cur] { return 0; }
         TASK_ALLOC_BYTES[cur]
     }
@@ -478,7 +482,7 @@ pub fn current_task_alloc_bytes() -> u64 {
 pub fn current_task_insert_cap(cap: Capability) -> Result<usize, CapError> {
     let cid = current_core_id();
     unsafe {
-        let cur = CORE_CURRENT[cid];
+        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
         if cur < MAX_TASKS && TASK_VALID[cur] {
             TASK_CAP[cur].assume_init_mut().insert(cap)
         } else {
@@ -502,8 +506,7 @@ pub fn current_task_insert_cap(cap: Capability) -> Result<usize, CapError> {
 /// # Safety
 /// IF must be 0.  `slot` must be a valid ring-3 task slot.
 unsafe fn prepare_ring3_switch(core_id: usize, slot: usize) {
-    // SAFETY: TASK_KERNEL_STACK_TOP[slot] is set at enqueue; we have IF=0.
-    let ksp = unsafe { TASK_KERNEL_STACK_TOP[slot] };
+    let ksp = TASK_KERNEL_STACK_TOP[slot].load(Ordering::Relaxed);
 
     // SYSCALL entry must start 512 bytes below K0T, NOT at K0T.
     //
@@ -566,7 +569,7 @@ pub fn run(core_id: u32) -> ! {
                 unsafe {
                     core::arch::asm!("cli", options(nostack, nomem));
                     TASK_STATE[next].store(TaskState::Running as u8, Ordering::Relaxed);
-                    CORE_CURRENT[cid] = next;
+                    CORE_CURRENT[cid].store(next, Ordering::Relaxed);
                     if TASK_IS_USER[next] {
                         prepare_ring3_switch(cid, next);
                     }
@@ -575,7 +578,7 @@ pub fn run(core_id: u32) -> ! {
                     switch_context(sched, next_ctx);
                     // Execution returns here after the task is preempted and
                     // the scheduler loop is re-entered.
-                    CORE_CURRENT[cid] = IDLE;
+                    CORE_CURRENT[cid].store(IDLE, Ordering::Relaxed);
                     core::arch::asm!("sti", options(nostack, nomem));
                 }
             }
@@ -617,7 +620,7 @@ pub extern "C" fn timer_tick_from_irq() {
             crate::control::process_pending();
         }
 
-        let prev = CORE_CURRENT[cid];
+        let prev = CORE_CURRENT[cid].load(Ordering::Relaxed);
 
         if prev < MAX_TASKS && TASK_VALID[prev]
             && TaskState::from(TASK_STATE[prev].load(Ordering::Relaxed)) == TaskState::Running
@@ -639,7 +642,7 @@ pub extern "C" fn timer_tick_from_irq() {
                 let is_dead = prev < MAX_TASKS
                     && TASK_STATE[prev].load(Ordering::Relaxed) == TaskState::Dead as u8;
                 if is_dead {
-                    CORE_CURRENT[cid] = IDLE;
+                    CORE_CURRENT[cid].store(IDLE, Ordering::Relaxed);
                     // Save into CORE_DEAD_CTX — not TASK_CTX[prev] — to avoid a
                     // write-after-claim race if a concurrent spawn has already
                     // reserved TASK_CTX[prev] (possible now that TASK_VALID=false
@@ -672,7 +675,7 @@ pub extern "C" fn timer_tick_from_irq() {
         }
 
         TASK_STATE[next].store(TaskState::Running as u8, Ordering::Relaxed);
-        CORE_CURRENT[cid] = next;
+        CORE_CURRENT[cid].store(next, Ordering::Relaxed);
 
         // Save BEFORE prepare_ring3_switch so we capture the value from the last
         // SYSCALL entry for `prev`, not the value prepare_ring3_switch writes for `next`.
@@ -712,7 +715,7 @@ pub fn yield_current() {
 
     // SAFETY: IF=0.
     unsafe {
-        let prev = CORE_CURRENT[cid];
+        let prev = CORE_CURRENT[cid].load(Ordering::Relaxed);
         if prev < MAX_TASKS && TASK_VALID[prev]
             && TaskState::from(TASK_STATE[prev].load(Ordering::Relaxed)) == TaskState::Running
         {
@@ -731,7 +734,7 @@ pub fn yield_current() {
                 let is_dead = prev < MAX_TASKS
                     && TASK_STATE[prev].load(Ordering::Relaxed) == TaskState::Dead as u8;
                 if is_dead {
-                    CORE_CURRENT[cid] = IDLE;
+                    CORE_CURRENT[cid].store(IDLE, Ordering::Relaxed);
                     // Save into CORE_DEAD_CTX, not TASK_CTX[prev], to avoid a
                     // write-after-claim race with a concurrent spawn that may
                     // have already reserved the now-available slot.
@@ -756,7 +759,7 @@ pub fn yield_current() {
         }
 
         TASK_STATE[next].store(TaskState::Running as u8, Ordering::Relaxed);
-        CORE_CURRENT[cid] = next;
+        CORE_CURRENT[cid].store(next, Ordering::Relaxed);
 
         // Save BEFORE prepare_ring3_switch so we capture the value from SYSCALL
         // entry, not the value prepare_ring3_switch is about to write for `next`.
@@ -799,8 +802,7 @@ pub fn yield_current() {
 /// Returns `IDLE` (== MAX_TASKS) if the scheduler loop is active.
 pub fn current_task_slot() -> usize {
     let cid = current_core_id();
-    // SAFETY: read-only; stable within a syscall (IF=0).
-    unsafe { CORE_CURRENT[cid] }
+    CORE_CURRENT[cid].load(Ordering::Relaxed)
 }
 
 /// Wake the task at `slot` with the given result code.
@@ -878,11 +880,10 @@ pub fn find_task_by_name(name: &str) -> Option<usize> {
 /// yield_current's switch_context runs with IF=0, so the timer cannot fire
 /// during that window; after switch_context RSP is on a different stack.
 fn drain_pending_kstack(cid: usize) {
-    // SAFETY: CORE_PENDING_KSTACK_LEN[cid] is written only by this core.
-    let n = unsafe { CORE_PENDING_KSTACK_LEN[cid] };
+    let n = CORE_PENDING_KSTACK_LEN[cid].load(Ordering::Relaxed);
     if n != 0 {
         // Clear before processing so re-entrant callers see an empty queue.
-        unsafe { CORE_PENDING_KSTACK_LEN[cid] = 0; }
+        CORE_PENDING_KSTACK_LEN[cid].store(0, Ordering::Relaxed);
         for i in 0..n {
             let kstack = unsafe { CORE_PENDING_KSTACK[cid][i] };
             // SAFETY: RSP is NOT on this kstack (see above).  kstack is the top
@@ -993,7 +994,7 @@ pub fn kill_task_by_slot(slot: usize) {
         {
             let my_core = current_core_id();
             for cid in 0..MAX_CORES {
-                if cid != my_core && CORE_CURRENT[cid] == slot {
+                if cid != my_core && CORE_CURRENT[cid].load(Ordering::SeqCst) == slot {
                     // SAFETY: cid is a valid core index (loop bound), APIC is mapped.
                     unsafe {
                         crate::smp::ipi::send_ipi(
@@ -1012,7 +1013,7 @@ pub fn kill_task_by_slot(slot: usize) {
                     // Compiler + hardware barrier: reload CORE_CURRENT[cid] from
                     // memory on every iteration; do not use a cached register value.
                     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-                    if CORE_CURRENT[cid] != slot { break; }
+                    if CORE_CURRENT[cid].load(Ordering::Relaxed) != slot { break; }
                     core::hint::spin_loop();
                 }
             }
@@ -1032,7 +1033,7 @@ pub fn kill_task_by_slot(slot: usize) {
         //   (called from the scheduler loop / timer tick) where CR3 has already
         //   been switched to a different page table.
         let my_core = current_core_id();
-        let is_self_kill = CORE_CURRENT[my_core] == slot;
+        let is_self_kill = CORE_CURRENT[my_core].load(Ordering::Relaxed) == slot;
 
         // Reclaim all user-space frames: walk the page table and return each
         // frame to the allocator (§10.5).
@@ -1103,12 +1104,12 @@ pub fn kill_task_by_slot(slot: usize) {
         if is_self_kill {
             // Self-kill: defer only the kstack free; release slot immediately.
             if TASK_IS_USER[slot] {
-                let kstack = TASK_KERNEL_STACK_TOP[slot];
+                let kstack = TASK_KERNEL_STACK_TOP[slot].load(Ordering::Relaxed);
                 if kstack != 0 {
-                    let len = CORE_PENDING_KSTACK_LEN[my_core];
+                    let len = CORE_PENDING_KSTACK_LEN[my_core].load(Ordering::Relaxed);
                     if len < PENDING_KSTACK_CAP {
                         CORE_PENDING_KSTACK[my_core][len] = kstack;
-                        CORE_PENDING_KSTACK_LEN[my_core] = len + 1;
+                        CORE_PENDING_KSTACK_LEN[my_core].store(len + 1, Ordering::Relaxed);
                     } else {
                         // Queue overflow (>8 sequential self-kills): free immediately.
                         // Bounded risk — less likely than permanently leaking the stack.
@@ -1126,7 +1127,7 @@ pub fn kill_task_by_slot(slot: usize) {
         // Cross-kill: free kstack immediately (RSP is on a different kstack).
         if TASK_IS_USER[slot] {
             // SAFETY: Cross-kill — our RSP is on the supervisor's kstack, not K_a.
-            super::free_kstack(TASK_KERNEL_STACK_TOP[slot]);
+            super::free_kstack(TASK_KERNEL_STACK_TOP[slot].load(Ordering::Relaxed));
         }
 
         // Release the slot under the lock.  Re-store Dead to guard against a
@@ -1153,7 +1154,7 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
         core::arch::asm!("cli", options(nostack, nomem));
 
         let cid  = current_core_id();
-        let slot = CORE_CURRENT[cid];
+        let slot = CORE_CURRENT[cid].load(Ordering::Relaxed);
         assert!(slot < MAX_TASKS && TASK_VALID[slot],
                 "block_and_reschedule: no running task");
 
@@ -1189,7 +1190,7 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
         match pick_next(cid) {
             Some(next) => {
                 TASK_STATE[next].store(TaskState::Running as u8, Ordering::Relaxed);
-                CORE_CURRENT[cid] = next;
+                CORE_CURRENT[cid].store(next, Ordering::Relaxed);
                 if TASK_IS_USER[next] {
                     prepare_ring3_switch(cid, next);
                 }
@@ -1197,7 +1198,7 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
                 switch_context(current_ctx, next_ctx);
             }
             None => {
-                CORE_CURRENT[cid] = IDLE;
+                CORE_CURRENT[cid].store(IDLE, Ordering::Relaxed);
                 let sched = &raw mut CORE_SCHED_CTX[cid];
                 switch_context(current_ctx, sched);
             }
@@ -1213,7 +1214,7 @@ pub fn store_recv_message(msg: Message) {
     let cid = current_core_id();
     // SAFETY: CORE_CURRENT[cid] and TASK_RECV_BUF are written only by this core's scheduler path.
     unsafe {
-        let cur = CORE_CURRENT[cid];
+        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
         if cur < MAX_TASKS {
             TASK_RECV_BUF[cur] = Some(msg);
         }
@@ -1225,7 +1226,7 @@ pub fn take_recv_message() -> Option<Message> {
     let cid = current_core_id();
     // SAFETY: CORE_CURRENT[cid] and TASK_RECV_BUF are written only by this core's scheduler path.
     unsafe {
-        let cur = CORE_CURRENT[cid];
+        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
         if cur < MAX_TASKS {
             TASK_RECV_BUF[cur].take()
         } else {
@@ -1246,8 +1247,7 @@ pub fn take_recv_message() -> Option<Message> {
 /// being permanently starved by a dense band of ready tasks at lower indices
 /// (§9.1 — no service may monopolise a core; §9.3 — yield is advisory).
 fn pick_next(core_id: usize) -> Option<usize> {
-    // SAFETY: CORE_RR_SLOT is written only by this core's scheduler path.
-    let start = unsafe { CORE_RR_SLOT[core_id] };
+    let start = CORE_RR_SLOT[core_id].load(Ordering::Relaxed);
     for i in 0..MAX_TASKS {
         let idx = (start + i) % MAX_TASKS;
         // Acquire: sees the Ready write from wake_by_slot's Release store.
@@ -1259,7 +1259,7 @@ fn pick_next(core_id: usize) -> Option<usize> {
         };
         if ready {
             // Advance past the selected slot so the next call starts after it.
-            unsafe { CORE_RR_SLOT[core_id] = (idx + 1) % MAX_TASKS; }
+            CORE_RR_SLOT[core_id].store((idx + 1) % MAX_TASKS, Ordering::Relaxed);
             return Some(idx);
         }
     }
