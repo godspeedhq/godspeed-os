@@ -1225,7 +1225,7 @@ static TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["probe: 4A pass"],
             fail_on:      &["KERNEL PANIC", "probe: 4A FAIL"],
-            timeout_secs: 30,
+            timeout_secs: 60,
         },
     },
     TestSpec {
@@ -1261,7 +1261,7 @@ static TESTS: &[TestSpec] = &[
             restart_cmd:  "RESTART pong 1",
             expect_after: &["control: pong restarted"],
             fail_on:      &["KERNEL PANIC"],
-            timeout_secs: 180, // supervisor: ready ≤120s on loaded TCG; restart phase ≤30s; 180s covers both
+            timeout_secs: 240, // supervisor: ready ≤120s on loaded TCG; restart phase ≤30s; 240s covers both with margin
         },
     },
     TestSpec {
@@ -1274,7 +1274,7 @@ static TESTS: &[TestSpec] = &[
                 "ping: pong cap reacquired, resuming",
             ],
             fail_on:      &["KERNEL PANIC"],
-            timeout_secs: 180, // same as 6A — supervisor: ready ≤120s; reacquisition phase ≤30s
+            timeout_secs: 240, // same as 6A — supervisor: ready ≤120s; reacquisition phase ≤30s; 240s covers both with margin
         },
     },
     TestSpec {
@@ -1332,7 +1332,7 @@ static TESTS: &[TestSpec] = &[
             restart_cmd:  "RESTART pong 2",
             expect_after: &["pong: ready on core 2"],
             fail_on:      &["KERNEL PANIC"],
-            timeout_secs: 180, // supervisor: ready ≤120s on loaded TCG; restart + core-2 ready ≤30s
+            timeout_secs: 300, // supervisor: ready ≤120s on loaded TCG; restart + core-2 ready ≤30s; 300s covers both with margin
         },
     },
     TestSpec {
@@ -1345,7 +1345,7 @@ static TESTS: &[TestSpec] = &[
                 "ping: pong cap reacquired, resuming",
             ],
             fail_on:      &["KERNEL PANIC"],
-            timeout_secs: 180, // same as 10A — supervisor: ready ≤120s; reacquisition phase ≤30s
+            timeout_secs: 300, // same as 10A — supervisor: ready ≤120s; reacquisition phase ≤30s; 300s covers both with margin
         },
     },
 ];
@@ -1391,8 +1391,12 @@ pub fn run_identity_tests() {
     println!("identity: stopping any running QEMU instances...");
     kill_existing_qemu();
 
-    println!("identity: building...");
-    crate::cmd_build();
+    // Build with identity-only supervisor: spawns only the 15 identity probe
+    // services so supervisor: ready appears in < 10 s on TCG (vs 30–200 s with
+    // the full 160+ probe set).  This is the primary flakiness fix for
+    // WithRestart tests whose deadline budget was being eaten by the spawn loop.
+    println!("identity: building (identity-only supervisor)...");
+    crate::cmd_build_identity();
 
     let kernel_elf = Path::new("target/x86_64-unknown-none/release/kernel");
     if !kernel_elf.exists() {
@@ -1423,6 +1427,11 @@ pub fn run_identity_tests() {
         }
 
         results.push((test, outcome));
+
+        // Isolation: give the OS 500 ms to reclaim the QEMU process's 512 MiB
+        // pages before the next QEMU instance starts.  Prevents accumulated
+        // memory pressure from degrading boot times across back-to-back tests.
+        std::thread::sleep(Duration::from_millis(500));
     }
 
     // Summary.

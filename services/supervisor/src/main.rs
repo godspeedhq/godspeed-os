@@ -16,8 +16,8 @@ use godspeed_sdk::ServiceContext;
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Spawn pong and ping first so IPC between them is established well before
-    // the 178 probe services compete for scheduler quanta.  Pong must precede
-    // ping: ping's SEND cap to pong is wired by the kernel at spawn time.
+    // probe services compete for scheduler quanta.  Pong must precede ping:
+    // ping's SEND cap to pong is wired by the kernel at spawn time.
     if ctx.spawn_on("pong", 1).is_err() {
         ctx.log("supervisor: WARN: failed to spawn pong on core 1, trying core 0");
         let _ = ctx.spawn_on("pong", 0);
@@ -50,6 +50,25 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let _ = ctx.spawn("probe-7a");
     let _ = ctx.spawn("probe-7b");
 
+    // Property, fuzz, stress, perf, adversarial, chaos probes.
+    // Excluded in identity-only builds so supervisor: ready appears in < 10 s on
+    // TCG, giving WithRestart tests plenty of deadline margin (§22 flakiness fix).
+    spawn_extended_probes(&ctx);
+
+    ctx.log("supervisor: ready");
+
+    loop {
+        ctx.yield_cpu();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Extended probes — all non-identity test categories.
+// Compiled out when the `identity-only` feature is enabled.
+// ---------------------------------------------------------------------------
+
+#[cfg(not(feature = "identity-only"))]
+fn spawn_extended_probes(ctx: &ServiceContext) {
     // --- Brutal adversarial test probes — Milestone 20 ---
     // Spawned EARLY, before property/stress kill-respawn loops start, so the
     // supervisor's spawn calls land while the system is still lightly loaded.
@@ -285,10 +304,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let _ = ctx.spawn("brutal-id-13-send"); // fills queue then blocks on core 0
     // T11 self-referential queue: brutal-id-11 sends to itself; any spawn order.
     let _ = ctx.spawn("brutal-id-11");
-
-    ctx.log("supervisor: ready");
-
-    loop {
-        ctx.yield_cpu();
-    }
 }
+
+#[cfg(feature = "identity-only")]
+#[inline(always)]
+fn spawn_extended_probes(_ctx: &ServiceContext) {}

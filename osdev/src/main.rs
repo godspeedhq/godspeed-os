@@ -120,6 +120,49 @@ pub fn cmd_build() {
     println!("build: kernel OK");
 }
 
+/// Like `cmd_build` but compiles supervisor with `--features identity-only`.
+/// Used by `run_identity_tests` so the supervisor spawn loop takes < 10 s on
+/// TCG instead of 30–200 s with the full 160+ probe service set.
+pub fn cmd_build_identity() {
+    // Build every service crate except supervisor first.
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe"];
+    for crate_name in &non_supervisor {
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--release", "-p", crate_name,
+                   "--target", "x86_64-unknown-none"])
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run cargo build for {}: {}", crate_name, e));
+        if !status.success() {
+            eprintln!("build: {} FAILED", crate_name);
+            std::process::exit(1);
+        }
+        println!("build: {} OK", crate_name);
+    }
+    // Build supervisor with identity-only feature so only the 15 identity
+    // probe services are spawned; supervisor: ready appears in < 10 s on TCG.
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "supervisor",
+               "--target", "x86_64-unknown-none",
+               "--features", "supervisor/identity-only"])
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run cargo build for supervisor: {}", e));
+    if !status.success() {
+        eprintln!("build: supervisor (identity-only) FAILED");
+        std::process::exit(1);
+    }
+    println!("build: supervisor (identity-only) OK");
+
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .status()
+        .expect("failed to run cargo build for kernel");
+    if !status.success() {
+        eprintln!("build: kernel FAILED");
+        std::process::exit(1);
+    }
+    println!("build: kernel OK");
+}
+
 fn cmd_run(smp: u32) {
     cmd_build();
 

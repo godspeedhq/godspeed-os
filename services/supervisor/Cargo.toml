@@ -7,5 +7,11 @@ edition = "2021"
 name = "supervisor"
 path = "src/main.rs"
 
+[features]
+# Spawn only the 15 identity-test probe services; skip property/fuzz/stress/perf/
+# adversarial/chaos probes.  Used by `osdev test identity` to keep the supervisor
+# spawn loop under 10 s on TCG so WithRestart tests have plenty of deadline margin.
+identity-only = []
+
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }
