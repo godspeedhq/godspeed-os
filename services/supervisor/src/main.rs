@@ -49,6 +49,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Memory-limit probes — Tests 7A and 7B.
     let _ = ctx.spawn("probe-7a");
     let _ = ctx.spawn("probe-7b");
+    // Interrupt-routing probe — Test IR1A (§12.2, §12.3).
+    let _ = ctx.spawn("probe-11a");
 
     // Property, fuzz, stress, perf, adversarial, chaos probes.
     // Excluded in identity-only builds so supervisor: ready appears in < 10 s on

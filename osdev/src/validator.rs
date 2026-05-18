@@ -1348,6 +1348,29 @@ static TESTS: &[TestSpec] = &[
             timeout_secs: 60, // identity-only supervisor: ready ~3s; reacquisition phase ~5s; 60s is ~6× margin
         },
     },
+    // ----------------------------------------------------------------
+    // Interrupt-routing identity tests — §12.2, §12.3.
+    // ----------------------------------------------------------------
+    TestSpec {
+        id: "IR1A", name: "irq_delivery_driver_receives", spec_ref: "§12.2 §12.3",
+        kind: TestKind::WithRestart {
+            wait_for:     "probe: 11A ready",   // probe is alive and blocking on recv
+            restart_cmd:  "FIRE_IRQ 33",        // inject IRQ 33 via COM2 control channel
+            expect_after: &["probe: 11A pass irq=33"],
+            fail_on:      &["KERNEL PANIC", "probe: 11A FAIL"],
+            timeout_secs: 60,
+        },
+    },
+    TestSpec {
+        id: "IR1B", name: "irq_unregistered_discard_no_panic", spec_ref: "§12.2",
+        kind: TestKind::WithRestart {
+            wait_for:     "supervisor: ready",  // system fully up
+            restart_cmd:  "FIRE_IRQ 34",        // no driver registered for IRQ 34
+            expect_after: &["control: FIRE_IRQ 34"],
+            fail_on:      &["KERNEL PANIC"],
+            timeout_secs: 60,
+        },
+    },
 ];
 
 // ---------------------------------------------------------------------------

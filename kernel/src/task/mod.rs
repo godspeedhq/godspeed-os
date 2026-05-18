@@ -391,6 +391,20 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
         })),
         // ----------------------------------------------------------------
+        // Interrupt-routing probe — §22 Tests IR1A (§12.2, §12.3).
+        // hw_irqs registers IRQ 33 to probe-11a's recv endpoint at spawn.
+        // ----------------------------------------------------------------
+        "probe-11a" => Some(("probe-11a", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX, // round-robin
+            probe_mode:        160, // MODE_IRQ_RECV — Test IR1A
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[33],
+        })),
+        // ----------------------------------------------------------------
         // Property-test probes — Milestone 9 Phase 1.
         // prop-p9-victim must be listed (and spawned) before prop-p9 so its
         // endpoint is in the name registry when prop-p9's SEND caps are wired.

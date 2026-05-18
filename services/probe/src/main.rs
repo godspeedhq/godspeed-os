@@ -170,6 +170,9 @@ const MODE_CHAOS_BC5:       u32 = 157; // 500-level recursive yield_cpu() (5× C
 const MODE_CHAOS_BC6_MON:   u32 = 158; // 1,000 yields on core 0; 2-hog witness
 const MODE_CHAOS_BC7:       u32 = 159; // 15 cross-core kill/respawn cycles (brutal concurrent load)
 
+// Interrupt-routing test modes — Post-v1 item 9 (§12.2, §12.3).
+const MODE_IRQ_RECV:        u32 = 160; // IR1A: recv interrupt event; log pass
+
 // Brutal property test modes — Milestone 16.
 const MODE_PROP_BP1:        u32 = 104; // BP1: cap unforgeability — 100k iterations
 const MODE_PROP_BP2:        u32 = 105; // BP2: generation monotonic — 20 kill/respawn cycles
@@ -375,8 +378,26 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         MODE_ADV_BA8_WITNESS => mode_adv_ba8_witness(&ctx),
         MODE_ADV_BA9         => mode_adv_ba9(&ctx),
         MODE_ADV_BA10        => mode_adv_ba10(&ctx),
+        MODE_IRQ_RECV        => mode_irq_recv(&ctx),
         _                    => idle(&ctx),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Interrupt-routing test modes — Post-v1 item 9 (§12.2, §12.3).
+// ---------------------------------------------------------------------------
+
+fn mode_irq_recv(ctx: &ServiceContext) -> ! {
+    // Signal harness that the probe is alive and blocking on recv.
+    ctx.log("probe: 11A ready");
+    let msg = ctx.recv(); // blocks until FIRE_IRQ 33 delivers an interrupt event
+    let irq = if msg.payload_len > 0 { msg.payload[0] } else { 0 };
+    if irq == 33 {
+        ctx.log("probe: 11A pass irq=33");
+    } else {
+        ctx.log_fmt(format_args!("probe: 11A FAIL — expected irq=33, got {}", irq));
+    }
+    idle(ctx)
 }
 
 fn idle(ctx: &ServiceContext) -> ! {

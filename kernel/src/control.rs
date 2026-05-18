@@ -83,6 +83,14 @@ fn execute_command(cmd: &str) {
                 crate::kprintln!("control: {} not found", name);
             }
         }
+        Some("FIRE_IRQ") => {
+            let irq: u8 = match parts.next().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None    => { crate::kprintln!("control: FIRE_IRQ missing irq"); return; }
+            };
+            crate::kprintln!("control: FIRE_IRQ {}", irq);
+            crate::arch::x86_64::interrupts::fire_test_irq(irq);
+        }
         Some(other) => crate::kprintln!("control: unknown command '{}'", other),
         None => {}
     }

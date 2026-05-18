@@ -128,6 +128,22 @@ pub fn send_eoi() {
     unsafe { crate::arch::x86_64::boot::apic_send_eoi() }
 }
 
+/// Fire a test IRQ synchronously from the control channel.
+///
+/// Disables interrupts, calls `deliver(irq)` (which requires IF=0), then
+/// re-enables interrupts. Used only by the `FIRE_IRQ` COM2 control command
+/// (§22 Tests IR1A/IR1B). EOI inside `deliver` is idempotent when no real
+/// hardware interrupt is pending.
+#[inline]
+pub fn fire_test_irq(irq: u8) {
+    disable_interrupts();
+    // SAFETY: interrupts are disabled above (IF=0), satisfying deliver's calling
+    // convention. EOI to the APIC is safe outside a real IRQ — the write is
+    // idempotent and the APIC ignores spurious EOIs.
+    unsafe { crate::interrupt::route::deliver(irq); }
+    enable_interrupts();
+}
+
 /// Page-fault handler — kills the faulting task (§10.3).
 ///
 /// # Safety

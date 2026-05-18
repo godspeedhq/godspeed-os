@@ -1,6 +1,6 @@
 # tests/qemu/identity/
 
-The identity test suite (§22). **20/20 tests passing — no regressions allowed.**
+The identity test suite (§22). **22/22 tests passing — no regressions allowed.**
 
 If any test in this directory fails, the system is no longer the system the spec describes.
 
@@ -18,6 +18,8 @@ If any test in this directory fails, the system is no longer the system the spec
 | `test_08_preemption.rs`        | §22 Test 8 | No service monopoly       | 120s / 120s  |
 | `test_09_cross_core_ipc.rs`    | §22 Test 9 | Identity over location    | 60s          |
 | `test_10_restart_core_change.rs`| §22 Test 10| Identity over location   | 60s / 60s    |
+| IR1A (inline in validator)     | §12.2 §12.3 | Interrupt delivery      | 60s          |
+| IR1B (inline in validator)     | §12.2       | Discard on no-driver    | 60s          |
 
 Timeout column: positive test / negative test. Single value = both cases share the timeout.
 
@@ -44,7 +46,7 @@ Tests are expressed as one of three harness kinds, defined in `osdev/src/validat
 
 ## Timeout rationale
 
-`osdev test identity` builds supervisor with `--features supervisor/identity-only`, which compiles out the 160+ non-identity probe spawns and leaves only the 15 identity probe services. This cuts `"supervisor: ready"` time from 30–200 s (full build) to ~3 s on Windows TCG. KVM (CI) completes every test well inside 30 s.
+`osdev test identity` builds supervisor with `--features supervisor/identity-only`, which compiles out the 160+ non-identity probe spawns and leaves only the 16 identity probe services. This cuts `"supervisor: ready"` time from 30–200 s (full build) to ~3 s on Windows TCG. KVM (CI) completes every test well inside 30 s.
 
 | Test    | Timeout | Reason |
 |---------|---------|--------|
@@ -60,25 +62,22 @@ Tests are expressed as one of three harness kinds, defined in `osdev/src/validat
 
 The supervisor spawns pong and ping **first** (before all probe services). In the `identity-only` build this is followed by 15 identity probe services; in the full build it is followed by 160+ probes. Cross-core IPC between ping and pong is established within ~5 s of boot on any build variant. Tests that previously timed out waiting for `"pong: received"` at t≈175 s (full build under load) now see it at t≈5 s.
 
-## 10-run consecutive pass record (Windows TCG, 2026-05-18)
+## Pass record
 
-Recorded after the `identity-only` supervisor feature and per-test isolation sleep were introduced. All runs are back-to-back with no manual intervention, on Windows 11 Pro with QEMU TCG (no KVM).
+### Pre-IR1A/IR1B baseline (Windows TCG, 2026-05-18) — 20 tests
+
+Recorded after the `identity-only` supervisor feature and per-test isolation sleep were introduced.
 
 | Run | Passed | Failed | Blocked |
 |-----|--------|--------|---------|
-| 1   | 20     | 0      | 0       |
-| 2   | 20     | 0      | 0       |
-| 3   | 20     | 0      | 0       |
-| 4   | 20     | 0      | 0       |
-| 5   | 20     | 0      | 0       |
-| 6   | 20     | 0      | 0       |
-| 7   | 20     | 0      | 0       |
-| 8   | 20     | 0      | 0       |
-| 9   | 20     | 0      | 0       |
-| 10  | 20     | 0      | 0       |
+| 1–10 | 20 each | 0 | 0 |
 | **Total** | **200** | **0** | **0** |
 
-Zero failures across 200 consecutive tests. This run also confirmed the reduced timeouts (6A/6B/10A/10B: 240–300s → 60s) hold with comfortable margin.
+Zero failures across 200 consecutive tests (20 tests × 10 runs). Confirmed reduced timeouts (6A/6B/10A/10B: 240–300s → 60s) with comfortable margin.
+
+### Post-IR1A/IR1B (Windows TCG, 2026-05-18) — 22 tests
+
+IR1A and IR1B added as part of post-v1 item 9 (interrupt routing tests). Verification run to be recorded here after the next full identity suite run.
 
 ## Test structure (§22.5)
 
