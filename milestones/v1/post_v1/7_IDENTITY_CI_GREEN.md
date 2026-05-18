@@ -128,3 +128,41 @@ a subsequent probe spawn. Using `"supervisor: ready"` as the gate guarantees sup
 `loop { ctx.yield_cpu(); }` idle path — no spawns in flight, no possible ordering conflict.
 
 Total per-run wall time on Windows TCG (fresh system): drops from ~2100s to ~1200s.
+
+### Additional fixes (session 5 — 200/200 deterministic)
+
+**Problem:** even after the session 4 structural fix, 3–4 failures per 200 tests remained under
+extreme accumulated back-to-back host load. The `WithRestart` tests (6A, 6B, 10A, 10B) still used
+`"supervisor: ready"` as their gate, which required waiting for all 160+ non-identity probe services
+to finish spawning on TCG — occasionally taking close to the full 240–300s deadline, leaving
+insufficient margin for the restart phase.
+
+**Root cause identified:** `osdev test identity` was building and booting the full supervisor binary
+(160+ probe services) even for the 20 identity tests that only need 15 probe services. The 160+
+probe spawn loop was the source of all timing variance.
+
+**Fix 1 — `identity-only` Cargo feature (`services/supervisor/Cargo.toml`, `src/main.rs`):**
+- New `identity-only = []` feature excludes all non-identity probes at compile time.
+- `spawn_extended_probes()` helper contains all 160+ non-identity spawns, compiled out when
+  `identity-only` is enabled.
+- Result: `"supervisor: ready"` appears in ~3 s on TCG instead of 30–200 s.
+
+**Fix 2 — `cmd_build_identity()` (`osdev/src/main.rs`):**
+- New build function builds supervisor with `--features supervisor/identity-only`.
+- `run_identity_tests()` calls `cmd_build_identity()` instead of `cmd_build()`.
+- Full `cmd_build()` (all probes) is unchanged for property/fuzz/stress/perf/etc. test suites.
+
+**Fix 3 — per-test QEMU isolation sleep (`osdev/src/validator.rs`):**
+- 500 ms sleep after each test in the identity loop.
+- Gives Windows time to reclaim the 512 MiB QEMU pages before the next QEMU instance starts.
+- Prevents accumulation of memory pressure across 20 sequential QEMU instances.
+
+**Result:** 200/200 across 10 consecutive back-to-back runs on Windows TCG. Zero failures.
+Previous best was 197/200 (1–2% failure rate under extreme load). Now fully deterministic.
+
+| Metric | Before session 5 | After session 5 |
+|--------|-----------------|-----------------|
+| `"supervisor: ready"` time on TCG | 30–200 s | ~3 s |
+| Back-to-back 10-run score | 196–197/200 | 200/200 |
+| WithRestart test margin | ~0–40 s | ~237 s |
+| Per-test isolation | none | 500 ms OS reclaim pause |
