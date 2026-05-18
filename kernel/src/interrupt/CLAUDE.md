@@ -11,25 +11,24 @@ Hardware interrupt routing to userspace driver services (§12).
 
 ## How it works (§12.2)
 
-```mermaid
-sequenceDiagram
-    participant HW as Hardware IRQ N
-    participant IDT as Kernel IDT stub
-    participant Route as interrupt::route
-    participant IPC as ipc::routing
-    participant Drv as Driver Service
-
-    HW->>IDT: IRQ fires on some core
-    IDT->>Route: dispatch_irq(N)
-    Route->>Route: lookup IRQ_TABLE[N]
-    alt no driver registered
-        Route->>Route: discard, EOI APIC
-    else driver endpoint found
-        Route->>IPC: enqueue(endpoint, interrupt_event_msg)
-        IPC->>Drv: IPI wake if blocked on recv
-        Drv->>Drv: recv() returns interrupt event
-        Drv->>HW: handle device via MMIO cap
-    end
+```text
+  Hardware IRQ N fires on some core
+    │
+    ▼
+  Kernel IDT stub ── dispatch_irq(N) ──▶  interrupt::route::deliver(N)
+                                               │
+                                  lookup IRQ_TABLE[N]
+                                               │
+                         no driver registered ─┤─ discard, EOI APIC
+                                               │
+                         driver endpoint found ▼
+                                    ipc::routing::enqueue(endpoint, interrupt_event_msg)
+                                    EOI APIC
+                                               │
+                                    IPI wake if driver blocked on recv
+                                               │
+                                    Driver Service: recv() returns interrupt event
+                                    Driver handles device via MMIO capability
 ```
 
 ## Registration
