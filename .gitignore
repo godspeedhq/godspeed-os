@@ -1,30 +1,38 @@
-# Build output
+# ─── Rust / Cargo ────────────────────────────────────────────────────────────
 target/
 
-# Claude Code session data (local to each developer)
+# ─── Build artifacts ─────────────────────────────────────────────────────────
+build/
+tools/
+mutants.out/
+*.img
+*.ppm
+*.zip
+
+# ─── QEMU / run logs ─────────────────────────────────────────────────────────
+*.log
+*.diff
+
+# ─── Identity test serial-log artifact directories ───────────────────────────
+identity-serial-logs-*/
+
+# ─── Test runner output ───────────────────────────────────────────────────────
+*.output
+test_results*
+*_out.txt
+*_err.txt
+debugcon*.txt
+nographic_out.txt
+
+# ─── Editor / IDE ────────────────────────────────────────────────────────────
 .claude/
-
-# OS-generated
-.DS_Store
-Thumbs.db
-
-# Editor/IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# Windows
+# ─── OS-generated ────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
 desktop.ini
-
-build/
-tools/
-
-serial*.log
-identity-serial-logs-6fd71106d3a50e02a039b5f83ac397eafc76b65e
-*.diff
-mutants.out/
-*.output
-test_results*
-*.txt
