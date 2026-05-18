@@ -31,19 +31,32 @@ Cores discovered at boot are fixed for the system lifetime. No hotplug. The core
 ## IPI vectors
 
 Three distinct vectors, defined in `ipi::vectors`:
-- `WAKE_RECEIVER (0xF0)` — wake a task blocked on `recv` (used by cross-core `send`).
-- `TLB_SHOOTDOWN (0xF1)` — invalidate a page on remote TLBs (used on unmap).
-- `SCHEDULER_TICK (0xF2)` — force a scheduling point (used by timer overflow broadcast).
+
+| Vector              | Value | Purpose |
+|---------------------|-------|---------|
+| `WAKE_RECEIVER`     | 0xF0  | Wake a task blocked on `recv` (cross-core send) |
+| `TLB_SHOOTDOWN`     | 0xF1  | Invalidate a page on remote TLBs (unmap) |
+| `SCHEDULER_TICK`    | 0xF2  | Force a scheduling point (timer overflow broadcast) |
 
 ## TLB shootdown protocol (§10.5)
 
-1. Caller disables interrupts on its core.
-2. Calls `broadcast_tlb_shootdown(virt_addr)`.
-3. Each receiving core's `ipi_handler` calls `invlpg(virt_addr)` and increments the ack counter.
-4. Caller spins until `ack_count == ready_count - 1`.
-5. Caller re-enables interrupts and proceeds with frame reclaim.
+```mermaid
+sequenceDiagram
+    participant C0 as Core 0 (unmapping)
+    participant C1 as Core 1
+    participant C2 as Core 2
 
-This is a synchronous barrier. It is a real cost on every unmap. v1 minimises unmap frequency by reclaiming memory only at service death (§10.5).
+    C0->>C0: disable interrupts
+    C0->>C1: IPI TLB_SHOOTDOWN(virt_addr)
+    C0->>C2: IPI TLB_SHOOTDOWN(virt_addr)
+    C1->>C1: invlpg(virt_addr), increment ack
+    C2->>C2: invlpg(virt_addr), increment ack
+    C0->>C0: spin until ack_count == ready_count - 1
+    C0->>C0: re-enable interrupts
+    C0->>C0: free_frame(reclaimed_frame)
+```
+
+This is a synchronous barrier. It is a real cost on every unmap. v1 minimises unmap frequency by reclaiming memory only at service death.
 
 ## Placement (§9.2)
 

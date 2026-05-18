@@ -26,9 +26,17 @@ Do NOT add assertions that:
 
 ## Existing assertions
 
-| Function                           | Invariant pinned |
-|------------------------------------|-----------------|
-| `assert_cap_validated`             | §3.1 — no ambient authority |
-| `assert_no_mid_execution_migration`| §3.11 / §9.1    |
-| `assert_tcb_alive`                 | §6.2            |
-| `assert_cap_table_consistent`      | §7.8            |
+| Function                            | Invariant pinned               |
+|-------------------------------------|-------------------------------|
+| `assert_cap_validated`              | §3.1 — no ambient authority   |
+| `assert_no_mid_execution_migration` | §3.11 / §9.1                  |
+| `assert_tcb_alive`                  | §6.2                          |
+| `assert_cap_table_consistent`       | §7.8                          |
+
+## Adding a new assertion
+
+1. Add the function to `assertions.rs`.
+2. Call it from the relevant hot path (syscall entry, scheduler, spawn).
+3. Reference the spec section it pins in a `// Pins: §X.Y` comment on the function.
+4. Add a row to the table above.
+5. Add a corresponding identity or property test that would catch the invariant being violated.

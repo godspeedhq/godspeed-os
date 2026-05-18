@@ -30,14 +30,16 @@ Synchronous message-passing IPC (§8). No unsafe code lives here; physical memor
 ## Endpoint death (§8.6)
 
 `routing::kill_endpoint(id)`:
-1. Bumps the generation in the routing table (all outstanding caps become stale).
+1. Bumps the generation in the routing table (all outstanding caps on every core become stale).
 2. Drains the queue (drops all queued messages).
 3. Wakes any sender blocked on a full queue with `EndpointDead` (cross-core IPI if needed).
 
+Generation bump is lazy invalidation: no cap is deleted from remote task tables. Each cap fails on its next use when it loses the generation check. The check is atomic and the bump is visible to all cores after the spinlock release.
+
 ## Zero-copy is permanently rejected (§2.5)
 
-All messages are copied: sender buffer → kernel Message → receiver buffer. If you are about to add a `share_buffer` syscall, read §2.5 and stop.
+All messages are copied: sender buffer → kernel `Message` → receiver buffer. If you are about to add a `share_buffer` syscall, read §2.5 and stop.
 
 ## Deadlock warning (§8.9)
 
-In any protocol where A sends to B and B sends to A, at least one direction MUST use `try_send`. Mutual blocking `send` calls are a protocol bug the kernel will not detect.
+In any protocol where A sends to B and B sends to A, at least one direction MUST use `try_send`. Mutual blocking `send` calls are a protocol bug the kernel will not detect. The supervisor's quantum-starvation watchdog is a last resort, not a primary mitigation.

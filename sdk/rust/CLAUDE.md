@@ -16,16 +16,30 @@ Provide typed, safe wrappers around kernel syscalls so service code:
 | `lib.rs`              | Crate root: re-exports, `Error` enum |
 | `capability.rs`       | `CapHandle` (opaque slot index), `CapError` (mirrors kernel errors) |
 | `ipc.rs`              | `Message`, `recv`, `send`, `try_send`, `IpcError` |
-| `service_context.rs`  | `ServiceContext`: handed to `service_main`; named cap lookup; log helpers; TCB-only helpers |
+| `service_context.rs`  | `ServiceContext`: handed to `service_main`; named cap lookup; log helpers; spawn helpers (TCB-only) |
 
 ## `ServiceContext` contract
 
-`ServiceContext` is the single entry point for all OS interaction. It is:
+`ServiceContext` is the single entry point for all OS interaction:
 - Passed by the kernel to `service_main` at spawn.
-- Non-`Copy` — one per service instance.
+- Non-`Copy` — one instance per service; cannot be duplicated.
 - The only way to invoke syscalls (no raw `asm!` in service code).
 
-Named capability lookup (`ctx.capability("ipc_send.pong")`) resolves names against the kernel's contract metadata for this task. Requesting a name not in the contract returns `Err(CapNotHeld)`.
+```
+// Named cap lookup resolves against the task's contract metadata.
+// Returns Err(CapNotHeld) if the name is not declared in the contract.
+let pong_cap = ctx.capability("ipc_send.pong")?;
+
+// IPC
+pong_cap.send(Message::text("hello"))?;
+let msg = my_endpoint.recv()?;
+
+// Logging
+ctx.log("ping: starting");
+
+// Spawn (supervisor-only; requires service_control cap)
+ctx.spawn_on("pong", 1)?;
+```
 
 ## no_std
 
@@ -37,3 +51,4 @@ The SDK is `#![no_std]`. It does not depend on any allocator. Services that need
 - A network API (not in v1 scope).
 - Threads (services are single-threaded; parallelism is via multi-service composition).
 - A heap allocator (services must manage their own memory if they need it).
+- Raw syscall wrappers (intentionally absent — always go through `ServiceContext`).

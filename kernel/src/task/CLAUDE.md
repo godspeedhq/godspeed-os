@@ -6,7 +6,7 @@ Task management and per-core scheduler (§9, §14).
 
 | File            | Responsibility |
 |-----------------|---------------|
-| `mod.rs`        | `spawn_init()`, `kill_current()` |
+| `mod.rs`        | `spawn_init()`, `kill_current()`, `drain_pending_kstack()` |
 | `task.rs`       | `Task` struct: id, name, core_id, state, context, page table, cap table, memory owner |
 | `state.rs`      | `TaskState` enum: Ready, Running, BlockedOnRecv, BlockedOnSend, Dead |
 | `scheduler.rs`  | `run()` (never returns), `timer_tick()`, `wake(task_id)`, `block_on_send(endpoint)` |
@@ -37,6 +37,16 @@ The 10 ms quantum is enforced by the local APIC timer. `timer_tick()` is called 
 1. Set `task.state = Dead`.
 2. Bump the generation of all endpoints owned by the task (via `ipc::routing::kill_endpoint`).
 3. Call `smp::ipi::broadcast_tlb_shootdown` for any mapped pages.
-4. Call `memory::ownership::reclaim_all` to return frames.
+4. Call `memory::ownership::reclaim_all` to return frames — **skipping the PML4 frame** (see below).
 5. Notify supervisor via its death-notification endpoint.
 6. Call `scheduler::pick_next()` to resume another task.
+
+## Deferred PML4 free (self-kill path)
+
+In the self-kill path (the dying task's CR3 is still active on the core), the PML4 frame is **not** freed immediately. Freeing it while it is still loaded in CR3 creates a use-after-free window: another core's `PageTable::new()` can immediately alloc and zero that frame, and on a TLB miss the hardware page-walker reads the zeroed PML4, sees entry 511 = 0 (not present), and generates a kernel page fault.
+
+Fix: the PML4 frame is stored in `CORE_PENDING_PML4[my_core]` during the kill path. It is freed at the next `drain_pending_kstack` call (timer tick or scheduler idle) when a different CR3 is already loaded on that core.
+
+## Control channel polling (§17)
+
+`timer_tick()` on Core 0 calls `control::process_pending()` on every tick. This drains COM2 bytes and executes any `RESTART`/`KILL` commands. The call is made **on every tick** (not only in the idle branch) so control commands are processed even when Core 0 always has runnable tasks.

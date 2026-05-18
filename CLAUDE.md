@@ -365,6 +365,19 @@ syscall(cap, action, args):
     perform action
 ```
 
+```mermaid
+flowchart TD
+    SC[Syscall arrives with cap + action]
+    SC --> L{cap.resource_id<br/>in kernel table?}
+    L -->|no| CNH[Return CapNotHeld]
+    L -->|yes| G{cap.generation ==<br/>kernel_table generation?}
+    G -->|no — resource destroyed| ED[Return EndpointDead]
+    G -->|no — explicitly revoked| CR[Return CapRevoked]
+    G -->|yes| R{action in<br/>cap.rights?}
+    R -->|no| CIR[Return CapInsufficientRights]
+    R -->|yes| ACT[Perform action → Ok]
+```
+
 The generation check is one atomic comparison. It is the v1 mechanism for cross-core revocation: bumping the generation on one core makes every cap on every other core stale, with no synchronous notification required.
 
 ### 7.6 Lifecycle
@@ -531,6 +544,19 @@ The classic deadlock — A and B both call `send` to a full queue — is the dev
 - **Per-core run queues.** Each core runs round-robin over its own queue.
 - **Static placement.** Services are pinned at spawn; they never migrate.
 - **10 ms preemption quantum**, per core, enforced by each core's local timer.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Ready: spawn completes
+    Ready --> Running: scheduler selects
+    Running --> Ready: timer preemption (10ms) / yield()
+    Running --> BlockedOnRecv: recv() — queue empty
+    Running --> BlockedOnSend: send() — queue full
+    BlockedOnRecv --> Ready: message arrives (IPI wake from sender)
+    BlockedOnSend --> Ready: queue drains (IPI wake) or EndpointDead
+    Running --> Dead: page fault / supervisor kill
+    Dead --> [*]: frames reclaimed, generation bumped
+```
 
 ### 9.2 Placement (Strict)
 
@@ -778,6 +804,28 @@ Every syscall checks the calling task's capability table, populated *from* the c
 7. Service registers any owned endpoints with registry.
 8. Service enters main loop on its assigned core.
 
+```mermaid
+sequenceDiagram
+    participant Sup as Supervisor
+    participant K as Kernel
+    participant R as Registry
+    participant Svc as New Service
+
+    Sup->>K: spawn syscall (name, contract)
+    K->>K: resolve placement — contract core or round-robin (§9.2)
+    alt PlacementInvalid
+        K-->>Sup: Err(PlacementInvalid)
+    else core available
+        K->>K: allocate Task + CapTable from contract
+        K->>K: map binary into new address space
+        K->>K: enqueue task on target core run queue
+        K-->>Sup: Ok(task_id)
+        Svc->>R: register endpoint (name → cap)
+        R-->>Svc: Ok
+        Svc->>Svc: service_main() — enters work loop
+    end
+```
+
 ### 14.2 Restart and Cap Rebinding (Possibly Cross-Core)
 
 ```mermaid
@@ -968,6 +1016,31 @@ The test suite is layered. Each layer answers a different question about kernel 
 | Performance | Latency / throughput benchmarks                      | A measured number regressed                       | Active |
 | Adversarial | Capability isolation under attack                    | An attack succeeds where the spec says it fails   | Active |
 | Chaos       | Graceful degradation under partial failures          | A defined failure mode is not handled cleanly     | Active |
+
+```mermaid
+graph LR
+    subgraph Foundation["Foundation — must pass before anything else"]
+        I["Identity (§22)<br/>20 tests — 20/20 ✅<br/>Constitutional invariants"]
+    end
+    subgraph Coverage["Correctness coverage"]
+        P["Property<br/>Universal invariants<br/>under random inputs"]
+        F["Fuzz<br/>Crash resistance<br/>on adversarial inputs"]
+    end
+    subgraph Endurance["Endurance"]
+        S["Stress<br/>No drift, leak, or<br/>corruption over time"]
+        A["Adversarial<br/>Cap isolation<br/>under attack"]
+    end
+    subgraph Measurement["Measurement"]
+        B["Performance<br/>Latency/throughput<br/>baselines"]
+        C["Chaos<br/>Graceful degradation<br/>under partial failures"]
+    end
+    I --> P
+    I --> F
+    P --> S
+    F --> A
+    S --> B
+    A --> C
+```
 
 Tests live under `tests/qemu/`, organized by category:
 

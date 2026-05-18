@@ -9,6 +9,10 @@ Demonstration service — sends one message to `pong` per second (§23.1).
 - After `osdev restart pong`, ping sees `EndpointDead`, looks up via registry, and continues.
 - The resumed send crosses to whatever core pong landed on — transparently.
 
+## Spawn order
+
+Ping is spawned by the supervisor **before** any probe services — second only to pong (pong must precede ping because ping's SEND cap to pong is wired at spawn time). This means ping starts sending within seconds of boot, well before the 178 probe services compete for scheduler quanta on Core 0.
+
 ## Cap-rebinding pattern
 
 This service demonstrates the canonical client pattern for handling service restarts (§14.2, §6.B test):
@@ -17,10 +21,22 @@ This service demonstrates the canonical client pattern for handling service rest
 loop:
   result = try_send("pong", msg)
   if EndpointDead:
-    pong_cap = registry.lookup("pong")  // fresh cap, possibly new core
+    log("pong endpoint dead, reacquiring via kernel registry")
+    pong_cap = registry.lookup("pong")   // fresh cap, possibly new core
+    log("pong cap reacquired, resuming")
     retry
   if QueueFull:
-    sleep, retry
+    backoff, retry
 ```
 
-Both `try_send` and `send` are valid here. `try_send` is used because if pong is momentarily busy, it is better to log "queue full" and retry than to block ping indefinitely.
+`try_send` is used (not blocking `send`) so that if pong is momentarily restarting, ping logs a retry and continues rather than blocking indefinitely.
+
+## Log strings observed by identity tests
+
+The following strings appear on the serial console and are matched by validator tests:
+
+| String                                          | Test    |
+|-------------------------------------------------|---------|
+| `"ping: sent 20 messages"`                      | 8B      |
+| `"ping: pong endpoint dead, reacquiring via kernel registry"` | 6B, 10B |
+| `"ping: pong cap reacquired, resuming"`         | 6B, 10B |

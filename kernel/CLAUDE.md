@@ -17,30 +17,37 @@ Filesystem logic, network stack, drivers (beyond minimal arch boot stubs), loggi
 
 ## Build
 
-```
+```bash
 cargo build -p kernel --target x86_64-unknown-none
 ```
 
-The kernel requires a custom target spec. The binary is a flat ELF loaded by the bootloader.
+The kernel requires a custom target spec. The binary is a flat ELF loaded by Limine.
 
 ## Module map
 
-| Module           | Spec section | Unsafe? |
-|------------------|-------------|---------|
+| Module           | Spec section | Unsafe permitted? |
+|------------------|-------------|-------------------|
 | `arch/x86_64`    | §11, §12    | Yes — hardware boundary |
 | `memory/`        | §10         | Yes — physical addresses |
 | `capability/`    | §7          | Yes — global table |
 | `smp/`           | §9, §11     | Yes — APIC MMIO |
 | `ipc/`           | §8          | No  |
-| `task/`          | §9, §14     | No (grandfathered — see `docs/unsafe-audit.md`) |
-| `syscall/`       | §8.2        | No (grandfathered — 2 lines, see audit) |
-| `interrupt/`     | §12         | No (grandfathered — 1 line, see audit) |
+| `task/`          | §9, §14     | 2 grandfathered lines (kstack arithmetic — see `docs/unsafe-audit.md`) |
+| `syscall/`       | §8.2        | 2 grandfathered lines (syscall entry — see audit) |
+| `interrupt/`     | §12         | 1 grandfathered line (IDT delivery — see audit) |
 | `invariants/`    | §22         | No  |
 | `log.rs`         | §11.4       | No  |
+| `control.rs`     | §17         | No  |
 
 ## Unsafe policy (§18)
 
-`unsafe` is permitted **only** in `arch/`, `memory/`, `capability/`, `smp/`. Every `unsafe` block must have a `// SAFETY:` comment. A PR adding an unsafe block without a SAFETY comment is rejected without review.
+`unsafe` is permitted **only** in `arch/`, `memory/`, `capability/`, `smp/`. Every `unsafe` block must have a `// SAFETY:` comment. The grandfathered lines in `task/`, `syscall/`, and `interrupt/` are documented in `docs/unsafe-audit.md` and will not be extended.
+
+A PR adding an unsafe block without a SAFETY comment is rejected without review.
+
+## Control channel (`control.rs`)
+
+`control.rs` implements the COM2 serial control channel used by the test harness to inject `RESTART`/`KILL` commands at runtime (§17). `process_pending()` is called from Core 0's timer ISR on every tick — not only in the scheduler idle branch — so commands are processed even under full task load.
 
 ## Panic behaviour
 

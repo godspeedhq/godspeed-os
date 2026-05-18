@@ -11,12 +11,26 @@ Hardware interrupt routing to userspace driver services (§12).
 
 ## How it works (§12.2)
 
-1. Hardware fires IRQ N on some core.
-2. The IDT stub calls `arch::x86_64::interrupts::dispatch_irq(N)`.
-3. `dispatch_irq` calls `interrupt::route::deliver(N)`.
-4. `deliver` looks up the registered driver endpoint for IRQ N in `IRQ_TABLE`.
-5. If found: builds an interrupt-event IPC message and calls `ipc::routing::enqueue`.
-6. If the driver is on a different core: the enqueue returns the blocked receiver task ID and the caller sends an IPI to wake it.
+```mermaid
+sequenceDiagram
+    participant HW as Hardware IRQ N
+    participant IDT as Kernel IDT stub
+    participant Route as interrupt::route
+    participant IPC as ipc::routing
+    participant Drv as Driver Service
+
+    HW->>IDT: IRQ fires on some core
+    IDT->>Route: dispatch_irq(N)
+    Route->>Route: lookup IRQ_TABLE[N]
+    alt no driver registered
+        Route->>Route: discard, EOI APIC
+    else driver endpoint found
+        Route->>IPC: enqueue(endpoint, interrupt_event_msg)
+        IPC->>Drv: IPI wake if blocked on recv
+        Drv->>Drv: recv() returns interrupt event
+        Drv->>HW: handle device via MMIO cap
+    end
+```
 
 ## Registration
 
@@ -30,4 +44,4 @@ Hardware interrupt routing to userspace driver services (§12).
 
 ## Kernel does not handle device logic
 
-The kernel IDT routes IRQs to userspace and EOIs the APIC. Everything after that — MMIO reads, DMA, protocol state machines — lives in the driver service.
+The kernel IDT routes IRQs to userspace and EOIs the APIC. Everything after that — MMIO reads, DMA, protocol state machines — lives in the driver service. The `hw_mmio` capability grants the driver direct access to its device's MMIO region; no kernel mediation at runtime.

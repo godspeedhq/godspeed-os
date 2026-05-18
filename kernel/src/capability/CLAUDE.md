@@ -25,6 +25,20 @@ The capability system (§7). Unsafe boundary: the global resource table uses a r
 
 ## Concurrency (§7.8)
 
-v1: a single global `RwLock` around `GlobalResourceTable`. Reads (cap lookup + gen check) take a read lock; writes (spawn, death, revoke) take a write lock. This is a known bottleneck; sharding is v2 work requiring benchmarks.
+v1: a single global `RwLock` around `GlobalResourceTable`. Reads (cap lookup + gen check) take a read lock; writes (spawn, death, revoke) take a write lock. This is a known bottleneck; sharding is v2 work requiring benchmarks (see B7 in `tests/qemu/perf/CLAUDE.md`).
 
 Per-task `CapTable` is NOT shared: only one core accesses a given task's table (the task is pinned to that core). No lock needed for `CapTable`.
+
+## Capability lifecycle diagram (§7.6)
+
+```mermaid
+stateDiagram-v2
+    [*] --> Created: kernel mints with current gen
+    Created --> Held: inserted into cap table
+    Held --> Used: syscall + rights + gen check pass
+    Used --> Held: action complete
+    Held --> Transferred: send w/ GRANT right
+    Transferred --> Held: in receiver's cap table
+    Held --> Stale: kernel bumps resource generation
+    Stale --> [*]: next use returns CapRevoked / EndpointDead
+```

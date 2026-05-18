@@ -19,6 +19,17 @@ If you are adding a syscall:
 3. The first thing `handle_<name>` does is validate the capability.
 4. There are no exceptions to this rule.
 
+## Syscall table (v1)
+
+| Number | Name        | Required cap right             |
+|--------|-------------|--------------------------------|
+| 1      | `send`      | SEND                           |
+| 2      | `recv`      | RECV                           |
+| 3      | `try_send`  | SEND                           |
+| 4      | `yield`     | none                           |
+| 5      | `log`       | log_write cap                  |
+| 6      | `alloc_mem` | implicit (own task memory)     |
+
 ## Safety
 
 `syscall_handler` is `unsafe extern "C"` because it is called from a raw IDT stub at the ring 3 → ring 0 boundary. Arguments are raw register values from untrusted user code:
@@ -28,13 +39,16 @@ If you are adding a syscall:
 
 User-pointer operations go through `arch::x86_64::read_user_bytes(ptr, len)` and `write_user_bytes(dst, src)`, which validate the pointer range before touching memory. Do not use `from_raw_parts` or `copy_nonoverlapping` directly in handler functions — use those wrappers instead.
 
-## Syscall table (v1)
+## Dispatch flow
 
-| Number | Name       | Required cap right |
-|--------|------------|-------------------|
-| 1      | `send`     | SEND              |
-| 2      | `recv`     | RECV              |
-| 3      | `try_send` | SEND              |
-| 4      | `yield`    | none              |
-| 5      | `log`      | log_write cap     |
-| 6      | `alloc_mem`| implicit (own task memory) |
+```mermaid
+flowchart TD
+    IDT[IDT stub — ring 3 → ring 0] --> H[syscall_handler]
+    H --> N{SyscallNumber}
+    N -->|Send/TrySend| S[handle_send: validate SEND cap → enqueue → maybe IPI]
+    N -->|Recv| R[handle_recv: validate RECV cap → dequeue or block]
+    N -->|Yield| Y[handle_yield: timer_tick immediately]
+    N -->|Log| L[handle_log: validate log_write cap → append to ring buffer]
+    N -->|AllocMem| A[handle_alloc: track_alloc → map page]
+    N -->|Unknown| E[Return UnknownSyscall]
+```

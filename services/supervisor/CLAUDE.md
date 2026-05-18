@@ -10,6 +10,21 @@ Restart authority. TCB member (§6.1). **Non-restartable.**
 - Expose `kill` and `restart` API (§14.4).
 - Log all lifecycle events.
 
+## Spawn order in `service_main`
+
+Pong and ping are spawned **first**, before all 178 probe services. The probe spawn loop takes 18–120 s on Windows TCG; spawning pong/ping first ensures cross-core IPC between them is established within ~10 s of boot.
+
+```
+service_main():
+  1. spawn("pong") on core 1  ← pong must precede ping (SEND cap wired at spawn)
+  2. spawn("ping") on core 0
+  3. spawn 178 probe services (§22 test infrastructure)
+  4. log("supervisor: ready")
+  5. loop { yield_cpu() }
+```
+
+`"supervisor: ready"` appears after **all** spawns complete. Identity tests that trigger a service restart use this string as the `wait_for` gate to ensure the restart fires only when supervisor is safely in its yield loop — no restart-mid-spawn conflict.
+
 ## Sole holder of `service_control`
 
 The `service_control` capability is held **only** by supervisor. No other service can kill or restart another service. This is the enforcement mechanism for §3.1 (no ambient authority) at the service lifecycle level.
@@ -20,6 +35,24 @@ When supervisor calls `restart(name, placement_override)`:
 - If `placement_override` is `Some(n)`: requires core `n`; fails with `PlacementInvalid` if that core is unavailable.
 - If `placement_override` is `None`: re-evaluates from the service contract — same rules as initial spawn.
 - **The previous core is NOT remembered.** A service on core 1 that is restarted without an override may land on core 2.
+
+## Restart flow
+
+```mermaid
+sequenceDiagram
+    participant Ctrl as Control channel (COM2)
+    participant K as Kernel
+    participant OldSvc as Old Service (gen N)
+    participant NewSvc as New Service (gen N+1)
+    participant R as Registry
+
+    Ctrl->>K: RESTART <name> <core>
+    K->>OldSvc: kill — bump generation to N+1
+    K->>K: drain endpoint queue, reclaim memory
+    K->>NewSvc: spawn on target core with gen N+1 caps
+    NewSvc->>R: register endpoint (gen N+1)
+    K->>Ctrl: log "control: <name> restarted"
+```
 
 ## Failure semantics (§6.2)
 
