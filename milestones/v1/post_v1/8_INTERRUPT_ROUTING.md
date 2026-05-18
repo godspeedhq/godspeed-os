@@ -96,17 +96,17 @@ be done in the same pass.
 
 ## Acceptance criteria
 
-- [x] `deliver(irq)` enqueues an interrupt-event `Message` to the registered endpoint;
+- ✅ `deliver(irq)` enqueues an interrupt-event `Message` to the registered endpoint;
       EOIs the local APIC; discards silently when no driver is registered.
-- [x] A driver service declaring `hw_interrupt = [N]` in its contract receives its
+- ✅ A driver service declaring `hw_interrupt = [N]` in its contract receives its
       IRQ endpoint populated at spawn time via `register()`.
-- [x] Cross-core delivery: if the driver is pinned to a different core than the one
+- ✅ Cross-core delivery: if the driver is pinned to a different core than the one
       receiving the IRQ, the IPI wake path is exercised (same path as any cross-core
       `send`).
-- [x] No kernel panic on unregistered IRQs (existing behaviour preserved).
-- [x] `assert_tcb_alive()` and `assert_cap_table_consistent()` implemented.
-- [x] All 20 identity tests still pass after the changes.
-- [x] Unsafe audit doc updated if any new `unsafe` blocks are added.
+- ✅ No kernel panic on unregistered IRQs (existing behaviour preserved).
+- ✅ `assert_tcb_alive()` and `assert_cap_table_consistent()` implemented.
+- ✅ All 20 identity tests still pass after the changes.
+- ✅ Unsafe audit doc updated if any new `unsafe` blocks are added.
 
 ---
 
