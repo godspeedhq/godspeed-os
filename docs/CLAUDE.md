@@ -18,7 +18,7 @@ Narrative documentation. These files explain design decisions in prose; they do 
 
 CI checks that `unsafe-audit.md` lists every `unsafe` block in `kernel/src/`. If you add an `unsafe` block, you must update this file in the same commit. If you forget, CI fails. This is the enforcement mechanism for §18.4.
 
-Current floor: **52 lines** covering 4 permitted layers (`arch/`, `memory/`, `capability/`, `smp/`) plus 5 grandfathered lines in `task/`, `syscall/`, and `interrupt/`. The grandfathered count will not grow.
+Current floor: **54 lines** covering 4 permitted layers (`arch/`, `memory/`, `capability/`, `smp/`) plus grandfathered lines in `task/`, `syscall/`, and `interrupt/`. The grandfathered count will not grow.
 
 ## `cluster-design.md` is non-normative
 

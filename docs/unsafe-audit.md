@@ -63,12 +63,12 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | main.rs | 2 | grandfathered |
 | syscall/dispatch.rs | 2 | grandfathered |
 | task/mod.rs | 7 | grandfathered |
-| task/scheduler.rs | 36 | grandfathered |
+| task/scheduler.rs | 38 | grandfathered |
 <!-- unsafe-inventory-end -->
 
 **Permitted total:** 217 lines across 17 files  
-**Grandfathered total:** 52 lines across 6 files  
-**Grand total:** 269 lines across 23 files
+**Grandfathered total:** 54 lines across 6 files  
+**Grand total:** 271 lines across 23 files
 
 ---
 
@@ -339,9 +339,10 @@ removing 5 unsafe lines.
 
 ### task/scheduler.rs *(grandfathered)*
 
-36 unsafe lines. Four formerly-`static mut` arrays converted to atomic types,
-removing six standalone `unsafe {}` blocks (the previous count was 42, reduced
-back to the 36 baseline):
+38 unsafe lines (raised from 36 by the interrupt routing commit — see below).
+Four formerly-`static mut` arrays converted to atomic types, removing six
+standalone `unsafe {}` blocks (the previous count was 42, reduced to 36, now
+38 after `for_each_active_cap` was added):
 
 - `CORE_CURRENT` → `[AtomicUsize; MAX_CORES]`: removes the standalone `unsafe`
   in `current_task_slot()`; all other accesses are syntactically updated to
@@ -356,8 +357,21 @@ back to the 36 baseline):
   the inherently-unsafe `Frame::from_phys` + `free_frame` pair and the
   `send_ipi` call needed `unsafe` blocks.
 
+**Two additional lines** added with `for_each_active_cap` (interrupt routing
+commit, post-v1 item 8):
+- `if !unsafe { TASK_VALID[slot] } { continue; }` — reads the task-valid flag
+  without holding `TASK_SLOT_LOCKED`. Sound as a best-effort snapshot: a task
+  dying or spawning concurrently may be seen inconsistently for one iteration,
+  which is acceptable for the invariant assertion that is the sole caller. The
+  flag is `bool` so the read is atomic on all supported architectures.
+- `unsafe { TASK_CAP[slot].assume_init_ref() }.for_each_slot(&mut f)` — reads
+  the `MaybeUninit<CapTable>` after `TASK_VALID[slot]` was observed `true`.
+  Sound because `TASK_VALID[slot] == true` is a stable commitment that the
+  `CapTable` at that slot was fully initialised before the flag was set, and the
+  `assume_init_ref` call just re-exposes that invariant to the Rust type system.
+
 Sound in aggregate: all arrays are indexed by slot or core_id with bounds
 checked at their call sites; ring3 switch is called only from the scheduler
 with interrupts disabled; cap init runs before the task is visible to other
 cores; deferred PML4 free runs only after CR3 switch.
-`// SAFETY:` comments present in source for all remaining blocks.
+`// SAFETY:` comments present in source for all blocks.
