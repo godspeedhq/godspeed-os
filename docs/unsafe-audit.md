@@ -63,12 +63,12 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | main.rs | 2 | grandfathered |
 | syscall/dispatch.rs | 2 | grandfathered |
 | task/mod.rs | 7 | grandfathered |
-| task/scheduler.rs | 38 | grandfathered |
+| task/scheduler.rs | 36 | grandfathered |
 <!-- unsafe-inventory-end -->
 
 **Permitted total:** 217 lines across 17 files  
-**Grandfathered total:** 54 lines across 6 files  
-**Grand total:** 271 lines across 23 files
+**Grandfathered total:** 52 lines across 6 files  
+**Grand total:** 269 lines across 23 files
 
 ---
 
@@ -339,36 +339,36 @@ removing 5 unsafe lines.
 
 ### task/scheduler.rs *(grandfathered)*
 
-38 unsafe lines (raised from 36 by the interrupt routing commit — see below).
-Four formerly-`static mut` arrays converted to atomic types, removing six
-standalone `unsafe {}` blocks (the previous count was 42, reduced to 36, now
-38 after `for_each_active_cap` was added):
+36 unsafe lines. Five formerly-`static mut` arrays converted to atomic types,
+removing eight standalone `unsafe {}` blocks (previous count was 42, then 38,
+now back to the original 36 floor after `TASK_VALID` was also converted):
 
-- `CORE_CURRENT` → `[AtomicUsize; MAX_CORES]`: removes the standalone `unsafe`
-  in `current_task_slot()`; all other accesses are syntactically updated to
-  `.load()`/`.store()` inside existing large `unsafe` blocks.
-- `CORE_RR_SLOT` → `[AtomicUsize; MAX_CORES]`: removes both standalone `unsafe`
+- `CORE_CURRENT` → `[AtomicUsize; MAX_CORES]`: removed standalone `unsafe` in
+  `current_task_slot()`; accesses updated to `.load()`/`.store()`.
+- `CORE_RR_SLOT` → `[AtomicUsize; MAX_CORES]`: removed both standalone `unsafe`
   blocks in `pick_next()`.
-- `CORE_PENDING_KSTACK_LEN` → `[AtomicUsize; MAX_CORES]`: removes both
+- `CORE_PENDING_KSTACK_LEN` → `[AtomicUsize; MAX_CORES]`: removed both
   standalone `unsafe` blocks in `drain_pending_kstack()`.
-- `TASK_KERNEL_STACK_TOP` → `[AtomicU64; MAX_TASKS]`: removes the standalone
+- `TASK_KERNEL_STACK_TOP` → `[AtomicU64; MAX_TASKS]`: removed the standalone
   `unsafe` in `prepare_ring3_switch()`.
+- `TASK_VALID` → `[AtomicBool; MAX_TASKS]`: removed the standalone
+  `unsafe { TASK_VALID[slot] = false; }` in `release_task_slot()` and the
+  inline `if !unsafe { TASK_VALID[slot] }` in `for_each_active_cap()`. All
+  stores use `Release` ordering; the lock-free `for_each_active_cap` read uses
+  `Acquire` to pair with `Release` stores and ensure cap table visibility; all
+  reads inside lock-protected regions use `Relaxed`.
 - `CORE_PENDING_PML4` is `AtomicU64` so its load/store sites are safe — only
-  the inherently-unsafe `Frame::from_phys` + `free_frame` pair and the
-  `send_ipi` call needed `unsafe` blocks.
+  the `Frame::from_phys` + `free_frame` pair and the `send_ipi` call needed
+  `unsafe` blocks.
 
-**Two additional lines** added with `for_each_active_cap` (interrupt routing
-commit, post-v1 item 8):
-- `if !unsafe { TASK_VALID[slot] } { continue; }` — reads the task-valid flag
-  without holding `TASK_SLOT_LOCKED`. Sound as a best-effort snapshot: a task
-  dying or spawning concurrently may be seen inconsistently for one iteration,
-  which is acceptable for the invariant assertion that is the sole caller. The
-  flag is `bool` so the read is atomic on all supported architectures.
+One remaining line in `for_each_active_cap` is still `unsafe`:
 - `unsafe { TASK_CAP[slot].assume_init_ref() }.for_each_slot(&mut f)` — reads
-  the `MaybeUninit<CapTable>` after `TASK_VALID[slot]` was observed `true`.
-  Sound because `TASK_VALID[slot] == true` is a stable commitment that the
-  `CapTable` at that slot was fully initialised before the flag was set, and the
-  `assume_init_ref` call just re-exposes that invariant to the Rust type system.
+  a `MaybeUninit<CapTable>` after `TASK_VALID[slot].load(Acquire)` returned
+  `true`. Sound because the `Acquire` load pairs with the `Release` store in
+  `reserve_task_slot`/`enqueue`, establishing that the `CapTable` write
+  happened-before this read. `CapTable` cannot be const-constructed so
+  `MaybeUninit` is necessary; `assume_init_ref` is the unavoidable unsafe
+  assertion that the slot is initialised.
 
 Sound in aggregate: all arrays are indexed by slot or core_id with bounds
 checked at their call sites; ring3 switch is called only from the scheduler

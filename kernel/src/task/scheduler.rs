@@ -38,7 +38,7 @@ static mut TASK_CAP:   [MaybeUninit<CapTable>; MAX_TASKS] =
 static TASK_STATE: [AtomicU8; MAX_TASKS] =
     [const { AtomicU8::new(TaskState::Dead as u8) }; MAX_TASKS];
 static mut TASK_NAME:  [&str; MAX_TASKS]       = [""; MAX_TASKS];
-static mut TASK_VALID: [bool; MAX_TASKS]       = [false; MAX_TASKS];
+static TASK_VALID: [AtomicBool; MAX_TASKS] = [const { AtomicBool::new(false) }; MAX_TASKS];
 /// Which core each task is pinned to (set at enqueue time; immutable after).
 static mut TASK_CORE:  [u32; MAX_TASKS]        = [0u32; MAX_TASKS];
 /// Wakeup result written by `wake_by_slot`; returned by `block_and_reschedule`.
@@ -219,8 +219,8 @@ pub fn reserve_task_slot(core_id: u32) -> Option<usize> {
     let result = unsafe {
         let mut found = None;
         for i in 0..MAX_TASKS {
-            if !TASK_VALID[i] {
-                TASK_VALID[i] = true;
+            if !TASK_VALID[i].load(Ordering::Relaxed) {
+                TASK_VALID[i].store(true, Ordering::Release);
                 TASK_CORE[i]  = core_id;
                 found = Some(i);
                 break;
@@ -261,8 +261,7 @@ pub unsafe fn task_cap_init_empty(slot: usize) -> &'static mut CapTable {
 /// Release a previously-reserved slot without committing (called on spawn error).
 pub fn release_task_slot(slot: usize) {
     task_slot_lock();
-    // SAFETY: lock held; slot was reserved by this core.
-    unsafe { TASK_VALID[slot] = false; }
+    TASK_VALID[slot].store(false, Ordering::Release);
     task_slot_unlock();
 }
 
@@ -314,12 +313,12 @@ pub fn enqueue(
     // SAFETY: called from BSP before any AP scheduler starts.
     unsafe {
         for i in 0..MAX_TASKS {
-            if !TASK_VALID[i] {
+            if !TASK_VALID[i].load(Ordering::Relaxed) {
                 TASK_CTX[i].write(ctx);
                 TASK_CAP[i].write(caps);
                 TASK_STATE[i].store(TaskState::Ready as u8, Ordering::Relaxed);
                 TASK_NAME[i]             = name;
-                TASK_VALID[i]            = true;
+                TASK_VALID[i].store(true, Ordering::Release);
                 TASK_CORE[i]             = core_id;
                 TASK_IS_USER[i]          = is_user;
                 TASK_KERNEL_STACK_TOP[i].store(kernel_stack_top, Ordering::Relaxed);
@@ -342,7 +341,7 @@ pub fn current_task_lookup_cap(slot: usize, right: Rights) -> Result<Capability,
     // SAFETY: IF=0 in syscall context; CORE_CURRENT is stable for this core.
     unsafe {
         let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
-        if cur < MAX_TASKS && TASK_VALID[cur] {
+        if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Relaxed) {
             TASK_CAP[cur].assume_init_ref().get(slot, right)
         } else {
             Err(CapError::CapNotHeld)
@@ -355,7 +354,7 @@ pub fn current_task_remove_cap(slot: usize) -> Option<Capability> {
     let cid = current_core_id();
     unsafe {
         let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
-        if cur < MAX_TASKS && TASK_VALID[cur] {
+        if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Relaxed) {
             TASK_CAP[cur].assume_init_mut().remove(slot)
         } else {
             None
@@ -370,7 +369,7 @@ pub fn current_task_read_cap_rights(slot: usize) -> Option<Rights> {
     let cid = current_core_id();
     unsafe {
         let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
-        if cur < MAX_TASKS && TASK_VALID[cur] {
+        if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Relaxed) {
             crate::capability::cap_read_rights(TASK_CAP[cur].assume_init_ref(), slot)
         } else {
             None
@@ -385,12 +384,13 @@ pub fn current_task_read_cap_rights(slot: usize) -> Option<Rights> {
 /// from a spawn or kill path while TASK_SLOT_LOCKED is held by this core.
 pub fn for_each_active_cap<F: FnMut(&Capability)>(mut f: F) {
     for slot in 0..MAX_TASKS {
-        // SAFETY: TASK_VALID[slot] is read without TASK_SLOT_LOCKED for a
-        // best-effort snapshot. A task that dies or spawns concurrently may be
-        // seen inconsistently for one iteration — acceptable for an invariant
-        // assertion. TASK_CAP[slot] is valid (init_ref safe) whenever TASK_VALID[slot]
-        // is true at the point of reading.
-        if !unsafe { TASK_VALID[slot] } { continue; }
+        // Acquire pairs with the Release store in reserve_task_slot/enqueue, ensuring
+        // the cap table write is visible before we call assume_init_ref. Best-effort
+        // snapshot: a concurrent spawn/kill may be seen inconsistently for one
+        // iteration, which is acceptable for invariant-assertion use only.
+        if !TASK_VALID[slot].load(Ordering::Acquire) { continue; }
+        // SAFETY: TASK_VALID[slot] true (observed with Acquire) guarantees the
+        // CapTable was fully written before the Release store that set valid=true.
         unsafe { TASK_CAP[slot].assume_init_ref() }.for_each_slot(&mut f);
     }
 }
@@ -466,7 +466,7 @@ pub fn current_task_claim_alloc(size: u64) -> Option<u64> {
     // SAFETY: IF=0 in syscall context; single core writer.
     unsafe {
         let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
-        if cur >= MAX_TASKS || !TASK_VALID[cur] { return None; }
+        if cur >= MAX_TASKS || !TASK_VALID[cur].load(Ordering::Relaxed) { return None; }
 
         // Overflow guard: (size + 4095) wraps for very large values (e.g. u64::MAX).
         // saturating to u64::MAX guarantees the budget check rejects the request.
@@ -490,7 +490,7 @@ pub fn current_task_alloc_bytes() -> u64 {
     // SAFETY: IF=0 in syscall context; single core reader for this slot.
     unsafe {
         let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
-        if cur >= MAX_TASKS || !TASK_VALID[cur] { return 0; }
+        if cur >= MAX_TASKS || !TASK_VALID[cur].load(Ordering::Relaxed) { return 0; }
         TASK_ALLOC_BYTES[cur]
     }
 }
@@ -500,7 +500,7 @@ pub fn current_task_insert_cap(cap: Capability) -> Result<usize, CapError> {
     let cid = current_core_id();
     unsafe {
         let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
-        if cur < MAX_TASKS && TASK_VALID[cur] {
+        if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Relaxed) {
             TASK_CAP[cur].assume_init_mut().insert(cap)
         } else {
             Err(CapError::CapNotHeld)
@@ -639,7 +639,7 @@ pub extern "C" fn timer_tick_from_irq() {
 
         let prev = CORE_CURRENT[cid].load(Ordering::Relaxed);
 
-        if prev < MAX_TASKS && TASK_VALID[prev]
+        if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed)
             && TaskState::from(TASK_STATE[prev].load(Ordering::Relaxed)) == TaskState::Running
         {
             TASK_STATE[prev].store(TaskState::Ready as u8, Ordering::Relaxed);
@@ -671,7 +671,7 @@ pub extern "C" fn timer_tick_from_irq() {
                 } else {
                     // Restore Running only if we changed the state to Ready above.
                     // CAS fails if state is Blocked* or Dead, leaving it untouched.
-                    if prev < MAX_TASKS && TASK_VALID[prev] {
+                    if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) {
                         TASK_STATE[prev]
                             .compare_exchange(
                                 TaskState::Ready as u8,
@@ -696,7 +696,7 @@ pub extern "C" fn timer_tick_from_irq() {
 
         // Save BEFORE prepare_ring3_switch so we capture the value from the last
         // SYSCALL entry for `prev`, not the value prepare_ring3_switch writes for `next`.
-        if prev < MAX_TASKS && TASK_VALID[prev] && TASK_IS_USER[prev] {
+        if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) && TASK_IS_USER[prev] {
             TASK_USER_RSP[prev] =
                 crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[cid].user_rsp;
         }
@@ -707,7 +707,7 @@ pub extern "C" fn timer_tick_from_irq() {
 
         let current_ctx: *mut TaskContext = if prev >= MAX_TASKS {
             &raw mut CORE_SCHED_CTX[cid]
-        } else if !TASK_VALID[prev] {
+        } else if !TASK_VALID[prev].load(Ordering::Relaxed) {
             // Slot was immediately released by a self-kill (deferred-kstack
             // approach).  Save into CORE_DEAD_CTX to avoid a write-after-claim
             // race with a concurrent spawn.  CORE_DEAD_CTX is never resumed.
@@ -733,7 +733,7 @@ pub fn yield_current() {
     // SAFETY: IF=0.
     unsafe {
         let prev = CORE_CURRENT[cid].load(Ordering::Relaxed);
-        if prev < MAX_TASKS && TASK_VALID[prev]
+        if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed)
             && TaskState::from(TASK_STATE[prev].load(Ordering::Relaxed)) == TaskState::Running
         {
             TASK_STATE[prev].store(TaskState::Ready as u8, Ordering::Relaxed);
@@ -760,7 +760,7 @@ pub fn yield_current() {
                     switch_context(dead_ctx, sched_ctx);
                     // Unreachable: dead tasks are never rescheduled.
                 } else {
-                    if prev < MAX_TASKS && TASK_VALID[prev] {
+                    if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) {
                         TASK_STATE[prev].store(TaskState::Running as u8, Ordering::Relaxed);
                     }
                     core::arch::asm!("sti", options(nostack, nomem));
@@ -780,7 +780,7 @@ pub fn yield_current() {
 
         // Save BEFORE prepare_ring3_switch so we capture the value from SYSCALL
         // entry, not the value prepare_ring3_switch is about to write for `next`.
-        if prev < MAX_TASKS && TASK_VALID[prev] && TASK_IS_USER[prev] {
+        if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) && TASK_IS_USER[prev] {
             TASK_USER_RSP[prev] =
                 crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[cid].user_rsp;
         }
@@ -801,7 +801,7 @@ pub fn yield_current() {
         // CORE_DEAD_CTX is never used as a load source (dead tasks not resumed).
         let current_ctx: *mut TaskContext = if prev >= MAX_TASKS {
             &raw mut CORE_SCHED_CTX[cid]
-        } else if !TASK_VALID[prev] {
+        } else if !TASK_VALID[prev].load(Ordering::Relaxed) {
             &raw mut CORE_DEAD_CTX[cid]
         } else {
             TASK_CTX[prev].assume_init_mut() as *mut TaskContext
@@ -829,7 +829,7 @@ pub fn current_task_slot() -> usize {
 pub fn wake_by_slot(slot: usize, result: i64) {
     // SAFETY: IF=0 from IPC/syscall path.
     unsafe {
-        if slot < MAX_TASKS && TASK_VALID[slot] {
+        if slot < MAX_TASKS && TASK_VALID[slot].load(Ordering::Relaxed) {
             // Do not revive a task that kill_task_by_slot has already marked Dead.
             // If we overwrite Dead with Ready, the scheduler re-animates a task
             // whose kernel stack may already be freed — KERNEL PF on next entry.
@@ -874,7 +874,7 @@ pub fn find_task_by_name(name: &str) -> Option<usize> {
     // SAFETY: read-only scan; caller holds no locks.
     unsafe {
         for i in 0..MAX_TASKS {
-            if TASK_VALID[i]
+            if TASK_VALID[i].load(Ordering::Relaxed)
                 && TASK_NAME[i] == name
                 && TaskState::from(TASK_STATE[i].load(Ordering::Acquire)) != TaskState::Dead
             {
@@ -942,7 +942,7 @@ pub fn kill_task_by_slot(slot: usize) {
     task_slot_lock();
     // SAFETY: lock held; exclusive access to TASK_VALID/TASK_STATE across all cores.
     let already_dead = unsafe {
-        if slot >= MAX_TASKS || !TASK_VALID[slot] {
+        if slot >= MAX_TASKS || !TASK_VALID[slot].load(Ordering::Relaxed) {
             task_slot_unlock();
             return;
         }
@@ -1133,7 +1133,7 @@ pub fn kill_task_by_slot(slot: usize) {
             }
             // Release slot now — no zombie period, no starvation.
             task_slot_lock();
-            TASK_VALID[slot] = false;
+            TASK_VALID[slot].store(false, Ordering::Release);
             task_slot_unlock();
             return;
         }
@@ -1149,7 +1149,7 @@ pub fn kill_task_by_slot(slot: usize) {
         // top-of-function store and now.
         task_slot_lock();
         TASK_STATE[slot].store(TaskState::Dead as u8, Ordering::Release);
-        TASK_VALID[slot] = false;
+        TASK_VALID[slot].store(false, Ordering::Release);
         task_slot_unlock();
     }
 }
@@ -1169,7 +1169,7 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
 
         let cid  = current_core_id();
         let slot = CORE_CURRENT[cid].load(Ordering::Relaxed);
-        assert!(slot < MAX_TASKS && TASK_VALID[slot],
+        assert!(slot < MAX_TASKS && TASK_VALID[slot].load(Ordering::Relaxed),
                 "block_and_reschedule: no running task");
 
         // Atomically transition Running → Blocked.
@@ -1265,9 +1265,9 @@ fn pick_next(core_id: usize) -> Option<usize> {
     for i in 0..MAX_TASKS {
         let idx = (start + i) % MAX_TASKS;
         // Acquire: sees the Ready write from wake_by_slot's Release store.
-        // SAFETY: TASK_VALID, TASK_STATE, TASK_CORE are static arrays; idx < MAX_TASKS; read access is safe.
+        // SAFETY: TASK_STATE and TASK_CORE are static mut arrays; idx < MAX_TASKS.
         let ready = unsafe {
-            TASK_VALID[idx]
+            TASK_VALID[idx].load(Ordering::Relaxed)
                 && TaskState::from(TASK_STATE[idx].load(Ordering::Acquire)) == TaskState::Ready
                 && TASK_CORE[idx] == core_id as u32
         };
