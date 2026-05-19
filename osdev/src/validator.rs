@@ -602,7 +602,9 @@ static CHAOS_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["chaos: C5 pass"],
             fail_on:      &["KERNEL PANIC", "chaos: C5 FAIL"],
-            timeout_secs: 30,
+            // 100 recursive yield_cpu() calls; each yield costs ~500ms wall under
+            // load (150+ competing tasks); 100 × 500ms = 50s work + ~8s boot-to-spawn.
+            timeout_secs: 120,
         },
     },
     TestSpec {
