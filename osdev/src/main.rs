@@ -276,6 +276,10 @@ fn cmd_test(suite: &str) {
         "stress"      => crate::validator::run_stress_tests(),
         "stress-brutal" => crate::validator::run_brutal_stress_tests(),
         "perf"          => crate::validator::run_perf_tests(),
+        s if s.starts_with("perf:") => {
+            let id = s.trim_start_matches("perf:");
+            crate::validator::run_perf_tests_filtered(Some(id));
+        }
         "perf-brutal"   => crate::validator::run_brutal_perf_tests(),
         "adv"        => crate::validator::run_adv_tests(),
         "adv-brutal" => crate::validator::run_brutal_adv_tests(),

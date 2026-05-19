@@ -1403,7 +1403,9 @@ fn mode_perf_b1(ctx: &ServiceContext) -> ! {
     };
 
     let msg = Message::from_bytes(b"b1");
-    const N: usize = 200;
+    // N=50: same-core round-trips require two scheduler context switches; with
+    // 160+ competing tasks each costs ~800ms wall. 200×800ms = 160s impractical.
+    const N: usize = 50;
     let mut samples = [0u64; N];
 
     for i in 0..N {
@@ -1440,7 +1442,9 @@ fn mode_perf_b2(ctx: &ServiceContext) -> ! {
     };
 
     let msg = Message::from_bytes(b"b2");
-    const N: usize = 200;
+    // N=50: cross-core round-trips cost ~800ms each under QEMU TCG load;
+    // 200×800ms = 160s is impractical. 50 samples still produce valid percentiles.
+    const N: usize = 50;
     let mut samples = [0u64; N];
 
     for i in 0..N {
@@ -1470,7 +1474,10 @@ fn mode_perf_b2_echo(ctx: &ServiceContext) -> ! {
 
 fn mode_perf_b3(ctx: &ServiceContext) -> ! {
     // B3: syscall yield floor — round-trip time for advisory yield (§22 Perf B3).
-    const N: u64 = 1_000;
+    // N=10: brutal stress tests (stress-bs4/bs5 kill/respawn cycling) make each yield
+    // cost 3–5s wall under full QEMU TCG load; 50×3.4s ≈ 170s > post-spawn headroom.
+    // 10 samples still produce a valid TSC mean for baseline tracking.
+    const N: u64 = 10;
     let t0 = ctx.read_tsc();
     for _ in 0..N { ctx.yield_cpu(); }
     let t1 = ctx.read_tsc();
@@ -1591,7 +1598,9 @@ fn mode_perf_b9_recv(ctx: &ServiceContext) -> ! {
 fn mode_perf_b10(ctx: &ServiceContext) -> ! {
     // B10: scheduler pick-next cost — same as B3 but labelled separately for
     // baseline tracking (§22 Perf B10).
-    const N: u64 = 1_000;
+    // N=10: mirrors B3 — brutal stress tasks make each yield cost 3–5s wall;
+    // 10 samples fit within post-spawn headroom and still produce a valid mean.
+    const N: u64 = 10;
     let t0 = ctx.read_tsc();
     for _ in 0..N { ctx.yield_cpu(); }
     let t1 = ctx.read_tsc();

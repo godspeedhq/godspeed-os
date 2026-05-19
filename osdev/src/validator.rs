@@ -390,7 +390,10 @@ static PERF_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["perf: B1 done"],
             fail_on:      &["KERNEL PANIC", "perf: B1 FAIL"],
-            timeout_secs: 60,
+            // N reduced 200→50 in probe. Same-core round-trips need two scheduler
+            // context switches; with 160+ tasks each costs ~800ms wall.
+            // Spawn at ~48–150s + 50×800ms ≈ 40s work → worst-case ~190s < 300s.
+            timeout_secs: 300,
         },
     },
     TestSpec {
@@ -398,7 +401,9 @@ static PERF_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["perf: B2 done"],
             fail_on:      &["KERNEL PANIC", "perf: B2 FAIL"],
-            timeout_secs: 250,
+            // N reduced 200→50 in probe. Spawn at ~153s + 50×~1.8s ≈ 90s work →
+            // worst-case ~243s; raised to 300s to match other IPC/yield benchmarks.
+            timeout_secs: 300,
         },
     },
     TestSpec {
@@ -406,7 +411,9 @@ static PERF_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["perf: B3 done"],
             fail_on:      &["KERNEL PANIC", "perf: B3 FAIL"],
-            timeout_secs: 30,
+            // N reduced 1000→10 in probe. Brutal stress tasks make each yield cost
+            // 3–5s wall; 10×3.5s = 35s work + spawn ~128s ≪ 300s timeout.
+            timeout_secs: 300,
         },
     },
     TestSpec {
@@ -446,7 +453,9 @@ static PERF_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["perf: B8 done"],
             fail_on:      &["KERNEL PANIC", "perf: B8 FAIL"],
-            timeout_secs: 60,
+            // perf-b8 (slot ~160) spawns 4–120s depending on QEMU TCG load from
+            // brutal tests. Work itself is fast (16384 allocs). 300s covers worst case.
+            timeout_secs: 300,
         },
     },
     TestSpec {
@@ -454,7 +463,9 @@ static PERF_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["perf: B9 done"],
             fail_on:      &["KERNEL PANIC", "perf: B9 FAIL"],
-            timeout_secs: 60,
+            // perf-b9 (slot ~160) spawns 12–163s depending on QEMU TCG load.
+            // 200 blocking sends are fast once running. 300s covers worst-case boot.
+            timeout_secs: 300,
         },
     },
     TestSpec {
@@ -462,7 +473,9 @@ static PERF_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["perf: B10 done"],
             fail_on:      &["KERNEL PANIC", "perf: B10 FAIL"],
-            timeout_secs: 30,
+            // N reduced 1000→10 in probe. Mirrors B3: brutal stress tasks cost 3–5s/yield;
+            // 10×3.5s = 35s work + spawn ~128s ≪ 300s timeout.
+            timeout_secs: 300,
         },
     },
 ];
@@ -2042,6 +2055,10 @@ pub fn run_brutal_perf_tests() {
 /// After all benchmarks pass, extracted RDTSC metrics are written to
 /// `tests/qemu/perf/baseline.json` for future regression comparisons.
 pub fn run_perf_tests() {
+    run_perf_tests_filtered(None);
+}
+
+pub fn run_perf_tests_filtered(filter: Option<&str>) {
     println!("perf: stopping any running QEMU instances...");
     kill_existing_qemu();
 
@@ -2061,11 +2078,20 @@ pub fn run_perf_tests() {
     std::fs::create_dir_all("build/tests/5_PERFORMANCE")
         .expect("create build/tests/5_PERFORMANCE/");
 
-    println!("\nperf: running {} benchmarks\n", PERF_TESTS.len());
+    let tests: Vec<&TestSpec> = PERF_TESTS.iter()
+        .filter(|t| filter.map_or(true, |f| t.id.eq_ignore_ascii_case(f)))
+        .collect();
+
+    if tests.is_empty() {
+        eprintln!("perf: no tests match filter {:?}", filter);
+        std::process::exit(1);
+    }
+
+    println!("\nperf: running {} benchmark(s)\n", tests.len());
 
     let mut results: Vec<(&TestSpec, TestOutcome)> = Vec::new();
 
-    for test in PERF_TESTS {
+    for test in &tests {
         print!("  [{:>3}]  {:45}  ({})  … ", test.id, test.name, test.spec_ref);
         let _ = std::io::stdout().flush();
 
@@ -2256,21 +2282,17 @@ fn poll_serial(
     deadline: Instant,
 ) -> TestOutcome {
     loop {
-        if Instant::now() >= deadline {
-            let content = std::fs::read_to_string(path).unwrap_or_default();
-            let missing: Vec<String> = expect.iter()
-                .filter(|e| !content.contains(**e))
-                .map(|e| format!("\"{e}\""))
-                .collect();
-            return TestOutcome::Fail(format!(
-                "timeout — lines not seen: {}",
-                missing.join(", ")
-            ));
-        }
-
         let content = match std::fs::read_to_string(path) {
             Ok(s)  => s,
-            Err(_) => { std::thread::sleep(Duration::from_millis(100)); continue; }
+            Err(_) => {
+                // File may be transiently locked by QEMU on Windows. Still honour
+                // the deadline so a persistent lock never becomes an infinite loop.
+                if Instant::now() >= deadline {
+                    return TestOutcome::Fail("timeout — serial file unreadable".to_string());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
         };
 
         for &line in fail_on {
@@ -2281,6 +2303,24 @@ fn poll_serial(
 
         if expect.iter().all(|e| content.contains(e)) {
             return TestOutcome::Pass;
+        }
+
+        if Instant::now() >= deadline {
+            // QEMU buffers serial writes; give it 600ms to flush before the
+            // final check so we don't report a false timeout.
+            std::thread::sleep(Duration::from_millis(600));
+            let content = std::fs::read_to_string(path).unwrap_or_default();
+            let missing: Vec<String> = expect.iter()
+                .filter(|e| !content.contains(**e))
+                .map(|e| format!("\"{e}\""))
+                .collect();
+            if missing.is_empty() {
+                return TestOutcome::Pass;
+            }
+            return TestOutcome::Fail(format!(
+                "timeout — lines not seen: {}",
+                missing.join(", ")
+            ));
         }
 
         std::thread::sleep(Duration::from_millis(200));
