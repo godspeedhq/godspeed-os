@@ -967,9 +967,6 @@ pub fn kill_task_by_slot(slot: usize) {
         let task_name = TASK_NAME[slot];
         let task_ep   = TASK_ENDPOINT[slot];
 
-        // Free the task's name-table slot so it can be claimed by a future service.
-        crate::ipc::names::unregister(task_name);
-
         // Kill the task's endpoint if it has one.
         if let Some(ep_id) = task_ep {
             // Bump generation in routing table and wake any blocked tasks.

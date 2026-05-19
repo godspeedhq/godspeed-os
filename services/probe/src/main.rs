@@ -809,14 +809,15 @@ fn mode_prop_p4(ctx: &ServiceContext) -> ! {
 
 fn mode_prop_p5(ctx: &ServiceContext) -> ! {
     // P5 — Every live endpoint has exactly one owning task (§8.3).
-    // 200 kill/respawn cycles of prop-p5-victim. Endpoint registration happens at
-    // kernel spawn time (before the service ever runs), so InspectKernel(1) is
-    // accurate immediately after spawn returns. If endpoints were orphaned (marked
-    // Alive without a live owning task), the 32-slot routing table would overflow
-    // and the spawn syscall would return an error within ~15 cycles (system holds
-    // ~17 live endpoints at peak). Spawn success + count ≤ 32 for 200 cycles
-    // proves no orphaning.
-    const MAX_ENDPOINTS: u32 = 32;
+    // 50 kill/spawn cycles of prop-p5-victim. The routing table has 96 slots and
+    // the system holds ~70 alive endpoints at steady state, leaving ~26 free slots.
+    // If endpoints are orphaned (marked Alive without a live owning task), the table
+    // fills within ~26 cycles and `register` panics — or spawn returns an error
+    // here. 50 consecutive successful spawns prove no orphaning under test load.
+    //
+    // We do not sample the global count because other property tests run concurrently
+    // on the same boot and their victims are transiently dead when we sample, making
+    // the absolute count unreliable. Spawn success is the authoritative P5 signal.
     for _ in 0..50u32 {
         let _ = ctx.kill("prop-p5-victim");
         match ctx.spawn("prop-p5-victim") {
@@ -825,11 +826,6 @@ fn mode_prop_p5(ctx: &ServiceContext) -> ! {
                 idle(ctx);
             }
             Ok(()) => {}
-        }
-        let count = ctx.inspect_kernel_endpoint_count();
-        if count > MAX_ENDPOINTS {
-            ctx.log("prop: P5 FAIL — endpoint count exceeded table capacity (orphan detected)");
-            idle(ctx);
         }
     }
     ctx.log("prop: P5 pass (50/50)");
