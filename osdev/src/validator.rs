@@ -493,7 +493,10 @@ static ADV_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["adv: A3 pass"],
             fail_on:      &["KERNEL PANIC", "adv: A3 FAIL"],
-            timeout_secs: 30,
+            // adv-a3 is spawned after ~120 preceding tasks (adv-ba*, chaos-bc*,
+            // prop-p*, fuzz-f*, stress-s*, chaos-c*); at burst rate ~80 lines/sec
+            // that's ~25 s just to reach the spawn — 30 s fires before spawn completes.
+            timeout_secs: 90,
         },
     },
     TestSpec {
