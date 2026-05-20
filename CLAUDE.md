@@ -244,7 +244,7 @@ os/
     qemu/
       identity/            # identity test suite (§22)
       harness/             # shared test infrastructure
-      perf/                # deferred
+      perf/                # performance benchmarks (§22 B1–B10) — 10/10 ✅
 ```
 
 ---
@@ -992,7 +992,7 @@ The test suite is layered. Each layer answers a different question about kernel 
 | Property    | Universal invariants under random inputs             | A claim the spec makes does not hold              | Active |
 | Fuzz        | Crash resistance under adversarial inputs            | Kernel panics on user-controllable input          | Active |
 | Stress      | Survival under sustained load                        | Drift, leaks, or corruption appear over time      | Active |
-| Performance | Latency / throughput benchmarks                      | A measured number regressed                       | Active |
+| Performance | Latency / throughput benchmarks                      | A measured number regressed                       | §22 (10/10) |
 | Adversarial | Capability isolation under attack                    | An attack succeeds where the spec says it fails   | Active |
 | Chaos       | Graceful degradation under partial failures          | A defined failure mode is not handled cleanly     | Active |
 

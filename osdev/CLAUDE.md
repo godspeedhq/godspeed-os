@@ -14,7 +14,14 @@ Host-side developer CLI (§17). Builds for the developer's machine, not the kern
 | `osdev logs <service>`      | Tail service log output |
 | `osdev status <service>`    | Show service state + assigned core |
 | `osdev caps <service>`      | Show held capabilities |
-| `osdev test identity`       | Run §22 identity test suite |
+| `osdev test identity`       | Run §22 identity test suite (20 tests) |
+| `osdev test property`       | Run property tests (P1–P10) |
+| `osdev test fuzz`           | Run fuzz tests (F1–F8) |
+| `osdev test stress`         | Run stress tests (S1–S10) |
+| `osdev test perf`           | Run performance benchmarks (B1–B10) ✅ 10/10 |
+| `osdev test perf:<ID>`      | Run a single benchmark (e.g. `perf:B2`) |
+| `osdev test adv`            | Run adversarial / red-team tests (A1–A10) |
+| `osdev test chaos`          | Run chaos / partial-failure tests (C1–C7) |
 | `osdev validate`            | Validate all contracts against the JSON schema |
 
 ## Files
@@ -22,7 +29,8 @@ Host-side developer CLI (§17). Builds for the developer's machine, not the kern
 | File             | Responsibility |
 |------------------|---------------|
 | `src/main.rs`    | CLI parsing (`clap`), dispatch to handlers |
-| `src/validator.rs`| Contract validation + identity test runner |
+| `src/validator.rs`| Contract validation + all test suite runners (identity, property, fuzz, stress, perf, adversarial, chaos, and their brutal variants) |
+| `src/qemu.rs`    | QEMU launch helpers (`spawn_for_test`, `spawn_for_test_custom`) — file-based serial (`-serial file:`) on all platforms |
 
 ## Build
 

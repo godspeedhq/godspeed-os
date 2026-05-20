@@ -8,7 +8,7 @@ All QEMU-based tests. Tests in this tree boot the OS in QEMU; they are integrati
 |---------------|------------------------------------------------|-----------------|
 | `identity/`   | Constitutional identity tests (§22) — 20/20 ✅ | Complete        |
 | `harness/`    | Shared QEMU launcher, serial reader, runner    | —               |
-| `perf/`       | Performance benchmarks                         | Deferred        |
+| `perf/`       | Performance benchmarks (B1–B10)                | ✅ 10/10 complete |
 | `property/`   | Property tests (P1–P10, §22)                   | Active          |
 | `fuzz/`       | Fuzz tests (F1–F8, §22)                        | Active          |
 | `stress/`     | Stress scenarios (S1–S10, §22)                 | Active          |
