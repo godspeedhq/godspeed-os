@@ -66,10 +66,61 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
 // ---------------------------------------------------------------------------
 // Extended probes — all non-identity test categories.
-// Compiled out when the `identity-only` feature is enabled.
+//
+// Feature-gated variants (in priority order):
+//   identity-only     → spawn nothing (fastest boot, used by `osdev test identity`)
+//   perf-only         → spawn only regular perf-b* probes (used by `osdev test perf`)
+//   perf-brutal-only  → spawn only brutal perf-bp* probes (used by `osdev test perf-brutal`)
+//   (none)            → spawn everything (used by `osdev build` / `osdev run`)
 // ---------------------------------------------------------------------------
 
-#[cfg(not(feature = "identity-only"))]
+// identity-only: skip all extended probes.
+#[cfg(feature = "identity-only")]
+#[inline(always)]
+fn spawn_extended_probes(_ctx: &ServiceContext) {}
+
+// perf-only: spawn only the regular performance benchmark probe services.
+// Cuts spawn wait from ~18–120 s (178 probes) to ~2–5 s (~30 services) on TCG.
+#[cfg(all(not(feature = "identity-only"), feature = "perf-only"))]
+fn spawn_extended_probes(ctx: &ServiceContext) {
+    // Sender/controller before echo/recv so the sender's endpoint is registered
+    // when the echo partner's SEND cap is wired at spawn time.
+    // perf-b5-victim must be registered before perf-b5 starts cycling.
+    let _ = ctx.spawn("perf-b1");
+    let _ = ctx.spawn("perf-b1-echo");
+    let _ = ctx.spawn("perf-b2");
+    let _ = ctx.spawn("perf-b2-echo");
+    let _ = ctx.spawn("perf-b3");
+    let _ = ctx.spawn("perf-b4");
+    let _ = ctx.spawn("perf-b5-victim");
+    let _ = ctx.spawn("perf-b5");
+    let _ = ctx.spawn("perf-b7");
+    let _ = ctx.spawn("perf-b8");
+    let _ = ctx.spawn("perf-b9-recv");
+    let _ = ctx.spawn("perf-b9");
+    let _ = ctx.spawn("perf-b10");
+}
+
+// perf-brutal-only: spawn only the brutal performance benchmark probe services.
+#[cfg(all(not(feature = "identity-only"), not(feature = "perf-only"), feature = "perf-brutal-only"))]
+fn spawn_extended_probes(ctx: &ServiceContext) {
+    let _ = ctx.spawn("perf-bp1");
+    let _ = ctx.spawn("perf-bp1-echo");
+    let _ = ctx.spawn("perf-bp2");
+    let _ = ctx.spawn("perf-bp2-echo");
+    let _ = ctx.spawn("perf-bp3");
+    let _ = ctx.spawn("perf-bp4");
+    let _ = ctx.spawn("perf-bp5-victim");
+    let _ = ctx.spawn("perf-bp5");
+    let _ = ctx.spawn("perf-bp7");
+    let _ = ctx.spawn("perf-bp8");
+    let _ = ctx.spawn("perf-bp9-recv");
+    let _ = ctx.spawn("perf-bp9");
+    let _ = ctx.spawn("perf-bp10");
+}
+
+// Full build: spawn all non-identity probe categories.
+#[cfg(not(any(feature = "identity-only", feature = "perf-only", feature = "perf-brutal-only")))]
 fn spawn_extended_probes(ctx: &ServiceContext) {
     // --- Brutal adversarial test probes — Milestone 20 ---
     // Spawned EARLY, before property/stress kill-respawn loops start, so the
@@ -307,7 +358,3 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     // T11 self-referential queue: brutal-id-11 sends to itself; any spawn order.
     let _ = ctx.spawn("brutal-id-11");
 }
-
-#[cfg(feature = "identity-only")]
-#[inline(always)]
-fn spawn_extended_probes(_ctx: &ServiceContext) {}

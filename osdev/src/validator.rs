@@ -2003,7 +2003,7 @@ pub fn run_brutal_perf_tests() {
     kill_existing_qemu();
 
     println!("perf-brutal: building...");
-    crate::cmd_build();
+    crate::cmd_build_brutal_perf();
 
     let kernel_elf = Path::new("target/x86_64-unknown-none/release/kernel");
     if !kernel_elf.exists() {
@@ -2063,7 +2063,7 @@ pub fn run_perf_tests_filtered(filter: Option<&str>) {
     kill_existing_qemu();
 
     println!("perf: building...");
-    crate::cmd_build();
+    crate::cmd_build_perf();
 
     let kernel_elf = Path::new("target/x86_64-unknown-none/release/kernel");
     if !kernel_elf.exists() {

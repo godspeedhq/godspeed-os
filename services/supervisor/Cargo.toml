@@ -12,6 +12,14 @@ path = "src/main.rs"
 # adversarial/chaos probes.  Used by `osdev test identity` to keep the supervisor
 # spawn loop under 10 s on TCG so WithRestart tests have plenty of deadline margin.
 identity-only = []
+# Spawn only the regular performance-benchmark probe services (perf-b1…perf-b10
+# and their echo/victim partners).  Used by `osdev test perf` to eliminate the
+# 160+ non-perf probe spawn-wait, giving each benchmark maximum headroom before
+# its timeout fires.  Does not include brutal perf probes (bp*).
+perf-only = []
+# Spawn only the brutal performance-benchmark probe services (perf-bp1…perf-bp10
+# and their echo/victim partners).  Used by `osdev test perf-brutal`.
+perf-brutal-only = []
 
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }

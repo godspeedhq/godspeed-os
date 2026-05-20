@@ -163,6 +163,86 @@ pub fn cmd_build_identity() {
     println!("build: kernel OK");
 }
 
+/// Like `cmd_build` but compiles supervisor with `--features perf-only`.
+/// Spawns only the ~13 regular perf probe services instead of all 178, cutting
+/// the TCG spawn-wait from 18–120 s down to ~2–5 s and giving each benchmark
+/// maximum headroom before its timeout fires.
+pub fn cmd_build_perf() {
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe"];
+    for crate_name in &non_supervisor {
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--release", "-p", crate_name,
+                   "--target", "x86_64-unknown-none"])
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run cargo build for {}: {}", crate_name, e));
+        if !status.success() {
+            eprintln!("build: {} FAILED", crate_name);
+            std::process::exit(1);
+        }
+        println!("build: {} OK", crate_name);
+    }
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "supervisor",
+               "--target", "x86_64-unknown-none",
+               "--features", "supervisor/perf-only"])
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run cargo build for supervisor: {}", e));
+    if !status.success() {
+        eprintln!("build: supervisor (perf-only) FAILED");
+        std::process::exit(1);
+    }
+    println!("build: supervisor (perf-only) OK");
+
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .status()
+        .expect("failed to run cargo build for kernel");
+    if !status.success() {
+        eprintln!("build: kernel FAILED");
+        std::process::exit(1);
+    }
+    println!("build: kernel OK");
+}
+
+/// Like `cmd_build_perf` but uses `--features perf-brutal-only` for the brutal
+/// benchmark suite (BP1–BP10).
+pub fn cmd_build_brutal_perf() {
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe"];
+    for crate_name in &non_supervisor {
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--release", "-p", crate_name,
+                   "--target", "x86_64-unknown-none"])
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run cargo build for {}: {}", crate_name, e));
+        if !status.success() {
+            eprintln!("build: {} FAILED", crate_name);
+            std::process::exit(1);
+        }
+        println!("build: {} OK", crate_name);
+    }
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "supervisor",
+               "--target", "x86_64-unknown-none",
+               "--features", "supervisor/perf-brutal-only"])
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run cargo build for supervisor: {}", e));
+    if !status.success() {
+        eprintln!("build: supervisor (perf-brutal-only) FAILED");
+        std::process::exit(1);
+    }
+    println!("build: supervisor (perf-brutal-only) OK");
+
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .status()
+        .expect("failed to run cargo build for kernel");
+    if !status.success() {
+        eprintln!("build: kernel FAILED");
+        std::process::exit(1);
+    }
+    println!("build: kernel OK");
+}
+
 fn cmd_run(smp: u32) {
     cmd_build();
 
