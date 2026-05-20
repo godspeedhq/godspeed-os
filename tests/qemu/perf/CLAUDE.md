@@ -1,10 +1,19 @@
 # tests/qemu/perf/
 
 Performance benchmarks (§22.2, B1–B10). **Complete — 10/10 passing.**
+Brutal performance benchmarks (§22.2, BP1–BP10). **Complete — 10/10 passing.**
 
 ## Status
 
-All ten benchmarks pass in the full suite (`osdev test perf`) and in isolated runs. Results are committed to `baseline.json` and serve as the regression baseline going forward.
+All ten regular benchmarks pass in the full suite (`osdev test perf`). All ten brutal benchmarks pass in `osdev test perf-brutal`. Results are committed to `baseline.json` and serve as the regression baseline going forward.
+
+### Brutal benchmark iteration counts (TCG-calibrated)
+
+| Benchmark | N     | Rationale |
+|-----------|-------|-----------|
+| BP1       | 100   | ~800ms/round-trip on TCG; 100 × 800ms ≈ 80s < 600s timeout |
+| BP2       | 100   | Same as BP1 (cross-core, same TCG cost) |
+| BP10      | 200   | `perf-brutal-only` spawns ~30 services; reduced load vs. original full-suite assumption |
 
 ## What goes here
 

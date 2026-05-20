@@ -9,12 +9,12 @@ tests/
   qemu/
     identity/    # Constitutional identity tests (§22) — 20/20 complete ✅
     harness/     # QEMU launcher, serial parser, test runner
-    perf/        # Performance benchmarks — ✅ 10/10 complete (§22 B1–B10)
+    perf/        # Performance benchmarks — ✅ 10/10 complete (§22 B1–B10), ✅ 10/10 brutal (BP1–BP10)
     property/    # Property tests — Active (§22)
     fuzz/        # Fuzz tests — Active (§22)
     stress/      # Stress tests — Active (§22)
-    adversarial/ # Red-team / capability isolation tests — Active (§22)
-    chaos/       # Chaos / partial-failure tests — Active (§22)
+    adversarial/ # Red-team / capability isolation tests — ✅ 10/10 complete + 10/10 brutal (§22)
+    chaos/       # Chaos / partial-failure tests — ✅ 7/7 complete + 7/7 brutal (§22)
 ```
 
 ## Test categories (§22.2)
@@ -25,9 +25,9 @@ tests/
 | Property    | Universal invariants under random inputs          | Active              |
 | Fuzz        | Crash resistance on adversarial/malformed inputs  | Active              |
 | Stress      | No drift, leak, or corruption under sustained load| Active              |
-| Performance | Latency / throughput baselines                    | ✅ 10/10 complete   |
-| Adversarial | Capability isolation under direct attack          | Active              |
-| Chaos       | Graceful degradation under partial failures       | Active              |
+| Performance | Latency / throughput baselines                    | ✅ 10/10 + 10/10 brutal |
+| Adversarial | Capability isolation under direct attack          | ✅ 10/10 + 10/10 brutal |
+| Chaos       | Graceful degradation under partial failures       | ✅ 7/7 + 7/7 brutal  |
 
 ## Philosophy (§22.2)
 

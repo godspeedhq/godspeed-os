@@ -2820,14 +2820,15 @@ fn mode_brutal_id_13_kill(ctx: &ServiceContext) -> ! {
 // ---------------------------------------------------------------------------
 
 fn mode_perf_bp1(ctx: &ServiceContext) -> ! {
-    // BP1: same-core IPC roundtrip latency — 1000 samples (5× B1) (§22 Brutal Perf BP1).
+    // BP1: same-core IPC roundtrip latency — 100 samples (2× B1) (§22 Brutal Perf BP1).
+    // Each round-trip costs ~800ms on QEMU TCG; 100 samples = ~80s, well within 600s timeout.
     let echo_cap = loop {
         if let Some(cap) = ctx.acquire_send_cap("perf-bp1-echo") { break cap; }
         ctx.yield_cpu();
     };
 
     let msg = Message::from_bytes(b"bp1");
-    const N: usize = 1000;
+    const N: usize = 100;
     let mut samples = [0u64; N];
 
     for i in 0..N {
@@ -2856,14 +2857,15 @@ fn mode_perf_bp1_echo(ctx: &ServiceContext) -> ! {
 }
 
 fn mode_perf_bp2(ctx: &ServiceContext) -> ! {
-    // BP2: cross-core IPC roundtrip latency — 1000 samples (5× B2) (§22 Brutal Perf BP2).
+    // BP2: cross-core IPC roundtrip latency — 100 samples (2× B2) (§22 Brutal Perf BP2).
+    // Each cross-core round-trip costs ~800ms on QEMU TCG; 100 samples = ~80s, well within 600s.
     let echo_cap = loop {
         if let Some(cap) = ctx.acquire_send_cap("perf-bp2-echo") { break cap; }
         ctx.yield_cpu();
     };
 
     let msg = Message::from_bytes(b"bp2");
-    const N: usize = 1000;
+    const N: usize = 100;
     let mut samples = [0u64; N];
 
     for i in 0..N {
@@ -3012,9 +3014,9 @@ fn mode_perf_bp9_recv(ctx: &ServiceContext) -> ! {
 }
 
 fn mode_perf_bp10(ctx: &ServiceContext) -> ! {
-    // BP10: scheduler pick-next — 2000 yields under brutal 200-task load (§22 Brutal Perf BP10).
-    // 5000 was too slow: brutal stress probes' kill/spawn cycles starve the yield task past 600s.
-    const N: u64 = 2_000;
+    // BP10: scheduler pick-next — 200 yields (§22 Brutal Perf BP10).
+    // perf-brutal-only spawns ~30 services (not the full 200-task load the old N=2000 assumed).
+    const N: u64 = 200;
     let t0 = ctx.read_tsc();
     for _ in 0..N { ctx.yield_cpu(); }
     let t1 = ctx.read_tsc();

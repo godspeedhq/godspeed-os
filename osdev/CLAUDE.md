@@ -20,8 +20,11 @@ Host-side developer CLI (§17). Builds for the developer's machine, not the kern
 | `osdev test stress`         | Run stress tests (S1–S10) |
 | `osdev test perf`           | Run performance benchmarks (B1–B10) ✅ 10/10 |
 | `osdev test perf:<ID>`      | Run a single benchmark (e.g. `perf:B2`) |
-| `osdev test adv`            | Run adversarial / red-team tests (A1–A10) |
-| `osdev test chaos`          | Run chaos / partial-failure tests (C1–C7) |
+| `osdev test perf-brutal`    | Run brutal performance benchmarks (BP1–BP10) ✅ 10/10 |
+| `osdev test adv`            | Run adversarial / red-team tests (A1–A10) ✅ 10/10 |
+| `osdev test adv-brutal`     | Run brutal adversarial tests (BA1–BA10) ✅ 10/10 |
+| `osdev test chaos`          | Run chaos / partial-failure tests (C1–C7) ✅ 7/7 |
+| `osdev test chaos-brutal`   | Run brutal chaos tests (BC1–BC7) ✅ 7/7 |
 | `osdev validate`            | Validate all contracts against the JSON schema |
 
 ## Files
