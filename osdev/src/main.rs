@@ -273,13 +273,20 @@ fn cmd_image() {
     }
 
     let limine_dir = std::path::Path::new("tools/limine");
-    let image_path = disk_image::create(kernel_elf, limine_dir);
-    disk_image::install_bootloader(limine_dir, &image_path);
+
+    let bootx64 = limine_dir.join("BOOTX64.EFI");
+    if !bootx64.exists() {
+        eprintln!("BOOTX64.EFI not found at {} — UEFI image requires it", bootx64.display());
+        std::process::exit(1);
+    }
+
+    // UEFI GPT image: no limine bios-install needed.
+    let image_path = disk_image::create_uefi(kernel_elf, limine_dir);
 
     let abs = std::fs::canonicalize(&image_path)
         .unwrap_or_else(|_| image_path.to_path_buf());
     println!("image: ready at {}", abs.display());
-    println!("image: flash with Rufus (select 'DD Image' mode) or:");
+    println!("image: flash with Rufus (DD Image mode) or:");
     println!("image:   dd if={} of=/dev/sdX bs=4M status=progress", image_path.display());
 }
 

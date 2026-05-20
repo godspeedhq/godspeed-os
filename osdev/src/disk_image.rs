@@ -1,13 +1,16 @@
-//! Bootable disk image creation for Limine BIOS boot.
+//! Bootable disk image creation — BIOS (MBR) and UEFI (GPT) paths.
 //!
-//! Creates a raw disk image with:
-//!   - MBR partition table (one FAT32 partition, LBA)
-//!   - FAT32 filesystem containing limine-bios.sys, limine.conf, kernel.elf
-//!   - Limine BIOS bootloader installed via `limine bios-install`
+//! BIOS path (`create` / `create_at`):
+//!   MBR partition table + FAT32 + limine-bios.sys + limine bios-install.
+//!   Used by `osdev run` (QEMU).
 //!
-//! Prerequisites (§17): download a Limine release and extract to tools/limine/.
-//! Releases: https://github.com/limine-bootloader/limine/releases
-//! Required file: limine-bios.sys (and limine.exe / limine on Windows/Linux)
+//! UEFI path (`create_uefi` / `create_uefi_at`):
+//!   GPT partition table + EFI System Partition (FAT32) + BOOTX64.EFI.
+//!   Used by `osdev image` (bare-metal USB).
+//!
+//! Prerequisites: tools/limine/ must contain:
+//!   limine-bios.sys, limine.exe  — for BIOS path
+//!   BOOTX64.EFI                  — for UEFI path
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -207,4 +210,190 @@ impl Seek for OffsetFile {
         self.pos = new_pos.min(self.size);
         Ok(self.pos)
     }
+}
+
+// ---------------------------------------------------------------------------
+// UEFI image — GPT partition table + EFI System Partition
+// ---------------------------------------------------------------------------
+//
+// Disk layout (64 MiB, 512-byte sectors, 131072 sectors total):
+//   LBA 0           — Protective MBR
+//   LBA 1           — Primary GPT header
+//   LBA 2–33        — Primary GPT partition entries (128 × 128 B = 32 sectors)
+//   LBA 34–2047     — Unused (alignment gap to 1 MiB)
+//   LBA 2048–131038 — EFI System Partition (FAT32, ~63 MiB)
+//   LBA 131039–131070 — Secondary GPT partition entries
+//   LBA 131071      — Secondary GPT header
+//
+// The ESP contains:
+//   EFI/BOOT/BOOTX64.EFI — Limine UEFI loader
+//   limine.conf           — boot menu
+//   kernel.elf            — GodspeedOS kernel
+
+const TOTAL_SECTORS: u64    = IMAGE_SIZE / SECTOR_SIZE;     // 131072
+const GPT_ENTRY_SECTS: u64  = 32;                           // 128 entries × 128 B
+const ESP_START_LBA: u64    = 2048;
+const SEC_ENTRIES_LBA: u64  = TOTAL_SECTORS - 1 - GPT_ENTRY_SECTS; // 131039
+const LAST_USABLE_LBA: u64  = SEC_ENTRIES_LBA - 1;          // 131038
+const ESP_END_LBA: u64      = LAST_USABLE_LBA;
+
+/// Build a UEFI-bootable disk image at `build/os.img`. Returns the path.
+pub fn create_uefi(kernel_elf: &Path, limine_dir: &Path) -> PathBuf {
+    create_uefi_at(kernel_elf, limine_dir, Path::new("build/os.img"))
+}
+
+pub fn create_uefi_at(kernel_elf: &Path, limine_dir: &Path, image_path: &Path) -> PathBuf {
+    if let Some(p) = image_path.parent() {
+        std::fs::create_dir_all(p).expect("create image parent dir");
+    }
+
+    // Create zeroed image.
+    {
+        let img = std::fs::OpenOptions::new()
+            .read(true).write(true).create(true).truncate(true)
+            .open(image_path)
+            .unwrap_or_else(|e| panic!("create {}: {e}", image_path.display()));
+        img.set_len(IMAGE_SIZE).expect("set image size");
+    }
+
+    // Sector 0: Protective MBR.
+    {
+        let mut mbr = [0u8; 512];
+        mbr[446] = 0x00;                                          // not bootable
+        mbr[447..450].copy_from_slice(&[0x00, 0x02, 0x00]);       // CHS first (ignored)
+        mbr[450] = 0xEE;                                          // type: GPT protective
+        mbr[451..454].copy_from_slice(&[0xFF, 0xFF, 0xFF]);       // CHS last (ignored)
+        mbr[454..458].copy_from_slice(&1u32.to_le_bytes());       // LBA start = 1
+        let prot = ((TOTAL_SECTORS - 1) as u32).min(0xFFFF_FFFF);
+        mbr[458..462].copy_from_slice(&prot.to_le_bytes());
+        mbr[510] = 0x55; mbr[511] = 0xAA;
+        write_at(image_path, 0, &mbr);
+    }
+
+    // Build GPT partition entries array (128 × 128 bytes, all but first zeroed).
+    let mut gpt_entries = [0u8; 128 * 128];
+    {
+        // EFI System Partition type GUID: C12A7328-F81F-11D2-BA4B-00A0C93EC93B
+        // GPT stores the first three fields little-endian, last two big-endian.
+        let type_guid: [u8; 16] = [
+            0x28, 0x73, 0x2A, 0xC1,  // C12A7328 LE
+            0x1F, 0xF8,              // F81F LE
+            0xD2, 0x11,              // 11D2 LE
+            0xBA, 0x4B,              // BA4B BE
+            0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B, // 00A0C93EC93B BE
+        ];
+        // Unique partition GUID (fixed, deterministic).
+        let part_guid: [u8; 16] = *b"GodspeedOS-ESP-\x00";
+        let e = &mut gpt_entries[0..128];
+        e[0..16].copy_from_slice(&type_guid);
+        e[16..32].copy_from_slice(&part_guid);
+        e[32..40].copy_from_slice(&ESP_START_LBA.to_le_bytes());
+        e[40..48].copy_from_slice(&ESP_END_LBA.to_le_bytes());
+        // Partition name "EFI System Partition" in UTF-16LE at offset 56.
+        for (i, ch) in "EFI System Partition".encode_utf16().enumerate() {
+            let off = 56 + i * 2;
+            e[off..off + 2].copy_from_slice(&ch.to_le_bytes());
+        }
+    }
+    let entries_crc = gpt_crc32(&gpt_entries);
+
+    // Disk GUID (fixed, deterministic).
+    let disk_guid: [u8; 16] = *b"GodspeedOS-Disk\x00";
+
+    // Sector 1: Primary GPT header.
+    let primary_hdr = build_gpt_header(
+        1, TOTAL_SECTORS - 1, 34, LAST_USABLE_LBA, &disk_guid, 2, entries_crc,
+    );
+    write_at(image_path, SECTOR_SIZE, &primary_hdr);
+
+    // Sectors 2–33: Primary GPT entries.
+    write_at(image_path, 2 * SECTOR_SIZE, &gpt_entries);
+
+    // Format EFI System Partition as FAT32.
+    let esp_byte_off  = ESP_START_LBA * SECTOR_SIZE;
+    let esp_byte_size = (ESP_END_LBA - ESP_START_LBA + 1) * SECTOR_SIZE;
+    {
+        let part = OffsetFile::new(
+            std::fs::OpenOptions::new().read(true).write(true).open(image_path).unwrap(),
+            esp_byte_off, esp_byte_size,
+        );
+        fatfs::format_volume(part, fatfs::FormatVolumeOptions::new().volume_label(*b"GODSPEEDOS "))
+            .expect("format ESP FAT32");
+    }
+
+    // Populate ESP with bootloader + config + kernel.
+    {
+        let part = OffsetFile::new(
+            std::fs::OpenOptions::new().read(true).write(true).open(image_path).unwrap(),
+            esp_byte_off, esp_byte_size,
+        );
+        let fs   = fatfs::FileSystem::new(part, fatfs::FsOptions::new()).expect("open ESP FAT32");
+        let root = fs.root_dir();
+
+        let efi_dir  = root.create_dir("EFI").expect("create EFI/");
+        let boot_dir = efi_dir.create_dir("BOOT").expect("create EFI/BOOT/");
+        copy_into_fat(&boot_dir, &limine_dir.join("BOOTX64.EFI"), "BOOTX64.EFI");
+
+        let mut conf = root.create_file("limine.conf").expect("create limine.conf");
+        conf.write_all(LIMINE_CONF.as_bytes()).expect("write limine.conf");
+        copy_into_fat(&root, kernel_elf, "kernel.elf");
+    }
+
+    // Secondary GPT entries.
+    write_at(image_path, SEC_ENTRIES_LBA * SECTOR_SIZE, &gpt_entries);
+
+    // Last sector: Secondary GPT header.
+    let secondary_hdr = build_gpt_header(
+        TOTAL_SECTORS - 1, 1, 34, LAST_USABLE_LBA, &disk_guid, SEC_ENTRIES_LBA, entries_crc,
+    );
+    write_at(image_path, (TOTAL_SECTORS - 1) * SECTOR_SIZE, &secondary_hdr);
+
+    println!("run: UEFI image created at {}", image_path.display());
+    image_path.to_path_buf()
+}
+
+/// Write `data` into the image at `byte_offset`. Opens a fresh file handle each time.
+fn write_at(image_path: &Path, byte_offset: u64, data: &[u8]) {
+    let mut f = std::fs::OpenOptions::new().write(true).open(image_path)
+        .unwrap_or_else(|e| panic!("open {} for write: {e}", image_path.display()));
+    f.seek(SeekFrom::Start(byte_offset)).expect("seek");
+    f.write_all(data).expect("write");
+}
+
+/// Build a 512-byte sector containing a GPT header (92 bytes used, rest zeroed).
+fn build_gpt_header(
+    my_lba: u64, alt_lba: u64,
+    first_usable: u64, last_usable: u64,
+    disk_guid: &[u8; 16],
+    entries_lba: u64,
+    entries_crc: u32,
+) -> [u8; 512] {
+    let mut h = [0u8; 512];
+    h[0..8].copy_from_slice(b"EFI PART");                  // signature
+    h[8..12].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]);   // revision 1.0
+    h[12..16].copy_from_slice(&92u32.to_le_bytes());        // header size
+    // h[16..20] = CRC32 — computed below with field zeroed
+    h[24..32].copy_from_slice(&my_lba.to_le_bytes());
+    h[32..40].copy_from_slice(&alt_lba.to_le_bytes());
+    h[40..48].copy_from_slice(&first_usable.to_le_bytes());
+    h[48..56].copy_from_slice(&last_usable.to_le_bytes());
+    h[56..72].copy_from_slice(disk_guid);
+    h[72..80].copy_from_slice(&entries_lba.to_le_bytes());
+    h[80..84].copy_from_slice(&128u32.to_le_bytes());       // num entries
+    h[84..88].copy_from_slice(&128u32.to_le_bytes());       // entry size
+    h[88..92].copy_from_slice(&entries_crc.to_le_bytes());
+    let crc = gpt_crc32(&h[0..92]);
+    h[16..20].copy_from_slice(&crc.to_le_bytes());
+    h
+}
+
+fn gpt_crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
 }
