@@ -1,37 +1,37 @@
 {
   "metrics": {
     "B1": {
-      "p50": 117930667,
-      "p99": 182713903
+      "p50": 26247656,
+      "p99": 54289526
     },
     "B10": {
-      "mean": 277475821
+      "mean": 232151
     },
     "B2": {
-      "p50": 103606547,
-      "p99": 216503219
+      "p50": 26115151,
+      "p99": 55818964
     },
     "B3": {
-      "mean": 251176331
+      "mean": 2498563
     },
     "B4": {
-      "mean": 44160
+      "mean": 12364
     },
     "B5": {
-      "spawn_mean": 27208692
+      "spawn_mean": 5219948
     },
     "B6": {
-      "restart_mean": 134945670
+      "restart_mean": 9142356
     },
     "B7": {
-      "mean": 746577
+      "mean": 33024
     },
     "B8": {
-      "mean": 42436,
+      "mean": 12961,
       "n": 16384
     },
     "B9": {
-      "mean": 9916531
+      "mean": 1810549
     }
   },
   "note": "QEMU TCG RDTSC cycle counts — not comparable across hosts or QEMU versions; useful for detecting large regressions within one environment",
