@@ -2285,13 +2285,30 @@ fn poll_serial(
         let content = match std::fs::read_to_string(path) {
             Ok(s)  => s,
             Err(_) => {
-                // File may be transiently locked by QEMU on Windows. Still honour
-                // the deadline so a persistent lock never becomes an infinite loop.
-                if Instant::now() >= deadline {
-                    return TestOutcome::Fail("timeout — serial file unreadable".to_string());
+                // File may be transiently locked by QEMU on Windows (exclusive
+                // write handle on the serial file). Retry until the deadline,
+                // then fall through to the same 600ms grace period used for
+                // normal content timeouts so we never report a different error
+                // class just because the read raced with QEMU's file handle.
+                if Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
                 }
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
+                // At deadline: wait for QEMU to flush and release, then do a
+                // final read — same grace period as the normal timeout branch.
+                std::thread::sleep(Duration::from_millis(600));
+                let content = std::fs::read_to_string(path).unwrap_or_default();
+                let missing: Vec<String> = expect.iter()
+                    .filter(|e| !content.contains(**e))
+                    .map(|e| format!("\"{e}\""))
+                    .collect();
+                if missing.is_empty() {
+                    return TestOutcome::Pass;
+                }
+                return TestOutcome::Fail(format!(
+                    "timeout — lines not seen: {}",
+                    missing.join(", ")
+                ));
             }
         };
 
