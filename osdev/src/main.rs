@@ -264,7 +264,7 @@ fn cmd_run(smp: u32) {
 }
 
 fn cmd_image() {
-    cmd_build();
+    cmd_build_identity();
 
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
     if !kernel_elf.exists() {
