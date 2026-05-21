@@ -53,7 +53,7 @@ pub fn create_at(kernel_elf: &Path, limine_dir: &Path, image_path: &Path) -> Pat
         let partition = OffsetFile::new(img, part_offset, part_size);
         fatfs::format_volume(
             partition,
-            fatfs::FormatVolumeOptions::new().volume_label(*b"GODSPEEDOS "),
+            fatfs::FormatVolumeOptions::new().volume_label(*b"GODSPEED_OS"),
         ).expect("failed to format FAT32 partition");
     }
 
@@ -317,7 +317,7 @@ pub fn create_uefi_at(kernel_elf: &Path, limine_dir: &Path, image_path: &Path) -
             std::fs::OpenOptions::new().read(true).write(true).open(image_path).unwrap(),
             esp_byte_off, esp_byte_size,
         );
-        fatfs::format_volume(part, fatfs::FormatVolumeOptions::new().volume_label(*b"GODSPEEDOS "))
+        fatfs::format_volume(part, fatfs::FormatVolumeOptions::new().volume_label(*b"GODSPEED_OS"))
             .expect("format ESP FAT32");
     }
 
