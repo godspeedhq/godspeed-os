@@ -26,11 +26,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         ctx.log("supervisor: WARN: failed to spawn ping");
     }
 
-    // Probe services are harness-driven (the QEMU control port sends kill commands
-    // in response to sentinel serial strings).  Skip them entirely in bare-metal
-    // builds where no harness is present; probes like probe-4b-send and probe-hog
-    // would block or saturate core 0 with no way to complete their tests.
-    #[cfg(not(feature = "bare-metal"))]
+    // Identity probe services are harness-driven (QEMU control port sends kill
+    // commands in response to sentinel serial strings).  Skip them in bare-metal,
+    // perf-only, and perf-brutal-only builds: probe-hog tight-loops on core 0,
+    // probe-4b-send blocks waiting for a harness kill that never arrives on HW,
+    // and the combined 16-task load starves IPC benchmarks of scheduler quanta.
+    #[cfg(not(any(feature = "bare-metal", feature = "perf-only", feature = "perf-brutal-only")))]
     {
         // --- Probe services (§22 Group A identity tests) ---
         // Recv-endpoint probes must come first so their endpoints are registered
@@ -57,12 +58,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let _ = ctx.spawn("probe-7b");
         // Interrupt-routing probe — Test IR1A (§12.2, §12.3).
         let _ = ctx.spawn("probe-11a");
-
-        // Property, fuzz, stress, perf, adversarial, chaos probes.
-        // Excluded in identity-only builds so supervisor: ready appears in < 10 s on
-        // TCG, giving WithRestart tests plenty of deadline margin (§22 flakiness fix).
-        spawn_extended_probes(&ctx);
     }
+
+    // Property, fuzz, stress, perf, adversarial, chaos probes.
+    // Excluded in identity-only builds so supervisor: ready appears in < 10 s on
+    // TCG, giving WithRestart tests plenty of deadline margin (§22 flakiness fix).
+    // Also excluded in bare-metal builds (no harness present).
+    #[cfg(not(feature = "bare-metal"))]
+    spawn_extended_probes(&ctx);
 
     ctx.log("supervisor: ready");
 
