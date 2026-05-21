@@ -20,6 +20,7 @@ jobs:
 
       - name: Generate coverage report
         run: |
+          mkdir -p build
           cargo llvm-cov --package kernel \
             --lcov --output-path build/coverage.lcov
           cargo llvm-cov --package kernel \
