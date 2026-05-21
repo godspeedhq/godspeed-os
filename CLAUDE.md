@@ -1605,15 +1605,20 @@ GodspeedOS has booted on real x86_64 hardware (4-core CPU, 4 GB RAM) via UEFI US
 - Null modem serial (115200 8N1, PuTTY) confirms boot output; log appended to `build/putty_serial_output.log`.
 - `bare-metal` supervisor feature excludes harness-driven probe services that require QEMU's control port.
 
-Hardware performance data (bare-metal, ~3 GHz CPU):
+Hardware performance data (perf-brutal-only build, ~3 GHz CPU, 2026-05-21):
 
 | Benchmark | Result |
 |-----------|--------|
-| BP4 cap validation | 543 cycles (~181 ns) |
-| BP7 cap table | 1,656 cycles (~552 ns) |
-| BP8 allocator | 681 cycles/4KiB page (~227 ns) |
-| BP10 scheduler/yield | 4,850 cycles (~1.6 µs) |
-| BP3 yield floor | 13,330 cycles (~4.4 µs) |
+| BP1 IPC same-core p50 | 55,320 cycles (~18.4 µs) |
+| BP3 yield floor | 39,903 cycles (~13.3 µs) |
+| BP4 cap validation | 495 cycles (~165 ns) |
+| BP5 spawn cost | 8,121,378 cycles (~2.7 ms) |
+| BP6 restart cost | 14,462,309 cycles (~4.8 ms) |
+| BP7 cap table | 1,168 cycles (~389 ns) |
+| BP8 allocator | 616 cycles/4KiB page (~205 ns) |
+| BP9 message copy 4KiB | 20,073 cycles (~6.7 µs) |
+| BP10 scheduler decision | 2,323 cycles (~774 ns) |
+| BP2 IPC cross-core | Pending (blocking cross-core IPC investigation) |
 
 ### 23.4 Out of Scope for v1
 

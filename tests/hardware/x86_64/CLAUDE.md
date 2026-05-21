@@ -45,7 +45,7 @@ Open PuTTY, configure Session logging: **All session output**, append to `build/
 | `3_FUZZ.md` | Fuzz | F1–F8 | Pending |
 | `4_STRESS.md` | Stress | S1–S10 | Partial — S6/S8 underway |
 | `5_PERFORMANCE.md` | Performance (regular) | B1–B10 | Pending — no hardware run yet |
-| `12_PERFORMANCE_BRUTAL.md` | Performance (brutal) | BP1–BP10 | Partial — 5/10 complete (BP3/4/7/8/10) |
+| `12_PERFORMANCE_BRUTAL.md` | Performance (brutal) | BP1–BP10 | Partial — 9/10 complete (all except BP2) |
 | `6_ADVERSARIAL.md` | Adversarial | A1–A10 | Pending |
 | `7_CHAOS.md` | Chaos | C1–C7 | Pending — C1 first target |
 
