@@ -11,6 +11,10 @@ path = "src/main.rs"
 # Spawn only the 15 identity-test probe services; skip property/fuzz/stress/perf/
 # adversarial/chaos probes.  Used by `osdev test identity` to keep the supervisor
 # spawn loop under 10 s on TCG so WithRestart tests have plenty of deadline margin.
+# Spawn only pong + ping — no probe services at all.  Used by `osdev image`
+# (bare-metal USB) so core 0 is not loaded with harness-driven probes that
+# require the QEMU control port to complete (e.g. probe-4b, probe-hog).
+bare-metal = []
 identity-only = []
 # Spawn only the regular performance-benchmark probe services (perf-b1…perf-b10
 # and their echo/victim partners).  Used by `osdev test perf` to eliminate the

@@ -125,6 +125,45 @@ pub fn cmd_build() {
     println!("build: kernel OK");
 }
 
+/// Build for bare-metal USB: supervisor with `--features bare-metal` (pong + ping only,
+/// no probe services that require the QEMU harness control port to complete).
+pub fn cmd_build_bare_metal() {
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe"];
+    for crate_name in &non_supervisor {
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--release", "-p", crate_name,
+                   "--target", "x86_64-unknown-none"])
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run cargo build for {}: {}", crate_name, e));
+        if !status.success() {
+            eprintln!("build: {} FAILED", crate_name);
+            std::process::exit(1);
+        }
+        println!("build: {} OK", crate_name);
+    }
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "supervisor",
+               "--target", "x86_64-unknown-none",
+               "--features", "supervisor/bare-metal"])
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run cargo build for supervisor: {}", e));
+    if !status.success() {
+        eprintln!("build: supervisor (bare-metal) FAILED");
+        std::process::exit(1);
+    }
+    println!("build: supervisor (bare-metal) OK");
+
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .status()
+        .expect("failed to run cargo build for kernel");
+    if !status.success() {
+        eprintln!("build: kernel FAILED");
+        std::process::exit(1);
+    }
+    println!("build: kernel OK");
+}
+
 /// Like `cmd_build` but compiles supervisor with `--features identity-only`.
 /// Used by `run_identity_tests` so the supervisor spawn loop takes < 10 s on
 /// TCG instead of 30–200 s with the full 160+ probe service set.
@@ -264,7 +303,7 @@ fn cmd_run(smp: u32) {
 }
 
 fn cmd_image() {
-    cmd_build_identity();
+    cmd_build_bare_metal();
 
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
     if !kernel_elf.exists() {

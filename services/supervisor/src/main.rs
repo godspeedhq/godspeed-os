@@ -26,36 +26,43 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         ctx.log("supervisor: WARN: failed to spawn ping");
     }
 
-    // --- Probe services (§22 Group A identity tests) ---
-    // Recv-endpoint probes must come first so their endpoints are registered
-    // before sender probes are spawned (caps are wired at spawn time).
-    let _ = ctx.spawn("probe-recv");    // Test 3A receiver
-    let _ = ctx.spawn("probe-victim");  // Test 4A kill target
-    let _ = ctx.spawn("probe-4b-recv"); // Test 4B kill target
-    let _ = ctx.spawn("probe-3b");      // Test 3B (has recv slot for wrong-right probe)
-    // Sender / active probes — need SEND caps to the services above.
-    let _ = ctx.spawn("probe-sender");  // Test 3A sender; SEND cap to probe-recv
-    let _ = ctx.spawn("probe-4a");      // Test 4A; SEND cap to probe-victim
-    let _ = ctx.spawn("probe-4b-send"); // Test 4B; SEND cap to probe-4b-recv
-    // Cap-transfer probes (Tests 5A and 5B) — receiver first so its endpoint
-    // is registered before the senders' SEND|GRANT caps are wired.
-    let _ = ctx.spawn("probe-5a-recv"); // Test 5A/5B receiver
-    let _ = ctx.spawn("probe-5a-send"); // Test 5A sender (SEND|GRANT cap)
-    let _ = ctx.spawn("probe-5b-send"); // Test 5B negative (SEND-only cap)
-    // Probes with no send peers.
-    let _ = ctx.spawn("probe-yielder"); // Test 8A
-    let _ = ctx.spawn("probe-hog");     // Test 8B (tight loop; preemption via ping)
-    let _ = ctx.spawn("probe-9b");      // Test 9B
-    // Memory-limit probes — Tests 7A and 7B.
-    let _ = ctx.spawn("probe-7a");
-    let _ = ctx.spawn("probe-7b");
-    // Interrupt-routing probe — Test IR1A (§12.2, §12.3).
-    let _ = ctx.spawn("probe-11a");
+    // Probe services are harness-driven (the QEMU control port sends kill commands
+    // in response to sentinel serial strings).  Skip them entirely in bare-metal
+    // builds where no harness is present; probes like probe-4b-send and probe-hog
+    // would block or saturate core 0 with no way to complete their tests.
+    #[cfg(not(feature = "bare-metal"))]
+    {
+        // --- Probe services (§22 Group A identity tests) ---
+        // Recv-endpoint probes must come first so their endpoints are registered
+        // before sender probes are spawned (caps are wired at spawn time).
+        let _ = ctx.spawn("probe-recv");    // Test 3A receiver
+        let _ = ctx.spawn("probe-victim");  // Test 4A kill target
+        let _ = ctx.spawn("probe-4b-recv"); // Test 4B kill target
+        let _ = ctx.spawn("probe-3b");      // Test 3B (has recv slot for wrong-right probe)
+        // Sender / active probes — need SEND caps to the services above.
+        let _ = ctx.spawn("probe-sender");  // Test 3A sender; SEND cap to probe-recv
+        let _ = ctx.spawn("probe-4a");      // Test 4A; SEND cap to probe-victim
+        let _ = ctx.spawn("probe-4b-send"); // Test 4B; SEND cap to probe-4b-recv
+        // Cap-transfer probes (Tests 5A and 5B) — receiver first so its endpoint
+        // is registered before the senders' SEND|GRANT caps are wired.
+        let _ = ctx.spawn("probe-5a-recv"); // Test 5A/5B receiver
+        let _ = ctx.spawn("probe-5a-send"); // Test 5A sender (SEND|GRANT cap)
+        let _ = ctx.spawn("probe-5b-send"); // Test 5B negative (SEND-only cap)
+        // Probes with no send peers.
+        let _ = ctx.spawn("probe-yielder"); // Test 8A
+        let _ = ctx.spawn("probe-hog");     // Test 8B (tight loop; preemption via ping)
+        let _ = ctx.spawn("probe-9b");      // Test 9B
+        // Memory-limit probes — Tests 7A and 7B.
+        let _ = ctx.spawn("probe-7a");
+        let _ = ctx.spawn("probe-7b");
+        // Interrupt-routing probe — Test IR1A (§12.2, §12.3).
+        let _ = ctx.spawn("probe-11a");
 
-    // Property, fuzz, stress, perf, adversarial, chaos probes.
-    // Excluded in identity-only builds so supervisor: ready appears in < 10 s on
-    // TCG, giving WithRestart tests plenty of deadline margin (§22 flakiness fix).
-    spawn_extended_probes(&ctx);
+        // Property, fuzz, stress, perf, adversarial, chaos probes.
+        // Excluded in identity-only builds so supervisor: ready appears in < 10 s on
+        // TCG, giving WithRestart tests plenty of deadline margin (§22 flakiness fix).
+        spawn_extended_probes(&ctx);
+    }
 
     ctx.log("supervisor: ready");
 
@@ -74,14 +81,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 //   (none)            → spawn everything (used by `osdev build` / `osdev run`)
 // ---------------------------------------------------------------------------
 
+// bare-metal: no probes at all — spawn_extended_probes is never called, but
+// the function must exist so the linker is happy.
+#[cfg(feature = "bare-metal")]
+#[inline(always)]
+fn spawn_extended_probes(_ctx: &ServiceContext) {}
+
 // identity-only: skip all extended probes.
-#[cfg(feature = "identity-only")]
+#[cfg(all(not(feature = "bare-metal"), feature = "identity-only"))]
 #[inline(always)]
 fn spawn_extended_probes(_ctx: &ServiceContext) {}
 
 // perf-only: spawn only the regular performance benchmark probe services.
 // Cuts spawn wait from ~18–120 s (178 probes) to ~2–5 s (~30 services) on TCG.
-#[cfg(all(not(feature = "identity-only"), feature = "perf-only"))]
+#[cfg(all(not(feature = "bare-metal"), not(feature = "identity-only"), feature = "perf-only"))]
 fn spawn_extended_probes(ctx: &ServiceContext) {
     // Sender/controller before echo/recv so the sender's endpoint is registered
     // when the echo partner's SEND cap is wired at spawn time.
@@ -102,7 +115,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
 }
 
 // perf-brutal-only: spawn only the brutal performance benchmark probe services.
-#[cfg(all(not(feature = "identity-only"), not(feature = "perf-only"), feature = "perf-brutal-only"))]
+#[cfg(all(not(feature = "bare-metal"), not(feature = "identity-only"), not(feature = "perf-only"), feature = "perf-brutal-only"))]
 fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("perf-bp1");
     let _ = ctx.spawn("perf-bp1-echo");
@@ -120,7 +133,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
 }
 
 // Full build: spawn all non-identity probe categories.
-#[cfg(not(any(feature = "identity-only", feature = "perf-only", feature = "perf-brutal-only")))]
+#[cfg(not(any(feature = "bare-metal", feature = "identity-only", feature = "perf-only", feature = "perf-brutal-only")))]
 fn spawn_extended_probes(ctx: &ServiceContext) {
     // --- Brutal adversarial test probes — Milestone 20 ---
     // Spawned EARLY, before property/stress kill-respawn loops start, so the
