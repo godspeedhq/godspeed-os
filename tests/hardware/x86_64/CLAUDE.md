@@ -40,13 +40,13 @@ Open PuTTY, configure Session logging: **All session output**, append to `build/
 
 | File | Category | QEMU §22 | Hardware status |
 |------|----------|----------|-----------------|
-| `1_identity.md` | Identity | §22 (20/20 QEMU) | Partial — WatchSerial tests verifiable; WithRestart blocked (no COM2) |
-| `2_property.md` | Property | P1–P10 | Pending |
-| `3_fuzz.md` | Fuzz | F1–F8 | Pending |
-| `4_stress.md` | Stress | S1–S10 | Partial — S6/S8 underway |
-| `5_perf.md` | Performance | B1–B10, BP1–BP10 | Partial — 5/10 brutal complete |
-| `6_adversarial.md` | Adversarial | A1–A10 | Pending |
-| `7_chaos.md` | Chaos | C1–C7 | Pending — C1 first target |
+| `1_IDENTITY.md` | Identity | §22 (20/20 QEMU) | Partial — WatchSerial tests verifiable; WithRestart blocked (no COM2) |
+| `2_PROPERTY.md` | Property | P1–P10 | Pending |
+| `3_FUZZ.md` | Fuzz | F1–F8 | Pending |
+| `4_STRESS.md` | Stress | S1–S10 | Partial — S6/S8 underway |
+| `5_PERFORMANCE.md` | Performance | B1–B10, BP1–BP10 | Partial — 5/10 brutal complete |
+| `6_ADVERSARIAL.md` | Adversarial | A1–A10 | Pending |
+| `7_CHAOS.md` | Chaos | C1–C7 | Pending — C1 first target |
 
 ## Key differences from QEMU
 

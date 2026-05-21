@@ -1,0 +1,41 @@
+{
+  "metrics": {
+    "BP1": {
+      "p50": 27250150,
+      "p99": 82471482,
+      "p999": 82471482
+    },
+    "BP10": {
+      "mean": 27829652
+    },
+    "BP2": {
+      "p50": 26687370,
+      "p99": 55141895,
+      "p999": 55141895
+    },
+    "BP3": {
+      "mean": 12542
+    },
+    "BP4": {
+      "mean": 7402
+    },
+    "BP5": {
+      "spawn_mean": 5500594
+    },
+    "BP6": {
+      "restart_mean": 8195928
+    },
+    "BP7": {
+      "mean": 30318
+    },
+    "BP8": {
+      "mean": 10510,
+      "n": 16384
+    },
+    "BP9": {
+      "mean": 2406717
+    }
+  },
+  "note": "Brutal perf — QEMU TCG RDTSC cycle counts at 5× iteration counts; not comparable across hosts",
+  "regression_threshold_pct": 10
+}
