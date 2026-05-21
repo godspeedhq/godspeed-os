@@ -892,6 +892,7 @@ Push vs pull is irrelevant — verification is the security property. Live code 
 osdev new <service-name>            # scaffold
 osdev build                         # build kernel + services
 osdev run --smp <N>                 # boot in QEMU with N cores
+osdev image                         # build bare-metal image → build/os.img (UEFI GPT)
 osdev publish                       # package + serve a service
 osdev restart <service> [--core N]  # restart in running OS; --core is dev-mode only
 osdev logs <service>                # tail logs
@@ -1569,7 +1570,7 @@ If any cell becomes obsolete, the corresponding spec section is being changed an
 
 ---
 
-## 23. First Milestone
+## 23. First Milestone ✅ Complete
 
 ### 23.1 Goal
 
@@ -1582,19 +1583,39 @@ The supervisor restarts it (possibly on a different core).
 The system continues running.
 ```
 
-### 23.2 Acceptance Criteria
+### 23.2 Acceptance Criteria ✅
 
-1. `osdev run --smp 4` boots the OS with 4 cores; init, supervisor, registry, logger, ping, and pong reach steady state.
-2. ping placed on core 0; pong placed on core 1.
-3. `osdev logs ping` shows ping sending a message every second.
-4. `osdev logs pong` shows pong receiving each message (cross-core IPC).
-5. `osdev restart pong --core 2` kills pong on core 1 and respawns it on core 2.
-6. ping observes `EndpointDead` and reacquires via the registry; the new cap routes to core 2.
-7. After reacquisition, ping and pong continue communicating across the new core boundary.
-8. The kernel does not panic on any core.
-9. **All ten identity tests in §22 pass.**
+1. `osdev run --smp 4` boots the OS with 4 cores; init, supervisor, registry, logger, ping, and pong reach steady state. ✅
+2. ping placed on core 0; pong placed on core 1. ✅
+3. `osdev logs ping` shows ping sending a message every second. ✅
+4. `osdev logs pong` shows pong receiving each message (cross-core IPC). ✅
+5. `osdev restart pong --core 2` kills pong on core 1 and respawns it on core 2. ✅
+6. ping observes `EndpointDead` and reacquires via the registry; the new cap routes to core 2. ✅
+7. After reacquisition, ping and pong continue communicating across the new core boundary. ✅
+8. The kernel does not panic on any core. ✅
+9. **All ten identity tests in §22 pass.** ✅
 
-### 23.3 Out of Scope for v1
+### 23.3 Bare-Metal Achievement ✅
+
+GodspeedOS has booted on real x86_64 hardware (4-core CPU, 4 GB RAM) via UEFI USB boot (2026-05-21).
+
+- `osdev image` produces a UEFI GPT disk image at `build/os.img`.
+- Image written to USB with Cygwin `dd`; boots via `BOOTX64.EFI` (Limine 12.x).
+- All 4 cores come up; cross-core IPC (ping core 0 → pong core 1) runs continuously on hardware.
+- Null modem serial (115200 8N1, PuTTY) confirms boot output; log appended to `build/putty_serial_output.log`.
+- `bare-metal` supervisor feature excludes harness-driven probe services that require QEMU's control port.
+
+Hardware performance data (bare-metal, ~3 GHz CPU):
+
+| Benchmark | Result |
+|-----------|--------|
+| BP4 cap validation | 543 cycles (~181 ns) |
+| BP7 cap table | 1,656 cycles (~552 ns) |
+| BP8 allocator | 681 cycles/4KiB page (~227 ns) |
+| BP10 scheduler/yield | 4,850 cycles (~1.6 µs) |
+| BP3 yield floor | 13,330 cycles (~4.4 µs) |
+
+### 23.4 Out of Scope for v1
 
 Filesystem persistence beyond the trusted block driver, network stack, work-stealing scheduler, service migration, zero-copy IPC, live code updates, restartable block driver / fs, update model in production mode, core hotplug, per-endpoint queue depth in contract.
 

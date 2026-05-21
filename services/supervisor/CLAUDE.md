@@ -10,15 +10,29 @@ Restart authority. TCB member (§6.1). **Non-restartable.**
 - Expose `kill` and `restart` API (§14.4).
 - Log all lifecycle events.
 
+## Build features
+
+The supervisor has four mutually exclusive spawn-set features:
+
+| Feature            | Spawns                                  | Used by                          |
+|--------------------|-----------------------------------------|----------------------------------|
+| *(none)*           | pong + ping + all 178 probe services    | `osdev run` (full QEMU build)    |
+| `identity-only`    | pong + ping + 15 identity probe services | `osdev test identity`            |
+| `perf-only`        | pong + ping + B1–B10 perf probes        | `osdev test perf`                |
+| `perf-brutal-only` | pong + ping + BP1–BP10 brutal probes    | `osdev test perf-brutal`         |
+| `bare-metal`       | pong + ping only (no probes)            | `osdev image` (USB boot)         |
+
+The `bare-metal` feature exists because probe services require the QEMU control port (COM2/TCP:5555) to complete. Without it, probe-4b-send blocks permanently, and probe-hog runs `loop {}` starving core 0. On real hardware these probes would stall the system indefinitely.
+
 ## Spawn order in `service_main`
 
-Pong and ping are spawned **first**, before all 178 probe services. The probe spawn loop takes 18–120 s on Windows TCG; spawning pong/ping first ensures cross-core IPC between them is established within ~10 s of boot.
+Pong and ping are spawned **first**, before all probe services. The probe spawn loop takes 18–120 s on Windows TCG; spawning pong/ping first ensures cross-core IPC between them is established within ~10 s of boot.
 
 ```
 service_main():
   1. spawn("pong") on core 1  ← pong must precede ping (SEND cap wired at spawn)
   2. spawn("ping") on core 0
-  3. spawn 178 probe services (§22 test infrastructure)
+  3. spawn probe services (§22 test infrastructure) — skipped in bare-metal mode
   4. log("supervisor: ready")
   5. loop { yield_cpu() }
 ```
