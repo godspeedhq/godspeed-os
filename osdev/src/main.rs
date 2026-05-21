@@ -23,7 +23,7 @@
 //!   osdev test adv-brutal   — run brutal adversarial tests BA1–BA10 (Milestone 20)
 //!   osdev test chaos        — run §22 chaos / graceful-degradation test suite (Milestone 14)
 //!   osdev test chaos-brutal — run brutal chaos tests BC1–BC7 (Milestone 21)
-//!   osdev image             — build + create bootable disk image (build/os.img) without launching QEMU
+//!   osdev image [--mode M]  — build + create bootable disk image (build/os.img); M=bare-metal|perf|perf-brutal|identity
 
 mod disk_image;
 mod qemu;
@@ -68,7 +68,16 @@ enum Commands {
     Test { suite: String },
     /// Build + create bootable disk image at build/os.img without launching QEMU.
     /// Flash to USB with Rufus (DD mode) or `dd`.
-    Image,
+    Image {
+        /// Supervisor feature baked into the image.
+        ///
+        /// bare-metal  — pong + ping only; no probe services (default, safest on HW)
+        /// perf        — regular perf probes B1–B10
+        /// perf-brutal — brutal perf probes BP1–BP10
+        /// identity    — identity-only probes (WatchSerial tests; WithRestart needs COM2)
+        #[arg(long, default_value = "bare-metal")]
+        mode: String,
+    },
     /// Validate all service contracts against the JSON schema.
     Validate,
 }
@@ -86,7 +95,7 @@ fn main() {
         Commands::Status { service } => cmd_status(&service),
         Commands::Caps { service }   => cmd_caps(&service),
         Commands::Test { suite }     => cmd_test(&suite),
-        Commands::Image              => cmd_image(),
+        Commands::Image { mode }     => cmd_image(&mode),
         Commands::Validate           => cmd_validate(),
     }
 }
@@ -302,8 +311,17 @@ fn cmd_run(smp: u32) {
     qemu::run(&image_path, smp);
 }
 
-fn cmd_image() {
-    cmd_build_bare_metal();
+fn cmd_image(mode: &str) {
+    match mode {
+        "bare-metal"  => cmd_build_bare_metal(),
+        "perf"        => cmd_build_perf(),
+        "perf-brutal" => cmd_build_brutal_perf(),
+        "identity"    => cmd_build_identity(),
+        other => {
+            eprintln!("image: unknown --mode '{}'; valid: bare-metal, perf, perf-brutal, identity", other);
+            std::process::exit(1);
+        }
+    }
 
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
     if !kernel_elf.exists() {
@@ -324,7 +342,7 @@ fn cmd_image() {
 
     let abs = std::fs::canonicalize(&image_path)
         .unwrap_or_else(|_| image_path.to_path_buf());
-    println!("image: ready at {}", abs.display());
+    println!("image: [{mode}] ready at {}", abs.display());
     println!("image: flash with Rufus (DD Image mode) or:");
     println!("image:   dd if={} of=/dev/sdX bs=4M status=progress", image_path.display());
 }

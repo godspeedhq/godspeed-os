@@ -1,6 +1,6 @@
 # tests/
 
-All tests for the OS. v1 contains only QEMU-based integration tests.
+All tests for the OS. Tests run on two platforms: QEMU (automated harness) and real x86_64 hardware (manual flash-boot-observe).
 
 ## Structure
 
@@ -15,6 +15,15 @@ tests/
     stress/      # Stress tests — Active (§22)
     adversarial/ # Red-team / capability isolation tests — ✅ 10/10 complete + 10/10 brutal (§22)
     chaos/       # Chaos / partial-failure tests — ✅ 7/7 complete + 7/7 brutal (§22)
+  hardware/
+    x86_64/      # Real hardware — 4-core x86_64, ~3 GHz, UEFI USB boot, null modem serial
+      1_identity.md
+      2_property.md
+      3_fuzz.md
+      4_stress.md
+      5_perf.md      # 5/10 brutal complete (BP3/BP4/BP7/BP8/BP10)
+      6_adversarial.md
+      7_chaos.md
 ```
 
 ## Test categories (§22.2)
