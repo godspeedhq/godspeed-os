@@ -2886,10 +2886,15 @@ fn mode_perf_bp2(ctx: &ServiceContext) -> ! {
 }
 
 fn mode_perf_bp2_echo(ctx: &ServiceContext) -> ! {
+    // Use try_send + retry to match ping/pong's cross-core pattern.
+    // Blocking send stalls under heavy BP5 IPI traffic; try_send yields instead.
     let msg = Message::from_bytes(b"bp2e");
     loop {
         ctx.recv();
-        let _ = ctx.send("perf-bp2", &msg);
+        loop {
+            if ctx.try_send("perf-bp2", &msg).is_ok() { break; }
+            ctx.yield_cpu();
+        }
     }
 }
 
