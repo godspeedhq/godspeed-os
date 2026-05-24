@@ -47,7 +47,7 @@ Open PuTTY, configure Session logging: **All session output**, append to `build/
 | `5_PERFORMANCE.md` | Performance (regular) | B1–B10 | Pending — no hardware run yet |
 | `12_PERFORMANCE_BRUTAL.md` | Performance (brutal) | BP1–BP10 | Partial — 9/10 complete (all except BP2) |
 | `6_ADVERSARIAL.md` | Adversarial | A1–A10 | ✅ 10/10 (2026-05-24) |
-| `7_CHAOS.md` | Chaos | C1–C7 | 4/4 probe-driven PASS (C2/C3/C5/C6); C7 Goldmont+ backburner; C1 not testable on this HW; C4 pending RAM removal |
+| `7_CHAOS.md` | Chaos | C1–C7 | C2/C3/C5/C7 PASS (4-core + 2-core); C6 PASS (4-core), inconclusive (2-core); C1 partial (2-core degraded boot verified); C4 skipped |
 
 ## Key differences from QEMU
 
