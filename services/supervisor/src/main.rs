@@ -135,8 +135,35 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("perf-bp10");
 }
 
+// stress-only: spawn only the S1–S10 stress probe services.
+// All stress probes are self-contained (use ctx.kill/ctx.spawn internally);
+// no QEMU control port required — safe for real hardware.
+#[cfg(all(not(feature = "bare-metal"), not(feature = "identity-only"), not(feature = "perf-only"), not(feature = "perf-brutal-only"), feature = "stress-only"))]
+fn spawn_extended_probes(ctx: &ServiceContext) {
+    // Receivers/victims must register before their controllers so endpoints
+    // exist when sender SEND caps are wired at spawn time.
+    let _ = ctx.spawn("stress-s1-recv");
+    let _ = ctx.spawn("stress-s1");
+    let _ = ctx.spawn("stress-s2-victim");
+    let _ = ctx.spawn("stress-s2");
+    let _ = ctx.spawn("stress-s3-recv");    // core 1 — cross-core thrash receiver
+    let _ = ctx.spawn("stress-s3-send");    // core 0 — cross-core thrash sender
+    let _ = ctx.spawn("stress-s4-victim");
+    let _ = ctx.spawn("stress-s4");
+    let _ = ctx.spawn("stress-s5-victim");
+    let _ = ctx.spawn("stress-s5");
+    let _ = ctx.spawn("stress-s6");         // self-referential; endpoint registered at spawn
+    let _ = ctx.spawn("stress-s7");
+    let _ = ctx.spawn("stress-s8");
+    let _ = ctx.spawn("stress-s9-recv");    // core 2 — IPI storm receiver
+    let _ = ctx.spawn("stress-s9-send-a"); // core 0 → core 2
+    let _ = ctx.spawn("stress-s9-send-b"); // core 1 → core 2
+    let _ = ctx.spawn("stress-s10-victim"); // core 1 — cascading revocation target
+    let _ = ctx.spawn("stress-s10");        // core 0 — kills victim cross-core
+}
+
 // Full build: spawn all non-identity probe categories.
-#[cfg(not(any(feature = "bare-metal", feature = "identity-only", feature = "perf-only", feature = "perf-brutal-only")))]
+#[cfg(not(any(feature = "bare-metal", feature = "identity-only", feature = "perf-only", feature = "perf-brutal-only", feature = "stress-only")))]
 fn spawn_extended_probes(ctx: &ServiceContext) {
     // --- Brutal adversarial test probes — Milestone 20 ---
     // Spawned EARLY, before property/stress kill-respawn loops start, so the

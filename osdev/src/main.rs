@@ -75,6 +75,7 @@ enum Commands {
         /// perf        — regular perf probes B1–B10
         /// perf-brutal — brutal perf probes BP1–BP10
         /// identity    — identity-only probes (WatchSerial tests; WithRestart needs COM2)
+        /// stress      — S1–S10 stress probes; self-contained, no harness required
         #[arg(long, default_value = "bare-metal")]
         mode: String,
     },
@@ -257,6 +258,46 @@ pub fn cmd_build_perf() {
     println!("build: kernel OK");
 }
 
+/// Like `cmd_build_perf` but uses `--features stress-only` for a self-contained
+/// hardware stress run (S1–S10). All stress probes use ctx.kill/ctx.spawn
+/// internally — no QEMU control port required.
+pub fn cmd_build_stress() {
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe"];
+    for crate_name in &non_supervisor {
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--release", "-p", crate_name,
+                   "--target", "x86_64-unknown-none"])
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run cargo build for {}: {}", crate_name, e));
+        if !status.success() {
+            eprintln!("build: {} FAILED", crate_name);
+            std::process::exit(1);
+        }
+        println!("build: {} OK", crate_name);
+    }
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "supervisor",
+               "--target", "x86_64-unknown-none",
+               "--features", "supervisor/stress-only"])
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run cargo build for supervisor: {}", e));
+    if !status.success() {
+        eprintln!("build: supervisor (stress-only) FAILED");
+        std::process::exit(1);
+    }
+    println!("build: supervisor (stress-only) OK");
+
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .status()
+        .expect("failed to run cargo build for kernel");
+    if !status.success() {
+        eprintln!("build: kernel FAILED");
+        std::process::exit(1);
+    }
+    println!("build: kernel OK");
+}
+
 /// Like `cmd_build_perf` but uses `--features perf-brutal-only` for the brutal
 /// benchmark suite (BP1–BP10).
 pub fn cmd_build_brutal_perf() {
@@ -317,8 +358,9 @@ fn cmd_image(mode: &str) {
         "perf"        => cmd_build_perf(),
         "perf-brutal" => cmd_build_brutal_perf(),
         "identity"    => cmd_build_identity(),
+        "stress"      => cmd_build_stress(),
         other => {
-            eprintln!("image: unknown --mode '{}'; valid: bare-metal, perf, perf-brutal, identity", other);
+            eprintln!("image: unknown --mode '{}'; valid: bare-metal, perf, perf-brutal, identity, stress", other);
             std::process::exit(1);
         }
     }

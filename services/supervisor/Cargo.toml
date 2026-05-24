@@ -24,6 +24,9 @@ perf-only = []
 # Spawn only the brutal performance-benchmark probe services (perf-bp1…perf-bp10
 # and their echo/victim partners).  Used by `osdev test perf-brutal`.
 perf-brutal-only = []
+# Spawn only the S1–S10 stress probe services (and pong/ping).
+# Used by `osdev image --mode stress` for a self-contained hardware stress run.
+stress-only = []
 
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }
