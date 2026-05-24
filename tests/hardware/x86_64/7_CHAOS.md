@@ -2,7 +2,7 @@
 
 Mirrors §22 Chaos Tests (C1–C7). Graceful degradation under partial failures on real silicon.
 
-**Status: C2/C3/C5/C7 PASS (4-core); C2/C3/C5/C7 PASS (2-core C1 variant). C6 inconclusive under 2-core. C1/C4 not testable on this hardware.**
+**Status: 5/5 PASS (4-core, post-placement-fix) — 2026-05-24. C1 partial (2-core degraded boot verified). C4 skipped.**
 
 ## Hardware applicability
 
@@ -57,6 +57,7 @@ chaos: C7 pass — 30 cross-core TLB shootdowns survived
 | Date | Test | Cores | Result | Notes |
 |------|------|-------|--------|-------|
 | 2026-05-24 | C2/C3/C5/C6/C7 | 4 | 5/5 PASS | Full 4-core run, pre-placement-fix image |
+| 2026-05-24 | C2/C3/C5/C6/C7 | 4 | 5/5 PASS | Post-placement-fix image. C6: hog core 3, monitor core 0. C7: 30 iters, victim on core 2. |
 | 2026-05-24 | C2/C3/C5/C7 | 2 | 4/4 PASS | 2-core C1 variant; placement fix applied. C7 passes (30 iters). C6 inconclusive (hog+monitor both on core 0). |
 | 2026-05-24 | C1 | 2 | Partial | 2-core degraded boot verified; true AP-never-starts not testable on this HW |
 | — | C4 | — | Skipped | 2×4 GB; not a meaningful stress test |
