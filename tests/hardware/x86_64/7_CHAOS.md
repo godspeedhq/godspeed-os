@@ -2,19 +2,19 @@
 
 Mirrors §22 Chaos Tests (C1–C7). Graceful degradation under partial failures on real silicon.
 
-**Status: Pending** — `chaos-only` build mode ready; awaiting hardware run.
+**Status: 5/5 probe-driven PASS** (C2–C7) — 2026-05-24, Dell Wyse 5070. C1 (AP failure) and C4 (minimal RAM) pending hardware reconfiguration.
 
 ## Hardware applicability
 
 | ID | Failure injected | HW method | HW feasible? | Status |
 |----|-----------------|-----------|-------------|--------|
-| C1 | One or more APs fail to come up | Disable cores in BIOS/UEFI settings | Yes | Pending |
-| C2 | Corrupted ELF in boot manifest (non-TCB) | Probe-driven (chaos-only build) | Yes | Pending |
-| C3 | Allocator forced to return `AllocFailed` at random points | Probe-driven (chaos-only build) | Yes | Pending |
-| C4 | Degraded bootloader environment (minimal RAM) | Remove RAM sticks from hardware | Yes | Pending |
-| C5 | Kernel stack near exhaustion under deep syscall | Probe-driven (chaos-only build) | Yes | Pending |
-| C6 | Tight-loop hog starves cores | Probe-driven (chaos-only build) | Yes | Pending |
-| C7 | Cross-core TLB shootdowns under concurrent IPC load | Probe-driven (chaos-only build) | Yes | Pending |
+| C1 | One or more APs fail to come up | Disable cores in BIOS/UEFI settings | Yes | Pending (HW reconfig) |
+| C2 | Corrupted ELF in boot manifest (non-TCB) | Probe-driven (chaos-only build) | Yes | PASS 2026-05-24 |
+| C3 | Allocator forced to return `AllocFailed` at random points | Probe-driven (chaos-only build) | Yes | PASS 2026-05-24 |
+| C4 | Degraded bootloader environment (minimal RAM) | Remove RAM sticks from hardware | Yes | Pending (HW reconfig) |
+| C5 | Kernel stack near exhaustion under deep syscall | Probe-driven (chaos-only build) | Yes | PASS 2026-05-24 |
+| C6 | Tight-loop hog starves cores | Probe-driven (chaos-only build) | Yes | PASS 2026-05-24 |
+| C7 | Cross-core TLB shootdowns under concurrent IPC load | Probe-driven (chaos-only build) | Yes | PASS 2026-05-24 |
 
 Note: C6 and C7 were previously labelled "QEMU only" but the probes test preemption (C6) and TLB shootdown survival (C7) — both run fine on hardware. "QEMU fault injection" refers to a different injection vector not used by the probes.
 
@@ -73,4 +73,6 @@ pong: received "1"
 
 | Date | Test | Variant | Result | Notes |
 |------|------|---------|--------|-------|
-| — | — | — | — | No hardware chaos runs yet |
+| 2026-05-24 | C2–C7 (probe-driven) | chaos-only build | 5/5 PASS | Dell Wyse 5070, J5005, 4 cores. C7: 30 TLB shootdown iters. C3: 500 alloc-deny cycles. No panics. |
+| — | C1 | bare-metal + BIOS core disable | Pending | Requires disabling cores in UEFI setup |
+| — | C4 | bare-metal + RAM removal | Pending | Requires physical RAM removal |
