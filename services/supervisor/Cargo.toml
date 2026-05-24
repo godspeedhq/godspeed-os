@@ -27,6 +27,9 @@ perf-brutal-only = []
 # Spawn only the S1–S10 stress probe services (and pong/ping).
 # Used by `osdev image --mode stress` for a self-contained hardware stress run.
 stress-only = []
+# Spawn only the A1–A10 adversarial probe services (and pong/ping).
+# Used by `osdev image --mode adv` for a self-contained hardware adversarial run.
+adv-only = []
 
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }

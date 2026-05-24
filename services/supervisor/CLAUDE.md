@@ -12,7 +12,7 @@ Restart authority. TCB member (§6.1). **Non-restartable.**
 
 ## Build features
 
-The supervisor has four mutually exclusive spawn-set features:
+The supervisor has mutually exclusive spawn-set features:
 
 | Feature            | Spawns                                  | Used by                          |
 |--------------------|-----------------------------------------|----------------------------------|
@@ -20,6 +20,8 @@ The supervisor has four mutually exclusive spawn-set features:
 | `identity-only`    | pong + ping + 15 identity probe services | `osdev test identity`            |
 | `perf-only`        | pong + ping + B1–B10 perf probes        | `osdev test perf`                |
 | `perf-brutal-only` | pong + ping + BP1–BP10 brutal probes    | `osdev test perf-brutal`         |
+| `stress-only`      | pong + ping + S1–S10 stress probes      | `osdev image --mode stress`      |
+| `adv-only`         | pong + ping + A1–A10 adversarial probes | `osdev image --mode adv`         |
 | `bare-metal`       | pong + ping only (no probes)            | `osdev image` (USB boot)         |
 
 The `bare-metal` feature exists because probe services require the QEMU control port (COM2/TCP:5555) to complete. Without it, probe-4b-send blocks permanently, and probe-hog runs `loop {}` starving core 0. On real hardware these probes would stall the system indefinitely.

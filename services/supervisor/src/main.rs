@@ -31,7 +31,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // perf-only, and perf-brutal-only builds: probe-hog tight-loops on core 0,
     // probe-4b-send blocks waiting for a harness kill that never arrives on HW,
     // and the combined 16-task load starves IPC benchmarks of scheduler quanta.
-    #[cfg(not(any(feature = "bare-metal", feature = "perf-only", feature = "perf-brutal-only", feature = "stress-only")))]
+    #[cfg(not(any(feature = "bare-metal", feature = "perf-only", feature = "perf-brutal-only", feature = "stress-only", feature = "adv-only")))]
     {
         // --- Probe services (§22 Group A identity tests) ---
         // Recv-endpoint probes must come first so their endpoints are registered
@@ -162,8 +162,29 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("stress-s10");        // core 0 — kills victim cross-core
 }
 
+// adv-only: spawn only the A1–A10 adversarial probe services.
+// All adversarial probes are self-contained — no QEMU control port required.
+#[cfg(all(not(feature = "bare-metal"), not(feature = "identity-only"), not(feature = "perf-only"), not(feature = "perf-brutal-only"), not(feature = "stress-only"), feature = "adv-only"))]
+fn spawn_extended_probes(ctx: &ServiceContext) {
+    // Passive/victim services before their attackers so endpoints exist when
+    // attacker SEND caps are wired at spawn time.
+    let _ = ctx.spawn("adv-a1");
+    let _ = ctx.spawn("adv-a2");
+    let _ = ctx.spawn("adv-a3");
+    let _ = ctx.spawn("adv-a4");
+    let _ = ctx.spawn("adv-a5-victim"); // passive — killed by adv-a5
+    let _ = ctx.spawn("adv-a5");
+    let _ = ctx.spawn("adv-a6");
+    let _ = ctx.spawn("adv-a7-recv");   // passive recv — registered before sender
+    let _ = ctx.spawn("adv-a7");
+    let _ = ctx.spawn("adv-a8");        // tight-loop attacker
+    let _ = ctx.spawn("adv-a8-witness");
+    let _ = ctx.spawn("adv-a9");
+    let _ = ctx.spawn("adv-a10");
+}
+
 // Full build: spawn all non-identity probe categories.
-#[cfg(not(any(feature = "bare-metal", feature = "identity-only", feature = "perf-only", feature = "perf-brutal-only", feature = "stress-only")))]
+#[cfg(not(any(feature = "bare-metal", feature = "identity-only", feature = "perf-only", feature = "perf-brutal-only", feature = "stress-only", feature = "adv-only")))]
 fn spawn_extended_probes(ctx: &ServiceContext) {
     // --- Brutal adversarial test probes — Milestone 20 ---
     // Spawned EARLY, before property/stress kill-respawn loops start, so the
