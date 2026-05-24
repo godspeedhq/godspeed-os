@@ -119,6 +119,15 @@ impl ServiceContext {
         }
     }
 
+    /// Block until a message arrives; returns the error instead of looping silently.
+    pub fn recv_result(&self) -> Result<Message, crate::ipc::IpcError> {
+        let data = Self::ctx();
+        if data.magic != SERVICE_CTX_MAGIC { return Err(crate::ipc::IpcError::EndpointDead); }
+        let slot = data.recv_slot;
+        if slot == u32::MAX { return Err(crate::ipc::IpcError::EndpointDead); }
+        crate::ipc::recv(CapHandle(slot))
+    }
+
     /// Send to a named peer declared in `ipc_send`. Blocking.
     pub fn send(&self, peer: &str, msg: &Message) -> Result<(), IpcError> {
         let slot = self.find_send_slot(peer).ok_or(IpcError::CapError(CapError::CapNotHeld))?;

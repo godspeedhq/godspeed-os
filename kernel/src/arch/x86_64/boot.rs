@@ -126,6 +126,7 @@ static mut APIC_VIRT_BASE: u64 = 0;
 
 // APIC register offsets (xAPIC MMIO, 32-bit accesses).
 const APIC_ID:           u64 = 0x020;
+const APIC_TPR:          u64 = 0x080; // Task Priority Register — must be 0 to accept all vectors
 const APIC_EOI:          u64 = 0x0B0;
 const APIC_SPURIOUS:     u64 = 0x0F0;
 const APIC_LVT_TIMER:    u64 = 0x320;
@@ -191,6 +192,13 @@ pub unsafe fn init_local_apic() {
 
     // SAFETY: APIC_VIRT_BASE written once per core before apic_send_eoi is called.
     unsafe { APIC_VIRT_BASE = apic_virt };
+
+    // UEFI may leave the Task Priority Register (TPR) non-zero on the BSP,
+    // which blocks delivery of any interrupt vector whose priority class ≤ TPR.
+    // Vector 0xF0 (WAKE_RECEIVER) has priority class 0xF; if TPR = 0xF0 the APIC
+    // silently discards it while the LVT timer still fires (LVT ignores TPR).
+    // Explicitly zero TPR so all interrupt classes are accepted.
+    unsafe { write_apic(apic_virt, APIC_TPR, 0x00) };
 
     // Enable APIC software: set bit 8 of the spurious interrupt vector register.
     // Spurious vector = 0xFF (unused; interrupt gates handle real vectors).
@@ -613,17 +621,38 @@ unsafe extern "C" fn ipi_dispatch(vector: u64) {
     unsafe { crate::smp::ipi::ipi_handler(vector as u8) }
 }
 
+/// WAKE_RECEIVER ISR stub (vector 0xF0) — cross-core task wakeup (§9.4).
+///
+/// Mirrors `timer_isr_stub` exactly: conditional swapgs, save caller-saved
+/// registers, call `timer_tick_from_irq` (which sends EOI and reschedules),
+/// restore registers, conditional swapgs, iretq.
+///
+/// Calling `timer_tick_from_irq` here (rather than going through `ipi_dispatch`)
+/// ensures the same swapgs invariant and the same context-switch path as a
+/// real timer preemption, avoiding GS corruption when a cross-core wakeup
+/// interrupts a ring-3 task that is in the middle of a SYSCALL.
 #[unsafe(naked)]
 unsafe extern "C" fn ipi_wake_stub() {
     core::arch::naked_asm!(
+        // Conditional swapgs: ring-3 interrupts have GS.base = 0 (user);
+        // load kernel GS before any gs:[...] access inside timer_tick_from_irq.
+        "test byte ptr [rsp + 8], 3",
+        "jz 1f",
+        "swapgs",
+        "1:",
         "push rax", "push rcx", "push rdx",
         "push rdi", "push rsi", "push r8",
         "push r9",  "push r10", "push r11",
-        "mov rdi, 0xF0",
-        "call ipi_dispatch",
+        "call timer_tick_from_irq",
         "pop r11", "pop r10", "pop r9",
         "pop r8",  "pop rsi", "pop rdi",
         "pop rdx", "pop rcx", "pop rax",
+        // Conditional swapgs before iretq: if the frame at RSP is ring-3
+        // (possibly a new task after a context switch), restore user GS.
+        "test byte ptr [rsp + 8], 3",
+        "jz 2f",
+        "swapgs",
+        "2:",
         "iretq",
     )
 }

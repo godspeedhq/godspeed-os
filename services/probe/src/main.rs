@@ -2859,10 +2859,12 @@ fn mode_perf_bp1_echo(ctx: &ServiceContext) -> ! {
 fn mode_perf_bp2(ctx: &ServiceContext) -> ! {
     // BP2: cross-core IPC roundtrip latency — 100 samples (2× B2) (§22 Brutal Perf BP2).
     // Each cross-core round-trip costs ~800ms on QEMU TCG; 100 samples = ~80s, well within 600s.
+    ctx.log("perf: BP2 sender start");
     let echo_cap = loop {
         if let Some(cap) = ctx.acquire_send_cap("perf-bp2-echo") { break cap; }
         ctx.yield_cpu();
     };
+    ctx.log("perf: BP2 sender cap-acquired");
 
     let msg = Message::from_bytes(b"bp2");
     const N: usize = 100;
@@ -2871,7 +2873,11 @@ fn mode_perf_bp2(ctx: &ServiceContext) -> ! {
     for i in 0..N {
         let t0 = ctx.read_tsc();
         let _ = ctx.send_by_handle(echo_cap, &msg);
-        ctx.recv();
+        if i == 0 { ctx.log("perf: BP2 sender sent-0"); }
+        match ctx.recv_result() {
+            Ok(_) => { if i == 0 { ctx.log("perf: BP2 sender recv-0 OK"); } }
+            Err(_) => { if i == 0 { ctx.log("perf: BP2 sender recv-0 ERR"); } loop {} }
+        }
         let t1 = ctx.read_tsc();
         samples[i] = t1.wrapping_sub(t0);
     }
@@ -2888,13 +2894,18 @@ fn mode_perf_bp2(ctx: &ServiceContext) -> ! {
 fn mode_perf_bp2_echo(ctx: &ServiceContext) -> ! {
     // Use try_send + retry to match ping/pong's cross-core pattern.
     // Blocking send stalls under heavy BP5 IPI traffic; try_send yields instead.
+    ctx.log("perf: BP2 echo start");
     let msg = Message::from_bytes(b"bp2e");
+    let mut count = 0u32;
     loop {
         ctx.recv();
+        count += 1;
+        if count == 1 { ctx.log("perf: BP2 echo recv-0"); }
         loop {
             if ctx.try_send("perf-bp2", &msg).is_ok() { break; }
             ctx.yield_cpu();
         }
+        if count == 1 { ctx.log("perf: BP2 echo sent-0"); }
     }
 }
 

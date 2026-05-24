@@ -206,8 +206,13 @@ fn handle_try_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 
     // Pass None for blocked_sender_slot — QueueFull is returned directly.
     match crate::ipc::routing::enqueue(endpoint_id, msg, cap.generation, None) {
-        Ok(Some(receiver_slot)) => { scheduler::wake_by_slot(receiver_slot, 0); 0 }
-        Ok(None) => 0,
+        Ok(Some(receiver_slot)) => {
+            scheduler::wake_by_slot(receiver_slot, 0);
+            0
+        }
+        Ok(None) => {
+            0
+        }
         Err(e)   => ipc_err_to_i64(e),
     }
 }

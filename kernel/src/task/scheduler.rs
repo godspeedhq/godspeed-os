@@ -105,6 +105,21 @@ static CORE_CURRENT: [AtomicUsize; MAX_CORES] =
 static CORE_RR_SLOT: [AtomicUsize; MAX_CORES] =
     [const { AtomicUsize::new(0) }; MAX_CORES];
 
+/// Per-core immediate-schedule hint set by `wake_by_slot`.
+///
+/// When a task is woken via cross-core IPC, its slot is stored here so
+/// `pick_next` can schedule it on the very next call rather than waiting for
+/// the round-robin pointer to naturally wrap around to it.  Without this hint,
+/// a just-woken task can be starved for an entire RR cycle by a dense band of
+/// Ready tasks at lower slot indices that keep the RR pointer pinned below the
+/// woken slot (root cause of the BP2 hardware hang).
+///
+/// Sentinel: `MAX_TASKS` = no hint pending.  Written with Release by
+/// `wake_by_slot` so the Ready state written before the hint is visible to
+/// `pick_next`'s subsequent Acquire load of TASK_STATE.
+static CORE_WAKE_HINT: [AtomicUsize; MAX_CORES] =
+    [const { AtomicUsize::new(MAX_TASKS) }; MAX_CORES];
+
 /// Per-core queue of kernel stack tops awaiting deferred free after a self-kill.
 ///
 /// When a task kills itself (CORE_CURRENT[core] == slot), RSP is still on that
@@ -165,6 +180,7 @@ static mut CORE_SCHED_CTX: [TaskContext; MAX_CORES] = [const {
     TaskContext { rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0,
                   rip: 0, rsp: 0, cr3: 0 }
 }; MAX_CORES];
+
 
 // ---------------------------------------------------------------------------
 // Helper: identify the current core.
@@ -616,8 +632,6 @@ pub fn run(core_id: u32) -> ! {
     }
 }
 
-/// Called by the timer ISR every ~10 ms to enforce the preemption quantum.
-///
 /// # Safety
 /// Must only be called from the timer ISR with interrupts disabled (IF=0).
 #[no_mangle]
@@ -831,32 +845,72 @@ pub fn wake_by_slot(slot: usize, result: i64) {
     unsafe {
         if slot < MAX_TASKS && TASK_VALID[slot].load(Ordering::Relaxed) {
             // Do not revive a task that kill_task_by_slot has already marked Dead.
-            // If we overwrite Dead with Ready, the scheduler re-animates a task
-            // whose kernel stack may already be freed — KERNEL PF on next entry.
-            // Use CAS so that a concurrent Dead-store (from kill_task_by_slot
-            // under the slot lock) wins rather than being silently overwritten.
-            // We must read current state first; if it's already Dead, bail.
-            let current = TASK_STATE[slot].load(Ordering::Acquire);
-            if current == TaskState::Dead as u8 { return; }
+            let first = TASK_STATE[slot].load(Ordering::Acquire);
+            if first == TaskState::Dead as u8 { return; }
             TASK_WAKEUP_ERR[slot] = result;
-            // CAS: only transition to Ready from the observed non-Dead state.
-            // If kill raced and set Dead between our load and here, the CAS
-            // fails and we correctly leave the task Dead.
-            if TASK_STATE[slot]
-                .compare_exchange(
+
+            // CAS retry loop: transition any non-Dead state → Ready.
+            //
+            // On real SMP hardware, block_and_reschedule (core A) and
+            // wake_by_slot (core B) can race on TASK_STATE[slot]:
+            //
+            //   Core A loads Running, Core B loads Running.
+            //   Core A's CAS(Running→Blocked) wins.
+            //   Core B's CAS(Running→Ready) fails — state is now Blocked.
+            //
+            // Without a retry, Core B silently returns and the task stays
+            // Blocked forever (confirmed on real hardware; never observed on
+            // QEMU TCG because TCG serialises cores).  The retry loop re-reads
+            // the updated state (Blocked) and CAS(Blocked→Ready) succeeds.
+            //
+            // The loop terminates because: Dead terminates early; Ready
+            // terminates as "already woken"; every other state (Running,
+            // BlockedOnRecv, BlockedOnSend) either has its CAS succeed or
+            // transitions to Dead/Ready on the next iteration.
+            let mut current = first;
+            loop {
+                if current == TaskState::Dead as u8 { return; }
+                if TaskState::from(current) == TaskState::Ready { break; }
+                match TASK_STATE[slot].compare_exchange(
                     current,
                     TaskState::Ready as u8,
                     Ordering::Release,
                     Ordering::Relaxed,
-                )
-                .is_err()
-            {
-                return;
+                ) {
+                    Ok(_) => {
+                        break;
+                    }
+                    Err(new) => {
+                        current = new;
+                        core::hint::spin_loop();
+                    }
+                }
             }
 
             let task_core = TASK_CORE[slot] as usize;
             let my_core   = current_core_id();
+
             if task_core != my_core {
+                // Cross-core wakeup: the target core's pick_next may be deep into
+                // its RR scan and far from `slot`.  Set the hint so pick_next
+                // returns `slot` on the very next call, ahead of the RR scan.
+                // Same-core wakeups do NOT set the hint: the RR scan will reach
+                // the just-readied slot naturally within a few picks, and setting
+                // the hint for same-core tasks (e.g. BP1's 6↔7 loop) would cause
+                // pick_next to always bypass the scan and return the most recently
+                // woken same-core task, starving all other slots indefinitely.
+                //
+                // CAS instead of store: only install hint when no hint is pending.
+                // If a different slot's hint is already set (e.g. hint=8 for
+                // BP2-sender when pong tries to overwrite with hint=5 for ping),
+                // leave the existing hint alone.  This slot is already Ready (CAS
+                // above); if the hint fires for the other slot first, the RR scan
+                // on the immediately-following pick_next call will find this slot
+                // (it starts from RR_SLOT which hint-fires advance past the hinted
+                // slot, keeping the scan pointer near this slot's index).
+                CORE_WAKE_HINT[task_core]
+                    .compare_exchange(MAX_TASKS, slot, Ordering::Release, Ordering::Relaxed)
+                    .ok();
                 // SAFETY: APIC is initialised; task_core is a ready core.
                 unsafe {
                     crate::smp::ipi::send_ipi(
@@ -1260,17 +1314,56 @@ pub fn take_recv_message() -> Option<Message> {
 /// is visited before the pointer wraps, preventing high-numbered slots from
 /// being permanently starved by a dense band of ready tasks at lower indices
 /// (§9.1 — no service may monopolise a core; §9.3 — yield is advisory).
+///
+/// Before the RR scan, checks `CORE_WAKE_HINT`: if a task was just woken by
+/// `wake_by_slot` it is returned immediately without scanning, so a recently
+/// woken task cannot be starved by the current RR position.
 fn pick_next(core_id: usize) -> Option<usize> {
+    // Fast path: schedule the just-woken task immediately.
+    let hint = CORE_WAKE_HINT[core_id].load(Ordering::Acquire);
+    if hint < MAX_TASKS {
+        // Clear the hint regardless — if the slot turns out not to be
+        // schedulable the RR scan below will find something else.
+        CORE_WAKE_HINT[core_id].store(MAX_TASKS, Ordering::Relaxed);
+        // SAFETY: hint < MAX_TASKS; TASK_VALID/TASK_STATE are AtomicBool/AtomicU8
+        // arrays (no unsafe needed); TASK_CORE is static mut but read-only here
+        // after task spawn (immutable once set — see scheduler.rs §9.1 invariant).
+        let v = TASK_VALID[hint].load(Ordering::Relaxed);
+        let s = TASK_STATE[hint].load(Ordering::Acquire);
+        let c = unsafe { TASK_CORE[hint] };
+        let ready = v
+            && TaskState::from(s) == TaskState::Ready
+            && c == core_id as u32;
+        if ready {
+            // Do NOT advance CORE_RR_SLOT here.
+            //
+            // Advancing RR from the hint path resets the scan pointer to
+            // (hint+1) on every hint fire.  When a frequently-woken slot
+            // (e.g. supervisor at slot 1) fires hint repeatedly, RR is
+            // continually reset to 2, and any task at a higher slot index
+            // is never reached by the RR scan between hint firings.
+            //
+            // The RR scan path below advances the pointer correctly after
+            // each scan-selected pick.  The hint path's sole job is to
+            // return the just-woken slot immediately; it must not disturb
+            // the scan state.
+            return Some(hint);
+        }
+    }
+
     let start = CORE_RR_SLOT[core_id].load(Ordering::Relaxed);
     for i in 0..MAX_TASKS {
         let idx = (start + i) % MAX_TASKS;
         // Acquire: sees the Ready write from wake_by_slot's Release store.
         // SAFETY: TASK_STATE and TASK_CORE are static mut arrays; idx < MAX_TASKS.
-        let ready = unsafe {
-            TASK_VALID[idx].load(Ordering::Relaxed)
-                && TaskState::from(TASK_STATE[idx].load(Ordering::Acquire)) == TaskState::Ready
-                && TASK_CORE[idx] == core_id as u32
-        };
+        let (v2, s2, c2) = unsafe {(
+            TASK_VALID[idx].load(Ordering::Relaxed),
+            TASK_STATE[idx].load(Ordering::Acquire),
+            TASK_CORE[idx],
+        )};
+        let ready = v2
+            && TaskState::from(s2) == TaskState::Ready
+            && c2 == core_id as u32;
         if ready {
             // Advance past the selected slot so the next call starts after it.
             CORE_RR_SLOT[core_id].store((idx + 1) % MAX_TASKS, Ordering::Relaxed);

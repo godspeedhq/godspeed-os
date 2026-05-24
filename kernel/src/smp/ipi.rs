@@ -82,11 +82,10 @@ pub unsafe fn broadcast_tlb_shootdown(virt_addr: u64) {
 pub unsafe fn ipi_handler(vector: u8) {
     match vector {
         vectors::WAKE_RECEIVER => {
-            // wake_by_slot already set the task's state to Ready.  The IPI's
-            // sole purpose is to wake the target core from `hlt`.  After iretq
-            // the scheduler loop calls pick_next and switches to the ready task.
-            // Calling yield_current here would save the ISR stack into
-            // CORE_SCHED_CTX and corrupt the scheduler context (§9.4).
+            // ipi_wake_stub now calls timer_tick_from_irq directly (with the
+            // same swapgs protocol as timer_isr_stub) so it never reaches this
+            // branch.  Left as a no-op for robustness if another path routes
+            // here unexpectedly.
         }
         vectors::TLB_SHOOTDOWN => handle_tlb_shootdown(),
         vectors::SCHEDULER_TICK => {
