@@ -16,10 +16,15 @@ Hardware test suite for GodspeedOS on real x86_64 silicon. Mirrors the QEMU test
 
 | `--mode` | Supervisor feature | Spawns | Used for |
 |----------|--------------------|--------|----------|
-| `bare-metal` | `bare-metal` | pong + ping only | Stability, smoke test |
+| `bare-metal` | `bare-metal` | pong + ping only | Stability, smoke test, S6/S8 24h soak |
 | `perf` | `perf-only` | B1–B10 probes | Regular perf benchmarks |
 | `perf-brutal` | `perf-brutal-only` | BP1–BP10 probes | Brutal perf benchmarks |
 | `identity` | `identity-only` | 15 identity probes | Identity WatchSerial tests |
+| `stress` | `stress-only` | S1–S10 probes | Stress benchmarks |
+| `adv` | `adv-only` | A1–A10 probes | Adversarial tests |
+| `chaos` | `chaos-only` | C2–C7 probes | Chaos tests |
+| `b2-only` | `b2-only` | perf-b2 + echo | B2 isolation (Goldmont+ investigation) |
+| `bp2-only` | `bp2-only` | perf-bp2 + echo | BP2 isolation (Goldmont+ investigation) |
 
 ## Flash procedure
 
@@ -43,9 +48,9 @@ Open PuTTY, configure Session logging: **All session output**, append to `build/
 | `1_IDENTITY.md` | Identity | §22 (20/20 QEMU) | Partial — WatchSerial tests verifiable; WithRestart blocked (no COM2) |
 | `2_PROPERTY.md` | Property | P1–P10 | Pending |
 | `3_FUZZ.md` | Fuzz | F1–F8 | Pending |
-| `4_STRESS.md` | Stress | S1–S10 | Partial — S6/S8 underway |
-| `5_PERFORMANCE.md` | Performance (regular) | B1–B10 | Pending — no hardware run yet |
-| `12_PERFORMANCE_BRUTAL.md` | Performance (brutal) | BP1–BP10 | Partial — 9/10 complete (all except BP2) |
+| `4_STRESS.md` | Stress | S1–S10 | 8/10 (S3/S9 Goldmont+ backburner); S6/S8 24h bare-metal soak pending |
+| `5_PERFORMANCE.md` | Performance (regular) | B1–B10 | 9/10 (2026-05-24); B2 Goldmont+ backburner; isolation confirmed not load-dependent |
+| `12_PERFORMANCE_BRUTAL.md` | Performance (brutal) | BP1–BP10 | 9/10 (2026-05-21); BP2 Goldmont+ backburner |
 | `6_ADVERSARIAL.md` | Adversarial | A1–A10 | ✅ 10/10 (2026-05-24) |
 | `7_CHAOS.md` | Chaos | C1–C7 | ✅ 5/5 PASS (4-core, 2026-05-24); C1 partial (2-core degraded boot verified); C4 skipped |
 
