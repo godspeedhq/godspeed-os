@@ -31,7 +31,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // perf-only, and perf-brutal-only builds: probe-hog tight-loops on core 0,
     // probe-4b-send blocks waiting for a harness kill that never arrives on HW,
     // and the combined 16-task load starves IPC benchmarks of scheduler quanta.
-    #[cfg(not(any(feature = "bare-metal", feature = "perf-only", feature = "perf-brutal-only", feature = "stress-only", feature = "adv-only")))]
+    #[cfg(not(any(feature = "bare-metal", feature = "perf-only", feature = "perf-brutal-only", feature = "stress-only", feature = "adv-only", feature = "chaos-only")))]
     {
         // --- Probe services (§22 Group A identity tests) ---
         // Recv-endpoint probes must come first so their endpoints are registered
@@ -162,6 +162,23 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("stress-s10");        // core 0 — kills victim cross-core
 }
 
+// chaos-only: spawn only the C2–C7 chaos probe services.
+// C1 (degraded SMP boot) and C4 (minimal RAM) use bare-metal + hardware
+// reconfiguration instead of probes.  All probes here are self-contained.
+#[cfg(all(not(feature = "bare-metal"), not(feature = "identity-only"), not(feature = "perf-only"), not(feature = "perf-brutal-only"), not(feature = "stress-only"), not(feature = "adv-only"), feature = "chaos-only"))]
+fn spawn_extended_probes(ctx: &ServiceContext) {
+    // BC7/C7 victims must be registered before their controllers so endpoints
+    // exist when the controller's SEND caps are wired at spawn time.
+    let _ = ctx.spawn("chaos-c2");          // non-TCB page fault, system continues
+    let _ = ctx.spawn("chaos-c2-monitor");  // witness — alive after c2 faults
+    let _ = ctx.spawn("chaos-c3");          // alloc-deny pressure cycles
+    let _ = ctx.spawn("chaos-c5");          // recursive yields (kernel stack depth)
+    let _ = ctx.spawn("chaos-c6-hog");      // tight-loop hog on core 3
+    let _ = ctx.spawn("chaos-c6-monitor");  // witness on core 0
+    let _ = ctx.spawn("chaos-c7-victim");   // passive recv target on core 2
+    let _ = ctx.spawn("chaos-c7");          // TLB shootdown controller on core 1
+}
+
 // adv-only: spawn only the A1–A10 adversarial probe services.
 // All adversarial probes are self-contained — no QEMU control port required.
 #[cfg(all(not(feature = "bare-metal"), not(feature = "identity-only"), not(feature = "perf-only"), not(feature = "perf-brutal-only"), not(feature = "stress-only"), feature = "adv-only"))]
@@ -184,7 +201,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
 }
 
 // Full build: spawn all non-identity probe categories.
-#[cfg(not(any(feature = "bare-metal", feature = "identity-only", feature = "perf-only", feature = "perf-brutal-only", feature = "stress-only", feature = "adv-only")))]
+#[cfg(not(any(feature = "bare-metal", feature = "identity-only", feature = "perf-only", feature = "perf-brutal-only", feature = "stress-only", feature = "adv-only", feature = "chaos-only")))]
 fn spawn_extended_probes(ctx: &ServiceContext) {
     // --- Brutal adversarial test probes — Milestone 20 ---
     // Spawned EARLY, before property/stress kill-respawn loops start, so the

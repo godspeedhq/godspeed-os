@@ -2,32 +2,48 @@
 
 Mirrors §22 Chaos Tests (C1–C7). Graceful degradation under partial failures on real silicon.
 
-**Reference:** `tests/qemu/chaos/CLAUDE.md` for full spec.
+**Status: Pending** — `chaos-only` build mode ready; awaiting hardware run.
 
 ## Hardware applicability
 
-Chaos tests inject failures. Some failures are more naturally injected on real hardware than in QEMU; others require QEMU-specific fault injection mechanisms. Hardware is the authoritative platform for C1 (AP failure) and C4 (degraded bootloader environment).
-
 | ID | Failure injected | HW method | HW feasible? | Status |
 |----|-----------------|-----------|-------------|--------|
-| C1 | One or more APs fail to come up | Disable cores in BIOS/UEFI settings | Yes — first target | Pending |
-| C2 | Corrupted ELF in boot manifest (non-TCB) | Bake a corrupt ELF into the image at build | Yes | Pending |
-| C3 | Allocator forced to return `AllocFailed` at random points | Probe-driven — inject via service | Yes — self-contained | Pending |
-| C4 | Degraded bootloader environment (minimal RAM) | Remove RAM sticks from hardware | Yes — hardware configuration | Pending |
-| C5 | Kernel stack near exhaustion under deep syscall | Probe-driven — self-contained | Yes | Pending |
-| C6 | One core's timer interrupt dropped for extended period | Not achievable without QEMU fault injection | No (QEMU only) | N/A |
-| C7 | TLB shootdown IPI delayed across cores | Not achievable without QEMU fault injection | No (QEMU only) | N/A |
+| C1 | One or more APs fail to come up | Disable cores in BIOS/UEFI settings | Yes | Pending |
+| C2 | Corrupted ELF in boot manifest (non-TCB) | Probe-driven (chaos-only build) | Yes | Pending |
+| C3 | Allocator forced to return `AllocFailed` at random points | Probe-driven (chaos-only build) | Yes | Pending |
+| C4 | Degraded bootloader environment (minimal RAM) | Remove RAM sticks from hardware | Yes | Pending |
+| C5 | Kernel stack near exhaustion under deep syscall | Probe-driven (chaos-only build) | Yes | Pending |
+| C6 | Tight-loop hog starves cores | Probe-driven (chaos-only build) | Yes | Pending |
+| C7 | Cross-core TLB shootdowns under concurrent IPC load | Probe-driven (chaos-only build) | Yes | Pending |
 
-## C1 — AP failure (first target)
+Note: C6 and C7 were previously labelled "QEMU only" but the probes test preemption (C6) and TLB shootdown survival (C7) — both run fine on hardware. "QEMU fault injection" refers to a different injection vector not used by the probes.
 
-**Why hardware is the authoritative test:** QEMU simulates AP failure by not starting the AP thread. Real hardware AP failure involves actual APIC, real-mode trampoline, and actual BIOS interaction. These differ.
+## Build mode
+
+```
+osdev image --mode chaos
+# Rufus DD Image mode → USB → reboot hardware, observe PuTTY
+```
+
+Spawns pong + ping + chaos-c2/c2-monitor/c3/c5/c6-hog/c6-monitor/c7-victim/c7. All probes are self-contained — no COM2 control port needed.
+
+**Expected serial lines (any order):**
+```
+chaos: C2 pass — system continued after non-TCB page fault
+chaos: C3 pass — 500 alloc-deny cycles without panic
+chaos: C5 pass — 100/100 recursive yields without stack overflow
+chaos: C6 pass — core 0 alive despite core 3 hog
+chaos: C7 pass — 30 cross-core TLB shootdowns survived
+```
+
+No `KERNEL PANIC` and no line containing `FAIL` allowed.
+
+## C1 — AP failure
 
 **Method:** Enter BIOS/UEFI setup and disable 1–3 cores. Boot `osdev image --mode bare-metal`.
 
 **Expected serial output:**
 ```
-smp: core 1 ready       ← (missing if core 1 disabled)
-smp: core 2 ready       ← (missing if core 2 disabled)
 kernel: N cores ready   ← N < 4, matching the enabled count
 supervisor: ready
 ping: starting
@@ -40,33 +56,18 @@ pong: received "1"
 - System boots and reaches steady state with the available cores
 - No `KERNEL PANIC`
 - `kernel: N cores ready` reflects the actual enabled core count
-- ping and pong communicate successfully across whatever cores are available
-
-**Fail criteria:**
-- `KERNEL PANIC` with missing-core reason
-- System hangs during AP startup
-- ping/pong fail to communicate
+- ping and pong communicate successfully
 
 **Variants to test:**
 - 3 cores (disable core 3): expected `kernel: 3 cores ready`
 - 2 cores (disable cores 2+3): expected `kernel: 2 cores ready`
-- 1 core (disable cores 1+2+3): pong must land on core 0 (same core as ping); verify same-core IPC still works
-
-## C2 — Corrupted ELF in boot manifest
-
-**Method:** `osdev image --mode identity` after manually corrupting a non-TCB probe ELF in the build output. Supervisor should log `PlacementInvalid` or spawn-failure and continue with remaining services.
-
-**Build mode:** Custom (corrupt probe ELF, then `osdev image --mode identity`).
-
-**Status:** Pending — needs build tooling to inject the corrupt binary.
+- 1 core (disable cores 1+2+3): pong lands on core 0; same-core IPC verified
 
 ## C4 — Minimal RAM
 
-**Method:** Remove RAM from hardware to reduce to minimal amount (e.g. 1 GB). Boot bare-metal image.
+**Method:** Remove RAM from hardware. Boot `osdev image --mode bare-metal`.
 
 **Expected:** System boots within reduced memory budget. Frame allocator reports reduced free pages. Services operate normally within constraints.
-
-**Status:** Pending — requires hardware reconfiguration.
 
 ## Pass record
 

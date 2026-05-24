@@ -23,7 +23,7 @@
 //!   osdev test adv-brutal   — run brutal adversarial tests BA1–BA10 (Milestone 20)
 //!   osdev test chaos        — run §22 chaos / graceful-degradation test suite (Milestone 14)
 //!   osdev test chaos-brutal — run brutal chaos tests BC1–BC7 (Milestone 21)
-//!   osdev image [--mode M]  — build + create bootable disk image (build/os.img); M=bare-metal|perf|perf-brutal|identity|stress|adv
+//!   osdev image [--mode M]  — build + create bootable disk image (build/os.img); M=bare-metal|perf|perf-brutal|identity|stress|adv|chaos
 
 mod disk_image;
 mod qemu;
@@ -77,6 +77,7 @@ enum Commands {
         /// identity    — identity-only probes (WatchSerial tests; WithRestart needs COM2)
         /// stress      — S1–S10 stress probes; self-contained, no harness required
         /// adv         — A1–A10 adversarial probes; self-contained, no harness required
+        /// chaos       — C2–C7 chaos probes; self-contained, no harness required (C1/C4 use bare-metal + HW reconfiguration)
         #[arg(long, default_value = "bare-metal")]
         mode: String,
     },
@@ -299,6 +300,45 @@ pub fn cmd_build_stress() {
     println!("build: kernel OK");
 }
 
+/// Like `cmd_build_adv` but uses `--features chaos-only` for a self-contained
+/// hardware chaos run (C2–C7). C1 and C4 use bare-metal + hardware reconfiguration.
+pub fn cmd_build_chaos() {
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe"];
+    for crate_name in &non_supervisor {
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--release", "-p", crate_name,
+                   "--target", "x86_64-unknown-none"])
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run cargo build for {}: {}", crate_name, e));
+        if !status.success() {
+            eprintln!("build: {} FAILED", crate_name);
+            std::process::exit(1);
+        }
+        println!("build: {} OK", crate_name);
+    }
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "supervisor",
+               "--target", "x86_64-unknown-none",
+               "--features", "supervisor/chaos-only"])
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run cargo build for supervisor: {}", e));
+    if !status.success() {
+        eprintln!("build: supervisor (chaos-only) FAILED");
+        std::process::exit(1);
+    }
+    println!("build: supervisor (chaos-only) OK");
+
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .status()
+        .expect("failed to run cargo build for kernel");
+    if !status.success() {
+        eprintln!("build: kernel FAILED");
+        std::process::exit(1);
+    }
+    println!("build: kernel OK");
+}
+
 /// Like `cmd_build_stress` but uses `--features adv-only` for a self-contained
 /// hardware adversarial run (A1–A10). All adversarial probes are self-contained —
 /// no QEMU control port required.
@@ -401,8 +441,9 @@ fn cmd_image(mode: &str) {
         "identity"    => cmd_build_identity(),
         "stress"      => cmd_build_stress(),
         "adv"         => cmd_build_adv(),
+        "chaos"       => cmd_build_chaos(),
         other => {
-            eprintln!("image: unknown --mode '{}'; valid: bare-metal, perf, perf-brutal, identity, stress, adv", other);
+            eprintln!("image: unknown --mode '{}'; valid: bare-metal, perf, perf-brutal, identity, stress, adv, chaos", other);
             std::process::exit(1);
         }
     }
