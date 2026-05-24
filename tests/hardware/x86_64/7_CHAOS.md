@@ -2,7 +2,7 @@
 
 Mirrors §22 Chaos Tests (C1–C7). Graceful degradation under partial failures on real silicon.
 
-**Status: 4/5 probe-driven PASS** (C2/C3/C5/C6); C7 backburner (Goldmont+ cross-core IPI); C1/C4 not testable on this hardware.
+**Status: Pending re-run** — placement bug fixed (preferred_core bypassed is_ready check); new image built. C7 backburner (Goldmont+). C1/C4 not testable on this hardware.
 
 ## Hardware applicability
 
@@ -11,7 +11,7 @@ Mirrors §22 Chaos Tests (C1–C7). Graceful degradation under partial failures 
 | C1 | One or more APs fail to come up | Disable cores in BIOS/UEFI | Not on this HW | Not testable — Wyse 5070 BIOS "multicore" setting only delays AP startup; APs always come up |
 | C2 | Corrupted ELF in boot manifest (non-TCB) | Probe-driven (chaos-only build) | Yes | PASS 2026-05-24 |
 | C3 | Allocator forced to return `AllocFailed` at random points | Probe-driven (chaos-only build) | Yes | PASS 2026-05-24 |
-| C4 | Degraded bootloader environment (minimal RAM) | Remove RAM sticks from hardware | Yes (RAM removal) | Pending (physical RAM removal) |
+| C4 | Degraded bootloader environment (minimal RAM) | Remove RAM sticks from hardware | Not meaningful | Skip — 2×4 GB config; removing one stick leaves 4 GB, far above minimum. C4 requires ≤256 MB to stress the frame allocator. |
 | C5 | Kernel stack near exhaustion under deep syscall | Probe-driven (chaos-only build) | Yes | PASS 2026-05-24 |
 | C6 | Tight-loop hog starves cores | Probe-driven (chaos-only build) | Yes | PASS 2026-05-24 |
 | C7 | Cross-core TLB shootdowns under concurrent IPC load | Probe-driven (chaos-only build) | Backburner | Hung — cross-core IPC between non-BSP cores hits Goldmont+ IPI quirk (same backburner as S3/S9) |
@@ -58,4 +58,4 @@ chaos: C6 pass — core 0 alive despite core 3 hog
 | 2026-05-24 | C2/C3/C5/C6 | chaos-only build | 4/4 PASS | Wyse 5070, J5005, 4 cores. |
 | 2026-05-24 | C7 | chaos-only build | Hung | Goldmont+ cross-core IPI backburner (cores 1→2 IPC stalls) |
 | 2026-05-24 | C1 | bare-metal + BIOS "multicore=1" | Not testable | APs still boot despite setting; QEMU `-smp 1` is authoritative |
-| — | C4 | bare-metal + 1×4 GB RAM | Pending | Physical RAM removal required |
+| — | C4 | bare-metal + minimal RAM | Skipped | 2×4 GB config; removing one stick still leaves 4 GB — not a meaningful stress test |

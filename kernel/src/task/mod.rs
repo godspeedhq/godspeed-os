@@ -2239,7 +2239,19 @@ pub fn spawn_service_by_name(name: &str, core_override: Option<u32>) -> Result<(
                 RR.fetch_add(1, Ordering::Relaxed) % count
             }
         }
-        None => cfg.preferred_core,
+        None => {
+            let p = cfg.preferred_core;
+            if crate::smp::core::is_ready(p) {
+                p
+            } else {
+                // Preferred core not available (degraded SMP); fall back to
+                // round-robin across ready cores so the probe still runs.
+                let count = crate::smp::core::ready_count() as u32;
+                use core::sync::atomic::{AtomicU32, Ordering};
+                static RR_FALLBACK: AtomicU32 = AtomicU32::new(0);
+                RR_FALLBACK.fetch_add(1, Ordering::Relaxed) % count.max(1)
+            }
+        }
     };
 
     let result = spawn_service_with_config(static_name, cfg.elf, core_id,
