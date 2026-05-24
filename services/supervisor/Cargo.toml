@@ -34,6 +34,15 @@ adv-only = []
 # C1 uses bare-metal + BIOS core disable; C4 uses bare-metal + RAM removal.
 # Used by `osdev image --mode chaos` for a self-contained hardware chaos run.
 chaos-only = []
+# Spawn only perf-b2 + perf-b2-echo (and pong/ping).
+# Isolation build: eliminates concurrent IPI noise from other benchmarks so
+# the cross-core blocking round-trip can complete without IPI contention.
+# Used by `osdev image --mode b2-only`.
+b2-only = []
+# Spawn only perf-bp2 + perf-bp2-echo (and pong/ping).
+# Brutal-isolation equivalent of b2-only at higher iteration count.
+# Used by `osdev image --mode bp2-only`.
+bp2-only = []
 
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }

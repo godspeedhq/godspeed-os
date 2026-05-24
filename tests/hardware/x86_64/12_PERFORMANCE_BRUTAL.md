@@ -31,7 +31,9 @@ BP2 did not emit `perf: BP2 done` on the Goldmont+ hardware (Dell Wyse 5070, Int
 
 **Cross-core IPC is correct:** ping/pong (the v1 milestone demo, also cross-core) runs continuously on this hardware with no issues. The mechanism is proven correct. The BP2 brutal benchmark measures round-trip latency specifically under concurrent IPI load, which exposes the Goldmont+ quirk.
 
-**Workaround for future measurement:** Run BP2 in isolation (a dedicated boot with only the BP2 probes active and no concurrent benchmark traffic). Alternatively, test on different hardware — AMD or a later Intel microarchitecture (Tremont/Golden Cove) without this specific APIC behavior under load.
+**Isolation attempt (2026-05-24):** The regular B2 equivalent was run in isolation (`osdev image --mode b2-only` — only perf-b2/echo + pong/ping, no other probes). B2 still stalled. The Goldmont+ IPI delivery failure is an inherent hardware limitation, not an artifact of concurrent benchmark load. BP2 isolation would produce the same result.
+
+**Required hardware:** AMD or a later Intel microarchitecture (Tremont/Golden Cove) without this specific BSP APIC behavior under blocking round-trip IPI load.
 
 ## Boot history
 

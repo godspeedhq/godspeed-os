@@ -339,6 +339,85 @@ pub fn cmd_build_chaos() {
     println!("build: kernel OK");
 }
 
+/// B2 isolation build: spawns only perf-b2 + perf-b2-echo alongside pong/ping.
+/// Eliminates concurrent IPI noise from other benchmarks (B5 spawn/kill, B6 restart)
+/// that triggers the Goldmont+ BSP IPI delivery quirk on the blocking round-trip.
+pub fn cmd_build_b2_only() {
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe"];
+    for crate_name in &non_supervisor {
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--release", "-p", crate_name,
+                   "--target", "x86_64-unknown-none"])
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run cargo build for {}: {}", crate_name, e));
+        if !status.success() {
+            eprintln!("build: {} FAILED", crate_name);
+            std::process::exit(1);
+        }
+        println!("build: {} OK", crate_name);
+    }
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "supervisor",
+               "--target", "x86_64-unknown-none",
+               "--features", "supervisor/b2-only"])
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run cargo build for supervisor: {}", e));
+    if !status.success() {
+        eprintln!("build: supervisor (b2-only) FAILED");
+        std::process::exit(1);
+    }
+    println!("build: supervisor (b2-only) OK");
+
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .status()
+        .expect("failed to run cargo build for kernel");
+    if !status.success() {
+        eprintln!("build: kernel FAILED");
+        std::process::exit(1);
+    }
+    println!("build: kernel OK");
+}
+
+/// BP2 brutal-isolation build: spawns only perf-bp2 + perf-bp2-echo alongside pong/ping.
+/// Brutal equivalent of b2-only — 1000-sample iteration count, same isolation rationale.
+pub fn cmd_build_bp2_only() {
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe"];
+    for crate_name in &non_supervisor {
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--release", "-p", crate_name,
+                   "--target", "x86_64-unknown-none"])
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run cargo build for {}: {}", crate_name, e));
+        if !status.success() {
+            eprintln!("build: {} FAILED", crate_name);
+            std::process::exit(1);
+        }
+        println!("build: {} OK", crate_name);
+    }
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "supervisor",
+               "--target", "x86_64-unknown-none",
+               "--features", "supervisor/bp2-only"])
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run cargo build for supervisor: {}", e));
+    if !status.success() {
+        eprintln!("build: supervisor (bp2-only) FAILED");
+        std::process::exit(1);
+    }
+    println!("build: supervisor (bp2-only) OK");
+
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .status()
+        .expect("failed to run cargo build for kernel");
+    if !status.success() {
+        eprintln!("build: kernel FAILED");
+        std::process::exit(1);
+    }
+    println!("build: kernel OK");
+}
+
 /// Like `cmd_build_stress` but uses `--features adv-only` for a self-contained
 /// hardware adversarial run (A1–A10). All adversarial probes are self-contained —
 /// no QEMU control port required.
@@ -442,8 +521,10 @@ fn cmd_image(mode: &str) {
         "stress"      => cmd_build_stress(),
         "adv"         => cmd_build_adv(),
         "chaos"       => cmd_build_chaos(),
+        "b2-only"     => cmd_build_b2_only(),
+        "bp2-only"    => cmd_build_bp2_only(),
         other => {
-            eprintln!("image: unknown --mode '{}'; valid: bare-metal, perf, perf-brutal, identity, stress, adv, chaos", other);
+            eprintln!("image: unknown --mode '{}'; valid: bare-metal, perf, perf-brutal, identity, stress, adv, chaos, b2-only, bp2-only", other);
             std::process::exit(1);
         }
     }
