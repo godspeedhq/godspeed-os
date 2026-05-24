@@ -198,6 +198,8 @@ pub unsafe fn init_local_apic() {
     // Vector 0xF0 (WAKE_RECEIVER) has priority class 0xF; if TPR = 0xF0 the APIC
     // silently discards it while the LVT timer still fires (LVT ignores TPR).
     // Explicitly zero TPR so all interrupt classes are accepted.
+    // SAFETY: apic_virt is mapped above via map_in_active_tables; APIC_TPR offset
+    // is within the 4 KiB APIC MMIO page established by that mapping.
     unsafe { write_apic(apic_virt, APIC_TPR, 0x00) };
 
     // Enable APIC software: set bit 8 of the spurious interrupt vector register.

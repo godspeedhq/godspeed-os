@@ -42,7 +42,7 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
 | arch/x86_64/ap_boot.rs | 3 | permitted |
-| arch/x86_64/boot.rs | 60 | permitted |
+| arch/x86_64/boot.rs | 61 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |
 | arch/x86_64/interrupts.rs | 10 | permitted |
 | arch/x86_64/mod.rs | 21 | permitted |
@@ -63,12 +63,12 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | main.rs | 2 | grandfathered |
 | syscall/dispatch.rs | 2 | grandfathered |
 | task/mod.rs | 7 | grandfathered |
-| task/scheduler.rs | 36 | grandfathered |
+| task/scheduler.rs | 37 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 217 lines across 17 files  
-**Grandfathered total:** 52 lines across 6 files  
-**Grand total:** 269 lines across 23 files
+**Permitted total:** 218 lines across 17 files  
+**Grandfathered total:** 53 lines across 6 files  
+**Grand total:** 271 lines across 23 files
 
 ---
 
@@ -99,6 +99,13 @@ and writes, paging init, and IPI delivery. All operations are sound because
 they target fixed hardware addresses verified against the Limine memory map, or
 operate on per-core structures indexed by a valid `core_id` bounded by
 `MAX_CORES`. APIC MMIO is mapped once before any AP comes up.
+
+One additional `unsafe {}` block (count +1): `write_apic(apic_virt, APIC_TPR, 0x00)`
+in `init_local_apic` — zeroes the Task Priority Register so all interrupt
+vector classes (including `WAKE_RECEIVER` at 0xF0) are accepted. Sound because
+`apic_virt` is established by the preceding `map_in_active_tables` call within
+the same function; `APIC_TPR` offset is within the mapped 4 KiB MMIO page.
+`// SAFETY:` comment present in source.
 
 ---
 
@@ -369,6 +376,16 @@ One remaining line in `for_each_active_cap` is still `unsafe`:
   happened-before this read. `CapTable` cannot be const-constructed so
   `MaybeUninit` is necessary; `assume_init_ref` is the unavoidable unsafe
   assertion that the slot is initialised.
+
+One additional `unsafe {}` block (count +1, net): `TASK_CORE` reads in
+`pick_next` — the wake-hint fast path (`TASK_CORE[hint]`) and the RR scan loop
+(`TASK_CORE[idx]`) both read this `static mut [u32; MAX_TASKS]` array. Sound
+because `TASK_CORE[slot]` is written exactly once at spawn and never modified
+thereafter (§9.1 static-placement invariant); all indices are bounded by
+`MAX_TASKS`; reads are unsynchronised but safe because the value is immutable
+after task spawn. Two new `unsafe` lines were added; one previously-unsafe
+access to a now-atomic variable was removed, yielding net +1.
+`// SAFETY:` comments present in source for both new blocks.
 
 Sound in aggregate: all arrays are indexed by slot or core_id with bounds
 checked at their call sites; ring3 switch is called only from the scheduler
