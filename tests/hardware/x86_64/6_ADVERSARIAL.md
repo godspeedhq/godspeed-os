@@ -4,7 +4,7 @@ Mirrors §22 Adversarial Tests (A1–A10). Capability isolation under direct att
 
 **Reference:** `tests/qemu/adversarial/CLAUDE.md` for full spec.
 
-**Status: Pending** — `adv-only` build mode ready; awaiting hardware run.
+**Status: 10/10 PASS** — 2026-05-24, Dell Wyse 5070 (Goldmont+, 4 cores).
 
 ## Hardware applicability
 
@@ -14,16 +14,16 @@ A7 (timing side-channel) is more meaningful on real hardware than on QEMU TCG be
 
 | ID | Attack | Status |
 |----|--------|--------|
-| A1 | Random u64 values used as caps (10000 iters) | Pending |
-| A2 | Brute-force endpoint IDs across u32 space | Pending |
-| A3 | Alloc beyond contract limit through every syscall path | Pending |
-| A4 | Use cap with rights not held (RECV cap as SEND) | Pending |
-| A5 | TOCTOU: race syscall with revocation | Pending |
-| A6 | Fill cap table to DoS kernel | Pending |
-| A7 | Detect IPC partner identity via timing | Pending |
-| A8 | Monopolize core via tight loop (preemption verified) | Pending |
-| A9 | Spawn service directly, bypassing supervisor | Pending |
-| A10 | Pass kernel addresses as syscall args | Pending |
+| A1 | Random u64 values used as caps (10000 iters) | PASS |
+| A2 | Brute-force endpoint IDs across u32 space | PASS |
+| A3 | Alloc beyond contract limit through every syscall path | PASS |
+| A4 | Use cap with rights not held (RECV cap as SEND) | PASS |
+| A5 | TOCTOU: race syscall with revocation | PASS |
+| A6 | Fill cap table to DoS kernel | PASS (filled 61 slots) |
+| A7 | Detect IPC partner identity via timing | PASS (mean 2931 cycles/try_send) |
+| A8 | Monopolize core via tight loop (preemption verified) | PASS |
+| A9 | Spawn service directly, bypassing supervisor | PASS |
+| A10 | Pass kernel addresses as syscall args | PASS |
 
 ## Build mode
 
@@ -54,4 +54,4 @@ No `KERNEL PANIC` and no line containing `FAIL` allowed.
 
 | Date | Completed | Notes |
 |------|-----------|-------|
-| — | — | No hardware adversarial runs yet |
+| 2026-05-24 | 10/10 | Dell Wyse 5070 (J5005, 4 cores). A5 required CAS fix in scheduler Running→Ready transitions (timer_tick_from_irq + yield_current). A7 timing mean 2931 cycles/try_send on hardware. |

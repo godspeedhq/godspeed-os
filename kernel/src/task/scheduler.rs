@@ -653,10 +653,17 @@ pub extern "C" fn timer_tick_from_irq() {
 
         let prev = CORE_CURRENT[cid].load(Ordering::Relaxed);
 
-        if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed)
-            && TaskState::from(TASK_STATE[prev].load(Ordering::Relaxed)) == TaskState::Running
-        {
-            TASK_STATE[prev].store(TaskState::Ready as u8, Ordering::Relaxed);
+        // CAS instead of store: if a cross-core kill wrote Dead between our
+        // load and this transition, the CAS fails and Dead is preserved.
+        // An unconditional store(Ready) would silently overwrite Dead, causing
+        // kill_task_by_slot's CORE_CURRENT spin-wait to never exit.
+        if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) {
+            let _ = TASK_STATE[prev].compare_exchange(
+                TaskState::Running as u8,
+                TaskState::Ready as u8,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
         }
 
         let next = match pick_next(cid) {
@@ -701,7 +708,15 @@ pub extern "C" fn timer_tick_from_irq() {
         };
 
         if next == prev {
-            TASK_STATE[prev].store(TaskState::Running as u8, Ordering::Relaxed);
+            // CAS: if kill wrote Dead between pick_next and here, preserve Dead.
+            // On CAS failure the next timer tick's is_dead branch will switch
+            // CORE_CURRENT to IDLE and release the kill spin-wait.
+            let _ = TASK_STATE[prev].compare_exchange(
+                TaskState::Ready as u8,
+                TaskState::Running as u8,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
             return;
         }
 
@@ -747,10 +762,14 @@ pub fn yield_current() {
     // SAFETY: IF=0.
     unsafe {
         let prev = CORE_CURRENT[cid].load(Ordering::Relaxed);
-        if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed)
-            && TaskState::from(TASK_STATE[prev].load(Ordering::Relaxed)) == TaskState::Running
-        {
-            TASK_STATE[prev].store(TaskState::Ready as u8, Ordering::Relaxed);
+        // CAS: preserve Dead if a cross-core kill races with this transition.
+        if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) {
+            let _ = TASK_STATE[prev].compare_exchange(
+                TaskState::Running as u8,
+                TaskState::Ready as u8,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
         }
 
         let next = match pick_next(cid) {
@@ -774,8 +793,17 @@ pub fn yield_current() {
                     switch_context(dead_ctx, sched_ctx);
                     // Unreachable: dead tasks are never rescheduled.
                 } else {
+                    // CAS: don't overwrite Dead if kill raced between is_dead
+                    // check and this restore.
                     if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) {
-                        TASK_STATE[prev].store(TaskState::Running as u8, Ordering::Relaxed);
+                        TASK_STATE[prev]
+                            .compare_exchange(
+                                TaskState::Ready as u8,
+                                TaskState::Running as u8,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            )
+                            .ok();
                     }
                     core::arch::asm!("sti", options(nostack, nomem));
                 }
@@ -784,7 +812,13 @@ pub fn yield_current() {
         };
 
         if next == prev {
-            TASK_STATE[prev].store(TaskState::Running as u8, Ordering::Relaxed);
+            // CAS: preserve Dead if kill raced between pick_next and here.
+            let _ = TASK_STATE[prev].compare_exchange(
+                TaskState::Ready as u8,
+                TaskState::Running as u8,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
             core::arch::asm!("sti", options(nostack, nomem));
             return;
         }
