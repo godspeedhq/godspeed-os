@@ -45,7 +45,7 @@ Open PuTTY, configure Session logging: **All session output**, append to `build/
 
 | File | Category | QEMU §22 | Hardware status |
 |------|----------|----------|-----------------|
-| `1_IDENTITY.md` | Identity | §22 (20/20 QEMU) | Partial — WatchSerial tests verifiable; WithRestart blocked (no COM2) |
+| `1_IDENTITY.md` | Identity | §22 (20/20 QEMU) | ✅ 13/13 WatchSerial (2026-05-24); WithRestart + IR1A/IR1B blocked (no COM2); WithBadTcb blocked |
 | `2_PROPERTY.md` | Property | P1–P10 | Pending |
 | `3_FUZZ.md` | Fuzz | F1–F8 | Pending |
 | `4_STRESS.md` | Stress | S1–S10 | 8/10 (S3/S9 Goldmont+ backburner); S6/S8 24h bare-metal soak pending |
