@@ -103,16 +103,18 @@ pub fn disable_interrupts() {
     unsafe { core::arch::asm!("cli", options(nostack, nomem)) }
 }
 
-/// Enable interrupts and halt until the next interrupt fires, then return.
+/// Enable interrupts and yield one spin-loop hint, then return.
 ///
-/// Used in the idle loop. Interrupts are re-disabled by the interrupt handler
-/// before this function's continuation executes.
+/// Used in the idle loop. On Goldmont+ (Apollo Lake / Gemini Lake), `hlt`
+/// triggers aggressive firmware C-state promotion that power-gates the local
+/// APIC, silencing both APIC timer ticks and cross-core IPIs.  Using `pause`
+/// instead keeps the core active, prevents C-state entry, and lets the
+/// scheduler loop spin-check for new work without missing wakeups.
 #[inline]
 pub fn wait_for_interrupt() {
-    // SAFETY: STI+HLT pair in idle loop; interrupts were previously disabled
-    // by the caller (scheduler). The processor atomically enables interrupts
-    // and halts, preventing a missed-wakeup race.
-    unsafe { core::arch::asm!("sti; hlt", options(nostack)) }
+    // SAFETY: STI enables interrupts; PAUSE is always safe in ring-0.
+    // The outer scheduler loop provides the retry; no HLT is needed.
+    unsafe { core::arch::asm!("sti; pause", options(nostack, nomem)) }
 }
 
 /// Signal End-Of-Interrupt to the local APIC so the interrupt line is re-armed.

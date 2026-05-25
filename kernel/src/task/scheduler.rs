@@ -692,12 +692,13 @@ pub fn run(core_id: u32) -> ! {
                 if cid == 0 {
                     crate::control::process_pending();
                 }
-                // No ready tasks for this core; sleep until the next interrupt.
-                // `wait_for_interrupt` atomically enables interrupts and halts;
-                // the next interrupt (timer or IPI) will wake the core.  The
-                // function is a memory clobber: after hlt returns the IPI handler
-                // will have written TASK_STATE; the compiler must not cache the
-                // previous None result across this boundary.
+                // No ready tasks for this core; yield one spin hint and loop.
+                // `wait_for_interrupt` enables interrupts and issues a PAUSE.
+                // The compiler_fence above this match forces a fresh reload of
+                // TASK_STATE on every iteration, so a wakeup written by another
+                // core is visible without an HLT.  HLT is intentionally avoided:
+                // on Goldmont+ it triggers firmware C-state promotion that
+                // power-gates the local APIC, silencing timer ticks and IPIs.
                 crate::arch::x86_64::wait_for_interrupt();
             }
         }
