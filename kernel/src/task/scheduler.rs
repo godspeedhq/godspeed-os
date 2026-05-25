@@ -718,6 +718,14 @@ pub extern "C" fn timer_tick_from_irq() {
     unsafe {
         crate::arch::x86_64::boot::apic_send_eoi();
 
+        // TSC-Deadline mode is one-shot: re-arm immediately after EOI.
+        // In periodic mode this is a no-op (TSC_DEADLINE_MODE stays false).
+        // SAFETY: IF=0; ring-0; TSC_DEADLINE_MODE=true implies TSC-Deadline
+        // was verified at init_local_apic time and TSC_TICKS_PER_QUANTUM > 0.
+        if crate::arch::x86_64::boot::TSC_DEADLINE_MODE.load(Ordering::Relaxed) {
+            crate::arch::x86_64::boot::rearm_tsc_deadline();
+        }
+
         // Poll the COM2 control channel on every core-0 timer tick (§17).
         // The idle branch can't be relied on when core 0 always has ready tasks.
         if cid == 0 {

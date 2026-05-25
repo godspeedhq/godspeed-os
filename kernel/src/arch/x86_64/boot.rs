@@ -1,5 +1,7 @@
 //! BSP/AP hardware initialisation — §11.1, §11.2.
 
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
 use super::BootInfo;
 
 const MAX_CORES: usize = crate::smp::core::MAX_CORES;
@@ -133,6 +135,19 @@ const APIC_LVT_TIMER:    u64 = 0x320;
 const APIC_TIMER_INIT:   u64 = 0x380;
 const APIC_TIMER_DIVIDE: u64 = 0x3E0;
 
+// TSC-Deadline timer MSR (IA32_TSC_DEADLINE).  Writing a 64-bit TSC value
+// here arms a one-shot timer that fires when RDTSC reaches that value.
+// The TSC runs in all C-states, so delivery is guaranteed even on Goldmont+
+// where the APIC counter is power-gated in deep package C-states.
+const MSR_IA32_TSC_DEADLINE: u32 = 0x6E0;
+
+/// Set by `init_local_apic` when TSC-Deadline mode is selected.
+/// Read by `timer_tick_from_irq` to decide whether to re-arm.
+pub static TSC_DEADLINE_MODE: AtomicBool = AtomicBool::new(false);
+
+/// TSC ticks per 10 ms quantum.  Set once during BSP boot; read by every core.
+static TSC_TICKS_PER_QUANTUM: AtomicU64 = AtomicU64::new(0);
+
 // ---------------------------------------------------------------------------
 // Public init surface.
 // ---------------------------------------------------------------------------
@@ -206,21 +221,149 @@ pub unsafe fn init_local_apic() {
     // Spurious vector = 0xFF (unused; interrupt gates handle real vectors).
     write_apic(apic_virt, APIC_SPURIOUS, 0x1FF);
 
-    // LVT timer: periodic mode (bit 17), vector 32 (0x20).
-    write_apic(apic_virt, APIC_LVT_TIMER, (1 << 17) | 0x20);
-
-    // Divide by 16.
-    write_apic(apic_virt, APIC_TIMER_DIVIDE, 0x03);
-
-    // Initial count → ~10 ms at a 1 GHz APIC bus / 16 divider (QEMU default).
-    // 1 GHz / 16 = 62.5 MHz; 62.5 MHz × 0.01 s = 625,000 ticks.
-    write_apic(apic_virt, APIC_TIMER_INIT, 625_000);
-
-    // Attempt to prevent Goldmont+ firmware from autonomously entering deep
-    // package C-states that power-gate the APIC.  Safe no-op if MSR is locked.
     // SAFETY: ring-0; called once per core; APIC is already initialised above.
     let lapic_id = unsafe { get_lapic_id() };
-    unsafe { limit_package_cstates(lapic_id) };
+
+    // Probe for TSC-Deadline timer support (CPUID.1.ECX[24]).
+    // On Goldmont+ (Wyse 5070 J5005), the periodic APIC timer is silenced when
+    // the firmware promotes the SoC package to PC6+ (APIC power-gated).  The
+    // TSC continues running in all C-states, so TSC-Deadline fires even then.
+    let tsc_deadline_supported = unsafe { cpuid_tsc_deadline_supported() };
+    let tsc_ticks = if tsc_deadline_supported {
+        // Compute from CPUID.0x15; returns 0 if frequency cannot be determined.
+        unsafe { compute_tsc_ticks_per_10ms(lapic_id) }
+    } else {
+        0
+    };
+
+    if tsc_ticks > 0 {
+        // TSC-Deadline mode: LVT bits[18:17] = 10b (mode 2), vector 0x20.
+        // No DIVIDE or INIT registers used in this mode.
+        write_apic(apic_virt, APIC_LVT_TIMER, (1 << 18) | 0x20);
+
+        // Store per-quantum tick count for re-arm in the timer ISR.
+        // Relaxed is fine: written once before APs start, read after.
+        TSC_TICKS_PER_QUANTUM.store(tsc_ticks, Ordering::Relaxed);
+        TSC_DEADLINE_MODE.store(true, Ordering::Relaxed);
+
+        // Arm the first deadline.
+        // SAFETY: TSC-Deadline MSR exists (CPUID confirmed); ring-0.
+        unsafe { arm_tsc_deadline_now(tsc_ticks) };
+        crate::kprintln!("apic: core {} TSC-Deadline timer ({} ticks/quantum)", lapic_id, tsc_ticks);
+    } else {
+        // Periodic mode: fires every ~10 ms regardless of C-states on supported HW.
+        // On QEMU (no TSC-Deadline in default cpu model) this is the normal path.
+        write_apic(apic_virt, APIC_LVT_TIMER, (1 << 17) | 0x20);
+        write_apic(apic_virt, APIC_TIMER_DIVIDE, 0x03);
+        // ~10 ms at 1 GHz APIC bus / 16 divider.
+        write_apic(apic_virt, APIC_TIMER_INIT, 625_000);
+        if tsc_deadline_supported {
+            crate::kprintln!("apic: core {} periodic timer (TSC freq unknown)", lapic_id);
+        }
+        // Attempt MSR C-state limit as a best-effort supplement (no-op if locked).
+        // SAFETY: ring-0; APIC initialised above.
+        unsafe { limit_package_cstates(lapic_id) };
+    }
+}
+
+/// Check CPUID leaf 1, ECX bit 24 for TSC-Deadline timer support.
+///
+/// # Safety
+/// Ring-0 only.
+unsafe fn cpuid_tsc_deadline_supported() -> bool {
+    // SAFETY: __cpuid(1) is universally safe on x86_64; CPUID.01H:ECX[24] =
+    // APIC TSC-Deadline timer support (Intel SDM Vol. 2A).
+    let result = unsafe { core::arch::x86_64::__cpuid(1) };
+    (result.ecx >> 24) & 1 != 0
+}
+
+/// Determine TSC ticks per 10 ms quantum using CPUID leaves 0x15 and 0x16.
+///
+/// Returns 0 if the TSC frequency cannot be reliably determined (caller falls
+/// back to periodic APIC timer mode).
+///
+/// Leaf 0x15 (TSC / Crystal Clock Ratio) on Goldmont+:
+///   EAX = denominator, EBX = numerator, ECX = crystal_hz (19 200 000 on J5005)
+///   tsc_hz = crystal_hz × EBX / EAX
+///
+/// Leaf 0x16 (Processor Frequency) fallback:
+///   EAX[15:0] = Core Base Frequency in MHz
+///   tsc_hz ≈ base_mhz × 1 000 000
+///
+/// # Safety
+/// Ring-0 only.  Called once during `init_local_apic`.
+unsafe fn compute_tsc_ticks_per_10ms(lapic_id: u32) -> u64 {
+    // SAFETY: __cpuid_count is safe on x86_64; leaf 0x15, sub-leaf 0.
+    let r15 = unsafe { core::arch::x86_64::__cpuid_count(0x15, 0) };
+    if r15.ecx != 0 && r15.ebx != 0 && r15.eax != 0 {
+        // tsc_hz = crystal_hz × numerator / denominator
+        let tsc_hz = (r15.ecx as u64) * (r15.ebx as u64) / (r15.eax as u64);
+        let ticks  = tsc_hz / 100; // 10 ms = tsc_hz / 100
+        crate::kprintln!(
+            "apic: core {} CPUID.0x15 crystal={}Hz ratio={}/{} tsc_hz={} ticks/10ms={}",
+            lapic_id, r15.ecx, r15.ebx, r15.eax, tsc_hz, ticks
+        );
+        return ticks;
+    }
+
+    // Fallback: CPUID.0x16 Base Frequency (MHz).
+    // SAFETY: __cpuid(0) returns max_leaf; always available.
+    let max_leaf = unsafe { core::arch::x86_64::__cpuid(0) }.eax;
+    if max_leaf >= 0x16 {
+        // SAFETY: leaf 0x16 exists per max_leaf check above.
+        let r16 = unsafe { core::arch::x86_64::__cpuid(0x16) };
+        let base_mhz = r16.eax & 0xFFFF;
+        if base_mhz > 0 {
+            let tsc_hz = base_mhz as u64 * 1_000_000;
+            let ticks  = tsc_hz / 100;
+            crate::kprintln!(
+                "apic: core {} CPUID.0x16 base={}MHz tsc_hz={} ticks/10ms={}",
+                lapic_id, base_mhz, tsc_hz, ticks
+            );
+            return ticks;
+        }
+    }
+
+    crate::kprintln!("apic: core {} TSC frequency unknown (CPUID.0x15 and 0x16 both zero)", lapic_id);
+    0
+}
+
+/// Write the TSC-Deadline MSR to fire `ticks` TSC counts from now.
+///
+/// # Safety
+/// Ring-0 only.  TSC-Deadline must be supported (CPUID.1.ECX[24]=1).
+#[inline]
+unsafe fn arm_tsc_deadline_now(ticks: u64) {
+    // SAFETY: _rdtsc() reads the processor TSC; always available on x86_64 ring-0.
+    let now      = unsafe { core::arch::x86_64::_rdtsc() };
+    let deadline = now.wrapping_add(ticks);
+    // SAFETY: MSR_IA32_TSC_DEADLINE (0x6E0) is writable in ring-0 when
+    // TSC-Deadline is supported; writing 0 disarms, non-zero arms one-shot.
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") MSR_IA32_TSC_DEADLINE,
+            in("eax") deadline as u32,
+            in("edx") (deadline >> 32) as u32,
+            options(nostack, nomem),
+        );
+    }
+}
+
+/// Re-arm the TSC-Deadline timer for the next ~10 ms quantum.
+///
+/// Called from the timer ISR (`timer_tick_from_irq`) immediately after EOI
+/// when `TSC_DEADLINE_MODE` is true.  TSC-Deadline is one-shot; the kernel
+/// must explicitly reload it after every tick.
+///
+/// # Safety
+/// Must be called from interrupt context (IF=0) in ring-0.
+/// Only valid when `TSC_DEADLINE_MODE` is `true`.
+#[inline]
+pub unsafe fn rearm_tsc_deadline() {
+    let ticks = TSC_TICKS_PER_QUANTUM.load(Ordering::Relaxed);
+    // SAFETY: delegated to arm_tsc_deadline_now — same preconditions.
+    unsafe { arm_tsc_deadline_now(ticks) };
 }
 
 /// Limit package C-states to PC1 to prevent APIC power-gate on Goldmont+.
