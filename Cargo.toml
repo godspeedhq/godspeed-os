@@ -14,6 +14,7 @@ members = [
     "examples/pong",
     "services/probe",
     "services/observe",
+    "services/shell",
 ]
 
 # kernel and all services/examples build for the bare-metal target;

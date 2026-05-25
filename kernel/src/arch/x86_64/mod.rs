@@ -319,6 +319,112 @@ pub fn com2_try_read_byte() -> Option<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// COM1 UART RX — interrupt-driven ring buffer for the shell service.
+// ---------------------------------------------------------------------------
+
+const COM1_RX_BUF_SIZE: usize = 64;
+
+/// Single-producer (IRQ handler) / single-consumer (ConsoleRead syscall) ring buffer.
+/// head = read index (consumer advances), tail = write index (producer advances).
+/// Buffer is full when (tail - head) == COM1_RX_BUF_SIZE.
+// SAFETY: Access is synchronised by the SPSC protocol: the producer (IRQ handler)
+// only writes to indices [tail, next_tail) and the consumer only reads from [head, head+1).
+// The atomic head/tail ensure visibility across cores via Release/Acquire ordering.
+static mut COM1_RX_BUF: [u8; COM1_RX_BUF_SIZE] = [0u8; COM1_RX_BUF_SIZE];
+static COM1_RX_HEAD: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static COM1_RX_TAIL: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Task slot waiting for a console byte (u32::MAX = nobody blocked).
+pub static CONSOLE_READ_WAITER: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Enable COM1 RX interrupts (call once after com2_init, from kernel main).
+///
+/// # Safety
+/// Must be called after serial_init and after the IDT is loaded with vector 36.
+pub unsafe fn uart_rx_enable() {
+    // Unmask IRQ 4 (COM1) on the master PIC.  mask_pic() left OCW1 = 0xFF.
+    // Clearing bit 4 enables IRQ 4; all other IRQs remain masked.
+    // SAFETY: PIC port I/O; must run after mask_pic() sets OCW1=0xFF.
+    unsafe {
+        let mask = inb(0x21);
+        outb(0x21, mask & 0xEF); // clear bit 4 (IRQ 4 = COM1)
+        outb(COM1 + 1, 0x01);    // IER: enable RX data available interrupt
+    }
+}
+
+/// Push a byte into the COM1 RX ring buffer (called from IRQ handler).
+///
+/// # Safety
+/// Must be called only from the IRQ handler (single producer).
+pub unsafe fn uart_rx_push(b: u8) {
+    use core::sync::atomic::Ordering;
+    let tail = COM1_RX_TAIL.load(Ordering::Relaxed);
+    let head = COM1_RX_HEAD.load(Ordering::Acquire);
+    let next_tail = (tail + 1) % COM1_RX_BUF_SIZE;
+    if next_tail == head {
+        return; // buffer full — drop byte
+    }
+    // SAFETY: tail index is within COM1_RX_BUF bounds; only this producer writes to it.
+    unsafe { COM1_RX_BUF[tail] = b; }
+    COM1_RX_TAIL.store(next_tail, Ordering::Release);
+}
+
+/// Pop one byte from the COM1 RX ring buffer (called from ConsoleRead syscall).
+///
+/// Returns `None` if the buffer is empty.
+pub fn uart_rx_pop() -> Option<u8> {
+    use core::sync::atomic::Ordering;
+    let head = COM1_RX_HEAD.load(Ordering::Relaxed);
+    let tail = COM1_RX_TAIL.load(Ordering::Acquire);
+    if head == tail {
+        return None;
+    }
+    // SAFETY: head index is within COM1_RX_BUF bounds; only the consumer reads here.
+    let b = unsafe { COM1_RX_BUF[head] };
+    COM1_RX_HEAD.store((head + 1) % COM1_RX_BUF_SIZE, Ordering::Release);
+    Some(b)
+}
+
+/// Poll COM1 RX and wake any task blocked in ConsoleRead.
+///
+/// Called from the core-0 timer ISR every 10 ms.
+/// Replaces IRQ-driven reception — the legacy PIC (IRQ 4) is fully masked;
+/// APIC-only kernels must poll the UART LSR instead.
+pub fn uart_rx_poll() {
+    use core::sync::atomic::Ordering;
+    // SAFETY: called from timer ISR with IF=0; uart_rx_drain_fifo is safe
+    // to call here because: (a) timer ISR is IF=0 so no re-entrancy, and
+    // (b) this is the only producer path (uart_rx_isr_stub is dead code
+    // since IRQ 4 is masked).
+    unsafe { uart_rx_drain_fifo(); }
+    let head = COM1_RX_HEAD.load(Ordering::Acquire);
+    let tail = COM1_RX_TAIL.load(Ordering::Acquire);
+    if head != tail {
+        let waiter = CONSOLE_READ_WAITER.load(Ordering::Acquire);
+        if waiter != u32::MAX {
+            crate::task::scheduler::wake_by_slot(waiter as usize, 0);
+        }
+    }
+}
+
+/// Drain all available COM1 RX bytes into the ring buffer (called from IRQ).
+///
+/// # Safety
+/// Must be called only from the IRQ handler with IF=0.
+pub unsafe fn uart_rx_drain_fifo() {
+    // SAFETY: port I/O to COM1; called from ISR with interrupts disabled.
+    unsafe {
+        while inb(COM1 + 5) & 0x01 != 0 {
+            let b = inb(COM1);
+            uart_rx_push(b);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Port I/O helpers.
 // ---------------------------------------------------------------------------
 

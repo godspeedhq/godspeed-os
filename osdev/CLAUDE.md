@@ -25,7 +25,9 @@ Host-side developer CLI (§17). Builds for the developer's machine, not the kern
 | `osdev test adv-brutal`     | Run brutal adversarial tests (BA1–BA10) ✅ 10/10 |
 | `osdev test chaos`          | Run chaos / partial-failure tests (C1–C7) ✅ 7/7 |
 | `osdev test chaos-brutal`   | Run brutal chaos tests (BC1–BC7) ✅ 7/7 |
+| `osdev test shell`          | Scripted shell smoke-test: boot, help, cores, status, unknown |
 | `osdev validate`            | Validate all contracts against the JSON schema |
+| `osdev shell [--smp N]`     | Boot in QEMU with the interactive shell on stdin/stdout (bare-metal build — no probe services; type `help` at `gs>` prompt; Ctrl-A X to quit) |
 | `osdev image`               | Build with `bare-metal` supervisor + create UEFI-bootable `build/os.img` (GPT + ESP + BOOTX64.EFI) |
 | `osdev image --mode perf`   | Same image, `perf-only` supervisor (B1–B10 probes) |
 | `osdev image --mode perf-brutal` | Same image, `perf-brutal-only` supervisor (BP1–BP10 probes) |

@@ -77,6 +77,72 @@ pub unsafe extern "C" fn timer_isr_stub() {
 }
 
 // ---------------------------------------------------------------------------
+// UART RX ISR (vector 36 = PIC offset 32 + IRQ 4) — COM1 console input.
+// ---------------------------------------------------------------------------
+
+/// Naked ISR stub for COM1 UART RX (IRQ 4, vector 36).
+///
+/// Structure mirrors `timer_isr_stub`: conditional swapgs, save caller-saved
+/// registers, call handler, restore, conditional swapgs, iretq.
+/// No context switch occurs here — we just drain the FIFO, push to the ring
+/// buffer, and optionally wake a blocked ConsoleRead syscall.
+#[no_mangle]
+#[unsafe(naked)]
+pub unsafe extern "C" fn uart_rx_isr_stub() {
+    // SAFETY: raw interrupt entry; all register saves are explicit.
+    core::arch::naked_asm!(
+        "test byte ptr [rsp + 8], 3",
+        "jz 1f",
+        "swapgs",
+        "1:",
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rdi",
+        "push rsi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "call uart_rx_irq_handler",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rsi",
+        "pop rdi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "test byte ptr [rsp + 8], 3",
+        "jz 2f",
+        "swapgs",
+        "2:",
+        "iretq",
+    )
+}
+
+/// COM1 UART RX IRQ handler — drains FIFO, wakes blocked ConsoleRead task.
+///
+/// # Safety
+/// Called from raw interrupt context (IF=0).
+#[no_mangle]
+unsafe extern "C" fn uart_rx_irq_handler() {
+    use core::sync::atomic::Ordering;
+    // SAFETY: called from ISR with IF=0; uart_rx_drain_fifo reads COM1 FIFO.
+    unsafe { crate::arch::x86_64::uart_rx_drain_fifo(); }
+
+    // Wake any task blocked on ConsoleRead.
+    let waiter = crate::arch::x86_64::CONSOLE_READ_WAITER.load(Ordering::Acquire);
+    if waiter != u32::MAX {
+        crate::task::scheduler::wake_by_slot(waiter as usize, 0);
+    }
+
+    // EOI to local APIC.
+    send_eoi();
+}
+
+// ---------------------------------------------------------------------------
 // Dispatch helpers.
 // ---------------------------------------------------------------------------
 

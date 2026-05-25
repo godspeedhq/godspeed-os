@@ -1,0 +1,249 @@
+#![no_std]
+#![no_main]
+
+use godspeed_sdk::ServiceContext;
+
+const MAX_LINE: usize = 128;
+const MAX_ARGS: usize = 4;
+
+// Entry point called by the kernel after spawning this service.
+// ctx.log() appends a newline; the Windows terminal line-buffers input and
+// echoes characters locally, so we just accumulate bytes until \r or \n.
+#[no_mangle]
+pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
+    ctx.log("shell: ready (type 'help')");
+    ctx.log("gs>");
+
+    let mut line_buf = [0u8; MAX_LINE];
+    let mut line_len = 0usize;
+
+    loop {
+        let b = ctx.console_read();
+
+        match b {
+            b'\r' | b'\n' => {
+                if line_len > 0 {
+                    execute(&ctx, &line_buf[..line_len]);
+                    line_len = 0;
+                }
+                ctx.log("gs>");
+            }
+            0x7f | 0x08 => {
+                // backspace — remove last byte
+                if line_len > 0 { line_len -= 1; }
+            }
+            0x03 => {
+                // Ctrl-C — clear line
+                ctx.log("^C");
+                line_len = 0;
+                ctx.log("gs>");
+            }
+            b if b >= 0x20 && b < 0x7f => {
+                if line_len < MAX_LINE {
+                    line_buf[line_len] = b;
+                    line_len += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn execute(ctx: &ServiceContext, line: &[u8]) {
+    let Ok(s) = core::str::from_utf8(line) else {
+        ctx.log("shell: invalid input");
+        return;
+    };
+    let s = s.trim();
+    if s.is_empty() { return; }
+
+    let mut args = [""; MAX_ARGS];
+    let mut argc = 0usize;
+    for word in s.split_ascii_whitespace() {
+        if argc >= MAX_ARGS { break; }
+        args[argc] = word;
+        argc += 1;
+    }
+    if argc == 0 { return; }
+
+    match args[0] {
+        "help"    => cmd_help(ctx),
+        "cores"   => cmd_cores(ctx),
+        "status"  => cmd_status(ctx),
+        "spawn"   => {
+            if argc < 2 { ctx.log("usage: spawn <name>"); }
+            else { cmd_spawn(ctx, args[1]); }
+        }
+        "kill"    => {
+            if argc < 2 { ctx.log("usage: kill <name>"); }
+            else { cmd_kill(ctx, args[1]); }
+        }
+        "restart" => {
+            if argc < 2 { ctx.log("usage: restart <name> [core]"); }
+            else {
+                let core = if argc >= 3 { parse_u32(args[2]) } else { None };
+                cmd_restart(ctx, args[1], core);
+            }
+        }
+        other => {
+            // Build "unknown: <cmd>" in a stack buffer to avoid two ctx.log calls
+            let mut buf = [0u8; 64];
+            let mut pos = 0usize;
+            write_bytes(&mut buf, &mut pos, b"unknown: ");
+            write_bytes(&mut buf, &mut pos, other.as_bytes());
+            ctx.log(core::str::from_utf8(&buf[..pos]).unwrap_or("unknown cmd"));
+        }
+    }
+}
+
+fn cmd_help(ctx: &ServiceContext) {
+    ctx.log("GodspeedOS shell commands:");
+    ctx.log("  help                   show this message");
+    ctx.log("  cores                  show core count");
+    ctx.log("  status                 list all live tasks");
+    ctx.log("  spawn <name>           spawn a service");
+    ctx.log("  kill <name>            kill a service");
+    ctx.log("  restart <name> [core]  restart a service");
+}
+
+fn cmd_cores(ctx: &ServiceContext) {
+    let n = ctx.inspect_core_count();
+    let mut buf = [0u8; 32];
+    let mut pos = 0usize;
+    write_bytes(&mut buf, &mut pos, b"cores: ");
+    write_u32(&mut buf, &mut pos, n);
+    ctx.log(core::str::from_utf8(&buf[..pos]).unwrap_or("?"));
+}
+
+fn cmd_status(ctx: &ServiceContext) {
+    ctx.log("SLOT  NAME               CORE STATE");
+    let mut found = false;
+    for slot in 0u32..256 {
+        let stat = ctx.task_stat(slot);
+        if !stat.valid { continue; }
+        found = true;
+        let mut buf = [b' '; 80];
+        let mut pos = 0usize;
+        // slot (4)
+        write_u32_padded(&mut buf, &mut pos, slot, 4);
+        buf[pos] = b' '; buf[pos+1] = b' '; pos += 2;
+        // name (18)
+        let name_bytes = &stat.name[..stat.name_len.min(18)];
+        write_bytes(&mut buf, &mut pos, name_bytes);
+        while pos < 22 { buf[pos] = b' '; pos += 1; }
+        // core (4)
+        write_u32_padded(&mut buf, &mut pos, stat.core as u32, 4);
+        buf[pos] = b' '; pos += 1;
+        // state
+        let st = stat.state_str().as_bytes();
+        write_bytes(&mut buf, &mut pos, st);
+        ctx.log(core::str::from_utf8(&buf[..pos]).unwrap_or("?"));
+    }
+    if !found { ctx.log("  (no live tasks)"); }
+}
+
+fn cmd_spawn(ctx: &ServiceContext, name: &str) {
+    match ctx.spawn(name) {
+        Ok(()) => {
+            let mut buf = [0u8; 64];
+            let mut pos = 0usize;
+            write_bytes(&mut buf, &mut pos, b"spawned: ");
+            write_bytes(&mut buf, &mut pos, name.as_bytes());
+            ctx.log(core::str::from_utf8(&buf[..pos]).unwrap_or("spawned"));
+        }
+        Err(_) => {
+            let mut buf = [0u8; 64];
+            let mut pos = 0usize;
+            write_bytes(&mut buf, &mut pos, b"spawn failed: ");
+            write_bytes(&mut buf, &mut pos, name.as_bytes());
+            ctx.log(core::str::from_utf8(&buf[..pos]).unwrap_or("spawn failed"));
+        }
+    }
+}
+
+fn cmd_kill(ctx: &ServiceContext, name: &str) {
+    match ctx.kill(name) {
+        Ok(()) => {
+            let mut buf = [0u8; 64];
+            let mut pos = 0usize;
+            write_bytes(&mut buf, &mut pos, b"killed: ");
+            write_bytes(&mut buf, &mut pos, name.as_bytes());
+            ctx.log(core::str::from_utf8(&buf[..pos]).unwrap_or("killed"));
+        }
+        Err(_) => {
+            let mut buf = [0u8; 64];
+            let mut pos = 0usize;
+            write_bytes(&mut buf, &mut pos, b"kill failed: ");
+            write_bytes(&mut buf, &mut pos, name.as_bytes());
+            ctx.log(core::str::from_utf8(&buf[..pos]).unwrap_or("kill failed"));
+        }
+    }
+}
+
+fn cmd_restart(ctx: &ServiceContext, name: &str, core: Option<u32>) {
+    match ctx.restart(name, core) {
+        Ok(()) => {
+            let mut buf = [0u8; 64];
+            let mut pos = 0usize;
+            write_bytes(&mut buf, &mut pos, b"restarted: ");
+            write_bytes(&mut buf, &mut pos, name.as_bytes());
+            ctx.log(core::str::from_utf8(&buf[..pos]).unwrap_or("restarted"));
+        }
+        Err(_) => {
+            let mut buf = [0u8; 64];
+            let mut pos = 0usize;
+            write_bytes(&mut buf, &mut pos, b"restart failed: ");
+            write_bytes(&mut buf, &mut pos, name.as_bytes());
+            ctx.log(core::str::from_utf8(&buf[..pos]).unwrap_or("restart failed"));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers — no-alloc string building into stack buffers.
+// ---------------------------------------------------------------------------
+
+fn write_bytes(buf: &mut [u8], pos: &mut usize, src: &[u8]) {
+    let space = buf.len().saturating_sub(*pos);
+    let n = src.len().min(space);
+    buf[*pos..*pos + n].copy_from_slice(&src[..n]);
+    *pos += n;
+}
+
+fn write_u32(buf: &mut [u8], pos: &mut usize, n: u32) {
+    let mut tmp = [0u8; 10];
+    let s = u32_to_str(n, &mut tmp);
+    write_bytes(buf, pos, s.as_bytes());
+}
+
+fn write_u32_padded(buf: &mut [u8], pos: &mut usize, n: u32, width: usize) {
+    let mut tmp = [0u8; 10];
+    let s = u32_to_str(n, &mut tmp);
+    let pad = width.saturating_sub(s.len());
+    for _ in 0..pad { if *pos < buf.len() { buf[*pos] = b' '; *pos += 1; } }
+    write_bytes(buf, pos, s.as_bytes());
+}
+
+fn u32_to_str(n: u32, buf: &mut [u8; 10]) -> &str {
+    if n == 0 {
+        buf[0] = b'0';
+        return core::str::from_utf8(&buf[..1]).unwrap_or("0");
+    }
+    let mut i = 10usize;
+    let mut v = n;
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    core::str::from_utf8(&buf[i..]).unwrap_or("?")
+}
+
+fn parse_u32(s: &str) -> Option<u32> {
+    let mut n = 0u32;
+    for b in s.bytes() {
+        if b < b'0' || b > b'9' { return None; }
+        n = n.checked_mul(10)?.checked_add((b - b'0') as u32)?;
+    }
+    Some(n)
+}

@@ -246,10 +246,19 @@ pub unsafe fn init_local_apic() {
         TSC_TICKS_PER_QUANTUM.store(tsc_ticks, Ordering::Relaxed);
         TSC_DEADLINE_MODE.store(true, Ordering::Relaxed);
 
-        // Arm the first deadline.
-        // SAFETY: TSC-Deadline MSR exists (CPUID confirmed); ring-0.
-        unsafe { arm_tsc_deadline_now(tsc_ticks) };
+        // First deadline arm is deferred to scheduler::run(), after
+        // CORE_SCHED_CTX[cid].cr3 is seeded.  Arming here would risk the
+        // timer firing before the scheduler context is initialised, causing
+        // switch_context to load cr3=0 and triple-fault silently.
         crate::kprintln!("apic: core {} TSC-Deadline timer ({} ticks/quantum)", lapic_id, tsc_ticks);
+
+        // TSC-Deadline mode still needs the package C-state limit.
+        // Without it the firmware can promote the package to PC6+ between
+        // timer deadlines, power-gating the APIC and silently dropping the
+        // next TSC-Deadline interrupt.  Limiting to PC1 keeps the APIC
+        // powered across all C-states the OS sees.
+        // SAFETY: ring-0; APIC initialised above.
+        unsafe { limit_package_cstates(lapic_id) };
     } else {
         // Periodic mode: fires every ~10 ms regardless of C-states on supported HW.
         // On QEMU (no TSC-Deadline in default cpu model) this is the normal path.
@@ -260,7 +269,6 @@ pub unsafe fn init_local_apic() {
         if tsc_deadline_supported {
             crate::kprintln!("apic: core {} periodic timer (TSC freq unknown)", lapic_id);
         }
-        // Attempt MSR C-state limit as a best-effort supplement (no-op if locked).
         // SAFETY: ring-0; APIC initialised above.
         unsafe { limit_package_cstates(lapic_id) };
     }
@@ -337,6 +345,12 @@ unsafe fn arm_tsc_deadline_now(ticks: u64) {
     // SAFETY: _rdtsc() reads the processor TSC; always available on x86_64 ring-0.
     let now      = unsafe { core::arch::x86_64::_rdtsc() };
     let deadline = now.wrapping_add(ticks);
+    // Intel SDM Vol. 3A §10.5.4.2: MFENCE is required before every WRMSR to
+    // IA32_TSC_DEADLINE.  Without it, Goldmont+'s out-of-order store buffers
+    // can commit the WRMSR before a preceding LVT write is visible to APIC
+    // hardware, causing the ISR to fire with stale LVT state.
+    // SAFETY: MFENCE is a full memory barrier; always valid in ring-0.
+    unsafe { core::arch::asm!("mfence", options(nostack)) };
     // SAFETY: MSR_IA32_TSC_DEADLINE (0x6E0) is writable in ring-0 when
     // TSC-Deadline is supported; writing 0 disarms, non-zero arms one-shot.
     unsafe {
@@ -800,6 +814,7 @@ pub(super) unsafe fn init_idt() {
         IDT[13]   = IdtEntry::new(gpf_stub  as u64);
         IDT[14]   = IdtEntry::new(pf_stub   as u64);
         IDT[32]   = IdtEntry::new(timer);
+        IDT[36]   = IdtEntry::new(super::interrupts::uart_rx_isr_stub as u64); // IRQ 4 = COM1 RX
         IDT[0xF0] = IdtEntry::new(ipi_wake_stub   as u64);
         IDT[0xF1] = IdtEntry::new(ipi_tlb_stub    as u64);
         IDT[0xF2] = IdtEntry::new(ipi_tick_stub   as u64);
@@ -1033,13 +1048,63 @@ unsafe extern "C" fn pf_handler(error_code: u64, fault_rip: u64, hw_user_rsp: u6
 
 // ---------------------------------------------------------------------------
 // Exception stub — all unhandled vectors point here.
+//
+// Reads the top four stack words and passes them to exception_halt_handler,
+// which prints them over lock-free serial before halting.  This converts
+// every silent freeze into a labelled failure (constitutional invariant 12).
+//
+// Stack layout on entry:
+//   No error code: [RSP+0]=RIP  [RSP+8]=CS  [RSP+16]=RFLAGS  [RSP+24]=RSP
+//   Error code:    [RSP+0]=err  [RSP+8]=RIP [RSP+16]=CS      [RSP+24]=RFLAGS
+// The CS value (0x08=kernel, 0x28=user) identifies which layout applies.
 // ---------------------------------------------------------------------------
 
 #[unsafe(naked)]
 unsafe extern "C" fn exception_halt() -> ! {
     core::arch::naked_asm!(
         "cli",
+        "mov rdi, [rsp]",
+        "mov rsi, [rsp + 8]",
+        "mov rdx, [rsp + 16]",
+        "mov rcx, [rsp + 24]",
+        "call exception_halt_handler",
         "2: hlt",
         "jmp 2b",
     )
+}
+
+/// Print the four frame words over lock-free serial, then return to the
+/// `hlt` loop in the naked stub above.
+///
+/// # Safety
+/// Called from raw exception context (IF=0, ring-0).  Uses only lock-free
+/// serial helpers to avoid deadlocking on LOG_LOCK if the exception fired
+/// inside a `kprintln!`.
+#[no_mangle]
+unsafe extern "C" fn exception_halt_handler(w0: u64, w1: u64, w2: u64, w3: u64) {
+    // Identify the likely frame layout by finding the CS slot.
+    // CS is zero-extended to 64 bits on the stack: 0x08 (kernel) or 0x28 (user).
+    unsafe {
+        serial_puts_nolck(b"\nEXCEPTION: [");
+        serial_hex64_nolck(w0);
+        serial_puts_nolck(b"] [");
+        serial_hex64_nolck(w1);
+        serial_puts_nolck(b"] [");
+        serial_hex64_nolck(w2);
+        serial_puts_nolck(b"] [");
+        serial_hex64_nolck(w3);
+        serial_puts_nolck(b"]");
+        if w1 == 0x08 || w1 == 0x28 {
+            // No error code pushed: w0=RIP, w1=CS
+            serial_puts_nolck(b" RIP=");
+            serial_hex64_nolck(w0);
+        } else if w2 == 0x08 || w2 == 0x28 {
+            // Error code pushed by CPU: w0=errcode, w1=RIP, w2=CS
+            serial_puts_nolck(b" errcode=");
+            serial_hex64_nolck(w0);
+            serial_puts_nolck(b" RIP=");
+            serial_hex64_nolck(w1);
+        }
+        serial_puts_nolck(b"\n");
+    }
 }

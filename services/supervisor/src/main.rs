@@ -21,13 +21,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Skipped in idle-only builds (S8): no active workload by design.
     #[cfg(not(feature = "idle-only"))]
     {
+        ctx.log("supervisor: spawning pong...");
         if ctx.spawn_on("pong", 1).is_err() {
             ctx.log("supervisor: WARN: failed to spawn pong on core 1, trying core 0");
             let _ = ctx.spawn_on("pong", 0);
         }
+        ctx.log("supervisor: spawning ping...");
         if ctx.spawn_on("ping", 0).is_err() {
             ctx.log("supervisor: WARN: failed to spawn ping");
         }
+        ctx.log("supervisor: pong+ping done");
     }
 
     // Identity probe services are harness-driven (QEMU control port sends kill
@@ -79,6 +82,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "adv-only", feature = "chaos-only",
                   feature = "b2-only", feature = "bp2-only")))]
     let _ = ctx.spawn("observe");
+
+    // shell: spawn alongside observe in bare-metal + full builds only.
+    // Excluded from test-specific builds for the same reasons as observe.
+    #[cfg(not(any(feature = "identity-only", feature = "perf-only",
+                  feature = "perf-brutal-only", feature = "stress-only",
+                  feature = "adv-only", feature = "chaos-only",
+                  feature = "b2-only", feature = "bp2-only")))]
+    let _ = ctx.spawn("shell");
 
     ctx.log("supervisor: ready");
 

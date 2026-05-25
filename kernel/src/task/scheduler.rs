@@ -655,6 +655,17 @@ pub fn run(core_id: u32) -> ! {
         CORE_SCHED_CTX[cid].cr3 = cr3;
     }
 
+    // Arm the TSC-Deadline timer now that cr3 is seeded.  The arm was deferred
+    // from init_local_apic to here so that any timer ISR firing after this point
+    // will find a valid CORE_SCHED_CTX[cid].cr3 and can safely call pick_next
+    // → switch_context without loading a garbage page table.
+    if crate::arch::x86_64::boot::TSC_DEADLINE_MODE.load(Ordering::Relaxed) {
+        // SAFETY: ring-0; TSC-Deadline was confirmed in init_local_apic
+        // (TSC_DEADLINE_MODE=true implies CPUID check passed and
+        // TSC_TICKS_PER_QUANTUM > 0); cr3 seeded above.
+        unsafe { crate::arch::x86_64::boot::rearm_tsc_deadline() };
+    }
+
     loop {
         // Free any deferred kstack from a prior self-kill on this core.
         // RSP is on CORE_SCHED_CTX's stack (per-core BSS), not any kstack.
@@ -726,10 +737,12 @@ pub extern "C" fn timer_tick_from_irq() {
             crate::arch::x86_64::boot::rearm_tsc_deadline();
         }
 
-        // Poll the COM2 control channel on every core-0 timer tick (§17).
-        // The idle branch can't be relied on when core 0 always has ready tasks.
+        // Poll the COM2 control channel and COM1 UART RX on every core-0 timer
+        // tick (§17).  The idle branch can't be relied on when core 0 always
+        // has ready tasks.  COM1 polling replaces IRQ 4 (fully masked by PIC).
         if cid == 0 {
             crate::control::process_pending();
+            crate::arch::x86_64::uart_rx_poll();
         }
 
         let prev = CORE_CURRENT[cid].load(Ordering::Relaxed);

@@ -1,0 +1,241 @@
+//! Scripted smoke-test for `osdev test shell`.
+//!
+//! Boots the OS (bare-metal mode: pong + ping + observe + shell, no probes)
+//! and communicates with the shell service over a TCP serial port.
+//!
+//! QEMU is launched with `-serial tcp::PORT,server` (no `nowait`): QEMU
+//! waits until this test connects before starting execution, guaranteeing
+//! every byte of serial output is captured.  COM2 is unused in this test.
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::path::Path;
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// TCP port for COM1 in the shell test.
+/// Matches nothing else in the codebase (5555 = COM2 control channel).
+const SHELL_PORT: u16 = 5556;
+
+pub fn run(image_path: &Path, smp: u32) {
+    println!("shell-test: booting OS (smp={smp}) — scripted mode");
+
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-smp",     &smp.to_string(),
+        "-m",       "512M",
+        // COM1 → TCP server; QEMU waits for a client before booting so we
+        // never miss output that was written before we connected.
+        "-serial",  &format!("tcp::{SHELL_PORT},server"),
+        "-serial",  "null",   // COM2 unused
+        "-display", "none",
+        "-no-reboot",
+        "-no-shutdown",
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| {
+        eprintln!("shell-test: QEMU launch failed at {qemu}: {e}");
+        std::process::exit(1);
+    });
+
+    // Connect to QEMU's serial server; this triggers QEMU to begin booting.
+    let stream = match retry_tcp_connect(SHELL_PORT, Duration::from_secs(10)) {
+        Some(s) => s,
+        None    => {
+            eprintln!("shell-test: could not connect to QEMU serial port {SHELL_PORT}");
+            child.kill().ok();
+            std::process::exit(1);
+        }
+    };
+
+    let mut read_half  = stream.try_clone().expect("clone tcp stream for reading");
+    let mut write_half = stream;
+
+    // Background thread streams all bytes into a shared buffer.
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop {
+                match read_half.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n)          => buf2.lock().unwrap().extend_from_slice(&tmp[..n]),
+                }
+            }
+        });
+    }
+
+    let mut pass   = 0usize;
+    let mut fail   = 0usize;
+    let mut cursor = 0usize;
+
+    macro_rules! check {
+        ($ok:expr, $label:expr) => {
+            if $ok {
+                println!("shell-test: PASS — {}", $label);
+                pass += 1;
+            } else {
+                println!("shell-test: FAIL — {}", $label);
+                fail += 1;
+            }
+        };
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 1: wait for first gs> — boot complete, shell ready.
+    // -----------------------------------------------------------------------
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(30)) {
+        Some(boot_out) => {
+            check!(boot_out.contains("shell: ready"), "boot: shell ready message");
+        }
+        None => {
+            // Print what we did receive to help diagnose failures.
+            let received = {
+                let g = buf.lock().unwrap();
+                String::from_utf8_lossy(&g).into_owned()
+            };
+            println!("shell-test: FAIL — timed out waiting for first gs>");
+            println!("shell-test: received so far:\n{received}");
+            child.kill().ok();
+            child.wait().ok();
+            std::process::exit(1);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // help
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"help\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => {
+            check!(r.contains("GodspeedOS shell commands"), "help: header");
+            check!(r.contains("spawn"),   "help: spawn listed");
+            check!(r.contains("restart"), "help: restart listed");
+            check!(r.contains("status"),  "help: status listed");
+        }
+        None => {
+            println!("shell-test: FAIL — timed out after `help`  [×4]");
+            fail += 4;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // cores
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"cores\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => {
+            check!(r.contains(&format!("cores: {smp}")), "cores: reports smp count");
+        }
+        None => {
+            println!("shell-test: FAIL — timed out after `cores`");
+            fail += 1;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // status
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"status\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => {
+            check!(r.contains("SLOT"), "status: header present");
+            check!(
+                r.contains("pong") || r.contains("ping") || r.contains("shell"),
+                "status: tasks visible"
+            );
+        }
+        None => {
+            println!("shell-test: FAIL — timed out after `status`  [×2]");
+            fail += 2;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // unknown command
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"xyzzy\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("unknown: xyzzy"), "unknown command error"),
+        None    => { println!("shell-test: FAIL — timed out after unknown command"); fail += 1; }
+    }
+
+    // -----------------------------------------------------------------------
+    // Done.
+    // -----------------------------------------------------------------------
+    child.kill().ok();
+    child.wait().ok();
+
+    println!("\nshell-test: {pass} passed, {fail} failed");
+    if fail > 0 {
+        std::process::exit(1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Retry connecting to `127.0.0.1:port` every 100 ms until `timeout` expires.
+/// QEMU needs ~50–200 ms to open the port after launch.
+fn retry_tcp_connect(port: u16, timeout: Duration) -> Option<TcpStream> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(s) => {
+                // Keep the stream in blocking mode; reads/writes block naturally.
+                let _ = s.set_read_timeout(None);
+                return Some(s);
+            }
+            Err(_) => {
+                if Instant::now() >= deadline { return None; }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+/// Block (polling every 50 ms) until `sentinel` appears in `buf[*cursor..]`
+/// or `timeout` expires.  Advances `*cursor` past the sentinel on success.
+fn collect_until(
+    buf:      &Arc<Mutex<Vec<u8>>>,
+    cursor:   &mut usize,
+    sentinel: &[u8],
+    timeout:  Duration,
+) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        {
+            let g = buf.lock().unwrap();
+            let slice = &g[*cursor..];
+            if let Some(pos) = window_find(slice, sentinel) {
+                let end   = *cursor + pos + sentinel.len();
+                let chunk = String::from_utf8_lossy(&g[*cursor..end]).into_owned();
+                *cursor   = end;
+                return Some(chunk);
+            }
+        }
+        if Instant::now() >= deadline { return None; }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn window_find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() { return Some(0); }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn send(stream: &mut impl Write, data: &[u8]) {
+    let _ = stream.write_all(data);
+    let _ = stream.flush();
+}

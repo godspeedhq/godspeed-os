@@ -12,7 +12,7 @@ use crate::arch::x86_64::context_switch::TaskContext;
 use crate::arch::x86_64::page_tables::{
     get_hhdm_offset, PageFlags, VirtAddr, PAGE_SIZE,
 };
-use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE};
+use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE};
 use crate::capability::cap::ResourceId;
 use crate::capability::generation::Generation;
 use crate::ipc::endpoint::EndpointId;
@@ -101,15 +101,15 @@ struct SendPeerEntry {
 /// Layout written into the service context page before launch.
 #[repr(C)]
 struct ServiceContextData {
-    magic:           u32,
-    log_write_slot:  u32,
-    recv_slot:       u32,
-    spawn_slot:      u32,
-    send_peer_count: u32,
-    core_id:         u32,
-    probe_mode:      u32,
-    _pad:            u32,
-    send_peers:      [SendPeerEntry; MAX_SEND_PEERS],
+    magic:              u32,
+    log_write_slot:     u32,
+    recv_slot:          u32,
+    spawn_slot:         u32,
+    send_peer_count:    u32,
+    core_id:            u32,
+    probe_mode:         u32,
+    console_read_slot:  u32, // u32::MAX = not present; slot index if service has console_read cap
+    send_peers:         [SendPeerEntry; MAX_SEND_PEERS],
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +172,9 @@ struct ServiceConfig {
     /// At spawn time the kernel calls `interrupt::route::register(irq, endpoint)`
     /// for each entry. Empty for all non-driver services.
     hw_irqs:           &'static [u8],
+    /// If true, mint a CONSOLE_READ_RESOURCE cap and write the slot to
+    /// ServiceContextData.console_read_slot. Only the shell service sets this.
+    has_console_read:  bool,
 }
 
 fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
@@ -185,6 +188,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "registry" => Some(("registry", ServiceConfig {
             elf:               REGISTRY_ELF,
@@ -195,6 +199,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "logger" => Some(("logger", ServiceConfig {
             elf:               include_bytes!(env!("SVC_LOGGER_ELF")),
@@ -205,6 +210,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "ping" => Some(("ping", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PING_ELF")),
@@ -215,6 +221,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "pong" => Some(("pong", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PONG_ELF")),
@@ -225,6 +232,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // ----------------------------------------------------------------
         // Probe services — §22 Group A identity tests.
@@ -241,6 +249,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        1, // MODE_ECHO_RECV — Test 3A
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "probe-victim" => Some(("probe-victim", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -251,6 +260,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0, // MODE_PASSIVE — killed by probe-4a in Test 4A
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "probe-4b-recv" => Some(("probe-4b-recv", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -261,6 +271,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0, // MODE_PASSIVE — killed by harness in Test 4B
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "probe-3b" => Some(("probe-3b", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -271,6 +282,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        3, // MODE_NO_SEND_RIGHT — Test 3B
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "probe-sender" => Some(("probe-sender", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -281,6 +293,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        2, // MODE_ECHO_SEND — Test 3A
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "probe-4a" => Some(("probe-4a", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -291,6 +304,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        4, // MODE_SEND_AFTER_KILL — Test 4A
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "probe-4b-send" => Some(("probe-4b-send", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -301,6 +315,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        5, // MODE_FILL_AND_BLOCK — Test 4B
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "probe-yielder" => Some(("probe-yielder", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -311,6 +326,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        6, // MODE_YIELD_LOGGER — Test 8A
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "probe-hog" => Some(("probe-hog", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -321,6 +337,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        7, // MODE_HOG — Test 8B (preemption proven via ping)
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "probe-9b" => Some(("probe-9b", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -331,6 +348,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        8, // MODE_CAP_FORGE — Test 9B
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // ----------------------------------------------------------------
         // Cap-transfer probes — §22 Tests 5A and 5B.
@@ -346,6 +364,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        9, // MODE_GRANT_RECV — Test 5A receiver
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "probe-5a-send" => Some(("probe-5a-send", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -356,6 +375,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        10, // MODE_GRANT_SEND — Test 5A sender
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "probe-5b-send" => Some(("probe-5b-send", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -366,6 +386,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        11, // MODE_NO_GRANT_SEND — Test 5B negative
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // ----------------------------------------------------------------
         // Memory-limit probes — §22 Tests 7A and 7B.
@@ -379,6 +400,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        12, // MODE_ALLOC_OK — Test 7A
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "probe-7b" => Some(("probe-7b", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -389,6 +411,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        13, // MODE_ALLOC_LIMIT — Test 7B
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // ----------------------------------------------------------------
         // Interrupt-routing probe — §22 Tests IR1A (§12.2, §12.3).
@@ -403,6 +426,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        160, // MODE_IRQ_RECV — Test IR1A
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[33],
+            has_console_read:  false,
         })),
         // ----------------------------------------------------------------
         // Property-test probes — Milestone 9 Phase 1.
@@ -418,6 +442,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0,  // MODE_PASSIVE — killed by prop-p9
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "prop-p1" => Some(("prop-p1", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -428,6 +453,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        20, // MODE_PROP_P1
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "prop-p9" => Some(("prop-p9", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -440,6 +466,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        21, // MODE_PROP_P9
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "prop-p10" => Some(("prop-p10", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -450,6 +477,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        22, // MODE_PROP_P10
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // ----------------------------------------------------------------
         // Property-test probes — Milestone 9 Phase 2.
@@ -465,6 +493,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0,  // MODE_PASSIVE — killed/respawned by prop-p2
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "prop-p2" => Some(("prop-p2", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -475,6 +504,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        23, // MODE_PROP_P2
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // P3: cap rights non-widening. Self-referential: sends cap to own endpoint.
         "prop-p3" => Some(("prop-p3", ServiceConfig {
@@ -486,6 +516,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        24, // MODE_PROP_P3
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // P6: queue invariants. Self-referential: sends to own endpoint.
         // Pinned to Core 2 — away from the P2 (Core 3) and P8 (Core 1) kill/spawn
@@ -499,6 +530,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        25, // MODE_PROP_P6
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // P8: name resolves to higher generation + liveness. prop-p8-victim before prop-p8.
         // Pinned to Core 1 so P8's kill/spawn loop doesn't share a core with P6 (Core 2)
@@ -512,6 +544,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0,  // MODE_PASSIVE — killed/respawned by prop-p8
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "prop-p8" => Some(("prop-p8", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -522,6 +555,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        26, // MODE_PROP_P8
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // ----------------------------------------------------------------
         // Property-test probes — Milestone 9 Phase 3.
@@ -536,6 +570,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        27, // MODE_PROP_P4
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // P5: endpoint ownership. Victim must be listed before controller.
         "prop-p5-victim" => Some(("prop-p5-victim", ServiceConfig {
@@ -547,6 +582,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0,  // MODE_PASSIVE — killed/respawned by prop-p5
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "prop-p5" => Some(("prop-p5", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -557,6 +593,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        28, // MODE_PROP_P5
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // P7: TLB shootdown proxy. Victim must be listed before controller.
         "prop-p7-victim" => Some(("prop-p7-victim", ServiceConfig {
@@ -568,6 +605,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0,  // MODE_PASSIVE — killed/respawned by prop-p7
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "prop-p7" => Some(("prop-p7", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -578,6 +616,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        29, // MODE_PROP_P7
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // ----------------------------------------------------------------
         // Brutal property test probes — Milestone 16.
@@ -594,6 +633,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        104,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BP2: generation monotonic over 20 kill/respawn cycles.
         "prop-bp2-victim" => Some(("prop-bp2-victim", ServiceConfig {
@@ -605,6 +645,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "prop-bp2" => Some(("prop-bp2", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -615,6 +656,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        105,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BP3: cap rights never widen — 10k iterations (self-referential, like P3).
         "prop-bp3" => Some(("prop-bp3", ServiceConfig {
@@ -626,6 +668,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        106,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BP4: alloc accounting exact — 2k iterations.
         "prop-bp4" => Some(("prop-bp4", ServiceConfig {
@@ -637,6 +680,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        107,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BP5: endpoint ownership — 150 kill/respawn cycles.
         "prop-bp5-victim" => Some(("prop-bp5-victim", ServiceConfig {
@@ -648,6 +692,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "prop-bp5" => Some(("prop-bp5", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -658,6 +703,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        108,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BP6: queue invariants — 2k iterations (self-referential, like P6).
         "prop-bp6" => Some(("prop-bp6", ServiceConfig {
@@ -669,6 +715,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        109,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BP7: TLB shootdown proxy — 150 kill/respawn cycles.
         "prop-bp7-victim" => Some(("prop-bp7-victim", ServiceConfig {
@@ -680,6 +727,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "prop-bp7" => Some(("prop-bp7", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -690,6 +738,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        110,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BP8: restart + higher-generation liveness — 20 iterations.
         "prop-bp8-victim" => Some(("prop-bp8-victim", ServiceConfig {
@@ -701,6 +750,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "prop-bp8" => Some(("prop-bp8", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -711,6 +761,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        111,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BP9: generation invalidates ALL 3 slots, over 10 kill/respawn cycles.
         "prop-bp9-victim" => Some(("prop-bp9-victim", ServiceConfig {
@@ -722,6 +773,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "prop-bp9" => Some(("prop-bp9", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -732,6 +784,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        112,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BP10: every send returns a defined outcome — 100k iterations.
         "prop-bp10" => Some(("prop-bp10", ServiceConfig {
@@ -743,6 +796,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        113,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // ----------------------------------------------------------------
         // Fuzz-test probes — Milestone 10.
@@ -757,6 +811,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        30, // FUZZ_F1: random syscall args
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "fuzz-f2" => Some(("fuzz-f2", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -767,6 +822,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        31, // FUZZ_F2: random syscall numbers
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // F5: IPC message body fuzzing — recv target first.
         "fuzz-f5-recv" => Some(("fuzz-f5-recv", ServiceConfig {
@@ -778,6 +834,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0, // PASSIVE — soaks up random messages
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "fuzz-f5" => Some(("fuzz-f5", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -788,6 +845,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        32, // FUZZ_F5: random IPC message bodies
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // F6: embedded cap fuzzing — recv target first.
         "fuzz-f6-recv" => Some(("fuzz-f6-recv", ServiceConfig {
@@ -799,6 +857,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0, // PASSIVE — receives (or rejects) cap-embedded messages
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "fuzz-f6" => Some(("fuzz-f6", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -809,6 +868,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        33, // FUZZ_F6: random embedded cap slot indices
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // F7: stale cap / generation fuzzing — victim first.
         "fuzz-f7-victim" => Some(("fuzz-f7-victim", ServiceConfig {
@@ -820,6 +880,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0, // PASSIVE — killed/respawned by fuzz-f7
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "fuzz-f7" => Some(("fuzz-f7", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -830,6 +891,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        34, // FUZZ_F7: stale-cap sends after kill
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // F8: memory request size fuzzing — no peers needed.
         "fuzz-f8" => Some(("fuzz-f8", ServiceConfig {
@@ -841,6 +903,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        35, // FUZZ_F8: edge-case + random memory request sizes
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // ----------------------------------------------------------------
         // Brutal fuzz test probes — Milestone 17.
@@ -855,6 +918,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0, // passive recv sink
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "fuzz-bf5" => Some(("fuzz-bf5", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -865,6 +929,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        116, // FUZZ_BF5: random IPC bodies — 5k sends
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "fuzz-bf6-recv" => Some(("fuzz-bf6-recv", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -875,6 +940,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0, // passive recv sink
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "fuzz-bf6" => Some(("fuzz-bf6", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -885,6 +951,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        117, // FUZZ_BF6: random cap slots — 5k SendWithCap
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "fuzz-bf7-victim" => Some(("fuzz-bf7-victim", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -895,6 +962,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0, // passive recv — killed/respawned by fuzz-bf7
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "fuzz-bf7" => Some(("fuzz-bf7", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -905,6 +973,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        118, // FUZZ_BF7: stale cap — 200 kill/respawn cycles
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "fuzz-bf1" => Some(("fuzz-bf1", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -915,6 +984,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        114, // FUZZ_BF1: syscall args — 500 × 10 calls
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "fuzz-bf2" => Some(("fuzz-bf2", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -925,6 +995,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        115, // FUZZ_BF2: syscall numbers — 200k random
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "fuzz-bf8" => Some(("fuzz-bf8", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -935,6 +1006,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        119, // FUZZ_BF8: memory sizes — 10 edge + 5k random
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // ----------------------------------------------------------------
         // Stress-test probes — Milestone 11 Phase 1.
@@ -950,6 +1022,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0, // PASSIVE — queue fills; stress-s1 measures saturation
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "stress-s1" => Some(("stress-s1", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -960,6 +1033,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        40, // STRESS_S1: 10,000 try_send under saturation
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // S2: Restart storm. Victim killed/respawned 50 times.
         "stress-s2-victim" => Some(("stress-s2-victim", ServiceConfig {
@@ -971,6 +1045,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0, // PASSIVE — killed/respawned by stress-s2
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "stress-s2" => Some(("stress-s2", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -981,6 +1056,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        41, // STRESS_S2: 50 kill/respawn cycles; kstack-leak check
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // S3: Cross-core thrash. Receiver pinned to core 1, sender to core 0.
         "stress-s3-recv" => Some(("stress-s3-recv", ServiceConfig {
@@ -992,6 +1068,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        43, // STRESS_S3_RECV: drain 500 cross-core messages
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "stress-s3-send" => Some(("stress-s3-send", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1002,6 +1079,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        42, // STRESS_S3_SEND: 500 blocking sends to core 1
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // S4: Cap table churn. Victim killed/respawned 50×; 2 cap slots verified dead each kill.
         "stress-s4-victim" => Some(("stress-s4-victim", ServiceConfig {
@@ -1013,6 +1091,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0, // PASSIVE — killed/respawned by stress-s4
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "stress-s4" => Some(("stress-s4", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1024,6 +1103,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        44, // STRESS_S4: 50 kill/respawn cycles; 2-cap dead check
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // S7: Memory pressure. Single probe; no peers needed.
         "stress-s7" => Some(("stress-s7", ServiceConfig {
@@ -1035,6 +1115,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        45, // STRESS_S7: 100 alloc-to-limit passes
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // S10: Cascading revocation. Victim on core 1; coordinator on core 0 (cross-core kill).
         "stress-s10-victim" => Some(("stress-s10-victim", ServiceConfig {
@@ -1046,6 +1127,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0, // PASSIVE — killed by stress-s10
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "stress-s10" => Some(("stress-s10", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1057,6 +1139,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        46, // STRESS_S10: kill victim; verify 3 caps all EndpointDead
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // S5: Generation counter integrity (1000 kill/respawn cycles)
         "stress-s5-victim" => Some(("stress-s5-victim", ServiceConfig {
@@ -1068,6 +1151,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0, // PASSIVE — killed by stress-s5
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "stress-s5" => Some(("stress-s5", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1078,6 +1162,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        47, // STRESS_S5: 1000 kill/respawn; generation strictly monotonic
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // S6: Long-running IPC self-ping stability (5000 rounds)
         "stress-s6" => Some(("stress-s6", ServiceConfig {
@@ -1089,6 +1174,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        48, // STRESS_S6: 5000 self-ping rounds
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // S8: Idle scheduler heartbeat (600 yield cycles)
         "stress-s8" => Some(("stress-s8", ServiceConfig {
@@ -1100,6 +1186,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        49, // STRESS_S8: 600 yields, proves scheduler returns from idle
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // S9: Cross-core IPI storm — receiver on core 2; two senders on cores 0 and 1
         "stress-s9-recv" => Some(("stress-s9-recv", ServiceConfig {
@@ -1111,6 +1198,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        51, // STRESS_S9_RECV: drain 1000 messages
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "stress-s9-send-a" => Some(("stress-s9-send-a", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1121,6 +1209,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        50, // STRESS_S9_SEND: 500 blocking sends to s9-recv
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "stress-s9-send-b" => Some(("stress-s9-send-b", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1131,6 +1220,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        50, // STRESS_S9_SEND: 500 blocking sends to s9-recv
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // ----------------------------------------------------------------
         // Brutal stress-test probes — Milestone 18.
@@ -1146,6 +1236,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0, // PASSIVE — queue fills; bs1 measures saturation
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "stress-bs1" => Some(("stress-bs1", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1156,6 +1247,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        120, // STRESS_BS1: 50k try_send
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BS2: restart storm, 4× S2.
         "stress-bs2-victim" => Some(("stress-bs2-victim", ServiceConfig {
@@ -1167,6 +1259,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0, // PASSIVE
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "stress-bs2" => Some(("stress-bs2", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1177,6 +1270,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        121, // STRESS_BS2: 200 kill/respawn cycles
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BS3: cross-core thrash, 4× S3. Receiver on core 1, sender on core 0.
         "stress-bs3-recv" => Some(("stress-bs3-recv", ServiceConfig {
@@ -1188,6 +1282,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        123, // STRESS_BS3_RECV: drain 2000 cross-core messages
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "stress-bs3-send" => Some(("stress-bs3-send", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1198,6 +1293,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        122, // STRESS_BS3_SEND: 2000 blocking sends
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BS4: cap table churn, 5× S4. Victim before controller; 2 send_peers slots.
         "stress-bs4-victim" => Some(("stress-bs4-victim", ServiceConfig {
@@ -1209,6 +1305,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0, // PASSIVE
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "stress-bs4" => Some(("stress-bs4", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1219,6 +1316,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        124, // STRESS_BS4: 50 churn cycles; 2 cap slots
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BS5: generation integrity, 5× S5. Victim before controller.
         "stress-bs5-victim" => Some(("stress-bs5-victim", ServiceConfig {
@@ -1230,6 +1328,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0, // PASSIVE
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "stress-bs5" => Some(("stress-bs5", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1240,6 +1339,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        125, // STRESS_BS5: 5000 kill/respawn; generation monotonic
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BS6: self-ping stability, 4× S6. Self-referential send_peers.
         "stress-bs6" => Some(("stress-bs6", ServiceConfig {
@@ -1251,6 +1351,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        126, // STRESS_BS6: 20000 self-ping rounds
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BS7: memory pressure, 5× S7.
         "stress-bs7" => Some(("stress-bs7", ServiceConfig {
@@ -1262,6 +1363,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        127, // STRESS_BS7: 500 alloc passes
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BS8: scheduler heartbeat, 5× S8.
         "stress-bs8" => Some(("stress-bs8", ServiceConfig {
@@ -1273,6 +1375,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        128, // STRESS_BS8: 3000 yields
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BS9: IPI storm, 5× S9. Receiver on core 2; two senders on cores 0, 1.
         "stress-bs9-recv" => Some(("stress-bs9-recv", ServiceConfig {
@@ -1284,6 +1387,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        130, // STRESS_BS9_RECV: drain 5000 msgs
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "stress-bs9-send-a" => Some(("stress-bs9-send-a", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1294,6 +1398,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        129, // STRESS_BS9_SEND: 2500 sends
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "stress-bs9-send-b" => Some(("stress-bs9-send-b", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1304,6 +1409,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        129, // STRESS_BS9_SEND: 2500 sends
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BS10: cascading revocation, 50 cycles. Victim on core 1; controller on core 0.
         "stress-bs10-victim" => Some(("stress-bs10-victim", ServiceConfig {
@@ -1315,6 +1421,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0, // PASSIVE
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "stress-bs10" => Some(("stress-bs10", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1325,6 +1432,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        131, // STRESS_BS10: 50 kill/respawn cycles; 3 cap slots
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // ----------------------------------------------------------------
         // Performance-benchmark probes — Milestone 12.
@@ -1341,6 +1449,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        60, // PERF_B1: same-core roundtrip sender
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "perf-b1-echo" => Some(("perf-b1-echo", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1351,6 +1460,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        61, // PERF_B1_ECHO: echo messages back
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // B2: cross-core IPC roundtrip. Sender on core 0, echo on core 1.
         "perf-b2" => Some(("perf-b2", ServiceConfig {
@@ -1362,6 +1472,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        62, // PERF_B2: cross-core roundtrip sender
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "perf-b2-echo" => Some(("perf-b2-echo", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1372,6 +1483,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        63, // PERF_B2_ECHO: echo messages back
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // B3: yield floor. No peers needed.
         "perf-b3" => Some(("perf-b3", ServiceConfig {
@@ -1383,6 +1495,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        64, // PERF_B3: syscall yield floor
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // B4: cap validation throughput. Needs recv endpoint to have a cap to query.
         "perf-b4" => Some(("perf-b4", ServiceConfig {
@@ -1394,6 +1507,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        65, // PERF_B4: cap + generation check throughput
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // B5/B6: spawn and restart cost. Victim spawned first so perf-b5 can kill/respawn it.
         "perf-b5-victim" => Some(("perf-b5-victim", ServiceConfig {
@@ -1405,6 +1519,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0, // PASSIVE — killed/respawned by perf-b5
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "perf-b5" => Some(("perf-b5", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1415,6 +1530,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        66, // PERF_B5: spawn + restart cost (covers B5 and B6)
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // B7: cap table insert/remove throughput. Self-referential (acquires SEND cap to self).
         "perf-b7" => Some(("perf-b7", ServiceConfig {
@@ -1426,6 +1542,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        67, // PERF_B7: cap insert/remove throughput
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // B8: allocator throughput. No peers needed.
         "perf-b8" => Some(("perf-b8", ServiceConfig {
@@ -1437,6 +1554,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        68, // PERF_B8: alloc-4kib throughput
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // B9: 4 KiB message copy. Both on core 0 to isolate copy from cross-core routing.
         // Recv partner must be registered before sender's SEND cap is wired.
@@ -1449,6 +1567,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        70, // PERF_B9_RECV: drain large messages
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "perf-b9" => Some(("perf-b9", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1459,6 +1578,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        69, // PERF_B9: 4 KiB message sender
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // B10: scheduler pick-next cost. No peers needed.
         "perf-b10" => Some(("perf-b10", ServiceConfig {
@@ -1470,6 +1590,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        71, // PERF_B10: scheduler pick-next cost
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // ----------------------------------------------------------------
         // Brutal performance-benchmark probes — Milestone 19 (5× iteration counts).
@@ -1484,6 +1605,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        132, // PERF_BP1: same-core roundtrip sender, 1000 samples
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "perf-bp1-echo" => Some(("perf-bp1-echo", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1494,6 +1616,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        133, // PERF_BP1_ECHO
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BP2: cross-core roundtrip. Sender on core 0, echo on core 1.
         "perf-bp2" => Some(("perf-bp2", ServiceConfig {
@@ -1505,6 +1628,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        134, // PERF_BP2: cross-core roundtrip sender, 1000 samples
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "perf-bp2-echo" => Some(("perf-bp2-echo", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1515,6 +1639,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        135, // PERF_BP2_ECHO
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BP3: yield floor. No peers.
         "perf-bp3" => Some(("perf-bp3", ServiceConfig {
@@ -1526,6 +1651,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        136, // PERF_BP3: yield floor, 5000 yields
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BP4: cap validation. Needs recv endpoint to have a cap to query.
         "perf-bp4" => Some(("perf-bp4", ServiceConfig {
@@ -1537,6 +1663,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        137, // PERF_BP4: cap + generation check, 50000 checks
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BP5/BP6: spawn and restart cost. Victim spawned first.
         "perf-bp5-victim" => Some(("perf-bp5-victim", ServiceConfig {
@@ -1548,6 +1675,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0, // PASSIVE — killed/respawned by perf-bp5
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "perf-bp5" => Some(("perf-bp5", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1558,6 +1686,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        138, // PERF_BP5: spawn + restart cost, 50 cycles
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BP7: cap table insert/remove. Self-referential.
         "perf-bp7" => Some(("perf-bp7", ServiceConfig {
@@ -1569,6 +1698,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        139, // PERF_BP7: cap insert/remove, 5000 cycles
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BP8: allocator throughput. No peers.
         "perf-bp8" => Some(("perf-bp8", ServiceConfig {
@@ -1580,6 +1710,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        140, // PERF_BP8: alloc-4kib throughput
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BP9: 4 KiB message copy. Both on core 0 to isolate copy from routing overhead.
         "perf-bp9-recv" => Some(("perf-bp9-recv", ServiceConfig {
@@ -1591,6 +1722,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        142, // PERF_BP9_RECV: drain 4 KiB messages
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "perf-bp9" => Some(("perf-bp9", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1601,6 +1733,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        141, // PERF_BP9: 4 KiB message sender, 1000 sends
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BP10: scheduler pick-next cost. No peers.
         "perf-bp10" => Some(("perf-bp10", ServiceConfig {
@@ -1612,6 +1745,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        143, // PERF_BP10: scheduler pick-next, 5000 yields
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // ----------------------------------------------------------------
         // Adversarial-test probes — Milestone 13.
@@ -1628,6 +1762,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        80, // ADV_A1: random slot → Err (cap unforgeability)
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // A2: brute-force slot range → defined errors. No caps needed.
         "adv-a2" => Some(("adv-a2", ServiceConfig {
@@ -1639,6 +1774,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        81, // ADV_A2: slots 0..=127 + u32::MAX → defined errors
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // A3: alloc beyond 4 MiB limit → AllocDenied. Tight memory_limit.
         "adv-a3" => Some(("adv-a3", ServiceConfig {
@@ -1650,6 +1786,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        82, // ADV_A3: alloc edge cases under 4 MiB cap
             memory_limit:      4 * 1024 * 1024, // 4 MiB — tight limit for the test
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // A4: RECV cap used as SEND target → CapInsufficientRights. Has recv endpoint.
         "adv-a4" => Some(("adv-a4", ServiceConfig {
@@ -1661,6 +1798,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        83, // ADV_A4: RECV cap → try_send → CapInsufficientRights
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // A5: TOCTOU — victim must be registered before attacker's SEND cap is wired.
         "adv-a5-victim" => Some(("adv-a5-victim", ServiceConfig {
@@ -1672,6 +1810,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0, // MODE_PASSIVE — killed by adv-a5
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "adv-a5" => Some(("adv-a5", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1682,6 +1821,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        84, // ADV_A5: kill victim then try_send → EndpointDead
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // A6: fill own cap table. Has recv endpoint so it can be acquired via name.
         "adv-a6" => Some(("adv-a6", ServiceConfig {
@@ -1693,6 +1833,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        85, // ADV_A6: acquire_send_cap loop until table full
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // A7: timing probe — passive recv target must be registered before sender.
         "adv-a7-recv" => Some(("adv-a7-recv", ServiceConfig {
@@ -1704,6 +1845,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0, // MODE_PASSIVE — absorbs timing probe messages
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "adv-a7" => Some(("adv-a7", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1714,6 +1856,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        86, // ADV_A7: 100 timing sends to passive partner
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // A8: tight-loop hog + witness. Both round-robin so preemption is tested.
         "adv-a8" => Some(("adv-a8", ServiceConfig {
@@ -1725,6 +1868,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        87, // ADV_A8: tight loop attempting monopoly
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "adv-a8-witness" => Some(("adv-a8-witness", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1735,6 +1879,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        88, // ADV_A8_WITNESS: 1000 yields then log pass
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // A9: spawn non-existent service → Err. No caps needed beyond spawn (always present).
         "adv-a9" => Some(("adv-a9", ServiceConfig {
@@ -1746,6 +1891,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        89, // ADV_A9: spawn unknown service → Err
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // A10: kernel addresses as syscall buffer args → rejected. No caps needed.
         "adv-a10" => Some(("adv-a10", ServiceConfig {
@@ -1757,6 +1903,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        90, // ADV_A10: kernel-addr syscall args → rejected
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // ----------------------------------------------------------------
         // Chaos-test probes — Milestone 14.
@@ -1773,6 +1920,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        91, // CHAOS_C2: null-deref → page fault → killed
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "chaos-c2-monitor" => Some(("chaos-c2-monitor", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1783,6 +1931,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        92, // CHAOS_C2_MON: 1,000 yields then log pass
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // C3: alloc saturation. Tight 4 MiB limit so impossible requests are denied quickly.
         "chaos-c3" => Some(("chaos-c3", ServiceConfig {
@@ -1794,6 +1943,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        93, // CHAOS_C3: 500 alloc-deny cycles without panic
             memory_limit:      4 * 1024 * 1024, // 4 MiB — tight limit for the test
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // C5: kernel stack depth probe. No peers needed.
         "chaos-c5" => Some(("chaos-c5", ServiceConfig {
@@ -1805,6 +1955,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        94, // CHAOS_C5: 100-level recursive yield_cpu() depth probe
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // C6: hog on core 3 (simulates timer-starved core) + monitor on core 0.
         "chaos-c6-hog" => Some(("chaos-c6-hog", ServiceConfig {
@@ -1816,6 +1967,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        7, // MODE_HOG: tight loop (reused)
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "chaos-c6-monitor" => Some(("chaos-c6-monitor", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1826,6 +1978,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        95, // CHAOS_C6_MON: 200 yields then log pass
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // C7: cross-core kill/respawn TLB-shootdown stress.
         // Victim on core 2 must be registered before controller on core 1 gets SEND cap.
@@ -1838,6 +1991,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0, // MODE_PASSIVE — killed/respawned by chaos-c7
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "chaos-c7" => Some(("chaos-c7", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1848,6 +2002,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        96, // CHAOS_C7: 30 cross-core kill/respawn TLB shootdowns
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // ----------------------------------------------------------------
         // Brutal identity test probes — Milestone 15.
@@ -1865,6 +2020,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        97,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "brutal-id-12-a" => Some(("brutal-id-12-a", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1875,6 +2031,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        98,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "brutal-id-12-b" => Some(("brutal-id-12-b", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1885,6 +2042,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        99,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "brutal-id-12-c" => Some(("brutal-id-12-c", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1895,6 +2053,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        100,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "brutal-id-13-recv" => Some(("brutal-id-13-recv", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1905,6 +2064,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        101,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "brutal-id-13-send" => Some(("brutal-id-13-send", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1915,6 +2075,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        102,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "brutal-id-13-kill" => Some(("brutal-id-13-kill", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1925,6 +2086,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        103,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // ----------------------------------------------------------------
         // Brutal adversarial test probes — Milestone 20.
@@ -1941,6 +2103,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        144, // MODE_ADV_BA1: 50k random slot → Err
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BA2: extended brute-force slots 0..=511 + 4 extreme values.
         "adv-ba2" => Some(("adv-ba2", ServiceConfig {
@@ -1952,6 +2115,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        145, // MODE_ADV_BA2: 512 + extreme slot sweep
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BA3: 5× alloc edge-case cycles. Tight 4 MiB limit so impossible requests fail fast.
         "adv-ba3" => Some(("adv-ba3", ServiceConfig {
@@ -1963,6 +2127,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        146, // MODE_ADV_BA3: 5× alloc edge cycles
             memory_limit:      4 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BA4: RECV cap used as SEND target × 5. Needs own recv endpoint.
         "adv-ba4" => Some(("adv-ba4", ServiceConfig {
@@ -1974,6 +2139,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        147, // MODE_ADV_BA4: RECV-cap-as-SEND → CapInsufficientRights
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BA5: 5 TOCTOU kill+send cycles. Victim registered before attacker.
         "adv-ba5-victim" => Some(("adv-ba5-victim", ServiceConfig {
@@ -1985,6 +2151,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0, // MODE_PASSIVE — killed/re-killed by adv-ba5
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "adv-ba5" => Some(("adv-ba5", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -1995,6 +2162,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        148, // MODE_ADV_BA5: 5× kill+try_send → EndpointDead
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BA6: fill own cap table × 5 cycles. Needs recv endpoint so acquire_send_cap("adv-ba6") works.
         "adv-ba6" => Some(("adv-ba6", ServiceConfig {
@@ -2006,6 +2174,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        149, // MODE_ADV_BA6: 5× cap-table fill → None without panic
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BA7: 500 timing samples (5× A7). Passive recv registered before sender.
         "adv-ba7-recv" => Some(("adv-ba7-recv", ServiceConfig {
@@ -2017,6 +2186,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0, // MODE_PASSIVE — absorbs timing probe messages
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "adv-ba7" => Some(("adv-ba7", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -2027,6 +2197,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        150, // MODE_ADV_BA7: 500 timing sends to passive partner
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BA8: tight-loop hog + witness (5× A8). Pinned to core 3 to avoid
         // starving IPC/yield probes on cores 0-2 under QEMU TCG.
@@ -2039,6 +2210,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        151, // MODE_ADV_BA8: tight loop hog
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "adv-ba8-witness" => Some(("adv-ba8-witness", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -2049,6 +2221,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        152, // MODE_ADV_BA8_WITNESS: 5000 yields alongside hog
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BA9: 5 direct-spawn bypass attempts with bogus names → Err.
         "adv-ba9" => Some(("adv-ba9", ServiceConfig {
@@ -2060,6 +2233,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        153, // MODE_ADV_BA9: spawn unknown → Err
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BA10: 20 kernel-space address patterns as syscall args (5× A10). No caps needed.
         "adv-ba10" => Some(("adv-ba10", ServiceConfig {
@@ -2071,6 +2245,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        154, // MODE_ADV_BA10: kernel addr syscall args → rejected
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // ----------------------------------------------------------------
         // Brutal chaos-test services — Milestone 21.
@@ -2085,6 +2260,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        91, // MODE_CHAOS_C2: null-deref → page fault → killed
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "chaos-bc2-b" => Some(("chaos-bc2-b", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -2095,6 +2271,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        91, // MODE_CHAOS_C2: null-deref → page fault → killed
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "chaos-bc2-c" => Some(("chaos-bc2-c", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -2105,6 +2282,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        91, // MODE_CHAOS_C2: null-deref → page fault → killed
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "chaos-bc2-d" => Some(("chaos-bc2-d", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -2115,6 +2293,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        91, // MODE_CHAOS_C2: null-deref → page fault → killed
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "chaos-bc2-e" => Some(("chaos-bc2-e", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -2125,6 +2304,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        91, // MODE_CHAOS_C2: null-deref → page fault → killed
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "chaos-bc2-monitor" => Some(("chaos-bc2-monitor", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -2135,6 +2315,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        155, // MODE_CHAOS_BC2_MON: 500 yields then log pass
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BC3: 2,500 alloc-deny cycles. Tight 4 MiB limit so impossible requests fail fast.
         "chaos-bc3" => Some(("chaos-bc3", ServiceConfig {
@@ -2146,6 +2327,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        156, // MODE_CHAOS_BC3: 2,500 alloc-deny cycles
             memory_limit:      4 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BC5: 500-level recursive yield_cpu() stack depth probe.
         "chaos-bc5" => Some(("chaos-bc5", ServiceConfig {
@@ -2157,6 +2339,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        157, // MODE_CHAOS_BC5: 500-level recursive yield
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BC6: 2 hogs on cores 2+3, monitor on core 0 runs 1,000 yields.
         "chaos-bc6-hog-a" => Some(("chaos-bc6-hog-a", ServiceConfig {
@@ -2168,6 +2351,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        7, // MODE_HOG: tight loop (reused)
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "chaos-bc6-hog-b" => Some(("chaos-bc6-hog-b", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -2178,6 +2362,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        7, // MODE_HOG: tight loop (reused)
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "chaos-bc6-monitor" => Some(("chaos-bc6-monitor", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -2188,6 +2373,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        158, // MODE_CHAOS_BC6_MON: 1,000 yields then log pass
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         // BC7: 150 cross-core kill/respawn TLB-shootdown cycles.
         // Victim on core 2 must be registered before controller on core 1 gets SEND cap.
@@ -2200,6 +2386,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0, // MODE_PASSIVE — killed/respawned by chaos-bc7
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "chaos-bc7" => Some(("chaos-bc7", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PROBE_ELF")),
@@ -2210,6 +2397,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        159, // MODE_CHAOS_BC7: 150 cross-core kill/respawn cycles
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
         })),
         "observe" => Some(("observe", ServiceConfig {
             elf:               include_bytes!(env!("SVC_OBSERVE_ELF")),
@@ -2220,6 +2408,18 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             probe_mode:        0,
             memory_limit:      8 * 1024 * 1024,
             hw_irqs:           &[],
+            has_console_read:  false,
+        })),
+        "shell" => Some(("shell", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_SHELL_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    0,
+            probe_mode:        0,
+            memory_limit:      8 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  true,
         })),
         _ => None,
     }
@@ -2266,7 +2466,8 @@ pub fn spawn_service_by_name(name: &str, core_override: Option<u32>) -> Result<(
 
     let result = spawn_service_with_config(static_name, cfg.elf, core_id,
                               cfg.has_recv_endpoint, cfg.send_peers, cfg.probe_mode,
-                              cfg.send_peers_grant, cfg.memory_limit, cfg.hw_irqs);
+                              cfg.send_peers_grant, cfg.memory_limit, cfg.hw_irqs,
+                              cfg.has_console_read);
     if let Err(ref e) = result {
         crate::kprintln!("task: spawn '{}' failed: {:?}", name, e);
     }
@@ -2284,10 +2485,16 @@ fn spawn_service_with_config(
     send_peers_grant:  bool,
     memory_limit:      u64,
     hw_irqs:           &[u8],
+    has_console_read:  bool,
 ) -> Result<(), SpawnError> {
+    // DIAG: step markers to narrow bare-metal freeze after "registry spawned OK"
+    crate::kprintln!("spawn[elf]: '{}'", name);
+
     // 1. Parse ELF.
     let crate::loader::LoadedElf { mut page_table, entry_va } =
         crate::loader::load(elf_bytes)?;
+
+    crate::kprintln!("spawn[stack]: '{}'", name);
 
     // 2. Map user stack.
     let stack_flags = PageFlags::PRESENT | PageFlags::USER
@@ -2313,8 +2520,11 @@ fn spawn_service_with_config(
         }
     }
 
+    crate::kprintln!("spawn[slot]: '{}'", name);
+
     // 3. Reserve a task slot and initialise its CapTable directly in BSS.
     let task_slot = scheduler::reserve_task_slot(core_id).ok_or(SpawnError::NoMemory)?;
+    crate::kprintln!("spawn[caps]: '{}' slot={}", name, task_slot);
     // SAFETY: task_slot was just reserved; IF=0 in syscall context.
     let caps = unsafe { scheduler::task_cap_init_empty(task_slot) };
 
@@ -2372,6 +2582,15 @@ fn spawn_service_with_config(
         }
     }
 
+    // 4b. Optional CONSOLE_READ cap (shell service only).
+    let mut console_read_slot_u32 = u32::MAX;
+    if has_console_read {
+        let cr_cap = mint_cap(CONSOLE_READ_RESOURCE, Rights::READ);
+        let cap_slot = caps.insert(cr_cap)
+            .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
+        console_read_slot_u32 = cap_slot as u32;
+    }
+
     // 5. Send-peer SEND caps (wired at spawn from the name registry).
     let mut peer_data: [(u32, u32, [u8; PEER_NAME_BYTES]); MAX_SEND_PEERS] =
         [(u32::MAX, 0, [0u8; PEER_NAME_BYTES]); MAX_SEND_PEERS];
@@ -2419,13 +2638,14 @@ fn spawn_service_with_config(
             let virt = (get_hhdm_offset() + ctx_phys) as *mut u8;
             core::ptr::write_bytes(virt, 0, PAGE_SIZE);
             let data = &mut *(virt as *mut ServiceContextData);
-            data.magic           = SERVICE_CTX_MAGIC;
-            data.log_write_slot  = 0;
-            data.recv_slot       = recv_slot_u32;
-            data.spawn_slot      = 1;
-            data.send_peer_count = peer_count as u32;
-            data.core_id         = core_id;
-            data.probe_mode      = probe_mode;
+            data.magic              = SERVICE_CTX_MAGIC;
+            data.log_write_slot     = 0;
+            data.recv_slot          = recv_slot_u32;
+            data.spawn_slot         = 1;
+            data.send_peer_count    = peer_count as u32;
+            data.core_id            = core_id;
+            data.probe_mode         = probe_mode;
+            data.console_read_slot  = console_read_slot_u32;
             for i in 0..peer_count {
                 data.send_peers[i].slot     = peer_data[i].0;
                 data.send_peers[i].name_len = peer_data[i].1;
@@ -2439,8 +2659,11 @@ fn spawn_service_with_config(
         core::mem::forget(ctx_frame);
     }
 
+    crate::kprintln!("spawn[kstack]: '{}'", name);
+
     // 7. Kernel stack.
     let kstack_top = alloc_kstack().ok_or(SpawnError::NoMemory)?;
+    crate::kprintln!("spawn[commit]: '{}' kstack ok", name);
 
     // 8. Initial ring-3 context.
     let cr3 = page_table.into_cr3();
@@ -2466,7 +2689,7 @@ fn spawn_service_with_config(
 /// Spawn `init` on Core 0. Called once by `kernel_main` (§11.1).
 pub fn spawn_init() {
     let elf_bytes = include_bytes!(env!("SVC_INIT_ELF"));
-    match spawn_service_with_config("init", elf_bytes, 0, false, &[], 0, false, 64 * 1024 * 1024, &[]) {
+    match spawn_service_with_config("init", elf_bytes, 0, false, &[], 0, false, 64 * 1024 * 1024, &[], false) {
         Ok(()) => crate::kprintln!("task: init spawned on core 0"),
         Err(e) => panic!("task: failed to spawn init: {:?}", e),
     }

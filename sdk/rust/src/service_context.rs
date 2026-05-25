@@ -28,15 +28,15 @@ struct SendPeerEntry {
 /// Layout of the kernel-written page at SERVICE_CTX_ADDR.
 #[repr(C)]
 struct ServiceContextData {
-    magic:           u32,
-    log_write_slot:  u32,
-    recv_slot:       u32,
-    spawn_slot:      u32,
-    send_peer_count: u32,
-    core_id:         u32,
-    probe_mode:      u32,
-    _pad:            u32,
-    send_peers:      [SendPeerEntry; MAX_SEND_PEERS],
+    magic:              u32,
+    log_write_slot:     u32,
+    recv_slot:          u32,
+    spawn_slot:         u32,
+    send_peer_count:    u32,
+    core_id:            u32,
+    probe_mode:         u32,
+    console_read_slot:  u32, // u32::MAX = not present
+    send_peers:         [SendPeerEntry; MAX_SEND_PEERS],
 }
 
 // ---------------------------------------------------------------------------
@@ -482,6 +482,20 @@ impl ServiceContext {
             raw_syscall(11, packed, payload.as_ptr() as u64, payload.len() as u64)
         };
         if ret == 0 { Ok(()) } else { Err(crate::ipc::i64_to_ipc_error(ret)) }
+    }
+
+    /// Block until one byte is available on COM1 console input (syscall 17).
+    ///
+    /// Returns the byte value. Only usable by services that declared
+    /// `has_console_read` in their kernel config (currently: shell only).
+    pub fn console_read(&self) -> u8 {
+        let data = Self::ctx();
+        if data.magic != SERVICE_CTX_MAGIC { loop {} }
+        let slot = data.console_read_slot;
+        if slot == u32::MAX { loop {} }
+        // SAFETY: syscall(17) = ConsoleRead; slot is kernel-written cap index.
+        let ret = unsafe { raw_syscall(17, slot as u64, 0, 0) };
+        if ret >= 0 { ret as u8 } else { 0 }
     }
 
     /// Return the core this service was spawned on.

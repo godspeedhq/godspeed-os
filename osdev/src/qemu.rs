@@ -93,6 +93,54 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 }
 
+/// Launch QEMU with stdin/stdout wired to COM1 for the interactive shell.
+///
+/// COM1 → stdio (bidirectional): shell output comes to the terminal,
+/// terminal input goes to COM1 RX (the ConsoleRead syscall).
+/// COM2 → TCP:5555 so `osdev restart` still works.
+/// `-nographic` suppresses QEMU's VGA window and SDL/GTK dependencies.
+pub fn run_shell(image_path: &Path, smp: u32) {
+    let qemu = qemu_binary();
+
+    println!("shell: launching QEMU (smp={smp}) — type 'help' at the gs> prompt");
+    println!("shell: press Ctrl-A X to quit QEMU");
+
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",
+        &format!("format=raw,file={image_str},if=ide"),
+        "-smp",
+        &smp.to_string(),
+        "-m",
+        "512M",
+        // COM1 → stdio: bidirectional for the shell.
+        "-serial",
+        "stdio",
+        // COM2 → TCP control channel for `osdev restart`.
+        "-serial",
+        "tcp::5555,server,nowait",
+        "-display",
+        "none",
+        "-nographic",
+        "-no-reboot",
+        "-no-shutdown",
+    ]);
+    if kvm_available() {
+        cmd.arg("-enable-kvm");
+    }
+    let status = cmd
+        .status()
+        .unwrap_or_else(|e| {
+            eprintln!("failed to launch QEMU at {}: {}", qemu, e);
+            eprintln!("Install QEMU from https://www.qemu.org/download/");
+            std::process::exit(1);
+        });
+
+    println!("shell: QEMU exited ({})", status);
+}
+
 // ---------------------------------------------------------------------------
 // Test harness support.
 // ---------------------------------------------------------------------------
@@ -192,7 +240,7 @@ pub fn spawn_for_test_custom(
     QemuTestInstance { child, serial_path: serial_path.to_owned() }
 }
 
-fn qemu_binary() -> String {
+pub fn qemu_binary() -> String {
     if cfg!(windows) {
         let default = r"C:\Program Files\qemu\qemu-system-x86_64.exe";
         if std::path::Path::new(default).exists() {

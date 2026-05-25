@@ -26,10 +26,15 @@ pub const LOG_WRITE_RESOURCE: ResourceId = ResourceId(1);
 /// to call `SyscallNumber::Spawn` (syscall 7).
 pub const SPAWN_RESOURCE: ResourceId = ResourceId(2);
 
+/// The console read authority. A task must hold this resource with `Rights::READ`
+/// to call `SyscallNumber::ConsoleRead` (syscall 17).
+pub const CONSOLE_READ_RESOURCE: ResourceId = ResourceId(3);
+
 pub fn init() {
     table::init_global();
     // Register stable kernel resources (generation 0 forever — §7.5).
     table::register_resource(LOG_WRITE_RESOURCE);
     table::register_resource(SPAWN_RESOURCE);
+    table::register_resource(CONSOLE_READ_RESOURCE);
     crate::kprintln!("capability: subsystem ready");
 }

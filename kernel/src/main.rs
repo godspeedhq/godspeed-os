@@ -200,6 +200,8 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
 
     arch::x86_64::init_timer();
     arch::x86_64::com2_init();
+    // SAFETY: IDT is loaded (init above), serial_init already called; enables COM1 RX IRQ.
+    unsafe { arch::x86_64::uart_rx_enable(); }
 
     capability::init();
     ipc::init();

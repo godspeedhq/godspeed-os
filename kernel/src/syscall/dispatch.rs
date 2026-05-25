@@ -35,6 +35,7 @@ pub enum SyscallNumber {
     QueryCapRights = 14,
     RemoveCap      = 15,
     TaskStat       = 16,
+    ConsoleRead    = 17,
 }
 
 /// Raw syscall dispatcher — called from the SYSCALL/SYSENTER IDT stub.
@@ -71,6 +72,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::QueryCapRights as u64 => handle_query_cap_rights(arg0),
         n if n == SyscallNumber::RemoveCap      as u64 => handle_remove_cap(arg0),
         n if n == SyscallNumber::TaskStat       as u64 => handle_task_stat(arg0, arg1, arg2),
+        n if n == SyscallNumber::ConsoleRead    as u64 => handle_console_read(arg0),
         _ => -1, // Unknown syscall.
     }
 }
@@ -616,6 +618,45 @@ fn handle_task_stat(slot: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     buf[64..72].copy_from_slice(&stat.run_ticks.to_le_bytes());
 
     if write_user_bytes(buf_ptr, &buf) { 0 } else { -1 }
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: ConsoleRead (17) — block until one byte is available on COM1 RX.
+// ---------------------------------------------------------------------------
+
+fn handle_console_read(cap_slot: u64) -> i64 {
+    use crate::capability::CONSOLE_READ_RESOURCE;
+    use core::sync::atomic::Ordering;
+
+    // Validate cap: must hold CONSOLE_READ_RESOURCE with READ right.
+    let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::READ) {
+        Ok(c)  => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    if cap.resource_id != CONSOLE_READ_RESOURCE {
+        return cap_err_to_i64(CapError::CapWrongScope);
+    }
+
+    // Store our slot as waiter before entering the block loop to avoid a
+    // lost-wakeup race with the IRQ handler.
+    let my_slot = scheduler::current_task_slot();
+    crate::arch::x86_64::CONSOLE_READ_WAITER.store(my_slot as u32, Ordering::Release);
+
+    loop {
+        // Try to consume a byte from the ring buffer.
+        if let Some(b) = crate::arch::x86_64::uart_rx_pop() {
+            crate::arch::x86_64::CONSOLE_READ_WAITER.store(u32::MAX, Ordering::Release);
+            return b as i64;
+        }
+
+        // Block until the IRQ handler wakes us.
+        let err = scheduler::block_and_reschedule(TaskState::BlockedOnRecv);
+        if err != 0 {
+            crate::arch::x86_64::CONSOLE_READ_WAITER.store(u32::MAX, Ordering::Release);
+            return err;
+        }
+        // Woken by uart_rx_irq_handler; loop to pop the byte.
+    }
 }
 
 fn ipc_err_to_i64(e: IpcError) -> i64 {
