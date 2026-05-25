@@ -37,7 +37,18 @@ pub unsafe fn send_ipi(core_id: u32, vector: u8) {
     // SAFETY: apic_base is a valid MMIO address set during init_local_apic.
     unsafe {
         write_apic_reg(apic_base + APIC_ICR_HIGH, (lapic_id & 0xFF) << 24);
-        write_apic_reg(apic_base + APIC_ICR_LOW,  (vector as u32) | (1 << 14));
+        // Per Intel SDM §10.6.1: poll the Delivery Status bit (bit 12 of
+        // ICR_LOW) before writing a new IPI.  Writing while DELIVS=1 silently
+        // drops the interrupt on some xAPIC implementations (observed on
+        // Goldmont+ under concurrent IPI load).  Cap at 10 000 iterations to
+        // avoid an infinite spin if the APIC is wedged.
+        let mut tries = 0u32;
+        while (read_apic_reg(apic_base + APIC_ICR_LOW) >> 12) & 1 != 0 {
+            core::hint::spin_loop();
+            tries += 1;
+            if tries >= 10_000 { break; }
+        }
+        write_apic_reg(apic_base + APIC_ICR_LOW, (vector as u32) | (1 << 14));
     }
 }
 
@@ -62,6 +73,14 @@ pub unsafe fn broadcast_tlb_shootdown(virt_addr: u64) {
     // SAFETY: APIC mapped; caller holds IF=0.
     unsafe {
         write_apic_reg(apic_base + APIC_ICR_HIGH, 0);
+        // Poll DELIVS (bit 12) before writing the broadcast; same requirement
+        // as point-to-point IPIs per SDM §10.6.1.
+        let mut tries = 0u32;
+        while (read_apic_reg(apic_base + APIC_ICR_LOW) >> 12) & 1 != 0 {
+            core::hint::spin_loop();
+            tries += 1;
+            if tries >= 10_000 { break; }
+        }
         write_apic_reg(
             apic_base + APIC_ICR_LOW,
             (vectors::TLB_SHOOTDOWN as u32) | (1 << 14) | (0b11 << 18),
@@ -141,6 +160,13 @@ pub unsafe fn broadcast_full_tlb_flush() {
         // SAFETY: APIC mapped; IF=0.
         unsafe {
             write_apic_reg(apic_base + APIC_ICR_HIGH, 0);
+            // Poll DELIVS before the broadcast per SDM §10.6.1.
+            let mut tries = 0u32;
+            while (read_apic_reg(apic_base + APIC_ICR_LOW) >> 12) & 1 != 0 {
+                core::hint::spin_loop();
+                tries += 1;
+                if tries >= 10_000 { break; }
+            }
             write_apic_reg(
                 apic_base + APIC_ICR_LOW,
                 (vectors::TLB_SHOOTDOWN as u32) | (1 << 14) | (0b11 << 18),
@@ -177,6 +203,12 @@ fn handle_tlb_shootdown() {
         unsafe { core::arch::asm!("invlpg [{addr}]", addr = in(reg) addr, options(nostack)); }
     }
     TLB_ACK.fetch_add(1, Ordering::SeqCst);
+}
+
+#[inline]
+unsafe fn read_apic_reg(addr: u64) -> u32 {
+    // SAFETY: addr is a valid MMIO register inside the mapped APIC page.
+    unsafe { (addr as *const u32).read_volatile() }
 }
 
 #[inline]
