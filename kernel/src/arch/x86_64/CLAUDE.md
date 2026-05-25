@@ -21,7 +21,7 @@ These functions in `arch::x86_64` expose hardware operations as a safe API. If y
 |------------------------------|---------------|
 | `disable_interrupts()`       | `cli` |
 | `enable_interrupts()`        | `sti` |
-| `wait_for_interrupt()`       | `sti; pause` (enable interrupts + spin hint; avoids Goldmont+ C-state APIC power-gate) |
+| `wait_for_interrupt()`       | `sti` only — no C-state hint; avoids Goldmont+ APIC power-gate from both `hlt` and `pause` |
 | `validate_user_ptr(ptr, len)`| Range check: ptr..ptr+len must be below `USER_END` (0x0000_8000_0000_0000) |
 | `read_user_bytes(ptr, len)`  | Validated `from_raw_parts` into user VA |
 | `write_user_bytes(dst, src)` | Validated `copy_nonoverlapping` to user VA |

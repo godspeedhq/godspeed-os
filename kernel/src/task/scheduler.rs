@@ -692,13 +692,13 @@ pub fn run(core_id: u32) -> ! {
                 if cid == 0 {
                     crate::control::process_pending();
                 }
-                // No ready tasks for this core; yield one spin hint and loop.
-                // `wait_for_interrupt` enables interrupts and issues a PAUSE.
-                // The compiler_fence above this match forces a fresh reload of
-                // TASK_STATE on every iteration, so a wakeup written by another
-                // core is visible without an HLT.  HLT is intentionally avoided:
-                // on Goldmont+ it triggers firmware C-state promotion that
-                // power-gates the local APIC, silencing timer ticks and IPIs.
+                // No ready tasks; re-enable interrupts and loop.
+                // `wait_for_interrupt` issues only `sti` — no PAUSE, no HLT.
+                // On Goldmont+, both are "low-power hints" that allow firmware
+                // C-state promotion, power-gating the LAPIC and dropping timer
+                // ticks and IPIs.  The compiler_fence above forces a fresh reload
+                // of TASK_STATE on every iteration so wakeups from other cores
+                // are always visible.
                 crate::arch::x86_64::wait_for_interrupt();
             }
         }

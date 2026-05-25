@@ -103,18 +103,22 @@ pub fn disable_interrupts() {
     unsafe { core::arch::asm!("cli", options(nostack, nomem)) }
 }
 
-/// Enable interrupts and yield one spin-loop hint, then return.
+/// Enable interrupts and return immediately (pure busy-spin, no C-state hint).
 ///
-/// Used in the idle loop. On Goldmont+ (Apollo Lake / Gemini Lake), `hlt`
-/// triggers aggressive firmware C-state promotion that power-gates the local
-/// APIC, silencing both APIC timer ticks and cross-core IPIs.  Using `pause`
-/// instead keeps the core active, prevents C-state entry, and lets the
-/// scheduler loop spin-check for new work without missing wakeups.
+/// Used in the idle loop. On Goldmont+ (Apollo Lake / Gemini Lake), both `hlt`
+/// and `pause` trigger firmware C-state promotion that power-gates the local
+/// APIC, silencing both APIC timer ticks and cross-core IPIs.  Issuing only
+/// `sti` — with no low-power hint of any kind — keeps the core fully active
+/// and prevents C-state entry entirely.  The outer scheduler loop's
+/// `compiler_fence(SeqCst)` ensures every iteration re-reads TASK_STATE,
+/// so wakeups written by other cores are not missed.
 #[inline]
 pub fn wait_for_interrupt() {
-    // SAFETY: STI enables interrupts; PAUSE is always safe in ring-0.
-    // The outer scheduler loop provides the retry; no HLT is needed.
-    unsafe { core::arch::asm!("sti; pause", options(nostack, nomem)) }
+    // SAFETY: STI is always safe in ring-0; no other instructions follow.
+    // Intentionally omitting PAUSE and HLT: on Goldmont+ both are
+    // "low-power hints" that allow firmware to power-gate the LAPIC,
+    // causing missed timer ticks and dropped IPIs under sustained load.
+    unsafe { core::arch::asm!("sti", options(nostack, nomem)) }
 }
 
 /// Signal End-Of-Interrupt to the local APIC so the interrupt line is re-armed.
