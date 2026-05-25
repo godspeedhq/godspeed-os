@@ -215,6 +215,70 @@ pub unsafe fn init_local_apic() {
     // Initial count → ~10 ms at a 1 GHz APIC bus / 16 divider (QEMU default).
     // 1 GHz / 16 = 62.5 MHz; 62.5 MHz × 0.01 s = 625,000 ticks.
     write_apic(apic_virt, APIC_TIMER_INIT, 625_000);
+
+    // Attempt to prevent Goldmont+ firmware from autonomously entering deep
+    // package C-states that power-gate the APIC.  Safe no-op if MSR is locked.
+    // SAFETY: ring-0; called once per core; APIC is already initialised above.
+    let lapic_id = unsafe { get_lapic_id() };
+    unsafe { limit_package_cstates(lapic_id) };
+}
+
+/// Limit package C-states to PC1 to prevent APIC power-gate on Goldmont+.
+///
+/// On Intel Atom / Goldmont+ (Gemini Lake, Wyse 5070 J5005), the firmware
+/// autonomously promotes the SoC package to PC6+, which power-gates the local
+/// APIC — silencing both the periodic APIC timer and cross-core IPIs even when
+/// the cores are actively executing code (no PAUSE/HLT required to trigger it).
+///
+/// MSR_PKG_CST_CONFIG_CONTROL (0xE2) bits:
+///   [2:0] package C-state limit  (0=PC0, 1=PC1, 2=PC2, …; higher = deeper)
+///   [15]  CFG_LOCK — if set, MSR is read-only (WRMSR → #GP)
+///
+/// Writes bits[2:0]=1 (PC1 limit) if the MSR is not locked.  PC1 keeps the
+/// APIC powered; PC2+ may not.  If the MSR is locked we cannot help via this
+/// path and must fall back to TSC-Deadline timer mode (see TODO).
+///
+/// # Safety
+/// Ring-0 only.  Called once per core from `init_local_apic` after APIC setup.
+unsafe fn limit_package_cstates(core_id: u32) {
+    const MSR_PKG_CST_CONFIG_CONTROL: u32 = 0xE2;
+    const CFG_LOCK: u64 = 1 << 15;
+    const PC1_LIMIT: u64 = 1; // bits[2:0] = 001 → max package C-state = PC1
+
+    // SAFETY: RDMSR in ring-0; MSR 0xE2 exists on all Intel Goldmont+ platforms.
+    let (lo, hi): (u32, u32);
+    unsafe {
+        core::arch::asm!(
+            "rdmsr",
+            in("ecx")  MSR_PKG_CST_CONFIG_CONTROL,
+            out("eax") lo,
+            out("edx") hi,
+            options(nostack, nomem),
+        );
+    }
+    let current = ((hi as u64) << 32) | (lo as u64);
+    crate::kprintln!("cstate: core {} MSR 0xE2 = {:#018x} (lock={})",
+        core_id, current, (current >> 15) & 1);
+
+    if current & CFG_LOCK != 0 {
+        // BIOS locked the MSR — cannot write; APIC timer may still be gated in
+        // deep package C-states.  A TSC-Deadline timer does not require this MSR.
+        crate::kprintln!("cstate: core {} MSR 0xE2 locked — C-state limit cannot be set via MSR", core_id);
+        return;
+    }
+
+    let new_val = (current & !0x7u64) | PC1_LIMIT;
+    // SAFETY: MSR is not locked (checked above); WRMSR in ring-0 is valid.
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx")  MSR_PKG_CST_CONFIG_CONTROL,
+            in("eax")  new_val as u32,
+            in("edx")  (new_val >> 32) as u32,
+            options(nostack, nomem),
+        );
+    }
+    crate::kprintln!("cstate: core {} limited to PC1 (MSR 0xE2 = {:#018x})", core_id, new_val);
 }
 
 /// Send an End-Of-Interrupt signal to the local APIC.
