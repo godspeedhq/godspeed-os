@@ -43,6 +43,10 @@ b2-only = []
 # Brutal-isolation equivalent of b2-only at higher iteration count.
 # Used by `osdev image --mode bp2-only`.
 bp2-only = []
+# Spawn only observe — no pong, no ping, no probe services.
+# Used by `osdev image --mode s8` for the S8 24-hour idle stability run:
+# kernel idles on all cores; observe reports system state every ~500 yields.
+idle-only = []
 
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }

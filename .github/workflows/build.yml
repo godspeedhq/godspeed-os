@@ -1,8 +1,7 @@
 name: build
 
 on:
-  push:
-  pull_request:
+  workflow_dispatch:  # paused: re-add push/pull_request when CI minutes are available
 
 jobs:
   build:

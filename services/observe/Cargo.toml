@@ -1,0 +1,11 @@
+[package]
+name = "observe"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "observe"
+path = "src/main.rs"
+
+[dependencies]
+godspeed-sdk = { path = "../../sdk/rust" }

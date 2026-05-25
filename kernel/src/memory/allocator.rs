@@ -45,8 +45,8 @@ fn guard_bugcheck(phys: u64) {
 // ---------------------------------------------------------------------------
 
 const FRAME_SIZE_USIZE: usize = FRAME_SIZE as usize;
-const MAX_FRAMES: usize = (4 * 1024 * 1024 * 1024_usize) / FRAME_SIZE_USIZE;
-const BITMAP_BYTES: usize = MAX_FRAMES / 8; // 128 KiB
+const MAX_FRAMES: usize = (8 * 1024 * 1024 * 1024_usize) / FRAME_SIZE_USIZE;
+const BITMAP_BYTES: usize = MAX_FRAMES / 8; // 256 KiB
 
 // 0 = used, 1 = free; zero-init means all used at startup.
 static mut BITMAP: [u8; BITMAP_BYTES] = [0u8; BITMAP_BYTES];
@@ -61,6 +61,8 @@ static mut KERNEL_PT_PROTECTED: [u8; BITMAP_BYTES] = [0u8; BITMAP_BYTES];
 
 struct BitmapAllocator {
     free_frames: usize,
+    /// Total usable frames at init time. Fixed after init; never decremented.
+    total_frames: usize,
     /// Byte-index scan hint — avoids rescanning from 0 on every alloc.
     next_byte: usize,
     /// Highest frame index (exclusive) that was ever marked usable.
@@ -71,7 +73,7 @@ struct BitmapAllocator {
 
 impl BitmapAllocator {
     const fn new() -> Self {
-        Self { free_frames: 0, next_byte: 0, max_valid_frame: 0 }
+        Self { free_frames: 0, total_frames: 0, next_byte: 0, max_valid_frame: 0 }
     }
 
     // SAFETY: caller must guarantee single-threaded access; called once by BSP during memory::init.
@@ -113,6 +115,7 @@ impl BitmapAllocator {
                 self.free_frames += 1;
             }
         }
+        self.total_frames = self.free_frames;
     }
 
     // SAFETY: caller must hold ALLOC_LOCKED; BITMAP and ALLOCATOR are exclusively accessible under the lock.
@@ -273,6 +276,12 @@ pub unsafe fn free_frame(frame: Frame) {
 pub fn free_frame_count() -> usize {
     // SAFETY: read-only; racing reads are harmless for diagnostic use.
     unsafe { ALLOCATOR.free_frames() }
+}
+
+/// Return the total number of usable physical frames at boot time (fixed after init).
+pub fn total_frame_count() -> usize {
+    // SAFETY: read-only; set once at init, never mutated after.
+    unsafe { ALLOCATOR.total_frames }
 }
 
 /// Walk the kernel half of the live PML4 (entries 256–511) and mark every

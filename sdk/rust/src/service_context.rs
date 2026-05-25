@@ -63,6 +63,55 @@ static mut SEND_CAP_CACHE: [CacheEntry; CACHE_SIZE] =
     [const { CacheEntry::empty() }; CACHE_SIZE];
 
 // ---------------------------------------------------------------------------
+// TaskStat — returned by ServiceContext::task_stat.
+// ---------------------------------------------------------------------------
+
+/// Snapshot of kernel task state for a single scheduler slot.
+#[derive(Clone, Copy)]
+pub struct TaskStat {
+    /// True if the slot holds a live task.
+    pub valid:       bool,
+    /// Task state: 0=Ready, 1=Running, 2=BlockedOnRecv, 3=BlockedOnSend, 4=Dead.
+    pub state:       u8,
+    /// Core the task is pinned to.
+    pub core:        u8,
+    /// Bytes dynamically allocated so far.
+    pub mem_used:    u64,
+    /// Maximum bytes the task may allocate.
+    pub mem_limit:   u64,
+    /// Byte length of the name stored in `name`.
+    pub name_len:    usize,
+    /// Task name bytes (zero-padded to 32 bytes).
+    pub name:        [u8; 32],
+    /// Current endpoint generation (restart counter).
+    pub generation:  u32,
+    /// Current inbound IPC queue depth (0–16).
+    pub queue_depth: u8,
+    /// Timer ticks spent as the running task on its core (monotonic since boot).
+    pub run_ticks:   u64,
+}
+
+impl TaskStat {
+    /// Return the task name as a `&str`.
+    pub fn name_str(&self) -> &str {
+        let len = self.name_len.min(32);
+        core::str::from_utf8(&self.name[..len]).unwrap_or("?")
+    }
+
+    /// Return a short human-readable state label.
+    pub fn state_str(&self) -> &'static str {
+        match self.state {
+            0 => "Ready",
+            1 => "Running",
+            2 => "BlockRecv",
+            3 => "BlockSend",
+            4 => "Dead",
+            _ => "?",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // AllocError — returned by ServiceContext::alloc_mem.
 // ---------------------------------------------------------------------------
 
@@ -297,6 +346,51 @@ impl ServiceContext {
         if ret < 0 { 0 } else { ret as u32 }
     }
 
+    /// Return the number of free physical frames.
+    ///
+    /// Wraps InspectKernel query 4.
+    pub fn inspect_kernel_free_frames(&self) -> u64 {
+        // SAFETY: syscall(13) = InspectKernel; query_id=4 = free frame count.
+        let ret = unsafe { raw_syscall(13, 4, 0, 0) };
+        if ret < 0 { 0 } else { ret as u64 }
+    }
+
+    /// Return the total usable physical frames at boot time.
+    ///
+    /// Wraps InspectKernel query 5.
+    pub fn inspect_kernel_total_frames(&self) -> u64 {
+        // SAFETY: syscall(13) = InspectKernel; query_id=5 = total frame count.
+        let ret = unsafe { raw_syscall(13, 5, 0, 0) };
+        if ret < 0 { 0 } else { ret as u64 }
+    }
+
+    /// Timer ticks the given core spent running a user task (not idle) since boot.
+    ///
+    /// Wraps InspectKernel query 6 (arg1 = core index).
+    pub fn inspect_core_active_ticks(&self, core: u32) -> u64 {
+        // SAFETY: syscall(13) = InspectKernel; query_id=6, arg1=core.
+        let ret = unsafe { raw_syscall(13, 6, core as u64, 0) };
+        if ret < 0 { 0 } else { ret as u64 }
+    }
+
+    /// Total timer ticks seen on the given core since boot.
+    ///
+    /// Wraps InspectKernel query 7 (arg1 = core index).
+    pub fn inspect_core_total_ticks(&self, core: u32) -> u64 {
+        // SAFETY: syscall(13) = InspectKernel; query_id=7, arg1=core.
+        let ret = unsafe { raw_syscall(13, 7, core as u64, 0) };
+        if ret < 0 { 0 } else { ret as u64 }
+    }
+
+    /// Number of CPU cores ready since boot.
+    ///
+    /// Wraps InspectKernel query 8.
+    pub fn inspect_core_count(&self) -> u32 {
+        // SAFETY: syscall(13) = InspectKernel; query_id=8.
+        let ret = unsafe { raw_syscall(13, 8, 0, 0) };
+        if ret <= 0 { 1 } else { ret as u32 }
+    }
+
     /// Read the hardware TSC (Time Stamp Counter) via the kernel.
     ///
     /// Returns RDTSC cycle count. Useful for measuring kernel operation latencies
@@ -305,6 +399,42 @@ impl ServiceContext {
         // SAFETY: syscall(13) = InspectKernel; query_id=3 = read TSC.
         let ret = unsafe { raw_syscall(13, 3, 0, 0) };
         if ret < 0 { 0 } else { ret as u64 }
+    }
+
+    /// Query the kernel task stat for scheduler slot `slot` (syscall 16).
+    ///
+    /// Returns a best-effort snapshot. If `slot` is out of range or the task
+    /// is dead, `valid` will be false.
+    pub fn task_stat(&self, slot: u32) -> TaskStat {
+        let mut buf = [0u8; 72];
+        // SAFETY: syscall(16) = TaskStat; buf is a local array on the user stack.
+        let ret = unsafe {
+            raw_syscall(16, slot as u64, buf.as_mut_ptr() as u64, 72)
+        };
+        if ret != 0 {
+            return TaskStat {
+                valid: false, state: 0, core: 0,
+                mem_used: 0, mem_limit: 0, name_len: 0, name: [0u8; 32],
+                generation: 0, queue_depth: 0, run_ticks: 0,
+            };
+        }
+        let valid       = buf[0] != 0;
+        let state       = buf[1];
+        let core        = buf[2];
+        let name_len    = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+        let mem_used    = u64::from_le_bytes([buf[8],  buf[9],  buf[10], buf[11],
+                                              buf[12], buf[13], buf[14], buf[15]]);
+        let mem_limit   = u64::from_le_bytes([buf[16], buf[17], buf[18], buf[19],
+                                              buf[20], buf[21], buf[22], buf[23]]);
+        let mut name = [0u8; 32];
+        let copy_len = name_len.min(32);
+        name[..copy_len].copy_from_slice(&buf[24..24 + copy_len]);
+        let generation  = u32::from_le_bytes([buf[56], buf[57], buf[58], buf[59]]);
+        let queue_depth = buf[60];
+        let run_ticks   = u64::from_le_bytes([buf[64], buf[65], buf[66], buf[67],
+                                              buf[68], buf[69], buf[70], buf[71]]);
+        TaskStat { valid, state, core, mem_used, mem_limit, name_len: copy_len, name,
+                   generation, queue_depth, run_ticks }
     }
 
     /// Send a message via an explicit cap handle (blocking).

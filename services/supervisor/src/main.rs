@@ -18,12 +18,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Spawn pong and ping first so IPC between them is established well before
     // probe services compete for scheduler quanta.  Pong must precede ping:
     // ping's SEND cap to pong is wired by the kernel at spawn time.
-    if ctx.spawn_on("pong", 1).is_err() {
-        ctx.log("supervisor: WARN: failed to spawn pong on core 1, trying core 0");
-        let _ = ctx.spawn_on("pong", 0);
-    }
-    if ctx.spawn_on("ping", 0).is_err() {
-        ctx.log("supervisor: WARN: failed to spawn ping");
+    // Skipped in idle-only builds (S8): no active workload by design.
+    #[cfg(not(feature = "idle-only"))]
+    {
+        if ctx.spawn_on("pong", 1).is_err() {
+            ctx.log("supervisor: WARN: failed to spawn pong on core 1, trying core 0");
+            let _ = ctx.spawn_on("pong", 0);
+        }
+        if ctx.spawn_on("ping", 0).is_err() {
+            ctx.log("supervisor: WARN: failed to spawn ping");
+        }
     }
 
     // Identity probe services are harness-driven (QEMU control port sends kill
@@ -64,8 +68,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Excluded in identity-only builds so supervisor: ready appears in < 10 s on
     // TCG, giving WithRestart tests plenty of deadline margin (§22 flakiness fix).
     // Also excluded in bare-metal builds (no harness present).
-    #[cfg(not(feature = "bare-metal"))]
+    #[cfg(not(any(feature = "bare-metal", feature = "idle-only")))]
     spawn_extended_probes(&ctx);
+
+    // observe: spawn in bare-metal + full builds only; excluded from all
+    // test-specific builds where the extra 224-slot scan every 500 yields
+    // would add noise to benchmark and stress timings.
+    #[cfg(not(any(feature = "identity-only", feature = "perf-only",
+                  feature = "perf-brutal-only", feature = "stress-only",
+                  feature = "adv-only", feature = "chaos-only",
+                  feature = "b2-only", feature = "bp2-only")))]
+    let _ = ctx.spawn("observe");
 
     ctx.log("supervisor: ready");
 
@@ -87,6 +100,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 // bare-metal: no probes at all — spawn_extended_probes is never called, but
 // the function must exist so the linker is happy.
 #[cfg(feature = "bare-metal")]
+#[inline(always)]
+fn spawn_extended_probes(_ctx: &ServiceContext) {}
+
+// idle-only (S8): no probes, no pong/ping.
+#[cfg(feature = "idle-only")]
 #[inline(always)]
 fn spawn_extended_probes(_ctx: &ServiceContext) {}
 
@@ -218,7 +236,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
 }
 
 // Full build: spawn all non-identity probe categories.
-#[cfg(not(any(feature = "bare-metal", feature = "identity-only", feature = "perf-only", feature = "perf-brutal-only", feature = "stress-only", feature = "adv-only", feature = "chaos-only", feature = "b2-only", feature = "bp2-only")))]
+#[cfg(not(any(feature = "bare-metal", feature = "idle-only", feature = "identity-only", feature = "perf-only", feature = "perf-brutal-only", feature = "stress-only", feature = "adv-only", feature = "chaos-only", feature = "b2-only", feature = "bp2-only")))]
 fn spawn_extended_probes(ctx: &ServiceContext) {
     // --- Brutal adversarial test probes — Milestone 20 ---
     // Spawned EARLY, before property/stress kill-respawn loops start, so the

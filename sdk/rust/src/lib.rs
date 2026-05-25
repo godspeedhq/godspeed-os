@@ -12,7 +12,7 @@ pub(crate) mod syscall;
 
 pub use capability::{CapHandle, CapError};
 pub use ipc::{Message, IpcError};
-pub use service_context::ServiceContext;
+pub use service_context::{ServiceContext, TaskStat};
 
 pub type Result<T> = core::result::Result<T, Error>;
 

@@ -1,9 +1,7 @@
 name: identity
 
 on:
-  push:
-    branches: [main]
-  workflow_dispatch:
+  workflow_dispatch:  # paused: re-add push/branches: [main] when CI minutes are available
 
 jobs:
   identity:

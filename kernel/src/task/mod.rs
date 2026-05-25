@@ -2211,6 +2211,16 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
         })),
+        "observe" => Some(("observe", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_OBSERVE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0,
+            memory_limit:      8 * 1024 * 1024,
+            hw_irqs:           &[],
+        })),
         _ => None,
     }
 }

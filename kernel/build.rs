@@ -31,6 +31,7 @@ fn main() {
         ("PING",       "ping"),
         ("PONG",       "pong"),
         ("PROBE",      "probe"),
+        ("OBSERVE",    "observe"),
     ];
 
     for (env_name, bin_name) in services {

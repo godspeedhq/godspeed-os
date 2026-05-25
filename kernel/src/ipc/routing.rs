@@ -263,6 +263,15 @@ pub fn is_endpoint_alive(endpoint: EndpointId) -> bool {
     table.iter().any(|e| e.valid && e.id == endpoint && e.liveness == EndpointLiveness::Alive)
 }
 
+/// Return the current queue depth for `endpoint`, or 0 if not found.
+pub fn endpoint_queue_depth(endpoint: EndpointId) -> u8 {
+    let table = TABLE.lock();
+    table.iter()
+        .find(|e| e.valid && e.id == endpoint)
+        .map(|e| e.queue.depth() as u8)
+        .unwrap_or(0)
+}
+
 /// Mark the endpoint dead: bump generation, drain queue, return blocked slots.
 ///
 /// Returns `(blocked_receiver_slot, blocked_sender_slot)` — the caller must

@@ -34,6 +34,7 @@ pub enum SyscallNumber {
     InspectKernel  = 13,
     QueryCapRights = 14,
     RemoveCap      = 15,
+    TaskStat       = 16,
 }
 
 /// Raw syscall dispatcher — called from the SYSCALL/SYSENTER IDT stub.
@@ -69,6 +70,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::InspectKernel  as u64 => handle_inspect_kernel(arg0, arg1, arg2),
         n if n == SyscallNumber::QueryCapRights as u64 => handle_query_cap_rights(arg0),
         n if n == SyscallNumber::RemoveCap      as u64 => handle_remove_cap(arg0),
+        n if n == SyscallNumber::TaskStat       as u64 => handle_task_stat(arg0, arg1, arg2),
         _ => -1, // Unknown syscall.
     }
 }
@@ -503,6 +505,11 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         0 => scheduler::current_task_alloc_bytes() as i64,
         1 => crate::ipc::routing::count_live_endpoints() as i64,
         3 => read_cycle_counter() as i64,
+        4 => crate::memory::allocator::free_frame_count() as i64,
+        5 => crate::memory::allocator::total_frame_count() as i64,
+        6 => scheduler::core_active_ticks(arg1 as usize) as i64,
+        7 => scheduler::core_total_ticks(arg1 as usize) as i64,
+        8 => crate::smp::core::ready_count() as i64,
         2 => {
             // Endpoint generation by name.
             let len = arg2 as usize;
@@ -558,6 +565,57 @@ fn handle_query_cap_rights(slot: u64) -> i64 {
 fn handle_remove_cap(slot: u64) -> i64 {
     scheduler::current_task_remove_cap(slot as usize);
     0
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: TaskStat (16) — read task state for a given slot index.
+// ---------------------------------------------------------------------------
+
+/// arg0 = slot (u32), arg1 = buf_ptr (user VA), arg2 = buf_len (must be ≥ 72).
+///
+/// No capability required — read-only kernel state, consistent with InspectKernel.
+///
+/// Buffer layout (72 bytes):
+///   [0]       valid:       u8  (1 = live, 0 = dead/unused)
+///   [1]       state:       u8  (0=Ready, 1=Running, 2=BlockedOnRecv, 3=BlockedOnSend, 4=Dead)
+///   [2]       core:        u8
+///   [3]       pad:         u8
+///   [4..8]    name_len:    u32 LE
+///   [8..16]   mem_used:    u64 LE
+///   [16..24]  mem_limit:   u64 LE
+///   [24..56]  name:        [u8; 32] (truncated; zero-padded)
+///   [56..60]  generation:  u32 LE
+///   [60]      queue_depth: u8
+///   [61..64]  pad:         [u8; 3]
+///   [64..72]  run_ticks:   u64 LE
+///
+/// Returns 0 on success, -1 on invalid args.
+fn handle_task_stat(slot: u64, buf_ptr: u64, buf_len: u64) -> i64 {
+    const STAT_SIZE: usize = 72;
+    if buf_len < STAT_SIZE as u64 { return -1; }
+    if !validate_user_ptr(buf_ptr, STAT_SIZE) { return -1; }
+
+    let stat = scheduler::task_stat(slot as usize);
+
+    let name_bytes = stat.name.as_bytes();
+    let copy_len   = name_bytes.len().min(32);
+    let name_len   = copy_len as u32;
+
+    let mut buf = [0u8; STAT_SIZE];
+    buf[0] = stat.valid as u8;
+    buf[1] = stat.state;
+    buf[2] = stat.core as u8;
+    // buf[3] = 0 (pad, already zeroed)
+    buf[4..8].copy_from_slice(&name_len.to_le_bytes());
+    buf[8..16].copy_from_slice(&stat.mem_used.to_le_bytes());
+    buf[16..24].copy_from_slice(&stat.mem_limit.to_le_bytes());
+    buf[24..24 + copy_len].copy_from_slice(&name_bytes[..copy_len]);
+    buf[56..60].copy_from_slice(&stat.generation.to_le_bytes());
+    buf[60] = stat.queue_depth;
+    // buf[61..64] = 0 (pad, already zeroed)
+    buf[64..72].copy_from_slice(&stat.run_ticks.to_le_bytes());
+
+    if write_user_bytes(buf_ptr, &buf) { 0 } else { -1 }
 }
 
 fn ipc_err_to_i64(e: IpcError) -> i64 {

@@ -17,6 +17,7 @@ use crate::capability::rights::Rights;
 use crate::capability::table::CapTable;
 use crate::ipc::endpoint::EndpointId;
 use crate::ipc::message::Message;
+use crate::ipc::routing;
 use crate::task::state::TaskState;
 
 // ---------------------------------------------------------------------------
@@ -84,7 +85,9 @@ static mut TASK_ALLOC_BYTES:   [u64; MAX_TASKS] = [0u64; MAX_TASKS];
 static mut TASK_LIMIT_BYTES:   [u64; MAX_TASKS] = [0u64; MAX_TASKS];
 /// Next virtual address available for dynamic allocation in each task's space.
 static mut TASK_NEXT_ALLOC_VA: [u64; MAX_TASKS] = [0u64; MAX_TASKS];
-
+/// Timer ticks each task spent as the running task on its core.
+static TASK_RUN_TICKS: [AtomicU64; MAX_TASKS] =
+    [const { AtomicU64::new(0) }; MAX_TASKS];
 
 // ---------------------------------------------------------------------------
 // Per-core scheduler state.
@@ -93,6 +96,18 @@ static mut TASK_NEXT_ALLOC_VA: [u64; MAX_TASKS] = [0u64; MAX_TASKS];
 /// Index of the task currently running on each core (IDLE if none).
 static CORE_CURRENT: [AtomicUsize; MAX_CORES] =
     [const { AtomicUsize::new(IDLE) }; MAX_CORES];
+/// AtomicU64 padded to one 64-byte cache line to prevent false sharing between
+/// per-core ISR hot-path writes on different cores (`lock xadd` on adjacent
+/// elements would otherwise bounce the same cache line between cores).
+#[repr(align(64))]
+struct CachePaddedU64(AtomicU64);
+
+/// Timer ticks each core spent running a user task (not idle).
+static CORE_ACTIVE_TICKS: [CachePaddedU64; MAX_CORES] =
+    [const { CachePaddedU64(AtomicU64::new(0)) }; MAX_CORES];
+/// Total timer ticks seen on each core.
+static CORE_TOTAL_TICKS: [CachePaddedU64; MAX_CORES] =
+    [const { CachePaddedU64(AtomicU64::new(0)) }; MAX_CORES];
 
 /// Sticky round-robin scan pointer per core (§9.1, §9.3).
 ///
@@ -511,6 +526,63 @@ pub fn current_task_alloc_bytes() -> u64 {
     }
 }
 
+/// Raw task stat snapshot for a given slot. Used by TaskStat syscall (16).
+pub struct TaskStatRaw {
+    pub valid:       bool,
+    pub state:       u8,
+    pub core:        u32,
+    pub mem_used:    u64,
+    pub mem_limit:   u64,
+    pub name:        &'static str,
+    pub generation:  u32,
+    pub queue_depth: u8,
+    pub run_ticks:   u64,
+}
+
+/// Return a best-effort snapshot of task state at `slot`.
+///
+/// Called from the TaskStat syscall (16) handler. Consistent with the same
+/// best-effort snapshot contract used by `for_each_active_cap`.
+pub fn task_stat(slot: usize) -> TaskStatRaw {
+    if slot >= MAX_TASKS {
+        return TaskStatRaw { valid: false, state: 0, core: 0, mem_used: 0, mem_limit: 0,
+                             name: "", generation: 0, queue_depth: 0, run_ticks: 0 };
+    }
+    // SAFETY: read-only snapshot of static arrays; all reads are individually
+    // naturally-atomic on x86_64 (u64/u32/pointer-width). Best-effort consistency
+    // is acceptable — same contract as for_each_active_cap.
+    unsafe {
+        let endpoint = TASK_ENDPOINT[slot];
+        let (generation, queue_depth) = match endpoint {
+            Some(ep) => (routing::get_generation(ep).0, routing::endpoint_queue_depth(ep)),
+            None     => (0, 0),
+        };
+        TaskStatRaw {
+            valid:       TASK_VALID[slot].load(Ordering::Relaxed),
+            state:       TASK_STATE[slot].load(Ordering::Acquire),
+            core:        TASK_CORE[slot],
+            mem_used:    TASK_ALLOC_BYTES[slot],
+            mem_limit:   TASK_LIMIT_BYTES[slot],
+            name:        TASK_NAME[slot],
+            generation,
+            queue_depth,
+            run_ticks:   TASK_RUN_TICKS[slot].load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Total timer ticks the given core spent running a user task (not idle).
+pub fn core_active_ticks(core: usize) -> u64 {
+    if core >= MAX_CORES { return 0; }
+    CORE_ACTIVE_TICKS[core].0.load(Ordering::Relaxed)
+}
+
+/// Total timer ticks seen on the given core since boot.
+pub fn core_total_ticks(core: usize) -> u64 {
+    if core >= MAX_CORES { return 0; }
+    CORE_TOTAL_TICKS[core].0.load(Ordering::Relaxed)
+}
+
 /// Insert a capability into the current task's table (incoming GRANT).
 pub fn current_task_insert_cap(cap: Capability) -> Result<usize, CapError> {
     let cid = current_core_id();
@@ -653,6 +725,12 @@ pub extern "C" fn timer_tick_from_irq() {
 
         let prev = CORE_CURRENT[cid].load(Ordering::Relaxed);
 
+        // Accumulate CPU utilisation counters.
+        CORE_TOTAL_TICKS[cid].0.fetch_add(1, Ordering::Relaxed);
+        if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) {
+            CORE_ACTIVE_TICKS[cid].0.fetch_add(1, Ordering::Relaxed);
+        }
+
         // CAS instead of store: if a cross-core kill wrote Dead between our
         // load and this transition, the CAS fails and Dead is preserved.
         // An unconditional store(Ready) would silently overwrite Dead, causing
@@ -762,6 +840,13 @@ pub fn yield_current() {
     // SAFETY: IF=0.
     unsafe {
         let prev = CORE_CURRENT[cid].load(Ordering::Relaxed);
+
+        // Count each scheduler quantum (yield or timer) for CPU utilisation.
+        CORE_TOTAL_TICKS[cid].0.fetch_add(1, Ordering::Relaxed);
+        if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) {
+            CORE_ACTIVE_TICKS[cid].0.fetch_add(1, Ordering::Relaxed);
+        }
+
         // CAS: preserve Dead if a cross-core kill races with this transition.
         if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) {
             let _ = TASK_STATE[prev].compare_exchange(

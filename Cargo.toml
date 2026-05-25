@@ -13,6 +13,7 @@ members = [
     "examples/ping",
     "examples/pong",
     "services/probe",
+    "services/observe",
 ]
 
 # kernel and all services/examples build for the bare-metal target;

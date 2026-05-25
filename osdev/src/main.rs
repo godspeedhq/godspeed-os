@@ -23,7 +23,7 @@
 //!   osdev test adv-brutal   — run brutal adversarial tests BA1–BA10 (Milestone 20)
 //!   osdev test chaos        — run §22 chaos / graceful-degradation test suite (Milestone 14)
 //!   osdev test chaos-brutal — run brutal chaos tests BC1–BC7 (Milestone 21)
-//!   osdev image [--mode M]  — build + create bootable disk image (build/os.img); M=bare-metal|perf|perf-brutal|identity|stress|adv|chaos
+//!   osdev image [--mode M]  — build + create bootable disk image (build/os.img); M=bare-metal|perf|perf-brutal|identity|stress|adv|chaos|s8
 
 mod disk_image;
 mod qemu;
@@ -71,7 +71,7 @@ enum Commands {
     Image {
         /// Supervisor feature baked into the image.
         ///
-        /// bare-metal  — pong + ping only; no probe services (default, safest on HW)
+        /// bare-metal  — pong + ping + observe; no probe services (default; S6 24-hour stability)
         /// perf        — regular perf probes B1–B10
         /// perf-brutal — brutal perf probes BP1–BP10
         /// identity    — identity-only probes (WatchSerial tests; WithRestart needs COM2)
@@ -111,7 +111,7 @@ pub fn cmd_build() {
     // Services must be compiled before the kernel — kernel/build.rs embeds
     // the service ELF bytes via include_bytes!(env!("SVC_*_ELF")).
     let service_crates = [
-        "init", "supervisor", "registry", "logger", "ping", "pong", "probe",
+        "init", "supervisor", "registry", "logger", "ping", "pong", "probe", "observe",
     ];
     for crate_name in &service_crates {
         let status = std::process::Command::new("cargo")
@@ -140,7 +140,7 @@ pub fn cmd_build() {
 /// Build for bare-metal USB: supervisor with `--features bare-metal` (pong + ping only,
 /// no probe services that require the QEMU harness control port to complete).
 pub fn cmd_build_bare_metal() {
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe", "observe"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -176,12 +176,53 @@ pub fn cmd_build_bare_metal() {
     println!("build: kernel OK");
 }
 
+/// Build for S8 idle-stability run: supervisor with `--features idle-only`.
+/// Spawns only observe — no pong, no ping, no probes.  The kernel idles on all
+/// cores; observe snapshots system state every ~500 yields.
+/// Bar: no panic, no resource leak after 24 hours.
+pub fn cmd_build_idle() {
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe", "observe"];
+    for crate_name in &non_supervisor {
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--release", "-p", crate_name,
+                   "--target", "x86_64-unknown-none"])
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run cargo build for {}: {}", crate_name, e));
+        if !status.success() {
+            eprintln!("build: {} FAILED", crate_name);
+            std::process::exit(1);
+        }
+        println!("build: {} OK", crate_name);
+    }
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "supervisor",
+               "--target", "x86_64-unknown-none",
+               "--features", "supervisor/idle-only"])
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run cargo build for supervisor: {}", e));
+    if !status.success() {
+        eprintln!("build: supervisor (idle-only) FAILED");
+        std::process::exit(1);
+    }
+    println!("build: supervisor (idle-only) OK");
+
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .status()
+        .expect("failed to run cargo build for kernel");
+    if !status.success() {
+        eprintln!("build: kernel FAILED");
+        std::process::exit(1);
+    }
+    println!("build: kernel OK");
+}
+
 /// Like `cmd_build` but compiles supervisor with `--features identity-only`.
 /// Used by `run_identity_tests` so the supervisor spawn loop takes < 10 s on
 /// TCG instead of 30–200 s with the full 160+ probe service set.
 pub fn cmd_build_identity() {
     // Build every service crate except supervisor first.
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe", "observe"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -224,7 +265,7 @@ pub fn cmd_build_identity() {
 /// the TCG spawn-wait from 18–120 s down to ~2–5 s and giving each benchmark
 /// maximum headroom before its timeout fires.
 pub fn cmd_build_perf() {
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe", "observe"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -264,7 +305,7 @@ pub fn cmd_build_perf() {
 /// hardware stress run (S1–S10). All stress probes use ctx.kill/ctx.spawn
 /// internally — no QEMU control port required.
 pub fn cmd_build_stress() {
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe", "observe"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -303,7 +344,7 @@ pub fn cmd_build_stress() {
 /// Like `cmd_build_adv` but uses `--features chaos-only` for a self-contained
 /// hardware chaos run (C2–C7). C1 and C4 use bare-metal + hardware reconfiguration.
 pub fn cmd_build_chaos() {
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe", "observe"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -343,7 +384,7 @@ pub fn cmd_build_chaos() {
 /// Eliminates concurrent IPI noise from other benchmarks (B5 spawn/kill, B6 restart)
 /// that triggers the Goldmont+ BSP IPI delivery quirk on the blocking round-trip.
 pub fn cmd_build_b2_only() {
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe", "observe"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -382,7 +423,7 @@ pub fn cmd_build_b2_only() {
 /// BP2 brutal-isolation build: spawns only perf-bp2 + perf-bp2-echo alongside pong/ping.
 /// Brutal equivalent of b2-only — 1000-sample iteration count, same isolation rationale.
 pub fn cmd_build_bp2_only() {
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe", "observe"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -422,7 +463,7 @@ pub fn cmd_build_bp2_only() {
 /// hardware adversarial run (A1–A10). All adversarial probes are self-contained —
 /// no QEMU control port required.
 pub fn cmd_build_adv() {
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe", "observe"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -461,7 +502,7 @@ pub fn cmd_build_adv() {
 /// Like `cmd_build_perf` but uses `--features perf-brutal-only` for the brutal
 /// benchmark suite (BP1–BP10).
 pub fn cmd_build_brutal_perf() {
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe", "observe"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -523,8 +564,9 @@ fn cmd_image(mode: &str) {
         "chaos"       => cmd_build_chaos(),
         "b2-only"     => cmd_build_b2_only(),
         "bp2-only"    => cmd_build_bp2_only(),
+        "s8"          => cmd_build_idle(),
         other => {
-            eprintln!("image: unknown --mode '{}'; valid: bare-metal, perf, perf-brutal, identity, stress, adv, chaos, b2-only, bp2-only", other);
+            eprintln!("image: unknown --mode '{}'; valid: bare-metal, perf, perf-brutal, identity, stress, adv, chaos, b2-only, bp2-only, s8", other);
             std::process::exit(1);
         }
     }
