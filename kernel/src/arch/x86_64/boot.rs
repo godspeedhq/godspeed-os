@@ -105,6 +105,11 @@ impl IdtEntry {
             _reserved:   0,
         }
     }
+
+    /// Like `new` but DPL=3 — ring-3 code may invoke this vector via `int N`.
+    fn new_user(handler: u64) -> Self {
+        Self { type_attr: 0xEE, ..Self::new(handler) } // P=1, DPL=3, interrupt gate
+    }
 }
 
 // SAFETY: written only during init_idt before APs start; read-only after.
@@ -147,6 +152,47 @@ pub static TSC_DEADLINE_MODE: AtomicBool = AtomicBool::new(false);
 
 /// TSC ticks per 10 ms quantum.  Set once during BSP boot; read by every core.
 static TSC_TICKS_PER_QUANTUM: AtomicU64 = AtomicU64::new(0);
+
+// ---------------------------------------------------------------------------
+// Diagnostic exception flags — set as the very first action inside each
+// exception stub, before any serial output that might stall with IF=0.
+// Reported by timer ISR ticks 10/11/12 on whichever cores are still alive.
+// ---------------------------------------------------------------------------
+
+/// Set (to 1) by the `exception_halt` stub before `cli`.
+/// Tick 10 reports [EXC-HALT-YES/NO].
+pub static EXCEPTION_HALT_REACHED: AtomicBool = AtomicBool::new(false);
+
+/// Set (to 1) by `pf_stub` as its very first instruction (before swapgs).
+/// Tick 11 reports [PF-YES/NO] and the stored CR2 value.
+pub static PF_REACHED: AtomicBool = AtomicBool::new(false);
+
+/// CR2 at the time of the first #PF; written by `pf_stub` before swapgs.
+pub static PF_CR2_STORED: AtomicU64 = AtomicU64::new(0);
+
+/// Set (to 1) by `gpf_stub` as its very first instruction.
+/// Tick 12 reports [GP-YES/NO].
+pub static GP_REACHED: AtomicBool = AtomicBool::new(false);
+
+/// Per-core interrupted RIP saved by `timer_tick_from_irq` on every tick.
+/// Index = core ID (0–3).  Low 2 bits of the matching INTERRUPTED_CS entry = CPL.
+pub static INTERRUPTED_RIP: [AtomicU64; 4] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+];
+
+/// Per-core interrupted CS saved by `timer_tick_from_irq` on every tick.
+/// Low 2 bits are CPL: 0 = ring-0, 3 = ring-3.
+pub static INTERRUPTED_CS: [AtomicU64; 4] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+];
+
+/// Per-core interrupted user RSP saved by `timer_tick_from_irq` on every tick.
+/// Only meaningful when the matching INTERRUPTED_CS entry shows CPL=3.
+/// If RSP == 0x80000000 (init's initial stack top) the task was interrupted
+/// before executing its very first instruction (`push rbx` at 0x400000).
+pub static INTERRUPTED_RSP: [AtomicU64; 4] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+];
 
 // ---------------------------------------------------------------------------
 // Public init surface.
@@ -264,8 +310,11 @@ pub unsafe fn init_local_apic() {
         // On QEMU (no TSC-Deadline in default cpu model) this is the normal path.
         write_apic(apic_virt, APIC_LVT_TIMER, (1 << 17) | 0x20);
         write_apic(apic_virt, APIC_TIMER_DIVIDE, 0x03);
-        // ~10 ms at 1 GHz APIC bus / 16 divider.
-        write_apic(apic_virt, APIC_TIMER_INIT, 625_000);
+        // ~100 ms at 1 GHz APIC bus / 16 divider (QEMU).
+        // ~50 ms on AMD GX-420GI (Jaguar): APIC timer ≈ CPU_CLOCK/16 ≈ 125 MHz.
+        // Increased 10× from 625_000 to break the timer-ISR cascade on AMD hardware
+        // where verbose diagnostic output (~18 ms) exceeded the prior 5 ms period.
+        write_apic(apic_virt, APIC_TIMER_INIT, 6_250_000);
         if tsc_deadline_supported {
             crate::kprintln!("apic: core {} periodic timer (TSC freq unknown)", lapic_id);
         }
@@ -380,6 +429,18 @@ pub unsafe fn rearm_tsc_deadline() {
     unsafe { arm_tsc_deadline_now(ticks) };
 }
 
+/// Returns true when running on a GenuineIntel CPU.
+///
+/// Used to gate Intel-specific MSR accesses (e.g. MSR 0xE2) that do not exist
+/// on AMD and would cause #GP(0) if accessed there.
+fn is_intel_cpu() -> bool {
+    // CPUID leaf 0: EBX/ECX/EDX encode the 12-byte vendor string.
+    // "GenuineIntel" → EBX=0x756e6547 EDX=0x49656e69 ECX=0x6c65746e
+    // SAFETY: __cpuid(0) is universally safe on x86_64.
+    let r = unsafe { core::arch::x86_64::__cpuid(0) };
+    r.ebx == 0x756e_6547 && r.edx == 0x4965_6e69 && r.ecx == 0x6c65_746e
+}
+
 /// Limit package C-states to PC1 to prevent APIC power-gate on Goldmont+.
 ///
 /// On Intel Atom / Goldmont+ (Gemini Lake, Wyse 5070 J5005), the firmware
@@ -398,11 +459,18 @@ pub unsafe fn rearm_tsc_deadline() {
 /// # Safety
 /// Ring-0 only.  Called once per core from `init_local_apic` after APIC setup.
 unsafe fn limit_package_cstates(core_id: u32) {
+    // MSR 0xE2 (MSR_PKG_CST_CONFIG_CONTROL) is Intel-specific.
+    // On AMD processors this MSR does not exist; RDMSR/WRMSR cause #GP(0).
+    if !is_intel_cpu() {
+        return;
+    }
+
     const MSR_PKG_CST_CONFIG_CONTROL: u32 = 0xE2;
     const CFG_LOCK: u64 = 1 << 15;
     const PC1_LIMIT: u64 = 1; // bits[2:0] = 001 → max package C-state = PC1
 
-    // SAFETY: RDMSR in ring-0; MSR 0xE2 exists on all Intel Goldmont+ platforms.
+    // SAFETY: RDMSR in ring-0; Intel vendor confirmed above; MSR 0xE2 exists
+    // on all Intel Goldmont+ platforms.
     let (lo, hi): (u32, u32);
     unsafe {
         core::arch::asm!(
@@ -571,6 +639,7 @@ unsafe fn write_apic(base: u64, reg: u64, val: u32) {
     unsafe { ((base + reg) as *mut u32).write_volatile(val) };
 }
 
+
 /// Build a 16-byte TSS descriptor (two 8-byte GDT slots) for `tss_ptr`.
 ///
 /// Returns `(low_qword, high_qword)` to be stored at GDT[6..=7].
@@ -725,6 +794,20 @@ pub(super) unsafe fn init_syscall(core_id: u32) {
             options(nostack, nomem),
         );
 
+        // LSTAR readback — confirm the WRMSR took effect (AMD quirk guard).
+        let (lstar_rd_lo, lstar_rd_hi): (u32, u32);
+        core::arch::asm!(
+            "rdmsr",
+            in("ecx")  0xC000_0082u32,
+            out("eax") lstar_rd_lo,
+            out("edx") lstar_rd_hi,
+            options(nostack, nomem),
+        );
+        let lstar_rd = ((lstar_rd_hi as u64) << 32) | (lstar_rd_lo as u64);
+        crate::kprintln!(
+            "init_syscall: core={} LSTAR={:#018x} (expected={:#018x})",
+            core_id, lstar_rd, lstar as u64);
+
         // SFMASK MSR.
         core::arch::asm!(
             "wrmsr",
@@ -732,6 +815,41 @@ pub(super) unsafe fn init_syscall(core_id: u32) {
             in("eax") SFMASK as u32,
             in("edx") (SFMASK >> 32) as u32,
             options(nostack, nomem),
+        );
+
+        // CSTAR MSR (0xC000_0083) — AMD compat-mode SYSCALL dispatch target.
+        // On AMD CPUs a `syscall` from compat mode (CS.L=0) dispatches here, not LSTAR.
+        // GodspeedOS ring-3 runs in 64-bit mode (CS.L=1) and uses `ud2` for syscalls,
+        // so `cstar_entry` should never be reached; it halts loudly if it ever is.
+        let cstar = super::syscall_entry::cstar_entry as u64;
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") 0xC000_0083u32,
+            in("eax") cstar as u32,
+            in("edx") (cstar >> 32) as u32,
+            options(nostack, nomem),
+        );
+
+        // Diagnostic: read back EFER to confirm SCE (bit 0) and NXE (bit 11) are set.
+        // NXE absence on Limine-BIOS boot (AMD T630) makes bit 63 in PTEs a reserved
+        // bit, causing silent #PF on first ring-3 stack access.
+        let (efer_rd_lo, efer_rd_hi): (u32, u32);
+        core::arch::asm!(
+            "rdmsr",
+            in("ecx")  0xC000_0080u32,
+            out("eax") efer_rd_lo,
+            out("edx") efer_rd_hi,
+            options(nostack, nomem),
+        );
+        let efer_rd = ((efer_rd_hi as u64) << 32) | (efer_rd_lo as u64);
+        crate::kprintln!(
+            "init_syscall: core={} EFER={:#010x} SCE={} NXE={} LME={} LMA={}",
+            core_id,
+            efer_rd,
+            (efer_rd >> 0) & 1,
+            (efer_rd >> 11) & 1,
+            (efer_rd >> 8) & 1,
+            (efer_rd >> 10) & 1,
         );
     }
 
@@ -811,10 +929,16 @@ pub(super) unsafe fn init_idt() {
         for entry in IDT.iter_mut() {
             *entry = IdtEntry::new(halt);
         }
+        // IDT[6] = #UD handler: used as the syscall entry on AMD GX-420GI where
+        // both SYSCALL and int $0x80 silently stall from ring-3.  DPL=0 is
+        // correct — CPU exceptions bypass the DPL check, so ud2 from ring-3
+        // always dispatches here; int 6 from ring-3 would #GP (intended).
+        IDT[6]    = IdtEntry::new(super::syscall_entry::ud2_syscall_entry as u64);
         IDT[13]   = IdtEntry::new(gpf_stub  as u64);
         IDT[14]   = IdtEntry::new(pf_stub   as u64);
         IDT[32]   = IdtEntry::new(timer);
         IDT[36]   = IdtEntry::new(super::interrupts::uart_rx_isr_stub as u64); // IRQ 4 = COM1 RX
+        IDT[0x80] = IdtEntry::new_user(super::syscall_entry::int80_entry as u64);
         IDT[0xF0] = IdtEntry::new(ipi_wake_stub   as u64);
         IDT[0xF1] = IdtEntry::new(ipi_tlb_stub    as u64);
         IDT[0xF2] = IdtEntry::new(ipi_tick_stub   as u64);
@@ -928,12 +1052,24 @@ unsafe fn init_paging(_boot_info: &BootInfo) {}
 #[unsafe(naked)]
 unsafe extern "C" fn gpf_stub() -> ! {
     // SAFETY: vector 13 pushes error_code then RIP; reads are before any RSP change.
+    // GP_REACHED is set before any other work so timer ISR on other cores can
+    // report it even if gpf_handler stalls.
     core::arch::naked_asm!(
+        // Raw 'G' to COM1 as absolute first instruction.
+        "mov dx, 0x3fd",
+        "88: in al, dx",
+        "test al, 0x20",
+        "jz 88b",
+        "mov dx, 0x3f8",
+        "mov al, 0x47",   // 'G'
+        "out dx, al",
+        "mov byte ptr [{gp_flag}], 1",
         "mov rdi, [rsp]",      // error_code → first arg
         "mov rsi, [rsp + 8]",  // saved RIP  → second arg
         "call gpf_handler",
         "2: hlt",
         "jmp 2b",
+        gp_flag = sym GP_REACHED,
     )
 }
 
@@ -953,6 +1089,32 @@ unsafe extern "C" fn pf_stub() -> ! {
     // access per-core data via gs:[...].  A kernel fault (CPL=0) means
     // GS.base is already the kernel pointer — skip swapgs.
     core::arch::naked_asm!(
+        // Raw 'P' to COM1 as absolute first instruction — fires before any
+        // flag-set or push.  A fault→iretq→fault loop produces a visible
+        // flood independent of all other handler logic.  dx/al are scratch;
+        // this handler never returns to the interrupted context.
+        "mov dx, 0x3fd",
+        "88: in al, dx",
+        "test al, 0x20",
+        "jz 88b",
+        "mov dx, 0x3f8",
+        "mov al, 0x50",   // 'P'
+        "out dx, al",
+        // Store CR2 and set PF_REACHED before any swapgs or serial output.
+        // rax is clobbered transiently; saved/restored so the exception frame
+        // offsets below are unchanged after the pops.
+        "push rax",
+        "mov rax, cr2",
+        "mov [{pf_cr2}], rax",
+        "mov byte ptr [{pf_flag}], 1",
+        "pop rax",
+        // After pop, RSP is back at exception-frame base:
+        //   [RSP+0]  error_code
+        //   [RSP+8]  saved RIP
+        //   [RSP+16] saved CS  (bits 1:0 = CPL)
+        //   [RSP+24] saved RFLAGS
+        //   [RSP+32] saved RSP (user RSP, ring-3→ring-0 only)
+        //   [RSP+40] saved SS
         "xor edx, edx",                // hw_user_rsp = 0 for kernel faults (3rd arg)
         "test byte ptr [rsp + 16], 3", // CPL in saved CS: non-zero = ring-3
         "jz 1f",                       // kernel fault → skip swapgs + rsp load
@@ -964,6 +1126,8 @@ unsafe extern "C" fn pf_stub() -> ! {
         "call pf_handler",
         "2: hlt",
         "jmp 2b",
+        pf_cr2  = sym PF_CR2_STORED,
+        pf_flag = sym PF_REACHED,
     )
 }
 
@@ -1061,7 +1225,19 @@ unsafe extern "C" fn pf_handler(error_code: u64, fault_rip: u64, hw_user_rsp: u6
 
 #[unsafe(naked)]
 unsafe extern "C" fn exception_halt() -> ! {
+    // EXCEPTION_HALT_REACHED set BEFORE cli so timer ISR on other cores
+    // can observe the flag even though Core 0 will lose its timer after cli.
     core::arch::naked_asm!(
+        // Raw '?' to COM1 as absolute first instruction — fires for every
+        // unhandled exception vector before cli or flag-set.
+        "mov dx, 0x3fd",
+        "88: in al, dx",
+        "test al, 0x20",
+        "jz 88b",
+        "mov dx, 0x3f8",
+        "mov al, 0x3f",   // '?'
+        "out dx, al",
+        "mov byte ptr [{flag}], 1",
         "cli",
         "mov rdi, [rsp]",
         "mov rsi, [rsp + 8]",
@@ -1070,6 +1246,7 @@ unsafe extern "C" fn exception_halt() -> ! {
         "call exception_halt_handler",
         "2: hlt",
         "jmp 2b",
+        flag = sym EXCEPTION_HALT_REACHED,
     )
 }
 

@@ -718,8 +718,10 @@ pub fn run(core_id: u32) -> ! {
 
 /// # Safety
 /// Must only be called from the timer ISR with interrupts disabled (IF=0).
+/// The interrupted RIP/CS/RSP are passed from `timer_isr_stub` via rdi/rsi/rdx;
+/// they are unused now that the ring-3 bring-up diagnostics are removed.
 #[no_mangle]
-pub extern "C" fn timer_tick_from_irq() {
+pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u64, _interrupted_rsp: u64) {
     let cid = current_core_id();
     // Free any deferred kstack from a prior self-kill on this core.
     // RSP is now on the current task's kstack, not the dead task's, so

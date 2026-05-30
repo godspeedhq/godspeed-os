@@ -21,67 +21,6 @@ pub struct PerCoreSyscallData {
 pub static mut PER_CORE_SYSCALL: [PerCoreSyscallData; MAX_CORES] =
     [const { PerCoreSyscallData { user_rsp: 0, kernel_rsp: 0 } }; MAX_CORES];
 
-// ---------------------------------------------------------------------------
-// Lock-free serial helpers — used during early init when LOG_LOCK may not
-// be safe to acquire (e.g., concurrent AP bring-up, fault handlers).
-// ---------------------------------------------------------------------------
-
-#[inline]
-unsafe fn ser_putc(c: u8) {
-    // SAFETY: port I/O in ring-0; COM1 LSR (0x3FD) and THR (0x3F8) are standard.
-    unsafe {
-        loop {
-            let lsr: u8;
-            core::arch::asm!(
-                "in al, dx",
-                out("al") lsr,
-                in("dx") 0x3FDu16,
-                options(nostack, nomem),
-            );
-            if lsr & 0x20 != 0 { break; }
-        }
-        core::arch::asm!(
-            "out dx, al",
-            in("dx") 0x3F8u16,
-            in("al") c,
-            options(nostack, nomem),
-        );
-    }
-}
-
-#[inline]
-unsafe fn ser_puts(s: &[u8]) {
-    for &c in s {
-        // SAFETY: called within an unsafe fn; serial port exclusively owned in early-boot context.
-        unsafe { ser_putc(c) };
-    }
-}
-
-#[inline]
-unsafe fn ser_hex64(val: u64) {
-    let mut buf = [0u8; 18];
-    buf[0] = b'0';
-    buf[1] = b'x';
-    for i in 0..16 {
-        let nibble = ((val >> ((15 - i) * 4)) & 0xF) as u8;
-        buf[2 + i] = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
-    }
-    // SAFETY: called within an unsafe fn; serial port exclusively owned in early-boot context.
-    unsafe { ser_puts(&buf) };
-}
-
-#[inline]
-unsafe fn ser_u8_dec(val: u8) {
-    let h = val / 10;
-    let l = val % 10;
-    if h > 0 {
-        // SAFETY: called within an unsafe fn; serial port exclusively owned in early-boot context.
-        unsafe { ser_putc(b'0' + h) };
-    }
-    // SAFETY: called within an unsafe fn; serial port exclusively owned in early-boot context.
-    unsafe { ser_putc(b'0' + l) };
-}
-
 /// Initialise per-core GS MSRs for the SYSCALL stub.
 ///
 /// GS invariant (enforced here and maintained by every ISR/trampoline):
@@ -121,26 +60,6 @@ pub unsafe fn init_per_core_syscall(core_id: usize) {
             in("edx") 0u32,
             options(nostack, nomem),
         );
-
-        // Diagnostic readback of both MSRs.
-        let (gs_lo, gs_hi): (u32, u32);
-        let (kgs_lo, kgs_hi): (u32, u32);
-        core::arch::asm!("rdmsr",
-            in("ecx") 0xC000_0101u32, out("eax") gs_lo, out("edx") gs_hi,
-            options(nostack, nomem));
-        core::arch::asm!("rdmsr",
-            in("ecx") 0xC000_0102u32, out("eax") kgs_lo, out("edx") kgs_hi,
-            options(nostack, nomem));
-        let gs_rb  = ((gs_hi  as u64) << 32) | (gs_lo  as u64);
-        let kgs_rb = ((kgs_hi as u64) << 32) | (kgs_lo as u64);
-
-        ser_puts(b"syscall-init: core ");
-        ser_u8_dec(core_id as u8);
-        ser_puts(b" GS_BASE=");
-        ser_hex64(gs_rb);
-        ser_puts(b" KGSB=");
-        ser_hex64(kgs_rb);
-        ser_putc(b'\n');
     }
 }
 
@@ -192,6 +111,27 @@ pub fn read_cycle_counter() -> u64 {
     // SAFETY: RDTSC is always available on x86_64 in ring-0 and has no
     // side effects other than reading the counter.
     unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+/// CSTAR entry point — installed as the CSTAR MSR target (AMD compat-mode SYSCALL).
+///
+/// On AMD processors, a `syscall` from a ring-3 task in compatibility mode
+/// (CS.L=0) dispatches here instead of LSTAR.  GodspeedOS runs all ring-3 code
+/// in 64-bit mode (CS.L=1) and uses `ud2` (IDT[6]) as the syscall mechanism, so
+/// this entry should never be reached.  If it ever is, halt loudly rather than
+/// execute with an unexpected register state.
+///
+/// # Safety
+/// Called at the compat-mode ring-3 → ring-0 SYSCALL boundary. Same register
+/// state as LSTAR entry (RCX=user_RIP, R11=user_RFLAGS, RSP=user_RSP).
+#[unsafe(naked)]
+pub unsafe extern "C" fn cstar_entry() {
+    // SAFETY: no stack or GS access; just disables interrupts and halts.
+    core::arch::naked_asm!(
+        "cli",
+        "1: hlt",
+        "jmp 1b",
+    )
 }
 
 /// SYSCALL entry point — installed as the LSTAR MSR target.
@@ -262,5 +202,105 @@ pub unsafe extern "C" fn syscall_entry() {
         "push 0x2b",            // CS  = 0x2b (user code, DPL=3, RPL=3, L=1)
         "push rcx",             // RIP = user_rip
         "iretq",                // → ring-3: RIP=user_rip, CS=0x2b, RFLAGS, RSP=user_rsp, SS=0x23
+    )
+}
+
+/// INT 0x80 syscall entry — kept for reference; superseded by `ud2_syscall_entry`
+/// on AMD GX-420GI where int $0x80 also stalls.
+///
+/// The CPU pushes a full hardware frame onto the kernel stack (via TSS.rsp0)
+/// before jumping here, so no manual stack switch is needed:
+///   [RSP+0]  saved RIP   (user RIP — return address)
+///   [RSP+8]  saved CS    (0x2b: user code, L=1, DPL=3)
+///   [RSP+16] saved RFLAGS
+///   [RSP+24] saved RSP   (user RSP)
+///   [RSP+32] saved SS    (0x23: user data, DPL=3)
+///
+/// IF is cleared on entry (interrupt gate, type_attr=0xEE).
+/// GS invariant: on entry from ring-3, GS.base=0 (user); swapgs installs
+/// the kernel pointer so any kernel code that needs per-core data via GS works.
+///
+/// IDT entry uses DPL=3 so ring-3 code can raise this vector via `int 0x80`.
+///
+/// # Safety
+/// Called at the ring-3 → ring-0 boundary via `int 0x80`. IF=0 on entry.
+#[unsafe(naked)]
+pub unsafe extern "C" fn int80_entry() {
+    core::arch::naked_asm!(
+        // Install kernel GS so per-core data is accessible.
+        "swapgs",
+        // Mirror the SYSCALL path: save user RSP into PER_CORE_SYSCALL.user_rsp
+        // at gs:[0] so pf_handler diagnostics and any GS-based user-RSP readers
+        // see the correct value.  User RSP is at [RSP+24] in the CPU frame.
+        "mov r10, [rsp + 24]",
+        "mov gs:[0], r10",
+        // Rearrange into syscall_handler(nr, a0, a1, a2) System V convention:
+        //   rdi=nr  rsi=a0  rdx=a1  rcx=a2
+        // On entry from ring-3: rax=nr  rdi=a0  rsi=a1  rdx=a2
+        "mov rcx, rdx",
+        "mov rdx, rsi",
+        "mov rsi, rdi",
+        "mov rdi, rax",
+        "call syscall_handler",
+        // rax = return value (syscall_handler's return value, untouched by iretq).
+        // Restore user GS before returning to ring-3.
+        "swapgs",
+        // iretq pops RIP, CS, RFLAGS, RSP, SS from the CPU-pushed frame and
+        // resumes ring-3 at the instruction after the `int 0x80`.
+        "iretq",
+    )
+}
+
+/// UD2 syscall entry — IDT[6] (#UD hardware exception).
+///
+/// AMD GX-420GI (Jaguar/Puma+): both `syscall` and `int N` (software interrupt
+/// dispatch) silently stall the core from ring-3.  `ud2` (0x0F 0x0B) is decoded
+/// by the CPU as an explicitly undefined instruction and takes the hardware
+/// exception pathway — the same one used by #PF and #GP — which does work on
+/// this hardware.
+///
+/// CPU frame on #UD (no error code):
+///   [RSP+ 0] saved RIP   (address of the ud2 opcode; advanced +2 before iretq)
+///   [RSP+ 8] saved CS    (0x2b = ring-3, 0x08 = ring-0)
+///   [RSP+16] saved RFLAGS
+///   [RSP+24] saved RSP   (user RSP)
+///   [RSP+32] saved SS
+///
+/// # Safety
+/// Installed at IDT[6]; called automatically by the CPU on any `ud2` instruction.
+/// IF=0 on entry (interrupt gate).
+#[unsafe(naked)]
+pub unsafe extern "C" fn ud2_syscall_entry() {
+    core::arch::naked_asm!(
+        // CPL check: saved CS is at [rsp+8] in the CPU exception frame.
+        // CS=0x08 → ring-0 kernel ud2 (unexpected crash); CS=0x2b → ring-3 syscall.
+        "mov r11, [rsp + 8]",
+        "cmp r11, 0x08",
+        "je 3f",
+        // --- Ring-3 syscall path ---
+        // Install kernel GS so per-core data is accessible.
+        "swapgs",
+        // Save user RSP (at [rsp+24]) into PER_CORE_SYSCALL.user_rsp at gs:[0].
+        "mov r10, [rsp + 24]",
+        "mov gs:[0], r10",
+        // Advance saved RIP past the ud2 opcode (2 bytes: 0x0F 0x0B) so iretq
+        // resumes ring-3 at the instruction *after* ud2, not on ud2 again.
+        "add qword ptr [rsp], 2",
+        // Rearrange into syscall_handler(nr, a0, a1, a2) System V convention:
+        //   rdi=nr   rsi=a0   rdx=a1   rcx=a2
+        // On entry: rax=nr   rdi=a0   rsi=a1   rdx=a2
+        "mov rcx, rdx",
+        "mov rdx, rsi",
+        "mov rsi, rdi",
+        "mov rdi, rax",
+        "call syscall_handler",
+        // rax = return value; restore user GS and re-enter ring-3.
+        "swapgs",
+        "iretq",
+        // --- Kernel ud2 crash path (ring-0 ud2, should never happen) ---
+        "3:",
+        "cli",
+        "4: hlt",
+        "jmp 4b",
     )
 }

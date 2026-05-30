@@ -526,7 +526,21 @@ impl ServiceContext {
         let bytes = reason.as_bytes();
         // SAFETY: syscall(9) = Abort; bytes is a valid slice in user space.
         unsafe { raw_syscall(9, bytes.as_ptr() as u64, bytes.len() as u64, 0) };
-        loop {} // unreachable; abort does not return
+        // DIAGNOSTIC: ud2 fires if syscall returns (SYSCALL no-op on this hw).
+        // "EXCEPTION: #UD" at RIP after syscall → SYSCALL fell through.
+        // "KERNEL PANIC" → SYSCALL dispatched correctly; ud2 never reached.
+        // SAFETY: noreturn; ud2 is intentional — catches SYSCALL fallthrough.
+        unsafe { core::arch::asm!("ud2", options(noreturn)) }
+    }
+
+    /// Trigger a hardware reset via the kernel reboot syscall (18). Does not return.
+    ///
+    /// Flushes "rebooting..." to serial before the reset so the operator sees
+    /// confirmation in PuTTY before the line goes silent.
+    pub fn reboot(&self) -> ! {
+        // SAFETY: syscall(18) = Reboot; no arguments.
+        unsafe { raw_syscall(18, 0, 0, 0) };
+        loop {} // unreachable
     }
 
     /// Advisory yield (§9.3).

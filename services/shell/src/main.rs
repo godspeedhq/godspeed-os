@@ -85,6 +85,7 @@ fn execute(ctx: &ServiceContext, line: &[u8]) {
                 cmd_restart(ctx, args[1], core);
             }
         }
+        "reboot"  => cmd_reboot(ctx),
         other => {
             // Build "unknown: <cmd>" in a stack buffer to avoid two ctx.log calls
             let mut buf = [0u8; 64];
@@ -104,6 +105,12 @@ fn cmd_help(ctx: &ServiceContext) {
     ctx.log("  spawn <name>           spawn a service");
     ctx.log("  kill <name>            kill a service");
     ctx.log("  restart <name> [core]  restart a service");
+    ctx.log("  reboot                 hardware reset");
+}
+
+fn cmd_reboot(ctx: &ServiceContext) -> ! {
+    ctx.log("rebooting...");
+    ctx.reboot()
 }
 
 fn cmd_cores(ctx: &ServiceContext) {

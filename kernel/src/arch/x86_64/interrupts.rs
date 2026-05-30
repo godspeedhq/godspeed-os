@@ -57,6 +57,16 @@ pub unsafe extern "C" fn timer_isr_stub() {
         "push r9",
         "push r10",
         "push r11",
+        // Pass interrupted RIP ([RSP+72]), CS ([RSP+80]), and user RSP ([RSP+96])
+        // as arguments to timer_tick_from_irq(rdi=rip, rsi=cs, rdx=user_rsp).
+        // The hardware interrupt frame (from ring-3) lays out as:
+        //   [RSP+72]=RIP  [RSP+80]=CS  [RSP+88]=RFLAGS  [RSP+96]=RSP  [RSP+104]=SS
+        // The saved values of rdi, rsi, rdx are on the stack at [RSP+24],[RSP+32],
+        // [RSP+16]; they are restored after the call, so overwriting them here is safe.
+        // 9 pushes × 8 bytes = 72 bytes between current RSP and the interrupt frame.
+        "mov rdi, [rsp + 72]",
+        "mov rsi, [rsp + 80]",
+        "mov rdx, [rsp + 96]",
         "call timer_tick_from_irq",
         "pop r11",
         "pop r10",

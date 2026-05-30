@@ -200,8 +200,11 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
 
     arch::x86_64::init_timer();
     arch::x86_64::com2_init();
-    // SAFETY: IDT is loaded (init above), serial_init already called; enables COM1 RX IRQ.
-    unsafe { arch::x86_64::uart_rx_enable(); }
+    // COM1 RX is polled from the core-0 timer ISR (uart_rx_poll every 10 ms).
+    // IRQ-driven reception was abandoned because the kernel masks all PIC IRQs
+    // globally (APIC-only kernel). uart_rx_enable() must NOT be called: on real
+    // hardware unmasking PIC IRQ 4 without proper PIC EOI in the handler causes
+    // the PIC ISR to jam and lock up the interrupt controller before boot.
 
     capability::init();
     ipc::init();

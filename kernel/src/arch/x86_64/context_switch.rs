@@ -65,7 +65,8 @@ unsafe extern "C" fn task_entry_trampoline() -> ! {
 #[unsafe(naked)]
 unsafe extern "C" fn ring3_entry_trampoline() -> ! {
     // SAFETY: stack layout guaranteed by `new_user`.  Interrupts are disabled
-    // (cli from switch_context); IRETQ atomically enables them via RFLAGS=0x202.
+    // (cli from switch_context); IRETQ atomically enables them via RFLAGS=0x202
+    // (IF=1 | reserved bit 1).  IOPL stays 0, so ring-3 has no port-I/O privilege.
     // GS invariant: `swapgs` before IRETQ swaps GS.base (kernel ptr → 0) and
     // KERNEL_GS_BASE (0 → kernel ptr), so ring-3 sees GS.base=0.
     //
@@ -90,7 +91,8 @@ unsafe extern "C" fn ring3_entry_trampoline() -> ! {
         "push rcx",          // RFLAGS = IF=1 | reserved bit 1
         "mov rcx, 0x2b",
         "push rcx",          // CS  = 0x2b  (user code, DPL=3, RPL=3)
-        "push rax",          // RIP = user_rip
+        "push rax",          // RIP = user_rip  (IRETQ frame complete)
+
         "swapgs",            // GS.base: kernel_ptr → 0 (user); KERNEL_GS_BASE: 0 → kernel_ptr
         "iretq",             // → ring-3 at user_rip, rsp=user_rsp, rflags=0x202, ss=0x23
     )
@@ -188,10 +190,9 @@ impl TaskContext {
         //   → RIP = ring3_entry_trampoline, RSP = K0T-376
         //
         // ring3_entry_trampoline:
-        //   swapgs
-        //   pop rcx  → rcx = user_rip,  RSP = K0T-368
-        //   pop rsp  → rsp = user_rsp   (switches to user stack)
-        //   sysretq  → ring-3 at user_rip, rsp=user_rsp, rflags=0x202
+        //   pop rax/rbx → user_rip, user_rsp; builds the 5-word IRETQ frame
+        //   swapgs      → GS.base kernel_ptr → 0
+        //   iretq       → ring-3 at user_rip, rsp=user_rsp, rflags=0x202, ss=0x23
         //
         // SAFETY: caller guarantees kernel_stack_top is valid and writable.
         let sp = unsafe {

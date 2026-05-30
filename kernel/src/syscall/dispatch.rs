@@ -36,6 +36,7 @@ pub enum SyscallNumber {
     RemoveCap      = 15,
     TaskStat       = 16,
     ConsoleRead    = 17,
+    Reboot         = 18,
 }
 
 /// Raw syscall dispatcher — called from the SYSCALL/SYSENTER IDT stub.
@@ -73,6 +74,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::RemoveCap      as u64 => handle_remove_cap(arg0),
         n if n == SyscallNumber::TaskStat       as u64 => handle_task_stat(arg0, arg1, arg2),
         n if n == SyscallNumber::ConsoleRead    as u64 => handle_console_read(arg0),
+        n if n == SyscallNumber::Reboot        as u64 => handle_reboot(),
         _ => -1, // Unknown syscall.
     }
 }
@@ -657,6 +659,20 @@ fn handle_console_read(cap_slot: u64) -> i64 {
         }
         // Woken by uart_rx_irq_handler; loop to pop the byte.
     }
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: Reboot (18) — hardware reset via keyboard controller CPU reset line.
+// ---------------------------------------------------------------------------
+
+/// No arguments. Does not return.
+///
+/// Phase 5: no capability check — intended for dev-mode use by the shell
+/// service (same rationale as Kill/8). Logs to serial before resetting so
+/// the operator sees confirmation in PuTTY before the line goes silent.
+fn handle_reboot() -> i64 {
+    crate::kprintln!("reboot: hardware reset");
+    crate::arch::x86_64::hardware_reset();
 }
 
 fn ipc_err_to_i64(e: IpcError) -> i64 {

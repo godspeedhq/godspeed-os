@@ -2639,6 +2639,10 @@ fn spawn_service_with_config(
             core::ptr::write_bytes(virt, 0, PAGE_SIZE);
             let data = &mut *(virt as *mut ServiceContextData);
             data.magic              = SERVICE_CTX_MAGIC;
+            // Readback: confirm write was not silently dropped (should always pass).
+            if data.magic != SERVICE_CTX_MAGIC {
+                crate::arch::x86_64::serial_write_bytes_lockfree(b"CTX-MAGIC-MISMATCH\n");
+            }
             data.log_write_slot     = 0;
             data.recv_slot          = recv_slot_u32;
             data.spawn_slot         = 1;

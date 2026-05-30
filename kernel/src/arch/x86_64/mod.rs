@@ -232,6 +232,33 @@ pub fn halt_all_cores() -> ! {
     }
 }
 
+/// Issue an x86 hardware reset via the keyboard controller CPU reset line.
+///
+/// Writes 0xFE to I/O port 0x64, asserting CPURST# and causing an unconditional
+/// hardware reset. Used by the Reboot syscall (18). Does not return.
+pub fn hardware_reset() -> ! {
+    // SAFETY: CLI before touching the KBC so no ISR reads port 0x60 between
+    // our status poll and the reset command.
+    unsafe { core::arch::asm!("cli", options(nostack, nomem)) };
+
+    // Wait for KBC input buffer empty (status bit 1 = 0).
+    // SAFETY: port 0x64 is the standard keyboard controller status/command port.
+    unsafe {
+        loop {
+            if inb(0x64) & 0x02 == 0 { break; }
+            core::hint::spin_loop();
+        }
+        // 0xFE on port 0x64 pulses the CPURST# line — unconditional CPU reset.
+        // SAFETY: keyboard controller command; universally supported on x86.
+        outb(0x64, 0xFE);
+    }
+
+    // Reset propagates in a few µs. Spin in case it doesn't fire immediately.
+    loop {
+        unsafe { core::arch::asm!("hlt", options(nostack, nomem)) };
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Serial (COM1) — used by log::write_fmt for all kprintln! output.
 // ---------------------------------------------------------------------------
@@ -282,6 +309,35 @@ pub fn serial_write_byte(b: u8) {
         outb(COM1, b);
     }
     SERIAL_LOCK.store(false, Ordering::Release);
+}
+
+/// Write bytes to COM1 without acquiring SERIAL_LOCK or touching RING.
+///
+/// Diagnostic only — bypasses all spinlocks so it is safe to call even when
+/// RING or SERIAL_LOCK might be held or contended. Used to narrow down hang
+/// points that would be invisible through the normal kprintln path.
+pub fn serial_write_bytes_lockfree(s: &[u8]) {
+    for &b in s {
+        // SAFETY: port I/O to COM1; LSR read + THR write; no shared state touched.
+        unsafe {
+            loop {
+                let lsr: u8;
+                core::arch::asm!(
+                    "in al, dx",
+                    out("al") lsr,
+                    in("dx") (COM1 + 5),
+                    options(nostack, nomem)
+                );
+                if lsr & 0x20 != 0 { break; }
+            }
+            core::arch::asm!(
+                "out dx, al",
+                in("dx") COM1,
+                in("al") b,
+                options(nostack, nomem)
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

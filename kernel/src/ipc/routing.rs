@@ -62,10 +62,15 @@ impl RoutingEntry {
     }
 }
 
-static TABLE: SpinLock<[RoutingEntry; MAX_ENDPOINTS]> = {
-    const E: RoutingEntry = RoutingEntry::empty();
-    SpinLock::new([E; MAX_ENDPOINTS])
-};
+// SAFETY for the zeroed() call:
+//   SpinLock<[RoutingEntry; MAX_ENDPOINTS]> is valid when zero-initialized:
+//   - SpinLock.locked = AtomicBool(false)
+//   - Every RoutingEntry: valid=false, liveness=Alive(discriminant 0), generation=0,
+//     all queue slots=None (Option discriminant 0), blocked fields=None.
+//   zeroed() instead of SpinLock::new([E; N]) avoids undef padding bytes that
+//   LLD rejects when placing a symbol in .bss. Limine zeroes BSS before entry.
+#[link_section = ".bss"]
+static TABLE: SpinLock<[RoutingEntry; MAX_ENDPOINTS]> = unsafe { core::mem::zeroed() };
 
 // ---------------------------------------------------------------------------
 // Public API.
