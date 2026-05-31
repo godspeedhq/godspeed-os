@@ -226,18 +226,3 @@ pub fn fire_test_irq(irq: u8) {
     enable_interrupts();
 }
 
-/// Page-fault handler — kills the faulting task (§10.3).
-///
-/// # Safety
-/// Called from IDT entry #14.
-pub unsafe extern "C" fn page_fault_handler(frame: &ExceptionFrame, error_code: u64) {
-    let fault_addr: u64;
-    // SAFETY: CR2 holds the fault address on x86.
-    unsafe { core::arch::asm!("mov {}, cr2", out(reg) fault_addr) };
-
-    crate::kprintln!(
-        "service killed: protection violation at {:#x} (err={:#x})",
-        fault_addr, error_code
-    );
-    crate::task::kill_current();
-}

@@ -174,26 +174,6 @@ pub static PF_CR2_STORED: AtomicU64 = AtomicU64::new(0);
 /// Tick 12 reports [GP-YES/NO].
 pub static GP_REACHED: AtomicBool = AtomicBool::new(false);
 
-/// Per-core interrupted RIP saved by `timer_tick_from_irq` on every tick.
-/// Index = core ID (0–3).  Low 2 bits of the matching INTERRUPTED_CS entry = CPL.
-pub static INTERRUPTED_RIP: [AtomicU64; 4] = [
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-];
-
-/// Per-core interrupted CS saved by `timer_tick_from_irq` on every tick.
-/// Low 2 bits are CPL: 0 = ring-0, 3 = ring-3.
-pub static INTERRUPTED_CS: [AtomicU64; 4] = [
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-];
-
-/// Per-core interrupted user RSP saved by `timer_tick_from_irq` on every tick.
-/// Only meaningful when the matching INTERRUPTED_CS entry shows CPL=3.
-/// If RSP == 0x80000000 (init's initial stack top) the task was interrupted
-/// before executing its very first instruction (`push rbx` at 0x400000).
-pub static INTERRUPTED_RSP: [AtomicU64; 4] = [
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-];
-
 // ---------------------------------------------------------------------------
 // Public init surface.
 // ---------------------------------------------------------------------------
@@ -330,7 +310,7 @@ pub unsafe fn init_local_apic() {
 unsafe fn cpuid_tsc_deadline_supported() -> bool {
     // SAFETY: __cpuid(1) is universally safe on x86_64; CPUID.01H:ECX[24] =
     // APIC TSC-Deadline timer support (Intel SDM Vol. 2A).
-    let result = unsafe { core::arch::x86_64::__cpuid(1) };
+    let result = core::arch::x86_64::__cpuid(1);
     (result.ecx >> 24) & 1 != 0
 }
 
@@ -351,7 +331,7 @@ unsafe fn cpuid_tsc_deadline_supported() -> bool {
 /// Ring-0 only.  Called once during `init_local_apic`.
 unsafe fn compute_tsc_ticks_per_10ms(lapic_id: u32) -> u64 {
     // SAFETY: __cpuid_count is safe on x86_64; leaf 0x15, sub-leaf 0.
-    let r15 = unsafe { core::arch::x86_64::__cpuid_count(0x15, 0) };
+    let r15 = core::arch::x86_64::__cpuid_count(0x15, 0);
     if r15.ecx != 0 && r15.ebx != 0 && r15.eax != 0 {
         // tsc_hz = crystal_hz × numerator / denominator
         let tsc_hz = (r15.ecx as u64) * (r15.ebx as u64) / (r15.eax as u64);
@@ -365,10 +345,10 @@ unsafe fn compute_tsc_ticks_per_10ms(lapic_id: u32) -> u64 {
 
     // Fallback: CPUID.0x16 Base Frequency (MHz).
     // SAFETY: __cpuid(0) returns max_leaf; always available.
-    let max_leaf = unsafe { core::arch::x86_64::__cpuid(0) }.eax;
+    let max_leaf = core::arch::x86_64::__cpuid(0).eax;
     if max_leaf >= 0x16 {
         // SAFETY: leaf 0x16 exists per max_leaf check above.
-        let r16 = unsafe { core::arch::x86_64::__cpuid(0x16) };
+        let r16 = core::arch::x86_64::__cpuid(0x16);
         let base_mhz = r16.eax & 0xFFFF;
         if base_mhz > 0 {
             let tsc_hz = base_mhz as u64 * 1_000_000;
@@ -437,7 +417,7 @@ fn is_intel_cpu() -> bool {
     // CPUID leaf 0: EBX/ECX/EDX encode the 12-byte vendor string.
     // "GenuineIntel" → EBX=0x756e6547 EDX=0x49656e69 ECX=0x6c65746e
     // SAFETY: __cpuid(0) is universally safe on x86_64.
-    let r = unsafe { core::arch::x86_64::__cpuid(0) };
+    let r = core::arch::x86_64::__cpuid(0);
     r.ebx == 0x756e_6547 && r.edx == 0x4965_6e69 && r.ecx == 0x6c65_746e
 }
 
@@ -785,7 +765,7 @@ pub(super) unsafe fn init_syscall(core_id: u32) {
         );
 
         // LSTAR MSR — address of the SYSCALL entry point.
-        let lstar = super::syscall_entry::syscall_entry as u64;
+        let lstar = super::syscall_entry::syscall_entry as *const () as u64;
         core::arch::asm!(
             "wrmsr",
             in("ecx") 0xC000_0082u32,
@@ -821,7 +801,7 @@ pub(super) unsafe fn init_syscall(core_id: u32) {
         // On AMD CPUs a `syscall` from compat mode (CS.L=0) dispatches here, not LSTAR.
         // GodspeedOS ring-3 runs in 64-bit mode (CS.L=1) and uses `ud2` for syscalls,
         // so `cstar_entry` should never be reached; it halts loudly if it ever is.
-        let cstar = super::syscall_entry::cstar_entry as u64;
+        let cstar = super::syscall_entry::cstar_entry as *const () as u64;
         core::arch::asm!(
             "wrmsr",
             in("ecx") 0xC000_0083u32,
@@ -921,31 +901,36 @@ pub unsafe fn set_tss_rsp0(core_id: usize, rsp: u64) {
 /// # Safety
 /// Must be called after `init_gdt` (entries reference the kernel CS = 0x08).
 pub(super) unsafe fn init_idt() {
-    let halt    = exception_halt as u64;
-    let timer   = super::interrupts::timer_isr_stub as u64;
+    let halt    = exception_halt as *const () as u64;
+    let timer   = super::interrupts::timer_isr_stub as *const () as u64;
 
     // SAFETY: IDT is a kernel-lifetime static; APs haven't started yet.
     unsafe {
-        for entry in IDT.iter_mut() {
+        // &mut *addr_of_mut! is the sanctioned way to get a &mut to a `static mut`
+        // without materialising a direct reference (avoids static_mut_refs lint).
+        // Fn-item handlers are cast via `*const ()` first so the fn-item→integer
+        // lint does not fire (the numeric value is the entry-point address).
+        let idt = &mut *core::ptr::addr_of_mut!(IDT);
+        for entry in idt.iter_mut() {
             *entry = IdtEntry::new(halt);
         }
         // IDT[6] = #UD handler: used as the syscall entry on AMD GX-420GI where
         // both SYSCALL and int $0x80 silently stall from ring-3.  DPL=0 is
         // correct — CPU exceptions bypass the DPL check, so ud2 from ring-3
         // always dispatches here; int 6 from ring-3 would #GP (intended).
-        IDT[6]    = IdtEntry::new(super::syscall_entry::ud2_syscall_entry as u64);
-        IDT[13]   = IdtEntry::new(gpf_stub  as u64);
-        IDT[14]   = IdtEntry::new(pf_stub   as u64);
-        IDT[32]   = IdtEntry::new(timer);
-        IDT[36]   = IdtEntry::new(super::interrupts::uart_rx_isr_stub as u64); // IRQ 4 = COM1 RX
-        IDT[0x80] = IdtEntry::new_user(super::syscall_entry::int80_entry as u64);
-        IDT[0xF0] = IdtEntry::new(ipi_wake_stub   as u64);
-        IDT[0xF1] = IdtEntry::new(ipi_tlb_stub    as u64);
-        IDT[0xF2] = IdtEntry::new(ipi_tick_stub   as u64);
+        idt[6]    = IdtEntry::new(super::syscall_entry::ud2_syscall_entry as *const () as u64);
+        idt[13]   = IdtEntry::new(gpf_stub  as *const () as u64);
+        idt[14]   = IdtEntry::new(pf_stub   as *const () as u64);
+        idt[32]   = IdtEntry::new(timer);
+        idt[36]   = IdtEntry::new(super::interrupts::uart_rx_isr_stub as *const () as u64); // IRQ 4 = COM1 RX
+        idt[0x80] = IdtEntry::new_user(super::syscall_entry::int80_entry as *const () as u64);
+        idt[0xF0] = IdtEntry::new(ipi_wake_stub   as *const () as u64);
+        idt[0xF1] = IdtEntry::new(ipi_tlb_stub    as *const () as u64);
+        idt[0xF2] = IdtEntry::new(ipi_tick_stub   as *const () as u64);
 
         let desc = TableDescriptor {
-            limit: (core::mem::size_of_val(&IDT) - 1) as u16,
-            base:  IDT.as_ptr() as u64,
+            limit: (core::mem::size_of_val(idt) - 1) as u16,
+            base:  idt.as_ptr() as u64,
         };
         core::arch::asm!(
             "lidt [{desc}]",

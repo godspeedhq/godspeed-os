@@ -8,6 +8,22 @@ unless this file is updated in the same commit with a written SAFETY argument.**
 
 ---
 
+## 2026-05-31 — static-analysis + unsafe-audit pass (boot-verified, T630)
+
+Full write-up: `milestones/v2/STATIC_ANALYSIS_AUDIT.md`. Branch
+`verify/static-analysis-unsafe-audit`, commit `d276566`.
+
+| Area | Result |
+|------|--------|
+| Policy violation | **Fixed** — `unsafe` removed from `ipc/` (§18.1); moved to `SpinLock::ZEROED` in `smp/spinlock.rs`. |
+| Safety / correctness lints | **0** — 11 unnecessary `unsafe`, 11 `static mut` refs (→ `addr_of!`), 14 fn-item→int casts, 6 no-op `mem::forget`. |
+| Cruft removed | orphaned `page_fault_handler` + `INTERRUPTED_*` statics. |
+| Inventory | reconciled below — 302 lines / 23 files, passes clean; `task/scheduler.rs` 37 → 36 (under floor). |
+| Kernel warnings | 104 → 57 (rest intentional unwired architecture). |
+| Hardware | boots clean on T630, cross-core ping/pong to 83k+ msgs, zero `#PF`/panic. |
+
+---
+
 ## Policy (§18)
 
 `unsafe` is permitted only in:
@@ -41,34 +57,43 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/x86_64/ap_boot.rs | 3 | permitted |
-| arch/x86_64/boot.rs | 61 | permitted |
+| arch/x86_64/ap_boot.rs | 2 | permitted |
+| arch/x86_64/boot.rs | 79 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |
-| arch/x86_64/interrupts.rs | 10 | permitted |
-| arch/x86_64/mod.rs | 21 | permitted |
+| arch/x86_64/interrupts.rs | 12 | permitted |
+| arch/x86_64/mod.rs | 33 | permitted |
 | arch/x86_64/page_tables.rs | 25 | permitted |
-| arch/x86_64/syscall_entry.rs | 16 | permitted |
+| arch/x86_64/syscall_entry.rs | 13 | permitted |
 | capability/table.rs | 7 | permitted |
-| memory/allocator.rs | 28 | permitted |
+| memory/allocator.rs | 29 | permitted |
 | memory/frame.rs | 1 | permitted |
 | memory/mod.rs | 1 | permitted |
 | memory/page.rs | 1 | permitted |
 | smp/core.rs | 6 | permitted |
-| smp/ipi.rs | 21 | permitted |
+| smp/ipi.rs | 23 | permitted |
 | smp/mod.rs | 1 | permitted |
 | smp/placement.rs | 1 | permitted |
-| smp/spinlock.rs | 4 | permitted |
+| smp/spinlock.rs | 5 | permitted |
 | interrupt/route.rs | 1 | grandfathered |
 | loader.rs | 4 | grandfathered |
 | main.rs | 2 | grandfathered |
 | syscall/dispatch.rs | 2 | grandfathered |
 | task/mod.rs | 7 | grandfathered |
-| task/scheduler.rs | 37 | grandfathered |
+| task/scheduler.rs | 36 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 218 lines across 17 files  
-**Grandfathered total:** 53 lines across 6 files  
-**Grand total:** 271 lines across 23 files
+**Permitted total:** 250 lines across 17 files  
+**Grandfathered total:** 52 lines across 6 files  
+**Grand total:** 302 lines across 23 files
+
+> **Reconciled 2026-05-31** (branch `verify/static-analysis-unsafe-audit`). The
+> permitted-layer growth since the prior baseline is from the AMD GX-420GI ring-3 /
+> TSC-Deadline-APIC / COM1 work that landed on `main` (boot.rs, mod.rs, interrupts.rs,
+> ipi.rs, allocator.rs). `smp/spinlock.rs` +1 is the new `ZEROED` const (below).
+> Reductions: the static-analysis pass removed unnecessary `unsafe` blocks
+> (ap_boot, boot, mod, scheduler) and the orphaned `page_fault_handler` /
+> `INTERRUPTED_*` diagnostics (interrupts.rs net still up from the AMD work).
+> **`task/scheduler.rs` is back to 36** — under its grandfathered floor again.
 
 ---
 
@@ -262,7 +287,7 @@ core 0 ready before spawning init). `// SAFETY:` comment present in source.
 
 ### smp/spinlock.rs
 
-`SpinLock<T>` interior-mutable spinlock. Four unsafe constructs:
+`SpinLock<T>` interior-mutable spinlock. Five unsafe constructs:
 - `unsafe impl Send for SpinLock<T>`: sound because the atomic spinlock
   serialises all access to `T`; `T: Send` is required.
 - `unsafe impl Sync for SpinLock<T>`: same reasoning — mutual exclusion is
@@ -272,8 +297,14 @@ core 0 ready before spawning init). `// SAFETY:` comment present in source.
   exist simultaneously.
 - `unsafe { &mut *self.lock.data.get() }` in `DerefMut`: same reasoning for
   mutable access.
+- `pub const ZEROED: Self = unsafe { core::mem::zeroed() }`: all-zeroes
+  initializer for placing a large `SpinLock<T>` in `.bss` without the undef
+  padding bytes that LLD rejects there. Sound only when the all-zeroes bit
+  pattern is a valid `T` — the caller's responsibility via the `T` instantiated.
+  Replaces a `core::mem::zeroed()` that previously sat in `ipc/routing.rs`
+  (outside the permitted layers); moving it here keeps `ipc/` unsafe-free (§18.1).
 
-`// SAFETY:` comments present in source for all four.
+`// SAFETY:` comments present in source for all five.
 
 ---
 

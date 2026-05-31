@@ -128,7 +128,7 @@ impl TaskContext {
             let sp = sp.sub(1);
             sp.write(entry as u64);                    // real task entry
             let sp = sp.sub(1);
-            sp.write(task_entry_trampoline as u64);    // first ret target
+            sp.write(task_entry_trampoline as *const () as u64);    // first ret target
             sp
         };
         TaskContext {
@@ -201,7 +201,7 @@ impl TaskContext {
             let sp = sp.sub(1);                              // K0T-376
             sp.write(user_entry);                            // user_rip
             let sp = sp.sub(1);                              // K0T-384
-            sp.write(ring3_entry_trampoline as u64);         // first ret target
+            sp.write(ring3_entry_trampoline as *const () as u64);         // first ret target
             sp
         };
         TaskContext {

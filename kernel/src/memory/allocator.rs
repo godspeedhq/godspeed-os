@@ -121,7 +121,7 @@ impl BitmapAllocator {
     // SAFETY: caller must hold ALLOC_LOCKED; BITMAP and ALLOCATOR are exclusively accessible under the lock.
     unsafe fn alloc(&mut self) -> Option<Frame> {
         // SAFETY: exclusive access guaranteed by single-core invariant (v1).
-        let bitmap = unsafe { &mut BITMAP };
+        let bitmap = unsafe { &mut *core::ptr::addr_of_mut!(BITMAP) };
 
         // Scan from hint, wrap if not found.
         let idx = scan_free(bitmap, self.next_byte, BITMAP_BYTES)
@@ -247,7 +247,7 @@ pub fn init(boot_info: &BootInfo) {
     unsafe {
         GUARD_START = boot_info.kernel_phys_start;
         GUARD_END   = boot_info.kernel_phys_end;
-        ALLOCATOR.init_from_map(boot_info)
+        (*core::ptr::addr_of_mut!(ALLOCATOR)).init_from_map(boot_info)
     };
 }
 
@@ -255,7 +255,7 @@ pub fn init(boot_info: &BootInfo) {
 pub fn alloc_frame() -> Option<Frame> {
     alloc_lock();
     // SAFETY: lock held; single writer across all cores.
-    let frame = unsafe { ALLOCATOR.alloc() };
+    let frame = unsafe { (*core::ptr::addr_of_mut!(ALLOCATOR)).alloc() };
     alloc_unlock();
     frame
 }
@@ -268,14 +268,14 @@ pub fn alloc_frame() -> Option<Frame> {
 pub unsafe fn free_frame(frame: Frame) {
     alloc_lock();
     // SAFETY: lock held; caller guarantees exclusive ownership.
-    unsafe { ALLOCATOR.free(frame) }
+    unsafe { (*core::ptr::addr_of_mut!(ALLOCATOR)).free(frame) }
     alloc_unlock();
 }
 
 /// Total free frames available (used for diagnostic output in memory::init).
 pub fn free_frame_count() -> usize {
     // SAFETY: read-only; racing reads are harmless for diagnostic use.
-    unsafe { ALLOCATOR.free_frames() }
+    unsafe { (*core::ptr::addr_of!(ALLOCATOR)).free_frames() }
 }
 
 /// Return the total number of usable physical frames at boot time (fixed after init).

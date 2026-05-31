@@ -461,11 +461,10 @@ fn handle_alloc_mem(size: u64) -> i64 {
         // SAFETY: va is in the task heap range (0x1_0000_0000+); phys is from the
         // allocator; the task's page table is the active CR3 during this syscall.
         if unsafe { map_in_active_tables(va, phys, flags) }.is_err() {
-            core::mem::forget(frame);
             return -1;
         }
-        // Transfer frame ownership to the page table (freed when task dies).
-        core::mem::forget(frame);
+        // Frame ownership passes to the page table (freed when task dies);
+        // `Frame` is Copy/no-Drop, so there is nothing to release here.
     }
 
     base_va as i64

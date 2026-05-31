@@ -71,9 +71,9 @@ extern "C" fn _start() -> ! {
 
     let boot_info = collect_boot_info();
 
-    // SAFETY: _start never returns (kernel_main is -> !), so boot_info on
-    // this stack frame is valid for the entire kernel lifetime.
-    unsafe { crate::kernel_main(&boot_info as *const _) }
+    // _start never returns (kernel_main is -> !), so boot_info on this stack
+    // frame is valid for the entire kernel lifetime.
+    crate::kernel_main(&boot_info as *const _)
 }
 
 fn collect_boot_info() -> BootInfo {
@@ -134,9 +134,9 @@ fn collect_boot_info() -> BootInfo {
         .map(|r| {
             let phys_base = r.physical_base;
             let virt_base = r.virtual_base;
-            // SAFETY: __bss_end is a linker symbol; its address is the first
-            // virtual byte past the kernel's .bss section.
-            let virt_end = unsafe { core::ptr::addr_of!(__bss_end) as u64 };
+            // __bss_end is a linker symbol; its address is the first virtual
+            // byte past the kernel's .bss section. addr_of! does not deref.
+            let virt_end = core::ptr::addr_of!(__bss_end) as u64;
             let kernel_size = virt_end.saturating_sub(virt_base);
             // Round up to the next page boundary.
             let phys_end = phys_base

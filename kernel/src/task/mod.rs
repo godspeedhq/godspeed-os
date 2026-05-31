@@ -45,8 +45,11 @@ fn alloc_kstack() -> Option<*mut u8> {
         if !used[i] {
             used[i] = true;
             // SAFETY: i < TASK_KSTACK_MAX; offset is within KSTACK_STORAGE bounds.
+            // addr_of_mut! yields the same pointer without materialising a &mut
+            // to the `static mut` (avoids the static_mut_refs lint).
             let top = unsafe {
-                KSTACK_STORAGE.data.as_mut_ptr().add(i * KSTACK_SIZE + KSTACK_SIZE)
+                (core::ptr::addr_of_mut!(KSTACK_STORAGE.data) as *mut u8)
+                    .add(i * KSTACK_SIZE + KSTACK_SIZE)
             };
             return Some(top);
         }
@@ -64,7 +67,7 @@ fn alloc_kstack() -> Option<*mut u8> {
 pub fn free_kstack(kstack_top: u64) {
     if kstack_top == 0 { return; }
     // SAFETY: KSTACK_STORAGE is a stable static; pointer arithmetic is within bounds.
-    let base = unsafe { KSTACK_STORAGE.data.as_ptr() as u64 };
+    let base = unsafe { core::ptr::addr_of!(KSTACK_STORAGE.data) as *const u8 as u64 };
     // top = base + (idx + 1) * KSTACK_SIZE  →  idx = (top - base) / KSTACK_SIZE - 1
     if kstack_top <= base { return; }
     let offset = kstack_top - base;
@@ -2515,7 +2518,7 @@ fn spawn_service_with_config(
             page_table
                 .map(VirtAddr(va), PhysAddr(phys), stack_flags)
                 .map_err(|_| SpawnError::MapFailed)?;
-            core::mem::forget(frame);
+            // Frame owned by the page table now; Frame is Copy/no-Drop (no release).
             va += PAGE_SIZE as u64;
         }
     }
@@ -2660,7 +2663,7 @@ fn spawn_service_with_config(
         page_table
             .map(VirtAddr(SERVICE_CTX_VA), PhysAddr(ctx_phys), ctx_flags)
             .map_err(|_| SpawnError::MapFailed)?;
-        core::mem::forget(ctx_frame);
+        // ctx_frame owned by the page table now; Frame is Copy/no-Drop (no release).
     }
 
     crate::kprintln!("spawn[kstack]: '{}'", name);

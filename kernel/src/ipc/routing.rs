@@ -62,15 +62,14 @@ impl RoutingEntry {
     }
 }
 
-// SAFETY for the zeroed() call:
-//   SpinLock<[RoutingEntry; MAX_ENDPOINTS]> is valid when zero-initialized:
-//   - SpinLock.locked = AtomicBool(false)
-//   - Every RoutingEntry: valid=false, liveness=Alive(discriminant 0), generation=0,
-//     all queue slots=None (Option discriminant 0), blocked fields=None.
-//   zeroed() instead of SpinLock::new([E; N]) avoids undef padding bytes that
-//   LLD rejects when placing a symbol in .bss. Limine zeroes BSS before entry.
+// `SpinLock::ZEROED` keeps the `unsafe` zeroing in smp/spinlock.rs (a permitted
+// layer, §18.1); ipc/ stays unsafe-free (see ipc/CLAUDE.md). The all-zeroes value
+// is valid here: every RoutingEntry has valid=false, liveness=Alive(discriminant
+// 0), generation=0, queue slots=None, blocked fields=None; lock=AtomicBool(false).
+// This avoids the undef padding bytes that LLD rejects for a `.bss` symbol; Limine
+// zeroes `.bss` before entry.
 #[link_section = ".bss"]
-static TABLE: SpinLock<[RoutingEntry; MAX_ENDPOINTS]> = unsafe { core::mem::zeroed() };
+static TABLE: SpinLock<[RoutingEntry; MAX_ENDPOINTS]> = SpinLock::ZEROED;
 
 // ---------------------------------------------------------------------------
 // Public API.

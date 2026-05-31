@@ -278,9 +278,10 @@ fn walk_or_alloc(table_phys: u64, idx: usize, flags: u64) -> Result<u64, MapErro
     // SAFETY: table_phys valid, idx in 0..512.
     unsafe { write_entry(table_phys, idx, child_phys | flags) };
 
-    // Leak the frame intentionally — page table frames are owned by the
-    // PageTable and freed when the whole table is torn down (Milestone 5).
-    core::mem::forget(child);
+    // The frame is intentionally not returned to the allocator here — page
+    // table frames are owned by the PageTable and freed when the whole table
+    // is torn down (Milestone 5). `Frame` is `Copy`/no-Drop, so simply not
+    // freeing it is the leak; an explicit `forget` would be a no-op.
     Ok(child_phys)
 }
 

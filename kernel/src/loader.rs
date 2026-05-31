@@ -221,9 +221,9 @@ pub fn load(bytes: &[u8]) -> Result<LoadedElf, LoadError> {
 
             pt.map(VirtAddr(va), PhysAddr(phys), flags)?;
 
-            // Frames are owned by the page table; freed at task death (Phase 5).
-            core::mem::forget(frame);
-
+            // Frame ownership passes to the page table; freed at task death
+            // (Phase 5). `Frame` is `Copy`/no-Drop, so there is nothing to
+            // release here — not freeing it is the leak.
             va += PAGE_SIZE as u64;
         }
     }

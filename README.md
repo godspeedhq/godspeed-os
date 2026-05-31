@@ -72,6 +72,19 @@ GodspeedOS treats testing as architecture. The suite is layered — each layer m
 | Adversarial (A1–A10) | Capability isolation under direct attack | Active |
 | Chaos (C1–C7) | Graceful degradation under partial failures | Active |
 
+### Static analysis & unsafe audit
+
+Every `unsafe` block is inventoried in `docs/unsafe-audit.md` and enforced by
+`scripts/unsafe_check.py` — counts may not grow without a written SAFETY argument.
+Latest pass (2026-05-31, boot-verified on AMD T630; `milestones/v2/STATIC_ANALYSIS_AUDIT.md`):
+
+| Check | Result |
+|-------|--------|
+| Unsafe confined to permitted layers (§18.1) | ✅ `ipc/` violation fixed; audit passes (302 lines / 23 files) |
+| Safety / correctness lints (static-mut refs, fn-casts, redundant `unsafe`) | ✅ 0 |
+| Kernel build warnings | 104 → 57 (remaining are intentional unwired architecture) |
+| Hardware boot regression | ✅ clean — 4 cores, cross-core ping/pong to 83k+ msgs, zero faults |
+
 ---
 
 ## Getting started
