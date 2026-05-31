@@ -1618,7 +1618,7 @@ Hardware performance data (perf-brutal-only build, ~3 GHz CPU, 2026-05-21):
 | BP8 allocator | 616 cycles/4KiB page (~205 ns) |
 | BP9 message copy 4KiB | 20,073 cycles (~6.7 µs) |
 | BP10 scheduler decision | 2,323 cycles (~774 ns) |
-| BP2 IPC cross-core | Not measured — Goldmont+ BSP IPI quirk under concurrent load; cross-core IPC verified correct via ping/pong |
+| BP2 IPC cross-core p50 | 1,433,087 cycles (~0.72 ms @ ~2 GHz) — measured 2026-05-31 on HP T630 (AMD GX-420GI), isolated `bp2-only` build; p99/p999 = 16,409,799. NB: distinct machine (~2 GHz) from the rest of this ~3 GHz table. The earlier stall was an unbounded COM2 drain wedging core 0 IF=0 in its timer ISR (fixed, a306fd3), **not** an APIC/IPI quirk — NMI probing proved AP→BSP IPI delivery to the BSP was correct all along. |
 
 ### 23.4 Out of Scope for v1
 
