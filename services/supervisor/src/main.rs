@@ -19,7 +19,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // probe services compete for scheduler quanta.  Pong must precede ping:
     // ping's SEND cap to pong is wired by the kernel at spawn time.
     // Skipped in idle-only builds (S8): no active workload by design.
-    #[cfg(not(feature = "idle-only"))]
+    // Skipped in bp2-only: that mode isolates the BP2 cross-core round-trip
+    // (perf-bp2 on core 0 ⇄ perf-bp2-echo on core 1) so echo is not starved by
+    // the ping→pong flood on core 1 — gives clean, fast BP2 latency numbers.
+    #[cfg(not(any(feature = "idle-only", feature = "bp2-only")))]
     {
         ctx.log("supervisor: spawning pong...");
         if ctx.spawn_on("pong", 1).is_err() {

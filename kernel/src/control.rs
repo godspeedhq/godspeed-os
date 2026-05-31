@@ -26,14 +26,27 @@ static LINE: SpinLock<LineBuf> = SpinLock::new(LineBuf::new());
 
 /// Drain COM2 and process any complete `\n`-terminated commands.
 ///
-/// Called from Core 0's scheduler idle loop only — never from interrupt context.
+/// Called from Core 0's timer ISR (IF=0) on every tick, and from the scheduler
+/// idle loop. Because it runs with interrupts disabled, the drain loop MUST be
+/// bounded: on bare-metal hardware with no usable COM2 the LSR reads 0xFF, so
+/// `com2_try_read_byte` returns `Some(0xFF)` indefinitely. An unbounded loop
+/// here hard-wedges core 0 — it never returns from the timer ISR, so it can
+/// never take the cross-core WAKE_RECEIVER IPI and any task blocked on `recv`
+/// on the BSP stalls forever. The budget (256) far exceeds any real command
+/// line (BUF_SIZE = 128); a stuck LSR just drains 256 junk bytes and returns.
 pub fn process_pending() {
     let mut state = match LINE.try_lock() {
         Some(g) => g,
         None    => return,
     };
 
-    while let Some(b) = crate::arch::x86_64::com2_try_read_byte() {
+    let mut budget = 256u32;
+    while budget > 0 {
+        budget -= 1;
+        let b = match crate::arch::x86_64::com2_try_read_byte() {
+            Some(b) => b,
+            None    => break,
+        };
         if b == b'\n' || b == b'\r' {
             if state.len > 0 {
                 let line = core::str::from_utf8(&state.buf[..state.len]).unwrap_or("");

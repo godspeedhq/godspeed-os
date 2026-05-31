@@ -295,48 +295,91 @@ pub unsafe fn serial_init() {
 /// `serial_init` must have been called before the first call.
 pub fn serial_write_byte(b: u8) {
     use core::sync::atomic::Ordering;
-    // SAFETY: SERIAL_LOCK is a boolean spinlock; we hold it only for the
-    // duration of one THRE poll + one outb, then release it unconditionally.
-    while SERIAL_LOCK
-        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
+    // Bounded best-effort lock acquire: a wedged SERIAL_LOCK must never spin a
+    // core forever with IF=0 (see bugs/1_CROSS_CORE_IPC_REPLY_TO_BSP_STALLS.md).
+    let mut got = false;
+    let mut t = 0u32;
+    while t < SERIAL_LOCK_SPIN_CAP {
+        if SERIAL_LOCK
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            got = true;
+            break;
+        }
         core::hint::spin_loop();
+        t += 1;
     }
     // SAFETY: port I/O to COM1; initialised before first use in _start.
     unsafe {
-        while (inb(COM1 + 5) & 0x20) == 0 {}  // wait: THR empty (LSR bit 5)
-        outb(COM1, b);
+        // Bounded THRE poll: drop the byte rather than spin forever if the UART
+        // never reports THR-empty (the unbounded poll was a real IF=0 wedge).
+        if serial_thre_wait() {
+            outb(COM1, b);
+        }
     }
-    SERIAL_LOCK.store(false, Ordering::Release);
+    if got {
+        SERIAL_LOCK.store(false, Ordering::Release);
+    }
 }
 
-/// Write bytes to COM1 without acquiring SERIAL_LOCK or touching RING.
+/// Spin cap for best-effort `SERIAL_LOCK` acquisition (~seconds on real HW).
+const SERIAL_LOCK_SPIN_CAP: u32 = 5_000_000;
+/// Spin cap for the COM1 THRE (transmit-holding-register-empty) poll.
+const THRE_SPIN_CAP: u32 = 1_000_000;
+
+/// Poll COM1 LSR bit 5 (THR empty) up to `THRE_SPIN_CAP` times.
+/// Returns `true` if the transmit register became empty, `false` on timeout.
 ///
-/// Diagnostic only — bypasses all spinlocks so it is safe to call even when
-/// RING or SERIAL_LOCK might be held or contended. Used to narrow down hang
-/// points that would be invisible through the normal kprintln path.
-pub fn serial_write_bytes_lockfree(s: &[u8]) {
-    for &b in s {
-        // SAFETY: port I/O to COM1; LSR read + THR write; no shared state touched.
-        unsafe {
-            loop {
-                let lsr: u8;
-                core::arch::asm!(
-                    "in al, dx",
-                    out("al") lsr,
-                    in("dx") (COM1 + 5),
-                    options(nostack, nomem)
-                );
-                if lsr & 0x20 != 0 { break; }
-            }
-            core::arch::asm!(
-                "out dx, al",
-                in("dx") COM1,
-                in("al") b,
-                options(nostack, nomem)
-            );
+/// # Safety
+/// COM1 must be initialised; performs port I/O.
+#[inline]
+unsafe fn serial_thre_wait() -> bool {
+    let mut k = 0u32;
+    while k < THRE_SPIN_CAP {
+        // SAFETY: reading the COM1 line-status register.
+        if unsafe { inb(COM1 + 5) } & 0x20 != 0 {
+            return true;
         }
+        core::hint::spin_loop();
+        k += 1;
+    }
+    false
+}
+
+/// Write bytes to COM1, serializing the whole sequence through `SERIAL_LOCK`.
+///
+/// Best-effort lock: if `SERIAL_LOCK` can't be acquired within the spin cap it
+/// proceeds anyway (so it still works during a hang where another core holds the
+/// lock), but normally it serializes with `serial_write_byte` so concurrent
+/// writers can't corrupt each other's THRE poll / TX FIFO state.  Every THRE
+/// poll is bounded (drop the byte on timeout) so a stuck UART can't wedge a core
+/// with IF=0.  (Formerly bypassed the lock with an unbounded poll — a real bug.)
+pub fn serial_write_bytes_lockfree(s: &[u8]) {
+    use core::sync::atomic::Ordering;
+    let mut got = false;
+    let mut t = 0u32;
+    while t < SERIAL_LOCK_SPIN_CAP {
+        if SERIAL_LOCK
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            got = true;
+            break;
+        }
+        core::hint::spin_loop();
+        t += 1;
+    }
+    for &b in s {
+        // SAFETY: port I/O to COM1; bounded THRE poll, drop the byte on timeout.
+        unsafe {
+            if serial_thre_wait() {
+                outb(COM1, b);
+            }
+        }
+    }
+    if got {
+        SERIAL_LOCK.store(false, Ordering::Release);
     }
 }
 
