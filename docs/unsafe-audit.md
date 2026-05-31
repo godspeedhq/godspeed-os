@@ -8,6 +8,22 @@ unless this file is updated in the same commit with a written SAFETY argument.**
 
 ---
 
+## 2026-05-31 — static-analysis + unsafe-audit pass (boot-verified, T630)
+
+Full write-up: `milestones/v2/STATIC_ANALYSIS_AUDIT.md`. Branch
+`verify/static-analysis-unsafe-audit`, commit `d276566`.
+
+| Area | Result |
+|------|--------|
+| Policy violation | **Fixed** — `unsafe` removed from `ipc/` (§18.1); moved to `SpinLock::ZEROED` in `smp/spinlock.rs`. |
+| Safety / correctness lints | **0** — 11 unnecessary `unsafe`, 11 `static mut` refs (→ `addr_of!`), 14 fn-item→int casts, 6 no-op `mem::forget`. |
+| Cruft removed | orphaned `page_fault_handler` + `INTERRUPTED_*` statics. |
+| Inventory | reconciled below — 302 lines / 23 files, passes clean; `task/scheduler.rs` 37 → 36 (under floor). |
+| Kernel warnings | 104 → 57 (rest intentional unwired architecture). |
+| Hardware | boots clean on T630, cross-core ping/pong to 83k+ msgs, zero `#PF`/panic. |
+
+---
+
 ## Policy (§18)
 
 `unsafe` is permitted only in:

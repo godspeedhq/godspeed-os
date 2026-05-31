@@ -258,6 +258,25 @@ No regression: the run completed clean on all four cores.
 
 ---
 
+## Static-analysis + unsafe-audit cleanup (2026-05-31)
+
+A local static-analysis pass over the kernel after the AMD ring-3 / APIC / COM1 /
+shell work. No CI minutes consumed. Full write-up: `milestones/v2/STATIC_ANALYSIS_AUDIT.md`.
+
+| Area | Result |
+|------|--------|
+| Policy violation | **Fixed** — `unsafe` removed from `ipc/` (§18.1 forbidden layer); `.bss` zeroed-static moved to `SpinLock::ZEROED` in `smp/`. `ipc/` unsafe-free again. |
+| Safety / correctness lints | **0** — 11 unnecessary `unsafe`, 11 `static mut` refs (→ `addr_of!`), 14 fn-item→int casts, 6 no-op `mem::forget` all cleared. |
+| Cruft removed | orphaned `page_fault_handler` + `INTERRUPTED_*` diagnostic statics. |
+| Unsafe audit | **passes clean** — 302 lines / 23 files; `task/scheduler.rs` back under its grandfathered floor (37 → 36). |
+| Kernel warnings | **104 → 57** (remaining 57 are intentional unwired architecture — §22 assertions, capability/IPC API — kept deliberately). |
+| Hardware (T630) | **boots clean** — 4 cores, cross-core ping/pong to **83,043 messages**, zero `#PF`/panic. Decisive verification: the changes touched IDT setup, frame allocator, BSP stack switch, context-switch trampolines. |
+| Miri (kernel `lib`) | lone failure was proptest regression-file I/O vs miri's sandbox; passes with `-Zmiri-disable-isolation`. Covers logic untouched here. |
+
+Commit `d276566` on branch `verify/static-analysis-unsafe-audit`.
+
+---
+
 ## Known residue / follow-ups
 
 - **Multi-core serial garbling.** When all four cores write COM1 simultaneously
