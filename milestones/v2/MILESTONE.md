@@ -206,6 +206,58 @@ indicators (§3.12).
 
 ---
 
+## Cross-core test suite on AMD — perf-brutal (2026-05-31)
+
+The cross-core suite that was backburnered on Goldmont+ now runs end-to-end on
+the T630. Getting there required one more hardware bug fix.
+
+**BP2 unblocked (the COM2 timer-ISR wedge).** Cross-core IPC reply to the BSP
+hung: a task blocked on `recv` on core 0 was never woken by an AP's send. Root
+cause was **not** an APIC/IPI quirk (NMI-into-core-0 probing proved the wake IPI
+reached core 0's IRR) — it was `control::process_pending` draining COM2 with an
+**unbounded** `while let Some(b) = com2_try_read_byte()` loop, called from core
+0's timer ISR with `IF=0`. The T630 has no usable COM2, so its LSR floats to
+`0xFF` (Data-Ready permanently set) → the loop never returns → core 0 spins
+interrupts-disabled and can never take the latched `WAKE_RECEIVER` IPI. Fixed by
+bounding the drain to 256 iterations/call (commit `a306fd3` on `main`; full
+investigation in `bugs/1_FINDINGS_AP_TO_BSP_IPI.md`).
+
+**Full perf-brutal run.** With the fix in place, all ten BP probes completed,
+no panic, no `#PF`, over a sustained ~27k-line run. BP2 was measured for the
+first time on this hardware.
+
+| Bench | J5005 (~3 GHz, Goldmont+) | T630 (~2 GHz, Jaguar/Puma+) | notes |
+|-------|---------------------------|------------------------------|-------|
+| BP1 same-core IPC p50      | 55,320      | ~102,600              | clean (~1.9×) |
+| BP2 cross-core IPC p50     | *not measured* | **9,516,027** (in-suite) | **first measure**; isolated `bp2-only` = 1,433,087 |
+| BP3 yield                  | 39,903      | ~143,000              | preemption-dominated |
+| BP4 cap validation         | 495         | ~1,258                | clean (~2.5×) |
+| BP5 spawn                  | 8,121,378   | 75,106,731            | contention |
+| BP6 restart                | 14,462,309  | 87,574,924            | contention |
+| BP7 cap table              | 1,168       | 5,290 – 526,316       | high variance (preemption) |
+| BP8 allocator (4 KiB)      | 616         | ~1,472                | clean (~2.4×) |
+| BP9 message copy 4 KiB     | 20,073      | ~149,000              | contention |
+| BP10 scheduler decision    | 2,323       | ~10,100               | contention |
+
+*All figures in CPU cycles; T630 values are the cleanest across re-runs.*
+
+**Reading the numbers honestly.** They split in two. The compute-bound,
+single-shot-per-iteration probes (BP1, BP4, BP8) land at a steady **~1.9–2.5×**
+the J5005 cycle counts — genuine microarchitecture (Jaguar/Puma+ is a 2-wide
+low-power core with lower IPC than Goldmont). The large/variable figures (BP5,
+BP6, BP9, BP3, BP10, and BP7's 100× spread) are **contention/preemption-inflated,
+not real per-op latency**: under the full 13-probe load a measurement's TSC delta
+includes time the probe sat preempted. The proof is BP2 itself — **9.5M cycles
+in-suite vs 1.43M isolated**, a 6.6× inflation purely from load. For publishable
+per-op latency, each probe must be isolated (à la `bp2-only`); the suite-under-load
+numbers measure throughput-under-contention and robustness, not single-op cost.
+
+ping/pong reached only `pong: received "3"` — starved out by the 13 active probes,
+as expected under brutal load; cross-core IPC still functioned (pong did receive).
+No regression: the run completed clean on all four cores.
+
+---
+
 ## Known residue / follow-ups
 
 - **Multi-core serial garbling.** When all four cores write COM1 simultaneously
@@ -216,7 +268,12 @@ indicators (§3.12).
   after the diagnostic removal. Harmless (no warning), removable later.
 - **Kernel fixes pending commit.** The IRETQ/`ud2`/timer-count changes and the
   diagnostic cleanup are in the working tree, not yet committed/tagged.
-- **Cross-core test suite on AMD.** The Goldmont+ backburner items — **B2/BP2**
-  (cross-core IPC latency), **S3** (cross-core thrash), **S9** (IPI storm) — were
-  blocked on Goldmont+ IPI delivery. With cross-core ping/pong now running on AMD,
-  these are the immediate next runs (`osdev image --mode bp2-only` / `stress`).
+- **Cross-core test suite on AMD.** ✅ **BP2 done** (see "Cross-core test suite on
+  AMD — perf-brutal" above): root-caused the COM2 timer-ISR wedge, fixed, and ran
+  the full perf-brutal suite to completion on the T630. Still outstanding from the
+  Goldmont+ backburner: **S3** (cross-core thrash) and **S9** (IPI storm) under
+  `osdev image --mode stress` — these should now run given the same fix, but have
+  not yet been executed on AMD.
+- **Isolated per-probe perf numbers.** The perf-brutal table is contention-inflated
+  (see note above). A per-probe isolation pass (one benchmark at a time, like
+  `bp2-only`) would give clean, publishable T630 latencies for CLAUDE.md §23.3.
