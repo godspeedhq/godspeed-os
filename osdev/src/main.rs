@@ -448,6 +448,15 @@ pub fn cmd_build_perf_iso(feature: &str) {
         }
         println!("build: {} OK", crate_name);
     }
+    // Force a clean supervisor build. Switching iso-bpN features can make cargo
+    // re-materialise the binary from cache with an OLD mtime, which then fails to
+    // trip the kernel's `rerun-if-changed` on supervisor.elf — so the kernel
+    // keeps a stale embedded supervisor and the wrong probe runs. A clean build
+    // guarantees a fresh mtime so the kernel re-embeds the right one.
+    let _ = std::process::Command::new("cargo")
+        .args(["clean", "--release", "-p", "supervisor",
+               "--target", "x86_64-unknown-none"])
+        .status();
     let sup_feature = format!("supervisor/{}", feature);
     let status = std::process::Command::new("cargo")
         .args(["build", "--release", "-p", "supervisor",
