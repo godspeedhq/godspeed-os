@@ -274,6 +274,11 @@ No regression: the run completed clean on all four cores.
   Goldmont+ backburner: **S3** (cross-core thrash) and **S9** (IPI storm) under
   `osdev image --mode stress` — these should now run given the same fix, but have
   not yet been executed on AMD.
-- **Isolated per-probe perf numbers.** The perf-brutal table is contention-inflated
-  (see note above). A per-probe isolation pass (one benchmark at a time, like
-  `bp2-only`) would give clean, publishable T630 latencies for CLAUDE.md §23.3.
+- **Isolated per-probe perf numbers.** ✅ Done. Added `perf-iso` per-probe isolation
+  builds (`osdev image --mode iso-bp{3,5,7,9,10}`; bp5 covers BP5+BP6) — one benchmark
+  alone, no ping/pong — giving clean, uncontended T630 latencies. The full isolated
+  column is now in CLAUDE.md §23.3. Headline: isolation stripped 7–100× of contention
+  noise (e.g. BP7 5,290–526,316 in-suite → a stable 2,932; BP9 149k–280k → 21,796, ≈
+  the J5005's 20,073 — proving its apparent "regression" was pure scheduling noise).
+  (Build note: a cargo cache-mtime quirk could embed a stale supervisor in the kernel
+  for these single-feature builds; fixed in `ed8a151` by force-cleaning the supervisor.)

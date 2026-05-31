@@ -1618,7 +1618,33 @@ Hardware performance data (perf-brutal-only build, ~3 GHz CPU, 2026-05-21):
 | BP8 allocator | 616 cycles/4KiB page (~205 ns) |
 | BP9 message copy 4KiB | 20,073 cycles (~6.7 µs) |
 | BP10 scheduler decision | 2,323 cycles (~774 ns) |
-| BP2 IPC cross-core p50 | 1,433,087 cycles (~0.72 ms @ ~2 GHz) — measured 2026-05-31 on HP T630 (AMD GX-420GI), isolated `bp2-only` build; p99/p999 = 16,409,799. NB: distinct machine (~2 GHz) from the rest of this ~3 GHz table. The earlier stall was an unbounded COM2 drain wedging core 0 IF=0 in its timer ISR (fixed, a306fd3), **not** an APIC/IPI quirk — NMI probing proved AP→BSP IPI delivery to the BSP was correct all along. |
+| BP2 IPC cross-core | Not measured on J5005 (Goldmont+ stalled cross-core under load) — measured on the T630, see table below |
+
+HP T630 (AMD GX-420GI, Jaguar/Puma+, ~2 GHz) — per-probe **isolated** measurements
+(one benchmark alone: no ping/pong, no competing probes; 2026-05-31, build `ed8a151`).
+µs/ms at ~2 GHz:
+
+| Benchmark | T630 isolated | J5005 (above, perf-brutal) |
+|-----------|---------------|-----------------------------|
+| BP1 IPC same-core p50 | ~102,600 cycles (~51 µs) † | 55,320 |
+| BP2 IPC cross-core p50 | 1,433,087 cycles (~0.72 ms); p99/p999 16,409,799 | not measured |
+| BP3 yield floor | 19,281 cycles (~9.6 µs) | 39,903 |
+| BP4 cap validation | ~1,258 cycles (~0.63 µs) † | 495 |
+| BP5 spawn cost | 45,406,292 cycles (~22.7 ms) | 8,121,378 |
+| BP6 restart cost | 54,231,139 cycles (~27.1 ms) | 14,462,309 |
+| BP7 cap table | 2,932 cycles (~1.5 µs) | 1,168 |
+| BP8 allocator | ~1,472 cycles/4KiB (~0.74 µs) † | 616 |
+| BP9 message copy 4KiB | 21,796 cycles (~10.9 µs) | 20,073 |
+| BP10 scheduler decision | 20,726 cycles (~10.4 µs) | 2,323 |
+
+All cycle counts. † = perf-brutal in-suite p50 (already low-variance); the rest are
+single-probe isolation builds (`osdev image --mode iso-bp{3,5,7,9,10}`; bp5 covers BP5+BP6).
+The two columns are **not** a clean head-to-head: J5005 was perf-brutal (contended), the T630
+column is isolated (uncontended), so they compare fairly only where both were clean —
+BP1/BP4/BP8 at ~1.9–2.5×, genuine Jaguar-vs-Goldmont IPC. Where the T630 number is *lower*
+(BP3) the J5005 figure was itself contention-inflated. BP5/BP6 (spawn/restart) are
+memory-bandwidth-bound — the low-power thin client lags most there. The full investigation
+behind BP2 (the COM2 timer-ISR wedge, fixed `a306fd3`) is in `bugs/1_FINDINGS_AP_TO_BSP_IPI.md`.
 
 ### 23.4 Out of Scope for v1
 
