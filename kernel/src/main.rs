@@ -183,7 +183,7 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     // 16-byte aligned.  boot_info_ptr remains valid — it points to data in
     // Limine's boot-time memory, not on the old stack.
     unsafe {
-        let top = BSP_BOOT_STACK.as_mut_ptr().add(512 * 1024);
+        let top = (core::ptr::addr_of_mut!(BSP_BOOT_STACK) as *mut u8).add(512 * 1024);
         let top_aligned = (top as usize & !15) as u64;
         core::arch::asm!(
             "mov rsp, {0}",

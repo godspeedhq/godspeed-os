@@ -1054,13 +1054,11 @@ pub fn wake_by_slot(slot: usize, result: i64) {
                 CORE_WAKE_HINT[task_core]
                     .compare_exchange(MAX_TASKS, slot, Ordering::Release, Ordering::Relaxed)
                     .ok();
-                // SAFETY: APIC is initialised; task_core is a ready core.
-                unsafe {
-                    crate::smp::ipi::send_ipi(
-                        task_core as u32,
-                        crate::smp::ipi::vectors::WAKE_RECEIVER,
-                    );
-                }
+                // APIC is initialised; task_core is a ready core (outer unsafe).
+                crate::smp::ipi::send_ipi(
+                    task_core as u32,
+                    crate::smp::ipi::vectors::WAKE_RECEIVER,
+                );
             }
         }
     }
@@ -1137,8 +1135,9 @@ pub fn kill_task_by_slot(slot: usize) {
     // claiming the kill (TASK_STATE=Dead).  Release the lock before the long
     // cleanup so spawn on other cores can proceed concurrently.
     task_slot_lock();
-    // SAFETY: lock held; exclusive access to TASK_VALID/TASK_STATE across all cores.
-    let already_dead = unsafe {
+    // Lock held; exclusive access to TASK_VALID/TASK_STATE across all cores.
+    // All accesses below are atomic loads/stores — no unsafe required.
+    let already_dead = {
         if slot >= MAX_TASKS || !TASK_VALID[slot].load(Ordering::Relaxed) {
             task_slot_unlock();
             return;
@@ -1206,13 +1205,11 @@ pub fn kill_task_by_slot(slot: usize) {
             let my_core = current_core_id();
             for cid in 0..MAX_CORES {
                 if cid != my_core && CORE_CURRENT[cid].load(Ordering::SeqCst) == slot {
-                    // SAFETY: cid is a valid core index (loop bound), APIC is mapped.
-                    unsafe {
-                        crate::smp::ipi::send_ipi(
-                            cid as u32,
-                            crate::smp::ipi::vectors::WAKE_RECEIVER,
-                        );
-                    }
+                    // cid is a valid core index (loop bound); APIC mapped (outer unsafe).
+                    crate::smp::ipi::send_ipi(
+                        cid as u32,
+                        crate::smp::ipi::vectors::WAKE_RECEIVER,
+                    );
                 }
             }
         }

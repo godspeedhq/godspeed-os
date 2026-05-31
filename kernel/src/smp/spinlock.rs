@@ -26,6 +26,21 @@ impl<T> SpinLock<T> {
         Self { locked: AtomicBool::new(false), data: UnsafeCell::new(val) }
     }
 
+    /// All-zeroes initializer for placing a large `SpinLock<T>` in `.bss`.
+    ///
+    /// `SpinLock::new([E; N])` materialises the value with undef padding bytes,
+    /// which LLD rejects when the symbol is placed in `.bss`; an all-zeroes
+    /// value has no undef bytes. Limine zeroes `.bss` before kernel entry, so
+    /// the runtime bit pattern matches this const.
+    ///
+    /// SAFETY: the all-zeroes bit pattern must be a valid `T`. This is the
+    /// caller's responsibility via the `T` they instantiate: only reference
+    /// `ZEROED` when every field of `T` is valid at zero (integers, `bool`
+    /// false, `AtomicBool(false)`, `Option` `None` at discriminant 0, arrays
+    /// thereof). The zeroed `locked: AtomicBool` is `false` (unlocked), which
+    /// is the correct initial lock state.
+    pub const ZEROED: Self = unsafe { core::mem::zeroed() };
+
     #[inline]
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
         while self.locked

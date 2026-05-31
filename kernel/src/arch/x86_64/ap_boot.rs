@@ -72,6 +72,6 @@ pub unsafe fn start_all_aps(boot_info: &super::BootInfo) -> u32 {
 /// for that core (no stack protection, no IDT, no APIC yet).
 unsafe extern "C" fn ap_limine_entry(info: &MpInfo) -> ! {
     let core_id = info.extra_argument() as u32;
-    // SAFETY: core_id is valid; this is the standard AP entry path.
-    unsafe { crate::ap_main(core_id) }
+    // core_id is valid; this is the standard AP entry path.
+    crate::ap_main(core_id)
 }
