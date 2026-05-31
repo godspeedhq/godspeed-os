@@ -47,6 +47,17 @@ bp2-only = []
 # Used by `osdev image --mode s8` for the S8 24-hour idle stability run:
 # kernel idles on all cores; observe reports system state every ~500 yields.
 idle-only = []
+# perf-iso: per-probe isolation builds for clean, uncontended T630 latency.
+# `perf-iso` is the umbrella (no ping/pong, no other probes); each `iso-bpN`
+# sub-feature pulls it in and selects exactly one brutal perf probe (+ partners).
+# bp5 covers BP5 (spawn) and BP6 (restart) — same probe. Used by
+# `osdev image --mode iso-bp{3,5,7,9,10}`.
+perf-iso = []
+iso-bp3  = ["perf-iso"]
+iso-bp5  = ["perf-iso"]
+iso-bp7  = ["perf-iso"]
+iso-bp9  = ["perf-iso"]
+iso-bp10 = ["perf-iso"]
 
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }

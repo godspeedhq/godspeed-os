@@ -22,7 +22,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Skipped in bp2-only: that mode isolates the BP2 cross-core round-trip
     // (perf-bp2 on core 0 ⇄ perf-bp2-echo on core 1) so echo is not starved by
     // the ping→pong flood on core 1 — gives clean, fast BP2 latency numbers.
-    #[cfg(not(any(feature = "idle-only", feature = "bp2-only")))]
+    // Skipped in perf-iso: per-probe isolation builds run one benchmark alone.
+    #[cfg(not(any(feature = "idle-only", feature = "bp2-only", feature = "perf-iso")))]
     {
         ctx.log("supervisor: spawning pong...");
         if ctx.spawn_on("pong", 1).is_err() {
@@ -41,7 +42,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // perf-only, and perf-brutal-only builds: probe-hog tight-loops on core 0,
     // probe-4b-send blocks waiting for a harness kill that never arrives on HW,
     // and the combined 16-task load starves IPC benchmarks of scheduler quanta.
-    #[cfg(not(any(feature = "bare-metal", feature = "perf-only", feature = "perf-brutal-only", feature = "stress-only", feature = "adv-only", feature = "chaos-only", feature = "b2-only", feature = "bp2-only")))]
+    #[cfg(not(any(feature = "bare-metal", feature = "perf-only", feature = "perf-brutal-only", feature = "stress-only", feature = "adv-only", feature = "chaos-only", feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
     {
         // --- Probe services (§22 Group A identity tests) ---
         // Recv-endpoint probes must come first so their endpoints are registered
@@ -83,7 +84,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     #[cfg(not(any(feature = "identity-only", feature = "perf-only",
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only",
-                  feature = "b2-only", feature = "bp2-only")))]
+                  feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
     let _ = ctx.spawn("observe");
 
     // shell: spawn alongside observe in bare-metal + full builds only.
@@ -91,7 +92,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     #[cfg(not(any(feature = "identity-only", feature = "perf-only",
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only",
-                  feature = "b2-only", feature = "bp2-only")))]
+                  feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
     let _ = ctx.spawn("shell");
 
     ctx.log("supervisor: ready");
@@ -249,8 +250,23 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("perf-bp2-echo"); // BP2 echo  (core 1) — wires SEND cap to perf-bp2
 }
 
+// perf-iso: isolate ONE brutal perf probe (+ its partners) — no ping/pong, no
+// other probes — for clean uncontended per-op latency on hardware. The probe is
+// selected by an iso-bpN sub-feature (each pulls in perf-iso). bp5 covers both
+// BP5 (spawn) and BP6 (restart) — same probe. Partners are spawned first
+// (victim before perf-bp5; recv before perf-bp9) so endpoints/caps are wired.
+#[cfg(feature = "perf-iso")]
+fn spawn_extended_probes(ctx: &ServiceContext) {
+    #[cfg(feature = "iso-bp3")]  { let _ = ctx.spawn("perf-bp3"); }
+    #[cfg(feature = "iso-bp5")]  { let _ = ctx.spawn("perf-bp5-victim"); let _ = ctx.spawn("perf-bp5"); }
+    #[cfg(feature = "iso-bp7")]  { let _ = ctx.spawn("perf-bp7"); }
+    #[cfg(feature = "iso-bp9")]  { let _ = ctx.spawn("perf-bp9-recv"); let _ = ctx.spawn("perf-bp9"); }
+    #[cfg(feature = "iso-bp10")] { let _ = ctx.spawn("perf-bp10"); }
+    let _ = ctx; // used by every sub-feature arm; silences the no-arm case
+}
+
 // Full build: spawn all non-identity probe categories.
-#[cfg(not(any(feature = "bare-metal", feature = "idle-only", feature = "identity-only", feature = "perf-only", feature = "perf-brutal-only", feature = "stress-only", feature = "adv-only", feature = "chaos-only", feature = "b2-only", feature = "bp2-only")))]
+#[cfg(not(any(feature = "bare-metal", feature = "idle-only", feature = "identity-only", feature = "perf-only", feature = "perf-brutal-only", feature = "stress-only", feature = "adv-only", feature = "chaos-only", feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
 fn spawn_extended_probes(ctx: &ServiceContext) {
     // --- Brutal adversarial test probes — Milestone 20 ---
     // Spawned EARLY, before property/stress kill-respawn loops start, so the

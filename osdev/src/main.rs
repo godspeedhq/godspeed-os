@@ -430,6 +430,48 @@ pub fn cmd_build_b2_only() {
 
 /// BP2 brutal-isolation build: spawns only perf-bp2 + perf-bp2-echo alongside pong/ping.
 /// Brutal equivalent of b2-only — 1000-sample iteration count, same isolation rationale.
+/// Per-probe isolation build (`perf-iso` umbrella + one `iso-bpN` sub-feature).
+/// Spawns exactly one brutal perf probe (+ its partners), no ping/pong, no other
+/// probes — for clean, uncontended per-op latency on hardware. `feature` is the
+/// supervisor sub-feature, e.g. "iso-bp5".
+pub fn cmd_build_perf_iso(feature: &str) {
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe", "observe", "shell"];
+    for crate_name in &non_supervisor {
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--release", "-p", crate_name,
+                   "--target", "x86_64-unknown-none"])
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run cargo build for {}: {}", crate_name, e));
+        if !status.success() {
+            eprintln!("build: {} FAILED", crate_name);
+            std::process::exit(1);
+        }
+        println!("build: {} OK", crate_name);
+    }
+    let sup_feature = format!("supervisor/{}", feature);
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "supervisor",
+               "--target", "x86_64-unknown-none",
+               "--features", &sup_feature])
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run cargo build for supervisor: {}", e));
+    if !status.success() {
+        eprintln!("build: supervisor ({}) FAILED", feature);
+        std::process::exit(1);
+    }
+    println!("build: supervisor ({}) OK", feature);
+
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .status()
+        .expect("failed to run cargo build for kernel");
+    if !status.success() {
+        eprintln!("build: kernel FAILED");
+        std::process::exit(1);
+    }
+    println!("build: kernel OK");
+}
+
 pub fn cmd_build_bp2_only() {
     let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe", "observe", "shell"];
     for crate_name in &non_supervisor {
@@ -572,9 +614,14 @@ fn cmd_image(mode: &str) {
         "chaos"       => cmd_build_chaos(),
         "b2-only"     => cmd_build_b2_only(),
         "bp2-only"    => cmd_build_bp2_only(),
+        "iso-bp3"     => cmd_build_perf_iso("iso-bp3"),
+        "iso-bp5"     => cmd_build_perf_iso("iso-bp5"),
+        "iso-bp7"     => cmd_build_perf_iso("iso-bp7"),
+        "iso-bp9"     => cmd_build_perf_iso("iso-bp9"),
+        "iso-bp10"    => cmd_build_perf_iso("iso-bp10"),
         "s8"          => cmd_build_idle(),
         other => {
-            eprintln!("image: unknown --mode '{}'; valid: bare-metal, perf, perf-brutal, identity, stress, adv, chaos, b2-only, bp2-only, s8", other);
+            eprintln!("image: unknown --mode '{}'; valid: bare-metal, perf, perf-brutal, identity, stress, adv, chaos, b2-only, bp2-only, iso-bp3, iso-bp5, iso-bp7, iso-bp9, iso-bp10, s8", other);
             std::process::exit(1);
         }
     }
