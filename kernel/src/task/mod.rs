@@ -238,6 +238,35 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         // ----------------------------------------------------------------
+        // greet / upper — capability-mediated pipe demo (Appendix D.3).
+        // `upper` recvs and uppercases each line. `greet` has NO static send
+        // authority (send_peers empty) — the shell delegates it a SEND cap to
+        // upper's endpoint at spawn, which becomes its send_peers[0]. Authority
+        // is granted at composition time, not held by contract.
+        // ----------------------------------------------------------------
+        "upper" => Some(("upper", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_UPPER_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0,
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
+        "greet" => Some(("greet", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_GREET_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[], // delegated at runtime by the shell, not contracted
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0,
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
+        // ----------------------------------------------------------------
         // Probe services — §22 Group A identity tests.
         // All use the same probe ELF; probe_mode selects the test behaviour.
         // Spawn ordering in supervisor: recv-endpoint services first, then
@@ -2438,34 +2467,57 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
 /// - If `core_override` is `Some(n)`, spawn on core `n` (§9.2 strict rule).
 /// - Otherwise, use `ServiceConfig::preferred_core`; u32::MAX = round-robin
 ///   across ready cores.
+/// Resolve which core a spawn lands on: explicit override, else the contract's
+/// preferred core (falling back to round-robin if it isn't ready), else
+/// round-robin across ready cores.
+fn resolve_spawn_core(core_override: Option<u32>, preferred_core: u32) -> u32 {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static RR: AtomicU32 = AtomicU32::new(0);
+    match core_override {
+        Some(n) => n,
+        None if preferred_core == u32::MAX => {
+            let count = crate::smp::core::ready_count() as u32;
+            if count == 0 { 0 } else { RR.fetch_add(1, Ordering::Relaxed) % count }
+        }
+        None => {
+            if crate::smp::core::is_ready(preferred_core) {
+                preferred_core
+            } else {
+                let count = crate::smp::core::ready_count() as u32;
+                RR.fetch_add(1, Ordering::Relaxed) % count.max(1)
+            }
+        }
+    }
+}
+
+/// Spawn a producer and delegate it a SEND cap to `sink`'s endpoint as its
+/// `send_peers[0]` — the capability-broker primitive behind shell pipes
+/// (`producer | sink`). The producer's *contract* send peers are intentionally
+/// not used: its only send authority is this runtime-delegated pipe cap, so it
+/// can reach exactly the sink the shell wired it to and nothing else (§3.1, no
+/// ambient authority — composition grants, it doesn't assume).
+///
+/// `sink` must already be spawned and have registered its endpoint, so the SEND
+/// cap can be minted against it. The shell spawns the consumer before the producer.
+pub fn spawn_service_pipe(producer: &str, sink: &str, core_override: Option<u32>)
+    -> Result<(), SpawnError>
+{
+    let (static_name, cfg) = service_config(producer).ok_or(SpawnError::NotFound)?;
+    let core_id = resolve_spawn_core(core_override, cfg.preferred_core);
+    let pipe_peers: [&str; 1] = [sink];
+    let result = spawn_service_with_config(static_name, cfg.elf, core_id,
+        cfg.has_recv_endpoint, &pipe_peers, cfg.probe_mode, cfg.send_peers_grant,
+        cfg.memory_limit, cfg.hw_irqs, cfg.has_console_read);
+    if let Err(ref e) = result {
+        crate::kprintln!("task: spawn pipe '{}' -> '{}' failed: {:?}", producer, sink, e);
+    }
+    result
+}
+
 pub fn spawn_service_by_name(name: &str, core_override: Option<u32>) -> Result<(), SpawnError> {
     let (static_name, cfg) = service_config(name).ok_or(SpawnError::NotFound)?;
 
-    let core_id = match core_override {
-        Some(n) => n,
-        None if cfg.preferred_core == u32::MAX => {
-            // Round-robin across ready cores.
-            let count = crate::smp::core::ready_count() as u32;
-            if count == 0 { 0 } else {
-                use core::sync::atomic::{AtomicU32, Ordering};
-                static RR: AtomicU32 = AtomicU32::new(0);
-                RR.fetch_add(1, Ordering::Relaxed) % count
-            }
-        }
-        None => {
-            let p = cfg.preferred_core;
-            if crate::smp::core::is_ready(p) {
-                p
-            } else {
-                // Preferred core not available (degraded SMP); fall back to
-                // round-robin across ready cores so the probe still runs.
-                let count = crate::smp::core::ready_count() as u32;
-                use core::sync::atomic::{AtomicU32, Ordering};
-                static RR_FALLBACK: AtomicU32 = AtomicU32::new(0);
-                RR_FALLBACK.fetch_add(1, Ordering::Relaxed) % count.max(1)
-            }
-        }
-    };
+    let core_id = resolve_spawn_core(core_override, cfg.preferred_core);
 
     let result = spawn_service_with_config(static_name, cfg.elf, core_id,
                               cfg.has_recv_endpoint, cfg.send_peers, cfg.probe_mode,

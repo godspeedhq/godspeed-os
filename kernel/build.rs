@@ -30,6 +30,8 @@ fn main() {
         ("LOGGER",     "logger"),
         ("PING",       "ping"),
         ("PONG",       "pong"),
+        ("GREET",      "greet"),
+        ("UPPER",      "upper"),
         ("PROBE",      "probe"),
         ("OBSERVE",    "observe"),
         ("SHELL",      "shell"),
