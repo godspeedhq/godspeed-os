@@ -115,7 +115,24 @@ fn cmd_new(name: &str) {
     todo!("scaffold service directory, Cargo.toml, src/main.rs, contracts/{name}.toml from template")
 }
 
+/// Force a clean rebuild of the supervisor (kernel target) before a build mode runs.
+///
+/// Every build mode compiles the supervisor with a different spawn-set feature.
+/// When switching modes, cargo can return a `supervisor.elf` whose mtime is OLDER
+/// than a previously-built kernel, so the kernel's `rerun-if-changed` on
+/// `supervisor.elf` never fires and the kernel keeps a STALE embedded supervisor —
+/// the resulting image/test then runs the *previous* mode's spawn set. Cleaning
+/// guarantees a fresh mtime so the kernel re-embeds the supervisor this mode built.
+/// Every `cmd_build_*` calls this first; `cmd_image` therefore does not need to.
+fn clean_supervisor() {
+    let _ = std::process::Command::new("cargo")
+        .args(["clean", "--release", "-p", "supervisor",
+               "--target", "x86_64-unknown-none"])
+        .status();
+}
+
 pub fn cmd_build() {
+    clean_supervisor();
     // Services must be compiled before the kernel — kernel/build.rs embeds
     // the service ELF bytes via include_bytes!(env!("SVC_*_ELF")).
     let service_crates = [
@@ -148,6 +165,7 @@ pub fn cmd_build() {
 /// Build for bare-metal USB: supervisor with `--features bare-metal` (pong + ping only,
 /// no probe services that require the QEMU harness control port to complete).
 pub fn cmd_build_bare_metal() {
+    clean_supervisor();
     let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe", "observe", "shell"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
@@ -189,6 +207,7 @@ pub fn cmd_build_bare_metal() {
 /// cores; observe snapshots system state every ~500 yields.
 /// Bar: no panic, no resource leak after 24 hours.
 pub fn cmd_build_idle() {
+    clean_supervisor();
     let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe", "observe", "shell"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
@@ -229,6 +248,7 @@ pub fn cmd_build_idle() {
 /// Used by `run_identity_tests` so the supervisor spawn loop takes < 10 s on
 /// TCG instead of 30–200 s with the full 160+ probe service set.
 pub fn cmd_build_identity() {
+    clean_supervisor();
     // Build every service crate except supervisor first.
     let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe", "observe", "shell"];
     for crate_name in &non_supervisor {
@@ -273,6 +293,7 @@ pub fn cmd_build_identity() {
 /// the TCG spawn-wait from 18–120 s down to ~2–5 s and giving each benchmark
 /// maximum headroom before its timeout fires.
 pub fn cmd_build_perf() {
+    clean_supervisor();
     let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe", "observe", "shell"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
@@ -313,6 +334,7 @@ pub fn cmd_build_perf() {
 /// hardware stress run (S1–S10). All stress probes use ctx.kill/ctx.spawn
 /// internally — no QEMU control port required.
 pub fn cmd_build_stress() {
+    clean_supervisor();
     let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe", "observe", "shell"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
@@ -352,6 +374,7 @@ pub fn cmd_build_stress() {
 /// Like `cmd_build_adv` but uses `--features chaos-only` for a self-contained
 /// hardware chaos run (C2–C7). C1 and C4 use bare-metal + hardware reconfiguration.
 pub fn cmd_build_chaos() {
+    clean_supervisor();
     let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe", "observe", "shell"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
@@ -392,6 +415,7 @@ pub fn cmd_build_chaos() {
 /// Eliminates concurrent IPI noise from other benchmarks (B5 spawn/kill, B6 restart)
 /// that triggers the Goldmont+ BSP IPI delivery quirk on the blocking round-trip.
 pub fn cmd_build_b2_only() {
+    clean_supervisor();
     let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe", "observe", "shell"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
@@ -448,15 +472,7 @@ pub fn cmd_build_perf_iso(feature: &str) {
         }
         println!("build: {} OK", crate_name);
     }
-    // Force a clean supervisor build. Switching iso-bpN features can make cargo
-    // re-materialise the binary from cache with an OLD mtime, which then fails to
-    // trip the kernel's `rerun-if-changed` on supervisor.elf — so the kernel
-    // keeps a stale embedded supervisor and the wrong probe runs. A clean build
-    // guarantees a fresh mtime so the kernel re-embeds the right one.
-    let _ = std::process::Command::new("cargo")
-        .args(["clean", "--release", "-p", "supervisor",
-               "--target", "x86_64-unknown-none"])
-        .status();
+    clean_supervisor();
     let sup_feature = format!("supervisor/{}", feature);
     let status = std::process::Command::new("cargo")
         .args(["build", "--release", "-p", "supervisor",
@@ -482,6 +498,7 @@ pub fn cmd_build_perf_iso(feature: &str) {
 }
 
 pub fn cmd_build_bp2_only() {
+    clean_supervisor();
     let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe", "observe", "shell"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
@@ -522,6 +539,7 @@ pub fn cmd_build_bp2_only() {
 /// hardware adversarial run (A1–A10). All adversarial probes are self-contained —
 /// no QEMU control port required.
 pub fn cmd_build_adv() {
+    clean_supervisor();
     let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe", "observe", "shell"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
@@ -561,6 +579,7 @@ pub fn cmd_build_adv() {
 /// Like `cmd_build_perf` but uses `--features perf-brutal-only` for the brutal
 /// benchmark suite (BP1–BP10).
 pub fn cmd_build_brutal_perf() {
+    clean_supervisor();
     let non_supervisor = ["init", "registry", "logger", "ping", "pong", "probe", "observe", "shell"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
@@ -613,21 +632,9 @@ fn cmd_run(smp: u32) {
 }
 
 fn cmd_image(mode: &str) {
-    // Force a clean supervisor rebuild before the mode build runs.
-    //
-    // Every `--mode` builds the supervisor with a different spawn-set feature
-    // (bare-metal / stress / perf / …). When you switch modes, cargo can hand back
-    // a supervisor.elf whose mtime is OLDER than a previously-built kernel — so the
-    // kernel's `rerun-if-changed` on supervisor.elf never fires, the kernel keeps a
-    // STALE embedded supervisor, and the image silently boots the *previous* mode's
-    // probe set (e.g. a "bare-metal" image that actually runs the stress probes).
-    // Cleaning here guarantees a fresh mtime so the kernel re-embeds the supervisor
-    // this mode actually built. (Same mechanism the iso build path relies on.)
-    let _ = std::process::Command::new("cargo")
-        .args(["clean", "--release", "-p", "supervisor",
-               "--target", "x86_64-unknown-none"])
-        .status();
-
+    // Each dispatched `cmd_build_*` calls `clean_supervisor()` first, which forces
+    // the kernel to re-embed the supervisor this mode built (see that helper for
+    // the stale-embed rationale). So no clean is needed here.
     match mode {
         "bare-metal"  => cmd_build_bare_metal(),
         "perf"        => cmd_build_perf(),
