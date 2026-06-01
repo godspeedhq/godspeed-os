@@ -229,6 +229,34 @@ faulting slot's clobbered word, to capture which write does it; (2) only then im
 structural fix (re-base #UD syscalls in `ud2_syscall_entry` to a separate/lower stack), and
 verify the fault is gone on hardware.
 
+## Update 9 (2026-06-01) — FIXED + hardware-verified ✅
+
+Root cause (confirmed): on the GX-420GI the live syscall path is `ud2`/#UD, which enters on
+`TSS.rsp0 = K0T` — the same top-of-kstack region the timer ISR's context-switch path descends
+into (canary: down to ~K0T-504). `ud2_syscall_entry` ran the entire syscall chain there, so the
+timer-switch could zero-write a suspended recv syscall's return address → the intermittent
+rip→kstack `#PF`. The `K0T-512` separation was *designed* (`prepare_ring3_switch` already set
+`PER_CORE_SYSCALL.kernel_rsp`) but never wired into the `#UD` path; the dead LSTAR path already
+switched to it.
+
+**Fix** (commit on `fix/bug2-kstack-overlap`, fresh from `main`):
+- `ud2_syscall_entry` now switches `RSP` to `kernel_rsp` before `call syscall_handler`, stashing
+  the `#UD` CPU frame pointer on the syscall stack for the final `iretq` (the frame is safe across
+  the call: the task is CPL0 during the syscall, so interrupts use the current/kernel stack, never
+  `TSS.rsp0`). 16-byte ABI alignment preserved.
+- `prepare_ring3_switch` sets `kernel_rsp = K0T-2048` (was 512) — ~1.5 KiB guard over the measured
+  timer reach (K0T-504); the deepest syscall (~4.6 KiB for a 4 KiB Message) still fits in 64 KiB.
+
+This made the "pin the exact clobber first" caution (Update 8) unnecessary: the structural root
+(no syscall/interrupt stack separation for `#UD`) was solid enough to fix directly, and the result
+confirms it.
+
+**Verification:**
+- QEMU: boots clean, ping/pong `send`/`recv` flow, 0 `#PF`/`#UD`/`#GP` — syscall path intact.
+- Hardware (T630, iso-s9 repro): **14 power-cycles, 0 Bug 2 faults, `S9 pass (100/100)` on every
+  boot.** Pre-fix the same workload faulted ~50% of boots (0.5¹⁴ ≈ 0.006% if still live). Bug 2
+  is resolved.
+
 ## Next steps (when chased)
 
 1. Make it reproduce reliably (1/6 is too rare) — e.g. loop the isolated probe, or add a probe
