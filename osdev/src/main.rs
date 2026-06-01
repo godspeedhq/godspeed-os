@@ -613,6 +613,21 @@ fn cmd_run(smp: u32) {
 }
 
 fn cmd_image(mode: &str) {
+    // Force a clean supervisor rebuild before the mode build runs.
+    //
+    // Every `--mode` builds the supervisor with a different spawn-set feature
+    // (bare-metal / stress / perf / …). When you switch modes, cargo can hand back
+    // a supervisor.elf whose mtime is OLDER than a previously-built kernel — so the
+    // kernel's `rerun-if-changed` on supervisor.elf never fires, the kernel keeps a
+    // STALE embedded supervisor, and the image silently boots the *previous* mode's
+    // probe set (e.g. a "bare-metal" image that actually runs the stress probes).
+    // Cleaning here guarantees a fresh mtime so the kernel re-embeds the supervisor
+    // this mode actually built. (Same mechanism the iso build path relies on.)
+    let _ = std::process::Command::new("cargo")
+        .args(["clean", "--release", "-p", "supervisor",
+               "--target", "x86_64-unknown-none"])
+        .status();
+
     match mode {
         "bare-metal"  => cmd_build_bare_metal(),
         "perf"        => cmd_build_perf(),
