@@ -622,19 +622,19 @@ unsafe fn prepare_ring3_switch(core_id: usize, slot: usize) {
 
     let ksp = TASK_KERNEL_STACK_TOP[slot].load(Ordering::Relaxed);
 
-    // SYSCALL entry must start 512 bytes below K0T, NOT at K0T.
+    // The syscall stack must start well below K0T, NOT at K0T (Bug 2).
     //
-    // Both the timer ISR (via TSS.rsp0 → K0T) and SYSCALL entry would otherwise
-    // start from the same K0T, making their stack frames overlap.  The timer ISR
-    // saves switch_context's return address at K0T-200; spawn_service_with_config's
-    // frame (which starts around K0T-192 for the SYSCALL path) covers K0T-200 and
-    // any zero-init within the frame writes 0 there — corrupting the saved return
-    // address and causing the rip=0 crash on the next resume.
+    // Both the timer ISR (via TSS.rsp0 → K0T) and the syscall path enter at the
+    // top of the kstack; if the syscall chain runs there too, the timer ISR's
+    // context-switch path — which descends much deeper than once assumed: canary
+    // measurement showed it zero-writing down to ~K0T-504 — clobbers a suspended
+    // recv syscall's return address, causing the intermittent rip→kstack #PF.
     //
-    // By starting SYSCALL at K0T-512, all SYSCALL frames live below K0T-512.
-    // K0T-200 (the timer ISR's deepest save point) is above K0T-512 and is
-    // therefore never touched by any SYSCALL frame.
-    let syscall_rsp = ksp - 512;
+    // `ud2_syscall_entry` switches RSP to this value before calling the handler,
+    // so the whole syscall chain lives below it. K0T-2048 leaves ~1.5 KiB of guard
+    // over the measured timer reach (K0T-504); the deepest syscall (~4.6 KiB for a
+    // 4 KiB Message) still fits comfortably in the 64 KiB kstack below K0T-2048.
+    let syscall_rsp = ksp - 2048;
 
     // SAFETY: PER_CORE_SYSCALL lives in .data; single writer (this core).
     unsafe {
