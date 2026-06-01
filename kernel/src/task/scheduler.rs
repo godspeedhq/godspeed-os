@@ -611,6 +611,15 @@ pub fn current_task_insert_cap(cap: Capability) -> Result<usize, CapError> {
 /// # Safety
 /// IF must be 0.  `slot` must be a valid ring-3 task slot.
 unsafe fn prepare_ring3_switch(core_id: usize, slot: usize) {
+    // §9.1 (static placement): `pick_next` only ever returns a slot whose
+    // TASK_CORE equals the running core, so a task is never resumed on a core it
+    // is not pinned to. Assert it as the executable form of the invariant — a
+    // mismatch here means the scheduler attempted a forbidden mid-execution
+    // migration (§3.11), which is a kernel logic bug, not a recoverable state.
+    crate::invariants::assertions::assert_no_mid_execution_migration(
+        TASK_CORE[slot], core_id as u32,
+    );
+
     let ksp = TASK_KERNEL_STACK_TOP[slot].load(Ordering::Relaxed);
 
     // SYSCALL entry must start 512 bytes below K0T, NOT at K0T.

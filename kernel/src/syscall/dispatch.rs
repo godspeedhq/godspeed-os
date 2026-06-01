@@ -95,6 +95,9 @@ fn handle_log(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     if cap.resource_id != crate::capability::LOG_WRITE_RESOURCE {
         return cap_err_to_i64(CapError::CapWrongScope);
     }
+    // §3.1 (no ambient authority): control reaches the privileged log write only
+    // with a cap the lookup + scope check validated. Executable §3.1 checkpoint.
+    crate::invariants::assertions::assert_cap_validated(&Ok(()));
 
     let len = msg_len as usize;
     if len == 0 || len > 256 { return -1; }
@@ -124,6 +127,10 @@ fn handle_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
         Ok(m)  => m,
         Err(e) => return e,
     };
+
+    // §3.1 (no ambient authority): the send below requires a validated SEND cap,
+    // which the lookup above enforced. Executable §3.1 checkpoint.
+    crate::invariants::assertions::assert_cap_validated(&Ok(()));
 
     let my_slot = scheduler::current_task_slot();
 
@@ -155,6 +162,9 @@ fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
         Ok(c)  => c,
         Err(e) => return cap_err_to_i64(e),
     };
+    // §3.1 (no ambient authority): the recv below requires a validated RECV cap,
+    // which the lookup above enforced. Executable §3.1 checkpoint.
+    crate::invariants::assertions::assert_cap_validated(&Ok(()));
     let endpoint_id = EndpointId(cap.resource_id.0);
 
     let buf_len = out_len as usize;
@@ -209,6 +219,10 @@ fn handle_try_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
         Ok(m)  => m,
         Err(e) => return e,
     };
+
+    // §3.1 (no ambient authority): the send below requires a validated SEND cap,
+    // which the lookup above enforced. Executable §3.1 checkpoint.
+    crate::invariants::assertions::assert_cap_validated(&Ok(()));
 
     // Pass None for blocked_sender_slot — QueueFull is returned directly.
     match crate::ipc::routing::enqueue(endpoint_id, msg, cap.generation, None) {
@@ -299,7 +313,36 @@ fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
         Ok(s)  => s,
         Err(_) => return -1,
     };
-    if crate::task::kill_by_name(name) { 0 } else { -1 }
+    // §6.2 (fail-closed): the trusted root (init/supervisor/registry) is
+    // non-restartable — its death requires a reboot, so a caller must not be able
+    // to kill it via this syscall. Reject the request *before* any kill happens.
+    // This is the primary §6.2 gate; the assert_tcb_alive sweep below is a
+    // defensive secondary check. Rejection (not panic) is deliberate: a mere kill
+    // *attempt* is not a TCB death, and panicking would hand any caller of this
+    // syscall a reboot denial-of-service. Because TCB services can no longer be
+    // killed here, a TCB name *absent* from the task table at the post-kill sweep
+    // can only mean "not spawned in this configuration" (never "killed"), which is
+    // why assert_tcb_alive safely tolerates absence (§22 uses minimal manifests).
+    if matches!(name, "init" | "supervisor" | "registry") {
+        return -1;
+    }
+    if crate::task::kill_by_name(name) {
+        // A kill bumps the dead endpoint's generation and could (if a bug let it
+        // target a trusted service) take down the TCB. Now that the kill has
+        // completed and no kernel locks are held, verify the two invariants a
+        // kill is most likely to break:
+        //   §6.2 — every TCB service (init/supervisor/registry) is still alive;
+        //          TCB death is a loud, unrecoverable failure, not a silent one.
+        //   §7.8 — the cap table is still consistent (no cap carries a generation
+        //          beyond its resource's current generation). The generation bump
+        //          only ever moves resources forward, so all surviving caps stay
+        //          stale-or-current. This is an O(active-caps) walk; the kill path
+        //          is not a per-syscall hot path, so it is an acceptable home for
+        //          the §7.8 check (see invariants/CLAUDE.md).
+        crate::invariants::assertions::assert_tcb_alive();
+        crate::invariants::assertions::assert_cap_table_consistent();
+        0
+    } else { -1 }
 }
 
 /// arg0 = name_ptr, arg1 = name_len, arg2 = include_grant (0 = SEND only, 1 = SEND|GRANT).

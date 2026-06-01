@@ -32,13 +32,39 @@ pub fn assert_no_mid_execution_migration(original_core: u32, current_core: u32) 
 /// an immediate system reboot — §6.2.
 pub fn assert_tcb_alive() {
     const TCB: &[&str] = &["init", "supervisor", "registry"];
-    for &name in TCB {
-        let Some(ep_id) = crate::ipc::names::lookup(name) else {
-            panic!("invariant violation: TCB service '{}' has no registered endpoint (§6.2)", name);
-        };
-        if !crate::ipc::routing::is_endpoint_alive(ep_id) {
-            panic!("invariant violation: TCB service '{}' endpoint is dead (§6.2)", name);
+    const DEAD: u8 = crate::task::state::TaskState::Dead as u8;
+    // §6.2 governs the *death of a service that exists*, not the *omission* of
+    // one: identity-test manifests are minimal and spawn only the subset a given
+    // test needs (e.g. cross-core tests run without `registry`). So a TCB name
+    // that is simply absent from this configuration is skipped — only a service
+    // that exists and is Dead (or whose endpoint was killed) is a violation.
+    //
+    // This absence-tolerance is NOT fail-open: the only syscall that can kill a
+    // service (`handle_kill`) rejects TCB targets before any kill happens, so a
+    // TCB name absent here can only mean "never spawned in this configuration",
+    // never "killed-and-reclaimed". A TCB service that dies by fault (kill_current)
+    // is caught while still present-and-Dead by the `state == DEAD` check above.
+    'next: for &name in TCB {
+        for slot in 0..crate::task::scheduler::MAX_TASKS {
+            let stat = crate::task::scheduler::task_stat(slot);
+            if stat.valid && stat.name == name {
+                // Found the task. Liveness by task state works uniformly, including
+                // for `init`, which persists (`loop { yield }`) but registers no
+                // named IPC endpoint and so cannot be checked by endpoint.
+                if stat.state == DEAD {
+                    panic!("invariant violation: TCB service '{}' is Dead (§6.2)", name);
+                }
+                // A TCB service that also exposes a named endpoint must have it
+                // alive — a live task with a killed endpoint is also a §6.2 break.
+                if let Some(ep_id) = crate::ipc::names::lookup(name) {
+                    if !crate::ipc::routing::is_endpoint_alive(ep_id) {
+                        panic!("invariant violation: TCB service '{}' endpoint is dead (§6.2)", name);
+                    }
+                }
+                continue 'next;
+            }
         }
+        // `name` not present in this configuration — not a §6.2 violation.
     }
 }
 

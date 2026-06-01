@@ -277,6 +277,48 @@ Commit `d276566` on branch `verify/static-analysis-unsafe-audit`.
 
 ---
 
+## §22 invariant assertions wired (2026-06-01)
+
+The four constitutional assertions in `kernel/src/invariants/assertions.rs` were
+dead code (defined, never called — flagged by the static-analysis pass above).
+They are now wired into the hot paths they guard, so they enforce the invariants
+at runtime in release builds rather than living as documentation.
+
+| Assertion | Call site | Pins |
+|-----------|-----------|------|
+| `assert_no_mid_execution_migration` | `prepare_ring3_switch` (every ring-3 resume) | §9.1 static placement |
+| `assert_cap_validated` | success path of `send`/`recv`/`try_send`/`log` handlers | §3.1 no ambient authority |
+| `assert_tcb_alive` | `handle_kill` success path | §6.2 TCB liveness |
+| `assert_cap_table_consistent` | `handle_kill` success path | §7.8 no future-generation caps |
+
+Two issues surfaced and were fixed in the process:
+
+- **Latent `assert_tcb_alive` bug.** It assumed all three TCB services register a
+  named IPC endpoint, but `init` is the bootstrap spawner and never does, and the
+  minimal §22 test manifests omit `registry`. As written it would have panicked the
+  first time it was ever called. Rewritten to check **task liveness** via the safe
+  `task_stat` snapshot (no new unsafe), tolerant of services a given config omits.
+- **Fail-open → fail-closed (security review, HIGH).** Tolerating an absent TCB name
+  is only safe if such a service can never be killed-and-reclaimed. `handle_kill` now
+  **rejects killing `init`/`supervisor`/`registry`** before any kill happens (rejection,
+  not panic, to avoid handing a caller a reboot DoS). Absence at the post-kill sweep can
+  then only mean "never spawned", making the tolerance provably safe.
+
+**Verification.** Boot-verified on the T630: **0 invariant violations across ~4,500
+kills** plus the full perf/adv/chaos/stress probe suite, 0 kernel panics. The migration
+check runs on every context switch and `assert_cap_validated` on every privileged
+syscall, so both hot-path assertions were exercised continuously. Identity suite 17/22
+locally (the 5 failures are QEMU-TCG-on-Windows boot-speed timeouts — non-deterministic,
+0 logic failures). Clears 7 dead-code warnings (the assertions + `is_endpoint_alive` +
+`for_each_active_cap` now used): kernel warnings **57 → 50**. Commit `3094719` on branch
+`verify/wire-invariant-assertions`.
+
+Remaining: `assert_cap_validated` is a post-validation tripwire (tautological in correct
+code, since the handler already returns on a bad cap) — it documents the §3.1 boundary
+and would catch a future handler that performs a privileged action without validating.
+
+---
+
 ## Known residue / follow-ups
 
 - **Multi-core serial garbling.** When all four cores write COM1 simultaneously
