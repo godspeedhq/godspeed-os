@@ -354,12 +354,12 @@ pre-fix ~50% fault rate. Cross-core-heavy workloads are now safe on hardware.
   after the diagnostic removal. Harmless (no warning), removable later.
 - **Kernel fixes pending commit.** The IRETQ/`ud2`/timer-count changes and the
   diagnostic cleanup are in the working tree, not yet committed/tagged.
-- **Cross-core test suite on AMD.** ✅ **BP2 done** (see "Cross-core test suite on
-  AMD — perf-brutal" above): root-caused the COM2 timer-ISR wedge, fixed, and ran
-  the full perf-brutal suite to completion on the T630. Still outstanding from the
-  Goldmont+ backburner: **S3** (cross-core thrash) and **S9** (IPI storm) under
-  `osdev image --mode stress` — these should now run given the same fix, but have
-  not yet been executed on AMD.
+- **Cross-core test suite on AMD.** ✅ **BP2 + S3 + S9 done.** BP2 root-caused (COM2
+  timer-ISR wedge) and the full perf-brutal suite ran to completion on the T630. The
+  Goldmont+ backburner is cleared: **S3** (cross-core thrash) **pass (50/50)** and
+  **S9** (IPI storm) **pass (100/100)** on the T630, via the per-probe isolation builds
+  (`osdev image --mode iso-s3 / iso-s9`), repeatedly. (The iso-s9 build later doubled as
+  the Bug 2 repro — see "Bug 2 fixed" above.)
 - **Isolated per-probe perf numbers.** ✅ Done. Added `perf-iso` per-probe isolation
   builds (`osdev image --mode iso-bp{3,5,7,9,10}`; bp5 covers BP5+BP6) — one benchmark
   alone, no ping/pong — giving clean, uncontended T630 latencies. The full isolated
