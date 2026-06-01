@@ -293,7 +293,26 @@ pub unsafe extern "C" fn ud2_syscall_entry() {
         "mov rdx, rsi",
         "mov rsi, rdi",
         "mov rdi, rax",
+        // --- Re-base onto the dedicated syscall stack (Bug 2 fix) ---
+        // The #UD CPU frame lives at the top of the kstack (entered via
+        // TSS.rsp0 = K0T), which is the SAME region the timer ISR's context-switch
+        // path descends into (~K0T-504). Running the whole syscall chain there let
+        // the timer-switch zero-write a suspended recv syscall's return address
+        // (Bug 2). Switch to PER_CORE_SYSCALL.kernel_rsp (= K0T-2048, set by
+        // prepare_ring3_switch) so the syscall chain lives well below the timer's
+        // reach. The LSTAR path already does this; the #UD path didn't.
+        //
+        // The #UD frame (needed for the final iretq) stays at the top of the
+        // kstack and is safe across the call: while in the syscall the task is
+        // CPL0, so any interrupt uses the current (kernel_rsp) stack, never
+        // TSS.rsp0 — nothing overwrites the top-of-kstack frame.
+        "mov r10, rsp",            // r10 = #UD frame ptr (top of kstack)
+        "mov rsp, gs:[8]",         // rsp = kernel_rsp (dedicated syscall stack)
+        "sub rsp, 16",             // reserve a 16-byte slot, keep ABI alignment
+        "mov [rsp], r10",          // stash #UD frame ptr (r10 is caller-saved)
         "call syscall_handler",
+        "mov r10, [rsp]",          // recover #UD frame ptr
+        "mov rsp, r10",            // switch back to the #UD frame
         // rax = return value; restore user GS and re-enter ring-3.
         "swapgs",
         "iretq",

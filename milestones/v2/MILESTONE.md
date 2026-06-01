@@ -319,6 +319,31 @@ and would catch a future handler that performs a privileged action without valid
 
 ---
 
+## Bug 2 fixed — #UD syscall / timer stack overlap (2026-06-01)
+
+The last known kernel bug: an intermittent `rip → kstack` `#PF` under heavy cross-core
+`recv` load on real hardware (root-caused earlier, banked; full history in
+`bugs/2_INTERMITTENT_RIP0_PF_POST_IDLE.md`, Updates 1–9).
+
+**Root cause.** On the GX-420GI the live syscall path is `ud2`/#UD, which enters on
+`TSS.rsp0 = K0T` — the same top-of-kstack region the timer ISR's context-switch path
+descends into (~K0T-504). `ud2_syscall_entry` ran the whole syscall chain there, so the
+timer-switch could zero-write a suspended recv syscall's return address. The `K0T-512`
+separation was *designed* (`prepare_ring3_switch` sets `kernel_rsp`) but never wired into
+the `#UD` path — the dead LSTAR path already switched to it.
+
+**Fix** (small, surgical — wires up the intended separation):
+- `ud2_syscall_entry` switches `RSP` to `kernel_rsp` before calling the handler (stashing
+  the `#UD` frame pointer for the final `iretq`).
+- `prepare_ring3_switch` sets `kernel_rsp = K0T-2048` (was 512) for ~1.5 KiB guard over the
+  measured timer reach.
+
+**Verification.** QEMU: boots, `send`/`recv` flow, 0 `#PF`/`#UD`/`#GP`. Hardware (T630,
+iso-s9 repro): **14 power-cycles, 0 Bug 2 faults, `S9 pass (100/100)` every boot** — vs the
+pre-fix ~50% fault rate. Cross-core-heavy workloads are now safe on hardware.
+
+---
+
 ## Known residue / follow-ups
 
 - **Multi-core serial garbling.** When all four cores write COM1 simultaneously

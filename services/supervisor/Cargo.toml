@@ -52,12 +52,18 @@ idle-only = []
 # sub-feature pulls it in and selects exactly one brutal perf probe (+ partners).
 # bp5 covers BP5 (spawn) and BP6 (restart) — same probe. Used by
 # `osdev image --mode iso-bp{3,5,7,9,10}`.
+# perf-iso is the generic single-probe isolation umbrella (no ping/pong, no other
+# probes). iso-s3/iso-s9 reuse it to isolate the cross-core STRESS tests (S3
+# thrash, S9 IPI storm) — pass/fail robustness runs without the restart-churn
+# probes (S2/S4/S10). Used by `osdev image --mode iso-s{3,9}`.
 perf-iso = []
 iso-bp3  = ["perf-iso"]
 iso-bp5  = ["perf-iso"]
 iso-bp7  = ["perf-iso"]
 iso-bp9  = ["perf-iso"]
 iso-bp10 = ["perf-iso"]
+iso-s3   = ["perf-iso"]
+iso-s9   = ["perf-iso"]
 
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }
