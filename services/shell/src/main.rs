@@ -11,6 +11,14 @@ const MAX_ARGS: usize = 4;
 // echoes characters locally, so we just accumulate bytes until \r or \n.
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
+    // Let the one-time boot logging flush first (logger/registry/supervisor
+    // "ready", init "all spawns done") so the screen rests with `gs>` as the
+    // last line. Each peer service logs once then yields; a generous yield count
+    // guarantees they all get scheduler turns before we print the prompt. Nothing
+    // logs after this in the bare-metal image, so `gs>` stays at the bottom.
+    for _ in 0..256 {
+        ctx.yield_cpu();
+    }
     ctx.log("shell: ready (type 'help')");
     ctx.log("gs>");
 
