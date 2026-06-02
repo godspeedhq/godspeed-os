@@ -42,8 +42,10 @@ struct Fb {
     bpp: usize,    // bytes per pixel
     width: usize,  // visible width in pixels
     height: usize, // visible height in pixels
-    cols: usize,   // text columns (width / GLYPH_W)
-    rows: usize,   // text rows (height / GLYPH_H)
+    org_x: usize,  // left edge of the text area (safe-area inset for TV overscan)
+    org_y: usize,  // top edge of the text area
+    cols: usize,   // text columns within the safe area
+    rows: usize,   // text rows within the safe area
     col: usize,    // cursor column
     row: usize,    // cursor row
     fg: u32,       // foreground pixel value (already in the device's channel layout)
@@ -53,8 +55,14 @@ struct Fb {
 
 static FB: SpinLock<Fb> = SpinLock::new(Fb {
     base: 0, pitch: 0, bpp: 0, width: 0, height: 0,
-    cols: 0, rows: 0, col: 0, row: 0, fg: 0, bg: 0, ready: false,
+    org_x: 0, org_y: 0, cols: 0, rows: 0, col: 0, row: 0, fg: 0, bg: 0, ready: false,
 });
+
+/// Safe-area inset per edge, as a percentage of each dimension. TVs overscan
+/// (crop) ~3–5% off every edge; insetting the text by 5% keeps it all visible
+/// without depending on the TV's "Just Scan" / "Screen Fit" / "Full pixel"
+/// setting. Harmless on a monitor (no overscan) — just a small border.
+const SAFE_PCT: usize = 5;
 
 /// Initialise the console from Limine's framebuffer descriptor. Called once in
 /// `_start`, right after `serial_init`, before the first `kprintln`.
@@ -71,8 +79,11 @@ pub fn fb_init(fb: &Framebuffer) {
     s.bpp = (fb.bpp as usize) / 8;
     s.width = fb.width as usize;
     s.height = fb.height as usize;
-    s.cols = s.width / GLYPH_W;
-    s.rows = s.height / GLYPH_H;
+    // Inset the text area by SAFE_PCT on each edge so TV overscan can't clip it.
+    s.org_x = s.width * SAFE_PCT / 100;
+    s.org_y = s.height * SAFE_PCT / 100;
+    s.cols = (s.width - 2 * s.org_x) / GLYPH_W;
+    s.rows = (s.height - 2 * s.org_y) / GLYPH_H;
     s.col = 0;
     s.row = 0;
     s.fg = make(0x80, 0xFF, 0x80); // soft green on black — classic console look
@@ -150,8 +161,8 @@ fn put_pixel(s: &Fb, x: usize, y: usize, color: u32) {
 /// Render one glyph at text cell (col, row), scaled by `SCALE`.
 fn draw_glyph(s: &Fb, ch: u8, col: usize, row: usize) {
     let bits = glyph(ch);
-    let x0 = col * GLYPH_W;
-    let y0 = row * GLYPH_H;
+    let x0 = s.org_x + col * GLYPH_W;
+    let y0 = s.org_y + row * GLYPH_H;
     for gy in 0..8 {
         let rowbits = bits[gy];
         for gx in 0..8 {
@@ -170,16 +181,22 @@ fn draw_glyph(s: &Fb, ch: u8, col: usize, row: usize) {
 /// glyph height and clears the freed bottom row.
 fn scroll(s: &Fb) {
     let row_bytes = GLYPH_H * s.pitch;
-    let total = s.height * s.pitch;
-    if row_bytes >= total {
+    let text_top = s.org_y * s.pitch; // byte offset of the first text scanline
+    let text_bytes = s.rows * GLYPH_H * s.pitch; // height of the text region
+    if row_bytes >= text_bytes {
         return;
     }
     let base = s.base as *mut u8;
-    // SAFETY: source [base+row_bytes, base+total) and dest [base, base+total-
-    // row_bytes) are both within the mapped framebuffer; copy handles overlap.
+    // SAFETY: the text strip [org_y, org_y + rows*GLYPH_H) lies within the mapped
+    // framebuffer (org_y + rows*GLYPH_H ≤ height by construction). copy shifts it
+    // up one glyph row (handles overlap); write_bytes clears the freed bottom
+    // row (bg is black ⇒ byte-zero). The margins outside the strip are untouched.
     unsafe {
-        core::ptr::copy(base.add(row_bytes), base, total - row_bytes);
-        // Clear the freed bottom row (bg is black ⇒ byte-zero).
-        core::ptr::write_bytes(base.add(total - row_bytes), 0, row_bytes);
+        core::ptr::copy(
+            base.add(text_top + row_bytes),
+            base.add(text_top),
+            text_bytes - row_bytes,
+        );
+        core::ptr::write_bytes(base.add(text_top + text_bytes - row_bytes), 0, row_bytes);
     }
 }
