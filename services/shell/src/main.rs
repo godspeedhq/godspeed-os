@@ -57,6 +57,15 @@ fn execute(ctx: &ServiceContext, line: &[u8]) {
     let s = s.trim();
     if s.is_empty() { return; }
 
+    // Capability-mediated pipe: `producer | sink`. The shell brokers the channel
+    // (Appendix D.3): spawn the consumer, then spawn the producer with a SEND cap
+    // to the consumer's endpoint delegated to it — the producer has no ambient
+    // authority of its own.
+    if let Some(bar) = s.find('|') {
+        cmd_pipe(ctx, s[..bar].trim(), s[bar + 1..].trim());
+        return;
+    }
+
     let mut args = [""; MAX_ARGS];
     let mut argc = 0usize;
     for word in s.split_ascii_whitespace() {
@@ -165,6 +174,32 @@ fn cmd_spawn(ctx: &ServiceContext, name: &str) {
             write_bytes(&mut buf, &mut pos, name.as_bytes());
             ctx.log(core::str::from_utf8(&buf[..pos]).unwrap_or("spawn failed"));
         }
+    }
+}
+
+/// `producer | sink` — broker a capability-mediated pipe. Spawn the consumer
+/// (registers its endpoint), then spawn the producer with a SEND cap to that
+/// endpoint delegated to it. The producer holds no ambient send authority.
+fn cmd_pipe(ctx: &ServiceContext, producer: &str, sink: &str) {
+    if producer.is_empty() || sink.is_empty() {
+        ctx.log("usage: <producer> | <sink>");
+        return;
+    }
+    if ctx.spawn(sink).is_err() {
+        ctx.log("pipe: failed to spawn sink");
+        return;
+    }
+    match ctx.spawn_pipe(producer, sink) {
+        Ok(()) => {
+            let mut buf = [0u8; 96];
+            let mut pos = 0usize;
+            write_bytes(&mut buf, &mut pos, b"pipe wired: ");
+            write_bytes(&mut buf, &mut pos, producer.as_bytes());
+            write_bytes(&mut buf, &mut pos, b" | ");
+            write_bytes(&mut buf, &mut pos, sink.as_bytes());
+            ctx.log(core::str::from_utf8(&buf[..pos]).unwrap_or("pipe wired"));
+        }
+        Err(_) => ctx.log("pipe: failed to spawn producer with delegated cap"),
     }
 }
 

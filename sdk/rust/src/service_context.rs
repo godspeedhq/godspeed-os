@@ -603,6 +603,38 @@ impl ServiceContext {
         if ret == 0 { Ok(()) } else { Err(crate::Error::InvalidArgument) }
     }
 
+    /// Spawn `producer` and delegate it a SEND cap to `sink`'s endpoint
+    /// (`producer | sink`). `sink` must already be spawned. Requires the spawn
+    /// capability — held only by the shell/supervisor.
+    pub fn spawn_pipe(&self, producer: &str, sink: &str) -> Result<(), crate::Error> {
+        self.spawn_pipe_on(producer, sink, 0xFFFF)
+    }
+
+    pub fn spawn_pipe_on(&self, producer: &str, sink: &str, core: u32) -> Result<(), crate::Error> {
+        let data = Self::ctx();
+        if data.magic != SERVICE_CTX_MAGIC {
+            return Err(crate::Error::InvalidArgument);
+        }
+        let slot = data.spawn_slot;
+        if slot == u32::MAX {
+            return Err(crate::Error::Cap(CapError::CapNotHeld));
+        }
+        // Build "producer sink" in a fixed stack buffer (no_std, no alloc).
+        let (pb, sb) = (producer.as_bytes(), sink.as_bytes());
+        let mut buf = [0u8; 130];
+        if pb.len() + 1 + sb.len() > buf.len() {
+            return Err(crate::Error::InvalidArgument);
+        }
+        let mut n = 0;
+        buf[n..n + pb.len()].copy_from_slice(pb); n += pb.len();
+        buf[n] = b' '; n += 1;
+        buf[n..n + sb.len()].copy_from_slice(sb); n += sb.len();
+        let packed = ((core as u64 & 0xFFFF) << 16) | (slot as u64 & 0xFFFF);
+        // SAFETY: syscall(19) = SpawnPipe; slot from kernel-written page; buf is valid.
+        let ret = unsafe { raw_syscall(19, packed, buf.as_ptr() as u64, n as u64) };
+        if ret == 0 { Ok(()) } else { Err(crate::Error::InvalidArgument) }
+    }
+
     /// Kill a named service (supervisor only in production; unrestricted in Phase 5).
     pub fn kill(&self, name: &str) -> Result<(), crate::Error> {
         let bytes = name.as_bytes();
