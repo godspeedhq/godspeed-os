@@ -37,6 +37,7 @@ pub enum SyscallNumber {
     TaskStat       = 16,
     ConsoleRead    = 17,
     Reboot         = 18,
+    SpawnPipe      = 19,
 }
 
 /// Raw syscall dispatcher — called from the SYSCALL/SYSENTER IDT stub.
@@ -75,6 +76,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::TaskStat       as u64 => handle_task_stat(arg0, arg1, arg2),
         n if n == SyscallNumber::ConsoleRead    as u64 => handle_console_read(arg0),
         n if n == SyscallNumber::Reboot        as u64 => handle_reboot(),
+        n if n == SyscallNumber::SpawnPipe     as u64 => handle_spawn_pipe(arg0, arg1, arg2),
         _ => -1, // Unknown syscall.
     }
 }
@@ -292,6 +294,48 @@ fn handle_spawn(packed_arg0: u64, name_ptr: u64, name_len: u64) -> i64 {
     };
 
     match crate::task::spawn_service_by_name(name, core_override) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// arg0 = packed (cap_slot in low 16 bits, core in next 16; core 0xFFFF = round-robin).
+/// arg1 = ptr to a "producer sink" string, arg2 = its length.
+///
+/// Capability-broker pipe spawn (`producer | sink`): spawns `producer` and
+/// delegates it a SEND cap to `sink`'s endpoint as its send_peers[0]
+/// (task::spawn_service_pipe). The shell spawns `sink` first, then calls this.
+fn handle_spawn_pipe(packed_arg0: u64, buf_ptr: u64, buf_len: u64) -> i64 {
+    let spawn_cap_slot = (packed_arg0 & 0xFFFF) as usize;
+    let core_raw       = ((packed_arg0 >> 16) & 0xFFFF) as u32;
+    let core_override  = if core_raw == 0xFFFF { None } else { Some(core_raw) };
+
+    // Same authorization as handle_spawn: the caller must hold the spawn cap.
+    let cap = match scheduler::current_task_lookup_cap(spawn_cap_slot, Rights::WRITE) {
+        Ok(c)  => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    if cap.resource_id != crate::capability::SPAWN_RESOURCE {
+        return cap_err_to_i64(CapError::CapWrongScope);
+    }
+
+    let len = buf_len as usize;
+    if len == 0 || len > 130 { return -1; }
+    let bytes = match read_user_bytes(buf_ptr, len) {
+        Some(b) => b,
+        None    => return -1,
+    };
+    let s = match core::str::from_utf8(bytes) {
+        Ok(s)  => s,
+        Err(_) => return -1,
+    };
+
+    // Buffer is "producer sink" (single space). Split into the two names.
+    let mut parts = s.split(' ').filter(|p| !p.is_empty());
+    let producer = match parts.next() { Some(p) => p, None => return -1 };
+    let sink     = match parts.next() { Some(p) => p, None => return -1 };
+
+    match crate::task::spawn_service_pipe(producer, sink, core_override) {
         Ok(()) => 0,
         Err(_) => -1,
     }

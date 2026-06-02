@@ -12,6 +12,8 @@ members = [
     "osdev",
     "examples/ping",
     "examples/pong",
+    "examples/greet",
+    "examples/upper",
     "services/probe",
     "services/observe",
     "services/shell",
