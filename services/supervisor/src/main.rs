@@ -23,7 +23,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // (perf-bp2 on core 0 ⇄ perf-bp2-echo on core 1) so echo is not starved by
     // the ping→pong flood on core 1 — gives clean, fast BP2 latency numbers.
     // Skipped in perf-iso: per-probe isolation builds run one benchmark alone.
-    #[cfg(not(any(feature = "idle-only", feature = "bp2-only", feature = "perf-iso")))]
+    // Skipped in bare-metal: the USB-boot image settles at a quiet `gs>` prompt.
+    // ping/pong are demo services (examples/) — spawn them on demand from the
+    // shell (`spawn pong` then `spawn ping`) when you want the cross-core demo.
+    #[cfg(not(any(feature = "bare-metal", feature = "idle-only", feature = "bp2-only", feature = "perf-iso")))]
     {
         ctx.log("supervisor: spawning pong...");
         if ctx.spawn_on("pong", 1).is_err() {
@@ -78,17 +81,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     #[cfg(not(any(feature = "bare-metal", feature = "idle-only")))]
     spawn_extended_probes(&ctx);
 
-    // observe: spawn in bare-metal + full builds only; excluded from all
-    // test-specific builds where the extra 224-slot scan every 500 yields
-    // would add noise to benchmark and stress timings.
-    #[cfg(not(any(feature = "identity-only", feature = "perf-only",
+    // observe: spawn in full (osdev run) builds only. Excluded from test-specific
+    // builds (its 224-slot scan every 500 yields adds timing noise) and from
+    // bare-metal — its periodic table dump would keep the display scrolling, but
+    // the USB image rests at `gs>`. Run `observe` from the shell on demand.
+    #[cfg(not(any(feature = "bare-metal", feature = "identity-only", feature = "perf-only",
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
     let _ = ctx.spawn("observe");
 
-    // shell: spawn alongside observe in bare-metal + full builds only.
-    // Excluded from test-specific builds for the same reasons as observe.
+    // shell: the interactive prompt. Spawned in bare-metal (the USB image rests
+    // here) and full builds; excluded from test-specific builds.
     #[cfg(not(any(feature = "identity-only", feature = "perf-only",
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only",
