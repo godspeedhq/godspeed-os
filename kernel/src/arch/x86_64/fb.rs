@@ -62,7 +62,7 @@ static FB: SpinLock<Fb> = SpinLock::new(Fb {
 /// (crop) ~3–5% off every edge; insetting the text by 5% keeps it all visible
 /// without depending on the TV's "Just Scan" / "Screen Fit" / "Full pixel"
 /// setting. Harmless on a monitor (no overscan) — just a small border.
-const SAFE_PCT: usize = 5;
+const SAFE_PCT: usize = 10;
 
 /// Initialise the console from Limine's framebuffer descriptor. Called once in
 /// `_start`, right after `serial_init`, before the first `kprintln`.
