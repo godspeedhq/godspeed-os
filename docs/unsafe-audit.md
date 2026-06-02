@@ -60,6 +60,7 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | arch/x86_64/ap_boot.rs | 2 | permitted |
 | arch/x86_64/boot.rs | 79 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |
+| arch/x86_64/fb.rs | 3 | permitted |
 | arch/x86_64/interrupts.rs | 12 | permitted |
 | arch/x86_64/mod.rs | 33 | permitted |
 | arch/x86_64/page_tables.rs | 25 | permitted |
@@ -82,9 +83,9 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | task/scheduler.rs | 36 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 250 lines across 17 files  
+**Permitted total:** 253 lines across 18 files  
 **Grandfathered total:** 52 lines across 6 files  
-**Grand total:** 302 lines across 23 files
+**Grand total:** 305 lines across 24 files
 
 > **Reconciled 2026-05-31** (branch `verify/static-analysis-unsafe-audit`). The
 > permitted-layer growth since the prior baseline is from the AMD GX-420GI ring-3 /
@@ -140,6 +141,21 @@ Stack construction for new kernel and user tasks. `new_kernel` and `new_user`
 write a synthetic initial register frame to a freshly allocated kernel stack
 pointer. Sound because the stack buffer is owned exclusively by the new task
 and not yet visible to the scheduler.
+
+---
+
+### arch/x86_64/fb.rs
+
+Framebuffer text console (Phase 1 boot output, §11.4). Three blocks, all writing
+to Limine's linear framebuffer at `base + y*pitch + x*bpp`:
+- `clear`: `write_bytes(base, 0, height*pitch)` — fills the whole buffer.
+- `put_pixel`: writes `bpp` bytes at a bounds-checked offset (`x<width`, `y<height`).
+- `scroll`: `copy`/`write_bytes` shifting the buffer up one glyph row.
+
+Sound because the framebuffer is the region Limine mapped and sized
+(`height*pitch` bytes), it lives in the higher half (PML4 256–511) that every
+address space inherits via `PageTable::new`, so it is valid for writes for the
+system lifetime; every offset is bounds-checked against the reported geometry.
 
 ---
 

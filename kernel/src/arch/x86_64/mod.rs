@@ -6,11 +6,14 @@
 pub mod ap_boot;
 pub mod boot;
 pub mod context_switch;
+pub mod fb;
 pub mod interrupts;
 pub mod page_tables;
 pub mod syscall_entry;
 
-use limine::request::{ExecutableAddressRequest, HhdmRequest, MemmapRequest, MpRequest};
+use limine::request::{
+    ExecutableAddressRequest, FramebufferRequest, HhdmRequest, MemmapRequest, MpRequest,
+};
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 
 // Kernel virtual extent from the linker script (kernel.ld).
@@ -49,6 +52,10 @@ static SMP_REQUEST: MpRequest = MpRequest::new(0);
 static KERNEL_ADDRESS_REQUEST: ExecutableAddressRequest = ExecutableAddressRequest::new();
 
 #[used]
+#[link_section = ".requests"]
+static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
+
+#[used]
 #[link_section = ".requests_end"]
 static _REQUESTS_END: RequestsEndMarker = RequestsEndMarker::new();
 
@@ -68,6 +75,15 @@ extern "C" fn _start() -> ! {
     unsafe { serial_init() };
 
     assert!(BASE_REVISION.is_supported(), "unsupported Limine protocol revision");
+
+    // Bring up the framebuffer console before the first kprintln so all boot
+    // output mirrors to the display (§11.4). The framebuffer Limine mapped is in
+    // the higher half and stays valid for the system lifetime.
+    if let Some(resp) = FRAMEBUFFER_REQUEST.response() {
+        if let Some(&fb) = resp.framebuffers().first() {
+            fb::fb_init(fb);
+        }
+    }
 
     let boot_info = collect_boot_info();
 
@@ -321,6 +337,9 @@ pub fn serial_write_byte(b: u8) {
     if got {
         SERIAL_LOCK.store(false, Ordering::Release);
     }
+    // Mirror to the framebuffer console (no-op until fb_init runs). Done after
+    // releasing SERIAL_LOCK so the two locks never nest.
+    fb::put_byte(b);
 }
 
 /// Spin cap for best-effort `SERIAL_LOCK` acquisition (~seconds on real HW).
@@ -380,6 +399,10 @@ pub fn serial_write_bytes_lockfree(s: &[u8]) {
     }
     if got {
         SERIAL_LOCK.store(false, Ordering::Release);
+    }
+    // Mirror the whole sequence to the framebuffer console (no-op pre-init).
+    for &b in s {
+        fb::put_byte(b);
     }
 }
 

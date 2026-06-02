@@ -17,6 +17,9 @@ path = "src/lib.rs"
 [dependencies]
 bitflags = { version = "2", default-features = false }
 limine = "0.6"
+# Public-domain 8x8 bitmap font for the framebuffer console (fb.rs). Pure const
+# data, no_std (default features off → no std dependency).
+font8x8 = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 # Only used by the lib target (host-compiled, std available).
