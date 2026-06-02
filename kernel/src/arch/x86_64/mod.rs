@@ -9,6 +9,7 @@ pub mod context_switch;
 pub mod fb;
 pub mod interrupts;
 pub mod page_tables;
+pub mod pci;
 pub mod syscall_entry;
 
 use limine::request::{

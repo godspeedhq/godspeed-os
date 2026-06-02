@@ -198,6 +198,10 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     arch::x86_64::init(boot_info);
     memory::init(boot_info);
 
+    // Stage 1 of the USB stack: locate the xHCI controller (§12). Records its
+    // MMIO base + IRQ for a future userspace driver's hw_mmio/hw_interrupt caps.
+    arch::x86_64::pci::init();
+
     arch::x86_64::init_timer();
     arch::x86_64::com2_init();
     // COM1 RX is polled from the core-0 timer ISR (uart_rx_poll every 10 ms).
