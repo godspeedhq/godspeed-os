@@ -46,10 +46,17 @@ pub unsafe fn start_all_aps(boot_info: &super::BootInfo) -> u32 {
         core_idx += 1;
     }
 
-    // Wait for all APs to call mark_ready (or timeout after ~200 ms).
+    // Wait for all APs to call mark_ready, or time out (~10x the old 200M-spin
+    // budget). On the HP T630 (AMD GX-420GI) the APs come up just *after* the
+    // old budget expired: the BSP declared single-core, started the scheduler,
+    // then the late APs joined and raced the committed single-core state →
+    // triple fault → silent reset. A generous budget lets every AP check in
+    // before the BSP proceeds, so the loop exits on ready_count (not timeout)
+    // and there is no late-join race. (Spin-count is CPU-speed-dependent; a
+    // TSC-based wall-clock bound would be more robust — future work.)
     let expected_ready = boot_info.ap_ids.len() as u32 + 1; // +1 for BSP
     let mut spins: u64 = 0;
-    while crate::smp::core::ready_count() < expected_ready && spins < 200_000_000 {
+    while crate::smp::core::ready_count() < expected_ready && spins < 2_000_000_000 {
         core::hint::spin_loop();
         spins += 1;
     }
