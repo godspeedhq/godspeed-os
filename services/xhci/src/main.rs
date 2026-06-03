@@ -46,10 +46,16 @@ const EP0_TR_OFF: usize = 0x8000;
 const EVENT_RING_TRBS: usize = 16;
 const TRB_SIZE: usize = 16;
 
+const TRB_SETUP_STAGE: u32 = 2;
+const TRB_DATA_STAGE: u32 = 3;
+const TRB_STATUS_STAGE: u32 = 4;
 const TRB_ENABLE_SLOT: u32 = 9;
 const TRB_ADDRESS_DEVICE: u32 = 11;
+const TRB_TRANSFER_EVENT: u32 = 32;
 const TRB_CMD_COMPLETION: u32 = 33;
 const TRB_PORT_STATUS_CHANGE: u32 = 34;
+
+const DATA_BUF_OFF: usize = 0x9000; // control-transfer data buffer (page 9)
 
 fn spin<F: Fn() -> bool>(cond: F) {
     let mut n = 0u32;
@@ -287,13 +293,57 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             idle(&ctx);
         }
     };
-    if comp == 1 {
+    if comp != 1 {
+        ctx.log_fmt(format_args!("xhci: Address Device failed (completion={})", comp));
+        idle(&ctx);
+    }
+    ctx.log_fmt(format_args!(
+        "xhci: Address Device OK — device on port {} addressed (slot {})",
+        port, slot
+    ));
+
+    // --- Stage 3c: Get Device Descriptor over EP0 (control transfer) ---
+    // Three TRBs on the EP0 transfer ring: Setup (immediate GET_DESCRIPTOR),
+    // Data (IN, 18 bytes), Status (OUT, IOC). Then ring the slot's EP0 doorbell.
+    let data_phys = dma.phys_at(DATA_BUF_OFF);
+    dma.write32(EP0_TR_OFF, 0x80 | (6 << 8) | (0x0100 << 16)); // bmReqType|bRequest|wValue
+    dma.write32(EP0_TR_OFF + 4, 18 << 16); // wIndex=0 | wLength=18
+    dma.write32(EP0_TR_OFF + 8, 8); // setup data length
+    dma.write32(EP0_TR_OFF + 12, 1 | (1 << 6) | (TRB_SETUP_STAGE << 10) | (3 << 16)); // cyc|IDT|type|TRT=IN
+    dma.write32(EP0_TR_OFF + 16, data_phys as u32);
+    dma.write32(EP0_TR_OFF + 20, (data_phys >> 32) as u32);
+    dma.write32(EP0_TR_OFF + 24, 18);
+    dma.write32(EP0_TR_OFF + 28, 1 | (TRB_DATA_STAGE << 10) | (1 << 16)); // cyc|type|DIR=IN
+    dma.write32(EP0_TR_OFF + 32, 0);
+    dma.write32(EP0_TR_OFF + 36, 0);
+    dma.write32(EP0_TR_OFF + 40, 0);
+    dma.write32(EP0_TR_OFF + 44, 1 | (1 << 5) | (TRB_STATUS_STAGE << 10)); // cyc|IOC|type
+    mmio.write32(dboff + slot as usize * 4, 1); // EP0 doorbell (DCI 1)
+
+    let mut ok = false;
+    for _ in 0..8 {
+        match next_event(&dma, &mmio, ir0, &mut ev_idx, &mut ev_cycle) {
+            Some((TRB_TRANSFER_EVENT, c, _)) => {
+                ctx.log_fmt(format_args!("xhci: control transfer completion={}", c));
+                ok = c == 1 || c == 13; // success or short-packet
+                break;
+            }
+            Some((t, _, _)) => ctx.log_fmt(format_args!("xhci: (event type {})", t)),
+            None => break,
+        }
+    }
+    if ok {
+        let d0 = dma.read32(DATA_BUF_OFF);
+        let ids = dma.read32(DATA_BUF_OFF + 8);
         ctx.log_fmt(format_args!(
-            "xhci: Address Device OK — device on port {} is addressed (slot {})",
-            port, slot
+            "xhci: DEVICE DESCRIPTOR bLength={} type={} VID={:#06x} PID={:#06x}",
+            d0 & 0xFF,
+            (d0 >> 8) & 0xFF,
+            ids & 0xFFFF,
+            (ids >> 16) & 0xFFFF
         ));
     } else {
-        ctx.log_fmt(format_args!("xhci: Address Device failed (completion={})", comp));
+        ctx.log("xhci: Get Descriptor failed");
     }
 
     idle(&ctx);
