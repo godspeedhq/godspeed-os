@@ -350,6 +350,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut ep_mps = 0u16;
     let mut ep_interval = 0u8;
     let mut cfg_val = 0u8;
+    let mut kbd_iface = 0u8; // bInterfaceNumber of the bound boot-keyboard interface
 
     'ports: for p in 1..=max_ports {
         let portsc_off = op + OP_PORTSC_BASE + (p as usize - 1) * 0x10;
@@ -564,6 +565,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         ep_interval = 0;
         cfg_val = 0;
         let mut hid_proto = 0u8;
+        let mut cur_kbd = false; // are we inside a HID boot-keyboard interface?
         while i + 2 <= total && i < 200 {
             let blen = dma.read8(CONFIG_BUF_OFF + i) as usize;
             let dtype = dma.read8(CONFIG_BUF_OFF + i + 1);
@@ -572,11 +574,25 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
             match dtype {
                 2 => cfg_val = dma.read8(CONFIG_BUF_OFF + i + 5),
-                4 => hid_proto = dma.read8(CONFIG_BUF_OFF + i + 7),
+                4 => {
+                    // Interface descriptor: class[+5], protocol[+7], number[+2].
+                    // A boot keyboard is HID class (3) with protocol 1. A composite
+                    // keyboard also exposes a media-keys interface (protocol 0) with
+                    // its OWN interrupt-IN endpoint — we must bind the keyboard's,
+                    // not whichever endpoint happens to come last.
+                    let iclass = dma.read8(CONFIG_BUF_OFF + i + 5);
+                    let iproto = dma.read8(CONFIG_BUF_OFF + i + 7);
+                    cur_kbd = iclass == 3 && iproto == 1;
+                    if cur_kbd {
+                        hid_proto = iproto;
+                        kbd_iface = dma.read8(CONFIG_BUF_OFF + i + 2);
+                    }
+                }
                 5 => {
                     let addr = dma.read8(CONFIG_BUF_OFF + i + 2);
                     let attr = dma.read8(CONFIG_BUF_OFF + i + 3);
-                    if attr & 0x3 == 0x3 && addr & 0x80 != 0 {
+                    // First interrupt-IN endpoint of the boot-keyboard interface.
+                    if cur_kbd && attr & 0x3 == 0x3 && addr & 0x80 != 0 && ep_addr == 0 {
                         ep_addr = addr;
                         ep_mps = dma.read16(CONFIG_BUF_OFF + i + 4);
                         ep_interval = dma.read8(CONFIG_BUF_OFF + i + 6);
@@ -620,10 +636,23 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     dma.write32(islot + 4, port << 16);
     let iep = INPUT_CTX_OFF + (1 + dci as usize) * ctx_size;
     let int_tr = dma.phys_at(INT_TR_OFF);
-    let xhci_interval = if ep_interval > 1 {
-        (ep_interval - 1) as u32
-    } else {
-        3
+    // xHCI Endpoint Context Interval encoding is speed-dependent (xHCI §6.2.3.6):
+    //   Low/Full speed (PSI 1,2): bInterval is in 1 ms frames → 3 + floor(log2(bInterval)),
+    //                             clamped to [3, 10].
+    //   High/Super speed (PSI 3,4): bInterval is already a 2^(n-1) exponent → bInterval - 1.
+    // Writing the raw frame count (e.g. 32 → 31) overflows the field → Parameter Error (17).
+    let xhci_interval = match speed {
+        1 | 2 => {
+            let bi = if ep_interval == 0 { 1 } else { ep_interval as u32 };
+            (3 + (31 - bi.leading_zeros())).clamp(3, 10)
+        }
+        _ => {
+            if ep_interval > 1 {
+                (ep_interval - 1) as u32
+            } else {
+                0
+            }
+        }
     };
     dma.write32(iep, xhci_interval << 16); // Interval [23:16]
     dma.write32(iep + 4, (3 << 1) | (7 << 3) | ((ep_mps as u32) << 16)); // CErr|Int-IN(7)|mps
@@ -685,10 +714,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         0x21,
         0x0B,
         0,
+        kbd_iface as u32,
         0,
         0,
-        0,
-    ); // SET_PROTOCOL: boot (wValue=0, interface 0)
+    ); // SET_PROTOCOL: boot (wValue=0) on the keyboard's interface
 
     // --- Stage 4c: poll the interrupt endpoint for HID key reports ---
     let report_phys = dma.phys_at(REPORT_OFF);
