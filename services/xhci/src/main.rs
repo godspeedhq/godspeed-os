@@ -1,47 +1,55 @@
-//! `xhci` — USB host-controller driver (§12). Stage 3: build the command +
-//! event rings and the device-context array in DMA memory, run the controller,
-//! and issue an Enable Slot command — proving the full command-ring → doorbell
-//! → event-ring round trip. No `unsafe` here: all hardware access goes through
-//! the SDK's audited Mmio / Dma wrappers (§18).
+//! `xhci` — USB host-controller driver (§12). Stage 3: run the controller and
+//! enumerate the device on a connected port — reset the port, Enable Slot,
+//! Address Device. All hardware access is via the SDK's audited Mmio / Dma
+//! wrappers (§18); no `unsafe` here.
 
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::ServiceContext;
+use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
 // Capability registers (BAR + 0).
-const CAP_CAPLEN_VERSION: usize = 0x00; // CAPLENGTH[7:0], HCIVERSION[31:16]
+const CAP_CAPLEN_VERSION: usize = 0x00;
 const CAP_HCSPARAMS1: usize = 0x04;
 const CAP_HCSPARAMS2: usize = 0x08;
-const CAP_DBOFF: usize = 0x14; // doorbell array offset
-const CAP_RTSOFF: usize = 0x18; // runtime register space offset
+const CAP_HCCPARAMS1: usize = 0x10;
+const CAP_DBOFF: usize = 0x14;
+const CAP_RTSOFF: usize = 0x18;
 
 // Operational registers (BAR + CAPLENGTH).
 const OP_USBCMD: usize = 0x00;
 const OP_USBSTS: usize = 0x04;
-const OP_CRCR: usize = 0x18; // command ring control (64-bit)
-const OP_DCBAAP: usize = 0x30; // device-context base array ptr (64-bit)
+const OP_CRCR: usize = 0x18;
+const OP_DCBAAP: usize = 0x30;
 const OP_CONFIG: usize = 0x38;
+const OP_PORTSC_BASE: usize = 0x400; // PORTSC[n] = base + n*0x10
 
 const CMD_RS: u32 = 1 << 0;
 const CMD_HCRST: u32 = 1 << 1;
 const STS_HCH: u32 = 1 << 0;
 const STS_CNR: u32 = 1 << 11;
 
-// DMA arena layout (within the 64 KiB granted region).
-const DCBAA_OFF: usize = 0x0000; // device-context base array (page 0)
-const CMD_RING_OFF: usize = 0x1000; // command ring (page 1)
-const EVENT_RING_OFF: usize = 0x2000; // event ring (page 2)
-const ERST_OFF: usize = 0x3000; // event-ring segment table (page 3)
-const SCRATCH_ARR_OFF: usize = 0x4000; // scratchpad buffer array (page 4)
-const SCRATCH_BUF_OFF: usize = 0x5000; // scratchpad buffers (pages 5..)
-const MAX_SCRATCH_PAGES: usize = 11; // pages 5..16 of the arena
+const PORT_CCS: u32 = 1 << 0;
+const PORT_PED: u32 = 1 << 1;
+const PORT_PR: u32 = 1 << 4;
+const PORT_RW1C: u32 = 0x00FE_0000; // change bits 17..23 (write 0 to preserve)
+
+// DMA arena layout (64 KiB).
+const DCBAA_OFF: usize = 0x0000;
+const CMD_RING_OFF: usize = 0x1000;
+const EVENT_RING_OFF: usize = 0x2000;
+const ERST_OFF: usize = 0x3000;
+const INPUT_CTX_OFF: usize = 0x6000;
+const DEVICE_CTX_OFF: usize = 0x7000;
+const EP0_TR_OFF: usize = 0x8000;
 
 const EVENT_RING_TRBS: usize = 16;
 const TRB_SIZE: usize = 16;
 
 const TRB_ENABLE_SLOT: u32 = 9;
+const TRB_ADDRESS_DEVICE: u32 = 11;
 const TRB_CMD_COMPLETION: u32 = 33;
+const TRB_PORT_STATUS_CHANGE: u32 = 34;
 
 fn spin<F: Fn() -> bool>(cond: F) {
     let mut n = 0u32;
@@ -54,6 +62,74 @@ fn idle(ctx: &ServiceContext) -> ! {
     loop {
         ctx.yield_cpu();
     }
+}
+
+/// Poll the event ring for the next event TRB. Returns (trb_type, completion,
+/// slot_id) and advances the dequeue pointer, or None on timeout.
+fn next_event(
+    dma: &Dma,
+    mmio: &Mmio,
+    ir0: usize,
+    ev_idx: &mut usize,
+    ev_cycle: &mut u32,
+) -> Option<(u32, u32, u32)> {
+    let mut tries = 0u32;
+    while tries < 10_000_000 {
+        tries += 1;
+        let off = EVENT_RING_OFF + *ev_idx * TRB_SIZE;
+        let ctrl = dma.read32(off + 12);
+        if (ctrl & 1) != *ev_cycle {
+            continue;
+        }
+        let trb_type = (ctrl >> 10) & 0x3F;
+        let completion = dma.read32(off + 8) >> 24;
+        let slot_id = (ctrl >> 24) & 0xFF;
+        *ev_idx += 1;
+        if *ev_idx == EVENT_RING_TRBS {
+            *ev_idx = 0;
+            *ev_cycle ^= 1;
+        }
+        mmio.write64(ir0 + 0x18, dma.phys_at(EVENT_RING_OFF + *ev_idx * TRB_SIZE) | (1 << 3));
+        return Some((trb_type, completion, slot_id));
+    }
+    None
+}
+
+/// Issue a command TRB and wait for its Command Completion Event, skipping any
+/// intervening events (e.g. Port Status Change). Returns (completion, slot_id).
+fn run_command(
+    ctx: &ServiceContext,
+    dma: &Dma,
+    mmio: &Mmio,
+    dboff: usize,
+    ir0: usize,
+    cmd_trb_off: usize,
+    d0: u32,
+    d1: u32,
+    d2: u32,
+    d3: u32,
+    ev_idx: &mut usize,
+    ev_cycle: &mut u32,
+) -> Option<(u32, u32)> {
+    dma.write32(cmd_trb_off, d0);
+    dma.write32(cmd_trb_off + 4, d1);
+    dma.write32(cmd_trb_off + 8, d2);
+    dma.write32(cmd_trb_off + 12, d3);
+    mmio.write32(dboff, 0); // command doorbell
+
+    for _ in 0..8 {
+        match next_event(dma, mmio, ir0, ev_idx, ev_cycle) {
+            Some((TRB_CMD_COMPLETION, completion, slot)) => return Some((completion, slot)),
+            Some((TRB_PORT_STATUS_CHANGE, _, _)) => {
+                ctx.log("xhci: (port status change event)");
+            }
+            Some((t, _, _)) => {
+                ctx.log_fmt(format_args!("xhci: (event type {})", t));
+            }
+            None => return None,
+        }
+    }
+    None
 }
 
 #[no_mangle]
@@ -75,26 +151,27 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         }
     };
 
-    // --- Capability registers ---
+    // Capability registers.
     let cap_version = mmio.read32(CAP_CAPLEN_VERSION);
     let caplen = (cap_version & 0xFF) as usize;
     let version = (cap_version >> 16) as u16;
     let hcs1 = mmio.read32(CAP_HCSPARAMS1);
-    let hcs2 = mmio.read32(CAP_HCSPARAMS2);
+    let hcc1 = mmio.read32(CAP_HCCPARAMS1);
     let max_slots = hcs1 & 0xFF;
     let max_ports = (hcs1 >> 24) & 0xFF;
-    let max_scratch = ((((hcs2 >> 21) & 0x1F) << 5) | ((hcs2 >> 27) & 0x1F)) as usize;
+    let _hcs2 = mmio.read32(CAP_HCSPARAMS2);
+    let ctx_size = if hcc1 & (1 << 2) != 0 { 64 } else { 32 }; // CSZ
     let dboff = (mmio.read32(CAP_DBOFF) & !0x3) as usize;
     let rtsoff = (mmio.read32(CAP_RTSOFF) & !0x1F) as usize;
     let op = caplen;
-    let ir0 = rtsoff + 0x20; // interrupter 0 register set
+    let ir0 = rtsoff + 0x20;
 
     ctx.log_fmt(format_args!(
-        "xhci: v{:#06x} slots={} ports={} scratch={} caplen={:#x} dboff={:#x} rtsoff={:#x}",
-        version, max_slots, max_ports, max_scratch, caplen, dboff, rtsoff
+        "xhci: v{:#06x} slots={} ports={} ctx_size={} dboff={:#x} rtsoff={:#x}",
+        version, max_slots, max_ports, ctx_size, dboff, rtsoff
     ));
 
-    // --- Reset: halt, then HCRST, wait for ready ---
+    // Reset.
     let cmd = mmio.read32(op + OP_USBCMD);
     mmio.write32(op + OP_USBCMD, cmd & !CMD_RS);
     spin(|| mmio.read32(op + OP_USBSTS) & STS_HCH != 0);
@@ -102,100 +179,121 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     spin(|| {
         mmio.read32(op + OP_USBCMD) & CMD_HCRST == 0 && mmio.read32(op + OP_USBSTS) & STS_CNR == 0
     });
-    ctx.log("xhci: controller reset");
 
-    // --- Build DMA structures ---
+    // Build DMA structures + run.
     dma.zero();
-
-    // Scratchpad: the controller may require N scratchpad pages. DCBAA[0] points
-    // to an array of their physical addresses.
-    let scratch = max_scratch.min(MAX_SCRATCH_PAGES);
-    if scratch < max_scratch {
-        ctx.log("xhci: WARNING — scratchpad need exceeds arena; capping");
-    }
-    if scratch > 0 {
-        for i in 0..scratch {
-            let buf = dma.phys_at(SCRATCH_BUF_OFF + i * 0x1000);
-            dma.write64(SCRATCH_ARR_OFF + i * 8, buf);
-        }
-        dma.write64(DCBAA_OFF, dma.phys_at(SCRATCH_ARR_OFF));
-    }
-
-    // DCBAAP = device-context base array physical base.
     mmio.write64(op + OP_DCBAAP, dma.phys_at(DCBAA_OFF));
-
-    // Command ring: CRCR = ring phys | RCS (cycle = 1).
     mmio.write64(op + OP_CRCR, dma.phys_at(CMD_RING_OFF) | 1);
-
-    // Event ring segment table: one segment of EVENT_RING_TRBS entries.
-    dma.write64(ERST_OFF, dma.phys_at(EVENT_RING_OFF)); // ring segment base
-    dma.write32(ERST_OFF + 8, EVENT_RING_TRBS as u32); // ring segment size
-    mmio.write32(ir0 + 0x08, 1); // ERSTSZ = 1 segment
-    mmio.write64(ir0 + 0x10, dma.phys_at(ERST_OFF)); // ERSTBA
-    mmio.write64(ir0 + 0x18, dma.phys_at(EVENT_RING_OFF)); // ERDP
-
-    // CONFIG.MaxSlotsEn
+    dma.write64(ERST_OFF, dma.phys_at(EVENT_RING_OFF));
+    dma.write32(ERST_OFF + 8, EVENT_RING_TRBS as u32);
+    mmio.write32(ir0 + 0x08, 1);
+    mmio.write64(ir0 + 0x10, dma.phys_at(ERST_OFF));
+    mmio.write64(ir0 + 0x18, dma.phys_at(EVENT_RING_OFF));
     mmio.write32(op + OP_CONFIG, max_slots);
-
-    // --- Run ---
     let c = mmio.read32(op + OP_USBCMD);
     mmio.write32(op + OP_USBCMD, c | CMD_RS);
     spin(|| mmio.read32(op + OP_USBSTS) & STS_HCH == 0);
+    ctx.log("xhci: controller running");
+
+    // Find a connected port.
+    let mut port = 0u32;
+    for p in 1..=max_ports {
+        let psc = mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10);
+        if psc & PORT_CCS != 0 {
+            port = p;
+            break;
+        }
+    }
+    if port == 0 {
+        ctx.log("xhci: no connected port — idling");
+        idle(&ctx);
+    }
+    let portsc_off = op + OP_PORTSC_BASE + (port as usize - 1) * 0x10;
+
+    // Reset the port: set PR (preserving non-change bits), wait for enable.
+    let psc = mmio.read32(portsc_off);
+    mmio.write32(portsc_off, (psc & !PORT_RW1C) | PORT_PR);
+    spin(|| mmio.read32(portsc_off) & PORT_PED != 0);
+    let psc = mmio.read32(portsc_off);
+    let speed = (psc >> 10) & 0xF;
+    let max_packet: u32 = match speed {
+        2 => 8,   // low-speed
+        4 => 512, // super-speed
+        _ => 64,  // full / high-speed
+    };
     ctx.log_fmt(format_args!(
-        "xhci: running (USBSTS={:#x})",
-        mmio.read32(op + OP_USBSTS)
+        "xhci: port {} reset; PORTSC={:#010x} speed={} max_packet={}",
+        port, psc, speed, max_packet
     ));
 
-    // --- Issue Enable Slot on the command ring (TRB 0), ring doorbell 0 ---
-    dma.write32(CMD_RING_OFF, 0);
-    dma.write32(CMD_RING_OFF + 4, 0);
-    dma.write32(CMD_RING_OFF + 8, 0);
-    dma.write32(CMD_RING_OFF + 12, (TRB_ENABLE_SLOT << 10) | 1); // type + cycle
-    mmio.write32(dboff, 0); // doorbell 0, target 0 = command ring
-
-    // --- Poll the event ring for the Command Completion Event ---
     let mut ev_idx = 0usize;
     let mut ev_cycle = 1u32;
-    let mut found = false;
-    let mut tries = 0u32;
-    while tries < 10_000_000 && !found {
-        tries += 1;
-        let off = EVENT_RING_OFF + ev_idx * TRB_SIZE;
-        let ctrl = dma.read32(off + 12);
-        if (ctrl & 1) != ev_cycle {
-            continue; // no new event yet
+    let mut cmd_idx = 0usize; // command ring producer index
+
+    // Enable Slot.
+    let cmd_off = CMD_RING_OFF + cmd_idx * TRB_SIZE;
+    cmd_idx += 1;
+    let (comp, slot) = match run_command(
+        &ctx, &dma, &mmio, dboff, ir0, cmd_off, 0, 0, 0,
+        (TRB_ENABLE_SLOT << 10) | 1, &mut ev_idx, &mut ev_cycle,
+    ) {
+        Some(r) => r,
+        None => {
+            ctx.log("xhci: Enable Slot — no completion");
+            idle(&ctx);
         }
-        let trb_type = (ctrl >> 10) & 0x3F;
-        let completion = dma.read32(off + 8) >> 24;
-        let slot_id = (ctrl >> 24) & 0xFF;
-        ctx.log_fmt(format_args!(
-            "xhci: event type={} completion={} slot={}",
-            trb_type, completion, slot_id
-        ));
-        if trb_type == TRB_CMD_COMPLETION {
-            if completion == 1 {
-                ctx.log_fmt(format_args!(
-                    "xhci: Enable Slot OK — slot {} assigned; command ring works!",
-                    slot_id
-                ));
-            } else {
-                ctx.log_fmt(format_args!(
-                    "xhci: Enable Slot completion={} (not success)",
-                    completion
-                ));
-            }
-            found = true;
-        }
-        // Advance the event-ring dequeue pointer (wrap + flip cycle at the end).
-        ev_idx += 1;
-        if ev_idx == EVENT_RING_TRBS {
-            ev_idx = 0;
-            ev_cycle ^= 1;
-        }
-        mmio.write64(ir0 + 0x18, dma.phys_at(EVENT_RING_OFF + ev_idx * TRB_SIZE) | (1 << 3));
+    };
+    if comp != 1 {
+        ctx.log_fmt(format_args!("xhci: Enable Slot failed (completion={})", comp));
+        idle(&ctx);
     }
-    if !found {
-        ctx.log("xhci: no command-completion event (ring/doorbell issue?)");
+    ctx.log_fmt(format_args!("xhci: slot {} enabled", slot));
+
+    // Build the Input Context for Address Device.
+    //   +0:            Input Control Context — Add flags A0(slot)|A1(ep0)
+    //   +ctx_size:     Slot Context
+    //   +2*ctx_size:   Endpoint 0 Context
+    let ictl = INPUT_CTX_OFF;
+    let islot = INPUT_CTX_OFF + ctx_size;
+    let iep0 = INPUT_CTX_OFF + 2 * ctx_size;
+    dma.write32(ictl + 4, 0b11); // Add Context flags: slot + EP0
+
+    // Slot Context: Context Entries=1 [31:27], Speed [23:20]; Root Hub Port [23:16].
+    dma.write32(islot, (1 << 27) | (speed << 20));
+    dma.write32(islot + 4, port << 16);
+
+    // EP0 Context (Control): CErr=3 [2:1], EP Type=4 [5:3], Max Packet [31:16];
+    // TR Dequeue Ptr | DCS; Average TRB Length.
+    let ep0_tr = dma.phys_at(EP0_TR_OFF);
+    dma.write32(iep0 + 4, (3 << 1) | (4 << 3) | (max_packet << 16));
+    dma.write32(iep0 + 8, (ep0_tr as u32 & !0xF) | 1);
+    dma.write32(iep0 + 12, (ep0_tr >> 32) as u32);
+    dma.write32(iep0 + 16, 8);
+
+    // DCBAA[slot] = device context physical base.
+    dma.write64(DCBAA_OFF + slot as usize * 8, dma.phys_at(DEVICE_CTX_OFF));
+
+    // Address Device command (input context ptr, slot id).
+    let in_phys = dma.phys_at(INPUT_CTX_OFF);
+    let cmd_off = CMD_RING_OFF + cmd_idx * TRB_SIZE;
+    let (comp, _) = match run_command(
+        &ctx, &dma, &mmio, dboff, ir0, cmd_off,
+        in_phys as u32, (in_phys >> 32) as u32, 0,
+        (TRB_ADDRESS_DEVICE << 10) | (slot << 24) | 1, &mut ev_idx, &mut ev_cycle,
+    ) {
+        Some(r) => r,
+        None => {
+            ctx.log("xhci: Address Device — no completion");
+            idle(&ctx);
+        }
+    };
+    if comp == 1 {
+        ctx.log_fmt(format_args!(
+            "xhci: Address Device OK — device on port {} is addressed (slot {})",
+            port, slot
+        ));
+    } else {
+        ctx.log_fmt(format_args!("xhci: Address Device failed (completion={})", comp));
     }
 
     idle(&ctx);
