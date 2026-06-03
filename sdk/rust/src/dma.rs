@@ -50,6 +50,20 @@ impl Dma {
         unsafe { core::ptr::write_bytes(self.base, 0, self.len) }
     }
 
+    /// Read an 8-bit value at byte offset `off` (`off < len`).
+    #[inline]
+    pub fn read8(&self, off: usize) -> u8 {
+        // SAFETY: base is a valid kernel-granted mapping; caller keeps off in range.
+        unsafe { core::ptr::read_volatile(self.base.add(off)) }
+    }
+
+    /// Read a 16-bit value at byte offset `off` (2-byte aligned, `off < len`).
+    #[inline]
+    pub fn read16(&self, off: usize) -> u16 {
+        // SAFETY: as read8; aligned 16-bit access in range.
+        unsafe { core::ptr::read_volatile(self.base.add(off) as *const u16) }
+    }
+
     /// Read a 32-bit value at byte offset `off` (4-byte aligned, `off < len`).
     #[inline]
     pub fn read32(&self, off: usize) -> u32 {

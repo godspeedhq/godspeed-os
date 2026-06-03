@@ -56,6 +56,7 @@ const TRB_CMD_COMPLETION: u32 = 33;
 const TRB_PORT_STATUS_CHANGE: u32 = 34;
 
 const DATA_BUF_OFF: usize = 0x9000; // control-transfer data buffer (page 9)
+const CONFIG_BUF_OFF: usize = 0xA000; // config-descriptor buffer (page 10)
 
 fn spin<F: Fn() -> bool>(cond: F) {
     let mut n = 0u32;
@@ -332,18 +333,92 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             None => break,
         }
     }
-    if ok {
-        let d0 = dma.read32(DATA_BUF_OFF);
-        let ids = dma.read32(DATA_BUF_OFF + 8);
+    if !ok {
+        ctx.log("xhci: Get Device Descriptor failed");
+        idle(&ctx);
+    }
+    let d0 = dma.read32(DATA_BUF_OFF);
+    let ids = dma.read32(DATA_BUF_OFF + 8);
+    ctx.log_fmt(format_args!(
+        "xhci: DEVICE DESCRIPTOR bLength={} type={} VID={:#06x} PID={:#06x}",
+        d0 & 0xFF,
+        (d0 >> 8) & 0xFF,
+        ids & 0xFFFF,
+        (ids >> 16) & 0xFFFF
+    ));
+
+    // --- Stage 4a: Get Configuration Descriptor; find the interrupt-IN endpoint ---
+    let cfg_phys = dma.phys_at(CONFIG_BUF_OFF);
+    let tr = EP0_TR_OFF + 48; // next 3 TRBs on the EP0 transfer ring
+    dma.write32(tr, 0x80 | (6 << 8) | (0x0200 << 16)); // GET_DESCRIPTOR Config(2), idx 0
+    dma.write32(tr + 4, 64 << 16); // wIndex=0 | wLength=64
+    dma.write32(tr + 8, 8);
+    dma.write32(tr + 12, 1 | (1 << 6) | (TRB_SETUP_STAGE << 10) | (3 << 16));
+    dma.write32(tr + 16, cfg_phys as u32);
+    dma.write32(tr + 20, (cfg_phys >> 32) as u32);
+    dma.write32(tr + 24, 64);
+    dma.write32(tr + 28, 1 | (TRB_DATA_STAGE << 10) | (1 << 16));
+    dma.write32(tr + 32, 0);
+    dma.write32(tr + 36, 0);
+    dma.write32(tr + 40, 0);
+    dma.write32(tr + 44, 1 | (1 << 5) | (TRB_STATUS_STAGE << 10));
+    mmio.write32(dboff + slot as usize * 4, 1);
+    let mut cfg_ok = false;
+    for _ in 0..8 {
+        match next_event(&dma, &mmio, ir0, &mut ev_idx, &mut ev_cycle) {
+            Some((TRB_TRANSFER_EVENT, c, _)) => {
+                cfg_ok = c == 1 || c == 13;
+                break;
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    if !cfg_ok {
+        ctx.log("xhci: Get Config Descriptor failed");
+        idle(&ctx);
+    }
+
+    // Walk the descriptors: config (bConfigurationValue), interface (HID protocol),
+    // endpoint (the interrupt-IN endpoint we'll poll for key reports).
+    let total = ((dma.read32(CONFIG_BUF_OFF) >> 16) & 0xFFFF) as usize;
+    let mut i = 0usize;
+    let mut ep_addr = 0u8;
+    let mut ep_mps = 0u16;
+    let mut ep_interval = 0u8;
+    let mut cfg_val = 0u8;
+    let mut hid_proto = 0u8;
+    while i + 2 <= total && i < 200 {
+        let blen = dma.read8(CONFIG_BUF_OFF + i) as usize;
+        let dtype = dma.read8(CONFIG_BUF_OFF + i + 1);
+        if blen == 0 {
+            break;
+        }
+        match dtype {
+            2 => cfg_val = dma.read8(CONFIG_BUF_OFF + i + 5),
+            4 => hid_proto = dma.read8(CONFIG_BUF_OFF + i + 7),
+            5 => {
+                let addr = dma.read8(CONFIG_BUF_OFF + i + 2);
+                let attr = dma.read8(CONFIG_BUF_OFF + i + 3);
+                if attr & 0x3 == 0x3 && addr & 0x80 != 0 {
+                    ep_addr = addr;
+                    ep_mps = dma.read16(CONFIG_BUF_OFF + i + 4);
+                    ep_interval = dma.read8(CONFIG_BUF_OFF + i + 6);
+                }
+            }
+            _ => {}
+        }
+        i += blen;
+    }
+    if ep_addr != 0 {
+        let ep_num = (ep_addr & 0x0F) as u32;
+        let dci = ep_num * 2 + 1; // interrupt-IN endpoint
         ctx.log_fmt(format_args!(
-            "xhci: DEVICE DESCRIPTOR bLength={} type={} VID={:#06x} PID={:#06x}",
-            d0 & 0xFF,
-            (d0 >> 8) & 0xFF,
-            ids & 0xFFFF,
-            (ids >> 16) & 0xFFFF
+            "xhci: HID int-IN endpoint {} (DCI {}) mps={} interval={} cfg_val={} proto={}",
+            ep_num, dci, ep_mps, ep_interval, cfg_val, hid_proto
         ));
     } else {
-        ctx.log("xhci: Get Descriptor failed");
+        ctx.log("xhci: no interrupt-IN endpoint found");
     }
 
     idle(&ctx);
