@@ -66,4 +66,19 @@ impl Mmio {
         // SAFETY: as `read8`; aligned 32-bit write.
         unsafe { core::ptr::write_volatile(self.base.add(off) as *mut u32, val) }
     }
+
+    /// Read a 64-bit register at `off` (must be 8-byte aligned). For the
+    /// controller's 64-bit registers (DCBAAP, CRCR, ERSTBA, ERDP).
+    #[inline]
+    pub fn read64(&self, off: usize) -> u64 {
+        // SAFETY: as `read8`; aligned 64-bit access within the mapped region.
+        unsafe { core::ptr::read_volatile(self.base.add(off) as *const u64) }
+    }
+
+    /// Write a 64-bit register at `off` (must be 8-byte aligned).
+    #[inline]
+    pub fn write64(&self, off: usize, val: u64) {
+        // SAFETY: as `read8`; aligned 64-bit write.
+        unsafe { core::ptr::write_volatile(self.base.add(off) as *mut u64, val) }
+    }
 }
