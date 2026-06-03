@@ -9,7 +9,7 @@
 //!
 //! Port I/O is hardware access, so this lives in the arch layer (§18.1).
 
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
@@ -26,6 +26,12 @@ const PROGIF_XHCI: u8 = 0x30;
 pub static XHCI_FOUND: AtomicBool = AtomicBool::new(false);
 pub static XHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
 pub static XHCI_IRQ: AtomicU8 = AtomicU8::new(0);
+
+/// All discovered xHCI controllers (a system may have several; the boot drive
+/// and the keyboard often sit on different ones). Recorded during the scan.
+pub static XHCI_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static XHCI_BASES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+pub static XHCI_IRQS: [AtomicU8; 4] = [const { AtomicU8::new(0) }; 4];
 
 /// Write a 32-bit value to an I/O port.
 ///
@@ -84,9 +90,11 @@ pub fn init() {
                 let class = (class_reg >> 24) as u8;
                 let subclass = (class_reg >> 16) as u8;
                 let progif = (class_reg >> 8) as u8;
-                if class == CLASS_SERIAL_BUS && subclass == SUBCLASS_USB && progif == PROGIF_XHCI {
-                    // BAR0 (offset 0x10). xHCI uses a memory BAR; bits[2:1]=10
-                    // marks a 64-bit BAR whose upper half is BAR1 (offset 0x14).
+                // Log EVERY USB host controller (subclass 0x03), of any kind, so
+                // we can see the full USB topology — devices may live on a second
+                // xHCI or an EHCI/OHCI the boot-port controller doesn't cover.
+                if class == CLASS_SERIAL_BUS && subclass == SUBCLASS_USB {
+                    // BAR0 (offset 0x10). 64-bit memory BAR if bits[2:1]=10.
                     let bar0 = config_read32(bus as u8, dev, func, 0x10);
                     let mmio_base = if bar0 & 0x6 == 0x4 {
                         let bar1 = config_read32(bus as u8, dev, func, 0x14);
@@ -94,21 +102,42 @@ pub fn init() {
                     } else {
                         (bar0 & 0xFFFF_FFF0) as u64
                     };
-                    // Legacy interrupt line (offset 0x3C, low byte). xHCI normally
-                    // prefers MSI/MSI-X; this is the fallback IRQ for now.
                     let irq = (config_read32(bus as u8, dev, func, 0x3C) & 0xFF) as u8;
-
-                    XHCI_MMIO_BASE.store(mmio_base, Ordering::Relaxed);
-                    XHCI_IRQ.store(irq, Ordering::Relaxed);
-                    XHCI_FOUND.store(true, Ordering::Relaxed);
+                    let kind = match progif {
+                        0x00 => "UHCI",
+                        0x10 => "OHCI",
+                        0x20 => "EHCI",
+                        0x30 => "xHCI",
+                        _ => "USB?",
+                    };
                     crate::kprintln!(
-                        "pci: xHCI controller at {:02x}:{:02x}.{} vendor={:#06x} MMIO={:#x} IRQ={}",
-                        bus, dev, func, vendor, mmio_base, irq
+                        "pci: {} at {:02x}:{:02x}.{} vendor={:#06x} MMIO={:#x} IRQ={}",
+                        kind, bus, dev, func, vendor, mmio_base, irq
                     );
-                    return;
+                    // Record every xHCI into the array.
+                    if progif == PROGIF_XHCI {
+                        let n = XHCI_COUNT.load(Ordering::Relaxed) as usize;
+                        if n < 4 {
+                            XHCI_BASES[n].store(mmio_base, Ordering::Relaxed);
+                            XHCI_IRQS[n].store(irq, Ordering::Relaxed);
+                            XHCI_COUNT.store((n + 1) as u32, Ordering::Relaxed);
+                        }
+                    }
                 }
             }
         }
     }
-    crate::kprintln!("pci: no xHCI controller found");
+    // Pick which xHCI the driver uses. The boot drive is on the first; a keyboard
+    // on the rear ports is typically on the second. Prefer index 1 when present.
+    let count = XHCI_COUNT.load(Ordering::Relaxed);
+    if count > 0 {
+        let pick = if count >= 2 { 1 } else { 0 };
+        let base = XHCI_BASES[pick].load(Ordering::Relaxed);
+        XHCI_MMIO_BASE.store(base, Ordering::Relaxed);
+        XHCI_IRQ.store(XHCI_IRQS[pick].load(Ordering::Relaxed), Ordering::Relaxed);
+        XHCI_FOUND.store(true, Ordering::Relaxed);
+        crate::kprintln!("pci: driver uses xHCI #{} of {} (MMIO={:#x})", pick, count, base);
+    } else {
+        crate::kprintln!("pci: no xHCI controller found");
+    }
 }
