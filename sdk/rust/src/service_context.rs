@@ -36,6 +36,7 @@ struct ServiceContextData {
     core_id:            u32,
     probe_mode:         u32,
     console_read_slot:  u32, // u32::MAX = not present
+    xhci_mmio_va:       u64, // 0 = not mapped; else VA of the mapped xHCI BAR
     send_peers:         [SendPeerEntry; MAX_SEND_PEERS],
 }
 
@@ -500,6 +501,19 @@ impl ServiceContext {
 
     /// Return the core this service was spawned on.
     pub fn core_id(&self) -> u32 { Self::ctx().core_id }
+
+    /// Safe MMIO handle for this service's xHCI controller, if one was granted
+    /// (§12). The kernel mapped the controller's BAR into this driver's address
+    /// space; the returned [`crate::Mmio`] reads/writes the uncached device
+    /// registers directly. `None` for non-driver services.
+    pub fn xhci_mmio(&self) -> Option<crate::mmio::Mmio> {
+        let va = Self::ctx().xhci_mmio_va;
+        if va == 0 {
+            None
+        } else {
+            Some(crate::mmio::Mmio::new(va as *mut u8))
+        }
+    }
 
     /// Allocate `size` bytes of read/write memory within this task's budget.
     ///
