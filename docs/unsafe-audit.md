@@ -8,6 +8,24 @@ unless this file is updated in the same commit with a written SAFETY argument.**
 
 ---
 
+## 2026-06-03 — USB/xHCI stack (boot-verified, T630)
+
+Branch `feat/usb-keyboard`. The userspace USB keyboard stack (§12) added unsafe
+in the permitted arch + memory layers (the driver *service* itself is unsafe-free
+behind the SDK's audited `Mmio`/`Dma` wrappers — §18.1).
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/x86_64/pci.rs` | **new, 5 lines** | PCI config mechanism #1 port I/O (`outl`/`inl` + `config_read32`) to locate the xHCI controller. |
+| `arch/x86_64/mod.rs` | 33 → 34 (+1) | `console_push_byte` pushes a USB-decoded key into the COM1 RX ring (`uart_rx_push`) so keystrokes reach the shell's `ConsoleRead`. |
+| `memory/allocator.rs` | 29 → 32 (+3) | `alloc_contiguous(n)` — bitmap scan for a physically-contiguous run, for the driver's DMA arena. |
+
+All blocks carry `// SAFETY:` comments in source. SDK `mmio.rs`/`dma.rs` unsafe
+lives outside `kernel/src/` (the §18.1-amended SDK hardware/ABI layer) and is not
+counted by `scripts/unsafe_check.py`, which scans `kernel/src/` only.
+
+---
+
 ## 2026-05-31 — static-analysis + unsafe-audit pass (boot-verified, T630)
 
 Full write-up: `milestones/v2/STATIC_ANALYSIS_AUDIT.md`. Branch
@@ -62,11 +80,12 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | arch/x86_64/context_switch.rs | 11 | permitted |
 | arch/x86_64/fb.rs | 3 | permitted |
 | arch/x86_64/interrupts.rs | 12 | permitted |
-| arch/x86_64/mod.rs | 33 | permitted |
+| arch/x86_64/mod.rs | 34 | permitted |
 | arch/x86_64/page_tables.rs | 25 | permitted |
+| arch/x86_64/pci.rs | 5 | permitted |
 | arch/x86_64/syscall_entry.rs | 13 | permitted |
 | capability/table.rs | 7 | permitted |
-| memory/allocator.rs | 29 | permitted |
+| memory/allocator.rs | 32 | permitted |
 | memory/frame.rs | 1 | permitted |
 | memory/mod.rs | 1 | permitted |
 | memory/page.rs | 1 | permitted |
@@ -83,9 +102,9 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | task/scheduler.rs | 36 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 253 lines across 18 files  
+**Permitted total:** 262 lines across 19 files  
 **Grandfathered total:** 52 lines across 6 files  
-**Grand total:** 305 lines across 24 files
+**Grand total:** 314 lines across 25 files
 
 > **Reconciled 2026-05-31** (branch `verify/static-analysis-unsafe-audit`). The
 > permitted-layer growth since the prior baseline is from the AMD GX-420GI ring-3 /
@@ -193,6 +212,13 @@ and the `init` call chain into `boot.rs`. Sound because serial ports are
 exclusively owned by the kernel at these call sites; `cli`/`hlt` is the correct
 halt sequence; all callers are within the single-threaded BSP init path.
 
+One additional `unsafe {}` block (count +1): `console_push_byte` calls
+`uart_rx_push(b)` to enqueue a USB-keyboard-decoded byte into the COM1 RX ring,
+then wakes any task blocked in `ConsoleRead`. Sound because the RX ring is a
+single-logical-producer buffer (the timer-ISR UART drain and the xHCI driver's
+`ConsolePush` syscall both run on Core 0's serial path); the push is a bounded
+ring write with head/tail wrap. `// SAFETY:` comment present in source.
+
 ---
 
 ### arch/x86_64/page_tables.rs
@@ -205,6 +231,23 @@ written once before any AP starts; PTE access goes through the HHDM which is
 valid after `set_hhdm_offset`; `map_in_active_tables` holds the frame allocator
 lock for the duration; `reclaim_user_frames` is called only after TLB shootdown
 acknowledgment from all cores.
+
+---
+
+### arch/x86_64/pci.rs
+
+PCI configuration-space access via legacy mechanism #1 (port `0xCF8` address /
+`0xCFC` data), used once at boot to locate the xHCI USB host controller and
+record its MMIO base + IRQ (§12). Five unsafe lines:
+- `unsafe fn outl` / its inner `unsafe {}` block — 32-bit `out dx, eax` port write.
+- `unsafe fn inl` / its inner `unsafe {}` block — 32-bit `in eax, dx` port read.
+- `unsafe {}` in `config_read32` — pairs an `outl(address)` then `inl(data)`.
+
+Sound because port I/O is ring-0 and these ports are the architecturally fixed
+PCI config registers, owned exclusively by the kernel during single-threaded BSP
+boot (the scan runs before any AP or task exists); the address dword is
+constructed from bounded bus/dev/func/offset values with the enable bit set per
+the mechanism-#1 spec. `// SAFETY:` comments present in source for all five.
 
 ---
 
@@ -240,6 +283,14 @@ init from the Limine memory map. Sound because the allocator is protected by a
 `SpinLock`; bitmap indices are bounds-checked before access; guard-page ranges
 are set once during init. `// SAFETY:` comments present in source for most
 blocks; a small number need back-fill (see grandfathered note in §18).
+
+Three additional `unsafe` lines (count 29 → 32): the `alloc_contiguous(n)` path
+for driver DMA arenas (§12) — the `unsafe fn alloc_contiguous` method, its inner
+`&mut *addr_of_mut!(BITMAP)` access, and the public `alloc_contiguous` wrapper's
+`(*addr_of_mut!(ALLOCATOR)).alloc_contiguous(n)` call. Sound for the same reason
+as the rest of the allocator: every access holds `ALLOC_LOCKED` (single writer
+across all cores), and the bitmap scan is bounds-checked against
+`max_valid_frame`. `// SAFETY:` comments present in source for all three.
 
 ---
 

@@ -297,41 +297,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     spin(|| mmio.read32(op + OP_USBSTS) & STS_HCH == 0);
     ctx.log("xhci: controller running");
 
-    // DIAGNOSTIC: dump the Supported Protocol extended caps (which ports are USB2
-    // vs USB3) and every powered/connected port's PORTSC, to map the controller's
-    // USB topology. HCCPARAMS1[31:16] = xECP (extended-cap pointer, in dwords).
-    let xecp = (mmio.read32(CAP_HCCPARAMS1) >> 16) & 0xFFFF;
-    if xecp != 0 {
-        let mut cap = (xecp as usize) * 4;
-        for _ in 0..32 {
-            let d0 = mmio.read32(cap);
-            let id = d0 & 0xFF;
-            let next = (d0 >> 8) & 0xFF;
-            if id == 2 {
-                let major = (d0 >> 24) & 0xFF;
-                let d2 = mmio.read32(cap + 8);
-                let poff = d2 & 0xFF;
-                let pcnt = (d2 >> 8) & 0xFF;
-                ctx.log_fmt(format_args!(
-                    "xhci: proto USB{}.x ports {}..{}",
-                    major,
-                    poff,
-                    poff + pcnt - 1
-                ));
-            }
-            if next == 0 {
-                break;
-            }
-            cap += (next as usize) * 4;
-        }
-    }
-    for p in 1..=max_ports {
-        let psc = mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10);
-        if psc & 0x1 != 0 || psc & 0x200 != 0 {
-            ctx.log_fmt(format_args!("xhci: port {} PORTSC={:#010x}", p, psc));
-        }
-    }
-
     // Persistent ring state across every command and every port we probe.
     let mut ev_idx = 0usize;
     let mut ev_cycle = 1u32;
