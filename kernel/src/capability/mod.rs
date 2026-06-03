@@ -30,11 +30,18 @@ pub const SPAWN_RESOURCE: ResourceId = ResourceId(2);
 /// to call `SyscallNumber::ConsoleRead` (syscall 17).
 pub const CONSOLE_READ_RESOURCE: ResourceId = ResourceId(3);
 
+/// The console push authority — inject a byte into the console input ring (§12).
+/// Held only by an input-driver service (the USB keyboard driver) with
+/// `Rights::WRITE` to call `SyscallNumber::ConsolePush` (syscall 20). Gating
+/// this prevents an arbitrary service from forging keystrokes into the shell.
+pub const CONSOLE_PUSH_RESOURCE: ResourceId = ResourceId(4);
+
 pub fn init() {
     table::init_global();
     // Register stable kernel resources (generation 0 forever — §7.5).
     table::register_resource(LOG_WRITE_RESOURCE);
     table::register_resource(SPAWN_RESOURCE);
     table::register_resource(CONSOLE_READ_RESOURCE);
+    table::register_resource(CONSOLE_PUSH_RESOURCE);
     crate::kprintln!("capability: subsystem ready");
 }

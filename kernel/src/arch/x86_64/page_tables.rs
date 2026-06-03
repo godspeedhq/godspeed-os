@@ -298,6 +298,8 @@ bitflags::bitflags! {
         const PRESENT   = 1 << 0;
         const WRITABLE  = 1 << 1;
         const USER      = 1 << 2;
+        const PWT       = 1 << 3; // page write-through — for uncached MMIO (§12)
+        const PCD       = 1 << 4; // page cache-disable — for uncached MMIO (§12)
         const NO_EXEC   = 1 << 63;
     }
 }

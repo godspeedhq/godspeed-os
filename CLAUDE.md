@@ -913,9 +913,21 @@ Iteration loop: edit → `build` → `publish` → `restart` → `logs`. Only th
 
 `kernel/src/arch/`, `kernel/src/memory/`, `kernel/src/capability/`, `kernel/src/smp/`.
 
+**Plus the SDK's audited hardware/ABI layer:** the syscall ABI (`raw_syscall`,
+inline `asm!`) and the MMIO/DMA accessor modules (`sdk/rust/src/mmio.rs`, and a
+future `dma.rs`). Userspace drivers (§12) cannot touch device registers or DMA
+memory without `unsafe`; isolating it to these designated SDK modules — each
+block carrying a `// SAFETY:` comment — keeps the *driver services themselves*
+`unsafe`-free behind safe wrappers (`Mmio::read32`, etc.), exactly as the kernel
+isolates its `unsafe` to the four layers above. This is a recognition of what
+the syscall ABI already required, extended to the hardware access §12 needs.
+
 ### 18.2 Forbidden
 
-All userspace services, `sdk/`, `osdev/`, all kernel code outside the four layers above.
+All userspace services, `osdev/`, and all of `sdk/` **except** the audited
+hardware/ABI layer named in §18.1 — and all kernel code outside the four
+permitted layers. A driver service that writes `unsafe` directly (rather than
+going through the SDK's safe `Mmio`/`Dma` wrappers) is rejected.
 
 ### 18.3 Documentation
 

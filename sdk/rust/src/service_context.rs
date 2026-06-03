@@ -36,6 +36,11 @@ struct ServiceContextData {
     core_id:            u32,
     probe_mode:         u32,
     console_read_slot:  u32, // u32::MAX = not present
+    xhci_mmio_va:       u64, // 0 = not mapped; else VA of the mapped xHCI BAR
+    xhci_dma_va:        u64, // 0 = none; else VA of the driver's DMA arena
+    xhci_dma_phys:      u64, // physical base of the DMA arena
+    xhci_dma_len:       u64, // length of the DMA arena in bytes
+    console_push_slot:  u32, // u32::MAX = none; else CONSOLE_PUSH cap slot
     send_peers:         [SendPeerEntry; MAX_SEND_PEERS],
 }
 
@@ -484,6 +489,19 @@ impl ServiceContext {
         if ret == 0 { Ok(()) } else { Err(crate::ipc::i64_to_ipc_error(ret)) }
     }
 
+    /// Inject one byte into the console input ring (syscall 20). Only effective
+    /// for an input-driver service holding a CONSOLE_PUSH cap (the USB keyboard
+    /// driver, §12); the byte reaches the shell exactly like a serial keystroke.
+    /// No-op for services without the cap.
+    pub fn console_push(&self, byte: u8) {
+        let slot = Self::ctx().console_push_slot;
+        if slot == u32::MAX {
+            return;
+        }
+        // SAFETY: syscall(20) = ConsolePush; slot is the kernel-written cap index.
+        let _ = unsafe { raw_syscall(20, slot as u64, byte as u64, 0) };
+    }
+
     /// Block until one byte is available on COM1 console input (syscall 17).
     ///
     /// Returns the byte value. Only usable by services that declared
@@ -500,6 +518,36 @@ impl ServiceContext {
 
     /// Return the core this service was spawned on.
     pub fn core_id(&self) -> u32 { Self::ctx().core_id }
+
+    /// Safe MMIO handle for this service's xHCI controller, if one was granted
+    /// (§12). The kernel mapped the controller's BAR into this driver's address
+    /// space; the returned [`crate::Mmio`] reads/writes the uncached device
+    /// registers directly. `None` for non-driver services.
+    pub fn xhci_mmio(&self) -> Option<crate::mmio::Mmio> {
+        let va = Self::ctx().xhci_mmio_va;
+        if va == 0 {
+            None
+        } else {
+            Some(crate::mmio::Mmio::new(va as *mut u8))
+        }
+    }
+
+    /// Safe handle to this service's DMA arena, if one was granted (§12). The
+    /// kernel mapped a physically-contiguous region into this driver; the
+    /// returned [`crate::Dma`] gives the CPU view (read/write) and the physical
+    /// base to program into the controller. `None` for non-driver services.
+    pub fn dma_region(&self) -> Option<crate::dma::Dma> {
+        let d = Self::ctx();
+        if d.xhci_dma_va == 0 {
+            None
+        } else {
+            Some(crate::dma::Dma::new(
+                d.xhci_dma_va as *mut u8,
+                d.xhci_dma_phys,
+                d.xhci_dma_len as usize,
+            ))
+        }
+    }
 
     /// Allocate `size` bytes of read/write memory within this task's budget.
     ///

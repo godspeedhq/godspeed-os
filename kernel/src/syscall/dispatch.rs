@@ -38,6 +38,7 @@ pub enum SyscallNumber {
     ConsoleRead    = 17,
     Reboot         = 18,
     SpawnPipe      = 19,
+    ConsolePush    = 20,
 }
 
 /// Raw syscall dispatcher — called from the SYSCALL/SYSENTER IDT stub.
@@ -77,6 +78,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::ConsoleRead    as u64 => handle_console_read(arg0),
         n if n == SyscallNumber::Reboot        as u64 => handle_reboot(),
         n if n == SyscallNumber::SpawnPipe     as u64 => handle_spawn_pipe(arg0, arg1, arg2),
+        n if n == SyscallNumber::ConsolePush   as u64 => handle_console_push(arg0, arg1),
         _ => -1, // Unknown syscall.
     }
 }
@@ -745,6 +747,26 @@ fn handle_console_read(cap_slot: u64) -> i64 {
         }
         // Woken by uart_rx_irq_handler; loop to pop the byte.
     }
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: ConsolePush (20) — inject a byte into the console input ring.
+// Gated by CONSOLE_PUSH_RESOURCE (held only by the USB keyboard driver, §12)
+// so an arbitrary service cannot forge keystrokes into the shell.
+// ---------------------------------------------------------------------------
+
+fn handle_console_push(cap_slot: u64, byte: u64) -> i64 {
+    use crate::capability::CONSOLE_PUSH_RESOURCE;
+
+    let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::WRITE) {
+        Ok(c) => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    if cap.resource_id != CONSOLE_PUSH_RESOURCE {
+        return cap_err_to_i64(CapError::CapWrongScope);
+    }
+    crate::arch::x86_64::console_push_byte(byte as u8);
+    0
 }
 
 // ---------------------------------------------------------------------------

@@ -6,12 +6,16 @@
 #![no_std]
 
 pub mod capability;
+pub mod dma;
 pub mod ipc;
+pub mod mmio;
 pub mod service_context;
 pub(crate) mod syscall;
 
 pub use capability::{CapHandle, CapError};
+pub use dma::Dma;
 pub use ipc::{Message, IpcError};
+pub use mmio::Mmio;
 pub use service_context::{ServiceContext, TaskStat};
 
 pub type Result<T> = core::result::Result<T, Error>;

@@ -52,12 +52,21 @@ pub unsafe fn init_per_core_syscall(core_id: usize) {
             options(nostack, nomem),
         );
 
-        // IA32_KERNEL_GS_BASE = 0 — user's GS value; swapgs exchanges it with GS.base.
+        // IA32_KERNEL_GS_BASE = the SAME per-core ptr (not 0). swapgs then swaps
+        // per-core ↔ per-core, so GS.base can never become 0 regardless of swapgs
+        // parity. Without this, an AP whose swapgs parity is left imbalanced by
+        // interrupt activity (observed on the T630, core 1) flips GS.base to 0,
+        // and the #UD syscall stub's `mov %r10, %gs:0x0` writes to address 0 →
+        // kernel #PF loop → reboot. The BSP stays balanced so never hit it.
+        // Cost: a ring-3 task can read its core's PER_CORE_SYSCALL via gs:[...]
+        // (the kernel_rsp pointer) — a minor info leak, acceptable in v1; user
+        // services don't use GS. Finding the imbalanced swapgs handler so this
+        // can return to 0 is a follow-up.
         core::arch::asm!(
             "wrmsr",
             in("ecx") 0xC000_0102u32,
-            in("eax") 0u32,
-            in("edx") 0u32,
+            in("eax") ptr as u32,
+            in("edx") (ptr >> 32) as u32,
             options(nostack, nomem),
         );
     }

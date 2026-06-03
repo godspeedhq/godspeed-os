@@ -99,6 +99,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
     let _ = ctx.spawn("shell");
 
+    // xhci: USB host-controller driver (§12). Spawned in bare-metal + full
+    // builds; the kernel maps its controller's MMIO BAR at spawn (Stage 2).
+    #[cfg(not(any(feature = "identity-only", feature = "perf-only",
+                  feature = "perf-brutal-only", feature = "stress-only",
+                  feature = "adv-only", feature = "chaos-only",
+                  feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
+    let _ = ctx.spawn("xhci");
+
     ctx.log("supervisor: ready");
 
     loop {

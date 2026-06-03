@@ -12,7 +12,7 @@ use crate::arch::x86_64::context_switch::TaskContext;
 use crate::arch::x86_64::page_tables::{
     get_hhdm_offset, PageFlags, VirtAddr, PAGE_SIZE,
 };
-use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE};
+use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE};
 use crate::capability::cap::ResourceId;
 use crate::capability::generation::Generation;
 use crate::ipc::endpoint::EndpointId;
@@ -88,6 +88,18 @@ pub fn free_kstack(kstack_top: u64) {
 pub const SERVICE_CTX_VA:    u64 = 0x3ff000;
 pub const SERVICE_CTX_MAGIC: u32 = 0xD0_5D_EA_D5;
 
+/// VA where the xHCI controller's MMIO BAR is mapped into the driver's address
+/// space (§12). 4 GiB — well above the user stack (0x8000_0000) and ctx page.
+pub const XHCI_MMIO_VA:    u64 = 0x1_0000_0000;
+/// Pages of MMIO to map for the xHCI BAR (64 KiB — cap/op/runtime/doorbell regs).
+const XHCI_MMIO_PAGES:     u64 = 16;
+
+/// VA where the driver's physically-contiguous DMA arena is mapped (8 GiB).
+pub const XHCI_DMA_VA:     u64 = 0x2_0000_0000;
+/// Pages of contiguous DMA memory for the xHCI driver (64 KiB: command/event
+/// rings, device-context base array, ERST, scratchpad array).
+const XHCI_DMA_PAGES:      u64 = 16;
+
 /// Maximum named send peers per service.
 pub const MAX_SEND_PEERS:  usize = 4;
 /// Maximum bytes per peer name stored in ServiceContextData.
@@ -112,6 +124,11 @@ struct ServiceContextData {
     core_id:            u32,
     probe_mode:         u32,
     console_read_slot:  u32, // u32::MAX = not present; slot index if service has console_read cap
+    xhci_mmio_va:       u64, // 0 = not mapped; else VA where the xHCI BAR is mapped (§12)
+    xhci_dma_va:        u64, // 0 = none; else VA of the driver's DMA arena (§12)
+    xhci_dma_phys:      u64, // physical base of the DMA arena (programmed into the device)
+    xhci_dma_len:       u64, // length of the DMA arena in bytes
+    console_push_slot:  u32, // u32::MAX = none; else CONSOLE_PUSH cap slot (input driver)
     send_peers:         [SendPeerEntry; MAX_SEND_PEERS],
 }
 
@@ -261,6 +278,22 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[], // delegated at runtime by the shell, not contracted
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
+            probe_mode:        0,
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
+        // xhci — USB host-controller driver (§12). Receives its controller's
+        // MMIO BAR (mapped by name in the spawn path) + later its IRQ. Trusted
+        // userspace driver. has_recv_endpoint for future interrupt delivery.
+        "xhci" => Some(("xhci", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_XHCI_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            // Pin to core 1: the poll loop busy-spins (no interrupt wired yet),
+            // so keep it off core 0 where the shell + TCB live (§9.2).
+            preferred_core:    1,
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
@@ -2646,6 +2679,16 @@ fn spawn_service_with_config(
         console_read_slot_u32 = cap_slot as u32;
     }
 
+    // The USB keyboard driver gets a CONSOLE_PUSH cap so it can inject decoded
+    // keystrokes into the console input ring (§12). Name-gated to `xhci`.
+    let mut console_push_slot_u32 = u32::MAX;
+    if name == "xhci" {
+        let cp_cap = mint_cap(CONSOLE_PUSH_RESOURCE, Rights::WRITE);
+        let cap_slot = caps.insert(cp_cap)
+            .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
+        console_push_slot_u32 = cap_slot as u32;
+    }
+
     // 5. Send-peer SEND caps (wired at spawn from the name registry).
     let mut peer_data: [(u32, u32, [u8; PEER_NAME_BYTES]); MAX_SEND_PEERS] =
         [(u32::MAX, 0, [0u8; PEER_NAME_BYTES]); MAX_SEND_PEERS];
@@ -2684,6 +2727,67 @@ fn spawn_service_with_config(
         }
     }
 
+    // 6a. Map the xHCI controller's MMIO BAR into the driver's address space
+    // (§12). Name-gated: only the `xhci` service receives it, and only if the
+    // PCI scan found a controller. Device registers must be uncached (PCD|PWT).
+    let xhci_mmio_va = if name == "xhci"
+        && crate::arch::x86_64::pci::XHCI_FOUND.load(core::sync::atomic::Ordering::Relaxed)
+    {
+        let bar =
+            crate::arch::x86_64::pci::XHCI_MMIO_BASE.load(core::sync::atomic::Ordering::Relaxed);
+        let mmio_flags = PageFlags::PRESENT
+            | PageFlags::WRITABLE
+            | PageFlags::USER
+            | PageFlags::NO_EXEC
+            | PageFlags::PCD
+            | PageFlags::PWT;
+        for i in 0..XHCI_MMIO_PAGES {
+            let off = i * PAGE_SIZE as u64;
+            page_table
+                .map(VirtAddr(XHCI_MMIO_VA + off), PhysAddr(bar + off), mmio_flags)
+                .map_err(|_| SpawnError::MapFailed)?;
+        }
+        crate::kprintln!("spawn[mmio]: 'xhci' BAR {:#x} -> VA {:#x}", bar, XHCI_MMIO_VA);
+        XHCI_MMIO_VA
+    } else {
+        0
+    };
+
+    // 6b. Allocate + map a physically-contiguous DMA arena for the xHCI driver
+    // (§12). The controller DMAs into this memory (rings/contexts), so the driver
+    // needs both the VA (to build structures) and the physical base (to program
+    // the controller). Normal cacheable mapping — x86 DMA is cache-coherent.
+    let (xhci_dma_va, xhci_dma_phys, xhci_dma_len) = if name == "xhci"
+        && crate::arch::x86_64::pci::XHCI_FOUND.load(core::sync::atomic::Ordering::Relaxed)
+    {
+        match crate::memory::allocator::alloc_contiguous(XHCI_DMA_PAGES as usize) {
+            Some(phys) => {
+                let flags = PageFlags::PRESENT
+                    | PageFlags::WRITABLE
+                    | PageFlags::USER
+                    | PageFlags::NO_EXEC;
+                for i in 0..XHCI_DMA_PAGES {
+                    let off = i * PAGE_SIZE as u64;
+                    page_table
+                        .map(VirtAddr(XHCI_DMA_VA + off), PhysAddr(phys + off), flags)
+                        .map_err(|_| SpawnError::MapFailed)?;
+                }
+                let len = XHCI_DMA_PAGES * PAGE_SIZE as u64;
+                crate::kprintln!(
+                    "spawn[dma]: 'xhci' arena phys {:#x} -> VA {:#x} ({} KiB)",
+                    phys, XHCI_DMA_VA, len / 1024
+                );
+                (XHCI_DMA_VA, phys, len)
+            }
+            None => {
+                crate::kprintln!("spawn[dma]: 'xhci' WARN: no contiguous DMA arena");
+                (0, 0, 0)
+            }
+        }
+    } else {
+        (0, 0, 0)
+    };
+
     // 6. Allocate and map the ServiceContextData page.
     {
         let ctx_frame = alloc_frame().ok_or(SpawnError::NoMemory)?;
@@ -2705,6 +2809,11 @@ fn spawn_service_with_config(
             data.core_id            = core_id;
             data.probe_mode         = probe_mode;
             data.console_read_slot  = console_read_slot_u32;
+            data.console_push_slot  = console_push_slot_u32;
+            data.xhci_mmio_va       = xhci_mmio_va;
+            data.xhci_dma_va        = xhci_dma_va;
+            data.xhci_dma_phys      = xhci_dma_phys;
+            data.xhci_dma_len       = xhci_dma_len;
             for i in 0..peer_count {
                 data.send_peers[i].slot     = peer_data[i].0;
                 data.send_peers[i].name_len = peer_data[i].1;
