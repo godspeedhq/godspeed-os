@@ -533,6 +533,22 @@ pub fn uart_rx_poll() {
     }
 }
 
+/// Inject one byte into the console input ring from a userspace input driver
+/// (the USB keyboard, §12), then wake any blocked ConsoleRead. Mirrors the COM1
+/// poll path's push + wake, so USB keystrokes reach the shell exactly like
+/// serial bytes would. On the target hardware COM1 RX is dead, so the driver is
+/// the only producer in practice; a concurrent COM1 poll would race the ring
+/// tail — acceptable while COM1 input is unused (a per-ring lock is future work).
+pub fn console_push_byte(b: u8) {
+    use core::sync::atomic::Ordering;
+    // SAFETY: single-producer ring push in practice (see note above).
+    unsafe { uart_rx_push(b) };
+    let waiter = CONSOLE_READ_WAITER.load(Ordering::Acquire);
+    if waiter != u32::MAX {
+        crate::task::scheduler::wake_by_slot(waiter as usize, 0);
+    }
+}
+
 /// Drain all available COM1 RX bytes into the ring buffer (called from IRQ).
 ///
 /// # Safety

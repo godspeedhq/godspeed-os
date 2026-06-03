@@ -12,7 +12,7 @@ use crate::arch::x86_64::context_switch::TaskContext;
 use crate::arch::x86_64::page_tables::{
     get_hhdm_offset, PageFlags, VirtAddr, PAGE_SIZE,
 };
-use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE};
+use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE};
 use crate::capability::cap::ResourceId;
 use crate::capability::generation::Generation;
 use crate::ipc::endpoint::EndpointId;
@@ -128,6 +128,7 @@ struct ServiceContextData {
     xhci_dma_va:        u64, // 0 = none; else VA of the driver's DMA arena (§12)
     xhci_dma_phys:      u64, // physical base of the DMA arena (programmed into the device)
     xhci_dma_len:       u64, // length of the DMA arena in bytes
+    console_push_slot:  u32, // u32::MAX = none; else CONSOLE_PUSH cap slot (input driver)
     send_peers:         [SendPeerEntry; MAX_SEND_PEERS],
 }
 
@@ -290,7 +291,9 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
-            preferred_core:    u32::MAX,
+            // Pin to core 1: the poll loop busy-spins (no interrupt wired yet),
+            // so keep it off core 0 where the shell + TCB live (§9.2).
+            preferred_core:    1,
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
@@ -2676,6 +2679,16 @@ fn spawn_service_with_config(
         console_read_slot_u32 = cap_slot as u32;
     }
 
+    // The USB keyboard driver gets a CONSOLE_PUSH cap so it can inject decoded
+    // keystrokes into the console input ring (§12). Name-gated to `xhci`.
+    let mut console_push_slot_u32 = u32::MAX;
+    if name == "xhci" {
+        let cp_cap = mint_cap(CONSOLE_PUSH_RESOURCE, Rights::WRITE);
+        let cap_slot = caps.insert(cp_cap)
+            .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
+        console_push_slot_u32 = cap_slot as u32;
+    }
+
     // 5. Send-peer SEND caps (wired at spawn from the name registry).
     let mut peer_data: [(u32, u32, [u8; PEER_NAME_BYTES]); MAX_SEND_PEERS] =
         [(u32::MAX, 0, [0u8; PEER_NAME_BYTES]); MAX_SEND_PEERS];
@@ -2796,6 +2809,7 @@ fn spawn_service_with_config(
             data.core_id            = core_id;
             data.probe_mode         = probe_mode;
             data.console_read_slot  = console_read_slot_u32;
+            data.console_push_slot  = console_push_slot_u32;
             data.xhci_mmio_va       = xhci_mmio_va;
             data.xhci_dma_va        = xhci_dma_va;
             data.xhci_dma_phys      = xhci_dma_phys;

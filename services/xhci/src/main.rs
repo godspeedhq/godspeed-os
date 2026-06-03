@@ -557,6 +557,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut int_idx = 0usize;
     let mut int_cycle = 1u32;
     let mut need_queue = true;
+    let mut last_key = 0u8;
     loop {
         if need_queue {
             let t = INT_TR_OFF + int_idx * 16;
@@ -578,12 +579,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         {
             let mods = dma.read8(REPORT_OFF);
             let key = dma.read8(REPORT_OFF + 2); // first keycode in the boot report
-            if key != 0 {
-                match hid_to_ascii(key, mods) {
-                    Some(ch) => ctx.log_fmt(format_args!("xhci: KEY '{}'", ch as char)),
-                    None => ctx.log_fmt(format_args!("xhci: keycode {:#04x}", key)),
+            // Only act on a NEW press (key changed) so a held key doesn't spam.
+            if key != 0 && key != last_key {
+                if let Some(ch) = hid_to_ascii(key, mods) {
+                    ctx.console_push(ch); // → console input ring → the shell's gs>
+                    ctx.log_fmt(format_args!("xhci: KEY '{}'", ch as char));
+                } else {
+                    ctx.log_fmt(format_args!("xhci: keycode {:#04x}", key));
                 }
             }
+            last_key = key;
             need_queue = true;
         }
         ctx.yield_cpu();

@@ -40,6 +40,7 @@ struct ServiceContextData {
     xhci_dma_va:        u64, // 0 = none; else VA of the driver's DMA arena
     xhci_dma_phys:      u64, // physical base of the DMA arena
     xhci_dma_len:       u64, // length of the DMA arena in bytes
+    console_push_slot:  u32, // u32::MAX = none; else CONSOLE_PUSH cap slot
     send_peers:         [SendPeerEntry; MAX_SEND_PEERS],
 }
 
@@ -486,6 +487,19 @@ impl ServiceContext {
             raw_syscall(11, packed, payload.as_ptr() as u64, payload.len() as u64)
         };
         if ret == 0 { Ok(()) } else { Err(crate::ipc::i64_to_ipc_error(ret)) }
+    }
+
+    /// Inject one byte into the console input ring (syscall 20). Only effective
+    /// for an input-driver service holding a CONSOLE_PUSH cap (the USB keyboard
+    /// driver, §12); the byte reaches the shell exactly like a serial keystroke.
+    /// No-op for services without the cap.
+    pub fn console_push(&self, byte: u8) {
+        let slot = Self::ctx().console_push_slot;
+        if slot == u32::MAX {
+            return;
+        }
+        // SAFETY: syscall(20) = ConsolePush; slot is the kernel-written cap index.
+        let _ = unsafe { raw_syscall(20, slot as u64, byte as u64, 0) };
     }
 
     /// Block until one byte is available on COM1 console input (syscall 17).
