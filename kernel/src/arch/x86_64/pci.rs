@@ -127,11 +127,11 @@ pub fn init() {
             }
         }
     }
-    // Pick which xHCI the driver uses. The boot drive is on the first; a keyboard
-    // on the rear ports is typically on the second. Prefer index 1 when present.
+    // Use the first xHCI for the driver. (Multiple xHCIs are recorded above; a
+    // general design would enumerate every controller + device and bind by class.)
     let count = XHCI_COUNT.load(Ordering::Relaxed);
     if count > 0 {
-        let pick = if count >= 2 { 1 } else { 0 };
+        let pick = 0;
         let base = XHCI_BASES[pick].load(Ordering::Relaxed);
         XHCI_MMIO_BASE.store(base, Ordering::Relaxed);
         XHCI_IRQ.store(XHCI_IRQS[pick].load(Ordering::Relaxed), Ordering::Relaxed);

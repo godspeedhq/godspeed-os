@@ -101,7 +101,10 @@ fn next_event(
             *ev_idx = 0;
             *ev_cycle ^= 1;
         }
-        mmio.write64(ir0 + 0x18, dma.phys_at(EVENT_RING_OFF + *ev_idx * TRB_SIZE) | (1 << 3));
+        mmio.write64(
+            ir0 + 0x18,
+            dma.phys_at(EVENT_RING_OFF + *ev_idx * TRB_SIZE) | (1 << 3),
+        );
         return Some((trb_type, completion, slot_id));
     }
     None
@@ -169,7 +172,10 @@ fn control(
     dma.write32(tr + 4, widx | (wlen << 16));
     dma.write32(tr + 8, 8);
     let trt = if wlen > 0 { 3 } else { 0 }; // 3 = IN data stage, 0 = no data
-    dma.write32(tr + 12, 1 | (1 << 6) | (TRB_SETUP_STAGE << 10) | (trt << 16));
+    dma.write32(
+        tr + 12,
+        1 | (1 << 6) | (TRB_SETUP_STAGE << 10) | (trt << 16),
+    );
     let mut off = tr + 16;
     if wlen > 0 {
         let dp = dma.phys_at(data_off);
@@ -183,7 +189,10 @@ fn control(
     dma.write32(off, 0);
     dma.write32(off + 4, 0);
     dma.write32(off + 8, 0);
-    dma.write32(off + 12, 1 | (1 << 5) | (TRB_STATUS_STAGE << 10) | (sdir << 16));
+    dma.write32(
+        off + 12,
+        1 | (1 << 5) | (TRB_STATUS_STAGE << 10) | (sdir << 16),
+    );
     mmio.write32(dboff + slot as usize * 4, 1);
     for _ in 0..8 {
         match next_event(dma, mmio, ir0, ev_idx, ev_cycle) {
@@ -305,7 +314,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 let pcnt = (d2 >> 8) & 0xFF;
                 ctx.log_fmt(format_args!(
                     "xhci: proto USB{}.x ports {}..{}",
-                    major, poff, poff + pcnt - 1
+                    major,
+                    poff,
+                    poff + pcnt - 1
                 ));
             }
             if next == 0 {
@@ -321,266 +332,363 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         }
     }
 
-    // Find a connected port.
-    let mut port = 0u32;
-    for p in 1..=max_ports {
-        let psc = mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10);
-        if psc & PORT_CCS != 0 {
-            port = p;
-            break;
-        }
-    }
-    if port == 0 {
-        ctx.log("xhci: no connected port — idling");
-        idle(&ctx);
-    }
-    let portsc_off = op + OP_PORTSC_BASE + (port as usize - 1) * 0x10;
-
-    // Enable the port. USB3 (SuperSpeed) ports auto-train and are already enabled
-    // (PED=1) on their own — issuing the USB2 port-reset (PR) bit *disables* them
-    // (PORTSC speed→0, link→Disabled). So only reset a not-yet-enabled (USB2)
-    // port; a port that is already enabled is used as-is.
-    let psc = mmio.read32(portsc_off);
-    if psc & PORT_PED == 0 {
-        mmio.write32(portsc_off, (psc & !PORT_RW1C) | PORT_PR);
-        spin(|| mmio.read32(portsc_off) & PORT_PED != 0);
-    }
-    let psc = mmio.read32(portsc_off);
-    let speed = (psc >> 10) & 0xF;
-    let max_packet: u32 = match speed {
-        2 => 8,   // low-speed
-        4 => 512, // super-speed
-        _ => 64,  // full / high-speed
-    };
-    ctx.log_fmt(format_args!(
-        "xhci: port {} ready; PORTSC={:#010x} speed={} max_packet={}",
-        port, psc, speed, max_packet
-    ));
-
+    // Persistent ring state across every command and every port we probe.
     let mut ev_idx = 0usize;
     let mut ev_cycle = 1u32;
-    let mut cmd_idx = 0usize; // command ring producer index
+    let mut cmd_idx = 0usize; // command ring producer index (monotonic)
 
-    // Enable Slot.
-    let cmd_off = CMD_RING_OFF + cmd_idx * TRB_SIZE;
-    cmd_idx += 1;
-    let (comp, slot) = match run_command(
-        &ctx, &dma, &mmio, dboff, ir0, cmd_off, 0, 0, 0,
-        (TRB_ENABLE_SLOT << 10) | 1, &mut ev_idx, &mut ev_cycle,
-    ) {
-        Some(r) => r,
-        None => {
-            ctx.log("xhci: Enable Slot — no completion");
-            idle(&ctx);
-        }
-    };
-    if comp != 1 {
-        ctx.log_fmt(format_args!("xhci: Enable Slot failed (completion={})", comp));
-        idle(&ctx);
-    }
-    ctx.log_fmt(format_args!("xhci: slot {} enabled", slot));
-
-    // Build the Input Context for Address Device.
-    //   +0:            Input Control Context — Add flags A0(slot)|A1(ep0)
-    //   +ctx_size:     Slot Context
-    //   +2*ctx_size:   Endpoint 0 Context
-    let ictl = INPUT_CTX_OFF;
-    let islot = INPUT_CTX_OFF + ctx_size;
-    let iep0 = INPUT_CTX_OFF + 2 * ctx_size;
-    dma.write32(ictl + 4, 0b11); // Add Context flags: slot + EP0
-
-    // Slot Context: Context Entries=1 [31:27], Speed [23:20]; Root Hub Port [23:16].
-    dma.write32(islot, (1 << 27) | (speed << 20));
-    dma.write32(islot + 4, port << 16);
-
-    // EP0 Context (Control): CErr=3 [2:1], EP Type=4 [5:3], Max Packet [31:16];
-    // TR Dequeue Ptr | DCS; Average TRB Length.
-    let ep0_tr = dma.phys_at(EP0_TR_OFF);
-    dma.write32(iep0 + 4, (3 << 1) | (4 << 3) | (max_packet << 16));
-    dma.write32(iep0 + 8, (ep0_tr as u32 & !0xF) | 1);
-    dma.write32(iep0 + 12, (ep0_tr >> 32) as u32);
-    dma.write32(iep0 + 16, 8);
-
-    // DCBAA[slot] = device context physical base.
-    dma.write64(DCBAA_OFF + slot as usize * 8, dma.phys_at(DEVICE_CTX_OFF));
-
-    // Address Device command (input context ptr, slot id).
-    let in_phys = dma.phys_at(INPUT_CTX_OFF);
-    let cmd_off = CMD_RING_OFF + cmd_idx * TRB_SIZE;
-    let (comp, _) = match run_command(
-        &ctx, &dma, &mmio, dboff, ir0, cmd_off,
-        in_phys as u32, (in_phys >> 32) as u32, 0,
-        (TRB_ADDRESS_DEVICE << 10) | (slot << 24) | 1, &mut ev_idx, &mut ev_cycle,
-    ) {
-        Some(r) => r,
-        None => {
-            ctx.log("xhci: Address Device — no completion");
-            idle(&ctx);
-        }
-    };
-    if comp != 1 {
-        ctx.log_fmt(format_args!("xhci: Address Device failed (completion={})", comp));
-        idle(&ctx);
-    }
-    ctx.log_fmt(format_args!(
-        "xhci: Address Device OK — device on port {} addressed (slot {})",
-        port, slot
-    ));
-
-    // --- Stage 3c: Get Device Descriptor over EP0 (control transfer) ---
-    // Three TRBs on the EP0 transfer ring: Setup (immediate GET_DESCRIPTOR),
-    // Data (IN, 18 bytes), Status (OUT, IOC). Then ring the slot's EP0 doorbell.
-    let data_phys = dma.phys_at(DATA_BUF_OFF);
-    dma.write32(EP0_TR_OFF, 0x80 | (6 << 8) | (0x0100 << 16)); // bmReqType|bRequest|wValue
-    dma.write32(EP0_TR_OFF + 4, 18 << 16); // wIndex=0 | wLength=18
-    dma.write32(EP0_TR_OFF + 8, 8); // setup data length
-    dma.write32(EP0_TR_OFF + 12, 1 | (1 << 6) | (TRB_SETUP_STAGE << 10) | (3 << 16)); // cyc|IDT|type|TRT=IN
-    dma.write32(EP0_TR_OFF + 16, data_phys as u32);
-    dma.write32(EP0_TR_OFF + 20, (data_phys >> 32) as u32);
-    dma.write32(EP0_TR_OFF + 24, 18);
-    dma.write32(EP0_TR_OFF + 28, 1 | (TRB_DATA_STAGE << 10) | (1 << 16)); // cyc|type|DIR=IN
-    dma.write32(EP0_TR_OFF + 32, 0);
-    dma.write32(EP0_TR_OFF + 36, 0);
-    dma.write32(EP0_TR_OFF + 40, 0);
-    dma.write32(EP0_TR_OFF + 44, 1 | (1 << 5) | (TRB_STATUS_STAGE << 10)); // cyc|IOC|type
-    mmio.write32(dboff + slot as usize * 4, 1); // EP0 doorbell (DCI 1)
-
-    let mut ok = false;
-    for _ in 0..8 {
-        match next_event(&dma, &mmio, ir0, &mut ev_idx, &mut ev_cycle) {
-            Some((TRB_TRANSFER_EVENT, c, _)) => {
-                ctx.log_fmt(format_args!("xhci: control transfer completion={}", c));
-                ok = c == 1 || c == 13; // success or short-packet
-                break;
-            }
-            Some((t, _, _)) => ctx.log_fmt(format_args!("xhci: (event type {})", t)),
-            None => break,
-        }
-    }
-    if !ok {
-        ctx.log("xhci: Get Device Descriptor failed");
-        idle(&ctx);
-    }
-    let d0 = dma.read32(DATA_BUF_OFF);
-    let ids = dma.read32(DATA_BUF_OFF + 8);
-    ctx.log_fmt(format_args!(
-        "xhci: DEVICE DESCRIPTOR bLength={} type={} VID={:#06x} PID={:#06x}",
-        d0 & 0xFF,
-        (d0 >> 8) & 0xFF,
-        ids & 0xFFFF,
-        (ids >> 16) & 0xFFFF
-    ));
-
-    // --- Stage 4a: Get Configuration Descriptor; find the interrupt-IN endpoint ---
-    let cfg_phys = dma.phys_at(CONFIG_BUF_OFF);
-    let tr = EP0_TR_OFF + 48; // next 3 TRBs on the EP0 transfer ring
-    dma.write32(tr, 0x80 | (6 << 8) | (0x0200 << 16)); // GET_DESCRIPTOR Config(2), idx 0
-    dma.write32(tr + 4, 64 << 16); // wIndex=0 | wLength=64
-    dma.write32(tr + 8, 8);
-    dma.write32(tr + 12, 1 | (1 << 6) | (TRB_SETUP_STAGE << 10) | (3 << 16));
-    dma.write32(tr + 16, cfg_phys as u32);
-    dma.write32(tr + 20, (cfg_phys >> 32) as u32);
-    dma.write32(tr + 24, 64);
-    dma.write32(tr + 28, 1 | (TRB_DATA_STAGE << 10) | (1 << 16));
-    dma.write32(tr + 32, 0);
-    dma.write32(tr + 36, 0);
-    dma.write32(tr + 40, 0);
-    dma.write32(tr + 44, 1 | (1 << 5) | (TRB_STATUS_STAGE << 10));
-    mmio.write32(dboff + slot as usize * 4, 1);
-    let mut cfg_ok = false;
-    for _ in 0..8 {
-        match next_event(&dma, &mmio, ir0, &mut ev_idx, &mut ev_cycle) {
-            Some((TRB_TRANSFER_EVENT, c, _)) => {
-                cfg_ok = c == 1 || c == 13;
-                break;
-            }
-            Some(_) => {}
-            None => break,
-        }
-    }
-    if !cfg_ok {
-        ctx.log("xhci: Get Config Descriptor failed");
-        idle(&ctx);
-    }
-
-    // Walk the descriptors: config (bConfigurationValue), interface (HID protocol),
-    // endpoint (the interrupt-IN endpoint we'll poll for key reports).
-    let total = ((dma.read32(CONFIG_BUF_OFF) >> 16) & 0xFFFF) as usize;
-    let mut i = 0usize;
+    // Enumerate EVERY connected port and bind to the first device that is a HID
+    // keyboard — i.e. one that exposes an interrupt-IN endpoint (Linux-style,
+    // class-based binding). The mass-storage boot drive has no interrupt endpoint
+    // and is skipped, so the keyboard is found wherever it sits, on any machine.
+    let mut found = false;
+    let mut port = 0u32;
+    let mut slot = 0u32;
+    let mut speed = 0u32;
+    let mut max_packet = 64u32;
     let mut ep_addr = 0u8;
     let mut ep_mps = 0u16;
     let mut ep_interval = 0u8;
     let mut cfg_val = 0u8;
-    let mut hid_proto = 0u8;
-    while i + 2 <= total && i < 200 {
-        let blen = dma.read8(CONFIG_BUF_OFF + i) as usize;
-        let dtype = dma.read8(CONFIG_BUF_OFF + i + 1);
-        if blen == 0 {
-            break;
+
+    'ports: for p in 1..=max_ports {
+        let portsc_off = op + OP_PORTSC_BASE + (p as usize - 1) * 0x10;
+        let psc = mmio.read32(portsc_off);
+        if psc & PORT_CCS == 0 {
+            continue; // nothing connected on this port
         }
-        match dtype {
-            2 => cfg_val = dma.read8(CONFIG_BUF_OFF + i + 5),
-            4 => hid_proto = dma.read8(CONFIG_BUF_OFF + i + 7),
-            5 => {
-                let addr = dma.read8(CONFIG_BUF_OFF + i + 2);
-                let attr = dma.read8(CONFIG_BUF_OFF + i + 3);
-                if attr & 0x3 == 0x3 && addr & 0x80 != 0 {
-                    ep_addr = addr;
-                    ep_mps = dma.read16(CONFIG_BUF_OFF + i + 4);
-                    ep_interval = dma.read8(CONFIG_BUF_OFF + i + 6);
-                }
+        port = p; // root-hub port number used by Address Device below
+        ctx.log_fmt(format_args!(
+            "xhci: enumerating port {} PORTSC={:#010x}",
+            p, psc
+        ));
+
+        // Enable the port. USB3 (SuperSpeed) ports auto-train and are already
+        // enabled (PED=1) — issuing the USB2 port-reset (PR) bit *disables* them
+        // (PORTSC speed→0, link→Disabled). So only reset a not-yet-enabled (USB2)
+        // port; an already-enabled port is used as-is.
+        if psc & PORT_PED == 0 {
+            mmio.write32(portsc_off, (psc & !PORT_RW1C) | PORT_PR);
+            spin(|| mmio.read32(portsc_off) & PORT_PED != 0);
+        }
+        let psc = mmio.read32(portsc_off);
+        speed = (psc >> 10) & 0xF;
+        max_packet = match speed {
+            2 => 8,   // low-speed
+            4 => 512, // super-speed
+            _ => 64,  // full / high-speed
+        };
+        ctx.log_fmt(format_args!(
+            "xhci: port {} ready; PORTSC={:#010x} speed={} max_packet={}",
+            p, psc, speed, max_packet
+        ));
+
+        // Enable Slot.
+        let cmd_off = CMD_RING_OFF + cmd_idx * TRB_SIZE;
+        cmd_idx += 1;
+        let (comp, got_slot) = match run_command(
+            &ctx,
+            &dma,
+            &mmio,
+            dboff,
+            ir0,
+            cmd_off,
+            0,
+            0,
+            0,
+            (TRB_ENABLE_SLOT << 10) | 1,
+            &mut ev_idx,
+            &mut ev_cycle,
+        ) {
+            Some(r) => r,
+            None => {
+                ctx.log("xhci: Enable Slot — no completion; next port");
+                continue 'ports;
             }
-            _ => {}
+        };
+        if comp != 1 {
+            ctx.log_fmt(format_args!(
+                "xhci: Enable Slot failed (completion={}); next port",
+                comp
+            ));
+            continue 'ports;
         }
-        i += blen;
-    }
-    if ep_addr == 0 {
-        ctx.log("xhci: no interrupt-IN endpoint found — idling");
+        slot = got_slot;
+        ctx.log_fmt(format_args!("xhci: slot {} enabled", slot));
+
+        // Build the Input Context for Address Device.
+        //   +0:            Input Control Context — Add flags A0(slot)|A1(ep0)
+        //   +ctx_size:     Slot Context
+        //   +2*ctx_size:   Endpoint 0 Context
+        let ictl = INPUT_CTX_OFF;
+        let islot = INPUT_CTX_OFF + ctx_size;
+        let iep0 = INPUT_CTX_OFF + 2 * ctx_size;
+        dma.write32(ictl + 4, 0b11); // Add Context flags: slot + EP0
+
+        // Slot Context: Context Entries=1 [31:27], Speed [23:20]; Root Hub Port [23:16].
+        dma.write32(islot, (1 << 27) | (speed << 20));
+        dma.write32(islot + 4, port << 16);
+
+        // EP0 Context (Control): CErr=3 [2:1], EP Type=4 [5:3], Max Packet [31:16];
+        // TR Dequeue Ptr | DCS; Average TRB Length.
+        let ep0_tr = dma.phys_at(EP0_TR_OFF);
+        dma.write32(iep0 + 4, (3 << 1) | (4 << 3) | (max_packet << 16));
+        dma.write32(iep0 + 8, (ep0_tr as u32 & !0xF) | 1);
+        dma.write32(iep0 + 12, (ep0_tr >> 32) as u32);
+        dma.write32(iep0 + 16, 8);
+
+        // DCBAA[slot] = device context physical base.
+        dma.write64(DCBAA_OFF + slot as usize * 8, dma.phys_at(DEVICE_CTX_OFF));
+
+        // Address Device command (input context ptr, slot id).
+        let in_phys = dma.phys_at(INPUT_CTX_OFF);
+        let cmd_off = CMD_RING_OFF + cmd_idx * TRB_SIZE;
+        cmd_idx += 1;
+        let (comp, _) = match run_command(
+            &ctx,
+            &dma,
+            &mmio,
+            dboff,
+            ir0,
+            cmd_off,
+            in_phys as u32,
+            (in_phys >> 32) as u32,
+            0,
+            (TRB_ADDRESS_DEVICE << 10) | (slot << 24) | 1,
+            &mut ev_idx,
+            &mut ev_cycle,
+        ) {
+            Some(r) => r,
+            None => {
+                ctx.log("xhci: Address Device — no completion; next port");
+                continue 'ports;
+            }
+        };
+        if comp != 1 {
+            ctx.log_fmt(format_args!(
+                "xhci: Address Device failed (completion={}); next port",
+                comp
+            ));
+            continue 'ports;
+        }
+        ctx.log_fmt(format_args!(
+            "xhci: Address Device OK — device on port {} addressed (slot {})",
+            port, slot
+        ));
+
+        // --- Stage 3c: Get Device Descriptor over EP0 (control transfer) ---
+        // Three TRBs on the EP0 transfer ring: Setup (immediate GET_DESCRIPTOR),
+        // Data (IN, 18 bytes), Status (OUT, IOC). Then ring the slot's EP0 doorbell.
+        let data_phys = dma.phys_at(DATA_BUF_OFF);
+        dma.write32(EP0_TR_OFF, 0x80 | (6 << 8) | (0x0100 << 16)); // bmReqType|bRequest|wValue
+        dma.write32(EP0_TR_OFF + 4, 18 << 16); // wIndex=0 | wLength=18
+        dma.write32(EP0_TR_OFF + 8, 8); // setup data length
+        dma.write32(
+            EP0_TR_OFF + 12,
+            1 | (1 << 6) | (TRB_SETUP_STAGE << 10) | (3 << 16),
+        ); // cyc|IDT|type|TRT=IN
+        dma.write32(EP0_TR_OFF + 16, data_phys as u32);
+        dma.write32(EP0_TR_OFF + 20, (data_phys >> 32) as u32);
+        dma.write32(EP0_TR_OFF + 24, 18);
+        dma.write32(EP0_TR_OFF + 28, 1 | (TRB_DATA_STAGE << 10) | (1 << 16)); // cyc|type|DIR=IN
+        dma.write32(EP0_TR_OFF + 32, 0);
+        dma.write32(EP0_TR_OFF + 36, 0);
+        dma.write32(EP0_TR_OFF + 40, 0);
+        dma.write32(EP0_TR_OFF + 44, 1 | (1 << 5) | (TRB_STATUS_STAGE << 10)); // cyc|IOC|type
+        mmio.write32(dboff + slot as usize * 4, 1); // EP0 doorbell (DCI 1)
+
+        let mut ok = false;
+        for _ in 0..8 {
+            match next_event(&dma, &mmio, ir0, &mut ev_idx, &mut ev_cycle) {
+                Some((TRB_TRANSFER_EVENT, c, _)) => {
+                    ctx.log_fmt(format_args!("xhci: control transfer completion={}", c));
+                    ok = c == 1 || c == 13; // success or short-packet
+                    break;
+                }
+                Some((t, _, _)) => ctx.log_fmt(format_args!("xhci: (event type {})", t)),
+                None => break,
+            }
+        }
+        if !ok {
+            ctx.log("xhci: Get Device Descriptor failed; next port");
+            continue 'ports;
+        }
+        let d0 = dma.read32(DATA_BUF_OFF);
+        let ids = dma.read32(DATA_BUF_OFF + 8);
+        ctx.log_fmt(format_args!(
+            "xhci: DEVICE DESCRIPTOR bLength={} type={} VID={:#06x} PID={:#06x}",
+            d0 & 0xFF,
+            (d0 >> 8) & 0xFF,
+            ids & 0xFFFF,
+            (ids >> 16) & 0xFFFF
+        ));
+
+        // --- Stage 4a: Get Configuration Descriptor; find the interrupt-IN endpoint ---
+        let cfg_phys = dma.phys_at(CONFIG_BUF_OFF);
+        let tr = EP0_TR_OFF + 48; // next 3 TRBs on the EP0 transfer ring
+        dma.write32(tr, 0x80 | (6 << 8) | (0x0200 << 16)); // GET_DESCRIPTOR Config(2), idx 0
+        dma.write32(tr + 4, 64 << 16); // wIndex=0 | wLength=64
+        dma.write32(tr + 8, 8);
+        dma.write32(tr + 12, 1 | (1 << 6) | (TRB_SETUP_STAGE << 10) | (3 << 16));
+        dma.write32(tr + 16, cfg_phys as u32);
+        dma.write32(tr + 20, (cfg_phys >> 32) as u32);
+        dma.write32(tr + 24, 64);
+        dma.write32(tr + 28, 1 | (TRB_DATA_STAGE << 10) | (1 << 16));
+        dma.write32(tr + 32, 0);
+        dma.write32(tr + 36, 0);
+        dma.write32(tr + 40, 0);
+        dma.write32(tr + 44, 1 | (1 << 5) | (TRB_STATUS_STAGE << 10));
+        mmio.write32(dboff + slot as usize * 4, 1);
+        let mut cfg_ok = false;
+        for _ in 0..8 {
+            match next_event(&dma, &mmio, ir0, &mut ev_idx, &mut ev_cycle) {
+                Some((TRB_TRANSFER_EVENT, c, _)) => {
+                    cfg_ok = c == 1 || c == 13;
+                    break;
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        if !cfg_ok {
+            ctx.log("xhci: Get Config Descriptor failed; next port");
+            continue 'ports;
+        }
+
+        // Walk the descriptors: config (bConfigurationValue), interface (HID protocol),
+        // endpoint (the interrupt-IN endpoint we'll poll for key reports).
+        let total = ((dma.read32(CONFIG_BUF_OFF) >> 16) & 0xFFFF) as usize;
+        let mut i = 0usize;
+        ep_addr = 0;
+        ep_mps = 0;
+        ep_interval = 0;
+        cfg_val = 0;
+        let mut hid_proto = 0u8;
+        while i + 2 <= total && i < 200 {
+            let blen = dma.read8(CONFIG_BUF_OFF + i) as usize;
+            let dtype = dma.read8(CONFIG_BUF_OFF + i + 1);
+            if blen == 0 {
+                break;
+            }
+            match dtype {
+                2 => cfg_val = dma.read8(CONFIG_BUF_OFF + i + 5),
+                4 => hid_proto = dma.read8(CONFIG_BUF_OFF + i + 7),
+                5 => {
+                    let addr = dma.read8(CONFIG_BUF_OFF + i + 2);
+                    let attr = dma.read8(CONFIG_BUF_OFF + i + 3);
+                    if attr & 0x3 == 0x3 && addr & 0x80 != 0 {
+                        ep_addr = addr;
+                        ep_mps = dma.read16(CONFIG_BUF_OFF + i + 4);
+                        ep_interval = dma.read8(CONFIG_BUF_OFF + i + 6);
+                    }
+                }
+                _ => {}
+            }
+            i += blen;
+        }
+        if ep_addr != 0 {
+            // This device is a HID keyboard — bind to it and stop scanning.
+            ctx.log_fmt(format_args!(
+                "xhci: keyboard found on port {} (slot {}, proto={})",
+                port, slot, hid_proto
+            ));
+            found = true;
+            break 'ports;
+        }
+        ctx.log_fmt(format_args!(
+            "xhci: port {} device has no interrupt-IN endpoint (not a keyboard); next port",
+            port
+        ));
+    } // end 'ports — scan of every connected port
+
+    if !found {
+        ctx.log("xhci: no HID keyboard found on any port — idling");
         idle(&ctx);
     }
     let ep_num = (ep_addr & 0x0F) as u32;
     let dci = ep_num * 2 + 1;
     ctx.log_fmt(format_args!(
-        "xhci: HID int-IN endpoint {} (DCI {}) mps={} interval={} cfg_val={} proto={}",
-        ep_num, dci, ep_mps, ep_interval, cfg_val, hid_proto
+        "xhci: HID int-IN endpoint {} (DCI {}) mps={} interval={} cfg_val={}",
+        ep_num, dci, ep_mps, ep_interval, cfg_val
     ));
 
     // --- Stage 4b: Configure Endpoint (add the interrupt-IN endpoint) ---
+    let islot = INPUT_CTX_OFF + ctx_size; // Slot Context within the input context
     dma.write32(INPUT_CTX_OFF, 0); // Drop flags
     dma.write32(INPUT_CTX_OFF + 4, 1 | (1 << dci)); // Add: slot + interrupt endpoint
     dma.write32(islot, (dci << 27) | (speed << 20)); // Context Entries = dci
     dma.write32(islot + 4, port << 16);
     let iep = INPUT_CTX_OFF + (1 + dci as usize) * ctx_size;
     let int_tr = dma.phys_at(INT_TR_OFF);
-    let xhci_interval = if ep_interval > 1 { (ep_interval - 1) as u32 } else { 3 };
+    let xhci_interval = if ep_interval > 1 {
+        (ep_interval - 1) as u32
+    } else {
+        3
+    };
     dma.write32(iep, xhci_interval << 16); // Interval [23:16]
     dma.write32(iep + 4, (3 << 1) | (7 << 3) | ((ep_mps as u32) << 16)); // CErr|Int-IN(7)|mps
     dma.write32(iep + 8, (int_tr as u32 & !0xF) | 1); // TR Dequeue | DCS
     dma.write32(iep + 12, (int_tr >> 32) as u32);
     dma.write32(iep + 16, ep_mps as u32 | ((ep_mps as u32) << 16)); // Avg TRB | Max ESIT
-    cmd_idx += 1;
+    // Command ring must stay contiguous (no gaps): use cmd_idx, then advance.
     let cmd_off = CMD_RING_OFF + cmd_idx * TRB_SIZE;
+    cmd_idx += 1;
     let in_phys = dma.phys_at(INPUT_CTX_OFF);
     let ce = run_command(
-        &ctx, &dma, &mmio, dboff, ir0, cmd_off,
-        in_phys as u32, (in_phys >> 32) as u32, 0,
+        &ctx,
+        &dma,
+        &mmio,
+        dboff,
+        ir0,
+        cmd_off,
+        in_phys as u32,
+        (in_phys >> 32) as u32,
+        0,
         (TRB_CONFIGURE_ENDPOINT << 10) | (slot << 24) | 1,
-        &mut ev_idx, &mut ev_cycle,
+        &mut ev_idx,
+        &mut ev_cycle,
     )
     .map(|(c, _)| c)
     .unwrap_or(0);
     ctx.log_fmt(format_args!("xhci: Configure Endpoint completion={}", ce));
 
     // Set Configuration, then Set Protocol (boot) on EP0.
-    if control(&dma, &mmio, dboff, ir0, slot, 96, &mut ev_idx, &mut ev_cycle,
-        0x00, 9, cfg_val as u32, 0, 0, 0)
-    {
+    if control(
+        &dma,
+        &mmio,
+        dboff,
+        ir0,
+        slot,
+        96,
+        &mut ev_idx,
+        &mut ev_cycle,
+        0x00,
+        9,
+        cfg_val as u32,
+        0,
+        0,
+        0,
+    ) {
         ctx.log("xhci: Set Configuration OK");
     } else {
         ctx.log("xhci: Set Configuration failed");
     }
-    let _ = control(&dma, &mmio, dboff, ir0, slot, 128, &mut ev_idx, &mut ev_cycle,
-        0x21, 0x0B, 0, 0, 0, 0); // SET_PROTOCOL: boot (wValue=0, interface 0)
+    let _ = control(
+        &dma,
+        &mmio,
+        dboff,
+        ir0,
+        slot,
+        128,
+        &mut ev_idx,
+        &mut ev_cycle,
+        0x21,
+        0x0B,
+        0,
+        0,
+        0,
+        0,
+    ); // SET_PROTOCOL: boot (wValue=0, interface 0)
 
     // --- Stage 4c: poll the interrupt endpoint for HID key reports ---
     let report_phys = dma.phys_at(REPORT_OFF);
@@ -617,7 +725,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         {
             let mods = dma.read8(REPORT_OFF);
             let key = dma.read8(REPORT_OFF + 2); // first keycode in the boot report
-            // Only act on a NEW press (key changed) so a held key doesn't spam.
+                                                 // Only act on a NEW press (key changed) so a held key doesn't spam.
             if key != 0 && key != last_key {
                 if let Some(ch) = hid_to_ascii(key, mods) {
                     ctx.console_push(ch); // → console input ring → the shell's gs>
