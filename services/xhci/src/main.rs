@@ -50,6 +50,31 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         ctx.log("xhci: WARNING — implausible capability registers (mapping?)");
     }
 
+    // Stage 2b: verify the DMA arena — write sentinels, read them back, and
+    // report the physical base the controller will be programmed with.
+    match ctx.dma_region() {
+        Some(dma) => {
+            dma.zero();
+            dma.write32(0, 0xCAFE_F00D);
+            dma.write64(8, 0x1122_3344_5566_7788);
+            let r0 = dma.read32(0);
+            let r1 = dma.read64(8);
+            ctx.log_fmt(format_args!(
+                "xhci: DMA arena phys={:#x} len={} bytes; readback {:#010x} {:#018x}",
+                dma.phys_base(),
+                dma.len(),
+                r0,
+                r1
+            ));
+            if r0 == 0xCAFE_F00D && r1 == 0x1122_3344_5566_7788 {
+                ctx.log("xhci: DMA arena verified — writable + readable, phys known");
+            } else {
+                ctx.log("xhci: WARNING — DMA readback mismatch");
+            }
+        }
+        None => ctx.log("xhci: no DMA arena granted"),
+    }
+
     loop {
         ctx.yield_cpu();
     }

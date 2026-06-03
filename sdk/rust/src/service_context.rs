@@ -37,6 +37,9 @@ struct ServiceContextData {
     probe_mode:         u32,
     console_read_slot:  u32, // u32::MAX = not present
     xhci_mmio_va:       u64, // 0 = not mapped; else VA of the mapped xHCI BAR
+    xhci_dma_va:        u64, // 0 = none; else VA of the driver's DMA arena
+    xhci_dma_phys:      u64, // physical base of the DMA arena
+    xhci_dma_len:       u64, // length of the DMA arena in bytes
     send_peers:         [SendPeerEntry; MAX_SEND_PEERS],
 }
 
@@ -512,6 +515,23 @@ impl ServiceContext {
             None
         } else {
             Some(crate::mmio::Mmio::new(va as *mut u8))
+        }
+    }
+
+    /// Safe handle to this service's DMA arena, if one was granted (§12). The
+    /// kernel mapped a physically-contiguous region into this driver; the
+    /// returned [`crate::Dma`] gives the CPU view (read/write) and the physical
+    /// base to program into the controller. `None` for non-driver services.
+    pub fn dma_region(&self) -> Option<crate::dma::Dma> {
+        let d = Self::ctx();
+        if d.xhci_dma_va == 0 {
+            None
+        } else {
+            Some(crate::dma::Dma::new(
+                d.xhci_dma_va as *mut u8,
+                d.xhci_dma_phys,
+                d.xhci_dma_len as usize,
+            ))
         }
     }
 

@@ -146,6 +146,47 @@ impl BitmapAllocator {
         Some(unsafe { Frame::from_phys(phys) })
     }
 
+    /// Allocate `n` physically-contiguous frames; return the phys address of the
+    /// first. Scans the bitmap for a run of `n` consecutive free bits. Used for
+    /// driver DMA arenas (§12). Kernel-image frames are never free in the
+    /// bitmap, so a free run can never straddle them.
+    ///
+    /// SAFETY: caller must hold ALLOC_LOCKED.
+    unsafe fn alloc_contiguous(&mut self, n: usize) -> Option<u64> {
+        if n == 0 {
+            return None;
+        }
+        // SAFETY: exclusive access guaranteed by the lock.
+        let bitmap = unsafe { &mut *core::ptr::addr_of_mut!(BITMAP) };
+        let max = (self.max_valid_frame + 1).min(MAX_FRAMES);
+        let mut run = 0usize;
+        let mut start = 0usize;
+        let mut found = None;
+        let mut idx = 0usize;
+        while idx < max {
+            let free = (bitmap[idx / 8] >> (idx % 8)) & 1 != 0;
+            if free {
+                if run == 0 {
+                    start = idx;
+                }
+                run += 1;
+                if run == n {
+                    found = Some(start);
+                    break;
+                }
+            } else {
+                run = 0;
+            }
+            idx += 1;
+        }
+        let start = found?;
+        for i in start..start + n {
+            bitmap[i / 8] &= !(1u8 << (i % 8));
+        }
+        self.free_frames -= n;
+        Some(start as u64 * FRAME_SIZE)
+    }
+
     // SAFETY: caller must hold ALLOC_LOCKED and have exclusive ownership of `frame`.
     unsafe fn free(&mut self, frame: Frame) {
         let idx = frame.frame_number() as usize;
@@ -258,6 +299,20 @@ pub fn alloc_frame() -> Option<Frame> {
     let frame = unsafe { (*core::ptr::addr_of_mut!(ALLOCATOR)).alloc() };
     alloc_unlock();
     frame
+}
+
+/// Allocate `n` physically-contiguous, page-aligned frames; return the physical
+/// address of the first, or `None` if no run that long is free. For driver DMA
+/// arenas (§12) where the device DMAs into contiguous memory. The frames are not
+/// returned as individual `Frame`s — the driver-spawn path maps them into the
+/// driver's address space and they live for the driver's lifetime (v1: trusted
+/// drivers are effectively permanent; reclaim-on-restart is future work).
+pub fn alloc_contiguous(n: usize) -> Option<u64> {
+    alloc_lock();
+    // SAFETY: lock held; single writer across all cores.
+    let phys = unsafe { (*core::ptr::addr_of_mut!(ALLOCATOR)).alloc_contiguous(n) };
+    alloc_unlock();
+    phys
 }
 
 /// Return a frame to the allocator.
