@@ -288,6 +288,39 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     spin(|| mmio.read32(op + OP_USBSTS) & STS_HCH == 0);
     ctx.log("xhci: controller running");
 
+    // DIAGNOSTIC: dump the Supported Protocol extended caps (which ports are USB2
+    // vs USB3) and every powered/connected port's PORTSC, to map the controller's
+    // USB topology. HCCPARAMS1[31:16] = xECP (extended-cap pointer, in dwords).
+    let xecp = (mmio.read32(CAP_HCCPARAMS1) >> 16) & 0xFFFF;
+    if xecp != 0 {
+        let mut cap = (xecp as usize) * 4;
+        for _ in 0..32 {
+            let d0 = mmio.read32(cap);
+            let id = d0 & 0xFF;
+            let next = (d0 >> 8) & 0xFF;
+            if id == 2 {
+                let major = (d0 >> 24) & 0xFF;
+                let d2 = mmio.read32(cap + 8);
+                let poff = d2 & 0xFF;
+                let pcnt = (d2 >> 8) & 0xFF;
+                ctx.log_fmt(format_args!(
+                    "xhci: proto USB{}.x ports {}..{}",
+                    major, poff, poff + pcnt - 1
+                ));
+            }
+            if next == 0 {
+                break;
+            }
+            cap += (next as usize) * 4;
+        }
+    }
+    for p in 1..=max_ports {
+        let psc = mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10);
+        if psc & 0x1 != 0 || psc & 0x200 != 0 {
+            ctx.log_fmt(format_args!("xhci: port {} PORTSC={:#010x}", p, psc));
+        }
+    }
+
     // Find a connected port.
     let mut port = 0u32;
     for p in 1..=max_ports {
@@ -303,10 +336,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     }
     let portsc_off = op + OP_PORTSC_BASE + (port as usize - 1) * 0x10;
 
-    // Reset the port: set PR (preserving non-change bits), wait for enable.
+    // Enable the port. USB3 (SuperSpeed) ports auto-train and are already enabled
+    // (PED=1) on their own — issuing the USB2 port-reset (PR) bit *disables* them
+    // (PORTSC speed→0, link→Disabled). So only reset a not-yet-enabled (USB2)
+    // port; a port that is already enabled is used as-is.
     let psc = mmio.read32(portsc_off);
-    mmio.write32(portsc_off, (psc & !PORT_RW1C) | PORT_PR);
-    spin(|| mmio.read32(portsc_off) & PORT_PED != 0);
+    if psc & PORT_PED == 0 {
+        mmio.write32(portsc_off, (psc & !PORT_RW1C) | PORT_PR);
+        spin(|| mmio.read32(portsc_off) & PORT_PED != 0);
+    }
     let psc = mmio.read32(portsc_off);
     let speed = (psc >> 10) & 0xF;
     let max_packet: u32 = match speed {
@@ -315,7 +353,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         _ => 64,  // full / high-speed
     };
     ctx.log_fmt(format_args!(
-        "xhci: port {} reset; PORTSC={:#010x} speed={} max_packet={}",
+        "xhci: port {} ready; PORTSC={:#010x} speed={} max_packet={}",
         port, psc, speed, max_packet
     ));
 
