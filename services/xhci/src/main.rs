@@ -46,17 +46,22 @@ const EP0_TR_OFF: usize = 0x8000;
 const EVENT_RING_TRBS: usize = 16;
 const TRB_SIZE: usize = 16;
 
+const TRB_NORMAL: u32 = 1;
 const TRB_SETUP_STAGE: u32 = 2;
 const TRB_DATA_STAGE: u32 = 3;
 const TRB_STATUS_STAGE: u32 = 4;
+const TRB_LINK: u32 = 6;
 const TRB_ENABLE_SLOT: u32 = 9;
 const TRB_ADDRESS_DEVICE: u32 = 11;
+const TRB_CONFIGURE_ENDPOINT: u32 = 12;
 const TRB_TRANSFER_EVENT: u32 = 32;
 const TRB_CMD_COMPLETION: u32 = 33;
 const TRB_PORT_STATUS_CHANGE: u32 = 34;
 
 const DATA_BUF_OFF: usize = 0x9000; // control-transfer data buffer (page 9)
 const CONFIG_BUF_OFF: usize = 0xA000; // config-descriptor buffer (page 10)
+const INT_TR_OFF: usize = 0xB000; // interrupt-endpoint transfer ring (page 11)
+const REPORT_OFF: usize = 0xC000; // HID report buffer (page 12)
 
 fn spin<F: Fn() -> bool>(cond: F) {
     let mut n = 0u32;
@@ -137,6 +142,87 @@ fn run_command(
         }
     }
     None
+}
+
+/// Issue a control transfer on EP0 at `ep0_off` in the EP0 transfer ring
+/// (Setup, optional IN Data, Status). `wlen == 0` means a no-data transfer.
+/// Returns true on success/short-packet completion.
+#[allow(clippy::too_many_arguments)]
+fn control(
+    dma: &Dma,
+    mmio: &Mmio,
+    dboff: usize,
+    ir0: usize,
+    slot: u32,
+    ep0_off: usize,
+    ev_idx: &mut usize,
+    ev_cycle: &mut u32,
+    bmreq: u32,
+    breq: u32,
+    wval: u32,
+    widx: u32,
+    wlen: u32,
+    data_off: usize,
+) -> bool {
+    let tr = EP0_TR_OFF + ep0_off;
+    dma.write32(tr, bmreq | (breq << 8) | (wval << 16));
+    dma.write32(tr + 4, widx | (wlen << 16));
+    dma.write32(tr + 8, 8);
+    let trt = if wlen > 0 { 3 } else { 0 }; // 3 = IN data stage, 0 = no data
+    dma.write32(tr + 12, 1 | (1 << 6) | (TRB_SETUP_STAGE << 10) | (trt << 16));
+    let mut off = tr + 16;
+    if wlen > 0 {
+        let dp = dma.phys_at(data_off);
+        dma.write32(off, dp as u32);
+        dma.write32(off + 4, (dp >> 32) as u32);
+        dma.write32(off + 8, wlen);
+        dma.write32(off + 12, 1 | (TRB_DATA_STAGE << 10) | (1 << 16)); // DIR=IN
+        off += 16;
+    }
+    let sdir = if wlen > 0 { 0 } else { 1 }; // status dir opposite of data; no-data → IN
+    dma.write32(off, 0);
+    dma.write32(off + 4, 0);
+    dma.write32(off + 8, 0);
+    dma.write32(off + 12, 1 | (1 << 5) | (TRB_STATUS_STAGE << 10) | (sdir << 16));
+    mmio.write32(dboff + slot as usize * 4, 1);
+    for _ in 0..8 {
+        match next_event(dma, mmio, ir0, ev_idx, ev_cycle) {
+            Some((TRB_TRANSFER_EVENT, c, _)) => return c == 1 || c == 13,
+            Some(_) => {}
+            None => return false,
+        }
+    }
+    false
+}
+
+/// Decode a HID boot-keyboard usage code to ASCII (US layout, common keys).
+fn hid_to_ascii(key: u8, mods: u8) -> Option<u8> {
+    let shift = mods & 0x22 != 0; // left or right Shift
+    match key {
+        0x04..=0x1D => {
+            let base = b'a' + (key - 0x04);
+            Some(if shift { base - 32 } else { base })
+        }
+        0x1E..=0x26 => {
+            if shift {
+                Some([b'!', b'@', b'#', b'$', b'%', b'^', b'&', b'*', b'('][(key - 0x1E) as usize])
+            } else {
+                Some(b'1' + (key - 0x1E))
+            }
+        }
+        0x27 => Some(if shift { b')' } else { b'0' }),
+        0x28 => Some(b'\n'), // Enter
+        0x2A => Some(0x08),  // Backspace
+        0x2B => Some(b'\t'), // Tab
+        0x2C => Some(b' '),  // Space
+        0x2D => Some(if shift { b'_' } else { b'-' }),
+        0x2E => Some(if shift { b'+' } else { b'=' }),
+        0x33 => Some(if shift { b':' } else { b';' }),
+        0x36 => Some(if shift { b'<' } else { b',' }),
+        0x37 => Some(if shift { b'>' } else { b'.' }),
+        0x38 => Some(if shift { b'?' } else { b'/' }),
+        _ => None,
+    }
 }
 
 #[no_mangle]
@@ -410,16 +496,96 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         }
         i += blen;
     }
-    if ep_addr != 0 {
-        let ep_num = (ep_addr & 0x0F) as u32;
-        let dci = ep_num * 2 + 1; // interrupt-IN endpoint
-        ctx.log_fmt(format_args!(
-            "xhci: HID int-IN endpoint {} (DCI {}) mps={} interval={} cfg_val={} proto={}",
-            ep_num, dci, ep_mps, ep_interval, cfg_val, hid_proto
-        ));
-    } else {
-        ctx.log("xhci: no interrupt-IN endpoint found");
+    if ep_addr == 0 {
+        ctx.log("xhci: no interrupt-IN endpoint found — idling");
+        idle(&ctx);
     }
+    let ep_num = (ep_addr & 0x0F) as u32;
+    let dci = ep_num * 2 + 1;
+    ctx.log_fmt(format_args!(
+        "xhci: HID int-IN endpoint {} (DCI {}) mps={} interval={} cfg_val={} proto={}",
+        ep_num, dci, ep_mps, ep_interval, cfg_val, hid_proto
+    ));
 
-    idle(&ctx);
+    // --- Stage 4b: Configure Endpoint (add the interrupt-IN endpoint) ---
+    dma.write32(INPUT_CTX_OFF, 0); // Drop flags
+    dma.write32(INPUT_CTX_OFF + 4, 1 | (1 << dci)); // Add: slot + interrupt endpoint
+    dma.write32(islot, (dci << 27) | (speed << 20)); // Context Entries = dci
+    dma.write32(islot + 4, port << 16);
+    let iep = INPUT_CTX_OFF + (1 + dci as usize) * ctx_size;
+    let int_tr = dma.phys_at(INT_TR_OFF);
+    let xhci_interval = if ep_interval > 1 { (ep_interval - 1) as u32 } else { 3 };
+    dma.write32(iep, xhci_interval << 16); // Interval [23:16]
+    dma.write32(iep + 4, (3 << 1) | (7 << 3) | ((ep_mps as u32) << 16)); // CErr|Int-IN(7)|mps
+    dma.write32(iep + 8, (int_tr as u32 & !0xF) | 1); // TR Dequeue | DCS
+    dma.write32(iep + 12, (int_tr >> 32) as u32);
+    dma.write32(iep + 16, ep_mps as u32 | ((ep_mps as u32) << 16)); // Avg TRB | Max ESIT
+    cmd_idx += 1;
+    let cmd_off = CMD_RING_OFF + cmd_idx * TRB_SIZE;
+    let in_phys = dma.phys_at(INPUT_CTX_OFF);
+    let ce = run_command(
+        &ctx, &dma, &mmio, dboff, ir0, cmd_off,
+        in_phys as u32, (in_phys >> 32) as u32, 0,
+        (TRB_CONFIGURE_ENDPOINT << 10) | (slot << 24) | 1,
+        &mut ev_idx, &mut ev_cycle,
+    )
+    .map(|(c, _)| c)
+    .unwrap_or(0);
+    ctx.log_fmt(format_args!("xhci: Configure Endpoint completion={}", ce));
+
+    // Set Configuration, then Set Protocol (boot) on EP0.
+    if control(&dma, &mmio, dboff, ir0, slot, 96, &mut ev_idx, &mut ev_cycle,
+        0x00, 9, cfg_val as u32, 0, 0, 0)
+    {
+        ctx.log("xhci: Set Configuration OK");
+    } else {
+        ctx.log("xhci: Set Configuration failed");
+    }
+    let _ = control(&dma, &mmio, dboff, ir0, slot, 128, &mut ev_idx, &mut ev_cycle,
+        0x21, 0x0B, 0, 0, 0, 0); // SET_PROTOCOL: boot (wValue=0, interface 0)
+
+    // --- Stage 4c: poll the interrupt endpoint for HID key reports ---
+    let report_phys = dma.phys_at(REPORT_OFF);
+    let ring_phys = dma.phys_at(INT_TR_OFF);
+    let link = INT_TR_OFF + 15 * 16; // Link TRB closes the 16-entry ring
+    dma.write32(link, ring_phys as u32);
+    dma.write32(link + 4, (ring_phys >> 32) as u32);
+    dma.write32(link + 8, 0);
+    dma.write32(link + 12, (TRB_LINK << 10) | (1 << 1) | 1); // Link | Toggle Cycle | cycle
+
+    ctx.log("xhci: keyboard ready — press keys");
+    let mut int_idx = 0usize;
+    let mut int_cycle = 1u32;
+    let mut need_queue = true;
+    loop {
+        if need_queue {
+            let t = INT_TR_OFF + int_idx * 16;
+            dma.write32(t, report_phys as u32);
+            dma.write32(t + 4, (report_phys >> 32) as u32);
+            dma.write32(t + 8, 8);
+            dma.write32(t + 12, int_cycle | (1 << 5) | (TRB_NORMAL << 10)); // cycle|IOC|Normal
+            int_idx += 1;
+            if int_idx == 15 {
+                dma.write32(link + 12, (TRB_LINK << 10) | (1 << 1) | int_cycle);
+                int_idx = 0;
+                int_cycle ^= 1;
+            }
+            mmio.write32(dboff + slot as usize * 4, dci); // ring the endpoint doorbell
+            need_queue = false;
+        }
+        if let Some((TRB_TRANSFER_EVENT, _, _)) =
+            next_event(&dma, &mmio, ir0, &mut ev_idx, &mut ev_cycle)
+        {
+            let mods = dma.read8(REPORT_OFF);
+            let key = dma.read8(REPORT_OFF + 2); // first keycode in the boot report
+            if key != 0 {
+                match hid_to_ascii(key, mods) {
+                    Some(ch) => ctx.log_fmt(format_args!("xhci: KEY '{}'", ch as char)),
+                    None => ctx.log_fmt(format_args!("xhci: keycode {:#04x}", key)),
+                }
+            }
+            need_queue = true;
+        }
+        ctx.yield_cpu();
+    }
 }
