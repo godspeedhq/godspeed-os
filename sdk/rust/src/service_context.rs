@@ -625,6 +625,25 @@ impl ServiceContext {
         }
     }
 
+    /// Write a string to the console WITHOUT a trailing newline (syscall 22,
+    /// requires log_write cap). For inline output such as the shell prompt, where
+    /// `log`'s newline would push the user's typed echo to the next line.
+    pub fn print(&self, msg: &str) {
+        let data = Self::ctx();
+        if data.magic != SERVICE_CTX_MAGIC { return; }
+        let slot = data.log_write_slot;
+        if slot == u32::MAX { return; }
+
+        let bytes = msg.as_bytes();
+        let len   = bytes.len();
+        if len == 0 || len > 256 { return; }
+
+        // SAFETY: syscall(22) = Print; bytes is a valid slice within user space.
+        unsafe {
+            raw_syscall(22, slot as u64, bytes.as_ptr() as u64, len as u64);
+        }
+    }
+
     /// Log a formatted message.
     pub fn log_fmt(&self, args: core::fmt::Arguments) {
         let mut buf    = [0u8; 256];

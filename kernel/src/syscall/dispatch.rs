@@ -40,6 +40,7 @@ pub enum SyscallNumber {
     SpawnPipe      = 19,
     ConsolePush    = 20,
     Park           = 21,
+    Print          = 22,
 }
 
 /// Raw syscall dispatcher — called from the SYSCALL/SYSENTER IDT stub.
@@ -81,6 +82,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::SpawnPipe     as u64 => handle_spawn_pipe(arg0, arg1, arg2),
         n if n == SyscallNumber::ConsolePush   as u64 => handle_console_push(arg0, arg1),
         n if n == SyscallNumber::Park          as u64 => scheduler::park_current(),
+        n if n == SyscallNumber::Print         as u64 => handle_print(arg0, arg1, arg2),
         _ => -1, // Unknown syscall.
     }
 }
@@ -114,6 +116,35 @@ fn handle_log(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     };
     match core::str::from_utf8(bytes) {
         Ok(s) => { crate::kprintln!("{}", s); 0 }
+        Err(_) => -1,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: Print (22) — like Log but WITHOUT a trailing newline.
+// ---------------------------------------------------------------------------
+
+/// arg0 = cap_slot, arg1 = pointer to UTF-8 bytes, arg2 = byte length.
+///
+/// Requires `Rights::WRITE` on `LOG_WRITE_RESOURCE`. For inline console output
+/// such as the shell prompt (`gs> `), where a newline would push typed input to
+/// the next line.
+fn handle_print(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
+    let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::WRITE) {
+        Ok(c) => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    if cap.resource_id != crate::capability::LOG_WRITE_RESOURCE {
+        return cap_err_to_i64(CapError::CapWrongScope);
+    }
+    let len = msg_len as usize;
+    if len == 0 || len > 256 { return -1; }
+    let bytes = match read_user_bytes(msg_ptr, len) {
+        Some(b) => b,
+        None    => return -1,
+    };
+    match core::str::from_utf8(bytes) {
+        Ok(s) => { crate::kprint!("{}", s); 0 }
         Err(_) => -1,
     }
 }

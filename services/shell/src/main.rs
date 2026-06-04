@@ -36,7 +36,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     execute(&ctx, &line_buf[..line_len]);
                     line_len = 0;
                 }
-                ctx.log("gs>");
+                ctx.print("gs> ");
             }
             0x7f | 0x08 => {
                 // backspace — remove last byte
@@ -46,7 +46,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // Ctrl-C — clear line
                 ctx.log("^C");
                 line_len = 0;
-                ctx.log("gs>");
+                ctx.print("gs> ");
             }
             b if b >= 0x20 && b < 0x7f => {
                 if line_len < MAX_LINE {
