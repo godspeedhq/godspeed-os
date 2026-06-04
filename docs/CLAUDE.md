@@ -12,6 +12,7 @@ Narrative documentation. These files explain design decisions in prose; they do 
 | `restart.md`        | Service restart flow: cap rebinding, core reassignment, client recovery pattern |
 | `smp.md`            | SMP design: per-core run queues, IPI vectors, TLB shootdown protocol, placement algorithm |
 | `unsafe-audit.md`   | Complete inventory of every `unsafe` block in the kernel (§18.4) |
+| `introspection-capability.md` | Design note: gating `InspectKernel`/`TaskStat` behind the `INTROSPECT` cap (§3.1) — closes the ambient-introspection exception |
 | `cluster-design.md` | Cluster mode design notes (non-normative, far-future; expands Appendix C.4 of `CLAUDE.md`) |
 
 ## `unsafe-audit.md` is special

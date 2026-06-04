@@ -222,11 +222,13 @@ least-authority requirement is real today, not hypothetical.
 live view — a console-ownership/input handoff for the `q` keypress) and a
 spawn-per-invocation (~ms, fine — performance is third, §20).
 
-**To verify before build:** `observe`'s contract should declare an *explicit*
-introspection capability. If the `inspect_*` syscalls are currently ungated
-(ambient), the authority-separation argument still holds (observe never holds the
-shell's mutate caps), but making introspection a declared cap is the more-in-spirit
-refinement and should be checked.
+**Introspection capability (resolved 2026-06-03).** Introspection is now gated by
+`INTROSPECT_RESOURCE` (READ): `TaskStat` and the system-state `InspectKernel`
+queries require it; self-state and the TSC stay ambient. `observe` is granted the
+cap at spawn (name-gated, like `shell`), so its least-authority story is now
+literal — it holds the introspection cap plus a console cap, never the shell's
+`spawn`/`kill`/`restart`. Done on branch `feat/introspect-cap`; see
+`docs/introspection-capability.md`.
 
 ---
 
@@ -260,8 +262,7 @@ shell brokers the spawn; the kernel mints these caps from the contract at spawn 
 
 ## 10. Open questions
 
-1. §7 — built-in vs standalone service for the canonical `observe`.
-2. Live-view refresh cadence: fixed 1 s, or `observe <interval>` to tune it later?
+1. Live-view refresh cadence: fixed 1 s, or `observe <interval>` to tune it later?
    (Deferred — `now` vs bare covers the static/live split; interval tuning is a
    possible future addition, not v1.)
 

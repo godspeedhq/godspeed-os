@@ -19,6 +19,17 @@ If you are adding a syscall:
 3. The first thing `handle_<name>` does is validate the capability.
 4. There are no exceptions to this rule.
 
+**Two validation forms.** Most syscalls take a `cap_slot` argument and validate
+with `CapTable::get(slot, right)`. A handful of *read* syscalls — the
+introspection ones (`InspectKernel` 13 system queries, `TaskStat` 16) — consume
+all three ABI argument registers for the query and have no slot to pass. They
+instead validate by **holdings**: `scheduler::current_task_holds_resource(rid,
+right)` confirms the calling task holds the gating resource. This still satisfies
+§3.1 (a capability is validated before the privileged read); only the calling
+convention differs. `holds_resource` is for **stable** resources only (gen 0
+forever) — see `docs/introspection-capability.md` and the note on its definition
+in `capability/table.rs`.
+
 ## Syscall table (v1)
 
 | Number | Name        | Required cap right             |
@@ -29,6 +40,8 @@ If you are adding a syscall:
 | 4      | `yield`     | none                           |
 | 5      | `log`       | log_write cap                  |
 | 6      | `alloc_mem` | implicit (own task memory)     |
+| 13     | `inspect_kernel` | INTROSPECT (READ) for system queries 1,2,4,5,6,7,8; **none** for query 0 (own alloc) and 3 (TSC) |
+| 16     | `task_stat` | INTROSPECT (READ) — discloses any task's state |
 
 ## Safety
 

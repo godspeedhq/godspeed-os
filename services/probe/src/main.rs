@@ -173,6 +173,9 @@ const MODE_CHAOS_BC7:       u32 = 159; // 15 cross-core kill/respawn cycles (bru
 // Interrupt-routing test modes — Post-v1 item 9 (§12.2, §12.3).
 const MODE_IRQ_RECV:        u32 = 160; // IR1A: recv interrupt event; log pass
 
+// Introspection-gate adversarial mode (§3.1; docs/introspection-capability.md).
+const MODE_ADV_A11:         u32 = 161; // gated query denied without INTROSPECT cap
+
 // Brutal property test modes — Milestone 16.
 const MODE_PROP_BP1:        u32 = 104; // BP1: cap unforgeability — 100k iterations
 const MODE_PROP_BP2:        u32 = 105; // BP2: generation monotonic — 20 kill/respawn cycles
@@ -310,6 +313,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         MODE_ADV_A8_WITNESS  => mode_adv_a8_witness(&ctx),
         MODE_ADV_A9          => mode_adv_a9(&ctx),
         MODE_ADV_A10         => mode_adv_a10(&ctx),
+        MODE_ADV_A11         => mode_adv_a11(&ctx),
         MODE_CHAOS_C2        => mode_chaos_c2(&ctx),
         MODE_CHAOS_C2_MON    => mode_chaos_c2_monitor(&ctx),
         MODE_CHAOS_C3        => mode_chaos_c3(&ctx),
@@ -1772,6 +1776,30 @@ fn mode_adv_a10(ctx: &ServiceContext) -> ! {
         }
     }
     ctx.log("adv: A10 pass — kernel addrs as syscall args rejected without panic");
+    idle(ctx)
+}
+
+fn mode_adv_a11(ctx: &ServiceContext) -> ! {
+    // A11 — Introspection is gated by the INTROSPECT capability (§3.1;
+    // docs/introspection-capability.md). adv-a11 holds NO introspect cap (its name
+    // matches no grant), so a gated query must be DENIED and an ambient one must work.
+    //
+    // TaskStat(slot 0) targets init — a TCB task that is always alive. Without the
+    // cap the kernel returns CapNotHeld, which the SDK coerces to valid:false. So a
+    // *live* slot reading back invalid is the proof we were denied (with the cap it
+    // would read back valid:true). A valid:true here would mean the gate is open.
+    let stat = ctx.task_stat(0);
+    if stat.valid {
+        ctx.log("adv: A11 FAIL — TaskStat(0) succeeded without INTROSPECT cap (gate open)");
+        idle(ctx);
+    }
+    // Ambient queries stay open with no cap: the TSC clock (InspectKernel 3) must
+    // still return a nonzero value.
+    if ctx.read_tsc() == 0 {
+        ctx.log("adv: A11 FAIL — ambient TSC query (InspectKernel 3) returned 0");
+        idle(ctx);
+    }
+    ctx.log("adv: A11 pass — gated introspection denied without cap; ambient queries open");
     idle(ctx)
 }
 

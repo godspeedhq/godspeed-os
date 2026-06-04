@@ -568,6 +568,15 @@ static ADV_TESTS: &[TestSpec] = &[
             timeout_secs: 30,
         },
     },
+    TestSpec {
+        id: "A11", name: "introspection_denied_without_cap",
+        spec_ref: "§3.1; docs/introspection-capability.md",
+        kind: TestKind::WatchSerial {
+            expect:       &["adv: A11 pass"],
+            fail_on:      &["KERNEL PANIC", "adv: A11 FAIL"],
+            timeout_secs: 30,
+        },
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -1635,7 +1644,11 @@ pub fn run_adv_tests() {
     kill_existing_qemu();
 
     println!("adv: building...");
-    crate::cmd_build();
+    // Build the LEAN adv-only supervisor (11 self-contained probes), not the full
+    // ~180-probe set. The full boot takes 18–120 s under TCG, far past the 30 s
+    // per-test timeout, so every adv test would time out before `supervisor: ready`.
+    // (Mirrors run_identity_tests → cmd_build_identity.)
+    crate::cmd_build_adv();
 
     let kernel_elf = Path::new("target/x86_64-unknown-none/release/kernel");
     if !kernel_elf.exists() {
