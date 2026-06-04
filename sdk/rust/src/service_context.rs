@@ -597,6 +597,17 @@ impl ServiceContext {
         unsafe { raw_syscall(4, 0, 0, 0); }
     }
 
+    /// Park this task forever: block with no waker. For idle services that have
+    /// no further work (init, supervisor) — far better than `loop { yield_cpu() }`,
+    /// which keeps the core busy and prevents it from halting (so it never runs
+    /// cool). Nothing wakes a parked task in v1; the loop re-parks defensively.
+    pub fn park(&self) -> ! {
+        loop {
+            // SAFETY: syscall(21) = Park; blocks this task indefinitely.
+            unsafe { raw_syscall(21, 0, 0, 0); }
+        }
+    }
+
     /// Log a string via the kernel ring buffer (syscall 5, requires log_write cap).
     pub fn log(&self, msg: &str) {
         let data = Self::ctx();

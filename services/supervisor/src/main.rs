@@ -109,9 +109,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     ctx.log("supervisor: ready");
 
-    loop {
-        ctx.yield_cpu();
-    }
+    // Park (block forever) instead of busy-yielding so core 0 can halt and run
+    // cool. In v1 the supervisor has no further work: restart/kill commands are
+    // driven from the COM2 control channel in the timer ISR (control::
+    // process_pending), not from this task. The Phase-6 death-notification loop
+    // will replace this with a blocking recv on a notification endpoint.
+    ctx.park();
 }
 
 // ---------------------------------------------------------------------------

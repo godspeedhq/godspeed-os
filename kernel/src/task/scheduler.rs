@@ -1385,6 +1385,16 @@ pub fn kill_task_by_slot(slot: usize) {
 /// The caller must have already recorded the blocking reason in the routing
 /// table (under its spinlock) *before* calling this function. The routing
 /// spinlock must be released *before* this call.
+/// Park the current task: block it indefinitely with no waker. Used by idle
+/// trusted-root services (init, supervisor) once their work is done — they must
+/// not busy-`yield`, which keeps their core off the idle (halt) path and pegs it
+/// at 100%. Parking lets the core reach the scheduler idle loop and halt (cool)
+/// where ARAT/TSC-Deadline allow it. Reuses block_and_reschedule; nothing wakes a
+/// parked task in v1 (the supervisor's death-notification loop is future work).
+pub fn park_current() -> i64 {
+    block_and_reschedule(TaskState::BlockedOnRecv)
+}
+
 pub fn block_and_reschedule(state: TaskState) -> i64 {
     // SAFETY: IF=0 (caller ensures this; double-cli is a no-op).
     unsafe {

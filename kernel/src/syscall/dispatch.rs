@@ -39,6 +39,7 @@ pub enum SyscallNumber {
     Reboot         = 18,
     SpawnPipe      = 19,
     ConsolePush    = 20,
+    Park           = 21,
 }
 
 /// Raw syscall dispatcher — called from the SYSCALL/SYSENTER IDT stub.
@@ -79,6 +80,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::Reboot        as u64 => handle_reboot(),
         n if n == SyscallNumber::SpawnPipe     as u64 => handle_spawn_pipe(arg0, arg1, arg2),
         n if n == SyscallNumber::ConsolePush   as u64 => handle_console_push(arg0, arg1),
+        n if n == SyscallNumber::Park          as u64 => scheduler::park_current(),
         _ => -1, // Unknown syscall.
     }
 }

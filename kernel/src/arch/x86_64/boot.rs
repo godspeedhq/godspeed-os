@@ -255,6 +255,23 @@ pub unsafe fn init_local_apic() {
     // the firmware promotes the SoC package to PC6+ (APIC power-gated).  The
     // TSC continues running in all C-states, so TSC-Deadline fires even then.
     let tsc_deadline_supported = unsafe { cpuid_tsc_deadline_supported() };
+
+    // Decide whether idle cores may HALT (run cool) rather than spin. A halted
+    // core is safe only if its scheduler tick survives the C-state: TSC-Deadline
+    // fires from the always-running TSC, and ARAT (CPUID.06H:EAX[2]) means the
+    // LAPIC timer keeps ticking too. The T630 uses the LAPIC periodic timer, so
+    // ARAT is its signal. Without either, halting would drop ticks (Goldmont
+    // APIC power-gate) — keep the sti-only spin. Idempotent across cores.
+    let arat = unsafe { cpuid_arat_supported() };
+    let can_halt = tsc_deadline_supported || arat;
+    super::interrupts::set_idle_can_halt(can_halt);
+    if lapic_id == 0 {
+        crate::kprintln!(
+            "idle: cores may halt = {} (tsc_deadline={}, arat={})",
+            can_halt, tsc_deadline_supported, arat
+        );
+    }
+
     let tsc_ticks = if tsc_deadline_supported {
         // Compute from CPUID.0x15; returns 0 if frequency cannot be determined.
         unsafe { compute_tsc_ticks_per_10ms(lapic_id) }
@@ -312,6 +329,18 @@ unsafe fn cpuid_tsc_deadline_supported() -> bool {
     // APIC TSC-Deadline timer support (Intel SDM Vol. 2A).
     let result = core::arch::x86_64::__cpuid(1);
     (result.ecx >> 24) & 1 != 0
+}
+
+/// Check CPUID leaf 6, EAX bit 2 for ARAT (Always Running APIC Timer) — the
+/// LAPIC timer keeps ticking through C-states, so an idle core may `hlt` and
+/// still receive its scheduler tick.
+///
+/// # Safety
+/// Ring-0 only.
+unsafe fn cpuid_arat_supported() -> bool {
+    // SAFETY: __cpuid(6) is safe on x86_64; CPUID.06H:EAX[2] = ARAT.
+    let result = core::arch::x86_64::__cpuid(6);
+    (result.eax >> 2) & 1 != 0
 }
 
 /// Determine TSC ticks per 10 ms quantum using CPUID leaves 0x15 and 0x16.

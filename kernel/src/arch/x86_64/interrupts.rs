@@ -188,13 +188,36 @@ pub fn disable_interrupts() {
 /// and prevents C-state entry entirely.  The outer scheduler loop's
 /// `compiler_fence(SeqCst)` ensures every iteration re-reads TASK_STATE,
 /// so wakeups written by other cores are not missed.
+/// True when idle cores may safely `hlt` — set once at boot from the ARAT CPUID
+/// bit (CPUID.06H:EAX[2], "Always Running APIC Timer"). ARAT is the hardware's
+/// guarantee that the LAPIC timer keeps ticking through C-states, so a halted
+/// core still receives its scheduler tick (and IPIs/IRQs wake it). When ARAT is
+/// absent (e.g. some Goldmont parts) we keep the legacy sti-only spin.
+static IDLE_CAN_HALT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Record (once, at BSP boot) whether idle cores may halt. See `IDLE_CAN_HALT`.
+pub fn set_idle_can_halt(v: bool) {
+    IDLE_CAN_HALT.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
 #[inline]
 pub fn wait_for_interrupt() {
-    // SAFETY: STI is always safe in ring-0; no other instructions follow.
-    // Intentionally omitting PAUSE and HLT: on Goldmont+ both are
-    // "low-power hints" that allow firmware to power-gate the LAPIC,
-    // causing missed timer ticks and dropped IPIs under sustained load.
-    unsafe { core::arch::asm!("sti", options(nostack, nomem)) }
+    if IDLE_CAN_HALT.load(core::sync::atomic::Ordering::Relaxed) {
+        // ARAT present: halting is safe — the LAPIC timer survives the C-state,
+        // so the next tick/IPI/IRQ wakes the core. Draws near-zero power, so an
+        // idle core runs cool instead of spinning. `sti; hlt` is atomic w.r.t.
+        // interrupt delivery (an interrupt cannot fire in the 1-instruction
+        // window after STI), so there is no lost-wakeup race.
+        // SAFETY: STI then HLT in ring-0; HLT wakes on any interrupt.
+        unsafe { core::arch::asm!("sti; hlt", options(nostack, nomem)) }
+    } else {
+        // No ARAT: HLT/PAUSE let firmware power-gate the LAPIC, dropping timer
+        // ticks and IPIs (observed on Goldmont+). Spin with STI only — keeps the
+        // core hot but the scheduler correct.
+        // SAFETY: STI is always safe in ring-0; no other instructions follow.
+        unsafe { core::arch::asm!("sti", options(nostack, nomem)) }
+    }
 }
 
 /// Signal End-Of-Interrupt to the local APIC so the interrupt line is re-armed.
