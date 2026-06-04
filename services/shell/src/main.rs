@@ -186,7 +186,38 @@ fn cmd_observe_now(ctx: &ServiceContext) {
     let _ = ctx.kill("observe-now");
     if ctx.spawn("observe-now").is_err() {
         ctx.log("observe: failed to spawn observe-now");
+        return;
     }
+    // observe-now's frame is serial-bound (~100+ ms) and prints asynchronously, so
+    // returning immediately would put the next prompt ABOVE the frame. Wait until
+    // observe-now finishes and parks (BlockRecv) so the prompt lands below it.
+    // Bounded against a child that never parks. (The console service will make
+    // output ordering automatic; this is the interim fix.)
+    if let Some(slot) = observe_now_slot(ctx) {
+        for _ in 0..1_000_000u32 {
+            ctx.yield_cpu();
+            let st = ctx.task_stat(slot);
+            // state 2 = BlockedOnRecv → finished printing; invalid → gone.
+            if !st.valid || st.state == 2 {
+                break;
+            }
+        }
+    }
+}
+
+/// Slot of the just-spawned (live, not the killed dead) `observe-now`, waiting
+/// briefly for it to appear. `None` if it never shows up.
+fn observe_now_slot(ctx: &ServiceContext) -> Option<u32> {
+    for _ in 0..2000u32 {
+        ctx.yield_cpu();
+        for slot in 0..256u32 {
+            let st = ctx.task_stat(slot);
+            if st.valid && st.state != 4 /* Dead */ && st.name_str() == "observe-now" {
+                return Some(slot);
+            }
+        }
+    }
+    None
 }
 
 fn cmd_spawn(ctx: &ServiceContext, name: &str) {
