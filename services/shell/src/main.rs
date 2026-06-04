@@ -7,8 +7,10 @@ const MAX_LINE: usize = 128;
 const MAX_ARGS: usize = 4;
 
 // Entry point called by the kernel after spawning this service.
-// ctx.log() appends a newline; the Windows terminal line-buffers input and
-// echoes characters locally, so we just accumulate bytes until \r or \n.
+// ctx.log() appends a newline. The kernel echoes each console keystroke to the
+// display (arch::console_push_byte), so we don't echo here — just accumulate
+// bytes until \r or \n. (On a serial terminal, turn local echo OFF to avoid
+// doubled characters.)
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Let the one-time boot logging flush first (logger/registry/supervisor
