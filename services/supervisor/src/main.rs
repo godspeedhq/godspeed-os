@@ -228,6 +228,11 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
 // All adversarial probes are self-contained — no QEMU control port required.
 #[cfg(all(not(feature = "bare-metal"), not(feature = "identity-only"), not(feature = "perf-only"), not(feature = "perf-brutal-only"), not(feature = "stress-only"), feature = "adv-only"))]
 fn spawn_extended_probes(ctx: &ServiceContext) {
+    // adv-a11 first: it is self-contained (no peers, no IPC) and logs its pass
+    // line within the first second, so it completes even when the CPU-heavy
+    // attackers (A1's 10k-iteration loop, A2 brute-force) would otherwise starve
+    // a TCG-throttled boot. Order is functionally irrelevant for it.
+    let _ = ctx.spawn("adv-a11"); // introspection gated — denied without INTROSPECT cap
     // Passive/victim services before their attackers so endpoints exist when
     // attacker SEND caps are wired at spawn time.
     let _ = ctx.spawn("adv-a1");
@@ -473,6 +478,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("adv-a8-witness");
     let _ = ctx.spawn("adv-a9");
     let _ = ctx.spawn("adv-a10");
+    let _ = ctx.spawn("adv-a11"); // introspection gated — denied without INTROSPECT cap
 
     // --- Brutal performance-benchmark probes — Milestone 19 ---
     // Sender/controller BEFORE echo/recv so endpoints register first.
