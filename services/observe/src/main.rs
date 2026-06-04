@@ -93,7 +93,12 @@ fn print_state(
     let total_frames = ctx.inspect_kernel_total_frames();
     let used_bytes   = (total_frames - free_frames) * FRAME_SIZE;
     let total_mib    = (total_frames * FRAME_SIZE) / (1024 * 1024);
-    let total_gib    = (total_mib + 512) / 1024;
+    // Show total in MiB under 1 GiB, GiB otherwise (avoids "0 GiB" for small RAM).
+    let (total_val, total_unit) = if total_mib >= 1024 {
+        ((total_mib + 512) / 1024, "GiB")
+    } else {
+        (total_mib, "MiB")
+    };
     let used_mib     = used_bytes / (1024 * 1024);
     let used_pct     = if total_mib > 0 { (used_mib * 100) / total_mib } else { 0 };
     let (used_val, used_unit) = bytes_fmt(used_bytes);
@@ -130,8 +135,8 @@ fn print_state(
     }
 
     ctx.log_fmt(format_args!(
-        "observe: RAM: {} {} used / {} GiB  total ({}%)",
-        used_val, used_unit, total_gib, used_pct,
+        "observe: RAM: {} {} used / {} {} total ({}%)",
+        used_val, used_unit, total_val, total_unit, used_pct,
     ));
 
     // --- Task table ---
