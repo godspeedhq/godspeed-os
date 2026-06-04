@@ -105,14 +105,14 @@ fn print_state(
     let (used_val, used_unit) = bytes_fmt(used_bytes);
 
     // --- Legend ---
-    ctx.log("observe: legend: TASK: scheduler slot | NAME: service name");
-    ctx.log("observe: legend: CORE: cpu core | STATE: task state");
-    ctx.log("observe: legend: MEM_USED/LIMIT: heap memory allocated via alloc_mem syscall / contract memory limit");
-    ctx.log("observe: legend: RESTARTS: restart count | QUEUE/LIMIT: inbound queue depth / max queue depth");
-    ctx.log("observe: legend: CPU%: percentage of assigned core used since last snapshot");
+    ctx.console_writeln("observe: legend: TASK: scheduler slot | NAME: service name");
+    ctx.console_writeln("observe: legend: CORE: cpu core | STATE: task state");
+    ctx.console_writeln("observe: legend: MEM_USED/LIMIT: heap memory allocated via alloc_mem syscall / contract memory limit");
+    ctx.console_writeln("observe: legend: RESTARTS: restart count | QUEUE/LIMIT: inbound queue depth / max queue depth");
+    ctx.console_writeln("observe: legend: CPU%: percentage of assigned core used since last snapshot");
 
     // --- System summary ---
-    ctx.log_fmt(format_args!("observe: ----------- system state ({} live) -----------", live));
+    ctx.console_writeln_fmt(format_args!("observe: ----------- system state ({} live) -----------", live));
 
     // Build CPU summary line: "C0  98%  C1  99%  ...  total (49%)"
     let mut cpu_line = [0u8; 128];
@@ -132,16 +132,16 @@ fn print_state(
     cpu_line[pos] = b')'; pos += 1;
 
     if let Ok(s) = core::str::from_utf8(&cpu_line[..pos]) {
-        ctx.log_fmt(format_args!("observe: CPU: {}", s));
+        ctx.console_writeln_fmt(format_args!("observe: CPU: {}", s));
     }
 
-    ctx.log_fmt(format_args!(
+    ctx.console_writeln_fmt(format_args!(
         "observe: RAM: {} {} used / {} {} total ({}%)",
         used_val, used_unit, total_val, total_unit, used_pct,
     ));
 
     // --- Task table ---
-    ctx.log("observe: TASK  NAME             CORE STATE        MEM_USED/LIMIT  RESTARTS  QUEUE/LIMIT  CPU%");
+    ctx.console_writeln("observe: TASK  NAME             CORE STATE        MEM_USED/LIMIT  RESTARTS  QUEUE/LIMIT  CPU%");
     for slot in 0..MAX_SLOTS {
         let stat = ctx.task_stat(slot);
         if !stat.valid { continue; }
@@ -153,7 +153,7 @@ fn print_state(
         let c = (stat.core as usize).min(MAX_CORES as usize - 1);
         let task_pct = core_pct[c];
 
-        ctx.log_fmt(format_args!(
+        ctx.console_writeln_fmt(format_args!(
             "observe: {:<5} {:<16} C{:<3} {:<12} {:>3} {:3}/{:>2} {:3}  {:<9} {:>2}/{}{}  {:>3}%",
             slot,
             stat.name_str(),

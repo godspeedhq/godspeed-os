@@ -7,7 +7,7 @@ const MAX_LINE: usize = 128;
 const MAX_ARGS: usize = 4;
 
 // Entry point called by the kernel after spawning this service.
-// ctx.log() appends a newline. The kernel echoes each console keystroke to the
+// ctx.console_writeln() appends a newline. The kernel echoes each console keystroke to the
 // display (arch::console_push_byte), so we don't echo here — just accumulate
 // bytes until \r or \n. (On a serial terminal, turn local echo OFF to avoid
 // doubled characters.)
@@ -21,8 +21,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     for _ in 0..256 {
         ctx.yield_cpu();
     }
-    ctx.log("shell: ready (type 'help')");
-    ctx.log("gs>");
+    ctx.console_writeln("shell: ready (type 'help')");
+    ctx.console_write("gs> ");
 
     let mut line_buf = [0u8; MAX_LINE];
     let mut line_len = 0usize;
@@ -36,7 +36,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     execute(&ctx, &line_buf[..line_len]);
                     line_len = 0;
                 }
-                ctx.print("gs> ");
+                ctx.console_write("gs> ");
             }
             0x7f | 0x08 => {
                 // backspace — remove last byte
@@ -44,9 +44,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
             0x03 => {
                 // Ctrl-C — clear line
-                ctx.log("^C");
+                ctx.console_writeln("^C");
                 line_len = 0;
-                ctx.print("gs> ");
+                ctx.console_write("gs> ");
             }
             b if b >= 0x20 && b < 0x7f => {
                 if line_len < MAX_LINE {
@@ -61,7 +61,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
 fn execute(ctx: &ServiceContext, line: &[u8]) {
     let Ok(s) = core::str::from_utf8(line) else {
-        ctx.log("shell: invalid input");
+        ctx.console_writeln("shell: invalid input");
         return;
     };
     let s = s.trim();
@@ -93,19 +93,19 @@ fn execute(ctx: &ServiceContext, line: &[u8]) {
             if argc >= 2 && args[1] == "now" {
                 cmd_observe_now(ctx);
             } else {
-                ctx.log("observe: live view coming soon — try 'observe now'");
+                ctx.console_writeln("observe: live view coming soon — try 'observe now'");
             }
         }
         "spawn"   => {
-            if argc < 2 { ctx.log("usage: spawn <name>"); }
+            if argc < 2 { ctx.console_writeln("usage: spawn <name>"); }
             else { cmd_spawn(ctx, args[1]); }
         }
         "kill"    => {
-            if argc < 2 { ctx.log("usage: kill <name>"); }
+            if argc < 2 { ctx.console_writeln("usage: kill <name>"); }
             else { cmd_kill(ctx, args[1]); }
         }
         "restart" => {
-            if argc < 2 { ctx.log("usage: restart <name> [core]"); }
+            if argc < 2 { ctx.console_writeln("usage: restart <name> [core]"); }
             else {
                 let core = if argc >= 3 { parse_u32(args[2]) } else { None };
                 cmd_restart(ctx, args[1], core);
@@ -118,25 +118,25 @@ fn execute(ctx: &ServiceContext, line: &[u8]) {
             let mut pos = 0usize;
             write_bytes(&mut buf, &mut pos, b"unknown: ");
             write_bytes(&mut buf, &mut pos, other.as_bytes());
-            ctx.log(core::str::from_utf8(&buf[..pos]).unwrap_or("unknown cmd"));
+            ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("unknown cmd"));
         }
     }
 }
 
 fn cmd_help(ctx: &ServiceContext) {
-    ctx.log("GodspeedOS shell commands:");
-    ctx.log("  help                   show this message");
-    ctx.log("  cores                  show core count");
-    ctx.log("  status                 list all live tasks");
-    ctx.log("  observe now            show a static system-metrics frame");
-    ctx.log("  spawn <name>           spawn a service");
-    ctx.log("  kill <name>            kill a service");
-    ctx.log("  restart <name> [core]  restart a service");
-    ctx.log("  reboot                 hardware reset");
+    ctx.console_writeln("GodspeedOS shell commands:");
+    ctx.console_writeln("  help                   show this message");
+    ctx.console_writeln("  cores                  show core count");
+    ctx.console_writeln("  status                 list all live tasks");
+    ctx.console_writeln("  observe now            show a static system-metrics frame");
+    ctx.console_writeln("  spawn <name>           spawn a service");
+    ctx.console_writeln("  kill <name>            kill a service");
+    ctx.console_writeln("  restart <name> [core]  restart a service");
+    ctx.console_writeln("  reboot                 hardware reset");
 }
 
 fn cmd_reboot(ctx: &ServiceContext) -> ! {
-    ctx.log("rebooting...");
+    ctx.console_writeln("rebooting...");
     ctx.reboot()
 }
 
@@ -146,11 +146,11 @@ fn cmd_cores(ctx: &ServiceContext) {
     let mut pos = 0usize;
     write_bytes(&mut buf, &mut pos, b"cores: ");
     write_u32(&mut buf, &mut pos, n);
-    ctx.log(core::str::from_utf8(&buf[..pos]).unwrap_or("?"));
+    ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("?"));
 }
 
 fn cmd_status(ctx: &ServiceContext) {
-    ctx.log("SLOT  NAME               CORE STATE");
+    ctx.console_writeln("SLOT  NAME               CORE STATE");
     let mut found = false;
     for slot in 0u32..256 {
         let stat = ctx.task_stat(slot);
@@ -171,9 +171,9 @@ fn cmd_status(ctx: &ServiceContext) {
         // state
         let st = stat.state_str().as_bytes();
         write_bytes(&mut buf, &mut pos, st);
-        ctx.log(core::str::from_utf8(&buf[..pos]).unwrap_or("?"));
+        ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("?"));
     }
-    if !found { ctx.log("  (no live tasks)"); }
+    if !found { ctx.console_writeln("  (no live tasks)"); }
 }
 
 /// `observe now` — broker a one-shot static metrics frame.
@@ -185,7 +185,7 @@ fn cmd_status(ctx: &ServiceContext) {
 fn cmd_observe_now(ctx: &ServiceContext) {
     let _ = ctx.kill("observe-now");
     if ctx.spawn("observe-now").is_err() {
-        ctx.log("observe: failed to spawn observe-now");
+        ctx.console_writeln("observe: failed to spawn observe-now");
         return;
     }
     // observe-now's frame is serial-bound (~100+ ms) and prints asynchronously, so
@@ -227,14 +227,14 @@ fn cmd_spawn(ctx: &ServiceContext, name: &str) {
             let mut pos = 0usize;
             write_bytes(&mut buf, &mut pos, b"spawned: ");
             write_bytes(&mut buf, &mut pos, name.as_bytes());
-            ctx.log(core::str::from_utf8(&buf[..pos]).unwrap_or("spawned"));
+            ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("spawned"));
         }
         Err(_) => {
             let mut buf = [0u8; 64];
             let mut pos = 0usize;
             write_bytes(&mut buf, &mut pos, b"spawn failed: ");
             write_bytes(&mut buf, &mut pos, name.as_bytes());
-            ctx.log(core::str::from_utf8(&buf[..pos]).unwrap_or("spawn failed"));
+            ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("spawn failed"));
         }
     }
 }
@@ -244,11 +244,11 @@ fn cmd_spawn(ctx: &ServiceContext, name: &str) {
 /// endpoint delegated to it. The producer holds no ambient send authority.
 fn cmd_pipe(ctx: &ServiceContext, producer: &str, sink: &str) {
     if producer.is_empty() || sink.is_empty() {
-        ctx.log("usage: <producer> | <sink>");
+        ctx.console_writeln("usage: <producer> | <sink>");
         return;
     }
     if ctx.spawn(sink).is_err() {
-        ctx.log("pipe: failed to spawn sink");
+        ctx.console_writeln("pipe: failed to spawn sink");
         return;
     }
     match ctx.spawn_pipe(producer, sink) {
@@ -259,9 +259,9 @@ fn cmd_pipe(ctx: &ServiceContext, producer: &str, sink: &str) {
             write_bytes(&mut buf, &mut pos, producer.as_bytes());
             write_bytes(&mut buf, &mut pos, b" | ");
             write_bytes(&mut buf, &mut pos, sink.as_bytes());
-            ctx.log(core::str::from_utf8(&buf[..pos]).unwrap_or("pipe wired"));
+            ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("pipe wired"));
         }
-        Err(_) => ctx.log("pipe: failed to spawn producer with delegated cap"),
+        Err(_) => ctx.console_writeln("pipe: failed to spawn producer with delegated cap"),
     }
 }
 
@@ -272,14 +272,14 @@ fn cmd_kill(ctx: &ServiceContext, name: &str) {
             let mut pos = 0usize;
             write_bytes(&mut buf, &mut pos, b"killed: ");
             write_bytes(&mut buf, &mut pos, name.as_bytes());
-            ctx.log(core::str::from_utf8(&buf[..pos]).unwrap_or("killed"));
+            ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("killed"));
         }
         Err(_) => {
             let mut buf = [0u8; 64];
             let mut pos = 0usize;
             write_bytes(&mut buf, &mut pos, b"kill failed: ");
             write_bytes(&mut buf, &mut pos, name.as_bytes());
-            ctx.log(core::str::from_utf8(&buf[..pos]).unwrap_or("kill failed"));
+            ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("kill failed"));
         }
     }
 }
@@ -291,14 +291,14 @@ fn cmd_restart(ctx: &ServiceContext, name: &str, core: Option<u32>) {
             let mut pos = 0usize;
             write_bytes(&mut buf, &mut pos, b"restarted: ");
             write_bytes(&mut buf, &mut pos, name.as_bytes());
-            ctx.log(core::str::from_utf8(&buf[..pos]).unwrap_or("restarted"));
+            ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("restarted"));
         }
         Err(_) => {
             let mut buf = [0u8; 64];
             let mut pos = 0usize;
             write_bytes(&mut buf, &mut pos, b"restart failed: ");
             write_bytes(&mut buf, &mut pos, name.as_bytes());
-            ctx.log(core::str::from_utf8(&buf[..pos]).unwrap_or("restart failed"));
+            ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("restart failed"));
         }
     }
 }

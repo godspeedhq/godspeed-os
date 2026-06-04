@@ -115,7 +115,33 @@ Stage it so each step is useful on its own.
 
 ---
 
-## 5. Key decisions (please steer)
+## 5. Key decisions — RESOLVED (2026-06-05)
+
+All settled per the recommendations below: **(1)** land **Stage 1 first** as its
+own mergeable win, then Stage 2; **(2)** console output reaches the framebuffer
+via a **kernel render path** (the kernel keeps glyph rendering = mechanism);
+**(3)** cursor control via a **minimal ANSI subset** (one escape stream works on
+the TV and a serial terminal); **(4)** the **console service owns the keyboard**
+(Stage 2); **(5)** log-vs-console routing is **by API** (`ctx.log` = log → serial;
+new `ctx.console_*` = console → serial + framebuffer).
+
+### Stage 1 mechanism (this branch, first)
+- `serial_write_byte` / `serial_write_bytes_lockfree` → **COM1 only** (drop the
+  framebuffer mirror). This makes *all* existing logs — `kprintln` and every
+  service's `ctx.log` — serial-only automatically; the TV goes quiet during boot.
+- New `console_write_*` (kernel) → COM1 **and** the framebuffer. The keyboard echo
+  uses this so typed input still shows on the TV.
+- New `ConsoleWrite` syscall (23) + `ctx.console_write`/`console_writeln` — the
+  interactive path. Gated by `LOG_WRITE` for now (Stage 2 introduces a dedicated
+  console cap held only by the console service).
+- The **shell** (prompt + command output) and **observe** (its frame) switch their
+  user-facing output to `ctx.console_*`. Everything else keeps `ctx.log` → serial.
+- **Result:** TV shows a clean interactive session (shell, echo, observe); serial
+  keeps the full logs *and* the session, so debugging/capture is unaffected.
+
+---
+
+## 5b. Original options (for reference)
 
 1. **Scope for this branch.** Stage 1 only (separate streams → clean TV, small,
    high-impact), or push through Stage 2 (the console service + live observe) in

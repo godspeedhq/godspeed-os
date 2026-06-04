@@ -41,6 +41,7 @@ pub enum SyscallNumber {
     ConsolePush    = 20,
     Park           = 21,
     Print          = 22,
+    ConsoleWrite   = 23,
 }
 
 /// Raw syscall dispatcher — called from the SYSCALL/SYSENTER IDT stub.
@@ -83,6 +84,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::ConsolePush   as u64 => handle_console_push(arg0, arg1),
         n if n == SyscallNumber::Park          as u64 => scheduler::park_current(),
         n if n == SyscallNumber::Print         as u64 => handle_print(arg0, arg1, arg2),
+        n if n == SyscallNumber::ConsoleWrite  as u64 => handle_console_write(arg0, arg1, arg2),
         _ => -1, // Unknown syscall.
     }
 }
@@ -147,6 +149,35 @@ fn handle_print(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
         Ok(s) => { crate::kprint!("{}", s); 0 }
         Err(_) => -1,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: ConsoleWrite (23) — write to the interactive console (serial + TV).
+// ---------------------------------------------------------------------------
+
+/// arg0 = cap_slot, arg1 = pointer to UTF-8 bytes, arg2 = byte length.
+///
+/// Requires `Rights::WRITE` on `LOG_WRITE_RESOURCE` (Stage 1; Stage 2 gives the
+/// console service a dedicated cap). Unlike `Log`/`Print` (which now go to the
+/// log stream = serial only), this writes the CONSOLE path — serial AND the
+/// framebuffer — for interactive output (the shell prompt, `observe`). No newline
+/// is added; the caller includes one if wanted. See `docs/console-service.md`.
+fn handle_console_write(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
+    let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::WRITE) {
+        Ok(c) => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    if cap.resource_id != crate::capability::LOG_WRITE_RESOURCE {
+        return cap_err_to_i64(CapError::CapWrongScope);
+    }
+    let len = msg_len as usize;
+    if len == 0 || len > 256 { return -1; }
+    let bytes = match read_user_bytes(msg_ptr, len) {
+        Some(b) => b,
+        None    => return -1,
+    };
+    crate::arch::x86_64::console_write_bytes(bytes);
+    0
 }
 
 // ---------------------------------------------------------------------------

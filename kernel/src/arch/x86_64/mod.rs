@@ -338,9 +338,9 @@ pub fn serial_write_byte(b: u8) {
     if got {
         SERIAL_LOCK.store(false, Ordering::Release);
     }
-    // Mirror to the framebuffer console (no-op until fb_init runs). Done after
-    // releasing SERIAL_LOCK so the two locks never nest.
-    fb::put_byte(b);
+    // COM1 only — this is the LOG stream (kprintln, ctx.log). The interactive
+    // console (framebuffer) is written via `console_write_byte` instead, so logs
+    // no longer smear the TV (§ docs/console-service.md, Stage 1).
 }
 
 /// Spin cap for best-effort `SERIAL_LOCK` acquisition (~seconds on real HW).
@@ -401,7 +401,21 @@ pub fn serial_write_bytes_lockfree(s: &[u8]) {
     if got {
         SERIAL_LOCK.store(false, Ordering::Release);
     }
-    // Mirror the whole sequence to the framebuffer console (no-op pre-init).
+    // COM1 only (log stream). See `serial_write_byte`.
+}
+
+/// Write one byte to the **interactive console** — COM1 *and* the framebuffer
+/// (TV). This is the CONSOLE path (the shell prompt, `observe`, keystroke echo);
+/// kept separate from the log path so logs don't smear the TV. See
+/// `docs/console-service.md` (Stage 1).
+pub fn console_write_byte(b: u8) {
+    serial_write_byte(b);
+    fb::put_byte(b);
+}
+
+/// Write bytes to the interactive console — COM1 (serialised) and the framebuffer.
+pub fn console_write_bytes(s: &[u8]) {
+    serial_write_bytes_lockfree(s);
     for &b in s {
         fb::put_byte(b);
     }
@@ -546,10 +560,12 @@ pub fn console_push_byte(b: u8) {
     // without this typing is invisible on a display. (On a serial terminal, turn
     // local echo OFF so characters are not doubled.) Enter advances a line;
     // backspace erases the last glyph.
+    // Echo via the CONSOLE path (serial + framebuffer) — keystrokes are part of
+    // the interactive session, not the log stream, so they belong on the TV.
     match b {
-        b'\n' | b'\r' => { serial_write_byte(b'\r'); serial_write_byte(b'\n'); }
-        0x08 | 0x7f   => { serial_write_byte(0x08); serial_write_byte(b' '); serial_write_byte(0x08); }
-        0x20..=0x7e   => serial_write_byte(b),
+        b'\n' | b'\r' => { console_write_byte(b'\r'); console_write_byte(b'\n'); }
+        0x08 | 0x7f   => { console_write_byte(0x08); console_write_byte(b' '); console_write_byte(0x08); }
+        0x20..=0x7e   => console_write_byte(b),
         _             => {}
     }
     // SAFETY: single-producer ring push in practice (see note above).
