@@ -693,7 +693,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     dma.write32(link + 8, 0);
     dma.write32(link + 12, (TRB_LINK << 10) | (1 << 1) | 1); // Link | Toggle Cycle | cycle
 
-    ctx.log("xhci: keyboard ready — press keys");
+    ctx.log("xhci: keyboard ready — press Enter for a prompt");
     let mut int_idx = 0usize;
     let mut int_cycle = 1u32;
     let mut need_queue = true;
