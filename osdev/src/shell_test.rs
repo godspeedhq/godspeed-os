@@ -171,6 +171,25 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
+    // observe now — the shell brokers a one-shot observe-now service that prints
+    // a static metrics frame. Its output is ASYNCHRONOUS (the prompt returns
+    // before observe-now is scheduled), so wait on observe's own summary line
+    // rather than on gs>. This also exercises the gated introspection path
+    // (observe-now holds the INTROSPECT cap; task_stat/inspect_* succeed).
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"observe now\r");
+    match collect_until(&buf, &mut cursor, b"system state", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("observe:"), "observe now: static frame printed"),
+        None    => { println!("shell-test: FAIL — timed out waiting for observe now frame"); fail += 1; }
+    }
+    // The frame should carry the task table header (gated task_stat working).
+    // Wait on RESTARTS (end of the header) so the chunk includes TASK + NAME.
+    match collect_until(&buf, &mut cursor, b"RESTARTS", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("TASK") && r.contains("NAME"), "observe now: task table header"),
+        None    => { println!("shell-test: FAIL — observe now: no task table"); fail += 1; }
+    }
+
+    // -----------------------------------------------------------------------
     // Done.
     // -----------------------------------------------------------------------
     child.kill().ok();

@@ -15,16 +15,33 @@ const FRAME_SIZE:     u64 = 4096;
 const QUEUE_MAX:      u8  = 16;
 const MAX_CORES:      u32 = 16;
 
+// Mode passed by the kernel at spawn (ServiceConfig.probe_mode).
+const MODE_LIVE: u32 = 0; // `observe`     — refresh forever
+const MODE_NOW:  u32 = 1; // `observe now` — one static frame, then park
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
-    ctx.log("observe: ready");
-    let mut tick: u32 = 0;
-
     // Per-core tick baselines for delta-based CPU%.
     // Stack allocation — not global mutable state (§3.9).
     let mut prev_core_active = [0u64; MAX_CORES as usize];
     let mut prev_core_total  = [0u64; MAX_CORES as usize];
 
+    if ctx.probe_mode() == MODE_NOW {
+        // `observe now`: print exactly one frame, then park. The first frame has
+        // no previous baseline, so CPU% is the cumulative share since boot — the
+        // correct meaning for a point-in-time snapshot. There is no graceful
+        // self-exit in v1; the shell kills any parked instance before the next
+        // `observe now`, so at most one lingers.
+        print_state(&ctx, &mut prev_core_active, &mut prev_core_total);
+        loop { ctx.yield_cpu(); }
+    }
+
+    // `observe` (live): refresh every ~500 yields. Reachable from full (`osdev
+    // run`) builds today; the shell's bare `observe` reports "coming soon" until
+    // the live view's console-ownership handoff (clear+home, q-to-quit) is built.
+    let _ = MODE_LIVE;
+    ctx.log("observe: ready");
+    let mut tick: u32 = 0;
     loop {
         ctx.yield_cpu();
         tick += 1;

@@ -2483,7 +2483,20 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
-            probe_mode:        0,
+            probe_mode:        0, // MODE_LIVE
+            memory_limit:      8 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
+        // `observe now` — one-shot static metrics frame (probe_mode 1 = MODE_NOW).
+        // Same ELF as `observe`; the shell brokers a kill-then-spawn of this.
+        "observe-now" => Some(("observe-now", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_OBSERVE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        1, // MODE_NOW
             memory_limit:      8 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -2709,7 +2722,7 @@ fn spawn_service_with_config(
     // query 2). Self-state (own alloc bytes) and the TSC stay ungated, so every
     // other service needs nothing. No slot is stored — the gate scans holdings.
     if name == "shell"
-        || name == "observe"
+        || name.starts_with("observe") // observe + observe-now (and future modes)
         || name.starts_with("prop-")
         || name.starts_with("stress-")
     {

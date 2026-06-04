@@ -87,6 +87,13 @@ fn execute(ctx: &ServiceContext, line: &[u8]) {
         "help"    => cmd_help(ctx),
         "cores"   => cmd_cores(ctx),
         "status"  => cmd_status(ctx),
+        "observe" => {
+            if argc >= 2 && args[1] == "now" {
+                cmd_observe_now(ctx);
+            } else {
+                ctx.log("observe: live view coming soon — try 'observe now'");
+            }
+        }
         "spawn"   => {
             if argc < 2 { ctx.log("usage: spawn <name>"); }
             else { cmd_spawn(ctx, args[1]); }
@@ -119,6 +126,7 @@ fn cmd_help(ctx: &ServiceContext) {
     ctx.log("  help                   show this message");
     ctx.log("  cores                  show core count");
     ctx.log("  status                 list all live tasks");
+    ctx.log("  observe now            show a static system-metrics frame");
     ctx.log("  spawn <name>           spawn a service");
     ctx.log("  kill <name>            kill a service");
     ctx.log("  restart <name> [core]  restart a service");
@@ -164,6 +172,19 @@ fn cmd_status(ctx: &ServiceContext) {
         ctx.log(core::str::from_utf8(&buf[..pos]).unwrap_or("?"));
     }
     if !found { ctx.log("  (no live tasks)"); }
+}
+
+/// `observe now` — broker a one-shot static metrics frame.
+///
+/// `observe` is a least-authority service: it holds only INTROSPECT + log caps,
+/// never the shell's spawn/kill/restart. The shell spawns it; it prints one frame
+/// via its own caps and parks. Kill any parked prior instance first (one-shot
+/// observe has no graceful self-exit in v1), so at most one lingers.
+fn cmd_observe_now(ctx: &ServiceContext) {
+    let _ = ctx.kill("observe-now");
+    if ctx.spawn("observe-now").is_err() {
+        ctx.log("observe: failed to spawn observe-now");
+    }
 }
 
 fn cmd_spawn(ctx: &ServiceContext, name: &str) {
