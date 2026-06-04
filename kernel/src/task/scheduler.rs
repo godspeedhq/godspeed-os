@@ -380,6 +380,26 @@ pub fn current_task_lookup_cap(slot: usize, right: Rights) -> Result<Capability,
     }
 }
 
+/// Return true if the current task holds a live capability on `rid` carrying
+/// `right`. Used to gate the introspection syscalls (§3.1), which consume all
+/// argument registers and so cannot pass a cap-slot. See
+/// `docs/introspection-capability.md`.
+pub fn current_task_holds_resource(
+    rid: crate::capability::ResourceId,
+    right: Rights,
+) -> bool {
+    let cid = current_core_id();
+    // SAFETY: IF=0 in syscall context; CORE_CURRENT is stable for this core.
+    unsafe {
+        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
+        if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Relaxed) {
+            TASK_CAP[cur].assume_init_ref().holds_resource(rid, right)
+        } else {
+            false
+        }
+    }
+}
+
 /// Remove the capability at `slot` from the current task's table (GRANT).
 pub fn current_task_remove_cap(slot: usize) -> Option<Capability> {
     let cid = current_core_id();

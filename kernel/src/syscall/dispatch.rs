@@ -593,6 +593,15 @@ fn handle_abort(msg_ptr: u64, msg_len: u64) -> i64 {
 ///   Returns the current generation of the named endpoint as a non-negative
 ///   i64, or -1 if the name is not registered.
 fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
+    // Self-state (0 = own alloc bytes) and the clock (3 = TSC) are ungated. Every
+    // other query discloses another task's or system-wide state and requires the
+    // INTROSPECT capability with READ (§3.1; docs/introspection-capability.md).
+    if !matches!(query_id, 0 | 3)
+        && !scheduler::current_task_holds_resource(
+            crate::capability::INTROSPECT_RESOURCE, Rights::READ)
+    {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
     match query_id {
         0 => scheduler::current_task_alloc_bytes() as i64,
         1 => crate::ipc::routing::count_live_endpoints() as i64,
@@ -665,7 +674,7 @@ fn handle_remove_cap(slot: u64) -> i64 {
 
 /// arg0 = slot (u32), arg1 = buf_ptr (user VA), arg2 = buf_len (must be ≥ 72).
 ///
-/// No capability required — read-only kernel state, consistent with InspectKernel.
+/// Requires the INTROSPECT capability (READ) — discloses any task's state (§3.1).
 ///
 /// Buffer layout (72 bytes):
 ///   [0]       valid:       u8  (1 = live, 0 = dead/unused)
@@ -684,6 +693,13 @@ fn handle_remove_cap(slot: u64) -> i64 {
 /// Returns 0 on success, -1 on invalid args.
 fn handle_task_stat(slot: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     const STAT_SIZE: usize = 72;
+    // TaskStat discloses any task's full snapshot — requires INTROSPECT (READ)
+    // (§3.1; docs/introspection-capability.md).
+    if !scheduler::current_task_holds_resource(
+        crate::capability::INTROSPECT_RESOURCE, Rights::READ)
+    {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
     if buf_len < STAT_SIZE as u64 { return -1; }
     if !validate_user_ptr(buf_ptr, STAT_SIZE) { return -1; }
 

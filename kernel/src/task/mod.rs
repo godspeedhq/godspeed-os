@@ -12,7 +12,7 @@ use crate::arch::x86_64::context_switch::TaskContext;
 use crate::arch::x86_64::page_tables::{
     get_hhdm_offset, PageFlags, VirtAddr, PAGE_SIZE,
 };
-use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE};
+use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE};
 use crate::capability::cap::ResourceId;
 use crate::capability::generation::Generation;
 use crate::ipc::endpoint::EndpointId;
@@ -1970,6 +1970,19 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
+        // A11: introspection gated — TaskStat denied without INTROSPECT cap (§3.1).
+        // Name matches no introspect grant, so adv-a11 holds no introspect cap.
+        "adv-a11" => Some(("adv-a11", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        161, // ADV_A11: gated query denied without INTROSPECT
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
         // ----------------------------------------------------------------
         // Chaos-test probes — Milestone 14.
         // Victim/passive services must be listed before their controllers so
@@ -2687,6 +2700,22 @@ fn spawn_service_with_config(
         let cap_slot = caps.insert(cp_cap)
             .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
         console_push_slot_u32 = cap_slot as u32;
+    }
+
+    // Services that read another task's or system-wide kernel state hold the
+    // INTROSPECT cap (§3.1; docs/introspection-capability.md). The shell and the
+    // observe utility use TaskStat + the aggregate InspectKernel queries; the
+    // prop-*/stress-* test-harness probes query victim generations (InspectKernel
+    // query 2). Self-state (own alloc bytes) and the TSC stay ungated, so every
+    // other service needs nothing. No slot is stored — the gate scans holdings.
+    if name == "shell"
+        || name == "observe"
+        || name.starts_with("prop-")
+        || name.starts_with("stress-")
+    {
+        let in_cap = mint_cap(INTROSPECT_RESOURCE, Rights::READ);
+        caps.insert(in_cap)
+            .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
     }
 
     // 5. Send-peer SEND caps (wired at spawn from the name registry).

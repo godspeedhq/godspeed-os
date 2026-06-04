@@ -36,6 +36,14 @@ pub const CONSOLE_READ_RESOURCE: ResourceId = ResourceId(3);
 /// this prevents an arbitrary service from forging keystrokes into the shell.
 pub const CONSOLE_PUSH_RESOURCE: ResourceId = ResourceId(4);
 
+/// The introspection authority — read another task's or system-wide kernel state
+/// via `InspectKernel` (syscall 13, the system-state queries) and `TaskStat`
+/// (syscall 16). A task must hold this resource with `Rights::READ`. Self-state
+/// queries (own alloc bytes) and the TSC clock remain ungated. Gating prevents an
+/// arbitrary service from enumerating every task's name / memory / restart count
+/// (§3.1). See `docs/introspection-capability.md`.
+pub const INTROSPECT_RESOURCE: ResourceId = ResourceId(5);
+
 pub fn init() {
     table::init_global();
     // Register stable kernel resources (generation 0 forever — §7.5).
@@ -43,5 +51,6 @@ pub fn init() {
     table::register_resource(SPAWN_RESOURCE);
     table::register_resource(CONSOLE_READ_RESOURCE);
     table::register_resource(CONSOLE_PUSH_RESOURCE);
+    table::register_resource(INTROSPECT_RESOURCE);
     crate::kprintln!("capability: subsystem ready");
 }
