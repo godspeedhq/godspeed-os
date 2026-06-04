@@ -233,6 +233,10 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
         task::spawn_init();
         smp::init(boot_info);
         kprintln!("kernel: {} cores ready", smp::core::ready_count());
+        kprintln!(
+            "idle: cores may halt = {} (cool when idle if true)",
+            arch::x86_64::interrupts::idle_can_halt()
+        );
         task::scheduler::run(0)
     }
 }

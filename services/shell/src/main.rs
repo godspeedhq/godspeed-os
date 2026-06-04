@@ -7,8 +7,10 @@ const MAX_LINE: usize = 128;
 const MAX_ARGS: usize = 4;
 
 // Entry point called by the kernel after spawning this service.
-// ctx.log() appends a newline; the Windows terminal line-buffers input and
-// echoes characters locally, so we just accumulate bytes until \r or \n.
+// ctx.log() appends a newline. The kernel echoes each console keystroke to the
+// display (arch::console_push_byte), so we don't echo here — just accumulate
+// bytes until \r or \n. (On a serial terminal, turn local echo OFF to avoid
+// doubled characters.)
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Let the one-time boot logging flush first (logger/registry/supervisor
@@ -34,7 +36,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     execute(&ctx, &line_buf[..line_len]);
                     line_len = 0;
                 }
-                ctx.log("gs>");
+                ctx.print("gs> ");
             }
             0x7f | 0x08 => {
                 // backspace — remove last byte
@@ -44,7 +46,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // Ctrl-C — clear line
                 ctx.log("^C");
                 line_len = 0;
-                ctx.log("gs>");
+                ctx.print("gs> ");
             }
             b if b >= 0x20 && b < 0x7f => {
                 if line_len < MAX_LINE {
@@ -87,6 +89,13 @@ fn execute(ctx: &ServiceContext, line: &[u8]) {
         "help"    => cmd_help(ctx),
         "cores"   => cmd_cores(ctx),
         "status"  => cmd_status(ctx),
+        "observe" => {
+            if argc >= 2 && args[1] == "now" {
+                cmd_observe_now(ctx);
+            } else {
+                ctx.log("observe: live view coming soon — try 'observe now'");
+            }
+        }
         "spawn"   => {
             if argc < 2 { ctx.log("usage: spawn <name>"); }
             else { cmd_spawn(ctx, args[1]); }
@@ -119,6 +128,7 @@ fn cmd_help(ctx: &ServiceContext) {
     ctx.log("  help                   show this message");
     ctx.log("  cores                  show core count");
     ctx.log("  status                 list all live tasks");
+    ctx.log("  observe now            show a static system-metrics frame");
     ctx.log("  spawn <name>           spawn a service");
     ctx.log("  kill <name>            kill a service");
     ctx.log("  restart <name> [core]  restart a service");
@@ -164,6 +174,50 @@ fn cmd_status(ctx: &ServiceContext) {
         ctx.log(core::str::from_utf8(&buf[..pos]).unwrap_or("?"));
     }
     if !found { ctx.log("  (no live tasks)"); }
+}
+
+/// `observe now` — broker a one-shot static metrics frame.
+///
+/// `observe` is a least-authority service: it holds only INTROSPECT + log caps,
+/// never the shell's spawn/kill/restart. The shell spawns it; it prints one frame
+/// via its own caps and parks. Kill any parked prior instance first (one-shot
+/// observe has no graceful self-exit in v1), so at most one lingers.
+fn cmd_observe_now(ctx: &ServiceContext) {
+    let _ = ctx.kill("observe-now");
+    if ctx.spawn("observe-now").is_err() {
+        ctx.log("observe: failed to spawn observe-now");
+        return;
+    }
+    // observe-now's frame is serial-bound (~100+ ms) and prints asynchronously, so
+    // returning immediately would put the next prompt ABOVE the frame. Wait until
+    // observe-now finishes and parks (BlockRecv) so the prompt lands below it.
+    // Bounded against a child that never parks. (The console service will make
+    // output ordering automatic; this is the interim fix.)
+    if let Some(slot) = observe_now_slot(ctx) {
+        for _ in 0..1_000_000u32 {
+            ctx.yield_cpu();
+            let st = ctx.task_stat(slot);
+            // state 2 = BlockedOnRecv → finished printing; invalid → gone.
+            if !st.valid || st.state == 2 {
+                break;
+            }
+        }
+    }
+}
+
+/// Slot of the just-spawned (live, not the killed dead) `observe-now`, waiting
+/// briefly for it to appear. `None` if it never shows up.
+fn observe_now_slot(ctx: &ServiceContext) -> Option<u32> {
+    for _ in 0..2000u32 {
+        ctx.yield_cpu();
+        for slot in 0..256u32 {
+            let st = ctx.task_stat(slot);
+            if st.valid && st.state != 4 /* Dead */ && st.name_str() == "observe-now" {
+                return Some(slot);
+            }
+        }
+    }
+    None
 }
 
 fn cmd_spawn(ctx: &ServiceContext, name: &str) {

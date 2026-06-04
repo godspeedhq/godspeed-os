@@ -95,6 +95,28 @@ impl CapTable {
             }
         }
     }
+
+    /// Return true if this table holds a capability on `rid` carrying
+    /// `required_right`. Searches by resource rather than slot — used to gate
+    /// syscalls that consume all argument registers and so cannot pass a cap-slot
+    /// (the introspection syscalls, §3.1). See `docs/introspection-capability.md`.
+    ///
+    /// **Intended for STABLE kernel resources only** (generation 0 forever —
+    /// `LOG_WRITE`, `SPAWN`, `INTROSPECT`, …). Those are never revoked, so a held
+    /// cap always matches the record; we deliberately skip the generation check —
+    /// and the `GLOBAL_RESOURCES` lock it would need — to keep this off the syscall
+    /// hot path (the v1 global lock is the §7.8 contention point). Do NOT use for
+    /// revocable/endpoint resources, where a stale cap must fail its gen check.
+    pub fn holds_resource(&self, rid: ResourceId, required_right: Rights) -> bool {
+        for slot in &self.slots {
+            if let Some(cap) = slot {
+                if cap.resource_id == rid && cap.rights.contains(required_right) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
 }
 
 // ---

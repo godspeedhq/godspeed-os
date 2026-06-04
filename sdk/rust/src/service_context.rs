@@ -597,6 +597,17 @@ impl ServiceContext {
         unsafe { raw_syscall(4, 0, 0, 0); }
     }
 
+    /// Park this task forever: block with no waker. For idle services that have
+    /// no further work (init, supervisor) — far better than `loop { yield_cpu() }`,
+    /// which keeps the core busy and prevents it from halting (so it never runs
+    /// cool). Nothing wakes a parked task in v1; the loop re-parks defensively.
+    pub fn park(&self) -> ! {
+        loop {
+            // SAFETY: syscall(21) = Park; blocks this task indefinitely.
+            unsafe { raw_syscall(21, 0, 0, 0); }
+        }
+    }
+
     /// Log a string via the kernel ring buffer (syscall 5, requires log_write cap).
     pub fn log(&self, msg: &str) {
         let data = Self::ctx();
@@ -611,6 +622,25 @@ impl ServiceContext {
         // SAFETY: syscall(5) = Log; bytes is a valid slice within user space.
         unsafe {
             raw_syscall(5, slot as u64, bytes.as_ptr() as u64, len as u64);
+        }
+    }
+
+    /// Write a string to the console WITHOUT a trailing newline (syscall 22,
+    /// requires log_write cap). For inline output such as the shell prompt, where
+    /// `log`'s newline would push the user's typed echo to the next line.
+    pub fn print(&self, msg: &str) {
+        let data = Self::ctx();
+        if data.magic != SERVICE_CTX_MAGIC { return; }
+        let slot = data.log_write_slot;
+        if slot == u32::MAX { return; }
+
+        let bytes = msg.as_bytes();
+        let len   = bytes.len();
+        if len == 0 || len > 256 { return; }
+
+        // SAFETY: syscall(22) = Print; bytes is a valid slice within user space.
+        unsafe {
+            raw_syscall(22, slot as u64, bytes.as_ptr() as u64, len as u64);
         }
     }
 

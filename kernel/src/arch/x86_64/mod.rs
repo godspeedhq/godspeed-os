@@ -541,6 +541,17 @@ pub fn uart_rx_poll() {
 /// tail — acceptable while COM1 input is unused (a per-ring lock is future work).
 pub fn console_push_byte(b: u8) {
     use core::sync::atomic::Ordering;
+    // Echo the keystroke to the console (serial + framebuffer) so the user sees
+    // their input inline — the framebuffer has no terminal-side local echo, so
+    // without this typing is invisible on a display. (On a serial terminal, turn
+    // local echo OFF so characters are not doubled.) Enter advances a line;
+    // backspace erases the last glyph.
+    match b {
+        b'\n' | b'\r' => { serial_write_byte(b'\r'); serial_write_byte(b'\n'); }
+        0x08 | 0x7f   => { serial_write_byte(0x08); serial_write_byte(b' '); serial_write_byte(0x08); }
+        0x20..=0x7e   => serial_write_byte(b),
+        _             => {}
+    }
     // SAFETY: single-producer ring push in practice (see note above).
     unsafe { uart_rx_push(b) };
     let waiter = CONSOLE_READ_WAITER.load(Ordering::Acquire);

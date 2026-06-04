@@ -693,7 +693,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     dma.write32(link + 8, 0);
     dma.write32(link + 12, (TRB_LINK << 10) | (1 << 1) | 1); // Link | Toggle Cycle | cycle
 
-    ctx.log("xhci: keyboard ready — press keys");
+    ctx.log("xhci: keyboard ready — press Enter for a prompt");
     let mut int_idx = 0usize;
     let mut int_cycle = 1u32;
     let mut need_queue = true;
@@ -721,11 +721,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             let key = dma.read8(REPORT_OFF + 2); // first keycode in the boot report
                                                  // Only act on a NEW press (key changed) so a held key doesn't spam.
             if key != 0 && key != last_key {
+                // Push the decoded key into the console input ring → the shell's
+                // gs>. The kernel echoes it to the display; no per-key log here
+                // (that was the vertical KEY-per-line cascade during bring-up).
                 if let Some(ch) = hid_to_ascii(key, mods) {
-                    ctx.console_push(ch); // → console input ring → the shell's gs>
-                    ctx.log_fmt(format_args!("xhci: KEY '{}'", ch as char));
-                } else {
-                    ctx.log_fmt(format_args!("xhci: keycode {:#04x}", key));
+                    ctx.console_push(ch);
                 }
             }
             last_key = key;

@@ -109,9 +109,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     ctx.log("supervisor: ready");
 
-    loop {
-        ctx.yield_cpu();
-    }
+    // Park (block forever) instead of busy-yielding so core 0 can halt and run
+    // cool. In v1 the supervisor has no further work: restart/kill commands are
+    // driven from the COM2 control channel in the timer ISR (control::
+    // process_pending), not from this task. The Phase-6 death-notification loop
+    // will replace this with a blocking recv on a notification endpoint.
+    ctx.park();
 }
 
 // ---------------------------------------------------------------------------
@@ -228,6 +231,11 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
 // All adversarial probes are self-contained — no QEMU control port required.
 #[cfg(all(not(feature = "bare-metal"), not(feature = "identity-only"), not(feature = "perf-only"), not(feature = "perf-brutal-only"), not(feature = "stress-only"), feature = "adv-only"))]
 fn spawn_extended_probes(ctx: &ServiceContext) {
+    // adv-a11 first: it is self-contained (no peers, no IPC) and logs its pass
+    // line within the first second, so it completes even when the CPU-heavy
+    // attackers (A1's 10k-iteration loop, A2 brute-force) would otherwise starve
+    // a TCG-throttled boot. Order is functionally irrelevant for it.
+    let _ = ctx.spawn("adv-a11"); // introspection gated — denied without INTROSPECT cap
     // Passive/victim services before their attackers so endpoints exist when
     // attacker SEND caps are wired at spawn time.
     let _ = ctx.spawn("adv-a1");
@@ -473,6 +481,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("adv-a8-witness");
     let _ = ctx.spawn("adv-a9");
     let _ = ctx.spawn("adv-a10");
+    let _ = ctx.spawn("adv-a11"); // introspection gated — denied without INTROSPECT cap
 
     // --- Brutal performance-benchmark probes — Milestone 19 ---
     // Sender/controller BEFORE echo/recv so endpoints register first.

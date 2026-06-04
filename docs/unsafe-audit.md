@@ -8,6 +8,19 @@ unless this file is updated in the same commit with a written SAFETY argument.**
 
 ---
 
+## 2026-06-04 — idle-halt (cool when idle) + introspection holds-check reconcile
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/x86_64/interrupts.rs` | 12 → 13 (+1) | `wait_for_interrupt` gains a `sti; hlt` branch so ARAT-capable cores halt (run cool) instead of spinning; the no-ARAT branch keeps the legacy `sti`-only spin. |
+| `arch/x86_64/boot.rs` | 79 → 81 (+2) | `cpuid_arat_supported` (`unsafe fn` + `__cpuid(6)`) — detects whether the LAPIC timer survives a C-state, gating the halt. |
+| `task/scheduler.rs` | 36 → 37 (+1, grandfathered) | reconciles `current_task_holds_resource` — the §3.1 introspection holds-check (mirrors the existing grandfathered `current_task_lookup_cap`: reads `TASK_CAP[cur].assume_init_ref()`). Added with the introspection gate; the audit count was not bumped then — corrected here. A single read-only line for a security gate, same pattern as the lines already grandfathered in this file. |
+
+All blocks carry `// SAFETY:` comments. The `hlt` is ARAT/TSC-Deadline-gated, so on
+hardware without an always-running timer it never executes (no regression).
+
+---
+
 ## 2026-06-03 — USB/xHCI stack (boot-verified, T630)
 
 Branch `feat/usb-keyboard`. The userspace USB keyboard stack (§12) added unsafe
@@ -76,10 +89,10 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
 | arch/x86_64/ap_boot.rs | 2 | permitted |
-| arch/x86_64/boot.rs | 79 | permitted |
+| arch/x86_64/boot.rs | 81 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |
 | arch/x86_64/fb.rs | 3 | permitted |
-| arch/x86_64/interrupts.rs | 12 | permitted |
+| arch/x86_64/interrupts.rs | 13 | permitted |
 | arch/x86_64/mod.rs | 34 | permitted |
 | arch/x86_64/page_tables.rs | 25 | permitted |
 | arch/x86_64/pci.rs | 5 | permitted |
@@ -99,12 +112,12 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | main.rs | 2 | grandfathered |
 | syscall/dispatch.rs | 2 | grandfathered |
 | task/mod.rs | 7 | grandfathered |
-| task/scheduler.rs | 36 | grandfathered |
+| task/scheduler.rs | 37 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 262 lines across 19 files  
-**Grandfathered total:** 52 lines across 6 files  
-**Grand total:** 314 lines across 25 files
+**Permitted total:** 265 lines across 19 files  
+**Grandfathered total:** 53 lines across 6 files  
+**Grand total:** 318 lines across 25 files
 
 > **Reconciled 2026-05-31** (branch `verify/static-analysis-unsafe-audit`). The
 > permitted-layer growth since the prior baseline is from the AMD GX-420GI ring-3 /

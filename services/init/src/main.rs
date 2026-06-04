@@ -35,8 +35,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let _ = ctx.spawn("logger");
     }
 
-    ctx.log("init: all spawns done, entering yield loop");
-    loop {
-        ctx.yield_cpu();
-    }
+    ctx.log("init: all spawns done, parking");
+    // Park (block forever) instead of busy-yielding: init has no further work, and
+    // a yield loop would keep core 0 from ever halting — pegging it at 100%.
+    ctx.park();
 }

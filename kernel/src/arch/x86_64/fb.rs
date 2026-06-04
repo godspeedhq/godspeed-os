@@ -100,14 +100,18 @@ pub fn put_byte(b: u8) {
         return;
     }
     match b {
-        b'\n' => advance_line(&mut s),
-        b'\r' => s.col = 0,
+        // Position-changing controls: the cursor cell is not overwritten by a
+        // glyph, so erase it before moving (otherwise it leaves a trail).
+        b'\n' => { erase_cursor(&s); advance_line(&mut s); }
+        b'\r' => { erase_cursor(&s); s.col = 0; }
         0x08 | 0x7f => {
+            erase_cursor(&s);
             if s.col > 0 {
                 s.col -= 1;
             }
         }
         0x20..=0x7e => {
+            // The glyph is drawn at the cursor cell, overwriting the cursor.
             let (c, r) = (s.col, s.row);
             draw_glyph(&s, b, c, r);
             s.col += 1;
@@ -117,6 +121,20 @@ pub fn put_byte(b: u8) {
         }
         _ => {}
     }
+    // The cursor follows the write position: a steady underline at the cell where
+    // the next character will land. It rests after `gs> ` when idle and trails the
+    // text as you type. Framebuffer only — a serial terminal draws its own cursor.
+    draw_cursor(&s);
+}
+
+/// Draw the text cursor (a steady underline) at the current write position.
+fn draw_cursor(s: &Fb) {
+    draw_glyph(s, b'_', s.col, s.row);
+}
+
+/// Erase the cursor at the current write position (blank the cell).
+fn erase_cursor(s: &Fb) {
+    draw_glyph(s, b' ', s.col, s.row);
 }
 
 /// Move the cursor to the start of the next row, scrolling if at the bottom.
