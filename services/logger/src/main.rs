@@ -16,7 +16,9 @@ use godspeed_sdk::ServiceContext;
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("logger: ready");
 
-    loop {
-        ctx.yield_cpu();
-    }
+    // Stub: no IPC log draining yet (services log via the kernel ring buffer, not
+    // by sending to this service). Park instead of busy-yielding so core 0 can
+    // reach the idle loop and halt. A real recv loop replaces this once the logger
+    // gains an input endpoint (see CLAUDE.md).
+    ctx.park();
 }

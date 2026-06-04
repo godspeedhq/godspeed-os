@@ -263,14 +263,7 @@ pub unsafe fn init_local_apic() {
     // ARAT is its signal. Without either, halting would drop ticks (Goldmont
     // APIC power-gate) — keep the sti-only spin. Idempotent across cores.
     let arat = unsafe { cpuid_arat_supported() };
-    let can_halt = tsc_deadline_supported || arat;
-    super::interrupts::set_idle_can_halt(can_halt);
-    if lapic_id == 0 {
-        crate::kprintln!(
-            "idle: cores may halt = {} (tsc_deadline={}, arat={})",
-            can_halt, tsc_deadline_supported, arat
-        );
-    }
+    super::interrupts::set_idle_can_halt(tsc_deadline_supported || arat);
 
     let tsc_ticks = if tsc_deadline_supported {
         // Compute from CPUID.0x15; returns 0 if frequency cannot be determined.

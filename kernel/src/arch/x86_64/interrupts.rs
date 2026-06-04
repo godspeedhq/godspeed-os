@@ -201,6 +201,11 @@ pub fn set_idle_can_halt(v: bool) {
     IDLE_CAN_HALT.store(v, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether idle cores halt (true) or spin (false). See `IDLE_CAN_HALT`.
+pub fn idle_can_halt() -> bool {
+    IDLE_CAN_HALT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 #[inline]
 pub fn wait_for_interrupt() {
     if IDLE_CAN_HALT.load(core::sync::atomic::Ordering::Relaxed) {

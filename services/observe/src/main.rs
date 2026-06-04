@@ -31,9 +31,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // no previous baseline, so CPU% is the cumulative share since boot — the
         // correct meaning for a point-in-time snapshot. There is no graceful
         // self-exit in v1; the shell kills any parked instance before the next
-        // `observe now`, so at most one lingers.
+        // `observe now`, so at most one lingers. PARK (not yield) so the parked
+        // instance does not peg its core until it is killed.
         print_state(&ctx, &mut prev_core_active, &mut prev_core_total);
-        loop { ctx.yield_cpu(); }
+        ctx.park();
     }
 
     // `observe` (live): refresh every ~500 yields. Reachable from full (`osdev
