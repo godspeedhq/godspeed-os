@@ -142,10 +142,119 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 "not high-speed (low/full-speed direct on the port)"
             }
         ));
+
+        // E3b — the device on the port (the high-speed hub) is now enabled at the
+        // default address 0. Build the async schedule and read its device
+        // descriptor over a control transfer.
+        if enabled {
+            e3b_read_device_descriptor(&ctx, &mmio, op);
+        }
     }
 
-    // E3b builds the async schedule and addresses whatever the reset enabled.
     ctx.park();
+}
+
+// --- EHCI async-schedule registers + DMA layout for the control transfer ---
+const OP_CTRLDSSEGMENT: usize = 0x10; // high 32 bits of 64-bit data-structure addrs
+const OP_ASYNCLISTADDR: usize = 0x18; // physical base of the async (QH) list
+const CMD_ASE:          u32   = 1 << 5;  // USBCMD: Async Schedule Enable
+const STS_ASS:          u32   = 1 << 15; // USBSTS: Async Schedule Status
+
+// Offsets within the granted DMA arena (32-byte aligned where a QH/qTD lives).
+const QH_OFF:     usize = 0x000; // Queue Head (48 bytes)
+const QTD_SETUP:  usize = 0x040; // SETUP-stage qTD
+const QTD_DATA:   usize = 0x060; // DATA-stage qTD
+const QTD_STATUS: usize = 0x080; // STATUS-stage qTD
+const SETUP_PKT:  usize = 0x100; // 8-byte USB setup packet
+const DATA_BUF:   usize = 0x200; // control-transfer data buffer
+
+// qTD token bits.
+const QTD_ACTIVE: u32 = 1 << 7;
+const QTD_HALTED: u32 = 1 << 6;
+const QTD_ERRMASK: u32 = (1 << 3) | (1 << 4) | (1 << 5); // XactErr | Babble | BufErr
+
+/// E3b — read the enabled high-speed device's device descriptor over a control
+/// transfer (Get_Descriptor(Device)) using a one-QH async schedule. The device is
+/// at the default address 0. Confirms it's the rate-matching hub (bDeviceClass
+/// 0x09) and reports VID/PID, before E3c does the hub-class enumeration.
+fn e3b_read_device_descriptor(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
+    let dma = match ctx.dma_region() {
+        Some(d) => d,
+        None => { ctx.log("ehci: no DMA arena granted — cannot enumerate; idling"); return; }
+    };
+    dma.zero();
+
+    let qh_phys     = dma.phys_at(QH_OFF) as u32;
+    let setup_phys  = dma.phys_at(QTD_SETUP) as u32;
+    let data_phys   = dma.phys_at(QTD_DATA) as u32;
+    let status_phys = dma.phys_at(QTD_STATUS) as u32;
+    let pkt_phys    = dma.phys_at(SETUP_PKT) as u32;
+    let buf_phys    = dma.phys_at(DATA_BUF) as u32;
+
+    // Queue Head for EP0 of the high-speed device at address 0.
+    dma.write32(QH_OFF + 0x00, (qh_phys & !0x1F) | (1 << 1)); // self-link, Typ=QH, T=0
+    // EP chars: addr 0, EP 0, speed=HS(2<<12), DTC=1, H=1 (reclamation head), MaxPkt=64.
+    dma.write32(QH_OFF + 0x04, (2 << 12) | (1 << 14) | (1 << 15) | (64 << 16));
+    dma.write32(QH_OFF + 0x08, 1 << 30); // EP caps: Mult=1 (no split — talking to the HS hub)
+    dma.write32(QH_OFF + 0x0C, 0);       // current qTD
+    dma.write32(QH_OFF + 0x10, setup_phys & !0x1F); // overlay: next qTD = SETUP
+    dma.write32(QH_OFF + 0x14, 1);       // alt next qTD = terminate
+    dma.write32(QH_OFF + 0x18, 0);       // overlay token: Active clear → fetch next qTD
+
+    // SETUP qTD: 8-byte setup packet, DATA0.
+    dma.write32(QTD_SETUP + 0x00, data_phys & !0x1F);
+    dma.write32(QTD_SETUP + 0x04, 1);
+    dma.write32(QTD_SETUP + 0x08, QTD_ACTIVE | (2 << 8) | (3 << 10) | (8 << 16)); // PID=SETUP, CERR=3, 8 bytes
+    dma.write32(QTD_SETUP + 0x0C, pkt_phys);
+
+    // DATA qTD: IN, 18 bytes, DATA1.
+    dma.write32(QTD_DATA + 0x00, status_phys & !0x1F);
+    dma.write32(QTD_DATA + 0x04, 1);
+    dma.write32(QTD_DATA + 0x08, QTD_ACTIVE | (1 << 8) | (3 << 10) | (18 << 16) | (1 << 31)); // PID=IN, 18 bytes, DT=1
+    dma.write32(QTD_DATA + 0x0C, buf_phys);
+
+    // STATUS qTD: OUT, 0 bytes, DATA1, interrupt-on-complete.
+    dma.write32(QTD_STATUS + 0x00, 1); // terminate
+    dma.write32(QTD_STATUS + 0x04, 1);
+    dma.write32(QTD_STATUS + 0x08, QTD_ACTIVE | (0 << 8) | (3 << 10) | (1 << 15) | (1 << 31)); // PID=OUT, IOC, DT=1
+    dma.write32(QTD_STATUS + 0x0C, 0);
+
+    // Setup packet: Get_Descriptor(Device, index 0, length 18).
+    dma.write32(SETUP_PKT + 0x00, 0x0100_0680); // bmRequestType=0x80 bRequest=0x06 wValue=0x0100
+    dma.write32(SETUP_PKT + 0x04, 0x0012_0000); // wIndex=0 wLength=18
+
+    // Point the async list at the QH and enable the async schedule.
+    mmio.write32(op + OP_CTRLDSSEGMENT, 0);
+    mmio.write32(op + OP_ASYNCLISTADDR, qh_phys & !0x1F);
+    mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) | CMD_ASE);
+    wait(mmio, op + OP_USBSTS, STS_ASS, true);
+
+    // Wait for the STATUS qTD to retire (Active clears) — the whole transfer done.
+    let mut done = false;
+    for _ in 0..10_000_000u32 {
+        if dma.read32(QTD_STATUS + 0x08) & QTD_ACTIVE == 0 { done = true; break; }
+    }
+    let toks = dma.read32(QTD_SETUP + 0x08) | dma.read32(QTD_DATA + 0x08) | dma.read32(QTD_STATUS + 0x08);
+
+    if !done {
+        ctx.log_fmt(format_args!("ehci: control transfer timed out (tokens={:#010x})", toks));
+    } else if toks & QTD_HALTED != 0 || toks & QTD_ERRMASK != 0 {
+        ctx.log_fmt(format_args!("ehci: control transfer error (tokens={:#010x})", toks));
+    } else {
+        let blen   = dma.read8(DATA_BUF + 0);
+        let dtype  = dma.read8(DATA_BUF + 1);
+        let class  = dma.read8(DATA_BUF + 4);
+        let mps0   = dma.read8(DATA_BUF + 7);
+        let vid    = dma.read16(DATA_BUF + 8);
+        let pid    = dma.read16(DATA_BUF + 10);
+        ctx.log_fmt(format_args!(
+            "ehci: DEVICE DESCRIPTOR bLength={} type={} class={:#04x} mps0={} VID={:#06x} PID={:#06x}",
+            blen, dtype, class, mps0, vid, pid
+        ));
+        if class == 0x09 {
+            ctx.log("ehci: device is a USB hub (the rate-matching hub) -> E3c enumerates its ports");
+        }
+    }
 }
 
 /// Busy-wait roughly `cycles` TSC ticks. Used for the millisecond-scale USB reset

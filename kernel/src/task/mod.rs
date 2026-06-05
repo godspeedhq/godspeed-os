@@ -2877,9 +2877,15 @@ fn spawn_service_with_config(
     // (§12). The controller DMAs into this memory (rings/contexts), so the driver
     // needs both the VA (to build structures) and the physical base (to program
     // the controller). Normal cacheable mapping — x86 DMA is cache-coherent.
-    let (xhci_dma_va, xhci_dma_phys, xhci_dma_len) = if name == "xhci"
-        && crate::arch::x86_64::pci::XHCI_FOUND.load(core::sync::atomic::Ordering::Relaxed)
-    {
+    // Grant a physically-contiguous DMA arena to a USB driver (xhci or ehci) for
+    // its queue structures. Shared VA/fields, separate address spaces (§12).
+    let dma_for_driver = {
+        use core::sync::atomic::Ordering::Relaxed;
+        use crate::arch::x86_64::pci;
+        (name == "xhci" && pci::XHCI_FOUND.load(Relaxed))
+            || (name == "ehci" && pci::EHCI_FOUND.load(Relaxed))
+    };
+    let (xhci_dma_va, xhci_dma_phys, xhci_dma_len) = if dma_for_driver {
         match crate::memory::allocator::alloc_contiguous(XHCI_DMA_PAGES as usize) {
             Some(phys) => {
                 let flags = PageFlags::PRESENT
@@ -2894,13 +2900,13 @@ fn spawn_service_with_config(
                 }
                 let len = XHCI_DMA_PAGES * PAGE_SIZE as u64;
                 crate::kprintln!(
-                    "spawn[dma]: 'xhci' arena phys {:#x} -> VA {:#x} ({} KiB)",
-                    phys, XHCI_DMA_VA, len / 1024
+                    "spawn[dma]: '{}' arena phys {:#x} -> VA {:#x} ({} KiB)",
+                    name, phys, XHCI_DMA_VA, len / 1024
                 );
                 (XHCI_DMA_VA, phys, len)
             }
             None => {
-                crate::kprintln!("spawn[dma]: 'xhci' WARN: no contiguous DMA arena");
+                crate::kprintln!("spawn[dma]: '{}' WARN: no contiguous DMA arena", name);
                 (0, 0, 0)
             }
         }
