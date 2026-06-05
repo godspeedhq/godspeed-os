@@ -44,6 +44,15 @@ pub const CONSOLE_PUSH_RESOURCE: ResourceId = ResourceId(4);
 /// (§3.1). See `docs/introspection-capability.md`.
 pub const INTROSPECT_RESOURCE: ResourceId = ResourceId(5);
 
+/// The service-control authority — kill a service via `Kill` (syscall 8), and so
+/// the kill half of restart. A task must hold this resource with `Rights::WRITE`.
+/// Held by the shell (the interactive broker) and the test-driver probes (they
+/// kill victim services to exercise the kill/revocation machinery), plus the
+/// supervisor (§14.4). Gating closes the §3.1 ambient-authority hole: without it,
+/// any service could kill any non-trusted-root service. See
+/// `docs/service-control-cap.md`.
+pub const SERVICE_CONTROL_RESOURCE: ResourceId = ResourceId(6);
+
 pub fn init() {
     table::init_global();
     // Register stable kernel resources (generation 0 forever — §7.5).
@@ -52,5 +61,6 @@ pub fn init() {
     table::register_resource(CONSOLE_READ_RESOURCE);
     table::register_resource(CONSOLE_PUSH_RESOURCE);
     table::register_resource(INTROSPECT_RESOURCE);
+    table::register_resource(SERVICE_CONTROL_RESOURCE);
     crate::kprintln!("capability: subsystem ready");
 }

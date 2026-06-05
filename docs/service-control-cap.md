@@ -1,11 +1,43 @@
 # Design Note: capability-gate kill/restart (`service_control`)
 
-**Status:** DESIGN — not yet implemented.
+**Status:** IMPLEMENTED + verified (2026-06-05).
 **Branch:** `feat/service-control-cap` (off `main`).
 **Date:** 2026-06-05
 **Pins:** §3.1 (no ambient authority), §14.4 (`service_control`, held by the
 supervisor), §7 (capability model), §22 (identity + property/stress/fuzz/adv/perf/
 chaos suites must stay green).
+
+---
+
+## 0. Implementation summary (as built)
+
+- `SERVICE_CONTROL_RESOURCE = ResourceId(6)`, registered in `capability::init`.
+- `handle_kill` (syscall 8) gates on `current_task_holds_resource(SERVICE_CONTROL,
+  WRITE)` as its first action — killing is now a privileged, capability-checked
+  action, not ambient.
+- Minted at spawn for `shell`, `supervisor`, and every probe service. Probes are
+  identified by **ELF identity**: all probe configs now share one `PROBE_ELF`
+  const, and the mint matches `core::ptr::eq(elf_bytes, PROBE_ELF)` — miss-proof,
+  no name enumeration. (Strategy (a) below.)
+- `caps <service>` maps id 6 → `service_control`.
+
+### Verification (kill path exercised, all green)
+- identity **22/22** — Test 4A kills `probe-victim`; 6A/6B/10A/10B restart.
+- property **10/10** — P2/P5/P7/P8/P9 kill victims.
+- adversarial **11/11** — A5 (TOCTOU kill), A9, A11.
+- fuzz: F7 (50-iteration kill storm) times out under TCG — its serial log shows
+  `kill_task: ... freed N frames` succeeding throughout, so the gate is correct;
+  the timeout is the known TCG ceiling (chaos is 0/7 on **main** too, i.e.
+  pre-existing/environmental, not this change). No new unsafe (318).
+
+### Denial coverage
+No dedicated negative test was added. Every probe gets the cap via ELF identity,
+so a probe-based "kill denied without cap" test would require excluding one probe
+name from the mint — a test-only wart on a clean gate. The denial *mechanism*
+(`current_task_holds_resource` returning `CapNotHeld` when the cap is absent) is
+the identical code path already proven by **A11** (`introspection_denied_without_cap`).
+If an explicit `service_control` denial test is wanted later, it costs that mint
+exclusion.
 
 ---
 

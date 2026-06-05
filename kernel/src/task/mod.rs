@@ -12,7 +12,7 @@ use crate::arch::x86_64::context_switch::TaskContext;
 use crate::arch::x86_64::page_tables::{
     get_hhdm_offset, PageFlags, VirtAddr, PAGE_SIZE,
 };
-use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE};
+use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE};
 use crate::capability::cap::ResourceId;
 use crate::capability::generation::Generation;
 use crate::ipc::endpoint::EndpointId;
@@ -178,6 +178,13 @@ const REGISTRY_ELF: &[u8] = b"\xDE\xAD"; // invalid ELF, triggers LoadFailed
 #[cfg(not(feature = "test-bad-registry"))]
 const REGISTRY_ELF: &[u8] = include_bytes!(env!("SVC_REGISTRY_ELF"));
 
+/// The one shared probe ELF. Every probe/test-driver service uses this exact
+/// reference, so the spawn path can identify "is a probe" by pointer identity
+/// (`elf_bytes` == `PROBE_ELF`) — used to mint the service_control cap for the
+/// test drivers without enumerating every probe name. A single const guarantees
+/// the pointer compares equal; separate `include_bytes!` sites would not.
+const PROBE_ELF: &[u8] = include_bytes!(env!("SVC_PROBE_ELF"));
+
 struct ServiceConfig {
     elf:               &'static [u8],
     has_recv_endpoint: bool,
@@ -309,7 +316,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // senders that need SEND caps wired to them.
         // ----------------------------------------------------------------
         "probe-recv" => Some(("probe-recv", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -320,7 +327,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "probe-victim" => Some(("probe-victim", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -331,7 +338,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "probe-4b-recv" => Some(("probe-4b-recv", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -342,7 +349,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "probe-3b" => Some(("probe-3b", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -353,7 +360,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "probe-sender" => Some(("probe-sender", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["probe-recv"],
             send_peers_grant:  false,
@@ -364,7 +371,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "probe-4a" => Some(("probe-4a", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["probe-victim"],
             send_peers_grant:  false,
@@ -375,7 +382,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "probe-4b-send" => Some(("probe-4b-send", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["probe-4b-recv"],
             send_peers_grant:  false,
@@ -386,7 +393,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "probe-yielder" => Some(("probe-yielder", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -397,7 +404,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "probe-hog" => Some(("probe-hog", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -408,7 +415,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "probe-9b" => Some(("probe-9b", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -424,7 +431,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // so its endpoint is registered before sender caps are wired.
         // ----------------------------------------------------------------
         "probe-5a-recv" => Some(("probe-5a-recv", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -435,7 +442,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "probe-5a-send" => Some(("probe-5a-send", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["probe-5a-recv"],
             send_peers_grant:  true,  // mints SEND|GRANT cap to probe-5a-recv
@@ -446,7 +453,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "probe-5b-send" => Some(("probe-5b-send", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["probe-5a-recv"],
             send_peers_grant:  false, // SEND only — no GRANT right; should return CapNotGrantable
@@ -460,7 +467,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // Memory-limit probes — §22 Tests 7A and 7B.
         // ----------------------------------------------------------------
         "probe-7a" => Some(("probe-7a", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -471,7 +478,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "probe-7b" => Some(("probe-7b", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -486,7 +493,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // hw_irqs registers IRQ 33 to probe-11a's recv endpoint at spawn.
         // ----------------------------------------------------------------
         "probe-11a" => Some(("probe-11a", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -502,7 +509,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // endpoint is in the name registry when prop-p9's SEND caps are wired.
         // ----------------------------------------------------------------
         "prop-p9-victim" => Some(("prop-p9-victim", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -513,7 +520,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "prop-p1" => Some(("prop-p1", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -524,7 +531,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "prop-p9" => Some(("prop-p9", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             // Three SEND caps to the same endpoint — proves all cap slots are
             // invalidated on endpoint death, not just the first (§7.5).
@@ -537,7 +544,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "prop-p10" => Some(("prop-p10", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -553,7 +560,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // P2: generation monotonic. prop-p2-victim must be listed before prop-p2.
         // prop-p2 pinned to Core 3 — away from P8 (Core 1) and P6 (Core 2).
         "prop-p2-victim" => Some(("prop-p2-victim", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -564,7 +571,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "prop-p2" => Some(("prop-p2", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -576,7 +583,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // P3: cap rights non-widening. Self-referential: sends cap to own endpoint.
         "prop-p3" => Some(("prop-p3", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -590,7 +597,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // Pinned to Core 2 — away from the P2 (Core 3) and P8 (Core 1) kill/spawn
         // controllers whose long spawn syscalls would starve P6 of CPU time.
         "prop-p6" => Some(("prop-p6", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &["prop-p6"],
             send_peers_grant:  false,
@@ -604,7 +611,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // Pinned to Core 1 so P8's kill/spawn loop doesn't share a core with P6 (Core 2)
         // or P2 (Core 3).
         "prop-p8-victim" => Some(("prop-p8-victim", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -615,7 +622,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "prop-p8" => Some(("prop-p8", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -630,7 +637,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // ----------------------------------------------------------------
         // P4: memory accounting. No victim needed.
         "prop-p4" => Some(("prop-p4", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -642,7 +649,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // P5: endpoint ownership. Victim must be listed before controller.
         "prop-p5-victim" => Some(("prop-p5-victim", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -653,7 +660,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "prop-p5" => Some(("prop-p5", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -665,7 +672,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // P7: TLB shootdown proxy. Victim must be listed before controller.
         "prop-p7-victim" => Some(("prop-p7-victim", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -676,7 +683,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "prop-p7" => Some(("prop-p7", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -693,7 +700,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // ----------------------------------------------------------------
         // BP1: cap unforgeability at 100k iterations.
         "prop-bp1" => Some(("prop-bp1", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -705,7 +712,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BP2: generation monotonic over 20 kill/respawn cycles.
         "prop-bp2-victim" => Some(("prop-bp2-victim", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -716,7 +723,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "prop-bp2" => Some(("prop-bp2", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -728,7 +735,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BP3: cap rights never widen — 10k iterations (self-referential, like P3).
         "prop-bp3" => Some(("prop-bp3", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -740,7 +747,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BP4: alloc accounting exact — 2k iterations.
         "prop-bp4" => Some(("prop-bp4", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -752,7 +759,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BP5: endpoint ownership — 150 kill/respawn cycles.
         "prop-bp5-victim" => Some(("prop-bp5-victim", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -763,7 +770,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "prop-bp5" => Some(("prop-bp5", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -775,7 +782,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BP6: queue invariants — 2k iterations (self-referential, like P6).
         "prop-bp6" => Some(("prop-bp6", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &["prop-bp6"],
             send_peers_grant:  false,
@@ -787,7 +794,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BP7: TLB shootdown proxy — 150 kill/respawn cycles.
         "prop-bp7-victim" => Some(("prop-bp7-victim", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -798,7 +805,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "prop-bp7" => Some(("prop-bp7", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -810,7 +817,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BP8: restart + higher-generation liveness — 20 iterations.
         "prop-bp8-victim" => Some(("prop-bp8-victim", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -821,7 +828,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "prop-bp8" => Some(("prop-bp8", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -833,7 +840,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BP9: generation invalidates ALL 3 slots, over 10 kill/respawn cycles.
         "prop-bp9-victim" => Some(("prop-bp9-victim", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -844,7 +851,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "prop-bp9" => Some(("prop-bp9", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["prop-bp9-victim", "prop-bp9-victim", "prop-bp9-victim"],
             send_peers_grant:  false,
@@ -856,7 +863,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BP10: every send returns a defined outcome — 100k iterations.
         "prop-bp10" => Some(("prop-bp10", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -871,7 +878,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // Recv-endpoint victims must be listed before their fuzz controllers.
         // ----------------------------------------------------------------
         "fuzz-f1" => Some(("fuzz-f1", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -882,7 +889,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "fuzz-f2" => Some(("fuzz-f2", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -894,7 +901,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // F5: IPC message body fuzzing — recv target first.
         "fuzz-f5-recv" => Some(("fuzz-f5-recv", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -905,7 +912,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "fuzz-f5" => Some(("fuzz-f5", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["fuzz-f5-recv"],
             send_peers_grant:  false,
@@ -917,7 +924,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // F6: embedded cap fuzzing — recv target first.
         "fuzz-f6-recv" => Some(("fuzz-f6-recv", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -928,7 +935,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "fuzz-f6" => Some(("fuzz-f6", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["fuzz-f6-recv"],
             send_peers_grant:  false,
@@ -940,7 +947,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // F7: stale cap / generation fuzzing — victim first.
         "fuzz-f7-victim" => Some(("fuzz-f7-victim", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -951,7 +958,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "fuzz-f7" => Some(("fuzz-f7", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["fuzz-f7-victim"],
             send_peers_grant:  false,
@@ -963,7 +970,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // F8: memory request size fuzzing — no peers needed.
         "fuzz-f8" => Some(("fuzz-f8", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -978,7 +985,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // Victims/recv-endpoints before controllers.
         // ----------------------------------------------------------------
         "fuzz-bf5-recv" => Some(("fuzz-bf5-recv", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -989,7 +996,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "fuzz-bf5" => Some(("fuzz-bf5", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["fuzz-bf5-recv"],
             send_peers_grant:  false,
@@ -1000,7 +1007,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "fuzz-bf6-recv" => Some(("fuzz-bf6-recv", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1011,7 +1018,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "fuzz-bf6" => Some(("fuzz-bf6", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["fuzz-bf6-recv"],
             send_peers_grant:  false,
@@ -1022,7 +1029,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "fuzz-bf7-victim" => Some(("fuzz-bf7-victim", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1033,7 +1040,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "fuzz-bf7" => Some(("fuzz-bf7", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["fuzz-bf7-victim"],
             send_peers_grant:  false,
@@ -1044,7 +1051,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "fuzz-bf1" => Some(("fuzz-bf1", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1055,7 +1062,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "fuzz-bf2" => Some(("fuzz-bf2", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1066,7 +1073,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "fuzz-bf8" => Some(("fuzz-bf8", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1082,7 +1089,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // ----------------------------------------------------------------
         // S1: IPC saturation. Receiver is passive (never drains).
         "stress-s1-recv" => Some(("stress-s1-recv", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1093,7 +1100,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "stress-s1" => Some(("stress-s1", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["stress-s1-recv"],
             send_peers_grant:  false,
@@ -1105,7 +1112,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // S2: Restart storm. Victim killed/respawned 50 times.
         "stress-s2-victim" => Some(("stress-s2-victim", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1116,7 +1123,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "stress-s2" => Some(("stress-s2", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["stress-s2-victim"],
             send_peers_grant:  false,
@@ -1128,7 +1135,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // S3: Cross-core thrash. Receiver pinned to core 1, sender to core 0.
         "stress-s3-recv" => Some(("stress-s3-recv", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1139,7 +1146,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "stress-s3-send" => Some(("stress-s3-send", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["stress-s3-recv"],
             send_peers_grant:  false,
@@ -1151,7 +1158,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // S4: Cap table churn. Victim killed/respawned 50×; 2 cap slots verified dead each kill.
         "stress-s4-victim" => Some(("stress-s4-victim", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1162,7 +1169,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "stress-s4" => Some(("stress-s4", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             // Two SEND caps to the same endpoint — both must die on one kill (§7.5).
             send_peers:        &["stress-s4-victim", "stress-s4-victim"],
@@ -1175,7 +1182,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // S7: Memory pressure. Single probe; no peers needed.
         "stress-s7" => Some(("stress-s7", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1187,7 +1194,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // S10: Cascading revocation. Victim on core 1; coordinator on core 0 (cross-core kill).
         "stress-s10-victim" => Some(("stress-s10-victim", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1198,7 +1205,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "stress-s10" => Some(("stress-s10", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             // Three SEND caps to the same endpoint — all must die on one kill (§7.5, §8.6).
             send_peers:        &["stress-s10-victim", "stress-s10-victim", "stress-s10-victim"],
@@ -1211,7 +1218,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // S5: Generation counter integrity (1000 kill/respawn cycles)
         "stress-s5-victim" => Some(("stress-s5-victim", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1222,7 +1229,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "stress-s5" => Some(("stress-s5", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1234,7 +1241,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // S6: Long-running IPC self-ping stability (5000 rounds)
         "stress-s6" => Some(("stress-s6", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &["stress-s6"], // self-referential: same endpoint for send+recv
             send_peers_grant:  false,
@@ -1246,7 +1253,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // S8: Idle scheduler heartbeat (600 yield cycles)
         "stress-s8" => Some(("stress-s8", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1258,7 +1265,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // S9: Cross-core IPI storm — receiver on core 2; two senders on cores 0 and 1
         "stress-s9-recv" => Some(("stress-s9-recv", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1269,7 +1276,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "stress-s9-send-a" => Some(("stress-s9-send-a", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["stress-s9-recv"],
             send_peers_grant:  false,
@@ -1280,7 +1287,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "stress-s9-send-b" => Some(("stress-s9-send-b", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["stress-s9-recv"],
             send_peers_grant:  false,
@@ -1296,7 +1303,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // ----------------------------------------------------------------
         // BS1: IPC saturation, 5× S1.
         "stress-bs1-recv" => Some(("stress-bs1-recv", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1307,7 +1314,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "stress-bs1" => Some(("stress-bs1", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["stress-bs1-recv"],
             send_peers_grant:  false,
@@ -1319,7 +1326,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BS2: restart storm, 4× S2.
         "stress-bs2-victim" => Some(("stress-bs2-victim", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1330,7 +1337,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "stress-bs2" => Some(("stress-bs2", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["stress-bs2-victim"],
             send_peers_grant:  false,
@@ -1342,7 +1349,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BS3: cross-core thrash, 4× S3. Receiver on core 1, sender on core 0.
         "stress-bs3-recv" => Some(("stress-bs3-recv", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1353,7 +1360,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "stress-bs3-send" => Some(("stress-bs3-send", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["stress-bs3-recv"],
             send_peers_grant:  false,
@@ -1365,7 +1372,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BS4: cap table churn, 5× S4. Victim before controller; 2 send_peers slots.
         "stress-bs4-victim" => Some(("stress-bs4-victim", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1376,7 +1383,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "stress-bs4" => Some(("stress-bs4", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["stress-bs4-victim", "stress-bs4-victim"],
             send_peers_grant:  false,
@@ -1388,7 +1395,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BS5: generation integrity, 5× S5. Victim before controller.
         "stress-bs5-victim" => Some(("stress-bs5-victim", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1399,7 +1406,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "stress-bs5" => Some(("stress-bs5", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1411,7 +1418,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BS6: self-ping stability, 4× S6. Self-referential send_peers.
         "stress-bs6" => Some(("stress-bs6", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &["stress-bs6"],
             send_peers_grant:  false,
@@ -1423,7 +1430,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BS7: memory pressure, 5× S7.
         "stress-bs7" => Some(("stress-bs7", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1435,7 +1442,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BS8: scheduler heartbeat, 5× S8.
         "stress-bs8" => Some(("stress-bs8", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1447,7 +1454,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BS9: IPI storm, 5× S9. Receiver on core 2; two senders on cores 0, 1.
         "stress-bs9-recv" => Some(("stress-bs9-recv", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1458,7 +1465,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "stress-bs9-send-a" => Some(("stress-bs9-send-a", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["stress-bs9-recv"],
             send_peers_grant:  false,
@@ -1469,7 +1476,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "stress-bs9-send-b" => Some(("stress-bs9-send-b", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["stress-bs9-recv"],
             send_peers_grant:  false,
@@ -1481,7 +1488,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BS10: cascading revocation, 50 cycles. Victim on core 1; controller on core 0.
         "stress-bs10-victim" => Some(("stress-bs10-victim", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1492,7 +1499,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "stress-bs10" => Some(("stress-bs10", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["stress-bs10-victim", "stress-bs10-victim", "stress-bs10-victim"],
             send_peers_grant:  false,
@@ -1509,7 +1516,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // ----------------------------------------------------------------
         // B1: same-core IPC roundtrip. Sender acquires cap dynamically.
         "perf-b1" => Some(("perf-b1", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1520,7 +1527,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "perf-b1-echo" => Some(("perf-b1-echo", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &["perf-b1"],
             send_peers_grant:  false,
@@ -1532,7 +1539,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // B2: cross-core IPC roundtrip. Sender on core 0, echo on core 1.
         "perf-b2" => Some(("perf-b2", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1543,7 +1550,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "perf-b2-echo" => Some(("perf-b2-echo", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &["perf-b2"],
             send_peers_grant:  false,
@@ -1555,7 +1562,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // B3: yield floor. No peers needed.
         "perf-b3" => Some(("perf-b3", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1567,7 +1574,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // B4: cap validation throughput. Needs recv endpoint to have a cap to query.
         "perf-b4" => Some(("perf-b4", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1579,7 +1586,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // B5/B6: spawn and restart cost. Victim spawned first so perf-b5 can kill/respawn it.
         "perf-b5-victim" => Some(("perf-b5-victim", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1590,7 +1597,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "perf-b5" => Some(("perf-b5", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1602,7 +1609,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // B7: cap table insert/remove throughput. Self-referential (acquires SEND cap to self).
         "perf-b7" => Some(("perf-b7", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1614,7 +1621,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // B8: allocator throughput. No peers needed.
         "perf-b8" => Some(("perf-b8", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1627,7 +1634,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // B9: 4 KiB message copy. Both on core 0 to isolate copy from cross-core routing.
         // Recv partner must be registered before sender's SEND cap is wired.
         "perf-b9-recv" => Some(("perf-b9-recv", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1638,7 +1645,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "perf-b9" => Some(("perf-b9", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["perf-b9-recv"],
             send_peers_grant:  false,
@@ -1650,7 +1657,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // B10: scheduler pick-next cost. No peers needed.
         "perf-b10" => Some(("perf-b10", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1665,7 +1672,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // Sender/controller spawned before echo/recv so endpoints register first.
         // ----------------------------------------------------------------
         "perf-bp1" => Some(("perf-bp1", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1676,7 +1683,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "perf-bp1-echo" => Some(("perf-bp1-echo", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &["perf-bp1"],
             send_peers_grant:  false,
@@ -1688,7 +1695,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BP2: cross-core roundtrip. Sender on core 0, echo on core 1.
         "perf-bp2" => Some(("perf-bp2", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1699,7 +1706,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "perf-bp2-echo" => Some(("perf-bp2-echo", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &["perf-bp2"],
             send_peers_grant:  false,
@@ -1711,7 +1718,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BP3: yield floor. No peers.
         "perf-bp3" => Some(("perf-bp3", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1723,7 +1730,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BP4: cap validation. Needs recv endpoint to have a cap to query.
         "perf-bp4" => Some(("perf-bp4", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1735,7 +1742,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BP5/BP6: spawn and restart cost. Victim spawned first.
         "perf-bp5-victim" => Some(("perf-bp5-victim", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1746,7 +1753,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "perf-bp5" => Some(("perf-bp5", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1758,7 +1765,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BP7: cap table insert/remove. Self-referential.
         "perf-bp7" => Some(("perf-bp7", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1770,7 +1777,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BP8: allocator throughput. No peers.
         "perf-bp8" => Some(("perf-bp8", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1782,7 +1789,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BP9: 4 KiB message copy. Both on core 0 to isolate copy from routing overhead.
         "perf-bp9-recv" => Some(("perf-bp9-recv", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1793,7 +1800,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "perf-bp9" => Some(("perf-bp9", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["perf-bp9-recv"],
             send_peers_grant:  false,
@@ -1805,7 +1812,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BP10: scheduler pick-next cost. No peers.
         "perf-bp10" => Some(("perf-bp10", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1822,7 +1829,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // ----------------------------------------------------------------
         // A1: random cap slots → always Err. No caps needed.
         "adv-a1" => Some(("adv-a1", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1834,7 +1841,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // A2: brute-force slot range → defined errors. No caps needed.
         "adv-a2" => Some(("adv-a2", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1846,7 +1853,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // A3: alloc beyond 4 MiB limit → AllocDenied. Tight memory_limit.
         "adv-a3" => Some(("adv-a3", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1858,7 +1865,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // A4: RECV cap used as SEND target → CapInsufficientRights. Has recv endpoint.
         "adv-a4" => Some(("adv-a4", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1870,7 +1877,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // A5: TOCTOU — victim must be registered before attacker's SEND cap is wired.
         "adv-a5-victim" => Some(("adv-a5-victim", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1881,7 +1888,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "adv-a5" => Some(("adv-a5", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["adv-a5-victim"],
             send_peers_grant:  false,
@@ -1893,7 +1900,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // A6: fill own cap table. Has recv endpoint so it can be acquired via name.
         "adv-a6" => Some(("adv-a6", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1905,7 +1912,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // A7: timing probe — passive recv target must be registered before sender.
         "adv-a7-recv" => Some(("adv-a7-recv", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1916,7 +1923,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "adv-a7" => Some(("adv-a7", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["adv-a7-recv"],
             send_peers_grant:  false,
@@ -1928,7 +1935,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // A8: tight-loop hog + witness. Both round-robin so preemption is tested.
         "adv-a8" => Some(("adv-a8", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1939,7 +1946,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "adv-a8-witness" => Some(("adv-a8-witness", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1951,7 +1958,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // A9: spawn non-existent service → Err. No caps needed beyond spawn (always present).
         "adv-a9" => Some(("adv-a9", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1963,7 +1970,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // A10: kernel addresses as syscall buffer args → rejected. No caps needed.
         "adv-a10" => Some(("adv-a10", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1976,7 +1983,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // A11: introspection gated — TaskStat denied without INTROSPECT cap (§3.1).
         // Name matches no introspect grant, so adv-a11 holds no introspect cap.
         "adv-a11" => Some(("adv-a11", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -1993,7 +2000,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // ----------------------------------------------------------------
         // C2: null-deref → page fault → killed. Monitor on separate round-robin core.
         "chaos-c2" => Some(("chaos-c2", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2004,7 +2011,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "chaos-c2-monitor" => Some(("chaos-c2-monitor", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2016,7 +2023,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // C3: alloc saturation. Tight 4 MiB limit so impossible requests are denied quickly.
         "chaos-c3" => Some(("chaos-c3", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2028,7 +2035,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // C5: kernel stack depth probe. No peers needed.
         "chaos-c5" => Some(("chaos-c5", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2040,7 +2047,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // C6: hog on core 3 (simulates timer-starved core) + monitor on core 0.
         "chaos-c6-hog" => Some(("chaos-c6-hog", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2051,7 +2058,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "chaos-c6-monitor" => Some(("chaos-c6-monitor", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2064,7 +2071,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // C7: cross-core kill/respawn TLB-shootdown stress.
         // Victim on core 2 must be registered before controller on core 1 gets SEND cap.
         "chaos-c7-victim" => Some(("chaos-c7-victim", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2075,7 +2082,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "chaos-c7" => Some(("chaos-c7", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["chaos-c7-victim"],
             send_peers_grant:  false,
@@ -2093,7 +2100,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // T-SMP: SMP escalation (smp=2, 8, 16 — run via osdev test identity-brutal).
         // ----------------------------------------------------------------
         "brutal-id-11" => Some(("brutal-id-11", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &["brutal-id-11"], // self-referential send peer
             send_peers_grant:  false,
@@ -2104,7 +2111,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "brutal-id-12-a" => Some(("brutal-id-12-a", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["brutal-id-12-b"],
             send_peers_grant:  false,
@@ -2115,7 +2122,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "brutal-id-12-b" => Some(("brutal-id-12-b", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &["brutal-id-12-c"], // B forwards to C
             send_peers_grant:  false,
@@ -2126,7 +2133,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "brutal-id-12-c" => Some(("brutal-id-12-c", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2137,7 +2144,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "brutal-id-13-recv" => Some(("brutal-id-13-recv", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2148,7 +2155,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "brutal-id-13-send" => Some(("brutal-id-13-send", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["brutal-id-13-recv"],
             send_peers_grant:  false,
@@ -2159,7 +2166,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "brutal-id-13-kill" => Some(("brutal-id-13-kill", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2176,7 +2183,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // ----------------------------------------------------------------
         // BA1: 50k random cap forgery attempts (5× A1). No caps needed.
         "adv-ba1" => Some(("adv-ba1", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2188,7 +2195,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BA2: extended brute-force slots 0..=511 + 4 extreme values.
         "adv-ba2" => Some(("adv-ba2", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2200,7 +2207,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BA3: 5× alloc edge-case cycles. Tight 4 MiB limit so impossible requests fail fast.
         "adv-ba3" => Some(("adv-ba3", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2212,7 +2219,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BA4: RECV cap used as SEND target × 5. Needs own recv endpoint.
         "adv-ba4" => Some(("adv-ba4", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2224,7 +2231,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BA5: 5 TOCTOU kill+send cycles. Victim registered before attacker.
         "adv-ba5-victim" => Some(("adv-ba5-victim", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2235,7 +2242,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "adv-ba5" => Some(("adv-ba5", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["adv-ba5-victim"],
             send_peers_grant:  false,
@@ -2247,7 +2254,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BA6: fill own cap table × 5 cycles. Needs recv endpoint so acquire_send_cap("adv-ba6") works.
         "adv-ba6" => Some(("adv-ba6", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2259,7 +2266,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BA7: 500 timing samples (5× A7). Passive recv registered before sender.
         "adv-ba7-recv" => Some(("adv-ba7-recv", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2270,7 +2277,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "adv-ba7" => Some(("adv-ba7", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["adv-ba7-recv"],
             send_peers_grant:  false,
@@ -2283,7 +2290,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // BA8: tight-loop hog + witness (5× A8). Pinned to core 3 to avoid
         // starving IPC/yield probes on cores 0-2 under QEMU TCG.
         "adv-ba8" => Some(("adv-ba8", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2294,7 +2301,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "adv-ba8-witness" => Some(("adv-ba8-witness", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2306,7 +2313,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BA9: 5 direct-spawn bypass attempts with bogus names → Err.
         "adv-ba9" => Some(("adv-ba9", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2318,7 +2325,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BA10: 20 kernel-space address patterns as syscall args (5× A10). No caps needed.
         "adv-ba10" => Some(("adv-ba10", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2333,7 +2340,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // BC2: 5 simultaneous null-deref faulters + 1 monitor proving system survival.
         // ----------------------------------------------------------------
         "chaos-bc2-a" => Some(("chaos-bc2-a", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2344,7 +2351,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "chaos-bc2-b" => Some(("chaos-bc2-b", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2355,7 +2362,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "chaos-bc2-c" => Some(("chaos-bc2-c", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2366,7 +2373,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "chaos-bc2-d" => Some(("chaos-bc2-d", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2377,7 +2384,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "chaos-bc2-e" => Some(("chaos-bc2-e", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2388,7 +2395,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "chaos-bc2-monitor" => Some(("chaos-bc2-monitor", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2400,7 +2407,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BC3: 2,500 alloc-deny cycles. Tight 4 MiB limit so impossible requests fail fast.
         "chaos-bc3" => Some(("chaos-bc3", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2412,7 +2419,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BC5: 500-level recursive yield_cpu() stack depth probe.
         "chaos-bc5" => Some(("chaos-bc5", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2424,7 +2431,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // BC6: 2 hogs on cores 2+3, monitor on core 0 runs 1,000 yields.
         "chaos-bc6-hog-a" => Some(("chaos-bc6-hog-a", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2435,7 +2442,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "chaos-bc6-hog-b" => Some(("chaos-bc6-hog-b", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2446,7 +2453,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "chaos-bc6-monitor" => Some(("chaos-bc6-monitor", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2459,7 +2466,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // BC7: 150 cross-core kill/respawn TLB-shootdown cycles.
         // Victim on core 2 must be registered before controller on core 1 gets SEND cap.
         "chaos-bc7-victim" => Some(("chaos-bc7-victim", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -2470,7 +2477,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         "chaos-bc7" => Some(("chaos-bc7", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PROBE_ELF")),
+            elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["chaos-bc7-victim"],
             send_peers_grant:  false,
@@ -2759,6 +2766,20 @@ fn spawn_service_with_config(
     {
         let in_cap = mint_cap(INTROSPECT_RESOURCE, Rights::READ);
         caps.insert(in_cap)
+            .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
+    }
+
+    // Services that kill other services hold the service_control cap (§3.1/§14.4;
+    // docs/service-control-cap.md): the shell (interactive broker), the supervisor
+    // (restart authority), and every test-driver probe (they kill victim services
+    // to exercise kill/revocation). Probes are identified by ELF identity
+    // (elf_bytes == PROBE_ELF) so no probe family is missed by name.
+    if name == "shell"
+        || name == "supervisor"
+        || core::ptr::eq(elf_bytes.as_ptr(), PROBE_ELF.as_ptr())
+    {
+        let sc_cap = mint_cap(SERVICE_CONTROL_RESOURCE, Rights::WRITE);
+        caps.insert(sc_cap)
             .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
     }
 

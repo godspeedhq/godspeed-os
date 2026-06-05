@@ -254,6 +254,7 @@ fn cmd_caps(ctx: &ServiceContext, name: &str) {
             3 => write_bytes(&mut buf, &mut pos, b"console_read"),
             4 => write_bytes(&mut buf, &mut pos, b"console_push"),
             5 => write_bytes(&mut buf, &mut pos, b"introspect"),
+            6 => write_bytes(&mut buf, &mut pos, b"service_control"),
             id => {
                 write_bytes(&mut buf, &mut pos, b"endpoint#");
                 write_u32(&mut buf, &mut pos, id as u32);
