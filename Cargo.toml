@@ -18,6 +18,7 @@ members = [
     "services/observe",
     "services/shell",
     "services/xhci",
+    "services/ehci",
 ]
 
 # kernel and all services/examples build for the bare-metal target;

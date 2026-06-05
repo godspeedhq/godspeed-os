@@ -309,6 +309,20 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
+        // `ehci` — userspace USB 2.0 driver (§12) for the back ports' EHCI
+        // controller. Same shape as `xhci`; the kernel grants its MMIO/DMA at
+        // spawn (E1b+). Pinned to core 1, off the shell/TCB on core 0.
+        "ehci" => Some(("ehci", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_EHCI_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    1,
+            probe_mode:        0,
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
         // ----------------------------------------------------------------
         // Probe services — §22 Group A identity tests.
         // All use the same probe ELF; probe_mode selects the test behaviour.

@@ -283,6 +283,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ehci"
+version = "0.1.0"
+dependencies = [
+ "godspeed-sdk",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
