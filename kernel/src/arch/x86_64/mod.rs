@@ -345,7 +345,6 @@ pub fn serial_write_byte(b: u8) {
     if boot_log_to_fb() {
         fb::put_byte(b);
     }
-    bump_console_activity();
 }
 
 /// Spin cap for best-effort `SERIAL_LOCK` acquisition (~seconds on real HW).
@@ -413,7 +412,6 @@ pub fn serial_write_bytes_lockfree(s: &[u8]) {
             fb::put_byte(b);
         }
     }
-    bump_console_activity();
 }
 
 /// Write one byte to the **interactive console** — COM1 *and* the framebuffer
@@ -530,21 +528,23 @@ pub fn console_boot_complete() {
     fb::clear_and_home();
 }
 
-/// Monotonic console-output activity counter. Bumped once per serial write call
-/// (log or console path). The shell watches this to detect boot quiescence: when
-/// it stops changing, boot output has settled and it is safe to clear the boot
-/// screen and hand over a clean prompt — without a magic timer.
-pub static CONSOLE_ACTIVITY: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+/// Set true by the USB keyboard driver (xHCI) once it has finished its setup —
+/// in every terminal path: keyboard enumerated, no keyboard found, or no
+/// controller/DMA. This is the deterministic end-of-boot signal: the input driver
+/// is the last thing to come up, so when it reports in, the boot sequence is done.
+/// The shell waits on this to auto-clear the boot screen — no timer, no heuristic.
+pub static INPUT_READY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
-#[inline]
-fn bump_console_activity() {
-    CONSOLE_ACTIVITY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+/// Mark input-subsystem setup complete (from the `SignalInputReady` syscall, called
+/// by the xHCI driver). The end-of-boot signal the shell watches.
+pub fn set_input_ready() {
+    INPUT_READY.store(true, core::sync::atomic::Ordering::Release);
 }
 
-/// Read the console-output activity counter (exposed via `InspectKernel` query 10).
-pub fn console_activity() -> u64 {
-    CONSOLE_ACTIVITY.load(core::sync::atomic::Ordering::Relaxed)
+/// Whether the input driver has reported in (exposed via `InspectKernel` query 10).
+pub fn input_ready() -> bool {
+    INPUT_READY.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// Enable COM1 RX interrupts (call once after com2_init, from kernel main).

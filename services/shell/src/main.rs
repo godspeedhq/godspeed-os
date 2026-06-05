@@ -15,14 +15,15 @@ const MAX_ARGS: usize = 4;
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // The boot sequence (kernel + every service's logs, the xHCI enumeration) is
     // shown on the TV during startup — the user wants to see it come up. We log our
-    // "ready" line into that stream, then wait for boot output to SETTLE before
-    // automatically clearing the TV and presenting a clean prompt (no keypress).
+    // "ready" line into that stream, then wait for the input driver to report in
+    // (the deterministic end-of-boot signal) before automatically clearing the TV
+    // and presenting a clean prompt — no keypress, no timer.
     for _ in 0..256 {
         ctx.yield_cpu();
     }
     ctx.console_writeln("shell: ready (type 'help')");
 
-    wait_for_boot_quiescence(&ctx);
+    wait_for_input_ready(&ctx);
 
     // Boot is done: dismiss the boot screen on the TV (clear + stop mirroring logs
     // to it) and present a clean prompt. Serial keeps the full stream. This is also
@@ -65,33 +66,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     }
 }
 
-/// Wait until boot output has settled, so we clear the boot screen only after the
-/// init sequence (including the asynchronous xHCI keyboard enumeration on another
-/// core) has finished — never mid-stream. We watch the kernel's console-activity
-/// counter: when it stops changing across consecutive windows, boot is quiet.
-/// Bounded by `MAX_WINDOWS` so a service that logs forever can't wedge startup —
-/// we hand over the prompt regardless once the cap is hit.
-fn wait_for_boot_quiescence(ctx: &ServiceContext) {
-    const WINDOW_YIELDS: u32 = 4000; // long enough to span gaps between boot lines
-    const QUIET_NEEDED:  u32 = 2;    // consecutive quiet windows to confirm settled
-    const MAX_WINDOWS:   u32 = 200;  // upper bound on the total wait
-
-    let mut last  = ctx.console_activity();
-    let mut quiet = 0u32;
-    for _ in 0..MAX_WINDOWS {
-        for _ in 0..WINDOW_YIELDS {
-            ctx.yield_cpu();
+/// Wait until the input subsystem reports in — the deterministic end-of-boot
+/// signal. The xHCI driver sets `input_ready` once it finishes, in every terminal
+/// path (keyboard up, no keyboard, or no controller), and it is the last
+/// subsystem to come up. So when it reports, the boot sequence — including the
+/// asynchronous xHCI enumeration on another core — is genuinely done, and we can
+/// clear the boot screen without ever cutting it off mid-stream. The loop is just
+/// polling that flag; `MAX_SPINS` is a pure safety net for the impossible case
+/// where the driver never reports (it would mean xHCI hard-crashed at boot).
+fn wait_for_input_ready(ctx: &ServiceContext) {
+    const MAX_SPINS: u32 = 50_000_000;
+    for _ in 0..MAX_SPINS {
+        if ctx.input_ready() {
+            return;
         }
-        let now = ctx.console_activity();
-        if now == last {
-            quiet += 1;
-            if quiet >= QUIET_NEEDED {
-                return;
-            }
-        } else {
-            quiet = 0;
-            last = now;
-        }
+        ctx.yield_cpu();
     }
 }
 

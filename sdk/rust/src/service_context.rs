@@ -412,13 +412,22 @@ impl ServiceContext {
         }
     }
 
-    /// Monotonic console-output activity counter (syscall 13, query 10). Bumped on
-    /// every serial write (log or console). The shell watches it for boot
-    /// quiescence — when it stops changing, boot output has settled. Ambient.
-    pub fn console_activity(&self) -> u64 {
-        // SAFETY: syscall(13) = InspectKernel; query_id=10 = console activity.
-        let ret = unsafe { raw_syscall(13, 10, 0, 0) };
-        if ret < 0 { 0 } else { ret as u64 }
+    /// Whether the input driver has reported setup complete (syscall 13, query 10).
+    /// The deterministic end-of-boot signal: the shell watches it to auto-clear the
+    /// boot screen the moment the keyboard subsystem is up. Ambient.
+    pub fn input_ready(&self) -> bool {
+        // SAFETY: syscall(13) = InspectKernel; query_id=10 = input-ready flag.
+        unsafe { raw_syscall(13, 10, 0, 0) > 0 }
+    }
+
+    /// Report that input-subsystem setup is complete (syscall 27). Called by the
+    /// USB keyboard driver (xHCI) in every terminal path once it has finished — the
+    /// end-of-boot signal. Requires the CONSOLE_PUSH cap (the input driver only).
+    pub fn signal_input_ready(&self) {
+        let slot = Self::ctx().console_push_slot;
+        if slot == u32::MAX { return; }
+        // SAFETY: syscall(27) = SignalInputReady; slot is the kernel-written cap index.
+        let _ = unsafe { raw_syscall(27, slot as u64, 0, 0) };
     }
 
     /// Read the hardware TSC (Time Stamp Counter) via the kernel.
