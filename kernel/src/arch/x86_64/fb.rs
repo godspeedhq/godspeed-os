@@ -51,11 +51,22 @@ struct Fb {
     fg: u32,       // foreground pixel value (already in the device's channel layout)
     bg: u32,       // background pixel value
     ready: bool,   // false until fb_init runs; put_byte no-ops until then
+    // --- Minimal ANSI escape parser (Stage 2a) ---
+    // The console service drives the terminal by emitting a small ANSI subset
+    // (clear, cursor position, erase line, hide/show cursor). The same escapes
+    // work on a serial terminal for free. State persists across put_byte calls
+    // because an escape sequence spans several bytes.
+    esc: u8,             // 0 = normal, 1 = saw ESC, 2 = inside CSI (after '[')
+    csi_priv: bool,      // saw '?' immediately after '[' (private-mode sequence)
+    csi_params: [u16; 3],// numeric parameters (e.g. row;col)
+    csi_nparam: usize,   // count of parameters accumulated
+    cursor_visible: bool,// draw the underline cursor (off for full-screen apps)
 }
 
 static FB: SpinLock<Fb> = SpinLock::new(Fb {
     base: 0, pitch: 0, bpp: 0, width: 0, height: 0,
     org_x: 0, org_y: 0, cols: 0, rows: 0, col: 0, row: 0, fg: 0, bg: 0, ready: false,
+    esc: 0, csi_priv: false, csi_params: [0; 3], csi_nparam: 0, cursor_visible: true,
 });
 
 /// Safe-area inset per edge, as a percentage of each dimension. TVs overscan
@@ -88,30 +99,77 @@ pub fn fb_init(fb: &Framebuffer) {
     s.row = 0;
     s.fg = make(0x80, 0xFF, 0x80); // soft green on black — classic console look
     s.bg = make(0x00, 0x00, 0x00);
+    s.esc = 0;
+    s.csi_nparam = 0;
+    s.cursor_visible = true;
     s.ready = true;
     clear(&s);
 }
 
-/// Mirror one output byte to the framebuffer console. Called from
-/// `serial_write_byte` / `serial_write_bytes_lockfree` for every output byte.
+/// Framebuffer text geometry packed as `(rows << 16) | cols`, or 0 if the
+/// console has not been initialised. Exposed to userspace via `InspectKernel`
+/// query 9 so the console service can lay out its terminal.
+pub fn dims_packed() -> u32 {
+    let s = FB.lock();
+    if !s.ready { return 0; }
+    (((s.rows as u32) & 0xFFFF) << 16) | ((s.cols as u32) & 0xFFFF)
+}
+
+/// Write one output byte to the framebuffer console. Called from
+/// `console_write_byte` / `console_write_bytes` (Stage 1: only the interactive
+/// console path reaches the framebuffer; logs go to serial only).
+///
+/// Recognises a minimal ANSI escape subset (Stage 2a) so the console service can
+/// drive a terminal: `ESC[2J` clear, `ESC[H`/`ESC[r;cH` cursor position,
+/// `ESC[K`/`ESC[2K` erase line, `ESC[J` erase to end of screen, `ESC[?25l/h`
+/// hide/show cursor. Unrecognised escapes are consumed and dropped.
 pub fn put_byte(b: u8) {
     let mut s = FB.lock();
     if !s.ready {
         return;
     }
+
+    // --- Escape-sequence state machine ---
+    match s.esc {
+        1 => {
+            // Saw ESC; expect '[' to start a CSI sequence. Anything else: drop.
+            if b == b'[' {
+                s.esc = 2;
+                s.csi_priv = false;
+                s.csi_params = [0; 3];
+                s.csi_nparam = 0;
+            } else {
+                s.esc = 0;
+            }
+            return;
+        }
+        2 => {
+            handle_csi(&mut s, b);
+            return;
+        }
+        _ => {}
+    }
+    if b == 0x1B {
+        s.esc = 1;
+        return;
+    }
+
+    // --- Normal byte ---
+    // Erase the underline cursor at the current cell before changing position or
+    // drawing, so it never leaves a trail. Redraw it at the new position after.
+    if s.cursor_visible {
+        erase_cursor(&s);
+    }
     match b {
-        // Position-changing controls: the cursor cell is not overwritten by a
-        // glyph, so erase it before moving (otherwise it leaves a trail).
-        b'\n' => { erase_cursor(&s); advance_line(&mut s); }
-        b'\r' => { erase_cursor(&s); s.col = 0; }
+        b'\n' => advance_line(&mut s),
+        b'\r' => s.col = 0,
         0x08 | 0x7f => {
-            erase_cursor(&s);
             if s.col > 0 {
                 s.col -= 1;
             }
         }
         0x20..=0x7e => {
-            // The glyph is drawn at the cursor cell, overwriting the cursor.
+            // The glyph is drawn at the (now blank) cursor cell.
             let (c, r) = (s.col, s.row);
             draw_glyph(&s, b, c, r);
             s.col += 1;
@@ -122,9 +180,120 @@ pub fn put_byte(b: u8) {
         _ => {}
     }
     // The cursor follows the write position: a steady underline at the cell where
-    // the next character will land. It rests after `gs> ` when idle and trails the
-    // text as you type. Framebuffer only — a serial terminal draws its own cursor.
-    draw_cursor(&s);
+    // the next character will land. Framebuffer only — a serial terminal draws its
+    // own cursor. Full-screen apps hide it via ESC[?25l.
+    if s.cursor_visible {
+        draw_cursor(&s);
+    }
+}
+
+/// Handle one byte inside a CSI (`ESC[`) sequence. Accumulates numeric
+/// parameters until a final byte (0x40..=0x7e) dispatches the command.
+fn handle_csi(s: &mut Fb, b: u8) {
+    match b {
+        b'0'..=b'9' => {
+            if s.csi_nparam == 0 {
+                s.csi_nparam = 1;
+            }
+            let i = s.csi_nparam - 1;
+            if i < s.csi_params.len() {
+                s.csi_params[i] = s.csi_params[i]
+                    .saturating_mul(10)
+                    .saturating_add((b - b'0') as u16);
+            }
+        }
+        b';' => {
+            if s.csi_nparam == 0 {
+                s.csi_nparam = 1; // empty leading parameter defaults to 0
+            }
+            if s.csi_nparam < s.csi_params.len() {
+                s.csi_nparam += 1;
+            }
+        }
+        b'?' => {
+            s.csi_priv = true;
+        }
+        0x40..=0x7e => {
+            execute_csi(s, b);
+            s.esc = 0;
+        }
+        _ => {
+            // Malformed — abort the sequence.
+            s.esc = 0;
+        }
+    }
+}
+
+/// `csi_params[i]`, or `default` if fewer than `i+1` parameters were given.
+fn csi_param(s: &Fb, i: usize, default: u16) -> u16 {
+    if i < s.csi_nparam {
+        s.csi_params[i]
+    } else {
+        default
+    }
+}
+
+/// Dispatch a complete CSI command given its final byte.
+fn execute_csi(s: &mut Fb, final_byte: u8) {
+    // Erase the underline cursor before any geometry change so it leaves no trail.
+    if s.cursor_visible {
+        erase_cursor(s);
+    }
+    match final_byte {
+        // Cursor position: ESC[r;cH or ESC[r;cf (1-based; defaults to 1,1 = home).
+        b'H' | b'f' => {
+            let r = csi_param(s, 0, 1).max(1) as usize - 1;
+            let c = csi_param(s, 1, 1).max(1) as usize - 1;
+            s.row = r.min(s.rows.saturating_sub(1));
+            s.col = c.min(s.cols.saturating_sub(1));
+        }
+        // Erase in display: 2 = whole screen + home; 0 (default) = cursor to end.
+        b'J' => match csi_param(s, 0, 0) {
+            2 => {
+                clear(s);
+                s.row = 0;
+                s.col = 0;
+            }
+            _ => erase_to_end_of_screen(s),
+        },
+        // Erase in line: 2 = whole line; 0 (default) = cursor to end of line.
+        b'K' => match csi_param(s, 0, 0) {
+            2 => erase_line_full(s),
+            _ => erase_line_to_eol(s),
+        },
+        // Private mode set/reset: ESC[?25h shows the cursor, ESC[?25l hides it.
+        b'h' if s.csi_priv && csi_param(s, 0, 0) == 25 => s.cursor_visible = true,
+        b'l' if s.csi_priv && csi_param(s, 0, 0) == 25 => s.cursor_visible = false,
+        _ => {} // unsupported command — ignore
+    }
+    if s.cursor_visible {
+        draw_cursor(s);
+    }
+}
+
+/// Blank cells from the cursor column to the end of the current row.
+fn erase_line_to_eol(s: &Fb) {
+    for c in s.col..s.cols {
+        draw_glyph(s, b' ', c, s.row);
+    }
+}
+
+/// Blank every cell on the current row.
+fn erase_line_full(s: &Fb) {
+    for c in 0..s.cols {
+        draw_glyph(s, b' ', c, s.row);
+    }
+}
+
+/// Blank from the cursor to the end of the screen (rest of this row, then every
+/// row below it).
+fn erase_to_end_of_screen(s: &Fb) {
+    erase_line_to_eol(s);
+    for r in (s.row + 1)..s.rows {
+        for c in 0..s.cols {
+            draw_glyph(s, b' ', c, r);
+        }
+    }
 }
 
 /// Draw the text cursor (a steady underline) at the current write position.

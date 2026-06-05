@@ -657,10 +657,11 @@ fn handle_abort(msg_ptr: u64, msg_len: u64) -> i64 {
 ///   Returns the current generation of the named endpoint as a non-negative
 ///   i64, or -1 if the name is not registered.
 fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
-    // Self-state (0 = own alloc bytes) and the clock (3 = TSC) are ungated. Every
-    // other query discloses another task's or system-wide state and requires the
+    // Self-state (0 = own alloc bytes), the clock (3 = TSC), and console geometry
+    // (9 = fbcon rows/cols — task-neutral hardware info) are ungated. Every other
+    // query discloses another task's or system-wide state and requires the
     // INTROSPECT capability with READ (§3.1; docs/introspection-capability.md).
-    if !matches!(query_id, 0 | 3)
+    if !matches!(query_id, 0 | 3 | 9)
         && !scheduler::current_task_holds_resource(
             crate::capability::INTROSPECT_RESOURCE, Rights::READ)
     {
@@ -670,6 +671,10 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         0 => scheduler::current_task_alloc_bytes() as i64,
         1 => crate::ipc::routing::count_live_endpoints() as i64,
         3 => read_cycle_counter() as i64,
+        // Console (fbcon) geometry packed as (rows << 16) | cols. The console
+        // service needs this to lay out its terminal (pin the input line to the
+        // bottom row). 0 if the framebuffer never initialised.
+        9 => crate::arch::x86_64::fb::dims_packed() as i64,
         4 => crate::memory::allocator::free_frame_count() as i64,
         5 => crate::memory::allocator::total_frame_count() as i64,
         6 => scheduler::core_active_ticks(arg1 as usize) as i64,

@@ -396,6 +396,22 @@ impl ServiceContext {
         if ret <= 0 { 1 } else { ret as u32 }
     }
 
+    /// Framebuffer console geometry as `(rows, cols)` text cells, or `(0, 0)` if
+    /// there is no framebuffer. The console service uses this to lay out its
+    /// terminal (pin the input line to the bottom row).
+    ///
+    /// Wraps InspectKernel query 9 (ambient — screen geometry is task-neutral).
+    pub fn console_dims(&self) -> (u16, u16) {
+        // SAFETY: syscall(13) = InspectKernel; query_id=9 = packed (rows<<16)|cols.
+        let ret = unsafe { raw_syscall(13, 9, 0, 0) };
+        if ret <= 0 {
+            (0, 0)
+        } else {
+            let packed = ret as u64;
+            (((packed >> 16) & 0xFFFF) as u16, (packed & 0xFFFF) as u16)
+        }
+    }
+
     /// Read the hardware TSC (Time Stamp Counter) via the kernel.
     ///
     /// Returns RDTSC cycle count. Useful for measuring kernel operation latencies
