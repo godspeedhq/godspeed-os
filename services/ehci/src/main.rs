@@ -296,11 +296,13 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
     let setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]; // Get_Descriptor(Device), 18
     if control(ctx, mmio, &dma, op, &Ep::hs(0, 64), &setup, 18, true).is_none() { return; }
     let class = dma.read8(DATA_BUF + 4);
+    let proto = dma.read8(DATA_BUF + 6); // hub: 0/1 = single-TT, 2 = multi-TT
     let mps0  = dma.read8(DATA_BUF + 7) as u32;
     let vid   = dma.read16(DATA_BUF + 8);
     let pid   = dma.read16(DATA_BUF + 10);
     ctx.log_fmt(format_args!(
-        "ehci: DEVICE DESCRIPTOR class={:#04x} mps0={} VID={:#06x} PID={:#06x}", class, mps0, vid, pid));
+        "ehci: DEVICE DESCRIPTOR class={:#04x} proto={} (TT type) mps0={} VID={:#06x} PID={:#06x}",
+        class, proto, mps0, vid, pid));
 
     // E3c: assign address 1.
     let setup = [0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]; // Set_Address(1)
@@ -362,33 +364,33 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
             port, status, (status & 1) as u8, ((status >> 9) & 1) as u8));
         if status & 1 == 0 { continue; } // nothing connected
 
-        // Reset the downstream port and clear the reset-change.
-        let setup = [0x23, 0x03, 0x04, 0x00, port, 0x00, 0x00, 0x00]; // Set_Feature(PORT_RESET)
-        let _ = control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &setup, 0, false);
-        delay_cycles(ctx, RESET_HOLD_CYCLES);
-        let setup = [0x23, 0x01, 0x14, 0x00, port, 0x00, 0x00, 0x00]; // Clear_Feature(C_PORT_RESET)
-        let _ = control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &setup, 0, false);
-        delay_cycles(ctx, RECOVERY_CYCLES);
-
-        // Confirm the port enabled (bit 1) after reset.
-        let setup = [0xA3, 0x00, 0x00, 0x00, port, 0x00, 0x04, 0x00];
-        let _ = control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &setup, 4, true);
-        let pstat = dma.read16(DATA_BUF + 0);
-        ctx.log_fmt(format_args!(
-            "ehci: hub port {} after reset: status={:#06x} enabled={}",
-            port, pstat, ((pstat >> 1) & 1) as u8));
-
-        // Read the low-speed device's descriptor over SPLIT (EP0 max packet 8),
-        // retrying a couple times — the first transaction after reset can XactErr.
+        // Reset the port and read the device descriptor over SPLIT, retrying with a
+        // FULL re-reset (+ connect-debounce + longer recovery) each attempt — the
+        // Logitech keyboard's first SETUP after a single reset XactErrs, the
+        // Microsoft mouse needs only one.
         let kep = Ep::low(0, 8, 1, port);
-        let setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]; // Get_Descriptor(Device), 18
+        let dd  = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]; // Get_Descriptor(Device), 18
         let mut got = false;
-        for _ in 0..3 {
-            if control(ctx, mmio, &dma, op, &kep, &setup, 18, true).is_some() { got = true; break; }
-            delay_cycles(ctx, RECOVERY_CYCLES);
+        for attempt in 1..=3u32 {
+            delay_cycles(ctx, DEBOUNCE_CYCLES); // connect-debounce before reset
+            let s = [0x23, 0x03, 0x04, 0x00, port, 0x00, 0x00, 0x00]; // Set_Feature(PORT_RESET)
+            let _ = control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &s, 0, false);
+            delay_cycles(ctx, RESET_HOLD_CYCLES);
+            let s = [0x23, 0x01, 0x14, 0x00, port, 0x00, 0x00, 0x00]; // Clear_Feature(C_PORT_RESET)
+            let _ = control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &s, 0, false);
+            delay_cycles(ctx, RESET_HOLD_CYCLES); // generous post-reset recovery
+
+            let s = [0xA3, 0x00, 0x00, 0x00, port, 0x00, 0x04, 0x00]; // Get_Status
+            let _ = control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &s, 4, true);
+            let pstat = dma.read16(DATA_BUF + 0);
+
+            if control(ctx, mmio, &dma, op, &kep, &dd, 18, true).is_some() { got = true; break; }
+            ctx.log_fmt(format_args!(
+                "ehci: hub port {} attempt {} failed (post-reset status={:#06x}) — re-resetting",
+                port, attempt, pstat));
         }
         if !got {
-            ctx.log_fmt(format_args!("ehci: split descriptor on hub port {} failed (3 tries)", port));
+            ctx.log_fmt(format_args!("ehci: split descriptor on hub port {} failed after 3 resets", port));
             continue;
         }
         let vid = dma.read16(DATA_BUF + 8);
@@ -445,6 +447,8 @@ fn delay_cycles(ctx: &ServiceContext, cycles: u64) {
 const RESET_HOLD_CYCLES: u64 = 200_000_000;
 /// ~20 ms at 2 GHz — reset-recovery settle before reading the port.
 const RECOVERY_CYCLES:   u64 = 40_000_000;
+/// ~50 ms at 2 GHz — connect-debounce before resetting a hub downstream port.
+const DEBOUNCE_CYCLES:   u64 = 100_000_000;
 
 // --- EHCI operational registers (offsets from base + CAPLENGTH) + bit fields ---
 const OP_USBCMD:     usize = 0x00;
