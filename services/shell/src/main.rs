@@ -371,6 +371,11 @@ const CORE_SERVICES: [&str; 3] = ["init", "supervisor", "registry"];
 const PROTECTED_MSG: &str =
     "Not applicable. Core services (init, supervisor, registry) are protected";
 
+/// Shown when spawn/kill/restart targets an observe variant — they are brokered by
+/// the `observe` / `observe now` commands, not raw service operations.
+const OBSERVE_HINT: &str =
+    "observe runs from a command: type 'observe' (live) or 'observe now' (snapshot)";
+
 fn is_core_service(name: &str) -> bool {
     CORE_SERVICES.contains(&name)
 }
@@ -393,7 +398,7 @@ fn report(ctx: &ServiceContext, prefix: &str, name: &str) {
 
 fn cmd_spawn(ctx: &ServiceContext, name: &str) {
     if is_observe_variant(name) {
-        ctx.console_writeln("observe runs from a command: type 'observe' (live) or 'observe now' (snapshot)");
+        ctx.console_writeln(OBSERVE_HINT);
         return;
     }
     if is_core_service(name) {
@@ -441,6 +446,10 @@ fn cmd_kill(ctx: &ServiceContext, name: &str) {
         ctx.console_writeln(PROTECTED_MSG);
         return;
     }
+    if is_observe_variant(name) {
+        ctx.console_writeln(OBSERVE_HINT);
+        return;
+    }
     if slot_of(ctx, name).is_none() {
         report(ctx, "not running: ", name);
         return;
@@ -457,7 +466,7 @@ fn cmd_restart(ctx: &ServiceContext, name: &str, core: Option<u32>) {
         return;
     }
     if is_observe_variant(name) {
-        ctx.console_writeln("observe runs from a command: type 'observe' (live) or 'observe now' (snapshot)");
+        ctx.console_writeln(OBSERVE_HINT);
         return;
     }
     match ctx.restart(name, core) {
