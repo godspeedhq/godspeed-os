@@ -239,6 +239,10 @@ fn cmd_caps(ctx: &ServiceContext, name: &str) {
         ctx.console_writeln("  (none)");
         return;
     }
+    // Legend: left column is the resource the cap targets, right column the rights
+    // it grants (§7.4). log_write/spawn/console_read/console_push/introspect are
+    // kernel resources; endpoint#N is an IPC endpoint.
+    ctx.console_writeln("  RESOURCE (target)  RIGHTS (read/write/send/recv/grant/revoke)");
     for cap in caps.iter().take(n) {
         let mut buf = [b' '; 64];
         let mut pos = 0usize;
@@ -256,12 +260,12 @@ fn cmd_caps(ctx: &ServiceContext, name: &str) {
             }
         }
         while pos < 18 { buf[pos] = b' '; pos += 1; }
-        // Rights letters.
+        // Rights spelled out (§7.4) so no decoding is needed.
         let r = cap.rights;
-        if r & 0x01 != 0 { write_bytes(&mut buf, &mut pos, b"rd "); }
-        if r & 0x02 != 0 { write_bytes(&mut buf, &mut pos, b"wr "); }
-        if r & 0x04 != 0 { write_bytes(&mut buf, &mut pos, b"snd "); }
-        if r & 0x08 != 0 { write_bytes(&mut buf, &mut pos, b"rcv "); }
+        if r & 0x01 != 0 { write_bytes(&mut buf, &mut pos, b"read "); }
+        if r & 0x02 != 0 { write_bytes(&mut buf, &mut pos, b"write "); }
+        if r & 0x04 != 0 { write_bytes(&mut buf, &mut pos, b"send "); }
+        if r & 0x08 != 0 { write_bytes(&mut buf, &mut pos, b"recv "); }
         if r & 0x10 != 0 { write_bytes(&mut buf, &mut pos, b"grant "); }
         if r & 0x20 != 0 { write_bytes(&mut buf, &mut pos, b"revoke "); }
         ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("?"));
@@ -362,6 +366,11 @@ fn find_running_slot(ctx: &ServiceContext, name: &str) -> Option<u32> {
 /// a second instance; the shell explains why before the syscall is even tried.
 const CORE_SERVICES: [&str; 3] = ["init", "supervisor", "registry"];
 
+/// Shown when spawn/kill/restart targets a core service — "Not applicable" makes
+/// it clear the command is refused *because* the target is protected, not failed.
+const PROTECTED_MSG: &str =
+    "Not applicable. Core services (init, supervisor, registry) are protected";
+
 fn is_core_service(name: &str) -> bool {
     CORE_SERVICES.contains(&name)
 }
@@ -388,7 +397,7 @@ fn cmd_spawn(ctx: &ServiceContext, name: &str) {
         return;
     }
     if is_core_service(name) {
-        ctx.console_writeln("spawn: core services (init, supervisor, registry) are protected");
+        ctx.console_writeln(PROTECTED_MSG);
         return;
     }
     if slot_of(ctx, name).is_some() {
@@ -429,7 +438,7 @@ fn cmd_pipe(ctx: &ServiceContext, producer: &str, sink: &str) {
 
 fn cmd_kill(ctx: &ServiceContext, name: &str) {
     if is_core_service(name) {
-        ctx.console_writeln("kill: core services (init, supervisor, registry) are protected");
+        ctx.console_writeln(PROTECTED_MSG);
         return;
     }
     if slot_of(ctx, name).is_none() {
@@ -444,7 +453,7 @@ fn cmd_kill(ctx: &ServiceContext, name: &str) {
 
 fn cmd_restart(ctx: &ServiceContext, name: &str, core: Option<u32>) {
     if is_core_service(name) {
-        ctx.console_writeln("restart: core services (init, supervisor, registry) are protected");
+        ctx.console_writeln(PROTECTED_MSG);
         return;
     }
     if is_observe_variant(name) {

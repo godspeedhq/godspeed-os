@@ -212,7 +212,7 @@ pub fn run(image_path: &Path, smp: u32) {
     // -----------------------------------------------------------------------
     send(&mut write_half, b"spawn supervisor\r");
     match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("core services") && r.contains("protected"),
+        Some(r) => check!(r.contains("Core services") && r.contains("protected"),
                           "spawn: trusted-root refused with reason"),
         None    => { println!("shell-test: FAIL — timed out after spawn supervisor"); fail += 1; }
     }
