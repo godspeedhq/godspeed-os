@@ -388,6 +388,19 @@ fn is_observe_variant(name: &str) -> bool {
     matches!(name, "observe" | "observe-now" | "observe-live")
 }
 
+/// Services the live console session depends on for I/O. Killing/restarting them
+/// from the shell would brick the very session issuing the command — the input
+/// driver (`xhci` = USB keyboard) or the shell itself. Returns the reason to show,
+/// or `None` if `name` is safe to operate on. (Not a §6.2 trusted-root guard —
+/// these are restartable in principle, just not from the session that needs them.)
+fn session_critical_msg(name: &str) -> Option<&'static str> {
+    match name {
+        "xhci"  => Some("Not applicable. xhci is the USB keyboard driver — killing it disables input"),
+        "shell" => Some("Not applicable. that is this shell — the session you are typing in"),
+        _       => None,
+    }
+}
+
 /// Print `prefix` followed by `name` as one console line.
 fn report(ctx: &ServiceContext, prefix: &str, name: &str) {
     let mut buf = [0u8; 96];
@@ -447,6 +460,10 @@ fn cmd_kill(ctx: &ServiceContext, name: &str) {
         ctx.console_writeln(PROTECTED_MSG);
         return;
     }
+    if let Some(msg) = session_critical_msg(name) {
+        ctx.console_writeln(msg);
+        return;
+    }
     if is_observe_variant(name) {
         ctx.console_writeln(OBSERVE_HINT);
         return;
@@ -464,6 +481,10 @@ fn cmd_kill(ctx: &ServiceContext, name: &str) {
 fn cmd_restart(ctx: &ServiceContext, name: &str, core: Option<u32>) {
     if is_core_service(name) {
         ctx.console_writeln(PROTECTED_MSG);
+        return;
+    }
+    if let Some(msg) = session_critical_msg(name) {
+        ctx.console_writeln(msg);
         return;
     }
     if is_observe_variant(name) {
