@@ -143,11 +143,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         ));
 
-        // E3b — the device on the port (the high-speed hub) is now enabled at the
-        // default address 0. Build the async schedule and read its device
-        // descriptor over a control transfer.
+        // E3b/E3c — the device on the port (the high-speed hub) is now enabled at
+        // the default address 0. Build the async schedule, address it, configure
+        // it, and read its hub descriptor.
         if enabled {
-            e3b_read_device_descriptor(&ctx, &mmio, op);
+            enumerate_hub(&ctx, &mmio, op);
         }
     }
 
@@ -173,15 +173,15 @@ const QTD_ACTIVE: u32 = 1 << 7;
 const QTD_HALTED: u32 = 1 << 6;
 const QTD_ERRMASK: u32 = (1 << 3) | (1 << 4) | (1 << 5); // XactErr | Babble | BufErr
 
-/// E3b — read the enabled high-speed device's device descriptor over a control
-/// transfer (Get_Descriptor(Device)) using a one-QH async schedule. The device is
-/// at the default address 0. Confirms it's the rate-matching hub (bDeviceClass
-/// 0x09) and reports VID/PID, before E3c does the hub-class enumeration.
-fn e3b_read_device_descriptor(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
-    let dma = match ctx.dma_region() {
-        Some(d) => d,
-        None => { ctx.log("ehci: no DMA arena granted — cannot enumerate; idling"); return; }
-    };
+/// Run one control transfer on EP0 of the device at `addr` (high-speed, no split —
+/// we talk to the rate-matching hub directly). `setup` is the 8-byte setup packet;
+/// for an IN transfer up to `data_len` bytes land in DATA_BUF. Returns the byte
+/// count transferred, or None on error/timeout (with the qTD tokens logged). The
+/// async schedule stays enabled across calls; the single QH is idle between them.
+fn control(
+    ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
+    op: usize, addr: u8, max_packet: u32, setup: &[u8; 8], data_len: usize, in_dir: bool,
+) -> Option<usize> {
     dma.zero();
 
     let qh_phys     = dma.phys_at(QH_OFF) as u32;
@@ -191,69 +191,128 @@ fn e3b_read_device_descriptor(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, o
     let pkt_phys    = dma.phys_at(SETUP_PKT) as u32;
     let buf_phys    = dma.phys_at(DATA_BUF) as u32;
 
-    // Queue Head for EP0 of the high-speed device at address 0.
-    dma.write32(QH_OFF + 0x00, (qh_phys & !0x1F) | (1 << 1)); // self-link, Typ=QH, T=0
-    // EP chars: addr 0, EP 0, speed=HS(2<<12), DTC=1, H=1 (reclamation head), MaxPkt=64.
-    dma.write32(QH_OFF + 0x04, (2 << 12) | (1 << 14) | (1 << 15) | (64 << 16));
-    dma.write32(QH_OFF + 0x08, 1 << 30); // EP caps: Mult=1 (no split — talking to the HS hub)
-    dma.write32(QH_OFF + 0x0C, 0);       // current qTD
-    dma.write32(QH_OFF + 0x10, setup_phys & !0x1F); // overlay: next qTD = SETUP
-    dma.write32(QH_OFF + 0x14, 1);       // alt next qTD = terminate
-    dma.write32(QH_OFF + 0x18, 0);       // overlay token: Active clear → fetch next qTD
+    // QH for EP0 @ addr: HS speed, DTC=1, reclamation head, this transfer's MaxPkt.
+    dma.write32(QH_OFF + 0x00, (qh_phys & !0x1F) | (1 << 1));
+    dma.write32(QH_OFF + 0x04,
+        (addr as u32 & 0x7F) | (2 << 12) | (1 << 14) | (1 << 15) | (max_packet << 16));
+    dma.write32(QH_OFF + 0x08, 1 << 30); // Mult=1
+    dma.write32(QH_OFF + 0x0C, 0);
+    dma.write32(QH_OFF + 0x10, setup_phys & !0x1F);
+    dma.write32(QH_OFF + 0x14, 1);
+    dma.write32(QH_OFF + 0x18, 0);
 
-    // SETUP qTD: 8-byte setup packet, DATA0.
-    dma.write32(QTD_SETUP + 0x00, data_phys & !0x1F);
+    // 8-byte setup packet → two little-endian dwords.
+    let s0 = setup[0] as u32 | (setup[1] as u32) << 8 | (setup[2] as u32) << 16 | (setup[3] as u32) << 24;
+    let s1 = setup[4] as u32 | (setup[5] as u32) << 8 | (setup[6] as u32) << 16 | (setup[7] as u32) << 24;
+    dma.write32(SETUP_PKT + 0x00, s0);
+    dma.write32(SETUP_PKT + 0x04, s1);
+
+    // SETUP qTD (DATA0). Chains to DATA if there is a data stage, else STATUS.
+    let after_setup = if data_len > 0 { data_phys } else { status_phys };
+    dma.write32(QTD_SETUP + 0x00, after_setup & !0x1F);
     dma.write32(QTD_SETUP + 0x04, 1);
-    dma.write32(QTD_SETUP + 0x08, QTD_ACTIVE | (2 << 8) | (3 << 10) | (8 << 16)); // PID=SETUP, CERR=3, 8 bytes
+    dma.write32(QTD_SETUP + 0x08, QTD_ACTIVE | (2 << 8) | (3 << 10) | (8 << 16));
     dma.write32(QTD_SETUP + 0x0C, pkt_phys);
 
-    // DATA qTD: IN, 18 bytes, DATA1.
-    dma.write32(QTD_DATA + 0x00, status_phys & !0x1F);
-    dma.write32(QTD_DATA + 0x04, 1);
-    dma.write32(QTD_DATA + 0x08, QTD_ACTIVE | (1 << 8) | (3 << 10) | (18 << 16) | (1 << 31)); // PID=IN, 18 bytes, DT=1
-    dma.write32(QTD_DATA + 0x0C, buf_phys);
+    // DATA qTD (DATA1), if any. PID IN=01 / OUT=00.
+    if data_len > 0 {
+        let pid = if in_dir { 1u32 } else { 0u32 };
+        dma.write32(QTD_DATA + 0x00, status_phys & !0x1F);
+        dma.write32(QTD_DATA + 0x04, 1);
+        dma.write32(QTD_DATA + 0x08,
+            QTD_ACTIVE | (pid << 8) | (3 << 10) | ((data_len as u32) << 16) | (1 << 31));
+        dma.write32(QTD_DATA + 0x0C, buf_phys);
+    }
 
-    // STATUS qTD: OUT, 0 bytes, DATA1, interrupt-on-complete.
-    dma.write32(QTD_STATUS + 0x00, 1); // terminate
+    // STATUS qTD (DATA1, IOC). Opposite direction: IN unless the data stage was IN.
+    let status_pid = if in_dir && data_len > 0 { 0u32 } else { 1u32 };
+    dma.write32(QTD_STATUS + 0x00, 1);
     dma.write32(QTD_STATUS + 0x04, 1);
-    dma.write32(QTD_STATUS + 0x08, QTD_ACTIVE | (0 << 8) | (3 << 10) | (1 << 15) | (1 << 31)); // PID=OUT, IOC, DT=1
+    dma.write32(QTD_STATUS + 0x08,
+        QTD_ACTIVE | (status_pid << 8) | (3 << 10) | (1 << 15) | (1 << 31));
     dma.write32(QTD_STATUS + 0x0C, 0);
 
-    // Setup packet: Get_Descriptor(Device, index 0, length 18).
-    dma.write32(SETUP_PKT + 0x00, 0x0100_0680); // bmRequestType=0x80 bRequest=0x06 wValue=0x0100
-    dma.write32(SETUP_PKT + 0x04, 0x0012_0000); // wIndex=0 wLength=18
-
-    // Point the async list at the QH and enable the async schedule.
+    // Point the async list at the QH; enable the schedule if it isn't already.
     mmio.write32(op + OP_CTRLDSSEGMENT, 0);
     mmio.write32(op + OP_ASYNCLISTADDR, qh_phys & !0x1F);
-    mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) | CMD_ASE);
-    wait(mmio, op + OP_USBSTS, STS_ASS, true);
+    if mmio.read32(op + OP_USBSTS) & STS_ASS == 0 {
+        mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) | CMD_ASE);
+        wait(mmio, op + OP_USBSTS, STS_ASS, true);
+    }
 
-    // Wait for the STATUS qTD to retire (Active clears) — the whole transfer done.
+    // Wait for the STATUS qTD to retire.
     let mut done = false;
     for _ in 0..10_000_000u32 {
         if dma.read32(QTD_STATUS + 0x08) & QTD_ACTIVE == 0 { done = true; break; }
     }
-    let toks = dma.read32(QTD_SETUP + 0x08) | dma.read32(QTD_DATA + 0x08) | dma.read32(QTD_STATUS + 0x08);
-
-    if !done {
-        ctx.log_fmt(format_args!("ehci: control transfer timed out (tokens={:#010x})", toks));
-    } else if toks & QTD_HALTED != 0 || toks & QTD_ERRMASK != 0 {
-        ctx.log_fmt(format_args!("ehci: control transfer error (tokens={:#010x})", toks));
-    } else {
-        let blen   = dma.read8(DATA_BUF + 0);
-        let dtype  = dma.read8(DATA_BUF + 1);
-        let class  = dma.read8(DATA_BUF + 4);
-        let mps0   = dma.read8(DATA_BUF + 7);
-        let vid    = dma.read16(DATA_BUF + 8);
-        let pid    = dma.read16(DATA_BUF + 10);
+    let toks = dma.read32(QTD_SETUP + 0x08) | dma.read32(QTD_STATUS + 0x08)
+        | if data_len > 0 { dma.read32(QTD_DATA + 0x08) } else { 0 };
+    if !done || toks & (QTD_HALTED | QTD_ERRMASK) != 0 {
         ctx.log_fmt(format_args!(
-            "ehci: DEVICE DESCRIPTOR bLength={} type={} class={:#04x} mps0={} VID={:#06x} PID={:#06x}",
-            blen, dtype, class, mps0, vid, pid
-        ));
-        if class == 0x09 {
-            ctx.log("ehci: device is a USB hub (the rate-matching hub) -> E3c enumerates its ports");
-        }
+            "ehci: control(req={:#04x}) FAILED tokens={:#010x} done={}",
+            setup[1], toks, done as u8));
+        return None;
+    }
+    // Bytes actually moved = requested - (DATA token's remaining-bytes field).
+    let moved = if data_len > 0 {
+        data_len - ((dma.read32(QTD_DATA + 0x08) >> 16) & 0x7FFF) as usize
+    } else { 0 };
+    Some(moved)
+}
+
+/// E3b/E3c — address and configure the high-speed hub on the port, then read its
+/// hub descriptor (downstream port count). The keyboard is on one of those ports;
+/// E3c-2 will power them and find it.
+fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
+    let dma = match ctx.dma_region() {
+        Some(d) => d,
+        None => { ctx.log("ehci: no DMA arena granted — cannot enumerate; idling"); return; }
+    };
+
+    // E3b: device descriptor at the default address 0.
+    let setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]; // Get_Descriptor(Device), 18
+    if control(ctx, mmio, &dma, op, 0, 64, &setup, 18, true).is_none() { return; }
+    let class = dma.read8(DATA_BUF + 4);
+    let mps0  = dma.read8(DATA_BUF + 7) as u32;
+    let vid   = dma.read16(DATA_BUF + 8);
+    let pid   = dma.read16(DATA_BUF + 10);
+    ctx.log_fmt(format_args!(
+        "ehci: DEVICE DESCRIPTOR class={:#04x} mps0={} VID={:#06x} PID={:#06x}", class, mps0, vid, pid));
+
+    // E3c: assign address 1.
+    let setup = [0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]; // Set_Address(1)
+    if control(ctx, mmio, &dma, op, 0, mps0, &setup, 0, false).is_none() {
+        ctx.log("ehci: Set_Address failed"); return;
+    }
+    delay_cycles(ctx, RECOVERY_CYCLES); // SetAddress recovery (>= 2 ms)
+    ctx.log("ehci: hub addressed (1)");
+
+    // Get the configuration descriptor (first 9 bytes) for bConfigurationValue.
+    let setup = [0x80, 0x06, 0x00, 0x02, 0x00, 0x00, 0x09, 0x00]; // Get_Descriptor(Config), 9
+    if control(ctx, mmio, &dma, op, 1, mps0, &setup, 9, true).is_none() {
+        ctx.log("ehci: Get_Config failed"); return;
+    }
+    let cfgval = dma.read8(DATA_BUF + 5);
+
+    // Set configuration.
+    let setup = [0x00, 0x09, cfgval, 0x00, 0x00, 0x00, 0x00, 0x00]; // Set_Configuration
+    if control(ctx, mmio, &dma, op, 1, mps0, &setup, 0, false).is_none() {
+        ctx.log("ehci: Set_Configuration failed"); return;
+    }
+    ctx.log_fmt(format_args!("ehci: hub configured (cfg={})", cfgval));
+
+    // Hub class descriptor → number of downstream ports.
+    let setup = [0xA0, 0x06, 0x00, 0x29, 0x00, 0x00, 0x40, 0x00]; // Get_Descriptor(Hub 0x29), 64
+    let n = match control(ctx, mmio, &dma, op, 1, mps0, &setup, 64, true) {
+        Some(n) => n,
+        None => { ctx.log("ehci: Get_Hub_Descriptor failed"); return; }
+    };
+    if n >= 4 {
+        let nports  = dma.read8(DATA_BUF + 2);
+        let hubchar = dma.read16(DATA_BUF + 3);
+        ctx.log_fmt(format_args!(
+            "ehci: HUB DESCRIPTOR ports={} characteristics={:#06x} -> E3c-2 powers them + finds the keyboard",
+            nports, hubchar));
     }
 }
 
