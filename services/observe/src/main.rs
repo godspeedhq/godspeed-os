@@ -159,6 +159,19 @@ fn print_state(
     let used_pct     = if total_mib > 0 { (used_mib * 100) / total_mib } else { 0 };
     let (used_val, used_unit) = bytes_fmt(used_bytes);
 
+    // Per-line prefix. The `observe: ` tag earns its keep in `observe now`, whose
+    // lines share the log/serial stream and need to be identifiable. The live view
+    // owns the whole screen and carries a title bar, so the prefix is just clutter
+    // there — dropped. (font8x8 is ASCII-only, so the title bar uses '-'/'=' not
+    // box-drawing or em dashes.)
+    let p = if live { "" } else { "observe: " };
+
+    // --- Title bar (live only) — the quit hint up top where the eye starts ---
+    if live {
+        ctx.console_line(true, "observe - live                                      (q to quit)");
+        ctx.console_line(true, "================================================================");
+    }
+
     // --- Legend ---
     // Skipped in the live view — it is static noise that wastes screen space the
     // repainting frame wants. `observe now` (one-shot) keeps it for reference.
@@ -171,7 +184,7 @@ fn print_state(
     }
 
     // --- System summary ---
-    ctx.console_line_fmt(live, format_args!("observe: ----------- system state ({} live) -----------", live_count));
+    ctx.console_line_fmt(live, format_args!("{}----------- system state ({} live) -----------", p, live_count));
 
     // Build CPU summary line: "C0  98%  C1  99%  ...  total (49%)"
     let mut cpu_line = [0u8; 128];
@@ -191,16 +204,17 @@ fn print_state(
     cpu_line[pos] = b')'; pos += 1;
 
     if let Ok(s) = core::str::from_utf8(&cpu_line[..pos]) {
-        ctx.console_line_fmt(live, format_args!("observe: CPU: {}", s));
+        ctx.console_line_fmt(live, format_args!("{}CPU: {}", p, s));
     }
 
     ctx.console_line_fmt(live, format_args!(
-        "observe: RAM: {} {} used / {} {} total ({}%)",
-        used_val, used_unit, total_val, total_unit, used_pct,
+        "{}RAM: {} {} used / {} {} total ({}%)",
+        p, used_val, used_unit, total_val, total_unit, used_pct,
     ));
 
     // --- Task table ---
-    ctx.console_line(live, "observe: TASK  NAME             CORE STATE        MEM_USED/LIMIT  RESTARTS  QUEUE/LIMIT  CPU%");
+    ctx.console_line_fmt(live, format_args!(
+        "{}TASK  NAME             CORE STATE        MEM_USED/LIMIT  RESTARTS  QUEUE/LIMIT  CPU%", p));
     for slot in 0..MAX_SLOTS {
         let stat = ctx.task_stat(slot);
         if !stat.valid { continue; }
@@ -213,7 +227,8 @@ fn print_state(
         let task_pct = core_pct[c];
 
         ctx.console_line_fmt(live, format_args!(
-            "observe: {:<5} {:<16} C{:<3} {:<12} {:>3} {:3}/{:>2} {:3}  {:<9} {:>2}/{}{}  {:>3}%",
+            "{}{:<5} {:<16} C{:<3} {:<12} {:>3} {:3}/{:>2} {:3}  {:<9} {:>2}/{}{}  {:>3}%",
+            p,
             slot,
             stat.name_str(),
             stat.core,
@@ -228,9 +243,8 @@ fn print_state(
     }
 
     // In the live view, clear any rows left over below the frame (e.g. if a task
-    // count shrank between frames), and show a footer.
+    // count shrank between frames). The quit hint lives in the title bar up top.
     if live {
-        ctx.console_line(true, "observe: ----------- press q to quit -----------");
         ctx.console_write("\x1b[J"); // erase from cursor to end of screen
     }
 }

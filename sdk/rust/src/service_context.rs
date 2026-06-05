@@ -412,6 +412,15 @@ impl ServiceContext {
         }
     }
 
+    /// Monotonic console-output activity counter (syscall 13, query 10). Bumped on
+    /// every serial write (log or console). The shell watches it for boot
+    /// quiescence — when it stops changing, boot output has settled. Ambient.
+    pub fn console_activity(&self) -> u64 {
+        // SAFETY: syscall(13) = InspectKernel; query_id=10 = console activity.
+        let ret = unsafe { raw_syscall(13, 10, 0, 0) };
+        if ret < 0 { 0 } else { ret as u64 }
+    }
+
     /// Read the hardware TSC (Time Stamp Counter) via the kernel.
     ///
     /// Returns RDTSC cycle count. Useful for measuring kernel operation latencies
@@ -558,6 +567,19 @@ impl ServiceContext {
         if slot == u32::MAX { return; }
         // SAFETY: syscall(25) = ConsoleEcho; slot is kernel-written cap index.
         let _ = unsafe { raw_syscall(25, slot as u64, on as u64, 0) };
+    }
+
+    /// End boot-log mirroring to the framebuffer and clear the TV (syscall 26).
+    /// The shell calls this once, on the first keystroke, so the user sees the
+    /// boot sequence on the display and then gets a clean interactive console.
+    /// Requires the CONSOLE_READ cap.
+    pub fn console_boot_complete(&self) {
+        let data = Self::ctx();
+        if data.magic != SERVICE_CTX_MAGIC { return; }
+        let slot = data.console_read_slot;
+        if slot == u32::MAX { return; }
+        // SAFETY: syscall(26) = ConsoleBootComplete; slot is kernel-written cap index.
+        let _ = unsafe { raw_syscall(26, slot as u64, 0, 0) };
     }
 
     /// Return the core this service was spawned on.

@@ -13,15 +13,21 @@ const MAX_ARGS: usize = 4;
 // doubled characters.)
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
-    // Let the one-time boot logging flush first (logger/registry/supervisor
-    // "ready", init "all spawns done") so the screen rests with `gs>` as the
-    // last line. Each peer service logs once then yields; a generous yield count
-    // guarantees they all get scheduler turns before we print the prompt. Nothing
-    // logs after this in the bare-metal image, so `gs>` stays at the bottom.
+    // The boot sequence (kernel + every service's logs, the xHCI enumeration) is
+    // shown on the TV during startup — the user wants to see it come up. We log our
+    // "ready" line into that stream, then wait for boot output to SETTLE before
+    // automatically clearing the TV and presenting a clean prompt (no keypress).
     for _ in 0..256 {
         ctx.yield_cpu();
     }
     ctx.console_writeln("shell: ready (type 'help')");
+
+    wait_for_boot_quiescence(&ctx);
+
+    // Boot is done: dismiss the boot screen on the TV (clear + stop mirroring logs
+    // to it) and present a clean prompt. Serial keeps the full stream. This is also
+    // the first `gs> ` the serial-driven shell-test waits on.
+    ctx.console_boot_complete();
     ctx.console_write("gs> ");
 
     let mut line_buf = [0u8; MAX_LINE];
@@ -55,6 +61,36 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// Wait until boot output has settled, so we clear the boot screen only after the
+/// init sequence (including the asynchronous xHCI keyboard enumeration on another
+/// core) has finished — never mid-stream. We watch the kernel's console-activity
+/// counter: when it stops changing across consecutive windows, boot is quiet.
+/// Bounded by `MAX_WINDOWS` so a service that logs forever can't wedge startup —
+/// we hand over the prompt regardless once the cap is hit.
+fn wait_for_boot_quiescence(ctx: &ServiceContext) {
+    const WINDOW_YIELDS: u32 = 4000; // long enough to span gaps between boot lines
+    const QUIET_NEEDED:  u32 = 2;    // consecutive quiet windows to confirm settled
+    const MAX_WINDOWS:   u32 = 200;  // upper bound on the total wait
+
+    let mut last  = ctx.console_activity();
+    let mut quiet = 0u32;
+    for _ in 0..MAX_WINDOWS {
+        for _ in 0..WINDOW_YIELDS {
+            ctx.yield_cpu();
+        }
+        let now = ctx.console_activity();
+        if now == last {
+            quiet += 1;
+            if quiet >= QUIET_NEEDED {
+                return;
+            }
+        } else {
+            quiet = 0;
+            last = now;
         }
     }
 }

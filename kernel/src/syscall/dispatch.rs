@@ -44,6 +44,7 @@ pub enum SyscallNumber {
     ConsoleWrite   = 23,
     TryConsoleRead = 24,
     ConsoleEcho    = 25,
+    ConsoleBootComplete = 26,
 }
 
 /// Raw syscall dispatcher — called from the SYSCALL/SYSENTER IDT stub.
@@ -89,6 +90,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::ConsoleWrite  as u64 => handle_console_write(arg0, arg1, arg2),
         n if n == SyscallNumber::TryConsoleRead as u64 => handle_try_console_read(arg0),
         n if n == SyscallNumber::ConsoleEcho   as u64 => handle_console_echo(arg0, arg1),
+        n if n == SyscallNumber::ConsoleBootComplete as u64 => handle_console_boot_complete(arg0),
         _ => -1, // Unknown syscall.
     }
 }
@@ -665,7 +667,7 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     // (9 = fbcon rows/cols — task-neutral hardware info) are ungated. Every other
     // query discloses another task's or system-wide state and requires the
     // INTROSPECT capability with READ (§3.1; docs/introspection-capability.md).
-    if !matches!(query_id, 0 | 3 | 9)
+    if !matches!(query_id, 0 | 3 | 9 | 10)
         && !scheduler::current_task_holds_resource(
             crate::capability::INTROSPECT_RESOURCE, Rights::READ)
     {
@@ -679,6 +681,9 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // service needs this to lay out its terminal (pin the input line to the
         // bottom row). 0 if the framebuffer never initialised.
         9 => crate::arch::x86_64::fb::dims_packed() as i64,
+        // Console-output activity counter — the shell watches it for boot
+        // quiescence (when it stops changing, boot output has settled).
+        10 => crate::arch::x86_64::console_activity() as i64,
         4 => crate::memory::allocator::free_frame_count() as i64,
         5 => crate::memory::allocator::total_frame_count() as i64,
         6 => scheduler::core_active_ticks(arg1 as usize) as i64,
@@ -885,6 +890,28 @@ fn handle_console_echo(cap_slot: u64, on: u64) -> i64 {
         return cap_err_to_i64(CapError::CapWrongScope);
     }
     crate::arch::x86_64::set_console_echo(on != 0);
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: ConsoleBootComplete (26) — end boot-log mirroring + clear the screen.
+// ---------------------------------------------------------------------------
+
+/// End boot-log mirroring to the framebuffer and clear the TV, handing over a
+/// clean interactive console. The shell calls this once, on the first keystroke,
+/// after the boot sequence has been displayed. Gated by CONSOLE_READ (only the
+/// keyboard-owning service decides when boot output is dismissed).
+fn handle_console_boot_complete(cap_slot: u64) -> i64 {
+    use crate::capability::CONSOLE_READ_RESOURCE;
+
+    let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::READ) {
+        Ok(c)  => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    if cap.resource_id != CONSOLE_READ_RESOURCE {
+        return cap_err_to_i64(CapError::CapWrongScope);
+    }
+    crate::arch::x86_64::console_boot_complete();
     0
 }
 

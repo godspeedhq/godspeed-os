@@ -115,6 +115,20 @@ pub fn dims_packed() -> u32 {
     (((s.rows as u32) & 0xFFFF) << 16) | ((s.cols as u32) & 0xFFFF)
 }
 
+/// Clear the framebuffer and move the cursor to the top-left. Used when the shell
+/// ends boot-log mirroring (`console_boot_complete`) to hand over a clean console.
+pub fn clear_and_home() {
+    let mut s = FB.lock();
+    if !s.ready { return; }
+    clear(&s);
+    s.col = 0;
+    s.row = 0;
+    s.esc = 0;
+    if s.cursor_visible {
+        draw_cursor(&s);
+    }
+}
+
 /// Write one output byte to the framebuffer console. Called from
 /// `console_write_byte` / `console_write_bytes` (Stage 1: only the interactive
 /// console path reaches the framebuffer; logs go to serial only).

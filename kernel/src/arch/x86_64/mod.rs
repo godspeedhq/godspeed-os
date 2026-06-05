@@ -338,9 +338,14 @@ pub fn serial_write_byte(b: u8) {
     if got {
         SERIAL_LOCK.store(false, Ordering::Release);
     }
-    // COM1 only — this is the LOG stream (kprintln, ctx.log). The interactive
-    // console (framebuffer) is written via `console_write_byte` instead, so logs
-    // no longer smear the TV (§ docs/console-service.md, Stage 1).
+    // Log stream → COM1. During boot it is ALSO mirrored to the framebuffer so the
+    // user sees the init sequence on the TV; the shell ends this once boot output
+    // settles (console_boot_complete). After that, logs are serial-only and only
+    // the console path reaches the TV (Stage 1; docs/console-service.md).
+    if boot_log_to_fb() {
+        fb::put_byte(b);
+    }
+    bump_console_activity();
 }
 
 /// Spin cap for best-effort `SERIAL_LOCK` acquisition (~seconds on real HW).
@@ -401,7 +406,14 @@ pub fn serial_write_bytes_lockfree(s: &[u8]) {
     if got {
         SERIAL_LOCK.store(false, Ordering::Release);
     }
-    // COM1 only (log stream). See `serial_write_byte`.
+    // Log stream → COM1, mirrored to the framebuffer during boot. See
+    // `serial_write_byte`.
+    if boot_log_to_fb() {
+        for &b in s {
+            fb::put_byte(b);
+        }
+    }
+    bump_console_activity();
 }
 
 /// Write one byte to the **interactive console** — COM1 *and* the framebuffer
@@ -410,14 +422,22 @@ pub fn serial_write_bytes_lockfree(s: &[u8]) {
 /// `docs/console-service.md` (Stage 1).
 pub fn console_write_byte(b: u8) {
     serial_write_byte(b);
-    fb::put_byte(b);
+    // During boot, `serial_write_byte` already mirrored to the framebuffer; adding
+    // it again here would double-render every console glyph. After boot-complete,
+    // the log mirror is off, so the console path is what puts console output on the
+    // TV.
+    if !boot_log_to_fb() {
+        fb::put_byte(b);
+    }
 }
 
 /// Write bytes to the interactive console — COM1 (serialised) and the framebuffer.
 pub fn console_write_bytes(s: &[u8]) {
     serial_write_bytes_lockfree(s);
-    for &b in s {
-        fb::put_byte(b);
+    if !boot_log_to_fb() {
+        for &b in s {
+            fb::put_byte(b);
+        }
     }
 }
 
@@ -488,6 +508,43 @@ pub static CONSOLE_ECHO_ENABLED: core::sync::atomic::AtomicBool =
 /// holding the CONSOLE_READ cap (the shell, or a foreground app).
 pub fn set_console_echo(on: bool) {
     CONSOLE_ECHO_ENABLED.store(on, core::sync::atomic::Ordering::Release);
+}
+
+/// Whether boot-time **log** output is also mirrored to the framebuffer (TV).
+/// True during boot so the user sees the init sequence on the display; the shell
+/// flips it false on the first keystroke and clears the screen, leaving a clean
+/// interactive console (after that, only console output reaches the TV — Stage 1).
+pub static BOOT_LOG_TO_FB: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+#[inline]
+fn boot_log_to_fb() -> bool {
+    BOOT_LOG_TO_FB.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// End boot-log mirroring to the framebuffer and clear the screen. Called from
+/// the `ConsoleBootComplete` syscall once boot output has settled — the boot
+/// jargon has served its purpose; hand over a clean console.
+pub fn console_boot_complete() {
+    BOOT_LOG_TO_FB.store(false, core::sync::atomic::Ordering::Release);
+    fb::clear_and_home();
+}
+
+/// Monotonic console-output activity counter. Bumped once per serial write call
+/// (log or console path). The shell watches this to detect boot quiescence: when
+/// it stops changing, boot output has settled and it is safe to clear the boot
+/// screen and hand over a clean prompt — without a magic timer.
+pub static CONSOLE_ACTIVITY: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+fn bump_console_activity() {
+    CONSOLE_ACTIVITY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the console-output activity counter (exposed via `InspectKernel` query 10).
+pub fn console_activity() -> u64 {
+    CONSOLE_ACTIVITY.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Enable COM1 RX interrupts (call once after com2_init, from kernel main).
