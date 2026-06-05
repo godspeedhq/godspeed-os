@@ -93,7 +93,7 @@ fn execute(ctx: &ServiceContext, line: &[u8]) {
             if argc >= 2 && args[1] == "now" {
                 cmd_observe_now(ctx);
             } else {
-                ctx.console_writeln("observe: live view coming soon — try 'observe now'");
+                cmd_observe_live(ctx);
             }
         }
         "spawn"   => {
@@ -193,7 +193,7 @@ fn cmd_observe_now(ctx: &ServiceContext) {
     // observe-now finishes and parks (BlockRecv) so the prompt lands below it.
     // Bounded against a child that never parks. (The console service will make
     // output ordering automatic; this is the interim fix.)
-    if let Some(slot) = observe_now_slot(ctx) {
+    if let Some(slot) = find_running_slot(ctx, "observe-now") {
         for _ in 0..1_000_000u32 {
             ctx.yield_cpu();
             let st = ctx.task_stat(slot);
@@ -205,14 +205,48 @@ fn cmd_observe_now(ctx: &ServiceContext) {
     }
 }
 
-/// Slot of the just-spawned (live, not the killed dead) `observe-now`, waiting
-/// briefly for it to appear. `None` if it never shows up.
-fn observe_now_slot(ctx: &ServiceContext) -> Option<u32> {
+/// `observe` (live) — broker the full-screen foreground view (Stage 2c).
+///
+/// The shell is the capability-broker (Appendix B.3): it lends the keyboard to
+/// the foreground child by *not reading it* while the child runs, then takes it
+/// back. We spawn `observe-live` (which owns the screen: hides the cursor,
+/// suppresses echo, repaints, polls `q`), then wait — without touching
+/// `console_read` — until it parks (q pressed → it restored the console and
+/// parked) or dies. Then we clean up and our read loop resumes.
+fn cmd_observe_live(ctx: &ServiceContext) {
+    let _ = ctx.kill("observe-live"); // clear any stale instance
+    if ctx.spawn("observe-live").is_err() {
+        ctx.console_writeln("observe: failed to spawn observe-live");
+        return;
+    }
+    if let Some(slot) = find_running_slot(ctx, "observe-live") {
+        // Wait for the foreground child to finish. The bound is the child's
+        // lifetime — it parks on `q` (state 2) or dies (invalid); the large count
+        // is a paranoid safety net so a hung child can never wedge the shell
+        // forever. We must NOT call console_read here: the child owns the keyboard.
+        for _ in 0..u32::MAX {
+            ctx.yield_cpu();
+            let st = ctx.task_stat(slot);
+            if !st.valid || st.state == 2 {
+                break;
+            }
+        }
+    }
+    let _ = ctx.kill("observe-live"); // reap the parked instance
+    // Defensive: restore the console even if the child died mid-view without
+    // restoring it (echo back on, cursor visible) so the shell stays usable.
+    ctx.console_echo(true);
+    ctx.console_write("\x1b[?25h");
+}
+
+/// Slot of a just-spawned, still-live service by name (not a killed/dead one),
+/// waiting briefly for it to appear. `None` if it never shows up.
+fn find_running_slot(ctx: &ServiceContext, name: &str) -> Option<u32> {
     for _ in 0..2000u32 {
         ctx.yield_cpu();
         for slot in 0..256u32 {
             let st = ctx.task_stat(slot);
-            if st.valid && st.state != 4 /* Dead */ && st.name_str() == "observe-now" {
+            if st.valid && st.state != 4 /* Dead */ && st.name_str() == name {
                 return Some(slot);
             }
         }

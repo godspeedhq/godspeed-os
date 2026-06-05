@@ -532,6 +532,34 @@ impl ServiceContext {
         if ret >= 0 { ret as u8 } else { 0 }
     }
 
+    /// Non-blocking console read (syscall 24). Returns `Some(byte)` if a keystroke
+    /// is waiting, `None` if the ring is empty. A foreground full-screen app polls
+    /// this for `q`-to-quit between repaints instead of blocking in `console_read`.
+    /// Requires the CONSOLE_READ cap (`has_console_read` in the kernel config).
+    pub fn try_console_read(&self) -> Option<u8> {
+        let data = Self::ctx();
+        if data.magic != SERVICE_CTX_MAGIC { return None; }
+        let slot = data.console_read_slot;
+        if slot == u32::MAX { return None; }
+        // SAFETY: syscall(24) = TryConsoleRead; slot is kernel-written cap index.
+        // Returns 0..=255 (byte), 256 (empty), or negative (cap error).
+        let ret = unsafe { raw_syscall(24, slot as u64, 0, 0) };
+        if (0..=255).contains(&ret) { Some(ret as u8) } else { None }
+    }
+
+    /// Enable (`true`) or disable (`false`) console keystroke echo (syscall 25).
+    /// A foreground full-screen app disables echo while it owns the screen — so
+    /// its raw key polls do not smear its frame — and re-enables it on exit.
+    /// Requires the CONSOLE_READ cap.
+    pub fn console_echo(&self, on: bool) {
+        let data = Self::ctx();
+        if data.magic != SERVICE_CTX_MAGIC { return; }
+        let slot = data.console_read_slot;
+        if slot == u32::MAX { return; }
+        // SAFETY: syscall(25) = ConsoleEcho; slot is kernel-written cap index.
+        let _ = unsafe { raw_syscall(25, slot as u64, on as u64, 0) };
+    }
+
     /// Return the core this service was spawned on.
     pub fn core_id(&self) -> u32 { Self::ctx().core_id }
 
@@ -712,6 +740,30 @@ impl ServiceContext {
             self.console_write(core::str::from_utf8(&buf[..cursor]).unwrap_or("(fmt error)"));
         }
         self.console_write("\n");
+    }
+
+    /// Write one console line. When `clear_eol` is true the line ends with
+    /// `ESC[K` (erase to end of line) before the newline — so a full-screen app
+    /// repainting in place (cursor homed each frame) overwrites a previous,
+    /// longer line without leaving stale characters, and without a full-screen
+    /// clear (no flicker). When false, behaves exactly like `console_writeln`.
+    pub fn console_line(&self, clear_eol: bool, msg: &str) {
+        self.console_write(msg);
+        self.console_write(if clear_eol { "\x1b[K\n" } else { "\n" });
+    }
+
+    /// Formatted variant of [`console_line`].
+    pub fn console_line_fmt(&self, clear_eol: bool, args: core::fmt::Arguments) {
+        let mut buf    = [0u8; 256];
+        let mut cursor = 0usize;
+        let _ = core::fmt::write(
+            &mut StackWriter { buf: &mut buf, pos: &mut cursor },
+            args,
+        );
+        if cursor > 0 {
+            self.console_write(core::str::from_utf8(&buf[..cursor]).unwrap_or("(fmt error)"));
+        }
+        self.console_write(if clear_eol { "\x1b[K\n" } else { "\n" });
     }
 
     /// Spawn a service by name on the kernel-selected core.

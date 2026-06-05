@@ -2501,6 +2501,22 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
+        // `observe` (live) — full-screen foreground view (probe_mode 2 = MODE_LIVE).
+        // Same ELF as `observe`; the shell spawns it, pauses its own read loop, and
+        // resumes when it parks (the shell-brokered foreground handoff). Holds
+        // CONSOLE_READ so it can poll for `q` (non-blocking) and toggle echo while
+        // it owns the screen.
+        "observe-live" => Some(("observe-live", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_OBSERVE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    0,
+            probe_mode:        2, // MODE_LIVE
+            memory_limit:      8 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  true,
+        })),
         "shell" => Some(("shell", ServiceConfig {
             elf:               include_bytes!(env!("SVC_SHELL_ELF")),
             has_recv_endpoint: false,

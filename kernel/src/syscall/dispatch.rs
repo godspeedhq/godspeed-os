@@ -42,6 +42,8 @@ pub enum SyscallNumber {
     Park           = 21,
     Print          = 22,
     ConsoleWrite   = 23,
+    TryConsoleRead = 24,
+    ConsoleEcho    = 25,
 }
 
 /// Raw syscall dispatcher — called from the SYSCALL/SYSENTER IDT stub.
@@ -85,6 +87,8 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::Park          as u64 => scheduler::park_current(),
         n if n == SyscallNumber::Print         as u64 => handle_print(arg0, arg1, arg2),
         n if n == SyscallNumber::ConsoleWrite  as u64 => handle_console_write(arg0, arg1, arg2),
+        n if n == SyscallNumber::TryConsoleRead as u64 => handle_try_console_read(arg0),
+        n if n == SyscallNumber::ConsoleEcho   as u64 => handle_console_echo(arg0, arg1),
         _ => -1, // Unknown syscall.
     }
 }
@@ -832,6 +836,56 @@ fn handle_console_read(cap_slot: u64) -> i64 {
         }
         // Woken by uart_rx_irq_handler; loop to pop the byte.
     }
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: TryConsoleRead (24) — non-blocking console read.
+// ---------------------------------------------------------------------------
+
+/// Pop one byte from the console ring without blocking. A foreground full-screen
+/// app (live `observe`) uses this to poll for `q` between repaints, since it
+/// cannot afford to block in `ConsoleRead`. Does NOT register as the console
+/// waiter (it never sleeps).
+///
+/// Returns the byte (0..=255) if one is available, `NO_CONSOLE_BYTE` (256) if the
+/// ring is empty, or a negative cap error.
+fn handle_try_console_read(cap_slot: u64) -> i64 {
+    use crate::capability::CONSOLE_READ_RESOURCE;
+    const NO_CONSOLE_BYTE: i64 = 256;
+
+    let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::READ) {
+        Ok(c)  => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    if cap.resource_id != CONSOLE_READ_RESOURCE {
+        return cap_err_to_i64(CapError::CapWrongScope);
+    }
+    match crate::arch::x86_64::uart_rx_pop() {
+        Some(b) => b as i64,
+        None    => NO_CONSOLE_BYTE,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: ConsoleEcho (25) — enable/disable keystroke echo.
+// ---------------------------------------------------------------------------
+
+/// Turn console keystroke echo on (`arg1 != 0`) or off (`arg1 == 0`). A
+/// foreground app disables echo while it owns the screen and re-enables it on
+/// exit. Gated by CONSOLE_READ (only services that consume the keyboard may
+/// control its echo).
+fn handle_console_echo(cap_slot: u64, on: u64) -> i64 {
+    use crate::capability::CONSOLE_READ_RESOURCE;
+
+    let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::READ) {
+        Ok(c)  => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    if cap.resource_id != CONSOLE_READ_RESOURCE {
+        return cap_err_to_i64(CapError::CapWrongScope);
+    }
+    crate::arch::x86_64::set_console_echo(on != 0);
+    0
 }
 
 // ---------------------------------------------------------------------------

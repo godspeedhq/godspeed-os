@@ -16,8 +16,13 @@ const QUEUE_MAX:      u8  = 16;
 const MAX_CORES:      u32 = 16;
 
 // Mode passed by the kernel at spawn (ServiceConfig.probe_mode).
-const MODE_LIVE: u32 = 0; // `observe`     — refresh forever
-const MODE_NOW:  u32 = 1; // `observe now` — one static frame, then park
+const MODE_LIVE:    u32 = 0; // `observe`      — refresh forever (full-build streaming)
+const MODE_NOW:     u32 = 1; // `observe now`  — one static frame, then park
+const MODE_LIVE_FG: u32 = 2; // `observe` live — full-screen foreground view
+
+/// Repaint cadence for the live view, in TSC cycles (~0.5 s at 2 GHz on the
+/// T630). `q` is polled every loop iteration regardless, so quit stays snappy.
+const FRAME_CYCLES: u64 = 1_000_000_000;
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
@@ -33,13 +38,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // self-exit in v1; the shell kills any parked instance before the next
         // `observe now`, so at most one lingers. PARK (not yield) so the parked
         // instance does not peg its core until it is killed.
-        print_state(&ctx, &mut prev_core_active, &mut prev_core_total);
+        print_state(&ctx, &mut prev_core_active, &mut prev_core_total, false);
         ctx.park();
     }
 
-    // `observe` (live): refresh every ~500 yields. Reachable from full (`osdev
-    // run`) builds today; the shell's bare `observe` reports "coming soon" until
-    // the live view's console-ownership handoff (clear+home, q-to-quit) is built.
+    if ctx.probe_mode() == MODE_LIVE_FG {
+        // `observe` (live): the shell-brokered foreground view. We own the screen:
+        // hide the cursor, suppress keystroke echo, repaint in place every
+        // FRAME_CYCLES, and poll `q` to quit. On exit we restore the console and
+        // park; the shell detects the park, cleans up, and reprints its prompt.
+        run_live(&ctx, &mut prev_core_active, &mut prev_core_total);
+        ctx.park();
+    }
+
+    // MODE_LIVE (full `osdev run` builds): refresh every ~500 yields to the log
+    // stream. Not the interactive foreground view (that is MODE_LIVE_FG above).
     let _ = MODE_LIVE;
     ctx.log("observe: ready");
     let mut tick: u32 = 0;
@@ -48,14 +61,56 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         tick += 1;
         if tick < YIELD_INTERVAL { continue; }
         tick = 0;
-        print_state(&ctx, &mut prev_core_active, &mut prev_core_total);
+        print_state(&ctx, &mut prev_core_active, &mut prev_core_total, false);
     }
+}
+
+/// Full-screen live view (MODE_LIVE_FG). Owns the console until `q` is pressed.
+fn run_live(
+    ctx:              &ServiceContext,
+    prev_core_active: &mut [u64; MAX_CORES as usize],
+    prev_core_total:  &mut [u64; MAX_CORES as usize],
+) {
+    // Take the screen: stop echoing keystrokes (we paint the display ourselves),
+    // hide the underline cursor, and clear once.
+    ctx.console_echo(false);
+    ctx.console_write("\x1b[?25l\x1b[2J");
+
+    let mut last = ctx.read_tsc();
+    // Home + paint the first frame immediately.
+    ctx.console_write("\x1b[H");
+    print_state(ctx, prev_core_active, prev_core_total, true);
+
+    loop {
+        // Poll for quit every iteration so `q` is responsive between repaints.
+        if let Some(b) = ctx.try_console_read() {
+            if b == b'q' || b == b'Q' {
+                break;
+            }
+        }
+        ctx.yield_cpu();
+
+        let now = ctx.read_tsc();
+        if now.wrapping_sub(last) >= FRAME_CYCLES {
+            last = now;
+            ctx.console_write("\x1b[H");
+            print_state(ctx, prev_core_active, prev_core_total, true);
+        }
+    }
+
+    // Release the screen: show the cursor, restore echo, and drop below the last
+    // frame (which stays on screen — no alt-screen buffer) so the shell's prompt
+    // lands cleanly underneath.
+    ctx.console_write("\x1b[?25h");
+    ctx.console_echo(true);
+    ctx.console_write("\r\n");
 }
 
 fn print_state(
     ctx:              &ServiceContext,
     prev_core_active: &mut [u64; MAX_CORES as usize],
     prev_core_total:  &mut [u64; MAX_CORES as usize],
+    live:             bool,
 ) {
     let num_cores = ctx.inspect_core_count().min(MAX_CORES);
 
@@ -84,9 +139,9 @@ fn print_state(
     };
 
     // --- Count live tasks ---
-    let mut live: u32 = 0;
+    let mut live_count: u32 = 0;
     for slot in 0..MAX_SLOTS {
-        if ctx.task_stat(slot).valid { live += 1; }
+        if ctx.task_stat(slot).valid { live_count += 1; }
     }
 
     // --- RAM ---
@@ -105,14 +160,18 @@ fn print_state(
     let (used_val, used_unit) = bytes_fmt(used_bytes);
 
     // --- Legend ---
-    ctx.console_writeln("observe: legend: TASK: scheduler slot | NAME: service name");
-    ctx.console_writeln("observe: legend: CORE: cpu core | STATE: task state");
-    ctx.console_writeln("observe: legend: MEM_USED/LIMIT: heap memory allocated via alloc_mem syscall / contract memory limit");
-    ctx.console_writeln("observe: legend: RESTARTS: restart count | QUEUE/LIMIT: inbound queue depth / max queue depth");
-    ctx.console_writeln("observe: legend: CPU%: percentage of assigned core used since last snapshot");
+    // Skipped in the live view — it is static noise that wastes screen space the
+    // repainting frame wants. `observe now` (one-shot) keeps it for reference.
+    if !live {
+        ctx.console_writeln("observe: legend: TASK: scheduler slot | NAME: service name");
+        ctx.console_writeln("observe: legend: CORE: cpu core | STATE: task state");
+        ctx.console_writeln("observe: legend: MEM_USED/LIMIT: heap memory allocated via alloc_mem syscall / contract memory limit");
+        ctx.console_writeln("observe: legend: RESTARTS: restart count | QUEUE/LIMIT: inbound queue depth / max queue depth");
+        ctx.console_writeln("observe: legend: CPU%: percentage of assigned core used since last snapshot");
+    }
 
     // --- System summary ---
-    ctx.console_writeln_fmt(format_args!("observe: ----------- system state ({} live) -----------", live));
+    ctx.console_line_fmt(live, format_args!("observe: ----------- system state ({} live) -----------", live_count));
 
     // Build CPU summary line: "C0  98%  C1  99%  ...  total (49%)"
     let mut cpu_line = [0u8; 128];
@@ -132,16 +191,16 @@ fn print_state(
     cpu_line[pos] = b')'; pos += 1;
 
     if let Ok(s) = core::str::from_utf8(&cpu_line[..pos]) {
-        ctx.console_writeln_fmt(format_args!("observe: CPU: {}", s));
+        ctx.console_line_fmt(live, format_args!("observe: CPU: {}", s));
     }
 
-    ctx.console_writeln_fmt(format_args!(
+    ctx.console_line_fmt(live, format_args!(
         "observe: RAM: {} {} used / {} {} total ({}%)",
         used_val, used_unit, total_val, total_unit, used_pct,
     ));
 
     // --- Task table ---
-    ctx.console_writeln("observe: TASK  NAME             CORE STATE        MEM_USED/LIMIT  RESTARTS  QUEUE/LIMIT  CPU%");
+    ctx.console_line(live, "observe: TASK  NAME             CORE STATE        MEM_USED/LIMIT  RESTARTS  QUEUE/LIMIT  CPU%");
     for slot in 0..MAX_SLOTS {
         let stat = ctx.task_stat(slot);
         if !stat.valid { continue; }
@@ -153,7 +212,7 @@ fn print_state(
         let c = (stat.core as usize).min(MAX_CORES as usize - 1);
         let task_pct = core_pct[c];
 
-        ctx.console_writeln_fmt(format_args!(
+        ctx.console_line_fmt(live, format_args!(
             "observe: {:<5} {:<16} C{:<3} {:<12} {:>3} {:3}/{:>2} {:3}  {:<9} {:>2}/{}{}  {:>3}%",
             slot,
             stat.name_str(),
@@ -166,6 +225,13 @@ fn print_state(
             if full { " (FULL)" } else { "       " },
             task_pct,
         ));
+    }
+
+    // In the live view, clear any rows left over below the frame (e.g. if a task
+    // count shrank between frames), and show a footer.
+    if live {
+        ctx.console_line(true, "observe: ----------- press q to quit -----------");
+        ctx.console_write("\x1b[J"); // erase from cursor to end of screen
     }
 }
 

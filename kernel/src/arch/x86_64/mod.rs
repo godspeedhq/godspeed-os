@@ -477,6 +477,19 @@ static COM1_RX_TAIL: core::sync::atomic::AtomicUsize =
 pub static CONSOLE_READ_WAITER: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(u32::MAX);
 
+/// Whether `console_push_byte` echoes keystrokes to the console (serial + TV).
+/// Normally true. A foreground full-screen app (e.g. live `observe`) sets it
+/// false while it owns the screen, so raw keystrokes (its `q`-to-quit poll) do
+/// not smear its frame; the app paints the display itself. Restored on exit.
+pub static CONSOLE_ECHO_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+/// Set keystroke echo on/off. Called from the `ConsoleEcho` syscall by a service
+/// holding the CONSOLE_READ cap (the shell, or a foreground app).
+pub fn set_console_echo(on: bool) {
+    CONSOLE_ECHO_ENABLED.store(on, core::sync::atomic::Ordering::Release);
+}
+
 /// Enable COM1 RX interrupts (call once after com2_init, from kernel main).
 ///
 /// # Safety
@@ -562,11 +575,15 @@ pub fn console_push_byte(b: u8) {
     // backspace erases the last glyph.
     // Echo via the CONSOLE path (serial + framebuffer) — keystrokes are part of
     // the interactive session, not the log stream, so they belong on the TV.
-    match b {
-        b'\n' | b'\r' => { console_write_byte(b'\r'); console_write_byte(b'\n'); }
-        0x08 | 0x7f   => { console_write_byte(0x08); console_write_byte(b' '); console_write_byte(0x08); }
-        0x20..=0x7e   => console_write_byte(b),
-        _             => {}
+    // Suppressed while a foreground full-screen app owns the screen (it paints the
+    // display itself; its raw key polls must not smear its frame).
+    if CONSOLE_ECHO_ENABLED.load(Ordering::Acquire) {
+        match b {
+            b'\n' | b'\r' => { console_write_byte(b'\r'); console_write_byte(b'\n'); }
+            0x08 | 0x7f   => { console_write_byte(0x08); console_write_byte(b' '); console_write_byte(0x08); }
+            0x20..=0x7e   => console_write_byte(b),
+            _             => {}
+        }
     }
     // SAFETY: single-producer ring push in practice (see note above).
     unsafe { uart_rx_push(b) };
