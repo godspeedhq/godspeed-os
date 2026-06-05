@@ -96,6 +96,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // Port census: with the controller running and CONFIGFLAG set, a device on a
     // back socket should now read connected=1. PORTSC is one 32-bit reg per port.
+    let mut first_connected: Option<usize> = None;
     for p in 0..n_ports as usize {
         let psc = mmio.read32(op + OP_PORTSC0 + p * 4);
         ctx.log_fmt(format_args!(
@@ -105,11 +106,59 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             (psc & PORTSC_PED != 0) as u8,
             (psc & PORTSC_OWNER != 0) as u8,
         ));
+        if psc & PORTSC_CCS != 0 && first_connected.is_none() {
+            first_connected = Some(p);
+        }
     }
 
-    // E3 enumerates whatever is connected. For now, observe and park.
+    // ---------------------------------------------------------------------------
+    // E3a — reset the first connected port and see if it enables. EHCI only
+    // enables a port for a HIGH-SPEED device; if PED comes up, the thing on that
+    // port is high-speed — for the back keyboard (low-speed) that means a
+    // high-speed hub (the integrated rate-matching hub), with the keyboard behind
+    // it. If PED stays 0, the device is low/full-speed directly on the port.
+    // ---------------------------------------------------------------------------
+    if let Some(p) = first_connected {
+        let off = op + OP_PORTSC0 + p * 4;
+        // Begin reset: set Port Reset, clear Port Enable, preserve the other RW
+        // bits, and write the write-1-to-clear change bits as 0 so we don't clear
+        // them by accident.
+        let keep = mmio.read32(off) & !PORTSC_W1C & !PORTSC_PED;
+        mmio.write32(off, keep | PORTSC_RESET);
+        delay_cycles(&ctx, RESET_HOLD_CYCLES); // hold reset >= 50 ms (USB 2.0 §7.1.7.5)
+        // End reset.
+        mmio.write32(off, mmio.read32(off) & !PORTSC_W1C & !PORTSC_RESET);
+        wait(&mmio, off, PORTSC_RESET, false); // controller finishes (~2 ms)
+        delay_cycles(&ctx, RECOVERY_CYCLES);   // reset-recovery settle (~10 ms)
+
+        let psc = mmio.read32(off);
+        let enabled = psc & PORTSC_PED != 0;
+        ctx.log_fmt(format_args!(
+            "ehci: port {} after reset: PORTSC={:#010x} enabled={} -> {}",
+            p + 1, psc, enabled as u8,
+            if enabled {
+                "HIGH-SPEED (hub or HS device on EHCI; keyboard is behind a hub) -> E3b enumerates it"
+            } else {
+                "not high-speed (low/full-speed direct on the port)"
+            }
+        ));
+    }
+
+    // E3b builds the async schedule and addresses whatever the reset enabled.
     ctx.park();
 }
+
+/// Busy-wait roughly `cycles` TSC ticks. Used for the millisecond-scale USB reset
+/// timings. Overestimated against the T630's ~2 GHz so the >= 50 ms reset hold is
+/// always satisfied even if the TSC runs faster.
+fn delay_cycles(ctx: &ServiceContext, cycles: u64) {
+    let start = ctx.read_tsc();
+    while ctx.read_tsc().wrapping_sub(start) < cycles {}
+}
+/// ~100 ms at 2 GHz — comfortably over the 50 ms minimum reset hold.
+const RESET_HOLD_CYCLES: u64 = 200_000_000;
+/// ~20 ms at 2 GHz — reset-recovery settle before reading the port.
+const RECOVERY_CYCLES:   u64 = 40_000_000;
 
 // --- EHCI operational registers (offsets from base + CAPLENGTH) + bit fields ---
 const OP_USBCMD:     usize = 0x00;
@@ -122,7 +171,11 @@ const CMD_HCRESET:   u32 = 1 << 1;  // Host Controller Reset
 const STS_HCHALTED:  u32 = 1 << 12; // HCHalted
 const PORTSC_CCS:    u32 = 1 << 0;  // Current Connect Status
 const PORTSC_PED:    u32 = 1 << 2;  // Port Enabled/Disabled
+const PORTSC_RESET:  u32 = 1 << 8;  // Port Reset
 const PORTSC_OWNER:  u32 = 1 << 13; // Port Owner (1 = handed to a companion)
+/// Write-1-to-clear change bits (CSC, PEDC, OCC) — mask off when writing PORTSC
+/// so a read-modify-write does not clear them unintentionally.
+const PORTSC_W1C:    u32 = (1 << 1) | (1 << 3) | (1 << 5);
 
 /// Poll a 32-bit register until `mask` is set (`want_set=true`) or clear
 /// (`false`), bounded. Returns true if the condition was met, false on timeout.
