@@ -173,14 +173,31 @@ const QTD_ACTIVE: u32 = 1 << 7;
 const QTD_HALTED: u32 = 1 << 6;
 const QTD_ERRMASK: u32 = (1 << 3) | (1 << 4) | (1 << 5); // XactErr | Babble | BufErr
 
-/// Run one control transfer on EP0 of the device at `addr` (high-speed, no split —
-/// we talk to the rate-matching hub directly). `setup` is the 8-byte setup packet;
-/// for an IN transfer up to `data_len` bytes land in DATA_BUF. Returns the byte
-/// count transferred, or None on error/timeout (with the qTD tokens logged). The
-/// async schedule stays enabled across calls; the single QH is idle between them.
+/// EP0 endpoint addressing for a control transfer. For the high-speed hub we talk
+/// directly (`hs`); for the low-speed keyboard behind it we go through the hub's
+/// transaction translator via split transactions (`low`, carrying the hub address
+/// and downstream port).
+struct Ep { addr: u8, max_packet: u32, speed: u32, hub_addr: u8, port: u8 }
+impl Ep {
+    /// High-speed device addressed directly (speed=2, no split).
+    fn hs(addr: u8, max_packet: u32) -> Ep {
+        Ep { addr, max_packet, speed: 2, hub_addr: 0, port: 0 }
+    }
+    /// Low-speed device behind a hub TT (speed=1, split via hub/port).
+    fn low(addr: u8, max_packet: u32, hub_addr: u8, port: u8) -> Ep {
+        Ep { addr, max_packet, speed: 1, hub_addr, port }
+    }
+}
+
+/// Run one control transfer on EP0 of `ep`. For a low-speed `ep` the controller
+/// wraps each transaction as a split through the hub TT (hub addr + port in the
+/// QH). `setup` is the 8-byte setup packet; for an IN transfer up to `data_len`
+/// bytes land in DATA_BUF. Returns the byte count transferred, or None on
+/// error/timeout (with the qTD tokens logged). The async schedule stays enabled
+/// across calls; the single QH is idle between them.
 fn control(
     ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
-    op: usize, addr: u8, max_packet: u32, setup: &[u8; 8], data_len: usize, in_dir: bool,
+    op: usize, ep: &Ep, setup: &[u8; 8], data_len: usize, in_dir: bool,
 ) -> Option<usize> {
     dma.zero();
 
@@ -191,11 +208,15 @@ fn control(
     let pkt_phys    = dma.phys_at(SETUP_PKT) as u32;
     let buf_phys    = dma.phys_at(DATA_BUF) as u32;
 
-    // QH for EP0 @ addr: HS speed, DTC=1, reclamation head, this transfer's MaxPkt.
+    // QH for EP0 @ ep.addr. Control Endpoint flag (C, bit 27) is set for non-HS
+    // endpoints behind a TT; the hub address + port (dword 2) drive the split.
+    let c = if ep.speed != 2 { 1u32 << 27 } else { 0 };
     dma.write32(QH_OFF + 0x00, (qh_phys & !0x1F) | (1 << 1));
     dma.write32(QH_OFF + 0x04,
-        (addr as u32 & 0x7F) | (2 << 12) | (1 << 14) | (1 << 15) | (max_packet << 16));
-    dma.write32(QH_OFF + 0x08, 1 << 30); // Mult=1
+        (ep.addr as u32 & 0x7F) | (ep.speed << 12) | (1 << 14) | (1 << 15)
+            | (ep.max_packet << 16) | c);
+    dma.write32(QH_OFF + 0x08,
+        (1 << 30) | ((ep.hub_addr as u32 & 0x7F) << 16) | ((ep.port as u32 & 0x7F) << 22));
     dma.write32(QH_OFF + 0x0C, 0);
     dma.write32(QH_OFF + 0x10, setup_phys & !0x1F);
     dma.write32(QH_OFF + 0x14, 1);
@@ -271,7 +292,7 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
 
     // E3b: device descriptor at the default address 0.
     let setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]; // Get_Descriptor(Device), 18
-    if control(ctx, mmio, &dma, op, 0, 64, &setup, 18, true).is_none() { return; }
+    if control(ctx, mmio, &dma, op, &Ep::hs(0, 64), &setup, 18, true).is_none() { return; }
     let class = dma.read8(DATA_BUF + 4);
     let mps0  = dma.read8(DATA_BUF + 7) as u32;
     let vid   = dma.read16(DATA_BUF + 8);
@@ -281,7 +302,7 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
 
     // E3c: assign address 1.
     let setup = [0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]; // Set_Address(1)
-    if control(ctx, mmio, &dma, op, 0, mps0, &setup, 0, false).is_none() {
+    if control(ctx, mmio, &dma, op, &Ep::hs(0, mps0), &setup, 0, false).is_none() {
         ctx.log("ehci: Set_Address failed"); return;
     }
     delay_cycles(ctx, RECOVERY_CYCLES); // SetAddress recovery (>= 2 ms)
@@ -289,21 +310,21 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
 
     // Get the configuration descriptor (first 9 bytes) for bConfigurationValue.
     let setup = [0x80, 0x06, 0x00, 0x02, 0x00, 0x00, 0x09, 0x00]; // Get_Descriptor(Config), 9
-    if control(ctx, mmio, &dma, op, 1, mps0, &setup, 9, true).is_none() {
+    if control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &setup, 9, true).is_none() {
         ctx.log("ehci: Get_Config failed"); return;
     }
     let cfgval = dma.read8(DATA_BUF + 5);
 
     // Set configuration.
     let setup = [0x00, 0x09, cfgval, 0x00, 0x00, 0x00, 0x00, 0x00]; // Set_Configuration
-    if control(ctx, mmio, &dma, op, 1, mps0, &setup, 0, false).is_none() {
+    if control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &setup, 0, false).is_none() {
         ctx.log("ehci: Set_Configuration failed"); return;
     }
     ctx.log_fmt(format_args!("ehci: hub configured (cfg={})", cfgval));
 
     // Hub class descriptor → number of downstream ports.
     let setup = [0xA0, 0x06, 0x00, 0x29, 0x00, 0x00, 0x40, 0x00]; // Get_Descriptor(Hub 0x29), 64
-    let n = match control(ctx, mmio, &dma, op, 1, mps0, &setup, 64, true) {
+    let n = match control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &setup, 64, true) {
         Some(n) => n,
         None => { ctx.log("ehci: Get_Hub_Descriptor failed"); return; }
     };
@@ -319,7 +340,7 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
     for port in 1..=nports {
         // Set_Feature(PORT_POWER=8) on the hub, wIndex = port.
         let setup = [0x23, 0x03, 0x08, 0x00, port, 0x00, 0x00, 0x00];
-        let _ = control(ctx, mmio, &dma, op, 1, mps0, &setup, 0, false);
+        let _ = control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &setup, 0, false);
     }
     delay_cycles(ctx, RESET_HOLD_CYCLES); // power-on-to-power-good settle (generous)
 
@@ -328,7 +349,7 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
     for port in 1..=nports {
         // Get_Status of the hub port, wIndex = port → 4 bytes (wPortStatus|wPortChange).
         let setup = [0xA3, 0x00, 0x00, 0x00, port, 0x00, 0x04, 0x00];
-        if control(ctx, mmio, &dma, op, 1, mps0, &setup, 4, true).is_none() { continue; }
+        if control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &setup, 4, true).is_none() { continue; }
         let status = dma.read16(DATA_BUF + 0);
         let connected = status & (1 << 0) != 0;
         let low       = status & (1 << 9) != 0;
@@ -342,12 +363,43 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
         }
     }
 
-    if kbd_port != 0 {
-        ctx.log_fmt(format_args!(
-            "ehci: device on hub port {} (low_speed={}) -> E4 resets it + addresses via split transactions",
-            kbd_port, kbd_low as u8));
-    } else {
+    if kbd_port == 0 {
         ctx.log("ehci: no device found on the hub's downstream ports");
+        return;
+    }
+    ctx.log_fmt(format_args!(
+        "ehci: device on hub port {} (low_speed={}) -> resetting it for split addressing",
+        kbd_port, kbd_low as u8));
+
+    // E4 — reset the hub's downstream port (arms the TT for that port), then read
+    // the low-speed device's descriptor via SPLIT control transfers (the QH now
+    // carries hub address 1 + the port, and the controller wraps each transaction
+    // as SSPLIT/CSPLIT through the hub's transaction translator).
+    let setup = [0x23, 0x03, 0x04, 0x00, kbd_port, 0x00, 0x00, 0x00]; // Set_Feature(PORT_RESET=4)
+    if control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &setup, 0, false).is_none() {
+        ctx.log("ehci: hub-port reset failed"); return;
+    }
+    delay_cycles(ctx, RESET_HOLD_CYCLES); // hub holds the reset internally (~10 ms); wait generously
+    let setup = [0x23, 0x01, 0x14, 0x00, kbd_port, 0x00, 0x00, 0x00]; // Clear_Feature(C_PORT_RESET=20)
+    let _ = control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &setup, 0, false);
+    delay_cycles(ctx, RECOVERY_CYCLES);
+
+    // Low-speed device at the default address 0, behind hub 1 / port kbd_port.
+    // Low-speed EP0 max packet is 8. Read the device descriptor through the TT.
+    let kep = Ep::low(0, 8, 1, kbd_port);
+    let setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]; // Get_Descriptor(Device), 18
+    if control(ctx, mmio, &dma, op, &kep, &setup, 18, true).is_none() {
+        ctx.log("ehci: device descriptor over SPLIT failed — split transactions not yet working");
+        return;
+    }
+    let class = dma.read8(DATA_BUF + 4);
+    let vid   = dma.read16(DATA_BUF + 8);
+    let pid   = dma.read16(DATA_BUF + 10);
+    ctx.log_fmt(format_args!(
+        "ehci: SPLIT device descriptor: VID={:#06x} PID={:#06x} class={:#04x} -> split transactions WORK",
+        vid, pid, class));
+    if vid == 0x046d {
+        ctx.log("ehci: that's the Logitech keyboard -> E4b sets address/config, E5 polls keys");
     }
 }
 
