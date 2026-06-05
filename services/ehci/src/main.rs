@@ -266,12 +266,14 @@ fn control(
     for _ in 0..10_000_000u32 {
         if dma.read32(QTD_STATUS + 0x08) & QTD_ACTIVE == 0 { done = true; break; }
     }
-    let toks = dma.read32(QTD_SETUP + 0x08) | dma.read32(QTD_STATUS + 0x08)
-        | if data_len > 0 { dma.read32(QTD_DATA + 0x08) } else { 0 };
+    let t_setup  = dma.read32(QTD_SETUP + 0x08);
+    let t_data   = if data_len > 0 { dma.read32(QTD_DATA + 0x08) } else { 0 };
+    let t_status = dma.read32(QTD_STATUS + 0x08);
+    let toks = t_setup | t_data | t_status;
     if !done || toks & (QTD_HALTED | QTD_ERRMASK) != 0 {
         ctx.log_fmt(format_args!(
-            "ehci: control(req={:#04x}) FAILED tokens={:#010x} done={}",
-            setup[1], toks, done as u8));
+            "ehci: control(req={:#04x}) FAILED done={} setup={:#010x} data={:#010x} status={:#010x}",
+            setup[1], done as u8, t_setup, t_data, t_status));
         return None;
     }
     // Bytes actually moved = requested - (DATA token's remaining-bytes field).
@@ -344,62 +346,59 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
     }
     delay_cycles(ctx, RESET_HOLD_CYCLES); // power-on-to-power-good settle (generous)
 
-    let mut kbd_port = 0u8;
-    let mut kbd_low  = false;
+    // E4 — for EACH connected downstream port, reset it (arms the hub TT) and try
+    // reading its device descriptor over SPLIT transactions. Trying every
+    // connected port finds the keyboard wherever it sits (ports 3 and 4 both
+    // showed a low-speed device). Per-port reset status + per-stage qTD tokens are
+    // logged so a split failure is precisely diagnosable.
+    let mut found = false;
     for port in 1..=nports {
-        // Get_Status of the hub port, wIndex = port → 4 bytes (wPortStatus|wPortChange).
-        let setup = [0xA3, 0x00, 0x00, 0x00, port, 0x00, 0x04, 0x00];
+        // Status before reset.
+        let setup = [0xA3, 0x00, 0x00, 0x00, port, 0x00, 0x04, 0x00]; // Get_Status
         if control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &setup, 4, true).is_none() { continue; }
         let status = dma.read16(DATA_BUF + 0);
-        let connected = status & (1 << 0) != 0;
-        let low       = status & (1 << 9) != 0;
-        let high      = status & (1 << 10) != 0;
         ctx.log_fmt(format_args!(
-            "ehci: hub port {}: status={:#06x} connected={} low_speed={} high_speed={}",
-            port, status, connected as u8, low as u8, high as u8));
-        if connected && kbd_port == 0 {
-            kbd_port = port;
-            kbd_low = low;
+            "ehci: hub port {}: status={:#06x} connected={} low_speed={}",
+            port, status, (status & 1) as u8, ((status >> 9) & 1) as u8));
+        if status & 1 == 0 { continue; } // nothing connected
+
+        // Reset the downstream port and clear the reset-change.
+        let setup = [0x23, 0x03, 0x04, 0x00, port, 0x00, 0x00, 0x00]; // Set_Feature(PORT_RESET)
+        let _ = control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &setup, 0, false);
+        delay_cycles(ctx, RESET_HOLD_CYCLES);
+        let setup = [0x23, 0x01, 0x14, 0x00, port, 0x00, 0x00, 0x00]; // Clear_Feature(C_PORT_RESET)
+        let _ = control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &setup, 0, false);
+        delay_cycles(ctx, RECOVERY_CYCLES);
+
+        // Confirm the port enabled (bit 1) after reset.
+        let setup = [0xA3, 0x00, 0x00, 0x00, port, 0x00, 0x04, 0x00];
+        let _ = control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &setup, 4, true);
+        let pstat = dma.read16(DATA_BUF + 0);
+        ctx.log_fmt(format_args!(
+            "ehci: hub port {} after reset: status={:#06x} enabled={}",
+            port, pstat, ((pstat >> 1) & 1) as u8));
+
+        // Read the low-speed device's descriptor over SPLIT (EP0 max packet 8).
+        let kep = Ep::low(0, 8, 1, port);
+        let setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]; // Get_Descriptor(Device), 18
+        if control(ctx, mmio, &dma, op, &kep, &setup, 18, true).is_none() {
+            ctx.log_fmt(format_args!("ehci: split descriptor on hub port {} failed", port));
+            continue;
+        }
+        let class = dma.read8(DATA_BUF + 4);
+        let vid   = dma.read16(DATA_BUF + 8);
+        let pid   = dma.read16(DATA_BUF + 10);
+        ctx.log_fmt(format_args!(
+            "ehci: SPLIT device descriptor (hub port {}): VID={:#06x} PID={:#06x} class={:#04x} -> split WORKS",
+            port, vid, pid, class));
+        found = true;
+        if vid == 0x046d {
+            ctx.log("ehci: Logitech keyboard found over EHCI split! -> E4b/E5 next");
+            break;
         }
     }
-
-    if kbd_port == 0 {
-        ctx.log("ehci: no device found on the hub's downstream ports");
-        return;
-    }
-    ctx.log_fmt(format_args!(
-        "ehci: device on hub port {} (low_speed={}) -> resetting it for split addressing",
-        kbd_port, kbd_low as u8));
-
-    // E4 — reset the hub's downstream port (arms the TT for that port), then read
-    // the low-speed device's descriptor via SPLIT control transfers (the QH now
-    // carries hub address 1 + the port, and the controller wraps each transaction
-    // as SSPLIT/CSPLIT through the hub's transaction translator).
-    let setup = [0x23, 0x03, 0x04, 0x00, kbd_port, 0x00, 0x00, 0x00]; // Set_Feature(PORT_RESET=4)
-    if control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &setup, 0, false).is_none() {
-        ctx.log("ehci: hub-port reset failed"); return;
-    }
-    delay_cycles(ctx, RESET_HOLD_CYCLES); // hub holds the reset internally (~10 ms); wait generously
-    let setup = [0x23, 0x01, 0x14, 0x00, kbd_port, 0x00, 0x00, 0x00]; // Clear_Feature(C_PORT_RESET=20)
-    let _ = control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &setup, 0, false);
-    delay_cycles(ctx, RECOVERY_CYCLES);
-
-    // Low-speed device at the default address 0, behind hub 1 / port kbd_port.
-    // Low-speed EP0 max packet is 8. Read the device descriptor through the TT.
-    let kep = Ep::low(0, 8, 1, kbd_port);
-    let setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]; // Get_Descriptor(Device), 18
-    if control(ctx, mmio, &dma, op, &kep, &setup, 18, true).is_none() {
-        ctx.log("ehci: device descriptor over SPLIT failed — split transactions not yet working");
-        return;
-    }
-    let class = dma.read8(DATA_BUF + 4);
-    let vid   = dma.read16(DATA_BUF + 8);
-    let pid   = dma.read16(DATA_BUF + 10);
-    ctx.log_fmt(format_args!(
-        "ehci: SPLIT device descriptor: VID={:#06x} PID={:#06x} class={:#04x} -> split transactions WORK",
-        vid, pid, class));
-    if vid == 0x046d {
-        ctx.log("ehci: that's the Logitech keyboard -> E4b sets address/config, E5 polls keys");
+    if !found {
+        ctx.log("ehci: no device descriptor read over split on any connected port");
     }
 }
 
