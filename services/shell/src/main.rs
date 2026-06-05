@@ -358,22 +358,46 @@ fn find_running_slot(ctx: &ServiceContext, name: &str) -> Option<u32> {
     None
 }
 
+/// The trusted root (§6.1). The kernel refuses to kill these and refuses to spawn
+/// a second instance; the shell explains why before the syscall is even tried.
+const CORE_SERVICES: [&str; 3] = ["init", "supervisor", "registry"];
+
+fn is_core_service(name: &str) -> bool {
+    CORE_SERVICES.contains(&name)
+}
+
+/// `observe`'s variants are brokered by the `observe` / `observe now` commands —
+/// not meant to be raw-spawned (the bare `observe` service is a serial-streaming
+/// dev build that scrolls forever and ignores `q`).
+fn is_observe_variant(name: &str) -> bool {
+    matches!(name, "observe" | "observe-now" | "observe-live")
+}
+
+/// Print `prefix` followed by `name` as one console line.
+fn report(ctx: &ServiceContext, prefix: &str, name: &str) {
+    let mut buf = [0u8; 96];
+    let mut pos = 0usize;
+    write_bytes(&mut buf, &mut pos, prefix.as_bytes());
+    write_bytes(&mut buf, &mut pos, name.as_bytes());
+    ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or(prefix));
+}
+
 fn cmd_spawn(ctx: &ServiceContext, name: &str) {
+    if is_observe_variant(name) {
+        ctx.console_writeln("observe runs from a command: type 'observe' (live) or 'observe now' (snapshot)");
+        return;
+    }
+    if is_core_service(name) {
+        ctx.console_writeln("spawn: core services (init, supervisor, registry) are protected");
+        return;
+    }
+    if slot_of(ctx, name).is_some() {
+        report(ctx, "already running: ", name);
+        return;
+    }
     match ctx.spawn(name) {
-        Ok(()) => {
-            let mut buf = [0u8; 64];
-            let mut pos = 0usize;
-            write_bytes(&mut buf, &mut pos, b"spawned: ");
-            write_bytes(&mut buf, &mut pos, name.as_bytes());
-            ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("spawned"));
-        }
-        Err(_) => {
-            let mut buf = [0u8; 64];
-            let mut pos = 0usize;
-            write_bytes(&mut buf, &mut pos, b"spawn failed: ");
-            write_bytes(&mut buf, &mut pos, name.as_bytes());
-            ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("spawn failed"));
-        }
+        Ok(())  => report(ctx, "spawned: ", name),
+        Err(_)  => report(ctx, "spawn failed (unknown service?): ", name),
     }
 }
 
@@ -404,40 +428,32 @@ fn cmd_pipe(ctx: &ServiceContext, producer: &str, sink: &str) {
 }
 
 fn cmd_kill(ctx: &ServiceContext, name: &str) {
+    if is_core_service(name) {
+        ctx.console_writeln("kill: core services (init, supervisor, registry) are protected");
+        return;
+    }
+    if slot_of(ctx, name).is_none() {
+        report(ctx, "not running: ", name);
+        return;
+    }
     match ctx.kill(name) {
-        Ok(()) => {
-            let mut buf = [0u8; 64];
-            let mut pos = 0usize;
-            write_bytes(&mut buf, &mut pos, b"killed: ");
-            write_bytes(&mut buf, &mut pos, name.as_bytes());
-            ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("killed"));
-        }
-        Err(_) => {
-            let mut buf = [0u8; 64];
-            let mut pos = 0usize;
-            write_bytes(&mut buf, &mut pos, b"kill failed: ");
-            write_bytes(&mut buf, &mut pos, name.as_bytes());
-            ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("kill failed"));
-        }
+        Ok(())  => report(ctx, "killed: ", name),
+        Err(_)  => report(ctx, "kill failed: ", name),
     }
 }
 
 fn cmd_restart(ctx: &ServiceContext, name: &str, core: Option<u32>) {
+    if is_core_service(name) {
+        ctx.console_writeln("restart: core services (init, supervisor, registry) are protected");
+        return;
+    }
+    if is_observe_variant(name) {
+        ctx.console_writeln("observe runs from a command: type 'observe' (live) or 'observe now' (snapshot)");
+        return;
+    }
     match ctx.restart(name, core) {
-        Ok(()) => {
-            let mut buf = [0u8; 64];
-            let mut pos = 0usize;
-            write_bytes(&mut buf, &mut pos, b"restarted: ");
-            write_bytes(&mut buf, &mut pos, name.as_bytes());
-            ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("restarted"));
-        }
-        Err(_) => {
-            let mut buf = [0u8; 64];
-            let mut pos = 0usize;
-            write_bytes(&mut buf, &mut pos, b"restart failed: ");
-            write_bytes(&mut buf, &mut pos, name.as_bytes());
-            ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("restart failed"));
-        }
+        Ok(()) => report(ctx, "restarted: ", name),
+        Err(_) => report(ctx, "restart failed: ", name),
     }
 }
 
