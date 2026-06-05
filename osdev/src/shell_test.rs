@@ -207,6 +207,16 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
+    // Singleton guard — spawning an already-live service (here the trusted-root
+    // supervisor) must be refused, so the shell can't create a duplicate TCB.
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"spawn supervisor\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("spawn failed"), "spawn: duplicate/trusted-root refused"),
+        None    => { println!("shell-test: FAIL — timed out after spawn supervisor"); fail += 1; }
+    }
+
+    // -----------------------------------------------------------------------
     // Done.
     // -----------------------------------------------------------------------
     child.kill().ok();
