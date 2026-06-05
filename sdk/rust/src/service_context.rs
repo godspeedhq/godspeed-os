@@ -644,6 +644,19 @@ impl ServiceContext {
         }
     }
 
+    /// Safe MMIO handle for this service's EHCI controller, if one was granted
+    /// (§12). Reads the same kernel-mapped controller-BAR window as
+    /// [`xhci_mmio`](Self::xhci_mmio) — a driver service holds exactly one
+    /// controller, so the field is shared and unambiguous. `None` for non-drivers.
+    pub fn ehci_mmio(&self) -> Option<crate::mmio::Mmio> {
+        let va = Self::ctx().xhci_mmio_va;
+        if va == 0 {
+            None
+        } else {
+            Some(crate::mmio::Mmio::new(va as *mut u8))
+        }
+    }
+
     /// Safe handle to this service's DMA arena, if one was granted (§12). The
     /// kernel mapped a physically-contiguous region into this driver; the
     /// returned [`crate::Dma`] gives the CPU view (read/write) and the physical

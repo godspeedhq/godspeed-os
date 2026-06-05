@@ -124,7 +124,7 @@ struct ServiceContextData {
     core_id:            u32,
     probe_mode:         u32,
     console_read_slot:  u32, // u32::MAX = not present; slot index if service has console_read cap
-    xhci_mmio_va:       u64, // 0 = not mapped; else VA where the xHCI BAR is mapped (§12)
+    xhci_mmio_va:       u64, // 0 = not mapped; else VA of the driver's controller BAR — xHCI or EHCI (§12)
     xhci_dma_va:        u64, // 0 = none; else VA of the driver's DMA arena (§12)
     xhci_dma_phys:      u64, // physical base of the DMA arena (programmed into the device)
     xhci_dma_len:       u64, // length of the DMA arena in bytes
@@ -2838,27 +2838,39 @@ fn spawn_service_with_config(
     // 6a. Map the xHCI controller's MMIO BAR into the driver's address space
     // (§12). Name-gated: only the `xhci` service receives it, and only if the
     // PCI scan found a controller. Device registers must be uncached (PCD|PWT).
-    let xhci_mmio_va = if name == "xhci"
-        && crate::arch::x86_64::pci::XHCI_FOUND.load(core::sync::atomic::Ordering::Relaxed)
-    {
-        let bar =
-            crate::arch::x86_64::pci::XHCI_MMIO_BASE.load(core::sync::atomic::Ordering::Relaxed);
-        let mmio_flags = PageFlags::PRESENT
-            | PageFlags::WRITABLE
-            | PageFlags::USER
-            | PageFlags::NO_EXEC
-            | PageFlags::PCD
-            | PageFlags::PWT;
-        for i in 0..XHCI_MMIO_PAGES {
-            let off = i * PAGE_SIZE as u64;
-            page_table
-                .map(VirtAddr(XHCI_MMIO_VA + off), PhysAddr(bar + off), mmio_flags)
-                .map_err(|_| SpawnError::MapFailed)?;
+    // Map the USB host-controller BAR for a driver service into its address space
+    // at XHCI_MMIO_VA. Both the xhci and ehci drivers use this one window — a
+    // service holds exactly one controller, and each has its own address space, so
+    // the shared VA + ctx field (`xhci_mmio_va`, read by `ctx.xhci_mmio()` /
+    // `ctx.ehci_mmio()`) is unambiguous (§12).
+    let xhci_mmio_va = {
+        use core::sync::atomic::Ordering::Relaxed;
+        use crate::arch::x86_64::pci;
+        let bar = if name == "xhci" && pci::XHCI_FOUND.load(Relaxed) {
+            pci::XHCI_MMIO_BASE.load(Relaxed)
+        } else if name == "ehci" && pci::EHCI_FOUND.load(Relaxed) {
+            pci::EHCI_MMIO_BASE.load(Relaxed)
+        } else {
+            0
+        };
+        if bar != 0 {
+            let mmio_flags = PageFlags::PRESENT
+                | PageFlags::WRITABLE
+                | PageFlags::USER
+                | PageFlags::NO_EXEC
+                | PageFlags::PCD
+                | PageFlags::PWT;
+            for i in 0..XHCI_MMIO_PAGES {
+                let off = i * PAGE_SIZE as u64;
+                page_table
+                    .map(VirtAddr(XHCI_MMIO_VA + off), PhysAddr(bar + off), mmio_flags)
+                    .map_err(|_| SpawnError::MapFailed)?;
+            }
+            crate::kprintln!("spawn[mmio]: '{}' BAR {:#x} -> VA {:#x}", name, bar, XHCI_MMIO_VA);
+            XHCI_MMIO_VA
+        } else {
+            0
         }
-        crate::kprintln!("spawn[mmio]: 'xhci' BAR {:#x} -> VA {:#x}", bar, XHCI_MMIO_VA);
-        XHCI_MMIO_VA
-    } else {
-        0
     };
 
     // 6b. Allocate + map a physically-contiguous DMA arena for the xHCI driver
