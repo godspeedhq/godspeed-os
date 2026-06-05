@@ -423,6 +423,17 @@ fn handle_spawn_pipe(packed_arg0: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 /// Phase 5: no capability check (cap check added in Phase 6 when service_control
 /// is fully wired).
 fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
+    // §3.1 / §14.4: killing a service is a privileged action — it requires the
+    // service_control capability. Without this gate `kill` was ambient authority
+    // (any service could kill any non-trusted-root service). Like the other
+    // name-taking syscalls it consumes both arg registers, so it validates by
+    // holdings on the stable SERVICE_CONTROL resource. See
+    // docs/service-control-cap.md.
+    if !scheduler::current_task_holds_resource(
+        crate::capability::SERVICE_CONTROL_RESOURCE, Rights::WRITE)
+    {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
     let len = name_len as usize;
     if len == 0 || len > 64 { return -1; }
     let name_bytes = match read_user_bytes(name_ptr, len) {
