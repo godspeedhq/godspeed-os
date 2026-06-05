@@ -657,6 +657,47 @@ impl ServiceContext {
         }
     }
 
+    /// Write a string to the **interactive console** (serial + framebuffer),
+    /// WITHOUT a trailing newline (syscall 23, requires log_write cap in Stage 1).
+    /// This is the user-facing path: the shell prompt, command results, and
+    /// `observe` frames. Unlike `log`/`print` (now serial-only), this also reaches
+    /// the framebuffer/TV — the interactive surface (see docs/console-service.md).
+    pub fn console_write(&self, msg: &str) {
+        let data = Self::ctx();
+        if data.magic != SERVICE_CTX_MAGIC { return; }
+        let slot = data.log_write_slot;
+        if slot == u32::MAX { return; }
+
+        let bytes = msg.as_bytes();
+        let len   = bytes.len();
+        if len == 0 || len > 256 { return; }
+
+        // SAFETY: syscall(23) = ConsoleWrite; bytes is a valid slice within user space.
+        unsafe {
+            raw_syscall(23, slot as u64, bytes.as_ptr() as u64, len as u64);
+        }
+    }
+
+    /// Write a string to the interactive console followed by a newline.
+    pub fn console_writeln(&self, msg: &str) {
+        self.console_write(msg);
+        self.console_write("\n");
+    }
+
+    /// Write a formatted message to the interactive console, followed by a newline.
+    pub fn console_writeln_fmt(&self, args: core::fmt::Arguments) {
+        let mut buf    = [0u8; 256];
+        let mut cursor = 0usize;
+        let _ = core::fmt::write(
+            &mut StackWriter { buf: &mut buf, pos: &mut cursor },
+            args,
+        );
+        if cursor > 0 {
+            self.console_write(core::str::from_utf8(&buf[..cursor]).unwrap_or("(fmt error)"));
+        }
+        self.console_write("\n");
+    }
+
     /// Spawn a service by name on the kernel-selected core.
     pub fn spawn(&self, name: &str) -> Result<(), crate::Error> {
         self.spawn_on(name, 0xFFFF)
