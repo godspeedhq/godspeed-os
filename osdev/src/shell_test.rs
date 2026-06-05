@@ -15,15 +15,17 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// TCP port for COM1 in the shell test.
-/// Matches nothing else in the codebase (5555 = COM2 control channel).
-const SHELL_PORT: u16 = 5556;
-
 pub fn run(image_path: &Path, smp: u32) {
     println!("shell-test: booting OS (smp={smp}) — scripted mode");
 
     let qemu      = crate::qemu::qemu_binary();
     let image_str = image_path.to_string_lossy().replace('\\', "/");
+
+    // COM1 → TCP server on a FRESH free port per run. A fixed port (was 5556)
+    // collided with a stale QEMU left over from a previous/concurrent run, which
+    // showed up as "could not connect". An ephemeral port can't collide — a leftover
+    // QEMU is always on a different port.
+    let shell_port = pick_free_port();
 
     let mut cmd = std::process::Command::new(&qemu);
     cmd.args([
@@ -32,7 +34,7 @@ pub fn run(image_path: &Path, smp: u32) {
         "-m",       "512M",
         // COM1 → TCP server; QEMU waits for a client before booting so we
         // never miss output that was written before we connected.
-        "-serial",  &format!("tcp::{SHELL_PORT},server"),
+        "-serial",  &format!("tcp::{shell_port},server"),
         "-serial",  "null",   // COM2 unused
         "-display", "none",
         "-no-reboot",
@@ -48,10 +50,10 @@ pub fn run(image_path: &Path, smp: u32) {
     });
 
     // Connect to QEMU's serial server; this triggers QEMU to begin booting.
-    let stream = match retry_tcp_connect(SHELL_PORT, Duration::from_secs(10)) {
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
         Some(s) => s,
         None    => {
-            eprintln!("shell-test: could not connect to QEMU serial port {SHELL_PORT}");
+            eprintln!("shell-test: could not connect to QEMU serial port {shell_port}");
             child.kill().ok();
             std::process::exit(1);
         }
@@ -232,6 +234,19 @@ pub fn run(image_path: &Path, smp: u32) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Ask the OS for a free TCP port: bind `127.0.0.1:0` (kernel assigns an unused
+/// ephemeral port), read it back, then drop the listener so QEMU can claim it as
+/// its serial server. The drop→QEMU-bind window is negligible for a local harness,
+/// and a fresh port per run removes the stale-QEMU collision class entirely.
+/// Falls back to 5556 only if binding somehow fails.
+fn pick_free_port() -> u16 {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .ok()
+        .and_then(|l| l.local_addr().ok())
+        .map(|a| a.port())
+        .unwrap_or(5556)
+}
 
 /// Retry connecting to `127.0.0.1:port` every 100 ms until `timeout` expires.
 /// QEMU needs ~50–200 ms to open the port after launch.
