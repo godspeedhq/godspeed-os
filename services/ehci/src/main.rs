@@ -378,23 +378,55 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
             "ehci: hub port {} after reset: status={:#06x} enabled={}",
             port, pstat, ((pstat >> 1) & 1) as u8));
 
-        // Read the low-speed device's descriptor over SPLIT (EP0 max packet 8).
+        // Read the low-speed device's descriptor over SPLIT (EP0 max packet 8),
+        // retrying a couple times — the first transaction after reset can XactErr.
         let kep = Ep::low(0, 8, 1, port);
         let setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]; // Get_Descriptor(Device), 18
-        if control(ctx, mmio, &dma, op, &kep, &setup, 18, true).is_none() {
-            ctx.log_fmt(format_args!("ehci: split descriptor on hub port {} failed", port));
+        let mut got = false;
+        for _ in 0..3 {
+            if control(ctx, mmio, &dma, op, &kep, &setup, 18, true).is_some() { got = true; break; }
+            delay_cycles(ctx, RECOVERY_CYCLES);
+        }
+        if !got {
+            ctx.log_fmt(format_args!("ehci: split descriptor on hub port {} failed (3 tries)", port));
             continue;
         }
-        let class = dma.read8(DATA_BUF + 4);
-        let vid   = dma.read16(DATA_BUF + 8);
-        let pid   = dma.read16(DATA_BUF + 10);
+        let vid = dma.read16(DATA_BUF + 8);
+        let pid = dma.read16(DATA_BUF + 10);
         ctx.log_fmt(format_args!(
-            "ehci: SPLIT device descriptor (hub port {}): VID={:#06x} PID={:#06x} class={:#04x} -> split WORKS",
-            port, vid, pid, class));
+            "ehci: SPLIT device (hub port {}): VID={:#06x} PID={:#06x}", port, vid, pid));
         found = true;
-        if vid == 0x046d {
-            ctx.log("ehci: Logitech keyboard found over EHCI split! -> E4b/E5 next");
-            break;
+
+        // Read the config descriptor to identify the device: HID interface
+        // class/protocol (1=keyboard, 2=mouse) and the interrupt-IN endpoint.
+        let setup = [0x80, 0x06, 0x00, 0x02, 0x00, 0x00, 0x40, 0x00]; // Get_Descriptor(Config), 64
+        if control(ctx, mmio, &dma, op, &kep, &setup, 64, true).is_some() {
+            let mut o = 0usize;
+            let (mut iclass, mut iproto, mut ep_addr, mut ep_int) = (0u8, 0u8, 0u8, 0u8);
+            while o + 2 <= 64 {
+                let blen = dma.read8(DATA_BUF + o) as usize;
+                if blen == 0 { break; }
+                match dma.read8(DATA_BUF + o + 1) {
+                    0x04 if o + 8 <= 64 && iclass == 0 => {       // interface
+                        iclass = dma.read8(DATA_BUF + o + 5);
+                        iproto = dma.read8(DATA_BUF + o + 7);
+                    }
+                    0x05 if o + 7 <= 64 && ep_addr == 0 => {      // endpoint
+                        if dma.read8(DATA_BUF + o + 3) & 0x03 == 0x03 { // interrupt
+                            ep_addr = dma.read8(DATA_BUF + o + 2);
+                            ep_int  = dma.read8(DATA_BUF + o + 6);
+                        }
+                    }
+                    _ => {}
+                }
+                o += blen;
+            }
+            ctx.log_fmt(format_args!(
+                "ehci: port {} HID class={:#x} protocol={} (1=kbd 2=mouse) int_ep={:#04x} interval={}",
+                port, iclass, iproto, ep_addr, ep_int));
+            if iclass == 0x03 && iproto == 1 {
+                ctx.log_fmt(format_args!("ehci: *** boot KEYBOARD on hub port {} -> E4b/E5 ***", port));
+            }
         }
     }
     if !found {
