@@ -42,6 +42,11 @@ pub enum SyscallNumber {
     Park           = 21,
     Print          = 22,
     ConsoleWrite   = 23,
+    TryConsoleRead = 24,
+    ConsoleEcho    = 25,
+    ConsoleBootComplete = 26,
+    SignalInputReady    = 27,
+    TaskCaps            = 28,
 }
 
 /// Raw syscall dispatcher — called from the SYSCALL/SYSENTER IDT stub.
@@ -85,6 +90,11 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::Park          as u64 => scheduler::park_current(),
         n if n == SyscallNumber::Print         as u64 => handle_print(arg0, arg1, arg2),
         n if n == SyscallNumber::ConsoleWrite  as u64 => handle_console_write(arg0, arg1, arg2),
+        n if n == SyscallNumber::TryConsoleRead as u64 => handle_try_console_read(arg0),
+        n if n == SyscallNumber::ConsoleEcho   as u64 => handle_console_echo(arg0, arg1),
+        n if n == SyscallNumber::ConsoleBootComplete as u64 => handle_console_boot_complete(arg0),
+        n if n == SyscallNumber::SignalInputReady as u64 => handle_signal_input_ready(arg0),
+        n if n == SyscallNumber::TaskCaps as u64 => handle_task_caps(arg0, arg1, arg2),
         _ => -1, // Unknown syscall.
     }
 }
@@ -657,10 +667,11 @@ fn handle_abort(msg_ptr: u64, msg_len: u64) -> i64 {
 ///   Returns the current generation of the named endpoint as a non-negative
 ///   i64, or -1 if the name is not registered.
 fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
-    // Self-state (0 = own alloc bytes) and the clock (3 = TSC) are ungated. Every
-    // other query discloses another task's or system-wide state and requires the
+    // Self-state (0 = own alloc bytes), the clock (3 = TSC), and console geometry
+    // (9 = fbcon rows/cols — task-neutral hardware info) are ungated. Every other
+    // query discloses another task's or system-wide state and requires the
     // INTROSPECT capability with READ (§3.1; docs/introspection-capability.md).
-    if !matches!(query_id, 0 | 3)
+    if !matches!(query_id, 0 | 3 | 9 | 10)
         && !scheduler::current_task_holds_resource(
             crate::capability::INTROSPECT_RESOURCE, Rights::READ)
     {
@@ -670,6 +681,13 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         0 => scheduler::current_task_alloc_bytes() as i64,
         1 => crate::ipc::routing::count_live_endpoints() as i64,
         3 => read_cycle_counter() as i64,
+        // Console (fbcon) geometry packed as (rows << 16) | cols. The console
+        // service needs this to lay out its terminal (pin the input line to the
+        // bottom row). 0 if the framebuffer never initialised.
+        9 => crate::arch::x86_64::fb::dims_packed() as i64,
+        // Input-ready flag — set by the xHCI driver when it finishes setup (the
+        // last boot step). The shell watches it to auto-clear the boot screen.
+        10 => crate::arch::x86_64::input_ready() as i64,
         4 => crate::memory::allocator::free_frame_count() as i64,
         5 => crate::memory::allocator::total_frame_count() as i64,
         6 => scheduler::core_active_ticks(arg1 as usize) as i64,
@@ -827,6 +845,143 @@ fn handle_console_read(cap_slot: u64) -> i64 {
         }
         // Woken by uart_rx_irq_handler; loop to pop the byte.
     }
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: TryConsoleRead (24) — non-blocking console read.
+// ---------------------------------------------------------------------------
+
+/// Pop one byte from the console ring without blocking. A foreground full-screen
+/// app (live `observe`) uses this to poll for `q` between repaints, since it
+/// cannot afford to block in `ConsoleRead`. Does NOT register as the console
+/// waiter (it never sleeps).
+///
+/// Returns the byte (0..=255) if one is available, `NO_CONSOLE_BYTE` (256) if the
+/// ring is empty, or a negative cap error.
+fn handle_try_console_read(cap_slot: u64) -> i64 {
+    use crate::capability::CONSOLE_READ_RESOURCE;
+    const NO_CONSOLE_BYTE: i64 = 256;
+
+    let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::READ) {
+        Ok(c)  => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    if cap.resource_id != CONSOLE_READ_RESOURCE {
+        return cap_err_to_i64(CapError::CapWrongScope);
+    }
+    match crate::arch::x86_64::uart_rx_pop() {
+        Some(b) => b as i64,
+        None    => NO_CONSOLE_BYTE,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: ConsoleEcho (25) — enable/disable keystroke echo.
+// ---------------------------------------------------------------------------
+
+/// Turn console keystroke echo on (`arg1 != 0`) or off (`arg1 == 0`). A
+/// foreground app disables echo while it owns the screen and re-enables it on
+/// exit. Gated by CONSOLE_READ (only services that consume the keyboard may
+/// control its echo).
+fn handle_console_echo(cap_slot: u64, on: u64) -> i64 {
+    use crate::capability::CONSOLE_READ_RESOURCE;
+
+    let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::READ) {
+        Ok(c)  => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    if cap.resource_id != CONSOLE_READ_RESOURCE {
+        return cap_err_to_i64(CapError::CapWrongScope);
+    }
+    crate::arch::x86_64::set_console_echo(on != 0);
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: ConsoleBootComplete (26) — end boot-log mirroring + clear the screen.
+// ---------------------------------------------------------------------------
+
+/// End boot-log mirroring to the framebuffer and clear the TV, handing over a
+/// clean interactive console. The shell calls this once, on the first keystroke,
+/// after the boot sequence has been displayed. Gated by CONSOLE_READ (only the
+/// keyboard-owning service decides when boot output is dismissed).
+fn handle_console_boot_complete(cap_slot: u64) -> i64 {
+    use crate::capability::CONSOLE_READ_RESOURCE;
+
+    let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::READ) {
+        Ok(c)  => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    if cap.resource_id != CONSOLE_READ_RESOURCE {
+        return cap_err_to_i64(CapError::CapWrongScope);
+    }
+    crate::arch::x86_64::console_boot_complete();
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: SignalInputReady (27) — input driver reports setup complete.
+// ---------------------------------------------------------------------------
+
+/// The USB keyboard driver (xHCI) calls this once it finishes setup, in every
+/// terminal path. As the last subsystem to come up, its report is the
+/// deterministic end-of-boot signal the shell uses to auto-clear the boot screen.
+/// Gated by CONSOLE_PUSH (held only by the input driver, §12) so no other service
+/// can fake "boot done".
+fn handle_signal_input_ready(cap_slot: u64) -> i64 {
+    use crate::capability::CONSOLE_PUSH_RESOURCE;
+
+    let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::WRITE) {
+        Ok(c)  => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    if cap.resource_id != CONSOLE_PUSH_RESOURCE {
+        return cap_err_to_i64(CapError::CapWrongScope);
+    }
+    crate::arch::x86_64::set_input_ready();
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: TaskCaps (28) — list the capabilities held by a task.
+// ---------------------------------------------------------------------------
+
+/// arg0 = slot, arg1 = buf_ptr (user VA), arg2 = buf_len (bytes).
+///
+/// Writes up to `buf_len / 16` entries describing the target task's held caps,
+/// returns the count. Each 16-byte entry: [0..8] resource_id u64 LE, [8] rights
+/// u8, [9..16] pad. Requires INTROSPECT (READ) — discloses a task's authority
+/// (the in-OS form of `osdev caps`, §17; makes authority visible per §26.9).
+///
+/// Best-effort snapshot (see `scheduler::for_each_cap_of`). Returns -1 on bad args.
+fn handle_task_caps(slot: u64, buf_ptr: u64, buf_len: u64) -> i64 {
+    const ENTRY: usize = 16;
+    const MAX_ENTRIES: usize = 64; // CapTable holds at most 64 slots
+
+    if !scheduler::current_task_holds_resource(
+        crate::capability::INTROSPECT_RESOURCE, Rights::READ)
+    {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+    let cap = (buf_len as usize / ENTRY).min(MAX_ENTRIES);
+    if cap == 0 { return 0; }
+
+    // Collect into a kernel buffer first; do not touch user memory inside the
+    // iteration closure.
+    let mut tmp = [0u8; ENTRY * MAX_ENTRIES];
+    let mut n = 0usize;
+    scheduler::for_each_cap_of(slot as usize, |c| {
+        if n < cap {
+            let o = n * ENTRY;
+            tmp[o..o + 8].copy_from_slice(&c.resource_id.0.to_le_bytes());
+            tmp[o + 8] = c.rights.0;
+            n += 1;
+        }
+    });
+
+    let bytes = n * ENTRY;
+    if !validate_user_ptr(buf_ptr, bytes) { return -1; }
+    if write_user_bytes(buf_ptr, &tmp[..bytes]) { n as i64 } else { -1 }
 }
 
 // ---------------------------------------------------------------------------

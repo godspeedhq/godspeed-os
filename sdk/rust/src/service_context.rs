@@ -116,6 +116,17 @@ impl TaskStat {
     }
 }
 
+/// One held capability, as reported by [`ServiceContext::task_caps`].
+#[derive(Clone, Copy, Default)]
+pub struct CapInfo {
+    /// Resource the cap targets. Stable kernel resources: 1=log_write, 2=spawn,
+    /// 3=console_read, 4=console_push, 5=introspect; larger ids are IPC endpoints
+    /// or other per-resource grants.
+    pub resource_id: u64,
+    /// Rights bitfield: READ=1, WRITE=2, SEND=4, RECV=8, GRANT=16, REVOKE=32.
+    pub rights: u8,
+}
+
 // ---------------------------------------------------------------------------
 // AllocError — returned by ServiceContext::alloc_mem.
 // ---------------------------------------------------------------------------
@@ -396,6 +407,40 @@ impl ServiceContext {
         if ret <= 0 { 1 } else { ret as u32 }
     }
 
+    /// Framebuffer console geometry as `(rows, cols)` text cells, or `(0, 0)` if
+    /// there is no framebuffer. The console service uses this to lay out its
+    /// terminal (pin the input line to the bottom row).
+    ///
+    /// Wraps InspectKernel query 9 (ambient — screen geometry is task-neutral).
+    pub fn console_dims(&self) -> (u16, u16) {
+        // SAFETY: syscall(13) = InspectKernel; query_id=9 = packed (rows<<16)|cols.
+        let ret = unsafe { raw_syscall(13, 9, 0, 0) };
+        if ret <= 0 {
+            (0, 0)
+        } else {
+            let packed = ret as u64;
+            (((packed >> 16) & 0xFFFF) as u16, (packed & 0xFFFF) as u16)
+        }
+    }
+
+    /// Whether the input driver has reported setup complete (syscall 13, query 10).
+    /// The deterministic end-of-boot signal: the shell watches it to auto-clear the
+    /// boot screen the moment the keyboard subsystem is up. Ambient.
+    pub fn input_ready(&self) -> bool {
+        // SAFETY: syscall(13) = InspectKernel; query_id=10 = input-ready flag.
+        unsafe { raw_syscall(13, 10, 0, 0) > 0 }
+    }
+
+    /// Report that input-subsystem setup is complete (syscall 27). Called by the
+    /// USB keyboard driver (xHCI) in every terminal path once it has finished — the
+    /// end-of-boot signal. Requires the CONSOLE_PUSH cap (the input driver only).
+    pub fn signal_input_ready(&self) {
+        let slot = Self::ctx().console_push_slot;
+        if slot == u32::MAX { return; }
+        // SAFETY: syscall(27) = SignalInputReady; slot is the kernel-written cap index.
+        let _ = unsafe { raw_syscall(27, slot as u64, 0, 0) };
+    }
+
     /// Read the hardware TSC (Time Stamp Counter) via the kernel.
     ///
     /// Returns RDTSC cycle count. Useful for measuring kernel operation latencies
@@ -440,6 +485,32 @@ impl ServiceContext {
                                               buf[68], buf[69], buf[70], buf[71]]);
         TaskStat { valid, state, core, mem_used, mem_limit, name_len: copy_len, name,
                    generation, queue_depth, run_ticks }
+    }
+
+    /// List the capabilities held by the task in `slot`, into `out`. Returns the
+    /// number of entries written (capped at `out.len()` and 64). Requires the
+    /// INTROSPECT cap. Best-effort snapshot — see [`task_stat`](Self::task_stat).
+    pub fn task_caps(&self, slot: u32, out: &mut [CapInfo]) -> usize {
+        const ENTRY: usize = 16;
+        const MAX: usize = 64;
+        let want = out.len().min(MAX);
+        if want == 0 { return 0; }
+        let mut buf = [0u8; ENTRY * MAX];
+        // SAFETY: syscall(28) = TaskCaps; buf is a local array on the user stack.
+        let ret = unsafe {
+            raw_syscall(28, slot as u64, buf.as_mut_ptr() as u64, (want * ENTRY) as u64)
+        };
+        if ret <= 0 { return 0; }
+        let count = (ret as usize).min(want);
+        for i in 0..count {
+            let o = i * ENTRY;
+            out[i].resource_id = u64::from_le_bytes([
+                buf[o], buf[o + 1], buf[o + 2], buf[o + 3],
+                buf[o + 4], buf[o + 5], buf[o + 6], buf[o + 7],
+            ]);
+            out[i].rights = buf[o + 8];
+        }
+        count
     }
 
     /// Send a message via an explicit cap handle (blocking).
@@ -514,6 +585,47 @@ impl ServiceContext {
         // SAFETY: syscall(17) = ConsoleRead; slot is kernel-written cap index.
         let ret = unsafe { raw_syscall(17, slot as u64, 0, 0) };
         if ret >= 0 { ret as u8 } else { 0 }
+    }
+
+    /// Non-blocking console read (syscall 24). Returns `Some(byte)` if a keystroke
+    /// is waiting, `None` if the ring is empty. A foreground full-screen app polls
+    /// this for `q`-to-quit between repaints instead of blocking in `console_read`.
+    /// Requires the CONSOLE_READ cap (`has_console_read` in the kernel config).
+    pub fn try_console_read(&self) -> Option<u8> {
+        let data = Self::ctx();
+        if data.magic != SERVICE_CTX_MAGIC { return None; }
+        let slot = data.console_read_slot;
+        if slot == u32::MAX { return None; }
+        // SAFETY: syscall(24) = TryConsoleRead; slot is kernel-written cap index.
+        // Returns 0..=255 (byte), 256 (empty), or negative (cap error).
+        let ret = unsafe { raw_syscall(24, slot as u64, 0, 0) };
+        if (0..=255).contains(&ret) { Some(ret as u8) } else { None }
+    }
+
+    /// Enable (`true`) or disable (`false`) console keystroke echo (syscall 25).
+    /// A foreground full-screen app disables echo while it owns the screen — so
+    /// its raw key polls do not smear its frame — and re-enables it on exit.
+    /// Requires the CONSOLE_READ cap.
+    pub fn console_echo(&self, on: bool) {
+        let data = Self::ctx();
+        if data.magic != SERVICE_CTX_MAGIC { return; }
+        let slot = data.console_read_slot;
+        if slot == u32::MAX { return; }
+        // SAFETY: syscall(25) = ConsoleEcho; slot is kernel-written cap index.
+        let _ = unsafe { raw_syscall(25, slot as u64, on as u64, 0) };
+    }
+
+    /// End boot-log mirroring to the framebuffer and clear the TV (syscall 26).
+    /// The shell calls this once, on the first keystroke, so the user sees the
+    /// boot sequence on the display and then gets a clean interactive console.
+    /// Requires the CONSOLE_READ cap.
+    pub fn console_boot_complete(&self) {
+        let data = Self::ctx();
+        if data.magic != SERVICE_CTX_MAGIC { return; }
+        let slot = data.console_read_slot;
+        if slot == u32::MAX { return; }
+        // SAFETY: syscall(26) = ConsoleBootComplete; slot is kernel-written cap index.
+        let _ = unsafe { raw_syscall(26, slot as u64, 0, 0) };
     }
 
     /// Return the core this service was spawned on.
@@ -696,6 +808,30 @@ impl ServiceContext {
             self.console_write(core::str::from_utf8(&buf[..cursor]).unwrap_or("(fmt error)"));
         }
         self.console_write("\n");
+    }
+
+    /// Write one console line. When `clear_eol` is true the line ends with
+    /// `ESC[K` (erase to end of line) before the newline — so a full-screen app
+    /// repainting in place (cursor homed each frame) overwrites a previous,
+    /// longer line without leaving stale characters, and without a full-screen
+    /// clear (no flicker). When false, behaves exactly like `console_writeln`.
+    pub fn console_line(&self, clear_eol: bool, msg: &str) {
+        self.console_write(msg);
+        self.console_write(if clear_eol { "\x1b[K\n" } else { "\n" });
+    }
+
+    /// Formatted variant of [`console_line`].
+    pub fn console_line_fmt(&self, clear_eol: bool, args: core::fmt::Arguments) {
+        let mut buf    = [0u8; 256];
+        let mut cursor = 0usize;
+        let _ = core::fmt::write(
+            &mut StackWriter { buf: &mut buf, pos: &mut cursor },
+            args,
+        );
+        if cursor > 0 {
+            self.console_write(core::str::from_utf8(&buf[..cursor]).unwrap_or("(fmt error)"));
+        }
+        self.console_write(if clear_eol { "\x1b[K\n" } else { "\n" });
     }
 
     /// Spawn a service by name on the kernel-selected core.

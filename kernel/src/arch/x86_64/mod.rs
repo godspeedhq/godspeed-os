@@ -338,9 +338,13 @@ pub fn serial_write_byte(b: u8) {
     if got {
         SERIAL_LOCK.store(false, Ordering::Release);
     }
-    // COM1 only — this is the LOG stream (kprintln, ctx.log). The interactive
-    // console (framebuffer) is written via `console_write_byte` instead, so logs
-    // no longer smear the TV (§ docs/console-service.md, Stage 1).
+    // Log stream → COM1. During boot it is ALSO mirrored to the framebuffer so the
+    // user sees the init sequence on the TV; the shell ends this once boot output
+    // settles (console_boot_complete). After that, logs are serial-only and only
+    // the console path reaches the TV (Stage 1; docs/console-service.md).
+    if boot_log_to_fb() {
+        fb::put_byte(b);
+    }
 }
 
 /// Spin cap for best-effort `SERIAL_LOCK` acquisition (~seconds on real HW).
@@ -401,7 +405,13 @@ pub fn serial_write_bytes_lockfree(s: &[u8]) {
     if got {
         SERIAL_LOCK.store(false, Ordering::Release);
     }
-    // COM1 only (log stream). See `serial_write_byte`.
+    // Log stream → COM1, mirrored to the framebuffer during boot. See
+    // `serial_write_byte`.
+    if boot_log_to_fb() {
+        for &b in s {
+            fb::put_byte(b);
+        }
+    }
 }
 
 /// Write one byte to the **interactive console** — COM1 *and* the framebuffer
@@ -410,14 +420,22 @@ pub fn serial_write_bytes_lockfree(s: &[u8]) {
 /// `docs/console-service.md` (Stage 1).
 pub fn console_write_byte(b: u8) {
     serial_write_byte(b);
-    fb::put_byte(b);
+    // During boot, `serial_write_byte` already mirrored to the framebuffer; adding
+    // it again here would double-render every console glyph. After boot-complete,
+    // the log mirror is off, so the console path is what puts console output on the
+    // TV.
+    if !boot_log_to_fb() {
+        fb::put_byte(b);
+    }
 }
 
 /// Write bytes to the interactive console — COM1 (serialised) and the framebuffer.
 pub fn console_write_bytes(s: &[u8]) {
     serial_write_bytes_lockfree(s);
-    for &b in s {
-        fb::put_byte(b);
+    if !boot_log_to_fb() {
+        for &b in s {
+            fb::put_byte(b);
+        }
     }
 }
 
@@ -476,6 +494,58 @@ static COM1_RX_TAIL: core::sync::atomic::AtomicUsize =
 /// Task slot waiting for a console byte (u32::MAX = nobody blocked).
 pub static CONSOLE_READ_WAITER: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Whether `console_push_byte` echoes keystrokes to the console (serial + TV).
+/// Normally true. A foreground full-screen app (e.g. live `observe`) sets it
+/// false while it owns the screen, so raw keystrokes (its `q`-to-quit poll) do
+/// not smear its frame; the app paints the display itself. Restored on exit.
+pub static CONSOLE_ECHO_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+/// Set keystroke echo on/off. Called from the `ConsoleEcho` syscall by a service
+/// holding the CONSOLE_READ cap (the shell, or a foreground app).
+pub fn set_console_echo(on: bool) {
+    CONSOLE_ECHO_ENABLED.store(on, core::sync::atomic::Ordering::Release);
+}
+
+/// Whether boot-time **log** output is also mirrored to the framebuffer (TV).
+/// True during boot so the user sees the init sequence on the display; the shell
+/// flips it false on the first keystroke and clears the screen, leaving a clean
+/// interactive console (after that, only console output reaches the TV — Stage 1).
+pub static BOOT_LOG_TO_FB: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+#[inline]
+fn boot_log_to_fb() -> bool {
+    BOOT_LOG_TO_FB.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// End boot-log mirroring to the framebuffer and clear the screen. Called from
+/// the `ConsoleBootComplete` syscall once boot output has settled — the boot
+/// jargon has served its purpose; hand over a clean console.
+pub fn console_boot_complete() {
+    BOOT_LOG_TO_FB.store(false, core::sync::atomic::Ordering::Release);
+    fb::clear_and_home();
+}
+
+/// Set true by the USB keyboard driver (xHCI) once it has finished its setup —
+/// in every terminal path: keyboard enumerated, no keyboard found, or no
+/// controller/DMA. This is the deterministic end-of-boot signal: the input driver
+/// is the last thing to come up, so when it reports in, the boot sequence is done.
+/// The shell waits on this to auto-clear the boot screen — no timer, no heuristic.
+pub static INPUT_READY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Mark input-subsystem setup complete (from the `SignalInputReady` syscall, called
+/// by the xHCI driver). The end-of-boot signal the shell watches.
+pub fn set_input_ready() {
+    INPUT_READY.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Whether the input driver has reported in (exposed via `InspectKernel` query 10).
+pub fn input_ready() -> bool {
+    INPUT_READY.load(core::sync::atomic::Ordering::Acquire)
+}
 
 /// Enable COM1 RX interrupts (call once after com2_init, from kernel main).
 ///
@@ -562,11 +632,18 @@ pub fn console_push_byte(b: u8) {
     // backspace erases the last glyph.
     // Echo via the CONSOLE path (serial + framebuffer) — keystrokes are part of
     // the interactive session, not the log stream, so they belong on the TV.
-    match b {
-        b'\n' | b'\r' => { console_write_byte(b'\r'); console_write_byte(b'\n'); }
-        0x08 | 0x7f   => { console_write_byte(0x08); console_write_byte(b' '); console_write_byte(0x08); }
-        0x20..=0x7e   => console_write_byte(b),
-        _             => {}
+    // Suppressed while a foreground full-screen app owns the screen (it paints the
+    // display itself; its raw key polls must not smear its frame).
+    if CONSOLE_ECHO_ENABLED.load(Ordering::Acquire) {
+        match b {
+            b'\n' | b'\r' => { console_write_byte(b'\r'); console_write_byte(b'\n'); }
+            // Backspace is NOT echoed here: a destructive erase (BS, space, BS)
+            // would chew past the prompt when the line is empty. Line editing is
+            // the reader's policy — the shell echoes the erase only when it has a
+            // character to delete (it knows the line length; the kernel does not).
+            0x20..=0x7e   => console_write_byte(b),
+            _             => {}
+        }
     }
     // SAFETY: single-producer ring push in practice (see note above).
     unsafe { uart_rx_push(b) };

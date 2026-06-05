@@ -141,6 +141,51 @@ new `ctx.console_*` = console → serial + framebuffer).
 
 ---
 
+## 5a. Stage 2 direction — REVISED (2026-06-05)
+
+Stage 1 changed the premise. The console service's original headline job — keeping
+the input line from being smeared by async **log** output — is **already solved**:
+Stage 1 stopped mirroring logs to the framebuffer, so the TV only ever shows
+console output. The *only* remaining job a console service was for is **foreground
+input arbitration** for a full-screen live view (live `observe` reading `q`).
+
+A confirmed kernel constraint then settled the design: there is **one console ring
+and one `CONSOLE_READ_WAITER`** (`arch/x86_64/mod.rs`) — exactly one task reads the
+keyboard at a time, and there is no `select()`. A separate always-on console
+service that *owns* the keyboard would block in `ConsoleRead` and could not also
+field out-of-band "take/release the screen" messages without either busy-polling
+(throwing away the idle-halt work) or reworking the hardware-verified USB keystroke
+path into IPC messages. The kernel's single-waiter slot **is** the foreground-input
+ownership primitive already.
+
+**Decision:** build the live-view seam now, **shell-brokered**, not as a separate
+service. The reusable foundation is the *utility-facing* contract — "become the
+console reader, paint via `console_write` + ANSI, poll `q`, release on exit" — which
+is **identical** whether the shell or a future console service brokers it. The shell
+is already the Appendix B.3 capability-broker and fits the kernel's waiter model.
+A dedicated console service is deferred until a real multi-consumer need pulls it
+into existence (a real `logger` consuming the log stream, multiple terminals,
+multiple foreground apps) — at which point it takes over *brokering* with **zero
+changes to the utilities** (§26.2: features pulled into existence; nothing built
+speculatively, nothing wasted).
+
+This supersedes decision **(4)** below ("console service owns input"): input stays
+shell-brokered for now. Decisions (1) Stage 1 first, (2) kernel render path, (3)
+ANSI subset, and (5) routing by API stand.
+
+**Stage 2 as built:**
+- **2a (mechanism):** minimal ANSI subset in the fbcon — clear, cursor position,
+  erase line, hide/show cursor — plus `InspectKernel` query 9 for screen geometry.
+- **2c (live `observe`):** a non-blocking `TryConsoleRead` (24) and a `ConsoleEcho`
+  (25) echo toggle, both gated by `CONSOLE_READ`; `observe` gains a `MODE_LIVE_FG`
+  that hides the cursor, suppresses echo, repaints in place (home + `ESC[K` per
+  line, no full-clear flicker) every ~0.5 s, and polls `q`; the **shell** spawns
+  `observe-live`, stops reading the keyboard while it runs, and resumes when it
+  parks (the foreground handoff). The first client of the seam validates it.
+- (There is no "2b separate console service" — folded away by the decision above.)
+
+---
+
 ## 5b. Original options (for reference)
 
 1. **Scope for this branch.** Stage 1 only (separate streams → clean TV, small,

@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::ServiceContext;
+use godspeed_sdk::{ServiceContext, CapInfo};
 
 const MAX_LINE: usize = 128;
 const MAX_ARGS: usize = 4;
@@ -13,15 +13,22 @@ const MAX_ARGS: usize = 4;
 // doubled characters.)
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
-    // Let the one-time boot logging flush first (logger/registry/supervisor
-    // "ready", init "all spawns done") so the screen rests with `gs>` as the
-    // last line. Each peer service logs once then yields; a generous yield count
-    // guarantees they all get scheduler turns before we print the prompt. Nothing
-    // logs after this in the bare-metal image, so `gs>` stays at the bottom.
+    // The boot sequence (kernel + every service's logs, the xHCI enumeration) is
+    // shown on the TV during startup — the user wants to see it come up. We log our
+    // "ready" line into that stream, then wait for the input driver to report in
+    // (the deterministic end-of-boot signal) before automatically clearing the TV
+    // and presenting a clean prompt — no keypress, no timer.
     for _ in 0..256 {
         ctx.yield_cpu();
     }
     ctx.console_writeln("shell: ready (type 'help')");
+
+    wait_for_input_ready(&ctx);
+
+    // Boot is done: dismiss the boot screen on the TV (clear + stop mirroring logs
+    // to it) and present a clean prompt. Serial keeps the full stream. This is also
+    // the first `gs> ` the serial-driven shell-test waits on.
+    ctx.console_boot_complete();
     ctx.console_write("gs> ");
 
     let mut line_buf = [0u8; MAX_LINE];
@@ -39,8 +46,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 ctx.console_write("gs> ");
             }
             0x7f | 0x08 => {
-                // backspace — remove last byte
-                if line_len > 0 { line_len -= 1; }
+                // backspace — remove last byte and erase it on the display, but
+                // only if there is one. The kernel does not echo backspace (it
+                // can't tell the line is empty), so a no-op here leaves the prompt
+                // untouched. "\x08 \x08" = move back, overwrite with space, move back.
+                if line_len > 0 {
+                    line_len -= 1;
+                    ctx.console_write("\x08 \x08");
+                }
             }
             0x03 => {
                 // Ctrl-C — clear line
@@ -56,6 +69,24 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
             _ => {}
         }
+    }
+}
+
+/// Wait until the input subsystem reports in — the deterministic end-of-boot
+/// signal. The xHCI driver sets `input_ready` once it finishes, in every terminal
+/// path (keyboard up, no keyboard, or no controller), and it is the last
+/// subsystem to come up. So when it reports, the boot sequence — including the
+/// asynchronous xHCI enumeration on another core — is genuinely done, and we can
+/// clear the boot screen without ever cutting it off mid-stream. The loop is just
+/// polling that flag; `MAX_SPINS` is a pure safety net for the impossible case
+/// where the driver never reports (it would mean xHCI hard-crashed at boot).
+fn wait_for_input_ready(ctx: &ServiceContext) {
+    const MAX_SPINS: u32 = 50_000_000;
+    for _ in 0..MAX_SPINS {
+        if ctx.input_ready() {
+            return;
+        }
+        ctx.yield_cpu();
     }
 }
 
@@ -93,8 +124,12 @@ fn execute(ctx: &ServiceContext, line: &[u8]) {
             if argc >= 2 && args[1] == "now" {
                 cmd_observe_now(ctx);
             } else {
-                ctx.console_writeln("observe: live view coming soon — try 'observe now'");
+                cmd_observe_live(ctx);
             }
+        }
+        "caps"    => {
+            if argc < 2 { ctx.console_writeln("usage: caps <service>"); }
+            else { cmd_caps(ctx, args[1]); }
         }
         "spawn"   => {
             if argc < 2 { ctx.console_writeln("usage: spawn <name>"); }
@@ -128,7 +163,9 @@ fn cmd_help(ctx: &ServiceContext) {
     ctx.console_writeln("  help                   show this message");
     ctx.console_writeln("  cores                  show core count");
     ctx.console_writeln("  status                 list all live tasks");
-    ctx.console_writeln("  observe now            show a static system-metrics frame");
+    ctx.console_writeln("  observe                live system view (press q to quit)");
+    ctx.console_writeln("  observe now            one-shot system-metrics frame");
+    ctx.console_writeln("  caps <service>         list a service's capabilities");
     ctx.console_writeln("  spawn <name>           spawn a service");
     ctx.console_writeln("  kill <name>            kill a service");
     ctx.console_writeln("  restart <name> [core]  restart a service");
@@ -176,6 +213,77 @@ fn cmd_status(ctx: &ServiceContext) {
     if !found { ctx.console_writeln("  (no live tasks)"); }
 }
 
+/// `caps <service>` — list the capabilities a service holds. A thin broker over
+/// the kernel's `task_caps` introspection (held via the INTROSPECT cap). Makes
+/// authority visible on the box itself (§26.9): for each cap, the resource it
+/// targets and the rights it carries.
+fn cmd_caps(ctx: &ServiceContext, name: &str) {
+    let slot = match slot_of(ctx, name) {
+        Some(s) => s,
+        None => {
+            ctx.console_writeln("caps: no such live service");
+            return;
+        }
+    };
+    let mut caps = [CapInfo::default(); 64];
+    let n = ctx.task_caps(slot, &mut caps);
+
+    let mut hdr = [0u8; 48];
+    let mut hp = 0usize;
+    write_bytes(&mut hdr, &mut hp, b"caps for ");
+    write_bytes(&mut hdr, &mut hp, name.as_bytes());
+    write_bytes(&mut hdr, &mut hp, b":");
+    ctx.console_writeln(core::str::from_utf8(&hdr[..hp]).unwrap_or("caps:"));
+
+    if n == 0 {
+        ctx.console_writeln("  (none)");
+        return;
+    }
+    // Legend: left column is the resource the cap targets, right column the rights
+    // it grants (§7.4). log_write/spawn/console_read/console_push/introspect are
+    // kernel resources; endpoint#N is an IPC endpoint.
+    ctx.console_writeln("  RESOURCE (target)  RIGHTS (read/write/send/recv/grant/revoke)");
+    for cap in caps.iter().take(n) {
+        let mut buf = [b' '; 64];
+        let mut pos = 0usize;
+        write_bytes(&mut buf, &mut pos, b"  ");
+        // Resource name (stable kernel resources by id; others by number).
+        match cap.resource_id {
+            1 => write_bytes(&mut buf, &mut pos, b"log_write"),
+            2 => write_bytes(&mut buf, &mut pos, b"spawn"),
+            3 => write_bytes(&mut buf, &mut pos, b"console_read"),
+            4 => write_bytes(&mut buf, &mut pos, b"console_push"),
+            5 => write_bytes(&mut buf, &mut pos, b"introspect"),
+            id => {
+                write_bytes(&mut buf, &mut pos, b"endpoint#");
+                write_u32(&mut buf, &mut pos, id as u32);
+            }
+        }
+        while pos < 18 { buf[pos] = b' '; pos += 1; }
+        // Rights spelled out (§7.4) so no decoding is needed.
+        let r = cap.rights;
+        if r & 0x01 != 0 { write_bytes(&mut buf, &mut pos, b"read "); }
+        if r & 0x02 != 0 { write_bytes(&mut buf, &mut pos, b"write "); }
+        if r & 0x04 != 0 { write_bytes(&mut buf, &mut pos, b"send "); }
+        if r & 0x08 != 0 { write_bytes(&mut buf, &mut pos, b"recv "); }
+        if r & 0x10 != 0 { write_bytes(&mut buf, &mut pos, b"grant "); }
+        if r & 0x20 != 0 { write_bytes(&mut buf, &mut pos, b"revoke "); }
+        ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("?"));
+    }
+}
+
+/// Scheduler slot of a live service by name, scanned once (no wait). `None` if
+/// not found.
+fn slot_of(ctx: &ServiceContext, name: &str) -> Option<u32> {
+    for slot in 0..256u32 {
+        let st = ctx.task_stat(slot);
+        if st.valid && st.state != 4 /* Dead */ && st.name_str() == name {
+            return Some(slot);
+        }
+    }
+    None
+}
+
 /// `observe now` — broker a one-shot static metrics frame.
 ///
 /// `observe` is a least-authority service: it holds only INTROSPECT + log caps,
@@ -193,7 +301,7 @@ fn cmd_observe_now(ctx: &ServiceContext) {
     // observe-now finishes and parks (BlockRecv) so the prompt lands below it.
     // Bounded against a child that never parks. (The console service will make
     // output ordering automatic; this is the interim fix.)
-    if let Some(slot) = observe_now_slot(ctx) {
+    if let Some(slot) = find_running_slot(ctx, "observe-now") {
         for _ in 0..1_000_000u32 {
             ctx.yield_cpu();
             let st = ctx.task_stat(slot);
@@ -205,14 +313,48 @@ fn cmd_observe_now(ctx: &ServiceContext) {
     }
 }
 
-/// Slot of the just-spawned (live, not the killed dead) `observe-now`, waiting
-/// briefly for it to appear. `None` if it never shows up.
-fn observe_now_slot(ctx: &ServiceContext) -> Option<u32> {
+/// `observe` (live) — broker the full-screen foreground view (Stage 2c).
+///
+/// The shell is the capability-broker (Appendix B.3): it lends the keyboard to
+/// the foreground child by *not reading it* while the child runs, then takes it
+/// back. We spawn `observe-live` (which owns the screen: hides the cursor,
+/// suppresses echo, repaints, polls `q`), then wait — without touching
+/// `console_read` — until it parks (q pressed → it restored the console and
+/// parked) or dies. Then we clean up and our read loop resumes.
+fn cmd_observe_live(ctx: &ServiceContext) {
+    let _ = ctx.kill("observe-live"); // clear any stale instance
+    if ctx.spawn("observe-live").is_err() {
+        ctx.console_writeln("observe: failed to spawn observe-live");
+        return;
+    }
+    if let Some(slot) = find_running_slot(ctx, "observe-live") {
+        // Wait for the foreground child to finish. The bound is the child's
+        // lifetime — it parks on `q` (state 2) or dies (invalid); the large count
+        // is a paranoid safety net so a hung child can never wedge the shell
+        // forever. We must NOT call console_read here: the child owns the keyboard.
+        for _ in 0..u32::MAX {
+            ctx.yield_cpu();
+            let st = ctx.task_stat(slot);
+            if !st.valid || st.state == 2 {
+                break;
+            }
+        }
+    }
+    let _ = ctx.kill("observe-live"); // reap the parked instance
+    // Defensive: restore the console even if the child died mid-view without
+    // restoring it (echo back on, cursor visible) so the shell stays usable.
+    ctx.console_echo(true);
+    ctx.console_write("\x1b[?25h");
+}
+
+/// Slot of a just-spawned, still-live service by name (not a killed/dead one),
+/// waiting briefly for it to appear. `None` if it never shows up.
+fn find_running_slot(ctx: &ServiceContext, name: &str) -> Option<u32> {
     for _ in 0..2000u32 {
         ctx.yield_cpu();
         for slot in 0..256u32 {
             let st = ctx.task_stat(slot);
-            if st.valid && st.state != 4 /* Dead */ && st.name_str() == "observe-now" {
+            if st.valid && st.state != 4 /* Dead */ && st.name_str() == name {
                 return Some(slot);
             }
         }
@@ -220,22 +362,56 @@ fn observe_now_slot(ctx: &ServiceContext) -> Option<u32> {
     None
 }
 
+/// The trusted root (§6.1). The kernel refuses to kill these and refuses to spawn
+/// a second instance; the shell explains why before the syscall is even tried.
+const CORE_SERVICES: [&str; 3] = ["init", "supervisor", "registry"];
+
+/// Shown when spawn/kill/restart targets a core service — "Not applicable" makes
+/// it clear the command is refused *because* the target is protected, not failed.
+const PROTECTED_MSG: &str =
+    "Not applicable. Core services (init, supervisor, registry) are protected";
+
+/// Shown when spawn/kill/restart targets an observe variant — they are brokered by
+/// the `observe` / `observe now` commands, not raw service operations.
+const OBSERVE_HINT: &str =
+    "observe runs from a command: type 'observe' (live) or 'observe now' (snapshot)";
+
+fn is_core_service(name: &str) -> bool {
+    CORE_SERVICES.contains(&name)
+}
+
+/// `observe`'s variants are brokered by the `observe` / `observe now` commands —
+/// not meant to be raw-spawned (the bare `observe` service is a serial-streaming
+/// dev build that scrolls forever and ignores `q`).
+fn is_observe_variant(name: &str) -> bool {
+    matches!(name, "observe" | "observe-now" | "observe-live")
+}
+
+/// Print `prefix` followed by `name` as one console line.
+fn report(ctx: &ServiceContext, prefix: &str, name: &str) {
+    let mut buf = [0u8; 96];
+    let mut pos = 0usize;
+    write_bytes(&mut buf, &mut pos, prefix.as_bytes());
+    write_bytes(&mut buf, &mut pos, name.as_bytes());
+    ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or(prefix));
+}
+
 fn cmd_spawn(ctx: &ServiceContext, name: &str) {
+    if is_observe_variant(name) {
+        ctx.console_writeln(OBSERVE_HINT);
+        return;
+    }
+    if is_core_service(name) {
+        ctx.console_writeln(PROTECTED_MSG);
+        return;
+    }
+    if slot_of(ctx, name).is_some() {
+        report(ctx, "already running: ", name);
+        return;
+    }
     match ctx.spawn(name) {
-        Ok(()) => {
-            let mut buf = [0u8; 64];
-            let mut pos = 0usize;
-            write_bytes(&mut buf, &mut pos, b"spawned: ");
-            write_bytes(&mut buf, &mut pos, name.as_bytes());
-            ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("spawned"));
-        }
-        Err(_) => {
-            let mut buf = [0u8; 64];
-            let mut pos = 0usize;
-            write_bytes(&mut buf, &mut pos, b"spawn failed: ");
-            write_bytes(&mut buf, &mut pos, name.as_bytes());
-            ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("spawn failed"));
-        }
+        Ok(())  => report(ctx, "spawned: ", name),
+        Err(_)  => report(ctx, "spawn failed (unknown service?): ", name),
     }
 }
 
@@ -266,40 +442,36 @@ fn cmd_pipe(ctx: &ServiceContext, producer: &str, sink: &str) {
 }
 
 fn cmd_kill(ctx: &ServiceContext, name: &str) {
+    if is_core_service(name) {
+        ctx.console_writeln(PROTECTED_MSG);
+        return;
+    }
+    if is_observe_variant(name) {
+        ctx.console_writeln(OBSERVE_HINT);
+        return;
+    }
+    if slot_of(ctx, name).is_none() {
+        report(ctx, "not running: ", name);
+        return;
+    }
     match ctx.kill(name) {
-        Ok(()) => {
-            let mut buf = [0u8; 64];
-            let mut pos = 0usize;
-            write_bytes(&mut buf, &mut pos, b"killed: ");
-            write_bytes(&mut buf, &mut pos, name.as_bytes());
-            ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("killed"));
-        }
-        Err(_) => {
-            let mut buf = [0u8; 64];
-            let mut pos = 0usize;
-            write_bytes(&mut buf, &mut pos, b"kill failed: ");
-            write_bytes(&mut buf, &mut pos, name.as_bytes());
-            ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("kill failed"));
-        }
+        Ok(())  => report(ctx, "killed: ", name),
+        Err(_)  => report(ctx, "kill failed: ", name),
     }
 }
 
 fn cmd_restart(ctx: &ServiceContext, name: &str, core: Option<u32>) {
+    if is_core_service(name) {
+        ctx.console_writeln(PROTECTED_MSG);
+        return;
+    }
+    if is_observe_variant(name) {
+        ctx.console_writeln(OBSERVE_HINT);
+        return;
+    }
     match ctx.restart(name, core) {
-        Ok(()) => {
-            let mut buf = [0u8; 64];
-            let mut pos = 0usize;
-            write_bytes(&mut buf, &mut pos, b"restarted: ");
-            write_bytes(&mut buf, &mut pos, name.as_bytes());
-            ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("restarted"));
-        }
-        Err(_) => {
-            let mut buf = [0u8; 64];
-            let mut pos = 0usize;
-            write_bytes(&mut buf, &mut pos, b"restart failed: ");
-            write_bytes(&mut buf, &mut pos, name.as_bytes());
-            ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("restart failed"));
-        }
+        Ok(()) => report(ctx, "restarted: ", name),
+        Err(_) => report(ctx, "restart failed: ", name),
     }
 }
 

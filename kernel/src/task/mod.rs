@@ -151,6 +151,9 @@ pub enum SpawnError {
     MapFailed,
     CapTableFull,
     NotFound,
+    /// A live task with this name already exists. Refused to avoid duplicate
+    /// instances — in particular a second trusted-root service (§6.2).
+    AlreadyRunning,
 }
 
 impl From<crate::loader::LoadError> for SpawnError {
@@ -2501,6 +2504,22 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
+        // `observe` (live) — full-screen foreground view (probe_mode 2 = MODE_LIVE).
+        // Same ELF as `observe`; the shell spawns it, pauses its own read loop, and
+        // resumes when it parks (the shell-brokered foreground handoff). Holds
+        // CONSOLE_READ so it can poll for `q` (non-blocking) and toggle echo while
+        // it owns the screen.
+        "observe-live" => Some(("observe-live", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_OBSERVE_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    0,
+            probe_mode:        2, // MODE_LIVE
+            memory_limit:      8 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  true,
+        })),
         "shell" => Some(("shell", ServiceConfig {
             elf:               include_bytes!(env!("SVC_SHELL_ELF")),
             has_recv_endpoint: false,
@@ -2575,6 +2594,18 @@ pub fn spawn_service_pipe(producer: &str, sink: &str, core_override: Option<u32>
 
 pub fn spawn_service_by_name(name: &str, core_override: Option<u32>) -> Result<(), SpawnError> {
     let (static_name, cfg) = service_config(name).ok_or(SpawnError::NotFound)?;
+
+    // Singleton guard (§6.2, §26.6 bounded behaviour): refuse to spawn a service
+    // whose name is already live. This blocks duplicate instances in general, and
+    // in particular a second trusted-root service — init/supervisor/registry are
+    // always live while the system runs, so this always rejects spawning/restarting
+    // them, the same protection `handle_kill` gives. It does NOT block boot: there
+    // each service is spawned exactly once, before any instance is live. Loud
+    // rejection, never silent (§3.12).
+    if scheduler::find_task_by_name(static_name).is_some() {
+        crate::kprintln!("task: spawn '{}' rejected: already running", static_name);
+        return Err(SpawnError::AlreadyRunning);
+    }
 
     let core_id = resolve_spawn_core(core_override, cfg.preferred_core);
 

@@ -71,6 +71,10 @@ fn spin<F: Fn() -> bool>(cond: F) {
 }
 
 fn idle(ctx: &ServiceContext) -> ! {
+    // Degraded terminal path (no controller / no DMA / no keyboard). Still report
+    // input-ready so the shell's boot-screen auto-clear fires — boot is "done" as
+    // far as the input subsystem is concerned, even if there's no usable keyboard.
+    ctx.signal_input_ready();
     loop {
         ctx.yield_cpu();
     }
@@ -693,7 +697,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     dma.write32(link + 8, 0);
     dma.write32(link + 12, (TRB_LINK << 10) | (1 << 1) | 1); // Link | Toggle Cycle | cycle
 
-    ctx.log("xhci: keyboard ready — press Enter for a prompt");
+    ctx.log("xhci: keyboard ready");
+    ctx.signal_input_ready(); // end-of-boot signal: the shell auto-clears now
     let mut int_idx = 0usize;
     let mut int_cycle = 1u32;
     let mut need_queue = true;
