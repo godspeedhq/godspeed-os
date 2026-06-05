@@ -46,8 +46,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 ctx.console_write("gs> ");
             }
             0x7f | 0x08 => {
-                // backspace — remove last byte
-                if line_len > 0 { line_len -= 1; }
+                // backspace — remove last byte and erase it on the display, but
+                // only if there is one. The kernel does not echo backspace (it
+                // can't tell the line is empty), so a no-op here leaves the prompt
+                // untouched. "\x08 \x08" = move back, overwrite with space, move back.
+                if line_len > 0 {
+                    line_len -= 1;
+                    ctx.console_write("\x08 \x08");
+                }
             }
             0x03 => {
                 // Ctrl-C — clear line

@@ -637,7 +637,10 @@ pub fn console_push_byte(b: u8) {
     if CONSOLE_ECHO_ENABLED.load(Ordering::Acquire) {
         match b {
             b'\n' | b'\r' => { console_write_byte(b'\r'); console_write_byte(b'\n'); }
-            0x08 | 0x7f   => { console_write_byte(0x08); console_write_byte(b' '); console_write_byte(0x08); }
+            // Backspace is NOT echoed here: a destructive erase (BS, space, BS)
+            // would chew past the prompt when the line is empty. Line editing is
+            // the reader's policy — the shell echoes the erase only when it has a
+            // character to delete (it knows the line length; the kernel does not).
             0x20..=0x7e   => console_write_byte(b),
             _             => {}
         }
