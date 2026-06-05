@@ -307,12 +307,47 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
         Some(n) => n,
         None => { ctx.log("ehci: Get_Hub_Descriptor failed"); return; }
     };
-    if n >= 4 {
-        let nports  = dma.read8(DATA_BUF + 2);
-        let hubchar = dma.read16(DATA_BUF + 3);
+    if n < 4 { ctx.log("ehci: short hub descriptor"); return; }
+    let nports  = dma.read8(DATA_BUF + 2);
+    let hubchar = dma.read16(DATA_BUF + 3);
+    ctx.log_fmt(format_args!(
+        "ehci: HUB DESCRIPTOR ports={} characteristics={:#06x}", nports, hubchar));
+
+    // E3c-2 — power every downstream port (the hub does individual power
+    // switching), let power settle, then read each port's status to find the
+    // keyboard. A connected, low-speed port is our keyboard.
+    for port in 1..=nports {
+        // Set_Feature(PORT_POWER=8) on the hub, wIndex = port.
+        let setup = [0x23, 0x03, 0x08, 0x00, port, 0x00, 0x00, 0x00];
+        let _ = control(ctx, mmio, &dma, op, 1, mps0, &setup, 0, false);
+    }
+    delay_cycles(ctx, RESET_HOLD_CYCLES); // power-on-to-power-good settle (generous)
+
+    let mut kbd_port = 0u8;
+    let mut kbd_low  = false;
+    for port in 1..=nports {
+        // Get_Status of the hub port, wIndex = port → 4 bytes (wPortStatus|wPortChange).
+        let setup = [0xA3, 0x00, 0x00, 0x00, port, 0x00, 0x04, 0x00];
+        if control(ctx, mmio, &dma, op, 1, mps0, &setup, 4, true).is_none() { continue; }
+        let status = dma.read16(DATA_BUF + 0);
+        let connected = status & (1 << 0) != 0;
+        let low       = status & (1 << 9) != 0;
+        let high      = status & (1 << 10) != 0;
         ctx.log_fmt(format_args!(
-            "ehci: HUB DESCRIPTOR ports={} characteristics={:#06x} -> E3c-2 powers them + finds the keyboard",
-            nports, hubchar));
+            "ehci: hub port {}: status={:#06x} connected={} low_speed={} high_speed={}",
+            port, status, connected as u8, low as u8, high as u8));
+        if connected && kbd_port == 0 {
+            kbd_port = port;
+            kbd_low = low;
+        }
+    }
+
+    if kbd_port != 0 {
+        ctx.log_fmt(format_args!(
+            "ehci: device on hub port {} (low_speed={}) -> E4 resets it + addresses via split transactions",
+            kbd_port, kbd_low as u8));
+    } else {
+        ctx.log("ehci: no device found on the hub's downstream ports");
     }
 }
 
