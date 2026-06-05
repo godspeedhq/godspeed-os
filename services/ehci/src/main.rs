@@ -61,8 +61,80 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         "ehci: HCCPARAMS={:#010x} addr64={} eecp={:#x} (op regs at base+{:#x})",
         hccparams, addr64, eecp, caplength
     ));
+    let _ = (ppc, n_cc, n_pcc, addr64, eecp);
 
-    // E2 will reset + run the controller from here. For now, the controller is
-    // only observed; park so the core can idle.
+    // ---------------------------------------------------------------------------
+    // E2a — reset the controller and run it, then read the port status. No BIOS
+    // handoff yet (E2b adds it if the firmware fights us); every wait is bounded so
+    // a firmware tug-of-war times out and reports rather than hanging.
+    // ---------------------------------------------------------------------------
+    let op = caplength as usize; // operational registers begin at base + CAPLENGTH
+
+    // Stop the controller if the BIOS left it running, then wait for it to halt.
+    let cmd = mmio.read32(op + OP_USBCMD);
+    mmio.write32(op + OP_USBCMD, cmd & !CMD_RS);
+    if !wait(&mmio, op + OP_USBSTS, STS_HCHALTED, true) {
+        ctx.log("ehci: WARN — controller did not halt (BIOS may still own it; E2b handoff needed)");
+    }
+
+    // Reset: set HCRESET and wait for the controller to clear it.
+    mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) | CMD_HCRESET);
+    if !wait(&mmio, op + OP_USBCMD, CMD_HCRESET, false) {
+        ctx.log("ehci: WARN — HCRESET did not complete (E2b handoff needed); idling");
+        ctx.park();
+    }
+    ctx.log("ehci: controller reset");
+
+    // Route all ports to the EHCI (not to companion controllers) and run.
+    mmio.write32(op + OP_CONFIGFLAG, 1);
+    mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) | CMD_RS);
+    if wait(&mmio, op + OP_USBSTS, STS_HCHALTED, false) {
+        ctx.log("ehci: controller running");
+    } else {
+        ctx.log("ehci: WARN — controller did not leave halted state after run");
+    }
+
+    // Port census: with the controller running and CONFIGFLAG set, a device on a
+    // back socket should now read connected=1. PORTSC is one 32-bit reg per port.
+    for p in 0..n_ports as usize {
+        let psc = mmio.read32(op + OP_PORTSC0 + p * 4);
+        ctx.log_fmt(format_args!(
+            "ehci: port {}/{}: PORTSC={:#010x} connected={} enabled={} owner={} (1=companion)",
+            p + 1, n_ports, psc,
+            (psc & PORTSC_CCS != 0) as u8,
+            (psc & PORTSC_PED != 0) as u8,
+            (psc & PORTSC_OWNER != 0) as u8,
+        ));
+    }
+
+    // E3 enumerates whatever is connected. For now, observe and park.
     ctx.park();
+}
+
+// --- EHCI operational registers (offsets from base + CAPLENGTH) + bit fields ---
+const OP_USBCMD:     usize = 0x00;
+const OP_USBSTS:     usize = 0x04;
+const OP_CONFIGFLAG: usize = 0x40;
+const OP_PORTSC0:    usize = 0x44; // PORTSC[0]; +4 bytes per additional port
+
+const CMD_RS:        u32 = 1 << 0;  // Run/Stop
+const CMD_HCRESET:   u32 = 1 << 1;  // Host Controller Reset
+const STS_HCHALTED:  u32 = 1 << 12; // HCHalted
+const PORTSC_CCS:    u32 = 1 << 0;  // Current Connect Status
+const PORTSC_PED:    u32 = 1 << 2;  // Port Enabled/Disabled
+const PORTSC_OWNER:  u32 = 1 << 13; // Port Owner (1 = handed to a companion)
+
+/// Poll a 32-bit register until `mask` is set (`want_set=true`) or clear
+/// (`false`), bounded. Returns true if the condition was met, false on timeout.
+fn wait(mmio: &godspeed_sdk::Mmio, off: usize, mask: u32, want_set: bool) -> bool {
+    const MAX: u32 = 2_000_000;
+    let mut i = 0u32;
+    while i < MAX {
+        let set = mmio.read32(off) & mask != 0;
+        if set == want_set {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
