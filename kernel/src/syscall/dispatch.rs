@@ -46,6 +46,7 @@ pub enum SyscallNumber {
     ConsoleEcho    = 25,
     ConsoleBootComplete = 26,
     SignalInputReady    = 27,
+    TaskCaps            = 28,
 }
 
 /// Raw syscall dispatcher — called from the SYSCALL/SYSENTER IDT stub.
@@ -93,6 +94,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::ConsoleEcho   as u64 => handle_console_echo(arg0, arg1),
         n if n == SyscallNumber::ConsoleBootComplete as u64 => handle_console_boot_complete(arg0),
         n if n == SyscallNumber::SignalInputReady as u64 => handle_signal_input_ready(arg0),
+        n if n == SyscallNumber::TaskCaps as u64 => handle_task_caps(arg0, arg1, arg2),
         _ => -1, // Unknown syscall.
     }
 }
@@ -938,6 +940,48 @@ fn handle_signal_input_ready(cap_slot: u64) -> i64 {
     }
     crate::arch::x86_64::set_input_ready();
     0
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: TaskCaps (28) — list the capabilities held by a task.
+// ---------------------------------------------------------------------------
+
+/// arg0 = slot, arg1 = buf_ptr (user VA), arg2 = buf_len (bytes).
+///
+/// Writes up to `buf_len / 16` entries describing the target task's held caps,
+/// returns the count. Each 16-byte entry: [0..8] resource_id u64 LE, [8] rights
+/// u8, [9..16] pad. Requires INTROSPECT (READ) — discloses a task's authority
+/// (the in-OS form of `osdev caps`, §17; makes authority visible per §26.9).
+///
+/// Best-effort snapshot (see `scheduler::for_each_cap_of`). Returns -1 on bad args.
+fn handle_task_caps(slot: u64, buf_ptr: u64, buf_len: u64) -> i64 {
+    const ENTRY: usize = 16;
+    const MAX_ENTRIES: usize = 64; // CapTable holds at most 64 slots
+
+    if !scheduler::current_task_holds_resource(
+        crate::capability::INTROSPECT_RESOURCE, Rights::READ)
+    {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+    let cap = (buf_len as usize / ENTRY).min(MAX_ENTRIES);
+    if cap == 0 { return 0; }
+
+    // Collect into a kernel buffer first; do not touch user memory inside the
+    // iteration closure.
+    let mut tmp = [0u8; ENTRY * MAX_ENTRIES];
+    let mut n = 0usize;
+    scheduler::for_each_cap_of(slot as usize, |c| {
+        if n < cap {
+            let o = n * ENTRY;
+            tmp[o..o + 8].copy_from_slice(&c.resource_id.0.to_le_bytes());
+            tmp[o + 8] = c.rights.0;
+            n += 1;
+        }
+    });
+
+    let bytes = n * ENTRY;
+    if !validate_user_ptr(buf_ptr, bytes) { return -1; }
+    if write_user_bytes(buf_ptr, &tmp[..bytes]) { n as i64 } else { -1 }
 }
 
 // ---------------------------------------------------------------------------

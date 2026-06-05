@@ -116,6 +116,17 @@ impl TaskStat {
     }
 }
 
+/// One held capability, as reported by [`ServiceContext::task_caps`].
+#[derive(Clone, Copy, Default)]
+pub struct CapInfo {
+    /// Resource the cap targets. Stable kernel resources: 1=log_write, 2=spawn,
+    /// 3=console_read, 4=console_push, 5=introspect; larger ids are IPC endpoints
+    /// or other per-resource grants.
+    pub resource_id: u64,
+    /// Rights bitfield: READ=1, WRITE=2, SEND=4, RECV=8, GRANT=16, REVOKE=32.
+    pub rights: u8,
+}
+
 // ---------------------------------------------------------------------------
 // AllocError — returned by ServiceContext::alloc_mem.
 // ---------------------------------------------------------------------------
@@ -474,6 +485,32 @@ impl ServiceContext {
                                               buf[68], buf[69], buf[70], buf[71]]);
         TaskStat { valid, state, core, mem_used, mem_limit, name_len: copy_len, name,
                    generation, queue_depth, run_ticks }
+    }
+
+    /// List the capabilities held by the task in `slot`, into `out`. Returns the
+    /// number of entries written (capped at `out.len()` and 64). Requires the
+    /// INTROSPECT cap. Best-effort snapshot — see [`task_stat`](Self::task_stat).
+    pub fn task_caps(&self, slot: u32, out: &mut [CapInfo]) -> usize {
+        const ENTRY: usize = 16;
+        const MAX: usize = 64;
+        let want = out.len().min(MAX);
+        if want == 0 { return 0; }
+        let mut buf = [0u8; ENTRY * MAX];
+        // SAFETY: syscall(28) = TaskCaps; buf is a local array on the user stack.
+        let ret = unsafe {
+            raw_syscall(28, slot as u64, buf.as_mut_ptr() as u64, (want * ENTRY) as u64)
+        };
+        if ret <= 0 { return 0; }
+        let count = (ret as usize).min(want);
+        for i in 0..count {
+            let o = i * ENTRY;
+            out[i].resource_id = u64::from_le_bytes([
+                buf[o], buf[o + 1], buf[o + 2], buf[o + 3],
+                buf[o + 4], buf[o + 5], buf[o + 6], buf[o + 7],
+            ]);
+            out[i].rights = buf[o + 8];
+        }
+        count
     }
 
     /// Send a message via an explicit cap handle (blocking).

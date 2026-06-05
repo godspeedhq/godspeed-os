@@ -16,7 +16,7 @@ pub use capability::{CapHandle, CapError};
 pub use dma::Dma;
 pub use ipc::{Message, IpcError};
 pub use mmio::Mmio;
-pub use service_context::{ServiceContext, TaskStat};
+pub use service_context::{ServiceContext, TaskStat, CapInfo};
 
 pub type Result<T> = core::result::Result<T, Error>;
 

@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::ServiceContext;
+use godspeed_sdk::{ServiceContext, CapInfo};
 
 const MAX_LINE: usize = 128;
 const MAX_ARGS: usize = 4;
@@ -127,6 +127,10 @@ fn execute(ctx: &ServiceContext, line: &[u8]) {
                 cmd_observe_live(ctx);
             }
         }
+        "caps"    => {
+            if argc < 2 { ctx.console_writeln("usage: caps <service>"); }
+            else { cmd_caps(ctx, args[1]); }
+        }
         "spawn"   => {
             if argc < 2 { ctx.console_writeln("usage: spawn <name>"); }
             else { cmd_spawn(ctx, args[1]); }
@@ -159,7 +163,9 @@ fn cmd_help(ctx: &ServiceContext) {
     ctx.console_writeln("  help                   show this message");
     ctx.console_writeln("  cores                  show core count");
     ctx.console_writeln("  status                 list all live tasks");
-    ctx.console_writeln("  observe now            show a static system-metrics frame");
+    ctx.console_writeln("  observe                live system view (press q to quit)");
+    ctx.console_writeln("  observe now            one-shot system-metrics frame");
+    ctx.console_writeln("  caps <service>         list a service's capabilities");
     ctx.console_writeln("  spawn <name>           spawn a service");
     ctx.console_writeln("  kill <name>            kill a service");
     ctx.console_writeln("  restart <name> [core]  restart a service");
@@ -205,6 +211,73 @@ fn cmd_status(ctx: &ServiceContext) {
         ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("?"));
     }
     if !found { ctx.console_writeln("  (no live tasks)"); }
+}
+
+/// `caps <service>` — list the capabilities a service holds. A thin broker over
+/// the kernel's `task_caps` introspection (held via the INTROSPECT cap). Makes
+/// authority visible on the box itself (§26.9): for each cap, the resource it
+/// targets and the rights it carries.
+fn cmd_caps(ctx: &ServiceContext, name: &str) {
+    let slot = match slot_of(ctx, name) {
+        Some(s) => s,
+        None => {
+            ctx.console_writeln("caps: no such live service");
+            return;
+        }
+    };
+    let mut caps = [CapInfo::default(); 64];
+    let n = ctx.task_caps(slot, &mut caps);
+
+    let mut hdr = [0u8; 48];
+    let mut hp = 0usize;
+    write_bytes(&mut hdr, &mut hp, b"caps for ");
+    write_bytes(&mut hdr, &mut hp, name.as_bytes());
+    write_bytes(&mut hdr, &mut hp, b":");
+    ctx.console_writeln(core::str::from_utf8(&hdr[..hp]).unwrap_or("caps:"));
+
+    if n == 0 {
+        ctx.console_writeln("  (none)");
+        return;
+    }
+    for cap in caps.iter().take(n) {
+        let mut buf = [b' '; 64];
+        let mut pos = 0usize;
+        write_bytes(&mut buf, &mut pos, b"  ");
+        // Resource name (stable kernel resources by id; others by number).
+        match cap.resource_id {
+            1 => write_bytes(&mut buf, &mut pos, b"log_write"),
+            2 => write_bytes(&mut buf, &mut pos, b"spawn"),
+            3 => write_bytes(&mut buf, &mut pos, b"console_read"),
+            4 => write_bytes(&mut buf, &mut pos, b"console_push"),
+            5 => write_bytes(&mut buf, &mut pos, b"introspect"),
+            id => {
+                write_bytes(&mut buf, &mut pos, b"endpoint#");
+                write_u32(&mut buf, &mut pos, id as u32);
+            }
+        }
+        while pos < 18 { buf[pos] = b' '; pos += 1; }
+        // Rights letters.
+        let r = cap.rights;
+        if r & 0x01 != 0 { write_bytes(&mut buf, &mut pos, b"rd "); }
+        if r & 0x02 != 0 { write_bytes(&mut buf, &mut pos, b"wr "); }
+        if r & 0x04 != 0 { write_bytes(&mut buf, &mut pos, b"snd "); }
+        if r & 0x08 != 0 { write_bytes(&mut buf, &mut pos, b"rcv "); }
+        if r & 0x10 != 0 { write_bytes(&mut buf, &mut pos, b"grant "); }
+        if r & 0x20 != 0 { write_bytes(&mut buf, &mut pos, b"revoke "); }
+        ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("?"));
+    }
+}
+
+/// Scheduler slot of a live service by name, scanned once (no wait). `None` if
+/// not found.
+fn slot_of(ctx: &ServiceContext, name: &str) -> Option<u32> {
+    for slot in 0..256u32 {
+        let st = ctx.task_stat(slot);
+        if st.valid && st.state != 4 /* Dead */ && st.name_str() == name {
+            return Some(slot);
+        }
+    }
+    None
 }
 
 /// `observe now` — broker a one-shot static metrics frame.

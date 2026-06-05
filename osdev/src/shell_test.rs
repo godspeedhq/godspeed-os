@@ -190,6 +190,23 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
+    // caps <service> — list a service's held capabilities (introspection path).
+    // The shell holds the INTROSPECT cap, so it can read its own caps; introspect
+    // itself must appear in the list.
+    // -----------------------------------------------------------------------
+    // The observe-now step stopped reading at the table header, so its trailing
+    // `gs>` prompt is still in the stream — absorb it before issuing caps.
+    let _ = collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5));
+    send(&mut write_half, b"caps shell\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => {
+            check!(r.contains("caps for shell"), "caps: header");
+            check!(r.contains("introspect"), "caps: lists introspect cap");
+        }
+        None => { println!("shell-test: FAIL — timed out after caps"); fail += 2; }
+    }
+
+    // -----------------------------------------------------------------------
     // Done.
     // -----------------------------------------------------------------------
     child.kill().ok();

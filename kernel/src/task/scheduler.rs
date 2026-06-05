@@ -434,16 +434,26 @@ pub fn current_task_read_cap_rights(slot: usize) -> Option<Rights> {
 /// verify generation consistency across all task cap tables. Must not be called
 /// from a spawn or kill path while TASK_SLOT_LOCKED is held by this core.
 pub fn for_each_active_cap<F: FnMut(&Capability)>(mut f: F) {
+    // Delegates to `for_each_cap_of` (which holds the single SAFETY block) so the
+    // task/ unsafe count does not grow. Best-effort snapshot: a concurrent
+    // spawn/kill may be seen inconsistently for one iteration, acceptable for
+    // invariant-assertion use only.
     for slot in 0..MAX_TASKS {
-        // Acquire pairs with the Release store in reserve_task_slot/enqueue, ensuring
-        // the cap table write is visible before we call assume_init_ref. Best-effort
-        // snapshot: a concurrent spawn/kill may be seen inconsistently for one
-        // iteration, which is acceptable for invariant-assertion use only.
-        if !TASK_VALID[slot].load(Ordering::Acquire) { continue; }
-        // SAFETY: TASK_VALID[slot] true (observed with Acquire) guarantees the
-        // CapTable was fully written before the Release store that set valid=true.
-        unsafe { TASK_CAP[slot].assume_init_ref() }.for_each_slot(&mut f);
+        for_each_cap_of(slot, &mut f);
     }
+}
+
+/// Iterate the held capabilities of the task in `slot` (any task, not just the
+/// current one). Best-effort read-only snapshot for introspection (the `caps`
+/// command via `TaskCaps`): a concurrent spawn/kill may be seen inconsistently,
+/// which is acceptable for display. Same posture as `for_each_active_cap` and
+/// `task_stat`. No-op for an empty/invalid slot.
+pub fn for_each_cap_of<F: FnMut(&Capability)>(slot: usize, mut f: F) {
+    if slot >= MAX_TASKS { return; }
+    if !TASK_VALID[slot].load(Ordering::Acquire) { return; }
+    // SAFETY: TASK_VALID[slot] observed true (Acquire) guarantees the CapTable was
+    // fully initialised before the Release store that set valid=true.
+    unsafe { TASK_CAP[slot].assume_init_ref() }.for_each_slot(&mut f);
 }
 
 /// Push a cap slot into the current task's pending-received-caps buffer.
