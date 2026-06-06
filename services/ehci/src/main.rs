@@ -532,7 +532,8 @@ fn poll_keyboard(
         wait(mmio, op + OP_USBSTS, STS_ASS, true);
     }
 
-    let mut last_key = 0u8;
+    // Previous report's six keycodes (boot report bytes 2..8), for edge detection.
+    let mut last = [0u8; 6];
     loop {
         // Poll the qTD for retirement. A large bound means we normally catch the
         // keypress within one arming; if the window elapses with no key (the qTD
@@ -545,16 +546,24 @@ fn poll_keyboard(
         if done {
             let tok = dma.read32(QTD_DATA + 0x08);
             if tok & (QTD_HALTED | QTD_ERRMASK) == 0 {
-                // A report arrived. Edge-detect on the first keycode (byte 2) so a
-                // held key doesn't repeat; modifiers are byte 0.
+                // A report arrived. The boot report holds up to six simultaneously
+                // pressed keycodes (bytes 2..8); modifiers are byte 0. Emit every
+                // key that is down now but wasn't in the previous report — this is
+                // proper N-key edge detection, so rolling onto a new key before
+                // releasing the last one no longer drops characters, and a held
+                // key still fires only once.
                 let mods = dma.read8(DATA_BUF + 0);
-                let key  = dma.read8(DATA_BUF + 2);
-                if key != 0 && key != last_key {
-                    if let Some(ch) = hid_to_ascii(key, mods) {
-                        ctx.console_push(ch);
+                let mut cur = [0u8; 6];
+                for i in 0..6 { cur[i] = dma.read8(DATA_BUF + 2 + i); }
+                for &k in cur.iter() {
+                    if k == 0 || k == 0x01 { continue; } // 0=empty, 0x01=rollover error
+                    if !last.contains(&k) {
+                        if let Some(ch) = hid_to_ascii(k, mods) {
+                            ctx.console_push(ch);
+                        }
                     }
                 }
-                last_key = key;
+                last = cur;
                 toggle ^= 1;            // successful IN flips the data toggle
             }
             // On halt/error or success alike, re-arm the next IN.
