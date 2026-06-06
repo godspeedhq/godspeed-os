@@ -96,6 +96,7 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | arch/x86_64/mod.rs | 34 | permitted |
 | arch/x86_64/page_tables.rs | 25 | permitted |
 | arch/x86_64/pci.rs | 5 | permitted |
+| arch/x86_64/rtc.rs | 1 | permitted |
 | arch/x86_64/syscall_entry.rs | 13 | permitted |
 | capability/table.rs | 7 | permitted |
 | memory/allocator.rs | 32 | permitted |
@@ -115,9 +116,9 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | task/scheduler.rs | 37 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 265 lines across 19 files  
+**Permitted total:** 267 lines across 20 files  
 **Grandfathered total:** 53 lines across 6 files  
-**Grand total:** 318 lines across 25 files
+**Grand total:** 320 lines across 26 files
 
 > **Reconciled 2026-05-31** (branch `verify/static-analysis-unsafe-audit`). The
 > permitted-layer growth since the prior baseline is from the AMD GX-420GI ring-3 /
@@ -269,6 +270,22 @@ PCI config registers, owned exclusively by the kernel during single-threaded BSP
 boot (the scan runs before any AP or task exists); the address dword is
 constructed from bounded bus/dev/func/offset values with the enable bit set per
 the mechanism-#1 spec. `// SAFETY:` comments present in source for all five.
+
+---
+
+### arch/x86_64/rtc.rs
+
+MC146818 CMOS real-time-clock read via the legacy index/data ports (`0x70` /
+`0x71`), used to answer `InspectKernel` query 11 (wall-clock date/time) for the
+shell's `date`/`time` commands (§12). One unsafe line:
+- `unsafe {}` in `cmos_read` — wraps an `out dx, al` (select register) followed by
+  an `in al, dx` (read its value); the two asm blocks are not `pure`, so their
+  order is preserved.
+
+Sound because port I/O is ring-0 and these are the architecturally fixed CMOS
+ports; only a register number (`0x00..0x3F`) is written, and the read is
+side-effect-free. The driver is read-only — it never writes CMOS — so it cannot
+disturb other clock/NMI state. `// SAFETY:` comment present in source.
 
 ---
 

@@ -682,7 +682,7 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     // (9 = fbcon rows/cols — task-neutral hardware info) are ungated. Every other
     // query discloses another task's or system-wide state and requires the
     // INTROSPECT capability with READ (§3.1; docs/introspection-capability.md).
-    if !matches!(query_id, 0 | 3 | 9 | 10)
+    if !matches!(query_id, 0 | 3 | 9 | 10 | 11)
         && !scheduler::current_task_holds_resource(
             crate::capability::INTROSPECT_RESOURCE, Rights::READ)
     {
@@ -699,6 +699,9 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // Input-ready flag — set by the xHCI driver when it finishes setup (the
         // last boot step). The shell watches it to auto-clear the boot screen.
         10 => crate::arch::x86_64::input_ready() as i64,
+        // Wall-clock date/time from the hardware RTC, packed (see rtc.rs). Ungated
+        // — the time of day is task-neutral hardware info, like the TSC (query 3).
+        11 => crate::arch::x86_64::rtc::read_datetime() as i64,
         4 => crate::memory::allocator::free_frame_count() as i64,
         5 => crate::memory::allocator::total_frame_count() as i64,
         6 => scheduler::core_active_ticks(arg1 as usize) as i64,

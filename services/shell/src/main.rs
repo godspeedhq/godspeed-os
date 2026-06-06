@@ -123,6 +123,7 @@ fn execute(ctx: &ServiceContext, line: &[u8]) {
         "about"   => cmd_about(ctx),
         "mem"     => cmd_mem(ctx),
         "cores"   => cmd_cores(ctx),
+        "date"    => cmd_date(ctx, if argc >= 2 { args[1] } else { "" }),
         "status"  => cmd_status(ctx),
         "observe" => {
             if argc >= 2 && args[1] == "now" {
@@ -176,6 +177,7 @@ fn cmd_help(ctx: &ServiceContext) {
     help_line(ctx, "about", "identity + credits");
     help_line(ctx, "cores", "CPU core count");
     help_line(ctx, "mem", "physical memory usage");
+    help_line(ctx, "date [unix]", "date + time; 'unix' = epoch secs");
     ctx.console_writeln("");
     ctx.console_writeln("Services");
     help_line(ctx, "status", "list all live tasks");
@@ -242,6 +244,23 @@ fn cmd_cores(ctx: &ServiceContext) {
     write_bytes(&mut buf, &mut pos, b"cores: ");
     write_u32(&mut buf, &mut pos, n);
     ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("?"));
+}
+
+/// Wall-clock date+time from the hardware RTC. Default renders a full timestamp
+/// with weekday, e.g. `Sat 2026-06-06 22:05:09`. `date unix` prints Unix epoch
+/// seconds instead. Deliberately just these two forms — no clock-setting, format
+/// strings, or timezones (§26.2: minimal surface).
+fn cmd_date(ctx: &ServiceContext, arg: &str) {
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    let dt = ctx.datetime();
+    if arg == "unix" {
+        ctx.console_writeln_fmt(format_args!("{}", dt.unix_secs()));
+    } else {
+        let wd = WEEKDAYS[(dt.weekday() as usize) % 7];
+        ctx.console_writeln_fmt(format_args!(
+            "{} {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            wd, dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second));
+    }
 }
 
 fn cmd_status(ctx: &ServiceContext) {

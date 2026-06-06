@@ -8,6 +8,51 @@ use crate::capability::{CapError, CapHandle};
 use crate::ipc::{IpcError, Message};
 use crate::syscall::raw_syscall;
 
+/// Wall-clock date/time read from the hardware RTC, fully decoded (binary,
+/// 24-hour). See [`ServiceContext::datetime`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Datetime {
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+}
+
+impl Datetime {
+    /// Days since the Unix epoch (1970-01-01), proleptic Gregorian and leap-year
+    /// aware (Howard Hinnant's `days_from_civil`). The basis for both `weekday`
+    /// and `unix_secs`.
+    fn days_since_epoch(&self) -> i64 {
+        let mut y = self.year as i64;
+        let m = self.month as i64;
+        let d = self.day as i64;
+        y -= (m <= 2) as i64;
+        let era = (if y >= 0 { y } else { y - 399 }) / 400;
+        let yoe = y - era * 400;
+        let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146097 + doe - 719468
+    }
+
+    /// Day of week, 0 = Sunday .. 6 = Saturday (computed, not the RTC's
+    /// often-unreliable weekday register).
+    pub fn weekday(&self) -> u8 {
+        (self.days_since_epoch() + 4).rem_euclid(7) as u8
+    }
+
+    /// Seconds since the Unix epoch. Assumes the RTC reads UTC; if the hardware
+    /// clock is set to local time the value is offset by the timezone (v1 has no
+    /// timezone database).
+    pub fn unix_secs(&self) -> i64 {
+        self.days_since_epoch() * 86_400
+            + self.hour as i64 * 3_600
+            + self.minute as i64 * 60
+            + self.second as i64
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ServiceContextData page layout.
 // MUST match `ServiceContextData` in `kernel/src/task/mod.rs`.
@@ -449,6 +494,24 @@ impl ServiceContext {
         // SAFETY: syscall(13) = InspectKernel; query_id=3 = read TSC.
         let ret = unsafe { raw_syscall(13, 3, 0, 0) };
         if ret < 0 { 0 } else { ret as u64 }
+    }
+
+    /// Read the hardware real-time clock (wall-clock date/time) via the kernel.
+    ///
+    /// Ambient — the time of day is task-neutral hardware info, like the TSC.
+    /// Wraps InspectKernel query 11; the kernel returns the fields packed into a
+    /// `u64` (see `kernel/src/arch/x86_64/rtc.rs`), which this unpacks.
+    pub fn datetime(&self) -> Datetime {
+        // SAFETY: syscall(13) = InspectKernel; query_id=11 = packed RTC datetime.
+        let p = unsafe { raw_syscall(13, 11, 0, 0) } as u64;
+        Datetime {
+            second: (p & 0x3F) as u8,
+            minute: ((p >> 6) & 0x3F) as u8,
+            hour: ((p >> 12) & 0x1F) as u8,
+            day: ((p >> 17) & 0x1F) as u8,
+            month: ((p >> 22) & 0x0F) as u8,
+            year: ((p >> 26) & 0xFFF) as u16,
+        }
     }
 
     /// Query the kernel task stat for scheduler slot `slot` (syscall 16).
