@@ -164,6 +164,36 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
+    // starter-pack: echo / about / mem / caps (self)
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"echo PINGPONG42\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("PINGPONG42"), "echo: prints its argument"),
+        None    => { println!("shell-test: FAIL — timed out after echo"); fail += 1; }
+    }
+
+    send(&mut write_half, b"about\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => {
+            check!(r.contains("GodspeedOS"), "about: identity line");
+            check!(r.contains("Bankole Ogundero"), "about: creator credit");
+        }
+        None => { println!("shell-test: FAIL — timed out after about  [×2]"); fail += 2; }
+    }
+
+    send(&mut write_half, b"mem\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("mem:") && r.contains("total"), "mem: reports usage"),
+        None    => { println!("shell-test: FAIL — timed out after mem"); fail += 1; }
+    }
+
+    send(&mut write_half, b"caps\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("caps for shell"), "caps (no arg): shows this shell"),
+        None    => { println!("shell-test: FAIL — timed out after caps (self)"); fail += 1; }
+    }
+
+    // -----------------------------------------------------------------------
     // unknown command
     // -----------------------------------------------------------------------
     send(&mut write_half, b"xyzzy\r");
