@@ -1,7 +1,8 @@
-//! `xhci` — USB host-controller driver (§12). Stage 3: run the controller and
-//! enumerate the device on a connected port — reset the port, Enable Slot,
-//! Address Device. All hardware access is via the SDK's audited Mmio / Dma
-//! wrappers (§18); no `unsafe` here.
+//! `xhci` — USB host-controller driver (§12). Multi-HID: enumerates EVERY
+//! connected port and binds up to `MAX_HID` boot-protocol HID devices (a
+//! keyboard AND a mouse) on the SAME controller at once, then polls all of them
+//! from one loop, demultiplexing transfer events by slot id. All hardware access
+//! is via the SDK's audited Mmio / Dma wrappers (§18); no `unsafe` here.
 
 #![no_std]
 #![no_main]
@@ -170,6 +171,7 @@ fn next_event(
 
 /// Issue a command TRB and wait for its Command Completion Event, skipping any
 /// intervening events (e.g. Port Status Change). Returns (completion, slot_id).
+#[allow(clippy::too_many_arguments)]
 fn run_command(
     ctx: &ServiceContext,
     dma: &Dma,
@@ -205,8 +207,8 @@ fn run_command(
     None
 }
 
-/// Issue a control transfer on EP0 at `ep0_off` in the EP0 transfer ring
-/// (Setup, optional IN Data, Status). `wlen == 0` means a no-data transfer.
+/// Issue a control transfer on EP0 at `ep0_off` in device `dev`'s EP0 transfer
+/// ring (Setup, optional IN Data, Status). `wlen == 0` means a no-data transfer.
 /// Returns true on success/short-packet completion.
 #[allow(clippy::too_many_arguments)]
 fn control(
@@ -263,6 +265,305 @@ fn control(
     false
 }
 
+/// Fully enumerate the device on root-hub `port` into per-device DMA slice
+/// `dev_idx`: enable the port, Enable Slot, Address Device, read the device and
+/// configuration descriptors, find a boot-protocol HID interrupt-IN endpoint,
+/// Configure Endpoint, Set Configuration, Set Protocol(boot), and arm the
+/// interrupt transfer ring. Returns `Some(Hid)` if the device is a boot keyboard
+/// or mouse and is now ready to poll; `None` for any non-HID device (e.g. the
+/// mass-storage boot drive) or on any enumeration failure. Shares the command and
+/// event rings via the mutable bookkeeping refs.
+#[allow(clippy::too_many_arguments)]
+fn enumerate_one(
+    ctx: &ServiceContext,
+    dma: &Dma,
+    mmio: &Mmio,
+    dboff: usize,
+    ir0: usize,
+    op: usize,
+    ctx_size: usize,
+    port: u32,
+    dev_idx: usize,
+    ev_idx: &mut usize,
+    ev_cycle: &mut u32,
+    cmd_idx: &mut usize,
+) -> Option<Hid> {
+    let portsc_off = op + OP_PORTSC_BASE + (port as usize - 1) * 0x10;
+    let psc = mmio.read32(portsc_off);
+    if psc & PORT_CCS == 0 {
+        return None; // nothing connected on this port
+    }
+    ctx.log_fmt(format_args!(
+        "xhci: enumerating port {} PORTSC={:#010x} into dev slice {}",
+        port, psc, dev_idx
+    ));
+
+    // Enable the port. USB3 (SuperSpeed) ports auto-train and are already enabled
+    // (PED=1) — issuing the USB2 port-reset (PR) bit *disables* them. So only reset
+    // a not-yet-enabled (USB2) port; an already-enabled port is used as-is.
+    if psc & PORT_PED == 0 {
+        mmio.write32(portsc_off, (psc & !PORT_RW1C) | PORT_PR);
+        spin(|| mmio.read32(portsc_off) & PORT_PED != 0);
+    }
+    let psc = mmio.read32(portsc_off);
+    let speed = (psc >> 10) & 0xF;
+    let max_packet = match speed {
+        2 => 8,   // low-speed
+        4 => 512, // super-speed
+        _ => 64,  // full / high-speed
+    };
+    ctx.log_fmt(format_args!(
+        "xhci: port {} ready; PORTSC={:#010x} speed={} max_packet={}",
+        port, psc, speed, max_packet
+    ));
+
+    // Enable Slot.
+    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+    *cmd_idx += 1;
+    let (comp, slot) = match run_command(
+        ctx, dma, mmio, dboff, ir0, cmd_off,
+        0, 0, 0, (TRB_ENABLE_SLOT << 10) | 1,
+        ev_idx, ev_cycle,
+    ) {
+        Some(r) => r,
+        None => {
+            ctx.log("xhci: Enable Slot — no completion");
+            return None;
+        }
+    };
+    if comp != 1 {
+        ctx.log_fmt(format_args!("xhci: Enable Slot failed (completion={})", comp));
+        return None;
+    }
+    ctx.log_fmt(format_args!("xhci: slot {} enabled", slot));
+
+    // Build the Input Context for Address Device.
+    //   +0:            Input Control Context — Add flags A0(slot)|A1(ep0)
+    //   +ctx_size:     Slot Context
+    //   +2*ctx_size:   Endpoint 0 Context
+    let islot = INPUT_CTX_OFF + ctx_size;
+    let iep0 = INPUT_CTX_OFF + 2 * ctx_size;
+    dma.write32(INPUT_CTX_OFF + 4, 0b11); // Add Context flags: slot + EP0
+    dma.write32(islot, (1 << 27) | (speed << 20));
+    dma.write32(islot + 4, port << 16);
+    let ep0_tr = dma.phys_at(ep0_tr_off(dev_idx));
+    dma.write32(iep0 + 4, (3 << 1) | (4 << 3) | (max_packet << 16));
+    dma.write32(iep0 + 8, (ep0_tr as u32 & !0xF) | 1);
+    dma.write32(iep0 + 12, (ep0_tr >> 32) as u32);
+    dma.write32(iep0 + 16, 8);
+
+    // DCBAA[slot] = device context physical base.
+    dma.write64(DCBAA_OFF + slot as usize * 8, dma.phys_at(device_ctx_off(dev_idx)));
+
+    // Address Device command (input context ptr, slot id).
+    let in_phys = dma.phys_at(INPUT_CTX_OFF);
+    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+    *cmd_idx += 1;
+    let (comp, _) = match run_command(
+        ctx, dma, mmio, dboff, ir0, cmd_off,
+        in_phys as u32, (in_phys >> 32) as u32, 0,
+        (TRB_ADDRESS_DEVICE << 10) | (slot << 24) | 1,
+        ev_idx, ev_cycle,
+    ) {
+        Some(r) => r,
+        None => {
+            ctx.log("xhci: Address Device — no completion");
+            return None;
+        }
+    };
+    if comp != 1 {
+        ctx.log_fmt(format_args!("xhci: Address Device failed (completion={})", comp));
+        return None;
+    }
+    ctx.log_fmt(format_args!(
+        "xhci: Address Device OK — device on port {} addressed (slot {})",
+        port, slot
+    ));
+
+    // Get Device Descriptor over EP0 (control transfer): Setup (immediate
+    // GET_DESCRIPTOR), Data (IN, 18 bytes), Status (OUT, IOC).
+    let data_phys = dma.phys_at(DATA_BUF_OFF);
+    let tr0 = ep0_tr_off(dev_idx);
+    dma.write32(tr0, 0x80 | (6 << 8) | (0x0100 << 16));
+    dma.write32(tr0 + 4, 18 << 16);
+    dma.write32(tr0 + 8, 8);
+    dma.write32(tr0 + 12, 1 | (1 << 6) | (TRB_SETUP_STAGE << 10) | (3 << 16));
+    dma.write32(tr0 + 16, data_phys as u32);
+    dma.write32(tr0 + 20, (data_phys >> 32) as u32);
+    dma.write32(tr0 + 24, 18);
+    dma.write32(tr0 + 28, 1 | (TRB_DATA_STAGE << 10) | (1 << 16));
+    dma.write32(tr0 + 32, 0);
+    dma.write32(tr0 + 36, 0);
+    dma.write32(tr0 + 40, 0);
+    dma.write32(tr0 + 44, 1 | (1 << 5) | (TRB_STATUS_STAGE << 10));
+    mmio.write32(dboff + slot as usize * 4, 1);
+    let mut ok = false;
+    for _ in 0..8 {
+        match next_event(dma, mmio, ir0, ev_idx, ev_cycle) {
+            Some((TRB_TRANSFER_EVENT, c, _)) => { ok = c == 1 || c == 13; break; }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    if !ok {
+        ctx.log("xhci: Get Device Descriptor failed");
+        return None;
+    }
+    let d0 = dma.read32(DATA_BUF_OFF);
+    let ids = dma.read32(DATA_BUF_OFF + 8);
+    ctx.log_fmt(format_args!(
+        "xhci: DEVICE DESCRIPTOR bLength={} type={} VID={:#06x} PID={:#06x}",
+        d0 & 0xFF, (d0 >> 8) & 0xFF, ids & 0xFFFF, (ids >> 16) & 0xFFFF
+    ));
+
+    // Get Configuration Descriptor (64 bytes); walk it for the boot-HID
+    // interrupt-IN endpoint.
+    let cfg_phys = dma.phys_at(CONFIG_BUF_OFF);
+    let tr = ep0_tr_off(dev_idx) + 48;
+    dma.write32(tr, 0x80 | (6 << 8) | (0x0200 << 16));
+    dma.write32(tr + 4, 64 << 16);
+    dma.write32(tr + 8, 8);
+    dma.write32(tr + 12, 1 | (1 << 6) | (TRB_SETUP_STAGE << 10) | (3 << 16));
+    dma.write32(tr + 16, cfg_phys as u32);
+    dma.write32(tr + 20, (cfg_phys >> 32) as u32);
+    dma.write32(tr + 24, 64);
+    dma.write32(tr + 28, 1 | (TRB_DATA_STAGE << 10) | (1 << 16));
+    dma.write32(tr + 32, 0);
+    dma.write32(tr + 36, 0);
+    dma.write32(tr + 40, 0);
+    dma.write32(tr + 44, 1 | (1 << 5) | (TRB_STATUS_STAGE << 10));
+    mmio.write32(dboff + slot as usize * 4, 1);
+    let mut cfg_ok = false;
+    for _ in 0..8 {
+        match next_event(dma, mmio, ir0, ev_idx, ev_cycle) {
+            Some((TRB_TRANSFER_EVENT, c, _)) => { cfg_ok = c == 1 || c == 13; break; }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    if !cfg_ok {
+        ctx.log("xhci: Get Config Descriptor failed");
+        return None;
+    }
+
+    // Walk the descriptors: config (bConfigurationValue), interface (HID protocol),
+    // endpoint (the interrupt-IN endpoint we'll poll for reports). A composite
+    // device may expose extra interfaces with their own interrupt-IN endpoints —
+    // bind the boot keyboard (class 3, proto 1) or mouse (proto 2) interface, not
+    // whichever endpoint happens to come last.
+    let total = ((dma.read32(CONFIG_BUF_OFF) >> 16) & 0xFFFF) as usize;
+    let mut i = 0usize;
+    let mut ep_addr = 0u8;
+    let mut ep_mps = 0u16;
+    let mut ep_interval = 0u8;
+    let mut cfg_val = 0u8;
+    let mut hid_proto = 0u8;
+    let mut kbd_iface = 0u8;
+    let mut cur_hid = false;
+    while i + 2 <= total && i < 200 {
+        let blen = dma.read8(CONFIG_BUF_OFF + i) as usize;
+        let dtype = dma.read8(CONFIG_BUF_OFF + i + 1);
+        if blen == 0 { break; }
+        match dtype {
+            2 => cfg_val = dma.read8(CONFIG_BUF_OFF + i + 5),
+            4 => {
+                let iclass = dma.read8(CONFIG_BUF_OFF + i + 5);
+                let iproto = dma.read8(CONFIG_BUF_OFF + i + 7);
+                cur_hid = iclass == 3 && (iproto == 1 || iproto == 2);
+                if cur_hid {
+                    hid_proto = iproto;
+                    kbd_iface = dma.read8(CONFIG_BUF_OFF + i + 2);
+                }
+            }
+            5 => {
+                let addr = dma.read8(CONFIG_BUF_OFF + i + 2);
+                let attr = dma.read8(CONFIG_BUF_OFF + i + 3);
+                if cur_hid && attr & 0x3 == 0x3 && addr & 0x80 != 0 && ep_addr == 0 {
+                    ep_addr = addr;
+                    ep_mps = dma.read16(CONFIG_BUF_OFF + i + 4);
+                    ep_interval = dma.read8(CONFIG_BUF_OFF + i + 6);
+                }
+            }
+            _ => {}
+        }
+        i += blen;
+    }
+    if ep_addr == 0 {
+        ctx.log_fmt(format_args!(
+            "xhci: port {} device has no interrupt-IN endpoint (not a keyboard/mouse)",
+            port
+        ));
+        return None;
+    }
+    let is_mouse = hid_proto == 2;
+    let ep_num = (ep_addr & 0x0F) as u32;
+    let dci = ep_num * 2 + 1;
+    ctx.log_fmt(format_args!(
+        "xhci: {} found on port {} (slot {}, DCI {}, mps={} interval={} cfg_val={})",
+        if is_mouse { "mouse" } else { "keyboard" },
+        port, slot, dci, ep_mps, ep_interval, cfg_val
+    ));
+
+    // Configure Endpoint (add the interrupt-IN endpoint).
+    let int_tr = dma.phys_at(int_tr_off(dev_idx));
+    dma.write32(INPUT_CTX_OFF, 0); // Drop flags
+    dma.write32(INPUT_CTX_OFF + 4, 1 | (1 << dci)); // Add: slot + interrupt endpoint
+    dma.write32(islot, (dci << 27) | (speed << 20)); // Context Entries = dci
+    dma.write32(islot + 4, port << 16);
+    let iep = INPUT_CTX_OFF + (1 + dci as usize) * ctx_size;
+    // xHCI Endpoint Context Interval encoding is speed-dependent (xHCI §6.2.3.6).
+    let xhci_interval = match speed {
+        1 | 2 => {
+            let bi = if ep_interval == 0 { 1 } else { ep_interval as u32 };
+            (3 + (31 - bi.leading_zeros())).clamp(3, 10)
+        }
+        _ => {
+            if ep_interval > 1 { (ep_interval - 1) as u32 } else { 0 }
+        }
+    };
+    dma.write32(iep, xhci_interval << 16);
+    dma.write32(iep + 4, (3 << 1) | (7 << 3) | ((ep_mps as u32) << 16));
+    dma.write32(iep + 8, (int_tr as u32 & !0xF) | 1);
+    dma.write32(iep + 12, (int_tr >> 32) as u32);
+    dma.write32(iep + 16, ep_mps as u32 | ((ep_mps as u32) << 16));
+    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+    *cmd_idx += 1;
+    let in_phys = dma.phys_at(INPUT_CTX_OFF);
+    let ce = run_command(
+        ctx, dma, mmio, dboff, ir0, cmd_off,
+        in_phys as u32, (in_phys >> 32) as u32, 0,
+        (TRB_CONFIGURE_ENDPOINT << 10) | (slot << 24) | 1,
+        ev_idx, ev_cycle,
+    )
+    .map(|(c, _)| c)
+    .unwrap_or(0);
+    ctx.log_fmt(format_args!("xhci: Configure Endpoint completion={}", ce));
+
+    // Set Configuration, then Set Protocol (boot) on EP0.
+    if control(
+        dma, mmio, dboff, ir0, slot, dev_idx, 96,
+        ev_idx, ev_cycle, 0x00, 9, cfg_val as u32, 0, 0, 0,
+    ) {
+        ctx.log("xhci: Set Configuration OK");
+    } else {
+        ctx.log("xhci: Set Configuration failed");
+    }
+    let _ = control(
+        dma, mmio, dboff, ir0, slot, dev_idx, 128,
+        ev_idx, ev_cycle, 0x21, 0x0B, 0, kbd_iface as u32, 0, 0,
+    ); // SET_PROTOCOL: boot (wValue=0) on the HID interface
+
+    // Arm the interrupt transfer ring: the Link TRB closes the 16-entry ring.
+    let ring_phys = dma.phys_at(int_tr_off(dev_idx));
+    let link = int_tr_off(dev_idx) + 15 * 16;
+    dma.write32(link, ring_phys as u32);
+    dma.write32(link + 4, (ring_phys >> 32) as u32);
+    dma.write32(link + 8, 0);
+    dma.write32(link + 12, (TRB_LINK << 10) | (1 << 1) | 1);
+
+    Some(Hid { slot, dci, port, idx: dev_idx, is_mouse })
+}
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("xhci: driver starting");
@@ -309,11 +610,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Hot-plug loop. Each pass FULLY re-initializes the controller (stop, reset,
     // rebuild the command/event rings + DCBAA, run) so every (re)enumeration starts
     // from pristine state — no stale completion events or slots can survive an
-    // unplug/replug to desync the rings. Then it (re)scans ports, binds a HID
-    // device, and polls until it is unplugged (root-port CCS drops); on a drop it
-    // announces and loops. With nothing attached it waits on the ports. Per-pass
-    // re-init is heavy, but hot-plug is infrequent and it keeps the ring bookkeeping
-    // trivially correct (§26.12: correctness over cleverness).
+    // unplug/replug to desync the rings. Then it (re)scans every port, binds up to
+    // MAX_HID HID devices (keyboard + mouse), and polls all of them until ANY of
+    // them is unplugged (root-port CCS drops); on a drop it announces and loops,
+    // re-binding whatever remains. Per-pass re-init is heavy, but hot-plug is
+    // infrequent and it keeps the ring bookkeeping trivially correct (§26.12).
     'reenum: loop {
         // Stop + reset the controller.
         let cmd = mmio.read32(op + OP_USBCMD);
@@ -342,489 +643,137 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut ev_cycle = 1u32;
         let mut cmd_idx = 0usize;
 
-    // Enumerate EVERY connected port and bind to the first device that is a HID
-    // keyboard or mouse — i.e. one that exposes an interrupt-IN endpoint
-    // (Linux-style, class-based binding). The mass-storage boot drive has no
-    // interrupt endpoint and is skipped, so the device is found wherever it sits.
-    let mut found = false;
-    let mut port = 0u32;
-    let mut slot = 0u32;
-    let mut speed = 0u32;
-    let mut max_packet = 64u32;
-    let mut ep_addr = 0u8;
-    let mut ep_mps = 0u16;
-    let mut ep_interval = 0u8;
-    let mut cfg_val = 0u8;
-    let mut kbd_iface = 0u8;   // bInterfaceNumber of the bound HID interface
-    let mut bound_proto = 0u8; // HID protocol of the bound device (1=keyboard, 2=mouse)
-
-    // --- Port census (back-USB diagnostic) ---
-    // Log EVERY root-hub port's PORTSC, connected or not, BEFORE we start binding.
-    // This tells us exactly which xHCI ports are live when a keyboard is plugged
-    // into a back socket: if a back-port keyboard shows connected=1 here, it's an
-    // xHCI port we can enumerate (a driver fix); if NO xHCI port reacts to the
-    // back socket, that connector hangs off the EHCI controller (00:12.0), which
-    // this driver does not drive — a much bigger piece of work. CCS=bit0,
-    // PED=bit1, speed=bits10-13.
-    for p in 1..=max_ports {
-        let psc = mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10);
-        ctx.log_fmt(format_args!(
-            "xhci: port census {}/{}: PORTSC={:#010x} connected={} enabled={} speed={}",
-            p, max_ports, psc,
-            (psc & PORT_CCS != 0) as u8,
-            (psc & (1 << 1) != 0) as u8,
-            (psc >> 10) & 0xF,
-        ));
-    }
-
-    'ports: for p in 1..=max_ports {
-        let portsc_off = op + OP_PORTSC_BASE + (p as usize - 1) * 0x10;
-        let psc = mmio.read32(portsc_off);
-        if psc & PORT_CCS == 0 {
-            continue; // nothing connected on this port
-        }
-        port = p; // root-hub port number used by Address Device below
-        ctx.log_fmt(format_args!(
-            "xhci: enumerating port {} PORTSC={:#010x}",
-            p, psc
-        ));
-
-        // Enable the port. USB3 (SuperSpeed) ports auto-train and are already
-        // enabled (PED=1) — issuing the USB2 port-reset (PR) bit *disables* them
-        // (PORTSC speed→0, link→Disabled). So only reset a not-yet-enabled (USB2)
-        // port; an already-enabled port is used as-is.
-        if psc & PORT_PED == 0 {
-            mmio.write32(portsc_off, (psc & !PORT_RW1C) | PORT_PR);
-            spin(|| mmio.read32(portsc_off) & PORT_PED != 0);
-        }
-        let psc = mmio.read32(portsc_off);
-        speed = (psc >> 10) & 0xF;
-        max_packet = match speed {
-            2 => 8,   // low-speed
-            4 => 512, // super-speed
-            _ => 64,  // full / high-speed
-        };
-        ctx.log_fmt(format_args!(
-            "xhci: port {} ready; PORTSC={:#010x} speed={} max_packet={}",
-            p, psc, speed, max_packet
-        ));
-
-        // Enable Slot.
-        let cmd_off = CMD_RING_OFF + cmd_idx * TRB_SIZE;
-        cmd_idx += 1;
-        let (comp, got_slot) = match run_command(
-            &ctx,
-            &dma,
-            &mmio,
-            dboff,
-            ir0,
-            cmd_off,
-            0,
-            0,
-            0,
-            (TRB_ENABLE_SLOT << 10) | 1,
-            &mut ev_idx,
-            &mut ev_cycle,
-        ) {
-            Some(r) => r,
-            None => {
-                ctx.log("xhci: Enable Slot — no completion; next port");
-                continue 'ports;
-            }
-        };
-        if comp != 1 {
+        // --- Port census (diagnostic) ---
+        // Log EVERY root-hub port's PORTSC, connected or not, before binding. This
+        // tells us which xHCI ports are live; a device on a port absent here hangs
+        // off the EHCI controller, which this driver does not drive.
+        for p in 1..=max_ports {
+            let psc = mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10);
             ctx.log_fmt(format_args!(
-                "xhci: Enable Slot failed (completion={}); next port",
-                comp
+                "xhci: port census {}/{}: PORTSC={:#010x} connected={} enabled={} speed={}",
+                p, max_ports, psc,
+                (psc & PORT_CCS != 0) as u8,
+                (psc & (1 << 1) != 0) as u8,
+                (psc >> 10) & 0xF,
             ));
-            continue 'ports;
         }
-        slot = got_slot;
-        ctx.log_fmt(format_args!("xhci: slot {} enabled", slot));
 
-        // Build the Input Context for Address Device.
-        //   +0:            Input Control Context — Add flags A0(slot)|A1(ep0)
-        //   +ctx_size:     Slot Context
-        //   +2*ctx_size:   Endpoint 0 Context
-        let ictl = INPUT_CTX_OFF;
-        let islot = INPUT_CTX_OFF + ctx_size;
-        let iep0 = INPUT_CTX_OFF + 2 * ctx_size;
-        dma.write32(ictl + 4, 0b11); // Add Context flags: slot + EP0
-
-        // Slot Context: Context Entries=1 [31:27], Speed [23:20]; Root Hub Port [23:16].
-        dma.write32(islot, (1 << 27) | (speed << 20));
-        dma.write32(islot + 4, port << 16);
-
-        // EP0 Context (Control): CErr=3 [2:1], EP Type=4 [5:3], Max Packet [31:16];
-        // TR Dequeue Ptr | DCS; Average TRB Length.
-        let ep0_tr = dma.phys_at(ep0_tr_off(0));
-        dma.write32(iep0 + 4, (3 << 1) | (4 << 3) | (max_packet << 16));
-        dma.write32(iep0 + 8, (ep0_tr as u32 & !0xF) | 1);
-        dma.write32(iep0 + 12, (ep0_tr >> 32) as u32);
-        dma.write32(iep0 + 16, 8);
-
-        // DCBAA[slot] = device context physical base.
-        dma.write64(DCBAA_OFF + slot as usize * 8, dma.phys_at(device_ctx_off(0)));
-
-        // Address Device command (input context ptr, slot id).
-        let in_phys = dma.phys_at(INPUT_CTX_OFF);
-        let cmd_off = CMD_RING_OFF + cmd_idx * TRB_SIZE;
-        cmd_idx += 1;
-        let (comp, _) = match run_command(
-            &ctx,
-            &dma,
-            &mmio,
-            dboff,
-            ir0,
-            cmd_off,
-            in_phys as u32,
-            (in_phys >> 32) as u32,
-            0,
-            (TRB_ADDRESS_DEVICE << 10) | (slot << 24) | 1,
-            &mut ev_idx,
-            &mut ev_cycle,
-        ) {
-            Some(r) => r,
-            None => {
-                ctx.log("xhci: Address Device — no completion; next port");
-                continue 'ports;
+        // Enumerate EVERY connected port, binding up to MAX_HID boot HID devices
+        // (keyboard + mouse) into successive per-device DMA slices. Non-HID devices
+        // (the mass-storage boot drive) return None and are skipped, so the HID
+        // devices are found wherever they sit.
+        let mut devs = [Hid { slot: 0, dci: 0, port: 0, idx: 0, is_mouse: false }; MAX_HID];
+        let mut ndev = 0usize;
+        for p in 1..=max_ports {
+            if ndev >= MAX_HID { break; }
+            if let Some(hid) = enumerate_one(
+                &ctx, &dma, &mmio, dboff, ir0, op, ctx_size,
+                p, ndev, &mut ev_idx, &mut ev_cycle, &mut cmd_idx,
+            ) {
+                devs[ndev] = hid;
+                ndev += 1;
             }
-        };
-        if comp != 1 {
-            ctx.log_fmt(format_args!(
-                "xhci: Address Device failed (completion={}); next port",
-                comp
-            ));
-            continue 'ports;
         }
-        ctx.log_fmt(format_args!(
-            "xhci: Address Device OK — device on port {} addressed (slot {})",
-            port, slot
-        ));
 
-        // --- Stage 3c: Get Device Descriptor over EP0 (control transfer) ---
-        // Three TRBs on the EP0 transfer ring: Setup (immediate GET_DESCRIPTOR),
-        // Data (IN, 18 bytes), Status (OUT, IOC). Then ring the slot's EP0 doorbell.
-        let data_phys = dma.phys_at(DATA_BUF_OFF);
-        dma.write32(ep0_tr_off(0), 0x80 | (6 << 8) | (0x0100 << 16)); // bmReqType|bRequest|wValue
-        dma.write32(ep0_tr_off(0) + 4, 18 << 16); // wIndex=0 | wLength=18
-        dma.write32(ep0_tr_off(0) + 8, 8); // setup data length
-        dma.write32(
-            ep0_tr_off(0) + 12,
-            1 | (1 << 6) | (TRB_SETUP_STAGE << 10) | (3 << 16),
-        ); // cyc|IDT|type|TRT=IN
-        dma.write32(ep0_tr_off(0) + 16, data_phys as u32);
-        dma.write32(ep0_tr_off(0) + 20, (data_phys >> 32) as u32);
-        dma.write32(ep0_tr_off(0) + 24, 18);
-        dma.write32(ep0_tr_off(0) + 28, 1 | (TRB_DATA_STAGE << 10) | (1 << 16)); // cyc|type|DIR=IN
-        dma.write32(ep0_tr_off(0) + 32, 0);
-        dma.write32(ep0_tr_off(0) + 36, 0);
-        dma.write32(ep0_tr_off(0) + 40, 0);
-        dma.write32(ep0_tr_off(0) + 44, 1 | (1 << 5) | (TRB_STATUS_STAGE << 10)); // cyc|IOC|type
-        mmio.write32(dboff + slot as usize * 4, 1); // EP0 doorbell (DCI 1)
+        if ndev == 0 {
+            // Nothing usable attached. Still report input-ready once so the shell's
+            // boot-screen clear fires (the keyboard may be on the other controller),
+            // then wait for a port connection and re-scan.
+            if !signaled { ctx.signal_input_ready(); signaled = true; }
+            ctx.log("xhci: no HID keyboard/mouse on any port — waiting for a connection");
+            wait_for_port(&ctx, &mmio, op, max_ports);
+            announce = true; // whatever connects now is a real plug event
+            continue 'reenum;
+        }
 
-        let mut ok = false;
-        for _ in 0..8 {
-            match next_event(&dma, &mmio, ir0, &mut ev_idx, &mut ev_cycle) {
-                Some((TRB_TRANSFER_EVENT, c, _)) => {
-                    ctx.log_fmt(format_args!("xhci: control transfer completion={}", c));
-                    ok = c == 1 || c == 13; // success or short-packet
-                    break;
+        ctx.log_fmt(format_args!("xhci: {} HID device(s) bound", ndev));
+        if !signaled { ctx.signal_input_ready(); signaled = true; } // boot-screen clear, once
+        if announce {
+            for d in &devs[..ndev] {
+                notify(&ctx, match (d.is_mouse, d.idx) {
+                    (true, _) => "mouse connected (xhci)",
+                    (false, _) => "keyboard connected (xhci)",
+                });
+            }
+        }
+
+        // --- Poll every bound device's interrupt endpoint from one loop ---
+        // The event ring is shared; transfer events are demultiplexed by slot id.
+        // Each device has its own ring cursor (int_idx/int_cycle), re-arm flag, and
+        // decode state (keyboard rollover buffer or mouse tracker).
+        let mut int_idx = [0usize; MAX_HID];
+        let mut int_cycle = [1u32; MAX_HID];
+        let mut need_queue = [true; MAX_HID];
+        let mut kb_last = [[0u8; 6]; MAX_HID];
+        let mut mouse = [
+            godspeed_sdk::hid::MouseTracker::new(),
+            godspeed_sdk::hid::MouseTracker::new(),
+        ];
+        'poll: loop {
+            // (Re-)arm each device's interrupt ring as needed.
+            for d in 0..ndev {
+                if !need_queue[d] { continue; }
+                let dev = devs[d].idx;
+                let report_phys = dma.phys_at(report_off(dev));
+                let link = int_tr_off(dev) + 15 * 16;
+                let t = int_tr_off(dev) + int_idx[d] * 16;
+                dma.write32(t, report_phys as u32);
+                dma.write32(t + 4, (report_phys >> 32) as u32);
+                dma.write32(t + 8, 8);
+                dma.write32(t + 12, int_cycle[d] | (1 << 5) | (TRB_NORMAL << 10));
+                int_idx[d] += 1;
+                if int_idx[d] == 15 {
+                    dma.write32(link + 12, (TRB_LINK << 10) | (1 << 1) | int_cycle[d]);
+                    int_idx[d] = 0;
+                    int_cycle[d] ^= 1;
                 }
-                Some((t, _, _)) => ctx.log_fmt(format_args!("xhci: (event type {})", t)),
-                None => break,
+                mmio.write32(dboff + devs[d].slot as usize * 4, devs[d].dci);
+                need_queue[d] = false;
             }
-        }
-        if !ok {
-            ctx.log("xhci: Get Device Descriptor failed; next port");
-            continue 'ports;
-        }
-        let d0 = dma.read32(DATA_BUF_OFF);
-        let ids = dma.read32(DATA_BUF_OFF + 8);
-        ctx.log_fmt(format_args!(
-            "xhci: DEVICE DESCRIPTOR bLength={} type={} VID={:#06x} PID={:#06x}",
-            d0 & 0xFF,
-            (d0 >> 8) & 0xFF,
-            ids & 0xFFFF,
-            (ids >> 16) & 0xFFFF
-        ));
 
-        // --- Stage 4a: Get Configuration Descriptor; find the interrupt-IN endpoint ---
-        let cfg_phys = dma.phys_at(CONFIG_BUF_OFF);
-        let tr = ep0_tr_off(0) + 48; // next 3 TRBs on the EP0 transfer ring
-        dma.write32(tr, 0x80 | (6 << 8) | (0x0200 << 16)); // GET_DESCRIPTOR Config(2), idx 0
-        dma.write32(tr + 4, 64 << 16); // wIndex=0 | wLength=64
-        dma.write32(tr + 8, 8);
-        dma.write32(tr + 12, 1 | (1 << 6) | (TRB_SETUP_STAGE << 10) | (3 << 16));
-        dma.write32(tr + 16, cfg_phys as u32);
-        dma.write32(tr + 20, (cfg_phys >> 32) as u32);
-        dma.write32(tr + 24, 64);
-        dma.write32(tr + 28, 1 | (TRB_DATA_STAGE << 10) | (1 << 16));
-        dma.write32(tr + 32, 0);
-        dma.write32(tr + 36, 0);
-        dma.write32(tr + 40, 0);
-        dma.write32(tr + 44, 1 | (1 << 5) | (TRB_STATUS_STAGE << 10));
-        mmio.write32(dboff + slot as usize * 4, 1);
-        let mut cfg_ok = false;
-        for _ in 0..8 {
-            match next_event(&dma, &mmio, ir0, &mut ev_idx, &mut ev_cycle) {
-                Some((TRB_TRANSFER_EVENT, c, _)) => {
-                    cfg_ok = c == 1 || c == 13;
-                    break;
-                }
-                Some(_) => {}
-                None => break,
-            }
-        }
-        if !cfg_ok {
-            ctx.log("xhci: Get Config Descriptor failed; next port");
-            continue 'ports;
-        }
-
-        // Walk the descriptors: config (bConfigurationValue), interface (HID protocol),
-        // endpoint (the interrupt-IN endpoint we'll poll for key reports).
-        let total = ((dma.read32(CONFIG_BUF_OFF) >> 16) & 0xFFFF) as usize;
-        let mut i = 0usize;
-        ep_addr = 0;
-        ep_mps = 0;
-        ep_interval = 0;
-        cfg_val = 0;
-        let mut hid_proto = 0u8;
-        let mut cur_hid = false; // are we inside a HID boot keyboard/mouse interface?
-        while i + 2 <= total && i < 200 {
-            let blen = dma.read8(CONFIG_BUF_OFF + i) as usize;
-            let dtype = dma.read8(CONFIG_BUF_OFF + i + 1);
-            if blen == 0 {
-                break;
-            }
-            match dtype {
-                2 => cfg_val = dma.read8(CONFIG_BUF_OFF + i + 5),
-                4 => {
-                    // Interface descriptor: class[+5], protocol[+7], number[+2].
-                    // Bind a HID boot keyboard (class 3, protocol 1) OR mouse
-                    // (protocol 2). A composite device may expose extra interfaces
-                    // (e.g. media keys, protocol 0) with their OWN interrupt-IN
-                    // endpoints — bind the boot keyboard/mouse one, not whichever
-                    // endpoint happens to come last.
-                    let iclass = dma.read8(CONFIG_BUF_OFF + i + 5);
-                    let iproto = dma.read8(CONFIG_BUF_OFF + i + 7);
-                    cur_hid = iclass == 3 && (iproto == 1 || iproto == 2);
-                    if cur_hid {
-                        hid_proto = iproto;
-                        kbd_iface = dma.read8(CONFIG_BUF_OFF + i + 2);
+            // Drain one event; route a transfer event to its device by slot id.
+            if let Some((TRB_TRANSFER_EVENT, _, slot_id)) =
+                next_event(&dma, &mmio, ir0, &mut ev_idx, &mut ev_cycle)
+            {
+                if let Some(d) = devs[..ndev].iter().position(|h| h.slot == slot_id) {
+                    let dev = devs[d].idx;
+                    let mut rep = [0u8; 8];
+                    for (j, b) in rep.iter_mut().enumerate() {
+                        *b = dma.read8(report_off(dev) + j);
                     }
-                }
-                5 => {
-                    let addr = dma.read8(CONFIG_BUF_OFF + i + 2);
-                    let attr = dma.read8(CONFIG_BUF_OFF + i + 3);
-                    // First interrupt-IN endpoint of the bound HID interface.
-                    if cur_hid && attr & 0x3 == 0x3 && addr & 0x80 != 0 && ep_addr == 0 {
-                        ep_addr = addr;
-                        ep_mps = dma.read16(CONFIG_BUF_OFF + i + 4);
-                        ep_interval = dma.read8(CONFIG_BUF_OFF + i + 6);
+                    if devs[d].is_mouse {
+                        mouse[d].feed(
+                            &rep,
+                            |mask, down| ctx.log_fmt(format_args!(
+                                "xhci: mouse {} {}",
+                                godspeed_sdk::hid::button_name(mask),
+                                if down { "down" } else { "up" })),
+                            |dx, dy| ctx.log_fmt(format_args!(
+                                "xhci: mouse moved dx={} dy={}", dx, dy)),
+                        );
+                    } else {
+                        godspeed_sdk::hid::decode_keyboard(
+                            &rep, &mut kb_last[d], |ch| ctx.console_push(ch));
                     }
+                    need_queue[d] = true;
                 }
-                _ => {}
             }
-            i += blen;
-        }
-        if ep_addr != 0 {
-            // This device is a HID boot keyboard or mouse — bind it and stop.
-            ctx.log_fmt(format_args!(
-                "xhci: {} found on port {} (slot {}, proto={})",
-                if hid_proto == 2 { "mouse" } else { "keyboard" }, port, slot, hid_proto
-            ));
-            bound_proto = hid_proto;
-            found = true;
-            break 'ports;
-        }
-        ctx.log_fmt(format_args!(
-            "xhci: port {} device has no interrupt-IN endpoint (not a keyboard/mouse); next port",
-            port
-        ));
-    } // end 'ports — scan of every connected port
 
-    if !found {
-        // Nothing usable attached. Still report input-ready once so the shell's
-        // boot-screen clear fires (the keyboard may be on the other controller),
-        // then wait for a port connection and re-scan.
-        if !signaled { ctx.signal_input_ready(); signaled = true; }
-        ctx.log("xhci: no HID keyboard/mouse on any port — waiting for a connection");
-        wait_for_port(&ctx, &mmio, op, max_ports);
-        announce = true; // whatever connects now is a real plug event
-        continue 'reenum;
-    }
-    let is_mouse = bound_proto == 2;
-    let ep_num = (ep_addr & 0x0F) as u32;
-    let dci = ep_num * 2 + 1;
-    ctx.log_fmt(format_args!(
-        "xhci: HID int-IN endpoint {} (DCI {}) mps={} interval={} cfg_val={}",
-        ep_num, dci, ep_mps, ep_interval, cfg_val
-    ));
-
-    // --- Stage 4b: Configure Endpoint (add the interrupt-IN endpoint) ---
-    let islot = INPUT_CTX_OFF + ctx_size; // Slot Context within the input context
-    dma.write32(INPUT_CTX_OFF, 0); // Drop flags
-    dma.write32(INPUT_CTX_OFF + 4, 1 | (1 << dci)); // Add: slot + interrupt endpoint
-    dma.write32(islot, (dci << 27) | (speed << 20)); // Context Entries = dci
-    dma.write32(islot + 4, port << 16);
-    let iep = INPUT_CTX_OFF + (1 + dci as usize) * ctx_size;
-    let int_tr = dma.phys_at(int_tr_off(0));
-    // xHCI Endpoint Context Interval encoding is speed-dependent (xHCI §6.2.3.6):
-    //   Low/Full speed (PSI 1,2): bInterval is in 1 ms frames → 3 + floor(log2(bInterval)),
-    //                             clamped to [3, 10].
-    //   High/Super speed (PSI 3,4): bInterval is already a 2^(n-1) exponent → bInterval - 1.
-    // Writing the raw frame count (e.g. 32 → 31) overflows the field → Parameter Error (17).
-    let xhci_interval = match speed {
-        1 | 2 => {
-            let bi = if ep_interval == 0 { 1 } else { ep_interval as u32 };
-            (3 + (31 - bi.leading_zeros())).clamp(3, 10)
-        }
-        _ => {
-            if ep_interval > 1 {
-                (ep_interval - 1) as u32
-            } else {
-                0
+            // Unplug detection: if ANY bound device's root-port CCS drops, break and
+            // fully re-initialize — re-binding whatever remains on the next pass.
+            for d in 0..ndev {
+                let portsc_off = op + OP_PORTSC_BASE + (devs[d].port as usize - 1) * 0x10;
+                if mmio.read32(portsc_off) & PORT_CCS == 0 {
+                    notify(&ctx, if devs[d].is_mouse {
+                        "mouse disconnected (xhci)"
+                    } else {
+                        "keyboard disconnected (xhci)"
+                    });
+                    announce = true;
+                    break 'poll;
+                }
             }
+            ctx.yield_cpu();
         }
-    };
-    dma.write32(iep, xhci_interval << 16); // Interval [23:16]
-    dma.write32(iep + 4, (3 << 1) | (7 << 3) | ((ep_mps as u32) << 16)); // CErr|Int-IN(7)|mps
-    dma.write32(iep + 8, (int_tr as u32 & !0xF) | 1); // TR Dequeue | DCS
-    dma.write32(iep + 12, (int_tr >> 32) as u32);
-    dma.write32(iep + 16, ep_mps as u32 | ((ep_mps as u32) << 16)); // Avg TRB | Max ESIT
-    // Command ring must stay contiguous (no gaps): use cmd_idx, then advance.
-    let cmd_off = CMD_RING_OFF + cmd_idx * TRB_SIZE;
-    cmd_idx += 1;
-    let in_phys = dma.phys_at(INPUT_CTX_OFF);
-    let ce = run_command(
-        &ctx,
-        &dma,
-        &mmio,
-        dboff,
-        ir0,
-        cmd_off,
-        in_phys as u32,
-        (in_phys >> 32) as u32,
-        0,
-        (TRB_CONFIGURE_ENDPOINT << 10) | (slot << 24) | 1,
-        &mut ev_idx,
-        &mut ev_cycle,
-    )
-    .map(|(c, _)| c)
-    .unwrap_or(0);
-    ctx.log_fmt(format_args!("xhci: Configure Endpoint completion={}", ce));
-
-    // Set Configuration, then Set Protocol (boot) on EP0.
-    if control(
-        &dma,
-        &mmio,
-        dboff,
-        ir0,
-        slot,
-        0, // device slice index (Stage 2 will vary this)
-        96,
-        &mut ev_idx,
-        &mut ev_cycle,
-        0x00,
-        9,
-        cfg_val as u32,
-        0,
-        0,
-        0,
-    ) {
-        ctx.log("xhci: Set Configuration OK");
-    } else {
-        ctx.log("xhci: Set Configuration failed");
-    }
-    let _ = control(
-        &dma,
-        &mmio,
-        dboff,
-        ir0,
-        slot,
-        0, // device slice index (Stage 2 will vary this)
-        128,
-        &mut ev_idx,
-        &mut ev_cycle,
-        0x21,
-        0x0B,
-        0,
-        kbd_iface as u32,
-        0,
-        0,
-    ); // SET_PROTOCOL: boot (wValue=0) on the keyboard's interface
-
-    // --- Stage 4c: poll the interrupt endpoint for HID key reports ---
-    let report_phys = dma.phys_at(report_off(0));
-    let ring_phys = dma.phys_at(int_tr_off(0));
-    let link = int_tr_off(0) + 15 * 16; // Link TRB closes the 16-entry ring
-    dma.write32(link, ring_phys as u32);
-    dma.write32(link + 4, (ring_phys >> 32) as u32);
-    dma.write32(link + 8, 0);
-    dma.write32(link + 12, (TRB_LINK << 10) | (1 << 1) | 1); // Link | Toggle Cycle | cycle
-
-    ctx.log_fmt(format_args!("xhci: {} ready", if is_mouse { "mouse" } else { "keyboard" }));
-    if !signaled { ctx.signal_input_ready(); signaled = true; } // boot-screen clear, once
-    if announce {
-        notify(&ctx, if is_mouse { "mouse connected (xhci)" } else { "keyboard connected (xhci)" });
-    }
-    let mut int_idx = 0usize;
-    let mut int_cycle = 1u32;
-    let mut need_queue = true;
-    let mut kb_last = [0u8; 6];                            // keyboard edge-detection state
-    let mut mouse = godspeed_sdk::hid::MouseTracker::new(); // mouse button/motion state
-    let portsc_off = op + OP_PORTSC_BASE + (port as usize - 1) * 0x10;
-    'poll: loop {
-        if need_queue {
-            let t = int_tr_off(0) + int_idx * 16;
-            dma.write32(t, report_phys as u32);
-            dma.write32(t + 4, (report_phys >> 32) as u32);
-            dma.write32(t + 8, 8);
-            dma.write32(t + 12, int_cycle | (1 << 5) | (TRB_NORMAL << 10)); // cycle|IOC|Normal
-            int_idx += 1;
-            if int_idx == 15 {
-                dma.write32(link + 12, (TRB_LINK << 10) | (1 << 1) | int_cycle);
-                int_idx = 0;
-                int_cycle ^= 1;
-            }
-            mmio.write32(dboff + slot as usize * 4, dci); // ring the endpoint doorbell
-            need_queue = false;
-        }
-        if let Some((TRB_TRANSFER_EVENT, _, _)) =
-            next_event(&dma, &mmio, ir0, &mut ev_idx, &mut ev_cycle)
-        {
-            // Copy the 8-byte boot report out of DMA, then decode it with the
-            // controller-agnostic shared HID logic (§26.2). Keyboard reports push
-            // characters into the console; mouse reports log to serial (no cursor
-            // in a text console — that belongs to a future display server).
-            let mut rep = [0u8; 8];
-            for j in 0..8 { rep[j] = dma.read8(report_off(0) + j); }
-            if is_mouse {
-                mouse.feed(
-                    &rep,
-                    |mask, down| ctx.log_fmt(format_args!(
-                        "xhci: mouse {} {}",
-                        godspeed_sdk::hid::button_name(mask), if down { "down" } else { "up" })),
-                    |dx, dy| ctx.log_fmt(format_args!("xhci: mouse moved dx={} dy={}", dx, dy)),
-                );
-            } else {
-                godspeed_sdk::hid::decode_keyboard(&rep, &mut kb_last, |ch| ctx.console_push(ch));
-            }
-            need_queue = true;
-        }
-        // Unplug detection: the bound root port's Current Connect Status drops.
-        // A plain MMIO read — it doesn't disturb the transfer rings.
-        if mmio.read32(portsc_off) & PORT_CCS == 0 {
-            break 'poll;
-        }
-        ctx.yield_cpu();
-    }
-
-    // Device unplugged. Announce it and loop: the controller is fully
-    // re-initialized at the top of the next pass, which frees the slot and clears
-    // all device state, so we just await the reconnect.
-    notify(&ctx, if is_mouse { "mouse disconnected (xhci)" } else { "keyboard disconnected (xhci)" });
-    announce = true;
     } // end 'reenum loop
 }
