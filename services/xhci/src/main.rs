@@ -709,6 +709,22 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             godspeed_sdk::hid::MouseTracker::new(),
             godspeed_sdk::hid::MouseTracker::new(),
         ];
+        // Snapshot every connected root-hub port at poll start: the bound HID
+        // devices, plus any non-HID device (e.g. a thumbdrive). A genuinely NEW
+        // connection — a port NOT in this set becoming connected — triggers a
+        // re-enumeration, so a keyboard added while the mouse stays plugged is
+        // noticed. Without this the poll loop only ever reacts to disconnects, so a
+        // second device added later would stay invisible until everything is
+        // unplugged. Ports already present (including a device that failed to
+        // enumerate) never re-trigger: `present` is recomputed each pass and
+        // includes them. A port whose device leaves has its bit cleared below, so
+        // re-plugging into the same port counts as new.
+        let mut present = 0u32;
+        for p in 1..=max_ports {
+            if mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10) & PORT_CCS != 0 {
+                present |= 1 << p;
+            }
+        }
         'poll: loop {
             // (Re-)arm each device's interrupt ring as needed.
             for d in 0..ndev {
@@ -771,6 +787,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     });
                     announce = true;
                     break 'poll;
+                }
+            }
+            // New-device detection: while we still have a free device slice, a port
+            // that was NOT connected at poll start becoming connected is a fresh
+            // plug — break and re-enumerate to bind it alongside the existing
+            // device(s). Tracks port leaves so a re-plug into the same port counts.
+            if ndev < MAX_HID {
+                for p in 1..=max_ports {
+                    let c = mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10) & PORT_CCS != 0;
+                    if c && present & (1 << p) == 0 {
+                        ctx.log_fmt(format_args!("xhci: new device on port {} — re-enumerating", p));
+                        announce = true;
+                        break 'poll;
+                    }
+                    if !c { present &= !(1 << p); }
                 }
             }
             ctx.yield_cpu();
