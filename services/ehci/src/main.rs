@@ -446,28 +446,48 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
     }
 }
 
+/// Run a control transfer, retrying up to `tries` times. The Logitech keyboard's
+/// control endpoint over the hub TT intermittently XactErrs/times out a split
+/// SETUP; control() rebuilds the QH/qTDs fresh each call, so a plain retry (with a
+/// short settle between) reliably gets it through. Used for the configuration
+/// transfers, which must all succeed before the keyboard is usable.
+fn control_retry(
+    ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
+    op: usize, ep: &Ep, setup: &[u8; 8], data_len: usize, in_dir: bool, tries: u32,
+) -> Option<usize> {
+    for _ in 0..tries {
+        if let Some(n) = control(ctx, mmio, dma, op, ep, setup, data_len, in_dir) {
+            return Some(n);
+        }
+        delay_cycles(ctx, RECOVERY_CYCLES); // let the TT settle before retrying
+    }
+    None
+}
+
 /// E5a — address, configure, and set boot protocol on the low-speed keyboard
 /// behind hub `port` (currently at the default address 0). Moves it to address 2
-/// and selects HID boot protocol so its reports are the fixed 8-byte format.
+/// and selects HID boot protocol so its reports are the fixed 8-byte format. Each
+/// transfer retries (control_retry) because this keyboard's split control endpoint
+/// is intermittently flaky — one failed SETUP must not abandon the whole keyboard.
 fn setup_keyboard(
     ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
     op: usize, port: u8, cfg_val: u8, iface: u8,
 ) -> bool {
     // Set_Address(2) — issued while still at address 0.
     let s = [0x00, 0x05, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00];
-    if control(ctx, mmio, dma, op, &Ep::low(0, 8, 1, port), &s, 0, false).is_none() {
-        ctx.log("ehci: kbd Set_Address failed"); return false;
+    if control_retry(ctx, mmio, dma, op, &Ep::low(0, 8, 1, port), &s, 0, false, 5).is_none() {
+        ctx.log("ehci: kbd Set_Address failed (5 tries)"); return false;
     }
     delay_cycles(ctx, RECOVERY_CYCLES); // SetAddress recovery
     // Set_Configuration.
     let s = [0x00, 0x09, cfg_val, 0x00, 0x00, 0x00, 0x00, 0x00];
-    if control(ctx, mmio, dma, op, &Ep::low(2, 8, 1, port), &s, 0, false).is_none() {
-        ctx.log("ehci: kbd Set_Configuration failed"); return false;
+    if control_retry(ctx, mmio, dma, op, &Ep::low(2, 8, 1, port), &s, 0, false, 5).is_none() {
+        ctx.log("ehci: kbd Set_Configuration failed (5 tries)"); return false;
     }
     // HID Set_Protocol(boot=0) on the interface (bmRequestType 0x21, bRequest 0x0B).
     let s = [0x21, 0x0B, 0x00, 0x00, iface, 0x00, 0x00, 0x00];
-    if control(ctx, mmio, dma, op, &Ep::low(2, 8, 1, port), &s, 0, false).is_none() {
-        ctx.log("ehci: kbd Set_Protocol(boot) failed"); return false;
+    if control_retry(ctx, mmio, dma, op, &Ep::low(2, 8, 1, port), &s, 0, false, 5).is_none() {
+        ctx.log("ehci: kbd Set_Protocol(boot) failed (5 tries)"); return false;
     }
     ctx.log_fmt(format_args!("ehci: keyboard configured (addr 2, cfg {}, boot protocol)", cfg_val));
     true
