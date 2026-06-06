@@ -103,7 +103,10 @@ fn wait_for_port(ctx: &ServiceContext, mmio: &Mmio, op: usize, max_ports: u32) {
 /// "\n" starts the notice on its own line; the injected newline supplies the
 /// terminating line break, so there is no blank line.
 fn notify(ctx: &ServiceContext, msg: &str) {
-    ctx.console_write("\nUSB: ");
+    // Leading "\n " — the space is sacrificial: the framebuffer drops the first
+    // glyph drawn on a freshly-scrolled line, so we let it eat a space, not the
+    // 'U' of "USB:". (Serial is unaffected.)
+    ctx.console_write("\n USB: ");
     ctx.console_write(msg);
     ctx.console_push(b'\n');
 }

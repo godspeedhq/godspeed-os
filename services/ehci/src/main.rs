@@ -211,7 +211,7 @@ const POLL_STRIDE: usize = 0x100; // QH @ +0x00, qTD @ +0x40, report buf @ +0x80
 /// error/timeout (with the qTD tokens logged). The async schedule stays enabled
 /// across calls; the single QH is idle between them.
 fn control(
-    ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
+    _ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
     op: usize, ep: &Ep, setup: &[u8; 8], data_len: usize, in_dir: bool,
 ) -> Option<usize> {
     dma.zero();
@@ -286,9 +286,11 @@ fn control(
     let t_status = dma.read32(QTD_STATUS + 0x08);
     let toks = t_setup | t_data | t_status;
     if !done || toks & (QTD_HALTED | QTD_ERRMASK) != 0 {
-        ctx.log_fmt(format_args!(
-            "ehci: control(req={:#04x}) FAILED done={} setup={:#010x} data={:#010x} status={:#010x}",
-            setup[1], done as u8, t_setup, t_data, t_status));
+        // A failed control transfer is normal on a faulty/dead low-speed port; the
+        // caller retries and logs one summary, so don't spam a line per attempt.
+        // (The per-stage tokens are kept here only as a comment trail for future
+        // debugging: setup={t_setup} data={t_data} status={t_status}.)
+        let _ = (t_setup, t_data, t_status);
         return None;
     }
     // Bytes actually moved = requested - (DATA token's remaining-bytes field).
@@ -402,6 +404,7 @@ fn scan_devices(
     let mut devs = [HidDev { addr: 0, port: 0, ep_num: 0, is_mouse: false }; MAX_HID];
     let mut ndev = 0usize;
     let mut next_addr = 2u8; // 1 is the hub; devices start at 2
+    let mut any_failed = false; // a connected port we couldn't enumerate (faulty port)
     for port in 1..=nports {
         // Status before reset.
         let setup = [0xA3, 0x00, 0x00, 0x00, port, 0x00, 0x04, 0x00]; // Get_Status
@@ -442,6 +445,7 @@ fn scan_devices(
         }
         if !got {
             ctx.log_fmt(format_args!("ehci: split descriptor on hub port {} failed after 3 resets", port));
+            any_failed = true;
             continue;
         }
         let vid = dma.read16(DATA_BUF + 8);
@@ -500,6 +504,13 @@ fn scan_devices(
             ndev += 1;
             next_addr += 1;
         }
+    }
+    // A connected device we couldn't bring up means a faulty back port (the T630
+    // hub has dead low-speed ports). Tell the user once so a dead-port plug isn't
+    // silent — but only when nothing else came up, so a working device alongside
+    // a dead one doesn't nag.
+    if any_failed && ndev == 0 {
+        notify(ctx, "a back-port device didn't enumerate (faulty port — try another)");
     }
     (devs, ndev)
 }
@@ -707,7 +718,10 @@ const DISCONNECT_ERR_THRESHOLD: u32 = 250;
 /// scrolled up; the leading "\n" starts it on its own line and the injected
 /// newline supplies the terminating break + triggers a fresh `gs> `.
 fn notify(ctx: &ServiceContext, msg: &str) {
-    ctx.console_write("\nUSB: ");
+    // Leading "\n " — the space is sacrificial: the framebuffer drops the first
+    // glyph drawn on a freshly-scrolled line, so we let it eat a space, not the
+    // 'U' of "USB:". (Serial is unaffected.)
+    ctx.console_write("\n USB: ");
     ctx.console_write(msg);
     ctx.console_push(b'\n');
 }
