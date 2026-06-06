@@ -353,30 +353,61 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
     ctx.log_fmt(format_args!(
         "ehci: HUB DESCRIPTOR ports={} characteristics={:#06x}", nports, hubchar));
 
-    // E3c-2 — power every downstream port (the hub does individual power
-    // switching), let power settle, then read each port's status to find the
-    // keyboard. A connected, low-speed port is our keyboard.
+    // E6 — hot-plug loop. The hub stays addressed/configured for the driver's
+    // lifetime; only the downstream devices come and go. Each pass: (re)scan the
+    // ports for boot HID devices, announce what connected, poll until one drops,
+    // announce the drop, and loop. With nothing attached we wait on the hub's port
+    // status for a new connection rather than busy-rescanning.
+    // The device present at boot is not a plug event, so its "connected" line is
+    // suppressed (keeps the boot screen clean); every later connect/disconnect is
+    // announced on the console.
+    let mut announce = false;
+    loop {
+        let (devs, ndev) = scan_devices(ctx, mmio, &dma, op, mps0, nports);
+        if ndev == 0 {
+            ctx.log("ehci: no boot keyboard/mouse attached — waiting for a connection");
+            wait_for_connection(ctx, mmio, &dma, op, mps0, nports);
+            announce = true; // whatever connects after a wait is a real plug event
+            continue;
+        }
+        if announce {
+            for d in &devs[..ndev] {
+                ctx.console_writeln_fmt(format_args!(
+                    "[usb] {} connected (ehci)", if d.is_mouse { "mouse" } else { "keyboard" }));
+            }
+        }
+        let gone = poll_devices(ctx, mmio, &dma, op, &devs[..ndev]);
+        ctx.console_writeln_fmt(format_args!(
+            "[usb] {} disconnected (ehci)", if devs[gone].is_mouse { "mouse" } else { "keyboard" }));
+        announce = true; // the next connect (after re-scan) is a real plug event
+        delay_cycles(ctx, DEBOUNCE_CYCLES); // let the port status settle before re-scan
+    }
+}
+
+/// Power the hub's downstream ports, then reset + enumerate every connected one,
+/// configuring each boot keyboard/mouse at a unique address. Returns the device
+/// table and how many were configured. Called once per (re)scan in the hot-plug
+/// loop — addressing each device (Set_Address moves it off the default address 0)
+/// before resetting the next port is what lets two devices coexist.
+fn scan_devices(
+    ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
+    op: usize, mps0: u32, nports: u8,
+) -> ([HidDev; MAX_HID], usize) {
+    // Power every downstream port (the hub does individual power switching), let
+    // power settle, then enumerate each connected port.
     for port in 1..=nports {
-        // Set_Feature(PORT_POWER=8) on the hub, wIndex = port.
-        let setup = [0x23, 0x03, 0x08, 0x00, port, 0x00, 0x00, 0x00];
-        let _ = control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &setup, 0, false);
+        let setup = [0x23, 0x03, 0x08, 0x00, port, 0x00, 0x00, 0x00]; // Set_Feature(PORT_POWER)
+        let _ = control(ctx, mmio, dma, op, &Ep::hs(1, mps0), &setup, 0, false);
     }
     delay_cycles(ctx, RESET_HOLD_CYCLES); // power-on-to-power-good settle (generous)
 
-    // E4/E5 — for EACH connected downstream port, reset it (arms the hub TT),
-    // read its device descriptor over SPLIT, identify the HID class, and — if it's
-    // a boot keyboard or mouse — give it a unique address and configure it. Every
-    // device is collected; the combined poll loop drives them all. Addressing each
-    // device (Set_Address moves it off the default address 0) before resetting the
-    // next port is what lets two devices coexist — only one device may sit at
-    // address 0 at a time.
     let mut devs = [HidDev { addr: 0, port: 0, ep_num: 0, is_mouse: false }; MAX_HID];
     let mut ndev = 0usize;
     let mut next_addr = 2u8; // 1 is the hub; devices start at 2
     for port in 1..=nports {
         // Status before reset.
         let setup = [0xA3, 0x00, 0x00, 0x00, port, 0x00, 0x04, 0x00]; // Get_Status
-        if control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &setup, 4, true).is_none() { continue; }
+        if control(ctx, mmio, dma, op, &Ep::hs(1, mps0), &setup, 4, true).is_none() { continue; }
         let status = dma.read16(DATA_BUF + 0);
         ctx.log_fmt(format_args!(
             "ehci: hub port {}: status={:#06x} connected={} low_speed={}",
@@ -393,20 +424,20 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
         for attempt in 1..=3u32 {
             delay_cycles(ctx, DEBOUNCE_CYCLES); // connect-debounce before reset
             let s = [0x23, 0x03, 0x04, 0x00, port, 0x00, 0x00, 0x00]; // Set_Feature(PORT_RESET)
-            let _ = control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &s, 0, false);
+            let _ = control(ctx, mmio, dma, op, &Ep::hs(1, mps0), &s, 0, false);
             delay_cycles(ctx, RESET_HOLD_CYCLES);
             let s = [0x23, 0x01, 0x14, 0x00, port, 0x00, 0x00, 0x00]; // Clear_Feature(C_PORT_RESET)
-            let _ = control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &s, 0, false);
+            let _ = control(ctx, mmio, dma, op, &Ep::hs(1, mps0), &s, 0, false);
             delay_cycles(ctx, RESET_HOLD_CYCLES); // generous post-reset recovery
 
             let s = [0xA3, 0x00, 0x00, 0x00, port, 0x00, 0x04, 0x00]; // Get_Status
-            let _ = control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &s, 4, true);
+            let _ = control(ctx, mmio, dma, op, &Ep::hs(1, mps0), &s, 4, true);
             let pstat = dma.read16(DATA_BUF + 0);
 
             // Retry the descriptor read several times within this reset before
             // re-resetting: this keyboard's FIRST split SETUP after a reset
             // XactErrs, but a settle-and-retry on the same reset often succeeds.
-            if control_retry(ctx, mmio, &dma, op, &kep, &dd, 18, true, 6).is_some() { got = true; break; }
+            if control_retry(ctx, mmio, dma, op, &kep, &dd, 18, true, 6).is_some() { got = true; break; }
             ctx.log_fmt(format_args!(
                 "ehci: hub port {} attempt {} failed (post-reset status={:#06x}) — re-resetting",
                 port, attempt, pstat));
@@ -424,7 +455,7 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
         // HID interface number/class/protocol (1=keyboard, 2=mouse) and the
         // interrupt-IN endpoint.
         let setup = [0x80, 0x06, 0x00, 0x02, 0x00, 0x00, 0x40, 0x00]; // Get_Descriptor(Config), 64
-        if control(ctx, mmio, &dma, op, &kep, &setup, 64, true).is_none() { continue; }
+        if control(ctx, mmio, dma, op, &kep, &setup, 64, true).is_none() { continue; }
         let cfg_val = dma.read8(DATA_BUF + 5);
         let mut o = 0usize;
         let (mut iface, mut iclass, mut iproto, mut ep_addr, mut ep_int) = (0u8, 0u8, 0u8, 0u8, 0u8);
@@ -451,9 +482,9 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
             "ehci: port {} HID iface={} class={:#x} protocol={} (1=kbd 2=mouse) int_ep={:#04x} interval={}",
             port, iface, iclass, iproto, ep_addr, ep_int));
 
-        // E5a — boot keyboard (proto 1) or boot mouse (proto 2): give it a unique
-        // address and configure it (boot protocol). Record it for the poll loop.
-        // Set_Address here moves it off address 0 before we reset the next port.
+        // Boot keyboard (proto 1) or mouse (proto 2): address + configure it (boot
+        // protocol) and record it. Set_Address moves it off address 0 before the
+        // next port is reset.
         let is_kbd   = iclass == 0x03 && iproto == 1;
         let is_mouse = iclass == 0x03 && iproto == 2;
         if !(is_kbd || is_mouse) {
@@ -466,18 +497,34 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
         }
         ctx.log_fmt(format_args!(
             "ehci: *** boot {} on hub port {} ***", if is_mouse { "MOUSE" } else { "KEYBOARD" }, port));
-        if setup_hid(ctx, mmio, &dma, op, port, next_addr, cfg_val, iface, is_mouse) {
+        if setup_hid(ctx, mmio, dma, op, port, next_addr, cfg_val, iface, is_mouse) {
             devs[ndev] = HidDev { addr: next_addr, port, ep_num: ep_addr & 0x0F, is_mouse };
             ndev += 1;
             next_addr += 1;
         }
     }
-    if ndev == 0 {
-        ctx.log("ehci: no boot keyboard/mouse found on any connected port");
-        return;
+    (devs, ndev)
+}
+
+/// Poll the hub's downstream port status until at least one reports a connected
+/// device, then return so the caller re-scans. Used while nothing is attached, so
+/// the async schedule is free for these control transfers to the hub.
+fn wait_for_connection(
+    ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
+    op: usize, mps0: u32, nports: u8,
+) {
+    loop {
+        for port in 1..=nports {
+            let setup = [0xA3, 0x00, 0x00, 0x00, port, 0x00, 0x04, 0x00]; // Get_Status
+            if control(ctx, mmio, dma, op, &Ep::hs(1, mps0), &setup, 4, true).is_some()
+                && dma.read16(DATA_BUF + 0) & 1 != 0
+            {
+                return; // something plugged in
+            }
+        }
+        delay_cycles(ctx, DEBOUNCE_CYCLES); // ~50 ms between polls
+        ctx.yield_cpu();
     }
-    // E5b — poll all configured devices together; never returns.
-    poll_devices(ctx, mmio, &dma, op, &devs[..ndev]);
 }
 
 /// Run a control transfer, retrying up to `tries` times. The Logitech keyboard's
@@ -545,9 +592,12 @@ fn arm_int(dma: &godspeed_sdk::Dma, qh: usize, toggle: u32) {
     dma.write32(qh + 0x18, 0);                           // clear overlay token
 }
 
-/// E5b — poll every configured HID device's interrupt-IN endpoint over split
-/// transactions and act on the reports (keystrokes → console, mouse → log). Never
-/// returns: this is the driver's steady state.
+/// E5b/E6 — poll every configured HID device's interrupt-IN endpoint over split
+/// transactions and act on the reports (keystrokes → console, mouse → log).
+/// Returns the index of the first device that stops responding — when a device is
+/// unplugged its split transactions error (the hub TT gets no downstream response)
+/// instead of NAK'ing, so a run of errored completions means it's gone. The
+/// hot-plug loop announces the drop and re-scans.
 ///
 /// Each device gets its own QH; the QHs are linked into one async ring (so the
 /// controller services them all every pass) with the first marked head of the
@@ -560,7 +610,7 @@ fn arm_int(dma: &godspeed_sdk::Dma, qh: usize, toggle: u32) {
 fn poll_devices(
     ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
     op: usize, devs: &[HidDev],
-) -> ! {
+) -> usize {
     let n = devs.len();
     ctx.log_fmt(format_args!(
         "ehci: polling {} device(s) — type at the gs> prompt; mouse events log here", n));
@@ -593,6 +643,7 @@ fn poll_devices(
     wait(mmio, op + OP_USBSTS, STS_ASS, true);
 
     let mut toggle = [0u32; MAX_HID];
+    let mut err = [0u32; MAX_HID];                        // consecutive errored completions
     let mut kb_last = [0u8; 6];                           // keyboard edge-detection state
     let mut mouse = godspeed_sdk::hid::MouseTracker::new(); // mouse button/motion state
     loop {
@@ -617,12 +668,28 @@ fn poll_devices(
                     godspeed_sdk::hid::decode_keyboard(&rep, &mut kb_last, |ch| ctx.console_push(ch));
                 }
                 toggle[i] ^= 1;            // successful IN flips the data toggle
+                err[i] = 0;               // a good report clears the error run
+            } else {
+                // Errored completion. A present, idle device NAKs (the qTD stays
+                // ACTIVE and we `continue` above) — it never completes with error.
+                // A sustained run of errored completions therefore means the device
+                // was unplugged: report it so the hot-plug loop re-scans.
+                err[i] += 1;
+                if err[i] >= DISCONNECT_ERR_THRESHOLD {
+                    return i;
+                }
             }
             arm_int(dma, qh, toggle[i]);  // re-arm (on success or error alike)
         }
         ctx.yield_cpu();
     }
 }
+
+/// Consecutive errored interrupt completions before a device is declared
+/// unplugged. A present device never errors (it NAKs while idle), so this only
+/// trips on a real disconnect; the bound rides out the odd transient glitch. At
+/// roughly a few milliseconds per errored split this is well under a second.
+const DISCONNECT_ERR_THRESHOLD: u32 = 250;
 
 /// Busy-wait roughly `cycles` TSC ticks. Used for the millisecond-scale USB reset
 /// timings. Overestimated against the T630's ~2 GHz so the >= 50 ms reset hold is
