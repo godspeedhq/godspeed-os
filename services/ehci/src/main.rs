@@ -707,7 +707,7 @@ const DISCONNECT_ERR_THRESHOLD: u32 = 250;
 /// scrolled up; the leading "\n" starts it on its own line and the injected
 /// newline supplies the terminating break + triggers a fresh `gs> `.
 fn notify(ctx: &ServiceContext, msg: &str) {
-    ctx.console_write("\n[usb] ");
+    ctx.console_write("\nUSB: ");
     ctx.console_write(msg);
     ctx.console_push(b'\n');
 }
