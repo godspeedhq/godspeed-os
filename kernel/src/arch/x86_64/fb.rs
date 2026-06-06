@@ -61,12 +61,15 @@ struct Fb {
     csi_params: [u16; 3],// numeric parameters (e.g. row;col)
     csi_nparam: usize,   // count of parameters accumulated
     cursor_visible: bool,// draw the underline cursor (off for full-screen apps)
+    cur_col: usize,      // column where the cursor underline was last drawn
+    cur_row: usize,      // row where the cursor underline was last drawn
 }
 
 static FB: SpinLock<Fb> = SpinLock::new(Fb {
     base: 0, pitch: 0, bpp: 0, width: 0, height: 0,
     org_x: 0, org_y: 0, cols: 0, rows: 0, col: 0, row: 0, fg: 0, bg: 0, ready: false,
     esc: 0, csi_priv: false, csi_params: [0; 3], csi_nparam: 0, cursor_visible: true,
+    cur_col: 0, cur_row: 0,
 });
 
 /// Safe-area inset per edge, as a percentage of each dimension. TVs overscan
@@ -125,7 +128,7 @@ pub fn clear_and_home() {
     s.row = 0;
     s.esc = 0;
     if s.cursor_visible {
-        draw_cursor(&s);
+        draw_cursor(&mut s);
     }
 }
 
@@ -206,9 +209,17 @@ fn process_byte(s: &mut Fb, b: u8) {
     if s.cursor_visible {
         erase_cursor(s);
     }
+    // Carriage return moves to column 0, which usually still holds drawn text
+    // (e.g. the prompt). Stamping the cursor there and erasing it on the next byte
+    // would blank that text, so a `\r` does not redraw the cursor — the next glyph
+    // write or the newline's fresh line will place it.
+    let mut redraw_cursor = true;
     match b {
         b'\n' => advance_line(s),
-        b'\r' => s.col = 0,
+        b'\r' => {
+            s.col = 0;
+            redraw_cursor = false;
+        }
         0x08 | 0x7f => {
             if s.col > 0 {
                 s.col -= 1;
@@ -228,7 +239,7 @@ fn process_byte(s: &mut Fb, b: u8) {
     // The cursor follows the write position: a steady underline at the cell where
     // the next character will land. Framebuffer only — a serial terminal draws its
     // own cursor. Full-screen apps hide it via ESC[?25l.
-    if s.cursor_visible {
+    if s.cursor_visible && redraw_cursor {
         draw_cursor(s);
     }
 }
@@ -342,14 +353,22 @@ fn erase_to_end_of_screen(s: &Fb) {
     }
 }
 
-/// Draw the text cursor (a steady underline) at the current write position.
-fn draw_cursor(s: &Fb) {
+/// Draw the text cursor (a steady underline) at the current write position, and
+/// remember where it landed so `erase_cursor` can blank exactly that cell later —
+/// even after the write position has since moved (e.g. a carriage return).
+fn draw_cursor(s: &mut Fb) {
     draw_glyph(s, b'_', s.col, s.row);
+    s.cur_col = s.col;
+    s.cur_row = s.row;
 }
 
-/// Erase the cursor at the current write position (blank the cell).
+/// Erase the cursor at the cell where it was last drawn (blank it). Using the
+/// remembered position — not the current write position — is what stops a
+/// carriage return from blanking real text: after `\r` moves the column to 0 over
+/// existing characters, the cursor is still erased at its old cell, leaving the
+/// text (the `g` of `gs>`) intact.
 fn erase_cursor(s: &Fb) {
-    draw_glyph(s, b' ', s.col, s.row);
+    draw_glyph(s, b' ', s.cur_col, s.cur_row);
 }
 
 /// Move the cursor to the start of the next row, scrolling if at the bottom.
