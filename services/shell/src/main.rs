@@ -119,6 +119,9 @@ fn execute(ctx: &ServiceContext, line: &[u8]) {
     match args[0] {
         "help"    => cmd_help(ctx),
         "clear"   => cmd_clear(ctx),
+        "echo"    => cmd_echo(ctx, s["echo".len()..].trim()),
+        "about"   => cmd_about(ctx),
+        "mem"     => cmd_mem(ctx),
         "cores"   => cmd_cores(ctx),
         "status"  => cmd_status(ctx),
         "observe" => {
@@ -129,7 +132,9 @@ fn execute(ctx: &ServiceContext, line: &[u8]) {
             }
         }
         "caps"    => {
-            if argc < 2 { ctx.console_writeln("usage: caps <service>"); }
+            // No argument → show the shell's OWN capabilities (authority is
+            // explicit; the shell can inspect itself like any other service).
+            if argc < 2 { cmd_caps(ctx, "shell"); }
             else { cmd_caps(ctx, args[1]); }
         }
         "spawn"   => {
@@ -160,18 +165,36 @@ fn execute(ctx: &ServiceContext, line: &[u8]) {
 }
 
 fn cmd_help(ctx: &ServiceContext) {
-    ctx.console_writeln("GodspeedOS shell commands:");
-    ctx.console_writeln("  help                   show this message");
-    ctx.console_writeln("  clear                  clear the screen");
-    ctx.console_writeln("  cores                  show core count");
-    ctx.console_writeln("  status                 list all live tasks");
-    ctx.console_writeln("  observe                live system view (press q to quit)");
-    ctx.console_writeln("  observe now            one-shot system-metrics frame");
-    ctx.console_writeln("  caps <service>         list a service's capabilities");
-    ctx.console_writeln("  spawn <name>           spawn a service");
-    ctx.console_writeln("  kill <name>            kill a service");
-    ctx.console_writeln("  restart <name> [core]  restart a service");
-    ctx.console_writeln("  reboot                 hardware reset");
+    ctx.console_writeln("GodspeedOS shell commands");
+    ctx.console_writeln("");
+    ctx.console_writeln("Console");
+    help_line(ctx, "help", "show this message");
+    help_line(ctx, "clear", "clear the screen");
+    help_line(ctx, "echo <text>", "print text");
+    ctx.console_writeln("");
+    ctx.console_writeln("System");
+    help_line(ctx, "about", "identity + credits");
+    help_line(ctx, "cores", "CPU core count");
+    help_line(ctx, "mem", "physical memory usage");
+    ctx.console_writeln("");
+    ctx.console_writeln("Services");
+    help_line(ctx, "status", "list all live tasks");
+    help_line(ctx, "observe [now]", "live view (q to quit) / one-shot frame");
+    help_line(ctx, "caps [service]", "capabilities (default: this shell)");
+    help_line(ctx, "spawn <name>", "start a service");
+    help_line(ctx, "kill <name>", "stop a service");
+    help_line(ctx, "restart <name> [core]", "restart a service");
+    ctx.console_writeln("");
+    ctx.console_writeln("Power");
+    help_line(ctx, "reboot", "hardware reset");
+}
+
+/// One "  command  description" row. The command is left-justified to a fixed
+/// width with format padding so every description column lines up exactly — no
+/// hand-counted spaces, and ASCII-only so it renders identically on the TV
+/// framebuffer (whose font is ASCII) and a serial terminal.
+fn help_line(ctx: &ServiceContext, cmd: &str, desc: &str) {
+    ctx.console_writeln_fmt(format_args!("  {:<21}  {}", cmd, desc));
 }
 
 /// Clear the screen. Emits ANSI erase-display + cursor-home: the framebuffer
@@ -179,6 +202,32 @@ fn cmd_help(ctx: &ServiceContext) {
 /// does too, so both surfaces clear. The shell loop reprints the prompt after.
 fn cmd_clear(ctx: &ServiceContext) {
     ctx.console_write("\x1b[2J\x1b[H");
+}
+
+/// Print the rest of the line verbatim.
+fn cmd_echo(ctx: &ServiceContext, text: &str) {
+    ctx.console_writeln(text);
+}
+
+/// One-line identity for the system.
+fn cmd_about(ctx: &ServiceContext) {
+    ctx.console_writeln("GodspeedOS: a capability-based microkernel (v1 milestone)");
+    ctx.console_writeln_fmt(format_args!("  running on {} core(s)", ctx.inspect_core_count()));
+    ctx.console_writeln("  Created by Bankole Ogundero.");
+}
+
+/// Physical-memory usage, straight from the kernel's frame allocator (held via
+/// the INTROSPECT cap). Frames are 4 KiB pages: KiB = frames*4, MiB = frames/256.
+/// The percentage is computed in hundredths (two decimals, integer math) so the
+/// microkernel's tiny footprint shows as e.g. 0.03% rather than rounding to 0%.
+fn cmd_mem(ctx: &ServiceContext) {
+    let total = ctx.inspect_kernel_total_frames();
+    let free = ctx.inspect_kernel_free_frames();
+    let used = total.saturating_sub(free);
+    let pct_h = if total > 0 { used * 10000 / total } else { 0 }; // 0.01% units
+    ctx.console_writeln_fmt(format_args!(
+        "mem: {} KiB used / {} MiB total ({}.{:02}% used, {} MiB free)",
+        used * 4, total / 256, pct_h / 100, pct_h % 100, free / 256));
 }
 
 fn cmd_reboot(ctx: &ServiceContext) -> ! {
