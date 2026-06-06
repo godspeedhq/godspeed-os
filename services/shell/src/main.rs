@@ -118,6 +118,7 @@ fn execute(ctx: &ServiceContext, line: &[u8]) {
 
     match args[0] {
         "help"    => cmd_help(ctx),
+        "clear"   => cmd_clear(ctx),
         "cores"   => cmd_cores(ctx),
         "status"  => cmd_status(ctx),
         "observe" => {
@@ -161,6 +162,7 @@ fn execute(ctx: &ServiceContext, line: &[u8]) {
 fn cmd_help(ctx: &ServiceContext) {
     ctx.console_writeln("GodspeedOS shell commands:");
     ctx.console_writeln("  help                   show this message");
+    ctx.console_writeln("  clear                  clear the screen");
     ctx.console_writeln("  cores                  show core count");
     ctx.console_writeln("  status                 list all live tasks");
     ctx.console_writeln("  observe                live system view (press q to quit)");
@@ -170,6 +172,13 @@ fn cmd_help(ctx: &ServiceContext) {
     ctx.console_writeln("  kill <name>            kill a service");
     ctx.console_writeln("  restart <name> [core]  restart a service");
     ctx.console_writeln("  reboot                 hardware reset");
+}
+
+/// Clear the screen. Emits ANSI erase-display + cursor-home: the framebuffer
+/// console honours `ESC[2J` (clear + home) and `ESC[H`, and a serial terminal
+/// does too, so both surfaces clear. The shell loop reprints the prompt after.
+fn cmd_clear(ctx: &ServiceContext) {
+    ctx.console_write("\x1b[2J\x1b[H");
 }
 
 fn cmd_reboot(ctx: &ServiceContext) -> ! {
