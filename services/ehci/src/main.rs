@@ -399,41 +399,77 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
             "ehci: SPLIT device (hub port {}): VID={:#06x} PID={:#06x}", port, vid, pid));
         found = true;
 
-        // Read the config descriptor to identify the device: HID interface
-        // class/protocol (1=keyboard, 2=mouse) and the interrupt-IN endpoint.
+        // Read the config descriptor to identify the device: configuration value,
+        // HID interface number/class/protocol (1=keyboard, 2=mouse) and the
+        // interrupt-IN endpoint.
         let setup = [0x80, 0x06, 0x00, 0x02, 0x00, 0x00, 0x40, 0x00]; // Get_Descriptor(Config), 64
-        if control(ctx, mmio, &dma, op, &kep, &setup, 64, true).is_some() {
-            let mut o = 0usize;
-            let (mut iclass, mut iproto, mut ep_addr, mut ep_int) = (0u8, 0u8, 0u8, 0u8);
-            while o + 2 <= 64 {
-                let blen = dma.read8(DATA_BUF + o) as usize;
-                if blen == 0 { break; }
-                match dma.read8(DATA_BUF + o + 1) {
-                    0x04 if o + 8 <= 64 && iclass == 0 => {       // interface
-                        iclass = dma.read8(DATA_BUF + o + 5);
-                        iproto = dma.read8(DATA_BUF + o + 7);
-                    }
-                    0x05 if o + 7 <= 64 && ep_addr == 0 => {      // endpoint
-                        if dma.read8(DATA_BUF + o + 3) & 0x03 == 0x03 { // interrupt
-                            ep_addr = dma.read8(DATA_BUF + o + 2);
-                            ep_int  = dma.read8(DATA_BUF + o + 6);
-                        }
-                    }
-                    _ => {}
+        if control(ctx, mmio, &dma, op, &kep, &setup, 64, true).is_none() { continue; }
+        let cfg_val = dma.read8(DATA_BUF + 5);
+        let mut o = 0usize;
+        let (mut iface, mut iclass, mut iproto, mut ep_addr, mut ep_int) = (0u8, 0u8, 0u8, 0u8, 0u8);
+        while o + 2 <= 64 {
+            let blen = dma.read8(DATA_BUF + o) as usize;
+            if blen == 0 { break; }
+            match dma.read8(DATA_BUF + o + 1) {
+                0x04 if o + 8 <= 64 && iclass == 0 => {       // interface
+                    iface  = dma.read8(DATA_BUF + o + 2);
+                    iclass = dma.read8(DATA_BUF + o + 5);
+                    iproto = dma.read8(DATA_BUF + o + 7);
                 }
-                o += blen;
+                0x05 if o + 7 <= 64 && ep_addr == 0 => {      // endpoint
+                    if dma.read8(DATA_BUF + o + 3) & 0x03 == 0x03 { // interrupt
+                        ep_addr = dma.read8(DATA_BUF + o + 2);
+                        ep_int  = dma.read8(DATA_BUF + o + 6);
+                    }
+                }
+                _ => {}
             }
-            ctx.log_fmt(format_args!(
-                "ehci: port {} HID class={:#x} protocol={} (1=kbd 2=mouse) int_ep={:#04x} interval={}",
-                port, iclass, iproto, ep_addr, ep_int));
-            if iclass == 0x03 && iproto == 1 {
-                ctx.log_fmt(format_args!("ehci: *** boot KEYBOARD on hub port {} -> E4b/E5 ***", port));
+            o += blen;
+        }
+        ctx.log_fmt(format_args!(
+            "ehci: port {} HID iface={} class={:#x} protocol={} (1=kbd 2=mouse) int_ep={:#04x} interval={}",
+            port, iface, iclass, iproto, ep_addr, ep_int));
+
+        // E5a — if it's a boot keyboard, address + configure it and set boot
+        // protocol. (E5b will poll its interrupt endpoint and decode keystrokes.)
+        if iclass == 0x03 && iproto == 1 {
+            ctx.log_fmt(format_args!("ehci: *** boot KEYBOARD on hub port {} ***", port));
+            if setup_keyboard(ctx, mmio, &dma, op, port, cfg_val, iface) {
+                ctx.log("ehci: keyboard ready — (E5b will poll keys next)");
             }
+            break;
         }
     }
     if !found {
         ctx.log("ehci: no device descriptor read over split on any connected port");
     }
+}
+
+/// E5a — address, configure, and set boot protocol on the low-speed keyboard
+/// behind hub `port` (currently at the default address 0). Moves it to address 2
+/// and selects HID boot protocol so its reports are the fixed 8-byte format.
+fn setup_keyboard(
+    ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
+    op: usize, port: u8, cfg_val: u8, iface: u8,
+) -> bool {
+    // Set_Address(2) — issued while still at address 0.
+    let s = [0x00, 0x05, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00];
+    if control(ctx, mmio, dma, op, &Ep::low(0, 8, 1, port), &s, 0, false).is_none() {
+        ctx.log("ehci: kbd Set_Address failed"); return false;
+    }
+    delay_cycles(ctx, RECOVERY_CYCLES); // SetAddress recovery
+    // Set_Configuration.
+    let s = [0x00, 0x09, cfg_val, 0x00, 0x00, 0x00, 0x00, 0x00];
+    if control(ctx, mmio, dma, op, &Ep::low(2, 8, 1, port), &s, 0, false).is_none() {
+        ctx.log("ehci: kbd Set_Configuration failed"); return false;
+    }
+    // HID Set_Protocol(boot=0) on the interface (bmRequestType 0x21, bRequest 0x0B).
+    let s = [0x21, 0x0B, 0x00, 0x00, iface, 0x00, 0x00, 0x00];
+    if control(ctx, mmio, dma, op, &Ep::low(2, 8, 1, port), &s, 0, false).is_none() {
+        ctx.log("ehci: kbd Set_Protocol(boot) failed"); return false;
+    }
+    ctx.log_fmt(format_args!("ehci: keyboard configured (addr 2, cfg {}, boot protocol)", cfg_val));
+    true
 }
 
 /// Busy-wait roughly `cycles` TSC ticks. Used for the millisecond-scale USB reset
