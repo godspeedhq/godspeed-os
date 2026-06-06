@@ -321,6 +321,25 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut cfg_val = 0u8;
     let mut kbd_iface = 0u8; // bInterfaceNumber of the bound boot-keyboard interface
 
+    // --- Port census (back-USB diagnostic) ---
+    // Log EVERY root-hub port's PORTSC, connected or not, BEFORE we start binding.
+    // This tells us exactly which xHCI ports are live when a keyboard is plugged
+    // into a back socket: if a back-port keyboard shows connected=1 here, it's an
+    // xHCI port we can enumerate (a driver fix); if NO xHCI port reacts to the
+    // back socket, that connector hangs off the EHCI controller (00:12.0), which
+    // this driver does not drive — a much bigger piece of work. CCS=bit0,
+    // PED=bit1, speed=bits10-13.
+    for p in 1..=max_ports {
+        let psc = mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10);
+        ctx.log_fmt(format_args!(
+            "xhci: port census {}/{}: PORTSC={:#010x} connected={} enabled={} speed={}",
+            p, max_ports, psc,
+            (psc & PORT_CCS != 0) as u8,
+            (psc & (1 << 1) != 0) as u8,
+            (psc >> 10) & 0xF,
+        ));
+    }
+
     'ports: for p in 1..=max_ports {
         let portsc_off = op + OP_PORTSC_BASE + (p as usize - 1) * 0x10;
         let psc = mmio.read32(portsc_off);

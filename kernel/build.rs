@@ -36,6 +36,7 @@ fn main() {
         ("OBSERVE",    "observe"),
         ("SHELL",      "shell"),
         ("XHCI",       "xhci"),
+        ("EHCI",       "ehci"),
     ];
 
     for (env_name, bin_name) in services {

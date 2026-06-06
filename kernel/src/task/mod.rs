@@ -124,7 +124,7 @@ struct ServiceContextData {
     core_id:            u32,
     probe_mode:         u32,
     console_read_slot:  u32, // u32::MAX = not present; slot index if service has console_read cap
-    xhci_mmio_va:       u64, // 0 = not mapped; else VA where the xHCI BAR is mapped (§12)
+    xhci_mmio_va:       u64, // 0 = not mapped; else VA of the driver's controller BAR — xHCI or EHCI (§12)
     xhci_dma_va:        u64, // 0 = none; else VA of the driver's DMA arena (§12)
     xhci_dma_phys:      u64, // physical base of the DMA arena (programmed into the device)
     xhci_dma_len:       u64, // length of the DMA arena in bytes
@@ -303,6 +303,20 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  false,
             // Pin to core 1: the poll loop busy-spins (no interrupt wired yet),
             // so keep it off core 0 where the shell + TCB live (§9.2).
+            preferred_core:    1,
+            probe_mode:        0,
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
+        // `ehci` — userspace USB 2.0 driver (§12) for the back ports' EHCI
+        // controller. Same shape as `xhci`; the kernel grants its MMIO/DMA at
+        // spawn (E1b+). Pinned to core 1, off the shell/TCB on core 0.
+        "ehci" => Some(("ehci", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_EHCI_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
             preferred_core:    1,
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
@@ -2744,9 +2758,10 @@ fn spawn_service_with_config(
     }
 
     // The USB keyboard driver gets a CONSOLE_PUSH cap so it can inject decoded
-    // keystrokes into the console input ring (§12). Name-gated to `xhci`.
+    // keystrokes into the console input ring (§12). Both USB drivers hold it —
+    // `xhci` for front-port keyboards, `ehci` for the back-port (USB 2.0) ones.
     let mut console_push_slot_u32 = u32::MAX;
-    if name == "xhci" {
+    if name == "xhci" || name == "ehci" {
         let cp_cap = mint_cap(CONSOLE_PUSH_RESOURCE, Rights::WRITE);
         let cap_slot = caps.insert(cp_cap)
             .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
@@ -2824,36 +2839,54 @@ fn spawn_service_with_config(
     // 6a. Map the xHCI controller's MMIO BAR into the driver's address space
     // (§12). Name-gated: only the `xhci` service receives it, and only if the
     // PCI scan found a controller. Device registers must be uncached (PCD|PWT).
-    let xhci_mmio_va = if name == "xhci"
-        && crate::arch::x86_64::pci::XHCI_FOUND.load(core::sync::atomic::Ordering::Relaxed)
-    {
-        let bar =
-            crate::arch::x86_64::pci::XHCI_MMIO_BASE.load(core::sync::atomic::Ordering::Relaxed);
-        let mmio_flags = PageFlags::PRESENT
-            | PageFlags::WRITABLE
-            | PageFlags::USER
-            | PageFlags::NO_EXEC
-            | PageFlags::PCD
-            | PageFlags::PWT;
-        for i in 0..XHCI_MMIO_PAGES {
-            let off = i * PAGE_SIZE as u64;
-            page_table
-                .map(VirtAddr(XHCI_MMIO_VA + off), PhysAddr(bar + off), mmio_flags)
-                .map_err(|_| SpawnError::MapFailed)?;
+    // Map the USB host-controller BAR for a driver service into its address space
+    // at XHCI_MMIO_VA. Both the xhci and ehci drivers use this one window — a
+    // service holds exactly one controller, and each has its own address space, so
+    // the shared VA + ctx field (`xhci_mmio_va`, read by `ctx.xhci_mmio()` /
+    // `ctx.ehci_mmio()`) is unambiguous (§12).
+    let xhci_mmio_va = {
+        use core::sync::atomic::Ordering::Relaxed;
+        use crate::arch::x86_64::pci;
+        let bar = if name == "xhci" && pci::XHCI_FOUND.load(Relaxed) {
+            pci::XHCI_MMIO_BASE.load(Relaxed)
+        } else if name == "ehci" && pci::EHCI_FOUND.load(Relaxed) {
+            pci::EHCI_MMIO_BASE.load(Relaxed)
+        } else {
+            0
+        };
+        if bar != 0 {
+            let mmio_flags = PageFlags::PRESENT
+                | PageFlags::WRITABLE
+                | PageFlags::USER
+                | PageFlags::NO_EXEC
+                | PageFlags::PCD
+                | PageFlags::PWT;
+            for i in 0..XHCI_MMIO_PAGES {
+                let off = i * PAGE_SIZE as u64;
+                page_table
+                    .map(VirtAddr(XHCI_MMIO_VA + off), PhysAddr(bar + off), mmio_flags)
+                    .map_err(|_| SpawnError::MapFailed)?;
+            }
+            crate::kprintln!("spawn[mmio]: '{}' BAR {:#x} -> VA {:#x}", name, bar, XHCI_MMIO_VA);
+            XHCI_MMIO_VA
+        } else {
+            0
         }
-        crate::kprintln!("spawn[mmio]: 'xhci' BAR {:#x} -> VA {:#x}", bar, XHCI_MMIO_VA);
-        XHCI_MMIO_VA
-    } else {
-        0
     };
 
     // 6b. Allocate + map a physically-contiguous DMA arena for the xHCI driver
     // (§12). The controller DMAs into this memory (rings/contexts), so the driver
     // needs both the VA (to build structures) and the physical base (to program
     // the controller). Normal cacheable mapping — x86 DMA is cache-coherent.
-    let (xhci_dma_va, xhci_dma_phys, xhci_dma_len) = if name == "xhci"
-        && crate::arch::x86_64::pci::XHCI_FOUND.load(core::sync::atomic::Ordering::Relaxed)
-    {
+    // Grant a physically-contiguous DMA arena to a USB driver (xhci or ehci) for
+    // its queue structures. Shared VA/fields, separate address spaces (§12).
+    let dma_for_driver = {
+        use core::sync::atomic::Ordering::Relaxed;
+        use crate::arch::x86_64::pci;
+        (name == "xhci" && pci::XHCI_FOUND.load(Relaxed))
+            || (name == "ehci" && pci::EHCI_FOUND.load(Relaxed))
+    };
+    let (xhci_dma_va, xhci_dma_phys, xhci_dma_len) = if dma_for_driver {
         match crate::memory::allocator::alloc_contiguous(XHCI_DMA_PAGES as usize) {
             Some(phys) => {
                 let flags = PageFlags::PRESENT
@@ -2868,13 +2901,13 @@ fn spawn_service_with_config(
                 }
                 let len = XHCI_DMA_PAGES * PAGE_SIZE as u64;
                 crate::kprintln!(
-                    "spawn[dma]: 'xhci' arena phys {:#x} -> VA {:#x} ({} KiB)",
-                    phys, XHCI_DMA_VA, len / 1024
+                    "spawn[dma]: '{}' arena phys {:#x} -> VA {:#x} ({} KiB)",
+                    name, phys, XHCI_DMA_VA, len / 1024
                 );
                 (XHCI_DMA_VA, phys, len)
             }
             None => {
-                crate::kprintln!("spawn[dma]: 'xhci' WARN: no contiguous DMA arena");
+                crate::kprintln!("spawn[dma]: '{}' WARN: no contiguous DMA arena", name);
                 (0, 0, 0)
             }
         }

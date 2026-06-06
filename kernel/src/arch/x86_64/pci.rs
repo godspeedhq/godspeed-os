@@ -19,6 +19,7 @@ const CONFIG_DATA: u16 = 0xCFC;
 const CLASS_SERIAL_BUS: u8 = 0x0C;
 const SUBCLASS_USB: u8 = 0x03;
 const PROGIF_XHCI: u8 = 0x30;
+const PROGIF_EHCI: u8 = 0x20;
 
 /// Discovered-xHCI record. Written once by `init` on the BSP during boot,
 /// read later when minting the driver's caps. Plain atomics: single writer at
@@ -32,6 +33,13 @@ pub static XHCI_IRQ: AtomicU8 = AtomicU8::new(0);
 pub static XHCI_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static XHCI_BASES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 pub static XHCI_IRQS: [AtomicU8; 4] = [const { AtomicU8::new(0) }; 4];
+
+/// Discovered EHCI (USB 2.0) controller — the T630's back ports hang off it
+/// (§12). The userspace `ehci` driver gets this BAR mapped at spawn, exactly as
+/// the `xhci` driver gets the xHCI BAR. First EHCI found wins.
+pub static EHCI_FOUND: AtomicBool = AtomicBool::new(false);
+pub static EHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
+pub static EHCI_IRQ: AtomicU8 = AtomicU8::new(0);
 
 /// Write a 32-bit value to an I/O port.
 ///
@@ -122,6 +130,12 @@ pub fn init() {
                             XHCI_IRQS[n].store(irq, Ordering::Relaxed);
                             XHCI_COUNT.store((n + 1) as u32, Ordering::Relaxed);
                         }
+                    }
+                    // Record the first EHCI controller (T630 back ports, §12).
+                    if progif == PROGIF_EHCI && !EHCI_FOUND.load(Ordering::Relaxed) {
+                        EHCI_MMIO_BASE.store(mmio_base, Ordering::Relaxed);
+                        EHCI_IRQ.store(irq, Ordering::Relaxed);
+                        EHCI_FOUND.store(true, Ordering::Relaxed);
                     }
                 }
             }

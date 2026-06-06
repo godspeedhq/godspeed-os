@@ -107,6 +107,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
     let _ = ctx.spawn("xhci");
 
+    // ehci: USB 2.0 host-controller driver (§12) for the back ports. Same builds
+    // as xhci; the kernel grants its MMIO/DMA at spawn (E1b+).
+    #[cfg(not(any(feature = "identity-only", feature = "perf-only",
+                  feature = "perf-brutal-only", feature = "stress-only",
+                  feature = "adv-only", feature = "chaos-only",
+                  feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
+    let _ = ctx.spawn("ehci");
+
     ctx.log("supervisor: ready");
 
     // Park (block forever) instead of busy-yielding so core 0 can halt and run
