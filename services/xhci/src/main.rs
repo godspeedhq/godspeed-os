@@ -70,6 +70,47 @@ fn spin<F: Fn() -> bool>(cond: F) {
     }
 }
 
+/// Wait until a port reports a *newly* connected device, then return so the caller
+/// re-scans. Snapshots the ports already connected on entry (e.g. the USB boot
+/// drive, which is always present and is not a HID) and only returns when a port
+/// that was NOT connected becomes connected — otherwise an always-present non-HID
+/// device would make the hot-plug loop spin (re-scan → not a keyboard → wait →
+/// still connected → re-scan …).
+fn wait_for_port(ctx: &ServiceContext, mmio: &Mmio, op: usize, max_ports: u32) {
+    let connected = |p: u32| {
+        mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10) & PORT_CCS != 0
+    };
+    let mut base = 0u32;
+    for p in 1..=max_ports {
+        if connected(p) { base |= 1 << p; }
+    }
+    loop {
+        for p in 1..=max_ports {
+            let c = connected(p);
+            if c && base & (1 << p) == 0 {
+                return; // a new device appeared on port p
+            }
+            if !c { base &= !(1 << p); } // a known device left; its port can be reused
+        }
+        ctx.yield_cpu();
+    }
+}
+
+/// Print a hot-plug notice on the console, then nudge the shell to redraw its
+/// prompt. The notice is asynchronous output that lands wherever the cursor was,
+/// leaving the prompt scrolled up; injecting a newline into the input ring (which
+/// this driver already feeds) makes the shell print a fresh `gs> `. The leading
+/// "\n" starts the notice on its own line; the injected newline supplies the
+/// terminating line break, so there is no blank line.
+fn notify(ctx: &ServiceContext, msg: &str) {
+    // Leading "\n " — the space is sacrificial: the framebuffer drops the first
+    // glyph drawn on a freshly-scrolled line, so we let it eat a space, not the
+    // 'U' of "USB:". (Serial is unaffected.)
+    ctx.console_write("\n USB: ");
+    ctx.console_write(msg);
+    ctx.console_push(b'\n');
+}
+
 fn idle(ctx: &ServiceContext) -> ! {
     // Degraded terminal path (no controller / no DMA / no keyboard). Still report
     // input-ready so the shell's boot-screen auto-clear fires — boot is "done" as
@@ -247,39 +288,50 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         version, max_slots, max_ports, ctx_size, dboff, rtsoff
     ));
 
-    // Reset.
-    let cmd = mmio.read32(op + OP_USBCMD);
-    mmio.write32(op + OP_USBCMD, cmd & !CMD_RS);
-    spin(|| mmio.read32(op + OP_USBSTS) & STS_HCH != 0);
-    mmio.write32(op + OP_USBCMD, CMD_HCRST);
-    spin(|| {
-        mmio.read32(op + OP_USBCMD) & CMD_HCRST == 0 && mmio.read32(op + OP_USBSTS) & STS_CNR == 0
-    });
+    // Hot-plug state that persists across passes.
+    let mut announce = false; // suppress the connect line for the boot device
+    let mut signaled = false; // signal_input_ready (boot-screen clear) exactly once
 
-    // Build DMA structures + run.
-    dma.zero();
-    mmio.write64(op + OP_DCBAAP, dma.phys_at(DCBAA_OFF));
-    mmio.write64(op + OP_CRCR, dma.phys_at(CMD_RING_OFF) | 1);
-    dma.write64(ERST_OFF, dma.phys_at(EVENT_RING_OFF));
-    dma.write32(ERST_OFF + 8, EVENT_RING_TRBS as u32);
-    mmio.write32(ir0 + 0x08, 1);
-    mmio.write64(ir0 + 0x10, dma.phys_at(ERST_OFF));
-    mmio.write64(ir0 + 0x18, dma.phys_at(EVENT_RING_OFF));
-    mmio.write32(op + OP_CONFIG, max_slots);
-    let c = mmio.read32(op + OP_USBCMD);
-    mmio.write32(op + OP_USBCMD, c | CMD_RS);
-    spin(|| mmio.read32(op + OP_USBSTS) & STS_HCH == 0);
-    ctx.log("xhci: controller running");
+    // Hot-plug loop. Each pass FULLY re-initializes the controller (stop, reset,
+    // rebuild the command/event rings + DCBAA, run) so every (re)enumeration starts
+    // from pristine state — no stale completion events or slots can survive an
+    // unplug/replug to desync the rings. Then it (re)scans ports, binds a HID
+    // device, and polls until it is unplugged (root-port CCS drops); on a drop it
+    // announces and loops. With nothing attached it waits on the ports. Per-pass
+    // re-init is heavy, but hot-plug is infrequent and it keeps the ring bookkeeping
+    // trivially correct (§26.12: correctness over cleverness).
+    'reenum: loop {
+        // Stop + reset the controller.
+        let cmd = mmio.read32(op + OP_USBCMD);
+        mmio.write32(op + OP_USBCMD, cmd & !CMD_RS);
+        spin(|| mmio.read32(op + OP_USBSTS) & STS_HCH != 0);
+        mmio.write32(op + OP_USBCMD, CMD_HCRST);
+        spin(|| {
+            mmio.read32(op + OP_USBCMD) & CMD_HCRST == 0 && mmio.read32(op + OP_USBSTS) & STS_CNR == 0
+        });
+        // Rebuild DMA structures + run.
+        dma.zero();
+        mmio.write64(op + OP_DCBAAP, dma.phys_at(DCBAA_OFF));
+        mmio.write64(op + OP_CRCR, dma.phys_at(CMD_RING_OFF) | 1);
+        dma.write64(ERST_OFF, dma.phys_at(EVENT_RING_OFF));
+        dma.write32(ERST_OFF + 8, EVENT_RING_TRBS as u32);
+        mmio.write32(ir0 + 0x08, 1);
+        mmio.write64(ir0 + 0x10, dma.phys_at(ERST_OFF));
+        mmio.write64(ir0 + 0x18, dma.phys_at(EVENT_RING_OFF));
+        mmio.write32(op + OP_CONFIG, max_slots);
+        let c = mmio.read32(op + OP_USBCMD);
+        mmio.write32(op + OP_USBCMD, c | CMD_RS);
+        spin(|| mmio.read32(op + OP_USBSTS) & STS_HCH == 0);
 
-    // Persistent ring state across every command and every port we probe.
-    let mut ev_idx = 0usize;
-    let mut ev_cycle = 1u32;
-    let mut cmd_idx = 0usize; // command ring producer index (monotonic)
+        // Fresh ring bookkeeping for this pass.
+        let mut ev_idx = 0usize;
+        let mut ev_cycle = 1u32;
+        let mut cmd_idx = 0usize;
 
     // Enumerate EVERY connected port and bind to the first device that is a HID
-    // keyboard — i.e. one that exposes an interrupt-IN endpoint (Linux-style,
-    // class-based binding). The mass-storage boot drive has no interrupt endpoint
-    // and is skipped, so the keyboard is found wherever it sits, on any machine.
+    // keyboard or mouse — i.e. one that exposes an interrupt-IN endpoint
+    // (Linux-style, class-based binding). The mass-storage boot drive has no
+    // interrupt endpoint and is skipped, so the device is found wherever it sits.
     let mut found = false;
     let mut port = 0u32;
     let mut slot = 0u32;
@@ -579,8 +631,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     } // end 'ports — scan of every connected port
 
     if !found {
-        ctx.log("xhci: no HID keyboard/mouse found on any port — idling");
-        idle(&ctx);
+        // Nothing usable attached. Still report input-ready once so the shell's
+        // boot-screen clear fires (the keyboard may be on the other controller),
+        // then wait for a port connection and re-scan.
+        if !signaled { ctx.signal_input_ready(); signaled = true; }
+        ctx.log("xhci: no HID keyboard/mouse on any port — waiting for a connection");
+        wait_for_port(&ctx, &mmio, op, max_ports);
+        announce = true; // whatever connects now is a real plug event
+        continue 'reenum;
     }
     let is_mouse = bound_proto == 2;
     let ep_num = (ep_addr & 0x0F) as u32;
@@ -691,13 +749,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     dma.write32(link + 12, (TRB_LINK << 10) | (1 << 1) | 1); // Link | Toggle Cycle | cycle
 
     ctx.log_fmt(format_args!("xhci: {} ready", if is_mouse { "mouse" } else { "keyboard" }));
-    ctx.signal_input_ready(); // end-of-boot signal: the shell auto-clears now
+    if !signaled { ctx.signal_input_ready(); signaled = true; } // boot-screen clear, once
+    if announce {
+        notify(&ctx, if is_mouse { "mouse connected (xhci)" } else { "keyboard connected (xhci)" });
+    }
     let mut int_idx = 0usize;
     let mut int_cycle = 1u32;
     let mut need_queue = true;
     let mut kb_last = [0u8; 6];                            // keyboard edge-detection state
     let mut mouse = godspeed_sdk::hid::MouseTracker::new(); // mouse button/motion state
-    loop {
+    let portsc_off = op + OP_PORTSC_BASE + (port as usize - 1) * 0x10;
+    'poll: loop {
         if need_queue {
             let t = INT_TR_OFF + int_idx * 16;
             dma.write32(t, report_phys as u32);
@@ -735,6 +797,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
             need_queue = true;
         }
+        // Unplug detection: the bound root port's Current Connect Status drops.
+        // A plain MMIO read — it doesn't disturb the transfer rings.
+        if mmio.read32(portsc_off) & PORT_CCS == 0 {
+            break 'poll;
+        }
         ctx.yield_cpu();
     }
+
+    // Device unplugged. Announce it and loop: the controller is fully
+    // re-initialized at the top of the next pass, which frees the slot and clears
+    // all device state, so we just await the reconnect.
+    notify(&ctx, if is_mouse { "mouse disconnected (xhci)" } else { "keyboard disconnected (xhci)" });
+    announce = true;
+    } // end 'reenum loop
 }

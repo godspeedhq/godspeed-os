@@ -433,9 +433,9 @@ pub fn console_write_byte(b: u8) {
 pub fn console_write_bytes(s: &[u8]) {
     serial_write_bytes_lockfree(s);
     if !boot_log_to_fb() {
-        for &b in s {
-            fb::put_byte(b);
-        }
+        // One lock + one WC flush for the whole string, so it is atomic against
+        // another core's console output (no interleaving mid-string).
+        fb::put_bytes(s);
     }
 }
 
@@ -636,7 +636,7 @@ pub fn console_push_byte(b: u8) {
     // display itself; its raw key polls must not smear its frame).
     if CONSOLE_ECHO_ENABLED.load(Ordering::Acquire) {
         match b {
-            b'\n' | b'\r' => { console_write_byte(b'\r'); console_write_byte(b'\n'); }
+            b'\n' | b'\r' => console_write_bytes(b"\r\n"),
             // Backspace is NOT echoed here: a destructive erase (BS, space, BS)
             // would chew past the prompt when the line is empty. Line editing is
             // the reader's policy — the shell echoes the erase only when it has a

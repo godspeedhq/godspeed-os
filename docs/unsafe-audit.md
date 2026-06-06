@@ -91,7 +91,7 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | arch/x86_64/ap_boot.rs | 2 | permitted |
 | arch/x86_64/boot.rs | 81 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |
-| arch/x86_64/fb.rs | 3 | permitted |
+| arch/x86_64/fb.rs | 4 | permitted |
 | arch/x86_64/interrupts.rs | 13 | permitted |
 | arch/x86_64/mod.rs | 34 | permitted |
 | arch/x86_64/page_tables.rs | 25 | permitted |
@@ -178,7 +178,7 @@ and not yet visible to the scheduler.
 
 ### arch/x86_64/fb.rs
 
-Framebuffer text console (Phase 1 boot output, §11.4). Three blocks, all writing
+Framebuffer text console (Phase 1 boot output, §11.4). Four blocks; three write
 to Limine's linear framebuffer at `base + y*pitch + x*bpp`:
 - `clear`: `write_bytes(base, 0, height*pitch)` — fills the whole buffer.
 - `put_pixel`: writes `bpp` bytes at a bounds-checked offset (`x<width`, `y<height`).
@@ -188,6 +188,14 @@ Sound because the framebuffer is the region Limine mapped and sized
 (`height*pitch` bytes), it lives in the higher half (PML4 256–511) that every
 address space inherits via `PageTable::new`, so it is valid for writes for the
 system lifetime; every offset is bounds-checked against the reported geometry.
+
+The fourth block is `wc_flush`: a single `SFENCE` instruction. The framebuffer
+is mapped write-combining (Limine HHDM default), so the FB lock's atomic release
+does not order the WC store buffer — a scroll's pixel stores on one core could
+flush after the next line's first glyph drawn on another core, erasing it. Each
+`put_byte`/`put_bytes` issues `SFENCE` before releasing the lock so its WC stores
+are globally visible in order. Sound because `SFENCE` only orders stores and has
+no memory or privilege effects.
 
 ---
 
