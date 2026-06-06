@@ -142,7 +142,39 @@ pub fn put_byte(b: u8) {
     if !s.ready {
         return;
     }
+    process_byte(&mut s, b);
+    wc_flush();
+}
 
+/// Write a whole byte sequence under a SINGLE lock, then flush once. Used by the
+/// console path so a multi-byte write (e.g. the shell's `gs> ` prompt) is atomic
+/// with respect to another core's console output — no byte from another core can
+/// interleave mid-string.
+pub fn put_bytes(bytes: &[u8]) {
+    let mut s = FB.lock();
+    if !s.ready {
+        return;
+    }
+    for &b in bytes {
+        process_byte(&mut s, b);
+    }
+    wc_flush();
+}
+
+/// Flush write-combining framebuffer stores so they are globally visible before
+/// the FB lock is released. The framebuffer is mapped write-combining (Limine's
+/// HHDM default); the lock's atomic release orders normal memory but NOT the WC
+/// store buffer. Without this, a scroll on one core can flush *after* the next
+/// line's first glyph drawn on another core — erasing it ("gs>" → " s>").
+#[inline]
+fn wc_flush() {
+    // SAFETY: SFENCE is always valid in any privilege level; it only orders stores.
+    unsafe { core::arch::asm!("sfence", options(nostack, preserves_flags)); }
+}
+
+/// Process one output byte against the (locked) console state. Caller holds the
+/// FB lock and is responsible for `wc_flush()` before releasing it.
+fn process_byte(s: &mut Fb, b: u8) {
     // --- Escape-sequence state machine ---
     match s.esc {
         1 => {
@@ -158,7 +190,7 @@ pub fn put_byte(b: u8) {
             return;
         }
         2 => {
-            handle_csi(&mut s, b);
+            handle_csi(s, b);
             return;
         }
         _ => {}
@@ -172,10 +204,10 @@ pub fn put_byte(b: u8) {
     // Erase the underline cursor at the current cell before changing position or
     // drawing, so it never leaves a trail. Redraw it at the new position after.
     if s.cursor_visible {
-        erase_cursor(&s);
+        erase_cursor(s);
     }
     match b {
-        b'\n' => advance_line(&mut s),
+        b'\n' => advance_line(s),
         b'\r' => s.col = 0,
         0x08 | 0x7f => {
             if s.col > 0 {
@@ -185,10 +217,10 @@ pub fn put_byte(b: u8) {
         0x20..=0x7e => {
             // The glyph is drawn at the (now blank) cursor cell.
             let (c, r) = (s.col, s.row);
-            draw_glyph(&s, b, c, r);
+            draw_glyph(s, b, c, r);
             s.col += 1;
             if s.col >= s.cols {
-                advance_line(&mut s);
+                advance_line(s);
             }
         }
         _ => {}
@@ -197,7 +229,7 @@ pub fn put_byte(b: u8) {
     // the next character will land. Framebuffer only — a serial terminal draws its
     // own cursor. Full-screen apps hide it via ESC[?25l.
     if s.cursor_visible {
-        draw_cursor(&s);
+        draw_cursor(s);
     }
 }
 
