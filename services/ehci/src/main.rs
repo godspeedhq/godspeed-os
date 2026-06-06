@@ -372,13 +372,11 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
         }
         if announce {
             for d in &devs[..ndev] {
-                ctx.console_writeln_fmt(format_args!(
-                    "[usb] {} connected (ehci)", if d.is_mouse { "mouse" } else { "keyboard" }));
+                notify(ctx, if d.is_mouse { "mouse connected (ehci)" } else { "keyboard connected (ehci)" });
             }
         }
         let gone = poll_devices(ctx, mmio, &dma, op, &devs[..ndev]);
-        ctx.console_writeln_fmt(format_args!(
-            "[usb] {} disconnected (ehci)", if devs[gone].is_mouse { "mouse" } else { "keyboard" }));
+        notify(ctx, if devs[gone].is_mouse { "mouse disconnected (ehci)" } else { "keyboard disconnected (ehci)" });
         announce = true; // the next connect (after re-scan) is a real plug event
         delay_cycles(ctx, DEBOUNCE_CYCLES); // let the port status settle before re-scan
     }
@@ -702,6 +700,17 @@ fn poll_devices(
 /// trips on a real disconnect; the bound rides out the odd transient glitch. At
 /// roughly a few milliseconds per errored split this is well under a second.
 const DISCONNECT_ERR_THRESHOLD: u32 = 250;
+
+/// Print a hot-plug notice on the console, then nudge the shell to redraw its
+/// prompt by injecting a newline into the input ring (which this driver already
+/// feeds). The notice is async output that would otherwise leave the prompt
+/// scrolled up; the leading "\n" starts it on its own line and the injected
+/// newline supplies the terminating break + triggers a fresh `gs> `.
+fn notify(ctx: &ServiceContext, msg: &str) {
+    ctx.console_write("\n[usb] ");
+    ctx.console_write(msg);
+    ctx.console_push(b'\n');
+}
 
 /// Busy-wait roughly `cycles` TSC ticks. Used for the millisecond-scale USB reset
 /// timings. Overestimated against the T630's ~2 GHz so the >= 50 ms reset hold is

@@ -96,6 +96,18 @@ fn wait_for_port(ctx: &ServiceContext, mmio: &Mmio, op: usize, max_ports: u32) {
     }
 }
 
+/// Print a hot-plug notice on the console, then nudge the shell to redraw its
+/// prompt. The notice is asynchronous output that lands wherever the cursor was,
+/// leaving the prompt scrolled up; injecting a newline into the input ring (which
+/// this driver already feeds) makes the shell print a fresh `gs> `. The leading
+/// "\n" starts the notice on its own line; the injected newline supplies the
+/// terminating line break, so there is no blank line.
+fn notify(ctx: &ServiceContext, msg: &str) {
+    ctx.console_write("\n[usb] ");
+    ctx.console_write(msg);
+    ctx.console_push(b'\n');
+}
+
 fn idle(ctx: &ServiceContext) -> ! {
     // Degraded terminal path (no controller / no DMA / no keyboard). Still report
     // input-ready so the shell's boot-screen auto-clear fires — boot is "done" as
@@ -736,8 +748,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log_fmt(format_args!("xhci: {} ready", if is_mouse { "mouse" } else { "keyboard" }));
     if !signaled { ctx.signal_input_ready(); signaled = true; } // boot-screen clear, once
     if announce {
-        ctx.console_writeln_fmt(format_args!(
-            "[usb] {} connected (xhci)", if is_mouse { "mouse" } else { "keyboard" }));
+        notify(&ctx, if is_mouse { "mouse connected (xhci)" } else { "keyboard connected (xhci)" });
     }
     let mut int_idx = 0usize;
     let mut int_cycle = 1u32;
@@ -794,8 +805,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Device unplugged. Announce it and loop: the controller is fully
     // re-initialized at the top of the next pass, which frees the slot and clears
     // all device state, so we just await the reconnect.
-    ctx.console_writeln_fmt(format_args!(
-        "[usb] {} disconnected (xhci)", if is_mouse { "mouse" } else { "keyboard" }));
+    notify(&ctx, if is_mouse { "mouse disconnected (xhci)" } else { "keyboard disconnected (xhci)" });
     announce = true;
     } // end 'reenum loop
 }
