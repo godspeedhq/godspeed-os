@@ -189,6 +189,21 @@ impl Ep {
     }
 }
 
+/// A configured low-speed HID boot device behind the hub: its assigned address,
+/// the hub downstream port it sits on, its interrupt-IN endpoint number, and
+/// whether it's a mouse (vs a keyboard). Filled in during enumeration; the poll
+/// loop drives one QH per entry.
+#[derive(Clone, Copy)]
+struct HidDev { addr: u8, port: u8, ep_num: u8, is_mouse: bool }
+
+/// Maximum HID devices polled together (keyboard + mouse covers the cases we have).
+const MAX_HID: usize = 2;
+/// Poll-phase DMA layout: one QH + qTD + report buffer per device, `POLL_STRIDE`
+/// apart, starting at `POLL_BASE` — clear of the config-phase region (QH_OFF 0x0 …
+/// DATA_BUF 0x200) so enumeration and polling never alias.
+const POLL_BASE:   usize = 0x400;
+const POLL_STRIDE: usize = 0x100; // QH @ +0x00, qTD @ +0x40, report buf @ +0x80
+
 /// Run one control transfer on EP0 of `ep`. For a low-speed `ep` the controller
 /// wraps each transaction as a split through the hub TT (hub addr + port in the
 /// QH). `setup` is the 8-byte setup packet; for an IN transfer up to `data_len`
@@ -348,12 +363,16 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
     }
     delay_cycles(ctx, RESET_HOLD_CYCLES); // power-on-to-power-good settle (generous)
 
-    // E4 — for EACH connected downstream port, reset it (arms the hub TT) and try
-    // reading its device descriptor over SPLIT transactions. Trying every
-    // connected port finds the keyboard wherever it sits (ports 3 and 4 both
-    // showed a low-speed device). Per-port reset status + per-stage qTD tokens are
-    // logged so a split failure is precisely diagnosable.
-    let mut found = false;
+    // E4/E5 — for EACH connected downstream port, reset it (arms the hub TT),
+    // read its device descriptor over SPLIT, identify the HID class, and — if it's
+    // a boot keyboard or mouse — give it a unique address and configure it. Every
+    // device is collected; the combined poll loop drives them all. Addressing each
+    // device (Set_Address moves it off the default address 0) before resetting the
+    // next port is what lets two devices coexist — only one device may sit at
+    // address 0 at a time.
+    let mut devs = [HidDev { addr: 0, port: 0, ep_num: 0, is_mouse: false }; MAX_HID];
+    let mut ndev = 0usize;
+    let mut next_addr = 2u8; // 1 is the hub; devices start at 2
     for port in 1..=nports {
         // Status before reset.
         let setup = [0xA3, 0x00, 0x00, 0x00, port, 0x00, 0x04, 0x00]; // Get_Status
@@ -384,7 +403,10 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
             let _ = control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &s, 4, true);
             let pstat = dma.read16(DATA_BUF + 0);
 
-            if control(ctx, mmio, &dma, op, &kep, &dd, 18, true).is_some() { got = true; break; }
+            // Retry the descriptor read several times within this reset before
+            // re-resetting: this keyboard's FIRST split SETUP after a reset
+            // XactErrs, but a settle-and-retry on the same reset often succeeds.
+            if control_retry(ctx, mmio, &dma, op, &kep, &dd, 18, true, 6).is_some() { got = true; break; }
             ctx.log_fmt(format_args!(
                 "ehci: hub port {} attempt {} failed (post-reset status={:#06x}) — re-resetting",
                 port, attempt, pstat));
@@ -397,7 +419,6 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
         let pid = dma.read16(DATA_BUF + 10);
         ctx.log_fmt(format_args!(
             "ehci: SPLIT device (hub port {}): VID={:#06x} PID={:#06x}", port, vid, pid));
-        found = true;
 
         // Read the config descriptor to identify the device: configuration value,
         // HID interface number/class/protocol (1=keyboard, 2=mouse) and the
@@ -430,20 +451,33 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
             "ehci: port {} HID iface={} class={:#x} protocol={} (1=kbd 2=mouse) int_ep={:#04x} interval={}",
             port, iface, iclass, iproto, ep_addr, ep_int));
 
-        // E5a/E5b — if it's a boot keyboard, address + configure it, set boot
-        // protocol, then poll its interrupt endpoint forever, decoding keystrokes
-        // into the console (the call never returns).
-        if iclass == 0x03 && iproto == 1 {
-            ctx.log_fmt(format_args!("ehci: *** boot KEYBOARD on hub port {} ***", port));
-            if setup_keyboard(ctx, mmio, &dma, op, port, cfg_val, iface) {
-                poll_keyboard(ctx, mmio, &dma, op, port, ep_addr);
-            }
-            break;
+        // E5a — boot keyboard (proto 1) or boot mouse (proto 2): give it a unique
+        // address and configure it (boot protocol). Record it for the poll loop.
+        // Set_Address here moves it off address 0 before we reset the next port.
+        let is_kbd   = iclass == 0x03 && iproto == 1;
+        let is_mouse = iclass == 0x03 && iproto == 2;
+        if !(is_kbd || is_mouse) {
+            ctx.log_fmt(format_args!("ehci: hub port {} is not a boot keyboard/mouse — skipping", port));
+            continue;
+        }
+        if ndev >= MAX_HID {
+            ctx.log("ehci: more HID devices than supported — ignoring the extra one");
+            continue;
+        }
+        ctx.log_fmt(format_args!(
+            "ehci: *** boot {} on hub port {} ***", if is_mouse { "MOUSE" } else { "KEYBOARD" }, port));
+        if setup_hid(ctx, mmio, &dma, op, port, next_addr, cfg_val, iface, is_mouse) {
+            devs[ndev] = HidDev { addr: next_addr, port, ep_num: ep_addr & 0x0F, is_mouse };
+            ndev += 1;
+            next_addr += 1;
         }
     }
-    if !found {
-        ctx.log("ehci: no device descriptor read over split on any connected port");
+    if ndev == 0 {
+        ctx.log("ehci: no boot keyboard/mouse found on any connected port");
+        return;
     }
+    // E5b — poll all configured devices together; never returns.
+    poll_devices(ctx, mmio, &dma, op, &devs[..ndev]);
 }
 
 /// Run a control transfer, retrying up to `tries` times. The Logitech keyboard's
@@ -464,132 +498,173 @@ fn control_retry(
     None
 }
 
-/// E5a — address, configure, and set boot protocol on the low-speed keyboard
-/// behind hub `port` (currently at the default address 0). Moves it to address 2
-/// and selects HID boot protocol so its reports are the fixed 8-byte format. Each
-/// transfer retries (control_retry) because this keyboard's split control endpoint
-/// is intermittently flaky — one failed SETUP must not abandon the whole keyboard.
-fn setup_keyboard(
+/// E5a — give a low-speed HID device (currently at the default address 0 behind
+/// hub `port`) a unique `addr` and configure it in HID boot protocol so its
+/// reports are the fixed 8-byte format. Each transfer retries (control_retry)
+/// because this hub's split control endpoint is intermittently flaky — one failed
+/// SETUP must not abandon the device.
+fn setup_hid(
     ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
-    op: usize, port: u8, cfg_val: u8, iface: u8,
+    op: usize, port: u8, addr: u8, cfg_val: u8, iface: u8, is_mouse: bool,
 ) -> bool {
-    // Set_Address(2) — issued while still at address 0.
-    let s = [0x00, 0x05, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let what = if is_mouse { "mouse" } else { "keyboard" };
+    // Set_Address(addr) — issued while still at address 0.
+    let s = [0x00, 0x05, addr, 0x00, 0x00, 0x00, 0x00, 0x00];
     if control_retry(ctx, mmio, dma, op, &Ep::low(0, 8, 1, port), &s, 0, false, 5).is_none() {
-        ctx.log("ehci: kbd Set_Address failed (5 tries)"); return false;
+        ctx.log_fmt(format_args!("ehci: {} Set_Address failed (5 tries)", what)); return false;
     }
     delay_cycles(ctx, RECOVERY_CYCLES); // SetAddress recovery
-    // Set_Configuration.
+    // Set_Configuration (at the new address).
     let s = [0x00, 0x09, cfg_val, 0x00, 0x00, 0x00, 0x00, 0x00];
-    if control_retry(ctx, mmio, dma, op, &Ep::low(2, 8, 1, port), &s, 0, false, 5).is_none() {
-        ctx.log("ehci: kbd Set_Configuration failed (5 tries)"); return false;
+    if control_retry(ctx, mmio, dma, op, &Ep::low(addr, 8, 1, port), &s, 0, false, 5).is_none() {
+        ctx.log_fmt(format_args!("ehci: {} Set_Configuration failed (5 tries)", what)); return false;
     }
     // HID Set_Protocol(boot=0) on the interface (bmRequestType 0x21, bRequest 0x0B).
     let s = [0x21, 0x0B, 0x00, 0x00, iface, 0x00, 0x00, 0x00];
-    if control_retry(ctx, mmio, dma, op, &Ep::low(2, 8, 1, port), &s, 0, false, 5).is_none() {
-        ctx.log("ehci: kbd Set_Protocol(boot) failed (5 tries)"); return false;
+    if control_retry(ctx, mmio, dma, op, &Ep::low(addr, 8, 1, port), &s, 0, false, 5).is_none() {
+        ctx.log_fmt(format_args!("ehci: {} Set_Protocol(boot) failed (5 tries)", what)); return false;
     }
-    ctx.log_fmt(format_args!("ehci: keyboard configured (addr 2, cfg {}, boot protocol)", cfg_val));
+    ctx.log_fmt(format_args!("ehci: {} configured (addr {}, cfg {}, boot protocol)", what, addr, cfg_val));
     true
 }
 
-/// E5b — poll the keyboard's interrupt-IN endpoint over split transactions and
-/// push decoded keystrokes into the console input ring (§12). Never returns: this
-/// is the driver's steady state. The keyboard sits at address 2 behind hub 1's
-/// downstream `port`; its boot interrupt endpoint (`ep_addr`, e.g. 0x81) delivers
-/// the fixed 8-byte HID boot report.
+/// Arm an interrupt IN qTD (8-byte report, IOC, given data toggle) for the QH at
+/// DMA offset `qh`, and point the QH overlay at it so the controller re-fetches.
+/// The qTD lives at `qh + 0x40`, its report buffer at `qh + 0x80`.
+fn arm_int(dma: &godspeed_sdk::Dma, qh: usize, toggle: u32) {
+    let qtd = qh + 0x40;
+    let qtd_phys = dma.phys_at(qtd) as u32;
+    let buf_phys = dma.phys_at(qh + 0x80) as u32;
+    dma.write32(qtd + 0x00, 1);                          // next qTD = T (terminate)
+    dma.write32(qtd + 0x04, 1);                          // alt next  = T
+    dma.write32(qtd + 0x08,
+        QTD_ACTIVE | (1 << 8) | (3 << 10) | (1 << 15) | (8 << 16) | (toggle << 31));
+    dma.write32(qtd + 0x0C, buf_phys);                   // report buffer
+    dma.write32(qh + 0x10, qtd_phys & !0x1F);            // QH overlay → this qTD
+    dma.write32(qh + 0x14, 1);
+    dma.write32(qh + 0x18, 0);                           // clear overlay token
+}
+
+/// E5b — poll every configured HID device's interrupt-IN endpoint over split
+/// transactions and act on the reports (keystrokes → console, mouse → log). Never
+/// returns: this is the driver's steady state.
 ///
-/// We run the endpoint's QH on the async schedule, same as the control transfers
-/// that addressed the device. The QH carries the hub TT info (split), low speed,
-/// and — unlike a control endpoint — `C = 0` (the Control Endpoint flag is set
-/// only for low-speed *control* endpoints behind a TT). One IN qTD is armed at a
-/// time; with NakCnt-reload = 0 the controller keeps retrying it (the device NAKs
-/// between keypresses) until a report arrives, then the qTD retires and we re-arm
-/// with the data toggle flipped.
-fn poll_keyboard(
+/// Each device gets its own QH; the QHs are linked into one async ring (so the
+/// controller services them all every pass) with the first marked head of the
+/// reclamation list. Each QH carries the hub TT info (split), low speed, DTC=1
+/// (toggle from the qTD), and — unlike a control endpoint — `C = 0` (the Control
+/// Endpoint flag is for low-speed *control* endpoints only). One IN qTD per device
+/// is armed at a time; with NakCnt-reload = 0 the controller keeps retrying it
+/// (the device NAKs between events) until a report arrives, then the qTD retires,
+/// we act on it, and re-arm with the data toggle flipped.
+fn poll_devices(
     ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
-    op: usize, port: u8, ep_addr: u8,
+    op: usize, devs: &[HidDev],
 ) -> ! {
-    ctx.log("ehci: polling keyboard — type at the gs> prompt");
-    let addr   = 2u32;                          // keyboard's assigned address
-    let ep_num = (ep_addr & 0x0F) as u32;       // interrupt-IN endpoint (boot kbd: 1)
-    let mps    = 8u32;                           // boot report is a fixed 8 bytes
-    let qh_phys  = dma.phys_at(QH_OFF) as u32;
-    let qtd_phys = dma.phys_at(QTD_DATA) as u32;
-    let buf_phys = dma.phys_at(DATA_BUF) as u32;
+    let n = devs.len();
+    ctx.log_fmt(format_args!(
+        "ehci: polling {} device(s) — type at the gs> prompt; mouse events log here", n));
 
-    // Build the QH once. Low-speed (EPS=1) behind hub 1's TT (split), DTC=1 so the
-    // data toggle comes from the qTD, H=1 (sole QH in the async list), C=0.
-    dma.write32(QH_OFF + 0x00, (qh_phys & !0x1F) | (1 << 1)); // horiz link → self, typ=QH
-    dma.write32(QH_OFF + 0x04,
-        (addr & 0x7F) | (ep_num << 8) | (1 << 12) | (1 << 14) | (1 << 15) | (mps << 16));
-    dma.write32(QH_OFF + 0x08,
-        (1 << 30) | ((1u32 & 0x7F) << 16) | ((port as u32 & 0x7F) << 22)); // Mult=1, hub 1, port
-    dma.write32(QH_OFF + 0x0C, 0);
-
-    // Arm an IN qTD with the given data toggle: 8-byte IN, IOC, terminate next.
-    let arm = |toggle: u32| {
-        dma.write32(QTD_DATA + 0x00, 1);                    // next qTD = T (terminate)
-        dma.write32(QTD_DATA + 0x04, 1);                    // alt next  = T
-        dma.write32(QTD_DATA + 0x08,
-            QTD_ACTIVE | (1 << 8) | (3 << 10) | (1 << 15) | (mps << 16) | (toggle << 31));
-        dma.write32(QTD_DATA + 0x0C, buf_phys);             // buffer page 0
-        // Point the QH overlay at the fresh qTD and clear its token so the
-        // controller re-fetches.
-        dma.write32(QH_OFF + 0x10, qtd_phys & !0x1F);
-        dma.write32(QH_OFF + 0x14, 1);
-        dma.write32(QH_OFF + 0x18, 0);
-    };
-
-    let mut toggle = 0u32;
-    arm(toggle);
-
-    // Point the async list at our QH and make sure the schedule is enabled.
-    mmio.write32(op + OP_CTRLDSSEGMENT, 0);
-    mmio.write32(op + OP_ASYNCLISTADDR, qh_phys & !0x1F);
-    if mmio.read32(op + OP_USBSTS) & STS_ASS == 0 {
-        mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) | CMD_ASE);
-        wait(mmio, op + OP_USBSTS, STS_ASS, true);
+    // Build a ring of one QH per device, each with an interrupt-IN qTD armed.
+    for i in 0..n {
+        let qh = POLL_BASE + i * POLL_STRIDE;
+        let next_qh = POLL_BASE + ((i + 1) % n) * POLL_STRIDE;
+        let next_phys = dma.phys_at(next_qh) as u32;
+        let h = if i == 0 { 1u32 << 15 } else { 0 }; // sole head of reclamation list
+        dma.write32(qh + 0x00, (next_phys & !0x1F) | (1 << 1)); // horiz link → next QH, typ=QH
+        dma.write32(qh + 0x04,
+            (devs[i].addr as u32 & 0x7F) | ((devs[i].ep_num as u32) << 8)
+                | (1 << 12) | (1 << 14) | h | (8 << 16)); // low speed, DTC, [head], mps 8, C=0
+        dma.write32(qh + 0x08,
+            (1 << 30) | ((1u32 & 0x7F) << 16) | ((devs[i].port as u32 & 0x7F) << 22)); // Mult, hub 1, port
+        dma.write32(qh + 0x0C, 0);
+        arm_int(dma, qh, 0);
     }
 
-    // Previous report's six keycodes (boot report bytes 2..8), for edge detection.
-    let mut last = [0u8; 6];
+    // Repoint the async list at our ring with the schedule stopped (the spec wants
+    // ASYNCLISTADDR changed only while the async schedule is disabled), then run it.
+    if mmio.read32(op + OP_USBSTS) & STS_ASS != 0 {
+        mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) & !CMD_ASE);
+        wait(mmio, op + OP_USBSTS, STS_ASS, false);
+    }
+    mmio.write32(op + OP_CTRLDSSEGMENT, 0);
+    mmio.write32(op + OP_ASYNCLISTADDR, dma.phys_at(POLL_BASE) as u32 & !0x1F);
+    mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) | CMD_ASE);
+    wait(mmio, op + OP_USBSTS, STS_ASS, true);
+
+    let mut toggle = [0u32; MAX_HID];
+    let mut kb_last = [0u8; 6];                     // keyboard edge-detection state
+    let (mut ms_btn, mut ms_ax, mut ms_ay) = (0u8, 0i32, 0i32); // mouse state
     loop {
-        // Poll the qTD for retirement. A large bound means we normally catch the
-        // keypress within one arming; if the window elapses with no key (the qTD
-        // is still ACTIVE, NAK'd) we just keep polling the same qTD — the toggle
-        // is only consumed on a real transfer, so re-arming is unnecessary.
-        let mut done = false;
-        for _ in 0..50_000_000u32 {
-            if dma.read32(QTD_DATA + 0x08) & QTD_ACTIVE == 0 { done = true; break; }
-        }
-        if done {
-            let tok = dma.read32(QTD_DATA + 0x08);
+        for i in 0..n {
+            let qh = POLL_BASE + i * POLL_STRIDE;
+            let qtd = qh + 0x40;
+            let buf = qh + 0x80;
+            if dma.read32(qtd + 0x08) & QTD_ACTIVE != 0 { continue; } // still NAK'ing
+            let tok = dma.read32(qtd + 0x08);
             if tok & (QTD_HALTED | QTD_ERRMASK) == 0 {
-                // A report arrived. The boot report holds up to six simultaneously
-                // pressed keycodes (bytes 2..8); modifiers are byte 0. Emit every
-                // key that is down now but wasn't in the previous report — this is
-                // proper N-key edge detection, so rolling onto a new key before
-                // releasing the last one no longer drops characters, and a held
-                // key still fires only once.
-                let mods = dma.read8(DATA_BUF + 0);
-                let mut cur = [0u8; 6];
-                for i in 0..6 { cur[i] = dma.read8(DATA_BUF + 2 + i); }
-                for &k in cur.iter() {
-                    if k == 0 || k == 0x01 { continue; } // 0=empty, 0x01=rollover error
-                    if !last.contains(&k) {
-                        if let Some(ch) = hid_to_ascii(k, mods) {
-                            ctx.console_push(ch);
-                        }
-                    }
+                if devs[i].is_mouse {
+                    decode_mouse(ctx, dma, buf, &mut ms_btn, &mut ms_ax, &mut ms_ay);
+                } else {
+                    decode_keyboard(ctx, dma, buf, &mut kb_last);
                 }
-                last = cur;
-                toggle ^= 1;            // successful IN flips the data toggle
+                toggle[i] ^= 1;            // successful IN flips the data toggle
             }
-            // On halt/error or success alike, re-arm the next IN.
-            arm(toggle);
+            arm_int(dma, qh, toggle[i]);  // re-arm (on success or error alike)
         }
         ctx.yield_cpu();
+    }
+}
+
+/// Decode a keyboard boot report (mods byte 0, up to six keycodes bytes 2..8) with
+/// N-key edge detection: emit every key down now but not in `last`, so rolling
+/// onto a new key drops nothing and a held key fires once. `buf` is the report's
+/// DMA offset; `last` carries the previous report's keycodes.
+fn decode_keyboard(ctx: &ServiceContext, dma: &godspeed_sdk::Dma, buf: usize, last: &mut [u8; 6]) {
+    let mods = dma.read8(buf + 0);
+    let mut cur = [0u8; 6];
+    for i in 0..6 { cur[i] = dma.read8(buf + 2 + i); }
+    for &k in cur.iter() {
+        if k == 0 || k == 0x01 { continue; } // 0=empty, 0x01=rollover error
+        if !last.contains(&k) {
+            if let Some(ch) = hid_to_ascii(k, mods) {
+                ctx.console_push(ch);
+            }
+        }
+    }
+    *last = cur;
+}
+
+/// Decode a mouse boot report (byte 0 = buttons L/R/M, byte 1 = dx, byte 2 = dy as
+/// signed deltas) and log it sparingly: each button transition as a discrete
+/// event, and accumulated movement only once it crosses a threshold — a mouse
+/// emits far too many move reports to log each one. There is no on-screen cursor
+/// in a text console (that belongs to a future display server); this is the
+/// proof-of-life that the mouse works end to end.
+fn decode_mouse(
+    ctx: &ServiceContext, dma: &godspeed_sdk::Dma, buf: usize,
+    btn: &mut u8, ax: &mut i32, ay: &mut i32,
+) {
+    let b = dma.read8(buf + 0) & 0x07;
+    let dx = dma.read8(buf + 1) as i8 as i32;
+    let dy = dma.read8(buf + 2) as i8 as i32;
+    let changed = b ^ *btn;
+    if changed & 0x01 != 0 {
+        ctx.log_fmt(format_args!("ehci: mouse LEFT {}",   if b & 0x01 != 0 { "down" } else { "up" }));
+    }
+    if changed & 0x02 != 0 {
+        ctx.log_fmt(format_args!("ehci: mouse RIGHT {}",  if b & 0x02 != 0 { "down" } else { "up" }));
+    }
+    if changed & 0x04 != 0 {
+        ctx.log_fmt(format_args!("ehci: mouse MIDDLE {}", if b & 0x04 != 0 { "down" } else { "up" }));
+    }
+    *btn = b;
+    *ax += dx;
+    *ay += dy;
+    if (*ax).abs() + (*ay).abs() >= 60 {
+        ctx.log_fmt(format_args!("ehci: mouse moved dx={} dy={}", *ax, *ay));
+        *ax = 0;
+        *ay = 0;
     }
 }
 
