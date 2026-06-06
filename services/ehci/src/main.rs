@@ -430,12 +430,13 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
             "ehci: port {} HID iface={} class={:#x} protocol={} (1=kbd 2=mouse) int_ep={:#04x} interval={}",
             port, iface, iclass, iproto, ep_addr, ep_int));
 
-        // E5a — if it's a boot keyboard, address + configure it and set boot
-        // protocol. (E5b will poll its interrupt endpoint and decode keystrokes.)
+        // E5a/E5b — if it's a boot keyboard, address + configure it, set boot
+        // protocol, then poll its interrupt endpoint forever, decoding keystrokes
+        // into the console (the call never returns).
         if iclass == 0x03 && iproto == 1 {
             ctx.log_fmt(format_args!("ehci: *** boot KEYBOARD on hub port {} ***", port));
             if setup_keyboard(ctx, mmio, &dma, op, port, cfg_val, iface) {
-                ctx.log("ehci: keyboard ready — (E5b will poll keys next)");
+                poll_keyboard(ctx, mmio, &dma, op, port, ep_addr);
             }
             break;
         }
@@ -470,6 +471,127 @@ fn setup_keyboard(
     }
     ctx.log_fmt(format_args!("ehci: keyboard configured (addr 2, cfg {}, boot protocol)", cfg_val));
     true
+}
+
+/// E5b — poll the keyboard's interrupt-IN endpoint over split transactions and
+/// push decoded keystrokes into the console input ring (§12). Never returns: this
+/// is the driver's steady state. The keyboard sits at address 2 behind hub 1's
+/// downstream `port`; its boot interrupt endpoint (`ep_addr`, e.g. 0x81) delivers
+/// the fixed 8-byte HID boot report.
+///
+/// We run the endpoint's QH on the async schedule, same as the control transfers
+/// that addressed the device. The QH carries the hub TT info (split), low speed,
+/// and — unlike a control endpoint — `C = 0` (the Control Endpoint flag is set
+/// only for low-speed *control* endpoints behind a TT). One IN qTD is armed at a
+/// time; with NakCnt-reload = 0 the controller keeps retrying it (the device NAKs
+/// between keypresses) until a report arrives, then the qTD retires and we re-arm
+/// with the data toggle flipped.
+fn poll_keyboard(
+    ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
+    op: usize, port: u8, ep_addr: u8,
+) -> ! {
+    ctx.log("ehci: polling keyboard — type at the gs> prompt");
+    let addr   = 2u32;                          // keyboard's assigned address
+    let ep_num = (ep_addr & 0x0F) as u32;       // interrupt-IN endpoint (boot kbd: 1)
+    let mps    = 8u32;                           // boot report is a fixed 8 bytes
+    let qh_phys  = dma.phys_at(QH_OFF) as u32;
+    let qtd_phys = dma.phys_at(QTD_DATA) as u32;
+    let buf_phys = dma.phys_at(DATA_BUF) as u32;
+
+    // Build the QH once. Low-speed (EPS=1) behind hub 1's TT (split), DTC=1 so the
+    // data toggle comes from the qTD, H=1 (sole QH in the async list), C=0.
+    dma.write32(QH_OFF + 0x00, (qh_phys & !0x1F) | (1 << 1)); // horiz link → self, typ=QH
+    dma.write32(QH_OFF + 0x04,
+        (addr & 0x7F) | (ep_num << 8) | (1 << 12) | (1 << 14) | (1 << 15) | (mps << 16));
+    dma.write32(QH_OFF + 0x08,
+        (1 << 30) | ((1u32 & 0x7F) << 16) | ((port as u32 & 0x7F) << 22)); // Mult=1, hub 1, port
+    dma.write32(QH_OFF + 0x0C, 0);
+
+    // Arm an IN qTD with the given data toggle: 8-byte IN, IOC, terminate next.
+    let arm = |toggle: u32| {
+        dma.write32(QTD_DATA + 0x00, 1);                    // next qTD = T (terminate)
+        dma.write32(QTD_DATA + 0x04, 1);                    // alt next  = T
+        dma.write32(QTD_DATA + 0x08,
+            QTD_ACTIVE | (1 << 8) | (3 << 10) | (1 << 15) | (mps << 16) | (toggle << 31));
+        dma.write32(QTD_DATA + 0x0C, buf_phys);             // buffer page 0
+        // Point the QH overlay at the fresh qTD and clear its token so the
+        // controller re-fetches.
+        dma.write32(QH_OFF + 0x10, qtd_phys & !0x1F);
+        dma.write32(QH_OFF + 0x14, 1);
+        dma.write32(QH_OFF + 0x18, 0);
+    };
+
+    let mut toggle = 0u32;
+    arm(toggle);
+
+    // Point the async list at our QH and make sure the schedule is enabled.
+    mmio.write32(op + OP_CTRLDSSEGMENT, 0);
+    mmio.write32(op + OP_ASYNCLISTADDR, qh_phys & !0x1F);
+    if mmio.read32(op + OP_USBSTS) & STS_ASS == 0 {
+        mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) | CMD_ASE);
+        wait(mmio, op + OP_USBSTS, STS_ASS, true);
+    }
+
+    let mut last_key = 0u8;
+    loop {
+        // Poll the qTD for retirement. A large bound means we normally catch the
+        // keypress within one arming; if the window elapses with no key (the qTD
+        // is still ACTIVE, NAK'd) we just keep polling the same qTD — the toggle
+        // is only consumed on a real transfer, so re-arming is unnecessary.
+        let mut done = false;
+        for _ in 0..50_000_000u32 {
+            if dma.read32(QTD_DATA + 0x08) & QTD_ACTIVE == 0 { done = true; break; }
+        }
+        if done {
+            let tok = dma.read32(QTD_DATA + 0x08);
+            if tok & (QTD_HALTED | QTD_ERRMASK) == 0 {
+                // A report arrived. Edge-detect on the first keycode (byte 2) so a
+                // held key doesn't repeat; modifiers are byte 0.
+                let mods = dma.read8(DATA_BUF + 0);
+                let key  = dma.read8(DATA_BUF + 2);
+                if key != 0 && key != last_key {
+                    if let Some(ch) = hid_to_ascii(key, mods) {
+                        ctx.console_push(ch);
+                    }
+                }
+                last_key = key;
+                toggle ^= 1;            // successful IN flips the data toggle
+            }
+            // On halt/error or success alike, re-arm the next IN.
+            arm(toggle);
+        }
+        ctx.yield_cpu();
+    }
+}
+
+/// Decode a HID boot-keyboard usage code to ASCII (US layout, common keys).
+fn hid_to_ascii(key: u8, mods: u8) -> Option<u8> {
+    let shift = mods & 0x22 != 0; // left or right Shift
+    match key {
+        0x04..=0x1D => {
+            let base = b'a' + (key - 0x04);
+            Some(if shift { base - 32 } else { base })
+        }
+        0x1E..=0x26 => {
+            if shift {
+                Some([b'!', b'@', b'#', b'$', b'%', b'^', b'&', b'*', b'('][(key - 0x1E) as usize])
+            } else {
+                Some(b'1' + (key - 0x1E))
+            }
+        }
+        0x27 => Some(if shift { b')' } else { b'0' }),
+        0x28 => Some(b'\n'), // Enter
+        0x2A => Some(0x08),  // Backspace
+        0x2B => Some(b'\t'), // Tab
+        0x2C => Some(b' '),  // Space
+        0x2D => Some(if shift { b'_' } else { b'-' }),
+        0x2E => Some(if shift { b'+' } else { b'=' }),
+        0x33 => Some(if shift { b':' } else { b';' }),
+        0x36 => Some(if shift { b'<' } else { b',' }),
+        0x37 => Some(if shift { b'>' } else { b'.' }),
+        0x38 => Some(if shift { b'?' } else { b'/' }),
+        _ => None,
+    }
 }
 
 /// Busy-wait roughly `cycles` TSC ticks. Used for the millisecond-scale USB reset

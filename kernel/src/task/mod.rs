@@ -2758,9 +2758,10 @@ fn spawn_service_with_config(
     }
 
     // The USB keyboard driver gets a CONSOLE_PUSH cap so it can inject decoded
-    // keystrokes into the console input ring (§12). Name-gated to `xhci`.
+    // keystrokes into the console input ring (§12). Both USB drivers hold it —
+    // `xhci` for front-port keyboards, `ehci` for the back-port (USB 2.0) ones.
     let mut console_push_slot_u32 = u32::MAX;
-    if name == "xhci" {
+    if name == "xhci" || name == "ehci" {
         let cp_cap = mint_cap(CONSOLE_PUSH_RESOURCE, Rights::WRITE);
         let cap_slot = caps.insert(cp_cap)
             .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
