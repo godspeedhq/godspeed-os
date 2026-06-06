@@ -208,36 +208,6 @@ fn control(
     false
 }
 
-/// Decode a HID boot-keyboard usage code to ASCII (US layout, common keys).
-fn hid_to_ascii(key: u8, mods: u8) -> Option<u8> {
-    let shift = mods & 0x22 != 0; // left or right Shift
-    match key {
-        0x04..=0x1D => {
-            let base = b'a' + (key - 0x04);
-            Some(if shift { base - 32 } else { base })
-        }
-        0x1E..=0x26 => {
-            if shift {
-                Some([b'!', b'@', b'#', b'$', b'%', b'^', b'&', b'*', b'('][(key - 0x1E) as usize])
-            } else {
-                Some(b'1' + (key - 0x1E))
-            }
-        }
-        0x27 => Some(if shift { b')' } else { b'0' }),
-        0x28 => Some(b'\n'), // Enter
-        0x2A => Some(0x08),  // Backspace
-        0x2B => Some(b'\t'), // Tab
-        0x2C => Some(b' '),  // Space
-        0x2D => Some(if shift { b'_' } else { b'-' }),
-        0x2E => Some(if shift { b'+' } else { b'=' }),
-        0x33 => Some(if shift { b':' } else { b';' }),
-        0x36 => Some(if shift { b'<' } else { b',' }),
-        0x37 => Some(if shift { b'>' } else { b'.' }),
-        0x38 => Some(if shift { b'?' } else { b'/' }),
-        _ => None,
-    }
-}
-
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("xhci: driver starting");
@@ -319,7 +289,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut ep_mps = 0u16;
     let mut ep_interval = 0u8;
     let mut cfg_val = 0u8;
-    let mut kbd_iface = 0u8; // bInterfaceNumber of the bound boot-keyboard interface
+    let mut kbd_iface = 0u8;   // bInterfaceNumber of the bound HID interface
+    let mut bound_proto = 0u8; // HID protocol of the bound device (1=keyboard, 2=mouse)
 
     // --- Port census (back-USB diagnostic) ---
     // Log EVERY root-hub port's PORTSC, connected or not, BEFORE we start binding.
@@ -553,7 +524,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         ep_interval = 0;
         cfg_val = 0;
         let mut hid_proto = 0u8;
-        let mut cur_kbd = false; // are we inside a HID boot-keyboard interface?
+        let mut cur_hid = false; // are we inside a HID boot keyboard/mouse interface?
         while i + 2 <= total && i < 200 {
             let blen = dma.read8(CONFIG_BUF_OFF + i) as usize;
             let dtype = dma.read8(CONFIG_BUF_OFF + i + 1);
@@ -564,14 +535,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 2 => cfg_val = dma.read8(CONFIG_BUF_OFF + i + 5),
                 4 => {
                     // Interface descriptor: class[+5], protocol[+7], number[+2].
-                    // A boot keyboard is HID class (3) with protocol 1. A composite
-                    // keyboard also exposes a media-keys interface (protocol 0) with
-                    // its OWN interrupt-IN endpoint — we must bind the keyboard's,
-                    // not whichever endpoint happens to come last.
+                    // Bind a HID boot keyboard (class 3, protocol 1) OR mouse
+                    // (protocol 2). A composite device may expose extra interfaces
+                    // (e.g. media keys, protocol 0) with their OWN interrupt-IN
+                    // endpoints — bind the boot keyboard/mouse one, not whichever
+                    // endpoint happens to come last.
                     let iclass = dma.read8(CONFIG_BUF_OFF + i + 5);
                     let iproto = dma.read8(CONFIG_BUF_OFF + i + 7);
-                    cur_kbd = iclass == 3 && iproto == 1;
-                    if cur_kbd {
+                    cur_hid = iclass == 3 && (iproto == 1 || iproto == 2);
+                    if cur_hid {
                         hid_proto = iproto;
                         kbd_iface = dma.read8(CONFIG_BUF_OFF + i + 2);
                     }
@@ -579,8 +551,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 5 => {
                     let addr = dma.read8(CONFIG_BUF_OFF + i + 2);
                     let attr = dma.read8(CONFIG_BUF_OFF + i + 3);
-                    // First interrupt-IN endpoint of the boot-keyboard interface.
-                    if cur_kbd && attr & 0x3 == 0x3 && addr & 0x80 != 0 && ep_addr == 0 {
+                    // First interrupt-IN endpoint of the bound HID interface.
+                    if cur_hid && attr & 0x3 == 0x3 && addr & 0x80 != 0 && ep_addr == 0 {
                         ep_addr = addr;
                         ep_mps = dma.read16(CONFIG_BUF_OFF + i + 4);
                         ep_interval = dma.read8(CONFIG_BUF_OFF + i + 6);
@@ -591,24 +563,26 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             i += blen;
         }
         if ep_addr != 0 {
-            // This device is a HID keyboard — bind to it and stop scanning.
+            // This device is a HID boot keyboard or mouse — bind it and stop.
             ctx.log_fmt(format_args!(
-                "xhci: keyboard found on port {} (slot {}, proto={})",
-                port, slot, hid_proto
+                "xhci: {} found on port {} (slot {}, proto={})",
+                if hid_proto == 2 { "mouse" } else { "keyboard" }, port, slot, hid_proto
             ));
+            bound_proto = hid_proto;
             found = true;
             break 'ports;
         }
         ctx.log_fmt(format_args!(
-            "xhci: port {} device has no interrupt-IN endpoint (not a keyboard); next port",
+            "xhci: port {} device has no interrupt-IN endpoint (not a keyboard/mouse); next port",
             port
         ));
     } // end 'ports — scan of every connected port
 
     if !found {
-        ctx.log("xhci: no HID keyboard found on any port — idling");
+        ctx.log("xhci: no HID keyboard/mouse found on any port — idling");
         idle(&ctx);
     }
+    let is_mouse = bound_proto == 2;
     let ep_num = (ep_addr & 0x0F) as u32;
     let dci = ep_num * 2 + 1;
     ctx.log_fmt(format_args!(
@@ -716,12 +690,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     dma.write32(link + 8, 0);
     dma.write32(link + 12, (TRB_LINK << 10) | (1 << 1) | 1); // Link | Toggle Cycle | cycle
 
-    ctx.log("xhci: keyboard ready");
+    ctx.log_fmt(format_args!("xhci: {} ready", if is_mouse { "mouse" } else { "keyboard" }));
     ctx.signal_input_ready(); // end-of-boot signal: the shell auto-clears now
     let mut int_idx = 0usize;
     let mut int_cycle = 1u32;
     let mut need_queue = true;
-    let mut last_key = 0u8;
+    let mut kb_last = [0u8; 6];                            // keyboard edge-detection state
+    let mut mouse = godspeed_sdk::hid::MouseTracker::new(); // mouse button/motion state
     loop {
         if need_queue {
             let t = INT_TR_OFF + int_idx * 16;
@@ -741,18 +716,23 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         if let Some((TRB_TRANSFER_EVENT, _, _)) =
             next_event(&dma, &mmio, ir0, &mut ev_idx, &mut ev_cycle)
         {
-            let mods = dma.read8(REPORT_OFF);
-            let key = dma.read8(REPORT_OFF + 2); // first keycode in the boot report
-                                                 // Only act on a NEW press (key changed) so a held key doesn't spam.
-            if key != 0 && key != last_key {
-                // Push the decoded key into the console input ring → the shell's
-                // gs>. The kernel echoes it to the display; no per-key log here
-                // (that was the vertical KEY-per-line cascade during bring-up).
-                if let Some(ch) = hid_to_ascii(key, mods) {
-                    ctx.console_push(ch);
-                }
+            // Copy the 8-byte boot report out of DMA, then decode it with the
+            // controller-agnostic shared HID logic (§26.2). Keyboard reports push
+            // characters into the console; mouse reports log to serial (no cursor
+            // in a text console — that belongs to a future display server).
+            let mut rep = [0u8; 8];
+            for j in 0..8 { rep[j] = dma.read8(REPORT_OFF + j); }
+            if is_mouse {
+                mouse.feed(
+                    &rep,
+                    |mask, down| ctx.log_fmt(format_args!(
+                        "xhci: mouse {} {}",
+                        godspeed_sdk::hid::button_name(mask), if down { "down" } else { "up" })),
+                    |dx, dy| ctx.log_fmt(format_args!("xhci: mouse moved dx={} dy={}", dx, dy)),
+                );
+            } else {
+                godspeed_sdk::hid::decode_keyboard(&rep, &mut kb_last, |ch| ctx.console_push(ch));
             }
-            last_key = key;
             need_queue = true;
         }
         ctx.yield_cpu();

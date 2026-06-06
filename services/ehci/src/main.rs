@@ -593,8 +593,8 @@ fn poll_devices(
     wait(mmio, op + OP_USBSTS, STS_ASS, true);
 
     let mut toggle = [0u32; MAX_HID];
-    let mut kb_last = [0u8; 6];                     // keyboard edge-detection state
-    let (mut ms_btn, mut ms_ax, mut ms_ay) = (0u8, 0i32, 0i32); // mouse state
+    let mut kb_last = [0u8; 6];                           // keyboard edge-detection state
+    let mut mouse = godspeed_sdk::hid::MouseTracker::new(); // mouse button/motion state
     loop {
         for i in 0..n {
             let qh = POLL_BASE + i * POLL_STRIDE;
@@ -603,98 +603,24 @@ fn poll_devices(
             if dma.read32(qtd + 0x08) & QTD_ACTIVE != 0 { continue; } // still NAK'ing
             let tok = dma.read32(qtd + 0x08);
             if tok & (QTD_HALTED | QTD_ERRMASK) == 0 {
+                let mut rep = [0u8; 8];
+                for j in 0..8 { rep[j] = dma.read8(buf + j); }
                 if devs[i].is_mouse {
-                    decode_mouse(ctx, dma, buf, &mut ms_btn, &mut ms_ax, &mut ms_ay);
+                    mouse.feed(
+                        &rep,
+                        |mask, down| ctx.log_fmt(format_args!(
+                            "ehci: mouse {} {}",
+                            godspeed_sdk::hid::button_name(mask), if down { "down" } else { "up" })),
+                        |dx, dy| ctx.log_fmt(format_args!("ehci: mouse moved dx={} dy={}", dx, dy)),
+                    );
                 } else {
-                    decode_keyboard(ctx, dma, buf, &mut kb_last);
+                    godspeed_sdk::hid::decode_keyboard(&rep, &mut kb_last, |ch| ctx.console_push(ch));
                 }
                 toggle[i] ^= 1;            // successful IN flips the data toggle
             }
             arm_int(dma, qh, toggle[i]);  // re-arm (on success or error alike)
         }
         ctx.yield_cpu();
-    }
-}
-
-/// Decode a keyboard boot report (mods byte 0, up to six keycodes bytes 2..8) with
-/// N-key edge detection: emit every key down now but not in `last`, so rolling
-/// onto a new key drops nothing and a held key fires once. `buf` is the report's
-/// DMA offset; `last` carries the previous report's keycodes.
-fn decode_keyboard(ctx: &ServiceContext, dma: &godspeed_sdk::Dma, buf: usize, last: &mut [u8; 6]) {
-    let mods = dma.read8(buf + 0);
-    let mut cur = [0u8; 6];
-    for i in 0..6 { cur[i] = dma.read8(buf + 2 + i); }
-    for &k in cur.iter() {
-        if k == 0 || k == 0x01 { continue; } // 0=empty, 0x01=rollover error
-        if !last.contains(&k) {
-            if let Some(ch) = hid_to_ascii(k, mods) {
-                ctx.console_push(ch);
-            }
-        }
-    }
-    *last = cur;
-}
-
-/// Decode a mouse boot report (byte 0 = buttons L/R/M, byte 1 = dx, byte 2 = dy as
-/// signed deltas) and log it sparingly: each button transition as a discrete
-/// event, and accumulated movement only once it crosses a threshold — a mouse
-/// emits far too many move reports to log each one. There is no on-screen cursor
-/// in a text console (that belongs to a future display server); this is the
-/// proof-of-life that the mouse works end to end.
-fn decode_mouse(
-    ctx: &ServiceContext, dma: &godspeed_sdk::Dma, buf: usize,
-    btn: &mut u8, ax: &mut i32, ay: &mut i32,
-) {
-    let b = dma.read8(buf + 0) & 0x07;
-    let dx = dma.read8(buf + 1) as i8 as i32;
-    let dy = dma.read8(buf + 2) as i8 as i32;
-    let changed = b ^ *btn;
-    if changed & 0x01 != 0 {
-        ctx.log_fmt(format_args!("ehci: mouse LEFT {}",   if b & 0x01 != 0 { "down" } else { "up" }));
-    }
-    if changed & 0x02 != 0 {
-        ctx.log_fmt(format_args!("ehci: mouse RIGHT {}",  if b & 0x02 != 0 { "down" } else { "up" }));
-    }
-    if changed & 0x04 != 0 {
-        ctx.log_fmt(format_args!("ehci: mouse MIDDLE {}", if b & 0x04 != 0 { "down" } else { "up" }));
-    }
-    *btn = b;
-    *ax += dx;
-    *ay += dy;
-    if (*ax).abs() + (*ay).abs() >= 60 {
-        ctx.log_fmt(format_args!("ehci: mouse moved dx={} dy={}", *ax, *ay));
-        *ax = 0;
-        *ay = 0;
-    }
-}
-
-/// Decode a HID boot-keyboard usage code to ASCII (US layout, common keys).
-fn hid_to_ascii(key: u8, mods: u8) -> Option<u8> {
-    let shift = mods & 0x22 != 0; // left or right Shift
-    match key {
-        0x04..=0x1D => {
-            let base = b'a' + (key - 0x04);
-            Some(if shift { base - 32 } else { base })
-        }
-        0x1E..=0x26 => {
-            if shift {
-                Some([b'!', b'@', b'#', b'$', b'%', b'^', b'&', b'*', b'('][(key - 0x1E) as usize])
-            } else {
-                Some(b'1' + (key - 0x1E))
-            }
-        }
-        0x27 => Some(if shift { b')' } else { b'0' }),
-        0x28 => Some(b'\n'), // Enter
-        0x2A => Some(0x08),  // Backspace
-        0x2B => Some(b'\t'), // Tab
-        0x2C => Some(b' '),  // Space
-        0x2D => Some(if shift { b'_' } else { b'-' }),
-        0x2E => Some(if shift { b'+' } else { b'=' }),
-        0x33 => Some(if shift { b':' } else { b';' }),
-        0x36 => Some(if shift { b'<' } else { b',' }),
-        0x37 => Some(if shift { b'>' } else { b'.' }),
-        0x38 => Some(if shift { b'?' } else { b'/' }),
-        _ => None,
     }
 }
 
