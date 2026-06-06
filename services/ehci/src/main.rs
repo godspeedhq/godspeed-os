@@ -435,6 +435,7 @@ fn scan_devices(
         let kep = Ep::low(0, 8, 1, port);
         let dd  = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]; // Get_Descriptor(Device), 18
         let mut got = false;
+        let mut high_speed = false; // device enabled at high speed after reset
         for attempt in 1..=3u32 {
             delay_cycles(ctx, DEBOUNCE_CYCLES); // connect-debounce before reset
             let s = [0x23, 0x03, 0x04, 0x00, port, 0x00, 0x00, 0x00]; // Set_Feature(PORT_RESET)
@@ -448,6 +449,19 @@ fn scan_devices(
             let _ = control(ctx, mmio, dma, op, &Ep::hs(1, mps0), &s, 4, true);
             let pstat = dma.read16(DATA_BUF + 0);
 
+            // A device that enables at high speed (status bit 10) after reset is
+            // mass storage or a nested hub, not a boot HID. The speed bits aren't
+            // valid until the reset completes (a thumbdrive reads 0x0101 before
+            // reset, 0x0503 after), so this is where we can finally tell. Abandon it
+            // without retrying or marking the port faulty — it isn't.
+            if (pstat >> 10) & 1 != 0 {
+                ctx.log_fmt(format_args!(
+                    "ehci: hub port {} enabled high-speed (mass storage / hub) — not a HID, skipping",
+                    port));
+                high_speed = true;
+                break;
+            }
+
             // Retry the descriptor read several times within this reset before
             // re-resetting: this keyboard's FIRST split SETUP after a reset
             // XactErrs, but a settle-and-retry on the same reset often succeeds.
@@ -456,6 +470,7 @@ fn scan_devices(
                 "ehci: hub port {} attempt {} failed (post-reset status={:#06x}) — re-resetting",
                 port, attempt, pstat));
         }
+        if high_speed { continue; } // not a HID, and not faulty — skip quietly
         if !got {
             ctx.log_fmt(format_args!("ehci: split descriptor on hub port {} failed after 3 resets", port));
             any_failed = true;
