@@ -389,13 +389,15 @@ fn is_observe_variant(name: &str) -> bool {
 }
 
 /// Services the live console session depends on for I/O. Killing/restarting them
-/// from the shell would brick the very session issuing the command — the input
-/// driver (`xhci` = USB keyboard) or the shell itself. Returns the reason to show,
-/// or `None` if `name` is safe to operate on. (Not a §6.2 trusted-root guard —
-/// these are restartable in principle, just not from the session that needs them.)
+/// from the shell would brick the very session issuing the command — an input
+/// driver (`xhci`/`ehci` = USB keyboard, front and back ports) or the shell
+/// itself. Returns the reason to show, or `None` if `name` is safe to operate on.
+/// (Not a §6.2 trusted-root guard — these are restartable in principle, just not
+/// from the session that needs them.)
 fn session_critical_msg(name: &str) -> Option<&'static str> {
     match name {
-        "xhci"  => Some("Not applicable. xhci is the USB keyboard driver — killing it disables input"),
+        "xhci"  => Some("Not applicable. xhci is the USB keyboard driver (front ports) — killing it disables input"),
+        "ehci"  => Some("Not applicable. ehci is the USB keyboard driver (back ports) — killing it disables input"),
         "shell" => Some("Not applicable. that is this shell — the session you are typing in"),
         _       => None,
     }
