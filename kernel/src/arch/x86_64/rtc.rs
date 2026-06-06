@@ -1,0 +1,121 @@
+//! MC146818 CMOS real-time clock (§12, arch hardware boundary).
+//!
+//! Read-only wall-clock access. The RTC is a legacy device on the I/O ports
+//! 0x70 (index) / 0x71 (data); port I/O is ring-0, so — like the PIT, PIC, and
+//! serial UART — it lives in the arch layer rather than a userspace driver
+//! (there is no I/O-port capability in v1, and the clock is a tiny read-only
+//! device). Userspace reads it via `InspectKernel` query 11, ungated, because
+//! the time of day is task-neutral hardware info (like the TSC clock).
+
+const CMOS_INDEX: u16 = 0x70;
+const CMOS_DATA: u16 = 0x71;
+
+/// Read one CMOS register.
+fn cmos_read(reg: u8) -> u8 {
+    // SAFETY: 0x70/0x71 are the standard CMOS index/data ports. Writing a register
+    // number (0x00..0x3F, bit 7 clear) to 0x70 selects it; reading 0x71 returns its
+    // value. Pure port I/O with no memory effects. The two asm blocks are not `pure`,
+    // so the compiler preserves their order (index write before data read).
+    unsafe {
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") CMOS_INDEX,
+            in("al") reg,
+            options(nostack, nomem, preserves_flags),
+        );
+        let val: u8;
+        core::arch::asm!(
+            "in al, dx",
+            in("dx") CMOS_DATA,
+            out("al") val,
+            options(nostack, nomem, preserves_flags),
+        );
+        val
+    }
+}
+
+/// Status register A bit 7: an RTC update is in progress (values are changing).
+#[inline]
+fn update_in_progress() -> bool {
+    cmos_read(0x0A) & 0x80 != 0
+}
+
+#[inline]
+fn bcd_to_bin(v: u8) -> u8 {
+    (v & 0x0F) + ((v >> 4) * 10)
+}
+
+/// Read the RTC and return the wall-clock date/time packed into a `u64`:
+///
+/// ```text
+///   bits  0..6   second (0–59)
+///   bits  6..12  minute (0–59)
+///   bits 12..17  hour   (0–23)
+///   bits 17..22  day    (1–31)
+///   bits 22..26  month  (1–12)
+///   bits 26..38  year   (full, e.g. 2026)
+/// ```
+///
+/// Robust against an RTC tick landing mid-read: it reads every field, reads them
+/// again, and repeats until two consecutive reads agree (the standard algorithm —
+/// no need to disable interrupts). Decodes BCD and 12-hour mode per status
+/// register B, so the returned fields are always binary and 24-hour.
+pub fn read_datetime() -> u64 {
+    while update_in_progress() {}
+    let (mut sec, mut min, mut hour) = (cmos_read(0), cmos_read(2), cmos_read(4));
+    let (mut day, mut month, mut year, mut century) =
+        (cmos_read(7), cmos_read(8), cmos_read(9), cmos_read(0x32));
+    loop {
+        let prev = (sec, min, hour, day, month, year, century);
+        while update_in_progress() {}
+        sec = cmos_read(0);
+        min = cmos_read(2);
+        hour = cmos_read(4);
+        day = cmos_read(7);
+        month = cmos_read(8);
+        year = cmos_read(9);
+        century = cmos_read(0x32);
+        if prev == (sec, min, hour, day, month, year, century) {
+            break;
+        }
+    }
+
+    let regb = cmos_read(0x0B);
+    let is_binary = regb & 0x04 != 0; // DM: 1 = binary, 0 = BCD
+    let is_24h = regb & 0x02 != 0; // 1 = 24-hour, 0 = 12-hour
+
+    // The 12-hour PM flag is bit 7 of the raw hour byte; preserve it across BCD
+    // decode, which only touches the low 7 bits.
+    let pm = hour & 0x80 != 0;
+    if is_binary {
+        hour &= 0x7F;
+    } else {
+        sec = bcd_to_bin(sec);
+        min = bcd_to_bin(min);
+        hour = bcd_to_bin(hour & 0x7F);
+        day = bcd_to_bin(day);
+        month = bcd_to_bin(month);
+        year = bcd_to_bin(year);
+        century = bcd_to_bin(century);
+    }
+    if !is_24h {
+        if pm {
+            hour = (hour % 12) + 12; // 1–11 PM → 13–23, 12 PM → 12
+        } else if hour == 12 {
+            hour = 0; // 12 AM → 00
+        }
+    }
+
+    // Full year. The century register (0x32) is present on PCs and QEMU; if it
+    // reads an implausible value (an absent register can read 0 or 0xFF), assume
+    // the 2000s.
+    let century = if (19..=21).contains(&century) { century as u64 } else { 20 };
+    let full_year = century * 100 + (year as u64 % 100);
+
+    (sec as u64 & 0x3F)
+        | ((min as u64 & 0x3F) << 6)
+        | ((hour as u64 & 0x1F) << 12)
+        | ((day as u64 & 0x1F) << 17)
+        | ((month as u64 & 0x0F) << 22)
+        | ((full_year & 0xFFF) << 26)
+}
