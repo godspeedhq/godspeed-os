@@ -70,14 +70,27 @@ fn spin<F: Fn() -> bool>(cond: F) {
     }
 }
 
-/// Wait until some root-hub port reports a connected device, then return so the
-/// caller re-scans. Used between hot-plug events while nothing is attached.
+/// Wait until a port reports a *newly* connected device, then return so the caller
+/// re-scans. Snapshots the ports already connected on entry (e.g. the USB boot
+/// drive, which is always present and is not a HID) and only returns when a port
+/// that was NOT connected becomes connected — otherwise an always-present non-HID
+/// device would make the hot-plug loop spin (re-scan → not a keyboard → wait →
+/// still connected → re-scan …).
 fn wait_for_port(ctx: &ServiceContext, mmio: &Mmio, op: usize, max_ports: u32) {
+    let connected = |p: u32| {
+        mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10) & PORT_CCS != 0
+    };
+    let mut base = 0u32;
+    for p in 1..=max_ports {
+        if connected(p) { base |= 1 << p; }
+    }
     loop {
         for p in 1..=max_ports {
-            if mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10) & PORT_CCS != 0 {
-                return;
+            let c = connected(p);
+            if c && base & (1 << p) == 0 {
+                return; // a new device appeared on port p
             }
+            if !c { base &= !(1 << p); } // a known device left; its port can be reused
         }
         ctx.yield_cpu();
     }

@@ -506,21 +506,33 @@ fn scan_devices(
     (devs, ndev)
 }
 
-/// Poll the hub's downstream port status until at least one reports a connected
-/// device, then return so the caller re-scans. Used while nothing is attached, so
-/// the async schedule is free for these control transfers to the hub.
+/// Poll the hub's downstream ports until one reports a *newly* connected device,
+/// then return so the caller re-scans. Snapshots the ports already connected on
+/// entry (e.g. a device sitting on the dead port that never enumerates) and only
+/// returns on a port that was NOT connected — otherwise a connected-but-unusable
+/// device would make the hot-plug loop spin (re-scan → fails → wait → still
+/// connected → re-scan …). The async schedule is free for these hub control
+/// transfers while nothing usable is attached.
 fn wait_for_connection(
     ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
     op: usize, mps0: u32, nports: u8,
 ) {
+    let connected = |port: u8| -> bool {
+        let setup = [0xA3, 0x00, 0x00, 0x00, port, 0x00, 0x04, 0x00]; // Get_Status
+        control(ctx, mmio, dma, op, &Ep::hs(1, mps0), &setup, 4, true).is_some()
+            && dma.read16(DATA_BUF + 0) & 1 != 0
+    };
+    let mut base = 0u32;
+    for port in 1..=nports {
+        if connected(port) { base |= 1 << port; }
+    }
     loop {
         for port in 1..=nports {
-            let setup = [0xA3, 0x00, 0x00, 0x00, port, 0x00, 0x04, 0x00]; // Get_Status
-            if control(ctx, mmio, dma, op, &Ep::hs(1, mps0), &setup, 4, true).is_some()
-                && dma.read16(DATA_BUF + 0) & 1 != 0
-            {
-                return; // something plugged in
+            let c = connected(port);
+            if c && base & (1 << port) == 0 {
+                return; // a new device appeared on this port
             }
+            if !c { base &= !(1 << port); } // a known device left; its port can be reused
         }
         delay_cycles(ctx, DEBOUNCE_CYCLES); // ~50 ms between polls
         ctx.yield_cpu();
