@@ -415,6 +415,19 @@ fn scan_devices(
             port, status, (status & 1) as u8, ((status >> 9) & 1) as u8));
         if status & 1 == 0 { continue; } // nothing connected
 
+        // A high-speed device on a hub port (status bit 10) is mass storage or a
+        // nested hub — never a boot keyboard/mouse, which are low/full speed. Skip
+        // it: a low-speed split descriptor read to a high-speed device fails and
+        // would look like a faulty port, which it is not. This is how the USB boot
+        // thumbdrive, when it sits on an EHCI port, is correctly ignored (rather
+        // than nagging "faulty port — try another").
+        if (status >> 10) & 1 != 0 {
+            ctx.log_fmt(format_args!(
+                "ehci: hub port {} has a high-speed device (mass storage / hub) — not a HID, skipping",
+                port));
+            continue;
+        }
+
         // Reset the port and read the device descriptor over SPLIT, retrying with a
         // FULL re-reset (+ connect-debounce + longer recovery) each attempt — the
         // Logitech keyboard's first SETUP after a single reset XactErrs, the
@@ -422,6 +435,7 @@ fn scan_devices(
         let kep = Ep::low(0, 8, 1, port);
         let dd  = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]; // Get_Descriptor(Device), 18
         let mut got = false;
+        let mut high_speed = false; // device enabled at high speed after reset
         for attempt in 1..=3u32 {
             delay_cycles(ctx, DEBOUNCE_CYCLES); // connect-debounce before reset
             let s = [0x23, 0x03, 0x04, 0x00, port, 0x00, 0x00, 0x00]; // Set_Feature(PORT_RESET)
@@ -435,6 +449,19 @@ fn scan_devices(
             let _ = control(ctx, mmio, dma, op, &Ep::hs(1, mps0), &s, 4, true);
             let pstat = dma.read16(DATA_BUF + 0);
 
+            // A device that enables at high speed (status bit 10) after reset is
+            // mass storage or a nested hub, not a boot HID. The speed bits aren't
+            // valid until the reset completes (a thumbdrive reads 0x0101 before
+            // reset, 0x0503 after), so this is where we can finally tell. Abandon it
+            // without retrying or marking the port faulty — it isn't.
+            if (pstat >> 10) & 1 != 0 {
+                ctx.log_fmt(format_args!(
+                    "ehci: hub port {} enabled high-speed (mass storage / hub) — not a HID, skipping",
+                    port));
+                high_speed = true;
+                break;
+            }
+
             // Retry the descriptor read several times within this reset before
             // re-resetting: this keyboard's FIRST split SETUP after a reset
             // XactErrs, but a settle-and-retry on the same reset often succeeds.
@@ -443,6 +470,7 @@ fn scan_devices(
                 "ehci: hub port {} attempt {} failed (post-reset status={:#06x}) — re-resetting",
                 port, attempt, pstat));
         }
+        if high_speed { continue; } // not a HID, and not faulty — skip quietly
         if !got {
             ctx.log_fmt(format_args!("ehci: split descriptor on hub port {} failed after 3 resets", port));
             any_failed = true;
@@ -526,22 +554,31 @@ fn wait_for_connection(
     ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
     op: usize, mps0: u32, nports: u8,
 ) {
-    let connected = |port: u8| -> bool {
+    // Returns Some(true/false) on a successful status read, None if the read
+    // itself failed. Distinguishing "read failed (state unknown)" from "read OK,
+    // not connected" matters: a device whose split status reads are intermittently
+    // flaky (e.g. the boot thumbdrive on a hub TT) would otherwise flap
+    // connected→disconnected→connected and trigger a spurious "new device" return,
+    // re-scanning forever. On a failed read we leave the snapshot untouched.
+    let status = |port: u8| -> Option<bool> {
         let setup = [0xA3, 0x00, 0x00, 0x00, port, 0x00, 0x04, 0x00]; // Get_Status
-        control(ctx, mmio, dma, op, &Ep::hs(1, mps0), &setup, 4, true).is_some()
-            && dma.read16(DATA_BUF + 0) & 1 != 0
+        if control(ctx, mmio, dma, op, &Ep::hs(1, mps0), &setup, 4, true).is_some() {
+            Some(dma.read16(DATA_BUF + 0) & 1 != 0)
+        } else {
+            None
+        }
     };
     let mut base = 0u32;
     for port in 1..=nports {
-        if connected(port) { base |= 1 << port; }
+        if status(port) == Some(true) { base |= 1 << port; }
     }
     loop {
         for port in 1..=nports {
-            let c = connected(port);
-            if c && base & (1 << port) == 0 {
-                return; // a new device appeared on this port
+            match status(port) {
+                Some(true) if base & (1 << port) == 0 => return, // a new device appeared
+                Some(false) => base &= !(1 << port), // a known device left; reuse its port
+                _ => {}                              // unchanged, or unknown (read failed)
             }
-            if !c { base &= !(1 << port); } // a known device left; its port can be reused
         }
         delay_cycles(ctx, DEBOUNCE_CYCLES); // ~50 ms between polls
         ctx.yield_cpu();
