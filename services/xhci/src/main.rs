@@ -34,14 +34,31 @@ const PORT_PED: u32 = 1 << 1;
 const PORT_PR: u32 = 1 << 4;
 const PORT_RW1C: u32 = 0x00FE_0000; // change bits 17..23 (write 0 to preserve)
 
-// DMA arena layout (64 KiB).
+// DMA arena layout (64 KiB). Shared controller structures up front, then a
+// per-device 4-page slice (device context + EP0 ring + interrupt ring + report
+// buffer) for each HID device we bind — so a keyboard AND a mouse can run on the
+// same controller at once. Device i occupies [DEV_BASE + i*DEV_STRIDE, +STRIDE).
 const DCBAA_OFF: usize = 0x0000;
 const CMD_RING_OFF: usize = 0x1000;
 const EVENT_RING_OFF: usize = 0x2000;
 const ERST_OFF: usize = 0x3000;
-const INPUT_CTX_OFF: usize = 0x6000;
-const DEVICE_CTX_OFF: usize = 0x7000;
-const EP0_TR_OFF: usize = 0x8000;
+const INPUT_CTX_OFF: usize = 0x4000;  // transient: built per device for Address/Configure
+const DATA_BUF_OFF: usize = 0x5000;   // transient: control-transfer data during enumeration
+const CONFIG_BUF_OFF: usize = 0x6000; // transient: config descriptor during enumeration
+
+/// Maximum HID devices bound on one controller at once (keyboard + mouse).
+const MAX_HID: usize = 2;
+const DEV_BASE: usize = 0x7000;
+const DEV_STRIDE: usize = 0x4000; // 4 pages: device ctx, EP0 ring, int ring, report
+fn device_ctx_off(i: usize) -> usize { DEV_BASE + i * DEV_STRIDE }
+fn ep0_tr_off(i: usize) -> usize { DEV_BASE + i * DEV_STRIDE + 0x1000 }
+fn int_tr_off(i: usize) -> usize { DEV_BASE + i * DEV_STRIDE + 0x2000 }
+fn report_off(i: usize) -> usize { DEV_BASE + i * DEV_STRIDE + 0x3000 }
+
+/// A bound HID device: its slot, interrupt-endpoint DCI, root-hub port (for
+/// disconnect detection), per-device DMA slice index, and whether it's a mouse.
+#[derive(Clone, Copy)]
+struct Hid { slot: u32, dci: u32, port: u32, idx: usize, is_mouse: bool }
 
 const EVENT_RING_TRBS: usize = 16;
 const TRB_SIZE: usize = 16;
@@ -58,10 +75,6 @@ const TRB_TRANSFER_EVENT: u32 = 32;
 const TRB_CMD_COMPLETION: u32 = 33;
 const TRB_PORT_STATUS_CHANGE: u32 = 34;
 
-const DATA_BUF_OFF: usize = 0x9000; // control-transfer data buffer (page 9)
-const CONFIG_BUF_OFF: usize = 0xA000; // config-descriptor buffer (page 10)
-const INT_TR_OFF: usize = 0xB000; // interrupt-endpoint transfer ring (page 11)
-const REPORT_OFF: usize = 0xC000; // HID report buffer (page 12)
 
 fn spin<F: Fn() -> bool>(cond: F) {
     let mut n = 0u32;
@@ -202,6 +215,7 @@ fn control(
     dboff: usize,
     ir0: usize,
     slot: u32,
+    dev: usize,
     ep0_off: usize,
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
@@ -212,7 +226,7 @@ fn control(
     wlen: u32,
     data_off: usize,
 ) -> bool {
-    let tr = EP0_TR_OFF + ep0_off;
+    let tr = ep0_tr_off(dev) + ep0_off;
     dma.write32(tr, bmreq | (breq << 8) | (wval << 16));
     dma.write32(tr + 4, widx | (wlen << 16));
     dma.write32(tr + 8, 8);
@@ -443,14 +457,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
         // EP0 Context (Control): CErr=3 [2:1], EP Type=4 [5:3], Max Packet [31:16];
         // TR Dequeue Ptr | DCS; Average TRB Length.
-        let ep0_tr = dma.phys_at(EP0_TR_OFF);
+        let ep0_tr = dma.phys_at(ep0_tr_off(0));
         dma.write32(iep0 + 4, (3 << 1) | (4 << 3) | (max_packet << 16));
         dma.write32(iep0 + 8, (ep0_tr as u32 & !0xF) | 1);
         dma.write32(iep0 + 12, (ep0_tr >> 32) as u32);
         dma.write32(iep0 + 16, 8);
 
         // DCBAA[slot] = device context physical base.
-        dma.write64(DCBAA_OFF + slot as usize * 8, dma.phys_at(DEVICE_CTX_OFF));
+        dma.write64(DCBAA_OFF + slot as usize * 8, dma.phys_at(device_ctx_off(0)));
 
         // Address Device command (input context ptr, slot id).
         let in_phys = dma.phys_at(INPUT_CTX_OFF);
@@ -492,21 +506,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Three TRBs on the EP0 transfer ring: Setup (immediate GET_DESCRIPTOR),
         // Data (IN, 18 bytes), Status (OUT, IOC). Then ring the slot's EP0 doorbell.
         let data_phys = dma.phys_at(DATA_BUF_OFF);
-        dma.write32(EP0_TR_OFF, 0x80 | (6 << 8) | (0x0100 << 16)); // bmReqType|bRequest|wValue
-        dma.write32(EP0_TR_OFF + 4, 18 << 16); // wIndex=0 | wLength=18
-        dma.write32(EP0_TR_OFF + 8, 8); // setup data length
+        dma.write32(ep0_tr_off(0), 0x80 | (6 << 8) | (0x0100 << 16)); // bmReqType|bRequest|wValue
+        dma.write32(ep0_tr_off(0) + 4, 18 << 16); // wIndex=0 | wLength=18
+        dma.write32(ep0_tr_off(0) + 8, 8); // setup data length
         dma.write32(
-            EP0_TR_OFF + 12,
+            ep0_tr_off(0) + 12,
             1 | (1 << 6) | (TRB_SETUP_STAGE << 10) | (3 << 16),
         ); // cyc|IDT|type|TRT=IN
-        dma.write32(EP0_TR_OFF + 16, data_phys as u32);
-        dma.write32(EP0_TR_OFF + 20, (data_phys >> 32) as u32);
-        dma.write32(EP0_TR_OFF + 24, 18);
-        dma.write32(EP0_TR_OFF + 28, 1 | (TRB_DATA_STAGE << 10) | (1 << 16)); // cyc|type|DIR=IN
-        dma.write32(EP0_TR_OFF + 32, 0);
-        dma.write32(EP0_TR_OFF + 36, 0);
-        dma.write32(EP0_TR_OFF + 40, 0);
-        dma.write32(EP0_TR_OFF + 44, 1 | (1 << 5) | (TRB_STATUS_STAGE << 10)); // cyc|IOC|type
+        dma.write32(ep0_tr_off(0) + 16, data_phys as u32);
+        dma.write32(ep0_tr_off(0) + 20, (data_phys >> 32) as u32);
+        dma.write32(ep0_tr_off(0) + 24, 18);
+        dma.write32(ep0_tr_off(0) + 28, 1 | (TRB_DATA_STAGE << 10) | (1 << 16)); // cyc|type|DIR=IN
+        dma.write32(ep0_tr_off(0) + 32, 0);
+        dma.write32(ep0_tr_off(0) + 36, 0);
+        dma.write32(ep0_tr_off(0) + 40, 0);
+        dma.write32(ep0_tr_off(0) + 44, 1 | (1 << 5) | (TRB_STATUS_STAGE << 10)); // cyc|IOC|type
         mmio.write32(dboff + slot as usize * 4, 1); // EP0 doorbell (DCI 1)
 
         let mut ok = false;
@@ -537,7 +551,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
         // --- Stage 4a: Get Configuration Descriptor; find the interrupt-IN endpoint ---
         let cfg_phys = dma.phys_at(CONFIG_BUF_OFF);
-        let tr = EP0_TR_OFF + 48; // next 3 TRBs on the EP0 transfer ring
+        let tr = ep0_tr_off(0) + 48; // next 3 TRBs on the EP0 transfer ring
         dma.write32(tr, 0x80 | (6 << 8) | (0x0200 << 16)); // GET_DESCRIPTOR Config(2), idx 0
         dma.write32(tr + 4, 64 << 16); // wIndex=0 | wLength=64
         dma.write32(tr + 8, 8);
@@ -655,7 +669,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     dma.write32(islot, (dci << 27) | (speed << 20)); // Context Entries = dci
     dma.write32(islot + 4, port << 16);
     let iep = INPUT_CTX_OFF + (1 + dci as usize) * ctx_size;
-    let int_tr = dma.phys_at(INT_TR_OFF);
+    let int_tr = dma.phys_at(int_tr_off(0));
     // xHCI Endpoint Context Interval encoding is speed-dependent (xHCI §6.2.3.6):
     //   Low/Full speed (PSI 1,2): bInterval is in 1 ms frames → 3 + floor(log2(bInterval)),
     //                             clamped to [3, 10].
@@ -708,6 +722,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         dboff,
         ir0,
         slot,
+        0, // device slice index (Stage 2 will vary this)
         96,
         &mut ev_idx,
         &mut ev_cycle,
@@ -728,6 +743,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         dboff,
         ir0,
         slot,
+        0, // device slice index (Stage 2 will vary this)
         128,
         &mut ev_idx,
         &mut ev_cycle,
@@ -740,9 +756,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ); // SET_PROTOCOL: boot (wValue=0) on the keyboard's interface
 
     // --- Stage 4c: poll the interrupt endpoint for HID key reports ---
-    let report_phys = dma.phys_at(REPORT_OFF);
-    let ring_phys = dma.phys_at(INT_TR_OFF);
-    let link = INT_TR_OFF + 15 * 16; // Link TRB closes the 16-entry ring
+    let report_phys = dma.phys_at(report_off(0));
+    let ring_phys = dma.phys_at(int_tr_off(0));
+    let link = int_tr_off(0) + 15 * 16; // Link TRB closes the 16-entry ring
     dma.write32(link, ring_phys as u32);
     dma.write32(link + 4, (ring_phys >> 32) as u32);
     dma.write32(link + 8, 0);
@@ -761,7 +777,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let portsc_off = op + OP_PORTSC_BASE + (port as usize - 1) * 0x10;
     'poll: loop {
         if need_queue {
-            let t = INT_TR_OFF + int_idx * 16;
+            let t = int_tr_off(0) + int_idx * 16;
             dma.write32(t, report_phys as u32);
             dma.write32(t + 4, (report_phys >> 32) as u32);
             dma.write32(t + 8, 8);
@@ -783,7 +799,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // characters into the console; mouse reports log to serial (no cursor
             // in a text console — that belongs to a future display server).
             let mut rep = [0u8; 8];
-            for j in 0..8 { rep[j] = dma.read8(REPORT_OFF + j); }
+            for j in 0..8 { rep[j] = dma.read8(report_off(0) + j); }
             if is_mouse {
                 mouse.feed(
                     &rep,
