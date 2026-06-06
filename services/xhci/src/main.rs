@@ -604,8 +604,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ));
 
     // Hot-plug state that persists across passes.
-    let mut announce = false; // suppress the connect line for the boot device
-    let mut signaled = false; // signal_input_ready (boot-screen clear) exactly once
+    let mut announce = false;    // suppress the connect line for the boot device
+    let mut signaled = false;    // signal_input_ready (boot-screen clear) exactly once
+    let mut prev_ports = 0u32;   // root-hub ports bound on the previous pass
 
     // Hot-plug loop. Each pass FULLY re-initializes the controller (stop, reset,
     // rebuild the command/event rings + DCBAA, run) so every (re)enumeration starts
@@ -688,14 +689,27 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
         ctx.log_fmt(format_args!("xhci: {} HID device(s) bound", ndev));
         if !signaled { ctx.signal_input_ready(); signaled = true; } // boot-screen clear, once
+        // Announce only devices that weren't already bound on the previous pass. A
+        // hot-plug re-initializes the whole controller and re-binds EVERY surviving
+        // device, but a device whose port was bound last pass wasn't physically
+        // touched — announcing it again ("keyboard connected" when only the mouse
+        // was unplugged) would be misleading. `announce` stays false for the boot
+        // pass, so the initial devices are silent regardless.
         if announce {
             for d in &devs[..ndev] {
-                notify(&ctx, match (d.is_mouse, d.idx) {
-                    (true, _) => "mouse connected (xhci)",
-                    (false, _) => "keyboard connected (xhci)",
-                });
+                if prev_ports & (1 << d.port) == 0 {
+                    notify(&ctx, if d.is_mouse {
+                        "mouse connected (xhci)"
+                    } else {
+                        "keyboard connected (xhci)"
+                    });
+                }
             }
         }
+        // Remember which ports are bound so the next pass can tell a genuinely new
+        // plug from a survivor the re-init merely re-bound.
+        prev_ports = 0;
+        for d in &devs[..ndev] { prev_ports |= 1 << d.port; }
 
         // --- Poll every bound device's interrupt endpoint from one loop ---
         // The event ring is shared; transfer events are demultiplexed by slot id.
