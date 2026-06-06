@@ -403,7 +403,10 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
             let _ = control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &s, 4, true);
             let pstat = dma.read16(DATA_BUF + 0);
 
-            if control(ctx, mmio, &dma, op, &kep, &dd, 18, true).is_some() { got = true; break; }
+            // Retry the descriptor read several times within this reset before
+            // re-resetting: this keyboard's FIRST split SETUP after a reset
+            // XactErrs, but a settle-and-retry on the same reset often succeeds.
+            if control_retry(ctx, mmio, &dma, op, &kep, &dd, 18, true, 6).is_some() { got = true; break; }
             ctx.log_fmt(format_args!(
                 "ehci: hub port {} attempt {} failed (post-reset status={:#06x}) — re-resetting",
                 port, attempt, pstat));
