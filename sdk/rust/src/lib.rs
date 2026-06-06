@@ -7,6 +7,7 @@
 
 pub mod capability;
 pub mod dma;
+pub mod hid;
 pub mod ipc;
 pub mod mmio;
 pub mod service_context;
