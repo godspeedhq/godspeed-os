@@ -199,6 +199,13 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     arch::x86_64::init(boot_info);
     memory::init(boot_info);
 
+    // Hardening: unmap a guard page below each kernel-stack slot so an overflow
+    // faults loudly instead of corrupting the neighbouring stack. Done here — BSP
+    // only, before APs and before any kstack is allocated, so no TLB shootdown is
+    // needed and init's stack already carries its guard.
+    // SAFETY: BSP, after memory::init (page tables live), before smp::init.
+    unsafe { task::install_kstack_guards() };
+
     // Stage 1 of the USB stack: locate the xHCI controller (§12). Records its
     // MMIO base + IRQ for a future userspace driver's hw_mmio/hw_interrupt caps.
     arch::x86_64::pci::init();

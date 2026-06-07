@@ -24,20 +24,61 @@ use crate::memory::frame::PhysAddr;
 // ---------------------------------------------------------------------------
 
 const TASK_KSTACK_MAX: usize = 224; // raised from 208 to accommodate Milestone 20 brutal adversarial probes
-const KSTACK_SIZE:     usize = 64 * 1024;
+const KSTACK_SIZE:     usize = 64 * 1024; // usable stack per slot (unchanged)
+const KSTACK_GUARD:    usize = 4096;      // unmapped guard page below each slot
+const KSTACK_STRIDE:   usize = KSTACK_SIZE + KSTACK_GUARD; // 68 KiB per slot
 
-#[repr(C, align(16))]
+// Page-aligned (4 KiB) so each slot starts on a page boundary — required for the
+// per-slot guard page (`install_kstack_guards`). Each slot is a 4 KiB guard page
+// followed by 64 KiB of usable stack; usable size is unchanged, the guard is extra.
+#[repr(C, align(4096))]
 struct KernelStackStorage {
-    data: [u8; KSTACK_SIZE * TASK_KSTACK_MAX],
+    data: [u8; KSTACK_STRIDE * TASK_KSTACK_MAX],
 }
 
 static mut KSTACK_STORAGE: KernelStackStorage =
-    KernelStackStorage { data: [0u8; KSTACK_SIZE * TASK_KSTACK_MAX] };
+    KernelStackStorage { data: [0u8; KSTACK_STRIDE * TASK_KSTACK_MAX] };
 
 // Boolean liveness flags for each kstack slot. Protected by SpinLock so
 // concurrent alloc/free on different cores are atomic without volatile tricks.
 static KSTACK_USED: SpinLock<[bool; TASK_KSTACK_MAX]> =
     SpinLock::new([false; TASK_KSTACK_MAX]);
+
+/// Base virtual address of the kstack pool.
+pub fn kstack_pool_base() -> u64 {
+    // SAFETY: read-only address-of a stable static; no &mut materialised.
+    unsafe { core::ptr::addr_of!(KSTACK_STORAGE.data) as *const u8 as u64 }
+}
+
+/// Install a guard page below every kstack slot (hardening H4 guard-pages). The
+/// low 4 KiB page of each 68 KiB slot is unmapped; the 64 KiB usable stack sits
+/// above it. A kernel-stack overflow grows down from the top, past the 64 KiB of
+/// usable space, and faults loudly on the unmapped guard instead of silently
+/// corrupting the slot below — the structural cause of the kstack-overlap bug.
+/// Usable size is unchanged (64 KiB); the guard is extra space, so no legitimate
+/// deep path can false-positive.
+///
+/// Run once at boot after page tables are live and **before APs start and before
+/// the first kstack is allocated** — so only the BSP has a TLB (no shootdown
+/// needed) and `init`'s stack already carries its guard.
+///
+/// # Safety
+/// BSP, after `memory::init`, before `smp::init` / any `alloc_kstack`.
+pub unsafe fn install_kstack_guards() {
+    let base = kstack_pool_base();
+    debug_assert!(base & (PAGE_SIZE as u64 - 1) == 0, "kstack pool not page-aligned");
+    for i in 0..TASK_KSTACK_MAX {
+        let guard = base + (i * KSTACK_STRIDE) as u64;
+        // SAFETY: guard is the unused low page of slot i; nothing accesses it.
+        unsafe { crate::arch::x86_64::page_tables::unmap_active_4k(guard) };
+    }
+    // Verify: slot 0's guard is now unmapped, its usable second page still mapped.
+    let g = crate::arch::x86_64::page_tables::entry_for_va(base).is_none();
+    let u = crate::arch::x86_64::page_tables::entry_for_va(base + PAGE_SIZE as u64).is_some();
+    crate::kprintln!(
+        "kstack: {} guard pages installed (64 KiB usable/slot); guard_unmapped={} usable_mapped={}",
+        TASK_KSTACK_MAX, g, u);
+}
 
 fn alloc_kstack() -> Option<*mut u8> {
     let mut used = KSTACK_USED.lock();
@@ -47,9 +88,11 @@ fn alloc_kstack() -> Option<*mut u8> {
             // SAFETY: i < TASK_KSTACK_MAX; offset is within KSTACK_STORAGE bounds.
             // addr_of_mut! yields the same pointer without materialising a &mut
             // to the `static mut` (avoids the static_mut_refs lint).
+            // Top = high end of slot i. Usable stack is the 64 KiB just below it;
+            // the slot's low 4 KiB (the guard) sits beneath the usable region.
             let top = unsafe {
                 (core::ptr::addr_of_mut!(KSTACK_STORAGE.data) as *mut u8)
-                    .add(i * KSTACK_SIZE + KSTACK_SIZE)
+                    .add(i * KSTACK_STRIDE + KSTACK_STRIDE)
             };
             return Some(top);
         }
@@ -68,11 +111,11 @@ pub fn free_kstack(kstack_top: u64) {
     if kstack_top == 0 { return; }
     // SAFETY: KSTACK_STORAGE is a stable static; pointer arithmetic is within bounds.
     let base = unsafe { core::ptr::addr_of!(KSTACK_STORAGE.data) as *const u8 as u64 };
-    // top = base + (idx + 1) * KSTACK_SIZE  →  idx = (top - base) / KSTACK_SIZE - 1
+    // top = base + (idx + 1) * KSTACK_STRIDE  →  idx = (top - base) / KSTACK_STRIDE - 1
     if kstack_top <= base { return; }
     let offset = kstack_top - base;
-    if offset % KSTACK_SIZE as u64 != 0 { return; } // misaligned top — ignore
-    let idx_plus_one = offset / KSTACK_SIZE as u64;
+    if offset % KSTACK_STRIDE as u64 != 0 { return; } // misaligned top — ignore
+    let idx_plus_one = offset / KSTACK_STRIDE as u64;
     if idx_plus_one == 0 || idx_plus_one > TASK_KSTACK_MAX as u64 { return; }
     let idx = (idx_plus_one - 1) as usize;
     KSTACK_USED.lock()[idx] = false;
