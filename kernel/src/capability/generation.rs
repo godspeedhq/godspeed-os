@@ -19,8 +19,13 @@ pub struct Generation(pub u32);
 impl Generation {
     pub const INITIAL: Generation = Generation(0);
 
-    /// Bump to the next generation. Never wraps — a u32 gives 4 billion
-    /// restarts per resource before overflow, sufficient for v1.
+    /// Bump to the next generation. **Never wraps** — `checked_add` panics on
+    /// overflow rather than rolling over. A wrap to a low value would be a silent
+    /// *authority resurrection*: a stale cap minted at that low generation would
+    /// match a live resource again, defeating revocation (§7.5). A u32 gives ~4
+    /// billion restarts of a single resource, unreachable in practice; the panic is
+    /// the loud-failure backstop (§3.12; hardening H7). Pinned by
+    /// `bump_at_max_panics_never_wraps`.
     pub fn bump(self) -> Self {
         Generation(self.0.checked_add(1).expect("generation overflow"))
     }
@@ -67,6 +72,19 @@ mod tests {
         let cap_gen = live;           // cap was minted at generation 0
         let after_restart = live.bump(); // resource was restarted
         assert!(!cap_gen.matches(after_restart)); // cap is now stale
+    }
+
+    /// H7 — the overflow guarantee. `bump` NEVER wraps: at `u32::MAX` it panics
+    /// loudly rather than rolling over to a low value, which would let a stale cap
+    /// (minted at that low generation) match a live resource again — silent
+    /// authority resurrection. This pins the behaviour so a future change to
+    /// `wrapping_add` cannot reintroduce the resurrection path unnoticed; the
+    /// existing property tests deliberately exclude `u32::MAX`, leaving this the
+    /// only test of the boundary.
+    #[test]
+    #[should_panic(expected = "generation overflow")]
+    fn bump_at_max_panics_never_wraps() {
+        let _ = Generation(u32::MAX).bump();
     }
 
     #[test]
