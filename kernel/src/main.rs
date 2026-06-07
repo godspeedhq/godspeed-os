@@ -4,6 +4,7 @@
 mod arch;
 mod capability;
 mod control;
+mod elf_flags;
 mod interrupt;
 mod invariants;
 mod ipc;
