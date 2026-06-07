@@ -42,41 +42,15 @@ math, no `--`.
 
 ---
 
-## 3. Utility conventions (general — applies to every utility)
+## 3. Utility conventions
 
-These rules are not specific to `observe`; they define how *all* GodspeedOS
-utilities behave. They live here for now and should be hoisted to a shared
-`utilities/0_conventions.md` once a second utility exists (pull the abstraction
-into existence — do not build a framework speculatively, §26.2).
-
-1. **Every utility has `help`.** A bare utility name with no actionable args, or
-   an explicit `<util> help`, prints usage. With a fresh (non-POSIX) vocabulary,
-   the system must teach its own verbs at the point of use.
-2. **Every subcommand has `help`.** `<util> <subcommand> help` describes that
-   subcommand specifically (`observe now help`).
-3. **`help` is the word — the only form. No flags, no synonyms.** There is exactly
-   one way to ask for help: the word `help`. No `-h`, no `--help`, no hidden
-   aliases. A tolerated-but-undocumented synonym would itself be a hidden, unsaid
-   rule — the silent behavior the system forbids (§26.4 no silent complexity, §26.5
-   explicitness over magic). If a user types `-h`, it is simply `unknown:`, and that
-   response *teaches* the real word. The prompt says *type help*, so `help` is what
-   works — nothing else, nothing hidden.
-4. **Subcommands are words, never single-letter flags.** `observe now`, not
-   `observe -n`. A single letter is the most cryptic token there is (meaningless
-   without convention) for almost no economy, and it does not scale: across a
-   growing set of utilities, flag letters collide and drift in meaning (`-n` =
-   "now" here, "number" there), whereas a word means the same thing everywhere.
-   This is the `ls -Sslah` problem GodspeedOS rejects: a wall of letters you must
-   memorize a manual to read. Typing economy is a shell-ergonomics concern
-   (completion, history — future), not a reason to abbreviate the vocabulary.
-5. **Every utility has a version, reported by `<util> version`.** The version is
-   **per utility, not per subcommand** — subcommands evolve with their parent and
-   inherit its version. Version sprawl across subcommands has no consumer.
-6. **`help` output carries the version header.** Line 1 of any help/usage output
-   is `<util> <version>` so the version is always one keystroke away.
-7. **Utilities report raw facts; they do not editorialize.** Health verdicts,
-   policy, and recommendations belong to purpose-built utilities (e.g. `status`),
-   not bolted onto a metrics viewer.
+The general rules that apply to **every** GodspeedOS utility — `help` is the only
+help form (no `-h`/`--help`), subcommands are words not single-letter flags,
+per-utility `version`, raw-facts-only (no editorializing), non-POSIX vocabulary —
+now live in **`0_conventions.md`**. They were hoisted there once a second utility
+existed, exactly as this section originally anticipated (§26.2: pull the
+abstraction into existence, don't build it speculatively). `observe` follows all of
+them; what remains below is `observe`'s own normative help output.
 
 ### Help output shape (normative)
 
