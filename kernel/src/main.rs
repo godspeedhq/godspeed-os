@@ -198,10 +198,6 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     arch::x86_64::init(boot_info);
     memory::init(boot_info);
 
-    // Hardening H4b: log the kernel-side W^X posture (HHDM/text/data NX bits).
-    // Diagnostic only — surfaces whether the Limine-inherited mappings are NX.
-    arch::x86_64::boot::audit_wx();
-
     // Stage 1 of the USB stack: locate the xHCI controller (§12). Records its
     // MMIO base + IRQ for a future userspace driver's hw_mmio/hw_interrupt caps.
     arch::x86_64::pci::init();
@@ -236,6 +232,17 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     {
         task::spawn_init();
         smp::init(boot_info);
+
+        // Hardening H4b: Limine maps the HHDM W+X (RWX direct map of all RAM — a
+        // kernel-wide W^X bypass). Force it NO_EXEC now that all APs are up: Limine's
+        // AP long-mode bring-up runs through the executable direct map, so this must
+        // come AFTER smp::init. From here nothing executes from the HHDM (the kernel
+        // runs from its own .text), so the direct map is data-only for the rest of
+        // runtime. audit_wx then confirms the HHDM reads NX=1.
+        // SAFETY: BSP, after HHDM is live and APs are up.
+        unsafe { arch::x86_64::page_tables::harden_hhdm_nx() };
+        arch::x86_64::boot::audit_wx();
+
         kprintln!("kernel: {} cores ready", smp::core::ready_count());
         kprintln!(
             "idle: cores may halt = {} (cool when idle if true)",

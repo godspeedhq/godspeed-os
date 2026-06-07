@@ -279,6 +279,81 @@ pub fn entry_for_va(virt: u64) -> Option<u64> {
     if entry_present(pt_e) { Some(pt_e) } else { None }
 }
 
+/// Set the NX (no-execute) bit on every present mapping in the HHDM, closing the
+/// RWX-direct-map hole (hardening H4b). Limine maps the higher-half direct map
+/// **W+X**, so every physical RAM page has an executable alias — a kernel-wide W^X
+/// bypass. The kernel only ever uses the HHDM for *data* (the page-table walks
+/// above, the allocator, copying service ELFs into fresh frames); nothing executes
+/// from it (the kernel runs from its own `.text`, services from the loader's RX
+/// mappings, the AP trampoline from identity-mapped low memory). So forcing the
+/// whole HHDM `NO_EXEC` removes the executable alias without touching any code path.
+///
+/// Walks the single PML4 entry that roots the HHDM (one entry covers 512 GiB —
+/// always enough for v1) and ORs NX into each present PDPT / PD / PT entry,
+/// handling 1 GiB and 2 MiB large pages, then reloads CR3 to flush.
+///
+/// # Safety
+/// Must run on the BSP after `set_hhdm_offset` and before APs start. Modifies live
+/// page-table entries (reached via the HHDM).
+pub unsafe fn harden_hhdm_nx() {
+    const NX: u64 = 1 << 63;
+    const PS: u64 = 1 << 7; // page-size bit ⇒ large page at this level
+    let hhdm = get_hhdm_offset();
+    if hhdm == 0 {
+        return;
+    }
+    let cr3: u64;
+    // SAFETY: reading CR3 is always valid in ring 0.
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem)) };
+    let pml4 = cr3 & !0xFFF;
+    let pdpt = match walk(pml4, pml4_idx(hhdm)) {
+        Some(p) => p,
+        None => return,
+    };
+
+    // SAFETY: pdpt/pd/pt come from a chain of present entries rooted at the live
+    // PML4; HHDM lets us read/write the tables. NX only restricts instruction
+    // fetch, which the HHDM never serves.
+    unsafe {
+        for i in 0..512 {
+            let e = read_entry(pdpt, i);
+            if !entry_present(e) {
+                continue;
+            }
+            if e & PS != 0 {
+                write_entry(pdpt, i, e | NX); // 1 GiB page
+                continue;
+            }
+            let pd = entry_phys(e);
+            for j in 0..512 {
+                let e2 = read_entry(pd, j);
+                if !entry_present(e2) {
+                    continue;
+                }
+                if e2 & PS != 0 {
+                    write_entry(pd, j, e2 | NX); // 2 MiB page
+                    continue;
+                }
+                let pt = entry_phys(e2);
+                for k in 0..512 {
+                    let e3 = read_entry(pt, k);
+                    if entry_present(e3) {
+                        write_entry(pt, k, e3 | NX); // 4 KiB page
+                    }
+                }
+            }
+        }
+        // Flush this core's TLB by reloading CR3. The other cores are not flushed
+        // explicitly, and they do not need to be: nothing was ever *executed* from
+        // the HHDM, so no core holds an instruction-TLB entry for it — any future
+        // execute attempt misses the I-TLB and walks the now-NX tables, faulting.
+        // (Each core also flushes naturally on its next CR3-switching context
+        // switch.) The data-TLB staleness this leaves is irrelevant to NX, which
+        // only gates instruction fetch.
+        core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, nomem));
+    }
+}
+
 /// Follow an existing entry in `table_phys` at `idx`.
 /// Returns `Some(child_phys)` if present, `None` if absent.
 fn walk(table_phys: u64, idx: usize) -> Option<u64> {
