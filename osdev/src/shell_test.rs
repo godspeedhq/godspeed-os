@@ -249,8 +249,27 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(r) => {
             check!(r.contains("caps for shell"), "caps: header");
             check!(r.contains("introspect"), "caps: lists introspect cap");
+            // Positive least-privilege case: the shell brokers spawn, so it DOES
+            // hold the spawn cap.
+            check!(r.contains("spawn"), "caps: shell holds spawn (broker)");
         }
-        None => { println!("shell-test: FAIL — timed out after caps"); fail += 2; }
+        None => { println!("shell-test: FAIL — timed out after caps"); fail += 3; }
+    }
+
+    // -----------------------------------------------------------------------
+    // Least privilege (H10) — a non-spawning service must NOT hold the spawn cap.
+    // `logger` never spawns, so after SPAWN was gated to {init, supervisor, shell,
+    // probes}, `caps logger` lists no spawn. This is the negative regression test
+    // that locks the gate in: if a future change re-grants spawn universally, the
+    // word "spawn" reappears here and this fails.
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"caps logger\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => {
+            check!(r.contains("caps for logger"), "caps logger: header");
+            check!(!r.contains("spawn"), "least-privilege: logger does NOT hold spawn");
+        }
+        None => { println!("shell-test: FAIL — timed out after caps logger"); fail += 2; }
     }
 
     // -----------------------------------------------------------------------

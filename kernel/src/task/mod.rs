@@ -2697,9 +2697,27 @@ fn spawn_service_with_config(
     // Slot 0: log_write (always present in v1).
     caps.insert(mint_cap(LOG_WRITE_RESOURCE, Rights::WRITE))
         .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
-    // Slot 1: spawn authority (every service in v1).
-    caps.insert(mint_cap(SPAWN_RESOURCE, Rights::WRITE))
-        .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
+
+    // Spawn authority — least privilege (§3.1; H10 audit in
+    // security/hardening-strategy.md §9). Granted only to the services that
+    // actually start other services: init (spawns the trusted root), supervisor
+    // (spawns services + probes), the shell (brokers spawn/kill/restart), and the
+    // test-driver probes (property/stress/perf/chaos modes spawn victims; matched by
+    // ELF identity so no probe family is missed). registry, logger, the drivers,
+    // ping, pong, and observe never spawn and no longer hold the authority to.
+    // Previously every service got this unconditionally ("spawn authority, every
+    // service in v1") — a system-wide blast-radius widening this closes. Capture the
+    // slot (u32::MAX when not granted); the SDK already treats MAX as "not held".
+    let mut spawn_slot_u32 = u32::MAX;
+    if name == "init"
+        || name == "supervisor"
+        || name == "shell"
+        || core::ptr::eq(elf_bytes.as_ptr(), PROBE_ELF.as_ptr())
+    {
+        let sp_slot = caps.insert(mint_cap(SPAWN_RESOURCE, Rights::WRITE))
+            .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
+        spawn_slot_u32 = sp_slot as u32;
+    }
 
     // 4. Optional recv endpoint.
     let mut recv_slot_u32 = u32::MAX;
@@ -2931,7 +2949,7 @@ fn spawn_service_with_config(
             }
             data.log_write_slot     = 0;
             data.recv_slot          = recv_slot_u32;
-            data.spawn_slot         = 1;
+            data.spawn_slot         = spawn_slot_u32;
             data.send_peer_count    = peer_count as u32;
             data.core_id            = core_id;
             data.probe_mode         = probe_mode;
