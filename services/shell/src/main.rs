@@ -255,7 +255,7 @@ fn cmd_date(ctx: &ServiceContext, arg: &str) {
     const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     let dt = ctx.datetime();
     if arg == "epoch" {
-        ctx.console_writeln_fmt(format_args!("{}", dt.unix_secs()));
+        ctx.console_writeln_fmt(format_args!("{}", dt.epoch_secs()));
     } else {
         let wd = WEEKDAYS[(dt.weekday() as usize) % 7];
         ctx.console_writeln_fmt(format_args!(

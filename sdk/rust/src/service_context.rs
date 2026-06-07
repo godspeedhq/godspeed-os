@@ -21,9 +21,9 @@ pub struct Datetime {
 }
 
 impl Datetime {
-    /// Days since the Unix epoch (1970-01-01), proleptic Gregorian and leap-year
-    /// aware (Howard Hinnant's `days_from_civil`). The basis for both `weekday`
-    /// and `unix_secs`.
+    /// Days since the epoch (1970-01-01), proleptic Gregorian and leap-year aware
+    /// (Howard Hinnant's `days_from_civil`). The basis for both `weekday` and
+    /// `epoch_secs`.
     fn days_since_epoch(&self) -> i64 {
         let mut y = self.year as i64;
         let m = self.month as i64;
@@ -42,10 +42,10 @@ impl Datetime {
         (self.days_since_epoch() + 4).rem_euclid(7) as u8
     }
 
-    /// Seconds since the Unix epoch. Assumes the RTC reads UTC; if the hardware
-    /// clock is set to local time the value is offset by the timezone (v1 has no
-    /// timezone database).
-    pub fn unix_secs(&self) -> i64 {
+    /// Seconds since the epoch (1970-01-01). Assumes the RTC reads UTC; if the
+    /// hardware clock is set to local time the value is offset by the timezone
+    /// (v1 has no timezone database).
+    pub fn epoch_secs(&self) -> i64 {
         self.days_since_epoch() * 86_400
             + self.hour as i64 * 3_600
             + self.minute as i64 * 60
