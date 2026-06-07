@@ -193,6 +193,38 @@ pub unsafe fn init_bsp(boot_info: &BootInfo) {
     }
 }
 
+/// Boot-time W^X audit (hardening H4b). The kernel inherits all of its own page
+/// tables from Limine (`init_paging` is a no-op), so this *logs* — does not assume —
+/// the NO-EXECUTE (NX, bit 63) and WRITABLE (W, bit 1) status of three
+/// representative pages, to learn the kernel-side W^X posture:
+///   - the HHDM alias of a RAM page — a read/write alias of physical memory; if it
+///     is also executable that is a kernel-wide W^X hole (the classic risk);
+///   - a kernel code (.text) page — expected executable (NX=0) and read-only (W=0);
+///   - a kernel data (.bss) page — expected writable (W=1) and non-exec (NX=1).
+/// A diagnostic, not an assertion: it cannot panic the boot. If the HHDM shows NX,
+/// a follow-up can harden this into a loud assertion; if it shows W+X, that is a
+/// real RWX-direct-map hole to remap. Must be called after `memory::init` (HHDM).
+pub fn audit_wx() {
+    use crate::arch::x86_64::page_tables::{entry_for_va, get_hhdm_offset};
+    const NX: u64 = 1 << 63;
+    const W: u64 = 1 << 1;
+    let report = |name: &str, va: u64| match entry_for_va(va) {
+        Some(e) => crate::kprintln!(
+            "wx-audit: {:<11} va={:#018x} W={} NX={} {}",
+            name, va, (e & W != 0) as u8, (e & NX != 0) as u8,
+            if e & W != 0 && e & NX == 0 { "<<< W+X" } else { "ok" }),
+        None => crate::kprintln!("wx-audit: {:<11} va={:#018x} UNMAPPED", name, va),
+    };
+    // HHDM alias of a real RAM page. One frame is allocated to guarantee a
+    // usable-RAM physical address; it is intentionally leaked — one 4 KiB page,
+    // once at boot (there is no free_frame in v1, and this runs exactly once).
+    if let Some(frame) = crate::memory::allocator::alloc_frame() {
+        report("hhdm-ram", get_hhdm_offset() + frame.phys_addr().0);
+    }
+    report("kernel-text", audit_wx as usize as u64);
+    report("kernel-data", core::ptr::addr_of!(TSC_DEADLINE_MODE) as usize as u64);
+}
+
 /// Program the local APIC timer for a ~10 ms periodic interrupt on vector 32.
 /// Must be called after `memory::init` (needs HHDM offset).
 ///

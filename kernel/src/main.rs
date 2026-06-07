@@ -198,6 +198,10 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     arch::x86_64::init(boot_info);
     memory::init(boot_info);
 
+    // Hardening H4b: log the kernel-side W^X posture (HHDM/text/data NX bits).
+    // Diagnostic only — surfaces whether the Limine-inherited mappings are NX.
+    arch::x86_64::boot::audit_wx();
+
     // Stage 1 of the USB stack: locate the xHCI controller (§12). Records its
     // MMIO base + IRQ for a future userspace driver's hw_mmio/hw_interrupt caps.
     arch::x86_64::pci::init();

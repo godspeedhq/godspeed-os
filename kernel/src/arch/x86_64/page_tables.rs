@@ -246,6 +246,39 @@ pub unsafe fn map_in_active_tables(virt: u64, phys: u64, flags: u64) -> Result<(
     }
 }
 
+/// Page-size bit (PS) in a PDPT/PD entry: set ⇒ the entry maps a large page
+/// (1 GiB at PDPT level, 2 MiB at PD level) and the walk stops there.
+const PAGE_SIZE_BIT: u64 = 1 << 7;
+
+/// Return the raw PTE (or large-page entry) currently mapping `virt` in the active
+/// page tables, or `None` if `virt` is unmapped. Walks PML4→PDPT→PD→PT and stops
+/// early at a large-page entry. Read-only — it does not modify any table. Used to
+/// audit mapping permissions (the NX / W^X check in `boot::audit_wx`).
+pub fn entry_for_va(virt: u64) -> Option<u64> {
+    let cr3: u64;
+    // SAFETY: reading CR3 is always valid in ring 0.
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem)) };
+    let pml4 = cr3 & !0xFFF;
+
+    // PML4 entries never map pages directly — always point to a PDPT.
+    let pdpt = walk(pml4, pml4_idx(virt))?;
+    // SAFETY: pdpt is the phys of a present PML4 entry's child table.
+    let pdpt_e = unsafe { read_entry(pdpt, pdpt_idx(virt)) };
+    if !entry_present(pdpt_e) { return None; }
+    if pdpt_e & PAGE_SIZE_BIT != 0 { return Some(pdpt_e); } // 1 GiB page
+
+    let pd = entry_phys(pdpt_e);
+    // SAFETY: pd is the phys of a present PDPT entry's child table.
+    let pd_e = unsafe { read_entry(pd, pd_idx(virt)) };
+    if !entry_present(pd_e) { return None; }
+    if pd_e & PAGE_SIZE_BIT != 0 { return Some(pd_e); } // 2 MiB page
+
+    let pt = entry_phys(pd_e);
+    // SAFETY: pt is the phys of a present PD entry's child table.
+    let pt_e = unsafe { read_entry(pt, pt_idx(virt)) };
+    if entry_present(pt_e) { Some(pt_e) } else { None }
+}
+
 /// Follow an existing entry in `table_phys` at `idx`.
 /// Returns `Some(child_phys)` if present, `None` if absent.
 fn walk(table_phys: u64, idx: usize) -> Option<u64> {
