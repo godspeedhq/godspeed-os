@@ -188,7 +188,7 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // date — the RTC clock (QEMU emulates the MC146818 and returns host time).
-    // Default form is a full timestamp `Wkd YYYY-MM-DD HH:MM:SS`; `date unix`
+    // Default form is a full timestamp `Wkd YYYY-MM-DD HH:MM:SS`; `date epoch`
     // prints epoch seconds (digits, no date/time separators).
     send(&mut write_half, b"date\r");
     match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
@@ -196,10 +196,10 @@ pub fn run(image_path: &Path, smp: u32) {
         None    => { println!("shell-test: FAIL — timed out after date"); fail += 1; }
     }
 
-    send(&mut write_half, b"date unix\r");
+    send(&mut write_half, b"date epoch\r");
     match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
-        Some(r) => check!(r.chars().any(|c| c.is_ascii_digit()), "date unix: epoch seconds"),
-        None    => { println!("shell-test: FAIL — timed out after date unix"); fail += 1; }
+        Some(r) => check!(r.chars().any(|c| c.is_ascii_digit()), "date epoch: seconds since 1970"),
+        None    => { println!("shell-test: FAIL — timed out after date epoch"); fail += 1; }
     }
 
     send(&mut write_half, b"caps\r");
