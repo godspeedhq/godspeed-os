@@ -279,6 +279,42 @@ pub fn entry_for_va(virt: u64) -> Option<u64> {
     if entry_present(pt_e) { Some(pt_e) } else { None }
 }
 
+/// Mark the 4 KiB page mapping `virt` non-present in the active page tables, used
+/// to install kstack guard pages (hardening). Clears the PTE and invalidates the
+/// local TLB entry. The frame is NOT returned to the allocator — kstack guard
+/// pages belong to the kernel image's BSS, not the frame allocator. No-op if
+/// `virt` is unmapped or mapped by a large page (the kstack BSS is 4 KiB-mapped,
+/// verified at boot).
+///
+/// # Safety
+/// Caller ensures `virt` is a 4 KiB-mapped page safe to unmap (no live access).
+/// Run on the BSP before APs start, or follow with a TLB shootdown.
+pub unsafe fn unmap_active_4k(virt: u64) {
+    let cr3: u64;
+    // SAFETY: reading CR3 is always valid in ring 0.
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem)) };
+    let pml4 = cr3 & !0xFFF;
+    let pdpt = match walk(pml4, pml4_idx(virt)) {
+        Some(p) => p,
+        None => return,
+    };
+    // SAFETY: tables reached via present entries in the live PML4.
+    unsafe {
+        let pdpt_e = read_entry(pdpt, pdpt_idx(virt));
+        if !entry_present(pdpt_e) || pdpt_e & (1 << 7) != 0 {
+            return; // absent, or 1 GiB page (not a kstack mapping)
+        }
+        let pd = entry_phys(pdpt_e);
+        let pd_e = read_entry(pd, pd_idx(virt));
+        if !entry_present(pd_e) || pd_e & (1 << 7) != 0 {
+            return; // absent, or 2 MiB page
+        }
+        let pt = entry_phys(pd_e);
+        write_entry(pt, pt_idx(virt), 0); // non-present
+        core::arch::asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags));
+    }
+}
+
 /// Set the NX (no-execute) bit on every present mapping in the HHDM, closing the
 /// RWX-direct-map hole (hardening H4b). Limine maps the higher-half direct map
 /// **W+X**, so every physical RAM page has an executable alias — a kernel-wide W^X
