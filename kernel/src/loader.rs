@@ -25,8 +25,8 @@ const ELFDATA2LSB: u8  = 1;
 const ET_EXEC:     u16 = 2;
 const EM_X86_64:   u16 = 62;
 const PT_LOAD:     u32 = 1;
-const PF_X: u32 = 1;
-const PF_W: u32 = 2;
+// PF_X / PF_W / PF_R and the W^X permission decision live in `crate::elf_flags`
+// (host-testable; see hardening H4a).
 
 // ---------------------------------------------------------------------------
 // ELF64 header and program header.
@@ -175,10 +175,18 @@ pub fn load(bytes: &[u8]) -> Result<LoadedElf, LoadError> {
             return Err(LoadError::SegmentOutOfBounds);
         }
 
-        // Derive page flags from ELF segment flags.
+        // Derive page flags from ELF segment flags, ENFORCING W^X (hardening H4a):
+        // a page is executable only if its segment is executable AND not writable.
+        // The loader enforces the invariant rather than mirroring the ELF, so a
+        // W+X segment is forced NO_EXEC (and the anomaly logged) — a malformed or
+        // hostile binary cannot obtain a writable-executable mapping.
         let mut flags = PageFlags::PRESENT | PageFlags::USER;
-        if p_flags & PF_W != 0 { flags |= PageFlags::WRITABLE; }
-        if p_flags & PF_X == 0 { flags |= PageFlags::NO_EXEC;  }
+        if crate::elf_flags::segment_writable(p_flags) { flags |= PageFlags::WRITABLE; }
+        if crate::elf_flags::segment_no_exec(p_flags)  { flags |= PageFlags::NO_EXEC;  }
+        if crate::elf_flags::segment_is_wx(p_flags) {
+            crate::kprintln!(
+                "loader: W^X — segment p_flags={:#x} was W+X, forced NO_EXEC", p_flags);
+        }
 
         // Map full page-aligned VA range covering [p_vaddr .. p_vaddr + p_memsz).
         let va_start = p_vaddr & !(PAGE_SIZE as u64 - 1);

@@ -10,6 +10,10 @@
 // else that touches hardware.
 #![cfg_attr(not(test), no_std)]
 
+// Pure ELF-segment → page-permission logic (W^X enforcement, H4a). No hardware
+// dependencies, so it is host-testable here and also used by the bin's loader.rs.
+pub mod elf_flags;
+
 // capability/table.rs emits diagnostic messages via crate::kprintln!.
 // The binary target defines the real kprintln! in log.rs; the lib (host)
 // target provides this no-op stub so table.rs compiles without hardware.
