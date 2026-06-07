@@ -177,7 +177,7 @@ fn cmd_help(ctx: &ServiceContext) {
     help_line(ctx, "about", "identity + credits");
     help_line(ctx, "cores", "CPU core count");
     help_line(ctx, "mem", "physical memory usage");
-    help_line(ctx, "date [unix]", "date + time; 'unix' = epoch secs");
+    help_line(ctx, "date [epoch]", "date + time; 'epoch' = secs since 1970");
     ctx.console_writeln("");
     ctx.console_writeln("Services");
     help_line(ctx, "status", "list all live tasks");
@@ -247,14 +247,15 @@ fn cmd_cores(ctx: &ServiceContext) {
 }
 
 /// Wall-clock date+time from the hardware RTC. Default renders a full timestamp
-/// with weekday, e.g. `Sat 2026-06-06 22:05:09`. `date unix` prints Unix epoch
-/// seconds instead. Deliberately just these two forms — no clock-setting, format
-/// strings, or timezones (§26.2: minimal surface).
+/// with weekday, e.g. `Sat 2026-06-06 22:05:09`. `date epoch` prints seconds since
+/// 1970-01-01 instead. Deliberately just these two forms — no clock-setting, format
+/// strings, or timezones (§26.2: minimal surface). The subcommand is `epoch`, not
+/// `unix`: this is not POSIX, so the vocabulary doesn't borrow its name.
 fn cmd_date(ctx: &ServiceContext, arg: &str) {
     const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     let dt = ctx.datetime();
-    if arg == "unix" {
-        ctx.console_writeln_fmt(format_args!("{}", dt.unix_secs()));
+    if arg == "epoch" {
+        ctx.console_writeln_fmt(format_args!("{}", dt.epoch_secs()));
     } else {
         let wd = WEEKDAYS[(dt.weekday() as usize) % 7];
         ctx.console_writeln_fmt(format_args!(
