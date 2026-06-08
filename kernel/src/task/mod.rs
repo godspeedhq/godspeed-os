@@ -1215,6 +1215,42 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
+        // Cross-core task-lifecycle diagnostic (osdev image --mode iso-xlife):
+        // controller on core 1 kills/respawns a same-core victim (xlife-near, core 1)
+        // and a cross-core victim (xlife-far, core 2) to attribute C7's ~1.04 s respawn.
+        "xlife" => Some(("xlife", ServiceConfig {
+            elf:               PROBE_ELF,
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    1, // controller on core 1 (C7's controller core)
+            probe_mode:        202, // XLIFE: time kill/spawn of near+far victims
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
+        "xlife-near" => Some(("xlife-near", ServiceConfig {
+            elf:               PROBE_ELF,
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    1, // same core as the controller
+            probe_mode:        203, // XLIFE_VICTIM: idle until killed
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
+        "xlife-far" => Some(("xlife-far", ServiceConfig {
+            elf:               PROBE_ELF,
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    2, // cross-core from the controller (C7's victim core)
+            probe_mode:        203, // XLIFE_VICTIM: idle until killed
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
         "stress-s3-recv" => Some(("stress-s3-recv", ServiceConfig {
             elf:               PROBE_ELF,
             has_recv_endpoint: true,

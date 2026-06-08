@@ -86,6 +86,11 @@ iso-c7   = ["perf-iso"]
 # one-way cross-core send cost (by-handle, tight, by-name) that C7's "send" section
 # conflated with sending to a just-killed victim. Attributes the cross-core premium.
 iso-xsend = ["perf-iso"]
+# iso-xlife: isolate cross-core task lifecycle — a controller (core 1) kills/respawns
+# a same-core victim (xlife-near, core 1) and a cross-core victim (xlife-far, core 2),
+# timing each kill/spawn. far−near isolates cross-core coordination from task creation;
+# attributes C7's ~1.04 s respawn. No ping/pong, nothing else.
+iso-xlife = ["perf-iso"]
 
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }

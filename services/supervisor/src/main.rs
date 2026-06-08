@@ -332,6 +332,9 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     // iso-xsend: receiver (core 2) first so its endpoint exists when xsend's (core 1)
     // SEND cap is wired; sender then times bare cross-core try_sends to a LIVE receiver.
     #[cfg(feature = "iso-xsend")] { let _ = ctx.spawn("xsend-recv"); let _ = ctx.spawn("xsend"); }
+    // iso-xlife: both victims first so they exist when the controller's first kill
+    // fires; controller (core 1) then times kill/spawn of near (core 1) and far (core 2).
+    #[cfg(feature = "iso-xlife")] { let _ = ctx.spawn("xlife-near"); let _ = ctx.spawn("xlife-far"); let _ = ctx.spawn("xlife"); }
     #[cfg(feature = "iso-s9")]   {
         let _ = ctx.spawn("stress-s9-recv");
         let _ = ctx.spawn("stress-s9-send-a");
