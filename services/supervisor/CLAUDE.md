@@ -23,6 +23,7 @@ The supervisor has mutually exclusive spawn-set features:
 | `stress-only`      | pong + ping + S1–S10 stress probes      | `osdev image --mode stress`      |
 | `adv-only`         | pong + ping + A1–A10 adversarial probes | `osdev image --mode adv`         |
 | `chaos-only`       | pong + ping + C2–C7 chaos probes        | `osdev image --mode chaos`       |
+| `fuzz-only`        | pong + ping + F1/F2/F5/F6/F7/F8 + BF1/BF2/BF5/BF6/BF7/BF8 fuzz probes | `osdev image --mode fuzz` |
 | `bare-metal`       | shell only — rests at a quiet `gs>`     | `osdev image` (USB boot)         |
 
 The `bare-metal` feature exists because probe services require the QEMU control port (COM2/TCP:5555) to complete. Without it, probe-4b-send blocks permanently, and probe-hog runs `loop {}` starving core 0. On real hardware these probes would stall the system indefinitely.

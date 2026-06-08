@@ -24,7 +24,7 @@
 //!   osdev test chaos        — run §22 chaos / graceful-degradation test suite (Milestone 14)
 //!   osdev test chaos-brutal — run brutal chaos tests BC1–BC7 (Milestone 21)
 //!   osdev test shell        — scripted shell smoke-test (help, cores, status, unknown)
-//!   osdev image [--mode M]  — build + create bootable disk image (build/os.img); M=bare-metal|perf|perf-brutal|identity|stress|adv|chaos|s8
+//!   osdev image [--mode M]  — build + create bootable disk image (build/os.img); M=bare-metal|perf|perf-brutal|identity|stress|adv|chaos|fuzz|s8
 
 mod disk_image;
 mod qemu;
@@ -371,6 +371,50 @@ pub fn cmd_build_stress() {
     println!("build: kernel OK");
 }
 
+/// Like `cmd_build_stress` but uses `--features fuzz-only` for a self-contained
+/// hardware fuzz run (§22 F1/F2/F5/F6/F7/F8 + brutal BF1/BF2/BF5/BF6/BF7/BF8). All
+/// fuzz probes self-run and print "fuzz: F* pass (n/n)" over serial with no QEMU
+/// control port. F3/BF3 (ELF-loader fuzz) need a separate test-bad-elf kernel build;
+/// F4 is host-side contract validation. Watch COM1: a clean run shows every
+/// "fuzz: F* pass" line and never "KERNEL PANIC".
+pub fn cmd_build_fuzz() {
+    clean_supervisor();
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci"];
+    for crate_name in &non_supervisor {
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--release", "-p", crate_name,
+                   "--target", "x86_64-unknown-none"])
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run cargo build for {}: {}", crate_name, e));
+        if !status.success() {
+            eprintln!("build: {} FAILED", crate_name);
+            std::process::exit(1);
+        }
+        println!("build: {} OK", crate_name);
+    }
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "supervisor",
+               "--target", "x86_64-unknown-none",
+               "--features", "supervisor/fuzz-only"])
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run cargo build for supervisor: {}", e));
+    if !status.success() {
+        eprintln!("build: supervisor (fuzz-only) FAILED");
+        std::process::exit(1);
+    }
+    println!("build: supervisor (fuzz-only) OK");
+
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .status()
+        .expect("failed to run cargo build for kernel");
+    if !status.success() {
+        eprintln!("build: kernel FAILED");
+        std::process::exit(1);
+    }
+    println!("build: kernel OK");
+}
+
 /// Like `cmd_build_adv` but uses `--features chaos-only` for a self-contained
 /// hardware chaos run (C2–C7). C1 and C4 use bare-metal + hardware reconfiguration.
 pub fn cmd_build_chaos() {
@@ -643,6 +687,7 @@ fn cmd_image(mode: &str) {
         "stress"      => cmd_build_stress(),
         "adv"         => cmd_build_adv(),
         "chaos"       => cmd_build_chaos(),
+        "fuzz"        => cmd_build_fuzz(),
         "b2-only"     => cmd_build_b2_only(),
         "bp2-only"    => cmd_build_bp2_only(),
         "iso-bp3"     => cmd_build_perf_iso("iso-bp3"),
@@ -654,7 +699,7 @@ fn cmd_image(mode: &str) {
         "iso-s9"      => cmd_build_perf_iso("iso-s9"),
         "s8"          => cmd_build_idle(),
         other => {
-            eprintln!("image: unknown --mode '{}'; valid: bare-metal, perf, perf-brutal, identity, stress, adv, chaos, b2-only, bp2-only, iso-bp3, iso-bp5, iso-bp7, iso-bp9, iso-bp10, iso-s3, iso-s9, s8", other);
+            eprintln!("image: unknown --mode '{}'; valid: bare-metal, perf, perf-brutal, identity, stress, adv, chaos, fuzz, b2-only, bp2-only, iso-bp3, iso-bp5, iso-bp7, iso-bp9, iso-bp10, iso-s3, iso-s9, s8", other);
             std::process::exit(1);
         }
     }

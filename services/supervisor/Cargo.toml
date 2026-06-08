@@ -34,6 +34,12 @@ adv-only = []
 # C1 uses bare-metal + BIOS core disable; C4 uses bare-metal + RAM removal.
 # Used by `osdev image --mode chaos` for a self-contained hardware chaos run.
 chaos-only = []
+# Spawn only the §22 fuzz probe services (F1/F2/F5/F6/F7/F8 + brutal BF1/BF2/BF5/
+# BF6/BF7/BF8, with pong/ping). All self-run and print "fuzz: F* pass" over serial
+# with no QEMU control port — safe for real hardware. F3/BF3 (ELF-loader fuzz) need
+# a separate kernel build (test-bad-elf); F4 is host-side contract validation only.
+# Used by `osdev image --mode fuzz` for a self-contained hardware fuzz run.
+fuzz-only = []
 # Spawn only perf-b2 + perf-b2-echo (and pong/ping).
 # Isolation build: eliminates concurrent IPI noise from other benchmarks so
 # the cross-core blocking round-trip can complete without IPI contention.
