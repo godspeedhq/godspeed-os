@@ -70,6 +70,11 @@ iso-bp9  = ["perf-iso"]
 iso-bp10 = ["perf-iso"]
 iso-s3   = ["perf-iso"]
 iso-s9   = ["perf-iso"]
+# iso-s5: isolate the S5 generation-integrity test (500 kill/respawn cycles of
+# stress-s5-victim) with no ping/pong and no competing restart-storm probes
+# (S2/S10), so it runs uncontended — a clean diagnostic for whether S5 is merely
+# starved under the full stress load or genuinely slow/stuck on its own.
+iso-s5   = ["perf-iso"]
 
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }
