@@ -2027,18 +2027,45 @@ fn mode_chaos_c7(ctx: &ServiceContext) -> ! {
     // C7 — Cross-core TLB shootdown under load: 30 kill/respawn cycles (§22 Chaos C7).
     // Controller on core 1; victim on core 2. Each kill issues a cross-core IPI and
     // TLB shootdown; respawn maps new pages, triggering another shootdown on core 2.
+    //
+    // Instrumented: RDTSC-bracket each section (try_send / kill / spawn / 50-yield
+    // settle) and report mean cycles-per-section at each iter marker. This attributes
+    // the ~1.56 s/cycle uncontended cost measured on the T630 — confirming whether it
+    // lives in the cross-core kill (TLB-shootdown broadcast) or elsewhere, and proving
+    // the 50-yield settle loop is negligible. read_tsc is InspectKernel query 3
+    // (ungated, no cap); its own per-call cost sits inside every bracket equally, so
+    // the *relative* split is honest even though absolutes carry a small fixed offset.
     let msg = Message::from_bytes(b"c7");
+    let (mut c_send, mut c_kill, mut c_spawn, mut c_yield) = (0u64, 0u64, 0u64, 0u64);
     for i in 0..30u32 {
         // try_send exercises the generation-check on a live (or recently-dead) endpoint.
+        let t0 = ctx.read_tsc();
         let _ = ctx.try_send("chaos-c7-victim", &msg);
+        let t1 = ctx.read_tsc();
         // Kill victim on core 2 → IPI → TLB shootdown → page frames reclaimed.
         let _ = ctx.kill("chaos-c7-victim");
+        let t2 = ctx.read_tsc();
         // Respawn on core 2 → new page table mapping → another TLB shootdown on core 2.
         let _ = ctx.spawn("chaos-c7-victim");
+        let t3 = ctx.read_tsc();
         // Brief yield to allow the new victim to be scheduled and its pages faulted in.
         for _ in 0..50u32 { ctx.yield_cpu(); }
+        let t4 = ctx.read_tsc();
+
+        c_send  = c_send.wrapping_add(t1.wrapping_sub(t0));
+        c_kill  = c_kill.wrapping_add(t2.wrapping_sub(t1));
+        c_spawn = c_spawn.wrapping_add(t3.wrapping_sub(t2));
+        c_yield = c_yield.wrapping_add(t4.wrapping_sub(t3));
+
         if i % 10 == 9 {
+            let n = (i + 1) as u64;
             ctx.log_fmt(format_args!("chaos: C7 iter {}/30", i + 1));
+            // Mean cycles/iter per section over the run so far (divide by ~2 GHz
+            // on the T630 for seconds: e.g. 3.1e9 cyc ≈ 1.55 s).
+            ctx.log_fmt(format_args!(
+                "chaos: C7 split (cyc/iter) send={} kill={} spawn={} yield50={}",
+                c_send / n, c_kill / n, c_spawn / n, c_yield / n,
+            ));
         }
     }
     ctx.log("chaos: C7 pass — 30 cross-core TLB shootdowns survived");
