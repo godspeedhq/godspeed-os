@@ -324,6 +324,8 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     #[cfg(feature = "iso-bp10")] { let _ = ctx.spawn("perf-bp10"); }
     // Cross-core STRESS isolation (recv/partners first so endpoints are registered).
     #[cfg(feature = "iso-s3")]   { let _ = ctx.spawn("stress-s3-recv"); let _ = ctx.spawn("stress-s3-send"); }
+    // iso-s5: victim first so its endpoint exists when stress-s5's caps are wired.
+    #[cfg(feature = "iso-s5")]   { let _ = ctx.spawn("stress-s5-victim"); let _ = ctx.spawn("stress-s5"); }
     #[cfg(feature = "iso-s9")]   {
         let _ = ctx.spawn("stress-s9-recv");
         let _ = ctx.spawn("stress-s9-send-a");
