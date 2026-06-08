@@ -33,6 +33,15 @@ const SCALE: usize = 2;
 const GLYPH_W: usize = 8 * SCALE;
 const GLYPH_H: usize = 8 * SCALE;
 
+/// Char-grid shadow bounds. Sized for up to ~4K UHD with the 10% safe-area inset
+/// (3072/16 = 192 cols, 1728/16 = 108 rows); larger displays clamp the text area to
+/// these bounds. The shadow holds each cell's printable content so `scroll` can
+/// redraw from RAM instead of reading the framebuffer back — uncached/WC VRAM reads
+/// run ~100x slower than writes, the fbcon scroll trap that made a respawn look 40x
+/// a cold spawn (see the iso-c7/iso-xlife investigation).
+const MAX_COLS: usize = 256;
+const MAX_ROWS: usize = 128;
+
 /// Framebuffer console state. The base pointer is stored as `usize` so the
 /// struct is `Send` (a raw pointer would not be), which `SpinLock<T: Send>`
 /// requires to be `Sync` as a `static`.
@@ -63,6 +72,11 @@ struct Fb {
     cursor_visible: bool,// draw the underline cursor (off for full-screen apps)
     cur_col: usize,      // column where the cursor underline was last drawn
     cur_row: usize,      // row where the cursor underline was last drawn
+    // Char-grid shadow: the printable content of each text cell (the transient
+    // cursor overlay is excluded — it is always erased before a scroll). `scroll`
+    // shifts this in RAM and redraws the screen from it, so it never reads the
+    // (uncached) framebuffer back.
+    grid: [[u8; MAX_COLS]; MAX_ROWS],
 }
 
 static FB: SpinLock<Fb> = SpinLock::new(Fb {
@@ -70,6 +84,7 @@ static FB: SpinLock<Fb> = SpinLock::new(Fb {
     org_x: 0, org_y: 0, cols: 0, rows: 0, col: 0, row: 0, fg: 0, bg: 0, ready: false,
     esc: 0, csi_priv: false, csi_params: [0; 3], csi_nparam: 0, cursor_visible: true,
     cur_col: 0, cur_row: 0,
+    grid: [[b' '; MAX_COLS]; MAX_ROWS],
 });
 
 /// Safe-area inset per edge, as a percentage of each dimension. TVs overscan
@@ -98,6 +113,9 @@ pub fn fb_init(fb: &Framebuffer) {
     s.org_y = s.height * SAFE_PCT / 100;
     s.cols = (s.width - 2 * s.org_x) / GLYPH_W;
     s.rows = (s.height - 2 * s.org_y) / GLYPH_H;
+    // Clamp the text area to the char-grid shadow bounds (only matters above ~4K).
+    s.cols = s.cols.min(MAX_COLS);
+    s.rows = s.rows.min(MAX_ROWS);
     s.col = 0;
     s.row = 0;
     s.fg = make(0x80, 0xFF, 0x80); // soft green on black — classic console look
@@ -106,7 +124,7 @@ pub fn fb_init(fb: &Framebuffer) {
     s.csi_nparam = 0;
     s.cursor_visible = true;
     s.ready = true;
-    clear(&s);
+    clear(&mut s);
 }
 
 /// Framebuffer text geometry packed as `(rows << 16) | cols`, or 0 if the
@@ -123,7 +141,7 @@ pub fn dims_packed() -> u32 {
 pub fn clear_and_home() {
     let mut s = FB.lock();
     if !s.ready { return; }
-    clear(&s);
+    clear(&mut s);
     s.col = 0;
     s.row = 0;
     s.esc = 0;
@@ -229,6 +247,7 @@ fn process_byte(s: &mut Fb, b: u8) {
             // The glyph is drawn at the (now blank) cursor cell.
             let (c, r) = (s.col, s.row);
             draw_glyph(s, b, c, r);
+            grid_set(s, c, r, b);
             s.col += 1;
             if s.col >= s.cols {
                 advance_line(s);
@@ -329,26 +348,32 @@ fn execute_csi(s: &mut Fb, final_byte: u8) {
 }
 
 /// Blank cells from the cursor column to the end of the current row.
-fn erase_line_to_eol(s: &Fb) {
-    for c in s.col..s.cols {
-        draw_glyph(s, b' ', c, s.row);
+fn erase_line_to_eol(s: &mut Fb) {
+    let (row, col, cols) = (s.row, s.col, s.cols);
+    for c in col..cols {
+        draw_glyph(s, b' ', c, row);
+        grid_set(s, c, row, b' ');
     }
 }
 
 /// Blank every cell on the current row.
-fn erase_line_full(s: &Fb) {
-    for c in 0..s.cols {
-        draw_glyph(s, b' ', c, s.row);
+fn erase_line_full(s: &mut Fb) {
+    let (row, cols) = (s.row, s.cols);
+    for c in 0..cols {
+        draw_glyph(s, b' ', c, row);
+        grid_set(s, c, row, b' ');
     }
 }
 
 /// Blank from the cursor to the end of the screen (rest of this row, then every
 /// row below it).
-fn erase_to_end_of_screen(s: &Fb) {
+fn erase_to_end_of_screen(s: &mut Fb) {
     erase_line_to_eol(s);
-    for r in (s.row + 1)..s.rows {
-        for c in 0..s.cols {
+    let (rows, cols, start) = (s.rows, s.cols, s.row + 1);
+    for r in start..rows {
+        for c in 0..cols {
             draw_glyph(s, b' ', c, r);
+            grid_set(s, c, r, b' ');
         }
     }
 }
@@ -383,12 +408,18 @@ fn advance_line(s: &mut Fb) {
 
 /// Clear the whole framebuffer to the background colour. `bg` is black (all
 /// channels zero ⇒ all bytes zero), so a flat byte-zero fill is correct.
-fn clear(s: &Fb) {
+fn clear(s: &mut Fb) {
     let base = s.base as *mut u8;
     let total = s.height * s.pitch;
     // SAFETY: [base, base+total) is the framebuffer Limine mapped and sized
     // (height*pitch); it is valid for writes for the system lifetime.
     unsafe { core::ptr::write_bytes(base, 0, total) };
+    // Shadow: every cell is now blank.
+    for r in 0..MAX_ROWS {
+        for c in 0..MAX_COLS {
+            s.grid[r][c] = b' ';
+        }
+    }
 }
 
 /// Write a single pixel at (x, y) in the device's pixel layout.
@@ -429,26 +460,44 @@ fn draw_glyph(s: &Fb, ch: u8, col: usize, row: usize) {
     }
 }
 
-/// Scroll the display up by one text row. Copies the framebuffer up by one
-/// glyph height and clears the freed bottom row.
-fn scroll(s: &Fb) {
-    let row_bytes = GLYPH_H * s.pitch;
-    let text_top = s.org_y * s.pitch; // byte offset of the first text scanline
-    let text_bytes = s.rows * GLYPH_H * s.pitch; // height of the text region
-    if row_bytes >= text_bytes {
+/// Record a cell's printable character in the shadow grid. Bounds-guarded; cols/rows
+/// are clamped to the grid in `fb_init`, so in practice every cell is in range.
+#[inline]
+fn grid_set(s: &mut Fb, c: usize, r: usize, ch: u8) {
+    if r < MAX_ROWS && c < MAX_COLS {
+        s.grid[r][c] = ch;
+    }
+}
+
+/// Scroll the display up by one text row.
+///
+/// The old implementation `core::ptr::copy`'d the framebuffer up in place — which
+/// *reads the framebuffer back*. The framebuffer is uncached / write-combining, so
+/// those reads run at tens of MB/s; an 8 MB read-back cost ~130 ms per scrolled line
+/// on the T630, which dominated every kill/respawn-heavy workload (the iso-c7 /
+/// iso-xlife dig). Instead, shift the char-grid shadow up in normal RAM (fast) and
+/// repaint the text area from it — **write-only** to the framebuffer (WC writes are
+/// ~100x faster than reads).
+fn scroll(s: &mut Fb) {
+    let rows = s.rows;
+    let cols = s.cols;
+    if rows == 0 {
         return;
     }
-    let base = s.base as *mut u8;
-    // SAFETY: the text strip [org_y, org_y + rows*GLYPH_H) lies within the mapped
-    // framebuffer (org_y + rows*GLYPH_H ≤ height by construction). copy shifts it
-    // up one glyph row (handles overlap); write_bytes clears the freed bottom
-    // row (bg is black ⇒ byte-zero). The margins outside the strip are untouched.
-    unsafe {
-        core::ptr::copy(
-            base.add(text_top + row_bytes),
-            base.add(text_top),
-            text_bytes - row_bytes,
-        );
-        core::ptr::write_bytes(base.add(text_top + text_bytes - row_bytes), 0, row_bytes);
+    // Shift the shadow up one row in RAM; blank the freed bottom row.
+    for r in 0..rows - 1 {
+        for c in 0..cols {
+            s.grid[r][c] = s.grid[r + 1][c];
+        }
+    }
+    for c in 0..cols {
+        s.grid[rows - 1][c] = b' ';
+    }
+    // Repaint every cell from the shadow — no framebuffer read-back.
+    for r in 0..rows {
+        for c in 0..cols {
+            let ch = s.grid[r][c];
+            draw_glyph(s, ch, c, r);
+        }
     }
 }
