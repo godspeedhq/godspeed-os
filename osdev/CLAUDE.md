@@ -32,6 +32,7 @@ Host-side developer CLI (§17). Builds for the developer's machine, not the kern
 | `osdev image --mode perf`   | Same image, `perf-only` supervisor (B1–B10 probes) |
 | `osdev image --mode perf-brutal` | Same image, `perf-brutal-only` supervisor (BP1–BP10 probes) |
 | `osdev image --mode identity` | Same image, `identity-only` supervisor (WatchSerial identity tests) |
+| `osdev image --mode fuzz`   | Same image, `fuzz-only` supervisor (§22 F1–F8 + BF1–BF8 self-run over serial; F3/BF3 need test-bad-elf, F4 is host-only) |
 
 ## Files
 

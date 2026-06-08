@@ -45,7 +45,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // perf-only, and perf-brutal-only builds: probe-hog tight-loops on core 0,
     // probe-4b-send blocks waiting for a harness kill that never arrives on HW,
     // and the combined 16-task load starves IPC benchmarks of scheduler quanta.
-    #[cfg(not(any(feature = "bare-metal", feature = "perf-only", feature = "perf-brutal-only", feature = "stress-only", feature = "adv-only", feature = "chaos-only", feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
+    #[cfg(not(any(feature = "bare-metal", feature = "perf-only", feature = "perf-brutal-only", feature = "stress-only", feature = "adv-only", feature = "chaos-only", feature = "fuzz-only", feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
     {
         // --- Probe services (§22 Group A identity tests) ---
         // Recv-endpoint probes must come first so their endpoints are registered
@@ -87,7 +87,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // the USB image rests at `gs>`. Run `observe` from the shell on demand.
     #[cfg(not(any(feature = "bare-metal", feature = "identity-only", feature = "perf-only",
                   feature = "perf-brutal-only", feature = "stress-only",
-                  feature = "adv-only", feature = "chaos-only",
+                  feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
     let _ = ctx.spawn("observe");
 
@@ -95,7 +95,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // here) and full builds; excluded from test-specific builds.
     #[cfg(not(any(feature = "identity-only", feature = "perf-only",
                   feature = "perf-brutal-only", feature = "stress-only",
-                  feature = "adv-only", feature = "chaos-only",
+                  feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
     let _ = ctx.spawn("shell");
 
@@ -103,7 +103,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // builds; the kernel maps its controller's MMIO BAR at spawn (Stage 2).
     #[cfg(not(any(feature = "identity-only", feature = "perf-only",
                   feature = "perf-brutal-only", feature = "stress-only",
-                  feature = "adv-only", feature = "chaos-only",
+                  feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
     let _ = ctx.spawn("xhci");
 
@@ -111,7 +111,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // as xhci; the kernel grants its MMIO/DMA at spawn (E1b+).
     #[cfg(not(any(feature = "identity-only", feature = "perf-only",
                   feature = "perf-brutal-only", feature = "stress-only",
-                  feature = "adv-only", feature = "chaos-only",
+                  feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
     let _ = ctx.spawn("ehci");
 
@@ -261,6 +261,38 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("adv-a10");
 }
 
+// fuzz-only: spawn only the §22 fuzz probe services (F1/F2/F5/F6/F7/F8 + brutal
+// BF1/BF2/BF5/BF6/BF7/BF8). All self-run and print "fuzz: F* pass (n/n)" over
+// serial — no QEMU control port required, safe for real hardware. Recv-endpoint
+// victims/targets are spawned before their controllers so endpoints are registered
+// when the controllers' SEND caps are wired at spawn time (same ordering rule as
+// every other category). F3/BF3 (ELF-loader fuzz) need a separate test-bad-elf
+// kernel build that halts after fuzzing; F4 is host-side contract validation only.
+#[cfg(all(not(feature = "bare-metal"), not(feature = "idle-only"), not(feature = "identity-only"), not(feature = "perf-only"), not(feature = "perf-brutal-only"), not(feature = "stress-only"), not(feature = "adv-only"), not(feature = "chaos-only"), feature = "fuzz-only"))]
+fn spawn_extended_probes(ctx: &ServiceContext) {
+    // Regular fuzz probes (Milestone 10 Phase 1).
+    let _ = ctx.spawn("fuzz-f1");
+    let _ = ctx.spawn("fuzz-f2");
+    let _ = ctx.spawn("fuzz-f5-recv");
+    let _ = ctx.spawn("fuzz-f5");
+    let _ = ctx.spawn("fuzz-f6-recv");
+    let _ = ctx.spawn("fuzz-f6");
+    let _ = ctx.spawn("fuzz-f7-victim");
+    let _ = ctx.spawn("fuzz-f7");
+    let _ = ctx.spawn("fuzz-f8");
+    // Brutal fuzz probes (Milestone 17) — heavier iteration counts; run fast on
+    // real silicon (no TCG throttling). Recv/victim partners first.
+    let _ = ctx.spawn("fuzz-bf5-recv");
+    let _ = ctx.spawn("fuzz-bf5");
+    let _ = ctx.spawn("fuzz-bf6-recv");
+    let _ = ctx.spawn("fuzz-bf6");
+    let _ = ctx.spawn("fuzz-bf7-victim");
+    let _ = ctx.spawn("fuzz-bf7");
+    let _ = ctx.spawn("fuzz-bf1");
+    let _ = ctx.spawn("fuzz-bf2");
+    let _ = ctx.spawn("fuzz-bf8");
+}
+
 // b2-only: spawn only the regular B2 cross-core IPC probe pair (isolation build).
 // No other benchmarks running — eliminates concurrent IPI noise from B5 spawn/kill
 // and B6 restart cycles so the blocking round-trip can complete on Goldmont+.
@@ -301,7 +333,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
 }
 
 // Full build: spawn all non-identity probe categories.
-#[cfg(not(any(feature = "bare-metal", feature = "idle-only", feature = "identity-only", feature = "perf-only", feature = "perf-brutal-only", feature = "stress-only", feature = "adv-only", feature = "chaos-only", feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
+#[cfg(not(any(feature = "bare-metal", feature = "idle-only", feature = "identity-only", feature = "perf-only", feature = "perf-brutal-only", feature = "stress-only", feature = "adv-only", feature = "chaos-only", feature = "fuzz-only", feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
 fn spawn_extended_probes(ctx: &ServiceContext) {
     // --- Brutal adversarial test probes — Milestone 20 ---
     // Spawned EARLY, before property/stress kill-respawn loops start, so the
