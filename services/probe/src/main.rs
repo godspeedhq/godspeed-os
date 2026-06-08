@@ -175,6 +175,11 @@ const MODE_CHAOS_BC7:       u32 = 159; // 15 cross-core kill/respawn cycles (bru
 const MODE_XSEND:           u32 = 200; // sender (core 1): time try_send to xsend-recv (core 2)
 const MODE_XSEND_RECV:      u32 = 201; // receiver (core 2): drain forever
 
+// Cross-core task-lifecycle diagnostic — isolate the ~1.04s C7 respawn cost: is it
+// cross-core coordination or task creation? (osdev image --mode iso-xlife).
+const MODE_XLIFE:           u32 = 202; // controller (core 1): time kill/spawn of near+far victims
+const MODE_XLIFE_VICTIM:    u32 = 203; // victim: idle until killed (xlife-near core 1, xlife-far core 2)
+
 // Interrupt-routing test modes — Post-v1 item 9 (§12.2, §12.3).
 const MODE_IRQ_RECV:        u32 = 160; // IR1A: recv interrupt event; log pass
 
@@ -390,6 +395,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         MODE_IRQ_RECV        => mode_irq_recv(&ctx),
         MODE_XSEND           => mode_xsend(&ctx),
         MODE_XSEND_RECV      => mode_xsend_recv(&ctx),
+        MODE_XLIFE           => mode_xlife(&ctx),
+        MODE_XLIFE_VICTIM    => idle(&ctx),
         _                    => idle(&ctx),
     }
 }
@@ -2152,6 +2159,49 @@ fn mode_xsend(ctx: &ServiceContext) -> ! {
         tsc_overhead, paced_handle, tight_handle, paced_name,
     ));
     ctx.log("xsend: done");
+    idle(ctx)
+}
+
+fn mode_xlife(ctx: &ServiceContext) -> ! {
+    // Cross-core task-lifecycle timing: controller on core 1 kills+respawns a
+    // SAME-core victim (xlife-near, core 1) and a CROSS-core victim (xlife-far,
+    // core 2), RDTSC-bracketing each kill and each spawn separately. Both victims
+    // are the same PROBE_ELF, so task-creation work (page tables + mapping the
+    // binary) is identical — the far−near delta isolates the cross-core
+    // coordination cost (remote deschedule IPI + TLB-shootdown wait) from the
+    // task-creation cost. Attributes C7's ~1.04 s respawn: if spawn_far ≫ spawn_near
+    // the cost is cross-core; if spawn_near ≈ spawn_far ≫ BP5 (~23 ms) the cost is
+    // task creation itself. read_tsc is InspectKernel q3 (ungated). Victims exist
+    // at boot (supervisor spawns them first), so the first kill always has a target.
+    let (mut k_near, mut s_near, mut k_far, mut s_far) = (0u64, 0u64, 0u64, 0u64);
+    const N: u32 = 20;
+    for i in 0..N {
+        // same-core: kill + respawn xlife-near (core 1, the controller's own core).
+        let a = ctx.read_tsc();
+        let _ = ctx.kill("xlife-near");
+        let b = ctx.read_tsc();
+        let _ = ctx.spawn("xlife-near");
+        let c = ctx.read_tsc();
+        // cross-core: kill + respawn xlife-far (core 2).
+        let _ = ctx.kill("xlife-far");
+        let d = ctx.read_tsc();
+        let _ = ctx.spawn("xlife-far");
+        let e = ctx.read_tsc();
+
+        k_near = k_near.wrapping_add(b.wrapping_sub(a));
+        s_near = s_near.wrapping_add(c.wrapping_sub(b));
+        k_far  = k_far.wrapping_add(d.wrapping_sub(c));
+        s_far  = s_far.wrapping_add(e.wrapping_sub(d));
+
+        if i % 5 == 4 {
+            let n = (i + 1) as u64;
+            ctx.log_fmt(format_args!(
+                "xlife: cyc/op (n={}) kill_near={} spawn_near={} kill_far={} spawn_far={}",
+                n, k_near / n, s_near / n, k_far / n, s_far / n,
+            ));
+        }
+    }
+    ctx.log("xlife: done");
     idle(ctx)
 }
 
