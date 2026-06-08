@@ -32,7 +32,7 @@ The kernel requires a custom target spec. The binary is a flat ELF loaded by Lim
 | `capability/`    | §7          | Yes — global table |
 | `smp/`           | §9, §11     | Yes — APIC MMIO |
 | `ipc/`           | §8          | No  |
-| `task/`          | §9, §14     | 2 grandfathered lines (kstack arithmetic — see `docs/unsafe-audit.md`) |
+| `task/`          | §9, §14     | grandfathered: `mod.rs` 10 (kstack pool + spawn + H4 guards), `scheduler.rs` 37 — see `docs/unsafe-audit.md` |
 | `syscall/`       | §8.2        | 2 grandfathered lines (syscall entry — see audit) |
 | `interrupt/`     | §12         | 1 grandfathered line (IDT delivery — see audit) |
 | `invariants/`    | §22         | No  |
@@ -41,7 +41,7 @@ The kernel requires a custom target spec. The binary is a flat ELF loaded by Lim
 
 ## Unsafe policy (§18)
 
-`unsafe` is permitted **only** in `arch/`, `memory/`, `capability/`, `smp/`. Every `unsafe` block must have a `// SAFETY:` comment. The grandfathered lines in `task/`, `syscall/`, and `interrupt/` are documented in `docs/unsafe-audit.md` and will not be extended.
+`unsafe` is permitted **only** in `arch/`, `memory/`, `capability/`, `smp/`. Every `unsafe` block must have a `// SAFETY:` comment. The grandfathered lines in `task/`, `syscall/`, and `interrupt/` are documented in `docs/unsafe-audit.md` and frozen — they may decrease but increase only by a recorded §18.5 amendment with rationale. One such amendment exists: `task/mod.rs` 7 → 10 and `main.rs` 2 → 4 for the H4 W^X / kstack-guard hardening (2026-06-08).
 
 A PR adding an unsafe block without a SAFETY comment is rejected without review.
 
