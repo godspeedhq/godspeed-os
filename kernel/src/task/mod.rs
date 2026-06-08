@@ -1191,6 +1191,30 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         // S3: Cross-core thrash. Receiver pinned to core 1, sender to core 0.
+        // Cross-core try_send diagnostic (osdev image --mode iso-xsend): sender on
+        // core 1 → receiver on core 2, mirroring C7's controller→victim direction.
+        "xsend-recv" => Some(("xsend-recv", ServiceConfig {
+            elf:               PROBE_ELF,
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    2, // receiver on core 2 (C7's victim core)
+            probe_mode:        201, // XSEND_RECV: drain forever
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
+        "xsend" => Some(("xsend", ServiceConfig {
+            elf:               PROBE_ELF,
+            has_recv_endpoint: false,
+            send_peers:        &["xsend-recv"],
+            send_peers_grant:  false,
+            preferred_core:    1, // sender on core 1 (C7's controller core)
+            probe_mode:        200, // XSEND: time cross-core try_send to xsend-recv
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
         "stress-s3-recv" => Some(("stress-s3-recv", ServiceConfig {
             elf:               PROBE_ELF,
             has_recv_endpoint: true,
