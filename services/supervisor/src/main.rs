@@ -326,6 +326,9 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     #[cfg(feature = "iso-s3")]   { let _ = ctx.spawn("stress-s3-recv"); let _ = ctx.spawn("stress-s3-send"); }
     // iso-s5: victim first so its endpoint exists when stress-s5's caps are wired.
     #[cfg(feature = "iso-s5")]   { let _ = ctx.spawn("stress-s5-victim"); let _ = ctx.spawn("stress-s5"); }
+    // iso-c7: victim (core 2) first so its endpoint exists when chaos-c7's (core 1)
+    // SEND cap is wired; controller then drives 30 cross-core kill/respawn cycles.
+    #[cfg(feature = "iso-c7")]   { let _ = ctx.spawn("chaos-c7-victim"); let _ = ctx.spawn("chaos-c7"); }
     #[cfg(feature = "iso-s9")]   {
         let _ = ctx.spawn("stress-s9-recv");
         let _ = ctx.spawn("stress-s9-send-a");
