@@ -944,6 +944,25 @@ A PR with an unsafe block lacking a SAFETY comment is rejected without review.
 
 `docs/unsafe-audit.md` lists every unsafe block. CI checks the file matches source.
 
+### 18.5 Grandfathered Floors
+
+`unsafe` outside the four permitted layers (§18.1) is tolerated only as
+**grandfathered** lines in `task/`, `syscall/`, and `interrupt/`, frozen at the
+counts in `docs/unsafe-audit.md`. Those counts may **decrease** freely but may
+**increase** only by an amendment recorded here and in the audit, with a written
+safety + necessity rationale.
+
+**Amendment 2026-06-08 (H4 hardening).** The W^X and kernel-stack-guard mitigations
+(§3 invariant 12) required `unsafe` call sites the boot orchestrator alone can make
+sound, raising two grandfathered floors **once**: `main.rs` 2 → 4 (the
+`install_kstack_guards` / `harden_hhdm_nx` boot-ordering call sites) and `task/mod.rs`
+7 → 10 (the kstack-guard install — intrinsically about the task kstack pool). Every
+new block carries a `// SAFETY:` argument and is hardware-verified (T630). Relocating
+the `task/mod.rs` unsafe to a permitted layer (the alternative) was declined for
+locality. Full rationale: `docs/unsafe-audit.md` (2026-06-08 amendment entry). The
+freeze otherwise stands — these floors do not ratchet up again without a new
+amendment.
+
 ---
 
 ## 19. Debugging Model

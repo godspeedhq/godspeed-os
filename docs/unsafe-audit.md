@@ -8,6 +8,51 @@ unless this file is updated in the same commit with a written SAFETY argument.**
 
 ---
 
+## 2026-06-08 — fbcon scroll without VRAM read-back
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/x86_64/fb.rs` | 4 → 3 (−1) | `scroll` no longer `core::ptr::copy`s the framebuffer up in place (which *read* uncached/WC VRAM — ~130 ms/line on the T630, the fbcon perf trap behind the "40× respawn"). It now shifts a RAM char-grid shadow and repaints from it — write-only via `draw_glyph`/`put_pixel` — so the block is gone. |
+
+Reduction only; locks in the lower count. The three remaining blocks (`clear`,
+`put_pixel`, `wc_flush`) keep their `// SAFETY:` comments. Hardware-verified
+(T630): pixel-correct after thousands of scrolls; spawn 0.906 s → 9.9 ms.
+
+> **Note.** This same day also reconciled 3 files the earlier H4b/H4 hardening
+> merges left unaccounted (`page_tables.rs 25→35`, `main.rs 2→4`, `task/mod.rs
+> 7→10`) — see the amendment immediately below.
+
+---
+
+## 2026-06-08 — grandfathered floor amendment + H4 hardening reconcile
+
+The W^X-remap (H4a/H4b) and kstack-guard (H4) work that merged earlier this session
+added `unsafe` (all `// SAFETY:`-commented in source) but did not update this audit.
+Reconciled here; the grandfathered floor raise is the **amendment CLAUDE.md §18
+requires** for new grandfathered unsafe (also recorded in `CLAUDE.md §18` and
+`kernel/CLAUDE.md`).
+
+| File | Change | Layer | Why |
+|------|--------|-------|-----|
+| `arch/x86_64/page_tables.rs` | 25 → 35 (+10) | permitted | `entry_for_va`/`walk` PTE-walk, `unmap_active_4k` (guard-page unmap), `harden_hhdm_nx` (flip HHDM NX, close the RWX direct map). Permitted-layer growth — allowed with SAFETY comments + this entry. |
+| `main.rs` | 2 → 4 (+2) | **grandfathered** | Call sites `unsafe { install_kstack_guards() }` and `unsafe { harden_hhdm_nx() }` — boot-orchestration ordering preconditions only `kernel_main` can guarantee. |
+| `task/mod.rs` | 7 → 10 (+3) | **grandfathered** | `install_kstack_guards` (+ `kstack_pool_base`): the `unsafe fn`, the `unmap_active_4k` guard unmap, and the static `addr_of` base read. |
+
+**Rationale for raising the grandfathered floors (option A, chosen over B).** The two
+grandfathered increases are not feature creep — they are the security hardening the
+constitution itself calls for: §3 invariant 12 (loud failures) and the W^X / guard-page
+mitigations close real holes (the Limine RWX HHDM, the kstack-overlap class). The
+`unsafe` is irreducible at these sites: in `main.rs` it is the *call-site* assertion of
+boot ordering (hiding it inside a falsely-safe wrapper would be dishonest, §26.4); in
+`task/mod.rs` the guard logic is intrinsically about the task kstack pool. Option B
+(relocating the `task/mod.rs` unsafe to a permitted layer) was considered and declined
+in favour of locality. Every new block carries a `// SAFETY:`/`# Safety` argument
+(§18.3), all hardware-verified on the T630. The floors are raised **once** to
+`main.rs = 4`, `task/mod.rs = 10`; the freeze otherwise holds (they may still only
+decrease from here).
+
+---
+
 ## 2026-06-04 — idle-halt (cool when idle) + introspection holds-check reconcile
 
 | File | Change | Why |
@@ -91,10 +136,10 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | arch/x86_64/ap_boot.rs | 2 | permitted |
 | arch/x86_64/boot.rs | 81 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |
-| arch/x86_64/fb.rs | 4 | permitted |
+| arch/x86_64/fb.rs | 3 | permitted |
 | arch/x86_64/interrupts.rs | 13 | permitted |
 | arch/x86_64/mod.rs | 34 | permitted |
-| arch/x86_64/page_tables.rs | 25 | permitted |
+| arch/x86_64/page_tables.rs | 35 | permitted |
 | arch/x86_64/pci.rs | 5 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |
 | arch/x86_64/syscall_entry.rs | 13 | permitted |
@@ -110,15 +155,15 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | smp/spinlock.rs | 5 | permitted |
 | interrupt/route.rs | 1 | grandfathered |
 | loader.rs | 4 | grandfathered |
-| main.rs | 2 | grandfathered |
+| main.rs | 4 | grandfathered |
 | syscall/dispatch.rs | 2 | grandfathered |
-| task/mod.rs | 7 | grandfathered |
+| task/mod.rs | 10 | grandfathered |
 | task/scheduler.rs | 37 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 267 lines across 20 files  
-**Grandfathered total:** 53 lines across 6 files  
-**Grand total:** 320 lines across 26 files
+**Permitted total:** 276 lines across 20 files  
+**Grandfathered total:** 58 lines across 6 files  
+**Grand total:** 334 lines across 26 files
 
 > **Reconciled 2026-05-31** (branch `verify/static-analysis-unsafe-audit`). The
 > permitted-layer growth since the prior baseline is from the AMD GX-420GI ring-3 /
@@ -179,18 +224,23 @@ and not yet visible to the scheduler.
 
 ### arch/x86_64/fb.rs
 
-Framebuffer text console (Phase 1 boot output, §11.4). Four blocks; three write
+Framebuffer text console (Phase 1 boot output, §11.4). Three blocks; two write
 to Limine's linear framebuffer at `base + y*pitch + x*bpp`:
 - `clear`: `write_bytes(base, 0, height*pitch)` — fills the whole buffer.
 - `put_pixel`: writes `bpp` bytes at a bounds-checked offset (`x<width`, `y<height`).
-- `scroll`: `copy`/`write_bytes` shifting the buffer up one glyph row.
 
 Sound because the framebuffer is the region Limine mapped and sized
 (`height*pitch` bytes), it lives in the higher half (PML4 256–511) that every
 address space inherits via `PageTable::new`, so it is valid for writes for the
 system lifetime; every offset is bounds-checked against the reported geometry.
 
-The fourth block is `wc_flush`: a single `SFENCE` instruction. The framebuffer
+`scroll` previously held a fourth block — an in-place `copy`/`write_bytes` that
+shifted the framebuffer up one glyph row. That `copy` *read the framebuffer back*
+(uncached/WC VRAM, ~130 ms/line on the T630); it was replaced by a RAM char-grid
+shadow that scroll shifts and repaints from, leaving `scroll` entirely safe
+(write-only via `draw_glyph` → `put_pixel`). Net **4 → 3** (2026-06-08).
+
+The remaining `wc_flush` block is a single `SFENCE` instruction. The framebuffer
 is mapped write-combining (Limine HHDM default), so the FB lock's atomic release
 does not order the WC store buffer — a scroll's pixel stores on one core could
 flush after the next line's first glyph drawn on another core, erasing it. Each
@@ -253,6 +303,22 @@ written once before any AP starts; PTE access goes through the HHDM which is
 valid after `set_hhdm_offset`; `map_in_active_tables` holds the frame allocator
 lock for the duration; `reclaim_user_frames` is called only after TLB shootdown
 acknowledgment from all cores.
+
+Ten additional unsafe lines (count 25 → 35) from the W^X / guard-page hardening
+(H4a/H4b, 2026-06-07/08):
+- `entry_for_va` / `walk` / `read_entry` chain — read-only PTE walk used to probe
+  a VA's mapping (PTE/large-page) for the W^X audit and the kstack-guard install.
+- `unmap_active_4k(virt)` (`unsafe fn` + CR3 read + present-entry walk + clear PTE
+  + `invlpg`) — marks a 4 KiB page non-present; no-ops on a large page (fails safe).
+  Used to install the kernel-stack guard pages.
+- `harden_hhdm_nx()` (`unsafe fn` + CR3 read + HHDM subtree walk OR-ing NX into every
+  present PDPT/PD/PT, then CR3 reload) — flips the HHDM `NO_EXEC`, closing the
+  Limine-mapped RWX direct map (§3.12). Runs on the BSP after `smp::init`.
+
+All sound for the same reason as the rest of the file: HHDM is live, the tables are
+reached via present entries rooted at the live CR3-referenced PML4, and these run
+BSP-only at boot before APs execute from the affected region. `// SAFETY:` comments
+and `# Safety` docs present in source for every block.
 
 ---
 
@@ -436,14 +502,23 @@ four blocks.
 
 ---
 
-### main.rs *(grandfathered)*
+### main.rs *(grandfathered — floor raised 2 → 4, see amendment 2026-06-08)*
 
-Two unsafe blocks: (1) BSP stack switch via inline ASM — sound because
-`BSP_BOOT_STACK` is a 512 KiB static buffer and the pointer arithmetic is
+Four unsafe blocks. The original two: (1) BSP stack switch via inline ASM — sound
+because `BSP_BOOT_STACK` is a 512 KiB static buffer and the pointer arithmetic is
 bounded; (2) deref of `boot_info_ptr` — sound because the Limine bootloader
-guarantees alignment and validity. The third block (COM2 init) was removed when
-`com2_init` was made a safe function. `// SAFETY:` comments present in source
-for both remaining blocks.
+guarantees alignment and validity. (The earlier COM2-init block was removed when
+`com2_init` was made a safe function.)
+
+Two added by the H4 hardening (count 2 → 4, 2026-06-08): (3)
+`unsafe { task::install_kstack_guards() }` and (4)
+`unsafe { arch::x86_64::page_tables::harden_hhdm_nx() }`. Both are call sites of
+`unsafe fn`s whose preconditions are *ordering* facts the boot orchestrator alone
+can guarantee — install runs BSP-only after `memory::init` and before APs/alloc;
+harden runs BSP-only after `smp::init` (Limine's AP bring-up executes through the
+HHDM, so it must come after). Keeping the `unsafe` at the call site (rather than
+hiding the precondition inside a falsely-"safe" wrapper) is the honest pattern.
+`// SAFETY:` comments present in source for all four blocks.
 
 ---
 
@@ -464,15 +539,25 @@ encapsulate the unsafe in the permitted arch layer.
 
 ---
 
-### task/mod.rs *(grandfathered)*
+### task/mod.rs *(grandfathered — floor raised 7 → 10, see amendment 2026-06-08)*
 
-Seven unsafe blocks: two in the kstack pool (`as_mut_ptr().add(...)` in
-`alloc_kstack` and `as_ptr() as u64` in `free_kstack` — necessary HHDM pointer
-arithmetic to locate the per-slot buffer); five in the spawn path
-(`write_bytes` for stack zeroing, `task_cap_init_empty`, `write_bytes` +
-`*mut ServiceContextData` cast for ctx page, `TaskContext::new_user`, and
-`commit_task`). All are bounded by prior bounds checks or scheduler-layer
-invariants. `// SAFETY:` comments present in source for all blocks.
+Ten unsafe blocks. The original seven: two in the kstack pool (`addr_of` /
+`as_mut_ptr().add(...)` pointer arithmetic to locate the per-slot buffer) and five
+in the spawn path (`write_bytes` for stack zeroing, `task_cap_init_empty`,
+`write_bytes` + `*mut ServiceContextData` cast for ctx page, `TaskContext::new_user`,
+and `commit_task`).
+
+Three added by the H4 kstack-guard work (count 7 → 10, 2026-06-08), all in
+`install_kstack_guards` and its `kstack_pool_base` helper: the `unsafe fn`
+declaration, the `unsafe { unmap_active_4k(guard) }` call (unmaps each slot's low
+4 KiB guard page), and the `addr_of!(KSTACK_STORAGE.data)` base read. Sound because:
+the guard is the unused low page of slot `i` (nothing accesses it); `unmap_active_4k`
+no-ops on a large page (fails safe); the install runs BSP-only at boot before any
+kstack is allocated or any AP starts. `// SAFETY:` comments present in source for all
+ten blocks. (The guard-page logic lives in `task/` rather than a permitted layer
+because it is intrinsically about the task kstack pool; option B — relocating it to
+`arch/`/`memory/` to avoid the grandfathered bump — was considered and declined in
+favour of locality, per the 2026-06-08 amendment.)
 
 The previous magic-word liveness scheme (`KSTACK_MAGIC_USED` volatile
 reads/writes at slot offset 0) was replaced by `SpinLock<[bool; TASK_KSTACK_MAX]>`,
