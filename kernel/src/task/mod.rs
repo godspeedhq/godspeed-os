@@ -2743,6 +2743,17 @@ pub fn spawn_service_by_name(name: &str, core_override: Option<u32>) -> Result<(
     result
 }
 
+/// Per-spawn DIAG step-markers (`spawn[elf]`, `spawn[stack]`, …). Added to narrow a
+/// bare-metal boot freeze; kept as a debug aid but **off by default**. They were a
+/// real performance trap: in builds with no shell (the `iso-*`/probe images) the
+/// framebuffer mirror never turns off, so every kprintln line triggers a full-screen
+/// scroll that reads back uncached VRAM — ~130 ms per line on the T630. Seven markers
+/// per spawn made a respawn look ~40× a cold spawn (see the iso-c7/iso-xlife dig).
+/// Flip to `true` only to debug a spawn-path freeze; the compiler dead-code-eliminates
+/// the `kprintln!`s when `false`. The `task: … spawned OK` announce and `kill_task:`
+/// line are kept (legitimate lifecycle output, one line each).
+const SPAWN_TRACE: bool = false;
+
 /// Low-level spawn: load ELF, wire caps, enqueue on `core_id`.
 fn spawn_service_with_config(
     name:              &'static str,
@@ -2756,14 +2767,14 @@ fn spawn_service_with_config(
     hw_irqs:           &[u8],
     has_console_read:  bool,
 ) -> Result<(), SpawnError> {
-    // DIAG: step markers to narrow bare-metal freeze after "registry spawned OK"
-    crate::kprintln!("spawn[elf]: '{}'", name);
+    // DIAG step markers (gated by SPAWN_TRACE; off by default — see its doc).
+    if SPAWN_TRACE { crate::kprintln!("spawn[elf]: '{}'", name); }
 
     // 1. Parse ELF.
     let crate::loader::LoadedElf { mut page_table, entry_va } =
         crate::loader::load(elf_bytes)?;
 
-    crate::kprintln!("spawn[stack]: '{}'", name);
+    if SPAWN_TRACE { crate::kprintln!("spawn[stack]: '{}'", name); }
 
     // 2. Map user stack.
     let stack_flags = PageFlags::PRESENT | PageFlags::USER
@@ -2789,11 +2800,11 @@ fn spawn_service_with_config(
         }
     }
 
-    crate::kprintln!("spawn[slot]: '{}'", name);
+    if SPAWN_TRACE { crate::kprintln!("spawn[slot]: '{}'", name); }
 
     // 3. Reserve a task slot and initialise its CapTable directly in BSS.
     let task_slot = scheduler::reserve_task_slot(core_id).ok_or(SpawnError::NoMemory)?;
-    crate::kprintln!("spawn[caps]: '{}' slot={}", name, task_slot);
+    if SPAWN_TRACE { crate::kprintln!("spawn[caps]: '{}' slot={}", name, task_slot); }
     // SAFETY: task_slot was just reserved; IF=0 in syscall context.
     let caps = unsafe { scheduler::task_cap_init_empty(task_slot) };
 
@@ -3075,11 +3086,11 @@ fn spawn_service_with_config(
         // ctx_frame owned by the page table now; Frame is Copy/no-Drop (no release).
     }
 
-    crate::kprintln!("spawn[kstack]: '{}'", name);
+    if SPAWN_TRACE { crate::kprintln!("spawn[kstack]: '{}'", name); }
 
     // 7. Kernel stack.
     let kstack_top = alloc_kstack().ok_or(SpawnError::NoMemory)?;
-    crate::kprintln!("spawn[commit]: '{}' kstack ok", name);
+    if SPAWN_TRACE { crate::kprintln!("spawn[commit]: '{}' kstack ok", name); }
 
     // 8. Initial ring-3 context.
     let cr3 = page_table.into_cr3();
