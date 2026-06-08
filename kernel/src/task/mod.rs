@@ -44,9 +44,12 @@ static mut KSTACK_STORAGE: KernelStackStorage =
 static KSTACK_USED: SpinLock<[bool; TASK_KSTACK_MAX]> =
     SpinLock::new([false; TASK_KSTACK_MAX]);
 
-/// Base virtual address of the kstack pool.
+/// Base virtual address of the kstack pool. The single encapsulated read of the
+/// `static mut` pool address; `alloc_kstack` / `free_kstack` / guard install all go
+/// through it so the `unsafe` lives in exactly one place.
 pub fn kstack_pool_base() -> u64 {
-    // SAFETY: read-only address-of a stable static; no &mut materialised.
+    // SAFETY: read-only address-of a stable static; `addr_of!` yields a raw pointer
+    // without materialising a `&mut`, and the casts are pure value conversions.
     unsafe { core::ptr::addr_of!(KSTACK_STORAGE.data) as *const u8 as u64 }
 }
 
@@ -58,20 +61,17 @@ pub fn kstack_pool_base() -> u64 {
 /// Usable size is unchanged (64 KiB); the guard is extra space, so no legitimate
 /// deep path can false-positive.
 ///
-/// Run once at boot after page tables are live and **before APs start and before
-/// the first kstack is allocated** — so only the BSP has a TLB (no shootdown
-/// needed) and `init`'s stack already carries its guard.
-///
-/// # Safety
-/// BSP, after `memory::init`, before `smp::init` / any `alloc_kstack`.
-pub unsafe fn install_kstack_guards() {
+/// **Boot-ordering contract** (not a memory-safety one, so this is a safe `fn`):
+/// run once on the BSP after `memory::init` (page tables live) and **before APs
+/// start and before the first kstack is allocated** — so only the BSP has a TLB
+/// (no shootdown needed) and `init`'s stack already carries its guard. Calling it
+/// out of order wedges boot; it is not UB. Same shape as `memory::init`/`smp::init`.
+pub fn install_kstack_guards() {
     let base = kstack_pool_base();
     debug_assert!(base & (PAGE_SIZE as u64 - 1) == 0, "kstack pool not page-aligned");
-    for i in 0..TASK_KSTACK_MAX {
-        let guard = base + (i * KSTACK_STRIDE) as u64;
-        // SAFETY: guard is the unused low page of slot i; nothing accesses it.
-        unsafe { crate::arch::x86_64::page_tables::unmap_active_4k(guard) };
-    }
+    // Page-table work lives in the arch layer (§18.1) — no `unsafe` here.
+    crate::arch::x86_64::page_tables::unmap_4k_strided(
+        base, KSTACK_STRIDE as u64, TASK_KSTACK_MAX);
     // Verify: slot 0's guard is now unmapped, its usable second page still mapped.
     let g = crate::arch::x86_64::page_tables::entry_for_va(base).is_none();
     let u = crate::arch::x86_64::page_tables::entry_for_va(base + PAGE_SIZE as u64).is_some();
@@ -109,8 +109,7 @@ fn alloc_kstack() -> Option<*mut u8> {
 /// silently ignored.
 pub fn free_kstack(kstack_top: u64) {
     if kstack_top == 0 { return; }
-    // SAFETY: KSTACK_STORAGE is a stable static; pointer arithmetic is within bounds.
-    let base = unsafe { core::ptr::addr_of!(KSTACK_STORAGE.data) as *const u8 as u64 };
+    let base = kstack_pool_base();
     // top = base + (idx + 1) * KSTACK_STRIDE  →  idx = (top - base) / KSTACK_STRIDE - 1
     if kstack_top <= base { return; }
     let offset = kstack_top - base;
