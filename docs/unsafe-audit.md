@@ -8,6 +8,27 @@ unless this file is updated in the same commit with a written SAFETY argument.**
 
 ---
 
+## 2026-06-08 — fbcon scroll without VRAM read-back
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/x86_64/fb.rs` | 4 → 3 (−1) | `scroll` no longer `core::ptr::copy`s the framebuffer up in place (which *read* uncached/WC VRAM — ~130 ms/line on the T630, the fbcon perf trap behind the "40× respawn"). It now shifts a RAM char-grid shadow and repaints from it — write-only via `draw_glyph`/`put_pixel` — so the block is gone. |
+
+Reduction only; locks in the lower count. The three remaining blocks (`clear`,
+`put_pixel`, `wc_flush`) keep their `// SAFETY:` comments. Hardware-verified
+(T630): pixel-correct after thousands of scrolls; spawn 0.906 s → 9.9 ms.
+
+> **Note — audit still failing on 3 unrelated files.** `scripts/unsafe_check.py`
+> reports `page_tables.rs 25→35`, `main.rs 2→4`, `task/mod.rs 7→10` from the
+> earlier-this-session H4b W^X-remap (`harden_hhdm_nx`) and H4 kstack-guard
+> (`install_kstack_guards`) merges, which did not update this audit. `page_tables`
+> is a permitted layer (legitimate growth, needs an entry + count bump); `main.rs`
+> and `task/mod.rs` are **grandfathered** (frozen — their growth needs a §18
+> amendment or a refactor to move the unsafe out). Tracked separately; not
+> reconciled here.
+
+---
+
 ## 2026-06-04 — idle-halt (cool when idle) + introspection holds-check reconcile
 
 | File | Change | Why |
@@ -91,7 +112,7 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | arch/x86_64/ap_boot.rs | 2 | permitted |
 | arch/x86_64/boot.rs | 81 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |
-| arch/x86_64/fb.rs | 4 | permitted |
+| arch/x86_64/fb.rs | 3 | permitted |
 | arch/x86_64/interrupts.rs | 13 | permitted |
 | arch/x86_64/mod.rs | 34 | permitted |
 | arch/x86_64/page_tables.rs | 25 | permitted |
@@ -116,9 +137,9 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | task/scheduler.rs | 37 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 267 lines across 20 files  
+**Permitted total:** 266 lines across 20 files  
 **Grandfathered total:** 53 lines across 6 files  
-**Grand total:** 320 lines across 26 files
+**Grand total:** 319 lines across 26 files
 
 > **Reconciled 2026-05-31** (branch `verify/static-analysis-unsafe-audit`). The
 > permitted-layer growth since the prior baseline is from the AMD GX-420GI ring-3 /
@@ -179,18 +200,23 @@ and not yet visible to the scheduler.
 
 ### arch/x86_64/fb.rs
 
-Framebuffer text console (Phase 1 boot output, §11.4). Four blocks; three write
+Framebuffer text console (Phase 1 boot output, §11.4). Three blocks; two write
 to Limine's linear framebuffer at `base + y*pitch + x*bpp`:
 - `clear`: `write_bytes(base, 0, height*pitch)` — fills the whole buffer.
 - `put_pixel`: writes `bpp` bytes at a bounds-checked offset (`x<width`, `y<height`).
-- `scroll`: `copy`/`write_bytes` shifting the buffer up one glyph row.
 
 Sound because the framebuffer is the region Limine mapped and sized
 (`height*pitch` bytes), it lives in the higher half (PML4 256–511) that every
 address space inherits via `PageTable::new`, so it is valid for writes for the
 system lifetime; every offset is bounds-checked against the reported geometry.
 
-The fourth block is `wc_flush`: a single `SFENCE` instruction. The framebuffer
+`scroll` previously held a fourth block — an in-place `copy`/`write_bytes` that
+shifted the framebuffer up one glyph row. That `copy` *read the framebuffer back*
+(uncached/WC VRAM, ~130 ms/line on the T630); it was replaced by a RAM char-grid
+shadow that scroll shifts and repaints from, leaving `scroll` entirely safe
+(write-only via `draw_glyph` → `put_pixel`). Net **4 → 3** (2026-06-08).
+
+The remaining `wc_flush` block is a single `SFENCE` instruction. The framebuffer
 is mapped write-combining (Limine HHDM default), so the FB lock's atomic release
 does not order the WC store buffer — a scroll's pixel stores on one core could
 flush after the next line's first glyph drawn on another core, erasing it. Each
