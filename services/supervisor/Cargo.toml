@@ -81,6 +81,11 @@ iso-s5   = ["perf-iso"]
 # kill → IPI → TLB-shootdown → respawn path (it ran ~52s/cycle under full chaos
 # load on the T630; this isolates whether that is coordination cost or contention).
 iso-c7   = ["perf-iso"]
+# iso-xsend: isolate a single cross-core try_send (sender core 1 → xsend-recv core 2,
+# receiver drains forever) with no ping/pong and nothing else — measures the bare
+# one-way cross-core send cost (by-handle, tight, by-name) that C7's "send" section
+# conflated with sending to a just-killed victim. Attributes the cross-core premium.
+iso-xsend = ["perf-iso"]
 
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }

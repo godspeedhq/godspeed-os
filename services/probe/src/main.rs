@@ -170,6 +170,11 @@ const MODE_CHAOS_BC5:       u32 = 157; // 500-level recursive yield_cpu() (5× C
 const MODE_CHAOS_BC6_MON:   u32 = 158; // 1,000 yields on core 0; 2-hog witness
 const MODE_CHAOS_BC7:       u32 = 159; // 15 cross-core kill/respawn cycles (brutal concurrent load)
 
+// Cross-core try_send diagnostic — isolates the one-way send cost that C7's "send"
+// section conflated with sending to a just-killed victim (osdev image --mode iso-xsend).
+const MODE_XSEND:           u32 = 200; // sender (core 1): time try_send to xsend-recv (core 2)
+const MODE_XSEND_RECV:      u32 = 201; // receiver (core 2): drain forever
+
 // Interrupt-routing test modes — Post-v1 item 9 (§12.2, §12.3).
 const MODE_IRQ_RECV:        u32 = 160; // IR1A: recv interrupt event; log pass
 
@@ -383,6 +388,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         MODE_ADV_BA9         => mode_adv_ba9(&ctx),
         MODE_ADV_BA10        => mode_adv_ba10(&ctx),
         MODE_IRQ_RECV        => mode_irq_recv(&ctx),
+        MODE_XSEND           => mode_xsend(&ctx),
+        MODE_XSEND_RECV      => mode_xsend_recv(&ctx),
         _                    => idle(&ctx),
     }
 }
@@ -2069,6 +2076,82 @@ fn mode_chaos_c7(ctx: &ServiceContext) -> ! {
         }
     }
     ctx.log("chaos: C7 pass — 30 cross-core TLB shootdowns survived");
+    idle(ctx)
+}
+
+fn mode_xsend_recv(ctx: &ServiceContext) -> ! {
+    // Cross-core try_send diagnostic — receiver on core 2. Drain forever: recv()
+    // blocks when the queue is empty, so the sender on core 1 finds us either
+    // blocked-on-recv (its send fires a cross-core IPI wake) or with queue space.
+    // No echo — this isolates the ONE-WAY send cost, never a round-trip.
+    loop { let _ = ctx.recv(); }
+}
+
+fn mode_xsend(ctx: &ServiceContext) -> ! {
+    // Single cross-core try_send timing: sender on core 1 → xsend-recv on core 2.
+    // Isolates the cost C7's "send" section conflated with sending to a just-killed
+    // victim (stale cap → EndpointDead). Here the receiver is always LIVE.
+    //
+    // Reports mean RDTSC cyc/op (T630 ~2 GHz → cyc/2000 = µs) over N iters:
+    //   tsc-overhead : back-to-back read_tsc — subtract this from every figure below
+    //   paced-handle : 30 yields between sends so the receiver is blocked → each send
+    //                  enqueues + fires the cross-core IPI wake (by handle, no lookup)
+    //   tight-handle : back-to-back sends — queue saturates → mostly QueueFull fast path
+    //   paced-name   : paced, via try_send(name) → adds the userspace cap-cache lookup
+    // paced-handle is the apples-to-apples comparison against C7's ~249 ms "send".
+    let h = match ctx.send_peer_at(0) {
+        Some(h) => h,
+        None => { ctx.log("xsend: FAIL — no send cap to xsend-recv"); idle(ctx); }
+    };
+    let msg = Message::from_bytes(b"x");
+    const N: u64 = 2000;
+
+    // Baseline: empty read_tsc→read_tsc bracket (the fixed per-measurement offset).
+    let mut acc = 0u64;
+    for _ in 0..N {
+        let t0 = ctx.read_tsc();
+        let t1 = ctx.read_tsc();
+        acc = acc.wrapping_add(t1.wrapping_sub(t0));
+    }
+    let tsc_overhead = acc / N;
+
+    // paced-handle: receiver blocked → cross-core IPI wake on each send.
+    acc = 0;
+    for _ in 0..N {
+        for _ in 0..30u32 { ctx.yield_cpu(); }
+        let t0 = ctx.read_tsc();
+        let _ = ctx.try_send_by_handle(h, &msg);
+        let t1 = ctx.read_tsc();
+        acc = acc.wrapping_add(t1.wrapping_sub(t0));
+    }
+    let paced_handle = acc / N;
+
+    // tight-handle: back-to-back, queue saturates.
+    acc = 0;
+    for _ in 0..N {
+        let t0 = ctx.read_tsc();
+        let _ = ctx.try_send_by_handle(h, &msg);
+        let t1 = ctx.read_tsc();
+        acc = acc.wrapping_add(t1.wrapping_sub(t0));
+    }
+    let tight_handle = acc / N;
+
+    // paced-name: adds the find_send_slot userspace cache lookup.
+    acc = 0;
+    for _ in 0..N {
+        for _ in 0..30u32 { ctx.yield_cpu(); }
+        let t0 = ctx.read_tsc();
+        let _ = ctx.try_send("xsend-recv", &msg);
+        let t1 = ctx.read_tsc();
+        acc = acc.wrapping_add(t1.wrapping_sub(t0));
+    }
+    let paced_name = acc / N;
+
+    ctx.log_fmt(format_args!(
+        "xsend: cyc/op  tsc-overhead={} paced-handle={} tight-handle={} paced-name={}",
+        tsc_overhead, paced_handle, tight_handle, paced_name,
+    ));
+    ctx.log("xsend: done");
     idle(ctx)
 }
 
