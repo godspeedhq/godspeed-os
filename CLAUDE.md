@@ -952,16 +952,15 @@ counts in `docs/unsafe-audit.md`. Those counts may **decrease** freely but may
 **increase** only by an amendment recorded here and in the audit, with a written
 safety + necessity rationale.
 
-**Amendment 2026-06-08 (H4 hardening).** The W^X and kernel-stack-guard mitigations
-(§3 invariant 12) required `unsafe` call sites the boot orchestrator alone can make
-sound, raising two grandfathered floors **once**: `main.rs` 2 → 4 (the
-`install_kstack_guards` / `harden_hhdm_nx` boot-ordering call sites) and `task/mod.rs`
-7 → 10 (the kstack-guard install — intrinsically about the task kstack pool). Every
-new block carries a `// SAFETY:` argument and is hardware-verified (T630). Relocating
-the `task/mod.rs` unsafe to a permitted layer (the alternative) was declined for
-locality. Full rationale: `docs/unsafe-audit.md` (2026-06-08 amendment entry). The
-freeze otherwise stands — these floors do not ratchet up again without a new
-amendment.
+New `unsafe` that a feature or hardening needs must first try to live in a permitted
+layer (`arch/`, `memory/`, `capability/`, `smp/`) rather than grow a grandfathered
+file. A precondition that is merely *boot-ordering* (violating it wedges boot — a
+liveness bug, not UB) does **not** justify an `unsafe fn`; make it a safe `fn` with a
+documented contract, like `memory::init` / `smp::init`. Worked example: the H4
+kstack-guard / W^X hardening (2026-06-08) was structured so its page-table `unsafe`
+lives in `arch/` and the boot call sites are safe `fn`s — `main.rs` and `task/mod.rs`
+stayed at their floors with **no amendment needed**. There are currently no
+amendments to the grandfathered floors.
 
 ---
 

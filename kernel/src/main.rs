@@ -202,9 +202,9 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     // Hardening: unmap a guard page below each kernel-stack slot so an overflow
     // faults loudly instead of corrupting the neighbouring stack. Done here — BSP
     // only, before APs and before any kstack is allocated, so no TLB shootdown is
-    // needed and init's stack already carries its guard.
-    // SAFETY: BSP, after memory::init (page tables live), before smp::init.
-    unsafe { task::install_kstack_guards() };
+    // needed and init's stack already carries its guard. (Safe fn — boot-ordering
+    // contract, not UB; the page-unmap unsafe lives in the arch layer.)
+    task::install_kstack_guards();
 
     // Stage 1 of the USB stack: locate the xHCI controller (§12). Records its
     // MMIO base + IRQ for a future userspace driver's hw_mmio/hw_interrupt caps.
@@ -247,8 +247,9 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
         // come AFTER smp::init. From here nothing executes from the HHDM (the kernel
         // runs from its own .text), so the direct map is data-only for the rest of
         // runtime. audit_wx then confirms the HHDM reads NX=1.
-        // SAFETY: BSP, after HHDM is live and APs are up.
-        unsafe { arch::x86_64::page_tables::harden_hhdm_nx() };
+        // Safe fn — boot-ordering contract (must follow smp::init), not UB; the
+        // CR3/PTE unsafe lives in the arch layer.
+        arch::x86_64::page_tables::harden_hhdm_nx();
         arch::x86_64::boot::audit_wx();
 
         kprintln!("kernel: {} cores ready", smp::core::ready_count());

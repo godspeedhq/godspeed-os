@@ -315,6 +315,21 @@ pub unsafe fn unmap_active_4k(virt: u64) {
     }
 }
 
+/// Unmap the low 4 KiB page of each of `count` slots laid out at `base + i*stride`
+/// — the kernel-stack guard pages (§ kstack hardening H4). Page-table manipulation
+/// is arch-layer work (§18.1), so the per-page unmap `unsafe` is contained here
+/// rather than leaking into `task/`. Safe `fn` — a **boot-ordering** contract (BSP,
+/// before APs and before any kstack alloc), the same shape as the surrounding init.
+pub fn unmap_4k_strided(base: u64, stride: u64, count: usize) {
+    for i in 0..count {
+        let guard = base + i as u64 * stride;
+        // SAFETY: each `guard` is the unused low page of a kstack slot (nothing
+        // accesses it); `unmap_active_4k` touches only the active BSP page table and
+        // runs before any AP starts, so no shootdown is needed (boot contract).
+        unsafe { unmap_active_4k(guard) };
+    }
+}
+
 /// Set the NX (no-execute) bit on every present mapping in the HHDM, closing the
 /// RWX-direct-map hole (hardening H4b). Limine maps the higher-half direct map
 /// **W+X**, so every physical RAM page has an executable alias — a kernel-wide W^X
@@ -328,10 +343,12 @@ pub unsafe fn unmap_active_4k(virt: u64) {
 /// always enough for v1) and ORs NX into each present PDPT / PD / PT entry,
 /// handling 1 GiB and 2 MiB large pages, then reloads CR3 to flush.
 ///
-/// # Safety
-/// Must run on the BSP after `set_hhdm_offset` and before APs start. Modifies live
-/// page-table entries (reached via the HHDM).
-pub unsafe fn harden_hhdm_nx() {
+/// **Boot-ordering contract** (not a memory-safety one, so this is a safe `fn`):
+/// run on the BSP after `set_hhdm_offset` and **after `smp::init`** — Limine's AP
+/// long-mode bring-up executes through the HHDM, so flipping it NX earlier wedges
+/// AP boot (a liveness bug, not UB). The genuinely-unsafe CR3 read and PTE writes
+/// stay in `unsafe {}` blocks inside.
+pub fn harden_hhdm_nx() {
     const NX: u64 = 1 << 63;
     const PS: u64 = 1 << 7; // page-size bit ⇒ large page at this level
     let hhdm = get_hhdm_offset();
