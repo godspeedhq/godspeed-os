@@ -213,7 +213,7 @@ os/
   services/
     init/                  # PID 1 equivalent (TCB)
     supervisor/            # restart authority (TCB)
-    registry/              # name → endpoint resolution (TCB)
+    registry/              # name → endpoint resolution (restartable, H11; docs/registry.md)
     logger/
     block-driver/          # v1: trusted
     fs/                    # v1: trusted, depends on block-driver
@@ -260,13 +260,26 @@ os/
 | `kernel/smp`      | Concurrent-correctness primitives                   |
 | `init` service    | Spawns supervisor; first userspace authority        |
 | `supervisor`      | Holds restart authority over all other services     |
-| `registry`        | Without it, caps cannot be reacquired post-restart  |
 | `block-driver`    | (v1 only) FS depends on it; restart loses disk state |
 | `fs`              | (v1 only) Owns persistent state for the system      |
 
+> **Amendment 2026-06-09 (H11): `registry` is no longer a TCB member.** It became a
+> real userspace name service (register/lookup over IPC, holding only delegated caps
+> and deriving copies — `docs/registry.md`). It owns no kernel-critical state, so its
+> *runtime* death degrades name resolution temporarily rather than corrupting the
+> system, and it is now **restartable** (see §6.2, §6.3). Its *boot-time* spawn must
+> still succeed (the name service must come up to bootstrap), which remains fatal
+> (§11.3). Worked example of invariant 11 — identity (the name) is stable; the
+> registry instance/location is not.
+
 ### 6.2 Failure Semantics
 
-> **Failure of any TCB service (`init`, `supervisor`, `registry`, `block-driver`, `fs`) results in kernel panic and immediate system reboot. No automatic recovery is attempted in v1.**
+> **Failure of any TCB service (`init`, `supervisor`, `block-driver`, `fs`) results in kernel panic and immediate system reboot. No automatic recovery is attempted in v1.**
+
+> **`registry` is restartable (H11), not in this set.** Its runtime death is recovered
+> by the supervisor's death-notification restart loop (the kernel notifies the
+> supervisor, which respawns it); clients see a temporary `EndpointDead` / lookup miss
+> and retry (§14.3). Only its *boot-time* spawn failure is fatal (§11.3).
 
 > **Failure on any core that corrupts shared kernel state (capability table, routing table) results in kernel panic on all cores.**
 
@@ -274,7 +287,10 @@ Silent recovery of TCB state risks undefined system state. Loud failure plus cle
 
 ### 6.3 Reducing TCB Over Time
 
-The block-driver and FS being trusted is a v1 simplification. v2 goal: only `init`, `supervisor`, `registry`, and the kernel remain non-restartable.
+The block-driver and FS being trusted is a v1 simplification. v2 goal: only `init`,
+`supervisor`, and the kernel remain non-restartable. **`registry` was dropped from the
+non-restartable set early, via H11** (it is now a restartable userspace name service);
+the remaining v2 work is block-driver / fs.
 
 ---
 
@@ -676,7 +692,7 @@ Because Limine supplies APIC IDs directly, the kernel does not need to probe ACP
 | AP startup        | Kernel logs warning, continues with available cores; if zero APs come up, system runs as single-core |
 | init spawn        | Kernel panic, halt                     |
 | supervisor spawn  | Kernel panic, halt (TCB)               |
-| registry spawn    | Kernel panic, halt (TCB)               |
+| registry spawn (boot-time) | Kernel panic, halt — the name service must come up to bootstrap. *Runtime* death is recovered by the supervisor (H11; §6.2), not a reboot. |
 | logger spawn      | Init logs to kernel ring buffer, retry |
 | Application svc   | Supervisor logs, may retry per policy  |
 | Service contracted to unavailable core | Spawn rejected with `PlacementInvalid`; supervisor logs and skips; system runs without that service |
@@ -1019,7 +1035,7 @@ The test suite is layered. Each layer answers a different question about kernel 
 
 | Category    | Purpose                                              | Bar (what failure means)                          | Status |
 |-------------|------------------------------------------------------|---------------------------------------------------|--------|
-| Identity    | Pin constitutional decisions; existence proof        | Constitutional invariant violated                 | §22 (20/20) |
+| Identity    | Pin constitutional decisions; existence proof        | Constitutional invariant violated                 | §22 (Test 11 added, H11) |
 | Property    | Universal invariants under random inputs             | A claim the spec makes does not hold              | Active |
 | Fuzz        | Crash resistance under adversarial inputs            | Kernel panics on user-controllable input          | Active |
 | Stress      | Survival under sustained load                        | Drift, leaks, or corruption appear over time      | Active |
@@ -1030,7 +1046,7 @@ The test suite is layered. Each layer answers a different question about kernel 
 ```text
   ┌─────────────────────────────────────────────────────────────────────┐
   │  Foundation — must pass before anything else                        │
-  │  Identity (§22) — 20 tests — 20/20 ✅ — Constitutional invariants  │
+  │  Identity (§22) — Tests 1–11 ✅ — Constitutional invariants        │
   └──────────────────────┬──────────────────────────────────────────────┘
           ┌──────────────┴─────────────────┐
           ▼                                ▼
@@ -1079,7 +1095,7 @@ The bar across every category is the same as identity: **no FAIL, no BLOCKED wit
 
 #### Identity (§22) — Complete
 
-20/20 passing. No regressions allowed. Any failure here is a constitutional violation that requires either a kernel fix or a CLAUDE.md amendment.
+All passing (Tests 1–11; harness reports 23 cases incl. A/B + IR + Test 11). No regressions allowed. Any failure here is a constitutional violation that requires either a kernel fix or a CLAUDE.md amendment. **Test 11 (registry survives restart) was added by the H11 amendment (§6.1/§6.2).**
 
 ---
 
@@ -1581,6 +1597,29 @@ test client_reacquires_after_core_change:
 
 ---
 
+### Test 11: Registry Survives Its Own Restart (H11)
+
+**Pins:** §6.1/§6.2 (registry is restartable, not trusted root), §14 (supervisor restart authority), §3.11 (identity over location).
+
+The registry is a restartable userspace name service (amendment 2026-06-09). Killing
+it must NOT panic the kernel; the supervisor must observe its death (via the kernel's
+death-notification) and respawn it, and name resolution must recover.
+
+```
+test registry_survives_own_restart:
+    wait_for_serial("supervisor: ready")
+    control.kill("registry")                       # was rejected pre-H11 (trusted root)
+
+    assert serial_contains("supervisor: registry died, restarting")
+    assert serial_contains("supervisor: registry restarted")
+    assert serial_contains("registry: ready")      # fresh instance up
+    assert kernel_did_not_panic()
+    # Names re-populate via push re-registration (services re-announce); clients that
+    # looked up during the gap retry (§14.3).
+```
+
+---
+
 ### 22.6 Test Coverage Matrix
 
 | Test                              | Spec sections pinned       | Constitutional invariant      |
@@ -1595,6 +1634,7 @@ test client_reacquires_after_core_change:
 | 8. Preemption                     | §3.6, §9.1, §9.3           | No service monopoly           |
 | 9. Cross-core IPC                 | §8.3, §8.4, §9             | Identity over location        |
 | 10. Restart with core change      | §9.2, §14.2, §14.4, §11    | Identity over location        |
+| 11. Registry survives restart     | §6.1, §6.2, §14, §3.11     | Restartability / TCB shrink   |
 
 If any cell becomes obsolete, the corresponding spec section is being changed and the change requires a CLAUDE.md amendment.
 
@@ -1697,8 +1737,9 @@ Filesystem persistence beyond the trusted block driver, network stack, work-stea
 - **PlacementInvalid** — Error returned when a contracted core is unavailable; spawn rejected, supervisor logs and skips.
 - **Quantum** — The 10 ms time slice after which the per-core scheduler preempts.
 - **Routing table** — Kernel structure mapping `EndpointId → (CoreId, Generation, Liveness)`.
-- **TCB** — Trusted Computing Base. Kernel + arch + smp + init + supervisor + registry (+ block-driver, fs in v1).
-- **Trusted root** — `init`, `supervisor`, `registry`. Failure of any reboots the system.
+- **TCB** — Trusted Computing Base. Kernel + arch + smp + init + supervisor (+ block-driver, fs in v1). `registry` left the TCB via H11 (§6.1 amendment).
+- **Trusted root** — `init`, `supervisor`. Failure of either reboots the system. (`registry` was part of the trusted root pre-H11; it is now a restartable name service.)
+- **Registry** — Restartable userspace name service: maps stable names → current capabilities so services can find and re-find each other across restarts (H11; `docs/registry.md`).
 - **Service** — Userspace component with a contract, capability table, and isolated address space.
 - **Contract** — `service.toml` declaring resource, capability, and placement requirements.
 - **Supervisor** — User-space service holding restart authority over other services.
