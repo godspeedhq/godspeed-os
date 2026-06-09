@@ -171,6 +171,8 @@ struct ServiceContextData {
     xhci_dma_phys:      u64, // physical base of the DMA arena (programmed into the device)
     xhci_dma_len:       u64, // length of the DMA arena in bytes
     console_push_slot:  u32, // u32::MAX = none; else CONSOLE_PUSH cap slot (input driver)
+    self_grant_slot:    u32, // u32::MAX = none; else SEND|GRANT cap to this service's OWN
+                             // endpoint, so it can register with the registry (H11).
     send_peers:         [SendPeerEntry; MAX_SEND_PEERS],
 }
 
@@ -2834,6 +2836,7 @@ fn spawn_service_with_config(
 
     // 4. Optional recv endpoint.
     let mut recv_slot_u32 = u32::MAX;
+    let mut self_grant_slot_u32 = u32::MAX;
     let mut own_endpoint:  Option<EndpointId> = None;
 
     if has_recv_endpoint {
@@ -2872,6 +2875,14 @@ fn spawn_service_with_config(
             .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
         recv_slot_u32 = cap_slot as u32;
         own_endpoint  = Some(ep_id);
+
+        // Self-grant cap: a SEND|GRANT cap to this service's OWN endpoint, so it can
+        // announce itself to the registry by granting a derived copy (H11). GRANT is
+        // required for the cap to be transferable via SendWithCap; the service keeps
+        // this original and derives copies for re-registration after a registry restart.
+        if let Ok(sg) = caps.insert(mint_cap(resource_id, Rights::SEND | Rights::GRANT)) {
+            self_grant_slot_u32 = sg as u32;
+        }
 
         // Wire hw_interrupt lines to this endpoint (§12.3).
         for &irq in hw_irqs {
@@ -3068,6 +3079,7 @@ fn spawn_service_with_config(
             data.probe_mode         = probe_mode;
             data.console_read_slot  = console_read_slot_u32;
             data.console_push_slot  = console_push_slot_u32;
+            data.self_grant_slot    = self_grant_slot_u32;
             data.xhci_mmio_va       = xhci_mmio_va;
             data.xhci_dma_va        = xhci_dma_va;
             data.xhci_dma_phys      = xhci_dma_phys;

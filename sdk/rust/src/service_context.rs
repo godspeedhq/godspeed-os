@@ -86,6 +86,7 @@ struct ServiceContextData {
     xhci_dma_phys:      u64, // physical base of the DMA arena
     xhci_dma_len:       u64, // length of the DMA arena in bytes
     console_push_slot:  u32, // u32::MAX = none; else CONSOLE_PUSH cap slot
+    self_grant_slot:    u32, // u32::MAX = none; else SEND|GRANT cap to own endpoint (H11)
     send_peers:         [SendPeerEntry; MAX_SEND_PEERS],
 }
 
@@ -308,6 +309,15 @@ impl ServiceContext {
     /// Return the recv cap handle for direct-handle use (e.g. wrong-right test probing).
     pub fn recv_handle(&self) -> Option<crate::capability::CapHandle> {
         let slot = Self::ctx().recv_slot;
+        if slot == u32::MAX { None } else { Some(crate::capability::CapHandle(slot)) }
+    }
+
+    /// Handle to this service's `SEND|GRANT` cap to its **own** endpoint, minted at
+    /// spawn (H11). The service announces itself to the registry by deriving a copy
+    /// (`derive_cap`) and granting it across — keeping this original so it can
+    /// re-register after a registry restart. `None` if the service has no endpoint.
+    pub fn self_grant_handle(&self) -> Option<crate::capability::CapHandle> {
+        let slot = Self::ctx().self_grant_slot;
         if slot == u32::MAX { None } else { Some(crate::capability::CapHandle(slot)) }
     }
 
