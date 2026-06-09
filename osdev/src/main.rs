@@ -701,9 +701,10 @@ fn cmd_image(mode: &str) {
         "iso-c7"      => cmd_build_perf_iso("iso-c7"),
         "iso-xsend"   => cmd_build_perf_iso("iso-xsend"),
         "iso-xlife"   => cmd_build_perf_iso("iso-xlife"),
+        "iso-reg"     => cmd_build_perf_iso("iso-reg"),
         "s8"          => cmd_build_idle(),
         other => {
-            eprintln!("image: unknown --mode '{}'; valid: bare-metal, perf, perf-brutal, identity, stress, adv, chaos, fuzz, b2-only, bp2-only, iso-bp3, iso-bp5, iso-bp7, iso-bp9, iso-bp10, iso-s3, iso-s5, iso-s9, iso-c7, iso-xsend, iso-xlife, s8", other);
+            eprintln!("image: unknown --mode '{}'; valid: bare-metal, perf, perf-brutal, identity, stress, adv, chaos, fuzz, b2-only, bp2-only, iso-bp3, iso-bp5, iso-bp7, iso-bp9, iso-bp10, iso-s3, iso-s5, iso-s9, iso-c7, iso-xsend, iso-xlife, iso-reg, s8", other);
             std::process::exit(1);
         }
     }

@@ -91,6 +91,9 @@ iso-xsend = ["perf-iso"]
 # timing each kill/spawn. far−near isolates cross-core coordination from task creation;
 # attributes C7's ~1.04 s respawn. No ping/pong, nothing else.
 iso-xlife = ["perf-iso"]
+# iso-reg: registry register/lookup round-trip self-test (H11). Spawns the
+# reg-roundtrip probe alone; registry itself is spawned by init in every build.
+iso-reg = ["perf-iso"]
 
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }

@@ -1252,6 +1252,20 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
+        // Registry register/lookup round-trip self-test (H11; osdev image --mode iso-reg).
+        // Has its own endpoint (for the lookup reply + self round-trip) and a SEND cap
+        // to the registry (send_peers). The self-grant cap comes free with the endpoint.
+        "reg-roundtrip" => Some(("reg-roundtrip", ServiceConfig {
+            elf:               PROBE_ELF,
+            has_recv_endpoint: true,
+            send_peers:        &["registry"],
+            send_peers_grant:  false,
+            preferred_core:    0,
+            probe_mode:        204, // REG_ROUNDTRIP
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
         "stress-s3-recv" => Some(("stress-s3-recv", ServiceConfig {
             elf:               PROBE_ELF,
             has_recv_endpoint: true,
