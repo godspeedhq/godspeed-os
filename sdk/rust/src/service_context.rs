@@ -213,6 +213,28 @@ pub const REGISTRY_NOT_FOUND:   u8 = 1;
 /// Max registry name length (matches the kernel name registry).
 pub const REGISTRY_NAME_MAX:    usize = 32;
 
+/// Point the dynamic send-cap cache entry for `name` at `new_slot`, so the next
+/// `find_send_slot(name)` resolves to the freshly-acquired cap. Shared by the
+/// registry reacquire path; mirrors the inline update in `reacquire_cap`.
+fn cache_send_slot(name: &str, new_slot: u32) {
+    let bytes = name.as_bytes();
+    let len   = bytes.len().min(PEER_NAME_BYTES);
+    // SAFETY: single-threaded service process; no concurrent cache writers.
+    unsafe {
+        for entry in SEND_CAP_CACHE.iter_mut() {
+            if entry.slot == u32::MAX
+                || (entry.name_len as usize == len && &entry.name[..len] == &bytes[..len])
+            {
+                entry.slot     = new_slot;
+                entry.name_len = len as u8;
+                entry.name     = [0u8; PEER_NAME_BYTES];
+                entry.name[..len].copy_from_slice(&bytes[..len]);
+                break;
+            }
+        }
+    }
+}
+
 /// Encode a register/lookup request payload: `[op, name_len, name…]`.
 fn registry_request(op: u8, name: &str) -> Message {
     let nb  = name.as_bytes();
@@ -386,6 +408,19 @@ impl ServiceContext {
             self.take_pending_cap()
         } else {
             None
+        }
+    }
+
+    /// Reacquire a fresh SEND cap to `peer` via the **registry service** (H11) and
+    /// point the named-peer cache at it, so subsequent `try_send(peer)` / `send(peer)`
+    /// use the new cap. This is the registry-service replacement for `reacquire_cap`
+    /// (the kernel syscall-10 path). Returns `false` if the registry cannot currently
+    /// resolve the name (e.g. the named service has not yet re-registered after its
+    /// own restart) — the caller should retry on a later tick.
+    pub fn reacquire_via_registry(&self, peer: &str) -> bool {
+        match self.registry_lookup(peer) {
+            Some(h) => { cache_send_slot(peer, h.0); true }
+            None    => false,
         }
     }
 

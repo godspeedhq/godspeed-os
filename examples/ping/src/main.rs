@@ -28,10 +28,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 }
             }
             Err(IpcError::EndpointDead) => {
-                ctx.log("ping: pong endpoint dead, reacquiring via kernel registry");
-                match ctx.reacquire_cap("pong") {
-                    Ok(_) => ctx.log("ping: pong cap reacquired, resuming"),
-                    Err(_) => ctx.log("ping: reacquire failed, retrying next tick"),
+                ctx.log("ping: pong endpoint dead, reacquiring via registry service");
+                if ctx.reacquire_via_registry("pong") {
+                    ctx.log("ping: pong cap reacquired, resuming");
+                } else {
+                    ctx.log("ping: reacquire failed, retrying next tick");
                 }
             }
             Err(IpcError::QueueFull) => {

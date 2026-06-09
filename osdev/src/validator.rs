@@ -1297,7 +1297,7 @@ static TESTS: &[TestSpec] = &[
             wait_for:    "supervisor: ready", // pong/ping spawn first; wait for all probes done before restart
             restart_cmd: "RESTART pong 1",
             expect_after: &[
-                "ping: pong endpoint dead, reacquiring via kernel registry",
+                "ping: pong endpoint dead, reacquiring via registry service",
                 "ping: pong cap reacquired, resuming",
             ],
             fail_on:      &["KERNEL PANIC"],
@@ -1368,7 +1368,7 @@ static TESTS: &[TestSpec] = &[
             wait_for:    "supervisor: ready", // pong/ping spawn first; wait for all probes done before restart
             restart_cmd: "RESTART pong 2",
             expect_after: &[
-                "ping: pong endpoint dead, reacquiring via kernel registry",
+                "ping: pong endpoint dead, reacquiring via registry service",
                 "ping: pong cap reacquired, resuming",
             ],
             fail_on:      &["KERNEL PANIC"],
