@@ -327,9 +327,10 @@ impl ServiceContext {
         let new_slot = ret as u32;
 
         // Update dynamic cache.
-        // SAFETY: single-threaded service; no concurrent cache writes.
+        // SAFETY: single-threaded service; no concurrent cache writes. addr_of_mut!
+        // avoids a direct &mut to the static (static_mut_refs lint).
         unsafe {
-            for entry in SEND_CAP_CACHE.iter_mut() {
+            for entry in (*core::ptr::addr_of_mut!(SEND_CAP_CACHE)).iter_mut() {
                 if entry.slot == u32::MAX
                     || (entry.name_len as usize == len
                         && &entry.name[..len] == bytes)
