@@ -1398,6 +1398,23 @@ static TESTS: &[TestSpec] = &[
             timeout_secs: 60,
         },
     },
+    TestSpec {
+        // §22 Test 11 (H11 ph6): the registry is a RESTARTABLE userspace name service,
+        // not part of the non-restartable trusted root. Killing it must NOT panic the
+        // kernel; the supervisor must observe its death and respawn it.
+        id: "11", name: "registry_survives_own_restart", spec_ref: "§22 Test 11 (H11)",
+        kind: TestKind::WithRestart {
+            wait_for:     "supervisor: ready",
+            restart_cmd:  "KILL registry",
+            expect_after: &[
+                "supervisor: registry died, restarting",
+                "supervisor: registry restarted",
+                "registry: ready",
+            ],
+            fail_on:      &["KERNEL PANIC"],
+            timeout_secs: 60,
+        },
+    },
 ];
 
 // ---------------------------------------------------------------------------

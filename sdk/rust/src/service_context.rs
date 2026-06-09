@@ -220,8 +220,10 @@ fn cache_send_slot(name: &str, new_slot: u32) {
     let bytes = name.as_bytes();
     let len   = bytes.len().min(PEER_NAME_BYTES);
     // SAFETY: single-threaded service process; no concurrent cache writers.
+    // addr_of_mut! avoids materialising a &mut to the `static mut` directly
+    // (silences the static_mut_refs lint).
     unsafe {
-        for entry in SEND_CAP_CACHE.iter_mut() {
+        for entry in (*core::ptr::addr_of_mut!(SEND_CAP_CACHE)).iter_mut() {
             if entry.slot == u32::MAX
                 || (entry.name_len as usize == len && &entry.name[..len] == &bytes[..len])
             {
