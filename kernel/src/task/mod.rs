@@ -255,7 +255,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
     match name {
         "supervisor" => Some(("supervisor", ServiceConfig {
             elf:               include_bytes!(env!("SVC_SUPERVISOR_ELF")),
-            has_recv_endpoint: false,
+            has_recv_endpoint: true, // death-notification endpoint (H11 ph6 restart loop)
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    0,

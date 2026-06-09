@@ -443,7 +443,10 @@ fn find_running_slot(ctx: &ServiceContext, name: &str) -> Option<u32> {
 
 /// The trusted root (§6.1). The kernel refuses to kill these and refuses to spawn
 /// a second instance; the shell explains why before the syscall is even tried.
-const CORE_SERVICES: [&str; 3] = ["init", "supervisor", "registry"];
+// `registry` is no longer protected (H11 ph6): it is a restartable service, so the
+// shell permits `kill registry` (the supervisor respawns it). init/supervisor remain
+// the non-restartable trusted root.
+const CORE_SERVICES: [&str; 2] = ["init", "supervisor"];
 
 /// Shown when spawn/kill/restart targets a core service — "Not applicable" makes
 /// it clear the command is refused *because* the target is protected, not failed.

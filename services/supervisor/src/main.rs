@@ -117,12 +117,30 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     ctx.log("supervisor: ready");
 
-    // Park (block forever) instead of busy-yielding so core 0 can halt and run
-    // cool. In v1 the supervisor has no further work: restart/kill commands are
-    // driven from the COM2 control channel in the timer ISR (control::
-    // process_pending), not from this task. The Phase-6 death-notification loop
-    // will replace this with a blocking recv on a notification endpoint.
-    ctx.park();
+    // Death-notification restart loop (H11 ph6). The kernel enqueues the name of a
+    // dead restartable service to our endpoint; we respawn it. `recv` BLOCKS, so the
+    // core still reaches the idle/halt path and runs cool between deaths (no polling).
+    // In v1 the only restartable service routed here is `registry` (the trusted-root
+    // services init/supervisor remain non-restartable — their death is a kernel
+    // panic). Other restart/kill commands still arrive via the COM2 control channel
+    // (control::process_pending in the timer ISR).
+    //
+    // If this build gave us no endpoint (minimal test manifests), fall back to park.
+    if ctx.recv_handle().is_none() {
+        ctx.park();
+    }
+    loop {
+        let msg = ctx.recv();
+        let name = core::str::from_utf8(msg.payload_bytes()).unwrap_or("");
+        if name == "registry" {
+            ctx.log("supervisor: registry died, restarting");
+            if ctx.spawn("registry").is_ok() {
+                ctx.log("supervisor: registry restarted");
+            } else {
+                ctx.log("supervisor: registry restart FAILED");
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -20,11 +20,24 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         ctx.log("pong: registered with registry");
     }
 
+    // Periodic re-registration (H11 ph6): the registry is now restartable, so its
+    // name→cap table can be lost on a (rare) restart. Re-announcing every N messages
+    // re-populates "pong" within ~N ticks of a registry restart — cheap, push-based,
+    // no kernel involvement. `register` is idempotent (overwrites the entry), so when
+    // the registry is healthy this just refreshes it.
+    const REREGISTER_EVERY: u64 = 64;
+    let mut since_register: u64 = 0;
+
     loop {
         let msg = ctx.recv();
         ctx.log_fmt(format_args!(
             "pong: received \"{}\"",
             core::str::from_utf8(msg.payload_bytes()).unwrap_or("<invalid utf8>")
         ));
+        since_register += 1;
+        if since_register >= REREGISTER_EVERY {
+            since_register = 0;
+            let _ = ctx.register("pong");
+        }
     }
 }
