@@ -17,6 +17,14 @@ Pong is the **first** service spawned by the supervisor — before ping and befo
 
 The placement-free design exercises the round-robin path and demonstrates that identity (the name "pong") is stable while location (the core) is not (invariant §3.11). After restart, ping gets a fresh cap pointing to the new core but never learns which core that is.
 
+## Registers with the registry (H11)
+
+On startup pong calls `ctx.register("pong")`, granting the registry a `SEND|GRANT`
+cap to its endpoint. This is what lets ping `reacquire_via_registry("pong")` after a
+restart. Because `register` re-runs on every spawn, the restarted pong overwrites the
+registry's entry with its fresh endpoint/core — so ping's next lookup resolves to the
+new instance. Requires a `registry` send-peer (kernel-wired at spawn).
+
 ## Restartability
 
 Pong is stateless — it logs each received message. No state to reconstruct on restart.

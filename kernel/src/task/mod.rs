@@ -300,7 +300,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         "pong" => Some(("pong", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PONG_ELF")),
             has_recv_endpoint: true,
-            send_peers:        &[],
+            send_peers:        &["registry"], // to announce itself via the registry (H11)
             send_peers_grant:  false,
             preferred_core:    1,
             probe_mode:        0,
