@@ -287,6 +287,21 @@ impl ServiceContext {
         Ok(CapHandle(new_slot))
     }
 
+    /// Derive a duplicate of a capability this service holds **with the GRANT right**
+    /// into a fresh slot (syscall 29 = `DeriveCap`). The copy carries the same
+    /// resource, generation, and (non-widened) rights.
+    ///
+    /// Used by the `registry` to serve many `lookup`s from the one endpoint cap it
+    /// holds per name: it derives a copy per client and grants that copy away (via
+    /// `send_with_cap_by_handle`) while keeping the original. Returns `None` if the
+    /// cap lacks GRANT, is stale, or the cap table is full.
+    pub fn derive_cap(&self, held: CapHandle) -> Option<CapHandle> {
+        // SAFETY: syscall(29) = DeriveCap; `held.0` is a slot index into this task's
+        // own cap table. The kernel validates GRANT + generation before duplicating.
+        let ret = unsafe { raw_syscall(29, held.0 as u64, 0, 0) };
+        if ret < 0 { None } else { Some(CapHandle(ret as u32)) }
+    }
+
     /// Return the probe mode written by the kernel at spawn (0 for all production services).
     pub fn probe_mode(&self) -> u32 { Self::ctx().probe_mode }
 
