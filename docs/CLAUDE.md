@@ -10,6 +10,7 @@ Narrative documentation. These files explain design decisions in prose; they do 
 | `ipc.md`            | IPC deep-dive: queue discipline, cross-core send flow, deadlock patterns, examples |
 | `capability.md`     | Capability model: generation mechanism, rights model, transfer protocol, lifecycle examples |
 | `restart.md`        | Service restart flow: cap rebinding, core reassignment, client recovery pattern |
+| `registry.md`       | Why the registry exists: name → capability resolution, the rendezvous problem, identity-over-location (§14.2, §3.11, §26.10) |
 | `smp.md`            | SMP design: per-core run queues, IPI vectors, TLB shootdown protocol, placement algorithm |
 | `unsafe-audit.md`   | Complete inventory of every `unsafe` block in the kernel (§18.4) |
 | `introspection-capability.md` | Design note: gating `InspectKernel`/`TaskStat` behind the `INTROSPECT` cap (§3.1) — closes the ambient-introspection exception |
