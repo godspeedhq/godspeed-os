@@ -47,6 +47,7 @@ pub enum SyscallNumber {
     ConsoleBootComplete = 26,
     SignalInputReady    = 27,
     TaskCaps            = 28,
+    DeriveCap           = 29,
 }
 
 /// Raw syscall dispatcher — called from the SYSCALL/SYSENTER IDT stub.
@@ -77,6 +78,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::Kill           as u64 => handle_kill(arg0, arg1),
         n if n == SyscallNumber::Abort          as u64 => handle_abort(arg0, arg1),
         n if n == SyscallNumber::AcquireSendCap as u64 => handle_acquire_send_cap(arg0, arg1, arg2),
+        n if n == SyscallNumber::DeriveCap      as u64 => handle_derive_cap(arg0, arg1, arg2),
         n if n == SyscallNumber::SendWithCap    as u64 => handle_send_with_cap(arg0, arg1, arg2),
         n if n == SyscallNumber::TakePendingCap as u64 => handle_take_pending_cap(),
         n if n == SyscallNumber::InspectKernel  as u64 => handle_inspect_kernel(arg0, arg1, arg2),
@@ -509,6 +511,29 @@ fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> 
     let cap = crate::capability::mint_cap(resource_id, rights);
 
     match scheduler::current_task_insert_cap(cap) {
+        Ok(slot) => slot as i64,
+        Err(_)   => -1, // cap table full
+    }
+}
+
+/// Syscall: DeriveCap (29) — duplicate a capability the caller holds **with GRANT**
+/// into a fresh slot. arg0 = held cap slot. Returns the new slot, or a negative
+/// cap-error code.
+///
+/// This is the primitive that lets a userspace name service (the `registry`) serve
+/// many `lookup`s from one held endpoint cap: it derives a copy per client and grants
+/// that copy away (via `SendWithCap`) while retaining the original. Sound and
+/// non-escalating (§7.3): the copy carries the *same* resource, generation, and
+/// rights — never wider — and the GRANT gate means the caller could already transfer
+/// the whole cap wholesale, so duplicating it grants no authority it lacked. Endpoint
+/// caps already permit many concurrent senders, so duplication matches the IPC model.
+/// The generation check inside `lookup_cap` also forbids deriving from a stale cap.
+fn handle_derive_cap(held_slot: u64, _a1: u64, _a2: u64) -> i64 {
+    let held = match scheduler::current_task_lookup_cap(held_slot as usize, Rights::GRANT) {
+        Ok(c)  => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    match scheduler::current_task_insert_cap(held) {
         Ok(slot) => slot as i64,
         Err(_)   => -1, // cap table full
     }
