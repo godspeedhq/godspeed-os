@@ -264,13 +264,17 @@ unsafe fn mmio_write64(va: u64, off: u64, val: u64) {
 // event log.
 
 /// One AMD-Vi Device Table Entry: 256 bits = four little-endian u64 words.
-/// Field encoding (AMD I/O Virtualization spec; matches Linux amd_iommu):
-///   data[0]: V(0) | TV(1) | (mode<<9) | (page_table_root & 0xF_FFFF_FFFF_F000)
-///   data[1]: DomainID[15:0] | IR(61) | IW(62)
-const DTE_V:  u64 = 1 << 0;   // Valid
-const DTE_TV: u64 = 1 << 1;   // Translation info (mode + root) valid
-const DTE_IR: u64 = 1 << 61;  // I/O read permission   (data[1])
-const DTE_IW: u64 = 1 << 62;  // I/O write permission  (data[1])
+/// Field encoding (AMD I/O Virtualization spec; matches Linux amd_iommu).
+/// IMPORTANT: IR (bit 61) and IW (bit 62) live in the FIRST 64-bit word
+/// (`data[0]`), alongside V/TV/mode/root — NOT in `data[1]`. Putting them in
+/// `data[1]` sets DTE bits 125/126 (reserved/GCR3), which real AMD-Vi rejects as
+/// ILLEGAL_DEV_TAB_ENTRY (QEMU silently tolerated it).
+///   data[0]: V(0) | TV(1) | (mode<<9) | (page_table_root[51:12]) | IR(61) | IW(62)
+///   data[1]: DomainID[15:0]
+const DTE_V:  u64 = 1 << 0;   // Valid                  (data[0])
+const DTE_TV: u64 = 1 << 1;   // Translation info valid (data[0])
+const DTE_IR: u64 = 1 << 61;  // I/O read permission    (data[0])
+const DTE_IW: u64 = 1 << 62;  // I/O write permission   (data[0])
 const DTE_MODE_SHIFT: u64 = 9;
 const PT_ROOT_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
@@ -320,10 +324,10 @@ fn setup_structures(hhdm: u64, mmio_va: u64) -> bool {
     // Default every DTE to passthrough: V=1, TV=0, mode=0, IR=1, IW=1. Untranslated
     // access with full permission — the disk and all non-USB devices keep working
     // once the IOMMU is enabled. The USB controllers are switched to a confined
-    // domain in Phase 1c.
+    // domain in Phase 1c. V/IR/IW all live in data[0]; data[1]=0 (domain 0).
     for bdf in 0..DEV_TABLE_ENTRIES {
         // SAFETY: dt_va is the freshly-allocated mapped table; bdf in range.
-        unsafe { write_dte(dt_va, bdf as u32, DTE_V, DTE_IR | DTE_IW) };
+        unsafe { write_dte(dt_va, bdf as u32, DTE_V | DTE_IR | DTE_IW, 0) };
     }
 
     // --- Command buffer + event log: one 4 KiB frame each ---
@@ -631,9 +635,10 @@ pub fn confine_device(bdf: u32, arena_phys: u64, arena_len: u64) -> bool {
     // SAFETY: l4 is the root we just built; arena params from the caller.
     unsafe { confinement_selftest(l4, arena_phys, arena_len, hhdm) };
 
-    // Switch the device's DTE to the confined domain: V|TV|mode=4|root, IR|IW.
-    let data0 = DTE_V | DTE_TV | (4u64 << DTE_MODE_SHIFT) | (l4 & PT_ROOT_MASK);
-    let data1 = CONFINED_DOMAIN | DTE_IR | DTE_IW;
+    // Switch the device's DTE to the confined domain. V|TV|mode=4|root|IR|IW all
+    // go in data[0]; data[1] holds only the DomainID.
+    let data0 = DTE_V | DTE_TV | (4u64 << DTE_MODE_SHIFT) | (l4 & PT_ROOT_MASK) | DTE_IR | DTE_IW;
+    let data1 = CONFINED_DOMAIN;
     // SAFETY: dt_va is the mapped device table; bdf < 65536 (16-bit BDF).
     unsafe { write_dte(dt_va, bdf, data0, data1) };
     // SAFETY: order the DTE write before the invalidation reads it.
@@ -726,10 +731,10 @@ pub fn release_device(bdf: u32) -> bool {
     }
     let hhdm = crate::arch::x86_64::page_tables::get_hhdm_offset();
 
-    // Revert the DTE to passthrough (V|IR|IW), order it, then invalidate so the
-    // device no longer reaches the (about-to-be-freed) I/O page table.
+    // Revert the DTE to passthrough (V|IR|IW in data[0]; data[1]=0), order it,
+    // then invalidate so the device no longer reaches the (freed) I/O page table.
     // SAFETY: dt_va is the mapped device table; bdf < 65536.
-    unsafe { write_dte(dt_va, bdf, DTE_V, DTE_IR | DTE_IW) };
+    unsafe { write_dte(dt_va, bdf, DTE_V | DTE_IR | DTE_IW, 0) };
     // SAFETY: order the DTE write before invalidation/free.
     unsafe { core::arch::asm!("sfence", options(nostack, nomem, preserves_flags)) };
     // SAFETY: IOMMU enabled; command buffer programmed.
