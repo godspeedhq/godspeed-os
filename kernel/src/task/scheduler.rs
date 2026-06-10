@@ -1239,6 +1239,19 @@ pub fn kill_task_by_slot(slot: usize) {
             }
         }
 
+        // H1: if a confined DMA driver dies, reclaim its IOMMU resources (revert
+        // DTE to passthrough, free its I/O page table) so a restart does not leak
+        // and re-confines cleanly. Safe call; no-op if the device wasn't confined.
+        if task_name == "xhci" || task_name == "ehci" {
+            use core::sync::atomic::Ordering::Relaxed;
+            let bdf = if task_name == "xhci" {
+                crate::arch::x86_64::pci::XHCI_BDF.load(Relaxed)
+            } else {
+                crate::arch::x86_64::pci::EHCI_BDF.load(Relaxed)
+            };
+            crate::arch::x86_64::iommu::release_device(bdf);
+        }
+
         // SMP safety: spin until no other core has CORE_CURRENT[c] == slot.
         //
         // A core may have selected this slot from pick_next (observing STATE=Ready)

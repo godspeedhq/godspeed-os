@@ -429,6 +429,17 @@ const IO_PTE_IW: u64 = 1 << 62;  // write permission
 /// controller only ever reaches its own arena.
 const CONFINED_DOMAIN: u64 = 1;
 
+/// Record of one confined device so its I/O page table can be reclaimed and its
+/// DTE reverted to passthrough when the driver dies (restartability — a
+/// prerequisite for dropping the driver from the TCB). Up to 4 DMA drivers.
+#[derive(Clone, Copy)]
+struct Confined {
+    bdf: u32,
+    l4_phys: u64,
+}
+static CONFINED_TABLE: crate::smp::spinlock::SpinLock<[Option<Confined>; 4]> =
+    crate::smp::spinlock::SpinLock::new([None; 4]);
+
 /// Serialises command-buffer submission across cores (spawns may confine devices
 /// on different cores). Holds nothing — the buffer state lives in MMIO.
 static CMD_LOCK: crate::smp::spinlock::SpinLock<()> =
@@ -632,11 +643,105 @@ pub fn confine_device(bdf: u32, arena_phys: u64, arena_len: u64) -> bool {
     // SAFETY: IOMMU enabled in bringup; command buffer programmed.
     unsafe { invalidate_device(mmio_va, phys_to_virt(cmd_va_phys, hhdm), bdf) };
 
+    // Record so release_device can reclaim this on driver death.
+    {
+        let mut tbl = CONFINED_TABLE.lock();
+        // Replace any stale entry for this BDF, else take a free slot.
+        if let Some(e) = tbl.iter_mut().find(|e| matches!(e, Some(c) if c.bdf == bdf)) {
+            *e = Some(Confined { bdf, l4_phys: l4 });
+        } else if let Some(e) = tbl.iter_mut().find(|e| e.is_none()) {
+            *e = Some(Confined { bdf, l4_phys: l4 });
+        }
+    }
+
     let pages = (last - first) / 0x1000 + 1;
     crate::kprintln!(
         "iommu: confined BDF {:02x}:{:02x}.{} -> domain {} arena {:#x}..{:#x} ({} pages); DTE invalidated",
         (bdf >> 8) & 0xff, (bdf >> 3) & 0x1f, bdf & 0x7,
         CONFINED_DOMAIN, first, last + 0xFFF + 1, pages
+    );
+    true
+}
+
+/// Free the table frames of a 4-level I/O page table rooted at `table_phys`
+/// (level `level`). Frees only the page-table frames, never the leaf arena pages
+/// (those are reclaimed by ordinary task death).
+///
+/// # Safety
+/// `table_phys` must be a valid I/O page table built by `io_map_page` and no
+/// longer reachable by the device (DTE reverted + invalidated first).
+unsafe fn free_io_table(table_phys: u64, level: u32, hhdm: u64) {
+    if level >= 2 {
+        let va = phys_to_virt(table_phys, hhdm);
+        for idx in 0..512u64 {
+            // SAFETY: va is the mapped table; idx < 512.
+            let e = unsafe { core::ptr::read_volatile((va + idx * 8) as *const u64) };
+            if e & IO_PTE_PR != 0 {
+                // SAFETY: present non-leaf entry points to the next-level table.
+                unsafe { free_io_table(e & PT_ROOT_MASK, level - 1, hhdm) };
+            }
+        }
+    }
+    // SAFETY: table_phys is a page-table frame from the allocator, now unreachable.
+    unsafe {
+        crate::memory::allocator::free_frame(
+            crate::memory::frame::Frame::from_phys(crate::memory::frame::PhysAddr(table_phys)),
+        )
+    };
+}
+
+/// Reclaim a confined device's IOMMU resources on driver death: revert its DTE
+/// to passthrough, invalidate the cached entry, and free its I/O page-table
+/// frames. Makes confined DMA drivers restartable (no leak across restart).
+/// Safe wrapper; no-op if the device was not confined. Returns true if reclaimed.
+pub fn release_device(bdf: u32) -> bool {
+    if !IOMMU_PRESENT.load(Ordering::Relaxed) || bdf == 0xFFFF {
+        return false;
+    }
+    // Remove the record under the lock.
+    let rec = {
+        let mut tbl = CONFINED_TABLE.lock();
+        let mut found = None;
+        for e in tbl.iter_mut() {
+            if let Some(c) = e {
+                if c.bdf == bdf {
+                    found = Some(*c);
+                    *e = None;
+                    break;
+                }
+            }
+        }
+        found
+    };
+    let rec = match rec {
+        Some(r) => r,
+        None => return false,
+    };
+
+    let mmio_va = IOMMU_MMIO_VA.load(Ordering::Relaxed);
+    let dt_va = DEV_TABLE_VA.load(Ordering::Relaxed);
+    let cmd_phys = CMD_BUF_PHYS.load(Ordering::Relaxed);
+    if mmio_va == 0 || dt_va == 0 || cmd_phys == 0 {
+        return false;
+    }
+    let hhdm = crate::arch::x86_64::page_tables::get_hhdm_offset();
+
+    // Revert the DTE to passthrough (V|IR|IW), order it, then invalidate so the
+    // device no longer reaches the (about-to-be-freed) I/O page table.
+    // SAFETY: dt_va is the mapped device table; bdf < 65536.
+    unsafe { write_dte(dt_va, bdf, DTE_V, DTE_IR | DTE_IW) };
+    // SAFETY: order the DTE write before invalidation/free.
+    unsafe { core::arch::asm!("sfence", options(nostack, nomem, preserves_flags)) };
+    // SAFETY: IOMMU enabled; command buffer programmed.
+    unsafe { invalidate_device(mmio_va, phys_to_virt(cmd_phys, hhdm), bdf) };
+
+    // Now safe to free the I/O page-table frames (device can't reach them).
+    // SAFETY: rec.l4_phys was built by confine_device and is now unreachable.
+    unsafe { free_io_table(rec.l4_phys, 4, hhdm) };
+
+    crate::kprintln!(
+        "iommu: released BDF {:02x}:{:02x}.{} -> DTE back to passthrough, I/O page table freed",
+        (bdf >> 8) & 0xff, (bdf >> 3) & 0x1f, bdf & 0x7
     );
     true
 }

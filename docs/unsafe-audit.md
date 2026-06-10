@@ -135,7 +135,7 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | arch/x86_64/context_switch.rs | 11 | permitted |
 | arch/x86_64/fb.rs | 3 | permitted |
 | arch/x86_64/interrupts.rs | 13 | permitted |
-| arch/x86_64/iommu.rs | 60 | permitted |
+| arch/x86_64/iommu.rs | 68 | permitted |
 | arch/x86_64/mod.rs | 34 | permitted |
 | arch/x86_64/page_tables.rs | 35 | permitted |
 | arch/x86_64/pci.rs | 5 | permitted |
@@ -159,16 +159,16 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | task/scheduler.rs | 37 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 336 lines across 21 files  
+**Permitted total:** 344 lines across 21 files  
 **Grandfathered total:** 53 lines across 6 files  
-**Grand total:** 389 lines across 27 files
+**Grand total:** 397 lines across 27 files
 
 > **2026-06-10** (branch `feat/iommu-dma-confinement`). New file `arch/x86_64/iommu.rs`
 > (+60, permitted): the H1 AMD-Vi IOMMU work. Phase 0 (+18) is ACPI-table reads
 > (RSDP → RSDT/XSDT → IVRS) through the HHDM. Phase 1 (+42) is the IOMMU control
 > interface and translation setup: uncached MMIO register read/write, device-table
 > /command-buffer/event-log allocation and DTE writes, the 4-level I/O page-table
-> builder/translator, and command-buffer invalidation. Every block carries a
+> builder/translator/free, and command-buffer invalidation. Every block carries a
 > `// SAFETY:` argument that the target is a kernel-mapped IOMMU structure (MMIO
 > window, device table, command buffer, or I/O page table) and the access is in
 > bounds. All hardware `unsafe` is contained here behind the safe wrapper
@@ -317,18 +317,23 @@ the IOMMU and builds translation structures. Grouped:
   command buffer, and event log from the frame allocator, zero them through the
   HHDM, and write DTEs. All writes target the freshly-allocated, HHDM-mapped
   structures; the DTE index is a 16-bit BDF, in bounds of the 64K-entry table.
-- `io_walk_or_alloc` / `io_map_page` / `io_translate` — the 4-level AMD-Vi I/O
-  page-table builder and read-only translator. Each level VA is the HHDM alias of
-  a present/just-allocated table; indices are masked to 9 bits (< 512), so every
-  read/write is in bounds of a 4 KiB table.
+- `io_walk_or_alloc` / `io_map_page` / `io_translate` / `free_io_table` — the
+  4-level AMD-Vi I/O page-table builder, read-only translator, and frame reclaim.
+  Each level VA is the HHDM alias of a present/just-allocated table; indices are
+  masked to 9 bits (< 512), so every read/write is in bounds of a 4 KiB table.
+  `free_io_table` frees only the page-table frames (reached top-down from a root
+  that `release_device` has already detached from the device), never the leaf
+  arena pages.
 - `invalidate_device` — writes 16-byte commands into the mapped command-buffer
   ring at the hardware tail offset (masked to the 4 KiB ring) and rings the tail
   register; serialised by `CMD_LOCK`.
-- `confine_device` / `confinement_selftest` — orchestrate the above; the only
-  raw work they do directly is zeroing a freshly-allocated page table and an
-  `sfence` (no memory-safety effect, orders prior stores).
+- `confine_device` / `confinement_selftest` / `release_device` — orchestrate the
+  above; the raw work they do directly is zeroing a freshly-allocated page table,
+  an `sfence` (no memory-safety effect, orders prior stores), and (on release)
+  reverting a DTE before freeing the now-unreachable I/O page table.
 
-`confine_device`, `event_log_state`, and `bringup` are the safe entry points;
+`confine_device`, `release_device`, `event_log_state`, and `bringup` are the safe
+entry points;
 all callers outside the arch layer (e.g. `task/mod.rs`) use them without `unsafe`.
 `// SAFETY:` comments present on every block.
 
