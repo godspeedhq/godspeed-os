@@ -746,6 +746,67 @@ pub fn release_device(bdf: u32) -> bool {
     true
 }
 
+/// Drain and decode any new IOMMU fault events, printing each (device, fault
+/// type, faulting address). Safe; cheap when quiet (just a head/tail compare).
+/// Bounded per call so it is safe to invoke from the timer-tick path. Called
+/// from `control::process_pending` on core 0.
+pub fn drain_event_log() -> u32 {
+    let mmio_va = IOMMU_MMIO_VA.load(Ordering::Relaxed);
+    let evt_phys = EVENT_LOG_PHYS.load(Ordering::Relaxed);
+    if mmio_va == 0 || evt_phys == 0 {
+        return 0;
+    }
+    let hhdm = crate::arch::x86_64::page_tables::get_hhdm_offset();
+    let evt_va = phys_to_virt(evt_phys, hhdm);
+
+    // SAFETY: mmio_va mapped in bringup; head/tail are valid registers.
+    let mut head = unsafe { mmio_read64(mmio_va, reg::EVENT_LOG_HEAD) } & 0xFFF;
+    let tail = unsafe { mmio_read64(mmio_va, reg::EVENT_LOG_TAIL) } & 0xFFF;
+    if head == tail {
+        return 0;
+    }
+
+    let mut printed = 0u32;
+    let mut budget = 32u32; // bound the per-call work (event log is 256 entries)
+    while head != tail && budget > 0 {
+        budget -= 1;
+        let entry = evt_va + head;
+        // SAFETY: entry is within the mapped 4 KiB event-log ring (head < 0x1000).
+        let (e0, e1, e2, e3) = unsafe {
+            (
+                core::ptr::read_volatile(entry as *const u32),
+                core::ptr::read_volatile((entry + 4) as *const u32),
+                core::ptr::read_volatile((entry + 8) as *const u32),
+                core::ptr::read_volatile((entry + 12) as *const u32),
+            )
+        };
+        let devid = e0 & 0xFFFF;
+        let code = (e1 >> 28) & 0xF;
+        let addr = ((e3 as u64) << 32) | (e2 as u64);
+        let name = match code {
+            0x1 => "ILLEGAL_DEV_TAB_ENTRY",
+            0x2 => "IO_PAGE_FAULT",
+            0x3 => "DEV_TAB_HW_ERROR",
+            0x4 => "PAGE_TAB_HW_ERROR",
+            0x5 => "ILLEGAL_COMMAND",
+            0x6 => "COMMAND_HW_ERROR",
+            0x7 => "IOTLB_INV_TIMEOUT",
+            0x8 => "INVALID_DEV_REQUEST",
+            _ => "UNKNOWN",
+        };
+        crate::kprintln!(
+            "iommu: EVENT {} (code={:#x}) dev={:02x}:{:02x}.{} addr={:#x} raw={:08x},{:08x},{:08x},{:08x}",
+            name, code, (devid >> 8) & 0xff, (devid >> 3) & 0x1f, devid & 0x7,
+            addr, e0, e1, e2, e3
+        );
+        head = (head + 16) & 0xFFF;
+        printed += 1;
+    }
+    // SAFETY: advance the consumed head so the IOMMU can refill the ring.
+    unsafe { mmio_write64(mmio_va, reg::EVENT_LOG_HEAD, head) };
+    printed
+}
+
 /// Read the IOMMU event-log head/tail (for fault observation). Returns
 /// `(head, tail)` byte offsets; head != tail means fault events were logged.
 pub fn event_log_state() -> (u64, u64) {

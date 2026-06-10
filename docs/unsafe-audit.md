@@ -135,7 +135,7 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | arch/x86_64/context_switch.rs | 11 | permitted |
 | arch/x86_64/fb.rs | 3 | permitted |
 | arch/x86_64/interrupts.rs | 13 | permitted |
-| arch/x86_64/iommu.rs | 68 | permitted |
+| arch/x86_64/iommu.rs | 72 | permitted |
 | arch/x86_64/mod.rs | 34 | permitted |
 | arch/x86_64/page_tables.rs | 35 | permitted |
 | arch/x86_64/pci.rs | 5 | permitted |
@@ -159,9 +159,9 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | task/scheduler.rs | 37 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 344 lines across 21 files  
+**Permitted total:** 348 lines across 21 files  
 **Grandfathered total:** 53 lines across 6 files  
-**Grand total:** 397 lines across 27 files
+**Grand total:** 401 lines across 27 files
 
 > **2026-06-10** (branch `feat/iommu-dma-confinement`). New file `arch/x86_64/iommu.rs`
 > (+60, permitted): the H1 AMD-Vi IOMMU work. Phase 0 (+18) is ACPI-table reads
@@ -327,6 +327,9 @@ the IOMMU and builds translation structures. Grouped:
 - `invalidate_device` — writes 16-byte commands into the mapped command-buffer
   ring at the hardware tail offset (masked to the 4 KiB ring) and rings the tail
   register; serialised by `CMD_LOCK`.
+- `drain_event_log` — reads decoded fault events from the mapped 4 KiB event-log
+  ring (head < 0x1000) and advances the head register; bounded per call so it is
+  safe to invoke from the timer-tick path (`control::process_pending`).
 - `confine_device` / `confinement_selftest` / `release_device` — orchestrate the
   above; the raw work they do directly is zeroing a freshly-allocated page table,
   an `sfence` (no memory-safety effect, orders prior stores), and (on release)
