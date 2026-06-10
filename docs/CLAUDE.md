@@ -12,6 +12,7 @@ Narrative documentation. These files explain design decisions in prose; they do 
 | `restart.md`        | Service restart flow: cap rebinding, core reassignment, client recovery pattern |
 | `registry.md`       | Why the registry exists: name → capability resolution, the rendezvous problem, identity-over-location (§14.2, §3.11, §26.10) |
 | `smp.md`            | SMP design: per-core run queues, IPI vectors, TLB shootdown protocol, placement algorithm |
+| `iommu.md`          | IOMMU-backed DMA confinement (H1): why DMA-capable drivers are kernel-equivalent without an IOMMU, AMD-Vi detection/setup/confinement/reclaim, Phase 2 TCB-drop proposal (§6, §12, §18.1) |
 | `unsafe-audit.md`   | Complete inventory of every `unsafe` block in the kernel (§18.4) |
 | `introspection-capability.md` | Design note: gating `InspectKernel`/`TaskStat` behind the `INTROSPECT` cap (§3.1) — closes the ambient-introspection exception |
 | `cluster-design.md` | Cluster mode design notes (non-normative, far-future; expands Appendix C.4 of `CLAUDE.md`) |
