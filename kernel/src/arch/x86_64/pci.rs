@@ -27,12 +27,16 @@ const PROGIF_EHCI: u8 = 0x20;
 pub static XHCI_FOUND: AtomicBool = AtomicBool::new(false);
 pub static XHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
 pub static XHCI_IRQ: AtomicU8 = AtomicU8::new(0);
+/// PCI BDF (bus<<8 | dev<<3 | func) of the driver's xHCI — the index into the
+/// IOMMU device table for DMA confinement (H1). 0xFFFF if none found.
+pub static XHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
 
 /// All discovered xHCI controllers (a system may have several; the boot drive
 /// and the keyboard often sit on different ones). Recorded during the scan.
 pub static XHCI_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static XHCI_BASES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 pub static XHCI_IRQS: [AtomicU8; 4] = [const { AtomicU8::new(0) }; 4];
+pub static XHCI_BDFS: [AtomicU32; 4] = [const { AtomicU32::new(0xFFFF) }; 4];
 
 /// Discovered EHCI (USB 2.0) controller — the T630's back ports hang off it
 /// (§12). The userspace `ehci` driver gets this BAR mapped at spawn, exactly as
@@ -40,6 +44,14 @@ pub static XHCI_IRQS: [AtomicU8; 4] = [const { AtomicU8::new(0) }; 4];
 pub static EHCI_FOUND: AtomicBool = AtomicBool::new(false);
 pub static EHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
 pub static EHCI_IRQ: AtomicU8 = AtomicU8::new(0);
+/// PCI BDF of the EHCI controller — IOMMU device-table index (H1). 0xFFFF if none.
+pub static EHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
+
+/// Build a 16-bit PCI BDF (bus<<8 | dev<<3 | func) — the IOMMU device-table index.
+#[inline]
+pub fn make_bdf(bus: u8, dev: u8, func: u8) -> u32 {
+    ((bus as u32) << 8) | ((dev as u32) << 3) | (func as u32)
+}
 
 /// Write a 32-bit value to an I/O port.
 ///
@@ -128,6 +140,7 @@ pub fn init() {
                         if n < 4 {
                             XHCI_BASES[n].store(mmio_base, Ordering::Relaxed);
                             XHCI_IRQS[n].store(irq, Ordering::Relaxed);
+                            XHCI_BDFS[n].store(make_bdf(bus as u8, dev, func), Ordering::Relaxed);
                             XHCI_COUNT.store((n + 1) as u32, Ordering::Relaxed);
                         }
                     }
@@ -135,6 +148,7 @@ pub fn init() {
                     if progif == PROGIF_EHCI && !EHCI_FOUND.load(Ordering::Relaxed) {
                         EHCI_MMIO_BASE.store(mmio_base, Ordering::Relaxed);
                         EHCI_IRQ.store(irq, Ordering::Relaxed);
+                        EHCI_BDF.store(make_bdf(bus as u8, dev, func), Ordering::Relaxed);
                         EHCI_FOUND.store(true, Ordering::Relaxed);
                     }
                 }
@@ -147,10 +161,15 @@ pub fn init() {
     if count > 0 {
         let pick = 0;
         let base = XHCI_BASES[pick].load(Ordering::Relaxed);
+        let bdf = XHCI_BDFS[pick].load(Ordering::Relaxed);
         XHCI_MMIO_BASE.store(base, Ordering::Relaxed);
         XHCI_IRQ.store(XHCI_IRQS[pick].load(Ordering::Relaxed), Ordering::Relaxed);
+        XHCI_BDF.store(bdf, Ordering::Relaxed);
         XHCI_FOUND.store(true, Ordering::Relaxed);
-        crate::kprintln!("pci: driver uses xHCI #{} of {} (MMIO={:#x})", pick, count, base);
+        crate::kprintln!(
+            "pci: driver uses xHCI #{} of {} (MMIO={:#x} BDF={:02x}:{:02x}.{})",
+            pick, count, base, (bdf >> 8) & 0xff, (bdf >> 3) & 0x1f, bdf & 0x7
+        );
     } else {
         crate::kprintln!("pci: no xHCI controller found");
     }

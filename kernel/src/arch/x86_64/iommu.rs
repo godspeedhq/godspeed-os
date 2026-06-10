@@ -230,6 +230,138 @@ unsafe fn mmio_read64(va: u64, off: u64) -> u64 {
     unsafe { core::ptr::read_volatile((va + off) as *const u64) }
 }
 
+/// Write a 64-bit IOMMU MMIO register at `off`.
+///
+/// # Safety
+/// [`bringup`] must have mapped the MMIO block; `off + 8 <= IOMMU_MMIO_LEN`.
+#[inline]
+unsafe fn mmio_write64(va: u64, off: u64, val: u64) {
+    // SAFETY: va+off is inside the uncached IOMMU MMIO mapping; aligned 64-bit
+    // volatile write of a hardware register.
+    unsafe { core::ptr::write_volatile((va + off) as *mut u64, val) }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1b — device table, command buffer, event log
+// ---------------------------------------------------------------------------
+//
+// The IOMMU checks every upstream DMA against a Device Table Entry (DTE) indexed
+// by the originating device's PCI BDF. We allocate the full 64K-entry table (one
+// 256-bit DTE each = 2 MiB) so every device has an entry, default every entry to
+// *passthrough* (so the disk and everything else keep DMAing untranslated), and
+// later switch just the USB controllers' entries to a confined domain (Phase 1c).
+// The command buffer and event log are the IOMMU's two rings: we issue cache
+// invalidations through the command buffer and read translation faults from the
+// event log.
+
+/// One AMD-Vi Device Table Entry: 256 bits = four little-endian u64 words.
+/// Field encoding (AMD I/O Virtualization spec; matches Linux amd_iommu):
+///   data[0]: V(0) | TV(1) | (mode<<9) | (page_table_root & 0xF_FFFF_FFFF_F000)
+///   data[1]: DomainID[15:0] | IR(61) | IW(62)
+const DTE_V:  u64 = 1 << 0;   // Valid
+const DTE_TV: u64 = 1 << 1;   // Translation info (mode + root) valid
+const DTE_IR: u64 = 1 << 61;  // I/O read permission   (data[1])
+const DTE_IW: u64 = 1 << 62;  // I/O write permission  (data[1])
+const DTE_MODE_SHIFT: u64 = 9;
+const PT_ROOT_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
+/// Number of device-table entries (full 16-bit BDF space) and bytes per entry.
+const DEV_TABLE_ENTRIES: u64 = 1 << 16;
+const DTE_BYTES: u64 = 32;
+/// 2 MiB device table = 512 contiguous 4 KiB frames.
+const DEV_TABLE_PAGES: usize = ((DEV_TABLE_ENTRIES * DTE_BYTES) / 4096) as usize;
+
+/// Physical + HHDM-virtual base of each IOMMU structure (0 until allocated).
+pub static DEV_TABLE_PHYS: AtomicU64 = AtomicU64::new(0);
+static DEV_TABLE_VA: AtomicU64 = AtomicU64::new(0);
+static CMD_BUF_PHYS: AtomicU64 = AtomicU64::new(0);
+static EVENT_LOG_PHYS: AtomicU64 = AtomicU64::new(0);
+
+/// Write one DTE (`bdf`-th entry) in the device table at HHDM VA `dt_va`.
+///
+/// # Safety
+/// `dt_va` must be the mapped device table and `bdf < DEV_TABLE_ENTRIES`.
+unsafe fn write_dte(dt_va: u64, bdf: u32, data0: u64, data1: u64) {
+    let entry = dt_va + (bdf as u64) * DTE_BYTES;
+    // SAFETY: entry is within the 2 MiB device table (bdf bounded by caller);
+    // 8-byte aligned writes of the four DTE words.
+    unsafe {
+        core::ptr::write_volatile(entry as *mut u64, data0);
+        core::ptr::write_volatile((entry + 8) as *mut u64, data1);
+        core::ptr::write_volatile((entry + 16) as *mut u64, 0);
+        core::ptr::write_volatile((entry + 24) as *mut u64, 0);
+    }
+}
+
+/// Allocate and initialise the device table (all-passthrough), command buffer,
+/// and event log, then program the IOMMU base registers. Does NOT enable
+/// translation yet (Phase 1d). Returns false if allocation failed.
+fn setup_structures(hhdm: u64, mmio_va: u64) -> bool {
+    use crate::memory::allocator::alloc_contiguous;
+
+    // --- Device table: 2 MiB contiguous ---
+    let dt_phys = match alloc_contiguous(DEV_TABLE_PAGES) {
+        Some(p) => p,
+        None => {
+            crate::kprintln!("iommu: WARN no 2 MiB contiguous block for device table; aborting 1b");
+            return false;
+        }
+    };
+    let dt_va = phys_to_virt(dt_phys, hhdm);
+    // Default every DTE to passthrough: V=1, TV=0, mode=0, IR=1, IW=1. Untranslated
+    // access with full permission — the disk and all non-USB devices keep working
+    // once the IOMMU is enabled. The USB controllers are switched to a confined
+    // domain in Phase 1c.
+    for bdf in 0..DEV_TABLE_ENTRIES {
+        // SAFETY: dt_va is the freshly-allocated mapped table; bdf in range.
+        unsafe { write_dte(dt_va, bdf as u32, DTE_V, DTE_IR | DTE_IW) };
+    }
+
+    // --- Command buffer + event log: one 4 KiB frame each ---
+    let cmd_phys = match alloc_contiguous(1) {
+        Some(p) => p,
+        None => { crate::kprintln!("iommu: WARN no frame for command buffer"); return false; }
+    };
+    let evt_phys = match alloc_contiguous(1) {
+        Some(p) => p,
+        None => { crate::kprintln!("iommu: WARN no frame for event log"); return false; }
+    };
+    // SAFETY: both frames just allocated and HHDM-mapped; zero them.
+    unsafe {
+        core::ptr::write_bytes(phys_to_virt(cmd_phys, hhdm) as *mut u8, 0, 4096);
+        core::ptr::write_bytes(phys_to_virt(evt_phys, hhdm) as *mut u8, 0, 4096);
+    }
+
+    DEV_TABLE_PHYS.store(dt_phys, Ordering::Relaxed);
+    DEV_TABLE_VA.store(dt_va, Ordering::Relaxed);
+    CMD_BUF_PHYS.store(cmd_phys, Ordering::Relaxed);
+    EVENT_LOG_PHYS.store(evt_phys, Ordering::Relaxed);
+
+    // Make sure all the table writes land in RAM before the IOMMU reads them.
+    // SAFETY: SFENCE has no memory-safety effect; orders prior stores.
+    unsafe { core::arch::asm!("sfence", options(nostack, nomem, preserves_flags)) };
+
+    // --- Program base registers (translation still disabled) ---
+    // DTBR: base | size, size = (pages - 1) in bits[8:0].
+    let dtbr = (dt_phys & PT_ROOT_MASK) | ((DEV_TABLE_PAGES as u64) - 1);
+    // CMDBR / ELBR: base | (len<<56); len=8 => 4 KiB (256 entries).
+    let cmdbr = (cmd_phys & PT_ROOT_MASK) | (8u64 << 56);
+    let elbr = (evt_phys & PT_ROOT_MASK) | (8u64 << 56);
+    // SAFETY: mmio_va mapped in bringup; standard base-register programming.
+    unsafe {
+        mmio_write64(mmio_va, reg::DEVICE_TABLE_BASE, dtbr);
+        mmio_write64(mmio_va, reg::COMMAND_BUF_BASE, cmdbr);
+        mmio_write64(mmio_va, reg::EVENT_LOG_BASE, elbr);
+    }
+
+    crate::kprintln!(
+        "iommu: structures ready — devtab {:#x} ({} entries, passthrough), cmdbuf {:#x}, evtlog {:#x}",
+        dt_phys, DEV_TABLE_ENTRIES, cmd_phys, evt_phys
+    );
+    crate::kprintln!("iommu: H1 Phase 1b OK -> device table + rings programmed (translation still off)");
+    true
+}
+
 /// Map the IOMMU MMIO block and report its capabilities. Detection-and-readout
 /// only — programs nothing. Call after [`detect`]; no-op if no IOMMU was found.
 pub fn bringup(hhdm: u64) {
@@ -293,4 +425,7 @@ pub fn bringup(hhdm: u64) {
         hats, levels, iommu_enabled as u8, dev_tab, cmd_buf, evt_log
     );
     crate::kprintln!("iommu: H1 Phase 1a OK -> MMIO reachable; capabilities read");
+
+    // Phase 1b: allocate + program the device table, command buffer, event log.
+    setup_structures(hhdm, va);
 }
