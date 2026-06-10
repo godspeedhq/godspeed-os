@@ -486,6 +486,64 @@ unsafe fn io_map_page(l4_phys: u64, addr: u64, hhdm: u64) -> bool {
     true
 }
 
+/// Read-only walk of the I/O page table rooted at `l4_phys`: return the physical
+/// address `addr` translates to (R/W leaf), or `None` if unmapped. Used by the
+/// confinement self-test to prove the domain permits exactly the arena.
+///
+/// # Safety
+/// `l4_phys` must be a valid I/O page table root maintained by `io_map_page`.
+unsafe fn io_translate(l4_phys: u64, addr: u64, hhdm: u64) -> Option<u64> {
+    // SAFETY: each level VA is the HHDM alias of a present table; indices < 512.
+    unsafe {
+        let mut table = l4_phys;
+        for level in (1..=4u32).rev() {
+            let slot = phys_to_virt(table, hhdm) + io_idx(addr, level) * 8;
+            let e = core::ptr::read_volatile(slot as *const u64);
+            if e & IO_PTE_PR == 0 {
+                return None;
+            }
+            // Leaf when Next Level (bits 11:9) == 0.
+            if (e >> 9) & 0x7 == 0 {
+                return Some((e & PT_ROOT_MASK) | (addr & 0xFFF));
+            }
+            table = e & PT_ROOT_MASK;
+        }
+        None
+    }
+}
+
+/// Prove the I/O page table at `l4_phys` confines to exactly `[arena_phys,
+/// arena_phys+arena_len)`: every arena page translates identity (IOVA == PA), and
+/// the first page *past* the arena is unmapped. Logs PASS/FAIL.
+///
+/// # Safety
+/// `l4_phys` is the device's I/O page-table root built by `confine_device`.
+unsafe fn confinement_selftest(l4_phys: u64, arena_phys: u64, arena_len: u64, hhdm: u64) {
+    let first = arena_phys & !0xFFF;
+    let last = (arena_phys + arena_len - 1) & !0xFFF;
+    let outside = last + 0x1000;
+
+    // SAFETY: l4_phys is a valid root; addresses are page-aligned.
+    let inside_ok = unsafe {
+        io_translate(l4_phys, first, hhdm) == Some(first)
+            && io_translate(l4_phys, last, hhdm) == Some(last)
+    };
+    // SAFETY: as above.
+    let outside_unmapped = unsafe { io_translate(l4_phys, outside, hhdm).is_none() };
+
+    if inside_ok && outside_unmapped {
+        crate::kprintln!(
+            "iommu: selftest PASS — arena {:#x}/{:#x} translate identity, {:#x} (outside) unmapped",
+            first, last, outside
+        );
+    } else {
+        crate::kprintln!(
+            "iommu: selftest FAIL — inside_ok={} outside_unmapped={} (first {:#x} last {:#x} out {:#x})",
+            inside_ok as u8, outside_unmapped as u8, first, last, outside
+        );
+    }
+}
+
 /// Submit an INVALIDATE_DEVTAB_ENTRY (and an all-pages invalidate for the domain)
 /// and wait for the IOMMU to consume them, so a stale cached DTE/translation for
 /// `bdf` is dropped.
@@ -557,6 +615,10 @@ pub fn confine_device(bdf: u32, arena_phys: u64, arena_len: u64) -> bool {
         }
         pa += 0x1000;
     }
+
+    // Prove the table confines to exactly the arena before we attach the device.
+    // SAFETY: l4 is the root we just built; arena params from the caller.
+    unsafe { confinement_selftest(l4, arena_phys, arena_len, hhdm) };
 
     // Switch the device's DTE to the confined domain: V|TV|mode=4|root, IR|IW.
     let data0 = DTE_V | DTE_TV | (4u64 << DTE_MODE_SHIFT) | (l4 & PT_ROOT_MASK);

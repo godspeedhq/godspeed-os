@@ -135,7 +135,7 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | arch/x86_64/context_switch.rs | 11 | permitted |
 | arch/x86_64/fb.rs | 3 | permitted |
 | arch/x86_64/interrupts.rs | 13 | permitted |
-| arch/x86_64/iommu.rs | 18 | permitted |
+| arch/x86_64/iommu.rs | 60 | permitted |
 | arch/x86_64/mod.rs | 34 | permitted |
 | arch/x86_64/page_tables.rs | 35 | permitted |
 | arch/x86_64/pci.rs | 5 | permitted |
@@ -159,16 +159,21 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | task/scheduler.rs | 37 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 294 lines across 21 files  
+**Permitted total:** 336 lines across 21 files  
 **Grandfathered total:** 53 lines across 6 files  
-**Grand total:** 347 lines across 27 files
+**Grand total:** 389 lines across 27 files
 
 > **2026-06-10** (branch `feat/iommu-dma-confinement`). New file `arch/x86_64/iommu.rs`
-> (+18, permitted): the H1 Phase 0 AMD-Vi IOMMU detection probe. All 18 unsafe lines
-> are raw reads of firmware ACPI tables (RSDP → RSDT/XSDT → IVRS) through the HHDM,
-> each carrying a `// SAFETY:` argument that the address lies in a Limine-mapped ACPI
-> table and the read is in-bounds of that table's length field. Detection only — no
-> behaviour change. See the `arch/x86_64/iommu.rs` entry below.
+> (+60, permitted): the H1 AMD-Vi IOMMU work. Phase 0 (+18) is ACPI-table reads
+> (RSDP → RSDT/XSDT → IVRS) through the HHDM. Phase 1 (+42) is the IOMMU control
+> interface and translation setup: uncached MMIO register read/write, device-table
+> /command-buffer/event-log allocation and DTE writes, the 4-level I/O page-table
+> builder/translator, and command-buffer invalidation. Every block carries a
+> `// SAFETY:` argument that the target is a kernel-mapped IOMMU structure (MMIO
+> window, device table, command buffer, or I/O page table) and the access is in
+> bounds. All hardware `unsafe` is contained here behind the safe wrapper
+> `confine_device()`; `task/mod.rs` calls it without any new `unsafe` (its
+> grandfathered floor of 7 is unchanged). See the `arch/x86_64/iommu.rs` entry below.
 
 > **Reconciled 2026-05-31** (branch `verify/static-analysis-unsafe-audit`). The
 > permitted-layer growth since the prior baseline is from the AMD GX-420GI ring-3 /
@@ -300,8 +305,32 @@ at every step. Each block is sound because:
   zero length, so it cannot run off the end or loop forever.
 
 Detection only — no behaviour change, no writes, no device programming. The
-results are published in two atomics (`IOMMU_PRESENT`, `IOMMU_MMIO_BASE`) for the
-future Phase 1 translation setup. `// SAFETY:` comments present on every block.
+results are published in two atomics (`IOMMU_PRESENT`, `IOMMU_MMIO_BASE`).
+
+**Phase 1 (translation setup), +42.** The remaining unsafe in this file programs
+the IOMMU and builds translation structures. Grouped:
+
+- `mmio_read64` / `mmio_write64` — volatile access to the IOMMU MMIO control
+  registers, which `bringup` maps uncached (PCD|PWT) at their HHDM alias before
+  any access. Offsets are compile-time constants within the mapped 0x4000 window.
+- `setup_structures` / `write_dte` — allocate the device table (2 MiB contiguous),
+  command buffer, and event log from the frame allocator, zero them through the
+  HHDM, and write DTEs. All writes target the freshly-allocated, HHDM-mapped
+  structures; the DTE index is a 16-bit BDF, in bounds of the 64K-entry table.
+- `io_walk_or_alloc` / `io_map_page` / `io_translate` — the 4-level AMD-Vi I/O
+  page-table builder and read-only translator. Each level VA is the HHDM alias of
+  a present/just-allocated table; indices are masked to 9 bits (< 512), so every
+  read/write is in bounds of a 4 KiB table.
+- `invalidate_device` — writes 16-byte commands into the mapped command-buffer
+  ring at the hardware tail offset (masked to the 4 KiB ring) and rings the tail
+  register; serialised by `CMD_LOCK`.
+- `confine_device` / `confinement_selftest` — orchestrate the above; the only
+  raw work they do directly is zeroing a freshly-allocated page table and an
+  `sfence` (no memory-safety effect, orders prior stores).
+
+`confine_device`, `event_log_state`, and `bringup` are the safe entry points;
+all callers outside the arch layer (e.g. `task/mod.rs`) use them without `unsafe`.
+`// SAFETY:` comments present on every block.
 
 ---
 
