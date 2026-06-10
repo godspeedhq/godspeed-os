@@ -208,6 +208,8 @@ mod reg {
     pub const EVENT_LOG_BASE:    u64 = 0x0010;
     pub const CONTROL:           u64 = 0x0018;
     pub const EXT_FEATURE:       u64 = 0x0030;
+    pub const COMMAND_BUF_HEAD:  u64 = 0x2000;
+    pub const COMMAND_BUF_TAIL:  u64 = 0x2008;
     pub const EVENT_LOG_HEAD:    u64 = 0x2010;
     pub const EVENT_LOG_TAIL:    u64 = 0x2018;
     pub const STATUS:            u64 = 0x2020;
@@ -403,6 +405,193 @@ fn enable_passthrough(mmio_va: u64) {
             "iommu: WARN Phase 1c — enabled={} but event log advanced (head {:#x} tail {:#x})",
             enabled as u8, evt_head, evt_tail
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1d — per-device confinement: build an I/O page table for the driver's
+// DMA arena, point the device's DTE at it, invalidate the cached DTE.
+// ---------------------------------------------------------------------------
+//
+// AMD I/O page tables are a 4-level walk like x86-64, but each entry carries a
+// "Next Level" field (bits 11:9): a non-leaf entry names the level of the table
+// it points at; a leaf entry uses Next Level 0 and names a 4 KiB page. We build
+// a private table that identity-maps (IOVA == PA) only the arena pages, so the
+// device — programmed with the same physical addresses it always was — keeps
+// working, while any access outside the arena has no mapping and faults.
+
+const IO_PTE_PR: u64 = 1 << 0;   // present
+const IO_PTE_IR: u64 = 1 << 61;  // read permission
+const IO_PTE_IW: u64 = 1 << 62;  // write permission
+
+/// Domain ID assigned to confined USB controllers. Any non-zero ID distinct from
+/// the (unused) passthrough domain 0 works; one shared domain is fine since each
+/// controller only ever reaches its own arena.
+const CONFINED_DOMAIN: u64 = 1;
+
+/// Serialises command-buffer submission across cores (spawns may confine devices
+/// on different cores). Holds nothing — the buffer state lives in MMIO.
+static CMD_LOCK: crate::smp::spinlock::SpinLock<()> =
+    crate::smp::spinlock::SpinLock::new(());
+
+#[inline]
+fn io_idx(iova: u64, level: u32) -> u64 {
+    // level 4 -> bits 47:39, 3 -> 38:30, 2 -> 29:21, 1 -> 20:12.
+    (iova >> (12 + 9 * (level as u64 - 1))) & 0x1FF
+}
+
+/// Walk one level: return the child table's physical address, allocating + zeroing
+/// it (and writing the parent entry with the given `child_level`) if absent.
+///
+/// # Safety
+/// `table_va` must be a mapped 4 KiB I/O page table; `idx < 512`.
+unsafe fn io_walk_or_alloc(table_va: u64, idx: u64, child_level: u64, hhdm: u64) -> Option<u64> {
+    let slot = table_va + idx * 8;
+    // SAFETY: slot is within the mapped 4 KiB table (idx < 512).
+    let e = unsafe { core::ptr::read_volatile(slot as *const u64) };
+    if e & IO_PTE_PR != 0 {
+        return Some(e & PT_ROOT_MASK);
+    }
+    let child = crate::memory::allocator::alloc_contiguous(1)?;
+    // SAFETY: freshly allocated frame, HHDM-mapped; zero a full page.
+    unsafe { core::ptr::write_bytes(phys_to_virt(child, hhdm) as *mut u8, 0, 4096) };
+    let entry = IO_PTE_PR | IO_PTE_IR | IO_PTE_IW | (child & PT_ROOT_MASK) | (child_level << 9);
+    // SAFETY: slot in range; publishing the new non-leaf entry.
+    unsafe { core::ptr::write_volatile(slot as *mut u64, entry) };
+    Some(child)
+}
+
+/// Identity-map one 4 KiB page (IOVA == PA) into the 4-level table rooted at
+/// `l4_phys`, with read+write permission.
+///
+/// # Safety
+/// `l4_phys` must be a valid zeroed/maintained level-4 I/O page table.
+unsafe fn io_map_page(l4_phys: u64, addr: u64, hhdm: u64) -> bool {
+    // SAFETY: each level VA is the HHDM alias of a mapped table; indices < 512.
+    unsafe {
+        let l3 = match io_walk_or_alloc(phys_to_virt(l4_phys, hhdm), io_idx(addr, 4), 3, hhdm) {
+            Some(p) => p, None => return false,
+        };
+        let l2 = match io_walk_or_alloc(phys_to_virt(l3, hhdm), io_idx(addr, 3), 2, hhdm) {
+            Some(p) => p, None => return false,
+        };
+        let l1 = match io_walk_or_alloc(phys_to_virt(l2, hhdm), io_idx(addr, 2), 1, hhdm) {
+            Some(p) => p, None => return false,
+        };
+        let slot = phys_to_virt(l1, hhdm) + io_idx(addr, 1) * 8;
+        // Leaf: Next Level 0, page address, R/W.
+        let leaf = IO_PTE_PR | IO_PTE_IR | IO_PTE_IW | (addr & PT_ROOT_MASK);
+        core::ptr::write_volatile(slot as *mut u64, leaf);
+    }
+    true
+}
+
+/// Submit an INVALIDATE_DEVTAB_ENTRY (and an all-pages invalidate for the domain)
+/// and wait for the IOMMU to consume them, so a stale cached DTE/translation for
+/// `bdf` is dropped.
+///
+/// # Safety
+/// IOMMU must be enabled with a programmed command buffer (`bringup` ran).
+unsafe fn invalidate_device(mmio_va: u64, cmd_buf_va: u64, bdf: u32) {
+    let _g = CMD_LOCK.lock();
+    // Two 16-byte commands written at the current tail, then advance tail.
+    // SAFETY: command buffer is the mapped 4 KiB ring; tail register is valid.
+    unsafe {
+        let mut tail = mmio_read64(mmio_va, reg::COMMAND_BUF_TAIL) & 0xFFF;
+        // INVALIDATE_DEVTAB_ENTRY (opcode 0x2): dw0 = DeviceID.
+        let inval_dte = [(bdf & 0xFFFF) as u32, 0x2 << 28, 0, 0];
+        // INVALIDATE_IOMMU_PAGES (opcode 0x3), entire address space for our domain.
+        let inval_pages = [0u32, (CONFINED_DOMAIN as u32) | (0x3 << 28), 0xFFFF_F003, 0xFFFF_FFFF];
+        for cmd in [inval_dte, inval_pages] {
+            let slot = cmd_buf_va + tail;
+            for (i, w) in cmd.iter().enumerate() {
+                core::ptr::write_volatile((slot + (i as u64) * 4) as *mut u32, *w);
+            }
+            tail = (tail + 16) & 0xFFF;
+        }
+        core::arch::asm!("sfence", options(nostack, nomem, preserves_flags));
+        mmio_write64(mmio_va, reg::COMMAND_BUF_TAIL, tail);
+        // Poll head until it catches the tail (commands consumed), bounded.
+        for _ in 0..1_000_000 {
+            if mmio_read64(mmio_va, reg::COMMAND_BUF_HEAD) & 0xFFF == tail {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Confine a DMA-capable device (`bdf`) to its granted arena: build an I/O page
+/// table mapping only `[arena_phys, arena_phys+arena_len)` identity, switch the
+/// device's DTE from passthrough to that domain, and invalidate the cached DTE.
+/// Safe wrapper — all hardware `unsafe` is contained here (arch layer, §18.1).
+/// No-op (returns false) if the IOMMU is not enabled or `bdf` is invalid.
+pub fn confine_device(bdf: u32, arena_phys: u64, arena_len: u64) -> bool {
+    if !IOMMU_PRESENT.load(Ordering::Relaxed) || bdf == 0xFFFF || arena_len == 0 {
+        return false;
+    }
+    let mmio_va = IOMMU_MMIO_VA.load(Ordering::Relaxed);
+    let dt_va = DEV_TABLE_VA.load(Ordering::Relaxed);
+    let cmd_va_phys = CMD_BUF_PHYS.load(Ordering::Relaxed);
+    if mmio_va == 0 || dt_va == 0 || cmd_va_phys == 0 {
+        return false;
+    }
+    let hhdm = crate::arch::x86_64::page_tables::get_hhdm_offset();
+
+    // Build the I/O page table: a fresh level-4 root mapping only the arena.
+    let l4 = match crate::memory::allocator::alloc_contiguous(1) {
+        Some(p) => p,
+        None => { crate::kprintln!("iommu: confine WARN no frame for I/O page table root"); return false; }
+    };
+    // SAFETY: freshly allocated, HHDM-mapped; zero it.
+    unsafe { core::ptr::write_bytes(phys_to_virt(l4, hhdm) as *mut u8, 0, 4096) };
+
+    let first = arena_phys & !0xFFF;
+    let last = (arena_phys + arena_len - 1) & !0xFFF;
+    let mut pa = first;
+    while pa <= last {
+        // SAFETY: l4 is the zeroed root we just allocated; pa is page-aligned.
+        if !unsafe { io_map_page(l4, pa, hhdm) } {
+            crate::kprintln!("iommu: confine WARN failed mapping arena page {:#x}", pa);
+            return false;
+        }
+        pa += 0x1000;
+    }
+
+    // Switch the device's DTE to the confined domain: V|TV|mode=4|root, IR|IW.
+    let data0 = DTE_V | DTE_TV | (4u64 << DTE_MODE_SHIFT) | (l4 & PT_ROOT_MASK);
+    let data1 = CONFINED_DOMAIN | DTE_IR | DTE_IW;
+    // SAFETY: dt_va is the mapped device table; bdf < 65536 (16-bit BDF).
+    unsafe { write_dte(dt_va, bdf, data0, data1) };
+    // SAFETY: order the DTE write before the invalidation reads it.
+    unsafe { core::arch::asm!("sfence", options(nostack, nomem, preserves_flags)) };
+
+    // Drop the cached passthrough DTE so the new confined entry takes effect.
+    // SAFETY: IOMMU enabled in bringup; command buffer programmed.
+    unsafe { invalidate_device(mmio_va, phys_to_virt(cmd_va_phys, hhdm), bdf) };
+
+    let pages = (last - first) / 0x1000 + 1;
+    crate::kprintln!(
+        "iommu: confined BDF {:02x}:{:02x}.{} -> domain {} arena {:#x}..{:#x} ({} pages); DTE invalidated",
+        (bdf >> 8) & 0xff, (bdf >> 3) & 0x1f, bdf & 0x7,
+        CONFINED_DOMAIN, first, last + 0xFFF + 1, pages
+    );
+    true
+}
+
+/// Read the IOMMU event-log head/tail (for fault observation). Returns
+/// `(head, tail)` byte offsets; head != tail means fault events were logged.
+pub fn event_log_state() -> (u64, u64) {
+    let mmio_va = IOMMU_MMIO_VA.load(Ordering::Relaxed);
+    if mmio_va == 0 {
+        return (0, 0);
+    }
+    // SAFETY: mmio_va mapped in bringup; head/tail are valid registers.
+    unsafe {
+        (
+            mmio_read64(mmio_va, reg::EVENT_LOG_HEAD) & 0xFFF,
+            mmio_read64(mmio_va, reg::EVENT_LOG_TAIL) & 0xFFF,
+        )
     }
 }
 

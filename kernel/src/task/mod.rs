@@ -3060,6 +3060,19 @@ fn spawn_service_with_config(
                     "spawn[dma]: '{}' arena phys {:#x} -> VA {:#x} ({} KiB)",
                     name, phys, XHCI_DMA_VA, len / 1024
                 );
+                // H1 Phase 1d: confine this DMA-capable driver to its arena via
+                // the IOMMU, so a compromised driver cannot DMA outside it. No-op
+                // if no IOMMU is present (drivers then remain in the TCB).
+                {
+                    use core::sync::atomic::Ordering::Relaxed;
+                    use crate::arch::x86_64::pci;
+                    let bdf = if name == "xhci" {
+                        pci::XHCI_BDF.load(Relaxed)
+                    } else {
+                        pci::EHCI_BDF.load(Relaxed)
+                    };
+                    crate::arch::x86_64::iommu::confine_device(bdf, phys, len);
+                }
                 (XHCI_DMA_VA, phys, len)
             }
             None => {
