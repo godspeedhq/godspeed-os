@@ -189,3 +189,108 @@ pub fn detect(rsdp_addr: u64, hhdm: u64) {
         "iommu: H1 Phase 0 OK -> hardware supports DMA confinement; Phase 1 (translation) viable"
     );
 }
+
+// ===========================================================================
+// H1 Phase 1a — IOMMU MMIO bring-up + capability/feature register readout
+// ===========================================================================
+//
+// The IOMMU control interface is a block of memory-mapped registers at the base
+// the IVRS advertised. Before building any translation structures we map that
+// block (uncached, like the APIC) and read the Extended Feature Register and the
+// current control state. This proves the kernel can talk to the IOMMU and tells
+// us its capabilities (page-table levels, command/event-log support) — the facts
+// the later phases depend on. No structures are programmed yet.
+
+/// MMIO register offsets from the IOMMU base (AMD I/O Virtualization spec).
+mod reg {
+    pub const DEVICE_TABLE_BASE: u64 = 0x0000;
+    pub const COMMAND_BUF_BASE:  u64 = 0x0008;
+    pub const EVENT_LOG_BASE:    u64 = 0x0010;
+    pub const CONTROL:           u64 = 0x0018;
+    pub const EXT_FEATURE:       u64 = 0x0030;
+    pub const STATUS:            u64 = 0x2020;
+}
+
+/// Kernel virtual address the IOMMU MMIO block is mapped at (HHDM alias,
+/// re-mapped uncached). 0 until [`bringup`] runs.
+pub static IOMMU_MMIO_VA: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes of MMIO to map. The registers we use span 0x0000..0x2028, so four
+/// 4 KiB pages (0x4000) cover the whole control + head/tail register window.
+const IOMMU_MMIO_LEN: u64 = 0x4000;
+
+/// Read a 64-bit IOMMU MMIO register at `off`.
+///
+/// # Safety
+/// [`bringup`] must have mapped the MMIO block; `off + 8 <= IOMMU_MMIO_LEN`.
+#[inline]
+unsafe fn mmio_read64(va: u64, off: u64) -> u64 {
+    // SAFETY: va+off is inside the uncached IOMMU MMIO mapping established by
+    // bringup; aligned 64-bit volatile read of a hardware register.
+    unsafe { core::ptr::read_volatile((va + off) as *const u64) }
+}
+
+/// Map the IOMMU MMIO block and report its capabilities. Detection-and-readout
+/// only — programs nothing. Call after [`detect`]; no-op if no IOMMU was found.
+pub fn bringup(hhdm: u64) {
+    if !IOMMU_PRESENT.load(Ordering::Relaxed) {
+        return;
+    }
+    let phys = IOMMU_MMIO_BASE.load(Ordering::Relaxed);
+    if phys == 0 {
+        crate::kprintln!("iommu: IVRS gave no MMIO base; bring-up skipped");
+        return;
+    }
+
+    // Map the MMIO block at its HHDM alias, uncached (PCD|PWT) — exactly the
+    // APIC pattern in boot::init_local_apic. Limine's HHDM covers RAM but not
+    // MMIO, so we add the pages to the active tables ourselves.
+    let va = phys_to_virt(phys, hhdm);
+    {
+        use crate::arch::x86_64::page_tables::{map_in_active_tables, PageFlags};
+        let flags = PageFlags::PRESENT.bits()
+            | PageFlags::WRITABLE.bits()
+            | PageFlags::NO_EXEC.bits()
+            | PageFlags::PWT.bits()
+            | PageFlags::PCD.bits();
+        let mut off = 0u64;
+        while off < IOMMU_MMIO_LEN {
+            // SAFETY: called after set_hhdm_offset; va/phys page-aligned; the
+            // region is the IOMMU's MMIO window. Already-present is a no-op.
+            if let Err(_e) = unsafe { map_in_active_tables(va + off, phys + off, flags) } {
+                crate::kprintln!("iommu: WARN failed to map MMIO page at {:#x}", phys + off);
+            }
+            off += 0x1000;
+        }
+    }
+    IOMMU_MMIO_VA.store(va, Ordering::Relaxed);
+
+    // SAFETY: MMIO just mapped above; offsets are within IOMMU_MMIO_LEN.
+    let efr = unsafe { mmio_read64(va, reg::EXT_FEATURE) };
+    let control = unsafe { mmio_read64(va, reg::CONTROL) };
+    let status = unsafe { mmio_read64(va, reg::STATUS) };
+    let dev_tab = unsafe { mmio_read64(va, reg::DEVICE_TABLE_BASE) };
+    let cmd_buf = unsafe { mmio_read64(va, reg::COMMAND_BUF_BASE) };
+    let evt_log = unsafe { mmio_read64(va, reg::EVENT_LOG_BASE) };
+
+    // Host Address Translation Size (EFR[14:13]): 0 => 4-level, 1 => 5-level,
+    // 2 => 6-level I/O page tables. Determines the paging mode we set per DTE.
+    let hats = (efr >> 13) & 0x3;
+    let levels = match hats {
+        0 => 4,
+        1 => 5,
+        2 => 6,
+        _ => 0,
+    };
+    let iommu_enabled = control & 1 != 0;
+
+    crate::kprintln!(
+        "iommu: MMIO mapped at VA {:#x} (uncached); EFR={:#x} control={:#x} status={:#x}",
+        va, efr, control, status
+    );
+    crate::kprintln!(
+        "iommu: HATS={} -> {}-level I/O page tables; IommuEn={} (DTBR={:#x} CMDBR={:#x} ELBR={:#x})",
+        hats, levels, iommu_enabled as u8, dev_tab, cmd_buf, evt_log
+    );
+    crate::kprintln!("iommu: H1 Phase 1a OK -> MMIO reachable; capabilities read");
+}

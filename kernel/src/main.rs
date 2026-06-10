@@ -214,6 +214,8 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     // whether this machine can confine DMA-capable drivers to their granted
     // arena (the prerequisite for dropping xhci/ehci from the TCB).
     arch::x86_64::iommu::detect(boot_info.rsdp_addr, boot_info.hhdm_offset);
+    // H1 Phase 1a: if an IOMMU was found, map its MMIO and read capabilities.
+    arch::x86_64::iommu::bringup(boot_info.hhdm_offset);
 
     arch::x86_64::init_timer();
     arch::x86_64::com2_init();
