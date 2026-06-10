@@ -135,6 +135,7 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | arch/x86_64/context_switch.rs | 11 | permitted |
 | arch/x86_64/fb.rs | 3 | permitted |
 | arch/x86_64/interrupts.rs | 13 | permitted |
+| arch/x86_64/iommu.rs | 18 | permitted |
 | arch/x86_64/mod.rs | 34 | permitted |
 | arch/x86_64/page_tables.rs | 35 | permitted |
 | arch/x86_64/pci.rs | 5 | permitted |
@@ -158,9 +159,16 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | task/scheduler.rs | 37 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 276 lines across 20 files  
+**Permitted total:** 294 lines across 21 files  
 **Grandfathered total:** 53 lines across 6 files  
-**Grand total:** 329 lines across 26 files
+**Grand total:** 347 lines across 27 files
+
+> **2026-06-10** (branch `feat/iommu-dma-confinement`). New file `arch/x86_64/iommu.rs`
+> (+18, permitted): the H1 Phase 0 AMD-Vi IOMMU detection probe. All 18 unsafe lines
+> are raw reads of firmware ACPI tables (RSDP → RSDT/XSDT → IVRS) through the HHDM,
+> each carrying a `// SAFETY:` argument that the address lies in a Limine-mapped ACPI
+> table and the read is in-bounds of that table's length field. Detection only — no
+> behaviour change. See the `arch/x86_64/iommu.rs` entry below.
 
 > **Reconciled 2026-05-31** (branch `verify/static-analysis-unsafe-audit`). The
 > permitted-layer growth since the prior baseline is from the AMD GX-420GI ring-3 /
@@ -271,6 +279,29 @@ re-enabling them. Sound because IF=0 satisfies `deliver`'s calling convention;
 the surrounding `disable_interrupts()` / `enable_interrupts()` calls are safe
 arch functions; EOI inside `deliver` is idempotent outside a real hardware
 interrupt. Used only by the `FIRE_IRQ` COM2 control command (§22 Tests IR1A/IR1B).
+
+---
+
+### arch/x86_64/iommu.rs
+
+AMD-Vi IOMMU detection (H1 Phase 0). All 18 unsafe lines are raw reads of
+firmware ACPI tables — the RSDP, the RSDT/XSDT, and the IVRS — through the HHDM.
+The helpers `read_bytes`, `read32`, `read64` are `unsafe fn`; `detect` calls them
+at every step. Each block is sound because:
+
+- The RSDP virtual address comes from Limine's `RsdpRequest`, which points at a
+  table Limine keeps mapped in the HHDM; the signature is checked before any
+  further read.
+- Every subsequent table is reached only through a physical pointer that lives
+  inside an already-validated parent table, converted to a virtual address via
+  the HHDM (`hhdm + phys`), which Limine maps for all usable + ACPI memory.
+- Each read stays within the table's own length field (`sdt_len`, `ivrs_len`),
+  and the IVHD walk advances by the block's self-reported length and stops on a
+  zero length, so it cannot run off the end or loop forever.
+
+Detection only — no behaviour change, no writes, no device programming. The
+results are published in two atomics (`IOMMU_PRESENT`, `IOMMU_MMIO_BASE`) for the
+future Phase 1 translation setup. `// SAFETY:` comments present on every block.
 
 ---
 

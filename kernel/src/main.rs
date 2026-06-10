@@ -210,6 +210,11 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     // MMIO base + IRQ for a future userspace driver's hw_mmio/hw_interrupt caps.
     arch::x86_64::pci::init();
 
+    // H1 Phase 0: probe ACPI for an AMD-Vi IOMMU (IVRS). Detection only — reports
+    // whether this machine can confine DMA-capable drivers to their granted
+    // arena (the prerequisite for dropping xhci/ehci from the TCB).
+    arch::x86_64::iommu::detect(boot_info.rsdp_addr, boot_info.hhdm_offset);
+
     arch::x86_64::init_timer();
     arch::x86_64::com2_init();
     // COM1 RX is polled from the core-0 timer ISR (uart_rx_poll every 10 ms).
