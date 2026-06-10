@@ -208,8 +208,15 @@ mod reg {
     pub const EVENT_LOG_BASE:    u64 = 0x0010;
     pub const CONTROL:           u64 = 0x0018;
     pub const EXT_FEATURE:       u64 = 0x0030;
+    pub const EVENT_LOG_HEAD:    u64 = 0x2010;
+    pub const EVENT_LOG_TAIL:    u64 = 0x2018;
     pub const STATUS:            u64 = 0x2020;
 }
+
+/// Control register (offset 0x18) enable bits — AMD-Vi spec / Linux amd_iommu.
+const CTRL_IOMMU_EN:  u64 = 1 << 0;  // master translation enable
+const CTRL_EVT_LOG_EN: u64 = 1 << 2; // event logging enable
+const CTRL_CMD_BUF_EN: u64 = 1 << 12; // command buffer enable
 
 /// Kernel virtual address the IOMMU MMIO block is mapped at (HHDM alias,
 /// re-mapped uncached). 0 until [`bringup`] runs.
@@ -362,6 +369,43 @@ fn setup_structures(hhdm: u64, mmio_va: u64) -> bool {
     true
 }
 
+/// Turn translation on with every device in passthrough. Enables the command
+/// buffer + event log first, then the master IOMMU enable. After this every
+/// upstream DMA is checked against the device table — but since all entries are
+/// passthrough, nothing's behaviour changes; this just proves the engine runs.
+fn enable_passthrough(mmio_va: u64) {
+    // SAFETY: mmio_va mapped in bringup; control/status are valid registers.
+    unsafe {
+        // Enable command buffer + event log, then the master enable. A short
+        // read-back between writes orders them on the device side.
+        mmio_write64(mmio_va, reg::CONTROL, CTRL_CMD_BUF_EN | CTRL_EVT_LOG_EN);
+        let _ = mmio_read64(mmio_va, reg::CONTROL);
+        mmio_write64(mmio_va, reg::CONTROL, CTRL_CMD_BUF_EN | CTRL_EVT_LOG_EN | CTRL_IOMMU_EN);
+    }
+
+    // SAFETY: registers valid; read back to confirm the enable took.
+    let control = unsafe { mmio_read64(mmio_va, reg::CONTROL) };
+    let status = unsafe { mmio_read64(mmio_va, reg::STATUS) };
+    let evt_head = unsafe { mmio_read64(mmio_va, reg::EVENT_LOG_HEAD) };
+    let evt_tail = unsafe { mmio_read64(mmio_va, reg::EVENT_LOG_TAIL) };
+
+    let enabled = control & CTRL_IOMMU_EN != 0;
+    crate::kprintln!(
+        "iommu: enable -> control={:#x} (IommuEn={}) status={:#x} evtlog head={:#x} tail={:#x}",
+        control, enabled as u8, status, evt_head, evt_tail
+    );
+    if enabled && evt_tail == evt_head {
+        crate::kprintln!(
+            "iommu: H1 Phase 1c OK -> translation ON, all-passthrough, zero fault events"
+        );
+    } else {
+        crate::kprintln!(
+            "iommu: WARN Phase 1c — enabled={} but event log advanced (head {:#x} tail {:#x})",
+            enabled as u8, evt_head, evt_tail
+        );
+    }
+}
+
 /// Map the IOMMU MMIO block and report its capabilities. Detection-and-readout
 /// only — programs nothing. Call after [`detect`]; no-op if no IOMMU was found.
 pub fn bringup(hhdm: u64) {
@@ -427,5 +471,8 @@ pub fn bringup(hhdm: u64) {
     crate::kprintln!("iommu: H1 Phase 1a OK -> MMIO reachable; capabilities read");
 
     // Phase 1b: allocate + program the device table, command buffer, event log.
-    setup_structures(hhdm, va);
+    // Phase 1c: enable translation (all-passthrough) once they're in place.
+    if setup_structures(hhdm, va) {
+        enable_passthrough(va);
+    }
 }
