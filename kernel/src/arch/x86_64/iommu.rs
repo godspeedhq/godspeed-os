@@ -812,6 +812,7 @@ pub fn drain_event_log() -> u32 {
         let code = (dw1 >> 28) & 0xF;
         let addr = ((dw3 as u64) << 32) | (dw2 as u64);
         FAULT_LAST_CODE.store(code, Ordering::Relaxed);
+        FAULT_LAST_DW1.store(dw1, Ordering::Relaxed);
         if devid == xhci_bdf {
             XHCI_FAULTS.fetch_add(1, Ordering::Relaxed);
             XHCI_LAST_ADDR.store(addr, Ordering::Relaxed);
@@ -841,12 +842,18 @@ pub fn drain_event_log() -> u32 {
         let ov = FAULT_OVERFLOWS.load(Ordering::Relaxed);
         let total = xf + ef + of;
         if total > FAULT_REPORTED.load(Ordering::Relaxed) {
+            // IO_PAGE_FAULT flags (dw1): bit19=I, bit18=PR(present), bit17=RW
+            // (1=write), bit16=PE(perm), bit5=TR(translation req), bit3=RZ. The
+            // RW + PR bits say whether the controller was reading or writing and
+            // whether the page was simply absent vs a permission fault.
+            let dw1 = FAULT_LAST_DW1.load(Ordering::Relaxed);
             crate::kprintln!(
-                "iommu faults: xhci={} (last {:#x}) ehci={} (last {:#x}) other={} (dev={:#x} {:#x}) overflow={} code={:#x}",
+                "iommu faults: xhci={} (last {:#x}) ehci={} (last {:#x}) other={} (dev={:#x} {:#x}) overflow={} code={:#x} flags(dw1)={:#010x} rw={} pr={}",
                 xf, XHCI_LAST_ADDR.load(Ordering::Relaxed),
                 ef, EHCI_LAST_ADDR.load(Ordering::Relaxed),
                 of, OTHER_LAST_DEV.load(Ordering::Relaxed), OTHER_LAST_ADDR.load(Ordering::Relaxed),
-                ov, FAULT_LAST_CODE.load(Ordering::Relaxed)
+                ov, FAULT_LAST_CODE.load(Ordering::Relaxed),
+                dw1, (dw1 >> 17) & 1, (dw1 >> 18) & 1
             );
             FAULT_REPORTED.store(total, Ordering::Relaxed);
         }
@@ -866,6 +873,7 @@ static OTHER_LAST_ADDR: AtomicU64 = AtomicU64::new(0);
 static OTHER_LAST_DEV: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static FAULT_THROTTLE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static FAULT_LAST_CODE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static FAULT_LAST_DW1: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Read the IOMMU event-log head/tail (for fault observation). Returns
 /// `(head, tail)` byte offsets; head != tail means fault events were logged.

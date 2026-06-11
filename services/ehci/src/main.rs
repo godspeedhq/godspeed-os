@@ -93,6 +93,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     } else {
         ctx.log("ehci: WARN — controller did not leave halted state after run");
     }
+    // Diagnostic (H1): dump the schedule registers after reset+run. If the IOMMU
+    // is faulting on a garbage 0xffffffc0 pointer, one of these (or the schedule
+    // they point at) is the source — e.g. an uninitialised PERIODICLISTBASE the
+    // controller is walking, or a stale ASYNCLISTADDR.
+    ctx.log_fmt(format_args!(
+        "ehci: sched regs USBCMD={:#010x} USBSTS={:#010x} ASYNCLIST={:#010x} PERIODICLIST={:#010x}",
+        mmio.read32(op + OP_USBCMD), mmio.read32(op + OP_USBSTS),
+        mmio.read32(op + 0x18), mmio.read32(op + 0x14)
+    ));
 
     // Port census: with the controller running and CONFIGFLAG set, a device on a
     // back socket should now read connected=1. PORTSC is one 32-bit reg per port.
