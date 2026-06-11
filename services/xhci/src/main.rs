@@ -47,6 +47,16 @@ const INPUT_CTX_OFF: usize = 0x4000;  // transient: built per device for Address
 const DATA_BUF_OFF: usize = 0x5000;   // transient: control-transfer data during enumeration
 const CONFIG_BUF_OFF: usize = 0x6000; // transient: config descriptor during enumeration
 
+// Scratchpad: the controller's own runtime DMA workspace. DCBAA[0] points at the
+// Scratchpad Buffer Array (SBA) — an array of physical pointers to N page-aligned
+// scratchpad buffers, where N = HCSPARAMS2.MaxScratchpadBufs. Real AMD xHCI needs
+// 256 of them and malfunctions (devices drop, re-enumerate) without them. The SBA
+// lives at arena page 15; the buffers occupy pages 16.. (the arena's tail, sized
+// for this in the kernel's XHCI_DMA_PAGES).
+const SCRATCHPAD_SBA_OFF: usize = 0xF000;
+const SCRATCHPAD_BUF_BASE: usize = 0x10000;
+const MAX_SCRATCHPAD: usize = 256; // arena room = XHCI_DMA_PAGES (272) - 16
+
 /// Maximum HID devices bound on one controller at once (keyboard + mouse).
 const MAX_HID: usize = 2;
 const DEV_BASE: usize = 0x7000;
@@ -631,6 +641,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         });
         // Rebuild DMA structures + run.
         dma.zero();
+        // Scratchpad: build the SBA (N pointers to page-aligned buffers) and point
+        // DCBAA[0] at it, so the controller has the runtime workspace it requires
+        // (MaxScratchpadBufs); without it real xHCI drops devices after binding.
+        let n_scratch = (max_scratch as usize).min(MAX_SCRATCHPAD);
+        if n_scratch > 0 {
+            for i in 0..n_scratch {
+                dma.write64(
+                    SCRATCHPAD_SBA_OFF + i * 8,
+                    dma.phys_at(SCRATCHPAD_BUF_BASE + i * 0x1000),
+                );
+            }
+            dma.write64(DCBAA_OFF, dma.phys_at(SCRATCHPAD_SBA_OFF));
+        }
         mmio.write64(op + OP_DCBAAP, dma.phys_at(DCBAA_OFF));
         mmio.write64(op + OP_CRCR, dma.phys_at(CMD_RING_OFF) | 1);
         dma.write64(ERST_OFF, dma.phys_at(EVENT_RING_OFF));

@@ -138,9 +138,13 @@ const XHCI_MMIO_PAGES:     u64 = 16;
 
 /// VA where the driver's physically-contiguous DMA arena is mapped (8 GiB).
 pub const XHCI_DMA_VA:     u64 = 0x2_0000_0000;
-/// Pages of contiguous DMA memory for the xHCI driver (64 KiB: command/event
-/// rings, device-context base array, ERST, scratchpad array).
-const XHCI_DMA_PAGES:      u64 = 16;
+/// Pages of contiguous DMA memory for a USB driver. The first 16 pages hold the
+/// control structures (command/event rings, DCBAA, ERST, per-device slices, plus
+/// the scratchpad buffer array at page 15); the remaining 256 pages are the xHCI
+/// scratchpad buffers the controller DMAs into (real AMD xHCI reports
+/// MaxScratchpadBufs=256 — 1 MiB — and malfunctions without them). EHCI ignores
+/// the tail. Confined identity-mapped, so the device reaches all of it (§12, H1).
+const XHCI_DMA_PAGES:      u64 = 16 + 256;
 
 /// Maximum named send peers per service.
 pub const MAX_SEND_PEERS:  usize = 4;
