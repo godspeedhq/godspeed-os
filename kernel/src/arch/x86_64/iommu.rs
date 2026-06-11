@@ -321,13 +321,16 @@ fn setup_structures(hhdm: u64, mmio_va: u64) -> bool {
         }
     };
     let dt_va = phys_to_virt(dt_phys, hhdm);
-    // Default every DTE to passthrough: V=1, TV=0, mode=0, IR=1, IW=1. Untranslated
-    // access with full permission — the disk and all non-USB devices keep working
-    // once the IOMMU is enabled. The USB controllers are switched to a confined
-    // domain in Phase 1c. V/IR/IW all live in data[0]; data[1]=0 (domain 0).
+    // Default every DTE to passthrough using the canonical AMD-Vi identity
+    // encoding: V=1, TV=1, mode=0, page-table-root=0, IR=1, IW=1 (this is exactly
+    // Linux amd_iommu's PAGE_MODE_NONE passthrough). mode=0 with TV=1 means "no
+    // translation, GPA passed straight through" — the IOMMU walks no page table.
+    // (The earlier V=1,TV=0 encoding was NOT transparent on this hardware: it
+    // broke the firmware-co-owned EHCI controller even in passthrough.) The USB
+    // controllers are switched to a confined domain in Phase 1d.
     for bdf in 0..DEV_TABLE_ENTRIES {
         // SAFETY: dt_va is the freshly-allocated mapped table; bdf in range.
-        unsafe { write_dte(dt_va, bdf as u32, DTE_V | DTE_IR | DTE_IW, 0) };
+        unsafe { write_dte(dt_va, bdf as u32, DTE_V | DTE_TV | DTE_IR | DTE_IW, 0) };
     }
 
     // --- Command buffer + event log: one 4 KiB frame each ---
@@ -731,10 +734,10 @@ pub fn release_device(bdf: u32) -> bool {
     }
     let hhdm = crate::arch::x86_64::page_tables::get_hhdm_offset();
 
-    // Revert the DTE to passthrough (V|IR|IW in data[0]; data[1]=0), order it,
-    // then invalidate so the device no longer reaches the (freed) I/O page table.
+    // Revert the DTE to the canonical passthrough encoding (V|TV|mode=0|IR|IW),
+    // order it, then invalidate so the device no longer reaches the freed table.
     // SAFETY: dt_va is the mapped device table; bdf < 65536.
-    unsafe { write_dte(dt_va, bdf, DTE_V | DTE_IR | DTE_IW, 0) };
+    unsafe { write_dte(dt_va, bdf, DTE_V | DTE_TV | DTE_IR | DTE_IW, 0) };
     // SAFETY: order the DTE write before invalidation/free.
     unsafe { core::arch::asm!("sfence", options(nostack, nomem, preserves_flags)) };
     // SAFETY: IOMMU enabled; command buffer programmed.
