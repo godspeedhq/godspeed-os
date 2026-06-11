@@ -154,13 +154,18 @@ pub const CONFINE_USB_DRIVERS: bool = true;
 
 /// VA where the driver's physically-contiguous DMA arena is mapped (8 GiB).
 pub const XHCI_DMA_VA:     u64 = 0x2_0000_0000;
-/// Pages of contiguous DMA memory for a USB driver. The first 16 pages hold the
-/// control structures (command/event rings, DCBAA, ERST, per-device slices, plus
-/// the scratchpad buffer array at page 15); the remaining 256 pages are the xHCI
-/// scratchpad buffers the controller DMAs into (real AMD xHCI reports
-/// MaxScratchpadBufs=256 — 1 MiB — and malfunctions without them). EHCI ignores
-/// the tail. Confined identity-mapped, so the device reaches all of it (§12, H1).
+/// Pages of contiguous DMA memory for the **xHCI** driver. The first 16 pages
+/// hold the control structures (command/event rings, DCBAA, ERST, per-device
+/// slices, plus the scratchpad buffer array at page 15); the remaining 256 pages
+/// are the scratchpad buffers the controller DMAs into (real AMD xHCI reports
+/// MaxScratchpadBufs=256 — 1 MiB — and malfunctions without them). Confined
+/// identity-mapped, so the device reaches all of it (§12, H1).
 const XHCI_DMA_PAGES:      u64 = 16 + 256;
+/// Pages of contiguous DMA memory for the **EHCI** driver — 64 KiB, as on main.
+/// EHCI has no scratchpad concept, and its driver zeroes the whole arena on every
+/// control transfer; giving it the xHCI-sized 1 MiB arena (a leftover of sharing
+/// one constant) regressed back-port enumeration. Keep it small and separate.
+const EHCI_DMA_PAGES:      u64 = 16;
 
 /// Maximum named send peers per service.
 pub const MAX_SEND_PEERS:  usize = 4;
@@ -3062,20 +3067,23 @@ fn spawn_service_with_config(
         (name == "xhci" && pci::XHCI_FOUND.load(Relaxed))
             || (name == "ehci" && pci::EHCI_FOUND.load(Relaxed))
     };
+    // Per-driver arena size: xHCI needs room for its 256 scratchpad buffers;
+    // EHCI gets the small 64 KiB arena it had on main (see the constants above).
+    let dma_pages = if name == "ehci" { EHCI_DMA_PAGES } else { XHCI_DMA_PAGES };
     let (xhci_dma_va, xhci_dma_phys, xhci_dma_len) = if dma_for_driver {
-        match crate::memory::allocator::alloc_contiguous(XHCI_DMA_PAGES as usize) {
+        match crate::memory::allocator::alloc_contiguous(dma_pages as usize) {
             Some(phys) => {
                 let flags = PageFlags::PRESENT
                     | PageFlags::WRITABLE
                     | PageFlags::USER
                     | PageFlags::NO_EXEC;
-                for i in 0..XHCI_DMA_PAGES {
+                for i in 0..dma_pages {
                     let off = i * PAGE_SIZE as u64;
                     page_table
                         .map(VirtAddr(XHCI_DMA_VA + off), PhysAddr(phys + off), flags)
                         .map_err(|_| SpawnError::MapFailed)?;
                 }
-                let len = XHCI_DMA_PAGES * PAGE_SIZE as u64;
+                let len = dma_pages * PAGE_SIZE as u64;
                 crate::kprintln!(
                     "spawn[dma]: '{}' arena phys {:#x} -> VA {:#x} ({} KiB)",
                     name, phys, XHCI_DMA_VA, len / 1024
