@@ -96,6 +96,118 @@ fn config_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
     }
 }
 
+/// Write one 32-bit dword to PCI config space (mechanism #1). `offset` is
+/// dword-aligned (low two bits ignored).
+fn config_write32(bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
+    let addr = 0x8000_0000u32
+        | ((bus as u32) << 16)
+        | ((dev as u32) << 11)
+        | ((func as u32) << 8)
+        | ((offset as u32) & 0xFC);
+    // SAFETY: standard PCI config mechanism #1; ring-0 port I/O.
+    unsafe {
+        outl(CONFIG_ADDRESS, addr);
+        outl(CONFIG_DATA, val);
+    }
+}
+
+/// Take ownership of the EHCI controller from the firmware (BIOS→OS handoff).
+///
+/// EHCI's HCCPARAMS register (MMIO capability offset 0x08) carries the EHCI
+/// Extended Capabilities Pointer (EECP) — an offset into *PCI config space*
+/// (not MMIO) where a capability list lives. The USB Legacy Support capability
+/// (ID 0x01) has a BIOS-Owned and an OS-Owned semaphore. Until the OS sets
+/// OS-Owned and the firmware clears BIOS-Owned, the firmware (SMM) keeps poking
+/// the controller and running its own periodic schedule out of firmware memory.
+///
+/// Without an IOMMU that firmware DMA was invisible. With H1 confinement it
+/// faults (the firmware buffers are outside the driver's arena) and breaks the
+/// back-port keyboard. This handoff makes the firmware release the controller —
+/// standard OS behaviour at init. EECP lives in PCI config space, which the
+/// userspace `ehci` driver cannot reach, so the kernel must do it. Idempotent;
+/// no-op if no EHCI, no extended caps, or no USB Legacy Support capability.
+pub fn ehci_bios_handoff() {
+    if !EHCI_FOUND.load(Ordering::Relaxed) {
+        return;
+    }
+    let mmio = EHCI_MMIO_BASE.load(Ordering::Relaxed);
+    let bdf = EHCI_BDF.load(Ordering::Relaxed);
+    if mmio == 0 || bdf == 0xFFFF {
+        return;
+    }
+    let bus = ((bdf >> 8) & 0xff) as u8;
+    let dev = ((bdf >> 3) & 0x1f) as u8;
+    let func = (bdf & 0x7) as u8;
+
+    // Read HCCPARAMS (MMIO cap offset 0x08) to extract the EECP. Map the MMIO
+    // page uncached (PCD|PWT), like the APIC/IOMMU, since the HHDM covers RAM
+    // but not MMIO.
+    let hhdm = crate::arch::x86_64::page_tables::get_hhdm_offset();
+    let va = hhdm + (mmio & !0xFFF);
+    {
+        use crate::arch::x86_64::page_tables::{map_in_active_tables, PageFlags};
+        let flags = PageFlags::PRESENT.bits()
+            | PageFlags::WRITABLE.bits()
+            | PageFlags::NO_EXEC.bits()
+            | PageFlags::PWT.bits()
+            | PageFlags::PCD.bits();
+        // SAFETY: called after set_hhdm_offset; mapping the EHCI MMIO page
+        // (page-aligned). Already-present is a no-op.
+        if unsafe { map_in_active_tables(va, mmio & !0xFFF, flags) }.is_err() {
+            crate::kprintln!("ehci-handoff: WARN could not map MMIO {:#x}", mmio);
+            return;
+        }
+    }
+    let hccparams_va = hhdm + mmio + 0x08;
+    // SAFETY: HCCPARAMS is within the mapped MMIO page; aligned 32-bit read.
+    let hccparams = unsafe { core::ptr::read_volatile(hccparams_va as *const u32) };
+    let eecp = ((hccparams >> 8) & 0xFF) as u8;
+    if eecp < 0x40 {
+        crate::kprintln!("ehci-handoff: no extended capabilities (eecp={:#x})", eecp);
+        return;
+    }
+
+    // Walk the PCI-config extended-capability list for USB Legacy Support (ID 1).
+    let mut ptr = eecp;
+    let mut guard = 16; // cap lists are short; bound the walk
+    while ptr >= 0x40 && guard > 0 {
+        guard -= 1;
+        let cap = config_read32(bus, dev, func, ptr);
+        let cap_id = cap & 0xFF;
+        if cap_id == 0x01 {
+            // USBLEGSUP at `ptr`: bit16 = HC BIOS Owned, bit24 = HC OS Owned.
+            if cap & (1 << 16) != 0 {
+                // Claim OS ownership and wait for the firmware to release.
+                config_write32(bus, dev, func, ptr, cap | (1 << 24));
+                let mut ok = false;
+                for _ in 0..1_000_000u32 {
+                    let v = config_read32(bus, dev, func, ptr);
+                    if v & (1 << 16) == 0 {
+                        ok = true;
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+                crate::kprintln!(
+                    "ehci-handoff: USBLEGSUP@{:#x} OS-owned, BIOS released={} (was {:#010x})",
+                    ptr, ok as u8, cap
+                );
+            } else {
+                crate::kprintln!("ehci-handoff: already OS-owned (USBLEGSUP={:#010x})", cap);
+            }
+            // Disable all firmware SMIs on this controller (USBLEGCTLSTS at ptr+4).
+            config_write32(bus, dev, func, ptr + 4, 0);
+            return;
+        }
+        let next = ((cap >> 8) & 0xFF) as u8;
+        if next == 0 {
+            break;
+        }
+        ptr = next;
+    }
+    crate::kprintln!("ehci-handoff: no USB Legacy Support capability found");
+}
+
 /// Scan the PCI bus for the xHCI controller and record its MMIO base + IRQ.
 /// Called once on the BSP during boot. Logs the result either way.
 pub fn init() {

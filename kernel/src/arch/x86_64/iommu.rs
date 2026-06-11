@@ -764,6 +764,25 @@ pub fn drain_event_log() -> u32 {
     let hhdm = crate::arch::x86_64::page_tables::get_hhdm_offset();
     let evt_va = phys_to_virt(evt_phys, hhdm);
 
+    // Recover from event-log overflow (status bit 0): if more faults arrived than
+    // the 256-entry ring holds, the IOMMU sets EventOverflow and stops logging.
+    // Clear it (disable EvtLogEn, write-1-to-clear the status bit, reset head/tail,
+    // re-enable) so logging resumes — otherwise fault counts silently cap out.
+    // SAFETY: mmio_va mapped in bringup; status/control/head/tail are valid regs.
+    let status = unsafe { mmio_read64(mmio_va, reg::STATUS) };
+    if status & 1 != 0 {
+        unsafe {
+            let ctrl = mmio_read64(mmio_va, reg::CONTROL);
+            mmio_write64(mmio_va, reg::CONTROL, ctrl & !CTRL_EVT_LOG_EN);
+            mmio_write64(mmio_va, reg::STATUS, 1); // RW1C: clear EventOverflow
+            mmio_write64(mmio_va, reg::EVENT_LOG_HEAD, 0);
+            mmio_write64(mmio_va, reg::EVENT_LOG_TAIL, 0);
+            mmio_write64(mmio_va, reg::CONTROL, ctrl | CTRL_EVT_LOG_EN);
+        }
+        crate::kprintln!("iommu: WARN event-log overflowed — recovered (fault rate exceeds drain)");
+        return 0;
+    }
+
     // SAFETY: mmio_va mapped in bringup; head/tail are valid registers.
     let mut head = unsafe { mmio_read64(mmio_va, reg::EVENT_LOG_HEAD) } & 0xFFF;
     let tail = unsafe { mmio_read64(mmio_va, reg::EVENT_LOG_TAIL) } & 0xFFF;
