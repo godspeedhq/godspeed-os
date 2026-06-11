@@ -136,14 +136,21 @@ pub const XHCI_MMIO_VA:    u64 = 0x1_0000_0000;
 /// Pages of MMIO to map for the xHCI BAR (64 KiB — cap/op/runtime/doorbell regs).
 const XHCI_MMIO_PAGES:     u64 = 16;
 
-/// Master switch for IOMMU confinement of the USB drivers (H1). When false the
-/// USB stack behaves exactly as it did before the H1 branch: no BIOS→OS handoff,
-/// no confinement, controllers firmware-co-owned — the configuration in which
-/// BOTH keyboards work. When true, xHCI is handed off + confined (proven on
-/// hardware: a confined keyboard types). Default OFF as the working daily-driver
-/// config; flip to true to re-enable the confinement flagship. EHCI is never
-/// confined yet regardless (controller stale-pointer quirk — see docs/iommu.md).
-pub const CONFINE_USB_DRIVERS: bool = false;
+/// Master switch for IOMMU confinement of the USB drivers (H1).
+///
+/// `true`  → xHCI is handed off (BIOS→OS) + confined: the proven flagship — a
+///           confined front-port keyboard types on hardware. EHCI stays in
+///           passthrough (controller stale-pointer quirk, docs/iommu.md).
+/// `false` → no handoff, no confinement. Counter-intuitively this does NOT
+///           restore a working keyboard: without the handoff firmware and the
+///           driver contend for xHCI and Enable Slot never completes. So the
+///           clean "both keyboards work" config is **main** (this branch is not
+///           merged), not this switch off.
+///
+/// Default `true`: keep the flagship live + the front keyboard working. For a
+/// fully-working daily machine use a `main` build. EHCI dual-keyboard support on
+/// this branch is parked, well-characterised future work.
+pub const CONFINE_USB_DRIVERS: bool = true;
 
 /// VA where the driver's physically-contiguous DMA arena is mapped (8 GiB).
 pub const XHCI_DMA_VA:     u64 = 0x2_0000_0000;
