@@ -224,6 +224,10 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     if task::CONFINE_USB_DRIVERS {
         arch::x86_64::pci::xhci_bios_handoff();
     }
+    // Report whether the EHCI controller supports a PCI Function-Level Reset — the
+    // candidate for scrubbing its stale firmware-era internal state (which HCRESET
+    // doesn't clear) so it can run firmware-independent. Detection only.
+    arch::x86_64::pci::ehci_flr_probe();
 
     // H1 Phase 0: probe ACPI for an AMD-Vi IOMMU (IVRS). Detection only — reports
     // whether this machine can confine DMA-capable drivers to their granted

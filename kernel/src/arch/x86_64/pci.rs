@@ -313,6 +313,60 @@ pub fn xhci_bios_handoff() {
     crate::kprintln!("xhci-handoff: no USB Legacy Support capability found");
 }
 
+/// Report whether the EHCI controller supports a PCI Function-Level Reset (FLR),
+/// and dump its PCI capability list. FLR is a bit in the PCI Express capability's
+/// Device Capabilities register (bit 28); performing it (Device Control bit 15)
+/// resets the function far more thoroughly than the EHCI `HCRESET`, which on this
+/// machine does not scrub the controller's stale firmware-era internal DMA state.
+/// Detection only — does not perform the reset. No-op if no EHCI.
+pub fn ehci_flr_probe() {
+    if !EHCI_FOUND.load(Ordering::Relaxed) {
+        return;
+    }
+    let bdf = EHCI_BDF.load(Ordering::Relaxed);
+    if bdf == 0xFFFF {
+        return;
+    }
+    let bus = ((bdf >> 8) & 0xff) as u8;
+    let dev = ((bdf >> 3) & 0x1f) as u8;
+    let func = (bdf & 0x7) as u8;
+
+    // Status register (offset 0x06) bit 4 = capabilities list present.
+    let status = (config_read32(bus, dev, func, 0x04) >> 16) as u16;
+    if status & (1 << 4) == 0 {
+        crate::kprintln!("ehci-flr: no PCI capability list -> no PCIe cap -> no FLR");
+        return;
+    }
+    // Walk the capability list from the Capabilities Pointer (offset 0x34, low byte).
+    let mut cap = (config_read32(bus, dev, func, 0x34) & 0xFC) as u8;
+    let mut guard = 48;
+    let mut found_pcie = false;
+    while cap >= 0x40 && guard > 0 {
+        guard -= 1;
+        let hdr = config_read32(bus, dev, func, cap);
+        let cap_id = (hdr & 0xFF) as u8;
+        let next = ((hdr >> 8) & 0xFF) as u8;
+        crate::kprintln!("ehci-flr: cap@{:#04x} id={:#04x}", cap, cap_id);
+        if cap_id == 0x10 {
+            // PCI Express capability. Device Capabilities at cap+0x04; FLR = bit 28.
+            found_pcie = true;
+            let dev_cap = config_read32(bus, dev, func, cap + 0x04);
+            let flr = (dev_cap >> 28) & 1;
+            crate::kprintln!(
+                "ehci-flr: PCIe cap@{:#04x} DevCap={:#010x} FLR_supported={}",
+                cap, dev_cap, flr
+            );
+        }
+        if next == 0 {
+            break;
+        }
+        cap = next;
+    }
+    if !found_pcie {
+        crate::kprintln!("ehci-flr: no PCI Express capability (legacy-PCI function) -> no FLR");
+    }
+}
+
 /// Scan the PCI bus for the xHCI controller and record its MMIO base + IRQ.
 /// Called once on the BSP during boot. Logs the result either way.
 pub fn init() {
