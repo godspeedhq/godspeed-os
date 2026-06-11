@@ -151,11 +151,12 @@ const XHCI_MMIO_PAGES:     u64 = 16;
 /// fully-working daily machine use a `main` build. EHCI dual-keyboard support on
 /// this branch is parked, well-characterised future work.
 ///
-/// TEMPORARILY `false` to settle handoff-vs-IOMMU for EHCI: no xHCI handoff, IOMMU
-/// still enabled (both controllers passthrough). xHCI is expected to fail here
-/// (scratchpad/firmware contention) — we only read EHCI. If EHCI works → the
-/// handoff was the sole cause; if it still fails → it's the IOMMU/branch itself.
-pub const CONFINE_USB_DRIVERS: bool = false;
+/// SETTLED 2026-06-11: EHCI's regression is the IOMMU being enabled, not the xHCI
+/// handoff — with the handoff off and EHCI in passthrough, enabling the IOMMU
+/// still breaks it (works only on main, IOMMU off). So back to `true`: the
+/// flagship (confined xHCI keyboard) is the best the branch can do; EHCI cannot
+/// run while the IOMMU is on, by current evidence.
+pub const CONFINE_USB_DRIVERS: bool = true;
 
 /// VA where the driver's physically-contiguous DMA arena is mapped (8 GiB).
 pub const XHCI_DMA_VA:     u64 = 0x2_0000_0000;
