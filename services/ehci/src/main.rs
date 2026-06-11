@@ -277,32 +277,6 @@ fn control(
         QTD_ACTIVE | (status_pid << 8) | (3 << 10) | (1 << 15) | (1 << 31));
     dma.write32(QTD_STATUS + 0x0C, 0);
 
-    // One-shot diagnostic (H1): dump the EXACT bytes the controller will fetch —
-    // read back from the arena, not what we intended to write. If 0xffffffc0
-    // appears in any link/pointer field here, that's the source of the IOMMU
-    // read-fault; if every field is a valid arena address, the bad pointer is
-    // controller-internal. Gated to the first few control transfers.
-    {
-        use core::sync::atomic::{AtomicU32, Ordering};
-        static DUMPS: AtomicU32 = AtomicU32::new(0);
-        if DUMPS.fetch_add(1, Ordering::Relaxed) < 4 {
-            _ctx.log_fmt(format_args!(
-                "ehci: DUMP QH@{:#010x} hlink={:#010x} ep1={:#010x} ep2={:#010x} cur={:#010x} nextq={:#010x} altq={:#010x} tok={:#010x}",
-                qh_phys,
-                dma.read32(QH_OFF + 0x00), dma.read32(QH_OFF + 0x04), dma.read32(QH_OFF + 0x08),
-                dma.read32(QH_OFF + 0x0C), dma.read32(QH_OFF + 0x10), dma.read32(QH_OFF + 0x14),
-                dma.read32(QH_OFF + 0x18),
-            ));
-            _ctx.log_fmt(format_args!(
-                "ehci: DUMP SETUP@{:#010x} next={:#010x} alt={:#010x} tok={:#010x} buf0={:#010x} | STATUS@{:#010x} next={:#010x} buf0={:#010x} | asynclist={:#010x}",
-                setup_phys, dma.read32(QTD_SETUP + 0x00), dma.read32(QTD_SETUP + 0x04),
-                dma.read32(QTD_SETUP + 0x08), dma.read32(QTD_SETUP + 0x0C),
-                status_phys, dma.read32(QTD_STATUS + 0x00), dma.read32(QTD_STATUS + 0x0C),
-                qh_phys & !0x1F,
-            ));
-        }
-    }
-
     // Point the async list at the QH; enable the schedule if it isn't already.
     mmio.write32(op + OP_CTRLDSSEGMENT, 0);
     mmio.write32(op + OP_ASYNCLISTADDR, qh_phys & !0x1F);

@@ -3067,15 +3067,29 @@ fn spawn_service_with_config(
                 // H1 Phase 1d: confine this DMA-capable driver to its arena via
                 // the IOMMU, so a compromised driver cannot DMA outside it. No-op
                 // if no IOMMU is present (drivers then remain in the TCB).
+                //
+                // Confinement is per-driver, EARNED by the driver being complete
+                // enough to run fully confined (BIOS handoff + all controller DMA
+                // inside the arena). The xHCI driver qualifies (handoff + 256-buffer
+                // scratchpad: a confined keyboard works on hardware). The EHCI
+                // controller retains a stale internal DMA pointer into the firmware
+                // ROM region (~0xffffffc0) that survives HCRESET — its async/qTD
+                // schedule is provably correct (verified by byte-dump), so this is a
+                // controller quirk, not a driver bug. Confining it makes that benign
+                // read fatal and breaks the keyboard, so EHCI stays in passthrough
+                // until the quirk is resolved (e.g. a deeper PCI-level reset). See
+                // docs/iommu.md.
                 {
                     use core::sync::atomic::Ordering::Relaxed;
                     use crate::arch::x86_64::pci;
-                    let bdf = if name == "xhci" {
-                        pci::XHCI_BDF.load(Relaxed)
+                    if name == "xhci" {
+                        crate::arch::x86_64::iommu::confine_device(
+                            pci::XHCI_BDF.load(Relaxed), phys, len);
                     } else {
-                        pci::EHCI_BDF.load(Relaxed)
-                    };
-                    crate::arch::x86_64::iommu::confine_device(bdf, phys, len);
+                        crate::kprintln!(
+                            "spawn[dma]: 'ehci' left in IOMMU passthrough (controller stale-pointer quirk; see docs/iommu.md)"
+                        );
+                    }
                 }
                 (XHCI_DMA_VA, phys, len)
             }

@@ -152,8 +152,42 @@ iommu: confined BDF 00:04.0 -> domain 1 arena <fresh>; selftest PASS
 The negative path (no `-device amd-iommu`) prints "no IVRS ... drivers stay in
 TCB" and the system boots normally — H1 is a no-op where there is no IOMMU.
 
-**Not yet confirmed:** whether the real T630 (AMD GX-420GI, an embedded G-series
-APU) exposes a usable IVRS. The boot log answers it in one line; pending a flash.
+**Confirmed on real hardware (T630, AMD GX-420GI):** the APU exposes AMD-Vi
+(IVRS, IOMMU MMIO `0xfeb80000`, 6-level), and a **USB keyboard types into the
+shell while its xHCI controller is confined to a 1 MiB arena with zero faults** —
+the flagship demonstrated end-to-end on silicon. Getting there surfaced three
+real bugs the emulator never could (each a case of QEMU being lenient or the
+firmware quietly covering for the driver):
+
+1. **DTE permission bits in the wrong word.** `IR`/`IW` (bits 61/62) belong in
+   the DTE's first 64-bit word; they were written into the second, setting
+   reserved bits. QEMU ignored it; real AMD-Vi raised `ILLEGAL_DEV_TAB_ENTRY`.
+2. **USB controllers still owned by firmware.** The drivers never performed the
+   BIOS→OS handoff (EHCI's is in PCI config space, xHCI's in MMIO), so the
+   firmware kept running the controllers' DMA out of firmware memory — invisible
+   without an IOMMU, a fault storm with one. The kernel now does both handoffs
+   before confining (`pci::{ehci,xhci}_bios_handoff`).
+3. **xHCI scratchpad never allocated.** This controller reports
+   `MaxScratchpadBufs=256` — it DMAs into 1 MiB of scratchpad it finds via
+   `DCBAA[0]`. The driver left `DCBAA[0]=0` and leaned on firmware's scratchpad;
+   once handed off it had none and devices dropped after binding. The arena grew
+   to hold the 256 buffers and the driver builds the Scratchpad Buffer Array.
+
+## 4a. Per-driver confinement: confinement is earned
+
+Confinement is applied **per driver**, and a driver earns it by being complete
+enough to run fully confined — all its controller's DMA inside the granted arena,
+firmware released. The xHCI driver qualifies. The **EHCI** driver does **not yet**:
+its async schedule is provably correct (a byte-dump of every QH/qTD field the
+controller reads showed only valid in-arena pointers), but the controller retains
+a stale internal DMA pointer into the firmware-ROM region (~`0xffffffc0`) that
+survives `HCRESET`. Confining EHCI turns that benign read (harmless pre-IOMMU)
+into a fatal `IO_PAGE_FAULT` and breaks the back-port keyboard. So **EHCI is left
+in IOMMU passthrough** until the quirk is resolved (candidate: a deeper PCI-level
+function reset before confinement). This asymmetry is the policy working as
+intended — a driver is confined only when confinement is safe, and the trust
+posture is explicit and logged at spawn (`spawn[dma]: 'ehci' left in IOMMU
+passthrough …`).
 
 ## 5. Phase 2 proposal — dropping the drivers from the TCB (PENDING SIGN-OFF)
 
