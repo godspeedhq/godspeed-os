@@ -450,8 +450,10 @@ const CORE_SERVICES: [&str; 2] = ["init", "supervisor"];
 
 /// Shown when spawn/kill/restart targets a core service — "Not applicable" makes
 /// it clear the command is refused *because* the target is protected, not failed.
+/// Lists exactly `CORE_SERVICES`; `registry` is intentionally absent (H11 ph6:
+/// it is restartable, so `kill registry` is permitted).
 const PROTECTED_MSG: &str =
-    "Not applicable. Core services (init, supervisor, registry) are protected";
+    "Not applicable. Core services (init, supervisor) are protected";
 
 /// Shown when spawn/kill/restart targets an observe variant — they are brokered by
 /// the `observe` / `observe now` commands, not raw service operations.
