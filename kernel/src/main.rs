@@ -214,14 +214,16 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     // confines it — otherwise the firmware SMM keeps running its DMA out of
     // firmware memory, which faults under confinement and breaks the keyboard.
     //
-    // Handoff is done ONLY for controllers we confine. xHCI is confined, so it is
-    // handed off (it then runs fully on its own: handoff + scratchpad). EHCI is
-    // left in IOMMU passthrough (controller stale-pointer quirk, see task/mod.rs
-    // and docs/iommu.md), so it is NOT handed off — firmware keeps co-owning it
-    // exactly as before this branch, which is the configuration in which the
-    // back-port keyboard works. (ehci_bios_handoff stays available for when EHCI
-    // confinement is revisited.)
-    arch::x86_64::pci::xhci_bios_handoff();
+    // Handoff is only needed for a controller we confine (otherwise firmware SMM
+    // keeps running its DMA out of firmware memory, which faults under
+    // confinement). It is gated on the same master switch as confinement: with
+    // CONFINE_USB_DRIVERS off (the working daily-driver default) NO handoff runs,
+    // so firmware keeps co-owning both controllers exactly as before the H1 branch
+    // — the configuration in which both keyboards work. Flip the switch to
+    // re-enable the xHCI confinement flagship (hands off + confines xHCI only).
+    if task::CONFINE_USB_DRIVERS {
+        arch::x86_64::pci::xhci_bios_handoff();
+    }
 
     // H1 Phase 0: probe ACPI for an AMD-Vi IOMMU (IVRS). Detection only — reports
     // whether this machine can confine DMA-capable drivers to their granted

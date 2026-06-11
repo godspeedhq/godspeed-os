@@ -136,6 +136,15 @@ pub const XHCI_MMIO_VA:    u64 = 0x1_0000_0000;
 /// Pages of MMIO to map for the xHCI BAR (64 KiB — cap/op/runtime/doorbell regs).
 const XHCI_MMIO_PAGES:     u64 = 16;
 
+/// Master switch for IOMMU confinement of the USB drivers (H1). When false the
+/// USB stack behaves exactly as it did before the H1 branch: no BIOS→OS handoff,
+/// no confinement, controllers firmware-co-owned — the configuration in which
+/// BOTH keyboards work. When true, xHCI is handed off + confined (proven on
+/// hardware: a confined keyboard types). Default OFF as the working daily-driver
+/// config; flip to true to re-enable the confinement flagship. EHCI is never
+/// confined yet regardless (controller stale-pointer quirk — see docs/iommu.md).
+pub const CONFINE_USB_DRIVERS: bool = false;
+
 /// VA where the driver's physically-contiguous DMA arena is mapped (8 GiB).
 pub const XHCI_DMA_VA:     u64 = 0x2_0000_0000;
 /// Pages of contiguous DMA memory for a USB driver. The first 16 pages hold the
@@ -3082,12 +3091,13 @@ fn spawn_service_with_config(
                 {
                     use core::sync::atomic::Ordering::Relaxed;
                     use crate::arch::x86_64::pci;
-                    if name == "xhci" {
+                    if CONFINE_USB_DRIVERS && name == "xhci" {
                         crate::arch::x86_64::iommu::confine_device(
                             pci::XHCI_BDF.load(Relaxed), phys, len);
                     } else {
                         crate::kprintln!(
-                            "spawn[dma]: 'ehci' left in IOMMU passthrough (controller stale-pointer quirk; see docs/iommu.md)"
+                            "spawn[dma]: '{}' left in IOMMU passthrough (CONFINE_USB_DRIVERS={})",
+                            name, CONFINE_USB_DRIVERS
                         );
                     }
                 }
