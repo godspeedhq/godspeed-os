@@ -135,9 +135,10 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | arch/x86_64/context_switch.rs | 11 | permitted |
 | arch/x86_64/fb.rs | 3 | permitted |
 | arch/x86_64/interrupts.rs | 13 | permitted |
+| arch/x86_64/iommu.rs | 74 | permitted |
 | arch/x86_64/mod.rs | 34 | permitted |
 | arch/x86_64/page_tables.rs | 35 | permitted |
-| arch/x86_64/pci.rs | 5 | permitted |
+| arch/x86_64/pci.rs | 15 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |
 | arch/x86_64/syscall_entry.rs | 13 | permitted |
 | capability/table.rs | 7 | permitted |
@@ -158,9 +159,21 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | task/scheduler.rs | 37 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 276 lines across 20 files  
+**Permitted total:** 360 lines across 21 files  
 **Grandfathered total:** 53 lines across 6 files  
-**Grand total:** 329 lines across 26 files
+**Grand total:** 413 lines across 27 files
+
+> **2026-06-10** (branch `feat/iommu-dma-confinement`). New file `arch/x86_64/iommu.rs`
+> (+60, permitted): the H1 AMD-Vi IOMMU work. Phase 0 (+18) is ACPI-table reads
+> (RSDP → RSDT/XSDT → IVRS) through the HHDM. Phase 1 (+42) is the IOMMU control
+> interface and translation setup: uncached MMIO register read/write, device-table
+> /command-buffer/event-log allocation and DTE writes, the 4-level I/O page-table
+> builder/translator/free, and command-buffer invalidation. Every block carries a
+> `// SAFETY:` argument that the target is a kernel-mapped IOMMU structure (MMIO
+> window, device table, command buffer, or I/O page table) and the access is in
+> bounds. All hardware `unsafe` is contained here behind the safe wrapper
+> `confine_device()`; `task/mod.rs` calls it without any new `unsafe` (its
+> grandfathered floor of 7 is unchanged). See the `arch/x86_64/iommu.rs` entry below.
 
 > **Reconciled 2026-05-31** (branch `verify/static-analysis-unsafe-audit`). The
 > permitted-layer growth since the prior baseline is from the AMD GX-420GI ring-3 /
@@ -274,6 +287,63 @@ interrupt. Used only by the `FIRE_IRQ` COM2 control command (§22 Tests IR1A/IR1
 
 ---
 
+### arch/x86_64/iommu.rs
+
+AMD-Vi IOMMU detection (H1 Phase 0). All 18 unsafe lines are raw reads of
+firmware ACPI tables — the RSDP, the RSDT/XSDT, and the IVRS — through the HHDM.
+The helpers `read_bytes`, `read32`, `read64` are `unsafe fn`; `detect` calls them
+at every step. Each block is sound because:
+
+- The RSDP virtual address comes from Limine's `RsdpRequest`, which points at a
+  table Limine keeps mapped in the HHDM; the signature is checked before any
+  further read.
+- Every subsequent table is reached only through a physical pointer that lives
+  inside an already-validated parent table, converted to a virtual address via
+  the HHDM (`hhdm + phys`), which Limine maps for all usable + ACPI memory.
+- Each read stays within the table's own length field (`sdt_len`, `ivrs_len`),
+  and the IVHD walk advances by the block's self-reported length and stops on a
+  zero length, so it cannot run off the end or loop forever.
+
+Detection only — no behaviour change, no writes, no device programming. The
+results are published in two atomics (`IOMMU_PRESENT`, `IOMMU_MMIO_BASE`).
+
+**Phase 1 (translation setup), +42.** The remaining unsafe in this file programs
+the IOMMU and builds translation structures. Grouped:
+
+- `mmio_read64` / `mmio_write64` — volatile access to the IOMMU MMIO control
+  registers, which `bringup` maps uncached (PCD|PWT) at their HHDM alias before
+  any access. Offsets are compile-time constants within the mapped 0x4000 window.
+- `setup_structures` / `write_dte` — allocate the device table (2 MiB contiguous),
+  command buffer, and event log from the frame allocator, zero them through the
+  HHDM, and write DTEs. All writes target the freshly-allocated, HHDM-mapped
+  structures; the DTE index is a 16-bit BDF, in bounds of the 64K-entry table.
+- `io_walk_or_alloc` / `io_map_page` / `io_translate` / `free_io_table` — the
+  4-level AMD-Vi I/O page-table builder, read-only translator, and frame reclaim.
+  Each level VA is the HHDM alias of a present/just-allocated table; indices are
+  masked to 9 bits (< 512), so every read/write is in bounds of a 4 KiB table.
+  `free_io_table` frees only the page-table frames (reached top-down from a root
+  that `release_device` has already detached from the device), never the leaf
+  arena pages.
+- `invalidate_device` — writes 16-byte commands into the mapped command-buffer
+  ring at the hardware tail offset (masked to the 4 KiB ring) and rings the tail
+  register; serialised by `CMD_LOCK`.
+- `drain_event_log` — reads decoded fault events from the mapped 4 KiB event-log
+  ring (head < 0x1000) and advances the head register; bounded per call so it is
+  safe to invoke from the timer-tick path (`control::process_pending`). Also
+  recovers from event-log overflow (disable EvtLogEn, RW1C the status bit, reset
+  head/tail, re-enable) — all writes to valid IOMMU control/status/pointer regs.
+- `confine_device` / `confinement_selftest` / `release_device` — orchestrate the
+  above; the raw work they do directly is zeroing a freshly-allocated page table,
+  an `sfence` (no memory-safety effect, orders prior stores), and (on release)
+  reverting a DTE before freeing the now-unreachable I/O page table.
+
+`confine_device`, `release_device`, `event_log_state`, and `bringup` are the safe
+entry points;
+all callers outside the arch layer (e.g. `task/mod.rs`) use them without `unsafe`.
+`// SAFETY:` comments present on every block.
+
+---
+
 ### arch/x86_64/mod.rs
 
 Serial port init and COM2 init via `outb`/`inb`, `cli`/`hlt` in the halt loop,
@@ -336,7 +406,22 @@ Sound because port I/O is ring-0 and these ports are the architecturally fixed
 PCI config registers, owned exclusively by the kernel during single-threaded BSP
 boot (the scan runs before any AP or task exists); the address dword is
 constructed from bounded bus/dev/func/offset values with the enable bit set per
-the mechanism-#1 spec. `// SAFETY:` comments present in source for all five.
+the mechanism-#1 spec. `// SAFETY:` comments present in source.
+
+Three additional unsafe lines (+3) for the EHCI BIOS→OS handoff
+(`ehci_bios_handoff`): the `unsafe {}` in `config_write32` (paired `outl(address)`
++ `outl(data)`, same discipline as `config_read32`), the `map_in_active_tables`
+call mapping the EHCI MMIO page to read HCCPARAMS, and the `read_volatile` of
+HCCPARAMS. Sound for the same reason — ring-0 BSP boot, architecturally fixed
+ports, the MMIO page mapped uncached before the single aligned read.
+
+Seven more (+7) for the xHCI BIOS→OS handoff (`xhci_bios_handoff`): xHCI's legacy
+support lives in MMIO (not PCI config), so this maps the xHCI MMIO (16 pages,
+uncached), reads HCCPARAMS1 for the xECP, then walks the MMIO extended-capability
+list — `read_volatile`/`write_volatile` of USBLEGSUP (claim OS ownership, poll
+for BIOS release) and USBLEGCTLSTS (disable firmware SMIs). Each access is within
+the just-mapped 64 KiB MMIO window at a bounded offset (< 0x10000), during
+single-threaded BSP boot. All carry `// SAFETY:` comments.
 
 ---
 

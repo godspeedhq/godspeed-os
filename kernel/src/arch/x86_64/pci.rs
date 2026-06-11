@@ -27,12 +27,16 @@ const PROGIF_EHCI: u8 = 0x20;
 pub static XHCI_FOUND: AtomicBool = AtomicBool::new(false);
 pub static XHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
 pub static XHCI_IRQ: AtomicU8 = AtomicU8::new(0);
+/// PCI BDF (bus<<8 | dev<<3 | func) of the driver's xHCI — the index into the
+/// IOMMU device table for DMA confinement (H1). 0xFFFF if none found.
+pub static XHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
 
 /// All discovered xHCI controllers (a system may have several; the boot drive
 /// and the keyboard often sit on different ones). Recorded during the scan.
 pub static XHCI_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static XHCI_BASES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 pub static XHCI_IRQS: [AtomicU8; 4] = [const { AtomicU8::new(0) }; 4];
+pub static XHCI_BDFS: [AtomicU32; 4] = [const { AtomicU32::new(0xFFFF) }; 4];
 
 /// Discovered EHCI (USB 2.0) controller — the T630's back ports hang off it
 /// (§12). The userspace `ehci` driver gets this BAR mapped at spawn, exactly as
@@ -40,6 +44,14 @@ pub static XHCI_IRQS: [AtomicU8; 4] = [const { AtomicU8::new(0) }; 4];
 pub static EHCI_FOUND: AtomicBool = AtomicBool::new(false);
 pub static EHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
 pub static EHCI_IRQ: AtomicU8 = AtomicU8::new(0);
+/// PCI BDF of the EHCI controller — IOMMU device-table index (H1). 0xFFFF if none.
+pub static EHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
+
+/// Build a 16-bit PCI BDF (bus<<8 | dev<<3 | func) — the IOMMU device-table index.
+#[inline]
+pub fn make_bdf(bus: u8, dev: u8, func: u8) -> u32 {
+    ((bus as u32) << 8) | ((dev as u32) << 3) | (func as u32)
+}
 
 /// Write a 32-bit value to an I/O port.
 ///
@@ -81,6 +93,277 @@ fn config_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
     unsafe {
         outl(CONFIG_ADDRESS, addr);
         inl(CONFIG_DATA)
+    }
+}
+
+/// Write one 32-bit dword to PCI config space (mechanism #1). `offset` is
+/// dword-aligned (low two bits ignored).
+fn config_write32(bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
+    let addr = 0x8000_0000u32
+        | ((bus as u32) << 16)
+        | ((dev as u32) << 11)
+        | ((func as u32) << 8)
+        | ((offset as u32) & 0xFC);
+    // SAFETY: standard PCI config mechanism #1; ring-0 port I/O.
+    unsafe {
+        outl(CONFIG_ADDRESS, addr);
+        outl(CONFIG_DATA, val);
+    }
+}
+
+/// Take ownership of the EHCI controller from the firmware (BIOS→OS handoff).
+///
+/// EHCI's HCCPARAMS register (MMIO capability offset 0x08) carries the EHCI
+/// Extended Capabilities Pointer (EECP) — an offset into *PCI config space*
+/// (not MMIO) where a capability list lives. The USB Legacy Support capability
+/// (ID 0x01) has a BIOS-Owned and an OS-Owned semaphore. Until the OS sets
+/// OS-Owned and the firmware clears BIOS-Owned, the firmware (SMM) keeps poking
+/// the controller and running its own periodic schedule out of firmware memory.
+///
+/// Without an IOMMU that firmware DMA was invisible. With H1 confinement it
+/// faults (the firmware buffers are outside the driver's arena) and breaks the
+/// back-port keyboard. This handoff makes the firmware release the controller —
+/// standard OS behaviour at init. EECP lives in PCI config space, which the
+/// userspace `ehci` driver cannot reach, so the kernel must do it. Idempotent;
+/// no-op if no EHCI, no extended caps, or no USB Legacy Support capability.
+///
+/// Retained but not currently called: EHCI is left in IOMMU passthrough (firmware
+/// co-owns it, the configuration the back-port keyboard works in), so it is not
+/// handed off. Re-enable when EHCI confinement is revisited.
+#[allow(dead_code)]
+pub fn ehci_bios_handoff() {
+    if !EHCI_FOUND.load(Ordering::Relaxed) {
+        return;
+    }
+    let mmio = EHCI_MMIO_BASE.load(Ordering::Relaxed);
+    let bdf = EHCI_BDF.load(Ordering::Relaxed);
+    if mmio == 0 || bdf == 0xFFFF {
+        return;
+    }
+    let bus = ((bdf >> 8) & 0xff) as u8;
+    let dev = ((bdf >> 3) & 0x1f) as u8;
+    let func = (bdf & 0x7) as u8;
+
+    // Read HCCPARAMS (MMIO cap offset 0x08) to extract the EECP. Map the MMIO
+    // page uncached (PCD|PWT), like the APIC/IOMMU, since the HHDM covers RAM
+    // but not MMIO.
+    let hhdm = crate::arch::x86_64::page_tables::get_hhdm_offset();
+    let va = hhdm + (mmio & !0xFFF);
+    {
+        use crate::arch::x86_64::page_tables::{map_in_active_tables, PageFlags};
+        let flags = PageFlags::PRESENT.bits()
+            | PageFlags::WRITABLE.bits()
+            | PageFlags::NO_EXEC.bits()
+            | PageFlags::PWT.bits()
+            | PageFlags::PCD.bits();
+        // SAFETY: called after set_hhdm_offset; mapping the EHCI MMIO page
+        // (page-aligned). Already-present is a no-op.
+        if unsafe { map_in_active_tables(va, mmio & !0xFFF, flags) }.is_err() {
+            crate::kprintln!("ehci-handoff: WARN could not map MMIO {:#x}", mmio);
+            return;
+        }
+    }
+    let hccparams_va = hhdm + mmio + 0x08;
+    // SAFETY: HCCPARAMS is within the mapped MMIO page; aligned 32-bit read.
+    let hccparams = unsafe { core::ptr::read_volatile(hccparams_va as *const u32) };
+    let eecp = ((hccparams >> 8) & 0xFF) as u8;
+    if eecp < 0x40 {
+        crate::kprintln!("ehci-handoff: no extended capabilities (eecp={:#x})", eecp);
+        return;
+    }
+
+    // Walk the PCI-config extended-capability list for USB Legacy Support (ID 1).
+    let mut ptr = eecp;
+    let mut guard = 16; // cap lists are short; bound the walk
+    while ptr >= 0x40 && guard > 0 {
+        guard -= 1;
+        let cap = config_read32(bus, dev, func, ptr);
+        let cap_id = cap & 0xFF;
+        if cap_id == 0x01 {
+            // USBLEGSUP at `ptr`: bit16 = HC BIOS Owned, bit24 = HC OS Owned.
+            if cap & (1 << 16) != 0 {
+                // Claim OS ownership and wait for the firmware to release.
+                config_write32(bus, dev, func, ptr, cap | (1 << 24));
+                let mut ok = false;
+                for _ in 0..1_000_000u32 {
+                    let v = config_read32(bus, dev, func, ptr);
+                    if v & (1 << 16) == 0 {
+                        ok = true;
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+                crate::kprintln!(
+                    "ehci-handoff: USBLEGSUP@{:#x} OS-owned, BIOS released={} (was {:#010x})",
+                    ptr, ok as u8, cap
+                );
+            } else {
+                crate::kprintln!("ehci-handoff: already OS-owned (USBLEGSUP={:#010x})", cap);
+            }
+            // Disable all firmware SMIs on this controller (USBLEGCTLSTS at ptr+4).
+            config_write32(bus, dev, func, ptr + 4, 0);
+            return;
+        }
+        let next = ((cap >> 8) & 0xFF) as u8;
+        if next == 0 {
+            break;
+        }
+        ptr = next;
+    }
+    crate::kprintln!("ehci-handoff: no USB Legacy Support capability found");
+}
+
+/// Take ownership of the xHCI controller from the firmware (BIOS→OS handoff).
+///
+/// Unlike EHCI (whose handoff register is in PCI config space), xHCI's extended
+/// capabilities — including USB Legacy Support — live in MMIO, reached via the
+/// xECP field of HCCPARAMS1 (MMIO cap offset 0x10). We could put this in the
+/// userspace driver, but doing it here keeps both controllers handed off
+/// uniformly before the IOMMU confines them: otherwise the firmware SMM keeps
+/// poking the controller (running DMA out of firmware memory, which faults under
+/// confinement) and the device that was leaning on firmware support breaks.
+/// Idempotent; no-op if no xHCI, no extended caps, or no Legacy Support cap.
+pub fn xhci_bios_handoff() {
+    if !XHCI_FOUND.load(Ordering::Relaxed) {
+        return;
+    }
+    let mmio = XHCI_MMIO_BASE.load(Ordering::Relaxed);
+    if mmio == 0 {
+        return;
+    }
+    let hhdm = crate::arch::x86_64::page_tables::get_hhdm_offset();
+    let base = mmio & !0xFFF;
+    {
+        use crate::arch::x86_64::page_tables::{map_in_active_tables, PageFlags};
+        let flags = PageFlags::PRESENT.bits()
+            | PageFlags::WRITABLE.bits()
+            | PageFlags::NO_EXEC.bits()
+            | PageFlags::PWT.bits()
+            | PageFlags::PCD.bits();
+        // Map 16 pages (64 KiB) — enough to reach the extended-capability list.
+        for i in 0..16u64 {
+            let off = i * 0x1000;
+            // SAFETY: called after set_hhdm_offset; mapping the xHCI MMIO pages
+            // (page-aligned) uncached. Already-present is a no-op.
+            if unsafe { map_in_active_tables(hhdm + base + off, base + off, flags) }.is_err() {
+                crate::kprintln!("xhci-handoff: WARN could not map MMIO {:#x}", base + off);
+                return;
+            }
+        }
+    }
+    let va = hhdm + mmio;
+    // HCCPARAMS1 (cap offset 0x10): xECP = bits [31:16], a dword offset from base.
+    // SAFETY: within the mapped MMIO; aligned 32-bit read.
+    let hccparams1 = unsafe { core::ptr::read_volatile((va + 0x10) as *const u32) };
+    let xecp = (hccparams1 >> 16) & 0xFFFF;
+    if xecp == 0 {
+        crate::kprintln!("xhci-handoff: no extended capabilities");
+        return;
+    }
+    // Walk the MMIO extended-capability list for USB Legacy Support (ID 1).
+    let mut off = (xecp as u64) * 4;
+    let mut guard = 64;
+    while off != 0 && off < 0x10000 && guard > 0 {
+        guard -= 1;
+        let cap_va = va + off;
+        // SAFETY: off bounded < 0x10000, within the mapped 64 KiB; aligned read.
+        let cap = unsafe { core::ptr::read_volatile(cap_va as *const u32) };
+        let cap_id = cap & 0xFF;
+        if cap_id == 0x01 {
+            // USBLEGSUP at `off`: bit16 = BIOS Owned, bit24 = OS Owned.
+            if cap & (1 << 16) != 0 {
+                // SAFETY: claim OS ownership.
+                unsafe { core::ptr::write_volatile(cap_va as *mut u32, cap | (1 << 24)) };
+                let mut ok = false;
+                for _ in 0..1_000_000u32 {
+                    // SAFETY: poll the same register for BIOS release.
+                    if unsafe { core::ptr::read_volatile(cap_va as *const u32) } & (1 << 16) == 0 {
+                        ok = true;
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+                crate::kprintln!(
+                    "xhci-handoff: USBLEGSUP@{:#x} OS-owned, BIOS released={} (was {:#010x})",
+                    off, ok as u8, cap
+                );
+            } else {
+                crate::kprintln!("xhci-handoff: already OS-owned (USBLEGSUP={:#010x})", cap);
+            }
+            // USBLEGCTLSTS (off+4): disable all BIOS SMIs, clear SMI events (RW1C).
+            // Masks per the xHCI spec / Linux quirk_usb_handoff_xhci.
+            const DISABLE_SMI: u32 = (0x7 << 1) | (0xff << 5) | (0x7 << 17);
+            const SMI_EVENTS: u32 = 0x7 << 29;
+            // SAFETY: ctlsts is the dword after USBLEGSUP, within the mapping.
+            let ctl = unsafe { core::ptr::read_volatile((cap_va + 4) as *const u32) };
+            unsafe {
+                core::ptr::write_volatile(
+                    (cap_va + 4) as *mut u32,
+                    (ctl & !DISABLE_SMI) | SMI_EVENTS,
+                )
+            };
+            return;
+        }
+        let next = (cap >> 8) & 0xFF; // next pointer, in dwords
+        if next == 0 {
+            break;
+        }
+        off += (next as u64) * 4;
+    }
+    crate::kprintln!("xhci-handoff: no USB Legacy Support capability found");
+}
+
+/// Report whether the EHCI controller supports a PCI Function-Level Reset (FLR),
+/// and dump its PCI capability list. FLR is a bit in the PCI Express capability's
+/// Device Capabilities register (bit 28); performing it (Device Control bit 15)
+/// resets the function far more thoroughly than the EHCI `HCRESET`, which on this
+/// machine does not scrub the controller's stale firmware-era internal DMA state.
+/// Detection only — does not perform the reset. No-op if no EHCI.
+pub fn ehci_flr_probe() {
+    if !EHCI_FOUND.load(Ordering::Relaxed) {
+        return;
+    }
+    let bdf = EHCI_BDF.load(Ordering::Relaxed);
+    if bdf == 0xFFFF {
+        return;
+    }
+    let bus = ((bdf >> 8) & 0xff) as u8;
+    let dev = ((bdf >> 3) & 0x1f) as u8;
+    let func = (bdf & 0x7) as u8;
+
+    // Status register (offset 0x06) bit 4 = capabilities list present.
+    let status = (config_read32(bus, dev, func, 0x04) >> 16) as u16;
+    if status & (1 << 4) == 0 {
+        crate::kprintln!("ehci-flr: no PCI capability list -> no PCIe cap -> no FLR");
+        return;
+    }
+    // Walk the capability list from the Capabilities Pointer (offset 0x34, low byte).
+    let mut cap = (config_read32(bus, dev, func, 0x34) & 0xFC) as u8;
+    let mut guard = 48;
+    let mut found_pcie = false;
+    while cap >= 0x40 && guard > 0 {
+        guard -= 1;
+        let hdr = config_read32(bus, dev, func, cap);
+        let cap_id = (hdr & 0xFF) as u8;
+        let next = ((hdr >> 8) & 0xFF) as u8;
+        crate::kprintln!("ehci-flr: cap@{:#04x} id={:#04x}", cap, cap_id);
+        if cap_id == 0x10 {
+            // PCI Express capability. Device Capabilities at cap+0x04; FLR = bit 28.
+            found_pcie = true;
+            let dev_cap = config_read32(bus, dev, func, cap + 0x04);
+            let flr = (dev_cap >> 28) & 1;
+            crate::kprintln!(
+                "ehci-flr: PCIe cap@{:#04x} DevCap={:#010x} FLR_supported={}",
+                cap, dev_cap, flr
+            );
+        }
+        if next == 0 {
+            break;
+        }
+        cap = next;
+    }
+    if !found_pcie {
+        crate::kprintln!("ehci-flr: no PCI Express capability (legacy-PCI function) -> no FLR");
     }
 }
 
@@ -128,6 +411,7 @@ pub fn init() {
                         if n < 4 {
                             XHCI_BASES[n].store(mmio_base, Ordering::Relaxed);
                             XHCI_IRQS[n].store(irq, Ordering::Relaxed);
+                            XHCI_BDFS[n].store(make_bdf(bus as u8, dev, func), Ordering::Relaxed);
                             XHCI_COUNT.store((n + 1) as u32, Ordering::Relaxed);
                         }
                     }
@@ -135,6 +419,7 @@ pub fn init() {
                     if progif == PROGIF_EHCI && !EHCI_FOUND.load(Ordering::Relaxed) {
                         EHCI_MMIO_BASE.store(mmio_base, Ordering::Relaxed);
                         EHCI_IRQ.store(irq, Ordering::Relaxed);
+                        EHCI_BDF.store(make_bdf(bus as u8, dev, func), Ordering::Relaxed);
                         EHCI_FOUND.store(true, Ordering::Relaxed);
                     }
                 }
@@ -147,10 +432,15 @@ pub fn init() {
     if count > 0 {
         let pick = 0;
         let base = XHCI_BASES[pick].load(Ordering::Relaxed);
+        let bdf = XHCI_BDFS[pick].load(Ordering::Relaxed);
         XHCI_MMIO_BASE.store(base, Ordering::Relaxed);
         XHCI_IRQ.store(XHCI_IRQS[pick].load(Ordering::Relaxed), Ordering::Relaxed);
+        XHCI_BDF.store(bdf, Ordering::Relaxed);
         XHCI_FOUND.store(true, Ordering::Relaxed);
-        crate::kprintln!("pci: driver uses xHCI #{} of {} (MMIO={:#x})", pick, count, base);
+        crate::kprintln!(
+            "pci: driver uses xHCI #{} of {} (MMIO={:#x} BDF={:02x}:{:02x}.{})",
+            pick, count, base, (bdf >> 8) & 0xff, (bdf >> 3) & 0x1f, bdf & 0x7
+        );
     } else {
         crate::kprintln!("pci: no xHCI controller found");
     }

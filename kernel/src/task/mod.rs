@@ -136,11 +136,42 @@ pub const XHCI_MMIO_VA:    u64 = 0x1_0000_0000;
 /// Pages of MMIO to map for the xHCI BAR (64 KiB — cap/op/runtime/doorbell regs).
 const XHCI_MMIO_PAGES:     u64 = 16;
 
+/// Master switch for IOMMU confinement of the USB drivers (H1).
+///
+/// `true`  → xHCI is handed off (BIOS→OS) + confined: the proven flagship — a
+///           confined front-port keyboard types on hardware. EHCI stays in
+///           passthrough (controller stale-pointer quirk, docs/iommu.md).
+/// `false` → no handoff, no confinement. Counter-intuitively this does NOT
+///           restore a working keyboard: without the handoff firmware and the
+///           driver contend for xHCI and Enable Slot never completes. So the
+///           clean "both keyboards work" config is **main** (this branch is not
+///           merged), not this switch off.
+///
+/// Default `true`: keep the flagship live + the front keyboard working. For a
+/// fully-working daily machine use a `main` build. EHCI dual-keyboard support on
+/// this branch is parked, well-characterised future work.
+///
+/// SETTLED 2026-06-11: EHCI's regression is the IOMMU being enabled, not the xHCI
+/// handoff — with the handoff off and EHCI in passthrough, enabling the IOMMU
+/// still breaks it (works only on main, IOMMU off). So back to `true`: the
+/// flagship (confined xHCI keyboard) is the best the branch can do; EHCI cannot
+/// run while the IOMMU is on, by current evidence.
+pub const CONFINE_USB_DRIVERS: bool = true;
+
 /// VA where the driver's physically-contiguous DMA arena is mapped (8 GiB).
 pub const XHCI_DMA_VA:     u64 = 0x2_0000_0000;
-/// Pages of contiguous DMA memory for the xHCI driver (64 KiB: command/event
-/// rings, device-context base array, ERST, scratchpad array).
-const XHCI_DMA_PAGES:      u64 = 16;
+/// Pages of contiguous DMA memory for the **xHCI** driver. The first 16 pages
+/// hold the control structures (command/event rings, DCBAA, ERST, per-device
+/// slices, plus the scratchpad buffer array at page 15); the remaining 256 pages
+/// are the scratchpad buffers the controller DMAs into (real AMD xHCI reports
+/// MaxScratchpadBufs=256 — 1 MiB — and malfunctions without them). Confined
+/// identity-mapped, so the device reaches all of it (§12, H1).
+const XHCI_DMA_PAGES:      u64 = 16 + 256;
+/// Pages of contiguous DMA memory for the **EHCI** driver — 64 KiB, as on main.
+/// EHCI has no scratchpad concept, and its driver zeroes the whole arena on every
+/// control transfer; giving it the xHCI-sized 1 MiB arena (a leftover of sharing
+/// one constant) regressed back-port enumeration. Keep it small and separate.
+const EHCI_DMA_PAGES:      u64 = 16;
 
 /// Maximum named send peers per service.
 pub const MAX_SEND_PEERS:  usize = 4;
@@ -3042,24 +3073,55 @@ fn spawn_service_with_config(
         (name == "xhci" && pci::XHCI_FOUND.load(Relaxed))
             || (name == "ehci" && pci::EHCI_FOUND.load(Relaxed))
     };
+    // Per-driver arena size: xHCI needs room for its 256 scratchpad buffers;
+    // EHCI gets the small 64 KiB arena it had on main (see the constants above).
+    let dma_pages = if name == "ehci" { EHCI_DMA_PAGES } else { XHCI_DMA_PAGES };
     let (xhci_dma_va, xhci_dma_phys, xhci_dma_len) = if dma_for_driver {
-        match crate::memory::allocator::alloc_contiguous(XHCI_DMA_PAGES as usize) {
+        match crate::memory::allocator::alloc_contiguous(dma_pages as usize) {
             Some(phys) => {
                 let flags = PageFlags::PRESENT
                     | PageFlags::WRITABLE
                     | PageFlags::USER
                     | PageFlags::NO_EXEC;
-                for i in 0..XHCI_DMA_PAGES {
+                for i in 0..dma_pages {
                     let off = i * PAGE_SIZE as u64;
                     page_table
                         .map(VirtAddr(XHCI_DMA_VA + off), PhysAddr(phys + off), flags)
                         .map_err(|_| SpawnError::MapFailed)?;
                 }
-                let len = XHCI_DMA_PAGES * PAGE_SIZE as u64;
+                let len = dma_pages * PAGE_SIZE as u64;
                 crate::kprintln!(
                     "spawn[dma]: '{}' arena phys {:#x} -> VA {:#x} ({} KiB)",
                     name, phys, XHCI_DMA_VA, len / 1024
                 );
+                // H1 Phase 1d: confine this DMA-capable driver to its arena via
+                // the IOMMU, so a compromised driver cannot DMA outside it. No-op
+                // if no IOMMU is present (drivers then remain in the TCB).
+                //
+                // Confinement is per-driver, EARNED by the driver being complete
+                // enough to run fully confined (BIOS handoff + all controller DMA
+                // inside the arena). The xHCI driver qualifies (handoff + 256-buffer
+                // scratchpad: a confined keyboard works on hardware). The EHCI
+                // controller retains a stale internal DMA pointer into the firmware
+                // ROM region (~0xffffffc0) that survives HCRESET — its async/qTD
+                // schedule is provably correct (verified by byte-dump), so this is a
+                // controller quirk, not a driver bug. Confining it makes that benign
+                // read fatal and breaks the keyboard, so EHCI stays in passthrough
+                // until the quirk is resolved (e.g. a deeper PCI-level reset). See
+                // docs/iommu.md.
+                {
+                    use core::sync::atomic::Ordering::Relaxed;
+                    use crate::arch::x86_64::pci;
+                    if CONFINE_USB_DRIVERS && name == "xhci" {
+                        crate::arch::x86_64::iommu::confine_device(
+                            pci::XHCI_BDF.load(Relaxed), phys, len);
+                    } else {
+                        crate::kprintln!(
+                            "spawn[dma]: '{}' left in IOMMU passthrough (CONFINE_USB_DRIVERS={})",
+                            name, CONFINE_USB_DRIVERS
+                        );
+                    }
+                }
                 (XHCI_DMA_VA, phys, len)
             }
             None => {

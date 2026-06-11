@@ -7,6 +7,7 @@ pub mod ap_boot;
 pub mod boot;
 pub mod context_switch;
 pub mod fb;
+pub mod iommu;
 pub mod interrupts;
 pub mod page_tables;
 pub mod pci;
@@ -15,6 +16,7 @@ pub mod syscall_entry;
 
 use limine::request::{
     ExecutableAddressRequest, FramebufferRequest, HhdmRequest, MemmapRequest, MpRequest,
+    RsdpRequest,
 };
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 
@@ -56,6 +58,12 @@ static KERNEL_ADDRESS_REQUEST: ExecutableAddressRequest = ExecutableAddressReque
 #[used]
 #[link_section = ".requests"]
 static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
+
+// ACPI RSDP pointer — entry point to the ACPI table tree. Needed to locate the
+// IVRS table that describes the AMD-Vi IOMMU (H1: DMA confinement, §12).
+#[used]
+#[link_section = ".requests"]
+static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 
 #[used]
 #[link_section = ".requests_end"]
@@ -128,6 +136,14 @@ fn collect_boot_info() -> BootInfo {
         .map(|r| r.offset)
         .unwrap_or(0);
 
+    // ACPI RSDP pointer (0 if firmware/Limine did not supply one). On Limine
+    // base revision 6 this is a virtual (HHDM) address; iommu::detect normalises
+    // it defensively in case a physical address is ever handed over.
+    let rsdp_addr = RSDP_REQUEST
+        .response()
+        .map(|r| r.address as u64)
+        .unwrap_or(0);
+
     // Collect non-BSP LAPIC IDs from the SMP response.
     const MAX_AP_IDS: usize = 16;
     static mut AP_ID_BUF: [u32; MAX_AP_IDS] = [0u32; MAX_AP_IDS];
@@ -172,6 +188,7 @@ fn collect_boot_info() -> BootInfo {
         kernel_phys_start,
         kernel_phys_end,
         hhdm_offset,
+        rsdp_addr,
     }
 }
 
@@ -189,6 +206,9 @@ pub struct BootInfo {
     /// Base virtual address of Limine's higher-half direct map (HHDM).
     /// Physical address P is accessible at virtual address `hhdm_offset + P`.
     pub hhdm_offset: u64,
+    /// ACPI RSDP pointer supplied by Limine (0 if unavailable). Entry point for
+    /// locating the IVRS table (AMD-Vi IOMMU description). See `iommu.rs`.
+    pub rsdp_addr: u64,
 }
 
 #[repr(C)]

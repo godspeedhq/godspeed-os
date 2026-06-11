@@ -93,6 +93,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     } else {
         ctx.log("ehci: WARN — controller did not leave halted state after run");
     }
+    // Diagnostic (H1): dump the schedule registers after reset+run. If the IOMMU
+    // is faulting on a garbage 0xffffffc0 pointer, one of these (or the schedule
+    // they point at) is the source — e.g. an uninitialised PERIODICLISTBASE the
+    // controller is walking, or a stale ASYNCLISTADDR.
+    ctx.log_fmt(format_args!(
+        "ehci: sched regs USBCMD={:#010x} USBSTS={:#010x} ASYNCLIST={:#010x} PERIODICLIST={:#010x}",
+        mmio.read32(op + OP_USBCMD), mmio.read32(op + OP_USBSTS),
+        mmio.read32(op + 0x18), mmio.read32(op + 0x14)
+    ));
 
     // Port census: with the controller running and CONFIGFLAG set, a device on a
     // back socket should now read connected=1. PORTSC is one 32-bit reg per port.
@@ -158,7 +167,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 const OP_CTRLDSSEGMENT: usize = 0x10; // high 32 bits of 64-bit data-structure addrs
 const OP_ASYNCLISTADDR: usize = 0x18; // physical base of the async (QH) list
 const CMD_ASE:          u32   = 1 << 5;  // USBCMD: Async Schedule Enable
+const CMD_IAAD:         u32   = 1 << 6;  // USBCMD: Interrupt on Async Advance Doorbell
 const STS_ASS:          u32   = 1 << 15; // USBSTS: Async Schedule Status
+const STS_IAA:          u32   = 1 << 5;  // USBSTS: Interrupt on Async Advance
 
 // Offsets within the granted DMA arena (32-byte aligned where a QH/qTD lives).
 const QH_OFF:     usize = 0x000; // Queue Head (48 bytes)
@@ -268,13 +279,28 @@ fn control(
         QTD_ACTIVE | (status_pid << 8) | (3 << 10) | (1 << 15) | (1 << 31));
     dma.write32(QTD_STATUS + 0x0C, 0);
 
-    // Point the async list at the QH; enable the schedule if it isn't already.
+    // Refresh the async schedule cleanly and flush the controller's internal
+    // pointer cache. On `main` the firmware's ongoing activity keeps the EHCI
+    // controller coherent; once we confine xHCI the firmware abandons EHCI and a
+    // stale firmware-era internal DMA pointer (read-faults at 0xffffffc0) that
+    // HCRESET never scrubbed surfaces. The EHCI spec's tool for this is the
+    // Interrupt-on-Async-Advance doorbell: it forces the controller to advance
+    // the async schedule to a safe point and acknowledge, re-reading it from
+    // ASYNCLISTADDR. We first cycle ASE off→on (ASYNCLISTADDR may only change
+    // while ASE=0) to point it at our QH, then ring the doorbell.
     mmio.write32(op + OP_CTRLDSSEGMENT, 0);
-    mmio.write32(op + OP_ASYNCLISTADDR, qh_phys & !0x1F);
-    if mmio.read32(op + OP_USBSTS) & STS_ASS == 0 {
-        mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) | CMD_ASE);
-        wait(mmio, op + OP_USBSTS, STS_ASS, true);
+    if mmio.read32(op + OP_USBSTS) & STS_ASS != 0 {
+        mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) & !CMD_ASE);
+        wait(mmio, op + OP_USBSTS, STS_ASS, false);
     }
+    mmio.write32(op + OP_ASYNCLISTADDR, qh_phys & !0x1F);
+    mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) | CMD_ASE);
+    wait(mmio, op + OP_USBSTS, STS_ASS, true);
+    // Doorbell: set IAAD, wait for the controller to set IAA (bounded — if the
+    // controller is wedged it simply won't fire and we proceed), then clear it.
+    mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) | CMD_IAAD);
+    wait(mmio, op + OP_USBSTS, STS_IAA, true);
+    mmio.write32(op + OP_USBSTS, STS_IAA); // RW1C: acknowledge the advance
 
     // Wait for the STATUS qTD to retire.
     let mut done = false;

@@ -47,6 +47,16 @@ const INPUT_CTX_OFF: usize = 0x4000;  // transient: built per device for Address
 const DATA_BUF_OFF: usize = 0x5000;   // transient: control-transfer data during enumeration
 const CONFIG_BUF_OFF: usize = 0x6000; // transient: config descriptor during enumeration
 
+// Scratchpad: the controller's own runtime DMA workspace. DCBAA[0] points at the
+// Scratchpad Buffer Array (SBA) — an array of physical pointers to N page-aligned
+// scratchpad buffers, where N = HCSPARAMS2.MaxScratchpadBufs. Real AMD xHCI needs
+// 256 of them and malfunctions (devices drop, re-enumerate) without them. The SBA
+// lives at arena page 15; the buffers occupy pages 16.. (the arena's tail, sized
+// for this in the kernel's XHCI_DMA_PAGES).
+const SCRATCHPAD_SBA_OFF: usize = 0xF000;
+const SCRATCHPAD_BUF_BASE: usize = 0x10000;
+const MAX_SCRATCHPAD: usize = 256; // arena room = XHCI_DMA_PAGES (272) - 16
+
 /// Maximum HID devices bound on one controller at once (keyboard + mouse).
 const MAX_HID: usize = 2;
 const DEV_BASE: usize = 0x7000;
@@ -591,7 +601,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let hcc1 = mmio.read32(CAP_HCCPARAMS1);
     let max_slots = hcs1 & 0xFF;
     let max_ports = (hcs1 >> 24) & 0xFF;
-    let _hcs2 = mmio.read32(CAP_HCSPARAMS2);
+    let hcs2 = mmio.read32(CAP_HCSPARAMS2);
+    // Max Scratchpad Buffers: HCSPARAMS2 bits [31:27] (hi) and [25:21] (lo). Real
+    // controllers need these pages allocated and DCBAA[0] pointed at the buffer
+    // array before they run; if non-zero we must set them up (§ scratchpad).
+    let max_scratch = (((hcs2 >> 27) & 0x1F) << 5) | ((hcs2 >> 21) & 0x1F);
     let ctx_size = if hcc1 & (1 << 2) != 0 { 64 } else { 32 }; // CSZ
     let dboff = (mmio.read32(CAP_DBOFF) & !0x3) as usize;
     let rtsoff = (mmio.read32(CAP_RTSOFF) & !0x1F) as usize;
@@ -599,8 +613,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let ir0 = rtsoff + 0x20;
 
     ctx.log_fmt(format_args!(
-        "xhci: v{:#06x} slots={} ports={} ctx_size={} dboff={:#x} rtsoff={:#x}",
-        version, max_slots, max_ports, ctx_size, dboff, rtsoff
+        "xhci: v{:#06x} slots={} ports={} ctx_size={} dboff={:#x} rtsoff={:#x} max_scratch={}",
+        version, max_slots, max_ports, ctx_size, dboff, rtsoff, max_scratch
     ));
 
     // Hot-plug state that persists across passes.
@@ -627,6 +641,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         });
         // Rebuild DMA structures + run.
         dma.zero();
+        // Scratchpad: build the SBA (N pointers to page-aligned buffers) and point
+        // DCBAA[0] at it, so the controller has the runtime workspace it requires
+        // (MaxScratchpadBufs); without it real xHCI drops devices after binding.
+        let n_scratch = (max_scratch as usize).min(MAX_SCRATCHPAD);
+        if n_scratch > 0 {
+            for i in 0..n_scratch {
+                dma.write64(
+                    SCRATCHPAD_SBA_OFF + i * 8,
+                    dma.phys_at(SCRATCHPAD_BUF_BASE + i * 0x1000),
+                );
+            }
+            dma.write64(DCBAA_OFF, dma.phys_at(SCRATCHPAD_SBA_OFF));
+        }
         mmio.write64(op + OP_DCBAAP, dma.phys_at(DCBAA_OFF));
         mmio.write64(op + OP_CRCR, dma.phys_at(CMD_RING_OFF) | 1);
         dma.write64(ERST_OFF, dma.phys_at(EVENT_RING_OFF));

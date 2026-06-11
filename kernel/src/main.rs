@@ -210,6 +210,32 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     // MMIO base + IRQ for a future userspace driver's hw_mmio/hw_interrupt caps.
     arch::x86_64::pci::init();
 
+    // Take a USB controller from the firmware (BIOS→OS handoff) before the IOMMU
+    // confines it — otherwise the firmware SMM keeps running its DMA out of
+    // firmware memory, which faults under confinement and breaks the keyboard.
+    //
+    // Handoff is only needed for a controller we confine (otherwise firmware SMM
+    // keeps running its DMA out of firmware memory, which faults under
+    // confinement). It is gated on the same master switch as confinement: with
+    // CONFINE_USB_DRIVERS off (the working daily-driver default) NO handoff runs,
+    // so firmware keeps co-owning both controllers exactly as before the H1 branch
+    // — the configuration in which both keyboards work. Flip the switch to
+    // re-enable the xHCI confinement flagship (hands off + confines xHCI only).
+    if task::CONFINE_USB_DRIVERS {
+        arch::x86_64::pci::xhci_bios_handoff();
+    }
+    // Report whether the EHCI controller supports a PCI Function-Level Reset — the
+    // candidate for scrubbing its stale firmware-era internal state (which HCRESET
+    // doesn't clear) so it can run firmware-independent. Detection only.
+    arch::x86_64::pci::ehci_flr_probe();
+
+    // H1 Phase 0: probe ACPI for an AMD-Vi IOMMU (IVRS). Detection only — reports
+    // whether this machine can confine DMA-capable drivers to their granted
+    // arena (the prerequisite for dropping xhci/ehci from the TCB).
+    arch::x86_64::iommu::detect(boot_info.rsdp_addr, boot_info.hhdm_offset);
+    // H1 Phase 1a: if an IOMMU was found, map its MMIO and read capabilities.
+    arch::x86_64::iommu::bringup(boot_info.hhdm_offset);
+
     arch::x86_64::init_timer();
     arch::x86_64::com2_init();
     // COM1 RX is polled from the core-0 timer ISR (uart_rx_poll every 10 ms).

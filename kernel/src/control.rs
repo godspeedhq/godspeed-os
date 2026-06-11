@@ -35,6 +35,11 @@ static LINE: SpinLock<LineBuf> = SpinLock::new(LineBuf::new());
 /// on the BSP stalls forever. The budget (256) far exceeds any real command
 /// line (BUF_SIZE = 128); a stuck LSR just drains 256 junk bytes and returns.
 pub fn process_pending() {
+    // H1 diagnostic: surface any IOMMU translation faults (device DMA blocked
+    // outside its confined arena). Cheap when quiet (a head/tail compare); prints
+    // the faulting device + address when a confined driver oversteps its arena.
+    crate::arch::x86_64::iommu::drain_event_log();
+
     let mut state = match LINE.try_lock() {
         Some(g) => g,
         None    => return,
