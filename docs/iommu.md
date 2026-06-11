@@ -155,9 +155,11 @@ TCB" and the system boots normally — H1 is a no-op where there is no IOMMU.
 **Confirmed on real hardware (T630, AMD GX-420GI):** the APU exposes AMD-Vi
 (IVRS, IOMMU MMIO `0xfeb80000`, 6-level), and a **USB keyboard types into the
 shell while its xHCI controller is confined to a 1 MiB arena with zero faults** —
-the flagship demonstrated end-to-end on silicon. Getting there surfaced three
-real bugs the emulator never could (each a case of QEMU being lenient or the
-firmware quietly covering for the driver):
+the flagship demonstrated end-to-end on silicon — and ultimately **both USB
+keyboards working at once with the IOMMU enabled: the front confined, the back in
+passthrough.** Getting there surfaced four real bugs the emulator never could
+(each a case of QEMU being lenient or the firmware quietly covering for the
+driver):
 
 1. **DTE permission bits in the wrong word.** `IR`/`IW` (bits 61/62) belong in
    the DTE's first 64-bit word; they were written into the second, setting
@@ -165,29 +167,35 @@ firmware quietly covering for the driver):
 2. **USB controllers still owned by firmware.** The drivers never performed the
    BIOS→OS handoff (EHCI's is in PCI config space, xHCI's in MMIO), so the
    firmware kept running the controllers' DMA out of firmware memory — invisible
-   without an IOMMU, a fault storm with one. The kernel now does both handoffs
-   before confining (`pci::{ehci,xhci}_bios_handoff`).
+   without an IOMMU, a fault storm with one. The kernel now hands off the
+   controller it confines (`pci::xhci_bios_handoff`).
 3. **xHCI scratchpad never allocated.** This controller reports
    `MaxScratchpadBufs=256` — it DMAs into 1 MiB of scratchpad it finds via
    `DCBAA[0]`. The driver left `DCBAA[0]=0` and leaned on firmware's scratchpad;
    once handed off it had none and devices dropped after binding. The arena grew
    to hold the 256 buffers and the driver builds the Scratchpad Buffer Array.
+4. **Wrong passthrough DTE encoding.** Passthrough was written as `V=1, TV=0`.
+   On real AMD-Vi that is **not** a transparent state — it broke *all* DMA for the
+   one device actually exercising passthrough after enable (the firmware-co-owned
+   EHCI controller), stalling the back keyboard. The canonical identity encoding
+   — `V=1, TV=1, mode=0, root=0, IR=1, IW=1`, exactly Linux `amd_iommu`'s
+   `PAGE_MODE_NONE` — is genuinely transparent. With it, EHCI runs untouched while
+   the IOMMU is on. QEMU accepted the broken encoding; only hardware rejected it.
 
-## 4a. Per-driver confinement: confinement is earned
+## 4a. Per-driver confinement: confine what can be confined, pass the rest through
 
-Confinement is applied **per driver**, and a driver earns it by being complete
-enough to run fully confined — all its controller's DMA inside the granted arena,
-firmware released. The xHCI driver qualifies. The **EHCI** driver does **not yet**:
-its async schedule is provably correct (a byte-dump of every QH/qTD field the
-controller reads showed only valid in-arena pointers), but the controller retains
-a stale internal DMA pointer into the firmware-ROM region (~`0xffffffc0`) that
-survives `HCRESET`. Confining EHCI turns that benign read (harmless pre-IOMMU)
-into a fatal `IO_PAGE_FAULT` and breaks the back-port keyboard. So **EHCI is left
-in IOMMU passthrough** until the quirk is resolved (candidate: a deeper PCI-level
-function reset before confinement). This asymmetry is the policy working as
-intended — a driver is confined only when confinement is safe, and the trust
-posture is explicit and logged at spawn (`spawn[dma]: 'ehci' left in IOMMU
-passthrough …`).
+Confinement is applied **per driver**. The xHCI driver is **confined**: handed off
++ scratchpad-complete, all its controller DMA inside the granted arena (a confined
+keyboard types on hardware). The **EHCI** driver is left in **passthrough**: its
+controller legitimately DMAs to firmware/hub regions outside any arena we could
+grant (the `0xffffffc0` accesses), and it reaches a low-speed keyboard only
+through a high-speed hub's transaction translator via split transactions — so a
+tight arena confinement isn't applicable. But passthrough is now genuinely
+transparent (bug 4), so EHCI works with the IOMMU enabled. The result on hardware:
+**front xHCI keyboard confined to least privilege, back EHCI keyboard working in
+transparent passthrough, simultaneously, zero faults.** A device is confined when
+confinement fits its DMA shape and passed through (transparently) otherwise; the
+trust posture is explicit and logged at spawn.
 
 ## 5. Phase 2 proposal — dropping the drivers from the TCB (PENDING SIGN-OFF)
 
