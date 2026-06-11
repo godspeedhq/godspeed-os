@@ -210,14 +210,17 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     // MMIO base + IRQ for a future userspace driver's hw_mmio/hw_interrupt caps.
     arch::x86_64::pci::init();
 
-    // Take the USB controllers from the firmware (BIOS→OS handoff) before the
-    // IOMMU confines them. Otherwise the firmware SMM keeps running the
-    // controllers' DMA out of firmware memory, which faults under confinement
-    // (the buffers are outside the driver's arena) and breaks the keyboard. Both
-    // controllers are handed off uniformly so neither leans on firmware support:
-    // EHCI's handoff register is in PCI config space, xHCI's is in MMIO — only
-    // the kernel can reach the former, so both live here.
-    arch::x86_64::pci::ehci_bios_handoff();
+    // Take a USB controller from the firmware (BIOS→OS handoff) before the IOMMU
+    // confines it — otherwise the firmware SMM keeps running its DMA out of
+    // firmware memory, which faults under confinement and breaks the keyboard.
+    //
+    // Handoff is done ONLY for controllers we confine. xHCI is confined, so it is
+    // handed off (it then runs fully on its own: handoff + scratchpad). EHCI is
+    // left in IOMMU passthrough (controller stale-pointer quirk, see task/mod.rs
+    // and docs/iommu.md), so it is NOT handed off — firmware keeps co-owning it
+    // exactly as before this branch, which is the configuration in which the
+    // back-port keyboard works. (ehci_bios_handoff stays available for when EHCI
+    // confinement is revisited.)
     arch::x86_64::pci::xhci_bios_handoff();
 
     // H1 Phase 0: probe ACPI for an AMD-Vi IOMMU (IVRS). Detection only — reports

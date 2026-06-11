@@ -126,6 +126,11 @@ fn config_write32(bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
 /// standard OS behaviour at init. EECP lives in PCI config space, which the
 /// userspace `ehci` driver cannot reach, so the kernel must do it. Idempotent;
 /// no-op if no EHCI, no extended caps, or no USB Legacy Support capability.
+///
+/// Retained but not currently called: EHCI is left in IOMMU passthrough (firmware
+/// co-owns it, the configuration the back-port keyboard works in), so it is not
+/// handed off. Re-enable when EHCI confinement is revisited.
+#[allow(dead_code)]
 pub fn ehci_bios_handoff() {
     if !EHCI_FOUND.load(Ordering::Relaxed) {
         return;
