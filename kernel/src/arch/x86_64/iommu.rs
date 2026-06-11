@@ -764,10 +764,10 @@ pub fn drain_event_log() -> u32 {
     let hhdm = crate::arch::x86_64::page_tables::get_hhdm_offset();
     let evt_va = phys_to_virt(evt_phys, hhdm);
 
-    // Recover from event-log overflow (status bit 0): if more faults arrived than
-    // the 256-entry ring holds, the IOMMU sets EventOverflow and stops logging.
-    // Clear it (disable EvtLogEn, write-1-to-clear the status bit, reset head/tail,
-    // re-enable) so logging resumes — otherwise fault counts silently cap out.
+    // Recover from event-log overflow (status bit 0) SILENTLY — count it and fold
+    // it into the throttled summary, never print per-overflow (a high fault rate
+    // overflows the 256-entry ring many times/sec). Disable EvtLogEn, RW1C the
+    // status bit, reset head/tail, re-enable so logging resumes.
     // SAFETY: mmio_va mapped in bringup; status/control/head/tail are valid regs.
     let status = unsafe { mmio_read64(mmio_va, reg::STATUS) };
     if status & 1 != 0 {
@@ -779,23 +779,19 @@ pub fn drain_event_log() -> u32 {
             mmio_write64(mmio_va, reg::EVENT_LOG_TAIL, 0);
             mmio_write64(mmio_va, reg::CONTROL, ctrl | CTRL_EVT_LOG_EN);
         }
-        crate::kprintln!("iommu: WARN event-log overflowed — recovered (fault rate exceeds drain)");
-        return 0;
+        FAULT_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
     }
+
+    let xhci_bdf = crate::arch::x86_64::pci::XHCI_BDF.load(Ordering::Relaxed);
+    let ehci_bdf = crate::arch::x86_64::pci::EHCI_BDF.load(Ordering::Relaxed);
 
     // SAFETY: mmio_va mapped in bringup; head/tail are valid registers.
     let mut head = unsafe { mmio_read64(mmio_va, reg::EVENT_LOG_HEAD) } & 0xFFF;
     let tail = unsafe { mmio_read64(mmio_va, reg::EVENT_LOG_TAIL) } & 0xFFF;
-    if head == tail {
-        return 0;
-    }
 
-    // Drain the ring SILENTLY — accumulate into counters and advance head. The
-    // IOMMU runs in the timer ISR; printing a line per fault (a confined driver
-    // can fault thousands of times/sec) floods the serial+framebuffer under the
-    // console lock and can starve other cores. Instead we coalesce and emit one
-    // throttled summary line, well below the fault rate. We drain up to a full
-    // ring per call so we keep up and avoid overflow.
+    // Drain the ring SILENTLY — accumulate per-controller counters, advance head.
+    // Printing a line per fault (thousands/sec) would flood serial+framebuffer
+    // under the console lock from the timer ISR. We emit one throttled summary.
     let mut drained = 0u32;
     let mut budget = 256u32;
     while head != tail && budget > 0 {
@@ -815,29 +811,42 @@ pub fn drain_event_log() -> u32 {
         let devid = dw0 & 0xFFFF;
         let code = (dw1 >> 28) & 0xF;
         let addr = ((dw3 as u64) << 32) | (dw2 as u64);
-        FAULT_TOTAL.fetch_add(1, Ordering::Relaxed);
-        FAULT_LAST_DEV.store(devid, Ordering::Relaxed);
         FAULT_LAST_CODE.store(code, Ordering::Relaxed);
-        FAULT_LAST_ADDR.store(addr, Ordering::Relaxed);
+        if devid == xhci_bdf {
+            XHCI_FAULTS.fetch_add(1, Ordering::Relaxed);
+            XHCI_LAST_ADDR.store(addr, Ordering::Relaxed);
+        } else if devid == ehci_bdf {
+            EHCI_FAULTS.fetch_add(1, Ordering::Relaxed);
+            EHCI_LAST_ADDR.store(addr, Ordering::Relaxed);
+        } else {
+            OTHER_FAULTS.fetch_add(1, Ordering::Relaxed);
+            OTHER_LAST_DEV.store(devid, Ordering::Relaxed);
+            OTHER_LAST_ADDR.store(addr, Ordering::Relaxed);
+        }
         head = (head + 16) & 0xFFF;
         drained += 1;
     }
-    // SAFETY: advance the consumed head so the IOMMU can refill the ring.
-    unsafe { mmio_write64(mmio_va, reg::EVENT_LOG_HEAD, head) };
+    if drained > 0 {
+        // SAFETY: advance the consumed head so the IOMMU can refill the ring.
+        unsafe { mmio_write64(mmio_va, reg::EVENT_LOG_HEAD, head) };
+    }
 
-    // Throttled summary: at most once per ~2.5 s (256 ticks), and only when new
-    // faults have accumulated since the last report.
+    // Throttled summary: at most once per ~2.5 s (256 ticks), only when new faults
+    // accumulated. Per-controller counts + last faulting address (the address is
+    // the diagnostic — it says exactly where each controller's DMA overstepped).
     if FAULT_THROTTLE.fetch_add(1, Ordering::Relaxed) % 256 == 0 {
-        let total = FAULT_TOTAL.load(Ordering::Relaxed);
-        let reported = FAULT_REPORTED.load(Ordering::Relaxed);
-        if total > reported {
-            let devid = FAULT_LAST_DEV.load(Ordering::Relaxed);
-            let code = FAULT_LAST_CODE.load(Ordering::Relaxed);
-            let addr = FAULT_LAST_ADDR.load(Ordering::Relaxed);
+        let xf = XHCI_FAULTS.load(Ordering::Relaxed);
+        let ef = EHCI_FAULTS.load(Ordering::Relaxed);
+        let of = OTHER_FAULTS.load(Ordering::Relaxed);
+        let ov = FAULT_OVERFLOWS.load(Ordering::Relaxed);
+        let total = xf + ef + of;
+        if total > FAULT_REPORTED.load(Ordering::Relaxed) {
             crate::kprintln!(
-                "iommu: {} IOMMU fault(s) [total {}], last code={:#x} dev={:02x}:{:02x}.{} addr={:#x}",
-                total - reported, total, code,
-                (devid >> 8) & 0xff, (devid >> 3) & 0x1f, devid & 0x7, addr
+                "iommu faults: xhci={} (last {:#x}) ehci={} (last {:#x}) other={} (dev={:#x} {:#x}) overflow={} code={:#x}",
+                xf, XHCI_LAST_ADDR.load(Ordering::Relaxed),
+                ef, EHCI_LAST_ADDR.load(Ordering::Relaxed),
+                of, OTHER_LAST_DEV.load(Ordering::Relaxed), OTHER_LAST_ADDR.load(Ordering::Relaxed),
+                ov, FAULT_LAST_CODE.load(Ordering::Relaxed)
             );
             FAULT_REPORTED.store(total, Ordering::Relaxed);
         }
@@ -845,13 +854,18 @@ pub fn drain_event_log() -> u32 {
     drained
 }
 
-/// Coalesced fault-event counters (rate-limited logging from the timer ISR).
-static FAULT_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Coalesced per-controller fault counters (rate-limited logging from timer ISR).
+static XHCI_FAULTS: AtomicU64 = AtomicU64::new(0);
+static EHCI_FAULTS: AtomicU64 = AtomicU64::new(0);
+static OTHER_FAULTS: AtomicU64 = AtomicU64::new(0);
 static FAULT_REPORTED: AtomicU64 = AtomicU64::new(0);
+static FAULT_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
+static XHCI_LAST_ADDR: AtomicU64 = AtomicU64::new(0);
+static EHCI_LAST_ADDR: AtomicU64 = AtomicU64::new(0);
+static OTHER_LAST_ADDR: AtomicU64 = AtomicU64::new(0);
+static OTHER_LAST_DEV: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static FAULT_THROTTLE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-static FAULT_LAST_DEV: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static FAULT_LAST_CODE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-static FAULT_LAST_ADDR: AtomicU64 = AtomicU64::new(0);
 
 /// Read the IOMMU event-log head/tail (for fault observation). Returns
 /// `(head, tail)` byte offsets; head != tail means fault events were logged.

@@ -591,7 +591,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let hcc1 = mmio.read32(CAP_HCCPARAMS1);
     let max_slots = hcs1 & 0xFF;
     let max_ports = (hcs1 >> 24) & 0xFF;
-    let _hcs2 = mmio.read32(CAP_HCSPARAMS2);
+    let hcs2 = mmio.read32(CAP_HCSPARAMS2);
+    // Max Scratchpad Buffers: HCSPARAMS2 bits [31:27] (hi) and [25:21] (lo). Real
+    // controllers need these pages allocated and DCBAA[0] pointed at the buffer
+    // array before they run; if non-zero we must set them up (§ scratchpad).
+    let max_scratch = (((hcs2 >> 27) & 0x1F) << 5) | ((hcs2 >> 21) & 0x1F);
     let ctx_size = if hcc1 & (1 << 2) != 0 { 64 } else { 32 }; // CSZ
     let dboff = (mmio.read32(CAP_DBOFF) & !0x3) as usize;
     let rtsoff = (mmio.read32(CAP_RTSOFF) & !0x1F) as usize;
@@ -599,8 +603,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let ir0 = rtsoff + 0x20;
 
     ctx.log_fmt(format_args!(
-        "xhci: v{:#06x} slots={} ports={} ctx_size={} dboff={:#x} rtsoff={:#x}",
-        version, max_slots, max_ports, ctx_size, dboff, rtsoff
+        "xhci: v{:#06x} slots={} ports={} ctx_size={} dboff={:#x} rtsoff={:#x} max_scratch={}",
+        version, max_slots, max_ports, ctx_size, dboff, rtsoff, max_scratch
     ));
 
     // Hot-plug state that persists across passes.
