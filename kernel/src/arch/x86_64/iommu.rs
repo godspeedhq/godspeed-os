@@ -790,13 +790,21 @@ pub fn drain_event_log() -> u32 {
         return 0;
     }
 
-    let mut printed = 0u32;
-    let mut budget = 32u32; // bound the per-call work (event log is 256 entries)
+    // Drain the ring SILENTLY — accumulate into counters and advance head. The
+    // IOMMU runs in the timer ISR; printing a line per fault (a confined driver
+    // can fault thousands of times/sec) floods the serial+framebuffer under the
+    // console lock and can starve other cores. Instead we coalesce and emit one
+    // throttled summary line, well below the fault rate. We drain up to a full
+    // ring per call so we keep up and avoid overflow.
+    let mut drained = 0u32;
+    let mut budget = 256u32;
     while head != tail && budget > 0 {
         budget -= 1;
         let entry = evt_va + head;
+        // Event entry = four little-endian dwords: dw0=DeviceID, dw1=code|flags,
+        // dw2=addr[31:0], dw3=addr[63:32].
         // SAFETY: entry is within the mapped 4 KiB event-log ring (head < 0x1000).
-        let (e0, e1, e2, e3) = unsafe {
+        let (dw0, dw1, dw2, dw3) = unsafe {
             (
                 core::ptr::read_volatile(entry as *const u32),
                 core::ptr::read_volatile((entry + 4) as *const u32),
@@ -804,32 +812,46 @@ pub fn drain_event_log() -> u32 {
                 core::ptr::read_volatile((entry + 12) as *const u32),
             )
         };
-        let devid = e0 & 0xFFFF;
-        let code = (e1 >> 28) & 0xF;
-        let addr = ((e3 as u64) << 32) | (e2 as u64);
-        let name = match code {
-            0x1 => "ILLEGAL_DEV_TAB_ENTRY",
-            0x2 => "IO_PAGE_FAULT",
-            0x3 => "DEV_TAB_HW_ERROR",
-            0x4 => "PAGE_TAB_HW_ERROR",
-            0x5 => "ILLEGAL_COMMAND",
-            0x6 => "COMMAND_HW_ERROR",
-            0x7 => "IOTLB_INV_TIMEOUT",
-            0x8 => "INVALID_DEV_REQUEST",
-            _ => "UNKNOWN",
-        };
-        crate::kprintln!(
-            "iommu: EVENT {} (code={:#x}) dev={:02x}:{:02x}.{} addr={:#x} raw={:08x},{:08x},{:08x},{:08x}",
-            name, code, (devid >> 8) & 0xff, (devid >> 3) & 0x1f, devid & 0x7,
-            addr, e0, e1, e2, e3
-        );
+        let devid = dw0 & 0xFFFF;
+        let code = (dw1 >> 28) & 0xF;
+        let addr = ((dw3 as u64) << 32) | (dw2 as u64);
+        FAULT_TOTAL.fetch_add(1, Ordering::Relaxed);
+        FAULT_LAST_DEV.store(devid, Ordering::Relaxed);
+        FAULT_LAST_CODE.store(code, Ordering::Relaxed);
+        FAULT_LAST_ADDR.store(addr, Ordering::Relaxed);
         head = (head + 16) & 0xFFF;
-        printed += 1;
+        drained += 1;
     }
     // SAFETY: advance the consumed head so the IOMMU can refill the ring.
     unsafe { mmio_write64(mmio_va, reg::EVENT_LOG_HEAD, head) };
-    printed
+
+    // Throttled summary: at most once per ~2.5 s (256 ticks), and only when new
+    // faults have accumulated since the last report.
+    if FAULT_THROTTLE.fetch_add(1, Ordering::Relaxed) % 256 == 0 {
+        let total = FAULT_TOTAL.load(Ordering::Relaxed);
+        let reported = FAULT_REPORTED.load(Ordering::Relaxed);
+        if total > reported {
+            let devid = FAULT_LAST_DEV.load(Ordering::Relaxed);
+            let code = FAULT_LAST_CODE.load(Ordering::Relaxed);
+            let addr = FAULT_LAST_ADDR.load(Ordering::Relaxed);
+            crate::kprintln!(
+                "iommu: {} IOMMU fault(s) [total {}], last code={:#x} dev={:02x}:{:02x}.{} addr={:#x}",
+                total - reported, total, code,
+                (devid >> 8) & 0xff, (devid >> 3) & 0x1f, devid & 0x7, addr
+            );
+            FAULT_REPORTED.store(total, Ordering::Relaxed);
+        }
+    }
+    drained
 }
+
+/// Coalesced fault-event counters (rate-limited logging from the timer ISR).
+static FAULT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FAULT_REPORTED: AtomicU64 = AtomicU64::new(0);
+static FAULT_THROTTLE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static FAULT_LAST_DEV: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static FAULT_LAST_CODE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static FAULT_LAST_ADDR: AtomicU64 = AtomicU64::new(0);
 
 /// Read the IOMMU event-log head/tail (for fault observation). Returns
 /// `(head, tail)` byte offsets; head != tail means fault events were logged.

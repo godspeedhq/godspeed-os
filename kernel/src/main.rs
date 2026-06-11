@@ -210,12 +210,15 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     // MMIO base + IRQ for a future userspace driver's hw_mmio/hw_interrupt caps.
     arch::x86_64::pci::init();
 
-    // Take the EHCI controller from the firmware (BIOS→OS handoff) before the
-    // IOMMU confines it. Otherwise the firmware keeps running the controller's
-    // periodic schedule out of firmware memory, which faults under confinement
-    // (the buffers are outside the driver's arena) and breaks the back-port
-    // keyboard. EECP lives in PCI config space, so only the kernel can do this.
+    // Take the USB controllers from the firmware (BIOS→OS handoff) before the
+    // IOMMU confines them. Otherwise the firmware SMM keeps running the
+    // controllers' DMA out of firmware memory, which faults under confinement
+    // (the buffers are outside the driver's arena) and breaks the keyboard. Both
+    // controllers are handed off uniformly so neither leans on firmware support:
+    // EHCI's handoff register is in PCI config space, xHCI's is in MMIO — only
+    // the kernel can reach the former, so both live here.
     arch::x86_64::pci::ehci_bios_handoff();
+    arch::x86_64::pci::xhci_bios_handoff();
 
     // H1 Phase 0: probe ACPI for an AMD-Vi IOMMU (IVRS). Detection only — reports
     // whether this machine can confine DMA-capable drivers to their granted

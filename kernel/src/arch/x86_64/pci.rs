@@ -208,6 +208,106 @@ pub fn ehci_bios_handoff() {
     crate::kprintln!("ehci-handoff: no USB Legacy Support capability found");
 }
 
+/// Take ownership of the xHCI controller from the firmware (BIOS→OS handoff).
+///
+/// Unlike EHCI (whose handoff register is in PCI config space), xHCI's extended
+/// capabilities — including USB Legacy Support — live in MMIO, reached via the
+/// xECP field of HCCPARAMS1 (MMIO cap offset 0x10). We could put this in the
+/// userspace driver, but doing it here keeps both controllers handed off
+/// uniformly before the IOMMU confines them: otherwise the firmware SMM keeps
+/// poking the controller (running DMA out of firmware memory, which faults under
+/// confinement) and the device that was leaning on firmware support breaks.
+/// Idempotent; no-op if no xHCI, no extended caps, or no Legacy Support cap.
+pub fn xhci_bios_handoff() {
+    if !XHCI_FOUND.load(Ordering::Relaxed) {
+        return;
+    }
+    let mmio = XHCI_MMIO_BASE.load(Ordering::Relaxed);
+    if mmio == 0 {
+        return;
+    }
+    let hhdm = crate::arch::x86_64::page_tables::get_hhdm_offset();
+    let base = mmio & !0xFFF;
+    {
+        use crate::arch::x86_64::page_tables::{map_in_active_tables, PageFlags};
+        let flags = PageFlags::PRESENT.bits()
+            | PageFlags::WRITABLE.bits()
+            | PageFlags::NO_EXEC.bits()
+            | PageFlags::PWT.bits()
+            | PageFlags::PCD.bits();
+        // Map 16 pages (64 KiB) — enough to reach the extended-capability list.
+        for i in 0..16u64 {
+            let off = i * 0x1000;
+            // SAFETY: called after set_hhdm_offset; mapping the xHCI MMIO pages
+            // (page-aligned) uncached. Already-present is a no-op.
+            if unsafe { map_in_active_tables(hhdm + base + off, base + off, flags) }.is_err() {
+                crate::kprintln!("xhci-handoff: WARN could not map MMIO {:#x}", base + off);
+                return;
+            }
+        }
+    }
+    let va = hhdm + mmio;
+    // HCCPARAMS1 (cap offset 0x10): xECP = bits [31:16], a dword offset from base.
+    // SAFETY: within the mapped MMIO; aligned 32-bit read.
+    let hccparams1 = unsafe { core::ptr::read_volatile((va + 0x10) as *const u32) };
+    let xecp = (hccparams1 >> 16) & 0xFFFF;
+    if xecp == 0 {
+        crate::kprintln!("xhci-handoff: no extended capabilities");
+        return;
+    }
+    // Walk the MMIO extended-capability list for USB Legacy Support (ID 1).
+    let mut off = (xecp as u64) * 4;
+    let mut guard = 64;
+    while off != 0 && off < 0x10000 && guard > 0 {
+        guard -= 1;
+        let cap_va = va + off;
+        // SAFETY: off bounded < 0x10000, within the mapped 64 KiB; aligned read.
+        let cap = unsafe { core::ptr::read_volatile(cap_va as *const u32) };
+        let cap_id = cap & 0xFF;
+        if cap_id == 0x01 {
+            // USBLEGSUP at `off`: bit16 = BIOS Owned, bit24 = OS Owned.
+            if cap & (1 << 16) != 0 {
+                // SAFETY: claim OS ownership.
+                unsafe { core::ptr::write_volatile(cap_va as *mut u32, cap | (1 << 24)) };
+                let mut ok = false;
+                for _ in 0..1_000_000u32 {
+                    // SAFETY: poll the same register for BIOS release.
+                    if unsafe { core::ptr::read_volatile(cap_va as *const u32) } & (1 << 16) == 0 {
+                        ok = true;
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+                crate::kprintln!(
+                    "xhci-handoff: USBLEGSUP@{:#x} OS-owned, BIOS released={} (was {:#010x})",
+                    off, ok as u8, cap
+                );
+            } else {
+                crate::kprintln!("xhci-handoff: already OS-owned (USBLEGSUP={:#010x})", cap);
+            }
+            // USBLEGCTLSTS (off+4): disable all BIOS SMIs, clear SMI events (RW1C).
+            // Masks per the xHCI spec / Linux quirk_usb_handoff_xhci.
+            const DISABLE_SMI: u32 = (0x7 << 1) | (0xff << 5) | (0x7 << 17);
+            const SMI_EVENTS: u32 = 0x7 << 29;
+            // SAFETY: ctlsts is the dword after USBLEGSUP, within the mapping.
+            let ctl = unsafe { core::ptr::read_volatile((cap_va + 4) as *const u32) };
+            unsafe {
+                core::ptr::write_volatile(
+                    (cap_va + 4) as *mut u32,
+                    (ctl & !DISABLE_SMI) | SMI_EVENTS,
+                )
+            };
+            return;
+        }
+        let next = (cap >> 8) & 0xFF; // next pointer, in dwords
+        if next == 0 {
+            break;
+        }
+        off += (next as u64) * 4;
+    }
+    crate::kprintln!("xhci-handoff: no USB Legacy Support capability found");
+}
+
 /// Scan the PCI bus for the xHCI controller and record its MMIO base + IRQ.
 /// Called once on the BSP during boot. Logs the result either way.
 pub fn init() {

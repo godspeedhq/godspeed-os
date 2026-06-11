@@ -138,7 +138,7 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | arch/x86_64/iommu.rs | 74 | permitted |
 | arch/x86_64/mod.rs | 34 | permitted |
 | arch/x86_64/page_tables.rs | 35 | permitted |
-| arch/x86_64/pci.rs | 8 | permitted |
+| arch/x86_64/pci.rs | 15 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |
 | arch/x86_64/syscall_entry.rs | 13 | permitted |
 | capability/table.rs | 7 | permitted |
@@ -159,9 +159,9 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | task/scheduler.rs | 37 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 353 lines across 21 files  
+**Permitted total:** 360 lines across 21 files  
 **Grandfathered total:** 53 lines across 6 files  
-**Grand total:** 406 lines across 27 files
+**Grand total:** 413 lines across 27 files
 
 > **2026-06-10** (branch `feat/iommu-dma-confinement`). New file `arch/x86_64/iommu.rs`
 > (+60, permitted): the H1 AMD-Vi IOMMU work. Phase 0 (+18) is ACPI-table reads
@@ -413,8 +413,15 @@ Three additional unsafe lines (+3) for the EHCI BIOS→OS handoff
 + `outl(data)`, same discipline as `config_read32`), the `map_in_active_tables`
 call mapping the EHCI MMIO page to read HCCPARAMS, and the `read_volatile` of
 HCCPARAMS. Sound for the same reason — ring-0 BSP boot, architecturally fixed
-ports, the MMIO page mapped uncached before the single aligned read. All carry
-`// SAFETY:` comments.
+ports, the MMIO page mapped uncached before the single aligned read.
+
+Seven more (+7) for the xHCI BIOS→OS handoff (`xhci_bios_handoff`): xHCI's legacy
+support lives in MMIO (not PCI config), so this maps the xHCI MMIO (16 pages,
+uncached), reads HCCPARAMS1 for the xECP, then walks the MMIO extended-capability
+list — `read_volatile`/`write_volatile` of USBLEGSUP (claim OS ownership, poll
+for BIOS release) and USBLEGCTLSTS (disable firmware SMIs). Each access is within
+the just-mapped 64 KiB MMIO window at a bounded offset (< 0x10000), during
+single-threaded BSP boot. All carry `// SAFETY:` comments.
 
 ---
 
