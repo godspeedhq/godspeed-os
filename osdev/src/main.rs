@@ -896,6 +896,7 @@ fn cmd_test(suite: &str) {
         "iommu"        => run_iommu_test(),
         "blockdev"     => run_blockdev_test(),
         "blockdev-reboot" => run_blockdev_reboot_test(),
+        "blockdev-ahci"   => run_blockdev_ahci_test(),
         other => eprintln!("unknown test suite: {}", other),
     }
 }
@@ -1237,6 +1238,105 @@ fn run_blockdev_reboot_test() {
         println!("\n  [P1.5]  fs reboot survival (write → reboot → read)    … PASS\n\n  1 passed  0 failed");
     } else {
         println!("\n  [P1.5]  fs reboot survival (write → reboot → read)    … FAIL\n\n  0 passed  1 failed");
+        std::process::exit(1);
+    }
+}
+
+/// Build the AHCI block-driver variant: block-driver with its `ahci` feature,
+/// supervisor spawns only it (blockprobe) — no fs yet (AHCI read/write WIP).
+fn cmd_build_blockdev_ahci() {
+    clean_supervisor();
+    let others = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "fs"];
+    for crate_name in &others {
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"])
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run cargo build for {}: {}", crate_name, e));
+        if !status.success() { eprintln!("build: {} FAILED", crate_name); std::process::exit(1); }
+        println!("build: {} OK", crate_name);
+    }
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "block-driver", "--target", "x86_64-unknown-none",
+               "--features", "ahci"])
+        .status().unwrap_or_else(|e| panic!("failed to run cargo build for block-driver: {}", e));
+    if !status.success() { eprintln!("build: block-driver (ahci) FAILED"); std::process::exit(1); }
+    println!("build: block-driver (ahci) OK");
+
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "supervisor", "--target", "x86_64-unknown-none",
+               "--features", "supervisor/bare-metal,supervisor/blockprobe"])
+        .status().unwrap_or_else(|e| panic!("failed to run cargo build for supervisor: {}", e));
+    if !status.success() { eprintln!("build: supervisor FAILED"); std::process::exit(1); }
+    println!("build: supervisor (bare-metal,blockprobe) OK");
+
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .status().expect("failed to run cargo build for kernel");
+    if !status.success() { eprintln!("build: kernel FAILED"); std::process::exit(1); }
+    println!("build: kernel OK");
+}
+
+/// AHCI step A (docs/ahci.md): boot with an ich9-ahci SATA controller + a disk on
+/// it, and verify block-driver detects the HBA and the SATA disk via MMIO.
+fn run_blockdev_ahci_test() {
+    println!("\n=== AHCI step A: detect SATA controller + disk ===");
+    cmd_build_blockdev_ahci();
+
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_ahci.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create persist disk");
+
+    let serial = "build/tests/ahci_test_serial.log";
+    let _ = std::fs::remove_file(serial);
+    let img = std::fs::canonicalize(&image_path).unwrap_or_else(|_| image_path.to_path_buf());
+    let img_str = img.to_string_lossy().replace('\\', "/");
+    let persist_abs = std::fs::canonicalize(persist).unwrap_or_else(|_| std::path::PathBuf::from(persist));
+    let persist_str = persist_abs.to_string_lossy().replace('\\', "/");
+
+    let mut cmd = std::process::Command::new(qemu::qemu_binary());
+    cmd.args([
+        "-m", "512M", "-smp", "2",
+        // An explicit AHCI controller (i440fx has no built-in one); boot disk on
+        // port 0, the data disk on port 1 — both SATA, so block-driver sees them.
+        "-device", "ich9-ahci,id=ahci",
+        "-drive", &format!("id=boot,format=raw,file={img_str},if=none"),
+        "-device", "ide-hd,drive=boot,bus=ahci.0",
+        "-drive", &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device", "ide-hd,drive=data,bus=ahci.1",
+        "-serial", &format!("file:{serial}"),
+        "-serial", "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]);
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("ahci: failed to launch QEMU: {e}"); std::process::exit(1); });
+    println!("ahci: booting (ich9-ahci + 2 SATA disks), ~25s …");
+    std::thread::sleep(std::time::Duration::from_secs(25));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let log = std::fs::read_to_string(serial).unwrap_or_default().replace('\r', "");
+    let pci_found = log.contains("pci: AHCI at");
+    let hba       = log.contains("block-driver: AHCI HBA");
+    let disk      = log.contains("AHCI detection OK — SATA disk on port");
+    let no_panic  = !log.contains("KERNEL PANIC");
+
+    for l in log.lines().filter(|l| l.contains("AHCI") || l.contains("block-driver")) {
+        println!("ahci:   | {}", l.trim());
+    }
+    println!("ahci:   PCI found AHCI controller ... {}", if pci_found { "yes" } else { "NO" });
+    println!("ahci:   driver detected HBA ... {}", if hba { "yes" } else { "NO" });
+    println!("ahci:   SATA disk detected on a port ... {}", if disk { "yes" } else { "NO" });
+    println!("ahci:   kernel did not panic ... {}", if no_panic { "yes" } else { "NO" });
+
+    if pci_found && hba && disk && no_panic {
+        println!("\n  [AHCI.A]  detect SATA controller + disk  … PASS\n\n  1 passed  0 failed");
+    } else {
+        println!("\n  [AHCI.A]  detect SATA controller + disk  … FAIL\n\n  0 passed  1 failed");
         std::process::exit(1);
     }
 }

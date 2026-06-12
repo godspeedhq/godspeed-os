@@ -3068,6 +3068,8 @@ fn spawn_service_with_config(
             pci::XHCI_MMIO_BASE.load(Relaxed)
         } else if name == "ehci" && pci::EHCI_FOUND.load(Relaxed) {
             pci::EHCI_MMIO_BASE.load(Relaxed)
+        } else if name == "block-driver" && pci::AHCI_FOUND.load(Relaxed) {
+            pci::AHCI_ABAR.load(Relaxed) // AHCI HBA registers (docs/ahci.md)
         } else {
             0
         };
@@ -3119,10 +3121,16 @@ fn spawn_service_with_config(
         use crate::arch::x86_64::pci;
         (name == "xhci" && pci::XHCI_FOUND.load(Relaxed))
             || (name == "ehci" && pci::EHCI_FOUND.load(Relaxed))
+            || (name == "block-driver" && pci::AHCI_FOUND.load(Relaxed)) // AHCI (docs/ahci.md)
     };
     // Per-driver arena size: xHCI needs room for its 256 scratchpad buffers;
-    // EHCI gets the small 64 KiB arena it had on main (see the constants above).
-    let dma_pages = if name == "ehci" { EHCI_DMA_PAGES } else { XHCI_DMA_PAGES };
+    // EHCI gets the small 64 KiB arena it had on main; the AHCI block driver needs
+    // only its command list/FIS/command table + a data buffer — 64 KiB is plenty.
+    let dma_pages = if name == "ehci" || name == "block-driver" {
+        EHCI_DMA_PAGES
+    } else {
+        XHCI_DMA_PAGES
+    };
     let (xhci_dma_va, xhci_dma_phys, xhci_dma_len) = if dma_for_driver {
         match crate::memory::allocator::alloc_contiguous(dma_pages as usize) {
             Some(phys) => {

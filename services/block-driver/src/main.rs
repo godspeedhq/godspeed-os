@@ -16,6 +16,9 @@
 
 use godspeed_sdk::{CapHandle, Message, Pio, ServiceContext};
 
+#[cfg(feature = "ahci")]
+mod ahci;
+
 // Block IPC protocol (fs <-> block-driver). MUST match `services/fs`.
 //   Request : [op:u8, lba:u32 LE, (WriteBlock only: 512 data bytes)]
 //   Reply   : [status:u8, (ReadBlock only: 512 data bytes)]
@@ -48,13 +51,24 @@ const SCRATCH_LBA: u32 = 100;
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
-    let pio = ctx.pio();
     #[cfg(feature = "hw-probe")]
     {
+        let pio = ctx.pio();
         hw_probe_run(&ctx, &pio)
     }
-    #[cfg(not(feature = "hw-probe"))]
+    #[cfg(all(not(feature = "hw-probe"), feature = "ahci"))]
     {
+        match ctx.mmio() {
+            Some(hba) => ahci::run(&ctx, &hba),
+            None => {
+                ctx.log("block-driver: no AHCI ABAR granted (no SATA controller found)");
+                loop { ctx.yield_cpu(); }
+            }
+        }
+    }
+    #[cfg(all(not(feature = "hw-probe"), not(feature = "ahci")))]
+    {
+        let pio = ctx.pio();
         normal_run(ctx, pio)
     }
 }

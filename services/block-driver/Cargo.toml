@@ -16,3 +16,7 @@ godspeed-sdk = { path = "../../sdk/rust" }
 # WRITE SECTORS — disk media is untouched. Used to discover whether the T630 exposes a
 # disk via legacy IDE, and on which channel, before any write test.
 hw-probe = []
+# AHCI (SATA) backend instead of ATA PIO (docs/ahci.md). The modern-hardware path
+# (the T630's SSD is AHCI-only). Develops against QEMU q35/ich9-ahci; will become
+# the default once read/write/fs/reboot are verified on it, retiring ATA PIO.
+ahci = []

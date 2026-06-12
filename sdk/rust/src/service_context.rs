@@ -878,6 +878,19 @@ impl ServiceContext {
         }
     }
 
+    /// Safe MMIO handle to this service's device register window, if one was
+    /// granted (§12) — the neutrally-named accessor for non-USB drivers (e.g. the
+    /// AHCI `block-driver`, which maps its HBA ABAR here). Same kernel-mapped
+    /// window as [`xhci_mmio`](Self::xhci_mmio). `None` for non-driver services.
+    pub fn mmio(&self) -> Option<crate::mmio::Mmio> {
+        let va = Self::ctx().xhci_mmio_va;
+        if va == 0 {
+            None
+        } else {
+            Some(crate::mmio::Mmio::new(va as *mut u8))
+        }
+    }
+
     /// Safe handle to this service's DMA arena, if one was granted (§12). The
     /// kernel mapped a physically-contiguous region into this driver; the
     /// returned [`crate::Dma`] gives the CPU view (read/write) and the physical
