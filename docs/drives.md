@@ -38,8 +38,8 @@ With pluggable drives, the system needs to know *which* disk to mount on boot.
 ## 4. Multiple drives
 
 GodSpeed sees every attached disk (block-driver enumerates all SATA ports; today
-it only uses the first — multi-drive lifts that). Each drive is an independent flat
-GSFS namespace. A drive moves through states:
+it only uses the first — multi-drive lifts that). Each drive is an independent GSFS
+tree (its own root directory). A drive moves through states:
 
 ```
   raw  ──flash──▶  flashed  ──mount──▶  mounted  ──use──▶  current
@@ -48,67 +48,65 @@ GSFS namespace. A drive moves through states:
                                          readable)
 ```
 
-- **`mounted`** — `fs` has loaded the drive's superblock + entry table; you can
+- **`mounted`** — `fs` has loaded the drive's superblock + root directory; you can
   list/read it. Bounded: `fs` holds up to a fixed number of mounted drives (e.g. 4).
 - **`current`** — the one *unqualified* commands operate on. Exactly one at a time.
 - **`mount` ≠ `use`.** `drives mount 1` makes a drive accessible without making it
   current; `drives use 1` mounts it (if needed) **and** makes it current. This
   separates "I can see into it" from "it's my working drive."
 
-### 4.1 Addressing files across drives — by label (identity over location)
+### 4.1 Addressing — `[N:]label/path/to/file`
 
-GSFS is **flat** (name → blob, no directories), so there is nothing to `cd` into;
-"switching drives" is just changing the *current* drive. To touch a file on a
-*different* drive without switching, qualify the name with the drive.
-
-The GodSpeed-native way to name a drive is by **label, not index** — this is
-**invariant 11 (identity is stable; location is not)** applied to storage:
-
-- A drive's **index/port is its *location*** — it changes when you replug it.
-- A drive's **label is its *identity*** — stored in the GSFS superblock, stable
-  forever, replug-safe.
-
-So you flash a drive *with a name* and address it by that name regardless of port:
+GSFS has **real directories** (§ persistence.md), so a file is named by a path
+*within* a drive, and a drive is named by its label (optionally prefixed by index):
 
 ```
-  ls               # current drive
-  ls backup:       # the drive labelled "backup", without switching to it
-  cat backup:notes.txt
-  drives use backup
+  <address> ::= [ N: ] label / dir / … / file        # on another drive
+              |             /path/to/file             # on the current drive (leading /)
+              |              path/to/file             # relative to the current dir
 ```
 
-Bare name → current drive; `label:name` → that drive explicitly. (Plain indices
-like `1:name` also work as a fallback before a drive is labelled.)
+The **drive** part is the GodSpeed-native bit — **identity over location**
+(invariant 11): the **label is the drive's identity** (stored in the GSFS
+superblock, stable across replug); the **index is its location** (the port — changes
+when you replug). You normally use the **label alone**; you prefix the **index `N:`**
+only to disambiguate (see §4.2). Examples:
 
-### 4.2 Labels are unique — no duplicates (prevents cleverness)
+```
+  ls archive/projects/2026          # 'archive' is unique → no index needed
+  cat 0:data/notes.txt              # 'data' on drive 0
+  cat 1:data/notes.txt              # 'data' on drive 1 (a different drive, same label)
+  cat /etc/boot.cfg                 # leading / → current drive, absolute path
+  cat notes.txt                     # relative to the current directory
+```
 
-**There is never more than one drive with a given label.** GodSpeed refuses to
-*create* a clash rather than build machinery to *resolve* one (§26.13 discipline
-over cleverness, §26.2 simplicity). Uniqueness is enforced among the drives
-GodSpeed can currently see:
+Switching the *current* drive (`drives use`) changes what bare/relative paths mean;
+the `[N:]label/…` form reaches any mounted drive without switching.
 
-- **`drives flash <n> <label>`** and **`drives label <n> <label>`** are refused if
-  that label is already used by an attached drive — pick another unique name:
-  ```
-  gs> drives flash 2 data
-    drives: label 'data' is already used by drive 0. choose another name.
-  ```
-- **On boot / plug-in**, if a drive's stored label collides with one that's already
-  mounted, the newcomer is **not mounted** — reported loudly (§3.12), and shown as
-  unusable until relabelled. The index (location) is still unique, so you can always
-  reach it to fix it:
+### 4.2 Duplicate labels are fine — index disambiguates
+
+Labels need **not** be unique. Two drives can both be `data` — flashed separately,
+or one arriving pre-labelled from another GodSpeed instance. They are distinguished
+by the **index prefix**, which is unique by physics (one drive per port):
+
+- Unique label → address by label alone: `archive/…`.
+- Clashing label → prefix the index: `0:data/…` vs `1:data/…`. Both forms still
+  show a readable name; the number only disambiguates.
+
+This makes cross-instance drives **just work**: plug in a foreign `data` disk and it
+mounts as `1:data` — no refusing, no forced relabel, no silent renaming (§26.5), no
+UUID. Identity (label) names it; location (index) disambiguates when identity repeats.
+
+- `drives` flags a duplicated label so you can see it (and relabel with
+  `drives label N <new>` if you want a unique name), but it is never *required*:
   ```
   gs> drives
-    #  LABEL      STATUS          …
-    0  data       mounted         …
-    1  data       label-clash     …   ← not mounted; relabel to use it
-  gs> drives label 1 backup
-    drives: drive 1 relabelled → 'backup'; now mountable
+    #  LABEL      STATUS     …
+    0  data       mounted    …
+    1  data  (2)  mounted    …   ← duplicate label; address as 0:data / 1:data
   ```
-
-Because labels are unique, **`label:name` is always unambiguous** and there is no
-index-fallback resolution, no duplicate-marker, and no need for a separate UUID.
-The label *is* the drive's identity, and identities don't collide.
+- `drives use data` with two `data` drives asks you to qualify:
+  `drives use 1` (or `drives use 1:data`).
 
 ## 5. Command set
 
@@ -116,12 +114,12 @@ The label *is* the drive's identity, and identities don't collide.
 |---------|--------|-----------|
 | `drives` | list every drive: index, label, status, contents, current/default | — |
 | `drives flash <n> [label]` | format drive n as GSFS (asks `[y/N]` — it ERASES); optionally name it (must be unique); mounts immediately | data: yes |
-| `drives label <n\|label> <new>` | rename a drive's label (must be unique); rewrites the superblock | data: yes |
+| `drives label <n\|label> <new>` | rename a drive's label; rewrites the superblock (duplicates allowed — index disambiguates) | data: yes |
 | `drives mount <n\|label>` | make a flashed drive accessible (list/read) — **not** current | session |
 | `drives use <n\|label>` | mount (if needed) **and** make it the current drive | session |
 | `drives use default <n\|label>` | also persist: this drive auto-mounts + is current on every boot | **yes** (superblock flag) |
-| `ls` · `cat <name>` · `write <name> …` | operate on the **current** drive | — |
-| `ls <label>:` · `cat <label>:<name>` | operate on another mounted drive explicitly | — |
+| `cd <path>` · `mkdir <path>` | change / create a directory on the current drive | — |
+| `ls [path]` · `cat <path>` · `write <path> …` | list / read / write at a path (see §4.1 for `[N:]label/path`) | — |
 
 ## 6. How it looks (`gs>` mockups)
 
@@ -137,34 +135,36 @@ gs> drives flash 0 data
   drives: formatting drive 0 as GSFS, label 'data' … done
   drives: drive 0 mounted — ready to use now (no reboot needed)
 
-gs> write notes.txt "works immediately"
-  fs: wrote notes.txt (18 bytes)
+gs> mkdir projects
+  fs: created /projects
+gs> write projects/notes.txt "works immediately"
+  fs: wrote /projects/notes.txt (18 bytes)
 
 gs> drives use default 0
   drives: 'data' is now the default — auto-mounts on every boot
 ```
 
-Multiple drives, addressing by label, mount vs use:
+Multiple drives, paths, duplicate labels, mount vs use:
 
 ```
 gs> drives
   #  LABEL      STATUS     SIZE      CONTENTS                   USE
-  0  data       mounted    16 MiB    GSFS · 3 files · 32k free    * default · current
-  1  backup     flashed    32 MiB    GSFS · 1 file  · 65k free    (not mounted)
-  2  —          raw        8 MiB     — not formatted —
+  0  data       mounted    16 MiB    GSFS · 5 files · 32k free    * default · current
+  1  data  (2)  flashed    32 MiB    GSFS · 1 file  · 65k free    (not mounted)
+  2  archive    raw        8 MiB     — not formatted —
 
-gs> drives mount backup
-  drives: 'backup' mounted (read/list only; current is still 'data')
+gs> drives mount 1:data
+  drives: 1:data mounted (read/list only; current is still 0:data)
 
-gs> ls backup:
-  NAME         SIZE
-  archive.bin  40 KiB
+gs> ls 1:data/backups
+  NAME           SIZE
+  2026-06.tar    40 KiB
 
-gs> cat backup:notes
-  (file not found on 'backup')
+gs> cat 0:data/projects/notes.txt
+  works immediately
 
-gs> drives use backup
-  drives: current drive → 'backup' (default 'data' restores on reboot)
+gs> drives use 1:data
+  drives: current drive → 1:data (default 0:data restores on reboot)
 ```
 
 Replug-safety (identity over location):
@@ -185,33 +185,40 @@ A real multi-part feature, layered:
   gains a **drive index** (`ReadBlock(drive, lba)` / `WriteBlock(drive, lba, …)`);
   a **capacity** request (sector count from IDENTIFY) so a flash sizes the
   filesystem to the real disk.
-- **GSFS superblock:** add a `flags` field (`DEFAULT` bit) and a `label` field
-  (the drive's stable identity).
+- **GSFS becomes hierarchical** (directories) — see `persistence.md`. The on-disk
+  format gains inodes (file/dir) + directory blocks (name → inode) + path walking;
+  the superblock gains a `flags` field (`DEFAULT` bit) and a `label` field. (Phase 1
+  shipped a *flat* GSFS; directories are the adopted evolution.)
 - **`fs`:** become raw-tolerant (serve the drives API even with no filesystem);
-  hold several **mounted** drives at once (bounded slots) with a **current** pointer;
-  auto-mount the default on boot; drives API = `list` / `flash` / `mount` / `use` /
-  `use default`; resolve `label:name` addressing.
-- **shell:** the `drives` command (+ subcommands) and the file commands
-  (`ls` / `cat` / `write`) that operate on the current/labelled drive.
+  hold several **mounted** drives at once (bounded slots) with a **current** drive +
+  **current directory**; auto-mount the default on boot; resolve `[N:]label/path`
+  addressing; drives API = `list` / `flash` / `label` / `mount` / `use` / `use default`.
+- **block-driver:** enumerate *all* SATA disks; the block IPC gains a **drive index**;
+  a **capacity** request so a flash sizes the filesystem to the disk.
+- **shell:** `drives` (+ subcommands) and the file commands (`ls` / `cat` / `write` /
+  `cd` / `mkdir`) with `[N:]label/path` addressing.
 
 ## 8. Suggested order
 
-1. **Single-drive `drives`** — `flash` / `use` / `use default` + boot auto-mount of
-   the default. (One disk; proves the format/mount/default loop end to end.)
-2. **Labels** — name a drive at flash; address + select by label (identity layer).
-3. **Multi-drive** — enumerate all disks; per-drive block IPC; `mount` vs `use`;
-   `label:name` cross-drive addressing; bounded mounted-drive slots.
-4. **File commands** — `ls` / `cat` / `write` against the current/labelled drive.
+1. **Hierarchical GSFS** — evolve the format to inodes + directories + path walking
+   (the foundation the rest needs). `persistence.md`.
+2. **Single-drive `drives`** — `flash` / `use` / `use default` + boot auto-mount of
+   the default (one disk; proves the format/mount/default loop).
+3. **File commands** — `ls` / `cat` / `write` / `cd` / `mkdir` on the current drive.
+4. **Labels** — name a drive at flash/`label`; address + select by label.
+5. **Multi-drive** — enumerate all disks; per-drive block IPC; `mount` vs `use`;
+   `[N:]label/path` cross-drive addressing; bounded mounted-drive slots; duplicate
+   labels disambiguated by index.
 
 ## 9. Open questions
 
-- Bound on simultaneously-mounted drives (4?) and on the label length (16 chars?).
-- Label clashes: **resolved — labels are unique, no duplicates** (§4.2). flash/label
-  refuse a taken name; a plugged-in drive whose label clashes is not mounted until
-  relabelled. No index-fallback, no UUID.
+- Bound on simultaneously-mounted drives (4?), label length (16?), path depth / name
+  length, max files per directory.
+- Label clashes: **resolved — duplicates allowed, disambiguated by index** (§4.2).
+  No forced relabel on import, no UUID; `drives label` is available but optional.
 - Confirmation UX for `flash` (a `[y/N]` prompt vs a `--force`/`yes` token), given
   the shell is line-based.
-- Whether `current` resets to the default on every boot (proposed: yes) or is also
-  remembered (proposed: no — only the *default* persists; `use` is session-scoped).
+- Whether `current` (drive + directory) resets to the default on every boot
+  (proposed: yes) or is also remembered (proposed: no — only the *default* persists).
 - Hot-plug: re-enumerating drives when a disk is inserted/removed at runtime (later;
   the USB stack already does hot-plug, so there is a pattern to follow).

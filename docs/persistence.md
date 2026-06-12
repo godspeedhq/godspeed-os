@@ -29,7 +29,7 @@ name.
 | Filesystem | **Our own, from first principles** | ext4/btrfs are POSIX + enormous; both fights the constitution (§2.4, §3.3, §26.11). No interop requirement to justify the cost. |
 | Authority model | **File = capability** (north star) | Authority by capability, not by mode bits (§3.3). Extends the capability model instead of bolting a permission model beside it. |
 | Block device | **ATA PIO (legacy IDE)** | Simplest correct device; **no DMA → least-privilege by construction**; works in QEMU and has a hardware path; stepping-stone to AHCI. |
-| Namespace | **Flat name → blob** | What §15 actually needs (service binaries, service state). No directories/links/permissions. |
+| Namespace | **Hierarchical (directories + paths)** — adopted; Phase 1 shipped *flat* | Flat name→blob isn't realistic for real use; real directories from the start (§6.2). Still no links/permissions (authority is by capability, §3.3). |
 | Bounds | **Fixed, bounded** | Like the rest of the system (queue depth 16, MAX_ENDPOINTS): fixed file count / name length, no unbounded trees (§26.6). |
 | Crash model (Phase 1) | **Write-through, honest loss** | A crash mid-write may lose that write; refuse to mount on bad magic (§3.12). Transactional recovery is Phase 3 (§6.3). |
 
@@ -183,6 +183,42 @@ than a shared-buffer design *by construction*, and that is the accepted cost of 
 no-shared-memory invariant — a clean illustration of §20 (correctness and clarity over
 performance) and §26.7 (the copy is the honest, bounded behavior).
 
+### 6.2 Hierarchical evolution — real directories (adopted)
+
+The flat single-entry-table format above shipped in **Phase 1** (mount, named files,
+reboot survival — all working). It is being **evolved to a real hierarchical
+filesystem**: flat name→blob isn't realistic for actual use, so GSFS gets **real
+directories from the start** of the next phase. (See `docs/drives.md` for the
+user-facing path/addressing model, `[N:]label/path/to/file`.)
+
+The hierarchical format, still GodSpeed-minimal (bounded, no POSIX permissions —
+authority is by capability, §3.3 — and no hard links):
+
+```text
+  Superblock (LBA 0): magic "GSFS…", version, block_size, total_blocks,
+      inode_table_start/blocks, data_start, next_free_block,
+      root_inode, flags (DEFAULT bit), label[N]      ← drives.md: default + identity
+  Inode table: fixed array of inodes. Each inode:
+      type (free | file | dir), size_bytes, first_block, block_count   (contiguous extent)
+  Directory: a file (inode.type = dir) whose contents are entries:
+      { name[NAME_MAX], inode_number }               ← name → inode within this dir
+  Data region: file contents + directory blocks.
+```
+
+- **Path walking:** resolve `/a/b/c` by reading the **root inode** (a directory),
+  finding `a` → its inode, reading that directory, finding `b`, … Each component is
+  one directory lookup. Bounded path depth + entries-per-directory (§26.6).
+- **Operations:** `mkdir` (allocate a dir inode + add an entry to the parent),
+  create/`write` (allocate a file inode + entry), `ls` (read a directory's entries),
+  `cat`/read (walk to the file inode, read its extent), `cd` (resolve a directory,
+  update the session's current-directory inode).
+- **Still bounded & loud:** fixed inode count, fixed name length, contiguous extents
+  (no reclamation yet, Phase-1 carry-over); bad magic still refuses to mount (§3.12).
+- **The `label` + `flags(DEFAULT)` superblock fields** are what `drives` uses for
+  drive identity (invariant 11) and the persistent default drive (`docs/drives.md`).
+
+This supersedes the flat §6 format as the target; the flat version remains the
+historical Phase-1 record.
 ## 7. File = capability (the north star)
 
 The spine that makes this filesystem *ours* rather than a generic store: a file is named
