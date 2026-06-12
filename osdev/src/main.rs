@@ -1056,8 +1056,9 @@ fn run_blockdev_test() {
     let read_ok  = log.contains("block-driver: sector 0 read OK");
     // The driver logs the first 16 bytes of the sector; MAGIC is 17 chars, so we
     // match its 16-byte prefix (unambiguous proof the host's bytes were read back).
-    let magic    = log.contains("GODSPEEDFS-PHASE");
-    let no_panic = !log.contains("KERNEL PANIC");
+    let magic     = log.contains("GODSPEEDFS-PHASE");
+    let roundtrip = log.contains("write/read round-trip OK"); // step 2: write path
+    let no_panic  = !log.contains("KERNEL PANIC");
 
     for l in log.lines().filter(|l| l.contains("block-driver") || l.contains("spawn[pio]")) {
         println!("blockdev:   | {}", l.trim());
@@ -1066,12 +1067,19 @@ fn run_blockdev_test() {
     println!("blockdev:   driver started ... {}", if started { "yes" } else { "NO" });
     println!("blockdev:   sector 0 read OK ... {}", if read_ok { "yes" } else { "NO" });
     println!("blockdev:   magic 'GODSPEEDFS-PHASE' read back ... {}", if magic { "yes" } else { "NO" });
+    println!("blockdev:   write/read round-trip OK ... {}", if roundtrip { "yes" } else { "NO" });
     println!("blockdev:   kernel did not panic ... {}", if no_panic { "yes" } else { "NO" });
 
-    if granted && started && read_ok && magic && no_panic {
-        println!("\n  [P1.1]  block-driver reads sector 0 via hw_pio  … PASS\n\n  1 passed  0 failed");
+    if granted && started && read_ok && magic && roundtrip && no_panic {
+        println!("\n  [P1.1]  block-driver reads sector 0 via hw_pio       … PASS");
+        println!("  [P1.2]  block-driver write/read round-trip (ATA PIO)  … PASS\n\n  2 passed  0 failed");
     } else {
-        println!("\n  [P1.1]  block-driver reads sector 0 via hw_pio  … FAIL\n\n  0 passed  1 failed");
+        let r1 = if granted && started && read_ok && magic && no_panic { "PASS" } else { "FAIL" };
+        let r2 = if roundtrip && no_panic { "PASS" } else { "FAIL" };
+        println!("\n  [P1.1]  block-driver reads sector 0 via hw_pio       … {r1}");
+        println!("  [P1.2]  block-driver write/read round-trip (ATA PIO)  … {r2}");
+        let passed = (r1 == "PASS") as u32 + (r2 == "PASS") as u32;
+        println!("\n  {passed} passed  {} failed", 2 - passed);
         std::process::exit(1);
     }
 }

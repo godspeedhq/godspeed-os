@@ -274,8 +274,10 @@ All replies are exactly one of `{Ok-with-data, defined error}` — never silent
    ATA-PIO reads sector 0 of a QEMU secondary-channel `if=ide` disk and logs it —
    verified by reading back a host-written magic. Port I/O is kernel-mediated because
    ring-3 drivers cannot run `in`/`out` (granting IOPL would be ambient authority).
-2. **Block driver write + round-trip.** Write a known pattern to a scratch LBA, read it
-   back, assert equal. Pins the device read/write path end to end.
+2. **Block driver write + round-trip. ✅ done** (`osdev test blockdev`, case P1.2). The
+   driver writes a known pattern to a scratch LBA (WRITE SECTORS + FLUSH CACHE), reads it
+   back, and asserts equal — proving the device read/write path end to end. All in the
+   driver via the existing `Pio` wrapper; no new kernel surface.
 3. **Filesystem mount + format.** Host-side `osdev mkfs` writes a superblock + empty entry
    table + bitmap into a disk image; `fs` mounts it (validates magic), logs geometry.
 4. **Filesystem read/write (name→blob).** `WriteFile`/`ReadFile`/`StatFile` over IPC,
