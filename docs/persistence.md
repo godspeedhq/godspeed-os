@@ -295,8 +295,11 @@ All replies are exactly one of `{Ok-with-data, defined error}` — never silent
    `ReadBlock`. Verified by a mount-time round-trip (`greeting`). `fs` also serves the
    client API (`WriteFile`/`ReadFile`/`StatFile`, ops 10–12) over IPC via the reply-cap
    pattern.
-5. **Reboot survival (the headline).** Boot, write a file, quit QEMU, **reboot with the
-   same disk image**, read it back — bytes intact. This is the persistence guarantee.
+5. **Reboot survival (the headline). ✅ done** (`osdev test blockdev-reboot`, case P1.5).
+   Format once; boot 1 — `fs` creates `greeting`; **reboot on the same disk image without
+   reformatting** — boot 2 mounts (superblock persisted: `next_free=3, 1 files`) and reads
+   the file back byte-for-byte (`fs: persisted file 'greeting' verified across boot`). The
+   disk is a host file, so this is the real durability guarantee. **Phase 1 complete.**
 6. **Phase 2: file-as-capability.** Kernel-delegated resource caps (after the §7 amendment
    is signed off); `fs` returns/validates per-file caps.
 

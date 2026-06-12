@@ -894,6 +894,7 @@ fn cmd_test(suite: &str) {
         "shell"        => run_shell_test(),
         "iommu"        => run_iommu_test(),
         "blockdev"     => run_blockdev_test(),
+        "blockdev-reboot" => run_blockdev_reboot_test(),
         other => eprintln!("unknown test suite: {}", other),
     }
 }
@@ -1130,6 +1131,76 @@ fn run_blockdev_test() {
     let passed = (r1 == "PASS") as u32 + (r2 == "PASS") as u32 + (r3 == "PASS") as u32 + (r4 == "PASS") as u32;
     println!("\n  {passed} passed  {} failed", 4 - passed);
     if passed != 4 {
+        std::process::exit(1);
+    }
+}
+
+/// Boot the blockdev image once with `persist` on the ATA secondary channel,
+/// capture the serial log, and return it. The persist disk is NOT recreated —
+/// the caller controls its lifecycle (key for the reboot-survival test).
+fn boot_blockdev_qemu(img_str: &str, persist_str: &str, serial: &str, secs: u64) -> String {
+    let _ = std::fs::remove_file(serial);
+    let mut cmd = std::process::Command::new(qemu::qemu_binary());
+    cmd.args([
+        "-m", "512M", "-smp", "2",
+        "-drive", &format!("format=raw,file={img_str},if=ide,index=0"),
+        "-drive", &format!("format=raw,file={persist_str},if=ide,index=2"),
+        "-serial", &format!("file:{serial}"),
+        "-serial", "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]);
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("blockdev: failed to launch QEMU: {e}"); std::process::exit(1); });
+    std::thread::sleep(std::time::Duration::from_secs(secs));
+    let _ = child.kill();
+    let _ = child.wait();
+    std::fs::read_to_string(serial).unwrap_or_default().replace('\r', "")
+}
+
+/// Persistence Phase 1 step 5 (docs/persistence.md §10): reboot survival. Format a
+/// disk once, boot (fs creates `greeting`), then **reboot on the SAME disk image
+/// without reformatting** — fs must read the persisted file back. The disk is a
+/// host file, so this is the real durability guarantee, not a proxy.
+fn run_blockdev_reboot_test() {
+    println!("\n=== Persistence Phase 1 step 5: reboot survival ===");
+    cmd_build_blockdev();
+
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+
+    let _ = std::fs::create_dir_all("build/tests");
+    // Format ONCE; the disk then persists across both boots untouched by the host.
+    let persist = "build/tests/persist_reboot.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create persist disk");
+    format_superblock(persist);
+
+    let img = std::fs::canonicalize(&image_path).unwrap_or_else(|_| image_path.to_path_buf());
+    let img_str = img.to_string_lossy().replace('\\', "/");
+    let persist_abs = std::fs::canonicalize(persist).unwrap_or_else(|_| std::path::PathBuf::from(persist));
+    let persist_str = persist_abs.to_string_lossy().replace('\\', "/");
+
+    println!("blockdev: boot 1 — fs creates 'greeting', ~25s …");
+    let log1 = boot_blockdev_qemu(&img_str, &persist_str, "build/tests/blockdev_reboot_1.log", 25);
+    let created = log1.contains("fs: file round-trip OK (greeting)");
+    let panic1  = log1.contains("KERNEL PANIC");
+    println!("blockdev:   boot 1: fs created 'greeting' ... {}", if created { "yes" } else { "NO" });
+
+    // The persist disk is NOT touched here — only QEMU wrote to it in boot 1.
+    println!("blockdev: boot 2 — SAME disk, no reformat, fs must read it back, ~25s …");
+    let log2 = boot_blockdev_qemu(&img_str, &persist_str, "build/tests/blockdev_reboot_2.log", 25);
+    let survived = log2.contains("fs: persisted file 'greeting' verified across boot");
+    let panic2   = log2.contains("KERNEL PANIC");
+    for l in log2.lines().filter(|l| l.contains("fs:")) {
+        println!("blockdev:   boot2 | {}", l.trim());
+    }
+    println!("blockdev:   boot 2: 'greeting' survived the reboot ... {}", if survived { "yes" } else { "NO" });
+
+    if created && survived && !panic1 && !panic2 {
+        println!("\n  [P1.5]  fs reboot survival (write → reboot → read)    … PASS\n\n  1 passed  0 failed");
+    } else {
+        println!("\n  [P1.5]  fs reboot survival (write → reboot → read)    … FAIL\n\n  0 passed  1 failed");
         std::process::exit(1);
     }
 }
