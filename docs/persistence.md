@@ -287,8 +287,14 @@ All replies are exactly one of `{Ok-with-data, defined error}` — never silent
    files exist yet). Forward `fs → block-driver` cap wires via `send_peers` (block-driver
    spawns first, kernel auto-registers its endpoint name); the reply rides a per-request
    cap fs embeds.
-4. **Filesystem read/write (name→blob).** `WriteFile`/`ReadFile`/`StatFile` over IPC,
-   `fs` ↔ `block-driver`. A test service writes "hello" to `greeting`, reads it back.
+4. **Filesystem read/write (name→blob). ✅ done** (`osdev test blockdev`, case P1.4).
+   On-disk entry table (16 entries × 32 B, one block) + a bump allocator (next-free-block
+   in the superblock; contiguous extents, no reclamation yet). `fs` stores/retrieves named
+   files: `write_file` allocates an extent, writes the data blocks + entry table +
+   superblock through block-driver `WriteBlock`; `read_file` walks the entry's extent via
+   `ReadBlock`. Verified by a mount-time round-trip (`greeting`). `fs` also serves the
+   client API (`WriteFile`/`ReadFile`/`StatFile`, ops 10–12) over IPC via the reply-cap
+   pattern.
 5. **Reboot survival (the headline).** Boot, write a file, quit QEMU, **reboot with the
    same disk image**, read it back — bytes intact. This is the persistence guarantee.
 6. **Phase 2: file-as-capability.** Kernel-delegated resource caps (after the §7 amendment

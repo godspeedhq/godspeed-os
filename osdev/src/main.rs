@@ -114,29 +114,47 @@ fn main() {
     }
 }
 
-/// On-disk superblock magic — MUST match `services/fs` (docs/persistence.md §6).
+// On-disk format — MUST match `services/fs` (docs/persistence.md §6).
+// 512-byte blocks (= one ATA sector = one block-IPC request), so block number = LBA.
+//   Superblock @ LBA 0: magic[8] "GSPDFS01", version u32, block_size u32=512,
+//     total_blocks u32, entry_table_start u32=1, entry_table_blocks u32=1,
+//     data_start u32=2, next_free_block u32 (bump allocator), file_count u32.
+//   Entry table @ LBA 1 (1 block, 16 entries × 32 bytes). Data region from LBA 2.
 const FS_SB_MAGIC: &[u8; 8] = b"GSPDFS01";
-const FS_BLOCK_SIZE: u32 = 4096;
+const FS_BLOCK_SIZE: u32 = 512;
+const FS_ENTRY_TABLE_START: u32 = 1;
+const FS_ENTRY_TABLE_BLOCKS: u32 = 1;
+const FS_DATA_START: u32 = 2;
 
-/// Write a GodspeedOS filesystem superblock into LBA 0 of `path`, preserving the
-/// rest of the image. `total_blocks` is derived from the image size.
+/// Write a GodspeedOS filesystem superblock + empty entry table into `path`,
+/// preserving the rest of the image. `total_blocks` is derived from the image size.
 fn format_superblock(path: &str) {
     let mut data = std::fs::read(path)
         .unwrap_or_else(|e| { eprintln!("mkfs: cannot read {}: {}", path, e); std::process::exit(1); });
-    if data.len() < 512 {
+    if data.len() < (FS_DATA_START as usize) * 512 {
         eprintln!("mkfs: image too small ({} bytes)", data.len());
         std::process::exit(1);
     }
     let total_blocks = (data.len() as u64 / FS_BLOCK_SIZE as u64) as u32;
     let mut sb = [0u8; 512];
     sb[0..8].copy_from_slice(FS_SB_MAGIC);
-    sb[8..12].copy_from_slice(&1u32.to_le_bytes());            // version
-    sb[12..16].copy_from_slice(&FS_BLOCK_SIZE.to_le_bytes());  // block_size
-    sb[16..20].copy_from_slice(&total_blocks.to_le_bytes());   // total_blocks
+    sb[8..12].copy_from_slice(&1u32.to_le_bytes());                   // version
+    sb[12..16].copy_from_slice(&FS_BLOCK_SIZE.to_le_bytes());         // block_size
+    sb[16..20].copy_from_slice(&total_blocks.to_le_bytes());          // total_blocks
+    sb[20..24].copy_from_slice(&FS_ENTRY_TABLE_START.to_le_bytes());  // entry_table_start
+    sb[24..28].copy_from_slice(&FS_ENTRY_TABLE_BLOCKS.to_le_bytes()); // entry_table_blocks
+    sb[28..32].copy_from_slice(&FS_DATA_START.to_le_bytes());         // data_start
+    sb[32..36].copy_from_slice(&FS_DATA_START.to_le_bytes());         // next_free_block = data_start
+    sb[36..40].copy_from_slice(&0u32.to_le_bytes());                  // file_count
     data[0..512].copy_from_slice(&sb);
+    // Zero the entry table block(s) — no files yet.
+    let et = (FS_ENTRY_TABLE_START as usize) * 512;
+    let et_end = et + (FS_ENTRY_TABLE_BLOCKS as usize) * 512;
+    for b in &mut data[et..et_end] { *b = 0; }
     std::fs::write(path, &data)
         .unwrap_or_else(|e| { eprintln!("mkfs: cannot write {}: {}", path, e); std::process::exit(1); });
-    println!("mkfs: formatted {} ({} blocks of {} bytes)", path, total_blocks, FS_BLOCK_SIZE);
+    println!("mkfs: formatted {} ({} blocks of {} bytes, data from block {})",
+             path, total_blocks, FS_BLOCK_SIZE, FS_DATA_START);
 }
 
 fn cmd_mkfs(image: &str) {
@@ -1085,6 +1103,9 @@ fn run_blockdev_test() {
     let magic     = log.contains("GSPDFS01");                    // superblock magic at LBA 0
     let roundtrip = log.contains("write/read round-trip OK");    // step 2: write path
     let fs_mounted = log.contains("fs: mounted");                // step 3: fs reads SB via IPC
+    // step 4: fs stores + retrieves a named file (entry table + extent + data blocks).
+    let fs_file = log.contains("fs: file round-trip OK")
+        || log.contains("fs: persisted file 'greeting' verified");
     let no_panic  = !log.contains("KERNEL PANIC");
 
     for l in log.lines().filter(|l| l.contains("block-driver") || l.contains("spawn[pio]") || l.contains("fs:")) {
@@ -1095,17 +1116,20 @@ fn run_blockdev_test() {
     println!("blockdev:   sector 0 read OK + superblock magic ... {}", if read_ok && magic { "yes" } else { "NO" });
     println!("blockdev:   write/read round-trip OK ... {}", if roundtrip { "yes" } else { "NO" });
     println!("blockdev:   fs mounted (read SB via block-driver IPC) ... {}", if fs_mounted { "yes" } else { "NO" });
+    println!("blockdev:   fs file write/read round-trip ... {}", if fs_file { "yes" } else { "NO" });
     println!("blockdev:   kernel did not panic ... {}", if no_panic { "yes" } else { "NO" });
 
     let r1 = if granted && started && read_ok && magic && no_panic { "PASS" } else { "FAIL" };
     let r2 = if roundtrip && no_panic { "PASS" } else { "FAIL" };
     let r3 = if fs_mounted && no_panic { "PASS" } else { "FAIL" };
+    let r4 = if fs_file && no_panic { "PASS" } else { "FAIL" };
     println!("\n  [P1.1]  block-driver reads sector 0 via hw_pio        … {r1}");
     println!("  [P1.2]  block-driver write/read round-trip (ATA PIO)   … {r2}");
     println!("  [P1.3]  fs mounts (superblock read over block IPC)     … {r3}");
-    let passed = (r1 == "PASS") as u32 + (r2 == "PASS") as u32 + (r3 == "PASS") as u32;
-    println!("\n  {passed} passed  {} failed", 3 - passed);
-    if passed != 3 {
+    println!("  [P1.4]  fs stores + retrieves a named file            … {r4}");
+    let passed = (r1 == "PASS") as u32 + (r2 == "PASS") as u32 + (r3 == "PASS") as u32 + (r4 == "PASS") as u32;
+    println!("\n  {passed} passed  {} failed", 4 - passed);
+    if passed != 4 {
         std::process::exit(1);
     }
 }
