@@ -1262,12 +1262,13 @@ fn cmd_build_blockdev_ahci() {
     if !status.success() { eprintln!("build: block-driver (ahci) FAILED"); std::process::exit(1); }
     println!("build: block-driver (ahci) OK");
 
+    // Spawn block-driver + fs (blockdev) so fs mounts the AHCI disk over IPC.
     let status = std::process::Command::new("cargo")
         .args(["build", "--release", "-p", "supervisor", "--target", "x86_64-unknown-none",
-               "--features", "supervisor/bare-metal,supervisor/blockprobe"])
+               "--features", "supervisor/bare-metal,supervisor/blockdev"])
         .status().unwrap_or_else(|e| panic!("failed to run cargo build for supervisor: {}", e));
     if !status.success() { eprintln!("build: supervisor FAILED"); std::process::exit(1); }
-    println!("build: supervisor (bare-metal,blockprobe) OK");
+    println!("build: supervisor (bare-metal,blockdev) OK");
 
     let status = std::process::Command::new("cargo")
         .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
@@ -1276,10 +1277,13 @@ fn cmd_build_blockdev_ahci() {
     println!("build: kernel OK");
 }
 
-/// AHCI step A (docs/ahci.md): boot with an ich9-ahci SATA controller + a disk on
-/// it, and verify block-driver detects the HBA and the SATA disk via MMIO.
+/// AHCI steps A-D (docs/ahci.md): boot from a legacy-IDE disk, put the persistence
+/// disk ALONE on an ich9-ahci controller (so block-driver targets it on port 0 —
+/// mirroring the T630, where the SSD is the only SATA disk and boot is elsewhere),
+/// and verify detection, IDENTIFY, and the full fs stack (mount + file round-trip)
+/// running over AHCI READ/WRITE DMA EXT.
 fn run_blockdev_ahci_test() {
-    println!("\n=== AHCI step A: detect SATA controller + disk ===");
+    println!("\n=== AHCI steps A-D: detect + IDENTIFY + fs over AHCI ===");
     cmd_build_blockdev_ahci();
 
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
@@ -1289,8 +1293,11 @@ fn run_blockdev_ahci_test() {
     disk_image::install_bootloader(limine_dir, &image_path);
 
     let _ = std::fs::create_dir_all("build/tests");
+    // Persistence disk, formatted, ALONE on the AHCI controller (→ block-driver
+    // port 0). The boot image is on legacy IDE so it is not a SATA disk.
     let persist = "build/tests/persist_ahci.img";
     std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create persist disk");
+    format_superblock(persist);
 
     let serial = "build/tests/ahci_test_serial.log";
     let _ = std::fs::remove_file(serial);
@@ -1302,45 +1309,50 @@ fn run_blockdev_ahci_test() {
     let mut cmd = std::process::Command::new(qemu::qemu_binary());
     cmd.args([
         "-m", "512M", "-smp", "2",
-        // An explicit AHCI controller (i440fx has no built-in one); boot disk on
-        // port 0, the data disk on port 1 — both SATA, so block-driver sees them.
+        // Boot disk on legacy IDE (PIIX3) — SeaBIOS boots it; it is NOT SATA so
+        // block-driver's AHCI scan ignores it.
+        "-drive", &format!("format=raw,file={img_str},if=ide"),
+        // The persistence disk ALONE on an explicit AHCI controller → port 0.
         "-device", "ich9-ahci,id=ahci",
-        "-drive", &format!("id=boot,format=raw,file={img_str},if=none"),
-        "-device", "ide-hd,drive=boot,bus=ahci.0",
         "-drive", &format!("id=data,format=raw,file={persist_str},if=none"),
-        "-device", "ide-hd,drive=data,bus=ahci.1",
+        "-device", "ide-hd,drive=data,bus=ahci.0",
         "-serial", &format!("file:{serial}"),
         "-serial", "null",
         "-display", "none", "-no-reboot", "-no-shutdown",
     ]);
     let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("ahci: failed to launch QEMU: {e}"); std::process::exit(1); });
-    println!("ahci: booting (ich9-ahci + 2 SATA disks), ~25s …");
+    println!("ahci: booting (IDE boot + ich9-ahci data disk), ~25s …");
     std::thread::sleep(std::time::Duration::from_secs(25));
     let _ = child.kill();
     let _ = child.wait();
 
     let log = std::fs::read_to_string(serial).unwrap_or_default().replace('\r', "");
-    let pci_found = log.contains("pci: AHCI at");
-    let hba       = log.contains("block-driver: AHCI HBA");
-    let disk      = log.contains("device present (DET=3)") && log.contains("SATA disk");
-    let identify  = log.contains("IDENTIFY OK");        // step B: port init + IDENTIFY
-    let no_panic  = !log.contains("KERNEL PANIC");
+    let pci_found  = log.contains("pci: AHCI at");
+    let identify   = log.contains("IDENTIFY OK");
+    let serving    = log.contains("AHCI serving block I/O");
+    let fs_mounted = log.contains("fs: mounted");                 // step C: AHCI ReadBlock
+    let fs_file    = log.contains("fs: file round-trip OK")       // step D: AHCI WriteBlock+ReadBlock
+        || log.contains("fs: persisted file 'greeting' verified");
+    let no_panic   = !log.contains("KERNEL PANIC");
 
-    for l in log.lines().filter(|l| l.contains("AHCI") || l.contains("block-driver")) {
+    for l in log.lines().filter(|l| l.contains("AHCI") || l.contains("block-driver") || l.contains("fs:")) {
         println!("ahci:   | {}", l.trim());
     }
-    println!("ahci:   PCI found AHCI controller ... {}", if pci_found { "yes" } else { "NO" });
-    println!("ahci:   driver detected HBA + SATA disk ... {}", if hba && disk { "yes" } else { "NO" });
-    println!("ahci:   port init + IDENTIFY OK ... {}", if identify { "yes" } else { "NO" });
+    println!("ahci:   detect + IDENTIFY ... {}", if pci_found && identify { "yes" } else { "NO" });
+    println!("ahci:   serving block I/O ... {}", if serving { "yes" } else { "NO" });
+    println!("ahci:   fs mounted (AHCI ReadBlock) ... {}", if fs_mounted { "yes" } else { "NO" });
+    println!("ahci:   fs file round-trip (AHCI WriteBlock+ReadBlock) ... {}", if fs_file { "yes" } else { "NO" });
     println!("ahci:   kernel did not panic ... {}", if no_panic { "yes" } else { "NO" });
 
-    let a = if pci_found && hba && disk && no_panic { "PASS" } else { "FAIL" };
-    let b = if identify && no_panic { "PASS" } else { "FAIL" };
-    println!("\n  [AHCI.A]  detect SATA controller + disk   … {a}");
-    println!("  [AHCI.B]  port init + IDENTIFY DEVICE      … {b}");
-    let passed = (a == "PASS") as u32 + (b == "PASS") as u32;
-    println!("\n  {passed} passed  {} failed", 2 - passed);
-    if passed != 2 {
+    let ab = if pci_found && identify && no_panic { "PASS" } else { "FAIL" };
+    let c  = if fs_mounted && no_panic { "PASS" } else { "FAIL" };
+    let d  = if fs_file && no_panic { "PASS" } else { "FAIL" };
+    println!("\n  [AHCI.A/B]  detect + port init + IDENTIFY        … {ab}");
+    println!("  [AHCI.C]    read (fs mounts over AHCI)            … {c}");
+    println!("  [AHCI.D]    write (fs file round-trip over AHCI)  … {d}");
+    let passed = (ab == "PASS") as u32 + (c == "PASS") as u32 + (d == "PASS") as u32;
+    println!("\n  {passed} passed  {} failed", 3 - passed);
+    if passed != 3 {
         std::process::exit(1);
     }
 }

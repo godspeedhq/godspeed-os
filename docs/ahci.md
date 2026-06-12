@@ -54,10 +54,14 @@ once read/write/fs/reboot are verified on it. Test: `osdev test blockdev-ahci`.
   header + H2D Register FIS + single-PRDT command table, wait on PxCI, and parse the
   result. Verified: model `QEMU HARDDISK`, 131072 sectors (64 MiB). The full DMA
   command path (command list / FIS / PRDT / command-issue / completion) now works.
-- **Step C — read.** READ DMA EXT (0x25) for a sector into a PRDT buffer; re-enable
-  the read path (block IPC `ReadBlock`).
-- **Step D — write + integrate.** WRITE DMA EXT (0x35) + FLUSH; restore the block
-  IPC serve loop; re-validate `fs` mount / file round-trip / reboot survival on AHCI.
+- **Step C — read. ✅ done** (`osdev test blockdev-ahci`, AHCI.C). READ DMA EXT (0x25)
+  via `issue()` into the PRDT data buffer; block IPC `ReadBlock` restored. Verified:
+  `fs` mounts the AHCI disk over IPC (`fs: mounted`).
+- **Step D — write + integrate. ✅ done** (AHCI.D). WRITE DMA EXT (0x35) + FLUSH EXT
+  (0xEA); the block-IPC serve loop runs in the AHCI backend; `fs` spawns and the full
+  file round-trip works over AHCI (`fs: file round-trip OK`). The whole filesystem
+  stack now runs on AHCI. Harness: boot on legacy IDE, the persist disk ALONE on
+  `ich9-ahci` (→ port 0), mirroring the T630 (SSD is the only SATA disk).
 - **Step E — confine.** Bring AHCI under IOMMU confinement (§6.4) once its DMA is
   fully arena-resident; then make `ahci` the default backend.
 

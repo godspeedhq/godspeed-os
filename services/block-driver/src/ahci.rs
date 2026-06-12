@@ -9,7 +9,7 @@
 //! / command table in the arena, start the port, and issue IDENTIFY DEVICE to read
 //! the model + sector count. Read/write (READ/WRITE DMA EXT) come next.
 
-use godspeed_sdk::{Dma, Mmio, ServiceContext};
+use godspeed_sdk::{CapHandle, Dma, Message, Mmio, ServiceContext};
 
 // HBA Generic Host Control registers (offsets from ABAR).
 const HBA_CAP: usize = 0x00;
@@ -51,6 +51,9 @@ const PRDT_OFF: usize = CMD_TBL_OFF + 0x80;
 const DATA_OFF: usize = 0x1000;    // data buffer (one page)
 
 const ATA_IDENTIFY: u8 = 0xEC;
+const ATA_READ_DMA_EXT: u8 = 0x25;
+const ATA_WRITE_DMA_EXT: u8 = 0x35;
+const ATA_FLUSH_EXT: u8 = 0xEA;
 
 struct Ahci<'a> {
     hba: &'a Mmio,
@@ -118,8 +121,10 @@ impl<'a> Ahci<'a> {
             return Err("port busy before issue");
         }
 
-        // Command header[0]: CFL=5 dwords (H2D register FIS), PRDTL=1.
-        let dw0 = 5u32 | (if write { 1 << 6 } else { 0 }) | (1u32 << 16);
+        // Command header[0]: CFL=5 dwords (H2D register FIS); PRDTL=1 if there's
+        // data, 0 for no-data commands (e.g. FLUSH).
+        let prdtl = if data_bytes > 0 { 1u32 } else { 0 };
+        let dw0 = 5u32 | (if write { 1 << 6 } else { 0 }) | (prdtl << 16);
         self.arena.write32(CMD_LIST_OFF, dw0);
         self.arena.write32(CMD_LIST_OFF + 4, 0); // PRDBC
         let ctba = self.arena.phys_at(CMD_TBL_OFF);
@@ -151,12 +156,14 @@ impl<'a> Ahci<'a> {
         // DW3: count[7:0] | count[15:8]
         self.arena.write32(CMD_TBL_OFF + 12, (count as u32 & 0xFF) | (((count >> 8) as u32 & 0xFF) << 8));
 
-        // PRDT[0]: data base + (byte count - 1).
-        let dba = self.arena.phys_at(DATA_OFF);
-        self.arena.write32(PRDT_OFF, dba as u32);
-        self.arena.write32(PRDT_OFF + 4, (dba >> 32) as u32);
-        self.arena.write32(PRDT_OFF + 8, 0);
-        self.arena.write32(PRDT_OFF + 12, data_bytes - 1);
+        // PRDT[0]: data base + (byte count - 1). Only for data commands.
+        if data_bytes > 0 {
+            let dba = self.arena.phys_at(DATA_OFF);
+            self.arena.write32(PRDT_OFF, dba as u32);
+            self.arena.write32(PRDT_OFF + 4, (dba >> 32) as u32);
+            self.arena.write32(PRDT_OFF + 8, 0);
+            self.arena.write32(PRDT_OFF + 12, data_bytes - 1);
+        }
 
         // Issue command slot 0 and wait for it to clear.
         self.pwrite(PX_CI, 1);
@@ -194,6 +201,73 @@ impl<'a> Ahci<'a> {
                 | ((self.arena.read16(DATA_OFF + 61 * 2) as u64) << 16)
         };
         Ok((model, sectors))
+    }
+
+    /// Read one 512-byte sector at `lba` into `out` (READ DMA EXT).
+    fn read_block(&self, lba: u64, out: &mut [u8; 512]) -> Result<(), &'static str> {
+        self.issue(ATA_READ_DMA_EXT, lba, 1, false, 512)?;
+        for i in 0..128 {
+            let w = self.arena.read32(DATA_OFF + i * 4);
+            out[i * 4] = w as u8;
+            out[i * 4 + 1] = (w >> 8) as u8;
+            out[i * 4 + 2] = (w >> 16) as u8;
+            out[i * 4 + 3] = (w >> 24) as u8;
+        }
+        Ok(())
+    }
+
+    /// Write one 512-byte sector of `data` to `lba` (WRITE DMA EXT + FLUSH).
+    fn write_block(&self, lba: u64, data: &[u8; 512]) -> Result<(), &'static str> {
+        for i in 0..128 {
+            let w = (data[i * 4] as u32)
+                | ((data[i * 4 + 1] as u32) << 8)
+                | ((data[i * 4 + 2] as u32) << 16)
+                | ((data[i * 4 + 3] as u32) << 24);
+            self.arena.write32(DATA_OFF + i * 4, w);
+        }
+        self.issue(ATA_WRITE_DMA_EXT, lba, 1, true, 512)?;
+        // Commit to the medium so writes survive a reboot (no-data command).
+        self.issue(ATA_FLUSH_EXT, 0, 0, false, 0)?;
+        Ok(())
+    }
+
+    /// Serve one block-IPC request (same protocol as the ATA PIO backend),
+    /// replying through the client's `reply` cap.
+    fn serve(&self, ctx: &ServiceContext, p: &[u8], reply: CapHandle) {
+        use super::{OP_READ_BLOCK, OP_WRITE_BLOCK, STATUS_ERR, STATUS_OK};
+        if p.len() < 5 {
+            let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR]));
+            return;
+        }
+        let lba = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as u64;
+        match p[0] {
+            OP_READ_BLOCK => {
+                let mut out = [0u8; 1 + 512];
+                let mut sec = [0u8; 512];
+                match self.read_block(lba, &mut sec) {
+                    Ok(()) => {
+                        out[0] = STATUS_OK;
+                        out[1..].copy_from_slice(&sec);
+                        let _ = ctx.send_by_handle(reply, &Message::from_bytes(&out));
+                    }
+                    Err(_) => { let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR])); }
+                }
+            }
+            OP_WRITE_BLOCK => {
+                if p.len() < 5 + 512 {
+                    let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR]));
+                    return;
+                }
+                let mut sec = [0u8; 512];
+                sec.copy_from_slice(&p[5..5 + 512]);
+                let status = match self.write_block(lba, &sec) {
+                    Ok(()) => STATUS_OK,
+                    Err(_) => STATUS_ERR,
+                };
+                let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[status]));
+            }
+            _ => { let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR])); }
+        }
     }
 }
 
@@ -261,7 +335,15 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
         Err(e) => ctx.log_fmt(format_args!("block-driver: AHCI IDENTIFY FAILED: {}", e)),
     }
 
+    // Serve block read/write requests from `fs` over IPC (READ/WRITE DMA EXT).
+    ctx.log("block-driver: AHCI serving block I/O");
     loop {
-        ctx.yield_cpu();
+        let msg = ctx.recv();
+        let reply = match ctx.take_pending_cap() {
+            Some(c) => c,
+            None => continue,
+        };
+        ahci.serve(ctx, msg.payload_bytes(), reply);
+        ctx.remove_cap(reply);
     }
 }
