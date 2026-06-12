@@ -48,8 +48,12 @@ once read/write/fs/reboot are verified on it. Test: `osdev test blockdev-ahci`.
 - **Step A — detect + HBA init. ✅ done.** Map ABAR, enable AHCI mode (GHC.AE),
   read CAP/VS/PI, enumerate implemented ports, report which carry a SATA disk
   (DET=3, sig 0x00000101). Verified: 6 ports, disks on ports 0/1.
-- **Step B — port init + IDENTIFY.** Stop the port, set the command-list + FIS
-  base in the arena, start it, issue IDENTIFY DEVICE, read model + sector count.
+- **Step B — port init + IDENTIFY. ✅ done** (`osdev test blockdev-ahci`, AHCI.B).
+  Stop the port (clear ST/FRE, wait CR/FR), plant the command list + received-FIS
+  base in the arena, restart (FRE then ST), then issue IDENTIFY DEVICE via a command
+  header + H2D Register FIS + single-PRDT command table, wait on PxCI, and parse the
+  result. Verified: model `QEMU HARDDISK`, 131072 sectors (64 MiB). The full DMA
+  command path (command list / FIS / PRDT / command-issue / completion) now works.
 - **Step C — read.** READ DMA EXT (0x25) for a sector into a PRDT buffer; re-enable
   the read path (block IPC `ReadBlock`).
 - **Step D — write + integrate.** WRITE DMA EXT (0x35) + FLUSH; restore the block

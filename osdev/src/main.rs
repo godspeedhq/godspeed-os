@@ -1322,21 +1322,25 @@ fn run_blockdev_ahci_test() {
     let log = std::fs::read_to_string(serial).unwrap_or_default().replace('\r', "");
     let pci_found = log.contains("pci: AHCI at");
     let hba       = log.contains("block-driver: AHCI HBA");
-    let disk      = log.contains("AHCI detection OK — SATA disk on port");
+    let disk      = log.contains("device present (DET=3)") && log.contains("SATA disk");
+    let identify  = log.contains("IDENTIFY OK");        // step B: port init + IDENTIFY
     let no_panic  = !log.contains("KERNEL PANIC");
 
     for l in log.lines().filter(|l| l.contains("AHCI") || l.contains("block-driver")) {
         println!("ahci:   | {}", l.trim());
     }
     println!("ahci:   PCI found AHCI controller ... {}", if pci_found { "yes" } else { "NO" });
-    println!("ahci:   driver detected HBA ... {}", if hba { "yes" } else { "NO" });
-    println!("ahci:   SATA disk detected on a port ... {}", if disk { "yes" } else { "NO" });
+    println!("ahci:   driver detected HBA + SATA disk ... {}", if hba && disk { "yes" } else { "NO" });
+    println!("ahci:   port init + IDENTIFY OK ... {}", if identify { "yes" } else { "NO" });
     println!("ahci:   kernel did not panic ... {}", if no_panic { "yes" } else { "NO" });
 
-    if pci_found && hba && disk && no_panic {
-        println!("\n  [AHCI.A]  detect SATA controller + disk  … PASS\n\n  1 passed  0 failed");
-    } else {
-        println!("\n  [AHCI.A]  detect SATA controller + disk  … FAIL\n\n  0 passed  1 failed");
+    let a = if pci_found && hba && disk && no_panic { "PASS" } else { "FAIL" };
+    let b = if identify && no_panic { "PASS" } else { "FAIL" };
+    println!("\n  [AHCI.A]  detect SATA controller + disk   … {a}");
+    println!("  [AHCI.B]  port init + IDENTIFY DEVICE      … {b}");
+    let passed = (a == "PASS") as u32 + (b == "PASS") as u32;
+    println!("\n  {passed} passed  {} failed", 2 - passed);
+    if passed != 2 {
         std::process::exit(1);
     }
 }
