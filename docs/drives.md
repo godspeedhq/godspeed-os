@@ -80,12 +80,43 @@ So you flash a drive *with a name* and address it by that name regardless of por
 Bare name → current drive; `label:name` → that drive explicitly. (Plain indices
 like `1:name` also work as a fallback before a drive is labelled.)
 
+### 4.2 Labels are unique — no duplicates (prevents cleverness)
+
+**There is never more than one drive with a given label.** GodSpeed refuses to
+*create* a clash rather than build machinery to *resolve* one (§26.13 discipline
+over cleverness, §26.2 simplicity). Uniqueness is enforced among the drives
+GodSpeed can currently see:
+
+- **`drives flash <n> <label>`** and **`drives label <n> <label>`** are refused if
+  that label is already used by an attached drive — pick another unique name:
+  ```
+  gs> drives flash 2 data
+    drives: label 'data' is already used by drive 0. choose another name.
+  ```
+- **On boot / plug-in**, if a drive's stored label collides with one that's already
+  mounted, the newcomer is **not mounted** — reported loudly (§3.12), and shown as
+  unusable until relabelled. The index (location) is still unique, so you can always
+  reach it to fix it:
+  ```
+  gs> drives
+    #  LABEL      STATUS          …
+    0  data       mounted         …
+    1  data       label-clash     …   ← not mounted; relabel to use it
+  gs> drives label 1 backup
+    drives: drive 1 relabelled → 'backup'; now mountable
+  ```
+
+Because labels are unique, **`label:name` is always unambiguous** and there is no
+index-fallback resolution, no duplicate-marker, and no need for a separate UUID.
+The label *is* the drive's identity, and identities don't collide.
+
 ## 5. Command set
 
 | Command | Effect | Persists? |
 |---------|--------|-----------|
 | `drives` | list every drive: index, label, status, contents, current/default | — |
-| `drives flash <n> [label]` | format drive n as GSFS (asks `[y/N]` — it ERASES); optionally name it; mounts immediately | data: yes |
+| `drives flash <n> [label]` | format drive n as GSFS (asks `[y/N]` — it ERASES); optionally name it (must be unique); mounts immediately | data: yes |
+| `drives label <n\|label> <new>` | rename a drive's label (must be unique); rewrites the superblock | data: yes |
 | `drives mount <n\|label>` | make a flashed drive accessible (list/read) — **not** current | session |
 | `drives use <n\|label>` | mount (if needed) **and** make it the current drive | session |
 | `drives use default <n\|label>` | also persist: this drive auto-mounts + is current on every boot | **yes** (superblock flag) |
@@ -175,6 +206,9 @@ A real multi-part feature, layered:
 ## 9. Open questions
 
 - Bound on simultaneously-mounted drives (4?) and on the label length (16 chars?).
+- Label clashes: **resolved — labels are unique, no duplicates** (§4.2). flash/label
+  refuse a taken name; a plugged-in drive whose label clashes is not mounted until
+  relabelled. No index-fallback, no UUID.
 - Confirmation UX for `flash` (a `[y/N]` prompt vs a `--force`/`yes` token), given
   the shell is line-based.
 - Whether `current` resets to the default on every boot (proposed: yes) or is also
