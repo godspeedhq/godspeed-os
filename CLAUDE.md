@@ -267,6 +267,17 @@ os/
 | `supervisor`      | Holds restart authority over all other services     |
 | `block-driver`    | (v1 only) FS depends on it; restart loses disk state |
 | `fs`              | (v1 only) Owns persistent state for the system      |
+| `xhci`, `ehci` (DMA drivers) | **Machine-dependent (H1, §6.4):** in the TCB only on a machine with no IOMMU to confine them (DMA-anywhere = kernel-equivalent reach); **dropped** from it — least-privilege and restartable — wherever an IOMMU confines them to their arena. The case is reported loudly at boot (invariant 12). |
+
+> **Amendment 2026-06-12 (H1): DMA-capable drivers are no longer an unconditional TCB
+> member.** Before H1 they were an *implicit, unstated* member: with no IOMMU a driver
+> directs its controller's DMA engine at any physical address — kernel-equivalent power
+> the capability model never granted (see the invariant 1 amendment). H1 makes their
+> trust **machine-dependent**: confined by an IOMMU, a compromise is bounded to the
+> granted arena, so the driver is genuinely least-privilege and restartable and **leaves
+> the TCB**; on a machine with no IOMMU it stays trust-critical by necessity. The same
+> binary, different posture, with the difference printed at boot. §6.4 is the full
+> treatment; §22 Test 12 pins the confined case.
 
 > **Amendment 2026-06-09 (H11): `registry` is no longer a TCB member.** It became a
 > real userspace name service (register/lookup over IPC, holding only delegated caps
