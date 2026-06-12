@@ -6,9 +6,11 @@ request = "8MiB"
 limit   = "16MiB"
 
 [capabilities]
-# virtio-blk MMIO base + size (QEMU default).
-hw_mmio      = ["0x10001000+0x1000"]
-hw_interrupt = [11]
-ipc_receive  = ["block-driver"]
-ipc_send     = ["registry"]
-log_write    = true
+# ATA secondary channel via kernel-mediated port I/O (docs/persistence.md §5):
+# command block 0x170-0x177 (+0x8) and the 0x376 control port (+0x1). No DMA,
+# no MMIO — a PIO driver is least-privilege by construction (§5.1).
+hw_pio    = ["0x170+0x8", "0x376+0x1"]
+log_write = true
+
+[placement]
+core = 1

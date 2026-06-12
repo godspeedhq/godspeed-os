@@ -5,6 +5,7 @@
 
 pub mod cap;
 pub mod generation;
+pub mod hw_pio;
 pub mod revoke;
 pub mod rights;
 pub mod table;

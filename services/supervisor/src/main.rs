@@ -115,6 +115,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
     let _ = ctx.spawn("ehci");
 
+    // block-driver: userspace ATA PIO disk driver (persistence, v2;
+    // docs/persistence.md Phase 1). Spawned only in the `blockdev` smoke-test
+    // build, which attaches a disk on the ATA secondary channel. The kernel
+    // grants its hw_pio port window at spawn; it reads sector 0 and logs it.
+    #[cfg(feature = "blockdev")]
+    let _ = ctx.spawn("block-driver");
+
     ctx.log("supervisor: ready");
 
     // Death-notification restart loop (H11 ph6). The kernel enqueues the name of a

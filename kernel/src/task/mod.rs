@@ -398,6 +398,21 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
+        // `block-driver` — userspace ATA PIO disk driver (persistence, v2; §6.3,
+        // docs/persistence.md). The kernel grants its ATA port window by name in
+        // the spawn path (6a-pio); no MMIO, no DMA, no IRQ wired yet (polled).
+        // Phase 1 reads sector 0 and logs it. Pinned to core 1, off the shell/TCB.
+        "block-driver" => Some(("block-driver", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_BLOCK_DRIVER_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    1,
+            probe_mode:        0,
+            memory_limit:      16 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
         // ----------------------------------------------------------------
         // Probe services — §22 Group A identity tests.
         // All use the same probe ELF; probe_mode selects the test behaviour.
@@ -3060,6 +3075,19 @@ fn spawn_service_with_config(
             0
         }
     };
+
+    // 6a-pio. Grant the block driver its ATA PIO port window (persistence, §12;
+    // docs/persistence.md §5). Name-gated like the MMIO BAR above: only
+    // `block-driver` may touch the secondary ATA channel — command block
+    // 0x170-0x177 plus the 0x376 control port. The PortRead/PortWrite syscalls
+    // validate every access against this grant (§3.1, no ambient authority).
+    // There is no DMA grant: a PIO driver never touches RAM, so it is
+    // least-privilege by construction (§5.1) — no IOMMU confinement needed.
+    if name == "block-driver" {
+        const BLOCK_PIO_RANGES: &[(u16, u16)] = &[(0x170, 8), (0x376, 1)];
+        crate::capability::hw_pio::set(task_slot, BLOCK_PIO_RANGES);
+        crate::kprintln!("spawn[pio]: 'block-driver' granted ATA secondary 0x170-0x177,0x376");
+    }
 
     // 6b. Allocate + map a physically-contiguous DMA arena for the xHCI driver
     // (§12). The controller DMAs into this memory (rings/contexts), so the driver

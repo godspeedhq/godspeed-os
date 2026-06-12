@@ -979,13 +979,16 @@ Iteration loop: edit → `build` → `publish` → `restart` → `logs`. Only th
 `kernel/src/arch/`, `kernel/src/memory/`, `kernel/src/capability/`, `kernel/src/smp/`.
 
 **Plus the SDK's audited hardware/ABI layer:** the syscall ABI (`raw_syscall`,
-inline `asm!`) and the MMIO/DMA accessor modules (`sdk/rust/src/mmio.rs`, and a
-future `dma.rs`). Userspace drivers (§12) cannot touch device registers or DMA
-memory without `unsafe`; isolating it to these designated SDK modules — each
-block carrying a `// SAFETY:` comment — keeps the *driver services themselves*
-`unsafe`-free behind safe wrappers (`Mmio::read32`, etc.), exactly as the kernel
-isolates its `unsafe` to the four layers above. This is a recognition of what
-the syscall ABI already required, extended to the hardware access §12 needs.
+inline `asm!`) and the hardware-access accessor modules (`sdk/rust/src/mmio.rs`,
+`sdk/rust/src/dma.rs`, and `sdk/rust/src/pio.rs`). Userspace drivers (§12) cannot
+touch device registers, DMA memory, or I/O ports without `unsafe`; isolating it
+to these designated SDK modules — each block carrying a `// SAFETY:` comment —
+keeps the *driver services themselves* `unsafe`-free behind safe wrappers
+(`Mmio::read32`, `Pio::read16`, etc.), exactly as the kernel isolates its
+`unsafe` to the four layers above. (`pio.rs` only calls `raw_syscall` — port I/O
+is kernel-mediated for ring-3 drivers, §12 — so it is the ABI surface, not a new
+`asm!` one.) This is a recognition of what the syscall ABI already required,
+extended to the hardware access §12 needs.
 
 ### 18.2 Forbidden
 

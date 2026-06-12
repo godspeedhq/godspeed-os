@@ -268,8 +268,12 @@ All replies are exactly one of `{Ok-with-data, defined error}` — never silent
 
 ## 10. Phased build plan
 
-1. **Block driver read path.** Add `hw_pio` cap + SDK `pio.rs`; `block-driver` ATA-PIO
-   reads sector 0 of a QEMU `if=ide` disk and logs its bytes. Pins the device works.
+1. **Block driver read path. ✅ done** (`osdev test blockdev`). Added the `hw_pio`
+   grant (kernel-mediated `PortRead`/`PortWrite` syscalls validated per access,
+   grant store in `capability/hw_pio.rs`), SDK `pio.rs` (`Pio`), and `block-driver`
+   ATA-PIO reads sector 0 of a QEMU secondary-channel `if=ide` disk and logs it —
+   verified by reading back a host-written magic. Port I/O is kernel-mediated because
+   ring-3 drivers cannot run `in`/`out` (granting IOPL would be ambient authority).
 2. **Block driver write + round-trip.** Write a known pattern to a scratch LBA, read it
    back, assert equal. Pins the device read/write path end to end.
 3. **Filesystem mount + format.** Host-side `osdev mkfs` writes a superblock + empty entry

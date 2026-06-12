@@ -48,6 +48,11 @@ pub enum SyscallNumber {
     SignalInputReady    = 27,
     TaskCaps            = 28,
     DeriveCap           = 29,
+    /// Persistence/ATA PIO (§12, docs/persistence.md §5.2): read/write an I/O
+    /// port, validated against the caller's `hw_pio` grant. Ring-3 cannot issue
+    /// `in`/`out` directly, so port I/O is kernel-mediated and checked per access.
+    PortRead            = 30,
+    PortWrite           = 31,
 }
 
 /// Raw syscall dispatcher — called from the SYSCALL/SYSENTER IDT stub.
@@ -97,6 +102,8 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::ConsoleBootComplete as u64 => handle_console_boot_complete(arg0),
         n if n == SyscallNumber::SignalInputReady as u64 => handle_signal_input_ready(arg0),
         n if n == SyscallNumber::TaskCaps as u64 => handle_task_caps(arg0, arg1, arg2),
+        n if n == SyscallNumber::PortRead  as u64 => handle_port_read(arg0, arg1),
+        n if n == SyscallNumber::PortWrite as u64 => handle_port_write(arg0, arg1, arg2),
         _ => -1, // Unknown syscall.
     }
 }
@@ -160,6 +167,45 @@ fn handle_print(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     match core::str::from_utf8(bytes) {
         Ok(s) => { crate::kprint!("{}", s); 0 }
         Err(_) => -1,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: PortRead (30) / PortWrite (31) — capability-mediated I/O port access.
+//
+// Ring-3 services cannot execute `in`/`out`, and granting IOPL=3 would be
+// ambient authority over EVERY port (§3.1). So port I/O is kernel-mediated:
+// each access is validated against the calling task's `hw_pio` grant — the
+// granted port range IS the capability, validated by holdings (like Kill /
+// InspectKernel) because port/width/value fill the ABI registers, leaving no
+// slot to pass. Used by `block-driver` for ATA PIO (docs/persistence.md §5.2).
+// ---------------------------------------------------------------------------
+
+/// arg0 = port, arg1 = width (1 = byte, 2 = word). Returns the read value
+/// (0..=0xFFFF, always non-negative) or `-1` (not authorized / bad width/port).
+fn handle_port_read(port: u64, width: u64) -> i64 {
+    if port > 0xFFFF { return -1; }
+    let port = port as u16;
+    if !crate::capability::hw_pio::allowed(scheduler::current_task_slot(), port) { return -1; }
+    // §3.1: the privileged port read is reached only after the grant check passed.
+    crate::invariants::assertions::assert_cap_validated(&Ok(()));
+    match width {
+        1 => crate::arch::x86_64::port_in8(port)  as i64,
+        2 => crate::arch::x86_64::port_in16(port) as i64,
+        _ => -1,
+    }
+}
+
+/// arg0 = port, arg1 = width (1|2), arg2 = value. Returns `0` or `-1`.
+fn handle_port_write(port: u64, width: u64, val: u64) -> i64 {
+    if port > 0xFFFF { return -1; }
+    let port = port as u16;
+    if !crate::capability::hw_pio::allowed(scheduler::current_task_slot(), port) { return -1; }
+    crate::invariants::assertions::assert_cap_validated(&Ok(()));
+    match width {
+        1 => { crate::arch::x86_64::port_out8(port, val as u8);   0 }
+        2 => { crate::arch::x86_64::port_out16(port, val as u16); 0 }
+        _ => -1,
     }
 }
 

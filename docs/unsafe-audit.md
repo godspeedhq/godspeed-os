@@ -136,11 +136,12 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | arch/x86_64/fb.rs | 3 | permitted |
 | arch/x86_64/interrupts.rs | 13 | permitted |
 | arch/x86_64/iommu.rs | 74 | permitted |
-| arch/x86_64/mod.rs | 34 | permitted |
+| arch/x86_64/mod.rs | 38 | permitted |
 | arch/x86_64/page_tables.rs | 35 | permitted |
 | arch/x86_64/pci.rs | 15 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |
 | arch/x86_64/syscall_entry.rs | 13 | permitted |
+| capability/hw_pio.rs | 3 | permitted |
 | capability/table.rs | 7 | permitted |
 | memory/allocator.rs | 32 | permitted |
 | memory/frame.rs | 1 | permitted |
@@ -159,9 +160,19 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | task/scheduler.rs | 37 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 360 lines across 21 files  
+**Permitted total:** 367 lines across 22 files  
 **Grandfathered total:** 53 lines across 6 files  
-**Grand total:** 413 lines across 27 files
+**Grand total:** 420 lines across 28 files
+
+> **2026-06-12** (branch `feat/persistence`). Persistence Phase 1 (ATA PIO block
+> driver, docs/persistence.md §5). `arch/x86_64/mod.rs` +4 (permitted): safe
+> public port-I/O wrappers `port_in8/16` + `port_out8/16` (the `in`/`out` asm,
+> isolated in the arch layer; callers validate the port first). New file
+> `capability/hw_pio.rs` +3 (permitted): the per-task `hw_pio` grant store
+> (`set`/`clear`/`allowed`) — placed in the capability layer **on purpose**, so
+> the per-task port-range state does not grow the grandfathered `unsafe` floor in
+> `task/` (§18.5). `task/scheduler.rs` and `syscall/dispatch.rs` gained **no**
+> `unsafe` (they call the safe wrappers / the capability-layer functions).
 
 > **2026-06-10** (branch `feat/iommu-dma-confinement`). New file `arch/x86_64/iommu.rs`
 > (+60, permitted): the H1 AMD-Vi IOMMU work. Phase 0 (+18) is ACPI-table reads

@@ -877,6 +877,15 @@ impl ServiceContext {
         }
     }
 
+    /// Capability-mediated I/O port access (§12, docs/persistence.md §5). Used by
+    /// `block-driver` for ATA PIO. The kernel validates every access against this
+    /// task's `hw_pio` grant, so a service with no grant (every non-driver) gets
+    /// `None`/`false` from the [`crate::Pio`] accessors — the handle itself is
+    /// harmless without the grant, so it is handed out unconditionally.
+    pub fn pio(&self) -> crate::pio::Pio {
+        crate::pio::Pio::new()
+    }
+
     /// Allocate `size` bytes of read/write memory within this task's budget.
     ///
     /// Returns the virtual address of the mapping on success, or `AllocError`

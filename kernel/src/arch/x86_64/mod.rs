@@ -719,3 +719,59 @@ unsafe fn inb(port: u16) -> u8 {
     }
     val
 }
+
+// ---------------------------------------------------------------------------
+// Capability-mediated port I/O (§12, persistence/ATA PIO).
+//
+// Safe public wrappers — the `unsafe` asm is isolated here in the arch layer
+// (§18.1). Port I/O is a hardware side effect, not Rust-UB, so these mirror the
+// other safe arch wrappers (`disable_interrupts`, `read_cycle_counter`). The
+// CALLER (the PortRead/PortWrite syscall handlers) must validate the port
+// against the calling task's `hw_pio` grant BEFORE calling — these wrappers do
+// no authorization, exactly like the MMIO accessors do none.
+// ---------------------------------------------------------------------------
+
+/// Read a byte from an I/O port.
+#[inline]
+pub fn port_in8(port: u16) -> u8 {
+    // SAFETY: `in` is a pure hardware read; the port is validated by the caller
+    // against the task's granted range. No memory is touched.
+    unsafe { inb(port) }
+}
+
+/// Read a 16-bit word from an I/O port (the ATA data register, 0x1F0/0x170).
+#[inline]
+pub fn port_in16(port: u16) -> u16 {
+    let val: u16;
+    // SAFETY: `in` 16-bit hardware read; port validated by the caller.
+    unsafe {
+        core::arch::asm!(
+            "in ax, dx",
+            out("ax") val,
+            in("dx") port,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    val
+}
+
+/// Write a byte to an I/O port.
+#[inline]
+pub fn port_out8(port: u16, val: u8) {
+    // SAFETY: `out` is a hardware write; port validated by the caller.
+    unsafe { outb(port, val) }
+}
+
+/// Write a 16-bit word to an I/O port.
+#[inline]
+pub fn port_out16(port: u16, val: u16) {
+    // SAFETY: `out` 16-bit hardware write; port validated by the caller.
+    unsafe {
+        core::arch::asm!(
+            "out dx, ax",
+            in("dx") port,
+            in("ax") val,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+}
