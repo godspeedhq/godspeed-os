@@ -14,7 +14,16 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, Pio};
+use godspeed_sdk::{CapHandle, Message, Pio, ServiceContext};
+
+// Block IPC protocol (fs <-> block-driver). MUST match `services/fs`.
+//   Request : [op:u8, lba:u32 LE, (WriteBlock only: 512 data bytes)]
+//   Reply   : [status:u8, (ReadBlock only: 512 data bytes)]
+const OP_READ_BLOCK:  u8 = 1;
+const OP_WRITE_BLOCK: u8 = 2;
+const STATUS_OK:  u8 = 0;
+const STATUS_ERR: u8 = 1;
+const BLOCK_BYTES: usize = 512; // one ATA sector per IPC request (docs/persistence.md §6.1)
 
 // Secondary ATA channel command block + control port (the `hw_pio` grant).
 const ATA_DATA:     u16 = 0x170; // 16-bit data register
@@ -64,9 +73,55 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         Err(e) => ctx.log_fmt(format_args!("block-driver: round-trip FAILED: {}", e)),
     }
 
-    // Phase 1 has no IPC loop yet; stay alive (and observable) idling.
+    // Serve block read/write requests from `fs` over IPC (docs/persistence.md §4).
+    // The client embeds a per-request reply cap; we reply through it.
+    ctx.log("block-driver: serving block I/O");
     loop {
-        ctx.yield_cpu();
+        let msg = ctx.recv();
+        let reply = match ctx.take_pending_cap() {
+            Some(c) => c,
+            None => continue, // no reply cap — malformed request, drop it
+        };
+        serve_request(&ctx, &pio, msg.payload_bytes(), reply);
+        ctx.remove_cap(reply); // per-request reply cap; don't accumulate
+    }
+}
+
+/// Handle one block request and reply through the client's `reply` cap.
+fn serve_request(ctx: &ServiceContext, pio: &Pio, p: &[u8], reply: CapHandle) {
+    if p.len() < 5 {
+        let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR]));
+        return;
+    }
+    let op = p[0];
+    let lba = u32::from_le_bytes([p[1], p[2], p[3], p[4]]);
+    match op {
+        OP_READ_BLOCK => {
+            let mut out = [0u8; 1 + BLOCK_BYTES];
+            let mut sec = [0u8; 512];
+            match read_lba(pio, lba, &mut sec) {
+                Ok(()) => {
+                    out[0] = STATUS_OK;
+                    out[1..].copy_from_slice(&sec);
+                    let _ = ctx.send_by_handle(reply, &Message::from_bytes(&out));
+                }
+                Err(_) => { let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR])); }
+            }
+        }
+        OP_WRITE_BLOCK => {
+            if p.len() < 5 + BLOCK_BYTES {
+                let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR]));
+                return;
+            }
+            let mut sec = [0u8; 512];
+            sec.copy_from_slice(&p[5..5 + BLOCK_BYTES]);
+            let status = match write_lba(pio, lba, &sec) {
+                Ok(()) => STATUS_OK,
+                Err(_) => STATUS_ERR,
+            };
+            let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[status]));
+        }
+        _ => { let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR])); }
     }
 }
 

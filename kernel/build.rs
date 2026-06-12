@@ -38,6 +38,7 @@ fn main() {
         ("XHCI",       "xhci"),
         ("EHCI",       "ehci"),
         ("BLOCK_DRIVER", "block-driver"),
+        ("FS",         "fs"),
     ];
 
     for (env_name, bin_name) in services {

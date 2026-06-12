@@ -414,6 +414,24 @@ impl ServiceContext {
         }
     }
 
+    /// Send a request to a named `peer` and block for its reply (synchronous
+    /// request/response). Embeds a per-request reply cap — a `SEND|GRANT` copy of
+    /// this service's own endpoint cap — so the server can reply via
+    /// `take_pending_cap()` + `send_by_handle()` (the registry pattern, §8). The
+    /// caller must own an endpoint and not have other traffic racing the reply.
+    /// `None` if the peer is unknown, the cap cannot be derived, or the send fails.
+    pub fn request_with_reply(
+        &self,
+        peer: &str,
+        msg:  &crate::ipc::Message,
+    ) -> Option<crate::ipc::Message> {
+        let target = CapHandle(self.find_send_slot(peer)?);
+        let self_grant = self.self_grant_handle()?;
+        let reply_cap = self.derive_cap(self_grant)?;
+        self.send_with_cap_by_handle(target, reply_cap, msg).ok()?;
+        crate::ipc::recv(self.recv_handle()?).ok()
+    }
+
     /// Reacquire a fresh SEND cap to `peer` via the **registry service** (H11) and
     /// point the named-peer cache at it, so subsequent `try_send(peer)` / `send(peer)`
     /// use the new cap. This is the registry-service replacement for `reacquire_cap`

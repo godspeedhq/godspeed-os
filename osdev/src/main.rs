@@ -90,6 +90,8 @@ enum Commands {
     },
     /// Validate all service contracts against the JSON schema.
     Validate,
+    /// Format a disk image with a GodspeedOS filesystem superblock (docs/persistence.md §6).
+    Mkfs { image: String },
 }
 
 fn main() {
@@ -108,7 +110,37 @@ fn main() {
         Commands::Image { mode }     => cmd_image(&mode),
         Commands::Shell { smp }      => cmd_shell(smp),
         Commands::Validate           => cmd_validate(),
+        Commands::Mkfs { image }     => cmd_mkfs(&image),
     }
+}
+
+/// On-disk superblock magic — MUST match `services/fs` (docs/persistence.md §6).
+const FS_SB_MAGIC: &[u8; 8] = b"GSPDFS01";
+const FS_BLOCK_SIZE: u32 = 4096;
+
+/// Write a GodspeedOS filesystem superblock into LBA 0 of `path`, preserving the
+/// rest of the image. `total_blocks` is derived from the image size.
+fn format_superblock(path: &str) {
+    let mut data = std::fs::read(path)
+        .unwrap_or_else(|e| { eprintln!("mkfs: cannot read {}: {}", path, e); std::process::exit(1); });
+    if data.len() < 512 {
+        eprintln!("mkfs: image too small ({} bytes)", data.len());
+        std::process::exit(1);
+    }
+    let total_blocks = (data.len() as u64 / FS_BLOCK_SIZE as u64) as u32;
+    let mut sb = [0u8; 512];
+    sb[0..8].copy_from_slice(FS_SB_MAGIC);
+    sb[8..12].copy_from_slice(&1u32.to_le_bytes());            // version
+    sb[12..16].copy_from_slice(&FS_BLOCK_SIZE.to_le_bytes());  // block_size
+    sb[16..20].copy_from_slice(&total_blocks.to_le_bytes());   // total_blocks
+    data[0..512].copy_from_slice(&sb);
+    std::fs::write(path, &data)
+        .unwrap_or_else(|e| { eprintln!("mkfs: cannot write {}: {}", path, e); std::process::exit(1); });
+    println!("mkfs: formatted {} ({} blocks of {} bytes)", path, total_blocks, FS_BLOCK_SIZE);
+}
+
+fn cmd_mkfs(image: &str) {
+    format_superblock(image);
 }
 
 fn cmd_new(name: &str) {
@@ -136,7 +168,7 @@ pub fn cmd_build() {
     // Services must be compiled before the kernel — kernel/build.rs embeds
     // the service ELF bytes via include_bytes!(env!("SVC_*_ELF")).
     let service_crates = [
-        "init", "supervisor", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver",
+        "init", "supervisor", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs",
     ];
     for crate_name in &service_crates {
         let status = std::process::Command::new("cargo")
@@ -166,7 +198,7 @@ pub fn cmd_build() {
 /// no probe services that require the QEMU harness control port to complete).
 pub fn cmd_build_bare_metal() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -208,7 +240,7 @@ pub fn cmd_build_bare_metal() {
 /// Bar: no panic, no resource leak after 24 hours.
 pub fn cmd_build_idle() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -250,7 +282,7 @@ pub fn cmd_build_idle() {
 pub fn cmd_build_identity() {
     clean_supervisor();
     // Build every service crate except supervisor first.
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -294,7 +326,7 @@ pub fn cmd_build_identity() {
 /// maximum headroom before its timeout fires.
 pub fn cmd_build_perf() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -335,7 +367,7 @@ pub fn cmd_build_perf() {
 /// internally — no QEMU control port required.
 pub fn cmd_build_stress() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -379,7 +411,7 @@ pub fn cmd_build_stress() {
 /// "fuzz: F* pass" line and never "KERNEL PANIC".
 pub fn cmd_build_fuzz() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -419,7 +451,7 @@ pub fn cmd_build_fuzz() {
 /// hardware chaos run (C2–C7). C1 and C4 use bare-metal + hardware reconfiguration.
 pub fn cmd_build_chaos() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -460,7 +492,7 @@ pub fn cmd_build_chaos() {
 /// that triggers the Goldmont+ BSP IPI delivery quirk on the blocking round-trip.
 pub fn cmd_build_b2_only() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -503,7 +535,7 @@ pub fn cmd_build_b2_only() {
 /// probes — for clean, uncontended per-op latency on hardware. `feature` is the
 /// supervisor sub-feature, e.g. "iso-bp5".
 pub fn cmd_build_perf_iso(feature: &str) {
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -543,7 +575,7 @@ pub fn cmd_build_perf_iso(feature: &str) {
 
 pub fn cmd_build_bp2_only() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -584,7 +616,7 @@ pub fn cmd_build_bp2_only() {
 /// no QEMU control port required.
 pub fn cmd_build_adv() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -624,7 +656,7 @@ pub fn cmd_build_adv() {
 /// benchmark suite (BP1–BP10).
 pub fn cmd_build_brutal_perf() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -874,7 +906,7 @@ fn cmd_shell(smp: u32) {
 /// §22 Test 12 / H1 §6.4.
 fn cmd_build_iommu_fault() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"])
@@ -975,7 +1007,7 @@ fn run_iommu_test() {
 /// services (incl. block-driver). No special kernel feature.
 fn cmd_build_blockdev() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"])
@@ -1014,15 +1046,11 @@ fn run_blockdev_test() {
     disk_image::install_bootloader(limine_dir, &image_path);
 
     let _ = std::fs::create_dir_all("build/tests");
-    // Persistence disk: 16 MiB raw, with a recognizable magic in sector 0 so the
-    // driver's read is verifiable in the serial log.
-    const MAGIC: &[u8] = b"GODSPEEDFS-PHASE1";
+    // Persistence disk: 16 MiB raw, formatted with a GodspeedOS superblock at LBA 0
+    // (osdev mkfs) so block-driver reads back its magic and fs can mount it.
     let persist = "build/tests/persist.img";
-    {
-        let mut data = vec![0u8; 16 * 1024 * 1024];
-        data[..MAGIC.len()].copy_from_slice(MAGIC);
-        std::fs::write(persist, &data).expect("failed to create persist.img");
-    }
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create persist.img");
+    format_superblock(persist);
 
     let serial = "build/tests/blockdev_test_serial.log";
     let _ = std::fs::remove_file(serial);
@@ -1054,32 +1082,30 @@ fn run_blockdev_test() {
     let granted  = log.contains("spawn[pio]: 'block-driver' granted");
     let started  = log.contains("block-driver: starting");
     let read_ok  = log.contains("block-driver: sector 0 read OK");
-    // The driver logs the first 16 bytes of the sector; MAGIC is 17 chars, so we
-    // match its 16-byte prefix (unambiguous proof the host's bytes were read back).
-    let magic     = log.contains("GODSPEEDFS-PHASE");
-    let roundtrip = log.contains("write/read round-trip OK"); // step 2: write path
+    let magic     = log.contains("GSPDFS01");                    // superblock magic at LBA 0
+    let roundtrip = log.contains("write/read round-trip OK");    // step 2: write path
+    let fs_mounted = log.contains("fs: mounted");                // step 3: fs reads SB via IPC
     let no_panic  = !log.contains("KERNEL PANIC");
 
-    for l in log.lines().filter(|l| l.contains("block-driver") || l.contains("spawn[pio]")) {
+    for l in log.lines().filter(|l| l.contains("block-driver") || l.contains("spawn[pio]") || l.contains("fs:")) {
         println!("blockdev:   | {}", l.trim());
     }
     println!("blockdev:   kernel granted hw_pio ... {}", if granted { "yes" } else { "NO" });
     println!("blockdev:   driver started ... {}", if started { "yes" } else { "NO" });
-    println!("blockdev:   sector 0 read OK ... {}", if read_ok { "yes" } else { "NO" });
-    println!("blockdev:   magic 'GODSPEEDFS-PHASE' read back ... {}", if magic { "yes" } else { "NO" });
+    println!("blockdev:   sector 0 read OK + superblock magic ... {}", if read_ok && magic { "yes" } else { "NO" });
     println!("blockdev:   write/read round-trip OK ... {}", if roundtrip { "yes" } else { "NO" });
+    println!("blockdev:   fs mounted (read SB via block-driver IPC) ... {}", if fs_mounted { "yes" } else { "NO" });
     println!("blockdev:   kernel did not panic ... {}", if no_panic { "yes" } else { "NO" });
 
-    if granted && started && read_ok && magic && roundtrip && no_panic {
-        println!("\n  [P1.1]  block-driver reads sector 0 via hw_pio       … PASS");
-        println!("  [P1.2]  block-driver write/read round-trip (ATA PIO)  … PASS\n\n  2 passed  0 failed");
-    } else {
-        let r1 = if granted && started && read_ok && magic && no_panic { "PASS" } else { "FAIL" };
-        let r2 = if roundtrip && no_panic { "PASS" } else { "FAIL" };
-        println!("\n  [P1.1]  block-driver reads sector 0 via hw_pio       … {r1}");
-        println!("  [P1.2]  block-driver write/read round-trip (ATA PIO)  … {r2}");
-        let passed = (r1 == "PASS") as u32 + (r2 == "PASS") as u32;
-        println!("\n  {passed} passed  {} failed", 2 - passed);
+    let r1 = if granted && started && read_ok && magic && no_panic { "PASS" } else { "FAIL" };
+    let r2 = if roundtrip && no_panic { "PASS" } else { "FAIL" };
+    let r3 = if fs_mounted && no_panic { "PASS" } else { "FAIL" };
+    println!("\n  [P1.1]  block-driver reads sector 0 via hw_pio        … {r1}");
+    println!("  [P1.2]  block-driver write/read round-trip (ATA PIO)   … {r2}");
+    println!("  [P1.3]  fs mounts (superblock read over block IPC)     … {r3}");
+    let passed = (r1 == "PASS") as u32 + (r2 == "PASS") as u32 + (r3 == "PASS") as u32;
+    println!("\n  {passed} passed  {} failed", 3 - passed);
+    if passed != 3 {
         std::process::exit(1);
     }
 }

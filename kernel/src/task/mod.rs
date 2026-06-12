@@ -404,12 +404,27 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // Phase 1 reads sector 0 and logs it. Pinned to core 1, off the shell/TCB.
         "block-driver" => Some(("block-driver", ServiceConfig {
             elf:               include_bytes!(env!("SVC_BLOCK_DRIVER_ELF")),
-            has_recv_endpoint: false,
-            send_peers:        &[],
+            has_recv_endpoint: true, // serves block read/write requests from fs (§4)
+            send_peers:        &[],  // replies via the per-request reply cap fs embeds
             send_peers_grant:  false,
             preferred_core:    1,
             probe_mode:        0,
             memory_limit:      16 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
+        // `fs` — userspace filesystem (persistence, v2; §15, docs/persistence.md).
+        // Phase 1: mounts by reading the superblock (LBA 0) from `block-driver`
+        // over IPC and validating its magic. Spawned AFTER block-driver (its
+        // send-peer cap wires from the kernel name table at spawn). Core 1.
+        "fs" => Some(("fs", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_FS_ELF")),
+            has_recv_endpoint: true, // owns an endpoint (reply target + future fs API)
+            send_peers:        &["block-driver"],
+            send_peers_grant:  false,
+            preferred_core:    1,
+            probe_mode:        0,
+            memory_limit:      32 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
         })),

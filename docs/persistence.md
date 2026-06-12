@@ -278,8 +278,15 @@ All replies are exactly one of `{Ok-with-data, defined error}` — never silent
    driver writes a known pattern to a scratch LBA (WRITE SECTORS + FLUSH CACHE), reads it
    back, and asserts equal — proving the device read/write path end to end. All in the
    driver via the existing `Pio` wrapper; no new kernel surface.
-3. **Filesystem mount + format.** Host-side `osdev mkfs` writes a superblock + empty entry
-   table + bitmap into a disk image; `fs` mounts it (validates magic), logs geometry.
+3. **Filesystem mount + format. ✅ done** (`osdev test blockdev`, case P1.3). Host-side
+   `osdev mkfs <image>` writes the superblock (magic `GSPDFS01`, version, block_size,
+   total_blocks) into LBA 0; `block-driver` gained an IPC server loop (`ReadBlock` /
+   `WriteBlock`, the per-request reply-cap pattern); `fs` mounts by reading LBA 0 over
+   that IPC (SDK `request_with_reply`), validating the magic loudly, and logging the
+   geometry. The entry table + free bitmap are written by `mkfs` in a later step (no
+   files exist yet). Forward `fs → block-driver` cap wires via `send_peers` (block-driver
+   spawns first, kernel auto-registers its endpoint name); the reply rides a per-request
+   cap fs embeds.
 4. **Filesystem read/write (name→blob).** `WriteFile`/`ReadFile`/`StatFile` over IPC,
    `fs` ↔ `block-driver`. A test service writes "hello" to `greeting`, reads it back.
 5. **Reboot survival (the headline).** Boot, write a file, quit QEMU, **reboot with the
