@@ -897,6 +897,7 @@ fn cmd_test(suite: &str) {
         "blockdev"     => run_blockdev_test(),
         "blockdev-reboot" => run_blockdev_reboot_test(),
         "blockdev-ahci"   => run_blockdev_ahci_test(),
+        "blockdev-ahci-reboot" => run_blockdev_ahci_reboot_test(),
         other => eprintln!("unknown test suite: {}", other),
     }
 }
@@ -1227,7 +1228,9 @@ fn run_blockdev_reboot_test() {
     // The persist disk is NOT touched here — only QEMU wrote to it in boot 1.
     println!("blockdev: boot 2 — SAME disk, no reformat, fs must read it back, ~25s …");
     let log2 = boot_blockdev_qemu(&img_str, &persist_str, "build/tests/blockdev_reboot_2.log", 25);
-    let survived = log2.contains("fs: persisted file 'greeting' verified across boot");
+    // Tail-match: the "fs:" prefix can be clobbered by a concurrent shell write on
+    // the shared serial (cosmetic interleaving); the line tail is interleave-safe.
+    let survived = log2.contains("verified across boot");
     let panic2   = log2.contains("KERNEL PANIC");
     for l in log2.lines().filter(|l| l.contains("fs:")) {
         println!("blockdev:   boot2 | {}", l.trim());
@@ -1353,6 +1356,74 @@ fn run_blockdev_ahci_test() {
     let passed = (ab == "PASS") as u32 + (c == "PASS") as u32 + (d == "PASS") as u32;
     println!("\n  {passed} passed  {} failed", 3 - passed);
     if passed != 3 {
+        std::process::exit(1);
+    }
+}
+
+/// Boot the AHCI image once with `persist` alone on an ich9-ahci controller and
+/// the boot image on legacy IDE; capture and return the serial log.
+fn boot_ahci_qemu(img_str: &str, persist_str: &str, serial: &str, secs: u64) -> String {
+    let _ = std::fs::remove_file(serial);
+    let mut cmd = std::process::Command::new(qemu::qemu_binary());
+    cmd.args([
+        "-m", "512M", "-smp", "2",
+        "-drive", &format!("format=raw,file={img_str},if=ide"),
+        "-device", "ich9-ahci,id=ahci",
+        "-drive", &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device", "ide-hd,drive=data,bus=ahci.0",
+        "-serial", &format!("file:{serial}"),
+        "-serial", "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]);
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("ahci: failed to launch QEMU: {e}"); std::process::exit(1); });
+    std::thread::sleep(std::time::Duration::from_secs(secs));
+    let _ = child.kill();
+    let _ = child.wait();
+    std::fs::read_to_string(serial).unwrap_or_default().replace('\r', "")
+}
+
+/// AHCI reboot survival: format once, boot (fs writes `greeting` over AHCI), then
+/// reboot on the SAME SATA disk image — fs must read it back over AHCI.
+fn run_blockdev_ahci_reboot_test() {
+    println!("\n=== AHCI reboot survival (write → reboot → read, over SATA) ===");
+    cmd_build_blockdev_ahci();
+
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_ahci_reboot.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create persist disk");
+    format_superblock(persist);
+
+    let img = std::fs::canonicalize(&image_path).unwrap_or_else(|_| image_path.to_path_buf());
+    let img_str = img.to_string_lossy().replace('\\', "/");
+    let persist_abs = std::fs::canonicalize(persist).unwrap_or_else(|_| std::path::PathBuf::from(persist));
+    let persist_str = persist_abs.to_string_lossy().replace('\\', "/");
+
+    println!("ahci: boot 1 — fs creates 'greeting' over AHCI, ~25s …");
+    let log1 = boot_ahci_qemu(&img_str, &persist_str, "build/tests/ahci_reboot_1.log", 25);
+    let created = log1.contains("fs: file round-trip OK (greeting)");
+
+    println!("ahci: boot 2 — SAME SATA disk, no reformat, fs reads it back, ~25s …");
+    let log2 = boot_ahci_qemu(&img_str, &persist_str, "build/tests/ahci_reboot_2.log", 25);
+    // Match the END of the line — the "fs:" prefix can be clobbered by a concurrent
+    // shell write on the shared serial (cosmetic interleaving), but the tail is safe.
+    let survived = log2.contains("verified across boot");
+    for l in log2.lines().filter(|l| l.contains("fs:") || l.contains("IDENTIFY")) {
+        println!("ahci:   boot2 | {}", l.trim());
+    }
+    let panic = log1.contains("KERNEL PANIC") || log2.contains("KERNEL PANIC");
+    println!("ahci:   boot 1 created 'greeting' ... {}", if created { "yes" } else { "NO" });
+    println!("ahci:   boot 2 read it back from SATA ... {}", if survived { "yes" } else { "NO" });
+
+    if created && survived && !panic {
+        println!("\n  [AHCI.R]  reboot survival over SATA  … PASS\n\n  1 passed  0 failed");
+    } else {
+        println!("\n  [AHCI.R]  reboot survival over SATA  … FAIL\n\n  0 passed  1 failed");
         std::process::exit(1);
     }
 }
