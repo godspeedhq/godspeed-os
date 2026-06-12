@@ -116,11 +116,11 @@ fn main() {
 
 // On-disk format — MUST match `services/fs` (docs/persistence.md §6).
 // 512-byte blocks (= one ATA sector = one block-IPC request), so block number = LBA.
-//   Superblock @ LBA 0: magic[8] "GSPDFS01", version u32, block_size u32=512,
+//   Superblock @ LBA 0: magic[8] "GSFS0001", version u32, block_size u32=512,
 //     total_blocks u32, entry_table_start u32=1, entry_table_blocks u32=1,
 //     data_start u32=2, next_free_block u32 (bump allocator), file_count u32.
 //   Entry table @ LBA 1 (1 block, 16 entries × 32 bytes). Data region from LBA 2.
-const FS_SB_MAGIC: &[u8; 8] = b"GSPDFS01";
+const FS_SB_MAGIC: &[u8; 8] = b"GSFS0001";
 const FS_BLOCK_SIZE: u32 = 512;
 const FS_ENTRY_TABLE_START: u32 = 1;
 const FS_ENTRY_TABLE_BLOCKS: u32 = 1;
@@ -1139,7 +1139,7 @@ fn run_blockdev_test() {
     let granted  = log.contains("spawn[pio]: 'block-driver' granted");
     let started  = log.contains("block-driver: starting");
     let read_ok  = log.contains("block-driver: sector 0 read OK");
-    let magic     = log.contains("GSPDFS01");                    // superblock magic at LBA 0
+    let magic     = log.contains("GSFS0001");                    // superblock magic at LBA 0
     let roundtrip = log.contains("write/read round-trip OK");    // step 2: write path
     let fs_mounted = log.contains("fs: mounted");                // step 3: fs reads SB via IPC
     // step 4: fs stores + retrieves a named file (entry table + extent + data blocks).

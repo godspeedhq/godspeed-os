@@ -17,7 +17,7 @@
 use godspeed_sdk::{CapHandle, Message, ServiceContext};
 
 // On-disk format — MUST match `osdev mkfs` (docs/persistence.md §6). 512-byte blocks.
-const SB_MAGIC: &[u8; 8] = b"GSPDFS01";
+const SB_MAGIC: &[u8; 8] = b"GSFS0001";
 const BLOCK: usize = 512;
 const MAX_FILES: usize = 16; // 16 entries × 32 bytes = 512 = one entry-table block
 const NAME_MAX: usize = 16;

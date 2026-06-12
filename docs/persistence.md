@@ -279,7 +279,7 @@ All replies are exactly one of `{Ok-with-data, defined error}` — never silent
    back, and asserts equal — proving the device read/write path end to end. All in the
    driver via the existing `Pio` wrapper; no new kernel surface.
 3. **Filesystem mount + format. ✅ done** (`osdev test blockdev`, case P1.3). Host-side
-   `osdev mkfs <image>` writes the superblock (magic `GSPDFS01`, version, block_size,
+   `osdev mkfs <image>` writes the superblock (magic `GSFS0001`, version, block_size,
    total_blocks) into LBA 0; `block-driver` gained an IPC server loop (`ReadBlock` /
    `WriteBlock`, the per-request reply-cap pattern); `fs` mounts by reading LBA 0 over
    that IPC (SDK `request_with_reply`), validating the magic loudly, and logging the
