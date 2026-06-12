@@ -681,6 +681,7 @@ fn cmd_image(mode: &str) {
     // the stale-embed rationale). So no clean is needed here.
     match mode {
         "bare-metal"  => cmd_build_bare_metal(),
+        "iommu-fault" => cmd_build_iommu_fault(),
         "perf"        => cmd_build_perf(),
         "perf-brutal" => cmd_build_brutal_perf(),
         "identity"    => cmd_build_identity(),
@@ -704,7 +705,7 @@ fn cmd_image(mode: &str) {
         "iso-reg"     => cmd_build_perf_iso("iso-reg"),
         "s8"          => cmd_build_idle(),
         other => {
-            eprintln!("image: unknown --mode '{}'; valid: bare-metal, perf, perf-brutal, identity, stress, adv, chaos, fuzz, b2-only, bp2-only, iso-bp3, iso-bp5, iso-bp7, iso-bp9, iso-bp10, iso-s3, iso-s5, iso-s9, iso-c7, iso-xsend, iso-xlife, iso-reg, s8", other);
+            eprintln!("image: unknown --mode '{}'; valid: bare-metal, iommu-fault, perf, perf-brutal, identity, stress, adv, chaos, fuzz, b2-only, bp2-only, iso-bp3, iso-bp5, iso-bp7, iso-bp9, iso-bp10, iso-s3, iso-s5, iso-s9, iso-c7, iso-xsend, iso-xlife, iso-reg, s8", other);
             std::process::exit(1);
         }
     }
@@ -841,6 +842,7 @@ fn cmd_test(suite: &str) {
         "chaos"        => crate::validator::run_chaos_tests(),
         "chaos-brutal" => crate::validator::run_chaos_brutal_tests(),
         "shell"        => run_shell_test(),
+        "iommu"        => run_iommu_test(),
         other => eprintln!("unknown test suite: {}", other),
     }
 }
@@ -863,6 +865,108 @@ fn cmd_shell(smp: u32) {
     let image_path = disk_image::create(kernel_elf, limine_dir);
     disk_image::install_bootloader(limine_dir, &image_path);
     qemu::run_shell(&image_path, smp);
+}
+
+/// Build like bare-metal, but compile the kernel with `--features
+/// iommu-fault-test` so the first confined driver (xhci) is confined to an EMPTY
+/// IOMMU domain — its init DMA then faults, the deterministic live proof for
+/// §22 Test 12 / H1 §6.4.
+fn cmd_build_iommu_fault() {
+    clean_supervisor();
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci"];
+    for crate_name in &non_supervisor {
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"])
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run cargo build for {}: {}", crate_name, e));
+        if !status.success() { eprintln!("build: {} FAILED", crate_name); std::process::exit(1); }
+        println!("build: {} OK", crate_name);
+    }
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "supervisor", "--target", "x86_64-unknown-none",
+               "--features", "supervisor/bare-metal"])
+        .status().unwrap_or_else(|e| panic!("failed to run cargo build for supervisor: {}", e));
+    if !status.success() { eprintln!("build: supervisor (bare-metal) FAILED"); std::process::exit(1); }
+    println!("build: supervisor (bare-metal) OK");
+
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none",
+               "--features", "kernel/iommu-fault-test"])
+        .status().expect("failed to run cargo build for kernel");
+    if !status.success() { eprintln!("build: kernel (iommu-fault-test) FAILED"); std::process::exit(1); }
+    println!("build: kernel (iommu-fault-test) OK");
+}
+
+/// §22 Test 12 (H1 §6.4): boot with an emulated AMD-Vi IOMMU and a USB device on
+/// qemu-xhci, and verify the confinement guarantee structurally on a live, enabled
+/// IOMMU — the confined driver's I/O page table maps **exactly** its arena and the
+/// page just outside it is **unmapped** (so an out-of-arena DMA has no translation
+/// and would fault), AND the driver still operates *through* the confined domain
+/// (its keyboard enumerates), AND the kernel does not panic.
+///
+/// QEMU's `amd-iommu` does not actually *enforce* translation faults (it is lenient
+/// where real AMD-Vi is strict), so the live `IO_PAGE_FAULT` cannot be reproduced in
+/// emulation — it is hardware-verified on the T630 (and reproducible there with the
+/// kernel `iommu-fault-test` feature, which confines xhci to an empty domain). The
+/// `selftest` line is a CPU-side page-table walk QEMU cannot fake, so it is the
+/// portable executable form of the guarantee. Requires q35 + `-device amd-iommu`,
+/// which the BIOS/i440fx test path can't provide, so this launches QEMU itself.
+fn run_iommu_test() {
+    println!("\n=== §22 Test 12: confined driver — out-of-arena is unmapped (H1 §6.4) ===");
+    cmd_build_bare_metal();
+
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+
+    let _ = std::fs::create_dir_all("build/tests");
+    let serial = "build/tests/iommu_test_serial.log";
+    let _ = std::fs::remove_file(serial);
+    let img = std::fs::canonicalize(&image_path).unwrap_or_else(|_| image_path.to_path_buf());
+    let img_str = img.to_string_lossy().replace('\\', "/");
+
+    let mut cmd = std::process::Command::new(qemu::qemu_binary());
+    cmd.args([
+        "-machine", "q35", "-m", "512M", "-smp", "2",
+        "-device", "amd-iommu",
+        "-device", "qemu-xhci,id=xhci",
+        "-device", "usb-kbd,bus=xhci.0",
+        "-drive", &format!("format=raw,file={img_str},if=ide"),
+        "-serial", &format!("file:{serial}"),
+        "-serial", "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]);
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("iommu: failed to launch QEMU: {e}"); std::process::exit(1); });
+    println!("iommu: booting (q35 + amd-iommu + qemu-xhci + usb-kbd), ~28s …");
+    std::thread::sleep(std::time::Duration::from_secs(28));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let log = std::fs::read_to_string(serial).unwrap_or_default();
+    let log = log.replace('\r', "");
+    let confined      = log.contains("confined BDF");
+    // The selftest proves the confined page table maps exactly the arena and the
+    // page just outside it is unmapped — the structural form of "out-of-arena DMA
+    // would fault".
+    let outside_unmapped = log.contains("selftest PASS") && log.contains("(outside) unmapped");
+    let works_confined   = log.contains("keyboard found");          // driver operates through the domain
+    let no_panic         = !log.contains("KERNEL PANIC");
+
+    let sel = log.lines().find(|l| l.contains("selftest PASS")).unwrap_or("(none)");
+    println!("iommu:   driver confined to its arena ... {}", if confined { "yes" } else { "NO" });
+    println!("iommu:   out-of-arena UNMAPPED (would fault) ... {}", if outside_unmapped { "yes" } else { "NO" });
+    println!("iommu:   driver operates through the confined domain ... {}", if works_confined { "yes" } else { "NO" });
+    println!("iommu:   kernel did not panic ... {}", if no_panic { "yes" } else { "NO" });
+    println!("iommu:   selftest: {}", sel.trim());
+
+    if confined && outside_unmapped && works_confined && no_panic {
+        println!("\n  [12]  confined_driver_dma_faults  (§22 Test 12)  … PASS\n\n  1 passed  0 failed");
+    } else {
+        println!("\n  [12]  confined_driver_dma_faults  (§22 Test 12)  … FAIL\n\n  0 passed  1 failed");
+        std::process::exit(1);
+    }
 }
 
 /// Build bare-metal image and run the scripted shell smoke-test.

@@ -624,19 +624,32 @@ pub fn confine_device(bdf: u32, arena_phys: u64, arena_len: u64) -> bool {
 
     let first = arena_phys & !0xFFF;
     let last = (arena_phys + arena_len - 1) & !0xFFF;
-    let mut pa = first;
-    while pa <= last {
-        // SAFETY: l4 is the zeroed root we just allocated; pa is page-aligned.
-        if !unsafe { io_map_page(l4, pa, hhdm) } {
-            crate::kprintln!("iommu: confine WARN failed mapping arena page {:#x}", pa);
-            return false;
-        }
-        pa += 0x1000;
-    }
 
-    // Prove the table confines to exactly the arena before we attach the device.
-    // SAFETY: l4 is the root we just built; arena params from the caller.
-    unsafe { confinement_selftest(l4, arena_phys, arena_len, hhdm) };
+    // §22 Test 12 (H1 §6.4): confine to an EMPTY domain so the device's own init
+    // DMA lands outside it and faults — a deterministic live proof that the IOMMU
+    // blocks + logs out-of-arena DMA. Off in every normal build (cfg feature).
+    #[cfg(feature = "iommu-fault-test")]
+    {
+        crate::kprintln!(
+            "iommu: FAULT-TEST — confining BDF {:02x}:{:02x}.{} to an EMPTY domain (arena {:#x}..{:#x} UNMAPPED; expect IO_PAGE_FAULT)",
+            (bdf >> 8) & 0xff, (bdf >> 3) & 0x1f, bdf & 0x7, first, last + 0x1000
+        );
+    }
+    #[cfg(not(feature = "iommu-fault-test"))]
+    {
+        let mut pa = first;
+        while pa <= last {
+            // SAFETY: l4 is the zeroed root we just allocated; pa is page-aligned.
+            if !unsafe { io_map_page(l4, pa, hhdm) } {
+                crate::kprintln!("iommu: confine WARN failed mapping arena page {:#x}", pa);
+                return false;
+            }
+            pa += 0x1000;
+        }
+        // Prove the table confines to exactly the arena before we attach the device.
+        // SAFETY: l4 is the root we just built; arena params from the caller.
+        unsafe { confinement_selftest(l4, arena_phys, arena_len, hhdm) };
+    }
 
     // Switch the device's DTE to the confined domain. V|TV|mode=4|root|IR|IW all
     // go in data[0]; data[1] holds only the DomainID.

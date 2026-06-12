@@ -197,16 +197,17 @@ transparent passthrough, simultaneously, zero faults.** A device is confined whe
 confinement fits its DMA shape and passed through (transparently) otherwise; the
 trust posture is explicit and logged at spawn.
 
-## 5. Phase 2 proposal — dropping the drivers from the TCB (PENDING SIGN-OFF)
+## 5. Phase 2 — DMA-capable drivers brought into least-privilege (ADOPTED 2026-06-12)
 
 With confinement (1d/1e) and restartability (1f) in place, the trust argument for
-`xhci`/`ehci` changes: an IOMMU-confined driver can no longer DMA outside its
+`xhci`/`ehci` changed: an IOMMU-confined driver can no longer DMA outside its
 arena, so its compromise no longer endangers the kernel or other services. That
-removes the reason they were trust-critical and lets them join the ordinary
-restartable services — the genuine trusted-base shrink H1 was aimed at.
+removed the reason they were trust-critical and brought them into the ordinary
+least-privilege model — the genuine trusted-base shrink H1 was aimed at.
 
-This is a **constitutional change** and is **not** made without explicit
-approval. The proposed amendment, for review:
+**Adopted** as the constitutional amendment **CLAUDE.md §6.4** (with the §3.1
+DMA-gap note and §22 Test 12), signed off 2026-06-12. The headline points the
+amendment fixed:
 
 - **§6 / §12.1:** state that DMA-capable userspace drivers are IOMMU-confined and
   therefore **not** trusted **on machines where an IOMMU is present**. Where no

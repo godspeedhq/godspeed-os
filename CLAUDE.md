@@ -117,6 +117,11 @@ A deliberately small, fully-understood capability microkernel, built to internal
 These are the laws that bound every design choice. Any change that violates an invariant must first amend the invariant — and amendments require a written rationale.
 
 1. **No ambient authority.** Every privileged action requires an explicit capability.
+   > **Amendment 2026-06-12 (H1):** DMA-capable devices were an unstated exception
+   > to this invariant — a driver could direct its controller's DMA engine at any
+   > physical address, kernel-equivalent reach the capability model never granted.
+   > H1 (IOMMU confinement) closes the gap: a confined device reaches only its
+   > granted arena. See §6.4.
 2. **No shared mutable memory by default.** Services have isolated address spaces.
 3. **All authority is explicit.** Capabilities, not identity.
 4. **Kernel remains tiny.** Memory, scheduling, IPC, capabilities, interrupts, cross-core routing. Nothing else.
@@ -291,6 +296,39 @@ The block-driver and FS being trusted is a v1 simplification. v2 goal: only `ini
 `supervisor`, and the kernel remain non-restartable. **`registry` was dropped from the
 non-restartable set early, via H11** (it is now a restartable userspace name service);
 the remaining v2 work is block-driver / fs.
+
+### 6.4 DMA-Capable Drivers and the IOMMU (H1)
+
+> **Amendment 2026-06-12 (H1).** Adopts IOMMU DMA-confinement as the mechanism that
+> brings DMA-capable userspace drivers into the least-privilege model (invariant 1).
+
+DMA-capable userspace drivers (`xhci`, `ehci`) are **not** trusted root. Their trust
+status is **machine-dependent**, and which case holds is reported loudly at boot
+(invariant 12):
+
+- **Without an IOMMU**, a DMA-capable driver holds implicit kernel-equivalent power:
+  it programs its controller's DMA engine with physical addresses and can therefore
+  read or write *anywhere* in RAM, regardless of the capabilities it holds. Its
+  compromise is unbounded, so it is **trust-critical by necessity**. (Boot reports
+  `iommu: no IVRS table ... drivers stay in TCB`.)
+- **With an IOMMU confining it (H1)**, the device can reach only the driver's granted
+  DMA arena; a DMA outside it faults rather than corrupting memory. A compromise is
+  then bounded to the arena the capability model already granted, so the driver is
+  **genuinely least-privilege and restartable** — exactly as ordinary services are.
+  (Boot reports `iommu: ... confined BDF ...`; out-of-arena DMA is pinned by §22
+  Test 12.)
+
+This machine-dependent posture is deliberate: the same driver binary is least-privilege
+on a machine whose IOMMU confines it and trust-critical on one without, and the
+difference is a printed boot fact rather than a hidden assumption. Confinement is applied
+**per driver** and only where it fits the driver's DMA shape — `xhci` is confined to its
+arena; `ehci` (which legitimately reaches firmware/hub regions and a low-speed device only
+through a hub's transaction translator) runs in transparent IOMMU passthrough. See
+`docs/iommu.md`.
+
+Operationally these drivers were already restartable (their death reclaims their IOMMU
+resources and the supervisor respawns them); this amendment makes the *trust* claim
+official, not the runtime behaviour.
 
 ---
 
@@ -1620,6 +1658,54 @@ test registry_survives_own_restart:
 
 ---
 
+### Test 12: Confined Driver Cannot DMA Outside Its Arena (H1)
+
+**Pins:** §3.1 / invariant 1 (no ambient authority — the DMA gap), §6.4 (DMA-capable
+drivers are least-privilege when IOMMU-confined), §12 (drivers).
+
+The point of H1: a confined DMA-capable driver's device can reach only its granted
+arena. A DMA outside it must be **blocked at the IOMMU** (a logged `IO_PAGE_FAULT` on
+real hardware), never silently read/write other memory. This is the executable form of
+the §6.4 trust claim — without it, "confined" is a word, not a guarantee.
+
+Runs only where an IOMMU is present (`osdev test iommu` launches QEMU with
+`-device amd-iommu`); on a machine with no IVRS the driver is trusted (§6.4) and the
+test is not applicable.
+
+**Verification is structural, not a live fault, and the reason is a QEMU limitation.**
+QEMU's emulated `amd-iommu` installs the device tables and page tables but does **not**
+enforce translation faults on unmapped I/O addresses — a device DMA to an unmapped page
+is silently allowed through. So a live `IO_PAGE_FAULT` cannot be observed under QEMU.
+The harness therefore asserts the property QEMU *can* be made to prove: the kernel's
+confinement **selftest** — a CPU-side walk of the device's I/O page table — confirms the
+arena translates identity and the page one past it is **unmapped** (so a DMA there has no
+translation and *would* fault on conforming silicon). That selftest is exactly the
+structure an `IO_PAGE_FAULT` is raised from; pinning it pins the guarantee. (The live
+fault itself is hardware-verified on the T630 and reproducible anywhere via the
+`iommu-fault-test` build feature, which confines the driver to an *empty* domain so its
+normal init DMA lands out-of-arena.)
+
+```
+test confined_driver_dma_faults:           # osdev test iommu
+    boot(smp=2, iommu=on)                                     # q35 + amd-iommu + qemu-xhci + usb-kbd
+    assert serial_contains("iommu: ... confined BDF")         # driver is confined to its arena
+
+    # The kernel's confinement selftest walks the device's I/O page table: the arena
+    # maps identity, and the page one past arena_end has NO mapping — the structural
+    # form of "out-of-arena DMA would fault" (QEMU can't raise the fault itself).
+    assert serial_contains("iommu: selftest PASS")
+    assert serial_contains("(outside) unmapped")
+
+    assert serial_contains("keyboard found")                  # driver still operates THROUGH the domain
+    assert kernel_did_not_panic()                             # confinement is not fatal to a well-behaved driver
+
+# Live-fault form (hardware / `--features iommu-fault-test`, not QEMU's lenient model):
+#   confine the driver to an EMPTY domain → its first init DMA is out-of-arena →
+#   IOMMU raises IO_PAGE_FAULT, kernel logs it, memory outside the arena is unchanged.
+```
+
+---
+
 ### 22.6 Test Coverage Matrix
 
 | Test                              | Spec sections pinned       | Constitutional invariant      |
@@ -1635,6 +1721,7 @@ test registry_survives_own_restart:
 | 9. Cross-core IPC                 | §8.3, §8.4, §9             | Identity over location        |
 | 10. Restart with core change      | §9.2, §14.2, §14.4, §11    | Identity over location        |
 | 11. Registry survives restart     | §6.1, §6.2, §14, §3.11     | Restartability / TCB shrink   |
+| 12. Confined driver DMA faults    | §3.1, §6.4, §12            | No ambient authority (DMA)    |
 
 If any cell becomes obsolete, the corresponding spec section is being changed and the change requires a CLAUDE.md amendment.
 
