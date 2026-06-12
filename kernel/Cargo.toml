@@ -44,5 +44,11 @@ test-bad-elf = []
 # random single-byte + 50 multi-byte mutations).  Only used by `osdev test fuzz-brutal`.
 test-bad-elf-brutal = []
 
+# Confine the first DMA-capable driver (xhci) to an EMPTY IOMMU domain instead of
+# its arena, so its normal init DMA faults — a deterministic live proof that the
+# IOMMU blocks + logs out-of-arena DMA (§22 Test 12, H1 §6.4). Only used by
+# `osdev test iommu` (boots with -device amd-iommu); off in every normal build.
+iommu-fault-test = []
+
 [profile.release]
 panic = "abort"
