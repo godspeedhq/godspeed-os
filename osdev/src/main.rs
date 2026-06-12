@@ -732,6 +732,7 @@ fn cmd_image(mode: &str) {
     match mode {
         "bare-metal"  => cmd_build_bare_metal(),
         "iommu-fault" => cmd_build_iommu_fault(),
+        "blockprobe"  => cmd_build_blockprobe(),
         "perf"        => cmd_build_perf(),
         "perf-brutal" => cmd_build_brutal_perf(),
         "identity"    => cmd_build_identity(),
@@ -755,7 +756,7 @@ fn cmd_image(mode: &str) {
         "iso-reg"     => cmd_build_perf_iso("iso-reg"),
         "s8"          => cmd_build_idle(),
         other => {
-            eprintln!("image: unknown --mode '{}'; valid: bare-metal, iommu-fault, perf, perf-brutal, identity, stress, adv, chaos, fuzz, b2-only, bp2-only, iso-bp3, iso-bp5, iso-bp7, iso-bp9, iso-bp10, iso-s3, iso-s5, iso-s9, iso-c7, iso-xsend, iso-xlife, iso-reg, s8", other);
+            eprintln!("image: unknown --mode '{}'; valid: bare-metal, iommu-fault, blockprobe, perf, perf-brutal, identity, stress, adv, chaos, fuzz, b2-only, bp2-only, iso-bp3, iso-bp5, iso-bp7, iso-bp9, iso-bp10, iso-s3, iso-s5, iso-s9, iso-c7, iso-xsend, iso-xlife, iso-reg, s8", other);
             std::process::exit(1);
         }
     }
@@ -1041,6 +1042,41 @@ fn cmd_build_blockdev() {
         .status().unwrap_or_else(|e| panic!("failed to run cargo build for supervisor: {}", e));
     if !status.success() { eprintln!("build: supervisor (bare-metal,blockdev) FAILED"); std::process::exit(1); }
     println!("build: supervisor (bare-metal,blockdev) OK");
+
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .status().expect("failed to run cargo build for kernel");
+    if !status.success() { eprintln!("build: kernel FAILED"); std::process::exit(1); }
+    println!("build: kernel OK");
+}
+
+/// Build the read-only hardware-probe image: block-driver with its `hw-probe`
+/// feature (probes both ATA channels read-only), supervisor spawns only it (no fs).
+fn cmd_build_blockprobe() {
+    clean_supervisor();
+    // Everything except block-driver builds normally; block-driver gets hw-probe.
+    let others = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "fs"];
+    for crate_name in &others {
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"])
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run cargo build for {}: {}", crate_name, e));
+        if !status.success() { eprintln!("build: {} FAILED", crate_name); std::process::exit(1); }
+        println!("build: {} OK", crate_name);
+    }
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "block-driver", "--target", "x86_64-unknown-none",
+               "--features", "hw-probe"])
+        .status().unwrap_or_else(|e| panic!("failed to run cargo build for block-driver: {}", e));
+    if !status.success() { eprintln!("build: block-driver (hw-probe) FAILED"); std::process::exit(1); }
+    println!("build: block-driver (hw-probe) OK");
+
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "supervisor", "--target", "x86_64-unknown-none",
+               "--features", "supervisor/bare-metal,supervisor/blockprobe"])
+        .status().unwrap_or_else(|e| panic!("failed to run cargo build for supervisor: {}", e));
+    if !status.success() { eprintln!("build: supervisor (bare-metal,blockprobe) FAILED"); std::process::exit(1); }
+    println!("build: supervisor (bare-metal,blockprobe) OK");
 
     let status = std::process::Command::new("cargo")
         .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])

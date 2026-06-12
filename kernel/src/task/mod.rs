@@ -3099,9 +3099,13 @@ fn spawn_service_with_config(
     // There is no DMA grant: a PIO driver never touches RAM, so it is
     // least-privilege by construction (§5.1) — no IOMMU confinement needed.
     if name == "block-driver" {
-        const BLOCK_PIO_RANGES: &[(u16, u16)] = &[(0x170, 8), (0x376, 1)];
+        // Both legacy IDE channels — the disk driver owns the controller's command
+        // blocks: primary 0x1F0-0x1F7 + 0x3F6, secondary 0x170-0x177 + 0x376. The
+        // hardware probe reads both to find where a disk is exposed (§12).
+        const BLOCK_PIO_RANGES: &[(u16, u16)] =
+            &[(0x1F0, 8), (0x3F6, 1), (0x170, 8), (0x376, 1)];
         crate::capability::hw_pio::set(task_slot, BLOCK_PIO_RANGES);
-        crate::kprintln!("spawn[pio]: 'block-driver' granted ATA secondary 0x170-0x177,0x376");
+        crate::kprintln!("spawn[pio]: 'block-driver' granted ATA primary+secondary command blocks");
     }
 
     // 6b. Allocate + map a physically-contiguous DMA arena for the xHCI driver

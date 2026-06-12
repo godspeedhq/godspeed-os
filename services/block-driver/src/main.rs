@@ -48,8 +48,100 @@ const SCRATCH_LBA: u32 = 100;
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
-    ctx.log("block-driver: starting (ATA PIO, secondary master)");
     let pio = ctx.pio();
+    #[cfg(feature = "hw-probe")]
+    {
+        hw_probe_run(&ctx, &pio)
+    }
+    #[cfg(not(feature = "hw-probe"))]
+    {
+        normal_run(ctx, pio)
+    }
+}
+
+/// Read-only hardware probe of both ATA channels (feature `hw-probe`). Writes only
+/// to the controller's task-file registers (port I/O) + issues READ SECTORS; never
+/// WRITE SECTORS, so disk media is never modified. Reports what's on each channel.
+#[cfg(feature = "hw-probe")]
+fn hw_probe_run(ctx: &ServiceContext, pio: &Pio) -> ! {
+    ctx.log("block-driver: HW PROBE — read-only, no media writes");
+    probe_channel(ctx, pio, "primary",   0x1F0);
+    probe_channel(ctx, pio, "secondary", 0x170);
+    ctx.log("block-driver: probe complete (read-only)");
+    loop {
+        ctx.yield_cpu();
+    }
+}
+
+/// Read sector 0 of the master drive on the ATA channel at `base` and report it.
+/// Read-only: no WRITE SECTORS is ever issued.
+#[cfg(feature = "hw-probe")]
+fn probe_channel(ctx: &ServiceContext, pio: &Pio, name: &str, base: u16) {
+    let data = base;
+    let seccount = base + 2;
+    let (lba0, lba1, lba2) = (base + 3, base + 4, base + 5);
+    let drive = base + 6;
+    let cmd = base + 7; // status (read) / command (write to task-file, not media)
+
+    pio.write8(drive, 0xE0); // select master, LBA mode
+    for _ in 0..4 {
+        let _ = pio.read8(cmd);
+    }
+    let st0 = pio.read8(cmd).unwrap_or(0xFF);
+    if st0 == 0xFF {
+        ctx.log_fmt(format_args!(
+            "block-driver: probe {} (base {:#06x}): no drive (status 0xFF)", name, base));
+        return;
+    }
+    // Wait BSY clear (bounded).
+    let mut not_busy = false;
+    for _ in 0..1_000_000u32 {
+        let s = pio.read8(cmd).unwrap_or(0xFF);
+        if s == 0xFF { break; }
+        if s & ST_BSY == 0 { not_busy = true; break; }
+    }
+    if !not_busy {
+        ctx.log_fmt(format_args!(
+            "block-driver: probe {} (base {:#06x}): BSY stuck (status {:#04x})", name, base, st0));
+        return;
+    }
+    // Issue READ SECTORS for LBA 0 (one sector).
+    pio.write8(seccount, 1);
+    pio.write8(lba0, 0);
+    pio.write8(lba1, 0);
+    pio.write8(lba2, 0);
+    pio.write8(cmd, CMD_READ_SECTORS);
+
+    let mut ready = false;
+    for _ in 0..1_000_000u32 {
+        let s = pio.read8(cmd).unwrap_or(0xFF);
+        if s == 0xFF { break; }
+        if s & ST_ERR != 0 {
+            ctx.log_fmt(format_args!(
+                "block-driver: probe {} (base {:#06x}): ERR on read (status {:#04x})", name, base, s));
+            return;
+        }
+        if s & ST_BSY == 0 && s & ST_DRQ != 0 { ready = true; break; }
+    }
+    if !ready {
+        ctx.log_fmt(format_args!(
+            "block-driver: probe {} (base {:#06x}): no DRQ — likely no disk (status {:#04x})", name, base, st0));
+        return;
+    }
+    let mut sec = [0u8; 512];
+    for i in 0..256 {
+        let w = pio.read16(data).unwrap_or(0);
+        sec[i * 2] = (w & 0xFF) as u8;
+        sec[i * 2 + 1] = (w >> 8) as u8;
+    }
+    ctx.log_fmt(format_args!(
+        "block-driver: probe {} (base {:#06x}): DISK FOUND (status {:#04x})", name, base, st0));
+    log_first16(ctx, &sec);
+}
+
+#[cfg(not(feature = "hw-probe"))]
+fn normal_run(ctx: ServiceContext, pio: Pio) -> ! {
+    ctx.log("block-driver: starting (ATA PIO, secondary master)");
 
     // Step 1: read sector 0 and log it.
     let mut sector = [0u8; 512];

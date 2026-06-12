@@ -9,3 +9,10 @@ path = "src/main.rs"
 
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }
+
+[features]
+# Read-only hardware probe (osdev image --mode blockprobe): probe BOTH ATA channels
+# (primary 0x1F0 + secondary 0x170), read sector 0, report what's found. Never issues
+# WRITE SECTORS — disk media is untouched. Used to discover whether the T630 exposes a
+# disk via legacy IDE, and on which channel, before any write test.
+hw-probe = []
