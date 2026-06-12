@@ -29,8 +29,10 @@ performs a hardware reset. Does not return. There is no confirmation prompt in v
 
 ## 5. Non-goals
 
-- **No shutdown/poweroff.** v1 has no ACPI power-off path; `reboot` resets, it does
-  not power down.
+- **No shutdown/poweroff.** `reboot` resets — it does not power down, and there is
+  no `poweroff` command: cutting power needs ACPI S5 + an AML interpreter the
+  firmware's `\_PTS` gate requires (verified on hardware). See `14_poweroff.md`
+  for why it was considered, built, tested, and removed.
 - **No "reboot into X".** No boot-target selection — it is a plain reset. (Limine
   handles boot; `reboot` does not negotiate with it.)
 
