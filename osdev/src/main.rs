@@ -681,6 +681,7 @@ fn cmd_image(mode: &str) {
     // the stale-embed rationale). So no clean is needed here.
     match mode {
         "bare-metal"  => cmd_build_bare_metal(),
+        "iommu-fault" => cmd_build_iommu_fault(),
         "perf"        => cmd_build_perf(),
         "perf-brutal" => cmd_build_brutal_perf(),
         "identity"    => cmd_build_identity(),
@@ -704,7 +705,7 @@ fn cmd_image(mode: &str) {
         "iso-reg"     => cmd_build_perf_iso("iso-reg"),
         "s8"          => cmd_build_idle(),
         other => {
-            eprintln!("image: unknown --mode '{}'; valid: bare-metal, perf, perf-brutal, identity, stress, adv, chaos, fuzz, b2-only, bp2-only, iso-bp3, iso-bp5, iso-bp7, iso-bp9, iso-bp10, iso-s3, iso-s5, iso-s9, iso-c7, iso-xsend, iso-xlife, iso-reg, s8", other);
+            eprintln!("image: unknown --mode '{}'; valid: bare-metal, iommu-fault, perf, perf-brutal, identity, stress, adv, chaos, fuzz, b2-only, bp2-only, iso-bp3, iso-bp5, iso-bp7, iso-bp9, iso-bp10, iso-s3, iso-s5, iso-s9, iso-c7, iso-xsend, iso-xlife, iso-reg, s8", other);
             std::process::exit(1);
         }
     }
