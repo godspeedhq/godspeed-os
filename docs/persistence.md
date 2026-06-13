@@ -235,13 +235,21 @@ than a shared-buffer design *by construction*, and that is the accepted cost of 
 no-shared-memory invariant — a clean illustration of §20 (correctness and clarity over
 performance) and §26.7 (the copy is the honest, bounded behavior).
 
-### 6.2 Hierarchical evolution — real directories (adopted)
+### 6.2 Hierarchical evolution — real directories (adopted; **built**)
 
 The flat single-entry-table format above shipped in **Phase 1** (mount, named files,
-reboot survival — all working). It is being **evolved to a real hierarchical
-filesystem**: flat name→blob isn't realistic for actual use, so GSFS gets **real
-directories from the start** of the next phase. (See `docs/drives.md` for the
-user-facing path/addressing model, `[N:]label/path/to/file`.)
+reboot survival — all working). It was **evolved to a real hierarchical filesystem**
+(magic `GSFS0002`) — flat name→blob isn't realistic for actual use, so GSFS gets **real
+directories from the start**. (See `docs/drives.md` for the user-facing path/addressing
+model, `[N:]label/path/to/file`.)
+
+> **Status: built + QEMU-verified.** `services/fs` is the hierarchical format below
+> (inode table + per-directory blocks + path walking); `osdev mkfs` formats it; the
+> block-IPC LBA is u64 (§6.3). `osdev test blockdev` pins it (`[GSFS.E]` mkdir + nested
+> `/etc/motd` path-walk) and `blockdev-reboot` proves the tree survives a reboot
+> (root → `/etc` → `/etc/motd` + `/greeting` walked back from the persisted inode table).
+> Geometry: 256 inodes (64 B each, 32 blocks), one 512-B block per directory (16 entries,
+> `name[27]`), files = contiguous extents via the bump allocator.
 
 The hierarchical format, still GodSpeed-minimal (bounded, no POSIX permissions —
 authority is by capability, §3.3 — and no hard links). **All capacity-bearing fields

@@ -114,47 +114,73 @@ fn main() {
     }
 }
 
-// On-disk format — MUST match `services/fs` (docs/persistence.md §6).
-// 512-byte blocks (= one ATA sector = one block-IPC request), so block number = LBA.
-//   Superblock @ LBA 0: magic[8] "GSFS0001", version u32, block_size u32=512,
-//     total_blocks u32, entry_table_start u32=1, entry_table_blocks u32=1,
-//     data_start u32=2, next_free_block u32 (bump allocator), file_count u32.
-//   Entry table @ LBA 1 (1 block, 16 entries × 32 bytes). Data region from LBA 2.
-const FS_SB_MAGIC: &[u8; 8] = b"GSFS0001";
+// On-disk format — MUST match `services/fs` (docs/persistence.md §6.2/§6.3).
+// 512-byte blocks (= one AHCI sector = one block-IPC request), so block number = LBA.
+// All capacity-bearing fields are u64 (~8 ZiB ceiling, §6.3).
+//   Superblock @ LBA 0: magic[8] "GSFS0002", version u32, block_size u32=512,
+//     total_blocks u64, inode_table_start u64=1, inode_table_blocks u64,
+//     data_start u64, next_free_block u64 (bump allocator), root_inode u32, flags u32.
+//   Inode table @ LBA 1.. : INODE_COUNT slots × 64 bytes (8 per block).
+//     Inode: type u8 (0 free|1 file|2 dir) @0, size u64 @8, first_block u64 @16,
+//            block_count u64 @24.
+//   Directory: a dir inode's data block holds 16 entries × 32 bytes
+//     { name_len u8, name[27], inode u32 }. Root (inode 0) is a dir at data_start.
+const FS_SB_MAGIC: &[u8; 8] = b"GSFS0002";
 const FS_BLOCK_SIZE: u32 = 512;
-const FS_ENTRY_TABLE_START: u32 = 1;
-const FS_ENTRY_TABLE_BLOCKS: u32 = 1;
-const FS_DATA_START: u32 = 2;
+const FS_INODE_SIZE: u64 = 64;
+const FS_INODE_COUNT: u64 = 256;
+const FS_INODE_TABLE_START: u64 = 1;
+const FS_INODE_TABLE_BLOCKS: u64 = FS_INODE_COUNT / (FS_BLOCK_SIZE as u64 / FS_INODE_SIZE); // 32
+const FS_DATA_START: u64 = FS_INODE_TABLE_START + FS_INODE_TABLE_BLOCKS;                    // 33
+const FS_ROOT_INODE: u32 = 0;
+const FS_ITYPE_DIR: u8 = 2;
 
-/// Write a GodspeedOS filesystem superblock + empty entry table into `path`,
-/// preserving the rest of the image. `total_blocks` is derived from the image size.
+/// Write a GodspeedOS (GSFS) hierarchical superblock + a zeroed inode table + an empty
+/// root directory into `path`, preserving the rest of the image. `total_blocks` is
+/// derived from the image size.
 fn format_superblock(path: &str) {
     let mut data = std::fs::read(path)
         .unwrap_or_else(|e| { eprintln!("mkfs: cannot read {}: {}", path, e); std::process::exit(1); });
-    if data.len() < (FS_DATA_START as usize) * 512 {
+    let root_dir_block = FS_DATA_START;            // root directory's single data block
+    let next_free_block = FS_DATA_START + 1;       // first free block after root's dir block
+    if (data.len() as u64) < next_free_block * 512 {
         eprintln!("mkfs: image too small ({} bytes)", data.len());
         std::process::exit(1);
     }
-    let total_blocks = (data.len() as u64 / FS_BLOCK_SIZE as u64) as u32;
+    let total_blocks = data.len() as u64 / FS_BLOCK_SIZE as u64;
+
+    // Superblock (LBA 0).
     let mut sb = [0u8; 512];
     sb[0..8].copy_from_slice(FS_SB_MAGIC);
-    sb[8..12].copy_from_slice(&1u32.to_le_bytes());                   // version
-    sb[12..16].copy_from_slice(&FS_BLOCK_SIZE.to_le_bytes());         // block_size
-    sb[16..20].copy_from_slice(&total_blocks.to_le_bytes());          // total_blocks
-    sb[20..24].copy_from_slice(&FS_ENTRY_TABLE_START.to_le_bytes());  // entry_table_start
-    sb[24..28].copy_from_slice(&FS_ENTRY_TABLE_BLOCKS.to_le_bytes()); // entry_table_blocks
-    sb[28..32].copy_from_slice(&FS_DATA_START.to_le_bytes());         // data_start
-    sb[32..36].copy_from_slice(&FS_DATA_START.to_le_bytes());         // next_free_block = data_start
-    sb[36..40].copy_from_slice(&0u32.to_le_bytes());                  // file_count
+    sb[8..12].copy_from_slice(&2u32.to_le_bytes());                       // version
+    sb[12..16].copy_from_slice(&FS_BLOCK_SIZE.to_le_bytes());             // block_size
+    sb[16..24].copy_from_slice(&total_blocks.to_le_bytes());              // total_blocks u64
+    sb[24..32].copy_from_slice(&FS_INODE_TABLE_START.to_le_bytes());      // inode_table_start u64
+    sb[32..40].copy_from_slice(&FS_INODE_TABLE_BLOCKS.to_le_bytes());     // inode_table_blocks u64
+    sb[40..48].copy_from_slice(&FS_DATA_START.to_le_bytes());             // data_start u64
+    sb[48..56].copy_from_slice(&next_free_block.to_le_bytes());           // next_free_block u64
+    sb[56..60].copy_from_slice(&FS_ROOT_INODE.to_le_bytes());             // root_inode u32
+    sb[60..64].copy_from_slice(&0u32.to_le_bytes());                      // flags (DEFAULT bit clear)
     data[0..512].copy_from_slice(&sb);
-    // Zero the entry table block(s) — no files yet.
-    let et = (FS_ENTRY_TABLE_START as usize) * 512;
-    let et_end = et + (FS_ENTRY_TABLE_BLOCKS as usize) * 512;
-    for b in &mut data[et..et_end] { *b = 0; }
+
+    // Zero the inode table, then write root inode 0 (a dir at root_dir_block).
+    let it = (FS_INODE_TABLE_START as usize) * 512;
+    let it_end = it + (FS_INODE_TABLE_BLOCKS as usize) * 512;
+    for b in &mut data[it..it_end] { *b = 0; }
+    // Root inode is slot 0 of the first inode-table block → offset `it`.
+    data[it] = FS_ITYPE_DIR;                                              // type @0
+    data[it + 8..it + 16].copy_from_slice(&0u64.to_le_bytes());           // size @8
+    data[it + 16..it + 24].copy_from_slice(&root_dir_block.to_le_bytes());// first_block @16
+    data[it + 24..it + 32].copy_from_slice(&1u64.to_le_bytes());          // block_count @24
+
+    // Zero the root directory block (no entries yet).
+    let rd = (root_dir_block as usize) * 512;
+    for b in &mut data[rd..rd + 512] { *b = 0; }
+
     std::fs::write(path, &data)
         .unwrap_or_else(|e| { eprintln!("mkfs: cannot write {}: {}", path, e); std::process::exit(1); });
-    println!("mkfs: formatted {} ({} blocks of {} bytes, data from block {})",
-             path, total_blocks, FS_BLOCK_SIZE, FS_DATA_START);
+    println!("mkfs: formatted {} GSFS ({} blocks of {} bytes, {} inodes, data from block {})",
+             path, total_blocks, FS_BLOCK_SIZE, FS_INODE_COUNT, FS_DATA_START);
 }
 
 fn cmd_mkfs(image: &str) {
@@ -896,6 +922,8 @@ fn cmd_test(suite: &str) {
         "iommu"        => run_iommu_test(),
         "blockdev"     => run_blockdev_test(),
         "blockdev-reboot" => run_blockdev_reboot_test(),
+        "drives-raw"   => run_drives_raw_test(),
+        "drives"       => run_drives_scripted_test(),
         other => eprintln!("unknown test suite: {}", other),
     }
 }
@@ -1047,7 +1075,11 @@ fn boot_blockdev_qemu(img_str: &str, persist_str: &str, serial: &str, secs: u64)
 /// supervisor spawns block-driver + fs (bare-metal,blockdev). AHCI by default.
 fn cmd_build_blockdev() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
+    // Force a fresh `fs` so its `selftest` feature (added below) is compiled in even if a
+    // prior plain build cached it — otherwise the blockdev tests miss the self-test logs.
+    let _ = std::process::Command::new("cargo")
+        .args(["clean", "--release", "-p", "fs", "--target", "x86_64-unknown-none"]).status();
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"])
@@ -1056,6 +1088,13 @@ fn cmd_build_blockdev() {
         if !status.success() { eprintln!("build: {} FAILED", crate_name); std::process::exit(1); }
         println!("build: {} OK", crate_name);
     }
+    // fs WITH the selftest feature — the blockdev tests assert its self-test log lines.
+    // (Production `osdev image` builds fs without it, so it never writes to a real disk.)
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "fs", "--target", "x86_64-unknown-none", "--features", "selftest"])
+        .status().unwrap_or_else(|e| panic!("failed to run cargo build for fs: {}", e));
+    if !status.success() { eprintln!("build: fs FAILED"); std::process::exit(1); }
+    println!("build: fs (selftest) OK");
     // Spawn block-driver + fs (blockdev) so fs mounts the AHCI disk over IPC.
     let status = std::process::Command::new("cargo")
         .args(["build", "--release", "-p", "supervisor", "--target", "x86_64-unknown-none",
@@ -1124,9 +1163,12 @@ fn run_blockdev_test() {
     let pci_found  = log.contains("pci: AHCI at");
     let identify   = log.contains("IDENTIFY OK");
     let serving    = log.contains("AHCI serving block I/O");
-    let fs_mounted = log.contains("fs: mounted");                 // step C: AHCI ReadBlock
+    let fs_mounted = log.contains("fs: mounted GSFS");            // step C: AHCI ReadBlock
     let fs_file    = log.contains("fs: file round-trip OK")       // step D: AHCI WriteBlock+ReadBlock
         || log.contains("fs: persisted file 'greeting' verified");
+    // step E: hierarchical GSFS — mkdir + a file nested inside it, walked by path.
+    let fs_hier = (log.contains("fs: mkdir /etc OK") && log.contains("fs: nested file round-trip OK (/etc/motd)"))
+        || log.contains("fs: nested '/etc/motd' verified across boot");
     let no_panic   = !log.contains("KERNEL PANIC");
 
     for l in log.lines().filter(|l| l.contains("AHCI") || l.contains("block-driver") || l.contains("fs:")) {
@@ -1136,17 +1178,20 @@ fn run_blockdev_test() {
     println!("ahci:   serving block I/O ... {}", if serving { "yes" } else { "NO" });
     println!("ahci:   fs mounted (AHCI ReadBlock) ... {}", if fs_mounted { "yes" } else { "NO" });
     println!("ahci:   fs file round-trip (AHCI WriteBlock+ReadBlock) ... {}", if fs_file { "yes" } else { "NO" });
+    println!("ahci:   fs hierarchy (mkdir + nested path) ... {}", if fs_hier { "yes" } else { "NO" });
     println!("ahci:   kernel did not panic ... {}", if no_panic { "yes" } else { "NO" });
 
     let ab = if pci_found && identify && no_panic { "PASS" } else { "FAIL" };
     let c  = if fs_mounted && no_panic { "PASS" } else { "FAIL" };
     let d  = if fs_file && no_panic { "PASS" } else { "FAIL" };
+    let e  = if fs_hier && no_panic { "PASS" } else { "FAIL" };
     println!("\n  [AHCI.A/B]  detect + port init + IDENTIFY        … {ab}");
     println!("  [AHCI.C]    read (fs mounts over AHCI)            … {c}");
     println!("  [AHCI.D]    write (fs file round-trip over AHCI)  … {d}");
-    let passed = (ab == "PASS") as u32 + (c == "PASS") as u32 + (d == "PASS") as u32;
-    println!("\n  {passed} passed  {} failed", 3 - passed);
-    if passed != 3 {
+    println!("  [GSFS.E]    hierarchy (mkdir + nested path walk)  … {e}");
+    let passed = (ab == "PASS") as u32 + (c == "PASS") as u32 + (d == "PASS") as u32 + (e == "PASS") as u32;
+    println!("\n  {passed} passed  {} failed", 4 - passed);
+    if passed != 4 {
         std::process::exit(1);
     }
 }
@@ -1217,6 +1262,74 @@ fn run_blockdev_reboot_test() {
         println!("\n  [AHCI.R]  reboot survival over SATA  … FAIL\n\n  0 passed  1 failed");
         std::process::exit(1);
     }
+}
+
+/// Step 3a: raw-disk tolerance. Boot with an UNFORMATTED disk on the AHCI controller
+/// (no `mkfs`): `fs` must learn the disk's capacity (OP_CAPACITY), recognise there is no
+/// filesystem, NOT auto-format (§3.12), and stay up serving — never panic, never hang.
+fn run_drives_raw_test() {
+    println!("\n=== drives 3a: raw-disk tolerance (capacity + no auto-format) ===");
+    cmd_build_blockdev();
+
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+
+    let _ = std::fs::create_dir_all("build/tests");
+    // A RAW disk — zeros, deliberately NOT formatted with `format_superblock`.
+    let persist = "build/tests/persist_ahci_raw.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create raw disk");
+
+    let img = std::fs::canonicalize(&image_path).unwrap_or_else(|_| image_path.to_path_buf());
+    let img_str = img.to_string_lossy().replace('\\', "/");
+    let persist_abs = std::fs::canonicalize(persist).unwrap_or_else(|_| std::path::PathBuf::from(persist));
+    let persist_str = persist_abs.to_string_lossy().replace('\\', "/");
+
+    println!("drives: booting with a RAW (unformatted) AHCI disk, ~25s …");
+    let log = boot_ahci_qemu(&img_str, &persist_str, "build/tests/drives_raw.log", 25);
+
+    let capacity = log.contains("fs: disk capacity =");           // OP_CAPACITY round-trip
+    let no_fs    = log.contains("fs: no filesystem") && log.contains("awaiting drives flash");
+    let serving  = log.contains("fs: serving file API");          // fs stayed up
+    let not_formatted = !log.contains("fs: mounted GSFS");         // did NOT auto-format
+    let no_panic = !log.contains("KERNEL PANIC");
+
+    for l in log.lines().filter(|l| l.contains("fs:") || l.contains("IDENTIFY OK")) {
+        println!("drives:   | {}", l.trim());
+    }
+    println!("drives:   learned capacity (OP_CAPACITY) ... {}", if capacity { "yes" } else { "NO" });
+    println!("drives:   recognised raw disk, no auto-format ... {}", if no_fs && not_formatted { "yes" } else { "NO" });
+    println!("drives:   fs stayed up serving ... {}", if serving { "yes" } else { "NO" });
+    println!("drives:   kernel did not panic ... {}", if no_panic { "yes" } else { "NO" });
+
+    if capacity && no_fs && serving && not_formatted && no_panic {
+        println!("\n  [DRIVES.raw]  raw-disk tolerance  … PASS\n\n  1 passed  0 failed");
+    } else {
+        println!("\n  [DRIVES.raw]  raw-disk tolerance  … FAIL\n\n  0 passed  1 failed");
+        std::process::exit(1);
+    }
+}
+
+/// Step 3b: scripted `drives` end-to-end. Build the bare-metal image (now spawns
+/// block-driver + fs before the shell), attach a RAW AHCI disk, and script
+/// `drives` → `drives flash data` (with [y/N] confirm) → list → `drives label`.
+fn run_drives_scripted_test() {
+    println!("\n=== drives 3b: flash + label from the shell (RAW AHCI disk) ===");
+    cmd_build_bare_metal();
+
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_drives_raw.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create raw disk");
+
+    crate::shell_test::run_drives(&image_path, persist, 4);
 }
 
 /// Build bare-metal image and run the scripted shell smoke-test.

@@ -91,6 +91,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
     let _ = ctx.spawn("observe");
 
+    // Persistence (v2; docs/persistence.md) — block-driver + fs. Spawned in bare-metal
+    // (so a usable OS / Prime sees its disk and `drives flash` can format it) and in the
+    // blockdev smoke-test. block-driver MUST precede fs (fs's send-peer cap to it wires
+    // from the name table at fs's spawn), and BOTH must precede the shell (the shell's
+    // send-peer cap to `fs` wires the same way). On a machine with no SATA disk both come
+    // up and idle gracefully (block-driver: "no controller"; fs: raw-tolerant).
+    #[cfg(any(feature = "bare-metal", feature = "blockdev"))]
+    {
+        let _ = ctx.spawn("block-driver");
+        let _ = ctx.spawn("fs");
+    }
+
     // shell: the interactive prompt. Spawned in bare-metal (the USB image rests
     // here) and full builds; excluded from test-specific builds.
     #[cfg(not(any(feature = "identity-only", feature = "perf-only",
@@ -114,17 +126,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
     let _ = ctx.spawn("ehci");
-
-    // Persistence (v2; docs/persistence.md), spawned only in the `blockdev`
-    // smoke-test build (a disk is attached on the ATA secondary channel).
-    // block-driver MUST precede fs: the kernel registers block-driver's endpoint
-    // name at spawn, and fs's send-peer cap to it wires from that name table at
-    // fs's spawn. fs then mounts by reading the superblock over IPC.
-    #[cfg(feature = "blockdev")]
-    {
-        let _ = ctx.spawn("block-driver");
-        let _ = ctx.spawn("fs");
-    }
 
     ctx.log("supervisor: ready");
 

@@ -2722,8 +2722,12 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         "shell" => Some(("shell", ServiceConfig {
             elf:               include_bytes!(env!("SVC_SHELL_ELF")),
-            has_recv_endpoint: false,
-            send_peers:        &[],
+            // Endpoint + an `fs` send-peer so the `drives`/file commands can request_with_reply
+            // to `fs` (the reply-cap pattern needs the shell's own endpoint). The shell holds
+            // only a narrow SEND to fs — fs enforces all disk authority. `fs` must be spawned
+            // before the shell so this cap resolves (supervisor order).
+            has_recv_endpoint: true,
+            send_peers:        &["fs"],
             send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        0,

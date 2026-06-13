@@ -4,6 +4,17 @@
 > shell utility and the multi-drive model, decided in conversation. Builds on the
 > GSFS filesystem (`docs/persistence.md`) and the AHCI block driver (`docs/ahci.md`).
 > Trails `CLAUDE.md`; does not amend it.
+>
+> **Command surface superseded by `utilities/15_drives.md`** (+ the file commands
+> `utilities/16`–`24`), which are authoritative for the user-facing verbs. Three POSIX
+> reflexes shown in this doc's older examples were **dropped** when the utility surface
+> was settled: **`mount`** (GodspeedOS has no global tree to graft into — a drive is
+> reachable on demand by `[index:]label/path` whenever it's plugged in; `15_drives.md`
+> §3.1), and **`drives use` / `drives use default`** (the current location is a single
+> drive+dir pointer moved by `cd`, not a second "current drive" verb; `15_drives.md`
+> §3.2). The boot layer is the `drives godspeed install|update|default` namespace. This
+> doc is retained for the **architecture/rationale** — addressing (§4.1/§4.2), the
+> default-flag (§3), the multi-drive model (§4), build scope (§7) — not the verb list.
 
 ## 1. What it is
 
@@ -42,18 +53,20 @@ it only uses the first — multi-drive lifts that). Each drive is an independent
 tree (its own root directory). A drive moves through states:
 
 ```
-  raw  ──flash──▶  flashed  ──mount──▶  mounted  ──use──▶  current
-   (no GSFS)        (GSFS, not          (metadata        (bare commands
-                     loaded)             loaded;           target it)
-                                         readable)
+  raw  ──flash──▶  flashed  ◀──── present whenever plugged in ────▶  (absent when unplugged)
+   (no GSFS)        (GSFS;        addressable on demand by [index:]label/path
+                     usable)
 ```
 
-- **`mounted`** — `fs` has loaded the drive's superblock + root directory; you can
-  list/read it. Bounded: `fs` holds up to a fixed number of mounted drives (e.g. 4).
-- **`current`** — the one *unqualified* commands operate on. Exactly one at a time.
-- **`mount` ≠ `use`.** `drives mount 1` makes a drive accessible without making it
-  current; `drives use 1` mounts it (if needed) **and** makes it current. This
-  separates "I can see into it" from "it's my working drive."
+> **Superseded — no `mounted` state** (`utilities/15_drives.md` §3.1). The earlier model
+> here had `raw → flashed → mounted → current`; the `mounted` step was a POSIX reflex.
+> GodspeedOS has no global tree to graft into, so there is nothing to "mount" — a flashed
+> drive is reachable on demand by `[index:]label/path` whenever it is physically present,
+> and disappears when unplugged. There is no mount table and no bounded mount-slots.
+
+- **`current`** — the drive+directory that *unqualified* commands operate on, moved by
+  `cd` (`utilities/17_cd.md`). One **location** pointer (drive + dir), not a separate
+  "current drive" — see `utilities/15_drives.md` §3.2 for why `drives use` was dropped.
 
 ### 4.1 Addressing — `[N:]label/path/to/file`
 
@@ -110,16 +123,23 @@ UUID. Identity (label) names it; location (index) disambiguates when identity re
 
 ## 5. Command set
 
+> Authoritative command surface: `utilities/15_drives.md` (drive lifecycle) +
+> `utilities/16`–`24` (file commands). This table reflects the settled vocabulary.
+
 | Command | Effect | Persists? |
 |---------|--------|-----------|
-| `drives` | list every drive: index, label, status, contents, current/default | — |
-| `drives flash <n> [label]` | format drive n as GSFS (asks `[y/N]` — it ERASES); optionally name it (must be unique); mounts immediately | data: yes |
-| `drives label <n\|label> <new>` | rename a drive's label; rewrites the superblock (duplicates allowed — index disambiguates) | data: yes |
-| `drives mount <n\|label>` | make a flashed drive accessible (list/read) — **not** current | session |
-| `drives use <n\|label>` | mount (if needed) **and** make it the current drive | session |
-| `drives use default <n\|label>` | also persist: this drive auto-mounts + is current on every boot | **yes** (superblock flag) |
-| `cd <path>` · `mkdir <path>` | change / create a directory on the current drive | — |
-| `ls [path]` · `cat <path>` · `write <path> …` | list / read / write at a path (see §4.1 for `[N:]label/path`) | — |
+| `drives` | list every drive: index, label, status, size, current/default | — |
+| `drives flash <drive> [label]` | format `<drive>` as a GSFS data drive (asks `[y/N]` — it ERASES); optional label; usable at once | data: yes |
+| `drives label <drive> <new>` | rename a drive's label; rewrites the superblock (duplicates allowed — index disambiguates) | data: yes |
+| `drives godspeed install <drive>` | install bootable GodspeedOS onto the drive (Prime) | **yes** |
+| `drives godspeed update <drive>` | A/B kernel update of an installed drive | **yes** |
+| `drives godspeed default <drive>` | which installed GodspeedOS the machine boots | **yes** |
+| `drives godspeed` | list installed GodspeedOS drives / help | — |
+| `cd <path>` · `mkdir <path>` | change current location / create a directory (`utilities/17`,`20`) | — |
+| `ls [path]` · `read <path>` · `write <path> …` · `copy`/`move`/`rename`/`delete` | navigate / read / write / manage files (`utilities/16`–`24`) | — |
+
+`<drive> = index | label | index:label` (§4.1/§4.2). No `mount`/`use` — the current
+location is a `cd` pointer (§4 note, `utilities/15_drives.md` §3.2).
 
 ## 6. How it looks (`gs>` mockups)
 
