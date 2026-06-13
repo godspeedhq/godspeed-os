@@ -57,6 +57,58 @@ costs are disqualifying:
 So: a deliberately minimal filesystem, **pulled into existence by what §15 needs**
 (§26.2), not by what "a real filesystem has."
 
+### 3.1 Why not just FAT (we already need it for the boot ESP)?
+
+FAT is the sharpest version of the question — the UEFI boot ESP *must* be FAT, so
+why not use FAT (or exFAT) for data too and skip GSFS? Note first that the §3
+*permission* argument does **not** apply here: FAT has no `uid/gid/mode`, so it
+does not clash with capability authority the way ext4 does. The real reasons:
+
+1. **"We already need FAT" is softer than it looks.** GodspeedOS implements **zero
+   FAT** today — the ESP is built by host tooling (`osdev image`) and read by Limine;
+   the kernel has never touched a FAT byte. And a **minimal, write-once boot ESP**
+   (a few static files, or a stamped prebuilt blob) is *far* simpler than a **general
+   read/write/grow/delete data filesystem**. Making a boot ESP does not hand us a free
+   general FAT.
+2. **A *correct* FAT is not "simple."** It carries 40 years of compatibility cruft —
+   8.3 names, the VFAT long-filename + checksum scheme, FAT-chain allocation, FSInfo,
+   two FAT copies. A clean inode+directory GSFS is **comparable-or-less** code than a
+   correct VFAT, and it is *ours*: our fields (the `drives` `DEFAULT` flag + drive
+   `label`), our evolution path (file-as-capability, §7), no legacy, no exFAT patents.
+3. **No interop requirement** (§3) — FAT's one real win is universal readability on
+   other OSes, which we do not need.
+
+> **Reconsider-if:** the deciding factor is *not* "FAT is bad" — it is that we'd have
+> to implement FAT inside the OS anyway and a correct one isn't simpler, plus we have
+> no interop need. **If reading GodspeedOS data drives on Windows/Mac/Linux ever
+> becomes a goal, FAT/exFAT deserve a serious second look.** Recorded so a future
+> contributor sees the trade was made with eyes open, not by reflex.
+
+### 3.2 Capacity is the wrong axis — the real difference is features
+
+A natural question is "how much can GSFS hold vs ext4/NTFS/APFS/ZFS?" The honest
+answer is that **capacity is just field width** and a poor way to compare:
+
+| Filesystem | Max file | Max volume |
+|------------|----------|-----------|
+| FAT32 | 4 GiB | 2 TiB |
+| exFAT | 16 EiB | 128 PiB |
+| NTFS | 8 PiB | 8 PiB |
+| ext4 | 16 TiB | 1 EiB |
+| APFS | 8 EiB | 8 EiB |
+| ZFS | 16 EiB | 256 ZiB (2¹²⁸-addressable) |
+| **GSFS (today)** | 4 GiB (u32 size) | 2 TiB (u32 blocks × 512 B) |
+| **GSFS (u64 fields)** | 16 EiB | ~8 ZiB |
+
+GSFS is FAT32-class **today only because Phase-1 chose 32-bit fields**; widening
+`size` + `total_blocks` to `u64` is a one-line change that vaults it past ext4. So
+capacity does not distinguish these filesystems. What ext4/NTFS/APFS/ZFS actually buy
+is **features** — journaling (crash-safety), checksums (bit-rot), snapshots,
+copy-on-write, B-tree metadata that stays fast at millions of files. **GSFS
+deliberately has none yet** — that, not size, is its real trade-off: §26.6/§20
+minimalism now, with journaling arriving as the Phase-3 transactional-recovery work
+(§6.3) only when a real need pulls it in.
+
 ## 4. Layering and responsibilities
 
 ```text
