@@ -53,7 +53,7 @@ A drive GodspeedOS can **boot from** has two regions:
 A **data-only drive** has just a GSFS region (no boot region). A **bootable
 GodspeedOS drive** has both.
 
-## 3. Two verbs: `flash` vs `install`
+## 3. Three verbs: `flash`, `install`, `update`
 
 The distinction the whole model rests on:
 
@@ -61,8 +61,10 @@ The distinction the whole model rests on:
 |---------|-------|--------|
 | `drives flash <n> [label]` | a **data** drive (GSFS only) | files; not bootable |
 | `drives install <n>` | a **bootable GodspeedOS** drive (boot region + GSFS) | the machine can boot GodspeedOS from it |
+| `drives update <n>` | a new kernel in the **inactive A/B slot** of an existing Prime | reboot boots the new kernel; the old stays as fallback (§10) |
 
-`install` is **self-replication**: GodspeedOS writing GodspeedOS onto a drive.
+`install` is **self-replication** (GodspeedOS writing GodspeedOS onto a drive);
+`update` is **self-update** (GodspeedOS replacing its own kernel, safely, §10).
 
 ## 4. The flow — boot, self-install, propagate
 
@@ -108,23 +110,40 @@ So the layering is clean:
 - **World** = portable *content* (your services + state) in a drive's GSFS region,
   loaded on top of whatever Prime booted.
 
-## 6. The one new capability it needs
+## 6. Self-replication: Prime is *self-carrying* (resolved)
 
-Honesty about cost: `install` means **writing a bootable layout from inside
-GodspeedOS** — a GPT, a FAT ESP, Limine, and the kernel image. That's precisely what
-`osdev image` does **on the host**; Prime self-install is doing it **self-hosted**.
-Bounded but real:
+`install` means **writing a bootable layout from inside GodspeedOS** — a GPT, a FAT
+ESP (Limine + kernel), and a GSFS region — exactly what `osdev image` does **on the
+host**, now self-hosted. The crux was: where do the boot-image bytes come from? A
+constraint settles it:
 
-- a small **GPT writer** (partition table) + block writes (already have `block-driver`);
-- the boot region: either a **FAT32 writer**, or — simpler — Prime carries a
-  prebuilt **ESP blob** and stamps it onto the target, patching only the kernel;
-- the **kernel image to copy**: Prime either **carries a compressed copy of its own
-  boot image** (self-contained, larger) or **reads it back from the medium it booted
-  from** (leaner, but only while that medium is attached). The same recursion every
-  live-USB installer uses.
+> **GodspeedOS cannot read the medium it booted from.** `block-driver` is an
+> **AHCI/SATA** driver; the USB you boot Prime from lives on the **xhci/ehci**
+> controller — a different device entirely. So "read the boot ESP back from the boot
+> medium" is impossible for the first USB→SSD install (it would need a USB
+> mass-storage driver). The bytes must come from inside Prime.
 
-None of this touches the kernel's `unsafe` story — it's block writes + format
-construction in userspace (`drives` + `fs` + `block-driver`).
+**So Prime *carries* a copy of its own bootable image** and stamps it onto any target
+(raw block writes — the ESP is an opaque blob, so **no FAT *read/write* needed for
+install**). `install` = write GPT → stamp the carried boot image into the ESP region →
+make a fresh GSFS data partition. Source-medium-independent.
+
+The mild recursion (an image of yourself contains a kernel that contains the image) is
+closed two ways; **v1 picks the simpler (§26.2/§26.13):**
+- **One-version-behind (chosen):** Prime carries the *previous stable* Prime image.
+  Dead simple, no build-time fixed-point; the freshly-installed copy is one rev old
+  until it re-installs. Fine because Prime changes rarely.
+- *(Alt)* Compression fixed-point: a compressed self-image converges to a small fixed
+  point so `install` always writes *current* Prime — needs a build-time iteration.
+
+None of this touches the kernel's `unsafe` story — block writes + format construction
+in userspace (`drives` + `fs` + `block-driver`).
+
+> **Caveat (see §10):** *install* needs no FAT logic (raw blob stamp), but in-place
+> A/B *update* — swapping one kernel slot and flipping the boot default — does need a
+> **minimal, bounded FAT writer** (overwrite a known file + edit `limine.conf`). So a
+> fully self-updating Prime carries a small FAT writer after all; the raw-stamp covers
+> the whole-ESP case, the FAT writer covers the per-slot case.
 
 ## 7. Why this fits the constitution
 
@@ -140,12 +159,59 @@ construction in userspace (`drives` + `fs` + `block-driver`).
   identity; the machine is fungible. This is the project's core principle applied to
   the OS instance itself.
 
-## 8. Open questions
+## 8. A/B kernel self-update (the dev-loop feature)
 
-1. **Self-replication source:** Prime carries its own boot image (self-contained,
-   bigger) vs reads it back from the boot medium (leaner, medium must be attached)?
-2. **Boot region writer:** a real FAT32 writer vs a carried ESP blob that's stamped +
-   kernel-patched? (Blob is simpler for v1; FAT writer is more flexible.)
+The point that makes Prime worth it day to day: **GodspeedOS updates its own kernel
+safely, without re-flashing a USB.** Build a new kernel, push it into the *inactive*
+slot, reboot into it — and if it's bad, the old one is still there. This is the
+**A/B-slot-with-rollback** scheme (Android / ChromeOS / CoreOS), and it is the
+constitution's **§16 update model applied to the whole kernel** instead of one service
+("write a new binary, verify before trust").
+
+### 8.1 The model
+
+- A Prime drive has **two kernel slots, A and B.** One is *active* (running), one
+  *inactive*. The active slot is never touched by an update — a bad build cannot brick.
+- **`drives update <n>`** writes the new kernel to the **inactive** slot, then flips
+  "which slot boots next."
+- **Reboot auto-selects the new slot.** If it fails, you fall back to the old.
+- Verbs: `install` makes a *new* bootable drive (full GPT + ESP + GSFS); `update` swaps
+  the inactive A/B kernel slot *in place* on an existing Prime.
+
+### 8.2 The honest cost: flipping the slot needs to touch the boot region
+
+`install` is a raw whole-ESP stamp (no FAT logic, §6). But `update` must **write one
+kernel file and change the boot default**, which means modifying the boot region. Two
+ways, and this is the key sub-decision:
+
+1. **Two kernel files in one ESP + a *minimal* FAT writer (chosen for v1).**
+   `kernel_a.elf` / `kernel_b.elf`; `update` overwrites the inactive file and edits
+   `limine.conf`'s default. The FAT writer is *bounded* — "overwrite a known file,
+   edit a tiny config" — not a general filesystem. Tractable, and it admits the honest
+   truth that a self-updating OS needs a little FAT-write (§6 caveat).
+2. *(Alt)* **Two whole-ESP partitions, each raw-stamped + UEFI `BootNext`/`BootOrder`.**
+   No FAT logic, but needs UEFI runtime-variable access from a post-boot microkernel —
+   fiddly, and bootloader-agnostic (does not depend on Limine).
+
+### 8.3 Rollback
+
+- **v1 — the Limine menu** (short timeout): if the new slot hangs, pick the old one.
+- **v2 — boot-count auto-rollback:** mark the new slot "trial"; if userspace doesn't
+  confirm "boot OK" within N boots, the bootloader reverts to the known-good slot. This
+  is the real safety net and the right long-term shape.
+
+### 8.4 Where the new kernel comes from
+
+- **Now:** a kernel image on a **data drive / GSFS file** that `update` reads — already
+  a win (a file copy, no USB re-flash, slot swap + fallback handled by Prime).
+- **Later:** **over the network** — then the dev loop is "build, push, reboot" with no
+  physical media at all.
+
+## 9. Open questions
+
+1. **Compression fixed-point vs one-version-behind** for the self-carried image (§6) —
+   v1 leans one-version-behind; revisit if "always install current Prime" matters.
+2. **Boot-default mechanism** (§8.2): minimal FAT writer (v1) vs UEFI boot variables.
 3. **Run-from-drive vs merge-into-primary:** does a portable drive *boot directly*
    (Prime + its GSFS world) and/or get *copied/merged* into a host's primary via a
    `drives copy`? (Probably both, eventually.)
@@ -157,12 +223,15 @@ construction in userspace (`drives` + `fs` + `block-driver`).
 6. **Boot precedence:** after `drives install 0`, how is boot order chosen (firmware
    boot menu, or GodspeedOS sets it)? Removing the USB is the simple v1 answer.
 
-## 9. Suggested order (when built)
+## 10. Suggested order (when built)
 
 1. **Hierarchical GSFS + `drives flash`/`use`** (the storage foundation —
    `persistence.md`, `drives.md`).
 2. **`drives install`** — write a bootable GodspeedOS drive (GPT + ESP/Limine +
-   kernel). Self-install from USB to SSD; boot without the USB.
-3. **Self-replication** — `install` to *other* drives; carry + boot them elsewhere.
-4. **Carrying a world** — supervisor loads services from a drive's GSFS region (§16
+   kernel) from the self-carried image (§6). Self-install USB → SSD; boot without the USB.
+3. **A/B `drives update`** (§8) — two kernel slots + the minimal FAT writer + boot-default
+   flip + the Limine-menu fallback. *This is the dev-loop payoff: kernel swaps without
+   re-flashing.* (Boot-count auto-rollback is a later refinement.)
+4. **Self-replication** — `install` to *other* drives; carry + boot them elsewhere.
+5. **Carrying a world** — supervisor loads services from a drive's GSFS region (§16
    generalized), so a drive carries your *content* on top of portable *Prime*.
