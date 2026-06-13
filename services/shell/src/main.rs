@@ -10,6 +10,7 @@ const MAX_ARGS: usize = 4;
 const OP_DRIVES_INFO: u8 = 20;
 const OP_FLASH: u8 = 21;
 const OP_LABEL: u8 = 22;
+const OP_RESET: u8 = 23;
 const FS_OK: u8 = 0;
 const LABEL_MAX: usize = 31;
 const DRIVES_VERSION: &str = "drives 0.1.0";
@@ -615,6 +616,11 @@ fn cmd_drives(ctx: &ServiceContext, args: &[&str], argc: usize) {
             if name.is_empty() { ctx.console_writeln("usage: drives label [drive] <name>"); }
             else if drive_sel_ok(ctx, sel) { drives_label(ctx, name); }
         }
+        "reset"   => {
+            // `drives reset [drive]` — un-format back to raw (optional selector, no value).
+            let sel = if argc >= 3 { args[2] } else { "" };
+            if drive_sel_ok(ctx, sel) { drives_reset(ctx); }
+        }
         "version" => ctx.console_writeln(DRIVES_VERSION),
         "help"    => drives_help(ctx),
         other     => {
@@ -655,6 +661,7 @@ fn drives_help(ctx: &ServiceContext) {
     help_line(ctx, "drives", "list attached drive(s)");
     help_line(ctx, "drives flash [drive] [label]", "format as GSFS (ERASES; asks y/N)");
     help_line(ctx, "drives label [drive] <name>", "name / rename the drive");
+    help_line(ctx, "drives reset [drive]", "un-format back to raw (ERASES; asks y/N)");
     help_line(ctx, "drives version", "print the version");
     help_line(ctx, "drives help", "print this message");
 }
@@ -710,6 +717,23 @@ fn drives_flash(ctx: &ServiceContext, label: &str) {
             ctx.console_writeln("drives: formatted as GSFS — mounted, ready to use now (no reboot)");
         }
         Some(_) => ctx.console_writeln("drives: flash FAILED (no disk, or disk too small)"),
+        None    => ctx.console_writeln("drives: storage unavailable (no fs?)"),
+    }
+}
+
+/// `drives reset` — un-format the drive back to raw (zero the superblock). Destructive;
+/// a quick clean slate for re-testing the raw→flash path. NOT a secure wipe.
+fn drives_reset(ctx: &ServiceContext) {
+    ctx.console_write("This un-formats the drive back to raw (ERASES). Continue? [y/N] ");
+    if !read_confirm(ctx) {
+        ctx.console_writeln("drives: aborted");
+        return;
+    }
+    match ctx.request_with_reply("fs", &Message::from_bytes(&[OP_RESET])) {
+        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
+            ctx.console_writeln("drives: reset to raw — 'drives flash' to use again");
+        }
+        Some(_) => ctx.console_writeln("drives: reset FAILED (no disk?)"),
         None    => ctx.console_writeln("drives: storage unavailable (no fs?)"),
     }
 }

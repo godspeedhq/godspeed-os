@@ -412,6 +412,24 @@ pub fn run_drives(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("drives-test: FAIL — timed out after `drives` (3)"); fail += 1; }
     }
 
+    // 5. `drives reset` — un-format back to raw (confirm [y/N]), then list shows raw.
+    send(&mut write_half, b"drives reset\r");
+    match collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(10)) {
+        Some(_) => {
+            send(&mut write_half, b"y\r");
+            match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(15)) {
+                Some(r) => check!(r.contains("reset to raw"), "reset: un-formatted to raw"),
+                None    => { println!("drives-test: FAIL — timed out after reset confirm"); fail += 1; }
+            }
+        }
+        None => { println!("drives-test: FAIL — reset: no [y/N] confirm"); fail += 1; }
+    }
+    send(&mut write_half, b"drives\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(10)) {
+        Some(r) => check!(r.contains("raw") && r.contains("not formatted"), "reset: drive now raw"),
+        None    => { println!("drives-test: FAIL — timed out after `drives` (4)"); fail += 1; }
+    }
+
     child.kill().ok();
     child.wait().ok();
 

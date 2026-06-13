@@ -156,6 +156,7 @@ from the boot default — you might boot off drive 0 yet work on drive 1.)
 | `drives` | list every drive: index, label, status, size, current/default | — | **3** |
 | `drives flash <drive> [label]` | format `<drive>` as a GSFS data drive (asks `[y/N]` — it ERASES); optional label; usable at once | data: yes | **3** |
 | `drives label <drive> <name>` | name / rename a drive — rewrites the superblock (duplicates allowed, §3) | data: yes | **3** |
+| `drives reset <drive>` | un-format a drive back to raw (asks `[y/N]` — it ERASES the GSFS marker); the inverse of `flash`. NOT a secure wipe (data blocks remain) — a quick clean slate, mainly for re-testing the raw→flash path | data: yes | **3** |
 | `drives godspeed install <drive>` | install bootable GodspeedOS onto the drive (Prime) | **yes** | 6 |
 | `drives godspeed update <drive>` | A/B kernel update of an installed drive | **yes** | 6 |
 | `drives godspeed default <drive>` | which installed GodspeedOS the machine boots | **yes** | 6 |

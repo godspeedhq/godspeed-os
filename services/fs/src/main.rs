@@ -72,6 +72,7 @@ const OP_LIST_DIR: u8 = 14;
 const OP_DRIVES_INFO: u8 = 20;
 const OP_FLASH: u8 = 21;
 const OP_LABEL: u8 = 22;
+const OP_RESET: u8 = 23; // un-format: zero the superblock → the drive reads as raw again
 const FS_OK: u8 = 0;
 const FS_ERR: u8 = 1;
 const FS_NOTFOUND: u8 = 2;
@@ -258,6 +259,20 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
             match vol {
                 Some(f) => send(&[match f.relabel(ctx, label) { Ok(()) => FS_OK, Err(_) => FS_ERR }]),
                 None => send(&[FS_NOFS]),
+            }
+            return;
+        }
+        OP_RESET => {
+            // Un-format: zero the superblock so the disk reads as raw again (the inverse
+            // of FLASH). Quick clean slate for re-testing the raw→flash path — NOT a
+            // secure wipe (data blocks remain). Drops any mounted filesystem.
+            if capacity == 0 {
+                send(&[FS_ERR]); // no disk
+            } else if block_write(ctx, 0, &[0u8; BLOCK]) {
+                *vol = None;
+                send(&[FS_OK]);
+            } else {
+                send(&[FS_ERR]);
             }
             return;
         }
