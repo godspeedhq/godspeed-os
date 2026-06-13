@@ -604,10 +604,16 @@ fn cmd_drives(ctx: &ServiceContext, args: &[&str], argc: usize) {
     let sub = if argc >= 2 { args[1] } else { "" };
     match sub {
         ""        => drives_list(ctx),
-        "flash"   => drives_flash(ctx, if argc >= 3 { args[2] } else { "" }),
+        "flash"   => {
+            // `drives flash [drive] [label]` — the drive selector is optional (one drive).
+            let (sel, label) = split_drive_value(args, argc);
+            if drive_sel_ok(ctx, sel) { drives_flash(ctx, label); }
+        }
         "label"   => {
-            if argc < 3 { ctx.console_writeln("usage: drives label <name>"); }
-            else { drives_label(ctx, args[2]); }
+            // `drives label [drive] <name>` — selector optional; name required.
+            let (sel, name) = split_drive_value(args, argc);
+            if name.is_empty() { ctx.console_writeln("usage: drives label [drive] <name>"); }
+            else if drive_sel_ok(ctx, sel) { drives_label(ctx, name); }
         }
         "version" => ctx.console_writeln(DRIVES_VERSION),
         "help"    => drives_help(ctx),
@@ -618,13 +624,37 @@ fn cmd_drives(ctx: &ServiceContext, args: &[&str], argc: usize) {
     }
 }
 
+/// Split the operands after `drives <sub>` into (optional drive selector, value). The
+/// value is the LAST operand; an operand before it is the drive selector. So
+/// `drives flash data` → ("", "data") and `drives flash 0 data` → ("0", "data").
+fn split_drive_value<'a>(args: &[&'a str], argc: usize) -> (&'a str, &'a str) {
+    match argc {
+        n if n >= 4 => (args[2], args[3]),
+        3           => ("", args[2]),
+        _           => ("", ""),
+    }
+}
+
+/// Validate a drive selector for the single attached drive (step 3). Accepts empty,
+/// `0`, or a label; rejects a numeric index other than 0 with a teaching message.
+fn drive_sel_ok(ctx: &ServiceContext, sel: &str) -> bool {
+    if sel.is_empty() || sel == "0" {
+        return true;
+    }
+    if sel.bytes().all(|b| b.is_ascii_digit()) {
+        ctx.console_writeln_fmt(format_args!("drives: no drive {} — only drive 0 is attached", sel));
+        return false;
+    }
+    true // a label selector — single drive, accept
+}
+
 fn drives_help(ctx: &ServiceContext) {
     ctx.console_writeln_fmt(format_args!("{} — manage attached disks (format, name, list)", DRIVES_VERSION));
     ctx.console_writeln("");
     ctx.console_writeln("usage:");
     help_line(ctx, "drives", "list attached drive(s)");
-    help_line(ctx, "drives flash [label]", "format the drive as GSFS (ERASES; asks y/N)");
-    help_line(ctx, "drives label <name>", "name / rename the drive");
+    help_line(ctx, "drives flash [drive] [label]", "format as GSFS (ERASES; asks y/N)");
+    help_line(ctx, "drives label [drive] <name>", "name / rename the drive");
     help_line(ctx, "drives version", "print the version");
     help_line(ctx, "drives help", "print this message");
 }

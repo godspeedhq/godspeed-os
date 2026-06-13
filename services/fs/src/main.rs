@@ -132,6 +132,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         }
     };
 
+    // The self-test WRITES to the disk, so it runs only in test builds (`--features
+    // selftest`). A production fs must never auto-write to the user's disk (the hardware
+    // run showed it polluting a real SSD with /etc + /greeting every boot).
+    #[cfg(feature = "selftest")]
     if let Some(ref mut f) = fs {
         self_test(&ctx, f);
     }
@@ -152,6 +156,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 /// Exercise the hierarchy and reboot survival. On a fresh disk: `mkdir /etc`, write a
 /// nested file `/etc/motd`, write a top-level `/greeting`. On a later boot: verify both
 /// already exist (persistence). Log strings are stable — the `osdev` tests gate on them.
+/// TEST-ONLY (`--features selftest`): it writes to the disk, so it must never run against
+/// a user's real disk.
+#[cfg(feature = "selftest")]
 fn self_test(ctx: &ServiceContext, fs: &mut Fs) {
     const GREET: &[u8] = b"/greeting";
     const GREET_DATA: &[u8] = b"hello, persistence!";

@@ -1075,7 +1075,11 @@ fn boot_blockdev_qemu(img_str: &str, persist_str: &str, serial: &str, secs: u64)
 /// supervisor spawns block-driver + fs (bare-metal,blockdev). AHCI by default.
 fn cmd_build_blockdev() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
+    // Force a fresh `fs` so its `selftest` feature (added below) is compiled in even if a
+    // prior plain build cached it — otherwise the blockdev tests miss the self-test logs.
+    let _ = std::process::Command::new("cargo")
+        .args(["clean", "--release", "-p", "fs", "--target", "x86_64-unknown-none"]).status();
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"])
@@ -1084,6 +1088,13 @@ fn cmd_build_blockdev() {
         if !status.success() { eprintln!("build: {} FAILED", crate_name); std::process::exit(1); }
         println!("build: {} OK", crate_name);
     }
+    // fs WITH the selftest feature — the blockdev tests assert its self-test log lines.
+    // (Production `osdev image` builds fs without it, so it never writes to a real disk.)
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "fs", "--target", "x86_64-unknown-none", "--features", "selftest"])
+        .status().unwrap_or_else(|e| panic!("failed to run cargo build for fs: {}", e));
+    if !status.success() { eprintln!("build: fs FAILED"); std::process::exit(1); }
+    println!("build: fs (selftest) OK");
     // Spawn block-driver + fs (blockdev) so fs mounts the AHCI disk over IPC.
     let status = std::process::Command::new("cargo")
         .args(["build", "--release", "-p", "supervisor", "--target", "x86_64-unknown-none",

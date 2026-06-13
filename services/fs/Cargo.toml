@@ -7,5 +7,12 @@ edition = "2021"
 name = "fs"
 path = "src/main.rs"
 
+[features]
+# Run the mount-time self-test (writes /greeting + /etc/motd to verify the hierarchy
+# and reboot survival). TEST BUILDS ONLY — it writes to the disk, so it must never be
+# enabled in a production/bare-metal build where the disk is the user's. Enabled by
+# `osdev test blockdev`/`blockdev-reboot`; absent from `osdev image`.
+selftest = []
+
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }
