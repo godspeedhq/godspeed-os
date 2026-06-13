@@ -17,8 +17,10 @@ use godspeed_sdk::ServiceContext;
 mod ahci;
 
 // Block IPC protocol (fs <-> block-driver). MUST match `services/fs`.
-//   Request : [op:u8, lba:u32 LE, (WriteBlock only: 512 data bytes)]
+//   Request : [op:u8, lba:u64 LE, (WriteBlock only: 512 data bytes)]
 //   Reply   : [status:u8, (ReadBlock only: 512 data bytes)]
+// The LBA is u64 (persistence §6.3): GSFS capacity fields are u64, so the block
+// address reaches the device at full width.
 const OP_READ_BLOCK: u8 = 1;
 const OP_WRITE_BLOCK: u8 = 2;
 const STATUS_OK: u8 = 0;

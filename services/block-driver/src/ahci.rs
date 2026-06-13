@@ -235,11 +235,13 @@ impl<'a> Ahci<'a> {
     /// replying through the client's `reply` cap.
     fn serve(&self, ctx: &ServiceContext, p: &[u8], reply: CapHandle) {
         use super::{OP_READ_BLOCK, OP_WRITE_BLOCK, STATUS_ERR, STATUS_OK};
-        if p.len() < 5 {
+        // Request: [op:u8, lba:u64 LE, (WriteBlock only: 512 data bytes)] — the LBA is
+        // u64 so GSFS's u64 capacity fields reach the device unchanged (persistence §6.3).
+        if p.len() < 9 {
             let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR]));
             return;
         }
-        let lba = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as u64;
+        let lba = u64::from_le_bytes([p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]]);
         match p[0] {
             OP_READ_BLOCK => {
                 let mut out = [0u8; 1 + 512];
@@ -254,12 +256,12 @@ impl<'a> Ahci<'a> {
                 }
             }
             OP_WRITE_BLOCK => {
-                if p.len() < 5 + 512 {
+                if p.len() < 9 + 512 {
                     let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR]));
                     return;
                 }
                 let mut sec = [0u8; 512];
-                sec.copy_from_slice(&p[5..5 + 512]);
+                sec.copy_from_slice(&p[9..9 + 512]);
                 let status = match self.write_block(lba, &sec) {
                     Ok(()) => STATUS_OK,
                     Err(_) => STATUS_ERR,

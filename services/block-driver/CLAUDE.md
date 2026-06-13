@@ -1,54 +1,52 @@
 # services/block-driver/
 
-Userspace **ATA PIO** disk driver (persistence, v2; §6.3, `docs/persistence.md`).
-Currently a TCB member (§6.1); the v2 goal is to drop it (§6.3, Phase 3).
+Userspace **AHCI (SATA)** disk driver (persistence, v2; §6.3, `docs/ahci.md`,
+`docs/persistence.md`). Currently a TCB member (§6.1); the v2 goal is to drop it
+(§6.3, Phase 3).
 
-## Device: ATA PIO, no DMA
+## Device: AHCI, MMIO + DMA
 
-The driver talks to a legacy IDE disk on the **secondary channel** (command block
-`0x170-0x177`, control `0x376`) using programmed I/O only — no DMA, no MMIO. Because
-a PIO driver never points a device at RAM, it has **no DMA-anywhere reach**: it is
-least-privilege *by construction* and does not need IOMMU confinement (the H1 problem
-does not apply). This is also what makes it a clean candidate to leave the TCB (§6.3),
-independent of IOMMU presence. See `docs/persistence.md` §5.
+The driver talks to a SATA disk through an AHCI HBA: the kernel maps the HBA's ABAR
+(MMIO) and grants a physically-contiguous DMA arena at spawn — the same path the USB
+drivers use. It brings up port 0, IDENTIFYs the disk, runs a boot read self-test, then
+serves block read/write to `fs` over IPC. It uses the SDK's safe `Mmio`/`Dma` wrappers,
+so the driver itself is `unsafe`-free (§18.1).
 
-## Why not virtio-blk
+Command shape: a command list (32 headers) + received-FIS area + a command table per
+slot (H2D Register FIS type 0x27 + PRDT). ATA commands: IDENTIFY `0xEC`, READ DMA EXT
+`0x25`, WRITE DMA EXT `0x35`, FLUSH EXT `0xEA` (writes flush to the medium so they
+survive reboot). See `docs/ahci.md` for the register cheat-sheet.
 
-virtio-blk is a QEMU-only paravirtual device that runs on no real hardware, and its
-virtqueue is DMA. ATA PIO works in QEMU **and** on real hardware (legacy/IDE mode), is
-far simpler, and is the conceptual stepping-stone to a future AHCI driver. (The earlier
-virtio plan was reconsidered before any code — `docs/persistence.md` §2–§5.)
+## Why AHCI (not ATA PIO, not virtio-blk)
 
-## Capability: `hw_pio` (kernel-mediated port I/O)
+The T630's SSD is **AHCI-only** — no legacy/IDE mode — so AHCI is the production path.
+ATA PIO was the bring-up backend (simplest correct device, no DMA); it was retired once
+AHCI proved out on real hardware. virtio-blk is a QEMU-only paravirtual device that runs
+on no real hardware, so it was never a candidate.
 
-Ring-3 services cannot execute `in`/`out`, and granting IOPL would be ambient authority
-over every port (§3.1). So port I/O is kernel-mediated: the driver's `hw_pio` grant (its
-contract port ranges) is recorded at spawn, and the `PortRead`/`PortWrite` syscalls
-validate **every** access against it. The SDK `Pio` wrapper (`Pio::read16` etc.) hides
-the syscalls so the driver stays `unsafe`-free (§18). The grant store + validation live
-in `kernel/src/capability/hw_pio.rs` (a permitted unsafe layer, §18.5).
+## DMA confinement (H1 / §6.4)
 
-```toml
-[capabilities]
-hw_pio = ["0x170+0x8", "0x376+0x1"]   # ATA secondary channel
+AHCI is a DMA-capable driver, so on a machine with an IOMMU it should be confined to its
+granted arena. On the T630 the firmware hands the SATA controller over with a stale DMA
+pointer (`0xffffffc0`, the same quirk `ehci` hits), so confining it faults a benign init
+read — block-driver runs in **IOMMU passthrough** there. Full confinement needs an AHCI
+BIOS/OS handoff (BOHC) — a future step (`docs/ahci.md` step E).
+
+## Block IPC protocol (fs ↔ block-driver)
+
+```
+Request : [op:u8, lba:u64 LE, (WriteBlock only: 512 data bytes)]
+Reply   : [status:u8, (ReadBlock only: 512 data bytes)]
+OP_READ_BLOCK = 1, OP_WRITE_BLOCK = 2; STATUS_OK = 0, STATUS_ERR = 1
 ```
 
-## Phases (docs/persistence.md §10)
-
-- **Phase 1 (done):** read sector 0 and log it — proves the cap-mediated port-I/O path.
-  Verified by `osdev test blockdev` (boots with a disk on the ATA secondary channel,
-  the driver reads back the host-written magic in sector 0).
-- **Phase 2+:** the block read/write interface to `fs` over IPC (Read/Write blocks),
-  then transactional recovery toward dropping block-driver from the TCB (§6.3).
-
-## Exposed interface (to fs via IPC — later phases)
-
-| Request   | Args                        | Response |
-|-----------|-----------------------------|----------|
-| `Read`    | LBA (u64), block count (u32)| data bytes or `IoError` |
-| `Write`   | LBA (u64), data bytes       | `Ok` or `IoError` |
+The LBA is **u64** (persistence §6.3) so GSFS's u64 capacity fields reach the device at
+full width. One request moves one 512-byte block (= one sector). `fs` owns file layout;
+`block-driver` only moves sectors — policy above, mechanism below.
 
 ## Failure semantics (§6.2)
 
 While still a TCB member (Phase 1–2), block-driver death = kernel panic = system reboot.
-Phase 3 (§6.3) makes it restartable and drops it from the TCB.
+Phase 3 (§6.3) makes it restartable and drops it from the TCB. Operationally it is
+already restartable (death reclaims its DMA/IOMMU resources and the supervisor respawns
+it); Phase 3 is the *trust* claim plus transactional recovery in `fs`.

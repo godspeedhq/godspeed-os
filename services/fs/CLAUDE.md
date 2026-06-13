@@ -11,22 +11,42 @@ fs owns persistent state for the system (§15). It cannot persist its own metada
 - `block-driver`: all I/O goes through block-driver IPC.
 - `registry`: registers its endpoint so supervisor and other services can find it.
 
-## v1 scope
+## On-disk format: GSFS, hierarchical (magic `GSFS0002`)
 
-- Flat namespace (no subdirectories beyond what supervisor needs).
-- Read/write files by path.
-- Serves: `supervisor` (service binaries), and any service holding `ipc_send = ["fs"]`.
+Phase 2 evolved the flat name→blob store into a real **hierarchical** filesystem
+(`docs/persistence.md` §6.2/§6.3). 512-byte blocks (= one AHCI sector = one block-IPC
+request), all capacity fields **u64** (~8 ZiB ceiling):
 
-## Exposed interface (via IPC)
+- **Superblock** (LBA 0): magic, version, `block_size`, `total_blocks:u64`,
+  `inode_table_start/blocks:u64`, `data_start:u64`, `next_free_block:u64`,
+  `root_inode:u32`, `flags` (DEFAULT bit, for `drives`).
+- **Inode table**: `INODE_COUNT` (256) slots × 64 bytes. Each inode: `type`
+  (free|file|dir), `size:u64`, `first_block:u64`, `block_count:u64`.
+- **Directory**: a dir inode whose single data block holds 16 entries × 32 bytes
+  (`name_len:u8`, `name[27]`, `inode:u32`). Path walking starts at `root_inode`.
 
-| Request      | Args              | Response |
-|--------------|-------------------|----------|
-| `ReadFile`   | path (string)     | file bytes or `NotFound` / `IoError` |
-| `WriteFile`  | path, data bytes  | `Ok` or `IoError` |
-| `StatFile`   | path              | size, exists flag |
+Bounded & loud (§26.6): fixed inode count, fixed name length, one block per directory,
+contiguous file extents via a bump allocator (overwrite leaks the old extent — a Phase-1
+carry-over). No POSIX permission bits (authority is by capability, §3.3), no hard links.
+Bad superblock magic is a loud mount refusal, never an auto-reformat (§3.12).
+
+## Exposed interface (via IPC — name field carries a path `/a/b/c`)
+
+| Request     | Op | Args              | Response |
+|-------------|----|-------------------|----------|
+| `WriteFile` | 10 | path, data bytes  | `Ok` / `Err` |
+| `ReadFile`  | 11 | path              | size + file bytes / `NotFound` |
+| `StatFile`  | 12 | path              | exists, size:u64, is_dir |
+| `Mkdir`     | 13 | path              | `Ok` / `Err` |
+| `ListDir`   | 14 | path              | `{name, is_dir}` entries |
 
 ## State and persistence (§15)
 
-fs holds an in-memory inode table built from the on-disk superblock at mount time. All writes go immediately to block-driver. There is no write-back cache in v1.
+fs holds the inode table in memory (built from the on-disk table at mount); directory
+blocks are read/written on demand. All writes are write-through to block-driver — no
+write-back cache.
 
-The filesystem cannot recover from a crash that leaves a partial write in progress. v1 accepts this: both block-driver and fs are non-restartable. The only recovery mechanism is a full system reboot.
+The filesystem cannot recover from a crash that leaves a partial write in progress. v1
+accepts this: both block-driver and fs are non-restartable. The only recovery mechanism
+is a full system reboot. Transactional metadata recovery is Phase 3 (the TCB-drop work,
+§6.3).
