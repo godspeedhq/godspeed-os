@@ -297,3 +297,71 @@ ways, and this is the key sub-decision:
 4. **Self-replication** — `install` to *other* drives; carry + boot them elsewhere.
 5. **Carrying a world** — supervisor loads services from a drive's GSFS region (§16
    generalized), so a drive carries your *content* on top of portable *Prime*.
+
+## 11. Rug pull: what happens to running apps when Prime is replaced
+
+> The lifecycle contract for the *whole OS*. Short version: **a Prime swap is a
+> reboot, and only state persisted to GSFS (§15) survives — the same restart
+> contract every service already lives under, applied one level up.**
+
+### 11.1 The kernel is not a service — you can't restart the floor
+
+Service restart (§14) works because **the kernel survives to mediate it**: it marks
+the dead service's generation stale, the client's caps fail, the client reacquires a
+fresh cap and resumes. But **Prime *is* the kernel** — the floor every app stands on.
+Page tables, cap tables, IPC queues, the scheduler, the CPU state all live *inside* it.
+You cannot pull the floor from under apps standing on it. So:
+
+**Replacing Prime is necessarily a reboot** — a clean, intentional one (not a crash,
+not "start afresh" blindly), but a reboot. It is **not** the service-restart pattern:
+there is no surviving kernel to report endpoints "dead" or keep cap-staleness coherent.
+In a kernel swap, *everything in RAM resets at once* — caps, endpoints, running
+execution, all gone together.
+
+### 11.2 But the apps step off, the floor is replaced, they step back on
+
+GodspeedOS turns that reboot into something that *feels* seamless, using the exact
+discipline that makes services restartable, scaled up. A planned update is a
+**checkpoint → reboot → reconstruct**:
+
+```text
+  1. signal running services: "system updating — persist your state"
+  2. services flush their state to GSFS         (the world survives on disk, §15)
+  3. reboot into the new kernel                 (A/B slot, rollback if bad, §8)
+  4. new kernel boots → supervisor RESPAWNS the services (from the GSFS world, §5)
+        → each service RECONSTRUCTS its state from GSFS → carries on
+```
+
+The apps do **not** survive in memory across the swap. What crosses the seam is
+**persisted state, not running processes.** The new kernel does not *resume* the old
+execution — it *respawns* the apps and they *reconstruct*. That is
+**restart-with-reconstruction (§2.5) at the whole-system level** — the constitution's
+stance (*live code update rejected; restart is sufficient*) with the kernel as its
+ultimate case, not an exception.
+
+### 11.3 Who survives — one consistent rule
+
+**Only apps that followed §15** (persist your own state externally; reconstruct on
+startup). A well-behaved app comes back where it left off; a RAM-only app that never
+persisted starts fresh — *exactly* as a non-persisting service loses its state on a
+normal restart. The kernel rug-pull adds **no new failure mode**; it is the **same
+restart contract, one level up.**
+
+### 11.4 Why it's survivable at all
+
+The property worth naming: **the architecture that makes services restartable is what
+makes kernel updates survivable.** On a monolith, a kernel update is a reboot where apps
+just *die* and someone restarts them by hand. In GodspeedOS the apps were *born* knowing
+how to checkpoint and resume — so a Prime swap is *less* disruptive than on Linux, not
+more, **because** of the isolation + persist-and-reconstruct discipline. Nothing was ever
+standing on the rug that didn't know how to land.
+
+### 11.5 Two edges
+
+- **Unplanned rug pull (kernel panic):** same as planned, minus step 1 — apps don't get
+  to flush, so they reconstruct from their *last* persisted checkpoint. The crash page
+  (§19) preserves the panic reason across the reboot. Hence the app-author's discipline:
+  persist often.
+- **A/B is what makes the rug pull safe to attempt** (§8): a broken new Prime is a
+  reboot you can *undo* (rollback to the old slot), not a brick. Without A/B, a bad
+  kernel update bricks; with it, it's reversible.
