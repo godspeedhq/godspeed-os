@@ -923,6 +923,7 @@ fn cmd_test(suite: &str) {
         "blockdev"     => run_blockdev_test(),
         "blockdev-reboot" => run_blockdev_reboot_test(),
         "drives-raw"   => run_drives_raw_test(),
+        "drives"       => run_drives_scripted_test(),
         other => eprintln!("unknown test suite: {}", other),
     }
 }
@@ -1298,6 +1299,26 @@ fn run_drives_raw_test() {
         println!("\n  [DRIVES.raw]  raw-disk tolerance  … FAIL\n\n  0 passed  1 failed");
         std::process::exit(1);
     }
+}
+
+/// Step 3b: scripted `drives` end-to-end. Build the bare-metal image (now spawns
+/// block-driver + fs before the shell), attach a RAW AHCI disk, and script
+/// `drives` → `drives flash data` (with [y/N] confirm) → list → `drives label`.
+fn run_drives_scripted_test() {
+    println!("\n=== drives 3b: flash + label from the shell (RAW AHCI disk) ===");
+    cmd_build_bare_metal();
+
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_drives_raw.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create raw disk");
+
+    crate::shell_test::run_drives(&image_path, persist, 4);
 }
 
 /// Build bare-metal image and run the scripted shell smoke-test.

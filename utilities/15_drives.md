@@ -1,10 +1,11 @@
 # Utility: `drives` — manage attached disks
 
-**Status:** Design agreed, **build in progress** (step 3 = the data primitives:
-`flash` / `label` / list). The boot-layer (`install` / `update` / `default`) and the
-multi-drive selectors (`use` / `use default` / `mount`) are reserved and specified here
-so the vocabulary is coherent from the start, but are later steps (see §8). This doc is
-the user-facing utility surface; the architecture/rationale lives in `docs/drives.md`
+**Status:** **Built + QEMU-verified** (step 3 = the data primitives: `flash` / `label` /
+list, as a shell built-in over `fs` — `osdev test drives` 7/7). The boot-layer
+(`godspeed install` / `update` / `default`) and the multi-drive selectors (`use` /
+`use default`) are reserved and specified here so the vocabulary is coherent from the
+start, but are later steps (see §8). This doc is the user-facing utility surface; the
+architecture/rationale lives in `docs/drives.md`
 (multi-drive model, addressing, default-flag) and `docs/prime.md` (the boot layer).
 Trails `CLAUDE.md`; does not amend it.
 
@@ -166,22 +167,36 @@ Drive *contents* (`ls` / `cat` / `write` / `cd` / `mkdir`) are **their own utili
 `drives` subcommands — they operate on paths within a drive, addressable as
 `[index:]label/path` or `/abs` / `rel` on the current drive (`docs/drives.md` §4.1).
 
-## 7. Implementation shape: a standalone service (least authority)
+## 7. Implementation shape: a shell built-in sending to `fs` (as built)
 
-`drives` is a **standalone service the shell brokers**, not a shell built-in — the same
-shape as `observe`, and for the same reason (`0_conventions.md` §2): flashing is
-*destructive*, and the conventions say a command that would otherwise run in the same
-protection domain as `spawn`/`kill`/`restart` should be its own task. So `drives` holds a
-contract-scoped, least-authority cap set — a send-cap to `fs` (and `block-driver` for
-capacity/enumeration), plus console read/write for its listing and the `[y/N]` prompt —
-and **cannot** spawn or kill anything *by construction* (§3.1, §26.9).
+> **Decided at build time (step 3b).** The earlier plan here was a *standalone service*
+> like `observe`. Building it surfaced why that's the wrong shape for storage commands,
+> and `drives` ships as a **shell built-in** instead. Recorded honestly, not silently.
 
-Flashing reads the keyboard for its `[y/N]` confirm via the same console-handoff the shell
-already uses for `observe-live`: the shell stops reading, the child owns the keyboard, and
-the shell takes it back when the child parks.
+`drives` (and the file commands) are **shell built-ins that send the drives/file API to
+`fs` over IPC**; `fs` holds and enforces *all* disk authority. The shell gains only a
+single narrow `ipc_send = ["fs"]` cap (plus its own endpoint for the reply-cap pattern) —
+**not** any new disk authority of its own. Three reasons the built-in is right here, where
+`observe` went standalone:
 
-After a flash the drive is **mounted and usable immediately** — no reboot. A reboot only
-*proves* persistence (the bytes survive a power-cycle); it is never part of the workflow.
+- **`fs` is the enforcing authority, not the shell.** A `SEND` cap to `fs` is not a
+  dangerous capability — it can only *ask* `fs`, which validates every request. Adding it
+  to the shell creates no new dangerous combination; the shell's `spawn`/`kill`/`restart`
+  caps are unchanged. (Contrast `observe`, which needed isolation because it would
+  otherwise hold introspection *alongside* the lifecycle caps.)
+- **Per-command services would be absurd.** A standalone `read`/`write`/`ls`/… each needs
+  console + `fs` caps + a way to receive its arguments — ten services where one narrow
+  send-cap on the shell suffices. The least-authority *win* is illusory once `fs` is the
+  gatekeeper.
+- **The `[y/N]` confirm is trivial in-shell** — the shell already owns the console and the
+  read loop; no console-handoff dance is needed.
+
+> **If least authority ever demands it**, the escape hatch is a *single* standalone
+> `files` broker the shell forwards command lines to — not one service per verb. Not
+> needed now (`fs` is the gate), recorded so the option is on the table.
+
+After a flash the drive is **usable immediately** — no reboot. A reboot only *proves*
+persistence (the bytes survive a power-cycle); it is never part of the workflow.
 
 ## 8. Build order (mirrors `docs/drives.md` §8)
 

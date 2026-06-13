@@ -295,6 +295,132 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 }
 
+/// Step 3b: drive the `drives` shell command end to end against a RAW AHCI disk.
+/// Boots the bare-metal build (which now spawns block-driver + fs before the shell),
+/// then scripts: `drives` (raw) → `drives flash data` + confirm → `drives` (GSFS) →
+/// `drives label archive` → `drives` (archive). Proves the OS formats its own disk
+/// over IPC from a user command, and lists/relabels it — all with no reboot.
+pub fn run_drives(image_path: &Path, persist_path: &str, smp: u32) {
+    println!("drives-test: booting (smp={smp}) with a RAW AHCI disk — scripted mode");
+
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let persist   = std::fs::canonicalize(persist_path)
+        .unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let persist_str = persist.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        // Boot image on legacy IDE; the persistence disk ALONE on an AHCI controller
+        // (→ block-driver port 0), RAW (not formatted) so `drives flash` does the work.
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(),
+        "-m",       "512M",
+        "-serial",  &format!("tcp::{shell_port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ])
+    .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| {
+        eprintln!("drives-test: QEMU launch failed at {qemu}: {e}");
+        std::process::exit(1);
+    });
+
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => { eprintln!("drives-test: could not connect to serial port {shell_port}"); child.kill().ok(); std::process::exit(1); }
+    };
+    let mut read_half  = stream.try_clone().expect("clone tcp stream");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop {
+                match read_half.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]),
+                }
+            }
+        });
+    }
+
+    let mut pass = 0usize;
+    let mut fail = 0usize;
+    let mut cursor = 0usize;
+    macro_rules! check {
+        ($ok:expr, $label:expr) => {
+            if $ok { println!("drives-test: PASS — {}", $label); pass += 1; }
+            else   { println!("drives-test: FAIL — {}", $label); fail += 1; }
+        };
+    }
+
+    // Boot complete.
+    if collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(40)).is_none() {
+        let got = { String::from_utf8_lossy(&buf.lock().unwrap()).into_owned() };
+        println!("drives-test: FAIL — timed out waiting for first gs>\n{got}");
+        child.kill().ok(); child.wait().ok();
+        std::process::exit(1);
+    }
+
+    // 1. `drives` — a raw, unformatted disk.
+    send(&mut write_half, b"drives\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(10)) {
+        Some(r) => check!(r.contains("raw") && r.contains("not formatted"), "drives: raw disk listed"),
+        None    => { println!("drives-test: FAIL — timed out after `drives`"); fail += 1; }
+    }
+
+    // 2. `drives flash data` — confirm the [y/N], then format.
+    send(&mut write_half, b"drives flash data\r");
+    match collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(10)) {
+        Some(_) => {
+            check!(true, "flash: destructive [y/N] confirm shown");
+            send(&mut write_half, b"y\r");
+            match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(20)) {
+                Some(r) => check!(r.contains("formatted as GSFS"), "flash: formatted over IPC"),
+                None    => { println!("drives-test: FAIL — timed out after confirm"); fail += 1; }
+            }
+        }
+        None => { println!("drives-test: FAIL — no [y/N] confirm  [×2]"); fail += 2; }
+    }
+
+    // 3. `drives` — now a mounted GSFS labelled 'data'.
+    send(&mut write_half, b"drives\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(10)) {
+        Some(r) => {
+            check!(r.contains("GSFS"), "drives: now formatted GSFS");
+            check!(r.contains("data"), "drives: label 'data' shown");
+        }
+        None => { println!("drives-test: FAIL — timed out after `drives` (2)  [×2]"); fail += 2; }
+    }
+
+    // 4. `drives label archive` — rename, then confirm it stuck.
+    send(&mut write_half, b"drives label archive\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(10)) {
+        Some(r) => check!(r.contains("labelled 'archive'"), "label: rename acknowledged"),
+        None    => { println!("drives-test: FAIL — timed out after `drives label`"); fail += 1; }
+    }
+    send(&mut write_half, b"drives\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(10)) {
+        Some(r) => check!(r.contains("archive"), "label: new label 'archive' listed"),
+        None    => { println!("drives-test: FAIL — timed out after `drives` (3)"); fail += 1; }
+    }
+
+    child.kill().ok();
+    child.wait().ok();
+
+    println!("\ndrives-test: {pass} passed, {fail} failed");
+    if fail > 0 {
+        std::process::exit(1);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

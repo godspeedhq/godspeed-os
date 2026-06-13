@@ -1,10 +1,18 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, CapInfo};
+use godspeed_sdk::{ServiceContext, CapInfo, Message};
 
 const MAX_LINE: usize = 128;
 const MAX_ARGS: usize = 4;
+
+// drives API (shell <-> fs). MUST match `services/fs`.
+const OP_DRIVES_INFO: u8 = 20;
+const OP_FLASH: u8 = 21;
+const OP_LABEL: u8 = 22;
+const FS_OK: u8 = 0;
+const LABEL_MAX: usize = 31;
+const DRIVES_VERSION: &str = "drives 0.1.0";
 
 // Entry point called by the kernel after spawning this service.
 // ctx.console_writeln() appends a newline. The kernel echoes each console keystroke to the
@@ -154,6 +162,7 @@ fn execute(ctx: &ServiceContext, line: &[u8]) {
             }
         }
         "reboot"  => cmd_reboot(ctx),
+        "drives"  => cmd_drives(ctx, &args, argc),
         other => {
             // Build "unknown: <cmd>" in a stack buffer to avoid two ctx.log calls
             let mut buf = [0u8; 64];
@@ -186,6 +195,9 @@ fn cmd_help(ctx: &ServiceContext) {
     help_line(ctx, "spawn <name>", "start a service");
     help_line(ctx, "kill <name>", "stop a service");
     help_line(ctx, "restart <name> [core]", "restart a service");
+    ctx.console_writeln("");
+    ctx.console_writeln("Storage");
+    help_line(ctx, "drives [flash|label]", "manage attached disks (drives help)");
     ctx.console_writeln("");
     ctx.console_writeln("Power");
     help_line(ctx, "reboot", "hardware reset");
@@ -580,6 +592,138 @@ fn cmd_restart(ctx: &ServiceContext, name: &str, core: Option<u32>) {
         Ok(()) => report(ctx, "restarted: ", name),
         Err(_) => report(ctx, "restart failed: ", name),
     }
+}
+
+// ---------------------------------------------------------------------------
+// drives — manage attached disks (utilities/15_drives.md). A shell built-in that
+// sends the drives API to `fs` over IPC; `fs` holds and enforces all disk authority.
+// Step 3: the data primitives `flash` / `label` / list (boot layer + multi-drive later).
+// ---------------------------------------------------------------------------
+
+fn cmd_drives(ctx: &ServiceContext, args: &[&str], argc: usize) {
+    let sub = if argc >= 2 { args[1] } else { "" };
+    match sub {
+        ""        => drives_list(ctx),
+        "flash"   => drives_flash(ctx, if argc >= 3 { args[2] } else { "" }),
+        "label"   => {
+            if argc < 3 { ctx.console_writeln("usage: drives label <name>"); }
+            else { drives_label(ctx, args[2]); }
+        }
+        "version" => ctx.console_writeln(DRIVES_VERSION),
+        "help"    => drives_help(ctx),
+        other     => {
+            ctx.console_writeln_fmt(format_args!("drives: unknown subcommand '{}'", other));
+            drives_help(ctx);
+        }
+    }
+}
+
+fn drives_help(ctx: &ServiceContext) {
+    ctx.console_writeln_fmt(format_args!("{} — manage attached disks (format, name, list)", DRIVES_VERSION));
+    ctx.console_writeln("");
+    ctx.console_writeln("usage:");
+    help_line(ctx, "drives", "list attached drive(s)");
+    help_line(ctx, "drives flash [label]", "format the drive as GSFS (ERASES; asks y/N)");
+    help_line(ctx, "drives label <name>", "name / rename the drive");
+    help_line(ctx, "drives version", "print the version");
+    help_line(ctx, "drives help", "print this message");
+}
+
+/// `drives` — list the attached drive (single-drive in step 3; index 0).
+fn drives_list(ctx: &ServiceContext) {
+    let reply = match ctx.request_with_reply("fs", &Message::from_bytes(&[OP_DRIVES_INFO])) {
+        Some(r) => r,
+        None => { ctx.console_writeln("drives: storage unavailable (no fs?)"); return; }
+    };
+    let p = reply.payload_bytes();
+    if p.first() != Some(&FS_OK) || p.len() < 28 {
+        ctx.console_writeln("drives: no disk found");
+        return;
+    }
+    let mounted = p[1] != 0;
+    let mib = u64_le(&p[2..10]) / 2048;
+    ctx.console_writeln("  #  LABEL        STATUS   SIZE");
+    if mounted {
+        let total = u64_le(&p[10..18]);
+        let next = u64_le(&p[18..26]);
+        let free_mib = total.saturating_sub(next) / 2048;
+        let ll = (p[27] as usize).min(LABEL_MAX);
+        let label = core::str::from_utf8(&p[28..28 + ll]).unwrap_or("?");
+        let label = if label.is_empty() { "-" } else { label };
+        ctx.console_writeln_fmt(format_args!(
+            "  0  {:<11}  GSFS     {} MiB ({} MiB free)", label, mib, free_mib));
+    } else {
+        ctx.console_writeln_fmt(format_args!(
+            "  0  {:<11}  raw      {} MiB  - not formatted -", "-", mib));
+    }
+}
+
+/// `drives flash [label]` — format the drive as GSFS after a `[y/N]` confirm. Destructive.
+fn drives_flash(ctx: &ServiceContext, label: &str) {
+    if label.len() > LABEL_MAX {
+        ctx.console_writeln_fmt(format_args!("drives: label too long (max {})", LABEL_MAX));
+        return;
+    }
+    ctx.console_write("This ERASES the drive. Continue? [y/N] ");
+    if !read_confirm(ctx) {
+        ctx.console_writeln("drives: aborted");
+        return;
+    }
+    let lb = label.as_bytes();
+    let ll = lb.len().min(LABEL_MAX);
+    let mut req = [0u8; 2 + LABEL_MAX];
+    req[0] = OP_FLASH;
+    req[1] = ll as u8;
+    req[2..2 + ll].copy_from_slice(&lb[..ll]);
+    match ctx.request_with_reply("fs", &Message::from_bytes(&req[..2 + ll])) {
+        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
+            ctx.console_writeln("drives: formatted as GSFS — mounted, ready to use now (no reboot)");
+        }
+        Some(_) => ctx.console_writeln("drives: flash FAILED (no disk, or disk too small)"),
+        None    => ctx.console_writeln("drives: storage unavailable (no fs?)"),
+    }
+}
+
+/// `drives label <name>` — name / rename the drive (rewrites the superblock).
+fn drives_label(ctx: &ServiceContext, name: &str) {
+    let nb = name.as_bytes();
+    if nb.is_empty() || nb.len() > LABEL_MAX {
+        ctx.console_writeln_fmt(format_args!("drives: label must be 1..{} chars", LABEL_MAX));
+        return;
+    }
+    let ll = nb.len();
+    let mut req = [0u8; 2 + LABEL_MAX];
+    req[0] = OP_LABEL;
+    req[1] = ll as u8;
+    req[2..2 + ll].copy_from_slice(nb);
+    match ctx.request_with_reply("fs", &Message::from_bytes(&req[..2 + ll])) {
+        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
+            ctx.console_writeln_fmt(format_args!("drives: labelled '{}'", name));
+        }
+        Some(_) => ctx.console_writeln("drives: label FAILED (no filesystem? run 'drives flash' first)"),
+        None    => ctx.console_writeln("drives: storage unavailable (no fs?)"),
+    }
+}
+
+/// Read one line from the console and return true iff it begins with y/Y. The kernel
+/// echoes keystrokes, so the user sees their answer; default (empty / anything else) is No.
+fn read_confirm(ctx: &ServiceContext) -> bool {
+    let mut first = 0u8;
+    loop {
+        let b = ctx.console_read();
+        match b {
+            b'\r' | b'\n' => break,
+            _ if first == 0 && b >= 0x20 && b < 0x7f => first = b,
+            _ => {}
+        }
+    }
+    first == b'y' || first == b'Y'
+}
+
+fn u64_le(b: &[u8]) -> u64 {
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&b[..8]);
+    u64::from_le_bytes(a)
 }
 
 // ---------------------------------------------------------------------------

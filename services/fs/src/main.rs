@@ -32,6 +32,13 @@ const BLOCK: usize = 512;
 const INODE_SIZE: usize = 64;
 const INODES_PER_BLOCK: usize = BLOCK / INODE_SIZE; // 8
 const INODE_COUNT: usize = 256;
+const ROOT_INODE: u32 = 0;
+// Fixed on-disk geometry — MUST match `osdev format_superblock`. Inode table at LBA 1
+// (32 blocks for 256 inodes), data region from LBA 33. Used by the in-OS `format()`.
+const INODE_TABLE_START: u64 = 1;
+const INODE_TABLE_BLOCKS: u64 = (INODE_COUNT / INODES_PER_BLOCK) as u64; // 32
+const DATA_START: u64 = INODE_TABLE_START + INODE_TABLE_BLOCKS; // 33
+const LABEL_MAX: usize = 31; // superblock: label_len u8 @64, label[31] @65
 
 const ITYPE_FREE: u8 = 0;
 const ITYPE_FILE: u8 = 1;
@@ -59,6 +66,12 @@ const OP_READ_FILE: u8 = 11;
 const OP_STAT_FILE: u8 = 12;
 const OP_MKDIR: u8 = 13;
 const OP_LIST_DIR: u8 = 14;
+// drives API (the `drives` command <-> fs). Works in BOTH states (raw + mounted),
+// except LABEL which needs a filesystem. INFO reports the volume; FLASH formats a
+// raw disk (or re-formats); LABEL renames.
+const OP_DRIVES_INFO: u8 = 20;
+const OP_FLASH: u8 = 21;
+const OP_LABEL: u8 = 22;
 const FS_OK: u8 = 0;
 const FS_ERR: u8 = 1;
 const FS_NOTFOUND: u8 = 2;
@@ -85,6 +98,9 @@ struct Fs {
     data_start: u64,
     next_free_block: u64,
     root_inode: u32,
+    flags: u32,             // superblock @60; bit0 = DEFAULT (drives.md §3)
+    label: [u8; LABEL_MAX], // superblock @65
+    label_len: u8,          // superblock @64
     inodes: [Inode; INODE_COUNT],
 }
 
@@ -128,7 +144,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             Some(c) => c,
             None => continue,
         };
-        serve(&ctx, &mut fs, msg.payload_bytes(), reply);
+        serve(&ctx, &mut fs, capacity, msg.payload_bytes(), reply);
         ctx.remove_cap(reply);
     }
 }
@@ -186,8 +202,62 @@ fn self_test(ctx: &ServiceContext, fs: &mut Fs) {
 /// File ops require a mounted filesystem; on a raw disk (`fs` is `None`) they return
 /// `FS_NOFS` so the caller can tell "no filesystem here" from "not found". (The drives
 /// API — flash/info/label — is added in step 3b and works in both states.)
-fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, p: &[u8], reply: CapHandle) {
+fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], reply: CapHandle) {
     let send = |bytes: &[u8]| { let _ = ctx.send_by_handle(reply, &Message::from_bytes(bytes)); };
+    if p.is_empty() {
+        send(&[FS_ERR]);
+        return;
+    }
+
+    // drives API first — INFO/FLASH work on a raw disk; LABEL needs a filesystem.
+    match p[0] {
+        OP_DRIVES_INFO => {
+            // [FS_OK, mounted, capacity:u64, total_blocks:u64, next_free:u64, flags:u8,
+            //  label_len:u8, label…]
+            let mut out = [0u8; 28 + LABEL_MAX];
+            out[0] = FS_OK;
+            out[2..10].copy_from_slice(&capacity.to_le_bytes());
+            if let Some(f) = vol {
+                out[1] = 1;
+                out[10..18].copy_from_slice(&f.total_blocks.to_le_bytes());
+                out[18..26].copy_from_slice(&f.next_free_block.to_le_bytes());
+                out[26] = f.flags as u8;
+                let ll = (f.label_len as usize).min(LABEL_MAX);
+                out[27] = ll as u8;
+                out[28..28 + ll].copy_from_slice(&f.label[..ll]);
+                send(&out[..28 + ll]);
+            } else {
+                send(&out[..28]);
+            }
+            return;
+        }
+        OP_FLASH => {
+            // [op, label_len, label…] — format the disk (raw or re-flash) to capacity.
+            if capacity == 0 {
+                send(&[FS_ERR]); // no disk
+                return;
+            }
+            let ll = if p.len() >= 2 { (p[1] as usize).min(LABEL_MAX) } else { 0 };
+            let label = if p.len() >= 2 + ll { &p[2..2 + ll] } else { &[][..] };
+            match Fs::format(ctx, capacity, label) {
+                Ok(f) => { *vol = Some(f); send(&[FS_OK]); }
+                Err(_) => send(&[FS_ERR]),
+            }
+            return;
+        }
+        OP_LABEL => {
+            let ll = if p.len() >= 2 { (p[1] as usize).min(LABEL_MAX) } else { 0 };
+            let label = if p.len() >= 2 + ll { &p[2..2 + ll] } else { &[][..] };
+            match vol {
+                Some(f) => send(&[match f.relabel(ctx, label) { Ok(()) => FS_OK, Err(_) => FS_ERR }]),
+                None => send(&[FS_NOFS]),
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    // File ops require a mounted filesystem.
     if p.len() < 2 {
         send(&[FS_ERR]);
         return;
@@ -261,6 +331,9 @@ impl Fs {
         }
         let inode_table_start = u64_at(&sb, 24);
         let inode_table_blocks = u64_at(&sb, 32);
+        let mut label = [0u8; LABEL_MAX];
+        let label_len = (sb[64] as usize).min(LABEL_MAX);
+        label[..label_len].copy_from_slice(&sb[65..65 + label_len]);
         let mut fs = Fs {
             total_blocks: u64_at(&sb, 16),
             inode_table_start,
@@ -268,6 +341,9 @@ impl Fs {
             data_start: u64_at(&sb, 40),
             next_free_block: u64_at(&sb, 48),
             root_inode: u32_at(&sb, 56),
+            flags: u32_at(&sb, 60),
+            label,
+            label_len: label_len as u8,
             inodes: [Inode::FREE; INODE_COUNT],
         };
         // Read the inode table (INODE_COUNT inodes, INODES_PER_BLOCK per block).
@@ -280,6 +356,74 @@ impl Fs {
             }
         }
         Ok(fs)
+    }
+
+    /// Format the disk as an empty GSFS sized to `capacity` (sectors), with `label`,
+    /// then mount it. Writes the superblock + a zeroed inode table + the root directory
+    /// inode + an empty root directory block — the same layout `osdev mkfs` writes, but
+    /// over block IPC and sized to the real disk. This is `drives flash`; it is only ever
+    /// invoked by an explicit user command, never automatically (§3.12).
+    fn format(ctx: &ServiceContext, capacity: u64, label: &[u8]) -> Result<Fs, &'static str> {
+        let total_blocks = capacity;
+        let root_dir_block = DATA_START;
+        let next_free_block = DATA_START + 1;
+        if total_blocks < next_free_block {
+            return Err("disk too small for a filesystem");
+        }
+
+        // Superblock (LBA 0).
+        let mut sb = [0u8; BLOCK];
+        sb[0..8].copy_from_slice(SB_MAGIC);
+        sb[8..12].copy_from_slice(&2u32.to_le_bytes()); // version
+        sb[12..16].copy_from_slice(&(BLOCK as u32).to_le_bytes()); // block_size
+        sb[16..24].copy_from_slice(&total_blocks.to_le_bytes());
+        sb[24..32].copy_from_slice(&INODE_TABLE_START.to_le_bytes());
+        sb[32..40].copy_from_slice(&INODE_TABLE_BLOCKS.to_le_bytes());
+        sb[40..48].copy_from_slice(&DATA_START.to_le_bytes());
+        sb[48..56].copy_from_slice(&next_free_block.to_le_bytes());
+        sb[56..60].copy_from_slice(&ROOT_INODE.to_le_bytes());
+        sb[60..64].copy_from_slice(&0u32.to_le_bytes()); // flags (DEFAULT clear)
+        let ll = label.len().min(LABEL_MAX);
+        sb[64] = ll as u8;
+        sb[65..65 + ll].copy_from_slice(&label[..ll]);
+        if !block_write(ctx, 0, &sb) {
+            return Err("superblock write failed");
+        }
+
+        // Zero the inode table, then write the root inode (slot 0 = a dir at data_start).
+        let zero = [0u8; BLOCK];
+        for b in 0..INODE_TABLE_BLOCKS {
+            if !block_write(ctx, INODE_TABLE_START + b, &zero) {
+                return Err("inode table init failed");
+            }
+        }
+        let mut ib = [0u8; BLOCK];
+        encode_inode(&mut ib, 0, &Inode { itype: ITYPE_DIR, size: 0, first_block: root_dir_block, block_count: 1 });
+        if !block_write(ctx, INODE_TABLE_START, &ib) {
+            return Err("root inode write failed");
+        }
+        // Empty root directory block.
+        if !block_write(ctx, root_dir_block, &zero) {
+            return Err("root directory init failed");
+        }
+
+        Fs::mount(ctx)
+    }
+
+    /// Rewrite the on-disk label (and the in-memory copy). `drives label`.
+    fn relabel(&mut self, ctx: &ServiceContext, label: &[u8]) -> Result<(), &'static str> {
+        let ll = label.len().min(LABEL_MAX);
+        let mut sb = block_read(ctx, 0).ok_or("superblock read failed")?;
+        sb[64] = ll as u8;
+        for b in &mut sb[65..65 + LABEL_MAX] { *b = 0; }
+        sb[65..65 + ll].copy_from_slice(&label[..ll]);
+        if !block_write(ctx, 0, &sb) {
+            return Err("superblock write failed");
+        }
+        self.label = [0u8; LABEL_MAX];
+        self.label[..ll].copy_from_slice(&label[..ll]);
+        self.label_len = ll as u8;
+        Ok(())
     }
 
     // ── inode allocation + persistence ───────────────────────────────────────
