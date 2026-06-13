@@ -115,6 +115,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
     let _ = ctx.spawn("ehci");
 
+    // Persistence (v2; docs/persistence.md), spawned only in the `blockdev`
+    // smoke-test build (a disk is attached on the ATA secondary channel).
+    // block-driver MUST precede fs: the kernel registers block-driver's endpoint
+    // name at spawn, and fs's send-peer cap to it wires from that name table at
+    // fs's spawn. fs then mounts by reading the superblock over IPC.
+    #[cfg(feature = "blockdev")]
+    {
+        let _ = ctx.spawn("block-driver");
+        let _ = ctx.spawn("fs");
+    }
+
     ctx.log("supervisor: ready");
 
     // Death-notification restart loop (H11 ph6). The kernel enqueues the name of a

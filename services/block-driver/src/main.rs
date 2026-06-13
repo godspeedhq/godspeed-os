@@ -1,40 +1,38 @@
-//! `block-driver` — trusted block device driver. TCB member in v1 (§6.1).
+//! `block-driver` — userspace **AHCI (SATA)** disk driver (persistence, v2; §6.3,
+//! docs/ahci.md, docs/persistence.md).
 //!
-//! Owns the `hw_mmio` and `hw_interrupt` capabilities for the storage device.
-//! Exposes a read/write block interface to `fs` via IPC.
+//! An MMIO + DMA driver: the kernel maps the AHCI HBA's ABAR and grants a
+//! physically-contiguous DMA arena at spawn (the same path as the USB drivers).
+//! It IDENTIFYs the disk, runs a boot self-test, then serves block read/write to
+//! `fs` over IPC.
 //!
-//! Non-restartable in v1: `fs` depends on it and a restart would lose disk
-//! state. v2 goal: make block-driver restartable with transactional recovery (§6.3).
-//!
-//! v1 target: QEMU virtio-blk (MMIO variant, single queue).
+//! (ATA PIO + the `hw_pio` capability were the bring-up backend; retired once AHCI
+//! proved out — the T630's SSD is AHCI-only, so AHCI is the production path.)
 
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, Message};
+use godspeed_sdk::ServiceContext;
+
+mod ahci;
+
+// Block IPC protocol (fs <-> block-driver). MUST match `services/fs`.
+//   Request : [op:u8, lba:u32 LE, (WriteBlock only: 512 data bytes)]
+//   Reply   : [status:u8, (ReadBlock only: 512 data bytes)]
+const OP_READ_BLOCK: u8 = 1;
+const OP_WRITE_BLOCK: u8 = 2;
+const STATUS_OK: u8 = 0;
+const STATUS_ERR: u8 = 1;
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
-    let mmio = ctx.capability("hw_mmio").expect("block-driver: missing hw_mmio cap");
-    let irq  = ctx.capability("hw_interrupt").expect("block-driver: missing hw_interrupt cap");
-
-    init_virtio_blk(&mmio);
-    ctx.log("block-driver: ready");
-
-    loop {
-        // Wait for either a block request from fs or an interrupt from the device.
-        todo!("recv from either fs endpoint or interrupt endpoint; dispatch accordingly")
+    match ctx.mmio() {
+        Some(hba) => ahci::run(&ctx, &hba),
+        None => {
+            ctx.log("block-driver: no AHCI controller found (no SATA disk?)");
+            loop {
+                ctx.yield_cpu();
+            }
+        }
     }
-}
-
-fn init_virtio_blk(mmio: &godspeed_sdk::CapHandle) {
-    todo!("negotiate virtio features, set up virtqueue, enable interrupts")
-}
-
-fn handle_read_request(lba: u64, buf_cap: godspeed_sdk::CapHandle) {
-    todo!("submit virtio read descriptor, wait for completion, return data via IPC reply")
-}
-
-fn handle_write_request(lba: u64, data: &[u8]) {
-    todo!("submit virtio write descriptor, wait for completion, reply with Ok")
 }

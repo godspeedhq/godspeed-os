@@ -13,6 +13,11 @@ Narrative documentation. These files explain design decisions in prose; they do 
 | `registry.md`       | Why the registry exists: name → capability resolution, the rendezvous problem, identity-over-location (§14.2, §3.11, §26.10) |
 | `smp.md`            | SMP design: per-core run queues, IPI vectors, TLB shootdown protocol, placement algorithm |
 | `iommu.md`          | IOMMU-backed DMA confinement (H1): why DMA-capable drivers are kernel-equivalent without an IOMMU, AMD-Vi detection/setup/confinement/reclaim, Phase 2 TCB-drop proposal (§6, §12, §18.1) |
+| `persistence.md`    | Block driver + filesystem (v2): why our own filesystem not ext4/btrfs, ATA PIO (no-DMA, least-privilege), flat name→blob format, file-as-capability via kernel-delegated resource caps, phased plan + TCB-drop trajectory (§6.3, §15, §23.4) |
+| `ahci.md`           | AHCI (SATA) block-driver backend: why (T630 SSD is AHCI-only), MMIO+DMA shape, command list/FIS/PRDT, IOMMU confinement (H1), incremental build steps A–E |
+| `drives.md`         | `drives` shell utility + multi-drive model (design, not built): flash/use/default, no-reboot flow, default-drive superblock flag, drive labels = identity over location (invariant 11), `[N:]label/path` addressing, command set + mockups |
+| `prime.md`          | GodspeedOS Prime (design, not built): the minimal self-installing portable core (TCB + run/portability utilities), bootable-drive anatomy (ESP boot region + GSFS), `flash`/`install`/`update`, self-install USB→SSD + self-replication, A/B kernel self-update (§16 generalized), carrying a "world" on a drive |
+| `licensing.md`      | Licensing intent/policy (not yet legal text): GPL copyleft kernel + permissive SDK, the capability/IPC boundary as the license boundary, Limine BSD-2-Clause compatibility, GPLv2-vs-v3 + MIT-vs-Apache open choices |
 | `unsafe-audit.md`   | Complete inventory of every `unsafe` block in the kernel (§18.4) |
 | `introspection-capability.md` | Design note: gating `InspectKernel`/`TaskStat` behind the `INTROSPECT` cap (§3.1) — closes the ambient-introspection exception |
 | `cluster-design.md` | Cluster mode design notes (non-normative, far-future; expands Appendix C.4 of `CLAUDE.md`) |

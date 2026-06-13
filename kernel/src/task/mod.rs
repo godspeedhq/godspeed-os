@@ -398,6 +398,36 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
+        // `block-driver` — userspace ATA PIO disk driver (persistence, v2; §6.3,
+        // docs/persistence.md). The kernel grants its ATA port window by name in
+        // the spawn path (6a-pio); no MMIO, no DMA, no IRQ wired yet (polled).
+        // Phase 1 reads sector 0 and logs it. Pinned to core 1, off the shell/TCB.
+        "block-driver" => Some(("block-driver", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_BLOCK_DRIVER_ELF")),
+            has_recv_endpoint: true, // serves block read/write requests from fs (§4)
+            send_peers:        &[],  // replies via the per-request reply cap fs embeds
+            send_peers_grant:  false,
+            preferred_core:    1,
+            probe_mode:        0,
+            memory_limit:      16 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
+        // `fs` — userspace filesystem (persistence, v2; §15, docs/persistence.md).
+        // Phase 1: mounts by reading the superblock (LBA 0) from `block-driver`
+        // over IPC and validating its magic. Spawned AFTER block-driver (its
+        // send-peer cap wires from the kernel name table at spawn). Core 1.
+        "fs" => Some(("fs", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_FS_ELF")),
+            has_recv_endpoint: true, // owns an endpoint (reply target + future fs API)
+            send_peers:        &["block-driver"],
+            send_peers_grant:  false,
+            preferred_core:    1,
+            probe_mode:        0,
+            memory_limit:      32 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
         // ----------------------------------------------------------------
         // Probe services — §22 Group A identity tests.
         // All use the same probe ELF; probe_mode selects the test behaviour.
@@ -3038,6 +3068,8 @@ fn spawn_service_with_config(
             pci::XHCI_MMIO_BASE.load(Relaxed)
         } else if name == "ehci" && pci::EHCI_FOUND.load(Relaxed) {
             pci::EHCI_MMIO_BASE.load(Relaxed)
+        } else if name == "block-driver" && pci::AHCI_FOUND.load(Relaxed) {
+            pci::AHCI_ABAR.load(Relaxed) // AHCI HBA registers (docs/ahci.md)
         } else {
             0
         };
@@ -3072,10 +3104,16 @@ fn spawn_service_with_config(
         use crate::arch::x86_64::pci;
         (name == "xhci" && pci::XHCI_FOUND.load(Relaxed))
             || (name == "ehci" && pci::EHCI_FOUND.load(Relaxed))
+            || (name == "block-driver" && pci::AHCI_FOUND.load(Relaxed)) // AHCI (docs/ahci.md)
     };
     // Per-driver arena size: xHCI needs room for its 256 scratchpad buffers;
-    // EHCI gets the small 64 KiB arena it had on main (see the constants above).
-    let dma_pages = if name == "ehci" { EHCI_DMA_PAGES } else { XHCI_DMA_PAGES };
+    // EHCI gets the small 64 KiB arena it had on main; the AHCI block driver needs
+    // only its command list/FIS/command table + a data buffer — 64 KiB is plenty.
+    let dma_pages = if name == "ehci" || name == "block-driver" {
+        EHCI_DMA_PAGES
+    } else {
+        XHCI_DMA_PAGES
+    };
     let (xhci_dma_va, xhci_dma_phys, xhci_dma_len) = if dma_for_driver {
         match crate::memory::allocator::alloc_contiguous(dma_pages as usize) {
             Some(phys) => {
@@ -3116,6 +3154,13 @@ fn spawn_service_with_config(
                         crate::arch::x86_64::iommu::confine_device(
                             pci::XHCI_BDF.load(Relaxed), phys, len);
                     } else {
+                        // `block-driver` (AHCI) stays in IOMMU passthrough, like ehci:
+                        // the T630 BIOS hands the SATA controller over with a stale
+                        // firmware DMA pointer (~0xffffffc0). Confining it makes that
+                        // benign stale read a fatal IO_PAGE_FAULT (CI stuck); in
+                        // passthrough the read is harmless and AHCI works. Confinement
+                        // needs an AHCI BIOS/OS handoff first (a future step, §6.4;
+                        // docs/ahci.md) — same situation the USB drivers hit.
                         crate::kprintln!(
                             "spawn[dma]: '{}' left in IOMMU passthrough (CONFINE_USB_DRIVERS={})",
                             name, CONFINE_USB_DRIVERS

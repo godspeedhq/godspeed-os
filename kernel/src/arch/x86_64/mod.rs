@@ -719,3 +719,4 @@ unsafe fn inb(port: u16) -> u8 {
     }
     val
 }
+

@@ -15,6 +15,10 @@ path = "src/main.rs"
 # (bare-metal USB) so core 0 is not loaded with harness-driven probes that
 # require the QEMU control port to complete (e.g. probe-4b, probe-hog).
 bare-metal = []
+# Additionally spawn `block-driver` (persistence smoke test, docs/persistence.md
+# Phase 1). Combined with `bare-metal` by `osdev test blockdev`, which attaches a
+# disk on the ATA secondary channel; block-driver reads sector 0 and logs it.
+blockdev = []
 identity-only = []
 # Spawn only the regular performance-benchmark probe services (perf-b1…perf-b10
 # and their echo/victim partners).  Used by `osdev test perf` to eliminate the

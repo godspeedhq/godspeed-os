@@ -90,6 +90,8 @@ enum Commands {
     },
     /// Validate all service contracts against the JSON schema.
     Validate,
+    /// Format a disk image with a GodspeedOS filesystem superblock (docs/persistence.md §6).
+    Mkfs { image: String },
 }
 
 fn main() {
@@ -108,7 +110,55 @@ fn main() {
         Commands::Image { mode }     => cmd_image(&mode),
         Commands::Shell { smp }      => cmd_shell(smp),
         Commands::Validate           => cmd_validate(),
+        Commands::Mkfs { image }     => cmd_mkfs(&image),
     }
+}
+
+// On-disk format — MUST match `services/fs` (docs/persistence.md §6).
+// 512-byte blocks (= one ATA sector = one block-IPC request), so block number = LBA.
+//   Superblock @ LBA 0: magic[8] "GSFS0001", version u32, block_size u32=512,
+//     total_blocks u32, entry_table_start u32=1, entry_table_blocks u32=1,
+//     data_start u32=2, next_free_block u32 (bump allocator), file_count u32.
+//   Entry table @ LBA 1 (1 block, 16 entries × 32 bytes). Data region from LBA 2.
+const FS_SB_MAGIC: &[u8; 8] = b"GSFS0001";
+const FS_BLOCK_SIZE: u32 = 512;
+const FS_ENTRY_TABLE_START: u32 = 1;
+const FS_ENTRY_TABLE_BLOCKS: u32 = 1;
+const FS_DATA_START: u32 = 2;
+
+/// Write a GodspeedOS filesystem superblock + empty entry table into `path`,
+/// preserving the rest of the image. `total_blocks` is derived from the image size.
+fn format_superblock(path: &str) {
+    let mut data = std::fs::read(path)
+        .unwrap_or_else(|e| { eprintln!("mkfs: cannot read {}: {}", path, e); std::process::exit(1); });
+    if data.len() < (FS_DATA_START as usize) * 512 {
+        eprintln!("mkfs: image too small ({} bytes)", data.len());
+        std::process::exit(1);
+    }
+    let total_blocks = (data.len() as u64 / FS_BLOCK_SIZE as u64) as u32;
+    let mut sb = [0u8; 512];
+    sb[0..8].copy_from_slice(FS_SB_MAGIC);
+    sb[8..12].copy_from_slice(&1u32.to_le_bytes());                   // version
+    sb[12..16].copy_from_slice(&FS_BLOCK_SIZE.to_le_bytes());         // block_size
+    sb[16..20].copy_from_slice(&total_blocks.to_le_bytes());          // total_blocks
+    sb[20..24].copy_from_slice(&FS_ENTRY_TABLE_START.to_le_bytes());  // entry_table_start
+    sb[24..28].copy_from_slice(&FS_ENTRY_TABLE_BLOCKS.to_le_bytes()); // entry_table_blocks
+    sb[28..32].copy_from_slice(&FS_DATA_START.to_le_bytes());         // data_start
+    sb[32..36].copy_from_slice(&FS_DATA_START.to_le_bytes());         // next_free_block = data_start
+    sb[36..40].copy_from_slice(&0u32.to_le_bytes());                  // file_count
+    data[0..512].copy_from_slice(&sb);
+    // Zero the entry table block(s) — no files yet.
+    let et = (FS_ENTRY_TABLE_START as usize) * 512;
+    let et_end = et + (FS_ENTRY_TABLE_BLOCKS as usize) * 512;
+    for b in &mut data[et..et_end] { *b = 0; }
+    std::fs::write(path, &data)
+        .unwrap_or_else(|e| { eprintln!("mkfs: cannot write {}: {}", path, e); std::process::exit(1); });
+    println!("mkfs: formatted {} ({} blocks of {} bytes, data from block {})",
+             path, total_blocks, FS_BLOCK_SIZE, FS_DATA_START);
+}
+
+fn cmd_mkfs(image: &str) {
+    format_superblock(image);
 }
 
 fn cmd_new(name: &str) {
@@ -136,7 +186,7 @@ pub fn cmd_build() {
     // Services must be compiled before the kernel — kernel/build.rs embeds
     // the service ELF bytes via include_bytes!(env!("SVC_*_ELF")).
     let service_crates = [
-        "init", "supervisor", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci",
+        "init", "supervisor", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs",
     ];
     for crate_name in &service_crates {
         let status = std::process::Command::new("cargo")
@@ -166,7 +216,7 @@ pub fn cmd_build() {
 /// no probe services that require the QEMU harness control port to complete).
 pub fn cmd_build_bare_metal() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -208,7 +258,7 @@ pub fn cmd_build_bare_metal() {
 /// Bar: no panic, no resource leak after 24 hours.
 pub fn cmd_build_idle() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -250,7 +300,7 @@ pub fn cmd_build_idle() {
 pub fn cmd_build_identity() {
     clean_supervisor();
     // Build every service crate except supervisor first.
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -294,7 +344,7 @@ pub fn cmd_build_identity() {
 /// maximum headroom before its timeout fires.
 pub fn cmd_build_perf() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -335,7 +385,7 @@ pub fn cmd_build_perf() {
 /// internally — no QEMU control port required.
 pub fn cmd_build_stress() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -379,7 +429,7 @@ pub fn cmd_build_stress() {
 /// "fuzz: F* pass" line and never "KERNEL PANIC".
 pub fn cmd_build_fuzz() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -419,7 +469,7 @@ pub fn cmd_build_fuzz() {
 /// hardware chaos run (C2–C7). C1 and C4 use bare-metal + hardware reconfiguration.
 pub fn cmd_build_chaos() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -460,7 +510,7 @@ pub fn cmd_build_chaos() {
 /// that triggers the Goldmont+ BSP IPI delivery quirk on the blocking round-trip.
 pub fn cmd_build_b2_only() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -503,7 +553,7 @@ pub fn cmd_build_b2_only() {
 /// probes — for clean, uncontended per-op latency on hardware. `feature` is the
 /// supervisor sub-feature, e.g. "iso-bp5".
 pub fn cmd_build_perf_iso(feature: &str) {
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -543,7 +593,7 @@ pub fn cmd_build_perf_iso(feature: &str) {
 
 pub fn cmd_build_bp2_only() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -584,7 +634,7 @@ pub fn cmd_build_bp2_only() {
 /// no QEMU control port required.
 pub fn cmd_build_adv() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -624,7 +674,7 @@ pub fn cmd_build_adv() {
 /// benchmark suite (BP1–BP10).
 pub fn cmd_build_brutal_perf() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -682,6 +732,7 @@ fn cmd_image(mode: &str) {
     match mode {
         "bare-metal"  => cmd_build_bare_metal(),
         "iommu-fault" => cmd_build_iommu_fault(),
+        "blockdev"    => cmd_build_blockdev(),
         "perf"        => cmd_build_perf(),
         "perf-brutal" => cmd_build_brutal_perf(),
         "identity"    => cmd_build_identity(),
@@ -705,7 +756,7 @@ fn cmd_image(mode: &str) {
         "iso-reg"     => cmd_build_perf_iso("iso-reg"),
         "s8"          => cmd_build_idle(),
         other => {
-            eprintln!("image: unknown --mode '{}'; valid: bare-metal, iommu-fault, perf, perf-brutal, identity, stress, adv, chaos, fuzz, b2-only, bp2-only, iso-bp3, iso-bp5, iso-bp7, iso-bp9, iso-bp10, iso-s3, iso-s5, iso-s9, iso-c7, iso-xsend, iso-xlife, iso-reg, s8", other);
+            eprintln!("image: unknown --mode '{}'; valid: bare-metal, iommu-fault, blockdev, perf, perf-brutal, identity, stress, adv, chaos, fuzz, b2-only, bp2-only, iso-bp3, iso-bp5, iso-bp7, iso-bp9, iso-bp10, iso-s3, iso-s5, iso-s9, iso-c7, iso-xsend, iso-xlife, iso-reg, s8", other);
             std::process::exit(1);
         }
     }
@@ -843,6 +894,8 @@ fn cmd_test(suite: &str) {
         "chaos-brutal" => crate::validator::run_chaos_brutal_tests(),
         "shell"        => run_shell_test(),
         "iommu"        => run_iommu_test(),
+        "blockdev"     => run_blockdev_test(),
+        "blockdev-reboot" => run_blockdev_reboot_test(),
         other => eprintln!("unknown test suite: {}", other),
     }
 }
@@ -873,7 +926,7 @@ fn cmd_shell(smp: u32) {
 /// §22 Test 12 / H1 §6.4.
 fn cmd_build_iommu_fault() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"])
@@ -965,6 +1018,203 @@ fn run_iommu_test() {
         println!("\n  [12]  confined_driver_dma_faults  (§22 Test 12)  … PASS\n\n  1 passed  0 failed");
     } else {
         println!("\n  [12]  confined_driver_dma_faults  (§22 Test 12)  … FAIL\n\n  0 passed  1 failed");
+        std::process::exit(1);
+    }
+}
+
+/// Boot the blockdev image once with `persist` on the ATA secondary channel,
+/// capture the serial log, and return it. The persist disk is NOT recreated —
+/// the caller controls its lifecycle (key for the reboot-survival test).
+fn boot_blockdev_qemu(img_str: &str, persist_str: &str, serial: &str, secs: u64) -> String {
+    let _ = std::fs::remove_file(serial);
+    let mut cmd = std::process::Command::new(qemu::qemu_binary());
+    cmd.args([
+        "-m", "512M", "-smp", "2",
+        "-drive", &format!("format=raw,file={img_str},if=ide,index=0"),
+        "-drive", &format!("format=raw,file={persist_str},if=ide,index=2"),
+        "-serial", &format!("file:{serial}"),
+        "-serial", "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]);
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("blockdev: failed to launch QEMU: {e}"); std::process::exit(1); });
+    std::thread::sleep(std::time::Duration::from_secs(secs));
+    let _ = child.kill();
+    let _ = child.wait();
+    std::fs::read_to_string(serial).unwrap_or_default().replace('\r', "")
+}
+
+/// Build the AHCI block-driver variant: block-driver with its `ahci` feature,
+/// supervisor spawns block-driver + fs (bare-metal,blockdev). AHCI by default.
+fn cmd_build_blockdev() {
+    clean_supervisor();
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
+    for crate_name in &non_supervisor {
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"])
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run cargo build for {}: {}", crate_name, e));
+        if !status.success() { eprintln!("build: {} FAILED", crate_name); std::process::exit(1); }
+        println!("build: {} OK", crate_name);
+    }
+    // Spawn block-driver + fs (blockdev) so fs mounts the AHCI disk over IPC.
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "supervisor", "--target", "x86_64-unknown-none",
+               "--features", "supervisor/bare-metal,supervisor/blockdev"])
+        .status().unwrap_or_else(|e| panic!("failed to run cargo build for supervisor: {}", e));
+    if !status.success() { eprintln!("build: supervisor FAILED"); std::process::exit(1); }
+    println!("build: supervisor (bare-metal,blockdev) OK");
+
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .status().expect("failed to run cargo build for kernel");
+    if !status.success() { eprintln!("build: kernel FAILED"); std::process::exit(1); }
+    println!("build: kernel OK");
+}
+
+/// AHCI steps A-D (docs/ahci.md): boot from a legacy-IDE disk, put the persistence
+/// disk ALONE on an ich9-ahci controller (so block-driver targets it on port 0 —
+/// mirroring the T630, where the SSD is the only SATA disk and boot is elsewhere),
+/// and verify detection, IDENTIFY, and the full fs stack (mount + file round-trip)
+/// running over AHCI READ/WRITE DMA EXT.
+fn run_blockdev_test() {
+    println!("\n=== AHCI steps A-D: detect + IDENTIFY + fs over AHCI ===");
+    cmd_build_blockdev();
+
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+
+    let _ = std::fs::create_dir_all("build/tests");
+    // Persistence disk, formatted, ALONE on the AHCI controller (→ block-driver
+    // port 0). The boot image is on legacy IDE so it is not a SATA disk.
+    let persist = "build/tests/persist_ahci.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create persist disk");
+    format_superblock(persist);
+
+    let serial = "build/tests/ahci_test_serial.log";
+    let _ = std::fs::remove_file(serial);
+    let img = std::fs::canonicalize(&image_path).unwrap_or_else(|_| image_path.to_path_buf());
+    let img_str = img.to_string_lossy().replace('\\', "/");
+    let persist_abs = std::fs::canonicalize(persist).unwrap_or_else(|_| std::path::PathBuf::from(persist));
+    let persist_str = persist_abs.to_string_lossy().replace('\\', "/");
+
+    let mut cmd = std::process::Command::new(qemu::qemu_binary());
+    cmd.args([
+        "-m", "512M", "-smp", "2",
+        // Boot disk on legacy IDE (PIIX3) — SeaBIOS boots it; it is NOT SATA so
+        // block-driver's AHCI scan ignores it.
+        "-drive", &format!("format=raw,file={img_str},if=ide"),
+        // The persistence disk ALONE on an explicit AHCI controller → port 0.
+        "-device", "ich9-ahci,id=ahci",
+        "-drive", &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device", "ide-hd,drive=data,bus=ahci.0",
+        "-serial", &format!("file:{serial}"),
+        "-serial", "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]);
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("ahci: failed to launch QEMU: {e}"); std::process::exit(1); });
+    println!("ahci: booting (IDE boot + ich9-ahci data disk), ~25s …");
+    std::thread::sleep(std::time::Duration::from_secs(25));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let log = std::fs::read_to_string(serial).unwrap_or_default().replace('\r', "");
+    let pci_found  = log.contains("pci: AHCI at");
+    let identify   = log.contains("IDENTIFY OK");
+    let serving    = log.contains("AHCI serving block I/O");
+    let fs_mounted = log.contains("fs: mounted");                 // step C: AHCI ReadBlock
+    let fs_file    = log.contains("fs: file round-trip OK")       // step D: AHCI WriteBlock+ReadBlock
+        || log.contains("fs: persisted file 'greeting' verified");
+    let no_panic   = !log.contains("KERNEL PANIC");
+
+    for l in log.lines().filter(|l| l.contains("AHCI") || l.contains("block-driver") || l.contains("fs:")) {
+        println!("ahci:   | {}", l.trim());
+    }
+    println!("ahci:   detect + IDENTIFY ... {}", if pci_found && identify { "yes" } else { "NO" });
+    println!("ahci:   serving block I/O ... {}", if serving { "yes" } else { "NO" });
+    println!("ahci:   fs mounted (AHCI ReadBlock) ... {}", if fs_mounted { "yes" } else { "NO" });
+    println!("ahci:   fs file round-trip (AHCI WriteBlock+ReadBlock) ... {}", if fs_file { "yes" } else { "NO" });
+    println!("ahci:   kernel did not panic ... {}", if no_panic { "yes" } else { "NO" });
+
+    let ab = if pci_found && identify && no_panic { "PASS" } else { "FAIL" };
+    let c  = if fs_mounted && no_panic { "PASS" } else { "FAIL" };
+    let d  = if fs_file && no_panic { "PASS" } else { "FAIL" };
+    println!("\n  [AHCI.A/B]  detect + port init + IDENTIFY        … {ab}");
+    println!("  [AHCI.C]    read (fs mounts over AHCI)            … {c}");
+    println!("  [AHCI.D]    write (fs file round-trip over AHCI)  … {d}");
+    let passed = (ab == "PASS") as u32 + (c == "PASS") as u32 + (d == "PASS") as u32;
+    println!("\n  {passed} passed  {} failed", 3 - passed);
+    if passed != 3 {
+        std::process::exit(1);
+    }
+}
+
+/// Boot the AHCI image once with `persist` alone on an ich9-ahci controller and
+/// the boot image on legacy IDE; capture and return the serial log.
+fn boot_ahci_qemu(img_str: &str, persist_str: &str, serial: &str, secs: u64) -> String {
+    let _ = std::fs::remove_file(serial);
+    let mut cmd = std::process::Command::new(qemu::qemu_binary());
+    cmd.args([
+        "-m", "512M", "-smp", "2",
+        "-drive", &format!("format=raw,file={img_str},if=ide"),
+        "-device", "ich9-ahci,id=ahci",
+        "-drive", &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device", "ide-hd,drive=data,bus=ahci.0",
+        "-serial", &format!("file:{serial}"),
+        "-serial", "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]);
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("ahci: failed to launch QEMU: {e}"); std::process::exit(1); });
+    std::thread::sleep(std::time::Duration::from_secs(secs));
+    let _ = child.kill();
+    let _ = child.wait();
+    std::fs::read_to_string(serial).unwrap_or_default().replace('\r', "")
+}
+
+/// AHCI reboot survival: format once, boot (fs writes `greeting` over AHCI), then
+/// reboot on the SAME SATA disk image — fs must read it back over AHCI.
+fn run_blockdev_reboot_test() {
+    println!("\n=== AHCI reboot survival (write → reboot → read, over SATA) ===");
+    cmd_build_blockdev();
+
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_ahci_reboot.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create persist disk");
+    format_superblock(persist);
+
+    let img = std::fs::canonicalize(&image_path).unwrap_or_else(|_| image_path.to_path_buf());
+    let img_str = img.to_string_lossy().replace('\\', "/");
+    let persist_abs = std::fs::canonicalize(persist).unwrap_or_else(|_| std::path::PathBuf::from(persist));
+    let persist_str = persist_abs.to_string_lossy().replace('\\', "/");
+
+    println!("ahci: boot 1 — fs creates 'greeting' over AHCI, ~25s …");
+    let log1 = boot_ahci_qemu(&img_str, &persist_str, "build/tests/ahci_reboot_1.log", 25);
+    let created = log1.contains("fs: file round-trip OK (greeting)");
+
+    println!("ahci: boot 2 — SAME SATA disk, no reformat, fs reads it back, ~25s …");
+    let log2 = boot_ahci_qemu(&img_str, &persist_str, "build/tests/ahci_reboot_2.log", 25);
+    // Match the END of the line — the "fs:" prefix can be clobbered by a concurrent
+    // shell write on the shared serial (cosmetic interleaving), but the tail is safe.
+    let survived = log2.contains("verified across boot");
+    for l in log2.lines().filter(|l| l.contains("fs:") || l.contains("IDENTIFY")) {
+        println!("ahci:   boot2 | {}", l.trim());
+    }
+    let panic = log1.contains("KERNEL PANIC") || log2.contains("KERNEL PANIC");
+    println!("ahci:   boot 1 created 'greeting' ... {}", if created { "yes" } else { "NO" });
+    println!("ahci:   boot 2 read it back from SATA ... {}", if survived { "yes" } else { "NO" });
+
+    if created && survived && !panic {
+        println!("\n  [AHCI.R]  reboot survival over SATA  … PASS\n\n  1 passed  0 failed");
+    } else {
+        println!("\n  [AHCI.R]  reboot survival over SATA  … FAIL\n\n  0 passed  1 failed");
         std::process::exit(1);
     }
 }

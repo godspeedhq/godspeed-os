@@ -47,6 +47,20 @@ pub static EHCI_IRQ: AtomicU8 = AtomicU8::new(0);
 /// PCI BDF of the EHCI controller — IOMMU device-table index (H1). 0xFFFF if none.
 pub static EHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
 
+// AHCI is PCI class 0x01 (mass storage), subclass 0x06 (SATA), progif 0x01 (AHCI).
+const CLASS_MASS_STORAGE: u8 = 0x01;
+const SUBCLASS_SATA: u8 = 0x06;
+const PROGIF_AHCI: u8 = 0x01;
+
+/// Discovered AHCI (SATA) controller — the `block-driver` gets its ABAR (BAR5)
+/// mapped + a DMA arena at spawn, exactly as the USB drivers do (§12,
+/// docs/ahci.md). First AHCI found wins. ABAR is a 32-bit MMIO BAR.
+pub static AHCI_FOUND: AtomicBool = AtomicBool::new(false);
+pub static AHCI_ABAR: AtomicU64 = AtomicU64::new(0);
+pub static AHCI_IRQ: AtomicU8 = AtomicU8::new(0);
+/// PCI BDF of the AHCI controller — IOMMU device-table index (H1). 0xFFFF if none.
+pub static AHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
+
 /// Build a 16-bit PCI BDF (bus<<8 | dev<<3 | func) — the IOMMU device-table index.
 #[inline]
 pub fn make_bdf(bus: u8, dev: u8, func: u8) -> u32 {
@@ -422,6 +436,23 @@ pub fn init() {
                         EHCI_BDF.store(make_bdf(bus as u8, dev, func), Ordering::Relaxed);
                         EHCI_FOUND.store(true, Ordering::Relaxed);
                     }
+                }
+                // AHCI (SATA) controller — the block driver's disk (docs/ahci.md).
+                if class == CLASS_MASS_STORAGE && subclass == SUBCLASS_SATA
+                    && progif == PROGIF_AHCI && !AHCI_FOUND.load(Ordering::Relaxed)
+                {
+                    // ABAR is BAR5 (offset 0x24), a 32-bit memory BAR.
+                    let bar5 = config_read32(bus as u8, dev, func, 0x24);
+                    let abar = (bar5 & 0xFFFF_FFF0) as u64;
+                    let irq = (config_read32(bus as u8, dev, func, 0x3C) & 0xFF) as u8;
+                    AHCI_ABAR.store(abar, Ordering::Relaxed);
+                    AHCI_IRQ.store(irq, Ordering::Relaxed);
+                    AHCI_BDF.store(make_bdf(bus as u8, dev, func), Ordering::Relaxed);
+                    AHCI_FOUND.store(true, Ordering::Relaxed);
+                    crate::kprintln!(
+                        "pci: AHCI at {:02x}:{:02x}.{} vendor={:#06x} ABAR={:#x} IRQ={}",
+                        bus, dev, func, vendor, abar, irq
+                    );
                 }
             }
         }

@@ -163,6 +163,23 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 **Grandfathered total:** 53 lines across 6 files  
 **Grand total:** 413 lines across 27 files
 
+> **2026-06-13** (branch `feat/persistence`). **ATA PIO / `hw_pio` retired** — the
+> AHCI (MMIO+DMA) backend replaced ATA PIO (the T630's SSD is AHCI-only). Reverts the
+> 2026-06-12 addition below: `arch/x86_64/mod.rs` 38 → 34 (the `port_in8/16`,
+> `port_out8/16` wrappers removed; `inb`/`outb` stay — used by serial + reboot), and
+> `capability/hw_pio.rs` deleted (−3). Back to 413/27. The `PortRead`/`PortWrite`
+> syscalls and the SDK `pio.rs` (not kernel-audited) are gone too.
+
+> **2026-06-12** (branch `feat/persistence`). Persistence Phase 1 (ATA PIO block
+> driver, docs/persistence.md §5). `arch/x86_64/mod.rs` +4 (permitted): safe
+> public port-I/O wrappers `port_in8/16` + `port_out8/16` (the `in`/`out` asm,
+> isolated in the arch layer; callers validate the port first). New file
+> `capability/hw_pio.rs` +3 (permitted): the per-task `hw_pio` grant store
+> (`set`/`clear`/`allowed`) — placed in the capability layer **on purpose**, so
+> the per-task port-range state does not grow the grandfathered `unsafe` floor in
+> `task/` (§18.5). `task/scheduler.rs` and `syscall/dispatch.rs` gained **no**
+> `unsafe` (they call the safe wrappers / the capability-layer functions).
+
 > **2026-06-10** (branch `feat/iommu-dma-confinement`). New file `arch/x86_64/iommu.rs`
 > (+60, permitted): the H1 AMD-Vi IOMMU work. Phase 0 (+18) is ACPI-table reads
 > (RSDP → RSDT/XSDT → IVRS) through the HHDM. Phase 1 (+42) is the IOMMU control
