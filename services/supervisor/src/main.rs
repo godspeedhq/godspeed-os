@@ -126,11 +126,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let _ = ctx.spawn("fs");
     }
 
-    // Read-only hardware probe (osdev image --mode blockprobe): only block-driver,
-    // built with its hw-probe feature. No fs — nothing writes to the disk.
-    #[cfg(feature = "blockprobe")]
-    let _ = ctx.spawn("block-driver");
-
     ctx.log("supervisor: ready");
 
     // Death-notification restart loop (H11 ph6). The kernel enqueues the name of a

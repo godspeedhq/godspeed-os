@@ -732,7 +732,7 @@ fn cmd_image(mode: &str) {
     match mode {
         "bare-metal"  => cmd_build_bare_metal(),
         "iommu-fault" => cmd_build_iommu_fault(),
-        "blockprobe"  => cmd_build_blockprobe(),
+        "blockdev"    => cmd_build_blockdev(),
         "perf"        => cmd_build_perf(),
         "perf-brutal" => cmd_build_brutal_perf(),
         "identity"    => cmd_build_identity(),
@@ -756,7 +756,7 @@ fn cmd_image(mode: &str) {
         "iso-reg"     => cmd_build_perf_iso("iso-reg"),
         "s8"          => cmd_build_idle(),
         other => {
-            eprintln!("image: unknown --mode '{}'; valid: bare-metal, iommu-fault, blockprobe, perf, perf-brutal, identity, stress, adv, chaos, fuzz, b2-only, bp2-only, iso-bp3, iso-bp5, iso-bp7, iso-bp9, iso-bp10, iso-s3, iso-s5, iso-s9, iso-c7, iso-xsend, iso-xlife, iso-reg, s8", other);
+            eprintln!("image: unknown --mode '{}'; valid: bare-metal, iommu-fault, blockdev, perf, perf-brutal, identity, stress, adv, chaos, fuzz, b2-only, bp2-only, iso-bp3, iso-bp5, iso-bp7, iso-bp9, iso-bp10, iso-s3, iso-s5, iso-s9, iso-c7, iso-xsend, iso-xlife, iso-reg, s8", other);
             std::process::exit(1);
         }
     }
@@ -896,8 +896,6 @@ fn cmd_test(suite: &str) {
         "iommu"        => run_iommu_test(),
         "blockdev"     => run_blockdev_test(),
         "blockdev-reboot" => run_blockdev_reboot_test(),
-        "blockdev-ahci"   => run_blockdev_ahci_test(),
-        "blockdev-ahci-reboot" => run_blockdev_ahci_reboot_test(),
         other => eprintln!("unknown test suite: {}", other),
     }
 }
@@ -1024,155 +1022,6 @@ fn run_iommu_test() {
     }
 }
 
-/// Build the persistence Phase-1 smoke-test image: bare-metal supervisor that
-/// also spawns `block-driver` (the `blockdev` feature), plus the kernel and all
-/// services (incl. block-driver). No special kernel feature.
-fn cmd_build_blockdev() {
-    clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
-    for crate_name in &non_supervisor {
-        let status = std::process::Command::new("cargo")
-            .args(["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"])
-            .status()
-            .unwrap_or_else(|e| panic!("failed to run cargo build for {}: {}", crate_name, e));
-        if !status.success() { eprintln!("build: {} FAILED", crate_name); std::process::exit(1); }
-        println!("build: {} OK", crate_name);
-    }
-    let status = std::process::Command::new("cargo")
-        .args(["build", "--release", "-p", "supervisor", "--target", "x86_64-unknown-none",
-               "--features", "supervisor/bare-metal,supervisor/blockdev"])
-        .status().unwrap_or_else(|e| panic!("failed to run cargo build for supervisor: {}", e));
-    if !status.success() { eprintln!("build: supervisor (bare-metal,blockdev) FAILED"); std::process::exit(1); }
-    println!("build: supervisor (bare-metal,blockdev) OK");
-
-    let status = std::process::Command::new("cargo")
-        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
-        .status().expect("failed to run cargo build for kernel");
-    if !status.success() { eprintln!("build: kernel FAILED"); std::process::exit(1); }
-    println!("build: kernel OK");
-}
-
-/// Build the read-only hardware-probe image: block-driver with its `hw-probe`
-/// feature (probes both ATA channels read-only), supervisor spawns only it (no fs).
-fn cmd_build_blockprobe() {
-    clean_supervisor();
-    // Everything except block-driver builds normally; block-driver gets hw-probe.
-    let others = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "fs"];
-    for crate_name in &others {
-        let status = std::process::Command::new("cargo")
-            .args(["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"])
-            .status()
-            .unwrap_or_else(|e| panic!("failed to run cargo build for {}: {}", crate_name, e));
-        if !status.success() { eprintln!("build: {} FAILED", crate_name); std::process::exit(1); }
-        println!("build: {} OK", crate_name);
-    }
-    let status = std::process::Command::new("cargo")
-        .args(["build", "--release", "-p", "block-driver", "--target", "x86_64-unknown-none",
-               "--features", "hw-probe"])
-        .status().unwrap_or_else(|e| panic!("failed to run cargo build for block-driver: {}", e));
-    if !status.success() { eprintln!("build: block-driver (hw-probe) FAILED"); std::process::exit(1); }
-    println!("build: block-driver (hw-probe) OK");
-
-    let status = std::process::Command::new("cargo")
-        .args(["build", "--release", "-p", "supervisor", "--target", "x86_64-unknown-none",
-               "--features", "supervisor/bare-metal,supervisor/blockprobe"])
-        .status().unwrap_or_else(|e| panic!("failed to run cargo build for supervisor: {}", e));
-    if !status.success() { eprintln!("build: supervisor (bare-metal,blockprobe) FAILED"); std::process::exit(1); }
-    println!("build: supervisor (bare-metal,blockprobe) OK");
-
-    let status = std::process::Command::new("cargo")
-        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
-        .status().expect("failed to run cargo build for kernel");
-    if !status.success() { eprintln!("build: kernel FAILED"); std::process::exit(1); }
-    println!("build: kernel OK");
-}
-
-/// Persistence Phase 1 (docs/persistence.md §10 step 1): boot with a disk on the
-/// ATA secondary channel, spawn `block-driver`, and verify it reads sector 0 via
-/// capability-mediated port I/O (the `hw_pio` grant) and logs the magic the host
-/// wrote there. Proves the PortRead/PortWrite syscalls + grant validation +
-/// SDK `Pio` + ATA PIO path end to end. Pure QEMU (default i440fx has legacy IDE).
-fn run_blockdev_test() {
-    println!("\n=== Persistence Phase 1: block-driver reads sector 0 via hw_pio ===");
-    cmd_build_blockdev();
-
-    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
-    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
-    let limine_dir = std::path::Path::new("tools/limine");
-    let image_path = disk_image::create(kernel_elf, limine_dir);
-    disk_image::install_bootloader(limine_dir, &image_path);
-
-    let _ = std::fs::create_dir_all("build/tests");
-    // Persistence disk: 16 MiB raw, formatted with a GodspeedOS superblock at LBA 0
-    // (osdev mkfs) so block-driver reads back its magic and fs can mount it.
-    let persist = "build/tests/persist.img";
-    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create persist.img");
-    format_superblock(persist);
-
-    let serial = "build/tests/blockdev_test_serial.log";
-    let _ = std::fs::remove_file(serial);
-    let img = std::fs::canonicalize(&image_path).unwrap_or_else(|_| image_path.to_path_buf());
-    let img_str = img.to_string_lossy().replace('\\', "/");
-    let persist_abs = std::fs::canonicalize(persist).unwrap_or_else(|_| std::path::PathBuf::from(persist));
-    let persist_str = persist_abs.to_string_lossy().replace('\\', "/");
-
-    let mut cmd = std::process::Command::new(qemu::qemu_binary());
-    cmd.args([
-        "-m", "512M", "-smp", "2",
-        // Boot disk on the primary channel (index 0 = primary master); the
-        // persistence disk on the secondary channel (index 2 = secondary master,
-        // ports 0x170-0x177), which is exactly block-driver's hw_pio grant.
-        "-drive", &format!("format=raw,file={img_str},if=ide,index=0"),
-        "-drive", &format!("format=raw,file={persist_str},if=ide,index=2"),
-        "-serial", &format!("file:{serial}"),
-        "-serial", "null",
-        "-display", "none", "-no-reboot", "-no-shutdown",
-    ]);
-    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("blockdev: failed to launch QEMU: {e}"); std::process::exit(1); });
-    println!("blockdev: booting (i440fx + IDE secondary disk), ~25s …");
-    std::thread::sleep(std::time::Duration::from_secs(25));
-    let _ = child.kill();
-    let _ = child.wait();
-
-    let log = std::fs::read_to_string(serial).unwrap_or_default();
-    let log = log.replace('\r', "");
-    let granted  = log.contains("spawn[pio]: 'block-driver' granted");
-    let started  = log.contains("block-driver: starting");
-    let read_ok  = log.contains("block-driver: sector 0 read OK");
-    let magic     = log.contains("GSFS0001");                    // superblock magic at LBA 0
-    let roundtrip = log.contains("write/read round-trip OK");    // step 2: write path
-    let fs_mounted = log.contains("fs: mounted");                // step 3: fs reads SB via IPC
-    // step 4: fs stores + retrieves a named file (entry table + extent + data blocks).
-    let fs_file = log.contains("fs: file round-trip OK")
-        || log.contains("fs: persisted file 'greeting' verified");
-    let no_panic  = !log.contains("KERNEL PANIC");
-
-    for l in log.lines().filter(|l| l.contains("block-driver") || l.contains("spawn[pio]") || l.contains("fs:")) {
-        println!("blockdev:   | {}", l.trim());
-    }
-    println!("blockdev:   kernel granted hw_pio ... {}", if granted { "yes" } else { "NO" });
-    println!("blockdev:   driver started ... {}", if started { "yes" } else { "NO" });
-    println!("blockdev:   sector 0 read OK + superblock magic ... {}", if read_ok && magic { "yes" } else { "NO" });
-    println!("blockdev:   write/read round-trip OK ... {}", if roundtrip { "yes" } else { "NO" });
-    println!("blockdev:   fs mounted (read SB via block-driver IPC) ... {}", if fs_mounted { "yes" } else { "NO" });
-    println!("blockdev:   fs file write/read round-trip ... {}", if fs_file { "yes" } else { "NO" });
-    println!("blockdev:   kernel did not panic ... {}", if no_panic { "yes" } else { "NO" });
-
-    let r1 = if granted && started && read_ok && magic && no_panic { "PASS" } else { "FAIL" };
-    let r2 = if roundtrip && no_panic { "PASS" } else { "FAIL" };
-    let r3 = if fs_mounted && no_panic { "PASS" } else { "FAIL" };
-    let r4 = if fs_file && no_panic { "PASS" } else { "FAIL" };
-    println!("\n  [P1.1]  block-driver reads sector 0 via hw_pio        … {r1}");
-    println!("  [P1.2]  block-driver write/read round-trip (ATA PIO)   … {r2}");
-    println!("  [P1.3]  fs mounts (superblock read over block IPC)     … {r3}");
-    println!("  [P1.4]  fs stores + retrieves a named file            … {r4}");
-    let passed = (r1 == "PASS") as u32 + (r2 == "PASS") as u32 + (r3 == "PASS") as u32 + (r4 == "PASS") as u32;
-    println!("\n  {passed} passed  {} failed", 4 - passed);
-    if passed != 4 {
-        std::process::exit(1);
-    }
-}
-
 /// Boot the blockdev image once with `persist` on the ATA secondary channel,
 /// capture the serial log, and return it. The persist disk is NOT recreated —
 /// the caller controls its lifecycle (key for the reboot-survival test).
@@ -1194,63 +1043,12 @@ fn boot_blockdev_qemu(img_str: &str, persist_str: &str, serial: &str, secs: u64)
     std::fs::read_to_string(serial).unwrap_or_default().replace('\r', "")
 }
 
-/// Persistence Phase 1 step 5 (docs/persistence.md §10): reboot survival. Format a
-/// disk once, boot (fs creates `greeting`), then **reboot on the SAME disk image
-/// without reformatting** — fs must read the persisted file back. The disk is a
-/// host file, so this is the real durability guarantee, not a proxy.
-fn run_blockdev_reboot_test() {
-    println!("\n=== Persistence Phase 1 step 5: reboot survival ===");
-    cmd_build_blockdev();
-
-    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
-    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
-    let limine_dir = std::path::Path::new("tools/limine");
-    let image_path = disk_image::create(kernel_elf, limine_dir);
-    disk_image::install_bootloader(limine_dir, &image_path);
-
-    let _ = std::fs::create_dir_all("build/tests");
-    // Format ONCE; the disk then persists across both boots untouched by the host.
-    let persist = "build/tests/persist_reboot.img";
-    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create persist disk");
-    format_superblock(persist);
-
-    let img = std::fs::canonicalize(&image_path).unwrap_or_else(|_| image_path.to_path_buf());
-    let img_str = img.to_string_lossy().replace('\\', "/");
-    let persist_abs = std::fs::canonicalize(persist).unwrap_or_else(|_| std::path::PathBuf::from(persist));
-    let persist_str = persist_abs.to_string_lossy().replace('\\', "/");
-
-    println!("blockdev: boot 1 — fs creates 'greeting', ~25s …");
-    let log1 = boot_blockdev_qemu(&img_str, &persist_str, "build/tests/blockdev_reboot_1.log", 25);
-    let created = log1.contains("fs: file round-trip OK (greeting)");
-    let panic1  = log1.contains("KERNEL PANIC");
-    println!("blockdev:   boot 1: fs created 'greeting' ... {}", if created { "yes" } else { "NO" });
-
-    // The persist disk is NOT touched here — only QEMU wrote to it in boot 1.
-    println!("blockdev: boot 2 — SAME disk, no reformat, fs must read it back, ~25s …");
-    let log2 = boot_blockdev_qemu(&img_str, &persist_str, "build/tests/blockdev_reboot_2.log", 25);
-    // Tail-match: the "fs:" prefix can be clobbered by a concurrent shell write on
-    // the shared serial (cosmetic interleaving); the line tail is interleave-safe.
-    let survived = log2.contains("verified across boot");
-    let panic2   = log2.contains("KERNEL PANIC");
-    for l in log2.lines().filter(|l| l.contains("fs:")) {
-        println!("blockdev:   boot2 | {}", l.trim());
-    }
-    println!("blockdev:   boot 2: 'greeting' survived the reboot ... {}", if survived { "yes" } else { "NO" });
-
-    if created && survived && !panic1 && !panic2 {
-        println!("\n  [P1.5]  fs reboot survival (write → reboot → read)    … PASS\n\n  1 passed  0 failed");
-    } else {
-        println!("\n  [P1.5]  fs reboot survival (write → reboot → read)    … FAIL\n\n  0 passed  1 failed");
-        std::process::exit(1);
-    }
-}
-
 /// Build the AHCI block-driver variant: block-driver with its `ahci` feature,
-/// supervisor spawns only it (blockprobe) — no fs yet (AHCI read/write WIP).
-fn cmd_build_blockdev_ahci() {
+/// supervisor spawns block-driver + fs (bare-metal,blockdev). AHCI by default.
+fn cmd_build_blockdev() {
     clean_supervisor();
-    let others = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "fs"];
-    for crate_name in &others {
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
+    for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"])
             .status()
@@ -1258,13 +1056,6 @@ fn cmd_build_blockdev_ahci() {
         if !status.success() { eprintln!("build: {} FAILED", crate_name); std::process::exit(1); }
         println!("build: {} OK", crate_name);
     }
-    let status = std::process::Command::new("cargo")
-        .args(["build", "--release", "-p", "block-driver", "--target", "x86_64-unknown-none",
-               "--features", "ahci"])
-        .status().unwrap_or_else(|e| panic!("failed to run cargo build for block-driver: {}", e));
-    if !status.success() { eprintln!("build: block-driver (ahci) FAILED"); std::process::exit(1); }
-    println!("build: block-driver (ahci) OK");
-
     // Spawn block-driver + fs (blockdev) so fs mounts the AHCI disk over IPC.
     let status = std::process::Command::new("cargo")
         .args(["build", "--release", "-p", "supervisor", "--target", "x86_64-unknown-none",
@@ -1285,9 +1076,9 @@ fn cmd_build_blockdev_ahci() {
 /// mirroring the T630, where the SSD is the only SATA disk and boot is elsewhere),
 /// and verify detection, IDENTIFY, and the full fs stack (mount + file round-trip)
 /// running over AHCI READ/WRITE DMA EXT.
-fn run_blockdev_ahci_test() {
+fn run_blockdev_test() {
     println!("\n=== AHCI steps A-D: detect + IDENTIFY + fs over AHCI ===");
-    cmd_build_blockdev_ahci();
+    cmd_build_blockdev();
 
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
     if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
@@ -1384,9 +1175,9 @@ fn boot_ahci_qemu(img_str: &str, persist_str: &str, serial: &str, secs: u64) -> 
 
 /// AHCI reboot survival: format once, boot (fs writes `greeting` over AHCI), then
 /// reboot on the SAME SATA disk image — fs must read it back over AHCI.
-fn run_blockdev_ahci_reboot_test() {
+fn run_blockdev_reboot_test() {
     println!("\n=== AHCI reboot survival (write → reboot → read, over SATA) ===");
-    cmd_build_blockdev_ahci();
+    cmd_build_blockdev();
 
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
     if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }

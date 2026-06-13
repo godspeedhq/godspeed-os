@@ -3093,23 +3093,6 @@ fn spawn_service_with_config(
         }
     };
 
-    // 6a-pio. Grant the block driver its ATA PIO port window (persistence, §12;
-    // docs/persistence.md §5). Name-gated like the MMIO BAR above: only
-    // `block-driver` may touch the secondary ATA channel — command block
-    // 0x170-0x177 plus the 0x376 control port. The PortRead/PortWrite syscalls
-    // validate every access against this grant (§3.1, no ambient authority).
-    // There is no DMA grant: a PIO driver never touches RAM, so it is
-    // least-privilege by construction (§5.1) — no IOMMU confinement needed.
-    if name == "block-driver" {
-        // Both legacy IDE channels — the disk driver owns the controller's command
-        // blocks: primary 0x1F0-0x1F7 + 0x3F6, secondary 0x170-0x177 + 0x376. The
-        // hardware probe reads both to find where a disk is exposed (§12).
-        const BLOCK_PIO_RANGES: &[(u16, u16)] =
-            &[(0x1F0, 8), (0x3F6, 1), (0x170, 8), (0x376, 1)];
-        crate::capability::hw_pio::set(task_slot, BLOCK_PIO_RANGES);
-        crate::kprintln!("spawn[pio]: 'block-driver' granted ATA primary+secondary command blocks");
-    }
-
     // 6b. Allocate + map a physically-contiguous DMA arena for the xHCI driver
     // (§12). The controller DMAs into this memory (rings/contexts), so the driver
     // needs both the VA (to build structures) and the physical base (to program
@@ -3170,6 +3153,13 @@ fn spawn_service_with_config(
                     if CONFINE_USB_DRIVERS && name == "xhci" {
                         crate::arch::x86_64::iommu::confine_device(
                             pci::XHCI_BDF.load(Relaxed), phys, len);
+                    } else if name == "block-driver" && pci::AHCI_FOUND.load(Relaxed) {
+                        // AHCI is DMA-capable; confine it to its arena (H1/§6.4). All
+                        // its DMA (command list / FIS / command table / PRDT / data
+                        // buffer) lives in this arena, so confinement is exact. No-op
+                        // if no IOMMU (block-driver then stays trust-critical, §6.4).
+                        crate::arch::x86_64::iommu::confine_device(
+                            pci::AHCI_BDF.load(Relaxed), phys, len);
                     } else {
                         crate::kprintln!(
                             "spawn[dma]: '{}' left in IOMMU passthrough (CONFINE_USB_DRIVERS={})",

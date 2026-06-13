@@ -10,7 +10,6 @@ pub mod dma;
 pub mod hid;
 pub mod ipc;
 pub mod mmio;
-pub mod pio;
 pub mod service_context;
 pub(crate) mod syscall;
 
@@ -18,7 +17,6 @@ pub use capability::{CapHandle, CapError};
 pub use dma::Dma;
 pub use ipc::{Message, IpcError};
 pub use mmio::Mmio;
-pub use pio::Pio;
 pub use service_context::{ServiceContext, TaskStat, CapInfo, Datetime};
 pub use service_context::{
     REGISTRY_OP_REGISTER, REGISTRY_OP_LOOKUP, REGISTRY_FOUND, REGISTRY_NOT_FOUND,

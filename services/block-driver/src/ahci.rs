@@ -335,6 +335,18 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
         Err(e) => ctx.log_fmt(format_args!("block-driver: AHCI IDENTIFY FAILED: {}", e)),
     }
 
+    // Boot self-test: read sector 0 (proves the AHCI read/DMA path on this disk —
+    // the key thing to confirm on real hardware). Non-destructive; write is proven
+    // by the fs file round-trip (and by `drives flash` later on hardware).
+    let mut s0 = [0u8; 512];
+    match ahci.read_block(0, &mut s0) {
+        Ok(()) => ctx.log_fmt(format_args!(
+            "block-driver: AHCI read self-test OK — sector 0 [{:02x} {:02x} {:02x} {:02x} …]",
+            s0[0], s0[1], s0[2], s0[3]
+        )),
+        Err(e) => ctx.log_fmt(format_args!("block-driver: AHCI read self-test FAILED: {}", e)),
+    }
+
     // Serve block read/write requests from `fs` over IPC (READ/WRITE DMA EXT).
     ctx.log("block-driver: AHCI serving block I/O");
     loop {

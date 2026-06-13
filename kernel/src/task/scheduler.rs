@@ -253,10 +253,6 @@ pub fn reserve_task_slot(core_id: u32) -> Option<usize> {
             if !TASK_VALID[i].load(Ordering::Relaxed) {
                 TASK_VALID[i].store(true, Ordering::Release);
                 TASK_CORE[i]  = core_id;
-                // Clear any hw_pio grant from a previous occupant of this slot so a
-                // new task never inherits a dead driver's port authority (§3.1).
-                // State + unsafe live in the capability layer (§18.5); safe call.
-                crate::capability::hw_pio::clear(i);
                 found = Some(i);
                 break;
             }

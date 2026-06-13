@@ -62,8 +62,14 @@ once read/write/fs/reboot are verified on it. Test: `osdev test blockdev-ahci`.
   file round-trip works over AHCI (`fs: file round-trip OK`). The whole filesystem
   stack now runs on AHCI. Harness: boot on legacy IDE, the persist disk ALONE on
   `ich9-ahci` (→ port 0), mirroring the T630 (SSD is the only SATA disk).
-- **Step E — confine.** Bring AHCI under IOMMU confinement (§6.4) once its DMA is
-  fully arena-resident; then make `ahci` the default backend.
+- **Step E — confine + promote. ✅ done.** AHCI is now the **only** backend (the
+  `ahci` cargo feature is gone; ATA PIO + the `hw_pio` capability + the IDE probe are
+  retired — the T630's SSD is AHCI-only). block-driver is **IOMMU-confined** to its
+  arena at spawn when an IOMMU is present (H1/§6.4) — exact, because all its DMA
+  (command list / FIS / command table / PRDT / data buffer) is arena-resident; a no-op
+  on a machine without an IOMMU (block-driver then stays trust-critical, §6.4).
+  Verified: `osdev test blockdev` 3/3 + identity 23/23; unsafe audit back to 413/27
+  (the `hw_pio` arch wrappers + `capability/hw_pio.rs` + SDK `pio.rs` removed).
 
 ## 5. Register cheat-sheet
 

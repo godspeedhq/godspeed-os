@@ -19,9 +19,6 @@ bare-metal = []
 # Phase 1). Combined with `bare-metal` by `osdev test blockdev`, which attaches a
 # disk on the ATA secondary channel; block-driver reads sector 0 and logs it.
 blockdev = []
-# Read-only hardware probe: spawn ONLY block-driver (built with its hw-probe feature),
-# no fs. Used by `osdev image --mode blockprobe` to discover the T630's disk layout.
-blockprobe = []
 identity-only = []
 # Spawn only the regular performance-benchmark probe services (perf-b1…perf-b10
 # and their echo/victim partners).  Used by `osdev test perf` to eliminate the

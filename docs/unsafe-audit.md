@@ -136,12 +136,11 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | arch/x86_64/fb.rs | 3 | permitted |
 | arch/x86_64/interrupts.rs | 13 | permitted |
 | arch/x86_64/iommu.rs | 74 | permitted |
-| arch/x86_64/mod.rs | 38 | permitted |
+| arch/x86_64/mod.rs | 34 | permitted |
 | arch/x86_64/page_tables.rs | 35 | permitted |
 | arch/x86_64/pci.rs | 15 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |
 | arch/x86_64/syscall_entry.rs | 13 | permitted |
-| capability/hw_pio.rs | 3 | permitted |
 | capability/table.rs | 7 | permitted |
 | memory/allocator.rs | 32 | permitted |
 | memory/frame.rs | 1 | permitted |
@@ -160,9 +159,16 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | task/scheduler.rs | 37 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 367 lines across 22 files  
+**Permitted total:** 360 lines across 21 files  
 **Grandfathered total:** 53 lines across 6 files  
-**Grand total:** 420 lines across 28 files
+**Grand total:** 413 lines across 27 files
+
+> **2026-06-13** (branch `feat/persistence`). **ATA PIO / `hw_pio` retired** — the
+> AHCI (MMIO+DMA) backend replaced ATA PIO (the T630's SSD is AHCI-only). Reverts the
+> 2026-06-12 addition below: `arch/x86_64/mod.rs` 38 → 34 (the `port_in8/16`,
+> `port_out8/16` wrappers removed; `inb`/`outb` stay — used by serial + reboot), and
+> `capability/hw_pio.rs` deleted (−3). Back to 413/27. The `PortRead`/`PortWrite`
+> syscalls and the SDK `pio.rs` (not kernel-audited) are gone too.
 
 > **2026-06-12** (branch `feat/persistence`). Persistence Phase 1 (ATA PIO block
 > driver, docs/persistence.md §5). `arch/x86_64/mod.rs` +4 (permitted): safe
