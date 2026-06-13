@@ -1,8 +1,8 @@
 # Utility: `read` — print a file's contents
 
-**Status:** Design — built in the file-commands step (step 4) on hierarchical GSFS
-(`docs/persistence.md`). Read-only; works on Phase-2 GSFS. Trails `CLAUDE.md`; does not
-amend it.
+**Status:** **Built + QEMU-verified** (`osdev test files` 11/11) — a shell built-in over
+the `fs` READ_FILE API, on hierarchical GSFS (`docs/persistence.md`). Read-only. Trails
+`CLAUDE.md`; does not amend it.
 
 ---
 
@@ -50,4 +50,6 @@ Read-only, so a **shell built-in** sending `ReadFile` to `fs` over a narrow
 
 ## 6. Conformance
 
-Built spec-first against `0_conventions.md`: implements its own `read help` / `read version`.
+Like the other simple shell built-ins, `read` is listed in the shell's top-level `help`
+but does **not** yet implement its own `read help` / `read version` — the shared future
+work in `0_conventions.md` §3.

@@ -1,8 +1,8 @@
 # Utility: `mkdir` — create a directory
 
-**Status:** Design — built in the file-commands step (step 4) on hierarchical GSFS
-(`docs/persistence.md`). Mutating; works on Phase-2 GSFS. Trails `CLAUDE.md`; does not
-amend it.
+**Status:** **Built + QEMU-verified** (`osdev test files` 11/11) — a shell built-in over
+the `fs` MKDIR API, on hierarchical GSFS (`docs/persistence.md`). Mutating. Trails
+`CLAUDE.md`; does not amend it.
 
 ---
 
@@ -45,4 +45,6 @@ holds the disk authority (`Mkdir`, op 13) and enforces.
 
 ## 6. Conformance
 
-Built spec-first against `0_conventions.md`: implements its own `mkdir help` / `mkdir version`.
+Like the other simple shell built-ins, `mkdir` is listed in the shell's top-level `help`
+but does **not** yet implement its own `mkdir help` / `mkdir version` — the shared future
+work in `0_conventions.md` §3.

@@ -6,13 +6,23 @@ use godspeed_sdk::{ServiceContext, CapInfo, Message};
 const MAX_LINE: usize = 128;
 const MAX_ARGS: usize = 4;
 
-// drives API (shell <-> fs). MUST match `services/fs`.
+// fs API (shell <-> fs). MUST match `services/fs`.
+//   File ops:   [op, path_len:u8, path[path_len], (WriteFile: data)]
+const OP_WRITE_FILE: u8 = 10;
+const OP_READ_FILE: u8 = 11;
+const OP_STAT_FILE: u8 = 12;
+const OP_MKDIR: u8 = 13;
+const OP_LIST_DIR: u8 = 14;
+// drives ops:
 const OP_DRIVES_INFO: u8 = 20;
 const OP_FLASH: u8 = 21;
 const OP_LABEL: u8 = 22;
 const OP_RESET: u8 = 23;
 const FS_OK: u8 = 0;
+const FS_NOTFOUND: u8 = 2;
+const FS_NOFS: u8 = 3;
 const LABEL_MAX: usize = 31;
+const PATH_MAX: usize = 120; // fits in MAX_LINE; path_len is u8
 const DRIVES_VERSION: &str = "drives 0.1.0";
 
 // Entry point called by the kernel after spawning this service.
@@ -42,6 +52,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     let mut line_buf = [0u8; MAX_LINE];
     let mut line_len = 0usize;
+    // Current location on the (single) drive: the directory bare/relative paths target,
+    // moved by `cd` (utilities/17_cd.md). Session state; resets to "/" each boot.
+    let mut cwd = Cwd::root();
 
     loop {
         let b = ctx.console_read();
@@ -49,7 +62,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         match b {
             b'\r' | b'\n' => {
                 if line_len > 0 {
-                    execute(&ctx, &line_buf[..line_len]);
+                    execute(&ctx, &line_buf[..line_len], &mut cwd);
                     line_len = 0;
                 }
                 ctx.console_write("gs> ");
@@ -99,7 +112,7 @@ fn wait_for_input_ready(ctx: &ServiceContext) {
     }
 }
 
-fn execute(ctx: &ServiceContext, line: &[u8]) {
+fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
     let Ok(s) = core::str::from_utf8(line) else {
         ctx.console_writeln("shell: invalid input");
         return;
@@ -164,6 +177,17 @@ fn execute(ctx: &ServiceContext, line: &[u8]) {
         }
         "reboot"  => cmd_reboot(ctx),
         "drives"  => cmd_drives(ctx, &args, argc),
+        "ls"      => cmd_ls(ctx, cwd, if argc >= 2 { args[1] } else { "" }),
+        "read"    => {
+            if argc < 2 { ctx.console_writeln("usage: read <path>"); }
+            else { cmd_read(ctx, cwd, args[1]); }
+        }
+        "write"   => cmd_write(ctx, cwd, s["write".len()..].trim()),
+        "mkdir"   => {
+            if argc < 2 { ctx.console_writeln("usage: mkdir <path>"); }
+            else { cmd_mkdir(ctx, cwd, args[1]); }
+        }
+        "cd"      => cmd_cd(ctx, cwd, if argc >= 2 { args[1] } else { "/" }),
         other => {
             // Build "unknown: <cmd>" in a stack buffer to avoid two ctx.log calls
             let mut buf = [0u8; 64];
@@ -198,7 +222,12 @@ fn cmd_help(ctx: &ServiceContext) {
     help_line(ctx, "restart <name> [core]", "restart a service");
     ctx.console_writeln("");
     ctx.console_writeln("Storage");
-    help_line(ctx, "drives [flash|label]", "manage attached disks (drives help)");
+    help_line(ctx, "drives [flash|label|reset]", "manage attached disks (drives help)");
+    help_line(ctx, "ls [path]", "list a directory");
+    help_line(ctx, "cd [path]", "change current directory");
+    help_line(ctx, "read <path>", "print a file");
+    help_line(ctx, "write <path> [text]", "create/overwrite a file");
+    help_line(ctx, "mkdir <path>", "create a directory");
     ctx.console_writeln("");
     ctx.console_writeln("Power");
     help_line(ctx, "reboot", "hardware reset");
@@ -593,6 +622,241 @@ fn cmd_restart(ctx: &ServiceContext, name: &str, core: Option<u32>) {
         Ok(()) => report(ctx, "restarted: ", name),
         Err(_) => report(ctx, "restart failed: ", name),
     }
+}
+
+// ---------------------------------------------------------------------------
+// File commands — ls / read / write / mkdir / cd (utilities/16..20). Shell built-ins
+// that send the fs file API to `fs` over IPC; `fs` holds + enforces all disk authority.
+// The shell tracks the current location (a drive+directory pointer) and resolves
+// relative / `.` / `..` paths to an absolute path before sending — fs only walks
+// absolute paths from root (it has no notion of "current directory").
+// ---------------------------------------------------------------------------
+
+/// The current directory on the (single) drive — an absolute path like "/" or "/etc".
+struct Cwd {
+    buf: [u8; PATH_MAX],
+    len: usize,
+}
+
+impl Cwd {
+    fn root() -> Self {
+        let mut buf = [0u8; PATH_MAX];
+        buf[0] = b'/';
+        Cwd { buf, len: 1 }
+    }
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("/")
+    }
+    fn set(&mut self, path: &[u8]) {
+        let n = path.len().min(PATH_MAX);
+        self.buf[..n].copy_from_slice(&path[..n]);
+        self.len = n.max(1);
+        if self.len == 0 { self.buf[0] = b'/'; self.len = 1; }
+    }
+}
+
+/// Resolve `input` against the current directory `cwd` into a normalized absolute path
+/// in `out`. Handles absolute (`/a`), relative (`a/b`), `.` and `..`. Returns the length,
+/// or None if it would overflow `out`.
+fn resolve_path(cwd: &str, input: &str, out: &mut [u8; PATH_MAX]) -> Option<usize> {
+    out[0] = b'/';
+    let mut len = 1usize;
+    // Seed with the current directory unless the input is absolute.
+    if !input.starts_with('/') {
+        for comp in cwd.split('/').filter(|c| !c.is_empty()) {
+            push_comp(out, &mut len, comp)?;
+        }
+    }
+    for comp in input.split('/').filter(|c| !c.is_empty()) {
+        match comp {
+            "." => {}
+            ".." => pop_comp(out, &mut len),
+            _ => push_comp(out, &mut len, comp)?,
+        }
+    }
+    Some(len)
+}
+
+/// Append a path component, inserting a '/' separator unless `out` already ends with one.
+fn push_comp(out: &mut [u8; PATH_MAX], len: &mut usize, comp: &str) -> Option<()> {
+    let cb = comp.as_bytes();
+    let need = if out[*len - 1] == b'/' { cb.len() } else { cb.len() + 1 };
+    if *len + need > PATH_MAX { return None; }
+    if out[*len - 1] != b'/' { out[*len] = b'/'; *len += 1; }
+    out[*len..*len + cb.len()].copy_from_slice(cb);
+    *len += cb.len();
+    Some(())
+}
+
+/// Remove the last path component (the `..` case), never going above root "/".
+fn pop_comp(out: &mut [u8; PATH_MAX], len: &mut usize) {
+    // Find the last '/' in out[..len]; truncate there (or to root).
+    let mut i = *len;
+    while i > 1 {
+        i -= 1;
+        if out[i] == b'/' { *len = i.max(1); return; }
+    }
+    *len = 1; // back to root
+}
+
+/// Resolve `input` against `cwd`; on overflow print an error and return None.
+fn resolve_or_err<'a>(ctx: &ServiceContext, cwd: &Cwd, input: &str, out: &'a mut [u8; PATH_MAX]) -> Option<&'a [u8]> {
+    match resolve_path(cwd.as_str(), input, out) {
+        Some(n) => Some(&out[..n]),
+        None => { ctx.console_writeln("path too long"); None }
+    }
+}
+
+/// Send an fs file-API request `[op, path_len, path, data]` and return the reply.
+fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<Message> {
+    let pl = path.len().min(255);
+    let mut req = [0u8; 4096];
+    req[0] = op;
+    req[1] = pl as u8;
+    req[2..2 + pl].copy_from_slice(&path[..pl]);
+    let dn = data.len().min(req.len() - 2 - pl);
+    req[2 + pl..2 + pl + dn].copy_from_slice(&data[..dn]);
+    ctx.request_with_reply("fs", &Message::from_bytes(&req[..2 + pl + dn]))
+}
+
+/// True if `fs` replied "no filesystem" — print the standard hint and consume it.
+fn no_fs(ctx: &ServiceContext, p: &[u8]) -> bool {
+    if p.first() == Some(&FS_NOFS) {
+        ctx.console_writeln("no filesystem — run 'drives flash' first");
+        true
+    } else {
+        false
+    }
+}
+
+/// `ls [path]` — list a directory.
+fn cmd_ls(ctx: &ServiceContext, cwd: &Cwd, arg: &str) {
+    let mut buf = [0u8; PATH_MAX];
+    let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return };
+    let reply = match fs_request(ctx, OP_LIST_DIR, path, &[]) {
+        Some(r) => r,
+        None => { ctx.console_writeln("ls: storage unavailable"); return; }
+    };
+    let p = reply.payload_bytes();
+    if no_fs(ctx, p) { return; }
+    if p.first() == Some(&FS_NOTFOUND) || p.len() < 2 {
+        ctx.console_writeln_fmt(format_args!("ls: not a directory: {}", str_of(path)));
+        return;
+    }
+    let count = p[1] as usize;
+    ctx.console_writeln_fmt(format_args!("{}  ({} entries)", str_of(path), count));
+    let mut i = 2usize;
+    for _ in 0..count {
+        if i >= p.len() { break; }
+        let nl = p[i] as usize;
+        i += 1;
+        if i + nl + 1 > p.len() { break; }
+        let name = core::str::from_utf8(&p[i..i + nl]).unwrap_or("?");
+        let is_dir = p[i + nl] != 0;
+        i += nl + 1;
+        ctx.console_writeln_fmt(format_args!("  {:<20}  {}", name, if is_dir { "dir" } else { "file" }));
+    }
+    if count == 0 { ctx.console_writeln("  (empty)"); }
+}
+
+/// `read <path>` — print a file's contents.
+fn cmd_read(ctx: &ServiceContext, cwd: &Cwd, arg: &str) {
+    let mut buf = [0u8; PATH_MAX];
+    let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return };
+    let reply = match fs_request(ctx, OP_READ_FILE, path, &[]) {
+        Some(r) => r,
+        None => { ctx.console_writeln("read: storage unavailable"); return; }
+    };
+    let p = reply.payload_bytes();
+    if no_fs(ctx, p) { return; }
+    if p.first() == Some(&FS_OK) && p.len() >= 5 {
+        let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
+        let end = (5 + n).min(p.len());
+        ctx.console_write(core::str::from_utf8(&p[5..end]).unwrap_or(""));
+        if end == 0 || p[end - 1] != b'\n' { ctx.console_writeln(""); }
+    } else {
+        ctx.console_writeln_fmt(format_args!("read: not found: {}", str_of(path)));
+    }
+}
+
+/// `write <path> [content]` — create/overwrite a file with the rest of the line.
+fn cmd_write(ctx: &ServiceContext, cwd: &Cwd, rest: &str) {
+    if rest.is_empty() {
+        ctx.console_writeln("usage: write <path> [content]");
+        return;
+    }
+    // Split off the first token (path); the remainder (with spaces) is the content.
+    let (pstr, content) = match rest.split_once(char::is_whitespace) {
+        Some((p, c)) => (p, c.trim_start()),
+        None => (rest, ""),
+    };
+    let mut buf = [0u8; PATH_MAX];
+    let path = match resolve_or_err(ctx, cwd, pstr, &mut buf) { Some(p) => p, None => return };
+    // Copy the path out before reusing buffers (path borrows `buf`).
+    let mut pbuf = [0u8; PATH_MAX];
+    let pl = path.len();
+    pbuf[..pl].copy_from_slice(path);
+    let reply = match fs_request(ctx, OP_WRITE_FILE, &pbuf[..pl], content.as_bytes()) {
+        Some(r) => r,
+        None => { ctx.console_writeln("write: storage unavailable"); return; }
+    };
+    let p = reply.payload_bytes();
+    if no_fs(ctx, p) { return; }
+    if p.first() == Some(&FS_OK) {
+        ctx.console_writeln_fmt(format_args!("wrote {} ({} bytes)", str_of(&pbuf[..pl]), content.len()));
+    } else {
+        ctx.console_writeln("write: failed (bad path, or parent missing?)");
+    }
+}
+
+/// `mkdir <path>` — create a directory.
+fn cmd_mkdir(ctx: &ServiceContext, cwd: &Cwd, arg: &str) {
+    let mut buf = [0u8; PATH_MAX];
+    let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return };
+    let reply = match fs_request(ctx, OP_MKDIR, path, &[]) {
+        Some(r) => r,
+        None => { ctx.console_writeln("mkdir: storage unavailable"); return; }
+    };
+    let p = reply.payload_bytes();
+    if no_fs(ctx, p) { return; }
+    if p.first() == Some(&FS_OK) {
+        ctx.console_writeln_fmt(format_args!("created {}", str_of(path)));
+    } else {
+        ctx.console_writeln("mkdir: failed (already exists, or parent missing?)");
+    }
+}
+
+/// `cd [path]` — change the current directory (validates it exists + is a directory).
+fn cmd_cd(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str) {
+    let mut buf = [0u8; PATH_MAX];
+    let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return };
+    // Root always exists — no need to stat it.
+    if path == b"/" {
+        cwd.set(b"/");
+        ctx.console_writeln("/");
+        return;
+    }
+    let reply = match fs_request(ctx, OP_STAT_FILE, path, &[]) {
+        Some(r) => r,
+        None => { ctx.console_writeln("cd: storage unavailable"); return; }
+    };
+    let p = reply.payload_bytes();
+    if no_fs(ctx, p) { return; }
+    // STAT reply: [FS_OK, exists, size:u64, is_dir].
+    if p.first() == Some(&FS_OK) && p.len() >= 11 && p[1] == 1 {
+        if p[10] == 1 {
+            cwd.set(path);
+            ctx.console_writeln(cwd.as_str());
+        } else {
+            ctx.console_writeln_fmt(format_args!("cd: not a directory: {}", str_of(path)));
+        }
+    } else {
+        ctx.console_writeln_fmt(format_args!("cd: no such directory: {}", str_of(path)));
+    }
+}
+
+fn str_of(b: &[u8]) -> &str {
+    core::str::from_utf8(b).unwrap_or("?")
 }
 
 // ---------------------------------------------------------------------------

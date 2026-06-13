@@ -1,8 +1,9 @@
 # Utility: `write` — create or overwrite a file
 
-**Status:** Design — built in the file-commands step (step 4) on hierarchical GSFS
-(`docs/persistence.md`). Mutating; works on Phase-2 GSFS (overwrite leaks the old extent
-until the reclamation phase — a stated carry-over). Trails `CLAUDE.md`; does not amend it.
+**Status:** **Built + QEMU-verified** (`osdev test files` 11/11) — a shell built-in over
+the `fs` WRITE_FILE API, on hierarchical GSFS (`docs/persistence.md`). Mutating; inline
+content (`write <path> <text>`) — overwrite still leaks the old extent until the
+reclamation phase (a stated carry-over). Trails `CLAUDE.md`; does not amend it.
 
 ---
 
@@ -58,4 +59,6 @@ enforces; with file-as-capability (`docs/persistence.md` §7) `write` presents a
 
 ## 6. Conformance
 
-Built spec-first against `0_conventions.md`: implements its own `write help` / `write version`.
+Like the other simple shell built-ins, `write` is listed in the shell's top-level `help`
+but does **not** yet implement its own `write help` / `write version` — the shared future
+work in `0_conventions.md` §3.
