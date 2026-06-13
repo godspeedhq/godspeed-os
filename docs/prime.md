@@ -396,27 +396,31 @@ transaction, flush, close — so there is **no journal replay and no partial-wri
 at all. That gap is real, and wider today because GSFS Phase 1 has no journal (§6.3), so a
 clean flush is the difference between "consistent on disk" and "trusting recovery."
 
-So GodspeedOS **will** support lifecycle notifications — but **not as POSIX signals.** POSIX
-signals are async interrupts (they hijack the program, run a handler → re-entrancy hazards,
-ambient authority). The GodspeedOS-native form is the inverse, and it reuses the one
-primitive the whole OS is built on — **IPC**:
+So GodspeedOS **will** support lifecycle notifications — but as a **subscribe-and-forget
+courtesy broadcast, not POSIX signals.** POSIX signals are async interrupts (they hijack
+the program, run a handler → re-entrancy hazards, ambient authority); worse, they invite a
+"send signal, *wait* for everyone to wind down" handshake. This is the opposite of both:
 
-- **A message on the app's endpoint** (e.g. `PrepareToStop { deadline }`), handled in its
-  *normal recv loop* — synchronous, when the app is ready; no async handler, no re-entrancy.
-- **Capability-gated / opt-in** — an app receives lifecycle events only if it holds the cap
-  (declared in its contract). Apps that don't care never see them and pay nothing. No
-  ambient "anyone can signal you."
-- **Bounded** — the OS gives a *deadline*, then proceeds with the reboot regardless. No app
-  can veto or stall an update by sitting on the signal (§8.9, §26.6); the supervisor's
-  watchdog is the backstop.
-- **Optimization-only** — correctness *never* depends on it. Miss it (unplanned panic, or
-  just ignore it) and the app still recovers from its last checkpoint. It sits *on top of*
-  "assume failure"; it never replaces it.
+- **Pure information — it doesn't *do* anything.** The signal is "FYI, I'm going down," not
+  a command and not a request for permission. It triggers no OS behavior and cannot veto,
+  stall, or delay the reboot.
+- **The OS does not wait.** It *publishes* the event and **proceeds immediately on its own
+  schedule** — no deadline, no acknowledgment, no negotiation. It is going to do what it is
+  going to do. (So there is *nothing to coordinate* and nothing that can stall an update —
+  the whole deadline/ack/watchdog apparatus simply doesn't exist.)
+- **Subscribe / opt-in, capability-gated.** An app receives lifecycle events only if it
+  subscribed (holds the cap, declared in its contract). Apps that don't care never see them
+  and pay nothing. No ambient "anyone can signal you."
+- **A message on the app's endpoint**, handled in its *normal recv loop* — synchronous,
+  when the app is ready; no async handler, no re-entrancy.
+- **Zero guarantees — strictly best-effort.** A responsive app *might* catch it and flush;
+  a mid-operation one might not. It does not even promise a *window*. So "assume failure"
+  stays the floor entirely; this is courtesy laid on top, never relied on for correctness.
 
-So it is almost the opposite of POSIX signals in mechanism: *"an event you handle when
-you're ready,"* not *"an interrupt that hijacks you."* And it is barely new machinery — a
-**convention** (a lifecycle message kind + a deadline) plus a **cap to opt in**, over
-existing IPC. No new subsystem.
+So it is almost the inverse of POSIX signals: *"an event you handle if you happen to catch
+it,"* not *"an interrupt that hijacks you and a handshake that waits for you."* And it is
+barely any new machinery — a **convention** (a lifecycle message kind) plus a **cap to
+subscribe**, over existing IPC. No new subsystem, no coordination, no waiting.
 
 **Timing (§26.2):** the *decision* is recorded here; the *code* is built when a real
 stateful app pulls it into existence (there is no database on GodspeedOS today). Recording
