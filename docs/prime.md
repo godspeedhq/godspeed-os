@@ -320,16 +320,17 @@ execution, all gone together.
 
 ### 11.2 But the apps step off, the floor is replaced, they step back on
 
-GodspeedOS turns that reboot into something that *feels* seamless, using the exact
-discipline that makes services restartable, scaled up. A planned update is a
-**checkpoint → reboot → reconstruct**:
+The foundation is **"apps assume failure"** (§14.3, §26.7): every app already recovers
+from *any* failure, *anytime*, from its last persisted checkpoint — no warning relied
+upon. So a Prime swap is, to an app, **just another failure it already knows how to
+survive.** Recovery needs no special handshake — it is the ordinary restart path:
 
 ```text
-  1. signal running services: "system updating — persist your state"
-  2. services flush their state to GSFS         (the world survives on disk, §15)
-  3. reboot into the new kernel                 (A/B slot, rollback if bad, §8)
-  4. new kernel boots → supervisor RESPAWNS the services (from the GSFS world, §5)
-        → each service RECONSTRUCTS its state from GSFS → carries on
+  1. reboot into the new kernel                 (A/B slot, rollback if bad, §8)
+  2. new kernel boots → supervisor RESPAWNS the services (per the manifest/contracts,
+        §14.1; or from the GSFS world, §5) → kernel RE-MINTS each cap per the contract
+  3. each service RECONSTRUCTS its state from GSFS (§15) and RE-ACQUIRES any runtime
+        caps via the registry (§14.2) → carries on
 ```
 
 The apps do **not** survive in memory across the swap. What crosses the seam is
@@ -338,6 +339,25 @@ execution — it *respawns* the apps and they *reconstruct*. That is
 **restart-with-reconstruction (§2.5) at the whole-system level** — the constitution's
 stance (*live code update rejected; restart is sufficient*) with the kernel as its
 ultimate case, not an exception.
+
+> **No kernel grant-snapshot is needed (or wanted).** The grant *topology* —
+> who-holds-what authority — is already captured **declaratively in the contracts**
+> (§13); the supervisor respawns and the kernel re-mints per contract on boot. Caps
+> can't be "restored" anyway — they are generationed (`ResourceId + Rights +
+> Generation`) and bound to specific resource instances that are recreated fresh on
+> reboot, so old caps are stale by definition; authority is **re-minted**, not
+> restored. Runtime-delegated caps (not in any contract) are re-established by the
+> delegating app's recovery logic — or by the supervisor persisting its own running-set
+> (its §15 state). A kernel that snapshotted live grants would duplicate the contracts
+> opaquely (§26.4/§26.5) — exactly the hidden magic the constitution forbids.
+
+> **The "prepare to checkpoint" signal is optional gravy, not a required step.** Because
+> apps assume failure, correctness never depends on a warning. An optional "system is
+> updating" notification can let a *stateful* app (e.g. a database) commit cleanly and
+> lose a little less work on a *planned* update — but an app that ignores it still
+> recovers fine from its last checkpoint. So it is built only when a stateful app pulls
+> it into existence (§26.2); it never changes the failure model, it just makes a planned
+> failure tidier than a crash.
 
 ### 11.3 Who survives — one consistent rule
 
