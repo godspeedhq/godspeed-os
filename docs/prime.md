@@ -53,6 +53,54 @@ A drive GodspeedOS can **boot from** has two regions:
 A **data-only drive** has just a GSFS region (no boot region). A **bootable
 GodspeedOS drive** has both.
 
+### 2.1 At a glance
+
+A bootable Prime drive — note the **two interchangeable kernel slots** (A/B, §8) in
+the boot region:
+
+```text
+╔══════════════════════════════════════════════════════════════════════╗
+║              A bootable GodspeedOS Prime drive  (GPT)                ║
+╠══════════════════════════════════════════════════════════════════════╣
+║  BOOT REGION ── ESP (FAT) ── the firmware boots THIS                 ║
+║  ┌────────────────────────────────────────────────────────────────┐  ║
+║  │  Limine  +  limine.conf   (default ─▶ active slot)             │  ║
+║  │    ▸ slot A : kernel_a.elf      ● ACTIVE    (running now)       │  ║
+║  │    ▸ slot B : kernel_b.elf      ○ inactive  (fallback / target)│  ║
+║  └────────────────────────────────────────────────────────────────┘  ║
+║        = PRIME = mechanism (kernel + TCB + drives/shell/storage)     ║
+╠══════════════════════════════════════════════════════════════════════╣
+║  GSFS REGION ── your WORLD = content                                 ║
+║  ┌────────────────────────────────────────────────────────────────┐  ║
+║  │  /services   /state   /config   /data  …                       │  ║
+║  │  label:"ssd"      DEFAULT ✓     (identity + auto-mount)         │  ║
+║  └────────────────────────────────────────────────────────────────┘  ║
+╚══════════════════════════════════════════════════════════════════════╝
+   Prime travels; the World travels on top of it; the machine is fungible.
+```
+
+Deployment & propagation — install once, then never re-flash:
+
+```text
+   [ USB stick : Prime ]
+          │ boot
+          ▼
+   GodspeedOS running ─────────────────────────────────────────────────┐
+          │                                                             │
+          │  drives install 0   (stamp self-carried image → GPT+ESP+GSFS)
+          ▼                                                             │
+   [ Internal SSD : Prime A/B ] ──boot, no USB──▶ GodspeedOS            │
+          │                                          │                  │
+          │  drives update 0                         │  drives install 1
+          │  (new kernel → inactive slot → reboot)   ▼                  │
+          ▼                                  [ Spare drive : Prime ]    │
+     runs NEW kernel                            unplug → carry →        │
+     (old slot = rollback)                      boot on ANY machine ────┘
+```
+
+Legend: `●` active · `○` inactive · `install` = whole-drive raw stamp (no FAT) ·
+`update` = in-place A/B slot swap (minimal FAT write).
+
 ## 3. Three verbs: `flash`, `install`, `update`
 
 The distinction the whole model rests on:
@@ -177,6 +225,20 @@ constitution's **§16 update model applied to the whole kernel** instead of one 
 - **Reboot auto-selects the new slot.** If it fails, you fall back to the old.
 - Verbs: `install` makes a *new* bootable drive (full GPT + ESP + GSFS); `update` swaps
   the inactive A/B kernel slot *in place* on an existing Prime.
+
+```text
+  drives update 0
+  (1) running          (2) write inactive      (3) flip default       (4) reboot
+  ┌──────────────┐     ┌──────────────────┐    ┌────────────────┐    ┌──────────────┐
+  │ A ● active   │     │ A ● active (safe)│    │ A ○            │    │ A ○ fallback │
+  │ B ○ old      │ ──▶ │ B ◀ NEW kernel   │──▶ │ B ◀ default    │──▶ │ B ● active   │
+  └──────────────┘     └──────────────────┘    └────────────────┘    └──────────────┘
+       old build           A untouched            atomic flip            NEW kernel
+                          (can't brick)        (edit limine.conf)            │
+                                                                             │
+     new kernel bad / hangs?  ──reboot──▶ Limine menu picks A  ◀─────────────┘
+                                          ( = rollback, old kernel back )
+```
 
 ### 8.2 The honest cost: flipping the slot needs to touch the boot region
 
