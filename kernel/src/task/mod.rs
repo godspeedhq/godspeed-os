@@ -3153,14 +3153,14 @@ fn spawn_service_with_config(
                     if CONFINE_USB_DRIVERS && name == "xhci" {
                         crate::arch::x86_64::iommu::confine_device(
                             pci::XHCI_BDF.load(Relaxed), phys, len);
-                    } else if name == "block-driver" && pci::AHCI_FOUND.load(Relaxed) {
-                        // AHCI is DMA-capable; confine it to its arena (H1/§6.4). All
-                        // its DMA (command list / FIS / command table / PRDT / data
-                        // buffer) lives in this arena, so confinement is exact. No-op
-                        // if no IOMMU (block-driver then stays trust-critical, §6.4).
-                        crate::arch::x86_64::iommu::confine_device(
-                            pci::AHCI_BDF.load(Relaxed), phys, len);
                     } else {
+                        // `block-driver` (AHCI) stays in IOMMU passthrough, like ehci:
+                        // the T630 BIOS hands the SATA controller over with a stale
+                        // firmware DMA pointer (~0xffffffc0). Confining it makes that
+                        // benign stale read a fatal IO_PAGE_FAULT (CI stuck); in
+                        // passthrough the read is harmless and AHCI works. Confinement
+                        // needs an AHCI BIOS/OS handoff first (a future step, §6.4;
+                        // docs/ahci.md) — same situation the USB drivers hit.
                         crate::kprintln!(
                             "spawn[dma]: '{}' left in IOMMU passthrough (CONFINE_USB_DRIVERS={})",
                             name, CONFINE_USB_DRIVERS
