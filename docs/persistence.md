@@ -244,18 +244,39 @@ directories from the start** of the next phase. (See `docs/drives.md` for the
 user-facing path/addressing model, `[N:]label/path/to/file`.)
 
 The hierarchical format, still GodSpeed-minimal (bounded, no POSIX permissions —
-authority is by capability, §3.3 — and no hard links):
+authority is by capability, §3.3 — and no hard links). **All capacity-bearing fields
+are `u64` from the start** (block counts, file sizes, block pointers, the block-IPC
+LBA) — see §6.3:
 
 ```text
-  Superblock (LBA 0): magic "GSFS…", version, block_size, total_blocks,
-      inode_table_start/blocks, data_start, next_free_block,
+  Superblock (LBA 0): magic "GSFS…", version, block_size, total_blocks:u64,
+      inode_table_start/blocks, data_start, next_free_block:u64,
       root_inode, flags (DEFAULT bit), label[N]      ← drives.md: default + identity
   Inode table: fixed array of inodes. Each inode:
-      type (free | file | dir), size_bytes, first_block, block_count   (contiguous extent)
+      type (free | file | dir), size_bytes:u64, first_block:u64, block_count:u64
   Directory: a file (inode.type = dir) whose contents are entries:
       { name[NAME_MAX], inode_number }               ← name → inode within this dir
   Data region: file contents + directory blocks.
 ```
+
+### 6.3 Capacity: `u64` fields from day one (decided)
+
+Phase 1 used `u32` for block counts + file size — FAT32-class limits (2 TiB volume,
+4 GiB file, §3.2). The hierarchical format **widens every capacity-bearing field to
+`u64`**: `total_blocks`, `next_free_block`, inode `size_bytes`/`first_block`/
+`block_count`, **and the block-IPC `lba`** (`ReadBlock`/`WriteBlock` carry an 8-byte
+LBA, and `block-driver`/AHCI already use a `u64` LBA). These must move *together* —
+widening only some unlocks nothing.
+
+The resulting ceiling is effectively unlimited: **~8 ZiB volume** (2⁶⁴ × 512 B) and a
+**16 EiB max file** — past ext4, into ZFS territory. The cost is a handful of bytes per
+superblock/inode; the bound is *stated and fixed*, not elastic (§26.6). This is the
+"capacity is field width" point (§3.2) acted on: pick the wide field once, at the
+format's birth, and never revisit the ceiling.
+
+> **Why now, not retrofitted onto the flat format:** the flat Phase-1 format is being
+> replaced by this hierarchical one, so `u64` is baked into the *new* format at design
+> time rather than churned into throwaway code. `u64` is the convention from here on.
 
 - **Path walking:** resolve `/a/b/c` by reading the **root inode** (a directory),
   finding `a` → its inode, reading that directory, finding `b`, … Each component is
