@@ -378,10 +378,47 @@ standing on the rug that didn't know how to land.
 
 ### 11.5 Two edges
 
-- **Unplanned rug pull (kernel panic):** same as planned, minus step 1 — apps don't get
-  to flush, so they reconstruct from their *last* persisted checkpoint. The crash page
-  (§19) preserves the panic reason across the reboot. Hence the app-author's discipline:
-  persist often.
+- **Unplanned rug pull (kernel panic):** identical to a planned one — the apps recover
+  the same way, from their *last* persisted checkpoint. The only difference is there was
+  no chance for an optional graceful wind-down (§11.6), so an app loses whatever it had
+  not yet checkpointed. The crash page (§19) preserves the panic reason across the
+  reboot. Hence the app-author's discipline: persist often.
 - **A/B is what makes the rug pull safe to attempt** (§8): a broken new Prime is a
   reboot you can *undo* (rollback to the old slot), not a brick. Without A/B, a bad
   kernel update bricks; with it, it's reversible.
+
+### 11.6 Lifecycle notifications — graceful shutdown (decided; build when pulled in)
+
+"Assume failure" (§11.2) is the floor, but a *stateful* app — a database, anything with
+in-flight transactions, buffered writes, or open connections — genuinely benefits from a
+chance to wind down **cleanly** before a *planned* restart/Prime swap: commit the current
+transaction, flush, close — so there is **no journal replay and no partial-write window**
+at all. That gap is real, and wider today because GSFS Phase 1 has no journal (§6.3), so a
+clean flush is the difference between "consistent on disk" and "trusting recovery."
+
+So GodspeedOS **will** support lifecycle notifications — but **not as POSIX signals.** POSIX
+signals are async interrupts (they hijack the program, run a handler → re-entrancy hazards,
+ambient authority). The GodspeedOS-native form is the inverse, and it reuses the one
+primitive the whole OS is built on — **IPC**:
+
+- **A message on the app's endpoint** (e.g. `PrepareToStop { deadline }`), handled in its
+  *normal recv loop* — synchronous, when the app is ready; no async handler, no re-entrancy.
+- **Capability-gated / opt-in** — an app receives lifecycle events only if it holds the cap
+  (declared in its contract). Apps that don't care never see them and pay nothing. No
+  ambient "anyone can signal you."
+- **Bounded** — the OS gives a *deadline*, then proceeds with the reboot regardless. No app
+  can veto or stall an update by sitting on the signal (§8.9, §26.6); the supervisor's
+  watchdog is the backstop.
+- **Optimization-only** — correctness *never* depends on it. Miss it (unplanned panic, or
+  just ignore it) and the app still recovers from its last checkpoint. It sits *on top of*
+  "assume failure"; it never replaces it.
+
+So it is almost the opposite of POSIX signals in mechanism: *"an event you handle when
+you're ready,"* not *"an interrupt that hijacks you."* And it is barely new machinery — a
+**convention** (a lifecycle message kind + a deadline) plus a **cap to opt in**, over
+existing IPC. No new subsystem.
+
+**Timing (§26.2):** the *decision* is recorded here; the *code* is built when a real
+stateful app pulls it into existence (there is no database on GodspeedOS today). Recording
+the shape now means that when one arrives, the design is waiting — and nobody reaches for
+POSIX signals by reflex.
