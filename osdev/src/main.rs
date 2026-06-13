@@ -922,6 +922,7 @@ fn cmd_test(suite: &str) {
         "iommu"        => run_iommu_test(),
         "blockdev"     => run_blockdev_test(),
         "blockdev-reboot" => run_blockdev_reboot_test(),
+        "drives-raw"   => run_drives_raw_test(),
         other => eprintln!("unknown test suite: {}", other),
     }
 }
@@ -1247,6 +1248,54 @@ fn run_blockdev_reboot_test() {
         println!("\n  [AHCI.R]  reboot survival over SATA  … PASS\n\n  1 passed  0 failed");
     } else {
         println!("\n  [AHCI.R]  reboot survival over SATA  … FAIL\n\n  0 passed  1 failed");
+        std::process::exit(1);
+    }
+}
+
+/// Step 3a: raw-disk tolerance. Boot with an UNFORMATTED disk on the AHCI controller
+/// (no `mkfs`): `fs` must learn the disk's capacity (OP_CAPACITY), recognise there is no
+/// filesystem, NOT auto-format (§3.12), and stay up serving — never panic, never hang.
+fn run_drives_raw_test() {
+    println!("\n=== drives 3a: raw-disk tolerance (capacity + no auto-format) ===");
+    cmd_build_blockdev();
+
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+
+    let _ = std::fs::create_dir_all("build/tests");
+    // A RAW disk — zeros, deliberately NOT formatted with `format_superblock`.
+    let persist = "build/tests/persist_ahci_raw.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create raw disk");
+
+    let img = std::fs::canonicalize(&image_path).unwrap_or_else(|_| image_path.to_path_buf());
+    let img_str = img.to_string_lossy().replace('\\', "/");
+    let persist_abs = std::fs::canonicalize(persist).unwrap_or_else(|_| std::path::PathBuf::from(persist));
+    let persist_str = persist_abs.to_string_lossy().replace('\\', "/");
+
+    println!("drives: booting with a RAW (unformatted) AHCI disk, ~25s …");
+    let log = boot_ahci_qemu(&img_str, &persist_str, "build/tests/drives_raw.log", 25);
+
+    let capacity = log.contains("fs: disk capacity =");           // OP_CAPACITY round-trip
+    let no_fs    = log.contains("fs: no filesystem") && log.contains("awaiting drives flash");
+    let serving  = log.contains("fs: serving file API");          // fs stayed up
+    let not_formatted = !log.contains("fs: mounted GSFS");         // did NOT auto-format
+    let no_panic = !log.contains("KERNEL PANIC");
+
+    for l in log.lines().filter(|l| l.contains("fs:") || l.contains("IDENTIFY OK")) {
+        println!("drives:   | {}", l.trim());
+    }
+    println!("drives:   learned capacity (OP_CAPACITY) ... {}", if capacity { "yes" } else { "NO" });
+    println!("drives:   recognised raw disk, no auto-format ... {}", if no_fs && not_formatted { "yes" } else { "NO" });
+    println!("drives:   fs stayed up serving ... {}", if serving { "yes" } else { "NO" });
+    println!("drives:   kernel did not panic ... {}", if no_panic { "yes" } else { "NO" });
+
+    if capacity && no_fs && serving && not_formatted && no_panic {
+        println!("\n  [DRIVES.raw]  raw-disk tolerance  … PASS\n\n  1 passed  0 failed");
+    } else {
+        println!("\n  [DRIVES.raw]  raw-disk tolerance  … FAIL\n\n  0 passed  1 failed");
         std::process::exit(1);
     }
 }

@@ -50,6 +50,7 @@ const MAX_FILE_BYTES: usize = 7 * BLOCK; // 3584
 // Block IPC protocol (fs <-> block-driver). MUST match `services/block-driver`.
 const OP_READ_BLOCK: u8 = 1;
 const OP_WRITE_BLOCK: u8 = 2;
+const OP_CAPACITY: u8 = 3;
 const BLK_OK: u8 = 0;
 
 // fs file API (client <-> fs). Paths are passed where the name was (§8 of persistence.md).
@@ -61,6 +62,7 @@ const OP_LIST_DIR: u8 = 14;
 const FS_OK: u8 = 0;
 const FS_ERR: u8 = 1;
 const FS_NOTFOUND: u8 = 2;
+const FS_NOFS: u8 = 3; // no filesystem on the disk (raw — needs `drives flash`)
 
 #[derive(Clone, Copy)]
 struct Inode {
@@ -90,21 +92,33 @@ struct Fs {
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("fs: starting");
 
-    let mut fs = match Fs::mount(&ctx) {
+    // Disk size, from block-driver's IDENTIFY — what a future `drives flash` sizes a
+    // fresh filesystem to (step 3b). 0 if block-driver is unreachable.
+    let capacity = block_capacity(&ctx).unwrap_or(0);
+    ctx.log_fmt(format_args!(
+        "fs: disk capacity = {} sectors ({} MiB)", capacity, capacity / 2048
+    ));
+
+    // Raw-tolerant: a bad superblock is NOT fatal (a raw disk is the normal state of a
+    // never-flashed drive). fs stays up; `drives flash` will format it (step 3b). It is
+    // never auto-formatted — silent reformat is forbidden (§3.12).
+    let mut fs: Option<Fs> = match Fs::mount(&ctx) {
         Ok(f) => {
             ctx.log_fmt(format_args!(
                 "fs: mounted GSFS ({} blocks, {} inodes, data@{}, next_free={})",
                 f.total_blocks, INODE_COUNT, f.data_start, f.next_free_block
             ));
-            f
+            Some(f)
         }
         Err(e) => {
-            ctx.log_fmt(format_args!("fs: mount FAILED: {}", e));
-            loop { ctx.yield_cpu(); }
+            ctx.log_fmt(format_args!("fs: no filesystem ({}) — awaiting drives flash", e));
+            None
         }
     };
 
-    self_test(&ctx, &mut fs);
+    if let Some(ref mut f) = fs {
+        self_test(&ctx, f);
+    }
 
     // Serve the file API to other services over IPC (the reply-cap pattern, §8).
     ctx.log("fs: serving file API");
@@ -168,12 +182,23 @@ fn self_test(ctx: &ServiceContext, fs: &mut Fs) {
 
 /// Dispatch one file-API request and reply through the client's `reply` cap.
 /// Layout: `[op:u8, path_len:u8, path[path_len], (WriteFile: data)]`.
-fn serve(ctx: &ServiceContext, fs: &mut Fs, p: &[u8], reply: CapHandle) {
+///
+/// File ops require a mounted filesystem; on a raw disk (`fs` is `None`) they return
+/// `FS_NOFS` so the caller can tell "no filesystem here" from "not found". (The drives
+/// API — flash/info/label — is added in step 3b and works in both states.)
+fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, p: &[u8], reply: CapHandle) {
     let send = |bytes: &[u8]| { let _ = ctx.send_by_handle(reply, &Message::from_bytes(bytes)); };
     if p.len() < 2 {
         send(&[FS_ERR]);
         return;
     }
+    let fs = match vol {
+        Some(f) => f,
+        None => {
+            send(&[FS_NOFS]);
+            return;
+        }
+    };
     let op = p[0];
     let plen = p[1] as usize;
     if p.len() < 2 + plen {
@@ -499,6 +524,17 @@ fn encode_inode(blk: &mut [u8], o: usize, n: &Inode) {
     blk[o + 8..o + 16].copy_from_slice(&n.size.to_le_bytes());
     blk[o + 16..o + 24].copy_from_slice(&n.first_block.to_le_bytes());
     blk[o + 24..o + 32].copy_from_slice(&n.block_count.to_le_bytes());
+}
+
+/// Ask `block-driver` for the disk's sector count (OP_CAPACITY → [BLK_OK, sectors:u64]).
+fn block_capacity(ctx: &ServiceContext) -> Option<u64> {
+    let reply = ctx.request_with_reply("block-driver", &Message::from_bytes(&[OP_CAPACITY]))?;
+    let p = reply.payload_bytes();
+    if p.first() == Some(&BLK_OK) && p.len() >= 9 {
+        Some(u64_at(p, 1))
+    } else {
+        None
+    }
 }
 
 /// Read one 512-byte block at `lba` from `block-driver` over IPC (u64 LBA, §6.3).

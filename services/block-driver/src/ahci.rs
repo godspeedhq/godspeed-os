@@ -9,6 +9,8 @@
 //! / command table in the arena, start the port, and issue IDENTIFY DEVICE to read
 //! the model + sector count. Read/write (READ/WRITE DMA EXT) come next.
 
+use core::cell::Cell;
+
 use godspeed_sdk::{CapHandle, Dma, Message, Mmio, ServiceContext};
 
 // HBA Generic Host Control registers (offsets from ABAR).
@@ -59,6 +61,8 @@ struct Ahci<'a> {
     hba: &'a Mmio,
     arena: Dma,
     port: u32,
+    /// Total addressable 512-byte sectors, from IDENTIFY. Served on OP_CAPACITY.
+    sectors: Cell<u64>,
 }
 
 impl<'a> Ahci<'a> {
@@ -234,11 +238,23 @@ impl<'a> Ahci<'a> {
     /// Serve one block-IPC request (same protocol as the ATA PIO backend),
     /// replying through the client's `reply` cap.
     fn serve(&self, ctx: &ServiceContext, p: &[u8], reply: CapHandle) {
-        use super::{OP_READ_BLOCK, OP_WRITE_BLOCK, STATUS_ERR, STATUS_OK};
-        // Request: [op:u8, lba:u64 LE, (WriteBlock only: 512 data bytes)] — the LBA is
-        // u64 so GSFS's u64 capacity fields reach the device unchanged (persistence §6.3).
+        use super::{OP_CAPACITY, OP_READ_BLOCK, OP_WRITE_BLOCK, STATUS_ERR, STATUS_OK};
+        let err = |ctx: &ServiceContext| { let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR])); };
+        if p.is_empty() {
+            err(ctx);
+            return;
+        }
+        // OP_CAPACITY carries no LBA; read/write carry [op, lba:u64 LE, (write: 512 data)].
+        // The LBA is u64 so GSFS's u64 fields reach the device unchanged (persistence §6.3).
+        if p[0] == OP_CAPACITY {
+            let mut out = [0u8; 9];
+            out[0] = STATUS_OK;
+            out[1..9].copy_from_slice(&self.sectors.get().to_le_bytes());
+            let _ = ctx.send_by_handle(reply, &Message::from_bytes(&out));
+            return;
+        }
         if p.len() < 9 {
-            let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR]));
+            err(ctx);
             return;
         }
         let lba = u64::from_le_bytes([p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]]);
@@ -252,12 +268,12 @@ impl<'a> Ahci<'a> {
                         out[1..].copy_from_slice(&sec);
                         let _ = ctx.send_by_handle(reply, &Message::from_bytes(&out));
                     }
-                    Err(_) => { let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR])); }
+                    Err(_) => err(ctx),
                 }
             }
             OP_WRITE_BLOCK => {
                 if p.len() < 9 + 512 {
-                    let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR]));
+                    err(ctx);
                     return;
                 }
                 let mut sec = [0u8; 512];
@@ -268,7 +284,7 @@ impl<'a> Ahci<'a> {
                 };
                 let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[status]));
             }
-            _ => { let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR])); }
+            _ => err(ctx),
         }
     }
 }
@@ -322,11 +338,12 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
         }
     };
     arena.zero();
-    let ahci = Ahci { hba, arena, port };
+    let ahci = Ahci { hba, arena, port, sectors: Cell::new(0) };
     ahci.init_port();
 
     match ahci.identify() {
         Ok((model, sectors)) => {
+            ahci.sectors.set(sectors); // served on OP_CAPACITY so `fs` sizes a flash to the disk
             let model_str = core::str::from_utf8(&model).unwrap_or("?");
             let mib = sectors / 2048; // 512-byte sectors → MiB
             ctx.log_fmt(format_args!(
