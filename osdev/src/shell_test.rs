@@ -673,6 +673,17 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         Some(r) => check!(r.contains("find: 0 match"), "find: reports 0 matches for a missing name"),
         None    => { println!("files-test: FAIL — find missing timeout"); fail += 1; }
     }
+    // find substring: `.txt` matches inside.txt AND sub/note.txt (2). Exact match would be 0.
+    match run!(b"find .txt\r", 10) {
+        Some(r) => check!(r.contains("find: 2 match"), "find: substring match (.txt → 2 files)"),
+        None    => { println!("files-test: FAIL — find substring timeout"); fail += 1; }
+    }
+
+    // ls shows file sizes: /docs/inside.txt holds "nested-content" = 14 bytes.
+    match run!(b"ls /docs\r", 10) {
+        Some(r) => check!(r.contains("inside.txt") && r.contains("14 B"), "ls: shows file size (inside.txt 14 B)"),
+        None    => { println!("files-test: FAIL — ls size timeout"); fail += 1; }
+    }
 
     child.kill().ok();
     child.wait().ok();

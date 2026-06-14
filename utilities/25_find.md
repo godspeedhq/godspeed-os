@@ -9,9 +9,10 @@ does not amend it.
 ## 1. What it is
 
 `find <name> [path]` searches a subtree — the **whole filesystem** (`/`) by default, or a
-given starting `path` — for entries named exactly `<name>`, and prints each match's full
-path. It is whole-filesystem **enumeration**: the one operation that reads across the entire
-tree rather than a single path or directory.
+given starting `path` — for entries whose name **contains** `<name>` (substring match), and
+prints each match's full path. So `find report` matches `report.txt`, `2026-report`, etc.;
+`find .txt` lists every `.txt`. It is whole-filesystem **enumeration**: the one operation
+that reads across the entire tree rather than a single path or directory.
 
 ```
 find 0.1.0 — search the tree for a name
@@ -61,8 +62,8 @@ same `find` command (lazy, version-invalidated, rebuilt-from-truth — §6.5). U
 
 ## 5. Later (separate doc so it can grow)
 
-- **Pattern / substring match** (`find "*.txt"`, or a contains-match) — a *word*-flagged
-  mode, never `-name` (`0_conventions.md` §4).
+- **Substring match — done** (`find report` matches `report.txt`). **Glob patterns**
+  (`find "*.txt"`) remain later, as a *word*-flagged mode, never `-name`.
 - **Type filter** (files only / dirs only).
 - **`fs_index`-backed fast path** when the tree-walk is measured too slow (§6.5).
 

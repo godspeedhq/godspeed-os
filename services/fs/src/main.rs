@@ -659,7 +659,7 @@ impl Fs {
         Some(size)
     }
 
-    /// Reply: `[FS_OK, count:u8, {name_len:u8, name, is_dir:u8}…]`, bounded to one block.
+    /// Reply: `[FS_OK, count:u8, {name_len:u8, name, is_dir:u8, size:u64}…]`, one block.
     fn list_dir(&self, ctx: &ServiceContext, path: &[u8]) -> Option<[u8; BLOCK]> {
         let d = self.walk(ctx, path)?;
         if d.itype != ITYPE_DIR { return None; }
@@ -675,11 +675,12 @@ impl Fs {
                 if t == ITYPE_FREE { continue; }
                 let nl = blk[o + 1] as usize;
                 if nl == 0 || nl > NAME_MAX { continue; }
-                if w + 1 + nl + 1 > BLOCK { break; }
+                if w + 1 + nl + 1 + 8 > BLOCK { break; }
                 out[w] = nl as u8;
                 out[w + 1..w + 1 + nl].copy_from_slice(&blk[o + 2..o + 2 + nl]);
                 out[w + 1 + nl] = (t == ITYPE_DIR) as u8;
-                w += 1 + nl + 1;
+                out[w + 2 + nl..w + 2 + nl + 8].copy_from_slice(&blk[o + 40..o + 48]); // size:u64
+                w += 1 + nl + 1 + 8;
                 count += 1;
             }
         }

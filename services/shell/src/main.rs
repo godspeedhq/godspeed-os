@@ -364,9 +364,9 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "delete" => help_block(ctx, "delete", "remove a file or empty directory", &[
             ("delete <path>", "remove the file/empty dir <path>", "delete /docs/old.txt"),
         ], true),
-        "find" => help_block(ctx, "find", "search the tree for a name", &[
-            ("find <name>", "search the whole filesystem", "find notes.txt"),
-            ("find <name> <path>", "search only under <path>", "find notes.txt /docs"),
+        "find" => help_block(ctx, "find", "search the tree for a name (substring match)", &[
+            ("find <name>", "search everywhere; matches names containing <name>", "find report"),
+            ("find <name> <path>", "search only under <path>", "find .txt /docs"),
         ], true),
         _ => return false,
     }
@@ -953,16 +953,22 @@ fn cmd_ls(ctx: &ServiceContext, cwd: &Cwd, arg: &str) {
     }
     let count = p[1] as usize;
     ctx.console_writeln_fmt(format_args!("{}  ({} entries)", str_of(path), count));
+    if count > 0 { ctx.console_writeln("  NAME                  TYPE   SIZE"); }
     let mut i = 2usize;
     for _ in 0..count {
         if i >= p.len() { break; }
         let nl = p[i] as usize;
         i += 1;
-        if i + nl + 1 > p.len() { break; }
+        if i + nl + 1 + 8 > p.len() { break; }
         let name = core::str::from_utf8(&p[i..i + nl]).unwrap_or("?");
         let is_dir = p[i + nl] != 0;
-        i += nl + 1;
-        ctx.console_writeln_fmt(format_args!("  {:<20}  {}", name, if is_dir { "dir" } else { "file" }));
+        let size = u64_le(&p[i + nl + 1..i + nl + 9]);
+        i += nl + 1 + 8;
+        if is_dir {
+            ctx.console_writeln_fmt(format_args!("  {:<20}  dir    -", name));
+        } else {
+            ctx.console_writeln_fmt(format_args!("  {:<20}  file   {} B", name, size));
+        }
     }
     if count == 0 { ctx.console_writeln("  (empty)"); }
 }
@@ -1201,13 +1207,13 @@ fn cmd_find(ctx: &ServiceContext, cwd: &Cwd, target: &str, start: &str) {
             if i >= p.len() { break; }
             let nl = p[i] as usize;
             i += 1;
-            if i + nl + 1 > p.len() { break; }
+            if i + nl + 1 + 8 > p.len() { break; }
             let name = &p[i..i + nl];
             let is_dir = p[i + nl] != 0;
-            i += nl + 1;
+            i += nl + 1 + 8; // name_len + name + is_dir + size:u64
             let mut child = [0u8; PATH_MAX];
             if let Some(clen) = join_path(&dir[..dlen], name, &mut child) {
-                if name == target {
+                if contains(name, target) {
                     ctx.console_writeln(str_of(&child[..clen]));
                     matches += 1;
                 }
@@ -1237,6 +1243,13 @@ fn join_path(dir: &[u8], name: &[u8], out: &mut [u8; PATH_MAX]) -> Option<usize>
     if len + name.len() > PATH_MAX { return None; }
     out[len..len + name.len()].copy_from_slice(name);
     Some(len + name.len())
+}
+
+/// True if `needle` appears as a contiguous substring of `haystack` (find's match).
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() { return true; }
+    if needle.len() > haystack.len() { return false; }
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 fn str_of(b: &[u8]) -> &str {
