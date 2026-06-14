@@ -8,7 +8,7 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, CapInfo, Message};
+use godspeed_sdk::{ServiceContext, CapInfo, CapHandle, Message};
 
 const MAX_LINE: usize = 128;
 const MAX_ARGS: usize = 4;
@@ -35,6 +35,71 @@ const FS_NOTFOUND: u8 = 2;
 const FS_NOFS: u8 = 3;
 const LABEL_MAX: usize = 31;
 const PATH_MAX: usize = 120; // fits in MAX_LINE; path_len is u8
+
+// ── pipe output capture ────────────────────────────────────────────────────────
+// When a built-in is the *producer* side of a pipe (`read /f | upper`), its text is captured
+// into one message-sized buffer instead of going to the console (§26.6: bounded; loud if the
+// output overflows). The captured bytes are then sent to the sink (a service endpoint or the
+// `write` built-in). Only produced *text* flows through `Out`; errors always go to the console.
+// End-of-stream marker a producer service sends to a built-in sink (the shell draining a
+// `service | write` pipe). A non-empty sentinel — the IPC path doesn't deliver an empty body.
+const PIPE_EOT: u8 = 0x04; // ASCII EOT
+const CAP_MAX: usize = 4096;
+struct Cap {
+    buf: [u8; CAP_MAX],
+    len: usize,
+    overflow: bool,
+}
+impl Cap {
+    fn new() -> Self { Cap { buf: [0u8; CAP_MAX], len: 0, overflow: false } }
+    fn push(&mut self, b: &[u8]) {
+        let room = CAP_MAX - self.len;
+        let take = b.len().min(room);
+        if take < b.len() { self.overflow = true; }
+        self.buf[self.len..self.len + take].copy_from_slice(&b[..take]);
+        self.len += take;
+    }
+    fn bytes(&self) -> &[u8] { &self.buf[..self.len] }
+}
+impl core::fmt::Write for Cap {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result { self.push(s.as_bytes()); Ok(()) }
+}
+
+/// A producer built-in's output target: straight to the console, or into a capture buffer
+/// when the built-in feeds a pipe. Methods take `ctx` (the console case needs it; the capture
+/// case ignores it).
+enum Out<'a> {
+    Console,
+    Capture(&'a mut Cap),
+}
+impl Out<'_> {
+    /// Write a string, no trailing newline.
+    fn put(&mut self, ctx: &ServiceContext, s: &str) {
+        match self {
+            Out::Console => ctx.console_write(s),
+            Out::Capture(c) => c.push(s.as_bytes()),
+        }
+    }
+    /// Write raw bytes, no trailing newline (file content may not be clean UTF-8).
+    fn put_bytes(&mut self, ctx: &ServiceContext, b: &[u8]) {
+        match self {
+            Out::Console => ctx.console_write(str_of(b)),
+            Out::Capture(c) => c.push(b),
+        }
+    }
+    /// Write a string followed by a newline.
+    fn line(&mut self, ctx: &ServiceContext, s: &str) {
+        self.put(ctx, s);
+        self.put(ctx, "\n");
+    }
+    /// Write formatted args followed by a newline.
+    fn line_fmt(&mut self, ctx: &ServiceContext, args: core::fmt::Arguments) {
+        match self {
+            Out::Console => ctx.console_writeln_fmt(args),
+            Out::Capture(c) => { let _ = core::fmt::write(c, args); c.push(b"\n"); }
+        }
+    }
+}
 
 // Entry point called by the kernel after spawning this service.
 // ctx.console_writeln() appends a newline. The kernel echoes each console keystroke to the
@@ -226,7 +291,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
     // to the consumer's endpoint delegated to it — the producer has no ambient
     // authority of its own.
     if let Some(bar) = s.find('|') {
-        cmd_pipe(ctx, s[..bar].trim(), s[bar + 1..].trim());
+        cmd_pipe(ctx, cwd, s[..bar].trim(), s[bar + 1..].trim());
         return;
     }
 
@@ -253,7 +318,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
     match args[0] {
         "help"    => cmd_help(ctx),
         "clear"   => cmd_clear(ctx),
-        "echo"    => cmd_echo(ctx, s["echo".len()..].trim()),
+        "echo"    => cmd_echo(ctx, s["echo".len()..].trim(), &mut Out::Console),
         "about"   => cmd_about(ctx),
         "mem"     => cmd_mem(ctx),
         "cores"   => cmd_cores(ctx),
@@ -289,10 +354,10 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
         }
         "reboot"  => cmd_reboot(ctx),
         "drives"  => cmd_drives(ctx, &args, argc),
-        "ls"      => cmd_ls(ctx, cwd, if argc >= 2 { args[1] } else { "" }),
+        "ls"      => cmd_ls(ctx, cwd, if argc >= 2 { args[1] } else { "" }, &mut Out::Console),
         "read"    => {
             if argc < 2 { ctx.console_writeln("usage: read <path>"); }
-            else { cmd_read(ctx, cwd, args[1]); }
+            else { cmd_read(ctx, cwd, args[1], &mut Out::Console); }
         }
         "write"   => cmd_write(ctx, cwd, s["write".len()..].trim()),
         "mkdir"   => {
@@ -322,9 +387,9 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
         }
         "find"    => {
             if argc < 2 { ctx.console_writeln("usage: find <name> [path]"); }
-            else { cmd_find(ctx, cwd, args[1], if argc >= 3 { args[2] } else { "/" }); }
+            else { cmd_find(ctx, cwd, args[1], if argc >= 3 { args[2] } else { "/" }, &mut Out::Console); }
         }
-        "tree"    => cmd_tree(ctx, cwd, if argc >= 2 { args[1] } else { "" }),
+        "tree"    => cmd_tree(ctx, cwd, if argc >= 2 { args[1] } else { "" }, &mut Out::Console),
         other => {
             // Build "unknown: <cmd>" in a stack buffer to avoid two ctx.log calls
             let mut buf = [0u8; 64];
@@ -546,6 +611,11 @@ fn cmd_help(ctx: &ServiceContext) {
     help_line(ctx, "find <pattern> [path]", "search by name (substring or *? glob)");
     help_line(ctx, "tree [path]", "print the directory hierarchy");
     ctx.console_writeln("");
+    ctx.console_writeln("Pipes");
+    help_line(ctx, "<producer> | <sink>", "feed output to a sink (Appendix D)");
+    help_line(ctx, "  e.g. read /f | upper", "filter a file through a service");
+    help_line(ctx, "  e.g. tree / | write /out", "capture output to a file");
+    ctx.console_writeln("");
     ctx.console_writeln("Power");
     help_line(ctx, "reboot", "hardware reset");
     ctx.console_writeln("");
@@ -568,8 +638,8 @@ fn cmd_clear(ctx: &ServiceContext) {
 }
 
 /// Print the rest of the line verbatim.
-fn cmd_echo(ctx: &ServiceContext, text: &str) {
-    ctx.console_writeln(text);
+fn cmd_echo(ctx: &ServiceContext, text: &str, out: &mut Out) {
+    out.line(ctx, text);
 }
 
 /// One-line identity for the system.
@@ -876,28 +946,172 @@ fn cmd_spawn(ctx: &ServiceContext, name: &str) {
     }
 }
 
-/// `producer | sink` — broker a capability-mediated pipe. Spawn the consumer
-/// (registers its endpoint), then spawn the producer with a SEND cap to that
-/// endpoint delegated to it. The producer holds no ambient send authority.
-fn cmd_pipe(ctx: &ServiceContext, producer: &str, sink: &str) {
+/// `A | B` — a capability-mediated pipe (Appendix D.3). Either side may be a SERVICE or a
+/// shell BUILT-IN, so there are four shapes, all routed through real IPC endpoints (never a
+/// hidden shell buffer — §26.4 forbids silent data paths):
+///
+/// - `builtin | write <file>` — run the producer capturing its text, write it to the file.
+/// - `builtin | service`      — capture the producer, send it to the sink service's endpoint
+///   (resolved via the registry; the shell holds no ambient cap to it).
+/// - `service | write <file>` — spawn the producer wired to the SHELL's own endpoint, drain
+///   its stream (empty message = end), write it to the file. Producer must follow the EOF
+///   protocol (whitelisted, so a non-conforming service can't wedge the shell on `recv`).
+/// - `service | service`      — spawn the sink, then the producer with a delegated SEND cap to
+///   the sink (the original demo, `greet | upper`).
+fn cmd_pipe(ctx: &ServiceContext, cwd: &Cwd, producer: &str, sink: &str) {
     if producer.is_empty() || sink.is_empty() {
         ctx.console_writeln("usage: <producer> | <sink>");
         return;
     }
+    let (pcmd, _) = split_first(producer);
+    let (scmd, sarg) = split_first(sink);
+    let sink_is_write = scmd == "write";
+
+    if is_producer_builtin(pcmd) {
+        let mut cap = Cap::new();
+        run_producer(ctx, cwd, producer, &mut Out::Capture(&mut cap));
+        if cap.overflow {
+            ctx.console_writeln("pipe: producer output exceeded the pipe buffer (truncated)");
+        }
+        if sink_is_write { pipe_write_file(ctx, cwd, sarg, cap.bytes()); }
+        else             { pipe_to_service(ctx, scmd, cap.bytes()); }
+        return;
+    }
+    // Producer is a service.
+    if sink_is_write { pipe_service_to_file(ctx, cwd, producer, sarg); }
+    else             { pipe_service_to_service(ctx, producer, sink); }
+}
+
+/// Split `s` into (first word, rest-trimmed).
+fn split_first(s: &str) -> (&str, &str) {
+    match s.split_once(char::is_whitespace) {
+        Some((a, b)) => (a, b.trim_start()),
+        None => (s, ""),
+    }
+}
+
+/// Built-ins that emit text and can be the producer side of a pipe.
+fn is_producer_builtin(name: &str) -> bool {
+    matches!(name, "read" | "cat" | "echo" | "ls" | "tree" | "find")
+}
+
+/// Producer SERVICES that follow the pipe EOF protocol (send a zero-length message after
+/// their data). Only these may be drained by `service | write` — a non-conforming service
+/// would block the shell forever on `recv` (there is no non-blocking recv in v1).
+fn is_pipe_producer_service(name: &str) -> bool {
+    matches!(name, "greet")
+}
+
+/// Run a producer built-in (`cmd args`) with its output going to `out`.
+fn run_producer(ctx: &ServiceContext, cwd: &Cwd, cmdline: &str, out: &mut Out) {
+    let (cmd, arg) = split_first(cmdline);
+    match cmd {
+        "echo"         => cmd_echo(ctx, arg, out),
+        "read" | "cat" => cmd_read(ctx, cwd, arg, out),
+        "ls"           => cmd_ls(ctx, cwd, arg, out),
+        "tree"         => cmd_tree(ctx, cwd, arg, out),
+        "find"         => {
+            let (target, start) = split_first(arg);
+            cmd_find(ctx, cwd, target, if start.is_empty() { "/" } else { start }, out);
+        }
+        _ => {}
+    }
+}
+
+/// Write captured bytes to a file (the `write` sink). Overwrites, like plain `write`.
+fn pipe_write_file(ctx: &ServiceContext, cwd: &Cwd, path_arg: &str, data: &[u8]) {
+    let (pstr, _) = split_first(path_arg);
+    if pstr.is_empty() { ctx.console_writeln("pipe: write needs a file path"); return; }
+    let mut buf = [0u8; PATH_MAX];
+    let path = match resolve_or_err(ctx, cwd, pstr, &mut buf) { Some(p) => p, None => return };
+    let mut pbuf = [0u8; PATH_MAX];
+    let pl = path.len();
+    pbuf[..pl].copy_from_slice(path);
+    match fs_request(ctx, OP_WRITE_FILE, &pbuf[..pl], data) {
+        Some(r) if r.payload_bytes().first() == Some(&FS_OK) =>
+            ctx.console_writeln_fmt(format_args!("piped {} bytes → {}", data.len(), str_of(&pbuf[..pl]))),
+        Some(r) if no_fs(ctx, r.payload_bytes()) => {}
+        Some(_) => ctx.console_writeln("pipe: write failed (bad path, or parent missing?)"),
+        None    => ctx.console_writeln("pipe: storage unavailable"),
+    }
+}
+
+/// `builtin | service` — send captured producer text to a sink SERVICE: spawn it, find its
+/// endpoint via the registry (the shell holds no ambient cap to it), send the text line by
+/// line, then reap it so it can be re-spawned next time.
+fn pipe_to_service(ctx: &ServiceContext, sink: &str, data: &[u8]) {
+    if ctx.spawn(sink).is_err() {
+        ctx.console_writeln_fmt(format_args!("pipe: failed to spawn sink '{}'", sink));
+        return;
+    }
+    let handle = match lookup_sink(ctx, sink) {
+        Some(h) => h,
+        None => {
+            ctx.console_writeln_fmt(format_args!("pipe: sink '{}' never registered", sink));
+            let _ = ctx.kill(sink);
+            return;
+        }
+    };
+    let mut sent = 0u32;
+    for line in data.split(|&b| b == b'\n') {
+        if line.is_empty() { continue; }
+        let _ = ctx.send_by_handle(handle, &Message::from_bytes(line));
+        sent += 1;
+    }
+    // Let the sink drain + act before we reap it.
+    for _ in 0..4000 { ctx.yield_cpu(); }
+    let _ = ctx.kill(sink);
+    ctx.console_writeln_fmt(format_args!("piped {} line(s) → {}", sent, sink));
+}
+
+/// Look up a just-spawned sink's endpoint via the registry, retrying while it registers.
+fn lookup_sink(ctx: &ServiceContext, sink: &str) -> Option<CapHandle> {
+    for _ in 0..200 {
+        if let Some(h) = ctx.registry_lookup(sink) { return Some(h); }
+        for _ in 0..50 { ctx.yield_cpu(); }
+    }
+    None
+}
+
+/// `service | write <file>` — spawn the producer wired to the SHELL's endpoint, drain its
+/// stream into a buffer (empty message = end-of-stream), then write it to the file.
+fn pipe_service_to_file(ctx: &ServiceContext, cwd: &Cwd, producer: &str, path_arg: &str) {
+    if !is_pipe_producer_service(producer) {
+        ctx.console_writeln_fmt(format_args!(
+            "pipe: '{}' is not a pipe producer (must send an EOF message)", producer));
+        return;
+    }
+    if ctx.spawn_pipe(producer, "shell").is_err() {
+        ctx.console_writeln_fmt(format_args!("pipe: failed to spawn producer '{}'", producer));
+        return;
+    }
+    let mut cap = Cap::new();
+    // Drain the producer's stream. Bounded: stop on the EOT (0x04) marker, on overflow, or
+    // after a fixed number of messages (a conforming producer always sends EOT to end).
+    for _ in 0..512 {
+        let msg = ctx.recv();
+        let p = msg.payload_bytes();
+        if p == [PIPE_EOT] { break; } // end-of-stream marker
+        cap.push(p);
+        cap.push(b"\n");
+        if cap.overflow { break; }
+    }
+    let _ = ctx.kill(producer);
+    if cap.overflow {
+        ctx.console_writeln("pipe: producer output exceeded the pipe buffer (truncated)");
+    }
+    pipe_write_file(ctx, cwd, path_arg, cap.bytes());
+}
+
+/// `service | service` — the original demo: spawn the sink, then the producer with a SEND cap
+/// to the sink's endpoint delegated to it (the producer holds no ambient authority).
+fn pipe_service_to_service(ctx: &ServiceContext, producer: &str, sink: &str) {
     if ctx.spawn(sink).is_err() {
         ctx.console_writeln("pipe: failed to spawn sink");
         return;
     }
     match ctx.spawn_pipe(producer, sink) {
-        Ok(()) => {
-            let mut buf = [0u8; 96];
-            let mut pos = 0usize;
-            write_bytes(&mut buf, &mut pos, b"pipe wired: ");
-            write_bytes(&mut buf, &mut pos, producer.as_bytes());
-            write_bytes(&mut buf, &mut pos, b" | ");
-            write_bytes(&mut buf, &mut pos, sink.as_bytes());
-            ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("pipe wired"));
-        }
+        Ok(()) => ctx.console_writeln_fmt(format_args!("pipe wired: {} | {}", producer, sink)),
         Err(_) => ctx.console_writeln("pipe: failed to spawn producer with delegated cap"),
     }
 }
@@ -1059,7 +1273,7 @@ fn no_fs(ctx: &ServiceContext, p: &[u8]) -> bool {
 }
 
 /// `ls [path]` — list a directory.
-fn cmd_ls(ctx: &ServiceContext, cwd: &Cwd, arg: &str) {
+fn cmd_ls(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return };
     let reply = match fs_request(ctx, OP_LIST_DIR, path, &[]) {
@@ -1073,8 +1287,8 @@ fn cmd_ls(ctx: &ServiceContext, cwd: &Cwd, arg: &str) {
         return;
     }
     let count = p[1] as usize;
-    ctx.console_writeln_fmt(format_args!("{}  ({} entries)", str_of(path), count));
-    if count > 0 { ctx.console_writeln("  NAME                  TYPE   SIZE"); }
+    out.line_fmt(ctx, format_args!("{}  ({} entries)", str_of(path), count));
+    if count > 0 { out.line(ctx, "  NAME                  TYPE   SIZE"); }
     let mut i = 2usize;
     for _ in 0..count {
         if i >= p.len() { break; }
@@ -1086,16 +1300,16 @@ fn cmd_ls(ctx: &ServiceContext, cwd: &Cwd, arg: &str) {
         let size = u64_le(&p[i + nl + 1..i + nl + 9]);
         i += nl + 1 + 8;
         if is_dir {
-            ctx.console_writeln_fmt(format_args!("  {:<20}  dir    -", name));
+            out.line_fmt(ctx, format_args!("  {:<20}  dir    -", name));
         } else {
-            ctx.console_writeln_fmt(format_args!("  {:<20}  file   {} B", name, size));
+            out.line_fmt(ctx, format_args!("  {:<20}  file   {} B", name, size));
         }
     }
-    if count == 0 { ctx.console_writeln("  (empty)"); }
+    if count == 0 { out.line(ctx, "  (empty)"); }
 }
 
 /// `read <path>` — print a file's contents.
-fn cmd_read(ctx: &ServiceContext, cwd: &Cwd, arg: &str) {
+fn cmd_read(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return };
     let reply = match fs_request(ctx, OP_READ_FILE, path, &[]) {
@@ -1107,9 +1321,10 @@ fn cmd_read(ctx: &ServiceContext, cwd: &Cwd, arg: &str) {
     if p.first() == Some(&FS_OK) && p.len() >= 5 {
         let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
         let end = (5 + n).min(p.len());
-        ctx.console_write(core::str::from_utf8(&p[5..end]).unwrap_or(""));
-        if end == 0 || p[end - 1] != b'\n' { ctx.console_writeln(""); }
+        out.put_bytes(ctx, &p[5..end]);
+        if end == 0 || p[end - 1] != b'\n' { out.put(ctx, "\n"); }
     } else {
+        // Errors are not pipe data — always to the console.
         ctx.console_writeln_fmt(format_args!("read: not found: {}", str_of(path)));
     }
 }
@@ -1490,7 +1705,7 @@ fn cmd_move(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) {
 /// is bounded (a fixed pending-directory stack) and **loud on truncation** (§26.6/§3.12);
 /// the `fs_index` accelerator (persistence.md §6.5) is what we'd build if this walk ever
 /// gets too slow on a huge tree — not before.
-fn cmd_find(ctx: &ServiceContext, cwd: &Cwd, target: &str, start: &str) {
+fn cmd_find(ctx: &ServiceContext, cwd: &Cwd, target: &str, start: &str, out: &mut Out) {
     let mut sbuf = [0u8; PATH_MAX];
     let start_abs = match resolve_or_err(ctx, cwd, start, &mut sbuf) { Some(p) => p, None => return };
     let mut stack = PathStack::new();
@@ -1524,7 +1739,8 @@ fn cmd_find(ctx: &ServiceContext, cwd: &Cwd, target: &str, start: &str) {
             if let Some(clen) = join_path(&dir[..dlen], name, &mut child) {
                 let hit = if is_glob { glob_match(target, name) } else { contains(name, target) };
                 if hit {
-                    ctx.console_writeln(str_of(&child[..clen]));
+                    // The matched paths are the pipe data; the summary below is metadata.
+                    out.line(ctx, str_of(&child[..clen]));
                     matches += 1;
                 }
                 if is_dir {
@@ -1546,12 +1762,12 @@ fn cmd_find(ctx: &ServiceContext, cwd: &Cwd, target: &str, start: &str) {
 /// pushed so siblings nest correctly, and a directory's whole subtree drains before its next
 /// sibling (LIFO + reverse-push). ASCII only (2 spaces per level, `/` marks directories) —
 /// the framebuffer console renders no box-drawing glyphs.
-fn cmd_tree(ctx: &ServiceContext, cwd: &Cwd, arg: &str) {
+fn cmd_tree(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) {
     let mut buf = [0u8; PATH_MAX];
     let start = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return };
     match stat_kind(ctx, start) {
         Some(true)  => {}
-        Some(false) => { ctx.console_writeln(str_of(start)); ctx.console_writeln("0 directories, 1 file"); return; }
+        Some(false) => { out.line(ctx, str_of(start)); out.line(ctx, "0 directories, 1 file"); return; }
         None        => { ctx.console_writeln_fmt(format_args!("tree: not found: {}", str_of(start))); return; }
     }
     let mut stack = TreeStack::new();
@@ -1560,10 +1776,10 @@ fn cmd_tree(ctx: &ServiceContext, cwd: &Cwd, arg: &str) {
     while let Some((plen, is_dir, depth)) = stack.pop(&mut buf) {
         // Print this node: indent by depth; root shows its full path, deeper nodes their
         // basename; a trailing '/' marks a directory.
-        for _ in 0..depth { ctx.console_write("  "); }
+        for _ in 0..depth { out.put(ctx, "  "); }
         let name = if depth == 0 { &buf[..plen] } else { basename(&buf[..plen]) };
-        if is_dir { ctx.console_writeln_fmt(format_args!("{}/", str_of(name))); }
-        else      { ctx.console_writeln(str_of(name)); }
+        if is_dir { out.line_fmt(ctx, format_args!("{}/", str_of(name))); }
+        else      { out.line(ctx, str_of(name)); }
         if !is_dir { files += 1; continue; }
         if depth > 0 { dirs += 1; }
 
@@ -1602,7 +1818,7 @@ fn cmd_tree(ctx: &ServiceContext, cwd: &Cwd, arg: &str) {
         ctx.console_writeln_fmt(format_args!(
             "tree: truncated — more than {} pending entries (bounded walk)", TREE_CAP));
     }
-    ctx.console_writeln_fmt(format_args!(
+    out.line_fmt(ctx, format_args!(
         "{} director{}, {} file{}",
         dirs, if dirs == 1 { "y" } else { "ies" }, files, if files == 1 { "" } else { "s" }));
 }

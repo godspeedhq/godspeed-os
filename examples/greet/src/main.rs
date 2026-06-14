@@ -27,10 +27,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         Some(sink) => {
             for line in lines.iter() {
                 let msg = Message::from_bytes(line.as_bytes());
-                // Blocking send: the sink (upper) wakes and drains each line.
+                // Blocking send: the sink (upper, or the shell as a `| write` sink) wakes and
+                // drains each line.
                 let _ = ctx.send_by_handle(sink, &msg);
             }
-            ctx.log("greet: sent 3 lines through the delegated pipe cap");
+            // End-of-stream marker: a one-byte EOT (0x04). A built-in sink (the shell draining
+            // `greet | write file`) recvs until it sees this, so it knows the stream is done
+            // without waiting forever. (A zero-length message is not a reliable signal — the
+            // IPC path does not deliver an empty body.) A service sink like `upper` just
+            // uppercases the control byte harmlessly.
+            let _ = ctx.send_by_handle(sink, &Message::from_bytes(&[0x04]));
+            ctx.log("greet: sent 3 lines + EOF through the delegated pipe cap");
         }
         None => {
             ctx.log("greet: no pipe cap was delegated — nothing to send to");

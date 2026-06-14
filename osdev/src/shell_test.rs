@@ -825,6 +825,39 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     }
     let _ = run!(b"cd /\r", 10);
 
+    // ── pipes: built-ins and services compose, both directions (Appendix D) ─────────
+    // builtin producer → write-file sink: capture echo's output to a file.
+    let _ = run!(b"echo piped-to-file | write /pipe1.txt\r", 10);
+    match run!(b"read /pipe1.txt\r", 10) {
+        Some(r) => check!(r.contains("piped-to-file"), "pipe: builtin | write file (echo → file)"),
+        None    => { println!("files-test: FAIL — pipe echo|write timeout"); fail += 1; }
+    }
+    // builtin producer (find, glob) → write-file sink: capture a listing to a file.
+    match run!(b"find *.txt /docs | write /found.txt\r", 12) {
+        Some(r) => check!(r.contains("piped") && r.contains("found.txt"), "pipe: find | write file (wired)"),
+        None    => { println!("files-test: FAIL — pipe find|write timeout"); fail += 1; }
+    }
+    match run!(b"read /found.txt\r", 10) {
+        Some(r) => check!(r.contains("/docs/inside.txt"), "pipe: find | write captured the matches"),
+        None    => { println!("files-test: FAIL — read found.txt timeout"); fail += 1; }
+    }
+    // builtin producer → service sink: echo's text through the `upper` filter service, which
+    // logs each line uppercased. Proves the shell brokers a cap to a service it doesn't contract.
+    match run!(b"echo hello pipes | upper\r", 14) {
+        Some(r) => check!(r.contains("HELLO PIPES") && r.contains("piped"), "pipe: builtin | service (echo → upper → HELLO PIPES)"),
+        None    => { println!("files-test: FAIL — pipe echo|upper timeout"); fail += 1; }
+    }
+    // service producer → write-file sink: capture `greet`'s output to a file. The shell is the
+    // sink: it drains greet's stream (EOF = empty message) and writes it.
+    match run!(b"greet | write /greetout.txt\r", 14) {
+        Some(r) => check!(r.contains("piped") && r.contains("greetout.txt"), "pipe: service | write file (greet → file)"),
+        None    => { println!("files-test: FAIL — pipe greet|write timeout"); fail += 1; }
+    }
+    match run!(b"read /greetout.txt\r", 10) {
+        Some(r) => check!(r.contains("hello from godspeed"), "pipe: service | write captured greet's output"),
+        None    => { println!("files-test: FAIL — read greetout timeout"); fail += 1; }
+    }
+
     child.kill().ok();
     child.wait().ok();
     println!("\nfiles-test: {pass} passed, {fail} failed");

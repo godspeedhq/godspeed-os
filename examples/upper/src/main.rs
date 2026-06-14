@@ -12,12 +12,19 @@ use godspeed_sdk::ServiceContext;
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
+    // Announce ourselves to the registry so a built-in pipe producer (the shell capturing
+    // `echo … | upper`) can resolve our endpoint at runtime and send us its text. A sink
+    // service still needs no knowledge of *who* sends — only that it is discoverable.
+    let _ = ctx.register("upper");
     ctx.log("upper: ready");
 
     let mut out = [0u8; 256];
     loop {
         let msg = ctx.recv();
         let src = msg.payload_bytes();
+        // A producer ends its stream with a lone EOT (0x04) sentinel; ignore it (there is
+        // nothing to uppercase) so the pipe's tail isn't a blank line.
+        if src == [0x04] { continue; }
         let n = src.len().min(out.len());
         for i in 0..n {
             let c = src[i];
