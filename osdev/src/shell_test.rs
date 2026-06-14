@@ -714,6 +714,53 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL — mkdir strict timeout"); fail += 1; }
     }
 
+    // ── recursive copy + delete (non-empty directories) ───────────────────────────
+    // Build a small subtree: /grove/{leaf1.txt, branch/leaf2.txt}.
+    let _ = run!(b"mkdir /grove\r", 10);
+    let _ = run!(b"write /grove/leaf1.txt apple\r", 10);
+    let _ = run!(b"mkdir /grove/branch\r", 10);
+    let _ = run!(b"write /grove/branch/leaf2.txt cherry\r", 10);
+
+    // copy recursive: whole subtree → /orchard (2 dirs: root + branch; 2 files).
+    match run!(b"copy /grove /orchard recursive\r", 12) {
+        Some(r) => check!(r.contains("copied") && r.contains("2 dirs") && r.contains("2 files"),
+                          "copy recursive: /grove → /orchard (2 dirs, 2 files)"),
+        None    => { println!("files-test: FAIL — copy recursive timeout"); fail += 1; }
+    }
+    match run!(b"read /orchard/branch/leaf2.txt\r", 10) {
+        Some(r) => check!(r.contains("cherry"), "copy recursive: nested file copied with content"),
+        None    => { println!("files-test: FAIL — read deep copy timeout"); fail += 1; }
+    }
+    match run!(b"read /orchard/leaf1.txt\r", 10) {
+        Some(r) => check!(r.contains("apple"), "copy recursive: top-level file copied"),
+        None    => { println!("files-test: FAIL — read shallow copy timeout"); fail += 1; }
+    }
+    // Guard: copying a directory into its own subtree is refused (would never terminate).
+    match run!(b"copy /grove /grove/inner recursive\r", 10) {
+        Some(r) => check!(r.contains("cannot copy into itself"), "copy recursive: refuses copy into own subtree"),
+        None    => { println!("files-test: FAIL — copy-into-self timeout"); fail += 1; }
+    }
+    // Plain delete still refuses a non-empty directory (recursive is opt-in).
+    match run!(b"delete /grove\r", 10) {
+        Some(r) => check!(r.contains("delete: failed"), "delete (non-recursive): refuses non-empty dir"),
+        None    => { println!("files-test: FAIL — delete non-empty timeout"); fail += 1; }
+    }
+    // delete recursive: removes the whole source subtree.
+    match run!(b"delete /grove recursive\r", 12) {
+        Some(r) => check!(r.contains("deleted (recursive)"), "delete recursive: /grove subtree removed"),
+        None    => { println!("files-test: FAIL — delete recursive timeout"); fail += 1; }
+    }
+    match run!(b"ls /\r", 10) {
+        Some(r) => check!(!r.contains("grove") && r.contains("orchard"),
+                          "delete recursive: /grove gone, /orchard (the copy) survives"),
+        None    => { println!("files-test: FAIL — ls after recursive delete timeout"); fail += 1; }
+    }
+    // The copy is independent — its nested file is intact after the source was deleted.
+    match run!(b"read /orchard/branch/leaf2.txt\r", 10) {
+        Some(r) => check!(r.contains("cherry"), "copy is independent of the deleted source"),
+        None    => { println!("files-test: FAIL — read copy after delete timeout"); fail += 1; }
+    }
+
     child.kill().ok();
     child.wait().ok();
     println!("\nfiles-test: {pass} passed, {fail} failed");

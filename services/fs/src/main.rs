@@ -37,6 +37,11 @@ const BITS_PER_BMBLOCK: u64 = (BLOCK as u64) * 8; // 4096 bits per bitmap block
 const REC_SIZE: usize = 64;
 const RECS_PER_BLOCK: usize = BLOCK / REC_SIZE; // 8
 const NAME_MAX: usize = 38; // entry: type u8 @0, name_len u8 @1, name[38] @2, size @40, first @48, count @56
+
+// Recursive-delete depth cap (§26.6). Paths are capped well below this by the wire
+// `path_len` (u8) and the shell's PATH_MAX (120), so this is a backstop, not the binding
+// limit — a too-deep tree is refused loudly rather than risking the service stack.
+const MAX_TREE_DEPTH: u32 = 64;
 const LABEL_MAX: usize = 31; // superblock: label_len u8 @76, label[31] @77
 
 const ITYPE_FREE: u8 = 0;
@@ -64,6 +69,7 @@ const OP_RENAME: u8 = 15;
 const OP_DELETE: u8 = 16;
 const OP_MOVE: u8 = 17;
 const OP_MKDIR_P: u8 = 18; // mkdir creating any missing parent directories
+const OP_DELETE_TREE: u8 = 19; // delete a file or a WHOLE subtree (recursive)
 // drives API.
 const OP_DRIVES_INFO: u8 = 20;
 const OP_FLASH: u8 = 21;
@@ -291,6 +297,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
         },
         OP_RENAME => send(&[match fs.rename(ctx, path, tail) { Ok(()) => FS_OK, Err(_) => FS_ERR }]),
         OP_DELETE => send(&[match fs.delete(ctx, path) { Ok(()) => FS_OK, Err(_) => FS_ERR }]),
+        OP_DELETE_TREE => send(&[match fs.delete_tree(ctx, path) { Ok(()) => FS_OK, Err(_) => FS_ERR }]),
         OP_MOVE => send(&[match fs.move_path(ctx, path, tail) { Ok(()) => FS_OK, Err(_) => FS_ERR }]),
         _ => send(&[FS_ERR]),
     }
@@ -745,6 +752,50 @@ impl Fs {
         let (parent, name) = self.walk_parent(ctx, path).ok_or("not found")?;
         self.dir_remove(ctx, &parent, name)?;
         self.free_run(ctx, e.first_block, e.block_count)
+    }
+
+    /// `delete … recursive`: remove a file or a WHOLE subtree. Unlinks the entry from its
+    /// parent, then frees the entry and every descendant via `free_subtree`. A file is just
+    /// the depth-0 case (no children), so this is a strict superset of `delete`.
+    fn delete_tree(&mut self, ctx: &ServiceContext, path: &[u8]) -> Result<(), &'static str> {
+        let e = self.walk(ctx, path).ok_or("not found")?;
+        if e.loc.is_none() { return Err("cannot delete root"); }
+        // Unlink first so a mid-walk failure can't leave the parent pointing at half-freed
+        // blocks; the subtree is then unreachable and we reclaim it.
+        let (parent, name) = self.walk_parent(ctx, path).ok_or("not found")?;
+        self.dir_remove(ctx, &parent, name)?;
+        self.free_subtree(ctx, e.itype, e.first_block, e.block_count, 0)
+    }
+
+    /// Free an entry's blocks and, if it is a directory, all of its descendants first
+    /// (post-order). Bounded two ways (§26.6): a hard **depth** cap, and small stack frames —
+    /// each level extracts its block's child extents into fixed locals (≤8 per block) and
+    /// drops the 512-byte block buffer *before* recursing, so a frame never carries it down.
+    fn free_subtree(&mut self, ctx: &ServiceContext, itype: u8, first: u64, count: u64, depth: u32)
+        -> Result<(), &'static str> {
+        if depth > MAX_TREE_DEPTH { return Err("tree too deep"); }
+        if itype == ITYPE_DIR {
+            for bi in 0..count {
+                // Scope the block read so `blk` is gone before we recurse into the children.
+                let (kids, nk) = {
+                    let blk = block_read(ctx, first + bi).ok_or("dir read failed")?;
+                    let mut kids = [(0u8, 0u64, 0u64); RECS_PER_BLOCK];
+                    let mut nk = 0usize;
+                    for slot in 0..RECS_PER_BLOCK {
+                        let o = slot * REC_SIZE;
+                        if blk[o] == ITYPE_FREE { continue; }
+                        kids[nk] = (blk[o], u64_at(&blk, o + 48), u64_at(&blk, o + 56));
+                        nk += 1;
+                    }
+                    (kids, nk)
+                };
+                for k in 0..nk {
+                    let (kt, kf, kc) = kids[k];
+                    self.free_subtree(ctx, kt, kf, kc, depth + 1)?;
+                }
+            }
+        }
+        self.free_run(ctx, first, count)
     }
 
     /// Move (relink) an entry: same data, new directory/name. Same-directory move is a
