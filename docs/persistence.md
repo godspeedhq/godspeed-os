@@ -356,6 +356,51 @@ is), never an `inode`. "Index node" hid implementation jargon ("node") in a user
 This supersedes §6.2 as the target. §6.2 (GSFS0002, inode table) and the flat §6 (GSFS0001)
 remain the historical record.
 
+### 6.5 `fs_index` — the deferred global index (built when search pulls it in)
+
+> **Specified 2026-06-14, deliberately NOT built (§26.2).** A design the conversation
+> converged on and want on record, so the day it's needed it snaps on cleanly.
+
+**Two distinct things, two names — keep them apart:**
+
+- **`file_record`** — the *per-file/dir* metadata: the self-describing directory entry
+  `{type, name, size, first_block, block_count}` of §6.4. One record per file, lives in the
+  tree. This is the **unit** (never `inode` — "index node" smuggled impl-jargon into a user
+  word; `file_record` says what it is).
+- **`fs_index`** — a global index built *over all* `file_records`, for fast
+  **whole-filesystem enumeration**. This is the **aggregate**. (`fs_index`, not `fs_record`:
+  "index" is the honest word for an aggregate lookup structure and doesn't collide with the
+  per-file `file_record`; it also keeps the half of "inode" that made sense — *index* — and
+  drops the half that didn't — *node*.)
+
+**Why it's deferred.** The three GSFS0003 structures already serve every *current*
+operation: mount (superblock + bitmap), path lookup (walk the path), `ls` (one directory),
+free space (the bitmap). The **only** thing `fs_index` accelerates is whole-FS enumeration —
+a `find`, a global search, an "every file" view — which GodspeedOS does not have yet. So by
+§26.2 it is built the day such a command pulls it into existence, not before.
+
+**How it works when built** (the part worth recording now):
+
+- **`fs` maintains it inline — no events, no interrupts, no new caps.** `fs` is the single
+  authority through which every create / delete / rename / move flows, so it doesn't need to
+  be *notified* of a change — it *is* the change, and updates `fs_index` in the **same
+  operation** that mutates the tree. The "event" is the op; `fs` is already there (§8
+  ownership paying off — one owner of the filesystem, one place that maintains its index).
+- **Tree is truth; `fs_index` is a derived cache.** Steady state is **synchronous** (tree +
+  index written together → immediately consistent, not "eventual").
+- **Crash repair is the only eventual part.** A dirty flag: clean → trust the index; dirty →
+  rebuild by walking the tree **once**, lazily / in the background while still serving from
+  the tree. The tree is *always* authoritative.
+- **On disk, disposable, rebuildable, non-authoritative, and visible** (§26.4) — never
+  RAM-resident (a trillion 64-byte records won't fit), never the source of truth, never a
+  hidden layer.
+- **Cross-instance falls out for free.** Unplug a drive, replug into another GodspeedOS
+  instance: it reads `fs_index`, trusts it if clean, reconciles by walking if dirty — a fast
+  remount without re-walking the whole tree, with eventual-consistency repair while in use.
+
+Specified, not built. GSFS0003 ships the three structures (§6.4); `fs_index` is the layer
+that snaps on when search arrives.
+
 ## 7. File = capability (the north star)
 
 The spine that makes this filesystem *ours* rather than a generic store: a file is named
