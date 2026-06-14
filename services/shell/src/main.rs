@@ -58,6 +58,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // to it) and present a clean prompt. Serial keeps the full stream. This is also
     // the first `gs> ` the serial-driven shell-test waits on.
     ctx.console_boot_complete();
+
+    // The shell owns echo from here on. The kernel's auto-echo (console_push_byte)
+    // can only echo single bytes blindly, so it prints the `[` and `A` of an arrow
+    // key's `ESC [ A` sequence before the shell consumes them — smearing "[A" onto
+    // the line. We turn kernel echo OFF and echo printable bytes ourselves below, so
+    // escape sequences are swallowed silently and line editing stays under our control.
+    ctx.console_echo(false);
     ctx.console_write("gs> ");
 
     let mut line_buf = [0u8; MAX_LINE];
@@ -65,17 +72,51 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Current location on the (single) drive: the directory bare/relative paths target,
     // moved by `cd` (utilities/17_cd.md). Session state; resets to "/" each boot.
     let mut cwd = Cwd::root();
+    // Command history for up/down-arrow recall. `nav == hist.len()` means the live line.
+    let mut hist = History::new();
+    let mut nav = 0usize;
 
     loop {
         let b = ctx.console_read();
 
         match b {
             b'\r' | b'\n' => {
+                // We own echo now, so move to a fresh line ourselves (the kernel used
+                // to echo the Enter as "\r\n").
+                ctx.console_write("\r\n");
                 if line_len > 0 {
+                    hist.push(&line_buf[..line_len]);
                     execute(&ctx, &line_buf[..line_len], &mut cwd);
                     line_len = 0;
                 }
+                nav = hist.len();
                 ctx.console_write("gs> ");
+            }
+            0x1B => {
+                // Escape sequence. Arrow keys arrive as ESC [ A/B/C/D — from a serial
+                // terminal directly, and the USB keyboard emits the same (sdk hid.rs).
+                // Up/Down walk the history; Left/Right are not handled yet (no in-line
+                // cursor movement). The two follow-up bytes are part of the sequence.
+                let b1 = ctx.console_read();
+                let b2 = ctx.console_read();
+                if b1 == b'[' {
+                    match b2 {
+                        b'A' => { // Up — older command
+                            if nav > 0 {
+                                nav -= 1;
+                                replace_line(&ctx, &mut line_buf, &mut line_len, hist.get(nav));
+                            }
+                        }
+                        b'B' => { // Down — newer command (past the end → blank live line)
+                            if nav < hist.len() {
+                                nav += 1;
+                                let line: &[u8] = if nav == hist.len() { &[] } else { hist.get(nav) };
+                                replace_line(&ctx, &mut line_buf, &mut line_len, line);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
             }
             0x7f | 0x08 => {
                 // backspace — remove last byte and erase it on the display, but
@@ -91,16 +132,65 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // Ctrl-C — clear line
                 ctx.console_writeln("^C");
                 line_len = 0;
+                nav = hist.len();
                 ctx.console_write("gs> ");
             }
             b if b >= 0x20 && b < 0x7f => {
                 if line_len < MAX_LINE {
                     line_buf[line_len] = b;
                     line_len += 1;
+                    // Echo the printable byte ourselves (kernel echo is off). Escape
+                    // sequences never reach here — they're consumed in the 0x1B arm.
+                    let s = [b];
+                    ctx.console_write(core::str::from_utf8(&s).unwrap_or(""));
                 }
             }
             _ => {}
         }
+    }
+}
+
+/// Erase the current on-screen input, then set + print `new` as the line buffer (used by
+/// up/down-arrow history recall). Erasing uses the same `\x08 \x08` the backspace path does.
+fn replace_line(ctx: &ServiceContext, buf: &mut [u8; MAX_LINE], len: &mut usize, new: &[u8]) {
+    for _ in 0..*len {
+        ctx.console_write("\x08 \x08");
+    }
+    let n = new.len().min(MAX_LINE);
+    buf[..n].copy_from_slice(&new[..n]);
+    *len = n;
+    if n > 0 {
+        ctx.console_write(core::str::from_utf8(&buf[..n]).unwrap_or(""));
+    }
+}
+
+/// A bounded ring of recent command lines for up/down-arrow recall (§26.6: fixed size,
+/// oldest dropped when full). Lives in the shell session; cleared each boot.
+const HIST_MAX: usize = 16;
+struct History {
+    lines: [[u8; MAX_LINE]; HIST_MAX],
+    lens: [usize; HIST_MAX],
+    n: usize,
+}
+impl History {
+    fn new() -> Self {
+        History { lines: [[0u8; MAX_LINE]; HIST_MAX], lens: [0; HIST_MAX], n: 0 }
+    }
+    fn len(&self) -> usize { self.n }
+    fn get(&self, i: usize) -> &[u8] { &self.lines[i][..self.lens[i]] }
+    fn push(&mut self, line: &[u8]) {
+        if self.n > 0 && self.get(self.n - 1) == line { return; } // skip consecutive dupes
+        let l = line.len().min(MAX_LINE);
+        if self.n == HIST_MAX {
+            for i in 1..HIST_MAX {
+                self.lines[i - 1] = self.lines[i];
+                self.lens[i - 1] = self.lens[i];
+            }
+            self.n = HIST_MAX - 1;
+        }
+        self.lines[self.n][..l].copy_from_slice(&line[..l]);
+        self.lens[self.n] = l;
+        self.n += 1;
     }
 }
 
@@ -674,8 +764,9 @@ fn cmd_observe_live(ctx: &ServiceContext) {
     }
     let _ = ctx.kill("observe-live"); // reap the parked instance
     // Defensive: restore the console even if the child died mid-view without
-    // restoring it (echo back on, cursor visible) so the shell stays usable.
-    ctx.console_echo(true);
+    // restoring it (cursor visible) so the shell stays usable. Echo stays OFF —
+    // the shell, not the kernel, owns echo (it echoes printable bytes itself).
+    ctx.console_echo(false);
     ctx.console_write("\x1b[?25h");
 }
 
