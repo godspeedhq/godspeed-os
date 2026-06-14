@@ -50,6 +50,5 @@ Read-only, so a **shell built-in** sending `ReadFile` to `fs` over a narrow
 
 ## 6. Conformance
 
-Like the other simple shell built-ins, `read` is listed in the shell's top-level `help`
-but does **not** yet implement its own `read help` / `read version` — the shared future
-work in `0_conventions.md` §3.
+Conforms: `read help` (usage with a real example per row) and `read version` (number +
+creator credit) per `0_conventions.md` (the shared `help_block` helper).

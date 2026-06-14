@@ -69,6 +69,5 @@ same `find` command (lazy, version-invalidated, rebuilt-from-truth — §6.5). U
 ## 6. Implementation shape & conformance
 
 A shell built-in (like the other file commands) sending `LIST_DIR` to `fs`; `fs` holds all
-disk authority. Like the other simple built-ins, `find` is listed in the shell's top-level
-`help` but does not yet implement its own `find help` / `find version` — the shared
-future-work gap in `0_conventions.md` §3.
+disk authority. Conforms: `find help` (usage with a real example per row) and
+`find version` (number + creator credit) per `0_conventions.md`.

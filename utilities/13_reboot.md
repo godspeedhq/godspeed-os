@@ -38,5 +38,5 @@ performs a hardware reset. Does not return. There is no confirmation prompt in v
 
 ## 6. Conformance
 
-Built-in: no `reboot help` / `reboot version` yet; listed by the shell's top-level
+Conforms: own `reboot help` / `reboot version` (with a real example, per `0_conventions.md`); listed by the shell's top-level
 `help` under **Power**. See `0_conventions.md` §3.

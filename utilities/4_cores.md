@@ -41,5 +41,5 @@ cores: 4
 
 ## 7. Conformance
 
-Built-in: no `cores help` / `cores version` yet; listed by the shell's top-level
+Conforms: own `cores help` / `cores version` (with a real example, per `0_conventions.md`); listed by the shell's top-level
 `help` under **System**. See `0_conventions.md` §3.

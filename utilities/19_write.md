@@ -59,6 +59,5 @@ enforces; with file-as-capability (`docs/persistence.md` §7) `write` presents a
 
 ## 6. Conformance
 
-Like the other simple shell built-ins, `write` is listed in the shell's top-level `help`
-but does **not** yet implement its own `write help` / `write version` — the shared future
-work in `0_conventions.md` §3.
+Conforms: `write help` (usage with a real example per row, incl. `write /docs/todo.txt
+"buy milk"`) and `write version` (number + creator credit) per `0_conventions.md`.

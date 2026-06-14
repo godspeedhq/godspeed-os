@@ -45,6 +45,5 @@ holds the disk authority (`Mkdir`, op 13) and enforces.
 
 ## 6. Conformance
 
-Like the other simple shell built-ins, `mkdir` is listed in the shell's top-level `help`
-but does **not** yet implement its own `mkdir help` / `mkdir version` — the shared future
-work in `0_conventions.md` §3.
+Conforms: `mkdir help` (usage with a real example per row) and `mkdir version` (number +
+creator credit) per `0_conventions.md` (the shared `help_block` helper).

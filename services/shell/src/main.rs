@@ -26,7 +26,6 @@ const FS_NOTFOUND: u8 = 2;
 const FS_NOFS: u8 = 3;
 const LABEL_MAX: usize = 31;
 const PATH_MAX: usize = 120; // fits in MAX_LINE; path_len is u8
-const DRIVES_VERSION: &str = "drives 0.1.0";
 
 // Entry point called by the kernel after spawning this service.
 // ctx.console_writeln() appends a newline. The kernel echoes each console keystroke to the
@@ -141,6 +140,17 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
     }
     if argc == 0 { return; }
 
+    // Per-utility `help` / `version` (0_conventions.md): every utility self-documents.
+    // `<util> help` and `<util> version` are intercepted here for every utility; subcommand
+    // help (`<util> <sub> help`, e.g. `drives flash help`) is intercepted just below.
+    if argc == 2 && is_util(args[0]) {
+        if args[1] == "version" { util_version(ctx, args[0]); return; }
+        if args[1] == "help" { util_help(ctx, args[0]); return; }
+    }
+    if argc == 3 && args[2] == "help" && is_util(args[0]) {
+        if sub_help(ctx, args[0], args[1]) { return; }
+    }
+
     match args[0] {
         "help"    => cmd_help(ctx),
         "clear"   => cmd_clear(ctx),
@@ -222,6 +232,167 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-utility help + version (0_conventions.md). Every utility self-documents:
+// `<util> help` prints usage with a real example per row; `<util> version` prints the
+// version + creator credit. The format lives in ONE place (`help_block`) so all utilities
+// render identically and a tweak updates every one at once.
+// ---------------------------------------------------------------------------
+
+const UTIL_VERSION: &str = "0.1.0";
+
+/// Utilities that self-document (gates the `help`/`version` intercept in `execute`).
+const UTILS: &[&str] = &[
+    "echo", "clear", "about", "mem", "cores", "date", "status", "observe", "caps",
+    "spawn", "kill", "restart", "reboot", "drives", "ls", "cd", "read", "write",
+    "mkdir", "copy", "move", "rename", "delete", "find",
+];
+fn is_util(name: &str) -> bool { UTILS.contains(&name) }
+
+/// `<util> version` — version number, then creator credit.
+fn util_version(ctx: &ServiceContext, util: &str) {
+    ctx.console_writeln_fmt(format_args!("{} {}", util, UTIL_VERSION));
+    ctx.console_writeln("Created by Bankole Ogundero.");
+}
+
+/// One usage row: (signature with `<placeholders>`, description, a real example).
+type Row = (&'static str, &'static str, &'static str);
+
+/// Render the standard help block: `<title> <ver> — <desc>`, each usage row followed by a
+/// real example, then (for a top-level utility) the version/help footer.
+fn help_block(ctx: &ServiceContext, title: &str, desc: &str, rows: &[Row], footer: bool) {
+    ctx.console_writeln_fmt(format_args!("{} {} — {}", title, UTIL_VERSION, desc));
+    ctx.console_writeln("");
+    ctx.console_writeln("usage:");
+    for (sig, d, ex) in rows {
+        ctx.console_writeln_fmt(format_args!("  {:<28}  {}", sig, d));
+        if !ex.is_empty() {
+            ctx.console_writeln_fmt(format_args!("      e.g. {}", ex));
+        }
+    }
+    if footer {
+        ctx.console_writeln_fmt(format_args!("  {} version", title));
+        ctx.console_writeln_fmt(format_args!("  {} help", title));
+    }
+}
+
+/// `<util> help` — usage with examples. Returns false for an unknown name.
+fn util_help(ctx: &ServiceContext, util: &str) -> bool {
+    match util {
+        "echo" => help_block(ctx, "echo", "print text", &[
+            ("echo <text>", "print text verbatim", "echo hello world"),
+        ], true),
+        "clear" => help_block(ctx, "clear", "clear the screen", &[
+            ("clear", "clear the screen and home the cursor", "clear"),
+        ], true),
+        "about" => help_block(ctx, "about", "system identity + credits", &[
+            ("about", "name, core count, creator", "about"),
+        ], true),
+        "mem" => help_block(ctx, "mem", "physical memory usage", &[
+            ("mem", "used / total / free physical memory", "mem"),
+        ], true),
+        "cores" => help_block(ctx, "cores", "CPU core count", &[
+            ("cores", "how many CPU cores are up", "cores"),
+        ], true),
+        "date" => help_block(ctx, "date", "date + time from the hardware clock", &[
+            ("date", "full timestamp (weekday date time)", "date"),
+            ("date epoch", "seconds since 1970-01-01", "date epoch"),
+        ], true),
+        "status" => help_block(ctx, "status", "list all live tasks", &[
+            ("status", "slot, name, core, state of every task", "status"),
+        ], true),
+        "observe" => help_block(ctx, "observe", "live system metrics view", &[
+            ("observe", "full-screen live view (q to quit)", "observe"),
+            ("observe now", "one-shot metrics frame", "observe now"),
+        ], true),
+        "caps" => help_block(ctx, "caps", "show a service's capabilities", &[
+            ("caps", "this shell's own capabilities", "caps"),
+            ("caps <service>", "capabilities held by <service>", "caps logger"),
+        ], true),
+        "spawn" => help_block(ctx, "spawn", "start a service", &[
+            ("spawn <name>", "start the service <name>", "spawn pong"),
+        ], true),
+        "kill" => help_block(ctx, "kill", "stop a service", &[
+            ("kill <name>", "stop the running service <name>", "kill pong"),
+        ], true),
+        "restart" => help_block(ctx, "restart", "restart a service", &[
+            ("restart <name>", "restart (re-placed per contract)", "restart pong"),
+            ("restart <name> <core>", "restart on core <core>", "restart pong 2"),
+        ], true),
+        "reboot" => help_block(ctx, "reboot", "hardware reset", &[
+            ("reboot", "reset the machine", "reboot"),
+        ], true),
+        "drives" => help_block(ctx, "drives", "manage attached disks", &[
+            ("drives", "list attached drive(s)", "drives"),
+            ("drives flash [drive] [label]", "format a drive as GSFS (ERASES)", "drives flash 0 data"),
+            ("drives label [drive] <name>", "name / rename a drive", "drives label 0 archive"),
+            ("drives reset [drive]", "un-format a drive back to raw", "drives reset 0"),
+        ], true),
+        "ls" => help_block(ctx, "ls", "list a directory", &[
+            ("ls", "list the current directory", "ls"),
+            ("ls <path>", "list the directory at <path>", "ls /docs"),
+        ], true),
+        "cd" => help_block(ctx, "cd", "change current directory", &[
+            ("cd <path>", "move to <path> (no arg → root)", "cd /docs"),
+        ], true),
+        "read" => help_block(ctx, "read", "print a file", &[
+            ("read <path>", "print the contents of <path>", "read /docs/notes.txt"),
+        ], true),
+        "write" => help_block(ctx, "write", "create or overwrite a file", &[
+            ("write <path>", "create an empty file", "write /docs/todo.txt"),
+            ("write <path> <text>", "create/overwrite with text", "write /docs/todo.txt \"buy milk\""),
+        ], true),
+        "mkdir" => help_block(ctx, "mkdir", "create a directory", &[
+            ("mkdir <path>", "create the directory <path>", "mkdir /docs"),
+        ], true),
+        "copy" => help_block(ctx, "copy", "copy a file", &[
+            ("copy <src> <dst>", "copy file <src> to <dst>", "copy /docs/a.txt /docs/b.txt"),
+        ], true),
+        "move" => help_block(ctx, "move", "relocate a file or directory", &[
+            ("move <src> <dst>", "move <src> to <dst>", "move /docs/a.txt /archive/a.txt"),
+        ], true),
+        "rename" => help_block(ctx, "rename", "rename an entry in place", &[
+            ("rename <path> <newname>", "rename <path> to <newname>", "rename /docs/a.txt b.txt"),
+        ], true),
+        "delete" => help_block(ctx, "delete", "remove a file or empty directory", &[
+            ("delete <path>", "remove the file/empty dir <path>", "delete /docs/old.txt"),
+        ], true),
+        "find" => help_block(ctx, "find", "search the tree for a name", &[
+            ("find <name>", "search the whole filesystem", "find notes.txt"),
+            ("find <name> <path>", "search only under <path>", "find notes.txt /docs"),
+        ], true),
+        _ => return false,
+    }
+    true
+}
+
+/// `<util> <sub> help` — focused help for a subcommand. Returns false if not a subcommand.
+fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
+    match (util, sub) {
+        ("date", "epoch") => help_block(ctx, "date epoch", "seconds since 1970-01-01", &[
+            ("date epoch", "print epoch seconds (not POSIX 'unix')", "date epoch"),
+        ], false),
+        ("observe", "now") => help_block(ctx, "observe now", "one-shot metrics frame", &[
+            ("observe now", "print a single metrics frame and return", "observe now"),
+        ], false),
+        ("drives", "flash") => help_block(ctx, "drives flash", "format a drive as GSFS (ERASES it; asks y/N)", &[
+            ("drives flash", "format the only drive, no label", "drives flash"),
+            ("drives flash <label>", "format + name it", "drives flash data"),
+            ("drives flash <drive> <label>", "format drive <drive>, name it", "drives flash 0 data"),
+        ], false),
+        ("drives", "label") => help_block(ctx, "drives label", "name / rename a drive", &[
+            ("drives label <name>", "name the only drive", "drives label archive"),
+            ("drives label <drive> <name>", "name drive <drive>", "drives label 0 archive"),
+        ], false),
+        ("drives", "reset") => help_block(ctx, "drives reset", "un-format a drive back to raw (ERASES; asks y/N)", &[
+            ("drives reset", "un-format the only drive", "drives reset"),
+            ("drives reset <drive>", "un-format drive <drive>", "drives reset 0"),
+        ], false),
+        _ => return false,
+    }
+    true
+}
+
 fn cmd_help(ctx: &ServiceContext) {
     ctx.console_writeln("GodspeedOS shell commands");
     ctx.console_writeln("");
@@ -259,6 +430,8 @@ fn cmd_help(ctx: &ServiceContext) {
     ctx.console_writeln("");
     ctx.console_writeln("Power");
     help_line(ctx, "reboot", "hardware reset");
+    ctx.console_writeln("");
+    ctx.console_writeln("Type '<command> help' for usage + examples, '<command> version' for the version.");
 }
 
 /// One "  command  description" row. The command is left-justified to a fixed
@@ -1121,11 +1294,11 @@ fn cmd_drives(ctx: &ServiceContext, args: &[&str], argc: usize) {
             let sel = if argc >= 3 { args[2] } else { "" };
             if drive_sel_ok(ctx, sel) { drives_reset(ctx); }
         }
-        "version" => ctx.console_writeln(DRIVES_VERSION),
-        "help"    => drives_help(ctx),
+        // `drives help` / `drives version` and `drives <sub> help` are handled by the
+        // generic per-utility intercept in `execute` (0_conventions.md).
         other     => {
             ctx.console_writeln_fmt(format_args!("drives: unknown subcommand '{}'", other));
-            drives_help(ctx);
+            util_help(ctx, "drives");
         }
     }
 }
@@ -1154,17 +1327,6 @@ fn drive_sel_ok(ctx: &ServiceContext, sel: &str) -> bool {
     true // a label selector — single drive, accept
 }
 
-fn drives_help(ctx: &ServiceContext) {
-    ctx.console_writeln_fmt(format_args!("{} — manage attached disks (format, name, list)", DRIVES_VERSION));
-    ctx.console_writeln("");
-    ctx.console_writeln("usage:");
-    help_line(ctx, "drives", "list attached drive(s)");
-    help_line(ctx, "drives flash [drive] [label]", "format as GSFS (ERASES; asks y/N)");
-    help_line(ctx, "drives label [drive] <name>", "name / rename the drive");
-    help_line(ctx, "drives reset [drive]", "un-format back to raw (ERASES; asks y/N)");
-    help_line(ctx, "drives version", "print the version");
-    help_line(ctx, "drives help", "print this message");
-}
 
 /// `drives` — list the attached drive (single-drive in step 3; index 0).
 fn drives_list(ctx: &ServiceContext) {

@@ -47,5 +47,5 @@ core count.
 
 ## 7. Conformance
 
-Built-in: no `about help` / `about version` yet; listed by the shell's top-level
+Conforms: own `about help` / `about version` (with a real example, per `0_conventions.md`); listed by the shell's top-level
 `help` under **System**. See `0_conventions.md` §3.

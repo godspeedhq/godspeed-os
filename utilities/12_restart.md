@@ -51,6 +51,6 @@ back on a **different core**: identity is stable, location is not (§11, §14.2)
 
 ## 6. Conformance
 
-Built-in: no `restart help` / `restart version` yet; listed by the shell's
+Conforms: own `restart help` / `restart version` (with a real example, per `0_conventions.md`); listed by the shell's
 top-level `help` under **Services** as `restart <name> [core]`. See
 `0_conventions.md` §3.

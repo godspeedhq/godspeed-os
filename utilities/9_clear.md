@@ -36,5 +36,5 @@ surfaces clear. The shell loop reprints the prompt afterward.
 
 ## 6. Conformance
 
-Built-in: no `clear help` / `clear version` yet; listed by the shell's top-level
+Conforms: own `clear help` / `clear version` (with a real example, per `0_conventions.md`); listed by the shell's top-level
 `help` under **Console**. See `0_conventions.md` §3.

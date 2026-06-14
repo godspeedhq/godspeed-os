@@ -57,5 +57,5 @@ service name to its scheduler slot first.
 
 ## 7. Conformance
 
-Built-in: no `caps help` / `caps version` yet; listed by the shell's top-level
+Conforms: own `caps help` / `caps version` (with a real example, per `0_conventions.md`); listed by the shell's top-level
 `help` under **Services** as `caps [service]`. See `0_conventions.md` §3.

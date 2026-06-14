@@ -42,17 +42,30 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
 
 ### Help output shape (normative)
 
+Every usage row carries **both** a placeholder signature **and** a real example — the
+placeholder teaches the grammar, the example teaches what real input looks like (not
+everyone knows what `<path>` should be filled with):
+
 ```
 <util> <version> — <one-line description>
 
 usage:
-  <util>              <default behaviour>
-  <util> <subcmd>     <what the subcommand does>
-  <util> version      print the version
-  <util> help         print this message
+  <util>                      <default behaviour>
+      e.g. <real example>
+  <util> <subcmd>             <what the subcommand does>
+      e.g. <real example>
+  <util> version              print the version
+  <util> help                 print this message
 
 subcommand help:
-  <util> <subcmd> help
+  <util> <subcmd> help        (same shape, focused on the subcommand)
+```
+
+`version` output is the name + version number, then the creator credit:
+
+```
+<util> <version>
+Created by Bankole Ogundero.
 ```
 
 ---
@@ -81,11 +94,14 @@ the same domain as `spawn`/`kill`/`restart`, prefer a standalone service.
 
 ## 3. Conformance status (as-built, honest)
 
-The full convention (per-command `help` + `version`, help-shape header) is
-implemented today **only by `observe`**, which was built spec-first against these
-rules. The simple shell built-ins (`echo`, `about`, `mem`, `cores`, `date`,
-`clear`, `status`, `caps`, `spawn`, `kill`, `restart`, `reboot`) are documented by
-the shell's top-level `help` (categorised command list) but do **not** yet
-implement their own `<util> help` / `<util> version`. Closing that gap — giving
-every built-in its own `help`/`version` — is future work, recorded here rather than
-left as a silent inconsistency (§26.4). Each built-in's doc repeats this note.
+**As of 2026-06-14, every utility conforms.** Each one implements its own
+`<util> help` (usage with a real example per row) and `<util> version` (number +
+"Created by Bankole Ogundero."), and each real subcommand (`date epoch`,
+`observe now`, `drives flash` / `label` / `reset`) has its own `<util> <subcmd> help`.
+
+The shell built-ins are driven by a single `help_block` helper (the format lives in
+one place, so all of them render identically), with `<util> help` / `<util> version`
+intercepted uniformly in the command dispatch; `observe` (a standalone service) was
+already spec-first conformant. The earlier gap — built-ins documented only by the
+top-level `help` list — is closed. (Still open, separately: the top-level `help`
+command is the categorised list, not itself a `help`-shaped utility.)

@@ -284,6 +284,29 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
+    // Per-utility help / version (0_conventions.md): every utility self-documents,
+    // with a real example per usage row and a creator credit in `version`.
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"write help\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => {
+            check!(r.contains("write 0.1.0") && r.contains("create or overwrite"), "write help: header + version");
+            check!(r.contains("<path>") && r.contains("e.g.") && r.contains("buy milk"), "write help: placeholder + real example");
+        }
+        None => { println!("shell-test: FAIL — timed out after `write help`  [×2]"); fail += 2; }
+    }
+    send(&mut write_half, b"ls version\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("ls 0.1.0") && r.contains("Created by Bankole Ogundero"), "ls version: number + creator credit"),
+        None    => { println!("shell-test: FAIL — timed out after `ls version`"); fail += 1; }
+    }
+    send(&mut write_half, b"drives flash help\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("drives flash") && r.contains("drives flash 0 data"), "subcommand help: drives flash help + example"),
+        None    => { println!("shell-test: FAIL — timed out after `drives flash help`"); fail += 1; }
+    }
+
+    // -----------------------------------------------------------------------
     // Done.
     // -----------------------------------------------------------------------
     child.kill().ok();

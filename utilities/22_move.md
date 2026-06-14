@@ -49,4 +49,4 @@ Mutating, least-authority shape of the writers (`19_write.md` §4): `fs` copy + 
 
 ## 6. Conformance
 
-Will be built spec-first against `0_conventions.md`: its own `move help` / `move version`.
+Conforms: own `move help` / `move version` (with a real example, per `0_conventions.md`).

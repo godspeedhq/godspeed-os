@@ -48,5 +48,5 @@ Frames are 4 KiB pages, from the kernel frame allocator via introspection:
 
 ## 7. Conformance
 
-Built-in: no `mem help` / `mem version` yet; listed by the shell's top-level `help`
+Conforms: own `mem help` / `mem version` (with a real example, per `0_conventions.md`); listed by the shell's top-level `help`
 under **System**. See `0_conventions.md` §3.

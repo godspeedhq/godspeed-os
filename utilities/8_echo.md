@@ -41,5 +41,5 @@ hello from the shell
 
 ## 6. Conformance
 
-Built-in: no `echo help` / `echo version` yet; listed by the shell's top-level
+Conforms: own `echo help` / `echo version` (with a real example, per `0_conventions.md`); listed by the shell's top-level
 `help` under **Console** as `echo <text>`. See `0_conventions.md` §3.

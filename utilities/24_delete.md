@@ -49,4 +49,4 @@ TBD) that unlinks the entry, frees the inode, and returns the data blocks to the
 
 ## 6. Conformance
 
-Will be built spec-first against `0_conventions.md`: its own `delete help` / `delete version`.
+Conforms: own `delete help` / `delete version` (with a real example, per `0_conventions.md`).
