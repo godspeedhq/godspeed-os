@@ -692,6 +692,23 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         Some(r) => check!(r.contains("find: 2 match"), "find: substring match (.txt → 2 files)"),
         None    => { println!("files-test: FAIL — find substring timeout"); fail += 1; }
     }
+    // find glob: `*.txt` is anchored — matches names ENDING in .txt (inside.txt, note.txt = 2),
+    // unlike the substring form which would also match a "txt" anywhere.
+    match run!(b"find *.txt\r", 10) {
+        Some(r) => check!(r.contains("find: 2 match"), "find: glob '*.txt' (anchored, 2 files)"),
+        None    => { println!("files-test: FAIL — find glob *.txt timeout"); fail += 1; }
+    }
+    // find glob `?`: f? matches the 2-char names f1..f9 (9) but NOT f10 (3 chars) — proves
+    // single-char `?` and whole-name anchoring. Substring 'f?' would match nothing literally.
+    match run!(b"find f?\r", 10) {
+        Some(r) => check!(r.contains("find: 9 match"), "find: glob 'f?' (9 of f1..f10, not f10)"),
+        None    => { println!("files-test: FAIL — find glob f? timeout"); fail += 1; }
+    }
+    // glob is anchored both ends: `inside.*` matches inside.txt (1), not a mere substring.
+    match run!(b"find inside.*\r", 10) {
+        Some(r) => check!(r.contains("/docs/inside.txt") && r.contains("find: 1 match"), "find: glob 'inside.*' (1 file)"),
+        None    => { println!("files-test: FAIL — find glob inside.* timeout"); fail += 1; }
+    }
 
     // ls shows file sizes: /docs/inside.txt holds "nested-content" = 14 bytes.
     match run!(b"ls /docs\r", 10) {
