@@ -14,6 +14,8 @@ const OP_STAT_FILE: u8 = 12;
 const OP_MKDIR: u8 = 13;
 const OP_LIST_DIR: u8 = 14;
 const OP_RENAME: u8 = 15;
+const OP_DELETE: u8 = 16;
+const OP_MOVE: u8 = 17;
 // drives ops:
 const OP_DRIVES_INFO: u8 = 20;
 const OP_FLASH: u8 = 21;
@@ -197,6 +199,14 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
             if argc < 3 { ctx.console_writeln("usage: rename <path> <newname>"); }
             else { cmd_rename(ctx, cwd, args[1], args[2]); }
         }
+        "delete"  => {
+            if argc < 2 { ctx.console_writeln("usage: delete <path>"); }
+            else { cmd_delete(ctx, cwd, args[1]); }
+        }
+        "move"    => {
+            if argc < 3 { ctx.console_writeln("usage: move <src> <dst>"); }
+            else { cmd_move(ctx, cwd, args[1], args[2]); }
+        }
         other => {
             // Build "unknown: <cmd>" in a stack buffer to avoid two ctx.log calls
             let mut buf = [0u8; 64];
@@ -238,7 +248,9 @@ fn cmd_help(ctx: &ServiceContext) {
     help_line(ctx, "write <path> [text]", "create/overwrite a file");
     help_line(ctx, "mkdir <path>", "create a directory");
     help_line(ctx, "copy <src> <dst>", "copy a file");
+    help_line(ctx, "move <src> <dst>", "relocate a file/dir");
     help_line(ctx, "rename <path> <name>", "rename an entry in place");
+    help_line(ctx, "delete <path>", "remove a file/empty dir");
     ctx.console_writeln("");
     ctx.console_writeln("Power");
     help_line(ctx, "reboot", "hardware reset");
@@ -923,6 +935,54 @@ fn cmd_rename(ctx: &ServiceContext, cwd: &Cwd, path: &str, newname: &str) {
         Some(r) if no_fs(ctx, r.payload_bytes()) => {}
         Some(_) => ctx.console_writeln("rename: failed (not found, or name exists, or bad name)"),
         None    => ctx.console_writeln("rename: storage unavailable"),
+    }
+}
+
+/// `delete <path>` — remove a file or empty directory (frees its blocks; fs reclaims).
+fn cmd_delete(ctx: &ServiceContext, cwd: &Cwd, arg: &str) {
+    let mut buf = [0u8; PATH_MAX];
+    let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return };
+    if path == b"/" {
+        ctx.console_writeln("delete: cannot delete the root directory");
+        return;
+    }
+    let mut pp = [0u8; PATH_MAX];
+    let pl = path.len();
+    pp[..pl].copy_from_slice(path);
+    match fs_request(ctx, OP_DELETE, &pp[..pl], &[]) {
+        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
+            ctx.console_writeln_fmt(format_args!("deleted {}", str_of(&pp[..pl])));
+        }
+        Some(r) if no_fs(ctx, r.payload_bytes()) => {}
+        Some(_) => ctx.console_writeln("delete: failed (not found, or directory not empty?)"),
+        None    => ctx.console_writeln("delete: storage unavailable"),
+    }
+}
+
+/// `move <src> <dst>` — relocate an entry (same data; only the directory entries change).
+fn cmd_move(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) {
+    let mut sbuf = [0u8; PATH_MAX];
+    let spath = match resolve_or_err(ctx, cwd, src, &mut sbuf) { Some(p) => p, None => return };
+    let mut sp = [0u8; PATH_MAX];
+    let sl = spath.len();
+    sp[..sl].copy_from_slice(spath);
+    let mut dbuf = [0u8; PATH_MAX];
+    let dpath = match resolve_or_err(ctx, cwd, dst, &mut dbuf) { Some(p) => p, None => return };
+    let mut dp = [0u8; PATH_MAX];
+    let dl = dpath.len();
+    dp[..dl].copy_from_slice(dpath);
+    // Guard against moving a directory into itself or its own subtree (would orphan it).
+    if dp[..dl] == sp[..sl] || (dl > sl && dp[..sl] == sp[..sl] && dp[sl] == b'/') {
+        ctx.console_writeln("move: cannot move into itself");
+        return;
+    }
+    match fs_request(ctx, OP_MOVE, &sp[..sl], &dp[..dl]) {
+        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
+            ctx.console_writeln_fmt(format_args!("moved {} → {}", str_of(&sp[..sl]), str_of(&dp[..dl])));
+        }
+        Some(r) if no_fs(ctx, r.payload_bytes()) => {}
+        Some(_) => ctx.console_writeln("move: failed (not found, or dest exists?)"),
+        None    => ctx.console_writeln("move: storage unavailable"),
     }
 }
 

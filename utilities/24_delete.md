@@ -1,8 +1,9 @@
 # Utility: `delete` — remove a file or directory
 
-**Status:** Design — **gated on GSFS free-space reclamation** (delete frees blocks, which
-Phase-2 GSFS does not yet do — the bump allocator leaks). Names the verb now; built when
-reclamation lands. Trails `CLAUDE.md`; does not amend it.
+**Status:** **Built + QEMU-verified** (`osdev test files` 21/21) on GSFS0003 — reclamation is
+intrinsic (delete clears the entry and frees its blocks in the bitmap). Removes a file or an
+**empty** directory (a non-empty directory is a loud error; recursive delete is future work).
+Trails `CLAUDE.md`; does not amend it.
 
 ---
 

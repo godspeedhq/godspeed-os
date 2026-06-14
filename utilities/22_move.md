@@ -1,8 +1,9 @@
 # Utility: `move` — relocate a file
 
-**Status:** Design — **gated on GSFS free-space reclamation** (the delete-source step frees
-blocks, which Phase-2 GSFS does not yet do — the bump allocator leaks). Names the verb now;
-built when reclamation lands. Trails `CLAUDE.md`; does not amend it.
+**Status:** **Built + QEMU-verified** (`osdev test files` 21/21) on GSFS0003. Same-drive move
+is a **relink** — only the directory entries change, no data copied and (so) no reclamation
+needed; `fs` treats a same-directory move as a rename. (Cross-drive move = copy + delete is
+later, with multi-drive.) Trails `CLAUDE.md`; does not amend it.
 
 ---
 

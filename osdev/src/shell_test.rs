@@ -586,6 +586,45 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL — ls after rename timeout"); fail += 1; }
     }
 
+    // delete (GSFS0003: frees blocks, reclaims) — file then re-list shows it gone.
+    match run!(b"delete /docs/renamed.txt\r", 10) {
+        Some(r) => check!(r.contains("deleted"), "delete /docs/renamed.txt"),
+        None    => { println!("files-test: FAIL — delete timeout"); fail += 1; }
+    }
+    match run!(b"ls /docs\r", 10) {
+        Some(r) => check!(!r.contains("renamed.txt"), "ls: deleted file is gone"),
+        None    => { println!("files-test: FAIL — ls after delete timeout"); fail += 1; }
+    }
+
+    // move (relink) — into the /docs/sub directory created earlier.
+    match run!(b"move /docs/note.txt /docs/sub/note.txt\r", 10) {
+        Some(r) => check!(r.contains("moved"), "move /docs/note.txt → /docs/sub/note.txt"),
+        None    => { println!("files-test: FAIL — move timeout"); fail += 1; }
+    }
+    match run!(b"ls /docs/sub\r", 10) {
+        Some(r) => check!(r.contains("note.txt"), "ls /docs/sub shows moved file"),
+        None    => { println!("files-test: FAIL — ls sub timeout"); fail += 1; }
+    }
+    match run!(b"read /docs/sub/note.txt\r", 10) {
+        Some(r) => check!(r.contains("hello world"), "moved file keeps its content"),
+        None    => { println!("files-test: FAIL — read moved timeout"); fail += 1; }
+    }
+
+    // Directory growth: write 10 files into one directory (a dir block holds 8 entries),
+    // forcing the directory to grow a second block — proving there's no per-dir cap.
+    let _ = run!(b"mkdir /big\r", 10);
+    for i in 1..=10 {
+        let cmd = format!("write /big/f{} x\r", i);
+        let _ = run!(cmd.as_bytes(), 10);
+    }
+    match run!(b"ls /big\r", 10) {
+        Some(r) => {
+            let n = (1..=10).filter(|i| r.contains(&format!("f{}", i))).count();
+            check!(n == 10, "directory grew past 8 entries (no per-dir cap) — 10 files listed");
+        }
+        None => { println!("files-test: FAIL — ls /big timeout"); fail += 1; }
+    }
+
     child.kill().ok();
     child.wait().ok();
     println!("\nfiles-test: {pass} passed, {fail} failed");
