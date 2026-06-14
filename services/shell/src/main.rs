@@ -24,6 +24,7 @@ const OP_RENAME: u8 = 15;
 const OP_DELETE: u8 = 16;
 const OP_MOVE: u8 = 17;
 const OP_MKDIR_P: u8 = 18;
+const OP_DELETE_TREE: u8 = 19; // delete a file or a whole subtree (recursive)
 // drives ops:
 const OP_DRIVES_INFO: u8 = 20;
 const OP_FLASH: u8 = 21;
@@ -301,7 +302,9 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
         }
         "cd"      => cmd_cd(ctx, cwd, if argc >= 2 { args[1] } else { "/" }),
         "copy"    => {
-            if argc < 3 { ctx.console_writeln("usage: copy <src> <dst>"); }
+            // `copy <src> <dst>` (file) or `copy <src> <dst> recursive` (whole subtree).
+            if argc < 3 { ctx.console_writeln("usage: copy <src> <dst> [recursive]"); }
+            else if argc >= 4 && args[3] == "recursive" { cmd_copy_tree(ctx, cwd, args[1], args[2]); }
             else { cmd_copy(ctx, cwd, args[1], args[2]); }
         }
         "rename"  => {
@@ -309,8 +312,9 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
             else { cmd_rename(ctx, cwd, args[1], args[2]); }
         }
         "delete"  => {
-            if argc < 2 { ctx.console_writeln("usage: delete <path>"); }
-            else { cmd_delete(ctx, cwd, args[1]); }
+            // `delete <path>` (file/empty dir) or `delete <path> recursive` (whole subtree).
+            if argc < 2 { ctx.console_writeln("usage: delete <path> [recursive]"); }
+            else { cmd_delete(ctx, cwd, args[1], argc >= 3 && args[2] == "recursive"); }
         }
         "move"    => {
             if argc < 3 { ctx.console_writeln("usage: move <src> <dst>"); }
@@ -445,8 +449,9 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("mkdir <path>", "create the directory <path>", "mkdir /docs"),
             ("mkdir <path> parents", "create missing parent dirs too", "mkdir /a/b/c parents"),
         ], true),
-        "copy" => help_block(ctx, "copy", "copy a file", &[
+        "copy" => help_block(ctx, "copy", "copy a file or a whole subtree", &[
             ("copy <src> <dst>", "copy file <src> to <dst>", "copy /docs/a.txt /docs/b.txt"),
+            ("copy <src> <dst> recursive", "copy directory <src> and everything under it", "copy /docs /backup recursive"),
         ], true),
         "move" => help_block(ctx, "move", "relocate a file or directory", &[
             ("move <src> <dst>", "move <src> to <dst>", "move /docs/a.txt /archive/a.txt"),
@@ -454,8 +459,9 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "rename" => help_block(ctx, "rename", "rename an entry in place", &[
             ("rename <path> <newname>", "rename <path> to <newname>", "rename /docs/a.txt b.txt"),
         ], true),
-        "delete" => help_block(ctx, "delete", "remove a file or empty directory", &[
+        "delete" => help_block(ctx, "delete", "remove a file, empty directory, or whole subtree", &[
             ("delete <path>", "remove the file/empty dir <path>", "delete /docs/old.txt"),
+            ("delete <path> recursive", "remove directory <path> and everything under it", "delete /docs recursive"),
         ], true),
         "find" => help_block(ctx, "find", "search the tree for a name (substring match)", &[
             ("find <name>", "search everywhere; matches names containing <name>", "find report"),
@@ -522,10 +528,10 @@ fn cmd_help(ctx: &ServiceContext) {
     help_line(ctx, "read <path>", "print a file");
     help_line(ctx, "write <path> [text]", "create/overwrite a file");
     help_line(ctx, "mkdir <path> [parents]", "create a directory");
-    help_line(ctx, "copy <src> <dst>", "copy a file");
+    help_line(ctx, "copy <src> <dst> [recursive]", "copy a file or subtree");
     help_line(ctx, "move <src> <dst>", "relocate a file/dir");
     help_line(ctx, "rename <path> <name>", "rename an entry in place");
-    help_line(ctx, "delete <path>", "remove a file/empty dir");
+    help_line(ctx, "delete <path> [recursive]", "remove a file/dir/subtree");
     help_line(ctx, "find <name> [path]", "search the tree for a name");
     ctx.console_writeln("");
     ctx.console_writeln("Power");
@@ -1207,6 +1213,126 @@ fn cmd_copy(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) {
     }
 }
 
+/// `copy <src> <dst> recursive` — copy a whole subtree. Reuses the SAME bounded walk
+/// (`PathStack`) `find` uses (§26.6): pop a source dir, recreate it under `dst`, then for
+/// each child either copy the file (read+write, existing ops) or push the subdir. No new fs
+/// surface — copy already lives in the shell. Loud if the tree is wider than the walk's cap
+/// (§3.12), and refuses to copy a directory into its own subtree (would never terminate).
+fn cmd_copy_tree(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) {
+    let mut sbuf = [0u8; PATH_MAX];
+    let src_abs = match resolve_or_err(ctx, cwd, src, &mut sbuf) { Some(p) => p, None => return };
+    let mut sp = [0u8; PATH_MAX];
+    let sl = src_abs.len();
+    sp[..sl].copy_from_slice(src_abs);
+    if &sp[..sl] == b"/" { ctx.console_writeln("copy: cannot copy the root directory"); return; }
+
+    let mut dbuf = [0u8; PATH_MAX];
+    let dst_abs = match resolve_or_err(ctx, cwd, dst, &mut dbuf) { Some(p) => p, None => return };
+    let mut dp = [0u8; PATH_MAX];
+    let dl = dst_abs.len();
+    dp[..dl].copy_from_slice(dst_abs);
+    // Dest inside src (or equal) → the walk would copy what it just created, forever.
+    if dp[..dl] == sp[..sl] || (dl > sl && dp[..sl] == sp[..sl] && dp[sl] == b'/') {
+        ctx.console_writeln("copy: cannot copy into itself");
+        return;
+    }
+
+    // A plain file? Fall back to the single-file copy (this command is for subtrees).
+    match stat_kind(ctx, &sp[..sl]) {
+        Some(false) => { cmd_copy(ctx, cwd, src, dst); return; }
+        Some(true)  => {}
+        None        => { ctx.console_writeln_fmt(format_args!("copy: source not found: {}", str_of(&sp[..sl]))); return; }
+    }
+
+    // Create the destination root, then walk the source breadth-first.
+    if !mkdir_at(ctx, &dp[..dl]) {
+        ctx.console_writeln("copy: cannot create destination (already exists?)");
+        return;
+    }
+    let mut stack = PathStack::new();
+    stack.push(&sp[..sl]);
+    let (mut dirs, mut files) = (1u32, 0u32);
+    let mut data = [0u8; 4096];
+    while let Some(slen) = stack.pop(&mut sbuf) {
+        let reply = match fs_request(ctx, OP_LIST_DIR, &sbuf[..slen], &[]) {
+            Some(r) => r,
+            None => { ctx.console_writeln("copy: storage unavailable"); return; }
+        };
+        let p = reply.payload_bytes();
+        if no_fs(ctx, p) { return; }
+        if p.first() != Some(&FS_OK) || p.len() < 2 { continue; }
+        let count = p[1] as usize;
+        let mut i = 2usize;
+        for _ in 0..count {
+            if i >= p.len() { break; }
+            let nl = p[i] as usize;
+            i += 1;
+            if i + nl + 1 + 8 > p.len() { break; }
+            let name = &p[i..i + nl];
+            let is_dir = p[i + nl] != 0;
+            i += nl + 1 + 8; // name_len + name + is_dir + size:u64
+            let mut schild = [0u8; PATH_MAX];
+            let clen = match join_path(&sbuf[..slen], name, &mut schild) { Some(c) => c, None => continue };
+            let mut dchild = [0u8; PATH_MAX];
+            let dclen = match remap(&dp[..dl], &sp[..sl], &schild[..clen], &mut dchild) { Some(c) => c, None => continue };
+            if is_dir {
+                if mkdir_at(ctx, &dchild[..dclen]) { dirs += 1; }
+                stack.push(&schild[..clen]);
+            } else if copy_one(ctx, &schild[..clen], &dchild[..dclen], &mut data) {
+                files += 1;
+            }
+        }
+    }
+    if stack.overflow {
+        ctx.console_writeln_fmt(format_args!(
+            "copy: truncated — tree wider than {} pending directories (bounded walk)", FIND_QCAP));
+    }
+    ctx.console_writeln_fmt(format_args!(
+        "copied {} → {} ({} dirs, {} files)", str_of(&sp[..sl]), str_of(&dp[..dl]), dirs, files));
+}
+
+/// Stat a path: `Some(is_dir)` if it exists, `None` if not (or storage is down).
+fn stat_kind(ctx: &ServiceContext, path: &[u8]) -> Option<bool> {
+    let reply = fs_request(ctx, OP_STAT_FILE, path, &[])?;
+    let p = reply.payload_bytes();
+    if p.first() == Some(&FS_OK) && p.len() >= 11 && p[1] == 1 { Some(p[10] != 0) } else { None }
+}
+
+/// `mkdir <path>` via fs, treating success as true. Used by recursive copy to recreate dirs.
+fn mkdir_at(ctx: &ServiceContext, path: &[u8]) -> bool {
+    matches!(fs_request(ctx, OP_MKDIR, path, &[]), Some(r) if r.payload_bytes().first() == Some(&FS_OK))
+}
+
+/// Copy one file `src`→`dst` (read then write). Returns true on success; logs on failure so a
+/// single bad file in a subtree copy is visible but does not abort the whole walk (§3.12).
+fn copy_one(ctx: &ServiceContext, src: &[u8], dst: &[u8], data: &mut [u8; 4096]) -> bool {
+    let reply = match fs_request(ctx, OP_READ_FILE, src, &[]) { Some(r) => r, None => return false };
+    let p = reply.payload_bytes();
+    if p.first() != Some(&FS_OK) || p.len() < 5 {
+        ctx.console_writeln_fmt(format_args!("copy: skipped (read failed): {}", str_of(src)));
+        return false;
+    }
+    let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
+    let end = (5 + n).min(p.len());
+    let dn = end - 5;
+    data[..dn].copy_from_slice(&p[5..end]);
+    drop(reply);
+    match fs_request(ctx, OP_WRITE_FILE, dst, &data[..dn]) {
+        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => true,
+        _ => { ctx.console_writeln_fmt(format_args!("copy: skipped (write failed): {}", str_of(dst))); false }
+    }
+}
+
+/// Map a source path under `src_root` onto `dst_root`: `dst_root + (s - src_root)`. `s` always
+/// begins with `src_root` (it came from walking under it), so the suffix is the relative tail.
+fn remap(dst_root: &[u8], src_root: &[u8], s: &[u8], out: &mut [u8; PATH_MAX]) -> Option<usize> {
+    let suffix = &s[src_root.len()..]; // "" for the root itself, else "/sub/..."
+    if dst_root.len() + suffix.len() > PATH_MAX { return None; }
+    out[..dst_root.len()].copy_from_slice(dst_root);
+    out[dst_root.len()..dst_root.len() + suffix.len()].copy_from_slice(suffix);
+    Some(dst_root.len() + suffix.len())
+}
+
 /// `rename <path> <newname>` — rename an entry in place (not a move; newname is one
 /// component). fs edits the directory entry; no blocks are read or freed.
 fn cmd_rename(ctx: &ServiceContext, cwd: &Cwd, path: &str, newname: &str) {
@@ -1226,8 +1352,10 @@ fn cmd_rename(ctx: &ServiceContext, cwd: &Cwd, path: &str, newname: &str) {
     }
 }
 
-/// `delete <path>` — remove a file or empty directory (frees its blocks; fs reclaims).
-fn cmd_delete(ctx: &ServiceContext, cwd: &Cwd, arg: &str) {
+/// `delete <path>` — remove a file or empty directory; `delete <path> recursive` removes a
+/// whole subtree. fs does the work either way (plain = `OP_DELETE`, recursive =
+/// `OP_DELETE_TREE`, a depth-bounded subtree free); it frees the blocks and reclaims them.
+fn cmd_delete(ctx: &ServiceContext, cwd: &Cwd, arg: &str, recursive: bool) {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return };
     if path == b"/" {
@@ -1237,12 +1365,15 @@ fn cmd_delete(ctx: &ServiceContext, cwd: &Cwd, arg: &str) {
     let mut pp = [0u8; PATH_MAX];
     let pl = path.len();
     pp[..pl].copy_from_slice(path);
-    match fs_request(ctx, OP_DELETE, &pp[..pl], &[]) {
+    let op = if recursive { OP_DELETE_TREE } else { OP_DELETE };
+    match fs_request(ctx, op, &pp[..pl], &[]) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
-            ctx.console_writeln_fmt(format_args!("deleted {}", str_of(&pp[..pl])));
+            let what = if recursive { "deleted (recursive)" } else { "deleted" };
+            ctx.console_writeln_fmt(format_args!("{} {}", what, str_of(&pp[..pl])));
         }
         Some(r) if no_fs(ctx, r.payload_bytes()) => {}
-        Some(_) => ctx.console_writeln("delete: failed (not found, or directory not empty?)"),
+        Some(_) if recursive => ctx.console_writeln("delete: failed (not found, or tree too deep?)"),
+        Some(_) => ctx.console_writeln("delete: failed (not found, or directory not empty? use 'delete <path> recursive')"),
         None    => ctx.console_writeln("delete: storage unavailable"),
     }
 }
