@@ -381,22 +381,37 @@ a `find`, a global search, an "every file" view — which GodspeedOS does not ha
 
 **How it works when built** (the part worth recording now):
 
-- **`fs` maintains it inline — no events, no interrupts, no new caps.** `fs` is the single
-  authority through which every create / delete / rename / move flows, so it doesn't need to
-  be *notified* of a change — it *is* the change, and updates `fs_index` in the **same
-  operation** that mutates the tree. The "event" is the op; `fs` is already there (§8
-  ownership paying off — one owner of the filesystem, one place that maintains its index).
-- **Tree is truth; `fs_index` is a derived cache.** Steady state is **synchronous** (tree +
-  index written together → immediately consistent, not "eventual").
-- **Crash repair is the only eventual part.** A dirty flag: clean → trust the index; dirty →
-  rebuild by walking the tree **once**, lazily / in the background while still serving from
-  the tree. The tree is *always* authoritative.
+- **Single owner, single-threaded → no concurrency to reconcile.** `fs` serves one IPC
+  request at a time; "operations in different places" are just different *clients*, but they
+  **queue at `fs` and run serialized**. No structure is ever mutated in parallel — no races
+  on the tree, the bitmap, or the index (the §8-ownership simplifier).
+- **The truth — tree + bitmap — is ALWAYS strongly consistent.** `fs` updates them inline,
+  per op, before serving the next request. A million ops = a million serialized; there is
+  *never* an eventual window on the truth. Any reader needing the authoritative answer reads
+  the tree, always current.
+- **`fs_index` is lazy, version-invalidated, rebuilt-from-truth — and *that* is the eventual
+  part, safely.** Writes do **not** touch the index; each mutation just bumps a cheap
+  tree-version counter, so the hot path is untaxed even under a million ops. When the index
+  is actually *read* (a `find`), `fs` compares versions; if stale, it **rebuilds the index by
+  walking the tree once** — bounded by *tree size*, not by the churn that invalidated it.
+  Eventual consistency is harmless here because the index is **never authoritative**: a
+  fresh index, a stale index, or a fallback to the tree all yield a correct answer. (This
+  refines an earlier "update inline on every write" framing — taxing every write to keep a
+  *rarely-read* index live is the wrong trade; mark-stale + rebuild-on-read keeps writes fast
+  and is still always-correct.)
+- **No events, interrupts, or new caps.** `fs` is the sole mutation point, so "the index
+  changed" is just "`fs` did an op + bumped the version." Crash repair is the *same*
+  mechanism: a stale/dirty version → rebuild from the tree.
 - **On disk, disposable, rebuildable, non-authoritative, and visible** (§26.4) — never
   RAM-resident (a trillion 64-byte records won't fit), never the source of truth, never a
   hidden layer.
 - **Cross-instance falls out for free.** Unplug a drive, replug into another GodspeedOS
-  instance: it reads `fs_index`, trusts it if clean, reconciles by walking if dirty — a fast
-  remount without re-walking the whole tree, with eventual-consistency repair while in use.
+  instance: it reads `fs_index`, trusts it if the version matches, rebuilds from the tree if
+  stale — a fast remount without re-walking the whole tree.
+- **Escape hatch for a giant tree:** if even the rebuild-on-`find` walk ever gets too slow,
+  *then* add incremental maintenance — an append-only change log + a background applier that
+  drains it into the index (classic write-ahead-log eventual consistency). A heavier machine
+  pulled in only by a measured need (§26.2), not now.
 
 Specified, not built. GSFS0003 ships the three structures (§6.4); `fs_index` is the layer
 that snaps on when search arrives.
