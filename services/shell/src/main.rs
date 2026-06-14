@@ -324,6 +324,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
             if argc < 2 { ctx.console_writeln("usage: find <name> [path]"); }
             else { cmd_find(ctx, cwd, args[1], if argc >= 3 { args[2] } else { "/" }); }
         }
+        "tree"    => cmd_tree(ctx, cwd, if argc >= 2 { args[1] } else { "" }),
         other => {
             // Build "unknown: <cmd>" in a stack buffer to avoid two ctx.log calls
             let mut buf = [0u8; 64];
@@ -348,7 +349,7 @@ const UTIL_VERSION: &str = "0.1.0";
 const UTILS: &[&str] = &[
     "echo", "clear", "about", "mem", "cores", "date", "status", "observe", "caps",
     "spawn", "kill", "restart", "reboot", "drives", "ls", "cd", "read", "write",
-    "mkdir", "copy", "move", "rename", "delete", "find",
+    "mkdir", "copy", "move", "rename", "delete", "find", "tree",
 ];
 fn is_util(name: &str) -> bool { UTILS.contains(&name) }
 
@@ -467,6 +468,10 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("find <name>", "search everywhere; matches names containing <name>", "find report"),
             ("find <name> <path>", "search only under <path>", "find .txt /docs"),
         ], true),
+        "tree" => help_block(ctx, "tree", "print the directory hierarchy", &[
+            ("tree", "tree of the current directory", "tree"),
+            ("tree <path>", "tree rooted at <path>", "tree /docs"),
+        ], true),
         _ => return false,
     }
     true
@@ -533,6 +538,7 @@ fn cmd_help(ctx: &ServiceContext) {
     help_line(ctx, "rename <path> <name>", "rename an entry in place");
     help_line(ctx, "delete <path> [recursive]", "remove a file/dir/subtree");
     help_line(ctx, "find <name> [path]", "search the tree for a name");
+    help_line(ctx, "tree [path]", "print the directory hierarchy");
     ctx.console_writeln("");
     ctx.console_writeln("Power");
     help_line(ctx, "reboot", "hardware reset");
@@ -1456,6 +1462,118 @@ fn cmd_find(ctx: &ServiceContext, cwd: &Cwd, target: &str, start: &str) {
             "find: search truncated — more than {} directories pending (bounded walk)", FIND_QCAP));
     }
     ctx.console_writeln_fmt(format_args!("find: {} match(es)", matches));
+}
+
+/// `tree [path]` — print the directory hierarchy as an indented tree (default: the current
+/// directory). Same bounded-walk discipline as `find` (§26.6): a fixed-capacity explicit
+/// stack, depth-first, no recursion, loud on overflow (§3.12). Every child (file or dir) is
+/// pushed so siblings nest correctly, and a directory's whole subtree drains before its next
+/// sibling (LIFO + reverse-push). ASCII only (2 spaces per level, `/` marks directories) —
+/// the framebuffer console renders no box-drawing glyphs.
+fn cmd_tree(ctx: &ServiceContext, cwd: &Cwd, arg: &str) {
+    let mut buf = [0u8; PATH_MAX];
+    let start = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return };
+    match stat_kind(ctx, start) {
+        Some(true)  => {}
+        Some(false) => { ctx.console_writeln(str_of(start)); ctx.console_writeln("0 directories, 1 file"); return; }
+        None        => { ctx.console_writeln_fmt(format_args!("tree: not found: {}", str_of(start))); return; }
+    }
+    let mut stack = TreeStack::new();
+    stack.push(start, true, 0);
+    let (mut dirs, mut files) = (0u32, 0u32);
+    while let Some((plen, is_dir, depth)) = stack.pop(&mut buf) {
+        // Print this node: indent by depth; root shows its full path, deeper nodes their
+        // basename; a trailing '/' marks a directory.
+        for _ in 0..depth { ctx.console_write("  "); }
+        let name = if depth == 0 { &buf[..plen] } else { basename(&buf[..plen]) };
+        if is_dir { ctx.console_writeln_fmt(format_args!("{}/", str_of(name))); }
+        else      { ctx.console_writeln(str_of(name)); }
+        if !is_dir { files += 1; continue; }
+        if depth > 0 { dirs += 1; }
+
+        let reply = match fs_request(ctx, OP_LIST_DIR, &buf[..plen], &[]) {
+            Some(r) => r,
+            None => { ctx.console_writeln("tree: storage unavailable"); return; }
+        };
+        let p = reply.payload_bytes();
+        if no_fs(ctx, p) { return; }
+        if p.first() != Some(&FS_OK) || p.len() < 2 { continue; }
+        // Record each child's offset, then push in REVERSE so they pop in directory order.
+        let count = p[1] as usize;
+        let mut offs = [0usize; TREE_FANOUT];
+        let mut nc = 0usize;
+        let mut i = 2usize;
+        for _ in 0..count {
+            if i >= p.len() || nc >= TREE_FANOUT { break; }
+            let nl = p[i] as usize;
+            if i + 1 + nl + 1 + 8 > p.len() { break; }
+            offs[nc] = i;
+            nc += 1;
+            i += 1 + nl + 1 + 8;
+        }
+        for k in (0..nc).rev() {
+            let off = offs[k];
+            let nl = p[off] as usize;
+            let cname = &p[off + 1..off + 1 + nl];
+            let cdir = p[off + 1 + nl] != 0;
+            let mut child = [0u8; PATH_MAX];
+            if let Some(clen) = join_path(&buf[..plen], cname, &mut child) {
+                stack.push(&child[..clen], cdir, depth + 1);
+            }
+        }
+    }
+    if stack.overflow {
+        ctx.console_writeln_fmt(format_args!(
+            "tree: truncated — more than {} pending entries (bounded walk)", TREE_CAP));
+    }
+    ctx.console_writeln_fmt(format_args!(
+        "{} director{}, {} file{}",
+        dirs, if dirs == 1 { "y" } else { "ies" }, files, if files == 1 { "" } else { "s" }));
+}
+
+/// Last path component (`/a/b/c` → `c`); the whole path if it has no `/`.
+fn basename(path: &[u8]) -> &[u8] {
+    match path.iter().rposition(|&b| b == b'/') {
+        Some(i) => &path[i + 1..],
+        None => path,
+    }
+}
+
+/// Bounded DFS stack for `tree`: each slot carries a path, whether it is a directory, and its
+/// depth (for indentation). Fixed capacity (§26.6); pushing past it sets `overflow` so `tree`
+/// reports truncation rather than silently dropping part of the tree (§3.12).
+const TREE_CAP: usize = 96;
+const TREE_FANOUT: usize = 64; // max children read from one LIST_DIR reply (one block)
+struct TreeStack {
+    buf: [[u8; PATH_MAX]; TREE_CAP],
+    len: [usize; TREE_CAP],
+    is_dir: [bool; TREE_CAP],
+    depth: [u16; TREE_CAP],
+    top: usize,
+    overflow: bool,
+}
+impl TreeStack {
+    fn new() -> Self {
+        TreeStack {
+            buf: [[0u8; PATH_MAX]; TREE_CAP], len: [0; TREE_CAP],
+            is_dir: [false; TREE_CAP], depth: [0; TREE_CAP], top: 0, overflow: false,
+        }
+    }
+    fn push(&mut self, p: &[u8], is_dir: bool, depth: u16) {
+        if self.top >= TREE_CAP || p.len() > PATH_MAX { self.overflow = true; return; }
+        self.buf[self.top][..p.len()].copy_from_slice(p);
+        self.len[self.top] = p.len();
+        self.is_dir[self.top] = is_dir;
+        self.depth[self.top] = depth;
+        self.top += 1;
+    }
+    fn pop(&mut self, out: &mut [u8; PATH_MAX]) -> Option<(usize, bool, u16)> {
+        if self.top == 0 { return None; }
+        self.top -= 1;
+        let l = self.len[self.top];
+        out[..l].copy_from_slice(&self.buf[self.top][..l]);
+        Some((l, self.is_dir[self.top], self.depth[self.top]))
+    }
 }
 
 /// Join `dir` + `name` into an absolute child path (`/` separator, no double slash).
