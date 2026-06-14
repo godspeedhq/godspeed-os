@@ -58,6 +58,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // to it) and present a clean prompt. Serial keeps the full stream. This is also
     // the first `gs> ` the serial-driven shell-test waits on.
     ctx.console_boot_complete();
+
+    // The shell owns echo from here on. The kernel's auto-echo (console_push_byte)
+    // can only echo single bytes blindly, so it prints the `[` and `A` of an arrow
+    // key's `ESC [ A` sequence before the shell consumes them — smearing "[A" onto
+    // the line. We turn kernel echo OFF and echo printable bytes ourselves below, so
+    // escape sequences are swallowed silently and line editing stays under our control.
+    ctx.console_echo(false);
     ctx.console_write("gs> ");
 
     let mut line_buf = [0u8; MAX_LINE];
@@ -74,6 +81,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
         match b {
             b'\r' | b'\n' => {
+                // We own echo now, so move to a fresh line ourselves (the kernel used
+                // to echo the Enter as "\r\n").
+                ctx.console_write("\r\n");
                 if line_len > 0 {
                     hist.push(&line_buf[..line_len]);
                     execute(&ctx, &line_buf[..line_len], &mut cwd);
@@ -129,6 +139,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 if line_len < MAX_LINE {
                     line_buf[line_len] = b;
                     line_len += 1;
+                    // Echo the printable byte ourselves (kernel echo is off). Escape
+                    // sequences never reach here — they're consumed in the 0x1B arm.
+                    let s = [b];
+                    ctx.console_write(core::str::from_utf8(&s).unwrap_or(""));
                 }
             }
             _ => {}
@@ -750,8 +764,9 @@ fn cmd_observe_live(ctx: &ServiceContext) {
     }
     let _ = ctx.kill("observe-live"); // reap the parked instance
     // Defensive: restore the console even if the child died mid-view without
-    // restoring it (echo back on, cursor visible) so the shell stays usable.
-    ctx.console_echo(true);
+    // restoring it (cursor visible) so the shell stays usable. Echo stays OFF —
+    // the shell, not the kernel, owns echo (it echoes printable bytes itself).
+    ctx.console_echo(false);
     ctx.console_write("\x1b[?25h");
 }
 

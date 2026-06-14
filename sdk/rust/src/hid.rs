@@ -39,6 +39,7 @@ pub fn hid_to_ascii(key: u8, mods: u8) -> Option<u8> {
         0x2F => Some(if shift { b'{' } else { b'[' }),
         0x30 => Some(if shift { b'}' } else { b']' }),
         0x31 => Some(if shift { b'|' } else { b'\\' }),
+        0x32 => Some(if shift { b'~' } else { b'#' }), // Non-US # and ~ (ISO-layout extra key)
         0x33 => Some(if shift { b':' } else { b';' }),
         0x34 => Some(if shift { b'"' } else { b'\'' }), // apostrophe / quote
         0x35 => Some(if shift { b'~' } else { b'`' }),  // grave / tilde
