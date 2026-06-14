@@ -207,6 +207,10 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
             if argc < 3 { ctx.console_writeln("usage: move <src> <dst>"); }
             else { cmd_move(ctx, cwd, args[1], args[2]); }
         }
+        "find"    => {
+            if argc < 2 { ctx.console_writeln("usage: find <name> [path]"); }
+            else { cmd_find(ctx, cwd, args[1], if argc >= 3 { args[2] } else { "/" }); }
+        }
         other => {
             // Build "unknown: <cmd>" in a stack buffer to avoid two ctx.log calls
             let mut buf = [0u8; 64];
@@ -251,6 +255,7 @@ fn cmd_help(ctx: &ServiceContext) {
     help_line(ctx, "move <src> <dst>", "relocate a file/dir");
     help_line(ctx, "rename <path> <name>", "rename an entry in place");
     help_line(ctx, "delete <path>", "remove a file/empty dir");
+    help_line(ctx, "find <name> [path]", "search the tree for a name");
     ctx.console_writeln("");
     ctx.console_writeln("Power");
     help_line(ctx, "reboot", "hardware reset");
@@ -986,8 +991,108 @@ fn cmd_move(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) {
     }
 }
 
+/// `find <name> [path]` — search a subtree (default the whole filesystem, `/`) for entries
+/// named exactly `<name>`, printing each match's full path. This is whole-filesystem
+/// enumeration done the disciplined way: a **tree walk** (the tree IS the index, §6.4),
+/// client-side via LIST_DIR so results stream as found and `fs` needs no new op. The walk
+/// is bounded (a fixed pending-directory stack) and **loud on truncation** (§26.6/§3.12);
+/// the `fs_index` accelerator (persistence.md §6.5) is what we'd build if this walk ever
+/// gets too slow on a huge tree — not before.
+fn cmd_find(ctx: &ServiceContext, cwd: &Cwd, target: &str, start: &str) {
+    let mut sbuf = [0u8; PATH_MAX];
+    let start_abs = match resolve_or_err(ctx, cwd, start, &mut sbuf) { Some(p) => p, None => return };
+    let mut stack = PathStack::new();
+    stack.push(start_abs);
+
+    let target = target.as_bytes();
+    let mut matches = 0u32;
+    let mut dir = [0u8; PATH_MAX];
+    while let Some(dlen) = stack.pop(&mut dir) {
+        let reply = match fs_request(ctx, OP_LIST_DIR, &dir[..dlen], &[]) {
+            Some(r) => r,
+            None => { ctx.console_writeln("find: storage unavailable"); return; }
+        };
+        let p = reply.payload_bytes();
+        if no_fs(ctx, p) { return; }
+        if p.first() != Some(&FS_OK) || p.len() < 2 { continue; }
+        let count = p[1] as usize;
+        let mut i = 2usize;
+        for _ in 0..count {
+            if i >= p.len() { break; }
+            let nl = p[i] as usize;
+            i += 1;
+            if i + nl + 1 > p.len() { break; }
+            let name = &p[i..i + nl];
+            let is_dir = p[i + nl] != 0;
+            i += nl + 1;
+            let mut child = [0u8; PATH_MAX];
+            if let Some(clen) = join_path(&dir[..dlen], name, &mut child) {
+                if name == target {
+                    ctx.console_writeln(str_of(&child[..clen]));
+                    matches += 1;
+                }
+                if is_dir {
+                    stack.push(&child[..clen]);
+                }
+            }
+        }
+    }
+    if stack.overflow {
+        ctx.console_writeln_fmt(format_args!(
+            "find: search truncated — more than {} directories pending (bounded walk)", FIND_QCAP));
+    }
+    ctx.console_writeln_fmt(format_args!("find: {} match(es)", matches));
+}
+
+/// Join `dir` + `name` into an absolute child path (`/` separator, no double slash).
+fn join_path(dir: &[u8], name: &[u8], out: &mut [u8; PATH_MAX]) -> Option<usize> {
+    if dir.len() > PATH_MAX { return None; }
+    out[..dir.len()].copy_from_slice(dir);
+    let mut len = dir.len();
+    if len == 0 || out[len - 1] != b'/' {
+        if len >= PATH_MAX { return None; }
+        out[len] = b'/';
+        len += 1;
+    }
+    if len + name.len() > PATH_MAX { return None; }
+    out[len..len + name.len()].copy_from_slice(name);
+    Some(len + name.len())
+}
+
 fn str_of(b: &[u8]) -> &str {
     core::str::from_utf8(b).unwrap_or("?")
+}
+
+/// Bounded stack of directory paths still to visit during a `find` walk (§26.6). Pushing
+/// past the cap sets `overflow` so `find` reports the truncation rather than silently
+/// missing part of the tree (§3.12).
+const FIND_QCAP: usize = 32;
+struct PathStack {
+    buf: [[u8; PATH_MAX]; FIND_QCAP],
+    len: [usize; FIND_QCAP],
+    top: usize,
+    overflow: bool,
+}
+impl PathStack {
+    fn new() -> Self {
+        PathStack { buf: [[0u8; PATH_MAX]; FIND_QCAP], len: [0; FIND_QCAP], top: 0, overflow: false }
+    }
+    fn push(&mut self, p: &[u8]) {
+        if self.top >= FIND_QCAP || p.len() > PATH_MAX {
+            self.overflow = true;
+            return;
+        }
+        self.buf[self.top][..p.len()].copy_from_slice(p);
+        self.len[self.top] = p.len();
+        self.top += 1;
+    }
+    fn pop(&mut self, out: &mut [u8; PATH_MAX]) -> Option<usize> {
+        if self.top == 0 { return None; }
+        self.top -= 1;
+        let l = self.len[self.top];
+        out[..l].copy_from_slice(&self.buf[self.top][..l]);
+        Some(l)
+    }
 }
 
 // ---------------------------------------------------------------------------

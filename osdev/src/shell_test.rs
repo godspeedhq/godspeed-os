@@ -625,6 +625,25 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None => { println!("files-test: FAIL — ls /big timeout"); fail += 1; }
     }
 
+    // find — whole-filesystem tree walk from root. Tree now: /docs/{inside.txt, sub/note.txt},
+    // /big/{f1..f10}.
+    match run!(b"find inside.txt\r", 10) {
+        Some(r) => check!(r.contains("/docs/inside.txt") && r.contains("find: 1 match"), "find: locates /docs/inside.txt"),
+        None    => { println!("files-test: FAIL — find timeout"); fail += 1; }
+    }
+    match run!(b"find note.txt\r", 10) {
+        Some(r) => check!(r.contains("/docs/sub/note.txt") && r.contains("find: 1 match"), "find: descends into subdir (/docs/sub/note.txt)"),
+        None    => { println!("files-test: FAIL — find sub timeout"); fail += 1; }
+    }
+    match run!(b"find f5\r", 10) {
+        Some(r) => check!(r.contains("/big/f5") && r.contains("find: 1 match"), "find: locates a file in a grown directory (/big/f5)"),
+        None    => { println!("files-test: FAIL — find grown timeout"); fail += 1; }
+    }
+    match run!(b"find nope.txt\r", 10) {
+        Some(r) => check!(r.contains("find: 0 match"), "find: reports 0 matches for a missing name"),
+        None    => { println!("files-test: FAIL — find missing timeout"); fail += 1; }
+    }
+
     child.kill().ok();
     child.wait().ok();
     println!("\nfiles-test: {pass} passed, {fail} failed");
