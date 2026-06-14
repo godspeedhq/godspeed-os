@@ -356,7 +356,10 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         "upper" => Some(("upper", ServiceConfig {
             elf:               include_bytes!(env!("SVC_UPPER_ELF")),
             has_recv_endpoint: true,
-            send_peers:        &[],
+            // A pipe SINK service registers its name so a built-in producer (the shell) can
+            // resolve its endpoint via the registry (`builtin | service`). The shell holds no
+            // contracted cap to it — it looks it up at runtime, like any registry client.
+            send_peers:        &["registry"],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
             probe_mode:        0,
@@ -2732,9 +2735,11 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // Endpoint + an `fs` send-peer so the `drives`/file commands can request_with_reply
             // to `fs` (the reply-cap pattern needs the shell's own endpoint). The shell holds
             // only a narrow SEND to fs — fs enforces all disk authority. `fs` must be spawned
-            // before the shell so this cap resolves (supervisor order).
+            // before the shell so this cap resolves (supervisor order). `registry` lets the
+            // shell resolve a pipe sink's endpoint at runtime (`builtin | service`), so it can
+            // send captured output to a service it holds no contracted cap to.
             has_recv_endpoint: true,
-            send_peers:        &["fs"],
+            send_peers:        &["fs", "registry"],
             send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        0,
