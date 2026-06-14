@@ -443,9 +443,10 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "read" => help_block(ctx, "read", "print a file", &[
             ("read <path>", "print the contents of <path>", "read /docs/notes.txt"),
         ], true),
-        "write" => help_block(ctx, "write", "create or overwrite a file", &[
+        "write" => help_block(ctx, "write", "create, overwrite, or append to a file", &[
             ("write <path>", "create an empty file", "write /docs/todo.txt"),
             ("write <path> <text>", "create/overwrite with text", "write /docs/todo.txt \"buy milk\""),
+            ("write append <path> <text>", "add text to the end (create if missing)", "write append /docs/todo.txt \"eggs\""),
         ], true),
         "mkdir" => help_block(ctx, "mkdir", "create a directory", &[
             ("mkdir <path>", "create the directory <path>", "mkdir /docs"),
@@ -486,6 +487,9 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
         ], false),
         ("observe", "now") => help_block(ctx, "observe now", "one-shot metrics frame", &[
             ("observe now", "print a single metrics frame and return", "observe now"),
+        ], false),
+        ("write", "append") => help_block(ctx, "write append", "append to a file (create if missing)", &[
+            ("write append <path> <text>", "add <text> to the end of <path>", "write append /log started"),
         ], false),
         ("drives", "flash") => help_block(ctx, "drives flash", "format a drive as GSFS (ERASES it; asks y/N)", &[
             ("drives flash", "format the only drive, no label", "drives flash"),
@@ -532,7 +536,7 @@ fn cmd_help(ctx: &ServiceContext) {
     help_line(ctx, "ls [path]", "list a directory");
     help_line(ctx, "cd [path|-]", "change directory (- = previous)");
     help_line(ctx, "read <path>", "print a file");
-    help_line(ctx, "write <path> [text]", "create/overwrite a file");
+    help_line(ctx, "write [append] <path> [text]", "create/overwrite/append a file");
     help_line(ctx, "mkdir <path> [parents]", "create a directory");
     help_line(ctx, "copy <src> <dst> [recursive]", "copy a file or subtree");
     help_line(ctx, "move <src> <dst>", "relocate a file/dir");
@@ -1109,10 +1113,18 @@ fn cmd_read(ctx: &ServiceContext, cwd: &Cwd, arg: &str) {
     }
 }
 
-/// `write <path> [content]` — create/overwrite a file with the rest of the line.
+/// `write <path> [content]` overwrites; `write append <path> [content]` appends (creating the
+/// file if missing). `append` is a *leading* keyword because write's content is free-form — it
+/// can't trail the way `mkdir … parents` does (it would be swallowed as content).
 fn cmd_write(ctx: &ServiceContext, cwd: &Cwd, rest: &str) {
+    // `append` counts as the keyword only when followed by whitespace or end-of-line, so a
+    // path like "appendix.txt" is still treated as a path.
+    let (append, rest) = match rest.strip_prefix("append") {
+        Some(r) if r.is_empty() || r.starts_with(char::is_whitespace) => (true, r.trim_start()),
+        _ => (false, rest),
+    };
     if rest.is_empty() {
-        ctx.console_writeln("usage: write <path> [content]");
+        ctx.console_writeln("usage: write [append] <path> [content]");
         return;
     }
     // Split off the first token (path); the remainder (with spaces) is the content.
@@ -1126,6 +1138,10 @@ fn cmd_write(ctx: &ServiceContext, cwd: &Cwd, rest: &str) {
     let mut pbuf = [0u8; PATH_MAX];
     let pl = path.len();
     pbuf[..pl].copy_from_slice(path);
+    if append {
+        cmd_write_append(ctx, &pbuf[..pl], content.as_bytes());
+        return;
+    }
     let reply = match fs_request(ctx, OP_WRITE_FILE, &pbuf[..pl], content.as_bytes()) {
         Some(r) => r,
         None => { ctx.console_writeln("write: storage unavailable"); return; }
@@ -1136,6 +1152,42 @@ fn cmd_write(ctx: &ServiceContext, cwd: &Cwd, rest: &str) {
         ctx.console_writeln_fmt(format_args!("wrote {} ({} bytes)", str_of(&pbuf[..pl]), content.len()));
     } else {
         ctx.console_writeln("write: failed (bad path, or parent missing?)");
+    }
+}
+
+/// Append `add` to file `path`, creating it if missing. Shell-side (no new fs surface): read
+/// the current content, concatenate, write the whole file back. The combined size is bounded
+/// by `fs`'s file-size limit, which rejects an over-large WriteFile loudly.
+fn cmd_write_append(ctx: &ServiceContext, path: &[u8], add: &[u8]) {
+    let mut data = [0u8; 4096];
+    // Read existing content; an absent file just starts empty (append creates).
+    let n_old = match fs_request(ctx, OP_READ_FILE, path, &[]) {
+        Some(r) => {
+            let p = r.payload_bytes();
+            if no_fs(ctx, p) { return; }
+            if p.first() == Some(&FS_OK) && p.len() >= 5 {
+                let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
+                let end = (5 + n).min(p.len());
+                data[..end - 5].copy_from_slice(&p[5..end]);
+                end - 5
+            } else {
+                0 // NOTFOUND → create a new file with just the appended text
+            }
+        }
+        None => { ctx.console_writeln("write: storage unavailable"); return; }
+    };
+    if n_old + add.len() > data.len() {
+        ctx.console_writeln("write: append would exceed the maximum file size");
+        return;
+    }
+    data[n_old..n_old + add.len()].copy_from_slice(add);
+    let total = n_old + add.len();
+    match fs_request(ctx, OP_WRITE_FILE, path, &data[..total]) {
+        Some(r) if r.payload_bytes().first() == Some(&FS_OK) =>
+            ctx.console_writeln_fmt(format_args!("appended {} bytes to {} ({} total)", add.len(), str_of(path), total)),
+        Some(r) if no_fs(ctx, r.payload_bytes()) => {}
+        Some(_) => ctx.console_writeln("write: append failed (file-size limit, or bad path?)"),
+        None    => ctx.console_writeln("write: storage unavailable"),
     }
 }
 

@@ -297,7 +297,7 @@ pub fn run(image_path: &Path, smp: u32) {
     send(&mut write_half, b"write help\r");
     match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
         Some(r) => {
-            check!(r.contains("write 0.1.0") && r.contains("create or overwrite"), "write help: header + version");
+            check!(r.contains("write 0.1.0") && r.contains("overwrite"), "write help: header + version");
             check!(r.contains("<path>") && r.contains("e.g.") && r.contains("buy milk"), "write help: placeholder + real example");
         }
         None => { println!("shell-test: FAIL — timed out after `write help`  [×2]"); fail += 2; }
@@ -774,6 +774,25 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     match run!(b"read /orchard/branch/leaf2.txt\r", 10) {
         Some(r) => check!(r.contains("cherry"), "copy is independent of the deleted source"),
         None    => { println!("files-test: FAIL — read copy after delete timeout"); fail += 1; }
+    }
+
+    // ── write append: add to a file, and create-on-append ──────────────────────────
+    let _ = run!(b"write /applog AAA\r", 10);
+    let _ = run!(b"write append /applog BBB\r", 10);
+    match run!(b"read /applog\r", 10) {
+        Some(r) => check!(r.contains("AAABBB"), "write append: appends without overwriting"),
+        None    => { println!("files-test: FAIL — read appended timeout"); fail += 1; }
+    }
+    // append to a missing file creates it.
+    let _ = run!(b"write append /freshlog ZZZ\r", 10);
+    match run!(b"read /freshlog\r", 10) {
+        Some(r) => check!(r.contains("ZZZ"), "write append: creates the file when missing"),
+        None    => { println!("files-test: FAIL — read created-by-append timeout"); fail += 1; }
+    }
+    // a path literally starting with "append" is still a path, not the keyword.
+    match run!(b"write appendix.txt hi\r", 10) {
+        Some(r) => check!(r.contains("wrote") && r.contains("appendix.txt"), "write: 'appendix.txt' is a path, not the append keyword"),
+        None    => { println!("files-test: FAIL — appendix path timeout"); fail += 1; }
     }
 
     // ── cd - : toggle to the previous directory ────────────────────────────────────
