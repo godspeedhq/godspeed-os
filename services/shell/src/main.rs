@@ -438,6 +438,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         ], true),
         "cd" => help_block(ctx, "cd", "change current directory", &[
             ("cd <path>", "move to <path> (no arg → root)", "cd /docs"),
+            ("cd -", "move to the previous directory", "cd -"),
         ], true),
         "read" => help_block(ctx, "read", "print a file", &[
             ("read <path>", "print the contents of <path>", "read /docs/notes.txt"),
@@ -529,7 +530,7 @@ fn cmd_help(ctx: &ServiceContext) {
     ctx.console_writeln("Storage");
     help_line(ctx, "drives [flash|label|reset]", "manage attached disks (drives help)");
     help_line(ctx, "ls [path]", "list a directory");
-    help_line(ctx, "cd [path]", "change current directory");
+    help_line(ctx, "cd [path|-]", "change directory (- = previous)");
     help_line(ctx, "read <path>", "print a file");
     help_line(ctx, "write <path> [text]", "create/overwrite a file");
     help_line(ctx, "mkdir <path> [parents]", "create a directory");
@@ -946,22 +947,31 @@ fn cmd_restart(ctx: &ServiceContext, name: &str, core: Option<u32>) {
 // absolute paths from root (it has no notion of "current directory").
 // ---------------------------------------------------------------------------
 
-/// The current directory on the (single) drive — an absolute path like "/" or "/etc".
+/// The current directory on the (single) drive — an absolute path like "/" or "/etc". Also
+/// remembers the *previous* directory so `cd -` can toggle back (both default to root).
 struct Cwd {
     buf: [u8; PATH_MAX],
     len: usize,
+    prev: [u8; PATH_MAX],
+    prev_len: usize,
 }
 
 impl Cwd {
     fn root() -> Self {
         let mut buf = [0u8; PATH_MAX];
         buf[0] = b'/';
-        Cwd { buf, len: 1 }
+        let mut prev = [0u8; PATH_MAX];
+        prev[0] = b'/';
+        Cwd { buf, len: 1, prev, prev_len: 1 }
     }
     fn as_str(&self) -> &str {
         core::str::from_utf8(&self.buf[..self.len]).unwrap_or("/")
     }
+    /// Move to `path`, saving the directory we're leaving as the previous (for `cd -`). Only
+    /// ever called on a *successful* cd, so `prev` always names a directory that existed.
     fn set(&mut self, path: &[u8]) {
+        self.prev[..self.len].copy_from_slice(&self.buf[..self.len]);
+        self.prev_len = self.len;
         let n = path.len().min(PATH_MAX);
         self.buf[..n].copy_from_slice(&path[..n]);
         self.len = n.max(1);
@@ -1152,7 +1162,15 @@ fn cmd_mkdir(ctx: &ServiceContext, cwd: &Cwd, arg: &str, parents: bool) {
 /// `cd [path]` — change the current directory (validates it exists + is a directory).
 fn cmd_cd(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str) {
     let mut buf = [0u8; PATH_MAX];
-    let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return };
+    // `cd -` toggles to the previous directory (already an absolute, normalized path — use it
+    // directly, then run the same stat-validated switch so a since-deleted dir errors loudly).
+    let path: &[u8] = if arg == "-" {
+        let pl = cwd.prev_len;
+        buf[..pl].copy_from_slice(&cwd.prev[..pl]);
+        &buf[..pl]
+    } else {
+        match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return }
+    };
     // Root always exists — no need to stat it.
     if path == b"/" {
         cwd.set(b"/");

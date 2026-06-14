@@ -776,6 +776,19 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL — read copy after delete timeout"); fail += 1; }
     }
 
+    // ── cd - : toggle to the previous directory ────────────────────────────────────
+    let _ = run!(b"cd /docs\r", 10);
+    let _ = run!(b"cd /big\r", 10);
+    match run!(b"cd -\r", 10) {
+        Some(r) => check!(r.contains("/docs"), "cd -: returns to the previous directory"),
+        None    => { println!("files-test: FAIL — cd - timeout"); fail += 1; }
+    }
+    match run!(b"cd -\r", 10) {
+        Some(r) => check!(r.contains("/big"), "cd -: toggles back to where we just were"),
+        None    => { println!("files-test: FAIL — cd - toggle timeout"); fail += 1; }
+    }
+    let _ = run!(b"cd /\r", 10);
+
     child.kill().ok();
     child.wait().ok();
     println!("\nfiles-test: {pass} passed, {fail} failed");
