@@ -714,6 +714,21 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL — mkdir strict timeout"); fail += 1; }
     }
 
+    // ── tree: indented hierarchy ───────────────────────────────────────────────────
+    // Build /t/{a.txt, sub/b.txt}, then `tree /t` shows nesting + a correct summary.
+    let _ = run!(b"mkdir /t\r", 10);
+    let _ = run!(b"write /t/a.txt x\r", 10);
+    let _ = run!(b"mkdir /t/sub\r", 10);
+    let _ = run!(b"write /t/sub/b.txt y\r", 10);
+    match run!(b"tree /t\r", 12) {
+        Some(r) => {
+            check!(r.contains("sub/"), "tree: marks a directory with '/'");
+            check!(r.contains("    b.txt"), "tree: nests a grandchild (4-space indent)");
+            check!(r.contains("1 directory, 2 files"), "tree: summary counts dirs + files");
+        }
+        None => { println!("files-test: FAIL — tree timeout"); fail += 1; }
+    }
+
     // ── recursive copy + delete (non-empty directories) ───────────────────────────
     // Build a small subtree: /grove/{leaf1.txt, branch/leaf2.txt}.
     let _ = run!(b"mkdir /grove\r", 10);
