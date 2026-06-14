@@ -22,6 +22,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     loop {
         let msg = ctx.recv();
         let src = msg.payload_bytes();
+        // A producer ends its stream with a lone EOT (0x04) sentinel; ignore it (there is
+        // nothing to uppercase) so the pipe's tail isn't a blank line.
+        if src == [0x04] { continue; }
         let n = src.len().min(out.len());
         for i in 0..n {
             let c = src[i];
