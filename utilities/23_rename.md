@@ -1,8 +1,8 @@
 # Utility: `rename` — rename a file or directory in place
 
-**Status:** Design — built in the file-commands step (step 4) on hierarchical GSFS
-(`docs/persistence.md`). Mutating but **needs no reclamation** (it only edits a directory
-entry), so it works on Phase-2 GSFS. Trails `CLAUDE.md`; does not amend it.
+**Status:** **Built + QEMU-verified** (`osdev test files` 15/15) — a shell built-in over
+the `fs` RENAME op, which edits the directory entry in place (no reclamation needed). On
+hierarchical GSFS (`docs/persistence.md`). Trails `CLAUDE.md`; does not amend it.
 
 ---
 

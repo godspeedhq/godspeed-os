@@ -300,6 +300,122 @@ format's birth, and never revisit the ceiling.
 
 This supersedes the flat §6 format as the target; the flat version remains the
 historical Phase-1 record.
+
+### 6.4 Phase 3 — the scalable format (GSFS0003): free bitmap + self-describing entries, no inode table
+
+> **Decided 2026-06-14, from first principles.** The §6.2 inode-table format shipped and
+> works, but it reaches for two POSIX ideas it doesn't need and one that doesn't scale:
+> the word/concept **`inode`** (a metadata "node" — index-node — kept apart from the name,
+> which exists in Unix mainly for **hard links**, which GSFS doesn't have), and a **fixed
+> global inode cap (256)** — absurdly small on a 122 GB disk. This phase replaces both.
+
+**First-principles structure set — exactly three things on disk:**
+
+1. **Superblock.**
+2. **Free bitmap** — one bit per block (set = used). The *only* global structure, and it is
+   a **free map, not a file index**. Read **on demand** (one ~512-byte bitmap block covers
+   4096 data blocks) + a small "last allocated" hint, so the allocator's RAM footprint is a
+   few hundred bytes regardless of file count. This is *not* a POSIX reflex — it answers a
+   **physical** constraint (you cannot cheaply enumerate N allocations by walking the tree
+   or caching every record in RAM) that applies to any OS. Battle-tested because of physics,
+   not because Unix.
+3. **The directory tree.** A directory is a file (type = dir) whose blocks hold
+   **self-describing entries** — each entry carries its own metadata, so there is **no inode
+   table and no inode number**:
+   ```
+   Superblock (LBA 0): magic "GSFS0003", version, block_size, total_blocks:u64,
+       bitmap_start:u64, bitmap_blocks:u64, data_start:u64,
+       root_first_block:u64, root_block_count:u64,   ← root has no parent → its extent here
+       flags (DEFAULT bit), label[N]
+   Directory entry (64 B): type u8 (free|file|dir), name_len u8, name[38],
+       size:u64, first_block:u64, block_count:u64
+   ```
+
+**Why no separate `file_record` and no global index** (the questions that drove this):
+
+- **No separate record** — the self-describing entry *is* the record. Name and metadata
+  travel together; there is no second copy to reconcile (on-disk duplication is what
+  creates inconsistency, so we keep a single on-disk truth).
+- **No global index** — its two possible jobs are already covered. *Finding* a file = walk
+  the path from root: **the directory tree is the index**, hierarchical and distributed
+  (each directory indexes its own children). *Free space* = the bitmap. Nothing needs a
+  flat global list.
+- **A global accelerator** (skip the walk for hot paths) would be a *performance* cache. If
+  a measured need ever pulls one in (§26.2), it lives **on disk, rebuildable, disposable,
+  never RAM-resident, never authoritative** (the tree stays truth) and **visible, not a
+  hidden layer** (§26.4). Not built now.
+
+**Bounds (still bounded, §26.6) — but local, not a global wall:** the only ceiling is the
+disk itself (the bitmap). Directories **grow** (allocate a bigger extent when full), so
+there is no per-directory entry cap either; name length is fixed (38). Reclamation is
+intrinsic: `delete`/overwrite flip bits free; the allocator finds a free run in the bitmap.
+
+**Renaming:** the metadata record is a **`file_record`** (self-justifying — it says what it
+is), never an `inode`. "Index node" hid implementation jargon ("node") in a user-facing word.
+
+This supersedes §6.2 as the target. §6.2 (GSFS0002, inode table) and the flat §6 (GSFS0001)
+remain the historical record.
+
+### 6.5 `fs_index` — the deferred global index (built when search pulls it in)
+
+> **Specified 2026-06-14, deliberately NOT built (§26.2).** A design the conversation
+> converged on and want on record, so the day it's needed it snaps on cleanly.
+
+**Two distinct things, two names — keep them apart:**
+
+- **`file_record`** — the *per-file/dir* metadata: the self-describing directory entry
+  `{type, name, size, first_block, block_count}` of §6.4. One record per file, lives in the
+  tree. This is the **unit** (never `inode` — "index node" smuggled impl-jargon into a user
+  word; `file_record` says what it is).
+- **`fs_index`** — a global index built *over all* `file_records`, for fast
+  **whole-filesystem enumeration**. This is the **aggregate**. (`fs_index`, not `fs_record`:
+  "index" is the honest word for an aggregate lookup structure and doesn't collide with the
+  per-file `file_record`; it also keeps the half of "inode" that made sense — *index* — and
+  drops the half that didn't — *node*.)
+
+**Why it's deferred.** The three GSFS0003 structures already serve every *current*
+operation: mount (superblock + bitmap), path lookup (walk the path), `ls` (one directory),
+free space (the bitmap). The **only** thing `fs_index` accelerates is whole-FS enumeration —
+a `find`, a global search, an "every file" view — which GodspeedOS does not have yet. So by
+§26.2 it is built the day such a command pulls it into existence, not before.
+
+**How it works when built** (the part worth recording now):
+
+- **Single owner, single-threaded → no concurrency to reconcile.** `fs` serves one IPC
+  request at a time; "operations in different places" are just different *clients*, but they
+  **queue at `fs` and run serialized**. No structure is ever mutated in parallel — no races
+  on the tree, the bitmap, or the index (the §8-ownership simplifier).
+- **The truth — tree + bitmap — is ALWAYS strongly consistent.** `fs` updates them inline,
+  per op, before serving the next request. A million ops = a million serialized; there is
+  *never* an eventual window on the truth. Any reader needing the authoritative answer reads
+  the tree, always current.
+- **`fs_index` is lazy, version-invalidated, rebuilt-from-truth — and *that* is the eventual
+  part, safely.** Writes do **not** touch the index; each mutation just bumps a cheap
+  tree-version counter, so the hot path is untaxed even under a million ops. When the index
+  is actually *read* (a `find`), `fs` compares versions; if stale, it **rebuilds the index by
+  walking the tree once** — bounded by *tree size*, not by the churn that invalidated it.
+  Eventual consistency is harmless here because the index is **never authoritative**: a
+  fresh index, a stale index, or a fallback to the tree all yield a correct answer. (This
+  refines an earlier "update inline on every write" framing — taxing every write to keep a
+  *rarely-read* index live is the wrong trade; mark-stale + rebuild-on-read keeps writes fast
+  and is still always-correct.)
+- **No events, interrupts, or new caps.** `fs` is the sole mutation point, so "the index
+  changed" is just "`fs` did an op + bumped the version." Crash repair is the *same*
+  mechanism: a stale/dirty version → rebuild from the tree.
+- **On disk, disposable, rebuildable, non-authoritative, and visible** (§26.4) — never
+  RAM-resident (a trillion 64-byte records won't fit), never the source of truth, never a
+  hidden layer.
+- **Cross-instance falls out for free.** Unplug a drive, replug into another GodspeedOS
+  instance: it reads `fs_index`, trusts it if the version matches, rebuilds from the tree if
+  stale — a fast remount without re-walking the whole tree.
+- **Escape hatch for a giant tree:** if even the rebuild-on-`find` walk ever gets too slow,
+  *then* add incremental maintenance — an append-only change log + a background applier that
+  drains it into the index (classic write-ahead-log eventual consistency). A heavier machine
+  pulled in only by a measured need (§26.2), not now.
+
+Specified, not built. GSFS0003 ships the three structures (§6.4); `fs_index` is the layer
+that snaps on when search arrives.
+
 ## 7. File = capability (the north star)
 
 The spine that makes this filesystem *ours* rather than a generic store: a file is named

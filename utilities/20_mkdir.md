@@ -1,8 +1,8 @@
 # Utility: `mkdir` — create a directory
 
-**Status:** Design — built in the file-commands step (step 4) on hierarchical GSFS
-(`docs/persistence.md`). Mutating; works on Phase-2 GSFS. Trails `CLAUDE.md`; does not
-amend it.
+**Status:** **Built + QEMU-verified** (`osdev test files` 11/11) — a shell built-in over
+the `fs` MKDIR API, on hierarchical GSFS (`docs/persistence.md`). Mutating. Trails
+`CLAUDE.md`; does not amend it.
 
 ---
 
@@ -37,12 +37,16 @@ not silent growth. No POSIX permission bits (authority is by capability, §3.3).
 Mutating, so the same least-authority shape as the other writers (`19_write.md` §4): `fs`
 holds the disk authority (`Mkdir`, op 13) and enforces.
 
-## 5. Later (separate doc so it can grow)
+## 5. Built / later
 
-- Create intermediate parents in one call — as a **word**, e.g. `mkdir <path> parents`,
-  never `-p` (`0_conventions.md` §4).
-- Multi-block directories (lift the 16-entry bound) once a real need pulls it in (§26.2).
+- **`mkdir <path> parents` — done.** Creates every missing parent directory in one call
+  (a *word*, never `-p`, per `0_conventions.md` §4); `fs` walks the path component by
+  component, creating what's missing. Idempotent; errors only if a component is in the way
+  as a file. Plain `mkdir <path>` stays strict (parent must exist) — `parents` is opt-in.
+- **Later:** on GSFS0003 directories already grow without bound (the old 16-entry limit is
+  gone — `docs/persistence.md` §6.4), so that item is moot.
 
 ## 6. Conformance
 
-Built spec-first against `0_conventions.md`: implements its own `mkdir help` / `mkdir version`.
+Conforms: `mkdir help` (usage with a real example per row) and `mkdir version` (number +
+creator credit) per `0_conventions.md` (the shared `help_block` helper).

@@ -1,3 +1,10 @@
+// GodspeedOS — Created by Bankole Ogundero.
+//
+// This software is provided "as is", without warranty or guarantee of any kind,
+// express or implied. The author makes no guarantee of its correctness, reliability,
+// or fitness for any purpose, and accepts no liability for any damages arising from
+// its use. Use at your own risk.
+
 //! Scripted smoke-test for `osdev test shell`.
 //!
 //! Boots the OS (bare-metal mode: pong + ping + observe + shell, no probes)
@@ -284,6 +291,29 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
+    // Per-utility help / version (0_conventions.md): every utility self-documents,
+    // with a real example per usage row and a creator credit in `version`.
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"write help\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => {
+            check!(r.contains("write 0.1.0") && r.contains("create or overwrite"), "write help: header + version");
+            check!(r.contains("<path>") && r.contains("e.g.") && r.contains("buy milk"), "write help: placeholder + real example");
+        }
+        None => { println!("shell-test: FAIL — timed out after `write help`  [×2]"); fail += 2; }
+    }
+    send(&mut write_half, b"ls version\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("ls 0.1.0") && r.contains("Created by Bankole Ogundero"), "ls version: number + creator credit"),
+        None    => { println!("shell-test: FAIL — timed out after `ls version`"); fail += 1; }
+    }
+    send(&mut write_half, b"drives flash help\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("drives flash") && r.contains("drives flash 0 data"), "subcommand help: drives flash help + example"),
+        None    => { println!("shell-test: FAIL — timed out after `drives flash help`"); fail += 1; }
+    }
+
+    // -----------------------------------------------------------------------
     // Done.
     // -----------------------------------------------------------------------
     child.kill().ok();
@@ -434,6 +464,245 @@ pub fn run_drives(image_path: &Path, persist_path: &str, smp: u32) {
     child.wait().ok();
 
     println!("\ndrives-test: {pass} passed, {fail} failed");
+    if fail > 0 {
+        std::process::exit(1);
+    }
+}
+
+/// Step 4: drive the file commands (ls / read / write / mkdir / cd) end to end. Boots
+/// bare-metal with a RAW AHCI disk, flashes it, then exercises the commands including
+/// relative paths and `..` (the shell's current-directory + path resolution).
+pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
+    println!("files-test: booting (smp={smp}) with a RAW AHCI disk — scripted mode");
+
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let persist   = std::fs::canonicalize(persist_path)
+        .unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let persist_str = persist.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(),
+        "-m",       "512M",
+        "-serial",  &format!("tcp::{shell_port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ])
+    .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| {
+        eprintln!("files-test: QEMU launch failed at {qemu}: {e}");
+        std::process::exit(1);
+    });
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => { eprintln!("files-test: could not connect to serial {shell_port}"); child.kill().ok(); std::process::exit(1); }
+    };
+    let mut read_half  = stream.try_clone().expect("clone tcp stream");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop {
+                match read_half.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]),
+                }
+            }
+        });
+    }
+
+    let mut pass = 0usize;
+    let mut fail = 0usize;
+    let mut cursor = 0usize;
+    macro_rules! check {
+        ($ok:expr, $label:expr) => {
+            if $ok { println!("files-test: PASS — {}", $label); pass += 1; }
+            else   { println!("files-test: FAIL — {}", $label); fail += 1; }
+        };
+    }
+    // Send a command and capture output up to the next prompt.
+    macro_rules! run {
+        ($c:expr, $secs:expr) => {{
+            send(&mut write_half, $c);
+            collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs($secs))
+        }};
+    }
+
+    if collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(40)).is_none() {
+        let got = { String::from_utf8_lossy(&buf.lock().unwrap()).into_owned() };
+        println!("files-test: FAIL — timed out waiting for first gs>\n{got}");
+        child.kill().ok(); child.wait().ok();
+        std::process::exit(1);
+    }
+
+    // Format the disk first (file commands need a filesystem).
+    send(&mut write_half, b"drives flash data\r");
+    if collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(10)).is_some() {
+        send(&mut write_half, b"y\r");
+        match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(20)) {
+            Some(r) => check!(r.contains("formatted as GSFS"), "setup: flashed GSFS"),
+            None    => { println!("files-test: FAIL — flash timeout"); fail += 1; }
+        }
+    } else { println!("files-test: FAIL — no flash confirm"); fail += 1; }
+
+    // mkdir + write + ls + read (absolute paths).
+    match run!(b"mkdir /docs\r", 10) {
+        Some(r) => check!(r.contains("created /docs"), "mkdir /docs"),
+        None    => { println!("files-test: FAIL — mkdir timeout"); fail += 1; }
+    }
+    match run!(b"write /docs/note.txt hello world\r", 10) {
+        Some(r) => check!(r.contains("wrote /docs/note.txt"), "write /docs/note.txt"),
+        None    => { println!("files-test: FAIL — write timeout"); fail += 1; }
+    }
+    match run!(b"ls /docs\r", 10) {
+        Some(r) => check!(r.contains("note.txt") && r.contains("file"), "ls /docs shows note.txt"),
+        None    => { println!("files-test: FAIL — ls timeout"); fail += 1; }
+    }
+    match run!(b"read /docs/note.txt\r", 10) {
+        Some(r) => check!(r.contains("hello world"), "read /docs/note.txt"),
+        None    => { println!("files-test: FAIL — read timeout"); fail += 1; }
+    }
+
+    // cd + relative path + `..`.
+    match run!(b"cd /docs\r", 10) {
+        Some(r) => check!(r.contains("/docs"), "cd /docs"),
+        None    => { println!("files-test: FAIL — cd timeout"); fail += 1; }
+    }
+    match run!(b"write inside.txt nested-content\r", 10) {
+        Some(r) => check!(r.contains("wrote /docs/inside.txt"), "write relative → /docs/inside.txt"),
+        None    => { println!("files-test: FAIL — relative write timeout"); fail += 1; }
+    }
+    match run!(b"ls\r", 10) {
+        Some(r) => check!(r.contains("note.txt") && r.contains("inside.txt"), "ls (cwd) shows both files"),
+        None    => { println!("files-test: FAIL — ls cwd timeout"); fail += 1; }
+    }
+    match run!(b"mkdir sub\r", 10) {
+        Some(r) => check!(r.contains("created /docs/sub"), "mkdir relative → /docs/sub"),
+        None    => { println!("files-test: FAIL — mkdir relative timeout"); fail += 1; }
+    }
+    match run!(b"cd ..\r", 10) {
+        Some(r) => check!(r.contains('/') && !r.contains("/docs"), "cd .. → root"),
+        None    => { println!("files-test: FAIL — cd .. timeout"); fail += 1; }
+    }
+    match run!(b"read /docs/inside.txt\r", 10) {
+        Some(r) => check!(r.contains("nested-content"), "read absolute after cd .."),
+        None    => { println!("files-test: FAIL — final read timeout"); fail += 1; }
+    }
+
+    // copy + rename.
+    match run!(b"copy /docs/note.txt /docs/note-copy.txt\r", 10) {
+        Some(r) => check!(r.contains("copied"), "copy /docs/note.txt → note-copy.txt"),
+        None    => { println!("files-test: FAIL — copy timeout"); fail += 1; }
+    }
+    match run!(b"read /docs/note-copy.txt\r", 10) {
+        Some(r) => check!(r.contains("hello world"), "read copy has same content"),
+        None    => { println!("files-test: FAIL — read copy timeout"); fail += 1; }
+    }
+    match run!(b"rename /docs/note-copy.txt renamed.txt\r", 10) {
+        Some(r) => check!(r.contains("renamed"), "rename note-copy.txt → renamed.txt"),
+        None    => { println!("files-test: FAIL — rename timeout"); fail += 1; }
+    }
+    match run!(b"ls /docs\r", 10) {
+        Some(r) => check!(r.contains("renamed.txt") && !r.contains("note-copy.txt"), "ls shows renamed, not old name"),
+        None    => { println!("files-test: FAIL — ls after rename timeout"); fail += 1; }
+    }
+
+    // delete (GSFS0003: frees blocks, reclaims) — file then re-list shows it gone.
+    match run!(b"delete /docs/renamed.txt\r", 10) {
+        Some(r) => check!(r.contains("deleted"), "delete /docs/renamed.txt"),
+        None    => { println!("files-test: FAIL — delete timeout"); fail += 1; }
+    }
+    match run!(b"ls /docs\r", 10) {
+        Some(r) => check!(!r.contains("renamed.txt"), "ls: deleted file is gone"),
+        None    => { println!("files-test: FAIL — ls after delete timeout"); fail += 1; }
+    }
+
+    // move (relink) — into the /docs/sub directory created earlier.
+    match run!(b"move /docs/note.txt /docs/sub/note.txt\r", 10) {
+        Some(r) => check!(r.contains("moved"), "move /docs/note.txt → /docs/sub/note.txt"),
+        None    => { println!("files-test: FAIL — move timeout"); fail += 1; }
+    }
+    match run!(b"ls /docs/sub\r", 10) {
+        Some(r) => check!(r.contains("note.txt"), "ls /docs/sub shows moved file"),
+        None    => { println!("files-test: FAIL — ls sub timeout"); fail += 1; }
+    }
+    match run!(b"read /docs/sub/note.txt\r", 10) {
+        Some(r) => check!(r.contains("hello world"), "moved file keeps its content"),
+        None    => { println!("files-test: FAIL — read moved timeout"); fail += 1; }
+    }
+
+    // Directory growth: write 10 files into one directory (a dir block holds 8 entries),
+    // forcing the directory to grow a second block — proving there's no per-dir cap.
+    let _ = run!(b"mkdir /big\r", 10);
+    for i in 1..=10 {
+        let cmd = format!("write /big/f{} x\r", i);
+        let _ = run!(cmd.as_bytes(), 10);
+    }
+    match run!(b"ls /big\r", 10) {
+        Some(r) => {
+            let n = (1..=10).filter(|i| r.contains(&format!("f{}", i))).count();
+            check!(n == 10, "directory grew past 8 entries (no per-dir cap) — 10 files listed");
+        }
+        None => { println!("files-test: FAIL — ls /big timeout"); fail += 1; }
+    }
+
+    // find — whole-filesystem tree walk from root. Tree now: /docs/{inside.txt, sub/note.txt},
+    // /big/{f1..f10}.
+    match run!(b"find inside.txt\r", 10) {
+        Some(r) => check!(r.contains("/docs/inside.txt") && r.contains("find: 1 match"), "find: locates /docs/inside.txt"),
+        None    => { println!("files-test: FAIL — find timeout"); fail += 1; }
+    }
+    match run!(b"find note.txt\r", 10) {
+        Some(r) => check!(r.contains("/docs/sub/note.txt") && r.contains("find: 1 match"), "find: descends into subdir (/docs/sub/note.txt)"),
+        None    => { println!("files-test: FAIL — find sub timeout"); fail += 1; }
+    }
+    match run!(b"find f5\r", 10) {
+        Some(r) => check!(r.contains("/big/f5") && r.contains("find: 1 match"), "find: locates a file in a grown directory (/big/f5)"),
+        None    => { println!("files-test: FAIL — find grown timeout"); fail += 1; }
+    }
+    match run!(b"find nope.txt\r", 10) {
+        Some(r) => check!(r.contains("find: 0 match"), "find: reports 0 matches for a missing name"),
+        None    => { println!("files-test: FAIL — find missing timeout"); fail += 1; }
+    }
+    // find substring: `.txt` matches inside.txt AND sub/note.txt (2). Exact match would be 0.
+    match run!(b"find .txt\r", 10) {
+        Some(r) => check!(r.contains("find: 2 match"), "find: substring match (.txt → 2 files)"),
+        None    => { println!("files-test: FAIL — find substring timeout"); fail += 1; }
+    }
+
+    // ls shows file sizes: /docs/inside.txt holds "nested-content" = 14 bytes.
+    match run!(b"ls /docs\r", 10) {
+        Some(r) => check!(r.contains("inside.txt") && r.contains("14 B"), "ls: shows file size (inside.txt 14 B)"),
+        None    => { println!("files-test: FAIL — ls size timeout"); fail += 1; }
+    }
+
+    // mkdir parents: create a 3-deep chain in one call (none of /x, /x/y exist yet).
+    match run!(b"mkdir /x/y/z parents\r", 10) {
+        Some(r) => check!(r.contains("created /x/y/z"), "mkdir parents: created /x/y/z chain"),
+        None    => { println!("files-test: FAIL — mkdir parents timeout"); fail += 1; }
+    }
+    match run!(b"ls /x/y\r", 10) {
+        Some(r) => check!(r.contains("z") && r.contains("dir"), "mkdir parents: /x/y/z exists as a dir"),
+        None    => { println!("files-test: FAIL — ls /x/y timeout"); fail += 1; }
+    }
+    // plain mkdir into a missing parent still fails (parents is opt-in).
+    match run!(b"mkdir /no/such/dir\r", 10) {
+        Some(r) => check!(r.contains("mkdir: failed"), "mkdir (no parents): fails on missing parent"),
+        None    => { println!("files-test: FAIL — mkdir strict timeout"); fail += 1; }
+    }
+
+    child.kill().ok();
+    child.wait().ok();
+    println!("\nfiles-test: {pass} passed, {fail} failed");
     if fail > 0 {
         std::process::exit(1);
     }

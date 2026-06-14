@@ -1,3 +1,10 @@
+// GodspeedOS — Created by Bankole Ogundero.
+//
+// This software is provided "as is", without warranty or guarantee of any kind,
+// express or implied. The author makes no guarantee of its correctness, reliability,
+// or fitness for any purpose, and accepts no liability for any damages arising from
+// its use. Use at your own risk.
+
 #![no_std]
 #![no_main]
 
@@ -6,14 +13,27 @@ use godspeed_sdk::{ServiceContext, CapInfo, Message};
 const MAX_LINE: usize = 128;
 const MAX_ARGS: usize = 4;
 
-// drives API (shell <-> fs). MUST match `services/fs`.
+// fs API (shell <-> fs). MUST match `services/fs`.
+//   File ops:   [op, path_len:u8, path[path_len], (WriteFile: data)]
+const OP_WRITE_FILE: u8 = 10;
+const OP_READ_FILE: u8 = 11;
+const OP_STAT_FILE: u8 = 12;
+const OP_MKDIR: u8 = 13;
+const OP_LIST_DIR: u8 = 14;
+const OP_RENAME: u8 = 15;
+const OP_DELETE: u8 = 16;
+const OP_MOVE: u8 = 17;
+const OP_MKDIR_P: u8 = 18;
+// drives ops:
 const OP_DRIVES_INFO: u8 = 20;
 const OP_FLASH: u8 = 21;
 const OP_LABEL: u8 = 22;
 const OP_RESET: u8 = 23;
 const FS_OK: u8 = 0;
+const FS_NOTFOUND: u8 = 2;
+const FS_NOFS: u8 = 3;
 const LABEL_MAX: usize = 31;
-const DRIVES_VERSION: &str = "drives 0.1.0";
+const PATH_MAX: usize = 120; // fits in MAX_LINE; path_len is u8
 
 // Entry point called by the kernel after spawning this service.
 // ctx.console_writeln() appends a newline. The kernel echoes each console keystroke to the
@@ -42,6 +62,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     let mut line_buf = [0u8; MAX_LINE];
     let mut line_len = 0usize;
+    // Current location on the (single) drive: the directory bare/relative paths target,
+    // moved by `cd` (utilities/17_cd.md). Session state; resets to "/" each boot.
+    let mut cwd = Cwd::root();
 
     loop {
         let b = ctx.console_read();
@@ -49,7 +72,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         match b {
             b'\r' | b'\n' => {
                 if line_len > 0 {
-                    execute(&ctx, &line_buf[..line_len]);
+                    execute(&ctx, &line_buf[..line_len], &mut cwd);
                     line_len = 0;
                 }
                 ctx.console_write("gs> ");
@@ -99,7 +122,7 @@ fn wait_for_input_ready(ctx: &ServiceContext) {
     }
 }
 
-fn execute(ctx: &ServiceContext, line: &[u8]) {
+fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
     let Ok(s) = core::str::from_utf8(line) else {
         ctx.console_writeln("shell: invalid input");
         return;
@@ -124,6 +147,17 @@ fn execute(ctx: &ServiceContext, line: &[u8]) {
         argc += 1;
     }
     if argc == 0 { return; }
+
+    // Per-utility `help` / `version` (0_conventions.md): every utility self-documents.
+    // `<util> help` and `<util> version` are intercepted here for every utility; subcommand
+    // help (`<util> <sub> help`, e.g. `drives flash help`) is intercepted just below.
+    if argc == 2 && is_util(args[0]) {
+        if args[1] == "version" { util_version(ctx, args[0]); return; }
+        if args[1] == "help" { util_help(ctx, args[0]); return; }
+    }
+    if argc == 3 && args[2] == "help" && is_util(args[0]) {
+        if sub_help(ctx, args[0], args[1]) { return; }
+    }
 
     match args[0] {
         "help"    => cmd_help(ctx),
@@ -164,6 +198,38 @@ fn execute(ctx: &ServiceContext, line: &[u8]) {
         }
         "reboot"  => cmd_reboot(ctx),
         "drives"  => cmd_drives(ctx, &args, argc),
+        "ls"      => cmd_ls(ctx, cwd, if argc >= 2 { args[1] } else { "" }),
+        "read"    => {
+            if argc < 2 { ctx.console_writeln("usage: read <path>"); }
+            else { cmd_read(ctx, cwd, args[1]); }
+        }
+        "write"   => cmd_write(ctx, cwd, s["write".len()..].trim()),
+        "mkdir"   => {
+            // `mkdir <path>` or `mkdir <path> parents` (create missing parent dirs).
+            if argc < 2 { ctx.console_writeln("usage: mkdir <path> [parents]"); }
+            else { cmd_mkdir(ctx, cwd, args[1], argc >= 3 && args[2] == "parents"); }
+        }
+        "cd"      => cmd_cd(ctx, cwd, if argc >= 2 { args[1] } else { "/" }),
+        "copy"    => {
+            if argc < 3 { ctx.console_writeln("usage: copy <src> <dst>"); }
+            else { cmd_copy(ctx, cwd, args[1], args[2]); }
+        }
+        "rename"  => {
+            if argc < 3 { ctx.console_writeln("usage: rename <path> <newname>"); }
+            else { cmd_rename(ctx, cwd, args[1], args[2]); }
+        }
+        "delete"  => {
+            if argc < 2 { ctx.console_writeln("usage: delete <path>"); }
+            else { cmd_delete(ctx, cwd, args[1]); }
+        }
+        "move"    => {
+            if argc < 3 { ctx.console_writeln("usage: move <src> <dst>"); }
+            else { cmd_move(ctx, cwd, args[1], args[2]); }
+        }
+        "find"    => {
+            if argc < 2 { ctx.console_writeln("usage: find <name> [path]"); }
+            else { cmd_find(ctx, cwd, args[1], if argc >= 3 { args[2] } else { "/" }); }
+        }
         other => {
             // Build "unknown: <cmd>" in a stack buffer to avoid two ctx.log calls
             let mut buf = [0u8; 64];
@@ -173,6 +239,168 @@ fn execute(ctx: &ServiceContext, line: &[u8]) {
             ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("unknown cmd"));
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-utility help + version (0_conventions.md). Every utility self-documents:
+// `<util> help` prints usage with a real example per row; `<util> version` prints the
+// version + creator credit. The format lives in ONE place (`help_block`) so all utilities
+// render identically and a tweak updates every one at once.
+// ---------------------------------------------------------------------------
+
+const UTIL_VERSION: &str = "0.1.0";
+
+/// Utilities that self-document (gates the `help`/`version` intercept in `execute`).
+const UTILS: &[&str] = &[
+    "echo", "clear", "about", "mem", "cores", "date", "status", "observe", "caps",
+    "spawn", "kill", "restart", "reboot", "drives", "ls", "cd", "read", "write",
+    "mkdir", "copy", "move", "rename", "delete", "find",
+];
+fn is_util(name: &str) -> bool { UTILS.contains(&name) }
+
+/// `<util> version` — version number, then creator credit.
+fn util_version(ctx: &ServiceContext, util: &str) {
+    ctx.console_writeln_fmt(format_args!("{} {}", util, UTIL_VERSION));
+    ctx.console_writeln("Created by Bankole Ogundero.");
+}
+
+/// One usage row: (signature with `<placeholders>`, description, a real example).
+type Row = (&'static str, &'static str, &'static str);
+
+/// Render the standard help block: `<title> <ver> — <desc>`, each usage row followed by a
+/// real example, then (for a top-level utility) the version/help footer.
+fn help_block(ctx: &ServiceContext, title: &str, desc: &str, rows: &[Row], footer: bool) {
+    ctx.console_writeln_fmt(format_args!("{} {} — {}", title, UTIL_VERSION, desc));
+    ctx.console_writeln("");
+    ctx.console_writeln("usage:");
+    for (sig, d, ex) in rows {
+        ctx.console_writeln_fmt(format_args!("  {:<28}  {}", sig, d));
+        if !ex.is_empty() {
+            ctx.console_writeln_fmt(format_args!("      e.g. {}", ex));
+        }
+    }
+    if footer {
+        ctx.console_writeln_fmt(format_args!("  {} version", title));
+        ctx.console_writeln_fmt(format_args!("  {} help", title));
+    }
+}
+
+/// `<util> help` — usage with examples. Returns false for an unknown name.
+fn util_help(ctx: &ServiceContext, util: &str) -> bool {
+    match util {
+        "echo" => help_block(ctx, "echo", "print text", &[
+            ("echo <text>", "print text verbatim", "echo hello world"),
+        ], true),
+        "clear" => help_block(ctx, "clear", "clear the screen", &[
+            ("clear", "clear the screen and home the cursor", "clear"),
+        ], true),
+        "about" => help_block(ctx, "about", "system identity + credits", &[
+            ("about", "name, core count, creator", "about"),
+        ], true),
+        "mem" => help_block(ctx, "mem", "physical memory usage", &[
+            ("mem", "used / total / free physical memory", "mem"),
+        ], true),
+        "cores" => help_block(ctx, "cores", "CPU core count", &[
+            ("cores", "how many CPU cores are up", "cores"),
+        ], true),
+        "date" => help_block(ctx, "date", "date + time from the hardware clock", &[
+            ("date", "full timestamp (weekday date time)", "date"),
+            ("date epoch", "seconds since 1970-01-01", "date epoch"),
+        ], true),
+        "status" => help_block(ctx, "status", "list all live tasks", &[
+            ("status", "slot, name, core, state of every task", "status"),
+        ], true),
+        "observe" => help_block(ctx, "observe", "live system metrics view", &[
+            ("observe", "full-screen live view (q to quit)", "observe"),
+            ("observe now", "one-shot metrics frame", "observe now"),
+        ], true),
+        "caps" => help_block(ctx, "caps", "show a service's capabilities", &[
+            ("caps", "this shell's own capabilities", "caps"),
+            ("caps <service>", "capabilities held by <service>", "caps logger"),
+        ], true),
+        "spawn" => help_block(ctx, "spawn", "start a service", &[
+            ("spawn <name>", "start the service <name>", "spawn pong"),
+        ], true),
+        "kill" => help_block(ctx, "kill", "stop a service", &[
+            ("kill <name>", "stop the running service <name>", "kill pong"),
+        ], true),
+        "restart" => help_block(ctx, "restart", "restart a service", &[
+            ("restart <name>", "restart (re-placed per contract)", "restart pong"),
+            ("restart <name> <core>", "restart on core <core>", "restart pong 2"),
+        ], true),
+        "reboot" => help_block(ctx, "reboot", "hardware reset", &[
+            ("reboot", "reset the machine", "reboot"),
+        ], true),
+        "drives" => help_block(ctx, "drives", "manage attached disks", &[
+            ("drives", "list attached drive(s)", "drives"),
+            ("drives flash [drive] [label]", "format a drive as GSFS (ERASES)", "drives flash 0 data"),
+            ("drives label [drive] <name>", "name / rename a drive", "drives label 0 archive"),
+            ("drives reset [drive]", "un-format a drive back to raw", "drives reset 0"),
+        ], true),
+        "ls" => help_block(ctx, "ls", "list a directory", &[
+            ("ls", "list the current directory", "ls"),
+            ("ls <path>", "list the directory at <path>", "ls /docs"),
+        ], true),
+        "cd" => help_block(ctx, "cd", "change current directory", &[
+            ("cd <path>", "move to <path> (no arg → root)", "cd /docs"),
+        ], true),
+        "read" => help_block(ctx, "read", "print a file", &[
+            ("read <path>", "print the contents of <path>", "read /docs/notes.txt"),
+        ], true),
+        "write" => help_block(ctx, "write", "create or overwrite a file", &[
+            ("write <path>", "create an empty file", "write /docs/todo.txt"),
+            ("write <path> <text>", "create/overwrite with text", "write /docs/todo.txt \"buy milk\""),
+        ], true),
+        "mkdir" => help_block(ctx, "mkdir", "create a directory", &[
+            ("mkdir <path>", "create the directory <path>", "mkdir /docs"),
+            ("mkdir <path> parents", "create missing parent dirs too", "mkdir /a/b/c parents"),
+        ], true),
+        "copy" => help_block(ctx, "copy", "copy a file", &[
+            ("copy <src> <dst>", "copy file <src> to <dst>", "copy /docs/a.txt /docs/b.txt"),
+        ], true),
+        "move" => help_block(ctx, "move", "relocate a file or directory", &[
+            ("move <src> <dst>", "move <src> to <dst>", "move /docs/a.txt /archive/a.txt"),
+        ], true),
+        "rename" => help_block(ctx, "rename", "rename an entry in place", &[
+            ("rename <path> <newname>", "rename <path> to <newname>", "rename /docs/a.txt b.txt"),
+        ], true),
+        "delete" => help_block(ctx, "delete", "remove a file or empty directory", &[
+            ("delete <path>", "remove the file/empty dir <path>", "delete /docs/old.txt"),
+        ], true),
+        "find" => help_block(ctx, "find", "search the tree for a name (substring match)", &[
+            ("find <name>", "search everywhere; matches names containing <name>", "find report"),
+            ("find <name> <path>", "search only under <path>", "find .txt /docs"),
+        ], true),
+        _ => return false,
+    }
+    true
+}
+
+/// `<util> <sub> help` — focused help for a subcommand. Returns false if not a subcommand.
+fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
+    match (util, sub) {
+        ("date", "epoch") => help_block(ctx, "date epoch", "seconds since 1970-01-01", &[
+            ("date epoch", "print epoch seconds (not POSIX 'unix')", "date epoch"),
+        ], false),
+        ("observe", "now") => help_block(ctx, "observe now", "one-shot metrics frame", &[
+            ("observe now", "print a single metrics frame and return", "observe now"),
+        ], false),
+        ("drives", "flash") => help_block(ctx, "drives flash", "format a drive as GSFS (ERASES it; asks y/N)", &[
+            ("drives flash", "format the only drive, no label", "drives flash"),
+            ("drives flash <label>", "format + name it", "drives flash data"),
+            ("drives flash <drive> <label>", "format drive <drive>, name it", "drives flash 0 data"),
+        ], false),
+        ("drives", "label") => help_block(ctx, "drives label", "name / rename a drive", &[
+            ("drives label <name>", "name the only drive", "drives label archive"),
+            ("drives label <drive> <name>", "name drive <drive>", "drives label 0 archive"),
+        ], false),
+        ("drives", "reset") => help_block(ctx, "drives reset", "un-format a drive back to raw (ERASES; asks y/N)", &[
+            ("drives reset", "un-format the only drive", "drives reset"),
+            ("drives reset <drive>", "un-format drive <drive>", "drives reset 0"),
+        ], false),
+        _ => return false,
+    }
+    true
 }
 
 fn cmd_help(ctx: &ServiceContext) {
@@ -198,10 +426,22 @@ fn cmd_help(ctx: &ServiceContext) {
     help_line(ctx, "restart <name> [core]", "restart a service");
     ctx.console_writeln("");
     ctx.console_writeln("Storage");
-    help_line(ctx, "drives [flash|label]", "manage attached disks (drives help)");
+    help_line(ctx, "drives [flash|label|reset]", "manage attached disks (drives help)");
+    help_line(ctx, "ls [path]", "list a directory");
+    help_line(ctx, "cd [path]", "change current directory");
+    help_line(ctx, "read <path>", "print a file");
+    help_line(ctx, "write <path> [text]", "create/overwrite a file");
+    help_line(ctx, "mkdir <path> [parents]", "create a directory");
+    help_line(ctx, "copy <src> <dst>", "copy a file");
+    help_line(ctx, "move <src> <dst>", "relocate a file/dir");
+    help_line(ctx, "rename <path> <name>", "rename an entry in place");
+    help_line(ctx, "delete <path>", "remove a file/empty dir");
+    help_line(ctx, "find <name> [path]", "search the tree for a name");
     ctx.console_writeln("");
     ctx.console_writeln("Power");
     help_line(ctx, "reboot", "hardware reset");
+    ctx.console_writeln("");
+    ctx.console_writeln("Type '<command> help' for usage + examples, '<command> version' for the version.");
 }
 
 /// One "  command  description" row. The command is left-justified to a fixed
@@ -596,6 +836,465 @@ fn cmd_restart(ctx: &ServiceContext, name: &str, core: Option<u32>) {
 }
 
 // ---------------------------------------------------------------------------
+// File commands — ls / read / write / mkdir / cd (utilities/16..20). Shell built-ins
+// that send the fs file API to `fs` over IPC; `fs` holds + enforces all disk authority.
+// The shell tracks the current location (a drive+directory pointer) and resolves
+// relative / `.` / `..` paths to an absolute path before sending — fs only walks
+// absolute paths from root (it has no notion of "current directory").
+// ---------------------------------------------------------------------------
+
+/// The current directory on the (single) drive — an absolute path like "/" or "/etc".
+struct Cwd {
+    buf: [u8; PATH_MAX],
+    len: usize,
+}
+
+impl Cwd {
+    fn root() -> Self {
+        let mut buf = [0u8; PATH_MAX];
+        buf[0] = b'/';
+        Cwd { buf, len: 1 }
+    }
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("/")
+    }
+    fn set(&mut self, path: &[u8]) {
+        let n = path.len().min(PATH_MAX);
+        self.buf[..n].copy_from_slice(&path[..n]);
+        self.len = n.max(1);
+        if self.len == 0 { self.buf[0] = b'/'; self.len = 1; }
+    }
+}
+
+/// Resolve `input` against the current directory `cwd` into a normalized absolute path
+/// in `out`. Handles absolute (`/a`), relative (`a/b`), `.` and `..`. Returns the length,
+/// or None if it would overflow `out`.
+fn resolve_path(cwd: &str, input: &str, out: &mut [u8; PATH_MAX]) -> Option<usize> {
+    out[0] = b'/';
+    let mut len = 1usize;
+    // Seed with the current directory unless the input is absolute.
+    if !input.starts_with('/') {
+        for comp in cwd.split('/').filter(|c| !c.is_empty()) {
+            push_comp(out, &mut len, comp)?;
+        }
+    }
+    for comp in input.split('/').filter(|c| !c.is_empty()) {
+        match comp {
+            "." => {}
+            ".." => pop_comp(out, &mut len),
+            _ => push_comp(out, &mut len, comp)?,
+        }
+    }
+    Some(len)
+}
+
+/// Append a path component, inserting a '/' separator unless `out` already ends with one.
+fn push_comp(out: &mut [u8; PATH_MAX], len: &mut usize, comp: &str) -> Option<()> {
+    let cb = comp.as_bytes();
+    let need = if out[*len - 1] == b'/' { cb.len() } else { cb.len() + 1 };
+    if *len + need > PATH_MAX { return None; }
+    if out[*len - 1] != b'/' { out[*len] = b'/'; *len += 1; }
+    out[*len..*len + cb.len()].copy_from_slice(cb);
+    *len += cb.len();
+    Some(())
+}
+
+/// Remove the last path component (the `..` case), never going above root "/".
+fn pop_comp(out: &mut [u8; PATH_MAX], len: &mut usize) {
+    // Find the last '/' in out[..len]; truncate there (or to root).
+    let mut i = *len;
+    while i > 1 {
+        i -= 1;
+        if out[i] == b'/' { *len = i.max(1); return; }
+    }
+    *len = 1; // back to root
+}
+
+/// Resolve `input` against `cwd`; on overflow print an error and return None.
+fn resolve_or_err<'a>(ctx: &ServiceContext, cwd: &Cwd, input: &str, out: &'a mut [u8; PATH_MAX]) -> Option<&'a [u8]> {
+    match resolve_path(cwd.as_str(), input, out) {
+        Some(n) => Some(&out[..n]),
+        None => { ctx.console_writeln("path too long"); None }
+    }
+}
+
+/// Send an fs file-API request `[op, path_len, path, data]` and return the reply.
+fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<Message> {
+    let pl = path.len().min(255);
+    let mut req = [0u8; 4096];
+    req[0] = op;
+    req[1] = pl as u8;
+    req[2..2 + pl].copy_from_slice(&path[..pl]);
+    let dn = data.len().min(req.len() - 2 - pl);
+    req[2 + pl..2 + pl + dn].copy_from_slice(&data[..dn]);
+    ctx.request_with_reply("fs", &Message::from_bytes(&req[..2 + pl + dn]))
+}
+
+/// True if `fs` replied "no filesystem" — print the standard hint and consume it.
+fn no_fs(ctx: &ServiceContext, p: &[u8]) -> bool {
+    if p.first() == Some(&FS_NOFS) {
+        ctx.console_writeln("no filesystem — run 'drives flash' first");
+        true
+    } else {
+        false
+    }
+}
+
+/// `ls [path]` — list a directory.
+fn cmd_ls(ctx: &ServiceContext, cwd: &Cwd, arg: &str) {
+    let mut buf = [0u8; PATH_MAX];
+    let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return };
+    let reply = match fs_request(ctx, OP_LIST_DIR, path, &[]) {
+        Some(r) => r,
+        None => { ctx.console_writeln("ls: storage unavailable"); return; }
+    };
+    let p = reply.payload_bytes();
+    if no_fs(ctx, p) { return; }
+    if p.first() == Some(&FS_NOTFOUND) || p.len() < 2 {
+        ctx.console_writeln_fmt(format_args!("ls: not a directory: {}", str_of(path)));
+        return;
+    }
+    let count = p[1] as usize;
+    ctx.console_writeln_fmt(format_args!("{}  ({} entries)", str_of(path), count));
+    if count > 0 { ctx.console_writeln("  NAME                  TYPE   SIZE"); }
+    let mut i = 2usize;
+    for _ in 0..count {
+        if i >= p.len() { break; }
+        let nl = p[i] as usize;
+        i += 1;
+        if i + nl + 1 + 8 > p.len() { break; }
+        let name = core::str::from_utf8(&p[i..i + nl]).unwrap_or("?");
+        let is_dir = p[i + nl] != 0;
+        let size = u64_le(&p[i + nl + 1..i + nl + 9]);
+        i += nl + 1 + 8;
+        if is_dir {
+            ctx.console_writeln_fmt(format_args!("  {:<20}  dir    -", name));
+        } else {
+            ctx.console_writeln_fmt(format_args!("  {:<20}  file   {} B", name, size));
+        }
+    }
+    if count == 0 { ctx.console_writeln("  (empty)"); }
+}
+
+/// `read <path>` — print a file's contents.
+fn cmd_read(ctx: &ServiceContext, cwd: &Cwd, arg: &str) {
+    let mut buf = [0u8; PATH_MAX];
+    let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return };
+    let reply = match fs_request(ctx, OP_READ_FILE, path, &[]) {
+        Some(r) => r,
+        None => { ctx.console_writeln("read: storage unavailable"); return; }
+    };
+    let p = reply.payload_bytes();
+    if no_fs(ctx, p) { return; }
+    if p.first() == Some(&FS_OK) && p.len() >= 5 {
+        let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
+        let end = (5 + n).min(p.len());
+        ctx.console_write(core::str::from_utf8(&p[5..end]).unwrap_or(""));
+        if end == 0 || p[end - 1] != b'\n' { ctx.console_writeln(""); }
+    } else {
+        ctx.console_writeln_fmt(format_args!("read: not found: {}", str_of(path)));
+    }
+}
+
+/// `write <path> [content]` — create/overwrite a file with the rest of the line.
+fn cmd_write(ctx: &ServiceContext, cwd: &Cwd, rest: &str) {
+    if rest.is_empty() {
+        ctx.console_writeln("usage: write <path> [content]");
+        return;
+    }
+    // Split off the first token (path); the remainder (with spaces) is the content.
+    let (pstr, content) = match rest.split_once(char::is_whitespace) {
+        Some((p, c)) => (p, c.trim_start()),
+        None => (rest, ""),
+    };
+    let mut buf = [0u8; PATH_MAX];
+    let path = match resolve_or_err(ctx, cwd, pstr, &mut buf) { Some(p) => p, None => return };
+    // Copy the path out before reusing buffers (path borrows `buf`).
+    let mut pbuf = [0u8; PATH_MAX];
+    let pl = path.len();
+    pbuf[..pl].copy_from_slice(path);
+    let reply = match fs_request(ctx, OP_WRITE_FILE, &pbuf[..pl], content.as_bytes()) {
+        Some(r) => r,
+        None => { ctx.console_writeln("write: storage unavailable"); return; }
+    };
+    let p = reply.payload_bytes();
+    if no_fs(ctx, p) { return; }
+    if p.first() == Some(&FS_OK) {
+        ctx.console_writeln_fmt(format_args!("wrote {} ({} bytes)", str_of(&pbuf[..pl]), content.len()));
+    } else {
+        ctx.console_writeln("write: failed (bad path, or parent missing?)");
+    }
+}
+
+/// `mkdir <path> [parents]` — create a directory (with `parents`, create missing parents).
+fn cmd_mkdir(ctx: &ServiceContext, cwd: &Cwd, arg: &str, parents: bool) {
+    let mut buf = [0u8; PATH_MAX];
+    let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return };
+    let op = if parents { OP_MKDIR_P } else { OP_MKDIR };
+    let reply = match fs_request(ctx, op, path, &[]) {
+        Some(r) => r,
+        None => { ctx.console_writeln("mkdir: storage unavailable"); return; }
+    };
+    let p = reply.payload_bytes();
+    if no_fs(ctx, p) { return; }
+    if p.first() == Some(&FS_OK) {
+        ctx.console_writeln_fmt(format_args!("created {}", str_of(path)));
+    } else if parents {
+        ctx.console_writeln("mkdir: failed (a component is in the way as a file?)");
+    } else {
+        ctx.console_writeln("mkdir: failed (already exists, or parent missing? try 'mkdir <path> parents')");
+    }
+}
+
+/// `cd [path]` — change the current directory (validates it exists + is a directory).
+fn cmd_cd(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str) {
+    let mut buf = [0u8; PATH_MAX];
+    let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return };
+    // Root always exists — no need to stat it.
+    if path == b"/" {
+        cwd.set(b"/");
+        ctx.console_writeln("/");
+        return;
+    }
+    let reply = match fs_request(ctx, OP_STAT_FILE, path, &[]) {
+        Some(r) => r,
+        None => { ctx.console_writeln("cd: storage unavailable"); return; }
+    };
+    let p = reply.payload_bytes();
+    if no_fs(ctx, p) { return; }
+    // STAT reply: [FS_OK, exists, size:u64, is_dir].
+    if p.first() == Some(&FS_OK) && p.len() >= 11 && p[1] == 1 {
+        if p[10] == 1 {
+            cwd.set(path);
+            ctx.console_writeln(cwd.as_str());
+        } else {
+            ctx.console_writeln_fmt(format_args!("cd: not a directory: {}", str_of(path)));
+        }
+    } else {
+        ctx.console_writeln_fmt(format_args!("cd: no such directory: {}", str_of(path)));
+    }
+}
+
+/// `copy <src> <dst>` — copy a file (read src, write dst). Shell-side, so it carries the
+/// content through one message-sized buffer; file-only in this cut (no recursive dirs).
+fn cmd_copy(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) {
+    // Resolve + read the source.
+    let mut sbuf = [0u8; PATH_MAX];
+    let spath = match resolve_or_err(ctx, cwd, src, &mut sbuf) { Some(p) => p, None => return };
+    let mut sp = [0u8; PATH_MAX];
+    let sl = spath.len();
+    sp[..sl].copy_from_slice(spath);
+    let reply = match fs_request(ctx, OP_READ_FILE, &sp[..sl], &[]) {
+        Some(r) => r,
+        None => { ctx.console_writeln("copy: storage unavailable"); return; }
+    };
+    let p = reply.payload_bytes();
+    if no_fs(ctx, p) { return; }
+    if p.first() != Some(&FS_OK) || p.len() < 5 {
+        ctx.console_writeln_fmt(format_args!("copy: source not found: {}", str_of(&sp[..sl])));
+        return;
+    }
+    let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
+    let end = (5 + n).min(p.len());
+    let dn = end - 5;
+    let mut data = [0u8; 4096];
+    data[..dn].copy_from_slice(&p[5..end]);
+    drop(reply);
+
+    // Resolve + write the destination.
+    let mut dbuf = [0u8; PATH_MAX];
+    let dpath = match resolve_or_err(ctx, cwd, dst, &mut dbuf) { Some(p) => p, None => return };
+    let mut dp = [0u8; PATH_MAX];
+    let dl = dpath.len();
+    dp[..dl].copy_from_slice(dpath);
+    match fs_request(ctx, OP_WRITE_FILE, &dp[..dl], &data[..dn]) {
+        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
+            ctx.console_writeln_fmt(format_args!("copied {} → {} ({} bytes)", str_of(&sp[..sl]), str_of(&dp[..dl]), dn));
+        }
+        Some(_) => ctx.console_writeln("copy: write failed (parent missing?)"),
+        None    => ctx.console_writeln("copy: storage unavailable"),
+    }
+}
+
+/// `rename <path> <newname>` — rename an entry in place (not a move; newname is one
+/// component). fs edits the directory entry; no blocks are read or freed.
+fn cmd_rename(ctx: &ServiceContext, cwd: &Cwd, path: &str, newname: &str) {
+    let mut buf = [0u8; PATH_MAX];
+    let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return };
+    let mut pp = [0u8; PATH_MAX];
+    let pl = abspath.len();
+    pp[..pl].copy_from_slice(abspath);
+    // fs_request appends `newname` after the path — exactly the OP_RENAME wire format.
+    match fs_request(ctx, OP_RENAME, &pp[..pl], newname.as_bytes()) {
+        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
+            ctx.console_writeln_fmt(format_args!("renamed {} → {}", str_of(&pp[..pl]), newname));
+        }
+        Some(r) if no_fs(ctx, r.payload_bytes()) => {}
+        Some(_) => ctx.console_writeln("rename: failed (not found, or name exists, or bad name)"),
+        None    => ctx.console_writeln("rename: storage unavailable"),
+    }
+}
+
+/// `delete <path>` — remove a file or empty directory (frees its blocks; fs reclaims).
+fn cmd_delete(ctx: &ServiceContext, cwd: &Cwd, arg: &str) {
+    let mut buf = [0u8; PATH_MAX];
+    let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return };
+    if path == b"/" {
+        ctx.console_writeln("delete: cannot delete the root directory");
+        return;
+    }
+    let mut pp = [0u8; PATH_MAX];
+    let pl = path.len();
+    pp[..pl].copy_from_slice(path);
+    match fs_request(ctx, OP_DELETE, &pp[..pl], &[]) {
+        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
+            ctx.console_writeln_fmt(format_args!("deleted {}", str_of(&pp[..pl])));
+        }
+        Some(r) if no_fs(ctx, r.payload_bytes()) => {}
+        Some(_) => ctx.console_writeln("delete: failed (not found, or directory not empty?)"),
+        None    => ctx.console_writeln("delete: storage unavailable"),
+    }
+}
+
+/// `move <src> <dst>` — relocate an entry (same data; only the directory entries change).
+fn cmd_move(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) {
+    let mut sbuf = [0u8; PATH_MAX];
+    let spath = match resolve_or_err(ctx, cwd, src, &mut sbuf) { Some(p) => p, None => return };
+    let mut sp = [0u8; PATH_MAX];
+    let sl = spath.len();
+    sp[..sl].copy_from_slice(spath);
+    let mut dbuf = [0u8; PATH_MAX];
+    let dpath = match resolve_or_err(ctx, cwd, dst, &mut dbuf) { Some(p) => p, None => return };
+    let mut dp = [0u8; PATH_MAX];
+    let dl = dpath.len();
+    dp[..dl].copy_from_slice(dpath);
+    // Guard against moving a directory into itself or its own subtree (would orphan it).
+    if dp[..dl] == sp[..sl] || (dl > sl && dp[..sl] == sp[..sl] && dp[sl] == b'/') {
+        ctx.console_writeln("move: cannot move into itself");
+        return;
+    }
+    match fs_request(ctx, OP_MOVE, &sp[..sl], &dp[..dl]) {
+        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
+            ctx.console_writeln_fmt(format_args!("moved {} → {}", str_of(&sp[..sl]), str_of(&dp[..dl])));
+        }
+        Some(r) if no_fs(ctx, r.payload_bytes()) => {}
+        Some(_) => ctx.console_writeln("move: failed (not found, or dest exists?)"),
+        None    => ctx.console_writeln("move: storage unavailable"),
+    }
+}
+
+/// `find <name> [path]` — search a subtree (default the whole filesystem, `/`) for entries
+/// named exactly `<name>`, printing each match's full path. This is whole-filesystem
+/// enumeration done the disciplined way: a **tree walk** (the tree IS the index, §6.4),
+/// client-side via LIST_DIR so results stream as found and `fs` needs no new op. The walk
+/// is bounded (a fixed pending-directory stack) and **loud on truncation** (§26.6/§3.12);
+/// the `fs_index` accelerator (persistence.md §6.5) is what we'd build if this walk ever
+/// gets too slow on a huge tree — not before.
+fn cmd_find(ctx: &ServiceContext, cwd: &Cwd, target: &str, start: &str) {
+    let mut sbuf = [0u8; PATH_MAX];
+    let start_abs = match resolve_or_err(ctx, cwd, start, &mut sbuf) { Some(p) => p, None => return };
+    let mut stack = PathStack::new();
+    stack.push(start_abs);
+
+    let target = target.as_bytes();
+    let mut matches = 0u32;
+    let mut dir = [0u8; PATH_MAX];
+    while let Some(dlen) = stack.pop(&mut dir) {
+        let reply = match fs_request(ctx, OP_LIST_DIR, &dir[..dlen], &[]) {
+            Some(r) => r,
+            None => { ctx.console_writeln("find: storage unavailable"); return; }
+        };
+        let p = reply.payload_bytes();
+        if no_fs(ctx, p) { return; }
+        if p.first() != Some(&FS_OK) || p.len() < 2 { continue; }
+        let count = p[1] as usize;
+        let mut i = 2usize;
+        for _ in 0..count {
+            if i >= p.len() { break; }
+            let nl = p[i] as usize;
+            i += 1;
+            if i + nl + 1 + 8 > p.len() { break; }
+            let name = &p[i..i + nl];
+            let is_dir = p[i + nl] != 0;
+            i += nl + 1 + 8; // name_len + name + is_dir + size:u64
+            let mut child = [0u8; PATH_MAX];
+            if let Some(clen) = join_path(&dir[..dlen], name, &mut child) {
+                if contains(name, target) {
+                    ctx.console_writeln(str_of(&child[..clen]));
+                    matches += 1;
+                }
+                if is_dir {
+                    stack.push(&child[..clen]);
+                }
+            }
+        }
+    }
+    if stack.overflow {
+        ctx.console_writeln_fmt(format_args!(
+            "find: search truncated — more than {} directories pending (bounded walk)", FIND_QCAP));
+    }
+    ctx.console_writeln_fmt(format_args!("find: {} match(es)", matches));
+}
+
+/// Join `dir` + `name` into an absolute child path (`/` separator, no double slash).
+fn join_path(dir: &[u8], name: &[u8], out: &mut [u8; PATH_MAX]) -> Option<usize> {
+    if dir.len() > PATH_MAX { return None; }
+    out[..dir.len()].copy_from_slice(dir);
+    let mut len = dir.len();
+    if len == 0 || out[len - 1] != b'/' {
+        if len >= PATH_MAX { return None; }
+        out[len] = b'/';
+        len += 1;
+    }
+    if len + name.len() > PATH_MAX { return None; }
+    out[len..len + name.len()].copy_from_slice(name);
+    Some(len + name.len())
+}
+
+/// True if `needle` appears as a contiguous substring of `haystack` (find's match).
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() { return true; }
+    if needle.len() > haystack.len() { return false; }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn str_of(b: &[u8]) -> &str {
+    core::str::from_utf8(b).unwrap_or("?")
+}
+
+/// Bounded stack of directory paths still to visit during a `find` walk (§26.6). Pushing
+/// past the cap sets `overflow` so `find` reports the truncation rather than silently
+/// missing part of the tree (§3.12).
+const FIND_QCAP: usize = 32;
+struct PathStack {
+    buf: [[u8; PATH_MAX]; FIND_QCAP],
+    len: [usize; FIND_QCAP],
+    top: usize,
+    overflow: bool,
+}
+impl PathStack {
+    fn new() -> Self {
+        PathStack { buf: [[0u8; PATH_MAX]; FIND_QCAP], len: [0; FIND_QCAP], top: 0, overflow: false }
+    }
+    fn push(&mut self, p: &[u8]) {
+        if self.top >= FIND_QCAP || p.len() > PATH_MAX {
+            self.overflow = true;
+            return;
+        }
+        self.buf[self.top][..p.len()].copy_from_slice(p);
+        self.len[self.top] = p.len();
+        self.top += 1;
+    }
+    fn pop(&mut self, out: &mut [u8; PATH_MAX]) -> Option<usize> {
+        if self.top == 0 { return None; }
+        self.top -= 1;
+        let l = self.len[self.top];
+        out[..l].copy_from_slice(&self.buf[self.top][..l]);
+        Some(l)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // drives — manage attached disks (utilities/15_drives.md). A shell built-in that
 // sends the drives API to `fs` over IPC; `fs` holds and enforces all disk authority.
 // Step 3: the data primitives `flash` / `label` / list (boot layer + multi-drive later).
@@ -621,11 +1320,11 @@ fn cmd_drives(ctx: &ServiceContext, args: &[&str], argc: usize) {
             let sel = if argc >= 3 { args[2] } else { "" };
             if drive_sel_ok(ctx, sel) { drives_reset(ctx); }
         }
-        "version" => ctx.console_writeln(DRIVES_VERSION),
-        "help"    => drives_help(ctx),
+        // `drives help` / `drives version` and `drives <sub> help` are handled by the
+        // generic per-utility intercept in `execute` (0_conventions.md).
         other     => {
             ctx.console_writeln_fmt(format_args!("drives: unknown subcommand '{}'", other));
-            drives_help(ctx);
+            util_help(ctx, "drives");
         }
     }
 }
@@ -654,17 +1353,6 @@ fn drive_sel_ok(ctx: &ServiceContext, sel: &str) -> bool {
     true // a label selector — single drive, accept
 }
 
-fn drives_help(ctx: &ServiceContext) {
-    ctx.console_writeln_fmt(format_args!("{} — manage attached disks (format, name, list)", DRIVES_VERSION));
-    ctx.console_writeln("");
-    ctx.console_writeln("usage:");
-    help_line(ctx, "drives", "list attached drive(s)");
-    help_line(ctx, "drives flash [drive] [label]", "format as GSFS (ERASES; asks y/N)");
-    help_line(ctx, "drives label [drive] <name>", "name / rename the drive");
-    help_line(ctx, "drives reset [drive]", "un-format back to raw (ERASES; asks y/N)");
-    help_line(ctx, "drives version", "print the version");
-    help_line(ctx, "drives help", "print this message");
-}
 
 /// `drives` — list the attached drive (single-drive in step 3; index 0).
 fn drives_list(ctx: &ServiceContext) {

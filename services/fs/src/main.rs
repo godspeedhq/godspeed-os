@@ -1,129 +1,123 @@
+// GodspeedOS — Created by Bankole Ogundero.
+//
+// This software is provided "as is", without warranty or guarantee of any kind,
+// express or implied. The author makes no guarantee of its correctness, reliability,
+// or fitness for any purpose, and accepts no liability for any damages arising from
+// its use. Use at your own risk.
+
 //! `fs` — userspace filesystem service (persistence, v2; §15, docs/persistence.md).
 //!
-//! **Phase 2: a real hierarchical filesystem (GSFS, magic "GSFS0002").** Mounts by
-//! reading the superblock (LBA 0) from `block-driver`, then resolves files and
-//! directories by **path** (`/a/b/c`) through an on-disk **inode table** + per-directory
-//! **directory blocks** (`name → inode`). All capacity-bearing fields are **u64**
-//! (volume size, file size, block pointers, the block-IPC LBA) — see §6.3, the ~8 ZiB
-//! ceiling. Directories and files are inodes; a directory's contents are entries naming
-//! child inodes. Path walking starts at the root inode.
+//! **Phase 3: GSFS0003 — the scalable format (docs/persistence.md §6.4).** Three on-disk
+//! structures and no more: a **superblock**, a **free bitmap** (1 bit/block, read on
+//! demand — the only global structure, a free *map* not a file index), and the
+//! **directory tree** of **self-describing `file_record` entries** (`{type, name, size,
+//! first_block, block_count}` — no inode table, no inode number, no global file cap). The
+//! directory tree *is* the index (walk a path from root); the bitmap is the allocation
+//! map; reclamation is intrinsic (`delete`/overwrite free bits). Directories **grow**
+//! (reallocate a bigger extent when full) so there is no per-directory entry cap either.
+//! The only ceiling is the disk. (`fs_index`, the deferred global enumeration cache, is
+//! §6.5 — not built; built when a `find`/search need pulls it in.)
 //!
-//! Bounded & loud, in the Godspeed spirit (§26.6): a fixed inode count, a fixed name
-//! length, one block per directory (16 entries), contiguous file extents via a bump
-//! allocator (no reclamation yet — overwrite leaks the old extent, a Phase-1 carry-over,
-//! §26.2). No POSIX permission bits (authority is by capability, §3.3) and no hard links.
-//! Bad superblock magic is a loud mount refusal, never an auto-reformat (§3.12).
-//!
-//! All disk I/O goes through `block-driver` over IPC; this service touches no hardware.
-//! On mount it runs a self-test that exercises the hierarchy (mkdir + a nested file) and
-//! is reboot-aware (verifies persisted files on a second boot), then serves the file API.
+//! `fs` is the single owner of the filesystem (§8): it serves one IPC request at a time,
+//! so every mutation is serialized — no concurrency to reconcile. All disk I/O goes through
+//! `block-driver` over IPC; this service touches no hardware. Raw-tolerant: a bad magic is
+//! a loud refusal, never an auto-format (§3.12).
 
 #![no_std]
 #![no_main]
 
 use godspeed_sdk::{CapHandle, Message, ServiceContext};
 
-// ── On-disk format — MUST match `osdev mkfs` (docs/persistence.md §6.2/§6.3). ──
-// 512-byte blocks (= one ATA/AHCI sector = one block-IPC request), so block number = LBA.
-const SB_MAGIC: &[u8; 8] = b"GSFS0002";
+// ── On-disk format — MUST match `osdev format_superblock` (persistence.md §6.4). ──
+const SB_MAGIC: &[u8; 8] = b"GSFS0003";
 const BLOCK: usize = 512;
+const BITS_PER_BMBLOCK: u64 = (BLOCK as u64) * 8; // 4096 bits per bitmap block
 
-// Inode table: INODE_COUNT slots × INODE_SIZE bytes.
-const INODE_SIZE: usize = 64;
-const INODES_PER_BLOCK: usize = BLOCK / INODE_SIZE; // 8
-const INODE_COUNT: usize = 256;
-const ROOT_INODE: u32 = 0;
-// Fixed on-disk geometry — MUST match `osdev format_superblock`. Inode table at LBA 1
-// (32 blocks for 256 inodes), data region from LBA 33. Used by the in-OS `format()`.
-const INODE_TABLE_START: u64 = 1;
-const INODE_TABLE_BLOCKS: u64 = (INODE_COUNT / INODES_PER_BLOCK) as u64; // 32
-const DATA_START: u64 = INODE_TABLE_START + INODE_TABLE_BLOCKS; // 33
-const LABEL_MAX: usize = 31; // superblock: label_len u8 @64, label[31] @65
+// file_record entry: 64 bytes, 8 per block.
+const REC_SIZE: usize = 64;
+const RECS_PER_BLOCK: usize = BLOCK / REC_SIZE; // 8
+const NAME_MAX: usize = 38; // entry: type u8 @0, name_len u8 @1, name[38] @2, size @40, first @48, count @56
+const LABEL_MAX: usize = 31; // superblock: label_len u8 @76, label[31] @77
 
 const ITYPE_FREE: u8 = 0;
 const ITYPE_FILE: u8 = 1;
 const ITYPE_DIR: u8 = 2;
 
-// Directory block: one 512-byte block = DIRENTS_PER_BLOCK entries × DIRENT_SIZE bytes.
-// One block per directory in this phase (bounded; overflow is a loud error).
-const DIRENT_SIZE: usize = 32;
-const DIRENTS_PER_BLOCK: usize = BLOCK / DIRENT_SIZE; // 16
-const NAME_MAX: usize = 27; // dirent: name_len u8 + name[27] + inode u32 = 32
-
-// One file read/write travels in a single IPC message; bound the body so the file API
-// reply (5-byte header + data) never exceeds MAX_PAYLOAD (4096).
+// One file read/write travels in a single IPC message; bound the body so the READ reply
+// (5-byte header + data) never exceeds MAX_PAYLOAD (4096).
 const MAX_FILE_BYTES: usize = 7 * BLOCK; // 3584
 
 // Block IPC protocol (fs <-> block-driver). MUST match `services/block-driver`.
 const OP_READ_BLOCK: u8 = 1;
 const OP_WRITE_BLOCK: u8 = 2;
 const OP_CAPACITY: u8 = 3;
+const OP_WRITE_ZEROS: u8 = 4; // [op, lba:u64, count:u64] — zero a run of blocks (fast format)
 const BLK_OK: u8 = 0;
 
-// fs file API (client <-> fs). Paths are passed where the name was (§8 of persistence.md).
+// fs file API (client <-> fs). `[op, path_len, path, (WriteFile: data | Rename/Move: tail)]`.
 const OP_WRITE_FILE: u8 = 10;
 const OP_READ_FILE: u8 = 11;
 const OP_STAT_FILE: u8 = 12;
 const OP_MKDIR: u8 = 13;
 const OP_LIST_DIR: u8 = 14;
-// drives API (the `drives` command <-> fs). Works in BOTH states (raw + mounted),
-// except LABEL which needs a filesystem. INFO reports the volume; FLASH formats a
-// raw disk (or re-formats); LABEL renames.
+const OP_RENAME: u8 = 15;
+const OP_DELETE: u8 = 16;
+const OP_MOVE: u8 = 17;
+const OP_MKDIR_P: u8 = 18; // mkdir creating any missing parent directories
+// drives API.
 const OP_DRIVES_INFO: u8 = 20;
 const OP_FLASH: u8 = 21;
 const OP_LABEL: u8 = 22;
-const OP_RESET: u8 = 23; // un-format: zero the superblock → the drive reads as raw again
+const OP_RESET: u8 = 23;
 const FS_OK: u8 = 0;
 const FS_ERR: u8 = 1;
 const FS_NOTFOUND: u8 = 2;
-const FS_NOFS: u8 = 3; // no filesystem on the disk (raw — needs `drives flash`)
+const FS_NOFS: u8 = 3;
 
+/// In-memory superblock view. No inode table — the tree lives on disk and is read on
+/// demand; the bitmap likewise (this struct holds only geometry + the maintained free
+/// count + the root's extent + drive label/flags).
+struct Fs {
+    total_blocks: u64,
+    bitmap_start: u64,
+    data_start: u64,
+    root_first_block: u64,
+    root_block_count: u64,
+    free_blocks: u64,
+    flags: u32,
+    label: [u8; LABEL_MAX],
+    label_len: u8,
+}
+
+/// A decoded `file_record` plus where it lives, so it can be written back. `loc == None`
+/// means the root directory (its extent lives in the superblock, it has no parent entry).
 #[derive(Clone, Copy)]
-struct Inode {
+struct Entry {
     itype: u8,
     size: u64,
     first_block: u64,
     block_count: u64,
+    loc: Option<Loc>,
 }
-
-impl Inode {
-    const FREE: Inode = Inode { itype: ITYPE_FREE, size: 0, first_block: 0, block_count: 0 };
-    fn is_dir(&self) -> bool { self.itype == ITYPE_DIR }
-    fn is_file(&self) -> bool { self.itype == ITYPE_FILE }
-}
-
-struct Fs {
-    total_blocks: u64,
-    inode_table_start: u64,
-    inode_table_blocks: u64,
-    data_start: u64,
-    next_free_block: u64,
-    root_inode: u32,
-    flags: u32,             // superblock @60; bit0 = DEFAULT (drives.md §3)
-    label: [u8; LABEL_MAX], // superblock @65
-    label_len: u8,          // superblock @64
-    inodes: [Inode; INODE_COUNT],
+#[derive(Clone, Copy)]
+struct Loc {
+    block: u64,
+    slot: usize,
 }
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("fs: starting");
 
-    // Disk size, from block-driver's IDENTIFY — what a future `drives flash` sizes a
-    // fresh filesystem to (step 3b). 0 if block-driver is unreachable.
     let capacity = block_capacity(&ctx).unwrap_or(0);
-    ctx.log_fmt(format_args!(
-        "fs: disk capacity = {} sectors ({} MiB)", capacity, capacity / 2048
-    ));
+    ctx.log_fmt(format_args!("fs: disk capacity = {} sectors ({} MiB)", capacity, capacity / 2048));
 
-    // Raw-tolerant: a bad superblock is NOT fatal (a raw disk is the normal state of a
-    // never-flashed drive). fs stays up; `drives flash` will format it (step 3b). It is
-    // never auto-formatted — silent reformat is forbidden (§3.12).
+    // Raw-tolerant: a bad superblock is the normal state of a never-flashed drive (§3.12).
     let mut fs: Option<Fs> = match Fs::mount(&ctx) {
         Ok(f) => {
             ctx.log_fmt(format_args!(
-                "fs: mounted GSFS ({} blocks, {} inodes, data@{}, next_free={})",
-                f.total_blocks, INODE_COUNT, f.data_start, f.next_free_block
+                "fs: mounted GSFS0003 ({} blocks, bitmap {}..{}, root@{}, {} free)",
+                f.total_blocks, f.bitmap_start, f.data_start, f.root_first_block, f.free_blocks
             ));
             Some(f)
         }
@@ -133,15 +127,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         }
     };
 
-    // The self-test WRITES to the disk, so it runs only in test builds (`--features
-    // selftest`). A production fs must never auto-write to the user's disk (the hardware
-    // run showed it polluting a real SSD with /etc + /greeting every boot).
+    // TEST builds only (`--features selftest`): exercises the tree + reboot survival by
+    // WRITING to the disk. Never enabled in production (it would pollute a user's disk).
     #[cfg(feature = "selftest")]
     if let Some(ref mut f) = fs {
         self_test(&ctx, f);
     }
 
-    // Serve the file API to other services over IPC (the reply-cap pattern, §8).
     ctx.log("fs: serving file API");
     loop {
         let msg = ctx.recv();
@@ -154,21 +146,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     }
 }
 
-/// Exercise the hierarchy and reboot survival. On a fresh disk: `mkdir /etc`, write a
-/// nested file `/etc/motd`, write a top-level `/greeting`. On a later boot: verify both
-/// already exist (persistence). Log strings are stable — the `osdev` tests gate on them.
-/// TEST-ONLY (`--features selftest`): it writes to the disk, so it must never run against
-/// a user's real disk.
 #[cfg(feature = "selftest")]
 fn self_test(ctx: &ServiceContext, fs: &mut Fs) {
     const GREET: &[u8] = b"/greeting";
     const GREET_DATA: &[u8] = b"hello, persistence!";
     const DIR: &[u8] = b"/etc";
     const NESTED: &[u8] = b"/etc/motd";
-    const NESTED_DATA: &[u8] = b"godspeed hierarchical fs";
+    const NESTED_DATA: &[u8] = b"godspeed scalable fs";
     let mut buf = [0u8; MAX_FILE_BYTES];
 
-    // Reboot path: if /greeting is already there and correct, we have persisted state.
     if let Some(n) = fs.read_path(ctx, GREET, &mut buf) {
         if &buf[..n] == GREET_DATA {
             ctx.log("fs: persisted file 'greeting' verified across boot");
@@ -180,8 +166,6 @@ fn self_test(ctx: &ServiceContext, fs: &mut Fs) {
             return;
         }
     }
-
-    // Fresh disk: build a small tree.
     match fs.mkdir(ctx, DIR) {
         Ok(()) => ctx.log("fs: mkdir /etc OK"),
         Err(e) => ctx.log_fmt(format_args!("fs: mkdir /etc FAILED: {}", e)),
@@ -189,27 +173,20 @@ fn self_test(ctx: &ServiceContext, fs: &mut Fs) {
     match fs.write_path(ctx, NESTED, NESTED_DATA) {
         Ok(()) => match fs.read_path(ctx, NESTED, &mut buf) {
             Some(n) if &buf[..n] == NESTED_DATA => ctx.log("fs: nested file round-trip OK (/etc/motd)"),
-            Some(_) => ctx.log("fs: nested round-trip MISMATCH"),
-            None => ctx.log("fs: nested read-back FAILED"),
+            _ => ctx.log("fs: nested round-trip MISMATCH"),
         },
         Err(e) => ctx.log_fmt(format_args!("fs: nested write FAILED: {}", e)),
     }
     match fs.write_path(ctx, GREET, GREET_DATA) {
         Ok(()) => match fs.read_path(ctx, GREET, &mut buf) {
             Some(n) if &buf[..n] == GREET_DATA => ctx.log("fs: file round-trip OK (greeting)"),
-            Some(_) => ctx.log("fs: file round-trip MISMATCH"),
-            None => ctx.log("fs: read-back FAILED"),
+            _ => ctx.log("fs: file round-trip MISMATCH"),
         },
         Err(e) => ctx.log_fmt(format_args!("fs: write FAILED: {}", e)),
     }
 }
 
-/// Dispatch one file-API request and reply through the client's `reply` cap.
-/// Layout: `[op:u8, path_len:u8, path[path_len], (WriteFile: data)]`.
-///
-/// File ops require a mounted filesystem; on a raw disk (`fs` is `None`) they return
-/// `FS_NOFS` so the caller can tell "no filesystem here" from "not found". (The drives
-/// API — flash/info/label — is added in step 3b and works in both states.)
+/// Dispatch one request and reply through the client's `reply` cap.
 fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], reply: CapHandle) {
     let send = |bytes: &[u8]| { let _ = ctx.send_by_handle(reply, &Message::from_bytes(bytes)); };
     if p.is_empty() {
@@ -217,18 +194,18 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
         return;
     }
 
-    // drives API first — INFO/FLASH work on a raw disk; LABEL needs a filesystem.
+    // drives API — INFO/FLASH work on a raw disk; LABEL/RESET as below.
     match p[0] {
         OP_DRIVES_INFO => {
-            // [FS_OK, mounted, capacity:u64, total_blocks:u64, next_free:u64, flags:u8,
-            //  label_len:u8, label…]
+            // [FS_OK, mounted, capacity:u64, used:u64, flags:u8, label_len:u8, label…]
             let mut out = [0u8; 28 + LABEL_MAX];
             out[0] = FS_OK;
             out[2..10].copy_from_slice(&capacity.to_le_bytes());
             if let Some(f) = vol {
                 out[1] = 1;
+                let used = f.total_blocks.saturating_sub(f.free_blocks);
                 out[10..18].copy_from_slice(&f.total_blocks.to_le_bytes());
-                out[18..26].copy_from_slice(&f.next_free_block.to_le_bytes());
+                out[18..26].copy_from_slice(&used.to_le_bytes());
                 out[26] = f.flags as u8;
                 let ll = (f.label_len as usize).min(LABEL_MAX);
                 out[27] = ll as u8;
@@ -240,11 +217,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
             return;
         }
         OP_FLASH => {
-            // [op, label_len, label…] — format the disk (raw or re-flash) to capacity.
-            if capacity == 0 {
-                send(&[FS_ERR]); // no disk
-                return;
-            }
+            if capacity == 0 { send(&[FS_ERR]); return; }
             let ll = if p.len() >= 2 { (p[1] as usize).min(LABEL_MAX) } else { 0 };
             let label = if p.len() >= 2 + ll { &p[2..2 + ll] } else { &[][..] };
             match Fs::format(ctx, capacity, label) {
@@ -263,46 +236,27 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
             return;
         }
         OP_RESET => {
-            // Un-format: zero the superblock so the disk reads as raw again (the inverse
-            // of FLASH). Quick clean slate for re-testing the raw→flash path — NOT a
-            // secure wipe (data blocks remain). Drops any mounted filesystem.
-            if capacity == 0 {
-                send(&[FS_ERR]); // no disk
-            } else if block_write(ctx, 0, &[0u8; BLOCK]) {
-                *vol = None;
-                send(&[FS_OK]);
-            } else {
-                send(&[FS_ERR]);
-            }
+            if capacity == 0 { send(&[FS_ERR]); }
+            else if block_write(ctx, 0, &[0u8; BLOCK]) { *vol = None; send(&[FS_OK]); }
+            else { send(&[FS_ERR]); }
             return;
         }
         _ => {}
     }
 
     // File ops require a mounted filesystem.
-    if p.len() < 2 {
-        send(&[FS_ERR]);
-        return;
-    }
+    if p.len() < 2 { send(&[FS_ERR]); return; }
     let fs = match vol {
         Some(f) => f,
-        None => {
-            send(&[FS_NOFS]);
-            return;
-        }
+        None => { send(&[FS_NOFS]); return; }
     };
     let op = p[0];
     let plen = p[1] as usize;
-    if p.len() < 2 + plen {
-        send(&[FS_ERR]);
-        return;
-    }
+    if p.len() < 2 + plen { send(&[FS_ERR]); return; }
     let path = &p[2..2 + plen];
+    let tail = &p[2 + plen..]; // WriteFile data, or Rename newname, or Move dst-path
     match op {
-        OP_WRITE_FILE => {
-            let data = &p[2 + plen..];
-            send(&[match fs.write_path(ctx, path, data) { Ok(()) => FS_OK, Err(_) => FS_ERR }]);
-        }
+        OP_WRITE_FILE => send(&[match fs.write_path(ctx, path, tail) { Ok(()) => FS_OK, Err(_) => FS_ERR }]),
         OP_READ_FILE => {
             let mut buf = [0u8; MAX_FILE_BYTES];
             match fs.read_path(ctx, path, &mut buf) {
@@ -317,355 +271,520 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
             }
         }
         OP_STAT_FILE => {
-            // Reply: [FS_OK, exists:u8, size:u64 LE, is_dir:u8]
             let mut out = [0u8; 11];
             out[0] = FS_OK;
             match fs.walk(ctx, path) {
-                Some(i) => {
-                    let n = fs.inodes[i as usize];
+                Some(e) => {
                     out[1] = 1;
-                    out[2..10].copy_from_slice(&n.size.to_le_bytes());
-                    out[10] = n.is_dir() as u8;
+                    out[2..10].copy_from_slice(&e.size.to_le_bytes());
+                    out[10] = (e.itype == ITYPE_DIR) as u8;
                 }
                 None => out[1] = 0,
             }
             send(&out);
         }
-        OP_MKDIR => {
-            send(&[match fs.mkdir(ctx, path) { Ok(()) => FS_OK, Err(_) => FS_ERR }]);
-        }
-        OP_LIST_DIR => {
-            // Reply: [FS_OK, count:u8, {name_len:u8, name[name_len], is_dir:u8}…]
-            match fs.list_dir(ctx, path) {
-                Some(out) => send(&out),
-                None => send(&[FS_NOTFOUND]),
-            }
-        }
+        OP_MKDIR => send(&[match fs.mkdir(ctx, path) { Ok(()) => FS_OK, Err(_) => FS_ERR }]),
+        OP_MKDIR_P => send(&[match fs.mkdir_parents(ctx, path) { Ok(()) => FS_OK, Err(_) => FS_ERR }]),
+        OP_LIST_DIR => match fs.list_dir(ctx, path) {
+            Some(out) => send(&out),
+            None => send(&[FS_NOTFOUND]),
+        },
+        OP_RENAME => send(&[match fs.rename(ctx, path, tail) { Ok(()) => FS_OK, Err(_) => FS_ERR }]),
+        OP_DELETE => send(&[match fs.delete(ctx, path) { Ok(()) => FS_OK, Err(_) => FS_ERR }]),
+        OP_MOVE => send(&[match fs.move_path(ctx, path, tail) { Ok(()) => FS_OK, Err(_) => FS_ERR }]),
         _ => send(&[FS_ERR]),
     }
 }
 
 impl Fs {
+    // ── mount / format / drive metadata ──────────────────────────────────────
     fn mount(ctx: &ServiceContext) -> Result<Fs, &'static str> {
         let sb = block_read(ctx, 0).ok_or("block 0 read failed (block-driver unreachable?)")?;
         if &sb[0..8] != SB_MAGIC {
-            return Err("bad superblock magic — disk not formatted (run osdev mkfs)");
+            return Err("bad superblock magic — disk not formatted (run drives flash)");
         }
-        let inode_table_start = u64_at(&sb, 24);
-        let inode_table_blocks = u64_at(&sb, 32);
         let mut label = [0u8; LABEL_MAX];
-        let label_len = (sb[64] as usize).min(LABEL_MAX);
-        label[..label_len].copy_from_slice(&sb[65..65 + label_len]);
-        let mut fs = Fs {
+        let ll = (sb[76] as usize).min(LABEL_MAX);
+        label[..ll].copy_from_slice(&sb[77..77 + ll]);
+        Ok(Fs {
             total_blocks: u64_at(&sb, 16),
-            inode_table_start,
-            inode_table_blocks,
+            bitmap_start: u64_at(&sb, 24),
             data_start: u64_at(&sb, 40),
-            next_free_block: u64_at(&sb, 48),
-            root_inode: u32_at(&sb, 56),
-            flags: u32_at(&sb, 60),
+            root_first_block: u64_at(&sb, 48),
+            root_block_count: u64_at(&sb, 56),
+            free_blocks: u64_at(&sb, 64),
+            flags: u32_at(&sb, 72),
             label,
-            label_len: label_len as u8,
-            inodes: [Inode::FREE; INODE_COUNT],
-        };
-        // Read the inode table (INODE_COUNT inodes, INODES_PER_BLOCK per block).
-        for b in 0..fs.inode_table_blocks {
-            let blk = block_read(ctx, inode_table_start + b).ok_or("inode-table read failed")?;
-            for s in 0..INODES_PER_BLOCK {
-                let idx = (b as usize) * INODES_PER_BLOCK + s;
-                if idx >= INODE_COUNT { break; }
-                fs.inodes[idx] = decode_inode(&blk, s * INODE_SIZE);
-            }
-        }
-        Ok(fs)
+            label_len: ll as u8,
+        })
     }
 
-    /// Format the disk as an empty GSFS sized to `capacity` (sectors), with `label`,
-    /// then mount it. Writes the superblock + a zeroed inode table + the root directory
-    /// inode + an empty root directory block — the same layout `osdev mkfs` writes, but
-    /// over block IPC and sized to the real disk. This is `drives flash`; it is only ever
-    /// invoked by an explicit user command, never automatically (§3.12).
+    /// Format the disk as an empty GSFS0003 sized to `capacity`, then mount. Same layout
+    /// `osdev format_superblock` writes. `drives flash`; only ever user-initiated (§3.12).
     fn format(ctx: &ServiceContext, capacity: u64, label: &[u8]) -> Result<Fs, &'static str> {
         let total_blocks = capacity;
-        let root_dir_block = DATA_START;
-        let next_free_block = DATA_START + 1;
-        if total_blocks < next_free_block {
+        let bitmap_start: u64 = 1;
+        let bitmap_blocks = (total_blocks + BITS_PER_BMBLOCK - 1) / BITS_PER_BMBLOCK;
+        let data_start = bitmap_start + bitmap_blocks;
+        let root_first_block = data_start;
+        let root_block_count: u64 = 1;
+        let used_through = data_start + root_block_count;
+        if total_blocks < used_through + 1 {
             return Err("disk too small for a filesystem");
         }
+        let free_blocks = total_blocks - used_through;
 
-        // Superblock (LBA 0).
         let mut sb = [0u8; BLOCK];
         sb[0..8].copy_from_slice(SB_MAGIC);
-        sb[8..12].copy_from_slice(&2u32.to_le_bytes()); // version
-        sb[12..16].copy_from_slice(&(BLOCK as u32).to_le_bytes()); // block_size
+        sb[8..12].copy_from_slice(&3u32.to_le_bytes());
+        sb[12..16].copy_from_slice(&(BLOCK as u32).to_le_bytes());
         sb[16..24].copy_from_slice(&total_blocks.to_le_bytes());
-        sb[24..32].copy_from_slice(&INODE_TABLE_START.to_le_bytes());
-        sb[32..40].copy_from_slice(&INODE_TABLE_BLOCKS.to_le_bytes());
-        sb[40..48].copy_from_slice(&DATA_START.to_le_bytes());
-        sb[48..56].copy_from_slice(&next_free_block.to_le_bytes());
-        sb[56..60].copy_from_slice(&ROOT_INODE.to_le_bytes());
-        sb[60..64].copy_from_slice(&0u32.to_le_bytes()); // flags (DEFAULT clear)
+        sb[24..32].copy_from_slice(&bitmap_start.to_le_bytes());
+        sb[32..40].copy_from_slice(&bitmap_blocks.to_le_bytes());
+        sb[40..48].copy_from_slice(&data_start.to_le_bytes());
+        sb[48..56].copy_from_slice(&root_first_block.to_le_bytes());
+        sb[56..64].copy_from_slice(&root_block_count.to_le_bytes());
+        sb[64..72].copy_from_slice(&free_blocks.to_le_bytes());
+        sb[72..76].copy_from_slice(&0u32.to_le_bytes());
         let ll = label.len().min(LABEL_MAX);
-        sb[64] = ll as u8;
-        sb[65..65 + ll].copy_from_slice(&label[..ll]);
-        if !block_write(ctx, 0, &sb) {
-            return Err("superblock write failed");
-        }
+        sb[76] = ll as u8;
+        sb[77..77 + ll].copy_from_slice(&label[..ll]);
+        if !block_write(ctx, 0, &sb) { return Err("superblock write failed"); }
 
-        // Zero the inode table, then write the root inode (slot 0 = a dir at data_start).
+        // Zero the bitmap region in one batched op (driver writes multi-sector zero runs —
+        // keeps `drives flash` fast even on a 122 GB disk), then mark [0..used_through) used.
         let zero = [0u8; BLOCK];
-        for b in 0..INODE_TABLE_BLOCKS {
-            if !block_write(ctx, INODE_TABLE_START + b, &zero) {
-                return Err("inode table init failed");
+        if !block_write_zeros(ctx, bitmap_start, bitmap_blocks) { return Err("bitmap init failed"); }
+        let mut b = 0u64;
+        while b < used_through {
+            let bm_blk = bitmap_start + b / BITS_PER_BMBLOCK;
+            let mut blk = block_read(ctx, bm_blk).ok_or("bitmap read failed")?;
+            let base = (b / BITS_PER_BMBLOCK) * BITS_PER_BMBLOCK;
+            let stop = used_through.min(base + BITS_PER_BMBLOCK);
+            while b < stop {
+                let w = (b - base) as usize;
+                blk[w / 8] |= 1 << (w % 8);
+                b += 1;
             }
-        }
-        let mut ib = [0u8; BLOCK];
-        encode_inode(&mut ib, 0, &Inode { itype: ITYPE_DIR, size: 0, first_block: root_dir_block, block_count: 1 });
-        if !block_write(ctx, INODE_TABLE_START, &ib) {
-            return Err("root inode write failed");
+            if !block_write(ctx, bm_blk, &blk) { return Err("bitmap write failed"); }
         }
         // Empty root directory block.
-        if !block_write(ctx, root_dir_block, &zero) {
-            return Err("root directory init failed");
-        }
+        if !block_write(ctx, root_first_block, &zero) { return Err("root dir init failed"); }
 
         Fs::mount(ctx)
     }
 
-    /// Rewrite the on-disk label (and the in-memory copy). `drives label`.
     fn relabel(&mut self, ctx: &ServiceContext, label: &[u8]) -> Result<(), &'static str> {
         let ll = label.len().min(LABEL_MAX);
-        let mut sb = block_read(ctx, 0).ok_or("superblock read failed")?;
-        sb[64] = ll as u8;
-        for b in &mut sb[65..65 + LABEL_MAX] { *b = 0; }
-        sb[65..65 + ll].copy_from_slice(&label[..ll]);
-        if !block_write(ctx, 0, &sb) {
-            return Err("superblock write failed");
-        }
         self.label = [0u8; LABEL_MAX];
         self.label[..ll].copy_from_slice(&label[..ll]);
         self.label_len = ll as u8;
-        Ok(())
+        self.persist_super(ctx)
     }
 
-    // ── inode allocation + persistence ───────────────────────────────────────
-    fn alloc_inode(&mut self) -> Option<u32> {
-        self.inodes.iter().position(|n| n.itype == ITYPE_FREE).map(|i| i as u32)
-    }
-
-    /// Persist one inode by read-modify-writing its inode-table block.
-    fn persist_inode(&self, ctx: &ServiceContext, idx: u32) -> Result<(), &'static str> {
-        let block = self.inode_table_start + (idx as u64) / (INODES_PER_BLOCK as u64);
-        let slot = (idx as usize) % INODES_PER_BLOCK;
-        let mut blk = block_read(ctx, block).ok_or("inode block read failed")?;
-        encode_inode(&mut blk, slot * INODE_SIZE, &self.inodes[idx as usize]);
-        if !block_write(ctx, block, &blk) {
-            return Err("inode block write failed");
-        }
-        Ok(())
-    }
-
-    /// Bump-allocate `n` contiguous data blocks; persist the superblock high-water.
-    fn alloc_blocks(&mut self, ctx: &ServiceContext, n: u64) -> Result<u64, &'static str> {
-        if self.next_free_block + n > self.total_blocks {
-            return Err("no space");
-        }
-        let first = self.next_free_block;
-        self.next_free_block += n;
-        self.persist_superblock(ctx)?;
-        Ok(first)
-    }
-
-    fn persist_superblock(&self, ctx: &ServiceContext) -> Result<(), &'static str> {
+    /// Re-write the mutable superblock fields (free count, root extent, flags, label) from
+    /// current in-memory state. Geometry (total/bitmap/data) is fixed at format.
+    fn persist_super(&self, ctx: &ServiceContext) -> Result<(), &'static str> {
         let mut sb = block_read(ctx, 0).ok_or("superblock read failed")?;
-        sb[48..56].copy_from_slice(&self.next_free_block.to_le_bytes());
-        if !block_write(ctx, 0, &sb) {
-            return Err("superblock write failed");
+        sb[48..56].copy_from_slice(&self.root_first_block.to_le_bytes());
+        sb[56..64].copy_from_slice(&self.root_block_count.to_le_bytes());
+        sb[64..72].copy_from_slice(&self.free_blocks.to_le_bytes());
+        sb[72..76].copy_from_slice(&self.flags.to_le_bytes());
+        let ll = (self.label_len as usize).min(LABEL_MAX);
+        sb[76] = ll as u8;
+        for b in &mut sb[77..77 + LABEL_MAX] { *b = 0; }
+        sb[77..77 + ll].copy_from_slice(&self.label[..ll]);
+        if !block_write(ctx, 0, &sb) { return Err("superblock write failed"); }
+        Ok(())
+    }
+
+    // ── free bitmap (read on demand; the only global structure) ───────────────
+    /// Allocate a contiguous run of `n` free blocks; mark them used; update the free count.
+    fn alloc_run(&mut self, ctx: &ServiceContext, n: u64) -> Result<u64, &'static str> {
+        if n == 0 { return Err("zero alloc"); }
+        let mut run_start: Option<u64> = None;
+        let mut run_len: u64 = 0;
+        let mut b = self.data_start;
+        while b < self.total_blocks {
+            let bm_blk = self.bitmap_start + b / BITS_PER_BMBLOCK;
+            let blk = block_read(ctx, bm_blk).ok_or("bitmap read failed")?;
+            let base = (b / BITS_PER_BMBLOCK) * BITS_PER_BMBLOCK;
+            let mut within = b - base;
+            while within < BITS_PER_BMBLOCK {
+                let idx = base + within;
+                if idx >= self.total_blocks { break; }
+                let used = (blk[(within / 8) as usize] >> (within % 8)) & 1 != 0;
+                if used {
+                    run_start = None;
+                    run_len = 0;
+                } else {
+                    if run_start.is_none() { run_start = Some(idx); run_len = 0; }
+                    run_len += 1;
+                    if run_len == n {
+                        let start = run_start.unwrap();
+                        self.bm_set_range(ctx, start, n, true)?;
+                        self.free_blocks = self.free_blocks.saturating_sub(n);
+                        self.persist_super(ctx)?;
+                        return Ok(start);
+                    }
+                }
+                within += 1;
+            }
+            b = base + BITS_PER_BMBLOCK;
+        }
+        Err("no space")
+    }
+
+    fn free_run(&mut self, ctx: &ServiceContext, first: u64, count: u64) -> Result<(), &'static str> {
+        if count == 0 { return Ok(()); }
+        self.bm_set_range(ctx, first, count, false)?;
+        self.free_blocks += count;
+        self.persist_super(ctx)
+    }
+
+    /// Set/clear the bits for blocks `[first, first+count)`, one bitmap block at a time.
+    fn bm_set_range(&self, ctx: &ServiceContext, first: u64, count: u64, used: bool) -> Result<(), &'static str> {
+        let end = first + count;
+        let mut b = first;
+        while b < end {
+            let bm_blk = self.bitmap_start + b / BITS_PER_BMBLOCK;
+            let mut blk = block_read(ctx, bm_blk).ok_or("bitmap read failed")?;
+            let base = (b / BITS_PER_BMBLOCK) * BITS_PER_BMBLOCK;
+            let stop = end.min(base + BITS_PER_BMBLOCK);
+            while b < stop {
+                let w = (b - base) as usize;
+                if used { blk[w / 8] |= 1 << (w % 8); } else { blk[w / 8] &= !(1 << (w % 8)); }
+                b += 1;
+            }
+            if !block_write(ctx, bm_blk, &blk) { return Err("bitmap write failed"); }
         }
         Ok(())
     }
 
-    // ── directory primitives (one block per directory in this phase) ──────────
-    /// Find `name` in directory inode `dir`; returns the child inode number.
-    fn dir_lookup(&self, ctx: &ServiceContext, dir: u32, name: &[u8]) -> Option<u32> {
-        let d = self.inodes[dir as usize];
-        if !d.is_dir() { return None; }
-        let blk = block_read(ctx, d.first_block)?;
-        for e in 0..DIRENTS_PER_BLOCK {
-            let o = e * DIRENT_SIZE;
-            let nl = blk[o] as usize;
-            if nl == 0 || nl > NAME_MAX { continue; }
-            if &blk[o + 1..o + 1 + nl] == name {
-                return Some(u32_at(&blk, o + 28));
+    // ── directory tree (self-describing entries) ──────────────────────────────
+    fn root_entry(&self) -> Entry {
+        Entry { itype: ITYPE_DIR, size: 0, first_block: self.root_first_block, block_count: self.root_block_count, loc: None }
+    }
+
+    /// Find `name` among a directory's entries; returns the child (with its on-disk loc).
+    fn dir_find(&self, ctx: &ServiceContext, dir: &Entry, name: &[u8]) -> Option<Entry> {
+        for bi in 0..dir.block_count {
+            let block = dir.first_block + bi;
+            let blk = block_read(ctx, block)?;
+            for slot in 0..RECS_PER_BLOCK {
+                let o = slot * REC_SIZE;
+                if blk[o] == ITYPE_FREE { continue; }
+                let nl = blk[o + 1] as usize;
+                if nl == 0 || nl > NAME_MAX { continue; }
+                if &blk[o + 2..o + 2 + nl] == name {
+                    return Some(Entry {
+                        itype: blk[o],
+                        size: u64_at(&blk, o + 40),
+                        first_block: u64_at(&blk, o + 48),
+                        block_count: u64_at(&blk, o + 56),
+                        loc: Some(Loc { block, slot }),
+                    });
+                }
             }
         }
         None
     }
 
-    /// Add `name → child` to directory inode `dir` (first free dirent slot).
-    fn dir_add(&self, ctx: &ServiceContext, dir: u32, name: &[u8], child: u32) -> Result<(), &'static str> {
-        if name.is_empty() || name.len() > NAME_MAX {
-            return Err("bad name length");
-        }
-        let d = self.inodes[dir as usize];
-        let mut blk = block_read(ctx, d.first_block).ok_or("dir read failed")?;
-        for e in 0..DIRENTS_PER_BLOCK {
-            let o = e * DIRENT_SIZE;
-            if blk[o] == 0 {
-                blk[o] = name.len() as u8;
-                blk[o + 1..o + 1 + name.len()].copy_from_slice(name);
-                blk[o + 28..o + 32].copy_from_slice(&child.to_le_bytes());
-                if !block_write(ctx, d.first_block, &blk) {
-                    return Err("dir write failed");
-                }
-                return Ok(());
-            }
-        }
-        Err("directory full")
-    }
-
-    // ── path walking ─────────────────────────────────────────────────────────
-    /// Resolve an absolute path to an inode number (file or dir). `/` → root.
-    fn walk(&self, ctx: &ServiceContext, path: &[u8]) -> Option<u32> {
-        let mut cur = self.root_inode;
+    fn walk(&self, ctx: &ServiceContext, path: &[u8]) -> Option<Entry> {
+        let mut cur = self.root_entry();
         for comp in components(path) {
-            cur = self.dir_lookup(ctx, cur, comp)?;
+            if cur.itype != ITYPE_DIR { return None; }
+            cur = self.dir_find(ctx, &cur, comp)?;
         }
         Some(cur)
     }
 
-    /// Split a path into (parent dir inode, last component). Walks every component but
-    /// the last (a one-component lookahead); errors if a parent directory is missing.
-    /// Path must be absolute and have ≥1 component.
-    fn walk_parent<'a>(&self, ctx: &ServiceContext, path: &'a [u8]) -> Result<(u32, &'a [u8]), &'static str> {
-        let mut cur = self.root_inode;
+    /// (parent dir entry, last component). Walks all but the last component.
+    fn walk_parent<'a>(&self, ctx: &ServiceContext, path: &'a [u8]) -> Option<(Entry, &'a [u8])> {
+        let mut cur = self.root_entry();
         let mut last: Option<&[u8]> = None;
         for comp in components(path) {
             if let Some(name) = last {
-                cur = self.dir_lookup(ctx, cur, name).ok_or("path not found")?;
+                if cur.itype != ITYPE_DIR { return None; }
+                cur = self.dir_find(ctx, &cur, name)?;
             }
             last = Some(comp);
         }
-        let name = last.ok_or("empty path")?;
-        Ok((cur, name))
+        last.map(|name| (cur, name))
+    }
+
+    /// Add a record to `dir`, growing the directory if it has no free slot.
+    fn dir_add(&mut self, ctx: &ServiceContext, dir: &mut Entry, name: &[u8],
+               itype: u8, size: u64, first: u64, count: u64) -> Result<(), &'static str> {
+        for bi in 0..dir.block_count {
+            let block = dir.first_block + bi;
+            let mut blk = block_read(ctx, block).ok_or("dir read failed")?;
+            for slot in 0..RECS_PER_BLOCK {
+                if blk[slot * REC_SIZE] == ITYPE_FREE {
+                    encode_rec(&mut blk, slot, itype, name, size, first, count);
+                    if !block_write(ctx, block, &blk) { return Err("dir write failed"); }
+                    return Ok(());
+                }
+            }
+        }
+        // No free slot — grow, then place in the fresh block.
+        self.grow_dir(ctx, dir)?;
+        let block = dir.first_block + dir.block_count - 1;
+        let mut blk = block_read(ctx, block).ok_or("dir read failed")?;
+        encode_rec(&mut blk, 0, itype, name, size, first, count);
+        if !block_write(ctx, block, &blk) { return Err("dir write failed"); }
+        Ok(())
+    }
+
+    /// Grow a directory by one block: reallocate a bigger contiguous extent, copy, free the
+    /// old, and persist the directory's own record (extent changed).
+    fn grow_dir(&mut self, ctx: &ServiceContext, dir: &mut Entry) -> Result<(), &'static str> {
+        let new_count = dir.block_count + 1;
+        let new_first = self.alloc_run(ctx, new_count)?;
+        for bi in 0..dir.block_count {
+            let blk = block_read(ctx, dir.first_block + bi).ok_or("dir read failed")?;
+            if !block_write(ctx, new_first + bi, &blk) { return Err("dir copy failed"); }
+        }
+        if !block_write(ctx, new_first + dir.block_count, &[0u8; BLOCK]) { return Err("dir grow init failed"); }
+        let (old_first, old_count) = (dir.first_block, dir.block_count);
+        dir.first_block = new_first;
+        dir.block_count = new_count;
+        self.persist_entry(ctx, dir)?;
+        self.free_run(ctx, old_first, old_count)
+    }
+
+    /// Write back an entry's mutable fields (size/first_block/block_count) at its loc;
+    /// for the root, update the superblock instead.
+    fn persist_entry(&mut self, ctx: &ServiceContext, e: &Entry) -> Result<(), &'static str> {
+        match e.loc {
+            None => {
+                self.root_first_block = e.first_block;
+                self.root_block_count = e.block_count;
+                self.persist_super(ctx)
+            }
+            Some(loc) => {
+                let mut blk = block_read(ctx, loc.block).ok_or("record read failed")?;
+                let o = loc.slot * REC_SIZE;
+                blk[o + 40..o + 48].copy_from_slice(&e.size.to_le_bytes());
+                blk[o + 48..o + 56].copy_from_slice(&e.first_block.to_le_bytes());
+                blk[o + 56..o + 64].copy_from_slice(&e.block_count.to_le_bytes());
+                if !block_write(ctx, loc.block, &blk) { return Err("record write failed"); }
+                Ok(())
+            }
+        }
+    }
+
+    fn dir_remove(&self, ctx: &ServiceContext, dir: &Entry, name: &[u8]) -> Result<(), &'static str> {
+        for bi in 0..dir.block_count {
+            let block = dir.first_block + bi;
+            let mut blk = block_read(ctx, block).ok_or("dir read failed")?;
+            for slot in 0..RECS_PER_BLOCK {
+                let o = slot * REC_SIZE;
+                if blk[o] == ITYPE_FREE { continue; }
+                let nl = blk[o + 1] as usize;
+                if nl == 0 || nl > NAME_MAX { continue; }
+                if &blk[o + 2..o + 2 + nl] == name {
+                    blk[o] = ITYPE_FREE;
+                    if !block_write(ctx, block, &blk) { return Err("dir write failed"); }
+                    return Ok(());
+                }
+            }
+        }
+        Err("entry not found")
+    }
+
+    fn dir_is_empty(&self, ctx: &ServiceContext, dir: &Entry) -> Option<bool> {
+        for bi in 0..dir.block_count {
+            let blk = block_read(ctx, dir.first_block + bi)?;
+            for slot in 0..RECS_PER_BLOCK {
+                if blk[slot * REC_SIZE] != ITYPE_FREE { return Some(false); }
+            }
+        }
+        Some(true)
     }
 
     // ── operations ────────────────────────────────────────────────────────────
     fn mkdir(&mut self, ctx: &ServiceContext, path: &[u8]) -> Result<(), &'static str> {
-        let (parent, name) = self.walk_parent(ctx, path)?;
-        if !self.inodes[parent as usize].is_dir() {
-            return Err("parent is not a directory");
+        let (mut parent, name) = self.walk_parent(ctx, path).ok_or("path not found")?;
+        if parent.itype != ITYPE_DIR { return Err("parent is not a directory"); }
+        if !valid_name(name) { return Err("bad name"); }
+        if self.dir_find(ctx, &parent, name).is_some() { return Err("already exists"); }
+        let first = self.alloc_run(ctx, 1)?;
+        if !block_write(ctx, first, &[0u8; BLOCK]) { return Err("dir block init failed"); }
+        self.dir_add(ctx, &mut parent, name, ITYPE_DIR, 0, first, 1)
+    }
+
+    /// `mkdir … parents`: create every missing directory along `path`. Walks component by
+    /// component from root; descends into existing dirs, creates missing ones. Idempotent
+    /// (a fully-existing path is OK); errors only if a component is in the way as a file.
+    fn mkdir_parents(&mut self, ctx: &ServiceContext, path: &[u8]) -> Result<(), &'static str> {
+        let mut cur = self.root_entry();
+        for comp in components(path) {
+            if cur.itype != ITYPE_DIR { return Err("a path component is not a directory"); }
+            match self.dir_find(ctx, &cur, comp) {
+                Some(child) => cur = child,
+                None => {
+                    if !valid_name(comp) { return Err("bad name"); }
+                    let first = self.alloc_run(ctx, 1)?;
+                    if !block_write(ctx, first, &[0u8; BLOCK]) { return Err("dir block init failed"); }
+                    self.dir_add(ctx, &mut cur, comp, ITYPE_DIR, 0, first, 1)?;
+                    cur = self.dir_find(ctx, &cur, comp).ok_or("created dir not found")?;
+                }
+            }
         }
-        if self.dir_lookup(ctx, parent, name).is_some() {
-            return Err("already exists");
-        }
-        let idx = self.alloc_inode().ok_or("inode table full")?;
-        let first = self.alloc_blocks(ctx, 1)?;
-        // Zero the new (empty) directory block.
-        if !block_write(ctx, first, &[0u8; BLOCK]) {
-            return Err("dir block init failed");
-        }
-        self.inodes[idx as usize] = Inode { itype: ITYPE_DIR, size: 0, first_block: first, block_count: 1 };
-        self.persist_inode(ctx, idx)?;
-        self.dir_add(ctx, parent, name, idx)
+        Ok(())
     }
 
     fn write_path(&mut self, ctx: &ServiceContext, path: &[u8], data: &[u8]) -> Result<(), &'static str> {
-        if data.len() > MAX_FILE_BYTES {
-            return Err("file too large");
-        }
-        let (parent, name) = self.walk_parent(ctx, path)?;
-        if !self.inodes[parent as usize].is_dir() {
-            return Err("parent is not a directory");
-        }
-        // Existing file → reuse its inode (old extent leaks, Phase-1 carry); else create.
-        let existing = self.dir_lookup(ctx, parent, name);
-        if let Some(i) = existing {
-            if !self.inodes[i as usize].is_file() {
-                return Err("path is a directory");
-            }
+        if data.len() > MAX_FILE_BYTES { return Err("file too large"); }
+        let (mut parent, name) = self.walk_parent(ctx, path).ok_or("path not found")?;
+        if parent.itype != ITYPE_DIR { return Err("parent is not a directory"); }
+        if !valid_name(name) { return Err("bad name"); }
+        let existing = self.dir_find(ctx, &parent, name);
+        if let Some(ref e) = existing {
+            if e.itype != ITYPE_FILE { return Err("path is a directory"); }
         }
         let blocks = ((data.len() + BLOCK - 1) / BLOCK).max(1) as u64;
-        let first = self.alloc_blocks(ctx, blocks)?;
+        // Alloc the new extent first (old still allocated), so a failure leaves the file
+        // intact; free the old extent only after the record points at the new one.
+        let first = self.alloc_run(ctx, blocks)?;
         for i in 0..blocks as usize {
             let mut blk = [0u8; BLOCK];
-            let start = i * BLOCK;
-            let end = (start + BLOCK).min(data.len());
-            if start < data.len() {
-                blk[..end - start].copy_from_slice(&data[start..end]);
-            }
-            if !block_write(ctx, first + i as u64, &blk) {
-                return Err("block write failed");
-            }
+            let s = i * BLOCK;
+            let e = (s + BLOCK).min(data.len());
+            if s < data.len() { blk[..e - s].copy_from_slice(&data[s..e]); }
+            if !block_write(ctx, first + i as u64, &blk) { return Err("block write failed"); }
         }
-        let idx = match existing {
-            Some(i) => i,
-            None => {
-                let i = self.alloc_inode().ok_or("inode table full")?;
-                self.inodes[i as usize].itype = ITYPE_FILE; // reserve before dir_add persists
-                i
+        match existing {
+            Some(e) => {
+                let (old_first, old_count) = (e.first_block, e.block_count);
+                let ne = Entry { itype: ITYPE_FILE, size: data.len() as u64, first_block: first, block_count: blocks, loc: e.loc };
+                self.persist_entry(ctx, &ne)?;
+                self.free_run(ctx, old_first, old_count)?;
             }
-        };
-        self.inodes[idx as usize] = Inode {
-            itype: ITYPE_FILE,
-            size: data.len() as u64,
-            first_block: first,
-            block_count: blocks,
-        };
-        self.persist_inode(ctx, idx)?;
-        if existing.is_none() {
-            self.dir_add(ctx, parent, name, idx)?;
+            None => self.dir_add(ctx, &mut parent, name, ITYPE_FILE, data.len() as u64, first, blocks)?,
         }
         Ok(())
     }
 
     fn read_path(&self, ctx: &ServiceContext, path: &[u8], out: &mut [u8]) -> Option<usize> {
-        let idx = self.walk(ctx, path)?;
-        let n = self.inodes[idx as usize];
-        if !n.is_file() { return None; }
-        let size = n.size as usize;
+        let e = self.walk(ctx, path)?;
+        if e.itype != ITYPE_FILE { return None; }
+        let size = e.size as usize;
         if size > out.len() { return None; }
-        for b in 0..n.block_count {
+        for b in 0..e.block_count {
             let start = (b as usize) * BLOCK;
             if start >= size { break; }
-            let blk = block_read(ctx, n.first_block + b)?;
+            let blk = block_read(ctx, e.first_block + b)?;
             let end = (start + BLOCK).min(size);
             out[start..end].copy_from_slice(&blk[..end - start]);
         }
         Some(size)
     }
 
-    /// List a directory's entries into a wire buffer:
-    /// `[FS_OK, count:u8, {name_len:u8, name[name_len], is_dir:u8}…]`.
+    /// Reply: `[FS_OK, count:u8, {name_len:u8, name, is_dir:u8, size:u64}…]`, one block.
     fn list_dir(&self, ctx: &ServiceContext, path: &[u8]) -> Option<[u8; BLOCK]> {
-        let idx = self.walk(ctx, path)?;
-        let d = self.inodes[idx as usize];
-        if !d.is_dir() { return None; }
-        let blk = block_read(ctx, d.first_block)?;
+        let d = self.walk(ctx, path)?;
+        if d.itype != ITYPE_DIR { return None; }
         let mut out = [0u8; BLOCK];
         out[0] = FS_OK;
         let mut count = 0u8;
         let mut w = 2usize;
-        for e in 0..DIRENTS_PER_BLOCK {
-            let o = e * DIRENT_SIZE;
-            let nl = blk[o] as usize;
-            if nl == 0 || nl > NAME_MAX { continue; }
-            if w + 1 + nl + 1 > BLOCK { break; }
-            let child = u32_at(&blk, o + 28);
-            out[w] = nl as u8;
-            out[w + 1..w + 1 + nl].copy_from_slice(&blk[o + 1..o + 1 + nl]);
-            out[w + 1 + nl] = self.inodes[child as usize].is_dir() as u8;
-            w += 1 + nl + 1;
-            count += 1;
+        for bi in 0..d.block_count {
+            let blk = block_read(ctx, d.first_block + bi)?;
+            for slot in 0..RECS_PER_BLOCK {
+                let o = slot * REC_SIZE;
+                let t = blk[o];
+                if t == ITYPE_FREE { continue; }
+                let nl = blk[o + 1] as usize;
+                if nl == 0 || nl > NAME_MAX { continue; }
+                if w + 1 + nl + 1 + 8 > BLOCK { break; }
+                out[w] = nl as u8;
+                out[w + 1..w + 1 + nl].copy_from_slice(&blk[o + 2..o + 2 + nl]);
+                out[w + 1 + nl] = (t == ITYPE_DIR) as u8;
+                out[w + 2 + nl..w + 2 + nl + 8].copy_from_slice(&blk[o + 40..o + 48]); // size:u64
+                w += 1 + nl + 1 + 8;
+                count += 1;
+            }
         }
         out[1] = count;
         Some(out)
     }
+
+    fn rename(&self, ctx: &ServiceContext, path: &[u8], newname: &[u8]) -> Result<(), &'static str> {
+        if !valid_name(newname) { return Err("bad new name"); }
+        let (parent, oldname) = self.walk_parent(ctx, path).ok_or("path not found")?;
+        if parent.itype != ITYPE_DIR { return Err("parent not a directory"); }
+        if self.dir_find(ctx, &parent, newname).is_some() { return Err("name already exists"); }
+        for bi in 0..parent.block_count {
+            let block = parent.first_block + bi;
+            let mut blk = block_read(ctx, block).ok_or("dir read failed")?;
+            for slot in 0..RECS_PER_BLOCK {
+                let o = slot * REC_SIZE;
+                if blk[o] == ITYPE_FREE { continue; }
+                let nl = blk[o + 1] as usize;
+                if nl == 0 || nl > NAME_MAX { continue; }
+                if &blk[o + 2..o + 2 + nl] == oldname {
+                    blk[o + 1] = newname.len() as u8;
+                    for b in &mut blk[o + 2..o + 2 + NAME_MAX] { *b = 0; }
+                    blk[o + 2..o + 2 + newname.len()].copy_from_slice(newname);
+                    if !block_write(ctx, block, &blk) { return Err("dir write failed"); }
+                    return Ok(());
+                }
+            }
+        }
+        Err("entry not found")
+    }
+
+    fn delete(&mut self, ctx: &ServiceContext, path: &[u8]) -> Result<(), &'static str> {
+        let e = self.walk(ctx, path).ok_or("not found")?;
+        if e.loc.is_none() { return Err("cannot delete root"); }
+        if e.itype == ITYPE_DIR && !self.dir_is_empty(ctx, &e).ok_or("dir read failed")? {
+            return Err("directory not empty");
+        }
+        let (parent, name) = self.walk_parent(ctx, path).ok_or("not found")?;
+        self.dir_remove(ctx, &parent, name)?;
+        self.free_run(ctx, e.first_block, e.block_count)
+    }
+
+    /// Move (relink) an entry: same data, new directory/name. Same-directory move is a
+    /// rename. No data copied — only the directory entries change.
+    fn move_path(&mut self, ctx: &ServiceContext, src: &[u8], dst: &[u8]) -> Result<(), &'static str> {
+        let e = self.walk(ctx, src).ok_or("source not found")?;
+        if e.loc.is_none() { return Err("cannot move root"); }
+        let (mut dparent, dname) = self.walk_parent(ctx, dst).ok_or("dest path not found")?;
+        if dparent.itype != ITYPE_DIR { return Err("dest not a directory"); }
+        if !valid_name(dname) { return Err("bad dest name"); }
+        if self.dir_find(ctx, &dparent, dname).is_some() { return Err("dest exists"); }
+        let (sparent, sname) = self.walk_parent(ctx, src).ok_or("source not found")?;
+        // Same directory → it's a rename (avoids the grow-stale-parent hazard).
+        if sparent.first_block == dparent.first_block {
+            return self.rename(ctx, src, dname);
+        }
+        self.dir_add(ctx, &mut dparent, dname, e.itype, e.size, e.first_block, e.block_count)?;
+        self.dir_remove(ctx, &sparent, sname)
+    }
 }
 
-/// Iterate the non-empty `/`-separated components of an absolute path.
+// ── helpers ──────────────────────────────────────────────────────────────────
 fn components(path: &[u8]) -> impl Iterator<Item = &[u8]> {
     path.split(|&b| b == b'/').filter(|c| !c.is_empty())
+}
+
+fn valid_name(name: &[u8]) -> bool {
+    !name.is_empty() && name.len() <= NAME_MAX && !name.iter().any(|&b| b == b'/')
+}
+
+fn encode_rec(blk: &mut [u8], slot: usize, itype: u8, name: &[u8], size: u64, first: u64, count: u64) {
+    let o = slot * REC_SIZE;
+    for b in &mut blk[o..o + REC_SIZE] { *b = 0; }
+    blk[o] = itype;
+    let nl = name.len().min(NAME_MAX);
+    blk[o + 1] = nl as u8;
+    blk[o + 2..o + 2 + nl].copy_from_slice(&name[..nl]);
+    blk[o + 40..o + 48].copy_from_slice(&size.to_le_bytes());
+    blk[o + 48..o + 56].copy_from_slice(&first.to_le_bytes());
+    blk[o + 56..o + 64].copy_from_slice(&count.to_le_bytes());
 }
 
 fn u32_at(b: &[u8], off: usize) -> u32 {
@@ -677,30 +796,11 @@ fn u64_at(b: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(a)
 }
 
-fn decode_inode(blk: &[u8], o: usize) -> Inode {
-    Inode {
-        itype: blk[o],
-        size: u64_at(blk, o + 8),
-        first_block: u64_at(blk, o + 16),
-        block_count: u64_at(blk, o + 24),
-    }
-}
-fn encode_inode(blk: &mut [u8], o: usize, n: &Inode) {
-    blk[o] = n.itype;
-    blk[o + 8..o + 16].copy_from_slice(&n.size.to_le_bytes());
-    blk[o + 16..o + 24].copy_from_slice(&n.first_block.to_le_bytes());
-    blk[o + 24..o + 32].copy_from_slice(&n.block_count.to_le_bytes());
-}
-
 /// Ask `block-driver` for the disk's sector count (OP_CAPACITY → [BLK_OK, sectors:u64]).
 fn block_capacity(ctx: &ServiceContext) -> Option<u64> {
     let reply = ctx.request_with_reply("block-driver", &Message::from_bytes(&[OP_CAPACITY]))?;
     let p = reply.payload_bytes();
-    if p.first() == Some(&BLK_OK) && p.len() >= 9 {
-        Some(u64_at(p, 1))
-    } else {
-        None
-    }
+    if p.first() == Some(&BLK_OK) && p.len() >= 9 { Some(u64_at(p, 1)) } else { None }
 }
 
 /// Read one 512-byte block at `lba` from `block-driver` over IPC (u64 LBA, §6.3).
@@ -716,6 +816,19 @@ fn block_read(ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
         Some(out)
     } else {
         None
+    }
+}
+
+/// Zero a run of `count` blocks from `lba` in one batched op (the driver writes
+/// multi-sector zero commands — no per-block IPC). Used to clear the bitmap at format.
+fn block_write_zeros(ctx: &ServiceContext, lba: u64, count: u64) -> bool {
+    let mut req = [0u8; 17];
+    req[0] = OP_WRITE_ZEROS;
+    req[1..9].copy_from_slice(&lba.to_le_bytes());
+    req[9..17].copy_from_slice(&count.to_le_bytes());
+    match ctx.request_with_reply("block-driver", &Message::from_bytes(&req)) {
+        Some(reply) => reply.payload_bytes().first() == Some(&BLK_OK),
+        None => false,
     }
 }
 

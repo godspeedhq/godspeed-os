@@ -46,5 +46,5 @@ table from its contract, place it on a core (§14.1), and add it to the run queu
 
 ## 6. Conformance
 
-Built-in: no `spawn help` / `spawn version` yet; listed by the shell's top-level
+Conforms: own `spawn help` / `spawn version` (with a real example, per `0_conventions.md`); listed by the shell's top-level
 `help` under **Services** as `spawn <name>`. See `0_conventions.md` §3.

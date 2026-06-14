@@ -59,5 +59,5 @@ by `observe`; `status` is the short roster.)
 
 ## 7. Conformance
 
-Built-in: no `status help` / `status version` yet; listed by the shell's top-level
+Conforms: own `status help` / `status version` (with a real example, per `0_conventions.md`); listed by the shell's top-level
 `help` under **Services**. See `0_conventions.md` §3.

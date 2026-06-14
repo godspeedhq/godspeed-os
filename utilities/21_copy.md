@@ -1,8 +1,8 @@
 # Utility: `copy` — copy a file
 
-**Status:** Design — built in the file-commands step (step 4) on hierarchical GSFS
-(`docs/persistence.md`). Mutating; the file form works on Phase-2 GSFS. Trails `CLAUDE.md`;
-does not amend it.
+**Status:** **Built + QEMU-verified** (`osdev test files` 15/15) — the **file** form, as a
+shell built-in (read src → write dst). Recursive directory copy is still future work.
+On hierarchical GSFS (`docs/persistence.md`). Trails `CLAUDE.md`; does not amend it.
 
 ---
 

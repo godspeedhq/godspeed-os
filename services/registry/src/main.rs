@@ -1,3 +1,10 @@
+// GodspeedOS — Created by Bankole Ogundero.
+//
+// This software is provided "as is", without warranty or guarantee of any kind,
+// express or implied. The author makes no guarantee of its correctness, reliability,
+// or fitness for any purpose, and accepts no liability for any damages arising from
+// its use. Use at your own risk.
+
 //! `registry` — name → endpoint resolution (§14.2). TCB member (§6.1) in v1.
 //!
 //! Phase 5 (H11): a real userspace name service. Services announce themselves with

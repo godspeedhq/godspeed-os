@@ -61,6 +61,5 @@ This keeps `date` from sprawling into "a full-blown application."
 
 ## 7. Conformance
 
-Built-in: `date help` / `date version` are not implemented yet; the shell's
-top-level `help` lists it under **System** as
-`date [epoch]   date + time; 'epoch' = secs since 1970`. See `0_conventions.md` §3.
+Conforms: own `date help` / `date version` (with real examples), plus the subcommand
+help `date epoch help`, per `0_conventions.md`.

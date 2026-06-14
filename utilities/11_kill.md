@@ -51,5 +51,5 @@ graceful-shutdown mechanism.
 
 ## 6. Conformance
 
-Built-in: no `kill help` / `kill version` yet; listed by the shell's top-level
+Conforms: own `kill help` / `kill version` (with a real example, per `0_conventions.md`); listed by the shell's top-level
 `help` under **Services** as `kill <name>`. See `0_conventions.md` §3.

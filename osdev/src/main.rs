@@ -1,3 +1,10 @@
+// GodspeedOS — Created by Bankole Ogundero.
+//
+// This software is provided "as is", without warranty or guarantee of any kind,
+// express or implied. The author makes no guarantee of its correctness, reliability,
+// or fitness for any purpose, and accepts no liability for any damages arising from
+// its use. Use at your own risk.
+
 //! `osdev` — host-side developer CLI (§17).
 //!
 //! Commands:
@@ -114,73 +121,74 @@ fn main() {
     }
 }
 
-// On-disk format — MUST match `services/fs` (docs/persistence.md §6.2/§6.3).
+// On-disk format — MUST match `services/fs` (docs/persistence.md §6.4, GSFS0003).
 // 512-byte blocks (= one AHCI sector = one block-IPC request), so block number = LBA.
-// All capacity-bearing fields are u64 (~8 ZiB ceiling, §6.3).
-//   Superblock @ LBA 0: magic[8] "GSFS0002", version u32, block_size u32=512,
-//     total_blocks u64, inode_table_start u64=1, inode_table_blocks u64,
-//     data_start u64, next_free_block u64 (bump allocator), root_inode u32, flags u32.
-//   Inode table @ LBA 1.. : INODE_COUNT slots × 64 bytes (8 per block).
-//     Inode: type u8 (0 free|1 file|2 dir) @0, size u64 @8, first_block u64 @16,
-//            block_count u64 @24.
-//   Directory: a dir inode's data block holds 16 entries × 32 bytes
-//     { name_len u8, name[27], inode u32 }. Root (inode 0) is a dir at data_start.
-const FS_SB_MAGIC: &[u8; 8] = b"GSFS0002";
+// Three structures: superblock + free bitmap + self-describing directory tree (no inode
+// table, no global file cap). All capacity-bearing fields are u64.
+//   Superblock @ LBA 0: magic[8] "GSFS0003", version u32, block_size u32=512,
+//     total_blocks u64, bitmap_start u64=1, bitmap_blocks u64, data_start u64,
+//     root_first_block u64, root_block_count u64, free_blocks u64, flags u32,
+//     label_len u8, label[31].
+//   Free bitmap @ LBA bitmap_start..data_start: 1 bit/block (set=used), 4096 bits/block.
+//   Directory entry (file_record, 64 B): type u8 (0 free|1 file|2 dir) @0, name_len u8 @1,
+//     name[38] @2, size u64 @40, first_block u64 @48, block_count u64 @56. 8 per block.
+//   Root is a dir at root_first_block (its extent lives in the superblock; it has no parent).
+const FS_SB_MAGIC: &[u8; 8] = b"GSFS0003";
 const FS_BLOCK_SIZE: u32 = 512;
-const FS_INODE_SIZE: u64 = 64;
-const FS_INODE_COUNT: u64 = 256;
-const FS_INODE_TABLE_START: u64 = 1;
-const FS_INODE_TABLE_BLOCKS: u64 = FS_INODE_COUNT / (FS_BLOCK_SIZE as u64 / FS_INODE_SIZE); // 32
-const FS_DATA_START: u64 = FS_INODE_TABLE_START + FS_INODE_TABLE_BLOCKS;                    // 33
-const FS_ROOT_INODE: u32 = 0;
+const FS_BITS_PER_BMBLOCK: u64 = (FS_BLOCK_SIZE as u64) * 8; // 4096
 const FS_ITYPE_DIR: u8 = 2;
 
-/// Write a GodspeedOS (GSFS) hierarchical superblock + a zeroed inode table + an empty
-/// root directory into `path`, preserving the rest of the image. `total_blocks` is
-/// derived from the image size.
+/// Write a GodspeedOS (GSFS0003) superblock + free bitmap + an empty root directory into
+/// `path`, preserving the rest of the image. Geometry is derived from the image size.
 fn format_superblock(path: &str) {
     let mut data = std::fs::read(path)
         .unwrap_or_else(|e| { eprintln!("mkfs: cannot read {}: {}", path, e); std::process::exit(1); });
-    let root_dir_block = FS_DATA_START;            // root directory's single data block
-    let next_free_block = FS_DATA_START + 1;       // first free block after root's dir block
-    if (data.len() as u64) < next_free_block * 512 {
+    let total_blocks = data.len() as u64 / FS_BLOCK_SIZE as u64;
+    let bitmap_start: u64 = 1;
+    let bitmap_blocks = (total_blocks + FS_BITS_PER_BMBLOCK - 1) / FS_BITS_PER_BMBLOCK; // ceil
+    let data_start = bitmap_start + bitmap_blocks;
+    let root_first_block = data_start;
+    let root_block_count: u64 = 1;
+    let used_through = data_start + root_block_count; // blocks [0..used_through) are used
+    if total_blocks < used_through + 1 {
         eprintln!("mkfs: image too small ({} bytes)", data.len());
         std::process::exit(1);
     }
-    let total_blocks = data.len() as u64 / FS_BLOCK_SIZE as u64;
+    let free_blocks = total_blocks - used_through;
 
     // Superblock (LBA 0).
     let mut sb = [0u8; 512];
     sb[0..8].copy_from_slice(FS_SB_MAGIC);
-    sb[8..12].copy_from_slice(&2u32.to_le_bytes());                       // version
-    sb[12..16].copy_from_slice(&FS_BLOCK_SIZE.to_le_bytes());             // block_size
-    sb[16..24].copy_from_slice(&total_blocks.to_le_bytes());              // total_blocks u64
-    sb[24..32].copy_from_slice(&FS_INODE_TABLE_START.to_le_bytes());      // inode_table_start u64
-    sb[32..40].copy_from_slice(&FS_INODE_TABLE_BLOCKS.to_le_bytes());     // inode_table_blocks u64
-    sb[40..48].copy_from_slice(&FS_DATA_START.to_le_bytes());             // data_start u64
-    sb[48..56].copy_from_slice(&next_free_block.to_le_bytes());           // next_free_block u64
-    sb[56..60].copy_from_slice(&FS_ROOT_INODE.to_le_bytes());             // root_inode u32
-    sb[60..64].copy_from_slice(&0u32.to_le_bytes());                      // flags (DEFAULT bit clear)
+    sb[8..12].copy_from_slice(&3u32.to_le_bytes());            // version
+    sb[12..16].copy_from_slice(&FS_BLOCK_SIZE.to_le_bytes());  // block_size
+    sb[16..24].copy_from_slice(&total_blocks.to_le_bytes());
+    sb[24..32].copy_from_slice(&bitmap_start.to_le_bytes());
+    sb[32..40].copy_from_slice(&bitmap_blocks.to_le_bytes());
+    sb[40..48].copy_from_slice(&data_start.to_le_bytes());
+    sb[48..56].copy_from_slice(&root_first_block.to_le_bytes());
+    sb[56..64].copy_from_slice(&root_block_count.to_le_bytes());
+    sb[64..72].copy_from_slice(&free_blocks.to_le_bytes());
+    sb[72..76].copy_from_slice(&0u32.to_le_bytes());           // flags (DEFAULT clear)
+    sb[76] = 0;                                                // label_len
     data[0..512].copy_from_slice(&sb);
 
-    // Zero the inode table, then write root inode 0 (a dir at root_dir_block).
-    let it = (FS_INODE_TABLE_START as usize) * 512;
-    let it_end = it + (FS_INODE_TABLE_BLOCKS as usize) * 512;
-    for b in &mut data[it..it_end] { *b = 0; }
-    // Root inode is slot 0 of the first inode-table block → offset `it`.
-    data[it] = FS_ITYPE_DIR;                                              // type @0
-    data[it + 8..it + 16].copy_from_slice(&0u64.to_le_bytes());           // size @8
-    data[it + 16..it + 24].copy_from_slice(&root_dir_block.to_le_bytes());// first_block @16
-    data[it + 24..it + 32].copy_from_slice(&1u64.to_le_bytes());          // block_count @24
+    // Zero the bitmap region, then mark blocks [0..used_through) used (superblock +
+    // bitmap + the root directory block).
+    let bm = (bitmap_start as usize) * 512;
+    let bm_end = (data_start as usize) * 512;
+    for b in &mut data[bm..bm_end] { *b = 0; }
+    for blk in 0..used_through as usize {
+        data[bm + blk / 8] |= 1 << (blk % 8);
+    }
 
     // Zero the root directory block (no entries yet).
-    let rd = (root_dir_block as usize) * 512;
+    let rd = (root_first_block as usize) * 512;
     for b in &mut data[rd..rd + 512] { *b = 0; }
 
     std::fs::write(path, &data)
         .unwrap_or_else(|e| { eprintln!("mkfs: cannot write {}: {}", path, e); std::process::exit(1); });
-    println!("mkfs: formatted {} GSFS ({} blocks of {} bytes, {} inodes, data from block {})",
-             path, total_blocks, FS_BLOCK_SIZE, FS_INODE_COUNT, FS_DATA_START);
+    println!("mkfs: formatted {} GSFS0003 ({} blocks, bitmap {}..{}, data from {}, {} free)",
+             path, total_blocks, bitmap_start, data_start, root_first_block, free_blocks);
 }
 
 fn cmd_mkfs(image: &str) {
@@ -924,6 +932,7 @@ fn cmd_test(suite: &str) {
         "blockdev-reboot" => run_blockdev_reboot_test(),
         "drives-raw"   => run_drives_raw_test(),
         "drives"       => run_drives_scripted_test(),
+        "files"        => run_files_test(),
         other => eprintln!("unknown test suite: {}", other),
     }
 }
@@ -1330,6 +1339,25 @@ fn run_drives_scripted_test() {
     std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create raw disk");
 
     crate::shell_test::run_drives(&image_path, persist, 4);
+}
+
+/// Step 4: scripted file commands (ls/read/write/mkdir/cd). Build bare-metal, attach a
+/// RAW AHCI disk, flash it, then exercise the file commands incl. relative paths + `..`.
+fn run_files_test() {
+    println!("\n=== files 4: ls / read / write / mkdir / cd (RAW AHCI disk) ===");
+    cmd_build_bare_metal();
+
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_files_raw.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create raw disk");
+
+    crate::shell_test::run_files(&image_path, persist, 4);
 }
 
 /// Build bare-metal image and run the scripted shell smoke-test.
