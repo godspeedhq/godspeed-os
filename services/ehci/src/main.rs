@@ -756,7 +756,12 @@ fn poll_devices(
                         |dx, dy| ctx.log_fmt(format_args!("ehci: mouse moved dx={} dy={}", dx, dy)),
                     );
                 } else {
-                    godspeed_sdk::hid::decode_keyboard(&rep, &mut kb_last, |ch| ctx.console_push(ch));
+                    godspeed_sdk::hid::decode_keyboard(
+                        &rep, &mut kb_last,
+                        |ch| ctx.console_push(ch),
+                        |code| ctx.log_fmt(format_args!(
+                            "ehci: unmapped HID key usage {:#04x} (add to sdk hid_to_ascii)", code)),
+                    );
                 }
                 toggle[i] ^= 1;            // successful IN flips the data toggle
                 err[i] = 0;               // a good report clears the error run

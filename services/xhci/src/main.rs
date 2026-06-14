@@ -817,7 +817,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         );
                     } else {
                         godspeed_sdk::hid::decode_keyboard(
-                            &rep, &mut kb_last[d], |ch| ctx.console_push(ch));
+                            &rep, &mut kb_last[d], |ch| ctx.console_push(ch),
+                            |code| ctx.log_fmt(format_args!(
+                                "xhci: unmapped HID key usage {:#04x} (add to sdk hid_to_ascii)", code)));
                     }
                     need_queue[d] = true;
                 }

@@ -45,8 +45,17 @@ pub fn hid_to_ascii(key: u8, mods: u8) -> Option<u8> {
         0x36 => Some(if shift { b'<' } else { b',' }),
         0x37 => Some(if shift { b'>' } else { b'.' }),
         0x38 => Some(if shift { b'?' } else { b'/' }),
+        0x64 => Some(if shift { b'|' } else { b'\\' }), // Non-US \ and | (the 0x31 twin)
         _ => None,
     }
+}
+
+/// Codes in the printable-key ranges (letters, digits, punctuation) — but NOT the control
+/// keys (Enter/Esc/Backspace/Tab/Space at 0x28-0x2C) or modifiers/F-keys/keypad. Used to
+/// decide whether an unmapped key is worth reporting (a missing punctuation mapping) vs
+/// silent noise (a function/modifier key with no character).
+fn is_typable_code(k: u8) -> bool {
+    matches!(k, 0x04..=0x27 | 0x2D..=0x38 | 0x64)
 }
 
 /// Decode a keyboard boot report (modifiers in byte 0, up to six keycodes in
@@ -54,7 +63,12 @@ pub fn hid_to_ascii(key: u8, mods: u8) -> Option<u8> {
 /// that is down now but was not in `last`, so rolling onto a new key before
 /// releasing the previous one drops nothing and a held key fires exactly once.
 /// `last` is updated to this report's keycodes for the next call.
-pub fn decode_keyboard(report: &[u8; 8], last: &mut [u8; 6], mut emit: impl FnMut(u8)) {
+pub fn decode_keyboard(
+    report: &[u8; 8],
+    last: &mut [u8; 6],
+    mut emit: impl FnMut(u8),
+    mut on_unmapped: impl FnMut(u8),
+) {
     let mods = report[0];
     let cur = [report[2], report[3], report[4], report[5], report[6], report[7]];
     for &k in cur.iter() {
@@ -62,13 +76,21 @@ pub fn decode_keyboard(report: &[u8; 8], last: &mut [u8; 6], mut emit: impl FnMu
         if !last.contains(&k) {
             // Arrow keys → ANSI escape sequences (ESC [ A/B/C/D), exactly what a serial
             // terminal sends, so the shell's one input parser handles both paths (e.g. the
-            // up-arrow history walk). Other keys decode to ASCII.
+            // up-arrow history walk). Other keys decode to ASCII; a key we don't map is
+            // reported via `on_unmapped` (loud, not silently dropped — §3.12) so the exact
+            // HID usage code can be logged and added to the map.
             match k {
                 0x52 => { emit(0x1B); emit(b'['); emit(b'A'); } // Up
                 0x51 => { emit(0x1B); emit(b'['); emit(b'B'); } // Down
                 0x4F => { emit(0x1B); emit(b'['); emit(b'C'); } // Right
                 0x50 => { emit(0x1B); emit(b'['); emit(b'D'); } // Left
-                _ => if let Some(ch) = hid_to_ascii(k, mods) { emit(ch); }
+                // Modifiers/Caps/etc. (0x29 Esc, 0x39 CapsLock, 0xE0-E7) are not printable;
+                // don't report them as "unmapped" noise — only report keys in the typable
+                // ranges we'd expect to map.
+                _ => match hid_to_ascii(k, mods) {
+                    Some(ch) => emit(ch),
+                    None => if is_typable_code(k) { on_unmapped(k); },
+                },
             }
         }
     }
