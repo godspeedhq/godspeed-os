@@ -11,6 +11,7 @@ Narrative documentation. These files explain design decisions in prose; they do 
 | `capability.md`     | Capability model: generation mechanism, rights model, transfer protocol, lifecycle examples |
 | `restart.md`        | Service restart flow: cap rebinding, core reassignment, client recovery pattern |
 | `registry.md`       | Why the registry exists: name → capability resolution, the rendezvous problem, identity-over-location (§14.2, §3.11, §26.10) |
+| `pipes.md`          | Composing built-ins and services with `A \| B`: capability-mediated pipes (not POSIX fd inheritance), the four shapes (builtin/service × write/service), registry-resolved sinks, the EOT end-of-stream marker (Appendix D.3) |
 | `smp.md`            | SMP design: per-core run queues, IPI vectors, TLB shootdown protocol, placement algorithm |
 | `iommu.md`          | IOMMU-backed DMA confinement (H1): why DMA-capable drivers are kernel-equivalent without an IOMMU, AMD-Vi detection/setup/confinement/reclaim, Phase 2 TCB-drop proposal (§6, §12, §18.1) |
 | `persistence.md`    | Block driver + filesystem (v2): why our own filesystem not ext4/btrfs, ATA PIO (no-DMA, least-privilege), flat name→blob format, file-as-capability via kernel-delegated resource caps, phased plan + TCB-drop trajectory (§6.3, §15, §23.4) |
