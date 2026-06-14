@@ -23,6 +23,7 @@ const OP_LIST_DIR: u8 = 14;
 const OP_RENAME: u8 = 15;
 const OP_DELETE: u8 = 16;
 const OP_MOVE: u8 = 17;
+const OP_MKDIR_P: u8 = 18;
 // drives ops:
 const OP_DRIVES_INFO: u8 = 20;
 const OP_FLASH: u8 = 21;
@@ -204,8 +205,9 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
         }
         "write"   => cmd_write(ctx, cwd, s["write".len()..].trim()),
         "mkdir"   => {
-            if argc < 2 { ctx.console_writeln("usage: mkdir <path>"); }
-            else { cmd_mkdir(ctx, cwd, args[1]); }
+            // `mkdir <path>` or `mkdir <path> parents` (create missing parent dirs).
+            if argc < 2 { ctx.console_writeln("usage: mkdir <path> [parents]"); }
+            else { cmd_mkdir(ctx, cwd, args[1], argc >= 3 && args[2] == "parents"); }
         }
         "cd"      => cmd_cd(ctx, cwd, if argc >= 2 { args[1] } else { "/" }),
         "copy"    => {
@@ -351,6 +353,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         ], true),
         "mkdir" => help_block(ctx, "mkdir", "create a directory", &[
             ("mkdir <path>", "create the directory <path>", "mkdir /docs"),
+            ("mkdir <path> parents", "create missing parent dirs too", "mkdir /a/b/c parents"),
         ], true),
         "copy" => help_block(ctx, "copy", "copy a file", &[
             ("copy <src> <dst>", "copy file <src> to <dst>", "copy /docs/a.txt /docs/b.txt"),
@@ -428,7 +431,7 @@ fn cmd_help(ctx: &ServiceContext) {
     help_line(ctx, "cd [path]", "change current directory");
     help_line(ctx, "read <path>", "print a file");
     help_line(ctx, "write <path> [text]", "create/overwrite a file");
-    help_line(ctx, "mkdir <path>", "create a directory");
+    help_line(ctx, "mkdir <path> [parents]", "create a directory");
     help_line(ctx, "copy <src> <dst>", "copy a file");
     help_line(ctx, "move <src> <dst>", "relocate a file/dir");
     help_line(ctx, "rename <path> <name>", "rename an entry in place");
@@ -1023,11 +1026,12 @@ fn cmd_write(ctx: &ServiceContext, cwd: &Cwd, rest: &str) {
     }
 }
 
-/// `mkdir <path>` — create a directory.
-fn cmd_mkdir(ctx: &ServiceContext, cwd: &Cwd, arg: &str) {
+/// `mkdir <path> [parents]` — create a directory (with `parents`, create missing parents).
+fn cmd_mkdir(ctx: &ServiceContext, cwd: &Cwd, arg: &str, parents: bool) {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return };
-    let reply = match fs_request(ctx, OP_MKDIR, path, &[]) {
+    let op = if parents { OP_MKDIR_P } else { OP_MKDIR };
+    let reply = match fs_request(ctx, op, path, &[]) {
         Some(r) => r,
         None => { ctx.console_writeln("mkdir: storage unavailable"); return; }
     };
@@ -1035,8 +1039,10 @@ fn cmd_mkdir(ctx: &ServiceContext, cwd: &Cwd, arg: &str) {
     if no_fs(ctx, p) { return; }
     if p.first() == Some(&FS_OK) {
         ctx.console_writeln_fmt(format_args!("created {}", str_of(path)));
+    } else if parents {
+        ctx.console_writeln("mkdir: failed (a component is in the way as a file?)");
     } else {
-        ctx.console_writeln("mkdir: failed (already exists, or parent missing?)");
+        ctx.console_writeln("mkdir: failed (already exists, or parent missing? try 'mkdir <path> parents')");
     }
 }
 

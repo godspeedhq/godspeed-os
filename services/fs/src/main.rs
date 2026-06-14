@@ -63,6 +63,7 @@ const OP_LIST_DIR: u8 = 14;
 const OP_RENAME: u8 = 15;
 const OP_DELETE: u8 = 16;
 const OP_MOVE: u8 = 17;
+const OP_MKDIR_P: u8 = 18; // mkdir creating any missing parent directories
 // drives API.
 const OP_DRIVES_INFO: u8 = 20;
 const OP_FLASH: u8 = 21;
@@ -283,6 +284,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
             send(&out);
         }
         OP_MKDIR => send(&[match fs.mkdir(ctx, path) { Ok(()) => FS_OK, Err(_) => FS_ERR }]),
+        OP_MKDIR_P => send(&[match fs.mkdir_parents(ctx, path) { Ok(()) => FS_OK, Err(_) => FS_ERR }]),
         OP_LIST_DIR => match fs.list_dir(ctx, path) {
             Some(out) => send(&out),
             None => send(&[FS_NOTFOUND]),
@@ -610,6 +612,27 @@ impl Fs {
         let first = self.alloc_run(ctx, 1)?;
         if !block_write(ctx, first, &[0u8; BLOCK]) { return Err("dir block init failed"); }
         self.dir_add(ctx, &mut parent, name, ITYPE_DIR, 0, first, 1)
+    }
+
+    /// `mkdir … parents`: create every missing directory along `path`. Walks component by
+    /// component from root; descends into existing dirs, creates missing ones. Idempotent
+    /// (a fully-existing path is OK); errors only if a component is in the way as a file.
+    fn mkdir_parents(&mut self, ctx: &ServiceContext, path: &[u8]) -> Result<(), &'static str> {
+        let mut cur = self.root_entry();
+        for comp in components(path) {
+            if cur.itype != ITYPE_DIR { return Err("a path component is not a directory"); }
+            match self.dir_find(ctx, &cur, comp) {
+                Some(child) => cur = child,
+                None => {
+                    if !valid_name(comp) { return Err("bad name"); }
+                    let first = self.alloc_run(ctx, 1)?;
+                    if !block_write(ctx, first, &[0u8; BLOCK]) { return Err("dir block init failed"); }
+                    self.dir_add(ctx, &mut cur, comp, ITYPE_DIR, 0, first, 1)?;
+                    cur = self.dir_find(ctx, &cur, comp).ok_or("created dir not found")?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn write_path(&mut self, ctx: &ServiceContext, path: &[u8], data: &[u8]) -> Result<(), &'static str> {

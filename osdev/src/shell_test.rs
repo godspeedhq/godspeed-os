@@ -685,6 +685,21 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL — ls size timeout"); fail += 1; }
     }
 
+    // mkdir parents: create a 3-deep chain in one call (none of /x, /x/y exist yet).
+    match run!(b"mkdir /x/y/z parents\r", 10) {
+        Some(r) => check!(r.contains("created /x/y/z"), "mkdir parents: created /x/y/z chain"),
+        None    => { println!("files-test: FAIL — mkdir parents timeout"); fail += 1; }
+    }
+    match run!(b"ls /x/y\r", 10) {
+        Some(r) => check!(r.contains("z") && r.contains("dir"), "mkdir parents: /x/y/z exists as a dir"),
+        None    => { println!("files-test: FAIL — ls /x/y timeout"); fail += 1; }
+    }
+    // plain mkdir into a missing parent still fails (parents is opt-in).
+    match run!(b"mkdir /no/such/dir\r", 10) {
+        Some(r) => check!(r.contains("mkdir: failed"), "mkdir (no parents): fails on missing parent"),
+        None    => { println!("files-test: FAIL — mkdir strict timeout"); fail += 1; }
+    }
+
     child.kill().ok();
     child.wait().ok();
     println!("\nfiles-test: {pass} passed, {fail} failed");
