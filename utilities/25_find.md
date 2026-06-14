@@ -8,20 +8,28 @@ does not amend it.
 
 ## 1. What it is
 
-`find <name> [path]` searches a subtree — the **whole filesystem** (`/`) by default, or a
-given starting `path` — for entries whose name **contains** `<name>` (substring match), and
-prints each match's full path. So `find report` matches `report.txt`, `2026-report`, etc.;
-`find .txt` lists every `.txt`. It is whole-filesystem **enumeration**: the one operation
-that reads across the entire tree rather than a single path or directory.
+`find <pattern> [path]` searches a subtree — the **whole filesystem** (`/`) by default, or a
+given starting `path` — for entries whose name matches `<pattern>`, and prints each match's
+full path. The match mode is chosen by the pattern itself:
+
+- **Plain word → substring.** `find report` matches `report.txt`, `2026-report`, etc.;
+  `find .txt` lists every `.txt`. The friendly default.
+- **Contains `*` or `?` → glob** (anchored to the whole name): `*` matches any run of
+  characters (including none), `?` matches exactly one. `find *.txt` matches names *ending*
+  in `.txt`; `find f?` matches `f1`…`f9` but not `f10`.
+
+It is whole-filesystem **enumeration**: the one operation that reads across the entire tree
+rather than a single path or directory.
 
 ```
-find 0.1.0 — search the tree for a name
+find 0.1.0 — search the tree by name (substring, or glob with */?)
 
 usage:
-  find <name>          search the whole filesystem (from /) for entries named <name>
-  find <name> <path>   search only the subtree under <path>
-  find version         print the version
-  find help            print this message
+  find <name>            search from / for entries whose name contains <name>
+  find <glob>            glob match: * = any run, ? = one char (e.g. find *.txt)
+  find <pattern> <path>  search only the subtree under <path>
+  find version           print the version
+  find help              print this message
 
 <path> = [index:]label/path | /abs | rel   (see docs/drives.md §4.1)
 ```
@@ -29,9 +37,10 @@ usage:
 Example:
 
 ```
-gs> find note.txt
+gs> find *.txt
+  /docs/inside.txt
   /docs/sub/note.txt
-  find: 1 match(es)
+  find: 2 match(es)
 ```
 
 ## 2. How it works — a tree walk (the tree *is* the index)
@@ -47,8 +56,8 @@ there is no chunked-reply problem — the shell just keeps asking `fs` to list d
 
 The walk holds a **bounded stack** of pending directories (`FIND_QCAP`, currently 32). A
 tree wide/deep enough to exceed it does not silently drop results — `find` prints
-`search truncated …` so the user knows the answer is partial. Exact-name match only in this
-cut (no globbing/substring — that's §5).
+`search truncated …` so the user knows the answer is partial. The glob matcher is itself
+bounded: iterative backtracking (`glob_match`), no recursion and no allocation.
 
 ## 4. Why no `fs_index` yet
 
@@ -62,8 +71,9 @@ same `find` command (lazy, version-invalidated, rebuilt-from-truth — §6.5). U
 
 ## 5. Later (separate doc so it can grow)
 
-- **Substring match — done** (`find report` matches `report.txt`). **Glob patterns**
-  (`find "*.txt"`) remain later, as a *word*-flagged mode, never `-name`.
+- **Substring match — done** (`find report` matches `report.txt`). **Glob patterns — done**
+  (`find *.txt`, `find f?`): a pattern with `*`/`?` switches to anchored glob matching, no
+  `-name` flag — the pattern speaks for itself.
 - **Type filter** (files only / dirs only).
 - **`fs_index`-backed fast path** when the tree-walk is measured too slow (§6.5).
 

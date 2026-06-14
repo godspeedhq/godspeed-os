@@ -466,9 +466,10 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("delete <path>", "remove the file/empty dir <path>", "delete /docs/old.txt"),
             ("delete <path> recursive", "remove directory <path> and everything under it", "delete /docs recursive"),
         ], true),
-        "find" => help_block(ctx, "find", "search the tree for a name (substring match)", &[
-            ("find <name>", "search everywhere; matches names containing <name>", "find report"),
-            ("find <name> <path>", "search only under <path>", "find .txt /docs"),
+        "find" => help_block(ctx, "find", "search the tree by name (substring, or glob with */?)", &[
+            ("find <name>", "matches names containing <name>", "find report"),
+            ("find <glob>", "glob match: * = any run, ? = one char", "find *.txt"),
+            ("find <pattern> <path>", "search only under <path>", "find *.txt /docs"),
         ], true),
         "tree" => help_block(ctx, "tree", "print the directory hierarchy", &[
             ("tree", "tree of the current directory", "tree"),
@@ -542,7 +543,7 @@ fn cmd_help(ctx: &ServiceContext) {
     help_line(ctx, "move <src> <dst>", "relocate a file/dir");
     help_line(ctx, "rename <path> <name>", "rename an entry in place");
     help_line(ctx, "delete <path> [recursive]", "remove a file/dir/subtree");
-    help_line(ctx, "find <name> [path]", "search the tree for a name");
+    help_line(ctx, "find <pattern> [path]", "search by name (substring or *? glob)");
     help_line(ctx, "tree [path]", "print the directory hierarchy");
     ctx.console_writeln("");
     ctx.console_writeln("Power");
@@ -1481,8 +1482,9 @@ fn cmd_move(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) {
     }
 }
 
-/// `find <name> [path]` — search a subtree (default the whole filesystem, `/`) for entries
-/// named exactly `<name>`, printing each match's full path. This is whole-filesystem
+/// `find <pattern> [path]` — search a subtree (default the whole filesystem, `/`) for entries
+/// matching `<pattern>`, printing each match's full path. A plain word is a substring match; a
+/// pattern with `*`/`?` is a glob (anchored, whole-name). This is whole-filesystem
 /// enumeration done the disciplined way: a **tree walk** (the tree IS the index, §6.4),
 /// client-side via LIST_DIR so results stream as found and `fs` needs no new op. The walk
 /// is bounded (a fixed pending-directory stack) and **loud on truncation** (§26.6/§3.12);
@@ -1495,6 +1497,9 @@ fn cmd_find(ctx: &ServiceContext, cwd: &Cwd, target: &str, start: &str) {
     stack.push(start_abs);
 
     let target = target.as_bytes();
+    // A pattern with `*` or `?` is a glob (anchored, whole-name match); otherwise the friendly
+    // default is a plain substring match (so `find report` still finds `report-final.txt`).
+    let is_glob = target.iter().any(|&b| b == b'*' || b == b'?');
     let mut matches = 0u32;
     let mut dir = [0u8; PATH_MAX];
     while let Some(dlen) = stack.pop(&mut dir) {
@@ -1517,7 +1522,8 @@ fn cmd_find(ctx: &ServiceContext, cwd: &Cwd, target: &str, start: &str) {
             i += nl + 1 + 8; // name_len + name + is_dir + size:u64
             let mut child = [0u8; PATH_MAX];
             if let Some(clen) = join_path(&dir[..dlen], name, &mut child) {
-                if contains(name, target) {
+                let hit = if is_glob { glob_match(target, name) } else { contains(name, target) };
+                if hit {
                     ctx.console_writeln(str_of(&child[..clen]));
                     matches += 1;
                 }
@@ -1661,11 +1667,41 @@ fn join_path(dir: &[u8], name: &[u8], out: &mut [u8; PATH_MAX]) -> Option<usize>
     Some(len + name.len())
 }
 
-/// True if `needle` appears as a contiguous substring of `haystack` (find's match).
+/// True if `needle` appears as a contiguous substring of `haystack` (find's default match).
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() { return true; }
     if needle.len() > haystack.len() { return false; }
     haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Match `name` against a glob `pat`: `*` matches any run (incl. empty), `?` matches exactly
+/// one character, everything else is literal. Anchored at both ends (a glob matches the whole
+/// name, like a shell). Iterative backtracking — no recursion, no allocation (§26.6): on a
+/// mismatch it falls back to extending the most recent `*`.
+fn glob_match(pat: &[u8], name: &[u8]) -> bool {
+    let (mut p, mut s) = (0usize, 0usize);
+    let mut star: Option<usize> = None; // pattern index just past the last '*' seen
+    let mut star_s = 0usize;            // name index that '*' is currently consuming up to
+    while s < name.len() {
+        if p < pat.len() && (pat[p] == b'?' || pat[p] == name[s]) {
+            p += 1;
+            s += 1;
+        } else if p < pat.len() && pat[p] == b'*' {
+            star = Some(p);
+            star_s = s;
+            p += 1;
+        } else if let Some(sp) = star {
+            // Mismatch: let the last '*' swallow one more character and retry.
+            p = sp + 1;
+            star_s += 1;
+            s = star_s;
+        } else {
+            return false;
+        }
+    }
+    // Trailing '*'s in the pattern can still match the (now empty) remainder.
+    while p < pat.len() && pat[p] == b'*' { p += 1; }
+    p == pat.len()
 }
 
 fn str_of(b: &[u8]) -> &str {
