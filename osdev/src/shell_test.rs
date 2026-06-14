@@ -314,6 +314,20 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
+    // Up-arrow history: run a command, then up-arrow + Enter (no retyping) must recall
+    // AND re-run it. `cores` is used because its OUTPUT ("cores: N") differs from the
+    // recalled command text ("cores"), so a match proves it actually ran, not just echoed.
+    // The arrow arrives as the ESC [ A sequence (same bytes the USB keyboard now emits).
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"cores\r");
+    let _ = collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5));
+    send(&mut write_half, b"\x1b[A\r"); // Up arrow, then Enter
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains(&format!("cores: {smp}")), "up-arrow history: recalled + ran the previous command"),
+        None    => { println!("shell-test: FAIL — timed out after up-arrow history"); fail += 1; }
+    }
+
+    // -----------------------------------------------------------------------
     // Done.
     // -----------------------------------------------------------------------
     child.kill().ok();

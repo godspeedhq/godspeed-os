@@ -36,7 +36,12 @@ pub fn hid_to_ascii(key: u8, mods: u8) -> Option<u8> {
         0x2C => Some(b' '),  // Space
         0x2D => Some(if shift { b'_' } else { b'-' }),
         0x2E => Some(if shift { b'+' } else { b'=' }),
+        0x2F => Some(if shift { b'{' } else { b'[' }),
+        0x30 => Some(if shift { b'}' } else { b']' }),
+        0x31 => Some(if shift { b'|' } else { b'\\' }),
         0x33 => Some(if shift { b':' } else { b';' }),
+        0x34 => Some(if shift { b'"' } else { b'\'' }), // apostrophe / quote
+        0x35 => Some(if shift { b'~' } else { b'`' }),  // grave / tilde
         0x36 => Some(if shift { b'<' } else { b',' }),
         0x37 => Some(if shift { b'>' } else { b'.' }),
         0x38 => Some(if shift { b'?' } else { b'/' }),
@@ -55,8 +60,15 @@ pub fn decode_keyboard(report: &[u8; 8], last: &mut [u8; 6], mut emit: impl FnMu
     for &k in cur.iter() {
         if k == 0 || k == 0x01 { continue; } // 0 = empty slot, 0x01 = rollover error
         if !last.contains(&k) {
-            if let Some(ch) = hid_to_ascii(k, mods) {
-                emit(ch);
+            // Arrow keys → ANSI escape sequences (ESC [ A/B/C/D), exactly what a serial
+            // terminal sends, so the shell's one input parser handles both paths (e.g. the
+            // up-arrow history walk). Other keys decode to ASCII.
+            match k {
+                0x52 => { emit(0x1B); emit(b'['); emit(b'A'); } // Up
+                0x51 => { emit(0x1B); emit(b'['); emit(b'B'); } // Down
+                0x4F => { emit(0x1B); emit(b'['); emit(b'C'); } // Right
+                0x50 => { emit(0x1B); emit(b'['); emit(b'D'); } // Left
+                _ => if let Some(ch) = hid_to_ascii(k, mods) { emit(ch); }
             }
         }
     }
