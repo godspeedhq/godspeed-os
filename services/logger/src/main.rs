@@ -1,3 +1,10 @@
+// GodspeedOS — Created by Bankole Ogundero.
+//
+// This software is provided "as is", without warranty or guarantee of any kind,
+// express or implied. The author makes no guarantee of its correctness, reliability,
+// or fitness for any purpose, and accepts no liability for any damages arising from
+// its use. Use at your own risk.
+
 //! `logger` — structured log sink (§11.4). Restartable.
 //!
 //! Phase 4: log "logger: ready" and enter the scheduler loop.
