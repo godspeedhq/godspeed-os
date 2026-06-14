@@ -26,6 +26,10 @@ const OP_WRITE_BLOCK: u8 = 2;
 // Capacity request: [OP_CAPACITY] → reply [STATUS_OK, sectors:u64 LE]. Lets `fs`
 // size a freshly-flashed filesystem to the real disk (drives §7, persistence §6.3).
 const OP_CAPACITY: u8 = 3;
+// Write-zeros: [OP_WRITE_ZEROS, lba:u64, count:u64] → zero `count` blocks from `lba`,
+// batched into multi-sector AHCI commands (no per-block IPC, no data carried). `fs` uses
+// it to zero the free bitmap at format time so `drives flash` stays fast on a big disk.
+const OP_WRITE_ZEROS: u8 = 4;
 const STATUS_OK: u8 = 0;
 const STATUS_ERR: u8 = 1;
 

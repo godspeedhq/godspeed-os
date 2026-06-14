@@ -44,6 +44,7 @@ const MAX_FILE_BYTES: usize = 7 * BLOCK; // 3584
 const OP_READ_BLOCK: u8 = 1;
 const OP_WRITE_BLOCK: u8 = 2;
 const OP_CAPACITY: u8 = 3;
+const OP_WRITE_ZEROS: u8 = 4; // [op, lba:u64, count:u64] — zero a run of blocks (fast format)
 const BLK_OK: u8 = 0;
 
 // fs file API (client <-> fs). `[op, path_len, path, (WriteFile: data | Rename/Move: tail)]`.
@@ -341,11 +342,10 @@ impl Fs {
         sb[77..77 + ll].copy_from_slice(&label[..ll]);
         if !block_write(ctx, 0, &sb) { return Err("superblock write failed"); }
 
-        // Zero the bitmap region, then mark blocks [0..used_through) used.
+        // Zero the bitmap region in one batched op (driver writes multi-sector zero runs —
+        // keeps `drives flash` fast even on a 122 GB disk), then mark [0..used_through) used.
         let zero = [0u8; BLOCK];
-        for bb in 0..bitmap_blocks {
-            if !block_write(ctx, bitmap_start + bb, &zero) { return Err("bitmap init failed"); }
-        }
+        if !block_write_zeros(ctx, bitmap_start, bitmap_blocks) { return Err("bitmap init failed"); }
         let mut b = 0u64;
         while b < used_through {
             let bm_blk = bitmap_start + b / BITS_PER_BMBLOCK;
@@ -785,6 +785,19 @@ fn block_read(ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
         Some(out)
     } else {
         None
+    }
+}
+
+/// Zero a run of `count` blocks from `lba` in one batched op (the driver writes
+/// multi-sector zero commands — no per-block IPC). Used to clear the bitmap at format.
+fn block_write_zeros(ctx: &ServiceContext, lba: u64, count: u64) -> bool {
+    let mut req = [0u8; 17];
+    req[0] = OP_WRITE_ZEROS;
+    req[1..9].copy_from_slice(&lba.to_le_bytes());
+    req[9..17].copy_from_slice(&count.to_le_bytes());
+    match ctx.request_with_reply("block-driver", &Message::from_bytes(&req)) {
+        Some(reply) => reply.payload_bytes().first() == Some(&BLK_OK),
+        None => false,
     }
 }
 

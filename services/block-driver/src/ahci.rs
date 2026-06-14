@@ -235,10 +235,34 @@ impl<'a> Ahci<'a> {
         Ok(())
     }
 
+    /// Write `count` zeroed sectors from `lba`, batched into multi-sector WRITE DMA EXT
+    /// commands (up to MAX_PER sectors each — bounded by the DMA arena's data area). One
+    /// IPC call zeros a whole run, so `fs` can clear a big bitmap without per-block traffic.
+    fn write_zeros(&self, lba: u64, count: u64) -> Result<(), &'static str> {
+        if count == 0 {
+            return Ok(());
+        }
+        const MAX_PER: u64 = 64; // 32 KiB — fits the arena's data area (DATA_OFF..64 KiB)
+        // Zero the data buffer once; it stays zero across the batched commands.
+        for i in 0..(MAX_PER as usize * 512 / 4) {
+            self.arena.write32(DATA_OFF + i * 4, 0);
+        }
+        let mut lba = lba;
+        let mut left = count;
+        while left > 0 {
+            let n = left.min(MAX_PER);
+            self.issue(ATA_WRITE_DMA_EXT, lba, n as u16, true, (n * 512) as u32)?;
+            lba += n;
+            left -= n;
+        }
+        self.issue(ATA_FLUSH_EXT, 0, 0, false, 0)?;
+        Ok(())
+    }
+
     /// Serve one block-IPC request (same protocol as the ATA PIO backend),
     /// replying through the client's `reply` cap.
     fn serve(&self, ctx: &ServiceContext, p: &[u8], reply: CapHandle) {
-        use super::{OP_CAPACITY, OP_READ_BLOCK, OP_WRITE_BLOCK, STATUS_ERR, STATUS_OK};
+        use super::{OP_CAPACITY, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_ZEROS, STATUS_ERR, STATUS_OK};
         let err = |ctx: &ServiceContext| { let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR])); };
         if p.is_empty() {
             err(ctx);
@@ -279,6 +303,19 @@ impl<'a> Ahci<'a> {
                 let mut sec = [0u8; 512];
                 sec.copy_from_slice(&p[9..9 + 512]);
                 let status = match self.write_block(lba, &sec) {
+                    Ok(()) => STATUS_OK,
+                    Err(_) => STATUS_ERR,
+                };
+                let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[status]));
+            }
+            OP_WRITE_ZEROS => {
+                // [op, lba:u64, count:u64] — zero `count` blocks from `lba`.
+                if p.len() < 17 {
+                    err(ctx);
+                    return;
+                }
+                let count = u64::from_le_bytes([p[9], p[10], p[11], p[12], p[13], p[14], p[15], p[16]]);
+                let status = match self.write_zeros(lba, count) {
                     Ok(()) => STATUS_OK,
                     Err(_) => STATUS_ERR,
                 };
