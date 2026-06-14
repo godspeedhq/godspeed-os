@@ -568,6 +568,24 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL — final read timeout"); fail += 1; }
     }
 
+    // copy + rename.
+    match run!(b"copy /docs/note.txt /docs/note-copy.txt\r", 10) {
+        Some(r) => check!(r.contains("copied"), "copy /docs/note.txt → note-copy.txt"),
+        None    => { println!("files-test: FAIL — copy timeout"); fail += 1; }
+    }
+    match run!(b"read /docs/note-copy.txt\r", 10) {
+        Some(r) => check!(r.contains("hello world"), "read copy has same content"),
+        None    => { println!("files-test: FAIL — read copy timeout"); fail += 1; }
+    }
+    match run!(b"rename /docs/note-copy.txt renamed.txt\r", 10) {
+        Some(r) => check!(r.contains("renamed"), "rename note-copy.txt → renamed.txt"),
+        None    => { println!("files-test: FAIL — rename timeout"); fail += 1; }
+    }
+    match run!(b"ls /docs\r", 10) {
+        Some(r) => check!(r.contains("renamed.txt") && !r.contains("note-copy.txt"), "ls shows renamed, not old name"),
+        None    => { println!("files-test: FAIL — ls after rename timeout"); fail += 1; }
+    }
+
     child.kill().ok();
     child.wait().ok();
     println!("\nfiles-test: {pass} passed, {fail} failed");

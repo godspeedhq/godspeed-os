@@ -13,6 +13,7 @@ const OP_READ_FILE: u8 = 11;
 const OP_STAT_FILE: u8 = 12;
 const OP_MKDIR: u8 = 13;
 const OP_LIST_DIR: u8 = 14;
+const OP_RENAME: u8 = 15;
 // drives ops:
 const OP_DRIVES_INFO: u8 = 20;
 const OP_FLASH: u8 = 21;
@@ -188,6 +189,14 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
             else { cmd_mkdir(ctx, cwd, args[1]); }
         }
         "cd"      => cmd_cd(ctx, cwd, if argc >= 2 { args[1] } else { "/" }),
+        "copy"    => {
+            if argc < 3 { ctx.console_writeln("usage: copy <src> <dst>"); }
+            else { cmd_copy(ctx, cwd, args[1], args[2]); }
+        }
+        "rename"  => {
+            if argc < 3 { ctx.console_writeln("usage: rename <path> <newname>"); }
+            else { cmd_rename(ctx, cwd, args[1], args[2]); }
+        }
         other => {
             // Build "unknown: <cmd>" in a stack buffer to avoid two ctx.log calls
             let mut buf = [0u8; 64];
@@ -228,6 +237,8 @@ fn cmd_help(ctx: &ServiceContext) {
     help_line(ctx, "read <path>", "print a file");
     help_line(ctx, "write <path> [text]", "create/overwrite a file");
     help_line(ctx, "mkdir <path>", "create a directory");
+    help_line(ctx, "copy <src> <dst>", "copy a file");
+    help_line(ctx, "rename <path> <name>", "rename an entry in place");
     ctx.console_writeln("");
     ctx.console_writeln("Power");
     help_line(ctx, "reboot", "hardware reset");
@@ -852,6 +863,66 @@ fn cmd_cd(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str) {
         }
     } else {
         ctx.console_writeln_fmt(format_args!("cd: no such directory: {}", str_of(path)));
+    }
+}
+
+/// `copy <src> <dst>` — copy a file (read src, write dst). Shell-side, so it carries the
+/// content through one message-sized buffer; file-only in this cut (no recursive dirs).
+fn cmd_copy(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) {
+    // Resolve + read the source.
+    let mut sbuf = [0u8; PATH_MAX];
+    let spath = match resolve_or_err(ctx, cwd, src, &mut sbuf) { Some(p) => p, None => return };
+    let mut sp = [0u8; PATH_MAX];
+    let sl = spath.len();
+    sp[..sl].copy_from_slice(spath);
+    let reply = match fs_request(ctx, OP_READ_FILE, &sp[..sl], &[]) {
+        Some(r) => r,
+        None => { ctx.console_writeln("copy: storage unavailable"); return; }
+    };
+    let p = reply.payload_bytes();
+    if no_fs(ctx, p) { return; }
+    if p.first() != Some(&FS_OK) || p.len() < 5 {
+        ctx.console_writeln_fmt(format_args!("copy: source not found: {}", str_of(&sp[..sl])));
+        return;
+    }
+    let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
+    let end = (5 + n).min(p.len());
+    let dn = end - 5;
+    let mut data = [0u8; 4096];
+    data[..dn].copy_from_slice(&p[5..end]);
+    drop(reply);
+
+    // Resolve + write the destination.
+    let mut dbuf = [0u8; PATH_MAX];
+    let dpath = match resolve_or_err(ctx, cwd, dst, &mut dbuf) { Some(p) => p, None => return };
+    let mut dp = [0u8; PATH_MAX];
+    let dl = dpath.len();
+    dp[..dl].copy_from_slice(dpath);
+    match fs_request(ctx, OP_WRITE_FILE, &dp[..dl], &data[..dn]) {
+        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
+            ctx.console_writeln_fmt(format_args!("copied {} → {} ({} bytes)", str_of(&sp[..sl]), str_of(&dp[..dl]), dn));
+        }
+        Some(_) => ctx.console_writeln("copy: write failed (parent missing?)"),
+        None    => ctx.console_writeln("copy: storage unavailable"),
+    }
+}
+
+/// `rename <path> <newname>` — rename an entry in place (not a move; newname is one
+/// component). fs edits the directory entry; no blocks are read or freed.
+fn cmd_rename(ctx: &ServiceContext, cwd: &Cwd, path: &str, newname: &str) {
+    let mut buf = [0u8; PATH_MAX];
+    let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return };
+    let mut pp = [0u8; PATH_MAX];
+    let pl = abspath.len();
+    pp[..pl].copy_from_slice(abspath);
+    // fs_request appends `newname` after the path — exactly the OP_RENAME wire format.
+    match fs_request(ctx, OP_RENAME, &pp[..pl], newname.as_bytes()) {
+        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
+            ctx.console_writeln_fmt(format_args!("renamed {} → {}", str_of(&pp[..pl]), newname));
+        }
+        Some(r) if no_fs(ctx, r.payload_bytes()) => {}
+        Some(_) => ctx.console_writeln("rename: failed (not found, or name exists, or bad name)"),
+        None    => ctx.console_writeln("rename: storage unavailable"),
     }
 }
 

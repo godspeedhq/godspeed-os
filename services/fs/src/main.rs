@@ -66,6 +66,7 @@ const OP_READ_FILE: u8 = 11;
 const OP_STAT_FILE: u8 = 12;
 const OP_MKDIR: u8 = 13;
 const OP_LIST_DIR: u8 = 14;
+const OP_RENAME: u8 = 15; // [op, path_len, path, newname] — rename an entry in place
 // drives API (the `drives` command <-> fs). Works in BOTH states (raw + mounted),
 // except LABEL which needs a filesystem. INFO reports the volume; FLASH formats a
 // raw disk (or re-formats); LABEL renames.
@@ -341,6 +342,11 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
                 None => send(&[FS_NOTFOUND]),
             }
         }
+        OP_RENAME => {
+            // The bytes after the path are the new name (a single component).
+            let newname = &p[2 + plen..];
+            send(&[match fs.rename(ctx, path, newname) { Ok(()) => FS_OK, Err(_) => FS_ERR }]);
+        }
         _ => send(&[FS_ERR]),
     }
 }
@@ -446,6 +452,40 @@ impl Fs {
         self.label[..ll].copy_from_slice(&label[..ll]);
         self.label_len = ll as u8;
         Ok(())
+    }
+
+    /// Rename an entry in place: change its name within its own directory (not a move).
+    /// `newname` must be a single component (no '/'). Needs no block reclamation — it only
+    /// rewrites the directory entry's name (mirrors `drives label`, one level up).
+    fn rename(&self, ctx: &ServiceContext, path: &[u8], newname: &[u8]) -> Result<(), &'static str> {
+        if newname.is_empty() || newname.len() > NAME_MAX || newname.iter().any(|&b| b == b'/') {
+            return Err("bad new name");
+        }
+        let (parent, oldname) = self.walk_parent(ctx, path)?;
+        if !self.inodes[parent as usize].is_dir() {
+            return Err("parent not a directory");
+        }
+        if self.dir_lookup(ctx, parent, newname).is_some() {
+            return Err("name already exists");
+        }
+        let d = self.inodes[parent as usize];
+        let mut blk = block_read(ctx, d.first_block).ok_or("dir read failed")?;
+        for e in 0..DIRENTS_PER_BLOCK {
+            let o = e * DIRENT_SIZE;
+            let nl = blk[o] as usize;
+            if nl == 0 || nl > NAME_MAX { continue; }
+            if &blk[o + 1..o + 1 + nl] == oldname {
+                blk[o] = newname.len() as u8;
+                for b in &mut blk[o + 1..o + 1 + NAME_MAX] { *b = 0; }
+                blk[o + 1..o + 1 + newname.len()].copy_from_slice(newname);
+                // inode number (at o+28) is unchanged — same file, new name.
+                if !block_write(ctx, d.first_block, &blk) {
+                    return Err("dir write failed");
+                }
+                return Ok(());
+            }
+        }
+        Err("entry not found")
     }
 
     // ── inode allocation + persistence ───────────────────────────────────────
