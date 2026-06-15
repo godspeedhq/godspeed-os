@@ -44,7 +44,19 @@ const PATH_MAX: usize = 120; // fits in MAX_LINE; path_len is u8
 // End-of-stream marker a producer service sends to a built-in sink (the shell draining a
 // `service | write` pipe). A non-empty sentinel — the IPC path doesn't deliver an empty body.
 const PIPE_EOT: u8 = 0x04; // ASCII EOT
-const CAP_MAX: usize = 4096;
+// One pipe stage's buffer. 64 KiB so a producer (`tree /`, `find …`) can capture a large
+// listing without being clipped at the buffer. NOTE this is no longer the *binding* limit:
+// an IPC message is 4 KiB (PIPE_MSG_MAX) and a file is ~3.5 KiB, so a buffer wider than those
+// can only flow to a sink that can take it (today: none beyond 4 KiB). Lifting those is the
+// streaming/multi-block work (docs/pipes.md). The buffer lives on the user stack; two coexist
+// for a middle filter (input + output ≈ 128 KiB), which fits the 256 KiB user stack.
+const CAP_MAX: usize = 64 * 1024;
+// A single IPC message body (= sdk MAX_PAYLOAD). A stage that must cross a service boundary is
+// bounded by this until pipe streaming chunks across messages.
+const PIPE_MSG_MAX: usize = 4096;
+// Largest file the `write` sink can store: one WriteFile message (fs MAX_FILE_BYTES = 7×512).
+// A bigger captured buffer can't reach a file until fs grows multi-block files.
+const PIPE_FILE_MAX: usize = 7 * 512; // 3584
 struct Cap {
     buf: [u8; CAP_MAX],
     len: usize,
@@ -1034,6 +1046,16 @@ fn stage_sink(ctx: &ServiceContext, cwd: &Cwd, stage: &str, input: &[u8]) {
 /// shell's endpoint until the service sends an EOT (0x04), then the service is reaped. Whole-
 /// buffer messaging (≤ one message each way) keeps the bounded queues deadlock-free (§8.9).
 fn drain_service(ctx: &ServiceContext, svc: &str, input: Option<&[u8]>, out: &mut Cap) -> bool {
+    // A stage crossing a service boundary is one IPC message until streaming chunks across
+    // many. Refuse a larger buffer LOUDLY rather than silently clipping it to 4 KiB (§3.12).
+    if let Some(inp) = input {
+        if inp.len() > PIPE_MSG_MAX {
+            ctx.console_writeln_fmt(format_args!(
+                "pipe: stage too large ({} bytes) for the '{}' filter — max {} KiB until pipe streaming",
+                inp.len(), svc, PIPE_MSG_MAX / 1024));
+            return false;
+        }
+    }
     // Wire the service to send its output to the SHELL's own endpoint.
     if ctx.spawn_pipe(svc, "shell").is_err() {
         ctx.console_writeln_fmt(format_args!("pipe: failed to spawn '{}'", svc));
@@ -1106,6 +1128,14 @@ fn run_producer(ctx: &ServiceContext, cwd: &Cwd, cmdline: &str, out: &mut Out) {
 fn pipe_write_file(ctx: &ServiceContext, cwd: &Cwd, path_arg: &str, data: &[u8]) {
     let (pstr, _) = split_first(path_arg);
     if pstr.is_empty() { ctx.console_writeln("pipe: write needs a file path"); return; }
+    // A file is one WriteFile message (fs MAX_FILE_BYTES). A bigger buffer can't be written
+    // until fs supports multi-block files — say so plainly instead of a generic write failure.
+    if data.len() > PIPE_FILE_MAX {
+        ctx.console_writeln_fmt(format_args!(
+            "pipe: {} bytes is too large to write to a file (max {} until multi-block files)",
+            data.len(), PIPE_FILE_MAX));
+        return;
+    }
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, pstr, &mut buf) { Some(p) => p, None => return };
     let mut pbuf = [0u8; PATH_MAX];
