@@ -65,8 +65,8 @@ surface — §7.7). Pipelines are also not on the model yet.
 ## 5. Later (separate so it can grow)
 
 - Convert the remaining commands (file ops, spawn/kill/restart, the record verbs, pipelines).
-- **`run <script>`** — execute a file of commands, aggregating `result` into "ran N, failed M"
-  (the hardware-suite driver).
+- **`run <script>`** — **built** (`utilities/33_run.md`): executes a file of commands,
+  aggregating `result` into "ran N, failed M".
 - **`assert`** — positive (`is_ok`) and negative (`fails-with <Variant>`) checks, so a script can
   self-verify the guardrails, not just the happy path.
 

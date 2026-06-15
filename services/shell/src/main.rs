@@ -168,7 +168,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 ctx.console_write("\r\n");
                 if line_len > 0 {
                     hist.push(&line_buf[..line_len]);
-                    last_result = execute(&ctx, &line_buf[..line_len], &mut cwd, last_result);
+                    last_result = execute(&ctx, &line_buf[..line_len], &mut cwd, last_result, 0);
                     line_len = 0;
                 }
                 nav = hist.len();
@@ -360,9 +360,17 @@ impl ShellError {
 
 /// Run one command line. Returns the command's `Result` (the Ok/Err model): `Ok(())` on success,
 /// `Err(ShellError)` on failure. `prev` is the previous line's result, so the `result` command
-/// can report it. Commands are being converted to return `Result` incrementally — those not yet
-/// converted run via the legacy dispatch and are treated as `Ok`.
-fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellError>) -> Result<(), ShellError> {
+/// can report it. `depth` is the script-nesting level (0 = interactive); `run` is refused at
+/// depth > 0 so a script can't run another script (keeps the user stack bounded). Commands are
+/// being converted to return `Result` incrementally — those not yet converted run via the legacy
+/// dispatch and are treated as `Ok`.
+///
+/// `#[inline(never)]`: `cmd_run` calls `execute` per script line, so `execute` must NOT be
+/// inlined into `cmd_run` — that would fold `execute`'s whole frame (including the `pipe_run`
+/// path's 64 KiB `Stream`) into `cmd_run`'s, blowing the bounded user stack on the nested
+/// `run → cmd_run → execute` path (the same inlining-inflates-frame trap as the record builders).
+#[inline(never)]
+fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellError>, depth: u8) -> Result<(), ShellError> {
     let Ok(s) = core::str::from_utf8(line) else {
         ctx.console_writeln("shell: invalid input");
         return Err(ShellError::Unknown);
@@ -406,6 +414,18 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         },
         // `result` reports the PREVIOUS command's result (this one always succeeds at reporting).
         "result" => { cmd_result(ctx, prev); return Ok(()); }
+        "run" => {
+            if depth > 0 {
+                ctx.console_writeln("run: a script cannot run another script (no nesting)");
+                return Err(ShellError::Unknown);
+            }
+            return if argc < 2 {
+                ctx.console_writeln("usage: run <path>");
+                Err(ShellError::Unknown)
+            } else {
+                cmd_run(ctx, cwd, args[1], depth)
+            };
+        }
         _ => {}
     }
 
@@ -510,6 +530,77 @@ fn cmd_result(ctx: &ServiceContext, prev: Result<(), ShellError>) {
     }
 }
 
+/// Largest script `run` will read (one `fs` file; the whole thing is buffered on the stack).
+const SCRIPT_MAX: usize = 4096;
+
+/// Trim leading/trailing ASCII whitespace from a byte slice (lines/commands in a script).
+fn trim_bytes(b: &[u8]) -> &[u8] {
+    let mut s = 0usize;
+    let mut e = b.len();
+    while s < e && b[s].is_ascii_whitespace() { s += 1; }
+    while e > s && b[e - 1].is_ascii_whitespace() { e -= 1; }
+    &b[s..e]
+}
+
+/// `run <path>` — execute a script file: each command is run exactly as if typed at the prompt.
+/// Lines split on `\n`; a non-comment line further splits on `;` (so a `.gs` can be real
+/// multi-line, or `cmd ; cmd ; cmd` — the latter is how scripts are authored before a host-side
+/// editor exists). `#`-comment lines and blanks are skipped; each command is echoed (`> cmd`) so
+/// the serial transcript self-documents; a summary reports how many ran and how many returned
+/// `Err`. `run` itself is `Ok` iff every command was `Ok`.
+///
+/// Scripts cannot nest: `run` at `depth > 0` is refused (in `execute`). `#[inline(never)]` keeps
+/// the script buffer off the hot pipe frame, and the `fs` reply is dropped before any command
+/// runs — both bound the user stack (see the pipe stack-overflow lesson).
+#[inline(never)]
+fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8) -> Result<(), ShellError> {
+    let mut pbuf = [0u8; PATH_MAX];
+    let path = match resolve_or_err(ctx, cwd, arg, &mut pbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
+    // Read the whole script into a fixed buffer, then drop the fs reply before executing anything.
+    let mut script = [0u8; SCRIPT_MAX];
+    let slen;
+    {
+        let reply = match fs_request(ctx, OP_READ_FILE, path, &[]) {
+            Some(r) => r,
+            None => { ctx.console_writeln("run: storage unavailable"); return Err(ShellError::Unknown); }
+        };
+        let p = reply.payload_bytes();
+        if no_fs(ctx, p) { return Err(ShellError::Unknown); }
+        if !(p.first() == Some(&FS_OK) && p.len() >= 5) {
+            ctx.console_writeln_fmt(format_args!("run: not found: {}", str_of(path)));
+            return Err(ShellError::FileNotFound);
+        }
+        let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
+        let end = (5 + n).min(p.len());
+        let body = &p[5..end];
+        let take = body.len().min(SCRIPT_MAX);
+        if take < body.len() {
+            ctx.console_writeln_fmt(format_args!("run: script truncated at {} bytes (max {})", take, SCRIPT_MAX));
+        }
+        script[..take].copy_from_slice(&body[..take]);
+        slen = take;
+    }
+    let mut ran = 0u32;
+    let mut failed = 0u32;
+    let mut last: Result<(), ShellError> = Ok(());
+    for line in script[..slen].split(|&b| b == b'\n') {
+        let line = trim_bytes(line);
+        if line.is_empty() || line[0] == b'#' { continue; } // blank or whole-line comment
+        for cmd in line.split(|&b| b == b';') {
+            let cmd = trim_bytes(cmd);
+            if cmd.is_empty() { continue; }
+            // Echo the command so the serial transcript shows what produced each result.
+            ctx.console_write("> ");
+            ctx.console_writeln(str_of(cmd));
+            last = execute(ctx, cmd, cwd, last, depth + 1);
+            ran += 1;
+            if last.is_err() { failed += 1; }
+        }
+    }
+    ctx.console_writeln_fmt(format_args!("run: ran {}, failed {}", ran, failed));
+    if failed == 0 { Ok(()) } else { Err(ShellError::Unknown) }
+}
+
 // ---------------------------------------------------------------------------
 // Per-utility help + version (0_conventions.md). Every utility self-documents:
 // `<util> help` prints usage with a real example per row; `<util> version` prints the
@@ -521,7 +612,7 @@ const UTIL_VERSION: &str = "0.1.0";
 
 /// Utilities that self-document (gates the `help`/`version` intercept in `execute`).
 const UTILS: &[&str] = &[
-    "help", "result",
+    "help", "result", "run",
     "echo", "clear", "about", "mem", "cores", "date", "status", "observe", "caps",
     "spawn", "kill", "restart", "reboot", "drives", "ls", "cd", "read", "write",
     "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count", "sort",
@@ -567,6 +658,10 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         ], true),
         "result" => help_block(ctx, "result", "show the previous command's result (Ok / Err)", &[
             ("result", "Ok if the last command succeeded, else Err(<reason>)", "result"),
+        ], true),
+        "run" => help_block(ctx, "run", "run a script of commands from a file", &[
+            ("run <path>", "execute each line/command as if typed; reports ran N, failed M", "run /suite.gs"),
+            ("# … (in the file)", "lines starting with # are comments; ';' separates commands", "run /test.gs"),
         ], true),
         "echo" => help_block(ctx, "echo", "print text", &[
             ("echo <text>", "print text verbatim", "echo hello world"),
@@ -754,6 +849,7 @@ fn cmd_help(ctx: &ServiceContext) {
     help_line(ctx, "clear", "clear the screen");
     help_line(ctx, "echo <text>", "print text");
     help_line(ctx, "result", "the last command's result (Ok / Err)");
+    help_line(ctx, "run <script>", "run a script of commands (.gs; # comments, ; separators)");
     ctx.console_writeln("");
     ctx.console_writeln("System");
     help_line(ctx, "about", "identity + credits");
@@ -1156,6 +1252,11 @@ enum Stream {
 /// bytes and records via `from`/`to`. Stage 1 produces; middle stages transform; the last stage
 /// sinks (`write`) or, if it isn't a sink, the final stream is rendered to the console. Replaces
 /// the separate byte and record pipelines. (docs/pipes.md, docs/records.md)
+///
+/// `#[inline(never)]`: holds a 64 KiB `Stream` on its frame, so it must never be inlined into
+/// `execute` (which would carry that 64 KiB into every command's frame, and via a nested
+/// `run → execute` chain overflow the user stack).
+#[inline(never)]
 fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str) {
     let mut stages = [""; MAX_STAGES];
     let mut n = 0usize;
