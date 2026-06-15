@@ -440,6 +440,8 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
         "match"   => cmd_match(ctx, cwd, &args, argc),
         "count"   => cmd_count(ctx, cwd, &args, argc),
         "sort"    => cmd_sort(ctx, cwd, &args, argc),
+        "first"   => cmd_take(ctx, cwd, &args, argc, false),
+        "last"    => cmd_take(ctx, cwd, &args, argc, true),
         other => {
             // Build "unknown: <cmd>" in a stack buffer to avoid two ctx.log calls
             let mut buf = [0u8; 64];
@@ -465,6 +467,7 @@ const UTILS: &[&str] = &[
     "echo", "clear", "about", "mem", "cores", "date", "status", "observe", "caps",
     "spawn", "kill", "restart", "reboot", "drives", "ls", "cd", "read", "write",
     "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count", "sort",
+    "first", "last",
 ];
 fn is_util(name: &str) -> bool { UTILS.contains(&name) }
 
@@ -605,6 +608,14 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("sort <path>", "sort a file's lines", "sort /names.txt"),
             ("sort reverse [path]", "sort descending", "read /names.txt | sort reverse"),
         ], true),
+        "first" => help_block(ctx, "first", "keep the first N lines (default 10)", &[
+            ("<producer> | first [N]", "first N piped lines", "find *.txt | first 5"),
+            ("first [N] <path>", "first N lines of a file", "first 20 /log"),
+        ], true),
+        "last" => help_block(ctx, "last", "keep the last N lines (default 10)", &[
+            ("<producer> | last [N]", "last N piped lines", "read /log | last 20"),
+            ("last [N] <path>", "last N lines of a file", "last 20 /log"),
+        ], true),
         _ => return false,
     }
     true
@@ -684,6 +695,7 @@ fn cmd_help(ctx: &ServiceContext) {
     help_line(ctx, "match <pattern> [path]", "keep lines matching (also: <prod> | match)");
     help_line(ctx, "count [path]", "count lines/words/bytes (also: <prod> | count)");
     help_line(ctx, "sort [reverse] [path]", "order lines (also: <prod> | sort)");
+    help_line(ctx, "first / last [N] [path]", "keep first/last N lines (also: <prod> |)");
     ctx.console_writeln("");
     ctx.console_writeln("Pipes");
     help_line(ctx, "<producer> | [filter |…] <sink>", "compose stages (Appendix D)");
@@ -1092,7 +1104,7 @@ fn stage_filter(ctx: &ServiceContext, cwd: &Cwd, stage: &str, input: &[u8], out:
 /// Built-in FILTERS — they consume input and emit output, so they can sit mid-pipe. Run
 /// in-process, so they are NOT subject to the 4 KiB service-boundary cap.
 fn is_filter_builtin(name: &str) -> bool {
-    matches!(name, "match" | "count" | "sort")
+    matches!(name, "match" | "count" | "sort" | "first" | "last")
 }
 
 /// The last stage — consumes the final buffer. `write <file>` writes it; a service filters it
@@ -2123,6 +2135,13 @@ fn run_filter_builtin(ctx: &ServiceContext, stage: &str, input: &[u8], out: &mut
             write_sorted(ctx, input, reverse, out);
             true
         }
+        "first" | "last" => {
+            let mut targs = [""; MAX_ARGS];
+            let tac = tokenize(stage, &mut targs);
+            let (n, _) = parse_take(&targs, tac, 1);
+            if cmd == "last" { write_last(ctx, input, n, out); } else { write_first(ctx, input, n, out); }
+            true
+        }
         _ => {
             // match (the default filter): tokenize for the `except` keyword + a quoted pattern.
             let mut margs = [""; MAX_ARGS];
@@ -2262,6 +2281,91 @@ fn cmd_sort(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) {
         write_sorted(ctx, &p[5..end], reverse, &mut Out::Console);
     } else {
         ctx.console_writeln_fmt(format_args!("sort: not found: {}", str_of(abspath)));
+    }
+}
+
+// ── first / last — keep the first or last N lines (the head/tail-equivalent) ──────
+// `first [N] <path>` / `last [N] <path>` for a file; `<producer> | first [N]` for a pipe.
+// Built-in FILTERS like match/count/sort. N defaults to 10. See utilities/30_first-last.md.
+
+const TAKE_DEFAULT: usize = 10;
+const TAKE_MAX: usize = 1024; // `last`'s ring keeps at most this many recent lines (§26.6)
+
+/// Pick the count and path out of a `first`/`last` invocation's args: a numeric arg is N (else
+/// the default), a non-numeric arg is the path ("" if none).
+fn parse_take<'a>(args: &[&'a str], argc: usize, start: usize) -> (usize, &'a str) {
+    let mut n = TAKE_DEFAULT;
+    let mut path = "";
+    for i in start..argc {
+        if let Ok(num) = args[i].parse::<usize>() { n = num; }
+        else if path.is_empty() { path = args[i]; }
+    }
+    (n, path)
+}
+
+/// Write the first `n` non-empty lines of `input` to `out` (one pass, no buffer).
+fn write_first(ctx: &ServiceContext, input: &[u8], n: usize, out: &mut Out) {
+    let mut emitted = 0usize;
+    for line in input.split(|&b| b == b'\n') {
+        if line.is_empty() { continue; }
+        if emitted >= n { break; }
+        out.put_bytes(ctx, line);
+        out.put(ctx, "\n");
+        emitted += 1;
+    }
+}
+
+/// Write the last `n` non-empty lines of `input` to `out`. Keeps the most recent `TAKE_MAX`
+/// line spans in a ring buffer, so it is correct even for input far larger than the ring; `n`
+/// itself is capped at `TAKE_MAX` (loud if more was asked).
+fn write_last(ctx: &ServiceContext, input: &[u8], n: usize, out: &mut Out) {
+    let capped = n.min(TAKE_MAX);
+    if n > TAKE_MAX {
+        ctx.console_writeln_fmt(format_args!("last: capped at {} lines (asked {})", TAKE_MAX, n));
+    }
+    let mut ring: [(usize, usize); TAKE_MAX] = [(0, 0); TAKE_MAX];
+    let mut total = 0usize;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i <= input.len() {
+        if i == input.len() || input[i] == b'\n' {
+            if i > start { ring[total % TAKE_MAX] = (start, i); total += 1; }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    let take = capped.min(total);
+    for k in (total - take)..total {
+        let (s, e) = ring[k % TAKE_MAX];
+        out.put_bytes(ctx, &input[s..e]);
+        out.put(ctx, "\n");
+    }
+}
+
+/// `first [N] <path>` / `last [N] <path>` — print a file's first/last N lines (default 10). The
+/// pipe form `<producer> | first [N]` takes from piped input; either way it consumes input.
+fn cmd_take(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize, last: bool) {
+    let name = if last { "last" } else { "first" };
+    let (n, path) = parse_take(args, argc, 1);
+    if path.is_empty() {
+        ctx.console_writeln_fmt(format_args!("{}: a path is required (or pipe: <producer> | {} [N])", name, name));
+        return;
+    }
+    let mut buf = [0u8; PATH_MAX];
+    let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return };
+    let reply = match fs_request(ctx, OP_READ_FILE, abspath, &[]) {
+        Some(r) => r,
+        None => { ctx.console_writeln_fmt(format_args!("{}: storage unavailable", name)); return; }
+    };
+    let p = reply.payload_bytes();
+    if no_fs(ctx, p) { return; }
+    if p.first() == Some(&FS_OK) && p.len() >= 5 {
+        let cnt = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
+        let end = (5 + cnt).min(p.len());
+        if last { write_last(ctx, &p[5..end], n, &mut Out::Console); }
+        else    { write_first(ctx, &p[5..end], n, &mut Out::Console); }
+    } else {
+        ctx.console_writeln_fmt(format_args!("{}: not found: {}", name, str_of(abspath)));
     }
 }
 
