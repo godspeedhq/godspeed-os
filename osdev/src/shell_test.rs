@@ -1146,18 +1146,24 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL — json→yaml roundtrip timeout"); fail += 1; }
     }
 
-    // ── a SERVICE producing records: `roster` builds a Table with the SDK, emits it as JSON;
-    //    `| from json` lifts it back so the record verbs filter a third-party service's output
-    //    (docs/records.md, sdk/rust/CLAUDE.md). Proves the SDK record API works outside the shell.
-    match run!(b"roster | from json | where role=core\r", 16) {
+    // ── a SERVICE producing records via the binary WIRE CODEC: `roster` builds a Table with the
+    //    SDK, `encode`s it, and the shell `decode`s it straight back — NO `from json` round-trip
+    //    (docs/records.md, sdk/rust/CLAUDE.md). Proves records cross a service boundary as records.
+    match run!(b"roster | where role=core\r", 16) {
         Some(r) => check!(r.contains("vesta") && !r.contains("atlas"),
-                          "roster service: from json | where filters service-produced records"),
-        None    => { println!("files-test: FAIL — roster|from json|where timeout"); fail += 1; }
+                          "roster codec: where filters records decoded from the service stream"),
+        None    => { println!("files-test: FAIL — roster|where timeout"); fail += 1; }
     }
-    match run!(b"roster | from json | select name core | to json\r", 16) {
+    match run!(b"roster | select name core | to json\r", 16) {
         Some(r) => check!(r.contains("\"name\": \"hermes\"") && r.contains("\"core\":") && !r.contains("\"role\""),
-                          "roster service: select + to json projects service records"),
+                          "roster codec: select + to json projects the decoded records"),
         None    => { println!("files-test: FAIL — roster|select timeout"); fail += 1; }
+    }
+    // It really is a record stream now (not text): a text filter is the loud, guided error.
+    match run!(b"roster | match atlas\r", 16) {
+        Some(r) => check!(r.contains("record stream") && r.contains("where"),
+                          "roster codec: a text filter on the decoded records errors with guidance"),
+        None    => { println!("files-test: FAIL — roster|match guard timeout"); fail += 1; }
     }
 
     // ── ls as a record producer: directory entries become typed rows (name/type/size) ──

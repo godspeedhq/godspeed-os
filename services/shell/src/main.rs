@@ -1129,6 +1129,16 @@ fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str) {
                 c0, REC_MAX_ROWS, REC_ARENA));
         }
         Stream::Table(t)
+    } else if is_record_producer_service(c0) {
+        // A SERVICE that emits records: drain its binary wire encoding (Table::encode, §
+        // docs/records.md) and decode it back into a Table — no JSON round-trip. The transport
+        // is the same byte drain as a text service; the bytes are records, decoded here.
+        let mut cap = Cap::new();
+        if !drain_service(ctx, c0, None, &mut cap) { return; }
+        match Table::decode(cap.bytes()) {
+            Ok(t) => Stream::Table(t),
+            Err(why) => { ctx.console_writeln_fmt(format_args!("{}: bad record stream — {}", c0, why)); return; }
+        }
     } else if is_producer_builtin(c0) {
         let mut cap = Cap::new();
         run_producer(ctx, cwd, stages[0], &mut Out::Capture(&mut cap));
@@ -1590,7 +1600,14 @@ fn is_producer_builtin(name: &str) -> bool {
 /// EOT end-of-stream protocol). A non-producer service in stage 1 would block the shell on
 /// `recv` (there is no non-blocking recv in v1), so the set is an explicit whitelist.
 fn is_pipe_producer_service(name: &str) -> bool {
-    matches!(name, "greet" | "roster")
+    matches!(name, "greet")
+}
+
+/// Producer SERVICES that emit **records** (the binary wire codec, `Table::encode`) rather than
+/// text. Stage 1 drains the service's bytes and `Table::decode`s them straight into a Table —
+/// no `from json` round-trip. Checked before the text producer-service whitelist.
+fn is_record_producer_service(name: &str) -> bool {
+    matches!(name, "roster")
 }
 
 /// Run a producer built-in (`cmd args`) with its output going to `out`.

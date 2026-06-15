@@ -23,8 +23,10 @@
 //! t.to_json(&mut buf);              // → `[ {"name": "alpha", "n": 1} ]`
 //! ```
 //!
-//! Crossing a service boundary *as records* (skipping the JSON round-trip) is the future
-//! bounded **wire codec** — deliberately not built until a service needs it (§26.2).
+//! To cross a **service** boundary *as records* (skipping the JSON round-trip), use the bounded
+//! binary **wire codec** instead: [`Table::encode`] on the producer, [`Table::decode`] on the
+//! consumer. It is the `Table` itself on the wire — compact and typed, not JSON. `examples/roster`
+//! produces records this way; the shell decodes them straight into a `Table`.
 //!
 //! ## Bounds (§26.6)
 //!
@@ -42,6 +44,10 @@ pub const REC_MAX_ROWS: usize = 64;
 pub const REC_ARENA: usize = 4 * 1024;
 /// Maximum column-name length (bytes).
 pub const REC_COL_NAME: usize = 24;
+
+/// Magic prefix of the binary wire encoding (`Table::encode`/`decode`). Lets a decoder reject a
+/// non-record byte stream loudly instead of misparsing it.
+const REC_WIRE_MAGIC: &[u8; 4] = b"GSR1";
 
 /// A typed cell. `Str` points into the owning [`Table`]'s arena (no lifetimes, no heap).
 #[derive(Clone, Copy)]
@@ -351,6 +357,95 @@ impl Table {
             if i < b.len() && b[i] == b']' { return Ok(t); }
             return Err("expected ',' or ']'");
         }
+    }
+
+    // ── wire codec (records across a service boundary) ────────────────────────────────────
+
+    /// Encode the table into a compact, *bounded* binary form for crossing a **service**
+    /// boundary as records (no JSON round-trip). This is emphatically **not** JSON — it is the
+    /// `Table` itself on the wire. Layout:
+    ///
+    /// ```text
+    /// magic "GSR1" | ncols:u8 | nrows:u8
+    /// per column:  name_len:u8 | name bytes
+    /// per cell:    tag:u8 (0=empty 1=int 2=str)
+    ///              int → val:u64-le ; str → len:u16-le | bytes ; empty → (nothing)
+    /// ```
+    ///
+    /// Symmetric with [`Table::decode`]. The whole encoding is bounded by the table's own
+    /// bounds; a producer sends it as one IPC message (≤ 4 KiB) for a small table, or chunks it
+    /// — the shell drains chunks until EOT, then decodes. (A chunked producer must never emit a
+    /// lone `0x04` chunk, which is the EOT marker; the magic guarantees the first chunk is not.)
+    pub fn encode(&self, out: &mut impl RecordSink) {
+        out.put(REC_WIRE_MAGIC);
+        out.put(&[self.ncols as u8, self.nrows as u8]);
+        for c in 0..self.ncols {
+            let name = self.col_name(c);
+            out.put(&[name.len() as u8]);
+            out.put(name);
+        }
+        for r in 0..self.nrows {
+            for c in 0..self.ncols {
+                match self.rows[r][c] {
+                    Value::Empty => out.put(&[0u8]),
+                    Value::Int(i) => { out.put(&[1u8]); out.put(&i.to_le_bytes()); }
+                    Value::Str { .. } => {
+                        let s = self.cell_str(self.rows[r][c]);
+                        out.put(&[2u8]);
+                        out.put(&(s.len() as u16).to_le_bytes());
+                        out.put(s);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Decode the binary form produced by [`Table::encode`]. Validates the magic and every length
+    /// against the table bounds and the buffer end — a truncated, oversized, or non-record buffer
+    /// is a loud `Err`, never a misparse (§3.12). Strings intern into the new table's arena.
+    #[inline(never)]
+    pub fn decode(bytes: &[u8]) -> Result<Table, &'static str> {
+        let b = bytes;
+        if b.len() < 6 || &b[..4] != &REC_WIRE_MAGIC[..] { return Err("not a record stream (bad magic)"); }
+        let mut p = 4usize;
+        let ncols = b[p] as usize; p += 1;
+        let nrows = b[p] as usize; p += 1;
+        if ncols > REC_MAX_COLS { return Err("record has too many columns"); }
+        if nrows > REC_MAX_ROWS { return Err("record has too many rows"); }
+        let mut t = Table::new(&[]);
+        for _ in 0..ncols {
+            if p >= b.len() { return Err("truncated record (column count)"); }
+            let nl = b[p] as usize; p += 1;
+            if p + nl > b.len() { return Err("truncated record (column name)"); }
+            if t.add_col(&b[p..p + nl]).is_none() { return Err("record column rejected (name too long)"); }
+            p += nl;
+        }
+        for _ in 0..nrows {
+            let mut row = [Value::Empty; REC_MAX_COLS];
+            for cell in row.iter_mut().take(ncols) {
+                if p >= b.len() { return Err("truncated record (cell tag)"); }
+                let tag = b[p]; p += 1;
+                *cell = match tag {
+                    0 => Value::Empty,
+                    1 => {
+                        if p + 8 > b.len() { return Err("truncated record (int)"); }
+                        let mut a = [0u8; 8];
+                        a.copy_from_slice(&b[p..p + 8]); p += 8;
+                        Value::Int(u64::from_le_bytes(a))
+                    }
+                    2 => {
+                        if p + 2 > b.len() { return Err("truncated record (string length)"); }
+                        let len = u16::from_le_bytes([b[p], b[p + 1]]) as usize; p += 2;
+                        if p + len > b.len() { return Err("truncated record (string)"); }
+                        let v = t.intern(&b[p..p + len]); p += len;
+                        v
+                    }
+                    _ => return Err("bad record cell tag"),
+                };
+            }
+            t.add_row(&row);
+        }
+        Ok(t)
     }
 }
 

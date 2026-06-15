@@ -49,9 +49,9 @@ the SDK so any service — not just the shell — can build records, filter them
 (`where`/`select`/`sort`), and render them to JSON/YAML. All bounded and `no_std` (fixed
 cols/rows/arena, loud on overflow — §26.6).
 
-A service participates in a record pipe **today, with no new kernel surface**: build a `Table`,
-render it with `to_json`, and emit the bytes (EOT-terminated) like any byte producer
-(`docs/pipes.md`). The shell's `| from json` lifts it back into records for `where`/`sort`:
+A service participates in a record pipe **with no new kernel surface**: build a `Table`, send it
+through the shell-delegated pipe cap (EOT-terminated, like any byte producer, `docs/pipes.md`).
+Two ways to put it on the wire:
 
 ```rust
 use godspeed_sdk::{Table, Value, RecordSink};
@@ -64,11 +64,20 @@ struct MsgSink<'a>(&'a mut [u8], usize);     // any sink: an IPC message, a buff
 impl RecordSink for MsgSink<'_> {
     fn put(&mut self, b: &[u8]) { /* append b */ }
 }
-t.to_json(&mut MsgSink(&mut buf, 0));         // → `[ {"name": "alpha", "n": 1} ]`
+
+t.encode(&mut sink);   // ← the binary WIRE CODEC: the Table itself, compact & typed.
+                       //   The shell decodes it straight into records — no round-trip.
+t.to_json(&mut sink);  // ← or JSON text; the shell's `| from json` lifts it back.
 ```
 
-Crossing a service boundary *as records* (skipping the JSON round-trip) is the future bounded
-**wire codec** — deliberately not built until a service needs it (§26.2).
+- **`encode`/`decode`** — the bounded binary codec. Use it for a service that *is* a record
+  producer (the shell knows it and `Table::decode`s its stream into a `Table`). Compact, typed,
+  not JSON. `examples/roster` does this.
+- **`to_json`** — render JSON at the edge; the shell's `| from json` parses external/text JSON
+  back into records. Use it for human-facing output and interop, not service→service transport.
+
+Both are bounded (§26.6) and fit the byte-pipe transport. The codec is what makes a service-side
+producer first-class — `roster | where role=core` with no `from json` in sight.
 
 ## no_std
 

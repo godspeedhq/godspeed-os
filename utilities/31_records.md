@@ -97,9 +97,10 @@ or kernel surface: these operate on data already in the pipeline.
 
 ## 5. Later (separate so it can grow)
 
-- The bounded **wire codec** (records crossing a *service* boundary) + an **SDK record API** so
-  third-party services can emit records — the same milestone. `status`/`ls`/`caps`/`drives`/
-  `find`/`observe now` (all shell-side) are done.
+- A JSON string-escaper; `from yaml`; record streams larger than one IPC message (chunked
+  `encode`). The **SDK record API** and the bounded **wire codec** (`encode`/`decode`) are
+  **done** — `examples/roster` is a record-producing *service* (`roster | where role=core`, no
+  `from json`). `status`/`ls`/`caps`/`drives`/`find`/`observe now` (shell-side) are done.
 - `from yaml`; a JSON string-escaper (values are plain ASCII today).
 - The bounded **wire codec** — only when a record first needs to cross a *service* boundary
   (today every producer is shell-side, so records pass by value). Emphatically not JSON on the
