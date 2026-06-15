@@ -16,10 +16,12 @@ use godspeed_sdk::{Message, ServiceContext};
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("greet: ready");
 
+    // Each line carries its own newline: the shell concatenates pipe-stage messages verbatim
+    // (it adds no separators), so a producer includes the line breaks in what it sends.
     let lines = [
-        "hello from godspeed",
-        "capability pipes work",
-        "no ambient authority here",
+        "hello from godspeed\n",
+        "capability pipes work\n",
+        "no ambient authority here\n",
     ];
 
     // send_peers[0] is the SEND cap the shell granted us to the pipe sink.

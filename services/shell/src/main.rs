@@ -290,8 +290,8 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
     // (Appendix D.3): spawn the consumer, then spawn the producer with a SEND cap
     // to the consumer's endpoint delegated to it — the producer has no ambient
     // authority of its own.
-    if let Some(bar) = s.find('|') {
-        cmd_pipe(ctx, cwd, s[..bar].trim(), s[bar + 1..].trim());
+    if s.contains('|') {
+        cmd_pipe(ctx, cwd, s);
         return;
     }
 
@@ -612,9 +612,10 @@ fn cmd_help(ctx: &ServiceContext) {
     help_line(ctx, "tree [path]", "print the directory hierarchy");
     ctx.console_writeln("");
     ctx.console_writeln("Pipes");
-    help_line(ctx, "<producer> | <sink>", "feed output to a sink (Appendix D)");
+    help_line(ctx, "<producer> | [filter |…] <sink>", "compose stages (Appendix D)");
     help_line(ctx, "  e.g. read /f | upper", "filter a file through a service");
     help_line(ctx, "  e.g. tree / | write /out", "capture output to a file");
+    help_line(ctx, "  e.g. greet | upper | write /g", "producer | filter | sink");
     ctx.console_writeln("");
     ctx.console_writeln("Power");
     help_line(ctx, "reboot", "hardware reset");
@@ -946,40 +947,123 @@ fn cmd_spawn(ctx: &ServiceContext, name: &str) {
     }
 }
 
-/// `A | B` — a capability-mediated pipe (Appendix D.3). Either side may be a SERVICE or a
-/// shell BUILT-IN, so there are four shapes, all routed through real IPC endpoints (never a
-/// hidden shell buffer — §26.4 forbids silent data paths):
-///
-/// - `builtin | write <file>` — run the producer capturing its text, write it to the file.
-/// - `builtin | service`      — capture the producer, send it to the sink service's endpoint
-///   (resolved via the registry; the shell holds no ambient cap to it).
-/// - `service | write <file>` — spawn the producer wired to the SHELL's own endpoint, drain
-///   its stream (empty message = end), write it to the file. Producer must follow the EOF
-///   protocol (whitelisted, so a non-conforming service can't wedge the shell on `recv`).
-/// - `service | service`      — spawn the sink, then the producer with a delegated SEND cap to
-///   the sink (the original demo, `greet | upper`).
-fn cmd_pipe(ctx: &ServiceContext, cwd: &Cwd, producer: &str, sink: &str) {
-    if producer.is_empty() || sink.is_empty() {
-        ctx.console_writeln("usage: <producer> | <sink>");
-        return;
-    }
-    let (pcmd, _) = split_first(producer);
-    let (scmd, sarg) = split_first(sink);
-    let sink_is_write = scmd == "write";
+/// Maximum stages in one pipeline (§26.6 bounded).
+const MAX_STAGES: usize = 8;
 
-    if is_producer_builtin(pcmd) {
-        let mut cap = Cap::new();
-        run_producer(ctx, cwd, producer, &mut Out::Capture(&mut cap));
-        if cap.overflow {
-            ctx.console_writeln("pipe: producer output exceeded the pipe buffer (truncated)");
+/// `A | B | C | …` — a capability-mediated, multi-stage pipe (Appendix D.3, docs/pipes.md).
+/// The shell orchestrates a bounded buffer down the chain: **stage 1 produces**, **middle
+/// stages filter**, the **last stage sinks**. Every hop is real IPC or in-process capture —
+/// never a hidden shared buffer (§26.4). A stage is a built-in or a service; service stages
+/// exchange whole buffers (one ≤4 KiB message each way + an EOT marker), which keeps the
+/// bounded IPC queues deadlock-free (§8.9).
+fn cmd_pipe(ctx: &ServiceContext, cwd: &Cwd, line: &str) {
+    let mut stages: [&str; MAX_STAGES] = [""; MAX_STAGES];
+    let mut n = 0usize;
+    for part in line.split('|') {
+        let s = part.trim();
+        if s.is_empty() { ctx.console_writeln("usage: <producer> | <sink> [| …]"); return; }
+        if n >= MAX_STAGES {
+            ctx.console_writeln_fmt(format_args!("pipe: too many stages (max {})", MAX_STAGES));
+            return;
         }
-        if sink_is_write { pipe_write_file(ctx, cwd, sarg, cap.bytes()); }
-        else             { pipe_to_service(ctx, scmd, cap.bytes()); }
+        stages[n] = s;
+        n += 1;
+    }
+    if n < 2 { ctx.console_writeln("usage: <producer> | <sink> [| …]"); return; }
+
+    // Stage 1 produces into `buf`; each middle stage filters it; the last stage sinks it.
+    let mut buf = Cap::new();
+    if !stage_produce(ctx, cwd, stages[0], &mut buf) { return; }
+    for i in 1..n - 1 {
+        let mut next = Cap::new();
+        if !stage_filter(ctx, cwd, stages[i], buf.bytes(), &mut next) { return; }
+        buf = next;
+    }
+    stage_sink(ctx, cwd, stages[n - 1], buf.bytes());
+}
+
+/// Stage 1 — must PRODUCE (it has no input). A producer built-in is captured; a producer
+/// service (`greet`) is spawned wired to the shell and drained. Anything else can't start a
+/// pipe. Returns false (loudly) on error.
+fn stage_produce(ctx: &ServiceContext, cwd: &Cwd, stage: &str, out: &mut Cap) -> bool {
+    let (cmd, _) = split_first(stage);
+    if is_producer_builtin(cmd) {
+        run_producer(ctx, cwd, stage, &mut Out::Capture(out));
+        if out.overflow { ctx.console_writeln("pipe: producer output exceeded the pipe buffer (truncated)"); }
+        return true;
+    }
+    if is_pipe_producer_service(cmd) {
+        return drain_service(ctx, cmd, None, out);
+    }
+    ctx.console_writeln_fmt(format_args!("pipe: '{}' cannot start a pipe (it produces no output)", cmd));
+    false
+}
+
+/// A middle stage — must FILTER (consume input, emit output). A future filter built-in (e.g.
+/// `match`) would transform in-process here; today a service filter (`upper`) does the work
+/// via a round-trip. A producer built-in or `write` in the middle is a loud error.
+fn stage_filter(ctx: &ServiceContext, cwd: &Cwd, stage: &str, input: &[u8], out: &mut Cap) -> bool {
+    let (cmd, _) = split_first(stage);
+    let _ = cwd; // (a filter built-in like `match` would use cwd for its direct-file form)
+    if is_producer_builtin(cmd) || cmd == "write" {
+        ctx.console_writeln_fmt(format_args!("pipe: '{}' cannot be used mid-pipe (it is not a filter)", cmd));
+        return false;
+    }
+    drain_service(ctx, cmd, Some(input), out) // service filter (upper)
+}
+
+/// The last stage — consumes the final buffer. `write <file>` writes it; a service filters it
+/// and its output is printed; a producer built-in here is a loud error (it ignores input).
+fn stage_sink(ctx: &ServiceContext, cwd: &Cwd, stage: &str, input: &[u8]) {
+    let (cmd, arg) = split_first(stage);
+    if cmd == "write" { pipe_write_file(ctx, cwd, arg, input); return; }
+    if is_producer_builtin(cmd) {
+        ctx.console_writeln_fmt(format_args!("pipe: '{}' ignores piped input (it is a producer)", cmd));
         return;
     }
-    // Producer is a service.
-    if sink_is_write { pipe_service_to_file(ctx, cwd, producer, sarg); }
-    else             { pipe_service_to_service(ctx, producer, sink); }
+    // A service sink/filter: send it the input, drain its output, print the result.
+    let mut out = Cap::new();
+    if drain_service(ctx, cmd, Some(input), &mut out) {
+        ctx.console_write(str_of(out.bytes()));
+    }
+}
+
+/// Run a SERVICE stage. `input == None` → a producer (`greet`): spawn it wired to the shell
+/// and drain its output. `input == Some(bytes)` → a filter/sink (`upper`): also send it the
+/// input first (the whole buffer as one ≤4 KiB message + an EOT). Output is drained from the
+/// shell's endpoint until the service sends an EOT (0x04), then the service is reaped. Whole-
+/// buffer messaging (≤ one message each way) keeps the bounded queues deadlock-free (§8.9).
+fn drain_service(ctx: &ServiceContext, svc: &str, input: Option<&[u8]>, out: &mut Cap) -> bool {
+    // Wire the service to send its output to the SHELL's own endpoint.
+    if ctx.spawn_pipe(svc, "shell").is_err() {
+        ctx.console_writeln_fmt(format_args!("pipe: failed to spawn '{}'", svc));
+        return false;
+    }
+    if let Some(inp) = input {
+        // Filter/sink: resolve the service's input endpoint (it must register) and feed it.
+        match lookup_sink(ctx, svc) {
+            Some(h) => {
+                let _ = ctx.send_by_handle(h, &Message::from_bytes(inp));
+                let _ = ctx.send_by_handle(h, &Message::from_bytes(&[PIPE_EOT]));
+            }
+            None => {
+                ctx.console_writeln_fmt(format_args!("pipe: '{}' is not a filter (never registered)", svc));
+                let _ = ctx.kill(svc);
+                return false;
+            }
+        }
+    }
+    // Drain the service's output until EOT (bounded — a conforming service always sends it).
+    for _ in 0..512 {
+        let msg = ctx.recv();
+        let p = msg.payload_bytes();
+        if p == [PIPE_EOT] { break; }
+        out.push(p);
+        if out.overflow { break; }
+    }
+    let _ = ctx.kill(svc);
+    if out.overflow { ctx.console_writeln("pipe: pipe output exceeded the buffer (truncated)"); }
+    true
 }
 
 /// Split `s` into (first word, rest-trimmed).
@@ -995,9 +1079,9 @@ fn is_producer_builtin(name: &str) -> bool {
     matches!(name, "read" | "cat" | "echo" | "ls" | "tree" | "find")
 }
 
-/// Producer SERVICES that follow the pipe EOF protocol (send a zero-length message after
-/// their data). Only these may be drained by `service | write` — a non-conforming service
-/// would block the shell forever on `recv` (there is no non-blocking recv in v1).
+/// Producer SERVICES that emit without needing input, so they can start a pipe (and follow the
+/// EOT end-of-stream protocol). A non-producer service in stage 1 would block the shell on
+/// `recv` (there is no non-blocking recv in v1), so the set is an explicit whitelist.
 fn is_pipe_producer_service(name: &str) -> bool {
     matches!(name, "greet")
 }
@@ -1036,84 +1120,13 @@ fn pipe_write_file(ctx: &ServiceContext, cwd: &Cwd, path_arg: &str, data: &[u8])
     }
 }
 
-/// `builtin | service` — send captured producer text to a sink SERVICE: spawn it, find its
-/// endpoint via the registry (the shell holds no ambient cap to it), send the text line by
-/// line, then reap it so it can be re-spawned next time.
-fn pipe_to_service(ctx: &ServiceContext, sink: &str, data: &[u8]) {
-    if ctx.spawn(sink).is_err() {
-        ctx.console_writeln_fmt(format_args!("pipe: failed to spawn sink '{}'", sink));
-        return;
-    }
-    let handle = match lookup_sink(ctx, sink) {
-        Some(h) => h,
-        None => {
-            ctx.console_writeln_fmt(format_args!("pipe: sink '{}' never registered", sink));
-            let _ = ctx.kill(sink);
-            return;
-        }
-    };
-    let mut sent = 0u32;
-    for line in data.split(|&b| b == b'\n') {
-        if line.is_empty() { continue; }
-        let _ = ctx.send_by_handle(handle, &Message::from_bytes(line));
-        sent += 1;
-    }
-    // Let the sink drain + act before we reap it.
-    for _ in 0..4000 { ctx.yield_cpu(); }
-    let _ = ctx.kill(sink);
-    ctx.console_writeln_fmt(format_args!("piped {} line(s) → {}", sent, sink));
-}
-
-/// Look up a just-spawned sink's endpoint via the registry, retrying while it registers.
+/// Look up a just-spawned service's endpoint via the registry, retrying while it registers.
 fn lookup_sink(ctx: &ServiceContext, sink: &str) -> Option<CapHandle> {
     for _ in 0..200 {
         if let Some(h) = ctx.registry_lookup(sink) { return Some(h); }
         for _ in 0..50 { ctx.yield_cpu(); }
     }
     None
-}
-
-/// `service | write <file>` — spawn the producer wired to the SHELL's endpoint, drain its
-/// stream into a buffer (empty message = end-of-stream), then write it to the file.
-fn pipe_service_to_file(ctx: &ServiceContext, cwd: &Cwd, producer: &str, path_arg: &str) {
-    if !is_pipe_producer_service(producer) {
-        ctx.console_writeln_fmt(format_args!(
-            "pipe: '{}' is not a pipe producer (must send an EOF message)", producer));
-        return;
-    }
-    if ctx.spawn_pipe(producer, "shell").is_err() {
-        ctx.console_writeln_fmt(format_args!("pipe: failed to spawn producer '{}'", producer));
-        return;
-    }
-    let mut cap = Cap::new();
-    // Drain the producer's stream. Bounded: stop on the EOT (0x04) marker, on overflow, or
-    // after a fixed number of messages (a conforming producer always sends EOT to end).
-    for _ in 0..512 {
-        let msg = ctx.recv();
-        let p = msg.payload_bytes();
-        if p == [PIPE_EOT] { break; } // end-of-stream marker
-        cap.push(p);
-        cap.push(b"\n");
-        if cap.overflow { break; }
-    }
-    let _ = ctx.kill(producer);
-    if cap.overflow {
-        ctx.console_writeln("pipe: producer output exceeded the pipe buffer (truncated)");
-    }
-    pipe_write_file(ctx, cwd, path_arg, cap.bytes());
-}
-
-/// `service | service` — the original demo: spawn the sink, then the producer with a SEND cap
-/// to the sink's endpoint delegated to it (the producer holds no ambient authority).
-fn pipe_service_to_service(ctx: &ServiceContext, producer: &str, sink: &str) {
-    if ctx.spawn(sink).is_err() {
-        ctx.console_writeln("pipe: failed to spawn sink");
-        return;
-    }
-    match ctx.spawn_pipe(producer, sink) {
-        Ok(()) => ctx.console_writeln_fmt(format_args!("pipe wired: {} | {}", producer, sink)),
-        Err(_) => ctx.console_writeln("pipe: failed to spawn producer with delegated cap"),
-    }
 }
 
 fn cmd_kill(ctx: &ServiceContext, name: &str) {

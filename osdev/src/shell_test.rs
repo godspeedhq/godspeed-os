@@ -841,14 +841,14 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         Some(r) => check!(r.contains("/docs/inside.txt"), "pipe: find | write captured the matches"),
         None    => { println!("files-test: FAIL — read found.txt timeout"); fail += 1; }
     }
-    // builtin producer → service sink: echo's text through the `upper` filter service, which
-    // logs each line uppercased. Proves the shell brokers a cap to a service it doesn't contract.
+    // builtin producer → service filter (terminal): echo's text through `upper`, whose
+    // uppercased output the shell prints to the console (the pipe's final result).
     match run!(b"echo hello pipes | upper\r", 14) {
-        Some(r) => check!(r.contains("HELLO PIPES") && r.contains("piped"), "pipe: builtin | service (echo → upper → HELLO PIPES)"),
+        Some(r) => check!(r.contains("HELLO PIPES"), "pipe: builtin | service (echo → upper → HELLO PIPES)"),
         None    => { println!("files-test: FAIL — pipe echo|upper timeout"); fail += 1; }
     }
     // service producer → write-file sink: capture `greet`'s output to a file. The shell is the
-    // sink: it drains greet's stream (EOF = empty message) and writes it.
+    // sink: it drains greet's stream (EOT marker = end) and writes it.
     match run!(b"greet | write /greetout.txt\r", 14) {
         Some(r) => check!(r.contains("piped") && r.contains("greetout.txt"), "pipe: service | write file (greet → file)"),
         None    => { println!("files-test: FAIL — pipe greet|write timeout"); fail += 1; }
@@ -856,6 +856,26 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     match run!(b"read /greetout.txt\r", 10) {
         Some(r) => check!(r.contains("hello from godspeed"), "pipe: service | write captured greet's output"),
         None    => { println!("files-test: FAIL — read greetout timeout"); fail += 1; }
+    }
+    // ── multi-stage (3 stages): producer | filter | sink ───────────────────────────
+    // builtin producer → service filter → write sink: echo → upper → file.
+    match run!(b"echo lower text | upper | write /up.txt\r", 16) {
+        Some(r) => check!(r.contains("piped") && r.contains("up.txt"), "pipe: 3-stage echo | upper | write (wired)"),
+        None    => { println!("files-test: FAIL — 3-stage echo|upper|write timeout"); fail += 1; }
+    }
+    match run!(b"read /up.txt\r", 10) {
+        Some(r) => check!(r.contains("LOWER TEXT"), "pipe: 3-stage filtered through upper to file"),
+        None    => { println!("files-test: FAIL — read up.txt timeout"); fail += 1; }
+    }
+    // service producer → service filter → write sink: greet → upper → file.
+    match run!(b"greet | upper | write /gu.txt\r", 16) {
+        Some(r) => check!(r.contains("piped") && r.contains("gu.txt"), "pipe: 3-stage greet | upper | write (wired)"),
+        None    => { println!("files-test: FAIL — 3-stage greet|upper|write timeout"); fail += 1; }
+    }
+    match run!(b"read /gu.txt\r", 10) {
+        Some(r) => check!(r.contains("HELLO FROM GODSPEED") && r.contains("NO AMBIENT AUTHORITY HERE"),
+                          "pipe: 3-stage greet → upper → file (all lines uppercased)"),
+        None    => { println!("files-test: FAIL — read gu.txt timeout"); fail += 1; }
     }
 
     child.kill().ok();
