@@ -434,84 +434,83 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         _ => {}
     }
 
-    // Legacy dispatch — commands not yet converted to `Result`; treated as `Ok`.
-    match args[0] {
-        "help"    => cmd_help(ctx),
-        "clear"   => cmd_clear(ctx),
-        "echo"    => cmd_echo(ctx, strip_quotes(s["echo".len()..].trim()), &mut Out::Console),
-        "about"   => cmd_about(ctx),
-        "mem"     => cmd_mem(ctx),
-        "cores"   => cmd_cores(ctx),
-        "date"    => cmd_date(ctx, if argc >= 2 { args[1] } else { "" }),
-        "status"  => cmd_status(ctx),
+    // Dispatch. The file/storage commands return a real `Result` (Ok/Err); the trivial info
+    // commands that don't meaningfully fail are wrapped `Ok`; an unknown command is `Err`.
+    return match args[0] {
+        "help"    => { cmd_help(ctx); Ok(()) }
+        "clear"   => { cmd_clear(ctx); Ok(()) }
+        "echo"    => { cmd_echo(ctx, strip_quotes(s["echo".len()..].trim()), &mut Out::Console); Ok(()) }
+        "about"   => { cmd_about(ctx); Ok(()) }
+        "mem"     => { cmd_mem(ctx); Ok(()) }
+        "cores"   => { cmd_cores(ctx); Ok(()) }
+        "date"    => { cmd_date(ctx, if argc >= 2 { args[1] } else { "" }); Ok(()) }
+        "status"  => { cmd_status(ctx); Ok(()) }
         "observe" => {
-            if argc >= 2 && args[1] == "now" {
-                cmd_observe_now(ctx);
-            } else {
-                cmd_observe_live(ctx);
-            }
+            if argc >= 2 && args[1] == "now" { cmd_observe_now(ctx); } else { cmd_observe_live(ctx); }
+            Ok(())
         }
         "caps"    => {
             // No argument → show the shell's OWN capabilities (authority is
             // explicit; the shell can inspect itself like any other service).
-            if argc < 2 { cmd_caps(ctx, "shell"); }
-            else { cmd_caps(ctx, args[1]); }
+            if argc < 2 { cmd_caps(ctx, "shell"); } else { cmd_caps(ctx, args[1]); }
+            Ok(())
         }
+        // service-control + drives: not yet on Result (their internals still print-and-return);
+        // a missing arg is a usage Err, the action itself is Ok-wrapped for now.
         "spawn"   => {
-            if argc < 2 { ctx.console_writeln("usage: spawn <name>"); }
-            else { cmd_spawn(ctx, args[1]); }
+            if argc < 2 { ctx.console_writeln("usage: spawn <name>"); Err(ShellError::Unknown) }
+            else { cmd_spawn(ctx, args[1]); Ok(()) }
         }
         "kill"    => {
-            if argc < 2 { ctx.console_writeln("usage: kill <name>"); }
-            else { cmd_kill(ctx, args[1]); }
+            if argc < 2 { ctx.console_writeln("usage: kill <name>"); Err(ShellError::Unknown) }
+            else { cmd_kill(ctx, args[1]); Ok(()) }
         }
         "restart" => {
-            if argc < 2 { ctx.console_writeln("usage: restart <name> [core]"); }
+            if argc < 2 { ctx.console_writeln("usage: restart <name> [core]"); Err(ShellError::Unknown) }
             else {
                 let core = if argc >= 3 { parse_u32(args[2]) } else { None };
-                cmd_restart(ctx, args[1], core);
+                cmd_restart(ctx, args[1], core); Ok(())
             }
         }
-        "reboot"  => cmd_reboot(ctx),
-        "drives"  => cmd_drives(ctx, &args, argc),
+        "reboot"  => { cmd_reboot(ctx); Ok(()) }
+        "drives"  => { cmd_drives(ctx, &args, argc); Ok(()) }
+        // ── file/storage commands — converted to the Result model ──
+        // ("read" and "result" are on the Result model above, not here.)
         "ls"      => cmd_ls(ctx, cwd, if argc >= 2 { args[1] } else { "" }, &mut Out::Console),
-        // "read" and "result" are handled above on the Result model (not here).
         "write"   => cmd_write(ctx, cwd, s["write".len()..].trim()),
         "mkdir"   => {
-            // `mkdir <path>` or `mkdir <path> parents` (create missing parent dirs).
-            if argc < 2 { ctx.console_writeln("usage: mkdir <path> [parents]"); }
-            else { cmd_mkdir(ctx, cwd, args[1], argc >= 3 && args[2] == "parents"); }
+            if argc < 2 { ctx.console_writeln("usage: mkdir <path> [parents]"); Err(ShellError::Unknown) }
+            else { cmd_mkdir(ctx, cwd, args[1], argc >= 3 && args[2] == "parents") }
         }
         "cd"      => cmd_cd(ctx, cwd, if argc >= 2 { args[1] } else { "/" }),
         "copy"    => {
-            // `copy <src> <dst>` (file) or `copy <src> <dst> recursive` (whole subtree).
-            if argc < 3 { ctx.console_writeln("usage: copy <src> <dst> [recursive]"); }
-            else if argc >= 4 && args[3] == "recursive" { cmd_copy_tree(ctx, cwd, args[1], args[2]); }
-            else { cmd_copy(ctx, cwd, args[1], args[2]); }
+            if argc < 3 { ctx.console_writeln("usage: copy <src> <dst> [recursive]"); Err(ShellError::Unknown) }
+            else if argc >= 4 && args[3] == "recursive" { cmd_copy_tree(ctx, cwd, args[1], args[2]) }
+            else { cmd_copy(ctx, cwd, args[1], args[2]) }
         }
         "rename"  => {
-            if argc < 3 { ctx.console_writeln("usage: rename <path> <newname>"); }
-            else { cmd_rename(ctx, cwd, args[1], args[2]); }
+            if argc < 3 { ctx.console_writeln("usage: rename <path> <newname>"); Err(ShellError::Unknown) }
+            else { cmd_rename(ctx, cwd, args[1], args[2]) }
         }
         "delete"  => {
-            // `delete <path>` (file/empty dir) or `delete <path> recursive` (whole subtree).
-            if argc < 2 { ctx.console_writeln("usage: delete <path> [recursive]"); }
-            else { cmd_delete(ctx, cwd, args[1], argc >= 3 && args[2] == "recursive"); }
+            if argc < 2 { ctx.console_writeln("usage: delete <path> [recursive]"); Err(ShellError::Unknown) }
+            else { cmd_delete(ctx, cwd, args[1], argc >= 3 && args[2] == "recursive") }
         }
         "move"    => {
-            if argc < 3 { ctx.console_writeln("usage: move <src> <dst>"); }
-            else { cmd_move(ctx, cwd, args[1], args[2]); }
+            if argc < 3 { ctx.console_writeln("usage: move <src> <dst>"); Err(ShellError::Unknown) }
+            else { cmd_move(ctx, cwd, args[1], args[2]) }
         }
         "find"    => {
-            if argc < 2 { ctx.console_writeln("usage: find <name> [path]"); }
-            else { cmd_find(ctx, cwd, args[1], if argc >= 3 { args[2] } else { "/" }, &mut Out::Console); }
+            if argc < 2 { ctx.console_writeln("usage: find <name> [path]"); Err(ShellError::Unknown) }
+            else { cmd_find(ctx, cwd, args[1], if argc >= 3 { args[2] } else { "/" }, &mut Out::Console) }
         }
         "tree"    => cmd_tree(ctx, cwd, if argc >= 2 { args[1] } else { "" }, &mut Out::Console),
-        "match"   => cmd_match(ctx, cwd, &args, argc),
-        "count"   => cmd_count(ctx, cwd, &args, argc),
-        "sort"    => cmd_sort(ctx, cwd, &args, argc),
-        "first"   => cmd_take(ctx, cwd, &args, argc, false),
-        "last"    => cmd_take(ctx, cwd, &args, argc, true),
+        // filter built-ins (direct form) — not yet on Result; Ok-wrapped.
+        "match"   => { cmd_match(ctx, cwd, &args, argc); Ok(()) }
+        "count"   => { cmd_count(ctx, cwd, &args, argc); Ok(()) }
+        "sort"    => { cmd_sort(ctx, cwd, &args, argc); Ok(()) }
+        "first"   => { cmd_take(ctx, cwd, &args, argc, false); Ok(()) }
+        "last"    => { cmd_take(ctx, cwd, &args, argc, true); Ok(()) }
         other => {
             // Build "unknown: <cmd>" in a stack buffer to avoid two ctx.log calls
             let mut buf = [0u8; 64];
@@ -519,10 +518,9 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
             write_bytes(&mut buf, &mut pos, b"unknown: ");
             write_bytes(&mut buf, &mut pos, other.as_bytes());
             ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("unknown cmd"));
+            Err(ShellError::Unknown) // an unknown command is a failure (so `assert fails …` holds)
         }
-    }
-    // Legacy commands above don't report failure yet — treated as Ok until converted.
-    Ok(())
+    };
 }
 
 /// `result` — print the previous command's result in Rust's `Result` shape: `Ok` on success,
@@ -1874,7 +1872,7 @@ fn run_producer(ctx: &ServiceContext, cwd: &Cwd, cmdline: &str, out: &mut Out) {
         "echo"         => cmd_echo(ctx, arg, out),
         "read" | "cat" => { let _ = cmd_read(ctx, cwd, arg, out); }
         // "ls" and "find" are record producers (handled on the record path), not text here.
-        "tree"         => cmd_tree(ctx, cwd, arg, out),
+        "tree"         => { let _ = cmd_tree(ctx, cwd, arg, out); }
         _ => {}
     }
 }
@@ -2071,18 +2069,18 @@ fn no_fs(ctx: &ServiceContext, p: &[u8]) -> bool {
 }
 
 /// `ls [path]` — list a directory.
-fn cmd_ls(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) {
+fn cmd_ls(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
-    let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return };
+    let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let reply = match fs_request(ctx, OP_LIST_DIR, path, &[]) {
         Some(r) => r,
-        None => { ctx.console_writeln("ls: storage unavailable"); return; }
+        None => { ctx.console_writeln("ls: storage unavailable"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return; }
+    if no_fs(ctx, p) { return Err(ShellError::Unknown); }
     if p.first() == Some(&FS_NOTFOUND) || p.len() < 2 {
         ctx.console_writeln_fmt(format_args!("ls: not a directory: {}", str_of(path)));
-        return;
+        return Err(ShellError::FileNotFound);
     }
     let count = p[1] as usize;
     out.line_fmt(ctx, format_args!("{}  ({} entries)", str_of(path), count));
@@ -2104,6 +2102,7 @@ fn cmd_ls(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) {
         }
     }
     if count == 0 { out.line(ctx, "  (empty)"); }
+    Ok(())
 }
 
 /// `read <path>` — print a file's contents. The first command on the Ok/Err `Result` model:
@@ -2135,7 +2134,7 @@ fn cmd_read(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result
 /// `write <path> [content]` overwrites; `write append <path> [content]` appends (creating the
 /// file if missing). `append` is a *leading* keyword because write's content is free-form — it
 /// can't trail the way `mkdir … parents` does (it would be swallowed as content).
-fn cmd_write(ctx: &ServiceContext, cwd: &Cwd, rest: &str) {
+fn cmd_write(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
     // `append` counts as the keyword only when followed by whitespace or end-of-line, so a
     // path like "appendix.txt" is still treated as a path.
     let (append, rest) = match rest.strip_prefix("append") {
@@ -2144,7 +2143,7 @@ fn cmd_write(ctx: &ServiceContext, cwd: &Cwd, rest: &str) {
     };
     if rest.is_empty() {
         ctx.console_writeln("usage: write [append] <path> [content]");
-        return;
+        return Err(ShellError::Unknown);
     }
     // Split off the first token (path); the remainder (with spaces) is the content. A
     // surrounding quote pair around the content is stripped (`write /f "two words"`).
@@ -2153,38 +2152,39 @@ fn cmd_write(ctx: &ServiceContext, cwd: &Cwd, rest: &str) {
         None => (rest, ""),
     };
     let mut buf = [0u8; PATH_MAX];
-    let path = match resolve_or_err(ctx, cwd, pstr, &mut buf) { Some(p) => p, None => return };
+    let path = match resolve_or_err(ctx, cwd, pstr, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     // Copy the path out before reusing buffers (path borrows `buf`).
     let mut pbuf = [0u8; PATH_MAX];
     let pl = path.len();
     pbuf[..pl].copy_from_slice(path);
     if append {
-        cmd_write_append(ctx, &pbuf[..pl], content.as_bytes());
-        return;
+        return cmd_write_append(ctx, &pbuf[..pl], content.as_bytes());
     }
     let reply = match fs_request(ctx, OP_WRITE_FILE, &pbuf[..pl], content.as_bytes()) {
         Some(r) => r,
-        None => { ctx.console_writeln("write: storage unavailable"); return; }
+        None => { ctx.console_writeln("write: storage unavailable"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return; }
+    if no_fs(ctx, p) { return Err(ShellError::Unknown); }
     if p.first() == Some(&FS_OK) {
         ctx.console_writeln_fmt(format_args!("wrote {} ({} bytes)", str_of(&pbuf[..pl]), content.len()));
+        Ok(())
     } else {
         ctx.console_writeln("write: failed (bad path, or parent missing?)");
+        Err(ShellError::Unknown)
     }
 }
 
 /// Append `add` to file `path`, creating it if missing. Shell-side (no new fs surface): read
 /// the current content, concatenate, write the whole file back. The combined size is bounded
 /// by `fs`'s file-size limit, which rejects an over-large WriteFile loudly.
-fn cmd_write_append(ctx: &ServiceContext, path: &[u8], add: &[u8]) {
+fn cmd_write_append(ctx: &ServiceContext, path: &[u8], add: &[u8]) -> Result<(), ShellError> {
     let mut data = [0u8; 4096];
     // Read existing content; an absent file just starts empty (append creates).
     let n_old = match fs_request(ctx, OP_READ_FILE, path, &[]) {
         Some(r) => {
             let p = r.payload_bytes();
-            if no_fs(ctx, p) { return; }
+            if no_fs(ctx, p) { return Err(ShellError::Unknown); }
             if p.first() == Some(&FS_OK) && p.len() >= 5 {
                 let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
                 let end = (5 + n).min(p.len());
@@ -2194,45 +2194,50 @@ fn cmd_write_append(ctx: &ServiceContext, path: &[u8], add: &[u8]) {
                 0 // NOTFOUND → create a new file with just the appended text
             }
         }
-        None => { ctx.console_writeln("write: storage unavailable"); return; }
+        None => { ctx.console_writeln("write: storage unavailable"); return Err(ShellError::Unknown); }
     };
     if n_old + add.len() > data.len() {
         ctx.console_writeln("write: append would exceed the maximum file size");
-        return;
+        return Err(ShellError::Unknown);
     }
     data[n_old..n_old + add.len()].copy_from_slice(add);
     let total = n_old + add.len();
     match fs_request(ctx, OP_WRITE_FILE, path, &data[..total]) {
-        Some(r) if r.payload_bytes().first() == Some(&FS_OK) =>
-            ctx.console_writeln_fmt(format_args!("appended {} bytes to {} ({} total)", add.len(), str_of(path), total)),
-        Some(r) if no_fs(ctx, r.payload_bytes()) => {}
-        Some(_) => ctx.console_writeln("write: append failed (file-size limit, or bad path?)"),
-        None    => ctx.console_writeln("write: storage unavailable"),
+        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
+            ctx.console_writeln_fmt(format_args!("appended {} bytes to {} ({} total)", add.len(), str_of(path), total));
+            Ok(())
+        }
+        Some(r) if no_fs(ctx, r.payload_bytes()) => Err(ShellError::Unknown),
+        Some(_) => { ctx.console_writeln("write: append failed (file-size limit, or bad path?)"); Err(ShellError::Unknown) }
+        None    => { ctx.console_writeln("write: storage unavailable"); Err(ShellError::Unknown) }
     }
 }
 
 /// `mkdir <path> [parents]` — create a directory (with `parents`, create missing parents).
-fn cmd_mkdir(ctx: &ServiceContext, cwd: &Cwd, arg: &str, parents: bool) {
+fn cmd_mkdir(ctx: &ServiceContext, cwd: &Cwd, arg: &str, parents: bool) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
-    let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return };
+    let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let op = if parents { OP_MKDIR_P } else { OP_MKDIR };
     let reply = match fs_request(ctx, op, path, &[]) {
         Some(r) => r,
-        None => { ctx.console_writeln("mkdir: storage unavailable"); return; }
+        None => { ctx.console_writeln("mkdir: storage unavailable"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return; }
+    if no_fs(ctx, p) { return Err(ShellError::Unknown); }
     if p.first() == Some(&FS_OK) {
         ctx.console_writeln_fmt(format_args!("created {}", str_of(path)));
+        Ok(())
     } else if parents {
         ctx.console_writeln("mkdir: failed (a component is in the way as a file?)");
+        Err(ShellError::Unknown)
     } else {
         ctx.console_writeln("mkdir: failed (already exists, or parent missing? try 'mkdir <path> parents')");
+        Err(ShellError::Unknown)
     }
 }
 
 /// `cd [path]` — change the current directory (validates it exists + is a directory).
-fn cmd_cd(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str) {
+fn cmd_cd(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     // `cd -` toggles to the previous directory (already an absolute, normalized path — use it
     // directly, then run the same stat-validated switch so a since-deleted dir errors loudly).
@@ -2241,51 +2246,54 @@ fn cmd_cd(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str) {
         buf[..pl].copy_from_slice(&cwd.prev[..pl]);
         &buf[..pl]
     } else {
-        match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return }
+        match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) }
     };
     // Root always exists — no need to stat it.
     if path == b"/" {
         cwd.set(b"/");
         ctx.console_writeln("/");
-        return;
+        return Ok(());
     }
     let reply = match fs_request(ctx, OP_STAT_FILE, path, &[]) {
         Some(r) => r,
-        None => { ctx.console_writeln("cd: storage unavailable"); return; }
+        None => { ctx.console_writeln("cd: storage unavailable"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return; }
+    if no_fs(ctx, p) { return Err(ShellError::Unknown); }
     // STAT reply: [FS_OK, exists, size:u64, is_dir].
     if p.first() == Some(&FS_OK) && p.len() >= 11 && p[1] == 1 {
         if p[10] == 1 {
             cwd.set(path);
             ctx.console_writeln(cwd.as_str());
+            Ok(())
         } else {
             ctx.console_writeln_fmt(format_args!("cd: not a directory: {}", str_of(path)));
+            Err(ShellError::Unknown)
         }
     } else {
         ctx.console_writeln_fmt(format_args!("cd: no such directory: {}", str_of(path)));
+        Err(ShellError::FileNotFound)
     }
 }
 
 /// `copy <src> <dst>` — copy a file (read src, write dst). Shell-side, so it carries the
 /// content through one message-sized buffer; file-only in this cut (no recursive dirs).
-fn cmd_copy(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) {
+fn cmd_copy(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) -> Result<(), ShellError> {
     // Resolve + read the source.
     let mut sbuf = [0u8; PATH_MAX];
-    let spath = match resolve_or_err(ctx, cwd, src, &mut sbuf) { Some(p) => p, None => return };
+    let spath = match resolve_or_err(ctx, cwd, src, &mut sbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let mut sp = [0u8; PATH_MAX];
     let sl = spath.len();
     sp[..sl].copy_from_slice(spath);
     let reply = match fs_request(ctx, OP_READ_FILE, &sp[..sl], &[]) {
         Some(r) => r,
-        None => { ctx.console_writeln("copy: storage unavailable"); return; }
+        None => { ctx.console_writeln("copy: storage unavailable"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return; }
+    if no_fs(ctx, p) { return Err(ShellError::Unknown); }
     if p.first() != Some(&FS_OK) || p.len() < 5 {
         ctx.console_writeln_fmt(format_args!("copy: source not found: {}", str_of(&sp[..sl])));
-        return;
+        return Err(ShellError::FileNotFound);
     }
     let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
     let end = (5 + n).min(p.len());
@@ -2296,16 +2304,17 @@ fn cmd_copy(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) {
 
     // Resolve + write the destination.
     let mut dbuf = [0u8; PATH_MAX];
-    let dpath = match resolve_or_err(ctx, cwd, dst, &mut dbuf) { Some(p) => p, None => return };
+    let dpath = match resolve_or_err(ctx, cwd, dst, &mut dbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let mut dp = [0u8; PATH_MAX];
     let dl = dpath.len();
     dp[..dl].copy_from_slice(dpath);
     match fs_request(ctx, OP_WRITE_FILE, &dp[..dl], &data[..dn]) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
             ctx.console_writeln_fmt(format_args!("copied {} → {} ({} bytes)", str_of(&sp[..sl]), str_of(&dp[..dl]), dn));
+            Ok(())
         }
-        Some(_) => ctx.console_writeln("copy: write failed (parent missing?)"),
-        None    => ctx.console_writeln("copy: storage unavailable"),
+        Some(_) => { ctx.console_writeln("copy: write failed (parent missing?)"); Err(ShellError::Unknown) }
+        None    => { ctx.console_writeln("copy: storage unavailable"); Err(ShellError::Unknown) }
     }
 }
 
@@ -2314,36 +2323,36 @@ fn cmd_copy(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) {
 /// each child either copy the file (read+write, existing ops) or push the subdir. No new fs
 /// surface — copy already lives in the shell. Loud if the tree is wider than the walk's cap
 /// (§3.12), and refuses to copy a directory into its own subtree (would never terminate).
-fn cmd_copy_tree(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) {
+fn cmd_copy_tree(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) -> Result<(), ShellError> {
     let mut sbuf = [0u8; PATH_MAX];
-    let src_abs = match resolve_or_err(ctx, cwd, src, &mut sbuf) { Some(p) => p, None => return };
+    let src_abs = match resolve_or_err(ctx, cwd, src, &mut sbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let mut sp = [0u8; PATH_MAX];
     let sl = src_abs.len();
     sp[..sl].copy_from_slice(src_abs);
-    if &sp[..sl] == b"/" { ctx.console_writeln("copy: cannot copy the root directory"); return; }
+    if &sp[..sl] == b"/" { ctx.console_writeln("copy: cannot copy the root directory"); return Err(ShellError::Unknown); }
 
     let mut dbuf = [0u8; PATH_MAX];
-    let dst_abs = match resolve_or_err(ctx, cwd, dst, &mut dbuf) { Some(p) => p, None => return };
+    let dst_abs = match resolve_or_err(ctx, cwd, dst, &mut dbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let mut dp = [0u8; PATH_MAX];
     let dl = dst_abs.len();
     dp[..dl].copy_from_slice(dst_abs);
     // Dest inside src (or equal) → the walk would copy what it just created, forever.
     if dp[..dl] == sp[..sl] || (dl > sl && dp[..sl] == sp[..sl] && dp[sl] == b'/') {
         ctx.console_writeln("copy: cannot copy into itself");
-        return;
+        return Err(ShellError::Unknown);
     }
 
     // A plain file? Fall back to the single-file copy (this command is for subtrees).
     match stat_kind(ctx, &sp[..sl]) {
-        Some(false) => { cmd_copy(ctx, cwd, src, dst); return; }
+        Some(false) => { return cmd_copy(ctx, cwd, src, dst); }
         Some(true)  => {}
-        None        => { ctx.console_writeln_fmt(format_args!("copy: source not found: {}", str_of(&sp[..sl]))); return; }
+        None        => { ctx.console_writeln_fmt(format_args!("copy: source not found: {}", str_of(&sp[..sl]))); return Err(ShellError::FileNotFound); }
     }
 
     // Create the destination root, then walk the source breadth-first.
     if !mkdir_at(ctx, &dp[..dl]) {
         ctx.console_writeln("copy: cannot create destination (already exists?)");
-        return;
+        return Err(ShellError::Unknown);
     }
     let mut stack = PathStack::new();
     stack.push(&sp[..sl]);
@@ -2352,10 +2361,10 @@ fn cmd_copy_tree(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) {
     while let Some(slen) = stack.pop(&mut sbuf) {
         let reply = match fs_request(ctx, OP_LIST_DIR, &sbuf[..slen], &[]) {
             Some(r) => r,
-            None => { ctx.console_writeln("copy: storage unavailable"); return; }
+            None => { ctx.console_writeln("copy: storage unavailable"); return Err(ShellError::Unknown); }
         };
         let p = reply.payload_bytes();
-        if no_fs(ctx, p) { return; }
+        if no_fs(ctx, p) { return Err(ShellError::Unknown); }
         if p.first() != Some(&FS_OK) || p.len() < 2 { continue; }
         let count = p[1] as usize;
         let mut i = 2usize;
@@ -2385,6 +2394,7 @@ fn cmd_copy_tree(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) {
     }
     ctx.console_writeln_fmt(format_args!(
         "copied {} → {} ({} dirs, {} files)", str_of(&sp[..sl]), str_of(&dp[..dl]), dirs, files));
+    Ok(())
 }
 
 /// Stat a path: `Some(is_dir)` if it exists, `None` if not (or storage is down).
@@ -2431,9 +2441,9 @@ fn remap(dst_root: &[u8], src_root: &[u8], s: &[u8], out: &mut [u8; PATH_MAX]) -
 
 /// `rename <path> <newname>` — rename an entry in place (not a move; newname is one
 /// component). fs edits the directory entry; no blocks are read or freed.
-fn cmd_rename(ctx: &ServiceContext, cwd: &Cwd, path: &str, newname: &str) {
+fn cmd_rename(ctx: &ServiceContext, cwd: &Cwd, path: &str, newname: &str) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
-    let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return };
+    let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let mut pp = [0u8; PATH_MAX];
     let pl = abspath.len();
     pp[..pl].copy_from_slice(abspath);
@@ -2441,22 +2451,23 @@ fn cmd_rename(ctx: &ServiceContext, cwd: &Cwd, path: &str, newname: &str) {
     match fs_request(ctx, OP_RENAME, &pp[..pl], newname.as_bytes()) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
             ctx.console_writeln_fmt(format_args!("renamed {} → {}", str_of(&pp[..pl]), newname));
+            Ok(())
         }
-        Some(r) if no_fs(ctx, r.payload_bytes()) => {}
-        Some(_) => ctx.console_writeln("rename: failed (not found, or name exists, or bad name)"),
-        None    => ctx.console_writeln("rename: storage unavailable"),
+        Some(r) if no_fs(ctx, r.payload_bytes()) => Err(ShellError::Unknown),
+        Some(_) => { ctx.console_writeln("rename: failed (not found, or name exists, or bad name)"); Err(ShellError::Unknown) }
+        None    => { ctx.console_writeln("rename: storage unavailable"); Err(ShellError::Unknown) }
     }
 }
 
 /// `delete <path>` — remove a file or empty directory; `delete <path> recursive` removes a
 /// whole subtree. fs does the work either way (plain = `OP_DELETE`, recursive =
 /// `OP_DELETE_TREE`, a depth-bounded subtree free); it frees the blocks and reclaims them.
-fn cmd_delete(ctx: &ServiceContext, cwd: &Cwd, arg: &str, recursive: bool) {
+fn cmd_delete(ctx: &ServiceContext, cwd: &Cwd, arg: &str, recursive: bool) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
-    let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return };
+    let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     if path == b"/" {
         ctx.console_writeln("delete: cannot delete the root directory");
-        return;
+        return Err(ShellError::Unknown);
     }
     let mut pp = [0u8; PATH_MAX];
     let pl = path.len();
@@ -2466,38 +2477,40 @@ fn cmd_delete(ctx: &ServiceContext, cwd: &Cwd, arg: &str, recursive: bool) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
             let what = if recursive { "deleted (recursive)" } else { "deleted" };
             ctx.console_writeln_fmt(format_args!("{} {}", what, str_of(&pp[..pl])));
+            Ok(())
         }
-        Some(r) if no_fs(ctx, r.payload_bytes()) => {}
-        Some(_) if recursive => ctx.console_writeln("delete: failed (not found, or tree too deep?)"),
-        Some(_) => ctx.console_writeln("delete: failed (not found, or directory not empty? use 'delete <path> recursive')"),
-        None    => ctx.console_writeln("delete: storage unavailable"),
+        Some(r) if no_fs(ctx, r.payload_bytes()) => Err(ShellError::Unknown),
+        Some(_) if recursive => { ctx.console_writeln("delete: failed (not found, or tree too deep?)"); Err(ShellError::Unknown) }
+        Some(_) => { ctx.console_writeln("delete: failed (not found, or directory not empty? use 'delete <path> recursive')"); Err(ShellError::Unknown) }
+        None    => { ctx.console_writeln("delete: storage unavailable"); Err(ShellError::Unknown) }
     }
 }
 
 /// `move <src> <dst>` — relocate an entry (same data; only the directory entries change).
-fn cmd_move(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) {
+fn cmd_move(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) -> Result<(), ShellError> {
     let mut sbuf = [0u8; PATH_MAX];
-    let spath = match resolve_or_err(ctx, cwd, src, &mut sbuf) { Some(p) => p, None => return };
+    let spath = match resolve_or_err(ctx, cwd, src, &mut sbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let mut sp = [0u8; PATH_MAX];
     let sl = spath.len();
     sp[..sl].copy_from_slice(spath);
     let mut dbuf = [0u8; PATH_MAX];
-    let dpath = match resolve_or_err(ctx, cwd, dst, &mut dbuf) { Some(p) => p, None => return };
+    let dpath = match resolve_or_err(ctx, cwd, dst, &mut dbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let mut dp = [0u8; PATH_MAX];
     let dl = dpath.len();
     dp[..dl].copy_from_slice(dpath);
     // Guard against moving a directory into itself or its own subtree (would orphan it).
     if dp[..dl] == sp[..sl] || (dl > sl && dp[..sl] == sp[..sl] && dp[sl] == b'/') {
         ctx.console_writeln("move: cannot move into itself");
-        return;
+        return Err(ShellError::Unknown);
     }
     match fs_request(ctx, OP_MOVE, &sp[..sl], &dp[..dl]) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
             ctx.console_writeln_fmt(format_args!("moved {} → {}", str_of(&sp[..sl]), str_of(&dp[..dl])));
+            Ok(())
         }
-        Some(r) if no_fs(ctx, r.payload_bytes()) => {}
-        Some(_) => ctx.console_writeln("move: failed (not found, or dest exists?)"),
-        None    => ctx.console_writeln("move: storage unavailable"),
+        Some(r) if no_fs(ctx, r.payload_bytes()) => Err(ShellError::Unknown),
+        Some(_) => { ctx.console_writeln("move: failed (not found, or dest exists?)"); Err(ShellError::Unknown) }
+        None    => { ctx.console_writeln("move: storage unavailable"); Err(ShellError::Unknown) }
     }
 }
 
@@ -2509,9 +2522,9 @@ fn cmd_move(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) {
 /// is bounded (a fixed pending-directory stack) and **loud on truncation** (§26.6/§3.12);
 /// the `fs_index` accelerator (persistence.md §6.5) is what we'd build if this walk ever
 /// gets too slow on a huge tree — not before.
-fn cmd_find(ctx: &ServiceContext, cwd: &Cwd, target: &str, start: &str, out: &mut Out) {
+fn cmd_find(ctx: &ServiceContext, cwd: &Cwd, target: &str, start: &str, out: &mut Out) -> Result<(), ShellError> {
     let mut sbuf = [0u8; PATH_MAX];
-    let start_abs = match resolve_or_err(ctx, cwd, start, &mut sbuf) { Some(p) => p, None => return };
+    let start_abs = match resolve_or_err(ctx, cwd, start, &mut sbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let mut stack = PathStack::new();
     stack.push(start_abs);
 
@@ -2524,10 +2537,10 @@ fn cmd_find(ctx: &ServiceContext, cwd: &Cwd, target: &str, start: &str, out: &mu
     while let Some(dlen) = stack.pop(&mut dir) {
         let reply = match fs_request(ctx, OP_LIST_DIR, &dir[..dlen], &[]) {
             Some(r) => r,
-            None => { ctx.console_writeln("find: storage unavailable"); return; }
+            None => { ctx.console_writeln("find: storage unavailable"); return Err(ShellError::Unknown); }
         };
         let p = reply.payload_bytes();
-        if no_fs(ctx, p) { return; }
+        if no_fs(ctx, p) { return Err(ShellError::Unknown); }
         if p.first() != Some(&FS_OK) || p.len() < 2 { continue; }
         let count = p[1] as usize;
         let mut i = 2usize;
@@ -2558,6 +2571,7 @@ fn cmd_find(ctx: &ServiceContext, cwd: &Cwd, target: &str, start: &str, out: &mu
             "find: search truncated — more than {} directories pending (bounded walk)", FIND_QCAP));
     }
     ctx.console_writeln_fmt(format_args!("find: {} match(es)", matches));
+    Ok(()) // a search that finds nothing still succeeded (0 matches is not an error)
 }
 
 /// `tree [path]` — print the directory hierarchy as an indented tree (default: the current
@@ -2566,13 +2580,13 @@ fn cmd_find(ctx: &ServiceContext, cwd: &Cwd, target: &str, start: &str, out: &mu
 /// pushed so siblings nest correctly, and a directory's whole subtree drains before its next
 /// sibling (LIFO + reverse-push). ASCII only (2 spaces per level, `/` marks directories) —
 /// the framebuffer console renders no box-drawing glyphs.
-fn cmd_tree(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) {
+fn cmd_tree(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
-    let start = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return };
+    let start = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     match stat_kind(ctx, start) {
         Some(true)  => {}
-        Some(false) => { out.line(ctx, str_of(start)); out.line(ctx, "0 directories, 1 file"); return; }
-        None        => { ctx.console_writeln_fmt(format_args!("tree: not found: {}", str_of(start))); return; }
+        Some(false) => { out.line(ctx, str_of(start)); out.line(ctx, "0 directories, 1 file"); return Ok(()); }
+        None        => { ctx.console_writeln_fmt(format_args!("tree: not found: {}", str_of(start))); return Err(ShellError::FileNotFound); }
     }
     let mut stack = TreeStack::new();
     stack.push(start, true, 0);
@@ -2589,10 +2603,10 @@ fn cmd_tree(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) {
 
         let reply = match fs_request(ctx, OP_LIST_DIR, &buf[..plen], &[]) {
             Some(r) => r,
-            None => { ctx.console_writeln("tree: storage unavailable"); return; }
+            None => { ctx.console_writeln("tree: storage unavailable"); return Err(ShellError::Unknown); }
         };
         let p = reply.payload_bytes();
-        if no_fs(ctx, p) { return; }
+        if no_fs(ctx, p) { return Err(ShellError::Unknown); }
         if p.first() != Some(&FS_OK) || p.len() < 2 { continue; }
         // Record each child's offset, then push in REVERSE so they pop in directory order.
         let count = p[1] as usize;
@@ -2625,6 +2639,7 @@ fn cmd_tree(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) {
     out.line_fmt(ctx, format_args!(
         "{} director{}, {} file{}",
         dirs, if dirs == 1 { "y" } else { "ies" }, files, if files == 1 { "" } else { "s" }));
+    Ok(())
 }
 
 /// Last path component (`/a/b/c` → `c`); the whole path if it has no `/`.
