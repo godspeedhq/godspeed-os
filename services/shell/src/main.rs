@@ -708,8 +708,10 @@ fn cmd_help(ctx: &ServiceContext) {
     help_line(ctx, "  e.g. greet | upper | write /g", "producer | filter | sink");
     ctx.console_writeln("");
     ctx.console_writeln("Records (typed pipes — docs/records.md)");
-    help_line(ctx, "status | where <col> <op> <val>", "filter the task table by field");
-    help_line(ctx, "status | to json", "render the table as JSON");
+    help_line(ctx, "status | where mem>0", "filter the task table by field (=,!=,>,<,~)");
+    help_line(ctx, "status | select name state", "keep only some columns");
+    help_line(ctx, "status | sort mem [reverse]", "order rows by a column");
+    help_line(ctx, "status | to json | to yaml", "render the table (default: a grid)");
     ctx.console_writeln("");
     ctx.console_writeln("Power");
     help_line(ctx, "reboot", "hardware reset");
@@ -996,6 +998,86 @@ fn row_matches(t: &Table, r: usize, ci: usize, op: &str, val: &str) -> bool {
     }
 }
 
+/// Parse a compact predicate token `col<op>val` (e.g. `mem>0`, `state=BlockRecv`, `name!=x`).
+/// The operator is the longest match (two-char `!=`/`>=`/`<=`/`==` before single `=`/`>`/`<`/
+/// `~`); everything before it is the column, everything after the value. `None` if no operator.
+fn parse_predicate(tok: &str) -> Option<(&str, &str, &str)> {
+    for op in ["!=", ">=", "<=", "=="] {
+        if let Some(i) = tok.find(op) { return Some((&tok[..i], op, &tok[i + op.len()..])); }
+    }
+    for op in ["=", ">", "<", "~"] {
+        if let Some(i) = tok.find(op) { return Some((&tok[..i], &tok[i..i + 1], &tok[i + 1..])); }
+    }
+    None
+}
+
+/// `select <col…>` — keep only the named columns, in the given order. Returns false (loudly) on
+/// an unknown column. Rows are rewritten in place; the arena (string storage) is untouched.
+fn table_select(ctx: &ServiceContext, t: &mut Table, names: &[&str]) -> bool {
+    let mut new_cols = [""; REC_MAX_COLS];
+    let mut map = [0usize; REC_MAX_COLS];
+    let mut nc = 0usize;
+    for &name in names {
+        if name.is_empty() { continue; }
+        match t.col_index(name) {
+            Some(oi) if nc < REC_MAX_COLS => { new_cols[nc] = t.cols[oi]; map[nc] = oi; nc += 1; }
+            Some(_) => {}
+            None => { ctx.console_writeln_fmt(format_args!("select: no such column '{}'", name)); return false; }
+        }
+    }
+    for r in 0..t.nrows {
+        let old = t.rows[r];
+        for i in 0..nc { t.rows[r][i] = old[map[i]]; }
+        for i in nc..t.ncols { t.rows[r][i] = Value::Empty; }
+    }
+    t.cols = new_cols;
+    t.ncols = nc;
+    true
+}
+
+/// Resolve a value to its comparable bytes (arena slice for `Str`, empty otherwise).
+fn val_str<'a>(v: Value, arena: &'a [u8]) -> &'a [u8] {
+    match v { Value::Str { off, len } => &arena[off as usize..(off + len) as usize], _ => &[] }
+}
+
+/// Order two cells: numeric when both are ints, else by bytes.
+fn cmp_values(a: Value, b: Value, arena: &[u8]) -> core::cmp::Ordering {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => x.cmp(&y),
+        _ => val_str(a, arena).cmp(val_str(b, arena)),
+    }
+}
+
+/// `sort <col> [reverse]` — order rows by a column (numeric or text), descending with `reverse`.
+fn table_sort(ctx: &ServiceContext, t: &mut Table, col: &str, reverse: bool) -> bool {
+    let ci = match t.col_index(col) {
+        Some(i) => i,
+        None => { ctx.console_writeln_fmt(format_args!("sort: no such column '{}'", col)); return false; }
+    };
+    let n = t.nrows;
+    let arena = &t.arena; // disjoint field borrow: rows is sorted mutably, arena read-only
+    t.rows[..n].sort_unstable_by(|a, b| {
+        let o = cmp_values(a[ci], b[ci], arena);
+        if reverse { o.reverse() } else { o }
+    });
+    true
+}
+
+/// Render a table as YAML — a list of mappings (`to yaml`, the other edge format).
+fn render_yaml(ctx: &ServiceContext, t: &Table, out: &mut Out) {
+    let mut cell = [0u8; 24];
+    for r in 0..t.nrows {
+        for c in 0..t.ncols {
+            out.put(ctx, if c == 0 { "- " } else { "  " });
+            out.put(ctx, t.cols[c]);
+            out.put(ctx, ": ");
+            let n = fmt_cell(t, t.rows[r][c], &mut cell);
+            out.put_bytes(ctx, &cell[..n]);
+            out.put(ctx, "\n");
+        }
+    }
+}
+
 /// Build the live-task table that `status` produces (columns: slot, name, core, state, mem,
 /// queue, restarts). The structured form of what `status` used to print directly.
 fn build_status_table(ctx: &ServiceContext) -> Table {
@@ -1035,18 +1117,36 @@ fn record_pipe(ctx: &ServiceContext, line: &str) {
         let mut sa = [""; MAX_ARGS];
         let sc = tokenize(stages[i], &mut sa);
         match sa[0] {
+            // Compact predicate, one token: `where mem>0`, `where state=BlockRecv`. Quote only
+            // if the value has a space (`where "name=block driver"`).
             "where" => {
-                if sc < 4 { ctx.console_writeln("usage: … | where <col> <op> <value>"); return; }
-                table_where(ctx, &mut t, sa[1], sa[2], sa[3]);
-            }
-            "to" => {
-                match sa.get(1) {
-                    Some(&"json") => { render_json(ctx, &t, &mut Out::Console); rendered = true; }
-                    _ => { ctx.console_writeln("to: unknown format (try: to json)"); return; }
+                match parse_predicate(sa.get(1).copied().unwrap_or("")) {
+                    Some((col, op, val)) => table_where(ctx, &mut t, col, op, val),
+                    None => { ctx.console_writeln("where: need a predicate like name=shell or mem>0"); return; }
                 }
             }
+            // Project columns: `select name core` keeps just those, in order.
+            "select" => {
+                if sc < 2 { ctx.console_writeln("usage: … | select <col> [col …]"); return; }
+                if !table_select(ctx, &mut t, &sa[1..sc]) { return; }
+            }
+            // Order rows by a column: `sort mem`, `sort name reverse`.
+            "sort" => {
+                let mut col = "";
+                let mut rev = false;
+                for a in &sa[1..sc] { if *a == "reverse" { rev = true; } else if col.is_empty() { col = a; } }
+                if col.is_empty() { ctx.console_writeln("usage: … | sort <col> [reverse]"); return; }
+                if !table_sort(ctx, &mut t, col, rev) { return; }
+            }
+            // Render: `to json` / `to yaml` (the edge formats). A bare end → the table view.
+            "to" => match sa.get(1) {
+                Some(&"json") => { render_json(ctx, &t, &mut Out::Console); rendered = true; }
+                Some(&"yaml") => { render_yaml(ctx, &t, &mut Out::Console); rendered = true; }
+                _ => { ctx.console_writeln("to: unknown format (try: to json | to yaml)"); return; }
+            },
             other => {
-                ctx.console_writeln_fmt(format_args!("status pipe: '{}' is not a record stage (try where, to json)", other));
+                ctx.console_writeln_fmt(format_args!(
+                    "records: '{}' is not a record stage (try where, select, sort, to json)", other));
                 return;
             }
         }
