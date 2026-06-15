@@ -103,5 +103,10 @@ The shell built-ins are driven by a single `help_block` helper (the format lives
 one place, so all of them render identically), with `<util> help` / `<util> version`
 intercepted uniformly in the command dispatch; `observe` (a standalone service) was
 already spec-first conformant. The earlier gap — built-ins documented only by the
-top-level `help` list — is closed. (Still open, separately: the top-level `help`
-command is the categorised list, not itself a `help`-shaped utility.)
+top-level `help` list — is closed.
+
+The last-open item is now closed too: the top-level **`help`** command conforms.
+Bare `help` is still the categorised command list, but its first line now carries the
+version header (rule 6: `help 0.1.0 — GodspeedOS shell commands`), and `help help` /
+`help version` resolve like any other utility's. So **every** command the shell
+dispatches — including `help` itself — self-documents and reports a version.

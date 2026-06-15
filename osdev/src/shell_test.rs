@@ -370,6 +370,19 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(r) => check!(r.contains("select 0.1.0") && r.contains("status | select name core state"), "select help: header + real example"),
         None    => { println!("shell-test: FAIL — timed out after `select help`"); fail += 1; }
     }
+    // The top-level `help` command itself conforms now (0_conventions.md §3, last open item):
+    // its categorised list carries the version header (rule 6), and `help help` / `help version`
+    // resolve like any other utility.
+    send(&mut write_half, b"help version\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("help 0.1.0") && r.contains("Created by Bankole Ogundero"), "help version: number + creator credit"),
+        None    => { println!("shell-test: FAIL — timed out after `help version`"); fail += 1; }
+    }
+    send(&mut write_half, b"help help\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("help 0.1.0") && r.contains("<command> help"), "help help: header + per-command hint"),
+        None    => { println!("shell-test: FAIL — timed out after `help help`"); fail += 1; }
+    }
 
     // -----------------------------------------------------------------------
     // Up-arrow history: run a command, then up-arrow + Enter (no retyping) must recall
