@@ -41,6 +41,15 @@ more — it never silently drops the rest.
 `sort` consumes input; it is never a pipe *producer*. Being a filter it can sit mid-pipe
 (`find *.txt | sort | count`) or end one.
 
+### On records — sort by a column
+`sort` spans **both** pipe worlds (`docs/records.md`): on a text stream it line-sorts as above; on
+a **record** stream (e.g. after `status`) it orders rows **by a column** — `sort mem`, `sort
+reverse name`. The column name follows the verb, with `reverse` leading so the column lands at the
+end and nothing dangles (`sort reverse mem`, same shape as `match except`). The comparison is
+numeric when the column's values are numeric, else textual. The record verbs proper
+(`where`/`select`/`to`/`from`) live in `utilities/31_records.md`; `sort` is documented here because
+its text form predates them.
+
 ## 4. Implementation
 
 A shell built-in FILTER (`is_filter_builtin`, with `match`/`count`): it runs **in-process**, so

@@ -46,6 +46,23 @@ BlockRecv / BlockSend / Dead.
 (The fuller per-task metrics — memory, queue depth, restarts, CPU% — are rendered
 by `observe`; `status` is the short roster.)
 
+## 4a. As a record producer (typed pipes)
+
+`status` is the first **record producer** of the structured-pipe subsystem
+(`docs/records.md`, `utilities/31_records.md`). Piped, it emits a typed **table** rather than the
+flat console text above — columns **slot / name / core / state / mem / queue / restarts** — so the
+record verbs operate on real fields:
+
+```
+status | where mem>0                  only tasks holding memory
+status | where state=BlockRecv | select name core
+status | sort reverse mem | to json   ordered desc, rendered as JSON
+status | where name=shell | to yaml
+```
+
+The bare `status` (no pipe) still prints the short SLOT/NAME/CORE/STATE roster; the extra
+columns surface only on the record path, where `select` can project whichever are wanted.
+
 ## 5. Capabilities
 
 - **`INTROSPECT`** (READ) — `task_stat` discloses any task's state and is gated;
