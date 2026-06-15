@@ -290,6 +290,46 @@ fn wait_for_input_ready(ctx: &ServiceContext) {
     }
 }
 
+/// Split `s` into args with **minimal quoting**: a token wrapped in a matching pair of `'…'`
+/// or `"…"` is one argument with the surrounding pair stripped — **no escapes, no nesting, no
+/// expansion** (single and double behave identically). This is what lets `match "two words"`
+/// pass a multi-word pattern; unquoted tokens split on whitespace exactly as before. Returns
+/// the arg count; each arg is a slice of `s` (no allocation).
+fn tokenize<'a>(s: &'a str, args: &mut [&'a str; MAX_ARGS]) -> usize {
+    let b = s.as_bytes();
+    let mut argc = 0usize;
+    let mut i = 0usize;
+    while i < b.len() && argc < MAX_ARGS {
+        while i < b.len() && b[i].is_ascii_whitespace() { i += 1; }
+        if i >= b.len() { break; }
+        if b[i] == b'\'' || b[i] == b'"' {
+            let q = b[i];
+            let start = i + 1;
+            let mut j = start;
+            while j < b.len() && b[j] != q { j += 1; }
+            args[argc] = &s[start..j];
+            i = if j < b.len() { j + 1 } else { j }; // step past the closing quote
+        } else {
+            let start = i;
+            while i < b.len() && !b[i].is_ascii_whitespace() { i += 1; }
+            args[argc] = &s[start..i];
+        }
+        argc += 1;
+    }
+    argc
+}
+
+/// Strip one matching surrounding `'…'`/`"…"` pair from a rest-of-line argument (e.g. `echo`,
+/// `write` content), so `echo "I am text"` prints `I am text`. Same minimal rule as `tokenize`.
+fn strip_quotes(s: &str) -> &str {
+    let b = s.as_bytes();
+    if b.len() >= 2 && (b[0] == b'\'' || b[0] == b'"') && b[b.len() - 1] == b[0] {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
 fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
     let Ok(s) = core::str::from_utf8(line) else {
         ctx.console_writeln("shell: invalid input");
@@ -308,12 +348,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
     }
 
     let mut args = [""; MAX_ARGS];
-    let mut argc = 0usize;
-    for word in s.split_ascii_whitespace() {
-        if argc >= MAX_ARGS { break; }
-        args[argc] = word;
-        argc += 1;
-    }
+    let argc = tokenize(s, &mut args);
     if argc == 0 { return; }
 
     // Per-utility `help` / `version` (0_conventions.md): every utility self-documents.
@@ -330,7 +365,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
     match args[0] {
         "help"    => cmd_help(ctx),
         "clear"   => cmd_clear(ctx),
-        "echo"    => cmd_echo(ctx, s["echo".len()..].trim(), &mut Out::Console),
+        "echo"    => cmd_echo(ctx, strip_quotes(s["echo".len()..].trim()), &mut Out::Console),
         "about"   => cmd_about(ctx),
         "mem"     => cmd_mem(ctx),
         "cores"   => cmd_cores(ctx),
@@ -402,6 +437,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
             else { cmd_find(ctx, cwd, args[1], if argc >= 3 { args[2] } else { "/" }, &mut Out::Console); }
         }
         "tree"    => cmd_tree(ctx, cwd, if argc >= 2 { args[1] } else { "" }, &mut Out::Console),
+        "match"   => cmd_match(ctx, cwd, &args, argc),
         other => {
             // Build "unknown: <cmd>" in a stack buffer to avoid two ctx.log calls
             let mut buf = [0u8; 64];
@@ -426,7 +462,7 @@ const UTIL_VERSION: &str = "0.1.0";
 const UTILS: &[&str] = &[
     "echo", "clear", "about", "mem", "cores", "date", "status", "observe", "caps",
     "spawn", "kill", "restart", "reboot", "drives", "ls", "cd", "read", "write",
-    "mkdir", "copy", "move", "rename", "delete", "find", "tree",
+    "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match",
 ];
 fn is_util(name: &str) -> bool { UTILS.contains(&name) }
 
@@ -552,6 +588,12 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("tree", "tree of the current directory", "tree"),
             ("tree <path>", "tree rooted at <path>", "tree /docs"),
         ], true),
+        "match" => help_block(ctx, "match", "keep the lines that match a pattern", &[
+            ("<producer> | match <pattern>", "keep piped lines matching <pattern>", "read /log | match error"),
+            ("match <pattern> <path>", "keep lines of <path> that match", "match error /log"),
+            ("match except <pattern> [path]", "keep the lines that do NOT match", "read /log | match except debug"),
+            ("match \"<two words>\" …", "quote a multi-word pattern", "match \"out of memory\" /log"),
+        ], true),
         _ => return false,
     }
     true
@@ -568,6 +610,9 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
         ], false),
         ("write", "append") => help_block(ctx, "write append", "append to a file (create if missing)", &[
             ("write append <path> <text>", "add <text> to the end of <path>", "write append /log started"),
+        ], false),
+        ("match", "except") => help_block(ctx, "match except", "keep the lines that do NOT match", &[
+            ("match except <pattern> [path]", "drop matching lines, keep the rest", "read /log | match except debug"),
         ], false),
         ("drives", "flash") => help_block(ctx, "drives flash", "format a drive as GSFS (ERASES it; asks y/N)", &[
             ("drives flash", "format the only drive, no label", "drives flash"),
@@ -622,6 +667,7 @@ fn cmd_help(ctx: &ServiceContext) {
     help_line(ctx, "delete <path> [recursive]", "remove a file/dir/subtree");
     help_line(ctx, "find <pattern> [path]", "search by name (substring or *? glob)");
     help_line(ctx, "tree [path]", "print the directory hierarchy");
+    help_line(ctx, "match <pattern> [path]", "keep lines matching (also: <prod> | match)");
     ctx.console_writeln("");
     ctx.console_writeln("Pipes");
     help_line(ctx, "<producer> | [filter |…] <sink>", "compose stages (Appendix D)");
@@ -1011,12 +1057,15 @@ fn stage_produce(ctx: &ServiceContext, cwd: &Cwd, stage: &str, out: &mut Cap) ->
     false
 }
 
-/// A middle stage — must FILTER (consume input, emit output). A future filter built-in (e.g.
-/// `match`) would transform in-process here; today a service filter (`upper`) does the work
-/// via a round-trip. A producer built-in or `write` in the middle is a loud error.
+/// A middle stage — must FILTER (consume input, emit output). A filter built-in (`match`)
+/// transforms in-process; a service filter (`upper`) does it via a round-trip. A producer
+/// built-in or `write` in the middle is a loud error.
 fn stage_filter(ctx: &ServiceContext, cwd: &Cwd, stage: &str, input: &[u8], out: &mut Cap) -> bool {
     let (cmd, _) = split_first(stage);
-    let _ = cwd; // (a filter built-in like `match` would use cwd for its direct-file form)
+    let _ = cwd;
+    if is_filter_builtin(cmd) {
+        return run_filter_builtin(ctx, stage, input, &mut Out::Capture(out));
+    }
     if is_producer_builtin(cmd) || cmd == "write" {
         ctx.console_writeln_fmt(format_args!("pipe: '{}' cannot be used mid-pipe (it is not a filter)", cmd));
         return false;
@@ -1024,11 +1073,22 @@ fn stage_filter(ctx: &ServiceContext, cwd: &Cwd, stage: &str, input: &[u8], out:
     drain_service(ctx, cmd, Some(input), out) // service filter (upper)
 }
 
+/// Built-in FILTERS — they consume input and emit output, so they can sit mid-pipe. Run
+/// in-process, so they are NOT subject to the 4 KiB service-boundary cap. Currently `match`.
+fn is_filter_builtin(name: &str) -> bool {
+    matches!(name, "match")
+}
+
 /// The last stage — consumes the final buffer. `write <file>` writes it; a service filters it
 /// and its output is printed; a producer built-in here is a loud error (it ignores input).
 fn stage_sink(ctx: &ServiceContext, cwd: &Cwd, stage: &str, input: &[u8]) {
     let (cmd, arg) = split_first(stage);
     if cmd == "write" { pipe_write_file(ctx, cwd, arg, input); return; }
+    if is_filter_builtin(cmd) {
+        // `match` as the final stage: print the matching lines to the console.
+        run_filter_builtin(ctx, stage, input, &mut Out::Console);
+        return;
+    }
     if is_producer_builtin(cmd) {
         ctx.console_writeln_fmt(format_args!("pipe: '{}' ignores piped input (it is a producer)", cmd));
         return;
@@ -1386,9 +1446,10 @@ fn cmd_write(ctx: &ServiceContext, cwd: &Cwd, rest: &str) {
         ctx.console_writeln("usage: write [append] <path> [content]");
         return;
     }
-    // Split off the first token (path); the remainder (with spaces) is the content.
+    // Split off the first token (path); the remainder (with spaces) is the content. A
+    // surrounding quote pair around the content is stripped (`write /f "two words"`).
     let (pstr, content) = match rest.split_once(char::is_whitespace) {
-        Some((p, c)) => (p, c.trim_start()),
+        Some((p, c)) => (p, strip_quotes(c.trim_start())),
         None => (rest, ""),
     };
     let mut buf = [0u8; PATH_MAX];
@@ -1965,6 +2026,86 @@ fn glob_match(pat: &[u8], name: &[u8]) -> bool {
 
 fn str_of(b: &[u8]) -> &str {
     core::str::from_utf8(b).unwrap_or("?")
+}
+
+// ── match — keep the lines that match a pattern (the grep-equivalent) ────────────
+// `match [except] <pattern> <path>` filters a file; `<producer> | match <pattern>` filters
+// piped input. A built-in FILTER: it consumes input and emits the matching lines. Substring
+// by default, `*`/`?` glob like `find` (shared `contains`/`glob_match`); `except` inverts.
+// See utilities/27_match.md.
+
+/// Filter `input`'s lines by `pattern`, writing each matching line (with its newline) to `out`.
+/// Substring by default; a pattern with `*`/`?` is an anchored glob (same as `find`). `invert`
+/// keeps the lines that do NOT match (the `except` form). Blank lines are skipped.
+fn match_lines(ctx: &ServiceContext, input: &[u8], pattern: &[u8], invert: bool, out: &mut Out) {
+    let is_glob = pattern.iter().any(|&b| b == b'*' || b == b'?');
+    for line in input.split(|&b| b == b'\n') {
+        if line.is_empty() { continue; }
+        let matched = if is_glob { glob_match(pattern, line) } else { contains(line, pattern) };
+        if matched != invert {
+            out.put_bytes(ctx, line);
+            out.put(ctx, "\n");
+        }
+    }
+}
+
+/// Parse a `match` invocation's args from index `start`: handles the leading `except` keyword
+/// and returns `(invert, pattern, path)` — `path` is "" if absent. `None` if no pattern.
+fn parse_match<'a>(args: &[&'a str], argc: usize, start: usize) -> Option<(bool, &'a str, &'a str)> {
+    let mut i = start;
+    // `except` is the keyword only when a pattern follows it (so `match except except` still
+    // matches the literal word "except": first is the keyword, second is the pattern).
+    let invert = argc > i + 1 && args[i] == "except";
+    if invert { i += 1; }
+    if argc <= i { return None; }
+    let pattern = args[i];
+    i += 1;
+    let path = if argc > i { args[i] } else { "" };
+    Some((invert, pattern, path))
+}
+
+/// `match [except] <pattern> <path>` — print the lines of `<path>` that match (or, with
+/// `except`, that do not). The pipe form filters piped input instead; either way `match` is a
+/// FILTER, never a pipe producer (use `read <path> | match …` to feed a pipeline from a file).
+fn cmd_match(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) {
+    let (invert, pattern, path) = match parse_match(args, argc, 1) {
+        Some(t) => t,
+        None => { ctx.console_writeln("usage: match [except] <pattern> <path>"); return; }
+    };
+    if path.is_empty() {
+        ctx.console_writeln("match: a path is required (or pipe input: <producer> | match <pattern>)");
+        return;
+    }
+    let mut buf = [0u8; PATH_MAX];
+    let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return };
+    let reply = match fs_request(ctx, OP_READ_FILE, abspath, &[]) {
+        Some(r) => r,
+        None => { ctx.console_writeln("match: storage unavailable"); return; }
+    };
+    let p = reply.payload_bytes();
+    if no_fs(ctx, p) { return; }
+    if p.first() == Some(&FS_OK) && p.len() >= 5 {
+        let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
+        let end = (5 + n).min(p.len());
+        match_lines(ctx, &p[5..end], pattern.as_bytes(), invert, &mut Out::Console);
+    } else {
+        ctx.console_writeln_fmt(format_args!("match: not found: {}", str_of(abspath)));
+    }
+}
+
+/// Run a filter built-in (currently `match`) over `input`, writing matches to `out`. Used when
+/// the filter sits **mid-pipe** — it runs in-process, so it is not subject to the 4 KiB
+/// service-boundary cap and can filter a full 64 KiB stage buffer.
+fn run_filter_builtin(ctx: &ServiceContext, stage: &str, input: &[u8], out: &mut Out) -> bool {
+    let mut margs = [""; MAX_ARGS];
+    let mac = tokenize(stage, &mut margs);
+    match parse_match(&margs, mac, 1) {
+        Some((invert, pattern, _)) => {
+            match_lines(ctx, input, pattern.as_bytes(), invert, out);
+            true
+        }
+        None => { ctx.console_writeln("match: usage: <producer> | match [except] <pattern>"); false }
+    }
 }
 
 /// Bounded stack of directory paths still to visit during a `find` walk (§26.6). Pushing
