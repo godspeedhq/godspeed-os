@@ -465,6 +465,7 @@ const UTIL_VERSION: &str = "0.1.0";
 
 /// Utilities that self-document (gates the `help`/`version` intercept in `execute`).
 const UTILS: &[&str] = &[
+    "help",
     "echo", "clear", "about", "mem", "cores", "date", "status", "observe", "caps",
     "spawn", "kill", "restart", "reboot", "drives", "ls", "cd", "read", "write",
     "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count", "sort",
@@ -504,6 +505,10 @@ fn help_block(ctx: &ServiceContext, title: &str, desc: &str, rows: &[Row], foote
 /// `<util> help` — usage with examples. Returns false for an unknown name.
 fn util_help(ctx: &ServiceContext, util: &str) -> bool {
     match util {
+        "help" => help_block(ctx, "help", "list all commands (or get help on one)", &[
+            ("help", "the full categorised command list", "help"),
+            ("<command> help", "usage + examples for one command", "status help"),
+        ], true),
         "echo" => help_block(ctx, "echo", "print text", &[
             ("echo <text>", "print text verbatim", "echo hello world"),
         ], true),
@@ -676,7 +681,8 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
 }
 
 fn cmd_help(ctx: &ServiceContext) {
-    ctx.console_writeln("GodspeedOS shell commands");
+    // Rule 6 (0_conventions.md): help output's first line is `<util> <version>`.
+    ctx.console_writeln_fmt(format_args!("help {} — GodspeedOS shell commands", UTIL_VERSION));
     ctx.console_writeln("");
     ctx.console_writeln("Console");
     help_line(ctx, "help", "show this message");
