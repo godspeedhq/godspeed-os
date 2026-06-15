@@ -52,15 +52,23 @@ message is the *detail*.
 
 ## 4. Conversion status (incremental)
 
-The shell is being moved to the `Result` model **one command at a time** (§26.2 — pull into
-existence, don't boil the ocean). Converted so far:
+The shell is being moved to the `Result` model **incrementally** (§26.2). Converted so far:
 
-- **`read`** → `Ok` on success, `Err(FileNotFound)` if missing, `Err(Unknown)` otherwise.
+- **`read`** and the **file/storage commands** — `ls`, `cd`, `write` (+`append`), `mkdir`,
+  `copy` (+recursive), `move`, `rename`, `delete`, `find`, `tree`: `Ok` on success,
+  `Err(FileNotFound)` for a missing path, `Err(Unknown)` for other failures (storage, bad args,
+  not-a-dir, not-empty, …).
+- **An unknown command is `Err`** (so `assert fails typo` holds, and a typo in a script counts as
+  a failure).
+- **Pipelines** are on the model too — `pipe_run` returns the pipeline's `Result` (a `| assert`
+  sink sets it; a stage error is `Err`).
 
-Not-yet-converted commands run via the legacy dispatch and are treated as `Ok` (they don't report
-failure yet). As each is converted, it returns a real `Result` and may add a named variant
-(`StorageUnavailable`, `NoSuchColumn`, `EndpointDead`, …, reusing kernel error names where they
-surface — §7.7). Pipelines are also not on the model yet.
+Still **`Ok`-wrapped** (don't yet report their own failure): the info commands that don't
+meaningfully fail (`echo`/`about`/`mem`/`cores`/`date`/`status`/`observe`/`caps`/`clear`/`help`),
+the service-control commands (`spawn`/`kill`/`restart`/`drives` — a missing *arg* is a usage
+`Err`, but the action is wrapped), and the direct form of the filter built-ins
+(`match`/`count`/`sort`/`first`/`last`). Those convert next, possibly adding named variants
+(`StorageUnavailable`, `EndpointDead`, … reusing kernel names — §7.7).
 
 ## 5. Later (separate so it can grow)
 

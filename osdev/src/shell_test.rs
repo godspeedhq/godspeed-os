@@ -1322,6 +1322,35 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL — assert script timeout"); fail += 1; }
     }
 
+    // ── Result model now spans the file commands + unknown-command. Exercise success and failure
+    //    through `assert ok/fails` (the file ops return real Ok/Err, not Ok-wrapped).
+    match run!(b"assert fails totallynotacommand\r", 10) {
+        Some(r) => check!(r.contains("assert: ok"), "result: an unknown command is now Err (assert fails holds)"),
+        None    => { println!("files-test: FAIL — unknown-cmd Err timeout"); fail += 1; }
+    }
+    match run!(b"assert ok mkdir /rdir\r", 10) {
+        Some(r) => check!(r.contains("assert: ok") && r.contains("created /rdir"), "result: mkdir success is Ok"),
+        None    => { println!("files-test: FAIL — assert ok mkdir timeout"); fail += 1; }
+    }
+    match run!(b"assert fails mkdir /no/such/parent/x\r", 10) {
+        Some(r) => check!(r.contains("assert: ok"), "result: mkdir into a missing parent is Err"),
+        None    => { println!("files-test: FAIL — assert fails mkdir timeout"); fail += 1; }
+    }
+    match run!(b"assert fails cd /nowhere\r", 10) {
+        Some(r) => check!(r.contains("assert: ok"), "result: cd to a missing dir is Err"),
+        None    => { println!("files-test: FAIL — assert fails cd timeout"); fail += 1; }
+    }
+    match run!(b"assert fails delete /nowhere\r", 10) {
+        Some(r) => check!(r.contains("assert: ok"), "result: delete of a missing path is Err"),
+        None    => { println!("files-test: FAIL — assert fails delete timeout"); fail += 1; }
+    }
+    // and `result` reflects a converted command directly.
+    let _ = run!(b"ls /nowhere\r", 10);
+    match run!(b"result\r", 10) {
+        Some(r) => check!(r.contains("Err(FileNotFound)"), "result: ls of a missing dir → Err(FileNotFound)"),
+        None    => { println!("files-test: FAIL — ls result timeout"); fail += 1; }
+    }
+
     child.kill().ok();
     child.wait().ok();
     println!("\nfiles-test: {pass} passed, {fail} failed");
