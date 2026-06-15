@@ -154,6 +154,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Command history for up/down-arrow recall. `nav == hist.len()` means the live line.
     let mut hist = History::new();
     let mut nav = 0usize;
+    // The previous command's result (the Ok/Err model), reported by `result`. Threaded as
+    // local session state — no global (services hold no global mutable state, §3.9).
+    let mut last_result: Result<(), ShellError> = Ok(());
 
     loop {
         let b = ctx.console_read();
@@ -165,7 +168,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 ctx.console_write("\r\n");
                 if line_len > 0 {
                     hist.push(&line_buf[..line_len]);
-                    execute(&ctx, &line_buf[..line_len], &mut cwd);
+                    last_result = execute(&ctx, &line_buf[..line_len], &mut cwd, last_result);
                     line_len = 0;
                 }
                 nav = hist.len();
@@ -331,13 +334,41 @@ fn strip_quotes(s: &str) -> &str {
     }
 }
 
-fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
+/// A command's typed failure (the `Err` of a command `Result`). Modelled on Rust's `Result`: the
+/// common path is just "is it `Ok`?" — callers never need to know these names. The variants exist
+/// for when you *do* want to pin a specific failure (negative tests, a future `assert`). Unit
+/// variants (no payload): the human-readable detail stays in the command's own printed message;
+/// this enum is the category. `Unknown` is the catch-all for a failure not yet given its own
+/// variant, so *every* failure is at least `Err(Unknown)`. Grown one variant at a time as
+/// commands are converted to the `Result` model (docs follow-up).
+#[derive(Clone, Copy)]
+enum ShellError {
+    /// A file/path the command needed does not exist.
+    FileNotFound,
+    /// A failure not yet categorised into its own variant.
+    Unknown,
+}
+impl ShellError {
+    /// The variant's Rust-cased name, for `result` to print as `Err(<name>)`.
+    fn name(self) -> &'static str {
+        match self {
+            ShellError::FileNotFound => "FileNotFound",
+            ShellError::Unknown => "Unknown",
+        }
+    }
+}
+
+/// Run one command line. Returns the command's `Result` (the Ok/Err model): `Ok(())` on success,
+/// `Err(ShellError)` on failure. `prev` is the previous line's result, so the `result` command
+/// can report it. Commands are being converted to return `Result` incrementally — those not yet
+/// converted run via the legacy dispatch and are treated as `Ok`.
+fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellError>) -> Result<(), ShellError> {
     let Ok(s) = core::str::from_utf8(line) else {
         ctx.console_writeln("shell: invalid input");
-        return;
+        return Err(ShellError::Unknown);
     };
     let s = s.trim();
-    if s.is_empty() { return; }
+    if s.is_empty() { return prev; } // a blank line is not a command — last result unchanged
 
     // Capability-mediated pipe: `producer | sink`. The shell brokers the channel
     // (Appendix D.3): spawn the consumer, then spawn the producer with a SEND cap
@@ -345,25 +376,40 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
     // authority of its own.
     if s.contains('|') {
         // One unified pipeline: threads bytes or records, with from/to bridging the two worlds.
+        // (Pipelines are not yet on the Result model — treated as Ok for now.)
         pipe_run(ctx, cwd, s);
-        return;
+        return Ok(());
     }
 
     let mut args = [""; MAX_ARGS];
     let argc = tokenize(s, &mut args);
-    if argc == 0 { return; }
+    if argc == 0 { return prev; }
 
     // Per-utility `help` / `version` (0_conventions.md): every utility self-documents.
     // `<util> help` and `<util> version` are intercepted here for every utility; subcommand
     // help (`<util> <sub> help`, e.g. `drives flash help`) is intercepted just below.
     if argc == 2 && is_util(args[0]) {
-        if args[1] == "version" { util_version(ctx, args[0]); return; }
-        if args[1] == "help" { util_help(ctx, args[0]); return; }
+        if args[1] == "version" { util_version(ctx, args[0]); return Ok(()); }
+        if args[1] == "help" { util_help(ctx, args[0]); return Ok(()); }
     }
     if argc == 3 && args[2] == "help" && is_util(args[0]) {
-        if sub_help(ctx, args[0], args[1]) { return; }
+        if sub_help(ctx, args[0], args[1]) { return Ok(()); }
     }
 
+    // Commands on the Ok/Err Result model (converted incrementally). These `return` their result.
+    match args[0] {
+        "read" => return if argc < 2 {
+            ctx.console_writeln("usage: read <path>");
+            Err(ShellError::Unknown)
+        } else {
+            cmd_read(ctx, cwd, args[1], &mut Out::Console)
+        },
+        // `result` reports the PREVIOUS command's result (this one always succeeds at reporting).
+        "result" => { cmd_result(ctx, prev); return Ok(()); }
+        _ => {}
+    }
+
+    // Legacy dispatch — commands not yet converted to `Result`; treated as `Ok`.
     match args[0] {
         "help"    => cmd_help(ctx),
         "clear"   => cmd_clear(ctx),
@@ -404,10 +450,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
         "reboot"  => cmd_reboot(ctx),
         "drives"  => cmd_drives(ctx, &args, argc),
         "ls"      => cmd_ls(ctx, cwd, if argc >= 2 { args[1] } else { "" }, &mut Out::Console),
-        "read"    => {
-            if argc < 2 { ctx.console_writeln("usage: read <path>"); }
-            else { cmd_read(ctx, cwd, args[1], &mut Out::Console); }
-        }
+        // "read" and "result" are handled above on the Result model (not here).
         "write"   => cmd_write(ctx, cwd, s["write".len()..].trim()),
         "mkdir"   => {
             // `mkdir <path>` or `mkdir <path> parents` (create missing parent dirs).
@@ -453,6 +496,18 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
             ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("unknown cmd"));
         }
     }
+    // Legacy commands above don't report failure yet — treated as Ok until converted.
+    Ok(())
+}
+
+/// `result` — print the previous command's result in Rust's `Result` shape: `Ok` on success,
+/// `Err(<Variant>)` on failure (the specific reason was already printed by that command). The
+/// common use is just eyeballing `Ok` vs not; a future `assert`/`run` reads the same value.
+fn cmd_result(ctx: &ServiceContext, prev: Result<(), ShellError>) {
+    match prev {
+        Ok(()) => ctx.console_writeln("Ok"),
+        Err(e) => ctx.console_writeln_fmt(format_args!("Err({})", e.name())),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -466,7 +521,7 @@ const UTIL_VERSION: &str = "0.1.0";
 
 /// Utilities that self-document (gates the `help`/`version` intercept in `execute`).
 const UTILS: &[&str] = &[
-    "help",
+    "help", "result",
     "echo", "clear", "about", "mem", "cores", "date", "status", "observe", "caps",
     "spawn", "kill", "restart", "reboot", "drives", "ls", "cd", "read", "write",
     "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count", "sort",
@@ -509,6 +564,9 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "help" => help_block(ctx, "help", "list all commands (or get help on one)", &[
             ("help", "the full categorised command list", "help"),
             ("<command> help", "usage + examples for one command", "status help"),
+        ], true),
+        "result" => help_block(ctx, "result", "show the previous command's result (Ok / Err)", &[
+            ("result", "Ok if the last command succeeded, else Err(<reason>)", "result"),
         ], true),
         "echo" => help_block(ctx, "echo", "print text", &[
             ("echo <text>", "print text verbatim", "echo hello world"),
@@ -695,6 +753,7 @@ fn cmd_help(ctx: &ServiceContext) {
     help_line(ctx, "help", "show this message");
     help_line(ctx, "clear", "clear the screen");
     help_line(ctx, "echo <text>", "print text");
+    help_line(ctx, "result", "the last command's result (Ok / Err)");
     ctx.console_writeln("");
     ctx.console_writeln("System");
     help_line(ctx, "about", "identity + credits");
@@ -1615,7 +1674,7 @@ fn run_producer(ctx: &ServiceContext, cwd: &Cwd, cmdline: &str, out: &mut Out) {
     let (cmd, arg) = split_first(cmdline);
     match cmd {
         "echo"         => cmd_echo(ctx, arg, out),
-        "read" | "cat" => cmd_read(ctx, cwd, arg, out),
+        "read" | "cat" => { let _ = cmd_read(ctx, cwd, arg, out); }
         // "ls" and "find" are record producers (handled on the record path), not text here.
         "tree"         => cmd_tree(ctx, cwd, arg, out),
         _ => {}
@@ -1849,24 +1908,29 @@ fn cmd_ls(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) {
     if count == 0 { out.line(ctx, "  (empty)"); }
 }
 
-/// `read <path>` — print a file's contents.
-fn cmd_read(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) {
+/// `read <path>` — print a file's contents. The first command on the Ok/Err `Result` model:
+/// `Ok(())` when the file was read, `Err(FileNotFound)` when it does not exist, `Err(Unknown)`
+/// for other failures (bad path, storage unavailable) until those get their own variants. The
+/// human-readable detail is still printed; the `Result` is the category.
+fn cmd_read(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
-    let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return };
+    let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let reply = match fs_request(ctx, OP_READ_FILE, path, &[]) {
         Some(r) => r,
-        None => { ctx.console_writeln("read: storage unavailable"); return; }
+        None => { ctx.console_writeln("read: storage unavailable"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return; }
+    if no_fs(ctx, p) { return Err(ShellError::Unknown); }
     if p.first() == Some(&FS_OK) && p.len() >= 5 {
         let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
         let end = (5 + n).min(p.len());
         out.put_bytes(ctx, &p[5..end]);
         if end == 0 || p[end - 1] != b'\n' { out.put(ctx, "\n"); }
+        Ok(())
     } else {
         // Errors are not pipe data — always to the console.
         ctx.console_writeln_fmt(format_args!("read: not found: {}", str_of(path)));
+        Err(ShellError::FileNotFound)
     }
 }
 

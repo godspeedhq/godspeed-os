@@ -1240,6 +1240,28 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL — find|select timeout"); fail += 1; }
     }
 
+    // ── result: the Ok/Err Result model on `read` (the first command converted). `result` prints
+    //    the previous command's result in Rust's shape — Ok, or Err(<Variant>). (/lsr/big.txt was
+    //    created in the ls section above.)
+    let _ = run!(b"read /lsr/big.txt\r", 10);             // exists → Ok
+    match run!(b"result\r", 10) {
+        Some(r) => check!(r.contains("Ok") && !r.contains("Err"), "result: Ok after a successful read"),
+        None    => { println!("files-test: FAIL — result(ok) timeout"); fail += 1; }
+    }
+    let _ = run!(b"read /lsr/does_not_exist\r", 10);      // missing → Err(FileNotFound)
+    match run!(b"result\r", 10) {
+        Some(r) => check!(r.contains("Err(FileNotFound)"), "result: Err(FileNotFound) after a missing read"),
+        None    => { println!("files-test: FAIL — result(err) timeout"); fail += 1; }
+    }
+    // a blank line is not a command, so it leaves the last result unchanged. (Note `result`
+    // itself succeeds, so it would reset to Ok — hence a fresh failing read right before.)
+    let _ = run!(b"read /lsr/still_missing\r", 10);       // Err(FileNotFound)
+    let _ = run!(b"\r", 8);                               // blank — not a command
+    match run!(b"result\r", 10) {
+        Some(r) => check!(r.contains("Err(FileNotFound)"), "result: a blank line leaves the last result unchanged"),
+        None    => { println!("files-test: FAIL — result(blank) timeout"); fail += 1; }
+    }
+
     child.kill().ok();
     child.wait().ok();
     println!("\nfiles-test: {pass} passed, {fail} failed");
