@@ -1045,6 +1045,34 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL — greet|sort|first timeout"); fail += 1; }
     }
 
+    // ── from json: the byte↔record bridge (read text → parse → manipulate → render) ──
+    let _ = run!(b"write /rec.json [{\"name\":\"alpha\",\"n\":1},{\"name\":\"beta\",\"n\":2}]\r", 10);
+    // read (bytes) → from json (records) → default table render.
+    match run!(b"read /rec.json | from json\r", 12) {
+        Some(r) => check!(r.contains("alpha") && r.contains("beta") && r.contains("name"),
+                          "from json: parses a json file into a table"),
+        None    => { println!("files-test: FAIL — from json timeout"); fail += 1; }
+    }
+    // read → from json → where (record filter on parsed data) → to json.
+    match run!(b"read /rec.json | from json | where n>1 | to json\r", 12) {
+        Some(r) => check!(r.contains("beta") && !r.contains("alpha"),
+                          "from json | where: filters parsed records"),
+        None    => { println!("files-test: FAIL — from json|where timeout"); fail += 1; }
+    }
+    // read → from json → select → to json (column projection on parsed data).
+    match run!(b"read /rec.json | from json | select name | to json\r", 12) {
+        Some(r) => check!(r.contains("\"name\": \"alpha\"") && !r.contains("\"n\":"),
+                          "from json | select: projects parsed columns"),
+        None    => { println!("files-test: FAIL — from json|select timeout"); fail += 1; }
+    }
+    // round-trip across formats: json file → records → yaml → file → read back.
+    let _ = run!(b"read /rec.json | from json | to yaml | write /rec.yaml\r", 12);
+    match run!(b"read /rec.yaml\r", 10) {
+        Some(r) => check!(r.contains("name: alpha") && r.contains("n: 2"),
+                          "from json | to yaml | write: json→records→yaml round-trip"),
+        None    => { println!("files-test: FAIL — json→yaml roundtrip timeout"); fail += 1; }
+    }
+
     child.kill().ok();
     child.wait().ok();
     println!("\nfiles-test: {pass} passed, {fail} failed");

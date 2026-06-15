@@ -343,11 +343,8 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
     // to the consumer's endpoint delegated to it — the producer has no ambient
     // authority of its own.
     if s.contains('|') {
-        // A pipeline whose first stage is a RECORD producer (`status`) runs the typed-table
-        // pipeline (where / to json); everything else is the byte pipeline.
-        let (fcmd, _) = split_first(s.split('|').next().unwrap_or("").trim());
-        if is_record_producer(fcmd) { record_pipe(ctx, s); }
-        else { cmd_pipe(ctx, cwd, s); }
+        // One unified pipeline: threads bytes or records, with from/to bridging the two worlds.
+        pipe_run(ctx, cwd, s);
         return;
     }
 
@@ -710,7 +707,7 @@ fn cmd_help(ctx: &ServiceContext) {
     ctx.console_writeln("Records (typed pipes — docs/records.md)");
     help_line(ctx, "status | where mem>0", "filter the task table by field (=,!=,>,<,~)");
     help_line(ctx, "status | select name state", "keep only some columns");
-    help_line(ctx, "status | sort mem [reverse]", "order rows by a column");
+    help_line(ctx, "status | sort [reverse] mem", "order rows by a column");
     help_line(ctx, "status | to json | to yaml", "render the table (default: a grid)");
     ctx.console_writeln("");
     ctx.console_writeln("Power");
@@ -817,10 +814,14 @@ enum Value {
     Empty,
 }
 
-/// A bounded table: static column names, rows of `Value`, and a byte arena holding the `Str`
-/// cells. The canonical structured-pipe value.
+const REC_COL_NAME: usize = 24; // max column-name length
+
+/// A bounded table: owned column names (so a `from json` parse can name columns dynamically,
+/// not just compile-time producers), rows of `Value`, and a byte arena holding the `Str` cells.
+/// The canonical structured-pipe value.
 struct Table {
-    cols: [&'static str; REC_MAX_COLS],
+    col_names: [[u8; REC_COL_NAME]; REC_MAX_COLS],
+    col_lens: [u8; REC_MAX_COLS],
     ncols: usize,
     rows: [[Value; REC_MAX_COLS]; REC_MAX_ROWS],
     nrows: usize,
@@ -829,15 +830,25 @@ struct Table {
     overflow: bool,
 }
 impl Table {
-    fn new(cols: &[&'static str]) -> Self {
+    fn new(cols: &[&str]) -> Self {
         let mut t = Table {
-            cols: [""; REC_MAX_COLS], ncols: cols.len().min(REC_MAX_COLS),
+            col_names: [[0u8; REC_COL_NAME]; REC_MAX_COLS], col_lens: [0; REC_MAX_COLS], ncols: 0,
             rows: [[Value::Empty; REC_MAX_COLS]; REC_MAX_ROWS], nrows: 0,
             arena: [0u8; REC_ARENA], alen: 0, overflow: false,
         };
-        for (i, c) in cols.iter().take(REC_MAX_COLS).enumerate() { t.cols[i] = c; }
+        for c in cols { t.add_col(c.as_bytes()); }
         t
     }
+    /// Add a column by name; returns its index (or `None` if full / name too long).
+    fn add_col(&mut self, name: &[u8]) -> Option<usize> {
+        if self.ncols >= REC_MAX_COLS || name.len() > REC_COL_NAME { self.overflow = true; return None; }
+        let i = self.ncols;
+        self.col_names[i][..name.len()].copy_from_slice(name);
+        self.col_lens[i] = name.len() as u8;
+        self.ncols += 1;
+        Some(i)
+    }
+    fn col_name(&self, c: usize) -> &[u8] { &self.col_names[c][..self.col_lens[c] as usize] }
     /// Copy bytes into the arena and return a `Str` value (or `Empty` if the arena is full).
     fn intern(&mut self, s: &[u8]) -> Value {
         if self.alen + s.len() > REC_ARENA { self.overflow = true; return Value::Empty; }
@@ -853,7 +864,7 @@ impl Table {
         self.nrows += 1;
     }
     fn col_index(&self, name: &str) -> Option<usize> {
-        (0..self.ncols).find(|&i| self.cols[i] == name)
+        (0..self.ncols).find(|&i| self.col_name(i) == name.as_bytes())
     }
     /// Resolve a cell's text: a `Str` from the arena, or the empty slice for non-strings.
     fn cell_str<'a>(&'a self, v: Value) -> &'a [u8] {
@@ -868,7 +879,7 @@ impl Table {
 /// the header and rows. Output goes through `Out` so it works to the console or a capture.
 fn render_table(ctx: &ServiceContext, t: &Table, out: &mut Out) {
     let mut w = [0usize; REC_MAX_COLS];
-    for c in 0..t.ncols { w[c] = t.cols[c].len(); }
+    for c in 0..t.ncols { w[c] = t.col_name(c).len(); }
     let mut cell = [0u8; 24];
     for r in 0..t.nrows {
         for c in 0..t.ncols {
@@ -878,8 +889,8 @@ fn render_table(ctx: &ServiceContext, t: &Table, out: &mut Out) {
     }
     // header
     for c in 0..t.ncols {
-        out.put(ctx, t.cols[c]);
-        pad(ctx, out, w[c] - t.cols[c].len() + 2);
+        out.put_bytes(ctx, t.col_name(c));
+        pad(ctx, out, w[c] - t.col_name(c).len() + 2);
     }
     out.put(ctx, "\n");
     // rows
@@ -928,7 +939,7 @@ fn render_json(ctx: &ServiceContext, t: &Table, out: &mut Out) {
         for c in 0..t.ncols {
             if c > 0 { out.put(ctx, ", "); }
             out.put(ctx, "\"");
-            out.put(ctx, t.cols[c]);
+            out.put_bytes(ctx, t.col_name(c));
             out.put(ctx, "\": ");
             match t.rows[r][c] {
                 Value::Int(_) => {
@@ -1014,13 +1025,19 @@ fn parse_predicate(tok: &str) -> Option<(&str, &str, &str)> {
 /// `select <col…>` — keep only the named columns, in the given order. Returns false (loudly) on
 /// an unknown column. Rows are rewritten in place; the arena (string storage) is untouched.
 fn table_select(ctx: &ServiceContext, t: &mut Table, names: &[&str]) -> bool {
-    let mut new_cols = [""; REC_MAX_COLS];
+    let mut new_names = [[0u8; REC_COL_NAME]; REC_MAX_COLS];
+    let mut new_lens = [0u8; REC_MAX_COLS];
     let mut map = [0usize; REC_MAX_COLS];
     let mut nc = 0usize;
     for &name in names {
         if name.is_empty() { continue; }
         match t.col_index(name) {
-            Some(oi) if nc < REC_MAX_COLS => { new_cols[nc] = t.cols[oi]; map[nc] = oi; nc += 1; }
+            Some(oi) if nc < REC_MAX_COLS => {
+                new_names[nc] = t.col_names[oi];
+                new_lens[nc] = t.col_lens[oi];
+                map[nc] = oi;
+                nc += 1;
+            }
             Some(_) => {}
             None => { ctx.console_writeln_fmt(format_args!("select: no such column '{}'", name)); return false; }
         }
@@ -1030,7 +1047,8 @@ fn table_select(ctx: &ServiceContext, t: &mut Table, names: &[&str]) -> bool {
         for i in 0..nc { t.rows[r][i] = old[map[i]]; }
         for i in nc..t.ncols { t.rows[r][i] = Value::Empty; }
     }
-    t.cols = new_cols;
+    t.col_names = new_names;
+    t.col_lens = new_lens;
     t.ncols = nc;
     true
 }
@@ -1069,7 +1087,7 @@ fn render_yaml(ctx: &ServiceContext, t: &Table, out: &mut Out) {
     for r in 0..t.nrows {
         for c in 0..t.ncols {
             out.put(ctx, if c == 0 { "- " } else { "  " });
-            out.put(ctx, t.cols[c]);
+            out.put_bytes(ctx, t.col_name(c));
             out.put(ctx, ": ");
             let n = fmt_cell(t, t.rows[r][c], &mut cell);
             out.put_bytes(ctx, &cell[..n]);
@@ -1100,61 +1118,274 @@ fn is_record_producer(name: &str) -> bool {
     matches!(name, "status")
 }
 
-/// `status` and its record pipeline: `status [| where …] [| to json]`. The whole chain runs in
-/// the shell process on one `Table` (no service boundary), so records are passed by value, not
-/// serialized. `to json` / a bare end (table) are renderings of the same model.
-fn record_pipe(ctx: &ServiceContext, line: &str) {
+// ── from json — parse text into the table model (the byte→record bridge) ──────────
+fn json_ws(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t' || b[i] == b'\n' || b[i] == b'\r') { i += 1; }
+    i
+}
+
+/// At a `"`, scan to the closing quote (a `\`-escaped char is skipped, not a terminator).
+/// Returns (content start, content end, index past the closing quote). Escapes are passed
+/// through literally — a real un-escaper is a documented follow-up.
+fn json_string(b: &[u8], i: usize) -> Option<(usize, usize, usize)> {
+    if i >= b.len() || b[i] != b'"' { return None; }
+    let start = i + 1;
+    let mut j = start;
+    while j < b.len() {
+        if b[j] == b'\\' { j += 2; continue; }
+        if b[j] == b'"' { return Some((start, j, j + 1)); }
+        j += 1;
+    }
+    None
+}
+
+/// Parse a JSON array of flat objects into a Table — the `from json` bridge (text → records).
+/// Bounded subset: `[ {"k": v, …}, … ]` with string / number / `true|false` / `null` values,
+/// **no nesting**. The first object defines the columns; later objects fill known columns (new
+/// keys are ignored). Strings intern into the table arena. Loud + `None` on malformed input.
+fn parse_json_table(ctx: &ServiceContext, input: &[u8]) -> Option<Table> {
+    let mut t = Table::new(&[]);
+    let b = input;
+    let mut i = json_ws(b, 0);
+    if i >= b.len() || b[i] != b'[' { ctx.console_writeln("from json: expected a JSON array '[ … ]'"); return None; }
+    i = json_ws(b, i + 1);
+    if i < b.len() && b[i] == b']' { return Some(t); }
+    let mut first_obj = true;
+    loop {
+        i = json_ws(b, i);
+        if i >= b.len() || b[i] != b'{' { ctx.console_writeln("from json: expected an object '{ … }'"); return None; }
+        i = json_ws(b, i + 1);
+        let mut row = [Value::Empty; REC_MAX_COLS];
+        // empty object?
+        if i < b.len() && b[i] == b'}' { i += 1; } else {
+            loop {
+                i = json_ws(b, i);
+                let (ks, ke, kn) = match json_string(b, i) {
+                    Some(x) => x,
+                    None => { ctx.console_writeln("from json: expected a \"key\""); return None; }
+                };
+                i = json_ws(b, kn);
+                if i >= b.len() || b[i] != b':' { ctx.console_writeln("from json: expected ':'"); return None; }
+                i = json_ws(b, i + 1);
+                // value → Value
+                let v;
+                if i < b.len() && b[i] == b'"' {
+                    let (vs, ve, vn) = json_string(b, i)?;
+                    v = t.intern(&b[vs..ve]);
+                    i = vn;
+                } else if b[i..].starts_with(b"true") { v = Value::Int(1); i += 4; }
+                else if b[i..].starts_with(b"false") { v = Value::Int(0); i += 5; }
+                else if b[i..].starts_with(b"null") { v = Value::Empty; i += 4; }
+                else if i < b.len() && (b[i] == b'-' || b[i].is_ascii_digit()) {
+                    let s = i;
+                    if b[i] == b'-' { i += 1; }
+                    while i < b.len() && b[i].is_ascii_digit() { i += 1; }
+                    // nested-unfriendly: a '.'/'e' (float) is stored as text
+                    if i < b.len() && (b[i] == b'.' || b[i] == b'e' || b[i] == b'E') {
+                        while i < b.len() && !matches!(b[i], b',' | b'}' | b' ' | b'\t' | b'\n' | b'\r') { i += 1; }
+                        v = t.intern(&b[s..i]);
+                    } else {
+                        v = core::str::from_utf8(&b[s..i]).ok().and_then(|x| x.parse::<u64>().ok())
+                            .map(Value::Int).unwrap_or(Value::Empty);
+                    }
+                } else {
+                    ctx.console_writeln("from json: unsupported value (nested objects/arrays not supported)");
+                    return None;
+                }
+                // map key → column (add while parsing the first object, else look up known cols)
+                let key = &b[ks..ke];
+                let ci = (0..t.ncols).find(|&c| t.col_name(c) == key);
+                let ci = match ci {
+                    Some(c) => Some(c),
+                    None if first_obj => t.add_col(key),
+                    None => None, // a key not seen in the first object — ignored
+                };
+                if let Some(ci) = ci { row[ci] = v; }
+                i = json_ws(b, i);
+                if i < b.len() && b[i] == b',' { i += 1; continue; }
+                if i < b.len() && b[i] == b'}' { i += 1; break; }
+                ctx.console_writeln("from json: expected ',' or '}'"); return None;
+            }
+        }
+        t.add_row(&row);
+        first_obj = false;
+        i = json_ws(b, i);
+        if i < b.len() && b[i] == b',' { i += 1; continue; }
+        if i < b.len() && b[i] == b']' { return Some(t); }
+        ctx.console_writeln("from json: expected ',' or ']'"); return None;
+    }
+}
+
+
+/// What flows through a pipe: either a byte buffer (text streams) or a typed Table (records).
+/// `from`/`to` convert between them; the dispatcher routes each stage by command AND by which
+/// of these it is currently holding (so `sort` is a line-sort on Bytes, a column-sort on a
+/// Table). This is the byte↔record unification.
+enum Stream {
+    Bytes(Cap),
+    Table(Table),
+}
+
+/// The unified pipe dispatcher: `A | B | C …`, threading a `Stream` that may transition between
+/// bytes and records via `from`/`to`. Stage 1 produces; middle stages transform; the last stage
+/// sinks (`write`) or, if it isn't a sink, the final stream is rendered to the console. Replaces
+/// the separate byte and record pipelines. (docs/pipes.md, docs/records.md)
+fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str) {
     let mut stages = [""; MAX_STAGES];
     let mut n = 0usize;
     for part in line.split('|') {
-        if n >= MAX_STAGES { break; }
-        stages[n] = part.trim();
+        let s = part.trim();
+        if s.is_empty() { ctx.console_writeln("usage: <producer> | <stage> [| …]"); return; }
+        if n >= MAX_STAGES { ctx.console_writeln_fmt(format_args!("pipe: too many stages (max {})", MAX_STAGES)); return; }
+        stages[n] = s;
         n += 1;
     }
-    let mut t = build_status_table(ctx);
-    let mut rendered = false;
+    if n < 2 { ctx.console_writeln("usage: <producer> | <stage> [| …]"); return; }
+
+    // Stage 1 — produce a Stream.
+    let (c0, _) = split_first(stages[0]);
+    let mut s = if is_record_producer(c0) {
+        Stream::Table(build_status_table(ctx))
+    } else if is_producer_builtin(c0) {
+        let mut cap = Cap::new();
+        run_producer(ctx, cwd, stages[0], &mut Out::Capture(&mut cap));
+        if cap.overflow { ctx.console_writeln("pipe: producer output exceeded the pipe buffer (truncated)"); }
+        Stream::Bytes(cap)
+    } else if is_pipe_producer_service(c0) {
+        let mut cap = Cap::new();
+        if !drain_service(ctx, c0, None, &mut cap) { return; }
+        Stream::Bytes(cap)
+    } else {
+        ctx.console_writeln_fmt(format_args!("pipe: '{}' cannot start a pipe", c0));
+        return;
+    };
+
+    // Stages 2..n — transform, with the last optionally a `write` sink.
     for i in 1..n {
-        let mut sa = [""; MAX_ARGS];
-        let sc = tokenize(stages[i], &mut sa);
-        match sa[0] {
-            // Compact predicate, one token: `where mem>0`, `where state=BlockRecv`. Quote only
-            // if the value has a space (`where "name=block driver"`).
-            "where" => {
-                match parse_predicate(sa.get(1).copied().unwrap_or("")) {
-                    Some((col, op, val)) => table_where(ctx, &mut t, col, op, val),
-                    None => { ctx.console_writeln("where: need a predicate like name=shell or mem>0"); return; }
+        let last = i == n - 1;
+        let (cmd, arg) = split_first(stages[i]);
+        if cmd == "write" {
+            if !last { ctx.console_writeln("pipe: write must be the last stage"); return; }
+            match &s {
+                Stream::Bytes(c) => pipe_write_file(ctx, cwd, arg, c.bytes()),
+                Stream::Table(t) => {
+                    let mut c = Cap::new();
+                    render_table(ctx, t, &mut Out::Capture(&mut c));
+                    pipe_write_file(ctx, cwd, arg, c.bytes());
                 }
             }
-            // Project columns: `select name core` keeps just those, in order.
-            "select" => {
-                if sc < 2 { ctx.console_writeln("usage: … | select <col> [col …]"); return; }
-                if !table_select(ctx, &mut t, &sa[1..sc]) { return; }
-            }
-            // Order rows by a column: `sort mem`, `sort name reverse`.
-            "sort" => {
-                let mut col = "";
-                let mut rev = false;
-                for a in &sa[1..sc] { if *a == "reverse" { rev = true; } else if col.is_empty() { col = a; } }
-                if col.is_empty() { ctx.console_writeln("usage: … | sort <col> [reverse]"); return; }
-                if !table_sort(ctx, &mut t, col, rev) { return; }
-            }
-            // Render: `to json` / `to yaml` (the edge formats). A bare end → the table view.
-            "to" => match sa.get(1) {
-                Some(&"json") => { render_json(ctx, &t, &mut Out::Console); rendered = true; }
-                Some(&"yaml") => { render_yaml(ctx, &t, &mut Out::Console); rendered = true; }
-                _ => { ctx.console_writeln("to: unknown format (try: to json | to yaml)"); return; }
-            },
-            other => {
-                ctx.console_writeln_fmt(format_args!(
-                    "records: '{}' is not a record stage (try where, select, sort, to json)", other));
-                return;
-            }
+            return;
         }
+        if !pipe_transform(ctx, stages[i], cmd, &mut s) { return; }
     }
-    if !rendered { render_table(ctx, &t, &mut Out::Console); }
-    if t.overflow {
-        ctx.console_writeln_fmt(format_args!("status: more than {} rows shown (bounded)", REC_MAX_ROWS));
+    // No `write` sink — render the final stream to the console.
+    match &s {
+        Stream::Bytes(c) => console_write_chunked(ctx, c.bytes()),
+        Stream::Table(t) => render_table(ctx, t, &mut Out::Console),
     }
+}
+
+/// Write a (possibly large) byte buffer to the console. `console_write` drops anything over
+/// 256 bytes, so split into ≤256-byte pieces. Output is ASCII (json/yaml/text), so chunk
+/// boundaries never split a multi-byte char.
+fn console_write_chunked(ctx: &ServiceContext, bytes: &[u8]) {
+    let mut i = 0;
+    while i < bytes.len() {
+        let end = (i + 256).min(bytes.len());
+        ctx.console_write(str_of(&bytes[i..end]));
+        i = end;
+    }
+}
+
+/// Apply one non-sink stage to the stream in place. Dispatches by command AND by whether the
+/// stream is currently Bytes or a Table; a mismatch is a loud error (false). `from`/`to` flip
+/// between the two worlds.
+fn pipe_transform(ctx: &ServiceContext, stage: &str, cmd: &str, s: &mut Stream) -> bool {
+    match cmd {
+        // text → records
+        "from" => {
+            let (_, fmt) = split_first(stage);
+            let (fmt, _) = split_first(fmt);
+            let bytes = match s { Stream::Bytes(c) => c, Stream::Table(_) => {
+                ctx.console_writeln("from: input is already records"); return false; } };
+            let t = match fmt {
+                "json" => match parse_json_table(ctx, bytes.bytes()) { Some(t) => t, None => return false },
+                _ => { ctx.console_writeln("from: unknown format (try: from json)"); return false; }
+            };
+            *s = Stream::Table(t);
+            true
+        }
+        // records → text
+        "to" => {
+            let (_, fmt) = split_first(stage);
+            let (fmt, _) = split_first(fmt);
+            let t = match s { Stream::Table(t) => t, Stream::Bytes(_) => {
+                ctx.console_writeln("to: input is text, not records (parse with 'from json' first)"); return false; } };
+            let mut c = Cap::new();
+            match fmt {
+                "json" => render_json(ctx, t, &mut Out::Capture(&mut c)),
+                "yaml" => render_yaml(ctx, t, &mut Out::Capture(&mut c)),
+                _ => { ctx.console_writeln("to: unknown format (try: to json | to yaml)"); return false; }
+            }
+            *s = Stream::Bytes(c);
+            true
+        }
+        // record filters (Table only)
+        "where" => match s {
+            Stream::Table(t) => match parse_predicate(split_first(stage).1) {
+                Some((col, op, val)) => { table_where(ctx, t, col, op, val); true }
+                None => { ctx.console_writeln("where: need a predicate like name=shell or mem>0"); false }
+            },
+            Stream::Bytes(_) => { ctx.console_writeln("where: needs records (try 'from json')"); false }
+        },
+        "select" => match s {
+            Stream::Table(t) => {
+                let mut sa = [""; MAX_ARGS];
+                let sc = tokenize(stage, &mut sa);
+                if sc < 2 { ctx.console_writeln("usage: … | select <col> [col …]"); return false; }
+                table_select(ctx, t, &sa[1..sc])
+            }
+            Stream::Bytes(_) => { ctx.console_writeln("select: needs records (try 'from json')"); false }
+        },
+        // sort is dual: column-sort on a Table, line-sort on Bytes
+        "sort" => match s {
+            Stream::Table(t) => {
+                let mut sa = [""; MAX_ARGS];
+                let sc = tokenize(stage, &mut sa);
+                let (mut col, mut rev) = ("", false);
+                for a in &sa[1..sc] { if *a == "reverse" { rev = true; } else if col.is_empty() { col = a; } }
+                if col.is_empty() { ctx.console_writeln("usage: … | sort [reverse] <col>"); return false; }
+                table_sort(ctx, t, col, rev)
+            }
+            Stream::Bytes(_) => byte_filter(ctx, stage, s),
+        },
+        // byte filters (Bytes only)
+        "match" | "count" | "first" | "last" => match s {
+            Stream::Bytes(_) => byte_filter(ctx, stage, s),
+            Stream::Table(_) => { ctx.console_writeln_fmt(format_args!("{}: needs text (render with 'to json' first)", cmd)); false }
+        },
+        // anything else: a service filter stage (Bytes only)
+        _ => match s {
+            Stream::Bytes(c) => {
+                let mut next = Cap::new();
+                if !drain_service(ctx, cmd, Some(c.bytes()), &mut next) { return false; }
+                *s = Stream::Bytes(next);
+                true
+            }
+            Stream::Table(_) => { ctx.console_writeln_fmt(format_args!("pipe: '{}' needs text (render with 'to json' first)", cmd)); false }
+        },
+    }
+}
+
+/// Run a built-in byte filter (match/count/sort/first/last) over the stream's bytes, replacing
+/// it with the filtered output. Caller guarantees the stream is `Bytes`.
+fn byte_filter(ctx: &ServiceContext, stage: &str, s: &mut Stream) -> bool {
+    let mut next = Cap::new();
+    if let Stream::Bytes(c) = s {
+        run_filter_builtin(ctx, stage, c.bytes(), &mut Out::Capture(&mut next));
+    }
+    *s = Stream::Bytes(next);
+    true
 }
 
 fn cmd_status(ctx: &ServiceContext) {
@@ -1391,98 +1622,6 @@ fn cmd_spawn(ctx: &ServiceContext, name: &str) {
 
 /// Maximum stages in one pipeline (§26.6 bounded).
 const MAX_STAGES: usize = 8;
-
-/// `A | B | C | …` — a capability-mediated, multi-stage pipe (Appendix D.3, docs/pipes.md).
-/// The shell orchestrates a bounded buffer down the chain: **stage 1 produces**, **middle
-/// stages filter**, the **last stage sinks**. Every hop is real IPC or in-process capture —
-/// never a hidden shared buffer (§26.4). A stage is a built-in or a service; service stages
-/// exchange whole buffers (one ≤4 KiB message each way + an EOT marker), which keeps the
-/// bounded IPC queues deadlock-free (§8.9).
-fn cmd_pipe(ctx: &ServiceContext, cwd: &Cwd, line: &str) {
-    let mut stages: [&str; MAX_STAGES] = [""; MAX_STAGES];
-    let mut n = 0usize;
-    for part in line.split('|') {
-        let s = part.trim();
-        if s.is_empty() { ctx.console_writeln("usage: <producer> | <sink> [| …]"); return; }
-        if n >= MAX_STAGES {
-            ctx.console_writeln_fmt(format_args!("pipe: too many stages (max {})", MAX_STAGES));
-            return;
-        }
-        stages[n] = s;
-        n += 1;
-    }
-    if n < 2 { ctx.console_writeln("usage: <producer> | <sink> [| …]"); return; }
-
-    // Stage 1 produces into `buf`; each middle stage filters it; the last stage sinks it.
-    let mut buf = Cap::new();
-    if !stage_produce(ctx, cwd, stages[0], &mut buf) { return; }
-    for i in 1..n - 1 {
-        let mut next = Cap::new();
-        if !stage_filter(ctx, cwd, stages[i], buf.bytes(), &mut next) { return; }
-        buf = next;
-    }
-    stage_sink(ctx, cwd, stages[n - 1], buf.bytes());
-}
-
-/// Stage 1 — must PRODUCE (it has no input). A producer built-in is captured; a producer
-/// service (`greet`) is spawned wired to the shell and drained. Anything else can't start a
-/// pipe. Returns false (loudly) on error.
-fn stage_produce(ctx: &ServiceContext, cwd: &Cwd, stage: &str, out: &mut Cap) -> bool {
-    let (cmd, _) = split_first(stage);
-    if is_producer_builtin(cmd) {
-        run_producer(ctx, cwd, stage, &mut Out::Capture(out));
-        if out.overflow { ctx.console_writeln("pipe: producer output exceeded the pipe buffer (truncated)"); }
-        return true;
-    }
-    if is_pipe_producer_service(cmd) {
-        return drain_service(ctx, cmd, None, out);
-    }
-    ctx.console_writeln_fmt(format_args!("pipe: '{}' cannot start a pipe (it produces no output)", cmd));
-    false
-}
-
-/// A middle stage — must FILTER (consume input, emit output). A filter built-in (`match`)
-/// transforms in-process; a service filter (`upper`) does it via a round-trip. A producer
-/// built-in or `write` in the middle is a loud error.
-fn stage_filter(ctx: &ServiceContext, cwd: &Cwd, stage: &str, input: &[u8], out: &mut Cap) -> bool {
-    let (cmd, _) = split_first(stage);
-    let _ = cwd;
-    if is_filter_builtin(cmd) {
-        return run_filter_builtin(ctx, stage, input, &mut Out::Capture(out));
-    }
-    if is_producer_builtin(cmd) || cmd == "write" {
-        ctx.console_writeln_fmt(format_args!("pipe: '{}' cannot be used mid-pipe (it is not a filter)", cmd));
-        return false;
-    }
-    drain_service(ctx, cmd, Some(input), out) // service filter (upper)
-}
-
-/// Built-in FILTERS — they consume input and emit output, so they can sit mid-pipe. Run
-/// in-process, so they are NOT subject to the 4 KiB service-boundary cap.
-fn is_filter_builtin(name: &str) -> bool {
-    matches!(name, "match" | "count" | "sort" | "first" | "last")
-}
-
-/// The last stage — consumes the final buffer. `write <file>` writes it; a service filters it
-/// and its output is printed; a producer built-in here is a loud error (it ignores input).
-fn stage_sink(ctx: &ServiceContext, cwd: &Cwd, stage: &str, input: &[u8]) {
-    let (cmd, arg) = split_first(stage);
-    if cmd == "write" { pipe_write_file(ctx, cwd, arg, input); return; }
-    if is_filter_builtin(cmd) {
-        // `match` as the final stage: print the matching lines to the console.
-        run_filter_builtin(ctx, stage, input, &mut Out::Console);
-        return;
-    }
-    if is_producer_builtin(cmd) {
-        ctx.console_writeln_fmt(format_args!("pipe: '{}' ignores piped input (it is a producer)", cmd));
-        return;
-    }
-    // A service sink/filter: send it the input, drain its output, print the result.
-    let mut out = Cap::new();
-    if drain_service(ctx, cmd, Some(input), &mut out) {
-        ctx.console_write(str_of(out.bytes()));
-    }
-}
 
 /// Run a SERVICE stage. `input == None` → a producer (`greet`): spawn it wired to the shell
 /// and drain its output. `input == Some(bytes)` → a filter/sink (`upper`): also send it the
@@ -2945,14 +3084,6 @@ fn write_bytes(buf: &mut [u8], pos: &mut usize, src: &[u8]) {
 fn write_u32(buf: &mut [u8], pos: &mut usize, n: u32) {
     let mut tmp = [0u8; 10];
     let s = u32_to_str(n, &mut tmp);
-    write_bytes(buf, pos, s.as_bytes());
-}
-
-fn write_u32_padded(buf: &mut [u8], pos: &mut usize, n: u32, width: usize) {
-    let mut tmp = [0u8; 10];
-    let s = u32_to_str(n, &mut tmp);
-    let pad = width.saturating_sub(s.len());
-    for _ in 0..pad { if *pos < buf.len() { buf[*pos] = b' '; *pos += 1; } }
     write_bytes(buf, pos, s.as_bytes());
 }
 
