@@ -921,6 +921,28 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL — match quoting timeout"); fail += 1; }
     }
 
+    // ── count: the wc-equivalent (lines / words / bytes) ────────────────────────────
+    // Pipe sink: count a producer's lines. greet emits 3 lines.
+    match run!(b"greet | count\r", 14) {
+        Some(r) => check!(r.contains("3 lines"), "count: pipe sink (greet | count → 3 lines)"),
+        None    => { println!("files-test: FAIL — greet|count timeout"); fail += 1; }
+    }
+    // Direct: count a file (greet's 3 lines were written to /greetout.txt earlier).
+    match run!(b"count /greetout.txt\r", 10) {
+        Some(r) => check!(r.contains("3 lines"), "count: direct file count (/greetout.txt → 3 lines)"),
+        None    => { println!("files-test: FAIL — count direct timeout"); fail += 1; }
+    }
+    // Singular forms: echo emits one line, one word.
+    match run!(b"echo hello | count\r", 14) {
+        Some(r) => check!(r.contains("1 line,") && r.contains("1 word,"), "count: singular (1 line, 1 word)"),
+        None    => { println!("files-test: FAIL — echo|count timeout"); fail += 1; }
+    }
+    // Composition: filter then count (producer | match | count) — drop the 'hello' line, count 2.
+    match run!(b"greet | match except hello | count\r", 16) {
+        Some(r) => check!(r.contains("2 lines"), "count: composes after a filter (greet | match except hello | count)"),
+        None    => { println!("files-test: FAIL — greet|match|count timeout"); fail += 1; }
+    }
+
     child.kill().ok();
     child.wait().ok();
     println!("\nfiles-test: {pass} passed, {fail} failed");
