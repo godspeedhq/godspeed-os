@@ -176,15 +176,34 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(r) => check!(r.contains("\"name\":") && r.contains("\"state\":"), "status | to json: JSON objects"),
         None    => { println!("shell-test: FAIL — status|to json timeout"); fail += 1; }
     }
-    send(&mut write_half, b"status | where name = shell\r");
+    // Compact predicate: where col<op>val (no spaces, no quotes needed).
+    send(&mut write_half, b"status | where name=shell\r");
     match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("shell") && !r.contains("logger"), "status | where name = shell: filters rows"),
+        Some(r) => check!(r.contains("shell") && !r.contains("logger"), "status | where name=shell: filters rows"),
         None    => { println!("shell-test: FAIL — status|where timeout"); fail += 1; }
     }
-    send(&mut write_half, b"status | where name = shell | to json\r");
+    send(&mut write_half, b"status | where name=shell | to json\r");
     match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("\"name\": \"shell\"") && !r.contains("\"logger\""), "status | where … | to json: filtered JSON"),
         None    => { println!("shell-test: FAIL — status|where|json timeout"); fail += 1; }
+    }
+    // select: project columns.
+    send(&mut write_half, b"status | where name=shell | select name state\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("name") && r.contains("state") && !r.contains("restarts"), "status | select: projects columns"),
+        None    => { println!("shell-test: FAIL — status|select timeout"); fail += 1; }
+    }
+    // to yaml: the other edge rendering.
+    send(&mut write_half, b"status | where name=shell | to yaml\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("- slot:") && r.contains("name: shell"), "status | to yaml: YAML mapping list"),
+        None    => { println!("shell-test: FAIL — status|to yaml timeout"); fail += 1; }
+    }
+    // sort by a column (just exercise the path; ordering of the full table is host-dependent).
+    send(&mut write_half, b"status | sort name | to json\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("\"name\":") && r.contains("shell"), "status | sort name: sorts the table"),
+        None    => { println!("shell-test: FAIL — status|sort timeout"); fail += 1; }
     }
 
     // -----------------------------------------------------------------------
