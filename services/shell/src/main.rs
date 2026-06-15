@@ -439,6 +439,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
         "tree"    => cmd_tree(ctx, cwd, if argc >= 2 { args[1] } else { "" }, &mut Out::Console),
         "match"   => cmd_match(ctx, cwd, &args, argc),
         "count"   => cmd_count(ctx, cwd, &args, argc),
+        "sort"    => cmd_sort(ctx, cwd, &args, argc),
         other => {
             // Build "unknown: <cmd>" in a stack buffer to avoid two ctx.log calls
             let mut buf = [0u8; 64];
@@ -463,7 +464,7 @@ const UTIL_VERSION: &str = "0.1.0";
 const UTILS: &[&str] = &[
     "echo", "clear", "about", "mem", "cores", "date", "status", "observe", "caps",
     "spawn", "kill", "restart", "reboot", "drives", "ls", "cd", "read", "write",
-    "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count",
+    "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count", "sort",
 ];
 fn is_util(name: &str) -> bool { UTILS.contains(&name) }
 
@@ -599,6 +600,11 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("<producer> | count", "count piped input", "find *.txt | count"),
             ("count <path>", "count a file", "count /log"),
         ], true),
+        "sort" => help_block(ctx, "sort", "order the lines (ascending, or reverse)", &[
+            ("<producer> | sort", "sort piped lines", "find *.txt | sort"),
+            ("sort <path>", "sort a file's lines", "sort /names.txt"),
+            ("sort reverse [path]", "sort descending", "read /names.txt | sort reverse"),
+        ], true),
         _ => return false,
     }
     true
@@ -618,6 +624,9 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
         ], false),
         ("match", "except") => help_block(ctx, "match except", "keep the lines that do NOT match", &[
             ("match except <pattern> [path]", "drop matching lines, keep the rest", "read /log | match except debug"),
+        ], false),
+        ("sort", "reverse") => help_block(ctx, "sort reverse", "order the lines descending", &[
+            ("sort reverse [path]", "sort Z→A / high→low", "read /names.txt | sort reverse"),
         ], false),
         ("drives", "flash") => help_block(ctx, "drives flash", "format a drive as GSFS (ERASES it; asks y/N)", &[
             ("drives flash", "format the only drive, no label", "drives flash"),
@@ -674,6 +683,7 @@ fn cmd_help(ctx: &ServiceContext) {
     help_line(ctx, "tree [path]", "print the directory hierarchy");
     help_line(ctx, "match <pattern> [path]", "keep lines matching (also: <prod> | match)");
     help_line(ctx, "count [path]", "count lines/words/bytes (also: <prod> | count)");
+    help_line(ctx, "sort [reverse] [path]", "order lines (also: <prod> | sort)");
     ctx.console_writeln("");
     ctx.console_writeln("Pipes");
     help_line(ctx, "<producer> | [filter |…] <sink>", "compose stages (Appendix D)");
@@ -1082,7 +1092,7 @@ fn stage_filter(ctx: &ServiceContext, cwd: &Cwd, stage: &str, input: &[u8], out:
 /// Built-in FILTERS — they consume input and emit output, so they can sit mid-pipe. Run
 /// in-process, so they are NOT subject to the 4 KiB service-boundary cap.
 fn is_filter_builtin(name: &str) -> bool {
-    matches!(name, "match" | "count")
+    matches!(name, "match" | "count" | "sort")
 }
 
 /// The last stage — consumes the final buffer. `write <file>` writes it; a service filters it
@@ -2106,6 +2116,13 @@ fn run_filter_builtin(ctx: &ServiceContext, stage: &str, input: &[u8], out: &mut
     let (cmd, _) = split_first(stage);
     match cmd {
         "count" => { write_count(ctx, input, out); true }
+        "sort" => {
+            let mut sargs = [""; MAX_ARGS];
+            let sac = tokenize(stage, &mut sargs);
+            let (reverse, _) = parse_sort(&sargs, sac, 1);
+            write_sorted(ctx, input, reverse, out);
+            true
+        }
         _ => {
             // match (the default filter): tokenize for the `except` keyword + a quoted pattern.
             let mut margs = [""; MAX_ARGS];
@@ -2168,6 +2185,83 @@ fn cmd_count(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) {
         write_count(ctx, &p[5..end], &mut Out::Console);
     } else {
         ctx.console_writeln_fmt(format_args!("count: not found: {}", str_of(abspath)));
+    }
+}
+
+// ── sort — order the lines (ascending, or `reverse`) ─────────────────────────────
+// `sort [reverse] <path>` sorts a file; `<producer> | sort [reverse]` sorts piped input. A
+// built-in FILTER like match/count. See utilities/29_sort.md.
+
+/// Most lines `sort` will order in one pass (§26.6 bounded). Beyond this it sorts the first
+/// `SORT_MAX_LINES` and says so — never silently drops the rest. The index array is
+/// `SORT_MAX_LINES × 16 bytes` on the stack.
+const SORT_MAX_LINES: usize = 1024;
+
+/// Pick `reverse` out of a `sort` invocation's args and return `(reverse, path)`. `reverse` is a
+/// keyword wherever it appears (after the verb); the other arg is the path ("" if none).
+fn parse_sort<'a>(args: &[&'a str], argc: usize, start: usize) -> (bool, &'a str) {
+    let mut reverse = false;
+    let mut path = "";
+    for i in start..argc {
+        if args[i] == "reverse" { reverse = true; }
+        else if path.is_empty() { path = args[i]; }
+    }
+    (reverse, path)
+}
+
+/// Sort `input`'s lines lexicographically (by bytes) and write them to `out`, descending if
+/// `reverse`. Blank lines are dropped; ties keep no defined order (`sort_unstable`). Bounded:
+/// the first `SORT_MAX_LINES` are sorted, with a loud note if there are more.
+fn write_sorted(ctx: &ServiceContext, input: &[u8], reverse: bool, out: &mut Out) {
+    let mut lines: [(usize, usize); SORT_MAX_LINES] = [(0, 0); SORT_MAX_LINES];
+    let mut n = 0usize;
+    let mut overflow = false;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i <= input.len() {
+        if i == input.len() || input[i] == b'\n' {
+            if i > start {
+                if n < SORT_MAX_LINES { lines[n] = (start, i); n += 1; } else { overflow = true; }
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    lines[..n].sort_unstable_by(|&(s1, e1), &(s2, e2)| input[s1..e1].cmp(&input[s2..e2]));
+    let mut emit = |k: usize| {
+        let (s, e) = lines[k];
+        out.put_bytes(ctx, &input[s..e]);
+        out.put(ctx, "\n");
+    };
+    if reverse { for k in (0..n).rev() { emit(k); } } else { for k in 0..n { emit(k); } }
+    if overflow {
+        ctx.console_writeln_fmt(format_args!(
+            "sort: more than {} lines — sorted the first {} (bounded)", SORT_MAX_LINES, SORT_MAX_LINES));
+    }
+}
+
+/// `sort [reverse] <path>` — print a file's lines in order. The pipe form `<producer> | sort`
+/// sorts piped input instead; either way `sort` consumes input (never a producer).
+fn cmd_sort(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) {
+    let (reverse, path) = parse_sort(args, argc, 1);
+    if path.is_empty() {
+        ctx.console_writeln("sort: a path is required (or pipe input: <producer> | sort)");
+        return;
+    }
+    let mut buf = [0u8; PATH_MAX];
+    let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return };
+    let reply = match fs_request(ctx, OP_READ_FILE, abspath, &[]) {
+        Some(r) => r,
+        None => { ctx.console_writeln("sort: storage unavailable"); return; }
+    };
+    let p = reply.payload_bytes();
+    if no_fs(ctx, p) { return; }
+    if p.first() == Some(&FS_OK) && p.len() >= 5 {
+        let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
+        let end = (5 + n).min(p.len());
+        write_sorted(ctx, &p[5..end], reverse, &mut Out::Console);
+    } else {
+        ctx.console_writeln_fmt(format_args!("sort: not found: {}", str_of(abspath)));
     }
 }
 
