@@ -1330,6 +1330,83 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     }
 }
 
+/// Boot bare-metal with a GSFS disk that has a self-checking `/suite.gs` baked in (host-side),
+/// then `run /suite.gs` — proving the flash-and-run loop and piped asserts in a script.
+pub fn run_script(image_path: &Path, disk_path: &str, smp: u32) {
+    println!("script-test: booting (smp={smp}) with a host-baked GSFS suite disk");
+
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let disk      = std::fs::canonicalize(disk_path).unwrap_or_else(|_| std::path::PathBuf::from(disk_path));
+    let disk_str  = disk.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(),
+        "-m",       "512M",
+        "-serial",  &format!("tcp::{shell_port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ])
+    .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| {
+        eprintln!("script-test: QEMU launch failed at {qemu}: {e}"); std::process::exit(1);
+    });
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => { eprintln!("script-test: could not connect to serial {shell_port}"); child.kill().ok(); std::process::exit(1); }
+    };
+    let mut read_half  = stream.try_clone().expect("clone tcp stream");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop {
+                match read_half.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]),
+                }
+            }
+        });
+    }
+
+    let mut pass = 0usize;
+    let mut fail = 0usize;
+    let mut cursor = 0usize;
+
+    if collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(40)).is_none() {
+        let got = { String::from_utf8_lossy(&buf.lock().unwrap()).into_owned() };
+        println!("script-test: FAIL — timed out waiting for first gs>\n{got}");
+        child.kill().ok(); child.wait().ok();
+        std::process::exit(1);
+    }
+
+    // Run the baked suite. The disk is GSFS (baked host-side), so the OS mounts it on boot and
+    // /suite.gs is present — no on-device authoring.
+    send(&mut write_half, b"run /suite.gs\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(20)) {
+        Some(r) => {
+            println!("\n=== baked suite transcript ===\n{}\n=== end ===", r.trim());
+            if r.contains("run: ran 6, failed 0") { println!("script-test: PASS — baked suite ran green (6/0)"); pass += 1; }
+            else { println!("script-test: FAIL — baked suite not green"); fail += 1; }
+        }
+        None => { println!("script-test: FAIL — `run /suite.gs` timed out"); fail += 1; }
+    }
+
+    child.kill().ok();
+    child.wait().ok();
+    println!("\nscript-test: {pass} passed, {fail} failed");
+    if fail > 0 { std::process::exit(1); }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

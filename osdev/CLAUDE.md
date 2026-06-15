@@ -26,6 +26,10 @@ Host-side developer CLI (§17). Builds for the developer's machine, not the kern
 | `osdev test chaos`          | Run chaos / partial-failure tests (C1–C7) ✅ 7/7 |
 | `osdev test chaos-brutal`   | Run brutal chaos tests (BC1–BC7) ✅ 7/7 |
 | `osdev test shell`          | Scripted shell smoke-test: boot, help, cores, status, unknown |
+| `osdev test files`          | Files/records/pipes/`result`/`run`/`assert` over a RAW AHCI disk (112 checks) |
+| `osdev test script`         | Bake a self-checking `.gs` (with piped asserts) into a GSFS disk, boot, `run /suite.gs`, assert `ran N, failed 0` — the host-baked-script loop |
+| `osdev mkfs <image>`        | Format a disk image as GSFS0003 (empty) |
+| `osdev script-disk <out> <script.gs>` | Build a flashable GSFS data disk with `<script>` baked in as `/<basename>` — `dd` it to the data drive, boot, `run /<basename>` (the hardware self-check) |
 | `osdev validate`            | Validate all contracts against the JSON schema |
 | `osdev shell [--smp N]`     | Boot in QEMU with the interactive shell on stdin/stdout (bare-metal build — no probe services; type `help` at `gs>` prompt; Ctrl-A X to quit) |
 | `osdev image`               | Build with `bare-metal` supervisor + create UEFI-bootable `build/os.img` (GPT + ESP + BOOTX64.EFI) |
@@ -42,6 +46,16 @@ Host-side developer CLI (§17). Builds for the developer's machine, not the kern
 | `src/validator.rs`| Contract validation + all test suite runners (identity, property, fuzz, stress, perf, adversarial, chaos, and their brutal variants) |
 | `src/qemu.rs`    | QEMU launch helpers (`spawn_for_test`, `spawn_for_test_custom`) — file-based serial (`-serial file:`) on all platforms |
 | `src/disk_image.rs` | UEFI GPT disk image creation: protective MBR, GPT headers (CRC32), EFI System Partition (FAT32), `BOOTX64.EFI`, `limine.conf`, `kernel.elf` |
+
+### GSFS host-side writer (`src/main.rs`)
+
+`format_superblock` writes an empty GSFS0003 (superblock + free bitmap + root dir), and
+`gsfs_add_file` bakes a file into it (allocate a contiguous extent, write content, add a root
+`file_record`, update the free count) — a host-side mirror of the `fs` write path, kept in lockstep
+with the on-disk format documented at the top of `main.rs` and in `docs/persistence.md` §6.4. This
+is what lets `osdev script-disk` ship a `.gs` suite to hardware: bake → `dd` to the data drive →
+boot → `run /suite.gs`. `osdev test script` proves the loop end to end (incl. piped asserts a
+script file can carry but on-device typing can't).
 
 ## Build
 
