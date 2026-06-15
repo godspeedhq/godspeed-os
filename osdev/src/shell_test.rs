@@ -974,6 +974,41 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL — greet|sort|count timeout"); fail += 1; }
     }
 
+    // ── first / last: keep the first/last N lines (greet emits hello / capability / no-ambient) ──
+    match run!(b"greet | first 1\r", 14) {
+        Some(r) => check!(r.contains("hello from godspeed") && !r.contains("no ambient authority here"),
+                          "first: keeps only the first line (first 1)"),
+        None    => { println!("files-test: FAIL — greet|first timeout"); fail += 1; }
+    }
+    match run!(b"greet | last 1\r", 14) {
+        Some(r) => check!(r.contains("no ambient authority here") && !r.contains("hello from godspeed"),
+                          "last: keeps only the last line (last 1)"),
+        None    => { println!("files-test: FAIL — greet|last timeout"); fail += 1; }
+    }
+    match run!(b"greet | first 2\r", 14) {
+        Some(r) => check!(r.contains("hello from godspeed") && r.contains("capability pipes work")
+                          && !r.contains("no ambient authority here"), "first 2: keeps the first two"),
+        None    => { println!("files-test: FAIL — greet|first 2 timeout"); fail += 1; }
+    }
+    // Default count (no N) = 10, so all 3 greet lines pass.
+    match run!(b"greet | last\r", 14) {
+        Some(r) => check!(r.contains("hello from godspeed") && r.contains("no ambient authority here"),
+                          "last: default N=10 (all 3 lines)"),
+        None    => { println!("files-test: FAIL — greet|last default timeout"); fail += 1; }
+    }
+    // Direct form on a file.
+    match run!(b"last 1 /greetout.txt\r", 10) {
+        Some(r) => check!(r.contains("no ambient authority here") && !r.contains("hello from godspeed"),
+                          "last: direct file (last 1 /greetout.txt)"),
+        None    => { println!("files-test: FAIL — last direct timeout"); fail += 1; }
+    }
+    // Composition: sort then take the first line → the alphabetically-first ("capability …").
+    match run!(b"greet | sort | first 1\r", 16) {
+        Some(r) => check!(r.contains("capability pipes work") && !r.contains("hello from godspeed"),
+                          "first: composes after sort (greet | sort | first 1)"),
+        None    => { println!("files-test: FAIL — greet|sort|first timeout"); fail += 1; }
+    }
+
     child.kill().ok();
     child.wait().ok();
     println!("\nfiles-test: {pass} passed, {fail} failed");
