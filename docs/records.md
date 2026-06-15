@@ -20,15 +20,18 @@ is therefore a **typed value**, with text/JSON as *renderings* of it — never t
 
 ## The three representations
 
-1. **In-memory model** — a Rust value (today a `Table`: typed columns + rows). The "language
-   between utilities". Between *built-in* stages (same address space) it is passed **by value**,
-   never serialized.
+1. **In-memory model** — a Rust value, the `Table` (typed columns + rows). The "language between
+   utilities", and it lives in the **SDK** (`godspeed_sdk::record`) so *any* service can build,
+   filter, and render records — not just the shell. Between same-address-space stages it is
+   passed **by value**, never serialized.
 2. **Wire codec** — a compact, *bounded* binary encoding, used **only** when a record must cross
-   a service boundary. Not built yet (the only producer, `status`, is shell-side). It is
-   emphatically **not** JSON — JSON on the wire is the slow, unbounded thing we are escaping.
-3. **Edge renderers** — `to json` (built), `to yaml`, the default aligned table. These live at
-   the *edge*: terminal output, or export for interop. A record never *is* JSON; JSON is one way
-   to *print* it.
+   a service boundary. Not built yet (every producer is shell-side today). It is emphatically
+   **not** JSON — JSON on the wire is the slow, unbounded thing we are escaping. Until it exists,
+   a service still participates in a record pipe by rendering `to json` internally and emitting
+   bytes, which `| from json` lifts back to records (`sdk/rust/CLAUDE.md`).
+3. **Edge renderers** — `to json`, `to yaml`, the default aligned grid (all built, in the SDK).
+   These live at the *edge*: terminal output, or export for interop. A record never *is* JSON;
+   JSON is one way to *print* it.
 
 ## The model — a bounded `Table`
 
@@ -115,12 +118,14 @@ pair.
   byte↔record pipeline** (`Stream = Bytes | Table`, dispatched by command + data type, `from`/`to`
   bridging). All in-process (no wire codec), QEMU-verified incl. a json → records → yaml → file
   round-trip and `ls | where type=file | sort reverse size`.
+- **Also built:** the **SDK record API** — the `Table` model, `where`/`select`/`sort`,
+  `to_json`/`to_yaml`/`to_grid` (over a `RecordSink`), and `from_json` now live in
+  `godspeed_sdk::record`, so any service can produce records and render them to JSON/YAML
+  (`sdk/rust/CLAUDE.md`). A service emits records today via `to_json` + the byte-pipe contract;
+  `| from json` lifts them back.
 - **Next:** a JSON string-escaper (values are plain ASCII today); the bounded **wire codec** —
-  pulled into existence the day a record must cross a *service* boundary (every producer is
-  shell-side today; `observe now` is built shell-side precisely to avoid needing it yet); an
-  **SDK record API** (the `Table` type + `to json`/`to yaml` + a producer/filter service
-  contract) so third-party services can emit records, which is the *same* wire-codec milestone;
-  `from yaml`; eventually heterogeneous records and richer interop.
+  pulled into existence the day a record must cross a *service* boundary as records (skipping the
+  JSON round-trip); `from yaml`; eventually heterogeneous records and richer interop.
 
 ## Discipline (so it doesn't rot into PowerShell-magic)
 
