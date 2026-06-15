@@ -315,6 +315,21 @@ pub fn run(image_path: &Path, smp: u32) {
         None => { println!("shell-test: FAIL — timed out after caps logger"); fail += 2; }
     }
 
+    // caps as a record producer (docs/records.md): piped, it emits resource/rights rows.
+    send(&mut write_half, b"caps | to json\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("\"resource\":") && r.contains("\"rights\":"),
+                          "caps record: to json renders resource/rights"),
+        None    => { println!("shell-test: FAIL — caps|to json timeout"); fail += 1; }
+    }
+    // where on the resource column: the shell holds the spawn cap, so this keeps a row.
+    send(&mut write_half, b"caps | where resource=spawn\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("spawn") && r.contains("resource"),
+                          "caps record: where resource=spawn keeps the spawn cap"),
+        None    => { println!("shell-test: FAIL — caps|where timeout"); fail += 1; }
+    }
+
     // -----------------------------------------------------------------------
     // Singleton guard — spawning an already-live service (here the trusted-root
     // supervisor) must be refused, so the shell can't create a duplicate TCB.
@@ -1152,6 +1167,34 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         Some(r) => check!(r.contains("record stream") && r.contains("where"),
                           "ls record: text filter (match) on records errors with guidance"),
         None    => { println!("files-test: FAIL — ls|match guard timeout"); fail += 1; }
+    }
+
+    // ── drives as a record producer: the attached disk as a row (index/label/status/size) ──
+    // The test disk is GSFS-formatted (we've been writing files to it).
+    match run!(b"drives | to json\r", 12) {
+        Some(r) => check!(r.contains("\"status\": \"GSFS\"") && r.contains("\"size_mib\":"),
+                          "drives record: to json renders the GSFS drive row"),
+        None    => { println!("files-test: FAIL — drives|to json timeout"); fail += 1; }
+    }
+
+    // ── find as a record producer: each hit is a row (name/type/path) ──────────────────
+    // /lsr holds big.txt + tiny.txt (files) and kids (dir).
+    match run!(b"find big /lsr | to json\r", 12) {
+        Some(r) => check!(r.contains("big.txt") && r.contains("\"type\": \"file\"") && r.contains("/lsr/big.txt"),
+                          "find record: to json renders name/type/path"),
+        None    => { println!("files-test: FAIL — find|to json timeout"); fail += 1; }
+    }
+    // where on the type column: a `*` glob matches all three, where type=dir keeps only kids.
+    match run!(b"find * /lsr | where type=dir\r", 12) {
+        Some(r) => check!(r.contains("kids") && !r.contains("big.txt"),
+                          "find record: where type=dir keeps the subdir, drops the files"),
+        None    => { println!("files-test: FAIL — find|where type=dir timeout"); fail += 1; }
+    }
+    // select projects the path column for files only.
+    match run!(b"find *.txt /lsr | select path\r", 12) {
+        Some(r) => check!(r.contains("/lsr/big.txt") && r.contains("/lsr/tiny.txt"),
+                          "find record: select path projects the matched paths"),
+        None    => { println!("files-test: FAIL — find|select timeout"); fail += 1; }
     }
 
     child.kill().ok();

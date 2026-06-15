@@ -43,6 +43,22 @@ gs> find *.txt
   find: 2 match(es)
 ```
 
+### As a record producer (typed pipes)
+
+Bare `find` prints the matching paths (above); **in a pipe** it is a record producer
+(`docs/records.md`, `utilities/31_records.md`) emitting a typed table — columns
+**`name` / `type` / `path`** — so each hit's structure is filterable:
+
+```
+find *.txt | where type=file        only file hits (not matching directories)
+find report | select path           just the paths
+find * /docs | where type=dir       directories under /docs
+find *.log | to json                the hits as JSON
+```
+
+This is the structured form of the planned type filter (§5): `where type=file` / `where
+type=dir` replaces a `-type`-style flag.
+
 ## 2. How it works — a tree walk (the tree *is* the index)
 
 `find` is the disciplined realisation of "enumerate everything": it **walks the directory
@@ -74,7 +90,7 @@ same `find` command (lazy, version-invalidated, rebuilt-from-truth — §6.5). U
 - **Substring match — done** (`find report` matches `report.txt`). **Glob patterns — done**
   (`find *.txt`, `find f?`): a pattern with `*`/`?` switches to anchored glob matching, no
   `-name` flag — the pattern speaks for itself.
-- **Type filter** (files only / dirs only).
+- **Type filter — done** via the record pipe (`find … | where type=file`), not a flag.
 - **`fs_index`-backed fast path** when the tree-walk is measured too slow (§6.5).
 
 ## 6. Implementation shape & conformance

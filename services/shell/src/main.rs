@@ -535,9 +535,10 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("observe", "full-screen live view (q to quit)", "observe"),
             ("observe now", "one-shot metrics frame", "observe now"),
         ], true),
-        "caps" => help_block(ctx, "caps", "show a service's capabilities", &[
+        "caps" => help_block(ctx, "caps", "show a service's capabilities (records when piped)", &[
             ("caps", "this shell's own capabilities", "caps"),
             ("caps <service>", "capabilities held by <service>", "caps logger"),
+            ("caps [service] | <verb>", "piped: records resource/rights", "caps logger | where rights~send"),
         ], true),
         "spawn" => help_block(ctx, "spawn", "start a service", &[
             ("spawn <name>", "start the service <name>", "spawn pong"),
@@ -552,8 +553,9 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "reboot" => help_block(ctx, "reboot", "hardware reset", &[
             ("reboot", "reset the machine", "reboot"),
         ], true),
-        "drives" => help_block(ctx, "drives", "manage attached disks", &[
+        "drives" => help_block(ctx, "drives", "manage attached disks (records when piped)", &[
             ("drives", "list attached drive(s)", "drives"),
+            ("drives | <verb>", "piped: records index/label/status/size_mib/free_mib", "drives | where free_mib>0"),
             ("drives flash [drive] [label]", "format a drive as GSFS (ERASES)", "drives flash 0 data"),
             ("drives label [drive] <name>", "name / rename a drive", "drives label 0 archive"),
             ("drives reset [drive]", "un-format a drive back to raw", "drives reset 0"),
@@ -594,10 +596,11 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("delete <path>", "remove the file/empty dir <path>", "delete /docs/old.txt"),
             ("delete <path> recursive", "remove directory <path> and everything under it", "delete /docs recursive"),
         ], true),
-        "find" => help_block(ctx, "find", "search the tree by name (substring, or glob with */?)", &[
+        "find" => help_block(ctx, "find", "search the tree by name (substring/glob; records when piped)", &[
             ("find <name>", "matches names containing <name>", "find report"),
             ("find <glob>", "glob match: * = any run, ? = one char", "find *.txt"),
             ("find <pattern> <path>", "search only under <path>", "find *.txt /docs"),
+            ("find … | <verb>", "piped: records name/type/path", "find *.txt | where type=file"),
         ], true),
         "tree" => help_block(ctx, "tree", "print the directory hierarchy", &[
             ("tree", "tree of the current directory", "tree"),
@@ -902,13 +905,14 @@ impl Table {
 
 /// Render a table as an aligned text grid (the default view). Two passes: column widths, then
 /// the header and rows. Output goes through `Out` so it works to the console or a capture.
+/// String cells render in full (via the arena) — never through the 24-byte `fmt_cell` scratch —
+/// so a long value like a `find` path is not silently clipped (§3.12).
 fn render_table(ctx: &ServiceContext, t: &Table, out: &mut Out) {
     let mut w = [0usize; REC_MAX_COLS];
     for c in 0..t.ncols { w[c] = t.col_name(c).len(); }
-    let mut cell = [0u8; 24];
     for r in 0..t.nrows {
         for c in 0..t.ncols {
-            let n = fmt_cell(t, t.rows[r][c], &mut cell);
+            let n = cell_width(t, t.rows[r][c]);
             if n > w[c] { w[c] = n; }
         }
     }
@@ -919,13 +923,25 @@ fn render_table(ctx: &ServiceContext, t: &Table, out: &mut Out) {
     }
     out.put(ctx, "\n");
     // rows
+    let mut scratch = [0u8; 24];
     for r in 0..t.nrows {
         for c in 0..t.ncols {
-            let n = fmt_cell(t, t.rows[r][c], &mut cell);
-            out.put_bytes(ctx, &cell[..n]);
+            let n = match t.rows[r][c] {
+                Value::Str { .. } => { let s = t.cell_str(t.rows[r][c]); out.put_bytes(ctx, s); s.len() }
+                v => { let n = fmt_cell(t, v, &mut scratch); out.put_bytes(ctx, &scratch[..n]); n }
+            };
             pad(ctx, out, w[c] - n + 2);
         }
         out.put(ctx, "\n");
+    }
+}
+
+/// Display width of a cell: a string's full arena length, else its formatted (numeric) length.
+fn cell_width(t: &Table, v: Value) -> usize {
+    match v {
+        Value::Str { len, .. } => len as usize,
+        Value::Int(_) => { let mut b = [0u8; 24]; fmt_cell(t, v, &mut b) }
+        Value::Empty => 0,
     }
 }
 
@@ -1138,11 +1154,13 @@ fn build_status_table(ctx: &ServiceContext) -> Table {
     t
 }
 
-/// Producers that emit a structured TABLE rather than text. `status` (task roster) and `ls`
-/// (directory listing) are inherently tabular, so in a pipe they emit records — composed with
-/// `where`/`select`/`sort <col>`, not the text filters. Bare (un-piped) they still print text.
+/// Producers that emit a structured TABLE rather than text. These are inherently tabular
+/// (uniform rows), so in a pipe they emit records — composed with `where`/`select`/`sort <col>`,
+/// not the text filters. Bare (un-piped) each still prints its normal text. `status` (task
+/// roster), `ls` (dir listing), `caps` (held capabilities), `drives` (attached disks), `find`
+/// (search hits) are shell-side, so no wire codec is needed — they pass by value like `status`.
 fn is_record_producer(name: &str) -> bool {
-    matches!(name, "status" | "ls")
+    matches!(name, "status" | "ls" | "caps" | "drives" | "find")
 }
 
 /// `ls` as a record producer: directory entries as a table (`name` / `type` / `size`). Mirrors
@@ -1176,6 +1194,149 @@ fn build_ls_table(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Option<Table> {
         let kind = t.intern(if is_dir { b"dir" } else { b"file" });
         let sz = if is_dir { Value::Empty } else { Value::Int(size) };
         t.add_row(&[name, kind, sz]);
+    }
+    Some(t)
+}
+
+/// `caps` as a record producer: one row per held capability — `resource` (the target,
+/// named for stable kernel resources, else `endpoint#N`) and `rights` (the spelled-out
+/// right words). Mirrors `cmd_caps`'s decoding. `name` empty → this shell's own caps.
+fn build_caps_table(ctx: &ServiceContext, name: &str) -> Option<Table> {
+    let name = if name.is_empty() { "shell" } else { name };
+    let slot = match slot_of(ctx, name) {
+        Some(s) => s,
+        None => { ctx.console_writeln("caps: no such live service"); return None; }
+    };
+    let mut caps = [CapInfo::default(); 64];
+    let n = ctx.task_caps(slot, &mut caps);
+    let mut t = Table::new(&["resource", "rights"]);
+    for cap in caps.iter().take(n) {
+        let mut rb = [0u8; 32];
+        let rlen = cap_resource_name(cap.resource_id, &mut rb);
+        let res = t.intern(&rb[..rlen]);
+        let mut gb = [0u8; 48];
+        let glen = cap_rights_str(cap.rights, &mut gb);
+        let rights = t.intern(&gb[..glen]);
+        t.add_row(&[res, rights]);
+    }
+    Some(t)
+}
+
+/// Write a capability's resource name into `buf`, returning its length. Stable kernel
+/// resources by id (matching `cmd_caps`), everything else as `endpoint#N`.
+fn cap_resource_name(id: u64, buf: &mut [u8]) -> usize {
+    let mut p = 0usize;
+    match id {
+        1 => write_bytes(buf, &mut p, b"log_write"),
+        2 => write_bytes(buf, &mut p, b"spawn"),
+        3 => write_bytes(buf, &mut p, b"console_read"),
+        4 => write_bytes(buf, &mut p, b"console_push"),
+        5 => write_bytes(buf, &mut p, b"introspect"),
+        6 => write_bytes(buf, &mut p, b"service_control"),
+        other => { write_bytes(buf, &mut p, b"endpoint#"); write_u32(buf, &mut p, other as u32); }
+    }
+    p
+}
+
+/// Write the spelled-out rights (space-separated, no trailing space) into `buf` (§7.4).
+fn cap_rights_str(r: u8, buf: &mut [u8]) -> usize {
+    let mut p = 0usize;
+    let words: [(u8, &[u8]); 6] = [
+        (0x01, b"read"), (0x02, b"write"), (0x04, b"send"),
+        (0x08, b"recv"), (0x10, b"grant"), (0x20, b"revoke"),
+    ];
+    for (bit, word) in words {
+        if r & bit != 0 {
+            if p > 0 { write_bytes(buf, &mut p, b" "); }
+            write_bytes(buf, &mut p, word);
+        }
+    }
+    p
+}
+
+/// `drives` as a record producer: one row per attached drive — `index`, `label`, `status`
+/// (`GSFS`/`raw`), `size_mib`, and `free_mib` (`Empty` for a raw, unformatted drive). Single
+/// drive in step 3; mirrors `drives_list`. Sizes are in MiB (so the column name carries the
+/// unit — a bare number cell can't).
+fn build_drives_table(ctx: &ServiceContext) -> Option<Table> {
+    let reply = match ctx.request_with_reply("fs", &Message::from_bytes(&[OP_DRIVES_INFO])) {
+        Some(r) => r,
+        None => { ctx.console_writeln("drives: storage unavailable (no fs?)"); return None; }
+    };
+    let p = reply.payload_bytes();
+    if p.first() != Some(&FS_OK) || p.len() < 28 {
+        ctx.console_writeln("drives: no disk found");
+        return None;
+    }
+    let mounted = p[1] != 0;
+    let mib = u64_le(&p[2..10]) / 2048;
+    let mut t = Table::new(&["index", "label", "status", "size_mib", "free_mib"]);
+    if mounted {
+        let total = u64_le(&p[10..18]);
+        let next = u64_le(&p[18..26]);
+        let free_mib = total.saturating_sub(next) / 2048;
+        let ll = (p[27] as usize).min(LABEL_MAX);
+        let lab = &p[28..28 + ll];
+        let label = if lab.is_empty() { t.intern(b"-") } else { t.intern(lab) };
+        let status = t.intern(b"GSFS");
+        t.add_row(&[Value::Int(0), label, status, Value::Int(mib), Value::Int(free_mib)]);
+    } else {
+        let label = t.intern(b"-");
+        let status = t.intern(b"raw");
+        t.add_row(&[Value::Int(0), label, status, Value::Int(mib), Value::Empty]);
+    }
+    Some(t)
+}
+
+/// `find` as a record producer: one row per match — `name`, `type` (`file`/`dir`), and the
+/// full `path`. Same bounded depth-first walk as `cmd_find`, emitting rows instead of printing
+/// the path. `arg` is the producer tail (`<pattern> [start]`).
+fn build_find_table(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Option<Table> {
+    let (target, start) = split_first(arg);
+    if target.is_empty() { ctx.console_writeln("usage: find <name> [path]"); return None; }
+    let start = if start.is_empty() { "/" } else { start };
+    let mut sbuf = [0u8; PATH_MAX];
+    let start_abs = resolve_or_err(ctx, cwd, start, &mut sbuf)?;
+    let mut stack = PathStack::new();
+    stack.push(start_abs);
+    let tb = target.as_bytes();
+    let is_glob = tb.iter().any(|&b| b == b'*' || b == b'?');
+    let mut t = Table::new(&["name", "type", "path"]);
+    let mut dir = [0u8; PATH_MAX];
+    while let Some(dlen) = stack.pop(&mut dir) {
+        let reply = match fs_request(ctx, OP_LIST_DIR, &dir[..dlen], &[]) {
+            Some(r) => r,
+            None => { ctx.console_writeln("find: storage unavailable"); return None; }
+        };
+        let p = reply.payload_bytes();
+        if no_fs(ctx, p) { return None; }
+        if p.first() != Some(&FS_OK) || p.len() < 2 { continue; }
+        let count = p[1] as usize;
+        let mut i = 2usize;
+        for _ in 0..count {
+            if i >= p.len() { break; }
+            let nl = p[i] as usize;
+            i += 1;
+            if i + nl + 1 + 8 > p.len() { break; }
+            let name = &p[i..i + nl];
+            let is_dir = p[i + nl] != 0;
+            i += nl + 1 + 8;
+            let mut child = [0u8; PATH_MAX];
+            if let Some(clen) = join_path(&dir[..dlen], name, &mut child) {
+                let hit = if is_glob { glob_match(tb, name) } else { contains(name, tb) };
+                if hit {
+                    let nv = t.intern(name);
+                    let tv = t.intern(if is_dir { b"dir" } else { b"file" });
+                    let pv = t.intern(&child[..clen]);
+                    t.add_row(&[nv, tv, pv]);
+                }
+                if is_dir { stack.push(&child[..clen]); }
+            }
+        }
+    }
+    if stack.overflow {
+        ctx.console_writeln_fmt(format_args!(
+            "find: search truncated — more than {} directories pending (bounded walk)", FIND_QCAP));
     }
     Some(t)
 }
@@ -1307,10 +1468,21 @@ fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str) {
     // Stage 1 — produce a Stream.
     let (c0, _) = split_first(stages[0]);
     let mut s = if is_record_producer(c0) {
+        let arg = split_first(stages[0]).1;
         let t = match c0 {
-            "ls" => match build_ls_table(ctx, cwd, split_first(stages[0]).1) { Some(t) => t, None => return },
-            _    => build_status_table(ctx),
+            "ls"     => match build_ls_table(ctx, cwd, arg)     { Some(t) => t, None => return },
+            "caps"   => match build_caps_table(ctx, arg)        { Some(t) => t, None => return },
+            "drives" => match build_drives_table(ctx)           { Some(t) => t, None => return },
+            "find"   => match build_find_table(ctx, cwd, arg)   { Some(t) => t, None => return },
+            _        => build_status_table(ctx),
         };
+        // Loud on the record bound (§3.12/§26.6): a producer that overran rows/arena is reported,
+        // never silently truncated — the same bar the text pipe buffer holds.
+        if t.overflow {
+            ctx.console_writeln_fmt(format_args!(
+                "{}: result exceeded the record bound ({} rows / {} bytes) — truncated",
+                c0, REC_MAX_ROWS, REC_ARENA));
+        }
         Stream::Table(t)
     } else if is_producer_builtin(c0) {
         let mut cap = Cap::new();
@@ -1746,10 +1918,11 @@ fn split_first(s: &str) -> (&str, &str) {
 }
 
 /// Built-ins that emit text and can be the producer side of a pipe.
-// `ls` is intentionally absent: it is a record producer (`is_record_producer`), handled on the
-// record path in `pipe_run` before this is consulted, so listing it here would be dead.
+// `ls` and `find` are intentionally absent: they are record producers (`is_record_producer`),
+// handled on the record path in `pipe_run` before this is consulted, so listing them here would
+// be dead. `tree` stays text — a hierarchy is not a flat table.
 fn is_producer_builtin(name: &str) -> bool {
-    matches!(name, "read" | "cat" | "echo" | "tree" | "find")
+    matches!(name, "read" | "cat" | "echo" | "tree")
 }
 
 /// Producer SERVICES that emit without needing input, so they can start a pipe (and follow the
@@ -1765,12 +1938,8 @@ fn run_producer(ctx: &ServiceContext, cwd: &Cwd, cmdline: &str, out: &mut Out) {
     match cmd {
         "echo"         => cmd_echo(ctx, arg, out),
         "read" | "cat" => cmd_read(ctx, cwd, arg, out),
-        // "ls" is a record producer (handled on the record path), not a text producer here.
+        // "ls" and "find" are record producers (handled on the record path), not text here.
         "tree"         => cmd_tree(ctx, cwd, arg, out),
-        "find"         => {
-            let (target, start) = split_first(arg);
-            cmd_find(ctx, cwd, target, if start.is_empty() { "/" } else { start }, out);
-        }
         _ => {}
     }
 }

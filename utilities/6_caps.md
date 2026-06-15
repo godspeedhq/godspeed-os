@@ -38,10 +38,25 @@ WRITE, SEND, RECV, GRANT, REVOKE). Stable kernel resources have well-known ids
 (1=log_write, 2=spawn, 3=console_read, 4=console_push, 5=introspect,
 6=service_control); larger ids are IPC endpoints or other grants.
 
+## 3a. As a record producer (typed pipes)
+
+Bare `caps` prints the list above; **in a pipe** it is a record producer
+(`docs/records.md`, `utilities/31_records.md`) emitting a typed table with columns
+**`resource`** (the target name) and **`rights`** (the spelled-out right words), so authority
+is queryable as data:
+
+```
+caps logger | where rights~send     services logger can send to
+caps | where resource=spawn         does this shell hold spawn? (one row if yes)
+caps shell | select resource        just the resources, no rights column
+caps logger | to json               logger's authority as JSON
+```
+
 ## 4. Data source
 
 `task_caps(slot)` / `query_cap_rights` over the introspection surface, resolving the
-service name to its scheduler slot first.
+service name to its scheduler slot first. The record form (`build_caps_table`) decodes the
+same `task_caps` reply into `resource`/`rights` rows.
 
 ## 5. Capabilities
 
