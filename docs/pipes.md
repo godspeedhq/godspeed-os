@@ -131,9 +131,11 @@ The store-and-forward machinery here is the foundation: the producer/filter/sink
 marker, and the whole-buffer round-trip generalise to chunked streaming without changing the
 shape — only *who drains whom, and when*.
 
-## Next (Appendix D)
+## Filter built-ins
 
-A general filter built-in set — **`match`** (grep-equivalent, see `utilities/27_match.md`),
-`count`, `sort`, `head`/`tail` — and piping into command arguments. The multi-stage machinery
-here is the foundation: `match` drops straight into a middle FILTER slot (and, being a built-in,
-is not subject to the 4 KiB service-boundary cap).
+A **filter built-in** consumes the previous stage's buffer and emits to the next — it runs
+in-process, so it is **not** subject to the 4 KiB service-boundary cap and can filter a full
+64 KiB buffer. **`match`** (the grep-equivalent line filter — `utilities/27_match.md`) is the
+first: `read /log | match error | write /errs.txt`. More — `count`, `sort`, `head`/`tail` — and
+piping into command arguments are the remaining Appendix-D work; each drops into the same middle
+FILTER slot.

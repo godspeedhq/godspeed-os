@@ -1,8 +1,9 @@
 # Utility: `match` — keep the lines that match (the grep-equivalent)
 
-**Status:** **Designed, not built (parked).** Multi-stage pipes are being built first so
-`match` can slot in mid-pipe (`read /log | match error | write /errs.txt`). This doc captures
-the agreed design. Trails `CLAUDE.md`; does not amend it.
+**Status:** **Built + QEMU-verified** (`osdev test files`). A shell built-in FILTER: the direct
+form `match <pattern> <path>`, the pipe form `<producer> | match <pattern>` (slots into the
+multi-stage middle), the `except` inverse, `*`/`?` glob (shared with `find`), and minimal
+quoting. Trails `CLAUDE.md`; does not amend it.
 
 ---
 
@@ -66,13 +67,16 @@ before bash's footguns (`'can'\''t'`, `$VAR`, `[[ ]]`). The one honest cost: wit
 character, emitting a lone literal quote is fiddly — an acceptable trade for a system that
 isn't trying to be bash.
 
-## 5. Implementation shape
+## 5. Implementation
 
-A shell built-in **filter**: input bytes → matching lines out. As a pipe sink it consumes the
-previous stage's buffer; in the direct form it `read`s the file itself (`fs` `ReadFile`, op
-11) — no new `fs` surface. Reuses `find`'s `contains` (substring) and `glob_match` (glob).
-Mid-pipe use (`a | match x | b`) rides the **multi-stage pipe** machinery (built first); the
-matcher itself is position-agnostic.
+A shell built-in **filter**: input bytes → matching lines out (`match_lines`, sharing `find`'s
+`contains` + `glob_match`). In a pipe it consumes the previous stage's buffer (`is_filter_builtin`
+→ `run_filter_builtin` in `stage_filter`/`stage_sink`); as a built-in it runs **in-process**, so
+it is **not** subject to the 4 KiB service-boundary cap and can filter a full 64 KiB stage
+buffer. The direct form `read`s the file itself (`fs` `ReadFile`, op 11) — no new `fs` surface.
+`match` is a FILTER, never a pipe producer: `match … /file | …` is refused (use `read /file |
+match …`). Minimal quoting lives in the shared `tokenize`/`strip_quotes` helpers, so it benefits
+every command, not just `match`.
 
 ## 6. Later (separate so it can grow)
 
@@ -85,5 +89,6 @@ matcher itself is position-agnostic.
 
 ## 7. Conformance
 
-Will conform to `0_conventions.md`: its own `match help` (usage with a real example per row)
-and `match version` (number + creator credit), via the shared `help_block` helper.
+Conforms to `0_conventions.md`: its own `match help` (usage with a real example per row), the
+`match except help` subcommand help, and `match version` (number + creator credit), via the
+shared `help_block` helper.

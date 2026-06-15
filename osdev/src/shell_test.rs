@@ -878,6 +878,49 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL — read gu.txt timeout"); fail += 1; }
     }
 
+    // ── match: the grep-equivalent line filter (direct, pipe, except, glob, quoting) ────
+    // /greetout.txt holds greet's 3 lines. Direct form: keep lines matching a substring.
+    match run!(b"match capability /greetout.txt\r", 10) {
+        Some(r) => check!(r.contains("capability pipes work") && !r.contains("no ambient authority"),
+                          "match: direct, keeps only the matching line"),
+        None    => { println!("files-test: FAIL — match direct timeout"); fail += 1; }
+    }
+    // `except`: keep the lines that do NOT match.
+    match run!(b"match except capability /greetout.txt\r", 10) {
+        Some(r) => check!(r.contains("hello from godspeed") && r.contains("no ambient authority")
+                          && !r.contains("capability pipes work"),
+                          "match except: keeps the non-matching lines"),
+        None    => { println!("files-test: FAIL — match except timeout"); fail += 1; }
+    }
+    // Pipe filter (last stage): a service producer's lines through match, printed to console.
+    match run!(b"greet | match ambient\r", 14) {
+        Some(r) => check!(r.contains("no ambient authority here") && !r.contains("hello from godspeed"),
+                          "match: as a pipe filter (greet | match ambient)"),
+        None    => { println!("files-test: FAIL — greet|match timeout"); fail += 1; }
+    }
+    // Anchored glob (whole-line): `*here` keeps lines ending in "here".
+    match run!(b"greet | match *here\r", 14) {
+        Some(r) => check!(r.contains("no ambient authority here") && !r.contains("capability pipes work"),
+                          "match: glob (anchored *here)"),
+        None    => { println!("files-test: FAIL — match glob timeout"); fail += 1; }
+    }
+    // 3-stage with match in the MIDDLE: greet | match except hello | write.
+    match run!(b"greet | match except hello | write /mx.txt\r", 16) {
+        Some(r) => check!(r.contains("piped") && r.contains("mx.txt"), "match: mid-pipe filter (3-stage wired)"),
+        None    => { println!("files-test: FAIL — 3-stage match timeout"); fail += 1; }
+    }
+    match run!(b"read /mx.txt\r", 10) {
+        Some(r) => check!(r.contains("capability pipes work") && !r.contains("hello from godspeed"),
+                          "match: mid-pipe dropped the 'hello' line"),
+        None    => { println!("files-test: FAIL — read mx.txt timeout"); fail += 1; }
+    }
+    // Minimal quoting: a quoted multi-word pattern is one argument. Without quoting, "two" and
+    // "words" would split and nothing would match the input "two words".
+    match run!(b"echo two words | match \"two words\"\r", 14) {
+        Some(r) => check!(r.contains("two words"), "match: quoted multi-word pattern (\"two words\")"),
+        None    => { println!("files-test: FAIL — match quoting timeout"); fail += 1; }
+    }
+
     child.kill().ok();
     child.wait().ok();
     println!("\nfiles-test: {pass} passed, {fail} failed");
