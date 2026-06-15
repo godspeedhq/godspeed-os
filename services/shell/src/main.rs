@@ -343,7 +343,11 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
     // to the consumer's endpoint delegated to it — the producer has no ambient
     // authority of its own.
     if s.contains('|') {
-        cmd_pipe(ctx, cwd, s);
+        // A pipeline whose first stage is a RECORD producer (`status`) runs the typed-table
+        // pipeline (where / to json); everything else is the byte pipeline.
+        let (fcmd, _) = split_first(s.split('|').next().unwrap_or("").trim());
+        if is_record_producer(fcmd) { record_pipe(ctx, s); }
+        else { cmd_pipe(ctx, cwd, s); }
         return;
     }
 
@@ -703,6 +707,10 @@ fn cmd_help(ctx: &ServiceContext) {
     help_line(ctx, "  e.g. tree / | write /out", "capture output to a file");
     help_line(ctx, "  e.g. greet | upper | write /g", "producer | filter | sink");
     ctx.console_writeln("");
+    ctx.console_writeln("Records (typed pipes — docs/records.md)");
+    help_line(ctx, "status | where <col> <op> <val>", "filter the task table by field");
+    help_line(ctx, "status | to json", "render the table as JSON");
+    ctx.console_writeln("");
     ctx.console_writeln("Power");
     help_line(ctx, "reboot", "hardware reset");
     ctx.console_writeln("");
@@ -782,31 +790,279 @@ fn cmd_date(ctx: &ServiceContext, arg: &str) {
     }
 }
 
-fn cmd_status(ctx: &ServiceContext) {
-    ctx.console_writeln("SLOT  NAME               CORE STATE");
-    let mut found = false;
-    for slot in 0u32..256 {
-        let stat = ctx.task_stat(slot);
-        if !stat.valid { continue; }
-        found = true;
-        let mut buf = [b' '; 80];
-        let mut pos = 0usize;
-        // slot (4)
-        write_u32_padded(&mut buf, &mut pos, slot, 4);
-        buf[pos] = b' '; buf[pos+1] = b' '; pos += 2;
-        // name (18)
-        let name_bytes = &stat.name[..stat.name_len.min(18)];
-        write_bytes(&mut buf, &mut pos, name_bytes);
-        while pos < 22 { buf[pos] = b' '; pos += 1; }
-        // core (4)
-        write_u32_padded(&mut buf, &mut pos, stat.core as u32, 4);
-        buf[pos] = b' '; pos += 1;
-        // state
-        let st = stat.state_str().as_bytes();
-        write_bytes(&mut buf, &mut pos, st);
-        ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("?"));
+// ════════════════════════════════════════════════════════════════════════════════
+// Structured records — a typed TABLE is the canonical pipe model (docs/records.md).
+//
+// POSIX pipes flatten structured data to text, which is why grep/awk/cut/sed must re-parse
+// it. Here a producer like `status` emits a TABLE (typed columns + rows); filters operate on
+// fields (`where mem > 0`), and JSON/table are *renderings* of the model, not the model
+// itself. The table is the language between utilities; formats are views at the edge.
+//
+// Bounded (§26.6): fixed columns, rows, and a string arena — all on the stack, no heap. For
+// now the only producer is `status` and the chain runs entirely in-process (no service
+// boundary, so no wire codec yet). Heterogeneous records, more producers, `select`/`sort by`,
+// and `to yaml` are the documented next steps.
+// ════════════════════════════════════════════════════════════════════════════════
+const REC_MAX_COLS: usize = 8;
+const REC_MAX_ROWS: usize = 64;
+const REC_ARENA: usize = 4 * 1024; // backing store for Str values
+
+/// A typed cell. `Str` points into the owning `Table`'s arena (no lifetimes, no heap).
+#[derive(Clone, Copy)]
+enum Value {
+    Str { off: u32, len: u32 },
+    Int(u64),
+    Empty,
+}
+
+/// A bounded table: static column names, rows of `Value`, and a byte arena holding the `Str`
+/// cells. The canonical structured-pipe value.
+struct Table {
+    cols: [&'static str; REC_MAX_COLS],
+    ncols: usize,
+    rows: [[Value; REC_MAX_COLS]; REC_MAX_ROWS],
+    nrows: usize,
+    arena: [u8; REC_ARENA],
+    alen: usize,
+    overflow: bool,
+}
+impl Table {
+    fn new(cols: &[&'static str]) -> Self {
+        let mut t = Table {
+            cols: [""; REC_MAX_COLS], ncols: cols.len().min(REC_MAX_COLS),
+            rows: [[Value::Empty; REC_MAX_COLS]; REC_MAX_ROWS], nrows: 0,
+            arena: [0u8; REC_ARENA], alen: 0, overflow: false,
+        };
+        for (i, c) in cols.iter().take(REC_MAX_COLS).enumerate() { t.cols[i] = c; }
+        t
     }
-    if !found { ctx.console_writeln("  (no live tasks)"); }
+    /// Copy bytes into the arena and return a `Str` value (or `Empty` if the arena is full).
+    fn intern(&mut self, s: &[u8]) -> Value {
+        if self.alen + s.len() > REC_ARENA { self.overflow = true; return Value::Empty; }
+        let off = self.alen as u32;
+        self.arena[self.alen..self.alen + s.len()].copy_from_slice(s);
+        self.alen += s.len();
+        Value::Str { off, len: s.len() as u32 }
+    }
+    /// Append a row (values in column order). Loud-bounded: extra rows set `overflow`.
+    fn add_row(&mut self, vals: &[Value]) {
+        if self.nrows >= REC_MAX_ROWS { self.overflow = true; return; }
+        for (i, v) in vals.iter().take(self.ncols).enumerate() { self.rows[self.nrows][i] = *v; }
+        self.nrows += 1;
+    }
+    fn col_index(&self, name: &str) -> Option<usize> {
+        (0..self.ncols).find(|&i| self.cols[i] == name)
+    }
+    /// Resolve a cell's text: a `Str` from the arena, or the empty slice for non-strings.
+    fn cell_str<'a>(&'a self, v: Value) -> &'a [u8] {
+        match v {
+            Value::Str { off, len } => &self.arena[off as usize..(off + len) as usize],
+            _ => &[],
+        }
+    }
+}
+
+/// Render a table as an aligned text grid (the default view). Two passes: column widths, then
+/// the header and rows. Output goes through `Out` so it works to the console or a capture.
+fn render_table(ctx: &ServiceContext, t: &Table, out: &mut Out) {
+    let mut w = [0usize; REC_MAX_COLS];
+    for c in 0..t.ncols { w[c] = t.cols[c].len(); }
+    let mut cell = [0u8; 24];
+    for r in 0..t.nrows {
+        for c in 0..t.ncols {
+            let n = fmt_cell(t, t.rows[r][c], &mut cell);
+            if n > w[c] { w[c] = n; }
+        }
+    }
+    // header
+    for c in 0..t.ncols {
+        out.put(ctx, t.cols[c]);
+        pad(ctx, out, w[c] - t.cols[c].len() + 2);
+    }
+    out.put(ctx, "\n");
+    // rows
+    for r in 0..t.nrows {
+        for c in 0..t.ncols {
+            let n = fmt_cell(t, t.rows[r][c], &mut cell);
+            out.put_bytes(ctx, &cell[..n]);
+            pad(ctx, out, w[c] - n + 2);
+        }
+        out.put(ctx, "\n");
+    }
+}
+
+/// Format one cell into `buf`, returning its length. Strings copy out; ints are decimal.
+fn fmt_cell(t: &Table, v: Value, buf: &mut [u8; 24]) -> usize {
+    match v {
+        Value::Str { .. } => {
+            let s = t.cell_str(v);
+            let n = s.len().min(buf.len());
+            buf[..n].copy_from_slice(&s[..n]);
+            n
+        }
+        Value::Int(i) => {
+            let mut tmp = [0u8; 20];
+            let mut p = tmp.len();
+            let mut x = i;
+            loop { p -= 1; tmp[p] = b'0' + (x % 10) as u8; x /= 10; if x == 0 { break; } }
+            let n = tmp.len() - p;
+            buf[..n].copy_from_slice(&tmp[p..]);
+            n
+        }
+        Value::Empty => 0,
+    }
+}
+
+fn pad(ctx: &ServiceContext, out: &mut Out, n: usize) {
+    for _ in 0..n { out.put(ctx, " "); }
+}
+
+/// Render a table as a JSON array of objects — `to json`, the interop/edge rendering. Task
+/// names are simple ASCII (no escaping needed yet; a real escaper is a documented follow-up).
+fn render_json(ctx: &ServiceContext, t: &Table, out: &mut Out) {
+    out.put(ctx, "[\n");
+    for r in 0..t.nrows {
+        out.put(ctx, "  {");
+        for c in 0..t.ncols {
+            if c > 0 { out.put(ctx, ", "); }
+            out.put(ctx, "\"");
+            out.put(ctx, t.cols[c]);
+            out.put(ctx, "\": ");
+            match t.rows[r][c] {
+                Value::Int(_) => {
+                    let mut b = [0u8; 24];
+                    let n = fmt_cell(t, t.rows[r][c], &mut b);
+                    out.put_bytes(ctx, &b[..n]);
+                }
+                Value::Empty  => out.put(ctx, "null"),
+                Value::Str { .. } => {
+                    out.put(ctx, "\"");
+                    out.put_bytes(ctx, t.cell_str(t.rows[r][c]));
+                    out.put(ctx, "\"");
+                }
+            }
+        }
+        out.put(ctx, if r + 1 < t.nrows { "},\n" } else { "}\n" });
+    }
+    out.put(ctx, "]\n");
+}
+
+/// Apply `where <col> <op> <value>` to a table in place (keep matching rows). Ops: `=` `!=`
+/// `>` `<` `~`(contains). Numeric comparison when both sides parse as numbers, else byte/text.
+/// Unknown column or missing operands → loud no-op (the table is left unchanged).
+fn table_where(ctx: &ServiceContext, t: &mut Table, col: &str, op: &str, val: &str) {
+    let ci = match t.col_index(col) {
+        Some(i) => i,
+        None => { ctx.console_writeln_fmt(format_args!("where: no such column '{}'", col)); return; }
+    };
+    let mut keep = 0usize;
+    for r in 0..t.nrows {
+        if row_matches(t, r, ci, op, val) {
+            if keep != r { t.rows[keep] = t.rows[r]; }
+            keep += 1;
+        }
+    }
+    t.nrows = keep;
+}
+
+/// Does row `r`'s column `ci` satisfy `<op> val`? Numeric if both are numbers, else textual.
+fn row_matches(t: &Table, r: usize, ci: usize, op: &str, val: &str) -> bool {
+    let cell = t.rows[r][ci];
+    // Numeric path: cell is an Int (or numeric string) and val parses as a number.
+    let cell_num = match cell {
+        Value::Int(i) => Some(i),
+        Value::Str { .. } => core::str::from_utf8(t.cell_str(cell)).ok().and_then(|s| s.parse::<u64>().ok()),
+        Value::Empty => None,
+    };
+    if let (Some(cn), Ok(vn)) = (cell_num, val.parse::<u64>()) {
+        return match op {
+            "=" | "==" => cn == vn,
+            "!=" => cn != vn,
+            ">" => cn > vn,
+            "<" => cn < vn,
+            ">=" => cn >= vn,
+            "<=" => cn <= vn,
+            _ => false,
+        };
+    }
+    // Textual path.
+    let cs = t.cell_str(cell);
+    let vb = val.as_bytes();
+    match op {
+        "=" | "==" => cs == vb,
+        "!=" => cs != vb,
+        "~" => contains(cs, vb),
+        _ => false,
+    }
+}
+
+/// Build the live-task table that `status` produces (columns: slot, name, core, state, mem,
+/// queue, restarts). The structured form of what `status` used to print directly.
+fn build_status_table(ctx: &ServiceContext) -> Table {
+    let mut t = Table::new(&["slot", "name", "core", "state", "mem", "queue", "restarts"]);
+    for slot in 0u32..256 {
+        let s = ctx.task_stat(slot);
+        if !s.valid { continue; }
+        let name = t.intern(&s.name[..s.name_len.min(31)]);
+        let state = t.intern(s.state_str().as_bytes());
+        t.add_row(&[
+            Value::Int(slot as u64), name, Value::Int(s.core as u64), state,
+            Value::Int(s.mem_used), Value::Int(s.queue_depth as u64), Value::Int(s.generation as u64),
+        ]);
+    }
+    t
+}
+
+/// Producers that emit a structured TABLE rather than text (currently just `status`).
+fn is_record_producer(name: &str) -> bool {
+    matches!(name, "status")
+}
+
+/// `status` and its record pipeline: `status [| where …] [| to json]`. The whole chain runs in
+/// the shell process on one `Table` (no service boundary), so records are passed by value, not
+/// serialized. `to json` / a bare end (table) are renderings of the same model.
+fn record_pipe(ctx: &ServiceContext, line: &str) {
+    let mut stages = [""; MAX_STAGES];
+    let mut n = 0usize;
+    for part in line.split('|') {
+        if n >= MAX_STAGES { break; }
+        stages[n] = part.trim();
+        n += 1;
+    }
+    let mut t = build_status_table(ctx);
+    let mut rendered = false;
+    for i in 1..n {
+        let mut sa = [""; MAX_ARGS];
+        let sc = tokenize(stages[i], &mut sa);
+        match sa[0] {
+            "where" => {
+                if sc < 4 { ctx.console_writeln("usage: … | where <col> <op> <value>"); return; }
+                table_where(ctx, &mut t, sa[1], sa[2], sa[3]);
+            }
+            "to" => {
+                match sa.get(1) {
+                    Some(&"json") => { render_json(ctx, &t, &mut Out::Console); rendered = true; }
+                    _ => { ctx.console_writeln("to: unknown format (try: to json)"); return; }
+                }
+            }
+            other => {
+                ctx.console_writeln_fmt(format_args!("status pipe: '{}' is not a record stage (try where, to json)", other));
+                return;
+            }
+        }
+    }
+    if !rendered { render_table(ctx, &t, &mut Out::Console); }
+    if t.overflow {
+        ctx.console_writeln_fmt(format_args!("status: more than {} rows shown (bounded)", REC_MAX_ROWS));
+    }
+}
+
+fn cmd_status(ctx: &ServiceContext) {
+    let t = build_status_table(ctx);
+    render_table(ctx, &t, &mut Out::Console);
+    if t.overflow {
+        ctx.console_writeln_fmt(format_args!("status: more than {} rows shown (bounded)", REC_MAX_ROWS));
+    }
 }
 
 /// `caps <service>` — list the capabilities a service holds. A thin broker over
