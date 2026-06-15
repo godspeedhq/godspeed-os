@@ -558,9 +558,11 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("drives label [drive] <name>", "name / rename a drive", "drives label 0 archive"),
             ("drives reset [drive]", "un-format a drive back to raw", "drives reset 0"),
         ], true),
-        "ls" => help_block(ctx, "ls", "list a directory", &[
+        "ls" => help_block(ctx, "ls", "list a directory (records when piped)", &[
             ("ls", "list the current directory", "ls"),
             ("ls <path>", "list the directory at <path>", "ls /docs"),
+            ("ls [path] | <verb>", "piped: emits records name/type/size", "ls | where size>0"),
+            ("ls | select … / sort …", "project / order the listing", "ls | sort reverse size"),
         ], true),
         "cd" => help_block(ctx, "cd", "change current directory", &[
             ("cd <path>", "move to <path> (no arg → root)", "cd /docs"),
@@ -1136,9 +1138,46 @@ fn build_status_table(ctx: &ServiceContext) -> Table {
     t
 }
 
-/// Producers that emit a structured TABLE rather than text (currently just `status`).
+/// Producers that emit a structured TABLE rather than text. `status` (task roster) and `ls`
+/// (directory listing) are inherently tabular, so in a pipe they emit records — composed with
+/// `where`/`select`/`sort <col>`, not the text filters. Bare (un-piped) they still print text.
 fn is_record_producer(name: &str) -> bool {
-    matches!(name, "status")
+    matches!(name, "status" | "ls")
+}
+
+/// `ls` as a record producer: directory entries as a table (`name` / `type` / `size`). Mirrors
+/// `cmd_ls`'s fs parse but emits rows instead of formatted text; `size` is `Int` for files and
+/// `Empty` for directories (a dir has no byte size). Errors print and return `None` (abort pipe).
+fn build_ls_table(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Option<Table> {
+    let mut buf = [0u8; PATH_MAX];
+    let path = resolve_or_err(ctx, cwd, arg, &mut buf)?;
+    let reply = match fs_request(ctx, OP_LIST_DIR, path, &[]) {
+        Some(r) => r,
+        None => { ctx.console_writeln("ls: storage unavailable"); return None; }
+    };
+    let p = reply.payload_bytes();
+    if no_fs(ctx, p) { return None; }
+    if p.first() == Some(&FS_NOTFOUND) || p.len() < 2 {
+        ctx.console_writeln_fmt(format_args!("ls: not a directory: {}", str_of(path)));
+        return None;
+    }
+    let count = p[1] as usize;
+    let mut t = Table::new(&["name", "type", "size"]);
+    let mut i = 2usize;
+    for _ in 0..count {
+        if i >= p.len() { break; }
+        let nl = p[i] as usize;
+        i += 1;
+        if i + nl + 1 + 8 > p.len() { break; }
+        let name = t.intern(&p[i..i + nl]);
+        let is_dir = p[i + nl] != 0;
+        let size = u64_le(&p[i + nl + 1..i + nl + 9]);
+        i += nl + 1 + 8;
+        let kind = t.intern(if is_dir { b"dir" } else { b"file" });
+        let sz = if is_dir { Value::Empty } else { Value::Int(size) };
+        t.add_row(&[name, kind, sz]);
+    }
+    Some(t)
 }
 
 // ── from json — parse text into the table model (the byte→record bridge) ──────────
@@ -1268,7 +1307,11 @@ fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str) {
     // Stage 1 — produce a Stream.
     let (c0, _) = split_first(stages[0]);
     let mut s = if is_record_producer(c0) {
-        Stream::Table(build_status_table(ctx))
+        let t = match c0 {
+            "ls" => match build_ls_table(ctx, cwd, split_first(stages[0]).1) { Some(t) => t, None => return },
+            _    => build_status_table(ctx),
+        };
+        Stream::Table(t)
     } else if is_producer_builtin(c0) {
         let mut cap = Cap::new();
         run_producer(ctx, cwd, stages[0], &mut Out::Capture(&mut cap));
@@ -1385,7 +1428,7 @@ fn pipe_transform(ctx: &ServiceContext, stage: &str, cmd: &str, s: &mut Stream) 
         // byte filters (Bytes only)
         "match" | "count" | "first" | "last" => match s {
             Stream::Bytes(_) => byte_filter(ctx, stage, s),
-            Stream::Table(_) => { ctx.console_writeln_fmt(format_args!("{}: needs text (render with 'to json' first)", cmd)); false }
+            Stream::Table(_) => { ctx.console_writeln_fmt(format_args!("{}: this is a record stream — use 'where'/'select'/'sort <col>', or 'to json' for text", cmd)); false }
         },
         // anything else: a service filter stage (Bytes only)
         _ => match s {
@@ -1703,8 +1746,10 @@ fn split_first(s: &str) -> (&str, &str) {
 }
 
 /// Built-ins that emit text and can be the producer side of a pipe.
+// `ls` is intentionally absent: it is a record producer (`is_record_producer`), handled on the
+// record path in `pipe_run` before this is consulted, so listing it here would be dead.
 fn is_producer_builtin(name: &str) -> bool {
-    matches!(name, "read" | "cat" | "echo" | "ls" | "tree" | "find")
+    matches!(name, "read" | "cat" | "echo" | "tree" | "find")
 }
 
 /// Producer SERVICES that emit without needing input, so they can start a pipe (and follow the
@@ -1720,7 +1765,7 @@ fn run_producer(ctx: &ServiceContext, cwd: &Cwd, cmdline: &str, out: &mut Out) {
     match cmd {
         "echo"         => cmd_echo(ctx, arg, out),
         "read" | "cat" => cmd_read(ctx, cwd, arg, out),
-        "ls"           => cmd_ls(ctx, cwd, arg, out),
+        // "ls" is a record producer (handled on the record path), not a text producer here.
         "tree"         => cmd_tree(ctx, cwd, arg, out),
         "find"         => {
             let (target, start) = split_first(arg);
