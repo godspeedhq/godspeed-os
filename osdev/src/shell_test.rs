@@ -1287,6 +1287,41 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL — run(nest) timeout"); fail += 1; }
     }
 
+    // ── assert: the verifying command. Content form (the pipe sink) is tested interactively —
+    //    a `|` can't yet be authored into a script via `write` (the shell pipes the write line).
+    match run!(b"roster | where role=core | assert contains vesta\r", 16) {
+        Some(r) => check!(r.contains("assert: ok"), "assert: contains holds on matching output"),
+        None    => { println!("files-test: FAIL — assert contains timeout"); fail += 1; }
+    }
+    match run!(b"roster | where role=worker | assert contains vesta\r", 16) {
+        Some(r) => check!(r.contains("assert: FAILED"), "assert: contains fails on non-matching output"),
+        None    => { println!("files-test: FAIL — assert contains(fail) timeout"); fail += 1; }
+    }
+    match run!(b"roster | where role=core | assert lacks atlas\r", 16) {
+        Some(r) => check!(r.contains("assert: ok"), "assert: lacks holds when text is absent"),
+        None    => { println!("files-test: FAIL — assert lacks timeout"); fail += 1; }
+    }
+    // result form (negative tests): `fails` holds when the command errors.
+    match run!(b"assert fails read /lsr/nope\r", 12) {
+        Some(r) => check!(r.contains("assert: ok"), "assert: fails holds when the command errors (negative test)"),
+        None    => { println!("files-test: FAIL — assert fails timeout"); fail += 1; }
+    }
+    match run!(b"assert ok read /lsr/big.txt\r", 12) {
+        Some(r) => check!(r.contains("assert: ok"), "assert: ok holds when the command succeeds"),
+        None    => { println!("files-test: FAIL — assert ok timeout"); fail += 1; }
+    }
+    match run!(b"assert fails read /lsr/big.txt\r", 12) {
+        Some(r) => check!(r.contains("assert: FAILED"), "assert: fails reports when a command unexpectedly succeeds"),
+        None    => { println!("files-test: FAIL — assert fails(neg) timeout"); fail += 1; }
+    }
+    // a self-checking script: standalone asserts via `run`, aggregated. (No `|`, so it can be
+    // authored with `write`.) Both hold → 0 failures.
+    let _ = run!(b"write /check.gs assert ok read /lsr/big.txt ; assert fails read /lsr/nope\r", 10);
+    match run!(b"run /check.gs\r", 16) {
+        Some(r) => check!(r.contains("run: ran 2, failed 0"), "assert: a self-checking script passes (run aggregates)"),
+        None    => { println!("files-test: FAIL — assert script timeout"); fail += 1; }
+    }
+
     child.kill().ok();
     child.wait().ok();
     println!("\nfiles-test: {pass} passed, {fail} failed");

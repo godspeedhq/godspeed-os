@@ -345,6 +345,8 @@ fn strip_quotes(s: &str) -> &str {
 enum ShellError {
     /// A file/path the command needed does not exist.
     FileNotFound,
+    /// An `assert` did not hold (the test failed).
+    AssertFailed,
     /// A failure not yet categorised into its own variant.
     Unknown,
 }
@@ -353,6 +355,7 @@ impl ShellError {
     fn name(self) -> &'static str {
         match self {
             ShellError::FileNotFound => "FileNotFound",
+            ShellError::AssertFailed => "AssertFailed",
             ShellError::Unknown => "Unknown",
         }
     }
@@ -384,9 +387,8 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
     // authority of its own.
     if s.contains('|') {
         // One unified pipeline: threads bytes or records, with from/to bridging the two worlds.
-        // (Pipelines are not yet on the Result model — treated as Ok for now.)
-        pipe_run(ctx, cwd, s);
-        return Ok(());
+        // Returns the pipeline's Result — an `… | assert` sink sets it (else Ok / a stage error).
+        return pipe_run(ctx, cwd, s);
     }
 
     let mut args = [""; MAX_ARGS];
@@ -414,6 +416,9 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         },
         // `result` reports the PREVIOUS command's result (this one always succeeds at reporting).
         "result" => { cmd_result(ctx, prev); return Ok(()); }
+        // `assert ok/fails <cmd>` — the result form (the content form `… | assert contains X` is
+        // a pipe sink, handled in pipe_run). `s` is the trimmed whole line.
+        "assert" => return cmd_assert(ctx, cwd, s["assert".len()..].trim(), depth),
         "run" => {
             if depth > 0 {
                 ctx.console_writeln("run: a script cannot run another script (no nesting)");
@@ -601,6 +606,37 @@ fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8) -> Result<
     if failed == 0 { Ok(()) } else { Err(ShellError::Unknown) }
 }
 
+/// `assert ok <cmd>` / `assert fails <cmd>` — the **result** form: run `<cmd>` and check that it
+/// succeeded (`ok`) or failed (`fails`). The assertion holds → `Ok` + `assert: ok`; it doesn't →
+/// `Err(AssertFailed)` + a `FAILED` line. This is the negative-test surface (§22's negative cases
+/// on hardware): `assert fails read /nope` verifies the guardrail refuses. The *content* form
+/// (`… | assert contains X`) is the pipe sink `assert_stream`.
+fn cmd_assert(ctx: &ServiceContext, cwd: &mut Cwd, rest: &str, depth: u8) -> Result<(), ShellError> {
+    let (verb, cmd) = split_first(rest);
+    match verb {
+        "ok" | "fails" => {
+            if cmd.is_empty() {
+                ctx.console_writeln("usage: assert ok <command>  |  assert fails <command>");
+                return Err(ShellError::Unknown);
+            }
+            // Run the command (its own output/errors print as usual), then judge its Result.
+            let r = execute(ctx, cmd.as_bytes(), cwd, Ok(()), depth + 1);
+            let held = if verb == "ok" { r.is_ok() } else { r.is_err() };
+            assert_verdict(ctx, held, verb, cmd)
+        }
+        "contains" | "lacks" | "empty" => {
+            ctx.console_writeln_fmt(format_args!(
+                "assert: '{}' checks a pipe — use: <producer> | assert {} …", verb, verb));
+            Err(ShellError::Unknown)
+        }
+        _ => {
+            ctx.console_writeln(
+                "usage: assert ok|fails <command>   or   <producer> | assert contains|lacks|empty …");
+            Err(ShellError::Unknown)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-utility help + version (0_conventions.md). Every utility self-documents:
 // `<util> help` prints usage with a real example per row; `<util> version` prints the
@@ -612,7 +648,7 @@ const UTIL_VERSION: &str = "0.1.0";
 
 /// Utilities that self-document (gates the `help`/`version` intercept in `execute`).
 const UTILS: &[&str] = &[
-    "help", "result", "run",
+    "help", "result", "run", "assert",
     "echo", "clear", "about", "mem", "cores", "date", "status", "observe", "caps",
     "spawn", "kill", "restart", "reboot", "drives", "ls", "cd", "read", "write",
     "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count", "sort",
@@ -662,6 +698,12 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "run" => help_block(ctx, "run", "run a script of commands from a file", &[
             ("run <path>", "execute each line/command as if typed; reports ran N, failed M", "run /suite.gs"),
             ("# … (in the file)", "lines starting with # are comments; ';' separates commands", "run /test.gs"),
+        ], true),
+        "assert" => help_block(ctx, "assert", "verify a result or output; Ok if it holds, else Err", &[
+            ("assert ok <command>", "the command must succeed", "assert ok read /notes.txt"),
+            ("assert fails <command>", "the command must fail (negative test)", "assert fails read /nope"),
+            ("<producer> | assert contains <text>", "piped output must contain <text>", "roster | where role=core | assert contains vesta"),
+            ("… | assert lacks <text> / empty", "must NOT contain / must be empty", "ls / | assert lacks secret"),
         ], true),
         "echo" => help_block(ctx, "echo", "print text", &[
             ("echo <text>", "print text verbatim", "echo hello world"),
@@ -850,6 +892,7 @@ fn cmd_help(ctx: &ServiceContext) {
     help_line(ctx, "echo <text>", "print text");
     help_line(ctx, "result", "the last command's result (Ok / Err)");
     help_line(ctx, "run <script>", "run a script of commands (.gs; # comments, ; separators)");
+    help_line(ctx, "assert ok|fails <cmd>", "verify success/failure (also: … | assert contains X)");
     ctx.console_writeln("");
     ctx.console_writeln("System");
     help_line(ctx, "about", "identity + credits");
@@ -1257,28 +1300,28 @@ enum Stream {
 /// `execute` (which would carry that 64 KiB into every command's frame, and via a nested
 /// `run → execute` chain overflow the user stack).
 #[inline(never)]
-fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str) {
+fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str) -> Result<(), ShellError> {
     let mut stages = [""; MAX_STAGES];
     let mut n = 0usize;
     for part in line.split('|') {
         let s = part.trim();
-        if s.is_empty() { ctx.console_writeln("usage: <producer> | <stage> [| …]"); return; }
-        if n >= MAX_STAGES { ctx.console_writeln_fmt(format_args!("pipe: too many stages (max {})", MAX_STAGES)); return; }
+        if s.is_empty() { ctx.console_writeln("usage: <producer> | <stage> [| …]"); return Err(ShellError::Unknown); }
+        if n >= MAX_STAGES { ctx.console_writeln_fmt(format_args!("pipe: too many stages (max {})", MAX_STAGES)); return Err(ShellError::Unknown); }
         stages[n] = s;
         n += 1;
     }
-    if n < 2 { ctx.console_writeln("usage: <producer> | <stage> [| …]"); return; }
+    if n < 2 { ctx.console_writeln("usage: <producer> | <stage> [| …]"); return Err(ShellError::Unknown); }
 
     // Stage 1 — produce a Stream.
     let (c0, _) = split_first(stages[0]);
     let mut s = if is_record_producer(c0) {
         let arg = split_first(stages[0]).1;
         let t = match c0 {
-            "ls"      => match build_ls_table(ctx, cwd, arg)    { Some(t) => t, None => return },
-            "caps"    => match build_caps_table(ctx, arg)       { Some(t) => t, None => return },
-            "drives"  => match build_drives_table(ctx)          { Some(t) => t, None => return },
-            "find"    => match build_find_table(ctx, cwd, arg)  { Some(t) => t, None => return },
-            "observe" => match build_observe_table(ctx, arg)    { Some(t) => t, None => return },
+            "ls"      => match build_ls_table(ctx, cwd, arg)    { Some(t) => t, None => return Err(ShellError::Unknown) },
+            "caps"    => match build_caps_table(ctx, arg)       { Some(t) => t, None => return Err(ShellError::Unknown) },
+            "drives"  => match build_drives_table(ctx)          { Some(t) => t, None => return Err(ShellError::Unknown) },
+            "find"    => match build_find_table(ctx, cwd, arg)  { Some(t) => t, None => return Err(ShellError::Unknown) },
+            "observe" => match build_observe_table(ctx, arg)    { Some(t) => t, None => return Err(ShellError::Unknown) },
             _         => build_status_table(ctx),
         };
         // Loud on the record bound (§3.12/§26.6): a producer that overran rows/arena is reported,
@@ -1294,10 +1337,10 @@ fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str) {
         // docs/records.md) and decode it back into a Table — no JSON round-trip. The transport
         // is the same byte drain as a text service; the bytes are records, decoded here.
         let mut cap = Cap::new();
-        if !drain_service(ctx, c0, None, &mut cap) { return; }
+        if !drain_service(ctx, c0, None, &mut cap) { return Err(ShellError::Unknown); }
         match Table::decode(cap.bytes()) {
             Ok(t) => Stream::Table(t),
-            Err(why) => { ctx.console_writeln_fmt(format_args!("{}: bad record stream — {}", c0, why)); return; }
+            Err(why) => { ctx.console_writeln_fmt(format_args!("{}: bad record stream — {}", c0, why)); return Err(ShellError::Unknown); }
         }
     } else if is_producer_builtin(c0) {
         let mut cap = Cap::new();
@@ -1306,19 +1349,19 @@ fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str) {
         Stream::Bytes(cap)
     } else if is_pipe_producer_service(c0) {
         let mut cap = Cap::new();
-        if !drain_service(ctx, c0, None, &mut cap) { return; }
+        if !drain_service(ctx, c0, None, &mut cap) { return Err(ShellError::Unknown); }
         Stream::Bytes(cap)
     } else {
         ctx.console_writeln_fmt(format_args!("pipe: '{}' cannot start a pipe", c0));
-        return;
+        return Err(ShellError::Unknown);
     };
 
-    // Stages 2..n — transform, with the last optionally a `write` sink.
+    // Stages 2..n — transform, with the last optionally a sink (`write` or `assert`).
     for i in 1..n {
         let last = i == n - 1;
         let (cmd, arg) = split_first(stages[i]);
         if cmd == "write" {
-            if !last { ctx.console_writeln("pipe: write must be the last stage"); return; }
+            if !last { ctx.console_writeln("pipe: write must be the last stage"); return Err(ShellError::Unknown); }
             match &s {
                 Stream::Bytes(c) => pipe_write_file(ctx, cwd, arg, c.bytes()),
                 Stream::Table(t) => {
@@ -1327,14 +1370,68 @@ fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str) {
                     pipe_write_file(ctx, cwd, arg, c.bytes());
                 }
             }
-            return;
+            return Ok(());
         }
-        if !pipe_transform(ctx, stages[i], cmd, &mut s) { return; }
+        if cmd == "assert" {
+            // The verifying sink: judge the stream and return Ok/Err so a script's `run` (and
+            // `result`) sees the verdict. Must be last — it consumes the stream.
+            if !last { ctx.console_writeln("pipe: assert must be the last stage"); return Err(ShellError::Unknown); }
+            return assert_stream(ctx, &s, arg);
+        }
+        if !pipe_transform(ctx, stages[i], cmd, &mut s) { return Err(ShellError::Unknown); }
     }
-    // No `write` sink — render the final stream to the console.
+    // No sink — render the final stream to the console.
     match &s {
         Stream::Bytes(c) => console_write_chunked(ctx, c.bytes()),
         Stream::Table(t) => { let mut o = Out::Console; t.to_grid(&mut OutSink { ctx, out: &mut o }); }
+    }
+    Ok(())
+}
+
+/// `… | assert <check> [text]` — the verifying pipe sink. Materialises the stream to text (a
+/// `Table` renders to its grid) and checks it, returning `Ok` if the assertion holds, else
+/// `Err(AssertFailed)`. Prints a terse verdict so a `run` transcript shows pass/fail per line.
+/// Checks: `contains <text>`, `lacks <text>` (negation), `empty`. (Content correctness; the
+/// `assert ok/fails <cmd>` *result* form is handled in `cmd_assert`, no pipe.)
+///
+/// `#[inline(never)]`: holds a 64 KiB `Cap` (to materialise a `Table`), so it must not fold into
+/// `pipe_run`'s frame (which already carries a 64 KiB `Stream`) — the inline-frame stack rule.
+#[inline(never)]
+fn assert_stream(ctx: &ServiceContext, s: &Stream, arg: &str) -> Result<(), ShellError> {
+    let mut tmp = Cap::new();
+    let bytes: &[u8] = match s {
+        Stream::Bytes(c) => c.bytes(),
+        Stream::Table(t) => {
+            { let mut o = Out::Capture(&mut tmp); t.to_grid(&mut OutSink { ctx, out: &mut o }); }
+            tmp.bytes()
+        }
+    };
+    let (check, rest) = split_first(arg);
+    let want = strip_quotes(rest);
+    let held = match check {
+        "contains" => contains(bytes, want.as_bytes()),
+        "lacks"    => !contains(bytes, want.as_bytes()),
+        "empty"    => trim_bytes(bytes).is_empty(),
+        _ => {
+            ctx.console_writeln_fmt(format_args!("assert: unknown check '{}' (try: contains, lacks, empty)", check));
+            return Err(ShellError::Unknown);
+        }
+    };
+    assert_verdict(ctx, held, check, want)
+}
+
+/// Print the verdict (`assert: ok` / `assert: FAILED — …`) and map it to a `Result`.
+fn assert_verdict(ctx: &ServiceContext, held: bool, check: &str, detail: &str) -> Result<(), ShellError> {
+    if held {
+        ctx.console_writeln("assert: ok");
+        Ok(())
+    } else {
+        if detail.is_empty() {
+            ctx.console_writeln_fmt(format_args!("assert: FAILED ({})", check));
+        } else {
+            ctx.console_writeln_fmt(format_args!("assert: FAILED ({} '{}')", check, detail));
+        }
+        Err(ShellError::AssertFailed)
     }
 }
 

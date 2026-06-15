@@ -67,8 +67,8 @@ surface — §7.7). Pipelines are also not on the model yet.
 - Convert the remaining commands (file ops, spawn/kill/restart, the record verbs, pipelines).
 - **`run <script>`** — **built** (`utilities/33_run.md`): executes a file of commands,
   aggregating `result` into "ran N, failed M".
-- **`assert`** — positive (`is_ok`) and negative (`fails-with <Variant>`) checks, so a script can
-  self-verify the guardrails, not just the happy path.
+- **`assert`** — **built** (`utilities/34_assert.md`): `assert ok/fails <cmd>` (result) and
+  `… | assert contains X` (content), so a script self-verifies the guardrails and the output.
 
 ## 6. Implementation shape & conformance
 

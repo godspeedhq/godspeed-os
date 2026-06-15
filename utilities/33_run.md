@@ -66,8 +66,8 @@ column, …). Verifying *correct output* (not just "didn't error") is the job of
 
 ## 5. Later (separate so it can grow)
 
-- **`assert`** — positive (`is_ok`) and negative (`fails-with <Variant>`) checks, so a script
-  self-verifies instead of being eyeballed (the rung that makes the T630 print PASS/FAIL).
+- **`assert`** — **built** (`utilities/34_assert.md`): `assert ok/fails <cmd>` and
+  `… | assert contains X`, so a script self-verifies instead of being eyeballed.
 - **Image-baked `.gs`** — `osdev` writing a script into the flashed image's GSFS, so it's
   flash-and-`run` on hardware with no on-device authoring.
 - Multi-line authoring on-device (a tiny editor, or newline-capable write).
