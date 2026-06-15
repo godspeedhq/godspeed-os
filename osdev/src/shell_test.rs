@@ -943,6 +943,37 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL — greet|match|count timeout"); fail += 1; }
     }
 
+    // ── sort: order the lines (greet emits hello / capability / no-ambient, out of order) ──
+    // Ascending (byte order c < h < n): "capability …" comes before "hello …".
+    match run!(b"greet | sort\r", 14) {
+        Some(r) => {
+            let (cap, hel) = (r.find("capability pipes work"), r.find("hello from godspeed"));
+            check!(cap.is_some() && hel.is_some() && cap < hel, "sort: ascending (capability before hello)");
+        }
+        None => { println!("files-test: FAIL — greet|sort timeout"); fail += 1; }
+    }
+    // Descending: "no ambient …" comes before "capability …".
+    match run!(b"greet | sort reverse\r", 14) {
+        Some(r) => {
+            let (na, cap) = (r.find("no ambient authority here"), r.find("capability pipes work"));
+            check!(na.is_some() && cap.is_some() && na < cap, "sort reverse: descending (no-ambient before capability)");
+        }
+        None => { println!("files-test: FAIL — greet|sort reverse timeout"); fail += 1; }
+    }
+    // Direct file sort (/greetout.txt holds greet's lines in original order).
+    match run!(b"sort /greetout.txt\r", 10) {
+        Some(r) => {
+            let (cap, hel) = (r.find("capability pipes work"), r.find("hello from godspeed"));
+            check!(cap.is_some() && hel.is_some() && cap < hel, "sort: direct file sort (capability before hello)");
+        }
+        None => { println!("files-test: FAIL — sort direct timeout"); fail += 1; }
+    }
+    // Composition: sort is a filter, count after it still sees 3 lines.
+    match run!(b"greet | sort | count\r", 16) {
+        Some(r) => check!(r.contains("3 lines"), "sort: composes (greet | sort | count → 3 lines)"),
+        None    => { println!("files-test: FAIL — greet|sort|count timeout"); fail += 1; }
+    }
+
     child.kill().ok();
     child.wait().ok();
     println!("\nfiles-test: {pass} passed, {fail} failed");

@@ -135,7 +135,7 @@ shape — only *who drains whom, and when*.
 
 A **filter built-in** consumes the previous stage's buffer and emits to the next — it runs
 in-process, so it is **not** subject to the 4 KiB service-boundary cap and can filter a full
-64 KiB buffer. Built so far: **`match`** (the grep-equivalent line filter —
-`utilities/27_match.md`) and **`count`** (the wc-equivalent — `utilities/28_count.md`):
-`read /log | match error | count`. More — `sort`, `head`/`tail` — and piping into command
-arguments are the remaining Appendix-D work; each drops into the same middle FILTER slot.
+64 KiB buffer. Built so far: **`match`** (grep — `utilities/27_match.md`), **`count`** (wc —
+`utilities/28_count.md`), and **`sort`** (`utilities/29_sort.md`): `read /log | match error |
+sort | count`. More — `head`/`tail` — and piping into command arguments are the remaining
+Appendix-D work; each drops into the same middle FILTER slot.
