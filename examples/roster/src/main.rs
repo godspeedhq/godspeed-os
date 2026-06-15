@@ -1,14 +1,15 @@
 //! `roster` — an example **record-producing** pipe service (Appendix D, `docs/records.md`).
 //!
 //! Where `greet` emits text lines, `roster` emits **structured records**: it builds a typed
-//! `Table` with the SDK (`godspeed_sdk::record`), renders it to JSON, and sends the bytes through
-//! the delegated pipe cap — exactly the path any third-party service uses to feed a record pipe
-//! *without* a new kernel surface. The shell's `| from json` lifts the JSON back into records, so
-//! `roster | from json | where role=core` filters on a real field:
+//! `Table` with the SDK (`godspeed_sdk::record`), serializes it with the **binary wire codec**
+//! (`Table::encode`), and sends the bytes through the delegated pipe cap. The shell decodes the
+//! stream straight back into a `Table` (it knows `roster` is a record service), so the record
+//! verbs operate on a real field with **no JSON round-trip**:
 //!
 //! ```text
-//! gs> roster | from json | where role=core
-//! gs> roster | from json | sort reverse core | select name core
+//! gs> roster | where role=core
+//! gs> roster | sort reverse core | select name core
+//! gs> roster | to json            (records → JSON only at the edge, if you want it)
 //! ```
 //!
 //! Like `greet`, `roster` declares **no** send peers — its only way out is the SEND cap the shell
@@ -19,8 +20,9 @@
 
 use godspeed_sdk::{Message, RecordSink, ServiceContext, Table, Value};
 
-/// A `RecordSink` that accumulates the rendered bytes into a fixed buffer (no heap). The JSON for
-/// a handful of rows is well under one IPC message (4 KiB); overflow is flagged, never silent.
+/// A `RecordSink` that accumulates the encoded bytes into a fixed buffer (no heap). The wire
+/// encoding for a handful of rows is well under one IPC message (4 KiB); overflow is flagged,
+/// never silent.
 struct BufSink {
     buf: [u8; 1024],
     len: usize,
@@ -55,18 +57,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         t.add_row(&[n, r, Value::Int(*core)]);
     }
 
-    // Render to JSON — the wire-friendly edge format the shell's `from json` lifts back to
-    // records. (Crossing the boundary *as records* is the future bounded wire codec.)
+    // Serialize with the binary wire codec — the `Table` itself on the wire, not JSON. The shell
+    // decodes it straight back into records (no `from json`).
     let mut sink = BufSink { buf: [0u8; 1024], len: 0, overflow: false };
-    t.to_json(&mut sink);
+    t.encode(&mut sink);
 
     // send_peers[0] is the SEND cap the shell delegated to the pipe sink.
     match ctx.send_peer_at(0) {
         Some(dst) => {
-            // The JSON fits in one 4 KiB message; then the EOT end-of-stream marker.
+            // The encoding fits in one 4 KiB message; then the EOT end-of-stream marker. (A larger
+            // table would be chunked — never as a lone 0x04, which is EOT.)
             let _ = ctx.send_by_handle(dst, &Message::from_bytes(&sink.buf[..sink.len]));
             let _ = ctx.send_by_handle(dst, &Message::from_bytes(&[0x04]));
-            ctx.log("roster: sent a 3-row table as JSON through the delegated pipe cap");
+            ctx.log("roster: sent a 3-row table via the binary record codec through the pipe cap");
         }
         None => {
             ctx.log("roster: no pipe cap was delegated — nothing to send to");
