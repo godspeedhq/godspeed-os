@@ -438,6 +438,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd) {
         }
         "tree"    => cmd_tree(ctx, cwd, if argc >= 2 { args[1] } else { "" }, &mut Out::Console),
         "match"   => cmd_match(ctx, cwd, &args, argc),
+        "count"   => cmd_count(ctx, cwd, &args, argc),
         other => {
             // Build "unknown: <cmd>" in a stack buffer to avoid two ctx.log calls
             let mut buf = [0u8; 64];
@@ -462,7 +463,7 @@ const UTIL_VERSION: &str = "0.1.0";
 const UTILS: &[&str] = &[
     "echo", "clear", "about", "mem", "cores", "date", "status", "observe", "caps",
     "spawn", "kill", "restart", "reboot", "drives", "ls", "cd", "read", "write",
-    "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match",
+    "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count",
 ];
 fn is_util(name: &str) -> bool { UTILS.contains(&name) }
 
@@ -594,6 +595,10 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("match except <pattern> [path]", "keep the lines that do NOT match", "read /log | match except debug"),
             ("match \"<two words>\" …", "quote a multi-word pattern", "match \"out of memory\" /log"),
         ], true),
+        "count" => help_block(ctx, "count", "count lines, words, and bytes", &[
+            ("<producer> | count", "count piped input", "find *.txt | count"),
+            ("count <path>", "count a file", "count /log"),
+        ], true),
         _ => return false,
     }
     true
@@ -668,6 +673,7 @@ fn cmd_help(ctx: &ServiceContext) {
     help_line(ctx, "find <pattern> [path]", "search by name (substring or *? glob)");
     help_line(ctx, "tree [path]", "print the directory hierarchy");
     help_line(ctx, "match <pattern> [path]", "keep lines matching (also: <prod> | match)");
+    help_line(ctx, "count [path]", "count lines/words/bytes (also: <prod> | count)");
     ctx.console_writeln("");
     ctx.console_writeln("Pipes");
     help_line(ctx, "<producer> | [filter |…] <sink>", "compose stages (Appendix D)");
@@ -1074,9 +1080,9 @@ fn stage_filter(ctx: &ServiceContext, cwd: &Cwd, stage: &str, input: &[u8], out:
 }
 
 /// Built-in FILTERS — they consume input and emit output, so they can sit mid-pipe. Run
-/// in-process, so they are NOT subject to the 4 KiB service-boundary cap. Currently `match`.
+/// in-process, so they are NOT subject to the 4 KiB service-boundary cap.
 fn is_filter_builtin(name: &str) -> bool {
-    matches!(name, "match")
+    matches!(name, "match" | "count")
 }
 
 /// The last stage — consumes the final buffer. `write <file>` writes it; a service filters it
@@ -2093,18 +2099,75 @@ fn cmd_match(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) {
     }
 }
 
-/// Run a filter built-in (currently `match`) over `input`, writing matches to `out`. Used when
-/// the filter sits **mid-pipe** — it runs in-process, so it is not subject to the 4 KiB
-/// service-boundary cap and can filter a full 64 KiB stage buffer.
+/// Run a filter built-in (`match`, `count`) over `input`, writing its output to `out`. Used
+/// when the filter sits **mid-pipe** or as the last stage — it runs in-process, so it is not
+/// subject to the 4 KiB service-boundary cap and can filter a full 64 KiB stage buffer.
 fn run_filter_builtin(ctx: &ServiceContext, stage: &str, input: &[u8], out: &mut Out) -> bool {
-    let mut margs = [""; MAX_ARGS];
-    let mac = tokenize(stage, &mut margs);
-    match parse_match(&margs, mac, 1) {
-        Some((invert, pattern, _)) => {
-            match_lines(ctx, input, pattern.as_bytes(), invert, out);
-            true
+    let (cmd, _) = split_first(stage);
+    match cmd {
+        "count" => { write_count(ctx, input, out); true }
+        _ => {
+            // match (the default filter): tokenize for the `except` keyword + a quoted pattern.
+            let mut margs = [""; MAX_ARGS];
+            let mac = tokenize(stage, &mut margs);
+            match parse_match(&margs, mac, 1) {
+                Some((invert, pattern, _)) => {
+                    match_lines(ctx, input, pattern.as_bytes(), invert, out);
+                    true
+                }
+                None => { ctx.console_writeln("match: usage: <producer> | match [except] <pattern>"); false }
+            }
         }
-        None => { ctx.console_writeln("match: usage: <producer> | match [except] <pattern>"); false }
+    }
+}
+
+// ── count — how many lines / words / bytes (the wc-equivalent) ───────────────────
+// `count <path>` counts a file; `<producer> | count` counts piped input. Like `match` it is a
+// built-in FILTER (in-process, no 4 KiB cap), but it consumes many lines and emits one summary
+// line, so it usually ends a pipe. See utilities/28_count.md.
+
+/// "" for a count of 1, "s" otherwise — readable singular/plural.
+fn plural(n: usize) -> &'static str { if n == 1 { "" } else { "s" } }
+
+/// Count `input`'s lines / words / bytes and write the labelled summary to `out`. Lines = newline
+/// count, plus one for a final unterminated line. Words = runs of non-whitespace bytes.
+fn write_count(ctx: &ServiceContext, input: &[u8], out: &mut Out) {
+    let bytes = input.len();
+    let mut lines = input.iter().filter(|&&b| b == b'\n').count();
+    if !input.is_empty() && input.last() != Some(&b'\n') { lines += 1; }
+    let mut words = 0usize;
+    let mut in_word = false;
+    for &b in input {
+        if b.is_ascii_whitespace() { in_word = false; }
+        else if !in_word { in_word = true; words += 1; }
+    }
+    out.line_fmt(ctx, format_args!(
+        "{} line{}, {} word{}, {} byte{}",
+        lines, plural(lines), words, plural(words), bytes, plural(bytes)));
+}
+
+/// `count <path>` — count the lines / words / bytes of a file. The pipe form `<producer> |
+/// count` counts piped input instead; either way `count` consumes input (never a producer).
+fn cmd_count(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) {
+    let path = if argc >= 2 { args[1] } else { "" };
+    if path.is_empty() {
+        ctx.console_writeln("count: a path is required (or pipe input: <producer> | count)");
+        return;
+    }
+    let mut buf = [0u8; PATH_MAX];
+    let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return };
+    let reply = match fs_request(ctx, OP_READ_FILE, abspath, &[]) {
+        Some(r) => r,
+        None => { ctx.console_writeln("count: storage unavailable"); return; }
+    };
+    let p = reply.payload_bytes();
+    if no_fs(ctx, p) { return; }
+    if p.first() == Some(&FS_OK) && p.len() >= 5 {
+        let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
+        let end = (5 + n).min(p.len());
+        write_count(ctx, &p[5..end], &mut Out::Console);
+    } else {
+        ctx.console_writeln_fmt(format_args!("count: not found: {}", str_of(abspath)));
     }
 }
 
