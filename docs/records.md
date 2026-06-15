@@ -61,8 +61,10 @@ grammar is deliberately **terse and code-like**, not an English sentence:
 
 The text filters (`match`/`count`/`sort`/`first`/`last`) stay — for genuinely-text streams like
 a file's contents. A pipeline is routed to the **record** path when its first stage is a record
-producer (`is_record_producer`, currently `status`), else the **byte** path. They coexist; the
-default rendering (no `to`) is the table grid.
+producer (`is_record_producer` — `status` and `ls`), else the **byte** path. They coexist; the
+default rendering (no `to`) is the table grid. A *text* filter applied to a record stream (e.g.
+`ls | match foo`) is a loud, guided error — use `where`/`select`/`sort <col>`, or `to json` to
+drop back to text first.
 
 ```
 status                                   the default table
@@ -97,14 +99,17 @@ pair.
 ## What's built vs next
 
 - **Built:** the `Table` model (owned column names + arena); `render_table` (default),
-  `render_json`, `render_yaml`; the compact `where`, `select`, `sort [reverse] <col>`; `status`
-  as the first record producer; **`from json`** (text → records); and the **unified byte↔record
-  pipeline** (`Stream = Bytes | Table`, dispatched by command + data type, `from`/`to` bridging).
-  All in-process (no wire codec), QEMU-verified incl. a json → records → yaml → file round-trip.
-- **Next:** a JSON string-escaper (values are plain ASCII today); more producers (`ls`, `find`,
-  `caps`, `observe`); `from yaml`; then — only when a record first needs to cross a *service*
-  boundary — the bounded wire codec; eventually heterogeneous records and richer interop (which
-  also needs an out-channel — file export now, network far later).
+  `render_json`, `render_yaml`; the compact `where`, `select`, `sort [reverse] <col>`; **two
+  record producers — `status` (task roster) and `ls` (directory listing: `name`/`type`/`size`)**;
+  **`from json`** (text → records); and the **unified byte↔record pipeline** (`Stream = Bytes |
+  Table`, dispatched by command + data type, `from`/`to` bridging). All in-process (no wire
+  codec), QEMU-verified incl. a json → records → yaml → file round-trip and `ls | where
+  type=file | sort reverse size`.
+- **Next:** a JSON string-escaper (values are plain ASCII today); more producers (`find`,
+  `caps`, `drives`, then `observe` — the first one across a *service* boundary); `from yaml`;
+  then — only when a record first needs to cross that service boundary — the bounded wire codec;
+  eventually heterogeneous records and richer interop (which also needs an out-channel — file
+  export now, network far later).
 
 ## Discipline (so it doesn't rot into PowerShell-magic)
 

@@ -1108,6 +1108,52 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL — json→yaml roundtrip timeout"); fail += 1; }
     }
 
+    // ── ls as a record producer: directory entries become typed rows (name/type/size) ──
+    // A dedicated dir with known contents: two files of different size + one subdir.
+    let _ = run!(b"mkdir /lsr\r", 10);
+    let _ = run!(b"write /lsr/big.txt hello world\r", 10);  // 11 bytes
+    let _ = run!(b"write /lsr/tiny.txt x\r", 10);           // 1 byte
+    let _ = run!(b"mkdir /lsr/kids\r", 10);                 // a subdirectory
+    // bare ls is still the plain text listing (record path is pipe-only).
+    match run!(b"ls /lsr\r", 10) {
+        Some(r) => check!(r.contains("big.txt") && r.contains("TYPE") && r.contains("dir"),
+                          "ls record: bare ls is still the text listing"),
+        None    => { println!("files-test: FAIL — ls /lsr timeout"); fail += 1; }
+    }
+    // where on the `type` column keeps only directories.
+    match run!(b"ls /lsr | where type=dir\r", 12) {
+        Some(r) => check!(r.contains("kids") && !r.contains("big.txt"),
+                          "ls record: where type=dir keeps the subdir, drops files"),
+        None    => { println!("files-test: FAIL — ls|where type=dir timeout"); fail += 1; }
+    }
+    // select projects just the name column (no type/size keys).
+    match run!(b"ls /lsr | select name | to json\r", 12) {
+        Some(r) => check!(r.contains("\"name\": \"big.txt\"") && !r.contains("\"type\"") && !r.contains("\"size\""),
+                          "ls record: select name projects one column"),
+        None    => { println!("files-test: FAIL — ls|select timeout"); fail += 1; }
+    }
+    // where type=file | to json renders file rows with a numeric size, no subdir.
+    match run!(b"ls /lsr | where type=file | to json\r", 12) {
+        Some(r) => check!(r.contains("\"type\": \"file\"") && r.contains("\"size\":") && !r.contains("kids"),
+                          "ls record: where type=file | to json renders file rows"),
+        None    => { println!("files-test: FAIL — ls|where|to json timeout"); fail += 1; }
+    }
+    // column sort works on the listing: reverse size puts big.txt (11) before tiny.txt (1).
+    match run!(b"ls /lsr | where type=file | sort reverse size | to json\r", 12) {
+        Some(r) => {
+            let (big, tiny) = (r.find("big.txt"), r.find("tiny.txt"));
+            check!(big.is_some() && tiny.is_some() && big < tiny,
+                   "ls record: sort reverse size orders files by byte size");
+        }
+        None => { println!("files-test: FAIL — ls|sort size timeout"); fail += 1; }
+    }
+    // a text filter on a record stream is a loud, guided error (not silent, not wrong output).
+    match run!(b"ls /lsr | match big\r", 12) {
+        Some(r) => check!(r.contains("record stream") && r.contains("where"),
+                          "ls record: text filter (match) on records errors with guidance"),
+        None    => { println!("files-test: FAIL — ls|match guard timeout"); fail += 1; }
+    }
+
     child.kill().ok();
     child.wait().ok();
     println!("\nfiles-test: {pass} passed, {fail} failed");

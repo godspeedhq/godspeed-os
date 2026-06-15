@@ -23,7 +23,10 @@ real fields. The names say what they do with no POSIX heritage to learn (§ conv
 - **`from`** — parse text *into* records (the bridge from the byte world).
 
 They are **pipe-only stages** — there is no `where /file`. They appear in a pipeline after a
-record producer (`status | where …`) or after `from` (`read x.json | from json | where …`).
+record producer (`status | where …`, `ls | where …`) or after `from`
+(`read x.json | from json | where …`). The record producers so far are **`status`** (the task
+roster) and **`ls`** (a directory listing — columns `name`/`type`/`size`); more are planned
+(`16_ls.md` §2a, `docs/records.md`).
 
 ## 2. Usage
 
@@ -90,7 +93,8 @@ or kernel surface: these operate on data already in the pipeline.
 
 ## 5. Later (separate so it can grow)
 
-- More record producers (`ls`, `find`, `caps`, `observe`) so the verbs apply beyond `status`.
+- More record producers (`find`, `caps`, `drives`, then `observe`) so the verbs apply to more
+  commands. `status` and `ls` are done.
 - `from yaml`; a JSON string-escaper (values are plain ASCII today).
 - The bounded **wire codec** — only when a record first needs to cross a *service* boundary
   (today every producer is shell-side, so records pass by value). Emphatically not JSON on the
