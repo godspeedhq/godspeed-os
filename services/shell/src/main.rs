@@ -906,7 +906,9 @@ impl Table {
 /// Render a table as an aligned text grid (the default view). Two passes: column widths, then
 /// the header and rows. Output goes through `Out` so it works to the console or a capture.
 /// String cells render in full (via the arena) — never through the 24-byte `fmt_cell` scratch —
-/// so a long value like a `find` path is not silently clipped (§3.12).
+/// so a long value like a `find` path is not silently clipped (§3.12). `saturating_sub` guards
+/// the pad width defensively (a width pass and an output pass that ever disagreed must not
+/// underflow into a multi-GB space run).
 fn render_table(ctx: &ServiceContext, t: &Table, out: &mut Out) {
     let mut w = [0usize; REC_MAX_COLS];
     for c in 0..t.ncols { w[c] = t.col_name(c).len(); }
@@ -919,7 +921,7 @@ fn render_table(ctx: &ServiceContext, t: &Table, out: &mut Out) {
     // header
     for c in 0..t.ncols {
         out.put_bytes(ctx, t.col_name(c));
-        pad(ctx, out, w[c] - t.col_name(c).len() + 2);
+        pad(ctx, out, w[c].saturating_sub(t.col_name(c).len()) + 2);
     }
     out.put(ctx, "\n");
     // rows
@@ -930,7 +932,7 @@ fn render_table(ctx: &ServiceContext, t: &Table, out: &mut Out) {
                 Value::Str { .. } => { let s = t.cell_str(t.rows[r][c]); out.put_bytes(ctx, s); s.len() }
                 v => { let n = fmt_cell(t, v, &mut scratch); out.put_bytes(ctx, &scratch[..n]); n }
             };
-            pad(ctx, out, w[c] - n + 2);
+            pad(ctx, out, w[c].saturating_sub(n) + 2);
         }
         out.put(ctx, "\n");
     }
@@ -1139,6 +1141,7 @@ fn render_yaml(ctx: &ServiceContext, t: &Table, out: &mut Out) {
 
 /// Build the live-task table that `status` produces (columns: slot, name, core, state, mem,
 /// queue, restarts). The structured form of what `status` used to print directly.
+#[inline(never)]
 fn build_status_table(ctx: &ServiceContext) -> Table {
     let mut t = Table::new(&["slot", "name", "core", "state", "mem", "queue", "restarts"]);
     for slot in 0u32..256 {
@@ -1166,6 +1169,13 @@ fn is_record_producer(name: &str) -> bool {
 /// `ls` as a record producer: directory entries as a table (`name` / `type` / `size`). Mirrors
 /// `cmd_ls`'s fs parse but emits rows instead of formatted text; `size` is `Int` for files and
 /// `Empty` for directories (a dir has no byte size). Errors print and return `None` (abort pipe).
+///
+/// `#[inline(never)]` (and on all the sibling builders): each holds a multi-KB `Table` (and
+/// `build_find_table` a `PathStack` too) on its stack. Inlined into `pipe_run`, those frames
+/// would inflate *every* pipeline's stack — even byte-only ones like `greet | sort` that never
+/// build a record — and overflow the bounded user stack. Out-of-line, the big frame exists only
+/// while the builder actually runs.
+#[inline(never)]
 fn build_ls_table(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Option<Table> {
     let mut buf = [0u8; PATH_MAX];
     let path = resolve_or_err(ctx, cwd, arg, &mut buf)?;
@@ -1201,6 +1211,7 @@ fn build_ls_table(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Option<Table> {
 /// `caps` as a record producer: one row per held capability — `resource` (the target,
 /// named for stable kernel resources, else `endpoint#N`) and `rights` (the spelled-out
 /// right words). Mirrors `cmd_caps`'s decoding. `name` empty → this shell's own caps.
+#[inline(never)]
 fn build_caps_table(ctx: &ServiceContext, name: &str) -> Option<Table> {
     let name = if name.is_empty() { "shell" } else { name };
     let slot = match slot_of(ctx, name) {
@@ -1258,6 +1269,7 @@ fn cap_rights_str(r: u8, buf: &mut [u8]) -> usize {
 /// (`GSFS`/`raw`), `size_mib`, and `free_mib` (`Empty` for a raw, unformatted drive). Single
 /// drive in step 3; mirrors `drives_list`. Sizes are in MiB (so the column name carries the
 /// unit — a bare number cell can't).
+#[inline(never)]
 fn build_drives_table(ctx: &ServiceContext) -> Option<Table> {
     let reply = match ctx.request_with_reply("fs", &Message::from_bytes(&[OP_DRIVES_INFO])) {
         Some(r) => r,
@@ -1291,6 +1303,7 @@ fn build_drives_table(ctx: &ServiceContext) -> Option<Table> {
 /// `find` as a record producer: one row per match — `name`, `type` (`file`/`dir`), and the
 /// full `path`. Same bounded depth-first walk as `cmd_find`, emitting rows instead of printing
 /// the path. `arg` is the producer tail (`<pattern> [start]`).
+#[inline(never)]
 fn build_find_table(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Option<Table> {
     let (target, start) = split_first(arg);
     if target.is_empty() { ctx.console_writeln("usage: find <name> [path]"); return None; }
