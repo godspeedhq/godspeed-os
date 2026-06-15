@@ -2798,9 +2798,20 @@ pub fn spawn_service_pipe(producer: &str, sink: &str, core_override: Option<u32>
 {
     let (static_name, cfg) = service_config(producer).ok_or(SpawnError::NotFound)?;
     let core_id = resolve_spawn_core(core_override, cfg.preferred_core);
-    let pipe_peers: [&str; 1] = [sink];
+    // The delegated pipe peer goes FIRST so the producer/filter reaches it via
+    // `send_peer_at(0)` (its "downstream"); the contract's own peers follow, so a filter that
+    // must `registry`-register to receive a stage's input (e.g. `upper`) still can. Bounded by
+    // MAX_SEND_PEERS — extra contract peers past the cap are dropped (the pipe peer is kept).
+    let mut pipe_peers: [&str; MAX_SEND_PEERS] = [""; MAX_SEND_PEERS];
+    pipe_peers[0] = sink;
+    let mut np = 1usize;
+    for &p in cfg.send_peers {
+        if np >= MAX_SEND_PEERS { break; }
+        pipe_peers[np] = p;
+        np += 1;
+    }
     let result = spawn_service_with_config(static_name, cfg.elf, core_id,
-        cfg.has_recv_endpoint, &pipe_peers, cfg.probe_mode, cfg.send_peers_grant,
+        cfg.has_recv_endpoint, &pipe_peers[..np], cfg.probe_mode, cfg.send_peers_grant,
         cfg.memory_limit, cfg.hw_irqs, cfg.has_console_read);
     if let Err(ref e) = result {
         crate::kprintln!("task: spawn pipe '{}' -> '{}' failed: {:?}", producer, sink, e);
