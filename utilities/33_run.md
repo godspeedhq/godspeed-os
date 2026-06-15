@@ -68,8 +68,9 @@ column, …). Verifying *correct output* (not just "didn't error") is the job of
 
 - **`assert`** — **built** (`utilities/34_assert.md`): `assert ok/fails <cmd>` and
   `… | assert contains X`, so a script self-verifies instead of being eyeballed.
-- **Image-baked `.gs`** — `osdev` writing a script into the flashed image's GSFS, so it's
-  flash-and-`run` on hardware with no on-device authoring.
+- **Image-baked `.gs`** — **built**: `osdev script-disk <out> <script>` bakes a script into a
+  GSFS data disk host-side (`gsfs_add_file`); `dd` it to the data drive and `run /suite.gs` on
+  hardware, no on-device authoring. `osdev test script` proves the loop (incl. piped asserts).
 - Multi-line authoring on-device (a tiny editor, or newline-capable write).
 
 ## 6. Implementation shape & conformance

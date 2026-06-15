@@ -99,6 +99,8 @@ enum Commands {
     Validate,
     /// Format a disk image with a GodspeedOS filesystem superblock (docs/persistence.md §6).
     Mkfs { image: String },
+    /// Build a flashable GSFS data disk with a `.gs` script baked in (run it on hardware).
+    ScriptDisk { out: String, script: String },
 }
 
 fn main() {
@@ -118,6 +120,7 @@ fn main() {
         Commands::Shell { smp }      => cmd_shell(smp),
         Commands::Validate           => cmd_validate(),
         Commands::Mkfs { image }     => cmd_mkfs(&image),
+        Commands::ScriptDisk { out, script } => cmd_script_disk(&out, &script),
     }
 }
 
@@ -193,6 +196,91 @@ fn format_superblock(path: &str) {
 
 fn cmd_mkfs(image: &str) {
     format_superblock(image);
+}
+
+/// Bake a file into a GSFS0003 image (host-side mirror of the `fs` write path) — used to ship a
+/// `.gs` script on a flashable data disk, so the OS can `run /suite.gs` on hardware with no
+/// on-device authoring. Allocates a contiguous extent, writes the content, adds a root
+/// `file_record`, and updates the free count. Intended right after `format_superblock` (minimal,
+/// unfragmented layout). `name` ≤ 38 bytes; fits in the single root directory block (8 entries).
+fn gsfs_add_file(path: &str, name: &str, content: &[u8]) {
+    let mut data = std::fs::read(path)
+        .unwrap_or_else(|e| { eprintln!("bake: cannot read {}: {}", path, e); std::process::exit(1); });
+    if data.len() < 512 || &data[0..8] != FS_SB_MAGIC {
+        eprintln!("bake: {} is not a GSFS0003 image", path); std::process::exit(1);
+    }
+    if name.len() > 38 { eprintln!("bake: name '{}' too long (max 38)", name); std::process::exit(1); }
+    let rdu = |d: &[u8], o: usize| u64::from_le_bytes(d[o..o + 8].try_into().unwrap());
+    let total_blocks = rdu(&data, 16);
+    let bitmap_start = rdu(&data, 24) as usize;
+    let data_start   = rdu(&data, 40);
+    let root_first   = rdu(&data, 48) as usize;
+    let mut free_blocks = rdu(&data, 64);
+
+    let nblocks = ((content.len() as u64) + 511) / 512;
+    // First run of `nblocks` free, contiguous blocks at/after data_start (set bit = used).
+    let mut first = data_start.max(1);
+    loop {
+        if first + nblocks > total_blocks {
+            eprintln!("bake: image too small for /{} ({} blocks needed)", name, nblocks);
+            std::process::exit(1);
+        }
+        let mut all_free = true;
+        for k in 0..nblocks {
+            let blk = first + k;
+            if data[bitmap_start * 512 + (blk / 8) as usize] & (1u8 << (blk % 8)) != 0 {
+                all_free = false; break;
+            }
+        }
+        if all_free { break; }
+        first += 1;
+    }
+    // Mark the extent used; update the free count.
+    for k in 0..nblocks {
+        let blk = first + k;
+        data[bitmap_start * 512 + (blk / 8) as usize] |= 1u8 << (blk % 8);
+    }
+    free_blocks -= nblocks;
+    data[64..72].copy_from_slice(&free_blocks.to_le_bytes());
+    // Write the content into the extent (the tail of the last block stays zero).
+    let off = (first as usize) * 512;
+    data[off..off + content.len()].copy_from_slice(content);
+    // Add a root file_record into the first free 64-byte slot (type 0 = free).
+    let rd = root_first * 512;
+    let mut placed = false;
+    for slot in 0..8 {
+        let r = rd + slot * 64;
+        if data[r] == 0 {
+            data[r] = 1;                                    // type = file
+            data[r + 1] = name.len() as u8;                 // name_len
+            data[r + 2..r + 2 + name.len()].copy_from_slice(name.as_bytes());
+            data[r + 40..r + 48].copy_from_slice(&(content.len() as u64).to_le_bytes()); // size
+            data[r + 48..r + 56].copy_from_slice(&first.to_le_bytes());                  // first_block
+            data[r + 56..r + 64].copy_from_slice(&nblocks.to_le_bytes());                // block_count
+            placed = true;
+            break;
+        }
+    }
+    if !placed { eprintln!("bake: root directory is full"); std::process::exit(1); }
+    std::fs::write(path, &data)
+        .unwrap_or_else(|e| { eprintln!("bake: cannot write {}: {}", path, e); std::process::exit(1); });
+    println!("bake: wrote /{} ({} bytes, {} block(s) at {}) into {}", name, content.len(), nblocks, first, path);
+}
+
+/// `osdev script-disk <out> <script>` — produce a flashable GSFS data disk with `<script>` baked
+/// in as `/<basename>`. Boot the OS with this disk attached and `run /<basename>` — the way to
+/// ship a self-checking suite to hardware (`dd` it to the data drive). Default 16 MiB.
+fn cmd_script_disk(out: &str, script: &str) {
+    let content = std::fs::read(script)
+        .unwrap_or_else(|e| { eprintln!("script-disk: cannot read {}: {}", script, e); std::process::exit(1); });
+    let name = std::path::Path::new(script).file_name()
+        .and_then(|s| s.to_str()).unwrap_or("suite.gs");
+    if let Some(parent) = std::path::Path::new(out).parent() { let _ = std::fs::create_dir_all(parent); }
+    std::fs::write(out, vec![0u8; 16 * 1024 * 1024])
+        .unwrap_or_else(|e| { eprintln!("script-disk: cannot create {}: {}", out, e); std::process::exit(1); });
+    format_superblock(out);
+    gsfs_add_file(out, name, &content);
+    println!("script-disk: {} ready — flash it to the data drive, then `run /{}`", out, name);
 }
 
 fn cmd_new(name: &str) {
@@ -933,6 +1021,7 @@ fn cmd_test(suite: &str) {
         "drives-raw"   => run_drives_raw_test(),
         "drives"       => run_drives_scripted_test(),
         "files"        => run_files_test(),
+        "script"       => run_script_test(),
         other => eprintln!("unknown test suite: {}", other),
     }
 }
@@ -1358,6 +1447,39 @@ fn run_files_test() {
     std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create raw disk");
 
     crate::shell_test::run_files(&image_path, persist, 4);
+}
+
+/// Host-baked-script test: bake a self-checking `.gs` suite into a GSFS data disk (the way a
+/// suite ships to hardware), boot with it attached, and `run /suite.gs`. Proves the whole
+/// flash-and-run loop AND piped asserts inside a script (which can't be authored on-device).
+fn run_script_test() {
+    println!("\n=== script: a host-baked .gs suite, run on boot (GSFS AHCI disk) ===");
+    cmd_build_bare_metal();
+
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+
+    // The suite — deterministic on a freshly-baked disk (only /suite.gs exists). Includes PIPED
+    // asserts, the thing on-device authoring can't express. One command per line.
+    let suite = "\
+# GodspeedOS self-check (baked into a data disk, run on boot)
+assert ok read /suite.gs
+ls / | assert contains suite.gs
+roster | where role=core | assert contains vesta
+roster | where role=worker | assert lacks vesta
+status | where name=shell | assert contains shell
+assert fails read /nope
+";
+    let _ = std::fs::create_dir_all("build/tests");
+    let disk = "build/tests/script_disk.img";
+    std::fs::write(disk, vec![0u8; 16 * 1024 * 1024]).expect("failed to create disk");
+    format_superblock(disk);
+    gsfs_add_file(disk, "suite.gs", suite.as_bytes());
+
+    crate::shell_test::run_script(&image_path, disk, 4);
 }
 
 /// Build bare-metal image and run the scripted shell smoke-test.

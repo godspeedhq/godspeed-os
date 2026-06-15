@@ -78,10 +78,12 @@ run: ran 2, failed 0
 
 `run: ran N, failed 0` is the green bar — the T630 telling you the suite passed, no eyeballing.
 
-> **Authoring caveat (today).** A script line containing `|` can't yet be written via `write`
-> (the shell pipes the `write` line itself), so **content-form** asserts are run interactively
-> until scripts are **baked into the image host-side** (the companion step). Result-form asserts
-> (no `|`) script fine. The content form's *mechanism* is fully tested interactively.
+> **Authoring a suite with piped asserts.** A script line containing `|` can't be written via the
+> on-device `write` (the shell pipes the `write` line itself). The answer is **host-side baking**:
+> `osdev script-disk build/suite.img my_suite.gs` produces a GSFS data disk with the suite baked
+> in; `dd` it to the data drive, boot, and `run /my_suite.gs`. `osdev test script` runs exactly
+> this loop in CI (a suite full of piped asserts → `ran 6, failed 0`). Result-form asserts (no
+> `|`) can also be authored on-device with `write … cmd ; cmd`.
 
 ## 5. Bounds & safety (§26.6 / §3.12)
 
@@ -96,7 +98,8 @@ run: ran 2, failed 0
 
 - `assert fails-with <Variant>` — pin the *specific* `Err` (needs more commands to name variants).
 - More content checks (`is <text>` exact, `lines <N>`), if a suite needs them.
-- Host-side **image-baked `.gs`** so content-form (piped) asserts run from a script on hardware.
+- Host-side **image-baked `.gs`** — **built** (`osdev script-disk`, `osdev test script`): a suite
+  of piped asserts ships on a GSFS data disk and runs from a script on hardware.
 
 ## 7. Implementation shape & conformance
 
