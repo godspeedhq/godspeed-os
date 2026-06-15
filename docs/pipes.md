@@ -10,6 +10,12 @@ real endpoint cap (or an in-process capture) between stages. There is no shared 
 ambient authority — data always crosses a real boundary (§26.4 forbids a silent shell-internal
 data path masquerading as a pipe).
 
+> **A pipe now carries text *or* records.** The dispatcher threads a `Stream` that is either a
+> byte buffer or a typed `Table`; `from json` / `to json` flip between them, and each stage is
+> chosen by its command *and* by which it currently holds. This page describes the **text**
+> world (producers, filters, sinks, services); the **record** world (`where`/`select`/`sort`,
+> `from`/`to`) is in `docs/records.md`. They are one pipeline.
+
 ## The stage model
 
 A pipeline is **one producer, zero or more filters, one sink**:
