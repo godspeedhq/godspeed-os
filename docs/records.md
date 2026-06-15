@@ -61,10 +61,17 @@ grammar is deliberately **terse and code-like**, not an English sentence:
 
 The text filters (`match`/`count`/`sort`/`first`/`last`) stay — for genuinely-text streams like
 a file's contents. A pipeline is routed to the **record** path when its first stage is a record
-producer (`is_record_producer` — `status`, `ls`, `caps`, `drives`, `find`), else the **byte**
-path. They coexist; the default rendering (no `to`) is the table grid. A *text* filter applied to
-a record stream (e.g. `ls | match foo`) is a loud, guided error — use `where`/`select`/`sort
-<col>`, or `to json` to drop back to text first.
+producer (`is_record_producer` — `status`, `ls`, `caps`, `drives`, `find`, `observe now`), else
+the **byte** path. They coexist; the default rendering (no `to`) is the table grid. A *text*
+filter applied to a record stream (e.g. `ls | match foo`) is a loud, guided error — use
+`where`/`select`/`sort <col>`, or `to json` to drop back to text first.
+
+**A live, screen-owning loop cannot be a pipe stage.** `observe` (bare) is the continuous
+full-screen view — it owns the console and never yields a discrete stream, so piping it would
+block the shell on a `recv` that never comes (the stage-1 hazard `docs/pipes.md` guards). Only
+its one-shot snapshot, **`observe now`**, is pipeable; bare `observe | …` is a loud refusal, not
+a hang. This is the general rule for any future live-loop utility: the *snapshot* form is the
+record producer, the *live* form is not.
 
 ```
 status                                   the default table
@@ -100,18 +107,20 @@ pair.
 
 - **Built:** the `Table` model (owned column names + arena); `render_table` (default, full
   string cells — no clipping), `render_json`, `render_yaml`; the compact `where`, `select`,
-  `sort [reverse] <col>`; **five shell-side record producers — `status` (task roster),
+  `sort [reverse] <col>`; **six shell-side record producers — `status` (task roster),
   `ls` (`name`/`type`/`size`), `caps` (`resource`/`rights`), `drives`
-  (`index`/`label`/`status`/`size_mib`/`free_mib`), `find` (`name`/`type`/`path`)**;
-  **`from json`** (text → records); and the **unified byte↔record pipeline** (`Stream = Bytes |
-  Table`, dispatched by command + data type, `from`/`to` bridging). All in-process (no wire
-  codec), QEMU-verified incl. a json → records → yaml → file round-trip and `ls | where
-  type=file | sort reverse size`.
-- **Next:** a JSON string-escaper (values are plain ASCII today); **`observe`** — the first
-  producer whose data lives in a *separate service*, so it is the one that pulls the bounded
-  **wire codec** into existence (its per-task table otherwise duplicates `status`, so it waits
-  for the codec rather than duplicating); `from yaml`; eventually heterogeneous records and
-  richer interop (which also needs an out-channel — file export now, network far later).
+  (`index`/`label`/`status`/`size_mib`/`free_mib`), `find` (`name`/`type`/`path`), and
+  `observe now` (the roster + a `ticks` cumulative-cpu-time column — the native "top",
+  `observe now | sort reverse ticks`)**; **`from json`** (text → records); and the **unified
+  byte↔record pipeline** (`Stream = Bytes | Table`, dispatched by command + data type, `from`/`to`
+  bridging). All in-process (no wire codec), QEMU-verified incl. a json → records → yaml → file
+  round-trip and `ls | where type=file | sort reverse size`.
+- **Next:** a JSON string-escaper (values are plain ASCII today); the bounded **wire codec** —
+  pulled into existence the day a record must cross a *service* boundary (every producer is
+  shell-side today; `observe now` is built shell-side precisely to avoid needing it yet); an
+  **SDK record API** (the `Table` type + `to json`/`to yaml` + a producer/filter service
+  contract) so third-party services can emit records, which is the *same* wire-codec milestone;
+  `from yaml`; eventually heterogeneous records and richer interop.
 
 ## Discipline (so it doesn't rot into PowerShell-magic)
 

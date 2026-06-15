@@ -27,9 +27,10 @@ record producer (`status | where …`, `ls | where …`) or after `from`
 (`read x.json | from json | where …`). The record producers so far are all shell-side:
 **`status`** (task roster, `slot`/`name`/`core`/`state`/`mem`/`queue`/`restarts`), **`ls`**
 (`name`/`type`/`size`), **`caps`** (`resource`/`rights`), **`drives`**
-(`index`/`label`/`status`/`size_mib`/`free_mib`), and **`find`** (`name`/`type`/`path`).
-`observe` is next but lives in a separate service, so it waits on the bounded wire codec
-(`docs/records.md`).
+(`index`/`label`/`status`/`size_mib`/`free_mib`), **`find`** (`name`/`type`/`path`), and
+**`observe now`** (the roster plus a `ticks` cumulative-cpu-time column — `observe now | sort
+reverse ticks` is the native "top"). Only the one-shot `observe now` is pipeable; the bare live
+`observe` owns the screen and refuses to be piped (a loud error, `docs/records.md`).
 
 ## 2. Usage
 
@@ -96,8 +97,9 @@ or kernel surface: these operate on data already in the pipeline.
 
 ## 5. Later (separate so it can grow)
 
-- `observe` as a record producer — the one that pulls the bounded wire codec into existence
-  (its data lives in a separate service). `status`/`ls`/`caps`/`drives`/`find` are done.
+- The bounded **wire codec** (records crossing a *service* boundary) + an **SDK record API** so
+  third-party services can emit records — the same milestone. `status`/`ls`/`caps`/`drives`/
+  `find`/`observe now` (all shell-side) are done.
 - `from yaml`; a JSON string-escaper (values are plain ASCII today).
 - The bounded **wire codec** — only when a record first needs to cross a *service* boundary
   (today every producer is shell-side, so records pass by value). Emphatically not JSON on the

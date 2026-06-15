@@ -531,9 +531,10 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "status" => help_block(ctx, "status", "list all live tasks", &[
             ("status", "slot, name, core, state of every task", "status"),
         ], true),
-        "observe" => help_block(ctx, "observe", "live system metrics view", &[
+        "observe" => help_block(ctx, "observe", "live system metrics view (records when piped)", &[
             ("observe", "full-screen live view (q to quit)", "observe"),
             ("observe now", "one-shot metrics frame", "observe now"),
+            ("observe now | <verb>", "piped: records + a 'ticks' (cpu-time) column", "observe now | sort reverse ticks"),
         ], true),
         "caps" => help_block(ctx, "caps", "show a service's capabilities (records when piped)", &[
             ("caps", "this shell's own capabilities", "caps"),
@@ -1157,13 +1158,45 @@ fn build_status_table(ctx: &ServiceContext) -> Table {
     t
 }
 
+/// `observe now` as a record producer: the task roster plus the metric `status` omits — `ticks`,
+/// each task's cumulative `run_ticks` (timer ticks it has spent running since boot). That column
+/// is what distinguishes `observe` (how busy) from `status` (who's alive): `observe now | sort
+/// reverse ticks` is the native "top". It is a *snapshot*-honest value — cumulative ticks, not an
+/// instantaneous % (a rate needs two samples, which only the live view has; observe's per-task
+/// "CPU%" is really its core's utilisation, not per-task, so it would not sort meaningfully).
+///
+/// Only the one-shot `observe now` is pipeable. Bare `observe` is the continuous live view — it
+/// owns the screen and never yields a discrete stream — so piping it is a loud refusal, not a
+/// silent hang (the same hazard the stage-1 producer whitelist guards, docs/pipes.md). `#[inline
+/// (never)]`: like the sibling builders, its `Table` must not inflate `pipe_run`'s frame.
+#[inline(never)]
+fn build_observe_table(ctx: &ServiceContext, arg: &str) -> Option<Table> {
+    if split_first(arg).0 != "now" {
+        ctx.console_writeln("observe: the live view can't be piped — use 'observe now | …'");
+        return None;
+    }
+    let mut t = Table::new(&["slot", "name", "core", "state", "mem", "queue", "restarts", "ticks"]);
+    for slot in 0u32..256 {
+        let s = ctx.task_stat(slot);
+        if !s.valid { continue; }
+        let name = t.intern(&s.name[..s.name_len.min(31)]);
+        let state = t.intern(s.state_str().as_bytes());
+        t.add_row(&[
+            Value::Int(slot as u64), name, Value::Int(s.core as u64), state,
+            Value::Int(s.mem_used), Value::Int(s.queue_depth as u64), Value::Int(s.generation as u64),
+            Value::Int(s.run_ticks),
+        ]);
+    }
+    Some(t)
+}
+
 /// Producers that emit a structured TABLE rather than text. These are inherently tabular
 /// (uniform rows), so in a pipe they emit records — composed with `where`/`select`/`sort <col>`,
 /// not the text filters. Bare (un-piped) each still prints its normal text. `status` (task
 /// roster), `ls` (dir listing), `caps` (held capabilities), `drives` (attached disks), `find`
 /// (search hits) are shell-side, so no wire codec is needed — they pass by value like `status`.
 fn is_record_producer(name: &str) -> bool {
-    matches!(name, "status" | "ls" | "caps" | "drives" | "find")
+    matches!(name, "status" | "ls" | "caps" | "drives" | "find" | "observe")
 }
 
 /// `ls` as a record producer: directory entries as a table (`name` / `type` / `size`). Mirrors
@@ -1483,11 +1516,12 @@ fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str) {
     let mut s = if is_record_producer(c0) {
         let arg = split_first(stages[0]).1;
         let t = match c0 {
-            "ls"     => match build_ls_table(ctx, cwd, arg)     { Some(t) => t, None => return },
-            "caps"   => match build_caps_table(ctx, arg)        { Some(t) => t, None => return },
-            "drives" => match build_drives_table(ctx)           { Some(t) => t, None => return },
-            "find"   => match build_find_table(ctx, cwd, arg)   { Some(t) => t, None => return },
-            _        => build_status_table(ctx),
+            "ls"      => match build_ls_table(ctx, cwd, arg)    { Some(t) => t, None => return },
+            "caps"    => match build_caps_table(ctx, arg)       { Some(t) => t, None => return },
+            "drives"  => match build_drives_table(ctx)          { Some(t) => t, None => return },
+            "find"    => match build_find_table(ctx, cwd, arg)  { Some(t) => t, None => return },
+            "observe" => match build_observe_table(ctx, arg)    { Some(t) => t, None => return },
+            _         => build_status_table(ctx),
         };
         // Loud on the record bound (§3.12/§26.6): a producer that overran rows/arena is reported,
         // never silently truncated — the same bar the text pipe buffer holds.

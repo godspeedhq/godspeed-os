@@ -35,6 +35,29 @@ the default and the static one is the modified form. The word after the verb pic
 the cadence: nothing = ongoing, `now` = a single instant. No flags, no interval
 math, no `--`.
 
+### 2.1 `observe now` as a record producer (typed pipes)
+
+Piped, **`observe now`** is a record producer (`docs/records.md`,
+`utilities/31_records.md`): it emits the task roster plus the metric `status` omits —
+**`ticks`**, each task's cumulative `run_ticks` (timer ticks spent running since boot).
+That column is what distinguishes `observe` (how busy) from `status` (who's alive):
+
+```
+observe now | sort reverse ticks     the native "top": busiest tasks first
+observe now | where core=1           tasks on a core, with their cpu-time
+observe now | select name ticks      just the cpu-time view
+observe now | to json                a snapshot frame as JSON
+```
+
+`ticks` is a **snapshot-honest** value — cumulative ticks, not an instantaneous %.
+A true rate needs two samples, which only the live view has (and the live view's
+per-task "CPU%" is in fact its *core's* utilisation, so it would not sort
+meaningfully per task anyway). **Only `observe now` is pipeable.** Bare `observe` is
+the live, screen-owning loop — it never yields a discrete stream, so `observe | …`
+is a **loud refusal** (`observe: the live view can't be piped — use 'observe now |
+…'`), never a silent hang. This is the general rule: a live-loop utility's *snapshot*
+form is the record producer; its *live* form is not (`docs/records.md`).
+
 > **Build-order note:** `observe now` (static) is built first — it needs no kernel
 > or console change. Until the live view exists, bare `observe` prints
 > `live view coming soon — try 'observe now'`. `observe`'s *meaning* never changes
