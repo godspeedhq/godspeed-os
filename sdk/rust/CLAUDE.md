@@ -16,6 +16,7 @@ Provide typed, safe wrappers around kernel syscalls so service code:
 | `lib.rs`              | Crate root: re-exports, `Error` enum |
 | `capability.rs`       | `CapHandle` (opaque slot index), `CapError` (mirrors kernel errors) |
 | `ipc.rs`              | `Message`, `recv`, `send`, `try_send`, `IpcError` |
+| `record.rs`           | `Table` (the typed structured-pipe value), `Value`, `RecordSink`; `where`/`select`/`sort` ops, `to_json`/`to_yaml`/`to_grid` renderers, `from_json`. The model behind typed pipes (`docs/records.md`), shared so any service can produce records |
 | `service_context.rs`  | `ServiceContext`: handed to `service_main`; named cap lookup; log helpers; spawn helpers (TCB-only) |
 
 ## `ServiceContext` contract
@@ -40,6 +41,34 @@ ctx.log("ping: starting");
 // Spawn (supervisor-only; requires service_control cap)
 ctx.spawn_on("pong", 1)?;
 ```
+
+## Records and pipe-friendly services (`record.rs`)
+
+GodspeedOS pipes carry a **typed `Table`**, not text (`docs/records.md`). The model lives here in
+the SDK so any service — not just the shell — can build records, filter them
+(`where`/`select`/`sort`), and render them to JSON/YAML. All bounded and `no_std` (fixed
+cols/rows/arena, loud on overflow — §26.6).
+
+A service participates in a record pipe **today, with no new kernel surface**: build a `Table`,
+render it with `to_json`, and emit the bytes (EOT-terminated) like any byte producer
+(`docs/pipes.md`). The shell's `| from json` lifts it back into records for `where`/`sort`:
+
+```rust
+use godspeed_sdk::{Table, Value, RecordSink};
+
+let mut t = Table::new(&["name", "n"]);
+let alpha = t.intern(b"alpha");
+t.add_row(&[alpha, Value::Int(1)]);
+
+struct MsgSink<'a>(&'a mut [u8], usize);     // any sink: an IPC message, a buffer, …
+impl RecordSink for MsgSink<'_> {
+    fn put(&mut self, b: &[u8]) { /* append b */ }
+}
+t.to_json(&mut MsgSink(&mut buf, 0));         // → `[ {"name": "alpha", "n": 1} ]`
+```
+
+Crossing a service boundary *as records* (skipping the JSON round-trip) is the future bounded
+**wire codec** — deliberately not built until a service needs it (§26.2).
 
 ## no_std
 

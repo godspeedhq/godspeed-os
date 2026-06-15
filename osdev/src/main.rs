@@ -220,7 +220,7 @@ pub fn cmd_build() {
     // Services must be compiled before the kernel — kernel/build.rs embeds
     // the service ELF bytes via include_bytes!(env!("SVC_*_ELF")).
     let service_crates = [
-        "init", "supervisor", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs",
+        "init", "supervisor", "registry", "logger", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs",
     ];
     for crate_name in &service_crates {
         let status = std::process::Command::new("cargo")
@@ -250,7 +250,7 @@ pub fn cmd_build() {
 /// no probe services that require the QEMU harness control port to complete).
 pub fn cmd_build_bare_metal() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -292,7 +292,7 @@ pub fn cmd_build_bare_metal() {
 /// Bar: no panic, no resource leak after 24 hours.
 pub fn cmd_build_idle() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -334,7 +334,7 @@ pub fn cmd_build_idle() {
 pub fn cmd_build_identity() {
     clean_supervisor();
     // Build every service crate except supervisor first.
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -378,7 +378,7 @@ pub fn cmd_build_identity() {
 /// maximum headroom before its timeout fires.
 pub fn cmd_build_perf() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -419,7 +419,7 @@ pub fn cmd_build_perf() {
 /// internally — no QEMU control port required.
 pub fn cmd_build_stress() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -463,7 +463,7 @@ pub fn cmd_build_stress() {
 /// "fuzz: F* pass" line and never "KERNEL PANIC".
 pub fn cmd_build_fuzz() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -503,7 +503,7 @@ pub fn cmd_build_fuzz() {
 /// hardware chaos run (C2–C7). C1 and C4 use bare-metal + hardware reconfiguration.
 pub fn cmd_build_chaos() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -544,7 +544,7 @@ pub fn cmd_build_chaos() {
 /// that triggers the Goldmont+ BSP IPI delivery quirk on the blocking round-trip.
 pub fn cmd_build_b2_only() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -587,7 +587,7 @@ pub fn cmd_build_b2_only() {
 /// probes — for clean, uncontended per-op latency on hardware. `feature` is the
 /// supervisor sub-feature, e.g. "iso-bp5".
 pub fn cmd_build_perf_iso(feature: &str) {
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -627,7 +627,7 @@ pub fn cmd_build_perf_iso(feature: &str) {
 
 pub fn cmd_build_bp2_only() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -668,7 +668,7 @@ pub fn cmd_build_bp2_only() {
 /// no QEMU control port required.
 pub fn cmd_build_adv() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -708,7 +708,7 @@ pub fn cmd_build_adv() {
 /// benchmark suite (BP1–BP10).
 pub fn cmd_build_brutal_perf() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -963,7 +963,7 @@ fn cmd_shell(smp: u32) {
 /// §22 Test 12 / H1 §6.4.
 fn cmd_build_iommu_fault() {
     clean_supervisor();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"])
@@ -1088,7 +1088,7 @@ fn cmd_build_blockdev() {
     // prior plain build cached it — otherwise the blockdev tests miss the self-test logs.
     let _ = std::process::Command::new("cargo")
         .args(["clean", "--release", "-p", "fs", "--target", "x86_64-unknown-none"]).status();
-    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "probe", "observe", "shell", "xhci", "ehci", "block-driver"];
+    let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"])

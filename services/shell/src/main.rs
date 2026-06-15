@@ -9,6 +9,7 @@
 #![no_main]
 
 use godspeed_sdk::{ServiceContext, CapInfo, CapHandle, Message};
+use godspeed_sdk::record::{Table, Value, RecordSink, parse_predicate, REC_MAX_ROWS, REC_ARENA};
 
 const MAX_LINE: usize = 128;
 const MAX_ARGS: usize = 4;
@@ -819,325 +820,20 @@ fn cmd_date(ctx: &ServiceContext, arg: &str) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-// Structured records — a typed TABLE is the canonical pipe model (docs/records.md).
-//
-// POSIX pipes flatten structured data to text, which is why grep/awk/cut/sed must re-parse
-// it. Here a producer like `status` emits a TABLE (typed columns + rows); filters operate on
-// fields (`where mem > 0`), and JSON/table are *renderings* of the model, not the model
-// itself. The table is the language between utilities; formats are views at the edge.
-//
-// Bounded (§26.6): fixed columns, rows, and a string arena — all on the stack, no heap. For
-// now the only producer is `status` and the chain runs entirely in-process (no service
-// boundary, so no wire codec yet). Heterogeneous records, more producers, `select`/`sort by`,
-// and `to yaml` are the documented next steps.
+// Structured records — the typed `Table` model now lives in the SDK (`godspeed_sdk::record`,
+// docs/records.md) so any service can build/filter/render records, not just the shell. Imported
+// at the top of this file. The shell keeps only the *shell-specific* glue: an `OutSink` that
+// bridges the SDK renderers to the console/capture `Out`, and the producer builders below.
 // ════════════════════════════════════════════════════════════════════════════════
-const REC_MAX_COLS: usize = 8;
-const REC_MAX_ROWS: usize = 64;
-const REC_ARENA: usize = 4 * 1024; // backing store for Str values
 
-/// A typed cell. `Str` points into the owning `Table`'s arena (no lifetimes, no heap).
-#[derive(Clone, Copy)]
-enum Value {
-    Str { off: u32, len: u32 },
-    Int(u64),
-    Empty,
+/// Bridges the SDK's `RecordSink` (byte-oriented) to the shell's `Out` (console or capture),
+/// carrying the `ctx` the shell's writers need. `t.to_json(&mut OutSink { ctx, out })`.
+struct OutSink<'a, 'o> {
+    ctx: &'a ServiceContext,
+    out: &'a mut Out<'o>,
 }
-
-const REC_COL_NAME: usize = 24; // max column-name length
-
-/// A bounded table: owned column names (so a `from json` parse can name columns dynamically,
-/// not just compile-time producers), rows of `Value`, and a byte arena holding the `Str` cells.
-/// The canonical structured-pipe value.
-struct Table {
-    col_names: [[u8; REC_COL_NAME]; REC_MAX_COLS],
-    col_lens: [u8; REC_MAX_COLS],
-    ncols: usize,
-    rows: [[Value; REC_MAX_COLS]; REC_MAX_ROWS],
-    nrows: usize,
-    arena: [u8; REC_ARENA],
-    alen: usize,
-    overflow: bool,
-}
-impl Table {
-    fn new(cols: &[&str]) -> Self {
-        let mut t = Table {
-            col_names: [[0u8; REC_COL_NAME]; REC_MAX_COLS], col_lens: [0; REC_MAX_COLS], ncols: 0,
-            rows: [[Value::Empty; REC_MAX_COLS]; REC_MAX_ROWS], nrows: 0,
-            arena: [0u8; REC_ARENA], alen: 0, overflow: false,
-        };
-        for c in cols { t.add_col(c.as_bytes()); }
-        t
-    }
-    /// Add a column by name; returns its index (or `None` if full / name too long).
-    fn add_col(&mut self, name: &[u8]) -> Option<usize> {
-        if self.ncols >= REC_MAX_COLS || name.len() > REC_COL_NAME { self.overflow = true; return None; }
-        let i = self.ncols;
-        self.col_names[i][..name.len()].copy_from_slice(name);
-        self.col_lens[i] = name.len() as u8;
-        self.ncols += 1;
-        Some(i)
-    }
-    fn col_name(&self, c: usize) -> &[u8] { &self.col_names[c][..self.col_lens[c] as usize] }
-    /// Copy bytes into the arena and return a `Str` value (or `Empty` if the arena is full).
-    fn intern(&mut self, s: &[u8]) -> Value {
-        if self.alen + s.len() > REC_ARENA { self.overflow = true; return Value::Empty; }
-        let off = self.alen as u32;
-        self.arena[self.alen..self.alen + s.len()].copy_from_slice(s);
-        self.alen += s.len();
-        Value::Str { off, len: s.len() as u32 }
-    }
-    /// Append a row (values in column order). Loud-bounded: extra rows set `overflow`.
-    fn add_row(&mut self, vals: &[Value]) {
-        if self.nrows >= REC_MAX_ROWS { self.overflow = true; return; }
-        for (i, v) in vals.iter().take(self.ncols).enumerate() { self.rows[self.nrows][i] = *v; }
-        self.nrows += 1;
-    }
-    fn col_index(&self, name: &str) -> Option<usize> {
-        (0..self.ncols).find(|&i| self.col_name(i) == name.as_bytes())
-    }
-    /// Resolve a cell's text: a `Str` from the arena, or the empty slice for non-strings.
-    fn cell_str<'a>(&'a self, v: Value) -> &'a [u8] {
-        match v {
-            Value::Str { off, len } => &self.arena[off as usize..(off + len) as usize],
-            _ => &[],
-        }
-    }
-}
-
-/// Render a table as an aligned text grid (the default view). Two passes: column widths, then
-/// the header and rows. Output goes through `Out` so it works to the console or a capture.
-/// String cells render in full (via the arena) — never through the 24-byte `fmt_cell` scratch —
-/// so a long value like a `find` path is not silently clipped (§3.12). `saturating_sub` guards
-/// the pad width defensively (a width pass and an output pass that ever disagreed must not
-/// underflow into a multi-GB space run).
-fn render_table(ctx: &ServiceContext, t: &Table, out: &mut Out) {
-    let mut w = [0usize; REC_MAX_COLS];
-    for c in 0..t.ncols { w[c] = t.col_name(c).len(); }
-    for r in 0..t.nrows {
-        for c in 0..t.ncols {
-            let n = cell_width(t, t.rows[r][c]);
-            if n > w[c] { w[c] = n; }
-        }
-    }
-    // header
-    for c in 0..t.ncols {
-        out.put_bytes(ctx, t.col_name(c));
-        pad(ctx, out, w[c].saturating_sub(t.col_name(c).len()) + 2);
-    }
-    out.put(ctx, "\n");
-    // rows
-    let mut scratch = [0u8; 24];
-    for r in 0..t.nrows {
-        for c in 0..t.ncols {
-            let n = match t.rows[r][c] {
-                Value::Str { .. } => { let s = t.cell_str(t.rows[r][c]); out.put_bytes(ctx, s); s.len() }
-                v => { let n = fmt_cell(t, v, &mut scratch); out.put_bytes(ctx, &scratch[..n]); n }
-            };
-            pad(ctx, out, w[c].saturating_sub(n) + 2);
-        }
-        out.put(ctx, "\n");
-    }
-}
-
-/// Display width of a cell: a string's full arena length, else its formatted (numeric) length.
-fn cell_width(t: &Table, v: Value) -> usize {
-    match v {
-        Value::Str { len, .. } => len as usize,
-        Value::Int(_) => { let mut b = [0u8; 24]; fmt_cell(t, v, &mut b) }
-        Value::Empty => 0,
-    }
-}
-
-/// Format one cell into `buf`, returning its length. Strings copy out; ints are decimal.
-fn fmt_cell(t: &Table, v: Value, buf: &mut [u8; 24]) -> usize {
-    match v {
-        Value::Str { .. } => {
-            let s = t.cell_str(v);
-            let n = s.len().min(buf.len());
-            buf[..n].copy_from_slice(&s[..n]);
-            n
-        }
-        Value::Int(i) => {
-            let mut tmp = [0u8; 20];
-            let mut p = tmp.len();
-            let mut x = i;
-            loop { p -= 1; tmp[p] = b'0' + (x % 10) as u8; x /= 10; if x == 0 { break; } }
-            let n = tmp.len() - p;
-            buf[..n].copy_from_slice(&tmp[p..]);
-            n
-        }
-        Value::Empty => 0,
-    }
-}
-
-fn pad(ctx: &ServiceContext, out: &mut Out, n: usize) {
-    for _ in 0..n { out.put(ctx, " "); }
-}
-
-/// Render a table as a JSON array of objects — `to json`, the interop/edge rendering. Task
-/// names are simple ASCII (no escaping needed yet; a real escaper is a documented follow-up).
-fn render_json(ctx: &ServiceContext, t: &Table, out: &mut Out) {
-    out.put(ctx, "[\n");
-    for r in 0..t.nrows {
-        out.put(ctx, "  {");
-        for c in 0..t.ncols {
-            if c > 0 { out.put(ctx, ", "); }
-            out.put(ctx, "\"");
-            out.put_bytes(ctx, t.col_name(c));
-            out.put(ctx, "\": ");
-            match t.rows[r][c] {
-                Value::Int(_) => {
-                    let mut b = [0u8; 24];
-                    let n = fmt_cell(t, t.rows[r][c], &mut b);
-                    out.put_bytes(ctx, &b[..n]);
-                }
-                Value::Empty  => out.put(ctx, "null"),
-                Value::Str { .. } => {
-                    out.put(ctx, "\"");
-                    out.put_bytes(ctx, t.cell_str(t.rows[r][c]));
-                    out.put(ctx, "\"");
-                }
-            }
-        }
-        out.put(ctx, if r + 1 < t.nrows { "},\n" } else { "}\n" });
-    }
-    out.put(ctx, "]\n");
-}
-
-/// Apply `where <col> <op> <value>` to a table in place (keep matching rows). Ops: `=` `!=`
-/// `>` `<` `~`(contains). Numeric comparison when both sides parse as numbers, else byte/text.
-/// Unknown column or missing operands → loud no-op (the table is left unchanged).
-fn table_where(ctx: &ServiceContext, t: &mut Table, col: &str, op: &str, val: &str) {
-    let ci = match t.col_index(col) {
-        Some(i) => i,
-        None => { ctx.console_writeln_fmt(format_args!("where: no such column '{}'", col)); return; }
-    };
-    let mut keep = 0usize;
-    for r in 0..t.nrows {
-        if row_matches(t, r, ci, op, val) {
-            if keep != r { t.rows[keep] = t.rows[r]; }
-            keep += 1;
-        }
-    }
-    t.nrows = keep;
-}
-
-/// Does row `r`'s column `ci` satisfy `<op> val`? Numeric if both are numbers, else textual.
-fn row_matches(t: &Table, r: usize, ci: usize, op: &str, val: &str) -> bool {
-    let cell = t.rows[r][ci];
-    // Numeric path: cell is an Int (or numeric string) and val parses as a number.
-    let cell_num = match cell {
-        Value::Int(i) => Some(i),
-        Value::Str { .. } => core::str::from_utf8(t.cell_str(cell)).ok().and_then(|s| s.parse::<u64>().ok()),
-        Value::Empty => None,
-    };
-    if let (Some(cn), Ok(vn)) = (cell_num, val.parse::<u64>()) {
-        return match op {
-            "=" | "==" => cn == vn,
-            "!=" => cn != vn,
-            ">" => cn > vn,
-            "<" => cn < vn,
-            ">=" => cn >= vn,
-            "<=" => cn <= vn,
-            _ => false,
-        };
-    }
-    // Textual path.
-    let cs = t.cell_str(cell);
-    let vb = val.as_bytes();
-    match op {
-        "=" | "==" => cs == vb,
-        "!=" => cs != vb,
-        "~" => contains(cs, vb),
-        _ => false,
-    }
-}
-
-/// Parse a compact predicate token `col<op>val` (e.g. `mem>0`, `state=BlockRecv`, `name!=x`).
-/// The operator is the longest match (two-char `!=`/`>=`/`<=`/`==` before single `=`/`>`/`<`/
-/// `~`); everything before it is the column, everything after the value. `None` if no operator.
-fn parse_predicate(tok: &str) -> Option<(&str, &str, &str)> {
-    for op in ["!=", ">=", "<=", "=="] {
-        if let Some(i) = tok.find(op) { return Some((&tok[..i], op, &tok[i + op.len()..])); }
-    }
-    for op in ["=", ">", "<", "~"] {
-        if let Some(i) = tok.find(op) { return Some((&tok[..i], &tok[i..i + 1], &tok[i + 1..])); }
-    }
-    None
-}
-
-/// `select <col…>` — keep only the named columns, in the given order. Returns false (loudly) on
-/// an unknown column. Rows are rewritten in place; the arena (string storage) is untouched.
-fn table_select(ctx: &ServiceContext, t: &mut Table, names: &[&str]) -> bool {
-    let mut new_names = [[0u8; REC_COL_NAME]; REC_MAX_COLS];
-    let mut new_lens = [0u8; REC_MAX_COLS];
-    let mut map = [0usize; REC_MAX_COLS];
-    let mut nc = 0usize;
-    for &name in names {
-        if name.is_empty() { continue; }
-        match t.col_index(name) {
-            Some(oi) if nc < REC_MAX_COLS => {
-                new_names[nc] = t.col_names[oi];
-                new_lens[nc] = t.col_lens[oi];
-                map[nc] = oi;
-                nc += 1;
-            }
-            Some(_) => {}
-            None => { ctx.console_writeln_fmt(format_args!("select: no such column '{}'", name)); return false; }
-        }
-    }
-    for r in 0..t.nrows {
-        let old = t.rows[r];
-        for i in 0..nc { t.rows[r][i] = old[map[i]]; }
-        for i in nc..t.ncols { t.rows[r][i] = Value::Empty; }
-    }
-    t.col_names = new_names;
-    t.col_lens = new_lens;
-    t.ncols = nc;
-    true
-}
-
-/// Resolve a value to its comparable bytes (arena slice for `Str`, empty otherwise).
-fn val_str<'a>(v: Value, arena: &'a [u8]) -> &'a [u8] {
-    match v { Value::Str { off, len } => &arena[off as usize..(off + len) as usize], _ => &[] }
-}
-
-/// Order two cells: numeric when both are ints, else by bytes.
-fn cmp_values(a: Value, b: Value, arena: &[u8]) -> core::cmp::Ordering {
-    match (a, b) {
-        (Value::Int(x), Value::Int(y)) => x.cmp(&y),
-        _ => val_str(a, arena).cmp(val_str(b, arena)),
-    }
-}
-
-/// `sort <col> [reverse]` — order rows by a column (numeric or text), descending with `reverse`.
-fn table_sort(ctx: &ServiceContext, t: &mut Table, col: &str, reverse: bool) -> bool {
-    let ci = match t.col_index(col) {
-        Some(i) => i,
-        None => { ctx.console_writeln_fmt(format_args!("sort: no such column '{}'", col)); return false; }
-    };
-    let n = t.nrows;
-    let arena = &t.arena; // disjoint field borrow: rows is sorted mutably, arena read-only
-    t.rows[..n].sort_unstable_by(|a, b| {
-        let o = cmp_values(a[ci], b[ci], arena);
-        if reverse { o.reverse() } else { o }
-    });
-    true
-}
-
-/// Render a table as YAML — a list of mappings (`to yaml`, the other edge format).
-fn render_yaml(ctx: &ServiceContext, t: &Table, out: &mut Out) {
-    let mut cell = [0u8; 24];
-    for r in 0..t.nrows {
-        for c in 0..t.ncols {
-            out.put(ctx, if c == 0 { "- " } else { "  " });
-            out.put_bytes(ctx, t.col_name(c));
-            out.put(ctx, ": ");
-            let n = fmt_cell(t, t.rows[r][c], &mut cell);
-            out.put_bytes(ctx, &cell[..n]);
-            out.put(ctx, "\n");
-        }
-    }
+impl RecordSink for OutSink<'_, '_> {
+    fn put(&mut self, bytes: &[u8]) { self.out.put_bytes(self.ctx, bytes); }
 }
 
 /// Build the live-task table that `status` produces (columns: slot, name, core, state, mem,
@@ -1387,104 +1083,6 @@ fn build_find_table(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Option<Table>
     Some(t)
 }
 
-// ── from json — parse text into the table model (the byte→record bridge) ──────────
-fn json_ws(b: &[u8], mut i: usize) -> usize {
-    while i < b.len() && (b[i] == b' ' || b[i] == b'\t' || b[i] == b'\n' || b[i] == b'\r') { i += 1; }
-    i
-}
-
-/// At a `"`, scan to the closing quote (a `\`-escaped char is skipped, not a terminator).
-/// Returns (content start, content end, index past the closing quote). Escapes are passed
-/// through literally — a real un-escaper is a documented follow-up.
-fn json_string(b: &[u8], i: usize) -> Option<(usize, usize, usize)> {
-    if i >= b.len() || b[i] != b'"' { return None; }
-    let start = i + 1;
-    let mut j = start;
-    while j < b.len() {
-        if b[j] == b'\\' { j += 2; continue; }
-        if b[j] == b'"' { return Some((start, j, j + 1)); }
-        j += 1;
-    }
-    None
-}
-
-/// Parse a JSON array of flat objects into a Table — the `from json` bridge (text → records).
-/// Bounded subset: `[ {"k": v, …}, … ]` with string / number / `true|false` / `null` values,
-/// **no nesting**. The first object defines the columns; later objects fill known columns (new
-/// keys are ignored). Strings intern into the table arena. Loud + `None` on malformed input.
-fn parse_json_table(ctx: &ServiceContext, input: &[u8]) -> Option<Table> {
-    let mut t = Table::new(&[]);
-    let b = input;
-    let mut i = json_ws(b, 0);
-    if i >= b.len() || b[i] != b'[' { ctx.console_writeln("from json: expected a JSON array '[ … ]'"); return None; }
-    i = json_ws(b, i + 1);
-    if i < b.len() && b[i] == b']' { return Some(t); }
-    let mut first_obj = true;
-    loop {
-        i = json_ws(b, i);
-        if i >= b.len() || b[i] != b'{' { ctx.console_writeln("from json: expected an object '{ … }'"); return None; }
-        i = json_ws(b, i + 1);
-        let mut row = [Value::Empty; REC_MAX_COLS];
-        // empty object?
-        if i < b.len() && b[i] == b'}' { i += 1; } else {
-            loop {
-                i = json_ws(b, i);
-                let (ks, ke, kn) = match json_string(b, i) {
-                    Some(x) => x,
-                    None => { ctx.console_writeln("from json: expected a \"key\""); return None; }
-                };
-                i = json_ws(b, kn);
-                if i >= b.len() || b[i] != b':' { ctx.console_writeln("from json: expected ':'"); return None; }
-                i = json_ws(b, i + 1);
-                // value → Value
-                let v;
-                if i < b.len() && b[i] == b'"' {
-                    let (vs, ve, vn) = json_string(b, i)?;
-                    v = t.intern(&b[vs..ve]);
-                    i = vn;
-                } else if b[i..].starts_with(b"true") { v = Value::Int(1); i += 4; }
-                else if b[i..].starts_with(b"false") { v = Value::Int(0); i += 5; }
-                else if b[i..].starts_with(b"null") { v = Value::Empty; i += 4; }
-                else if i < b.len() && (b[i] == b'-' || b[i].is_ascii_digit()) {
-                    let s = i;
-                    if b[i] == b'-' { i += 1; }
-                    while i < b.len() && b[i].is_ascii_digit() { i += 1; }
-                    // nested-unfriendly: a '.'/'e' (float) is stored as text
-                    if i < b.len() && (b[i] == b'.' || b[i] == b'e' || b[i] == b'E') {
-                        while i < b.len() && !matches!(b[i], b',' | b'}' | b' ' | b'\t' | b'\n' | b'\r') { i += 1; }
-                        v = t.intern(&b[s..i]);
-                    } else {
-                        v = core::str::from_utf8(&b[s..i]).ok().and_then(|x| x.parse::<u64>().ok())
-                            .map(Value::Int).unwrap_or(Value::Empty);
-                    }
-                } else {
-                    ctx.console_writeln("from json: unsupported value (nested objects/arrays not supported)");
-                    return None;
-                }
-                // map key → column (add while parsing the first object, else look up known cols)
-                let key = &b[ks..ke];
-                let ci = (0..t.ncols).find(|&c| t.col_name(c) == key);
-                let ci = match ci {
-                    Some(c) => Some(c),
-                    None if first_obj => t.add_col(key),
-                    None => None, // a key not seen in the first object — ignored
-                };
-                if let Some(ci) = ci { row[ci] = v; }
-                i = json_ws(b, i);
-                if i < b.len() && b[i] == b',' { i += 1; continue; }
-                if i < b.len() && b[i] == b'}' { i += 1; break; }
-                ctx.console_writeln("from json: expected ',' or '}'"); return None;
-            }
-        }
-        t.add_row(&row);
-        first_obj = false;
-        i = json_ws(b, i);
-        if i < b.len() && b[i] == b',' { i += 1; continue; }
-        if i < b.len() && b[i] == b']' { return Some(t); }
-        ctx.console_writeln("from json: expected ',' or ']'"); return None;
-    }
-}
-
 
 /// What flows through a pipe: either a byte buffer (text streams) or a typed Table (records).
 /// `from`/`to` convert between them; the dispatcher routes each stage by command AND by which
@@ -1525,7 +1123,7 @@ fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str) {
         };
         // Loud on the record bound (§3.12/§26.6): a producer that overran rows/arena is reported,
         // never silently truncated — the same bar the text pipe buffer holds.
-        if t.overflow {
+        if t.overflow() {
             ctx.console_writeln_fmt(format_args!(
                 "{}: result exceeded the record bound ({} rows / {} bytes) — truncated",
                 c0, REC_MAX_ROWS, REC_ARENA));
@@ -1555,7 +1153,7 @@ fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str) {
                 Stream::Bytes(c) => pipe_write_file(ctx, cwd, arg, c.bytes()),
                 Stream::Table(t) => {
                     let mut c = Cap::new();
-                    render_table(ctx, t, &mut Out::Capture(&mut c));
+                    { let mut o = Out::Capture(&mut c); t.to_grid(&mut OutSink { ctx, out: &mut o }); }
                     pipe_write_file(ctx, cwd, arg, c.bytes());
                 }
             }
@@ -1566,7 +1164,7 @@ fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str) {
     // No `write` sink — render the final stream to the console.
     match &s {
         Stream::Bytes(c) => console_write_chunked(ctx, c.bytes()),
-        Stream::Table(t) => render_table(ctx, t, &mut Out::Console),
+        Stream::Table(t) => { let mut o = Out::Console; t.to_grid(&mut OutSink { ctx, out: &mut o }); }
     }
 }
 
@@ -1594,7 +1192,10 @@ fn pipe_transform(ctx: &ServiceContext, stage: &str, cmd: &str, s: &mut Stream) 
             let bytes = match s { Stream::Bytes(c) => c, Stream::Table(_) => {
                 ctx.console_writeln("from: input is already records"); return false; } };
             let t = match fmt {
-                "json" => match parse_json_table(ctx, bytes.bytes()) { Some(t) => t, None => return false },
+                "json" => match Table::from_json(bytes.bytes()) {
+                    Ok(t) => t,
+                    Err(why) => { ctx.console_writeln_fmt(format_args!("from json: {}", why)); return false; }
+                },
                 _ => { ctx.console_writeln("from: unknown format (try: from json)"); return false; }
             };
             *s = Stream::Table(t);
@@ -1607,10 +1208,14 @@ fn pipe_transform(ctx: &ServiceContext, stage: &str, cmd: &str, s: &mut Stream) 
             let t = match s { Stream::Table(t) => t, Stream::Bytes(_) => {
                 ctx.console_writeln("to: input is text, not records (parse with 'from json' first)"); return false; } };
             let mut c = Cap::new();
-            match fmt {
-                "json" => render_json(ctx, t, &mut Out::Capture(&mut c)),
-                "yaml" => render_yaml(ctx, t, &mut Out::Capture(&mut c)),
-                _ => { ctx.console_writeln("to: unknown format (try: to json | to yaml)"); return false; }
+            {
+                let mut o = Out::Capture(&mut c);
+                let mut sink = OutSink { ctx, out: &mut o };
+                match fmt {
+                    "json" => t.to_json(&mut sink),
+                    "yaml" => t.to_yaml(&mut sink),
+                    _ => { ctx.console_writeln("to: unknown format (try: to json | to yaml)"); return false; }
+                }
             }
             *s = Stream::Bytes(c);
             true
@@ -1618,7 +1223,14 @@ fn pipe_transform(ctx: &ServiceContext, stage: &str, cmd: &str, s: &mut Stream) 
         // record filters (Table only)
         "where" => match s {
             Stream::Table(t) => match parse_predicate(split_first(stage).1) {
-                Some((col, op, val)) => { table_where(ctx, t, col, op, val); true }
+                // filter() returns false on an unknown column; like the original, the pipeline
+                // continues (unchanged table) after the loud notice.
+                Some((col, op, val)) => {
+                    if !t.filter(col, op, val) {
+                        ctx.console_writeln_fmt(format_args!("where: no such column '{}'", col));
+                    }
+                    true
+                }
                 None => { ctx.console_writeln("where: need a predicate like name=shell or mem>0"); false }
             },
             Stream::Bytes(_) => { ctx.console_writeln("where: needs records (try 'from json')"); false }
@@ -1628,7 +1240,8 @@ fn pipe_transform(ctx: &ServiceContext, stage: &str, cmd: &str, s: &mut Stream) 
                 let mut sa = [""; MAX_ARGS];
                 let sc = tokenize(stage, &mut sa);
                 if sc < 2 { ctx.console_writeln("usage: … | select <col> [col …]"); return false; }
-                table_select(ctx, t, &sa[1..sc])
+                if t.select(&sa[1..sc]) { true }
+                else { ctx.console_writeln("select: no such column (check the column names)"); false }
             }
             Stream::Bytes(_) => { ctx.console_writeln("select: needs records (try 'from json')"); false }
         },
@@ -1640,7 +1253,8 @@ fn pipe_transform(ctx: &ServiceContext, stage: &str, cmd: &str, s: &mut Stream) 
                 let (mut col, mut rev) = ("", false);
                 for a in &sa[1..sc] { if *a == "reverse" { rev = true; } else if col.is_empty() { col = a; } }
                 if col.is_empty() { ctx.console_writeln("usage: … | sort [reverse] <col>"); return false; }
-                table_sort(ctx, t, col, rev)
+                if t.sort(col, rev) { true }
+                else { ctx.console_writeln_fmt(format_args!("sort: no such column '{}'", col)); false }
             }
             Stream::Bytes(_) => byte_filter(ctx, stage, s),
         },
@@ -1675,8 +1289,8 @@ fn byte_filter(ctx: &ServiceContext, stage: &str, s: &mut Stream) -> bool {
 
 fn cmd_status(ctx: &ServiceContext) {
     let t = build_status_table(ctx);
-    render_table(ctx, &t, &mut Out::Console);
-    if t.overflow {
+    { let mut o = Out::Console; t.to_grid(&mut OutSink { ctx, out: &mut o }); }
+    if t.overflow() {
         ctx.console_writeln_fmt(format_args!("status: more than {} rows shown (bounded)", REC_MAX_ROWS));
     }
 }
@@ -1976,7 +1590,7 @@ fn is_producer_builtin(name: &str) -> bool {
 /// EOT end-of-stream protocol). A non-producer service in stage 1 would block the shell on
 /// `recv` (there is no non-blocking recv in v1), so the set is an explicit whitelist.
 fn is_pipe_producer_service(name: &str) -> bool {
-    matches!(name, "greet")
+    matches!(name, "greet" | "roster")
 }
 
 /// Run a producer built-in (`cmd args`) with its output going to `out`.

@@ -39,6 +39,7 @@ fn main() {
         ("PONG",       "pong"),
         ("GREET",      "greet"),
         ("UPPER",      "upper"),
+        ("ROSTER",     "roster"),
         ("PROBE",      "probe"),
         ("OBSERVE",    "observe"),
         ("SHELL",      "shell"),
