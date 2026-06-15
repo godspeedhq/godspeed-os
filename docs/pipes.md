@@ -26,7 +26,8 @@ A pipeline is **one producer, zero or more filters, one sink**:
 ```
 
 - **PRODUCER** — emits text, ignores input. Built-ins: `read`/`cat`, `echo`, `ls`, `tree`,
-  `find`. Service: `greet`.
+  `find`. Services: `greet` (text), `roster` (records — builds a `Table` and emits it as JSON;
+  `docs/records.md`, `sdk/rust/CLAUDE.md`).
 - **FILTER** — consumes input, emits output. Service: `upper` (re-emits its result, so it can
   sit *anywhere* in a chain). A future filter built-in (`match`) slots in here.
 - **SINK** — consumes the final buffer. Built-in: `write <file>`. A service filter used as the

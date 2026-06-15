@@ -1146,6 +1146,20 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL — json→yaml roundtrip timeout"); fail += 1; }
     }
 
+    // ── a SERVICE producing records: `roster` builds a Table with the SDK, emits it as JSON;
+    //    `| from json` lifts it back so the record verbs filter a third-party service's output
+    //    (docs/records.md, sdk/rust/CLAUDE.md). Proves the SDK record API works outside the shell.
+    match run!(b"roster | from json | where role=core\r", 16) {
+        Some(r) => check!(r.contains("vesta") && !r.contains("atlas"),
+                          "roster service: from json | where filters service-produced records"),
+        None    => { println!("files-test: FAIL — roster|from json|where timeout"); fail += 1; }
+    }
+    match run!(b"roster | from json | select name core | to json\r", 16) {
+        Some(r) => check!(r.contains("\"name\": \"hermes\"") && r.contains("\"core\":") && !r.contains("\"role\""),
+                          "roster service: select + to json projects service records"),
+        None    => { println!("files-test: FAIL — roster|select timeout"); fail += 1; }
+    }
+
     // ── ls as a record producer: directory entries become typed rows (name/type/size) ──
     // A dedicated dir with known contents: two files of different size + one subdir.
     let _ = run!(b"mkdir /lsr\r", 10);

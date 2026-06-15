@@ -84,6 +84,33 @@ status | sort reverse mem | to json       ordered desc, as JSON
 status | where name=shell | to yaml      one task, as YAML
 ```
 
+## A service producing records — the `roster` example
+
+`examples/roster` is the executable proof that records are not shell-only: it builds a `Table`
+with the SDK, renders it `to_json`, and emits the bytes through the shell-delegated pipe cap
+(zero ambient authority, like `greet`). The shell's `| from json` lifts it back to records:
+
+```text
+gs> roster | from json
+name    role     core
+atlas   worker   1
+hermes  courier  2
+vesta   core     0
+gs> roster | from json | sort reverse core | to json
+[
+  {"name": "hermes", "role": "courier", "core": 2},
+  {"name": "atlas", "role": "worker", "core": 1},
+  {"name": "vesta", "role": "core", "core": 0}
+]
+gs> roster | from json | where role=core | select name
+name
+vesta
+```
+
+This is the whole point of the SDK record API: a third-party service emits typed data, and the
+record verbs (`where`/`select`/`sort`/`to`) operate on it — no text re-parsing. (`osdev test
+files` pins it.)
+
 ## `from` — the bridge from text into the typed world
 
 `read file.json` gives **text** (bytes); `where`/`select` need **records**. So `from json`

@@ -14,6 +14,7 @@ members = [
     "examples/pong",
     "examples/greet",
     "examples/upper",
+    "examples/roster",
     "services/probe",
     "services/observe",
     "services/shell",

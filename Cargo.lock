@@ -1221,6 +1221,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "roster"
+version = "0.1.0"
+dependencies = [
+ "godspeed-sdk",
+]
+
+[[package]]
 name = "rustix"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

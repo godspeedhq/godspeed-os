@@ -378,6 +378,19 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
+        // roster — record-producing pipe demo (docs/records.md): emits a typed Table as JSON
+        // through the shell-delegated SEND cap. Same zero-ambient-authority shape as greet.
+        "roster" => Some(("roster", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_ROSTER_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[], // delegated at runtime by the shell, not contracted
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0,
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
         // xhci — USB host-controller driver (§12). Receives its controller's
         // MMIO BAR (mapped by name in the spawn path) + later its IRQ. Trusted
         // userspace driver. has_recv_endpoint for future interrupt delivery.

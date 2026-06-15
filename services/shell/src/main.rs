@@ -1590,7 +1590,7 @@ fn is_producer_builtin(name: &str) -> bool {
 /// EOT end-of-stream protocol). A non-producer service in stage 1 would block the shell on
 /// `recv` (there is no non-blocking recv in v1), so the set is an explicit whitelist.
 fn is_pipe_producer_service(name: &str) -> bool {
-    matches!(name, "greet")
+    matches!(name, "greet" | "roster")
 }
 
 /// Run a producer built-in (`cmd args`) with its output going to `out`.
