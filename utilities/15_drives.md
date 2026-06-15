@@ -168,6 +168,24 @@ Drive *contents* (`ls` / `cat` / `write` / `cd` / `mkdir`) are **their own utili
 `drives` subcommands — they operate on paths within a drive, addressable as
 `[index:]label/path` or `/abs` / `rel` on the current drive (`docs/drives.md` §4.1).
 
+### 6.1 The list is a record producer (typed pipes)
+
+Bare `drives` prints the table above; **piped**, the *list* view is a record producer
+(`docs/records.md`, `utilities/31_records.md`) emitting columns
+**`index` / `label` / `status` / `size_mib` / `free_mib`** (`free_mib` is empty for a raw,
+unformatted drive). So the inventory is queryable as data — useful once multi-drive (step 4)
+lands:
+
+```
+drives | where status=GSFS          only formatted drives
+drives | where free_mib>0           drives with space left
+drives | select label free_mib      a compact free-space view
+drives | to json                    the inventory as JSON
+```
+
+Only the **list** is a record producer; the action verbs (`flash`/`label`/`reset`/`godspeed …`)
+are unchanged — they mutate, they don't emit records.
+
 ## 7. Implementation shape: a shell built-in sending to `fs` (as built)
 
 > **Decided at build time (step 3b).** The earlier plan here was a *standalone service*
