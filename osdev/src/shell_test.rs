@@ -1262,6 +1262,31 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL — result(blank) timeout"); fail += 1; }
     }
 
+    // ── run: execute a script of commands (the .gs runner). Authored on one line with `;`
+    //    separators (no newline typing needed). The script reads a present then a missing file,
+    //    printing `result` after each — so it exercises echo, execution, and pass/fail counting.
+    let _ = run!(b"write /suite.gs read /lsr/big.txt ; result ; read /lsr/nope ; result\r", 10);
+    match run!(b"run /suite.gs\r", 16) {
+        Some(r) => {
+            check!(r.contains("> read /lsr/big.txt") && r.contains("hello world"),
+                   "run: echoes and executes a script command");
+            check!(r.contains("Err(FileNotFound)"), "run: a failing line surfaces its Err");
+            check!(r.contains("run: ran 4, failed 1"), "run: summary counts ran/failed");
+        }
+        None => { println!("files-test: FAIL — run timeout"); fail += 3; }
+    }
+    // a missing script reports not found (and `run` returns Err).
+    match run!(b"run /no_such.gs\r", 10) {
+        Some(r) => check!(r.contains("not found"), "run: a missing script reports not found"),
+        None    => { println!("files-test: FAIL — run(missing) timeout"); fail += 1; }
+    }
+    // scripts cannot nest: a `run` line inside a script is refused.
+    let _ = run!(b"write /nest.gs run /suite.gs\r", 10);
+    match run!(b"run /nest.gs\r", 14) {
+        Some(r) => check!(r.contains("cannot run another script"), "run: nested run is refused (stack-bounded)"),
+        None    => { println!("files-test: FAIL — run(nest) timeout"); fail += 1; }
+    }
+
     child.kill().ok();
     child.wait().ok();
     println!("\nfiles-test: {pass} passed, {fail} failed");
