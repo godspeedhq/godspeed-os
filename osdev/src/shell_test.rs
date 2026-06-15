@@ -158,7 +158,8 @@ pub fn run(image_path: &Path, smp: u32) {
     send(&mut write_half, b"status\r");
     match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
         Some(r) => {
-            check!(r.contains("SLOT"), "status: header present");
+            // status now renders a typed table (lowercase column names from the record model).
+            check!(r.contains("name") && r.contains("state"), "status: table header present");
             check!(
                 r.contains("pong") || r.contains("ping") || r.contains("shell"),
                 "status: tasks visible"
@@ -168,6 +169,22 @@ pub fn run(image_path: &Path, smp: u32) {
             println!("shell-test: FAIL — timed out after `status`  [×2]");
             fail += 2;
         }
+    }
+    // Structured records: status as a typed table → where filter + to json rendering.
+    send(&mut write_half, b"status | to json\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("\"name\":") && r.contains("\"state\":"), "status | to json: JSON objects"),
+        None    => { println!("shell-test: FAIL — status|to json timeout"); fail += 1; }
+    }
+    send(&mut write_half, b"status | where name = shell\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("shell") && !r.contains("logger"), "status | where name = shell: filters rows"),
+        None    => { println!("shell-test: FAIL — status|where timeout"); fail += 1; }
+    }
+    send(&mut write_half, b"status | where name = shell | to json\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("\"name\": \"shell\"") && !r.contains("\"logger\""), "status | where … | to json: filtered JSON"),
+        None    => { println!("shell-test: FAIL — status|where|json timeout"); fail += 1; }
     }
 
     // -----------------------------------------------------------------------
