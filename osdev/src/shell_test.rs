@@ -287,6 +287,29 @@ pub fn run(image_path: &Path, smp: u32) {
     // The observe-now step stopped reading at the table header, so its trailing
     // `gs>` prompt is still in the stream — absorb it before issuing caps.
     let _ = collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5));
+
+    // observe now as a record producer (docs/records.md): the only PIPEABLE form (bare
+    // `observe` is the live loop). Carries the `ticks` (cumulative cpu-time) column status omits.
+    send(&mut write_half, b"observe now | to json\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(10)) {
+        Some(r) => check!(r.contains("\"ticks\":") && r.contains("\"name\":"),
+                          "observe record: now | to json carries the ticks column"),
+        None    => { println!("shell-test: FAIL — observe now|to json timeout"); fail += 1; }
+    }
+    send(&mut write_half, b"observe now | select name ticks | to json\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(10)) {
+        Some(r) => check!(r.contains("\"ticks\":") && r.contains("\"name\":") && !r.contains("\"core\":"),
+                          "observe record: select name ticks projects the metric columns"),
+        None    => { println!("shell-test: FAIL — observe now|select timeout"); fail += 1; }
+    }
+    // The live loop must REFUSE to be piped (it owns the screen and never yields a stream),
+    // loudly — not hang the shell waiting on a recv that never comes.
+    send(&mut write_half, b"observe | sort reverse ticks\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(10)) {
+        Some(r) => check!(r.contains("live view can't be piped"),
+                          "observe record: bare live observe refuses to be piped (loud)"),
+        None    => { println!("shell-test: FAIL — observe pipe-refusal timeout"); fail += 1; }
+    }
     send(&mut write_half, b"caps shell\r");
     match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
         Some(r) => {
