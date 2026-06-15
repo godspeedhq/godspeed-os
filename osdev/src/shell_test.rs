@@ -348,6 +348,28 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(r) => check!(r.contains("drives flash") && r.contains("drives flash 0 data"), "subcommand help: drives flash help + example"),
         None    => { println!("shell-test: FAIL — timed out after `drives flash help`"); fail += 1; }
     }
+    // Record-pipe verbs self-document too (utilities/31_records.md): they are pipe-only
+    // stages, but `<verb> help` / `<verb> version` still resolve via the UTILS intercept.
+    send(&mut write_half, b"where help\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("where 0.1.0") && r.contains("status | where mem>0"), "where help: header + real example"),
+        None    => { println!("shell-test: FAIL — timed out after `where help`"); fail += 1; }
+    }
+    send(&mut write_half, b"to help\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("to 0.1.0") && r.contains("to json") && r.contains("to yaml"), "to help: header + json/yaml rows"),
+        None    => { println!("shell-test: FAIL — timed out after `to help`"); fail += 1; }
+    }
+    send(&mut write_half, b"from version\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("from 0.1.0") && r.contains("Created by Bankole Ogundero"), "from version: number + creator credit"),
+        None    => { println!("shell-test: FAIL — timed out after `from version`"); fail += 1; }
+    }
+    send(&mut write_half, b"select help\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("select 0.1.0") && r.contains("status | select name core state"), "select help: header + real example"),
+        None    => { println!("shell-test: FAIL — timed out after `select help`"); fail += 1; }
+    }
 
     // -----------------------------------------------------------------------
     // Up-arrow history: run a command, then up-arrow + Enter (no retyping) must recall

@@ -469,6 +469,8 @@ const UTILS: &[&str] = &[
     "spawn", "kill", "restart", "reboot", "drives", "ls", "cd", "read", "write",
     "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count", "sort",
     "first", "last",
+    // record-pipe verbs (pipe-only stages; see docs/records.md)
+    "where", "select", "to", "from",
 ];
 fn is_util(name: &str) -> bool { UTILS.contains(&name) }
 
@@ -616,6 +618,21 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "last" => help_block(ctx, "last", "keep the last N lines (default 10)", &[
             ("<producer> | last [N]", "last N piped lines", "read /log | last 20"),
             ("last [N] <path>", "last N lines of a file", "last 20 /log"),
+        ], true),
+        "where" => help_block(ctx, "where", "keep records whose field matches (record-pipe stage)", &[
+            ("<records> | where <col><op><val>", "ops: = != > < >= <= ~ (contains)", "status | where mem>0"),
+            ("… | where state=BlockRecv", "textual when either side is non-numeric", "status | where state=BlockRecv"),
+        ], true),
+        "select" => help_block(ctx, "select", "keep only some columns, in order (record-pipe stage)", &[
+            ("<records> | select <col> [col…]", "project the named columns", "status | select name core state"),
+        ], true),
+        "to" => help_block(ctx, "to", "render records to a format (record-pipe stage)", &[
+            ("<records> | to json", "JSON array of objects", "status | to json"),
+            ("<records> | to yaml", "YAML list of mappings", "status | where mem>0 | to yaml"),
+        ], true),
+        "from" => help_block(ctx, "from", "parse text into records (record-pipe stage)", &[
+            ("<text> | from json", "parse a flat JSON array of objects", "read /svc.json | from json"),
+            ("read x.json | from json | …", "bridge text → records, then filter", "read /svc.json | from json | where core=1"),
         ], true),
         _ => return false,
     }
