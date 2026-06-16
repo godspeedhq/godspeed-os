@@ -4,6 +4,24 @@
 > extension. Builds on the existing `run`/`run_lines` interpreter and the command **Result**
 > model (`execute` already returns `Ok`/`Err`). Not POSIX — see CLAUDE.md Appendix B.3 / D.
 
+## Contents
+
+1. [Spirit](#1-spirit)
+2. [Lexical](#2-lexical)
+3. [Variables, parameters, arithmetic](#3-variables-parameters-arithmetic)
+4. [Conditionals](#4-conditionals)
+5. [Loops](#5-loops)
+6. [Switch](#6-switch)
+7. [Functions](#7-functions)
+8. [Builtins](#8-builtins)
+9. [Bounds](#9-bounds)
+10. [Out of scope](#10-out-of-scope)
+11. [Tiers and effort](#11-tiers-and-effort)
+12. [Worked example](#12-worked-example)
+13. [Example programs](#13-example-programs) — [setup.gs](#131-setupgs) · [greet.gs](#132-greetgs) · [report.gs](#133-reportgs) · [check.gs](#134-checkgs) · [retry.gs](#135-retrygs)
+
+---
+
 ## 1. Spirit
 
 - **Go-simple surface.** Braces for blocks, newline-separated statements, **no trailing `;`**,
@@ -20,13 +38,31 @@
 ## 2. Lexical
 
 - **A newline ends a statement.** Like Go, you don't write a trailing `;`. Use `;` *only* to put
-  two statements on one line — `mkdir /x; cd /x` — never as a line terminator (a trailing one is
-  just ignored).
+  two statements on one line — never as a line terminator (a trailing one is just ignored).
 - `#` to end of line is a comment; blank lines are ignored.
 - Tokens: bare words (no spaces, literal), `"double quoted"` (spaces ok, `$var` expands),
   `'single quoted'` (literal, no expansion).
+- **Multi-line content** uses a triple-quoted block — for writing real files. It expands `$vars`
+  like `"…"`. It is for a command argument (bounded by `MAX_FILE_BYTES`); storing one in a `let`
+  var that exceeds the 128 B value cap is a loud error, not a silent truncation.
 
-## 3. Variables, expansion, parameters
+```
+echo one                        # a statement; the newline ends it
+mkdir /x; cd /x                  # two statements on one line, joined by ;
+
+echo "spaces kept, $name expands"
+echo 'literal $name — no expansion'
+```
+
+```
+write /work/config """
+mode  = normal
+cores = 4
+owner = $name
+"""
+```
+
+## 3. Variables, parameters, arithmetic
 
 **Command position vs value position (the one disambiguation rule).** The interpreter is always in
 one of two places, and that decides how bare text reads:
@@ -43,17 +79,69 @@ bare `(…)` is *not* — one obvious way.)
 ```
 let name = "Matthew"
 let n    = 3
-let out  = $(greet | count)    # value position: $( ) runs the command, captures its text (trimmed)
 let lit  = greet               # value position, no $( ): the literal string "greet"
 
 echo $name                     # Matthew
 echo "hi $name, n=$n"          # hi Matthew, n=3
-echo "live: $(status | where state=Running | count)"
 ```
 
-- `let x = <value>` declares or reassigns. Value is a word, a `"string"`, or a capture `$( … )`.
+Capture — promote a command into a value with `$( )`:
+
+```
+let count = $(greet | count)               # 3
+let when  = $(date)                         # the date stamp
+let live  = $(status | where state=Running | count)
+echo "running: $live, at $when"
+```
+
+Constants — immutable, loud on reassignment:
+
+```
+const ROOT = /work
+const MAX  = 16
+echo $ROOT/logs
+# ROOT = /tmp        # error: cannot reassign a const
+```
+
+Script parameters — `run greet.gs Matthew core`:
+
+```
+echo "name=$1 role=$2"         # name=Matthew role=core
+echo "got $# args: $@"          # got 2 args: Matthew core
+echo "script: $0"               # script: greet.gs
+```
+
+- `let x = <value>` declares or reassigns; `const NAME = <value>` declares an immutable binding.
+- A value is a literal word, a `"string"`, a capture `$( … )`, or an **arithmetic expression** (below).
 - `$x` expands; **undefined `$x` is a loud error** (never a silent empty string).
-- Script parameters: `run build.gs a b c` → `$1 $2 $3`, `$#` (count), `$@` (all), `$0` (name).
+- `$1 $2 …` positional, `$#` count, `$@` all, `$0` script name.
+
+**Arithmetic.** Integer expressions, evaluated wherever a **value** is expected — the right of
+`let`/`const`, and the operands of a comparison. Operators are `+ - * / %`, with bare `( )` for
+grouping and the usual precedence (`* / %` before `+ -`). Operands are integer literals or `$vars`
+that expand to integers.
+
+```
+let i = 0
+let i = $i + 1                 # 1 — replaces the old $(add $i 1)
+let area = $w * $h
+let half = $n / 2              # integer division — truncates
+let odd  = $n % 2
+let cost = ( $base + $tax ) * $qty    # bare ( ) groups; $( ) is still capture
+```
+
+```
+if $i + 1 > $max {
+    echo "next step would overflow the window"
+}
+```
+
+- **Signed 64-bit, checked.** Divide-by-zero and overflow are **loud errors**, never a wrap or a
+  silent zero; a non-integer operand is a loud error too.
+- **Space-separated operators**, so text is never mistaken for math: `$dir/sub` is a path,
+  `$n / 2` is division. String building stays interpolation (`"$a$b"`, `"$dir/sub"`), never `+`.
+- Arithmetic is **value-position only**. To use a result as a command argument, assign it first
+  (`let d = $n + $n` → `echo $d`) — the same compute-then-use discipline Go uses.
 
 ## 4. Conditionals
 
@@ -68,9 +156,15 @@ if read /sc/a.txt {
 } else {
     echo "nothing"
 }
+```
 
+```
 if $role == "core" {
     echo "the core service"
+}
+
+if $n >= 3 {
+    echo "enough"
 }
 
 if !read /sc/secret {            # ! negates a command condition
@@ -78,8 +172,18 @@ if !read /sc/secret {            # ! negates a command condition
 }
 ```
 
+Membership — the condition form of a one-arm `switch`:
+
+```
+if $role in core worker courier {
+    echo "known role"
+}
+```
+
 - `if <cond> { … } else if <cond> { … } else { … }` — Go-style, no parens, no `fi`.
 - Comparison ops: `== != < > <= >=` (numeric if **both** sides parse as integers, else string).
+  Either side may be an arithmetic expression — `if $i + 1 > $max { … }` (§3).
+- `$x in a b c` — true if `$x` equals one of the listed words.
 
 **Failure model — explicit, Go-style (no hidden `set -e`).** A failed statement is tallied (the run
 summary already does this) and execution continues; you handle errors where they happen by checking
@@ -90,10 +194,17 @@ mkdir /sc
 if result == Err {
     fail "could not create /sc"
 }
+```
 
+```
 read /sc/cfg
 if result == FileNotFound {        # compare the SPECIFIC variant, like errors.Is
     write /sc/cfg "defaults"
+}
+
+kill supervisor
+if result == Denied {              # a guardrail refused us
+    echo "supervisor is protected"
 }
 ```
 
@@ -102,36 +213,65 @@ if result == FileNotFound {        # compare the SPECIFIC variant, like errors.I
   `prev.is_err()`, nearly free to implement.
 - Compare `result` against `Ok`, `Err` (any failure), or a specific variant — `FileNotFound`,
   `Denied`, `AssertFailed`, `Unknown` (the same set `assert fails-with` uses).
-- `fail <msg>` prints `<msg>` loudly and ends the script with `Err` (the script-level analog of
-  `return err`). `return <cond>` ends a function (Tier 3) with a result.
-- *Optional* one-liner sugar, addable later (it just desugars to the `result` check): `a and b`
-  (run `b` iff `a` was `Ok`), `a or b` (run `b` iff `a` was `Err`). Not required — checking `result`
-  is the canonical way.
+- `fail <msg>` prints `<msg>` loudly and ends the script with `Err`. `return <cond>` ends a
+  function (§7) with a result.
+- *Optional* one-liner sugar, addable later (desugars to the `result` check): `a and b` (run `b`
+  iff `a` was `Ok`), `a or b` (run `b` iff `a` was `Err`). Not required.
 
 ## 5. Loops
 
+Iterate a stream — byte lines, or record rows with `$row.<col>`:
+
 ```
-for line in (greet) {            # iterate the LINES of a byte stream
+for line in (greet) {            # the LINES of a byte stream
     echo "> $line"
 }
 
-for row in (status | where state=Running) {   # iterate the ROWS of a record stream
-    echo "$row.name on core $row.core"         # record fields via $row.<column>
+for row in (status | where state=Running) {   # the ROWS of a record stream
+    echo "$row.name on core $row.core"
+}
+```
+
+Iterate params or a literal word list:
+
+```
+for arg in $@ {
+    echo "arg: $arg"
 }
 
+for svc in logger fs registry {
+    echo "checking $svc"
+}
+```
+
+Counting loops with `range`:
+
+```
 for i in range 3 {               # 0 1 2
     echo $i
 }
 
-while $n > 0 {
-    echo $n
-    let n = (sub $n 1)
+for i in range 2 6 {             # 2 3 4 5
+    echo $i
+}
+```
+
+`while`, `break`, `continue` — every loop has a hard cap, so even `while true` is safe:
+
+```
+let i = 0
+while true {
+    let i = $i + 1
+    if $i == 3 { continue }
+    if $i > 5 { break }
+    echo $i                       # 1 2 4 5
 }
 ```
 
 - `for x in ( … )` iterates lines of a byte stream **or** rows of a record stream; record rows
-  expose columns as `$x.<col>` (this is the payoff of typed pipes — nothing in POSIX has it).
-- `for i in range N` is the counting loop; `while <cond> { … }` reuses the §4 grammar.
+  expose columns as `$x.<col>` (the payoff of typed pipes — nothing in POSIX has it).
+- `for x in a b c` iterates literal words; `for x in $@` iterates the script's params.
+- `for i in range N` / `range A B` counts; `while <cond> { … }` reuses the §4 grammar.
 - `break` / `continue`. **Every loop has a hard iteration cap (default 100k)** → exceeding it is a
   loud error, never a silent hang.
 
@@ -145,7 +285,16 @@ switch $role {
 }
 ```
 
-Go-style: no fallthrough, `_` default.
+```
+switch $1 {
+    start  { echo "starting" }
+    stop   { echo "stopping" }
+    status { echo "ok" }
+    _      { fail "unknown command: $1" }
+}
+```
+
+Go-style: no fallthrough, `_` default, multiple values per arm.
 
 ## 7. Functions
 
@@ -160,14 +309,25 @@ fn ensure_dir path {
     }
 }
 
-fn double n {
-    add $n $n
-}
-
 greet Matthew                  # a function is just a command
 ensure_dir /sc
-let d = $(double 5)            # its OUTPUT is its value — capture with $( )
-if double 5 { echo "ok" }      # its RESULT (Ok/Err) drives if/while
+```
+
+Output is the value (`$( )`), result is the control (`if`/`while`):
+
+```
+fn full name surname {
+    echo "$name $surname"
+}
+
+fn double n {
+    let d = $n + $n             # arithmetic is value-position; assign, then output
+    echo $d
+}
+
+let who = $(full Matthew Levi)  # capture the output
+echo $who                       # Matthew Levi
+echo $(double 5)                # 10
 ```
 
 A function is **just a command** — that's what keeps it coherent with the rest of the language:
@@ -188,23 +348,53 @@ A function is **just a command** — that's what keeps it coherent with the rest
   fixed array of frames), not native recursion — so the user stack does not grow per call.
   Recursion is allowed but call depth is capped (loud error on overflow).
 
-## 8. New builtins (each returns a Result, so they compose with if/while)
+## 8. Builtins
 
-- `let` — declare/assign a variable.
-- `result` — the previous statement's outcome, as a value (compare with `== Ok` / `== Err` / `== <Variant>`).
+Each returns a `Result`, so they compose with `if`/`while`.
+
+- `let` / `const` — declare a mutable / immutable variable.
+- `result` — the previous statement's outcome, as a value (compare `== Ok` / `== Err` / `== <Variant>`).
 - `fail <msg>` — print loudly and end the script with `Err`; `return <cond>` ends a function (§7).
-- `Ok` / `Err` and the variant names (`FileNotFound`, `Denied`, `AssertFailed`, `Unknown`) — the
-  result values you compare against.
-- `true` / `false` — always-`Ok` / always-`Err` (safe in `while true { … break }` thanks to the loop cap).
-- `range N` — the counting iterator for `for`.
-- `add` / `sub` — Tier-1 integer math (full inline expressions are Tier 3).
-- `eq ne lt gt le ge` / `empty <v>` — prefix comparisons, when you prefer them to infix.
+- `defer <command>` — run a command when the current scope (function, or the whole script) exits,
+  **including on `fail`**; deferreds run LIFO.
+- `Ok` / `Err` and the variant names (`FileNotFound`, `Denied`, `AssertFailed`, `Unknown`).
+- `true` / `false` — always-`Ok` / always-`Err`.
+- `range N` / `range A B` — the counting iterator for `for`.
+- `empty <v>` — true if `<v>` is empty (a prefix test, handy in conditions).
 - `break`, `continue`.
+
+Arithmetic is **inline** (`+ - * / %`, value position) — see §3, not a builtin.
+
+`defer` — cleanup that always runs:
+
+```
+mkdir /tmp/build
+defer delete /tmp/build recursive    # runs no matter how we leave
+write /tmp/build/out done
+```
+
+**Record aggregators (typed-pipe stages).** Because our pipes carry a typed `Table`, a pipeline can
+*reduce* — something byte pipes can't. `count` is dual (rows of a record stream, lines of a byte
+stream); the column reducers are record-only:
+
+```
+let rows  = (roster | count)             # row count
+let files = (ls /work | count)           # entries in a directory
+let used  = (status | sum mem)           # sum a numeric column
+let big   = (ls /work | max size)        # largest file
+let avgq  = (status | avg queue)         # average a column
+```
+
+- `count` — rows (record stream) or lines (byte stream).
+- `sum <col>` `min <col>` `max <col>` `avg <col>` — reduce a numeric column; a non-numeric or
+  missing column is a loud error, never a silent 0.
 
 `assert` and the whole existing command set are unchanged, and a script's own result is still `Ok`
 iff every top-level statement was `Ok` (the PASS/FAIL summary keeps working).
 
-## 9. Bounded by design (no_std, no heap, tight 256 KiB user stack)
+## 9. Bounds
+
+Bounded by design (no_std, no heap, tight 256 KiB user stack):
 
 | Thing            | Bound (loud on overflow)                          |
 |------------------|---------------------------------------------------|
@@ -212,6 +402,7 @@ iff every top-level statement was `Ok` (the PASS/FAIL summary keeps working).
 | block nesting    | 16                                                |
 | loop iterations  | 100k (configurable per loop later)                |
 | function call depth | 16 frames (each = its params + locals)         |
+| deferred actions | 8 per scope                                       |
 | script size      | embedded: rodata; on-disk file: `MAX_FILE_BYTES`  |
 
 The function call-frame stack is the explicit array above — a call pushes a frame, not a Rust
@@ -222,22 +413,30 @@ block bounds, loops re-seek to their start, conditions evaluated by running a co
 two values. **No native recursion, no AST.** This is what keeps it inside the user stack (the same
 discipline behind every `#[inline(never)]` in the shell today).
 
-## 10. Out of scope (for now)
+## 10. Out of scope
 
-Capability delegation in script syntax (pipes-as-caps, `spawn` with explicit grants) is Appendix
-D.3 territory and waits on a service-initiated spawn API. An inline arithmetic/string **expression
-evaluator** (`$i + 1`, length, slice) and **cross-file include / `source`** stay Tier 3 — those are
-the genuinely balloon-prone parts. (Functions moved *out* of Tier 3 — see §7/§11.)
+For now:
 
-## 11. Tiers / effort
+- **Capability delegation in script syntax** (pipes-as-caps, `spawn` with explicit grants) is
+  Appendix D.3 territory and waits on a service-initiated spawn API.
+- A **string** toolkit (length, slice, split) — interpolation covers *building* strings; richer
+  string ops wait. (Integer arithmetic is **in** — §3.)
+- **Cross-file include / `source`**, and **record values held in variables** (hold a whole table in
+  a `let`) — bigger storage stories; iterate with `for` for now.
 
-- **Tier 1** (~2–4 days): `let` + `$`-expansion + params, `if`/`else if`/`else`, comparisons,
-  `result`/`fail`, `switch`.
-- **Tier 2** (~4–6 days): `$( )` capture, `for` (lines / rows / `range`), `while`,
-  `break`/`continue`, and **functions** (`fn`, pre-scan index, call-frame stack, `return`) —
-  pulled in early because helpers earn their keep from the first real script.
-- **Tier 3** (resist): inline arithmetic/string **expression evaluator**, cross-file
-  include / `source`.
+These are the genuinely balloon-prone parts. (Functions and integer arithmetic are *not* here —
+both are Tier 2.)
+
+## 11. Tiers and effort
+
+- **Tier 1** (~2–4 days): `let`/`const` + `$`-expansion + params, `if`/`else if`/`else`,
+  comparisons + `in`, `result`/`fail`, `switch`.
+- **Tier 2** (~6–8 days): `$( )` capture, multi-line `"""…"""`, **inline integer arithmetic**
+  (`+ - * / %`, precedence, `( )`, checked), `for` (lines / rows / words / `range`), `while`,
+  `break`/`continue`, **functions** (`fn`, pre-scan index, call-frame stack, `return`), `defer`,
+  and the **record aggregators** (`count`/`sum`/`min`/`max`/`avg`).
+- **Tier 3** (resist): a string toolkit (length/slice/split), cross-file include / `source`,
+  record-valued variables.
 
 ## 12. Worked example
 
@@ -263,13 +462,13 @@ let lines = $(greet | count)
 echo "greet emitted $lines"
 ```
 
-## 13. Example programs (what we'll be implementing)
+## 13. Example programs
 
-Each of these uses only Tier 1–2 features (vars, params, `if`/comparison, `result`/`fail`,
-`switch`, `for`, `while`, functions, `$( )` capture). They are the kind of script the language is
-*for* — and the bar each milestone is "these run."
+Complete scripts — the kind the language is *for*, using only Tier 1–2 features. The bar for each
+milestone is "these run."
 
-### 13.1 `setup.gs` — provision a workspace, fail loudly if it can't
+### 13.1 setup.gs
+*Provision a workspace; fail loudly if it can't.*
 
 ```
 fn ensure_dir path {
@@ -286,14 +485,18 @@ ensure_dir /work
 ensure_dir /work/logs
 
 if !read /work/config {
-    write /work/config "mode=normal"
+    write /work/config """
+    mode  = normal
+    cores = 4
+    """
     echo "seeded default config"
 }
 
 echo "workspace ready"
 ```
 
-### 13.2 `greet.gs` — parameters, usage check, and `switch`
+### 13.2 greet.gs
+*Parameters, usage check, and `switch`.*
 
 ```
 # run greet.gs <name> <role>
@@ -304,14 +507,18 @@ if $# < 2 {
 let name = $1
 let role = $2
 
-switch $role {
-    core           { echo "$name runs the core" }
-    worker courier { echo "$name is a $role" }
-    _              { echo "$name has an unknown role: $role" }
+if $role in core worker courier {
+    switch $role {
+        core           { echo "$name runs the core" }
+        worker courier { echo "$name is a $role" }
+    }
+} else {
+    fail "$name has an unknown role: $role"
 }
 ```
 
-### 13.3 `report.gs` — iterate a record stream (`$row.col`)
+### 13.3 report.gs
+*Iterate and aggregate a record stream.*
 
 ```
 echo "running services by core:"
@@ -319,34 +526,39 @@ for row in (status | where state=Running) {
     echo "  $row.name  core=$row.core  queue=$row.queue"
 }
 
-# byte streams can be counted; record rows are iterated
-let n = $(greet | count)
-echo "greet still emits $n"
+let running = (status | where state=Running | count)   # row count (record-aware)
+let memuse  = (status | sum mem)                         # reduce a column
+echo "$running running, $memuse KiB in use"
 ```
 
-### 13.4 `check.gs` — a reusable test helper (functions + assert + result)
+### 13.4 check.gs
+*Test helper (functions + assert) with `defer` cleanup.*
 
 ```
+const DIR = /check
+mkdir $DIR
+defer delete $DIR recursive        # cleaned up however we leave — even on fail
+
 # a helper returns its last statement's result — here, the assert's verdict
 fn roundtrip path text {
     write $path $text
     read $path | assert contains $text
 }
 
-roundtrip /a.chk hello
-roundtrip /b.chk "two words"
+roundtrip $DIR/a hello
+roundtrip $DIR/b "two words"
 
 # negative case: the file must NOT exist after delete
-delete /a.chk
-if read /a.chk {
-    fail "delete did not remove /a.chk"
+delete $DIR/a
+if read $DIR/a {
+    fail "delete did not remove $DIR/a"     # defer still runs DIR cleanup
 }
 
-delete /b.chk
 echo "all checks passed"
 ```
 
-### 13.5 `retry.gs` — `while`, `break`, and a bounded counter
+### 13.5 retry.gs
+*`while`, `break`, and a bounded counter.*
 
 ```
 let tries = 0
@@ -355,7 +567,7 @@ while $tries < 3 {
         echo "ready after $tries retries"
         break
     }
-    let tries = $(add $tries 1)
+    let tries = $tries + 1
 }
 
 if $tries >= 3 {
