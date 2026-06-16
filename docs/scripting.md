@@ -34,6 +34,10 @@
 - **Explicit and loud (the Godspeed part).** Referencing an undefined `$x` is an **error**, not
   a silent empty string. Every limit is fixed; overflow is a loud error, never silent truncation
   or a runaway loop.
+- **Bounded on purpose.** Fixed storage, no heap (§9). The ceiling is a feature: it forces small,
+  composable, readable scripts and keeps gsh from becoming the cryptic, magic-laden sprawl POSIX
+  shells drift into. A script that needs more than the ceiling is a *program* — use the Godspeed
+  language (`.gs`), not the shell.
 - **Not bash.** No `fi`/`esac`/`done`, no word-splitting surprises, no `$?` quirks.
 
 ## 2. Lexical
@@ -45,7 +49,7 @@
   `'single quoted'` (literal, no expansion).
 - **Multi-line content** uses a triple-quoted block — for writing real files. It expands `$vars`
   like `"…"`. It is for a command argument (bounded by `MAX_FILE_BYTES`); storing one in a `let`
-  var that exceeds the 128 B value cap is a loud error, not a silent truncation.
+  var that exceeds the value-size bound (§9) is a loud error, not a silent truncation.
 
 ```
 echo one                        # a statement; the newline ends it
@@ -95,16 +99,22 @@ let live  = $(status | where state=Running | count)
 echo "running: $live, at $when"
 ```
 
-Constants — immutable, loud on reassignment:
+**Immutable by default.** `let x = …` is an **immutable** binding — reassigning it is a loud error.
+Opt into mutation with `let mut x = …`, and reassign a mutable binding with bare `x = …` (no `let`):
 
 ```
-const ROOT = /work
-const MAX  = 16
+let ROOT = /work               # immutable
 echo $ROOT/logs
-# ROOT = /tmp        # error: cannot reassign a const
+# ROOT = /tmp                  # error: cannot reassign an immutable binding
+
+let mut i = 0                  # mutable
+i = $i + 1                     # reassign — no 'let'
 ```
 
-Script parameters — `run greet.gsh Matthew core`:
+There is no `const`: the default `let` *is* the constant. Mutation is explicit and visible at the
+declaration — and that `let` / `let mut` line is exactly the scope boundary functions key off (§7).
+
+Script parameters — `run greet.gsh Matthew core` (params are immutable, like a function's):
 
 ```
 echo "name=$1 role=$2"         # name=Matthew role=core
@@ -112,19 +122,20 @@ echo "got $# args: $@"          # got 2 args: Matthew core
 echo "script: $0"               # script: greet.gsh
 ```
 
-- `let x = <value>` declares or reassigns; `const NAME = <value>` declares an immutable binding.
+- `let x = <value>` declares an immutable binding; `let mut x = <value>` a mutable one; `x = …`
+  reassigns a mutable binding (loud error on an immutable or undeclared name).
 - A value is a literal word, a `"string"`, a capture `$( … )`, or an **arithmetic expression** (below).
 - `$x` expands; **undefined `$x` is a loud error** (never a silent empty string).
 - `$1 $2 …` positional, `$#` count, `$@` all, `$0` script name.
 
-**Arithmetic.** Integer expressions, evaluated wherever a **value** is expected — the right of
-`let`/`const`, and the operands of a comparison. Operators are `+ - * / %`, with bare `( )` for
-grouping and the usual precedence (`* / %` before `+ -`). Operands are integer literals or `$vars`
-that expand to integers.
+**Arithmetic.** Integer expressions, evaluated wherever a **value** is expected — the right of a
+`let`/`let mut`/reassignment, and the operands of a comparison. Operators are `+ - * / %`, with bare
+`( )` for grouping and the usual precedence (`* / %` before `+ -`). Operands are integer literals or
+`$vars` that expand to integers.
 
 ```
-let i = 0
-let i = $i + 1                 # 1 — replaces the old $(add $i 1)
+let mut i = 0
+i = $i + 1                     # 1 — replaces the old $(add $i 1)
 let area = $w * $h
 let half = $n / 2              # integer division — truncates
 let odd  = $n % 2
@@ -274,9 +285,9 @@ for i in range 2 6 {             # 2 3 4 5
 `loop` repeats until you `break` — the one unbounded loop:
 
 ```
-let i = 0
+let mut i = 0
 loop {
-    let i = $i + 1
+    i = $i + 1
     if $i == 3 { continue }
     if $i > 5 { break }
     echo $i                       # 1 2 4 5
@@ -370,21 +381,26 @@ A function is **just a command** — that's what keeps it coherent with the rest
   its `Ok`/`Err` works in conditions like any command. `return <cond>` ends early with that
   result; falling off the end returns the **last statement's** result (so a helper ending in an
   `assert` returns the assert's verdict). No separate "return value" concept.
-- **No ambient variables (the capability parallel).** A function sees only its **parameters** and
-  its own **locals** — not the script's globals. If it needs a value, pass it. Inputs are explicit,
-  exactly like a service gets only the capabilities it is handed (§3.1). Assignments inside are
-  local and vanish on return.
-- **Defined anywhere.** A one-pass pre-scan indexes every `fn` block, so you can call a function
-  before its definition (so definition order doesn't matter).
-- **Bounded, not natively recursive.** Calls use the interpreter's explicit **call-frame stack** (a
-  fixed array of frames), not native recursion — so the user stack does not grow per call.
-  Recursion is allowed but call depth is capped (loud error on overflow).
+- **Scope = params + locals + immutable globals (mirrors constitution invariant 9).** A function
+  sees its **parameters**, its own **locals**, and the script's **immutable (`let`) globals** — but
+  **not** mutable (`let mut`) globals. Invariant 9 is "no unowned global mutable state; immutable
+  globals are fine," applied one layer up: immutable config (`let ROOT = /work`) is ambient-readable
+  everywhere (no spooky action — it can't change); a value the script *mutates* must be passed in, so
+  a function's mutable inputs are explicit, exactly like a service's capabilities (§3.1). The
+  `let` / `let mut` distinction *is* this scope boundary. Assignments inside are local and vanish on return.
+- **Defined anywhere.** A one-pass pre-scan over the (resident) script indexes every `fn` block, so a
+  call can precede its definition — put helpers at the bottom and the main logic at the top if you
+  like. (This is why the script is loaded whole, not streamed — a deliberate trade for ergonomics
+  over arbitrarily-huge scripts; §9.)
+- **Bounded, not natively recursive.** Calls use the interpreter's explicit **call-frame stack**, not
+  native Rust recursion — so the native stack stays flat regardless of gsh call depth. Recursion is
+  allowed; depth is capped (loud error on overflow).
 
 ## 8. Builtins
 
 Each returns a `Result`, so they compose with `if`.
 
-- `let` / `const` — declare a mutable / immutable variable.
+- `let` / `let mut` — declare an immutable / mutable variable (reassign a mutable one with `x = …`).
 - `result` — the previous statement's outcome, as a value (compare `== Ok` / `== Err` / `== <Variant>`).
 - `fail <msg>` — print loudly and end the script with `Err`; `return <cond>` ends a function (§7).
 - `defer <command>` — run a command when the current scope (function, or the whole script) exits,
@@ -426,24 +442,38 @@ iff every top-level statement was `Ok` (the PASS/FAIL summary keeps working).
 
 ## 9. Bounds
 
-Bounded by design (no_std, no heap, tight 256 KiB user stack):
+**Bounded by design, and the bounds are the point.** gsh is `no_std`, **no heap** — fixed storage,
+loud on overflow. Every limit below is a deliberate ceiling, generous for real shell scripts and
+tunable; hitting one is a clear error, never a silent truncation or a runaway. (Values:)
 
 | Thing            | Bound (loud on overflow)                          |
 |------------------|---------------------------------------------------|
-| variables        | 32 × (name ≤ 24 B, value ≤ 128 B)                 |
-| block nesting    | 16                                                |
-| loop iterations  | 100k (configurable per loop later)                |
-| function call depth | 16 frames (each = its params + locals)         |
-| deferred actions | 8 per scope                                       |
+| variables        | fixed count × bounded value size                  |
+| block nesting    | fixed                                             |
+| loop iterations  | hard cap (no runaway; configurable per loop later)|
+| function call depth | fixed frames (each = its params + locals)      |
+| deferred actions | fixed per scope                                   |
 | script size      | embedded: rodata; on-disk file: `MAX_FILE_BYTES`  |
 
-The function call-frame stack is the explicit array above — a call pushes a frame, not a native
-stack frame — so the user stack stays flat regardless of call depth.
+This is a **feature, not a limitation.** A finite ceiling forces good script hygiene — small,
+composable, readable scripts — and rules out the cryptic, sprawling, magic-laden scripts the POSIX
+world drifts into. **If a script needs more than the ceiling, it isn't a shell script anymore — it's
+a program**, and that's the job of the general-purpose **Godspeed language** (`.gs`), not gsh.
+Choosing the right tool is the discipline; the loud overflow is what tells you you've crossed the
+line. (No silent stack→heap fallback, ever — §26.7.)
 
-**Execution model:** a line-oriented interpreter with an **explicit control stack** — brace-matched
-block bounds, loops re-seek to their start, conditions evaluated by running a command or comparing
-two values. **No native recursion, no AST.** This is what keeps it inside the user stack (the same
-discipline behind every `#[inline(never)]` in the shell today).
+**Execution model:** the script is loaded **whole** (resident in a fixed buffer — small file or
+embedded rodata), **pre-scanned once** for `fn` definitions (a tiny name→offset index, so functions
+are callable before they're defined, §7), then executed top-to-bottom. Control flow uses an
+**explicit control stack** (a flat array of frames), not native Rust recursion — loops and blocks
+re-seek within the resident buffer, conditions are a command result or a comparison. **No native
+recursion** — the native stack stays flat regardless of gsh nesting or call depth, the same
+discipline behind every `#[inline(never)]` in the shell today.
+
+Streaming huge scripts (read-at-offset from a multi-block file, buffering only the active block, the
+way bash reads a file descriptor) is *deliberately not done* — it would mean abandoning whole-script
+residency, which is what makes "defined anywhere" cheap. That trade-off lands on the side of small-
+script ergonomics; the streaming path belongs to Godspeed lang + a v2 fs.
 
 ## 10. Out of scope
 
@@ -455,13 +485,17 @@ For now:
   string ops wait. (Integer arithmetic is **in** — §3.)
 - **Cross-file include / `source`**, and **record values held in variables** (hold a whole table in
   a `let`) — bigger storage stories; iterate with `for` for now.
+- **A heap, and huge / streamed scripts.** gsh stays `no_std`/fixed-storage (§9). Heap-backed values,
+  multi-block-file streaming, and 10K-line scripts are explicitly **not** gsh's job — by the time a
+  script wants them it's a program, and that's the **Godspeed language** (`.gs`). The `.gsh`/`.gs`
+  split *is* this boundary. The loud overflow is the signal you've crossed it.
 
-These are the genuinely balloon-prone parts. (Functions and integer arithmetic are *not* here —
-both are Tier 2.)
+These are the genuinely balloon-prone parts, or they belong to the general-purpose language.
+(Functions and integer arithmetic are *not* here — both are Tier 2.)
 
 ## 11. Tiers and effort
 
-- **Tier 1** (~2–4 days): `let`/`const` + `$`-expansion + params, `if`/`else if`/`else`,
+- **Tier 1** (~2–4 days): `let`/`let mut` + `$`-expansion + params, `if`/`else if`/`else`,
   comparisons + `in`, `result`/`fail`, `switch`.
 - **Tier 2** (~6–8 days): `$( )` capture, multi-line `"""…"""`, **inline integer arithmetic**
   (`+ - * / %`, precedence, `( )`, checked), `for` (lines / rows / words / `range`), `loop`,
@@ -473,7 +507,7 @@ both are Tier 2.)
 ## 12. Worked example
 
 ```
-# a helper that takes only what it is given (no ambient vars)
+# a helper: its mutable inputs are explicit params (immutable globals it could read)
 fn ensure_dir path {
     if !ls $path {
         mkdir $path
@@ -567,7 +601,7 @@ echo "$running running, $memuse KiB in use"
 *Test helper (functions + assert) with `defer` cleanup.*
 
 ```
-const DIR = /check
+let DIR = /check                   # immutable
 mkdir $DIR
 defer delete $DIR recursive        # cleaned up however we leave — even on fail
 
@@ -593,7 +627,7 @@ echo "all checks passed"
 *`loop`, `break`, and a bounded counter.*
 
 ```
-let tries = 0
+let mut tries = 0
 loop {
     if read /work/ready {
         echo "ready after $tries retries"
@@ -602,6 +636,6 @@ loop {
     if $tries >= 3 {
         fail "never became ready"
     }
-    let tries = $tries + 1
+    tries = $tries + 1
 }
 ```
