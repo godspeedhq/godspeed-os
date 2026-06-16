@@ -2720,32 +2720,57 @@ fn cmd_find(ctx: &ServiceContext, cwd: &Cwd, target: &str, start: &str, out: &mu
     Ok(()) // a search that finds nothing still succeeded (0 matches is not an error)
 }
 
-/// `tree [path]` — print the directory hierarchy as an indented tree (default: the current
-/// directory). Same bounded-walk discipline as `find` (§26.6): a fixed-capacity explicit
-/// stack, depth-first, no recursion, loud on overflow (§3.12). Every child (file or dir) is
-/// pushed so siblings nest correctly, and a directory's whole subtree drains before its next
-/// sibling (LIFO + reverse-push). ASCII only (2 spaces per level, `/` marks directories) —
-/// the framebuffer console renders no box-drawing glyphs.
+/// Max depth tracked for box-drawing prefixes; deeper levels just keep a continuation bar.
+const TREE_MAX_DEPTH: usize = 32;
+/// Prefix scratch: up to `TREE_MAX_DEPTH` levels × the widest piece (`"│   "` = 6 bytes).
+const TREE_PREFIX_MAX: usize = TREE_MAX_DEPTH * 6;
+
+/// `tree [path]` — print the directory hierarchy with box-drawing connectors, like Unix `tree`
+/// (default: the current directory). Same bounded-walk discipline as `find` (§26.6): a fixed-
+/// capacity explicit stack, depth-first, no recursion, loud on overflow (§3.12). A directory's
+/// whole subtree drains before its next sibling (LIFO + reverse-push), and each node records
+/// whether it is its parent's *last* child so the prefix draws `├──`/`└──` and `│`/blank
+/// continuation correctly. UTF-8: the fbcon decodes `├ └ │ ─` and renders light box glyphs;
+/// a trailing `/` still marks directories (the console is monochrome — no colour to lean on).
+/// `#[inline(never)]`: holds the ~12 KiB `TreeStack` + prefix scratch off the hot pipe frame
+/// (it's a pipe producer; see [[project-shell-stack-pipe]]).
+#[inline(never)]
 fn cmd_tree(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let start = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     match stat_kind(ctx, start) {
         Some(true)  => {}
-        Some(false) => { out.line(ctx, str_of(start)); out.line(ctx, "0 directories, 1 file"); return Ok(()); }
+        Some(false) => { out.line(ctx, str_of(start)); out.line(ctx, ""); out.line(ctx, "0 directories, 1 file"); return Ok(()); }
         None        => { ctx.console_writeln_fmt(format_args!("tree: not found: {}", str_of(start))); return Err(ShellError::FileNotFound); }
     }
     let mut stack = TreeStack::new();
-    stack.push(start, true, 0);
+    stack.push(start, true, 0, true);
     let (mut dirs, mut files) = (0u32, 0u32);
-    while let Some((plen, is_dir, depth)) = stack.pop(&mut buf) {
-        // Print this node: indent by depth; root shows its full path, deeper nodes their
-        // basename; a trailing '/' marks a directory.
-        for _ in 0..depth { out.put(ctx, "  "); }
-        let name = if depth == 0 { &buf[..plen] } else { basename(&buf[..plen]) };
-        if is_dir { out.line_fmt(ctx, format_args!("{}/", str_of(name))); }
-        else      { out.line(ctx, str_of(name)); }
+    // `level_last[k]` = was the ancestor at depth k its parent's last child? (drives the prefix:
+    // a non-last ancestor draws a `│` continuation, a last one draws blank). The DFS finishes a
+    // subtree before its siblings, so this stays valid for every descendant.
+    let mut level_last = [false; TREE_MAX_DEPTH];
+    let mut pre = [0u8; TREE_PREFIX_MAX];
+    while let Some((plen, is_dir, depth, is_last)) = stack.pop(&mut buf) {
+        let d = depth as usize;
+        if d == 0 {
+            out.line(ctx, str_of(&buf[..plen])); // root: full path, no connector
+        } else {
+            // Build the prefix from the ancestors' last-child flags, then the connector.
+            let mut pl = 0usize;
+            for k in 1..d {
+                let piece: &[u8] = if k < TREE_MAX_DEPTH && level_last[k] { "    ".as_bytes() } else { "│   ".as_bytes() };
+                if pl + piece.len() <= pre.len() { pre[pl..pl + piece.len()].copy_from_slice(piece); pl += piece.len(); }
+            }
+            out.put(ctx, str_of(&pre[..pl]));
+            out.put(ctx, if is_last { "└── " } else { "├── " });
+            let name = basename(&buf[..plen]);
+            if is_dir { out.line_fmt(ctx, format_args!("{}/", str_of(name))); }
+            else      { out.line(ctx, str_of(name)); }
+        }
+        if d < TREE_MAX_DEPTH { level_last[d] = is_last; } // for this node's children
         if !is_dir { files += 1; continue; }
-        if depth > 0 { dirs += 1; }
+        if d > 0 { dirs += 1; }
 
         let reply = match fs_request(ctx, OP_LIST_DIR, &buf[..plen], &[]) {
             Some(r) => r,
@@ -2774,7 +2799,8 @@ fn cmd_tree(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result
             let cdir = p[off + 1 + nl] != 0;
             let mut child = [0u8; PATH_MAX];
             if let Some(clen) = join_path(&buf[..plen], cname, &mut child) {
-                stack.push(&child[..clen], cdir, depth + 1);
+                // The last child read (forward order) is its parent's last → draws `└──`.
+                stack.push(&child[..clen], cdir, depth + 1, k == nc - 1);
             }
         }
     }
@@ -2782,6 +2808,7 @@ fn cmd_tree(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result
         ctx.console_writeln_fmt(format_args!(
             "tree: truncated — more than {} pending entries (bounded walk)", TREE_CAP));
     }
+    out.line(ctx, "");
     out.line_fmt(ctx, format_args!(
         "{} director{}, {} file{}",
         dirs, if dirs == 1 { "y" } else { "ies" }, files, if files == 1 { "" } else { "s" }));
@@ -2806,6 +2833,7 @@ struct TreeStack {
     len: [usize; TREE_CAP],
     is_dir: [bool; TREE_CAP],
     depth: [u16; TREE_CAP],
+    is_last: [bool; TREE_CAP], // is this the last child of its parent? (drives └── vs ├──)
     top: usize,
     overflow: bool,
 }
@@ -2813,23 +2841,25 @@ impl TreeStack {
     fn new() -> Self {
         TreeStack {
             buf: [[0u8; PATH_MAX]; TREE_CAP], len: [0; TREE_CAP],
-            is_dir: [false; TREE_CAP], depth: [0; TREE_CAP], top: 0, overflow: false,
+            is_dir: [false; TREE_CAP], depth: [0; TREE_CAP], is_last: [false; TREE_CAP],
+            top: 0, overflow: false,
         }
     }
-    fn push(&mut self, p: &[u8], is_dir: bool, depth: u16) {
+    fn push(&mut self, p: &[u8], is_dir: bool, depth: u16, is_last: bool) {
         if self.top >= TREE_CAP || p.len() > PATH_MAX { self.overflow = true; return; }
         self.buf[self.top][..p.len()].copy_from_slice(p);
         self.len[self.top] = p.len();
         self.is_dir[self.top] = is_dir;
         self.depth[self.top] = depth;
+        self.is_last[self.top] = is_last;
         self.top += 1;
     }
-    fn pop(&mut self, out: &mut [u8; PATH_MAX]) -> Option<(usize, bool, u16)> {
+    fn pop(&mut self, out: &mut [u8; PATH_MAX]) -> Option<(usize, bool, u16, bool)> {
         if self.top == 0 { return None; }
         self.top -= 1;
         let l = self.len[self.top];
         out[..l].copy_from_slice(&self.buf[self.top][..l]);
-        Some((l, self.is_dir[self.top], self.depth[self.top]))
+        Some((l, self.is_dir[self.top], self.depth[self.top], self.is_last[self.top]))
     }
 }
 

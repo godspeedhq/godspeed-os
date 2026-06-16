@@ -27,21 +27,27 @@ usage:
 
 ## 3. Behaviour
 
-- **ASCII only.** Two spaces of indent per level; a trailing `/` marks directories. No
-  box-drawing connectors (`├──`, `│`) — the framebuffer console renders no Unicode glyphs, so
-  plain indentation is the honest, portable choice.
+- **Box-drawing, like Unix `tree`.** Connectors `├── ` / `└── ` mark each entry and `│` / blank
+  draw the continuation lines, so structure reads at a glance. A trailing `/` still marks
+  directories (the console is monochrome — there's no colour to lean on).
+- **UTF-8.** The box glyphs (`U+2500..U+253C`) are emitted as UTF-8 and render on **both** the
+  serial terminal and the framebuffer console — the fbcon now decodes UTF-8 and carries a small
+  set of hand-rolled light box-drawing glyphs (`kernel/src/arch/x86_64/fb.rs`). Unsupported
+  codepoints render as `?`, never silently dropped (§3.12).
 - The root line shows the path as given; deeper entries show their basename.
-- Ends with a summary: `N directories, M files` (counting everything *under* the root).
+- Ends with a blank line then a summary: `N directories, M files` (counting everything *under*
+  the root).
 - A path that names a file prints just that file; a missing path is a loud error (§3.12).
 
 Example:
 
 ```
 gsh> tree /docs
-/docs/
-  a.txt
-  sub/
-    b.txt
+/docs
+├── a.txt
+└── sub/
+    └── b.txt
+
 1 directory, 2 files
 ```
 
@@ -55,6 +61,12 @@ directory's whole subtree drains before its next sibling (LIFO + reverse-push). 
 wider than the walk's capacity it reports truncation rather than silently dropping branches
 (§3.12), exactly like `find`. Path-length limits (`PATH_MAX`, the u8 wire `path_len`) bound
 real depth to ~60 levels, well within the walk.
+
+The connectors come for free from the same DFS: each node carries whether it is its parent's
+**last** child (drives `└──` vs `├──`), and a small `level_last[depth]` array records each
+ancestor's last-child flag for the `│`/blank prefix. Because the DFS finishes a subtree before
+its siblings, that array is always valid when a node prints — no recursion, no per-node prefix
+storage.
 
 ## 5. Later (separate doc so it can grow)
 
