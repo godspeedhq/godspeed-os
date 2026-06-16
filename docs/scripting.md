@@ -198,21 +198,35 @@ if result == Err {
 
 ```
 read /sc/cfg
-if result == FileNotFound {        # compare the SPECIFIC failure kind
+if result == FileNotFound {        # the SPECIFIC failure kind — flat, no Err( ) wrapper
     write /sc/cfg "defaults"
 }
 
-kill supervisor
-if result == Denied {              # a guardrail refused us
-    echo "supervisor is protected"
+if result != Ok {                  # "anything failed" — the negation form
+    echo "something went wrong"
+}
+```
+
+To branch on *several* specific kinds, `switch` the result (§6) instead of chaining `if`s:
+
+```
+read /work/config
+switch result {
+    Ok           { echo "loaded" }
+    FileNotFound { write /work/config "defaults" }
+    Denied       { fail "no permission to read config" }
+    _            { fail "unexpected: config unreadable" }
 }
 ```
 
 - `result` is a first-class value: after every statement it holds that statement's outcome. It *is*
   the `Result` the shell already threads between commands — so `result == Err` is just
   `prev.is_err()`, nearly free to implement.
-- Compare `result` against `Ok`, `Err` (any failure), or a specific variant — `FileNotFound`,
-  `Denied`, `AssertFailed`, `Unknown` (the same set `assert fails-with` uses).
+- Compare `result` with `==` / `!=` against one of: `Ok`, `Err` (**any** failure), or a **specific
+  kind** — `FileNotFound`, `Denied`, `AssertFailed`, `Unknown` (the set `assert fails-with` uses).
+- **Flat, no wrapper.** It is `result == FileNotFound`, never `result == Err(FileNotFound)` — the
+  kind names are self-evidently errors, and `Err` alone already means "any failure". One spelling
+  per check.
 - `fail <msg>` prints `<msg>` loudly and ends the script with `Err`. `return <cond>` ends a
   function (§7) with a result.
 - *Optional* one-liner sugar, addable later (desugars to the `result` check): `a and b` (run `b`
@@ -310,7 +324,8 @@ switch $1 {
 }
 ```
 
-No fallthrough; `_` is the default; multiple values per arm.
+No fallthrough; `_` is the default; multiple values per arm. The matched value is any value —
+including `result`, which is the clean way to branch on several error kinds at once (§4).
 
 ## 7. Functions
 
