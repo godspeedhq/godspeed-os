@@ -791,7 +791,6 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         if cid == 0 {
             crate::control::process_pending();
             crate::arch::x86_64::uart_rx_poll();
-            crate::arch::x86_64::fb::cursor_blink_tick();
         }
 
         let prev = CORE_CURRENT[cid].load(Ordering::Relaxed);

@@ -21,7 +21,6 @@
 //! mapping is required.
 
 use crate::smp::spinlock::SpinLock;
-use core::sync::atomic::{AtomicU32, Ordering};
 use limine::framebuffer::Framebuffer;
 
 /// Font glyph lookup. `font8x8` legacy basic font: 8 rows per glyph, bit
@@ -80,7 +79,6 @@ struct Fb {
     cursor_visible: bool,// draw the underline cursor (off for full-screen apps)
     cur_col: usize,      // column where the cursor underline was last drawn
     cur_row: usize,      // row where the cursor underline was last drawn
-    blink_shown: bool,   // is the blinking underline currently drawn (vs blanked)?
     // Char-grid shadow: the printable content of each text cell (the transient
     // cursor overlay is excluded — it is always erased before a scroll). `scroll`
     // shifts this in RAM and redraws the screen from it, so it never reads the
@@ -92,7 +90,7 @@ static FB: SpinLock<Fb> = SpinLock::new(Fb {
     base: 0, pitch: 0, bpp: 0, width: 0, height: 0,
     org_x: 0, org_y: 0, cols: 0, rows: 0, col: 0, row: 0, fg: 0, bg: 0, ready: false,
     esc: 0, csi_priv: false, csi_params: [0; 3], csi_nparam: 0, cursor_visible: true,
-    cur_col: 0, cur_row: 0, blink_shown: true,
+    cur_col: 0, cur_row: 0,
     grid: [[b' '; MAX_COLS]; MAX_ROWS],
 });
 
@@ -394,44 +392,6 @@ fn draw_cursor(s: &mut Fb) {
     draw_glyph(s, b'_', s.col, s.row);
     s.cur_col = s.col;
     s.cur_row = s.row;
-    // A fresh draw (after any output/keystroke) starts the blink phase "shown", so the
-    // cursor is solid right after activity and only blinks once the prompt goes idle.
-    s.blink_shown = true;
-}
-
-/// Blink interval, in 10 ms timer ticks: toggle every ~500 ms (a 1 s on/off cycle).
-const BLINK_PERIOD_TICKS: u32 = 50;
-static BLINK_TICKS: AtomicU32 = AtomicU32::new(0);
-
-/// Called every timer tick on core 0 (next to `process_pending`/`uart_rx_poll`). Toggles the
-/// cursor underline every `BLINK_PERIOD_TICKS` so a ready prompt visibly blinks. Cheap: it
-/// redraws a single cell, and only when the period elapses.
-pub fn cursor_blink_tick() {
-    if BLINK_TICKS.fetch_add(1, Ordering::Relaxed) % BLINK_PERIOD_TICKS == 0 {
-        toggle_cursor_blink();
-    }
-}
-
-/// Flip the cursor cell between the underline and the character underneath it (normally blank,
-/// since the cursor sits at the next write position). `try_lock` — never block the timer ISR:
-/// if a console write holds the FB lock (it can be mid-write on this very core), skip this frame
-/// and blink on the next tick. A hidden/locked frame is harmless — the next write redraws solid.
-fn toggle_cursor_blink() {
-    let mut s = match FB.try_lock() { Some(g) => g, None => return };
-    if !s.ready || !s.cursor_visible { return; }
-    let (c, r) = (s.cur_col, s.cur_row);
-    if s.blink_shown {
-        let under = s.grid[r][c];        // restore the cell content (a space at the prompt)
-        draw_glyph(&s, under, c, r);
-        s.blink_shown = false;
-    } else {
-        draw_glyph(&s, b'_', c, r);
-        s.blink_shown = true;
-    }
-    // The framebuffer is write-combining: a lone one-cell `draw_glyph` would otherwise sit in
-    // the store buffer and never reach the panel until the next console write. Flush it so the
-    // blink is actually visible (the byte-sequence writers flush for the same reason).
-    wc_flush();
 }
 
 /// Erase the cursor at the cell where it was last drawn (blank it). Using the
