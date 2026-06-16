@@ -645,7 +645,7 @@ const RUN_MAX_CMDS: usize = 256;
 /// The self-check suite, embedded in the shell binary (so it ships with the boot image — no
 /// host-side `dd` of a data disk). Run straight from rodata, so it can be far larger than an
 /// on-disk file (`MAX_FILE_BYTES` — a file is one ≤4 KiB IPC message; rodata is not).
-const SELFCHECK_GS: &str = include_str!("../../../scripts/t630_selfcheck.gs");
+const SELFCHECK_GS: &str = include_str!("../../../scripts/selfcheck.gs");
 
 /// `selfcheck` — run the embedded self-check suite IN MEMORY (straight from rodata via
 /// `run_lines`; no file write, so it is not capped by `MAX_FILE_BYTES`). The one-USB hardware
