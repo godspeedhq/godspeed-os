@@ -1438,8 +1438,15 @@ fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str) -> Result<(), ShellErro
         let mut cap = Cap::new();
         if !drain_service(ctx, c0, None, &mut cap) { return Err(ShellError::Unknown); }
         Stream::Bytes(cap)
+    } else if c0 == "result" || c0 == "assert" {
+        // The classic mix-up: piping into the *outcome* channel. `result`/`assert` read a
+        // command's Ok/Err, not its piped output. Point at the right idiom instead of the
+        // generic "not a pipe source".
+        ctx.console_writeln_fmt(format_args!(
+            "pipe: '{}' checks a command's outcome, not piped output. Run the command, then 'result', or use 'assert ok <command>'", c0));
+        return Err(ShellError::Unknown);
     } else {
-        ctx.console_writeln_fmt(format_args!("pipe: '{}' cannot start a pipe", c0));
+        ctx.console_writeln_fmt(format_args!("pipe: '{}' cannot start a pipe because it's not a pipe source", c0));
         return Err(ShellError::Unknown);
     };
 
@@ -1464,6 +1471,11 @@ fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str) -> Result<(), ShellErro
             // `result`) sees the verdict. Must be last — it consumes the stream.
             if !last { ctx.console_writeln("pipe: assert must be the last stage"); return Err(ShellError::Unknown); }
             return assert_stream(ctx, &s, arg);
+        }
+        if cmd == "result" {
+            // `result` reads the outcome channel, not a stream — same mix-up as `<cmd> | result`.
+            ctx.console_writeln("pipe: 'result' checks a command's outcome, not piped output. Run the command, then 'result', or use 'assert ok <command>'");
+            return Err(ShellError::Unknown);
         }
         if !pipe_transform(ctx, stages[i], cmd, &mut s) { return Err(ShellError::Unknown); }
     }
