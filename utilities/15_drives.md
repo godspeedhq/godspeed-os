@@ -61,7 +61,7 @@ a bare-label command does not guess — it refuses, lists the matches, and print
 disambiguated commands to run:
 
 ```
-gs> drives flash data
+gsh> drives flash data
   drives: 'data' is ambiguous — 2 drives are labelled 'data':
     0:data   16 MiB   GSFS
     1:data   32 MiB   GSFS

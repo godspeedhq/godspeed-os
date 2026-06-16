@@ -20,7 +20,7 @@ reports raw facts and renders no verdict (`0_conventions.md` §1 rule 7).
 ## 3. Output
 
 ```
-gs> mem
+gsh> mem
 mem: 2048 KiB used / 4096 MiB total (0.04% used, 4095 MiB free)
 ```
 

@@ -20,7 +20,7 @@ how many cores it is running on, and who made it.
 ## 3. Output
 
 ```
-gs> about
+gsh> about
 GodspeedOS: a capability-based microkernel (v1 milestone)
   running on 4 core(s)
   Created by Bankole Ogundero.

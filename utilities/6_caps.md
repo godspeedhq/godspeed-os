@@ -25,7 +25,7 @@ any other (authority is explicit, not hidden).
 ## 3. Output
 
 ```
-gs> caps
+gsh> caps
 caps for shell
   resource 2  spawn            rights: WRITE
   resource 5  introspect       rights: READ

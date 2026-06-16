@@ -94,16 +94,16 @@ shell-delegated pipe cap (zero ambient authority, like `greet`). The shell knows
 record service, so it `decode`s the stream straight into a `Table` — **no `from json`**:
 
 ```text
-gs> roster | sort reverse core
+gsh> roster | sort reverse core
 name    role     core
 hermes  courier  2
 atlas   worker   1
 vesta   core     0
-gs> roster | where role=core | to json
+gsh> roster | where role=core | to json
 [
   {"name": "vesta", "role": "core", "core": 0}
 ]
-gs> roster | select name core
+gsh> roster | select name core
 name    core
 atlas   1
 hermes  2

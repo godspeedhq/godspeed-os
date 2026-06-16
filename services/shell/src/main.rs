@@ -135,7 +135,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // Boot is done: dismiss the boot screen on the TV (clear + stop mirroring logs
     // to it) and present a clean prompt. Serial keeps the full stream. This is also
-    // the first `gs> ` the serial-driven shell-test waits on.
+    // the first `gsh> ` the serial-driven shell-test waits on.
     ctx.console_boot_complete();
 
     // The shell owns echo from here on. The kernel's auto-echo (console_push_byte)
@@ -144,7 +144,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // the line. We turn kernel echo OFF and echo printable bytes ourselves below, so
     // escape sequences are swallowed silently and line editing stays under our control.
     ctx.console_echo(false);
-    ctx.console_write("gs> ");
+    ctx.console_write("gsh> ");
 
     let mut line_buf = [0u8; MAX_LINE];
     let mut line_len = 0usize;
@@ -172,7 +172,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     line_len = 0;
                 }
                 nav = hist.len();
-                ctx.console_write("gs> ");
+                ctx.console_write("gsh> ");
             }
             0x1B => {
                 // Escape sequence. Arrow keys arrive as ESC [ A/B/C/D — from a serial
@@ -215,7 +215,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 ctx.console_writeln("^C");
                 line_len = 0;
                 nav = hist.len();
-                ctx.console_write("gs> ");
+                ctx.console_write("gsh> ");
             }
             b if b >= 0x20 && b < 0x7f => {
                 if line_len < MAX_LINE {

@@ -101,9 +101,9 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
-    // Step 1: wait for first gs> — boot complete, shell ready.
+    // Step 1: wait for first gsh> — boot complete, shell ready.
     // -----------------------------------------------------------------------
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(30)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)) {
         Some(boot_out) => {
             check!(boot_out.contains("shell: ready"), "boot: shell ready message");
         }
@@ -113,7 +113,7 @@ pub fn run(image_path: &Path, smp: u32) {
                 let g = buf.lock().unwrap();
                 String::from_utf8_lossy(&g).into_owned()
             };
-            println!("shell-test: FAIL — timed out waiting for first gs>");
+            println!("shell-test: FAIL — timed out waiting for first gsh>");
             println!("shell-test: received so far:\n{received}");
             child.kill().ok();
             child.wait().ok();
@@ -125,7 +125,7 @@ pub fn run(image_path: &Path, smp: u32) {
     // help
     // -----------------------------------------------------------------------
     send(&mut write_half, b"help\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => {
             check!(r.contains("GodspeedOS shell commands"), "help: header");
             check!(r.contains("spawn"),   "help: spawn listed");
@@ -142,7 +142,7 @@ pub fn run(image_path: &Path, smp: u32) {
     // cores
     // -----------------------------------------------------------------------
     send(&mut write_half, b"cores\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => {
             check!(r.contains(&format!("cores: {smp}")), "cores: reports smp count");
         }
@@ -156,7 +156,7 @@ pub fn run(image_path: &Path, smp: u32) {
     // status
     // -----------------------------------------------------------------------
     send(&mut write_half, b"status\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => {
             // status now renders a typed table (lowercase column names from the record model).
             check!(r.contains("name") && r.contains("state"), "status: table header present");
@@ -172,36 +172,36 @@ pub fn run(image_path: &Path, smp: u32) {
     }
     // Structured records: status as a typed table → where filter + to json rendering.
     send(&mut write_half, b"status | to json\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("\"name\":") && r.contains("\"state\":"), "status | to json: JSON objects"),
         None    => { println!("shell-test: FAIL — status|to json timeout"); fail += 1; }
     }
     // Compact predicate: where col<op>val (no spaces, no quotes needed).
     send(&mut write_half, b"status | where name=shell\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("shell") && !r.contains("logger"), "status | where name=shell: filters rows"),
         None    => { println!("shell-test: FAIL — status|where timeout"); fail += 1; }
     }
     send(&mut write_half, b"status | where name=shell | to json\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("\"name\": \"shell\"") && !r.contains("\"logger\""), "status | where … | to json: filtered JSON"),
         None    => { println!("shell-test: FAIL — status|where|json timeout"); fail += 1; }
     }
     // select: project columns.
     send(&mut write_half, b"status | where name=shell | select name state\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("name") && r.contains("state") && !r.contains("restarts"), "status | select: projects columns"),
         None    => { println!("shell-test: FAIL — status|select timeout"); fail += 1; }
     }
     // to yaml: the other edge rendering.
     send(&mut write_half, b"status | where name=shell | to yaml\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("- slot:") && r.contains("name: shell"), "status | to yaml: YAML mapping list"),
         None    => { println!("shell-test: FAIL — status|to yaml timeout"); fail += 1; }
     }
     // sort by a column (just exercise the path; ordering of the full table is host-dependent).
     send(&mut write_half, b"status | sort name | to json\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("\"name\":") && r.contains("shell"), "status | sort name: sorts the table"),
         None    => { println!("shell-test: FAIL — status|sort timeout"); fail += 1; }
     }
@@ -210,13 +210,13 @@ pub fn run(image_path: &Path, smp: u32) {
     // starter-pack: echo / about / mem / caps (self)
     // -----------------------------------------------------------------------
     send(&mut write_half, b"echo PINGPONG42\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("PINGPONG42"), "echo: prints its argument"),
         None    => { println!("shell-test: FAIL — timed out after echo"); fail += 1; }
     }
 
     send(&mut write_half, b"about\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => {
             check!(r.contains("GodspeedOS"), "about: identity line");
             check!(r.contains("Bankole Ogundero"), "about: creator credit");
@@ -225,7 +225,7 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     send(&mut write_half, b"mem\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("mem:") && r.contains("total"), "mem: reports usage"),
         None    => { println!("shell-test: FAIL — timed out after mem"); fail += 1; }
     }
@@ -234,19 +234,19 @@ pub fn run(image_path: &Path, smp: u32) {
     // Default form is a full timestamp `Wkd YYYY-MM-DD HH:MM:SS`; `date epoch`
     // prints epoch seconds (digits, no date/time separators).
     send(&mut write_half, b"date\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains('-') && r.contains(':'), "date: full timestamp"),
         None    => { println!("shell-test: FAIL — timed out after date"); fail += 1; }
     }
 
     send(&mut write_half, b"date epoch\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.chars().any(|c| c.is_ascii_digit()), "date epoch: seconds since 1970"),
         None    => { println!("shell-test: FAIL — timed out after date epoch"); fail += 1; }
     }
 
     send(&mut write_half, b"caps\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("caps for shell"), "caps (no arg): shows this shell"),
         None    => { println!("shell-test: FAIL — timed out after caps (self)"); fail += 1; }
     }
@@ -255,7 +255,7 @@ pub fn run(image_path: &Path, smp: u32) {
     // unknown command
     // -----------------------------------------------------------------------
     send(&mut write_half, b"xyzzy\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("unknown: xyzzy"), "unknown command error"),
         None    => { println!("shell-test: FAIL — timed out after unknown command"); fail += 1; }
     }
@@ -264,7 +264,7 @@ pub fn run(image_path: &Path, smp: u32) {
     // observe now — the shell brokers a one-shot observe-now service that prints
     // a static metrics frame. Its output is ASYNCHRONOUS (the prompt returns
     // before observe-now is scheduled), so wait on observe's own summary line
-    // rather than on gs>. This also exercises the gated introspection path
+    // rather than on gsh>. This also exercises the gated introspection path
     // (observe-now holds the INTROSPECT cap; task_stat/inspect_* succeed).
     // -----------------------------------------------------------------------
     send(&mut write_half, b"observe now\r");
@@ -285,19 +285,19 @@ pub fn run(image_path: &Path, smp: u32) {
     // itself must appear in the list.
     // -----------------------------------------------------------------------
     // The observe-now step stopped reading at the table header, so its trailing
-    // `gs>` prompt is still in the stream — absorb it before issuing caps.
-    let _ = collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5));
+    // `gsh>` prompt is still in the stream — absorb it before issuing caps.
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5));
 
     // observe now as a record producer (docs/records.md): the only PIPEABLE form (bare
     // `observe` is the live loop). Carries the `ticks` (cumulative cpu-time) column status omits.
     send(&mut write_half, b"observe now | to json\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(10)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)) {
         Some(r) => check!(r.contains("\"ticks\":") && r.contains("\"name\":"),
                           "observe record: now | to json carries the ticks column"),
         None    => { println!("shell-test: FAIL — observe now|to json timeout"); fail += 1; }
     }
     send(&mut write_half, b"observe now | select name ticks | to json\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(10)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)) {
         Some(r) => check!(r.contains("\"ticks\":") && r.contains("\"name\":") && !r.contains("\"core\":"),
                           "observe record: select name ticks projects the metric columns"),
         None    => { println!("shell-test: FAIL — observe now|select timeout"); fail += 1; }
@@ -305,13 +305,13 @@ pub fn run(image_path: &Path, smp: u32) {
     // The live loop must REFUSE to be piped (it owns the screen and never yields a stream),
     // loudly — not hang the shell waiting on a recv that never comes.
     send(&mut write_half, b"observe | sort reverse ticks\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(10)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)) {
         Some(r) => check!(r.contains("live view can't be piped"),
                           "observe record: bare live observe refuses to be piped (loud)"),
         None    => { println!("shell-test: FAIL — observe pipe-refusal timeout"); fail += 1; }
     }
     send(&mut write_half, b"caps shell\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => {
             check!(r.contains("caps for shell"), "caps: header");
             check!(r.contains("introspect"), "caps: lists introspect cap");
@@ -330,7 +330,7 @@ pub fn run(image_path: &Path, smp: u32) {
     // word "spawn" reappears here and this fails.
     // -----------------------------------------------------------------------
     send(&mut write_half, b"caps logger\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => {
             check!(r.contains("caps for logger"), "caps logger: header");
             check!(!r.contains("spawn"), "least-privilege: logger does NOT hold spawn");
@@ -340,14 +340,14 @@ pub fn run(image_path: &Path, smp: u32) {
 
     // caps as a record producer (docs/records.md): piped, it emits resource/rights rows.
     send(&mut write_half, b"caps | to json\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("\"resource\":") && r.contains("\"rights\":"),
                           "caps record: to json renders resource/rights"),
         None    => { println!("shell-test: FAIL — caps|to json timeout"); fail += 1; }
     }
     // where on the resource column: the shell holds the spawn cap, so this keeps a row.
     send(&mut write_half, b"caps | where resource=spawn\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("spawn") && r.contains("resource"),
                           "caps record: where resource=spawn keeps the spawn cap"),
         None    => { println!("shell-test: FAIL — caps|where timeout"); fail += 1; }
@@ -358,7 +358,7 @@ pub fn run(image_path: &Path, smp: u32) {
     // supervisor) must be refused, so the shell can't create a duplicate TCB.
     // -----------------------------------------------------------------------
     send(&mut write_half, b"spawn supervisor\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("Core services") && r.contains("protected"),
                           "spawn: trusted-root refused with reason"),
         None    => { println!("shell-test: FAIL — timed out after spawn supervisor"); fail += 1; }
@@ -369,7 +369,7 @@ pub fn run(image_path: &Path, smp: u32) {
     // with a real example per usage row and a creator credit in `version`.
     // -----------------------------------------------------------------------
     send(&mut write_half, b"write help\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => {
             check!(r.contains("write 0.1.0") && r.contains("overwrite"), "write help: header + version");
             check!(r.contains("<path>") && r.contains("e.g.") && r.contains("buy milk"), "write help: placeholder + real example");
@@ -377,34 +377,34 @@ pub fn run(image_path: &Path, smp: u32) {
         None => { println!("shell-test: FAIL — timed out after `write help`  [×2]"); fail += 2; }
     }
     send(&mut write_half, b"ls version\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("ls 0.1.0") && r.contains("Created by Bankole Ogundero"), "ls version: number + creator credit"),
         None    => { println!("shell-test: FAIL — timed out after `ls version`"); fail += 1; }
     }
     send(&mut write_half, b"drives flash help\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("drives flash") && r.contains("drives flash 0 data"), "subcommand help: drives flash help + example"),
         None    => { println!("shell-test: FAIL — timed out after `drives flash help`"); fail += 1; }
     }
     // Record-pipe verbs self-document too (utilities/31_records.md): they are pipe-only
     // stages, but `<verb> help` / `<verb> version` still resolve via the UTILS intercept.
     send(&mut write_half, b"where help\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("where 0.1.0") && r.contains("status | where mem>0"), "where help: header + real example"),
         None    => { println!("shell-test: FAIL — timed out after `where help`"); fail += 1; }
     }
     send(&mut write_half, b"to help\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("to 0.1.0") && r.contains("to json") && r.contains("to yaml"), "to help: header + json/yaml rows"),
         None    => { println!("shell-test: FAIL — timed out after `to help`"); fail += 1; }
     }
     send(&mut write_half, b"from version\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("from 0.1.0") && r.contains("Created by Bankole Ogundero"), "from version: number + creator credit"),
         None    => { println!("shell-test: FAIL — timed out after `from version`"); fail += 1; }
     }
     send(&mut write_half, b"select help\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("select 0.1.0") && r.contains("status | select name core state"), "select help: header + real example"),
         None    => { println!("shell-test: FAIL — timed out after `select help`"); fail += 1; }
     }
@@ -412,12 +412,12 @@ pub fn run(image_path: &Path, smp: u32) {
     // its categorised list carries the version header (rule 6), and `help help` / `help version`
     // resolve like any other utility.
     send(&mut write_half, b"help version\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("help 0.1.0") && r.contains("Created by Bankole Ogundero"), "help version: number + creator credit"),
         None    => { println!("shell-test: FAIL — timed out after `help version`"); fail += 1; }
     }
     send(&mut write_half, b"help help\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("help 0.1.0") && r.contains("<command> help"), "help help: header + per-command hint"),
         None    => { println!("shell-test: FAIL — timed out after `help help`"); fail += 1; }
     }
@@ -429,9 +429,9 @@ pub fn run(image_path: &Path, smp: u32) {
     // The arrow arrives as the ESC [ A sequence (same bytes the USB keyboard now emits).
     // -----------------------------------------------------------------------
     send(&mut write_half, b"cores\r");
-    let _ = collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5));
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5));
     send(&mut write_half, b"\x1b[A\r"); // Up arrow, then Enter
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(5)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains(&format!("cores: {smp}")), "up-arrow history: recalled + ran the previous command"),
         None    => { println!("shell-test: FAIL — timed out after up-arrow history"); fail += 1; }
     }
@@ -515,16 +515,16 @@ pub fn run_drives(image_path: &Path, persist_path: &str, smp: u32) {
     }
 
     // Boot complete.
-    if collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(40)).is_none() {
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).is_none() {
         let got = { String::from_utf8_lossy(&buf.lock().unwrap()).into_owned() };
-        println!("drives-test: FAIL — timed out waiting for first gs>\n{got}");
+        println!("drives-test: FAIL — timed out waiting for first gsh>\n{got}");
         child.kill().ok(); child.wait().ok();
         std::process::exit(1);
     }
 
     // 1. `drives` — a raw, unformatted disk.
     send(&mut write_half, b"drives\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(10)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)) {
         Some(r) => check!(r.contains("raw") && r.contains("not formatted"), "drives: raw disk listed"),
         None    => { println!("drives-test: FAIL — timed out after `drives`"); fail += 1; }
     }
@@ -535,7 +535,7 @@ pub fn run_drives(image_path: &Path, persist_path: &str, smp: u32) {
         Some(_) => {
             check!(true, "flash: destructive [y/N] confirm shown");
             send(&mut write_half, b"y\r");
-            match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(20)) {
+            match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)) {
                 Some(r) => check!(r.contains("formatted as GSFS"), "flash: formatted over IPC"),
                 None    => { println!("drives-test: FAIL — timed out after confirm"); fail += 1; }
             }
@@ -545,7 +545,7 @@ pub fn run_drives(image_path: &Path, persist_path: &str, smp: u32) {
 
     // 3. `drives` — now a mounted GSFS labelled 'data'.
     send(&mut write_half, b"drives\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(10)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)) {
         Some(r) => {
             check!(r.contains("GSFS"), "drives: now formatted GSFS");
             check!(r.contains("data"), "drives: label 'data' shown");
@@ -555,12 +555,12 @@ pub fn run_drives(image_path: &Path, persist_path: &str, smp: u32) {
 
     // 4. `drives label archive` — rename, then confirm it stuck.
     send(&mut write_half, b"drives label archive\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(10)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)) {
         Some(r) => check!(r.contains("labelled 'archive'"), "label: rename acknowledged"),
         None    => { println!("drives-test: FAIL — timed out after `drives label`"); fail += 1; }
     }
     send(&mut write_half, b"drives\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(10)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)) {
         Some(r) => check!(r.contains("archive"), "label: new label 'archive' listed"),
         None    => { println!("drives-test: FAIL — timed out after `drives` (3)"); fail += 1; }
     }
@@ -570,7 +570,7 @@ pub fn run_drives(image_path: &Path, persist_path: &str, smp: u32) {
     match collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(10)) {
         Some(_) => {
             send(&mut write_half, b"y\r");
-            match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(15)) {
+            match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
                 Some(r) => check!(r.contains("reset to raw"), "reset: un-formatted to raw"),
                 None    => { println!("drives-test: FAIL — timed out after reset confirm"); fail += 1; }
             }
@@ -578,7 +578,7 @@ pub fn run_drives(image_path: &Path, persist_path: &str, smp: u32) {
         None => { println!("drives-test: FAIL — reset: no [y/N] confirm"); fail += 1; }
     }
     send(&mut write_half, b"drives\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(10)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)) {
         Some(r) => check!(r.contains("raw") && r.contains("not formatted"), "reset: drive now raw"),
         None    => { println!("drives-test: FAIL — timed out after `drives` (4)"); fail += 1; }
     }
@@ -656,13 +656,13 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     macro_rules! run {
         ($c:expr, $secs:expr) => {{
             send(&mut write_half, $c);
-            collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs($secs))
+            collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs))
         }};
     }
 
-    if collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(40)).is_none() {
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).is_none() {
         let got = { String::from_utf8_lossy(&buf.lock().unwrap()).into_owned() };
-        println!("files-test: FAIL — timed out waiting for first gs>\n{got}");
+        println!("files-test: FAIL — timed out waiting for first gsh>\n{got}");
         child.kill().ok(); child.wait().ok();
         std::process::exit(1);
     }
@@ -671,7 +671,7 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     send(&mut write_half, b"drives flash data\r");
     if collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(10)).is_some() {
         send(&mut write_half, b"y\r");
-        match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(20)) {
+        match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)) {
             Some(r) => check!(r.contains("formatted as GSFS"), "setup: flashed GSFS"),
             None    => { println!("files-test: FAIL — flash timeout"); fail += 1; }
         }
@@ -1464,9 +1464,9 @@ pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u3
     let mut fail = 0usize;
     let mut cursor = 0usize;
 
-    if collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(40)).is_none() {
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).is_none() {
         let got = { String::from_utf8_lossy(&buf.lock().unwrap()).into_owned() };
-        println!("script-test: FAIL — timed out waiting for first gs>\n{got}");
+        println!("script-test: FAIL — timed out waiting for first gsh>\n{got}");
         child.kill().ok(); child.wait().ok();
         std::process::exit(1);
     }
@@ -1474,7 +1474,7 @@ pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u3
     // Run the baked suite. The disk is GSFS (baked host-side), so the OS mounts it on boot and
     // /<script_name> is present — no on-device authoring.
     send(&mut write_half, format!("run /{script_name}\r").as_bytes());
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(30)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)) {
         Some(r) => {
             println!("\n=== baked suite transcript ===\n{}\n=== end ===", r.trim());
             // Green iff the run summary is "failed 0" AND no assert printed a FAILED line.
@@ -1492,7 +1492,7 @@ pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u3
     // `drives flash`es the SSD, then types `selfcheck`. The big suite + many service spawns
     // take a while under TCG, so allow a generous wall-clock window.
     send(&mut write_half, b"selfcheck\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(150)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(150)) {
         Some(r) => {
             if r.contains("failed 0") && !r.contains("FAILED") {
                 println!("script-test: PASS — embedded `selfcheck` ran green (failed 0)"); pass += 1;

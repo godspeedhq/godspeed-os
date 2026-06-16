@@ -175,7 +175,7 @@ pub fn put_byte(b: u8) {
 }
 
 /// Write a whole byte sequence under a SINGLE lock, then flush once. Used by the
-/// console path so a multi-byte write (e.g. the shell's `gs> ` prompt) is atomic
+/// console path so a multi-byte write (e.g. the shell's `gsh> ` prompt) is atomic
 /// with respect to another core's console output — no byte from another core can
 /// interleave mid-string.
 pub fn put_bytes(bytes: &[u8]) {
@@ -193,7 +193,7 @@ pub fn put_bytes(bytes: &[u8]) {
 /// the FB lock is released. The framebuffer is mapped write-combining (Limine's
 /// HHDM default); the lock's atomic release orders normal memory but NOT the WC
 /// store buffer. Without this, a scroll on one core can flush *after* the next
-/// line's first glyph drawn on another core — erasing it ("gs>" → " s>").
+/// line's first glyph drawn on another core — erasing it ("gsh>" → " s>").
 #[inline]
 fn wc_flush() {
     // SAFETY: SFENCE is always valid in any privilege level; it only orders stores.
@@ -398,7 +398,7 @@ fn draw_cursor(s: &mut Fb) {
 /// remembered position — not the current write position — is what stops a
 /// carriage return from blanking real text: after `\r` moves the column to 0 over
 /// existing characters, the cursor is still erased at its old cell, leaving the
-/// text (the `g` of `gs>`) intact.
+/// text (the `g` of `gsh>`) intact.
 fn erase_cursor(s: &Fb) {
     draw_glyph(s, b' ', s.cur_col, s.cur_row);
 }

@@ -27,7 +27,7 @@ every live scheduler slot. It reports raw facts and renders no health verdict
 ## 3. Output
 
 ```
-gs> status
+gsh> status
 SLOT  NAME               CORE STATE
 0     init               C0   BlockRecv
 1     supervisor         C0   BlockRecv

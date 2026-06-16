@@ -109,7 +109,7 @@ pub fn run(image_path: &Path, smp: u32) {
 pub fn run_shell(image_path: &Path, smp: u32) {
     let qemu = qemu_binary();
 
-    println!("shell: launching QEMU (smp={smp}) — type 'help' at the gs> prompt");
+    println!("shell: launching QEMU (smp={smp}) — type 'help' at the gsh> prompt");
     println!("shell: press Ctrl-A X to quit QEMU");
 
     let image_str = image_path.to_string_lossy().replace('\\', "/");

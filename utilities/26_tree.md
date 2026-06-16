@@ -37,7 +37,7 @@ usage:
 Example:
 
 ```
-gs> tree /docs
+gsh> tree /docs
 /docs/
   a.txt
   sub/

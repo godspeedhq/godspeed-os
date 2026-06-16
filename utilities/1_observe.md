@@ -25,7 +25,7 @@ apart is deliberate: `observe` = *what is happening*; `status` = *is it healthy*
 | Command | Meaning |
 |---|---|
 | `observe` | **Continuous** live-refreshing view. Repaints in place until you press `q`. |
-| `observe now` | **Static** one-shot frame. Prints once, returns to `gs>`. |
+| `observe now` | **Static** one-shot frame. Prints once, returns to `gsh>`. |
 | `observe help` | Usage for the utility (modes, subcommands, version header). |
 | `observe now help` | Usage for the static subcommand (what the columns mean). |
 | `observe version` | Prints `observe 0.1.0`. |
@@ -150,7 +150,7 @@ user presses **`q`**. Any other key is ignored.
 
 ### 5.2 Exit behaviour (decided)
 
-On `q`: stop refreshing, **leave the last frame on screen**, print `gs>` beneath
+On `q`: stop refreshing, **leave the last frame on screen**, print `gsh>` beneath
 it. The display does NOT vanish. Rationale: (a) the framebuffer console has no
 alternate-screen buffer to restore from, so htop-style "restore previous screen"
 is not a capability that exists; (b) the final frame persisting on the TV is

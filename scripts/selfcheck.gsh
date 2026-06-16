@@ -1,5 +1,5 @@
 # GodspeedOS extensive self-check suite.
-# Run it with:  gs> selfcheck      (runs this embedded suite IN MEMORY — no disk write,
+# Run it with:  gsh> selfcheck      (runs this embedded suite IN MEMORY — no disk write,
 # so it is not capped by the on-disk file size; it just needs a flashed GSFS drive for
 # the file-command tests). Passes iff the summary says "failed 0".
 #
