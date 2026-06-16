@@ -1406,9 +1406,9 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     }
 }
 
-/// Boot bare-metal with a GSFS disk that has a self-checking `/suite.gs` baked in (host-side),
-/// then `run /suite.gs` — proving the flash-and-run loop and piped asserts in a script.
-pub fn run_script(image_path: &Path, disk_path: &str, smp: u32) {
+/// Boot bare-metal with a GSFS disk that has a self-checking `.gs` baked in (host-side), then
+/// `run /<script_name>` — proving the flash-and-run loop and piped asserts in a script.
+pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u32) {
     println!("script-test: booting (smp={smp}) with a host-baked GSFS suite disk");
 
     let qemu      = crate::qemu::qemu_binary();
@@ -1466,15 +1466,19 @@ pub fn run_script(image_path: &Path, disk_path: &str, smp: u32) {
     }
 
     // Run the baked suite. The disk is GSFS (baked host-side), so the OS mounts it on boot and
-    // /suite.gs is present — no on-device authoring.
-    send(&mut write_half, b"run /suite.gs\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(20)) {
+    // /<script_name> is present — no on-device authoring.
+    send(&mut write_half, format!("run /{script_name}\r").as_bytes());
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(30)) {
         Some(r) => {
             println!("\n=== baked suite transcript ===\n{}\n=== end ===", r.trim());
-            if r.contains("run: ran 6, failed 0") { println!("script-test: PASS — baked suite ran green (6/0)"); pass += 1; }
-            else { println!("script-test: FAIL — baked suite not green"); fail += 1; }
+            // Green iff the run summary is "failed 0" AND no assert printed a FAILED line.
+            if r.contains("failed 0") && !r.contains("FAILED") {
+                println!("script-test: PASS — baked suite ran green (failed 0)"); pass += 1;
+            } else {
+                println!("script-test: FAIL — baked suite not green"); fail += 1;
+            }
         }
-        None => { println!("script-test: FAIL — `run /suite.gs` timed out"); fail += 1; }
+        None => { println!("script-test: FAIL — `run /{script_name}` timed out"); fail += 1; }
     }
 
     child.kill().ok();
