@@ -1481,6 +1481,22 @@ pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u3
         None => { println!("script-test: FAIL — `run /{script_name}` timed out"); fail += 1; }
     }
 
+    // Embed-and-autoprovision: `selfcheck` writes the shell-embedded suite to the disk
+    // (no host bake) and runs it — proving the one-USB hardware path where the operator
+    // flashes only os.img, `drives flash`es the SSD, then types `selfcheck`.
+    send(&mut write_half, b"selfcheck\r");
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(40)) {
+        Some(r) => {
+            if r.contains("failed 0") && !r.contains("FAILED") {
+                println!("script-test: PASS — embedded `selfcheck` ran green (failed 0)"); pass += 1;
+            } else {
+                println!("\n=== selfcheck transcript ===\n{}\n=== end ===", r.trim());
+                println!("script-test: FAIL — embedded `selfcheck` not green"); fail += 1;
+            }
+        }
+        None => { println!("script-test: FAIL — `selfcheck` timed out"); fail += 1; }
+    }
+
     child.kill().ok();
     child.wait().ok();
     println!("\nscript-test: {pass} passed, {fail} failed");
