@@ -435,6 +435,8 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
                 cmd_run(ctx, cwd, args[1], depth)
             };
         }
+        // `selfcheck` — write the embedded suite to the GSFS drive and run it (one-USB checkpoint).
+        "selfcheck" => return cmd_selfcheck(ctx, cwd, depth),
         _ => {}
     }
 
@@ -602,6 +604,34 @@ fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8) -> Result<
     if failed == 0 { Ok(()) } else { Err(ShellError::Unknown) }
 }
 
+/// The self-check suite, embedded in the shell binary (so it ships with the boot image — no
+/// host-side `dd` of a data disk). `selfcheck` writes it to the mounted GSFS and runs it.
+const SELFCHECK_GS: &str = include_str!("../../../scripts/t630_selfcheck.gs");
+
+/// `selfcheck` — provision + run the embedded self-check suite in one step: write
+/// `/t630_selfcheck.gs` to the mounted GSFS drive, then `run` it. The one-USB hardware checkpoint
+/// — flash the boot image, (`drives flash` a drive if it's raw), `selfcheck`. Re-runnable; you can
+/// also `run /t630_selfcheck.gs` afterwards. Refused inside a script (it would nest `run`).
+#[inline(never)]
+fn cmd_selfcheck(ctx: &ServiceContext, cwd: &mut Cwd, depth: u8) -> Result<(), ShellError> {
+    if depth > 0 {
+        ctx.console_writeln("selfcheck: not available inside a script (it runs one)");
+        return Err(ShellError::Unknown);
+    }
+    let path = b"/t630_selfcheck.gs";
+    match fs_request(ctx, OP_WRITE_FILE, path, SELFCHECK_GS.as_bytes()) {
+        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {}
+        Some(r) if no_fs(ctx, r.payload_bytes()) => return Err(ShellError::Unknown),
+        Some(_) => {
+            ctx.console_writeln("selfcheck: could not write the suite — is a drive flashed? ('drives flash')");
+            return Err(ShellError::Unknown);
+        }
+        None => { ctx.console_writeln("selfcheck: storage unavailable (no disk?)"); return Err(ShellError::Unknown); }
+    }
+    ctx.console_writeln_fmt(format_args!("selfcheck: wrote /t630_selfcheck.gs ({} bytes) — running...", SELFCHECK_GS.len()));
+    cmd_run(ctx, cwd, "/t630_selfcheck.gs", depth)
+}
+
 /// `assert ok <cmd>` / `assert fails <cmd>` — the **result** form: run `<cmd>` and check that it
 /// succeeded (`ok`) or failed (`fails`). The assertion holds → `Ok` + `assert: ok`; it doesn't →
 /// `Err(AssertFailed)` + a `FAILED` line. This is the negative-test surface (§22's negative cases
@@ -655,7 +685,7 @@ const UTIL_VERSION: &str = "0.1.0";
 
 /// Utilities that self-document (gates the `help`/`version` intercept in `execute`).
 const UTILS: &[&str] = &[
-    "help", "result", "run", "assert",
+    "help", "result", "run", "assert", "selfcheck",
     "echo", "clear", "about", "mem", "cores", "date", "status", "observe", "caps",
     "spawn", "kill", "restart", "reboot", "drives", "ls", "cd", "read", "write",
     "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count", "sort",
@@ -705,6 +735,9 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "run" => help_block(ctx, "run", "run a script of commands from a file", &[
             ("run <path>", "execute each line/command as if typed; reports ran N, failed M", "run /suite.gs"),
             ("# … (in the file)", "lines starting with # are comments; ';' separates commands", "run /test.gs"),
+        ], true),
+        "selfcheck" => help_block(ctx, "selfcheck", "run the built-in self-check suite (needs a flashed drive)", &[
+            ("selfcheck", "write the embedded suite to the drive and run it", "selfcheck"),
         ], true),
         "assert" => help_block(ctx, "assert", "verify a result or output; Ok if it holds, else Err", &[
             ("assert ok <command>", "the command must succeed", "assert ok read /notes.txt"),
@@ -900,6 +933,7 @@ fn cmd_help(ctx: &ServiceContext) -> Result<(), ShellError> {
     help_line(ctx, "echo <text>", "print text");
     help_line(ctx, "result", "the last command's result (Ok / Err)");
     help_line(ctx, "run <script>", "run a script of commands (.gs; # comments, ; separators)");
+    help_line(ctx, "selfcheck", "run the built-in self-check suite");
     help_line(ctx, "assert ok|fails <cmd>", "verify success/failure (also: … | assert contains X)");
     ctx.console_writeln("");
     ctx.console_writeln("System");
