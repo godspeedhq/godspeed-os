@@ -428,6 +428,10 @@ fn toggle_cursor_blink() {
         draw_glyph(&s, b'_', c, r);
         s.blink_shown = true;
     }
+    // The framebuffer is write-combining: a lone one-cell `draw_glyph` would otherwise sit in
+    // the store buffer and never reach the panel until the next console write. Flush it so the
+    // blink is actually visible (the byte-sequence writers flush for the same reason).
+    wc_flush();
 }
 
 /// Erase the cursor at the cell where it was last drawn (blank it). Using the
