@@ -11,13 +11,13 @@ Every shell command now produces a **`Result`** — Rust's, not a POSIX exit cod
 `Ok`; failure is `Err(ShellError)`. `result` prints the **previous** command's result:
 
 ```
-gs> read /notes.txt
+gsh> read /notes.txt
 …contents…
-gs> result
+gsh> result
 Ok
-gs> read /nope
+gsh> read /nope
 read: not found: /nope
-gs> result
+gsh> result
 Err(FileNotFound)
 ```
 

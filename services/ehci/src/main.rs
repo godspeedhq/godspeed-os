@@ -704,7 +704,7 @@ fn poll_devices(
 ) -> usize {
     let n = devs.len();
     ctx.log_fmt(format_args!(
-        "ehci: polling {} device(s) — type at the gs> prompt; mouse events log here", n));
+        "ehci: polling {} device(s) — type at the gsh> prompt; mouse events log here", n));
 
     // Build a ring of one QH per device, each with an interrupt-IN qTD armed.
     for i in 0..n {
@@ -791,7 +791,7 @@ const DISCONNECT_ERR_THRESHOLD: u32 = 250;
 /// prompt by injecting a newline into the input ring (which this driver already
 /// feeds). The notice is async output that would otherwise leave the prompt
 /// scrolled up; the leading "\n" starts it on its own line and the injected
-/// newline supplies the terminating break + triggers a fresh `gs> `.
+/// newline supplies the terminating break + triggers a fresh `gsh> `.
 fn notify(ctx: &ServiceContext, msg: &str) {
     // Leading "\n " — the space is sacrificial: the framebuffer drops the first
     // glyph drawn on a freshly-scrolled line, so we let it eat a space, not the

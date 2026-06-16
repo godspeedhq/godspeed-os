@@ -130,7 +130,7 @@ fn wait_for_port(ctx: &ServiceContext, mmio: &Mmio, op: usize, max_ports: u32) {
 /// Print a hot-plug notice on the console, then nudge the shell to redraw its
 /// prompt. The notice is asynchronous output that lands wherever the cursor was,
 /// leaving the prompt scrolled up; injecting a newline into the input ring (which
-/// this driver already feeds) makes the shell print a fresh `gs> `. The leading
+/// this driver already feeds) makes the shell print a fresh `gsh> `. The leading
 /// "\n" starts the notice on its own line; the injected newline supplies the
 /// terminating line break, so there is no blank line.
 fn notify(ctx: &ServiceContext, msg: &str) {

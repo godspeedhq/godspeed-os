@@ -148,7 +148,7 @@ fn handle_log(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 /// arg0 = cap_slot, arg1 = pointer to UTF-8 bytes, arg2 = byte length.
 ///
 /// Requires `Rights::WRITE` on `LOG_WRITE_RESOURCE`. For inline console output
-/// such as the shell prompt (`gs> `), where a newline would push typed input to
+/// such as the shell prompt (`gsh> `), where a newline would push typed input to
 /// the next line.
 fn handle_print(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::WRITE) {

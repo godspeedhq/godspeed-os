@@ -7,9 +7,9 @@
 //! verbs operate on a real field with **no JSON round-trip**:
 //!
 //! ```text
-//! gs> roster | where role=core
-//! gs> roster | sort reverse core | select name core
-//! gs> roster | to json            (records → JSON only at the edge, if you want it)
+//! gsh> roster | where role=core
+//! gsh> roster | sort reverse core | select name core
+//! gsh> roster | to json            (records → JSON only at the edge, if you want it)
 //! ```
 //!
 //! Like `greet`, `roster` declares **no** send peers — its only way out is the SEND cap the shell

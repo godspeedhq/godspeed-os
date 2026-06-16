@@ -113,7 +113,7 @@ UUID. Identity (label) names it; location (index) disambiguates when identity re
 - `drives` flags a duplicated label so you can see it (and relabel with
   `drives label N <new>` if you want a unique name), but it is never *required*:
   ```
-  gs> drives
+  gsh> drives
     #  LABEL      STATUS     …
     0  data       mounted    …
     1  data  (2)  mounted    …   ← duplicate label; address as 0:data / 1:data
@@ -141,58 +141,58 @@ UUID. Identity (label) names it; location (index) disambiguates when identity re
 `<drive> = index | label | index:label` (§4.1/§4.2). No `mount`/`use` — the current
 location is a `cd` pointer (§4 note, `utilities/15_drives.md` §3.2).
 
-## 6. How it looks (`gs>` mockups)
+## 6. How it looks (`gsh>` mockups)
 
 Flash and use a raw drive — immediately, no reboot:
 
 ```
-gs> drives
+gsh> drives
   #  LABEL      STATUS     SIZE      CONTENTS                   USE
   0  —          raw        16 MiB    — not formatted —
 
-gs> drives flash 0 data
+gsh> drives flash 0 data
   This ERASES drive 0 (QEMU HARDDISK, 16 MiB). Continue? [y/N] y
   drives: formatting drive 0 as GSFS, label 'data' … done
   drives: drive 0 mounted — ready to use now (no reboot needed)
 
-gs> mkdir projects
+gsh> mkdir projects
   fs: created /projects
-gs> write projects/notes.txt "works immediately"
+gsh> write projects/notes.txt "works immediately"
   fs: wrote /projects/notes.txt (18 bytes)
 
-gs> drives use default 0
+gsh> drives use default 0
   drives: 'data' is now the default — auto-mounts on every boot
 ```
 
 Multiple drives, paths, duplicate labels, mount vs use:
 
 ```
-gs> drives
+gsh> drives
   #  LABEL      STATUS     SIZE      CONTENTS                   USE
   0  data       mounted    16 MiB    GSFS · 5 files · 32k free    * default · current
   1  data  (2)  flashed    32 MiB    GSFS · 1 file  · 65k free    (not mounted)
   2  archive    raw        8 MiB     — not formatted —
 
-gs> drives mount 1:data
+gsh> drives mount 1:data
   drives: 1:data mounted (read/list only; current is still 0:data)
 
-gs> ls 1:data/backups
+gsh> ls 1:data/backups
   NAME           SIZE
   2026-06.tar    40 KiB
 
-gs> cat 0:data/projects/notes.txt
+gsh> cat 0:data/projects/notes.txt
   works immediately
 
-gs> drives use 1:data
+gsh> drives use 1:data
   drives: current drive → 1:data (default 0:data restores on reboot)
 ```
 
 Replug-safety (identity over location):
 
 ```
-gs> drives use archive          # by label
+gsh> drives use archive          # by label
    …unplug drive, move to another SATA port, replug…
-gs> drives                       # the index changed; the label did not
+gsh> drives                       # the index changed; the label did not
   #  LABEL      STATUS     SIZE   …
   0  archive    flashed    8 MiB  …     ← was #2, now #0; still "archive"
 ```

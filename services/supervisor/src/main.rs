@@ -30,7 +30,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // (perf-bp2 on core 0 ⇄ perf-bp2-echo on core 1) so echo is not starved by
     // the ping→pong flood on core 1 — gives clean, fast BP2 latency numbers.
     // Skipped in perf-iso: per-probe isolation builds run one benchmark alone.
-    // Skipped in bare-metal: the USB-boot image settles at a quiet `gs>` prompt.
+    // Skipped in bare-metal: the USB-boot image settles at a quiet `gsh>` prompt.
     // ping/pong are demo services (examples/) — spawn them on demand from the
     // shell (`spawn pong` then `spawn ping`) when you want the cross-core demo.
     #[cfg(not(any(feature = "bare-metal", feature = "idle-only", feature = "bp2-only", feature = "perf-iso")))]
@@ -91,7 +91,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // observe: spawn in full (osdev run) builds only. Excluded from test-specific
     // builds (its 224-slot scan every 500 yields adds timing noise) and from
     // bare-metal — its periodic table dump would keep the display scrolling, but
-    // the USB image rests at `gs>`. Run `observe` from the shell on demand.
+    // the USB image rests at `gsh>`. Run `observe` from the shell on demand.
     #[cfg(not(any(feature = "bare-metal", feature = "identity-only", feature = "perf-only",
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",

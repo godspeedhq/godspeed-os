@@ -14,7 +14,7 @@ runner**, deliberately **not** a scripting *language* (no variables, no `if`/`wh
 far-future, Appendix D).
 
 ```
-gs> run /suite.gsh
+gsh> run /suite.gsh
 > read /lsr/big.txt
 hello world
 > result

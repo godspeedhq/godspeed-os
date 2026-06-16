@@ -9,7 +9,7 @@
 ## 1. Purpose
 
 `clear` wipes the console and returns the cursor to the top, then the shell
-reprints `gs> ` beneath. For tidying the screen after scrolling output.
+reprints `gsh> ` beneath. For tidying the screen after scrolling output.
 
 ## 2. Invocation
 

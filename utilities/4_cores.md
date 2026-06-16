@@ -21,7 +21,7 @@ lifetime.
 ## 3. Output
 
 ```
-gs> cores
+gsh> cores
 cores: 4
 ```
 

@@ -37,7 +37,7 @@ usage:
 Example:
 
 ```
-gs> find *.txt
+gsh> find *.txt
   /docs/inside.txt
   /docs/sub/note.txt
   find: 2 match(es)

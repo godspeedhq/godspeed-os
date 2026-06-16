@@ -13,7 +13,7 @@ There is **one console stream**, and everything dumps to it. The kernel's
 `kprintln`, every service's `ctx.log`/`ctx.print`, the xhci driver's progress,
 and the shell's prompt all write the same append-only stream that is mirrored to
 **both** the serial port and the framebuffer (TV). So the interactive prompt
-fights with asynchronous log output: `gs>` and `xhci: keyboard ready` race for
+fights with asynchronous log output: `gsh>` and `xhci: keyboard ready` race for
 the bottom of the screen, `observe now` output interleaves with whatever else is
 logging, and there is no way for a full-screen view to own the display.
 

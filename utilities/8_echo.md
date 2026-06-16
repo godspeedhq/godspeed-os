@@ -24,7 +24,7 @@ into words — so spacing inside the text is preserved as typed.
 ## 3. Output
 
 ```
-gs> echo hello from the shell
+gsh> echo hello from the shell
 hello from the shell
 ```
 

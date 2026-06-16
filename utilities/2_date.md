@@ -26,9 +26,9 @@ exactly what it is: seconds since the 1970 reference point.
 ## 3. Output
 
 ```
-gs> date
+gsh> date
 Sat 2026-06-06 23:45:08
-gs> date epoch
+gsh> date epoch
 1780789511
 ```
 

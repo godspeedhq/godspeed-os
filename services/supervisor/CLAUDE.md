@@ -24,11 +24,11 @@ The supervisor has mutually exclusive spawn-set features:
 | `adv-only`         | pong + ping + A1–A10 adversarial probes | `osdev image --mode adv`         |
 | `chaos-only`       | pong + ping + C2–C7 chaos probes        | `osdev image --mode chaos`       |
 | `fuzz-only`        | pong + ping + F1/F2/F5/F6/F7/F8 + BF1/BF2/BF5/BF6/BF7/BF8 fuzz probes | `osdev image --mode fuzz` |
-| `bare-metal`       | shell only — rests at a quiet `gs>`     | `osdev image` (USB boot)         |
+| `bare-metal`       | shell only — rests at a quiet `gsh>`     | `osdev image` (USB boot)         |
 
 The `bare-metal` feature exists because probe services require the QEMU control port (COM2/TCP:5555) to complete. Without it, probe-4b-send blocks permanently, and probe-hog runs `loop {}` starving core 0. On real hardware these probes would stall the system indefinitely.
 
-**Bare-metal also skips ping/pong/observe** so the USB image boots to a calm, static `gs>` prompt instead of an endless `pong: received`/`observe:` scroll — the right resting state for a usable OS with a display. ping and pong are demo services spawnable on demand from the shell (`spawn pong` then `spawn ping`). The §23 cross-core demo still runs under `osdev run`/QEMU.
+**Bare-metal also skips ping/pong/observe** so the USB image boots to a calm, static `gsh>` prompt instead of an endless `pong: received`/`observe:` scroll — the right resting state for a usable OS with a display. ping and pong are demo services spawnable on demand from the shell (`spawn pong` then `spawn ping`). The §23 cross-core demo still runs under `osdev run`/QEMU.
 
 Introspection is reached through shell **commands**, not raw spawn: `observe` (live full-screen view, `q` to quit) and `observe now` (one-shot frame). The bare `observe` *service* (probe_mode 0) is the `osdev run` serial-streaming build — it scrolls forever and ignores `q`, so the shell refuses `spawn observe`/`observe-now`/`observe-live` and points the user at the commands instead.
 

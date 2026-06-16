@@ -39,7 +39,7 @@ Evidence from `build/putty_serial_output.log` (clean boot, 2026-05-29):
   - `init: ready` follows the first userspace syscall
 - ✅ `init` spawns supervisor, registry, logger; all reach ready
 - ✅ supervisor spawns pong, ping, observe, shell; `supervisor: ready`
-- ✅ Interactive shell prompt `gs>` reachable on hardware
+- ✅ Interactive shell prompt `gsh>` reachable on hardware
 - ✅ Cross-core IPC runs continuously: `pong: received "1" … "40"+` (ping core 0 → pong core 1)
 - ✅ No kernel panic, no `#GP`, no `#PF`, no unhandled exception on any core
 - ✅ All four cores online (`kernel: 4 cores ready`)

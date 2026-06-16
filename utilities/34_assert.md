@@ -17,12 +17,12 @@ itself. Two forms, because tests check two different things:
 - **Content form** — *did the output contain the right thing?* (catches wrong-but-valid output)
 
 ```
-gs> assert ok read /notes.txt          # must succeed
+gsh> assert ok read /notes.txt          # must succeed
 assert: ok
-gs> assert fails read /nope            # must FAIL (a negative test)
+gsh> assert fails read /nope            # must FAIL (a negative test)
 read: not found: /nope
 assert: ok
-gs> roster | where role=core | assert contains vesta
+gsh> roster | where role=core | assert contains vesta
 assert: ok
 ```
 
@@ -68,7 +68,7 @@ assert ok    read /lsr/big.txt
 assert fails read /lsr/nope
 ```
 ```
-gs> run /check.gsh
+gsh> run /check.gsh
 > assert ok read /lsr/big.txt
 hello world
 assert: ok
