@@ -1871,7 +1871,12 @@ fn drain_service(ctx: &ServiceContext, svc: &str, input: Option<&[u8]>, out: &mu
                 let _ = ctx.send_by_handle(h, &Message::from_bytes(&[PIPE_EOT]));
             }
             None => {
-                ctx.console_writeln_fmt(format_args!("pipe: '{}' is not a filter (never registered)", svc));
+                // Distinct, honest wording: a registration TIMEOUT (filter never became ready) is
+                // not "not a filter". The new phrasing also tells stale-image runs apart — if this
+                // text ever changes on hardware, the new shell is running (§26.7 loud failure).
+                ctx.console_writeln_fmt(format_args!(
+                    "pipe: '{}' never registered an input endpoint (waited ~{}s) — not a filter, or it failed to start",
+                    svc, FILTER_WAIT_TICKS / 100));
                 let _ = ctx.kill(svc);
                 return false;
             }
@@ -1969,13 +1974,17 @@ fn lookup_sink(ctx: &ServiceContext, sink: &str) -> Option<CapHandle> {
     // yielding. Wait up to ~3 s of wall-clock, returning the instant the name appears.
     let core  = ctx.core_id();
     let start = ctx.inspect_core_total_ticks(core);
-    const MAX_TICKS: u64 = 300; // ~3 s at the 10 ms quantum
     loop {
         if let Some(h) = ctx.registry_lookup(sink) { return Some(h); }
-        if ctx.inspect_core_total_ticks(core).wrapping_sub(start) >= MAX_TICKS { return None; }
+        if ctx.inspect_core_total_ticks(core).wrapping_sub(start) >= FILTER_WAIT_TICKS { return None; }
         for _ in 0..50 { ctx.yield_cpu(); }
     }
 }
+
+/// How long `lookup_sink` waits (in 10 ms timer ticks, §9.1) for a freshly-spawned filter to
+/// register its input endpoint. ~5 s — comfortably over the observed worst-case first-run latency
+/// (~1 s) on the T630 under selfcheck load, with margin.
+const FILTER_WAIT_TICKS: u64 = 500;
 
 fn cmd_kill(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     if is_core_service(name) {
