@@ -1351,6 +1351,31 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL — ls result timeout"); fail += 1; }
     }
 
+    // ── service-control on the Result model: a protected core service is Err(Denied). ──
+    match run!(b"assert fails spawn supervisor\r", 10) {
+        Some(r) => check!(r.contains("assert: ok"), "result: spawn of a protected core service is Err (fails holds)"),
+        None    => { println!("files-test: FAIL — assert fails spawn timeout"); fail += 1; }
+    }
+    let _ = run!(b"spawn supervisor\r", 10);
+    match run!(b"result\r", 10) {
+        Some(r) => check!(r.contains("Err(Denied)"), "result: spawn supervisor → Err(Denied)"),
+        None    => { println!("files-test: FAIL — spawn result timeout"); fail += 1; }
+    }
+
+    // ── assert fails-with <Variant>: pin the SPECIFIC failure (precise negative test). ──
+    match run!(b"assert fails-with FileNotFound read /nope\r", 10) {
+        Some(r) => check!(r.contains("assert: ok"), "assert fails-with: holds on the exact variant"),
+        None    => { println!("files-test: FAIL — fails-with FileNotFound timeout"); fail += 1; }
+    }
+    match run!(b"assert fails-with Denied spawn supervisor\r", 10) {
+        Some(r) => check!(r.contains("assert: ok"), "assert fails-with: Denied for a protected spawn"),
+        None    => { println!("files-test: FAIL — fails-with Denied timeout"); fail += 1; }
+    }
+    match run!(b"assert fails-with Denied read /nope\r", 10) {
+        Some(r) => check!(r.contains("assert: FAILED"), "assert fails-with: FAILS when the variant is wrong (got FileNotFound)"),
+        None    => { println!("files-test: FAIL — fails-with wrong timeout"); fail += 1; }
+    }
+
     child.kill().ok();
     child.wait().ok();
     println!("\nfiles-test: {pass} passed, {fail} failed");

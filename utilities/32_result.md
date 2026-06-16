@@ -54,21 +54,22 @@ message is the *detail*.
 
 The shell is being moved to the `Result` model **incrementally** (§26.2). Converted so far:
 
-- **`read`** and the **file/storage commands** — `ls`, `cd`, `write` (+`append`), `mkdir`,
-  `copy` (+recursive), `move`, `rename`, `delete`, `find`, `tree`: `Ok` on success,
-  `Err(FileNotFound)` for a missing path, `Err(Unknown)` for other failures (storage, bad args,
-  not-a-dir, not-empty, …).
-- **An unknown command is `Err`** (so `assert fails typo` holds, and a typo in a script counts as
-  a failure).
-- **Pipelines** are on the model too — `pipe_run` returns the pipeline's `Result` (a `| assert`
-  sink sets it; a stage error is `Err`).
+- **`read`** + the **file/storage commands** — `ls`, `cd`, `write` (+`append`), `mkdir`,
+  `copy` (+recursive), `move`, `rename`, `delete`, `find`, `tree`, and the filter built-ins'
+  direct form `match`/`count`/`sort`/`first`/`last`: `Ok` on success, `Err(FileNotFound)` for a
+  missing path, `Err(Unknown)` for other failures.
+- **Service-control** — `spawn`/`kill`/`restart`: `Err(Denied)` for a protected core /
+  session-critical service (so `assert fails spawn supervisor` holds), `Err(Unknown)` otherwise.
+- **An unknown command is `Err`** (so `assert fails typo` holds; a typo in a script counts).
+- **Pipelines** — `pipe_run` returns the pipeline's `Result` (a `| assert` sink sets it; a stage
+  error is `Err`).
 
-Still **`Ok`-wrapped** (don't yet report their own failure): the info commands that don't
-meaningfully fail (`echo`/`about`/`mem`/`cores`/`date`/`status`/`observe`/`caps`/`clear`/`help`),
-the service-control commands (`spawn`/`kill`/`restart`/`drives` — a missing *arg* is a usage
-`Err`, but the action is wrapped), and the direct form of the filter built-ins
-(`match`/`count`/`sort`/`first`/`last`). Those convert next, possibly adding named variants
-(`StorageUnavailable`, `EndpointDead`, … reusing kernel names — §7.7).
+The `ShellError` variants now in use: `FileNotFound`, `Denied`, `AssertFailed`, `Unknown`.
+
+Still **`Ok`-wrapped** (don't meaningfully fail, so it would be noise): the info commands
+(`echo`/`about`/`mem`/`cores`/`date`/`status`/`observe`/`caps`/`clear`/`help`) and `drives`
+(its sub-verbs print their own status). Future variants as needs appear: `StorageUnavailable`,
+`EndpointDead`, … (reuse kernel names — §7.7).
 
 ## 5. Later (separate so it can grow)
 
