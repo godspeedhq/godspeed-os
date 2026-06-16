@@ -270,6 +270,9 @@ while true {
 
 - `for x in ( … )` iterates lines of a byte stream **or** rows of a record stream; record rows
   expose columns as `$x.<col>` (the payoff of typed pipes — nothing in POSIX has it).
+- **Not `$( )` here.** `for … in` is command position — the live stream goes in directly (the
+  parens are optional readability). `$( )` would *flatten* the command to text and lose `$row.col`;
+  `for … in` keeps the stream so it can iterate rows. (`$( )` = "the text"; `for … in` = "the stream".)
 - `for x in a b c` iterates literal words; `for x in $@` iterates the script's params.
 - `for i in range N` / `range A B` counts; `while <cond> { … }` reuses the §4 grammar.
 - `break` / `continue`. **Every loop has a hard iteration cap (default 100k)** → exceeding it is a
@@ -378,11 +381,11 @@ write /tmp/build/out done
 stream); the column reducers are record-only:
 
 ```
-let rows  = (roster | count)             # row count
-let files = (ls /work | count)           # entries in a directory
-let used  = (status | sum mem)           # sum a numeric column
-let big   = (ls /work | max size)        # largest file
-let avgq  = (status | avg queue)         # average a column
+let rows  = $(roster | count)            # row count
+let files = $(ls /work | count)          # entries in a directory
+let used  = $(status | sum mem)          # sum a numeric column
+let big   = $(ls /work | max size)       # largest file
+let avgq  = $(status | avg queue)        # average a column
 ```
 
 - `count` — rows (record stream) or lines (byte stream).
@@ -526,8 +529,8 @@ for row in (status | where state=Running) {
     echo "  $row.name  core=$row.core  queue=$row.queue"
 }
 
-let running = (status | where state=Running | count)   # row count (record-aware)
-let memuse  = (status | sum mem)                         # reduce a column
+let running = $(status | where state=Running | count)   # row count (record-aware)
+let memuse  = $(status | sum mem)                        # reduce a column
 echo "$running running, $memuse KiB in use"
 ```
 
