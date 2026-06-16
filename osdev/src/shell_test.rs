@@ -261,6 +261,22 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
+    // pipe errors: a non-producer source, and the result/assert outcome mix-up
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"about | to json\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("'about' cannot start a pipe because it's not a pipe source"),
+                          "pipe: non-producer source error"),
+        None    => { println!("shell-test: FAIL — timed out after non-producer pipe"); fail += 1; }
+    }
+    send(&mut write_half, b"status | result\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("checks a command's outcome, not piped output"),
+                          "pipe: result-in-pipe outcome-channel hint"),
+        None    => { println!("shell-test: FAIL — timed out after result-in-pipe"); fail += 1; }
+    }
+
+    // -----------------------------------------------------------------------
     // observe now — the shell brokers a one-shot observe-now service that prints
     // a static metrics frame. Its output is ASYNCHRONOUS (the prompt returns
     // before observe-now is scheduled), so wait on observe's own summary line
