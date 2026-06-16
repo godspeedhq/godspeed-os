@@ -1376,6 +1376,28 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL — fails-with wrong timeout"); fail += 1; }
     }
 
+    // ── the last stragglers (caps, drives) + info commands are now on the Result model too. ──
+    match run!(b"assert fails-with FileNotFound caps nobody\r", 10) {
+        Some(r) => check!(r.contains("assert: ok"), "result: caps of a missing service → Err(FileNotFound)"),
+        None    => { println!("files-test: FAIL — caps fails-with timeout"); fail += 1; }
+    }
+    match run!(b"assert ok caps shell\r", 10) {
+        Some(r) => check!(r.contains("assert: ok"), "result: caps of a live service is Ok"),
+        None    => { println!("files-test: FAIL — caps ok timeout"); fail += 1; }
+    }
+    match run!(b"assert ok drives\r", 10) {
+        Some(r) => check!(r.contains("assert: ok"), "result: drives list (mounted GSFS) is Ok"),
+        None    => { println!("files-test: FAIL — drives ok timeout"); fail += 1; }
+    }
+    match run!(b"assert fails drives bogus\r", 12) {
+        Some(r) => check!(r.contains("assert: ok"), "result: drives unknown subcommand is Err"),
+        None    => { println!("files-test: FAIL — drives fails timeout"); fail += 1; }
+    }
+    match run!(b"assert ok status\r", 10) {
+        Some(r) => check!(r.contains("assert: ok"), "result: an info command (status) is Ok"),
+        None    => { println!("files-test: FAIL — status ok timeout"); fail += 1; }
+    }
+
     child.kill().ok();
     child.wait().ok();
     println!("\nfiles-test: {pass} passed, {fail} failed");
