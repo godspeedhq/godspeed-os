@@ -25,13 +25,54 @@ use limine::framebuffer::Framebuffer;
 
 /// Font glyph lookup. `font8x8` legacy basic font: 8 rows per glyph, bit
 /// `(1 << x)` of a row is the pixel at column `x` (LSB = leftmost).
+///
+/// ASCII (`< 128`) comes from the font; a handful of reserved high bytes carry hand-rolled
+/// **light box-drawing** glyphs (the UTF-8 decoder maps `U+2500..U+253C` to these via
+/// `cell_for_codepoint`). The masks connect cell-to-cell: vertical sits in columns 3–4
+/// (`0x18`), horizontal in rows 3–4; a half-line is left = cols 0–4 (`0x1F`) or right =
+/// cols 3–7 (`0xF8`). Everything else renders blank.
 #[inline]
 fn glyph(ch: u8) -> [u8; 8] {
     let idx = ch as usize;
     if idx < 128 {
-        font8x8::legacy::BASIC_LEGACY[idx]
-    } else {
-        [0u8; 8]
+        return font8x8::legacy::BASIC_LEGACY[idx];
+    }
+    match ch {
+        0xC4 => [0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00], // ─ horizontal
+        0xB3 => [0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18], // │ vertical
+        0xDA => [0x00, 0x00, 0x00, 0xF8, 0xF8, 0x18, 0x18, 0x18], // ┌ down+right
+        0xBF => [0x00, 0x00, 0x00, 0x1F, 0x1F, 0x18, 0x18, 0x18], // ┐ down+left
+        0xC0 => [0x18, 0x18, 0x18, 0xF8, 0xF8, 0x00, 0x00, 0x00], // └ up+right
+        0xD9 => [0x18, 0x18, 0x18, 0x1F, 0x1F, 0x00, 0x00, 0x00], // ┘ up+left
+        0xC3 => [0x18, 0x18, 0x18, 0xF8, 0xF8, 0x18, 0x18, 0x18], // ├ vertical+right
+        0xB4 => [0x18, 0x18, 0x18, 0x1F, 0x1F, 0x18, 0x18, 0x18], // ┤ vertical+left
+        0xC2 => [0x00, 0x00, 0x00, 0xFF, 0xFF, 0x18, 0x18, 0x18], // ┬ horizontal+down
+        0xC1 => [0x18, 0x18, 0x18, 0xFF, 0xFF, 0x00, 0x00, 0x00], // ┴ horizontal+up
+        0xC5 => [0x18, 0x18, 0x18, 0xFF, 0xFF, 0x18, 0x18, 0x18], // ┼ cross
+        _ => [0u8; 8],
+    }
+}
+
+/// Map a decoded Unicode codepoint to the internal **cell byte** the grid stores and `glyph`
+/// renders. ASCII passes through; the light box-drawing block (`U+2500..U+253C`) maps to the
+/// reserved high bytes above; anything else becomes `?` — visible, never silently dropped (§3.12).
+fn cell_for_codepoint(cp: u32) -> u8 {
+    if cp < 0x80 {
+        return cp as u8;
+    }
+    match cp {
+        0x2500 => 0xC4, // ─
+        0x2502 => 0xB3, // │
+        0x250C => 0xDA, // ┌
+        0x2510 => 0xBF, // ┐
+        0x2514 => 0xC0, // └
+        0x2518 => 0xD9, // ┘
+        0x251C => 0xC3, // ├
+        0x2524 => 0xB4, // ┤
+        0x252C => 0xC2, // ┬
+        0x2534 => 0xC1, // ┴
+        0x253C => 0xC5, // ┼
+        _ => b'?',
     }
 }
 
@@ -76,6 +117,10 @@ struct Fb {
     csi_priv: bool,      // saw '?' immediately after '[' (private-mode sequence)
     csi_params: [u16; 3],// numeric parameters (e.g. row;col)
     csi_nparam: usize,   // count of parameters accumulated
+    // UTF-8 decode: accumulate a multi-byte sequence into a codepoint. `utf8_remaining` is
+    // how many continuation bytes are still expected (0 = not mid-sequence).
+    utf8_cp: u32,
+    utf8_remaining: u8,
     cursor_visible: bool,// draw the underline cursor (off for full-screen apps)
     cur_col: usize,      // column where the cursor underline was last drawn
     cur_row: usize,      // row where the cursor underline was last drawn
@@ -89,8 +134,8 @@ struct Fb {
 static FB: SpinLock<Fb> = SpinLock::new(Fb {
     base: 0, pitch: 0, bpp: 0, width: 0, height: 0,
     org_x: 0, org_y: 0, cols: 0, rows: 0, col: 0, row: 0, fg: 0, bg: 0, ready: false,
-    esc: 0, csi_priv: false, csi_params: [0; 3], csi_nparam: 0, cursor_visible: true,
-    cur_col: 0, cur_row: 0,
+    esc: 0, csi_priv: false, csi_params: [0; 3], csi_nparam: 0, utf8_cp: 0, utf8_remaining: 0,
+    cursor_visible: true, cur_col: 0, cur_row: 0,
     grid: [[b' '; MAX_COLS]; MAX_ROWS],
 });
 
@@ -228,44 +273,67 @@ fn process_byte(s: &mut Fb, b: u8) {
         return;
     }
 
-    // --- Normal byte ---
-    // Erase the underline cursor at the current cell before changing position or
-    // drawing, so it never leaves a trail. Redraw it at the new position after.
+    // --- UTF-8 decode (so the console renders ├──, │, etc., not garbled bytes) ---
+    if s.utf8_remaining > 0 {
+        // Mid-sequence: fold a continuation byte into the codepoint; render when complete.
+        if b & 0xC0 == 0x80 {
+            s.utf8_cp = (s.utf8_cp << 6) | (b & 0x3F) as u32;
+            s.utf8_remaining -= 1;
+            if s.utf8_remaining == 0 {
+                put_printable_cell(s, cell_for_codepoint(s.utf8_cp));
+            }
+            return;
+        }
+        s.utf8_remaining = 0; // malformed — abandon the sequence and reprocess this byte
+    }
+    if b >= 0x80 {
+        // Lead byte: begin a 2/3/4-byte sequence; a stray continuation/invalid lead is a `?`.
+        if b & 0xE0 == 0xC0 { s.utf8_cp = (b & 0x1F) as u32; s.utf8_remaining = 1; return; }
+        if b & 0xF0 == 0xE0 { s.utf8_cp = (b & 0x0F) as u32; s.utf8_remaining = 2; return; }
+        if b & 0xF8 == 0xF0 { s.utf8_cp = (b & 0x07) as u32; s.utf8_remaining = 3; return; }
+        put_printable_cell(s, b'?');
+        return;
+    }
+
+    // --- Control / printable ASCII byte ---
+    // A `\r` moves to column 0 over already-drawn text (e.g. the prompt); stamping the cursor
+    // there and erasing it next byte would blank that text, so `\r` doesn't redraw the cursor.
+    match b {
+        b'\n' => { cursor_off(s); advance_line(s); cursor_on(s); }
+        b'\r' => { cursor_off(s); s.col = 0; }
+        0x08 | 0x7f => { cursor_off(s); if s.col > 0 { s.col -= 1; } cursor_on(s); }
+        0x20..=0x7e => put_printable_cell(s, b),
+        _ => {}
+    }
+}
+
+/// Draw a printable cell byte at the write position and advance. Self-contained: erases the
+/// cursor first and redraws it after, so it renders an ASCII byte and a UTF-8-decoded glyph
+/// (which may be a box-drawing cell byte > 0x7e) the same way.
+fn put_printable_cell(s: &mut Fb, cell: u8) {
+    cursor_off(s);
+    let (c, r) = (s.col, s.row);
+    draw_glyph(s, cell, c, r);
+    grid_set(s, c, r, cell);
+    s.col += 1;
+    if s.col >= s.cols {
+        advance_line(s);
+    }
+    cursor_on(s);
+}
+
+/// Erase the underline cursor if it is visible (so a move/draw leaves no trail).
+#[inline]
+fn cursor_off(s: &Fb) {
     if s.cursor_visible {
         erase_cursor(s);
     }
-    // Carriage return moves to column 0, which usually still holds drawn text
-    // (e.g. the prompt). Stamping the cursor there and erasing it on the next byte
-    // would blank that text, so a `\r` does not redraw the cursor — the next glyph
-    // write or the newline's fresh line will place it.
-    let mut redraw_cursor = true;
-    match b {
-        b'\n' => advance_line(s),
-        b'\r' => {
-            s.col = 0;
-            redraw_cursor = false;
-        }
-        0x08 | 0x7f => {
-            if s.col > 0 {
-                s.col -= 1;
-            }
-        }
-        0x20..=0x7e => {
-            // The glyph is drawn at the (now blank) cursor cell.
-            let (c, r) = (s.col, s.row);
-            draw_glyph(s, b, c, r);
-            grid_set(s, c, r, b);
-            s.col += 1;
-            if s.col >= s.cols {
-                advance_line(s);
-            }
-        }
-        _ => {}
-    }
-    // The cursor follows the write position: a steady underline at the cell where
-    // the next character will land. Framebuffer only — a serial terminal draws its
-    // own cursor. Full-screen apps hide it via ESC[?25l.
-    if s.cursor_visible && redraw_cursor {
+}
+
+/// Redraw the underline cursor at the write position if it is visible.
+#[inline]
+fn cursor_on(s: &mut Fb) {
+    if s.cursor_visible {
         draw_cursor(s);
     }
 }

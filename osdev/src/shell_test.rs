@@ -865,7 +865,11 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     match run!(b"tree /t\r", 12) {
         Some(r) => {
             check!(r.contains("sub/"), "tree: marks a directory with '/'");
-            check!(r.contains("    b.txt"), "tree: nests a grandchild (4-space indent)");
+            // box-drawing: a depth-1 entry gets a connector; the grandchild b.txt is the last
+            // child of `sub`, so it draws `└── ` behind a 4-wide prefix (`    ` or `│   `).
+            check!(r.contains("── a.txt"), "tree: child gets a box connector");
+            check!(r.contains("    └── b.txt") || r.contains("│   └── b.txt"),
+                   "tree: nests a grandchild under its parent (box prefix)");
             check!(r.contains("1 directory, 2 files"), "tree: summary counts dirs + files");
         }
         None => { println!("files-test: FAIL — tree timeout"); fail += 1; }
