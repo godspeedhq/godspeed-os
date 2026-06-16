@@ -8,11 +8,17 @@
 //! Framebuffer text console (fbcon) — Phase 1: boot output mirrored to the
 //! display (§11.4). Output-only.
 //!
-//! Renders a public-domain 8x8 bitmap font (`font8x8`) at 2x scale (16x16 px
-//! per glyph) into Limine's linear framebuffer. Every byte written to the
-//! serial console is also handed to `put_byte` here, so the monitor shows
+//! Renders **antialiased Noto Sans Mono** glyphs (`noto-sans-mono-bitmap`, the
+//! Regular weight at a 20 px raster) into Limine's linear framebuffer. Each glyph
+//! pixel is a 0–255 intensity, blended against the soft-green foreground, so text
+//! is smooth rather than the blocky look of a 1-bpp bitmap font. Every byte written
+//! to the serial console is also handed to `put_byte` here, so the monitor shows
 //! exactly what the serial console shows — boot logs, `supervisor: ready`,
 //! ping/pong, the lot.
+//!
+//! Box-drawing glyphs (`tree`'s `├──`, `│`, …) are drawn **procedurally** — the
+//! font's Basic-Latin range carries no U+2500 block, and procedural strokes connect
+//! cell-to-cell exactly.
 //!
 //! Lives in the arch layer (§18.1) because it writes framebuffer memory
 //! directly. The framebuffer is mapped by Limine in the higher half (PML4
@@ -22,40 +28,26 @@
 
 use crate::smp::spinlock::SpinLock;
 use limine::framebuffer::Framebuffer;
+use noto_sans_mono_bitmap::{get_raster, get_raster_width, FontWeight, RasterHeight};
 
-/// Font glyph lookup. `font8x8` legacy basic font: 8 rows per glyph, bit
-/// `(1 << x)` of a row is the pixel at column `x` (LSB = leftmost).
-///
-/// ASCII (`< 128`) comes from the font; a handful of reserved high bytes carry hand-rolled
-/// **light box-drawing** glyphs (the UTF-8 decoder maps `U+2500..U+253C` to these via
-/// `cell_for_codepoint`). The masks connect cell-to-cell: vertical sits in columns 3–4
-/// (`0x18`), horizontal in rows 3–4; a half-line is left = cols 0–4 (`0x1F`) or right =
-/// cols 3–7 (`0xF8`). Everything else renders blank.
-#[inline]
-fn glyph(ch: u8) -> [u8; 8] {
-    let idx = ch as usize;
-    if idx < 128 {
-        return font8x8::legacy::BASIC_LEGACY[idx];
-    }
-    match ch {
-        0xC4 => [0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00], // ─ horizontal
-        0xB3 => [0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18], // │ vertical
-        0xDA => [0x00, 0x00, 0x00, 0xF8, 0xF8, 0x18, 0x18, 0x18], // ┌ down+right
-        0xBF => [0x00, 0x00, 0x00, 0x1F, 0x1F, 0x18, 0x18, 0x18], // ┐ down+left
-        0xC0 => [0x18, 0x18, 0x18, 0xF8, 0xF8, 0x00, 0x00, 0x00], // └ up+right
-        0xD9 => [0x18, 0x18, 0x18, 0x1F, 0x1F, 0x00, 0x00, 0x00], // ┘ up+left
-        0xC3 => [0x18, 0x18, 0x18, 0xF8, 0xF8, 0x18, 0x18, 0x18], // ├ vertical+right
-        0xB4 => [0x18, 0x18, 0x18, 0x1F, 0x1F, 0x18, 0x18, 0x18], // ┤ vertical+left
-        0xC2 => [0x00, 0x00, 0x00, 0xFF, 0xFF, 0x18, 0x18, 0x18], // ┬ horizontal+down
-        0xC1 => [0x18, 0x18, 0x18, 0xFF, 0xFF, 0x00, 0x00, 0x00], // ┴ horizontal+up
-        0xC5 => [0x18, 0x18, 0x18, 0xFF, 0xFF, 0x18, 0x18, 0x18], // ┼ cross
-        _ => [0u8; 8],
-    }
-}
+/// Noto weight + raster height for the console. `get_raster_width`/`RasterHeight::val`
+/// are `const fn`, so the per-cell pixel box (`CELL_W` × `CELL_H`) is known at compile
+/// time and the char-grid geometry below is computed from it. Size20 ≈ 9×20 px — a touch
+/// taller than the old 16×16 bitmap cell and far smoother on a TV.
+const FONT_WEIGHT: FontWeight = FontWeight::Regular;
+const RASTER_HEIGHT: RasterHeight = RasterHeight::Size20;
+const CELL_W: usize = get_raster_width(FONT_WEIGHT, RASTER_HEIGHT);
+const CELL_H: usize = RASTER_HEIGHT.val();
 
-/// Map a decoded Unicode codepoint to the internal **cell byte** the grid stores and `glyph`
-/// renders. ASCII passes through; the light box-drawing block (`U+2500..U+253C`) maps to the
-/// reserved high bytes above; anything else becomes `?` — visible, never silently dropped (§3.12).
+/// Reserved cell bytes for the **box-drawing** glyphs (`tree`). The grid stores these
+/// high bytes; `draw_box_glyph` renders them with procedural strokes. The UTF-8 decoder
+/// maps `U+2500..U+253C` to them via `cell_for_codepoint`.
+const BOX_FIRST: u8 = 0xB3;
+
+/// Map a decoded Unicode codepoint to the internal **cell byte** the grid stores. ASCII
+/// passes through (rendered via Noto); the light box-drawing block (`U+2500..U+253C`)
+/// maps to the reserved high bytes (rendered procedurally); anything else becomes `?` —
+/// visible, never silently dropped (§3.12).
 fn cell_for_codepoint(cp: u32) -> u8 {
     if cp < 0x80 {
         return cp as u8;
@@ -76,18 +68,33 @@ fn cell_for_codepoint(cp: u32) -> u8 {
     }
 }
 
-/// Integer upscale factor: an 8x8 font cell becomes 16x16 px — readable on a TV.
-const SCALE: usize = 2;
-const GLYPH_W: usize = 8 * SCALE;
-const GLYPH_H: usize = 8 * SCALE;
+/// Which of the four arms a box-drawing cell byte has: `(up, down, left, right)`.
+/// The procedural renderer draws a stroke for each present arm out from the cell
+/// centre, so neighbouring cells join seamlessly.
+fn box_arms(ch: u8) -> (bool, bool, bool, bool) {
+    match ch {
+        0xC4 => (false, false, true, true),  // ─
+        0xB3 => (true, true, false, false),  // │
+        0xDA => (false, true, false, true),  // ┌
+        0xBF => (false, true, true, false),  // ┐
+        0xC0 => (true, false, false, true),  // └
+        0xD9 => (true, false, true, false),  // ┘
+        0xC3 => (true, true, false, true),   // ├
+        0xB4 => (true, true, true, false),   // ┤
+        0xC2 => (false, true, true, true),   // ┬
+        0xC1 => (true, false, true, true),   // ┴
+        0xC5 => (true, true, true, true),    // ┼
+        _ => (false, false, false, false),
+    }
+}
 
-/// Char-grid shadow bounds. Sized for up to ~4K UHD with the 10% safe-area inset
-/// (3072/16 = 192 cols, 1728/16 = 108 rows); larger displays clamp the text area to
+/// Char-grid shadow bounds. Sized for up to ~4K UHD edge-to-edge at the Noto cell
+/// (3840/9 ≈ 427 cols, 2160/20 = 108 rows); larger displays clamp the text area to
 /// these bounds. The shadow holds each cell's printable content so `scroll` can
 /// redraw from RAM instead of reading the framebuffer back — uncached/WC VRAM reads
 /// run ~100x slower than writes, the fbcon scroll trap that made a respawn look 40x
 /// a cold spawn (see the iso-c7/iso-xlife investigation).
-const MAX_COLS: usize = 256;
+const MAX_COLS: usize = 448;
 const MAX_ROWS: usize = 128;
 
 /// Framebuffer console state. The base pointer is stored as `usize` so the
@@ -107,6 +114,15 @@ struct Fb {
     row: usize,    // cursor row
     fg: u32,       // foreground pixel value (already in the device's channel layout)
     bg: u32,       // background pixel value
+    // Foreground as raw 0–255 channel components plus the device's channel shifts,
+    // so a glyph pixel's 0–255 antialiasing intensity can be blended toward the
+    // background per channel (`blend`) and composed into the device pixel layout.
+    fg_r: u32,
+    fg_g: u32,
+    fg_b: u32,
+    r_shift: u32,
+    g_shift: u32,
+    b_shift: u32,
     ready: bool,   // false until fb_init runs; put_byte no-ops until then
     // --- Minimal ANSI escape parser (Stage 2a) ---
     // The console service drives the terminal by emitting a small ANSI subset
@@ -133,26 +149,31 @@ struct Fb {
 
 static FB: SpinLock<Fb> = SpinLock::new(Fb {
     base: 0, pitch: 0, bpp: 0, width: 0, height: 0,
-    org_x: 0, org_y: 0, cols: 0, rows: 0, col: 0, row: 0, fg: 0, bg: 0, ready: false,
+    org_x: 0, org_y: 0, cols: 0, rows: 0, col: 0, row: 0, fg: 0, bg: 0,
+    fg_r: 0, fg_g: 0, fg_b: 0, r_shift: 0, g_shift: 0, b_shift: 0, ready: false,
     esc: 0, csi_priv: false, csi_params: [0; 3], csi_nparam: 0, utf8_cp: 0, utf8_remaining: 0,
     cursor_visible: true, cur_col: 0, cur_row: 0,
     grid: [[b' '; MAX_COLS]; MAX_ROWS],
 });
 
-/// Safe-area inset per edge, as a percentage of each dimension. TVs overscan
-/// (crop) ~3–5% off every edge; insetting the text by 5% keeps it all visible
-/// without depending on the TV's "Just Scan" / "Screen Fit" / "Full pixel"
-/// setting. Harmless on a monitor (no overscan) — just a small border.
-const SAFE_PCT: usize = 10;
+/// Safe-area inset per edge, as a percentage of each dimension. `0` = edge-to-edge:
+/// the console fills the whole framebuffer. A TV that overscans (crops ~3–5% off every
+/// edge) may clip the outermost characters — set the TV's "Just Scan" / "Screen Fit" /
+/// "1:1" picture mode so it maps one source pixel to one panel pixel. A non-zero value
+/// would re-introduce a border for displays that can't be told to stop overscanning.
+const SAFE_PCT: usize = 0;
 
 /// Initialise the console from Limine's framebuffer descriptor. Called once in
 /// `_start`, right after `serial_init`, before the first `kprintln`.
 pub fn fb_init(fb: &Framebuffer) {
     // Compose pixel values in the framebuffer's own channel layout via the
     // reported mask shifts, so we render correct colours on RGB or BGR devices.
-    let make = |r: u32, g: u32, b: u32| -> u32 {
-        (r << fb.red_mask_shift) | (g << fb.green_mask_shift) | (b << fb.blue_mask_shift)
-    };
+    let (rs, gs, bs) = (
+        fb.red_mask_shift as u32,
+        fb.green_mask_shift as u32,
+        fb.blue_mask_shift as u32,
+    );
+    let make = |r: u32, g: u32, b: u32| -> u32 { (r << rs) | (g << gs) | (b << bs) };
 
     let mut s = FB.lock();
     s.base = fb.address() as usize;
@@ -160,17 +181,21 @@ pub fn fb_init(fb: &Framebuffer) {
     s.bpp = (fb.bpp as usize) / 8;
     s.width = fb.width as usize;
     s.height = fb.height as usize;
-    // Inset the text area by SAFE_PCT on each edge so TV overscan can't clip it.
+    // Inset the text area by SAFE_PCT on each edge (0 = edge-to-edge full screen).
     s.org_x = s.width * SAFE_PCT / 100;
     s.org_y = s.height * SAFE_PCT / 100;
-    s.cols = (s.width - 2 * s.org_x) / GLYPH_W;
-    s.rows = (s.height - 2 * s.org_y) / GLYPH_H;
+    s.cols = (s.width - 2 * s.org_x) / CELL_W;
+    s.rows = (s.height - 2 * s.org_y) / CELL_H;
     // Clamp the text area to the char-grid shadow bounds (only matters above ~4K).
     s.cols = s.cols.min(MAX_COLS);
     s.rows = s.rows.min(MAX_ROWS);
     s.col = 0;
     s.row = 0;
-    s.fg = make(0x80, 0xFF, 0x80); // soft green on black — classic console look
+    // soft green on black — classic console look. Keep the raw components + channel
+    // shifts so antialiased glyph intensities can be blended per channel (`blend`).
+    s.fg_r = 0x80; s.fg_g = 0xFF; s.fg_b = 0x80;
+    s.r_shift = rs; s.g_shift = gs; s.b_shift = bs;
+    s.fg = make(s.fg_r, s.fg_g, s.fg_b);
     s.bg = make(0x00, 0x00, 0x00);
     s.esc = 0;
     s.csi_nparam = 0;
@@ -516,22 +541,91 @@ fn put_pixel(s: &Fb, x: usize, y: usize, color: u32) {
     }
 }
 
-/// Render one glyph at text cell (col, row), scaled by `SCALE`.
+/// Blend the foreground toward the background by an antialiasing `intensity` (0–255)
+/// and compose the result into the device's channel layout. 0 ⇒ background, 255 ⇒ full
+/// foreground; in between gives the smooth edges. Because the background is black, this
+/// is just the foreground scaled per channel — but written explicitly so a non-black
+/// background would still compose correctly.
+#[inline]
+fn blend(s: &Fb, intensity: u8) -> u32 {
+    if intensity == 0 {
+        return s.bg;
+    }
+    if intensity == 255 {
+        return s.fg;
+    }
+    let i = intensity as u32;
+    let r = s.fg_r * i / 255;
+    let g = s.fg_g * i / 255;
+    let b = s.fg_b * i / 255;
+    (r << s.r_shift) | (g << s.g_shift) | (b << s.b_shift)
+}
+
+/// Render one glyph at text cell (col, row). ASCII (`< 0x80`) renders via the
+/// antialiased Noto raster (every cell pixel is written — intensity 0 paints the
+/// background, so the cell is fully repainted with no stale pixels). The reserved
+/// high bytes render as procedural box-drawing strokes.
 fn draw_glyph(s: &Fb, ch: u8, col: usize, row: usize) {
-    let bits = glyph(ch);
-    let x0 = s.org_x + col * GLYPH_W;
-    let y0 = s.org_y + row * GLYPH_H;
-    for gy in 0..8 {
-        let rowbits = bits[gy];
-        for gx in 0..8 {
-            let on = (rowbits >> gx) & 1 != 0; // LSB = leftmost
-            let color = if on { s.fg } else { s.bg };
-            for sy in 0..SCALE {
-                for sx in 0..SCALE {
-                    put_pixel(s, x0 + gx * SCALE + sx, y0 + gy * SCALE + sy, color);
+    let x0 = s.org_x + col * CELL_W;
+    let y0 = s.org_y + row * CELL_H;
+    if ch >= BOX_FIRST && box_arms(ch) != (false, false, false, false) {
+        draw_box_glyph(s, ch, x0, y0);
+        return;
+    }
+    // Noto raster: `raster()` is `height` rows of `width` intensity bytes; the crate
+    // guarantees those dims equal CELL_H × CELL_W for this weight/size, so iterating the
+    // raster covers the whole cell. An unknown char falls back to a blank cell.
+    match get_raster(ch as char, FONT_WEIGHT, RASTER_HEIGHT) {
+        Some(rc) => {
+            for (gy, rowpix) in rc.raster().iter().enumerate() {
+                for (gx, &intensity) in rowpix.iter().enumerate() {
+                    put_pixel(s, x0 + gx, y0 + gy, blend(s, intensity));
                 }
             }
         }
+        None => clear_cell(s, x0, y0),
+    }
+}
+
+/// Paint a whole cell to the background colour (used when a char has no raster).
+fn clear_cell(s: &Fb, x0: usize, y0: usize) {
+    for gy in 0..CELL_H {
+        for gx in 0..CELL_W {
+            put_pixel(s, x0 + gx, y0 + gy, s.bg);
+        }
+    }
+}
+
+/// Draw a procedural box-drawing glyph at pixel origin (x0, y0). Each present arm is a
+/// stroke from the cell edge to the centre; arms overlap at the centre so adjacent cells
+/// connect into continuous lines. Stroke thickness is ~2 px, centred on the cell axes.
+fn draw_box_glyph(s: &Fb, ch: u8, x0: usize, y0: usize) {
+    clear_cell(s, x0, y0);
+    let (up, down, left, right) = box_arms(ch);
+    let th = (CELL_W / 5).max(2); // stroke thickness in px (~2 at Size20)
+    let vx = CELL_W.saturating_sub(th) / 2; // left edge of the vertical stroke band
+    let hy = CELL_H.saturating_sub(th) / 2; // top edge of the horizontal stroke band
+    let fill = |xs: usize, xe: usize, ys: usize, ye: usize| {
+        for y in ys..ye.min(CELL_H) {
+            for x in xs..xe.min(CELL_W) {
+                put_pixel(s, x0 + x, y0 + y, s.fg);
+            }
+        }
+    };
+    // Vertical arms span the stroke columns [vx, vx+th); they reach to the centre band's
+    // far edge so the cross is solid.
+    if up {
+        fill(vx, vx + th, 0, hy + th);
+    }
+    if down {
+        fill(vx, vx + th, hy, CELL_H);
+    }
+    // Horizontal arms span the stroke rows [hy, hy+th).
+    if left {
+        fill(0, vx + th, hy, hy + th);
+    }
+    if right {
+        fill(vx, CELL_W, hy, hy + th);
     }
 }
 
