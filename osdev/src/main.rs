@@ -1462,24 +1462,20 @@ fn run_script_test() {
     let image_path = disk_image::create(kernel_elf, limine_dir);
     disk_image::install_bootloader(limine_dir, &image_path);
 
-    // The suite — deterministic on a freshly-baked disk (only /suite.gs exists). Includes PIPED
-    // asserts, the thing on-device authoring can't express. One command per line.
-    let suite = "\
-# GodspeedOS self-check (baked into a data disk, run on boot)
-assert ok read /suite.gs
-ls / | assert contains suite.gs
-roster | where role=core | assert contains vesta
-roster | where role=worker | assert lacks vesta
-status | where name=shell | assert contains shell
-assert fails read /nope
-";
+    // The suite is the SAME file you bake for hardware (`scripts/t630_selfcheck.gs`) — CI verifies
+    // exactly what flashes. It creates its own files (a freshly-baked disk has only the suite).
+    let script_path = "scripts/t630_selfcheck.gs";
+    let suite = std::fs::read(script_path)
+        .unwrap_or_else(|e| { eprintln!("script-test: cannot read {}: {}", script_path, e); std::process::exit(1); });
+    let name = std::path::Path::new(script_path).file_name().and_then(|s| s.to_str()).unwrap_or("suite.gs");
+
     let _ = std::fs::create_dir_all("build/tests");
     let disk = "build/tests/script_disk.img";
     std::fs::write(disk, vec![0u8; 16 * 1024 * 1024]).expect("failed to create disk");
     format_superblock(disk);
-    gsfs_add_file(disk, "suite.gs", suite.as_bytes());
+    gsfs_add_file(disk, name, &suite);
 
-    crate::shell_test::run_script(&image_path, disk, 4);
+    crate::shell_test::run_script(&image_path, disk, name, 4);
 }
 
 /// Build bare-metal image and run the scripted shell smoke-test.
