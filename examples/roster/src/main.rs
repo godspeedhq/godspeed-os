@@ -46,10 +46,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // Build a small typed table — data this service "owns". Columns: name / role / core.
     let mut t = Table::new(&["name", "role", "core"]);
-    let rows: [(&[u8], &[u8], u64); 3] = [
-        (b"atlas", b"worker", 1),
-        (b"hermes", b"courier", 2),
-        (b"vesta", b"core", 0),
+    let rows: [(&[u8], &[u8], u64); 4] = [
+        (b"Matthew", b"core", 0),
+        (b"Mark", b"worker", 1),
+        (b"Luke", b"courier", 2),
+        (b"John", b"worker", 3),
     ];
     for (name, role, core) in rows.iter() {
         let n = t.intern(name);
@@ -69,7 +70,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // table would be chunked — never as a lone 0x04, which is EOT.)
             let _ = ctx.send_by_handle(dst, &Message::from_bytes(&sink.buf[..sink.len]));
             let _ = ctx.send_by_handle(dst, &Message::from_bytes(&[0x04]));
-            ctx.log("roster: sent a 3-row table via the binary record codec through the pipe cap");
+            ctx.log("roster: sent a 4-row table via the binary record codec through the pipe cap");
         }
         None => {
             ctx.log("roster: no pipe cap was delegated — nothing to send to");
