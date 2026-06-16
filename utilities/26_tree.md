@@ -31,9 +31,10 @@ usage:
   draw the continuation lines, so structure reads at a glance. A trailing `/` still marks
   directories (the console is monochrome — there's no colour to lean on).
 - **UTF-8.** The box glyphs (`U+2500..U+253C`) are emitted as UTF-8 and render on **both** the
-  serial terminal and the framebuffer console — the fbcon now decodes UTF-8 and carries a small
-  set of hand-rolled light box-drawing glyphs (`kernel/src/arch/x86_64/fb.rs`). Unsupported
-  codepoints render as `?`, never silently dropped (§3.12).
+  serial terminal and the framebuffer console — the fbcon decodes UTF-8 and draws the box
+  glyphs with **procedural strokes** (the antialiased Noto font it uses for text has no U+2500
+  block; procedural strokes also connect cell-to-cell exactly). See `kernel/src/arch/x86_64/fb.rs`.
+  Unsupported codepoints render as `?`, never silently dropped (§3.12).
 - The root line shows the path as given; deeper entries show their basename.
 - Ends with a blank line then a summary: `N directories, M files` (counting everything *under*
   the root).
