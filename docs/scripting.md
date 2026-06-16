@@ -1,7 +1,8 @@
 # gsh — the GodspeedOS shell language (design)
 
-> **Status:** design sketch, not yet built. Scope is Tier 1–2 below. Files keep the `.gs`
-> extension. Builds on the existing `run`/`run_lines` interpreter and the command **Result**
+> **Status:** design sketch, not yet built. Scope is Tier 1–2 below. Scripts use the `.gsh`
+> extension (GodspeedOS shell; `.gs` is reserved for the future general-purpose Godspeed
+> language). Builds on the existing `run`/`run_lines` interpreter and the command **Result**
 > model (`execute` already returns `Ok`/`Err`). Not POSIX — see CLAUDE.md Appendix B.3 / D.
 
 ## Contents
@@ -18,7 +19,7 @@
 10. [Out of scope](#10-out-of-scope)
 11. [Tiers and effort](#11-tiers-and-effort)
 12. [Worked example](#12-worked-example)
-13. [Example programs](#13-example-programs) — [setup.gs](#131-setupgs) · [greet.gs](#132-greetgs) · [report.gs](#133-reportgs) · [check.gs](#134-checkgs) · [retry.gs](#135-retrygs)
+13. [Example programs](#13-example-programs) — [setup.gsh](#131-setupgsh) · [greet.gsh](#132-greetgsh) · [report.gsh](#133-reportgsh) · [check.gsh](#134-checkgsh) · [retry.gsh](#135-retrygsh)
 
 ---
 
@@ -103,12 +104,12 @@ echo $ROOT/logs
 # ROOT = /tmp        # error: cannot reassign a const
 ```
 
-Script parameters — `run greet.gs Matthew core`:
+Script parameters — `run greet.gsh Matthew core`:
 
 ```
 echo "name=$1 role=$2"         # name=Matthew role=core
 echo "got $# args: $@"          # got 2 args: Matthew core
-echo "script: $0"               # script: greet.gs
+echo "script: $0"               # script: greet.gsh
 ```
 
 - `let x = <value>` declares or reassigns; `const NAME = <value>` declares an immutable binding.
@@ -498,7 +499,7 @@ echo "greet emitted $lines"
 Complete scripts — the kind the language is *for*, using only Tier 1–2 features. The bar for each
 milestone is "these run."
 
-### 13.1 setup.gs
+### 13.1 setup.gsh
 *Provision a workspace; fail loudly if it can't.*
 
 ```
@@ -526,13 +527,13 @@ if !read /work/config {
 echo "workspace ready"
 ```
 
-### 13.2 greet.gs
+### 13.2 greet.gsh
 *Parameters, usage check, and `switch`.*
 
 ```
-# run greet.gs <name> <role>
+# run greet.gsh <name> <role>
 if $# < 2 {
-    fail "usage: run greet.gs <name> <role>"
+    fail "usage: run greet.gsh <name> <role>"
 }
 
 let name = $1
@@ -548,7 +549,7 @@ if $role in core worker courier {
 }
 ```
 
-### 13.3 report.gs
+### 13.3 report.gsh
 *Iterate and aggregate a record stream.*
 
 ```
@@ -562,7 +563,7 @@ let memuse  = $(status | sum mem)                        # reduce a column
 echo "$running running, $memuse KiB in use"
 ```
 
-### 13.4 check.gs
+### 13.4 check.gsh
 *Test helper (functions + assert) with `defer` cleanup.*
 
 ```
@@ -588,7 +589,7 @@ if read $DIR/a {
 echo "all checks passed"
 ```
 
-### 13.5 retry.gs
+### 13.5 retry.gsh
 *`loop`, `break`, and a bounded counter.*
 
 ```

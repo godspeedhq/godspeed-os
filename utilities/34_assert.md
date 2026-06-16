@@ -1,7 +1,7 @@
 # Utility: `assert` — verify a result or output (the test verb)
 
 **Status:** **Built + QEMU-verified** (`osdev test files`). The top rung of the script-testing
-ladder (`result` → `run` → **`assert`**): it lets a `.gs` script **self-verify**, so the device
+ladder (`result` → `run` → **`assert`**): it lets a `.gsh` script **self-verify**, so the device
 prints PASS/FAIL instead of you reading the serial. Trails `CLAUDE.md`; does not amend it.
 
 ---
@@ -63,12 +63,12 @@ returns `Ok` whether or not it found `vesta`; `| assert contains vesta` is what 
 ## 4. In a script — the self-checking suite
 
 ```
-# /check.gs
+# /check.gsh
 assert ok    read /lsr/big.txt
 assert fails read /lsr/nope
 ```
 ```
-gs> run /check.gs
+gs> run /check.gsh
 > assert ok read /lsr/big.txt
 hello world
 assert: ok
@@ -82,8 +82,8 @@ run: ran 2, failed 0
 
 > **Authoring a suite with piped asserts.** A script line containing `|` can't be written via the
 > on-device `write` (the shell pipes the `write` line itself). The answer is **host-side baking**:
-> `osdev script-disk build/suite.img my_suite.gs` produces a GSFS data disk with the suite baked
-> in; `dd` it to the data drive, boot, and `run /my_suite.gs`. `osdev test script` runs exactly
+> `osdev script-disk build/suite.img my_suite.gsh` produces a GSFS data disk with the suite baked
+> in; `dd` it to the data drive, boot, and `run /my_suite.gsh`. `osdev test script` runs exactly
 > this loop in CI (a suite full of piped asserts → `ran 6, failed 0`). Result-form asserts (no
 > `|`) can also be authored on-device with `write … cmd ; cmd`.
 
@@ -100,7 +100,7 @@ run: ran 2, failed 0
 
 - `assert fails-with <Variant>` — pin the *specific* `Err` (needs more commands to name variants).
 - More content checks (`is <text>` exact, `lines <N>`), if a suite needs them.
-- Host-side **image-baked `.gs`** — **built** (`osdev script-disk`, `osdev test script`): a suite
+- Host-side **image-baked `.gsh`** — **built** (`osdev script-disk`, `osdev test script`): a suite
   of piped asserts ships on a GSFS data disk and runs from a script on hardware.
 
 ## 7. Implementation shape & conformance

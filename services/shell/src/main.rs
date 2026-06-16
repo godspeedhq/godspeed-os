@@ -548,7 +548,7 @@ fn trim_bytes(b: &[u8]) -> &[u8] {
 }
 
 /// `run <path>` — execute a script file: each command is run exactly as if typed at the prompt.
-/// Lines split on `\n`; a non-comment line further splits on `;` (so a `.gs` can be real
+/// Lines split on `\n`; a non-comment line further splits on `;` (so a `.gsh` can be real
 /// multi-line, or `cmd ; cmd ; cmd` — the latter is how scripts are authored before a host-side
 /// editor exists). `#`-comment lines and blanks are skipped; each command is echoed (`> cmd`) so
 /// the serial transcript self-documents; a summary reports how many ran and how many returned
@@ -645,7 +645,7 @@ const RUN_MAX_CMDS: usize = 256;
 /// The self-check suite, embedded in the shell binary (so it ships with the boot image — no
 /// host-side `dd` of a data disk). Run straight from rodata, so it can be far larger than an
 /// on-disk file (`MAX_FILE_BYTES` — a file is one ≤4 KiB IPC message; rodata is not).
-const SELFCHECK_GS: &str = include_str!("../../../scripts/selfcheck.gs");
+const SELFCHECK_GS: &str = include_str!("../../../scripts/selfcheck.gsh");
 
 /// `selfcheck` — run the embedded self-check suite IN MEMORY (straight from rodata via
 /// `run_lines`; no file write, so it is not capped by `MAX_FILE_BYTES`). The one-USB hardware
@@ -765,8 +765,8 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("result", "Ok if the last command succeeded, else Err(<reason>)", "result"),
         ], true),
         "run" => help_block(ctx, "run", "run a script of commands from a file", &[
-            ("run <path>", "execute each line/command as if typed; reports ran N, failed M", "run /suite.gs"),
-            ("# … (in the file)", "lines starting with # are comments; ';' separates commands", "run /test.gs"),
+            ("run <path>", "execute each line/command as if typed; reports ran N, failed M", "run /suite.gsh"),
+            ("# … (in the file)", "lines starting with # are comments; ';' separates commands", "run /test.gsh"),
         ], true),
         "selfcheck" => help_block(ctx, "selfcheck", "run the built-in self-check suite (needs a flashed drive)", &[
             ("selfcheck", "run the embedded suite in memory; reports ran N, failed M", "selfcheck"),
@@ -969,7 +969,7 @@ fn cmd_help(ctx: &ServiceContext) -> Result<(), ShellError> {
     help_line(ctx, "clear", "clear the screen");
     help_line(ctx, "echo <text>", "print text");
     help_line(ctx, "result", "the last command's result (Ok / Err)");
-    help_line(ctx, "run <script>", "run a script of commands (.gs; # comments, ; separators)");
+    help_line(ctx, "run <script>", "run a script of commands (.gsh; # comments, ; separators)");
     help_line(ctx, "selfcheck", "run the built-in self-check suite");
     help_line(ctx, "assert ok|fails <cmd>", "verify success/failure (also: … | assert contains X)");
     ctx.console_writeln("");

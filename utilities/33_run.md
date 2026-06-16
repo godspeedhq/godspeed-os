@@ -14,7 +14,7 @@ runner**, deliberately **not** a scripting *language* (no variables, no `if`/`wh
 far-future, Appendix D).
 
 ```
-gs> run /suite.gs
+gs> run /suite.gsh
 > read /lsr/big.txt
 hello world
 > result
@@ -29,15 +29,16 @@ run: ran 4, failed 1
 Each command is **echoed** (`> cmd`) before it runs, so the serial transcript is
 self-documenting — exactly what you want when eyeballing a run on the T630.
 
-## 2. The script format (`.gs`)
+## 2. The script format (`.gsh`)
 
 - **Lines** are split on newline; a non-comment line is further split on **`;`** into commands.
   So a script is either real multi-line, *or* `cmd ; cmd ; cmd` on one line — the latter is how
   scripts are authored today (the shell can't yet type a newline into a file; a host-side editor
-  / image-baked `.gs` is the companion step).
+  / image-baked `.gsh` is the companion step).
 - **`#` comments** — a line whose first non-blank character is `#` is skipped. Annotate freely.
 - **Blank lines** are skipped.
-- `.gs` is a naming **convention**, not a mechanism — `run` does not care about the extension
+- `.gsh` is a naming **convention** (GodspeedOS shell; `.gs` is reserved for the future
+  general-purpose Godspeed language), not a mechanism — `run` does not care about the extension
   (extension-driven behaviour is the hidden magic §26.5 forbids; cf. `read` not auto-parsing).
 
 ## 3. Result and the summary
@@ -68,8 +69,8 @@ column, …). Verifying *correct output* (not just "didn't error") is the job of
 
 - **`assert`** — **built** (`utilities/34_assert.md`): `assert ok/fails <cmd>` and
   `… | assert contains X`, so a script self-verifies instead of being eyeballed.
-- **Image-baked `.gs`** — **built**: `osdev script-disk <out> <script>` bakes a script into a
-  GSFS data disk host-side (`gsfs_add_file`); `dd` it to the data drive and `run /suite.gs` on
+- **Image-baked `.gsh`** — **built**: `osdev script-disk <out> <script>` bakes a script into a
+  GSFS data disk host-side (`gsfs_add_file`); `dd` it to the data drive and `run /suite.gsh` on
   hardware, no on-device authoring. `osdev test script` proves the loop (incl. piped asserts).
 - Multi-line authoring on-device (a tiny editor, or newline-capable write).
 
