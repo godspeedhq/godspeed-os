@@ -156,12 +156,13 @@ static FB: SpinLock<Fb> = SpinLock::new(Fb {
     grid: [[b' '; MAX_COLS]; MAX_ROWS],
 });
 
-/// Safe-area inset per edge, as a percentage of each dimension. `0` = edge-to-edge:
-/// the console fills the whole framebuffer. A TV that overscans (crops ~3–5% off every
-/// edge) may clip the outermost characters — set the TV's "Just Scan" / "Screen Fit" /
-/// "1:1" picture mode so it maps one source pixel to one panel pixel. A non-zero value
-/// would re-introduce a border for displays that can't be told to stop overscanning.
-const SAFE_PCT: usize = 0;
+/// Safe-area inset per edge, as a percentage of each dimension. TVs overscan (crop ~3–5%
+/// off every edge), which clips the outermost characters at `0`. `5` insets the text by 5%
+/// per edge so it all stays visible without depending on the TV's "Just Scan" / "1:1"
+/// picture mode (which most sets bury or don't offer). Set this to `0` only on a display
+/// known not to overscan, or when the TV is in a 1:1 pixel-mapping mode, for true
+/// edge-to-edge. Harmless on a monitor — just a small border.
+const SAFE_PCT: usize = 5;
 
 /// Initialise the console from Limine's framebuffer descriptor. Called once in
 /// `_start`, right after `serial_init`, before the first `kprintln`.
