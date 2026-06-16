@@ -24,12 +24,12 @@
 
 ## 1. Spirit
 
-- **Go-simple surface.** Braces for blocks, newline-separated statements, **no trailing `;`**,
-  no parentheses around conditions, a tiny keyword set.
-- **Conditions are command results.** `Ok` is true, `Err` is false. The thing that makes
-  `if`/`while` cheap is that we already produce a `Result` for every command.
+- **Simple, explicit surface.** Braces for blocks, newline-separated statements, **no trailing
+  `;`**, no parentheses around conditions, a tiny keyword set.
+- **Conditions are command results.** `Ok` is true, `Err` is false. The thing that makes `if`
+  cheap is that we already produce a `Result` for every command.
 - **Errors are checked, not hidden.** No `set -e`-style invisible mode — you inspect `result`
-  where the error happens, the way Go writes `if err != nil { … }`. See §4.
+  right where the error can happen. See §4.
 - **Explicit and loud (the Godspeed part).** Referencing an undefined `$x` is an **error**, not
   a silent empty string. Every limit is fixed; overflow is a loud error, never silent truncation
   or a runaway loop.
@@ -37,8 +37,8 @@
 
 ## 2. Lexical
 
-- **A newline ends a statement.** Like Go, you don't write a trailing `;`. Use `;` *only* to put
-  two statements on one line — never as a line terminator (a trailing one is just ignored).
+- **A newline ends a statement.** You don't write a trailing `;`. Use `;` *only* to put two
+  statements on one line — never as a line terminator (a trailing one is just ignored).
 - `#` to end of line is a comment; blank lines are ignored.
 - Tokens: bare words (no spaces, literal), `"double quoted"` (spaces ok, `$var` expands),
   `'single quoted'` (literal, no expansion).
@@ -67,7 +67,7 @@ owner = $name
 **Command position vs value position (the one disambiguation rule).** The interpreter is always in
 one of two places, and that decides how bare text reads:
 
-- **Command position** — a statement, or right after `if` / `while` / `for … in`. Bare text **is a
+- **Command position** — a statement, or right after `if` / `for … in`. Bare text **is a
   command**; no marker needed.
 - **Value position** — the right of `let x =`, or inside `"…"`. Bare text is a **literal**. To run a
   command here and use its output, promote it with `$( … )`.
@@ -141,7 +141,7 @@ if $i + 1 > $max {
 - **Space-separated operators**, so text is never mistaken for math: `$dir/sub` is a path,
   `$n / 2` is division. String building stays interpolation (`"$a$b"`, `"$dir/sub"`), never `+`.
 - Arithmetic is **value-position only**. To use a result as a command argument, assign it first
-  (`let d = $n + $n` → `echo $d`) — the same compute-then-use discipline Go uses.
+  (`let d = $n + $n` → `echo $d`) — compute it, then use it.
 
 ## 4. Conditionals
 
@@ -180,14 +180,14 @@ if $role in core worker courier {
 }
 ```
 
-- `if <cond> { … } else if <cond> { … } else { … }` — Go-style, no parens, no `fi`.
+- `if <cond> { … } else if <cond> { … } else { … }` — braces, no parens, no `fi`.
 - Comparison ops: `== != < > <= >=` (numeric if **both** sides parse as integers, else string).
   Either side may be an arithmetic expression — `if $i + 1 > $max { … }` (§3).
 - `$x in a b c` — true if `$x` equals one of the listed words.
 
-**Failure model — explicit, Go-style (no hidden `set -e`).** A failed statement is tallied (the run
-summary already does this) and execution continues; you handle errors where they happen by checking
-`result`, the way Go checks `if err != nil`:
+**Failure model — explicit (no hidden `set -e`).** A failed statement is tallied (the run summary
+already does this) and execution continues; you handle errors where they happen by checking
+`result` right where it can fail:
 
 ```
 mkdir /sc
@@ -198,7 +198,7 @@ if result == Err {
 
 ```
 read /sc/cfg
-if result == FileNotFound {        # compare the SPECIFIC variant, like errors.Is
+if result == FileNotFound {        # compare the SPECIFIC failure kind
     write /sc/cfg "defaults"
 }
 
@@ -256,15 +256,24 @@ for i in range 2 6 {             # 2 3 4 5
 }
 ```
 
-`while`, `break`, `continue` — every loop has a hard cap, so even `while true` is safe:
+`loop` repeats until you `break` — the one unbounded loop:
 
 ```
 let i = 0
-while true {
+loop {
     let i = $i + 1
     if $i == 3 { continue }
     if $i > 5 { break }
     echo $i                       # 1 2 4 5
+}
+```
+
+A loop that should stop on a condition just breaks on it:
+
+```
+loop {
+    if read /work/ready { break }
+    let waited = $waited + 1
 }
 ```
 
@@ -274,9 +283,13 @@ while true {
   parens are optional readability). `$( )` would *flatten* the command to text and lose `$row.col`;
   `for … in` keeps the stream so it can iterate rows. (`$( )` = "the text"; `for … in` = "the stream".)
 - `for x in a b c` iterates literal words; `for x in $@` iterates the script's params.
-- `for i in range N` / `range A B` counts; `while <cond> { … }` reuses the §4 grammar.
-- `break` / `continue`. **Every loop has a hard iteration cap (default 100k)** → exceeding it is a
-  loud error, never a silent hang.
+- `for i in range N` / `range A B` counts.
+- `loop { … }` repeats until `break`. There is no `while` — a conditional loop is
+  `loop { if !cond { break } … }`, which keeps the exit explicit and visible.
+- **Two loops, one job each — and the keyword tells you if it terminates.** `for` is **bounded**:
+  it walks something finite. `loop` is the **unbounded** one: it runs until `break`, with the hard
+  iteration cap (default 100k) as a loud backstop, never a silent hang.
+- `break` / `continue`.
 
 ## 6. Switch
 
@@ -297,7 +310,7 @@ switch $1 {
 }
 ```
 
-Go-style: no fallthrough, `_` default, multiple values per arm.
+No fallthrough; `_` is the default; multiple values per arm.
 
 ## 7. Functions
 
@@ -316,7 +329,7 @@ greet Matthew                  # a function is just a command
 ensure_dir /sc
 ```
 
-Output is the value (`$( )`), result is the control (`if`/`while`):
+Output is the value (`$( )`), result is the control (used by `if`):
 
 ```
 fn full name surname {
@@ -338,7 +351,7 @@ A function is **just a command** — that's what keeps it coherent with the rest
 - `fn <name> <param…> { … }` — named positional params, bound as `$name` in the body (`$1 … $@
   $#` also available).
 - **Output is the value, result is the control.** `$(f …)` captures what the function printed;
-  its `Ok`/`Err` works in `if`/`while` like any command. `return <cond>` ends early with that
+  its `Ok`/`Err` works in conditions like any command. `return <cond>` ends early with that
   result; falling off the end returns the **last statement's** result (so a helper ending in an
   `assert` returns the assert's verdict). No separate "return value" concept.
 - **No ambient variables (the capability parallel).** A function sees only its **parameters** and
@@ -346,14 +359,14 @@ A function is **just a command** — that's what keeps it coherent with the rest
   exactly like a service gets only the capabilities it is handed (§3.1). Assignments inside are
   local and vanish on return.
 - **Defined anywhere.** A one-pass pre-scan indexes every `fn` block, so you can call a function
-  before its definition (like Go's package funcs).
-- **Bounded, not Rust-recursive.** Calls use the interpreter's explicit **call-frame stack** (a
+  before its definition (so definition order doesn't matter).
+- **Bounded, not natively recursive.** Calls use the interpreter's explicit **call-frame stack** (a
   fixed array of frames), not native recursion — so the user stack does not grow per call.
   Recursion is allowed but call depth is capped (loud error on overflow).
 
 ## 8. Builtins
 
-Each returns a `Result`, so they compose with `if`/`while`.
+Each returns a `Result`, so they compose with `if`.
 
 - `let` / `const` — declare a mutable / immutable variable.
 - `result` — the previous statement's outcome, as a value (compare `== Ok` / `== Err` / `== <Variant>`).
@@ -408,7 +421,7 @@ Bounded by design (no_std, no heap, tight 256 KiB user stack):
 | deferred actions | 8 per scope                                       |
 | script size      | embedded: rodata; on-disk file: `MAX_FILE_BYTES`  |
 
-The function call-frame stack is the explicit array above — a call pushes a frame, not a Rust
+The function call-frame stack is the explicit array above — a call pushes a frame, not a native
 stack frame — so the user stack stays flat regardless of call depth.
 
 **Execution model:** a line-oriented interpreter with an **explicit control stack** — brace-matched
@@ -435,7 +448,7 @@ both are Tier 2.)
 - **Tier 1** (~2–4 days): `let`/`const` + `$`-expansion + params, `if`/`else if`/`else`,
   comparisons + `in`, `result`/`fail`, `switch`.
 - **Tier 2** (~6–8 days): `$( )` capture, multi-line `"""…"""`, **inline integer arithmetic**
-  (`+ - * / %`, precedence, `( )`, checked), `for` (lines / rows / words / `range`), `while`,
+  (`+ - * / %`, precedence, `( )`, checked), `for` (lines / rows / words / `range`), `loop`,
   `break`/`continue`, **functions** (`fn`, pre-scan index, call-frame stack, `return`), `defer`,
   and the **record aggregators** (`count`/`sum`/`min`/`max`/`avg`).
 - **Tier 3** (resist): a string toolkit (length/slice/split), cross-file include / `source`,
@@ -561,19 +574,18 @@ echo "all checks passed"
 ```
 
 ### 13.5 retry.gs
-*`while`, `break`, and a bounded counter.*
+*`loop`, `break`, and a bounded counter.*
 
 ```
 let tries = 0
-while $tries < 3 {
+loop {
     if read /work/ready {
         echo "ready after $tries retries"
         break
     }
+    if $tries >= 3 {
+        fail "never became ready"
+    }
     let tries = $tries + 1
-}
-
-if $tries >= 3 {
-    fail "never became ready"
 }
 ```
