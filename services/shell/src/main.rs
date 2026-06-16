@@ -585,6 +585,17 @@ fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8) -> Result<
         script[..take].copy_from_slice(&body[..take]);
         slen = take;
     }
+    run_lines(ctx, cwd, &script[..slen], depth)
+}
+
+/// Execute a script body (already in memory): split into commands, run each, then print a
+/// per-command PASS/FAIL summary and the `run: ran N, failed M` tally. Shared by `run` (file
+/// source) and `selfcheck` (the embedded suite, run straight from rodata — NOT written to disk,
+/// so it is **not** bound by `MAX_FILE_BYTES`/the single-message file transfer, only by the
+/// embedded const). `#[inline(never)]`: holds the verdict array and drives `execute` in a loop
+/// (the user stack is tight — see the pipe stack-overflow lesson).
+#[inline(never)]
+fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8) -> Result<(), ShellError> {
     let mut ran = 0u32;
     let mut failed = 0u32;
     let mut last: Result<(), ShellError> = Ok(());
@@ -592,7 +603,7 @@ fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8) -> Result<
     // and count, they just don't get a summary line (loud, not silent — §26.6).
     let mut verdict = [true; RUN_MAX_CMDS];
     let mut vi = 0usize;
-    for line in script[..slen].split(|&b| b == b'\n') {
+    for line in src.split(|&b| b == b'\n') {
         let line = trim_bytes(line);
         if line.is_empty() || line[0] == b'#' { continue; } // blank or whole-line comment
         for cmd in line.split(|&b| b == b';') {
@@ -612,7 +623,7 @@ fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8) -> Result<
     // "FAIL  " is deliberately not the word "FAILED" the harness greens on absence of.
     ctx.console_writeln("--- summary ---");
     let mut j = 0usize;
-    for line in script[..slen].split(|&b| b == b'\n') {
+    for line in src.split(|&b| b == b'\n') {
         let line = trim_bytes(line);
         if line.is_empty() || line[0] == b'#' { continue; }
         for cmd in line.split(|&b| b == b';') {
@@ -629,34 +640,28 @@ fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8) -> Result<
 
 /// Cap on per-command summary lines `run` records (the verdict array). Commands past this still
 /// run and count in the totals; only their individual PASS/FAIL line is omitted.
-const RUN_MAX_CMDS: usize = 128;
+const RUN_MAX_CMDS: usize = 256;
 
 /// The self-check suite, embedded in the shell binary (so it ships with the boot image — no
-/// host-side `dd` of a data disk). `selfcheck` writes it to the mounted GSFS and runs it.
+/// host-side `dd` of a data disk). Run straight from rodata, so it can be far larger than an
+/// on-disk file (`MAX_FILE_BYTES` — a file is one ≤4 KiB IPC message; rodata is not).
 const SELFCHECK_GS: &str = include_str!("../../../scripts/t630_selfcheck.gs");
 
-/// `selfcheck` — provision + run the embedded self-check suite in one step: write
-/// `/t630_selfcheck.gs` to the mounted GSFS drive, then `run` it. The one-USB hardware checkpoint
-/// — flash the boot image, (`drives flash` a drive if it's raw), `selfcheck`. Re-runnable; you can
-/// also `run /t630_selfcheck.gs` afterwards. Refused inside a script (it would nest `run`).
+/// `selfcheck` — run the embedded self-check suite IN MEMORY (straight from rodata via
+/// `run_lines`; no file write, so it is not capped by `MAX_FILE_BYTES`). The one-USB hardware
+/// checkpoint — flash the boot image, (`drives flash` a drive if it's raw, so the file-command
+/// tests have somewhere to write), then `selfcheck`. Re-runnable (the suite creates and deletes
+/// its own files). Refused inside a script (it runs one — no nesting).
 #[inline(never)]
 fn cmd_selfcheck(ctx: &ServiceContext, cwd: &mut Cwd, depth: u8) -> Result<(), ShellError> {
     if depth > 0 {
         ctx.console_writeln("selfcheck: not available inside a script (it runs one)");
         return Err(ShellError::Unknown);
     }
-    let path = b"/t630_selfcheck.gs";
-    match fs_request(ctx, OP_WRITE_FILE, path, SELFCHECK_GS.as_bytes()) {
-        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {}
-        Some(r) if no_fs(ctx, r.payload_bytes()) => return Err(ShellError::Unknown),
-        Some(_) => {
-            ctx.console_writeln("selfcheck: could not write the suite — is a drive flashed? ('drives flash')");
-            return Err(ShellError::Unknown);
-        }
-        None => { ctx.console_writeln("selfcheck: storage unavailable (no disk?)"); return Err(ShellError::Unknown); }
-    }
-    ctx.console_writeln_fmt(format_args!("selfcheck: wrote /t630_selfcheck.gs ({} bytes) — running...", SELFCHECK_GS.len()));
-    cmd_run(ctx, cwd, "/t630_selfcheck.gs", depth)
+    ctx.console_writeln_fmt(format_args!(
+        "selfcheck: running the embedded suite ({} bytes, in memory) — needs a flashed drive for the file tests...",
+        SELFCHECK_GS.len()));
+    run_lines(ctx, cwd, SELFCHECK_GS.as_bytes(), depth)
 }
 
 /// `assert ok <cmd>` / `assert fails <cmd>` — the **result** form: run `<cmd>` and check that it
@@ -764,7 +769,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("# … (in the file)", "lines starting with # are comments; ';' separates commands", "run /test.gs"),
         ], true),
         "selfcheck" => help_block(ctx, "selfcheck", "run the built-in self-check suite (needs a flashed drive)", &[
-            ("selfcheck", "write the embedded suite to the drive and run it", "selfcheck"),
+            ("selfcheck", "run the embedded suite in memory; reports ran N, failed M", "selfcheck"),
         ], true),
         "roster" => help_block(ctx, "roster", "example record-producing service (a typed table you can pipe)", &[
             ("roster", "render the table directly (name / role / core)", "roster"),

@@ -26,8 +26,8 @@ Host-side developer CLI (§17). Builds for the developer's machine, not the kern
 | `osdev test chaos`          | Run chaos / partial-failure tests (C1–C7) ✅ 7/7 |
 | `osdev test chaos-brutal`   | Run brutal chaos tests (BC1–BC7) ✅ 7/7 |
 | `osdev test shell`          | Scripted shell smoke-test: boot, help, cores, status, unknown |
-| `osdev test files`          | Files/records/pipes/`result`/`run`/`assert` over a RAW AHCI disk (112 checks) |
-| `osdev test script`         | Bake a self-checking `.gs` (with piped asserts) into a GSFS disk, boot, `run /suite.gs`, assert `ran N, failed 0` — the host-baked-script loop |
+| `osdev test files`          | Files/records/pipes/`result`/`run`/`assert` over a RAW AHCI disk (129 checks) |
+| `osdev test script`         | Two paths: (1) bake `scripts/smoke.gs` into a GSFS disk and `run /smoke.gs` (host-baked-file path, incl. a piped assert); (2) `selfcheck` — run the shell-embedded extensive suite (`scripts/t630_selfcheck.gs`) IN MEMORY. Both assert `ran N, failed 0`. The embedded suite isn't a disk file because an on-disk file is one ≤4 KiB IPC message (`MAX_FILE_BYTES`); rodata is not. |
 | `osdev mkfs <image>`        | Format a disk image as GSFS0003 (empty) |
 | `osdev script-disk <out> <script.gs>` | Build a flashable GSFS data disk with `<script>` baked in as `/<basename>` — `dd` it to the data drive, boot, `run /<basename>` (the hardware self-check) |
 | `osdev validate`            | Validate all contracts against the JSON schema |

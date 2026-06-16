@@ -1462,9 +1462,11 @@ fn run_script_test() {
     let image_path = disk_image::create(kernel_elf, limine_dir);
     disk_image::install_bootloader(limine_dir, &image_path);
 
-    // The suite is the SAME file you bake for hardware (`scripts/t630_selfcheck.gs`) — CI verifies
-    // exactly what flashes. It creates its own files (a freshly-baked disk has only the suite).
-    let script_path = "scripts/t630_selfcheck.gs";
+    // Host-baked FILE path: bake the SMALL smoke suite (an on-disk .gs is one ≤4 KiB IPC
+    // message — MAX_FILE_BYTES — so the big extensive suite can't be a file). The extensive
+    // coverage is the embedded suite, exercised below via `selfcheck` (run in memory). This
+    // file proves the script-disk → run-from-file path incl. a piped assert.
+    let script_path = "scripts/smoke.gs";
     let suite = std::fs::read(script_path)
         .unwrap_or_else(|e| { eprintln!("script-test: cannot read {}: {}", script_path, e); std::process::exit(1); });
     let name = std::path::Path::new(script_path).file_name().and_then(|s| s.to_str()).unwrap_or("suite.gs");
