@@ -1487,11 +1487,12 @@ pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u3
         None => { println!("script-test: FAIL — `run /{script_name}` timed out"); fail += 1; }
     }
 
-    // Embed-and-autoprovision: `selfcheck` writes the shell-embedded suite to the disk
-    // (no host bake) and runs it — proving the one-USB hardware path where the operator
-    // flashes only os.img, `drives flash`es the SSD, then types `selfcheck`.
+    // Embed-and-autoprovision: `selfcheck` runs the shell-embedded extensive suite IN MEMORY
+    // (no host bake) — the one-USB hardware path where the operator flashes only os.img,
+    // `drives flash`es the SSD, then types `selfcheck`. The big suite + many service spawns
+    // take a while under TCG, so allow a generous wall-clock window.
     send(&mut write_half, b"selfcheck\r");
-    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(40)) {
+    match collect_until(&buf, &mut cursor, b"gs>", Duration::from_secs(150)) {
         Some(r) => {
             if r.contains("failed 0") && !r.contains("FAILED") {
                 println!("script-test: PASS — embedded `selfcheck` ran green (failed 0)"); pass += 1;
