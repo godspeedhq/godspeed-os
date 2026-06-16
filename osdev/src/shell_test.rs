@@ -1150,20 +1150,26 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     //    SDK, `encode`s it, and the shell `decode`s it straight back — NO `from json` round-trip
     //    (docs/records.md, sdk/rust/CLAUDE.md). Proves records cross a service boundary as records.
     match run!(b"roster | where role=core\r", 16) {
-        Some(r) => check!(r.contains("vesta") && !r.contains("atlas"),
+        Some(r) => check!(r.contains("Matthew") && !r.contains("Mark"),
                           "roster codec: where filters records decoded from the service stream"),
         None    => { println!("files-test: FAIL — roster|where timeout"); fail += 1; }
     }
     match run!(b"roster | select name core | to json\r", 16) {
-        Some(r) => check!(r.contains("\"name\": \"hermes\"") && r.contains("\"core\":") && !r.contains("\"role\""),
+        Some(r) => check!(r.contains("\"name\": \"Mark\"") && r.contains("\"core\":") && !r.contains("\"role\""),
                           "roster codec: select + to json projects the decoded records"),
         None    => { println!("files-test: FAIL — roster|select timeout"); fail += 1; }
     }
     // It really is a record stream now (not text): a text filter is the loud, guided error.
-    match run!(b"roster | match atlas\r", 16) {
+    match run!(b"roster | match Mark\r", 16) {
         Some(r) => check!(r.contains("record stream") && r.contains("where"),
                           "roster codec: a text filter on the decoded records errors with guidance"),
         None    => { println!("files-test: FAIL — roster|match guard timeout"); fail += 1; }
+    }
+    // Bare `roster` (no pipe) renders the same table directly.
+    match run!(b"roster\r", 16) {
+        Some(r) => check!(r.contains("Matthew") && r.contains("John") && r.contains("role"),
+                          "roster: callable bare — renders the record table"),
+        None    => { println!("files-test: FAIL — bare roster timeout"); fail += 1; }
     }
 
     // ── ls as a record producer: directory entries become typed rows (name/type/size) ──
@@ -1289,15 +1295,15 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
 
     // ── assert: the verifying command. Content form (the pipe sink) is tested interactively —
     //    a `|` can't yet be authored into a script via `write` (the shell pipes the write line).
-    match run!(b"roster | where role=core | assert contains vesta\r", 16) {
+    match run!(b"roster | where role=core | assert contains Matthew\r", 16) {
         Some(r) => check!(r.contains("assert: ok"), "assert: contains holds on matching output"),
         None    => { println!("files-test: FAIL — assert contains timeout"); fail += 1; }
     }
-    match run!(b"roster | where role=worker | assert contains vesta\r", 16) {
+    match run!(b"roster | where role=worker | assert contains Matthew\r", 16) {
         Some(r) => check!(r.contains("assert: FAILED"), "assert: contains fails on non-matching output"),
         None    => { println!("files-test: FAIL — assert contains(fail) timeout"); fail += 1; }
     }
-    match run!(b"roster | where role=core | assert lacks atlas\r", 16) {
+    match run!(b"roster | where role=core | assert lacks Mark\r", 16) {
         Some(r) => check!(r.contains("assert: ok"), "assert: lacks holds when text is absent"),
         None    => { println!("files-test: FAIL — assert lacks timeout"); fail += 1; }
     }

@@ -37,9 +37,10 @@ find a.txt /t | where type=file | assert contains /t/a.txt
 observe now | sort reverse ticks | assert contains shell
 
 # --- a record SERVICE over the binary wire codec (no from json) ---
-roster | where role=core | assert contains vesta
-roster | where role=worker | assert lacks vesta
-roster | select name core | to json | assert contains hermes
+roster | where role=core | assert contains Matthew
+roster | where role=worker | assert lacks Matthew
+roster | where role=worker | assert contains John
+roster | select name core | to json | assert contains Luke
 
 # --- byte pipes: filter built-ins + service filters ---
 greet | assert contains hello

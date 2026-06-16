@@ -452,6 +452,8 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         "date"    => cmd_date(ctx, if argc >= 2 { args[1] } else { "" }),
         "status"  => cmd_status(ctx),
         "observe" => if argc >= 2 && args[1] == "now" { cmd_observe_now(ctx) } else { cmd_observe_live(ctx) },
+        // The example record SERVICE, callable bare (renders its table) as well as piped.
+        "roster"  => cmd_roster(ctx),
         // No argument → show the shell's OWN capabilities (authority is explicit; the shell can
         // inspect itself like any other service). `caps <bogus>` → Err(FileNotFound).
         "caps"    => if argc < 2 { cmd_caps(ctx, "shell") } else { cmd_caps(ctx, args[1]) },
@@ -586,6 +588,10 @@ fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8) -> Result<
     let mut ran = 0u32;
     let mut failed = 0u32;
     let mut last: Result<(), ShellError> = Ok(());
+    // Per-command verdicts, for the end-of-run summary. Bounded; commands past the cap still run
+    // and count, they just don't get a summary line (loud, not silent — §26.6).
+    let mut verdict = [true; RUN_MAX_CMDS];
+    let mut vi = 0usize;
     for line in script[..slen].split(|&b| b == b'\n') {
         let line = trim_bytes(line);
         if line.is_empty() || line[0] == b'#' { continue; } // blank or whole-line comment
@@ -596,13 +602,34 @@ fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8) -> Result<
             ctx.console_write("> ");
             ctx.console_writeln(str_of(cmd));
             last = execute(ctx, cmd, cwd, last, depth + 1);
+            if vi < RUN_MAX_CMDS { verdict[vi] = last.is_ok(); }
+            vi += 1;
             ran += 1;
             if last.is_err() { failed += 1; }
+        }
+    }
+    // End-of-run summary: PASS/FAIL per command (re-split identically, pairing with `verdict`).
+    // "FAIL  " is deliberately not the word "FAILED" the harness greens on absence of.
+    ctx.console_writeln("--- summary ---");
+    let mut j = 0usize;
+    for line in script[..slen].split(|&b| b == b'\n') {
+        let line = trim_bytes(line);
+        if line.is_empty() || line[0] == b'#' { continue; }
+        for cmd in line.split(|&b| b == b';') {
+            let cmd = trim_bytes(cmd);
+            if cmd.is_empty() { continue; }
+            ctx.console_write(if j < RUN_MAX_CMDS && !verdict[j] { "FAIL  " } else { "PASS  " });
+            ctx.console_writeln(str_of(cmd));
+            j += 1;
         }
     }
     ctx.console_writeln_fmt(format_args!("run: ran {}, failed {}", ran, failed));
     if failed == 0 { Ok(()) } else { Err(ShellError::Unknown) }
 }
+
+/// Cap on per-command summary lines `run` records (the verdict array). Commands past this still
+/// run and count in the totals; only their individual PASS/FAIL line is omitted.
+const RUN_MAX_CMDS: usize = 128;
 
 /// The self-check suite, embedded in the shell binary (so it ships with the boot image — no
 /// host-side `dd` of a data disk). `selfcheck` writes it to the mounted GSFS and runs it.
@@ -686,7 +713,7 @@ const UTIL_VERSION: &str = "0.1.0";
 /// Utilities that self-document (gates the `help`/`version` intercept in `execute`).
 const UTILS: &[&str] = &[
     "help", "result", "run", "assert", "selfcheck",
-    "echo", "clear", "about", "mem", "cores", "date", "status", "observe", "caps",
+    "echo", "clear", "about", "mem", "cores", "date", "status", "observe", "caps", "roster",
     "spawn", "kill", "restart", "reboot", "drives", "ls", "cd", "read", "write",
     "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count", "sort",
     "first", "last",
@@ -739,11 +766,16 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "selfcheck" => help_block(ctx, "selfcheck", "run the built-in self-check suite (needs a flashed drive)", &[
             ("selfcheck", "write the embedded suite to the drive and run it", "selfcheck"),
         ], true),
+        "roster" => help_block(ctx, "roster", "example record-producing service (a typed table you can pipe)", &[
+            ("roster", "render the table directly (name / role / core)", "roster"),
+            ("roster | where <col><op><val>", "filter rows — it is a record source for the pipe verbs", "roster | where role=core"),
+            ("roster | select <cols> | to json", "project columns / render as JSON at the edge", "roster | select name core | to json"),
+        ], true),
         "assert" => help_block(ctx, "assert", "verify a result or output; Ok if it holds, else Err", &[
             ("assert ok <command>", "the command must succeed", "assert ok read /notes.txt"),
             ("assert fails <command>", "the command must fail (negative test)", "assert fails read /nope"),
             ("assert fails-with <V> <command>", "must fail with the named Err variant", "assert fails-with FileNotFound read /nope"),
-            ("<producer> | assert contains <text>", "piped output must contain <text>", "roster | where role=core | assert contains vesta"),
+            ("<producer> | assert contains <text>", "piped output must contain <text>", "roster | where role=core | assert contains Matthew"),
             ("… | assert lacks <text> / empty", "must NOT contain / must be empty", "ls / | assert lacks secret"),
         ], true),
         "echo" => help_block(ctx, "echo", "print text", &[
@@ -946,6 +978,7 @@ fn cmd_help(ctx: &ServiceContext) -> Result<(), ShellError> {
     help_line(ctx, "status", "list all live tasks");
     help_line(ctx, "observe [now]", "live view (q to quit) / one-shot frame");
     help_line(ctx, "caps [service]", "capabilities (default: this shell)");
+    help_line(ctx, "roster", "example record service (a typed table; try roster | where role=core)");
     help_line(ctx, "spawn <name>", "start a service");
     help_line(ctx, "kill <name>", "stop a service");
     help_line(ctx, "restart <name> [core]", "restart a service");
@@ -1603,6 +1636,23 @@ fn byte_filter(ctx: &ServiceContext, stage: &str, s: &mut Stream) -> bool {
     true
 }
 
+/// `roster` (bare) — render the example record service's table directly: the same data a pipe
+/// sees (`roster | where role=core`). Spawns roster, drains its binary wire encoding (`Table::
+/// encode`), decodes it back into a `Table`, and renders the grid. `#[inline(never)]` — it holds a
+/// 64 KiB `Cap` on the user stack (USER_STACK_PAGES is tight; see [[project-shell-stack-pipe]]).
+#[inline(never)]
+fn cmd_roster(ctx: &ServiceContext) -> Result<(), ShellError> {
+    let mut cap = Cap::new();
+    if !drain_service(ctx, "roster", None, &mut cap) { return Err(ShellError::Unknown); }
+    match Table::decode(cap.bytes()) {
+        Ok(t) => { let mut o = Out::Console; t.to_grid(&mut OutSink { ctx, out: &mut o }); Ok(()) }
+        Err(why) => {
+            ctx.console_writeln_fmt(format_args!("roster: bad record stream — {}", why));
+            Err(ShellError::Unknown)
+        }
+    }
+}
+
 fn cmd_status(ctx: &ServiceContext) -> Result<(), ShellError> {
     let t = build_status_table(ctx);
     { let mut o = Out::Console; t.to_grid(&mut OutSink { ctx, out: &mut o }); }
@@ -1967,17 +2017,22 @@ fn pipe_write_file(ctx: &ServiceContext, cwd: &Cwd, path_arg: &str, data: &[u8])
 fn lookup_sink(ctx: &ServiceContext, sink: &str) -> Option<CapHandle> {
     // A freshly-spawned filter registers its input endpoint only once it actually RUNS — which on
     // real multi-core hardware is up to ~1 s after spawn (it's on another core and hasn't been
-    // scheduled yet). `yield_cpu` is near-free when the shell is the only runnable task on its core,
-    // so a *yield-counted* wait elapses in microseconds and loses the race (QEMU's TCG interleaves
-    // cores on one host thread, hiding this — it bit only on hardware). Bound the wait by REAL time
-    // instead: the per-core timer tick (~100 Hz, §9.1) advances on every timer IRQ regardless of
-    // yielding. Wait up to ~3 s of wall-clock, returning the instant the name appears.
+    // scheduled yet). Retry the registry lookup until it appears, bounded by REAL time.
+    //
+    // CRITICAL — do NOT `yield_cpu` in this wait. `CORE_TOTAL_TICKS` counts scheduler *quanta*
+    // (the timer IRQ **and** every `yield_current` — scheduler.rs), so yielding here inflates the
+    // very counter we use as the clock: 50 yields/iteration drove it past the budget in ~4 ms and
+    // the wait collapsed to nothing (the bug that bit the T630 twice — first as a yield-count wait,
+    // then as a yield-polluted tick wait). `registry_lookup` already blocks on `recv` for the
+    // registry's reply — a cooperative wait that lets the registry and the filter run and does NOT
+    // bump the tick counter (`block_and_reschedule` doesn't). So a plain retry loop is both
+    // cooperative (each iteration deschedules on the IPC) and real-time-bounded: with no yields the
+    // counter advances ~only on the 100 Hz timer IRQ — a true wall-clock.
     let core  = ctx.core_id();
     let start = ctx.inspect_core_total_ticks(core);
     loop {
         if let Some(h) = ctx.registry_lookup(sink) { return Some(h); }
         if ctx.inspect_core_total_ticks(core).wrapping_sub(start) >= FILTER_WAIT_TICKS { return None; }
-        for _ in 0..50 { ctx.yield_cpu(); }
     }
 }
 
