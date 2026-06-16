@@ -345,6 +345,9 @@ fn strip_quotes(s: &str) -> &str {
 enum ShellError {
     /// A file/path the command needed does not exist.
     FileNotFound,
+    /// The action was refused by authority/policy (a protected core service, a session-critical
+    /// service). Mirrors the kernel's "no ambient authority" refusals (§3.1).
+    Denied,
     /// An `assert` did not hold (the test failed).
     AssertFailed,
     /// A failure not yet categorised into its own variant.
@@ -355,6 +358,7 @@ impl ShellError {
     fn name(self) -> &'static str {
         match self {
             ShellError::FileNotFound => "FileNotFound",
+            ShellError::Denied => "Denied",
             ShellError::AssertFailed => "AssertFailed",
             ShellError::Unknown => "Unknown",
         }
@@ -455,21 +459,21 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
             if argc < 2 { cmd_caps(ctx, "shell"); } else { cmd_caps(ctx, args[1]); }
             Ok(())
         }
-        // service-control + drives: not yet on Result (their internals still print-and-return);
-        // a missing arg is a usage Err, the action itself is Ok-wrapped for now.
+        // service-control — on the Result model: `assert fails spawn supervisor` holds (a
+        // protected core service is `Err(Denied)`); a missing arg is a usage `Err`.
         "spawn"   => {
             if argc < 2 { ctx.console_writeln("usage: spawn <name>"); Err(ShellError::Unknown) }
-            else { cmd_spawn(ctx, args[1]); Ok(()) }
+            else { cmd_spawn(ctx, args[1]) }
         }
         "kill"    => {
             if argc < 2 { ctx.console_writeln("usage: kill <name>"); Err(ShellError::Unknown) }
-            else { cmd_kill(ctx, args[1]); Ok(()) }
+            else { cmd_kill(ctx, args[1]) }
         }
         "restart" => {
             if argc < 2 { ctx.console_writeln("usage: restart <name> [core]"); Err(ShellError::Unknown) }
             else {
                 let core = if argc >= 3 { parse_u32(args[2]) } else { None };
-                cmd_restart(ctx, args[1], core); Ok(())
+                cmd_restart(ctx, args[1], core)
             }
         }
         "reboot"  => { cmd_reboot(ctx); Ok(()) }
@@ -505,12 +509,12 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
             else { cmd_find(ctx, cwd, args[1], if argc >= 3 { args[2] } else { "/" }, &mut Out::Console) }
         }
         "tree"    => cmd_tree(ctx, cwd, if argc >= 2 { args[1] } else { "" }, &mut Out::Console),
-        // filter built-ins (direct form) — not yet on Result; Ok-wrapped.
-        "match"   => { cmd_match(ctx, cwd, &args, argc); Ok(()) }
-        "count"   => { cmd_count(ctx, cwd, &args, argc); Ok(()) }
-        "sort"    => { cmd_sort(ctx, cwd, &args, argc); Ok(()) }
-        "first"   => { cmd_take(ctx, cwd, &args, argc, false); Ok(()) }
-        "last"    => { cmd_take(ctx, cwd, &args, argc, true); Ok(()) }
+        // filter built-ins (direct form) — on the Result model (Err(FileNotFound) on a bad path).
+        "match"   => cmd_match(ctx, cwd, &args, argc),
+        "count"   => cmd_count(ctx, cwd, &args, argc),
+        "sort"    => cmd_sort(ctx, cwd, &args, argc),
+        "first"   => cmd_take(ctx, cwd, &args, argc, false),
+        "last"    => cmd_take(ctx, cwd, &args, argc, true),
         other => {
             // Build "unknown: <cmd>" in a stack buffer to avoid two ctx.log calls
             let mut buf = [0u8; 64];
@@ -622,6 +626,17 @@ fn cmd_assert(ctx: &ServiceContext, cwd: &mut Cwd, rest: &str, depth: u8) -> Res
             let held = if verb == "ok" { r.is_ok() } else { r.is_err() };
             assert_verdict(ctx, held, verb, cmd)
         }
+        // `assert fails-with <Variant> <cmd>` — pin the SPECIFIC failure (precise negative test).
+        "fails-with" => {
+            let (variant, inner) = split_first(cmd);
+            if variant.is_empty() || inner.is_empty() {
+                ctx.console_writeln("usage: assert fails-with <Variant> <command>  (e.g. FileNotFound, Denied)");
+                return Err(ShellError::Unknown);
+            }
+            let r = execute(ctx, inner.as_bytes(), cwd, Ok(()), depth + 1);
+            let held = matches!(r, Err(e) if e.name() == variant);
+            assert_verdict(ctx, held, "fails-with", variant)
+        }
         "contains" | "lacks" | "empty" => {
             ctx.console_writeln_fmt(format_args!(
                 "assert: '{}' checks a pipe — use: <producer> | assert {} …", verb, verb));
@@ -700,6 +715,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "assert" => help_block(ctx, "assert", "verify a result or output; Ok if it holds, else Err", &[
             ("assert ok <command>", "the command must succeed", "assert ok read /notes.txt"),
             ("assert fails <command>", "the command must fail (negative test)", "assert fails read /nope"),
+            ("assert fails-with <V> <command>", "must fail with the named Err variant", "assert fails-with FileNotFound read /nope"),
             ("<producer> | assert contains <text>", "piped output must contain <text>", "roster | where role=core | assert contains vesta"),
             ("… | assert lacks <text> / empty", "must NOT contain / must be empty", "ls / | assert lacks secret"),
         ], true),
@@ -1765,22 +1781,22 @@ fn report(ctx: &ServiceContext, prefix: &str, name: &str) {
     ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or(prefix));
 }
 
-fn cmd_spawn(ctx: &ServiceContext, name: &str) {
+fn cmd_spawn(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     if is_observe_variant(name) {
         ctx.console_writeln(OBSERVE_HINT);
-        return;
+        return Err(ShellError::Unknown);
     }
     if is_core_service(name) {
         ctx.console_writeln(PROTECTED_MSG);
-        return;
+        return Err(ShellError::Denied);
     }
     if slot_of(ctx, name).is_some() {
         report(ctx, "already running: ", name);
-        return;
+        return Err(ShellError::Unknown);
     }
     match ctx.spawn(name) {
-        Ok(())  => report(ctx, "spawned: ", name),
-        Err(_)  => report(ctx, "spawn failed (unknown service?): ", name),
+        Ok(())  => { report(ctx, "spawned: ", name); Ok(()) }
+        Err(_)  => { report(ctx, "spawn failed (unknown service?): ", name); Err(ShellError::Unknown) }
     }
 }
 
@@ -1912,45 +1928,45 @@ fn lookup_sink(ctx: &ServiceContext, sink: &str) -> Option<CapHandle> {
     None
 }
 
-fn cmd_kill(ctx: &ServiceContext, name: &str) {
+fn cmd_kill(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     if is_core_service(name) {
         ctx.console_writeln(PROTECTED_MSG);
-        return;
+        return Err(ShellError::Denied);
     }
     if let Some(msg) = session_critical_msg(name) {
         ctx.console_writeln(msg);
-        return;
+        return Err(ShellError::Denied);
     }
     if is_observe_variant(name) {
         ctx.console_writeln(OBSERVE_HINT);
-        return;
+        return Err(ShellError::Unknown);
     }
     if slot_of(ctx, name).is_none() {
         report(ctx, "not running: ", name);
-        return;
+        return Err(ShellError::Unknown);
     }
     match ctx.kill(name) {
-        Ok(())  => report(ctx, "killed: ", name),
-        Err(_)  => report(ctx, "kill failed: ", name),
+        Ok(())  => { report(ctx, "killed: ", name); Ok(()) }
+        Err(_)  => { report(ctx, "kill failed: ", name); Err(ShellError::Unknown) }
     }
 }
 
-fn cmd_restart(ctx: &ServiceContext, name: &str, core: Option<u32>) {
+fn cmd_restart(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<(), ShellError> {
     if is_core_service(name) {
         ctx.console_writeln(PROTECTED_MSG);
-        return;
+        return Err(ShellError::Denied);
     }
     if let Some(msg) = session_critical_msg(name) {
         ctx.console_writeln(msg);
-        return;
+        return Err(ShellError::Denied);
     }
     if is_observe_variant(name) {
         ctx.console_writeln(OBSERVE_HINT);
-        return;
+        return Err(ShellError::Unknown);
     }
     match ctx.restart(name, core) {
-        Ok(()) => report(ctx, "restarted: ", name),
-        Err(_) => report(ctx, "restart failed: ", name),
+        Ok(()) => { report(ctx, "restarted: ", name); Ok(()) }
+        Err(_) => { report(ctx, "restart failed: ", name); Err(ShellError::Unknown) }
     }
 }
 
@@ -2782,29 +2798,31 @@ fn parse_match<'a>(args: &[&'a str], argc: usize, start: usize) -> Option<(bool,
 /// `match [except] <pattern> <path>` — print the lines of `<path>` that match (or, with
 /// `except`, that do not). The pipe form filters piped input instead; either way `match` is a
 /// FILTER, never a pipe producer (use `read <path> | match …` to feed a pipeline from a file).
-fn cmd_match(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) {
+fn cmd_match(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) -> Result<(), ShellError> {
     let (invert, pattern, path) = match parse_match(args, argc, 1) {
         Some(t) => t,
-        None => { ctx.console_writeln("usage: match [except] <pattern> <path>"); return; }
+        None => { ctx.console_writeln("usage: match [except] <pattern> <path>"); return Err(ShellError::Unknown); }
     };
     if path.is_empty() {
         ctx.console_writeln("match: a path is required (or pipe input: <producer> | match <pattern>)");
-        return;
+        return Err(ShellError::Unknown);
     }
     let mut buf = [0u8; PATH_MAX];
-    let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return };
+    let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let reply = match fs_request(ctx, OP_READ_FILE, abspath, &[]) {
         Some(r) => r,
-        None => { ctx.console_writeln("match: storage unavailable"); return; }
+        None => { ctx.console_writeln("match: storage unavailable"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return; }
+    if no_fs(ctx, p) { return Err(ShellError::Unknown); }
     if p.first() == Some(&FS_OK) && p.len() >= 5 {
         let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
         let end = (5 + n).min(p.len());
         match_lines(ctx, &p[5..end], pattern.as_bytes(), invert, &mut Out::Console);
+        Ok(())
     } else {
         ctx.console_writeln_fmt(format_args!("match: not found: {}", str_of(abspath)));
+        Err(ShellError::FileNotFound)
     }
 }
 
@@ -2871,26 +2889,28 @@ fn write_count(ctx: &ServiceContext, input: &[u8], out: &mut Out) {
 
 /// `count <path>` — count the lines / words / bytes of a file. The pipe form `<producer> |
 /// count` counts piped input instead; either way `count` consumes input (never a producer).
-fn cmd_count(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) {
+fn cmd_count(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) -> Result<(), ShellError> {
     let path = if argc >= 2 { args[1] } else { "" };
     if path.is_empty() {
         ctx.console_writeln("count: a path is required (or pipe input: <producer> | count)");
-        return;
+        return Err(ShellError::Unknown);
     }
     let mut buf = [0u8; PATH_MAX];
-    let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return };
+    let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let reply = match fs_request(ctx, OP_READ_FILE, abspath, &[]) {
         Some(r) => r,
-        None => { ctx.console_writeln("count: storage unavailable"); return; }
+        None => { ctx.console_writeln("count: storage unavailable"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return; }
+    if no_fs(ctx, p) { return Err(ShellError::Unknown); }
     if p.first() == Some(&FS_OK) && p.len() >= 5 {
         let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
         let end = (5 + n).min(p.len());
         write_count(ctx, &p[5..end], &mut Out::Console);
+        Ok(())
     } else {
         ctx.console_writeln_fmt(format_args!("count: not found: {}", str_of(abspath)));
+        Err(ShellError::FileNotFound)
     }
 }
 
@@ -2948,26 +2968,28 @@ fn write_sorted(ctx: &ServiceContext, input: &[u8], reverse: bool, out: &mut Out
 
 /// `sort [reverse] <path>` — print a file's lines in order. The pipe form `<producer> | sort`
 /// sorts piped input instead; either way `sort` consumes input (never a producer).
-fn cmd_sort(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) {
+fn cmd_sort(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) -> Result<(), ShellError> {
     let (reverse, path) = parse_sort(args, argc, 1);
     if path.is_empty() {
         ctx.console_writeln("sort: a path is required (or pipe input: <producer> | sort)");
-        return;
+        return Err(ShellError::Unknown);
     }
     let mut buf = [0u8; PATH_MAX];
-    let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return };
+    let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let reply = match fs_request(ctx, OP_READ_FILE, abspath, &[]) {
         Some(r) => r,
-        None => { ctx.console_writeln("sort: storage unavailable"); return; }
+        None => { ctx.console_writeln("sort: storage unavailable"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return; }
+    if no_fs(ctx, p) { return Err(ShellError::Unknown); }
     if p.first() == Some(&FS_OK) && p.len() >= 5 {
         let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
         let end = (5 + n).min(p.len());
         write_sorted(ctx, &p[5..end], reverse, &mut Out::Console);
+        Ok(())
     } else {
         ctx.console_writeln_fmt(format_args!("sort: not found: {}", str_of(abspath)));
+        Err(ShellError::FileNotFound)
     }
 }
 
@@ -3031,28 +3053,30 @@ fn write_last(ctx: &ServiceContext, input: &[u8], n: usize, out: &mut Out) {
 
 /// `first [N] <path>` / `last [N] <path>` — print a file's first/last N lines (default 10). The
 /// pipe form `<producer> | first [N]` takes from piped input; either way it consumes input.
-fn cmd_take(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize, last: bool) {
+fn cmd_take(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize, last: bool) -> Result<(), ShellError> {
     let name = if last { "last" } else { "first" };
     let (n, path) = parse_take(args, argc, 1);
     if path.is_empty() {
         ctx.console_writeln_fmt(format_args!("{}: a path is required (or pipe: <producer> | {} [N])", name, name));
-        return;
+        return Err(ShellError::Unknown);
     }
     let mut buf = [0u8; PATH_MAX];
-    let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return };
+    let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let reply = match fs_request(ctx, OP_READ_FILE, abspath, &[]) {
         Some(r) => r,
-        None => { ctx.console_writeln_fmt(format_args!("{}: storage unavailable", name)); return; }
+        None => { ctx.console_writeln_fmt(format_args!("{}: storage unavailable", name)); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return; }
+    if no_fs(ctx, p) { return Err(ShellError::Unknown); }
     if p.first() == Some(&FS_OK) && p.len() >= 5 {
         let cnt = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
         let end = (5 + cnt).min(p.len());
         if last { write_last(ctx, &p[5..end], n, &mut Out::Console); }
         else    { write_first(ctx, &p[5..end], n, &mut Out::Console); }
+        Ok(())
     } else {
         ctx.console_writeln_fmt(format_args!("{}: not found: {}", name, str_of(abspath)));
+        Err(ShellError::FileNotFound)
     }
 }
 

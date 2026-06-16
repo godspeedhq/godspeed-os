@@ -31,12 +31,14 @@ assert: ok
 Runs `<command>` (its own output/errors print as usual), then judges its `Result`:
 
 - `assert ok <command>` — holds iff the command returned `Ok`.
-- `assert fails <command>` — holds iff it returned `Err`.
+- `assert fails <command>` — holds iff it returned `Err` (any failure).
+- `assert fails-with <Variant> <command>` — holds iff it returned `Err(<Variant>)` *specifically*
+  (e.g. `assert fails-with FileNotFound read /nope`, `assert fails-with Denied spawn supervisor`).
 
 `assert fails …` is the **negative-test** surface — §22's discipline that every test has a
 positive *and* a negative case, runnable on hardware: `assert fails read /nope` proves the
-guardrail refuses. (Today it checks *that* it failed, not *which* `Err`; a `fails-with <Variant>`
-form is a later refinement once more commands name their variants — `32_result.md`.)
+guardrail refuses, and `fails-with` pins *which* refusal (the variant names are in `32_result.md`:
+`FileNotFound`, `Denied`, …).
 
 ## 3. Content form — `<producer> | assert <check> [text]`
 
