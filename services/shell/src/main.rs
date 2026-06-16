@@ -438,27 +438,21 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         _ => {}
     }
 
-    // Dispatch. The file/storage commands return a real `Result` (Ok/Err); the trivial info
-    // commands that don't meaningfully fail are wrapped `Ok`; an unknown command is `Err`.
+    // Dispatch — every command returns its `Result` (Ok/Err); an unknown command is `Err`.
+    // The info commands always succeed (they return `Ok`), but they are on the model uniformly.
     return match args[0] {
-        "help"    => { cmd_help(ctx); Ok(()) }
-        "clear"   => { cmd_clear(ctx); Ok(()) }
-        "echo"    => { cmd_echo(ctx, strip_quotes(s["echo".len()..].trim()), &mut Out::Console); Ok(()) }
-        "about"   => { cmd_about(ctx); Ok(()) }
-        "mem"     => { cmd_mem(ctx); Ok(()) }
-        "cores"   => { cmd_cores(ctx); Ok(()) }
-        "date"    => { cmd_date(ctx, if argc >= 2 { args[1] } else { "" }); Ok(()) }
-        "status"  => { cmd_status(ctx); Ok(()) }
-        "observe" => {
-            if argc >= 2 && args[1] == "now" { cmd_observe_now(ctx); } else { cmd_observe_live(ctx); }
-            Ok(())
-        }
-        "caps"    => {
-            // No argument → show the shell's OWN capabilities (authority is
-            // explicit; the shell can inspect itself like any other service).
-            if argc < 2 { cmd_caps(ctx, "shell"); } else { cmd_caps(ctx, args[1]); }
-            Ok(())
-        }
+        "help"    => cmd_help(ctx),
+        "clear"   => cmd_clear(ctx),
+        "echo"    => cmd_echo(ctx, strip_quotes(s["echo".len()..].trim()), &mut Out::Console),
+        "about"   => cmd_about(ctx),
+        "mem"     => cmd_mem(ctx),
+        "cores"   => cmd_cores(ctx),
+        "date"    => cmd_date(ctx, if argc >= 2 { args[1] } else { "" }),
+        "status"  => cmd_status(ctx),
+        "observe" => if argc >= 2 && args[1] == "now" { cmd_observe_now(ctx) } else { cmd_observe_live(ctx) },
+        // No argument → show the shell's OWN capabilities (authority is explicit; the shell can
+        // inspect itself like any other service). `caps <bogus>` → Err(FileNotFound).
+        "caps"    => if argc < 2 { cmd_caps(ctx, "shell") } else { cmd_caps(ctx, args[1]) },
         // service-control — on the Result model: `assert fails spawn supervisor` holds (a
         // protected core service is `Err(Denied)`); a missing arg is a usage `Err`.
         "spawn"   => {
@@ -476,8 +470,8 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
                 cmd_restart(ctx, args[1], core)
             }
         }
-        "reboot"  => { cmd_reboot(ctx); Ok(()) }
-        "drives"  => { cmd_drives(ctx, &args, argc); Ok(()) }
+        "reboot"  => cmd_reboot(ctx), // `-> !` coerces to the match arm's Result type
+        "drives"  => cmd_drives(ctx, &args, argc),
         // ── file/storage commands — converted to the Result model ──
         // ("read" and "result" are on the Result model above, not here.)
         "ls"      => cmd_ls(ctx, cwd, if argc >= 2 { args[1] } else { "" }, &mut Out::Console),
@@ -896,7 +890,7 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
     true
 }
 
-fn cmd_help(ctx: &ServiceContext) {
+fn cmd_help(ctx: &ServiceContext) -> Result<(), ShellError> {
     // Rule 6 (0_conventions.md): help output's first line is `<util> <version>`.
     ctx.console_writeln_fmt(format_args!("help {} — GodspeedOS shell commands", UTIL_VERSION));
     ctx.console_writeln("");
@@ -956,6 +950,7 @@ fn cmd_help(ctx: &ServiceContext) {
     help_line(ctx, "reboot", "hardware reset");
     ctx.console_writeln("");
     ctx.console_writeln("Type '<command> help' for usage + examples, '<command> version' for the version.");
+    Ok(())
 }
 
 /// One "  command  description" row. The command is left-justified to a fixed
@@ -969,27 +964,30 @@ fn help_line(ctx: &ServiceContext, cmd: &str, desc: &str) {
 /// Clear the screen. Emits ANSI erase-display + cursor-home: the framebuffer
 /// console honours `ESC[2J` (clear + home) and `ESC[H`, and a serial terminal
 /// does too, so both surfaces clear. The shell loop reprints the prompt after.
-fn cmd_clear(ctx: &ServiceContext) {
+fn cmd_clear(ctx: &ServiceContext) -> Result<(), ShellError> {
     ctx.console_write("\x1b[2J\x1b[H");
+    Ok(())
 }
 
 /// Print the rest of the line verbatim.
-fn cmd_echo(ctx: &ServiceContext, text: &str, out: &mut Out) {
+fn cmd_echo(ctx: &ServiceContext, text: &str, out: &mut Out) -> Result<(), ShellError> {
     out.line(ctx, text);
+    Ok(())
 }
 
 /// One-line identity for the system.
-fn cmd_about(ctx: &ServiceContext) {
+fn cmd_about(ctx: &ServiceContext) -> Result<(), ShellError> {
     ctx.console_writeln("GodspeedOS: a capability-based microkernel (v1 milestone)");
     ctx.console_writeln_fmt(format_args!("  running on {} core(s)", ctx.inspect_core_count()));
     ctx.console_writeln("  Created by Bankole Ogundero.");
+    Ok(())
 }
 
 /// Physical-memory usage, straight from the kernel's frame allocator (held via
 /// the INTROSPECT cap). Frames are 4 KiB pages: KiB = frames*4, MiB = frames/256.
 /// The percentage is computed in hundredths (two decimals, integer math) so the
 /// microkernel's tiny footprint shows as e.g. 0.03% rather than rounding to 0%.
-fn cmd_mem(ctx: &ServiceContext) {
+fn cmd_mem(ctx: &ServiceContext) -> Result<(), ShellError> {
     let total = ctx.inspect_kernel_total_frames();
     let free = ctx.inspect_kernel_free_frames();
     let used = total.saturating_sub(free);
@@ -997,6 +995,7 @@ fn cmd_mem(ctx: &ServiceContext) {
     ctx.console_writeln_fmt(format_args!(
         "mem: {} KiB used / {} MiB total ({}.{:02}% used, {} MiB free)",
         used * 4, total / 256, pct_h / 100, pct_h % 100, free / 256));
+    Ok(())
 }
 
 fn cmd_reboot(ctx: &ServiceContext) -> ! {
@@ -1004,13 +1003,14 @@ fn cmd_reboot(ctx: &ServiceContext) -> ! {
     ctx.reboot()
 }
 
-fn cmd_cores(ctx: &ServiceContext) {
+fn cmd_cores(ctx: &ServiceContext) -> Result<(), ShellError> {
     let n = ctx.inspect_core_count();
     let mut buf = [0u8; 32];
     let mut pos = 0usize;
     write_bytes(&mut buf, &mut pos, b"cores: ");
     write_u32(&mut buf, &mut pos, n);
     ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("?"));
+    Ok(())
 }
 
 /// Wall-clock date+time from the hardware RTC. Default renders a full timestamp
@@ -1018,7 +1018,7 @@ fn cmd_cores(ctx: &ServiceContext) {
 /// 1970-01-01 instead. Deliberately just these two forms — no clock-setting, format
 /// strings, or timezones (§26.2: minimal surface). The subcommand is `epoch`, not
 /// `unix`: this is not POSIX, so the vocabulary doesn't borrow its name.
-fn cmd_date(ctx: &ServiceContext, arg: &str) {
+fn cmd_date(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
     const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     let dt = ctx.datetime();
     if arg == "epoch" {
@@ -1029,6 +1029,7 @@ fn cmd_date(ctx: &ServiceContext, arg: &str) {
             "{} {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
             wd, dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second));
     }
+    Ok(())
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -1568,24 +1569,25 @@ fn byte_filter(ctx: &ServiceContext, stage: &str, s: &mut Stream) -> bool {
     true
 }
 
-fn cmd_status(ctx: &ServiceContext) {
+fn cmd_status(ctx: &ServiceContext) -> Result<(), ShellError> {
     let t = build_status_table(ctx);
     { let mut o = Out::Console; t.to_grid(&mut OutSink { ctx, out: &mut o }); }
     if t.overflow() {
         ctx.console_writeln_fmt(format_args!("status: more than {} rows shown (bounded)", REC_MAX_ROWS));
     }
+    Ok(())
 }
 
 /// `caps <service>` — list the capabilities a service holds. A thin broker over
 /// the kernel's `task_caps` introspection (held via the INTROSPECT cap). Makes
 /// authority visible on the box itself (§26.9): for each cap, the resource it
 /// targets and the rights it carries.
-fn cmd_caps(ctx: &ServiceContext, name: &str) {
+fn cmd_caps(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     let slot = match slot_of(ctx, name) {
         Some(s) => s,
         None => {
             ctx.console_writeln("caps: no such live service");
-            return;
+            return Err(ShellError::FileNotFound);
         }
     };
     let mut caps = [CapInfo::default(); 64];
@@ -1600,7 +1602,7 @@ fn cmd_caps(ctx: &ServiceContext, name: &str) {
 
     if n == 0 {
         ctx.console_writeln("  (none)");
-        return;
+        return Ok(());
     }
     // Legend: left column is the resource the cap targets, right column the rights
     // it grants (§7.4). log_write/spawn/console_read/console_push/introspect are
@@ -1634,6 +1636,7 @@ fn cmd_caps(ctx: &ServiceContext, name: &str) {
         if r & 0x20 != 0 { write_bytes(&mut buf, &mut pos, b"revoke "); }
         ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("?"));
     }
+    Ok(())
 }
 
 /// Scheduler slot of a live service by name, scanned once (no wait). `None` if
@@ -1654,11 +1657,11 @@ fn slot_of(ctx: &ServiceContext, name: &str) -> Option<u32> {
 /// never the shell's spawn/kill/restart. The shell spawns it; it prints one frame
 /// via its own caps and parks. Kill any parked prior instance first (one-shot
 /// observe has no graceful self-exit in v1), so at most one lingers.
-fn cmd_observe_now(ctx: &ServiceContext) {
+fn cmd_observe_now(ctx: &ServiceContext) -> Result<(), ShellError> {
     let _ = ctx.kill("observe-now");
     if ctx.spawn("observe-now").is_err() {
         ctx.console_writeln("observe: failed to spawn observe-now");
-        return;
+        return Err(ShellError::Unknown);
     }
     // observe-now's frame is serial-bound (~100+ ms) and prints asynchronously, so
     // returning immediately would put the next prompt ABOVE the frame. Wait until
@@ -1675,6 +1678,7 @@ fn cmd_observe_now(ctx: &ServiceContext) {
             }
         }
     }
+    Ok(())
 }
 
 /// `observe` (live) — broker the full-screen foreground view (Stage 2c).
@@ -1685,11 +1689,11 @@ fn cmd_observe_now(ctx: &ServiceContext) {
 /// suppresses echo, repaints, polls `q`), then wait — without touching
 /// `console_read` — until it parks (q pressed → it restored the console and
 /// parked) or dies. Then we clean up and our read loop resumes.
-fn cmd_observe_live(ctx: &ServiceContext) {
+fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
     let _ = ctx.kill("observe-live"); // clear any stale instance
     if ctx.spawn("observe-live").is_err() {
         ctx.console_writeln("observe: failed to spawn observe-live");
-        return;
+        return Err(ShellError::Unknown);
     }
     if let Some(slot) = find_running_slot(ctx, "observe-live") {
         // Wait for the foreground child to finish. The bound is the child's
@@ -1710,6 +1714,7 @@ fn cmd_observe_live(ctx: &ServiceContext) {
     // the shell, not the kernel, owns echo (it echoes printable bytes itself).
     ctx.console_echo(false);
     ctx.console_write("\x1b[?25h");
+    Ok(())
 }
 
 /// Slot of a just-spawned, still-live service by name (not a killed/dead one),
@@ -1885,7 +1890,7 @@ fn is_record_producer_service(name: &str) -> bool {
 fn run_producer(ctx: &ServiceContext, cwd: &Cwd, cmdline: &str, out: &mut Out) {
     let (cmd, arg) = split_first(cmdline);
     match cmd {
-        "echo"         => cmd_echo(ctx, arg, out),
+        "echo"         => { let _ = cmd_echo(ctx, arg, out); }
         "read" | "cat" => { let _ = cmd_read(ctx, cwd, arg, out); }
         // "ls" and "find" are record producers (handled on the record path), not text here.
         "tree"         => { let _ = cmd_tree(ctx, cwd, arg, out); }
@@ -3118,31 +3123,32 @@ impl PathStack {
 // Step 3: the data primitives `flash` / `label` / list (boot layer + multi-drive later).
 // ---------------------------------------------------------------------------
 
-fn cmd_drives(ctx: &ServiceContext, args: &[&str], argc: usize) {
+fn cmd_drives(ctx: &ServiceContext, args: &[&str], argc: usize) -> Result<(), ShellError> {
     let sub = if argc >= 2 { args[1] } else { "" };
     match sub {
         ""        => drives_list(ctx),
         "flash"   => {
             // `drives flash [drive] [label]` — the drive selector is optional (one drive).
             let (sel, label) = split_drive_value(args, argc);
-            if drive_sel_ok(ctx, sel) { drives_flash(ctx, label); }
+            if drive_sel_ok(ctx, sel) { drives_flash(ctx, label) } else { Err(ShellError::Unknown) }
         }
         "label"   => {
             // `drives label [drive] <name>` — selector optional; name required.
             let (sel, name) = split_drive_value(args, argc);
-            if name.is_empty() { ctx.console_writeln("usage: drives label [drive] <name>"); }
-            else if drive_sel_ok(ctx, sel) { drives_label(ctx, name); }
+            if name.is_empty() { ctx.console_writeln("usage: drives label [drive] <name>"); Err(ShellError::Unknown) }
+            else if drive_sel_ok(ctx, sel) { drives_label(ctx, name) } else { Err(ShellError::Unknown) }
         }
         "reset"   => {
             // `drives reset [drive]` — un-format back to raw (optional selector, no value).
             let sel = if argc >= 3 { args[2] } else { "" };
-            if drive_sel_ok(ctx, sel) { drives_reset(ctx); }
+            if drive_sel_ok(ctx, sel) { drives_reset(ctx) } else { Err(ShellError::Unknown) }
         }
         // `drives help` / `drives version` and `drives <sub> help` are handled by the
         // generic per-utility intercept in `execute` (0_conventions.md).
         other     => {
             ctx.console_writeln_fmt(format_args!("drives: unknown subcommand '{}'", other));
             util_help(ctx, "drives");
+            Err(ShellError::Unknown)
         }
     }
 }
@@ -3173,15 +3179,15 @@ fn drive_sel_ok(ctx: &ServiceContext, sel: &str) -> bool {
 
 
 /// `drives` — list the attached drive (single-drive in step 3; index 0).
-fn drives_list(ctx: &ServiceContext) {
+fn drives_list(ctx: &ServiceContext) -> Result<(), ShellError> {
     let reply = match ctx.request_with_reply("fs", &Message::from_bytes(&[OP_DRIVES_INFO])) {
         Some(r) => r,
-        None => { ctx.console_writeln("drives: storage unavailable (no fs?)"); return; }
+        None => { ctx.console_writeln("drives: storage unavailable (no fs?)"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
     if p.first() != Some(&FS_OK) || p.len() < 28 {
         ctx.console_writeln("drives: no disk found");
-        return;
+        return Err(ShellError::Unknown);
     }
     let mounted = p[1] != 0;
     let mib = u64_le(&p[2..10]) / 2048;
@@ -3199,18 +3205,19 @@ fn drives_list(ctx: &ServiceContext) {
         ctx.console_writeln_fmt(format_args!(
             "  0  {:<11}  raw      {} MiB  - not formatted -", "-", mib));
     }
+    Ok(())
 }
 
 /// `drives flash [label]` — format the drive as GSFS after a `[y/N]` confirm. Destructive.
-fn drives_flash(ctx: &ServiceContext, label: &str) {
+fn drives_flash(ctx: &ServiceContext, label: &str) -> Result<(), ShellError> {
     if label.len() > LABEL_MAX {
         ctx.console_writeln_fmt(format_args!("drives: label too long (max {})", LABEL_MAX));
-        return;
+        return Err(ShellError::Unknown);
     }
     ctx.console_write("This ERASES the drive. Continue? [y/N] ");
     if !read_confirm(ctx) {
         ctx.console_writeln("drives: aborted");
-        return;
+        return Err(ShellError::Unknown); // the requested format did not happen
     }
     let lb = label.as_bytes();
     let ll = lb.len().min(LABEL_MAX);
@@ -3221,35 +3228,37 @@ fn drives_flash(ctx: &ServiceContext, label: &str) {
     match ctx.request_with_reply("fs", &Message::from_bytes(&req[..2 + ll])) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
             ctx.console_writeln("drives: formatted as GSFS — mounted, ready to use now (no reboot)");
+            Ok(())
         }
-        Some(_) => ctx.console_writeln("drives: flash FAILED (no disk, or disk too small)"),
-        None    => ctx.console_writeln("drives: storage unavailable (no fs?)"),
+        Some(_) => { ctx.console_writeln("drives: flash FAILED (no disk, or disk too small)"); Err(ShellError::Unknown) }
+        None    => { ctx.console_writeln("drives: storage unavailable (no fs?)"); Err(ShellError::Unknown) }
     }
 }
 
 /// `drives reset` — un-format the drive back to raw (zero the superblock). Destructive;
 /// a quick clean slate for re-testing the raw→flash path. NOT a secure wipe.
-fn drives_reset(ctx: &ServiceContext) {
+fn drives_reset(ctx: &ServiceContext) -> Result<(), ShellError> {
     ctx.console_write("This un-formats the drive back to raw (ERASES). Continue? [y/N] ");
     if !read_confirm(ctx) {
         ctx.console_writeln("drives: aborted");
-        return;
+        return Err(ShellError::Unknown);
     }
     match ctx.request_with_reply("fs", &Message::from_bytes(&[OP_RESET])) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
             ctx.console_writeln("drives: reset to raw — 'drives flash' to use again");
+            Ok(())
         }
-        Some(_) => ctx.console_writeln("drives: reset FAILED (no disk?)"),
-        None    => ctx.console_writeln("drives: storage unavailable (no fs?)"),
+        Some(_) => { ctx.console_writeln("drives: reset FAILED (no disk?)"); Err(ShellError::Unknown) }
+        None    => { ctx.console_writeln("drives: storage unavailable (no fs?)"); Err(ShellError::Unknown) }
     }
 }
 
 /// `drives label <name>` — name / rename the drive (rewrites the superblock).
-fn drives_label(ctx: &ServiceContext, name: &str) {
+fn drives_label(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     let nb = name.as_bytes();
     if nb.is_empty() || nb.len() > LABEL_MAX {
         ctx.console_writeln_fmt(format_args!("drives: label must be 1..{} chars", LABEL_MAX));
-        return;
+        return Err(ShellError::Unknown);
     }
     let ll = nb.len();
     let mut req = [0u8; 2 + LABEL_MAX];
@@ -3259,9 +3268,10 @@ fn drives_label(ctx: &ServiceContext, name: &str) {
     match ctx.request_with_reply("fs", &Message::from_bytes(&req[..2 + ll])) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
             ctx.console_writeln_fmt(format_args!("drives: labelled '{}'", name));
+            Ok(())
         }
-        Some(_) => ctx.console_writeln("drives: label FAILED (no filesystem? run 'drives flash' first)"),
-        None    => ctx.console_writeln("drives: storage unavailable (no fs?)"),
+        Some(_) => { ctx.console_writeln("drives: label FAILED (no filesystem? run 'drives flash' first)"); Err(ShellError::Unknown) }
+        None    => { ctx.console_writeln("drives: storage unavailable (no fs?)"); Err(ShellError::Unknown) }
     }
 }
 

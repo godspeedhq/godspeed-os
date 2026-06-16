@@ -52,24 +52,29 @@ message is the *detail*.
 
 ## 4. Conversion status (incremental)
 
-The shell is being moved to the `Result` model **incrementally** (§26.2). Converted so far:
+**Every command is on the `Result` model.** `execute()` returns the command's genuine `Result` —
+there is no `Ok`-wrapping that could hide a failure:
 
-- **`read`** + the **file/storage commands** — `ls`, `cd`, `write` (+`append`), `mkdir`,
-  `copy` (+recursive), `move`, `rename`, `delete`, `find`, `tree`, and the filter built-ins'
-  direct form `match`/`count`/`sort`/`first`/`last`: `Ok` on success, `Err(FileNotFound)` for a
-  missing path, `Err(Unknown)` for other failures.
+- **File/storage** — `read`, `ls`, `cd`, `write` (+`append`), `mkdir`, `copy` (+recursive),
+  `move`, `rename`, `delete`, `find`, `tree`, and the filter built-ins' direct form
+  `match`/`count`/`sort`/`first`/`last`: `Ok` on success, `Err(FileNotFound)` for a missing path,
+  `Err(Unknown)` otherwise.
 - **Service-control** — `spawn`/`kill`/`restart`: `Err(Denied)` for a protected core /
   session-critical service (so `assert fails spawn supervisor` holds), `Err(Unknown)` otherwise.
-- **An unknown command is `Err`** (so `assert fails typo` holds; a typo in a script counts).
+- **Introspection** — `caps <service>` → `Err(FileNotFound)` for a name that isn't live;
+  `observe`/`observe now` → `Err(Unknown)` if the view fails to spawn.
+- **`drives`** — list / `flash` / `label` / `reset` → `Err` on no disk, a bad selector, an
+  unknown subcommand, or a declined `[y/N]`.
 - **Pipelines** — `pipe_run` returns the pipeline's `Result` (a `| assert` sink sets it; a stage
   error is `Err`).
+- **An unknown command is `Err`** (so `assert fails typo` holds; a typo in a script counts).
+- **The info commands** (`echo`/`about`/`mem`/`cores`/`date`/`status`/`clear`/`help`) genuinely
+  can't fail, so they return `Ok` — uniformly on the model, not specially wrapped. (`reboot`
+  never returns.)
 
-The `ShellError` variants now in use: `FileNotFound`, `Denied`, `AssertFailed`, `Unknown`.
-
-Still **`Ok`-wrapped** (don't meaningfully fail, so it would be noise): the info commands
-(`echo`/`about`/`mem`/`cores`/`date`/`status`/`observe`/`caps`/`clear`/`help`) and `drives`
-(its sub-verbs print their own status). Future variants as needs appear: `StorageUnavailable`,
-`EndpointDead`, … (reuse kernel names — §7.7).
+`ShellError` variants in use: `FileNotFound`, `Denied`, `AssertFailed`, `Unknown`. New ones are
+added as a failure earns its own name (`StorageUnavailable`, `EndpointDead`, … reusing kernel
+names where they surface — §7.7).
 
 ## 5. Later (separate so it can grow)
 
