@@ -1268,11 +1268,11 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL — result(blank) timeout"); fail += 1; }
     }
 
-    // ── run: execute a script of commands (the .gs runner). Authored on one line with `;`
+    // ── run: execute a script of commands (the .gsh runner). Authored on one line with `;`
     //    separators (no newline typing needed). The script reads a present then a missing file,
     //    printing `result` after each — so it exercises echo, execution, and pass/fail counting.
-    let _ = run!(b"write /suite.gs read /lsr/big.txt ; result ; read /lsr/nope ; result\r", 10);
-    match run!(b"run /suite.gs\r", 16) {
+    let _ = run!(b"write /suite.gsh read /lsr/big.txt ; result ; read /lsr/nope ; result\r", 10);
+    match run!(b"run /suite.gsh\r", 16) {
         Some(r) => {
             check!(r.contains("> read /lsr/big.txt") && r.contains("hello world"),
                    "run: echoes and executes a script command");
@@ -1282,13 +1282,13 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None => { println!("files-test: FAIL — run timeout"); fail += 3; }
     }
     // a missing script reports not found (and `run` returns Err).
-    match run!(b"run /no_such.gs\r", 10) {
+    match run!(b"run /no_such.gsh\r", 10) {
         Some(r) => check!(r.contains("not found"), "run: a missing script reports not found"),
         None    => { println!("files-test: FAIL — run(missing) timeout"); fail += 1; }
     }
     // scripts cannot nest: a `run` line inside a script is refused.
-    let _ = run!(b"write /nest.gs run /suite.gs\r", 10);
-    match run!(b"run /nest.gs\r", 14) {
+    let _ = run!(b"write /nest.gsh run /suite.gsh\r", 10);
+    match run!(b"run /nest.gsh\r", 14) {
         Some(r) => check!(r.contains("cannot run another script"), "run: nested run is refused (stack-bounded)"),
         None    => { println!("files-test: FAIL — run(nest) timeout"); fail += 1; }
     }
@@ -1322,8 +1322,8 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     }
     // a self-checking script: standalone asserts via `run`, aggregated. (No `|`, so it can be
     // authored with `write`.) Both hold → 0 failures.
-    let _ = run!(b"write /check.gs assert ok read /lsr/big.txt ; assert fails read /lsr/nope\r", 10);
-    match run!(b"run /check.gs\r", 16) {
+    let _ = run!(b"write /check.gsh assert ok read /lsr/big.txt ; assert fails read /lsr/nope\r", 10);
+    match run!(b"run /check.gsh\r", 16) {
         Some(r) => check!(r.contains("run: ran 2, failed 0"), "assert: a self-checking script passes (run aggregates)"),
         None    => { println!("files-test: FAIL — assert script timeout"); fail += 1; }
     }
@@ -1412,7 +1412,7 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     }
 }
 
-/// Boot bare-metal with a GSFS disk that has a self-checking `.gs` baked in (host-side), then
+/// Boot bare-metal with a GSFS disk that has a self-checking `.gsh` baked in (host-side), then
 /// `run /<script_name>` — proving the flash-and-run loop and piped asserts in a script.
 pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u32) {
     println!("script-test: booting (smp={smp}) with a host-baked GSFS suite disk");

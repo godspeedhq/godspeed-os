@@ -99,7 +99,7 @@ enum Commands {
     Validate,
     /// Format a disk image with a GodspeedOS filesystem superblock (docs/persistence.md §6).
     Mkfs { image: String },
-    /// Build a flashable GSFS data disk with a `.gs` script baked in (run it on hardware).
+    /// Build a flashable GSFS data disk with a `.gsh` script baked in (run it on hardware).
     ScriptDisk { out: String, script: String },
 }
 
@@ -199,7 +199,7 @@ fn cmd_mkfs(image: &str) {
 }
 
 /// Bake a file into a GSFS0003 image (host-side mirror of the `fs` write path) — used to ship a
-/// `.gs` script on a flashable data disk, so the OS can `run /suite.gs` on hardware with no
+/// `.gsh` script on a flashable data disk, so the OS can `run /suite.gsh` on hardware with no
 /// on-device authoring. Allocates a contiguous extent, writes the content, adds a root
 /// `file_record`, and updates the free count. Intended right after `format_superblock` (minimal,
 /// unfragmented layout). `name` ≤ 38 bytes; fits in the single root directory block (8 entries).
@@ -274,7 +274,7 @@ fn cmd_script_disk(out: &str, script: &str) {
     let content = std::fs::read(script)
         .unwrap_or_else(|e| { eprintln!("script-disk: cannot read {}: {}", script, e); std::process::exit(1); });
     let name = std::path::Path::new(script).file_name()
-        .and_then(|s| s.to_str()).unwrap_or("suite.gs");
+        .and_then(|s| s.to_str()).unwrap_or("suite.gsh");
     if let Some(parent) = std::path::Path::new(out).parent() { let _ = std::fs::create_dir_all(parent); }
     std::fs::write(out, vec![0u8; 16 * 1024 * 1024])
         .unwrap_or_else(|e| { eprintln!("script-disk: cannot create {}: {}", out, e); std::process::exit(1); });
@@ -1449,11 +1449,11 @@ fn run_files_test() {
     crate::shell_test::run_files(&image_path, persist, 4);
 }
 
-/// Host-baked-script test: bake a self-checking `.gs` suite into a GSFS data disk (the way a
-/// suite ships to hardware), boot with it attached, and `run /suite.gs`. Proves the whole
+/// Host-baked-script test: bake a self-checking `.gsh` suite into a GSFS data disk (the way a
+/// suite ships to hardware), boot with it attached, and `run /suite.gsh`. Proves the whole
 /// flash-and-run loop AND piped asserts inside a script (which can't be authored on-device).
 fn run_script_test() {
-    println!("\n=== script: a host-baked .gs suite, run on boot (GSFS AHCI disk) ===");
+    println!("\n=== script: a host-baked .gsh suite, run on boot (GSFS AHCI disk) ===");
     cmd_build_bare_metal();
 
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
@@ -1462,14 +1462,14 @@ fn run_script_test() {
     let image_path = disk_image::create(kernel_elf, limine_dir);
     disk_image::install_bootloader(limine_dir, &image_path);
 
-    // Host-baked FILE path: bake the SMALL smoke suite (an on-disk .gs is one ≤4 KiB IPC
+    // Host-baked FILE path: bake the SMALL smoke suite (an on-disk .gsh is one ≤4 KiB IPC
     // message — MAX_FILE_BYTES — so the big extensive suite can't be a file). The extensive
     // coverage is the embedded suite, exercised below via `selfcheck` (run in memory). This
     // file proves the script-disk → run-from-file path incl. a piped assert.
-    let script_path = "scripts/smoke.gs";
+    let script_path = "scripts/smoke.gsh";
     let suite = std::fs::read(script_path)
         .unwrap_or_else(|e| { eprintln!("script-test: cannot read {}: {}", script_path, e); std::process::exit(1); });
-    let name = std::path::Path::new(script_path).file_name().and_then(|s| s.to_str()).unwrap_or("suite.gs");
+    let name = std::path::Path::new(script_path).file_name().and_then(|s| s.to_str()).unwrap_or("suite.gsh");
 
     let _ = std::fs::create_dir_all("build/tests");
     let disk = "build/tests/script_disk.img";
