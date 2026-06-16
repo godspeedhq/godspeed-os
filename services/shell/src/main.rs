@@ -1960,11 +1960,21 @@ fn pipe_write_file(ctx: &ServiceContext, cwd: &Cwd, path_arg: &str, data: &[u8])
 
 /// Look up a just-spawned service's endpoint via the registry, retrying while it registers.
 fn lookup_sink(ctx: &ServiceContext, sink: &str) -> Option<CapHandle> {
-    for _ in 0..200 {
+    // A freshly-spawned filter registers its input endpoint only once it actually RUNS — which on
+    // real multi-core hardware is up to ~1 s after spawn (it's on another core and hasn't been
+    // scheduled yet). `yield_cpu` is near-free when the shell is the only runnable task on its core,
+    // so a *yield-counted* wait elapses in microseconds and loses the race (QEMU's TCG interleaves
+    // cores on one host thread, hiding this — it bit only on hardware). Bound the wait by REAL time
+    // instead: the per-core timer tick (~100 Hz, §9.1) advances on every timer IRQ regardless of
+    // yielding. Wait up to ~3 s of wall-clock, returning the instant the name appears.
+    let core  = ctx.core_id();
+    let start = ctx.inspect_core_total_ticks(core);
+    const MAX_TICKS: u64 = 300; // ~3 s at the 10 ms quantum
+    loop {
         if let Some(h) = ctx.registry_lookup(sink) { return Some(h); }
+        if ctx.inspect_core_total_ticks(core).wrapping_sub(start) >= MAX_TICKS { return None; }
         for _ in 0..50 { ctx.yield_cpu(); }
     }
-    None
 }
 
 fn cmd_kill(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
