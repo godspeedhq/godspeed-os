@@ -13,6 +13,8 @@
 #     (a line with '|' is a pipeline; the trailing `assert` is its sink instead).
 #   - `<producer> | … | assert contains|lacks|empty <text>` is the CONTENT form.
 #   - match/count/first/last are byte filters; where/select/sort/to/from work on records.
+#   - exhaustive operator coverage runs on FREE producers (status, ls, json) to avoid
+#     spawning a service per line; roster/greet/upper lines are kept lean.
 
 # ===== meta: the result model + the assert forms themselves =====
 assert ok echo hello
@@ -21,6 +23,7 @@ assert fails-with Unknown totallybogus
 assert ok result
 echo one two three | assert contains two
 echo keep this | assert lacks secret
+echo "spaced words stay" | assert contains spaced words stay
 echo nothing | match zzz | assert empty
 
 # ===== self-documentation: <util> help / <util> version =====
@@ -28,7 +31,12 @@ assert ok help
 assert ok status help
 assert ok read help
 assert ok assert help
+assert ok mem help
+assert ok ls help
+assert ok run help
+assert ok roster help
 assert ok find version
+assert ok read version
 assert ok clear help
 
 # ===== system info (these print directly; they are not pipe producers) =====
@@ -38,31 +46,42 @@ assert ok mem
 assert ok date
 assert ok date epoch
 
-# ===== introspection producers: status / caps =====
+# ===== introspection producers: status / caps (+ every where operator, no spawn) =====
 assert ok status
 status | assert contains shell
 status | where name=shell | assert contains shell
+status | where name!=shell | assert lacks shell
 status | where core=0 | assert contains shell
-status | select name core | assert contains shell
+status | where state=Running | assert contains shell
+status | where slot>=0 | assert contains shell
+status | where core<1 | assert contains shell
+status | where name~super | assert contains supervisor
+status | select name state | assert contains shell
 status | sort name | assert contains supervisor
+status | sort reverse slot | assert contains shell
 assert ok caps
+caps | assert contains introspect
 caps shell | assert contains introspect
 caps shell | where resource=spawn | assert contains spawn
+caps shell | select resource | assert contains introspect
 assert fails caps nosuchservice
 assert fails-with FileNotFound caps nosuchservice
 
 # ===== lifecycle guardrails (negative only — safe, deterministic) =====
 assert fails spawn supervisor
 assert fails-with Denied spawn supervisor
-assert fails spawn init
+assert fails-with Denied spawn init
 assert fails kill supervisor
 assert fails-with Denied kill supervisor
+assert fails-with Denied kill init
 assert fails kill shell
 assert fails spawn nosuchservice
+assert fails-with Unknown spawn nosuchservice
 assert fails kill nosuchservice
 assert fails restart supervisor
+assert fails restart nosuchservice
 
-# ===== files: create / read / overwrite / append =====
+# ===== files: create / read / overwrite / append / empty / quoted =====
 mkdir /sc
 assert ok ls /sc
 assert fails mkdir /sc
@@ -75,6 +94,10 @@ write append /sc/a.txt MORE
 read /sc/a.txt | assert contains worldMORE
 write append /sc/fresh.txt born
 read /sc/fresh.txt | assert contains born
+write /sc/empty.txt
+read /sc/empty.txt | assert empty
+write /sc/q.txt "two words"
+read /sc/q.txt | assert contains two words
 assert fails read /sc/missing.txt
 assert fails-with FileNotFound read /sc/missing.txt
 
@@ -82,6 +105,8 @@ assert fails-with FileNotFound read /sc/missing.txt
 assert fails mkdir /sc/x/y/z
 mkdir /sc/x/y/z parents
 assert ok ls /sc/x/y/z
+mkdir /sc/x/y2 parents
+assert ok ls /sc/x/y2
 mkdir /sc/d1
 write /sc/d1/f.txt data
 assert fails delete /sc/d1
@@ -90,36 +115,53 @@ assert ok read /sc/d1/f.txt
 # ===== copy / move / rename (positive + negative) =====
 copy /sc/a.txt /sc/b.txt
 read /sc/b.txt | assert contains worldMORE
+assert ok read /sc/a.txt
 assert fails copy /sc/missing.txt /sc/z.txt
 copy /sc/d1 /sc/d2 recursive
 assert ok read /sc/d2/f.txt
 move /sc/b.txt /sc/c.txt
 assert ok read /sc/c.txt
 assert fails read /sc/b.txt
-assert fails move /sc/missing.txt /sc/q.txt
+assert fails move /sc/missing.txt /sc/q2.txt
 rename /sc/c.txt renamed.txt
 assert ok read /sc/renamed.txt
 write /sc/keep.txt x
 assert fails rename /sc/renamed.txt keep.txt
 
-# ===== cd: relative paths + negative =====
+# ===== cd: absolute / relative / parent / negative =====
 cd /sc
 assert ok read a.txt
+ls | assert contains a.txt
+cd /sc/d1
+cd ..
 ls | assert contains a.txt
 cd -
 assert ok read /sc/a.txt
 assert fails cd /sc/a.txt
 cd /
 
-# ===== ls / find / tree as record producers =====
+# ===== ls / find / tree as record producers (still referencing d1/d2) =====
 ls /sc | where type=file | assert contains a.txt
 ls /sc | where type=dir | assert contains d1
+ls /sc | where type=file | assert lacks d1
 ls /sc | select name | assert contains a.txt
+ls / | where type=dir | assert contains sc
 find a.txt /sc | assert contains /sc/a.txt
 find f.txt /sc | where type=file | assert contains /sc/d1/f.txt
+find fresh.txt | assert contains /sc/fresh.txt
+find *.txt /sc | assert contains fresh.txt
 assert ok find nomatchxyz /sc
 tree /sc | assert contains d1
+tree /sc | assert contains d2
 tree /sc | assert contains x
+
+# ===== directory move / rename (after the d1/d2 checks above) =====
+move /sc/d2 /sc/d3
+assert ok read /sc/d3/f.txt
+assert fails read /sc/d2/f.txt
+rename /sc/d1 dd1
+assert ok read /sc/dd1/f.txt
+assert fails read /sc/d1/f.txt
 
 # ===== byte pipes: producers + filters (each line spawns a service; kept lean) =====
 greet | assert contains hello
@@ -130,28 +172,32 @@ greet | sort | last 1 | assert contains ambient
 echo lower CASE | upper | assert contains LOWER CASE
 echo alpha beta gamma | match beta | assert contains beta
 
-# ===== record service over the binary wire codec (roster) — one line per operator =====
+# ===== record service over the binary wire codec (roster) — lean operator sample =====
 assert ok roster
 roster | where role=core | assert contains Matthew
 roster | where role!=core | assert lacks Matthew
-roster | where core=0 | assert contains Matthew
 roster | where core>0 | assert lacks Matthew
-roster | where core<2 | assert contains Mark
 roster | where name~ar | assert contains Mark
 roster | sort reverse core | assert contains John
 roster | to json | assert contains role
+roster | to json | from json | where role=core | assert contains Matthew
 roster | select name core | to json | assert contains Luke
 
-# ===== json <-> records bridge =====
+# ===== json <-> records bridge (exhaustive where/select/sort — no service spawn) =====
 write /sc/data.json [{"name":"x","n":1},{"name":"y","n":2},{"name":"z","n":3}]
 read /sc/data.json | from json | assert contains y
 read /sc/data.json | from json | where n>1 | assert contains z
 read /sc/data.json | from json | where n>1 | assert lacks x
 read /sc/data.json | from json | where n<2 | assert contains x
 read /sc/data.json | from json | where n=2 | assert contains y
+read /sc/data.json | from json | where n!=2 | assert lacks y
+read /sc/data.json | from json | where n>=2 | assert lacks x
+read /sc/data.json | from json | where n<=1 | assert contains x
+read /sc/data.json | from json | where name~y | assert contains y
 read /sc/data.json | from json | select name | assert contains z
+read /sc/data.json | from json | select name n | to yaml | assert contains name
+read /sc/data.json | from json | sort n | assert contains x
 read /sc/data.json | from json | sort reverse n | assert contains z
-read /sc/data.json | from json | to yaml | assert contains name
 
 # ===== cleanup: proves delete + delete recursive =====
 delete /sc/a.txt
