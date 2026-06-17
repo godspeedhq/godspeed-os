@@ -7,7 +7,7 @@
 
 //! `fs` — userspace filesystem service (persistence, v2; §15, docs/persistence.md).
 //!
-//! **GSFS0004 — checksummed scalable format (docs/persistence.md §6.4 + §6.6).** Three on-disk
+//! **GSFS0005 — checksummed scalable format (docs/persistence.md §6.4 + §6.6).** Three on-disk
 //! structures and no more: a **superblock**, a **free bitmap** (1 bit/block, read on
 //! demand — the only global structure, a free *map* not a file index), and the
 //! **directory tree** of **self-describing `file_record` entries** (`{type, name, size,
@@ -31,16 +31,23 @@ use godspeed_sdk::{CapHandle, Message, ServiceContext};
 mod crc32;
 use crc32::crc32;
 
-// ── On-disk format — MUST match `osdev format_superblock` (persistence.md §6.6). ──
-// GSFS0004 adds integrity checksums (no layout churn otherwise): a superblock CRC32 and a
-// per-directory-block CRC32, both verified on read — corruption is a loud refusal (§3.12),
-// never silent. The format also reserves a fixed journal region (filled by the Phase-C
-// crash-consistency work) so the on-disk geometry is baked once.
-const SB_MAGIC: &[u8; 8] = b"GSFS0004";
+// ── On-disk format — MUST match `osdev format_superblock` (persistence.md §6.6/§6.10). ──
+// GSFS0005: every block self-verifies with a CRC32 — the superblock (CRC @124), each
+// directory block (CRC trailer @448), and now each **file-data block** (508-byte payload +
+// CRC32 @508). Corruption is a loud refusal (§3.12), never silent. The format also reserves a
+// fixed journal region (Phase-C crash-consistency) so the on-disk geometry is baked once.
+const SB_MAGIC: &[u8; 8] = b"GSFS0005";
 const BLOCK: usize = 512;
 const BITS_PER_BMBLOCK: u64 = (BLOCK as u64) * 8; // 4096 bits per bitmap block
 
-// file_record entry: 64 bytes. GSFS0004 fits 7 per 512-byte directory block and reserves
+// File-data block: 508 bytes of payload + a 4-byte CRC32 trailer @508 (GSFS0005). A file of N
+// bytes spans ceil(N/508) data blocks; each carries the CRC of its own payload, verified on
+// every read. (Directory blocks use a different split — 448 records + CRC; superblock/bitmap/
+// journal blocks are raw, with their own integrity schemes.)
+const DATA_PAYLOAD: usize = 508;
+const DATA_CRC_OFF: usize = DATA_PAYLOAD; // 508 — u32 CRC32 of the 508-byte payload
+
+// file_record entry: 64 bytes. GSFS0005 fits 7 per 512-byte directory block and reserves
 // the last 64 bytes as a trailer holding the block's CRC32 (over the 448-byte record
 // region). The record layout itself is unchanged from GSFS0003 — names stay 38 bytes.
 const REC_SIZE: usize = 64;
@@ -49,7 +56,7 @@ const DIR_REC_REGION: usize = RECS_PER_BLOCK * REC_SIZE; // 448 — CRC covers [
 const DIR_CRC_OFF: usize = DIR_REC_REGION; // 448 — u32 CRC32 of the record region
 const NAME_MAX: usize = 38; // entry: type u8 @0, name_len u8 @1, name[38] @2, size @40, first @48, count @56
 
-// Crash-consistency journal region (GSFS0004 geometry). Fixed size, bounded (§26.6): a
+// Crash-consistency journal region (GSFS0005 geometry). Fixed size, bounded (§26.6): a
 // transaction larger than this is refused loudly, never partially applied.
 const JOURNAL_BLOCKS: u64 = 64; // 64 × 512 B = 32 KiB
 // One commit/header block + up to TXN_CAP data blocks must fit the journal region.
@@ -67,12 +74,12 @@ const ITYPE_FREE: u8 = 0;
 const ITYPE_FILE: u8 = 1;
 const ITYPE_DIR: u8 = 2;
 
-// Per-message data chunk: the most file bytes that travel in one IPC message, bounded so a
-// request/reply (a few header bytes + data) never exceeds MAX_PAYLOAD (4096). This is the
-// **streaming chunk size**, NOT a file-size cap — large files are read/written across many
-// of these chunks via the offset-addressed ops (WRITE_NEW/WRITE_AT/READ_AT). The one-shot
-// WRITE_FILE/READ_FILE ops carry a whole small file (≤ this) in a single message.
-const MAX_FILE_BYTES: usize = 7 * BLOCK; // 3584 — streaming chunk size
+// Per-message data chunk: the most file payload bytes that travel in one IPC message — exactly
+// 7 data-block payloads, so a streaming WRITE_AT chunk is always whole blocks (no read-modify-
+// write) and its byte offset stays block-aligned. NOT a file-size cap (large files cross many
+// of these via WRITE_NEW/WRITE_AT/READ_AT). 7×508 + a few header bytes ≤ MAX_PAYLOAD (4096).
+// The shell's IO_CHUNK must equal this.
+const MAX_FILE_BYTES: usize = 7 * DATA_PAYLOAD; // 3556 — streaming chunk size (7 data blocks)
 
 // Block IPC protocol (fs <-> block-driver). MUST match `services/block-driver`.
 const OP_READ_BLOCK: u8 = 1;
@@ -165,7 +172,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut fs: Option<Fs> = match Fs::mount(&ctx) {
         Ok(f) => {
             ctx.log_fmt(format_args!(
-                "fs: mounted GSFS0004 ({} blocks, bitmap {}..{}, root@{}, {} free)",
+                "fs: mounted GSFS0005 ({} blocks, bitmap {}..{}, root@{}, {} free)",
                 f.total_blocks, f.bitmap_start, f.data_start, f.root_first_block, f.free_blocks
             ));
             Some(f)
@@ -212,6 +219,16 @@ fn self_test(ctx: &ServiceContext, fs: &mut Fs) {
     const NESTED: &[u8] = b"/etc/motd";
     const NESTED_DATA: &[u8] = b"godspeed scalable fs";
     let mut buf = [0u8; MAX_FILE_BYTES];
+
+    // Data-integrity probe: if a host-baked `/probe.bin` exists, read it — exercising the
+    // per-data-block CRC (GSFS0005). A corrupt block is refused loudly by `data_read`, so the
+    // read fails rather than returning garbage. (Used by `osdev test fs-corrupt` case 3.)
+    if fs.walk(ctx, b"/probe.bin").is_some() {
+        match fs.read_path(ctx, b"/probe.bin", &mut buf) {
+            Some(n) => ctx.log_fmt(format_args!("fs: probe.bin read OK ({} bytes)", n)),
+            None    => ctx.log("fs: probe.bin read FAILED (data integrity)"),
+        }
+    }
 
     if let Some(n) = fs.read_path(ctx, GREET, &mut buf) {
         if &buf[..n] == GREET_DATA {
@@ -654,13 +671,13 @@ impl Fs {
         ctx.log_fmt(format_args!("fs: journal recovered {} block(s) from an interrupted write", n));
     }
 
-    /// Format the disk as an empty GSFS0004 sized to `capacity`, then mount. Same layout
+    /// Format the disk as an empty GSFS0005 sized to `capacity`, then mount. Same layout
     /// `osdev format_superblock` writes. `drives flash`; only ever user-initiated (§3.12).
     fn format(ctx: &ServiceContext, capacity: u64, label: &[u8]) -> Result<Fs, &'static str> {
         let total_blocks = capacity;
         let bitmap_start: u64 = 1;
         let bitmap_blocks = (total_blocks + BITS_PER_BMBLOCK - 1) / BITS_PER_BMBLOCK;
-        // Reserve the journal region between the bitmap and the data region (GSFS0004).
+        // Reserve the journal region between the bitmap and the data region (GSFS0005).
         let journal_start = bitmap_start + bitmap_blocks;
         let journal_blocks = JOURNAL_BLOCKS;
         let data_start = journal_start + journal_blocks;
@@ -674,7 +691,7 @@ impl Fs {
 
         let mut sb = [0u8; BLOCK];
         sb[0..8].copy_from_slice(SB_MAGIC);
-        sb[8..12].copy_from_slice(&4u32.to_le_bytes());
+        sb[8..12].copy_from_slice(&5u32.to_le_bytes());
         sb[12..16].copy_from_slice(&(BLOCK as u32).to_le_bytes());
         sb[16..24].copy_from_slice(&total_blocks.to_le_bytes());
         sb[24..32].copy_from_slice(&bitmap_start.to_le_bytes());
@@ -996,16 +1013,15 @@ impl Fs {
         if let Some(ref e) = existing {
             if e.itype != ITYPE_FILE { return Err("path is a directory"); }
         }
-        let blocks = ((data.len() + BLOCK - 1) / BLOCK).max(1) as u64;
+        let blocks = ((data.len() + DATA_PAYLOAD - 1) / DATA_PAYLOAD).max(1) as u64;
         // Alloc the new extent first (old still allocated), so a failure leaves the file
         // intact; free the old extent only after the record points at the new one.
         let first = self.alloc_run(ctx, blocks)?;
         for i in 0..blocks as usize {
-            let mut blk = [0u8; BLOCK];
-            let s = i * BLOCK;
-            let e = (s + BLOCK).min(data.len());
-            if s < data.len() { blk[..e - s].copy_from_slice(&data[s..e]); }
-            if !block_write(ctx, first + i as u64, &blk) { return Err("block write failed"); }
+            let s = i * DATA_PAYLOAD;
+            let e = (s + DATA_PAYLOAD).min(data.len());
+            let payload = if s < data.len() { &data[s..e] } else { &[][..] };
+            if !data_write(ctx, first + i as u64, payload) { return Err("block write failed"); }
         }
         match existing {
             Some(e) => {
@@ -1025,10 +1041,10 @@ impl Fs {
         let size = e.size as usize;
         if size > out.len() { return None; }
         for b in 0..e.block_count {
-            let start = (b as usize) * BLOCK;
+            let start = (b as usize) * DATA_PAYLOAD;
             if start >= size { break; }
-            let blk = block_read(ctx, e.first_block + b)?;
-            let end = (start + BLOCK).min(size);
+            let blk = data_read(ctx, e.first_block + b)?;
+            let end = (start + DATA_PAYLOAD).min(size);
             out[start..end].copy_from_slice(&blk[..end - start]);
         }
         Some(size)
@@ -1051,7 +1067,7 @@ impl Fs {
         if let Some(ref e) = existing {
             if e.itype != ITYPE_FILE { return Err("path is a directory"); }
         }
-        let blocks = ((total + BLOCK as u64 - 1) / BLOCK as u64).max(1);
+        let blocks = ((total + DATA_PAYLOAD as u64 - 1) / DATA_PAYLOAD as u64).max(1);
         let first = self.alloc_run(ctx, blocks)?;
         match existing {
             Some(e) => {
@@ -1064,23 +1080,21 @@ impl Fs {
         }
     }
 
-    /// Write `chunk` into an existing file at byte `offset`. The offset must be block-aligned
-    /// (clients stream in block-aligned chunks), so whole blocks are written with no
-    /// read-modify-write; the final block of a partial chunk is zero-padded. Bounded to the
-    /// file's allocated extent — a write past it is a loud error, never an overrun.
+    /// Write `chunk` into an existing file at byte `offset`. The offset must be **payload-block
+    /// aligned** (a multiple of DATA_PAYLOAD — clients stream in such chunks), so whole data
+    /// blocks are written with no read-modify-write; the final block of a partial chunk is
+    /// zero-padded. Bounded to the file's allocated extent — a write past it is a loud error.
     fn write_at(&self, ctx: &ServiceContext, path: &[u8], offset: u64, chunk: &[u8]) -> Result<(), &'static str> {
         let e = self.walk(ctx, path).ok_or("not found")?;
         if e.itype != ITYPE_FILE { return Err("not a file"); }
-        if offset % BLOCK as u64 != 0 { return Err("unaligned offset"); }
-        if offset + chunk.len() as u64 > e.block_count * BLOCK as u64 { return Err("write past extent"); }
-        let start = e.first_block + offset / BLOCK as u64;
-        let nblk = (chunk.len() + BLOCK - 1) / BLOCK;
+        if offset % DATA_PAYLOAD as u64 != 0 { return Err("unaligned offset"); }
+        if offset + chunk.len() as u64 > e.block_count * DATA_PAYLOAD as u64 { return Err("write past extent"); }
+        let start = e.first_block + offset / DATA_PAYLOAD as u64;
+        let nblk = (chunk.len() + DATA_PAYLOAD - 1) / DATA_PAYLOAD;
         for i in 0..nblk {
-            let mut blk = [0u8; BLOCK];
-            let s = i * BLOCK;
-            let end = (s + BLOCK).min(chunk.len());
-            blk[..end - s].copy_from_slice(&chunk[s..end]);
-            if !block_write(ctx, start + i as u64, &blk) { return Err("block write failed"); }
+            let s = i * DATA_PAYLOAD;
+            let end = (s + DATA_PAYLOAD).min(chunk.len());
+            if !data_write(ctx, start + i as u64, &chunk[s..end]) { return Err("block write failed"); }
         }
         Ok(())
     }
@@ -1097,9 +1111,9 @@ impl Fs {
         let mut done = 0;
         while done < n {
             let pos = offset as usize + done;
-            let blk = block_read(ctx, e.first_block + (pos / BLOCK) as u64)?;
-            let within = pos % BLOCK;
-            let take = (BLOCK - within).min(n - done);
+            let blk = data_read(ctx, e.first_block + (pos / DATA_PAYLOAD) as u64)?;
+            let within = pos % DATA_PAYLOAD;
+            let take = (DATA_PAYLOAD - within).min(n - done);
             out[done..done + take].copy_from_slice(&blk[within..within + take]);
             done += take;
         }
@@ -1341,4 +1355,34 @@ fn block_write(ctx: &ServiceContext, lba: u64, data: &[u8; BLOCK]) -> bool {
         Some(reply) => reply.payload_bytes().first() == Some(&BLK_OK),
         None => false,
     }
+}
+
+/// Write a **file-data block** at `lba`: copy ≤508 payload bytes (zero-padding the rest),
+/// stamp the CRC32 of the 508-byte payload at @508, and write the 512-byte block. Direct (not
+/// journaled) — data lands in an allocated-but-uncommitted extent, so a pre-commit crash just
+/// leaves harmless garbage in free space (Phase C). `payload.len()` must be ≤ DATA_PAYLOAD.
+fn data_write(ctx: &ServiceContext, lba: u64, payload: &[u8]) -> bool {
+    let mut blk = [0u8; BLOCK];
+    let n = payload.len().min(DATA_PAYLOAD);
+    blk[..n].copy_from_slice(&payload[..n]);
+    let c = crc32(&blk[..DATA_PAYLOAD]);
+    blk[DATA_CRC_OFF..DATA_CRC_OFF + 4].copy_from_slice(&c.to_le_bytes());
+    block_write(ctx, lba, &blk)
+}
+
+/// Read a **file-data block** at `lba` and verify its CRC trailer. Returns the full 512-byte
+/// block (payload is `[..DATA_PAYLOAD]`) on success; a CRC mismatch is a loud refusal (§3.12) —
+/// `fs` never hands back bytes from a corrupt data block.
+fn data_read(ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
+    let blk = block_read(ctx, lba)?;
+    let stored = u32_at(&blk, DATA_CRC_OFF);
+    let actual = crc32(&blk[..DATA_PAYLOAD]);
+    if stored != actual {
+        ctx.log_fmt(format_args!(
+            "fs: data block CRC mismatch at lba {} (stored {:#010x}, actual {:#010x}) — refusing",
+            lba, stored, actual
+        ));
+        return None;
+    }
+    Some(blk)
 }
