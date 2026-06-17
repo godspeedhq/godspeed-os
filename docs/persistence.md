@@ -416,6 +416,48 @@ a `find`, a global search, an "every file" view — which GodspeedOS does not ha
 Specified, not built. GSFS0003 ships the three structures (§6.4); `fs_index` is the layer
 that snaps on when search arrives.
 
+### 6.6 GSFS0004 — integrity checksums (the "robust filesystem" Phase A)
+
+> **Built 2026-06-17.** The first phase of the robustness program (crash-consistency +
+> large files + checksums + restartability — all four selected). GSFS0004 keeps the three
+> GSFS0003 structures and the whole directory-tree/bitmap design **unchanged**; it adds
+> **integrity checksums** and **bakes the final geometry once** so later phases add
+> behaviour, not new on-disk formats.
+
+**What changed vs GSFS0003 (magic `GSFS0004`, version 4):**
+
+1. **Superblock CRC32** — a `sb_crc32` (u32 @124) over the superblock's first 124 bytes,
+   **verified on mount**. A corrupt superblock is a loud refusal (§3.12), never trusted or
+   silently repaired — alongside the existing bad-magic refusal. Re-stamped on every
+   superblock write (`persist_super`).
+2. **Per-directory-block CRC32** — each 512-byte directory block now holds **7**
+   `file_record`s (was 8) and reserves its last 64 bytes as a trailer; the first 4 trailer
+   bytes are a CRC32 over the block's 448-byte record region. Verified on **every**
+   directory read (`dir_read`) and stamped on every write (`dir_write`), so corruption in
+   the metadata that *defines the tree* surfaces loudly instead of returning garbage
+   records. The `file_record` layout is otherwise unchanged — **names stay 38 bytes**.
+3. **Reserved journal region** — `journal_start`/`journal_blocks` (u64 @108/@116) carve a
+   fixed 64-block (32 KiB) region between the bitmap and the data region. **Empty and
+   unused in Phase A**; it is where Phase C's crash-consistency redo-journal lives. Baking
+   it now means the on-disk geometry is fixed once, not churned across phases.
+
+**Scope of Phase A checksums:** the superblock and the directory tree (the structural
+metadata whose corruption breaks the whole filesystem). **Bitmap blocks and file *data*
+blocks are not yet checksummed** — a corrupt bitmap is reconstructible from the tree, and
+per-file data integrity is a deferred follow-on (a per-file-record data CRC), pulled in
+only when a need does (§26.2). The CRC32 is the standard IEEE 802.3 algorithm
+(`services/fs/src/crc32.rs`); `osdev` carries a byte-identical copy (`osdev/src/crc32.rs`)
+so host-baked images (`mkfs`, `script-disk`) checksum exactly as `fs` would.
+
+**Migration:** GSFS0004 is **reformat-only** — there is no GSFS0003→0004 upgrader. There is
+no interop requirement (§3) and `flash` is user-initiated, so an existing GSFS0003 data
+drive is simply re-flashed. (Mounting a GSFS0003 image under GSFS0004 fails loudly on the
+magic check, as it should.)
+
+This supersedes §6.4 (GSFS0003) as the on-disk target; §6.4/§6.2/§6 remain the historical
+record. The remaining robustness phases (B large files, C crash-consistency, D
+restartable/TCB-drop) build on this format.
+
 ## 7. File = capability (the north star)
 
 The spine that makes this filesystem *ours* rather than a generic store: a file is named

@@ -33,6 +33,7 @@
 //!   osdev test shell        — scripted shell smoke-test (help, cores, status, unknown)
 //!   osdev image [--mode M]  — build + create bootable disk image (build/os.img); M=bare-metal|perf|perf-brutal|identity|stress|adv|chaos|fuzz|s8
 
+mod crc32;
 mod disk_image;
 mod qemu;
 mod shell_test;
@@ -124,22 +125,35 @@ fn main() {
     }
 }
 
-// On-disk format — MUST match `services/fs` (docs/persistence.md §6.4, GSFS0003).
+// On-disk format — MUST match `services/fs` (docs/persistence.md §6.6, GSFS0004).
 // 512-byte blocks (= one AHCI sector = one block-IPC request), so block number = LBA.
 // Three structures: superblock + free bitmap + self-describing directory tree (no inode
-// table, no global file cap). All capacity-bearing fields are u64.
-//   Superblock @ LBA 0: magic[8] "GSFS0003", version u32, block_size u32=512,
+// table, no global file cap). All capacity-bearing fields are u64. GSFS0004 adds integrity
+// checksums: a superblock CRC32 and a per-directory-block CRC32 (both verified on read).
+//   Superblock @ LBA 0: magic[8] "GSFS0004", version u32=4, block_size u32=512,
 //     total_blocks u64, bitmap_start u64=1, bitmap_blocks u64, data_start u64,
 //     root_first_block u64, root_block_count u64, free_blocks u64, flags u32,
-//     label_len u8, label[31].
-//   Free bitmap @ LBA bitmap_start..data_start: 1 bit/block (set=used), 4096 bits/block.
+//     label_len u8, label[31], journal_start u64 @108, journal_blocks u64 @116,
+//     sb_crc32 u32 @124 (CRC32 over @0..124).
+//   Free bitmap @ LBA bitmap_start..journal_start: 1 bit/block (set=used), 4096 bits/block.
+//   Journal @ LBA journal_start..data_start: reserved crash-consistency region (Phase C).
 //   Directory entry (file_record, 64 B): type u8 (0 free|1 file|2 dir) @0, name_len u8 @1,
-//     name[38] @2, size u64 @40, first_block u64 @48, block_count u64 @56. 8 per block.
+//     name[38] @2, size u64 @40, first_block u64 @48, block_count u64 @56. 7 per block;
+//     bytes 448..452 hold the block's CRC32 over its 448-byte record region.
 //   Root is a dir at root_first_block (its extent lives in the superblock; it has no parent).
-const FS_SB_MAGIC: &[u8; 8] = b"GSFS0003";
+const FS_SB_MAGIC: &[u8; 8] = b"GSFS0004";
 const FS_BLOCK_SIZE: u32 = 512;
 const FS_BITS_PER_BMBLOCK: u64 = (FS_BLOCK_SIZE as u64) * 8; // 4096
 const FS_ITYPE_DIR: u8 = 2;
+const FS_JOURNAL_BLOCKS: u64 = 64; // reserved journal region (must match services/fs JOURNAL_BLOCKS)
+const FS_RECS_PER_BLOCK: usize = 7; // directory records per block (8th slot region is the CRC trailer)
+const FS_DIR_REC_REGION: usize = FS_RECS_PER_BLOCK * 64; // 448 — CRC covers [0..448)
+
+/// Stamp a directory block's CRC32 trailer (over its 448-byte record region) at offset 448.
+fn fs_dir_stamp_crc(block: &mut [u8]) {
+    let c = crc32::crc32(&block[..FS_DIR_REC_REGION]);
+    block[FS_DIR_REC_REGION..FS_DIR_REC_REGION + 4].copy_from_slice(&c.to_le_bytes());
+}
 
 /// Write a GodspeedOS (GSFS0003) superblock + free bitmap + an empty root directory into
 /// `path`, preserving the rest of the image. Geometry is derived from the image size.
@@ -149,7 +163,9 @@ fn format_superblock(path: &str) {
     let total_blocks = data.len() as u64 / FS_BLOCK_SIZE as u64;
     let bitmap_start: u64 = 1;
     let bitmap_blocks = (total_blocks + FS_BITS_PER_BMBLOCK - 1) / FS_BITS_PER_BMBLOCK; // ceil
-    let data_start = bitmap_start + bitmap_blocks;
+    let journal_start = bitmap_start + bitmap_blocks;
+    let journal_blocks = FS_JOURNAL_BLOCKS;
+    let data_start = journal_start + journal_blocks;
     let root_first_block = data_start;
     let root_block_count: u64 = 1;
     let used_through = data_start + root_block_count; // blocks [0..used_through) are used
@@ -162,7 +178,7 @@ fn format_superblock(path: &str) {
     // Superblock (LBA 0).
     let mut sb = [0u8; 512];
     sb[0..8].copy_from_slice(FS_SB_MAGIC);
-    sb[8..12].copy_from_slice(&3u32.to_le_bytes());            // version
+    sb[8..12].copy_from_slice(&4u32.to_le_bytes());            // version
     sb[12..16].copy_from_slice(&FS_BLOCK_SIZE.to_le_bytes());  // block_size
     sb[16..24].copy_from_slice(&total_blocks.to_le_bytes());
     sb[24..32].copy_from_slice(&bitmap_start.to_le_bytes());
@@ -173,25 +189,30 @@ fn format_superblock(path: &str) {
     sb[64..72].copy_from_slice(&free_blocks.to_le_bytes());
     sb[72..76].copy_from_slice(&0u32.to_le_bytes());           // flags (DEFAULT clear)
     sb[76] = 0;                                                // label_len
+    sb[108..116].copy_from_slice(&journal_start.to_le_bytes());
+    sb[116..124].copy_from_slice(&journal_blocks.to_le_bytes());
+    let sb_crc = crc32::crc32(&sb[..124]);
+    sb[124..128].copy_from_slice(&sb_crc.to_le_bytes());
     data[0..512].copy_from_slice(&sb);
 
-    // Zero the bitmap region, then mark blocks [0..used_through) used (superblock +
-    // bitmap + the root directory block).
+    // Zero the bitmap region, then mark blocks [0..used_through) used (superblock + bitmap +
+    // journal + the root directory block).
     let bm = (bitmap_start as usize) * 512;
-    let bm_end = (data_start as usize) * 512;
+    let bm_end = (journal_start as usize) * 512;
     for b in &mut data[bm..bm_end] { *b = 0; }
     for blk in 0..used_through as usize {
         data[bm + blk / 8] |= 1 << (blk % 8);
     }
 
-    // Zero the root directory block (no entries yet).
+    // Zero the root directory block, then stamp its CRC trailer (no entries yet).
     let rd = (root_first_block as usize) * 512;
     for b in &mut data[rd..rd + 512] { *b = 0; }
+    fs_dir_stamp_crc(&mut data[rd..rd + 512]);
 
     std::fs::write(path, &data)
         .unwrap_or_else(|e| { eprintln!("mkfs: cannot write {}: {}", path, e); std::process::exit(1); });
-    println!("mkfs: formatted {} GSFS0003 ({} blocks, bitmap {}..{}, data from {}, {} free)",
-             path, total_blocks, bitmap_start, data_start, root_first_block, free_blocks);
+    println!("mkfs: formatted {} GSFS0004 ({} blocks, bitmap {}..{}, journal {}..{}, data from {}, {} free)",
+             path, total_blocks, bitmap_start, journal_start, journal_start, data_start, root_first_block, free_blocks);
 }
 
 fn cmd_mkfs(image: &str) {
@@ -202,12 +223,12 @@ fn cmd_mkfs(image: &str) {
 /// `.gsh` script on a flashable data disk, so the OS can `run /suite.gsh` on hardware with no
 /// on-device authoring. Allocates a contiguous extent, writes the content, adds a root
 /// `file_record`, and updates the free count. Intended right after `format_superblock` (minimal,
-/// unfragmented layout). `name` ≤ 38 bytes; fits in the single root directory block (8 entries).
+/// unfragmented layout). `name` ≤ 38 bytes; fits in the single root directory block (7 entries).
 fn gsfs_add_file(path: &str, name: &str, content: &[u8]) {
     let mut data = std::fs::read(path)
         .unwrap_or_else(|e| { eprintln!("bake: cannot read {}: {}", path, e); std::process::exit(1); });
     if data.len() < 512 || &data[0..8] != FS_SB_MAGIC {
-        eprintln!("bake: {} is not a GSFS0003 image", path); std::process::exit(1);
+        eprintln!("bake: {} is not a GSFS0004 image", path); std::process::exit(1);
     }
     if name.len() > 38 { eprintln!("bake: name '{}' too long (max 38)", name); std::process::exit(1); }
     let rdu = |d: &[u8], o: usize| u64::from_le_bytes(d[o..o + 8].try_into().unwrap());
@@ -242,13 +263,16 @@ fn gsfs_add_file(path: &str, name: &str, content: &[u8]) {
     }
     free_blocks -= nblocks;
     data[64..72].copy_from_slice(&free_blocks.to_le_bytes());
+    // Re-stamp the superblock CRC32 (@124) — we just mutated a superblock field (free count).
+    let sb_crc = crc32::crc32(&data[..124]);
+    data[124..128].copy_from_slice(&sb_crc.to_le_bytes());
     // Write the content into the extent (the tail of the last block stays zero).
     let off = (first as usize) * 512;
     data[off..off + content.len()].copy_from_slice(content);
     // Add a root file_record into the first free 64-byte slot (type 0 = free).
     let rd = root_first * 512;
     let mut placed = false;
-    for slot in 0..8 {
+    for slot in 0..FS_RECS_PER_BLOCK {
         let r = rd + slot * 64;
         if data[r] == 0 {
             data[r] = 1;                                    // type = file
@@ -262,6 +286,8 @@ fn gsfs_add_file(path: &str, name: &str, content: &[u8]) {
         }
     }
     if !placed { eprintln!("bake: root directory is full"); std::process::exit(1); }
+    // Re-stamp the root directory block's CRC trailer after mutating its records.
+    fs_dir_stamp_crc(&mut data[rd..rd + 512]);
     std::fs::write(path, &data)
         .unwrap_or_else(|e| { eprintln!("bake: cannot write {}: {}", path, e); std::process::exit(1); });
     println!("bake: wrote /{} ({} bytes, {} block(s) at {}) into {}", name, content.len(), nblocks, first, path);
@@ -1018,6 +1044,7 @@ fn cmd_test(suite: &str) {
         "iommu"        => run_iommu_test(),
         "blockdev"     => run_blockdev_test(),
         "blockdev-reboot" => run_blockdev_reboot_test(),
+        "fs-corrupt"   => run_fs_corruption_test(),
         "drives-raw"   => run_drives_raw_test(),
         "drives"       => run_drives_scripted_test(),
         "files"        => run_files_test(),
@@ -1358,6 +1385,83 @@ fn run_blockdev_reboot_test() {
         println!("\n  [AHCI.R]  reboot survival over SATA  … PASS\n\n  1 passed  0 failed");
     } else {
         println!("\n  [AHCI.R]  reboot survival over SATA  … FAIL\n\n  0 passed  1 failed");
+        std::process::exit(1);
+    }
+}
+
+/// GSFS0004 integrity: a corrupt structural block is a **loud refusal** (§3.12), never
+/// silently read back as garbage. Two cases, both observable in the boot log:
+///   (1) corrupt a superblock byte → `fs` mount fails its CRC check → "no filesystem",
+///       never mounts, never auto-reformats.
+///   (2) corrupt the root directory block → mount succeeds (superblock intact) but the
+///       mount-time self-test's first directory op hits the per-block CRC and logs a
+///       "directory block CRC mismatch" — it does NOT return records from a bad block.
+fn run_fs_corruption_test() {
+    println!("\n=== fs: GSFS0004 integrity — corrupt block → loud refusal (§3.12) ===");
+    cmd_build_blockdev();
+
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let img = std::fs::canonicalize(&image_path).unwrap_or_else(|_| image_path.to_path_buf());
+    let img_str = img.to_string_lossy().replace('\\', "/");
+    let _ = std::fs::create_dir_all("build/tests");
+
+    // Helper: make a formatted 16 MiB GSFS0004 disk, corrupt one byte, return its abs path.
+    let make = |name: &str, corrupt: &dyn Fn(&mut [u8])| -> String {
+        let p = format!("build/tests/{}", name);
+        std::fs::write(&p, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+        format_superblock(&p);
+        let mut data = std::fs::read(&p).unwrap();
+        corrupt(&mut data);
+        std::fs::write(&p, &data).unwrap();
+        let abs = std::fs::canonicalize(&p).unwrap_or_else(|_| std::path::PathBuf::from(&p));
+        abs.to_string_lossy().replace('\\', "/")
+    };
+
+    // Case 1: flip a superblock byte inside the CRC-covered region (free_blocks @64 — not
+    // the magic, so it is the CRC that catches it, not the magic check).
+    let sb_disk = make("fs_corrupt_sb.img", &|d: &mut [u8]| d[64] ^= 0xFF);
+    println!("fs: case 1 — corrupt superblock, boot (~25s) …");
+    let log1 = boot_ahci_qemu(&img_str, &sb_disk, "build/tests/fs_corrupt_sb.log", 25);
+    let sb_refused = log1.contains("superblock checksum mismatch");
+    let sb_nofs = log1.contains("fs: no filesystem");
+    let sb_not_mounted = !log1.contains("fs: mounted GSFS");
+    let sb_no_panic = !log1.contains("KERNEL PANIC");
+
+    // Case 2: leave the superblock valid; corrupt the ROOT directory block's record region.
+    // root_first_block is the u64 at superblock offset 48.
+    let dir_disk = make("fs_corrupt_dir.img", &|d: &mut [u8]| {
+        let root = u64::from_le_bytes(d[48..56].try_into().unwrap()) as usize;
+        d[root * 512] ^= 0xFF; // flip a byte in the 448-byte record region → trailer CRC fails
+    });
+    println!("fs: case 2 — corrupt root directory block, boot (~25s) …");
+    let log2 = boot_ahci_qemu(&img_str, &dir_disk, "build/tests/fs_corrupt_dir.log", 25);
+    let dir_mounted = log2.contains("fs: mounted GSFS");                 // superblock OK
+    let dir_caught = log2.contains("directory block CRC mismatch");      // loud
+    let dir_no_garbage = !log2.contains("round-trip OK (greeting)");     // never silently succeeded
+    let dir_no_panic = !log2.contains("KERNEL PANIC");
+
+    for (tag, ok) in [
+        ("case1: superblock CRC mismatch refused", sb_refused),
+        ("case1: reported no filesystem", sb_nofs),
+        ("case1: did NOT mount corrupt fs", sb_not_mounted),
+        ("case1: no kernel panic", sb_no_panic),
+        ("case2: superblock intact (mounted)", dir_mounted),
+        ("case2: directory CRC mismatch caught (loud)", dir_caught),
+        ("case2: never silently returned records", dir_no_garbage),
+        ("case2: no kernel panic", dir_no_panic),
+    ] {
+        println!("  {} … {}", if ok { "PASS" } else { "FAIL" }, tag);
+    }
+    let all = sb_refused && sb_nofs && sb_not_mounted && sb_no_panic
+        && dir_mounted && dir_caught && dir_no_garbage && dir_no_panic;
+    if all {
+        println!("\n  [GSFS.crc]  integrity: corruption is loud, never silent  … PASS\n\n  8 passed  0 failed");
+    } else {
+        println!("\n  [GSFS.crc]  integrity  … FAIL\n");
         std::process::exit(1);
     }
 }

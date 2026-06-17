@@ -27,6 +27,7 @@ Host-side developer CLI (§17). Builds for the developer's machine, not the kern
 | `osdev test chaos-brutal`   | Run brutal chaos tests (BC1–BC7) ✅ 7/7 |
 | `osdev test shell`          | Scripted shell smoke-test: boot, help, cores, status, unknown |
 | `osdev test files`          | Files/records/pipes/`result`/`run`/`assert` over a RAW AHCI disk (129 checks) |
+| `osdev test fs-corrupt`     | GSFS0004 integrity: corrupt a superblock byte (CRC mismatch → loud "no filesystem", no mount) and a root directory block (per-block CRC mismatch → loud, never returns garbage); asserts no panic (§3.12). 8 checks |
 | `osdev test script`         | Two paths: (1) bake `scripts/smoke.gsh` into a GSFS disk and `run /smoke.gsh` (host-baked-file path, incl. a piped assert); (2) `selfcheck` — run the shell-embedded extensive suite (`scripts/selfcheck.gsh`) IN MEMORY. Both assert `ran N, failed 0`. The embedded suite isn't a disk file because an on-disk file is one ≤4 KiB IPC message (`MAX_FILE_BYTES`); rodata is not. |
 | `osdev mkfs <image>`        | Format a disk image as GSFS0003 (empty) |
 | `osdev script-disk <out> <script.gsh>` | Build a flashable GSFS data disk with `<script>` baked in as `/<basename>` — `dd` it to the data drive, boot, `run /<basename>` (the hardware self-check) |
