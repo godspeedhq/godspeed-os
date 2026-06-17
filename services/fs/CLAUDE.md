@@ -50,6 +50,18 @@ hard links. Bad magic **or** bad CRC is a loud mount refusal, never an auto-refo
 | `StatFile`  | 12 | path              | exists, size:u64, is_dir |
 | `Mkdir`     | 13 | path              | `Ok` / `Err` |
 | `ListDir`   | 14 | path              | `{name, is_dir}` entries |
+| `WriteNew`  | 24 | path, total:u64   | `Ok` / `Err` — create/truncate sized for a large file |
+| `WriteAt`   | 25 | path, offset:u64, chunk | `Ok` / `Err` — write a chunk (block-aligned offset) |
+| `ReadAt`    | 26 | path, offset:u64, len:u32 | `Ok`, n:u32, bytes / `NotFound` |
+
+**Large files (streaming).** `WriteFile`/`ReadFile` carry a whole *small* file in one ≤4 KiB
+IPC message. Files larger than one message use the offset-addressed ops: `WriteNew` allocates
+the full extent and sizes the file, then a sequence of `WriteAt` chunks fills it; read it back
+with `StatFile` (for the size) + a sequence of `ReadAt` chunks. Stateless — each request is
+self-contained (no open-file table; §8). The on-disk file is a contiguous u64 extent, so size
+is bounded only by free space (fragmentation/grow-relocation is the known contiguous-extent
+limitation; a block-list is a deferred refinement, §26.2). The shell streams `cat`/`copy` and
+the pipe `write` sink through these ops.
 
 ## State and persistence (§15)
 

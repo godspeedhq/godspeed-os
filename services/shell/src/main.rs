@@ -31,6 +31,12 @@ const OP_DRIVES_INFO: u8 = 20;
 const OP_FLASH: u8 = 21;
 const OP_LABEL: u8 = 22;
 const OP_RESET: u8 = 23;
+// large-file streaming ops (offset-addressed): create a sized file, then write/read chunks.
+const OP_WRITE_NEW: u8 = 24; // [op, plen, path, total:u64]
+const OP_WRITE_AT: u8 = 25;  // [op, plen, path, offset:u64, chunk]
+const OP_READ_AT: u8 = 26;   // [op, plen, path, offset:u64, len:u32] -> [FS_OK, n:u32, bytes]
+// One streaming chunk: the most file bytes carried per message (matches fs MAX_FILE_BYTES).
+const IO_CHUNK: usize = 7 * 512; // 3584
 const FS_OK: u8 = 0;
 const FS_NOTFOUND: u8 = 2;
 const FS_NOFS: u8 = 3;
@@ -55,9 +61,6 @@ const CAP_MAX: usize = 64 * 1024;
 // A single IPC message body (= sdk MAX_PAYLOAD). A stage that must cross a service boundary is
 // bounded by this until pipe streaming chunks across messages.
 const PIPE_MSG_MAX: usize = 4096;
-// Largest file the `write` sink can store: one WriteFile message (fs MAX_FILE_BYTES = 7×512).
-// A bigger captured buffer can't reach a file until fs grows multi-block files.
-const PIPE_FILE_MAX: usize = 7 * 512; // 3584
 struct Cap {
     buf: [u8; CAP_MAX],
     len: usize,
@@ -2004,30 +2007,44 @@ fn run_producer(ctx: &ServiceContext, cwd: &Cwd, cmdline: &str, out: &mut Out) {
     }
 }
 
-/// Write captured bytes to a file (the `write` sink). Overwrites, like plain `write`.
+/// Write captured bytes to a file (the `write` sink). Overwrites, like plain `write`. Streams
+/// the captured buffer to the file in IO_CHUNK pieces (write_new + write_at), so a piped
+/// payload up to the capture buffer (CAP_MAX) — not just one message — reaches the file.
 fn pipe_write_file(ctx: &ServiceContext, cwd: &Cwd, path_arg: &str, data: &[u8]) {
     let (pstr, _) = split_first(path_arg);
     if pstr.is_empty() { ctx.console_writeln("pipe: write needs a file path"); return; }
-    // A file is one WriteFile message (fs MAX_FILE_BYTES). A bigger buffer can't be written
-    // until fs supports multi-block files — say so plainly instead of a generic write failure.
-    if data.len() > PIPE_FILE_MAX {
-        ctx.console_writeln_fmt(format_args!(
-            "pipe: {} bytes is too large to write to a file (max {} until multi-block files)",
-            data.len(), PIPE_FILE_MAX));
-        return;
-    }
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, pstr, &mut buf) { Some(p) => p, None => return };
     let mut pbuf = [0u8; PATH_MAX];
     let pl = path.len();
     pbuf[..pl].copy_from_slice(path);
-    match fs_request(ctx, OP_WRITE_FILE, &pbuf[..pl], data) {
-        Some(r) if r.payload_bytes().first() == Some(&FS_OK) =>
-            ctx.console_writeln_fmt(format_args!("piped {} bytes → {}", data.len(), str_of(&pbuf[..pl]))),
-        Some(r) if no_fs(ctx, r.payload_bytes()) => {}
-        Some(_) => ctx.console_writeln("pipe: write failed (bad path, or parent missing?)"),
-        None    => ctx.console_writeln("pipe: storage unavailable"),
+    let p = &pbuf[..pl];
+    // Small (single-message) payload: one WriteFile, as before.
+    if data.len() <= IO_CHUNK {
+        match fs_request(ctx, OP_WRITE_FILE, p, data) {
+            Some(r) if r.payload_bytes().first() == Some(&FS_OK) =>
+                ctx.console_writeln_fmt(format_args!("piped {} bytes → {}", data.len(), str_of(p))),
+            Some(r) if no_fs(ctx, r.payload_bytes()) => {}
+            Some(_) => ctx.console_writeln("pipe: write failed (bad path, or parent missing?)"),
+            None    => ctx.console_writeln("pipe: storage unavailable"),
+        }
+        return;
     }
+    // Large payload: allocate the file, then stream chunks.
+    if !fs_write_new(ctx, p, data.len() as u64) {
+        ctx.console_writeln("pipe: write failed (bad path, or parent missing?)");
+        return;
+    }
+    let mut off = 0usize;
+    while off < data.len() {
+        let end = (off + IO_CHUNK).min(data.len());
+        if !fs_write_at(ctx, p, off as u64, &data[off..end]) {
+            ctx.console_writeln("pipe: write failed mid-stream");
+            return;
+        }
+        off = end;
+    }
+    ctx.console_writeln_fmt(format_args!("piped {} bytes → {}", data.len(), str_of(p)));
 }
 
 /// Look up a just-spawned service's endpoint via the registry, retrying while it registers.
@@ -2204,6 +2221,54 @@ fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<
     ctx.request_with_reply("fs", &Message::from_bytes(&req[..2 + pl + dn]))
 }
 
+/// Stat a path: `Some((size, is_dir))` if it exists, `None` otherwise. Used by the streaming
+/// read/copy paths to learn a file's size before chunking through it.
+fn fs_stat(ctx: &ServiceContext, path: &[u8]) -> Option<(u64, bool)> {
+    let reply = fs_request(ctx, OP_STAT_FILE, path, &[])?;
+    let p = reply.payload_bytes();
+    if p.first() == Some(&FS_OK) && p.len() >= 11 && p[1] == 1 {
+        Some((u64::from_le_bytes([p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9]]), p[10] == 1))
+    } else {
+        None
+    }
+}
+
+/// Read up to `IO_CHUNK` bytes from `path` at byte `offset` into `out`; returns bytes read
+/// (0 at EOF). One message — the building block for streaming a large file.
+fn fs_read_at(ctx: &ServiceContext, path: &[u8], offset: u64, out: &mut [u8]) -> Option<usize> {
+    let mut tail = [0u8; 12];
+    tail[..8].copy_from_slice(&offset.to_le_bytes());
+    tail[8..12].copy_from_slice(&(IO_CHUNK as u32).to_le_bytes());
+    let reply = fs_request(ctx, OP_READ_AT, path, &tail)?;
+    let p = reply.payload_bytes();
+    if p.first() == Some(&FS_OK) && p.len() >= 5 {
+        let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
+        let end = (5 + n).min(p.len());
+        let n = end - 5;
+        out[..n].copy_from_slice(&p[5..end]);
+        Some(n)
+    } else {
+        None
+    }
+}
+
+/// Create/truncate `path` to hold `total` bytes (allocates the whole extent). Pairs with
+/// `fs_write_at` to stream a large file.
+fn fs_write_new(ctx: &ServiceContext, path: &[u8], total: u64) -> bool {
+    matches!(fs_request(ctx, OP_WRITE_NEW, path, &total.to_le_bytes()),
+             Some(r) if r.payload_bytes().first() == Some(&FS_OK))
+}
+
+/// Write `chunk` into `path` at block-aligned byte `offset`.
+fn fs_write_at(ctx: &ServiceContext, path: &[u8], offset: u64, chunk: &[u8]) -> bool {
+    let mut tail = [0u8; 8 + IO_CHUNK];
+    tail[..8].copy_from_slice(&offset.to_le_bytes());
+    let n = chunk.len().min(IO_CHUNK);
+    tail[8..8 + n].copy_from_slice(&chunk[..n]);
+    matches!(fs_request(ctx, OP_WRITE_AT, path, &tail[..8 + n]),
+             Some(r) if r.payload_bytes().first() == Some(&FS_OK))
+}
+
 /// True if `fs` replied "no filesystem" — print the standard hint and consume it.
 fn no_fs(ctx: &ServiceContext, p: &[u8]) -> bool {
     if p.first() == Some(&FS_NOFS) {
@@ -2258,23 +2323,36 @@ fn cmd_ls(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(
 fn cmd_read(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    let reply = match fs_request(ctx, OP_READ_FILE, path, &[]) {
+    // Stat first (one message) to learn the size, then STREAM the content in IO_CHUNK pieces
+    // via read_at — so a file far larger than one IPC message reads back correctly without a
+    // big buffer here.
+    let stat = match fs_request(ctx, OP_STAT_FILE, path, &[]) {
         Some(r) => r,
         None => { ctx.console_writeln("read: storage unavailable"); return Err(ShellError::Unknown); }
     };
-    let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-    if p.first() == Some(&FS_OK) && p.len() >= 5 {
-        let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
-        let end = (5 + n).min(p.len());
-        out.put_bytes(ctx, &p[5..end]);
-        if end == 0 || p[end - 1] != b'\n' { out.put(ctx, "\n"); }
-        Ok(())
-    } else {
-        // Errors are not pipe data — always to the console.
+    let sp = stat.payload_bytes();
+    if no_fs(ctx, sp) { return Err(ShellError::Unknown); }
+    let exists = sp.first() == Some(&FS_OK) && sp.len() >= 11 && sp[1] == 1;
+    let is_dir = exists && sp[10] == 1;
+    if !exists || is_dir {
         ctx.console_writeln_fmt(format_args!("read: not found: {}", str_of(path)));
-        Err(ShellError::FileNotFound)
+        return Err(ShellError::FileNotFound);
     }
+    let size = u64::from_le_bytes([sp[2], sp[3], sp[4], sp[5], sp[6], sp[7], sp[8], sp[9]]);
+    let mut chunk = [0u8; IO_CHUNK];
+    let mut off = 0u64;
+    let mut last = b'\n';
+    while off < size {
+        let n = match fs_read_at(ctx, path, off, &mut chunk) {
+            Some(n) if n > 0 => n,
+            _ => { ctx.console_writeln("read: storage error"); return Err(ShellError::Unknown); }
+        };
+        out.put_bytes(ctx, &chunk[..n]);
+        last = chunk[n - 1];
+        off += n as u64;
+    }
+    if size == 0 || last != b'\n' { out.put(ctx, "\n"); }
+    Ok(())
 }
 
 /// `write <path> [content]` overwrites; `write append <path> [content]` appends (creating the
@@ -2422,45 +2500,44 @@ fn cmd_cd(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str) -> Result<(), ShellErr
     }
 }
 
-/// `copy <src> <dst>` — copy a file (read src, write dst). Shell-side, so it carries the
-/// content through one message-sized buffer; file-only in this cut (no recursive dirs).
+/// `copy <src> <dst>` — copy a file by STREAMING it through fixed chunks (read_at/write_at),
+/// so it copies files far larger than one IPC message with no whole-file buffer. File-only in
+/// this cut (no recursive dirs — that's `copy … recursive`).
 fn cmd_copy(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) -> Result<(), ShellError> {
-    // Resolve + read the source.
     let mut sbuf = [0u8; PATH_MAX];
     let spath = match resolve_or_err(ctx, cwd, src, &mut sbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let mut sp = [0u8; PATH_MAX];
     let sl = spath.len();
     sp[..sl].copy_from_slice(spath);
-    let reply = match fs_request(ctx, OP_READ_FILE, &sp[..sl], &[]) {
+    // Check the source exists and is a file (also surfaces the "no filesystem" hint).
+    let stat = match fs_request(ctx, OP_STAT_FILE, &sp[..sl], &[]) {
         Some(r) => r,
         None => { ctx.console_writeln("copy: storage unavailable"); return Err(ShellError::Unknown); }
     };
-    let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-    if p.first() != Some(&FS_OK) || p.len() < 5 {
+    let stp = stat.payload_bytes();
+    if no_fs(ctx, stp) { return Err(ShellError::Unknown); }
+    let exists = stp.first() == Some(&FS_OK) && stp.len() >= 11 && stp[1] == 1;
+    if !exists {
         ctx.console_writeln_fmt(format_args!("copy: source not found: {}", str_of(&sp[..sl])));
         return Err(ShellError::FileNotFound);
     }
-    let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
-    let end = (5 + n).min(p.len());
-    let dn = end - 5;
-    let mut data = [0u8; 4096];
-    data[..dn].copy_from_slice(&p[5..end]);
-    drop(reply);
+    if stp[10] == 1 {
+        ctx.console_writeln("copy: source is a directory (use 'copy <src> <dst> recursive')");
+        return Err(ShellError::Unknown);
+    }
+    drop(stat);
 
-    // Resolve + write the destination.
     let mut dbuf = [0u8; PATH_MAX];
     let dpath = match resolve_or_err(ctx, cwd, dst, &mut dbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let mut dp = [0u8; PATH_MAX];
     let dl = dpath.len();
     dp[..dl].copy_from_slice(dpath);
-    match fs_request(ctx, OP_WRITE_FILE, &dp[..dl], &data[..dn]) {
-        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
-            ctx.console_writeln_fmt(format_args!("copied {} → {} ({} bytes)", str_of(&sp[..sl]), str_of(&dp[..dl]), dn));
+    match copy_file_streaming(ctx, &sp[..sl], &dp[..dl]) {
+        Some(bytes) => {
+            ctx.console_writeln_fmt(format_args!("copied {} → {} ({} bytes)", str_of(&sp[..sl]), str_of(&dp[..dl]), bytes));
             Ok(())
         }
-        Some(_) => { ctx.console_writeln("copy: write failed (parent missing?)"); Err(ShellError::Unknown) }
-        None    => { ctx.console_writeln("copy: storage unavailable"); Err(ShellError::Unknown) }
+        None => { ctx.console_writeln("copy: write failed (parent missing?)"); Err(ShellError::Unknown) }
     }
 }
 
@@ -2503,7 +2580,6 @@ fn cmd_copy_tree(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) -> Resul
     let mut stack = PathStack::new();
     stack.push(&sp[..sl]);
     let (mut dirs, mut files) = (1u32, 0u32);
-    let mut data = [0u8; 4096];
     while let Some(slen) = stack.pop(&mut sbuf) {
         let reply = match fs_request(ctx, OP_LIST_DIR, &sbuf[..slen], &[]) {
             Some(r) => r,
@@ -2529,7 +2605,7 @@ fn cmd_copy_tree(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) -> Resul
             if is_dir {
                 if mkdir_at(ctx, &dchild[..dclen]) { dirs += 1; }
                 stack.push(&schild[..clen]);
-            } else if copy_one(ctx, &schild[..clen], &dchild[..dclen], &mut data) {
+            } else if copy_one(ctx, &schild[..clen], &dchild[..dclen]) {
                 files += 1;
             }
         }
@@ -2555,23 +2631,30 @@ fn mkdir_at(ctx: &ServiceContext, path: &[u8]) -> bool {
     matches!(fs_request(ctx, OP_MKDIR, path, &[]), Some(r) if r.payload_bytes().first() == Some(&FS_OK))
 }
 
-/// Copy one file `src`→`dst` (read then write). Returns true on success; logs on failure so a
-/// single bad file in a subtree copy is visible but does not abort the whole walk (§3.12).
-fn copy_one(ctx: &ServiceContext, src: &[u8], dst: &[u8], data: &mut [u8; 4096]) -> bool {
-    let reply = match fs_request(ctx, OP_READ_FILE, src, &[]) { Some(r) => r, None => return false };
-    let p = reply.payload_bytes();
-    if p.first() != Some(&FS_OK) || p.len() < 5 {
-        ctx.console_writeln_fmt(format_args!("copy: skipped (read failed): {}", str_of(src)));
-        return false;
+/// Stream-copy a file `src`→`dst` of any size: stat the size, allocate `dst`, then chunk
+/// through with `read_at`/`write_at` (one IO_CHUNK buffer, no whole-file buffer). Returns
+/// `Some(bytes)` on success. The building block under both `copy` and recursive `copy`.
+fn copy_file_streaming(ctx: &ServiceContext, src: &[u8], dst: &[u8]) -> Option<u64> {
+    let (size, is_dir) = fs_stat(ctx, src)?;
+    if is_dir { return None; }
+    if !fs_write_new(ctx, dst, size) { return None; }
+    let mut chunk = [0u8; IO_CHUNK];
+    let mut off = 0u64;
+    while off < size {
+        let n = fs_read_at(ctx, src, off, &mut chunk)?;
+        if n == 0 { break; }
+        if !fs_write_at(ctx, dst, off, &chunk[..n]) { return None; }
+        off += n as u64;
     }
-    let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
-    let end = (5 + n).min(p.len());
-    let dn = end - 5;
-    data[..dn].copy_from_slice(&p[5..end]);
-    drop(reply);
-    match fs_request(ctx, OP_WRITE_FILE, dst, &data[..dn]) {
-        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => true,
-        _ => { ctx.console_writeln_fmt(format_args!("copy: skipped (write failed): {}", str_of(dst))); false }
+    Some(size)
+}
+
+/// Copy one file `src`→`dst` by streaming. Returns true on success; logs on failure so a
+/// single bad file in a subtree copy is visible but does not abort the whole walk (§3.12).
+fn copy_one(ctx: &ServiceContext, src: &[u8], dst: &[u8]) -> bool {
+    match copy_file_streaming(ctx, src, dst) {
+        Some(_) => true,
+        None => { ctx.console_writeln_fmt(format_args!("copy: skipped (copy failed): {}", str_of(src))); false }
     }
 }
 
