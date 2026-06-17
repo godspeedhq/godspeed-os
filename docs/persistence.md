@@ -458,6 +458,43 @@ This supersedes §6.4 (GSFS0003) as the on-disk target; §6.4/§6.2/§6 remain t
 record. The remaining robustness phases (B large files, C crash-consistency, D
 restartable/TCB-drop) build on this format.
 
+### 6.7 Large files — streaming offset-addressed I/O (Phase B)
+
+> **Built 2026-06-17.** Phase B of the robustness program. The 3584-byte file ceiling was
+> never an *on-disk* limit (a file is already a contiguous u64 extent; `block-driver` moves
+> one sector per IPC) — it was the **client↔fs message** boundary: the whole file rode in one
+> ≤4 KiB IPC message and one stack buffer. Phase B lifts it with a **streaming API**, no
+> on-disk format change.
+
+**Mechanism — stateless offset-addressed ops** (fit the single-owner, per-request model, §8;
+no open-file/session state):
+
+- `WriteNew(path, total)` (op 24) — create/truncate `path` to a file sized `total` bytes,
+  allocating the whole contiguous extent up front (record size = `total`; data filled next).
+- `WriteAt(path, offset, chunk)` (op 25) — write `chunk` at a **block-aligned** byte offset;
+  whole blocks only (the last block of a partial chunk is zero-padded), so no
+  read-modify-write. Bounded to the file's extent — a write past it is a loud error.
+- `ReadAt(path, offset, len)` (op 26) — read up to `len` bytes from `offset` (clamped to size).
+
+A large write = `WriteNew` then a sequence of `WriteAt` chunks; a large read = `StatFile` (for
+the size) then a sequence of `ReadAt` chunks. The streaming **chunk** is `MAX_FILE_BYTES`
+(3584) — now the per-message size, no longer a file cap. The one-shot `WriteFile`/`ReadFile`
+remain for small files.
+
+**Clients.** The shell streams `cat`/`read`, `copy` (incl. recursive), and the pipe `write`
+sink through these ops — so it views/copies files far larger than one message with only a
+single chunk buffer (important given the shell's tight stack). `run` (which must hold a whole
+script to parse) stays on the one-shot path, bounded by what it can hold; the embedded
+`selfcheck` continues to run from rodata, not from a disk file.
+
+**Crash behaviour (until Phase C).** A large write is many separate writes; a crash mid-write
+leaves a partial file — the same honest-loss as any write today. Phase C's journal makes the
+metadata commit atomic.
+
+**Verified:** `osdev test fs-large` writes + reads a 200 KiB file in streaming chunks and
+re-reads it across a **reboot** (boot 1 writes, boot 2 re-verifies on the same disk); files
+130/0 and script 2/2 confirm the shell `cat`/`copy` streaming is regression-free.
+
 ## 7. File = capability (the north star)
 
 The spine that makes this filesystem *ours* rather than a generic store: a file is named

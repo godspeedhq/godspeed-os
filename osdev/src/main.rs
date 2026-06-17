@@ -1045,6 +1045,7 @@ fn cmd_test(suite: &str) {
         "blockdev"     => run_blockdev_test(),
         "blockdev-reboot" => run_blockdev_reboot_test(),
         "fs-corrupt"   => run_fs_corruption_test(),
+        "fs-large"     => run_fs_large_test(),
         "drives-raw"   => run_drives_raw_test(),
         "drives"       => run_drives_scripted_test(),
         "files"        => run_files_test(),
@@ -1462,6 +1463,54 @@ fn run_fs_corruption_test() {
         println!("\n  [GSFS.crc]  integrity: corruption is loud, never silent  … PASS\n\n  8 passed  0 failed");
     } else {
         println!("\n  [GSFS.crc]  integrity  … FAIL\n");
+        std::process::exit(1);
+    }
+}
+
+/// Large files: a 200 KiB file (far past the 3584-byte single-message chunk) written and
+/// read in streaming chunks via WRITE_NEW/WRITE_AT/READ_AT, then verified to **persist
+/// across a reboot**. The fs self-test creates the file on boot 1 (and verifies the
+/// round-trip) and re-verifies it on boot 2 on the SAME disk — proving both the streaming
+/// path and durability of a large file.
+fn run_fs_large_test() {
+    println!("\n=== fs: large files (200 KiB streaming round-trip + reboot survival) ===");
+    cmd_build_blockdev();
+
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_fs_large.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create persist disk");
+    format_superblock(persist);
+
+    let img = std::fs::canonicalize(&image_path).unwrap_or_else(|_| image_path.to_path_buf());
+    let img_str = img.to_string_lossy().replace('\\', "/");
+    let persist_abs = std::fs::canonicalize(persist).unwrap_or_else(|_| std::path::PathBuf::from(persist));
+    let persist_str = persist_abs.to_string_lossy().replace('\\', "/");
+
+    println!("fs: boot 1 — write + read back a 200 KiB file (streaming), ~25s …");
+    let log1 = boot_ahci_qemu(&img_str, &persist_str, "build/tests/fs_large_1.log", 25);
+    let wrote = log1.contains("large-file 204800 B round-trip OK");
+
+    println!("fs: boot 2 — SAME disk, re-read the 200 KiB file, ~25s …");
+    let log2 = boot_ahci_qemu(&img_str, &persist_str, "build/tests/fs_large_2.log", 25);
+    let survived = log2.contains("large-file 204800 B round-trip OK");
+    let no_bad = !log1.contains("large-file MISMATCH") && !log2.contains("large-file MISMATCH")
+        && !log1.contains("large write") && !log2.contains("large-file READ FAILED");
+    let no_panic = !log1.contains("KERNEL PANIC") && !log2.contains("KERNEL PANIC");
+
+    println!("fs:   boot 1 streaming write+read 200 KiB ... {}", if wrote { "yes" } else { "NO" });
+    println!("fs:   boot 2 re-read across reboot ... {}", if survived { "yes" } else { "NO" });
+    println!("fs:   no mismatch / no panic ... {}", if no_bad && no_panic { "yes" } else { "NO" });
+
+    if wrote && survived && no_bad && no_panic {
+        println!("\n  [FS.large]  200 KiB streaming round-trip + reboot survival  … PASS\n\n  1 passed  0 failed");
+    } else {
+        println!("\n  [FS.large]  large files  … FAIL\n\n  0 passed  1 failed");
         std::process::exit(1);
     }
 }

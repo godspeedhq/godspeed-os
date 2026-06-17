@@ -63,9 +63,12 @@ const ITYPE_FREE: u8 = 0;
 const ITYPE_FILE: u8 = 1;
 const ITYPE_DIR: u8 = 2;
 
-// One file read/write travels in a single IPC message; bound the body so the READ reply
-// (5-byte header + data) never exceeds MAX_PAYLOAD (4096).
-const MAX_FILE_BYTES: usize = 7 * BLOCK; // 3584
+// Per-message data chunk: the most file bytes that travel in one IPC message, bounded so a
+// request/reply (a few header bytes + data) never exceeds MAX_PAYLOAD (4096). This is the
+// **streaming chunk size**, NOT a file-size cap — large files are read/written across many
+// of these chunks via the offset-addressed ops (WRITE_NEW/WRITE_AT/READ_AT). The one-shot
+// WRITE_FILE/READ_FILE ops carry a whole small file (≤ this) in a single message.
+const MAX_FILE_BYTES: usize = 7 * BLOCK; // 3584 — streaming chunk size
 
 // Block IPC protocol (fs <-> block-driver). MUST match `services/block-driver`.
 const OP_READ_BLOCK: u8 = 1;
@@ -90,6 +93,12 @@ const OP_DRIVES_INFO: u8 = 20;
 const OP_FLASH: u8 = 21;
 const OP_LABEL: u8 = 22;
 const OP_RESET: u8 = 23;
+// Large-file streaming (offset-addressed; stateless — each request is self-contained, §8).
+// A big file = WRITE_NEW (allocate the whole extent, size it) then a sequence of WRITE_AT
+// chunks; read it back with STAT (for the size) + a sequence of READ_AT chunks.
+const OP_WRITE_NEW: u8 = 24; // [op, plen, path, total:u64] — create/truncate `path` sized `total`
+const OP_WRITE_AT: u8 = 25;  // [op, plen, path, offset:u64, chunk…] — write chunk at byte offset
+const OP_READ_AT: u8 = 26;   // [op, plen, path, offset:u64, len:u32] → [FS_OK, n:u32, bytes]
 const FS_OK: u8 = 0;
 const FS_ERR: u8 = 1;
 const FS_NOTFOUND: u8 = 2;
@@ -186,6 +195,7 @@ fn self_test(ctx: &ServiceContext, fs: &mut Fs) {
                     ctx.log("fs: nested '/etc/motd' verified across boot");
                 }
             }
+            large_file_check(ctx, fs); // boot 2: verify the big file survived the reboot
             return;
         }
     }
@@ -207,6 +217,49 @@ fn self_test(ctx: &ServiceContext, fs: &mut Fs) {
         },
         Err(e) => ctx.log_fmt(format_args!("fs: write FAILED: {}", e)),
     }
+    large_file_check(ctx, fs); // boot 1: write the big file (and verify the round-trip)
+}
+
+/// Large-file round-trip proof (selftest only): a 200 KiB file written/read in streaming
+/// chunks via `write_new`/`write_at`/`read_at` — far past the one-message cap. The content
+/// is a deterministic pattern generated and verified chunk-by-chunk, so no big buffer is
+/// needed anywhere. Creates the file if absent (boot 1), then always verifies (boot 2 proves
+/// it survived the reboot).
+#[cfg(feature = "selftest")]
+fn large_file_check(ctx: &ServiceContext, fs: &mut Fs) {
+    const BIG: &[u8] = b"/big.bin";
+    const N: u64 = 200 * 1024; // 204800 bytes — ~57 chunks
+    let pat = |k: u64| -> u8 { (k.wrapping_mul(131).wrapping_add(7) & 0xFF) as u8 };
+
+    let present = matches!(fs.walk(ctx, BIG), Some(e) if e.itype == ITYPE_FILE && e.size == N);
+    if !present {
+        if fs.write_new(ctx, BIG, N).is_err() { ctx.log("fs: large write_new FAILED"); return; }
+        let mut chunk = [0u8; MAX_FILE_BYTES];
+        let mut off = 0u64;
+        while off < N {
+            let len = (MAX_FILE_BYTES as u64).min(N - off) as usize;
+            for i in 0..len { chunk[i] = pat(off + i as u64); }
+            if fs.write_at(ctx, BIG, off, &chunk[..len]).is_err() {
+                ctx.log("fs: large write_at FAILED"); return;
+            }
+            off += len as u64;
+        }
+    }
+    let mut buf = [0u8; MAX_FILE_BYTES];
+    let mut off = 0u64;
+    while off < N {
+        let want = (MAX_FILE_BYTES as u64).min(N - off) as usize;
+        match fs.read_at(ctx, BIG, off, want, &mut buf) {
+            Some(n) if n == want => {
+                for i in 0..n {
+                    if buf[i] != pat(off + i as u64) { ctx.log("fs: large-file MISMATCH"); return; }
+                }
+            }
+            _ => { ctx.log("fs: large-file READ FAILED"); return; }
+        }
+        off += want as u64;
+    }
+    ctx.log_fmt(format_args!("fs: large-file {} B round-trip OK", N));
 }
 
 /// Dispatch one request and reply through the client's `reply` cap.
@@ -283,6 +336,33 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
         OP_READ_FILE => {
             let mut buf = [0u8; MAX_FILE_BYTES];
             match fs.read_path(ctx, path, &mut buf) {
+                Some(n) => {
+                    let mut out = [0u8; 5 + MAX_FILE_BYTES];
+                    out[0] = FS_OK;
+                    out[1..5].copy_from_slice(&(n as u32).to_le_bytes());
+                    out[5..5 + n].copy_from_slice(&buf[..n]);
+                    send(&out[..5 + n]);
+                }
+                None => send(&[FS_NOTFOUND]),
+            }
+        }
+        OP_WRITE_NEW => {
+            if tail.len() < 8 { send(&[FS_ERR]); return; }
+            let total = u64_at(tail, 0);
+            send(&[match fs.write_new(ctx, path, total) { Ok(()) => FS_OK, Err(_) => FS_ERR }]);
+        }
+        OP_WRITE_AT => {
+            if tail.len() < 8 { send(&[FS_ERR]); return; }
+            let offset = u64_at(tail, 0);
+            let chunk = &tail[8..];
+            send(&[match fs.write_at(ctx, path, offset, chunk) { Ok(()) => FS_OK, Err(_) => FS_ERR }]);
+        }
+        OP_READ_AT => {
+            if tail.len() < 12 { send(&[FS_ERR]); return; }
+            let offset = u64_at(tail, 0);
+            let len = (u32_at(tail, 8) as usize).min(MAX_FILE_BYTES);
+            let mut buf = [0u8; MAX_FILE_BYTES];
+            match fs.read_at(ctx, path, offset, len, &mut buf) {
                 Some(n) => {
                     let mut out = [0u8; 5 + MAX_FILE_BYTES];
                     out[0] = FS_OK;
@@ -725,6 +805,78 @@ impl Fs {
             out[start..end].copy_from_slice(&blk[..end - start]);
         }
         Some(size)
+    }
+
+    // ── large-file streaming (offset-addressed; the data path that lifts the one-message
+    //    file-size cap). A big file is created once with `write_new` (which allocates the
+    //    whole extent up front), filled by sequential `write_at` chunks, and read back with
+    //    `read_at` chunks. No open-file/session state — each call is self-contained (§8).
+
+    /// Create or truncate `path` to a file sized for `total` bytes: allocate a contiguous
+    /// extent big enough, record it (size = `total`), and leave the data for `write_at` to
+    /// fill. Like `write_path`, the new extent is allocated before the old is freed, so a
+    /// failure leaves the previous file intact.
+    fn write_new(&mut self, ctx: &ServiceContext, path: &[u8], total: u64) -> Result<(), &'static str> {
+        let (mut parent, name) = self.walk_parent(ctx, path).ok_or("path not found")?;
+        if parent.itype != ITYPE_DIR { return Err("parent is not a directory"); }
+        if !valid_name(name) { return Err("bad name"); }
+        let existing = self.dir_find(ctx, &parent, name);
+        if let Some(ref e) = existing {
+            if e.itype != ITYPE_FILE { return Err("path is a directory"); }
+        }
+        let blocks = ((total + BLOCK as u64 - 1) / BLOCK as u64).max(1);
+        let first = self.alloc_run(ctx, blocks)?;
+        match existing {
+            Some(e) => {
+                let (old_first, old_count) = (e.first_block, e.block_count);
+                let ne = Entry { itype: ITYPE_FILE, size: total, first_block: first, block_count: blocks, loc: e.loc };
+                self.persist_entry(ctx, &ne)?;
+                self.free_run(ctx, old_first, old_count)
+            }
+            None => self.dir_add(ctx, &mut parent, name, ITYPE_FILE, total, first, blocks),
+        }
+    }
+
+    /// Write `chunk` into an existing file at byte `offset`. The offset must be block-aligned
+    /// (clients stream in block-aligned chunks), so whole blocks are written with no
+    /// read-modify-write; the final block of a partial chunk is zero-padded. Bounded to the
+    /// file's allocated extent — a write past it is a loud error, never an overrun.
+    fn write_at(&self, ctx: &ServiceContext, path: &[u8], offset: u64, chunk: &[u8]) -> Result<(), &'static str> {
+        let e = self.walk(ctx, path).ok_or("not found")?;
+        if e.itype != ITYPE_FILE { return Err("not a file"); }
+        if offset % BLOCK as u64 != 0 { return Err("unaligned offset"); }
+        if offset + chunk.len() as u64 > e.block_count * BLOCK as u64 { return Err("write past extent"); }
+        let start = e.first_block + offset / BLOCK as u64;
+        let nblk = (chunk.len() + BLOCK - 1) / BLOCK;
+        for i in 0..nblk {
+            let mut blk = [0u8; BLOCK];
+            let s = i * BLOCK;
+            let end = (s + BLOCK).min(chunk.len());
+            blk[..end - s].copy_from_slice(&chunk[s..end]);
+            if !block_write(ctx, start + i as u64, &blk) { return Err("block write failed"); }
+        }
+        Ok(())
+    }
+
+    /// Read up to `len` bytes from `path` starting at byte `offset` into `out` (clamped to the
+    /// file's size and `out.len()`). Returns the number of bytes read (0 at/after EOF). The
+    /// offset need not be block-aligned — it reads across block boundaries as needed.
+    fn read_at(&self, ctx: &ServiceContext, path: &[u8], offset: u64, len: usize, out: &mut [u8]) -> Option<usize> {
+        let e = self.walk(ctx, path)?;
+        if e.itype != ITYPE_FILE { return None; }
+        let size = e.size;
+        if offset >= size { return Some(0); }
+        let n = len.min((size - offset) as usize).min(out.len());
+        let mut done = 0;
+        while done < n {
+            let pos = offset as usize + done;
+            let blk = block_read(ctx, e.first_block + (pos / BLOCK) as u64)?;
+            let within = pos % BLOCK;
+            let take = (BLOCK - within).min(n - done);
+            out[done..done + take].copy_from_slice(&blk[within..within + take]);
+            done += take;
+        }
+        Some(n)
     }
 
     /// Reply: `[FS_OK, count:u8, {name_len:u8, name, is_dir:u8, size:u64}…]`, one block.
