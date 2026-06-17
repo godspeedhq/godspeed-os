@@ -1046,6 +1046,7 @@ fn cmd_test(suite: &str) {
         "blockdev-reboot" => run_blockdev_reboot_test(),
         "fs-corrupt"   => run_fs_corruption_test(),
         "fs-large"     => run_fs_large_test(),
+        "fs-journal"   => run_fs_journal_test(),
         "drives-raw"   => run_drives_raw_test(),
         "drives"       => run_drives_scripted_test(),
         "files"        => run_files_test(),
@@ -1199,10 +1200,14 @@ fn boot_blockdev_qemu(img_str: &str, persist_str: &str, serial: &str, secs: u64)
 
 /// Build the AHCI block-driver variant: block-driver with its `ahci` feature,
 /// supervisor spawns block-driver + fs (bare-metal,blockdev). AHCI by default.
-fn cmd_build_blockdev() {
+fn cmd_build_blockdev() { build_blockdev_fs("selftest"); }
+
+/// Build the blockdev image with `fs` compiled with the given feature set (`selftest` for the
+/// round-trip/reboot tests, `journal-crash-test` for the crash-consistency test).
+fn build_blockdev_fs(fs_features: &str) {
     clean_supervisor();
-    // Force a fresh `fs` so its `selftest` feature (added below) is compiled in even if a
-    // prior plain build cached it — otherwise the blockdev tests miss the self-test logs.
+    // Force a fresh `fs` so its test feature (added below) is compiled in even if a prior
+    // plain build cached it — otherwise the blockdev tests miss the self-test logs.
     let _ = std::process::Command::new("cargo")
         .args(["clean", "--release", "-p", "fs", "--target", "x86_64-unknown-none"]).status();
     let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver"];
@@ -1214,13 +1219,13 @@ fn cmd_build_blockdev() {
         if !status.success() { eprintln!("build: {} FAILED", crate_name); std::process::exit(1); }
         println!("build: {} OK", crate_name);
     }
-    // fs WITH the selftest feature — the blockdev tests assert its self-test log lines.
+    // fs WITH the requested test feature — the blockdev tests assert its self-test log lines.
     // (Production `osdev image` builds fs without it, so it never writes to a real disk.)
     let status = std::process::Command::new("cargo")
-        .args(["build", "--release", "-p", "fs", "--target", "x86_64-unknown-none", "--features", "selftest"])
+        .args(["build", "--release", "-p", "fs", "--target", "x86_64-unknown-none", "--features", fs_features])
         .status().unwrap_or_else(|e| panic!("failed to run cargo build for fs: {}", e));
     if !status.success() { eprintln!("build: fs FAILED"); std::process::exit(1); }
-    println!("build: fs (selftest) OK");
+    println!("build: fs ({}) OK", fs_features);
     // Spawn block-driver + fs (blockdev) so fs mounts the AHCI disk over IPC.
     let status = std::process::Command::new("cargo")
         .args(["build", "--release", "-p", "supervisor", "--target", "x86_64-unknown-none",
@@ -1511,6 +1516,92 @@ fn run_fs_large_test() {
         println!("\n  [FS.large]  200 KiB streaming round-trip + reboot survival  … PASS\n\n  1 passed  0 failed");
     } else {
         println!("\n  [FS.large]  large files  … FAIL\n\n  0 passed  1 failed");
+        std::process::exit(1);
+    }
+}
+
+/// Crash-consistency (Phase C). Two parts, both over a real SATA disk image:
+///   Part 1 (REPLAY): a `journal-crash-test` build writes a file through a transaction that
+///     halts right after the commit record is durable but before the checkpoint (simulated
+///     power loss). On the next boot, `mount`'s recovery replays the committed transaction
+///     from the journal — the file is present with the right bytes.
+///   Part 2 (REJECT): a normal build boots a disk whose journal holds a commit record with a
+///     BAD checksum (a torn/garbage commit). Recovery must IGNORE it — no replay, mount clean.
+fn run_fs_journal_test() {
+    println!("\n=== fs: crash-consistency (journal replay + reject invalid commit) ===");
+    const FS_JOURNAL_MAGIC: u32 = 0x474A_3034; // "GJ04" — must match services/fs JOURNAL_MAGIC
+
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    let limine_dir = std::path::Path::new("tools/limine");
+    let _ = std::fs::create_dir_all("build/tests");
+    let mut pass = 0; let mut fail = 0;
+    let mut check = |ok: bool, label: &str| {
+        if ok { println!("  PASS … {}", label); pass += 1; } else { println!("  FAIL … {}", label); fail += 1; }
+    };
+
+    // ── Part 1: replay a committed-but-unfinished transaction ──
+    build_blockdev_fs("journal-crash-test");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let img = std::fs::canonicalize(&image_path).unwrap_or_else(|_| image_path.to_path_buf());
+    let img_str = img.to_string_lossy().replace('\\', "/");
+
+    let disk = "build/tests/fs_journal.img";
+    std::fs::write(disk, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(disk);
+    let disk_abs = std::fs::canonicalize(disk).unwrap_or_else(|_| std::path::PathBuf::from(disk));
+    let disk_str = disk_abs.to_string_lossy().replace('\\', "/");
+
+    println!("fs: boot 1 — write /jcrash.txt, halt after commit record (simulated crash), ~18s …");
+    let log1 = boot_ahci_qemu(&img_str, &disk_str, "build/tests/fs_journal_1.log", 18);
+    check(log1.contains("halting before checkpoint"), "part1 boot1: crashed right after the commit record");
+    check(!log1.contains("did NOT crash"), "part1 boot1: the crash actually fired");
+    check(!log1.contains("KERNEL PANIC"), "part1 boot1: no kernel panic");
+
+    println!("fs: boot 2 — SAME disk, mount must replay the journal, ~18s …");
+    let log2 = boot_ahci_qemu(&img_str, &disk_str, "build/tests/fs_journal_2.log", 18);
+    check(log2.contains("journal recovered"), "part2 boot2: mount replayed the committed transaction");
+    check(log2.contains("jcrash RECOVERED+VERIFIED"), "part2 boot2: recovered file has the right bytes");
+    check(!log2.contains("DATA MISMATCH"), "part2 boot2: no data mismatch");
+    check(!log2.contains("KERNEL PANIC") && !log2.contains("CRC mismatch"), "part2 boot2: no panic, no corruption");
+
+    // ── Part 2: a normal build must REJECT a commit record with a bad CRC ──
+    build_blockdev_fs("selftest");
+    let image2 = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image2);
+    let img2 = std::fs::canonicalize(&image2).unwrap_or_else(|_| image2.to_path_buf());
+    let img2_str = img2.to_string_lossy().replace('\\', "/");
+
+    let disk2 = "build/tests/fs_journal_bad.img";
+    std::fs::write(disk2, vec![0u8; 16 * 1024 * 1024]).expect("create disk2");
+    format_superblock(disk2);
+    // Fabricate a commit record with a VALID magic but a DELIBERATELY WRONG crc at journal_start.
+    {
+        let mut data = std::fs::read(disk2).unwrap();
+        let journal_start = u64::from_le_bytes(data[108..116].try_into().unwrap()) as usize;
+        let off = journal_start * 512;
+        data[off..off + 4].copy_from_slice(&FS_JOURNAL_MAGIC.to_le_bytes());
+        data[off + 4..off + 8].copy_from_slice(&2u32.to_le_bytes()); // n = 2
+        data[off + 8..off + 24].copy_from_slice(&[7u8; 16]);          // bogus home LBAs
+        data[off + 508..off + 512].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes()); // wrong CRC
+        std::fs::write(disk2, &data).unwrap();
+    }
+    let disk2_abs = std::fs::canonicalize(disk2).unwrap_or_else(|_| std::path::PathBuf::from(disk2));
+    let disk2_str = disk2_abs.to_string_lossy().replace('\\', "/");
+
+    println!("fs: boot 3 — journal has a commit record with a BAD crc; recovery must ignore it, ~22s …");
+    let log3 = boot_ahci_qemu(&img2_str, &disk2_str, "build/tests/fs_journal_bad.log", 22);
+    check(log3.contains("mounted GSFS0004"), "reject: filesystem mounted cleanly");
+    check(!log3.contains("journal recovered"), "reject: did NOT replay the bad-CRC commit");
+    check(log3.contains("round-trip OK (greeting)") || log3.contains("verified across boot"),
+          "reject: fs serves normally (greeting round-trip)");
+    check(!log3.contains("KERNEL PANIC"), "reject: no kernel panic");
+
+    if fail == 0 {
+        println!("\n  [FS.journal]  crash-consistency: replay committed, reject torn  … PASS\n\n  {} passed  0 failed", pass);
+    } else {
+        println!("\n  [FS.journal]  crash-consistency  … FAIL\n\n  {} passed  {} failed", pass, fail);
         std::process::exit(1);
     }
 }

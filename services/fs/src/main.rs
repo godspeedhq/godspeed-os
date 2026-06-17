@@ -49,9 +49,13 @@ const DIR_REC_REGION: usize = RECS_PER_BLOCK * REC_SIZE; // 448 — CRC covers [
 const DIR_CRC_OFF: usize = DIR_REC_REGION; // 448 — u32 CRC32 of the record region
 const NAME_MAX: usize = 38; // entry: type u8 @0, name_len u8 @1, name[38] @2, size @40, first @48, count @56
 
-// Reserved crash-consistency journal region (GSFS0004 geometry; filled by Phase C). Fixed
-// size, bounded (§26.6): a transaction larger than this is refused loudly, never partial.
+// Crash-consistency journal region (GSFS0004 geometry). Fixed size, bounded (§26.6): a
+// transaction larger than this is refused loudly, never partially applied.
 const JOURNAL_BLOCKS: u64 = 64; // 64 × 512 B = 32 KiB
+// One commit/header block + up to TXN_CAP data blocks must fit the journal region.
+const TXN_CAP: usize = 56; // max structural blocks one transaction may stage
+const JOURNAL_MAGIC: u32 = 0x474A_3034; // "GJ04" — marks a committed transaction
+const COMMIT_CRC_OFF: usize = 508; // commit record: CRC32 of [0..8+n*8] lives at @508
 
 // Recursive-delete depth cap (§26.6). Paths are capped well below this by the wire
 // `path_len` (u8) and the shell's PATH_MAX (120), so this is a backstop, not the binding
@@ -119,6 +123,19 @@ struct Fs {
     flags: u32,
     label: [u8; LABEL_MAX],
     label_len: u8,
+    // Crash-consistency journal (Phase C). While `txn_active`, structural writes (directory,
+    // bitmap, superblock) are STAGED here — with read-your-writes — instead of going to disk,
+    // then committed atomically through the on-disk journal region (`commit_txn`). Data-block
+    // writes bypass this and go direct. A staged set larger than `TXN_CAP` is refused loudly.
+    txn_active: bool,
+    txn_n: usize,
+    txn_overflow: bool,
+    txn_lba: [u64; TXN_CAP],
+    txn_blk: [[u8; BLOCK]; TXN_CAP],
+    // Test-only crash injection (set only by the `journal-crash-test` build): halt inside
+    // `commit_txn` right after the commit record is durable but before the checkpoint, to
+    // simulate a power loss at the worst moment. Always false in production.
+    crash_after_commit: bool,
 }
 
 /// A decoded `file_record` plus where it lives, so it can be written back. `loc == None`
@@ -164,6 +181,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     #[cfg(feature = "selftest")]
     if let Some(ref mut f) = fs {
         self_test(&ctx, f);
+    }
+
+    #[cfg(feature = "journal-crash-test")]
+    if let Some(ref mut f) = fs {
+        journal_crash_test(&ctx, f);
     }
 
     ctx.log("fs: serving file API");
@@ -262,6 +284,34 @@ fn large_file_check(ctx: &ServiceContext, fs: &mut Fs) {
     ctx.log_fmt(format_args!("fs: large-file {} B round-trip OK", N));
 }
 
+/// Crash-consistency proof (`journal-crash-test` build only). Two-boot, same binary, same
+/// disk: on boot 1 the file is absent, so it writes `/jcrash.txt` through a transaction that
+/// **halts right after the commit record is durable but before the checkpoint** (simulated
+/// power loss). On boot 2 the file is absent on its home blocks, but `mount`'s recovery
+/// replays the committed transaction from the journal — so the file is present with the right
+/// bytes, proving the write was atomic and survived the crash.
+#[cfg(feature = "journal-crash-test")]
+fn journal_crash_test(ctx: &ServiceContext, fs: &mut Fs) {
+    const F: &[u8] = b"/jcrash.txt";
+    const D: &[u8] = b"journal crash consistency proof";
+    let mut buf = [0u8; MAX_FILE_BYTES];
+    if let Some(n) = fs.read_path(ctx, F, &mut buf) {
+        if &buf[..n] == D {
+            ctx.log("fs: jcrash RECOVERED+VERIFIED across simulated crash");
+        } else {
+            ctx.log("fs: jcrash recovered but DATA MISMATCH");
+        }
+        return;
+    }
+    // Boot 1: file absent — write it, arming the crash so commit_txn halts post-commit.
+    ctx.log("fs: jcrash boot1 — writing /jcrash.txt, will halt after commit record");
+    fs.begin_txn();
+    fs.crash_after_commit = true;
+    let _ = fs.write_path(ctx, F, D);
+    let _ = fs.commit_txn(ctx); // halts inside (armed) — control does not return
+    ctx.log("fs: jcrash boot1 did NOT crash (unexpected)");
+}
+
 /// Dispatch one request and reply through the client's `reply` cap.
 fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], reply: CapHandle) {
     let send = |bytes: &[u8]| { let _ = ctx.send_by_handle(reply, &Message::from_bytes(bytes)); };
@@ -306,7 +356,11 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
             let ll = if p.len() >= 2 { (p[1] as usize).min(LABEL_MAX) } else { 0 };
             let label = if p.len() >= 2 + ll { &p[2..2 + ll] } else { &[][..] };
             match vol {
-                Some(f) => send(&[match f.relabel(ctx, label) { Ok(()) => FS_OK, Err(_) => FS_ERR }]),
+                Some(f) => {
+                    f.begin_txn();
+                    let r = f.relabel(ctx, label);
+                    send(&[match f.end_txn(ctx, r) { Ok(()) => FS_OK, Err(_) => FS_ERR }]);
+                }
                 None => send(&[FS_NOFS]),
             }
             return;
@@ -331,8 +385,19 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
     if p.len() < 2 + plen { send(&[FS_ERR]); return; }
     let path = &p[2..2 + plen];
     let tail = &p[2 + plen..]; // WriteFile data, or Rename newname, or Move dst-path
+    // Run a metadata-mutating op as ONE atomic transaction: stage its structural writes, then
+    // commit them through the journal (`end_txn`). A crash before the commit record leaves the
+    // fs unchanged; after it, the op is replayed on the next mount. (delete_tree manages its
+    // own transactions; write_at writes only data, so neither is wrapped here.)
+    macro_rules! txn {
+        ($e:expr) => {{
+            fs.begin_txn();
+            let r = $e;
+            send(&[match fs.end_txn(ctx, r) { Ok(()) => FS_OK, Err(_) => FS_ERR }]);
+        }};
+    }
     match op {
-        OP_WRITE_FILE => send(&[match fs.write_path(ctx, path, tail) { Ok(()) => FS_OK, Err(_) => FS_ERR }]),
+        OP_WRITE_FILE => txn!(fs.write_path(ctx, path, tail)),
         OP_READ_FILE => {
             let mut buf = [0u8; MAX_FILE_BYTES];
             match fs.read_path(ctx, path, &mut buf) {
@@ -349,7 +414,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
         OP_WRITE_NEW => {
             if tail.len() < 8 { send(&[FS_ERR]); return; }
             let total = u64_at(tail, 0);
-            send(&[match fs.write_new(ctx, path, total) { Ok(()) => FS_OK, Err(_) => FS_ERR }]);
+            txn!(fs.write_new(ctx, path, total));
         }
         OP_WRITE_AT => {
             if tail.len() < 8 { send(&[FS_ERR]); return; }
@@ -386,16 +451,17 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
             }
             send(&out);
         }
-        OP_MKDIR => send(&[match fs.mkdir(ctx, path) { Ok(()) => FS_OK, Err(_) => FS_ERR }]),
-        OP_MKDIR_P => send(&[match fs.mkdir_parents(ctx, path) { Ok(()) => FS_OK, Err(_) => FS_ERR }]),
+        OP_MKDIR => txn!(fs.mkdir(ctx, path)),
+        OP_MKDIR_P => txn!(fs.mkdir_parents(ctx, path)),
         OP_LIST_DIR => match fs.list_dir(ctx, path) {
             Some(out) => send(&out),
             None => send(&[FS_NOTFOUND]),
         },
-        OP_RENAME => send(&[match fs.rename(ctx, path, tail) { Ok(()) => FS_OK, Err(_) => FS_ERR }]),
-        OP_DELETE => send(&[match fs.delete(ctx, path) { Ok(()) => FS_OK, Err(_) => FS_ERR }]),
+        OP_RENAME => txn!(fs.rename(ctx, path, tail)),
+        OP_DELETE => txn!(fs.delete(ctx, path)),
+        // delete_tree manages its own transactions (unlink + batched frees) — not wrapped.
         OP_DELETE_TREE => send(&[match fs.delete_tree(ctx, path) { Ok(()) => FS_OK, Err(_) => FS_ERR }]),
-        OP_MOVE => send(&[match fs.move_path(ctx, path, tail) { Ok(()) => FS_OK, Err(_) => FS_ERR }]),
+        OP_MOVE => txn!(fs.move_path(ctx, path, tail)),
         _ => send(&[FS_ERR]),
     }
 }
@@ -412,6 +478,9 @@ impl Fs {
         if u32_at(&sb, 124) != crc32(&sb[..124]) {
             return Err("superblock checksum mismatch — refusing to mount corrupt filesystem");
         }
+        // Crash recovery: replay a committed-but-unfinished transaction before serving (§9).
+        // Idempotent — a clean shutdown leaves no commit record, so this is a no-op then.
+        Fs::recover(ctx, u64_at(&sb, 108));
         let mut label = [0u8; LABEL_MAX];
         let ll = (sb[76] as usize).min(LABEL_MAX);
         label[..ll].copy_from_slice(&sb[77..77 + ll]);
@@ -427,7 +496,158 @@ impl Fs {
             flags: u32_at(&sb, 72),
             label,
             label_len: ll as u8,
+            txn_active: false,
+            txn_n: 0,
+            txn_overflow: false,
+            txn_lba: [0; TXN_CAP],
+            txn_blk: [[0u8; BLOCK]; TXN_CAP],
+            crash_after_commit: false,
         })
+    }
+
+    // ── crash-consistency journal (Phase C) ──────────────────────────────────
+    // Every metadata mutation runs as one atomic transaction: structural writes are staged
+    // (`tb_write`/`td_write`) instead of going to disk, then `commit_txn` writes them to the
+    // journal with a checksummed commit record (the atomic point), checkpoints them home, and
+    // invalidates the journal. A crash before the commit record lands leaves home untouched
+    // (discarded); a crash after it is replayed idempotently on the next mount (`recover`).
+    // Reads honor staged writes (read-your-writes) so an op sees its own changes.
+
+    /// Read a block, returning the staged version if this transaction has written `lba`.
+    fn tb_read(&self, ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
+        if self.txn_active {
+            let mut i = self.txn_n;
+            while i > 0 {
+                i -= 1;
+                if self.txn_lba[i] == lba { return Some(self.txn_blk[i]); }
+            }
+        }
+        block_read(ctx, lba)
+    }
+
+    /// Write a block: stage it in the active transaction (de-duplicating by `lba`), else write
+    /// through to disk. Staging overflow is recorded and surfaces as a loud commit failure.
+    fn tb_write(&mut self, ctx: &ServiceContext, lba: u64, data: &[u8; BLOCK]) -> bool {
+        if self.txn_active {
+            for i in 0..self.txn_n {
+                if self.txn_lba[i] == lba { self.txn_blk[i] = *data; return true; }
+            }
+            if self.txn_n >= TXN_CAP { self.txn_overflow = true; return false; }
+            self.txn_lba[self.txn_n] = lba;
+            self.txn_blk[self.txn_n] = *data;
+            self.txn_n += 1;
+            true
+        } else {
+            block_write(ctx, lba, data)
+        }
+    }
+
+    /// Directory-block read with CRC verify, honoring staged writes.
+    fn td_read(&self, ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
+        let blk = self.tb_read(ctx, lba)?;
+        if u32_at(&blk, DIR_CRC_OFF) != crc32(&blk[..DIR_REC_REGION]) {
+            ctx.log_fmt(format_args!("fs: directory block CRC mismatch at lba {} — refusing", lba));
+            return None;
+        }
+        Some(blk)
+    }
+
+    /// Directory-block write: stamp the CRC trailer, then stage/through via `tb_write`.
+    fn td_write(&mut self, ctx: &ServiceContext, lba: u64, blk: &mut [u8; BLOCK]) -> bool {
+        let c = crc32(&blk[..DIR_REC_REGION]);
+        blk[DIR_CRC_OFF..DIR_CRC_OFF + 4].copy_from_slice(&c.to_le_bytes());
+        self.tb_write(ctx, lba, blk)
+    }
+
+    fn begin_txn(&mut self) {
+        self.txn_active = true;
+        self.txn_n = 0;
+        self.txn_overflow = false;
+    }
+
+    fn abort_txn(&mut self) {
+        self.txn_active = false;
+        self.txn_n = 0;
+        self.txn_overflow = false;
+    }
+
+    /// Commit the staged transaction atomically: write the staged blocks into the journal, then
+    /// a checksummed commit record (the atomic point), then checkpoint them to their home LBAs,
+    /// then invalidate the journal. On overflow or any failure the transaction is dropped; if it
+    /// failed before the commit record landed, home is untouched (the fs is unchanged).
+    fn commit_txn(&mut self, ctx: &ServiceContext) -> Result<(), &'static str> {
+        if self.txn_overflow { self.abort_txn(); return Err("transaction too large to commit atomically"); }
+        let n = self.txn_n;
+        if n == 0 { self.txn_active = false; return Ok(()); }
+        // Snapshot so we can write through `block_write` while `txn_active` is cleared.
+        self.txn_active = false;
+        // 1. Stage the data blocks in the journal (journal_start+1 ..).
+        for i in 0..n {
+            if !block_write(ctx, self.journal_start + 1 + i as u64, &self.txn_blk[i]) {
+                return Err("journal data write failed");
+            }
+        }
+        // 2. Write the commit record — the atomic point. magic + n + home LBAs + CRC32.
+        let mut commit = [0u8; BLOCK];
+        commit[0..4].copy_from_slice(&JOURNAL_MAGIC.to_le_bytes());
+        commit[4..8].copy_from_slice(&(n as u32).to_le_bytes());
+        for i in 0..n {
+            commit[8 + i * 8..16 + i * 8].copy_from_slice(&self.txn_lba[i].to_le_bytes());
+        }
+        let crc = crc32(&commit[..8 + n * 8]);
+        commit[COMMIT_CRC_OFF..COMMIT_CRC_OFF + 4].copy_from_slice(&crc.to_le_bytes());
+        if !block_write(ctx, self.journal_start, &commit) { return Err("journal commit write failed"); }
+        // Test-only: simulate a power loss right here — commit record durable, home not yet
+        // updated. The next mount must replay this transaction. (Never set in production.)
+        if self.crash_after_commit {
+            ctx.log("fs: [journal-crash-test] commit record durable — halting before checkpoint (simulated crash)");
+            loop { ctx.yield_cpu(); }
+        }
+        // 3. Checkpoint: write each staged block to its home LBA.
+        for i in 0..n {
+            if !block_write(ctx, self.txn_lba[i], &self.txn_blk[i]) {
+                // Commit is durable: the next mount will replay this transaction. Report, but
+                // the data is safe — no corruption, only a deferred checkpoint.
+                return Err("checkpoint write failed (will replay on next mount)");
+            }
+        }
+        // 4. Invalidate the journal (idempotent — recovery tolerates a stale commit too).
+        let _ = block_write(ctx, self.journal_start, &[0u8; BLOCK]);
+        Ok(())
+    }
+
+    /// Commit on `Ok`, drop on `Err`. The single wrapper around a transactional operation.
+    fn end_txn(&mut self, ctx: &ServiceContext, res: Result<(), &'static str>) -> Result<(), &'static str> {
+        match res {
+            Ok(()) => self.commit_txn(ctx),
+            Err(e) => { self.abort_txn(); Err(e) }
+        }
+    }
+
+    /// Free an extent as its own small transaction (used by recursive delete, where the subtree
+    /// is already unlinked so each batch is independently consistent).
+    fn free_run_txn(&mut self, ctx: &ServiceContext, first: u64, count: u64) -> Result<(), &'static str> {
+        self.begin_txn();
+        let r = self.free_run(ctx, first, count);
+        self.end_txn(ctx, r)
+    }
+
+    /// Replay a committed-but-unfinished transaction at mount (idempotent). Called with the
+    /// journal geometry from the just-validated superblock, before serving any request.
+    fn recover(ctx: &ServiceContext, journal_start: u64) {
+        let commit = match block_read(ctx, journal_start) { Some(b) => b, None => return };
+        if u32_at(&commit, 0) != JOURNAL_MAGIC { return; }
+        let n = u32_at(&commit, 4) as usize;
+        if n == 0 || n > TXN_CAP || 8 + n * 8 > COMMIT_CRC_OFF { return; }
+        if crc32(&commit[..8 + n * 8]) != u32_at(&commit, COMMIT_CRC_OFF) { return; }
+        for i in 0..n {
+            let lba = u64_at(&commit, 8 + i * 8);
+            if let Some(blk) = block_read(ctx, journal_start + 1 + i as u64) {
+                let _ = block_write(ctx, lba, &blk);
+            }
+        }
+        let _ = block_write(ctx, journal_start, &[0u8; BLOCK]); // invalidate
+        ctx.log_fmt(format_args!("fs: journal recovered {} block(s) from an interrupted write", n));
     }
 
     /// Format the disk as an empty GSFS0004 sized to `capacity`, then mount. Same layout
@@ -488,6 +708,9 @@ impl Fs {
         // Empty root directory block (stamped with its CRC trailer via dir_write).
         let mut root = [0u8; BLOCK];
         if !dir_write(ctx, root_first_block, &mut root) { return Err("root dir init failed"); }
+        // Clear the journal commit block so a re-flash of a previously-used disk can't replay a
+        // stale transaction (a fresh host image is already zeroed here).
+        if !block_write(ctx, journal_start, &[0u8; BLOCK]) { return Err("journal init failed"); }
 
         Fs::mount(ctx)
     }
@@ -502,8 +725,8 @@ impl Fs {
 
     /// Re-write the mutable superblock fields (free count, root extent, flags, label) from
     /// current in-memory state. Geometry (total/bitmap/data) is fixed at format.
-    fn persist_super(&self, ctx: &ServiceContext) -> Result<(), &'static str> {
-        let mut sb = block_read(ctx, 0).ok_or("superblock read failed")?;
+    fn persist_super(&mut self, ctx: &ServiceContext) -> Result<(), &'static str> {
+        let mut sb = self.tb_read(ctx, 0).ok_or("superblock read failed")?;
         sb[48..56].copy_from_slice(&self.root_first_block.to_le_bytes());
         sb[56..64].copy_from_slice(&self.root_block_count.to_le_bytes());
         sb[64..72].copy_from_slice(&self.free_blocks.to_le_bytes());
@@ -516,7 +739,7 @@ impl Fs {
         // Re-stamp the integrity CRC over the updated superblock (§3.12).
         let sb_crc = crc32(&sb[..124]);
         sb[124..128].copy_from_slice(&sb_crc.to_le_bytes());
-        if !block_write(ctx, 0, &sb) { return Err("superblock write failed"); }
+        if !self.tb_write(ctx, 0, &sb) { return Err("superblock write failed"); }
         Ok(())
     }
 
@@ -529,7 +752,7 @@ impl Fs {
         let mut b = self.data_start;
         while b < self.total_blocks {
             let bm_blk = self.bitmap_start + b / BITS_PER_BMBLOCK;
-            let blk = block_read(ctx, bm_blk).ok_or("bitmap read failed")?;
+            let blk = self.tb_read(ctx, bm_blk).ok_or("bitmap read failed")?;
             let base = (b / BITS_PER_BMBLOCK) * BITS_PER_BMBLOCK;
             let mut within = b - base;
             while within < BITS_PER_BMBLOCK {
@@ -565,12 +788,12 @@ impl Fs {
     }
 
     /// Set/clear the bits for blocks `[first, first+count)`, one bitmap block at a time.
-    fn bm_set_range(&self, ctx: &ServiceContext, first: u64, count: u64, used: bool) -> Result<(), &'static str> {
+    fn bm_set_range(&mut self, ctx: &ServiceContext, first: u64, count: u64, used: bool) -> Result<(), &'static str> {
         let end = first + count;
         let mut b = first;
         while b < end {
             let bm_blk = self.bitmap_start + b / BITS_PER_BMBLOCK;
-            let mut blk = block_read(ctx, bm_blk).ok_or("bitmap read failed")?;
+            let mut blk = self.tb_read(ctx, bm_blk).ok_or("bitmap read failed")?;
             let base = (b / BITS_PER_BMBLOCK) * BITS_PER_BMBLOCK;
             let stop = end.min(base + BITS_PER_BMBLOCK);
             while b < stop {
@@ -578,7 +801,7 @@ impl Fs {
                 if used { blk[w / 8] |= 1 << (w % 8); } else { blk[w / 8] &= !(1 << (w % 8)); }
                 b += 1;
             }
-            if !block_write(ctx, bm_blk, &blk) { return Err("bitmap write failed"); }
+            if !self.tb_write(ctx, bm_blk, &blk) { return Err("bitmap write failed"); }
         }
         Ok(())
     }
@@ -592,7 +815,7 @@ impl Fs {
     fn dir_find(&self, ctx: &ServiceContext, dir: &Entry, name: &[u8]) -> Option<Entry> {
         for bi in 0..dir.block_count {
             let block = dir.first_block + bi;
-            let blk = dir_read(ctx, block)?;
+            let blk = self.td_read(ctx, block)?;
             for slot in 0..RECS_PER_BLOCK {
                 let o = slot * REC_SIZE;
                 if blk[o] == ITYPE_FREE { continue; }
@@ -640,11 +863,11 @@ impl Fs {
                itype: u8, size: u64, first: u64, count: u64) -> Result<(), &'static str> {
         for bi in 0..dir.block_count {
             let block = dir.first_block + bi;
-            let mut blk = dir_read(ctx, block).ok_or("dir read failed")?;
+            let mut blk = self.td_read(ctx, block).ok_or("dir read failed")?;
             for slot in 0..RECS_PER_BLOCK {
                 if blk[slot * REC_SIZE] == ITYPE_FREE {
                     encode_rec(&mut blk, slot, itype, name, size, first, count);
-                    if !dir_write(ctx, block, &mut blk) { return Err("dir write failed"); }
+                    if !self.td_write(ctx, block, &mut blk) { return Err("dir write failed"); }
                     return Ok(());
                 }
             }
@@ -652,9 +875,9 @@ impl Fs {
         // No free slot — grow, then place in the fresh block.
         self.grow_dir(ctx, dir)?;
         let block = dir.first_block + dir.block_count - 1;
-        let mut blk = dir_read(ctx, block).ok_or("dir read failed")?;
+        let mut blk = self.td_read(ctx, block).ok_or("dir read failed")?;
         encode_rec(&mut blk, 0, itype, name, size, first, count);
-        if !dir_write(ctx, block, &mut blk) { return Err("dir write failed"); }
+        if !self.td_write(ctx, block, &mut blk) { return Err("dir write failed"); }
         Ok(())
     }
 
@@ -664,11 +887,11 @@ impl Fs {
         let new_count = dir.block_count + 1;
         let new_first = self.alloc_run(ctx, new_count)?;
         for bi in 0..dir.block_count {
-            let mut blk = dir_read(ctx, dir.first_block + bi).ok_or("dir read failed")?;
-            if !dir_write(ctx, new_first + bi, &mut blk) { return Err("dir copy failed"); }
+            let mut blk = self.td_read(ctx, dir.first_block + bi).ok_or("dir read failed")?;
+            if !self.td_write(ctx, new_first + bi, &mut blk) { return Err("dir copy failed"); }
         }
         let mut fresh = [0u8; BLOCK];
-        if !dir_write(ctx, new_first + dir.block_count, &mut fresh) { return Err("dir grow init failed"); }
+        if !self.td_write(ctx, new_first + dir.block_count, &mut fresh) { return Err("dir grow init failed"); }
         let (old_first, old_count) = (dir.first_block, dir.block_count);
         dir.first_block = new_first;
         dir.block_count = new_count;
@@ -686,21 +909,21 @@ impl Fs {
                 self.persist_super(ctx)
             }
             Some(loc) => {
-                let mut blk = dir_read(ctx, loc.block).ok_or("record read failed")?;
+                let mut blk = self.td_read(ctx, loc.block).ok_or("record read failed")?;
                 let o = loc.slot * REC_SIZE;
                 blk[o + 40..o + 48].copy_from_slice(&e.size.to_le_bytes());
                 blk[o + 48..o + 56].copy_from_slice(&e.first_block.to_le_bytes());
                 blk[o + 56..o + 64].copy_from_slice(&e.block_count.to_le_bytes());
-                if !dir_write(ctx, loc.block, &mut blk) { return Err("record write failed"); }
+                if !self.td_write(ctx, loc.block, &mut blk) { return Err("record write failed"); }
                 Ok(())
             }
         }
     }
 
-    fn dir_remove(&self, ctx: &ServiceContext, dir: &Entry, name: &[u8]) -> Result<(), &'static str> {
+    fn dir_remove(&mut self, ctx: &ServiceContext, dir: &Entry, name: &[u8]) -> Result<(), &'static str> {
         for bi in 0..dir.block_count {
             let block = dir.first_block + bi;
-            let mut blk = dir_read(ctx, block).ok_or("dir read failed")?;
+            let mut blk = self.td_read(ctx, block).ok_or("dir read failed")?;
             for slot in 0..RECS_PER_BLOCK {
                 let o = slot * REC_SIZE;
                 if blk[o] == ITYPE_FREE { continue; }
@@ -708,7 +931,7 @@ impl Fs {
                 if nl == 0 || nl > NAME_MAX { continue; }
                 if &blk[o + 2..o + 2 + nl] == name {
                     blk[o] = ITYPE_FREE;
-                    if !dir_write(ctx, block, &mut blk) { return Err("dir write failed"); }
+                    if !self.td_write(ctx, block, &mut blk) { return Err("dir write failed"); }
                     return Ok(());
                 }
             }
@@ -718,7 +941,7 @@ impl Fs {
 
     fn dir_is_empty(&self, ctx: &ServiceContext, dir: &Entry) -> Option<bool> {
         for bi in 0..dir.block_count {
-            let blk = dir_read(ctx, dir.first_block + bi)?;
+            let blk = self.td_read(ctx, dir.first_block + bi)?;
             for slot in 0..RECS_PER_BLOCK {
                 if blk[slot * REC_SIZE] != ITYPE_FREE { return Some(false); }
             }
@@ -734,7 +957,7 @@ impl Fs {
         if self.dir_find(ctx, &parent, name).is_some() { return Err("already exists"); }
         let first = self.alloc_run(ctx, 1)?;
         let mut blk = [0u8; BLOCK];
-        if !dir_write(ctx, first, &mut blk) { return Err("dir block init failed"); }
+        if !self.td_write(ctx, first, &mut blk) { return Err("dir block init failed"); }
         self.dir_add(ctx, &mut parent, name, ITYPE_DIR, 0, first, 1)
     }
 
@@ -751,7 +974,7 @@ impl Fs {
                     if !valid_name(comp) { return Err("bad name"); }
                     let first = self.alloc_run(ctx, 1)?;
                     let mut blk = [0u8; BLOCK];
-                    if !dir_write(ctx, first, &mut blk) { return Err("dir block init failed"); }
+                    if !self.td_write(ctx, first, &mut blk) { return Err("dir block init failed"); }
                     self.dir_add(ctx, &mut cur, comp, ITYPE_DIR, 0, first, 1)?;
                     cur = self.dir_find(ctx, &cur, comp).ok_or("created dir not found")?;
                 }
@@ -888,7 +1111,7 @@ impl Fs {
         let mut count = 0u8;
         let mut w = 2usize;
         for bi in 0..d.block_count {
-            let blk = dir_read(ctx, d.first_block + bi)?;
+            let blk = self.td_read(ctx, d.first_block + bi)?;
             for slot in 0..RECS_PER_BLOCK {
                 let o = slot * REC_SIZE;
                 let t = blk[o];
@@ -908,14 +1131,14 @@ impl Fs {
         Some(out)
     }
 
-    fn rename(&self, ctx: &ServiceContext, path: &[u8], newname: &[u8]) -> Result<(), &'static str> {
+    fn rename(&mut self, ctx: &ServiceContext, path: &[u8], newname: &[u8]) -> Result<(), &'static str> {
         if !valid_name(newname) { return Err("bad new name"); }
         let (parent, oldname) = self.walk_parent(ctx, path).ok_or("path not found")?;
         if parent.itype != ITYPE_DIR { return Err("parent not a directory"); }
         if self.dir_find(ctx, &parent, newname).is_some() { return Err("name already exists"); }
         for bi in 0..parent.block_count {
             let block = parent.first_block + bi;
-            let mut blk = dir_read(ctx, block).ok_or("dir read failed")?;
+            let mut blk = self.td_read(ctx, block).ok_or("dir read failed")?;
             for slot in 0..RECS_PER_BLOCK {
                 let o = slot * REC_SIZE;
                 if blk[o] == ITYPE_FREE { continue; }
@@ -925,7 +1148,7 @@ impl Fs {
                     blk[o + 1] = newname.len() as u8;
                     for b in &mut blk[o + 2..o + 2 + NAME_MAX] { *b = 0; }
                     blk[o + 2..o + 2 + newname.len()].copy_from_slice(newname);
-                    if !dir_write(ctx, block, &mut blk) { return Err("dir write failed"); }
+                    if !self.td_write(ctx, block, &mut blk) { return Err("dir write failed"); }
                     return Ok(());
                 }
             }
@@ -947,13 +1170,20 @@ impl Fs {
     /// `delete … recursive`: remove a file or a WHOLE subtree. Unlinks the entry from its
     /// parent, then frees the entry and every descendant via `free_subtree`. A file is just
     /// the depth-0 case (no children), so this is a strict superset of `delete`.
+    /// Manages its own transactions (so it is NOT wrapped by the serve-level transaction):
+    /// the unlink is one atomic transaction, then the now-unreachable subtree is reclaimed in
+    /// bounded per-extent transactions — too many blocks to stage as a single atomic set.
     fn delete_tree(&mut self, ctx: &ServiceContext, path: &[u8]) -> Result<(), &'static str> {
         let e = self.walk(ctx, path).ok_or("not found")?;
         if e.loc.is_none() { return Err("cannot delete root"); }
-        // Unlink first so a mid-walk failure can't leave the parent pointing at half-freed
-        // blocks; the subtree is then unreachable and we reclaim it.
         let (parent, name) = self.walk_parent(ctx, path).ok_or("not found")?;
-        self.dir_remove(ctx, &parent, name)?;
+        // Atomic unlink: once this transaction commits, the subtree is unreachable. A crash
+        // before it leaves the tree untouched; after it, the entry is gone.
+        self.begin_txn();
+        let r = self.dir_remove(ctx, &parent, name);
+        self.end_txn(ctx, r)?;
+        // Reclaim the unreachable subtree in bounded transactions. A crash here only leaks
+        // blocks (nothing references them) — never corruption.
         self.free_subtree(ctx, e.itype, e.first_block, e.block_count, 0)
     }
 
@@ -968,7 +1198,7 @@ impl Fs {
             for bi in 0..count {
                 // Scope the block read so `blk` is gone before we recurse into the children.
                 let (kids, nk) = {
-                    let blk = dir_read(ctx, first + bi).ok_or("dir read failed")?;
+                    let blk = self.td_read(ctx, first + bi).ok_or("dir read failed")?;
                     let mut kids = [(0u8, 0u64, 0u64); RECS_PER_BLOCK];
                     let mut nk = 0usize;
                     for slot in 0..RECS_PER_BLOCK {
@@ -985,7 +1215,8 @@ impl Fs {
                 }
             }
         }
-        self.free_run(ctx, first, count)
+        // Each extent freed in its own bounded transaction (the subtree is already unlinked).
+        self.free_run_txn(ctx, first, count)
     }
 
     /// Move (relink) an entry: same data, new directory/name. Same-directory move is a
@@ -1073,27 +1304,9 @@ fn block_write_zeros(ctx: &ServiceContext, lba: u64, count: u64) -> bool {
     }
 }
 
-/// Read a **directory block** and verify its CRC trailer (GSFS0004). The block's first
-/// `DIR_REC_REGION` bytes are the records; the u32 at `DIR_CRC_OFF` is their CRC32. A
-/// mismatch is a loud refusal (§3.12) — `fs` returns the read as failed and logs the lba,
-/// never handing back records from a corrupt block. Use this for every directory-block read
-/// (bitmap, superblock, and file-data blocks stay on the raw `block_read`).
-fn dir_read(ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
-    let blk = block_read(ctx, lba)?;
-    let stored = u32_at(&blk, DIR_CRC_OFF);
-    let actual = crc32(&blk[..DIR_REC_REGION]);
-    if stored != actual {
-        ctx.log_fmt(format_args!(
-            "fs: directory block CRC mismatch at lba {} (stored {:#010x}, actual {:#010x}) — refusing",
-            lba, stored, actual
-        ));
-        return None;
-    }
-    Some(blk)
-}
-
-/// Stamp a **directory block**'s CRC trailer over its record region and write it. Pairs with
-/// `dir_read`. Every directory-block write goes through this so the trailer always matches.
+/// Stamp a **directory block**'s CRC trailer over its record region and write it (raw, no
+/// transaction). Used by `format` for the root block; the operational path uses the
+/// transaction-aware `Fs::td_write`/`Fs::td_read`.
 fn dir_write(ctx: &ServiceContext, lba: u64, blk: &mut [u8; BLOCK]) -> bool {
     let c = crc32(&blk[..DIR_REC_REGION]);
     blk[DIR_CRC_OFF..DIR_CRC_OFF + 4].copy_from_slice(&c.to_le_bytes());

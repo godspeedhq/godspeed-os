@@ -65,11 +65,22 @@ the pipe `write` sink through these ops.
 
 ## State and persistence (§15)
 
-fs holds the inode table in memory (built from the on-disk table at mount); directory
-blocks are read/written on demand. All writes are write-through to block-driver — no
-write-back cache.
+fs holds only superblock geometry + a maintained free count in memory (no inode table —
+the tree and bitmap live on disk, read on demand). Directory blocks are read/written on
+demand.
 
-The filesystem cannot recover from a crash that leaves a partial write in progress. v1
-accepts this: both block-driver and fs are non-restartable. The only recovery mechanism
-is a full system reboot. Transactional metadata recovery is Phase 3 (the TCB-drop work,
-§6.3).
+**Crash-consistency (Phase C, `docs/persistence.md` §6.8).** Every metadata mutation runs
+as one **atomic transaction** through the reserved journal region: structural writes
+(directory/bitmap/superblock) are staged in memory (read-your-writes), then `commit_txn`
+writes them to the journal, writes a checksummed commit record (the atomic point),
+checkpoints them home, and invalidates the journal. File **data** is written direct (into an
+extent nothing references until the transaction commits). On **mount**, `recover` replays a
+committed-but-unfinished transaction (valid commit magic + CRC) and discards a torn one — so a
+single power loss leaves the filesystem either entirely unchanged or fully applied, never
+half-updated. A transaction stages ≤ `TXN_CAP` (56) blocks (loud failure past that);
+`delete_tree` commits the unlink atomically then reclaims the subtree in bounded per-extent
+transactions. Proven by `osdev test fs-journal`.
+
+This is the transactional metadata recovery §6.3/§15 calls for. With it, fs no longer
+*needs* to be non-restartable on crash-safety grounds — dropping fs + block-driver from the
+TCB is the remaining Phase D step (a `CLAUDE.md` §6 amendment).

@@ -495,6 +495,55 @@ metadata commit atomic.
 re-reads it across a **reboot** (boot 1 writes, boot 2 re-verifies on the same disk); files
 130/0 and script 2/2 confirm the shell `cat`/`copy` streaming is regression-free.
 
+### 6.8 Crash-consistency — the metadata redo-journal (Phase C)
+
+> **Built 2026-06-17.** Phase C of the robustness program — the headline property: **any
+> single power loss leaves the filesystem consistent.** Every metadata mutation runs as one
+> atomic transaction through the reserved journal region (§6.6); a crash either leaves the
+> filesystem entirely unchanged or, once a transaction has committed, is replayed to
+> completion on the next mount. Realizes the `CLAUDE.md` §15 promise of transactional
+> metadata recovery (the TCB-drop that this unlocks is Phase D).
+
+**The transaction.** A metadata-mutating op (write, mkdir, mkdir -p, rename, move, delete,
+label) STAGES all its structural block writes (directory blocks, bitmap blocks, superblock)
+in an in-memory buffer instead of writing them to disk — with **read-your-writes**, so the
+op sees its own staged changes. `commit_txn` then:
+
+1. writes the staged blocks into the journal region;
+2. writes a **checksummed commit record** (magic + the home LBAs + a CRC32) — *the atomic
+   point*;
+3. checkpoints each staged block to its home LBA;
+4. invalidates the commit record.
+
+File **data** blocks are written directly (not journaled): they land in a freshly-allocated
+extent that nothing references until the metadata transaction commits, so a crash before
+commit just leaves harmless garbage in free space.
+
+**Recovery (at mount, before serving).** Read the commit record: a valid magic **and** CRC
+means a committed-but-unfinished transaction → replay its blocks to their home LBAs
+(idempotent) and invalidate. An absent/torn commit (no magic, or a CRC mismatch) → do
+nothing. So a crash *before* the commit record is discarded (home untouched); a crash *after*
+it is completed. There is no third outcome.
+
+**Why ordered durability is free.** `block-driver` flushes every sector write to the medium
+before replying (`FLUSH EXT`), and `fs` serializes requests, so the journal-data → commit →
+checkpoint ordering the protocol needs holds without any extra barrier op.
+
+**Bounds (§26.6).** A transaction stages at most `TXN_CAP` (56) blocks — comfortably more
+than any single op needs; an op that would exceed it fails loudly rather than committing
+partially. `delete` of a whole subtree (`delete_tree`) is the one unbounded case: it commits
+the **unlink as one atomic transaction** (after which the subtree is unreachable), then
+reclaims the subtree's blocks in **bounded per-extent transactions** — a crash mid-reclaim
+only leaks blocks (safe, never corruption).
+
+**Verified:** `osdev test fs-journal` (11 checks). Part 1 (REPLAY): a `journal-crash-test`
+build writes a file through a transaction that halts right after the commit record is durable
+(simulated power loss); the next boot's mount replays it from the journal and the file is
+present with the exact bytes. Part 2 (REJECT): a journal whose commit record has a bad CRC is
+ignored — the fs mounts clean and serves normally, no spurious replay. All five earlier
+suites (files, blockdev-reboot, fs-large, fs-corrupt, script) stay green with the journal
+active on every mutation.
+
 ## 7. File = capability (the north star)
 
 The spine that makes this filesystem *ours* rather than a generic store: a file is named
