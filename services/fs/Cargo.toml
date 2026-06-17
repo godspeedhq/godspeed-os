@@ -20,5 +20,12 @@ selftest = []
 # disk and deliberately hangs the service). Enabled by `osdev test fs-journal`.
 journal-crash-test = []
 
+# Extent-list / fragmentation proof (GSFS0007). Runs `frag_test` at mount: fills the disk
+# with small files, deletes every other one to scatter free space into small gaps, then
+# writes a multi-block file that CANNOT fit contiguously — forcing the fragmented
+# (`ITYPE_FILE_FRAG`) path — and verifies the read-back (and across a reboot). TEST BUILDS
+# ONLY (it writes to the disk). Enabled by `osdev test fs-frag`.
+frag-test = []
+
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }

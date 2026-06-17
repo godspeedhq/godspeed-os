@@ -125,13 +125,16 @@ fn main() {
     }
 }
 
-// On-disk format — MUST match `services/fs` (docs/persistence.md §6.6/§6.10/§6.11, GSFS0006).
+// On-disk format — MUST match `services/fs` (docs/persistence.md §6.6/§6.10/§6.11/§6.12, GSFS0007).
 // 512-byte blocks (= one AHCI sector = one block-IPC request), so block number = LBA.
 // Three structures: superblock + free bitmap + self-describing directory tree (no inode
-// table, no global file cap). All capacity-bearing fields are u64. GSFS0006: every block
+// table, no global file cap). All capacity-bearing fields are u64. GSFS0007: every block
 // self-verifies with a CRC32 — superblock, each directory block, and each file-data block —
-// and a BACKUP superblock copy sits at the last block (mount falls back to it).
-//   Superblock @ LBA 0 (and a copy @ total_blocks-1): magic[8] "GSFS0006", version u32=6,
+// and a BACKUP superblock copy sits at the last block (mount falls back to it). Files are a
+// contiguous extent (`type`=1) or, when no contiguous run is free, fragmented (`type`=3) with
+// `first_block` → a CRC'd extent block listing the runs. The host writer only ever bakes into
+// a fresh disk, so it always writes contiguous files (`type`=1); the fragmented path is fs-only.
+//   Superblock @ LBA 0 (and a copy @ total_blocks-1): magic[8] "GSFS0007", version u32=7,
 //     block_size u32=512, total_blocks u64, bitmap_start u64=1, bitmap_blocks u64, data_start
 //     u64, root_first_block u64, root_block_count u64, free_blocks u64, flags u32,
 //     label_len u8, label[31], journal_start u64 @108, journal_blocks u64 @116,
@@ -144,7 +147,7 @@ fn main() {
 //     bytes 448..452 hold the block's CRC32 over its 448-byte record region.
 //   File-data block: 508 bytes payload + CRC32 @508. A file of N bytes spans ceil(N/508) blocks.
 //   Root is a dir at root_first_block (its extent lives in the superblock; it has no parent).
-const FS_SB_MAGIC: &[u8; 8] = b"GSFS0006";
+const FS_SB_MAGIC: &[u8; 8] = b"GSFS0007";
 const FS_BLOCK_SIZE: u32 = 512;
 const FS_BITS_PER_BMBLOCK: u64 = (FS_BLOCK_SIZE as u64) * 8; // 4096
 const FS_ITYPE_DIR: u8 = 2;
@@ -159,7 +162,7 @@ fn fs_dir_stamp_crc(block: &mut [u8]) {
     block[FS_DIR_REC_REGION..FS_DIR_REC_REGION + 4].copy_from_slice(&c.to_le_bytes());
 }
 
-/// Write a GodspeedOS (GSFS0003) superblock + free bitmap + an empty root directory into
+/// Write a GodspeedOS (GSFS0007) superblock + free bitmap + an empty root directory into
 /// `path`, preserving the rest of the image. Geometry is derived from the image size.
 fn format_superblock(path: &str) {
     let mut data = std::fs::read(path)
@@ -177,13 +180,13 @@ fn format_superblock(path: &str) {
         eprintln!("mkfs: image too small ({} bytes)", data.len());
         std::process::exit(1);
     }
-    let backup_lba = total_blocks - 1; // GSFS0006: backup superblock at the last block
+    let backup_lba = total_blocks - 1; // GSFS0007: backup superblock at the last block
     let free_blocks = total_blocks - used_through - 1; // -1 for the reserved backup block
 
     // Superblock (LBA 0).
     let mut sb = [0u8; 512];
     sb[0..8].copy_from_slice(FS_SB_MAGIC);
-    sb[8..12].copy_from_slice(&6u32.to_le_bytes());            // version
+    sb[8..12].copy_from_slice(&7u32.to_le_bytes());            // version
     sb[12..16].copy_from_slice(&FS_BLOCK_SIZE.to_le_bytes());  // block_size
     sb[16..24].copy_from_slice(&total_blocks.to_le_bytes());
     sb[24..32].copy_from_slice(&bitmap_start.to_le_bytes());
@@ -219,7 +222,7 @@ fn format_superblock(path: &str) {
 
     std::fs::write(path, &data)
         .unwrap_or_else(|e| { eprintln!("mkfs: cannot write {}: {}", path, e); std::process::exit(1); });
-    println!("mkfs: formatted {} GSFS0006 ({} blocks, bitmap {}..{}, journal {}..{}, data from {}, backup@{}, {} free)",
+    println!("mkfs: formatted {} GSFS0007 ({} blocks, bitmap {}..{}, journal {}..{}, data from {}, backup@{}, {} free)",
              path, total_blocks, bitmap_start, journal_start, journal_start, data_start, root_first_block, backup_lba, free_blocks);
 }
 
@@ -227,7 +230,7 @@ fn cmd_mkfs(image: &str) {
     format_superblock(image);
 }
 
-/// Bake a file into a GSFS0003 image (host-side mirror of the `fs` write path) — used to ship a
+/// Bake a file into a GSFS0007 image (host-side mirror of the `fs` write path) — used to ship a
 /// `.gsh` script on a flashable data disk, so the OS can `run /suite.gsh` on hardware with no
 /// on-device authoring. Allocates a contiguous extent, writes the content, adds a root
 /// `file_record`, and updates the free count. Intended right after `format_superblock` (minimal,
@@ -236,7 +239,7 @@ fn gsfs_add_file(path: &str, name: &str, content: &[u8]) {
     let mut data = std::fs::read(path)
         .unwrap_or_else(|e| { eprintln!("bake: cannot read {}: {}", path, e); std::process::exit(1); });
     if data.len() < 512 || &data[0..8] != FS_SB_MAGIC {
-        eprintln!("bake: {} is not a GSFS0006 image", path); std::process::exit(1);
+        eprintln!("bake: {} is not a GSFS0007 image", path); std::process::exit(1);
     }
     if name.len() > 38 { eprintln!("bake: name '{}' too long (max 38)", name); std::process::exit(1); }
     let rdu = |d: &[u8], o: usize| u64::from_le_bytes(d[o..o + 8].try_into().unwrap());
@@ -246,7 +249,7 @@ fn gsfs_add_file(path: &str, name: &str, content: &[u8]) {
     let root_first   = rdu(&data, 48) as usize;
     let mut free_blocks = rdu(&data, 64);
 
-    // GSFS0006: a data block holds 508 payload bytes + a CRC32 trailer, so a file spans
+    // GSFS0007: a data block holds 508 payload bytes + a CRC32 trailer, so a file spans
     // ceil(content/508) blocks.
     let nblocks = (((content.len() as u64) + FS_DATA_PAYLOAD as u64 - 1) / FS_DATA_PAYLOAD as u64).max(1);
     // First run of `nblocks` free, contiguous blocks at/after data_start (set bit = used).
@@ -276,7 +279,7 @@ fn gsfs_add_file(path: &str, name: &str, content: &[u8]) {
     // Re-stamp the superblock CRC32 (@124) — we just mutated a superblock field (free count).
     let sb_crc = crc32::crc32(&data[..124]);
     data[124..128].copy_from_slice(&sb_crc.to_le_bytes());
-    // Keep the backup superblock (last block, GSFS0006) in sync with the primary.
+    // Keep the backup superblock (last block, GSFS0007) in sync with the primary.
     let bk = ((total_blocks - 1) as usize) * 512;
     let sb_copy: Vec<u8> = data[0..512].to_vec();
     data[bk..bk + 512].copy_from_slice(&sb_copy);
@@ -1067,6 +1070,7 @@ fn cmd_test(suite: &str) {
         "blockdev-reboot" => run_blockdev_reboot_test(),
         "fs-corrupt"   => run_fs_corruption_test(),
         "fs-large"     => run_fs_large_test(),
+        "fs-frag"      => run_fs_frag_test(),
         "fs-journal"   => run_fs_journal_test(),
         "fs-restart"   => run_fs_restart_test(),
         "fs-check"     => run_fs_check_test(),
@@ -1430,15 +1434,15 @@ fn run_blockdev_reboot_test() {
     }
 }
 
-/// GSFS0006 integrity: a corrupt block is a **loud refusal** (§3.12), never silently read
+/// GSFS0007 integrity: a corrupt block is a **loud refusal** (§3.12), never silently read
 /// back as garbage. Three cases, all observable in the boot log:
 ///   (1) corrupt a superblock byte → `fs` mount fails its CRC check → "no filesystem".
 ///   (2) corrupt the root directory block → mount OK but the first dir op logs a
 ///       "directory block CRC mismatch" — never returns records from a bad block.
 ///   (3) corrupt a file's data block → reading it logs a "data block CRC mismatch" — never
-///       returns bytes from a bad block (the GSFS0006 per-data-block CRC).
+///       returns bytes from a bad block (the GSFS0007 per-data-block CRC).
 fn run_fs_corruption_test() {
-    println!("\n=== fs: GSFS0006 integrity — corrupt block → loud refusal (§3.12) ===");
+    println!("\n=== fs: GSFS0007 integrity — corrupt block → loud refusal (§3.12) ===");
     cmd_build_blockdev();
 
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
@@ -1450,7 +1454,7 @@ fn run_fs_corruption_test() {
     let img_str = img.to_string_lossy().replace('\\', "/");
     let _ = std::fs::create_dir_all("build/tests");
 
-    // Helper: make a formatted 16 MiB GSFS0006 disk, corrupt one byte, return its abs path.
+    // Helper: make a formatted 16 MiB GSFS0007 disk, corrupt one byte, return its abs path.
     let make = |name: &str, corrupt: &dyn Fn(&mut [u8])| -> String {
         let p = format!("build/tests/{}", name);
         std::fs::write(&p, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
@@ -1462,15 +1466,15 @@ fn run_fs_corruption_test() {
         abs.to_string_lossy().replace('\\', "/")
     };
 
-    // Case 1a (GSFS0006): corrupt ONLY the primary superblock (flip free_blocks @64 — a
+    // Case 1a (GSFS0007): corrupt ONLY the primary superblock (flip free_blocks @64 — a
     // CRC-covered byte, not the magic). Mount must RECOVER from the backup at the last block.
     let sb1_disk = make("fs_corrupt_sb1.img", &|d: &mut [u8]| d[64] ^= 0xFF);
     println!("fs: case 1a — corrupt PRIMARY superblock only, boot (~25s) …");
     let log1a = boot_ahci_qemu(&img_str, &sb1_disk, "build/tests/fs_corrupt_sb1.log", 25);
     let sb1_recovered = log1a.contains("recovered from backup superblock");
-    // Match the geometry tail ("GSFS0006 (…") not "fs: mounted GSFS" — a concurrent shell write
+    // Match the geometry tail ("GSFS0007 (…") not "fs: mounted GSFS" — a concurrent shell write
     // can split the prefix on the shared serial. No "no filesystem" confirms it didn't refuse.
-    let sb1_mounted = log1a.contains("GSFS0006 (") && !log1a.contains("fs: no filesystem");
+    let sb1_mounted = log1a.contains("GSFS0007 (") && !log1a.contains("fs: no filesystem");
     let sb1_no_panic = !log1a.contains("KERNEL PANIC");
 
     // Case 1b: corrupt BOTH copies (primary @64 and the backup at the last block). With no good
@@ -1500,7 +1504,7 @@ fn run_fs_corruption_test() {
     let dir_no_garbage = !log2.contains("round-trip OK (greeting)");     // never silently succeeded
     let dir_no_panic = !log2.contains("KERNEL PANIC");
 
-    // Case 3 (GSFS0006): bake /probe.bin, then flip a PAYLOAD byte in its first data block.
+    // Case 3 (GSFS0007): bake /probe.bin, then flip a PAYLOAD byte in its first data block.
     // The selftest reads /probe.bin → the per-data-block CRC catches it (loud), read fails.
     let data_disk = {
         let p = "build/tests/fs_corrupt_data.img";
@@ -1603,6 +1607,65 @@ fn run_fs_large_test() {
     }
 }
 
+/// Extent lists / fragmentation (Phase I, GSFS0007). A `frag-test` build fills a small SATA
+/// disk with 2-block files, deletes every other one to scatter free space into ~2-block gaps,
+/// then writes a 20-block `/frag.bin` — far bigger than any gap, so contiguous allocation must
+/// fail and the file is stored FRAGMENTED across an extent list. We assert it became
+/// `ITYPE_FILE_FRAG`, that the streaming read-back matches, and (boot 2) that the extent list
+/// survives a reboot. Proves the fragmented data path + extent-block CRC + reboot durability.
+fn run_fs_frag_test() {
+    println!("\n=== fs: extent lists / fragmentation (GSFS0007 — forced fragmented file) ===");
+    build_blockdev_fs("frag-test", "");
+
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+
+    let _ = std::fs::create_dir_all("build/tests");
+    // Small disk (160 KiB) so the fill loop completes quickly but leaves plenty of free space
+    // (~100 blocks) after the every-other delete for the fragmented 20-block file.
+    let persist = "build/tests/persist_fs_frag.img";
+    std::fs::write(persist, vec![0u8; 160 * 1024]).expect("failed to create persist disk");
+    format_superblock(persist);
+
+    let img = std::fs::canonicalize(&image_path).unwrap_or_else(|_| image_path.to_path_buf());
+    let img_str = img.to_string_lossy().replace('\\', "/");
+    let persist_abs = std::fs::canonicalize(persist).unwrap_or_else(|_| std::path::PathBuf::from(persist));
+    let persist_str = persist_abs.to_string_lossy().replace('\\', "/");
+
+    let mut pass = 0; let mut fail = 0;
+    let mut check = |ok: bool, label: &str| {
+        if ok { println!("  PASS … {}", label); pass += 1; } else { println!("  FAIL … {}", label); fail += 1; }
+    };
+
+    println!("fs: boot 1 — fill, fragment free space, write a forced-fragmented file, ~40s …");
+    let log1 = boot_ahci_qemu(&img_str, &persist_str, "build/tests/fs_frag_1.log", 40);
+    check(log1.contains("[frag] filled"), "boot1: filled the disk with small files");
+    check(log1.contains("[frag] deleted"), "boot1: scattered free space (deleted every other)");
+    check(log1.contains("/frag.bin is FRAGMENTED"), "boot1: file forced onto the fragmented (extent-list) path");
+    check(!log1.contains("NOT fragmented"), "boot1: contiguous allocation genuinely failed");
+    check(log1.contains("[frag] write+read round-trip OK"), "boot1: fragmented file reads back exactly");
+    check(!log1.contains("CRC mismatch"), "boot1: no extent/data CRC failure");
+    check(!log1.contains("KERNEL PANIC"), "boot1: no kernel panic");
+
+    println!("fs: boot 2 — SAME disk, re-read the fragmented file across a reboot, ~25s …");
+    let log2 = boot_ahci_qemu(&img_str, &persist_str, "build/tests/fs_frag_2.log", 25);
+    check(log2.contains("/frag.bin present after reboot (FRAGMENTED"), "boot2: extent list persisted (still fragmented)");
+    check(log2.contains("[frag] reboot re-read OK"), "boot2: re-read matches after reboot");
+    check(!log2.contains("reboot re-read FAILED"), "boot2: no read failure");
+    check(!log2.contains("KERNEL PANIC") && !log2.contains("CRC mismatch"), "boot2: no panic, no corruption");
+
+    println!();
+    if fail == 0 {
+        println!("  [FS.frag]  extent lists / fragmentation  … PASS\n\n  {} passed  0 failed", pass);
+    } else {
+        println!("  [FS.frag]  extent lists / fragmentation  … FAIL\n\n  {} passed  {} failed", pass, fail);
+        std::process::exit(1);
+    }
+}
+
 /// Crash-consistency (Phase C). Two parts, both over a real SATA disk image:
 ///   Part 1 (REPLAY): a `journal-crash-test` build writes a file through a transaction that
 ///     halts right after the commit record is durable but before the checkpoint (simulated
@@ -1675,7 +1738,7 @@ fn run_fs_journal_test() {
 
     println!("fs: boot 3 — journal has a commit record with a BAD crc; recovery must ignore it, ~22s …");
     let log3 = boot_ahci_qemu(&img2_str, &disk2_str, "build/tests/fs_journal_bad.log", 22);
-    check(log3.contains("mounted GSFS0006"), "reject: filesystem mounted cleanly");
+    check(log3.contains("mounted GSFS0007"), "reject: filesystem mounted cleanly");
     check(!log3.contains("journal recovered"), "reject: did NOT replay the bad-CRC commit");
     check(log3.contains("round-trip OK (greeting)") || log3.contains("verified across boot"),
           "reject: fs serves normally (greeting round-trip)");
@@ -1824,7 +1887,7 @@ fn run_fs_restart_test() {
     crate::shell_test::run_fs_restart(&image_path, persist, 4);
 }
 
-/// Phase G: `drives check` (fsck) repairs a drifted free count. Bake a GSFS0006 disk with a
+/// Phase G: `drives check` (fsck) repairs a drifted free count. Bake a GSFS0007 disk with a
 /// file, deliberately corrupt the superblock's free count (both copies, CRC re-stamped so it
 /// still mounts), boot, and assert `drives check` rebuilds the correct free count from the tree
 /// and the file survives.

@@ -27,14 +27,15 @@ Host-side developer CLI (§17). Builds for the developer's machine, not the kern
 | `osdev test chaos-brutal`   | Run brutal chaos tests (BC1–BC7) ✅ 7/7 |
 | `osdev test shell`          | Scripted shell smoke-test: boot, help, cores, status, unknown |
 | `osdev test files`          | Files/records/pipes/`result`/`run`/`assert` over a RAW AHCI disk (129 checks) |
-| `osdev test fs-corrupt`     | GSFS0006 integrity + backup superblock: corrupt the primary superblock (→ **recovers from the backup**), both copies (→ loud "no filesystem"), a root directory block (→ loud dir-CRC mismatch, no garbage), and a file **data block** (→ loud data-CRC mismatch, read refused); asserts no panic (§3.12). 14 checks |
+| `osdev test fs-corrupt`     | GSFS0007 integrity + backup superblock: corrupt the primary superblock (→ **recovers from the backup**), both copies (→ loud "no filesystem"), a root directory block (→ loud dir-CRC mismatch, no garbage), and a file **data block** (→ loud data-CRC mismatch, read refused); asserts no panic (§3.12). 14 checks |
 | `osdev test fs-check`       | fsck / `drives check` (Phase G): boot a disk whose superblock free count was drifted host-side (both copies, CRC re-stamped); `drives check` rebuilds the correct free count + bitmap from the tree, reports 0 bad, the file survives. 5 checks |
 | `osdev test fs-ioretry`     | block I/O retry (Phase H): `io-error-test` build forces the first read/write commands to fail; block-driver retries + recovers the transient (boot self-test read succeeds, fs round-trips), no panic. 5 checks |
 | `osdev test fs-large`       | Large files: write + read a 200 KiB file in streaming chunks (WriteNew/WriteAt/ReadAt), then re-verify it across a reboot on the same disk (boot 1 writes, boot 2 re-reads). Proves the streaming path + durability |
+| `osdev test fs-frag`        | Extent lists / fragmentation (Phase I, GSFS0007): a `frag-test` build fills a small disk, deletes every other file to scatter free space into ~2-block gaps, then writes a 20-block file that can't fit contiguously — forcing the fragmented (`ITYPE_FILE_FRAG`) extent-list path; asserts it became fragmented, reads back exactly, and the extent list survives a reboot. 11 checks |
 | `osdev test fs-journal`     | Crash-consistency: (1) a `journal-crash-test` build halts right after a transaction's commit record is durable; the next boot's mount REPLAYS it from the journal (file recovered exactly). (2) a normal build REJECTS a journal commit with a bad CRC (no replay, mounts clean). 11 checks |
 | `osdev test fs-restart`     | §22 Test 13 (Phase D): fs survives its own restart. Shell writes a file, `KILL fs` over the control channel, supervisor respawns fs, fs re-mounts + re-registers, the shell reacquires fs via the registry and reads the file back; no panic. 7 checks |
 | `osdev test script`         | Two paths: (1) bake `scripts/smoke.gsh` into a GSFS disk and `run /smoke.gsh` (host-baked-file path, incl. a piped assert); (2) `selfcheck` — run the shell-embedded extensive suite (`scripts/selfcheck.gsh`) IN MEMORY. Both assert `ran N, failed 0`. The embedded suite isn't a disk file because an on-disk file is one ≤4 KiB IPC message (`MAX_FILE_BYTES`); rodata is not. |
-| `osdev mkfs <image>`        | Format a disk image as GSFS0003 (empty) |
+| `osdev mkfs <image>`        | Format a disk image as GSFS0007 (empty) |
 | `osdev script-disk <out> <script.gsh>` | Build a flashable GSFS data disk with `<script>` baked in as `/<basename>` — `dd` it to the data drive, boot, `run /<basename>` (the hardware self-check) |
 | `osdev validate`            | Validate all contracts against the JSON schema |
 | `osdev shell [--smp N]`     | Boot in QEMU with the interactive shell on stdin/stdout (bare-metal build — no probe services; type `help` at `gsh>` prompt; Ctrl-A X to quit) |
@@ -55,9 +56,11 @@ Host-side developer CLI (§17). Builds for the developer's machine, not the kern
 
 ### GSFS host-side writer (`src/main.rs`)
 
-`format_superblock` writes an empty GSFS0003 (superblock + free bitmap + root dir), and
+`format_superblock` writes an empty GSFS0007 (superblock + free bitmap + root dir), and
 `gsfs_add_file` bakes a file into it (allocate a contiguous extent, write content, add a root
-`file_record`, update the free count) — a host-side mirror of the `fs` write path, kept in lockstep
+`file_record`, update the free count) — always a contiguous `ITYPE_FILE` file, since it only ever
+bakes into a fresh disk (the fragmented extent-list path is `fs`-only) — a host-side mirror of the
+`fs` write path, kept in lockstep
 with the on-disk format documented at the top of `main.rs` and in `docs/persistence.md` §6.4. This
 is what lets `osdev script-disk` ship a `.gsh` suite to hardware: bake → `dd` to the data drive →
 boot → `run /suite.gsh`. `osdev test script` proves the loop end to end (incl. piped asserts a

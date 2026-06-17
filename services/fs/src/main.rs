@@ -7,7 +7,8 @@
 
 //! `fs` — userspace filesystem service (persistence, v2; §15, docs/persistence.md).
 //!
-//! **GSFS0006 — checksummed scalable format (docs/persistence.md §6.4 + §6.6).** Three on-disk
+//! **GSFS0007 — checksummed scalable format with extent lists (docs/persistence.md §6.4 +
+//! §6.6 + §6.12).** Three on-disk
 //! structures and no more: a **superblock**, a **free bitmap** (1 bit/block, read on
 //! demand — the only global structure, a free *map* not a file index), and the
 //! **directory tree** of **self-describing `file_record` entries** (`{type, name, size,
@@ -32,22 +33,34 @@ mod crc32;
 use crc32::crc32;
 
 // ── On-disk format — MUST match `osdev format_superblock` (persistence.md §6.6/§6.10). ──
-// GSFS0006: every block self-verifies with a CRC32 — the superblock (CRC @124), each
+// GSFS0007: every block self-verifies with a CRC32 — the superblock (CRC @124), each
 // directory block (CRC trailer @448), and now each **file-data block** (508-byte payload +
 // CRC32 @508). Corruption is a loud refusal (§3.12), never silent. The format also reserves a
 // fixed journal region (Phase-C crash-consistency) so the on-disk geometry is baked once.
-const SB_MAGIC: &[u8; 8] = b"GSFS0006";
+const SB_MAGIC: &[u8; 8] = b"GSFS0007";
 const BLOCK: usize = 512;
 const BITS_PER_BMBLOCK: u64 = (BLOCK as u64) * 8; // 4096 bits per bitmap block
 
-// File-data block: 508 bytes of payload + a 4-byte CRC32 trailer @508 (GSFS0006). A file of N
+// Extent lists (GSFS0007). A file is normally a single contiguous extent (`ITYPE_FILE`:
+// first_block..first_block+block_count is the data — the fast path). When no contiguous run is
+// free, the file becomes FRAGMENTED (`ITYPE_FILE_FRAG`): its `first_block` points to a single
+// CRC'd **extent block** and `block_count` = 1. The extent block lists the data runs, so a big
+// file can be stored across scattered free space. Bounded (§26.6): one extent block, so up to
+// EXT_MAX runs — a file fragmented into more pieces than that is refused loudly.
+const EXT_N_OFF: usize = 0;        // u32: number of {start,len} extents
+const EXT_ENTRIES_OFF: usize = 8;  // {start:u64, len:u64} pairs
+const EXT_ENTRY_SIZE: usize = 16;
+const EXT_CRC_OFF: usize = 508;    // u32 CRC32 over [0..508)
+const EXT_MAX: usize = (EXT_CRC_OFF - EXT_ENTRIES_OFF) / EXT_ENTRY_SIZE; // 31 runs per extent block
+
+// File-data block: 508 bytes of payload + a 4-byte CRC32 trailer @508 (GSFS0007). A file of N
 // bytes spans ceil(N/508) data blocks; each carries the CRC of its own payload, verified on
 // every read. (Directory blocks use a different split — 448 records + CRC; superblock/bitmap/
 // journal blocks are raw, with their own integrity schemes.)
 const DATA_PAYLOAD: usize = 508;
 const DATA_CRC_OFF: usize = DATA_PAYLOAD; // 508 — u32 CRC32 of the 508-byte payload
 
-// file_record entry: 64 bytes. GSFS0006 fits 7 per 512-byte directory block and reserves
+// file_record entry: 64 bytes. GSFS0007 fits 7 per 512-byte directory block and reserves
 // the last 64 bytes as a trailer holding the block's CRC32 (over the 448-byte record
 // region). The record layout itself is unchanged from GSFS0003 — names stay 38 bytes.
 const REC_SIZE: usize = 64;
@@ -56,7 +69,7 @@ const DIR_REC_REGION: usize = RECS_PER_BLOCK * REC_SIZE; // 448 — CRC covers [
 const DIR_CRC_OFF: usize = DIR_REC_REGION; // 448 — u32 CRC32 of the record region
 const NAME_MAX: usize = 38; // entry: type u8 @0, name_len u8 @1, name[38] @2, size @40, first @48, count @56
 
-// Crash-consistency journal region (GSFS0006 geometry). Fixed size, bounded (§26.6): a
+// Crash-consistency journal region (GSFS0007 geometry). Fixed size, bounded (§26.6): a
 // transaction larger than this is refused loudly, never partially applied.
 const JOURNAL_BLOCKS: u64 = 64; // 64 × 512 B = 32 KiB
 // One commit/header block + up to TXN_CAP data blocks must fit the journal region.
@@ -71,8 +84,9 @@ const MAX_TREE_DEPTH: u32 = 64;
 const LABEL_MAX: usize = 31; // superblock: label_len u8 @76, label[31] @77
 
 const ITYPE_FREE: u8 = 0;
-const ITYPE_FILE: u8 = 1;
+const ITYPE_FILE: u8 = 1;      // inline single contiguous extent (first_block, block_count)
 const ITYPE_DIR: u8 = 2;
+const ITYPE_FILE_FRAG: u8 = 3; // fragmented file: first_block → extent block, block_count = 1
 
 // Per-message data chunk: the most file payload bytes that travel in one IPC message — exactly
 // 7 data-block payloads, so a streaming WRITE_AT chunk is always whole blocks (no read-modify-
@@ -174,7 +188,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut fs: Option<Fs> = match Fs::mount(&ctx) {
         Ok(f) => {
             ctx.log_fmt(format_args!(
-                "fs: mounted GSFS0006 ({} blocks, bitmap {}..{}, root@{}, {} free)",
+                "fs: mounted GSFS0007 ({} blocks, bitmap {}..{}, root@{}, {} free)",
                 f.total_blocks, f.bitmap_start, f.data_start, f.root_first_block, f.free_blocks
             ));
             Some(f)
@@ -195,6 +209,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     #[cfg(feature = "journal-crash-test")]
     if let Some(ref mut f) = fs {
         journal_crash_test(&ctx, f);
+    }
+
+    #[cfg(feature = "frag-test")]
+    if let Some(ref mut f) = fs {
+        frag_test(&ctx, f);
     }
 
     // Register our name so clients can (re)acquire a cap to us via the registry — the path
@@ -223,7 +242,7 @@ fn self_test(ctx: &ServiceContext, fs: &mut Fs) {
     let mut buf = [0u8; MAX_FILE_BYTES];
 
     // Data-integrity probe: if a host-baked `/probe.bin` exists, read it — exercising the
-    // per-data-block CRC (GSFS0006). A corrupt block is refused loudly by `data_read`, so the
+    // per-data-block CRC (GSFS0007). A corrupt block is refused loudly by `data_read`, so the
     // read fails rather than returning garbage. (Used by `osdev test fs-corrupt` case 3.)
     if fs.walk(ctx, b"/probe.bin").is_some() {
         match fs.read_path(ctx, b"/probe.bin", &mut buf) {
@@ -333,6 +352,117 @@ fn journal_crash_test(ctx: &ServiceContext, fs: &mut Fs) {
     let _ = fs.write_path(ctx, F, D);
     let _ = fs.commit_txn(ctx); // halts inside (armed) — control does not return
     ctx.log("fs: jcrash boot1 did NOT crash (unexpected)");
+}
+
+/// Extent-list / fragmentation proof (`frag-test` build only). Two-boot, same binary, same
+/// disk. Boot 1: fill the disk with small files, then delete every other one so the only free
+/// space left is scattered small gaps — no contiguous run survives. Write `/frag.bin`, a file
+/// far bigger than any gap: contiguous allocation must FAIL and the fragmented
+/// (`ITYPE_FILE_FRAG`) path engages, storing the data across the gaps via a CRC'd extent block.
+/// Verify the read-back exactly. Boot 2: the same `/frag.bin` is re-read across the reboot,
+/// proving the extent list persists. The disk is small (set by `osdev test fs-frag`).
+#[cfg(feature = "frag-test")]
+fn frag_test(ctx: &ServiceContext, fs: &mut Fs) {
+    const FRAG: &[u8] = b"/frag.bin";
+    const NB: u64 = 20 * DATA_PAYLOAD as u64; // 20 data blocks — far larger than any gap
+    let pat = |k: u64| -> u8 { (k.wrapping_mul(151).wrapping_add(13) & 0xFF) as u8 };
+
+    // Boot 2: the proof file already exists — re-verify it survived the reboot.
+    if let Some(e) = fs.walk(ctx, FRAG) {
+        let kind = if e.itype == ITYPE_FILE_FRAG { "FRAGMENTED" } else { "contiguous" };
+        ctx.log_fmt(format_args!("fs: [frag] /frag.bin present after reboot ({}, {} B)", kind, e.size));
+        if e.itype == ITYPE_FILE_FRAG && frag_verify(ctx, fs, FRAG, NB, pat) {
+            ctx.log("fs: [frag] reboot re-read OK");
+        } else {
+            ctx.log("fs: [frag] reboot re-read FAILED");
+        }
+        return;
+    }
+
+    // Boot 1, step 1: fill the disk with 2-block files until no space remains.
+    const FILL_BYTES: usize = 2 * DATA_PAYLOAD;
+    let filler = [0xABu8; FILL_BYTES];
+    let mut nm = [0u8; 12];
+    let mut count = 0u32;
+    loop {
+        let path = frag_name(&mut nm, count);
+        match fs.write_path(ctx, path, &filler) {
+            Ok(()) => count += 1,
+            Err(_) => break,
+        }
+        if count >= 4000 { break; } // safety bound (§26.6) — never reached on the test disk
+    }
+    ctx.log_fmt(format_args!("fs: [frag] filled {} files", count));
+
+    // Step 2: delete every other file → free space becomes scattered ~2-block gaps.
+    let mut i = 0u32;
+    let mut deleted = 0u32;
+    while i < count {
+        let path = frag_name(&mut nm, i);
+        if fs.delete(ctx, path).is_ok() { deleted += 1; }
+        i += 2;
+    }
+    ctx.log_fmt(format_args!("fs: [frag] deleted {} files ({} free blocks scattered)", deleted, fs.free_blocks));
+
+    // Step 3: write a 20-block file — no contiguous run that big exists, so it MUST fragment.
+    if fs.write_new(ctx, FRAG, NB).is_err() { ctx.log("fs: [frag] write_new FAILED"); return; }
+    let mut chunk = [0u8; MAX_FILE_BYTES];
+    let mut off = 0u64;
+    while off < NB {
+        let len = (MAX_FILE_BYTES as u64).min(NB - off) as usize;
+        for j in 0..len { chunk[j] = pat(off + j as u64); }
+        if fs.write_at(ctx, FRAG, off, &chunk[..len]).is_err() { ctx.log("fs: [frag] write_at FAILED"); return; }
+        off += len as u64;
+    }
+    match fs.walk(ctx, FRAG) {
+        Some(e) if e.itype == ITYPE_FILE_FRAG =>
+            ctx.log_fmt(format_args!("fs: [frag] /frag.bin is FRAGMENTED ({} B across an extent list)", e.size)),
+        Some(e) =>
+            ctx.log_fmt(format_args!("fs: [frag] NOT fragmented (itype {}) — a contiguous run existed", e.itype)),
+        None => { ctx.log("fs: [frag] /frag.bin vanished"); return; }
+    }
+    if frag_verify(ctx, fs, FRAG, NB, pat) {
+        ctx.log("fs: [frag] write+read round-trip OK");
+    } else {
+        ctx.log("fs: [frag] write+read round-trip FAILED");
+    }
+}
+
+/// Read `n` bytes of `path` in streaming chunks and check the deterministic pattern.
+#[cfg(feature = "frag-test")]
+fn frag_verify(ctx: &ServiceContext, fs: &Fs, path: &[u8], n: u64, pat: impl Fn(u64) -> u8) -> bool {
+    let mut buf = [0u8; MAX_FILE_BYTES];
+    let mut off = 0u64;
+    while off < n {
+        let want = (MAX_FILE_BYTES as u64).min(n - off) as usize;
+        match fs.read_at(ctx, path, off, want, &mut buf) {
+            Some(m) if m == want => {
+                for j in 0..m { if buf[j] != pat(off + j as u64) { return false; } }
+            }
+            _ => return false,
+        }
+        off += want as u64;
+    }
+    true
+}
+
+/// Build the path `/f<n>` into `buf` for the fill/delete loop (frag-test only).
+#[cfg(feature = "frag-test")]
+fn frag_name(buf: &mut [u8; 12], n: u32) -> &[u8] {
+    buf[0] = b'/';
+    buf[1] = b'f';
+    let mut tmp = [0u8; 10];
+    let mut i = tmp.len();
+    let mut v = n;
+    loop {
+        i -= 1;
+        tmp[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 { break; }
+    }
+    let digits = &tmp[i..];
+    buf[2..2 + digits.len()].copy_from_slice(digits);
+    &buf[..2 + digits.len()]
 }
 
 /// Dispatch one request and reply through the client's `reply` cap.
@@ -522,7 +652,7 @@ impl Fs {
     }
 
     /// Read the superblock, falling back to the **backup copy at the last LBA** if the primary
-    /// (LBA 0) is unreadable or fails its CRC (GSFS0006). The backup is located via the device
+    /// (LBA 0) is unreadable or fails its CRC (GSFS0007). The backup is located via the device
     /// capacity, so it works even when the primary is unreadable (no chicken-and-egg). On a
     /// successful fallback the primary is healed (rewritten from the backup).
     fn read_superblock(ctx: &ServiceContext) -> Result<[u8; BLOCK], &'static str> {
@@ -722,13 +852,13 @@ impl Fs {
         ctx.log_fmt(format_args!("fs: journal recovered {} block(s) from an interrupted write", n));
     }
 
-    /// Format the disk as an empty GSFS0006 sized to `capacity`, then mount. Same layout
+    /// Format the disk as an empty GSFS0007 sized to `capacity`, then mount. Same layout
     /// `osdev format_superblock` writes. `drives flash`; only ever user-initiated (§3.12).
     fn format(ctx: &ServiceContext, capacity: u64, label: &[u8]) -> Result<Fs, &'static str> {
         let total_blocks = capacity;
         let bitmap_start: u64 = 1;
         let bitmap_blocks = (total_blocks + BITS_PER_BMBLOCK - 1) / BITS_PER_BMBLOCK;
-        // Reserve the journal region between the bitmap and the data region (GSFS0006).
+        // Reserve the journal region between the bitmap and the data region (GSFS0007).
         let journal_start = bitmap_start + bitmap_blocks;
         let journal_blocks = JOURNAL_BLOCKS;
         let data_start = journal_start + journal_blocks;
@@ -745,7 +875,7 @@ impl Fs {
 
         let mut sb = [0u8; BLOCK];
         sb[0..8].copy_from_slice(SB_MAGIC);
-        sb[8..12].copy_from_slice(&6u32.to_le_bytes());
+        sb[8..12].copy_from_slice(&7u32.to_le_bytes());
         sb[12..16].copy_from_slice(&(BLOCK as u32).to_le_bytes());
         sb[16..24].copy_from_slice(&total_blocks.to_le_bytes());
         sb[24..32].copy_from_slice(&bitmap_start.to_le_bytes());
@@ -893,6 +1023,148 @@ impl Fs {
             if !self.tb_write(ctx, bm_blk, &blk) { return Err("bitmap write failed"); }
         }
         Ok(())
+    }
+
+    // ── extent lists (GSFS0007) ───────────────────────────────────────────────
+    // A file is normally one contiguous extent (`ITYPE_FILE`, the fast path: data is
+    // `first_block..first_block+block_count`). When no contiguous run is free, the file is
+    // stored FRAGMENTED (`ITYPE_FILE_FRAG`): `first_block` → a single CRC'd **extent block**
+    // (`block_count` = 1) that lists the scattered data runs. Bounded (§26.6): one extent
+    // block ⇒ ≤ EXT_MAX runs; a file that would need more is refused loudly.
+
+    /// Read and decode a fragmented file's extent block (CRC-verified). Returns the runs
+    /// `(start, len)` and their count. A CRC failure is a loud refusal (§3.12), never garbage.
+    fn ext_of(&self, ctx: &ServiceContext, e: &Entry) -> Option<([(u64, u64); EXT_MAX], usize)> {
+        let blk = self.tb_read(ctx, e.first_block)?;
+        if u32_at(&blk, EXT_CRC_OFF) != crc32(&blk[..EXT_CRC_OFF]) {
+            ctx.log_fmt(format_args!("fs: extent block CRC mismatch at lba {} — refusing", e.first_block));
+            return None;
+        }
+        let n = (u32_at(&blk, EXT_N_OFF) as usize).min(EXT_MAX);
+        let mut out = [(0u64, 0u64); EXT_MAX];
+        for i in 0..n {
+            let o = EXT_ENTRIES_OFF + i * EXT_ENTRY_SIZE;
+            out[i] = (u64_at(&blk, o), u64_at(&blk, o + 8));
+        }
+        Some((out, n))
+    }
+
+    /// Build a fragmented file's extent block (`n` runs), stamp its CRC, and stage the write.
+    fn ext_write(&mut self, ctx: &ServiceContext, lba: u64, exts: &[(u64, u64); EXT_MAX], n: usize) -> bool {
+        let mut blk = [0u8; BLOCK];
+        blk[EXT_N_OFF..EXT_N_OFF + 4].copy_from_slice(&(n as u32).to_le_bytes());
+        for i in 0..n {
+            let o = EXT_ENTRIES_OFF + i * EXT_ENTRY_SIZE;
+            blk[o..o + 8].copy_from_slice(&exts[i].0.to_le_bytes());
+            blk[o + 8..o + 16].copy_from_slice(&exts[i].1.to_le_bytes());
+        }
+        let c = crc32(&blk[..EXT_CRC_OFF]);
+        blk[EXT_CRC_OFF..EXT_CRC_OFF + 4].copy_from_slice(&c.to_le_bytes());
+        self.tb_write(ctx, lba, &blk)
+    }
+
+    /// Find the first free run of blocks at or after `from`: returns `(start, len)` of the next
+    /// maximal contiguous free span, or `None` if the disk has no free block left. Scans the
+    /// bitmap one block at a time (each read honors staged writes).
+    fn find_free_run(&self, ctx: &ServiceContext, from: u64) -> Option<(u64, u64)> {
+        let mut b = from.max(self.data_start);
+        let mut start: Option<u64> = None;
+        let mut len = 0u64;
+        while b < self.total_blocks {
+            let bm_blk = self.bitmap_start + b / BITS_PER_BMBLOCK;
+            let blk = self.tb_read(ctx, bm_blk)?;
+            let base = (b / BITS_PER_BMBLOCK) * BITS_PER_BMBLOCK;
+            let mut within = b - base;
+            while within < BITS_PER_BMBLOCK {
+                let idx = base + within;
+                if idx >= self.total_blocks { break; }
+                let used = (blk[(within / 8) as usize] >> (within % 8)) & 1 != 0;
+                if used {
+                    if start.is_some() { return Some((start.unwrap(), len)); }
+                } else {
+                    if start.is_none() { start = Some(idx); len = 0; }
+                    len += 1;
+                }
+                within += 1;
+            }
+            b = base + BITS_PER_BMBLOCK;
+        }
+        start.map(|s| (s, len))
+    }
+
+    /// Allocate `blocks` data blocks as up to `EXT_MAX` scattered runs (the fragmented path,
+    /// used only when no single contiguous run is free). Marks the bits used and decrements the
+    /// free count. Returns the number of runs filled into `out`. Loud failure if the disk lacks
+    /// the space or would need more than `EXT_MAX` runs (frees what it grabbed first).
+    fn alloc_extents(&mut self, ctx: &ServiceContext, blocks: u64, out: &mut [(u64, u64); EXT_MAX])
+        -> Result<usize, &'static str> {
+        let mut need = blocks;
+        let mut n = 0usize;
+        let mut from = self.data_start;
+        while need > 0 {
+            if n >= EXT_MAX {
+                for i in 0..n { let (s, l) = out[i]; let _ = self.bm_set_range(ctx, s, l, false); }
+                return Err("file too fragmented");
+            }
+            let (start, len) = match self.find_free_run(ctx, from) {
+                Some(r) => r,
+                None => {
+                    for i in 0..n { let (s, l) = out[i]; let _ = self.bm_set_range(ctx, s, l, false); }
+                    return Err("no space");
+                }
+            };
+            let take = len.min(need);
+            self.bm_set_range(ctx, start, take, true)?;
+            out[n] = (start, take);
+            n += 1;
+            need -= take;
+            from = start + len;
+        }
+        self.free_blocks = self.free_blocks.saturating_sub(blocks);
+        self.persist_super(ctx)?;
+        Ok(n)
+    }
+
+    /// Allocate space for a file of `blocks` data blocks, preferring one contiguous extent
+    /// (`ITYPE_FILE`, the fast path). If no contiguous run is free, fall back to a fragmented
+    /// file (`ITYPE_FILE_FRAG`): scattered data runs + a CRC'd extent block listing them.
+    /// Returns the record fields `(itype, first_block, block_count)`.
+    fn alloc_file(&mut self, ctx: &ServiceContext, blocks: u64) -> Result<(u8, u64, u64), &'static str> {
+        match self.alloc_run(ctx, blocks) {
+            Ok(first) => Ok((ITYPE_FILE, first, blocks)),
+            Err("no space") => {
+                let mut exts = [(0u64, 0u64); EXT_MAX];
+                let ne = self.alloc_extents(ctx, blocks, &mut exts)?;
+                // One more block for the extent block itself.
+                let ext_lba = match self.alloc_run(ctx, 1) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        for i in 0..ne { let (s, l) = exts[i]; let _ = self.free_run(ctx, s, l); }
+                        return Err(e);
+                    }
+                };
+                if !self.ext_write(ctx, ext_lba, &exts, ne) {
+                    let _ = self.free_run(ctx, ext_lba, 1);
+                    for i in 0..ne { let (s, l) = exts[i]; let _ = self.free_run(ctx, s, l); }
+                    return Err("extent block write failed");
+                }
+                Ok((ITYPE_FILE_FRAG, ext_lba, 1))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Free a file's data blocks: a contiguous extent frees in one run; a fragmented file frees
+    /// each listed run, then the extent block itself. (Directories are freed via `free_run`.)
+    fn free_file(&mut self, ctx: &ServiceContext, e: &Entry) -> Result<(), &'static str> {
+        match e.itype {
+            ITYPE_FILE_FRAG => {
+                let (exts, ne) = self.ext_of(ctx, e).ok_or("extent block read failed")?;
+                for i in 0..ne { let (s, l) = exts[i]; self.free_run(ctx, s, l)?; }
+                self.free_run(ctx, e.first_block, e.block_count) // the extent block (count = 1)
+            }
+            _ => self.free_run(ctx, e.first_block, e.block_count),
+        }
     }
 
     // ── directory tree (self-describing entries) ──────────────────────────────
@@ -1079,39 +1351,64 @@ impl Fs {
         if !valid_name(name) { return Err("bad name"); }
         let existing = self.dir_find(ctx, &parent, name);
         if let Some(ref e) = existing {
-            if e.itype != ITYPE_FILE { return Err("path is a directory"); }
+            if !is_file(e.itype) { return Err("path is a directory"); }
         }
         let blocks = ((data.len() + DATA_PAYLOAD - 1) / DATA_PAYLOAD).max(1) as u64;
-        // Alloc the new extent first (old still allocated), so a failure leaves the file
-        // intact; free the old extent only after the record points at the new one.
-        let first = self.alloc_run(ctx, blocks)?;
-        for i in 0..blocks as usize {
-            let s = i * DATA_PAYLOAD;
-            let e = (s + DATA_PAYLOAD).min(data.len());
-            let payload = if s < data.len() { &data[s..e] } else { &[][..] };
-            if !data_write(ctx, first + i as u64, payload) { return Err("block write failed"); }
+        // Alloc the new file first (old still allocated), so a failure leaves the file intact;
+        // free the old extent only after the record points at the new one. `alloc_file` returns
+        // a contiguous extent (fast path) or a fragmented file when no contiguous run is free.
+        let (itype, first, count) = self.alloc_file(ctx, blocks)?;
+        // Write the data to its allocated blocks: contiguous → arithmetic; fragmented → walk the
+        // extent runs the extent block just recorded (read-your-writes via the staged txn).
+        if itype == ITYPE_FILE {
+            for i in 0..blocks as usize {
+                let s = i * DATA_PAYLOAD;
+                let e = (s + DATA_PAYLOAD).min(data.len());
+                let payload = if s < data.len() { &data[s..e] } else { &[][..] };
+                if !data_write(ctx, first + i as u64, payload) { return Err("block write failed"); }
+            }
+        } else {
+            let frag_e = Entry { itype, size: 0, first_block: first, block_count: count, loc: None };
+            let (exts, ne) = self.ext_of(ctx, &frag_e).ok_or("extent block read failed")?;
+            let mut produced = 0usize;
+            'fill: for ei in 0..ne {
+                let (s, l) = exts[ei];
+                for j in 0..l {
+                    let so = produced * DATA_PAYLOAD;
+                    if so >= data.len() && produced > 0 { break 'fill; }
+                    let eo = (so + DATA_PAYLOAD).min(data.len());
+                    let payload = if so < data.len() { &data[so..eo] } else { &[][..] };
+                    if !data_write(ctx, s + j, payload) { return Err("block write failed"); }
+                    produced += 1;
+                }
+            }
         }
         match existing {
             Some(e) => {
-                let (old_first, old_count) = (e.first_block, e.block_count);
-                let ne = Entry { itype: ITYPE_FILE, size: data.len() as u64, first_block: first, block_count: blocks, loc: e.loc };
+                let ne = Entry { itype, size: data.len() as u64, first_block: first, block_count: count, loc: e.loc };
                 self.persist_entry(ctx, &ne)?;
-                self.free_run(ctx, old_first, old_count)?;
+                self.free_file(ctx, &e)?;
             }
-            None => self.dir_add(ctx, &mut parent, name, ITYPE_FILE, data.len() as u64, first, blocks)?,
+            None => self.dir_add(ctx, &mut parent, name, itype, data.len() as u64, first, count)?,
         }
         Ok(())
     }
 
     fn read_path(&self, ctx: &ServiceContext, path: &[u8], out: &mut [u8]) -> Option<usize> {
         let e = self.walk(ctx, path)?;
-        if e.itype != ITYPE_FILE { return None; }
+        if !is_file(e.itype) { return None; }
         let size = e.size as usize;
         if size > out.len() { return None; }
-        for b in 0..e.block_count {
-            let start = (b as usize) * DATA_PAYLOAD;
-            if start >= size { break; }
-            let blk = data_read(ctx, e.first_block + b)?;
+        // Resolve the extent list once if fragmented; a contiguous file maps by arithmetic.
+        let frag = if e.itype == ITYPE_FILE_FRAG { Some(self.ext_of(ctx, &e)?) } else { None };
+        let nblocks = (size + DATA_PAYLOAD - 1) / DATA_PAYLOAD;
+        for b in 0..nblocks {
+            let start = b * DATA_PAYLOAD;
+            let lba = match &frag {
+                None => e.first_block + b as u64,
+                Some((exts, ne)) => nth_data_block(exts, *ne, b as u64)?,
+            };
+            let blk = data_read(ctx, lba)?;
             let end = (start + DATA_PAYLOAD).min(size);
             out[start..end].copy_from_slice(&blk[..end - start]);
         }
@@ -1133,18 +1430,17 @@ impl Fs {
         if !valid_name(name) { return Err("bad name"); }
         let existing = self.dir_find(ctx, &parent, name);
         if let Some(ref e) = existing {
-            if e.itype != ITYPE_FILE { return Err("path is a directory"); }
+            if !is_file(e.itype) { return Err("path is a directory"); }
         }
         let blocks = ((total + DATA_PAYLOAD as u64 - 1) / DATA_PAYLOAD as u64).max(1);
-        let first = self.alloc_run(ctx, blocks)?;
+        let (itype, first, count) = self.alloc_file(ctx, blocks)?;
         match existing {
             Some(e) => {
-                let (old_first, old_count) = (e.first_block, e.block_count);
-                let ne = Entry { itype: ITYPE_FILE, size: total, first_block: first, block_count: blocks, loc: e.loc };
+                let ne = Entry { itype, size: total, first_block: first, block_count: count, loc: e.loc };
                 self.persist_entry(ctx, &ne)?;
-                self.free_run(ctx, old_first, old_count)
+                self.free_file(ctx, &e)
             }
-            None => self.dir_add(ctx, &mut parent, name, ITYPE_FILE, total, first, blocks),
+            None => self.dir_add(ctx, &mut parent, name, itype, total, first, count),
         }
     }
 
@@ -1154,15 +1450,27 @@ impl Fs {
     /// zero-padded. Bounded to the file's allocated extent — a write past it is a loud error.
     fn write_at(&self, ctx: &ServiceContext, path: &[u8], offset: u64, chunk: &[u8]) -> Result<(), &'static str> {
         let e = self.walk(ctx, path).ok_or("not found")?;
-        if e.itype != ITYPE_FILE { return Err("not a file"); }
+        if !is_file(e.itype) { return Err("not a file"); }
         if offset % DATA_PAYLOAD as u64 != 0 { return Err("unaligned offset"); }
-        if offset + chunk.len() as u64 > e.block_count * DATA_PAYLOAD as u64 { return Err("write past extent"); }
-        let start = e.first_block + offset / DATA_PAYLOAD as u64;
+        // The file's data-block count: a contiguous file's `block_count`, else the extents'
+        // total (a fragmented file's `block_count` counts only the extent block).
+        let total_blocks = match e.itype {
+            ITYPE_FILE => e.block_count,
+            _ => (e.size + DATA_PAYLOAD as u64 - 1) / DATA_PAYLOAD as u64,
+        };
+        if offset + chunk.len() as u64 > total_blocks * DATA_PAYLOAD as u64 { return Err("write past extent"); }
+        let frag = if e.itype == ITYPE_FILE_FRAG { Some(self.ext_of(ctx, &e).ok_or("extent block read failed")?) } else { None };
+        let base_idx = offset / DATA_PAYLOAD as u64;
         let nblk = (chunk.len() + DATA_PAYLOAD - 1) / DATA_PAYLOAD;
         for i in 0..nblk {
             let s = i * DATA_PAYLOAD;
             let end = (s + DATA_PAYLOAD).min(chunk.len());
-            if !data_write(ctx, start + i as u64, &chunk[s..end]) { return Err("block write failed"); }
+            let idx = base_idx + i as u64;
+            let lba = match &frag {
+                None => e.first_block + idx,
+                Some((exts, ne)) => nth_data_block(exts, *ne, idx).ok_or("extent out of range")?,
+            };
+            if !data_write(ctx, lba, &chunk[s..end]) { return Err("block write failed"); }
         }
         Ok(())
     }
@@ -1172,14 +1480,20 @@ impl Fs {
     /// offset need not be block-aligned — it reads across block boundaries as needed.
     fn read_at(&self, ctx: &ServiceContext, path: &[u8], offset: u64, len: usize, out: &mut [u8]) -> Option<usize> {
         let e = self.walk(ctx, path)?;
-        if e.itype != ITYPE_FILE { return None; }
+        if !is_file(e.itype) { return None; }
         let size = e.size;
         if offset >= size { return Some(0); }
         let n = len.min((size - offset) as usize).min(out.len());
+        let frag = if e.itype == ITYPE_FILE_FRAG { Some(self.ext_of(ctx, &e)?) } else { None };
         let mut done = 0;
         while done < n {
             let pos = offset as usize + done;
-            let blk = data_read(ctx, e.first_block + (pos / DATA_PAYLOAD) as u64)?;
+            let idx = (pos / DATA_PAYLOAD) as u64;
+            let lba = match &frag {
+                None => e.first_block + idx,
+                Some((exts, ne)) => nth_data_block(exts, *ne, idx)?,
+            };
+            let blk = data_read(ctx, lba)?;
             let within = pos % DATA_PAYLOAD;
             let take = (DATA_PAYLOAD - within).min(n - done);
             out[done..done + take].copy_from_slice(&blk[within..within + take]);
@@ -1250,7 +1564,7 @@ impl Fs {
         }
         let (parent, name) = self.walk_parent(ctx, path).ok_or("not found")?;
         self.dir_remove(ctx, &parent, name)?;
-        self.free_run(ctx, e.first_block, e.block_count)
+        self.free_file(ctx, &e)
     }
 
     /// `delete … recursive`: remove a file or a WHOLE subtree. Unlinks the entry from its
@@ -1299,6 +1613,12 @@ impl Fs {
                     let (kt, kf, kc) = kids[k];
                     self.free_subtree(ctx, kt, kf, kc, depth + 1)?;
                 }
+            }
+        } else if itype == ITYPE_FILE_FRAG {
+            // Free the scattered data runs (each its own bounded txn) before the extent block.
+            let frag_e = Entry { itype, size: 0, first_block: first, block_count: count, loc: None };
+            if let Some((exts, ne)) = self.ext_of(ctx, &frag_e) {
+                for i in 0..ne { let (s, l) = exts[i]; self.free_run_txn(ctx, s, l)?; }
             }
         }
         // Each extent freed in its own bounded transaction (the subtree is already unlinked).
@@ -1367,11 +1687,29 @@ impl Fs {
             st.0 += 1;
             // Verify each data block's CRC (data_read logs a mismatch loudly). Blocks stay
             // marked used regardless — the entry references them; freeing would risk reuse.
-            let mut ok = true;
-            for bi in 0..count {
-                if data_read(ctx, first + bi).is_none() { ok = false; }
+            if itype == ITYPE_FILE_FRAG {
+                // `first` (already marked above) is the extent block; its runs hold the data.
+                let frag_e = Entry { itype, size: 0, first_block: first, block_count: count, loc: None };
+                match self.ext_of(ctx, &frag_e) {
+                    Some((exts, ne)) => {
+                        let mut ok = true;
+                        for i in 0..ne {
+                            let (s, l) = exts[i];
+                            self.bm_set_range(ctx, s, l, true)?; // data runs are referenced → used
+                            st.3 += l;
+                            for j in 0..l { if data_read(ctx, s + j).is_none() { ok = false; } }
+                        }
+                        if !ok { st.2 += 1; }
+                    }
+                    None => { st.2 += 1; } // corrupt extent block — logged loudly
+                }
+            } else {
+                let mut ok = true;
+                for bi in 0..count {
+                    if data_read(ctx, first + bi).is_none() { ok = false; }
+                }
+                if !ok { st.2 += 1; }
             }
-            if !ok { st.2 += 1; }
         }
         Ok(())
     }
@@ -1402,6 +1740,24 @@ fn components(path: &[u8]) -> impl Iterator<Item = &[u8]> {
 
 fn valid_name(name: &[u8]) -> bool {
     !name.is_empty() && name.len() <= NAME_MAX && !name.iter().any(|&b| b == b'/')
+}
+
+/// A regular file, contiguous (`ITYPE_FILE`) or fragmented (`ITYPE_FILE_FRAG`). Both store
+/// data; they differ only in how the data blocks are located (extent-list GSFS0007).
+fn is_file(itype: u8) -> bool {
+    itype == ITYPE_FILE || itype == ITYPE_FILE_FRAG
+}
+
+/// Map the `n`-th data block of a fragmented file to its LBA by walking the extent runs.
+/// `exts[..ne]` are `(start, len)` runs in file order; returns `None` past the last block.
+fn nth_data_block(exts: &[(u64, u64); EXT_MAX], ne: usize, n: u64) -> Option<u64> {
+    let mut acc = 0u64;
+    for i in 0..ne {
+        let (start, len) = exts[i];
+        if n < acc + len { return Some(start + (n - acc)); }
+        acc += len;
+    }
+    None
 }
 
 fn encode_rec(blk: &mut [u8], slot: usize, itype: u8, name: &[u8], size: u64, first: u64, count: u64) {
