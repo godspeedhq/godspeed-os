@@ -644,9 +644,17 @@ byte in its data block, boot: `fs` logs a "data block CRC mismatch" and the read
   drift the free count host-side (both copies, CRC re-stamped), boot, `drives check` rebuilds the
   correct value, 0 bad, the file survives. `selfcheck.gsh` also runs `assert ok drives check` on
   a populated tree (in the script test). No regression (files 130/0).
-- **Phase H — block I/O error handling.** A failed block read/write currently just fails the op.
-  Add a bounded **retry**, then a loud report (§3.12), to harden against a failing/slow SSD. No
-  format change.
+- **Phase H — block I/O error handling. ✅ Built + verified 2026-06-17.** A failed block
+  read/write just failed the op. Now `block-driver` issues every read/write/zero through
+  `issue_io`, a **bounded retry** (`MAX_IO_ATTEMPTS = 3`) with **port recovery between attempts**
+  (`recover_port` clears PxSERR/PxIS and restarts the command engine if it halted): a transient
+  error (marginal sector, controller hiccup) is recovered transparently and logged; a persistent
+  one is **reported loudly** (§3.12) and returns an error. `fs` also logs the failing LBA on a
+  block error. Bounded (§26.6) — never an infinite retry. No format change. Verified by
+  `osdev test fs-ioretry` (5/0): a `io-error-test` build forces the first read/write commands to
+  fail (QEMU never fails a real disk), and the driver retries + recovers (the boot self-test read
+  still succeeds; fs mounts + round-trips), no panic. The persistent-failure branch (report +
+  Err after N attempts) is the same loop's exhaustion path. No regression (files 130/0, reboot).
 
 **Deferred (heavier; pulled in only when a real need arises, §26.2 / §26.11):**
 
