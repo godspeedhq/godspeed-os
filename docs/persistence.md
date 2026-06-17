@@ -666,12 +666,23 @@ byte in its data block, boot: `fs` logs a "data block CRC mismatch" and the read
   file that *cannot* fit contiguously → it lands fragmented, reads back exactly, and survives a
   reboot. No regression (files 130/0, fs-large 1/1, fs-journal 11/0, fs-check 5/0, fs-ioretry 5/0,
   fs-corrupt 14/0, fs-restart 7/0, drives 9/0, script 2/2, blockdev-reboot).
+- **Phase J — Opt-in data journaling. ✅ Built + verified 2026-06-17.** The metadata journal made
+  every *structural* mutation atomic, but streaming `write_at` wrote data **direct** with no
+  transaction — a crash mid-chunk left torn data (caught by the data CRC on read, but not
+  recovered). Phase J adds a **journaled `write_at` variant** (`OP_WRITE_AT_J`) that stages the
+  chunk's data blocks in a transaction so the chunk commits **atomically** — a crash replays or
+  discards it whole, never torn. **Opt-in per write**: the caller picks the contract; default
+  `WRITE_AT` stays direct (the fast path). **Bounded** to one chunk (≤ 7 blocks) by the 64-block
+  journal — whole-file atomicity across chunks is out of scope and stays honest (§20/§26.6).
+  (`WriteFile` and overwrite were *already* crash-atomic — copy-on-write to a fresh extent, data
+  flushed before the metadata commit — so only the streaming path had a torn-data window.) Full
+  §6.13. No on-disk format change, no amendment. Verified by `osdev test fs-djournal` (7/0): a
+  journaled `write_at` halts right after its commit record (data only in the journal, home blocks
+  still zero), and the next boot replays the data home — a correct read proves the journal supplied
+  it. No regression (fs-large 1/1, fs-frag 11/0, fs-journal 11/0, files 130/0, script 2/2).
 
 **Deferred (heavier; pulled in only when a real need arises, §26.2 / §26.11):**
 
-- **Data journaling** — the journal is metadata-only by design; a torn *data* write is caught by
-  the data CRC (loud) but not recovered (honest loss of that write, §20). Full data journaling is
-  heavyweight and not yet justified.
 - **Scrubbing** — proactively re-verify rarely-read blocks to catch latent bit-rot early; needs a
   background task GodspeedOS doesn't have.
 - **Snapshots / copy-on-write / mirroring (RAID)** — real features, but each strains the
@@ -719,6 +730,49 @@ an unbounded indirection tree. This is deliberately *not* a btree/multi-level ex
 fixes the fragmentation limit that can actually bite while staying inside the 30-minute
 whiteboard rule (§26.11). A file too fragmented for 31 runs fails loudly; `drives check` can
 report it. Verified by `osdev test fs-frag` (11/0) + full regression green.
+
+### 6.13 Opt-in data journaling — atomic streaming chunks (Phase J)
+
+> **Adopted 2026-06-17 (Phase J).** Closes the one torn-data window left by the §6.8 model — the
+> streaming `write_at` path — without pretending to whole-file atomicity the 64-block journal
+> cannot give.
+
+The crash-consistency journal (§6.8) makes every **metadata** mutation atomic, and the common file
+operations are already crash-safe for *data* too — almost by accident of the design:
+
+- **`WriteFile`** allocates a fresh extent, writes its data (flushed), *then* commits the metadata.
+  A crash before the commit discards the metadata and leaks the data; after it, the data was already
+  durably home. The file either fully appears with correct bytes or not at all.
+- **Overwrite** is copy-on-write: a new extent is filled, the record is re-pointed, the old extent
+  freed — so the same "data-before-commit" ordering holds, and the old file survives a crash intact.
+
+The exception is the **streaming large-file path**: `write_new` commits the metadata (file sized,
+extent allocated) up front, then a sequence of `write_at` chunks fills the data **direct**, outside
+any transaction. A crash mid-chunk leaves some blocks new and some stale — *torn data*, caught by the
+per-block CRC on read (a loud refusal, never silent — §3.12) but **not recovered**.
+
+Phase J makes that recoverable, **opt-in per write**:
+
+- **`OP_WRITE_AT_J`** — a journaled `write_at`. It stages the chunk's data blocks in a transaction
+  (`data_stage`: stamp the CRC, `tb_write` into the staged set) and commits through the journal, so
+  the chunk's data rides the same atomic mechanism as metadata: `commit_txn` writes it to the
+  journal, lands the checksummed commit record (the atomic point), checkpoints it home, and
+  invalidates. A crash before the commit record discards the chunk; after it, the next mount's
+  `recover` replays it home. The chunk is applied **whole or not at all** — never torn.
+- **Default `WRITE_AT` stays direct** — the fast streaming path is unchanged. The caller chooses the
+  guarantee: pay the double-write (journal + home) for atomicity, or take the fast path and rely on
+  the read-time CRC. The durability contract is explicit, not hidden (§26.5/§26.7).
+
+**Bounded & honest (§26.6/§20).** The journal is 64 blocks (`TXN_CAP` = 56 staged), and a chunk is at
+most `7 × 508` payload bytes (7 data blocks), so a journaled chunk always fits — but **whole-file**
+data journaling does **not**, and Phase J does not pretend otherwise. The guarantee is *per-chunk*
+atomicity; a multi-chunk file written with `OP_WRITE_AT_J` is a sequence of individually-atomic
+chunks, not one atomic file. That is the honest ceiling of a fixed 64-block journal, stated plainly
+rather than papered over. Verified by `osdev test fs-djournal` (7/0): a journaled `write_at` halts
+right after its commit record — the data is only in the journal, the home blocks are still zero — and
+the next boot replays it; because a zero block fails the data CRC, reading the file back correctly can
+*only* mean the journal supplied the data. No on-disk format change; no constitutional amendment
+(within §15/§26.6, no TCB or §7 change).
 
 ## 7. File = capability (the north star)
 

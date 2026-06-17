@@ -27,5 +27,12 @@ journal-crash-test = []
 # ONLY (it writes to the disk). Enabled by `osdev test fs-frag`.
 frag-test = []
 
+# Data-journaling proof (Phase J). Runs `data_journal_test` at mount: creates a file (data blocks
+# left zero on disk), then a JOURNALED write_at through a transaction that halts after the commit
+# record — so the chunk's data lives only in the journal. The next boot must replay it from the
+# journal (home blocks were zero → a correct read proves recovery). TEST BUILDS ONLY (writes to
+# the disk and deliberately hangs the service). Enabled by `osdev test fs-djournal`.
+data-journal-test = []
+
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }

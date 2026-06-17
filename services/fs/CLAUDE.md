@@ -82,6 +82,7 @@ hard links. Bad magic **or** bad CRC is a loud mount refusal, never an auto-refo
 | `WriteAt`   | 25 | path, offset:u64, chunk | `Ok` / `Err` — write a chunk (block-aligned offset) |
 | `ReadAt`    | 26 | path, offset:u64, len:u32 | `Ok`, n:u32, bytes / `NotFound` |
 | `Check`     | 27 | —                 | fsck: `Ok`, files/dirs/bad:u32, used/free:u64 — rebuild bitmap+free from the tree, verify CRCs |
+| `WriteAtJ`  | 28 | path, offset:u64, chunk | `Ok` / `Err` — like `WriteAt` but the chunk's data is **journaled** (Phase J): applied atomically (crash → replayed or discarded, never torn). Bounded to one chunk; default `WriteAt` stays direct |
 
 **Large files (streaming).** `WriteFile`/`ReadFile` carry a whole *small* file in one ≤4 KiB
 IPC message. Files larger than one message use the offset-addressed ops: `WriteNew` allocates
@@ -109,6 +110,14 @@ single power loss leaves the filesystem either entirely unchanged or fully appli
 half-updated. A transaction stages ≤ `TXN_CAP` (56) blocks (loud failure past that);
 `delete_tree` commits the unlink atomically then reclaims the subtree in bounded per-extent
 transactions. Proven by `osdev test fs-journal`.
+
+**Opt-in data journaling (Phase J, §6.13).** `WriteFile`/overwrite are already crash-atomic (data
+flushed before the metadata commit; copy-on-write to a fresh extent). The streaming `write_at` path
+wrote data direct, so a crash mid-chunk left torn data — caught by the data CRC on read, but not
+recovered. `WriteAtJ` (op 28) stages the chunk's data blocks in the transaction (`data_stage`) so
+the chunk commits **atomically** through the journal — replayed or discarded on crash, never torn.
+Opt-in per write (default `WriteAt` stays direct); bounded to one chunk by the 64-block journal (no
+whole-file atomicity — stated honestly, not faked). Proven by `osdev test fs-djournal`.
 
 This is the transactional metadata recovery §6.3/§15 calls for. With it, fs no longer
 *needs* to be non-restartable on crash-safety grounds — dropping fs + block-driver from the

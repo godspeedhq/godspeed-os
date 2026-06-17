@@ -126,6 +126,11 @@ const OP_WRITE_AT: u8 = 25;  // [op, plen, path, offset:u64, chunk…] — write
 const OP_READ_AT: u8 = 26;   // [op, plen, path, offset:u64, len:u32] → [FS_OK, n:u32, bytes]
 const OP_CHECK: u8 = 27;     // fsck: rebuild bitmap+free from the tree, report CRC failures →
                              // [FS_OK, files:u32, dirs:u32, bad:u32, used:u64, free:u64]
+const OP_WRITE_AT_J: u8 = 28; // [op, plen, path, offset:u64, chunk…] — like WRITE_AT but the
+                             // chunk's data blocks are JOURNALED (Phase J): the chunk is applied
+                             // atomically (crash → fully replayed or fully discarded, never torn).
+                             // Bounded to one chunk (≤7 blocks) by the journal; default WRITE_AT
+                             // stays direct. Opt-in per write — the caller chooses the guarantee.
 const FS_OK: u8 = 0;
 const FS_ERR: u8 = 1;
 const FS_NOTFOUND: u8 = 2;
@@ -216,6 +221,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         frag_test(&ctx, f);
     }
 
+    #[cfg(feature = "data-journal-test")]
+    if let Some(ref mut f) = fs {
+        data_journal_test(&ctx, f);
+    }
+
     // Register our name so clients can (re)acquire a cap to us via the registry — the path
     // that lets the shell recover after an `fs` restart (Phase D, §14.3).
     let _ = ctx.register("fs");
@@ -303,7 +313,7 @@ fn large_file_check(ctx: &ServiceContext, fs: &mut Fs) {
         while off < N {
             let len = (MAX_FILE_BYTES as u64).min(N - off) as usize;
             for i in 0..len { chunk[i] = pat(off + i as u64); }
-            if fs.write_at(ctx, BIG, off, &chunk[..len]).is_err() {
+            if fs.write_at(ctx, BIG, off, &chunk[..len], false).is_err() {
                 ctx.log("fs: large write_at FAILED"); return;
             }
             off += len as u64;
@@ -411,7 +421,7 @@ fn frag_test(ctx: &ServiceContext, fs: &mut Fs) {
     while off < NB {
         let len = (MAX_FILE_BYTES as u64).min(NB - off) as usize;
         for j in 0..len { chunk[j] = pat(off + j as u64); }
-        if fs.write_at(ctx, FRAG, off, &chunk[..len]).is_err() { ctx.log("fs: [frag] write_at FAILED"); return; }
+        if fs.write_at(ctx, FRAG, off, &chunk[..len], false).is_err() { ctx.log("fs: [frag] write_at FAILED"); return; }
         off += len as u64;
     }
     match fs.walk(ctx, FRAG) {
@@ -463,6 +473,45 @@ fn frag_name(buf: &mut [u8; 12], n: u32) -> &[u8] {
     let digits = &tmp[i..];
     buf[2..2 + digits.len()].copy_from_slice(digits);
     &buf[..2 + digits.len()]
+}
+
+/// Data-journaling proof (`data-journal-test` build only). Two-boot, same binary, same disk.
+/// Boot 1: create `/jdata.bin` (its metadata commits, but its data blocks are still **zeros** on
+/// disk), then do ONE **journaled** `write_at` (`journal = true`) through a transaction armed to
+/// halt right after the commit record is durable but before the checkpoint — so the data blocks
+/// live in the journal and were NEVER written to their home LBAs. Boot 2: `mount`'s recovery
+/// replays the committed transaction, writing the data home; the file reads back exactly. This is
+/// airtight: the home blocks were zeros (a zero block fails the data CRC), so a correct read can
+/// only mean the journal supplied the data — proving the chunk was crash-atomic, not torn.
+#[cfg(feature = "data-journal-test")]
+fn data_journal_test(ctx: &ServiceContext, fs: &mut Fs) {
+    const F: &[u8] = b"/jdata.bin";
+    const N: u64 = 4 * DATA_PAYLOAD as u64; // 4 data blocks — comfortably within the journal
+    let pat = |k: u64| -> u8 { (k.wrapping_mul(193).wrapping_add(29) & 0xFF) as u8 };
+
+    // Boot 2: the file exists — its data must have been recovered from the journal.
+    if fs.walk(ctx, F).is_some() {
+        let mut buf = [0u8; MAX_FILE_BYTES];
+        match fs.read_at(ctx, F, 0, N as usize, &mut buf) {
+            Some(n) if n == N as usize && (0..n).all(|j| buf[j] == pat(j as u64)) =>
+                ctx.log("fs: jdata RECOVERED+VERIFIED across simulated crash"),
+            Some(_) => ctx.log("fs: jdata recovered but DATA MISMATCH"),
+            None => ctx.log("fs: jdata read FAILED (data not recovered — home blocks still zero)"),
+        }
+        return;
+    }
+
+    // Boot 1: create the file (metadata commits direct; data blocks remain zero on disk), then a
+    // journaled write_at that halts post-commit. The data is staged → journal, not yet home.
+    ctx.log("fs: jdata boot1 — journaled write_at, will halt after commit record");
+    if fs.write_new(ctx, F, N).is_err() { ctx.log("fs: jdata write_new FAILED"); return; }
+    let mut chunk = [0u8; N as usize];
+    for j in 0..chunk.len() { chunk[j] = pat(j as u64); }
+    fs.begin_txn();
+    fs.crash_after_commit = true;
+    let _ = fs.write_at(ctx, F, 0, &chunk, true); // stages the data blocks in the txn
+    let _ = fs.commit_txn(ctx); // halts inside (armed) — control does not return
+    ctx.log("fs: jdata boot1 did NOT crash (unexpected)");
 }
 
 /// Dispatch one request and reply through the client's `reply` cap.
@@ -598,7 +647,18 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
             if tail.len() < 8 { send(&[FS_ERR]); return; }
             let offset = u64_at(tail, 0);
             let chunk = &tail[8..];
-            send(&[match fs.write_at(ctx, path, offset, chunk) { Ok(()) => FS_OK, Err(_) => FS_ERR }]);
+            // Direct (not journaled): no transaction — the fast streaming path (§6.8 data model).
+            send(&[match fs.write_at(ctx, path, offset, chunk, false) { Ok(()) => FS_OK, Err(_) => FS_ERR }]);
+        }
+        OP_WRITE_AT_J => {
+            if tail.len() < 8 { send(&[FS_ERR]); return; }
+            let offset = u64_at(tail, 0);
+            let chunk = &tail[8..];
+            // Journaled (Phase J): stage the chunk's data blocks in a transaction so it commits
+            // atomically (crash → replayed or discarded, never torn). Bounded to one chunk.
+            fs.begin_txn();
+            let r = fs.write_at(ctx, path, offset, chunk, true);
+            send(&[match fs.end_txn(ctx, r) { Ok(()) => FS_OK, Err(_) => FS_ERR }]);
         }
         OP_READ_AT => {
             if tail.len() < 12 { send(&[FS_ERR]); return; }
@@ -1448,7 +1508,13 @@ impl Fs {
     /// aligned** (a multiple of DATA_PAYLOAD — clients stream in such chunks), so whole data
     /// blocks are written with no read-modify-write; the final block of a partial chunk is
     /// zero-padded. Bounded to the file's allocated extent — a write past it is a loud error.
-    fn write_at(&self, ctx: &ServiceContext, path: &[u8], offset: u64, chunk: &[u8]) -> Result<(), &'static str> {
+    ///
+    /// `journal` selects the durability contract (Phase J, §6.13): `false` writes the data
+    /// blocks **direct** (the fast streaming path — a torn chunk is caught by the data CRC on
+    /// read but not recovered); `true` **stages** them in the active transaction (`data_stage`)
+    /// so the whole chunk commits atomically — a crash replays or discards it, never tears it.
+    /// The journaled caller (`OP_WRITE_AT_J`) wraps this in `begin_txn`/`end_txn`.
+    fn write_at(&mut self, ctx: &ServiceContext, path: &[u8], offset: u64, chunk: &[u8], journal: bool) -> Result<(), &'static str> {
         let e = self.walk(ctx, path).ok_or("not found")?;
         if !is_file(e.itype) { return Err("not a file"); }
         if offset % DATA_PAYLOAD as u64 != 0 { return Err("unaligned offset"); }
@@ -1470,9 +1536,22 @@ impl Fs {
                 None => e.first_block + idx,
                 Some((exts, ne)) => nth_data_block(exts, *ne, idx).ok_or("extent out of range")?,
             };
-            if !data_write(ctx, lba, &chunk[s..end]) { return Err("block write failed"); }
+            let ok = if journal { self.data_stage(ctx, lba, &chunk[s..end]) } else { data_write(ctx, lba, &chunk[s..end]) };
+            if !ok { return Err("block write failed"); }
         }
         Ok(())
+    }
+
+    /// Stamp a file-data block's CRC32 and **stage** it in the active transaction (Phase J).
+    /// The data thus rides the journal with the metadata and is checkpointed atomically; mirror
+    /// of `data_write` but transaction-aware (read-your-writes via `tb_write`).
+    fn data_stage(&mut self, ctx: &ServiceContext, lba: u64, payload: &[u8]) -> bool {
+        let mut blk = [0u8; BLOCK];
+        let n = payload.len().min(DATA_PAYLOAD);
+        blk[..n].copy_from_slice(&payload[..n]);
+        let c = crc32(&blk[..DATA_PAYLOAD]);
+        blk[DATA_CRC_OFF..DATA_CRC_OFF + 4].copy_from_slice(&c.to_le_bytes());
+        self.tb_write(ctx, lba, &blk)
     }
 
     /// Read up to `len` bytes from `path` starting at byte `offset` into `out` (clamped to the
