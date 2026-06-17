@@ -64,12 +64,20 @@ const ATA_READ_DMA_EXT: u8 = 0x25;
 const ATA_WRITE_DMA_EXT: u8 = 0x35;
 const ATA_FLUSH_EXT: u8 = 0xEA;
 
+/// Bounded I/O retry (Phase H): a transient command error (bad/marginal sector, controller
+/// hiccup) is retried this many times — with port error-recovery between attempts — before the
+/// op is reported as failed. Bounded (§26.6); never an infinite retry loop.
+const MAX_IO_ATTEMPTS: u32 = 3;
+
 struct Ahci<'a> {
     hba: &'a Mmio,
     arena: Dma,
     port: u32,
     /// Total addressable 512-byte sectors, from IDENTIFY. Served on OP_CAPACITY.
     sectors: Cell<u64>,
+    /// Test-only (`io-error-test` build): force the next N read/write commands to fail, to
+    /// exercise the retry + recovery path. Always 0 in production.
+    forced_fails: Cell<u32>,
 }
 
 impl<'a> Ahci<'a> {
@@ -190,6 +198,71 @@ impl<'a> Ahci<'a> {
         Err("command timeout (CI stuck)")
     }
 
+    /// Clear the port's error state so a retried command can run: clear PxSERR + PxIS
+    /// (write-1-to-clear), and if the command engine halted on the error (CR clear while ST is
+    /// still set), restart it (toggle ST). Best-effort — used only on the retry path.
+    fn recover_port(&self) {
+        self.pwrite(PX_SERR, 0xFFFF_FFFF); // W1C all SATA error bits
+        self.pwrite(PX_IS, 0xFFFF_FFFF);   // W1C all port interrupt-status bits
+        let cmd = self.pread(PX_CMD);
+        if cmd & CMD_ST != 0 && cmd & CMD_CR == 0 {
+            // Engine halted on the error — stop fully, then restart.
+            self.pwrite(PX_CMD, cmd & !CMD_ST);
+            for _ in 0..1_000_000u32 {
+                if self.pread(PX_CMD) & CMD_CR == 0 { break; }
+            }
+            self.pwrite(PX_SERR, 0xFFFF_FFFF);
+            let cmd2 = self.pread(PX_CMD);
+            self.pwrite(PX_CMD, cmd2 | CMD_ST);
+        }
+    }
+
+    /// Test-only fault injection (`io-error-test` build): force a read/write command to fail so
+    /// the retry path runs. Returns `Some(Err)` to inject, `None` to issue for real. A no-op
+    /// (always `None`) in production.
+    #[cfg(feature = "io-error-test")]
+    fn maybe_inject(&self, ata_cmd: u8) -> Option<Result<(), &'static str>> {
+        if self.forced_fails.get() > 0 && (ata_cmd == ATA_READ_DMA_EXT || ata_cmd == ATA_WRITE_DMA_EXT) {
+            self.forced_fails.set(self.forced_fails.get() - 1);
+            return Some(Err("injected I/O error (io-error-test)"));
+        }
+        None
+    }
+    #[cfg(not(feature = "io-error-test"))]
+    fn maybe_inject(&self, _ata_cmd: u8) -> Option<Result<(), &'static str>> { None }
+
+    /// Issue an ATA command with **bounded retries + port recovery** (Phase H). A transient
+    /// error is recovered transparently (logged so it's visible); a persistent one is reported
+    /// loudly (§3.12) and returns Err. All data read/write/zero commands go through here.
+    fn issue_io(&self, ctx: &ServiceContext, op: &str, ata_cmd: u8, lba: u64,
+                count: u16, write: bool, data_bytes: u32) -> Result<(), &'static str> {
+        let mut last = "unknown error";
+        for attempt in 1..=MAX_IO_ATTEMPTS {
+            let r = self.maybe_inject(ata_cmd)
+                .unwrap_or_else(|| self.issue(ata_cmd, lba, count, write, data_bytes));
+            match r {
+                Ok(()) => {
+                    if attempt > 1 {
+                        ctx.log_fmt(format_args!(
+                            "block-driver: {} lba {} recovered after {} attempt(s)", op, lba, attempt));
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    last = e;
+                    ctx.log_fmt(format_args!(
+                        "block-driver: {} lba {} failed (attempt {}/{}): {} — recovering, will retry",
+                        op, lba, attempt, MAX_IO_ATTEMPTS, e));
+                    self.recover_port();
+                }
+            }
+        }
+        ctx.log_fmt(format_args!(
+            "block-driver: {} lba {} FAILED after {} attempts: {} (reporting error, §3.12)",
+            op, lba, MAX_IO_ATTEMPTS, last));
+        Err(last)
+    }
+
     /// IDENTIFY DEVICE → (model string bytes, total sectors).
     fn identify(&self) -> Result<([u8; 40], u64), &'static str> {
         self.issue(ATA_IDENTIFY, 0, 0, false, 512)?;
@@ -214,9 +287,9 @@ impl<'a> Ahci<'a> {
         Ok((model, sectors))
     }
 
-    /// Read one 512-byte sector at `lba` into `out` (READ DMA EXT).
-    fn read_block(&self, lba: u64, out: &mut [u8; 512]) -> Result<(), &'static str> {
-        self.issue(ATA_READ_DMA_EXT, lba, 1, false, 512)?;
+    /// Read one 512-byte sector at `lba` into `out` (READ DMA EXT), with bounded retry.
+    fn read_block(&self, ctx: &ServiceContext, lba: u64, out: &mut [u8; 512]) -> Result<(), &'static str> {
+        self.issue_io(ctx, "read", ATA_READ_DMA_EXT, lba, 1, false, 512)?;
         for i in 0..128 {
             let w = self.arena.read32(DATA_OFF + i * 4);
             out[i * 4] = w as u8;
@@ -227,8 +300,8 @@ impl<'a> Ahci<'a> {
         Ok(())
     }
 
-    /// Write one 512-byte sector of `data` to `lba` (WRITE DMA EXT + FLUSH).
-    fn write_block(&self, lba: u64, data: &[u8; 512]) -> Result<(), &'static str> {
+    /// Write one 512-byte sector of `data` to `lba` (WRITE DMA EXT + FLUSH), with bounded retry.
+    fn write_block(&self, ctx: &ServiceContext, lba: u64, data: &[u8; 512]) -> Result<(), &'static str> {
         for i in 0..128 {
             let w = (data[i * 4] as u32)
                 | ((data[i * 4 + 1] as u32) << 8)
@@ -236,16 +309,16 @@ impl<'a> Ahci<'a> {
                 | ((data[i * 4 + 3] as u32) << 24);
             self.arena.write32(DATA_OFF + i * 4, w);
         }
-        self.issue(ATA_WRITE_DMA_EXT, lba, 1, true, 512)?;
+        self.issue_io(ctx, "write", ATA_WRITE_DMA_EXT, lba, 1, true, 512)?;
         // Commit to the medium so writes survive a reboot (no-data command).
-        self.issue(ATA_FLUSH_EXT, 0, 0, false, 0)?;
+        self.issue_io(ctx, "flush", ATA_FLUSH_EXT, 0, 0, false, 0)?;
         Ok(())
     }
 
     /// Write `count` zeroed sectors from `lba`, batched into multi-sector WRITE DMA EXT
     /// commands (up to MAX_PER sectors each — bounded by the DMA arena's data area). One
     /// IPC call zeros a whole run, so `fs` can clear a big bitmap without per-block traffic.
-    fn write_zeros(&self, lba: u64, count: u64) -> Result<(), &'static str> {
+    fn write_zeros(&self, ctx: &ServiceContext, lba: u64, count: u64) -> Result<(), &'static str> {
         if count == 0 {
             return Ok(());
         }
@@ -258,11 +331,11 @@ impl<'a> Ahci<'a> {
         let mut left = count;
         while left > 0 {
             let n = left.min(MAX_PER);
-            self.issue(ATA_WRITE_DMA_EXT, lba, n as u16, true, (n * 512) as u32)?;
+            self.issue_io(ctx, "write-zeros", ATA_WRITE_DMA_EXT, lba, n as u16, true, (n * 512) as u32)?;
             lba += n;
             left -= n;
         }
-        self.issue(ATA_FLUSH_EXT, 0, 0, false, 0)?;
+        self.issue_io(ctx, "flush", ATA_FLUSH_EXT, 0, 0, false, 0)?;
         Ok(())
     }
 
@@ -293,7 +366,7 @@ impl<'a> Ahci<'a> {
             OP_READ_BLOCK => {
                 let mut out = [0u8; 1 + 512];
                 let mut sec = [0u8; 512];
-                match self.read_block(lba, &mut sec) {
+                match self.read_block(ctx, lba, &mut sec) {
                     Ok(()) => {
                         out[0] = STATUS_OK;
                         out[1..].copy_from_slice(&sec);
@@ -309,7 +382,7 @@ impl<'a> Ahci<'a> {
                 }
                 let mut sec = [0u8; 512];
                 sec.copy_from_slice(&p[9..9 + 512]);
-                let status = match self.write_block(lba, &sec) {
+                let status = match self.write_block(ctx, lba, &sec) {
                     Ok(()) => STATUS_OK,
                     Err(_) => STATUS_ERR,
                 };
@@ -322,7 +395,7 @@ impl<'a> Ahci<'a> {
                     return;
                 }
                 let count = u64::from_le_bytes([p[9], p[10], p[11], p[12], p[13], p[14], p[15], p[16]]);
-                let status = match self.write_zeros(lba, count) {
+                let status = match self.write_zeros(ctx, lba, count) {
                     Ok(()) => STATUS_OK,
                     Err(_) => STATUS_ERR,
                 };
@@ -382,7 +455,10 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
         }
     };
     arena.zero();
-    let ahci = Ahci { hba, arena, port, sectors: Cell::new(0) };
+    // `io-error-test` build: arm a few forced read/write failures so the boot self-test +
+    // mount exercise the retry/recovery path. Always 0 (no injection) in production.
+    let forced = if cfg!(feature = "io-error-test") { 2 } else { 0 };
+    let ahci = Ahci { hba, arena, port, sectors: Cell::new(0), forced_fails: Cell::new(forced) };
     ahci.init_port();
 
     match ahci.identify() {
@@ -402,7 +478,7 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
     // the key thing to confirm on real hardware). Non-destructive; write is proven
     // by the fs file round-trip (and by `drives flash` later on hardware).
     let mut s0 = [0u8; 512];
-    match ahci.read_block(0, &mut s0) {
+    match ahci.read_block(ctx, 0, &mut s0) {
         Ok(()) => ctx.log_fmt(format_args!(
             "block-driver: AHCI read self-test OK — sector 0 [{:02x} {:02x} {:02x} {:02x} …]",
             s0[0], s0[1], s0[2], s0[3]

@@ -1458,6 +1458,7 @@ fn block_read(ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
         out.copy_from_slice(&p[1..1 + BLOCK]);
         Some(out)
     } else {
+        ctx.log_fmt(format_args!("fs: block read failed at lba {} (device I/O error)", lba));
         None
     }
 }
@@ -1491,8 +1492,11 @@ fn block_write(ctx: &ServiceContext, lba: u64, data: &[u8; BLOCK]) -> bool {
     req[1..9].copy_from_slice(&lba.to_le_bytes());
     req[9..].copy_from_slice(data);
     match block_rpc(ctx, &req) {
-        Some(reply) => reply.payload_bytes().first() == Some(&BLK_OK),
-        None => false,
+        Some(reply) if reply.payload_bytes().first() == Some(&BLK_OK) => true,
+        _ => {
+            ctx.log_fmt(format_args!("fs: block write failed at lba {} (device I/O error)", lba));
+            false
+        }
     }
 }
 

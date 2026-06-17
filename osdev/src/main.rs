@@ -1070,6 +1070,7 @@ fn cmd_test(suite: &str) {
         "fs-journal"   => run_fs_journal_test(),
         "fs-restart"   => run_fs_restart_test(),
         "fs-check"     => run_fs_check_test(),
+        "fs-ioretry"   => run_fs_ioretry_test(),
         "drives-raw"   => run_drives_raw_test(),
         "drives"       => run_drives_scripted_test(),
         "files"        => run_files_test(),
@@ -1223,20 +1224,31 @@ fn boot_blockdev_qemu(img_str: &str, persist_str: &str, serial: &str, secs: u64)
 
 /// Build the AHCI block-driver variant: block-driver with its `ahci` feature,
 /// supervisor spawns block-driver + fs (bare-metal,blockdev). AHCI by default.
-fn cmd_build_blockdev() { build_blockdev_fs("selftest"); }
+fn cmd_build_blockdev() { build_blockdev_fs("selftest", ""); }
 
-/// Build the blockdev image with `fs` compiled with the given feature set (`selftest` for the
-/// round-trip/reboot tests, `journal-crash-test` for the crash-consistency test).
-fn build_blockdev_fs(fs_features: &str) {
+/// Build the blockdev image with `fs` compiled with `fs_features` (`selftest` for the
+/// round-trip/reboot tests, `journal-crash-test` for crash-consistency) and `block-driver`
+/// compiled with `bd_features` (e.g. `io-error-test` to exercise the I/O retry path; `""` for
+/// none).
+fn build_blockdev_fs(fs_features: &str, bd_features: &str) {
     clean_supervisor();
-    // Force a fresh `fs` so its test feature (added below) is compiled in even if a prior
-    // plain build cached it — otherwise the blockdev tests miss the self-test logs.
+    // Force a fresh `fs` (and `block-driver` if it gets a feature) so the test features are
+    // compiled in even if a prior plain build cached them.
     let _ = std::process::Command::new("cargo")
         .args(["clean", "--release", "-p", "fs", "--target", "x86_64-unknown-none"]).status();
+    if !bd_features.is_empty() {
+        let _ = std::process::Command::new("cargo")
+            .args(["clean", "--release", "-p", "block-driver", "--target", "x86_64-unknown-none"]).status();
+    }
     let non_supervisor = ["init", "registry", "logger", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver"];
     for crate_name in &non_supervisor {
+        let mut args = vec!["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"];
+        if *crate_name == "block-driver" && !bd_features.is_empty() {
+            args.push("--features");
+            args.push(bd_features);
+        }
         let status = std::process::Command::new("cargo")
-            .args(["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"])
+            .args(&args)
             .status()
             .unwrap_or_else(|e| panic!("failed to run cargo build for {}: {}", crate_name, e));
         if !status.success() { eprintln!("build: {} FAILED", crate_name); std::process::exit(1); }
@@ -1611,7 +1623,7 @@ fn run_fs_journal_test() {
     };
 
     // ── Part 1: replay a committed-but-unfinished transaction ──
-    build_blockdev_fs("journal-crash-test");
+    build_blockdev_fs("journal-crash-test", "");
     if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
     let image_path = disk_image::create(kernel_elf, limine_dir);
     disk_image::install_bootloader(limine_dir, &image_path);
@@ -1638,7 +1650,7 @@ fn run_fs_journal_test() {
     check(!log2.contains("KERNEL PANIC") && !log2.contains("CRC mismatch"), "part2 boot2: no panic, no corruption");
 
     // ── Part 2: a normal build must REJECT a commit record with a bad CRC ──
-    build_blockdev_fs("selftest");
+    build_blockdev_fs("selftest", "");
     let image2 = disk_image::create(kernel_elf, limine_dir);
     disk_image::install_bootloader(limine_dir, &image2);
     let img2 = std::fs::canonicalize(&image2).unwrap_or_else(|_| image2.to_path_buf());
@@ -1850,6 +1862,53 @@ fn run_fs_check_test() {
     println!("fs-check: drifted free count {} -> {} (both copies), correct value is {}", bogus, bogus, correct_free);
 
     crate::shell_test::run_fs_check(&image_path, persist, correct_free, 4);
+}
+
+/// Phase H: block I/O retry. Build block-driver with `io-error-test` (forces the first couple
+/// of read/write commands to fail), boot, and assert the driver RETRIES + RECOVERS the
+/// transient error (the boot self-test read still succeeds) — and that normal operation is
+/// unaffected (fs mounts + round-trips). QEMU never fails a real disk read, so the fault must
+/// be injected.
+fn run_fs_ioretry_test() {
+    println!("\n=== fs: block I/O retry — transient failure retried + recovered (Phase H) ===");
+    build_blockdev_fs("selftest", "io-error-test");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_fs_ioretry.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist); // formatted so fs mounts + the selftest round-trips run
+    let img = std::fs::canonicalize(&image_path).unwrap_or_else(|_| image_path.to_path_buf());
+    let img_str = img.to_string_lossy().replace('\\', "/");
+    let persist_abs = std::fs::canonicalize(persist).unwrap_or_else(|_| std::path::PathBuf::from(persist));
+    let persist_str = persist_abs.to_string_lossy().replace('\\', "/");
+
+    println!("fs: boot with forced transient I/O errors, ~25s …");
+    let log = boot_ahci_qemu(&img_str, &persist_str, "build/tests/fs_ioretry.log", 25);
+    let retried   = log.contains("failed (attempt 1/");             // a retry fired
+    let recovered = log.contains("recovered after");                // the transient cleared
+    let selftest_ok = log.contains("read self-test OK");            // the injected read ultimately succeeded
+    let fs_works  = log.contains("round-trip OK");                  // normal operation unaffected
+    let no_panic  = !log.contains("KERNEL PANIC");
+
+    for (tag, ok) in [
+        ("retried a failed command (attempt 1/N)", retried),
+        ("recovered the transient error", recovered),
+        ("the retried read ultimately succeeded", selftest_ok),
+        ("normal fs operation unaffected (round-trip OK)", fs_works),
+        ("no kernel panic", no_panic),
+    ] {
+        println!("  {} … {}", if ok { "PASS" } else { "FAIL" }, tag);
+    }
+    if retried && recovered && selftest_ok && fs_works && no_panic {
+        println!("\n  [FS.ioretry]  bounded retry recovers a transient I/O error  … PASS\n\n  5 passed  0 failed");
+    } else {
+        println!("\n  [FS.ioretry]  block I/O retry  … FAIL\n\n  some failed");
+        std::process::exit(1);
+    }
 }
 
 /// Build bare-metal image and run the scripted shell smoke-test.

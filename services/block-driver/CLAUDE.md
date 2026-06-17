@@ -18,6 +18,13 @@ slot (H2D Register FIS type 0x27 + PRDT). ATA commands: IDENTIFY `0xEC`, READ DM
 `0x25`, WRITE DMA EXT `0x35`, FLUSH EXT `0xEA` (writes flush to the medium so they
 survive reboot). See `docs/ahci.md` for the register cheat-sheet.
 
+**I/O retry (Phase H).** Every read/write/zero goes through `issue_io`: a **bounded retry**
+(`MAX_IO_ATTEMPTS = 3`) with **port recovery** between attempts (`recover_port` clears
+PxSERR/PxIS and restarts the command engine if it halted). A transient command error is
+recovered transparently + logged; a persistent one is reported loudly (§3.12) and returns an
+error. The `io-error-test` build feature injects forced failures to exercise this path (QEMU
+never fails a real disk read); off in production.
+
 ## Why AHCI (not ATA PIO, not virtio-blk)
 
 The T630's SSD is **AHCI-only** — no legacy/IDE mode — so AHCI is the production path.
