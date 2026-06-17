@@ -16,16 +16,23 @@ now restartable — the kernel notifies the supervisor of its death, which respa
 - `block-driver`: all I/O goes through block-driver IPC.
 - `registry`: registers its endpoint so supervisor and other services can find it.
 
-## On-disk format: GSFS, hierarchical (magic `GSFS0005`)
+## On-disk format: GSFS, hierarchical (magic `GSFS0006`)
 
-The format is **GSFS0005** (`docs/persistence.md` §6.4 + §6.6 + §6.10). Three on-disk
+The format is **GSFS0006** (`docs/persistence.md` §6.4 + §6.6 + §6.10 + §6.11). Three on-disk
 structures and no more — a **superblock**, a **free bitmap** (1 bit/block, the only global
 structure), and a **directory tree** of self-describing 64-byte `file_record`s (no inode
 table, no inode number, no global file cap; the tree *is* the index, the bitmap is the
 allocation map, reclamation is intrinsic). 512-byte blocks (= one AHCI sector = one block-IPC
 request), all capacity fields **u64** (~8 ZiB ceiling).
 
-**Every block self-verifies with a CRC32** (GSFS0005):
+**Backup superblock (GSFS0006):** a second superblock copy lives at the **last block**
+(`total_blocks-1`, reserved in the bitmap). `mount` validates the primary (LBA 0); if its
+magic/CRC fails it falls back to the backup (located via the device capacity, so it works
+even when the primary is unreadable) and heals the primary. Both copies are written together
+by `format`, kept in sync by `persist_super` (staged in the same transaction), and both wiped
+by `drives reset`.
+
+**Every block self-verifies with a CRC32** (GSFS0006):
 
 - **Superblock** (LBA 0): magic, version (5), `block_size`, `total_blocks:u64`,
   `bitmap_start/blocks:u64`, `data_start:u64`, `root_first_block/block_count:u64`,
