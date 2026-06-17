@@ -14,5 +14,11 @@ path = "src/main.rs"
 # `osdev test blockdev`/`blockdev-reboot`; absent from `osdev image`.
 selftest = []
 
+# Crash-consistency proof. Runs `journal_crash_test` at mount: writes a file through a
+# transaction that halts right after the commit record is durable (simulated power loss),
+# so the next boot must recover it from the journal. TEST BUILDS ONLY (it writes to the
+# disk and deliberately hangs the service). Enabled by `osdev test fs-journal`.
+journal-crash-test = []
+
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }
