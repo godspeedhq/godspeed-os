@@ -69,6 +69,7 @@ hard links. Bad magic **or** bad CRC is a loud mount refusal, never an auto-refo
 | `WriteNew`  | 24 | path, total:u64   | `Ok` / `Err` — create/truncate sized for a large file |
 | `WriteAt`   | 25 | path, offset:u64, chunk | `Ok` / `Err` — write a chunk (block-aligned offset) |
 | `ReadAt`    | 26 | path, offset:u64, len:u32 | `Ok`, n:u32, bytes / `NotFound` |
+| `Check`     | 27 | —                 | fsck: `Ok`, files/dirs/bad:u32, used/free:u64 — rebuild bitmap+free from the tree, verify CRCs |
 
 **Large files (streaming).** `WriteFile`/`ReadFile` carry a whole *small* file in one ≤4 KiB
 IPC message. Files larger than one message use the offset-addressed ops: `WriteNew` allocates

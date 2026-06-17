@@ -1069,6 +1069,7 @@ fn cmd_test(suite: &str) {
         "fs-large"     => run_fs_large_test(),
         "fs-journal"   => run_fs_journal_test(),
         "fs-restart"   => run_fs_restart_test(),
+        "fs-check"     => run_fs_check_test(),
         "drives-raw"   => run_drives_raw_test(),
         "drives"       => run_drives_scripted_test(),
         "files"        => run_files_test(),
@@ -1809,6 +1810,46 @@ fn run_fs_restart_test() {
     let persist = "build/tests/persist_fs_restart.img";
     std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create raw disk");
     crate::shell_test::run_fs_restart(&image_path, persist, 4);
+}
+
+/// Phase G: `drives check` (fsck) repairs a drifted free count. Bake a GSFS0006 disk with a
+/// file, deliberately corrupt the superblock's free count (both copies, CRC re-stamped so it
+/// still mounts), boot, and assert `drives check` rebuilds the correct free count from the tree
+/// and the file survives.
+fn run_fs_check_test() {
+    println!("\n=== fs: drives check (fsck) — rebuild a drifted free count from the tree (Phase G) ===");
+    cmd_build_bare_metal();
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+
+    // Pre-format the disk with a couple of files (host-side), then read the CORRECT free count.
+    let persist = "build/tests/persist_fs_check.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    gsfs_add_file(persist, "alpha.txt", b"alpha-payload");
+    gsfs_add_file(persist, "beta.txt", b"beta-payload");
+    let mut data = std::fs::read(persist).unwrap();
+    let correct_free = u64::from_le_bytes(data[64..72].try_into().unwrap());
+    let total = u64::from_le_bytes(data[16..24].try_into().unwrap());
+
+    // Drift the free count to a bogus value in BOTH superblock copies, re-stamping each CRC so
+    // the filesystem still mounts (the lie is internally consistent until fsck recomputes it).
+    let bogus = correct_free.wrapping_add(123_456);
+    let stamp = |d: &mut [u8], off: usize| {
+        d[off + 64..off + 72].copy_from_slice(&bogus.to_le_bytes());
+        let crc = crc32::crc32(&d[off..off + 124]);
+        d[off + 124..off + 128].copy_from_slice(&crc.to_le_bytes());
+    };
+    stamp(&mut data, 0);                                   // primary @ LBA 0
+    stamp(&mut data, ((total - 1) as usize) * 512);        // backup @ last LBA
+    std::fs::write(persist, &data).unwrap();
+    println!("fs-check: drifted free count {} -> {} (both copies), correct value is {}", bogus, bogus, correct_free);
+
+    crate::shell_test::run_fs_check(&image_path, persist, correct_free, 4);
 }
 
 /// Build bare-metal image and run the scripted shell smoke-test.

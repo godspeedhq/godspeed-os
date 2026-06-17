@@ -199,6 +199,9 @@ read /sc/data.json | from json | select name n | to yaml | assert contains name
 read /sc/data.json | from json | sort n | assert contains x
 read /sc/data.json | from json | sort reverse n | assert contains z
 
+# ===== fsck: drives check rebuilds bitmap/free from the populated tree, finds no corruption =====
+assert ok drives check
+
 # ===== cleanup: proves delete + delete recursive =====
 delete /sc/a.txt
 assert fails read /sc/a.txt

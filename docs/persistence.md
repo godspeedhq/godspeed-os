@@ -629,14 +629,21 @@ byte in its data block, boot: `fs` logs a "data block CRC mismatch" and the read
   `osdev test fs-corrupt` (now 14 checks): corrupt the primary → recovers from backup; corrupt
   both → loud refusal. No regression (files 130/0, fs-journal 11/0, fs-restart 7/0, drives 9/0,
   script 2/2, blockdev-reboot).
-- **Phase G — `drives check` (fsck / repair).** Today a CRC failure is *detected loudly* but not
-  *recoverable*, and a drifted bitmap/free-count has no repair. Because **the directory tree is
-  the source of truth**, an fsck falls out: walk the tree, **rebuild the free bitmap + free count
-  from it**, report/quarantine any file whose blocks fail their CRC, and refresh the backup
-  superblock. Turns "detected, dead" into "detected, repaired." A new `drives check` shell
-  command; no on-disk format change. **This subsumes a dedicated bitmap-block CRC** — if the
-  bitmap is rebuildable from the tree, checksumming it is redundant (so §6.10's deferred
-  bitmap-CRC is folded into fsck, not built separately).
+- **Phase G — `drives check` (fsck / repair). ✅ Built + verified 2026-06-17.** A CRC failure is
+  *detected loudly* but was not *recoverable*, and a drifted bitmap/free-count had no repair.
+  Because **the directory tree is the source of truth**, fsck falls out: zero the bitmap, mark
+  the system blocks + backup, then walk the tree marking every referenced extent — **rebuilding
+  the free bitmap + free count from the tree** (healing drift) — verifying every block's CRC and
+  **reporting** (not deleting) files/dirs that fail, and refreshing both superblock copies via
+  `persist_super`. Turns "detected, dead" into "detected, repaired." A new `drives check` shell
+  command (op `OP_CHECK`); no on-disk format change. Writes are DIRECT (not journaled): the
+  rewrite is larger than one transaction and idempotent, so a crash mid-check is harmless (the
+  tree is still truth; re-running converges). **This subsumes a dedicated bitmap-block CRC** — if
+  the bitmap is rebuildable from the tree, checksumming it is redundant (§6.10's deferred
+  bitmap-CRC is folded into fsck, not built separately). Verified by `osdev test fs-check` (5/0):
+  drift the free count host-side (both copies, CRC re-stamped), boot, `drives check` rebuilds the
+  correct value, 0 bad, the file survives. `selfcheck.gsh` also runs `assert ok drives check` on
+  a populated tree (in the script test). No regression (files 130/0).
 - **Phase H — block I/O error handling.** A failed block read/write currently just fails the op.
   Add a bounded **retry**, then a loud report (§3.12), to harden against a failing/slow SSD. No
   format change.

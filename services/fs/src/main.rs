@@ -110,6 +110,8 @@ const OP_RESET: u8 = 23;
 const OP_WRITE_NEW: u8 = 24; // [op, plen, path, total:u64] — create/truncate `path` sized `total`
 const OP_WRITE_AT: u8 = 25;  // [op, plen, path, offset:u64, chunk…] — write chunk at byte offset
 const OP_READ_AT: u8 = 26;   // [op, plen, path, offset:u64, len:u32] → [FS_OK, n:u32, bytes]
+const OP_CHECK: u8 = 27;     // fsck: rebuild bitmap+free from the tree, report CRC failures →
+                             // [FS_OK, files:u32, dirs:u32, bad:u32, used:u64, free:u64]
 const FS_OK: u8 = 0;
 const FS_ERR: u8 = 1;
 const FS_NOTFOUND: u8 = 2;
@@ -394,6 +396,26 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
                 let z = [0u8; BLOCK];
                 let ok = block_write(ctx, 0, &z) && block_write(ctx, capacity - 1, &z);
                 if ok { *vol = None; send(&[FS_OK]); } else { send(&[FS_ERR]); }
+            }
+            return;
+        }
+        OP_CHECK => {
+            // fsck: self-managed (not one transaction — rewrites the whole bitmap; idempotent).
+            match vol {
+                Some(f) => match f.check(ctx) {
+                    Ok((files, dirs, bad, used)) => {
+                        let mut out = [0u8; 29];
+                        out[0] = FS_OK;
+                        out[1..5].copy_from_slice(&files.to_le_bytes());
+                        out[5..9].copy_from_slice(&dirs.to_le_bytes());
+                        out[9..13].copy_from_slice(&bad.to_le_bytes());
+                        out[13..21].copy_from_slice(&used.to_le_bytes());
+                        out[21..29].copy_from_slice(&f.free_blocks.to_le_bytes());
+                        send(&out);
+                    }
+                    Err(_) => send(&[FS_ERR]),
+                },
+                None => send(&[FS_NOFS]),
             }
             return;
         }
@@ -1281,6 +1303,77 @@ impl Fs {
         }
         // Each extent freed in its own bounded transaction (the subtree is already unlinked).
         self.free_run_txn(ctx, first, count)
+    }
+
+    // ── fsck / `drives check` (Phase G) ───────────────────────────────────────
+    // Recover after detection. The directory tree is the source of truth: rebuild the free
+    // bitmap and free count from it (fixing any drift), and verify every block's CRC, reporting
+    // (not deleting) files/dirs that fail. Writes are DIRECT (not journaled) — the operation is
+    // far larger than one transaction and is idempotent (re-running converges), so a crash
+    // mid-check is harmless: the tree is still truth and a re-run finishes the job.
+
+    /// Walk the filesystem from root, rebuild the bitmap + free count, verify CRCs. Returns
+    /// `(files, dirs, bad, used)`.
+    fn check(&mut self, ctx: &ServiceContext) -> Result<(u32, u32, u32, u64), &'static str> {
+        // Start from an all-free bitmap (fast batched zero), then mark what is actually used.
+        // The bitmap region is [bitmap_start, journal_start).
+        let bitmap_blocks = self.journal_start - self.bitmap_start;
+        if !block_write_zeros(ctx, self.bitmap_start, bitmap_blocks) { return Err("bitmap zero failed"); }
+        // System blocks [0, data_start): superblock + bitmap + journal. Plus the backup block.
+        self.bm_set_range(ctx, 0, self.data_start, true)?;
+        self.bm_set_range(ctx, self.total_blocks - 1, 1, true)?;
+        let mut st = (0u32, 0u32, 0u32, self.data_start + 1); // (files, dirs, bad, used)
+        let root = self.root_entry();
+        self.check_subtree(ctx, root.itype, root.first_block, root.block_count, 0, &mut st)?;
+        // Recompute the free count from what the tree actually uses, and persist BOTH superblock
+        // copies (heals a drifted free count + refreshes the backup).
+        self.free_blocks = self.total_blocks - st.3;
+        self.persist_super(ctx)?;
+        Ok((st.0, st.1, st.2, st.3))
+    }
+
+    /// Mark a node's extent used, recurse into directories, verify file/dir CRCs. `st` is
+    /// `(files, dirs, bad, used)`. Bounded like `free_subtree` (depth cap + small frames).
+    fn check_subtree(&mut self, ctx: &ServiceContext, itype: u8, first: u64, count: u64,
+                     depth: u32, st: &mut (u32, u32, u32, u64)) -> Result<(), &'static str> {
+        if depth > MAX_TREE_DEPTH { return Err("tree too deep"); }
+        self.bm_set_range(ctx, first, count, true)?; // the extent is referenced → mark it used
+        st.3 += count;
+        if itype == ITYPE_DIR {
+            st.1 += 1;
+            for bi in 0..count {
+                let (kids, nk) = {
+                    match self.td_read(ctx, first + bi) {
+                        Some(blk) => {
+                            let mut kids = [(0u8, 0u64, 0u64); RECS_PER_BLOCK];
+                            let mut nk = 0usize;
+                            for slot in 0..RECS_PER_BLOCK {
+                                let o = slot * REC_SIZE;
+                                if blk[o] == ITYPE_FREE { continue; }
+                                kids[nk] = (blk[o], u64_at(&blk, o + 48), u64_at(&blk, o + 56));
+                                nk += 1;
+                            }
+                            (kids, nk)
+                        }
+                        None => { st.2 += 1; continue; } // corrupt dir block — already logged loudly
+                    }
+                };
+                for k in 0..nk {
+                    let (kt, kf, kc) = kids[k];
+                    self.check_subtree(ctx, kt, kf, kc, depth + 1, st)?;
+                }
+            }
+        } else {
+            st.0 += 1;
+            // Verify each data block's CRC (data_read logs a mismatch loudly). Blocks stay
+            // marked used regardless — the entry references them; freeing would risk reuse.
+            let mut ok = true;
+            for bi in 0..count {
+                if data_read(ctx, first + bi).is_none() { ok = false; }
+            }
+            if !ok { st.2 += 1; }
+        }
+        Ok(())
     }
 
     /// Move (relink) an entry: same data, new directory/name. Same-directory move is a
