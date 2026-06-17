@@ -188,6 +188,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         journal_crash_test(&ctx, f);
     }
 
+    // Register our name so clients can (re)acquire a cap to us via the registry — the path
+    // that lets the shell recover after an `fs` restart (Phase D, §14.3).
+    let _ = ctx.register("fs");
+
     ctx.log("fs: serving file API");
     loop {
         let msg = ctx.recv();
@@ -1268,9 +1272,23 @@ fn u64_at(b: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(a)
 }
 
+/// One block-driver RPC with restart recovery: if the reply is missing (block-driver may have
+/// restarted, leaving our cached cap EndpointDead), reacquire a fresh cap via the registry and
+/// retry once (Phase D, §14.3). All block I/O goes through here.
+fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
+    let msg = Message::from_bytes(req);
+    if let Some(r) = ctx.request_with_reply("block-driver", &msg) {
+        return Some(r);
+    }
+    if ctx.reacquire_via_registry("block-driver") {
+        return ctx.request_with_reply("block-driver", &msg);
+    }
+    None
+}
+
 /// Ask `block-driver` for the disk's sector count (OP_CAPACITY → [BLK_OK, sectors:u64]).
 fn block_capacity(ctx: &ServiceContext) -> Option<u64> {
-    let reply = ctx.request_with_reply("block-driver", &Message::from_bytes(&[OP_CAPACITY]))?;
+    let reply = block_rpc(ctx, &[OP_CAPACITY])?;
     let p = reply.payload_bytes();
     if p.first() == Some(&BLK_OK) && p.len() >= 9 { Some(u64_at(p, 1)) } else { None }
 }
@@ -1280,7 +1298,7 @@ fn block_read(ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
     let mut req = [0u8; 9];
     req[0] = OP_READ_BLOCK;
     req[1..9].copy_from_slice(&lba.to_le_bytes());
-    let reply = ctx.request_with_reply("block-driver", &Message::from_bytes(&req))?;
+    let reply = block_rpc(ctx, &req)?;
     let p = reply.payload_bytes();
     if p.first() == Some(&BLK_OK) && p.len() >= 1 + BLOCK {
         let mut out = [0u8; BLOCK];
@@ -1298,7 +1316,7 @@ fn block_write_zeros(ctx: &ServiceContext, lba: u64, count: u64) -> bool {
     req[0] = OP_WRITE_ZEROS;
     req[1..9].copy_from_slice(&lba.to_le_bytes());
     req[9..17].copy_from_slice(&count.to_le_bytes());
-    match ctx.request_with_reply("block-driver", &Message::from_bytes(&req)) {
+    match block_rpc(ctx, &req) {
         Some(reply) => reply.payload_bytes().first() == Some(&BLK_OK),
         None => false,
     }
@@ -1319,7 +1337,7 @@ fn block_write(ctx: &ServiceContext, lba: u64, data: &[u8; BLOCK]) -> bool {
     req[0] = OP_WRITE_BLOCK;
     req[1..9].copy_from_slice(&lba.to_le_bytes());
     req[9..].copy_from_slice(data);
-    match ctx.request_with_reply("block-driver", &Message::from_bytes(&req)) {
+    match block_rpc(ctx, &req) {
         Some(reply) => reply.payload_bytes().first() == Some(&BLK_OK),
         None => false,
     }

@@ -428,7 +428,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         "block-driver" => Some(("block-driver", ServiceConfig {
             elf:               include_bytes!(env!("SVC_BLOCK_DRIVER_ELF")),
             has_recv_endpoint: true, // serves block read/write requests from fs (§4)
-            send_peers:        &[],  // replies via the per-request reply cap fs embeds
+            send_peers:        &["registry"], // registers its name so fs can reacquire on restart (Phase D)
             send_peers_grant:  false,
             preferred_core:    1,
             probe_mode:        0,
@@ -443,7 +443,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         "fs" => Some(("fs", ServiceConfig {
             elf:               include_bytes!(env!("SVC_FS_ELF")),
             has_recv_endpoint: true, // owns an endpoint (reply target + future fs API)
-            send_peers:        &["block-driver"],
+            send_peers:        &["block-driver", "registry"], // registry: register "fs" so clients reacquire on restart (Phase D)
             send_peers_grant:  false,
             preferred_core:    1,
             probe_mode:        0,

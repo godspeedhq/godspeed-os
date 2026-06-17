@@ -1,10 +1,15 @@
 # services/fs/
 
-Filesystem service. TCB member in v1 (§6.1). **Non-restartable in v1.**
+Filesystem service. **Restartable, NOT a TCB member** (Phase D amendment, §6.1, 2026-06-17).
 
-## Why it's in the TCB (v1)
+## Restartable (it once was trusted root)
 
-fs owns persistent state for the system (§15). It cannot persist its own metadata to itself; the block driver holds a direct hardware capability for metadata storage. v2 goal: transactional metadata recovery so fs becomes restartable (§6.3).
+fs owns persistent state (§15) and for v1 was trusted because it could not recover from a crash
+mid-write. The crash-consistency journal (Phase C, `docs/persistence.md` §6.8) closes that: every
+metadata mutation commits atomically and fs **recovers to a consistent state on mount**. So fs is
+now restartable — the kernel notifies the supervisor of its death, which respawns it; fs re-mounts
+(recovering via the journal), re-registers with the registry, and clients reacquire it and retry
+(§14.3). Only its *boot-time* spawn must succeed (§11.3). Pinned by §22 Test 13.
 
 ## Dependencies
 

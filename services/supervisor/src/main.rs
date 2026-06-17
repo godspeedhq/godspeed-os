@@ -136,12 +136,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     ctx.log("supervisor: ready");
 
-    // Death-notification restart loop (H11 ph6). The kernel enqueues the name of a
-    // dead restartable service to our endpoint; we respawn it. `recv` BLOCKS, so the
-    // core still reaches the idle/halt path and runs cool between deaths (no polling).
-    // In v1 the only restartable service routed here is `registry` (the trusted-root
-    // services init/supervisor remain non-restartable — their death is a kernel
-    // panic). Other restart/kill commands still arrive via the COM2 control channel
+    // Death-notification restart loop (H11 ph6; extended for fs + block-driver in Phase D).
+    // The kernel enqueues the name of a dead restartable service to our endpoint; we respawn
+    // it. `recv` BLOCKS, so the core still reaches the idle/halt path and runs cool between
+    // deaths (no polling). Restartable services routed here: `registry`, `block-driver`, `fs`
+    // (the trusted-root services init/supervisor remain non-restartable — their death is a
+    // kernel panic). Other restart/kill commands still arrive via the COM2 control channel
     // (control::process_pending in the timer ISR).
     //
     // If this build gave us no endpoint (minimal test manifests), fall back to park.
@@ -151,13 +151,27 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     loop {
         let msg = ctx.recv();
         let name = core::str::from_utf8(msg.payload_bytes()).unwrap_or("");
-        if name == "registry" {
-            ctx.log("supervisor: registry died, restarting");
-            if ctx.spawn("registry").is_ok() {
-                ctx.log("supervisor: registry restarted");
-            } else {
-                ctx.log("supervisor: registry restart FAILED");
+        // Restartable services (§6.1 as amended): registry (H11), and fs + block-driver
+        // (Phase D). Respawn by name; the kernel re-wires send-peer caps from the name
+        // table at spawn, and the service re-registers + re-mounts itself. Clients see
+        // EndpointDead and reacquire via the registry (§14.3).
+        match name {
+            "registry" => {
+                ctx.log("supervisor: registry died, restarting");
+                if ctx.spawn("registry").is_ok() { ctx.log("supervisor: registry restarted"); }
+                else { ctx.log("supervisor: registry restart FAILED"); }
             }
+            "block-driver" => {
+                ctx.log("supervisor: block-driver died, restarting");
+                if ctx.spawn("block-driver").is_ok() { ctx.log("supervisor: block-driver restarted"); }
+                else { ctx.log("supervisor: block-driver restart FAILED"); }
+            }
+            "fs" => {
+                ctx.log("supervisor: fs died, restarting");
+                if ctx.spawn("fs").is_ok() { ctx.log("supervisor: fs restarted"); }
+                else { ctx.log("supervisor: fs restart FAILED"); }
+            }
+            _ => {}
         }
     }
 }

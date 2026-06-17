@@ -1432,6 +1432,127 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     }
 }
 
+/// §22 Test 13 — **fs survives its own restart** (Phase D). Drive the shell on COM1 to write a
+/// file, KILL `fs` over the COM2 control channel, then read the file back: the supervisor
+/// respawns `fs`, `fs` re-mounts (the data persisted on disk), and the shell reacquires a fresh
+/// `fs` cap via the registry (§14.3) — the file reads back, the kernel never panics. This is
+/// the executable proof of the §6 amendment that made `fs`/`block-driver` restartable.
+pub fn run_fs_restart(image_path: &Path, persist_path: &str, smp: u32) {
+    println!("fs-restart: booting (smp={smp}) bare-metal + AHCI disk; shell on COM1, control on COM2");
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let persist   = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let persist_str = persist.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+    let ctrl_port  = pick_free_port();
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(),
+        "-m",       "512M",
+        "-serial",  &format!("tcp::{shell_port},server"),         // COM1: shell I/O + logs (QEMU waits for us)
+        "-serial",  &format!("tcp::{ctrl_port},server,nowait"),   // COM2: control channel — nowait (we connect later)
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ])
+    .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("fs-restart: QEMU launch failed at {qemu}: {e}"); std::process::exit(1); });
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => { eprintln!("fs-restart: could not connect to shell serial {shell_port}"); child.kill().ok(); std::process::exit(1); }
+    };
+    let mut read_half  = stream.try_clone().expect("clone tcp stream");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop {
+                match read_half.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]),
+                }
+            }
+        });
+    }
+
+    let mut pass = 0usize;
+    let mut fail = 0usize;
+    let mut cursor = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-restart: PASS — {}", $label); pass += 1; }
+        else   { println!("fs-restart: FAIL — {}", $label); fail += 1; }
+    }; }
+    macro_rules! run { ($c:expr, $secs:expr) => {{
+        send(&mut write_half, $c);
+        collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs))
+    }}; }
+
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).is_none() {
+        println!("fs-restart: FAIL — timed out waiting for first gsh>");
+        child.kill().ok(); child.wait().ok(); std::process::exit(1);
+    }
+
+    // Flash the disk, then write a file and read it back (pre-restart baseline).
+    send(&mut write_half, b"drives flash data\r");
+    if collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(10)).is_some() {
+        send(&mut write_half, b"y\r");
+        match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)) {
+            Some(r) => check!(r.contains("formatted as GSFS"), "setup: flashed GSFS"),
+            None    => { println!("fs-restart: FAIL — flash timeout"); fail += 1; }
+        }
+    } else { println!("fs-restart: FAIL — no flash confirm"); fail += 1; }
+    match run!(b"write /t.txt survives-restart\r", 10) {
+        Some(r) => check!(r.contains("wrote /t.txt"), "wrote /t.txt before restart"),
+        None    => { println!("fs-restart: FAIL — write timeout"); fail += 1; }
+    }
+    match run!(b"read /t.txt\r", 10) {
+        Some(r) => check!(r.contains("survives-restart"), "read /t.txt before restart"),
+        None    => { println!("fs-restart: FAIL — read timeout"); fail += 1; }
+    }
+
+    // KILL fs over the COM2 control channel (kernel-side, no service_control cap needed).
+    println!("fs-restart: sending 'KILL fs' over the control channel …");
+    match retry_tcp_connect(ctrl_port, Duration::from_secs(10)) {
+        Some(mut ctrl) => { thread::sleep(Duration::from_millis(100)); send(&mut ctrl, b"\nKILL fs\n");
+            // The supervisor observes the death and respawns fs; wait for it to come back up.
+            let restarted = collect_until(&buf, &mut cursor, b"supervisor: fs restarted", Duration::from_secs(20));
+            check!(restarted.is_some(), "supervisor observed fs death and restarted it");
+            // Wait until the fresh fs is serving again (it has re-mounted + re-registered).
+            let serving = collect_until(&buf, &mut cursor, b"fs: serving file API", Duration::from_secs(20));
+            check!(serving.is_some(), "restarted fs re-mounted and is serving");
+            drop(ctrl);
+        }
+        None => { println!("fs-restart: FAIL — could not connect to control port"); fail += 1; }
+    }
+
+    // Read the file back: the shell must reacquire a fresh fs cap via the registry, and the
+    // file must still be there (persisted on disk, recovered on remount). The headline check.
+    // Retry a couple of times — reacquire returns None until fs has finished re-registering.
+    let mut got = false;
+    for _ in 0..4 {
+        if let Some(r) = run!(b"read /t.txt\r", 10) {
+            if r.contains("survives-restart") { got = true; break; }
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    check!(got, "read /t.txt AFTER restart (shell reacquired fs, file persisted)");
+
+    // No panic anywhere in the whole session.
+    let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    check!(!whole.contains("KERNEL PANIC"), "kernel never panicked across the restart");
+
+    child.kill().ok();
+    child.wait().ok();
+    println!("\nfs-restart: {pass} passed, {fail} failed");
+    if fail > 0 { std::process::exit(1); }
+}
+
 /// Boot bare-metal with a GSFS disk that has a self-checking `.gsh` baked in (host-side), then
 /// `run /<script_name>` — proving the flash-and-run loop and piped asserts in a script.
 pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u32) {

@@ -544,6 +544,36 @@ ignored — the fs mounts clean and serves normally, no spurious replay. All fiv
 suites (files, blockdev-reboot, fs-large, fs-corrupt, script) stay green with the journal
 active on every mutation.
 
+### 6.9 Restartable — `fs` + `block-driver` leave the TCB (Phase D)
+
+> **Built 2026-06-17, with a `CLAUDE.md` §6 amendment (signed off).** The §6.3 / §9 goal: with
+> crash-consistent recovery in hand (§6.8), `fs` and `block-driver` no longer need to be
+> trusted root — their death becomes a **supervisor restart, not a panic+reboot**. The
+> non-restartable set shrinks to just `init` + `supervisor` + kernel.
+
+**Mechanism (mirrors the H11 registry path).**
+- The kernel's death path notifies the supervisor for `registry`, `fs`, and `block-driver`
+  (sending the dead service's name); `assert_tcb_alive` guards only `init`/`supervisor`, so
+  killing `fs`/`block-driver` never panics.
+- The supervisor's death-notification loop respawns the named service. `block-driver` respawns
+  before `fs` (fs's send-peer cap to it wires from the kernel name table at spawn).
+- `fs` and `block-driver` **register** their names with the registry at startup, so clients can
+  reacquire a fresh cap after a restart.
+- On restart, `fs` re-mounts — replaying the journal if the crash interrupted a commit (§6.8) —
+  so it always comes back consistent. The persisted data is intact.
+- Clients reacquire + retry on `EndpointDead` (§14.3): the shell's `fs_request` reacquires `fs`,
+  and `fs`'s block I/O (`block_rpc`) reacquires `block-driver`. One retry covers the common
+  case; the next command covers the window before the service has re-registered.
+
+**Verified:** `osdev test fs-restart` (§22 Test 13, 7 checks) — the shell writes a file, `KILL
+fs` over the control channel, the supervisor respawns `fs`, `fs` re-mounts + re-registers, and
+the shell reacquires `fs` and reads the file back; the kernel never panics. The journal suite
+and all file suites stay green.
+
+This completes the four-part filesystem robustness program (A integrity, B large files, C
+crash-consistency, D restartable). The earlier "Phase 1/Phase 3 TCB trajectory" framing in §9
+is now realized.
+
 ## 7. File = capability (the north star)
 
 The spine that makes this filesystem *ours* rather than a generic store: a file is named

@@ -1047,6 +1047,7 @@ fn cmd_test(suite: &str) {
         "fs-corrupt"   => run_fs_corruption_test(),
         "fs-large"     => run_fs_large_test(),
         "fs-journal"   => run_fs_journal_test(),
+        "fs-restart"   => run_fs_restart_test(),
         "drives-raw"   => run_drives_raw_test(),
         "drives"       => run_drives_scripted_test(),
         "files"        => run_files_test(),
@@ -1722,6 +1723,23 @@ fn run_script_test() {
     gsfs_add_file(disk, name, &suite);
 
     crate::shell_test::run_script(&image_path, disk, name, 4);
+}
+
+/// §22 Test 13 (Phase D): fs survives its own restart. Bare-metal shell + AHCI disk; the
+/// harness writes a file, KILLs fs over the control channel, and reads it back after the
+/// supervisor respawns fs and the shell reacquires it via the registry.
+fn run_fs_restart_test() {
+    println!("\n=== fs: restartable — survives its own restart (Phase D, §22 Test 13) ===");
+    cmd_build_bare_metal();
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_fs_restart.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create raw disk");
+    crate::shell_test::run_fs_restart(&image_path, persist, 4);
 }
 
 /// Build bare-metal image and run the scripted shell smoke-test.
