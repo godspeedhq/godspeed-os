@@ -2,25 +2,29 @@
 
 All userspace services. Each service is a separate Rust crate that links against `sdk/rust`.
 
-## TCB members (§6.1) — non-restartable in v1
+## TCB members (§6.1) — non-restartable
 
 | Service         | Why non-restartable |
 |-----------------|---------------------|
 | `init/`         | Spawns supervisor; first userspace authority |
 | `supervisor/`   | Holds restart authority; its own death = system reboot |
-| `registry/`     | Without it, caps cannot be reacquired post-restart |
-| `block-driver/` | FS depends on it; restart loses disk state |
-| `fs/`           | Owns persistent state for the system |
 
-Failure of any TCB service causes a kernel panic and system reboot (§6.2). No silent recovery.
+Failure of `init` or `supervisor` causes a kernel panic and system reboot (§6.2). No silent
+recovery. These two are the only non-restartable services — the §6.3 TCB-shrink goal is met.
 
 ## Restartable services
 
 | Service      | Notes |
 |--------------|-------|
+| `registry/`  | Restartable name service (H11); supervisor respawns on death, clients reacquire (§14.3) |
+| `block-driver/` | Restartable (Phase D); holds no persistent state; re-inits the controller on respawn |
+| `fs/`        | Restartable (Phase D); re-mounts to a consistent state via its crash-consistency journal (§6.8) |
 | `logger/`    | Stateless; ring buffer preserves recent output across restarts |
 | `ping/`      | Stateless; canonical client restart pattern (§14.2) |
 | `pong/`      | Stateless; spawned first by supervisor (before probe services) |
+
+The kernel notifies the supervisor of any restartable service's death; the supervisor respawns
+it. `block-driver` must respawn before `fs` (fs's send-peer cap to it wires at spawn).
 
 ## Supervisor spawn order
 

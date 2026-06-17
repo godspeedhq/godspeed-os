@@ -410,6 +410,10 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
         Err(e) => ctx.log_fmt(format_args!("block-driver: AHCI read self-test FAILED: {}", e)),
     }
 
+    // Register our name so `fs` can (re)acquire a cap to us via the registry after a
+    // block-driver restart (Phase D, §14.3).
+    let _ = ctx.register("block-driver");
+
     // Serve block read/write requests from `fs` over IPC (READ/WRITE DMA EXT).
     ctx.log("block-driver: AHCI serving block I/O");
     loop {

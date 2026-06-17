@@ -265,8 +265,6 @@ os/
 | `kernel/smp`      | Concurrent-correctness primitives                   |
 | `init` service    | Spawns supervisor; first userspace authority        |
 | `supervisor`      | Holds restart authority over all other services     |
-| `block-driver`    | (v1 only) FS depends on it; restart loses disk state |
-| `fs`              | (v1 only) Owns persistent state for the system      |
 | `xhci`, `ehci` (DMA drivers) | **Machine-dependent (H1, §6.4):** in the TCB only on a machine with no IOMMU to confine them (DMA-anywhere = kernel-equivalent reach); **dropped** from it — least-privilege and restartable — wherever an IOMMU confines them to their arena. The case is reported loudly at boot (invariant 12). |
 
 > **Amendment 2026-06-12 (H1): DMA-capable drivers are no longer an unconditional TCB
@@ -279,6 +277,21 @@ os/
 > binary, different posture, with the difference printed at boot. §6.4 is the full
 > treatment; §22 Test 12 pins the confined case.
 
+> **Amendment 2026-06-17 (Phase D / FS robustness): `block-driver` and `fs` are no longer
+> TCB members.** They were a v1 simplification (§6.3): `fs` owned persistent state it could
+> not recover after a crash, so its death — and that of the `block-driver` it depends on —
+> was a panic+reboot. The filesystem robustness program closes that gap: `fs` now commits
+> every metadata mutation through a **crash-consistent redo-journal** and **recovers to a
+> consistent state on mount** (Phase C; `docs/persistence.md` §6.8). With recovery in hand,
+> both services are **restartable** like any other: the kernel notifies the supervisor of
+> their death, which respawns them; `fs` re-mounts (recovering via the journal) and
+> re-registers, `block-driver` re-initialises the controller, and clients reacquire via the
+> registry and retry (§14.3, §6.2). `block-driver` holds no persistent state and was already
+> operationally restartable. Their *boot-time* spawn must still succeed to bootstrap
+> persistence (§11.3); only their *runtime* death is now recovered, not fatal. Worked example
+> of invariant 11 and the §6.3 goal reached. §22 Test 13 pins it (`fs` survives its own
+> restart). The remaining non-restartable set is now just `init` + `supervisor` + kernel.
+
 > **Amendment 2026-06-09 (H11): `registry` is no longer a TCB member.** It became a
 > real userspace name service (register/lookup over IPC, holding only delegated caps
 > and deriving copies — `docs/registry.md`). It owns no kernel-critical state, so its
@@ -290,23 +303,30 @@ os/
 
 ### 6.2 Failure Semantics
 
-> **Failure of any TCB service (`init`, `supervisor`, `block-driver`, `fs`) results in kernel panic and immediate system reboot. No automatic recovery is attempted in v1.**
+> **Failure of any TCB service (`init`, `supervisor`) results in kernel panic and immediate system reboot. No automatic recovery is attempted.**
 
-> **`registry` is restartable (H11), not in this set.** Its runtime death is recovered
-> by the supervisor's death-notification restart loop (the kernel notifies the
-> supervisor, which respawns it); clients see a temporary `EndpointDead` / lookup miss
-> and retry (§14.3). Only its *boot-time* spawn failure is fatal (§11.3).
+> **`registry`, `block-driver`, and `fs` are restartable, not in this set.** Their runtime
+> death is recovered by the supervisor's death-notification restart loop (the kernel notifies
+> the supervisor, which respawns them); clients see a temporary `EndpointDead` / lookup miss,
+> reacquire via the registry, and retry (§14.3). `fs` re-mounts to a consistent state via its
+> crash-consistency journal (Phase C; `docs/persistence.md` §6.8). `registry` left the TCB via
+> H11; `block-driver` + `fs` via the Phase D amendment (§6.1). Only their *boot-time* spawn
+> failure is fatal (§11.3).
 
 > **Failure on any core that corrupts shared kernel state (capability table, routing table) results in kernel panic on all cores.**
 
 Silent recovery of TCB state risks undefined system state. Loud failure plus clean restart is the only safe v1 option.
 
-### 6.3 Reducing TCB Over Time
+### 6.3 Reducing TCB Over Time — **goal reached**
 
-The block-driver and FS being trusted is a v1 simplification. v2 goal: only `init`,
-`supervisor`, and the kernel remain non-restartable. **`registry` was dropped from the
-non-restartable set early, via H11** (it is now a restartable userspace name service);
-the remaining v2 work is block-driver / fs.
+The v2 goal was: only `init`, `supervisor`, and the kernel remain non-restartable. That goal
+is now **met**. `registry` was dropped early via H11 (a restartable userspace name service);
+`block-driver` and `fs` were dropped via the **Phase D amendment (§6.1, 2026-06-17)** once the
+filesystem gained crash-consistent recovery (the redo-journal, `docs/persistence.md` §6.8) —
+so an `fs` restart re-mounts to a consistent state rather than corrupting it. The
+non-restartable set is now just **`init` + `supervisor` + kernel** (plus DMA drivers only on a
+machine without an IOMMU, §6.4). Further shrinking would require making `init`/`supervisor`
+themselves recoverable — out of scope; they are the recovery authority.
 
 ### 6.4 DMA-Capable Drivers and the IOMMU (H1)
 
@@ -927,7 +947,7 @@ Kill is for misbehaving services and for restart. It is not a graceful shutdown 
 
 State belongs to services, not the kernel. Services that need to survive restart must persist externally and reconstruct on startup.
 
-The filesystem service is the externalization mechanism for everyone else and cannot persist *to itself*. Resolution: the block driver holds a direct hardware capability and stores fs metadata. In v1, both block-driver and fs are non-restartable. v2 will give fs transactional metadata recovery.
+The filesystem service is the externalization mechanism for everyone else and cannot persist *to itself*. Resolution: the block driver holds a direct hardware capability and stores fs metadata. `fs` gives itself **transactional metadata recovery** — every mutation commits through a crash-consistent redo-journal and `fs` recovers to a consistent state on mount (`docs/persistence.md` §6.8). With that, `block-driver` and `fs` are **restartable** and no longer in the TCB (§6.1 Phase D amendment, 2026-06-17); their death is a supervisor restart, not a reboot.
 
 Stateless services (logger in v1) restart trivially. Example application services (ping, pong) are also stateless and restart trivially — but they are demonstration services in `examples/`, not permanent architectural components.
 
@@ -1717,6 +1737,37 @@ test confined_driver_dma_faults:           # osdev test iommu
 
 ---
 
+### Test 13: Filesystem Survives Its Own Restart (Phase D)
+
+**Pins:** §6.1/§6.2 (`fs` + `block-driver` are restartable, not trusted root), §6.3 (TCB-shrink
+goal reached), §15 (transactional recovery), §14 (supervisor restart authority), §3.11.
+
+`fs` and `block-driver` are restartable userspace services (Phase D amendment 2026-06-17), made
+safe by `fs`'s crash-consistent recovery (Phase C). Killing `fs` must NOT panic the kernel; the
+supervisor must observe its death and respawn it; `fs` must re-mount to a consistent state
+(persisted data intact) and re-register; and a client must reacquire it via the registry and
+keep working.
+
+```
+test fs_survives_own_restart:                     # osdev test fs-restart
+    boot(bare-metal + AHCI disk; shell on COM1, control on COM2)
+    shell("drives flash data" → y)                # format
+    shell("write /t.txt survives-restart")
+    assert shell("read /t.txt") contains "survives-restart"
+
+    control.kill("fs")                            # was a panic+reboot pre-Phase-D
+
+    assert serial_contains("supervisor: fs died, restarting")
+    assert serial_contains("supervisor: fs restarted")
+    assert serial_contains("fs: serving file API")   # re-mounted + re-registered
+
+    # The shell reacquires a fresh fs cap via the registry (§14.3); the file persisted.
+    assert shell("read /t.txt") contains "survives-restart"
+    assert kernel_did_not_panic()
+```
+
+---
+
 ### 22.6 Test Coverage Matrix
 
 | Test                              | Spec sections pinned       | Constitutional invariant      |
@@ -1733,6 +1784,7 @@ test confined_driver_dma_faults:           # osdev test iommu
 | 10. Restart with core change      | §9.2, §14.2, §14.4, §11    | Identity over location        |
 | 11. Registry survives restart     | §6.1, §6.2, §14, §3.11     | Restartability / TCB shrink   |
 | 12. Confined driver DMA faults    | §3.1, §6.4, §12            | No ambient authority (DMA)    |
+| 13. fs survives own restart       | §6.1, §6.2, §6.3, §15, §14 | Restartability / TCB shrink   |
 
 If any cell becomes obsolete, the corresponding spec section is being changed and the change requires a CLAUDE.md amendment.
 
@@ -1835,8 +1887,8 @@ Filesystem persistence beyond the trusted block driver, network stack, work-stea
 - **PlacementInvalid** — Error returned when a contracted core is unavailable; spawn rejected, supervisor logs and skips.
 - **Quantum** — The 10 ms time slice after which the per-core scheduler preempts.
 - **Routing table** — Kernel structure mapping `EndpointId → (CoreId, Generation, Liveness)`.
-- **TCB** — Trusted Computing Base. Kernel + arch + smp + init + supervisor (+ block-driver, fs in v1). `registry` left the TCB via H11 (§6.1 amendment).
-- **Trusted root** — `init`, `supervisor`. Failure of either reboots the system. (`registry` was part of the trusted root pre-H11; it is now a restartable name service.)
+- **TCB** — Trusted Computing Base. Kernel + arch + smp + init + supervisor. `registry` left the TCB via H11; `block-driver` + `fs` left via the Phase D amendment (§6.1, once `fs` gained crash-consistent recovery). DMA drivers (`xhci`/`ehci`) are in the TCB only on a machine without an IOMMU (§6.4).
+- **Trusted root** — `init`, `supervisor`. Failure of either reboots the system; they are the only remaining non-restartable services. (`registry`, `block-driver`, `fs` are all restartable name/storage services now.)
 - **Registry** — Restartable userspace name service: maps stable names → current capabilities so services can find and re-find each other across restarts (H11; `docs/registry.md`).
 - **Service** — Userspace component with a contract, capability table, and isolated address space.
 - **Contract** — `service.toml` declaring resource, capability, and placement requirements.

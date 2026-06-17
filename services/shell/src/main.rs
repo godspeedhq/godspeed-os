@@ -2218,7 +2218,17 @@ fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<
     req[2..2 + pl].copy_from_slice(&path[..pl]);
     let dn = data.len().min(req.len() - 2 - pl);
     req[2 + pl..2 + pl + dn].copy_from_slice(&data[..dn]);
-    ctx.request_with_reply("fs", &Message::from_bytes(&req[..2 + pl + dn]))
+    let msg = Message::from_bytes(&req[..2 + pl + dn]);
+    if let Some(r) = ctx.request_with_reply("fs", &msg) {
+        return Some(r);
+    }
+    // No reply usually means `fs` restarted and our cached cap is now EndpointDead (Phase D,
+    // §14.3). Reacquire a fresh `fs` cap via the registry and retry once; if `fs` hasn't
+    // finished re-registering yet, this returns None and the next command retries.
+    if ctx.reacquire_via_registry("fs") {
+        return ctx.request_with_reply("fs", &msg);
+    }
+    None
 }
 
 /// Stat a path: `Some((size, is_dir))` if it exists, `None` otherwise. Used by the streaming
