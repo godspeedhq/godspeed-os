@@ -1072,6 +1072,7 @@ fn cmd_test(suite: &str) {
         "fs-large"     => run_fs_large_test(),
         "fs-frag"      => run_fs_frag_test(),
         "fs-journal"   => run_fs_journal_test(),
+        "fs-djournal"  => run_fs_djournal_test(),
         "fs-restart"   => run_fs_restart_test(),
         "fs-check"     => run_fs_check_test(),
         "fs-ioretry"   => run_fs_ioretry_test(),
@@ -1662,6 +1663,60 @@ fn run_fs_frag_test() {
         println!("  [FS.frag]  extent lists / fragmentation  … PASS\n\n  {} passed  0 failed", pass);
     } else {
         println!("  [FS.frag]  extent lists / fragmentation  … FAIL\n\n  {} passed  {} failed", pass, fail);
+        std::process::exit(1);
+    }
+}
+
+/// Data journaling (Phase J, opt-in per write). A `data-journal-test` build creates `/jdata.bin`
+/// (its data blocks left ZERO on disk), then issues ONE **journaled** `write_at` (`OP_WRITE_AT_J`)
+/// through a transaction that halts right after the commit record — so the chunk's data lives only
+/// in the journal, never written to its home LBAs. The next boot's mount must REPLAY it from the
+/// journal. Airtight: the home blocks were zero (a zero block fails the data CRC), so reading the
+/// file back correctly can only mean the journal supplied the data — proving the chunk was
+/// crash-atomic, not torn. Contrast with `fs-journal` (metadata replay; here it's the DATA).
+fn run_fs_djournal_test() {
+    println!("\n=== fs: data journaling (Phase J — journaled write_at survives a crash) ===");
+    build_blockdev_fs("data-journal-test", "");
+
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+
+    let _ = std::fs::create_dir_all("build/tests");
+    let disk = "build/tests/persist_fs_djournal.img";
+    std::fs::write(disk, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(disk);
+
+    let img = std::fs::canonicalize(&image_path).unwrap_or_else(|_| image_path.to_path_buf());
+    let img_str = img.to_string_lossy().replace('\\', "/");
+    let disk_abs = std::fs::canonicalize(disk).unwrap_or_else(|_| std::path::PathBuf::from(disk));
+    let disk_str = disk_abs.to_string_lossy().replace('\\', "/");
+
+    let mut pass = 0; let mut fail = 0;
+    let mut check = |ok: bool, label: &str| {
+        if ok { println!("  PASS … {}", label); pass += 1; } else { println!("  FAIL … {}", label); fail += 1; }
+    };
+
+    println!("fs: boot 1 — journaled write_at, halt after commit record (data only in journal), ~25s …");
+    let log1 = boot_ahci_qemu(&img_str, &disk_str, "build/tests/fs_djournal_1.log", 25);
+    check(log1.contains("halting before checkpoint"), "boot1: crashed right after the commit record");
+    check(!log1.contains("jdata write_new FAILED") && !log1.contains("did NOT crash"), "boot1: journaled write actually started + crashed");
+    check(!log1.contains("KERNEL PANIC"), "boot1: no kernel panic");
+
+    println!("fs: boot 2 — SAME disk, mount must replay the DATA from the journal, ~25s …");
+    let log2 = boot_ahci_qemu(&img_str, &disk_str, "build/tests/fs_djournal_2.log", 25);
+    check(log2.contains("journal recovered"), "boot2: mount replayed the committed transaction");
+    check(log2.contains("jdata RECOVERED+VERIFIED"), "boot2: recovered data is exactly correct (journal supplied it, not the zero home blocks)");
+    check(!log2.contains("DATA MISMATCH") && !log2.contains("data not recovered"), "boot2: no mismatch, data was recovered");
+    check(!log2.contains("KERNEL PANIC") && !log2.contains("CRC mismatch"), "boot2: no panic, no corruption");
+
+    println!();
+    if fail == 0 {
+        println!("  [FS.djournal]  opt-in data journaling: journaled write survives a crash  … PASS\n\n  {} passed  0 failed", pass);
+    } else {
+        println!("  [FS.djournal]  data journaling  … FAIL\n\n  {} passed  {} failed", pass, fail);
         std::process::exit(1);
     }
 }
