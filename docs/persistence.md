@@ -655,6 +655,17 @@ byte in its data block, boot: `fs` logs a "data block CRC mismatch" and the read
   fail (QEMU never fails a real disk), and the driver retries + recovers (the boot self-test read
   still succeeds; fs mounts + round-trips), no panic. The persistent-failure branch (report +
   Err after N attempts) is the same loop's exhaustion path. No regression (files 130/0, reboot).
+- **Phase I — Extent lists (GSFS0007). ✅ Built + verified 2026-06-17.** Files were a single
+  contiguous run, so a big file needed a big *contiguous* free span — fragmentation could refuse a
+  write the disk had room for. Now a file is contiguous (`ITYPE_FILE`, the fast path, byte-for-byte
+  unchanged) **or**, when no contiguous run is free, **fragmented** (`ITYPE_FILE_FRAG`): its
+  `first_block` points to a single CRC'd **extent block** (`block_count` = 1) that lists up to
+  `EXT_MAX = 31` scattered `(start, len)` data runs. So a file is stored across whatever free space
+  exists. Full §6.12. Reformat-only bump 0006→0007. Verified by `osdev test fs-frag` (11/0): fill a
+  small disk, delete every other file to scatter free space into ~2-block gaps, write a 20-block
+  file that *cannot* fit contiguously → it lands fragmented, reads back exactly, and survives a
+  reboot. No regression (files 130/0, fs-large 1/1, fs-journal 11/0, fs-check 5/0, fs-ioretry 5/0,
+  fs-corrupt 14/0, fs-restart 7/0, drives 9/0, script 2/2, blockdev-reboot).
 
 **Deferred (heavier; pulled in only when a real need arises, §26.2 / §26.11):**
 
@@ -663,11 +674,51 @@ byte in its data block, boot: `fs` logs a "data block CRC mismatch" and the read
   heavyweight and not yet justified.
 - **Scrubbing** — proactively re-verify rarely-read blocks to catch latent bit-rot early; needs a
   background task GodspeedOS doesn't have.
-- **Extent lists** — files are single contiguous runs today; that is a *fragmentation/capacity*
-  limit (a big file needs a big contiguous free run), not a robustness gap. A block-list/extent
-  tree fixes it when fragmentation actually bites.
 - **Snapshots / copy-on-write / mirroring (RAID)** — real features, but each strains the
   30-minute-whiteboard rule (§26.11); revisit only with a concrete need.
+
+### 6.12 Extent lists — files across scattered free space (GSFS0007)
+
+> **Adopted 2026-06-17 (Phase I).** Lifts the contiguous-extent fragmentation limit (§6.11
+> roadmap) while leaving the common case untouched.
+
+Through GSFS0006 a file was always a single contiguous run: `first_block ..
+first_block + block_count`. Simple and fast, but it meant a file needed a *contiguous* free
+span as large as itself — on a fragmented disk a write could be refused for lack of one big run
+even when the total free space was ample. GSFS0007 removes that limit with a minimal, opt-in
+second representation, chosen so the existing fast path is **byte-for-byte unchanged**:
+
+- **Contiguous file — `ITYPE_FILE` (= 1), the fast path.** Exactly as before: the record's
+  `first_block`/`block_count` are the data extent; the *n*-th data block is `first_block + n`.
+  Every existing test exercises this path, and the allocator still tries it first.
+- **Fragmented file — `ITYPE_FILE_FRAG` (= 3).** Engaged **only when no contiguous run is free**
+  (`alloc_run` returns "no space"). The record's `first_block` points to a single **extent
+  block** and `block_count` is 1. The extent block is a normal 512-byte block:
+  `n_extents:u32 @0`, then up to `EXT_MAX = 31` `(start:u64, len:u64)` runs from `@8`, and a
+  **CRC32 @508** over `[0..508)` — verified on every read, loud refusal on mismatch (§3.12),
+  exactly like a data or directory block. The *n*-th data block is found by walking the runs.
+
+**Allocation (`alloc_file`).** Try one contiguous run (fast path). On failure, `alloc_extents`
+grabs free runs greedily (`find_free_run` scans the bitmap; `take = len.min(need)`) until the
+request is satisfied — bounded to `EXT_MAX` runs, beyond which the write is refused loudly
+(§26.6) — then one more block holds the CRC'd extent block. A file fragmented into more than 31
+pieces is rejected, not silently mishandled. **Freeing (`free_file`)** mirrors it: a contiguous
+file frees its one run; a fragmented file frees each listed run, then the extent block.
+
+**Where it plugs in.** The extent block is *metadata*, so it is staged in the crash-consistency
+transaction (`ext_write` via `tb_write`) and commits atomically with the record and bitmap — a
+pre-commit crash leaves the data blocks unreferenced and the bitmap unchanged, identical to the
+contiguous case (§6.8). `read_path`/`read_at`/`write_at` resolve the extent list **once** per
+op when fragmented (a contiguous file maps by arithmetic, zero overhead), and `delete` /
+recursive `delete_tree` / `drives check` (fsck) all walk the runs so blocks are freed, verified,
+and accounted for whichever representation a file uses. The host writer (`osdev`) only ever bakes
+into a fresh disk, so it always produces contiguous files; the fragmented path is `fs`-only.
+
+**Bounds & honesty (§26.6).** One extent block ⇒ ≤ 31 runs per file — a hard, loud ceiling, not
+an unbounded indirection tree. This is deliberately *not* a btree/multi-level extent map: it
+fixes the fragmentation limit that can actually bite while staying inside the 30-minute
+whiteboard rule (§26.11). A file too fragmented for 31 runs fails loudly; `drives check` can
+report it. Verified by `osdev test fs-frag` (11/0) + full regression green.
 
 ## 7. File = capability (the north star)
 

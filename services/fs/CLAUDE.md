@@ -16,25 +16,25 @@ now restartable — the kernel notifies the supervisor of its death, which respa
 - `block-driver`: all I/O goes through block-driver IPC.
 - `registry`: registers its endpoint so supervisor and other services can find it.
 
-## On-disk format: GSFS, hierarchical (magic `GSFS0006`)
+## On-disk format: GSFS, hierarchical (magic `GSFS0007`)
 
-The format is **GSFS0006** (`docs/persistence.md` §6.4 + §6.6 + §6.10 + §6.11). Three on-disk
+The format is **GSFS0007** (`docs/persistence.md` §6.4 + §6.6 + §6.10 + §6.11 + §6.12). Three on-disk
 structures and no more — a **superblock**, a **free bitmap** (1 bit/block, the only global
 structure), and a **directory tree** of self-describing 64-byte `file_record`s (no inode
 table, no inode number, no global file cap; the tree *is* the index, the bitmap is the
 allocation map, reclamation is intrinsic). 512-byte blocks (= one AHCI sector = one block-IPC
 request), all capacity fields **u64** (~8 ZiB ceiling).
 
-**Backup superblock (GSFS0006):** a second superblock copy lives at the **last block**
+**Backup superblock (GSFS0007):** a second superblock copy lives at the **last block**
 (`total_blocks-1`, reserved in the bitmap). `mount` validates the primary (LBA 0); if its
 magic/CRC fails it falls back to the backup (located via the device capacity, so it works
 even when the primary is unreadable) and heals the primary. Both copies are written together
 by `format`, kept in sync by `persist_super` (staged in the same transaction), and both wiped
 by `drives reset`.
 
-**Every block self-verifies with a CRC32** (GSFS0006):
+**Every block self-verifies with a CRC32** (GSFS0007):
 
-- **Superblock** (LBA 0): magic, version (5), `block_size`, `total_blocks:u64`,
+- **Superblock** (LBA 0): magic, version (7), `block_size`, `total_blocks:u64`,
   `bitmap_start/blocks:u64`, `data_start:u64`, `root_first_block/block_count:u64`,
   `free_blocks:u64`, `flags` (DEFAULT bit), `label`, `journal_start/blocks:u64` @108
   (reserved crash-consistency region, filled by Phase C), and a **`sb_crc32` @124** over
@@ -42,13 +42,25 @@ by `drives reset`.
 - **Free bitmap** (LBA `bitmap_start..journal_start`): set bit = used block. (Not checksummed —
   reconstructible from the tree.)
 - **Journal** (LBA `journal_start..data_start`): reserved, 64 blocks (32 KiB).
-- **Directory block** (512 B): **7** `file_record`s × 64 B (`type u8`, `name_len u8`,
-  `name[38]`, `size u64`, `first_block u64`, `block_count u64`) + a 64-byte trailer whose
-  first 4 bytes are the **block's CRC32** over its 448-byte record region — verified on
-  every directory read (`dir_read`/`td_read`), stamped on every write (`dir_write`/`td_write`).
+- **Directory block** (512 B): **7** `file_record`s × 64 B (`type u8` — 0 free, 1 contiguous
+  file, 2 dir, 3 fragmented file; `name_len u8`, `name[38]`, `size u64`, `first_block u64`,
+  `block_count u64`) + a 64-byte trailer whose first 4 bytes are the **block's CRC32** over its
+  448-byte record region — verified on every directory read (`dir_read`/`td_read`), stamped on
+  every write (`dir_write`/`td_write`).
 - **File-data block** (512 B): **508 bytes payload + CRC32 @508**. A file of N bytes spans
   `ceil(N/508)` data blocks; the CRC covers the payload, verified on every read (`data_read`),
   stamped on every write (`data_write`). The per-message streaming chunk is `7×508 = 3556`.
+- **Extent block** (512 B, GSFS0007 — fragmented files only): `n_extents:u32 @0`, then up to
+  `EXT_MAX = 31` `(start:u64, len:u64)` data runs from `@8`, + a **CRC32 @508** over `[0..508)`.
+  A `type`-3 file's `first_block` points here (`block_count` = 1); the runs list its data.
+
+**Files: contiguous, or fragmented (GSFS0007 extent lists; `docs/persistence.md` §6.12).** A file
+is normally one **contiguous** extent (`type` 1 — the fast path: data is `first_block ..
+first_block+block_count`). When no contiguous run is free, the file is stored **fragmented**
+(`type` 3): `first_block` → a CRC'd **extent block** listing up to 31 scattered `(start, len)`
+runs. The contiguous path is unchanged; the fragmented path engages only when contiguous
+allocation fails, and a file needing more than 31 runs is refused loudly (§26.6). The extent
+block is metadata, staged in the same crash-consistency transaction as the record and bitmap.
 
 The CRC32 (IEEE 802.3) lives in `src/crc32.rs`; `osdev` carries a byte-identical copy so a
 host-baked image checksums exactly as `fs` would.
@@ -75,10 +87,10 @@ hard links. Bad magic **or** bad CRC is a loud mount refusal, never an auto-refo
 IPC message. Files larger than one message use the offset-addressed ops: `WriteNew` allocates
 the full extent and sizes the file, then a sequence of `WriteAt` chunks fills it; read it back
 with `StatFile` (for the size) + a sequence of `ReadAt` chunks. Stateless — each request is
-self-contained (no open-file table; §8). The on-disk file is a contiguous u64 extent, so size
-is bounded only by free space (fragmentation/grow-relocation is the known contiguous-extent
-limitation; a block-list is a deferred refinement, §26.2). The shell streams `cat`/`copy` and
-the pipe `write` sink through these ops.
+self-contained (no open-file table; §8). Size is bounded only by free space: a file is a
+contiguous u64 extent when one is free, else fragmented across an extent list (GSFS0007, §6.12
+above), so a fragmented disk no longer refuses a write it has room for. The shell streams
+`cat`/`copy` and the pipe `write` sink through these ops.
 
 ## State and persistence (§15)
 
