@@ -574,6 +574,40 @@ This completes the four-part filesystem robustness program (A integrity, B large
 crash-consistency, D restartable). The earlier "Phase 1/Phase 3 TCB trajectory" framing in §9
 is now realized.
 
+### 6.10 Data-block checksums — every block self-verifies (GSFS0005)
+
+> **Built 2026-06-17.** Phase A checksummed the *structural* metadata (superblock + directory
+> tree); file **data** blocks were the one thing still unchecksummed (a noted follow-on). This
+> closes it: each file-data block now carries its own CRC32, so silent bit-rot in file content
+> is caught loudly on read (§3.12) — exactly like the superblock and directory blocks.
+
+**Format change (magic `GSFS0004` → `GSFS0005`, reformat-only).** A file-data block is now
+**508 bytes of payload + a 4-byte CRC32 trailer @508** (mirroring the directory-block trailer).
+A file of N bytes spans `ceil(N/508)` data blocks; each block's CRC covers its own 508-byte
+payload, verified on every read (`data_read`) and stamped on every write (`data_write`). This
+makes **every block in the filesystem self-verifying** — superblock (CRC @124), directory block
+(CRC @448), data block (CRC @508) — a uniform, whiteboardable model with no side structure and
+no read-modify-write.
+
+**Consequences, all localized:**
+- The per-message streaming chunk is now `7 × 508 = 3556` bytes (`MAX_FILE_BYTES`, and the
+  shell's `IO_CHUNK`) — 7 whole data-block payloads, so a streaming `WRITE_AT` offset stays
+  block-aligned (no RMW). The offset-addressed ops and the shell streaming loops are otherwise
+  unchanged.
+- Data writes stay **direct** (not journaled), so the Phase-C crash model is unchanged: a
+  pre-commit crash leaves the data (and its CRCs) in an unreferenced extent — harmless.
+- ~0.8% space overhead (4 bytes per 512). The host baker (`osdev` `gsfs_add_file`) writes data
+  the same 508-payload-+-CRC way, so baked files (`script-disk`, `mkfs`) verify identically.
+
+**Scope.** Bitmap blocks remain unchecksummed — they are reconstructible from the tree, and a
+bitmap bit-flip is a space-accounting error, not data loss; a dedicated bitmap CRC is a future
+add only if a need arises (§26.2).
+
+**Verified:** `osdev test fs-corrupt` case 3 (now 11 checks total) — bake a file, flip a payload
+byte in its data block, boot: `fs` logs a "data block CRC mismatch" and the read is refused
+(never returns the corrupt bytes), no panic. files 130/0, fs-large, fs-journal 11/0, fs-restart
+7/0, script 2/2, blockdev-reboot all stay green with 508-byte data blocks.
+
 ## 7. File = capability (the north star)
 
 The spine that makes this filesystem *ours* rather than a generic store: a file is named

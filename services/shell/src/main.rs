@@ -35,8 +35,10 @@ const OP_RESET: u8 = 23;
 const OP_WRITE_NEW: u8 = 24; // [op, plen, path, total:u64]
 const OP_WRITE_AT: u8 = 25;  // [op, plen, path, offset:u64, chunk]
 const OP_READ_AT: u8 = 26;   // [op, plen, path, offset:u64, len:u32] -> [FS_OK, n:u32, bytes]
-// One streaming chunk: the most file bytes carried per message (matches fs MAX_FILE_BYTES).
-const IO_CHUNK: usize = 7 * 512; // 3584
+// One streaming chunk: the most file bytes carried per message (matches fs MAX_FILE_BYTES =
+// 7 data-block payloads). Must be a multiple of the 508-byte data payload so WRITE_AT offsets
+// stay block-aligned (no read-modify-write).
+const IO_CHUNK: usize = 7 * 508; // 3556
 const FS_OK: u8 = 0;
 const FS_NOTFOUND: u8 = 2;
 const FS_NOFS: u8 = 3;

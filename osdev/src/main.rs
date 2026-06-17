@@ -125,12 +125,12 @@ fn main() {
     }
 }
 
-// On-disk format — MUST match `services/fs` (docs/persistence.md §6.6, GSFS0004).
+// On-disk format — MUST match `services/fs` (docs/persistence.md §6.6/§6.10, GSFS0005).
 // 512-byte blocks (= one AHCI sector = one block-IPC request), so block number = LBA.
 // Three structures: superblock + free bitmap + self-describing directory tree (no inode
-// table, no global file cap). All capacity-bearing fields are u64. GSFS0004 adds integrity
-// checksums: a superblock CRC32 and a per-directory-block CRC32 (both verified on read).
-//   Superblock @ LBA 0: magic[8] "GSFS0004", version u32=4, block_size u32=512,
+// table, no global file cap). All capacity-bearing fields are u64. GSFS0005: every block
+// self-verifies with a CRC32 — superblock, each directory block, and each file-data block.
+//   Superblock @ LBA 0: magic[8] "GSFS0005", version u32=5, block_size u32=512,
 //     total_blocks u64, bitmap_start u64=1, bitmap_blocks u64, data_start u64,
 //     root_first_block u64, root_block_count u64, free_blocks u64, flags u32,
 //     label_len u8, label[31], journal_start u64 @108, journal_blocks u64 @116,
@@ -140,14 +140,16 @@ fn main() {
 //   Directory entry (file_record, 64 B): type u8 (0 free|1 file|2 dir) @0, name_len u8 @1,
 //     name[38] @2, size u64 @40, first_block u64 @48, block_count u64 @56. 7 per block;
 //     bytes 448..452 hold the block's CRC32 over its 448-byte record region.
+//   File-data block: 508 bytes payload + CRC32 @508. A file of N bytes spans ceil(N/508) blocks.
 //   Root is a dir at root_first_block (its extent lives in the superblock; it has no parent).
-const FS_SB_MAGIC: &[u8; 8] = b"GSFS0004";
+const FS_SB_MAGIC: &[u8; 8] = b"GSFS0005";
 const FS_BLOCK_SIZE: u32 = 512;
 const FS_BITS_PER_BMBLOCK: u64 = (FS_BLOCK_SIZE as u64) * 8; // 4096
 const FS_ITYPE_DIR: u8 = 2;
 const FS_JOURNAL_BLOCKS: u64 = 64; // reserved journal region (must match services/fs JOURNAL_BLOCKS)
 const FS_RECS_PER_BLOCK: usize = 7; // directory records per block (8th slot region is the CRC trailer)
 const FS_DIR_REC_REGION: usize = FS_RECS_PER_BLOCK * 64; // 448 — CRC covers [0..448)
+const FS_DATA_PAYLOAD: usize = 508; // file-data block payload; CRC32 trailer @508
 
 /// Stamp a directory block's CRC32 trailer (over its 448-byte record region) at offset 448.
 fn fs_dir_stamp_crc(block: &mut [u8]) {
@@ -178,7 +180,7 @@ fn format_superblock(path: &str) {
     // Superblock (LBA 0).
     let mut sb = [0u8; 512];
     sb[0..8].copy_from_slice(FS_SB_MAGIC);
-    sb[8..12].copy_from_slice(&4u32.to_le_bytes());            // version
+    sb[8..12].copy_from_slice(&5u32.to_le_bytes());            // version
     sb[12..16].copy_from_slice(&FS_BLOCK_SIZE.to_le_bytes());  // block_size
     sb[16..24].copy_from_slice(&total_blocks.to_le_bytes());
     sb[24..32].copy_from_slice(&bitmap_start.to_le_bytes());
@@ -211,7 +213,7 @@ fn format_superblock(path: &str) {
 
     std::fs::write(path, &data)
         .unwrap_or_else(|e| { eprintln!("mkfs: cannot write {}: {}", path, e); std::process::exit(1); });
-    println!("mkfs: formatted {} GSFS0004 ({} blocks, bitmap {}..{}, journal {}..{}, data from {}, {} free)",
+    println!("mkfs: formatted {} GSFS0005 ({} blocks, bitmap {}..{}, journal {}..{}, data from {}, {} free)",
              path, total_blocks, bitmap_start, journal_start, journal_start, data_start, root_first_block, free_blocks);
 }
 
@@ -228,7 +230,7 @@ fn gsfs_add_file(path: &str, name: &str, content: &[u8]) {
     let mut data = std::fs::read(path)
         .unwrap_or_else(|e| { eprintln!("bake: cannot read {}: {}", path, e); std::process::exit(1); });
     if data.len() < 512 || &data[0..8] != FS_SB_MAGIC {
-        eprintln!("bake: {} is not a GSFS0004 image", path); std::process::exit(1);
+        eprintln!("bake: {} is not a GSFS0005 image", path); std::process::exit(1);
     }
     if name.len() > 38 { eprintln!("bake: name '{}' too long (max 38)", name); std::process::exit(1); }
     let rdu = |d: &[u8], o: usize| u64::from_le_bytes(d[o..o + 8].try_into().unwrap());
@@ -238,7 +240,9 @@ fn gsfs_add_file(path: &str, name: &str, content: &[u8]) {
     let root_first   = rdu(&data, 48) as usize;
     let mut free_blocks = rdu(&data, 64);
 
-    let nblocks = ((content.len() as u64) + 511) / 512;
+    // GSFS0005: a data block holds 508 payload bytes + a CRC32 trailer, so a file spans
+    // ceil(content/508) blocks.
+    let nblocks = (((content.len() as u64) + FS_DATA_PAYLOAD as u64 - 1) / FS_DATA_PAYLOAD as u64).max(1);
     // First run of `nblocks` free, contiguous blocks at/after data_start (set bit = used).
     let mut first = data_start.max(1);
     loop {
@@ -266,9 +270,16 @@ fn gsfs_add_file(path: &str, name: &str, content: &[u8]) {
     // Re-stamp the superblock CRC32 (@124) — we just mutated a superblock field (free count).
     let sb_crc = crc32::crc32(&data[..124]);
     data[124..128].copy_from_slice(&sb_crc.to_le_bytes());
-    // Write the content into the extent (the tail of the last block stays zero).
-    let off = (first as usize) * 512;
-    data[off..off + content.len()].copy_from_slice(content);
+    // Write the content into the extent as 508-byte payloads, each with its CRC32 trailer @508
+    // (mirror of the on-disk `fs` data_write). The tail of the last block stays zero-padded.
+    for k in 0..nblocks as usize {
+        let blk_off = ((first as usize) + k) * 512;
+        let s = k * FS_DATA_PAYLOAD;
+        let e = (s + FS_DATA_PAYLOAD).min(content.len());
+        if s < content.len() { data[blk_off..blk_off + (e - s)].copy_from_slice(&content[s..e]); }
+        let crc = crc32::crc32(&data[blk_off..blk_off + FS_DATA_PAYLOAD]);
+        data[blk_off + FS_DATA_PAYLOAD..blk_off + FS_DATA_PAYLOAD + 4].copy_from_slice(&crc.to_le_bytes());
+    }
     // Add a root file_record into the first free 64-byte slot (type 0 = free).
     let rd = root_first * 512;
     let mut placed = false;
@@ -1396,15 +1407,15 @@ fn run_blockdev_reboot_test() {
     }
 }
 
-/// GSFS0004 integrity: a corrupt structural block is a **loud refusal** (§3.12), never
-/// silently read back as garbage. Two cases, both observable in the boot log:
-///   (1) corrupt a superblock byte → `fs` mount fails its CRC check → "no filesystem",
-///       never mounts, never auto-reformats.
-///   (2) corrupt the root directory block → mount succeeds (superblock intact) but the
-///       mount-time self-test's first directory op hits the per-block CRC and logs a
-///       "directory block CRC mismatch" — it does NOT return records from a bad block.
+/// GSFS0005 integrity: a corrupt block is a **loud refusal** (§3.12), never silently read
+/// back as garbage. Three cases, all observable in the boot log:
+///   (1) corrupt a superblock byte → `fs` mount fails its CRC check → "no filesystem".
+///   (2) corrupt the root directory block → mount OK but the first dir op logs a
+///       "directory block CRC mismatch" — never returns records from a bad block.
+///   (3) corrupt a file's data block → reading it logs a "data block CRC mismatch" — never
+///       returns bytes from a bad block (the GSFS0005 per-data-block CRC).
 fn run_fs_corruption_test() {
-    println!("\n=== fs: GSFS0004 integrity — corrupt block → loud refusal (§3.12) ===");
+    println!("\n=== fs: GSFS0005 integrity — corrupt block → loud refusal (§3.12) ===");
     cmd_build_blockdev();
 
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
@@ -1416,7 +1427,7 @@ fn run_fs_corruption_test() {
     let img_str = img.to_string_lossy().replace('\\', "/");
     let _ = std::fs::create_dir_all("build/tests");
 
-    // Helper: make a formatted 16 MiB GSFS0004 disk, corrupt one byte, return its abs path.
+    // Helper: make a formatted 16 MiB GSFS0005 disk, corrupt one byte, return its abs path.
     let make = |name: &str, corrupt: &dyn Fn(&mut [u8])| -> String {
         let p = format!("build/tests/{}", name);
         std::fs::write(&p, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
@@ -1451,6 +1462,34 @@ fn run_fs_corruption_test() {
     let dir_no_garbage = !log2.contains("round-trip OK (greeting)");     // never silently succeeded
     let dir_no_panic = !log2.contains("KERNEL PANIC");
 
+    // Case 3 (GSFS0005): bake /probe.bin, then flip a PAYLOAD byte in its first data block.
+    // The selftest reads /probe.bin → the per-data-block CRC catches it (loud), read fails.
+    let data_disk = {
+        let p = "build/tests/fs_corrupt_data.img";
+        std::fs::write(p, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+        format_superblock(p);
+        gsfs_add_file(p, "probe.bin", b"data-block integrity check payload - must read back exactly");
+        let mut d = std::fs::read(p).unwrap();
+        let root = u64::from_le_bytes(d[48..56].try_into().unwrap()) as usize;
+        let rd = root * 512;
+        let mut first_block = 0usize;
+        for slot in 0..7 {
+            let r = rd + slot * 64;
+            if d[r] == 1 { first_block = u64::from_le_bytes(d[r + 48..r + 56].try_into().unwrap()) as usize; break; }
+        }
+        d[first_block * 512] ^= 0xFF; // flip a payload byte (not the CRC @508) → data CRC fails
+        std::fs::write(p, &d).unwrap();
+        let abs = std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
+        abs.to_string_lossy().replace('\\', "/")
+    };
+    println!("fs: case 3 — corrupt a file data block, boot (~25s) …");
+    let log3 = boot_ahci_qemu(&img_str, &data_disk, "build/tests/fs_corrupt_data.log", 25);
+    let data_caught = log3.contains("data block CRC mismatch");           // loud
+    let data_failed = log3.contains("probe.bin read FAILED");             // read refused
+    let data_no_garbage = !log3.contains("probe.bin read OK");            // never silently returned bytes
+    let data_no_panic = !log3.contains("KERNEL PANIC");
+
+    let mut all = true;
     for (tag, ok) in [
         ("case1: superblock CRC mismatch refused", sb_refused),
         ("case1: reported no filesystem", sb_nofs),
@@ -1460,13 +1499,15 @@ fn run_fs_corruption_test() {
         ("case2: directory CRC mismatch caught (loud)", dir_caught),
         ("case2: never silently returned records", dir_no_garbage),
         ("case2: no kernel panic", dir_no_panic),
+        ("case3: data block CRC mismatch caught (loud)", data_caught),
+        ("case3: read refused (no garbage)", data_failed && data_no_garbage),
+        ("case3: no kernel panic", data_no_panic),
     ] {
         println!("  {} … {}", if ok { "PASS" } else { "FAIL" }, tag);
+        all &= ok;
     }
-    let all = sb_refused && sb_nofs && sb_not_mounted && sb_no_panic
-        && dir_mounted && dir_caught && dir_no_garbage && dir_no_panic;
     if all {
-        println!("\n  [GSFS.crc]  integrity: corruption is loud, never silent  … PASS\n\n  8 passed  0 failed");
+        println!("\n  [GSFS.crc]  integrity: corruption is loud, never silent  … PASS\n\n  11 passed  0 failed");
     } else {
         println!("\n  [GSFS.crc]  integrity  … FAIL\n");
         std::process::exit(1);
@@ -1554,14 +1595,14 @@ fn run_fs_journal_test() {
     let disk_abs = std::fs::canonicalize(disk).unwrap_or_else(|_| std::path::PathBuf::from(disk));
     let disk_str = disk_abs.to_string_lossy().replace('\\', "/");
 
-    println!("fs: boot 1 — write /jcrash.txt, halt after commit record (simulated crash), ~18s …");
-    let log1 = boot_ahci_qemu(&img_str, &disk_str, "build/tests/fs_journal_1.log", 18);
+    println!("fs: boot 1 — write /jcrash.txt, halt after commit record (simulated crash), ~25s …");
+    let log1 = boot_ahci_qemu(&img_str, &disk_str, "build/tests/fs_journal_1.log", 25);
     check(log1.contains("halting before checkpoint"), "part1 boot1: crashed right after the commit record");
     check(!log1.contains("did NOT crash"), "part1 boot1: the crash actually fired");
     check(!log1.contains("KERNEL PANIC"), "part1 boot1: no kernel panic");
 
-    println!("fs: boot 2 — SAME disk, mount must replay the journal, ~18s …");
-    let log2 = boot_ahci_qemu(&img_str, &disk_str, "build/tests/fs_journal_2.log", 18);
+    println!("fs: boot 2 — SAME disk, mount must replay the journal, ~25s …");
+    let log2 = boot_ahci_qemu(&img_str, &disk_str, "build/tests/fs_journal_2.log", 25);
     check(log2.contains("journal recovered"), "part2 boot2: mount replayed the committed transaction");
     check(log2.contains("jcrash RECOVERED+VERIFIED"), "part2 boot2: recovered file has the right bytes");
     check(!log2.contains("DATA MISMATCH"), "part2 boot2: no data mismatch");
@@ -1593,7 +1634,7 @@ fn run_fs_journal_test() {
 
     println!("fs: boot 3 — journal has a commit record with a BAD crc; recovery must ignore it, ~22s …");
     let log3 = boot_ahci_qemu(&img2_str, &disk2_str, "build/tests/fs_journal_bad.log", 22);
-    check(log3.contains("mounted GSFS0004"), "reject: filesystem mounted cleanly");
+    check(log3.contains("mounted GSFS0005"), "reject: filesystem mounted cleanly");
     check(!log3.contains("journal recovered"), "reject: did NOT replay the bad-CRC commit");
     check(log3.contains("round-trip OK (greeting)") || log3.contains("verified across boot"),
           "reject: fs serves normally (greeting round-trip)");
