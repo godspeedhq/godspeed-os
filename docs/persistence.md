@@ -608,6 +608,52 @@ byte in its data block, boot: `fs` logs a "data block CRC mismatch" and the read
 (never returns the corrupt bytes), no panic. files 130/0, fs-large, fs-journal 11/0, fs-restart
 7/0, script 2/2, blockdev-reboot all stay green with 508-byte data blocks.
 
+### 6.11 Further robustness — roadmap (recovery layer)
+
+> **Adopted 2026-06-17.** Phases A–E gave the filesystem **detection** (every block self-verifies),
+> **crash-consistency** (the metadata journal), **restartability**, and **persistence** — all
+> hardware-proven on the T630. The remaining robustness work is mostly the *next* layer:
+> **recover after detection**, and remove the **single fatal block**. These are pulled in
+> cheap-first; the heavy items stay deferred until a real need pulls them (§26.2).
+
+**Doing now (cheap, high value):**
+
+- **Phase F — Backup superblock (GSFS0006). ✅ Built + verified 2026-06-17.** The superblock is a
+  single block at LBA 0; if its CRC fails the whole volume won't mount. A **second copy at the
+  last LBA** (`total_blocks-1`, reserved in the bitmap at format) lets `mount` fall back to it
+  when the primary fails — and heal the primary from it. The backup is located via the
+  block-driver's reported capacity, so it works even when the primary is unreadable (no
+  chicken-and-egg). `format` writes both; `persist_super` keeps them in sync (staged in the same
+  transaction, so they commit atomically); `drives reset` wipes both. Removes the single most
+  catastrophic point of failure for ~no cost. Reformat-only bump 0005→0006. Verified by
+  `osdev test fs-corrupt` (now 14 checks): corrupt the primary → recovers from backup; corrupt
+  both → loud refusal. No regression (files 130/0, fs-journal 11/0, fs-restart 7/0, drives 9/0,
+  script 2/2, blockdev-reboot).
+- **Phase G — `drives check` (fsck / repair).** Today a CRC failure is *detected loudly* but not
+  *recoverable*, and a drifted bitmap/free-count has no repair. Because **the directory tree is
+  the source of truth**, an fsck falls out: walk the tree, **rebuild the free bitmap + free count
+  from it**, report/quarantine any file whose blocks fail their CRC, and refresh the backup
+  superblock. Turns "detected, dead" into "detected, repaired." A new `drives check` shell
+  command; no on-disk format change. **This subsumes a dedicated bitmap-block CRC** — if the
+  bitmap is rebuildable from the tree, checksumming it is redundant (so §6.10's deferred
+  bitmap-CRC is folded into fsck, not built separately).
+- **Phase H — block I/O error handling.** A failed block read/write currently just fails the op.
+  Add a bounded **retry**, then a loud report (§3.12), to harden against a failing/slow SSD. No
+  format change.
+
+**Deferred (heavier; pulled in only when a real need arises, §26.2 / §26.11):**
+
+- **Data journaling** — the journal is metadata-only by design; a torn *data* write is caught by
+  the data CRC (loud) but not recovered (honest loss of that write, §20). Full data journaling is
+  heavyweight and not yet justified.
+- **Scrubbing** — proactively re-verify rarely-read blocks to catch latent bit-rot early; needs a
+  background task GodspeedOS doesn't have.
+- **Extent lists** — files are single contiguous runs today; that is a *fragmentation/capacity*
+  limit (a big file needs a big contiguous free run), not a robustness gap. A block-list/extent
+  tree fixes it when fragmentation actually bites.
+- **Snapshots / copy-on-write / mirroring (RAID)** — real features, but each strains the
+  30-minute-whiteboard rule (§26.11); revisit only with a concrete need.
+
 ## 7. File = capability (the north star)
 
 The spine that makes this filesystem *ours* rather than a generic store: a file is named

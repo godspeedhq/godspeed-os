@@ -7,7 +7,7 @@
 
 //! `fs` — userspace filesystem service (persistence, v2; §15, docs/persistence.md).
 //!
-//! **GSFS0005 — checksummed scalable format (docs/persistence.md §6.4 + §6.6).** Three on-disk
+//! **GSFS0006 — checksummed scalable format (docs/persistence.md §6.4 + §6.6).** Three on-disk
 //! structures and no more: a **superblock**, a **free bitmap** (1 bit/block, read on
 //! demand — the only global structure, a free *map* not a file index), and the
 //! **directory tree** of **self-describing `file_record` entries** (`{type, name, size,
@@ -32,22 +32,22 @@ mod crc32;
 use crc32::crc32;
 
 // ── On-disk format — MUST match `osdev format_superblock` (persistence.md §6.6/§6.10). ──
-// GSFS0005: every block self-verifies with a CRC32 — the superblock (CRC @124), each
+// GSFS0006: every block self-verifies with a CRC32 — the superblock (CRC @124), each
 // directory block (CRC trailer @448), and now each **file-data block** (508-byte payload +
 // CRC32 @508). Corruption is a loud refusal (§3.12), never silent. The format also reserves a
 // fixed journal region (Phase-C crash-consistency) so the on-disk geometry is baked once.
-const SB_MAGIC: &[u8; 8] = b"GSFS0005";
+const SB_MAGIC: &[u8; 8] = b"GSFS0006";
 const BLOCK: usize = 512;
 const BITS_PER_BMBLOCK: u64 = (BLOCK as u64) * 8; // 4096 bits per bitmap block
 
-// File-data block: 508 bytes of payload + a 4-byte CRC32 trailer @508 (GSFS0005). A file of N
+// File-data block: 508 bytes of payload + a 4-byte CRC32 trailer @508 (GSFS0006). A file of N
 // bytes spans ceil(N/508) data blocks; each carries the CRC of its own payload, verified on
 // every read. (Directory blocks use a different split — 448 records + CRC; superblock/bitmap/
 // journal blocks are raw, with their own integrity schemes.)
 const DATA_PAYLOAD: usize = 508;
 const DATA_CRC_OFF: usize = DATA_PAYLOAD; // 508 — u32 CRC32 of the 508-byte payload
 
-// file_record entry: 64 bytes. GSFS0005 fits 7 per 512-byte directory block and reserves
+// file_record entry: 64 bytes. GSFS0006 fits 7 per 512-byte directory block and reserves
 // the last 64 bytes as a trailer holding the block's CRC32 (over the 448-byte record
 // region). The record layout itself is unchanged from GSFS0003 — names stay 38 bytes.
 const REC_SIZE: usize = 64;
@@ -56,7 +56,7 @@ const DIR_REC_REGION: usize = RECS_PER_BLOCK * REC_SIZE; // 448 — CRC covers [
 const DIR_CRC_OFF: usize = DIR_REC_REGION; // 448 — u32 CRC32 of the record region
 const NAME_MAX: usize = 38; // entry: type u8 @0, name_len u8 @1, name[38] @2, size @40, first @48, count @56
 
-// Crash-consistency journal region (GSFS0005 geometry). Fixed size, bounded (§26.6): a
+// Crash-consistency journal region (GSFS0006 geometry). Fixed size, bounded (§26.6): a
 // transaction larger than this is refused loudly, never partially applied.
 const JOURNAL_BLOCKS: u64 = 64; // 64 × 512 B = 32 KiB
 // One commit/header block + up to TXN_CAP data blocks must fit the journal region.
@@ -172,7 +172,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut fs: Option<Fs> = match Fs::mount(&ctx) {
         Ok(f) => {
             ctx.log_fmt(format_args!(
-                "fs: mounted GSFS0005 ({} blocks, bitmap {}..{}, root@{}, {} free)",
+                "fs: mounted GSFS0006 ({} blocks, bitmap {}..{}, root@{}, {} free)",
                 f.total_blocks, f.bitmap_start, f.data_start, f.root_first_block, f.free_blocks
             ));
             Some(f)
@@ -221,7 +221,7 @@ fn self_test(ctx: &ServiceContext, fs: &mut Fs) {
     let mut buf = [0u8; MAX_FILE_BYTES];
 
     // Data-integrity probe: if a host-baked `/probe.bin` exists, read it — exercising the
-    // per-data-block CRC (GSFS0005). A corrupt block is refused loudly by `data_read`, so the
+    // per-data-block CRC (GSFS0006). A corrupt block is refused loudly by `data_read`, so the
     // read fails rather than returning garbage. (Used by `osdev test fs-corrupt` case 3.)
     if fs.walk(ctx, b"/probe.bin").is_some() {
         match fs.read_path(ctx, b"/probe.bin", &mut buf) {
@@ -387,9 +387,14 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
             return;
         }
         OP_RESET => {
+            // Wipe BOTH superblock copies (primary @0 and backup @capacity-1), else mount would
+            // "recover" the just-reset filesystem from the surviving backup.
             if capacity == 0 { send(&[FS_ERR]); }
-            else if block_write(ctx, 0, &[0u8; BLOCK]) { *vol = None; send(&[FS_OK]); }
-            else { send(&[FS_ERR]); }
+            else {
+                let z = [0u8; BLOCK];
+                let ok = block_write(ctx, 0, &z) && block_write(ctx, capacity - 1, &z);
+                if ok { *vol = None; send(&[FS_OK]); } else { send(&[FS_ERR]); }
+            }
             return;
         }
         _ => {}
@@ -489,16 +494,40 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
 
 impl Fs {
     // ── mount / format / drive metadata ──────────────────────────────────────
+    /// Validate a superblock copy: correct magic AND CRC32 over the first 124 bytes (§3.12).
+    fn sb_valid(b: &[u8; BLOCK]) -> bool {
+        &b[0..8] == SB_MAGIC && u32_at(b, 124) == crc32(&b[..124])
+    }
+
+    /// Read the superblock, falling back to the **backup copy at the last LBA** if the primary
+    /// (LBA 0) is unreadable or fails its CRC (GSFS0006). The backup is located via the device
+    /// capacity, so it works even when the primary is unreadable (no chicken-and-egg). On a
+    /// successful fallback the primary is healed (rewritten from the backup).
+    fn read_superblock(ctx: &ServiceContext) -> Result<[u8; BLOCK], &'static str> {
+        let primary = block_read(ctx, 0);
+        if let Some(ref b) = primary {
+            if Self::sb_valid(b) { return Ok(*b); }
+        }
+        // Primary missing/corrupt — try the backup at capacity-1.
+        let cap = block_capacity(ctx).unwrap_or(0);
+        if cap >= 2 {
+            if let Some(bk) = block_read(ctx, cap - 1) {
+                if Self::sb_valid(&bk) {
+                    ctx.log("fs: primary superblock bad — recovered from backup superblock");
+                    let _ = block_write(ctx, 0, &bk); // heal the primary copy
+                    return Ok(bk);
+                }
+            }
+        }
+        match primary {
+            Some(ref b) if &b[0..8] == SB_MAGIC =>
+                Err("superblock checksum mismatch (both copies) — refusing to mount corrupt filesystem"),
+            _ => Err("bad superblock magic — disk not formatted (run drives flash)"),
+        }
+    }
+
     fn mount(ctx: &ServiceContext) -> Result<Fs, &'static str> {
-        let sb = block_read(ctx, 0).ok_or("block 0 read failed (block-driver unreachable?)")?;
-        if &sb[0..8] != SB_MAGIC {
-            return Err("bad superblock magic — disk not formatted (run drives flash)");
-        }
-        // Integrity: the superblock carries a CRC32 over its first 124 bytes (§3.12). A
-        // mismatch is a loud refusal — a corrupt superblock is never trusted or auto-fixed.
-        if u32_at(&sb, 124) != crc32(&sb[..124]) {
-            return Err("superblock checksum mismatch — refusing to mount corrupt filesystem");
-        }
+        let sb = Self::read_superblock(ctx)?;
         // Crash recovery: replay a committed-but-unfinished transaction before serving (§9).
         // Idempotent — a clean shutdown leaves no commit record, so this is a no-op then.
         Fs::recover(ctx, u64_at(&sb, 108));
@@ -671,27 +700,30 @@ impl Fs {
         ctx.log_fmt(format_args!("fs: journal recovered {} block(s) from an interrupted write", n));
     }
 
-    /// Format the disk as an empty GSFS0005 sized to `capacity`, then mount. Same layout
+    /// Format the disk as an empty GSFS0006 sized to `capacity`, then mount. Same layout
     /// `osdev format_superblock` writes. `drives flash`; only ever user-initiated (§3.12).
     fn format(ctx: &ServiceContext, capacity: u64, label: &[u8]) -> Result<Fs, &'static str> {
         let total_blocks = capacity;
         let bitmap_start: u64 = 1;
         let bitmap_blocks = (total_blocks + BITS_PER_BMBLOCK - 1) / BITS_PER_BMBLOCK;
-        // Reserve the journal region between the bitmap and the data region (GSFS0005).
+        // Reserve the journal region between the bitmap and the data region (GSFS0006).
         let journal_start = bitmap_start + bitmap_blocks;
         let journal_blocks = JOURNAL_BLOCKS;
         let data_start = journal_start + journal_blocks;
         let root_first_block = data_start;
         let root_block_count: u64 = 1;
         let used_through = data_start + root_block_count;
-        if total_blocks < used_through + 1 {
+        // The backup superblock occupies the last block (`total_blocks-1`); it is reserved out
+        // of the data region, so the disk must be big enough for the system blocks + a backup.
+        if total_blocks < used_through + 2 {
             return Err("disk too small for a filesystem");
         }
-        let free_blocks = total_blocks - used_through;
+        let backup_lba = total_blocks - 1;
+        let free_blocks = total_blocks - used_through - 1; // -1 for the reserved backup block
 
         let mut sb = [0u8; BLOCK];
         sb[0..8].copy_from_slice(SB_MAGIC);
-        sb[8..12].copy_from_slice(&5u32.to_le_bytes());
+        sb[8..12].copy_from_slice(&6u32.to_le_bytes());
         sb[12..16].copy_from_slice(&(BLOCK as u32).to_le_bytes());
         sb[16..24].copy_from_slice(&total_blocks.to_le_bytes());
         sb[24..32].copy_from_slice(&bitmap_start.to_le_bytes());
@@ -708,7 +740,9 @@ impl Fs {
         sb[116..124].copy_from_slice(&journal_blocks.to_le_bytes());
         let sb_crc = crc32(&sb[..124]);
         sb[124..128].copy_from_slice(&sb_crc.to_le_bytes());
+        // Write the superblock to BOTH the primary (LBA 0) and the backup (last LBA) copies.
         if !block_write(ctx, 0, &sb) { return Err("superblock write failed"); }
+        if !block_write(ctx, backup_lba, &sb) { return Err("backup superblock write failed"); }
 
         // Zero the bitmap region in one batched op (driver writes multi-sector zero runs —
         // keeps `drives flash` fast even on a 122 GB disk), then mark [0..used_through) used.
@@ -724,6 +758,15 @@ impl Fs {
                 blk[w / 8] |= 1 << (w % 8);
                 b += 1;
             }
+            if !block_write(ctx, bm_blk, &blk) { return Err("bitmap write failed"); }
+        }
+        // Reserve the backup superblock's block (`backup_lba`) so the allocator never hands it
+        // out for file data and overwrites the backup.
+        {
+            let bm_blk = bitmap_start + backup_lba / BITS_PER_BMBLOCK;
+            let mut blk = block_read(ctx, bm_blk).ok_or("bitmap read failed")?;
+            let w = (backup_lba % BITS_PER_BMBLOCK) as usize;
+            blk[w / 8] |= 1 << (w % 8);
             if !block_write(ctx, bm_blk, &blk) { return Err("bitmap write failed"); }
         }
         // Empty root directory block (stamped with its CRC trailer via dir_write).
@@ -760,7 +803,10 @@ impl Fs {
         // Re-stamp the integrity CRC over the updated superblock (§3.12).
         let sb_crc = crc32(&sb[..124]);
         sb[124..128].copy_from_slice(&sb_crc.to_le_bytes());
+        // Write BOTH copies — primary (LBA 0) and backup (last LBA) — staged in the same
+        // transaction, so they commit atomically and the backup never lags the primary.
         if !self.tb_write(ctx, 0, &sb) { return Err("superblock write failed"); }
+        if !self.tb_write(ctx, self.total_blocks - 1, &sb) { return Err("backup superblock write failed"); }
         Ok(())
     }
 
