@@ -7,7 +7,7 @@
 
 //! `fs` — userspace filesystem service (persistence, v2; §15, docs/persistence.md).
 //!
-//! **Phase 3: GSFS0003 — the scalable format (docs/persistence.md §6.4).** Three on-disk
+//! **GSFS0004 — checksummed scalable format (docs/persistence.md §6.4 + §6.6).** Three on-disk
 //! structures and no more: a **superblock**, a **free bitmap** (1 bit/block, read on
 //! demand — the only global structure, a free *map* not a file index), and the
 //! **directory tree** of **self-describing `file_record` entries** (`{type, name, size,
@@ -28,15 +28,30 @@
 
 use godspeed_sdk::{CapHandle, Message, ServiceContext};
 
-// ── On-disk format — MUST match `osdev format_superblock` (persistence.md §6.4). ──
-const SB_MAGIC: &[u8; 8] = b"GSFS0003";
+mod crc32;
+use crc32::crc32;
+
+// ── On-disk format — MUST match `osdev format_superblock` (persistence.md §6.6). ──
+// GSFS0004 adds integrity checksums (no layout churn otherwise): a superblock CRC32 and a
+// per-directory-block CRC32, both verified on read — corruption is a loud refusal (§3.12),
+// never silent. The format also reserves a fixed journal region (filled by the Phase-C
+// crash-consistency work) so the on-disk geometry is baked once.
+const SB_MAGIC: &[u8; 8] = b"GSFS0004";
 const BLOCK: usize = 512;
 const BITS_PER_BMBLOCK: u64 = (BLOCK as u64) * 8; // 4096 bits per bitmap block
 
-// file_record entry: 64 bytes, 8 per block.
+// file_record entry: 64 bytes. GSFS0004 fits 7 per 512-byte directory block and reserves
+// the last 64 bytes as a trailer holding the block's CRC32 (over the 448-byte record
+// region). The record layout itself is unchanged from GSFS0003 — names stay 38 bytes.
 const REC_SIZE: usize = 64;
-const RECS_PER_BLOCK: usize = BLOCK / REC_SIZE; // 8
+const RECS_PER_BLOCK: usize = 7; // 7×64 = 448 bytes of records + a 64-byte CRC trailer
+const DIR_REC_REGION: usize = RECS_PER_BLOCK * REC_SIZE; // 448 — CRC covers [0..448)
+const DIR_CRC_OFF: usize = DIR_REC_REGION; // 448 — u32 CRC32 of the record region
 const NAME_MAX: usize = 38; // entry: type u8 @0, name_len u8 @1, name[38] @2, size @40, first @48, count @56
+
+// Reserved crash-consistency journal region (GSFS0004 geometry; filled by Phase C). Fixed
+// size, bounded (§26.6): a transaction larger than this is refused loudly, never partial.
+const JOURNAL_BLOCKS: u64 = 64; // 64 × 512 B = 32 KiB
 
 // Recursive-delete depth cap (§26.6). Paths are capped well below this by the wire
 // `path_len` (u8) and the shell's PATH_MAX (120), so this is a backstop, not the binding
@@ -87,6 +102,8 @@ struct Fs {
     total_blocks: u64,
     bitmap_start: u64,
     data_start: u64,
+    journal_start: u64,
+    journal_blocks: u64,
     root_first_block: u64,
     root_block_count: u64,
     free_blocks: u64,
@@ -122,7 +139,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut fs: Option<Fs> = match Fs::mount(&ctx) {
         Ok(f) => {
             ctx.log_fmt(format_args!(
-                "fs: mounted GSFS0003 ({} blocks, bitmap {}..{}, root@{}, {} free)",
+                "fs: mounted GSFS0004 ({} blocks, bitmap {}..{}, root@{}, {} free)",
                 f.total_blocks, f.bitmap_start, f.data_start, f.root_first_block, f.free_blocks
             ));
             Some(f)
@@ -310,6 +327,11 @@ impl Fs {
         if &sb[0..8] != SB_MAGIC {
             return Err("bad superblock magic — disk not formatted (run drives flash)");
         }
+        // Integrity: the superblock carries a CRC32 over its first 124 bytes (§3.12). A
+        // mismatch is a loud refusal — a corrupt superblock is never trusted or auto-fixed.
+        if u32_at(&sb, 124) != crc32(&sb[..124]) {
+            return Err("superblock checksum mismatch — refusing to mount corrupt filesystem");
+        }
         let mut label = [0u8; LABEL_MAX];
         let ll = (sb[76] as usize).min(LABEL_MAX);
         label[..ll].copy_from_slice(&sb[77..77 + ll]);
@@ -317,6 +339,8 @@ impl Fs {
             total_blocks: u64_at(&sb, 16),
             bitmap_start: u64_at(&sb, 24),
             data_start: u64_at(&sb, 40),
+            journal_start: u64_at(&sb, 108),
+            journal_blocks: u64_at(&sb, 116),
             root_first_block: u64_at(&sb, 48),
             root_block_count: u64_at(&sb, 56),
             free_blocks: u64_at(&sb, 64),
@@ -326,13 +350,16 @@ impl Fs {
         })
     }
 
-    /// Format the disk as an empty GSFS0003 sized to `capacity`, then mount. Same layout
+    /// Format the disk as an empty GSFS0004 sized to `capacity`, then mount. Same layout
     /// `osdev format_superblock` writes. `drives flash`; only ever user-initiated (§3.12).
     fn format(ctx: &ServiceContext, capacity: u64, label: &[u8]) -> Result<Fs, &'static str> {
         let total_blocks = capacity;
         let bitmap_start: u64 = 1;
         let bitmap_blocks = (total_blocks + BITS_PER_BMBLOCK - 1) / BITS_PER_BMBLOCK;
-        let data_start = bitmap_start + bitmap_blocks;
+        // Reserve the journal region between the bitmap and the data region (GSFS0004).
+        let journal_start = bitmap_start + bitmap_blocks;
+        let journal_blocks = JOURNAL_BLOCKS;
+        let data_start = journal_start + journal_blocks;
         let root_first_block = data_start;
         let root_block_count: u64 = 1;
         let used_through = data_start + root_block_count;
@@ -343,7 +370,7 @@ impl Fs {
 
         let mut sb = [0u8; BLOCK];
         sb[0..8].copy_from_slice(SB_MAGIC);
-        sb[8..12].copy_from_slice(&3u32.to_le_bytes());
+        sb[8..12].copy_from_slice(&4u32.to_le_bytes());
         sb[12..16].copy_from_slice(&(BLOCK as u32).to_le_bytes());
         sb[16..24].copy_from_slice(&total_blocks.to_le_bytes());
         sb[24..32].copy_from_slice(&bitmap_start.to_le_bytes());
@@ -356,11 +383,14 @@ impl Fs {
         let ll = label.len().min(LABEL_MAX);
         sb[76] = ll as u8;
         sb[77..77 + ll].copy_from_slice(&label[..ll]);
+        sb[108..116].copy_from_slice(&journal_start.to_le_bytes());
+        sb[116..124].copy_from_slice(&journal_blocks.to_le_bytes());
+        let sb_crc = crc32(&sb[..124]);
+        sb[124..128].copy_from_slice(&sb_crc.to_le_bytes());
         if !block_write(ctx, 0, &sb) { return Err("superblock write failed"); }
 
         // Zero the bitmap region in one batched op (driver writes multi-sector zero runs —
         // keeps `drives flash` fast even on a 122 GB disk), then mark [0..used_through) used.
-        let zero = [0u8; BLOCK];
         if !block_write_zeros(ctx, bitmap_start, bitmap_blocks) { return Err("bitmap init failed"); }
         let mut b = 0u64;
         while b < used_through {
@@ -375,8 +405,9 @@ impl Fs {
             }
             if !block_write(ctx, bm_blk, &blk) { return Err("bitmap write failed"); }
         }
-        // Empty root directory block.
-        if !block_write(ctx, root_first_block, &zero) { return Err("root dir init failed"); }
+        // Empty root directory block (stamped with its CRC trailer via dir_write).
+        let mut root = [0u8; BLOCK];
+        if !dir_write(ctx, root_first_block, &mut root) { return Err("root dir init failed"); }
 
         Fs::mount(ctx)
     }
@@ -401,6 +432,10 @@ impl Fs {
         sb[76] = ll as u8;
         for b in &mut sb[77..77 + LABEL_MAX] { *b = 0; }
         sb[77..77 + ll].copy_from_slice(&self.label[..ll]);
+        // Journal geometry (@108..124) is fixed at format and rides through untouched.
+        // Re-stamp the integrity CRC over the updated superblock (§3.12).
+        let sb_crc = crc32(&sb[..124]);
+        sb[124..128].copy_from_slice(&sb_crc.to_le_bytes());
         if !block_write(ctx, 0, &sb) { return Err("superblock write failed"); }
         Ok(())
     }
@@ -477,7 +512,7 @@ impl Fs {
     fn dir_find(&self, ctx: &ServiceContext, dir: &Entry, name: &[u8]) -> Option<Entry> {
         for bi in 0..dir.block_count {
             let block = dir.first_block + bi;
-            let blk = block_read(ctx, block)?;
+            let blk = dir_read(ctx, block)?;
             for slot in 0..RECS_PER_BLOCK {
                 let o = slot * REC_SIZE;
                 if blk[o] == ITYPE_FREE { continue; }
@@ -525,11 +560,11 @@ impl Fs {
                itype: u8, size: u64, first: u64, count: u64) -> Result<(), &'static str> {
         for bi in 0..dir.block_count {
             let block = dir.first_block + bi;
-            let mut blk = block_read(ctx, block).ok_or("dir read failed")?;
+            let mut blk = dir_read(ctx, block).ok_or("dir read failed")?;
             for slot in 0..RECS_PER_BLOCK {
                 if blk[slot * REC_SIZE] == ITYPE_FREE {
                     encode_rec(&mut blk, slot, itype, name, size, first, count);
-                    if !block_write(ctx, block, &blk) { return Err("dir write failed"); }
+                    if !dir_write(ctx, block, &mut blk) { return Err("dir write failed"); }
                     return Ok(());
                 }
             }
@@ -537,9 +572,9 @@ impl Fs {
         // No free slot — grow, then place in the fresh block.
         self.grow_dir(ctx, dir)?;
         let block = dir.first_block + dir.block_count - 1;
-        let mut blk = block_read(ctx, block).ok_or("dir read failed")?;
+        let mut blk = dir_read(ctx, block).ok_or("dir read failed")?;
         encode_rec(&mut blk, 0, itype, name, size, first, count);
-        if !block_write(ctx, block, &blk) { return Err("dir write failed"); }
+        if !dir_write(ctx, block, &mut blk) { return Err("dir write failed"); }
         Ok(())
     }
 
@@ -549,10 +584,11 @@ impl Fs {
         let new_count = dir.block_count + 1;
         let new_first = self.alloc_run(ctx, new_count)?;
         for bi in 0..dir.block_count {
-            let blk = block_read(ctx, dir.first_block + bi).ok_or("dir read failed")?;
-            if !block_write(ctx, new_first + bi, &blk) { return Err("dir copy failed"); }
+            let mut blk = dir_read(ctx, dir.first_block + bi).ok_or("dir read failed")?;
+            if !dir_write(ctx, new_first + bi, &mut blk) { return Err("dir copy failed"); }
         }
-        if !block_write(ctx, new_first + dir.block_count, &[0u8; BLOCK]) { return Err("dir grow init failed"); }
+        let mut fresh = [0u8; BLOCK];
+        if !dir_write(ctx, new_first + dir.block_count, &mut fresh) { return Err("dir grow init failed"); }
         let (old_first, old_count) = (dir.first_block, dir.block_count);
         dir.first_block = new_first;
         dir.block_count = new_count;
@@ -570,12 +606,12 @@ impl Fs {
                 self.persist_super(ctx)
             }
             Some(loc) => {
-                let mut blk = block_read(ctx, loc.block).ok_or("record read failed")?;
+                let mut blk = dir_read(ctx, loc.block).ok_or("record read failed")?;
                 let o = loc.slot * REC_SIZE;
                 blk[o + 40..o + 48].copy_from_slice(&e.size.to_le_bytes());
                 blk[o + 48..o + 56].copy_from_slice(&e.first_block.to_le_bytes());
                 blk[o + 56..o + 64].copy_from_slice(&e.block_count.to_le_bytes());
-                if !block_write(ctx, loc.block, &blk) { return Err("record write failed"); }
+                if !dir_write(ctx, loc.block, &mut blk) { return Err("record write failed"); }
                 Ok(())
             }
         }
@@ -584,7 +620,7 @@ impl Fs {
     fn dir_remove(&self, ctx: &ServiceContext, dir: &Entry, name: &[u8]) -> Result<(), &'static str> {
         for bi in 0..dir.block_count {
             let block = dir.first_block + bi;
-            let mut blk = block_read(ctx, block).ok_or("dir read failed")?;
+            let mut blk = dir_read(ctx, block).ok_or("dir read failed")?;
             for slot in 0..RECS_PER_BLOCK {
                 let o = slot * REC_SIZE;
                 if blk[o] == ITYPE_FREE { continue; }
@@ -592,7 +628,7 @@ impl Fs {
                 if nl == 0 || nl > NAME_MAX { continue; }
                 if &blk[o + 2..o + 2 + nl] == name {
                     blk[o] = ITYPE_FREE;
-                    if !block_write(ctx, block, &blk) { return Err("dir write failed"); }
+                    if !dir_write(ctx, block, &mut blk) { return Err("dir write failed"); }
                     return Ok(());
                 }
             }
@@ -602,7 +638,7 @@ impl Fs {
 
     fn dir_is_empty(&self, ctx: &ServiceContext, dir: &Entry) -> Option<bool> {
         for bi in 0..dir.block_count {
-            let blk = block_read(ctx, dir.first_block + bi)?;
+            let blk = dir_read(ctx, dir.first_block + bi)?;
             for slot in 0..RECS_PER_BLOCK {
                 if blk[slot * REC_SIZE] != ITYPE_FREE { return Some(false); }
             }
@@ -617,7 +653,8 @@ impl Fs {
         if !valid_name(name) { return Err("bad name"); }
         if self.dir_find(ctx, &parent, name).is_some() { return Err("already exists"); }
         let first = self.alloc_run(ctx, 1)?;
-        if !block_write(ctx, first, &[0u8; BLOCK]) { return Err("dir block init failed"); }
+        let mut blk = [0u8; BLOCK];
+        if !dir_write(ctx, first, &mut blk) { return Err("dir block init failed"); }
         self.dir_add(ctx, &mut parent, name, ITYPE_DIR, 0, first, 1)
     }
 
@@ -633,7 +670,8 @@ impl Fs {
                 None => {
                     if !valid_name(comp) { return Err("bad name"); }
                     let first = self.alloc_run(ctx, 1)?;
-                    if !block_write(ctx, first, &[0u8; BLOCK]) { return Err("dir block init failed"); }
+                    let mut blk = [0u8; BLOCK];
+                    if !dir_write(ctx, first, &mut blk) { return Err("dir block init failed"); }
                     self.dir_add(ctx, &mut cur, comp, ITYPE_DIR, 0, first, 1)?;
                     cur = self.dir_find(ctx, &cur, comp).ok_or("created dir not found")?;
                 }
@@ -698,7 +736,7 @@ impl Fs {
         let mut count = 0u8;
         let mut w = 2usize;
         for bi in 0..d.block_count {
-            let blk = block_read(ctx, d.first_block + bi)?;
+            let blk = dir_read(ctx, d.first_block + bi)?;
             for slot in 0..RECS_PER_BLOCK {
                 let o = slot * REC_SIZE;
                 let t = blk[o];
@@ -725,7 +763,7 @@ impl Fs {
         if self.dir_find(ctx, &parent, newname).is_some() { return Err("name already exists"); }
         for bi in 0..parent.block_count {
             let block = parent.first_block + bi;
-            let mut blk = block_read(ctx, block).ok_or("dir read failed")?;
+            let mut blk = dir_read(ctx, block).ok_or("dir read failed")?;
             for slot in 0..RECS_PER_BLOCK {
                 let o = slot * REC_SIZE;
                 if blk[o] == ITYPE_FREE { continue; }
@@ -735,7 +773,7 @@ impl Fs {
                     blk[o + 1] = newname.len() as u8;
                     for b in &mut blk[o + 2..o + 2 + NAME_MAX] { *b = 0; }
                     blk[o + 2..o + 2 + newname.len()].copy_from_slice(newname);
-                    if !block_write(ctx, block, &blk) { return Err("dir write failed"); }
+                    if !dir_write(ctx, block, &mut blk) { return Err("dir write failed"); }
                     return Ok(());
                 }
             }
@@ -778,7 +816,7 @@ impl Fs {
             for bi in 0..count {
                 // Scope the block read so `blk` is gone before we recurse into the children.
                 let (kids, nk) = {
-                    let blk = block_read(ctx, first + bi).ok_or("dir read failed")?;
+                    let blk = dir_read(ctx, first + bi).ok_or("dir read failed")?;
                     let mut kids = [(0u8, 0u64, 0u64); RECS_PER_BLOCK];
                     let mut nk = 0usize;
                     for slot in 0..RECS_PER_BLOCK {
@@ -881,6 +919,33 @@ fn block_write_zeros(ctx: &ServiceContext, lba: u64, count: u64) -> bool {
         Some(reply) => reply.payload_bytes().first() == Some(&BLK_OK),
         None => false,
     }
+}
+
+/// Read a **directory block** and verify its CRC trailer (GSFS0004). The block's first
+/// `DIR_REC_REGION` bytes are the records; the u32 at `DIR_CRC_OFF` is their CRC32. A
+/// mismatch is a loud refusal (§3.12) — `fs` returns the read as failed and logs the lba,
+/// never handing back records from a corrupt block. Use this for every directory-block read
+/// (bitmap, superblock, and file-data blocks stay on the raw `block_read`).
+fn dir_read(ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
+    let blk = block_read(ctx, lba)?;
+    let stored = u32_at(&blk, DIR_CRC_OFF);
+    let actual = crc32(&blk[..DIR_REC_REGION]);
+    if stored != actual {
+        ctx.log_fmt(format_args!(
+            "fs: directory block CRC mismatch at lba {} (stored {:#010x}, actual {:#010x}) — refusing",
+            lba, stored, actual
+        ));
+        return None;
+    }
+    Some(blk)
+}
+
+/// Stamp a **directory block**'s CRC trailer over its record region and write it. Pairs with
+/// `dir_read`. Every directory-block write goes through this so the trailer always matches.
+fn dir_write(ctx: &ServiceContext, lba: u64, blk: &mut [u8; BLOCK]) -> bool {
+    let c = crc32(&blk[..DIR_REC_REGION]);
+    blk[DIR_CRC_OFF..DIR_CRC_OFF + 4].copy_from_slice(&c.to_le_bytes());
+    block_write(ctx, lba, blk)
 }
 
 /// Write one 512-byte block at `lba` to `block-driver` over IPC (u64 LBA, §6.3).
