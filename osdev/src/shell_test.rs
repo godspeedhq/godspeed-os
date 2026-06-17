@@ -1553,6 +1553,83 @@ pub fn run_fs_restart(image_path: &Path, persist_path: &str, smp: u32) {
     if fail > 0 { std::process::exit(1); }
 }
 
+/// `drives check` (fsck, Phase G): boot a PRE-FORMATTED disk whose superblock free count has
+/// been deliberately drifted host-side (CRC re-stamped so it still mounts). `drives check`
+/// must rebuild the free count from the tree and report the correct value (`expect_free`), with
+/// 0 bad blocks, and the baked file must still read back. Proves the recovery layer repairs
+/// allocation drift non-destructively.
+pub fn run_fs_check(image_path: &Path, persist_path: &str, expect_free: u64, smp: u32) {
+    println!("fs-check: booting (smp={smp}) with a pre-formatted disk whose free count was drifted");
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let persist   = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let persist_str = persist.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{shell_port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("fs-check: QEMU launch failed: {e}"); std::process::exit(1); });
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => { eprintln!("fs-check: could not connect to serial {shell_port}"); child.kill().ok(); std::process::exit(1); }
+    };
+    let mut read_half  = stream.try_clone().expect("clone tcp stream");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop {
+                match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) }
+            }
+        });
+    }
+
+    let mut pass = 0usize; let mut fail = 0usize; let mut cursor = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-check: PASS — {}", $label); pass += 1; } else { println!("fs-check: FAIL — {}", $label); fail += 1; }
+    }; }
+    macro_rules! run { ($c:expr, $secs:expr) => {{ send(&mut write_half, $c); collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs)) }}; }
+
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).is_none() {
+        println!("fs-check: FAIL — timed out waiting for first gsh>");
+        child.kill().ok(); child.wait().ok(); std::process::exit(1);
+    }
+
+    // The disk is already formatted (drifted free count); fs auto-mounted it. Run the fsck.
+    let expect = format!("{} free", expect_free);
+    match run!(b"drives check\r", 15) {
+        Some(r) => {
+            check!(r.contains(&expect), "free count rebuilt from the tree to the correct value");
+            check!(r.contains("0 bad"), "no corrupt blocks reported");
+            check!(r.contains("ok") || r.contains("consistent"), "reports consistent");
+        }
+        None => { println!("fs-check: FAIL — drives check timeout"); fail += 1; }
+    }
+    // The baked file survived the repair.
+    match run!(b"read /alpha.txt\r", 10) {
+        Some(r) => check!(r.contains("alpha-payload"), "baked file still reads back after check"),
+        None    => { println!("fs-check: FAIL — read timeout"); fail += 1; }
+    }
+    let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    check!(!whole.contains("KERNEL PANIC"), "no kernel panic");
+
+    child.kill().ok(); child.wait().ok();
+    println!("\nfs-check: {pass} passed, {fail} failed");
+    if fail > 0 { std::process::exit(1); }
+}
+
 /// Boot bare-metal with a GSFS disk that has a self-checking `.gsh` baked in (host-side), then
 /// `run /<script_name>` — proving the flash-and-run loop and piped asserts in a script.
 pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u32) {

@@ -31,6 +31,7 @@ const OP_DRIVES_INFO: u8 = 20;
 const OP_FLASH: u8 = 21;
 const OP_LABEL: u8 = 22;
 const OP_RESET: u8 = 23;
+const OP_CHECK: u8 = 27; // fsck: rebuild bitmap+free from the tree, report CRC failures
 // large-file streaming ops (offset-addressed): create a sized file, then write/read chunks.
 const OP_WRITE_NEW: u8 = 24; // [op, plen, path, total:u64]
 const OP_WRITE_AT: u8 = 25;  // [op, plen, path, offset:u64, chunk]
@@ -839,6 +840,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("drives flash [drive] [label]", "format a drive as GSFS (ERASES)", "drives flash 0 data"),
             ("drives label [drive] <name>", "name / rename a drive", "drives label 0 archive"),
             ("drives reset [drive]", "un-format a drive back to raw", "drives reset 0"),
+            ("drives check [drive]", "verify (fsck): rebuild bitmap/free, report CRC failures", "drives check"),
         ], true),
         "ls" => help_block(ctx, "ls", "list a directory (records when piped)", &[
             ("ls", "list the current directory", "ls"),
@@ -960,6 +962,10 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("drives reset", "un-format the only drive", "drives reset"),
             ("drives reset <drive>", "un-format drive <drive>", "drives reset 0"),
         ], false),
+        ("drives", "check") => help_block(ctx, "drives check", "fsck: verify integrity + rebuild the bitmap/free count (does NOT erase)", &[
+            ("drives check", "check the only drive", "drives check"),
+            ("drives check <drive>", "check drive <drive>", "drives check 0"),
+        ], false),
         _ => return false,
     }
     true
@@ -994,7 +1000,7 @@ fn cmd_help(ctx: &ServiceContext) -> Result<(), ShellError> {
     help_line(ctx, "restart <name> [core]", "restart a service");
     ctx.console_writeln("");
     ctx.console_writeln("Storage");
-    help_line(ctx, "drives [flash|label|reset]", "manage attached disks (drives help)");
+    help_line(ctx, "drives [flash|label|reset|check]", "manage attached disks (drives help)");
     help_line(ctx, "ls [path]", "list a directory");
     help_line(ctx, "cd [path|-]", "change directory (- = previous)");
     help_line(ctx, "read <path>", "print a file");
@@ -3393,6 +3399,11 @@ fn cmd_drives(ctx: &ServiceContext, args: &[&str], argc: usize) -> Result<(), Sh
             let sel = if argc >= 3 { args[2] } else { "" };
             if drive_sel_ok(ctx, sel) { drives_reset(ctx) } else { Err(ShellError::Unknown) }
         }
+        "check"   => {
+            // `drives check [drive]` — fsck: verify CRCs + rebuild the bitmap/free count.
+            let sel = if argc >= 3 { args[2] } else { "" };
+            if drive_sel_ok(ctx, sel) { drives_check(ctx) } else { Err(ShellError::Unknown) }
+        }
         // `drives help` / `drives version` and `drives <sub> help` are handled by the
         // generic per-utility intercept in `execute` (0_conventions.md).
         other     => {
@@ -3500,6 +3511,38 @@ fn drives_reset(ctx: &ServiceContext) -> Result<(), ShellError> {
         }
         Some(_) => { ctx.console_writeln("drives: reset FAILED (no disk?)"); Err(ShellError::Unknown) }
         None    => { ctx.console_writeln("drives: storage unavailable (no fs?)"); Err(ShellError::Unknown) }
+    }
+}
+
+/// `drives check` — fsck: walk the tree (the source of truth), rebuild the free bitmap + free
+/// count from it, and verify every block's CRC. Repairs allocation drift non-destructively;
+/// reports (does not delete) files/dirs whose blocks fail their CRC. No confirmation needed —
+/// it never erases data. Reply: [FS_OK, files:u32, dirs:u32, bad:u32, used:u64, free:u64].
+fn drives_check(ctx: &ServiceContext) -> Result<(), ShellError> {
+    match ctx.request_with_reply("fs", &Message::from_bytes(&[OP_CHECK])) {
+        Some(r) => {
+            let p = r.payload_bytes();
+            if no_fs(ctx, p) { return Err(ShellError::Unknown); }
+            if p.first() == Some(&FS_OK) && p.len() >= 29 {
+                let u32a = |o: usize| u32::from_le_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]]);
+                let u64a = |o: usize| u64::from_le_bytes([p[o], p[o+1], p[o+2], p[o+3], p[o+4], p[o+5], p[o+6], p[o+7]]);
+                let (files, dirs, bad, used, free) = (u32a(1), u32a(5), u32a(9), u64a(13), u64a(21));
+                ctx.console_writeln_fmt(format_args!(
+                    "check: {} files, {} dirs, {} bad; {} blocks used, {} free (bitmap + free count rebuilt from the tree)",
+                    files, dirs, bad, used, free));
+                if bad > 0 {
+                    ctx.console_writeln_fmt(format_args!(
+                        "check: WARNING — {} file(s)/dir(s) had unreadable (CRC-failed) blocks; see the log", bad));
+                    Err(ShellError::Unknown)
+                } else {
+                    ctx.console_writeln("check: ok — filesystem is consistent");
+                    Ok(())
+                }
+            } else {
+                ctx.console_writeln("check: FAILED"); Err(ShellError::Unknown)
+            }
+        }
+        None => { ctx.console_writeln("drives: storage unavailable (no fs?)"); Err(ShellError::Unknown) }
     }
 }
 
