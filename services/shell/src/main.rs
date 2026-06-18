@@ -159,6 +159,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // the line. We turn kernel echo OFF and echo printable bytes ourselves below, so
     // escape sequences are swallowed silently and line editing stays under our control.
     ctx.console_echo(false);
+    // A one-time grounding hint above the first prompt after boot — so a fresh user knows
+    // where to start. Only here, not on every prompt (that would be noise).
+    ctx.console_writeln("(F1=help or type 'help')");
     ctx.console_write("gsh> ");
 
     let mut line = Line::new();
