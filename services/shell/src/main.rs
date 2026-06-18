@@ -161,8 +161,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.console_echo(false);
     ctx.console_write("gsh> ");
 
-    let mut line_buf = [0u8; MAX_LINE];
-    let mut line_len = 0usize;
+    let mut line = Line::new();
     // Current location on the (single) drive: the directory bare/relative paths target,
     // moved by `cd` (utilities/17_cd.md). Session state; resets to "/" each boot.
     let mut cwd = Cwd::root();
@@ -181,89 +180,114 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // We own echo now, so move to a fresh line ourselves (the kernel used
                 // to echo the Enter as "\r\n").
                 ctx.console_write("\r\n");
-                if line_len > 0 {
-                    hist.push(&line_buf[..line_len]);
-                    last_result = execute(&ctx, &line_buf[..line_len], &mut cwd, last_result, 0);
-                    line_len = 0;
+                if line.len > 0 {
+                    hist.push(line.bytes());
+                    last_result = execute(&ctx, line.bytes(), &mut cwd, last_result, 0);
+                    line.len = 0;
+                    line.cur = 0;
                 }
                 nav = hist.len();
                 ctx.console_write("gsh> ");
             }
             0x1B => {
-                // Escape sequence. Arrow keys arrive as ESC [ A/B/C/D — from a serial
-                // terminal directly, and the USB keyboard emits the same (sdk hid.rs).
-                // Up/Down walk the history; Left/Right are not handled yet (no in-line
-                // cursor movement). The two follow-up bytes are part of the sequence.
-                let b1 = ctx.console_read();
-                let b2 = ctx.console_read();
-                if b1 == b'[' {
-                    match b2 {
-                        b'A' => { // Up — older command
-                            if nav > 0 {
-                                nav -= 1;
-                                replace_line(&ctx, &mut line_buf, &mut line_len, hist.get(nav));
-                            }
-                        }
-                        b'B' => { // Down — newer command (past the end → blank live line)
-                            if nav < hist.len() {
-                                nav += 1;
-                                let line: &[u8] = if nav == hist.len() { &[] } else { hist.get(nav) };
-                                replace_line(&ctx, &mut line_buf, &mut line_len, line);
-                            }
-                        }
-                        _ => {}
-                    }
+                // Escape: either a bare ESC (the Escape key → clear the line) or the start
+                // of a terminal escape sequence (arrows + the extended-keyboard navigation
+                // cluster, which send ESC [ … / ESC O …). `read_escape_byte` distinguishes
+                // them without blocking forever on a bare ESC; a confirmed sequence's
+                // remaining bytes are already queued (the keyboard pushes them atomically),
+                // so the rest reads blockingly.
+                match read_escape_byte(&ctx) {
+                    None => { line.clear(&ctx); nav = hist.len(); } // bare ESC → clear line
+                    Some(b'[') => handle_csi(&ctx, &mut line, &mut hist, &mut nav),
+                    Some(b'O') => { let _ = ctx.console_read(); } // SS3 (F1–F4): no shell action
+                    Some(_)    => {}                              // other ESC x: ignore
                 }
             }
-            0x7f | 0x08 => {
-                // backspace — remove last byte and erase it on the display, but
-                // only if there is one. The kernel does not echo backspace (it
-                // can't tell the line is empty), so a no-op here leaves the prompt
-                // untouched. "\x08 \x08" = move back, overwrite with space, move back.
-                if line_len > 0 {
-                    line_len -= 1;
-                    ctx.console_write("\x08 \x08");
-                }
-            }
+            0x7f | 0x08 => line.backspace(&ctx),
             0x09 => {
                 // Tab — complete the command name. One match → fill it in; several → print a
                 // numbered menu and the next digit selects (no Enter). Event-driven (redraws only
                 // on this keypress, via the same console-write path normal echo uses).
-                complete_tab(&ctx, &mut line_buf, &mut line_len);
+                complete_tab(&ctx, &mut line);
             }
             0x03 => {
                 // Ctrl-C — clear line
                 ctx.console_writeln("^C");
-                line_len = 0;
+                line.len = 0;
+                line.cur = 0;
                 nav = hist.len();
                 ctx.console_write("gsh> ");
             }
-            b if b >= 0x20 && b < 0x7f => {
-                if line_len < MAX_LINE {
-                    line_buf[line_len] = b;
-                    line_len += 1;
-                    // Echo the printable byte ourselves (kernel echo is off). Escape
-                    // sequences never reach here — they're consumed in the 0x1B arm.
-                    let s = [b];
-                    ctx.console_write(core::str::from_utf8(&s).unwrap_or(""));
-                }
-            }
+            b if b >= 0x20 && b < 0x7f => line.insert(&ctx, b),
             _ => {}
         }
     }
 }
 
-/// Erase the current on-screen input, then set + print `new` as the line buffer (used by
-/// up/down-arrow history recall). Erasing uses the same `\x08 \x08` the backspace path does.
-fn replace_line(ctx: &ServiceContext, buf: &mut [u8; MAX_LINE], len: &mut usize, new: &[u8]) {
-    for _ in 0..*len {
-        ctx.console_write("\x08 \x08");
+/// Read the first byte after an ESC, distinguishing a bare ESC (the Escape key, which
+/// sends nothing more) from the start of a terminal escape sequence. The keyboard driver
+/// pushes a navigation key's whole `ESC [ … ~` atomically, so its follow-up byte is
+/// already queued and `try_console_read` returns it at once; a serial terminal may split
+/// the bytes, so we wait a bounded few monotonic ticks (`ESC_WAIT_TICKS`) before giving
+/// up. `None` ⇒ bare ESC. Returning quickly matters so a held key's repeats stay snappy.
+const ESC_WAIT_TICKS: u64 = 2;
+fn read_escape_byte(ctx: &ServiceContext) -> Option<u8> {
+    if let Some(b) = ctx.try_console_read() { return Some(b); }
+    let deadline = ctx.monotonic_ticks() + ESC_WAIT_TICKS;
+    while ctx.monotonic_ticks() < deadline {
+        if let Some(b) = ctx.try_console_read() { return Some(b); }
+        ctx.yield_cpu();
     }
-    let n = new.len().min(MAX_LINE);
-    buf[..n].copy_from_slice(&new[..n]);
-    *len = n;
-    if n > 0 {
-        ctx.console_write(core::str::from_utf8(&buf[..n]).unwrap_or(""));
+    None
+}
+
+/// Handle a CSI sequence (everything after `ESC [`). Reads the optional numeric
+/// parameter and the final byte, then dispatches the key. Covers the arrows (history +
+/// cursor), Home/End, and the `~`-terminated navigation keys (Insert/Delete/Home/End/
+/// PageUp/PageDown) and function keys an extended keyboard sends. Unknown sequences are
+/// consumed and ignored — never smeared onto the line. Bounded: a final byte must arrive
+/// within `CSI_MAX` bytes or we stop (defensive against a malformed serial stream).
+fn handle_csi(ctx: &ServiceContext, line: &mut Line, hist: &History, nav: &mut usize) {
+    const CSI_MAX: usize = 8;
+    let mut param: u16 = 0;
+    let mut have_param = false;
+    let mut final_byte = 0u8;
+    for _ in 0..CSI_MAX {
+        let c = ctx.console_read();
+        if c.is_ascii_digit() {
+            have_param = true;
+            param = param.saturating_mul(10).saturating_add((c - b'0') as u16);
+        } else if c == b';' {
+            // Multi-parameter (e.g. modified keys): we only act on the first; keep reading.
+            continue;
+        } else {
+            final_byte = c; // 0x40..=0x7E terminates a CSI
+            break;
+        }
+    }
+    match final_byte {
+        b'A' => { // Up — older command
+            if *nav > 0 { *nav -= 1; line.set(ctx, hist.get(*nav)); }
+        }
+        b'B' => { // Down — newer command (past the end → blank live line)
+            if *nav < hist.len() {
+                *nav += 1;
+                let l: &[u8] = if *nav == hist.len() { &[] } else { hist.get(*nav) };
+                line.set(ctx, l);
+            }
+        }
+        b'C' => line.right(ctx), // Right — move cursor within the line
+        b'D' => line.left(ctx),  // Left
+        b'H' => line.home(ctx),  // Home (ESC[H)
+        b'F' => line.end(ctx),   // End  (ESC[F)
+        b'~' => match param {    // navigation cluster: ESC[<n>~
+            1 | 7 => line.home(ctx),   // Home
+            4 | 8 => line.end(ctx),    // End
+            3     => line.delete(ctx), // Delete (forward delete)
+            // 2 = Insert, 5 = PageUp, 6 = PageDown, 11.. = F-keys: no shell action, ignored.
+            _ => { let _ = have_param; }
+        },
+        _ => {} // unknown final byte — already consumed, do nothing
     }
 }
 
@@ -272,10 +296,15 @@ fn replace_line(ctx: &ServiceContext, buf: &mut [u8; MAX_LINE], len: &mut usize,
 /// numbered menu and block for one digit, which selects (no Enter) and drops the command into the
 /// prompt. Only completes a bare command (no space typed yet) — argument/path completion is future
 /// work. Bounded (§26.6): at most `UTILS.len()` matches, 1–9 selectable by digit.
-fn complete_tab(ctx: &ServiceContext, buf: &mut [u8; MAX_LINE], len: &mut usize) {
+fn complete_tab(ctx: &ServiceContext, line: &mut Line) {
     // Only complete while still typing the command token (nothing after a space).
-    if *len == 0 || buf[..*len].contains(&b' ') { return; }
-    let prefix = &buf[..*len];
+    if line.len == 0 || line.bytes().contains(&b' ') { return; }
+    // Operate from end-of-line so the menu reprint + replacement line up with the cursor.
+    line.end(ctx);
+    let mut prefix_buf = [0u8; MAX_LINE];
+    let plen = line.len;
+    prefix_buf[..plen].copy_from_slice(&line.buf[..plen]);
+    let prefix = &prefix_buf[..plen];
 
     // Collect matching command indices (UTILS order — stable, so the menu numbering is stable).
     let mut matches = [0usize; 64];
@@ -286,7 +315,7 @@ fn complete_tab(ctx: &ServiceContext, buf: &mut [u8; MAX_LINE], len: &mut usize)
         }
     }
     if n == 0 { return; }                       // no candidates — leave the line as-is
-    if n == 1 { set_completed(ctx, buf, len, UTILS[matches[0]]); return; }
+    if n == 1 { set_completed(ctx, line, UTILS[matches[0]]); return; }
 
     // Several candidates: print a numbered menu (1..=min(9,n)), then read one selection digit.
     let shown = n.min(9);
@@ -313,20 +342,19 @@ fn complete_tab(ctx: &ServiceContext, buf: &mut [u8; MAX_LINE], len: &mut usize)
     let sel = ctx.console_read();
     if (b'1'..=b'9').contains(&sel) {
         let idx = (sel - b'1') as usize;
-        if idx < shown { set_completed(ctx, buf, len, UTILS[matches[idx]]); }
+        if idx < shown { set_completed(ctx, line, UTILS[matches[idx]]); }
     }
 }
 
-/// Replace the on-screen input with `cmd` followed by a trailing space, updating `buf`/`len`.
-/// Reuses `replace_line`, so the old text is erased and the new text echoed the same way history
-/// recall does.
-fn set_completed(ctx: &ServiceContext, buf: &mut [u8; MAX_LINE], len: &mut usize, cmd: &str) {
+/// Replace the on-screen input with `cmd` followed by a trailing space. Uses `Line::set`,
+/// so the old text is erased and the new text echoed the same way history recall does.
+fn set_completed(ctx: &ServiceContext, line: &mut Line, cmd: &str) {
     let c = cmd.as_bytes();
     let cl = c.len().min(MAX_LINE - 1);
     let mut tmp = [0u8; MAX_LINE];
     tmp[..cl].copy_from_slice(&c[..cl]);
     tmp[cl] = b' ';                              // trailing space so the user can type args
-    replace_line(ctx, buf, len, &tmp[..cl + 1]);
+    line.set(ctx, &tmp[..cl + 1]);
 }
 
 /// A bounded ring of recent command lines for up/down-arrow recall (§26.6: fixed size,
@@ -357,6 +385,102 @@ impl History {
         self.lens[self.n] = l;
         self.n += 1;
     }
+}
+
+/// The editable input line with a cursor, so the navigation cluster of a standard
+/// extended keyboard (Left/Right/Home/End/Delete) edits *mid-line*, not just at the
+/// end. `cur` is the insertion point in `0..=len`. Every edit echoes itself using only
+/// `\x08` (non-destructive cursor-left on both the framebuffer console and a serial
+/// terminal), character reprints (cursor-right), and `ESC[K` (erase to end of line) —
+/// the lowest common denominator both honour, so editing looks identical over HDMI and
+/// over the serial console. Bounded (§26.6): `MAX_LINE`, loud-safe (over-long input is
+/// simply not accepted).
+struct Line {
+    buf: [u8; MAX_LINE],
+    len: usize,
+    cur: usize,
+}
+impl Line {
+    fn new() -> Self { Line { buf: [0u8; MAX_LINE], len: 0, cur: 0 } }
+    fn bytes(&self) -> &[u8] { &self.buf[..self.len] }
+
+    /// Reprint from the cursor to end-of-line, erase any stale tail (`ESC[K`), then
+    /// step the cursor back to `cur`. Used after an insert/delete shifts the tail.
+    fn redraw_tail(&self, ctx: &ServiceContext) {
+        if self.cur < self.len {
+            ctx.console_write(core::str::from_utf8(&self.buf[self.cur..self.len]).unwrap_or(""));
+        }
+        ctx.console_write("\x1b[K"); // erase whatever the old (possibly longer) tail left
+        for _ in self.cur..self.len { ctx.console_write("\x08"); }
+    }
+
+    /// Insert a printable byte at the cursor.
+    fn insert(&mut self, ctx: &ServiceContext, b: u8) {
+        if self.len >= MAX_LINE { return; }
+        let mut i = self.len;
+        while i > self.cur { self.buf[i] = self.buf[i - 1]; i -= 1; }
+        self.buf[self.cur] = b;
+        self.len += 1;
+        self.cur += 1;
+        // Echo the inserted byte, then redraw the shifted tail behind it.
+        let s = [b];
+        ctx.console_write(core::str::from_utf8(&s).unwrap_or(""));
+        self.redraw_tail(ctx);
+    }
+
+    /// Delete the character before the cursor (Backspace).
+    fn backspace(&mut self, ctx: &ServiceContext) {
+        if self.cur == 0 { return; }
+        for i in self.cur..self.len { self.buf[i - 1] = self.buf[i]; }
+        self.len -= 1;
+        self.cur -= 1;
+        ctx.console_write("\x08"); // step left onto the deleted cell
+        self.redraw_tail(ctx);
+    }
+
+    /// Delete the character at the cursor (the Delete key — forward delete).
+    fn delete(&mut self, ctx: &ServiceContext) {
+        if self.cur >= self.len { return; }
+        for i in (self.cur + 1)..self.len { self.buf[i - 1] = self.buf[i]; }
+        self.len -= 1;
+        self.redraw_tail(ctx);
+    }
+
+    fn left(&mut self, ctx: &ServiceContext) {
+        if self.cur > 0 { self.cur -= 1; ctx.console_write("\x08"); }
+    }
+    fn right(&mut self, ctx: &ServiceContext) {
+        if self.cur < self.len {
+            let s = [self.buf[self.cur]];
+            ctx.console_write(core::str::from_utf8(&s).unwrap_or("")); // reprint = move right
+            self.cur += 1;
+        }
+    }
+    fn home(&mut self, ctx: &ServiceContext) {
+        while self.cur > 0 { self.cur -= 1; ctx.console_write("\x08"); }
+    }
+    fn end(&mut self, ctx: &ServiceContext) {
+        if self.cur < self.len {
+            ctx.console_write(core::str::from_utf8(&self.buf[self.cur..self.len]).unwrap_or(""));
+            self.cur = self.len;
+        }
+    }
+
+    /// Erase the visible input and replace it with `new`, cursor at the end. Used by
+    /// history recall, tab completion, and the bare-ESC clear. Erases from wherever the
+    /// cursor is: step to the input start, `ESC[K` to wipe to end of line, then print.
+    fn set(&mut self, ctx: &ServiceContext, new: &[u8]) {
+        while self.cur > 0 { self.cur -= 1; ctx.console_write("\x08"); }
+        ctx.console_write("\x1b[K");
+        let n = new.len().min(MAX_LINE);
+        self.buf[..n].copy_from_slice(&new[..n]);
+        self.len = n;
+        self.cur = n;
+        if n > 0 { ctx.console_write(core::str::from_utf8(&self.buf[..n]).unwrap_or("")); }
+    }
+
+    /// Clear to an empty line (cursor at 0), erasing what was shown.
+    fn clear(&mut self, ctx: &ServiceContext) { self.set(ctx, &[]); }
 }
 
 /// Wait until the input subsystem reports in — the deterministic end-of-boot
@@ -1064,6 +1188,7 @@ fn cmd_help(ctx: &ServiceContext) -> Result<(), ShellError> {
     ctx.console_writeln("Console");
     help_line(ctx, "help", "show this message");
     help_line(ctx, "<prefix> Tab", "complete a command; if several match, press the shown digit to pick");
+    help_line(ctx, "arrows/Home/End/Del", "edit the line in place; Up/Down recall history; Esc clears");
     help_line(ctx, "clear", "clear the screen");
     help_line(ctx, "echo <text>", "print text");
     help_line(ctx, "result", "the last command's result (Ok / Err)");

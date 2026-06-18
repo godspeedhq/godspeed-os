@@ -31,6 +31,7 @@ pub fn hid_to_ascii(key: u8, mods: u8) -> Option<u8> {
         }
         0x27 => Some(if shift { b')' } else { b'0' }),
         0x28 => Some(b'\n'), // Enter
+        0x29 => Some(0x1B),  // Escape — bare ESC (the shell disambiguates it from a sequence)
         0x2A => Some(0x08),  // Backspace
         0x2B => Some(b'\t'), // Tab
         0x2C => Some(b' '),  // Space
@@ -170,8 +171,10 @@ pub fn decode_keyboard(
         if k == 0 || k == 0x01 { continue; } // 0 = empty slot, 0x01 = rollover error
         if !last.contains(&k) {
             if emit_key(k, mods, &mut emit) {
-                // Newest printable/cursor key held becomes the repeat key.
-                rep.arm(k, mods, now);
+                // Newest printable/cursor key held becomes the repeat key — except
+                // Escape (0x29), a one-shot control key whose repeat would just make
+                // the shell re-disambiguate a bare ESC on every tick.
+                if k != 0x29 { rep.arm(k, mods, now); }
             } else if is_typable_code(k) {
                 // Modifiers/Caps/Esc (0x29, 0x39, 0xE0-E7) are not printable; only the
                 // typable ranges we'd expect to map are surfaced as "unmapped" noise.
