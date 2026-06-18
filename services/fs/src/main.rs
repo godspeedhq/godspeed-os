@@ -7,7 +7,7 @@
 
 //! `fs` — userspace filesystem service (persistence, v2; §15, docs/persistence.md).
 //!
-//! **GSFS0007 — checksummed scalable format with extent lists (docs/persistence.md §6.4 +
+//! **GSFS0008 — checksummed scalable format with extent lists (docs/persistence.md §6.4 +
 //! §6.6 + §6.12).** Three on-disk
 //! structures and no more: a **superblock**, a **free bitmap** (1 bit/block, read on
 //! demand — the only global structure, a free *map* not a file index), and the
@@ -32,16 +32,41 @@ use godspeed_sdk::{CapHandle, Message, ServiceContext};
 mod crc32;
 use crc32::crc32;
 
-// ── On-disk format — MUST match `osdev format_superblock` (persistence.md §6.6/§6.10). ──
-// GSFS0007: every block self-verifies with a CRC32 — the superblock (CRC @124), each
-// directory block (CRC trailer @448), and now each **file-data block** (508-byte payload +
-// CRC32 @508). Corruption is a loud refusal (§3.12), never silent. The format also reserves a
+// ── On-disk format — MUST match `osdev format_superblock` (persistence.md §6.6/§6.10/§6.15). ──
+// GSFS0008: every block self-verifies with a CRC32 — the superblock (CRC @136), each
+// directory block (CRC trailer @448), and each **file-data block** (508-byte payload +
+// CRC32 @508). Corruption is a loud refusal (§3.12), never silent. The format reserves a
 // fixed journal region (Phase-C crash-consistency) so the on-disk geometry is baked once.
-const SB_MAGIC: &[u8; 8] = b"GSFS0007";
+//
+// **The magic is FROZEN at "GSFS0008" (§6.15, Phase L).** Versioning moved off the magic and onto
+// three FEATURE-MASK words so the format can evolve WITHOUT a reformat-only bump: a newer feature
+// is a bit in one of the masks, set on disk only when actually used, and the mount policy decides
+// what an older build does with a bit it doesn't recognise (see `mount`). The magic answers only
+// "is this GSFS?"; the masks answer "what does this disk use?".
+const SB_MAGIC: &[u8; 8] = b"GSFS0008";
+const SB_VERSION: u32 = 8;
 const BLOCK: usize = 512;
 const BITS_PER_BMBLOCK: u64 = (BLOCK as u64) * 8; // 4096 bits per bitmap block
 
-// Extent lists (GSFS0007). A file is normally a single contiguous extent (`ITYPE_FILE`:
+// Superblock feature masks (GSFS0008, §6.15). Three u32 words after the journal geometry, under
+// the widened superblock CRC (now @136 over [0..136)). Each bit is a feature the disk USES:
+//   compat    — an older build that doesn't know the bit may still mount READ-WRITE (safe to ignore)
+//   ro_compat — ... may mount READ-ONLY (reading is safe; writing could corrupt the feature)
+//   incompat  — ... must REFUSE to mount (the on-disk structure is fundamentally different)
+const FEAT_COMPAT_OFF: usize = 124;    // u32
+const FEAT_RO_COMPAT_OFF: usize = 128; // u32
+const FEAT_INCOMPAT_OFF: usize = 132;  // u32
+const SB_CRC_OFF: usize = 136;         // u32 CRC32 over [0..136) — moved from @124, covers the masks
+
+// Defined feature bits + what THIS build understands. A disk bit outside the KNOWN_* set drives the
+// mount policy above. (As features are added post-0008, define a bit here — never a new magic.)
+const FEAT_COMPAT_BACKUP_SB: u32 = 0x1; // a backup superblock sits at the last LBA (Phase F)
+const FEAT_INCOMPAT_EXTENTS: u32 = 0x1; // some file is fragmented (extent list, Phase I) — needed to read it
+const KNOWN_COMPAT: u32 = FEAT_COMPAT_BACKUP_SB;
+const KNOWN_RO_COMPAT: u32 = 0;
+const KNOWN_INCOMPAT: u32 = FEAT_INCOMPAT_EXTENTS;
+
+// Extent lists (GSFS0008). A file is normally a single contiguous extent (`ITYPE_FILE`:
 // first_block..first_block+block_count is the data — the fast path). When no contiguous run is
 // free, the file becomes FRAGMENTED (`ITYPE_FILE_FRAG`): its `first_block` points to a single
 // CRC'd **extent block** and `block_count` = 1. The extent block lists the data runs, so a big
@@ -53,14 +78,14 @@ const EXT_ENTRY_SIZE: usize = 16;
 const EXT_CRC_OFF: usize = 508;    // u32 CRC32 over [0..508)
 const EXT_MAX: usize = (EXT_CRC_OFF - EXT_ENTRIES_OFF) / EXT_ENTRY_SIZE; // 31 runs per extent block
 
-// File-data block: 508 bytes of payload + a 4-byte CRC32 trailer @508 (GSFS0007). A file of N
+// File-data block: 508 bytes of payload + a 4-byte CRC32 trailer @508 (GSFS0008). A file of N
 // bytes spans ceil(N/508) data blocks; each carries the CRC of its own payload, verified on
 // every read. (Directory blocks use a different split — 448 records + CRC; superblock/bitmap/
 // journal blocks are raw, with their own integrity schemes.)
 const DATA_PAYLOAD: usize = 508;
 const DATA_CRC_OFF: usize = DATA_PAYLOAD; // 508 — u32 CRC32 of the 508-byte payload
 
-// file_record entry: 64 bytes. GSFS0007 fits 7 per 512-byte directory block and reserves
+// file_record entry: 64 bytes. GSFS0008 fits 7 per 512-byte directory block and reserves
 // the last 64 bytes as a trailer holding the block's CRC32 (over the 448-byte record
 // region). The record layout itself is unchanged from GSFS0003 — names stay 38 bytes.
 const REC_SIZE: usize = 64;
@@ -69,7 +94,7 @@ const DIR_REC_REGION: usize = RECS_PER_BLOCK * REC_SIZE; // 448 — CRC covers [
 const DIR_CRC_OFF: usize = DIR_REC_REGION; // 448 — u32 CRC32 of the record region
 const NAME_MAX: usize = 38; // entry: type u8 @0, name_len u8 @1, name[38] @2, size @40, first @48, count @56
 
-// Crash-consistency journal region (GSFS0007 geometry). Fixed size, bounded (§26.6): a
+// Crash-consistency journal region (GSFS0008 geometry). Fixed size, bounded (§26.6): a
 // transaction larger than this is refused loudly, never partially applied.
 const JOURNAL_BLOCKS: u64 = 64; // 64 × 512 B = 32 KiB
 // One commit/header block + up to TXN_CAP data blocks must fit the journal region.
@@ -154,6 +179,14 @@ struct Fs {
     flags: u32,
     label: [u8; LABEL_MAX],
     label_len: u8,
+    // Feature masks (GSFS0008, §6.15). Preserved across `persist_super`; `feat_incompat` gains
+    // FEAT_INCOMPAT_EXTENTS the first time a file fragments. `read_only` is set at mount when the
+    // disk carries an unknown `ro_compat` bit (mount degraded rather than refuse), and gates every
+    // mutating op in `serve` (loud refusal, never a silent no-op).
+    feat_compat: u32,
+    feat_ro_compat: u32,
+    feat_incompat: u32,
+    read_only: bool,
     // Crash-consistency journal (Phase C). While `txn_active`, structural writes (directory,
     // bitmap, superblock) are STAGED here — with read-your-writes — instead of going to disk,
     // then committed atomically through the on-disk journal region (`commit_txn`). Data-block
@@ -196,7 +229,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut fs: Option<Fs> = match Fs::mount(&ctx) {
         Ok(f) => {
             ctx.log_fmt(format_args!(
-                "fs: mounted GSFS0007 ({} blocks, bitmap {}..{}, root@{}, {} free)",
+                "fs: mounted GSFS0008 ({} blocks, bitmap {}..{}, root@{}, {} free)",
                 f.total_blocks, f.bitmap_start, f.data_start, f.root_first_block, f.free_blocks
             ));
             Some(f)
@@ -255,7 +288,7 @@ fn self_test(ctx: &ServiceContext, fs: &mut Fs) {
     let mut buf = [0u8; MAX_FILE_BYTES];
 
     // Data-integrity probe: if a host-baked `/probe.bin` exists, read it — exercising the
-    // per-data-block CRC (GSFS0007). A corrupt block is refused loudly by `data_read`, so the
+    // per-data-block CRC (GSFS0008). A corrupt block is refused loudly by `data_read`, so the
     // read fails rather than returning garbage. (Used by `osdev test fs-corrupt` case 3.)
     if fs.walk(ctx, b"/probe.bin").is_some() {
         match fs.read_path(ctx, b"/probe.bin", &mut buf) {
@@ -561,6 +594,10 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
             let ll = if p.len() >= 2 { (p[1] as usize).min(LABEL_MAX) } else { 0 };
             let label = if p.len() >= 2 + ll { &p[2..2 + ll] } else { &[][..] };
             match vol {
+                Some(f) if f.read_only => {
+                    ctx.log("fs: label refused — filesystem mounted READ-ONLY (unsupported ro_compat feature)");
+                    send(&[FS_ERR]);
+                }
                 Some(f) => {
                     f.begin_txn();
                     let r = f.relabel(ctx, label);
@@ -584,6 +621,10 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
         OP_CHECK => {
             // fsck: self-managed (not one transaction — rewrites the whole bitmap; idempotent).
             match vol {
+                Some(f) if f.read_only => {
+                    ctx.log("fs: check refused — filesystem mounted READ-ONLY (fsck writes the bitmap)");
+                    send(&[FS_ERR]);
+                }
                 Some(f) => match f.check(ctx) {
                     Ok((files, dirs, bad, used)) => {
                         let mut out = [0u8; 29];
@@ -632,6 +673,13 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
         None => { send(&[FS_NOFS]); return; }
     };
     let op = p[0];
+    // Read-only mount (unknown ro_compat feature, §6.15): refuse every mutating op LOUDLY rather
+    // than silently dropping the write. Reads (STAT/READ/READ_AT/LIST) pass through.
+    if fs.read_only && op_is_mutating(op) {
+        ctx.log("fs: write refused — filesystem mounted READ-ONLY (unsupported ro_compat feature)");
+        send(&[FS_ERR]);
+        return;
+    }
     let plen = p[1] as usize;
     if p.len() < 2 + plen { send(&[FS_ERR]); return; }
     let path = &p[2..2 + plen];
@@ -730,13 +778,14 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
 
 impl Fs {
     // ── mount / format / drive metadata ──────────────────────────────────────
-    /// Validate a superblock copy: correct magic AND CRC32 over the first 124 bytes (§3.12).
+    /// Validate a superblock copy: correct (frozen) magic AND CRC32 over the first `SB_CRC_OFF`
+    /// bytes — which now includes the GSFS0008 feature masks (§3.12, §6.15).
     fn sb_valid(b: &[u8; BLOCK]) -> bool {
-        &b[0..8] == SB_MAGIC && u32_at(b, 124) == crc32(&b[..124])
+        &b[0..8] == SB_MAGIC && u32_at(b, SB_CRC_OFF) == crc32(&b[..SB_CRC_OFF])
     }
 
     /// Read the superblock, falling back to the **backup copy at the last LBA** if the primary
-    /// (LBA 0) is unreadable or fails its CRC (GSFS0007). The backup is located via the device
+    /// (LBA 0) is unreadable or fails its CRC (GSFS0008). The backup is located via the device
     /// capacity, so it works even when the primary is unreadable (no chicken-and-egg). On a
     /// successful fallback the primary is healed (rewritten from the backup).
     fn read_superblock(ctx: &ServiceContext) -> Result<[u8; BLOCK], &'static str> {
@@ -764,8 +813,31 @@ impl Fs {
 
     fn mount(ctx: &ServiceContext) -> Result<Fs, &'static str> {
         let sb = Self::read_superblock(ctx)?;
+        // Feature policy (GSFS0008, §6.15). The masks are valid because `sb_valid` (above) covers
+        // them under the superblock CRC. An `incompat` bit this build doesn't know means the
+        // on-disk structure is fundamentally different — REFUSE loudly (never a risky misread). An
+        // unknown `ro_compat` bit means we can read but not safely write — mount READ-ONLY. Unknown
+        // `compat` bits are safe to ignore. This is what lets the format evolve without a reformat.
+        let feat_compat = u32_at(&sb, FEAT_COMPAT_OFF);
+        let feat_ro_compat = u32_at(&sb, FEAT_RO_COMPAT_OFF);
+        let feat_incompat = u32_at(&sb, FEAT_INCOMPAT_OFF);
+        let unknown_incompat = feat_incompat & !KNOWN_INCOMPAT;
+        if unknown_incompat != 0 {
+            ctx.log_fmt(format_args!(
+                "fs: refusing to mount — disk uses incompatible features (incompat mask {:#010x}, unknown {:#010x})",
+                feat_incompat, unknown_incompat));
+            return Err("disk uses incompatible features this build does not understand");
+        }
+        let read_only = (feat_ro_compat & !KNOWN_RO_COMPAT) != 0;
+        if read_only {
+            ctx.log_fmt(format_args!(
+                "fs: mounting READ-ONLY — disk uses ro_compat features this build doesn't support (ro_compat mask {:#010x})",
+                feat_ro_compat));
+        }
         // Crash recovery: replay a committed-but-unfinished transaction before serving (§9).
-        // Idempotent — a clean shutdown leaves no commit record, so this is a no-op then.
+        // Idempotent — a clean shutdown leaves no commit record, so this is a no-op then. (A
+        // read-only mount still recovers: replaying an already-committed write is not a new write,
+        // and leaving the fs torn would be worse — see §6.15.)
         Fs::recover(ctx, u64_at(&sb, 108));
         let mut label = [0u8; LABEL_MAX];
         let ll = (sb[76] as usize).min(LABEL_MAX);
@@ -782,6 +854,10 @@ impl Fs {
             flags: u32_at(&sb, 72),
             label,
             label_len: ll as u8,
+            feat_compat,
+            feat_ro_compat,
+            feat_incompat,
+            read_only,
             txn_active: false,
             txn_n: 0,
             txn_overflow: false,
@@ -936,13 +1012,13 @@ impl Fs {
         ctx.log_fmt(format_args!("fs: journal recovered {} block(s) from an interrupted write", n));
     }
 
-    /// Format the disk as an empty GSFS0007 sized to `capacity`, then mount. Same layout
+    /// Format the disk as an empty GSFS0008 sized to `capacity`, then mount. Same layout
     /// `osdev format_superblock` writes. `drives flash`; only ever user-initiated (§3.12).
     fn format(ctx: &ServiceContext, capacity: u64, label: &[u8]) -> Result<Fs, &'static str> {
         let total_blocks = capacity;
         let bitmap_start: u64 = 1;
         let bitmap_blocks = (total_blocks + BITS_PER_BMBLOCK - 1) / BITS_PER_BMBLOCK;
-        // Reserve the journal region between the bitmap and the data region (GSFS0007).
+        // Reserve the journal region between the bitmap and the data region (GSFS0008).
         let journal_start = bitmap_start + bitmap_blocks;
         let journal_blocks = JOURNAL_BLOCKS;
         let data_start = journal_start + journal_blocks;
@@ -959,7 +1035,7 @@ impl Fs {
 
         let mut sb = [0u8; BLOCK];
         sb[0..8].copy_from_slice(SB_MAGIC);
-        sb[8..12].copy_from_slice(&7u32.to_le_bytes());
+        sb[8..12].copy_from_slice(&SB_VERSION.to_le_bytes());
         sb[12..16].copy_from_slice(&(BLOCK as u32).to_le_bytes());
         sb[16..24].copy_from_slice(&total_blocks.to_le_bytes());
         sb[24..32].copy_from_slice(&bitmap_start.to_le_bytes());
@@ -974,8 +1050,14 @@ impl Fs {
         sb[77..77 + ll].copy_from_slice(&label[..ll]);
         sb[108..116].copy_from_slice(&journal_start.to_le_bytes());
         sb[116..124].copy_from_slice(&journal_blocks.to_le_bytes());
-        let sb_crc = crc32(&sb[..124]);
-        sb[124..128].copy_from_slice(&sb_crc.to_le_bytes());
+        // Feature masks (GSFS0008): a fresh disk always has the backup superblock (compat), no
+        // ro_compat feature, and no fragmented file yet (incompat gains EXTENTS lazily, on first
+        // fragmentation — see `alloc_file`).
+        sb[FEAT_COMPAT_OFF..FEAT_COMPAT_OFF + 4].copy_from_slice(&FEAT_COMPAT_BACKUP_SB.to_le_bytes());
+        sb[FEAT_RO_COMPAT_OFF..FEAT_RO_COMPAT_OFF + 4].copy_from_slice(&0u32.to_le_bytes());
+        sb[FEAT_INCOMPAT_OFF..FEAT_INCOMPAT_OFF + 4].copy_from_slice(&0u32.to_le_bytes());
+        let sb_crc = crc32(&sb[..SB_CRC_OFF]);
+        sb[SB_CRC_OFF..SB_CRC_OFF + 4].copy_from_slice(&sb_crc.to_le_bytes());
         // Write the superblock to BOTH the primary (LBA 0) and the backup (last LBA) copies.
         if !block_write(ctx, 0, &sb) { return Err("superblock write failed"); }
         if !block_write(ctx, backup_lba, &sb) { return Err("backup superblock write failed"); }
@@ -1036,9 +1118,14 @@ impl Fs {
         for b in &mut sb[77..77 + LABEL_MAX] { *b = 0; }
         sb[77..77 + ll].copy_from_slice(&self.label[..ll]);
         // Journal geometry (@108..124) is fixed at format and rides through untouched.
-        // Re-stamp the integrity CRC over the updated superblock (§3.12).
-        let sb_crc = crc32(&sb[..124]);
-        sb[124..128].copy_from_slice(&sb_crc.to_le_bytes());
+        // Feature masks (GSFS0008): preserved across writes; `feat_incompat` may have gained
+        // FEAT_INCOMPAT_EXTENTS since mount (first fragmentation), so write the live values.
+        sb[FEAT_COMPAT_OFF..FEAT_COMPAT_OFF + 4].copy_from_slice(&self.feat_compat.to_le_bytes());
+        sb[FEAT_RO_COMPAT_OFF..FEAT_RO_COMPAT_OFF + 4].copy_from_slice(&self.feat_ro_compat.to_le_bytes());
+        sb[FEAT_INCOMPAT_OFF..FEAT_INCOMPAT_OFF + 4].copy_from_slice(&self.feat_incompat.to_le_bytes());
+        // Re-stamp the integrity CRC over the updated superblock — now covering the masks (§3.12).
+        let sb_crc = crc32(&sb[..SB_CRC_OFF]);
+        sb[SB_CRC_OFF..SB_CRC_OFF + 4].copy_from_slice(&sb_crc.to_le_bytes());
         // Write BOTH copies — primary (LBA 0) and backup (last LBA) — staged in the same
         // transaction, so they commit atomically and the backup never lags the primary.
         if !self.tb_write(ctx, 0, &sb) { return Err("superblock write failed"); }
@@ -1109,7 +1196,7 @@ impl Fs {
         Ok(())
     }
 
-    // ── extent lists (GSFS0007) ───────────────────────────────────────────────
+    // ── extent lists (GSFS0008) ───────────────────────────────────────────────
     // A file is normally one contiguous extent (`ITYPE_FILE`, the fast path: data is
     // `first_block..first_block+block_count`). When no contiguous run is free, the file is
     // stored FRAGMENTED (`ITYPE_FILE_FRAG`): `first_block` → a single CRC'd **extent block**
@@ -1231,6 +1318,13 @@ impl Fs {
                     let _ = self.free_run(ctx, ext_lba, 1);
                     for i in 0..ne { let (s, l) = exts[i]; let _ = self.free_run(ctx, s, l); }
                     return Err("extent block write failed");
+                }
+                // First fragmentation on this disk: record the EXTENTS incompat feature so a build
+                // that doesn't understand extent lists refuses rather than misreads (§6.15). Staged
+                // in the same transaction as the rest of the write; a no-op once already set.
+                if self.feat_incompat & FEAT_INCOMPAT_EXTENTS == 0 {
+                    self.feat_incompat |= FEAT_INCOMPAT_EXTENTS;
+                    self.persist_super(ctx)?;
                 }
                 Ok((ITYPE_FILE_FRAG, ext_lba, 1))
             }
@@ -1924,9 +2018,18 @@ fn valid_name(name: &[u8]) -> bool {
 }
 
 /// A regular file, contiguous (`ITYPE_FILE`) or fragmented (`ITYPE_FILE_FRAG`). Both store
-/// data; they differ only in how the data blocks are located (extent-list GSFS0007).
+/// data; they differ only in how the data blocks are located (extent-list GSFS0008).
 fn is_file(itype: u8) -> bool {
     itype == ITYPE_FILE || itype == ITYPE_FILE_FRAG
+}
+
+/// Whether a file-API op writes the filesystem — gated on a READ-ONLY mount (§6.15). The
+/// early-match ops (LABEL/CHECK mutate; FLASH/RESET reformat-or-wipe and are allowed; INFO/SCRUB
+/// read) are guarded inline; this covers the path-addressed ops dispatched below.
+fn op_is_mutating(op: u8) -> bool {
+    matches!(op,
+        OP_WRITE_FILE | OP_WRITE_NEW | OP_WRITE_AT | OP_WRITE_AT_J |
+        OP_MKDIR | OP_MKDIR_P | OP_RENAME | OP_DELETE | OP_DELETE_TREE | OP_MOVE)
 }
 
 /// Map the `n`-th data block of a fragmented file to its LBA by walking the extent runs.
