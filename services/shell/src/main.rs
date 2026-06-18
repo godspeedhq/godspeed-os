@@ -2442,10 +2442,17 @@ fn cmd_fcap(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Result<(), ShellError
         Some(_) => { fail(ctx, "fcap: FAIL cap usable after close"); ok = false; }
     }
 
-    // Cleanup so `fcap` is leak-free and re-runnable (e.g. in the selfcheck suite): close the
-    // RO cap (revokes its fs resource → frees a delegated band slot) and drop both shell handles
-    // (rw is already revoked from step 8). Otherwise each run would orphan an open file + 2 cap slots.
-    let _ = fc_invoke(ctx, ro, RIGHT_READ, &[FOP_CLOSE]);
+    // 9. Revocable on path rebinding (confused-deputy avoidance, §7.10): renaming the file makes
+    //    the old path name something else, so fs revokes the still-open `ro` cap — it can never
+    //    silently rebind to a different file later created at the old path.
+    let _ = fs_request(ctx, OP_RENAME, path, b"fcap.renamed");
+    match fc_invoke(ctx, ro, RIGHT_READ, &rbuf) {
+        None    => ctx.console_writeln("fcap: cap revoked after rename"),
+        Some(_) => { fail(ctx, "fcap: FAIL cap usable after rename"); ok = false; }
+    }
+
+    // Cleanup so `fcap` is leak-free and re-runnable (e.g. in selfcheck): drop both shell handles
+    // (rw revoked at close, ro revoked at rename). Otherwise each run orphans cap-table slots.
     ctx.remove_cap(ro);
     ctx.remove_cap(rw);
 

@@ -676,10 +676,11 @@ fn handle_resource_mint(rights_bits: u64, out_id_ptr: u64, _a2: u64) -> i64 {
 ///
 /// The "use = send" of a delegated resource cap. Validates the file cap carries `right_bits`
 /// (a READ-only cap invoking with WRITE fails `CapInsufficientRights` — non-escalation, §7.3),
-/// then routes the message to the owning service's endpoint with the badge
-/// `[resource_id:u64, right:u8]` prepended to the payload, carrying an embedded reply cap exactly
-/// as `SendWithCap`. The owner reads the badge to know which resource + which right the kernel
-/// validated; it never trusts the client, and the kernel never learns the operation.
+/// then routes the message to the owning service's endpoint with the badge carried in the
+/// **kernel-set `Message` fields** `badge_id`/`badge_right` (unforgeable — an ordinary `send`
+/// leaves them 0), and an embedded reply cap exactly as `SendWithCap`. The owner reads the badge
+/// (via `LastRecvBadge`) to know which resource + which right the kernel validated; it never
+/// trusts the client, and the kernel never learns the operation.
 fn handle_resource_invoke(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     use crate::capability::delegated;
     let file_slot  = (packed & 0xFFFF) as usize;

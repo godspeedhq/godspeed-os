@@ -1864,6 +1864,10 @@ impl Fs {
                     for b in &mut blk[o + 2..o + 2 + NAME_MAX] { *b = 0; }
                     blk[o + 2..o + 2 + newname.len()].copy_from_slice(newname);
                     if !self.td_write(ctx, block, &mut blk) { return Err("dir write failed"); }
+                    // The old path no longer names this file — revoke any open caps to it, so a
+                    // held cap can never silently rebind to a different file later created at the
+                    // old path (confused-deputy avoidance; §7.10). Same discipline as delete.
+                    self.revoke_open_by_path(ctx, path);
                     return Ok(());
                 }
             }
@@ -2181,7 +2185,11 @@ impl Fs {
             return self.rename(ctx, src, dname);
         }
         self.dir_add(ctx, &mut dparent, dname, e.itype, e.size, e.first_block, e.block_count)?;
-        self.dir_remove(ctx, &sparent, sname)
+        self.dir_remove(ctx, &sparent, sname)?;
+        // `src` no longer names this file — revoke any open caps to it (confused-deputy
+        // avoidance, §7.10). The same-directory case above goes through `rename`, which does this.
+        self.revoke_open_by_path(ctx, src);
+        Ok(())
     }
 }
 
