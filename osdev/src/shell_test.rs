@@ -261,6 +261,28 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
+    // Tab completion: single match fills in; multiple → numbered menu, digit selects.
+    // -----------------------------------------------------------------------
+    // `fc` + Tab → only `fcap` matches → it is filled in. (Ctrl-C clears the line afterward.)
+    send(&mut write_half, b"fc\t\x03");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("fcap"), "tab: single match completes (fc → fcap)"),
+        None    => { println!("shell-test: FAIL — timed out after tab(fc)"); fail += 1; }
+    }
+    // `co` + Tab → cores / copy / count → numbered menu; digit `1` selects `cores`; Enter runs it.
+    // The menu redraws its own `gsh> ` prompt, so the first collect ends at the menu; a second
+    // collect captures the selection + the executed command's output.
+    send(&mut write_half, b"co\t1\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(menu) => check!(menu.contains("1) cores") && menu.contains("copy"), "tab: numbered menu lists candidates"),
+        None       => { println!("shell-test: FAIL — timed out waiting for tab menu"); fail += 1; }
+    }
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(run) => check!(run.contains(&format!("cores: {smp}")), "tab: digit selects + runs the command (1 → cores)"),
+        None      => { println!("shell-test: FAIL — timed out after tab selection"); fail += 1; }
+    }
+
+    // -----------------------------------------------------------------------
     // pipe errors: a non-producer source, and the result/assert outcome mix-up
     // -----------------------------------------------------------------------
     send(&mut write_half, b"about | to json\r");

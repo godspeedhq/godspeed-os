@@ -225,6 +225,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     ctx.console_write("\x08 \x08");
                 }
             }
+            0x09 => {
+                // Tab — complete the command name. One match → fill it in; several → print a
+                // numbered menu and the next digit selects (no Enter). Event-driven (redraws only
+                // on this keypress, via the same console-write path normal echo uses).
+                complete_tab(&ctx, &mut line_buf, &mut line_len);
+            }
             0x03 => {
                 // Ctrl-C — clear line
                 ctx.console_writeln("^C");
@@ -259,6 +265,68 @@ fn replace_line(ctx: &ServiceContext, buf: &mut [u8; MAX_LINE], len: &mut usize,
     if n > 0 {
         ctx.console_write(core::str::from_utf8(&buf[..n]).unwrap_or(""));
     }
+}
+
+/// Tab-completion of the command name. Matches the current line (the first token) against the
+/// command list (`UTILS`): one match → fill it in with a trailing space; several → print a
+/// numbered menu and block for one digit, which selects (no Enter) and drops the command into the
+/// prompt. Only completes a bare command (no space typed yet) — argument/path completion is future
+/// work. Bounded (§26.6): at most `UTILS.len()` matches, 1–9 selectable by digit.
+fn complete_tab(ctx: &ServiceContext, buf: &mut [u8; MAX_LINE], len: &mut usize) {
+    // Only complete while still typing the command token (nothing after a space).
+    if *len == 0 || buf[..*len].contains(&b' ') { return; }
+    let prefix = &buf[..*len];
+
+    // Collect matching command indices (UTILS order — stable, so the menu numbering is stable).
+    let mut matches = [0usize; 64];
+    let mut n = 0usize;
+    for (i, u) in UTILS.iter().enumerate() {
+        if u.as_bytes().starts_with(prefix) {
+            if n < matches.len() { matches[n] = i; n += 1; }
+        }
+    }
+    if n == 0 { return; }                       // no candidates — leave the line as-is
+    if n == 1 { set_completed(ctx, buf, len, UTILS[matches[0]]); return; }
+
+    // Several candidates: print a numbered menu (1..=min(9,n)), then read one selection digit.
+    let shown = n.min(9);
+    ctx.console_write("\r\n");
+    for k in 0..shown {
+        let mut row = [0u8; 40];
+        let mut p = 0usize;
+        row[p] = b'1' + k as u8; p += 1;
+        row[p] = b')';          p += 1;
+        row[p] = b' ';          p += 1;
+        let name = UTILS[matches[k]].as_bytes();
+        let take = name.len().min(row.len() - p - 2);
+        row[p..p + take].copy_from_slice(&name[..take]); p += take;
+        row[p] = b' '; p += 1; row[p] = b' '; p += 1;     // two trailing spaces between entries
+        ctx.console_write(core::str::from_utf8(&row[..p]).unwrap_or(""));
+    }
+    if n > shown { ctx.console_write("(type more to narrow) "); }
+    ctx.console_write("\r\n");
+    // Reprint the prompt + what was typed so the cursor sits where it was.
+    ctx.console_write("gsh> ");
+    ctx.console_write(core::str::from_utf8(prefix).unwrap_or(""));
+
+    // The next key selects: a digit in range completes; anything else cancels (line unchanged).
+    let sel = ctx.console_read();
+    if (b'1'..=b'9').contains(&sel) {
+        let idx = (sel - b'1') as usize;
+        if idx < shown { set_completed(ctx, buf, len, UTILS[matches[idx]]); }
+    }
+}
+
+/// Replace the on-screen input with `cmd` followed by a trailing space, updating `buf`/`len`.
+/// Reuses `replace_line`, so the old text is erased and the new text echoed the same way history
+/// recall does.
+fn set_completed(ctx: &ServiceContext, buf: &mut [u8; MAX_LINE], len: &mut usize, cmd: &str) {
+    let c = cmd.as_bytes();
+    let cl = c.len().min(MAX_LINE - 1);
+    let mut tmp = [0u8; MAX_LINE];
+    tmp[..cl].copy_from_slice(&c[..cl]);
+    tmp[cl] = b' ';                              // trailing space so the user can type args
+    replace_line(ctx, buf, len, &tmp[..cl + 1]);
 }
 
 /// A bounded ring of recent command lines for up/down-arrow recall (§26.6: fixed size,
@@ -738,7 +806,7 @@ const UTIL_VERSION: &str = "0.1.0";
 const UTILS: &[&str] = &[
     "help", "result", "run", "assert", "selfcheck",
     "echo", "clear", "about", "mem", "cores", "date", "status", "observe", "caps", "roster",
-    "spawn", "kill", "restart", "reboot", "drives", "ls", "cd", "read", "write",
+    "spawn", "kill", "restart", "reboot", "drives", "ls", "cd", "read", "write", "fcap",
     "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count", "sort",
     "first", "last",
     // record-pipe verbs (pipe-only stages; see docs/records.md)
@@ -995,6 +1063,7 @@ fn cmd_help(ctx: &ServiceContext) -> Result<(), ShellError> {
     ctx.console_writeln("");
     ctx.console_writeln("Console");
     help_line(ctx, "help", "show this message");
+    help_line(ctx, "<prefix> Tab", "complete a command; if several match, press the shown digit to pick");
     help_line(ctx, "clear", "clear the screen");
     help_line(ctx, "echo <text>", "print text");
     help_line(ctx, "result", "the last command's result (Ok / Err)");
