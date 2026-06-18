@@ -788,6 +788,46 @@ impl ServiceContext {
         if ret == 0 { Ok(()) } else { Err(crate::ipc::i64_to_ipc_error(ret)) }
     }
 
+    /// Mint a **delegated resource** (§7.10, P2 file-as-capability): the kernel allocates a
+    /// fresh resource owned by this service and a cap for it carrying `rights` (use the
+    /// `RIGHT_*` bits), returning `(resource_id, cap)`. Requires the `RESOURCE_MINT` authority
+    /// (held by `fs`). The `resource_id` is what the kernel badges into a later
+    /// `resource_invoke`, so this service knows which resource a client is acting on (e.g. `fs`
+    /// maps it → file). `None` if the authority is missing, the band is full, or the cap table
+    /// is full. Syscall 30 = `ResourceMint`.
+    pub fn resource_mint(&self, rights: u8) -> Option<(u64, CapHandle)> {
+        let mut id: u64 = 0;
+        // SAFETY: syscall(30) = ResourceMint; arg1 points at our own `id` for the kernel to
+        // fill via write_user_bytes (validated kernel-side). Return is the cap slot or <0.
+        let ret = unsafe { raw_syscall(30, rights as u64, &mut id as *mut u64 as u64, 0) };
+        if ret < 0 { None } else { Some((id, CapHandle(ret as u32))) }
+    }
+
+    /// Use a delegated resource cap (§7.10) — the "send" of file-as-capability. The kernel
+    /// validates the cap holds `right` (a read needs `RIGHT_READ`, a write needs `RIGHT_WRITE`;
+    /// a cap lacking it fails `CapInsufficientRights` — the non-escalation check), then routes
+    /// `msg` to the owning service badged with the resource id + the validated right, embedding
+    /// `reply` (a SEND|GRANT cap) so the owner can reply. `Ok(())` on delivery. Syscall 31.
+    pub fn resource_invoke(&self, file: CapHandle, right: u8, reply: CapHandle, msg: &Message)
+        -> Result<(), IpcError> {
+        let packed = ((right as u64) << 32) | ((reply.0 as u64) << 16) | (file.0 as u64);
+        let payload = msg.payload_bytes();
+        // SAFETY: syscall(31) = ResourceInvoke; packed + payload are user values the kernel
+        // validates (cap slots, rights, generation, and the message bounds) before acting.
+        let ret = unsafe {
+            raw_syscall(31, packed, payload.as_ptr() as u64, payload.len() as u64)
+        };
+        if ret == 0 { Ok(()) } else { Err(crate::ipc::i64_to_ipc_error(ret)) }
+    }
+
+    /// Revoke a delegated resource this service owns (§7.10): bumps its generation so every
+    /// outstanding cap to it goes stale (clients see `CapRevoked`/`EndpointDead` on next use).
+    /// Owner-gated by the kernel (ownership is the check). `true` on success. Syscall 32.
+    pub fn resource_revoke(&self, resource_id: u64) -> bool {
+        // SAFETY: syscall(32) = ResourceRevoke; the kernel checks this task owns the resource.
+        unsafe { raw_syscall(32, resource_id, 0, 0) == 0 }
+    }
+
     /// Inject one byte into the console input ring (syscall 20). Only effective
     /// for an input-driver service holding a CONSOLE_PUSH cap (the USB keyboard
     /// driver, §12); the byte reaches the shell exactly like a serial keystroke.
