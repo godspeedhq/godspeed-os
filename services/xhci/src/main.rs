@@ -753,6 +753,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut int_cycle = [1u32; MAX_HID];
         let mut need_queue = [true; MAX_HID];
         let mut kb_last = [[0u8; 6]; MAX_HID];
+        let mut kb_rep = [
+            godspeed_sdk::hid::KeyRepeat::new(),
+            godspeed_sdk::hid::KeyRepeat::new(),
+        ];
         let mut mouse = [
             godspeed_sdk::hid::MouseTracker::new(),
             godspeed_sdk::hid::MouseTracker::new(),
@@ -817,7 +821,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         );
                     } else {
                         godspeed_sdk::hid::decode_keyboard(
-                            &rep, &mut kb_last[d], |ch| ctx.console_push(ch),
+                            &rep, &mut kb_last[d], &mut kb_rep[d], ctx.monotonic_ticks(),
+                            |ch| ctx.console_push(ch),
                             |code| ctx.log_fmt(format_args!(
                                 "xhci: unmapped HID key usage {:#04x} (add to sdk hid_to_ascii)", code)));
                     }
@@ -852,6 +857,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         break 'poll;
                     }
                     if !c { present &= !(1 << p); }
+                }
+            }
+            // Typematic auto-repeat: a held key sends no further USB reports, so
+            // synthesise repeats from the monotonic tick while the key stays down.
+            let now = ctx.monotonic_ticks();
+            for d in 0..ndev {
+                if !devs[d].is_mouse {
+                    kb_rep[d].poll(now, |ch| ctx.console_push(ch));
                 }
             }
             ctx.yield_cpu();

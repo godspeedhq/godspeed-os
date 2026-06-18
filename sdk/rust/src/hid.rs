@@ -59,14 +59,86 @@ fn is_typable_code(k: u8) -> bool {
     matches!(k, 0x04..=0x27 | 0x2D..=0x38 | 0x64)
 }
 
+/// Emit the byte(s) a single keycode produces under `mods`, returning `true` if it
+/// produced any output (i.e. it is a printable / cursor key worth auto-repeating).
+/// Shared by the first-press edge path and the auto-repeat path so a repeated key is
+/// byte-for-byte identical to its first press. Arrow keys → ANSI escape sequences
+/// (ESC [ A/B/C/D), exactly what a serial terminal sends, so the shell's one input
+/// parser handles USB and serial alike (e.g. the up-arrow history walk).
+fn emit_key(k: u8, mods: u8, emit: &mut impl FnMut(u8)) -> bool {
+    match k {
+        0x52 => { emit(0x1B); emit(b'['); emit(b'A'); true } // Up
+        0x51 => { emit(0x1B); emit(b'['); emit(b'B'); true } // Down
+        0x4F => { emit(0x1B); emit(b'['); emit(b'C'); true } // Right
+        0x50 => { emit(0x1B); emit(b'['); emit(b'D'); true } // Left
+        _ => match hid_to_ascii(k, mods) {
+            Some(ch) => { emit(ch); true }
+            None => false,
+        },
+    }
+}
+
+/// Typematic auto-repeat timing, in `ServiceContext::monotonic_ticks` units (one tick
+/// ≈ the kernel preemption period: ~50 ms on the T630 periodic timer, 10 ms under
+/// TSC-Deadline). USB HID boot keyboards report only on *change* — a held key sends
+/// one down report and then nothing until release — so the host must synthesise
+/// repeat itself. These are deliberately coarse; the goal is "hold backspace and it
+/// keeps deleting," not a configurable rate.
+pub const REPEAT_INITIAL_TICKS: u64 = 5; // delay before the first repeat (~250 ms HW)
+pub const REPEAT_INTERVAL_TICKS: u64 = 1; // then one repeat per tick (~20/s HW)
+
+/// Tracks the currently-held key so a driver can synthesise typematic auto-repeat
+/// from a monotonic tick. `decode_keyboard` arms it on a fresh printable press and
+/// disarms it when that key is released; the driver calls [`KeyRepeat::poll`] every
+/// loop iteration with the current tick to emit repeats. One per keyboard device.
+pub struct KeyRepeat {
+    key: u8,      // HID usage of the key being repeated (0 = none armed)
+    mods: u8,     // modifier byte captured at press (so Shift+key repeats the shifted form)
+    next_at: u64, // monotonic tick at which the next repeat is due
+}
+
+impl KeyRepeat {
+    pub const fn new() -> Self {
+        KeyRepeat { key: 0, mods: 0, next_at: 0 }
+    }
+
+    fn arm(&mut self, key: u8, mods: u8, now: u64) {
+        self.key = key;
+        self.mods = mods;
+        self.next_at = now.wrapping_add(REPEAT_INITIAL_TICKS);
+    }
+
+    fn disarm(&mut self) {
+        self.key = 0;
+    }
+
+    /// Emit a repeat of the held key if one is due at tick `now`. Call once per poll
+    /// iteration; it is a no-op until the initial delay elapses, then fires at most
+    /// once per `REPEAT_INTERVAL_TICKS`.
+    pub fn poll(&mut self, now: u64, mut emit: impl FnMut(u8)) {
+        if self.key == 0 || now < self.next_at {
+            return;
+        }
+        emit_key(self.key, self.mods, &mut emit);
+        self.next_at = now.wrapping_add(REPEAT_INTERVAL_TICKS);
+    }
+}
+
 /// Decode a keyboard boot report (modifiers in byte 0, up to six keycodes in
 /// bytes 2..8) with N-key edge detection: `emit(ascii)` is called for every key
 /// that is down now but was not in `last`, so rolling onto a new key before
 /// releasing the previous one drops nothing and a held key fires exactly once.
 /// `last` is updated to this report's keycodes for the next call.
+///
+/// `rep`/`now` drive typematic auto-repeat: the newest printable key still held is
+/// armed (at tick `now`) so the driver's [`KeyRepeat::poll`] re-emits it while held;
+/// releasing it disarms repeat. A key we don't map is reported via `on_unmapped`
+/// (loud, not silently dropped — §3.12) so its HID usage code can be logged and added.
 pub fn decode_keyboard(
     report: &[u8; 8],
     last: &mut [u8; 6],
+    rep: &mut KeyRepeat,
+    now: u64,
     mut emit: impl FnMut(u8),
     mut on_unmapped: impl FnMut(u8),
 ) {
@@ -75,25 +147,19 @@ pub fn decode_keyboard(
     for &k in cur.iter() {
         if k == 0 || k == 0x01 { continue; } // 0 = empty slot, 0x01 = rollover error
         if !last.contains(&k) {
-            // Arrow keys → ANSI escape sequences (ESC [ A/B/C/D), exactly what a serial
-            // terminal sends, so the shell's one input parser handles both paths (e.g. the
-            // up-arrow history walk). Other keys decode to ASCII; a key we don't map is
-            // reported via `on_unmapped` (loud, not silently dropped — §3.12) so the exact
-            // HID usage code can be logged and added to the map.
-            match k {
-                0x52 => { emit(0x1B); emit(b'['); emit(b'A'); } // Up
-                0x51 => { emit(0x1B); emit(b'['); emit(b'B'); } // Down
-                0x4F => { emit(0x1B); emit(b'['); emit(b'C'); } // Right
-                0x50 => { emit(0x1B); emit(b'['); emit(b'D'); } // Left
-                // Modifiers/Caps/etc. (0x29 Esc, 0x39 CapsLock, 0xE0-E7) are not printable;
-                // don't report them as "unmapped" noise — only report keys in the typable
-                // ranges we'd expect to map.
-                _ => match hid_to_ascii(k, mods) {
-                    Some(ch) => emit(ch),
-                    None => if is_typable_code(k) { on_unmapped(k); },
-                },
+            if emit_key(k, mods, &mut emit) {
+                // Newest printable/cursor key held becomes the repeat key.
+                rep.arm(k, mods, now);
+            } else if is_typable_code(k) {
+                // Modifiers/Caps/Esc (0x29, 0x39, 0xE0-E7) are not printable; only the
+                // typable ranges we'd expect to map are surfaced as "unmapped" noise.
+                on_unmapped(k);
             }
         }
+    }
+    // Stop repeating once the armed key is no longer held.
+    if rep.key != 0 && !cur.contains(&rep.key) {
+        rep.disarm();
     }
     *last = cur;
 }

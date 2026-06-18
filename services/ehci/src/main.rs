@@ -736,6 +736,7 @@ fn poll_devices(
     let mut toggle = [0u32; MAX_HID];
     let mut err = [0u32; MAX_HID];                        // consecutive errored completions
     let mut kb_last = [0u8; 6];                           // keyboard edge-detection state
+    let mut kb_rep = godspeed_sdk::hid::KeyRepeat::new();   // typematic auto-repeat state
     let mut mouse = godspeed_sdk::hid::MouseTracker::new(); // mouse button/motion state
     loop {
         for i in 0..n {
@@ -757,7 +758,7 @@ fn poll_devices(
                     );
                 } else {
                     godspeed_sdk::hid::decode_keyboard(
-                        &rep, &mut kb_last,
+                        &rep, &mut kb_last, &mut kb_rep, ctx.monotonic_ticks(),
                         |ch| ctx.console_push(ch),
                         |code| ctx.log_fmt(format_args!(
                             "ehci: unmapped HID key usage {:#04x} (add to sdk hid_to_ascii)", code)),
@@ -777,6 +778,9 @@ fn poll_devices(
             }
             arm_int(dma, qh, toggle[i]);  // re-arm (on success or error alike)
         }
+        // Typematic auto-repeat: a held key sends no further reports, so synthesise
+        // repeats from the monotonic tick while the key stays down.
+        kb_rep.poll(ctx.monotonic_ticks(), |ch| ctx.console_push(ch));
         ctx.yield_cpu();
     }
 }
