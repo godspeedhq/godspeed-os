@@ -1904,6 +1904,15 @@ GodspeedOS has booted on real x86_64 hardware (4-core CPU, 4 GB RAM) via UEFI US
 - Null modem serial (115200 8N1, PuTTY) confirms boot output; log appended to `build/putty_serial_output.log`.
 - `bare-metal` supervisor feature excludes harness-driven probe services that require QEMU's control port.
 
+**Persistence + file-as-capability hardware-proven on the HP T630 (2026-06-18).** Booted the bare-metal
+`os.img` on the T630 (AMD GX-420GI, real AHCI SSD) and ran the shell `selfcheck` suite: **`ran 163,
+failed 0`**. That run includes the full persistence stack (GSFS0008 format, journal, fsck/`drives check`,
+read-only `drives scrub`) and the **file-as-capability** self-check (`fcap`, §22 Test 14): a file opened
+as a real kernel capability, read/written *through* the cap, non-escalation enforced at both the kernel
+and fs layers, a forged handle rejected, and the cap revoked on close and on rename — all green on real
+hardware, no panic. The §7 "north star" (a file *is* a capability, true not approximate) is hardware-
+validated, not just QEMU. Serial in `build/putty_serial_output.log`.
+
 Hardware performance data (perf-brutal-only build, ~3 GHz CPU, 2026-05-21):
 
 | Benchmark | Result |
