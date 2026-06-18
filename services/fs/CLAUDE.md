@@ -92,6 +92,7 @@ hard links. Bad magic **or** bad CRC is a loud mount refusal, never an auto-refo
 | `Check`     | 27 | —                 | fsck: `Ok`, files/dirs/bad:u32, used/free:u64 — rebuild bitmap+free from the tree, verify CRCs |
 | `WriteAtJ`  | 28 | path, offset:u64, chunk | `Ok` / `Err` — like `WriteAt` but the chunk's data is **journaled** (Phase J): applied atomically (crash → replayed or discarded, never torn). Bounded to one chunk; default `WriteAt` stays direct |
 | `Scrub`     | 29 | —                 | scrub (Phase K): `Ok`, files/dirs/bad:u32, scanned:u64 — READ-ONLY CRC integrity sweep over the tree; reports bad blocks, **changes nothing** (unlike `Check`, which repairs) |
+| `Open`      | 30 | path, rights:u8   | file-as-capability (§7.10, P2): mint a delegated resource for the file, reply `[Ok]` + the **file cap** embedded. The holder then INVOKES the cap (kernel-badged) — `serve_filecap` resolves the badge's resource_id → file via the open-file table and enforces op ≤ the badged right (FOP_READ/WRITE/STAT/CLOSE). Proven by `osdev test file-cap` (§22 Test 14). |
 
 **Large files (streaming).** `WriteFile`/`ReadFile` carry a whole *small* file in one ≤4 KiB
 IPC message. Files larger than one message use the offset-addressed ops: `WriteNew` allocates

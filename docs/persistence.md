@@ -912,8 +912,13 @@ revocable, generationed) true for files, while honoring §4.4 (kernel stays file
 - **Phase 1 — authority = the cap to `fs`.** Holding `ipc_send=["fs"]` is the authority;
   files are addressed by name in the request. This ships *working, reboot-surviving
   persistence* without the new kernel mechanism.
-- **Phase 2 — per-file capabilities** via §7.2. `fs` returns a file cap on create/open;
-  read/write present the cap. File-as-capability becomes *true*, not approximate.
+- **Phase 2 — per-file capabilities** via §7.2. ✅ **Built + verified end-to-end 2026-06-18**
+  (`osdev test file-cap` 9/9). `fs` `Open(path, rights)` mints a delegated resource and returns a real
+  **file capability**; the holder operates the file by **invoking** that cap (`ResourceInvoke`), the
+  kernel badges the request with `(resource_id, right)` via an unforgeable `Message` field, and `fs`
+  resolves it through its open-file table, enforcing `op ≤ right`. Unforgeable, non-escalating (kernel
+  *and* fs layers), revocable on close/delete. File-as-capability is now *true*, not approximate. See
+  §7.4 (kernel mechanism) and §22 Test 14.
 
 ### 7.4 Phase 2 — concrete kernel mechanism (design, amendment-approved 2026-06-18)
 

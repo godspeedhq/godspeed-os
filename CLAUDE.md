@@ -1836,6 +1836,14 @@ test file_is_a_capability:
     assert kernel_did_not_panic()
 ```
 
+**Implemented (2026-06-18) as `osdev test file-cap` (9/9 ✅).** The shell `fcap <file>` command opens a
+file as a real kernel capability and exercises every property above end-to-end: read/write *through*
+the cap; non-escalation at **both** layers (the kernel rejects a READ-only cap's WRITE invocation with
+`CapInsufficientRights`, and `fs` refuses a write op carried under a read-validated badge — `op ≤ right`);
+a fabricated handle is rejected (unforgeable); and the cap is `CapRevoked` after close/delete (revocable).
+The badge that carries the validated `(resource_id, right)` to `fs` is an unforgeable kernel-set `Message`
+field (`LastRecvBadge` syscall) — a client cannot fake a file-cap invocation over its ordinary `fs` send cap.
+
 ---
 
 ### 22.6 Test Coverage Matrix

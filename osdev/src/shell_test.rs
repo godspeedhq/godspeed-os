@@ -1553,6 +1553,80 @@ pub fn run_fs_restart(image_path: &Path, persist_path: &str, smp: u32) {
     if fail > 0 { std::process::exit(1); }
 }
 
+/// §22 Test 14 — file-as-capability (P2). Boot a pre-formatted disk, create a file, then run the
+/// shell's `fcap <file>` command, which opens the file as a real kernel capability and self-checks
+/// every property: read/write via the cap, non-escalation (RO cap can't write at the kernel OR fs
+/// layer), forged-handle rejection, revoke-on-close. We assert each per-step line + the summary.
+pub fn run_fs_filecap(image_path: &Path, persist_path: &str, smp: u32) {
+    println!("file-cap: booting (smp={smp}) bare-metal + AHCI disk for the file-as-capability test");
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let persist   = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let persist_str = persist.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{shell_port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("file-cap: QEMU launch failed: {e}"); std::process::exit(1); });
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => { eprintln!("file-cap: could not connect to serial {shell_port}"); child.kill().ok(); std::process::exit(1); }
+    };
+    let mut read_half  = stream.try_clone().expect("clone tcp stream");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+
+    let mut pass = 0usize; let mut fail = 0usize; let mut cursor = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("file-cap: PASS — {}", $label); pass += 1; } else { println!("file-cap: FAIL — {}", $label); fail += 1; }
+    }; }
+    macro_rules! run { ($c:expr, $secs:expr) => {{ send(&mut write_half, $c); collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs)) }}; }
+
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).is_none() {
+        println!("file-cap: FAIL — timed out waiting for first gsh>");
+        child.kill().ok(); child.wait().ok(); std::process::exit(1);
+    }
+
+    // Create a file (name-addressed), then run the capability self-check on it.
+    let _ = run!(b"write /f.txt seeddata\r", 10);
+    match run!(b"fcap /f.txt\r", 15) {
+        Some(r) => {
+            check!(r.contains("opened rw (file cap)"), "fs minted a real file capability on open");
+            check!(r.contains("write via cap OK"),     "wrote the file THROUGH the cap");
+            check!(r.contains("read via cap OK"),      "read it back THROUGH the cap");
+            check!(r.contains("rejected by kernel (non-escalation)"), "kernel refuses a RO cap's WRITE invoke (non-escalation)");
+            check!(r.contains("op<=right"),            "fs refuses a write op under a read-validated right");
+            check!(r.contains("forged handle rejected"), "a fabricated handle is not a capability (unforgeable)");
+            check!(r.contains("revoked after close"),  "the cap is revoked on close (revocable)");
+            check!(r.contains("all file-capability checks passed"), "every file-cap property held");
+        }
+        None => { println!("file-cap: FAIL — fcap timed out"); fail += 1; }
+    }
+    let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    check!(!whole.contains("KERNEL PANIC"), "no kernel panic");
+
+    child.kill().ok(); child.wait().ok();
+    println!("\nfile-cap: {pass} passed, {fail} failed");
+    if fail > 0 { std::process::exit(1); }
+}
+
 /// `drives check` (fsck, Phase G): boot a PRE-FORMATTED disk whose superblock free count has
 /// been deliberately drifted host-side (CRC re-stamped so it still mounts). `drives check`
 /// must rebuild the free count from the tree and report the correct value (`expect_free`), with

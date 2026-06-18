@@ -44,6 +44,14 @@ const IO_CHUNK: usize = 7 * 508; // 3556
 const FS_OK: u8 = 0;
 const FS_NOTFOUND: u8 = 2;
 const FS_NOFS: u8 = 3;
+const FS_DENIED: u8 = 4; // file-cap op needs a right the cap lacks (non-escalation, §7.3)
+// File-as-capability (§7.10, P2): Open mints a file cap; the holder invokes it (FOP_*).
+const OP_OPEN: u8 = 30;  // [op, plen, path, rights:u8] → [FS_OK] + embedded FILE CAP
+const FOP_READ: u8 = 1;  // [FOP_READ, offset:u64, len:u32]  (needs READ)
+const FOP_WRITE: u8 = 2; // [FOP_WRITE, offset:u64, chunk…]  (needs WRITE)
+const FOP_CLOSE: u8 = 4; // [FOP_CLOSE] → revoke the resource
+const RIGHT_READ: u8 = 1 << 0;
+const RIGHT_WRITE: u8 = 1 << 1;
 const LABEL_MAX: usize = 31;
 const PATH_MAX: usize = 120; // fits in MAX_LINE; path_len is u8
 
@@ -485,6 +493,10 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         "drives"  => cmd_drives(ctx, &args, argc),
         // ── file/storage commands — converted to the Result model ──
         // ("read" and "result" are on the Result model above, not here.)
+        // file-as-capability (§7.10, P2): end-to-end demo + self-check on an existing file —
+        // open → write/read VIA THE CAP → non-escalation (RO cap can't write) → forged-handle →
+        // revoke-on-close. Prints per-step results; the harness asserts on them (Test 14).
+        "fcap"    => cmd_fcap(ctx, cwd, if argc >= 2 { args[1] } else { "" }),
         "ls"      => cmd_ls(ctx, cwd, if argc >= 2 { args[1] } else { "" }, &mut Out::Console),
         "write"   => cmd_write(ctx, cwd, s["write".len()..].trim()),
         "mkdir"   => {
@@ -2344,6 +2356,96 @@ fn cmd_ls(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(
 /// `Ok(())` when the file was read, `Err(FileNotFound)` when it does not exist, `Err(Unknown)`
 /// for other failures (bad path, storage unavailable) until those get their own variants. The
 /// human-readable detail is still printed; the `Result` is the category.
+/// Open `path` via fs (`OP_OPEN`) and return the **file capability** the reply embeds, or `None`.
+fn fc_open(ctx: &ServiceContext, path: &[u8], rights: u8) -> Option<CapHandle> {
+    let r = fs_request(ctx, OP_OPEN, path, &[rights])?;
+    if r.payload_bytes().first() == Some(&FS_OK) { ctx.take_pending_cap() } else { None }
+}
+
+/// Invoke a file cap (§7.10): the kernel validates `file` holds `right`, badges the request, and
+/// routes it to fs; fs replies on our endpoint. `None` means the kernel rejected the invocation
+/// (the cap lacks `right` — non-escalation — or is stale/revoked), so no reply comes back.
+fn fc_invoke(ctx: &ServiceContext, file: CapHandle, right: u8, payload: &[u8]) -> Option<Message> {
+    let self_grant = ctx.self_grant_handle()?;
+    let reply = ctx.derive_cap(self_grant)?;
+    if ctx.resource_invoke(file, right, reply, &Message::from_bytes(payload)).is_err() {
+        ctx.remove_cap(reply); // kernel didn't consume it (validation failed) — don't leak the slot
+        return None;
+    }
+    Some(ctx.recv())
+}
+
+/// `fcap <file>` — end-to-end demonstration AND self-check of file-as-capability (§7.10) on an
+/// existing file: open it as a real kernel capability and exercise every property the model
+/// promises. Each line is asserted by `osdev test file-cap` (§22 Test 14).
+fn cmd_fcap(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Result<(), ShellError> {
+    let mut pbuf = [0u8; PATH_MAX];
+    let path = match resolve_or_err(ctx, cwd, arg, &mut pbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
+    let mut ok = true;
+    let mut fail = |ctx: &ServiceContext, m: &str| { ctx.console_writeln(m); };
+
+    // 1. Open the file as a capability (fs mints a delegated resource + hands us the cap).
+    let rw = match fc_open(ctx, path, RIGHT_READ | RIGHT_WRITE) {
+        Some(c) => { ctx.console_writeln("fcap: opened rw (file cap)"); c }
+        None    => { ctx.console_writeln("fcap: FAIL open rw"); return Err(ShellError::Unknown); }
+    };
+
+    // 2. Write THROUGH the cap (FOP_WRITE needs WRITE, which rw holds).
+    let mut wbuf = [0u8; 1 + 8 + 7];
+    wbuf[0] = FOP_WRITE; // offset 0 (bytes 1..9 already zero); payload "capdata"
+    wbuf[9..16].copy_from_slice(b"capdata");
+    match fc_invoke(ctx, rw, RIGHT_WRITE, &wbuf) {
+        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => ctx.console_writeln("fcap: write via cap OK"),
+        _ => { fail(ctx, "fcap: FAIL write via cap"); ok = false; }
+    }
+
+    // 3. Read it back THROUGH the cap.
+    let mut rbuf = [0u8; 1 + 8 + 4];
+    rbuf[0] = FOP_READ;
+    rbuf[9..13].copy_from_slice(&7u32.to_le_bytes());
+    match fc_invoke(ctx, rw, RIGHT_READ, &rbuf) {
+        Some(r) if r.payload_bytes().first() == Some(&FS_OK) && r.payload_bytes().len() >= 12
+            && &r.payload_bytes()[5..12] == b"capdata" => ctx.console_writeln("fcap: read via cap OK"),
+        _ => { fail(ctx, "fcap: FAIL read via cap"); ok = false; }
+    }
+
+    // 4. Open a READ-ONLY cap to the same file.
+    let ro = match fc_open(ctx, path, RIGHT_READ) {
+        Some(c) => c,
+        None    => { fail(ctx, "fcap: FAIL open ro"); return Err(ShellError::Unknown); }
+    };
+
+    // 5. Non-escalation, kernel layer: invoking the RO cap declaring WRITE is rejected by the
+    //    KERNEL (the cap lacks WRITE → CapInsufficientRights), so no reply comes back.
+    match fc_invoke(ctx, ro, RIGHT_WRITE, &wbuf) {
+        None    => ctx.console_writeln("fcap: ro-cap write rejected by kernel (non-escalation)"),
+        Some(_) => { fail(ctx, "fcap: FAIL ro cap wrote (escalation!)"); ok = false; }
+    }
+
+    // 6. Non-escalation, fs layer: declare READ (kernel passes) but send a WRITE op — fs refuses
+    //    because the op needs more than the badged right (op ≤ right, FS_DENIED).
+    match fc_invoke(ctx, ro, RIGHT_READ, &wbuf) {
+        Some(r) if r.payload_bytes().first() == Some(&FS_DENIED) => ctx.console_writeln("fcap: fs refused write under read right (op<=right)"),
+        _ => { fail(ctx, "fcap: FAIL fs allowed write under read right"); ok = false; }
+    }
+
+    // 7. Unforgeable: a fabricated handle is not a capability.
+    match fc_invoke(ctx, CapHandle(60000), RIGHT_READ, &rbuf) {
+        None    => ctx.console_writeln("fcap: forged handle rejected"),
+        Some(_) => { fail(ctx, "fcap: FAIL forged handle accepted"); ok = false; }
+    }
+
+    // 8. Revocable: close the rw cap (fs revokes the resource), then a further use is stale.
+    let _ = fc_invoke(ctx, rw, RIGHT_READ, &[FOP_CLOSE]);
+    match fc_invoke(ctx, rw, RIGHT_READ, &rbuf) {
+        None    => ctx.console_writeln("fcap: cap revoked after close"),
+        Some(_) => { fail(ctx, "fcap: FAIL cap usable after close"); ok = false; }
+    }
+
+    if ok { ctx.console_writeln("fcap: all file-capability checks passed"); Ok(()) }
+    else { Err(ShellError::Unknown) }
+}
+
 fn cmd_read(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
