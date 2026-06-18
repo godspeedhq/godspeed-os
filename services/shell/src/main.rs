@@ -2442,6 +2442,13 @@ fn cmd_fcap(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Result<(), ShellError
         Some(_) => { fail(ctx, "fcap: FAIL cap usable after close"); ok = false; }
     }
 
+    // Cleanup so `fcap` is leak-free and re-runnable (e.g. in the selfcheck suite): close the
+    // RO cap (revokes its fs resource → frees a delegated band slot) and drop both shell handles
+    // (rw is already revoked from step 8). Otherwise each run would orphan an open file + 2 cap slots.
+    let _ = fc_invoke(ctx, ro, RIGHT_READ, &[FOP_CLOSE]);
+    ctx.remove_cap(ro);
+    ctx.remove_cap(rw);
+
     if ok { ctx.console_writeln("fcap: all file-capability checks passed"); Ok(()) }
     else { Err(ShellError::Unknown) }
 }
