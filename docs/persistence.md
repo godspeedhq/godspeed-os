@@ -915,6 +915,73 @@ revocable, generationed) true for files, while honoring §4.4 (kernel stays file
 - **Phase 2 — per-file capabilities** via §7.2. `fs` returns a file cap on create/open;
   read/write present the cap. File-as-capability becomes *true*, not approximate.
 
+### 7.4 Phase 2 — concrete kernel mechanism (design, amendment-approved 2026-06-18)
+
+> The `CLAUDE.md` §4.4/§7.10 amendment is **landed and signed off**. This section is the
+> implementation spec, grounded in the actual kernel (`capability/table.rs`, `ipc/routing.rs`,
+> `syscall/dispatch.rs`). It records two non-obvious correctness decisions so the code that follows
+> is right, not just fast.
+
+**What already exists (reuse, don't reinvent).** `ResourceId + Rights + Generation`, `mint_cap`,
+`register_resource(_at_gen)`, `revoke_resource` (gen bump + Revoked liveness), the per-task
+`CapTable`, and lazy generation invalidation. The global table is pre-sized (`DIRECT_CAP = 8192`,
+"P2 adds ~1000 entries"). Embedded-cap transfer (`SendWithCap`/`TakePendingCap`) already moves a cap
+to a client — that's how `fs` will hand over a file cap. An endpoint cap's `resource_id.0` is reused
+directly as its `EndpointId`.
+
+**The delegated band.** Reserve `ResourceId`s `[DELEGATED_BASE, DELEGATED_BASE+DELEGATED_CAP)`
+(within `[0, 8192)` so they stay direct-indexed in the global table). A new `capability/delegated.rs`
+owns: a `[Option<EndpointId>; DELEGATED_CAP]` owner array + an allocation cursor, under a `SpinLock`.
+`allocate(owner) -> ResourceId` finds a free slot, records the owner, registers the id in the global
+table, and returns it. `is_delegated(id)`, `owner_of(id)`, `revoke_owned(id, caller)`.
+
+> **Correctness decision 1 — ABA-safe id reuse.** A freed delegated id may be reallocated. If it
+> re-registered at generation 0, a *stale* file cap (also gen 0 from the id's previous life) would
+> spuriously re-validate — a cap-reuse hole. So `allocate` re-registers a reused id at
+> `get_resource_generation(id).bump()` (via `register_resource_at_gen`), keeping the generation
+> **monotonic across lives**. A stale cap can never match a future life of the same id. (First use of
+> a never-allocated id starts at gen 0.)
+
+**Three syscalls** (each validates a capability first — §3.1, no exceptions):
+
+- **`ResourceMint(rights_bits, out_id_ptr) -> cap_slot`** — gated by a new **`RESOURCE_MINT`**
+  stable resource (`ResourceId(7)`, gen 0 forever, granted only to `fs` + a test probe; validated by
+  `holds_resource`, like `SPAWN`). Allocates a delegated id owned by the caller's endpoint, mints a
+  cap with `rights_bits` into the caller's table, writes the id to `*out_id_ptr`, returns the slot.
+  `fs` calls this on `Open`, recording `ResourceId → file`, then GRANT-transfers a narrowed copy to
+  the client in the reply (existing embedded-cap path).
+- **`ResourceInvoke(cap_slot, right_bits, msg_ptr, msg_len, reply_cap…) -> i64`** — the "use = send"
+  of §7.10, but as its **own** syscall rather than overloading `send`. It validates the cap carries
+  `right_bits` (`CapTable::get(slot, right)`), then routes the message to the owning endpoint with
+  the badge **`[resource_id:u64, right:u8]` prepended to the payload**, reusing `routing::enqueue`
+  with the *owner endpoint's* current generation (so the routing gen-check passes; the file gen was
+  already validated against the global table). A reply cap is embedded exactly as `SendWithCap` does
+  today, so `fs` replies on the normal path.
+
+> **Correctness decision 2 — rights are enforced by the kernel, per operation, without the kernel
+> knowing what a file is.** A read needs `READ`, a write needs `WRITE`. The kernel can't read the
+> file op, so the *caller declares the right it intends* (`right_bits`) and the kernel validates the
+> cap actually holds it — a READ-only cap doing `ResourceInvoke(.., WRITE, ..)` fails
+> `CapInsufficientRights` at the kernel (this is the non-escalation enforcement, §7.3). The kernel
+> then badges the message with the **validated** right, and `fs` refuses any op whose required right
+> exceeds the badged right. So `fs` never has to trust the client, and the kernel never learns the op.
+
+- **`ResourceRevoke(resource_id) -> i64`** — **owner-gated** (ownership *is* the capability check:
+  `revoke_owned` only proceeds if the calling task's endpoint owns the id). Bumps the generation
+  (Revoked) so every outstanding file cap to it goes stale → next `ResourceInvoke` returns
+  `CapRevoked` (§7.5). Frees the owner slot. `fs` calls this on delete/close.
+
+**Why a dedicated `ResourceInvoke` rather than overloading `send`:** a file cap carries `READ`/
+`WRITE`/`GRANT`, not `SEND`, and `handle_send` requires `SEND`. Overloading would force file caps to
+carry `SEND` and lose per-operation rights enforcement. A distinct invoke keeps the file cap's rights
+meaning exactly the file operations, and keeps `handle_send` untouched (lower TCB risk).
+
+**Phase 2a deliverable:** the three syscalls + `delegated.rs` + the `RESOURCE_MINT` grant, exercised
+by two probe services (mint → grant a cap → invoke with READ ok / WRITE denied on a read-only cap →
+revoke → invoke returns `CapRevoked`) — **no `fs` needed**, so the mechanism is proven in isolation
+before 2b wires `fs` onto it. Then 2b (`fs` issues file caps), 2c (SDK `File` + shell demo), 2d (§22
+Test 14).
+
 ## 8. IPC protocols (proposed)
 
 **Client ↔ fs** (Phase 1, name-addressed):
