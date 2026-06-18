@@ -661,6 +661,20 @@ impl ServiceContext {
         if ret < 0 { 0 } else { ret as u64 }
     }
 
+    /// Read the kernel's monotonic timer-tick counter (InspectKernel query 12).
+    ///
+    /// Advances once per core-0 preemption-timer interrupt (~50 ms on the T630
+    /// periodic timer, 10 ms under TSC-Deadline) and — unlike `read_tsc` — needs
+    /// no frequency calibration to be useful as a coarse clock. It is **immune to
+    /// how often the caller yields** (unlike the per-core utilisation ticks), so a
+    /// busy-polling driver can use it for real-time pacing. Used by the USB HID
+    /// drivers for keyboard typematic auto-repeat. Ungated, like the TSC.
+    pub fn monotonic_ticks(&self) -> u64 {
+        // SAFETY: syscall(13) = InspectKernel; query_id=12 = monotonic tick.
+        let ret = unsafe { raw_syscall(13, 12, 0, 0) };
+        if ret < 0 { 0 } else { ret as u64 }
+    }
+
     /// Read the hardware real-time clock (wall-clock date/time) via the kernel.
     ///
     /// Ambient — the time of day is task-neutral hardware info, like the TSC.
@@ -1105,6 +1119,20 @@ impl ServiceContext {
     pub fn console_writeln(&self, msg: &str) {
         self.console_write(msg);
         self.console_write("\n");
+    }
+
+    /// Write a formatted message to the interactive console, with **no** trailing
+    /// newline (e.g. a pager status line the cursor should park on).
+    pub fn console_write_fmt(&self, args: core::fmt::Arguments) {
+        let mut buf    = [0u8; 256];
+        let mut cursor = 0usize;
+        let _ = core::fmt::write(
+            &mut StackWriter { buf: &mut buf, pos: &mut cursor },
+            args,
+        );
+        if cursor > 0 {
+            self.console_write(core::str::from_utf8(&buf[..cursor]).unwrap_or("(fmt error)"));
+        }
     }
 
     /// Write a formatted message to the interactive console, followed by a newline.

@@ -161,8 +161,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.console_echo(false);
     ctx.console_write("gsh> ");
 
-    let mut line_buf = [0u8; MAX_LINE];
-    let mut line_len = 0usize;
+    let mut line = Line::new();
     // Current location on the (single) drive: the directory bare/relative paths target,
     // moved by `cd` (utilities/17_cd.md). Session state; resets to "/" each boot.
     let mut cwd = Cwd::root();
@@ -181,89 +180,120 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // We own echo now, so move to a fresh line ourselves (the kernel used
                 // to echo the Enter as "\r\n").
                 ctx.console_write("\r\n");
-                if line_len > 0 {
-                    hist.push(&line_buf[..line_len]);
-                    last_result = execute(&ctx, &line_buf[..line_len], &mut cwd, last_result, 0);
-                    line_len = 0;
+                if line.len > 0 {
+                    hist.push(line.bytes());
+                    last_result = execute(&ctx, line.bytes(), &mut cwd, last_result, 0);
+                    line.len = 0;
+                    line.cur = 0;
                 }
                 nav = hist.len();
                 ctx.console_write("gsh> ");
             }
             0x1B => {
-                // Escape sequence. Arrow keys arrive as ESC [ A/B/C/D — from a serial
-                // terminal directly, and the USB keyboard emits the same (sdk hid.rs).
-                // Up/Down walk the history; Left/Right are not handled yet (no in-line
-                // cursor movement). The two follow-up bytes are part of the sequence.
-                let b1 = ctx.console_read();
-                let b2 = ctx.console_read();
-                if b1 == b'[' {
-                    match b2 {
-                        b'A' => { // Up — older command
-                            if nav > 0 {
-                                nav -= 1;
-                                replace_line(&ctx, &mut line_buf, &mut line_len, hist.get(nav));
-                            }
-                        }
-                        b'B' => { // Down — newer command (past the end → blank live line)
-                            if nav < hist.len() {
-                                nav += 1;
-                                let line: &[u8] = if nav == hist.len() { &[] } else { hist.get(nav) };
-                                replace_line(&ctx, &mut line_buf, &mut line_len, line);
-                            }
-                        }
-                        _ => {}
-                    }
+                // Escape: either a bare ESC (the Escape key → clear the line) or the start
+                // of a terminal escape sequence (arrows + the extended-keyboard navigation
+                // cluster, which send ESC [ … / ESC O …). `read_escape_byte` distinguishes
+                // them without blocking forever on a bare ESC; a confirmed sequence's
+                // remaining bytes are already queued (the keyboard pushes them atomically),
+                // so the rest reads blockingly.
+                match read_escape_byte(&ctx) {
+                    None => { line.clear(&ctx); nav = hist.len(); } // bare ESC → clear line
+                    Some(b'[') => handle_csi(&ctx, &mut line, &mut hist, &mut nav),
+                    Some(b'O') => { let _ = ctx.console_read(); } // SS3 (F1–F4): no shell action
+                    Some(_)    => {}                              // other ESC x: ignore
                 }
             }
-            0x7f | 0x08 => {
-                // backspace — remove last byte and erase it on the display, but
-                // only if there is one. The kernel does not echo backspace (it
-                // can't tell the line is empty), so a no-op here leaves the prompt
-                // untouched. "\x08 \x08" = move back, overwrite with space, move back.
-                if line_len > 0 {
-                    line_len -= 1;
-                    ctx.console_write("\x08 \x08");
-                }
-            }
+            0x7f | 0x08 => line.backspace(&ctx),
             0x09 => {
                 // Tab — complete the command name. One match → fill it in; several → print a
                 // numbered menu and the next digit selects (no Enter). Event-driven (redraws only
                 // on this keypress, via the same console-write path normal echo uses).
-                complete_tab(&ctx, &mut line_buf, &mut line_len);
+                complete_tab(&ctx, &mut line);
             }
             0x03 => {
                 // Ctrl-C — clear line
                 ctx.console_writeln("^C");
-                line_len = 0;
+                line.len = 0;
+                line.cur = 0;
                 nav = hist.len();
                 ctx.console_write("gsh> ");
             }
-            b if b >= 0x20 && b < 0x7f => {
-                if line_len < MAX_LINE {
-                    line_buf[line_len] = b;
-                    line_len += 1;
-                    // Echo the printable byte ourselves (kernel echo is off). Escape
-                    // sequences never reach here — they're consumed in the 0x1B arm.
-                    let s = [b];
-                    ctx.console_write(core::str::from_utf8(&s).unwrap_or(""));
-                }
-            }
+            b if b >= 0x20 && b < 0x7f => line.insert(&ctx, b),
             _ => {}
         }
     }
 }
 
-/// Erase the current on-screen input, then set + print `new` as the line buffer (used by
-/// up/down-arrow history recall). Erasing uses the same `\x08 \x08` the backspace path does.
-fn replace_line(ctx: &ServiceContext, buf: &mut [u8; MAX_LINE], len: &mut usize, new: &[u8]) {
-    for _ in 0..*len {
-        ctx.console_write("\x08 \x08");
+/// Read the first byte after an ESC, distinguishing a bare ESC (the Escape key, which
+/// sends nothing more) from the start of a terminal escape sequence. The keyboard driver
+/// pushes a navigation key's whole `ESC [ … ~` atomically, so its follow-up byte is
+/// already queued and `try_console_read` returns it at once; a serial terminal may split
+/// the bytes, so we wait a bounded few monotonic ticks (`ESC_WAIT_TICKS`) before giving
+/// up. `None` ⇒ bare ESC. Returning quickly matters so a held key's repeats stay snappy.
+// ~100 ms at ~2 GHz, in read_tsc cycles. We time the bare-ESC wait off the TSC, not the
+// kernel monotonic tick (query 12), because the tick was found NOT to advance reliably on
+// real hardware (it silently broke typematic auto-repeat on the T630). read_tsc is
+// hardware-proven (§22 perf). A real escape sequence's bytes are already queued (the
+// keyboard pushes them atomically), so this wait only bounds how long a bare Escape — which
+// has nothing following — takes to resolve to "clear the line".
+const ESC_WAIT_CYCLES: u64 = 200_000_000;
+fn read_escape_byte(ctx: &ServiceContext) -> Option<u8> {
+    if let Some(b) = ctx.try_console_read() { return Some(b); }
+    let deadline = ctx.read_tsc().wrapping_add(ESC_WAIT_CYCLES);
+    while ctx.read_tsc() < deadline {
+        if let Some(b) = ctx.try_console_read() { return Some(b); }
+        ctx.yield_cpu();
     }
-    let n = new.len().min(MAX_LINE);
-    buf[..n].copy_from_slice(&new[..n]);
-    *len = n;
-    if n > 0 {
-        ctx.console_write(core::str::from_utf8(&buf[..n]).unwrap_or(""));
+    None
+}
+
+/// Handle a CSI sequence (everything after `ESC [`). Reads the optional numeric
+/// parameter and the final byte, then dispatches the key. Covers the arrows (history +
+/// cursor), Home/End, and the `~`-terminated navigation keys (Insert/Delete/Home/End/
+/// PageUp/PageDown) and function keys an extended keyboard sends. Unknown sequences are
+/// consumed and ignored — never smeared onto the line. Bounded: a final byte must arrive
+/// within `CSI_MAX` bytes or we stop (defensive against a malformed serial stream).
+fn handle_csi(ctx: &ServiceContext, line: &mut Line, hist: &History, nav: &mut usize) {
+    const CSI_MAX: usize = 8;
+    let mut param: u16 = 0;
+    let mut have_param = false;
+    let mut final_byte = 0u8;
+    for _ in 0..CSI_MAX {
+        let c = ctx.console_read();
+        if c.is_ascii_digit() {
+            have_param = true;
+            param = param.saturating_mul(10).saturating_add((c - b'0') as u16);
+        } else if c == b';' {
+            // Multi-parameter (e.g. modified keys): we only act on the first; keep reading.
+            continue;
+        } else {
+            final_byte = c; // 0x40..=0x7E terminates a CSI
+            break;
+        }
+    }
+    match final_byte {
+        b'A' => { // Up — older command
+            if *nav > 0 { *nav -= 1; line.set(ctx, hist.get(*nav)); }
+        }
+        b'B' => { // Down — newer command (past the end → blank live line)
+            if *nav < hist.len() {
+                *nav += 1;
+                let l: &[u8] = if *nav == hist.len() { &[] } else { hist.get(*nav) };
+                line.set(ctx, l);
+            }
+        }
+        b'C' => line.right(ctx), // Right — move cursor within the line
+        b'D' => line.left(ctx),  // Left
+        b'H' => line.home(ctx),  // Home (ESC[H)
+        b'F' => line.end(ctx),   // End  (ESC[F)
+        b'~' => match param {    // navigation cluster: ESC[<n>~
+            1 | 7 => line.home(ctx),   // Home
+            4 | 8 => line.end(ctx),    // End
+            3     => line.delete(ctx), // Delete (forward delete)
+            // 2 = Insert, 5 = PageUp, 6 = PageDown, 11.. = F-keys: no shell action, ignored.
+            _ => { let _ = have_param; }
+        },
+        _ => {} // unknown final byte — already consumed, do nothing
     }
 }
 
@@ -272,10 +302,15 @@ fn replace_line(ctx: &ServiceContext, buf: &mut [u8; MAX_LINE], len: &mut usize,
 /// numbered menu and block for one digit, which selects (no Enter) and drops the command into the
 /// prompt. Only completes a bare command (no space typed yet) — argument/path completion is future
 /// work. Bounded (§26.6): at most `UTILS.len()` matches, 1–9 selectable by digit.
-fn complete_tab(ctx: &ServiceContext, buf: &mut [u8; MAX_LINE], len: &mut usize) {
+fn complete_tab(ctx: &ServiceContext, line: &mut Line) {
     // Only complete while still typing the command token (nothing after a space).
-    if *len == 0 || buf[..*len].contains(&b' ') { return; }
-    let prefix = &buf[..*len];
+    if line.len == 0 || line.bytes().contains(&b' ') { return; }
+    // Operate from end-of-line so the menu reprint + replacement line up with the cursor.
+    line.end(ctx);
+    let mut prefix_buf = [0u8; MAX_LINE];
+    let plen = line.len;
+    prefix_buf[..plen].copy_from_slice(&line.buf[..plen]);
+    let prefix = &prefix_buf[..plen];
 
     // Collect matching command indices (UTILS order — stable, so the menu numbering is stable).
     let mut matches = [0usize; 64];
@@ -286,7 +321,7 @@ fn complete_tab(ctx: &ServiceContext, buf: &mut [u8; MAX_LINE], len: &mut usize)
         }
     }
     if n == 0 { return; }                       // no candidates — leave the line as-is
-    if n == 1 { set_completed(ctx, buf, len, UTILS[matches[0]]); return; }
+    if n == 1 { set_completed(ctx, line, UTILS[matches[0]]); return; }
 
     // Several candidates: print a numbered menu (1..=min(9,n)), then read one selection digit.
     let shown = n.min(9);
@@ -313,20 +348,19 @@ fn complete_tab(ctx: &ServiceContext, buf: &mut [u8; MAX_LINE], len: &mut usize)
     let sel = ctx.console_read();
     if (b'1'..=b'9').contains(&sel) {
         let idx = (sel - b'1') as usize;
-        if idx < shown { set_completed(ctx, buf, len, UTILS[matches[idx]]); }
+        if idx < shown { set_completed(ctx, line, UTILS[matches[idx]]); }
     }
 }
 
-/// Replace the on-screen input with `cmd` followed by a trailing space, updating `buf`/`len`.
-/// Reuses `replace_line`, so the old text is erased and the new text echoed the same way history
-/// recall does.
-fn set_completed(ctx: &ServiceContext, buf: &mut [u8; MAX_LINE], len: &mut usize, cmd: &str) {
+/// Replace the on-screen input with `cmd` followed by a trailing space. Uses `Line::set`,
+/// so the old text is erased and the new text echoed the same way history recall does.
+fn set_completed(ctx: &ServiceContext, line: &mut Line, cmd: &str) {
     let c = cmd.as_bytes();
     let cl = c.len().min(MAX_LINE - 1);
     let mut tmp = [0u8; MAX_LINE];
     tmp[..cl].copy_from_slice(&c[..cl]);
     tmp[cl] = b' ';                              // trailing space so the user can type args
-    replace_line(ctx, buf, len, &tmp[..cl + 1]);
+    line.set(ctx, &tmp[..cl + 1]);
 }
 
 /// A bounded ring of recent command lines for up/down-arrow recall (§26.6: fixed size,
@@ -357,6 +391,102 @@ impl History {
         self.lens[self.n] = l;
         self.n += 1;
     }
+}
+
+/// The editable input line with a cursor, so the navigation cluster of a standard
+/// extended keyboard (Left/Right/Home/End/Delete) edits *mid-line*, not just at the
+/// end. `cur` is the insertion point in `0..=len`. Every edit echoes itself using only
+/// `\x08` (non-destructive cursor-left on both the framebuffer console and a serial
+/// terminal), character reprints (cursor-right), and `ESC[K` (erase to end of line) —
+/// the lowest common denominator both honour, so editing looks identical over HDMI and
+/// over the serial console. Bounded (§26.6): `MAX_LINE`, loud-safe (over-long input is
+/// simply not accepted).
+struct Line {
+    buf: [u8; MAX_LINE],
+    len: usize,
+    cur: usize,
+}
+impl Line {
+    fn new() -> Self { Line { buf: [0u8; MAX_LINE], len: 0, cur: 0 } }
+    fn bytes(&self) -> &[u8] { &self.buf[..self.len] }
+
+    /// Reprint from the cursor to end-of-line, erase any stale tail (`ESC[K`), then
+    /// step the cursor back to `cur`. Used after an insert/delete shifts the tail.
+    fn redraw_tail(&self, ctx: &ServiceContext) {
+        if self.cur < self.len {
+            ctx.console_write(core::str::from_utf8(&self.buf[self.cur..self.len]).unwrap_or(""));
+        }
+        ctx.console_write("\x1b[K"); // erase whatever the old (possibly longer) tail left
+        for _ in self.cur..self.len { ctx.console_write("\x08"); }
+    }
+
+    /// Insert a printable byte at the cursor.
+    fn insert(&mut self, ctx: &ServiceContext, b: u8) {
+        if self.len >= MAX_LINE { return; }
+        let mut i = self.len;
+        while i > self.cur { self.buf[i] = self.buf[i - 1]; i -= 1; }
+        self.buf[self.cur] = b;
+        self.len += 1;
+        self.cur += 1;
+        // Echo the inserted byte, then redraw the shifted tail behind it.
+        let s = [b];
+        ctx.console_write(core::str::from_utf8(&s).unwrap_or(""));
+        self.redraw_tail(ctx);
+    }
+
+    /// Delete the character before the cursor (Backspace).
+    fn backspace(&mut self, ctx: &ServiceContext) {
+        if self.cur == 0 { return; }
+        for i in self.cur..self.len { self.buf[i - 1] = self.buf[i]; }
+        self.len -= 1;
+        self.cur -= 1;
+        ctx.console_write("\x08"); // step left onto the deleted cell
+        self.redraw_tail(ctx);
+    }
+
+    /// Delete the character at the cursor (the Delete key — forward delete).
+    fn delete(&mut self, ctx: &ServiceContext) {
+        if self.cur >= self.len { return; }
+        for i in (self.cur + 1)..self.len { self.buf[i - 1] = self.buf[i]; }
+        self.len -= 1;
+        self.redraw_tail(ctx);
+    }
+
+    fn left(&mut self, ctx: &ServiceContext) {
+        if self.cur > 0 { self.cur -= 1; ctx.console_write("\x08"); }
+    }
+    fn right(&mut self, ctx: &ServiceContext) {
+        if self.cur < self.len {
+            let s = [self.buf[self.cur]];
+            ctx.console_write(core::str::from_utf8(&s).unwrap_or("")); // reprint = move right
+            self.cur += 1;
+        }
+    }
+    fn home(&mut self, ctx: &ServiceContext) {
+        while self.cur > 0 { self.cur -= 1; ctx.console_write("\x08"); }
+    }
+    fn end(&mut self, ctx: &ServiceContext) {
+        if self.cur < self.len {
+            ctx.console_write(core::str::from_utf8(&self.buf[self.cur..self.len]).unwrap_or(""));
+            self.cur = self.len;
+        }
+    }
+
+    /// Erase the visible input and replace it with `new`, cursor at the end. Used by
+    /// history recall, tab completion, and the bare-ESC clear. Erases from wherever the
+    /// cursor is: step to the input start, `ESC[K` to wipe to end of line, then print.
+    fn set(&mut self, ctx: &ServiceContext, new: &[u8]) {
+        while self.cur > 0 { self.cur -= 1; ctx.console_write("\x08"); }
+        ctx.console_write("\x1b[K");
+        let n = new.len().min(MAX_LINE);
+        self.buf[..n].copy_from_slice(&new[..n]);
+        self.len = n;
+        self.cur = n;
+        if n > 0 { ctx.console_write(core::str::from_utf8(&self.buf[..n]).unwrap_or("")); }
+    }
+
+    /// Clear to an empty line (cursor at 0), erasing what was shown.
+    fn clear(&mut self, ctx: &ServiceContext) { self.set(ctx, &[]); }
 }
 
 /// Wait until the input subsystem reports in — the deterministic end-of-boot
@@ -526,7 +656,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
     // Dispatch — every command returns its `Result` (Ok/Err); an unknown command is `Err`.
     // The info commands always succeed (they return `Ok`), but they are on the model uniformly.
     return match args[0] {
-        "help"    => cmd_help(ctx),
+        "help"    => cmd_help(ctx, depth),
         "clear"   => cmd_clear(ctx),
         "echo"    => cmd_echo(ctx, strip_quotes(s["echo".len()..].trim()), &mut Out::Console),
         "about"   => cmd_about(ctx),
@@ -1057,71 +1187,200 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
     true
 }
 
-fn cmd_help(ctx: &ServiceContext) -> Result<(), ShellError> {
-    // Rule 6 (0_conventions.md): help output's first line is `<util> <version>`.
-    ctx.console_writeln_fmt(format_args!("help {} — GodspeedOS shell commands", UTIL_VERSION));
-    ctx.console_writeln("");
-    ctx.console_writeln("Console");
-    help_line(ctx, "help", "show this message");
-    help_line(ctx, "<prefix> Tab", "complete a command; if several match, press the shown digit to pick");
-    help_line(ctx, "clear", "clear the screen");
-    help_line(ctx, "echo <text>", "print text");
-    help_line(ctx, "result", "the last command's result (Ok / Err)");
-    help_line(ctx, "run <script>", "run a script of commands (.gsh; # comments, ; separators)");
-    help_line(ctx, "selfcheck", "run the built-in self-check suite");
-    help_line(ctx, "fcap", "file-as-capability self-check (diagnostic; fcap help)");
-    help_line(ctx, "assert ok|fails <cmd>", "verify success/failure (also: … | assert contains X)");
-    ctx.console_writeln("");
-    ctx.console_writeln("System");
-    help_line(ctx, "about", "identity + credits");
-    help_line(ctx, "cores", "CPU core count");
-    help_line(ctx, "mem", "physical memory usage");
-    help_line(ctx, "date [epoch]", "date + time; 'epoch' = secs since 1970");
-    ctx.console_writeln("");
-    ctx.console_writeln("Services");
-    help_line(ctx, "status", "list all live tasks");
-    help_line(ctx, "observe [now]", "live view (q to quit) / one-shot frame");
-    help_line(ctx, "caps [service]", "capabilities (default: this shell)");
-    help_line(ctx, "roster", "example record service (a typed table; try roster | where role=core)");
-    help_line(ctx, "spawn <name>", "start a service");
-    help_line(ctx, "kill <name>", "stop a service");
-    help_line(ctx, "restart <name> [core]", "restart a service");
-    ctx.console_writeln("");
-    ctx.console_writeln("Storage");
-    help_line(ctx, "drives [flash|label|reset|check]", "manage attached disks (drives help)");
-    help_line(ctx, "ls [path]", "list a directory");
-    help_line(ctx, "cd [path|-]", "change directory (- = previous)");
-    help_line(ctx, "read <path>", "print a file");
-    help_line(ctx, "write [append] <path> [text]", "create/overwrite/append a file");
-    help_line(ctx, "mkdir <path> [parents]", "create a directory");
-    help_line(ctx, "copy <src> <dst> [recursive]", "copy a file or subtree");
-    help_line(ctx, "move <src> <dst>", "relocate a file/dir");
-    help_line(ctx, "rename <path> <name>", "rename an entry in place");
-    help_line(ctx, "delete <path> [recursive]", "remove a file/dir/subtree");
-    help_line(ctx, "find <pattern> [path]", "search by name (substring or *? glob)");
-    help_line(ctx, "tree [path]", "print the directory hierarchy");
-    help_line(ctx, "match <pattern> [path]", "keep lines matching (also: <prod> | match)");
-    help_line(ctx, "count [path]", "count lines/words/bytes (also: <prod> | count)");
-    help_line(ctx, "sort [reverse] [path]", "order lines (also: <prod> | sort)");
-    help_line(ctx, "first / last [N] [path]", "keep first/last N lines (also: <prod> |)");
-    ctx.console_writeln("");
-    ctx.console_writeln("Pipes");
-    help_line(ctx, "<producer> | [filter |…] <sink>", "compose stages (Appendix D)");
-    help_line(ctx, "  e.g. read /f | upper", "filter a file through a service");
-    help_line(ctx, "  e.g. tree / | write /out", "capture output to a file");
-    help_line(ctx, "  e.g. greet | upper | write /g", "producer | filter | sink");
-    ctx.console_writeln("");
-    ctx.console_writeln("Records (typed pipes — docs/records.md)");
-    help_line(ctx, "status | where mem>0", "filter the task table by field (=,!=,>,<,~)");
-    help_line(ctx, "status | select name state", "keep only some columns");
-    help_line(ctx, "status | sort [reverse] mem", "order rows by a column");
-    help_line(ctx, "status | to json | to yaml", "render the table (default: a grid)");
-    ctx.console_writeln("");
-    ctx.console_writeln("Power");
-    help_line(ctx, "reboot", "hardware reset");
-    ctx.console_writeln("");
-    ctx.console_writeln("Type '<command> help' for usage + examples, '<command> version' for the version.");
+/// One rendered line of `help`, as static data so the pager can index it (and the
+/// whole table lives in rodata, not on the shell's tight stack — §26.6). `Sec`/`Text`
+/// are full-width lines; `Row` is the aligned "  command  description" form.
+enum HelpRow {
+    Gap,
+    Sec(&'static str),
+    Text(&'static str),
+    Row(&'static str, &'static str),
+}
+use HelpRow::*;
+static HELP: &[HelpRow] = &[
+    Gap,
+    Sec("Console"),
+    Row("help", "show this message"),
+    Row("<prefix> Tab", "complete a command; if several match, press the shown digit to pick"),
+    Row("arrows/Home/End/Del", "edit the line in place; Up/Down recall history; Esc clears"),
+    Row("clear", "clear the screen"),
+    Row("echo <text>", "print text"),
+    Row("result", "the last command's result (Ok / Err)"),
+    Row("run <script>", "run a script of commands (.gsh; # comments, ; separators)"),
+    Row("selfcheck", "run the built-in self-check suite"),
+    Row("fcap", "file-as-capability self-check (diagnostic; fcap help)"),
+    Row("assert ok|fails <cmd>", "verify success/failure (also: … | assert contains X)"),
+    Gap,
+    Sec("System"),
+    Row("about", "identity + credits"),
+    Row("cores", "CPU core count"),
+    Row("mem", "physical memory usage"),
+    Row("date [epoch]", "date + time; 'epoch' = secs since 1970"),
+    Gap,
+    Sec("Services"),
+    Row("status", "list all live tasks"),
+    Row("observe [now]", "live view (q to quit) / one-shot frame"),
+    Row("caps [service]", "capabilities (default: this shell)"),
+    Row("roster", "example record service (a typed table; try roster | where role=core)"),
+    Row("spawn <name>", "start a service"),
+    Row("kill <name>", "stop a service"),
+    Row("restart <name> [core]", "restart a service"),
+    Gap,
+    Sec("Storage"),
+    Row("drives [flash|label|reset|check]", "manage attached disks (drives help)"),
+    Row("ls [path]", "list a directory"),
+    Row("cd [path|-]", "change directory (- = previous)"),
+    Row("read <path>", "print a file"),
+    Row("write [append] <path> [text]", "create/overwrite/append a file"),
+    Row("mkdir <path> [parents]", "create a directory"),
+    Row("copy <src> <dst> [recursive]", "copy a file or subtree"),
+    Row("move <src> <dst>", "relocate a file/dir"),
+    Row("rename <path> <name>", "rename an entry in place"),
+    Row("delete <path> [recursive]", "remove a file/dir/subtree"),
+    Row("find <pattern> [path]", "search by name (substring or *? glob)"),
+    Row("tree [path]", "print the directory hierarchy"),
+    Row("match <pattern> [path]", "keep lines matching (also: <prod> | match)"),
+    Row("count [path]", "count lines/words/bytes (also: <prod> | count)"),
+    Row("sort [reverse] [path]", "order lines (also: <prod> | sort)"),
+    Row("first / last [N] [path]", "keep first/last N lines (also: <prod> |)"),
+    Gap,
+    Sec("Pipes"),
+    Row("<producer> | [filter |…] <sink>", "compose stages (Appendix D)"),
+    Row("  e.g. read /f | upper", "filter a file through a service"),
+    Row("  e.g. tree / | write /out", "capture output to a file"),
+    Row("  e.g. greet | upper | write /g", "producer | filter | sink"),
+    Gap,
+    Sec("Records (typed pipes — docs/records.md)"),
+    Row("status | where mem>0", "filter the task table by field (=,!=,>,<,~)"),
+    Row("status | select name state", "keep only some columns"),
+    Row("status | sort [reverse] mem", "order rows by a column"),
+    Row("status | to json | to yaml", "render the table (default: a grid)"),
+    Gap,
+    Sec("Power"),
+    Row("reboot", "hardware reset"),
+    Gap,
+    Text("Type '<command> help' for usage + examples, '<command> version' for the version."),
+];
+
+/// Render help line `idx` (0 = the versioned header, then `HELP[idx-1]`).
+fn help_render_line(ctx: &ServiceContext, idx: usize) {
+    if idx == 0 {
+        // Rule 6 (0_conventions.md): help output's first line is `<util> <version>`.
+        ctx.console_writeln_fmt(format_args!("help {} — GodspeedOS shell commands", UTIL_VERSION));
+        return;
+    }
+    match &HELP[idx - 1] {
+        Gap => ctx.console_writeln(""),
+        Sec(s) | Text(s) => ctx.console_writeln(s),
+        Row(cmd, desc) => help_line(ctx, cmd, desc),
+    }
+}
+
+fn cmd_help(ctx: &ServiceContext, depth: u8) -> Result<(), ShellError> {
+    let total = HELP.len() + 1; // +1 for the header line
+    // Page only for a direct interactive `help` (depth 0). When help is run from a
+    // script, `assert`, or `selfcheck` (depth > 0) there is no human to press keys —
+    // the pager would block the run — so just dump it. The framebuffer console has no
+    // scrollback, so an interactive help longer than the screen scrolls its top off
+    // forever; page it then (a serial terminal has its own scrollback, but paging there
+    // is harmless and consistent). rows==0 means geometry is unknown → just print it.
+    let (rows, _cols) = ctx.console_dims();
+    let rows = rows as usize;
+    if depth > 0 || rows == 0 || total <= rows {
+        for i in 0..total { help_render_line(ctx, i); }
+        return Ok(());
+    }
+    help_pager(ctx, total, rows);
     Ok(())
+}
+
+/// `less`-style pager for `help`: render a screenful from `top`, a status line, then
+/// read a key and scroll. Space / PageDown page; Up/Down (or j/k) move a line; b /
+/// PageUp page back; g/G jump to top/bottom; q / Esc / Enter quit. Redraws by clearing
+/// (`ESC[2J`) and reprinting the viewport — the only way to scroll *up* on a console
+/// with no scrollback. Bounded: at most `total` lines, indices clamped every step.
+fn help_pager(ctx: &ServiceContext, total: usize, rows: usize) {
+    let page = rows.saturating_sub(1).max(1); // leave one row for the status line
+    let max_top = total.saturating_sub(page);
+    let mut top = 0usize;
+    loop {
+        ctx.console_write("\x1b[2J\x1b[H");
+        let end = (top + page).min(total);
+        for i in top..end { help_render_line(ctx, i); }
+        // Status line (no trailing newline so the cursor parks on it). Scroll keys lead,
+        // since holding Up/Down now scrolls smoothly (typematic auto-repeat).
+        ctx.console_write_fmt(format_args!(
+            "[ lines {}-{} of {} ]  up/down: scroll  space: next page  g/G: top/end  q: quit",
+            top + 1, end, total));
+        // Read one command key (arrows/PageUp/Down arrive as escape sequences).
+        let mut down = 0i64; // signed line delta to apply; isize via i64 to allow page jumps
+        let mut quit = false;
+        let mut to_top = false;
+        let mut to_bottom = false;
+        match ctx.console_read() {
+            b' ' | b'f' => down = page as i64,
+            b'b' => down = -(page as i64),
+            b'j' | b'\r' | b'\n' => down = 1,
+            b'k' => down = -1,
+            b'g' => to_top = true,
+            b'G' => to_bottom = true,
+            b'q' | 0x03 => quit = true,
+            0x1B => match read_escape_byte(ctx) {
+                None => quit = true, // bare ESC quits
+                Some(b'[') | Some(b'O') => match pager_csi(ctx) {
+                    PagerKey::LineDown => down = 1,
+                    PagerKey::LineUp => down = -1,
+                    PagerKey::PageDown => down = page as i64,
+                    PagerKey::PageUp => down = -(page as i64),
+                    PagerKey::Top => to_top = true,
+                    PagerKey::Bottom => to_bottom = true,
+                    PagerKey::Other => {}
+                },
+                Some(_) => {}
+            },
+            _ => {}
+        }
+        if quit { break; }
+        if to_top { top = 0; }
+        else if to_bottom { top = max_top; }
+        else {
+            let nt = top as i64 + down;
+            top = nt.clamp(0, max_top as i64) as usize;
+        }
+    }
+    // Leave a clean screen + the prompt comes from the main loop.
+    ctx.console_write("\x1b[2J\x1b[H");
+}
+
+/// Keys the pager recognises from a terminal escape sequence.
+enum PagerKey { LineUp, LineDown, PageUp, PageDown, Top, Bottom, Other }
+
+/// Parse the body of an escape sequence (after `ESC [` or `ESC O`) into a `PagerKey`.
+/// Mirrors `handle_csi`'s reader but maps to scrolling: arrows, Home/End, PageUp/Down.
+fn pager_csi(ctx: &ServiceContext) -> PagerKey {
+    const CSI_MAX: usize = 8;
+    let mut param: u16 = 0;
+    let mut final_byte = 0u8;
+    for _ in 0..CSI_MAX {
+        let c = ctx.console_read();
+        if c.is_ascii_digit() { param = param.saturating_mul(10).saturating_add((c - b'0') as u16); }
+        else if c == b';' { continue; }
+        else { final_byte = c; break; }
+    }
+    match final_byte {
+        b'A' => PagerKey::LineUp,
+        b'B' => PagerKey::LineDown,
+        b'H' => PagerKey::Top,    // Home
+        b'F' => PagerKey::Bottom, // End
+        b'~' => match param {
+            1 | 7 => PagerKey::Top,    // Home
+            4 | 8 => PagerKey::Bottom, // End
+            5 => PagerKey::PageUp,
+            6 => PagerKey::PageDown,
+            _ => PagerKey::Other,
+        },
+        _ => PagerKey::Other,
+    }
 }
 
 /// One "  command  description" row. The command is left-justified to a fixed

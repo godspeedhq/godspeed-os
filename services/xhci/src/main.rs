@@ -66,6 +66,13 @@ const MAX_SCRATCHPAD: usize = 256; // arena room = XHCI_DMA_PAGES (272) - 16
 
 /// Maximum HID devices bound on one controller at once (keyboard + mouse).
 const MAX_HID: usize = 2;
+
+/// Typematic auto-repeat delays, in TSC cycles (`ctx.read_tsc()` units). Sized for a
+/// ~2 GHz CPU (the T630): ~300 ms before the first repeat, then ~50 ms apart (~20/s).
+/// Auto-repeat is forgiving, so a 1.5–3 GHz spread just shifts the feel a little; no
+/// per-machine calibration needed. read_tsc is hardware-proven to advance (perf §22).
+const REPEAT_INITIAL_CYCLES: u64 = 600_000_000;
+const REPEAT_INTERVAL_CYCLES: u64 = 100_000_000;
 const DEV_BASE: usize = 0x7000;
 const DEV_STRIDE: usize = 0x4000; // 4 pages: device ctx, EP0 ring, int ring, report
 fn device_ctx_off(i: usize) -> usize { DEV_BASE + i * DEV_STRIDE }
@@ -153,16 +160,24 @@ fn idle(ctx: &ServiceContext) -> ! {
 }
 
 /// Poll the event ring for the next event TRB. Returns (trb_type, completion,
-/// slot_id) and advances the dequeue pointer, or None on timeout.
+/// slot_id) and advances the dequeue pointer, or None.
+///
+/// Drain one event from the event ring. `max_tries` bounds how long to wait for an
+/// event whose cycle bit has flipped: the command path passes a large budget (it just
+/// rang a doorbell and expects a completion imminently); the **poll loop passes 1** so
+/// it is fully non-blocking — otherwise, while a key is held (no new transfer events),
+/// this would busy-spin millions of times before returning `None`, starving the
+/// typematic auto-repeat poll at the bottom of the loop.
 fn next_event(
     dma: &Dma,
     mmio: &Mmio,
     ir0: usize,
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
+    max_tries: u32,
 ) -> Option<(u32, u32, u32)> {
     let mut tries = 0u32;
-    while tries < 10_000_000 {
+    while tries < max_tries {
         tries += 1;
         let off = EVENT_RING_OFF + *ev_idx * TRB_SIZE;
         let ctrl = dma.read32(off + 12);
@@ -210,7 +225,7 @@ fn run_command(
     mmio.write32(dboff, 0); // command doorbell
 
     for _ in 0..8 {
-        match next_event(dma, mmio, ir0, ev_idx, ev_cycle) {
+        match next_event(dma, mmio, ir0, ev_idx, ev_cycle, 10_000_000) {
             Some((TRB_CMD_COMPLETION, completion, slot)) => return Some((completion, slot)),
             Some((TRB_PORT_STATUS_CHANGE, _, _)) => {
                 ctx.log("xhci: (port status change event)");
@@ -273,7 +288,7 @@ fn control(
     );
     mmio.write32(dboff + slot as usize * 4, 1);
     for _ in 0..8 {
-        match next_event(dma, mmio, ir0, ev_idx, ev_cycle) {
+        match next_event(dma, mmio, ir0, ev_idx, ev_cycle, 10_000_000) {
             Some((TRB_TRANSFER_EVENT, c, _)) => return c == 1 || c == 13,
             Some(_) => {}
             None => return false,
@@ -416,7 +431,7 @@ fn enumerate_one(
     mmio.write32(dboff + slot as usize * 4, 1);
     let mut ok = false;
     for _ in 0..8 {
-        match next_event(dma, mmio, ir0, ev_idx, ev_cycle) {
+        match next_event(dma, mmio, ir0, ev_idx, ev_cycle, 10_000_000) {
             Some((TRB_TRANSFER_EVENT, c, _)) => { ok = c == 1 || c == 13; break; }
             Some(_) => {}
             None => break,
@@ -452,7 +467,7 @@ fn enumerate_one(
     mmio.write32(dboff + slot as usize * 4, 1);
     let mut cfg_ok = false;
     for _ in 0..8 {
-        match next_event(dma, mmio, ir0, ev_idx, ev_cycle) {
+        match next_event(dma, mmio, ir0, ev_idx, ev_cycle, 10_000_000) {
             Some((TRB_TRANSFER_EVENT, c, _)) => { cfg_ok = c == 1 || c == 13; break; }
             Some(_) => {}
             None => break,
@@ -753,6 +768,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut int_cycle = [1u32; MAX_HID];
         let mut need_queue = [true; MAX_HID];
         let mut kb_last = [[0u8; 6]; MAX_HID];
+        let mut kb_rep = [
+            godspeed_sdk::hid::KeyRepeat::new(REPEAT_INITIAL_CYCLES, REPEAT_INTERVAL_CYCLES),
+            godspeed_sdk::hid::KeyRepeat::new(REPEAT_INITIAL_CYCLES, REPEAT_INTERVAL_CYCLES),
+        ];
         let mut mouse = [
             godspeed_sdk::hid::MouseTracker::new(),
             godspeed_sdk::hid::MouseTracker::new(),
@@ -795,9 +814,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 need_queue[d] = false;
             }
 
-            // Drain one event; route a transfer event to its device by slot id.
+            // Drain one event (non-blocking: max_tries=1) so a held key — which produces
+            // no new events — doesn't trap us in next_event's spin and starve the auto-
+            // repeat poll below. Any pending event is still processed one per iteration.
             if let Some((TRB_TRANSFER_EVENT, _, slot_id)) =
-                next_event(&dma, &mmio, ir0, &mut ev_idx, &mut ev_cycle)
+                next_event(&dma, &mmio, ir0, &mut ev_idx, &mut ev_cycle, 1)
             {
                 if let Some(d) = devs[..ndev].iter().position(|h| h.slot == slot_id) {
                     let dev = devs[d].idx;
@@ -817,7 +838,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         );
                     } else {
                         godspeed_sdk::hid::decode_keyboard(
-                            &rep, &mut kb_last[d], |ch| ctx.console_push(ch),
+                            &rep, &mut kb_last[d], &mut kb_rep[d], ctx.read_tsc(),
+                            |ch| ctx.console_push(ch),
                             |code| ctx.log_fmt(format_args!(
                                 "xhci: unmapped HID key usage {:#04x} (add to sdk hid_to_ascii)", code)));
                     }
@@ -852,6 +874,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         break 'poll;
                     }
                     if !c { present &= !(1 << p); }
+                }
+            }
+            // Typematic auto-repeat: a held key sends no further USB reports, so
+            // synthesise repeats from the TSC cycle counter while the key stays down.
+            let now = ctx.read_tsc();
+            for d in 0..ndev {
+                if !devs[d].is_mouse {
+                    kb_rep[d].poll(now, |ch| ctx.console_push(ch));
                 }
             }
             ctx.yield_cpu();

@@ -10,7 +10,9 @@
 //! All userspace services link against this crate. It provides the typed
 //! wrappers around kernel syscalls so service code never issues raw syscalls.
 
-#![no_std]
+// `no_std` for the real (target) build; under `cargo test` we build for the host with
+// `std` so the pure-logic modules (e.g. `hid`) can have unit tests.
+#![cfg_attr(not(test), no_std)]
 
 pub mod capability;
 pub mod dma;
@@ -50,6 +52,7 @@ impl From<IpcError> for Error {
     fn from(e: IpcError) -> Self { Error::Ipc(e) }
 }
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}

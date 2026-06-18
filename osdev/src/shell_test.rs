@@ -124,17 +124,22 @@ pub fn run(image_path: &Path, smp: u32) {
     // -----------------------------------------------------------------------
     // help
     // -----------------------------------------------------------------------
-    send(&mut write_half, b"help\r");
+    // `help` is now paged (the framebuffer console has no scrollback). Drive the pager:
+    // page down through every screen (extra page-downs clamp at the bottom, harmless),
+    // then `q` to quit. The accumulated byte stream still contains every section, and
+    // reaching `gsh>` proves the pager exited cleanly back to the prompt.
+    send(&mut write_half, b"help\r          q");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => {
             check!(r.contains("GodspeedOS shell commands"), "help: header");
-            check!(r.contains("spawn"),   "help: spawn listed");
-            check!(r.contains("restart"), "help: restart listed");
-            check!(r.contains("status"),  "help: status listed");
+            check!(r.contains("spawn"),   "help: spawn listed (paged)");
+            check!(r.contains("restart"), "help: restart listed (paged)");
+            check!(r.contains("status"),  "help: status listed (paged)");
+            check!(r.contains("up/down: scroll") && r.contains("q: quit"), "help: pager status line shown");
         }
         None => {
-            println!("shell-test: FAIL — timed out after `help`  [×4]");
-            fail += 4;
+            println!("shell-test: FAIL — timed out after `help`  [×5]");
+            fail += 5;
         }
     }
 
@@ -472,6 +477,44 @@ pub fn run(image_path: &Path, smp: u32) {
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains(&format!("cores: {smp}")), "up-arrow history: recalled + ran the previous command"),
         None    => { println!("shell-test: FAIL — timed out after up-arrow history"); fail += 1; }
+    }
+
+    // -----------------------------------------------------------------------
+    // In-line editing (extended-keyboard navigation cluster). The harness can't see
+    // the cursor, but it CAN prove the edit by the resulting command's OUTPUT. Each
+    // case builds a different final command via mid-line cursor moves + insert/delete.
+    // -----------------------------------------------------------------------
+    // Left-arrow + insert: type "echo AC", Left once (cursor between A and C), type "B"
+    // → the line is "echo ABC". Output "ABC" proves the B was inserted mid-line.
+    send(&mut write_half, b"echo AC\x1b[DB\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("ABC"), "left-arrow + insert: byte lands mid-line (echo ABC)"),
+        None    => { println!("shell-test: FAIL — timed out after left+insert edit"); fail += 1; }
+    }
+    // Home + Right×5 + Delete: type "echo ZABC", Home (ESC[H) to the start, Right 5×
+    // (past "echo ") to just before Z, Delete (ESC[3~) removes Z → "echo ABC".
+    // Sent in <=16-byte pieces with a gap between so no single escape sequence is split
+    // across a UART-FIFO drain (a real keyboard delivers each sequence's bytes atomically;
+    // a 27-byte burst would split mid-sequence and isn't representative). esc() helps.
+    let esc = |w: &mut std::net::TcpStream, b: &[u8]| { send(w, b); std::thread::sleep(Duration::from_millis(60)); };
+    esc(&mut write_half, b"echo ZABC");
+    esc(&mut write_half, b"\x1b[H");                                 // Home
+    esc(&mut write_half, b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C");          // Right x5 (15 bytes)
+    esc(&mut write_half, b"\x1b[3~");                                // Delete
+    send(&mut write_half, b"\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("ABC") && !r.contains("ZABC"), "home + right + Delete: forward-delete mid-line (echo ABC)"),
+        None    => { println!("shell-test: FAIL — timed out after home/delete edit"); fail += 1; }
+    }
+    // Bare ESC clears the line: type "garbage", press ESC (no following byte → bare ESC),
+    // then "cores" + Enter. If ESC cleared, the command is just "cores"; if it didn't, it
+    // would be "garbagecores" → unknown. Output "cores: N" proves the clear.
+    send(&mut write_half, b"garbage\x1b");
+    std::thread::sleep(Duration::from_millis(400)); // let the bare-ESC wait elapse before more bytes
+    send(&mut write_half, b"cores\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains(&format!("cores: {smp}")) && !r.contains("unknown"), "bare ESC clears the line"),
+        None    => { println!("shell-test: FAIL — timed out after bare-ESC clear"); fail += 1; }
     }
 
     // -----------------------------------------------------------------------

@@ -31,6 +31,7 @@ pub fn hid_to_ascii(key: u8, mods: u8) -> Option<u8> {
         }
         0x27 => Some(if shift { b')' } else { b'0' }),
         0x28 => Some(b'\n'), // Enter
+        0x29 => Some(0x1B),  // Escape — bare ESC (the shell disambiguates it from a sequence)
         0x2A => Some(0x08),  // Backspace
         0x2B => Some(b'\t'), // Tab
         0x2C => Some(b' '),  // Space
@@ -47,16 +48,118 @@ pub fn hid_to_ascii(key: u8, mods: u8) -> Option<u8> {
         0x37 => Some(if shift { b'>' } else { b'.' }),
         0x38 => Some(if shift { b'?' } else { b'/' }),
         0x64 => Some(if shift { b'|' } else { b'\\' }), // Non-US \ and | (the 0x31 twin)
+        // Numeric keypad (a separate number pad sends these, 0x54-0x63). We don't track
+        // the NumLock LED state, so map them NumLock-ON unconditionally: digits + the
+        // arithmetic operators + keypad-Enter. This is what a shell wants from a numpad
+        // (typing numbers); the navigation interpretation (NumLock off → Home/arrows/etc.)
+        // is deliberately not modelled. Shift does not change keypad output here.
+        0x54 => Some(b'/'),  // Keypad /
+        0x55 => Some(b'*'),  // Keypad *
+        0x56 => Some(b'-'),  // Keypad -
+        0x57 => Some(b'+'),  // Keypad +
+        0x58 => Some(b'\n'), // Keypad Enter
+        0x59 => Some(b'1'),
+        0x5A => Some(b'2'),
+        0x5B => Some(b'3'),
+        0x5C => Some(b'4'),
+        0x5D => Some(b'5'),
+        0x5E => Some(b'6'),
+        0x5F => Some(b'7'),
+        0x60 => Some(b'8'),
+        0x61 => Some(b'9'),
+        0x62 => Some(b'0'),
+        0x63 => Some(b'.'),  // Keypad .
         _ => None,
     }
 }
 
-/// Codes in the printable-key ranges (letters, digits, punctuation) — but NOT the control
-/// keys (Enter/Esc/Backspace/Tab/Space at 0x28-0x2C) or modifiers/F-keys/keypad. Used to
+/// Codes in the printable-key ranges (letters, digits, punctuation, keypad) — but NOT the
+/// control keys (Enter/Esc/Backspace/Tab/Space at 0x28-0x2C) or modifiers/F-keys. Used to
 /// decide whether an unmapped key is worth reporting (a missing punctuation mapping) vs
-/// silent noise (a function/modifier key with no character).
+/// silent noise (a function/modifier key with no character). Keys in these ranges are all
+/// mapped by `hid_to_ascii`, so reaching `on_unmapped` here means a gap to fill.
 fn is_typable_code(k: u8) -> bool {
-    matches!(k, 0x04..=0x27 | 0x2D..=0x38 | 0x64)
+    matches!(k, 0x04..=0x27 | 0x2D..=0x38 | 0x54..=0x63 | 0x64)
+}
+
+/// Emit the byte(s) a single keycode produces under `mods`, returning `true` if it
+/// produced any output (i.e. it is a printable / cursor key worth auto-repeating).
+/// Shared by the first-press edge path and the auto-repeat path so a repeated key is
+/// byte-for-byte identical to its first press. The cursor and navigation-cluster keys
+/// emit the same ANSI escape sequences a serial terminal sends, so the shell's one input
+/// parser (`handle_csi` / the pager) handles USB and serial alike — this is what makes a
+/// standard extended keyboard's Home/End/Delete/PageUp/PageDown work on real hardware
+/// (without it the physical keys produce nothing).
+fn emit_key(k: u8, mods: u8, emit: &mut impl FnMut(u8)) -> bool {
+    // ESC [ <body...> for a cursor/navigation key. Returns true (it produced output).
+    fn csi(body: &[u8], emit: &mut impl FnMut(u8)) -> bool {
+        emit(0x1B);
+        emit(b'[');
+        for &b in body { emit(b); }
+        true
+    }
+    match k {
+        0x52 => csi(b"A", emit),  // Up
+        0x51 => csi(b"B", emit),  // Down
+        0x4F => csi(b"C", emit),  // Right
+        0x50 => csi(b"D", emit),  // Left
+        0x4A => csi(b"H", emit),  // Home
+        0x4D => csi(b"F", emit),  // End
+        0x49 => csi(b"2~", emit), // Insert
+        0x4C => csi(b"3~", emit), // Delete (forward delete)
+        0x4B => csi(b"5~", emit), // PageUp
+        0x4E => csi(b"6~", emit), // PageDown
+        _ => match hid_to_ascii(k, mods) {
+            Some(ch) => { emit(ch); true }
+            None => false,
+        },
+    }
+}
+
+/// Tracks the currently-held key so a driver can synthesise typematic auto-repeat.
+/// USB HID boot keyboards report only on *change* — a held key sends one down report
+/// and then nothing until release — so the host must synthesise repeat itself.
+///
+/// `now`, `initial`, and `interval` are in **whatever monotonic unit the driver feeds
+/// in** — the drivers use `ServiceContext::read_tsc()` cycles (hardware-proven to
+/// advance on real machines, unlike the coarse kernel tick), so `initial`/`interval`
+/// are cycle counts (e.g. ~300 ms / ~50 ms worth at the CPU's frequency). The unit is
+/// the driver's choice; this struct only compares and adds. `decode_keyboard` arms it
+/// on a fresh printable press and disarms on release; the driver calls
+/// [`KeyRepeat::poll`] every loop iteration with the current `now`. One per keyboard.
+pub struct KeyRepeat {
+    key: u8,       // HID usage of the key being repeated (0 = none armed)
+    mods: u8,      // modifier byte captured at press (so Shift+key repeats the shifted form)
+    next_at: u64,  // `now` value at which the next repeat is due
+    initial: u64,  // delay (in the driver's `now` unit) before the first repeat
+    interval: u64, // delay between subsequent repeats
+}
+
+impl KeyRepeat {
+    /// `initial`/`interval` are in the same unit the driver passes as `now` (TSC cycles).
+    pub const fn new(initial: u64, interval: u64) -> Self {
+        KeyRepeat { key: 0, mods: 0, next_at: 0, initial, interval }
+    }
+
+    fn arm(&mut self, key: u8, mods: u8, now: u64) {
+        self.key = key;
+        self.mods = mods;
+        self.next_at = now.wrapping_add(self.initial);
+    }
+
+    fn disarm(&mut self) {
+        self.key = 0;
+    }
+
+    /// Emit a repeat of the held key if one is due at `now`. Call once per poll
+    /// iteration; a no-op until `initial` elapses, then fires at most once per `interval`.
+    pub fn poll(&mut self, now: u64, mut emit: impl FnMut(u8)) {
+        if self.key == 0 || now < self.next_at {
+            return;
+        }
+        emit_key(self.key, self.mods, &mut emit);
+        self.next_at = now.wrapping_add(self.interval);
+    }
 }
 
 /// Decode a keyboard boot report (modifiers in byte 0, up to six keycodes in
@@ -64,9 +167,16 @@ fn is_typable_code(k: u8) -> bool {
 /// that is down now but was not in `last`, so rolling onto a new key before
 /// releasing the previous one drops nothing and a held key fires exactly once.
 /// `last` is updated to this report's keycodes for the next call.
+///
+/// `rep`/`now` drive typematic auto-repeat: the newest printable key still held is
+/// armed (at tick `now`) so the driver's [`KeyRepeat::poll`] re-emits it while held;
+/// releasing it disarms repeat. A key we don't map is reported via `on_unmapped`
+/// (loud, not silently dropped — §3.12) so its HID usage code can be logged and added.
 pub fn decode_keyboard(
     report: &[u8; 8],
     last: &mut [u8; 6],
+    rep: &mut KeyRepeat,
+    now: u64,
     mut emit: impl FnMut(u8),
     mut on_unmapped: impl FnMut(u8),
 ) {
@@ -75,25 +185,21 @@ pub fn decode_keyboard(
     for &k in cur.iter() {
         if k == 0 || k == 0x01 { continue; } // 0 = empty slot, 0x01 = rollover error
         if !last.contains(&k) {
-            // Arrow keys → ANSI escape sequences (ESC [ A/B/C/D), exactly what a serial
-            // terminal sends, so the shell's one input parser handles both paths (e.g. the
-            // up-arrow history walk). Other keys decode to ASCII; a key we don't map is
-            // reported via `on_unmapped` (loud, not silently dropped — §3.12) so the exact
-            // HID usage code can be logged and added to the map.
-            match k {
-                0x52 => { emit(0x1B); emit(b'['); emit(b'A'); } // Up
-                0x51 => { emit(0x1B); emit(b'['); emit(b'B'); } // Down
-                0x4F => { emit(0x1B); emit(b'['); emit(b'C'); } // Right
-                0x50 => { emit(0x1B); emit(b'['); emit(b'D'); } // Left
-                // Modifiers/Caps/etc. (0x29 Esc, 0x39 CapsLock, 0xE0-E7) are not printable;
-                // don't report them as "unmapped" noise — only report keys in the typable
-                // ranges we'd expect to map.
-                _ => match hid_to_ascii(k, mods) {
-                    Some(ch) => emit(ch),
-                    None => if is_typable_code(k) { on_unmapped(k); },
-                },
+            if emit_key(k, mods, &mut emit) {
+                // Newest printable/cursor key held becomes the repeat key — except
+                // Escape (0x29), a one-shot control key whose repeat would just make
+                // the shell re-disambiguate a bare ESC on every tick.
+                if k != 0x29 { rep.arm(k, mods, now); }
+            } else if is_typable_code(k) {
+                // Modifiers/Caps/Esc (0x29, 0x39, 0xE0-E7) are not printable; only the
+                // typable ranges we'd expect to map are surfaced as "unmapped" noise.
+                on_unmapped(k);
             }
         }
+    }
+    // Stop repeating once the armed key is no longer held.
+    if rep.key != 0 && !cur.contains(&rep.key) {
+        rep.disarm();
     }
     *last = cur;
 }
@@ -154,5 +260,50 @@ impl MouseTracker {
             self.ax = 0;
             self.ay = 0;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    extern crate std;
+    use std::vec::Vec;
+
+    // Decode a single-keycode report and collect the bytes it emits.
+    fn emit_for(code: u8) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut last = [0u8; 6];
+        let mut rep = KeyRepeat::new(0, 0);
+        let report = [0, 0, code, 0, 0, 0, 0, 0];
+        decode_keyboard(&report, &mut last, &mut rep, 0, |b| out.push(b), |_| {});
+        out
+    }
+
+    #[test]
+    fn nav_cluster_emits_terminal_escape_sequences() {
+        // The navigation cluster a standard extended keyboard sends — each must map to
+        // the exact escape sequence the shell's CSI parser / pager understands.
+        assert_eq!(emit_for(0x4A), b"\x1b[H");  // Home
+        assert_eq!(emit_for(0x4D), b"\x1b[F");  // End
+        assert_eq!(emit_for(0x49), b"\x1b[2~"); // Insert
+        assert_eq!(emit_for(0x4C), b"\x1b[3~"); // Delete
+        assert_eq!(emit_for(0x4B), b"\x1b[5~"); // PageUp
+        assert_eq!(emit_for(0x4E), b"\x1b[6~"); // PageDown
+    }
+
+    #[test]
+    fn arrows_still_emit_their_sequences() {
+        assert_eq!(emit_for(0x52), b"\x1b[A"); // Up
+        assert_eq!(emit_for(0x51), b"\x1b[B"); // Down
+        assert_eq!(emit_for(0x4F), b"\x1b[C"); // Right
+        assert_eq!(emit_for(0x50), b"\x1b[D"); // Left
+    }
+
+    #[test]
+    fn ordinary_and_keypad_keys_unaffected() {
+        assert_eq!(emit_for(0x04), b"a");      // letter
+        assert_eq!(emit_for(0x59), b"1");      // keypad 1
+        assert_eq!(emit_for(0x2A), &[0x08]);   // backspace
+        assert_eq!(emit_for(0x28), b"\n");     // enter
     }
 }
