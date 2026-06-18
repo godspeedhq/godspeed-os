@@ -186,6 +186,10 @@ const RIGHT_GRANT: u8 = 1 << 4;
 // MAX_OPEN files open at once; the path is re-walked per op (handles the file being moved/deleted —
 // the walk simply fails then). Lives on `Fs` (owned state, not a static — §3.9), reset on mount (an
 // fs restart kills all outstanding file caps, §14.3, so the table starts empty).
+//
+// NOTE — do not naively raise these: `Fs` is a stack local returned by value from `mount`/`format`
+// (it already holds the 28 KiB `txn_blk`), so bumping the table to 128 (let alone 256) overflows
+// fs's stack and kills it on boot. A bigger table needs `Fs` (or this table) OFF the stack first.
 const MAX_OPEN: usize = 64;
 const OPEN_PATH_MAX: usize = 96;
 #[derive(Clone, Copy)]
