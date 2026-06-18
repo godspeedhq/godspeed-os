@@ -47,16 +47,38 @@ pub fn hid_to_ascii(key: u8, mods: u8) -> Option<u8> {
         0x37 => Some(if shift { b'>' } else { b'.' }),
         0x38 => Some(if shift { b'?' } else { b'/' }),
         0x64 => Some(if shift { b'|' } else { b'\\' }), // Non-US \ and | (the 0x31 twin)
+        // Numeric keypad (a separate number pad sends these, 0x54-0x63). We don't track
+        // the NumLock LED state, so map them NumLock-ON unconditionally: digits + the
+        // arithmetic operators + keypad-Enter. This is what a shell wants from a numpad
+        // (typing numbers); the navigation interpretation (NumLock off → Home/arrows/etc.)
+        // is deliberately not modelled. Shift does not change keypad output here.
+        0x54 => Some(b'/'),  // Keypad /
+        0x55 => Some(b'*'),  // Keypad *
+        0x56 => Some(b'-'),  // Keypad -
+        0x57 => Some(b'+'),  // Keypad +
+        0x58 => Some(b'\n'), // Keypad Enter
+        0x59 => Some(b'1'),
+        0x5A => Some(b'2'),
+        0x5B => Some(b'3'),
+        0x5C => Some(b'4'),
+        0x5D => Some(b'5'),
+        0x5E => Some(b'6'),
+        0x5F => Some(b'7'),
+        0x60 => Some(b'8'),
+        0x61 => Some(b'9'),
+        0x62 => Some(b'0'),
+        0x63 => Some(b'.'),  // Keypad .
         _ => None,
     }
 }
 
-/// Codes in the printable-key ranges (letters, digits, punctuation) — but NOT the control
-/// keys (Enter/Esc/Backspace/Tab/Space at 0x28-0x2C) or modifiers/F-keys/keypad. Used to
+/// Codes in the printable-key ranges (letters, digits, punctuation, keypad) — but NOT the
+/// control keys (Enter/Esc/Backspace/Tab/Space at 0x28-0x2C) or modifiers/F-keys. Used to
 /// decide whether an unmapped key is worth reporting (a missing punctuation mapping) vs
-/// silent noise (a function/modifier key with no character).
+/// silent noise (a function/modifier key with no character). Keys in these ranges are all
+/// mapped by `hid_to_ascii`, so reaching `on_unmapped` here means a gap to fill.
 fn is_typable_code(k: u8) -> bool {
-    matches!(k, 0x04..=0x27 | 0x2D..=0x38 | 0x64)
+    matches!(k, 0x04..=0x27 | 0x2D..=0x38 | 0x54..=0x63 | 0x64)
 }
 
 /// Emit the byte(s) a single keycode produces under `mods`, returning `true` if it
