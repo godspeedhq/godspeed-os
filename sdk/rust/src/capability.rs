@@ -16,6 +16,14 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapHandle(pub u32);
 
+/// Capability right bits, mirroring the kernel `Rights` bitfield (§7.4). Used with the
+/// delegated-resource calls (`resource_mint`/`resource_invoke`, §7.10): a file cap minted
+/// `RIGHT_READ | RIGHT_WRITE | RIGHT_GRANT`, a read invoked with `RIGHT_READ`, a write with
+/// `RIGHT_WRITE` (a cap lacking the invoked right fails — the non-escalation check).
+pub const RIGHT_READ: u8 = 1 << 0;
+pub const RIGHT_WRITE: u8 = 1 << 1;
+pub const RIGHT_GRANT: u8 = 1 << 4;
+
 /// Errors mirrored from the kernel's CapError (§7.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapError {
