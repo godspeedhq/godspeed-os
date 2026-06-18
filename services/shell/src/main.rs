@@ -1285,18 +1285,25 @@ static HELP: &[HelpRow] = &[
     Text("Type '<command> help' for usage + examples, '<command> version' for the version."),
 ];
 
-/// Render help line `idx` (0 = the versioned header, then `HELP[idx-1]`).
-fn help_render_line(ctx: &ServiceContext, idx: usize) {
+/// Render help line `idx` (0 = the versioned header, then `HELP[idx-1]`). When `clear_eol`
+/// the line ends with `ESC[K` (erase to end of line) before the newline — the pager repaints
+/// each row in place over the old frame, so a shorter line must wipe the longer one's tail.
+fn help_render_line(ctx: &ServiceContext, idx: usize, clear_eol: bool) {
+    let eol = if clear_eol { "\x1b[K" } else { "" };
     if idx == 0 {
         // Rule 6 (0_conventions.md): help output's first line is `<util> <version>`.
-        ctx.console_writeln_fmt(format_args!("help {} — GodspeedOS shell commands", UTIL_VERSION));
-        return;
+        ctx.console_write_fmt(format_args!("help {} — GodspeedOS shell commands", UTIL_VERSION));
+    } else {
+        match &HELP[idx - 1] {
+            Gap => {}
+            Sec(s) | Text(s) => ctx.console_write(s),
+            // One "  command  description" row, left-justified to a fixed width so the
+            // description columns line up (ASCII-only — renders the same on TV and serial).
+            Row(cmd, desc) => ctx.console_write_fmt(format_args!("  {:<21}  {}", cmd, desc)),
+        }
     }
-    match &HELP[idx - 1] {
-        Gap => ctx.console_writeln(""),
-        Sec(s) | Text(s) => ctx.console_writeln(s),
-        Row(cmd, desc) => help_line(ctx, cmd, desc),
-    }
+    ctx.console_write(eol);
+    ctx.console_write("\n");
 }
 
 fn cmd_help(ctx: &ServiceContext, depth: u8) -> Result<(), ShellError> {
@@ -1310,7 +1317,7 @@ fn cmd_help(ctx: &ServiceContext, depth: u8) -> Result<(), ShellError> {
     let (rows, _cols) = ctx.console_dims();
     let rows = rows as usize;
     if depth > 0 || rows == 0 || total <= rows {
-        for i in 0..total { help_render_line(ctx, i); }
+        for i in 0..total { help_render_line(ctx, i, false); }
         return Ok(());
     }
     help_pager(ctx, total, rows);
@@ -1319,22 +1326,30 @@ fn cmd_help(ctx: &ServiceContext, depth: u8) -> Result<(), ShellError> {
 
 /// `less`-style pager for `help`: render a screenful from `top`, a status line, then
 /// read a key and scroll. Space / PageDown page; Up/Down (or j/k) move a line; b /
-/// PageUp page back; g/G jump to top/bottom; q / Esc / Enter quit. Redraws by clearing
-/// (`ESC[2J`) and reprinting the viewport — the only way to scroll *up* on a console
-/// with no scrollback. Bounded: at most `total` lines, indices clamped every step.
+/// PageUp page back; g/G jump to top/bottom; q / Esc / Enter quit.
+///
+/// Repaint is done **in place** to avoid the flicker and cost of a full clear: the cursor
+/// is hidden for the session (`ESC[?25l`) so the bulk redraw skips the per-character cursor
+/// toggle, each frame homes (`ESC[H`) instead of clearing to black, every row erases its own
+/// tail (`ESC[K`), and `ESC[J` wipes anything below the status line on a short last page.
+/// This is the same write-only repaint the fast boot-time scroll uses, so scrolling is smooth
+/// rather than a black flash + full reprint. Bounded: at most `total` lines, clamped each step.
 fn help_pager(ctx: &ServiceContext, total: usize, rows: usize) {
     let page = rows.saturating_sub(1).max(1); // leave one row for the status line
     let max_top = total.saturating_sub(page);
     let mut top = 0usize;
+    ctx.console_write("\x1b[?25l"); // hide the cursor for the whole pager session
     loop {
-        ctx.console_write("\x1b[2J\x1b[H");
+        ctx.console_write("\x1b[H"); // home — repaint over the old frame, no clear-to-black
         let end = (top + page).min(total);
-        for i in top..end { help_render_line(ctx, i); }
-        // Status line (no trailing newline so the cursor parks on it). Scroll keys lead,
-        // since holding Up/Down now scrolls smoothly (typematic auto-repeat).
+        for i in top..end { help_render_line(ctx, i, true); }
+        // Status line (no trailing newline so it parks at the bottom). Scroll keys lead,
+        // since holding Up/Down scrolls smoothly (typematic auto-repeat). ESC[J after it
+        // wipes any rows left over from a taller previous frame (e.g. the short last page).
         ctx.console_write_fmt(format_args!(
             "[ lines {}-{} of {} ]  up/down: scroll  space: next page  g/G: top/end  q: quit",
             top + 1, end, total));
+        ctx.console_write("\x1b[J");
         // Read one command key (arrows/PageUp/Down arrive as escape sequences).
         let mut down = 0i64; // signed line delta to apply; isize via i64 to allow page jumps
         let mut quit = false;
@@ -1371,8 +1386,8 @@ fn help_pager(ctx: &ServiceContext, total: usize, rows: usize) {
             top = nt.clamp(0, max_top as i64) as usize;
         }
     }
-    // Leave a clean screen + the prompt comes from the main loop.
-    ctx.console_write("\x1b[2J\x1b[H");
+    // Restore the cursor and leave a clean screen; the prompt comes from the main loop.
+    ctx.console_write("\x1b[?25h\x1b[2J\x1b[H");
 }
 
 /// Keys the pager recognises from a terminal escape sequence.
@@ -1404,14 +1419,6 @@ fn pager_csi(ctx: &ServiceContext) -> PagerKey {
         },
         _ => PagerKey::Other,
     }
-}
-
-/// One "  command  description" row. The command is left-justified to a fixed
-/// width with format padding so every description column lines up exactly — no
-/// hand-counted spaces, and ASCII-only so it renders identically on the TV
-/// framebuffer (whose font is ASCII) and a serial terminal.
-fn help_line(ctx: &ServiceContext, cmd: &str, desc: &str) {
-    ctx.console_writeln_fmt(format_args!("  {:<21}  {}", cmd, desc));
 }
 
 /// Clear the screen. Emits ANSI erase-display + cursor-home: the framebuffer
