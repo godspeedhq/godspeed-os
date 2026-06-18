@@ -66,6 +66,13 @@ const MAX_SCRATCHPAD: usize = 256; // arena room = XHCI_DMA_PAGES (272) - 16
 
 /// Maximum HID devices bound on one controller at once (keyboard + mouse).
 const MAX_HID: usize = 2;
+
+/// Typematic auto-repeat delays, in TSC cycles (`ctx.read_tsc()` units). Sized for a
+/// ~2 GHz CPU (the T630): ~300 ms before the first repeat, then ~50 ms apart (~20/s).
+/// Auto-repeat is forgiving, so a 1.5–3 GHz spread just shifts the feel a little; no
+/// per-machine calibration needed. read_tsc is hardware-proven to advance (perf §22).
+const REPEAT_INITIAL_CYCLES: u64 = 600_000_000;
+const REPEAT_INTERVAL_CYCLES: u64 = 100_000_000;
 const DEV_BASE: usize = 0x7000;
 const DEV_STRIDE: usize = 0x4000; // 4 pages: device ctx, EP0 ring, int ring, report
 fn device_ctx_off(i: usize) -> usize { DEV_BASE + i * DEV_STRIDE }
@@ -762,9 +769,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut need_queue = [true; MAX_HID];
         let mut kb_last = [[0u8; 6]; MAX_HID];
         let mut kb_rep = [
-            godspeed_sdk::hid::KeyRepeat::new(),
-            godspeed_sdk::hid::KeyRepeat::new(),
+            godspeed_sdk::hid::KeyRepeat::new(REPEAT_INITIAL_CYCLES, REPEAT_INTERVAL_CYCLES),
+            godspeed_sdk::hid::KeyRepeat::new(REPEAT_INITIAL_CYCLES, REPEAT_INTERVAL_CYCLES),
         ];
+        let mut repeat_logged = false; // one-time confirm that auto-repeat actually fires
         let mut mouse = [
             godspeed_sdk::hid::MouseTracker::new(),
             godspeed_sdk::hid::MouseTracker::new(),
@@ -831,7 +839,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         );
                     } else {
                         godspeed_sdk::hid::decode_keyboard(
-                            &rep, &mut kb_last[d], &mut kb_rep[d], ctx.monotonic_ticks(),
+                            &rep, &mut kb_last[d], &mut kb_rep[d], ctx.read_tsc(),
                             |ch| ctx.console_push(ch),
                             |code| ctx.log_fmt(format_args!(
                                 "xhci: unmapped HID key usage {:#04x} (add to sdk hid_to_ascii)", code)));
@@ -870,11 +878,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 }
             }
             // Typematic auto-repeat: a held key sends no further USB reports, so
-            // synthesise repeats from the monotonic tick while the key stays down.
-            let now = ctx.monotonic_ticks();
+            // synthesise repeats from the TSC cycle counter while the key stays down.
+            let now = ctx.read_tsc();
             for d in 0..ndev {
                 if !devs[d].is_mouse {
-                    kb_rep[d].poll(now, |ch| ctx.console_push(ch));
+                    let mut fired = false;
+                    kb_rep[d].poll(now, |ch| { ctx.console_push(ch); fired = true; });
+                    if fired && !repeat_logged {
+                        ctx.log("xhci: typematic auto-repeat firing");
+                        repeat_logged = true;
+                    }
                 }
             }
             ctx.yield_cpu();

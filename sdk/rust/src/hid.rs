@@ -101,49 +101,49 @@ fn emit_key(k: u8, mods: u8, emit: &mut impl FnMut(u8)) -> bool {
     }
 }
 
-/// Typematic auto-repeat timing, in `ServiceContext::monotonic_ticks` units (one tick
-/// ≈ the kernel preemption period: ~50 ms on the T630 periodic timer, 10 ms under
-/// TSC-Deadline). USB HID boot keyboards report only on *change* — a held key sends
-/// one down report and then nothing until release — so the host must synthesise
-/// repeat itself. These are deliberately coarse; the goal is "hold backspace and it
-/// keeps deleting," not a configurable rate.
-pub const REPEAT_INITIAL_TICKS: u64 = 5; // delay before the first repeat (~250 ms HW)
-pub const REPEAT_INTERVAL_TICKS: u64 = 1; // then one repeat per tick (~20/s HW)
-
-/// Tracks the currently-held key so a driver can synthesise typematic auto-repeat
-/// from a monotonic tick. `decode_keyboard` arms it on a fresh printable press and
-/// disarms it when that key is released; the driver calls [`KeyRepeat::poll`] every
-/// loop iteration with the current tick to emit repeats. One per keyboard device.
+/// Tracks the currently-held key so a driver can synthesise typematic auto-repeat.
+/// USB HID boot keyboards report only on *change* — a held key sends one down report
+/// and then nothing until release — so the host must synthesise repeat itself.
+///
+/// `now`, `initial`, and `interval` are in **whatever monotonic unit the driver feeds
+/// in** — the drivers use `ServiceContext::read_tsc()` cycles (hardware-proven to
+/// advance on real machines, unlike the coarse kernel tick), so `initial`/`interval`
+/// are cycle counts (e.g. ~300 ms / ~50 ms worth at the CPU's frequency). The unit is
+/// the driver's choice; this struct only compares and adds. `decode_keyboard` arms it
+/// on a fresh printable press and disarms on release; the driver calls
+/// [`KeyRepeat::poll`] every loop iteration with the current `now`. One per keyboard.
 pub struct KeyRepeat {
-    key: u8,      // HID usage of the key being repeated (0 = none armed)
-    mods: u8,     // modifier byte captured at press (so Shift+key repeats the shifted form)
-    next_at: u64, // monotonic tick at which the next repeat is due
+    key: u8,       // HID usage of the key being repeated (0 = none armed)
+    mods: u8,      // modifier byte captured at press (so Shift+key repeats the shifted form)
+    next_at: u64,  // `now` value at which the next repeat is due
+    initial: u64,  // delay (in the driver's `now` unit) before the first repeat
+    interval: u64, // delay between subsequent repeats
 }
 
 impl KeyRepeat {
-    pub const fn new() -> Self {
-        KeyRepeat { key: 0, mods: 0, next_at: 0 }
+    /// `initial`/`interval` are in the same unit the driver passes as `now` (TSC cycles).
+    pub const fn new(initial: u64, interval: u64) -> Self {
+        KeyRepeat { key: 0, mods: 0, next_at: 0, initial, interval }
     }
 
     fn arm(&mut self, key: u8, mods: u8, now: u64) {
         self.key = key;
         self.mods = mods;
-        self.next_at = now.wrapping_add(REPEAT_INITIAL_TICKS);
+        self.next_at = now.wrapping_add(self.initial);
     }
 
     fn disarm(&mut self) {
         self.key = 0;
     }
 
-    /// Emit a repeat of the held key if one is due at tick `now`. Call once per poll
-    /// iteration; it is a no-op until the initial delay elapses, then fires at most
-    /// once per `REPEAT_INTERVAL_TICKS`.
+    /// Emit a repeat of the held key if one is due at `now`. Call once per poll
+    /// iteration; a no-op until `initial` elapses, then fires at most once per `interval`.
     pub fn poll(&mut self, now: u64, mut emit: impl FnMut(u8)) {
         if self.key == 0 || now < self.next_at {
             return;
         }
         emit_key(self.key, self.mods, &mut emit);
-        self.next_at = now.wrapping_add(REPEAT_INTERVAL_TICKS);
+        self.next_at = now.wrapping_add(self.interval);
     }
 }
 
