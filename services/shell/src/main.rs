@@ -32,6 +32,7 @@ const OP_FLASH: u8 = 21;
 const OP_LABEL: u8 = 22;
 const OP_RESET: u8 = 23;
 const OP_CHECK: u8 = 27; // fsck: rebuild bitmap+free from the tree, report CRC failures
+const OP_SCRUB: u8 = 29; // scrub: read-only CRC integrity sweep (reports, changes nothing)
 // large-file streaming ops (offset-addressed): create a sized file, then write/read chunks.
 const OP_WRITE_NEW: u8 = 24; // [op, plen, path, total:u64]
 const OP_WRITE_AT: u8 = 25;  // [op, plen, path, offset:u64, chunk]
@@ -841,6 +842,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("drives label [drive] <name>", "name / rename a drive", "drives label 0 archive"),
             ("drives reset [drive]", "un-format a drive back to raw", "drives reset 0"),
             ("drives check [drive]", "verify (fsck): rebuild bitmap/free, report CRC failures", "drives check"),
+            ("drives scrub [drive]", "read-only integrity sweep: verify every block's CRC, report (changes nothing)", "drives scrub"),
         ], true),
         "ls" => help_block(ctx, "ls", "list a directory (records when piped)", &[
             ("ls", "list the current directory", "ls"),
@@ -965,6 +967,10 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
         ("drives", "check") => help_block(ctx, "drives check", "fsck: verify integrity + rebuild the bitmap/free count (does NOT erase)", &[
             ("drives check", "check the only drive", "drives check"),
             ("drives check <drive>", "check drive <drive>", "drives check 0"),
+        ], false),
+        ("drives", "scrub") => help_block(ctx, "drives scrub", "read-only integrity sweep: verify every block's CRC, report (changes nothing; run periodically)", &[
+            ("drives scrub", "scrub the only drive", "drives scrub"),
+            ("drives scrub <drive>", "scrub drive <drive>", "drives scrub 0"),
         ], false),
         _ => return false,
     }
@@ -3404,6 +3410,12 @@ fn cmd_drives(ctx: &ServiceContext, args: &[&str], argc: usize) -> Result<(), Sh
             let sel = if argc >= 3 { args[2] } else { "" };
             if drive_sel_ok(ctx, sel) { drives_check(ctx) } else { Err(ShellError::Unknown) }
         }
+        "scrub"   => {
+            // `drives scrub [drive]` — READ-ONLY integrity sweep: verify every block's CRC,
+            // report, change nothing (unlike `check`, which repairs). Phase K.
+            let sel = if argc >= 3 { args[2] } else { "" };
+            if drive_sel_ok(ctx, sel) { drives_scrub(ctx) } else { Err(ShellError::Unknown) }
+        }
         // `drives help` / `drives version` and `drives <sub> help` are handled by the
         // generic per-utility intercept in `execute` (0_conventions.md).
         other     => {
@@ -3540,6 +3552,38 @@ fn drives_check(ctx: &ServiceContext) -> Result<(), ShellError> {
                 }
             } else {
                 ctx.console_writeln("check: FAILED"); Err(ShellError::Unknown)
+            }
+        }
+        None => { ctx.console_writeln("drives: storage unavailable (no fs?)"); Err(ShellError::Unknown) }
+    }
+}
+
+/// `drives scrub` — READ-ONLY integrity sweep (Phase K): walk the tree, verify every block's
+/// CRC, report, change NOTHING on disk (distinct from `check`, which repairs the bitmap). Run it
+/// on a schedule to catch latent bit-rot early; without redundancy it detects but cannot repair.
+/// Reply: [FS_OK, files:u32, dirs:u32, bad:u32, scanned:u64].
+fn drives_scrub(ctx: &ServiceContext) -> Result<(), ShellError> {
+    match ctx.request_with_reply("fs", &Message::from_bytes(&[OP_SCRUB])) {
+        Some(r) => {
+            let p = r.payload_bytes();
+            if no_fs(ctx, p) { return Err(ShellError::Unknown); }
+            if p.first() == Some(&FS_OK) && p.len() >= 21 {
+                let u32a = |o: usize| u32::from_le_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]]);
+                let u64a = |o: usize| u64::from_le_bytes([p[o], p[o+1], p[o+2], p[o+3], p[o+4], p[o+5], p[o+6], p[o+7]]);
+                let (files, dirs, bad, scanned) = (u32a(1), u32a(5), u32a(9), u64a(13));
+                ctx.console_writeln_fmt(format_args!(
+                    "scrub: verified {} blocks across {} files, {} dirs; {} bad (read-only, nothing changed)",
+                    scanned, files, dirs, bad));
+                if bad > 0 {
+                    ctx.console_writeln_fmt(format_args!(
+                        "scrub: WARNING — {} file(s)/dir(s) had CRC-failed blocks (bit-rot); the data is lost, see the log", bad));
+                    Err(ShellError::Unknown)
+                } else {
+                    ctx.console_writeln("scrub: ok — every block verified");
+                    Ok(())
+                }
+            } else {
+                ctx.console_writeln("scrub: FAILED"); Err(ShellError::Unknown)
             }
         }
         None => { ctx.console_writeln("drives: storage unavailable (no fs?)"); Err(ShellError::Unknown) }

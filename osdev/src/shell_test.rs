@@ -1630,6 +1630,86 @@ pub fn run_fs_check(image_path: &Path, persist_path: &str, expect_free: u64, smp
     if fail > 0 { std::process::exit(1); }
 }
 
+/// `drives scrub` (Phase K): boot a PRE-FORMATTED disk holding a clean file and a file with a
+/// CORRUPTED data block. `drives scrub` must report `1 bad` without panicking, leave the disk
+/// UNCHANGED (a second scrub still reports `1 bad` — read-only, no repair), and the clean file
+/// must still read back. Proves a routine, non-destructive integrity sweep that detects bit-rot.
+pub fn run_fs_scrub(image_path: &Path, persist_path: &str, smp: u32) {
+    println!("fs-scrub: booting (smp={smp}) with a disk holding a clean file + a corrupted one");
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let persist   = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let persist_str = persist.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{shell_port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("fs-scrub: QEMU launch failed: {e}"); std::process::exit(1); });
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => { eprintln!("fs-scrub: could not connect to serial {shell_port}"); child.kill().ok(); std::process::exit(1); }
+    };
+    let mut read_half  = stream.try_clone().expect("clone tcp stream");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop {
+                match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) }
+            }
+        });
+    }
+
+    let mut pass = 0usize; let mut fail = 0usize; let mut cursor = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-scrub: PASS — {}", $label); pass += 1; } else { println!("fs-scrub: FAIL — {}", $label); fail += 1; }
+    }; }
+    macro_rules! run { ($c:expr, $secs:expr) => {{ send(&mut write_half, $c); collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs)) }}; }
+
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).is_none() {
+        println!("fs-scrub: FAIL — timed out waiting for first gsh>");
+        child.kill().ok(); child.wait().ok(); std::process::exit(1);
+    }
+
+    // First scrub: must detect the one corrupt file (read-only — reports, does not repair).
+    match run!(b"drives scrub\r", 15) {
+        Some(r) => {
+            check!(r.contains("verified") && r.contains("bad"), "scrub ran and reported a block count");
+            check!(r.contains("1 bad"), "scrub detected the 1 corrupt file");
+            check!(r.contains("WARNING") && r.contains("bit-rot"), "scrub warned loudly about the bad block");
+        }
+        None => { println!("fs-scrub: FAIL — drives scrub timeout"); fail += 1; }
+    }
+    // Second scrub: identical result proves scrub is READ-ONLY (it did not repair the block).
+    match run!(b"drives scrub\r", 15) {
+        Some(r) => check!(r.contains("1 bad"), "second scrub still reports 1 bad (read-only, nothing repaired)"),
+        None    => { println!("fs-scrub: FAIL — second drives scrub timeout"); fail += 1; }
+    }
+    // The clean file is untouched by the scrub.
+    match run!(b"read /good.txt\r", 10) {
+        Some(r) => check!(r.contains("good-payload-survives-the-scrub"), "clean file still reads back after scrub"),
+        None    => { println!("fs-scrub: FAIL — read timeout"); fail += 1; }
+    }
+    let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    check!(!whole.contains("KERNEL PANIC"), "no kernel panic");
+
+    child.kill().ok(); child.wait().ok();
+    println!("\nfs-scrub: {pass} passed, {fail} failed");
+    if fail > 0 { std::process::exit(1); }
+}
+
 /// Boot bare-metal with a GSFS disk that has a self-checking `.gsh` baked in (host-side), then
 /// `run /<script_name>` — proving the flash-and-run loop and piped asserts in a script.
 pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u32) {

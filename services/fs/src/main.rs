@@ -131,6 +131,9 @@ const OP_WRITE_AT_J: u8 = 28; // [op, plen, path, offset:u64, chunk…] — like
                              // atomically (crash → fully replayed or fully discarded, never torn).
                              // Bounded to one chunk (≤7 blocks) by the journal; default WRITE_AT
                              // stays direct. Opt-in per write — the caller chooses the guarantee.
+const OP_SCRUB: u8 = 29;      // scrub (Phase K): READ-ONLY integrity sweep — walk the tree, verify
+                             // every block's CRC, report → [FS_OK, files:u32, dirs:u32, bad:u32,
+                             // scanned:u64]. Writes nothing (unlike CHECK, which repairs the bitmap).
 const FS_OK: u8 = 0;
 const FS_ERR: u8 = 1;
 const FS_NOTFOUND: u8 = 2;
@@ -590,6 +593,27 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
                         out[9..13].copy_from_slice(&bad.to_le_bytes());
                         out[13..21].copy_from_slice(&used.to_le_bytes());
                         out[21..29].copy_from_slice(&f.free_blocks.to_le_bytes());
+                        send(&out);
+                    }
+                    Err(_) => send(&[FS_ERR]),
+                },
+                None => send(&[FS_NOFS]),
+            }
+            return;
+        }
+        OP_SCRUB => {
+            // scrub: READ-ONLY integrity sweep — verify every referenced block's CRC, report,
+            // change nothing on disk (distinct from `check`, which repairs the bitmap). Op-driven
+            // (the operator/policy sets the cadence; no hidden background task, §26.4).
+            match vol {
+                Some(f) => match f.scrub(ctx) {
+                    Ok((files, dirs, bad, scanned)) => {
+                        let mut out = [0u8; 21];
+                        out[0] = FS_OK;
+                        out[1..5].copy_from_slice(&files.to_le_bytes());
+                        out[5..9].copy_from_slice(&dirs.to_le_bytes());
+                        out[9..13].copy_from_slice(&bad.to_le_bytes());
+                        out[13..21].copy_from_slice(&scanned.to_le_bytes());
                         send(&out);
                     }
                     Err(_) => send(&[FS_ERR]),
@@ -1783,6 +1807,84 @@ impl Fs {
                     None => { st.2 += 1; } // corrupt extent block — logged loudly
                 }
             } else {
+                let mut ok = true;
+                for bi in 0..count {
+                    if data_read(ctx, first + bi).is_none() { ok = false; }
+                }
+                if !ok { st.2 += 1; }
+            }
+        }
+        Ok(())
+    }
+
+    // ── scrub / `drives scrub` (Phase K) ──────────────────────────────────────
+    // READ-ONLY integrity sweep: walk the tree and verify every referenced block's CRC,
+    // reporting (files, dirs, bad, scanned). Writes NOTHING (unlike `check`, which repairs the
+    // bitmap) — so it is safe to run on a healthy filesystem at whatever cadence the operator
+    // sets. Without redundancy (no RAID, by design), scrub DETECTS latent bit-rot but cannot
+    // repair it: a bad block is reported (and any read of it stays a loud refusal, §3.12), the
+    // data is already lost. The cadence is operator-driven — GodspeedOS has no background-task
+    // primitive, so "periodic" is policy (run `drives scrub` on a schedule), not a hidden timer
+    // (§26.4: no silent complexity). Read-only ⇒ `&self`, no transaction.
+
+    /// Walk the filesystem from root verifying every block's CRC; change nothing. Returns
+    /// `(files, dirs, bad, scanned)`.
+    fn scrub(&self, ctx: &ServiceContext) -> Result<(u32, u32, u32, u64), &'static str> {
+        let mut st = (0u32, 0u32, 0u32, 0u64); // (files, dirs, bad, scanned)
+        let root = self.root_entry();
+        self.scrub_subtree(ctx, root.itype, root.first_block, root.block_count, 0, &mut st)?;
+        Ok((st.0, st.1, st.2, st.3))
+    }
+
+    /// Verify a node's blocks read-only, recurse into directories. `st` is `(files, dirs, bad,
+    /// scanned)`. Mirrors `check_subtree` minus every write. Bounded (depth cap + small frames).
+    fn scrub_subtree(&self, ctx: &ServiceContext, itype: u8, first: u64, count: u64,
+                     depth: u32, st: &mut (u32, u32, u32, u64)) -> Result<(), &'static str> {
+        if depth > MAX_TREE_DEPTH { return Err("tree too deep"); }
+        if itype == ITYPE_DIR {
+            st.1 += 1;
+            for bi in 0..count {
+                st.3 += 1; // the directory block itself (read + CRC-verified by td_read)
+                let (kids, nk) = {
+                    match self.td_read(ctx, first + bi) {
+                        Some(blk) => {
+                            let mut kids = [(0u8, 0u64, 0u64); RECS_PER_BLOCK];
+                            let mut nk = 0usize;
+                            for slot in 0..RECS_PER_BLOCK {
+                                let o = slot * REC_SIZE;
+                                if blk[o] == ITYPE_FREE { continue; }
+                                kids[nk] = (blk[o], u64_at(&blk, o + 48), u64_at(&blk, o + 56));
+                                nk += 1;
+                            }
+                            (kids, nk)
+                        }
+                        None => { st.2 += 1; continue; } // corrupt dir block (CRC mismatch, logged loud)
+                    }
+                };
+                for k in 0..nk {
+                    let (kt, kf, kc) = kids[k];
+                    self.scrub_subtree(ctx, kt, kf, kc, depth + 1, st)?;
+                }
+            }
+        } else {
+            st.0 += 1;
+            if itype == ITYPE_FILE_FRAG {
+                st.3 += count; // the extent block (count == 1), read + CRC-verified by ext_of
+                let frag_e = Entry { itype, size: 0, first_block: first, block_count: count, loc: None };
+                match self.ext_of(ctx, &frag_e) {
+                    Some((exts, ne)) => {
+                        let mut ok = true;
+                        for i in 0..ne {
+                            let (s, l) = exts[i];
+                            st.3 += l;
+                            for j in 0..l { if data_read(ctx, s + j).is_none() { ok = false; } }
+                        }
+                        if !ok { st.2 += 1; }
+                    }
+                    None => { st.2 += 1; } // corrupt extent block — logged loudly
+                }
+            } else {
+                st.3 += count;
                 let mut ok = true;
                 for bi in 0..count {
                     if data_read(ctx, first + bi).is_none() { ok = false; }
