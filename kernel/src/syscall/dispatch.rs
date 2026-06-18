@@ -58,6 +58,7 @@ pub enum SyscallNumber {
     ResourceMint        = 30,
     ResourceInvoke      = 31,
     ResourceRevoke      = 32,
+    LastRecvBadge       = 33,
 }
 
 /// Raw syscall dispatcher — called from the SYSCALL/SYSENTER IDT stub.
@@ -110,6 +111,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::ResourceMint   as u64 => handle_resource_mint(arg0, arg1, arg2),
         n if n == SyscallNumber::ResourceInvoke as u64 => handle_resource_invoke(arg0, arg1, arg2),
         n if n == SyscallNumber::ResourceRevoke as u64 => handle_resource_revoke(arg0),
+        n if n == SyscallNumber::LastRecvBadge  as u64 => scheduler::take_last_recv_badge() as i64,
         _ => -1, // Unknown syscall.
     }
 }
@@ -272,6 +274,10 @@ fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
                 if let Some(slot) = sender_to_wake {
                     scheduler::wake_by_slot(slot, 0);
                 }
+                // Record the delegated-resource badge (§7.10), if any, for retrieval via
+                // LastRecvBadge. Unbadged messages (every ordinary send) clear it to 0, so a
+                // stale badge from a prior recv can never be read as this message's.
+                scheduler::set_last_recv_badge(msg.badge_id, msg.badge_right);
                 // Install any embedded capabilities into the receiver's cap table
                 // and push their slot indices into the pending-recv-cap buffer so
                 // the receiver can retrieve them via syscall 12 (TakePendingCap).
@@ -702,23 +708,17 @@ fn handle_resource_invoke(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
         Err(e) => return cap_err_to_i64(e),
     };
 
-    // 3. Build the badged message: [resource_id:u64 LE][right:u8][client payload].
-    let len = msg_len as usize;
-    if len > MAX_MESSAGE_SIZE - 9 {
-        return ipc_err_to_i64(IpcError::MessageTooLarge);
-    }
-    let user = match read_user_bytes(msg_ptr, len) {
-        Some(b) => b,
-        None    => return -1,
-    };
-    let mut buf = [0u8; MAX_MESSAGE_SIZE];
-    buf[0..8].copy_from_slice(&file_cap.resource_id.0.to_le_bytes());
-    buf[8] = right_bits;
-    buf[9..9 + len].copy_from_slice(user);
-    let mut msg = match Message::new(&buf[..9 + len]) {
+    // 3. Build the message: the client's payload UNCHANGED, with the badge carried in
+    //    kernel-set Message fields (NOT prepended to the payload). The badge is unforgeable:
+    //    only this handler — after validating the cap above — sets it; an ordinary `send`
+    //    leaves it 0, so the owner can trust a badged message is a real cap invocation and not
+    //    a payload a client crafted over a plain send (§7.10).
+    let mut msg = match build_message(msg_ptr, msg_len) {
         Ok(m)  => m,
-        Err(e) => return ipc_err_to_i64(e),
+        Err(e) => return e,
     };
+    msg.badge_id    = file_cap.resource_id.0;
+    msg.badge_right = right_bits;
     msg.caps[0]   = Some(reply_cap);
     msg.cap_count = 1;
 

@@ -820,6 +820,22 @@ impl ServiceContext {
         if ret == 0 { Ok(()) } else { Err(crate::ipc::i64_to_ipc_error(ret)) }
     }
 
+    /// Read (and clear) the delegated-resource badge of the message just `recv`'d (§7.10). A
+    /// service that owns delegated resources (e.g. `fs`) calls this right after `recv`: `Some((
+    /// resource_id, right))` means the message was a **kernel-validated** invocation of a real
+    /// cap on `resource_id` with `right` already checked (the owner enforces op ≤ `right`); `None`
+    /// means an ordinary message (no badge — handle it on the name-addressed path). The badge
+    /// cannot be forged over a plain `send`, so its presence is trustworthy. Syscall 33.
+    pub fn last_recv_badge(&self) -> Option<(u64, u8)> {
+        // SAFETY: syscall(33) = LastRecvBadge; reads+clears this task's stored badge.
+        let packed = unsafe { raw_syscall(33, 0, 0, 0) } as u64;
+        if packed == 0 {
+            None
+        } else {
+            Some((packed & 0xFFFF_FFFF, ((packed >> 32) & 0xFF) as u8))
+        }
+    }
+
     /// Revoke a delegated resource this service owns (§7.10): bumps its generation so every
     /// outstanding cap to it goes stale (clients see `CapRevoked`/`EndpointDead` on next use).
     /// Owner-gated by the kernel (ownership is the check). `true` on success. Syscall 32.

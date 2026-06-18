@@ -76,6 +76,10 @@ const MAX_PENDING_RECV_CAPS: usize = 4;
 static mut TASK_PENDING_RECV_CAPS: [[u32; MAX_PENDING_RECV_CAPS]; MAX_TASKS] =
     [[0u32; MAX_PENDING_RECV_CAPS]; MAX_TASKS];
 static mut TASK_PENDING_RECV_CAP_COUNT: [usize; MAX_TASKS] = [0; MAX_TASKS];
+// Delegated-resource badge of the most recently recv'd message (§7.10, file-as-capability).
+// Set by handle_recv when it delivers a kernel-badged (file-cap-invoke) message; read+cleared
+// by the LastRecvBadge syscall. Packed `(badge_right << 32) | badge_id`; 0 = no badge.
+static mut TASK_LAST_BADGE: [u64; MAX_TASKS] = [0u64; MAX_TASKS];
 
 // ---------------------------------------------------------------------------
 // Per-task memory budget (§10.3, §22 Tests 7A/7B).
@@ -482,6 +486,37 @@ pub fn for_each_cap_of<F: FnMut(&Capability)>(slot: usize, mut f: F) {
 ///
 /// Called by handle_recv when it installs an embedded cap into the receiver's
 /// table. The slot is retrieved by the service via syscall 12 (TakePendingCap).
+/// Record the delegated-resource badge of a just-delivered message for the current (receiving)
+/// task (§7.10). `badge_id == 0` clears it (an ordinary, unbadged message). Packed so the
+/// `LastRecvBadge` syscall returns it in one register.
+pub fn set_last_recv_badge(badge_id: u64, badge_right: u8) {
+    let cid = current_core_id();
+    // SAFETY: IF=0 in syscall context; single-core writer for this task slot.
+    unsafe {
+        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
+        if cur < MAX_TASKS {
+            TASK_LAST_BADGE[cur] =
+                if badge_id == 0 { 0 } else { ((badge_right as u64) << 32) | badge_id };
+        }
+    }
+}
+
+/// Take (and clear) the current task's last-recv badge. Returns the packed value (0 = none).
+pub fn take_last_recv_badge() -> u64 {
+    let cid = current_core_id();
+    // SAFETY: IF=0 in syscall context; single-core writer for this task slot.
+    unsafe {
+        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
+        if cur < MAX_TASKS {
+            let v = TASK_LAST_BADGE[cur];
+            TASK_LAST_BADGE[cur] = 0;
+            v
+        } else {
+            0
+        }
+    }
+}
+
 pub fn push_pending_recv_cap(cap_slot: u32) {
     let cid = current_core_id();
     // SAFETY: IF=0 in syscall context; single core writer.
