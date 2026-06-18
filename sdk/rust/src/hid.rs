@@ -109,6 +109,22 @@ fn emit_key(k: u8, mods: u8, emit: &mut impl FnMut(u8)) -> bool {
         0x4C => csi(b"3~", emit), // Delete (forward delete)
         0x4B => csi(b"5~", emit), // PageUp
         0x4E => csi(b"6~", emit), // PageDown
+        // Function keys F1–F12: the standard xterm sequences (F1–F4 are SS3 `ESC O P/Q/R/S`,
+        // F5–F12 are `ESC[<n>~`). The shell acts on F1 (help); the rest are recognised and
+        // consumed by its escape parser, so the physical keys are no longer dead and never
+        // smear stray characters onto the line.
+        0x3A => { emit(0x1B); emit(b'O'); emit(b'P'); true } // F1
+        0x3B => { emit(0x1B); emit(b'O'); emit(b'Q'); true } // F2
+        0x3C => { emit(0x1B); emit(b'O'); emit(b'R'); true } // F3
+        0x3D => { emit(0x1B); emit(b'O'); emit(b'S'); true } // F4
+        0x3E => csi(b"15~", emit), // F5
+        0x3F => csi(b"17~", emit), // F6
+        0x40 => csi(b"18~", emit), // F7
+        0x41 => csi(b"19~", emit), // F8
+        0x42 => csi(b"20~", emit), // F9
+        0x43 => csi(b"21~", emit), // F10
+        0x44 => csi(b"23~", emit), // F11
+        0x45 => csi(b"24~", emit), // F12
         _ => match hid_to_ascii(k, mods) {
             Some(ch) => { emit(ch); true }
             None => false,
@@ -186,10 +202,14 @@ pub fn decode_keyboard(
         if k == 0 || k == 0x01 { continue; } // 0 = empty slot, 0x01 = rollover error
         if !last.contains(&k) {
             if emit_key(k, mods, &mut emit) {
-                // Newest printable/cursor key held becomes the repeat key — except
-                // Escape (0x29), a one-shot control key whose repeat would just make
-                // the shell re-disambiguate a bare ESC on every tick.
-                if k != 0x29 { rep.arm(k, mods, now); }
+                // Newest printable/cursor key held becomes the repeat key — except the
+                // one-shot control keys: Escape (0x29), whose repeat would make the shell
+                // re-disambiguate a bare ESC every tick, and the function keys F1–F12
+                // (0x3A–0x45), which are actions, not characters (holding F1 should not
+                // re-open help over and over).
+                if k != 0x29 && !(0x3A..=0x45).contains(&k) {
+                    rep.arm(k, mods, now);
+                }
             } else if is_typable_code(k) {
                 // Modifiers/Caps/Esc (0x29, 0x39, 0xE0-E7) are not printable; only the
                 // typable ranges we'd expect to map are surfaced as "unmapped" noise.
@@ -289,6 +309,16 @@ mod tests {
         assert_eq!(emit_for(0x4C), b"\x1b[3~"); // Delete
         assert_eq!(emit_for(0x4B), b"\x1b[5~"); // PageUp
         assert_eq!(emit_for(0x4E), b"\x1b[6~"); // PageDown
+    }
+
+    #[test]
+    fn function_keys_emit_xterm_sequences() {
+        // F1–F4 are SS3 (ESC O P/Q/R/S); F5–F12 are ESC[<n>~. F1 is the one the shell acts
+        // on (help); the rest are recognised + consumed (no stray characters).
+        assert_eq!(emit_for(0x3A), b"\x1bOP");   // F1
+        assert_eq!(emit_for(0x3D), b"\x1bOS");   // F4
+        assert_eq!(emit_for(0x3E), b"\x1b[15~"); // F5
+        assert_eq!(emit_for(0x45), b"\x1b[24~"); // F12
     }
 
     #[test]

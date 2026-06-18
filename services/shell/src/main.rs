@@ -199,7 +199,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 match read_escape_byte(&ctx) {
                     None => { line.clear(&ctx); nav = hist.len(); } // bare ESC → clear line
                     Some(b'[') => handle_csi(&ctx, &mut line, &mut hist, &mut nav),
-                    Some(b'O') => { let _ = ctx.console_read(); } // SS3 (F1–F4): no shell action
+                    Some(b'O') => {
+                        // SS3 (F1–F4 = ESC O P/Q/R/S). F1 opens help; F2–F4 have no action.
+                        if ctx.console_read() == b'P' {
+                            run_help_key(&ctx, &mut cwd, &mut last_result, &mut line);
+                        }
+                    }
                     Some(_)    => {}                              // other ESC x: ignore
                 }
             }
@@ -221,6 +226,24 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             b if b >= 0x20 && b < 0x7f => line.insert(&ctx, b),
             _ => {}
         }
+    }
+}
+
+/// F1 → run `help`, preserving the line being edited. Help (the pager) takes over the
+/// screen and clears it on exit, so afterwards we reprint the prompt + the in-progress
+/// line and park the cursor at its end. Runs at depth 0 (interactive) so help pages.
+fn run_help_key(
+    ctx: &ServiceContext,
+    cwd: &mut Cwd,
+    last_result: &mut Result<(), ShellError>,
+    line: &mut Line,
+) {
+    ctx.console_write("\r\n");
+    *last_result = execute(ctx, b"help", cwd, *last_result, 0);
+    ctx.console_write("gsh> ");
+    line.cur = line.len; // cursor at end after the reprint
+    if line.len > 0 {
+        ctx.console_write(core::str::from_utf8(line.bytes()).unwrap_or(""));
     }
 }
 

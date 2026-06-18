@@ -858,12 +858,12 @@ fn handle_abort(msg_ptr: u64, msg_len: u64) -> i64 {
 ///   Returns the current generation of the named endpoint as a non-negative
 ///   i64, or -1 if the name is not registered.
 fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
-    // Self-state (0 = own alloc bytes), the clocks (3 = TSC, 12 = monotonic tick),
-    // and console geometry (9 = fbcon rows/cols — task-neutral hardware info) are
-    // ungated, as are the boot/RTC reads (10, 11). Every other query discloses
-    // another task's or system-wide state and requires the INTROSPECT capability
-    // with READ (§3.1; docs/introspection-capability.md).
-    if !matches!(query_id, 0 | 3 | 9 | 10 | 11 | 12)
+    // Self-state (0 = own alloc bytes), the clock (3 = TSC), and console geometry
+    // (9 = fbcon rows/cols — task-neutral hardware info) are ungated, as are the
+    // boot/RTC reads (10, 11). Every other query discloses another task's or
+    // system-wide state and requires the INTROSPECT capability with READ (§3.1;
+    // docs/introspection-capability.md).
+    if !matches!(query_id, 0 | 3 | 9 | 10 | 11)
         && !scheduler::current_task_holds_resource(
             crate::capability::INTROSPECT_RESOURCE, Rights::READ)
     {
@@ -883,10 +883,6 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // Wall-clock date/time from the hardware RTC, packed (see rtc.rs). Ungated
         // — the time of day is task-neutral hardware info, like the TSC (query 3).
         11 => crate::arch::x86_64::rtc::read_datetime() as i64,
-        // Monotonic preemption-timer tick (core 0 only; ~50 ms HW / 10 ms TSC-Deadline).
-        // Ungated like the TSC (3): a task-neutral hardware tick. Yield-immune, unlike
-        // query 7 — a coarse clock for userspace timing (e.g. keyboard auto-repeat).
-        12 => scheduler::monotonic_ticks() as i64,
         4 => crate::memory::allocator::free_frame_count() as i64,
         5 => crate::memory::allocator::total_frame_count() as i64,
         6 => scheduler::core_active_ticks(arg1 as usize) as i64,
