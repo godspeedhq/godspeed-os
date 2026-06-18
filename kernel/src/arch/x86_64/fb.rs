@@ -479,13 +479,26 @@ fn erase_to_end_of_screen(s: &mut Fb) {
     }
 }
 
-/// Draw the text cursor (a steady underline) at the current write position, and
-/// remember where it landed so `erase_cursor` can blank exactly that cell later —
-/// even after the write position has since moved (e.g. a carriage return).
+/// Draw the text cursor as a true underline at the current write position: paint the
+/// cell's real glyph first, then overlay a thin underline beneath it — so a character the
+/// cursor sits on stays visible (underlined), instead of being hidden by a `_` glyph that
+/// replaced it. Remember where it landed so `erase_cursor` can restore exactly that cell
+/// later, even after the write position has moved (e.g. a carriage return).
 fn draw_cursor(s: &mut Fb) {
-    draw_glyph(s, b'_', s.col, s.row);
-    s.cur_col = s.col;
-    s.cur_row = s.row;
+    let (c, r) = (s.col, s.row);
+    let ch = if r < MAX_ROWS && c < MAX_COLS { s.grid[r][c] } else { b' ' };
+    draw_glyph(s, ch, c, r);
+    // Underline: the bottom ~2 px of the cell, in the foreground colour.
+    let x0 = s.org_x + c * CELL_W;
+    let y0 = s.org_y + r * CELL_H;
+    let th = 2usize.min(CELL_H);
+    for gy in (CELL_H - th)..CELL_H {
+        for gx in 0..CELL_W {
+            put_pixel(s, x0 + gx, y0 + gy, s.fg);
+        }
+    }
+    s.cur_col = c;
+    s.cur_row = r;
 }
 
 /// Erase the cursor at the cell where it was last drawn by restoring that cell's real
