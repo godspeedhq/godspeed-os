@@ -85,15 +85,30 @@ fn is_typable_code(k: u8) -> bool {
 /// Emit the byte(s) a single keycode produces under `mods`, returning `true` if it
 /// produced any output (i.e. it is a printable / cursor key worth auto-repeating).
 /// Shared by the first-press edge path and the auto-repeat path so a repeated key is
-/// byte-for-byte identical to its first press. Arrow keys → ANSI escape sequences
-/// (ESC [ A/B/C/D), exactly what a serial terminal sends, so the shell's one input
-/// parser handles USB and serial alike (e.g. the up-arrow history walk).
+/// byte-for-byte identical to its first press. The cursor and navigation-cluster keys
+/// emit the same ANSI escape sequences a serial terminal sends, so the shell's one input
+/// parser (`handle_csi` / the pager) handles USB and serial alike — this is what makes a
+/// standard extended keyboard's Home/End/Delete/PageUp/PageDown work on real hardware
+/// (without it the physical keys produce nothing).
 fn emit_key(k: u8, mods: u8, emit: &mut impl FnMut(u8)) -> bool {
+    // ESC [ <body...> for a cursor/navigation key. Returns true (it produced output).
+    fn csi(body: &[u8], emit: &mut impl FnMut(u8)) -> bool {
+        emit(0x1B);
+        emit(b'[');
+        for &b in body { emit(b); }
+        true
+    }
     match k {
-        0x52 => { emit(0x1B); emit(b'['); emit(b'A'); true } // Up
-        0x51 => { emit(0x1B); emit(b'['); emit(b'B'); true } // Down
-        0x4F => { emit(0x1B); emit(b'['); emit(b'C'); true } // Right
-        0x50 => { emit(0x1B); emit(b'['); emit(b'D'); true } // Left
+        0x52 => csi(b"A", emit),  // Up
+        0x51 => csi(b"B", emit),  // Down
+        0x4F => csi(b"C", emit),  // Right
+        0x50 => csi(b"D", emit),  // Left
+        0x4A => csi(b"H", emit),  // Home
+        0x4D => csi(b"F", emit),  // End
+        0x49 => csi(b"2~", emit), // Insert
+        0x4C => csi(b"3~", emit), // Delete (forward delete)
+        0x4B => csi(b"5~", emit), // PageUp
+        0x4E => csi(b"6~", emit), // PageDown
         _ => match hid_to_ascii(k, mods) {
             Some(ch) => { emit(ch); true }
             None => false,
@@ -245,5 +260,50 @@ impl MouseTracker {
             self.ax = 0;
             self.ay = 0;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    extern crate std;
+    use std::vec::Vec;
+
+    // Decode a single-keycode report and collect the bytes it emits.
+    fn emit_for(code: u8) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut last = [0u8; 6];
+        let mut rep = KeyRepeat::new(0, 0);
+        let report = [0, 0, code, 0, 0, 0, 0, 0];
+        decode_keyboard(&report, &mut last, &mut rep, 0, |b| out.push(b), |_| {});
+        out
+    }
+
+    #[test]
+    fn nav_cluster_emits_terminal_escape_sequences() {
+        // The navigation cluster a standard extended keyboard sends — each must map to
+        // the exact escape sequence the shell's CSI parser / pager understands.
+        assert_eq!(emit_for(0x4A), b"\x1b[H");  // Home
+        assert_eq!(emit_for(0x4D), b"\x1b[F");  // End
+        assert_eq!(emit_for(0x49), b"\x1b[2~"); // Insert
+        assert_eq!(emit_for(0x4C), b"\x1b[3~"); // Delete
+        assert_eq!(emit_for(0x4B), b"\x1b[5~"); // PageUp
+        assert_eq!(emit_for(0x4E), b"\x1b[6~"); // PageDown
+    }
+
+    #[test]
+    fn arrows_still_emit_their_sequences() {
+        assert_eq!(emit_for(0x52), b"\x1b[A"); // Up
+        assert_eq!(emit_for(0x51), b"\x1b[B"); // Down
+        assert_eq!(emit_for(0x4F), b"\x1b[C"); // Right
+        assert_eq!(emit_for(0x50), b"\x1b[D"); // Left
+    }
+
+    #[test]
+    fn ordinary_and_keypad_keys_unaffected() {
+        assert_eq!(emit_for(0x04), b"a");      // letter
+        assert_eq!(emit_for(0x59), b"1");      // keypad 1
+        assert_eq!(emit_for(0x2A), &[0x08]);   // backspace
+        assert_eq!(emit_for(0x28), b"\n");     // enter
     }
 }
