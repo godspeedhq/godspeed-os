@@ -821,6 +821,55 @@ read-only and repaired nothing), and the clean file is untouched. `selfcheck.gsh
 `assert ok drives scrub` over a populated clean tree (the 0-bad path). No on-disk format change; no
 constitutional amendment (within §15/§26.6, no TCB or §7 change).
 
+### 6.15 Versioning & compatibility — feature flags, and the last magic (GSFS0008)
+
+> **Adopted 2026-06-18 (Phase L).** The final monolithic format bump. After this, the format
+> evolves by **feature bits**, not by minting a new magic — so a version difference no longer
+> forces a reformat.
+
+**The problem.** Through GSFS0007 the 8-byte magic did two jobs at once: "is this our filesystem?"
+*and* "which exact version?" Because all 8 bytes changed on every bump, **any** version difference
+failed the magic check, which made every bump **reformat-only** — upgrade the OS and your old disk
+won't mount. Fine for a learning OS with no production data, but it doesn't scale: there is no
+"GSFS00014" worth minting.
+
+**The fix (the ext/btrfs model).** Separate identity from capability:
+
+- **The magic is FROZEN at `GSFS0008`.** It answers only "is this GSFS?" It never changes again.
+- **Three feature-mask `u32`s** in the superblock (`@124` compat, `@128` ro_compat, `@132`
+  incompat, all under the widened CRC `@136`) answer "what does this disk *use*?" Each bit is a
+  feature, set on disk **only when actually used**. Future capabilities are new bits, not new magic.
+
+**The mount policy** — explicit and loud (invariant 12), the opposite of a silent fallback:
+
+| Mask | A bit this build doesn't recognise means… |
+|------|-------------------------------------------|
+| `compat` | mount **read-write normally** — ignoring the feature is safe |
+| `ro_compat` | mount **READ-ONLY** — reading is safe, but writing could corrupt the feature (every mutating op is refused loudly; reads pass) |
+| `incompat` | **REFUSE to mount, loudly** — the on-disk structure is fundamentally different |
+
+This is *more* honest than the old scheme, not less: an old build meeting a newer disk gets a
+precise reason (refuse / read-only / fine) instead of a version mismatch indistinguishable from a
+foreign disk.
+
+**Features earn forward-compatibility by being lazy.** The bit is set only when the feature is
+exercised. Extent lists (Phase I) are an `incompat` feature, but the `FEAT_INCOMPAT_EXTENTS` bit is
+set **the first time a file actually fragments** — a freshly-formatted disk that never fragments
+anything has the bit *clear*, so a build that predates extents could still mount it. You only lose
+compatibility once you actually use the new capability. (Backup-superblock, Phase F, is a `compat`
+bit — an old reader ignoring it is harmless.)
+
+**The honest caveat.** This is forward-looking *from 0008*. It cannot retroactively rescue pre-0008
+disks (0003–0007 predate the masks, and 0004/0005 genuinely changed per-block layout), so those need
+one last reflash. But 0008 is the last time the format ever *forces* that — every future GSFS
+feature is additive, governed by the masks. "GSFS00014" never happens; it would just be "GSFS0008
+with more feature bits set."
+
+Verified by `osdev test fs-compat` (12/0): three disks, each carrying an unknown bit in a different
+mask (CRC re-stamped so they still validate) — the unknown `incompat` disk is refused, the unknown
+`ro_compat` disk mounts read-only (reads work, writes refused), the unknown `compat` disk mounts
+normally read-write. No regression across the whole suite.
+
 ## 7. File = capability (the north star)
 
 The spine that makes this filesystem *ours* rather than a generic store: a file is named

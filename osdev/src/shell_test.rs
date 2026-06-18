@@ -1710,6 +1710,93 @@ pub fn run_fs_scrub(image_path: &Path, persist_path: &str, smp: u32) {
     if fail > 0 { std::process::exit(1); }
 }
 
+/// GSFS0008 feature-flag compatibility policy (Phase L): boot, one after another, three disks
+/// that each carry an UNKNOWN feature bit this build doesn't recognise, and assert the mount
+/// policy: an unknown `incompat` bit → REFUSE to mount (loud); an unknown `ro_compat` bit → mount
+/// READ-ONLY (reads work, writes refused); an unknown `compat` bit → mount NORMALLY (writes work).
+/// This is what lets the format evolve past 0008 without a reformat-only bump. Each disk also has
+/// a baked `/baked.txt` so the read/write distinction is observable.
+pub fn run_fs_compat(image_path: &Path, disk_incompat: &str, disk_ro: &str, disk_compat: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-compat: PASS — {}", $label); pass += 1; } else { println!("fs-compat: FAIL — {}", $label); fail += 1; }
+    }; }
+
+    // Boot one disk, drive a few shell commands, return (per-command outputs, whole serial log).
+    let boot = |disk_path: &str, cmds: &[&str]| -> (Vec<String>, String) {
+        let disk = std::fs::canonicalize(disk_path).unwrap_or_else(|_| std::path::PathBuf::from(disk_path));
+        let disk_str = disk.to_string_lossy().replace('\\', "/");
+        let port = pick_free_port();
+        let mut cmd = std::process::Command::new(&qemu);
+        cmd.args([
+            "-drive",   &format!("format=raw,file={image_str},if=ide"),
+            "-device",  "ich9-ahci,id=ahci",
+            "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+            "-device",  "ide-hd,drive=data,bus=ahci.0",
+            "-smp",     &smp.to_string(), "-m", "512M",
+            "-serial",  &format!("tcp::{port},server"),
+            "-serial",  "null",
+            "-display", "none", "-no-reboot", "-no-shutdown",
+        ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("fs-compat: QEMU launch failed: {e}"); std::process::exit(1); });
+        let stream = match retry_tcp_connect(port, Duration::from_secs(10)) {
+            Some(s) => s,
+            None => { eprintln!("fs-compat: could not connect to serial {port}"); child.kill().ok(); std::process::exit(1); }
+        };
+        let mut read_half = stream.try_clone().expect("clone tcp stream");
+        let mut write_half = stream;
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let buf2 = Arc::clone(&buf);
+            thread::spawn(move || {
+                let mut tmp = [0u8; 256];
+                loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+            });
+        }
+        let mut cursor = 0usize;
+        let mut outs = Vec::new();
+        if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).is_some() {
+            for c in cmds {
+                let line = format!("{c}\r");
+                send(&mut write_half, line.as_bytes());
+                outs.push(collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(12)).unwrap_or_default());
+            }
+        }
+        let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        child.kill().ok(); child.wait().ok();
+        (outs, whole)
+    };
+
+    // ── Scenario 1: unknown INCOMPAT bit → refuse to mount ──
+    println!("fs-compat: boot 1 — disk with an unknown INCOMPAT feature (must refuse to mount), ~40s …");
+    let (o1, log1) = boot(disk_incompat, &["read /baked.txt"]);
+    check!(log1.contains("incompatible features"), "incompat: mount refused loudly (incompatible features)");
+    check!(log1.contains("no filesystem") || log1.contains("awaiting drives flash"), "incompat: reported no usable filesystem");
+    check!(!o1.get(0).map(|s| s.contains("baked-payload")).unwrap_or(false), "incompat: file is NOT readable (did not mount)");
+    check!(!log1.contains("KERNEL PANIC"), "incompat: no kernel panic");
+
+    // ── Scenario 2: unknown RO_COMPAT bit → mount read-only ──
+    println!("fs-compat: boot 2 — disk with an unknown RO_COMPAT feature (must mount READ-ONLY), ~40s …");
+    let (o2, log2) = boot(disk_ro, &["read /baked.txt", "write /x.txt should-fail"]);
+    check!(log2.contains("READ-ONLY"), "ro_compat: mounted read-only (loud)");
+    check!(o2.get(0).map(|s| s.contains("baked-payload")).unwrap_or(false), "ro_compat: reads still work (baked file readable)");
+    check!(!o2.get(1).map(|s| s.contains("wrote") || s.contains("ok")).unwrap_or(false), "ro_compat: write was refused");
+    check!(!log2.contains("KERNEL PANIC"), "ro_compat: no kernel panic");
+
+    // ── Scenario 3: unknown COMPAT bit → mount normally, read-write ──
+    println!("fs-compat: boot 3 — disk with an unknown COMPAT feature (must mount read-write), ~40s …");
+    let (o3, log3) = boot(disk_compat, &["read /baked.txt", "write /x.txt hello-compat", "read /x.txt"]);
+    check!(!log3.contains("READ-ONLY") && !log3.contains("incompatible"), "compat: mounted normally (not read-only, not refused)");
+    check!(o3.get(0).map(|s| s.contains("baked-payload")).unwrap_or(false), "compat: baked file readable");
+    check!(o3.get(2).map(|s| s.contains("hello-compat")).unwrap_or(false), "compat: write+read-back works (read-write)");
+    check!(!log3.contains("KERNEL PANIC"), "compat: no kernel panic");
+
+    println!("\nfs-compat: {pass} passed, {fail} failed");
+    if fail > 0 { std::process::exit(1); }
+}
+
 /// Boot bare-metal with a GSFS disk that has a self-checking `.gsh` baked in (host-side), then
 /// `run /<script_name>` — proving the flash-and-run loop and piped asserts in a script.
 pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u32) {

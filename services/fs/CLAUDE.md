@@ -16,29 +16,37 @@ now restartable — the kernel notifies the supervisor of its death, which respa
 - `block-driver`: all I/O goes through block-driver IPC.
 - `registry`: registers its endpoint so supervisor and other services can find it.
 
-## On-disk format: GSFS, hierarchical (magic `GSFS0007`)
+## On-disk format: GSFS, hierarchical (magic `GSFS0008`, frozen)
 
-The format is **GSFS0007** (`docs/persistence.md` §6.4 + §6.6 + §6.10 + §6.11 + §6.12). Three on-disk
+The format is **GSFS0008** (`docs/persistence.md` §6.4 + §6.6 + §6.10 + §6.12 + §6.15). The magic is
+**frozen at `GSFS0008`** — versioning now lives in three superblock **feature masks** (compat @124,
+ro_compat @128, incompat @132, under the CRC @136), so the format evolves by feature bits, not new
+magic. Mount policy: an unknown `incompat` bit → refuse loudly; an unknown `ro_compat` bit → mount
+read-only (writes refused); unknown `compat` bits → ignored. Feature bits are set **only when used**
+(extent-lists is an incompat bit set on first fragmentation), so a disk earns forward-compatibility
+until it actually uses a feature. See §6.15; proven by `osdev test fs-compat`. Three on-disk
 structures and no more — a **superblock**, a **free bitmap** (1 bit/block, the only global
 structure), and a **directory tree** of self-describing 64-byte `file_record`s (no inode
 table, no inode number, no global file cap; the tree *is* the index, the bitmap is the
 allocation map, reclamation is intrinsic). 512-byte blocks (= one AHCI sector = one block-IPC
 request), all capacity fields **u64** (~8 ZiB ceiling).
 
-**Backup superblock (GSFS0007):** a second superblock copy lives at the **last block**
+**Backup superblock (GSFS0008):** a second superblock copy lives at the **last block**
 (`total_blocks-1`, reserved in the bitmap). `mount` validates the primary (LBA 0); if its
 magic/CRC fails it falls back to the backup (located via the device capacity, so it works
 even when the primary is unreadable) and heals the primary. Both copies are written together
 by `format`, kept in sync by `persist_super` (staged in the same transaction), and both wiped
 by `drives reset`.
 
-**Every block self-verifies with a CRC32** (GSFS0007):
+**Every block self-verifies with a CRC32** (GSFS0008):
 
-- **Superblock** (LBA 0): magic, version (7), `block_size`, `total_blocks:u64`,
+- **Superblock** (LBA 0): magic, version (8), `block_size`, `total_blocks:u64`,
   `bitmap_start/blocks:u64`, `data_start:u64`, `root_first_block/block_count:u64`,
   `free_blocks:u64`, `flags` (DEFAULT bit), `label`, `journal_start/blocks:u64` @108
-  (reserved crash-consistency region, filled by Phase C), and a **`sb_crc32` @124** over
-  the first 124 bytes — **verified on mount, loud refusal on mismatch** (§3.12).
+  (reserved crash-consistency region, filled by Phase C), **feature masks** `feature_compat` @124 /
+  `feature_ro_compat` @128 / `feature_incompat` @132 (GSFS0008, §6.15), and a **`sb_crc32` @136**
+  over the first 136 bytes (now covering the masks) — **verified on mount, loud refusal on
+  mismatch** (§3.12).
 - **Free bitmap** (LBA `bitmap_start..journal_start`): set bit = used block. (Not checksummed —
   reconstructible from the tree.)
 - **Journal** (LBA `journal_start..data_start`): reserved, 64 blocks (32 KiB).
@@ -50,11 +58,11 @@ by `drives reset`.
 - **File-data block** (512 B): **508 bytes payload + CRC32 @508**. A file of N bytes spans
   `ceil(N/508)` data blocks; the CRC covers the payload, verified on every read (`data_read`),
   stamped on every write (`data_write`). The per-message streaming chunk is `7×508 = 3556`.
-- **Extent block** (512 B, GSFS0007 — fragmented files only): `n_extents:u32 @0`, then up to
+- **Extent block** (512 B, GSFS0008 — fragmented files only): `n_extents:u32 @0`, then up to
   `EXT_MAX = 31` `(start:u64, len:u64)` data runs from `@8`, + a **CRC32 @508** over `[0..508)`.
   A `type`-3 file's `first_block` points here (`block_count` = 1); the runs list its data.
 
-**Files: contiguous, or fragmented (GSFS0007 extent lists; `docs/persistence.md` §6.12).** A file
+**Files: contiguous, or fragmented (GSFS0008 extent lists; `docs/persistence.md` §6.12).** A file
 is normally one **contiguous** extent (`type` 1 — the fast path: data is `first_block ..
 first_block+block_count`). When no contiguous run is free, the file is stored **fragmented**
 (`type` 3): `first_block` → a CRC'd **extent block** listing up to 31 scattered `(start, len)`
@@ -90,7 +98,7 @@ IPC message. Files larger than one message use the offset-addressed ops: `WriteN
 the full extent and sizes the file, then a sequence of `WriteAt` chunks fills it; read it back
 with `StatFile` (for the size) + a sequence of `ReadAt` chunks. Stateless — each request is
 self-contained (no open-file table; §8). Size is bounded only by free space: a file is a
-contiguous u64 extent when one is free, else fragmented across an extent list (GSFS0007, §6.12
+contiguous u64 extent when one is free, else fragmented across an extent list (GSFS0008, §6.12
 above), so a fragmented disk no longer refuses a write it has room for. The shell streams
 `cat`/`copy` and the pipe `write` sink through these ops.
 
