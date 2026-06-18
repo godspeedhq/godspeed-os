@@ -1301,9 +1301,10 @@ fn help_pager(ctx: &ServiceContext, total: usize, rows: usize) {
         ctx.console_write("\x1b[2J\x1b[H");
         let end = (top + page).min(total);
         for i in top..end { help_render_line(ctx, i); }
-        // Status line (no trailing newline so the cursor parks on it).
+        // Status line (no trailing newline so the cursor parks on it). Scroll keys lead,
+        // since holding Up/Down now scrolls smoothly (typematic auto-repeat).
         ctx.console_write_fmt(format_args!(
-            "-- {}-{}/{}  space/PgDn page, up/down line, g/G top/bottom, q quit --",
+            "[ lines {}-{} of {} ]  up/down: scroll  space: next page  g/G: top/end  q: quit",
             top + 1, end, total));
         // Read one command key (arrows/PageUp/Down arrive as escape sequences).
         let mut down = 0i64; // signed line delta to apply; isize via i64 to allow page jumps

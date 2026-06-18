@@ -153,16 +153,24 @@ fn idle(ctx: &ServiceContext) -> ! {
 }
 
 /// Poll the event ring for the next event TRB. Returns (trb_type, completion,
-/// slot_id) and advances the dequeue pointer, or None on timeout.
+/// slot_id) and advances the dequeue pointer, or None.
+///
+/// Drain one event from the event ring. `max_tries` bounds how long to wait for an
+/// event whose cycle bit has flipped: the command path passes a large budget (it just
+/// rang a doorbell and expects a completion imminently); the **poll loop passes 1** so
+/// it is fully non-blocking — otherwise, while a key is held (no new transfer events),
+/// this would busy-spin millions of times before returning `None`, starving the
+/// typematic auto-repeat poll at the bottom of the loop.
 fn next_event(
     dma: &Dma,
     mmio: &Mmio,
     ir0: usize,
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
+    max_tries: u32,
 ) -> Option<(u32, u32, u32)> {
     let mut tries = 0u32;
-    while tries < 10_000_000 {
+    while tries < max_tries {
         tries += 1;
         let off = EVENT_RING_OFF + *ev_idx * TRB_SIZE;
         let ctrl = dma.read32(off + 12);
@@ -210,7 +218,7 @@ fn run_command(
     mmio.write32(dboff, 0); // command doorbell
 
     for _ in 0..8 {
-        match next_event(dma, mmio, ir0, ev_idx, ev_cycle) {
+        match next_event(dma, mmio, ir0, ev_idx, ev_cycle, 10_000_000) {
             Some((TRB_CMD_COMPLETION, completion, slot)) => return Some((completion, slot)),
             Some((TRB_PORT_STATUS_CHANGE, _, _)) => {
                 ctx.log("xhci: (port status change event)");
@@ -273,7 +281,7 @@ fn control(
     );
     mmio.write32(dboff + slot as usize * 4, 1);
     for _ in 0..8 {
-        match next_event(dma, mmio, ir0, ev_idx, ev_cycle) {
+        match next_event(dma, mmio, ir0, ev_idx, ev_cycle, 10_000_000) {
             Some((TRB_TRANSFER_EVENT, c, _)) => return c == 1 || c == 13,
             Some(_) => {}
             None => return false,
@@ -416,7 +424,7 @@ fn enumerate_one(
     mmio.write32(dboff + slot as usize * 4, 1);
     let mut ok = false;
     for _ in 0..8 {
-        match next_event(dma, mmio, ir0, ev_idx, ev_cycle) {
+        match next_event(dma, mmio, ir0, ev_idx, ev_cycle, 10_000_000) {
             Some((TRB_TRANSFER_EVENT, c, _)) => { ok = c == 1 || c == 13; break; }
             Some(_) => {}
             None => break,
@@ -452,7 +460,7 @@ fn enumerate_one(
     mmio.write32(dboff + slot as usize * 4, 1);
     let mut cfg_ok = false;
     for _ in 0..8 {
-        match next_event(dma, mmio, ir0, ev_idx, ev_cycle) {
+        match next_event(dma, mmio, ir0, ev_idx, ev_cycle, 10_000_000) {
             Some((TRB_TRANSFER_EVENT, c, _)) => { cfg_ok = c == 1 || c == 13; break; }
             Some(_) => {}
             None => break,
@@ -799,9 +807,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 need_queue[d] = false;
             }
 
-            // Drain one event; route a transfer event to its device by slot id.
+            // Drain one event (non-blocking: max_tries=1) so a held key — which produces
+            // no new events — doesn't trap us in next_event's spin and starve the auto-
+            // repeat poll below. Any pending event is still processed one per iteration.
             if let Some((TRB_TRANSFER_EVENT, _, slot_id)) =
-                next_event(&dma, &mmio, ir0, &mut ev_idx, &mut ev_cycle)
+                next_event(&dma, &mmio, ir0, &mut ev_idx, &mut ev_cycle, 1)
             {
                 if let Some(d) = devs[..ndev].iter().position(|h| h.slot == slot_id) {
                     let dev = devs[d].idx;

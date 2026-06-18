@@ -135,7 +135,7 @@ pub fn run(image_path: &Path, smp: u32) {
             check!(r.contains("spawn"),   "help: spawn listed (paged)");
             check!(r.contains("restart"), "help: restart listed (paged)");
             check!(r.contains("status"),  "help: status listed (paged)");
-            check!(r.contains("page, up/down line"), "help: pager status line shown");
+            check!(r.contains("up/down: scroll") && r.contains("q: quit"), "help: pager status line shown");
         }
         None => {
             println!("shell-test: FAIL — timed out after `help`  [×5]");
