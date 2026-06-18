@@ -205,6 +205,12 @@ assert ok drives check
 # ===== scrub: read-only CRC integrity sweep over the populated tree finds no bit-rot =====
 assert ok drives scrub
 
+# ===== file-as-capability (§7.10, P2): open a file as a REAL kernel cap and exercise every
+# property — read/write THROUGH the cap, non-escalation (a read-only cap can't write, at both
+# the kernel and fs layers), unforgeable handle, revoke-on-close. `fcap` is Ok only if all hold. =====
+write /sc/cap.txt seeddata
+assert ok fcap /sc/cap.txt
+
 # ===== cleanup: proves delete + delete recursive =====
 delete /sc/a.txt
 assert fails read /sc/a.txt
