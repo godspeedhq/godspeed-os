@@ -55,6 +55,9 @@ pub enum SyscallNumber {
     SignalInputReady    = 27,
     TaskCaps            = 28,
     DeriveCap           = 29,
+    ResourceMint        = 30,
+    ResourceInvoke      = 31,
+    ResourceRevoke      = 32,
 }
 
 /// Raw syscall dispatcher — called from the SYSCALL/SYSENTER IDT stub.
@@ -104,6 +107,9 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::ConsoleBootComplete as u64 => handle_console_boot_complete(arg0),
         n if n == SyscallNumber::SignalInputReady as u64 => handle_signal_input_ready(arg0),
         n if n == SyscallNumber::TaskCaps as u64 => handle_task_caps(arg0, arg1, arg2),
+        n if n == SyscallNumber::ResourceMint   as u64 => handle_resource_mint(arg0, arg1, arg2),
+        n if n == SyscallNumber::ResourceInvoke as u64 => handle_resource_invoke(arg0, arg1, arg2),
+        n if n == SyscallNumber::ResourceRevoke as u64 => handle_resource_revoke(arg0),
         _ => -1, // Unknown syscall.
     }
 }
@@ -613,6 +619,146 @@ fn handle_send_with_cap(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
         }
         Err(e) => ipc_err_to_i64(e), // failure before delivery — cap stays
     }
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: ResourceMint (30) — allocate a delegated resource + mint a cap (§7.10, P2).
+// ---------------------------------------------------------------------------
+
+/// arg0 = rights bitfield for the minted cap, arg1 = user ptr to receive the u64 ResourceId,
+/// arg2 = unused.
+///
+/// Gated by `RESOURCE_MINT_RESOURCE` (WRITE). Allocates a fresh delegated resource owned by
+/// the caller's endpoint, mints a cap with the requested rights into the caller's table,
+/// writes the new `ResourceId` to `*arg1`, and returns the cap slot. The caller (`fs`) records
+/// `ResourceId → file` and GRANT-transfers a narrowed copy to a client (file-as-capability).
+fn handle_resource_mint(rights_bits: u64, out_id_ptr: u64, _a2: u64) -> i64 {
+    use crate::capability::{delegated, mint_cap, RESOURCE_MINT_RESOURCE};
+    // §3.1: minting a delegated resource requires the RESOURCE_MINT authority (held by `fs`).
+    if !scheduler::current_task_holds_resource(RESOURCE_MINT_RESOURCE, Rights::WRITE) {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+    crate::invariants::assertions::assert_cap_validated(&Ok(()));
+    let owner = match scheduler::current_task_endpoint() {
+        Some(e) => e.0, // delegated band tracks the owner endpoint as a raw u64
+        None    => return -1, // a service with no endpoint cannot own resources
+    };
+    // Only file-meaningful rights may ride a delegated cap (READ/WRITE), plus GRANT to transfer.
+    let allowed = Rights::READ | Rights::WRITE | Rights::GRANT;
+    let rights = Rights((rights_bits as u8) & allowed.0);
+    let id = match delegated::allocate(owner) {
+        Some(i) => i,
+        None    => return -1, // band full (loud, §26.6)
+    };
+    let cap = mint_cap(id, rights);
+    let slot = match scheduler::current_task_insert_cap(cap) {
+        Ok(s)  => s,
+        Err(_) => { delegated::release(id); return -1; } // cap table full — don't leak the id
+    };
+    if !write_user_bytes(out_id_ptr, &id.0.to_le_bytes()) {
+        return -1;
+    }
+    slot as i64
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: ResourceInvoke (31) — use a delegated (file) cap (§7.10, P2).
+// ---------------------------------------------------------------------------
+
+/// arg0 = (right_bits << 32) | (reply_grant_slot << 16) | file_cap_slot
+/// arg1 = msg_ptr (user VA), arg2 = msg_len.
+///
+/// The "use = send" of a delegated resource cap. Validates the file cap carries `right_bits`
+/// (a READ-only cap invoking with WRITE fails `CapInsufficientRights` — non-escalation, §7.3),
+/// then routes the message to the owning service's endpoint with the badge
+/// `[resource_id:u64, right:u8]` prepended to the payload, carrying an embedded reply cap exactly
+/// as `SendWithCap`. The owner reads the badge to know which resource + which right the kernel
+/// validated; it never trusts the client, and the kernel never learns the operation.
+fn handle_resource_invoke(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
+    use crate::capability::delegated;
+    let file_slot  = (packed & 0xFFFF) as usize;
+    let reply_slot = ((packed >> 16) & 0xFFFF) as usize;
+    let right_bits = ((packed >> 32) & 0xFF) as u8;
+    let required   = Rights(right_bits);
+
+    // 1. Validate the file cap holds the requested right (generation + rights, global table).
+    let file_cap = match scheduler::current_task_lookup_cap(file_slot, required) {
+        Ok(c)  => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    if !delegated::is_delegated(file_cap.resource_id) {
+        return cap_err_to_i64(CapError::CapWrongScope); // not a delegated/file cap
+    }
+    let owner = match delegated::owner_of(file_cap.resource_id) {
+        Some(o) => EndpointId(o), // u64 → the owner endpoint to route to
+        None    => return ipc_err_to_i64(IpcError::EndpointDead), // resource freed
+    };
+    crate::invariants::assertions::assert_cap_validated(&Ok(()));
+
+    // 2. Validate the embedded reply cap (GRANT) so the owner can reply (reply-cap pattern).
+    let reply_cap = match scheduler::current_task_lookup_cap(reply_slot, Rights::GRANT) {
+        Ok(c)  => c,
+        Err(CapError::CapInsufficientRights) => return cap_err_to_i64(CapError::CapNotGrantable),
+        Err(e) => return cap_err_to_i64(e),
+    };
+
+    // 3. Build the badged message: [resource_id:u64 LE][right:u8][client payload].
+    let len = msg_len as usize;
+    if len > MAX_MESSAGE_SIZE - 9 {
+        return ipc_err_to_i64(IpcError::MessageTooLarge);
+    }
+    let user = match read_user_bytes(msg_ptr, len) {
+        Some(b) => b,
+        None    => return -1,
+    };
+    let mut buf = [0u8; MAX_MESSAGE_SIZE];
+    buf[0..8].copy_from_slice(&file_cap.resource_id.0.to_le_bytes());
+    buf[8] = right_bits;
+    buf[9..9 + len].copy_from_slice(user);
+    let mut msg = match Message::new(&buf[..9 + len]) {
+        Ok(m)  => m,
+        Err(e) => return ipc_err_to_i64(e),
+    };
+    msg.caps[0]   = Some(reply_cap);
+    msg.cap_count = 1;
+
+    // 4. Route to the owner endpoint. The file cap's generation was validated against the
+    //    global table above; the routing table tracks the OWNER endpoint's generation, so pass
+    //    that (a live owner matches; a dead owner returns EndpointDead via check_live).
+    let owner_gen = crate::ipc::routing::get_generation(owner);
+    let my_slot   = scheduler::current_task_slot();
+    match crate::ipc::routing::enqueue(owner, msg, owner_gen, Some(my_slot)) {
+        Ok(Some(receiver_slot)) => {
+            scheduler::current_task_remove_cap(reply_slot);
+            scheduler::wake_by_slot(receiver_slot, 0);
+            0
+        }
+        Ok(None) => {
+            scheduler::current_task_remove_cap(reply_slot);
+            0
+        }
+        Err(IpcError::QueueFull) => {
+            scheduler::current_task_remove_cap(reply_slot);
+            scheduler::block_and_reschedule(TaskState::BlockedOnSend)
+        }
+        Err(e) => ipc_err_to_i64(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: ResourceRevoke (32) — revoke a delegated resource you own (§7.10, P2).
+// ---------------------------------------------------------------------------
+
+/// arg0 = `ResourceId` (u64). Owner-gated: succeeds only if the calling task's endpoint owns
+/// the resource (ownership IS the capability check, §3.1). Bumps the generation so every
+/// outstanding cap to it goes stale → next `ResourceInvoke` returns `CapRevoked` (§7.5).
+fn handle_resource_revoke(id_lo: u64) -> i64 {
+    use crate::capability::{delegated, ResourceId};
+    let owner = match scheduler::current_task_endpoint() {
+        Some(e) => e.0,
+        None    => return -1,
+    };
+    if delegated::revoke_owned(ResourceId(id_lo), owner) { 0 } else { -1 }
 }
 
 // ---------------------------------------------------------------------------

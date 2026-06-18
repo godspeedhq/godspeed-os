@@ -407,6 +407,21 @@ pub fn current_task_holds_resource(
     }
 }
 
+/// Return the current task's own recv endpoint id, if it has one. Used by `ResourceMint`/
+/// `ResourceRevoke` (§7.10) to record/check the owner of a delegated resource.
+pub fn current_task_endpoint() -> Option<EndpointId> {
+    let cid = current_core_id();
+    // SAFETY: IF=0 in syscall context; CORE_CURRENT is stable for this core.
+    unsafe {
+        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
+        if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Relaxed) {
+            TASK_ENDPOINT[cur]
+        } else {
+            None
+        }
+    }
+}
+
 /// Remove the capability at `slot` from the current task's table (GRANT).
 pub fn current_task_remove_cap(slot: usize) -> Option<Capability> {
     let cid = current_core_id();

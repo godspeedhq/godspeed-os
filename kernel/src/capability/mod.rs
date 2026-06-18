@@ -11,6 +11,7 @@
 //! the internal table and generation logic are private to this module.
 
 pub mod cap;
+pub mod delegated;
 pub mod generation;
 pub mod revoke;
 pub mod rights;
@@ -60,6 +61,13 @@ pub const INTROSPECT_RESOURCE: ResourceId = ResourceId(5);
 /// `docs/service-control-cap.md`.
 pub const SERVICE_CONTROL_RESOURCE: ResourceId = ResourceId(6);
 
+/// The resource-mint authority — allocate a **delegated resource** and mint a cap for it
+/// via `ResourceMint` (syscall 30, §7.10, P2 file-as-capability). A task must hold this
+/// resource with `Rights::WRITE`. Granted only to services that legitimately issue
+/// resources whose meaning they define — `fs` (files) in v1 — so delegated minting is
+/// explicit authority, never ambient (§3.1). See `docs/persistence.md` §7.4.
+pub const RESOURCE_MINT_RESOURCE: ResourceId = ResourceId(7);
+
 pub fn init() {
     table::init_global();
     // Register stable kernel resources (generation 0 forever — §7.5).
@@ -69,5 +77,6 @@ pub fn init() {
     table::register_resource(CONSOLE_PUSH_RESOURCE);
     table::register_resource(INTROSPECT_RESOURCE);
     table::register_resource(SERVICE_CONTROL_RESOURCE);
+    table::register_resource(RESOURCE_MINT_RESOURCE);
     crate::kprintln!("capability: subsystem ready");
 }
