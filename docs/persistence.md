@@ -681,12 +681,24 @@ byte in its data block, boot: `fs` logs a "data block CRC mismatch" and the read
   still zero), and the next boot replays the data home — a correct read proves the journal supplied
   it. No regression (fs-large 1/1, fs-frag 11/0, fs-journal 11/0, files 130/0, script 2/2).
 
+- **Phase K — Scrub (read-only integrity sweep). ✅ Built + verified 2026-06-17.** Every block
+  already self-verifies *on read*, but rarely-read blocks could rot undetected until you needed
+  them. `drives scrub` (`OP_SCRUB`) walks the tree and verifies **every** referenced block's CRC,
+  reporting `(files, dirs, bad, scanned)` and **changing nothing** — distinct from `check`, which
+  *repairs* the bitmap (writes). Read-only ⇒ safe to run at any cadence on a healthy filesystem.
+  Without redundancy (no RAID, by design) scrub **detects** bit-rot but cannot repair it: a bad
+  block is reported and any read of it stays a loud refusal (§3.12), the data is already lost. The
+  cadence is **operator-driven** — GodspeedOS has no background-task primitive, so "periodic" is
+  policy (run `drives scrub` on a schedule), not a hidden timer (§26.4: no silent complexity). Full
+  §6.14. No format change, no amendment. Verified by `osdev test fs-scrub` (6/0): a corrupt data
+  block is reported (`1 bad`), a second scrub still reports it (read-only — no repair), and the
+  clean file is untouched; `selfcheck.gsh` also runs `assert ok drives scrub` on a clean tree.
+
 **Deferred (heavier; pulled in only when a real need arises, §26.2 / §26.11):**
 
-- **Scrubbing** — proactively re-verify rarely-read blocks to catch latent bit-rot early; needs a
-  background task GodspeedOS doesn't have.
 - **Snapshots / copy-on-write / mirroring (RAID)** — real features, but each strains the
-  30-minute-whiteboard rule (§26.11); revisit only with a concrete need.
+  30-minute-whiteboard rule (§26.11); revisit only with a concrete need. (RAID would also let scrub
+  *repair*, not just detect — but it needs a second disk and is out of scope.)
 
 ### 6.12 Extent lists — files across scattered free space (GSFS0007)
 
@@ -773,6 +785,41 @@ right after its commit record — the data is only in the journal, the home bloc
 the next boot replays it; because a zero block fails the data CRC, reading the file back correctly can
 *only* mean the journal supplied the data. No on-disk format change; no constitutional amendment
 (within §15/§26.6, no TCB or §7 change).
+
+### 6.14 Scrub — a read-only integrity sweep (Phase K)
+
+> **Adopted 2026-06-17 (Phase K).** Turns the per-block CRC from a *read-time* guard into a
+> *proactive* one, honestly bounded by what GodspeedOS actually has.
+
+Every block self-verifies **on read** (§6.6/§6.10): a corrupt block is a loud refusal, never silent
+garbage. But a block you never read can rot undetected until the day you need it. A *scrub* closes
+that window: read everything periodically and verify it, so bit-rot surfaces early.
+
+`drives scrub` (`OP_SCRUB`) walks the directory tree from root and verifies **every** referenced
+block's CRC — directory blocks (`td_read`), extent blocks and the data runs they list (`ext_of` +
+`data_read`), and contiguous file data (`data_read`) — reporting `(files, dirs, bad, scanned)`. It
+**writes nothing**: `scrub`/`scrub_subtree` are `&self`, no transaction. This is the deliberate
+difference from `check` (fsck, §6.11 Phase G), which *repairs* — rebuilds the bitmap and free count
+(and so must write). Scrub only **detects and reports**, which makes it safe to run routinely on a
+healthy mounted filesystem without churning the disk.
+
+Two honesty points the constitution forces (§26.4/§26.7):
+
+- **Detect, not repair.** GodspeedOS has no redundancy (no RAID — §6.11, deliberately out of scope),
+  so there is no second copy to heal a rotted block from. Scrub reports `N bad`; the data is already
+  lost and the read stays a loud refusal. (RAID is exactly what would let scrub *repair* — and
+  exactly what the whiteboard rule keeps out for now.)
+- **Operator-driven cadence, not a hidden background task.** "Periodic scrubbing" in other systems
+  rides a background scheduler GodspeedOS does not have, and inventing a silent kernel/daemon timer
+  would be precisely the hidden complexity §26.4 forbids. So the *mechanism* is a plain command and
+  the *cadence* is policy: an operator (or a script on a timer they control) runs `drives scrub`. The
+  trigger is explicit and visible, which is the point.
+
+Verified by `osdev test fs-scrub` (6/0): a disk with one clean file and one whose data block was
+flipped host-side — scrub reports `1 bad`, a second scrub still reports `1 bad` (proving it is
+read-only and repaired nothing), and the clean file is untouched. `selfcheck.gsh` runs
+`assert ok drives scrub` over a populated clean tree (the 0-bad path). No on-disk format change; no
+constitutional amendment (within §15/§26.6, no TCB or §7 change).
 
 ## 7. File = capability (the north star)
 

@@ -83,6 +83,7 @@ hard links. Bad magic **or** bad CRC is a loud mount refusal, never an auto-refo
 | `ReadAt`    | 26 | path, offset:u64, len:u32 | `Ok`, n:u32, bytes / `NotFound` |
 | `Check`     | 27 | —                 | fsck: `Ok`, files/dirs/bad:u32, used/free:u64 — rebuild bitmap+free from the tree, verify CRCs |
 | `WriteAtJ`  | 28 | path, offset:u64, chunk | `Ok` / `Err` — like `WriteAt` but the chunk's data is **journaled** (Phase J): applied atomically (crash → replayed or discarded, never torn). Bounded to one chunk; default `WriteAt` stays direct |
+| `Scrub`     | 29 | —                 | scrub (Phase K): `Ok`, files/dirs/bad:u32, scanned:u64 — READ-ONLY CRC integrity sweep over the tree; reports bad blocks, **changes nothing** (unlike `Check`, which repairs) |
 
 **Large files (streaming).** `WriteFile`/`ReadFile` carry a whole *small* file in one ≤4 KiB
 IPC message. Files larger than one message use the offset-addressed ops: `WriteNew` allocates
@@ -118,6 +119,13 @@ recovered. `WriteAtJ` (op 28) stages the chunk's data blocks in the transaction 
 the chunk commits **atomically** through the journal — replayed or discarded on crash, never torn.
 Opt-in per write (default `WriteAt` stays direct); bounded to one chunk by the 64-block journal (no
 whole-file atomicity — stated honestly, not faked). Proven by `osdev test fs-djournal`.
+
+**Scrub (Phase K, §6.14).** Every block self-verifies *on read*; `Scrub` (op 29, `drives scrub`)
+makes that *proactive* — a READ-ONLY walk of the tree verifying every block's CRC, reporting
+`(files, dirs, bad, scanned)` and writing nothing (distinct from `Check`, which repairs). `scrub`/
+`scrub_subtree` are `&self`. Without redundancy it DETECTS bit-rot but cannot repair it; the cadence
+is operator-driven (no background-task primitive — "periodic" is policy, not a hidden timer, §26.4).
+Proven by `osdev test fs-scrub`.
 
 This is the transactional metadata recovery §6.3/§15 calls for. With it, fs no longer
 *needs* to be non-restartable on crash-safety grounds — dropping fs + block-driver from the

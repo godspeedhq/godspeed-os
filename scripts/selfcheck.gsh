@@ -202,6 +202,9 @@ read /sc/data.json | from json | sort reverse n | assert contains z
 # ===== fsck: drives check rebuilds bitmap/free from the populated tree, finds no corruption =====
 assert ok drives check
 
+# ===== scrub: read-only CRC integrity sweep over the populated tree finds no bit-rot =====
+assert ok drives scrub
+
 # ===== cleanup: proves delete + delete recursive =====
 delete /sc/a.txt
 assert fails read /sc/a.txt

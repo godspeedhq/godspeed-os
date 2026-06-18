@@ -1075,6 +1075,7 @@ fn cmd_test(suite: &str) {
         "fs-djournal"  => run_fs_djournal_test(),
         "fs-restart"   => run_fs_restart_test(),
         "fs-check"     => run_fs_check_test(),
+        "fs-scrub"     => run_fs_scrub_test(),
         "fs-ioretry"   => run_fs_ioretry_test(),
         "drives-raw"   => run_drives_raw_test(),
         "drives"       => run_drives_scripted_test(),
@@ -1980,6 +1981,47 @@ fn run_fs_check_test() {
     println!("fs-check: drifted free count {} -> {} (both copies), correct value is {}", bogus, bogus, correct_free);
 
     crate::shell_test::run_fs_check(&image_path, persist, correct_free, 4);
+}
+
+/// Phase K: `drives scrub` (read-only integrity sweep). Bake a clean file and a file with a
+/// CORRUPTED data block (a flipped payload byte), boot, and `drives scrub`: it must report the
+/// bad block (`1 bad`) without panicking, leave the disk UNCHANGED (a second scrub still reports
+/// `1 bad` — read-only, no repair), and the clean file must still read back. Proves a routine,
+/// non-destructive integrity sweep that detects bit-rot.
+fn run_fs_scrub_test() {
+    println!("\n=== fs: drives scrub (read-only integrity sweep) — detect bit-rot, change nothing (Phase K) ===");
+    cmd_build_bare_metal();
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+
+    let persist = "build/tests/persist_fs_scrub.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    gsfs_add_file(persist, "good.txt", b"good-payload-survives-the-scrub");
+    gsfs_add_file(persist, "bad.txt", b"this payload will be corrupted host-side to fail its data CRC");
+
+    // Flip a payload byte in bad.txt's first data block (not the CRC @508) → its data CRC fails.
+    let mut d = std::fs::read(persist).unwrap();
+    let root = u64::from_le_bytes(d[48..56].try_into().unwrap()) as usize;
+    let rd = root * 512;
+    let mut bad_block = 0usize;
+    for slot in 0..7 {
+        let r = rd + slot * 64;
+        if d[r] == 1 && &d[r + 2..r + 2 + d[r + 1] as usize] == b"bad.txt" {
+            bad_block = u64::from_le_bytes(d[r + 48..r + 56].try_into().unwrap()) as usize;
+            break;
+        }
+    }
+    assert!(bad_block != 0, "could not locate bad.txt data block");
+    d[bad_block * 512] ^= 0xFF;
+    std::fs::write(persist, &d).unwrap();
+    println!("fs-scrub: corrupted bad.txt's data block at LBA {} (good.txt left intact)", bad_block);
+
+    crate::shell_test::run_fs_scrub(&image_path, persist, 4);
 }
 
 /// Phase H: block I/O retry. Build block-driver with `io-error-test` (forces the first couple
