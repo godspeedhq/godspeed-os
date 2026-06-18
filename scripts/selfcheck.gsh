@@ -207,9 +207,9 @@ assert ok drives scrub
 
 # ===== file-as-capability (§7.10, P2): open a file as a REAL kernel cap and exercise every
 # property — read/write THROUGH the cap, non-escalation (a read-only cap can't write, at both
-# the kernel and fs layers), unforgeable handle, revoke-on-close. `fcap` is Ok only if all hold. =====
-write /sc/cap.txt seeddata
-assert ok fcap /sc/cap.txt
+# the kernel and fs layers), unforgeable handle, revoke-on-close. `fcap` is Ok only if all hold.
+# It is self-contained: it creates and deletes its own throwaway file, so it takes no argument. =====
+assert ok fcap
 
 # ===== cleanup: proves delete + delete recursive =====
 delete /sc/a.txt

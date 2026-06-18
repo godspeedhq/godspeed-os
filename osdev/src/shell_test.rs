@@ -1575,10 +1575,10 @@ pub fn run_fs_restart(image_path: &Path, persist_path: &str, smp: u32) {
     if fail > 0 { std::process::exit(1); }
 }
 
-/// §22 Test 14 — file-as-capability (P2). Boot a pre-formatted disk, create a file, then run the
-/// shell's `fcap <file>` command, which opens the file as a real kernel capability and self-checks
-/// every property: read/write via the cap, non-escalation (RO cap can't write at the kernel OR fs
-/// layer), forged-handle rejection, revoke-on-close. We assert each per-step line + the summary.
+/// §22 Test 14 — file-as-capability (P2). Boot a pre-formatted disk, then run the shell's argless
+/// `fcap` command, which creates its own throwaway file, opens it as a real kernel capability, and
+/// self-checks every property: read/write via the cap, non-escalation (RO cap can't write at the
+/// kernel OR fs layer), forged-handle rejection, revoke-on-close. We assert each line + the summary.
 pub fn run_fs_filecap(image_path: &Path, persist_path: &str, smp: u32) {
     println!("file-cap: booting (smp={smp}) bare-metal + AHCI disk for the file-as-capability test");
     let qemu      = crate::qemu::qemu_binary();
@@ -1626,9 +1626,9 @@ pub fn run_fs_filecap(image_path: &Path, persist_path: &str, smp: u32) {
         child.kill().ok(); child.wait().ok(); std::process::exit(1);
     }
 
-    // Create a file (name-addressed), then run the capability self-check on it.
-    let _ = run!(b"write /f.txt seeddata\r", 10);
-    match run!(b"fcap /f.txt\r", 15) {
+    // `fcap` is self-contained: it creates and deletes its own throwaway file, so it takes no
+    // argument and never touches a user's file.
+    match run!(b"fcap\r", 15) {
         Some(r) => {
             check!(r.contains("opened rw (file cap)"), "fs minted a real file capability on open");
             check!(r.contains("write via cap OK"),     "wrote the file THROUGH the cap");
