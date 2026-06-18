@@ -39,6 +39,10 @@ pub mod capability {
     // build doesn't try to compile it without the macro.
     #[cfg(test)]
     pub mod table;
+    // delegated.rs (§7.10) depends only on cap + table + SpinLock (no ipc/hardware), so its
+    // pure band logic is host-unit-testable. Gated on test (it uses the test-only `table`).
+    #[cfg(test)]
+    pub mod delegated;
 }
 
 pub mod ipc {

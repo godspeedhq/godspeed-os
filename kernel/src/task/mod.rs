@@ -19,7 +19,7 @@ use crate::arch::x86_64::context_switch::TaskContext;
 use crate::arch::x86_64::page_tables::{
     get_hhdm_offset, PageFlags, VirtAddr, PAGE_SIZE,
 };
-use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE};
+use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE};
 use crate::capability::cap::ResourceId;
 use crate::capability::generation::Generation;
 use crate::ipc::endpoint::EndpointId;
@@ -3052,6 +3052,15 @@ fn spawn_service_with_config(
     {
         let sc_cap = mint_cap(SERVICE_CONTROL_RESOURCE, Rights::WRITE);
         caps.insert(sc_cap)
+            .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
+    }
+
+    // The resource-mint authority (§7.10, P2 file-as-capability): held only by services that
+    // issue delegated resources whose meaning they define. `fs` mints a file cap per open file.
+    // Least-privilege (§3.1) — no other service can create delegated resources.
+    if name == "fs" {
+        let rm_cap = mint_cap(RESOURCE_MINT_RESOURCE, Rights::WRITE);
+        caps.insert(rm_cap)
             .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
     }
 

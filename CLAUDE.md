@@ -191,6 +191,13 @@ These are the laws that bound every design choice. Any change that violates an i
 
 The kernel does **not** contain filesystem logic, network stack, drivers (beyond minimal arch boot), logging infrastructure, application logic, developer tooling, work-stealing scheduler, service migration, or load balancing.
 
+> **Amendment 2026-06-18 (P2, file-as-capability): delegated resource capabilities do not add
+> file logic to the kernel.** The kernel gains the ability to mint, route, and revoke capabilities
+> for resources whose *meaning is defined by a service* (§7.10). It still contains **no filesystem
+> logic**: it tracks an opaque `ResourceId` and its owning endpoint and nothing more; the owning
+> service (`fs`) alone maps `ResourceId → file`. "A file is a capability" thus becomes literally
+> true while this anti-scope holds — the kernel never learns what a file *is*.
+
 ---
 
 ## 5. Repository Structure
@@ -496,6 +503,36 @@ fn main(ctx: ServiceContext) -> Result<()> {
     Ok(())
 }
 ```
+
+### 7.10 Delegated Resource Capabilities (P2 — file-as-capability)
+
+> **Amendment 2026-06-18 (P2).** Extends the capability model so a resource's *meaning* can be
+> owned by a service while the kernel still mints, validates, routes, and revokes its caps. This is
+> the mechanism that makes "a file is a capability" literally true (`docs/persistence.md` §7.2).
+
+The kernel mints unforgeable caps (§7.3) but has no concept of a file (§4.4). Delegated resource
+capabilities bridge the two: a service **owns a band of `ResourceId`s** whose meaning only it knows,
+and the kernel treats each as an **opaque** resource — identical machinery to an endpoint cap.
+
+- **Mint.** A service asks the kernel (`resource_mint`) to allocate a fresh `ResourceId` in its
+  band, register it (generation 0, Alive), record the service's endpoint as its **owner**, and mint
+  a cap with chosen `Rights` (READ/WRITE/GRANT). The service hands a (narrowed) copy to a client by
+  the existing embedded-cap transfer (§8.5). `fs` does this on `Open`, recording `ResourceId → file`.
+- **Use = send.** A holder uses the cap by `send`ing on it. The kernel validates it (generation +
+  required right) and routes the message to the **owning service's endpoint, badged with the
+  `ResourceId`** — so the owner knows which resource without the kernel knowing what it means. A
+  read/write to a file is then a first-class capability operation: validated, denied, or revoked by
+  the same code path as any cap.
+- **Revoke = generation bump (§7.5).** The owner revokes a resource it owns (`resource_revoke`);
+  every outstanding cap to it goes stale and the next use returns `CapRevoked`. `fs` revokes on
+  delete/close.
+- **Minting is gated (§3.1).** `resource_mint` requires a `RESOURCE_MINT` capability, granted only
+  to services that legitimately issue resources (e.g. `fs`). Delegated minting is explicit
+  authority, never ambient.
+
+Every §7.3 property holds for a delegated resource cap exactly as for an endpoint cap: unforgeable,
+non-escalating (rights narrow on transfer), scoped (to one `ResourceId`), revocable, generationed.
+The kernel learns nothing about files; it routes opaque resources. Pinned by §22 Test 14.
 
 ---
 
@@ -1768,6 +1805,39 @@ test fs_survives_own_restart:                     # osdev test fs-restart
 
 ---
 
+### Test 14: File Is a Capability (P2)
+
+**Pins:** §7.3 (cap properties), §7.10 (delegated resource capabilities), §3.1 (no ambient
+authority), §3.3 (authority by capability, not identity).
+
+The P2 amendment (2026-06-18) makes a file a real, kernel-minted capability via delegated resource
+caps. This test pins that the file cap is a *genuine* capability — not a service-level token — by
+exercising the three properties that distinguish one: unforgeable, revocable, non-escalating.
+
+```
+test file_is_a_capability:
+    # fs hands out a real cap on open (delegated resource cap, §7.10)
+    rw = fs.open("/doc.txt", rights=[READ, WRITE])     # returns a file capability
+    assert rw.write("hello") == Ok
+    assert rw.read()         == "hello"
+
+    # Unforgeable (§7.3): a fabricated handle is not a cap
+    assert use_random_handle_as_file_cap() in [Err(CapNotHeld), Err(CapInvalid)]
+
+    # Non-escalating (§7.3): a READ-only file cap cannot write
+    ro = fs.open("/doc.txt", rights=[READ])
+    assert ro.read()          == "hello"
+    assert ro.write("nope")   == Err(CapInsufficientRights)
+
+    # Revocable (§7.5/§7.10): deleting the file revokes every cap to it
+    fs.delete("/doc.txt")                               # fs revokes the resource (gen bump)
+    assert rw.read()  == Err(CapRevoked)
+    assert ro.read()  == Err(CapRevoked)
+    assert kernel_did_not_panic()
+```
+
+---
+
 ### 22.6 Test Coverage Matrix
 
 | Test                              | Spec sections pinned       | Constitutional invariant      |
@@ -1785,6 +1855,7 @@ test fs_survives_own_restart:                     # osdev test fs-restart
 | 11. Registry survives restart     | §6.1, §6.2, §14, §3.11     | Restartability / TCB shrink   |
 | 12. Confined driver DMA faults    | §3.1, §6.4, §12            | No ambient authority (DMA)    |
 | 13. fs survives own restart       | §6.1, §6.2, §6.3, §15, §14 | Restartability / TCB shrink   |
+| 14. File is a capability          | §7.3, §7.10, §3.1, §3.3    | Authority is explicit (files) |
 
 If any cell becomes obsolete, the corresponding spec section is being changed and the change requires a CLAUDE.md amendment.
 
@@ -1877,6 +1948,7 @@ Filesystem persistence beyond the trusted block driver, network stack, work-stea
 - **AP** — Application Processor. Any core other than the BSP.
 - **BSP** — Bootstrap Processor. The first core to execute kernel code.
 - **Capability** — Unforgeable token: ResourceId + Rights + Generation.
+- **Delegated resource capability** — A capability for a resource whose *meaning* is defined by a service (e.g. a file owned by `fs`), not the kernel. The owning service mints and revokes it (`resource_mint`/`resource_revoke`, gated by a `RESOURCE_MINT` cap); the kernel validates and routes it as for any cap, badging a send with the opaque `ResourceId` so the owner knows which resource. The mechanism behind file-as-capability (§7.10, P2).
 - **Endpoint** — IPC destination owned by a service. Bounded queue, depth 16 in v1.
 - **Generation** — Monotonic counter on resources; mismatch on cap use indicates the resource was destroyed or replaced.
 - **Grant** — The right to transfer a capability via IPC.
