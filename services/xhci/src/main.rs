@@ -772,7 +772,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             godspeed_sdk::hid::KeyRepeat::new(REPEAT_INITIAL_CYCLES, REPEAT_INTERVAL_CYCLES),
             godspeed_sdk::hid::KeyRepeat::new(REPEAT_INITIAL_CYCLES, REPEAT_INTERVAL_CYCLES),
         ];
-        let mut repeat_logged = false; // one-time confirm that auto-repeat actually fires
         let mut mouse = [
             godspeed_sdk::hid::MouseTracker::new(),
             godspeed_sdk::hid::MouseTracker::new(),
@@ -882,12 +881,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             let now = ctx.read_tsc();
             for d in 0..ndev {
                 if !devs[d].is_mouse {
-                    let mut fired = false;
-                    kb_rep[d].poll(now, |ch| { ctx.console_push(ch); fired = true; });
-                    if fired && !repeat_logged {
-                        ctx.log("xhci: typematic auto-repeat firing");
-                        repeat_logged = true;
-                    }
+                    kb_rep[d].poll(now, |ch| ctx.console_push(ch));
                 }
             }
             ctx.yield_cpu();

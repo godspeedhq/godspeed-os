@@ -740,7 +740,6 @@ fn poll_devices(
     // unlike the coarse kernel tick): ~300 ms before the first repeat, then ~50 ms apart
     // at ~2 GHz. The spread across 1.5–3 GHz CPUs just shifts the feel slightly.
     let mut kb_rep = godspeed_sdk::hid::KeyRepeat::new(600_000_000, 100_000_000);
-    let mut repeat_logged = false; // one-time confirm that auto-repeat actually fires
     let mut mouse = godspeed_sdk::hid::MouseTracker::new(); // mouse button/motion state
     loop {
         for i in 0..n {
@@ -784,12 +783,7 @@ fn poll_devices(
         }
         // Typematic auto-repeat: a held key sends no further reports, so synthesise
         // repeats from the monotonic tick while the key stays down.
-        let mut fired = false;
-        kb_rep.poll(ctx.read_tsc(), |ch| { ctx.console_push(ch); fired = true; });
-        if fired && !repeat_logged {
-            ctx.log("ehci: typematic auto-repeat firing");
-            repeat_logged = true;
-        }
+        kb_rep.poll(ctx.read_tsc(), |ch| ctx.console_push(ch));
         ctx.yield_cpu();
     }
 }

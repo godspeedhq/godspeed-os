@@ -230,11 +230,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 /// already queued and `try_console_read` returns it at once; a serial terminal may split
 /// the bytes, so we wait a bounded few monotonic ticks (`ESC_WAIT_TICKS`) before giving
 /// up. `None` ⇒ bare ESC. Returning quickly matters so a held key's repeats stay snappy.
-const ESC_WAIT_TICKS: u64 = 2;
+// ~100 ms at ~2 GHz, in read_tsc cycles. We time the bare-ESC wait off the TSC, not the
+// kernel monotonic tick (query 12), because the tick was found NOT to advance reliably on
+// real hardware (it silently broke typematic auto-repeat on the T630). read_tsc is
+// hardware-proven (§22 perf). A real escape sequence's bytes are already queued (the
+// keyboard pushes them atomically), so this wait only bounds how long a bare Escape — which
+// has nothing following — takes to resolve to "clear the line".
+const ESC_WAIT_CYCLES: u64 = 200_000_000;
 fn read_escape_byte(ctx: &ServiceContext) -> Option<u8> {
     if let Some(b) = ctx.try_console_read() { return Some(b); }
-    let deadline = ctx.monotonic_ticks() + ESC_WAIT_TICKS;
-    while ctx.monotonic_ticks() < deadline {
+    let deadline = ctx.read_tsc().wrapping_add(ESC_WAIT_CYCLES);
+    while ctx.read_tsc() < deadline {
         if let Some(b) = ctx.try_console_read() { return Some(b); }
         ctx.yield_cpu();
     }

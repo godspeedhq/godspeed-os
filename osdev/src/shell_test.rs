@@ -493,7 +493,15 @@ pub fn run(image_path: &Path, smp: u32) {
     }
     // Home + Right×5 + Delete: type "echo ZABC", Home (ESC[H) to the start, Right 5×
     // (past "echo ") to just before Z, Delete (ESC[3~) removes Z → "echo ABC".
-    send(&mut write_half, b"echo ZABC\x1b[H\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[3~\r");
+    // Sent in <=16-byte pieces with a gap between so no single escape sequence is split
+    // across a UART-FIFO drain (a real keyboard delivers each sequence's bytes atomically;
+    // a 27-byte burst would split mid-sequence and isn't representative). esc() helps.
+    let esc = |w: &mut std::net::TcpStream, b: &[u8]| { send(w, b); std::thread::sleep(Duration::from_millis(60)); };
+    esc(&mut write_half, b"echo ZABC");
+    esc(&mut write_half, b"\x1b[H");                                 // Home
+    esc(&mut write_half, b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C");          // Right x5 (15 bytes)
+    esc(&mut write_half, b"\x1b[3~");                                // Delete
+    send(&mut write_half, b"\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("ABC") && !r.contains("ZABC"), "home + right + Delete: forward-delete mid-line (echo ABC)"),
         None    => { println!("shell-test: FAIL — timed out after home/delete edit"); fail += 1; }
