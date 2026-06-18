@@ -488,13 +488,20 @@ fn draw_cursor(s: &mut Fb) {
     s.cur_row = s.row;
 }
 
-/// Erase the cursor at the cell where it was last drawn (blank it). Using the
-/// remembered position — not the current write position — is what stops a
-/// carriage return from blanking real text: after `\r` moves the column to 0 over
-/// existing characters, the cursor is still erased at its old cell, leaving the
-/// text (the `g` of `gsh>`) intact.
+/// Erase the cursor at the cell where it was last drawn by restoring that cell's real
+/// content from the shadow grid — NOT by blanking it. The cursor underline is drawn over
+/// whatever glyph occupies the cell (the grid is not touched), so restoring the grid glyph
+/// removes the underline without destroying text. Blanking instead would erase any
+/// character the cursor sits on, which is exactly what made moving the cursor back over
+/// typed text (Left arrow, Home) delete it. Using the *remembered* position (not the
+/// current write position) keeps a carriage return from touching real text elsewhere.
 fn erase_cursor(s: &Fb) {
-    draw_glyph(s, b' ', s.cur_col, s.cur_row);
+    let ch = if s.cur_row < MAX_ROWS && s.cur_col < MAX_COLS {
+        s.grid[s.cur_row][s.cur_col]
+    } else {
+        b' '
+    };
+    draw_glyph(s, ch, s.cur_col, s.cur_row);
 }
 
 /// Move the cursor to the start of the next row, scrolling if at the bottom.
