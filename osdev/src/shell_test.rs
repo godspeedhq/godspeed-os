@@ -1615,6 +1615,7 @@ pub fn run_fs_filecap(image_path: &Path, persist_path: &str, smp: u32) {
             check!(r.contains("op<=right"),            "fs refuses a write op under a read-validated right");
             check!(r.contains("forged handle rejected"), "a fabricated handle is not a capability (unforgeable)");
             check!(r.contains("revoked after close"),  "the cap is revoked on close (revocable)");
+            check!(r.contains("revoked after rename"),  "rename revokes the cap (no confused-deputy via path reuse)");
             check!(r.contains("all file-capability checks passed"), "every file-cap property held");
         }
         None => { println!("file-cap: FAIL — fcap timed out"); fail += 1; }
