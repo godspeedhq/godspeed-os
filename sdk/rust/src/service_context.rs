@@ -1121,6 +1121,20 @@ impl ServiceContext {
         self.console_write("\n");
     }
 
+    /// Write a formatted message to the interactive console, with **no** trailing
+    /// newline (e.g. a pager status line the cursor should park on).
+    pub fn console_write_fmt(&self, args: core::fmt::Arguments) {
+        let mut buf    = [0u8; 256];
+        let mut cursor = 0usize;
+        let _ = core::fmt::write(
+            &mut StackWriter { buf: &mut buf, pos: &mut cursor },
+            args,
+        );
+        if cursor > 0 {
+            self.console_write(core::str::from_utf8(&buf[..cursor]).unwrap_or("(fmt error)"));
+        }
+    }
+
     /// Write a formatted message to the interactive console, followed by a newline.
     pub fn console_writeln_fmt(&self, args: core::fmt::Arguments) {
         let mut buf    = [0u8; 256];

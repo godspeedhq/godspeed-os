@@ -124,17 +124,22 @@ pub fn run(image_path: &Path, smp: u32) {
     // -----------------------------------------------------------------------
     // help
     // -----------------------------------------------------------------------
-    send(&mut write_half, b"help\r");
+    // `help` is now paged (the framebuffer console has no scrollback). Drive the pager:
+    // page down through every screen (extra page-downs clamp at the bottom, harmless),
+    // then `q` to quit. The accumulated byte stream still contains every section, and
+    // reaching `gsh>` proves the pager exited cleanly back to the prompt.
+    send(&mut write_half, b"help\r          q");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => {
             check!(r.contains("GodspeedOS shell commands"), "help: header");
-            check!(r.contains("spawn"),   "help: spawn listed");
-            check!(r.contains("restart"), "help: restart listed");
-            check!(r.contains("status"),  "help: status listed");
+            check!(r.contains("spawn"),   "help: spawn listed (paged)");
+            check!(r.contains("restart"), "help: restart listed (paged)");
+            check!(r.contains("status"),  "help: status listed (paged)");
+            check!(r.contains("page, up/down line"), "help: pager status line shown");
         }
         None => {
-            println!("shell-test: FAIL — timed out after `help`  [×4]");
-            fail += 4;
+            println!("shell-test: FAIL — timed out after `help`  [×5]");
+            fail += 5;
         }
     }
 

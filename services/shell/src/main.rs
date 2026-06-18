@@ -650,7 +650,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
     // Dispatch — every command returns its `Result` (Ok/Err); an unknown command is `Err`.
     // The info commands always succeed (they return `Ok`), but they are on the model uniformly.
     return match args[0] {
-        "help"    => cmd_help(ctx),
+        "help"    => cmd_help(ctx, depth),
         "clear"   => cmd_clear(ctx),
         "echo"    => cmd_echo(ctx, strip_quotes(s["echo".len()..].trim()), &mut Out::Console),
         "about"   => cmd_about(ctx),
@@ -1181,72 +1181,199 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
     true
 }
 
-fn cmd_help(ctx: &ServiceContext) -> Result<(), ShellError> {
-    // Rule 6 (0_conventions.md): help output's first line is `<util> <version>`.
-    ctx.console_writeln_fmt(format_args!("help {} — GodspeedOS shell commands", UTIL_VERSION));
-    ctx.console_writeln("");
-    ctx.console_writeln("Console");
-    help_line(ctx, "help", "show this message");
-    help_line(ctx, "<prefix> Tab", "complete a command; if several match, press the shown digit to pick");
-    help_line(ctx, "arrows/Home/End/Del", "edit the line in place; Up/Down recall history; Esc clears");
-    help_line(ctx, "clear", "clear the screen");
-    help_line(ctx, "echo <text>", "print text");
-    help_line(ctx, "result", "the last command's result (Ok / Err)");
-    help_line(ctx, "run <script>", "run a script of commands (.gsh; # comments, ; separators)");
-    help_line(ctx, "selfcheck", "run the built-in self-check suite");
-    help_line(ctx, "fcap", "file-as-capability self-check (diagnostic; fcap help)");
-    help_line(ctx, "assert ok|fails <cmd>", "verify success/failure (also: … | assert contains X)");
-    ctx.console_writeln("");
-    ctx.console_writeln("System");
-    help_line(ctx, "about", "identity + credits");
-    help_line(ctx, "cores", "CPU core count");
-    help_line(ctx, "mem", "physical memory usage");
-    help_line(ctx, "date [epoch]", "date + time; 'epoch' = secs since 1970");
-    ctx.console_writeln("");
-    ctx.console_writeln("Services");
-    help_line(ctx, "status", "list all live tasks");
-    help_line(ctx, "observe [now]", "live view (q to quit) / one-shot frame");
-    help_line(ctx, "caps [service]", "capabilities (default: this shell)");
-    help_line(ctx, "roster", "example record service (a typed table; try roster | where role=core)");
-    help_line(ctx, "spawn <name>", "start a service");
-    help_line(ctx, "kill <name>", "stop a service");
-    help_line(ctx, "restart <name> [core]", "restart a service");
-    ctx.console_writeln("");
-    ctx.console_writeln("Storage");
-    help_line(ctx, "drives [flash|label|reset|check]", "manage attached disks (drives help)");
-    help_line(ctx, "ls [path]", "list a directory");
-    help_line(ctx, "cd [path|-]", "change directory (- = previous)");
-    help_line(ctx, "read <path>", "print a file");
-    help_line(ctx, "write [append] <path> [text]", "create/overwrite/append a file");
-    help_line(ctx, "mkdir <path> [parents]", "create a directory");
-    help_line(ctx, "copy <src> <dst> [recursive]", "copy a file or subtree");
-    help_line(ctx, "move <src> <dst>", "relocate a file/dir");
-    help_line(ctx, "rename <path> <name>", "rename an entry in place");
-    help_line(ctx, "delete <path> [recursive]", "remove a file/dir/subtree");
-    help_line(ctx, "find <pattern> [path]", "search by name (substring or *? glob)");
-    help_line(ctx, "tree [path]", "print the directory hierarchy");
-    help_line(ctx, "match <pattern> [path]", "keep lines matching (also: <prod> | match)");
-    help_line(ctx, "count [path]", "count lines/words/bytes (also: <prod> | count)");
-    help_line(ctx, "sort [reverse] [path]", "order lines (also: <prod> | sort)");
-    help_line(ctx, "first / last [N] [path]", "keep first/last N lines (also: <prod> |)");
-    ctx.console_writeln("");
-    ctx.console_writeln("Pipes");
-    help_line(ctx, "<producer> | [filter |…] <sink>", "compose stages (Appendix D)");
-    help_line(ctx, "  e.g. read /f | upper", "filter a file through a service");
-    help_line(ctx, "  e.g. tree / | write /out", "capture output to a file");
-    help_line(ctx, "  e.g. greet | upper | write /g", "producer | filter | sink");
-    ctx.console_writeln("");
-    ctx.console_writeln("Records (typed pipes — docs/records.md)");
-    help_line(ctx, "status | where mem>0", "filter the task table by field (=,!=,>,<,~)");
-    help_line(ctx, "status | select name state", "keep only some columns");
-    help_line(ctx, "status | sort [reverse] mem", "order rows by a column");
-    help_line(ctx, "status | to json | to yaml", "render the table (default: a grid)");
-    ctx.console_writeln("");
-    ctx.console_writeln("Power");
-    help_line(ctx, "reboot", "hardware reset");
-    ctx.console_writeln("");
-    ctx.console_writeln("Type '<command> help' for usage + examples, '<command> version' for the version.");
+/// One rendered line of `help`, as static data so the pager can index it (and the
+/// whole table lives in rodata, not on the shell's tight stack — §26.6). `Sec`/`Text`
+/// are full-width lines; `Row` is the aligned "  command  description" form.
+enum HelpRow {
+    Gap,
+    Sec(&'static str),
+    Text(&'static str),
+    Row(&'static str, &'static str),
+}
+use HelpRow::*;
+static HELP: &[HelpRow] = &[
+    Gap,
+    Sec("Console"),
+    Row("help", "show this message"),
+    Row("<prefix> Tab", "complete a command; if several match, press the shown digit to pick"),
+    Row("arrows/Home/End/Del", "edit the line in place; Up/Down recall history; Esc clears"),
+    Row("clear", "clear the screen"),
+    Row("echo <text>", "print text"),
+    Row("result", "the last command's result (Ok / Err)"),
+    Row("run <script>", "run a script of commands (.gsh; # comments, ; separators)"),
+    Row("selfcheck", "run the built-in self-check suite"),
+    Row("fcap", "file-as-capability self-check (diagnostic; fcap help)"),
+    Row("assert ok|fails <cmd>", "verify success/failure (also: … | assert contains X)"),
+    Gap,
+    Sec("System"),
+    Row("about", "identity + credits"),
+    Row("cores", "CPU core count"),
+    Row("mem", "physical memory usage"),
+    Row("date [epoch]", "date + time; 'epoch' = secs since 1970"),
+    Gap,
+    Sec("Services"),
+    Row("status", "list all live tasks"),
+    Row("observe [now]", "live view (q to quit) / one-shot frame"),
+    Row("caps [service]", "capabilities (default: this shell)"),
+    Row("roster", "example record service (a typed table; try roster | where role=core)"),
+    Row("spawn <name>", "start a service"),
+    Row("kill <name>", "stop a service"),
+    Row("restart <name> [core]", "restart a service"),
+    Gap,
+    Sec("Storage"),
+    Row("drives [flash|label|reset|check]", "manage attached disks (drives help)"),
+    Row("ls [path]", "list a directory"),
+    Row("cd [path|-]", "change directory (- = previous)"),
+    Row("read <path>", "print a file"),
+    Row("write [append] <path> [text]", "create/overwrite/append a file"),
+    Row("mkdir <path> [parents]", "create a directory"),
+    Row("copy <src> <dst> [recursive]", "copy a file or subtree"),
+    Row("move <src> <dst>", "relocate a file/dir"),
+    Row("rename <path> <name>", "rename an entry in place"),
+    Row("delete <path> [recursive]", "remove a file/dir/subtree"),
+    Row("find <pattern> [path]", "search by name (substring or *? glob)"),
+    Row("tree [path]", "print the directory hierarchy"),
+    Row("match <pattern> [path]", "keep lines matching (also: <prod> | match)"),
+    Row("count [path]", "count lines/words/bytes (also: <prod> | count)"),
+    Row("sort [reverse] [path]", "order lines (also: <prod> | sort)"),
+    Row("first / last [N] [path]", "keep first/last N lines (also: <prod> |)"),
+    Gap,
+    Sec("Pipes"),
+    Row("<producer> | [filter |…] <sink>", "compose stages (Appendix D)"),
+    Row("  e.g. read /f | upper", "filter a file through a service"),
+    Row("  e.g. tree / | write /out", "capture output to a file"),
+    Row("  e.g. greet | upper | write /g", "producer | filter | sink"),
+    Gap,
+    Sec("Records (typed pipes — docs/records.md)"),
+    Row("status | where mem>0", "filter the task table by field (=,!=,>,<,~)"),
+    Row("status | select name state", "keep only some columns"),
+    Row("status | sort [reverse] mem", "order rows by a column"),
+    Row("status | to json | to yaml", "render the table (default: a grid)"),
+    Gap,
+    Sec("Power"),
+    Row("reboot", "hardware reset"),
+    Gap,
+    Text("Type '<command> help' for usage + examples, '<command> version' for the version."),
+];
+
+/// Render help line `idx` (0 = the versioned header, then `HELP[idx-1]`).
+fn help_render_line(ctx: &ServiceContext, idx: usize) {
+    if idx == 0 {
+        // Rule 6 (0_conventions.md): help output's first line is `<util> <version>`.
+        ctx.console_writeln_fmt(format_args!("help {} — GodspeedOS shell commands", UTIL_VERSION));
+        return;
+    }
+    match &HELP[idx - 1] {
+        Gap => ctx.console_writeln(""),
+        Sec(s) | Text(s) => ctx.console_writeln(s),
+        Row(cmd, desc) => help_line(ctx, cmd, desc),
+    }
+}
+
+fn cmd_help(ctx: &ServiceContext, depth: u8) -> Result<(), ShellError> {
+    let total = HELP.len() + 1; // +1 for the header line
+    // Page only for a direct interactive `help` (depth 0). When help is run from a
+    // script, `assert`, or `selfcheck` (depth > 0) there is no human to press keys —
+    // the pager would block the run — so just dump it. The framebuffer console has no
+    // scrollback, so an interactive help longer than the screen scrolls its top off
+    // forever; page it then (a serial terminal has its own scrollback, but paging there
+    // is harmless and consistent). rows==0 means geometry is unknown → just print it.
+    let (rows, _cols) = ctx.console_dims();
+    let rows = rows as usize;
+    if depth > 0 || rows == 0 || total <= rows {
+        for i in 0..total { help_render_line(ctx, i); }
+        return Ok(());
+    }
+    help_pager(ctx, total, rows);
     Ok(())
+}
+
+/// `less`-style pager for `help`: render a screenful from `top`, a status line, then
+/// read a key and scroll. Space / PageDown page; Up/Down (or j/k) move a line; b /
+/// PageUp page back; g/G jump to top/bottom; q / Esc / Enter quit. Redraws by clearing
+/// (`ESC[2J`) and reprinting the viewport — the only way to scroll *up* on a console
+/// with no scrollback. Bounded: at most `total` lines, indices clamped every step.
+fn help_pager(ctx: &ServiceContext, total: usize, rows: usize) {
+    let page = rows.saturating_sub(1).max(1); // leave one row for the status line
+    let max_top = total.saturating_sub(page);
+    let mut top = 0usize;
+    loop {
+        ctx.console_write("\x1b[2J\x1b[H");
+        let end = (top + page).min(total);
+        for i in top..end { help_render_line(ctx, i); }
+        // Status line (no trailing newline so the cursor parks on it).
+        ctx.console_write_fmt(format_args!(
+            "-- {}-{}/{}  space/PgDn page, up/down line, g/G top/bottom, q quit --",
+            top + 1, end, total));
+        // Read one command key (arrows/PageUp/Down arrive as escape sequences).
+        let mut down = 0i64; // signed line delta to apply; isize via i64 to allow page jumps
+        let mut quit = false;
+        let mut to_top = false;
+        let mut to_bottom = false;
+        match ctx.console_read() {
+            b' ' | b'f' => down = page as i64,
+            b'b' => down = -(page as i64),
+            b'j' | b'\r' | b'\n' => down = 1,
+            b'k' => down = -1,
+            b'g' => to_top = true,
+            b'G' => to_bottom = true,
+            b'q' | 0x03 => quit = true,
+            0x1B => match read_escape_byte(ctx) {
+                None => quit = true, // bare ESC quits
+                Some(b'[') | Some(b'O') => match pager_csi(ctx) {
+                    PagerKey::LineDown => down = 1,
+                    PagerKey::LineUp => down = -1,
+                    PagerKey::PageDown => down = page as i64,
+                    PagerKey::PageUp => down = -(page as i64),
+                    PagerKey::Top => to_top = true,
+                    PagerKey::Bottom => to_bottom = true,
+                    PagerKey::Other => {}
+                },
+                Some(_) => {}
+            },
+            _ => {}
+        }
+        if quit { break; }
+        if to_top { top = 0; }
+        else if to_bottom { top = max_top; }
+        else {
+            let nt = top as i64 + down;
+            top = nt.clamp(0, max_top as i64) as usize;
+        }
+    }
+    // Leave a clean screen + the prompt comes from the main loop.
+    ctx.console_write("\x1b[2J\x1b[H");
+}
+
+/// Keys the pager recognises from a terminal escape sequence.
+enum PagerKey { LineUp, LineDown, PageUp, PageDown, Top, Bottom, Other }
+
+/// Parse the body of an escape sequence (after `ESC [` or `ESC O`) into a `PagerKey`.
+/// Mirrors `handle_csi`'s reader but maps to scrolling: arrows, Home/End, PageUp/Down.
+fn pager_csi(ctx: &ServiceContext) -> PagerKey {
+    const CSI_MAX: usize = 8;
+    let mut param: u16 = 0;
+    let mut final_byte = 0u8;
+    for _ in 0..CSI_MAX {
+        let c = ctx.console_read();
+        if c.is_ascii_digit() { param = param.saturating_mul(10).saturating_add((c - b'0') as u16); }
+        else if c == b';' { continue; }
+        else { final_byte = c; break; }
+    }
+    match final_byte {
+        b'A' => PagerKey::LineUp,
+        b'B' => PagerKey::LineDown,
+        b'H' => PagerKey::Top,    // Home
+        b'F' => PagerKey::Bottom, // End
+        b'~' => match param {
+            1 | 7 => PagerKey::Top,    // Home
+            4 | 8 => PagerKey::Bottom, // End
+            5 => PagerKey::PageUp,
+            6 => PagerKey::PageDown,
+            _ => PagerKey::Other,
+        },
+        _ => PagerKey::Other,
+    }
 }
 
 /// One "  command  description" row. The command is left-justified to a fixed
