@@ -28,8 +28,8 @@
 //! generation strictly monotonic across lives, so a stale cap can never match a future life.
 
 use super::cap::ResourceId;
-use super::table::{get_resource_generation, register_resource, register_resource_at_gen,
-                   revoke_resource};
+use super::table::{get_resource_generation, mark_dead_resource, register_resource,
+                   register_resource_at_gen, revoke_resource};
 use crate::smp::SpinLock;
 
 // The owner of a delegated resource is identified by its endpoint id as a raw `u64`
@@ -82,6 +82,19 @@ impl Band {
         if let Some(s) = self.owner.get_mut(slot) {
             *s = None;
         }
+    }
+
+    /// Free and return the first slot owned by `owner`, or `None` if it owns none. Used to
+    /// reclaim a dying owner's whole band one slot at a time (so the global table is updated
+    /// without holding the band lock across a second lock).
+    fn take_one_owned(&mut self, owner: OwnerId) -> Option<usize> {
+        for i in 0..DELEGATED_CAP {
+            if self.owner[i] == Some(owner) {
+                self.owner[i] = None;
+                return Some(i);
+            }
+        }
+        None
     }
 }
 
@@ -150,6 +163,29 @@ pub fn revoke_owned(id: ResourceId, caller: OwnerId) -> bool {
     true
 }
 
+/// Reclaim **every** delegated resource owned by `owner` — called from the endpoint-death
+/// path when a service dies (e.g. an `fs` restart, which is supported — Phase D). Without
+/// this, a restartable owner's resources would orphan in the band (the new instance gets a
+/// fresh endpoint id and never frees the old ones), leaking band capacity on every restart.
+/// Each freed resource is marked **Dead** (gen bump) so any outstanding cap to it fails its
+/// next use with `EndpointDead` (§7.5) — the same signal a client sees for any dead endpoint.
+/// Returns the number reclaimed. Frees one slot per lock acquisition so the band lock is never
+/// held across the global-table lock (`mark_dead_resource`).
+pub fn release_owner(owner: OwnerId) -> u32 {
+    let mut freed = 0u32;
+    loop {
+        let id = {
+            let mut band = BAND.lock();
+            band.take_one_owned(owner).map(id_of)
+        };
+        match id {
+            Some(id) => { mark_dead_resource(id); freed += 1; }
+            None => break,
+        }
+    }
+    freed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +228,25 @@ mod tests {
         let s = b.claim(ep(42)).unwrap();
         assert!(b.is_owner(s, ep(42)));
         assert!(!b.is_owner(s, ep(43)));
+    }
+
+    #[test]
+    fn take_one_owned_reclaims_only_that_owner() {
+        let mut b = Box::new(Band::new());
+        // Owner A claims two slots, owner B one — interleaved.
+        let a1 = b.claim(ep(1)).unwrap();
+        let _b1 = b.claim(ep(2)).unwrap();
+        let a2 = b.claim(ep(1)).unwrap();
+        // Drain everything owner A owns.
+        let mut drained = 0;
+        while let Some(slot) = b.take_one_owned(ep(1)) {
+            assert!(slot == a1 || slot == a2);
+            drained += 1;
+        }
+        assert_eq!(drained, 2);
+        // Owner A now owns nothing; owner B is untouched.
+        assert!(b.take_one_owned(ep(1)).is_none());
+        assert!(b.take_one_owned(ep(2)).is_some());
     }
 
     #[test]

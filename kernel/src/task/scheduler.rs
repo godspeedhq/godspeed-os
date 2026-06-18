@@ -1239,6 +1239,17 @@ pub fn kill_task_by_slot(slot: usize) {
             // Mark resource dead in global cap table so generation check fails.
             let resource_id = crate::capability::cap::ResourceId::from(ep_id);
             crate::capability::table::mark_dead_resource(resource_id);
+
+            // Reclaim every delegated resource this service owned (§7.10). A restartable
+            // owner (e.g. `fs`, Phase D) gets a fresh endpoint id on respawn and would never
+            // free the old instance's file resources, so without this they orphan in the band
+            // and leak its capacity on every restart. Each is marked Dead, so a client's stale
+            // file cap fails its next use with EndpointDead — the same signal as any dead owner.
+            let reclaimed = crate::capability::delegated::release_owner(ep_id.0);
+            if reclaimed > 0 {
+                crate::kprintln!("delegated: reclaimed {} resource(s) from dead endpoint {}",
+                    reclaimed, ep_id.0);
+            }
         }
 
         // Restartable-service death notification. `registry` (H11), and now `fs` +
