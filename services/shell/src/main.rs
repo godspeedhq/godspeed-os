@@ -564,7 +564,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         // file-as-capability (§7.10, P2): end-to-end demo + self-check on an existing file —
         // open → write/read VIA THE CAP → non-escalation (RO cap can't write) → forged-handle →
         // revoke-on-close. Prints per-step results; the harness asserts on them (Test 14).
-        "fcap"    => cmd_fcap(ctx, cwd, if argc >= 2 { args[1] } else { "" }),
+        "fcap"    => cmd_fcap(ctx, if argc >= 2 { args[1] } else { "" }),
         "ls"      => cmd_ls(ctx, cwd, if argc >= 2 { args[1] } else { "" }, &mut Out::Console),
         "write"   => cmd_write(ctx, cwd, s["write".len()..].trim()),
         "mkdir"   => {
@@ -1069,6 +1069,7 @@ fn cmd_help(ctx: &ServiceContext) -> Result<(), ShellError> {
     help_line(ctx, "result", "the last command's result (Ok / Err)");
     help_line(ctx, "run <script>", "run a script of commands (.gsh; # comments, ; separators)");
     help_line(ctx, "selfcheck", "run the built-in self-check suite");
+    help_line(ctx, "fcap", "file-as-capability self-check (diagnostic; fcap help)");
     help_line(ctx, "assert ok|fails <cmd>", "verify success/failure (also: … | assert contains X)");
     ctx.console_writeln("");
     ctx.console_writeln("System");
@@ -2444,19 +2445,49 @@ fn fc_invoke(ctx: &ServiceContext, file: CapHandle, right: u8, payload: &[u8]) -
     Some(ctx.recv())
 }
 
-/// `fcap <file>` — end-to-end demonstration AND self-check of file-as-capability (§7.10) on an
-/// existing file: open it as a real kernel capability and exercise every property the model
-/// promises. Each line is asserted by `osdev test file-cap` (§22 Test 14).
-fn cmd_fcap(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Result<(), ShellError> {
-    let mut pbuf = [0u8; PATH_MAX];
-    let path = match resolve_or_err(ctx, cwd, arg, &mut pbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
+/// `fcap` — self-contained demonstration AND self-check of file-as-capability (§7.10). It is a
+/// DIAGNOSTIC, not a file tool: it creates its own throwaway file, exercises every property the
+/// capability model promises against it, then deletes it — so it never touches a file of yours
+/// and takes no argument. Each line is asserted by `osdev test file-cap` (§22 Test 14).
+const FCAP_TMP: &[u8] = b"/.fcap-selftest";
+const FCAP_TMP_RENAMED: &[u8] = b"/.fcap-selftest.renamed";
+fn cmd_fcap_help(ctx: &ServiceContext) {
+    ctx.console_writeln("fcap - file-as-capability self-check (a diagnostic, not a file tool)");
+    ctx.console_writeln("");
+    ctx.console_writeln("usage: fcap          run the self-check");
+    ctx.console_writeln("       fcap help     this message");
+    ctx.console_writeln("");
+    ctx.console_writeln("It creates its own throwaway file, opens it as a real kernel capability,");
+    ctx.console_writeln("and verifies the file-cap model end to end (it then deletes the file):");
+    ctx.console_writeln("  - read/write THROUGH the cap (a file IS a capability, not a handle to one)");
+    ctx.console_writeln("  - non-escalation: a read-only cap cannot write (kernel AND fs both refuse)");
+    ctx.console_writeln("  - unforgeable: a fabricated handle is rejected");
+    ctx.console_writeln("  - revocable: the cap goes stale on close and on rename (no silent rebind)");
+    ctx.console_writeln("It takes no path and never touches your files. See CLAUDE.md 7.10 / Test 14.");
+}
+fn cmd_fcap(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
+    if arg.trim() == "help" { cmd_fcap_help(ctx); return Ok(()); }
+    if !arg.trim().is_empty() {
+        ctx.console_writeln("fcap: takes no argument (it uses its own throwaway file). Try `fcap help`.");
+        return Err(ShellError::Unknown);
+    }
+    let path = FCAP_TMP;
     let mut ok = true;
-    let mut fail = |ctx: &ServiceContext, m: &str| { ctx.console_writeln(m); };
+    let fail = |ctx: &ServiceContext, m: &str| { ctx.console_writeln(m); };
+
+    // 0. Create our own throwaway file so we never touch a user's file. Seed it with >=7 bytes so
+    //    the 7-byte "capdata" write-through-cap below fits the allocated extent (file-cap writes
+    //    don't grow the file). Overwrites a stale one from an aborted run; deleted again at the end.
+    if !matches!(fs_request(ctx, OP_WRITE_FILE, path, b"seeddata").as_ref().map(|r| r.payload_bytes().first().copied()),
+                 Some(Some(FS_OK))) {
+        ctx.console_writeln("fcap: FAIL create temp file (storage unavailable?)");
+        return Err(ShellError::Unknown);
+    }
 
     // 1. Open the file as a capability (fs mints a delegated resource + hands us the cap).
     let rw = match fc_open(ctx, path, RIGHT_READ | RIGHT_WRITE) {
         Some(c) => { ctx.console_writeln("fcap: opened rw (file cap)"); c }
-        None    => { ctx.console_writeln("fcap: FAIL open rw"); return Err(ShellError::Unknown); }
+        None    => { ctx.console_writeln("fcap: FAIL open rw"); let _ = fs_request(ctx, OP_DELETE, path, &[]); return Err(ShellError::Unknown); }
     };
 
     // 2. Write THROUGH the cap (FOP_WRITE needs WRITE, which rw holds).
@@ -2481,7 +2512,7 @@ fn cmd_fcap(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Result<(), ShellError
     // 4. Open a READ-ONLY cap to the same file.
     let ro = match fc_open(ctx, path, RIGHT_READ) {
         Some(c) => c,
-        None    => { fail(ctx, "fcap: FAIL open ro"); return Err(ShellError::Unknown); }
+        None    => { fail(ctx, "fcap: FAIL open ro"); ctx.remove_cap(rw); let _ = fs_request(ctx, OP_DELETE, path, &[]); return Err(ShellError::Unknown); }
     };
 
     // 5. Non-escalation, kernel layer: invoking the RO cap declaring WRITE is rejected by the
@@ -2514,16 +2545,18 @@ fn cmd_fcap(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Result<(), ShellError
     // 9. Revocable on path rebinding (confused-deputy avoidance, §7.10): renaming the file makes
     //    the old path name something else, so fs revokes the still-open `ro` cap — it can never
     //    silently rebind to a different file later created at the old path.
-    let _ = fs_request(ctx, OP_RENAME, path, b"fcap.renamed");
+    let _ = fs_request(ctx, OP_RENAME, path, b".fcap-selftest.renamed");
     match fc_invoke(ctx, ro, RIGHT_READ, &rbuf) {
         None    => ctx.console_writeln("fcap: cap revoked after rename"),
         Some(_) => { fail(ctx, "fcap: FAIL cap usable after rename"); ok = false; }
     }
 
     // Cleanup so `fcap` is leak-free and re-runnable (e.g. in selfcheck): drop both shell handles
-    // (rw revoked at close, ro revoked at rename). Otherwise each run orphans cap-table slots.
+    // (rw revoked at close, ro revoked at rename) and delete the throwaway file (now at the renamed
+    // path). Otherwise each run orphans cap-table slots and leaves a stray file behind.
     ctx.remove_cap(ro);
     ctx.remove_cap(rw);
+    let _ = fs_request(ctx, OP_DELETE, FCAP_TMP_RENAMED, &[]);
 
     if ok { ctx.console_writeln("fcap: all file-capability checks passed"); Ok(()) }
     else { Err(ShellError::Unknown) }
