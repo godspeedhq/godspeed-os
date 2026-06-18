@@ -120,21 +120,6 @@ static CORE_ACTIVE_TICKS: [CachePaddedU64; MAX_CORES] =
 static CORE_TOTAL_TICKS: [CachePaddedU64; MAX_CORES] =
     [const { CachePaddedU64(AtomicU64::new(0)) }; MAX_CORES];
 
-/// Monotonic wall-clock-ish tick: incremented ONLY by core 0's preemption-timer
-/// ISR (`timer_tick_from_irq`), never by the cooperative-yield path. Unlike
-/// `CORE_TOTAL_TICKS` (which a yielding task inflates — see the note on query 7),
-/// this advances at the true timer period (~50 ms on the T630 periodic timer,
-/// 10 ms under TSC-Deadline), so it is a usable coarse clock for userspace timing
-/// that must not be skewed by how often the caller yields — e.g. keyboard
-/// typematic auto-repeat (`sdk hid::KeyRepeat`). Exposed ungated as InspectKernel
-/// query 12, like the TSC (query 3): a task-neutral hardware tick.
-static MONOTONIC_TICKS: AtomicU64 = AtomicU64::new(0);
-
-/// Read the monotonic timer-tick counter (InspectKernel query 12).
-pub fn monotonic_ticks() -> u64 {
-    MONOTONIC_TICKS.load(Ordering::Relaxed)
-}
-
 /// Sticky round-robin scan pointer per core (§9.1, §9.3).
 ///
 /// `pick_next` starts scanning from `CORE_RR_SLOT[cid]` rather than
@@ -856,9 +841,6 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         if cid == 0 {
             crate::control::process_pending();
             crate::arch::x86_64::uart_rx_poll();
-            // Advance the monotonic clock once per core-0 preemption tick (not in
-            // the yield path), giving userspace a yield-immune coarse time base.
-            MONOTONIC_TICKS.fetch_add(1, Ordering::Relaxed);
         }
 
         let prev = CORE_CURRENT[cid].load(Ordering::Relaxed);
