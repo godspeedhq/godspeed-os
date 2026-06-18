@@ -1089,6 +1089,7 @@ fn cmd_test(suite: &str) {
         "fs-check"     => run_fs_check_test(),
         "fs-scrub"     => run_fs_scrub_test(),
         "fs-compat"    => run_fs_compat_test(),
+        "file-cap"     => run_fs_filecap_test(),
         "fs-ioretry"   => run_fs_ioretry_test(),
         "drives-raw"   => run_drives_raw_test(),
         "drives"       => run_drives_scripted_test(),
@@ -2035,6 +2036,27 @@ fn run_fs_scrub_test() {
     println!("fs-scrub: corrupted bad.txt's data block at LBA {} (good.txt left intact)", bad_block);
 
     crate::shell_test::run_fs_scrub(&image_path, persist, 4);
+}
+
+/// §22 Test 14 — file-as-capability (P2). Boot bare-metal + an AHCI disk, create a file, then run
+/// the shell's `fcap` command, which opens the file as a real kernel capability and exercises every
+/// property the model promises: read/write THROUGH the cap, non-escalation (a READ-only cap cannot
+/// write — at both the kernel and fs layers), a forged handle rejected, and revocation on close.
+fn run_fs_filecap_test() {
+    println!("\n=== fs: file-as-capability — open→read/write via cap, non-escalation, revoke (§22 Test 14) ===");
+    cmd_build_bare_metal();
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+
+    let persist = "build/tests/persist_fs_filecap.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+
+    crate::shell_test::run_fs_filecap(&image_path, persist, 4);
 }
 
 /// Set an UNKNOWN feature bit in a superblock mask and re-stamp the CRC on BOTH copies, so the

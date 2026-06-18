@@ -159,10 +159,41 @@ const OP_WRITE_AT_J: u8 = 28; // [op, plen, path, offset:u64, chunk…] — like
 const OP_SCRUB: u8 = 29;      // scrub (Phase K): READ-ONLY integrity sweep — walk the tree, verify
                              // every block's CRC, report → [FS_OK, files:u32, dirs:u32, bad:u32,
                              // scanned:u64]. Writes nothing (unlike CHECK, which repairs the bitmap).
+const OP_OPEN: u8 = 30;       // file-as-capability (§7.10, P2): [op, plen, path, rights:u8] → mint a
+                             // delegated resource for the file, reply [FS_OK] + the embedded FILE CAP.
+                             // The client then operates the file by INVOKING that cap (no fs name in
+                             // hand), the kernel badges the request with the resource id + right.
 const FS_OK: u8 = 0;
 const FS_ERR: u8 = 1;
 const FS_NOTFOUND: u8 = 2;
 const FS_NOFS: u8 = 3;
+const FS_DENIED: u8 = 4;     // op requires a right the file cap lacks (non-escalation, §7.3)
+
+// File-cap operations — the FIRST payload byte of a badged `ResourceInvoke` (§7.10). The kernel
+// has already validated the cap holds the invoked right; fs enforces that the op needs ≤ that right.
+const FOP_READ: u8 = 1;  // [FOP_READ, offset:u64, len:u32]      → [FS_OK, n:u32, bytes]   (needs READ)
+const FOP_WRITE: u8 = 2; // [FOP_WRITE, offset:u64, chunk…]      → [FS_OK]                 (needs WRITE)
+const FOP_STAT: u8 = 3;  // [FOP_STAT]                           → [FS_OK, size:u64]       (needs READ)
+const FOP_CLOSE: u8 = 4; // [FOP_CLOSE]  → [FS_OK]; revoke the resource + free the open-file slot (any holder)
+
+// Capability right bits — MUST match the kernel `Rights` bitfield (§7.4) and the SDK `RIGHT_*`.
+const RIGHT_READ: u8 = 1 << 0;
+const RIGHT_WRITE: u8 = 1 << 1;
+const RIGHT_GRANT: u8 = 1 << 4;
+
+// Open-file table (file-as-capability): maps a delegated `ResourceId` → the file path it names, so
+// a badged invoke (which carries only the resource id) resolves to a file. Bounded (§26.6): at most
+// MAX_OPEN files open at once; the path is re-walked per op (handles the file being moved/deleted —
+// the walk simply fails then). Lives on `Fs` (owned state, not a static — §3.9), reset on mount (an
+// fs restart kills all outstanding file caps, §14.3, so the table starts empty).
+const MAX_OPEN: usize = 64;
+const OPEN_PATH_MAX: usize = 96;
+#[derive(Clone, Copy)]
+struct OpenFile {
+    rid: u64, // 0 = free slot
+    plen: u8,
+    path: [u8; OPEN_PATH_MAX],
+}
 
 /// In-memory superblock view. No inode table — the tree lives on disk and is read on
 /// demand; the bitmap likewise (this struct holds only geometry + the maintained free
@@ -200,6 +231,9 @@ struct Fs {
     // `commit_txn` right after the commit record is durable but before the checkpoint, to
     // simulate a power loss at the worst moment. Always false in production.
     crash_after_commit: bool,
+    // Open-file table (file-as-capability, §7.10): delegated ResourceId → file path. `rid == 0`
+    // is a free slot. Reset on mount (an fs restart invalidates all outstanding file caps).
+    open_files: [OpenFile; MAX_OPEN],
 }
 
 /// A decoded `file_record` plus where it lives, so it can be written back. `loc == None`
@@ -269,11 +303,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("fs: serving file API");
     loop {
         let msg = ctx.recv();
+        // A delegated-resource badge (§7.10) is set ONLY by the kernel after it validated a real
+        // file cap — so its presence means "this is a trusted file-cap invocation", impossible to
+        // forge over the ordinary fs send-cap. No badge → a name-addressed request.
+        let badge = ctx.last_recv_badge();
         let reply = match ctx.take_pending_cap() {
             Some(c) => c,
             None => continue,
         };
-        serve(&ctx, &mut fs, capacity, msg.payload_bytes(), reply);
+        match badge {
+            Some((rid, right)) => serve_filecap(&ctx, &mut fs, rid, right, msg.payload_bytes(), reply),
+            None => serve(&ctx, &mut fs, capacity, msg.payload_bytes(), reply),
+        }
         ctx.remove_cap(reply);
     }
 }
@@ -772,6 +813,82 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
         // delete_tree manages its own transactions (unlink + batched frees) — not wrapped.
         OP_DELETE_TREE => send(&[match fs.delete_tree(ctx, path) { Ok(()) => FS_OK, Err(_) => FS_ERR }]),
         OP_MOVE => txn!(fs.move_path(ctx, path, tail)),
+        OP_OPEN => {
+            // [op, plen, path, rights:u8] → mint a delegated resource for the file and reply
+            // [FS_OK] with the FILE CAP embedded; the client then operates the file by invoking
+            // that cap (§7.10). `open_file` sends its own reply (it must embed the cap), so we
+            // only send FS_ERR if it failed before replying.
+            let want = if tail.is_empty() { 0 } else { tail[0] & (RIGHT_READ | RIGHT_WRITE) };
+            if fs.open_file(ctx, path, want, reply).is_err() { send(&[FS_ERR]); }
+        }
+        _ => send(&[FS_ERR]),
+    }
+}
+
+/// Serve a **file-cap invocation** (§7.10) — a message the kernel badged with the delegated
+/// `resource_id` + the `right` it validated. The badge is unforgeable (set only by the kernel
+/// after the cap check), so reaching here means the caller holds a real, live cap. We resolve the
+/// resource id → the open file's path, enforce that the operation needs **≤ the validated right**
+/// (the load-bearing non-escalation check, §7.3 — a READ cap can never write), and act.
+fn serve_filecap(ctx: &ServiceContext, vol: &mut Option<Fs>, rid: u64, right: u8, p: &[u8], reply: CapHandle) {
+    let send = |bytes: &[u8]| { let _ = ctx.send_by_handle(reply, &Message::from_bytes(bytes)); };
+    let fs = match vol { Some(f) => f, None => { send(&[FS_NOFS]); return; } };
+    if p.is_empty() { send(&[FS_ERR]); return; }
+    let fop = p[0];
+
+    // FOP_CLOSE needs no path (the holder retires its own handle).
+    if fop == FOP_CLOSE {
+        let _ = ctx.resource_revoke(rid); // gen bump → this cap (and any copies) go stale
+        fs.open_free(rid);
+        send(&[FS_OK]);
+        return;
+    }
+
+    // Resolve the resource id → path (copied out, so `fs` can be borrowed mutably below).
+    let (path_buf, plen) = match fs.open_path(rid) {
+        Some(x) => x,
+        None    => { send(&[FS_NOTFOUND]); return; } // unknown/closed resource
+    };
+    let path = &path_buf[..plen];
+
+    match fop {
+        FOP_READ => {
+            if right & RIGHT_READ == 0 { send(&[FS_DENIED]); return; } // op needs READ
+            if p.len() < 13 { send(&[FS_ERR]); return; }
+            let offset = u64_at(p, 1);
+            let len = (u32_at(p, 9) as usize).min(MAX_FILE_BYTES);
+            let mut buf = [0u8; MAX_FILE_BYTES];
+            match fs.read_at(ctx, path, offset, len, &mut buf) {
+                Some(n) => {
+                    let mut out = [0u8; 5 + MAX_FILE_BYTES];
+                    out[0] = FS_OK;
+                    out[1..5].copy_from_slice(&(n as u32).to_le_bytes());
+                    out[5..5 + n].copy_from_slice(&buf[..n]);
+                    send(&out[..5 + n]);
+                }
+                None => send(&[FS_NOTFOUND]),
+            }
+        }
+        FOP_WRITE => {
+            if right & RIGHT_WRITE == 0 { send(&[FS_DENIED]); return; } // ← non-escalation: a READ cap can't write
+            if fs.read_only { send(&[FS_ERR]); return; }
+            if p.len() < 9 { send(&[FS_ERR]); return; }
+            let offset = u64_at(p, 1);
+            let chunk = &p[9..];
+            send(&[match fs.write_at(ctx, path, offset, chunk, false) { Ok(()) => FS_OK, Err(_) => FS_ERR }]);
+        }
+        FOP_STAT => {
+            if right & RIGHT_READ == 0 { send(&[FS_DENIED]); return; }
+            match fs.walk(ctx, path) {
+                Some(e) => {
+                    let mut out = [0u8; 9];
+                    out[0] = FS_OK;
+                    out[1..9].copy_from_slice(&e.size.to_le_bytes());
+                    send(&out);
+                }
+                None => send(&[FS_NOTFOUND]),
+            }
+        }
         _ => send(&[FS_ERR]),
     }
 }
@@ -864,6 +981,7 @@ impl Fs {
             txn_lba: [0; TXN_CAP],
             txn_blk: [[0u8; BLOCK]; TXN_CAP],
             crash_after_commit: false,
+            open_files: [OpenFile { rid: 0, plen: 0, path: [0u8; OPEN_PATH_MAX] }; MAX_OPEN],
         })
     }
 
@@ -1753,6 +1871,63 @@ impl Fs {
         Err("entry not found")
     }
 
+    // ── file-as-capability: open-file table (§7.10) ───────────────────────────
+    /// Open an existing file `path`: mint a delegated resource owned by fs, record
+    /// `resource_id → path`, and reply `[FS_OK]` with the **file cap embedded** for the client.
+    /// The client operates the file by invoking that cap (the kernel badges the request with the
+    /// resource id + right; `serve_filecap` resolves it back here). Minted with `GRANT` so fs can
+    /// transfer a copy; fs drops its own copy afterward (it serves via the badge, not the cap).
+    fn open_file(&mut self, ctx: &ServiceContext, path: &[u8], want: u8, reply: CapHandle)
+        -> Result<(), &'static str> {
+        let e = self.walk(ctx, path).ok_or("not found")?;
+        if !is_file(e.itype) { return Err("not a file"); }
+        if path.len() > OPEN_PATH_MAX { return Err("path too long"); }
+        let slot = self.open_files.iter().position(|o| o.rid == 0).ok_or("too many open files")?;
+        let (rid, cap) = ctx.resource_mint(want | RIGHT_GRANT).ok_or("mint failed")?;
+        let mut of = OpenFile { rid, plen: path.len() as u8, path: [0u8; OPEN_PATH_MAX] };
+        of.path[..path.len()].copy_from_slice(path);
+        self.open_files[slot] = of;
+        // Hand a derived copy to the client; drop fs's original either way.
+        let granted = match ctx.derive_cap(cap) {
+            Some(c) => ctx.send_with_cap_by_handle(reply, c, &Message::from_bytes(&[FS_OK])).is_ok(),
+            None    => false,
+        };
+        ctx.remove_cap(cap);
+        if !granted {
+            self.open_files[slot].rid = 0;
+            let _ = ctx.resource_revoke(rid); // nothing was handed out — undo the mint
+            return Err("grant failed");
+        }
+        Ok(())
+    }
+
+    /// Resolve a delegated resource id → its file path (copied out so `self` can be reborrowed).
+    fn open_path(&self, rid: u64) -> Option<([u8; OPEN_PATH_MAX], usize)> {
+        self.open_files.iter()
+            .find(|o| o.rid != 0 && o.rid == rid)
+            .map(|o| (o.path, o.plen as usize))
+    }
+
+    /// Free the open-file slot for `rid` (after a close/revoke). Idempotent.
+    fn open_free(&mut self, rid: u64) {
+        if rid == 0 { return; }
+        for o in self.open_files.iter_mut() {
+            if o.rid == rid { o.rid = 0; }
+        }
+    }
+
+    /// Revoke every open file cap naming `path` — called on delete, so deleting a file a client
+    /// holds open makes its cap fail with `CapRevoked` on next use (the revocable property, §7.5).
+    fn revoke_open_by_path(&mut self, ctx: &ServiceContext, path: &[u8]) {
+        for i in 0..MAX_OPEN {
+            let o = self.open_files[i];
+            if o.rid != 0 && &o.path[..o.plen as usize] == path {
+                let _ = ctx.resource_revoke(o.rid);
+                self.open_files[i].rid = 0;
+            }
+        }
+    }
+
     fn delete(&mut self, ctx: &ServiceContext, path: &[u8]) -> Result<(), &'static str> {
         let e = self.walk(ctx, path).ok_or("not found")?;
         if e.loc.is_none() { return Err("cannot delete root"); }
@@ -1761,6 +1936,7 @@ impl Fs {
         }
         let (parent, name) = self.walk_parent(ctx, path).ok_or("not found")?;
         self.dir_remove(ctx, &parent, name)?;
+        self.revoke_open_by_path(ctx, path); // invalidate any open file caps to the deleted file
         self.free_file(ctx, &e)
     }
 
@@ -1779,6 +1955,7 @@ impl Fs {
         self.begin_txn();
         let r = self.dir_remove(ctx, &parent, name);
         self.end_txn(ctx, r)?;
+        self.revoke_open_by_path(ctx, path); // invalidate any open file caps to the deleted entry
         // Reclaim the unreachable subtree in bounded transactions. A crash here only leaks
         // blocks (nothing references them) — never corruption.
         self.free_subtree(ctx, e.itype, e.first_block, e.block_count, 0)

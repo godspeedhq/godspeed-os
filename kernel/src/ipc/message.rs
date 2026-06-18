@@ -26,6 +26,14 @@ pub struct Message {
     /// Capabilities embedded in this message (transferred via GRANT).
     pub caps: [Option<Capability>; MAX_EMBEDDED_CAPS],
     pub cap_count: usize,
+    /// Delegated-resource badge (§7.10, file-as-capability). Set **only** by the kernel's
+    /// `ResourceInvoke` handler, after it validates the caller's cap — `0` for every ordinary
+    /// `send`/`try_send`. This is what lets the owning service trust that a badged message is a
+    /// kernel-validated invocation of a real cap, not a payload a client forged over a plain send:
+    /// the normal send path cannot set it. `badge_id` is the delegated `ResourceId`; `badge_right`
+    /// is the cap right the kernel validated for this invocation (the owner enforces op ≤ right).
+    pub badge_id: u64,
+    pub badge_right: u8,
 }
 
 impl core::fmt::Debug for Message {
@@ -44,6 +52,8 @@ impl Message {
             payload_len: payload.len(),
             caps: [None; MAX_EMBEDDED_CAPS],
             cap_count: 0,
+            badge_id: 0,
+            badge_right: 0,
         };
         msg.payload[..payload.len()].copy_from_slice(payload);
         Ok(msg)
@@ -63,6 +73,8 @@ impl Message {
             payload_len: 1,
             caps:        [None; MAX_EMBEDDED_CAPS],
             cap_count:   0,
+            badge_id:    0,
+            badge_right: 0,
         };
         msg.payload[0] = irq;
         msg
