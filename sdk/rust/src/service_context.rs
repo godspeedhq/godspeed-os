@@ -295,6 +295,17 @@ impl ServiceContext {
         }
     }
 
+    /// Non-blocking receive on this service's primary recv endpoint: `Some(msg)` if a
+    /// message was waiting, `None` if the queue is empty. A busy-polling driver uses this
+    /// to drain interrupt events (§12) each loop iteration without blocking.
+    pub fn try_recv(&self) -> Option<Message> {
+        let data = Self::ctx();
+        if data.magic != SERVICE_CTX_MAGIC { return None; }
+        let slot = data.recv_slot;
+        if slot == u32::MAX { return None; }
+        crate::ipc::try_recv(CapHandle(slot)).ok().flatten()
+    }
+
     /// Block until a message arrives; returns the error instead of looping silently.
     pub fn recv_result(&self) -> Result<Message, crate::ipc::IpcError> {
         let data = Self::ctx();

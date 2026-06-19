@@ -399,12 +399,14 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
-            // Pin to core 1: the poll loop busy-spins (no interrupt wired yet),
-            // so keep it off core 0 where the shell + TCB live (§9.2).
+            // Pin to core 1: keep the driver off core 0 where the shell + TCB live (§9.2).
             preferred_core:    1,
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
+            // Route the xHCI MSI (interrupts::XHCI_MSI_VECTOR = 0x28) to this driver's recv
+            // endpoint (§12). The kernel programmed the controller's MSI-X to this vector at
+            // boot; the driver enables the controller's interrupter and drains the events.
+            hw_irqs:           &[0x28],
             has_console_read:  false,
         })),
         // `ehci` — userspace USB 2.0 driver (§12) for the back ports' EHCI

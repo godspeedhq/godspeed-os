@@ -33,6 +33,11 @@ const OP_CONFIG: usize = 0x38;
 const OP_PORTSC_BASE: usize = 0x400; // PORTSC[n] = base + n*0x10
 
 const CMD_RS: u32 = 1 << 0;
+// Interrupter enable (P2, interrupt-driven USB §12). The kernel programmed the controller's
+// MSI-X to deliver to vector 0x28; these turn the controller's interrupt generation on.
+const CMD_INTE: u32 = 1 << 2; // USBCMD: global interrupter enable
+const IMAN_IE: u32 = 1 << 1;  // Interrupter 0 Management: Interrupt Enable
+const IMAN_IP: u32 = 1 << 0;  // Interrupter 0 Management: Interrupt Pending (write 1 to clear)
 const CMD_HCRST: u32 = 1 << 1;
 const STS_HCH: u32 = 1 << 0;
 const STS_CNR: u32 = 1 << 11;
@@ -684,8 +689,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         mmio.write64(ir0 + 0x10, dma.phys_at(ERST_OFF));
         mmio.write64(ir0 + 0x18, dma.phys_at(EVENT_RING_OFF));
         mmio.write32(op + OP_CONFIG, max_slots);
+        // P2 (interrupt-driven, §12): enable the interrupter so the controller raises its
+        // MSI-X (kernel-programmed to vector 0x28) when it posts an event. IMAN: IE on, write
+        // 1 to IP to clear any stale pending; USBCMD.INTE gates interrupts globally. The poll
+        // loop still runs and acks (clears IMAN.IP) — belt-and-suspenders until P4.
+        mmio.write32(ir0 + 0x00, IMAN_IE | IMAN_IP);
         let c = mmio.read32(op + OP_USBCMD);
-        mmio.write32(op + OP_USBCMD, c | CMD_RS);
+        mmio.write32(op + OP_USBCMD, c | CMD_RS | CMD_INTE);
         spin(|| mmio.read32(op + OP_USBSTS) & STS_HCH == 0);
 
         // Fresh ring bookkeeping for this pass.
@@ -792,6 +802,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 present |= 1 << p;
             }
         }
+        let mut int_logged = false; // log the first MSI-X interrupt once (P2 proof)
         'poll: loop {
             // (Re-)arm each device's interrupt ring as needed.
             for d in 0..ndev {
@@ -882,6 +893,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             for d in 0..ndev {
                 if !devs[d].is_mouse {
                     kb_rep[d].poll(now, |ch| ctx.console_push(ch));
+                }
+            }
+            // P2 (interrupt-driven, §12): drain any interrupt events the kernel routed to us
+            // (MSI-X → vector 0x28 → IPC). Proves the interrupt fires and reaches the driver.
+            // Ack by clearing IMAN.IP (keep IE) so the next event re-arms. The poll path above
+            // still processes the event ring and manages ERDP/EHB — belt-and-suspenders.
+            while ctx.try_recv().is_some() {
+                mmio.write32(ir0 + 0x00, IMAN_IE | IMAN_IP);
+                if !int_logged {
+                    ctx.log("xhci: MSI-X interrupt received (P2: interrupt path live)");
+                    int_logged = true;
                 }
             }
             ctx.yield_cpu();

@@ -76,6 +76,30 @@ pub fn recv(endpoint: CapHandle) -> Result<Message, IpcError> {
     }
 }
 
+/// Non-blocking `recv`: return `Ok(None)` immediately if the endpoint queue is empty,
+/// `Ok(Some(msg))` if a message was waiting. (syscall 34 — `try_recv`) Lets a busy-polling
+/// driver drain interrupt events (§12) without giving up its loop.
+pub fn try_recv(endpoint: CapHandle) -> Result<Option<Message>, IpcError> {
+    const TRY_RECV_EMPTY: i64 = -1000; // kernel sentinel for an empty queue
+    let mut payload = [0u8; MAX_PAYLOAD];
+    // SAFETY: raw_syscall(34) = TryRecv; buf is a valid stack slice within user space.
+    let ret = unsafe {
+        raw_syscall(
+            34,
+            endpoint.0 as u64,
+            payload.as_mut_ptr() as u64,
+            MAX_PAYLOAD as u64,
+        )
+    };
+    if ret == TRY_RECV_EMPTY {
+        Ok(None)
+    } else if ret < 0 {
+        Err(i64_to_ipc_error(ret))
+    } else {
+        Ok(Some(Message::from_bytes(&payload[..ret as usize])))
+    }
+}
+
 /// Send a message to `endpoint`; block if the queue is full. (§8.2 — `send`)
 pub fn send(endpoint: CapHandle, msg: &Message) -> Result<(), IpcError> {
     let payload = msg.payload_bytes();

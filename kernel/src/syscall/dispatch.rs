@@ -59,6 +59,7 @@ pub enum SyscallNumber {
     ResourceInvoke      = 31,
     ResourceRevoke      = 32,
     LastRecvBadge       = 33,
+    TryRecv             = 34,
 }
 
 /// Raw syscall dispatcher — called from the SYSCALL/SYSENTER IDT stub.
@@ -78,6 +79,7 @@ pub unsafe extern "C" fn syscall_handler(
     match number {
         n if n == SyscallNumber::Send           as u64 => handle_send(arg0, arg1, arg2),
         n if n == SyscallNumber::Recv           as u64 => handle_recv(arg0, arg1, arg2),
+        n if n == SyscallNumber::TryRecv        as u64 => handle_try_recv(arg0, arg1, arg2),
         n if n == SyscallNumber::TrySend        as u64 => handle_try_send(arg0, arg1, arg2),
         n if n == SyscallNumber::Yield          as u64 => {
             crate::task::scheduler::yield_current();
@@ -304,6 +306,53 @@ fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
             }
             Err(e) => return ipc_err_to_i64(e),
         }
+    }
+}
+
+/// Sentinel returned by `TryRecv` when the endpoint queue is empty (distinct from a
+/// 0-byte message, which is a valid non-negative length, and from the small-negative
+/// cap/IPC error codes).
+pub const TRY_RECV_EMPTY: i64 = -1000;
+
+/// Non-blocking `recv` (syscall 34). Identical to `handle_recv` except it returns
+/// `TRY_RECV_EMPTY` instead of blocking when the queue is empty — so a busy-polling driver
+/// can drain interrupt events (§12) without giving up its loop. Same args as `recv`.
+fn handle_try_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
+    let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::RECV) {
+        Ok(c)  => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    crate::invariants::assertions::assert_cap_validated(&Ok(()));
+    let endpoint_id = EndpointId(cap.resource_id.0);
+
+    let buf_len = out_len as usize;
+    if buf_len == 0 || buf_len > MAX_MESSAGE_SIZE { return -1; }
+    if !validate_user_ptr(out_buf, buf_len) { return -1; }
+
+    let my_slot = scheduler::current_task_slot();
+    match crate::ipc::routing::dequeue(endpoint_id, cap.generation, Some(my_slot)) {
+        Ok((msg, sender_to_wake)) => {
+            if let Some(slot) = sender_to_wake {
+                scheduler::wake_by_slot(slot, 0);
+            }
+            scheduler::set_last_recv_badge(msg.badge_id, msg.badge_right);
+            let n_caps = msg.cap_count.min(msg.caps.len());
+            for i in 0..n_caps {
+                if let Some(embedded_cap) = msg.caps[i] {
+                    if let Ok(new_slot) = scheduler::current_task_insert_cap(embedded_cap) {
+                        scheduler::push_pending_recv_cap(new_slot as u32);
+                    }
+                }
+            }
+            let payload  = msg.payload_bytes();
+            let copy_len = payload.len().min(buf_len);
+            if !write_user_bytes(out_buf, &payload[..copy_len]) {
+                return -1;
+            }
+            copy_len as i64
+        }
+        Err(IpcError::QueueEmpty) => TRY_RECV_EMPTY,
+        Err(e) => ipc_err_to_i64(e),
     }
 }
 
