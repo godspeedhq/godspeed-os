@@ -293,7 +293,7 @@ static mut CORE_SCHED_CTX: [TaskContext; MAX_CORES] = [const {
 /// Read the local APIC ID register and look up the assigned core index.
 ///
 /// Must only be called after `init_local_apic` on this core.
-fn current_core_id() -> usize {
+pub fn current_core_id() -> usize {
     // SAFETY: APIC is mapped before the scheduler ever runs on any core.
     let lapic_id = unsafe { crate::arch::x86_64::boot::get_lapic_id() };
     crate::smp::core::lapic_to_core_id(lapic_id) as usize
