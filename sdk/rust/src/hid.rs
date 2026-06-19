@@ -203,6 +203,16 @@ pub fn decode_keyboard(
     mut emit: impl FnMut(u8),
     mut on_unmapped: impl FnMut(u8),
 ) {
+    // Reject an invalid report before decoding it. Byte 1 of a USB HID boot-keyboard report is
+    // reserved and is always 0; an all-`0xff` report (byte 1 == 0xff) is the signature of a
+    // failed/stale DMA read — what the buffer returns when the device has gone (e.g. mid-unplug)
+    // or the endpoint's buffer wasn't refreshed. Decoding it would spew 0xff "keystrokes" to the
+    // console AND corrupt `last` (poisoning edge-detection so later real keys diff wrong and
+    // never register). Drop it untouched: don't emit, don't update `last`, don't disarm repeat —
+    // so the next genuine report decodes cleanly.
+    if report[1] != 0 {
+        return;
+    }
     let mods = report[0];
     let cur = [report[2], report[3], report[4], report[5], report[6], report[7]];
     for &k in cur.iter() {
