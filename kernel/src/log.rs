@@ -53,20 +53,53 @@ impl RingBuffer {
     }
 }
 
-impl fmt::Write for RingBuffer {
+static RING: SpinLock<RingBuffer> = SpinLock::new(RingBuffer::new());
+
+/// Bytes a single log message stages for serial before flushing atomically. Covers any
+/// kernel log line and the 256-byte service-log cap (+`\n`) in one flush; a longer
+/// message flushes in chunks of this size (still far better than per-byte).
+const SERIAL_STAGE: usize = 512;
+
+/// `fmt::Write` sink for one log message: appends every byte to the ring buffer (the
+/// drain-to-logger sink) and stages it for serial, flushing the staged bytes to COM1 in a
+/// **single `SERIAL_LOCK` hold** so a concurrent console write (the shell prompt, `observe`)
+/// cannot split the message mid-character. Previously the serial mirror was per-byte, taking
+/// and releasing the lock for each byte, which let console output interleave into the gaps
+/// and garble the boot log.
+struct LogSink<'a> {
+    ring: &'a mut RingBuffer,
+    stage: [u8; SERIAL_STAGE],
+    n: usize,
+}
+
+impl LogSink<'_> {
+    fn flush(&mut self) {
+        if self.n > 0 {
+            crate::arch::x86_64::serial_write_bytes_lockfree(&self.stage[..self.n]);
+            self.n = 0;
+        }
+    }
+}
+
+impl fmt::Write for LogSink<'_> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        for b in s.bytes() {
-            self.write_byte(b);
-            crate::arch::x86_64::serial_write_byte(b);
+        for &b in s.as_bytes() {
+            self.ring.write_byte(b);
+            if self.n == SERIAL_STAGE {
+                self.flush();
+            }
+            self.stage[self.n] = b;
+            self.n += 1;
         }
         Ok(())
     }
 }
 
-static RING: SpinLock<RingBuffer> = SpinLock::new(RingBuffer::new());
-
 pub fn write_fmt(args: fmt::Arguments) {
-    let _ = RING.lock().write_fmt(args);
+    let mut ring = RING.lock();
+    let mut sink = LogSink { ring: &mut ring, stage: [0u8; SERIAL_STAGE], n: 0 };
+    let _ = sink.write_fmt(args);
+    sink.flush();
 }
 
 /// Drain the ring buffer into the logger service endpoint once it is ready.
