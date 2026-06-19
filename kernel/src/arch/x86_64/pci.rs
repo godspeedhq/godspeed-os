@@ -606,9 +606,13 @@ pub fn route_ehci_intx() {
         return;
     }
     let vector = crate::arch::x86_64::interrupts::EHCI_MSI_VECTOR;
-    // Deliver to the EHCI driver's own core (core 1) — see usb_irq_dest_lapic: a keypress then
-    // wakes that core directly from its idle hlt, no cross-core wake needed.
-    let dest = usb_irq_dest_lapic();
+    // Deliver to the BSP (core 0) — a legacy PCI INTx pin routes through the IOAPIC only to the
+    // BSP on this hardware (unlike an MSI, which can target any core). The EHCI driver is pinned
+    // to core 0 to match (task/mod.rs), so the keypress wakes core 0 from its idle hlt, deliver()
+    // runs on core 0, and the wake to the core-0 driver is local — no cross-core wake (which an
+    // idle, halted AP doesn't service promptly). Verified on the T630: INTx delivers to the BSP;
+    // routing it to an AP's LAPIC id silently dropped it.
+    let dest = crate::arch::x86_64::ioapic::bsp_lapic_id();
     let legacy = EHCI_IRQ.load(Ordering::Relaxed);
 
     // Legacy INTx only asserts the device's INTx# pin when PCI Command bit 10 (Interrupt

@@ -411,13 +411,18 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // `ehci` — userspace USB 2.0 driver (§12) for the back ports' EHCI
         // controller. Same shape as `xhci`; the kernel grants its MMIO/DMA at
-        // spawn (E1b+). Pinned to core 1, off the shell/TCB on core 0.
+        // spawn (E1b+). **Pinned to core 0 (the BSP)** — unlike the MSI-based xHCI (core 1),
+        // the EHCI has only legacy PCI INTx, and on this hardware the IOAPIC delivers a legacy
+        // INTx pin only to the BSP. The driver blocks on its interrupt (§12), and an idle core
+        // wakes only on an interrupt to *itself* (ARAT `hlt` idle), so the driver must live on
+        // the core its interrupt lands on. INTx→BSP→deliver-on-core-0→local wake (route_ehci_intx
+        // targets the BSP to match). xHCI's MSI can target core 1, so it stays there.
         "ehci" => Some(("ehci", ServiceConfig {
             elf:               include_bytes!(env!("SVC_EHCI_ELF")),
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
-            preferred_core:    1,
+            preferred_core:    0,
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
             // Route the EHCI INTx (interrupts::EHCI_MSI_VECTOR = 0x29, IOAPIC-routed) to this
