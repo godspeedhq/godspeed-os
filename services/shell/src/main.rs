@@ -2179,11 +2179,12 @@ fn cmd_observe_now(ctx: &ServiceContext) -> Result<(), ShellError> {
 /// `observe` (live) — broker the full-screen foreground view (Stage 2c).
 ///
 /// The shell is the capability-broker (Appendix B.3): it lends the keyboard to
-/// the foreground child by *not reading it* while the child runs, then takes it
-/// back. We spawn `observe-live` (which owns the screen: hides the cursor,
-/// suppresses echo, repaints, polls `q`), then wait — without touching
-/// `console_read` — until it parks (q pressed → it restored the console and
-/// parked) or dies. Then we clean up and our read loop resumes.
+/// the foreground child by owning `q` ourselves. We spawn `observe-live` (which paints the
+/// screen — hides the cursor, suppresses echo, repaints — but does NOT read input), then poll
+/// the console for `q` and kill it when pressed. The shell, not the child, reads the keyboard
+/// here (one reader, no race), and both we and the child SLEEP between polls so core 0 halts
+/// while `observe` is up — otherwise a busy wait would peg the core and make every task on it
+/// read as ~100% in observe's own display. Then we restore the screen and our read loop resumes.
 fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
     let _ = ctx.kill("observe-live"); // clear any stale instance
     if ctx.spawn("observe-live").is_err() {
@@ -2191,28 +2192,26 @@ fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
         return Err(ShellError::Unknown);
     }
     if let Some(slot) = find_running_slot(ctx, "observe-live") {
-        // Wait for the foreground child to finish. The bound is the child's
-        // lifetime — it parks on `q` (state 2) or dies (invalid); the large count
-        // is a paranoid safety net so a hung child can never wedge the shell
-        // forever. We must NOT call console_read here: the child owns the keyboard.
+        // Own `q` while the child paints. The bound is a paranoid safety net so a hung child can
+        // never wedge the shell forever; normally we break on `q` (or if the child dies).
         for _ in 0..u32::MAX {
-            // Sleep (don't busy-yield) between checks: the foreground child owns the screen and
-            // we have nothing to do but wait for it to park, so let core 0 halt in between —
-            // otherwise the shell pegs core 0 the whole time `observe` is up (~50 ms latency on
-            // noticing the child parked is invisible). ~50 ms at 2 GHz.
+            // Sleep (don't busy-yield) so core 0 halts between polls. ~50 ms `q` latency.
             ctx.sleep(100_000_000);
-            let st = ctx.task_stat(slot);
-            if !st.valid || st.state == 2 {
-                break;
+            // Drain the console; quit on `q`/`Q` (other keys are discarded — observe takes no
+            // other input). Echo is off (the child disabled it), so nothing smears the frame.
+            let mut quit = false;
+            while let Some(b) = ctx.try_console_read() {
+                if b == b'q' || b == b'Q' { quit = true; }
             }
+            if quit { break; }
+            if !ctx.task_stat(slot).valid { break; } // child died unexpectedly
         }
     }
-    let _ = ctx.kill("observe-live"); // reap the parked instance
-    // Defensive: restore the console even if the child died mid-view without
-    // restoring it (cursor visible) so the shell stays usable. Echo stays OFF —
-    // the shell, not the kernel, owns echo (it echoes printable bytes itself).
+    let _ = ctx.kill("observe-live"); // reap the child (it never exits on its own)
+    // Restore the console the child left in raw mode: show the cursor and drop below the last
+    // frame so the prompt lands cleanly. Echo stays OFF — the shell, not the kernel, owns echo.
     ctx.console_echo(false);
-    ctx.console_write("\x1b[?25h");
+    ctx.console_write("\x1b[?25h\r\n");
     Ok(())
 }
 
