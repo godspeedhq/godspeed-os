@@ -78,10 +78,14 @@ const MAX_HID: usize = 2;
 /// per-machine calibration needed. read_tsc is hardware-proven to advance (perf §22).
 const REPEAT_INITIAL_CYCLES: u64 = 600_000_000;
 const REPEAT_INTERVAL_CYCLES: u64 = 100_000_000;
-/// Idle block timeout (P4): when no key is held the driver blocks on its interrupt this long
-/// before waking to re-check hot-plug — a safety net in case a port change doesn't raise an
-/// interrupt. ~1 s at ~2 GHz; the wake costs nothing, so the core stays ~idle.
-const HOTPLUG_POLL_CYCLES: u64 = 2_000_000_000;
+/// Block-loop wake cadence (P4). The driver blocks on recv_timeout instead of busy-spinning,
+/// so the core idles. The kernel's PER-CORE timed-wait (scheduler::scan_timed_wakes on this
+/// driver's own core) guarantees a wake every POLL_INTERVAL_CYCLES; the MSI interrupt — when
+/// its cross-core delivery lands (it targets the BSP, the driver runs on core 1) — wakes us
+/// sooner as a bonus. We pace at a brisk ~30 ms (≈33 wakes/s, negligible CPU vs the old ~99%
+/// busy-poll) rather than a long idle timeout, because the timed-wait is the wake we rely on
+/// for responsive typing and hot-plug, not the not-relied-upon cross-core interrupt.
+const POLL_INTERVAL_CYCLES: u64 = 60_000_000;
 const DEV_BASE: usize = 0x7000;
 const DEV_STRIDE: usize = 0x4000; // 4 pages: device ctx, EP0 ring, int ring, report
 fn device_ctx_off(i: usize) -> usize { DEV_BASE + i * DEV_STRIDE }
@@ -835,9 +839,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // auto-repeats; the keyboard is silent while held), a long one otherwise (idle,
             // with an occasional hot-plug re-check as a safety net). This is what drops the
             // core from ~100% busy-poll to ~0% idle.
-            let any_held = (0..ndev).any(|d| !devs[d].is_mouse && kb_rep[d].armed());
-            let timeout = if any_held { REPEAT_INTERVAL_CYCLES } else { HOTPLUG_POLL_CYCLES };
-            let _ = ctx.recv_timeout(timeout);
+            let _ = ctx.recv_timeout(POLL_INTERVAL_CYCLES);
             // Drain any further queued interrupt events so the next recv_timeout truly idles.
             while ctx.try_recv().is_some() {}
             // Ack the interrupter (clear IP, keep IE) BEFORE draining the ring, so an event

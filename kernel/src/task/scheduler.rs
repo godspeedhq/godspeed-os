@@ -73,9 +73,20 @@ static mut TASK_ENDPOINT: [Option<EndpointId>; MAX_TASKS] =
 static TASK_WAKE_DEADLINE: [AtomicU64; MAX_TASKS] =
     [const { AtomicU64::new(0) }; MAX_TASKS];
 
-/// Arm a timed wake for `slot` at TSC `deadline` (0 disarms).
+/// The core that armed each slot's timed wake (`0xFF` = none). Recorded so the per-core
+/// `scan_timed_wakes` (run on each core) only acts on deadlines its own TSC set — the deadline
+/// is a TSC value and AMD cores need not share a TSC, so a deadline must be compared against,
+/// and the wake driven by, the core that created it (§12). A safe atomic so the per-core filter
+/// needs no `unsafe` read of `TASK_CORE` (which would grow a grandfathered file, §18.5). The
+/// arming core is always the task's own core: `set_wake_deadline` runs in the task's
+/// `recv_timeout`, on the core the task is running on.
+static TASK_WAKE_CORE: [AtomicU8; MAX_TASKS] =
+    [const { AtomicU8::new(0xFF) }; MAX_TASKS];
+
+/// Arm a timed wake for `slot` at TSC `deadline` (0 disarms), tagged with the calling core.
 pub fn set_wake_deadline(slot: usize, deadline: u64) {
     if slot < MAX_TASKS {
+        TASK_WAKE_CORE[slot].store(current_core_id() as u8, Ordering::Relaxed);
         TASK_WAKE_DEADLINE[slot].store(deadline, Ordering::Relaxed);
     }
 }
@@ -87,14 +98,25 @@ pub fn clear_wake_deadline(slot: usize) {
     }
 }
 
-/// Wake every task whose `recv_timeout` deadline has passed. Called from the core-0 timer
-/// ISR. Cheap: a scan of `MAX_TASKS` relaxed loads, almost all zero. Only wakes a task that
-/// is still `BlockedOnRecv` (a task that already returned cleared its deadline; the state
-/// guard also avoids reviving one that moved on). The wake result is 0 — the woken
-/// `recv_timeout` re-checks its own deadline and returns the timeout itself.
-pub fn scan_timed_wakes() {
+/// Wake every task **on this core** whose `recv_timeout` deadline has passed. Called from
+/// *each* core's timer ISR with that core's id. Cheap: a scan of `MAX_TASKS` relaxed loads,
+/// almost all zero. Only wakes a task that is still `BlockedOnRecv` (a task that already
+/// returned cleared its deadline; the state guard also avoids reviving one that moved on).
+/// The wake result is 0 — the woken `recv_timeout` re-checks its own deadline and returns
+/// the timeout itself.
+///
+/// **Per-core, by design (§9, §12).** Two cross-core hazards make a single core-0 scan
+/// wrong on real SMP hardware (both invisible under QEMU TCG, which serialises cores and
+/// keeps TSCs in lockstep): (1) the deadline was computed from the *blocked task's* core's
+/// TSC, and AMD cores need not have synchronised TSCs — comparing it against core 0's TSC
+/// can never fire; (2) the wake would be a cross-core `wake_by_slot` issued from interrupt
+/// context, a path the driver wake never needs to take if the scan runs on the task's own
+/// core. Scanning each core's own tasks with its own TSC makes the wake entirely local
+/// (CAS → Ready → this core's `pick_next`), no IPI, no cross-core clock compare.
+pub fn scan_timed_wakes(cid: usize) {
     let now = crate::arch::x86_64::read_cycle_counter();
     for slot in 0..MAX_TASKS {
+        if TASK_WAKE_CORE[slot].load(Ordering::Relaxed) as usize != cid { continue; }
         let deadline = TASK_WAKE_DEADLINE[slot].load(Ordering::Relaxed);
         if deadline != 0
             && now >= deadline
@@ -882,9 +904,12 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         if cid == 0 {
             crate::control::process_pending();
             crate::arch::x86_64::uart_rx_poll();
-            // Wake any task whose recv_timeout deadline has elapsed (§12 timed-wait).
-            scan_timed_wakes();
         }
+        // Wake any task ON THIS CORE whose recv_timeout deadline has elapsed (§12 timed-wait).
+        // Per-core (not core-0-only): the deadline was set with this core's TSC and the wake
+        // is local, avoiding cross-core TSC skew + a cross-core IPI from interrupt context —
+        // both real on SMP hardware, both hidden under QEMU. See scan_timed_wakes.
+        scan_timed_wakes(cid);
 
         let prev = CORE_CURRENT[cid].load(Ordering::Relaxed);
 

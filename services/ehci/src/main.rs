@@ -813,8 +813,7 @@ fn poll_devices(
         // occasional hot-plug / disconnect re-check as a safety net). This is what drops the
         // core from ~100% busy-poll to ~0% idle. The scan above runs each time we wake, so a
         // report that arrived with the interrupt is processed on the next pass.
-        let timeout = if kb_rep.armed() { REPEAT_INTERVAL_CYCLES } else { HOTPLUG_POLL_CYCLES };
-        let woke = ctx.recv_timeout(timeout).is_some();
+        let woke = ctx.recv_timeout(POLL_INTERVAL_CYCLES).is_some();
         // Drain any further queued interrupt IPCs so the next recv_timeout truly idles.
         while ctx.try_recv().is_some() {}
         // Ack + unmask the level INTx: clear USBSTS (deasserts the pin) BEFORE unmasking, so the
@@ -880,12 +879,17 @@ const STS_INT_BITS:   u32 = 0x3F;   // the six W1C interrupt-status bits (0..5)
 const EHCI_INT_VECTOR: u8 = 0x29;   // matches kernel interrupts::EHCI_MSI_VECTOR
 
 // E4 (interrupt-driven, §12) blocking-loop timings, in TSC cycles (~2 GHz on the T630).
-// While a key is held the keyboard sends no further reports, so we wake on a short timer to
-// emit auto-repeats; otherwise we block on the interrupt with a long timer as a hot-plug /
-// disconnect safety net. Mirrors the xHCI P4 loop.
+// The driver BLOCKS on recv_timeout instead of busy-spinning, so the core idles. The wake
+// is delivered by the kernel's PER-CORE timed-wait (scheduler::scan_timed_wakes, run on this
+// driver's own core) at POLL_INTERVAL_CYCLES, plus — as a bonus, when it lands — the device
+// interrupt. We deliberately wake at a steady ~30 ms cadence rather than a long idle timeout:
+// the device interrupt's cross-core delivery (it fires on the BSP; the driver runs on core 1)
+// is not a path we rely on for correctness, so the timed-wait is the guaranteed wake and must
+// be brisk enough for responsive typing. 30 ms ≈ 33 wakes/s — negligible CPU vs the old
+// busy-poll's ~99%, the actual win. Auto-repeat (50 ms) rides on top via kb_rep's own TSC clock.
 const REPEAT_INITIAL_CYCLES:  u64 = 600_000_000;   // ~300 ms before the first repeat
-const REPEAT_INTERVAL_CYCLES: u64 = 100_000_000;   // ~50 ms between repeats (and held-key wake)
-const HOTPLUG_POLL_CYCLES:    u64 = 2_000_000_000; // ~1 s idle re-check (hot-plug / disconnect)
+const REPEAT_INTERVAL_CYCLES: u64 = 100_000_000;   // ~50 ms between repeats
+const POLL_INTERVAL_CYCLES:   u64 = 60_000_000;    // ~30 ms guaranteed wake cadence (timed-wait)
 const OP_PORTSC0:    usize = 0x44; // PORTSC[0]; +4 bytes per additional port
 
 const CMD_RS:        u32 = 1 << 0;  // Run/Stop
