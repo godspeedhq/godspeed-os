@@ -833,13 +833,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 need_queue[d] = false;
             }
 
-            // P4 (interrupt-driven, §12): BLOCK instead of spin. The core idles here until the
-            // controller's MSI-X wakes us (a keypress / mouse move / port-status change posts
-            // an event), or the timer wakes us — a short timeout while a key is held (to emit
-            // auto-repeats; the keyboard is silent while held), a long one otherwise (idle,
-            // with an occasional hot-plug re-check as a safety net). This is what drops the
-            // core from ~100% busy-poll to ~0% idle.
-            let _ = ctx.recv_timeout(POLL_INTERVAL_CYCLES);
+            // P4 (interrupt-driven, §12): BLOCK when idle, busy-poll while a key is HELD. A held
+            // key sends no further reports, so auto-repeat must be driver-timed (kb_rep) — and
+            // relying on the cross-core timed-wake to this (idle, halted) core to fire those
+            // repeats is sluggish on this hardware. So: if any key is held, YIELD (spin) so the
+            // loop re-runs immediately and emits repeats at their precise ~50 ms interval;
+            // otherwise BLOCK so the core idles (~0%) until the MSI-X wakes us on the next
+            // keypress/mouse event. The hot spin lasts only as long as you actually hold a key.
+            let any_held = (0..ndev).any(|d| !devs[d].is_mouse && kb_rep[d].armed());
+            if any_held {
+                ctx.yield_cpu();
+            } else {
+                let _ = ctx.recv_timeout(POLL_INTERVAL_CYCLES);
+            }
             // Drain any further queued interrupt events so the next recv_timeout truly idles.
             while ctx.try_recv().is_some() {}
             // Ack the interrupter (clear IP, keep IE) BEFORE draining the ring, so an event
