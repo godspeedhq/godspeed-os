@@ -61,6 +61,7 @@ pub enum SyscallNumber {
     LastRecvBadge       = 33,
     TryRecv             = 34,
     RecvTimeout         = 35,
+    IrqUnmask           = 36,
 }
 
 /// Raw syscall dispatcher — called from the SYSCALL/SYSENTER IDT stub.
@@ -82,6 +83,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::Recv           as u64 => handle_recv(arg0, arg1, arg2),
         n if n == SyscallNumber::TryRecv        as u64 => handle_try_recv(arg0, arg1, arg2),
         n if n == SyscallNumber::RecvTimeout    as u64 => handle_recv_timeout(arg0, arg1, arg2),
+        n if n == SyscallNumber::IrqUnmask      as u64 => handle_irq_unmask(arg0),
         n if n == SyscallNumber::TrySend        as u64 => handle_try_send(arg0, arg1, arg2),
         n if n == SyscallNumber::Yield          as u64 => {
             crate::task::scheduler::yield_current();
@@ -421,6 +423,21 @@ fn handle_recv_timeout(packed: u64, out_buf: u64, timeout: u64) -> i64 {
     };
     scheduler::clear_wake_deadline(my_slot);
     result
+}
+
+/// Re-open the IOAPIC gate for a level-triggered IRQ after the driver has cleared its device's
+/// interrupt source (syscall 36, §12). The kernel masks a level INTx in `route::deliver` so it
+/// can't storm while the driver handles it; the driver calls this to unmask once acked. Gated:
+/// the caller must own the endpoint registered for `irq` (its `hw_interrupt` route). A no-op
+/// for edge/MSI vectors (their GSI table entry is empty). arg0 = irq/vector.
+fn handle_irq_unmask(irq: u64) -> i64 {
+    let irq = (irq & 0xFF) as u8;
+    let my_ep = scheduler::current_task_endpoint();
+    if my_ep.is_none() || crate::interrupt::route::registered_endpoint(irq) != my_ep {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+    crate::arch::x86_64::ioapic::unmask_vector(irq);
+    0
 }
 
 fn handle_try_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {

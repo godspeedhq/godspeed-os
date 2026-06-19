@@ -30,6 +30,12 @@ pub fn register(irq: u8, endpoint: EndpointId) {
     IRQ_TABLE.lock()[irq as usize] = Some(endpoint);
 }
 
+/// The driver endpoint registered for `irq`, if any. Used to gate the `IrqUnmask` syscall:
+/// only the driver that owns the route may re-open its IOAPIC gate (§12).
+pub fn registered_endpoint(irq: u8) -> Option<EndpointId> {
+    IRQ_TABLE.lock()[irq as usize]
+}
+
 /// Deliver IRQ `irq` to the registered driver as an IPC message.
 ///
 /// # Safety

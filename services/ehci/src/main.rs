@@ -733,9 +733,19 @@ fn poll_devices(
     mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) | CMD_ASE);
     wait(mmio, op + OP_USBSTS, STS_ASS, true);
 
+    // E2 (interrupt-driven, §12): enable the controller's interrupts. The interrupt qTDs
+    // already carry IOC, so a completed report sets USBSTS.USBINT and the controller asserts
+    // its (level) INTx, which the kernel routes via the IOAPIC to EHCI_INT_VECTOR. Clear any
+    // stale status first, then enable USB-interrupt + port-change. The poll loop still
+    // processes reports (belt-and-suspenders); it also acks (clears USBSTS) + unmasks.
+    mmio.write32(op + OP_USBSTS, STS_INT_BITS);
+    mmio.write32(op + OP_USBINTR, INT_USB | INT_PCD);
+
     let mut toggle = [0u32; MAX_HID];
     let mut err = [0u32; MAX_HID];                        // consecutive errored completions
     let mut kb_last = [0u8; 6];                           // keyboard edge-detection state
+    let mut int_logged = false;                          // log the first INTx interrupt once
+    let mut sts_logged = false;                          // log when USBSTS first shows USBINT
     // Typematic auto-repeat, timed in TSC cycles (read_tsc is hardware-proven to advance,
     // unlike the coarse kernel tick): ~300 ms before the first repeat, then ~50 ms apart
     // at ~2 GHz. The spread across 1.5–3 GHz CPUs just shifts the feel slightly.
@@ -784,6 +794,31 @@ fn poll_devices(
         // Typematic auto-repeat: a held key sends no further reports, so synthesise
         // repeats from the monotonic tick while the key stays down.
         kb_rep.poll(ctx.read_tsc(), |ch| ctx.console_push(ch));
+        // Diagnostic (E2): does the controller actually ASSERT its interrupt? If USBSTS.USBINT
+        // sets but no IPC arrives below, the controller is asserting INTx but the IOAPIC route
+        // (GSI / destination) is wrong; if it never sets, the controller isn't completing
+        // interrupt transfers. One-shot so it doesn't spam.
+        if !sts_logged {
+            let sts = mmio.read32(op + OP_USBSTS);
+            if sts & INT_USB != 0 {
+                ctx.log_fmt(format_args!(
+                    "ehci: USBSTS.USBINT set (controller asserting INTx), USBSTS={:#010x}", sts));
+                sts_logged = true;
+            }
+        }
+        // E2 (interrupt-driven, §12): drain any interrupt the kernel routed here (EHCI INTx →
+        // IOAPIC → vector 0x29 → IPC). The kernel masked the level source on deliver; ack by
+        // clearing USBSTS (deasserts INTx), then unmask so it can fire again. The poll above
+        // already processed the reports — belt-and-suspenders.
+        while ctx.try_recv().is_some() {
+            let sts = mmio.read32(op + OP_USBSTS);
+            mmio.write32(op + OP_USBSTS, sts & STS_INT_BITS); // ack: clear W1C status bits
+            ctx.irq_unmask(EHCI_INT_VECTOR);
+            if !int_logged {
+                ctx.log("ehci: INTx interrupt received (E2: interrupt path live)");
+                int_logged = true;
+            }
+        }
         ctx.yield_cpu();
     }
 }
@@ -825,7 +860,15 @@ const DEBOUNCE_CYCLES:   u64 = 100_000_000;
 // --- EHCI operational registers (offsets from base + CAPLENGTH) + bit fields ---
 const OP_USBCMD:     usize = 0x00;
 const OP_USBSTS:     usize = 0x04;
+const OP_USBINTR:    usize = 0x08; // Interrupt Enable register
 const OP_CONFIGFLAG: usize = 0x40;
+// USBINTR / USBSTS interrupt bits (E2, interrupt-driven §12). The interrupt qTDs already set
+// IOC, so a completed report sets USBSTS.USBINT; enabling it raises the controller's (level)
+// INTx, which the kernel routes via the IOAPIC to EHCI_INT_VECTOR. USBSTS bits are W1C.
+const INT_USB:        u32 = 1 << 0; // USB Interrupt (a transfer with IOC completed)
+const INT_PCD:        u32 = 1 << 2; // Port Change Detect (hot-plug)
+const STS_INT_BITS:   u32 = 0x3F;   // the six W1C interrupt-status bits (0..5)
+const EHCI_INT_VECTOR: u8 = 0x29;   // matches kernel interrupts::EHCI_MSI_VECTOR
 const OP_PORTSC0:    usize = 0x44; // PORTSC[0]; +4 bytes per additional port
 
 const CMD_RS:        u32 = 1 << 0;  // Run/Stop

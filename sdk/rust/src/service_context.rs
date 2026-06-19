@@ -318,6 +318,15 @@ impl ServiceContext {
         crate::ipc::recv_timeout(CapHandle(slot), timeout_cycles).ok().flatten()
     }
 
+    /// Re-open the kernel's IOAPIC gate for a level-triggered IRQ `vector` after this driver
+    /// has cleared its device's interrupt source (§12). The kernel masks a level INTx while the
+    /// driver handles it (so it can't storm); call this to let it fire again. Only the driver
+    /// registered for `vector` (via its `hw_interrupt` route) may unmask it. No-op for MSI.
+    pub fn irq_unmask(&self, vector: u8) {
+        // SAFETY: syscall(36) = IrqUnmask; gated kernel-side by the route registration.
+        let _ = unsafe { raw_syscall(36, vector as u64, 0, 0) };
+    }
+
     /// Block until a message arrives; returns the error instead of looping silently.
     pub fn recv_result(&self) -> Result<Message, crate::ipc::IpcError> {
         let data = Self::ctx();

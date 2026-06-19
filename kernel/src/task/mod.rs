@@ -420,7 +420,9 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             preferred_core:    1,
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
+            // Route the EHCI INTx (interrupts::EHCI_MSI_VECTOR = 0x29, IOAPIC-routed) to this
+            // driver's recv endpoint (§12). The driver enables USBINTR + acks + unmasks.
+            hw_irqs:           &[0x29],
             has_console_read:  false,
         })),
         // `block-driver` — userspace ATA PIO disk driver (persistence, v2; §6.3,
