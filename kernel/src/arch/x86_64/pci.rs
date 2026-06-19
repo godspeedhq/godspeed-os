@@ -573,23 +573,38 @@ pub fn program_ehci_msi() -> bool {
 }
 
 /// Route the EHCI's legacy INTx pin through the IOAPIC to the kernel's EHCI vector (§12), for
-/// a controller with no MSI. Uses the device's PCI interrupt-line register as the GSI (the
-/// usual identity for these platforms; validated on hardware), level-triggered + active-low
-/// (PCI INTx), destination = BSP. Registers the level route so dispatch can mask it and the
-/// driver can unmask after acking. No-op if no EHCI. Call after `ioapic::init()`.
+/// a controller with no MSI.
+///
+/// We have no ACPI `_PRT` parser, so the exact GSI the EHCI's INTx pin maps to is unknown: the
+/// PCI interrupt-line register holds the legacy 8259 IRQ (usually 11), but an AMD FCH routes PCI
+/// INTx to a *higher* GSI in the 16–23 range. Rather than gamble on one, we program a **candidate
+/// set** — the legacy line plus the platform PCI-INTx range — all to the same EHCI vector,
+/// level-triggered + active-low (PCI INTx), destination = the real BSP local-APIC id. Only the
+/// EHCI uses INTx (AHCI polls, xHCI is MSI), so the spurious candidates never fire; the one that
+/// matches the hardware delivers. Each is registered as a level route so dispatch masks — and the
+/// driver unmasks — the whole set together. No-op if no EHCI. Call after `ioapic::init()`.
 pub fn route_ehci_intx() {
     if !EHCI_FOUND.load(Ordering::Relaxed) {
         return;
     }
-    let gsi = EHCI_IRQ.load(Ordering::Relaxed);
     let vector = crate::arch::x86_64::interrupts::EHCI_MSI_VECTOR;
-    // dest_apic = 0 (the BSP's local-APIC id on these machines); unmasked — the EHCI asserts
-    // nothing until its driver enables USBINTR, so no interrupt fires yet.
-    crate::arch::x86_64::ioapic::set_redir(gsi, vector, 0, false);
-    crate::arch::x86_64::ioapic::set_level_route(vector, gsi);
+    let dest = crate::arch::x86_64::ioapic::bsp_lapic_id();
+    let legacy = EHCI_IRQ.load(Ordering::Relaxed);
+    // Candidate GSIs: the legacy interrupt-line value (usually 11) + the AMD FCH PCI-INTx range.
+    let mut candidates: [u8; 9] = [legacy, 16, 17, 18, 19, 20, 21, 22, 23];
+    for i in 0..candidates.len() {
+        let gsi = candidates[i];
+        // Skip a duplicate if the legacy line already falls in 16..=23.
+        if candidates[..i].contains(&gsi) {
+            continue;
+        }
+        crate::arch::x86_64::ioapic::set_redir(gsi, vector, dest, false);
+        crate::arch::x86_64::ioapic::set_level_route(vector, gsi);
+    }
+    let _ = &mut candidates;
     crate::kprintln!(
-        "ehci: legacy INTx routed via IOAPIC gsi={} -> vector={:#x}",
-        gsi, vector
+        "ehci: legacy INTx routed via IOAPIC candidates [{} ,16..=23] -> vector={:#x} dest_apic={}",
+        legacy, vector, dest
     );
 }
 

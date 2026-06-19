@@ -123,31 +123,63 @@ pub fn set_mask(gsi: u8, masked: bool) {
     }
 }
 
-// IDT vector → IOAPIC GSI map for *level-triggered* (INTx) routes, so the generic IRQ
-// dispatch (`route::deliver`) can mask the source while the driver handles it and the
-// driver can unmask after acking. `0xFF` = not a level/IOAPIC vector (e.g. an edge MSI like
-// the xHCI's, which needs no masking). Only a couple of legacy-INTx devices ever register.
-static VECTOR_GSI: [AtomicU8; 256] = [const { AtomicU8::new(0xFF) }; 256];
+/// BSP local-APIC id — the destination for level INTx routes. Captured at boot from the
+/// Limine SMP response (`mod.rs`). `0xFF` until set; `set_redir` then falls back to 0, the
+/// BSP id on essentially all machines, so routing still works if capture is skipped.
+static BSP_LAPIC_ID: AtomicU8 = AtomicU8::new(0xFF);
 
-/// Record that IDT `vector` is a level-triggered IOAPIC route on `gsi` (enables mask/unmask).
-pub fn set_level_route(vector: u8, gsi: u8) {
-    VECTOR_GSI[vector as usize].store(gsi, Ordering::Relaxed);
+/// Record the BSP's local-APIC id (called once at boot before any device routing).
+pub fn set_bsp_lapic_id(id: u8) {
+    BSP_LAPIC_ID.store(id, Ordering::Relaxed);
 }
 
-/// Mask the IOAPIC source for `vector` if it is a level route (no-op for edge/MSI vectors).
-/// Called from interrupt dispatch so a level INTx doesn't re-fire while the driver handles it.
-pub fn mask_vector(vector: u8) {
-    let gsi = VECTOR_GSI[vector as usize].load(Ordering::Relaxed);
-    if gsi != 0xFF {
-        set_mask(gsi, true);
+/// The BSP local-APIC id to route level interrupts to (0 if not captured).
+pub fn bsp_lapic_id() -> u8 {
+    let id = BSP_LAPIC_ID.load(Ordering::Relaxed);
+    if id == 0xFF { 0 } else { id }
+}
+
+// Level-triggered (INTx) route table: each entry binds an IDT `vector` to an IOAPIC `gsi`,
+// so the generic IRQ dispatch (`route::deliver`) can mask the source while the driver handles
+// it and the driver can unmask after acking. A *single* vector may have *several* GSI entries
+// — on a machine with no ACPI _PRT parser we route a legacy-INTx device to a candidate set of
+// GSIs (the real one plus the platform's PCI-INTx range) and mask/unmask the whole set, since
+// only one such device exists and the spurious entries never fire. Empty slots hold vector
+// `0xFF`. Edge MSI vectors (the xHCI's) are never registered here, so they are never masked.
+const MAX_LEVEL_ROUTES: usize = 16;
+static LEVEL_ROUTE_VEC: [AtomicU8; MAX_LEVEL_ROUTES] =
+    [const { AtomicU8::new(0xFF) }; MAX_LEVEL_ROUTES];
+static LEVEL_ROUTE_GSI: [AtomicU8; MAX_LEVEL_ROUTES] =
+    [const { AtomicU8::new(0xFF) }; MAX_LEVEL_ROUTES];
+
+/// Record that IDT `vector` is a level-triggered IOAPIC route on `gsi` (enables mask/unmask).
+/// May be called several times for one vector to register a candidate GSI set.
+pub fn set_level_route(vector: u8, gsi: u8) {
+    for i in 0..MAX_LEVEL_ROUTES {
+        if LEVEL_ROUTE_VEC[i].load(Ordering::Relaxed) == 0xFF {
+            LEVEL_ROUTE_GSI[i].store(gsi, Ordering::Relaxed);
+            LEVEL_ROUTE_VEC[i].store(vector, Ordering::Relaxed);
+            return;
+        }
     }
 }
 
-/// Unmask the IOAPIC source for `vector` if it is a level route — the driver calls this
+/// Mask the IOAPIC source(s) for `vector` if it has level route(s) (no-op for edge/MSI vectors).
+/// Called from interrupt dispatch so a level INTx doesn't re-fire while the driver handles it.
+pub fn mask_vector(vector: u8) {
+    for i in 0..MAX_LEVEL_ROUTES {
+        if LEVEL_ROUTE_VEC[i].load(Ordering::Relaxed) == vector {
+            set_mask(LEVEL_ROUTE_GSI[i].load(Ordering::Relaxed), true);
+        }
+    }
+}
+
+/// Unmask the IOAPIC source(s) for `vector` if it has level route(s) — the driver calls this
 /// (via a syscall) after clearing the device's interrupt source. No-op for edge/MSI vectors.
 pub fn unmask_vector(vector: u8) {
-    let gsi = VECTOR_GSI[vector as usize].load(Ordering::Relaxed);
-    if gsi != 0xFF {
-        set_mask(gsi, false);
+    for i in 0..MAX_LEVEL_ROUTES {
+        if LEVEL_ROUTE_VEC[i].load(Ordering::Relaxed) == vector {
+            set_mask(LEVEL_ROUTE_GSI[i].load(Ordering::Relaxed), false);
+        }
     }
 }
