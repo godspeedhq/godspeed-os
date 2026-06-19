@@ -2196,7 +2196,11 @@ fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
         // is a paranoid safety net so a hung child can never wedge the shell
         // forever. We must NOT call console_read here: the child owns the keyboard.
         for _ in 0..u32::MAX {
-            ctx.yield_cpu();
+            // Sleep (don't busy-yield) between checks: the foreground child owns the screen and
+            // we have nothing to do but wait for it to park, so let core 0 halt in between —
+            // otherwise the shell pegs core 0 the whole time `observe` is up (~50 ms latency on
+            // noticing the child parked is invisible). ~50 ms at 2 GHz.
+            ctx.sleep(100_000_000);
             let st = ctx.task_stat(slot);
             if !st.valid || st.state == 2 {
                 break;

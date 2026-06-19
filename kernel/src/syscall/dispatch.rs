@@ -62,6 +62,7 @@ pub enum SyscallNumber {
     TryRecv             = 34,
     RecvTimeout         = 35,
     IrqUnmask           = 36,
+    Sleep               = 37,
 }
 
 /// Raw syscall dispatcher — called from the SYSCALL/SYSENTER IDT stub.
@@ -84,6 +85,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::TryRecv        as u64 => handle_try_recv(arg0, arg1, arg2),
         n if n == SyscallNumber::RecvTimeout    as u64 => handle_recv_timeout(arg0, arg1, arg2),
         n if n == SyscallNumber::IrqUnmask      as u64 => handle_irq_unmask(arg0),
+        n if n == SyscallNumber::Sleep          as u64 => handle_sleep(arg0),
         n if n == SyscallNumber::TrySend        as u64 => handle_try_send(arg0, arg1, arg2),
         n if n == SyscallNumber::Yield          as u64 => {
             crate::task::scheduler::yield_current();
@@ -443,6 +445,26 @@ fn handle_irq_unmask(irq: u64) -> i64 {
         return cap_err_to_i64(CapError::CapNotHeld);
     }
     crate::arch::x86_64::ioapic::unmask_vector(irq);
+    0
+}
+
+/// Block the calling task for roughly `cycles` TSC cycles, then return (syscall 37). A real
+/// sleep — the core can `hlt` while the task is parked — so a service that needs to wait (e.g.
+/// a foreground UI polling for `q` between repaints, or the shell waiting for that UI to exit)
+/// does NOT busy-`yield`, which would peg its core at ~100% and make every task on that core
+/// read as fully busy in `observe`. Like `yield`, sleeping your own task needs no capability.
+/// Uses the same BSP-tick timed-wake as `recv_timeout` (§12); a `cycles` of 0 returns at once.
+fn handle_sleep(cycles: u64) -> i64 {
+    if cycles == 0 { return 0; }
+    let my_slot = scheduler::current_task_slot();
+    let deadline = scheduler::monotonic_ticks().wrapping_add(scheduler::cycles_to_ticks(cycles));
+    loop {
+        if scheduler::monotonic_ticks() >= deadline { break; }
+        scheduler::set_wake_deadline(my_slot, deadline);
+        let err = scheduler::block_and_reschedule(TaskState::BlockedOnRecv);
+        if err != 0 { break; }
+    }
+    scheduler::clear_wake_deadline(my_slot);
     0
 }
 

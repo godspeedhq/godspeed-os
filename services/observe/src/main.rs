@@ -31,6 +31,13 @@ const MODE_LIVE_FG: u32 = 2; // `observe` live — full-screen foreground view
 /// T630). `q` is polled every loop iteration regardless, so quit stays snappy.
 const FRAME_CYCLES: u64 = 1_000_000_000;
 
+/// Per-iteration sleep for the live loop, in TSC cycles (~30 ms at 2 GHz). The loop SLEEPS this
+/// long between `q`-polls/repaints instead of busy-`yield`ing, so the core halts in between and
+/// `observe` itself does not peg its core (which would make every task on that core read as
+/// ~100% busy — the very thing observe reports). `q` latency stays ≤ this; granularity is one
+/// quantum (~10 ms).
+const POLL_SLEEP_CYCLES: u64 = 60_000_000;
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Per-core tick baselines for delta-based CPU%.
@@ -95,7 +102,9 @@ fn run_live(
                 break;
             }
         }
-        ctx.yield_cpu();
+        // Sleep (don't busy-yield) so the core halts between polls — otherwise observe pegs its
+        // own core and reports every task on it as ~100%. q stays responsive (≤ POLL_SLEEP).
+        ctx.sleep(POLL_SLEEP_CYCLES);
 
         let now = ctx.read_tsc();
         if now.wrapping_sub(last) >= FRAME_CYCLES {

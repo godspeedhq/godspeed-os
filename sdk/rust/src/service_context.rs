@@ -327,6 +327,16 @@ impl ServiceContext {
         let _ = unsafe { raw_syscall(36, vector as u64, 0, 0) };
     }
 
+    /// Block this task for roughly `cycles` TSC cycles, then return (syscall 37). A real sleep:
+    /// the core can halt while parked, so a poll/wait loop does not busy-`yield` (which pegs the
+    /// core at ~100% and makes every task on it read as fully busy in `observe`). Like `yield`,
+    /// needs no capability. Granularity is one scheduler quantum (~10 ms). Use for UI repaint
+    /// pacing and "wait for child" loops — not for precise timing.
+    pub fn sleep(&self, cycles: u64) {
+        // SAFETY: syscall(37) = Sleep; sleeping your own task is unprivileged (like yield).
+        let _ = unsafe { raw_syscall(37, cycles, 0, 0) };
+    }
+
     /// Block until a message arrives; returns the error instead of looping silently.
     pub fn recv_result(&self) -> Result<Message, crate::ipc::IpcError> {
         let data = Self::ctx();
