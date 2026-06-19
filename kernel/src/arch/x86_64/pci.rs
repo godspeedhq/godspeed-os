@@ -449,6 +449,95 @@ pub fn program_msi(bdf: u32, vector: u8) -> bool {
     false
 }
 
+/// Program a device's MSI-X capability (id 0x11): point table entry 0 at local-APIC
+/// `vector` on the BSP, unmask it, and enable MSI-X. Returns `true` if MSI-X was found and
+/// programmed. Most modern controllers (incl. `qemu-xhci`) expose MSI-X rather than MSI.
+///
+/// MSI-X's message table lives in **MMIO** (inside a BAR), not config space, so this maps
+/// the table's page uncached at its HHDM alias (the same pattern the IOMMU MMIO uses) and
+/// writes entry 0. The device must also be a bus master (Command bit 2) to issue the
+/// upstream MSI memory write. The caller installs the IDT handler for `vector` first.
+pub fn program_msix(bdf: u32, vector: u8) -> bool {
+    let bus = ((bdf >> 8) & 0xff) as u8;
+    let dev = ((bdf >> 3) & 0x1f) as u8;
+    let func = (bdf & 0x7) as u8;
+
+    let status = (config_read32(bus, dev, func, 0x04) >> 16) as u16;
+    if status & (1 << 4) == 0 {
+        return false;
+    }
+    let mut cap = (config_read32(bus, dev, func, 0x34) & 0xFC) as u8;
+    let mut guard = 48u8;
+    while cap >= 0x40 && guard > 0 {
+        guard -= 1;
+        let hdr = config_read32(bus, dev, func, cap);
+        let cap_id = (hdr & 0xFF) as u8;
+        let next = ((hdr >> 8) & 0xFF) as u8;
+        if cap_id == 0x11 {
+            // Table Offset/BIR (cap+0x04): bits[2:0] = BAR index, bits[31:3] = byte offset.
+            let tbl = config_read32(bus, dev, func, cap + 0x04);
+            let bir = (tbl & 0x7) as u8;
+            let tbl_off = (tbl & !0x7u32) as u64;
+            // Physical base of BAR[bir] (handle a 64-bit memory BAR).
+            let bar_off = 0x10u8 + bir * 4;
+            let bar = config_read32(bus, dev, func, bar_off);
+            let bar_phys = if bar & 0x6 == 0x4 {
+                let bar_hi = config_read32(bus, dev, func, bar_off + 4);
+                ((bar_hi as u64) << 32) | ((bar & 0xFFFF_FFF0) as u64)
+            } else {
+                (bar & 0xFFFF_FFF0) as u64
+            };
+            let tbl_phys = bar_phys + tbl_off;
+
+            // Map the table's page uncached at its HHDM alias (Limine's HHDM covers RAM but
+            // not MMIO, so add the page to the active tables ourselves — like the IOMMU).
+            let hhdm = crate::arch::x86_64::page_tables::get_hhdm_offset();
+            let page_phys = tbl_phys & !0xFFFu64;
+            let va_page = hhdm.wrapping_add(page_phys);
+            {
+                use crate::arch::x86_64::page_tables::{map_in_active_tables, PageFlags};
+                let flags = PageFlags::PRESENT.bits()
+                    | PageFlags::WRITABLE.bits()
+                    | PageFlags::NO_EXEC.bits()
+                    | PageFlags::PWT.bits()
+                    | PageFlags::PCD.bits();
+                // SAFETY: page-aligned MMIO page (the device's MSI-X table BAR), uncached;
+                // already-present is a no-op.
+                let _ = unsafe { map_in_active_tables(va_page, page_phys, flags) };
+            }
+            let entry = hhdm.wrapping_add(tbl_phys); // table entry 0 (16 bytes)
+            // SAFETY: `entry` addresses MSI-X table entry 0 in the just-mapped MMIO page.
+            unsafe {
+                core::ptr::write_volatile((entry + 0x00) as *mut u32, 0xFEE0_0000); // addr lo (LAPIC, BSP)
+                core::ptr::write_volatile((entry + 0x04) as *mut u32, 0);           // addr hi
+                core::ptr::write_volatile((entry + 0x08) as *mut u32, vector as u32);// data (edge/fixed)
+                core::ptr::write_volatile((entry + 0x0C) as *mut u32, 0);           // vector control: unmask
+            }
+
+            // Bus master enable (Command bit 2) so the device can issue the MSI write.
+            let cmd = config_read32(bus, dev, func, 0x04);
+            config_write32(bus, dev, func, 0x04, cmd | (1 << 2));
+
+            // Enable MSI-X (Message Control bit 15), clear the function mask (bit 14).
+            let ctrl = (hdr >> 16) as u16;
+            let new_ctrl = (ctrl & !(1u16 << 14)) | (1u16 << 15);
+            let new_hdr = (hdr & 0x0000_FFFF) | ((new_ctrl as u32) << 16);
+            config_write32(bus, dev, func, cap, new_hdr);
+
+            crate::kprintln!(
+                "pci: MSI-X enabled on {:02x}:{:02x}.{} vector={:#x} bir={} tbl@{:#x}",
+                bus, dev, func, vector, bir, tbl_phys
+            );
+            return true;
+        }
+        if next == 0 {
+            break;
+        }
+        cap = next;
+    }
+    false
+}
+
 /// Program the picked xHCI controller's MSI to deliver to the kernel's xHCI MSI vector
 /// (P1, USB interrupts). No-op (returns false) if no xHCI was found. The controller's own
 /// interrupter must be enabled by the driver before any MSI actually fires (P2); this only
@@ -458,7 +547,9 @@ pub fn program_xhci_msi() -> bool {
         return false;
     }
     let bdf = XHCI_BDF.load(Ordering::Relaxed);
-    program_msi(bdf, crate::arch::x86_64::interrupts::XHCI_MSI_VECTOR)
+    let vector = crate::arch::x86_64::interrupts::XHCI_MSI_VECTOR;
+    // Prefer plain MSI; fall back to MSI-X (what qemu-xhci and most real xHCIs expose).
+    program_msi(bdf, vector) || program_msix(bdf, vector)
 }
 
 /// Scan the PCI bus for the xHCI controller and record its MMIO base + IRQ.
