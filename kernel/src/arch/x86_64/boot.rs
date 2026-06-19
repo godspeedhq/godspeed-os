@@ -482,6 +482,15 @@ pub unsafe fn rearm_tsc_deadline() {
     unsafe { arm_tsc_deadline_now(ticks) };
 }
 
+/// TSC cycles per scheduler quantum (the timer period), or 0 before the local APIC timer is
+/// calibrated. Used to convert a cycle-based `recv_timeout` into a count of timer ticks for the
+/// core-independent timed-wake clock (§12) — a TSC deadline can't be compared across cores
+/// whose TSCs need not be synchronised, so the timed-wake counts ticks of the BSP timer instead.
+#[inline]
+pub fn tsc_ticks_per_quantum() -> u64 {
+    TSC_TICKS_PER_QUANTUM.load(Ordering::Relaxed)
+}
+
 /// Returns true when running on a GenuineIntel CPU.
 ///
 /// Used to gate Intel-specific MSR accesses (e.g. MSR 0xE2) that do not exist

@@ -384,8 +384,14 @@ fn handle_recv_timeout(packed: u64, out_buf: u64, timeout: u64) -> i64 {
     if !validate_user_ptr(out_buf, buf_len) { return -1; }
 
     let my_slot = scheduler::current_task_slot();
-    // 0 = no deadline (block forever); else absolute TSC deadline.
-    let deadline = if timeout == 0 { 0 } else { read_cycle_counter().wrapping_add(timeout) };
+    // 0 = no deadline (block forever); else an absolute deadline in BSP timer TICKS, not TSC
+    // cycles — the timed-wake scan runs on the BSP and compares one shared tick clock, which is
+    // valid cross-core where a per-core TSC is not (see scheduler::scan_timed_wakes).
+    let deadline = if timeout == 0 {
+        0
+    } else {
+        scheduler::monotonic_ticks().wrapping_add(scheduler::cycles_to_ticks(timeout))
+    };
 
     let result = loop {
         match crate::ipc::routing::dequeue(endpoint_id, cap.generation, Some(my_slot)) {
@@ -408,7 +414,7 @@ fn handle_recv_timeout(packed: u64, out_buf: u64, timeout: u64) -> i64 {
                 break copy_len as i64;
             }
             Err(IpcError::QueueEmpty) => {
-                if deadline != 0 && read_cycle_counter() >= deadline {
+                if deadline != 0 && scheduler::monotonic_ticks() >= deadline {
                     break RECV_TIMED_OUT;
                 }
                 if deadline != 0 {
