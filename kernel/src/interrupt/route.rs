@@ -36,6 +36,12 @@ pub fn register(irq: u8, endpoint: EndpointId) {
 /// Called from interrupt context with IF=0. The APIC EOI is sent unconditionally
 /// at the end; missing the EOI would leave the IRQ line permanently masked.
 pub unsafe fn deliver(irq: u8) {
+    // For a level-triggered IOAPIC route (legacy INTx, e.g. the EHCI), mask the source now so
+    // it does not re-fire while the userspace driver handles it (the line stays asserted until
+    // the driver clears the device's interrupt status). The driver unmasks via the IrqUnmask
+    // syscall after acking. No-op for edge/MSI vectors (the xHCI), which need no masking.
+    crate::arch::x86_64::ioapic::mask_vector(irq);
+
     let endpoint = IRQ_TABLE.lock()[irq as usize];
     if let Some(ep) = endpoint {
         let msg = crate::ipc::message::Message::interrupt_event(irq);

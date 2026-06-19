@@ -572,6 +572,27 @@ pub fn program_ehci_msi() -> bool {
     ok
 }
 
+/// Route the EHCI's legacy INTx pin through the IOAPIC to the kernel's EHCI vector (§12), for
+/// a controller with no MSI. Uses the device's PCI interrupt-line register as the GSI (the
+/// usual identity for these platforms; validated on hardware), level-triggered + active-low
+/// (PCI INTx), destination = BSP. Registers the level route so dispatch can mask it and the
+/// driver can unmask after acking. No-op if no EHCI. Call after `ioapic::init()`.
+pub fn route_ehci_intx() {
+    if !EHCI_FOUND.load(Ordering::Relaxed) {
+        return;
+    }
+    let gsi = EHCI_IRQ.load(Ordering::Relaxed);
+    let vector = crate::arch::x86_64::interrupts::EHCI_MSI_VECTOR;
+    // dest_apic = 0 (the BSP's local-APIC id on these machines); unmasked — the EHCI asserts
+    // nothing until its driver enables USBINTR, so no interrupt fires yet.
+    crate::arch::x86_64::ioapic::set_redir(gsi, vector, 0, false);
+    crate::arch::x86_64::ioapic::set_level_route(vector, gsi);
+    crate::kprintln!(
+        "ehci: legacy INTx routed via IOAPIC gsi={} -> vector={:#x}",
+        gsi, vector
+    );
+}
+
 /// Scan the PCI bus for the xHCI controller and record its MMIO base + IRQ.
 /// Called once on the BSP during boot. Logs the result either way.
 pub fn init() {

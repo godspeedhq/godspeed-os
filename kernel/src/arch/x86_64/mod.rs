@@ -15,6 +15,7 @@ pub mod boot;
 pub mod context_switch;
 pub mod fb;
 pub mod iommu;
+pub mod ioapic;
 pub mod interrupts;
 pub mod page_tables;
 pub mod pci;
