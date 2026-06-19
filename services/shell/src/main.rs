@@ -725,6 +725,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         // revoke-on-close. Prints per-step results; the harness asserts on them (Test 14).
         "fcap"    => cmd_fcap(ctx, if argc >= 2 { args[1] } else { "" }),
         "ls"      => cmd_ls(ctx, cwd, if argc >= 2 { args[1] } else { "" }, &mut Out::Console),
+        "edit"    => cmd_edit(ctx, cwd, s["edit".len()..].trim()),
         "write"   => cmd_write(ctx, cwd, s["write".len()..].trim()),
         "mkdir"   => {
             if argc < 2 { ctx.console_writeln("usage: mkdir <path> [parents]"); Err(ShellError::Unknown) }
@@ -965,7 +966,7 @@ const UTIL_VERSION: &str = "0.1.0";
 const UTILS: &[&str] = &[
     "help", "result", "run", "assert", "selfcheck",
     "echo", "clear", "about", "mem", "cores", "date", "status", "observe", "caps", "roster",
-    "spawn", "kill", "restart", "reboot", "drives", "ls", "cd", "read", "write", "fcap",
+    "spawn", "kill", "restart", "reboot", "drives", "ls", "cd", "read", "write", "edit", "fcap",
     "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count", "sort",
     "first", "last",
     // record-pipe verbs (pipe-only stages; see docs/records.md)
@@ -1100,6 +1101,9 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("write <path>", "create an empty file", "write /docs/todo.txt"),
             ("write <path> <text>", "create/overwrite with text", "write /docs/todo.txt \"buy milk\""),
             ("write append <path> <text>", "add text to the end (create if missing)", "write append /docs/todo.txt \"eggs\""),
+        ], true),
+        "edit" => help_block(ctx, "edit", "full-screen text editor (^S save, ^Q quit)", &[
+            ("edit <path>", "open <path> for editing (creates it on save if new)", "edit /notes.txt"),
         ], true),
         "mkdir" => help_block(ctx, "mkdir", "create a directory", &[
             ("mkdir <path>", "create the directory <path>", "mkdir /docs"),
@@ -1261,6 +1265,7 @@ static HELP: &[HelpRow] = &[
     Row("cd [path|-]", "change directory (- = previous)"),
     Row("read <path>", "print a file"),
     Row("write [append] <path> [text]", "create/overwrite/append a file"),
+    Row("edit <path>", "full-screen text editor (^S save, ^Q quit)"),
     Row("mkdir <path> [parents]", "create a directory"),
     Row("copy <src> <dst> [recursive]", "copy a file or subtree"),
     Row("move <src> <dst>", "relocate a file/dir"),
@@ -2858,6 +2863,340 @@ fn cmd_fcap(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
 
     if ok { ctx.console_writeln("fcap: all file-capability checks passed"); Ok(()) }
     else { Err(ShellError::Unknown) }
+}
+
+// ── edit: a full-screen text editor (utilities/36_edit.md) ───────────────────────────────────
+//
+// Modelled after Microsoft's `edit`: a full-screen, modeless editor with a title bar on top, the
+// text area, and a bottom hint/status bar. Keyboard-only. The text lives in one flat stack
+// buffer — no heap (§26.6) — so a file up to one fs message (`MAX_EDIT_BYTES`) is editable; a
+// larger file is refused loudly rather than silently truncated. Rendering uses only the CSI
+// subset the console supports on BOTH transports (serial terminal AND the framebuffer console,
+// `arch/x86_64/fb.rs`): absolute cursor position, erase-to-end-of-line, show/hide cursor. The
+// reverse-video bars (SGR) render on a serial terminal and degrade to plain text on the fbcon
+// (it consumes the unsupported escape without drawing garbage), so it is readable on both.
+const MAX_EDIT_BYTES: usize = IO_CHUNK; // 3556 — one fs message (the file-transfer ceiling)
+const EDIT_COLS_MAX: usize = 256;       // bar-render scratch width cap
+const EDIT_TAB: usize = 4;              // Tab inserts this many spaces (keeps column math clean)
+
+/// In-memory edit buffer + view state. A flat byte array with the cursor as a byte offset; edits
+/// shift bytes (O(n), but n ≤ 3556 — trivial). Lines are the text between '\n's; line/column are
+/// computed on the fly (no line table → no extra stack), since the buffer is tiny.
+struct Editor {
+    buf:      [u8; MAX_EDIT_BYTES],
+    len:      usize,
+    cur:      usize,  // cursor byte offset, 0..=len
+    modified: bool,
+    top:      usize,  // first visible line (vertical scroll)
+    left:     usize,  // first visible column (horizontal scroll)
+    rows:     usize,  // screen rows
+    cols:     usize,  // screen cols
+}
+
+impl Editor {
+    fn new(rows: usize, cols: usize) -> Self {
+        Editor { buf: [0u8; MAX_EDIT_BYTES], len: 0, cur: 0, modified: false, top: 0, left: 0, rows, cols }
+    }
+    fn data(&self) -> &[u8] { &self.buf[..self.len] }
+    /// Byte offset of the start of the line containing `pos` (just after the previous '\n', or 0).
+    fn line_start(&self, pos: usize) -> usize {
+        let mut i = pos;
+        while i > 0 && self.buf[i - 1] != b'\n' { i -= 1; }
+        i
+    }
+    /// Byte offset of the '\n' ending the line containing `pos`, or `len` for the last line.
+    fn line_end(&self, pos: usize) -> usize {
+        let mut i = pos;
+        while i < self.len && self.buf[i] != b'\n' { i += 1; }
+        i
+    }
+    fn col_of(&self, pos: usize) -> usize { pos - self.line_start(pos) }
+    fn line_index(&self, pos: usize) -> usize {
+        let mut n = 0;
+        for &b in &self.buf[..pos] { if b == b'\n' { n += 1; } }
+        n
+    }
+    /// Byte offset where the `n`th line begins, or `len + 1` (a past-end sentinel) if absent.
+    fn nth_line_start(&self, n: usize) -> usize {
+        if n == 0 { return 0; }
+        let mut count = 0;
+        for i in 0..self.len {
+            if self.buf[i] == b'\n' { count += 1; if count == n { return i + 1; } }
+        }
+        self.len + 1
+    }
+    fn insert(&mut self, b: u8) {
+        if self.len >= MAX_EDIT_BYTES { return; } // full — refuse (the status bar shows the size)
+        let mut i = self.len;
+        while i > self.cur { self.buf[i] = self.buf[i - 1]; i -= 1; }
+        self.buf[self.cur] = b;
+        self.len += 1;
+        self.cur += 1;
+        self.modified = true;
+    }
+    fn backspace(&mut self) {
+        if self.cur == 0 { return; }
+        let mut i = self.cur;
+        while i < self.len { self.buf[i - 1] = self.buf[i]; i += 1; }
+        self.len -= 1;
+        self.cur -= 1;
+        self.modified = true;
+    }
+    fn delete(&mut self) {
+        if self.cur >= self.len { return; }
+        let mut i = self.cur + 1;
+        while i < self.len { self.buf[i - 1] = self.buf[i]; i += 1; }
+        self.len -= 1;
+        self.modified = true;
+    }
+    fn move_left(&mut self)  { if self.cur > 0 { self.cur -= 1; } }
+    fn move_right(&mut self) { if self.cur < self.len { self.cur += 1; } }
+    fn move_home(&mut self)  { self.cur = self.line_start(self.cur); }
+    fn move_end(&mut self)   { self.cur = self.line_end(self.cur); }
+    fn move_up(&mut self) {
+        let ls = self.line_start(self.cur);
+        if ls == 0 { self.cur = 0; return; }
+        let col = self.cur - ls;
+        let pls = self.line_start(ls - 1);  // previous line's start
+        let plen = (ls - 1) - pls;          // previous line's length (excluding its '\n')
+        self.cur = pls + col.min(plen);
+    }
+    fn move_down(&mut self) {
+        let le = self.line_end(self.cur);
+        if le >= self.len { self.cur = self.len; return; }
+        let col = self.cur - self.line_start(self.cur);
+        let nls = le + 1;                   // next line's start
+        let nlen = self.line_end(nls) - nls;
+        self.cur = nls + col.min(nlen);
+    }
+    fn page(&mut self, down: bool) {
+        for _ in 0..self.rows.saturating_sub(3).max(1) {
+            if down { self.move_down() } else { self.move_up() }
+        }
+    }
+}
+
+/// A bounded `fmt::Write` sink over a stack slice — used to format a status/title bar string
+/// before padding it to the bar width. Drops anything past the slice (the bar is clipped anyway).
+struct BarW<'a> { b: &'a mut [u8], n: usize }
+impl core::fmt::Write for BarW<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &c in s.as_bytes() { if self.n < self.b.len() { self.b[self.n] = c; self.n += 1; } else { break; } }
+        Ok(())
+    }
+}
+
+fn edit_goto(ctx: &ServiceContext, row: usize, col: usize) {
+    ctx.console_write_fmt(format_args!("\x1b[{};{}H", row, col));
+}
+
+/// Draw a full-width reverse-video bar: `text` (already formatted) left-justified, space-padded
+/// to `width`. The caller positions the cursor first. `\x1b[7m`/`\x1b[0m` are reverse-video on a
+/// serial terminal and a no-op on the fbcon (→ plain text), so the bar reads cleanly on both.
+fn edit_bar(ctx: &ServiceContext, text: &[u8], width: usize) {
+    let mut line = [b' '; EDIT_COLS_MAX];
+    let w = width.min(EDIT_COLS_MAX);
+    let n = text.len().min(w);
+    line[..n].copy_from_slice(&text[..n]);
+    ctx.console_write("\x1b[7m");
+    ctx.console_write(str_of(&line[..w]));
+    ctx.console_write("\x1b[0m");
+}
+
+/// Repaint the whole screen for `ed`. Adjusts scroll so the cursor stays visible, draws the
+/// title bar, the visible text rows (clipped to the window, horizontal scroll applied), the
+/// status bar, then parks the terminal cursor at the editing position.
+fn edit_render(ctx: &ServiceContext, ed: &mut Editor, name: &[u8]) {
+    use core::fmt::Write as _;
+    let textrows = ed.rows.saturating_sub(2).max(1); // rows between the title and status bars
+    let li = ed.line_index(ed.cur);
+    let col = ed.col_of(ed.cur);
+    if li < ed.top { ed.top = li; }
+    if li >= ed.top + textrows { ed.top = li + 1 - textrows; }
+    if col < ed.left { ed.left = col; }
+    if col >= ed.left + ed.cols { ed.left = col + 1 - ed.cols; }
+    let cols = ed.cols;
+
+    ctx.console_write("\x1b[?25l"); // hide cursor while repainting (no flicker trail)
+
+    // Title bar (row 1): name + a dirty marker. Full width (row-1 wrap is harmless).
+    edit_goto(ctx, 1, 1);
+    {
+        let mut t = [0u8; EDIT_COLS_MAX];
+        let mut w = BarW { b: &mut t, n: 0 };
+        let _ = write!(w, " edit  {}{}", str_of(name), if ed.modified { "  * (modified)" } else { "" });
+        let used = w.n;
+        edit_bar(ctx, &t[..used], cols);
+    }
+
+    // Text rows (screen rows 2..=rows-1): one buffer line each, from `top`.
+    let mut ls = ed.nth_line_start(ed.top);
+    for r in 0..textrows {
+        edit_goto(ctx, 2 + r, 1);
+        if ls <= ed.len {
+            let le = ed.line_end(ls);
+            let from = (ls + ed.left).min(le);
+            let to   = (ls + ed.left + cols).min(le);
+            if to > from { ctx.console_write(str_of(&ed.buf[from..to])); }
+            ctx.console_write("\x1b[K"); // erase the rest of the row (no SGR → no wrap)
+            ls = le + 1;
+        } else {
+            ctx.console_write("\x1b[K"); // past end of buffer → blank row
+        }
+    }
+
+    // Status bar (last row): key hints + position. One cell short of full width so writing it on
+    // the bottom row can never trigger an auto-wrap that scrolls the screen.
+    edit_goto(ctx, ed.rows, 1);
+    {
+        let mut t = [0u8; EDIT_COLS_MAX];
+        let mut w = BarW { b: &mut t, n: 0 };
+        let _ = write!(w, " ^S save   ^Q quit      Ln {}, Col {}   {}/{} bytes",
+            li + 1, col + 1, ed.len, MAX_EDIT_BYTES);
+        let used = w.n;
+        edit_bar(ctx, &t[..used], cols.saturating_sub(1));
+    }
+
+    // Park the editing cursor (title is row 1, so text line `li` is screen row 2 + (li - top)).
+    edit_goto(ctx, 2 + (li - ed.top), 1 + (col - ed.left));
+    ctx.console_write("\x1b[?25h"); // show it
+}
+
+fn edit_save(ctx: &ServiceContext, ed: &Editor, path: &[u8]) -> bool {
+    matches!(fs_request(ctx, OP_WRITE_FILE, path, ed.data())
+        .as_ref().map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK)))
+}
+
+/// Decode a CSI sequence (after `ESC [`) into an editor cursor/edit action. Mirrors the shell's
+/// line-editor `handle_csi`, but the actions move the document cursor instead of the prompt.
+fn edit_csi(ctx: &ServiceContext, ed: &mut Editor) {
+    let mut param: u16 = 0;
+    let mut fb = 0u8;
+    for _ in 0..8 {
+        let c = ctx.console_read();
+        if c.is_ascii_digit() { param = param.saturating_mul(10).saturating_add((c - b'0') as u16); }
+        else if c == b';' { continue; }
+        else { fb = c; break; }
+    }
+    match fb {
+        b'A' => ed.move_up(),
+        b'B' => ed.move_down(),
+        b'C' => ed.move_right(),
+        b'D' => ed.move_left(),
+        b'H' => ed.move_home(),
+        b'F' => ed.move_end(),
+        b'~' => match param {
+            1 | 7 => ed.move_home(),
+            4 | 8 => ed.move_end(),
+            3     => ed.delete(),       // forward Delete
+            5     => ed.page(false),    // PageUp
+            6     => ed.page(true),     // PageDown
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
+/// Quit handler: clean if unsaved changes are handled. Returns `true` if the editor should exit.
+/// With no unsaved changes, quits immediately; otherwise prompts on the status row (y = save then
+/// quit, n = discard and quit, anything else = cancel and keep editing).
+fn edit_try_quit(ctx: &ServiceContext, ed: &Editor, path: &[u8]) -> bool {
+    if !ed.modified { return true; }
+    edit_goto(ctx, ed.rows, 1);
+    edit_bar(ctx, b" unsaved changes  -  y = save & quit, n = discard, any other key = keep editing",
+        ed.cols.saturating_sub(1));
+    edit_goto(ctx, ed.rows, 1);
+    match ctx.console_read() {
+        b'y' | b'Y' => edit_save(ctx, ed, path),     // quit only if the save succeeds
+        b'n' | b'N' => true,                          // discard and quit
+        0x1B => { let _ = read_escape_byte(ctx); false } // Esc (drain any sequence) → cancel
+        _ => false,                                   // anything else → keep editing
+    }
+}
+
+#[inline(never)] // big stack frame (the edit buffer) — keep it off the hot call paths' frames
+fn cmd_edit(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Result<(), ShellError> {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        ctx.console_writeln("usage: edit <path>     e.g. edit /notes.txt");
+        return Err(ShellError::Unknown);
+    }
+    let mut pbuf = [0u8; PATH_MAX];
+    let path = match resolve_or_err(ctx, cwd, arg, &mut pbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
+    let mut pcopy = [0u8; PATH_MAX];
+    let pl = path.len();
+    pcopy[..pl].copy_from_slice(path);
+    let path = &pcopy[..pl];
+
+    let (rd, cd) = ctx.console_dims();
+    let rows = if rd == 0 { 24 } else { rd as usize };
+    let cols = if cd == 0 { 80 } else { cd as usize };
+    let mut ed = Editor::new(rows, cols);
+
+    // Load: stat first (existence / size / kind), then read the content in one message. A file
+    // larger than the one-message ceiling, or a directory, is refused — we never truncate.
+    if let Some(stat) = fs_request(ctx, OP_STAT_FILE, path, &[]) {
+        let sp = stat.payload_bytes();
+        if no_fs(ctx, sp) { return Err(ShellError::Unknown); }
+        let exists = sp.first() == Some(&FS_OK) && sp.len() >= 11 && sp[1] == 1;
+        if exists {
+            if sp[10] == 1 {
+                ctx.console_writeln_fmt(format_args!("edit: {} is a directory", str_of(path)));
+                return Err(ShellError::Unknown);
+            }
+            let size = u64::from_le_bytes([sp[2], sp[3], sp[4], sp[5], sp[6], sp[7], sp[8], sp[9]]);
+            if size as usize > MAX_EDIT_BYTES {
+                ctx.console_writeln_fmt(format_args!(
+                    "edit: {} is too large to edit ({} bytes; the editor handles up to {})",
+                    str_of(path), size, MAX_EDIT_BYTES));
+                return Err(ShellError::Unknown);
+            }
+            match fs_request(ctx, OP_READ_FILE, path, &[]) {
+                Some(r) => {
+                    let p = r.payload_bytes();
+                    if p.first() == Some(&FS_OK) && p.len() >= 5 {
+                        let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
+                        let end = (5 + n).min(p.len());
+                        let take = (end - 5).min(MAX_EDIT_BYTES);
+                        ed.buf[..take].copy_from_slice(&p[5..5 + take]);
+                        ed.len = take;
+                    }
+                }
+                None => { ctx.console_writeln("edit: storage unavailable"); return Err(ShellError::Unknown); }
+            }
+        }
+        // not found → start with an empty buffer (a new file, created on first save)
+    } else {
+        ctx.console_writeln("edit: storage unavailable");
+        return Err(ShellError::Unknown);
+    }
+
+    let name = basename(path);
+    ctx.console_write("\x1b[2J"); // clear the screen once on entry (every later frame just repaints)
+
+    loop {
+        edit_render(ctx, &mut ed, name);
+        match ctx.console_read() {
+            0x13 => { if edit_save(ctx, &ed, path) { ed.modified = false; } }   // ^S
+            0x11 => { if edit_try_quit(ctx, &ed, path) { break; } }             // ^Q
+            0x1B => match read_escape_byte(ctx) {
+                None        => { if edit_try_quit(ctx, &ed, path) { break; } }  // bare Esc → quit
+                Some(b'[')  => edit_csi(ctx, &mut ed),
+                Some(b'O')  => { let _ = ctx.console_read(); }                  // F-keys: consume, ignore
+                Some(_)     => {}
+            },
+            b'\r' | b'\n' => ed.insert(b'\n'),
+            0x7f | 0x08   => ed.backspace(),
+            0x09          => { for _ in 0..EDIT_TAB { ed.insert(b' '); } }      // Tab → spaces
+            b if (0x20..0x7f).contains(&b) => ed.insert(b),
+            _ => {}
+        }
+    }
+
+    // Restore the screen for the shell prompt: show the cursor and clear+home so `gsh> ` lands
+    // cleanly at the top-left. Echo is already off (the shell owns it), so we leave it.
+    ctx.console_write("\x1b[?25h\x1b[2J\x1b[H");
+    Ok(())
 }
 
 fn cmd_read(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {

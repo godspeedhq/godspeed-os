@@ -1094,6 +1094,7 @@ fn cmd_test(suite: &str) {
         "drives-raw"   => run_drives_raw_test(),
         "drives"       => run_drives_scripted_test(),
         "files"        => run_files_test(),
+        "edit"         => run_edit_test(),
         "script"       => run_script_test(),
         other => eprintln!("unknown test suite: {}", other),
     }
@@ -1907,6 +1908,24 @@ fn run_files_test() {
     std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create raw disk");
 
     crate::shell_test::run_files(&image_path, persist, 4);
+}
+
+/// `osdev test edit` — exercise the full-screen `edit` text editor over the serial console: open
+/// a new file, type/backspace/newline, save (^S) + quit (^Q), read it back; edit the existing
+/// file (insert at start); and quit with unsaved changes via the discard prompt. Bare-metal shell
+/// + a RAW AHCI disk the test formats first (the editor needs a filesystem to save to).
+fn run_edit_test() {
+    println!("\n=== edit: full-screen text editor — type / save / quit / read-back (AHCI disk) ===");
+    cmd_build_bare_metal();
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_edit.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create raw disk");
+    crate::shell_test::run_edit(&image_path, persist, 4);
 }
 
 /// Host-baked-script test: bake a self-checking `.gsh` suite into a GSFS data disk (the way a

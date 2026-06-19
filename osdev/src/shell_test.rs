@@ -1497,6 +1497,158 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     }
 }
 
+/// `osdev test edit` — drive the full-screen `edit` editor over the serial console end to end:
+/// open a NEW file, type (with a backspace), save (^S) + quit (^Q), and `read` it back to prove
+/// the bytes persisted; re-open the existing file and insert at the start; then open it, type
+/// junk, ^Q and DISCARD (n) at the unsaved-changes prompt, and read to prove the junk was not
+/// saved. Plus the no-arg usage. The editor's own TUI repaint is in the byte stream, but every
+/// assertion is on the post-edit `read` output (captured after the prompt returns), never the
+/// repaint — so we verify what actually hit the filesystem, not what was drawn.
+pub fn run_edit(image_path: &Path, persist_path: &str, smp: u32) {
+    println!("edit-test: booting (smp={smp}) with a RAW AHCI disk — scripted mode");
+
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let persist   = std::fs::canonicalize(persist_path)
+        .unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let persist_str = persist.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(),
+        "-m",       "512M",
+        "-serial",  &format!("tcp::{shell_port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ])
+    .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| {
+        eprintln!("edit-test: QEMU launch failed at {qemu}: {e}");
+        std::process::exit(1);
+    });
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => { eprintln!("edit-test: could not connect to serial {shell_port}"); child.kill().ok(); std::process::exit(1); }
+    };
+    let mut read_half  = stream.try_clone().expect("clone tcp stream");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop {
+                match read_half.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]),
+                }
+            }
+        });
+    }
+
+    let mut pass = 0usize;
+    let mut fail = 0usize;
+    let mut cursor = 0usize;
+    macro_rules! check {
+        ($ok:expr, $label:expr) => {
+            if $ok { println!("edit-test: PASS — {}", $label); pass += 1; }
+            else   { println!("edit-test: FAIL — {}", $label); fail += 1; }
+        };
+    }
+    // Send a command, then read the `read`-back output up to the next prompt.
+    macro_rules! read_back {
+        ($c:expr) => {{
+            send(&mut write_half, $c);
+            collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8))
+        }};
+    }
+
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).is_none() {
+        let got = { String::from_utf8_lossy(&buf.lock().unwrap()).into_owned() };
+        println!("edit-test: FAIL — timed out waiting for first gsh>\n{got}");
+        child.kill().ok(); child.wait().ok();
+        std::process::exit(1);
+    }
+
+    // Format the disk so the editor has a filesystem to save to.
+    send(&mut write_half, b"drives flash data\r");
+    if collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(10)).is_some() {
+        send(&mut write_half, b"y\r");
+        match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)) {
+            Some(r) => check!(r.contains("formatted as GSFS"), "setup: flashed GSFS"),
+            None    => { println!("edit-test: FAIL — flash timeout"); fail += 1; }
+        }
+    } else { println!("edit-test: FAIL — no flash confirm"); fail += 1; }
+
+    // 1. no-arg usage.
+    match read_back!(b"edit\r") {
+        Some(r) => check!(r.contains("usage: edit"), "edit (no arg): prints usage"),
+        None    => { println!("edit-test: FAIL — usage timeout"); fail += 1; }
+    }
+
+    // 2. NEW file: type (with a backspace + a newline), save (^S), quit (^Q), read back.
+    send(&mut write_half, b"edit /e.txt\r");
+    if collect_until(&buf, &mut cursor, b"^S save", Duration::from_secs(10)).is_some() {
+        check!(true, "edit /e.txt: editor opened (status bar shown)");
+        // "hello worldX" then Backspace (DEL) deletes the X; Enter inserts a newline; "second line".
+        send(&mut write_half, b"hello worldX\x7f\rsecond line\x13"); // ^S save
+        thread::sleep(Duration::from_millis(400));                   // let the save's fs round-trip land
+        send(&mut write_half, b"\x11");                              // ^Q — unmodified after save → clean quit
+        match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)) {
+            Some(_) => check!(true, "edit /e.txt: ^S then ^Q returned to the prompt"),
+            None    => { println!("edit-test: FAIL — editor did not return to prompt"); fail += 1; }
+        }
+    } else { println!("edit-test: FAIL — editor did not open (×2)"); fail += 2; }
+    match read_back!(b"read /e.txt\r") {
+        Some(r) => {
+            check!(r.contains("hello world") && r.contains("second line"), "read /e.txt: saved text present");
+            check!(!r.contains("worldX"), "read /e.txt: backspace took effect (no 'worldX')");
+        }
+        None => { println!("edit-test: FAIL — read after edit timeout (×2)"); fail += 2; }
+    }
+
+    // 3. EXISTING file: cursor opens at the start; insert "TOP ", save, quit, read.
+    send(&mut write_half, b"edit /e.txt\r");
+    if collect_until(&buf, &mut cursor, b"^S save", Duration::from_secs(10)).is_some() {
+        send(&mut write_half, b"TOP \x13");
+        thread::sleep(Duration::from_millis(400));
+        send(&mut write_half, b"\x11");
+        let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10));
+    } else { println!("edit-test: FAIL — re-open editor"); fail += 1; }
+    match read_back!(b"read /e.txt\r") {
+        Some(r) => check!(r.contains("TOP hello world"), "edit existing: insert-at-start saved ('TOP hello world')"),
+        None    => { println!("edit-test: FAIL — read after edit-existing timeout"); fail += 1; }
+    }
+
+    // 4. Quit with unsaved changes, DISCARD (n) — the junk must NOT persist.
+    send(&mut write_half, b"edit /e.txt\r");
+    if collect_until(&buf, &mut cursor, b"^S save", Duration::from_secs(10)).is_some() {
+        send(&mut write_half, b"ZZZJUNK\x11"); // type junk (now modified), then ^Q → prompt
+        if collect_until(&buf, &mut cursor, b"discard", Duration::from_secs(6)).is_some() {
+            check!(true, "edit: ^Q with unsaved changes shows the discard prompt");
+            send(&mut write_half, b"n"); // n = discard & quit
+            let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8));
+        } else { println!("edit-test: FAIL — no discard prompt"); fail += 1; }
+    } else { println!("edit-test: FAIL — re-open editor for discard"); fail += 1; }
+    match read_back!(b"read /e.txt\r") {
+        Some(r) => check!(r.contains("TOP hello world") && !r.contains("ZZZJUNK"), "edit discard: junk NOT saved (file unchanged)"),
+        None    => { println!("edit-test: FAIL — read after discard timeout"); fail += 1; }
+    }
+
+    child.kill().ok();
+    child.wait().ok();
+    println!("\nedit-test: {pass} passed, {fail} failed");
+    if fail > 0 {
+        std::process::exit(1);
+    }
+}
+
 /// §22 Test 13 — **fs survives its own restart** (Phase D). Drive the shell on COM1 to write a
 /// file, KILL `fs` over the COM2 control channel, then read the file back: the supervisor
 /// respawns `fs`, `fs` re-mounts (the data persisted on disk), and the shell reacquires a fresh
