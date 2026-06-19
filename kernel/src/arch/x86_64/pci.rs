@@ -400,7 +400,7 @@ pub fn ehci_flr_probe() {
 /// Note: only legacy MSI (cap 0x05) here, not MSI-X (cap 0x11, a separate MMIO table). USB
 /// controllers expose MSI; if a device is MSI-X-only this returns false and the caller keeps
 /// polling.
-pub fn program_msi(bdf: u32, vector: u8) -> bool {
+pub fn program_msi(bdf: u32, vector: u8, dest_apic: u8) -> bool {
     let bus = ((bdf >> 8) & 0xff) as u8;
     let dev = ((bdf >> 3) & 0x1f) as u8;
     let func = (bdf & 0x7) as u8;
@@ -422,8 +422,8 @@ pub fn program_msi(bdf: u32, vector: u8) -> bool {
             // MSI capability. Message Control = hdr[31:16]; bit 7 = 64-bit address capable.
             let ctrl = (hdr >> 16) as u16;
             let is_64 = ctrl & (1 << 7) != 0;
-            // Message Address (low) at cap+0x04 = 0xFEE00000 | (dest_apic << 12); BSP = 0.
-            config_write32(bus, dev, func, cap + 0x04, 0xFEE0_0000);
+            // Message Address (low) at cap+0x04 = 0xFEE00000 | (dest_apic << 12).
+            config_write32(bus, dev, func, cap + 0x04, 0xFEE0_0000 | ((dest_apic as u32) << 12));
             if is_64 {
                 config_write32(bus, dev, func, cap + 0x08, 0);                 // addr high
                 config_write32(bus, dev, func, cap + 0x0C, vector as u32);      // data (edge/fixed)
@@ -457,7 +457,7 @@ pub fn program_msi(bdf: u32, vector: u8) -> bool {
 /// the table's page uncached at its HHDM alias (the same pattern the IOMMU MMIO uses) and
 /// writes entry 0. The device must also be a bus master (Command bit 2) to issue the
 /// upstream MSI memory write. The caller installs the IDT handler for `vector` first.
-pub fn program_msix(bdf: u32, vector: u8) -> bool {
+pub fn program_msix(bdf: u32, vector: u8, dest_apic: u8) -> bool {
     let bus = ((bdf >> 8) & 0xff) as u8;
     let dev = ((bdf >> 3) & 0x1f) as u8;
     let func = (bdf & 0x7) as u8;
@@ -508,7 +508,8 @@ pub fn program_msix(bdf: u32, vector: u8) -> bool {
             let entry = hhdm.wrapping_add(tbl_phys); // table entry 0 (16 bytes)
             // SAFETY: `entry` addresses MSI-X table entry 0 in the just-mapped MMIO page.
             unsafe {
-                core::ptr::write_volatile((entry + 0x00) as *mut u32, 0xFEE0_0000); // addr lo (LAPIC, BSP)
+                core::ptr::write_volatile((entry + 0x00) as *mut u32,
+                    0xFEE0_0000 | ((dest_apic as u32) << 12));                        // addr lo (LAPIC dest)
                 core::ptr::write_volatile((entry + 0x04) as *mut u32, 0);           // addr hi
                 core::ptr::write_volatile((entry + 0x08) as *mut u32, vector as u32);// data (edge/fixed)
                 core::ptr::write_volatile((entry + 0x0C) as *mut u32, 0);           // vector control: unmask
@@ -548,8 +549,24 @@ pub fn program_xhci_msi() -> bool {
     }
     let bdf = XHCI_BDF.load(Ordering::Relaxed);
     let vector = crate::arch::x86_64::interrupts::XHCI_MSI_VECTOR;
+    let dest = usb_irq_dest_lapic();
     // Prefer plain MSI; fall back to MSI-X (what qemu-xhci and most real xHCIs expose).
-    program_msi(bdf, vector) || program_msix(bdf, vector)
+    program_msi(bdf, vector, dest) || program_msix(bdf, vector, dest)
+}
+
+/// LAPIC id to deliver USB-controller interrupts to: the core the USB drivers are pinned to
+/// (core 1, per the xhci/ehci contracts' `preferred_core`). Delivering the IRQ to the driver's
+/// OWN core means a device event (a keypress) wakes that core directly out of its idle `hlt`
+/// and the wake stays core-local — no cross-core IPI or BSP scan, which an idle AP on this
+/// hardware (ARAT `hlt` idle) does not service promptly (§12). Falls back to the BSP if there
+/// is no core 1 (single-core), where the driver runs on the BSP anyway.
+fn usb_irq_dest_lapic() -> u8 {
+    const USB_DRIVER_CORE: u32 = 1;
+    if crate::smp::core::is_ready(USB_DRIVER_CORE) {
+        crate::smp::core::core_lapic_id(USB_DRIVER_CORE) as u8
+    } else {
+        crate::arch::x86_64::ioapic::bsp_lapic_id()
+    }
 }
 
 /// Try to program the EHCI controller's MSI/MSI-X (interrupt-driven USB, §12). Returns true
@@ -563,7 +580,8 @@ pub fn program_ehci_msi() -> bool {
     }
     let bdf = EHCI_BDF.load(Ordering::Relaxed);
     let vector = crate::arch::x86_64::interrupts::EHCI_MSI_VECTOR;
-    let ok = program_msi(bdf, vector) || program_msix(bdf, vector);
+    let dest = usb_irq_dest_lapic();
+    let ok = program_msi(bdf, vector, dest) || program_msix(bdf, vector, dest);
     if !ok {
         crate::kprintln!(
             "ehci: no MSI/MSI-X capability — controller uses legacy INTx (IOAPIC routing needed)"
@@ -588,7 +606,9 @@ pub fn route_ehci_intx() {
         return;
     }
     let vector = crate::arch::x86_64::interrupts::EHCI_MSI_VECTOR;
-    let dest = crate::arch::x86_64::ioapic::bsp_lapic_id();
+    // Deliver to the EHCI driver's own core (core 1) — see usb_irq_dest_lapic: a keypress then
+    // wakes that core directly from its idle hlt, no cross-core wake needed.
+    let dest = usb_irq_dest_lapic();
     let legacy = EHCI_IRQ.load(Ordering::Relaxed);
 
     // Legacy INTx only asserts the device's INTx# pin when PCI Command bit 10 (Interrupt

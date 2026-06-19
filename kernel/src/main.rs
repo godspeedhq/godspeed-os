@@ -217,18 +217,10 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     // MMIO base + IRQ for a future userspace driver's hw_mmio/hw_interrupt caps.
     arch::x86_64::pci::init();
 
-    // P1 (interrupt-driven USB, §12): program the xHCI's MSI capability so it CAN deliver
-    // interrupts to the kernel's IDT vector. The controller's interrupter stays OFF until
-    // the userspace driver enables it (P2), so nothing fires yet — this validates that MSI
-    // programming works on this controller (logs "MSI enabled …" or "no MSI capability").
-    arch::x86_64::pci::program_xhci_msi();
-    // EHCI interrupt path (§12): use MSI/MSI-X if the controller has it (AMD may), else route
-    // its legacy INTx pin through the IOAPIC (the T630/Intel-ICH case). Either way the
-    // interrupter stays off until the EHCI driver enables USBINTR, so nothing fires yet.
+    // EHCI INTx routing needs the IOAPIC mapped; map it now (CPU MMIO, AP-independent). The
+    // actual MSI/INTx *programming* is deferred until after smp::init (below) so it can target
+    // the USB drivers' core (core 1) — see usb_irq_dest_lapic / the call after "cores ready".
     arch::x86_64::ioapic::init();
-    if !arch::x86_64::pci::program_ehci_msi() {
-        arch::x86_64::pci::route_ehci_intx();
-    }
 
     // Take a USB controller from the firmware (BIOS→OS handoff) before the IOMMU
     // confines it — otherwise the firmware SMM keeps running its DMA out of
@@ -303,6 +295,18 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
             "idle: cores may halt = {} (cool when idle if true)",
             arch::x86_64::interrupts::idle_can_halt()
         );
+
+        // Interrupt-driven USB (§12): program the USB controllers' interrupts now that the APs
+        // are up, so they target the drivers' core (core 1) — a keypress then wakes that core
+        // straight out of its idle `hlt`, no cross-core wake (which an idle AP doesn't service
+        // promptly on this hardware). The controllers' interrupters stay OFF until each
+        // userspace driver enables them, so nothing fires yet. xHCI uses MSI/MSI-X; the EHCI
+        // uses MSI/MSI-X if present (AMD may) else its legacy INTx routed through the IOAPIC.
+        arch::x86_64::pci::program_xhci_msi();
+        if !arch::x86_64::pci::program_ehci_msi() {
+            arch::x86_64::pci::route_ehci_intx();
+        }
+
         task::scheduler::run(0)
     }
 }
