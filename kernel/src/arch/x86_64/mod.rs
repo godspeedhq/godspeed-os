@@ -15,6 +15,7 @@ pub mod boot;
 pub mod context_switch;
 pub mod fb;
 pub mod iommu;
+pub mod ioapic;
 pub mod interrupts;
 pub mod page_tables;
 pub mod pci;
@@ -158,6 +159,8 @@ fn collect_boot_info() -> BootInfo {
 
     if let Some(mp) = SMP_REQUEST.response() {
         let bsp_lapic = mp.bsp_lapic_id;
+        // Record the BSP local-APIC id so legacy-INTx (EHCI) routes target the right LAPIC.
+        crate::arch::x86_64::ioapic::set_bsp_lapic_id(bsp_lapic as u8);
         for cpu in mp.cpus() {
             if cpu.lapic_id != bsp_lapic && ap_count < MAX_AP_IDS {
                 // SAFETY: single-threaded boot path.

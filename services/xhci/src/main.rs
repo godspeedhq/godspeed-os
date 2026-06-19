@@ -33,6 +33,11 @@ const OP_CONFIG: usize = 0x38;
 const OP_PORTSC_BASE: usize = 0x400; // PORTSC[n] = base + n*0x10
 
 const CMD_RS: u32 = 1 << 0;
+// Interrupter enable (P2, interrupt-driven USB §12). The kernel programmed the controller's
+// MSI-X to deliver to vector 0x28; these turn the controller's interrupt generation on.
+const CMD_INTE: u32 = 1 << 2; // USBCMD: global interrupter enable
+const IMAN_IE: u32 = 1 << 1;  // Interrupter 0 Management: Interrupt Enable
+const IMAN_IP: u32 = 1 << 0;  // Interrupter 0 Management: Interrupt Pending (write 1 to clear)
 const CMD_HCRST: u32 = 1 << 1;
 const STS_HCH: u32 = 1 << 0;
 const STS_CNR: u32 = 1 << 11;
@@ -684,8 +689,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         mmio.write64(ir0 + 0x10, dma.phys_at(ERST_OFF));
         mmio.write64(ir0 + 0x18, dma.phys_at(EVENT_RING_OFF));
         mmio.write32(op + OP_CONFIG, max_slots);
+        // P2 (interrupt-driven, §12): enable the interrupter so the controller raises its
+        // MSI-X (kernel-programmed to vector 0x28) when it posts an event. IMAN: IE on, write
+        // 1 to IP to clear any stale pending; USBCMD.INTE gates interrupts globally. The poll
+        // loop still runs and acks (clears IMAN.IP) — belt-and-suspenders until P4.
+        mmio.write32(ir0 + 0x00, IMAN_IE | IMAN_IP);
         let c = mmio.read32(op + OP_USBCMD);
-        mmio.write32(op + OP_USBCMD, c | CMD_RS);
+        mmio.write32(op + OP_USBCMD, c | CMD_RS | CMD_INTE);
         spin(|| mmio.read32(op + OP_USBSTS) & STS_HCH == 0);
 
         // Fresh ring bookkeeping for this pass.
@@ -793,7 +803,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         }
         'poll: loop {
-            // (Re-)arm each device's interrupt ring as needed.
+            // (Re-)arm each device's interrupt ring as needed, BEFORE blocking — so a fresh
+            // HID report can post a transfer event (→ MSI-X) that wakes us.
             for d in 0..ndev {
                 if !need_queue[d] { continue; }
                 let dev = devs[d].idx;
@@ -814,36 +825,61 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 need_queue[d] = false;
             }
 
-            // Drain one event (non-blocking: max_tries=1) so a held key — which produces
-            // no new events — doesn't trap us in next_event's spin and starve the auto-
-            // repeat poll below. Any pending event is still processed one per iteration.
-            if let Some((TRB_TRANSFER_EVENT, _, slot_id)) =
-                next_event(&dma, &mmio, ir0, &mut ev_idx, &mut ev_cycle, 1)
-            {
-                if let Some(d) = devs[..ndev].iter().position(|h| h.slot == slot_id) {
-                    let dev = devs[d].idx;
-                    let mut rep = [0u8; 8];
-                    for (j, b) in rep.iter_mut().enumerate() {
-                        *b = dma.read8(report_off(dev) + j);
+            // BUSY-POLL (§12). The CPU-reduction experiment (block on recv_timeout to idle the
+            // core, interrupt/timer to wake) introduced subtle quirks on this hardware — input
+            // lag, sluggish auto-repeat, hot-plug wedges — so we scaled it back to the model that
+            // worked flawlessly: yield each pass and re-scan. The MSI-X interrupt is still
+            // enabled and drained below (belt-and-suspenders), it just doesn't gate the loop.
+            // The core runs hot; reclaiming that idle cleanly is deferred (revisit later).
+            ctx.yield_cpu();
+            // Drain any queued interrupt-event IPCs (kept so an enabled MSI-X can't pile up).
+            while ctx.try_recv().is_some() {}
+            // Ack the interrupter (clear IP, keep IE) BEFORE draining the ring, so an event
+            // arriving mid-drain re-sets IP and re-arms a fresh MSI-X (no missed events).
+            mmio.write32(ir0 + 0x00, IMAN_IE | IMAN_IP);
+
+            // Drain ALL pending events. Transfer events → decode HID; other events (port
+            // status change, etc.) are dequeued and ignored (hot-plug is handled by the
+            // PORTSC checks below). next_event advances ERDP, which clears EHB.
+            loop {
+                match next_event(&dma, &mmio, ir0, &mut ev_idx, &mut ev_cycle, 1) {
+                    Some((TRB_TRANSFER_EVENT, _, slot_id)) => {
+                        if let Some(d) = devs[..ndev].iter().position(|h| h.slot == slot_id) {
+                            let dev = devs[d].idx;
+                            let mut rep = [0u8; 8];
+                            for (j, b) in rep.iter_mut().enumerate() {
+                                *b = dma.read8(report_off(dev) + j);
+                            }
+                            // Skip an all-0xff report — a failed/stale DMA read from a device
+                            // that vanished mid-transaction (e.g. a rapid unplug/replug). Decoding
+                            // it would push 0xff "keystrokes" to the console; the real disconnect
+                            // is caught by the PORTSC CCS check below, which re-initialises.
+                            if !godspeed_sdk::hid::report_is_valid(&rep) {
+                                need_queue[d] = true;
+                                continue;
+                            }
+                            if devs[d].is_mouse {
+                                mouse[d].feed(
+                                    &rep,
+                                    |mask, down| ctx.log_fmt(format_args!(
+                                        "xhci: mouse {} {}",
+                                        godspeed_sdk::hid::button_name(mask),
+                                        if down { "down" } else { "up" })),
+                                    |dx, dy| ctx.log_fmt(format_args!(
+                                        "xhci: mouse moved dx={} dy={}", dx, dy)),
+                                );
+                            } else {
+                                godspeed_sdk::hid::decode_keyboard(
+                                    &rep, &mut kb_last[d], &mut kb_rep[d], ctx.read_tsc(),
+                                    |ch| ctx.console_push(ch),
+                                    |code| ctx.log_fmt(format_args!(
+                                        "xhci: unmapped HID key usage {:#04x} (add to sdk hid_to_ascii)", code)));
+                            }
+                            need_queue[d] = true;
+                        }
                     }
-                    if devs[d].is_mouse {
-                        mouse[d].feed(
-                            &rep,
-                            |mask, down| ctx.log_fmt(format_args!(
-                                "xhci: mouse {} {}",
-                                godspeed_sdk::hid::button_name(mask),
-                                if down { "down" } else { "up" })),
-                            |dx, dy| ctx.log_fmt(format_args!(
-                                "xhci: mouse moved dx={} dy={}", dx, dy)),
-                        );
-                    } else {
-                        godspeed_sdk::hid::decode_keyboard(
-                            &rep, &mut kb_last[d], &mut kb_rep[d], ctx.read_tsc(),
-                            |ch| ctx.console_push(ch),
-                            |code| ctx.log_fmt(format_args!(
-                                "xhci: unmapped HID key usage {:#04x} (add to sdk hid_to_ascii)", code)));
-                    }
-                    need_queue[d] = true;
+                    Some(_) => {} // non-transfer event (port change, command, etc.) — drained
+                    None => break,
                 }
             }
 
@@ -876,15 +912,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     if !c { present &= !(1 << p); }
                 }
             }
-            // Typematic auto-repeat: a held key sends no further USB reports, so
-            // synthesise repeats from the TSC cycle counter while the key stays down.
+            // Typematic auto-repeat: a held key sends no further USB reports, so synthesise
+            // repeats from the TSC cycle counter. While a key is held we woke on the timer
+            // (short timeout above), so this fires the repeats at ~the repeat interval.
             let now = ctx.read_tsc();
             for d in 0..ndev {
                 if !devs[d].is_mouse {
                     kb_rep[d].poll(now, |ch| ctx.console_push(ch));
                 }
             }
-            ctx.yield_cpu();
         }
     } // end 'reenum loop
 }

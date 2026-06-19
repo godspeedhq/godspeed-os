@@ -217,6 +217,19 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     // MMIO base + IRQ for a future userspace driver's hw_mmio/hw_interrupt caps.
     arch::x86_64::pci::init();
 
+    // EHCI INTx routing needs the IOAPIC mapped; map it now (CPU MMIO, AP-independent).
+    arch::x86_64::ioapic::init();
+
+    // EHCI interrupt path (§12): program it HERE — before the firmware USB handoff + IOMMU
+    // below — which is where it worked in the E2 build; deferring it past the handoff stopped
+    // the legacy INTx from delivering on the T630. The EHCI routes to the BSP (available now,
+    // pre-smp::init — only the xHCI's core-1 MSI needs the APs up, so that one stays deferred).
+    // The EHCI driver is pinned to the BSP (task/mod.rs) to match. Interrupters stay off until
+    // each userspace driver enables them, so nothing fires yet.
+    if !arch::x86_64::pci::program_ehci_msi() {
+        arch::x86_64::pci::route_ehci_intx();
+    }
+
     // Take a USB controller from the firmware (BIOS→OS handoff) before the IOMMU
     // confines it — otherwise the firmware SMM keeps running its DMA out of
     // firmware memory, which faults under confinement and breaks the keyboard.
@@ -290,6 +303,14 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
             "idle: cores may halt = {} (cool when idle if true)",
             arch::x86_64::interrupts::idle_can_halt()
         );
+
+        // Interrupt-driven USB (§12): program the xHCI's MSI now that the APs are up, so it
+        // targets the xHCI driver's core (core 1) — a keypress then wakes that core straight
+        // out of its idle `hlt`, no cross-core wake. (The EHCI was programmed earlier, before
+        // the firmware handoff, routed to the BSP; see above.) The interrupter stays OFF until
+        // the userspace driver enables it, so nothing fires yet.
+        arch::x86_64::pci::program_xhci_msi();
+
         task::scheduler::run(0)
     }
 }

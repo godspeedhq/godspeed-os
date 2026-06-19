@@ -59,6 +59,10 @@ pub enum SyscallNumber {
     ResourceInvoke      = 31,
     ResourceRevoke      = 32,
     LastRecvBadge       = 33,
+    TryRecv             = 34,
+    RecvTimeout         = 35,
+    IrqUnmask           = 36,
+    Sleep               = 37,
 }
 
 /// Raw syscall dispatcher — called from the SYSCALL/SYSENTER IDT stub.
@@ -78,6 +82,10 @@ pub unsafe extern "C" fn syscall_handler(
     match number {
         n if n == SyscallNumber::Send           as u64 => handle_send(arg0, arg1, arg2),
         n if n == SyscallNumber::Recv           as u64 => handle_recv(arg0, arg1, arg2),
+        n if n == SyscallNumber::TryRecv        as u64 => handle_try_recv(arg0, arg1, arg2),
+        n if n == SyscallNumber::RecvTimeout    as u64 => handle_recv_timeout(arg0, arg1, arg2),
+        n if n == SyscallNumber::IrqUnmask      as u64 => handle_irq_unmask(arg0),
+        n if n == SyscallNumber::Sleep          as u64 => handle_sleep(arg0),
         n if n == SyscallNumber::TrySend        as u64 => handle_try_send(arg0, arg1, arg2),
         n if n == SyscallNumber::Yield          as u64 => {
             crate::task::scheduler::yield_current();
@@ -305,6 +313,159 @@ fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
             Err(e) => return ipc_err_to_i64(e),
         }
     }
+}
+
+/// Sentinel returned by `TryRecv` when the endpoint queue is empty (distinct from a
+/// 0-byte message, which is a valid non-negative length, and from the small-negative
+/// cap/IPC error codes).
+pub const TRY_RECV_EMPTY: i64 = -1000;
+
+/// Non-blocking `recv` (syscall 34). Identical to `handle_recv` except it returns
+/// `TRY_RECV_EMPTY` instead of blocking when the queue is empty — so a busy-polling driver
+/// can drain interrupt events (§12) without giving up its loop. Same args as `recv`.
+fn handle_try_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
+    let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::RECV) {
+        Ok(c)  => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    crate::invariants::assertions::assert_cap_validated(&Ok(()));
+    let endpoint_id = EndpointId(cap.resource_id.0);
+
+    let buf_len = out_len as usize;
+    if buf_len == 0 || buf_len > MAX_MESSAGE_SIZE { return -1; }
+    if !validate_user_ptr(out_buf, buf_len) { return -1; }
+
+    let my_slot = scheduler::current_task_slot();
+    match crate::ipc::routing::dequeue(endpoint_id, cap.generation, Some(my_slot)) {
+        Ok((msg, sender_to_wake)) => {
+            if let Some(slot) = sender_to_wake {
+                scheduler::wake_by_slot(slot, 0);
+            }
+            scheduler::set_last_recv_badge(msg.badge_id, msg.badge_right);
+            let n_caps = msg.cap_count.min(msg.caps.len());
+            for i in 0..n_caps {
+                if let Some(embedded_cap) = msg.caps[i] {
+                    if let Ok(new_slot) = scheduler::current_task_insert_cap(embedded_cap) {
+                        scheduler::push_pending_recv_cap(new_slot as u32);
+                    }
+                }
+            }
+            let payload  = msg.payload_bytes();
+            let copy_len = payload.len().min(buf_len);
+            if !write_user_bytes(out_buf, &payload[..copy_len]) {
+                return -1;
+            }
+            copy_len as i64
+        }
+        Err(IpcError::QueueEmpty) => TRY_RECV_EMPTY,
+        Err(e) => ipc_err_to_i64(e),
+    }
+}
+
+/// Sentinel returned by `RecvTimeout` when the timeout elapsed with no message (distinct
+/// from a non-negative length, `TRY_RECV_EMPTY`, and the cap/IPC error codes).
+pub const RECV_TIMED_OUT: i64 = -1001;
+
+/// Blocking `recv` with a timeout (syscall 35, §12 timed-wait). Blocks until a message
+/// arrives OR `timeout` TSC cycles elapse, whichever first; `timeout == 0` means no timeout
+/// (block forever, like `recv`). Returns the payload length, `RECV_TIMED_OUT` on timeout, or
+/// a negative error. Lets a driver wait on its interrupt yet still wake on a timer for
+/// auto-repeat. Args are packed to fit the 3-register ABI:
+///   arg0 = (out_len << 16) | (cap_slot & 0xFFFF), arg1 = out_buf, arg2 = timeout_cycles.
+fn handle_recv_timeout(packed: u64, out_buf: u64, timeout: u64) -> i64 {
+    let cap_slot = (packed & 0xFFFF) as usize;
+    let buf_len  = (packed >> 16) as usize;
+    let cap = match scheduler::current_task_lookup_cap(cap_slot, Rights::RECV) {
+        Ok(c)  => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    crate::invariants::assertions::assert_cap_validated(&Ok(()));
+    let endpoint_id = EndpointId(cap.resource_id.0);
+
+    if buf_len == 0 || buf_len > MAX_MESSAGE_SIZE { return -1; }
+    if !validate_user_ptr(out_buf, buf_len) { return -1; }
+
+    let my_slot = scheduler::current_task_slot();
+    // 0 = no deadline (block forever); else an absolute deadline in BSP timer TICKS, not TSC
+    // cycles — the timed-wake scan runs on the BSP and compares one shared tick clock, which is
+    // valid cross-core where a per-core TSC is not (see scheduler::scan_timed_wakes).
+    let deadline = if timeout == 0 {
+        0
+    } else {
+        scheduler::monotonic_ticks().wrapping_add(scheduler::cycles_to_ticks(timeout))
+    };
+
+    let result = loop {
+        match crate::ipc::routing::dequeue(endpoint_id, cap.generation, Some(my_slot)) {
+            Ok((msg, sender_to_wake)) => {
+                if let Some(slot) = sender_to_wake {
+                    scheduler::wake_by_slot(slot, 0);
+                }
+                scheduler::set_last_recv_badge(msg.badge_id, msg.badge_right);
+                let n_caps = msg.cap_count.min(msg.caps.len());
+                for i in 0..n_caps {
+                    if let Some(embedded_cap) = msg.caps[i] {
+                        if let Ok(new_slot) = scheduler::current_task_insert_cap(embedded_cap) {
+                            scheduler::push_pending_recv_cap(new_slot as u32);
+                        }
+                    }
+                }
+                let payload  = msg.payload_bytes();
+                let copy_len = payload.len().min(buf_len);
+                if !write_user_bytes(out_buf, &payload[..copy_len]) { break -1; }
+                break copy_len as i64;
+            }
+            Err(IpcError::QueueEmpty) => {
+                if deadline != 0 && scheduler::monotonic_ticks() >= deadline {
+                    break RECV_TIMED_OUT;
+                }
+                if deadline != 0 {
+                    scheduler::set_wake_deadline(my_slot, deadline);
+                }
+                let err = scheduler::block_and_reschedule(TaskState::BlockedOnRecv);
+                if err != 0 { break err; }
+                // Woken by a sender (message ready) or the timer (deadline) — re-check.
+            }
+            Err(e) => break ipc_err_to_i64(e),
+        }
+    };
+    scheduler::clear_wake_deadline(my_slot);
+    result
+}
+
+/// Re-open the IOAPIC gate for a level-triggered IRQ after the driver has cleared its device's
+/// interrupt source (syscall 36, §12). The kernel masks a level INTx in `route::deliver` so it
+/// can't storm while the driver handles it; the driver calls this to unmask once acked. Gated:
+/// the caller must own the endpoint registered for `irq` (its `hw_interrupt` route). A no-op
+/// for edge/MSI vectors (their GSI table entry is empty). arg0 = irq/vector.
+fn handle_irq_unmask(irq: u64) -> i64 {
+    let irq = (irq & 0xFF) as u8;
+    let my_ep = scheduler::current_task_endpoint();
+    if my_ep.is_none() || crate::interrupt::route::registered_endpoint(irq) != my_ep {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+    crate::arch::x86_64::ioapic::unmask_vector(irq);
+    0
+}
+
+/// Block the calling task for roughly `cycles` TSC cycles, then return (syscall 37). A real
+/// sleep — the core can `hlt` while the task is parked — so a service that needs to wait (e.g.
+/// a foreground UI polling for `q` between repaints, or the shell waiting for that UI to exit)
+/// does NOT busy-`yield`, which would peg its core at ~100% and make every task on that core
+/// read as fully busy in `observe`. Like `yield`, sleeping your own task needs no capability.
+/// Uses the same BSP-tick timed-wake as `recv_timeout` (§12); a `cycles` of 0 returns at once.
+fn handle_sleep(cycles: u64) -> i64 {
+    if cycles == 0 { return 0; }
+    let my_slot = scheduler::current_task_slot();
+    let deadline = scheduler::monotonic_ticks().wrapping_add(scheduler::cycles_to_ticks(cycles));
+    loop {
+        if scheduler::monotonic_ticks() >= deadline { break; }
+        scheduler::set_wake_deadline(my_slot, deadline);
+        let err = scheduler::block_and_reschedule(TaskState::BlockedOnRecv);
+        if err != 0 { break; }
+    }
+    scheduler::clear_wake_deadline(my_slot);
+    0
 }
 
 fn handle_try_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {

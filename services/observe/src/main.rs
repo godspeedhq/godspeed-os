@@ -31,6 +31,13 @@ const MODE_LIVE_FG: u32 = 2; // `observe` live — full-screen foreground view
 /// T630). `q` is polled every loop iteration regardless, so quit stays snappy.
 const FRAME_CYCLES: u64 = 1_000_000_000;
 
+/// Per-iteration sleep for the live loop, in TSC cycles (~30 ms at 2 GHz). The loop SLEEPS this
+/// long between `q`-polls/repaints instead of busy-`yield`ing, so the core halts in between and
+/// `observe` itself does not peg its core (which would make every task on that core read as
+/// ~100% busy — the very thing observe reports). `q` latency stays ≤ this; granularity is one
+/// quantum (~10 ms).
+const POLL_SLEEP_CYCLES: u64 = 60_000_000;
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Per-core tick baselines for delta-based CPU%.
@@ -88,15 +95,13 @@ fn run_live(
     ctx.console_write("\x1b[H");
     print_state(ctx, prev_core_active, prev_core_total, true);
 
+    // Paint forever; the SHELL owns `q` while we run (it polls the console and KILLS us when
+    // pressed, then restores the screen). We do NOT read input ourselves — one reader avoids a
+    // race over the keyboard — and we SLEEP between frames so we never peg our core (a busy
+    // refresh loop would make every task on this core read as ~100% in our own display, the
+    // bug this fixes). Never returns; the shell reaps us.
     loop {
-        // Poll for quit every iteration so `q` is responsive between repaints.
-        if let Some(b) = ctx.try_console_read() {
-            if b == b'q' || b == b'Q' {
-                break;
-            }
-        }
-        ctx.yield_cpu();
-
+        ctx.sleep(POLL_SLEEP_CYCLES);
         let now = ctx.read_tsc();
         if now.wrapping_sub(last) >= FRAME_CYCLES {
             last = now;
@@ -104,13 +109,6 @@ fn run_live(
             print_state(ctx, prev_core_active, prev_core_total, true);
         }
     }
-
-    // Release the screen: show the cursor, restore echo, and drop below the last
-    // frame (which stays on screen — no alt-screen buffer) so the shell's prompt
-    // lands cleanly underneath.
-    ctx.console_write("\x1b[?25h");
-    ctx.console_echo(true);
-    ctx.console_write("\r\n");
 }
 
 fn print_state(

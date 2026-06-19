@@ -399,17 +399,23 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
-            // Pin to core 1: the poll loop busy-spins (no interrupt wired yet),
-            // so keep it off core 0 where the shell + TCB live (§9.2).
+            // Pin to core 1: keep the driver off core 0 where the shell + TCB live (§9.2).
             preferred_core:    1,
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
+            // Route the xHCI MSI (interrupts::XHCI_MSI_VECTOR = 0x28) to this driver's recv
+            // endpoint (§12). The kernel programmed the controller's MSI-X to this vector at
+            // boot; the driver enables the controller's interrupter and drains the events.
+            hw_irqs:           &[0x28],
             has_console_read:  false,
         })),
-        // `ehci` — userspace USB 2.0 driver (§12) for the back ports' EHCI
-        // controller. Same shape as `xhci`; the kernel grants its MMIO/DMA at
-        // spawn (E1b+). Pinned to core 1, off the shell/TCB on core 0.
+        // `ehci` — userspace USB 2.0 driver (§12) for the back ports' EHCI controller. Same
+        // shape as `xhci`; the kernel grants its MMIO/DMA at spawn (E1b+). Busy-polls on core 1
+        // (alongside xHCI) — the model that worked flawlessly. The EHCI's legacy INTx can't drive
+        // a block-and-wake loop on this hardware (deliver() fired zero times once the driver
+        // blocked across many T630 flashes), and the CPU-reduction attempts introduced quirks, so
+        // both USB drivers are back on plain busy-poll. Core 1 runs hot; reclaiming that idle is
+        // deferred (revisit later).
         "ehci" => Some(("ehci", ServiceConfig {
             elf:               include_bytes!(env!("SVC_EHCI_ELF")),
             has_recv_endpoint: true,
@@ -418,7 +424,9 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             preferred_core:    1,
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
+            // Route the EHCI INTx (interrupts::EHCI_MSI_VECTOR = 0x29, IOAPIC-routed) to this
+            // driver's recv endpoint (§12). The driver enables USBINTR + acks + unmasks.
+            hw_irqs:           &[0x29],
             has_console_read:  false,
         })),
         // `block-driver` — userspace ATA PIO disk driver (persistence, v2; §6.3,

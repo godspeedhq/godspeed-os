@@ -24,10 +24,20 @@ const MAX_IRQ: usize = 256;
 /// Registered driver endpoint for each IRQ line.
 static IRQ_TABLE: SpinLock<[Option<EndpointId>; MAX_IRQ]> = SpinLock::new([None; MAX_IRQ]);
 
+/// One-shot guard for the EHCI deliver() diagnostic (logs the first EHCI IRQ + its core).
+static EHCI_DELIVER_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Register a driver endpoint to receive interrupts for `irq`.
 /// Called at spawn time when the kernel processes a `hw_interrupt` capability.
 pub fn register(irq: u8, endpoint: EndpointId) {
     IRQ_TABLE.lock()[irq as usize] = Some(endpoint);
+}
+
+/// The driver endpoint registered for `irq`, if any. Used to gate the `IrqUnmask` syscall:
+/// only the driver that owns the route may re-open its IOAPIC gate (§12).
+pub fn registered_endpoint(irq: u8) -> Option<EndpointId> {
+    IRQ_TABLE.lock()[irq as usize]
 }
 
 /// Deliver IRQ `irq` to the registered driver as an IPC message.
@@ -36,6 +46,22 @@ pub fn register(irq: u8, endpoint: EndpointId) {
 /// Called from interrupt context with IF=0. The APIC EOI is sent unconditionally
 /// at the end; missing the EOI would leave the IRQ line permanently masked.
 pub unsafe fn deliver(irq: u8) {
+    // One-shot diagnostic: confirm the IDT actually receives the EHCI vector and on which core
+    // (the EHCI's legacy INTx delivery has been the hard part on the T630). Logged once.
+    if irq == crate::arch::x86_64::interrupts::EHCI_MSI_VECTOR
+        && !EHCI_DELIVER_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed)
+    {
+        crate::kprintln!(
+            "ehci: kernel deliver() vector={:#x} on core {}",
+            irq, crate::task::scheduler::current_core_id()
+        );
+    }
+    // For a level-triggered IOAPIC route (legacy INTx, e.g. the EHCI), mask the source now so
+    // it does not re-fire while the userspace driver handles it (the line stays asserted until
+    // the driver clears the device's interrupt status). The driver unmasks via the IrqUnmask
+    // syscall after acking. No-op for edge/MSI vectors (the xHCI), which need no masking.
+    crate::arch::x86_64::ioapic::mask_vector(irq);
+
     let endpoint = IRQ_TABLE.lock()[irq as usize];
     if let Some(ep) = endpoint {
         let msg = crate::ipc::message::Message::interrupt_event(irq);

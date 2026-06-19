@@ -65,6 +65,84 @@ static TASK_KERNEL_STACK_TOP: [AtomicU64; MAX_TASKS] =
 static mut TASK_ENDPOINT: [Option<EndpointId>; MAX_TASKS] =
     [const { None }; MAX_TASKS];
 
+/// Timed-wake deadline (TSC cycles) for a task blocked in `recv_timeout` (§12). 0 = no
+/// timed wake. Set before the task blocks; the core-0 timer ISR scans these and wakes any
+/// blocked task whose deadline has passed (so a driver can wait on an interrupt yet still
+/// wake on a timer for auto-repeat). Wake granularity is the timer period (coarse — fine
+/// for repeat). The owning task clears its entry on every `recv_timeout` return path.
+/// Each slot's `recv_timeout` wake deadline, expressed in **BSP timer ticks** (`MONOTONIC_TICKS`),
+/// not TSC cycles — `0` = disarmed. Ticks, not cycles, because the deadline is set on the task's
+/// core but evaluated by core 0's scan, and AMD cores need not share a TSC (a TSC deadline set on
+/// core 1 can never be reached by core 0's TSC — this is exactly what wedged the first blocking
+/// build: the driver never woke). `MONOTONIC_TICKS` is a single counter advanced only by the BSP,
+/// so any core compares the same clock. Granularity is one quantum (~10 ms) — plenty for an I/O
+/// wake. The owning task clears its entry on every `recv_timeout` return path.
+static TASK_WAKE_DEADLINE: [AtomicU64; MAX_TASKS] =
+    [const { AtomicU64::new(0) }; MAX_TASKS];
+
+/// Monotonic timer-tick counter advanced once per quantum **by the BSP only** (core 0), which
+/// ticks reliably even when other cores idle. The core-independent clock the timed-wake (§12)
+/// measures deadlines against — see `TASK_WAKE_DEADLINE`. Distinct from `CORE_TOTAL_TICKS` (which
+/// is per-core and counts yields too).
+static MONOTONIC_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// Current BSP tick count (the timed-wake clock).
+pub fn monotonic_ticks() -> u64 {
+    MONOTONIC_TICKS.load(Ordering::Relaxed)
+}
+
+/// Convert a `recv_timeout` duration in TSC cycles to a count of BSP ticks (≥1), for arming a
+/// timed wake on the core-independent clock. Falls back to 1 tick if the quantum isn't calibrated.
+pub fn cycles_to_ticks(cycles: u64) -> u64 {
+    let q = crate::arch::x86_64::boot::tsc_ticks_per_quantum();
+    if q == 0 { 1 } else { (cycles / q).max(1) }
+}
+
+/// Arm a timed wake for `slot` at absolute BSP-tick `deadline` (0 disarms).
+pub fn set_wake_deadline(slot: usize, deadline: u64) {
+    if slot < MAX_TASKS {
+        TASK_WAKE_DEADLINE[slot].store(deadline, Ordering::Relaxed);
+    }
+}
+
+/// Disarm any timed wake for `slot`.
+pub fn clear_wake_deadline(slot: usize) {
+    if slot < MAX_TASKS {
+        TASK_WAKE_DEADLINE[slot].store(0, Ordering::Relaxed);
+    }
+}
+
+/// Advance the BSP tick clock and wake every task whose `recv_timeout` deadline has passed.
+/// Called from the **BSP** (core 0) timer ISR — the BSP ticks reliably even when other cores
+/// idle, so it is the dependable driver of all timed wakes. Cheap: a scan of `MAX_TASKS` relaxed
+/// loads, almost all zero. Only wakes a task still `BlockedOnRecv` (one that already returned
+/// cleared its deadline; the state guard also avoids reviving one that moved on). The wake
+/// result is 0 — the woken `recv_timeout` re-checks its own deadline and returns the timeout.
+///
+/// **BSP-driven, tick-clocked, by design (§9, §12).** Earlier attempts each failed on real SMP
+/// hardware (both invisible under QEMU TCG, which serialises cores and keeps TSCs in lockstep):
+/// a core-0 scan comparing a TSC deadline set on core 1 never fired (unsynchronised TSCs — the
+/// driver never woke at all); a per-core scan on the task's own core fired only when that core's
+/// timer did, but an idle AP's timer is unreliable on this hardware (the driver woke, but
+/// rarely → seconds of input lag). The cure is to (1) measure deadlines in BSP **ticks** via a
+/// single `MONOTONIC_TICKS` counter, so any core compares one clock, and (2) drive the scan from
+/// the BSP, which always ticks. The wake just CASes the task `Ready`; an idle AP's busy
+/// `sti`-spin idle loop re-checks `pick_next` every iteration and picks it up immediately, so no
+/// cross-core IPI is needed for correctness (the IPI in `wake_by_slot` only shortens the latency).
+pub fn scan_timed_wakes() {
+    let now = MONOTONIC_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    for slot in 0..MAX_TASKS {
+        let deadline = TASK_WAKE_DEADLINE[slot].load(Ordering::Relaxed);
+        if deadline != 0
+            && now >= deadline
+            && TASK_STATE[slot].load(Ordering::Relaxed) == TaskState::BlockedOnRecv as u8
+        {
+            TASK_WAKE_DEADLINE[slot].store(0, Ordering::Relaxed);
+            wake_by_slot(slot, 0);
+        }
+    }
+}
+
 /// Saved user-space RSP for each ring-3 task.  Updated whenever the task is
 /// switched away from mid-SYSCALL so the SYSRETQ exit path sees the correct
 /// per-task RSP instead of another task's value written to PER_CORE_SYSCALL.
@@ -215,7 +293,7 @@ static mut CORE_SCHED_CTX: [TaskContext; MAX_CORES] = [const {
 /// Read the local APIC ID register and look up the assigned core index.
 ///
 /// Must only be called after `init_local_apic` on this core.
-fn current_core_id() -> usize {
+pub fn current_core_id() -> usize {
     // SAFETY: APIC is mapped before the scheduler ever runs on any core.
     let lapic_id = unsafe { crate::arch::x86_64::boot::get_lapic_id() };
     crate::smp::core::lapic_to_core_id(lapic_id) as usize
@@ -841,6 +919,10 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         if cid == 0 {
             crate::control::process_pending();
             crate::arch::x86_64::uart_rx_poll();
+            // Advance the BSP tick clock + wake any task whose recv_timeout deadline elapsed
+            // (§12 timed-wait). BSP-driven because the BSP ticks reliably while APs idle; the
+            // wake is tick-clocked so it's valid cross-core. See scan_timed_wakes.
+            scan_timed_wakes();
         }
 
         let prev = CORE_CURRENT[cid].load(Ordering::Relaxed);

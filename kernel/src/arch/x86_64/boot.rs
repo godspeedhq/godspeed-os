@@ -482,6 +482,15 @@ pub unsafe fn rearm_tsc_deadline() {
     unsafe { arm_tsc_deadline_now(ticks) };
 }
 
+/// TSC cycles per scheduler quantum (the timer period), or 0 before the local APIC timer is
+/// calibrated. Used to convert a cycle-based `recv_timeout` into a count of timer ticks for the
+/// core-independent timed-wake clock (§12) — a TSC deadline can't be compared across cores
+/// whose TSCs need not be synchronised, so the timed-wake counts ticks of the BSP timer instead.
+#[inline]
+pub fn tsc_ticks_per_quantum() -> u64 {
+    TSC_TICKS_PER_QUANTUM.load(Ordering::Relaxed)
+}
+
 /// Returns true when running on a GenuineIntel CPU.
 ///
 /// Used to gate Intel-specific MSR accesses (e.g. MSR 0xE2) that do not exist
@@ -996,6 +1005,12 @@ pub(super) unsafe fn init_idt() {
         idt[14]   = IdtEntry::new(pf_stub   as *const () as u64);
         idt[32]   = IdtEntry::new(timer);
         idt[36]   = IdtEntry::new(super::interrupts::uart_rx_isr_stub as *const () as u64); // IRQ 4 = COM1 RX
+        // xHCI MSI (§12) — routed to the userspace driver via interrupt::route. The device
+        // delivers here once its interrupter is enabled (P2); harmless until then.
+        idt[super::interrupts::XHCI_MSI_VECTOR as usize] =
+            IdtEntry::new(super::interrupts::xhci_msi_isr_stub as *const () as u64);
+        idt[super::interrupts::EHCI_MSI_VECTOR as usize] =
+            IdtEntry::new(super::interrupts::ehci_msi_isr_stub as *const () as u64);
         idt[0x80] = IdtEntry::new_user(super::syscall_entry::int80_entry as *const () as u64);
         idt[0xF0] = IdtEntry::new(ipi_wake_stub   as *const () as u64);
         idt[0xF1] = IdtEntry::new(ipi_tlb_stub    as *const () as u64);

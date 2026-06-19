@@ -167,6 +167,13 @@ impl KeyRepeat {
         self.key = 0;
     }
 
+    /// Is a key currently held (repeat armed)? A driver uses this to decide how long to
+    /// block: a short timeout while a key is down (to wake and emit repeats), a long one
+    /// otherwise (the keyboard is silent, so just idle until the next interrupt).
+    pub fn armed(&self) -> bool {
+        self.key != 0
+    }
+
     /// Emit a repeat of the held key if one is due at `now`. Call once per poll
     /// iteration; a no-op until `initial` elapses, then fires at most once per `interval`.
     pub fn poll(&mut self, now: u64, mut emit: impl FnMut(u8)) {
@@ -176,6 +183,17 @@ impl KeyRepeat {
         emit_key(self.key, self.mods, &mut emit);
         self.next_at = now.wrapping_add(self.interval);
     }
+}
+
+/// Is an 8-byte HID boot report real device data, or the all-`0xff` signature of a failed/stale
+/// DMA read (a device that vanished mid-transaction, or a buffer the controller never wrote)?
+/// Returns `false` only for an all-`0xff` report. This is the **universal** garbage check — safe
+/// for both keyboards and mice (a real mouse won't send all-`0xff`; a keyboard never does) —
+/// which a driver uses to count a wedged endpoint toward disconnect and re-enumerate. (The
+/// keyboard decoder additionally rejects any report whose reserved byte 1 ≠ 0, a stricter check
+/// that only makes sense for keyboards.)
+pub fn report_is_valid(report: &[u8; 8]) -> bool {
+    *report != [0xFF; 8]
 }
 
 /// Decode a keyboard boot report (modifiers in byte 0, up to six keycodes in
@@ -196,6 +214,16 @@ pub fn decode_keyboard(
     mut emit: impl FnMut(u8),
     mut on_unmapped: impl FnMut(u8),
 ) {
+    // Reject an invalid report before decoding it. Byte 1 of a USB HID boot-keyboard report is
+    // reserved and is always 0; an all-`0xff` report (byte 1 == 0xff) is the signature of a
+    // failed/stale DMA read — what the buffer returns when the device has gone (e.g. mid-unplug)
+    // or the endpoint's buffer wasn't refreshed. Decoding it would spew 0xff "keystrokes" to the
+    // console AND corrupt `last` (poisoning edge-detection so later real keys diff wrong and
+    // never register). Drop it untouched: don't emit, don't update `last`, don't disarm repeat —
+    // so the next genuine report decodes cleanly.
+    if report[1] != 0 {
+        return;
+    }
     let mods = report[0];
     let cur = [report[2], report[3], report[4], report[5], report[6], report[7]];
     for &k in cur.iter() {

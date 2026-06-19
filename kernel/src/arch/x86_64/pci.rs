@@ -388,6 +388,268 @@ pub fn ehci_flr_probe() {
     }
 }
 
+/// Program a device's MSI capability to deliver interrupts to local-APIC `vector` on the
+/// BSP, then enable MSI. Returns `true` if an MSI capability (id 0x05) was found and
+/// programmed. Edge-triggered, fixed delivery, a single message vector.
+///
+/// MSI is the kernel's device-interrupt path (§12): the device writes the message —
+/// address `0xFEE00000` (LAPIC, dest BSP) and data = `vector` — straight to the local APIC,
+/// so no IOAPIC or ACPI `_PRT` routing is needed. The caller must have installed an IDT
+/// handler for `vector` (→ `interrupt::route::deliver`) before the device starts raising it.
+///
+/// Note: only legacy MSI (cap 0x05) here, not MSI-X (cap 0x11, a separate MMIO table). USB
+/// controllers expose MSI; if a device is MSI-X-only this returns false and the caller keeps
+/// polling.
+pub fn program_msi(bdf: u32, vector: u8, dest_apic: u8) -> bool {
+    let bus = ((bdf >> 8) & 0xff) as u8;
+    let dev = ((bdf >> 3) & 0x1f) as u8;
+    let func = (bdf & 0x7) as u8;
+
+    // Capabilities list present? Status register (0x06) bit 4.
+    let status = (config_read32(bus, dev, func, 0x04) >> 16) as u16;
+    if status & (1 << 4) == 0 {
+        return false;
+    }
+    // Walk the capability list from the Capabilities Pointer (0x34, low byte).
+    let mut cap = (config_read32(bus, dev, func, 0x34) & 0xFC) as u8;
+    let mut guard = 48;
+    while cap >= 0x40 && guard > 0 {
+        guard -= 1;
+        let hdr = config_read32(bus, dev, func, cap);
+        let cap_id = (hdr & 0xFF) as u8;
+        let next = ((hdr >> 8) & 0xFF) as u8;
+        if cap_id == 0x05 {
+            // MSI capability. Message Control = hdr[31:16]; bit 7 = 64-bit address capable.
+            let ctrl = (hdr >> 16) as u16;
+            let is_64 = ctrl & (1 << 7) != 0;
+            // Message Address (low) at cap+0x04 = 0xFEE00000 | (dest_apic << 12).
+            config_write32(bus, dev, func, cap + 0x04, 0xFEE0_0000 | ((dest_apic as u32) << 12));
+            if is_64 {
+                config_write32(bus, dev, func, cap + 0x08, 0);                 // addr high
+                config_write32(bus, dev, func, cap + 0x0C, vector as u32);      // data (edge/fixed)
+            } else {
+                config_write32(bus, dev, func, cap + 0x08, vector as u32);      // data
+            }
+            // Enable MSI (ctrl bit 0); Multiple Message Enable = 0 (bits[6:4]) → 1 vector.
+            let new_ctrl = (ctrl & !(0x7u16 << 4)) | 1;
+            let new_hdr = (hdr & 0x0000_FFFF) | ((new_ctrl as u32) << 16);
+            config_write32(bus, dev, func, cap, new_hdr);
+            crate::kprintln!(
+                "pci: MSI enabled on {:02x}:{:02x}.{} vector={:#x} ({}-bit addr)",
+                bus, dev, func, vector, if is_64 { 64 } else { 32 }
+            );
+            return true;
+        }
+        if next == 0 {
+            break;
+        }
+        cap = next;
+    }
+    crate::kprintln!("pci: no MSI capability (id 0x05) on {:02x}:{:02x}.{}", bus, dev, func);
+    false
+}
+
+/// Program a device's MSI-X capability (id 0x11): point table entry 0 at local-APIC
+/// `vector` on the BSP, unmask it, and enable MSI-X. Returns `true` if MSI-X was found and
+/// programmed. Most modern controllers (incl. `qemu-xhci`) expose MSI-X rather than MSI.
+///
+/// MSI-X's message table lives in **MMIO** (inside a BAR), not config space, so this maps
+/// the table's page uncached at its HHDM alias (the same pattern the IOMMU MMIO uses) and
+/// writes entry 0. The device must also be a bus master (Command bit 2) to issue the
+/// upstream MSI memory write. The caller installs the IDT handler for `vector` first.
+pub fn program_msix(bdf: u32, vector: u8, dest_apic: u8) -> bool {
+    let bus = ((bdf >> 8) & 0xff) as u8;
+    let dev = ((bdf >> 3) & 0x1f) as u8;
+    let func = (bdf & 0x7) as u8;
+
+    let status = (config_read32(bus, dev, func, 0x04) >> 16) as u16;
+    if status & (1 << 4) == 0 {
+        return false;
+    }
+    let mut cap = (config_read32(bus, dev, func, 0x34) & 0xFC) as u8;
+    let mut guard = 48u8;
+    while cap >= 0x40 && guard > 0 {
+        guard -= 1;
+        let hdr = config_read32(bus, dev, func, cap);
+        let cap_id = (hdr & 0xFF) as u8;
+        let next = ((hdr >> 8) & 0xFF) as u8;
+        if cap_id == 0x11 {
+            // Table Offset/BIR (cap+0x04): bits[2:0] = BAR index, bits[31:3] = byte offset.
+            let tbl = config_read32(bus, dev, func, cap + 0x04);
+            let bir = (tbl & 0x7) as u8;
+            let tbl_off = (tbl & !0x7u32) as u64;
+            // Physical base of BAR[bir] (handle a 64-bit memory BAR).
+            let bar_off = 0x10u8 + bir * 4;
+            let bar = config_read32(bus, dev, func, bar_off);
+            let bar_phys = if bar & 0x6 == 0x4 {
+                let bar_hi = config_read32(bus, dev, func, bar_off + 4);
+                ((bar_hi as u64) << 32) | ((bar & 0xFFFF_FFF0) as u64)
+            } else {
+                (bar & 0xFFFF_FFF0) as u64
+            };
+            let tbl_phys = bar_phys + tbl_off;
+
+            // Map the table's page uncached at its HHDM alias (Limine's HHDM covers RAM but
+            // not MMIO, so add the page to the active tables ourselves — like the IOMMU).
+            let hhdm = crate::arch::x86_64::page_tables::get_hhdm_offset();
+            let page_phys = tbl_phys & !0xFFFu64;
+            let va_page = hhdm.wrapping_add(page_phys);
+            {
+                use crate::arch::x86_64::page_tables::{map_in_active_tables, PageFlags};
+                let flags = PageFlags::PRESENT.bits()
+                    | PageFlags::WRITABLE.bits()
+                    | PageFlags::NO_EXEC.bits()
+                    | PageFlags::PWT.bits()
+                    | PageFlags::PCD.bits();
+                // SAFETY: page-aligned MMIO page (the device's MSI-X table BAR), uncached;
+                // already-present is a no-op.
+                let _ = unsafe { map_in_active_tables(va_page, page_phys, flags) };
+            }
+            let entry = hhdm.wrapping_add(tbl_phys); // table entry 0 (16 bytes)
+            // SAFETY: `entry` addresses MSI-X table entry 0 in the just-mapped MMIO page.
+            unsafe {
+                core::ptr::write_volatile((entry + 0x00) as *mut u32,
+                    0xFEE0_0000 | ((dest_apic as u32) << 12));                        // addr lo (LAPIC dest)
+                core::ptr::write_volatile((entry + 0x04) as *mut u32, 0);           // addr hi
+                core::ptr::write_volatile((entry + 0x08) as *mut u32, vector as u32);// data (edge/fixed)
+                core::ptr::write_volatile((entry + 0x0C) as *mut u32, 0);           // vector control: unmask
+            }
+
+            // Bus master enable (Command bit 2) so the device can issue the MSI write.
+            let cmd = config_read32(bus, dev, func, 0x04);
+            config_write32(bus, dev, func, 0x04, cmd | (1 << 2));
+
+            // Enable MSI-X (Message Control bit 15), clear the function mask (bit 14).
+            let ctrl = (hdr >> 16) as u16;
+            let new_ctrl = (ctrl & !(1u16 << 14)) | (1u16 << 15);
+            let new_hdr = (hdr & 0x0000_FFFF) | ((new_ctrl as u32) << 16);
+            config_write32(bus, dev, func, cap, new_hdr);
+
+            crate::kprintln!(
+                "pci: MSI-X enabled on {:02x}:{:02x}.{} vector={:#x} bir={} tbl@{:#x}",
+                bus, dev, func, vector, bir, tbl_phys
+            );
+            return true;
+        }
+        if next == 0 {
+            break;
+        }
+        cap = next;
+    }
+    false
+}
+
+/// Program the picked xHCI controller's MSI to deliver to the kernel's xHCI MSI vector
+/// (P1, USB interrupts). No-op (returns false) if no xHCI was found. The controller's own
+/// interrupter must be enabled by the driver before any MSI actually fires (P2); this only
+/// sets up the message so it *can*. Call after `init()` and after the local APIC is up.
+pub fn program_xhci_msi() -> bool {
+    if !XHCI_FOUND.load(Ordering::Relaxed) {
+        return false;
+    }
+    let bdf = XHCI_BDF.load(Ordering::Relaxed);
+    let vector = crate::arch::x86_64::interrupts::XHCI_MSI_VECTOR;
+    let dest = usb_irq_dest_lapic();
+    // Prefer plain MSI; fall back to MSI-X (what qemu-xhci and most real xHCIs expose).
+    program_msi(bdf, vector, dest) || program_msix(bdf, vector, dest)
+}
+
+/// LAPIC id to deliver USB-controller interrupts to: the core the USB drivers are pinned to
+/// (core 1, per the xhci/ehci contracts' `preferred_core`). Delivering the IRQ to the driver's
+/// OWN core means a device event (a keypress) wakes that core directly out of its idle `hlt`
+/// and the wake stays core-local — no cross-core IPI or BSP scan, which an idle AP on this
+/// hardware (ARAT `hlt` idle) does not service promptly (§12). Falls back to the BSP if there
+/// is no core 1 (single-core), where the driver runs on the BSP anyway.
+fn usb_irq_dest_lapic() -> u8 {
+    const USB_DRIVER_CORE: u32 = 1;
+    if crate::smp::core::is_ready(USB_DRIVER_CORE) {
+        crate::smp::core::core_lapic_id(USB_DRIVER_CORE) as u8
+    } else {
+        crate::arch::x86_64::ioapic::bsp_lapic_id()
+    }
+}
+
+/// Try to program the EHCI controller's MSI/MSI-X (interrupt-driven USB, §12). Returns true
+/// if MSI or MSI-X was found and programmed (→ the easy path, like xHCI). Logs the outcome.
+/// Classic Intel-ICH EHCI exposes neither (legacy INTx only — would need IOAPIC routing);
+/// other EHCIs (e.g. AMD) may have MSI. This both does P1 (when MSI exists) AND tells us at
+/// boot which interrupt path the running machine's EHCI needs.
+pub fn program_ehci_msi() -> bool {
+    if !EHCI_FOUND.load(Ordering::Relaxed) {
+        return false;
+    }
+    let bdf = EHCI_BDF.load(Ordering::Relaxed);
+    let vector = crate::arch::x86_64::interrupts::EHCI_MSI_VECTOR;
+    let dest = usb_irq_dest_lapic();
+    let ok = program_msi(bdf, vector, dest) || program_msix(bdf, vector, dest);
+    if !ok {
+        crate::kprintln!(
+            "ehci: no MSI/MSI-X capability — controller uses legacy INTx (IOAPIC routing needed)"
+        );
+    }
+    ok
+}
+
+/// Route the EHCI's legacy INTx pin through the IOAPIC to the kernel's EHCI vector (§12), for
+/// a controller with no MSI.
+///
+/// We have no ACPI `_PRT` parser, so the exact GSI the EHCI's INTx pin maps to is unknown: the
+/// PCI interrupt-line register holds the legacy 8259 IRQ (usually 11), but an AMD FCH routes PCI
+/// INTx to a *higher* GSI in the 16–23 range. Rather than gamble on one, we program a **candidate
+/// set** — the legacy line plus the platform PCI-INTx range — all to the same EHCI vector,
+/// level-triggered + active-low (PCI INTx), destination = the real BSP local-APIC id. Only the
+/// EHCI uses INTx (AHCI polls, xHCI is MSI), so the spurious candidates never fire; the one that
+/// matches the hardware delivers. Each is registered as a level route so dispatch masks — and the
+/// driver unmasks — the whole set together. No-op if no EHCI. Call after `ioapic::init()`.
+pub fn route_ehci_intx() {
+    if !EHCI_FOUND.load(Ordering::Relaxed) {
+        return;
+    }
+    let vector = crate::arch::x86_64::interrupts::EHCI_MSI_VECTOR;
+    // Deliver to the BSP (core 0) — a legacy PCI INTx pin routes through the IOAPIC only to the
+    // BSP on this hardware (unlike an MSI, which can target any core). The EHCI driver is pinned
+    // to core 0 to match (task/mod.rs), so the keypress wakes core 0 from its idle hlt, deliver()
+    // runs on core 0, and the wake to the core-0 driver is local — no cross-core wake (which an
+    // idle, halted AP doesn't service promptly). Verified on the T630: INTx delivers to the BSP;
+    // routing it to an AP's LAPIC id silently dropped it.
+    let dest = crate::arch::x86_64::ioapic::bsp_lapic_id();
+    let legacy = EHCI_IRQ.load(Ordering::Relaxed);
+
+    // Legacy INTx only asserts the device's INTx# pin when PCI Command bit 10 (Interrupt
+    // Disable) is CLEAR. If firmware left it set (common after MSI-style init elsewhere), even
+    // a correct IOAPIC route delivers nothing. Clear it (and keep bus-master for the EHCI's DMA).
+    {
+        let bdf = EHCI_BDF.load(Ordering::Relaxed);
+        let bus = ((bdf >> 8) & 0xFF) as u8;
+        let dev = ((bdf >> 3) & 0x1F) as u8;
+        let func = (bdf & 0x07) as u8;
+        let cmd = config_read32(bus, dev, func, 0x04);
+        // bit10 = Interrupt Disable (clear), bit2 = Bus Master (set), bit1 = Memory Space (set).
+        let new = (cmd & !(1 << 10)) | (1 << 2) | (1 << 1);
+        if new != cmd {
+            config_write32(bus, dev, func, 0x04, new);
+            crate::kprintln!("ehci: PCI command {:#06x} -> {:#06x} (INTx-disable cleared)",
+                cmd & 0xFFFF, new & 0xFFFF);
+        }
+    }
+    // Candidate GSIs: the legacy interrupt-line value (usually 11) + the AMD FCH PCI-INTx range.
+    let mut candidates: [u8; 9] = [legacy, 16, 17, 18, 19, 20, 21, 22, 23];
+    for i in 0..candidates.len() {
+        let gsi = candidates[i];
+        // Skip a duplicate if the legacy line already falls in 16..=23.
+        if candidates[..i].contains(&gsi) {
+            continue;
+        }
+        crate::arch::x86_64::ioapic::set_redir(gsi, vector, dest, false);
+        crate::arch::x86_64::ioapic::set_level_route(vector, gsi);
+    }
+    let _ = &mut candidates;
+    crate::kprintln!(
+        "ehci: legacy INTx routed via IOAPIC candidates [{} ,16..=23] -> vector={:#x} dest_apic={}",
+        legacy, vector, dest
+    );
+}
+
 /// Scan the PCI bus for the xHCI controller and record its MMIO base + IRQ.
 /// Called once on the BSP during boot. Logs the result either way.
 pub fn init() {

@@ -295,6 +295,48 @@ impl ServiceContext {
         }
     }
 
+    /// Non-blocking receive on this service's primary recv endpoint: `Some(msg)` if a
+    /// message was waiting, `None` if the queue is empty. A busy-polling driver uses this
+    /// to drain interrupt events (§12) each loop iteration without blocking.
+    pub fn try_recv(&self) -> Option<Message> {
+        let data = Self::ctx();
+        if data.magic != SERVICE_CTX_MAGIC { return None; }
+        let slot = data.recv_slot;
+        if slot == u32::MAX { return None; }
+        crate::ipc::try_recv(CapHandle(slot)).ok().flatten()
+    }
+
+    /// Block on this service's recv endpoint until a message arrives or `timeout_cycles`
+    /// (TSC cycles) elapse: `Some(msg)` = message, `None` = timed out. `timeout_cycles == 0`
+    /// blocks forever. A driver uses this to idle on its hardware interrupt while still
+    /// waking on a timer for auto-repeat (§12 timed-wait).
+    pub fn recv_timeout(&self, timeout_cycles: u64) -> Option<Message> {
+        let data = Self::ctx();
+        if data.magic != SERVICE_CTX_MAGIC { return None; }
+        let slot = data.recv_slot;
+        if slot == u32::MAX { return None; }
+        crate::ipc::recv_timeout(CapHandle(slot), timeout_cycles).ok().flatten()
+    }
+
+    /// Re-open the kernel's IOAPIC gate for a level-triggered IRQ `vector` after this driver
+    /// has cleared its device's interrupt source (§12). The kernel masks a level INTx while the
+    /// driver handles it (so it can't storm); call this to let it fire again. Only the driver
+    /// registered for `vector` (via its `hw_interrupt` route) may unmask it. No-op for MSI.
+    pub fn irq_unmask(&self, vector: u8) {
+        // SAFETY: syscall(36) = IrqUnmask; gated kernel-side by the route registration.
+        let _ = unsafe { raw_syscall(36, vector as u64, 0, 0) };
+    }
+
+    /// Block this task for roughly `cycles` TSC cycles, then return (syscall 37). A real sleep:
+    /// the core can halt while parked, so a poll/wait loop does not busy-`yield` (which pegs the
+    /// core at ~100% and makes every task on it read as fully busy in `observe`). Like `yield`,
+    /// needs no capability. Granularity is one scheduler quantum (~10 ms). Use for UI repaint
+    /// pacing and "wait for child" loops — not for precise timing.
+    pub fn sleep(&self, cycles: u64) {
+        // SAFETY: syscall(37) = Sleep; sleeping your own task is unprivileged (like yield).
+        let _ = unsafe { raw_syscall(37, cycles, 0, 0) };
+    }
+
     /// Block until a message arrives; returns the error instead of looping silently.
     pub fn recv_result(&self) -> Result<Message, crate::ipc::IpcError> {
         let data = Self::ctx();
