@@ -388,6 +388,67 @@ pub fn ehci_flr_probe() {
     }
 }
 
+/// Program a device's MSI capability to deliver interrupts to local-APIC `vector` on the
+/// BSP, then enable MSI. Returns `true` if an MSI capability (id 0x05) was found and
+/// programmed. Edge-triggered, fixed delivery, a single message vector.
+///
+/// MSI is the kernel's device-interrupt path (§12): the device writes the message —
+/// address `0xFEE00000` (LAPIC, dest BSP) and data = `vector` — straight to the local APIC,
+/// so no IOAPIC or ACPI `_PRT` routing is needed. The caller must have installed an IDT
+/// handler for `vector` (→ `interrupt::route::deliver`) before the device starts raising it.
+///
+/// Note: only legacy MSI (cap 0x05) here, not MSI-X (cap 0x11, a separate MMIO table). USB
+/// controllers expose MSI; if a device is MSI-X-only this returns false and the caller keeps
+/// polling.
+pub fn program_msi(bdf: u32, vector: u8) -> bool {
+    let bus = ((bdf >> 8) & 0xff) as u8;
+    let dev = ((bdf >> 3) & 0x1f) as u8;
+    let func = (bdf & 0x7) as u8;
+
+    // Capabilities list present? Status register (0x06) bit 4.
+    let status = (config_read32(bus, dev, func, 0x04) >> 16) as u16;
+    if status & (1 << 4) == 0 {
+        return false;
+    }
+    // Walk the capability list from the Capabilities Pointer (0x34, low byte).
+    let mut cap = (config_read32(bus, dev, func, 0x34) & 0xFC) as u8;
+    let mut guard = 48;
+    while cap >= 0x40 && guard > 0 {
+        guard -= 1;
+        let hdr = config_read32(bus, dev, func, cap);
+        let cap_id = (hdr & 0xFF) as u8;
+        let next = ((hdr >> 8) & 0xFF) as u8;
+        if cap_id == 0x05 {
+            // MSI capability. Message Control = hdr[31:16]; bit 7 = 64-bit address capable.
+            let ctrl = (hdr >> 16) as u16;
+            let is_64 = ctrl & (1 << 7) != 0;
+            // Message Address (low) at cap+0x04 = 0xFEE00000 | (dest_apic << 12); BSP = 0.
+            config_write32(bus, dev, func, cap + 0x04, 0xFEE0_0000);
+            if is_64 {
+                config_write32(bus, dev, func, cap + 0x08, 0);                 // addr high
+                config_write32(bus, dev, func, cap + 0x0C, vector as u32);      // data (edge/fixed)
+            } else {
+                config_write32(bus, dev, func, cap + 0x08, vector as u32);      // data
+            }
+            // Enable MSI (ctrl bit 0); Multiple Message Enable = 0 (bits[6:4]) → 1 vector.
+            let new_ctrl = (ctrl & !(0x7u16 << 4)) | 1;
+            let new_hdr = (hdr & 0x0000_FFFF) | ((new_ctrl as u32) << 16);
+            config_write32(bus, dev, func, cap, new_hdr);
+            crate::kprintln!(
+                "pci: MSI enabled on {:02x}:{:02x}.{} vector={:#x} ({}-bit addr)",
+                bus, dev, func, vector, if is_64 { 64 } else { 32 }
+            );
+            return true;
+        }
+        if next == 0 {
+            break;
+        }
+        cap = next;
+    }
+    crate::kprintln!("pci: no MSI capability (id 0x05) on {:02x}:{:02x}.{}", bus, dev, func);
+    false
+}
+
 /// Scan the PCI bus for the xHCI controller and record its MMIO base + IRQ.
 /// Called once on the BSP during boot. Logs the result either way.
 pub fn init() {
