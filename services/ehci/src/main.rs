@@ -749,7 +749,7 @@ fn poll_devices(
     // Typematic auto-repeat, timed in TSC cycles (read_tsc is hardware-proven to advance,
     // unlike the coarse kernel tick): ~300 ms before the first repeat, then ~50 ms apart
     // at ~2 GHz. The spread across 1.5–3 GHz CPUs just shifts the feel slightly.
-    let mut kb_rep = godspeed_sdk::hid::KeyRepeat::new(600_000_000, 100_000_000);
+    let mut kb_rep = godspeed_sdk::hid::KeyRepeat::new(REPEAT_INITIAL_CYCLES, REPEAT_INTERVAL_CYCLES);
     let mut mouse = godspeed_sdk::hid::MouseTracker::new(); // mouse button/motion state
     loop {
         for i in 0..n {
@@ -806,20 +806,29 @@ fn poll_devices(
                 sts_logged = true;
             }
         }
-        // E2 (interrupt-driven, §12): drain any interrupt the kernel routed here (EHCI INTx →
-        // IOAPIC → vector 0x29 → IPC). The kernel masked the level source on deliver; ack by
-        // clearing USBSTS (deasserts INTx), then unmask so it can fire again. The poll above
-        // already processed the reports — belt-and-suspenders.
-        while ctx.try_recv().is_some() {
-            let sts = mmio.read32(op + OP_USBSTS);
+        // E4 (interrupt-driven, §12): BLOCK instead of spin. The core idles here until the
+        // controller's INTx wakes us (a completed HID report sets USBSTS.USBINT → IOAPIC →
+        // vector 0x29 → IPC) or the timer wakes us — a short timeout while a key is held (to
+        // emit auto-repeats; a held key is silent), a long one otherwise (idle, with an
+        // occasional hot-plug / disconnect re-check as a safety net). This is what drops the
+        // core from ~100% busy-poll to ~0% idle. The scan above runs each time we wake, so a
+        // report that arrived with the interrupt is processed on the next pass.
+        let timeout = if kb_rep.armed() { REPEAT_INTERVAL_CYCLES } else { HOTPLUG_POLL_CYCLES };
+        let woke = ctx.recv_timeout(timeout).is_some();
+        // Drain any further queued interrupt IPCs so the next recv_timeout truly idles.
+        while ctx.try_recv().is_some() {}
+        // Ack + unmask the level INTx: clear USBSTS (deasserts the pin) BEFORE unmasking, so the
+        // IOAPIC entry the kernel masked on deliver can fire again without storming. On a pure
+        // timeout wake the vector was never masked, so the unmask is a harmless no-op.
+        let sts = mmio.read32(op + OP_USBSTS);
+        if sts & STS_INT_BITS != 0 {
             mmio.write32(op + OP_USBSTS, sts & STS_INT_BITS); // ack: clear W1C status bits
-            ctx.irq_unmask(EHCI_INT_VECTOR);
-            if !int_logged {
-                ctx.log("ehci: INTx interrupt received (E2: interrupt path live)");
-                int_logged = true;
-            }
         }
-        ctx.yield_cpu();
+        ctx.irq_unmask(EHCI_INT_VECTOR);
+        if woke && !int_logged {
+            ctx.log("ehci: INTx interrupt received (E2: interrupt path live)");
+            int_logged = true;
+        }
     }
 }
 
@@ -869,6 +878,14 @@ const INT_USB:        u32 = 1 << 0; // USB Interrupt (a transfer with IOC comple
 const INT_PCD:        u32 = 1 << 2; // Port Change Detect (hot-plug)
 const STS_INT_BITS:   u32 = 0x3F;   // the six W1C interrupt-status bits (0..5)
 const EHCI_INT_VECTOR: u8 = 0x29;   // matches kernel interrupts::EHCI_MSI_VECTOR
+
+// E4 (interrupt-driven, §12) blocking-loop timings, in TSC cycles (~2 GHz on the T630).
+// While a key is held the keyboard sends no further reports, so we wake on a short timer to
+// emit auto-repeats; otherwise we block on the interrupt with a long timer as a hot-plug /
+// disconnect safety net. Mirrors the xHCI P4 loop.
+const REPEAT_INITIAL_CYCLES:  u64 = 600_000_000;   // ~300 ms before the first repeat
+const REPEAT_INTERVAL_CYCLES: u64 = 100_000_000;   // ~50 ms between repeats (and held-key wake)
+const HOTPLUG_POLL_CYCLES:    u64 = 2_000_000_000; // ~1 s idle re-check (hot-plug / disconnect)
 const OP_PORTSC0:    usize = 0x44; // PORTSC[0]; +4 bytes per additional port
 
 const CMD_RS:        u32 = 1 << 0;  // Run/Stop
