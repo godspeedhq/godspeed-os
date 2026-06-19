@@ -217,6 +217,12 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     // MMIO base + IRQ for a future userspace driver's hw_mmio/hw_interrupt caps.
     arch::x86_64::pci::init();
 
+    // P1 (interrupt-driven USB, §12): program the xHCI's MSI capability so it CAN deliver
+    // interrupts to the kernel's IDT vector. The controller's interrupter stays OFF until
+    // the userspace driver enables it (P2), so nothing fires yet — this validates that MSI
+    // programming works on this controller (logs "MSI enabled …" or "no MSI capability").
+    arch::x86_64::pci::program_xhci_msi();
+
     // Take a USB controller from the firmware (BIOS→OS handoff) before the IOMMU
     // confines it — otherwise the firmware SMM keeps running its DMA out of
     // firmware memory, which faults under confinement and breaks the keyboard.

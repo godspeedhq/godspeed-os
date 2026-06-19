@@ -996,6 +996,10 @@ pub(super) unsafe fn init_idt() {
         idt[14]   = IdtEntry::new(pf_stub   as *const () as u64);
         idt[32]   = IdtEntry::new(timer);
         idt[36]   = IdtEntry::new(super::interrupts::uart_rx_isr_stub as *const () as u64); // IRQ 4 = COM1 RX
+        // xHCI MSI (§12) — routed to the userspace driver via interrupt::route. The device
+        // delivers here once its interrupter is enabled (P2); harmless until then.
+        idt[super::interrupts::XHCI_MSI_VECTOR as usize] =
+            IdtEntry::new(super::interrupts::xhci_msi_isr_stub as *const () as u64);
         idt[0x80] = IdtEntry::new_user(super::syscall_entry::int80_entry as *const () as u64);
         idt[0xF0] = IdtEntry::new(ipi_wake_stub   as *const () as u64);
         idt[0xF1] = IdtEntry::new(ipi_tlb_stub    as *const () as u64);

@@ -449,6 +449,18 @@ pub fn program_msi(bdf: u32, vector: u8) -> bool {
     false
 }
 
+/// Program the picked xHCI controller's MSI to deliver to the kernel's xHCI MSI vector
+/// (P1, USB interrupts). No-op (returns false) if no xHCI was found. The controller's own
+/// interrupter must be enabled by the driver before any MSI actually fires (P2); this only
+/// sets up the message so it *can*. Call after `init()` and after the local APIC is up.
+pub fn program_xhci_msi() -> bool {
+    if !XHCI_FOUND.load(Ordering::Relaxed) {
+        return false;
+    }
+    let bdf = XHCI_BDF.load(Ordering::Relaxed);
+    program_msi(bdf, crate::arch::x86_64::interrupts::XHCI_MSI_VECTOR)
+}
+
 /// Scan the PCI bus for the xHCI controller and record its MMIO base + IRQ.
 /// Called once on the BSP during boot. Logs the result either way.
 pub fn init() {
