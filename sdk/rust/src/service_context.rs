@@ -306,6 +306,18 @@ impl ServiceContext {
         crate::ipc::try_recv(CapHandle(slot)).ok().flatten()
     }
 
+    /// Block on this service's recv endpoint until a message arrives or `timeout_cycles`
+    /// (TSC cycles) elapse: `Some(msg)` = message, `None` = timed out. `timeout_cycles == 0`
+    /// blocks forever. A driver uses this to idle on its hardware interrupt while still
+    /// waking on a timer for auto-repeat (§12 timed-wait).
+    pub fn recv_timeout(&self, timeout_cycles: u64) -> Option<Message> {
+        let data = Self::ctx();
+        if data.magic != SERVICE_CTX_MAGIC { return None; }
+        let slot = data.recv_slot;
+        if slot == u32::MAX { return None; }
+        crate::ipc::recv_timeout(CapHandle(slot), timeout_cycles).ok().flatten()
+    }
+
     /// Block until a message arrives; returns the error instead of looping silently.
     pub fn recv_result(&self) -> Result<Message, crate::ipc::IpcError> {
         let data = Self::ctx();

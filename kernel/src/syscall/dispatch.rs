@@ -60,6 +60,7 @@ pub enum SyscallNumber {
     ResourceRevoke      = 32,
     LastRecvBadge       = 33,
     TryRecv             = 34,
+    RecvTimeout         = 35,
 }
 
 /// Raw syscall dispatcher — called from the SYSCALL/SYSENTER IDT stub.
@@ -80,6 +81,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::Send           as u64 => handle_send(arg0, arg1, arg2),
         n if n == SyscallNumber::Recv           as u64 => handle_recv(arg0, arg1, arg2),
         n if n == SyscallNumber::TryRecv        as u64 => handle_try_recv(arg0, arg1, arg2),
+        n if n == SyscallNumber::RecvTimeout    as u64 => handle_recv_timeout(arg0, arg1, arg2),
         n if n == SyscallNumber::TrySend        as u64 => handle_try_send(arg0, arg1, arg2),
         n if n == SyscallNumber::Yield          as u64 => {
             crate::task::scheduler::yield_current();
@@ -354,6 +356,71 @@ fn handle_try_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
         Err(IpcError::QueueEmpty) => TRY_RECV_EMPTY,
         Err(e) => ipc_err_to_i64(e),
     }
+}
+
+/// Sentinel returned by `RecvTimeout` when the timeout elapsed with no message (distinct
+/// from a non-negative length, `TRY_RECV_EMPTY`, and the cap/IPC error codes).
+pub const RECV_TIMED_OUT: i64 = -1001;
+
+/// Blocking `recv` with a timeout (syscall 35, §12 timed-wait). Blocks until a message
+/// arrives OR `timeout` TSC cycles elapse, whichever first; `timeout == 0` means no timeout
+/// (block forever, like `recv`). Returns the payload length, `RECV_TIMED_OUT` on timeout, or
+/// a negative error. Lets a driver wait on its interrupt yet still wake on a timer for
+/// auto-repeat. Args are packed to fit the 3-register ABI:
+///   arg0 = (out_len << 16) | (cap_slot & 0xFFFF), arg1 = out_buf, arg2 = timeout_cycles.
+fn handle_recv_timeout(packed: u64, out_buf: u64, timeout: u64) -> i64 {
+    let cap_slot = (packed & 0xFFFF) as usize;
+    let buf_len  = (packed >> 16) as usize;
+    let cap = match scheduler::current_task_lookup_cap(cap_slot, Rights::RECV) {
+        Ok(c)  => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    crate::invariants::assertions::assert_cap_validated(&Ok(()));
+    let endpoint_id = EndpointId(cap.resource_id.0);
+
+    if buf_len == 0 || buf_len > MAX_MESSAGE_SIZE { return -1; }
+    if !validate_user_ptr(out_buf, buf_len) { return -1; }
+
+    let my_slot = scheduler::current_task_slot();
+    // 0 = no deadline (block forever); else absolute TSC deadline.
+    let deadline = if timeout == 0 { 0 } else { read_cycle_counter().wrapping_add(timeout) };
+
+    let result = loop {
+        match crate::ipc::routing::dequeue(endpoint_id, cap.generation, Some(my_slot)) {
+            Ok((msg, sender_to_wake)) => {
+                if let Some(slot) = sender_to_wake {
+                    scheduler::wake_by_slot(slot, 0);
+                }
+                scheduler::set_last_recv_badge(msg.badge_id, msg.badge_right);
+                let n_caps = msg.cap_count.min(msg.caps.len());
+                for i in 0..n_caps {
+                    if let Some(embedded_cap) = msg.caps[i] {
+                        if let Ok(new_slot) = scheduler::current_task_insert_cap(embedded_cap) {
+                            scheduler::push_pending_recv_cap(new_slot as u32);
+                        }
+                    }
+                }
+                let payload  = msg.payload_bytes();
+                let copy_len = payload.len().min(buf_len);
+                if !write_user_bytes(out_buf, &payload[..copy_len]) { break -1; }
+                break copy_len as i64;
+            }
+            Err(IpcError::QueueEmpty) => {
+                if deadline != 0 && read_cycle_counter() >= deadline {
+                    break RECV_TIMED_OUT;
+                }
+                if deadline != 0 {
+                    scheduler::set_wake_deadline(my_slot, deadline);
+                }
+                let err = scheduler::block_and_reschedule(TaskState::BlockedOnRecv);
+                if err != 0 { break err; }
+                // Woken by a sender (message ready) or the timer (deadline) — re-check.
+            }
+            Err(e) => break ipc_err_to_i64(e),
+        }
+    };
+    scheduler::clear_wake_deadline(my_slot);
+    result
 }
 
 fn handle_try_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {

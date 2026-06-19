@@ -65,6 +65,47 @@ static TASK_KERNEL_STACK_TOP: [AtomicU64; MAX_TASKS] =
 static mut TASK_ENDPOINT: [Option<EndpointId>; MAX_TASKS] =
     [const { None }; MAX_TASKS];
 
+/// Timed-wake deadline (TSC cycles) for a task blocked in `recv_timeout` (§12). 0 = no
+/// timed wake. Set before the task blocks; the core-0 timer ISR scans these and wakes any
+/// blocked task whose deadline has passed (so a driver can wait on an interrupt yet still
+/// wake on a timer for auto-repeat). Wake granularity is the timer period (coarse — fine
+/// for repeat). The owning task clears its entry on every `recv_timeout` return path.
+static TASK_WAKE_DEADLINE: [AtomicU64; MAX_TASKS] =
+    [const { AtomicU64::new(0) }; MAX_TASKS];
+
+/// Arm a timed wake for `slot` at TSC `deadline` (0 disarms).
+pub fn set_wake_deadline(slot: usize, deadline: u64) {
+    if slot < MAX_TASKS {
+        TASK_WAKE_DEADLINE[slot].store(deadline, Ordering::Relaxed);
+    }
+}
+
+/// Disarm any timed wake for `slot`.
+pub fn clear_wake_deadline(slot: usize) {
+    if slot < MAX_TASKS {
+        TASK_WAKE_DEADLINE[slot].store(0, Ordering::Relaxed);
+    }
+}
+
+/// Wake every task whose `recv_timeout` deadline has passed. Called from the core-0 timer
+/// ISR. Cheap: a scan of `MAX_TASKS` relaxed loads, almost all zero. Only wakes a task that
+/// is still `BlockedOnRecv` (a task that already returned cleared its deadline; the state
+/// guard also avoids reviving one that moved on). The wake result is 0 — the woken
+/// `recv_timeout` re-checks its own deadline and returns the timeout itself.
+pub fn scan_timed_wakes() {
+    let now = crate::arch::x86_64::read_cycle_counter();
+    for slot in 0..MAX_TASKS {
+        let deadline = TASK_WAKE_DEADLINE[slot].load(Ordering::Relaxed);
+        if deadline != 0
+            && now >= deadline
+            && TASK_STATE[slot].load(Ordering::Relaxed) == TaskState::BlockedOnRecv as u8
+        {
+            TASK_WAKE_DEADLINE[slot].store(0, Ordering::Relaxed);
+            wake_by_slot(slot, 0);
+        }
+    }
+}
+
 /// Saved user-space RSP for each ring-3 task.  Updated whenever the task is
 /// switched away from mid-SYSCALL so the SYSRETQ exit path sees the correct
 /// per-task RSP instead of another task's value written to PER_CORE_SYSCALL.
@@ -841,6 +882,8 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         if cid == 0 {
             crate::control::process_pending();
             crate::arch::x86_64::uart_rx_poll();
+            // Wake any task whose recv_timeout deadline has elapsed (§12 timed-wait).
+            scan_timed_wakes();
         }
 
         let prev = CORE_CURRENT[cid].load(Ordering::Relaxed);

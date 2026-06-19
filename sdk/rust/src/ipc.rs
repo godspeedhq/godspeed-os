@@ -100,6 +100,26 @@ pub fn try_recv(endpoint: CapHandle) -> Result<Option<Message>, IpcError> {
     }
 }
 
+/// Blocking `recv` with a timeout in TSC cycles: `Ok(Some(msg))` on a message, `Ok(None)`
+/// on timeout, `Err` on a real error. `timeout_cycles == 0` blocks forever (like `recv`).
+/// (syscall 35 — `recv_timeout`) Lets a driver idle on its interrupt yet still wake on a
+/// timer (e.g. for keyboard auto-repeat while a key is held — §12).
+pub fn recv_timeout(endpoint: CapHandle, timeout_cycles: u64) -> Result<Option<Message>, IpcError> {
+    const RECV_TIMED_OUT: i64 = -1001; // kernel sentinel for "timed out, no message"
+    let mut payload = [0u8; MAX_PAYLOAD];
+    // arg0 packs the buffer length (high) and the cap slot (low) to fit the 3-arg ABI.
+    let packed = ((MAX_PAYLOAD as u64) << 16) | (endpoint.0 as u64 & 0xFFFF);
+    // SAFETY: raw_syscall(35) = RecvTimeout; buf is a valid stack slice within user space.
+    let ret = unsafe { raw_syscall(35, packed, payload.as_mut_ptr() as u64, timeout_cycles) };
+    if ret == RECV_TIMED_OUT {
+        Ok(None)
+    } else if ret < 0 {
+        Err(i64_to_ipc_error(ret))
+    } else {
+        Ok(Some(Message::from_bytes(&payload[..ret as usize])))
+    }
+}
+
 /// Send a message to `endpoint`; block if the queue is full. (§8.2 — `send`)
 pub fn send(endpoint: CapHandle, msg: &Message) -> Result<(), IpcError> {
     let payload = msg.payload_bytes();
