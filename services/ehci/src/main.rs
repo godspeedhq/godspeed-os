@@ -744,7 +744,6 @@ fn poll_devices(
     let mut toggle = [0u32; MAX_HID];
     let mut err = [0u32; MAX_HID];                        // consecutive errored completions
     let mut kb_last = [0u8; 6];                           // keyboard edge-detection state
-    let mut int_logged = false;                          // log the first INTx interrupt once
     let mut sts_logged = false;                          // log when USBSTS first shows USBINT
     // Typematic auto-repeat, timed in TSC cycles (read_tsc is hardware-proven to advance,
     // unlike the coarse kernel tick): ~300 ms before the first repeat, then ~50 ms apart
@@ -806,28 +805,25 @@ fn poll_devices(
                 sts_logged = true;
             }
         }
-        // E4 (interrupt-driven, §12): BLOCK instead of spin. The core idles here until the
-        // controller's INTx wakes us (a completed HID report sets USBSTS.USBINT → IOAPIC →
-        // vector 0x29 → IPC) or the timer wakes us — a short timeout while a key is held (to
-        // emit auto-repeats; a held key is silent), a long one otherwise (idle, with an
-        // occasional hot-plug / disconnect re-check as a safety net). This is what drops the
-        // core from ~100% busy-poll to ~0% idle. The scan above runs each time we wake, so a
-        // report that arrived with the interrupt is processed on the next pass.
-        let woke = ctx.recv_timeout(POLL_INTERVAL_CYCLES).is_some();
-        // Drain any further queued interrupt IPCs so the next recv_timeout truly idles.
-        while ctx.try_recv().is_some() {}
-        // Ack + unmask the level INTx: clear USBSTS (deasserts the pin) BEFORE unmasking, so the
-        // IOAPIC entry the kernel masked on deliver can fire again without storming. On a pure
-        // timeout wake the vector was never masked, so the unmask is a harmless no-op.
-        let sts = mmio.read32(op + OP_USBSTS);
-        if sts & STS_INT_BITS != 0 {
-            mmio.write32(op + OP_USBSTS, sts & STS_INT_BITS); // ack: clear W1C status bits
+        // BUSY-POLL (not interrupt-driven). The EHCI's legacy INTx never reaches the kernel in a
+        // block-and-wake model on this hardware (the controller only asserts while its async
+        // schedule is kept hot by continuous re-arming — proven across many T630 flashes: the
+        // kernel deliver() diagnostic fired ZERO times once the driver blocked). So this driver
+        // keeps the proven busy-poll: yield each pass (preemption still shares the core) and scan
+        // again. The cost is its core runs hot — accepted, because it is the ONLY model in which
+        // this controller's split-transaction keyboard works. It is pinned to its own core
+        // (task/mod.rs) so the system core and the interrupt-driven xHCI's core stay idle.
+        // (USBINTR + the drain/unmask below are belt-and-suspenders: if an INTx ever does post an
+        // IPC, we drain + ack it so it can't storm; the qTD scan above is what actually reads
+        // the keyboard.)
+        while ctx.try_recv().is_some() {
+            let sts = mmio.read32(op + OP_USBSTS);
+            if sts & STS_INT_BITS != 0 {
+                mmio.write32(op + OP_USBSTS, sts & STS_INT_BITS); // ack: clear W1C status bits
+            }
+            ctx.irq_unmask(EHCI_INT_VECTOR);
         }
-        ctx.irq_unmask(EHCI_INT_VECTOR);
-        if woke && !int_logged {
-            ctx.log("ehci: INTx interrupt received (E2: interrupt path live)");
-            int_logged = true;
-        }
+        ctx.yield_cpu();
     }
 }
 
@@ -878,18 +874,11 @@ const INT_PCD:        u32 = 1 << 2; // Port Change Detect (hot-plug)
 const STS_INT_BITS:   u32 = 0x3F;   // the six W1C interrupt-status bits (0..5)
 const EHCI_INT_VECTOR: u8 = 0x29;   // matches kernel interrupts::EHCI_MSI_VECTOR
 
-// E4 (interrupt-driven, §12) blocking-loop timings, in TSC cycles (~2 GHz on the T630).
-// The driver BLOCKS on recv_timeout instead of busy-spinning, so the core idles. The wake
-// is delivered by the kernel's PER-CORE timed-wait (scheduler::scan_timed_wakes, run on this
-// driver's own core) at POLL_INTERVAL_CYCLES, plus — as a bonus, when it lands — the device
-// interrupt. We deliberately wake at a steady ~30 ms cadence rather than a long idle timeout:
-// the device interrupt's cross-core delivery (it fires on the BSP; the driver runs on core 1)
-// is not a path we rely on for correctness, so the timed-wait is the guaranteed wake and must
-// be brisk enough for responsive typing. 30 ms ≈ 33 wakes/s — negligible CPU vs the old
-// busy-poll's ~99%, the actual win. Auto-repeat (50 ms) rides on top via kb_rep's own TSC clock.
+// Typematic auto-repeat timings, in TSC cycles (~2 GHz on the T630). The driver busy-polls, so
+// these only pace the synthesised key-repeat (a held key sends no further reports); kb_rep emits
+// a repeat off its own read_tsc clock. ~300 ms to first repeat, then ~50 ms apart.
 const REPEAT_INITIAL_CYCLES:  u64 = 600_000_000;   // ~300 ms before the first repeat
 const REPEAT_INTERVAL_CYCLES: u64 = 100_000_000;   // ~50 ms between repeats
-const POLL_INTERVAL_CYCLES:   u64 = 60_000_000;    // ~30 ms guaranteed wake cadence (timed-wait)
 const OP_PORTSC0:    usize = 0x44; // PORTSC[0]; +4 bytes per additional port
 
 const CMD_RS:        u32 = 1 << 0;  // Run/Stop

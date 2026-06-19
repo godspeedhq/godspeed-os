@@ -409,20 +409,20 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[0x28],
             has_console_read:  false,
         })),
-        // `ehci` — userspace USB 2.0 driver (§12) for the back ports' EHCI
-        // controller. Same shape as `xhci`; the kernel grants its MMIO/DMA at
-        // spawn (E1b+). **Pinned to core 0 (the BSP)** — unlike the MSI-based xHCI (core 1),
-        // the EHCI has only legacy PCI INTx, and on this hardware the IOAPIC delivers a legacy
-        // INTx pin only to the BSP. The driver blocks on its interrupt (§12), and an idle core
-        // wakes only on an interrupt to *itself* (ARAT `hlt` idle), so the driver must live on
-        // the core its interrupt lands on. INTx→BSP→deliver-on-core-0→local wake (route_ehci_intx
-        // targets the BSP to match). xHCI's MSI can target core 1, so it stays there.
+        // `ehci` — userspace USB 2.0 driver (§12) for the back ports' EHCI controller. Same
+        // shape as `xhci`; the kernel grants its MMIO/DMA at spawn (E1b+). **Busy-polls on its
+        // OWN core (2).** Unlike the MSI-based xHCI, the EHCI's legacy INTx never reaches the
+        // kernel in a block-and-wake model on this hardware (proven across many T630 flashes —
+        // deliver() fired zero times once the driver blocked), so it keeps the proven busy-poll,
+        // which runs its core hot. Pinning it to its own core (2) keeps the system core (0, the
+        // shell) and the interrupt-driven xHCI's core (1, which idles) free — so typing/scrolling
+        // stay snappy. (Was briefly on core 0, which bogged the shell → keyboard lag.)
         "ehci" => Some(("ehci", ServiceConfig {
             elf:               include_bytes!(env!("SVC_EHCI_ELF")),
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
-            preferred_core:    0,
+            preferred_core:    2,
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
             // Route the EHCI INTx (interrupts::EHCI_MSI_VECTOR = 0x29, IOAPIC-routed) to this
