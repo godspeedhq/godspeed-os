@@ -220,6 +220,43 @@ unsafe extern "C" fn xhci_msi_handler() {
     unsafe { dispatch_irq(XHCI_MSI_VECTOR); }
 }
 
+/// IDT vector / route pseudo-irq for the EHCI controller's MSI (§12). Used only if the EHCI
+/// exposes MSI/MSI-X; a legacy-INTx EHCI routes through the IOAPIC instead (different path).
+pub const EHCI_MSI_VECTOR: u8 = 0x29;
+
+/// Naked ISR stub for the EHCI MSI. Identical shape to `xhci_msi_isr_stub`.
+#[no_mangle]
+#[unsafe(naked)]
+pub unsafe extern "C" fn ehci_msi_isr_stub() {
+    // SAFETY: raw interrupt entry; all register saves are explicit.
+    core::arch::naked_asm!(
+        "test byte ptr [rsp + 8], 3",
+        "jz 1f",
+        "swapgs",
+        "1:",
+        "push rax", "push rcx", "push rdx", "push rdi", "push rsi",
+        "push r8", "push r9", "push r10", "push r11",
+        "call ehci_msi_handler",
+        "pop r11", "pop r10", "pop r9", "pop r8",
+        "pop rsi", "pop rdi", "pop rdx", "pop rcx", "pop rax",
+        "test byte ptr [rsp + 8], 3",
+        "jz 2f",
+        "swapgs",
+        "2:",
+        "iretq",
+    )
+}
+
+/// EHCI MSI handler — routes to the registered driver endpoint (§12.2) and EOIs.
+///
+/// # Safety
+/// Called from raw interrupt context (IF=0).
+#[no_mangle]
+unsafe extern "C" fn ehci_msi_handler() {
+    // SAFETY: called from the IDT stub with IF=0.
+    unsafe { dispatch_irq(EHCI_MSI_VECTOR); }
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch helpers.
 // ---------------------------------------------------------------------------

@@ -552,6 +552,26 @@ pub fn program_xhci_msi() -> bool {
     program_msi(bdf, vector) || program_msix(bdf, vector)
 }
 
+/// Try to program the EHCI controller's MSI/MSI-X (interrupt-driven USB, §12). Returns true
+/// if MSI or MSI-X was found and programmed (→ the easy path, like xHCI). Logs the outcome.
+/// Classic Intel-ICH EHCI exposes neither (legacy INTx only — would need IOAPIC routing);
+/// other EHCIs (e.g. AMD) may have MSI. This both does P1 (when MSI exists) AND tells us at
+/// boot which interrupt path the running machine's EHCI needs.
+pub fn program_ehci_msi() -> bool {
+    if !EHCI_FOUND.load(Ordering::Relaxed) {
+        return false;
+    }
+    let bdf = EHCI_BDF.load(Ordering::Relaxed);
+    let vector = crate::arch::x86_64::interrupts::EHCI_MSI_VECTOR;
+    let ok = program_msi(bdf, vector) || program_msix(bdf, vector);
+    if !ok {
+        crate::kprintln!(
+            "ehci: no MSI/MSI-X capability — controller uses legacy INTx (IOAPIC routing needed)"
+        );
+    }
+    ok
+}
+
 /// Scan the PCI bus for the xHCI controller and record its MMIO base + IRQ.
 /// Called once on the BSP during boot. Logs the result either way.
 pub fn init() {

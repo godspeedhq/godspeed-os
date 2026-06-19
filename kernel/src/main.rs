@@ -222,6 +222,10 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     // the userspace driver enables it (P2), so nothing fires yet — this validates that MSI
     // programming works on this controller (logs "MSI enabled …" or "no MSI capability").
     arch::x86_64::pci::program_xhci_msi();
+    // EHCI interrupt path (§12): program its MSI/MSI-X if it has one (logs which). A classic
+    // Intel-ICH EHCI has neither (legacy INTx → needs IOAPIC); an AMD EHCI may have MSI. This
+    // reports the running machine's EHCI capability at boot so we know which path it needs.
+    arch::x86_64::pci::program_ehci_msi();
 
     // Take a USB controller from the firmware (BIOS→OS handoff) before the IOMMU
     // confines it — otherwise the firmware SMM keeps running its DMA out of

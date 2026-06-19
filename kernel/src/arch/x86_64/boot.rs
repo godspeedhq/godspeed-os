@@ -1000,6 +1000,8 @@ pub(super) unsafe fn init_idt() {
         // delivers here once its interrupter is enabled (P2); harmless until then.
         idt[super::interrupts::XHCI_MSI_VECTOR as usize] =
             IdtEntry::new(super::interrupts::xhci_msi_isr_stub as *const () as u64);
+        idt[super::interrupts::EHCI_MSI_VECTOR as usize] =
+            IdtEntry::new(super::interrupts::ehci_msi_isr_stub as *const () as u64);
         idt[0x80] = IdtEntry::new_user(super::syscall_entry::int80_entry as *const () as u64);
         idt[0xF0] = IdtEntry::new(ipi_wake_stub   as *const () as u64);
         idt[0xF1] = IdtEntry::new(ipi_tlb_stub    as *const () as u64);
