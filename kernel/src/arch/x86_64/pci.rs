@@ -590,6 +590,24 @@ pub fn route_ehci_intx() {
     let vector = crate::arch::x86_64::interrupts::EHCI_MSI_VECTOR;
     let dest = crate::arch::x86_64::ioapic::bsp_lapic_id();
     let legacy = EHCI_IRQ.load(Ordering::Relaxed);
+
+    // Legacy INTx only asserts the device's INTx# pin when PCI Command bit 10 (Interrupt
+    // Disable) is CLEAR. If firmware left it set (common after MSI-style init elsewhere), even
+    // a correct IOAPIC route delivers nothing. Clear it (and keep bus-master for the EHCI's DMA).
+    {
+        let bdf = EHCI_BDF.load(Ordering::Relaxed);
+        let bus = ((bdf >> 8) & 0xFF) as u8;
+        let dev = ((bdf >> 3) & 0x1F) as u8;
+        let func = (bdf & 0x07) as u8;
+        let cmd = config_read32(bus, dev, func, 0x04);
+        // bit10 = Interrupt Disable (clear), bit2 = Bus Master (set), bit1 = Memory Space (set).
+        let new = (cmd & !(1 << 10)) | (1 << 2) | (1 << 1);
+        if new != cmd {
+            config_write32(bus, dev, func, 0x04, new);
+            crate::kprintln!("ehci: PCI command {:#06x} -> {:#06x} (INTx-disable cleared)",
+                cmd & 0xFFFF, new & 0xFFFF);
+        }
+    }
     // Candidate GSIs: the legacy interrupt-line value (usually 11) + the AMD FCH PCI-INTx range.
     let mut candidates: [u8; 9] = [legacy, 16, 17, 18, 19, 20, 21, 22, 23];
     for i in 0..candidates.len() {
