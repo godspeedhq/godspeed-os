@@ -410,19 +410,18 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         // `ehci` — userspace USB 2.0 driver (§12) for the back ports' EHCI controller. Same
-        // shape as `xhci`; the kernel grants its MMIO/DMA at spawn (E1b+). **Busy-polls on its
-        // OWN core (2).** Unlike the MSI-based xHCI, the EHCI's legacy INTx never reaches the
-        // kernel in a block-and-wake model on this hardware (proven across many T630 flashes —
-        // deliver() fired zero times once the driver blocked), so it keeps the proven busy-poll,
-        // which runs its core hot. Pinning it to its own core (2) keeps the system core (0, the
-        // shell) and the interrupt-driven xHCI's core (1, which idles) free — so typing/scrolling
-        // stay snappy. (Was briefly on core 0, which bogged the shell → keyboard lag.)
+        // shape as `xhci`; the kernel grants its MMIO/DMA at spawn (E1b+). Busy-polls on core 1
+        // (alongside xHCI) — the model that worked flawlessly. The EHCI's legacy INTx can't drive
+        // a block-and-wake loop on this hardware (deliver() fired zero times once the driver
+        // blocked across many T630 flashes), and the CPU-reduction attempts introduced quirks, so
+        // both USB drivers are back on plain busy-poll. Core 1 runs hot; reclaiming that idle is
+        // deferred (revisit later).
         "ehci" => Some(("ehci", ServiceConfig {
             elf:               include_bytes!(env!("SVC_EHCI_ELF")),
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
-            preferred_core:    2,
+            preferred_core:    1,
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
             // Route the EHCI INTx (interrupts::EHCI_MSI_VECTOR = 0x29, IOAPIC-routed) to this

@@ -78,14 +78,6 @@ const MAX_HID: usize = 2;
 /// per-machine calibration needed. read_tsc is hardware-proven to advance (perf §22).
 const REPEAT_INITIAL_CYCLES: u64 = 600_000_000;
 const REPEAT_INTERVAL_CYCLES: u64 = 100_000_000;
-/// Block-loop wake cadence (P4). The driver blocks on recv_timeout instead of busy-spinning,
-/// so the core idles. The kernel's PER-CORE timed-wait (scheduler::scan_timed_wakes on this
-/// driver's own core) guarantees a wake every POLL_INTERVAL_CYCLES; the MSI interrupt — when
-/// its cross-core delivery lands (it targets the BSP, the driver runs on core 1) — wakes us
-/// sooner as a bonus. We pace at a brisk ~30 ms (≈33 wakes/s, negligible CPU vs the old ~99%
-/// busy-poll) rather than a long idle timeout, because the timed-wait is the wake we rely on
-/// for responsive typing and hot-plug, not the not-relied-upon cross-core interrupt.
-const POLL_INTERVAL_CYCLES: u64 = 60_000_000;
 const DEV_BASE: usize = 0x7000;
 const DEV_STRIDE: usize = 0x4000; // 4 pages: device ctx, EP0 ring, int ring, report
 fn device_ctx_off(i: usize) -> usize { DEV_BASE + i * DEV_STRIDE }
@@ -833,20 +825,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 need_queue[d] = false;
             }
 
-            // P4 (interrupt-driven, §12): BLOCK when idle, busy-poll while a key is HELD. A held
-            // key sends no further reports, so auto-repeat must be driver-timed (kb_rep) — and
-            // relying on the cross-core timed-wake to this (idle, halted) core to fire those
-            // repeats is sluggish on this hardware. So: if any key is held, YIELD (spin) so the
-            // loop re-runs immediately and emits repeats at their precise ~50 ms interval;
-            // otherwise BLOCK so the core idles (~0%) until the MSI-X wakes us on the next
-            // keypress/mouse event. The hot spin lasts only as long as you actually hold a key.
-            let any_held = (0..ndev).any(|d| !devs[d].is_mouse && kb_rep[d].armed());
-            if any_held {
-                ctx.yield_cpu();
-            } else {
-                let _ = ctx.recv_timeout(POLL_INTERVAL_CYCLES);
-            }
-            // Drain any further queued interrupt events so the next recv_timeout truly idles.
+            // BUSY-POLL (§12). The CPU-reduction experiment (block on recv_timeout to idle the
+            // core, interrupt/timer to wake) introduced subtle quirks on this hardware — input
+            // lag, sluggish auto-repeat, hot-plug wedges — so we scaled it back to the model that
+            // worked flawlessly: yield each pass and re-scan. The MSI-X interrupt is still
+            // enabled and drained below (belt-and-suspenders), it just doesn't gate the loop.
+            // The core runs hot; reclaiming that idle cleanly is deferred (revisit later).
+            ctx.yield_cpu();
+            // Drain any queued interrupt-event IPCs (kept so an enabled MSI-X can't pile up).
             while ctx.try_recv().is_some() {}
             // Ack the interrupter (clear IP, keep IE) BEFORE draining the ring, so an event
             // arriving mid-drain re-sets IP and re-arms a fresh MSI-X (no missed events).
