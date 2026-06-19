@@ -167,6 +167,13 @@ impl KeyRepeat {
         self.key = 0;
     }
 
+    /// Is a key currently held (repeat armed)? A driver uses this to decide how long to
+    /// block: a short timeout while a key is down (to wake and emit repeats), a long one
+    /// otherwise (the keyboard is silent, so just idle until the next interrupt).
+    pub fn armed(&self) -> bool {
+        self.key != 0
+    }
+
     /// Emit a repeat of the held key if one is due at `now`. Call once per poll
     /// iteration; a no-op until `initial` elapses, then fires at most once per `interval`.
     pub fn poll(&mut self, now: u64, mut emit: impl FnMut(u8)) {
