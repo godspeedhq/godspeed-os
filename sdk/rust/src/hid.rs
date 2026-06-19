@@ -185,6 +185,17 @@ impl KeyRepeat {
     }
 }
 
+/// Is an 8-byte HID boot report real device data, or the all-`0xff` signature of a failed/stale
+/// DMA read (a device that vanished mid-transaction, or a buffer the controller never wrote)?
+/// Returns `false` only for an all-`0xff` report. This is the **universal** garbage check — safe
+/// for both keyboards and mice (a real mouse won't send all-`0xff`; a keyboard never does) —
+/// which a driver uses to count a wedged endpoint toward disconnect and re-enumerate. (The
+/// keyboard decoder additionally rejects any report whose reserved byte 1 ≠ 0, a stricter check
+/// that only makes sense for keyboards.)
+pub fn report_is_valid(report: &[u8; 8]) -> bool {
+    *report != [0xFF; 8]
+}
+
 /// Decode a keyboard boot report (modifiers in byte 0, up to six keycodes in
 /// bytes 2..8) with N-key edge detection: `emit(ascii)` is called for every key
 /// that is down now but was not in `last`, so rolling onto a new key before

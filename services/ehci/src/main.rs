@@ -760,6 +760,19 @@ fn poll_devices(
             if tok & (QTD_HALTED | QTD_ERRMASK) == 0 {
                 let mut rep = [0u8; 8];
                 for j in 0..8 { rep[j] = dma.read8(buf + j); }
+                if !godspeed_sdk::hid::report_is_valid(&rep) {
+                    // The qTD "completed" but the buffer reads garbage (all-0xff = a failed/stale
+                    // DMA read from a device that vanished mid-transaction, e.g. during a rapid
+                    // unplug/replug). It is NOT an errored completion, so the error path below
+                    // never trips and the driver would wedge here forever reading 0xff. Count it
+                    // toward disconnect so a sustained run forces a clean re-enumerate + recovery.
+                    err[i] += 1;
+                    if err[i] >= DISCONNECT_ERR_THRESHOLD {
+                        return i;
+                    }
+                    arm_int(dma, qh, toggle[i]); // re-arm and retry; don't flip toggle on garbage
+                    continue;
+                }
                 if devs[i].is_mouse {
                     mouse.feed(
                         &rep,

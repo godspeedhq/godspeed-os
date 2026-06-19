@@ -864,6 +864,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             for (j, b) in rep.iter_mut().enumerate() {
                                 *b = dma.read8(report_off(dev) + j);
                             }
+                            // Skip an all-0xff report — a failed/stale DMA read from a device
+                            // that vanished mid-transaction (e.g. a rapid unplug/replug). Decoding
+                            // it would push 0xff "keystrokes" to the console; the real disconnect
+                            // is caught by the PORTSC CCS check below, which re-initialises.
+                            if !godspeed_sdk::hid::report_is_valid(&rep) {
+                                need_queue[d] = true;
+                                continue;
+                            }
                             if devs[d].is_mouse {
                                 mouse[d].feed(
                                     &rep,
