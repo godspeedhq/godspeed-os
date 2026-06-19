@@ -144,7 +144,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     for _ in 0..256 {
         ctx.yield_cpu();
     }
-    ctx.console_writeln("shell: ready (type 'help')");
+    // One atomic console write (text + newline together) so a concurrent driver boot-log
+    // can't slip between the message and its newline on the serial console.
+    ctx.console_write("shell: ready (type 'help')\n");
 
     wait_for_input_ready(&ctx);
 
@@ -160,9 +162,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // escape sequences are swallowed silently and line editing stays under our control.
     ctx.console_echo(false);
     // A one-time grounding hint above the first prompt after boot — so a fresh user knows
-    // where to start. Only here, not on every prompt (that would be noise).
-    ctx.console_writeln("(F1=help or type 'help')");
-    ctx.console_write("gsh> ");
+    // where to start. Only here, not on every prompt (that would be noise). Sent as ONE
+    // console write so a concurrent driver boot-log can't land between the hint and the
+    // prompt (it stays one atomic unit on the serial console too).
+    ctx.console_write("(F1=help or type 'help')\ngsh> ");
 
     let mut line = Line::new();
     // Current location on the (single) drive: the directory bare/relative paths target,
