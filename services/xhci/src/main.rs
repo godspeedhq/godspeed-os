@@ -782,6 +782,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             godspeed_sdk::hid::KeyRepeat::new(REPEAT_INITIAL_CYCLES, REPEAT_INTERVAL_CYCLES),
             godspeed_sdk::hid::KeyRepeat::new(REPEAT_INITIAL_CYCLES, REPEAT_INTERVAL_CYCLES),
         ];
+        let mut kb_caps = [false; MAX_HID]; // Caps Lock latch per keyboard (host-tracked toggle)
         let mut mouse = [
             godspeed_sdk::hid::MouseTracker::new(),
             godspeed_sdk::hid::MouseTracker::new(),
@@ -877,7 +878,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                     ctx.reboot();
                                 }
                                 godspeed_sdk::hid::decode_keyboard(
-                                    &rep, &mut kb_last[d], &mut kb_rep[d], ctx.read_tsc(),
+                                    &rep, &mut kb_last[d], &mut kb_rep[d], &mut kb_caps[d], ctx.read_tsc(),
                                     |ch| ctx.console_push(ch),
                                     |code| ctx.log_fmt(format_args!(
                                         "xhci: unmapped HID key usage {:#04x} (add to sdk hid_to_ascii)", code)));
