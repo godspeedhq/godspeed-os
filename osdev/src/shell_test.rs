@@ -537,6 +537,28 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
+    // chaos kill-storm: the bounded resilience exerciser. Kill `registry` 5 times; the supervisor
+    // must respawn it each round (registry is auto-restarted). A pass proves: recovery held every
+    // round, AND the kernel never panicked (a panic reboots; reaching the verdict + the prompt
+    // proves it didn't). registry is the disk-free target, so this runs on the bare-metal build.
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"chaos kill-storm registry 5\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)) {
+        Some(r) => {
+            check!(r.contains("recovered: 5/5") && r.contains("verdict: PASS"), "chaos: kill-storm registry — 5/5 recovered, PASS");
+            check!(r.contains("recovered gen"), "chaos: report has per-round detail");
+            check!(r.contains("kernel: alive"), "chaos: kill-storm — kernel alive (no panic)");
+        }
+        None => { println!("shell-test: FAIL — chaos kill-storm timed out (recovery stuck / panic?)"); fail += 3; }
+    }
+    // The shell is still responsive after the storm (registry recovered, the prompt works).
+    send(&mut write_half, b"cores\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains(&format!("cores: {smp}")), "chaos: shell still responsive after the storm"),
+        None    => { println!("shell-test: FAIL — shell unresponsive after chaos"); fail += 1; }
+    }
+
+    // -----------------------------------------------------------------------
     // Done.
     // -----------------------------------------------------------------------
     child.kill().ok();
@@ -1518,6 +1540,19 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     match run!(b"assert ok status\r", 10) {
         Some(r) => check!(r.contains("assert: ok"), "result: an info command (status) is Ok"),
         None    => { println!("files-test: FAIL — status ok timeout"); fail += 1; }
+    }
+
+    // chaos `save`: the report is recorded in memory during the storm, then written to fs at the
+    // END (the catch-22-safe path — registry is the target, not fs, so fs is free to be written).
+    match run!(b"chaos kill-storm registry 3 save /chaos.txt\r", 30) {
+        Some(r) => check!(r.contains("verdict: PASS") && r.contains("report saved to /chaos.txt"),
+                          "chaos: storm + save report to a file"),
+        None    => { println!("files-test: FAIL — chaos save timeout"); fail += 1; }
+    }
+    match run!(b"read /chaos.txt\r", 10) {
+        Some(r) => check!(r.contains("verdict: PASS") && r.contains("recovered gen"),
+                          "chaos: saved report file holds the verdict + per-round detail"),
+        None    => { println!("files-test: FAIL — read chaos report timeout"); fail += 1; }
     }
 
     child.kill().ok();

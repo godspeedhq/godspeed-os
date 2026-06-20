@@ -901,6 +901,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
             }
         }
         "reboot"  => cmd_reboot(ctx), // `-> !` coerces to the match arm's Result type
+        "chaos"   => cmd_chaos(ctx, cwd, s["chaos".len()..].trim()),
         "drives"  => cmd_drives(ctx, &args, argc),
         // ── file/storage commands — converted to the Result model ──
         // ("read" and "result" are on the Result model above, not here.)
@@ -1233,7 +1234,7 @@ const UTIL_VERSION: &str = "0.1.0";
 const UTILS: &[&str] = &[
     "help", "result", "run", "assert", "selfcheck",
     "echo", "clear", "about", "mem", "cores", "date", "status", "observe", "caps", "roster",
-    "spawn", "kill", "restart", "reboot", "drives", "ls", "cd", "read", "write", "edit", "fcap",
+    "spawn", "kill", "restart", "reboot", "chaos", "drives", "ls", "cd", "read", "write", "edit", "fcap",
     "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count", "sort",
     "first", "last",
     // record-pipe verbs (pipe-only stages; see docs/records.md)
@@ -1343,6 +1344,11 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         ], true),
         "reboot" => help_block(ctx, "reboot", "hardware reset", &[
             ("reboot", "reset the machine", "reboot"),
+        ], true),
+        "chaos" => help_block(ctx, "chaos", "bounded resilience exerciser — stress one invariant, report a verdict", &[
+            ("chaos kill-storm <svc> [rounds]", "kill a service N times; verify the supervisor restarts it each time", "chaos kill-storm registry 20"),
+            ("chaos kill-storm <svc> [n] save <path>", "also write the report to a file (recorded in memory, written at the end)", "chaos kill-storm registry 20 save /chaos.txt"),
+            ("  <svc> = registry | block-driver | fs", "only the supervisor-auto-restarted services (others wouldn't recover)", "chaos kill-storm fs 10"),
         ], true),
         "drives" => help_block(ctx, "drives", "manage attached disks (records when piped)", &[
             ("drives", "list attached drive(s)", "drives"),
@@ -1566,6 +1572,7 @@ static HELP: &[HelpRow] = &[
     Gap,
     Sec("Power"),
     Row("reboot", "hardware reset"),
+    Row("chaos kill-storm <svc> [n]", "bounded resilience test: kill a service N times, verify it recovers"),
     Gap,
     Text("Type '<command> help' for usage + examples, '<command> version' for the version."),
 ];
@@ -2435,6 +2442,19 @@ fn slot_of(ctx: &ServiceContext, name: &str) -> Option<u32> {
     None
 }
 
+/// The restart generation of the live service named `name` (None if not running). A restart bumps
+/// the generation (§7.5), so a value strictly greater than a pre-kill reading proves a NEW instance
+/// came up — the recovery signal `chaos kill-storm` waits on.
+fn gen_of(ctx: &ServiceContext, name: &str) -> Option<u32> {
+    for slot in 0..256u32 {
+        let st = ctx.task_stat(slot);
+        if st.valid && st.state != 4 /* Dead */ && st.name_str() == name {
+            return Some(st.generation as u32);
+        }
+    }
+    None
+}
+
 /// `observe now` — broker a one-shot static metrics frame.
 ///
 /// `observe` is a least-authority service: it holds only INTROSPECT + log caps,
@@ -2914,6 +2934,146 @@ fn cmd_restart(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<()
         Ok(()) => { report(ctx, "restarted: ", name); Ok(()) }
         Err(_) => { report(ctx, "restart failed: ", name); Err(ShellError::Unknown) }
     }
+}
+
+// ── chaos — a BOUNDED resilience exerciser (not a generic firehose) ──────────────────────────────
+// Each mode stresses ONE named invariant through the shell's EXISTING capabilities (no new kernel
+// surface), runs a bounded number of rounds, and reports a loud verdict (§26.6). It never touches
+// the TCB (init/supervisor) — their death is a reboot, not graceful degradation, so there is nothing
+// to observe. v1 ships `kill-storm` (restartability); flooding/memory-pressure are future modes.
+
+/// Services the supervisor AUTO-restarts on unexpected death (its death-notification loop —
+/// services/supervisor). Only these recover from a bare `kill`, so only these make sense as a
+/// kill-storm target.
+const CHAOS_RESTARTABLE: [&str; 3] = ["registry", "block-driver", "fs"];
+const CHAOS_DEFAULT_ROUNDS: u32 = 20;
+const CHAOS_MAX_ROUNDS: u32 = 100;        // bounded (§26.6) — a deliberate cap, not a firehose
+const CHAOS_WAIT_YIELDS: u32 = 40_000;    // per-round recovery wait (safety bound; recovery is ~ms)
+
+fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
+    // Tokenize the raw line ourselves — `chaos kill-storm <svc> [rounds] [save <path>]` runs past
+    // the shell's MAX_ARGS=4 tokenizer (6 tokens), so we can't rely on the shared `args` array.
+    let mut tok: [&str; 8] = [""; 8];
+    let mut ntok = 0;
+    for t in rest.split_whitespace() {
+        if ntok == tok.len() { break; }
+        tok[ntok] = t; ntok += 1;
+    }
+    if ntok == 0 {
+        ctx.console_writeln("usage: chaos kill-storm <service> [rounds] [save <path>]   (service: registry | block-driver | fs)");
+        return Err(ShellError::Unknown);
+    }
+    match tok[0] {
+        "kill-storm" => chaos_kill_storm(ctx, cwd, &tok, ntok),
+        other => {
+            ctx.console_writeln_fmt(format_args!(
+                "chaos: unknown mode '{}' (try: chaos kill-storm <service> [rounds])", other));
+            Err(ShellError::Unknown)
+        }
+    }
+}
+
+/// `chaos kill-storm <svc> [rounds] [save <path>]` — kill the service `rounds` times; each round,
+/// wait for the supervisor's death-notification loop to respawn it (a higher restart generation = a
+/// new instance) and count it recovered. Returns `Ok` only if every round recovered; the kernel
+/// never panicking is proven by the command *returning at all* (a panic reboots). Bounded + loud
+/// (§26.6), capability-clean: only `kill` (SERVICE_CONTROL) + `task_stat` (INTROSPECT), both held.
+///
+/// **The report avoids a catch-22.** Each round is recorded in MEMORY only — chaos never touches fs
+/// during the storm, so `chaos kill-storm fs` does not write its log to the very thing it is killing.
+/// At the end the report is built in a bounded buffer and printed to the **console** (fs-independent,
+/// captured by the serial log); an optional `save <path>` then materialises it to a file once the
+/// target has recovered (best-effort — if fs was the target and is down, it falls back to the console).
+#[inline(never)]
+fn chaos_kill_storm(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
+    if ntok < 2 {
+        ctx.console_writeln("usage: chaos kill-storm <service> [rounds] [save <path>]   (service: registry | block-driver | fs)");
+        return Err(ShellError::Unknown);
+    }
+    let svc = tok[1];
+    if svc == "init" || svc == "supervisor" {
+        ctx.console_writeln("chaos: refusing the TCB — killing init/supervisor reboots the machine, which is not chaos to observe (§6.2).");
+        return Err(ShellError::Denied);
+    }
+    if !CHAOS_RESTARTABLE.contains(&svc) {
+        ctx.console_writeln_fmt(format_args!(
+            "chaos: '{}' is not auto-restarted on death — only registry/block-driver/fs are respawned by the supervisor, so others would not recover.", svc));
+        return Err(ShellError::Unknown);
+    }
+    // Parse [rounds] and [save <path>] in any order after the service. `rounds` is a bare number;
+    // `save` is followed by a path. Both optional.
+    let mut rounds = CHAOS_DEFAULT_ROUNDS;
+    let mut save: Option<&str> = None;
+    let mut i = 2;
+    while i < ntok {
+        if tok[i] == "save" && i + 1 < ntok { save = Some(tok[i + 1]); i += 2; }
+        else if let Some(n) = parse_u32(tok[i]) { rounds = n; i += 1; }
+        else { i += 1; }
+    }
+    let rounds = rounds.clamp(1, CHAOS_MAX_ROUNDS);
+    if slot_of(ctx, svc).is_none() {
+        ctx.console_writeln_fmt(format_args!("chaos: '{}' is not running", svc));
+        return Err(ShellError::Unknown);
+    }
+
+    ctx.console_writeln_fmt(format_args!(
+        "chaos kill-storm {}: {} rounds — kill, then wait for the supervisor to respawn it...", svc, rounds));
+
+    // Per-round results, tracked in MEMORY (no fs while we storm). Bounded by CHAOS_MAX_ROUNDS.
+    let mut old_g = [0u32; CHAOS_MAX_ROUNDS as usize];
+    let mut new_g = [0u32; CHAOS_MAX_ROUNDS as usize];
+    let mut ok_r  = [false; CHAOS_MAX_ROUNDS as usize];
+    let mut recovered = 0u32;
+    for r in 0..rounds as usize {
+        let og = gen_of(ctx, svc).unwrap_or(0);   // generation of the instance about to be killed
+        old_g[r] = og;
+        let _ = ctx.kill(svc);                     // unexpected death → supervisor's restart loop reacts
+        // Wait for a NEW instance: a generation different from the one we killed (a respawn bumps it,
+        // §7.5). Yield so the supervisor — sharing core 0 — runs and respawns.
+        for j in 0..CHAOS_WAIT_YIELDS {
+            ctx.yield_cpu();
+            if j % 32 == 0 {                       // poll periodically (a task_stat scan is not free)
+                if let Some(g) = gen_of(ctx, svc) {
+                    if g != og { new_g[r] = g; ok_r[r] = true; recovered += 1; break; }
+                }
+            }
+        }
+    }
+
+    // Build the report in a bounded buffer (at the END — nothing was written to fs during the storm).
+    use core::fmt::Write as _;
+    let mut rb = ReportBuf::new();
+    let _ = writeln!(rb, "=== chaos kill-storm {}: report ===", svc);
+    let _ = writeln!(rb, "target: {} (supervisor-auto-restarted); rounds: {}", svc, rounds);
+    for r in 0..rounds as usize {
+        if ok_r[r] {
+            let _ = writeln!(rb, "round {:>3}: killed gen {} -> recovered gen {}", r + 1, old_g[r], new_g[r]);
+        } else {
+            let _ = writeln!(rb, "round {:>3}: killed gen {} -> NOT RECOVERED (wait bound exceeded)", r + 1, old_g[r]);
+        }
+    }
+    let _ = writeln!(rb, "recovered: {}/{}; kernel: alive (no panic — this command returned)", recovered, rounds);
+    let _ = writeln!(rb, "verdict: {}", if recovered == rounds { "PASS" } else { "FAIL" });
+    if rb.overflow { let _ = writeln!(rb, "(report truncated at {} KiB)", REPORT_MAX / 1024); }
+
+    // Always print to the console — fs-independent, so even an `fs` storm reports cleanly.
+    console_write_chunked(ctx, rb.bytes());
+    // Optionally materialise to a file, now that the target has recovered. Best-effort: if fs was
+    // the target (or its block-driver) and is still down, the save fails and the console report stands.
+    if let Some(path) = save {
+        let mut pbuf = [0u8; PATH_MAX];
+        if let Some(p) = resolve_or_err(ctx, cwd, path, &mut pbuf) {
+            let mut ppath = [0u8; PATH_MAX];
+            let pl = p.len(); ppath[..pl].copy_from_slice(p);
+            if save_report(ctx, &ppath[..pl], rb.bytes()) {
+                ctx.console_writeln_fmt(format_args!("chaos: report saved to {}", str_of(&ppath[..pl])));
+            } else {
+                ctx.console_writeln_fmt(format_args!(
+                    "chaos: could not save to {} (fs unavailable — it may have been the target; the report above stands)", str_of(&ppath[..pl])));
+            }
+        }
+    }
+    if recovered == rounds { Ok(()) } else { Err(ShellError::Unknown) }
 }
 
 // ---------------------------------------------------------------------------
