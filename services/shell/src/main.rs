@@ -674,11 +674,11 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
                 ctx.console_writeln("usage: run <path>");
                 Err(ShellError::Unknown)
             } else {
-                cmd_run(ctx, cwd, args[1], depth)
+                cmd_run(ctx, cwd, args[1], depth, &mut Out::Console)
             };
         }
         // `selfcheck` — write the embedded suite to the GSFS drive and run it (one-USB checkpoint).
-        "selfcheck" => return cmd_selfcheck(ctx, cwd, depth),
+        "selfcheck" => return cmd_selfcheck(ctx, cwd, depth, &mut Out::Console),
         _ => {}
     }
 
@@ -688,10 +688,10 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         "help"    => cmd_help(ctx, depth),
         "clear"   => cmd_clear(ctx),
         "echo"    => cmd_echo(ctx, strip_quotes(s["echo".len()..].trim()), &mut Out::Console),
-        "about"   => cmd_about(ctx),
-        "mem"     => cmd_mem(ctx),
-        "cores"   => cmd_cores(ctx),
-        "date"    => cmd_date(ctx, if argc >= 2 { args[1] } else { "" }),
+        "about"   => cmd_about(ctx, &mut Out::Console),
+        "mem"     => cmd_mem(ctx, &mut Out::Console),
+        "cores"   => cmd_cores(ctx, &mut Out::Console),
+        "date"    => cmd_date(ctx, if argc >= 2 { args[1] } else { "" }, &mut Out::Console),
         "status"  => cmd_status(ctx),
         "observe" => if argc >= 2 && args[1] == "now" { cmd_observe_now(ctx) } else { cmd_observe_live(ctx) },
         // The example record SERVICE, callable bare (renders its table) as well as piped.
@@ -805,7 +805,7 @@ fn trim_bytes(b: &[u8]) -> &[u8] {
 /// the script buffer off the hot pipe frame, and the `fs` reply is dropped before any command
 /// runs — both bound the user stack (see the pipe stack-overflow lesson).
 #[inline(never)]
-fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8) -> Result<(), ShellError> {
+fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8, out: &mut Out) -> Result<(), ShellError> {
     let mut pbuf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut pbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     // Read the whole script into a fixed buffer, then drop the fs reply before executing anything.
@@ -832,7 +832,7 @@ fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8) -> Result<
         script[..take].copy_from_slice(&body[..take]);
         slen = take;
     }
-    run_lines(ctx, cwd, &script[..slen], depth)
+    run_lines(ctx, cwd, &script[..slen], depth, out)
 }
 
 /// Execute a script body (already in memory): split into commands, run each, then print a
@@ -841,8 +841,14 @@ fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8) -> Result<
 /// so it is **not** bound by `MAX_FILE_BYTES`/the single-message file transfer, only by the
 /// embedded const). `#[inline(never)]`: holds the verdict array and drives `execute` in a loop
 /// (the user stack is tight — see the pipe stack-overflow lesson).
+/// `out` receives the run **report** — the `> <cmd>` echoes, the `--- summary ---` block, the
+/// `PASS/FAIL <cmd>` lines, and the `run: ran N, failed M` tally. Each command's OWN output still
+/// goes to the console (it is produced inside `execute`, which writes there directly). So a piped
+/// `selfcheck | write /sc.txt` captures the report (the useful, savable part) while the sub-command
+/// chatter scrolls past on screen — documented behaviour, not a silent surprise. Bare/console runs
+/// pass `Out::Console`, so the report prints exactly as before.
 #[inline(never)]
-fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8) -> Result<(), ShellError> {
+fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out) -> Result<(), ShellError> {
     let mut ran = 0u32;
     let mut failed = 0u32;
     let mut last: Result<(), ShellError> = Ok(());
@@ -856,9 +862,9 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8) -> Resu
         for cmd in line.split(|&b| b == b';') {
             let cmd = trim_bytes(cmd);
             if cmd.is_empty() { continue; }
-            // Echo the command so the serial transcript shows what produced each result.
-            ctx.console_write("> ");
-            ctx.console_writeln(str_of(cmd));
+            // Echo the command so the transcript shows what produced each result.
+            out.put(ctx, "> ");
+            out.line(ctx, str_of(cmd));
             last = execute(ctx, cmd, cwd, last, depth + 1);
             if vi < RUN_MAX_CMDS { verdict[vi] = last.is_ok(); }
             vi += 1;
@@ -868,7 +874,7 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8) -> Resu
     }
     // End-of-run summary: PASS/FAIL per command (re-split identically, pairing with `verdict`).
     // "FAIL  " is deliberately not the word "FAILED" the harness greens on absence of.
-    ctx.console_writeln("--- summary ---");
+    out.line(ctx, "--- summary ---");
     let mut j = 0usize;
     for line in src.split(|&b| b == b'\n') {
         let line = trim_bytes(line);
@@ -876,12 +882,12 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8) -> Resu
         for cmd in line.split(|&b| b == b';') {
             let cmd = trim_bytes(cmd);
             if cmd.is_empty() { continue; }
-            ctx.console_write(if j < RUN_MAX_CMDS && !verdict[j] { "FAIL  " } else { "PASS  " });
-            ctx.console_writeln(str_of(cmd));
+            out.put(ctx, if j < RUN_MAX_CMDS && !verdict[j] { "FAIL  " } else { "PASS  " });
+            out.line(ctx, str_of(cmd));
             j += 1;
         }
     }
-    ctx.console_writeln_fmt(format_args!("run: ran {}, failed {}", ran, failed));
+    out.line_fmt(ctx, format_args!("run: ran {}, failed {}", ran, failed));
     if failed == 0 { Ok(()) } else { Err(ShellError::Unknown) }
 }
 
@@ -900,15 +906,17 @@ const SELFCHECK_GS: &str = include_str!("../../../scripts/selfcheck.gsh");
 /// tests have somewhere to write), then `selfcheck`. Re-runnable (the suite creates and deletes
 /// its own files). Refused inside a script (it runs one — no nesting).
 #[inline(never)]
-fn cmd_selfcheck(ctx: &ServiceContext, cwd: &mut Cwd, depth: u8) -> Result<(), ShellError> {
+fn cmd_selfcheck(ctx: &ServiceContext, cwd: &mut Cwd, depth: u8, out: &mut Out) -> Result<(), ShellError> {
     if depth > 0 {
         ctx.console_writeln("selfcheck: not available inside a script (it runs one)");
         return Err(ShellError::Unknown);
     }
+    // The intro is a status line → always to the console (even when the report is being captured to
+    // a file, so the operator sees the run start). The report itself goes to `out`.
     ctx.console_writeln_fmt(format_args!(
         "selfcheck: running the embedded suite ({} bytes, in memory) — needs a flashed drive for the file tests...",
         SELFCHECK_GS.len()));
-    run_lines(ctx, cwd, SELFCHECK_GS.as_bytes(), depth)
+    run_lines(ctx, cwd, SELFCHECK_GS.as_bytes(), depth, out)
 }
 
 /// `assert ok <cmd>` / `assert fails <cmd>` — the **result** form: run `<cmd>` and check that it
@@ -1097,10 +1105,12 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "read" => help_block(ctx, "read", "print a file", &[
             ("read <path>", "print the contents of <path>", "read /docs/notes.txt"),
         ], true),
-        "write" => help_block(ctx, "write", "create, overwrite, or append to a file", &[
+        "write" => help_block(ctx, "write", "create, overwrite, append, or prepend a file", &[
             ("write <path>", "create an empty file", "write /docs/todo.txt"),
             ("write <path> <text>", "create/overwrite with text", "write /docs/todo.txt \"buy milk\""),
             ("write append <path> <text>", "add text to the end (create if missing)", "write append /docs/todo.txt \"eggs\""),
+            ("write prepend <path> <text>", "add text to the front (create if missing)", "write prepend /docs/todo.txt \"# list\""),
+            ("<producer> | write [append|prepend] <path>", "save piped output to a file", "about | write /about.txt"),
         ], true),
         "edit" => help_block(ctx, "edit", "full-screen text editor (^S save, ^Q quit)", &[
             ("edit <path>", "open <path> for editing (creates it on save if new)", "edit /notes.txt"),
@@ -1188,6 +1198,9 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
         ("write", "append") => help_block(ctx, "write append", "append to a file (create if missing)", &[
             ("write append <path> <text>", "add <text> to the end of <path>", "write append /log started"),
         ], false),
+        ("write", "prepend") => help_block(ctx, "write prepend", "prepend to a file (create if missing)", &[
+            ("write prepend <path> <text>", "add <text> to the front of <path> (rewrites the file)", "write prepend /log \"# header\""),
+        ], false),
         ("match", "except") => help_block(ctx, "match except", "keep the lines that do NOT match", &[
             ("match except <pattern> [path]", "drop matching lines, keep the rest", "read /log | match except debug"),
         ], false),
@@ -1264,7 +1277,7 @@ static HELP: &[HelpRow] = &[
     Row("ls [path]", "list a directory"),
     Row("cd [path|-]", "change directory (- = previous)"),
     Row("read <path>", "print a file"),
-    Row("write [append] <path> [text]", "create/overwrite/append a file"),
+    Row("write [append|prepend] <path>", "create/overwrite/append/prepend (also: <prod> | write …)"),
     Row("edit <path>", "full-screen text editor (^S save, ^Q quit)"),
     Row("mkdir <path> [parents]", "create a directory"),
     Row("copy <src> <dst> [recursive]", "copy a file or subtree"),
@@ -1333,6 +1346,20 @@ fn cmd_help(ctx: &ServiceContext, depth: u8) -> Result<(), ShellError> {
     }
     help_pager(ctx, total, rows);
     Ok(())
+}
+
+/// Render the full `help` reference as plain text to `out` — the pipe-producer path
+/// (`help | write /help.txt`). Mirrors `help_render_line`'s content but with no pager, no cursor
+/// escapes, and no `ESC[K`: just the categorised command list, capturable to a file.
+fn help_to_out(ctx: &ServiceContext, out: &mut Out) {
+    out.line_fmt(ctx, format_args!("help {} — GodspeedOS shell commands", UTIL_VERSION));
+    for row in HELP {
+        match row {
+            Gap => out.line(ctx, ""),
+            Sec(s) | Text(s) => out.line(ctx, s),
+            Row(cmd, desc) => out.line_fmt(ctx, format_args!("  {:<21}  {}", cmd, desc)),
+        }
+    }
 }
 
 /// `less`-style pager for `help`: render a screenful from `top`, a status line, then
@@ -1446,11 +1473,12 @@ fn cmd_echo(ctx: &ServiceContext, text: &str, out: &mut Out) -> Result<(), Shell
     Ok(())
 }
 
-/// One-line identity for the system.
-fn cmd_about(ctx: &ServiceContext) -> Result<(), ShellError> {
-    ctx.console_writeln("GodspeedOS: a capability-based microkernel (v1 milestone)");
-    ctx.console_writeln_fmt(format_args!("  running on {} core(s)", ctx.inspect_core_count()));
-    ctx.console_writeln("  Created by Bankole Ogundero.");
+/// One-line identity for the system. A pipe source (`about | write /about.txt`): renders through
+/// `Out`, so it captures to a file as readily as it prints.
+fn cmd_about(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
+    out.line(ctx, "GodspeedOS: a capability-based microkernel (v1 milestone)");
+    out.line_fmt(ctx, format_args!("  running on {} core(s)", ctx.inspect_core_count()));
+    out.line(ctx, "  Created by Bankole Ogundero.");
     Ok(())
 }
 
@@ -1458,12 +1486,12 @@ fn cmd_about(ctx: &ServiceContext) -> Result<(), ShellError> {
 /// the INTROSPECT cap). Frames are 4 KiB pages: KiB = frames*4, MiB = frames/256.
 /// The percentage is computed in hundredths (two decimals, integer math) so the
 /// microkernel's tiny footprint shows as e.g. 0.03% rather than rounding to 0%.
-fn cmd_mem(ctx: &ServiceContext) -> Result<(), ShellError> {
+fn cmd_mem(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
     let total = ctx.inspect_kernel_total_frames();
     let free = ctx.inspect_kernel_free_frames();
     let used = total.saturating_sub(free);
     let pct_h = if total > 0 { used * 10000 / total } else { 0 }; // 0.01% units
-    ctx.console_writeln_fmt(format_args!(
+    out.line_fmt(ctx, format_args!(
         "mem: {} KiB used / {} MiB total ({}.{:02}% used, {} MiB free)",
         used * 4, total / 256, pct_h / 100, pct_h % 100, free / 256));
     Ok(())
@@ -1474,13 +1502,8 @@ fn cmd_reboot(ctx: &ServiceContext) -> ! {
     ctx.reboot()
 }
 
-fn cmd_cores(ctx: &ServiceContext) -> Result<(), ShellError> {
-    let n = ctx.inspect_core_count();
-    let mut buf = [0u8; 32];
-    let mut pos = 0usize;
-    write_bytes(&mut buf, &mut pos, b"cores: ");
-    write_u32(&mut buf, &mut pos, n);
-    ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("?"));
+fn cmd_cores(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
+    out.line_fmt(ctx, format_args!("cores: {}", ctx.inspect_core_count()));
     Ok(())
 }
 
@@ -1489,14 +1512,14 @@ fn cmd_cores(ctx: &ServiceContext) -> Result<(), ShellError> {
 /// 1970-01-01 instead. Deliberately just these two forms — no clock-setting, format
 /// strings, or timezones (§26.2: minimal surface). The subcommand is `epoch`, not
 /// `unix`: this is not POSIX, so the vocabulary doesn't borrow its name.
-fn cmd_date(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
+fn cmd_date(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     let dt = ctx.datetime();
     if arg == "epoch" {
-        ctx.console_writeln_fmt(format_args!("{}", dt.epoch_secs()));
+        out.line_fmt(ctx, format_args!("{}", dt.epoch_secs()));
     } else {
         let wd = WEEKDAYS[(dt.weekday() as usize) % 7];
-        ctx.console_writeln_fmt(format_args!(
+        out.line_fmt(ctx, format_args!(
             "{} {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
             wd, dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second));
     }
@@ -1856,11 +1879,11 @@ fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str) -> Result<(), ShellErro
         if cmd == "write" {
             if !last { ctx.console_writeln("pipe: write must be the last stage"); return Err(ShellError::Unknown); }
             match &s {
-                Stream::Bytes(c) => pipe_write_file(ctx, cwd, arg, c.bytes()),
+                Stream::Bytes(c) => pipe_write(ctx, cwd, arg, c.bytes()),
                 Stream::Table(t) => {
                     let mut c = Cap::new();
                     { let mut o = Out::Capture(&mut c); t.to_grid(&mut OutSink { ctx, out: &mut o }); }
-                    pipe_write_file(ctx, cwd, arg, c.bytes());
+                    pipe_write(ctx, cwd, arg, c.bytes());
                 }
             }
             return Ok(());
@@ -2377,7 +2400,13 @@ fn split_first(s: &str) -> (&str, &str) {
 // handled on the record path in `pipe_run` before this is consulted, so listing them here would
 // be dead. `tree` stays text — a hierarchy is not a flat table.
 fn is_producer_builtin(name: &str) -> bool {
-    matches!(name, "read" | "cat" | "echo" | "tree")
+    // Text emitters that can start a pipe (captured via `Out`). The info commands (about/mem/cores/
+    // date/help) join read/echo/tree so "anything that displays text can be saved to a file".
+    // No `cat`: `read` is the one file reader (utilities/18_read.md — `read` replaces POSIX `cat`,
+    // whose name describes a different operation; this OS does not carry POSIX vocabulary).
+    matches!(name, "read" | "echo" | "tree"
+                 | "about" | "mem" | "cores" | "date" | "help"
+                 | "selfcheck" | "run")
 }
 
 /// Producer SERVICES that emit without needing input, so they can start a pipe (and follow the
@@ -2399,26 +2428,63 @@ fn run_producer(ctx: &ServiceContext, cwd: &Cwd, cmdline: &str, out: &mut Out) {
     let (cmd, arg) = split_first(cmdline);
     match cmd {
         "echo"         => { let _ = cmd_echo(ctx, arg, out); }
-        "read" | "cat" => { let _ = cmd_read(ctx, cwd, arg, out); }
+        "read"         => { let _ = cmd_read(ctx, cwd, arg, out); }
         // "ls" and "find" are record producers (handled on the record path), not text here.
         "tree"         => { let _ = cmd_tree(ctx, cwd, arg, out); }
+        // Info/display commands — text emitters, capturable to a file.
+        "about"        => { let _ = cmd_about(ctx, out); }
+        "mem"          => { let _ = cmd_mem(ctx, out); }
+        "cores"        => { let _ = cmd_cores(ctx, out); }
+        "date"         => { let _ = cmd_date(ctx, arg, out); }
+        "help"         => help_to_out(ctx, out),
+        // Orchestrators — capture their RUN REPORT (the sub-commands' own output still goes to the
+        // console; see `run_lines`). Each gets its own `Cwd` so a `cd` inside can't move the
+        // interactive session. depth 0 → `selfcheck`/`run` are permitted (a pipe isn't a script).
+        "selfcheck"    => { let mut c = cwd.dup(); let _ = cmd_selfcheck(ctx, &mut c, 0, out); }
+        "run"          => { let mut c = cwd.dup(); let _ = cmd_run(ctx, &mut c, arg, 0, out); }
         _ => {}
     }
 }
 
-/// Write captured bytes to a file (the `write` sink). Overwrites, like plain `write`. Streams
-/// the captured buffer to the file in IO_CHUNK pieces (write_new + write_at), so a piped
-/// payload up to the capture buffer (CAP_MAX) — not just one message — reaches the file.
-fn pipe_write_file(ctx: &ServiceContext, cwd: &Cwd, path_arg: &str, data: &[u8]) {
-    let (pstr, _) = split_first(path_arg);
-    if pstr.is_empty() { ctx.console_writeln("pipe: write needs a file path"); return; }
-    let mut buf = [0u8; PATH_MAX];
-    let path = match resolve_or_err(ctx, cwd, pstr, &mut buf) { Some(p) => p, None => return };
-    let mut pbuf = [0u8; PATH_MAX];
-    let pl = path.len();
-    pbuf[..pl].copy_from_slice(path);
-    let p = &pbuf[..pl];
-    // Small (single-message) payload: one WriteFile, as before.
+/// Which way a `write` puts its data: replace the file, add to the end, or add to the front.
+/// Plain `write` / `… | write` is `Overwrite`; `append`/`prepend` are the explicit additive keywords.
+#[derive(Clone, Copy, PartialEq)]
+enum WriteMode { Overwrite, Append, Prepend }
+
+/// Parse a leading `append` / `prepend` keyword (each only when followed by whitespace or end, so a
+/// path like `appendix.txt` stays a path) from a write arg. Returns the mode + the remaining arg.
+fn parse_write_mode(arg: &str) -> (WriteMode, &str) {
+    if let Some(r) = arg.strip_prefix("append") {
+        if r.is_empty() || r.starts_with(char::is_whitespace) { return (WriteMode::Append, r.trim_start()); }
+    }
+    if let Some(r) = arg.strip_prefix("prepend") {
+        if r.is_empty() || r.starts_with(char::is_whitespace) { return (WriteMode::Prepend, r.trim_start()); }
+    }
+    (WriteMode::Overwrite, arg)
+}
+
+const WRITE_TMP: &[u8] = b"/.write.tmp"; // append/prepend staging file (root → no dirname math)
+
+/// Read exactly `out.len()` bytes from `path` at byte `off`, looping `read_at`. False on short read.
+fn read_file_exact(ctx: &ServiceContext, path: &[u8], off: usize, out: &mut [u8]) -> bool {
+    let mut done = 0usize;
+    let mut tmp = [0u8; IO_CHUNK];
+    while done < out.len() {
+        match fs_read_at(ctx, path, (off + done) as u64, &mut tmp) {
+            Some(n) if n > 0 => {
+                let take = n.min(out.len() - done);
+                out[done..done + take].copy_from_slice(&tmp[..take]);
+                done += take;
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Overwrite `p` (resolved path) with `data`. Small payload → one WriteFile; larger → write_new +
+/// streamed write_at chunks (so a piped payload up to the capture buffer reaches the file).
+fn stream_overwrite(ctx: &ServiceContext, p: &[u8], data: &[u8]) {
     if data.len() <= IO_CHUNK {
         match fs_request(ctx, OP_WRITE_FILE, p, data) {
             Some(r) if r.payload_bytes().first() == Some(&FS_OK) =>
@@ -2429,7 +2495,6 @@ fn pipe_write_file(ctx: &ServiceContext, cwd: &Cwd, path_arg: &str, data: &[u8])
         }
         return;
     }
-    // Large payload: allocate the file, then stream chunks.
     if !fs_write_new(ctx, p, data.len() as u64) {
         ctx.console_writeln("pipe: write failed (bad path, or parent missing?)");
         return;
@@ -2444,6 +2509,80 @@ fn pipe_write_file(ctx: &ServiceContext, cwd: &Cwd, path_arg: &str, data: &[u8])
         off = end;
     }
     ctx.console_writeln_fmt(format_args!("piped {} bytes → {}", data.len(), str_of(p)));
+}
+
+/// Append or prepend `new` to file `p`, streaming through a temp file: the original is read (via
+/// `read_at`) while the combined content `[old|new]` (append) or `[new|old]` (prepend) is written
+/// to `WRITE_TMP`, which then atomically replaces the target. Constant memory (one IO_CHUNK
+/// scratch), any file size. `prepend` is a **full-file rewrite** — there is no insert-at-front in
+/// the filesystem — so it costs the same as rewriting the file (honest, §26.7). True on success.
+#[inline(never)]
+fn fs_stream_combine(ctx: &ServiceContext, p: &[u8], new: &[u8], prepend: bool) -> bool {
+    let old_size = fs_stat(ctx, p).map(|(sz, _)| sz as usize).unwrap_or(0);
+    let total = old_size + new.len();
+    if total == 0 {
+        return matches!(fs_request(ctx, OP_WRITE_FILE, p, &[]).as_ref()
+            .map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK)));
+    }
+    if !fs_write_new(ctx, WRITE_TMP, total as u64) { return false; }
+    // Ordered segments: prepend = [new (mem) | old (disk)]; append = [old (disk) | new (mem)].
+    let (first_len, first_is_new) = if prepend { (new.len(), true) } else { (old_size, false) };
+    let mut off = 0usize;
+    let mut chunk = [0u8; IO_CHUNK];
+    while off < total {
+        let n = (total - off).min(IO_CHUNK);
+        let mut i = 0usize;
+        while i < n {
+            let g = off + i;
+            let (seg_is_new, local, remaining) = if g < first_len {
+                (first_is_new, g, first_len - g)
+            } else {
+                let s = g - first_len;
+                let second_is_new = !first_is_new;
+                let second_len = if second_is_new { new.len() } else { old_size };
+                (second_is_new, s, second_len - s)
+            };
+            let take = remaining.min(n - i);
+            if seg_is_new {
+                chunk[i..i + take].copy_from_slice(&new[local..local + take]);
+            } else if !read_file_exact(ctx, p, local, &mut chunk[i..i + take]) {
+                return false;
+            }
+            i += take;
+        }
+        if !fs_write_at(ctx, WRITE_TMP, off as u64, &chunk[..n]) { return false; }
+        off += n;
+    }
+    let _ = fs_request(ctx, OP_DELETE, p, &[]);
+    matches!(fs_request(ctx, OP_MOVE, WRITE_TMP, p).as_ref()
+        .map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK)))
+}
+
+/// The `write` pipe sink: `… | write [append|prepend] <path>`. Parses the mode (plain overwrites),
+/// resolves the path, and writes the captured/rendered `data`.
+fn pipe_write(ctx: &ServiceContext, cwd: &Cwd, arg: &str, data: &[u8]) {
+    let (mode, parg) = parse_write_mode(arg);
+    let (pstr, _) = split_first(parg);
+    if pstr.is_empty() { ctx.console_writeln("pipe: write needs a file path"); return; }
+    let mut buf = [0u8; PATH_MAX];
+    let path = match resolve_or_err(ctx, cwd, pstr, &mut buf) { Some(p) => p, None => return };
+    let mut pbuf = [0u8; PATH_MAX];
+    let pl = path.len();
+    pbuf[..pl].copy_from_slice(path);
+    let p = &pbuf[..pl];
+    match mode {
+        WriteMode::Overwrite => stream_overwrite(ctx, p, data),
+        WriteMode::Append | WriteMode::Prepend => {
+            let prepend = mode == WriteMode::Prepend;
+            if fs_stream_combine(ctx, p, data, prepend) {
+                ctx.console_writeln_fmt(format_args!(
+                    "{} {} bytes → {}", if prepend { "prepended" } else { "appended" }, data.len(), str_of(p)));
+            } else {
+                ctx.console_writeln_fmt(format_args!(
+                    "pipe: write {} failed (storage, or bad path?)", if prepend { "prepend" } else { "append" }));
+            }
+        }
+    }
 }
 
 /// Look up a just-spawned service's endpoint via the registry, retrying while it registers.
@@ -2534,6 +2673,12 @@ struct Cwd {
 }
 
 impl Cwd {
+    /// A by-value copy — a pipe producer that runs commands (`run`/`selfcheck`) gets its own
+    /// mutable `Cwd` so a `cd` inside the captured run can't disturb the interactive session's.
+    fn dup(&self) -> Cwd {
+        Cwd { buf: self.buf, len: self.len, prev: self.prev, prev_len: self.prev_len }
+    }
+
     fn root() -> Self {
         let mut buf = [0u8; PATH_MAX];
         buf[0] = b'/';
@@ -3466,18 +3611,15 @@ fn cmd_read(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result
     Ok(())
 }
 
-/// `write <path> [content]` overwrites; `write append <path> [content]` appends (creating the
-/// file if missing). `append` is a *leading* keyword because write's content is free-form — it
-/// can't trail the way `mkdir … parents` does (it would be swallowed as content).
+/// `write <path> [content]` overwrites; `write append|prepend <path> [content]` adds to the end /
+/// front (creating the file if missing). `append`/`prepend` are *leading* keywords because write's
+/// content is free-form — they can't trail the way `mkdir … parents` does (it would be swallowed as
+/// content). Append/prepend stream through a temp file (`fs_stream_combine`), so they are not bound
+/// by a small buffer; `prepend` is a full-file rewrite (no insert-at-front — honest, §26.7).
 fn cmd_write(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
-    // `append` counts as the keyword only when followed by whitespace or end-of-line, so a
-    // path like "appendix.txt" is still treated as a path.
-    let (append, rest) = match rest.strip_prefix("append") {
-        Some(r) if r.is_empty() || r.starts_with(char::is_whitespace) => (true, r.trim_start()),
-        _ => (false, rest),
-    };
+    let (mode, rest) = parse_write_mode(rest);
     if rest.is_empty() {
-        ctx.console_writeln("usage: write [append] <path> [content]");
+        ctx.console_writeln("usage: write [append|prepend] <path> [content]");
         return Err(ShellError::Unknown);
     }
     // Split off the first token (path); the remainder (with spaces) is the content. A
@@ -3492,59 +3634,30 @@ fn cmd_write(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
     let mut pbuf = [0u8; PATH_MAX];
     let pl = path.len();
     pbuf[..pl].copy_from_slice(path);
-    if append {
-        return cmd_write_append(ctx, &pbuf[..pl], content.as_bytes());
+    let p = &pbuf[..pl];
+    if mode != WriteMode::Overwrite {
+        let prepend = mode == WriteMode::Prepend;
+        if fs_stream_combine(ctx, p, content.as_bytes(), prepend) {
+            ctx.console_writeln_fmt(format_args!(
+                "{} {} bytes to {}", if prepend { "prepended" } else { "appended" }, content.len(), str_of(p)));
+            return Ok(());
+        }
+        ctx.console_writeln_fmt(format_args!(
+            "write: {} failed (storage, or bad path?)", if prepend { "prepend" } else { "append" }));
+        return Err(ShellError::Unknown);
     }
-    let reply = match fs_request(ctx, OP_WRITE_FILE, &pbuf[..pl], content.as_bytes()) {
+    let reply = match fs_request(ctx, OP_WRITE_FILE, p, content.as_bytes()) {
         Some(r) => r,
         None => { ctx.console_writeln("write: storage unavailable"); return Err(ShellError::Unknown); }
     };
-    let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-    if p.first() == Some(&FS_OK) {
-        ctx.console_writeln_fmt(format_args!("wrote {} ({} bytes)", str_of(&pbuf[..pl]), content.len()));
+    let rp = reply.payload_bytes();
+    if no_fs(ctx, rp) { return Err(ShellError::Unknown); }
+    if rp.first() == Some(&FS_OK) {
+        ctx.console_writeln_fmt(format_args!("wrote {} ({} bytes)", str_of(p), content.len()));
         Ok(())
     } else {
         ctx.console_writeln("write: failed (bad path, or parent missing?)");
         Err(ShellError::Unknown)
-    }
-}
-
-/// Append `add` to file `path`, creating it if missing. Shell-side (no new fs surface): read
-/// the current content, concatenate, write the whole file back. The combined size is bounded
-/// by `fs`'s file-size limit, which rejects an over-large WriteFile loudly.
-fn cmd_write_append(ctx: &ServiceContext, path: &[u8], add: &[u8]) -> Result<(), ShellError> {
-    let mut data = [0u8; 4096];
-    // Read existing content; an absent file just starts empty (append creates).
-    let n_old = match fs_request(ctx, OP_READ_FILE, path, &[]) {
-        Some(r) => {
-            let p = r.payload_bytes();
-            if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-            if p.first() == Some(&FS_OK) && p.len() >= 5 {
-                let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
-                let end = (5 + n).min(p.len());
-                data[..end - 5].copy_from_slice(&p[5..end]);
-                end - 5
-            } else {
-                0 // NOTFOUND → create a new file with just the appended text
-            }
-        }
-        None => { ctx.console_writeln("write: storage unavailable"); return Err(ShellError::Unknown); }
-    };
-    if n_old + add.len() > data.len() {
-        ctx.console_writeln("write: append would exceed the maximum file size");
-        return Err(ShellError::Unknown);
-    }
-    data[n_old..n_old + add.len()].copy_from_slice(add);
-    let total = n_old + add.len();
-    match fs_request(ctx, OP_WRITE_FILE, path, &data[..total]) {
-        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
-            ctx.console_writeln_fmt(format_args!("appended {} bytes to {} ({} total)", add.len(), str_of(path), total));
-            Ok(())
-        }
-        Some(r) if no_fs(ctx, r.payload_bytes()) => Err(ShellError::Unknown),
-        Some(_) => { ctx.console_writeln("write: append failed (file-size limit, or bad path?)"); Err(ShellError::Unknown) }
-        None    => { ctx.console_writeln("write: storage unavailable"); Err(ShellError::Unknown) }
     }
 }
 

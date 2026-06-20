@@ -39,12 +39,17 @@ assert ok find version
 assert ok read version
 assert ok clear help
 
-# ===== system info (these print directly; they are not pipe producers) =====
+# ===== system info — now PIPE PRODUCERS (text emitters captured via Out), bare + piped =====
 assert ok about
 assert ok cores
 assert ok mem
 assert ok date
 assert ok date epoch
+about | assert contains GodspeedOS
+cores | assert contains cores
+mem | assert contains used
+date | assert contains :
+help | assert contains status
 
 # ===== introspection producers: status / caps (+ every where operator, no spawn) =====
 assert ok status
@@ -94,6 +99,22 @@ write append /sc/a.txt MORE
 read /sc/a.txt | assert contains worldMORE
 write append /sc/fresh.txt born
 read /sc/fresh.txt | assert contains born
+# prepend (standalone): adds to the FRONT; append + prepend compose to TOP-MID-END
+write /sc/pp.txt MID
+write append /sc/pp.txt -END
+write prepend /sc/pp.txt TOP-
+read /sc/pp.txt | assert contains TOP-MID-END
+# append/prepend as PIPE SINKS (capture then add): header lands before footer
+echo footer | write append /sc/ap.txt
+read /sc/ap.txt | assert contains footer
+echo header | write prepend /sc/ap.txt
+read /sc/ap.txt | assert contains header
+read /sc/ap.txt | assert contains footer
+# pipe producer → file, then read back (capture-to-disk of a text producer + help)
+about | write /sc/about.txt
+read /sc/about.txt | assert contains GodspeedOS
+help | write /sc/help.txt
+read /sc/help.txt | assert contains Storage
 write /sc/empty.txt
 read /sc/empty.txt | assert empty
 write /sc/q.txt "two words"

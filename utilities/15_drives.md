@@ -116,7 +116,7 @@ entirely:
 `cd` is **not** an unwanted import — a "where am I" pointer is inherent to any hierarchical
 namespace (DOS and Windows have `cd` too), and real directories were a deliberate GSFS
 choice. `cd` is a **file-command utility** (its own doc, step 3-file-commands), not a
-`drives` subcommand — `drives` manages *drives*; `cd`/`ls`/`cat` navigate within and across
+`drives` subcommand — `drives` manages *drives*; `cd`/`ls`/`read` navigate within and across
 them. The one thing the old `drives use default` would have added — *persisting* a starting
 drive across boots (a session `cd` does not) — is **deferred** (§26.2): decided when file
 commands + multi-drive exist, not invented now.
@@ -164,7 +164,7 @@ from the boot default — you might boot off drive 0 yet work on drive 1.)
 | `drives version` | print the version | — | **3** |
 | `drives help` | print usage | — | **3** |
 
-Drive *contents* (`ls` / `cat` / `write` / `cd` / `mkdir`) are **their own utilities**, not
+Drive *contents* (`ls` / `read` / `write` / `cd` / `mkdir`) are **their own utilities**, not
 `drives` subcommands — they operate on paths within a drive, addressable as
 `[index:]label/path` or `/abs` / `rel` on the current drive (`docs/drives.md` §4.1).
 
@@ -225,7 +225,7 @@ persistence (the bytes survive a power-cycle); it is never part of the workflow.
    the OS format its own SSD (which unblocks on-hardware persistence verification).
    Needs: `block-driver` capacity request (IDENTIFY sectors → size the filesystem);
    `fs` raw-tolerant (serve the drives API even with no filesystem) + in-OS `format()`.
-3. **File commands** — `ls` / `cat` / `write` / `cd` / `mkdir` on the current drive; `cd`
+3. **File commands** — `ls` / `read` / `write` / `cd` / `mkdir` on the current drive; `cd`
    is the single current-location pointer (drive + dir).
 4. **Multi-drive** — enumerate all SATA disks; per-drive block IPC; `cd [index:]label/path`
    cross-drive addressing read on demand; duplicate labels disambiguated by index;
