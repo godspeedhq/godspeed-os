@@ -1,8 +1,9 @@
 # Design Spec: Move Naming Out of the Kernel
 
-> **Status:** Design proposal. **Non-normative until adopted.** This doc proposes amendments to
-> the constitution (`CLAUDE.md` §4.4, §11, and notes to §6/§13/§26.10) and a migration plan. No
-> boot-path code lands until this is signed off. The spec wins on any conflict; this doc trails it.
+> **Status:** Direction **signed off (2026-06-20)** — implementation proceeds in phases (§5). The
+> §3.5 open question is **DECIDED: retire `registry`** (the supervisor is the sole name authority).
+> Still non-normative as a document: the constitution amendments (§6) land *with* their phases. The
+> spec wins on any conflict; this doc trails it.
 >
 > **Author intent (2026-06-20):** the kernel currently performs a *policy* job — resolving service
 > *names* to *endpoints* — which §26.10 says belongs in a service. Pull it out so the kernel is pure
@@ -133,7 +134,7 @@ This is *explicit* reacquisition (§14.3 / §26.5 — no silent rebind), anchore
 never dies. It works for **every** name including the registry's role, because the anchor (supervisor)
 is reached by a bootstrap cap, not by a lookup. The `registry_lookup` syscall-10 fallback is removed.
 
-### 3.5 Fate of the `registry` service — **recommendation: retire it**
+### 3.5 Fate of the `registry` service — **DECIDED (2026-06-20): retire it**
 
 Today the userspace `registry` (H11) is a separate restartable name service. In this design the
 supervisor *is* the name authority (it holds the authoritative `name → cap` map by construction), so
@@ -149,9 +150,10 @@ the registry's job collapses into the supervisor:
   the *registry* cap from the supervisor (bootstrap). This keeps the supervisor lean but keeps a
   service and a cache-coherence concern.
 
-The author's stated preference ("give that job to the supervisor… keep init and supervisor the only
-unrestartable invariants") points at **retire**. This doc recommends retire; the alternative is
-recorded for the sign-off discussion.
+**Decision (signed off 2026-06-20): retire `registry`.** The supervisor is the sole name authority;
+the bootstrap chicken-and-egg disappears (no registry cap to reacquire — only the never-stale
+supervisor cap). The alternative (front-end) is recorded above for history. `init` + `supervisor`
+remain the only non-restartable services, as intended.
 
 ### 3.6 Death notifications
 
