@@ -520,8 +520,8 @@ fn ensure_dir path {
 # provision once, then report — re-runnable
 ensure_dir /sc
 
-for row in (roster | where core > 0) {
-    echo "$row.name is a $row.role on core $row.core"
+for row in (roster | where seat > 0) {
+    echo "$row.name is a $row.role at seat $row.seat"
 }
 
 let lines = $(greet | count)

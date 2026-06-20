@@ -93,21 +93,26 @@ with the SDK, **`encode`s it with the binary wire codec**, and emits the bytes t
 shell-delegated pipe cap (zero ambient authority, like `greet`). The shell knows `roster` is a
 record service, so it `decode`s the stream straight into a `Table` — **no `from json`**:
 
+`seat` is an illustrative `Int` column (a desk number, **not** a CPU core — roster is a fixed
+demo dataset, the same 4 rows on any machine; real core counts live in `cores`/`status`):
+
 ```text
-gsh> roster | sort reverse core
-name    role     core
-hermes  courier  2
-atlas   worker   1
-vesta   core     0
+gsh> roster | sort reverse seat
+name     role     seat
+John     worker   4
+Luke     courier  3
+Mark     worker   2
+Matthew  core     1
 gsh> roster | where role=core | to json
 [
-  {"name": "vesta", "role": "core", "core": 0}
+  {"name": "Matthew", "role": "core", "seat": 1}
 ]
-gsh> roster | select name core
-name    core
-atlas   1
-hermes  2
-vesta   0
+gsh> roster | select name seat
+name     seat
+Matthew  1
+Mark     2
+Luke     3
+John     4
 ```
 
 This is the whole point of the SDK record API: a third-party service emits typed data *as

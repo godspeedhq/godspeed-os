@@ -50,6 +50,11 @@ cores | assert contains cores
 mem | assert contains used
 date | assert contains :
 help | assert contains status
+# uptime — a record producer (wall-clock RTC delta): bare grid + json + column projection.
+assert ok uptime
+uptime | assert contains seconds
+uptime | to json | assert contains seconds
+uptime | select seconds | to json | assert lacks uptime
 
 # ===== introspection producers: status / caps (+ every where operator, no spawn) =====
 assert ok status
@@ -197,12 +202,13 @@ echo alpha beta gamma | match beta | assert contains beta
 assert ok roster
 roster | where role=core | assert contains Matthew
 roster | where role!=core | assert lacks Matthew
-roster | where core>0 | assert lacks Matthew
+roster | where seat>1 | assert lacks Matthew
+roster | where seat=1 | assert contains Matthew
 roster | where name~ar | assert contains Mark
-roster | sort reverse core | assert contains John
+roster | sort reverse seat | assert contains John
 roster | to json | assert contains role
 roster | to json | from json | where role=core | assert contains Matthew
-roster | select name core | to json | assert contains Luke
+roster | select name seat | to json | assert contains Luke
 
 # ===== json <-> records bridge (exhaustive where/select/sort — no service spawn) =====
 write /sc/data.json [{"name":"x","n":1},{"name":"y","n":2},{"name":"z","n":3}]

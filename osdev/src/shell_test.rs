@@ -1327,8 +1327,8 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
                           "roster codec: where filters records decoded from the service stream"),
         None    => { println!("files-test: FAIL — roster|where timeout"); fail += 1; }
     }
-    match run!(b"roster | select name core | to json\r", 16) {
-        Some(r) => check!(r.contains("\"name\": \"Mark\"") && r.contains("\"core\":") && !r.contains("\"role\""),
+    match run!(b"roster | select name seat | to json\r", 16) {
+        Some(r) => check!(r.contains("\"name\": \"Mark\"") && r.contains("\"seat\":") && !r.contains("\"role\""),
                           "roster codec: select + to json projects the decoded records"),
         None    => { println!("files-test: FAIL — roster|select timeout"); fail += 1; }
     }

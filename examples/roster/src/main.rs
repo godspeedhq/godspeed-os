@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! gsh> roster | where role=core
-//! gsh> roster | sort reverse core | select name core
+//! gsh> roster | sort reverse seat | select name seat
 //! gsh> roster | to json            (records → JSON only at the edge, if you want it)
 //! ```
 //!
@@ -44,18 +44,20 @@ impl RecordSink for BufSink {
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("roster: ready");
 
-    // Build a small typed table — data this service "owns". Columns: name / role / core.
-    let mut t = Table::new(&["name", "role", "core"]);
+    // Build a small typed table — data this service "owns". Columns: name / role / seat.
+    // `seat` is an illustrative Int column (a desk number, NOT a CPU core) — roster is a fixed
+    // demo dataset, the same 4 rows on any machine; real core counts live in `cores`/`status`.
+    let mut t = Table::new(&["name", "role", "seat"]);
     let rows: [(&[u8], &[u8], u64); 4] = [
-        (b"Matthew", b"core", 0),
-        (b"Mark", b"worker", 1),
-        (b"Luke", b"courier", 2),
-        (b"John", b"worker", 3),
+        (b"Matthew", b"core", 1),
+        (b"Mark", b"worker", 2),
+        (b"Luke", b"courier", 3),
+        (b"John", b"worker", 4),
     ];
-    for (name, role, core) in rows.iter() {
+    for (name, role, seat) in rows.iter() {
         let n = t.intern(name);
         let r = t.intern(role);
-        t.add_row(&[n, r, Value::Int(*core)]);
+        t.add_row(&[n, r, Value::Int(*seat)]);
     }
 
     // Serialize with the binary wire codec — the `Table` itself on the wire, not JSON. The shell
