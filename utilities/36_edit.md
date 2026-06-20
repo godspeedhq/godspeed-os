@@ -29,7 +29,7 @@ gsh> edit /notes.txt
 ```
 
 `<path>` resolves like every other file command (absolute, or relative to the current `cd`).
-A directory, or a file larger than the editor's buffer, is refused loudly (§5) — never truncated.
+A directory is refused loudly; a file of **any size** opens (§5).
 
 ## 3. The screen
 
@@ -40,12 +40,16 @@ shopping list                                                       ← the text
 - eggs
 _                                                                   ← the editing cursor
 
- ^S save   ^Q quit      Ln 4, Col 1   23/3556 bytes                 ← status bar (hints + position)
+ ^S save   ^Q quit      Col 1   23 bytes   (buf 12/32768)           ← status bar (hints + position)
 ```
 
 The title and status bars are drawn in reverse video on a serial terminal and as plain text on
-the framebuffer console (which has no colour) — readable on both. The status bar always shows the
-two essential keys and the live cursor position + buffer fill.
+the framebuffer console (which has no colour) — readable on both. The status bar shows the two
+essential keys, the live column, the document size, and the **edit-buffer fill** (`buf N/32768`)
+— how much you've typed since the last save (§5). When that buffer fills it flips to a loud
+`edit buffer full — save (^S) to continue` prompt. There is no absolute line number: that would
+require scanning the file from the top on every keystroke, which is exactly the O(file) cost the
+windowed design exists to avoid.
 
 ## 4. Keys
 
@@ -65,17 +69,28 @@ two essential keys and the live cursor position + buffer fill.
 
 The view scrolls vertically and horizontally to keep the cursor visible; there are no modes.
 
-## 5. The size limit (honest)
+## 5. Files of any size — a bounded piece table (honest)
 
-The text lives in **one fixed stack buffer** — services hold no heap by default (§26.6) — sized
-to one filesystem message (**3556 bytes**, the file-transfer ceiling, `IO_CHUNK`). So:
+`edit` opens a file of **any size**. It never loads the whole file into memory. The model is a
+**bounded piece table**, the no-heap (§26.6) realisation of "scroll a huge file the way iOS scrolls
+millions of rows":
 
-- A file up to 3556 bytes is editable.
-- A larger file is **refused** with its size (`edit: … too large to edit …`), never opened and
-  silently clipped — losing data quietly is the failure the constitution forbids (§3.12, §26.7).
+- **The original file stays on disk.** It is read in fixed `IO_CHUNK` (3556-byte) **windows** as you
+  scroll — only the visible window is ever materialised, so opening a 1 MiB file is as cheap as
+  opening a 1 KiB one.
+- **Edits never touch the original.** Typed bytes go into a fixed in-memory **add buffer**, and the
+  document is an ordered list of **spans** (pieces) into either the original file or the add buffer.
+  Inserting or deleting rewrites that span list — a few bytes — not the file.
+- **Save streams the spans out** to a temporary file and atomically replaces the original (write
+  temp → delete target → move temp into place), then **resets** the add buffer and span list. The
+  saved file becomes the new original and editing continues.
 
-This matches the system's "a small file is one IPC message" model. Editing larger files would
-need a streaming buffer; that is deferred until something needs it (§26.2), not built speculatively.
+So the only thing that is bounded is **how much you edit between saves**, not the file size. The add
+buffer holds **32 KiB** of new text and the span list holds 1024 pieces; if either fills, the next
+edit is **refused loudly** — the status bar shows `edit buffer full — save (^S) to continue` — and a
+save empties both. Nothing is ever silently dropped or truncated, which is the failure the
+constitution forbids (§3.12, §26.7). All of this state is fixed-size stack arrays: no heap, bounded,
+loud on overflow.
 
 ## 6. Capabilities
 
@@ -97,5 +112,14 @@ disk authority; `edit` only asks it to read one file and write one file.
 
 Conforms: own `edit help` (usage with a real example per `0_conventions.md`) and `edit version`
 (number + creator credit), listed by the shell's top-level `help` under **Storage**. Exercised
-end-to-end by `osdev test edit` (open → type/backspace/newline → ^S save → ^Q quit → `read`-back;
-edit-existing insert; quit-with-discard) — 9 checks, QEMU-validated. See `0_conventions.md` §3.
+end-to-end by `osdev test edit` — **15 checks, QEMU-validated**:
+
+- Small file: open → type/backspace/newline → ^S save → ^Q quit → `read`-back; edit-existing
+  insert-at-start; quit-with-discard at the unsaved-changes prompt; no-arg usage.
+- **Large file** (a pre-baked ~16 KiB / multi-window `/big.txt`): open it windowed, insert at offset
+  0, save; re-open, PageDown past the first window, insert a mid-file marker, save. The harness then
+  reads the bytes **back off the disk** and asserts the start edit, the mid-file edit, and the far
+  original tail all survived the streaming save — proving the windowed load + multi-chunk save path
+  end to end.
+
+See `0_conventions.md` §3.

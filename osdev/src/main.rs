@@ -1925,6 +1925,14 @@ fn run_edit_test() {
     let _ = std::fs::create_dir_all("build/tests");
     let persist = "build/tests/persist_edit.img";
     std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create raw disk");
+    // Pre-format GSFS and bake a MULTI-WINDOW text file (> several IO_CHUNK windows) so the editor
+    // exercises the piece-table windowed-load + streaming-save path on a real large file. 400 lines
+    // of a fixed shape (no "gsh>" substring — that's the harness sentinel); first "EDITLINE 0000",
+    // last "EDITLINE 0399" → asserts the start-edit and the untouched tail both survive a save.
+    format_superblock(persist);
+    let mut big = String::new();
+    for i in 0..400 { big.push_str(&format!("EDITLINE {i:04} the quick brown fox jumps\n")); }
+    gsfs_add_file(persist, "big.txt", big.as_bytes());
     crate::shell_test::run_edit(&image_path, persist, 4);
 }
 

@@ -1576,15 +1576,13 @@ pub fn run_edit(image_path: &Path, persist_path: &str, smp: u32) {
         std::process::exit(1);
     }
 
-    // Format the disk so the editor has a filesystem to save to.
-    send(&mut write_half, b"drives flash data\r");
-    if collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(10)).is_some() {
-        send(&mut write_half, b"y\r");
-        match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)) {
-            Some(r) => check!(r.contains("formatted as GSFS"), "setup: flashed GSFS"),
-            None    => { println!("edit-test: FAIL — flash timeout"); fail += 1; }
-        }
-    } else { println!("edit-test: FAIL — no flash confirm"); fail += 1; }
+    // The disk is pre-formatted host-side with a large baked file (`/big.txt`, ~400 lines / several
+    // IO_CHUNK windows). Confirm fs mounted it — proves the editor has a filesystem to save to and
+    // gives the large-file tests their fixture.
+    match read_back!(b"ls /\r") {
+        Some(r) => check!(r.contains("big.txt"), "setup: pre-baked /big.txt present"),
+        None    => { println!("edit-test: FAIL — ls / timeout"); fail += 1; }
+    }
 
     // 1. no-arg usage.
     match read_back!(b"edit\r") {
@@ -1641,8 +1639,60 @@ pub fn run_edit(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("edit-test: FAIL — read after discard timeout"); fail += 1; }
     }
 
+    // ── Large file (piece-table windowed load + streaming save) ─────────────────────────────────
+    // The editor is DRIVEN over serial; the result is verified on the DISK afterwards (a 16 KiB
+    // file dumped back over the console renders ~400 lines on the fbcon — far too slow under TCG —
+    // and the file commands that emit small output, `match`/`count`, read via one ≤4 KiB message so
+    // they can't read it either). The disk is the actual deliverable, so we assert on it directly.
+    //
+    // 5. Open the multi-window /big.txt and insert "AAA " at offset 0 (start-edit), save, quit. The
+    //    save streams ALL spans (the typed prefix + the windowed original tail) to a temp file and
+    //    atomically replaces /big.txt.
+    send(&mut write_half, b"edit /big.txt\r");
+    if collect_until(&buf, &mut cursor, b"^S save", Duration::from_secs(12)).is_some() {
+        check!(true, "edit /big.txt: large file opened (windowed)");
+        send(&mut write_half, b"AAA \x13");          // insert at start, ^S
+        thread::sleep(Duration::from_millis(1200));   // multi-chunk save round-trip
+        send(&mut write_half, b"\x11");               // ^Q (clean after save)
+        match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(12)) {
+            Some(_) => check!(true, "edit /big.txt: start-edit saved + returned to prompt"),
+            None    => { println!("edit-test: FAIL — big.txt edit did not return"); fail += 1; }
+        }
+    } else { println!("edit-test: FAIL — big.txt did not open (×2)"); fail += 2; }
+
+    // 6. Re-open /big.txt, PageDown into the file (windowed navigation past the first window), type
+    //    a mid-file marker, save, quit. Exercises an edit that isn't in window 0.
+    send(&mut write_half, b"edit /big.txt\r");
+    if collect_until(&buf, &mut cursor, b"^S save", Duration::from_secs(12)).is_some() {
+        send(&mut write_half, b"\x1b[6~");            // PageDown (one screen down — past row 0)
+        thread::sleep(Duration::from_millis(200));
+        send(&mut write_half, b"MID \x13");           // insert mid-file marker, ^S
+        thread::sleep(Duration::from_millis(1200));
+        send(&mut write_half, b"\x11");               // ^Q
+        match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(12)) {
+            Some(_) => check!(true, "edit /big.txt: mid-file edit saved + returned to prompt"),
+            None    => { println!("edit-test: FAIL — big.txt mid-edit did not return"); fail += 1; }
+        }
+    } else { println!("edit-test: FAIL — re-open big.txt for mid-edit"); fail += 1; }
+
     child.kill().ok();
     child.wait().ok();
+
+    // Verify the SAVED bytes on the disk (the editor's actual output). Parse the GSFS root for
+    // /big.txt, read its data region, and assert both edits landed and the far tail survived the
+    // streaming save — windowed load + multi-chunk save proven end to end, without rendering 16 KiB.
+    match gsfs_read_file(persist_path, b"big.txt") {
+        Some(content) => {
+            check!(content.starts_with(b"AAA EDITLINE 0000"),
+                   "big.txt (disk): start-edit at offset 0 ('AAA EDITLINE 0000')");
+            check!(window_find(&content, b"EDITLINE 0399").is_some(),
+                   "big.txt (disk): windowed original tail preserved ('EDITLINE 0399')");
+            check!(window_find(&content, b"MID ").is_some(),
+                   "big.txt (disk): mid-file edit present ('MID ')");
+        }
+        None => { println!("edit-test: FAIL — could not read /big.txt back from the disk (×3)"); fail += 3; }
+    }
+
     println!("\nedit-test: {pass} passed, {fail} failed");
     if fail > 0 {
         std::process::exit(1);
@@ -2256,4 +2306,36 @@ fn window_find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 fn send(stream: &mut impl Write, data: &[u8]) {
     let _ = stream.write_all(data);
     let _ = stream.flush();
+}
+
+/// Read a top-level GSFS0008 file's bytes back from a disk image, host-side. Parses the superblock
+/// for the root directory block, finds the named record, and concatenates its contiguous data
+/// blocks' 508-byte payloads up to the file size. Used to verify the editor's on-disk save without
+/// dumping the file over the (slow, capped) serial console. Contiguous files only (`type` 1) —
+/// which is what a fresh-disk streaming save produces; returns None otherwise.
+fn gsfs_read_file(image_path: &str, name: &[u8]) -> Option<Vec<u8>> {
+    const BLOCK: usize = 512;
+    const PAYLOAD: usize = 508;   // data bytes per block (last 4 = CRC32)
+    const RECS: usize = 7;        // file_records per directory block
+    let data = std::fs::read(image_path).ok()?;
+    if data.len() < BLOCK || &data[0..8] != b"GSFS0008" { return None; }
+    let root_first = u64::from_le_bytes(data.get(48..56)?.try_into().ok()?) as usize;
+    let rd = root_first * BLOCK;
+    for slot in 0..RECS {
+        let r = rd + slot * 64;
+        if data.get(r).copied()? != 1 { continue; }            // type 1 = contiguous file
+        let nl = data[r + 1] as usize;
+        if nl == 0 || nl > 38 || &data[r + 2..r + 2 + nl] != name { continue; }
+        let size = u64::from_le_bytes(data[r + 40..r + 48].try_into().ok()?) as usize;
+        let first = u64::from_le_bytes(data[r + 48..r + 56].try_into().ok()?) as usize;
+        let nblocks = size.div_ceil(PAYLOAD).max(1);
+        let mut out = Vec::with_capacity(size);
+        for k in 0..nblocks {
+            let bo = (first + k) * BLOCK;
+            let take = (size - out.len()).min(PAYLOAD);
+            out.extend_from_slice(data.get(bo..bo + take)?);
+        }
+        return Some(out);
+    }
+    None
 }

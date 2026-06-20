@@ -104,14 +104,14 @@ impl Out<'_> {
     /// Write a string, no trailing newline.
     fn put(&mut self, ctx: &ServiceContext, s: &str) {
         match self {
-            Out::Console => ctx.console_write(s),
+            Out::Console => console_write_chunked(ctx, s.as_bytes()),
             Out::Capture(c) => c.push(s.as_bytes()),
         }
     }
     /// Write raw bytes, no trailing newline (file content may not be clean UTF-8).
     fn put_bytes(&mut self, ctx: &ServiceContext, b: &[u8]) {
         match self {
-            Out::Console => ctx.console_write(str_of(b)),
+            Out::Console => console_write_chunked(ctx, b),
             Out::Capture(c) => c.push(b),
         }
     }
@@ -2867,111 +2867,296 @@ fn cmd_fcap(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
 
 // ── edit: a full-screen text editor (utilities/36_edit.md) ───────────────────────────────────
 //
-// Modelled after Microsoft's `edit`: a full-screen, modeless editor with a title bar on top, the
-// text area, and a bottom hint/status bar. Keyboard-only. The text lives in one flat stack
-// buffer — no heap (§26.6) — so a file up to one fs message (`MAX_EDIT_BYTES`) is editable; a
-// larger file is refused loudly rather than silently truncated. Rendering uses only the CSI
-// subset the console supports on BOTH transports (serial terminal AND the framebuffer console,
-// `arch/x86_64/fb.rs`): absolute cursor position, erase-to-end-of-line, show/hide cursor. The
-// reverse-video bars (SGR) render on a serial terminal and degrade to plain text on the fbcon
-// (it consumes the unsupported escape without drawing garbage), so it is readable on both.
-const MAX_EDIT_BYTES: usize = IO_CHUNK; // 3556 — one fs message (the file-transfer ceiling)
-const EDIT_COLS_MAX: usize = 256;       // bar-render scratch width cap
-const EDIT_TAB: usize = 4;              // Tab inserts this many spaces (keeps column math clean)
+// A modeless full-screen editor (title bar, text area, bottom status bar), modelled after
+// Microsoft's `edit`. Files of ANY size are editable: this is a **bounded piece table** (no heap,
+// §26.6). The original file stays on disk and is read in IO_CHUNK windows (`fs_read_at`) as you
+// scroll — only the visible window is ever materialised (the "scroll millions of lines" property).
+// Edits never touch the original: typed bytes go into a fixed `add` buffer, and the document is an
+// ordered list of `Piece` spans into either the original file or the add buffer. Save streams the
+// spans out to a temp file and atomically replaces the original, then RESETS the add buffer + span
+// list — so the only bound is how much you edit *between saves*, not the file size. When the add
+// buffer or span list fills, the edit is refused loudly (the status bar says to save), never
+// silently dropped (§26.7). Rendering uses only the CSI subset the serial terminal AND the fbcon
+// support (`arch/x86_64/fb.rs`): cursor position, erase-to-EOL, show/hide; reverse-video bars are
+// SGR (pretty on serial, plain on the fbcon — it ignores the unsupported escape, no garbage).
+const EDIT_COLS_MAX: usize = 256;          // bar-render scratch width cap; also caps render cols
+const EDIT_TAB: usize = 4;                 // Tab inserts this many spaces
+const EDIT_ADD_MAX: usize = 32 * 1024;     // add-buffer: new typed bytes between saves (save resets)
+const EDIT_MAX_PIECES: usize = 1024;       // span-list size (save resets); each edit adds ≤2 spans
+const EDIT_LINE_MAX: usize = 8192;         // bound on a single line's length for nav/render scans
+const EDIT_TMP: &[u8] = b"/.edit.tmp";     // save staging file (root → no dirname math)
 
-/// In-memory edit buffer + view state. A flat byte array with the cursor as a byte offset; edits
-/// shift bytes (O(n), but n ≤ 3556 — trivial). Lines are the text between '\n's; line/column are
-/// computed on the fly (no line table → no extra stack), since the buffer is tiny.
+/// One span of the document: `len` bytes starting at `start` in either the original file on disk
+/// (`add == false`) or the in-memory add buffer (`add == true`). The document is the ordered
+/// concatenation of all live pieces. Edits never modify the original — they append typed bytes to
+/// `add` and rewrite the span list.
+#[derive(Clone, Copy)]
+struct Piece { add: bool, start: u32, len: u32 }
+
+/// A bounded piece-table editor. The original file stays on disk and is read in IO_CHUNK windows
+/// (`cache`) on demand; typed bytes accumulate in `add`; the document is `pieces[..npieces]`.
+/// Cursor/scroll are logical byte offsets into the document. Fixed-size — no heap (§26.6); when
+/// `add` or the span list fills, the edit is refused (`full = true`) and the status bar says so
+/// rather than silently dropping it (§26.7). A save streams the spans to disk and RESETS `add` +
+/// the span list, so the only bound is how much is edited *between* saves, not the file size.
 struct Editor {
-    buf:      [u8; MAX_EDIT_BYTES],
-    len:      usize,
-    cur:      usize,  // cursor byte offset, 0..=len
-    modified: bool,
-    top:      usize,  // first visible line (vertical scroll)
-    left:     usize,  // first visible column (horizontal scroll)
-    rows:     usize,  // screen rows
-    cols:     usize,  // screen cols
+    pieces:    [Piece; EDIT_MAX_PIECES],
+    npieces:   usize,
+    add:       [u8; EDIT_ADD_MAX],
+    add_len:   usize,
+    total:     usize,             // logical document length (maintained)
+    path:      [u8; PATH_MAX],    // the file on disk (read source for Orig spans; save target)
+    path_len:  usize,
+    cache:     [u8; IO_CHUNK],    // one IO_CHUNK-aligned window of the original file
+    cache_off: usize,             // original-file offset the window starts at
+    cache_len: usize,             // valid bytes in `cache` (0 = empty/miss)
+    cur:       usize,             // cursor, logical offset 0..=total
+    top:       usize,             // first visible line, a logical offset at a line start
+    left:      usize,             // horizontal scroll (column)
+    rows:      usize,
+    cols:      usize,
+    modified:  bool,
+    full:      bool,              // a recent edit was refused (add/pieces full) — drives the hint
 }
 
 impl Editor {
-    fn new(rows: usize, cols: usize) -> Self {
-        Editor { buf: [0u8; MAX_EDIT_BYTES], len: 0, cur: 0, modified: false, top: 0, left: 0, rows, cols }
+    fn new(rows: usize, cols: usize, orig_size: usize) -> Self {
+        let mut ed = Editor {
+            pieces: [Piece { add: false, start: 0, len: 0 }; EDIT_MAX_PIECES],
+            npieces: 0,
+            add: [0u8; EDIT_ADD_MAX],
+            add_len: 0,
+            total: 0,
+            path: [0u8; PATH_MAX],
+            path_len: 0,
+            cache: [0u8; IO_CHUNK],
+            cache_off: 0,
+            cache_len: 0,
+            cur: 0, top: 0, left: 0, rows, cols, modified: false, full: false,
+        };
+        if orig_size > 0 {
+            ed.pieces[0] = Piece { add: false, start: 0, len: orig_size as u32 };
+            ed.npieces = 1;
+            ed.total = orig_size;
+        }
+        ed
     }
-    fn data(&self) -> &[u8] { &self.buf[..self.len] }
-    /// Byte offset of the start of the line containing `pos` (just after the previous '\n', or 0).
-    fn line_start(&self, pos: usize) -> usize {
+
+    /// Find the piece containing logical offset `pos`. Returns `(piece_index, offset_in_piece)`.
+    /// For `pos == total` (end of document) returns `(npieces, 0)`.
+    fn locate(&self, pos: usize) -> (usize, usize) {
+        let mut acc = 0usize;
+        for i in 0..self.npieces {
+            let plen = self.pieces[i].len as usize;
+            if pos < acc + plen { return (i, pos - acc); }
+            acc += plen;
+        }
+        (self.npieces, 0)
+    }
+
+    /// Refill the window cache with the IO_CHUNK-aligned window of the original file containing
+    /// original-file offset `abs`. On a read failure leaves `cache_len = 0`.
+    fn refill(&mut self, ctx: &ServiceContext, abs: usize) {
+        let win = (abs / IO_CHUNK) * IO_CHUNK;
+        let mut pbuf = [0u8; PATH_MAX];
+        let pl = self.path_len;
+        pbuf[..pl].copy_from_slice(&self.path[..pl]);
+        match fs_read_at(ctx, &pbuf[..pl], win as u64, &mut self.cache) {
+            Some(n) => { self.cache_off = win; self.cache_len = n; }
+            None    => { self.cache_len = 0; }
+        }
+    }
+
+    /// Copy up to `n` logical bytes starting at document offset `logical` into `out`; returns the
+    /// number actually copied (fewer than `n` only at end-of-document or on a read failure).
+    /// Add-piece bytes come from memory; original-piece bytes come through the window cache.
+    fn read_span(&mut self, ctx: &ServiceContext, logical: usize, n: usize, out: &mut [u8]) -> usize {
+        let want = n.min(out.len());
+        let mut produced = 0usize;
+        let (mut pi, mut off) = self.locate(logical);
+        while produced < want && pi < self.npieces {
+            let p = self.pieces[pi];
+            let avail = p.len as usize - off;
+            let take = avail.min(want - produced);
+            if p.add {
+                let s = p.start as usize + off;
+                out[produced..produced + take].copy_from_slice(&self.add[s..s + take]);
+                produced += take;
+            } else {
+                let mut copied = 0usize;
+                while copied < take {
+                    let abs = p.start as usize + off + copied; // original-file offset
+                    let hit = self.cache_len > 0 && abs >= self.cache_off && abs < self.cache_off + self.cache_len;
+                    if !hit {
+                        self.refill(ctx, abs);
+                        if self.cache_len == 0 { break; }      // read failed
+                    }
+                    let in_win = abs - self.cache_off;
+                    let m = (self.cache_len - in_win).min(take - copied);
+                    out[produced + copied..produced + copied + m].copy_from_slice(&self.cache[in_win..in_win + m]);
+                    copied += m;
+                }
+                produced += copied;
+                if copied < take { break; }
+            }
+            pi += 1;
+            off = 0;
+        }
+        produced
+    }
+
+    fn byte_at(&mut self, ctx: &ServiceContext, pos: usize) -> Option<u8> {
+        if pos >= self.total { return None; }
+        let mut b = [0u8; 1];
+        if self.read_span(ctx, pos, 1, &mut b) == 1 { Some(b[0]) } else { None }
+    }
+
+    /// Insert `piece` at logical offset `logical`, splitting an existing piece if `logical` lands
+    /// mid-piece. Returns false (changing nothing) if the span list has no room.
+    fn insert_piece_at(&mut self, logical: usize, piece: Piece) -> bool {
+        let (pi, off) = self.locate(logical);
+        if off == 0 {
+            if self.npieces + 1 > EDIT_MAX_PIECES { return false; }
+            let mut i = self.npieces;
+            while i > pi { self.pieces[i] = self.pieces[i - 1]; i -= 1; }
+            self.pieces[pi] = piece;
+            self.npieces += 1;
+        } else {
+            if self.npieces + 2 > EDIT_MAX_PIECES { return false; }
+            let orig = self.pieces[pi];
+            let left  = Piece { add: orig.add, start: orig.start, len: off as u32 };
+            let right = Piece { add: orig.add, start: orig.start + off as u32, len: orig.len - off as u32 };
+            let mut i = self.npieces + 1;
+            while i > pi + 2 { self.pieces[i] = self.pieces[i - 2]; i -= 1; }
+            self.pieces[pi]     = left;
+            self.pieces[pi + 1] = piece;
+            self.pieces[pi + 2] = right;
+            self.npieces += 2;
+        }
+        true
+    }
+
+    fn insert(&mut self, b: u8) {
+        if self.add_len >= EDIT_ADD_MAX { self.full = true; return; }
+        let idx = self.add_len as u32;
+        // Coalesce consecutive typing: if the piece just left of the cursor is an add-piece ending
+        // exactly at the next add slot, extend it in place rather than minting a new span.
+        let (pi, off) = self.locate(self.cur);
+        if off == 0 && pi >= 1 {
+            let prev = self.pieces[pi - 1];
+            if prev.add && prev.start + prev.len == idx {
+                self.add[self.add_len] = b;
+                self.add_len += 1;
+                self.pieces[pi - 1].len += 1;
+                self.cur += 1; self.total += 1; self.modified = true; self.full = false;
+                return;
+            }
+        }
+        let piece = Piece { add: true, start: idx, len: 1 };
+        if self.insert_piece_at(self.cur, piece) {
+            self.add[self.add_len] = b;
+            self.add_len += 1;
+            self.cur += 1; self.total += 1; self.modified = true; self.full = false;
+        } else {
+            self.full = true;
+        }
+    }
+
+    /// Remove one logical byte at offset `pos` (shrink or split the covering piece).
+    fn remove_at(&mut self, pos: usize) {
+        if pos >= self.total { return; }
+        let (pi, off) = self.locate(pos);
+        if pi >= self.npieces { return; }
+        let p = self.pieces[pi];
+        if p.len == 1 {
+            let mut i = pi;
+            while i + 1 < self.npieces { self.pieces[i] = self.pieces[i + 1]; i += 1; }
+            self.npieces -= 1;
+        } else if off == 0 {
+            self.pieces[pi].start += 1;
+            self.pieces[pi].len   -= 1;
+        } else if off == p.len as usize - 1 {
+            self.pieces[pi].len -= 1;
+        } else {
+            // split out the middle byte: left [0..off] | right [off+1..len]
+            if self.npieces + 1 > EDIT_MAX_PIECES { self.full = true; return; }
+            let right = Piece { add: p.add, start: p.start + off as u32 + 1, len: p.len - off as u32 - 1 };
+            self.pieces[pi].len = off as u32;
+            let mut i = self.npieces;
+            while i > pi + 1 { self.pieces[i] = self.pieces[i - 1]; i -= 1; }
+            self.pieces[pi + 1] = right;
+            self.npieces += 1;
+        }
+        self.total -= 1; self.modified = true; self.full = false;
+    }
+
+    fn delete(&mut self)    { let c = self.cur; self.remove_at(c); }
+    fn backspace(&mut self) { if self.cur > 0 { self.cur -= 1; let c = self.cur; self.remove_at(c); } }
+
+    fn move_left(&mut self)  { if self.cur > 0 { self.cur -= 1; } }
+    fn move_right(&mut self) { if self.cur < self.total { self.cur += 1; } }
+
+    /// Logical offset of the start of the line containing `pos` (just after the previous '\n', or
+    /// 0). Bounded by EDIT_LINE_MAX — a longer line falls back to that many bytes back.
+    fn line_start(&mut self, ctx: &ServiceContext, pos: usize) -> usize {
         let mut i = pos;
-        while i > 0 && self.buf[i - 1] != b'\n' { i -= 1; }
+        let mut steps = 0;
+        while i > 0 && steps < EDIT_LINE_MAX {
+            if self.byte_at(ctx, i - 1) == Some(b'\n') { return i; }
+            i -= 1; steps += 1;
+        }
         i
     }
-    /// Byte offset of the '\n' ending the line containing `pos`, or `len` for the last line.
-    fn line_end(&self, pos: usize) -> usize {
+    /// Logical offset of the '\n' ending the line containing `pos`, or `total` for the last line.
+    fn line_end(&mut self, ctx: &ServiceContext, pos: usize) -> usize {
         let mut i = pos;
-        while i < self.len && self.buf[i] != b'\n' { i += 1; }
+        let mut steps = 0;
+        while i < self.total && steps < EDIT_LINE_MAX {
+            if self.byte_at(ctx, i) == Some(b'\n') { return i; }
+            i += 1; steps += 1;
+        }
         i
     }
-    fn col_of(&self, pos: usize) -> usize { pos - self.line_start(pos) }
-    fn line_index(&self, pos: usize) -> usize {
-        let mut n = 0;
-        for &b in &self.buf[..pos] { if b == b'\n' { n += 1; } }
+    /// Count of '\n' bytes in `[from, to)` — the number of line breaks between two offsets.
+    fn lines_between(&mut self, ctx: &ServiceContext, from: usize, to: usize) -> usize {
+        let mut n = 0; let mut i = from;
+        while i < to { if self.byte_at(ctx, i) == Some(b'\n') { n += 1; } i += 1; }
         n
     }
-    /// Byte offset where the `n`th line begins, or `len + 1` (a past-end sentinel) if absent.
-    fn nth_line_start(&self, n: usize) -> usize {
-        if n == 0 { return 0; }
-        let mut count = 0;
-        for i in 0..self.len {
-            if self.buf[i] == b'\n' { count += 1; if count == n { return i + 1; } }
+    /// Advance `pos` forward by `k` line starts (stops at end-of-document).
+    fn advance_lines(&mut self, ctx: &ServiceContext, mut pos: usize, k: usize) -> usize {
+        for _ in 0..k {
+            let le = self.line_end(ctx, pos);
+            if le >= self.total { return pos; }
+            pos = le + 1;
         }
-        self.len + 1
+        pos
     }
-    fn insert(&mut self, b: u8) {
-        if self.len >= MAX_EDIT_BYTES { return; } // full — refuse (the status bar shows the size)
-        let mut i = self.len;
-        while i > self.cur { self.buf[i] = self.buf[i - 1]; i -= 1; }
-        self.buf[self.cur] = b;
-        self.len += 1;
-        self.cur += 1;
-        self.modified = true;
-    }
-    fn backspace(&mut self) {
-        if self.cur == 0 { return; }
-        let mut i = self.cur;
-        while i < self.len { self.buf[i - 1] = self.buf[i]; i += 1; }
-        self.len -= 1;
-        self.cur -= 1;
-        self.modified = true;
-    }
-    fn delete(&mut self) {
-        if self.cur >= self.len { return; }
-        let mut i = self.cur + 1;
-        while i < self.len { self.buf[i - 1] = self.buf[i]; i += 1; }
-        self.len -= 1;
-        self.modified = true;
-    }
-    fn move_left(&mut self)  { if self.cur > 0 { self.cur -= 1; } }
-    fn move_right(&mut self) { if self.cur < self.len { self.cur += 1; } }
-    fn move_home(&mut self)  { self.cur = self.line_start(self.cur); }
-    fn move_end(&mut self)   { self.cur = self.line_end(self.cur); }
-    fn move_up(&mut self) {
-        let ls = self.line_start(self.cur);
+
+    fn move_home(&mut self, ctx: &ServiceContext) { let c = self.cur; self.cur = self.line_start(ctx, c); }
+    fn move_end(&mut self, ctx: &ServiceContext)  { let c = self.cur; self.cur = self.line_end(ctx, c); }
+    fn move_up(&mut self, ctx: &ServiceContext) {
+        let c = self.cur;
+        let ls = self.line_start(ctx, c);
         if ls == 0 { self.cur = 0; return; }
-        let col = self.cur - ls;
-        let pls = self.line_start(ls - 1);  // previous line's start
-        let plen = (ls - 1) - pls;          // previous line's length (excluding its '\n')
+        let col = c - ls;
+        let pls = self.line_start(ctx, ls - 1); // previous line's start
+        let plen = (ls - 1) - pls;              // previous line length (excluding its '\n')
         self.cur = pls + col.min(plen);
     }
-    fn move_down(&mut self) {
-        let le = self.line_end(self.cur);
-        if le >= self.len { self.cur = self.len; return; }
-        let col = self.cur - self.line_start(self.cur);
-        let nls = le + 1;                   // next line's start
-        let nlen = self.line_end(nls) - nls;
+    fn move_down(&mut self, ctx: &ServiceContext) {
+        let c = self.cur;
+        let le = self.line_end(ctx, c);
+        if le >= self.total { self.cur = self.total; return; }
+        let ls = self.line_start(ctx, c);
+        let col = c - ls;
+        let nls = le + 1;                       // next line's start
+        let nlen = self.line_end(ctx, nls) - nls;
         self.cur = nls + col.min(nlen);
     }
-    fn page(&mut self, down: bool) {
+    fn page(&mut self, ctx: &ServiceContext, down: bool) {
         for _ in 0..self.rows.saturating_sub(3).max(1) {
-            if down { self.move_down() } else { self.move_up() }
+            if down { self.move_down(ctx) } else { self.move_up(ctx) }
         }
     }
 }
@@ -3003,19 +3188,30 @@ fn edit_bar(ctx: &ServiceContext, text: &[u8], width: usize) {
     ctx.console_write("\x1b[0m");
 }
 
-/// Repaint the whole screen for `ed`. Adjusts scroll so the cursor stays visible, draws the
-/// title bar, the visible text rows (clipped to the window, horizontal scroll applied), the
-/// status bar, then parks the terminal cursor at the editing position.
+/// Repaint the whole screen for `ed`. Adjusts scroll so the cursor stays visible (a line at a
+/// time, scanning only across the viewport — never the whole file), draws the title bar, the
+/// visible text rows materialised from the piece table through the window cache, the status bar,
+/// then parks the terminal cursor. Only the visible window is ever read — the iOS-scroll property.
 fn edit_render(ctx: &ServiceContext, ed: &mut Editor, name: &[u8]) {
     use core::fmt::Write as _;
     let textrows = ed.rows.saturating_sub(2).max(1); // rows between the title and status bars
-    let li = ed.line_index(ed.cur);
-    let col = ed.col_of(ed.cur);
-    if li < ed.top { ed.top = li; }
-    if li >= ed.top + textrows { ed.top = li + 1 - textrows; }
-    if col < ed.left { ed.left = col; }
-    if col >= ed.left + ed.cols { ed.left = col + 1 - ed.cols; }
     let cols = ed.cols;
+
+    // Vertical scroll: keep the cursor's line within [top, top+textrows). `top` stays a line start.
+    let cur = ed.cur;
+    let cls = ed.line_start(ctx, cur);
+    let col = cur - cls;
+    if cls < ed.top {
+        ed.top = cls;
+    } else {
+        let n = ed.lines_between(ctx, ed.top, cls);
+        if n >= textrows { ed.top = ed.advance_lines(ctx, ed.top, n - textrows + 1); }
+    }
+    // Horizontal scroll.
+    if col < ed.left { ed.left = col; }
+    if col >= ed.left + cols { ed.left = col + 1 - cols; }
+    // The cursor's screen row, now guaranteed < textrows.
+    let crow = ed.lines_between(ctx, ed.top, cls);
 
     ctx.console_write("\x1b[?25l"); // hide cursor while repainting (no flicker trail)
 
@@ -3029,42 +3225,95 @@ fn edit_render(ctx: &ServiceContext, ed: &mut Editor, name: &[u8]) {
         edit_bar(ctx, &t[..used], cols);
     }
 
-    // Text rows (screen rows 2..=rows-1): one buffer line each, from `top`.
-    let mut ls = ed.nth_line_start(ed.top);
+    // Text rows (screen rows 2..=rows-1): one document line each, starting at `top`. Each line's
+    // visible slice [left, left+cols) is read from the piece table into a row scratch.
+    let mut ls = ed.top;
     for r in 0..textrows {
         edit_goto(ctx, 2 + r, 1);
-        if ls <= ed.len {
-            let le = ed.line_end(ls);
-            let from = (ls + ed.left).min(le);
-            let to   = (ls + ed.left + cols).min(le);
-            if to > from { ctx.console_write(str_of(&ed.buf[from..to])); }
+        if ls <= ed.total {
+            let le = ed.line_end(ctx, ls);
+            let lstart = ls + ed.left;
+            if lstart < le {
+                let n = (le - lstart).min(cols).min(EDIT_COLS_MAX);
+                let mut row = [0u8; EDIT_COLS_MAX];
+                let got = ed.read_span(ctx, lstart, n, &mut row);
+                ctx.console_write(str_of(&row[..got]));
+            }
             ctx.console_write("\x1b[K"); // erase the rest of the row (no SGR → no wrap)
             ls = le + 1;
         } else {
-            ctx.console_write("\x1b[K"); // past end of buffer → blank row
+            ctx.console_write("\x1b[K"); // past end of document → blank row
         }
     }
 
     // Status bar (last row): key hints + position. One cell short of full width so writing it on
-    // the bottom row can never trigger an auto-wrap that scrolls the screen.
+    // the bottom row can never trigger an auto-wrap that scrolls the screen. No absolute "Ln" —
+    // that would need a scan from offset 0 (O(file)); Col + byte offset are O(viewport).
     edit_goto(ctx, ed.rows, 1);
     {
         let mut t = [0u8; EDIT_COLS_MAX];
         let mut w = BarW { b: &mut t, n: 0 };
-        let _ = write!(w, " ^S save   ^Q quit      Ln {}, Col {}   {}/{} bytes",
-            li + 1, col + 1, ed.len, MAX_EDIT_BYTES);
+        if ed.full {
+            let _ = write!(w, " edit buffer full — save (^S) to continue    Col {}   {} bytes",
+                col + 1, ed.total);
+        } else {
+            let _ = write!(w, " ^S save   ^Q quit      Col {}   {} bytes   (buf {}/{})",
+                col + 1, ed.total, ed.add_len, EDIT_ADD_MAX);
+        }
         let used = w.n;
         edit_bar(ctx, &t[..used], cols.saturating_sub(1));
     }
 
-    // Park the editing cursor (title is row 1, so text line `li` is screen row 2 + (li - top)).
-    edit_goto(ctx, 2 + (li - ed.top), 1 + (col - ed.left));
+    // Park the editing cursor (title is row 1, so the cursor line is screen row 2 + crow).
+    edit_goto(ctx, 2 + crow, 1 + (col - ed.left));
     ctx.console_write("\x1b[?25h"); // show it
 }
 
-fn edit_save(ctx: &ServiceContext, ed: &Editor, path: &[u8]) -> bool {
-    matches!(fs_request(ctx, OP_WRITE_FILE, path, ed.data())
-        .as_ref().map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK)))
+/// Save the document by streaming the piece spans to a temp file and atomically replacing the
+/// target, then RESET the add buffer + span list (the per-session edit budget). Returns false on
+/// any I/O failure, leaving `modified` set so the quit prompt still protects unsaved work.
+fn edit_save(ctx: &ServiceContext, ed: &mut Editor) -> bool {
+    let mut pbuf = [0u8; PATH_MAX];
+    let pl = ed.path_len;
+    pbuf[..pl].copy_from_slice(&ed.path[..pl]);
+    let path = &pbuf[..pl];
+    let total = ed.total;
+
+    if total == 0 {
+        // Empty document → write an empty file directly (one message).
+        if !matches!(fs_request(ctx, OP_WRITE_FILE, path, &[])
+            .as_ref().map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK))) {
+            return false;
+        }
+    } else {
+        if !fs_write_new(ctx, EDIT_TMP, total as u64) { return false; }
+        let mut off = 0usize;
+        let mut chunk = [0u8; IO_CHUNK];
+        while off < total {
+            let n = (total - off).min(IO_CHUNK);
+            let got = ed.read_span(ctx, off, n, &mut chunk);
+            if got == 0 { return false; } // short read of the source → fail loudly, keep `modified`
+            if !fs_write_at(ctx, EDIT_TMP, off as u64, &chunk[..got]) { return false; }
+            off += got;
+        }
+        // Atomic-ish replace: delete the target (ignore "not found" on a first save), move temp in.
+        let _ = fs_request(ctx, OP_DELETE, path, &[]);
+        let moved = matches!(fs_request(ctx, OP_MOVE, EDIT_TMP, path)
+            .as_ref().map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK)));
+        if !moved { return false; }
+    }
+
+    // Reset the budget: the saved file is now the original; one Orig span over it, add buffer empty.
+    ed.npieces = 0;
+    if total > 0 {
+        ed.pieces[0] = Piece { add: false, start: 0, len: total as u32 };
+        ed.npieces = 1;
+    }
+    ed.add_len = 0;
+    ed.cache_len = 0;   // the on-disk file changed — invalidate the window
+    ed.full = false;
+    ed.modified = false;
+    true
 }
 
 /// Decode a CSI sequence (after `ESC [`) into an editor cursor/edit action. Mirrors the shell's
@@ -3079,18 +3328,18 @@ fn edit_csi(ctx: &ServiceContext, ed: &mut Editor) {
         else { fb = c; break; }
     }
     match fb {
-        b'A' => ed.move_up(),
-        b'B' => ed.move_down(),
+        b'A' => ed.move_up(ctx),
+        b'B' => ed.move_down(ctx),
         b'C' => ed.move_right(),
         b'D' => ed.move_left(),
-        b'H' => ed.move_home(),
-        b'F' => ed.move_end(),
+        b'H' => ed.move_home(ctx),
+        b'F' => ed.move_end(ctx),
         b'~' => match param {
-            1 | 7 => ed.move_home(),
-            4 | 8 => ed.move_end(),
-            3     => ed.delete(),       // forward Delete
-            5     => ed.page(false),    // PageUp
-            6     => ed.page(true),     // PageDown
+            1 | 7 => ed.move_home(ctx),
+            4 | 8 => ed.move_end(ctx),
+            3     => ed.delete(),          // forward Delete
+            5     => ed.page(ctx, false),  // PageUp
+            6     => ed.page(ctx, true),   // PageDown
             _ => {}
         },
         _ => {}
@@ -3100,21 +3349,21 @@ fn edit_csi(ctx: &ServiceContext, ed: &mut Editor) {
 /// Quit handler: clean if unsaved changes are handled. Returns `true` if the editor should exit.
 /// With no unsaved changes, quits immediately; otherwise prompts on the status row (y = save then
 /// quit, n = discard and quit, anything else = cancel and keep editing).
-fn edit_try_quit(ctx: &ServiceContext, ed: &Editor, path: &[u8]) -> bool {
+fn edit_try_quit(ctx: &ServiceContext, ed: &mut Editor) -> bool {
     if !ed.modified { return true; }
     edit_goto(ctx, ed.rows, 1);
     edit_bar(ctx, b" unsaved changes  -  y = save & quit, n = discard, any other key = keep editing",
         ed.cols.saturating_sub(1));
     edit_goto(ctx, ed.rows, 1);
     match ctx.console_read() {
-        b'y' | b'Y' => edit_save(ctx, ed, path),     // quit only if the save succeeds
-        b'n' | b'N' => true,                          // discard and quit
-        0x1B => { let _ = read_escape_byte(ctx); false } // Esc (drain any sequence) → cancel
-        _ => false,                                   // anything else → keep editing
+        b'y' | b'Y' => edit_save(ctx, ed),               // quit only if the save succeeds
+        b'n' | b'N' => true,                              // discard and quit
+        0x1B => { let _ = read_escape_byte(ctx); false }  // Esc (drain any sequence) → cancel
+        _ => false,                                       // anything else → keep editing
     }
 }
 
-#[inline(never)] // big stack frame (the edit buffer) — keep it off the hot call paths' frames
+#[inline(never)] // big stack frame (the piece table + add buffer) — keep it off hot call paths
 fn cmd_edit(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Result<(), ShellError> {
     let arg = arg.trim();
     if arg.is_empty() {
@@ -3128,13 +3377,9 @@ fn cmd_edit(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Result<(), ShellError
     pcopy[..pl].copy_from_slice(path);
     let path = &pcopy[..pl];
 
-    let (rd, cd) = ctx.console_dims();
-    let rows = if rd == 0 { 24 } else { rd as usize };
-    let cols = if cd == 0 { 80 } else { cd as usize };
-    let mut ed = Editor::new(rows, cols);
-
-    // Load: stat first (existence / size / kind), then read the content in one message. A file
-    // larger than the one-message ceiling, or a directory, is refused — we never truncate.
+    // Stat first (existence / kind / size). A directory is refused; a missing file opens empty
+    // (created on first save); a file of ANY size opens — it's read in windows, never up front.
+    let mut orig_size = 0usize;
     if let Some(stat) = fs_request(ctx, OP_STAT_FILE, path, &[]) {
         let sp = stat.payload_bytes();
         if no_fs(ctx, sp) { return Err(ShellError::Unknown); }
@@ -3144,43 +3389,30 @@ fn cmd_edit(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Result<(), ShellError
                 ctx.console_writeln_fmt(format_args!("edit: {} is a directory", str_of(path)));
                 return Err(ShellError::Unknown);
             }
-            let size = u64::from_le_bytes([sp[2], sp[3], sp[4], sp[5], sp[6], sp[7], sp[8], sp[9]]);
-            if size as usize > MAX_EDIT_BYTES {
-                ctx.console_writeln_fmt(format_args!(
-                    "edit: {} is too large to edit ({} bytes; the editor handles up to {})",
-                    str_of(path), size, MAX_EDIT_BYTES));
-                return Err(ShellError::Unknown);
-            }
-            match fs_request(ctx, OP_READ_FILE, path, &[]) {
-                Some(r) => {
-                    let p = r.payload_bytes();
-                    if p.first() == Some(&FS_OK) && p.len() >= 5 {
-                        let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
-                        let end = (5 + n).min(p.len());
-                        let take = (end - 5).min(MAX_EDIT_BYTES);
-                        ed.buf[..take].copy_from_slice(&p[5..5 + take]);
-                        ed.len = take;
-                    }
-                }
-                None => { ctx.console_writeln("edit: storage unavailable"); return Err(ShellError::Unknown); }
-            }
+            orig_size = u64::from_le_bytes([sp[2], sp[3], sp[4], sp[5], sp[6], sp[7], sp[8], sp[9]]) as usize;
         }
-        // not found → start with an empty buffer (a new file, created on first save)
     } else {
         ctx.console_writeln("edit: storage unavailable");
         return Err(ShellError::Unknown);
     }
 
-    let name = basename(path);
-    ctx.console_write("\x1b[2J"); // clear the screen once on entry (every later frame just repaints)
+    let (rd, cd) = ctx.console_dims();
+    let rows = if rd == 0 { 24 } else { rd as usize };
+    let cols = if cd == 0 { 80 } else { cd as usize };
+    let mut ed = Editor::new(rows, cols, orig_size);
+    ed.path_len = pl;
+    ed.path[..pl].copy_from_slice(path);
+
+    let name = basename(path); // borrows pcopy, independent of `ed`
+    ctx.console_write("\x1b[2J"); // clear the screen once on entry (every later frame repaints)
 
     loop {
         edit_render(ctx, &mut ed, name);
         match ctx.console_read() {
-            0x13 => { if edit_save(ctx, &ed, path) { ed.modified = false; } }   // ^S
-            0x11 => { if edit_try_quit(ctx, &ed, path) { break; } }             // ^Q
+            0x13 => { let _ = edit_save(ctx, &mut ed); }                        // ^S (resets on success)
+            0x11 => { if edit_try_quit(ctx, &mut ed) { break; } }              // ^Q
             0x1B => match read_escape_byte(ctx) {
-                None        => { if edit_try_quit(ctx, &ed, path) { break; } }  // bare Esc → quit
+                None        => { if edit_try_quit(ctx, &mut ed) { break; } }   // bare Esc → quit
                 Some(b'[')  => edit_csi(ctx, &mut ed),
                 Some(b'O')  => { let _ = ctx.console_read(); }                  // F-keys: consume, ignore
                 Some(_)     => {}
