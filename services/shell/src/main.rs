@@ -2227,12 +2227,27 @@ fn assert_verdict(ctx: &ServiceContext, held: bool, check: &str, detail: &str) -
 /// Write a (possibly large) byte buffer to the console. `console_write` drops anything over
 /// 256 bytes, so split into ≤256-byte pieces. Output is ASCII (json/yaml/text), so chunk
 /// boundaries never split a multi-byte char.
+/// Bytes per console burst (≤ 256, the `console_write` syscall cap).
+const CONSOLE_BURST: usize = 256;
+/// Yields between bursts when pacing bulk output — see `console_write_chunked`.
+const CONSOLE_PACE_YIELDS: u32 = 2;
+
+/// Write `bytes` to the console in ≤256-byte bursts, **pacing** between bursts so the HOST
+/// serial side can drain. A big one-shot dump (a long chaos report, `read` of a large file)
+/// otherwise overruns the host UART / USB-serial receive buffer and bytes are lost mid-stream —
+/// the kernel's THRE poll is deliberately bounded (it drops a byte rather than wedge a core with
+/// IF=0, `arch/x86_64`). Yielding lets the host drain between bursts. Only the serial mirror is at
+/// risk (the framebuffer is locked per-string, so the TV is fine); this rescues the serial mirror.
+/// Output ≤ one burst never yields, so the prompt and short lines stay snappy.
 fn console_write_chunked(ctx: &ServiceContext, bytes: &[u8]) {
     let mut i = 0;
     while i < bytes.len() {
-        let end = (i + 256).min(bytes.len());
+        let end = (i + CONSOLE_BURST).min(bytes.len());
         ctx.console_write(str_of(&bytes[i..end]));
         i = end;
+        if i < bytes.len() {
+            for _ in 0..CONSOLE_PACE_YIELDS { ctx.yield_cpu(); }
+        }
     }
 }
 
