@@ -254,10 +254,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
             0x7f | 0x08 => line.backspace(&ctx),
             0x09 => {
-                // Tab — complete the command name. One match → fill it in; several → print a
-                // numbered menu and the next digit selects (no Enter). Event-driven (redraws only
-                // on this keypress, via the same console-write path normal echo uses).
-                complete_tab(&ctx, &mut line);
+                // Tab — complete the command name (first token) or a FILE PATH (a later token,
+                // resolved against `cwd`). One match → fill it in; several → a numbered menu (digit
+                // selects, Tab cycles). Event-driven (redraws only on this keypress).
+                complete_tab(&ctx, &mut line, &cwd);
             }
             0x03 => {
                 // Ctrl-C — clear line
@@ -364,16 +364,22 @@ fn handle_csi(ctx: &ServiceContext, line: &mut Line, hist: &History, nav: &mut u
     }
 }
 
-/// Tab-completion of the command name. Matches the current line (the first token) against the
-/// command list (`UTILS`): one match → fill it in with a trailing space; several → print a
-/// numbered menu and block for one digit, which selects (no Enter) and drops the command into the
-/// prompt. Only completes a bare command (no space typed yet) — argument/path completion is future
-/// work. Bounded (§26.6): at most `UTILS.len()` matches, 1–9 selectable by digit.
-fn complete_tab(ctx: &ServiceContext, line: &mut Line) {
-    // Only complete while still typing the command token (nothing after a space).
-    if line.len == 0 || line.bytes().contains(&b' ') { return; }
-    // Operate from end-of-line so the menu reprint + replacement line up with the cursor.
+/// Tab completion. On the FIRST token (nothing after a space yet) it completes a **command name**
+/// against `UTILS`; on a later token it completes a **file path** against the directory that token
+/// names (`complete_path`). Both use the same numbered-menu UX (1–9, next digit selects). Operates
+/// from end-of-line so the menu reprint + replacement line up with the cursor (§26.6: bounded).
+fn complete_tab(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd) {
+    if line.len == 0 { return; }
     line.end(ctx);
+    match line.bytes().iter().rposition(|&b| b == b' ') {
+        None => complete_command(ctx, line),
+        Some(sp) => complete_path(ctx, line, cwd, sp + 1),
+    }
+}
+
+/// Complete the command name (the first token): one match → fill it with a trailing space; several
+/// → a numbered menu, next digit selects. (Cursor is already at end-of-line.)
+fn complete_command(ctx: &ServiceContext, line: &mut Line) {
     let mut prefix_buf = [0u8; MAX_LINE];
     let plen = line.len;
     prefix_buf[..plen].copy_from_slice(&line.buf[..plen]);
@@ -416,6 +422,143 @@ fn complete_tab(ctx: &ServiceContext, line: &mut Line) {
     if (b'1'..=b'9').contains(&sel) {
         let idx = (sel - b'1') as usize;
         if idx < shown { set_completed(ctx, line, UTILS[matches[idx]]); }
+    }
+}
+
+/// One matched directory entry, as offsets into the (owned) LIST_DIR reply buffer.
+#[derive(Clone, Copy)]
+struct PathHit { off: usize, len: usize, is_dir: bool }
+
+/// Complete the path token from `tok_start` to end-of-line against the directory it names. The
+/// token splits into a dir part (up to the last `/`) and the leaf being typed; we `LIST_DIR` the
+/// resolved dir and match entries whose name starts with the leaf. One match → fill it (+ `/` for a
+/// dir, ` ` for a file); several → fill the common prefix, print a numbered menu, then **digit**
+/// selects or **Tab** cycles to the next candidate (any other key keeps the line). No new authority
+/// — the shell already holds the `fs` LIST_DIR cap (the same `ls` uses).
+fn complete_path(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd, tok_start: usize) {
+    let bytes = line.bytes();
+    let token = &bytes[tok_start..];
+    // dir part (everything up to and including the last '/') and the leaf being typed.
+    let (dir_in_tok, leaf): (&[u8], &[u8]) = match token.iter().rposition(|&b| b == b'/') {
+        Some(i) => (&token[..=i], &token[i + 1..]),
+        None => (&[][..], token),
+    };
+    // Resolve the directory to an absolute path (relative parts resolve against cwd).
+    let mut dirbuf = [0u8; PATH_MAX];
+    let dirpath: &[u8] = if dir_in_tok.is_empty() {
+        cwd.as_str().as_bytes()
+    } else {
+        match resolve_path(cwd.as_str(), core::str::from_utf8(dir_in_tok).unwrap_or("/"), &mut dirbuf) {
+            Some(n) => &dirbuf[..n],
+            None => return,
+        }
+    };
+    // LIST_DIR (the reply is one ≤512-byte block); copy it so it can outlive the fs reply across
+    // the menu/cycle loop below.
+    let mut rbuf = [0u8; 512];
+    let rn;
+    {
+        let reply = match fs_request(ctx, OP_LIST_DIR, dirpath, &[]) { Some(r) => r, None => return };
+        let pb = reply.payload_bytes();
+        if !(pb.first() == Some(&FS_OK) && pb.len() >= 2) { return; } // not a dir / error → no menu
+        rn = pb.len().min(512);
+        rbuf[..rn].copy_from_slice(&pb[..rn]);
+    }
+    // Collect entries whose name starts with `leaf`.
+    let count = rbuf[1] as usize;
+    let mut hits = [PathHit { off: 0, len: 0, is_dir: false }; 32];
+    let mut n = 0usize;
+    let mut i = 2usize;
+    for _ in 0..count {
+        if i >= rn { break; }
+        let nl = rbuf[i] as usize; i += 1;
+        if i + nl + 9 > rn { break; }                 // entry = name_len, name, is_dir, size:u64
+        let is_dir = rbuf[i + nl] != 0;
+        if rbuf[i..i + nl].starts_with(leaf) && n < hits.len() {
+            hits[n] = PathHit { off: i, len: nl, is_dir }; n += 1;
+        }
+        i += nl + 9;
+    }
+    if n == 0 { return; }
+    let base_len = tok_start + dir_in_tok.len();      // the line is fixed up to here
+
+    if n == 1 {
+        let h = hits[0];
+        fill_path(ctx, line, base_len, &rbuf[h.off..h.off + h.len], Some(h.is_dir));
+        return;
+    }
+    // Several: fill the longest common prefix first (often resolves enough on its own).
+    let lcp = path_lcp(&rbuf, &hits[..n]);
+    if lcp > leaf.len() {
+        let h = hits[0];
+        fill_path(ctx, line, base_len, &rbuf[h.off..h.off + lcp], None); // no sep — still ambiguous
+    }
+    path_menu(ctx, line, base_len, &rbuf, &hits[..n]);
+}
+
+/// Length of the longest common prefix shared by all matched names.
+fn path_lcp(rbuf: &[u8; 512], hits: &[PathHit]) -> usize {
+    let mut len = hits[0].len;
+    for h in &hits[1..] {
+        let mut k = 0;
+        while k < len && k < h.len && rbuf[hits[0].off + k] == rbuf[h.off + k] { k += 1; }
+        len = k;
+    }
+    len
+}
+
+/// Replace the line from `base_len` to end with `name`. `sep` Some(is_dir) appends `/` (dir) or ` `
+/// (file) — a committed completion; None appends nothing — a still-ambiguous common-prefix fill.
+fn fill_path(ctx: &ServiceContext, line: &mut Line, base_len: usize, name: &[u8], sep: Option<bool>) {
+    let mut tmp = [0u8; MAX_LINE];
+    let mut t = base_len.min(MAX_LINE);
+    tmp[..t].copy_from_slice(&line.buf[..t]);
+    let take = name.len().min(MAX_LINE.saturating_sub(t + 1));
+    tmp[t..t + take].copy_from_slice(&name[..take]); t += take;
+    if let Some(is_dir) = sep {
+        if t < MAX_LINE { tmp[t] = if is_dir { b'/' } else { b' ' }; t += 1; }
+    }
+    line.set(ctx, &tmp[..t]);
+}
+
+/// Print the numbered candidate menu, then run the selection loop: a **digit** (1–9) commits that
+/// entry; **Tab** cycles to the next candidate (filling it, no separator); any other key keeps the
+/// current line and returns (that key is not consumed as input — minor: re-press to use it).
+fn path_menu(ctx: &ServiceContext, line: &mut Line, base_len: usize, rbuf: &[u8; 512], hits: &[PathHit]) {
+    let n = hits.len();
+    let shown = n.min(9);
+    ctx.console_write("\r\n");
+    for k in 0..shown {
+        let h = hits[k];
+        let mut row = [0u8; 48];
+        let mut p = 0usize;
+        row[p] = b'1' + k as u8; p += 1; row[p] = b')'; p += 1; row[p] = b' '; p += 1;
+        let take = h.len.min(row.len() - p - 3);
+        row[p..p + take].copy_from_slice(&rbuf[h.off..h.off + take]); p += take;
+        if h.is_dir && p < row.len() { row[p] = b'/'; p += 1; } // dir cue
+        row[p] = b' '; p += 1; row[p] = b' '; p += 1;
+        ctx.console_write(core::str::from_utf8(&row[..p]).unwrap_or(""));
+    }
+    if n > shown { ctx.console_write("(type more to narrow) "); }
+    ctx.console_write("\r\n");
+    ctx.console_write("gsh> ");
+    ctx.console_write(str_of(line.bytes()));
+
+    let mut idx = usize::MAX; // MAX = no candidate filled yet (showing the common-prefix)
+    loop {
+        let key = ctx.console_read();
+        if (b'1'..=b'9').contains(&key) {
+            let d = (key - b'1') as usize;
+            if d < shown { let h = hits[d]; fill_path(ctx, line, base_len, &rbuf[h.off..h.off + h.len], Some(h.is_dir)); }
+            return;
+        }
+        if key == 0x09 { // Tab → cycle to the next candidate
+            idx = if idx == usize::MAX { 0 } else { (idx + 1) % n };
+            let h = hits[idx];
+            fill_path(ctx, line, base_len, &rbuf[h.off..h.off + h.len], None);
+            continue;
+        }
+        return; // any other key: keep the current line (common-prefix or last cycled candidate)
     }
 }
 
