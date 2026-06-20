@@ -16,12 +16,21 @@ sole member of the **Power** category.
 | Command | Meaning |
 |---|---|
 | `reboot` | Print `rebooting...` and reset the machine. |
+| **Ctrl+Alt+Del** (USB keyboard) | Reset the machine immediately, from any context. |
 
 ## 3. Behaviour
 
 Prints a final `rebooting...` line, then invokes the `Reboot` syscall (18), which
 performs a hardware reset. Does not return. There is no confirmation prompt in v1
 (an interactive guard could be added later).
+
+**Ctrl+Alt+Del** is a hardware *secure-attention* reset: the USB keyboard drivers
+(`xhci`/`ehci`) recognise the chord (either Ctrl + either Alt + Delete) directly in
+the HID report and invoke the same `Reboot` syscall — so it works from *any* context,
+including inside a full-screen app like `edit` or at a wedged prompt, not just at the
+shell. Detection is `godspeed_sdk::hid::is_ctrl_alt_del`, checked per poll for keyboard
+devices only (a mouse button byte can alias the modifier bits). Like the `reboot`
+command, it does not prompt — it resets immediately.
 
 ## 4. Capabilities
 

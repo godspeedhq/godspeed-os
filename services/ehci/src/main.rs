@@ -769,6 +769,13 @@ fn poll_devices(
                         |dx, dy| ctx.log_fmt(format_args!("ehci: mouse moved dx={} dy={}", dx, dy)),
                     );
                 } else {
+                    // Ctrl+Alt+Del = secure-attention reboot, from any context. Checked only for
+                    // keyboard reports (a mouse button byte can alias the modifier bits).
+                    // reboot() does not return.
+                    if godspeed_sdk::hid::is_ctrl_alt_del(&rep) {
+                        ctx.log("ehci: Ctrl+Alt+Del — rebooting");
+                        ctx.reboot();
+                    }
                     godspeed_sdk::hid::decode_keyboard(
                         &rep, &mut kb_last, &mut kb_rep, ctx.read_tsc(),
                         |ch| ctx.console_push(ch),
