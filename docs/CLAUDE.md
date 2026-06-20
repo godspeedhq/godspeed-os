@@ -22,6 +22,7 @@ Narrative documentation. These files explain design decisions in prose; they do 
 | `unsafe-audit.md`   | Complete inventory of every `unsafe` block in the kernel (§18.4) |
 | `introspection-capability.md` | Design note: gating `InspectKernel`/`TaskStat` behind the `INTROSPECT` cap (§3.1) — closes the ambient-introspection exception |
 | `cluster-design.md` | Cluster mode design notes (non-normative, far-future; expands Appendix C.4 of `CLAUDE.md`) |
+| `naming-design.md`  | **Design proposal (not adopted):** move name→endpoint resolution out of the kernel — delete `ipc::names` + syscall 10, supervisor owns naming + reacquisition, new spawn protocol (kernel returns endpoint caps / installs handed caps). Proposes §4.4/§11 amendments + an incremental always-bootable migration (§26.10) |
 
 ## `unsafe-audit.md` is special
 
