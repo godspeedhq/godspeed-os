@@ -84,6 +84,37 @@ pipe source iff its job is to *emit data*. That splits the command set three way
   file for `edit`'s windowing instead, append a *simple* producer a few times: `help | write
   /big.txt` then `help | write append /big.txt` ×N.)
 
+## Materialize, then pipe — the standing escape hatch
+
+> **When something can't be a direct pipe source — an orchestrator, output too large for the
+> capture buffer, anything that won't fit the transient model — don't reach for an in-memory
+> mechanism. Stage it through a file: materialize it (the utility writes its own file), then pipe
+> from the file.**
+
+This is the move to reach for *before* building machinery (a streaming sink, a buffer pool, a
+heap). It needs nothing new: a utility that can write a file, and `read` (a leaf producer) that
+pipes one. The **file is the adapter** between two things that couldn't meet directly — the cheapest,
+most universal one in the system: a named, bounded, durable artifact.
+
+```
+selfcheck save /report.txt        # step 1: produce → file (direct, no pipe)
+read /report.txt | match FAIL     # step 2: file → pipe (read is a leaf producer)
+```
+
+It is usually the *better* shape, not a compromise. A pipe couples producer and consumer in time
+(shared transient buffer, gone once consumed). A file turns that into a **checkpoint**: produce
+once, consume later, repeatedly, however you like — re-runnable, inspectable, resumable. This is the
+Unix "everything is a file" instinct (and Plan 9's), and it's how systems scale *past* memory: `sort`
+spills to a tempfile, MapReduce writes map output to disk before the shuffle, build systems
+checkpoint intermediate artifacts. "Materialize between stages" is the pattern that survives when the
+data won't fit in RAM and when you want fault tolerance (a disk checkpoint is restartable).
+
+Honest caveat: staging costs a disk round-trip and the artifact's space, and it is *not* concurrent
+(step 1 finishes before step 2 starts). For a **bounded, durable result** that is the right trade
+every time. Only a truly **unbounded flow through filters** justifies the real concurrent streaming
+pipeline — until then, materialize, then pipe. (Same shelf as "resist the heap", `CLAUDE.md`
+§26.6.1: reach for a bounded, durable, visible mechanism before an in-memory clever one.)
+
 ## The `write` sink — overwrite by default, append/prepend explicit
 
 `write` is the file sink, identical in the pipe (`… | write <path>`) and standalone
