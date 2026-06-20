@@ -890,11 +890,12 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
             if argc < 2 { ctx.console_writeln("usage: spawn <name>"); Err(ShellError::Unknown) }
             else { cmd_spawn(ctx, args[1]) }
         }
-        // Phase-0 naming-migration diagnostic (docs/naming-design.md) — spawn + get an endpoint cap.
+        // Phase-0 naming-migration diagnostics (docs/naming-design.md).
         "spawncap" => {
             if argc < 2 { ctx.console_writeln("usage: spawncap <name>"); Err(ShellError::Unknown) }
             else { cmd_spawncap(ctx, args[1]) }
         }
+        "spawnwired" => cmd_spawnwired(ctx),
         "kill"    => {
             if argc < 2 { ctx.console_writeln("usage: kill <name>"); Err(ShellError::Unknown) }
             else { cmd_kill(ctx, args[1]) }
@@ -2686,6 +2687,23 @@ fn cmd_spawncap(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
                 "spawncap: could not acquire endpoint cap for {} (cap not held / spawn failed / no endpoint)", name));
             Err(ShellError::Unknown)
         }
+    }
+}
+
+/// `spawnwired` — **Phase-0b diagnostic** (`docs/naming-design.md`). Spawns `pong` and acquires its
+/// endpoint cap (Phase 0a), then spawns `greet` wiring it to pong **via that passed cap** as
+/// `send_peer[0]` — NOT by name. `greet` sends its lines to `send_peer[0]`, so `pong` logs
+/// "pong: received …". This proves the kernel installs a caller-supplied cap into the child and the
+/// child uses it — the seam by which the supervisor (not the kernel) owns naming. Removed / folded
+/// into the supervisor in a later phase.
+fn cmd_spawnwired(ctx: &ServiceContext) -> Result<(), ShellError> {
+    let pong = match ctx.spawn_returning_endpoint("pong", 0xFFFF) {
+        Some(h) => h,
+        None => { ctx.console_writeln("spawnwired: could not spawn pong / acquire its endpoint cap"); return Err(ShellError::Unknown); }
+    };
+    match ctx.spawn_with_caps("greet", 0xFFFF, &[("pong", pong)]) {
+        Ok(_)  => { ctx.console_writeln("spawnwired: greet wired to pong via a passed cap (watch for pong: received)"); Ok(()) }
+        Err(_) => { ctx.console_writeln("spawnwired: spawn_with_caps(greet) failed"); Err(ShellError::Unknown) }
     }
 }
 

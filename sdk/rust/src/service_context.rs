@@ -1280,6 +1280,47 @@ impl ServiceContext {
         if ret < 0 { None } else { Some(CapHandle(ret as u32)) }
     }
 
+    /// Spawn `name` on `core` (0xFFFF = round-robin), wiring its send-peers from caller-supplied
+    /// `(label, cap)` pairs **instead of the kernel name table** (Phase 0b, `docs/naming-design.md`).
+    /// Each cap must be one this task holds with GRANT; the kernel copies it into the child under
+    /// `label`, so the child's `ctx.capability(label)` resolves to it. Returns the new service's
+    /// endpoint cap (`Ok(Some)`), `Ok(None)` if it spawned but has no recv endpoint (a producer like
+    /// `greet`), or `Err(())` if the spawn failed. Requires the SPAWN cap. This is how the supervisor
+    /// wires a dependent from its name→cap map without the kernel resolving names.
+    pub fn spawn_with_caps(&self, name: &str, core: u32, installs: &[(&str, CapHandle)])
+        -> Result<Option<CapHandle>, ()>
+    {
+        let data = Self::ctx();
+        if data.magic != SERVICE_CTX_MAGIC { return Err(()); }
+        let slot = data.spawn_slot;
+        if slot == u32::MAX { return Err(()); }
+        let nb = name.as_bytes();
+        if nb.is_empty() || nb.len() > 64 || installs.len() > 4 { return Err(()); }
+
+        // Build [name_len, name, count, {label_len, label, slot_lo, slot_hi}…] in a stack buffer.
+        let mut buf = [0u8; 256];
+        let mut n = 0usize;
+        buf[n] = nb.len() as u8; n += 1;
+        buf[n..n + nb.len()].copy_from_slice(nb); n += nb.len();
+        buf[n] = installs.len() as u8; n += 1;
+        for (label, cap) in installs {
+            let lb = label.as_bytes();
+            if lb.is_empty() || lb.len() > 24 || n + 1 + lb.len() + 2 > buf.len() { return Err(()); }
+            buf[n] = lb.len() as u8; n += 1;
+            buf[n..n + lb.len()].copy_from_slice(lb); n += lb.len();
+            buf[n] = (cap.0 & 0xFF) as u8; n += 1;
+            buf[n] = ((cap.0 >> 8) & 0xFF) as u8; n += 1;
+        }
+        let packed = ((core as u64 & 0xFFFF) << 16) | (slot as u64 & 0xFFFF);
+        // SAFETY: syscall(39) = SpawnWithCaps; slot from the kernel-written page; buf valid for n bytes.
+        let ret = unsafe { raw_syscall(39, packed, buf.as_ptr() as u64, n as u64) };
+        match ret {
+            -2 => Ok(None),                              // spawned OK, no recv endpoint
+            r if r >= 0 => Ok(Some(CapHandle(r as u32))),
+            _  => Err(()),                               // spawn failed
+        }
+    }
+
     /// Spawn `producer` and delegate it a SEND cap to `sink`'s endpoint
     /// (`producer | sink`). `sink` must already be spawned. Requires the spawn
     /// capability — held only by the shell/supervisor.

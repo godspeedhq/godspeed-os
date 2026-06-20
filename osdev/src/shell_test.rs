@@ -251,12 +251,25 @@ pub fn run(image_path: &Path, smp: u32) {
     // SpawnReturningEndpoint syscall hands the caller a SEND|GRANT cap to the spawned service's
     // endpoint. `spawncap pong` spawns pong, gets the cap, and sends a probe through it — proving
     // the returned cap actually routes. The old name-wiring path is untouched (purely additive).
-    send(&mut write_half, b"spawncap pong\r");
+    // Use `upper` (also has a recv endpoint) so the later `spawnwired` test can spawn `pong` itself.
+    send(&mut write_half, b"spawncap upper\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)) {
         Some(r) => check!(r.contains("endpoint cap acquired; send Ok"),
                           "spawncap: SpawnReturningEndpoint returns a routable endpoint cap"),
         None    => { println!("shell-test: FAIL — spawncap timeout"); fail += 1; }
     }
+    // Phase 0b (docs/naming-design.md): the kernel wires a child's send-peer from a CALLER-PASSED
+    // cap (not a name). `spawnwired` spawns `greet` wired to a fresh `pong` via the SpawnWithCaps
+    // syscall; greet sends to send_peer[0] = that cap → pong logs "pong: received". Proves the
+    // child uses a cap the kernel installed from the spawner, end to end.
+    send(&mut write_half, b"spawnwired\r");
+    match collect_until(&buf, &mut cursor, b"pong: received", Duration::from_secs(8)) {
+        Some(_) => check!(true,
+                          "naming Phase 0b: child uses a caller-passed cap (greet -> pong via SpawnWithCaps)"),
+        None    => { println!("shell-test: FAIL — naming Phase 0b: pong did not receive greet's message"); fail += 1; }
+    }
+    // drain back to the prompt before the next command.
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(3));
     // sort by a column (just exercise the path; ordering of the full table is host-dependent).
     send(&mut write_half, b"status | sort name | to json\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
