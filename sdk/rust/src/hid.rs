@@ -17,8 +17,15 @@
 /// Decode a HID boot-keyboard usage code to ASCII (US layout, common keys).
 pub fn hid_to_ascii(key: u8, mods: u8) -> Option<u8> {
     let shift = mods & 0x22 != 0; // left or right Shift
+    let ctrl  = mods & 0x11 != 0; // left or right Ctrl
     match key {
         0x04..=0x1D => {
+            // Ctrl+letter → the C0 control code (Ctrl+A=0x01 … Ctrl+Z=0x1A), exactly what a
+            // serial terminal sends. Without this a USB keyboard can't produce ^S/^Q/^C, so
+            // app shortcuts (the editor's save/quit, the shell's Ctrl-C) are unreachable on
+            // hardware — they only worked over the serial console, which synthesises these
+            // bytes itself. Ctrl takes precedence over Shift. (key 0x04='a' → 0x01.)
+            if ctrl { return Some(key - 0x03); }
             let base = b'a' + (key - 0x04);
             Some(if shift { base - 32 } else { base })
         }
@@ -363,5 +370,19 @@ mod tests {
         assert_eq!(emit_for(0x59), b"1");      // keypad 1
         assert_eq!(emit_for(0x2A), &[0x08]);   // backspace
         assert_eq!(emit_for(0x28), b"\n");     // enter
+    }
+
+    #[test]
+    fn ctrl_letter_emits_control_codes() {
+        // Ctrl+letter must produce the C0 control byte a terminal sends, so USB-keyboard
+        // users can reach app shortcuts (editor ^S/^Q, shell ^C). Left Ctrl = 0x01.
+        assert_eq!(hid_to_ascii(0x16, 0x01), Some(0x13)); // Ctrl-S (save)
+        assert_eq!(hid_to_ascii(0x14, 0x01), Some(0x11)); // Ctrl-Q (quit)
+        assert_eq!(hid_to_ascii(0x06, 0x01), Some(0x03)); // Ctrl-C
+        assert_eq!(hid_to_ascii(0x04, 0x10), Some(0x01)); // Ctrl-A via RIGHT Ctrl (0x10)
+        assert_eq!(hid_to_ascii(0x1D, 0x01), Some(0x1A)); // Ctrl-Z
+        // Ctrl takes precedence over Shift, and a plain letter is unchanged.
+        assert_eq!(hid_to_ascii(0x16, 0x01 | 0x02), Some(0x13)); // Ctrl+Shift+S → still ^S
+        assert_eq!(hid_to_ascii(0x16, 0x00), Some(b's'));        // no Ctrl → 's'
     }
 }

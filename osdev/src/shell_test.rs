@@ -1592,7 +1592,7 @@ pub fn run_edit(image_path: &Path, persist_path: &str, smp: u32) {
 
     // 2. NEW file: type (with a backspace + a newline), save (^S), quit (^Q), read back.
     send(&mut write_half, b"edit /e.txt\r");
-    if collect_until(&buf, &mut cursor, b"^S save", Duration::from_secs(10)).is_some() {
+    if collect_until(&buf, &mut cursor, b"Ctrl-S save", Duration::from_secs(10)).is_some() {
         check!(true, "edit /e.txt: editor opened (status bar shown)");
         // "hello worldX" then Backspace (DEL) deletes the X; Enter inserts a newline; "second line".
         send(&mut write_half, b"hello worldX\x7f\rsecond line\x13"); // ^S save
@@ -1613,7 +1613,7 @@ pub fn run_edit(image_path: &Path, persist_path: &str, smp: u32) {
 
     // 3. EXISTING file: cursor opens at the start; insert "TOP ", save, quit, read.
     send(&mut write_half, b"edit /e.txt\r");
-    if collect_until(&buf, &mut cursor, b"^S save", Duration::from_secs(10)).is_some() {
+    if collect_until(&buf, &mut cursor, b"Ctrl-S save", Duration::from_secs(10)).is_some() {
         send(&mut write_half, b"TOP \x13");
         thread::sleep(Duration::from_millis(400));
         send(&mut write_half, b"\x11");
@@ -1626,7 +1626,7 @@ pub fn run_edit(image_path: &Path, persist_path: &str, smp: u32) {
 
     // 4. Quit with unsaved changes, DISCARD (n) — the junk must NOT persist.
     send(&mut write_half, b"edit /e.txt\r");
-    if collect_until(&buf, &mut cursor, b"^S save", Duration::from_secs(10)).is_some() {
+    if collect_until(&buf, &mut cursor, b"Ctrl-S save", Duration::from_secs(10)).is_some() {
         send(&mut write_half, b"ZZZJUNK\x11"); // type junk (now modified), then ^Q → prompt
         if collect_until(&buf, &mut cursor, b"discard", Duration::from_secs(6)).is_some() {
             check!(true, "edit: ^Q with unsaved changes shows the discard prompt");
@@ -1649,7 +1649,7 @@ pub fn run_edit(image_path: &Path, persist_path: &str, smp: u32) {
     //    save streams ALL spans (the typed prefix + the windowed original tail) to a temp file and
     //    atomically replaces /big.txt.
     send(&mut write_half, b"edit /big.txt\r");
-    if collect_until(&buf, &mut cursor, b"^S save", Duration::from_secs(12)).is_some() {
+    if collect_until(&buf, &mut cursor, b"Ctrl-S save", Duration::from_secs(12)).is_some() {
         check!(true, "edit /big.txt: large file opened (windowed)");
         send(&mut write_half, b"AAA \x13");          // insert at start, ^S
         thread::sleep(Duration::from_millis(1200));   // multi-chunk save round-trip
@@ -1663,7 +1663,7 @@ pub fn run_edit(image_path: &Path, persist_path: &str, smp: u32) {
     // 6. Re-open /big.txt, PageDown into the file (windowed navigation past the first window), type
     //    a mid-file marker, save, quit. Exercises an edit that isn't in window 0.
     send(&mut write_half, b"edit /big.txt\r");
-    if collect_until(&buf, &mut cursor, b"^S save", Duration::from_secs(12)).is_some() {
+    if collect_until(&buf, &mut cursor, b"Ctrl-S save", Duration::from_secs(12)).is_some() {
         send(&mut write_half, b"\x1b[6~");            // PageDown (one screen down — past row 0)
         thread::sleep(Duration::from_millis(200));
         send(&mut write_half, b"MID \x13");           // insert mid-file marker, ^S

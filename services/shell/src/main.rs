@@ -3254,10 +3254,10 @@ fn edit_render(ctx: &ServiceContext, ed: &mut Editor, name: &[u8]) {
         let mut t = [0u8; EDIT_COLS_MAX];
         let mut w = BarW { b: &mut t, n: 0 };
         if ed.full {
-            let _ = write!(w, " edit buffer full — save (^S) to continue    Col {}   {} bytes",
+            let _ = write!(w, " edit buffer full — Ctrl-S to save & continue    Col {}   {} bytes",
                 col + 1, ed.total);
         } else {
-            let _ = write!(w, " ^S save   ^Q quit      Col {}   {} bytes   (buf {}/{})",
+            let _ = write!(w, " Ctrl-S save   Ctrl-Q quit      Col {}   {} bytes   (buf {}/{})",
                 col + 1, ed.total, ed.add_len, EDIT_ADD_MAX);
         }
         let used = w.n;
@@ -3352,7 +3352,7 @@ fn edit_csi(ctx: &ServiceContext, ed: &mut Editor) {
 fn edit_try_quit(ctx: &ServiceContext, ed: &mut Editor) -> bool {
     if !ed.modified { return true; }
     edit_goto(ctx, ed.rows, 1);
-    edit_bar(ctx, b" unsaved changes  -  y = save & quit, n = discard, any other key = keep editing",
+    edit_bar(ctx, b" unsaved changes  -  y = save & quit,  n = discard & quit,  any other key = keep editing",
         ed.cols.saturating_sub(1));
     edit_goto(ctx, ed.rows, 1);
     match ctx.console_read() {
