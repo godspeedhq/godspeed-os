@@ -448,12 +448,27 @@ impl ServiceContext {
     /// other traffic to race the reply. Replaces the kernel `reacquire_cap` path once
     /// services are cut over (Phase 5).
     pub fn registry_lookup(&self, name: &str) -> Option<CapHandle> {
-        let reg = CapHandle(self.find_send_slot("registry")?);
         let self_grant = self.self_grant_handle()?;
         // A SEND|GRANT copy of our own endpoint cap — the registry replies here.
         let reply_cap = self.derive_cap(self_grant)?;
         let req = registry_request(REGISTRY_OP_LOOKUP, name);
-        self.send_with_cap_by_handle(reg, reply_cap, &req).ok()?;
+
+        // Send the lookup to the registry. Our cached `registry` cap can be stale if the
+        // registry itself has restarted (H11) — and the registry is the one name a client
+        // cannot resolve *through* the registry (you can't look the namer up in the namer).
+        // So on a failed send, reacquire a fresh `registry` SEND cap from the **kernel name
+        // table** (syscall 10 — the bootstrap exception) and retry once. The send only fails
+        // here on a dead endpoint cap, which leaves `reply_cap` untouched (the kernel
+        // validates the endpoint cap before the embedded grant), so reusing it is leak-free.
+        // NOTE (stopgap): this is the one place a client falls back to the kernel name path;
+        // all other reacquisition still goes through the userspace registry. The planned
+        // "move naming to the supervisor" work removes this exception — see docs.
+        let mut reg = CapHandle(self.find_send_slot("registry")?);
+        if self.send_with_cap_by_handle(reg, reply_cap, &req).is_err() {
+            reg = self.reacquire_cap("registry").ok()?;
+            self.send_with_cap_by_handle(reg, reply_cap, &req).ok()?;
+        }
+
         // The registry always replies (found or not-found).
         let reply = crate::ipc::recv(self.recv_handle()?).ok()?;
         if reply.payload_bytes().first() == Some(&REGISTRY_FOUND) {

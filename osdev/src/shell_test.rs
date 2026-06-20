@@ -1555,6 +1555,25 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL — read chaos report timeout"); fail += 1; }
     }
 
+    // Regression — the registry-bootstrap bug chaos exposed on hardware (the DOUBLE storm).
+    // The registry was just stormed above, so the shell's cached `registry` cap is now stale.
+    // Storm `fs` too: the shell's `fs` cap dies, so the next storage op must reacquire `fs`
+    // THROUGH the registry — which the shell must itself first reacquire from the kernel name
+    // table (the bootstrap exception: you can't look the namer up in the namer). Before the
+    // fix, the dead registry cap made fs-reacquire fail and storage stayed permanently
+    // "unavailable". `ls /` succeeding proves the client resolved a name after a registry
+    // restart — the property §22 Test 11 never pinned.
+    match run!(b"chaos kill-storm fs 2\r", 30) {
+        Some(r) => check!(r.contains("verdict: PASS"),
+                          "chaos: fs storm recovers (after a registry storm)"),
+        None    => { println!("files-test: FAIL — chaos fs storm timeout"); fail += 1; }
+    }
+    match run!(b"ls /\r", 10) {
+        Some(r) => check!(!r.contains("storage unavailable"),
+                          "registry bootstrap: shell reacquires fs through a restarted registry (double-storm)"),
+        None    => { println!("files-test: FAIL — ls after double-storm timeout"); fail += 1; }
+    }
+
     child.kill().ok();
     child.wait().ok();
     println!("\nfiles-test: {pass} passed, {fail} failed");
