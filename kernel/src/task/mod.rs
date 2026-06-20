@@ -185,6 +185,19 @@ pub const MAX_SEND_PEERS:  usize = 4;
 /// Maximum bytes per peer name stored in ServiceContextData.
 pub const PEER_NAME_BYTES: usize = 24;
 
+/// One caller-supplied send-peer to install in a new task (Phase 0b, `docs/naming-design.md`):
+/// a `(label, Capability)` pair the supervisor hands the kernel at spawn, instead of the kernel
+/// resolving `label` against the name table. The kernel inserts `cap` into the child's cap table
+/// and records `label → slot` in its send-peer metadata, so the child's `ctx.capability(label)`
+/// resolves exactly as on the old name-wiring path. The cap is a copy of one the caller holds
+/// (validated with GRANT in the syscall handler), so this is non-escalating (§7.3).
+#[derive(Clone, Copy)]
+pub struct InstallCap {
+    pub name:     [u8; PEER_NAME_BYTES],
+    pub name_len: u8,
+    pub cap:      crate::capability::Capability,
+}
+
 /// One entry in the send-peer slot table.
 #[repr(C)]
 struct SendPeerEntry {
@@ -2833,7 +2846,7 @@ pub fn spawn_service_pipe(producer: &str, sink: &str, core_override: Option<u32>
     }
     let result = spawn_service_with_config(static_name, cfg.elf, core_id,
         cfg.has_recv_endpoint, &pipe_peers[..np], cfg.probe_mode, cfg.send_peers_grant,
-        cfg.memory_limit, cfg.hw_irqs, cfg.has_console_read);
+        cfg.memory_limit, cfg.hw_irqs, cfg.has_console_read, None);
     if let Err(ref e) = result {
         crate::kprintln!("task: spawn pipe '{}' -> '{}' failed: {:?}", producer, sink, e);
     }
@@ -2860,9 +2873,32 @@ pub fn spawn_service_by_name(name: &str, core_override: Option<u32>) -> Result<O
     let result = spawn_service_with_config(static_name, cfg.elf, core_id,
                               cfg.has_recv_endpoint, cfg.send_peers, cfg.probe_mode,
                               cfg.send_peers_grant, cfg.memory_limit, cfg.hw_irqs,
-                              cfg.has_console_read);
+                              cfg.has_console_read, None);
     if let Err(ref e) = result {
         crate::kprintln!("task: spawn '{}' failed: {:?}", name, e);
+    }
+    result
+}
+
+/// Phase 0b (`docs/naming-design.md`): spawn `name`, but wire its send-peers from caller-supplied
+/// `installs` (`(label, cap)` pairs) instead of the kernel name table. Same singleton guard +
+/// placement as `spawn_service_by_name`; returns the new task's recv `EndpointId` (`None` if it has
+/// none). The caps in `installs` are copies the caller held (GRANT-validated by the syscall handler).
+pub fn spawn_service_by_name_with_installs(
+    name: &str, core_override: Option<u32>, installs: &[InstallCap],
+) -> Result<Option<EndpointId>, SpawnError> {
+    let (static_name, cfg) = service_config(name).ok_or(SpawnError::NotFound)?;
+    if scheduler::find_task_by_name(static_name).is_some() {
+        crate::kprintln!("task: spawn '{}' rejected: already running", static_name);
+        return Err(SpawnError::AlreadyRunning);
+    }
+    let core_id = resolve_spawn_core(core_override, cfg.preferred_core);
+    let result = spawn_service_with_config(static_name, cfg.elf, core_id,
+                              cfg.has_recv_endpoint, cfg.send_peers, cfg.probe_mode,
+                              cfg.send_peers_grant, cfg.memory_limit, cfg.hw_irqs,
+                              cfg.has_console_read, Some(installs));
+    if let Err(ref e) = result {
+        crate::kprintln!("task: spawn '{}' (with installs) failed: {:?}", name, e);
     }
     result
 }
@@ -2893,6 +2929,12 @@ fn spawn_service_with_config(
     memory_limit:      u64,
     hw_irqs:           &[u8],
     has_console_read:  bool,
+    // Phase 0b (docs/naming-design.md): if `Some`, wire the child's send-peers from these
+    // caller-supplied `(label, cap)` entries instead of resolving `send_peers` against the kernel
+    // name table. The kernel installs each cap and records `label → slot` in the child's send-peer
+    // metadata, so the child's `ctx.capability(label)` resolves exactly as it does on the old path.
+    // `None` = the old name-resolution path (unchanged).
+    installs:          Option<&[InstallCap]>,
 ) -> Result<Option<EndpointId>, SpawnError> {
     // DIAG step markers (gated by SPAWN_TRACE; off by default — see its doc).
     if SPAWN_TRACE { crate::kprintln!("spawn[elf]: '{}'", name); }
@@ -3080,36 +3122,59 @@ fn spawn_service_with_config(
         [(u32::MAX, 0, [0u8; PEER_NAME_BYTES]); MAX_SEND_PEERS];
     let mut peer_count = 0usize;
 
-    for &peer_name in send_peers {
-        if peer_count >= MAX_SEND_PEERS { break; }
-
-        if let Some(peer_ep_id) = crate::ipc::names::lookup(peer_name) {
-            let peer_resource_id = ResourceId::from(peer_ep_id);
-            let peer_rights = if send_peers_grant {
-                Rights::SEND | Rights::GRANT
-            } else {
-                Rights::SEND
-            };
-            let send_cap = mint_cap(peer_resource_id, peer_rights);
-            match caps.insert(send_cap) {
-                Ok(cap_slot) => {
-                    let nb  = peer_name.as_bytes();
-                    let len = nb.len().min(PEER_NAME_BYTES);
-                    peer_data[peer_count].0 = cap_slot as u32;
-                    peer_data[peer_count].1 = len as u32;
-                    peer_data[peer_count].2[..len].copy_from_slice(&nb[..len]);
-                    peer_count += 1;
+    match installs {
+        // Phase 0b: wire the child's send-peers from caller-supplied caps — NO name resolution.
+        // The kernel installs each cap (a copy the caller already held, GRANT-validated in the
+        // syscall handler) and records its label, so the child resolves `ctx.capability(label)`
+        // identically to the old path. This is the seam by which the supervisor owns naming.
+        Some(installs) => {
+            for entry in installs {
+                if peer_count >= MAX_SEND_PEERS { break; }
+                match caps.insert(entry.cap) {
+                    Ok(cap_slot) => {
+                        let len = (entry.name_len as usize).min(PEER_NAME_BYTES);
+                        peer_data[peer_count].0 = cap_slot as u32;
+                        peer_data[peer_count].1 = len as u32;
+                        peer_data[peer_count].2[..len].copy_from_slice(&entry.name[..len]);
+                        peer_count += 1;
+                    }
+                    Err(_) => crate::kprintln!(
+                        "task: cap table full, skipping installed cap for '{}'", name),
                 }
-                Err(_) => crate::kprintln!(
-                    "task: cap table full, skipping SEND cap to '{}' for '{}'",
-                    peer_name, name
-                ),
             }
-        } else {
-            crate::kprintln!(
-                "task: peer '{}' not yet registered, no SEND cap for '{}'",
-                peer_name, name
-            );
+        }
+        // Old path: resolve each declared send-peer name against the kernel name table.
+        None => for &peer_name in send_peers {
+            if peer_count >= MAX_SEND_PEERS { break; }
+
+            if let Some(peer_ep_id) = crate::ipc::names::lookup(peer_name) {
+                let peer_resource_id = ResourceId::from(peer_ep_id);
+                let peer_rights = if send_peers_grant {
+                    Rights::SEND | Rights::GRANT
+                } else {
+                    Rights::SEND
+                };
+                let send_cap = mint_cap(peer_resource_id, peer_rights);
+                match caps.insert(send_cap) {
+                    Ok(cap_slot) => {
+                        let nb  = peer_name.as_bytes();
+                        let len = nb.len().min(PEER_NAME_BYTES);
+                        peer_data[peer_count].0 = cap_slot as u32;
+                        peer_data[peer_count].1 = len as u32;
+                        peer_data[peer_count].2[..len].copy_from_slice(&nb[..len]);
+                        peer_count += 1;
+                    }
+                    Err(_) => crate::kprintln!(
+                        "task: cap table full, skipping SEND cap to '{}' for '{}'",
+                        peer_name, name
+                    ),
+                }
+            } else {
+                crate::kprintln!(
+                    "task: peer '{}' not yet registered, no SEND cap for '{}'",
+                    peer_name, name
+                );
+            }
         }
     }
 
@@ -3308,7 +3373,7 @@ fn spawn_service_with_config(
 /// Spawn `init` on Core 0. Called once by `kernel_main` (§11.1).
 pub fn spawn_init() {
     let elf_bytes = include_bytes!(env!("SVC_INIT_ELF"));
-    match spawn_service_with_config("init", elf_bytes, 0, false, &[], 0, false, 64 * 1024 * 1024, &[], false) {
+    match spawn_service_with_config("init", elf_bytes, 0, false, &[], 0, false, 64 * 1024 * 1024, &[], false, None) {
         Ok(_) => crate::kprintln!("task: init spawned on core 0"),
         Err(e) => panic!("task: failed to spawn init: {:?}", e),
     }

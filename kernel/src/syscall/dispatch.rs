@@ -64,6 +64,7 @@ pub enum SyscallNumber {
     IrqUnmask           = 36,
     Sleep               = 37,
     SpawnReturningEndpoint = 38,
+    SpawnWithCaps          = 39,
 }
 
 /// Raw syscall dispatcher — called from the SYSCALL/SYSENTER IDT stub.
@@ -96,6 +97,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::AllocMem       as u64 => handle_alloc_mem(arg0),
         n if n == SyscallNumber::Spawn          as u64 => handle_spawn(arg0, arg1, arg2),
         n if n == SyscallNumber::SpawnReturningEndpoint as u64 => handle_spawn_returning_endpoint(arg0, arg1, arg2),
+        n if n == SyscallNumber::SpawnWithCaps as u64 => handle_spawn_with_caps(arg0, arg1, arg2),
         n if n == SyscallNumber::Kill           as u64 => handle_kill(arg0, arg1),
         n if n == SyscallNumber::Abort          as u64 => handle_abort(arg0, arg1),
         n if n == SyscallNumber::AcquireSendCap as u64 => handle_acquire_send_cap(arg0, arg1, arg2),
@@ -608,6 +610,87 @@ fn handle_spawn_returning_endpoint(packed_arg0: u64, name_ptr: u64, name_len: u6
         }
         Ok(None) => -1, // spawned, but no recv endpoint — nothing to hand back
         Err(_)   => -1,
+    }
+}
+
+/// Syscall: SpawnWithCaps (39) — the full Phase-0 spawn protocol (`docs/naming-design.md`). Spawns
+/// a service whose send-peers are wired from **caller-supplied caps** (not the kernel name table),
+/// then returns a `SEND|GRANT` cap to the new endpoint (like SpawnReturningEndpoint). This is how
+/// the supervisor wires a dependent from its `name → cap` map without the kernel resolving names.
+/// The old name-wiring path is untouched (this is a distinct syscall).
+///
+/// arg0 = packed (spawn_cap_slot low 16, core next 16; 0xFFFF = round-robin).
+/// arg1 = ptr, arg2 = len of a descriptor: `[name_len:u8, name…, count:u8,
+///        {label_len:u8, label…, slot_lo:u8, slot_hi:u8} × count]` (count ≤ MAX_SEND_PEERS).
+/// Each `slot` names a cap the CALLER holds; the kernel copies it (GRANT-validated, non-escalating
+/// §7.3) into the child under `label`. Returns the endpoint cap slot (≥0), or a negative error.
+fn handle_spawn_with_caps(packed_arg0: u64, buf_ptr: u64, buf_len: u64) -> i64 {
+    let spawn_cap_slot = (packed_arg0 & 0xFFFF) as usize;
+    let core_raw       = ((packed_arg0 >> 16) & 0xFFFF) as u32;
+    let core_override  = if core_raw == 0xFFFF { None } else { Some(core_raw) };
+
+    // Validate the SPAWN capability (same gate as Spawn — §3.1). Reuse it as the array filler.
+    let spawn_cap = match scheduler::current_task_lookup_cap(spawn_cap_slot, Rights::WRITE) {
+        Ok(c)  => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    if spawn_cap.resource_id != crate::capability::SPAWN_RESOURCE {
+        return cap_err_to_i64(CapError::CapWrongScope);
+    }
+
+    let len = buf_len as usize;
+    if len < 2 || len > 512 { return -1; }
+    let buf = match read_user_bytes(buf_ptr, len) {
+        Some(b) => b,
+        None    => return -1,
+    };
+
+    // Parse the descriptor with bounds checks at every step (untrusted input).
+    let name_len = buf[0] as usize;
+    let mut p = 1usize;
+    if name_len == 0 || name_len > 64 || p + name_len > len { return -1; }
+    let name = match core::str::from_utf8(&buf[p..p + name_len]) { Ok(s) => s, Err(_) => return -1 };
+    p += name_len;
+    if p >= len { return -1; }
+    let count = buf[p] as usize;
+    p += 1;
+    if count > crate::task::MAX_SEND_PEERS { return -1; }
+
+    // Build the install list — for each entry, copy the caller's cap (GRANT-validated).
+    use crate::task::{InstallCap, PEER_NAME_BYTES, MAX_SEND_PEERS};
+    let mut installs = [InstallCap { name: [0u8; PEER_NAME_BYTES], name_len: 0, cap: spawn_cap }; MAX_SEND_PEERS];
+    for entry in installs.iter_mut().take(count) {
+        if p >= len { return -1; }
+        let label_len = buf[p] as usize;
+        p += 1;
+        if label_len == 0 || label_len > PEER_NAME_BYTES || p + label_len + 2 > len { return -1; }
+        let mut nm = [0u8; PEER_NAME_BYTES];
+        nm[..label_len].copy_from_slice(&buf[p..p + label_len]);
+        p += label_len;
+        let slot = (buf[p] as usize) | ((buf[p + 1] as usize) << 8);
+        p += 2;
+        // The caller must hold this cap WITH GRANT — copying it into the child is then
+        // non-escalating (§7.3): the caller could already transfer the whole cap.
+        let held = match scheduler::current_task_lookup_cap(slot, Rights::GRANT) {
+            Ok(c)  => c,
+            Err(e) => return cap_err_to_i64(e),
+        };
+        entry.name     = nm;
+        entry.name_len = label_len as u8;
+        entry.cap      = held;
+    }
+
+    match crate::task::spawn_service_by_name_with_installs(name, core_override, &installs[..count]) {
+        Ok(Some(ep_id)) => {
+            let rid    = crate::capability::cap::ResourceId::from(ep_id);
+            let ep_cap = crate::capability::mint_cap(rid, Rights::SEND | Rights::GRANT);
+            match scheduler::current_task_insert_cap(ep_cap) {
+                Ok(slot) => slot as i64,
+                Err(e)   => cap_err_to_i64(e),
+            }
+        }
+        Ok(None) => -2, // spawned OK, but the service has no recv endpoint (a producer like `greet`)
+        Err(_)   => -1, // spawn failed
     }
 }
 
