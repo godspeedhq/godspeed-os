@@ -2949,6 +2949,13 @@ const CHAOS_RESTARTABLE: [&str; 3] = ["registry", "block-driver", "fs"];
 const CHAOS_DEFAULT_ROUNDS: u32 = 20;
 const CHAOS_MAX_ROUNDS: u32 = 100;        // bounded (§26.6) — a deliberate cap, not a firehose
 const CHAOS_WAIT_YIELDS: u32 = 40_000;    // per-round recovery wait (safety bound; recovery is ~ms)
+// After the storm, the target's task has respawned (recovery detected via its task generation),
+// but a heavy service like `fs` is not yet *serving* — it still has to re-mount and re-register,
+// and its restart log burst is still draining off the serial line. Settle before reporting (so the
+// report isn't shredded by that burst on the bounded-THRE serial path) and before saving (so an
+// `fs`-target save can actually reach a re-registered fs). Bounded (§26.6); §14.3 retry pattern.
+const CHAOS_SETTLE_YIELDS: u32 = 60_000;  // let the just-restarted target re-register + serial drain
+const CHAOS_SAVE_ATTEMPTS: u32 = 6;       // bounded save retries while fs finishes its remount
 
 fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
     // Tokenize the raw line ourselves — `chaos kill-storm <svc> [rounds] [save <path>]` runs past
@@ -3056,16 +3063,29 @@ fn chaos_kill_storm(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize) 
     let _ = writeln!(rb, "verdict: {}", if recovered == rounds { "PASS" } else { "FAIL" });
     if rb.overflow { let _ = writeln!(rb, "(report truncated at {} KiB)", REPORT_MAX / 1024); }
 
+    // Settle: let the just-restarted target finish re-mounting/re-registering and let its restart
+    // log burst drain off the serial line, so the report below survives on the wire (the bounded-THRE
+    // serial path drops bytes under a cross-core flood) and an `fs`-target save can reach a live fs.
+    for _ in 0..CHAOS_SETTLE_YIELDS { ctx.yield_cpu(); }
+
     // Always print to the console — fs-independent, so even an `fs` storm reports cleanly.
     console_write_chunked(ctx, rb.bytes());
-    // Optionally materialise to a file, now that the target has recovered. Best-effort: if fs was
-    // the target (or its block-driver) and is still down, the save fails and the console report stands.
+    // Optionally materialise to a file, now that the target has recovered. Best-effort with a bounded
+    // retry: if fs was the target it may still be finishing its remount, so retry the save a few times
+    // (yielding between) until it re-registers. If it never comes back in budget, the console report stands.
     if let Some(path) = save {
         let mut pbuf = [0u8; PATH_MAX];
         if let Some(p) = resolve_or_err(ctx, cwd, path, &mut pbuf) {
             let mut ppath = [0u8; PATH_MAX];
             let pl = p.len(); ppath[..pl].copy_from_slice(p);
-            if save_report(ctx, &ppath[..pl], rb.bytes()) {
+            let mut saved = false;
+            for attempt in 0..CHAOS_SAVE_ATTEMPTS {
+                if save_report(ctx, &ppath[..pl], rb.bytes()) { saved = true; break; }
+                if attempt + 1 < CHAOS_SAVE_ATTEMPTS {
+                    for _ in 0..CHAOS_SETTLE_YIELDS { ctx.yield_cpu(); } // wait for fs, then retry
+                }
+            }
+            if saved {
                 ctx.console_writeln_fmt(format_args!("chaos: report saved to {}", str_of(&ppath[..pl])));
             } else {
                 ctx.console_writeln_fmt(format_args!(

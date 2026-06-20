@@ -1563,10 +1563,20 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     // fix, the dead registry cap made fs-reacquire fail and storage stayed permanently
     // "unavailable". `ls /` succeeding proves the client resolved a name after a registry
     // restart — the property §22 Test 11 never pinned.
-    match run!(b"chaos kill-storm fs 2\r", 30) {
-        Some(r) => check!(r.contains("verdict: PASS"),
-                          "chaos: fs storm recovers (after a registry storm)"),
-        None    => { println!("files-test: FAIL — chaos fs storm timeout"); fail += 1; }
+    // Storm fs WITH a save: the report+save run when fs (the target) has just restarted and is
+    // still re-registering, so the chaos command must settle + reacquire fs THROUGH the (stale)
+    // registry to land the save. This is the catch-22-safe path (record in memory, write at the
+    // end) AND the double-storm registry-bootstrap path in one command. Generous timeout: the
+    // settle + bounded save-retry yields are slow under TCG.
+    match run!(b"chaos kill-storm fs 2 save /fsr.txt\r", 60) {
+        Some(r) => check!(r.contains("verdict: PASS") && r.contains("report saved to /fsr.txt"),
+                          "chaos: fs storm recovers + report saved (settle + reacquire fs via stale registry)"),
+        None    => { println!("files-test: FAIL — chaos fs storm+save timeout"); fail += 1; }
+    }
+    match run!(b"read /fsr.txt\r", 10) {
+        Some(r) => check!(r.contains("verdict: PASS") && r.contains("recovered gen"),
+                          "chaos: fs-target report file persisted (catch-22-safe save landed)"),
+        None    => { println!("files-test: FAIL — read fs chaos report timeout"); fail += 1; }
     }
     match run!(b"ls /\r", 10) {
         Some(r) => check!(!r.contains("storage unavailable"),
