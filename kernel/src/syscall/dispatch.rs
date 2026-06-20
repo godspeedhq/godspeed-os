@@ -63,6 +63,7 @@ pub enum SyscallNumber {
     RecvTimeout         = 35,
     IrqUnmask           = 36,
     Sleep               = 37,
+    SpawnReturningEndpoint = 38,
 }
 
 /// Raw syscall dispatcher — called from the SYSCALL/SYSENTER IDT stub.
@@ -94,6 +95,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::Log            as u64 => handle_log(arg0, arg1, arg2),
         n if n == SyscallNumber::AllocMem       as u64 => handle_alloc_mem(arg0),
         n if n == SyscallNumber::Spawn          as u64 => handle_spawn(arg0, arg1, arg2),
+        n if n == SyscallNumber::SpawnReturningEndpoint as u64 => handle_spawn_returning_endpoint(arg0, arg1, arg2),
         n if n == SyscallNumber::Kill           as u64 => handle_kill(arg0, arg1),
         n if n == SyscallNumber::Abort          as u64 => handle_abort(arg0, arg1),
         n if n == SyscallNumber::AcquireSendCap as u64 => handle_acquire_send_cap(arg0, arg1, arg2),
@@ -552,8 +554,60 @@ fn handle_spawn(packed_arg0: u64, name_ptr: u64, name_len: u64) -> i64 {
     };
 
     match crate::task::spawn_service_by_name(name, core_override) {
-        Ok(()) => 0,
+        Ok(_)  => 0,
         Err(_) => -1,
+    }
+}
+
+/// Syscall: SpawnReturningEndpoint (38). Like Spawn (7), but on success mints a `SEND|GRANT`
+/// cap to the new service's recv endpoint and inserts it into the **caller's** cap table,
+/// returning the slot. This is the Phase-0 seam for moving naming out of the kernel
+/// (`docs/naming-design.md`): a spawner (the supervisor) can collect a cap to every service it
+/// starts — a userspace `name → cap` map — without the kernel resolving names for third parties.
+/// The old name-wiring path is unchanged; this is purely additive.
+///
+/// arg0 = packed (spawn_cap_slot in low 16, core in next 16; core 0xFFFF = round-robin).
+/// arg1 = name ptr, arg2 = name len. Returns the endpoint cap slot (≥0), or a negative error
+/// (cap error, or -1 if the spawn failed / the service has no recv endpoint to hand back).
+fn handle_spawn_returning_endpoint(packed_arg0: u64, name_ptr: u64, name_len: u64) -> i64 {
+    let spawn_cap_slot = (packed_arg0 & 0xFFFF) as usize;
+    let core_raw       = ((packed_arg0 >> 16) & 0xFFFF) as u32;
+    let core_override  = if core_raw == 0xFFFF { None } else { Some(core_raw) };
+
+    // Validate the SPAWN capability (same gate as Spawn — §3.1).
+    let cap = match scheduler::current_task_lookup_cap(spawn_cap_slot, Rights::WRITE) {
+        Ok(c)  => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    if cap.resource_id != crate::capability::SPAWN_RESOURCE {
+        return cap_err_to_i64(CapError::CapWrongScope);
+    }
+
+    let len = name_len as usize;
+    if len == 0 || len > 64 { return -1; }
+    let name_bytes = match read_user_bytes(name_ptr, len) {
+        Some(b) => b,
+        None    => return -1,
+    };
+    let name = match core::str::from_utf8(name_bytes) {
+        Ok(s)  => s,
+        Err(_) => return -1,
+    };
+
+    match crate::task::spawn_service_by_name(name, core_override) {
+        Ok(Some(ep_id)) => {
+            // Mint a SEND|GRANT cap to the new endpoint at its current generation and hand it
+            // to the caller. SEND so the caller can route to it; GRANT so it can delegate copies
+            // into dependents (the supervisor wiring its name→cap map, future phases).
+            let rid    = crate::capability::cap::ResourceId::from(ep_id);
+            let ep_cap = crate::capability::mint_cap(rid, Rights::SEND | Rights::GRANT);
+            match scheduler::current_task_insert_cap(ep_cap) {
+                Ok(slot) => slot as i64,
+                Err(e)   => cap_err_to_i64(e),
+            }
+        }
+        Ok(None) => -1, // spawned, but no recv endpoint — nothing to hand back
+        Err(_)   => -1,
     }
 }
 

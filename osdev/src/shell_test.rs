@@ -239,6 +239,16 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(r) => check!(r.contains("uptime") && r.contains("seconds since boot"), "uptime help: header + example"),
         None    => { println!("shell-test: FAIL — uptime help timeout"); fail += 1; }
     }
+    // Phase-0 of moving naming out of the kernel (docs/naming-design.md): the new
+    // SpawnReturningEndpoint syscall hands the caller a SEND|GRANT cap to the spawned service's
+    // endpoint. `spawncap pong` spawns pong, gets the cap, and sends a probe through it — proving
+    // the returned cap actually routes. The old name-wiring path is untouched (purely additive).
+    send(&mut write_half, b"spawncap pong\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)) {
+        Some(r) => check!(r.contains("endpoint cap acquired; send Ok"),
+                          "spawncap: SpawnReturningEndpoint returns a routable endpoint cap"),
+        None    => { println!("shell-test: FAIL — spawncap timeout"); fail += 1; }
+    }
     // sort by a column (just exercise the path; ordering of the full table is host-dependent).
     send(&mut write_half, b"status | sort name | to json\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {

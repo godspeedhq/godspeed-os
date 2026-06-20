@@ -92,7 +92,7 @@ fn execute_command(cmd: &str) {
 
             // Respawn.
             match crate::task::spawn_service_by_name(name, core_override) {
-                Ok(()) => crate::kprintln!("control: {} restarted", name),
+                Ok(_)  => crate::kprintln!("control: {} restarted", name),
                 Err(e) => crate::kprintln!("control: restart failed: {:?}", e),
             }
         }

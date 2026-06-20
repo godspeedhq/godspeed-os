@@ -2837,10 +2837,10 @@ pub fn spawn_service_pipe(producer: &str, sink: &str, core_override: Option<u32>
     if let Err(ref e) = result {
         crate::kprintln!("task: spawn pipe '{}' -> '{}' failed: {:?}", producer, sink, e);
     }
-    result
+    result.map(|_| ())
 }
 
-pub fn spawn_service_by_name(name: &str, core_override: Option<u32>) -> Result<(), SpawnError> {
+pub fn spawn_service_by_name(name: &str, core_override: Option<u32>) -> Result<Option<EndpointId>, SpawnError> {
     let (static_name, cfg) = service_config(name).ok_or(SpawnError::NotFound)?;
 
     // Singleton guard (§6.2, §26.6 bounded behaviour): refuse to spawn a service
@@ -2878,7 +2878,10 @@ pub fn spawn_service_by_name(name: &str, core_override: Option<u32>) -> Result<(
 /// line are kept (legitimate lifecycle output, one line each).
 const SPAWN_TRACE: bool = false;
 
-/// Low-level spawn: load ELF, wire caps, enqueue on `core_id`.
+/// Low-level spawn: load ELF, wire caps, enqueue on `core_id`. Returns the new task's recv
+/// `EndpointId` (`None` if it has no endpoint) — the caller (via the spawn syscall) can mint a
+/// cap to it. This is the Phase-0 seam for moving naming out of the kernel (`docs/naming-design.md`):
+/// a spawner can collect a cap to every service it starts without the kernel resolving names.
 fn spawn_service_with_config(
     name:              &'static str,
     elf_bytes:         &[u8],
@@ -2890,7 +2893,7 @@ fn spawn_service_with_config(
     memory_limit:      u64,
     hw_irqs:           &[u8],
     has_console_read:  bool,
-) -> Result<(), SpawnError> {
+) -> Result<Option<EndpointId>, SpawnError> {
     // DIAG step markers (gated by SPAWN_TRACE; off by default — see its doc).
     if SPAWN_TRACE { crate::kprintln!("spawn[elf]: '{}'", name); }
 
@@ -3299,14 +3302,14 @@ fn spawn_service_with_config(
     scheduler::set_task_memory_budget(task_slot, memory_limit);
 
     crate::kprintln!("task: '{}' spawned OK on core {} (slot {})", name, core_id, task_slot);
-    Ok(())
+    Ok(own_endpoint)
 }
 
 /// Spawn `init` on Core 0. Called once by `kernel_main` (§11.1).
 pub fn spawn_init() {
     let elf_bytes = include_bytes!(env!("SVC_INIT_ELF"));
     match spawn_service_with_config("init", elf_bytes, 0, false, &[], 0, false, 64 * 1024 * 1024, &[], false) {
-        Ok(()) => crate::kprintln!("task: init spawned on core 0"),
+        Ok(_) => crate::kprintln!("task: init spawned on core 0"),
         Err(e) => panic!("task: failed to spawn init: {:?}", e),
     }
 }
