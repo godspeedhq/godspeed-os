@@ -890,6 +890,11 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
             if argc < 2 { ctx.console_writeln("usage: spawn <name>"); Err(ShellError::Unknown) }
             else { cmd_spawn(ctx, args[1]) }
         }
+        // Phase-0 naming-migration diagnostic (docs/naming-design.md) — spawn + get an endpoint cap.
+        "spawncap" => {
+            if argc < 2 { ctx.console_writeln("usage: spawncap <name>"); Err(ShellError::Unknown) }
+            else { cmd_spawncap(ctx, args[1]) }
+        }
         "kill"    => {
             if argc < 2 { ctx.console_writeln("usage: kill <name>"); Err(ShellError::Unknown) }
             else { cmd_kill(ctx, args[1]) }
@@ -2658,6 +2663,29 @@ fn cmd_spawn(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     match ctx.spawn(name) {
         Ok(())  => { report(ctx, "spawned: ", name); Ok(()) }
         Err(_)  => { report(ctx, "spawn failed (unknown service?): ", name); Err(ShellError::Unknown) }
+    }
+}
+
+/// `spawncap <name>` — **Phase-0 diagnostic** (`docs/naming-design.md`). Spawns a service via the
+/// new `SpawnReturningEndpoint` syscall, which hands the caller a `SEND|GRANT` cap to the new
+/// service's endpoint, then proves that cap routes by sending a probe message through it. This is
+/// the seam that will let the supervisor build a userspace `name → cap` map; it does NOT change how
+/// services are wired today (purely additive). Folded into the supervisor / removed in a later phase.
+fn cmd_spawncap(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
+    if is_core_service(name) {
+        ctx.console_writeln(PROTECTED_MSG);
+        return Err(ShellError::Denied);
+    }
+    match ctx.spawn_returning_endpoint(name, 0xFFFF) {
+        Some(h) => match ctx.try_send_by_handle(h, &Message::from_bytes(&[0x01])) {
+            Ok(())  => { ctx.console_writeln_fmt(format_args!("spawncap: {} — endpoint cap acquired; send Ok", name)); Ok(()) }
+            Err(_)  => { ctx.console_writeln_fmt(format_args!("spawncap: {} — cap acquired but send failed", name)); Err(ShellError::Unknown) }
+        },
+        None => {
+            ctx.console_writeln_fmt(format_args!(
+                "spawncap: could not acquire endpoint cap for {} (cap not held / spawn failed / no endpoint)", name));
+            Err(ShellError::Unknown)
+        }
     }
 }
 

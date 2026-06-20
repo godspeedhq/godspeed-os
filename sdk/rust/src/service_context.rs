@@ -1262,6 +1262,24 @@ impl ServiceContext {
         if ret == 0 { Ok(()) } else { Err(crate::Error::InvalidArgument) }
     }
 
+    /// Spawn `name` on `core` (0xFFFF = round-robin) and receive a `SEND|GRANT` cap to its recv
+    /// endpoint. This is the Phase-0 seam for moving naming out of the kernel
+    /// (`docs/naming-design.md`): a spawner (the supervisor) collects a cap to every service it
+    /// starts — a userspace `name → cap` map — instead of the kernel resolving names. Requires the
+    /// SPAWN cap. `None` if the cap is not held, the spawn failed, or the service has no recv
+    /// endpoint to hand back. The old name-wiring path is unchanged; this is purely additive.
+    pub fn spawn_returning_endpoint(&self, name: &str, core: u32) -> Option<CapHandle> {
+        let data = Self::ctx();
+        if data.magic != SERVICE_CTX_MAGIC { return None; }
+        let slot = data.spawn_slot;
+        if slot == u32::MAX { return None; }
+        let bytes  = name.as_bytes();
+        let packed = ((core as u64 & 0xFFFF) << 16) | (slot as u64 & 0xFFFF);
+        // SAFETY: syscall(38) = SpawnReturningEndpoint; slot from the kernel-written page; bytes valid.
+        let ret = unsafe { raw_syscall(38, packed, bytes.as_ptr() as u64, bytes.len() as u64) };
+        if ret < 0 { None } else { Some(CapHandle(ret as u32)) }
+    }
+
     /// Spawn `producer` and delegate it a SEND cap to `sink`'s endpoint
     /// (`producer | sink`). `sink` must already be spawned. Requires the spawn
     /// capability — held only by the shell/supervisor.
