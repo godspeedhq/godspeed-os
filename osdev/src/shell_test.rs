@@ -808,6 +808,18 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         Some(r) => check!(r.contains("note.txt") && r.contains("inside.txt"), "ls (cwd) shows both files"),
         None    => { println!("files-test: FAIL — ls cwd timeout"); fail += 1; }
     }
+    // Tab-completion of a FILE PATH: a unique prefix fills in the rest, and the completed command
+    // runs. /docs has note.txt + inside.txt, so 'i' and 'n' are unique. \t = Tab, then \r runs it.
+    // Absolute path: `read /docs/i<Tab>` → `read /docs/inside.txt ` → runs → inside.txt's content.
+    match run!(b"read /docs/i\t\r", 10) {
+        Some(r) => check!(r.contains("nested-content"), "tab: /docs/i<Tab> completes to inside.txt + runs"),
+        None    => { println!("files-test: FAIL — tab abs-path timeout"); fail += 1; }
+    }
+    // Relative path (cwd is /docs): `read n<Tab>` → `read note.txt ` → runs → note.txt's content.
+    match run!(b"read n\t\r", 10) {
+        Some(r) => check!(r.contains("hello world"), "tab: relative n<Tab> completes to note.txt + runs"),
+        None    => { println!("files-test: FAIL — tab rel-path timeout"); fail += 1; }
+    }
     match run!(b"mkdir sub\r", 10) {
         Some(r) => check!(r.contains("created /docs/sub"), "mkdir relative → /docs/sub"),
         None    => { println!("files-test: FAIL — mkdir relative timeout"); fail += 1; }
