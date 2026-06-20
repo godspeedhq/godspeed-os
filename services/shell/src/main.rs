@@ -674,11 +674,11 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
                 ctx.console_writeln("usage: run <path>");
                 Err(ShellError::Unknown)
             } else {
-                cmd_run(ctx, cwd, args[1], depth, &mut Out::Console)
+                cmd_run(ctx, cwd, args[1], depth)
             };
         }
         // `selfcheck` — write the embedded suite to the GSFS drive and run it (one-USB checkpoint).
-        "selfcheck" => return cmd_selfcheck(ctx, cwd, depth, &mut Out::Console),
+        "selfcheck" => return cmd_selfcheck(ctx, cwd, depth),
         _ => {}
     }
 
@@ -805,7 +805,7 @@ fn trim_bytes(b: &[u8]) -> &[u8] {
 /// the script buffer off the hot pipe frame, and the `fs` reply is dropped before any command
 /// runs — both bound the user stack (see the pipe stack-overflow lesson).
 #[inline(never)]
-fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8, out: &mut Out) -> Result<(), ShellError> {
+fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8) -> Result<(), ShellError> {
     let mut pbuf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut pbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     // Read the whole script into a fixed buffer, then drop the fs reply before executing anything.
@@ -832,7 +832,7 @@ fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8, out: &mut 
         script[..take].copy_from_slice(&body[..take]);
         slen = take;
     }
-    run_lines(ctx, cwd, &script[..slen], depth, out)
+    run_lines(ctx, cwd, &script[..slen], depth)
 }
 
 /// Execute a script body (already in memory): split into commands, run each, then print a
@@ -841,14 +841,11 @@ fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8, out: &mut 
 /// so it is **not** bound by `MAX_FILE_BYTES`/the single-message file transfer, only by the
 /// embedded const). `#[inline(never)]`: holds the verdict array and drives `execute` in a loop
 /// (the user stack is tight — see the pipe stack-overflow lesson).
-/// `out` receives the run **report** — the `> <cmd>` echoes, the `--- summary ---` block, the
-/// `PASS/FAIL <cmd>` lines, and the `run: ran N, failed M` tally. Each command's OWN output still
-/// goes to the console (it is produced inside `execute`, which writes there directly). So a piped
-/// `selfcheck | write /sc.txt` captures the report (the useful, savable part) while the sub-command
-/// chatter scrolls past on screen — documented behaviour, not a silent surprise. Bare/console runs
-/// pass `Out::Console`, so the report prints exactly as before.
+/// Writes its report to the console. NOTE: `run`/`selfcheck` are deliberately NOT pipe producers —
+/// an orchestrator runs the suite's own sub-pipelines, and capturing it would nest a 64 KiB pipe
+/// `Stream` inside another and overflow the user stack (HW-proven, [[project-shell-stack-pipe]]).
 #[inline(never)]
-fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out) -> Result<(), ShellError> {
+fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8) -> Result<(), ShellError> {
     let mut ran = 0u32;
     let mut failed = 0u32;
     let mut last: Result<(), ShellError> = Ok(());
@@ -863,8 +860,8 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
             let cmd = trim_bytes(cmd);
             if cmd.is_empty() { continue; }
             // Echo the command so the transcript shows what produced each result.
-            out.put(ctx, "> ");
-            out.line(ctx, str_of(cmd));
+            ctx.console_write("> ");
+            ctx.console_writeln(str_of(cmd));
             last = execute(ctx, cmd, cwd, last, depth + 1);
             if vi < RUN_MAX_CMDS { verdict[vi] = last.is_ok(); }
             vi += 1;
@@ -874,7 +871,7 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
     }
     // End-of-run summary: PASS/FAIL per command (re-split identically, pairing with `verdict`).
     // "FAIL  " is deliberately not the word "FAILED" the harness greens on absence of.
-    out.line(ctx, "--- summary ---");
+    ctx.console_writeln("--- summary ---");
     let mut j = 0usize;
     for line in src.split(|&b| b == b'\n') {
         let line = trim_bytes(line);
@@ -882,12 +879,12 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
         for cmd in line.split(|&b| b == b';') {
             let cmd = trim_bytes(cmd);
             if cmd.is_empty() { continue; }
-            out.put(ctx, if j < RUN_MAX_CMDS && !verdict[j] { "FAIL  " } else { "PASS  " });
-            out.line(ctx, str_of(cmd));
+            ctx.console_write(if j < RUN_MAX_CMDS && !verdict[j] { "FAIL  " } else { "PASS  " });
+            ctx.console_writeln(str_of(cmd));
             j += 1;
         }
     }
-    out.line_fmt(ctx, format_args!("run: ran {}, failed {}", ran, failed));
+    ctx.console_writeln_fmt(format_args!("run: ran {}, failed {}", ran, failed));
     if failed == 0 { Ok(()) } else { Err(ShellError::Unknown) }
 }
 
@@ -906,17 +903,15 @@ const SELFCHECK_GS: &str = include_str!("../../../scripts/selfcheck.gsh");
 /// tests have somewhere to write), then `selfcheck`. Re-runnable (the suite creates and deletes
 /// its own files). Refused inside a script (it runs one — no nesting).
 #[inline(never)]
-fn cmd_selfcheck(ctx: &ServiceContext, cwd: &mut Cwd, depth: u8, out: &mut Out) -> Result<(), ShellError> {
+fn cmd_selfcheck(ctx: &ServiceContext, cwd: &mut Cwd, depth: u8) -> Result<(), ShellError> {
     if depth > 0 {
         ctx.console_writeln("selfcheck: not available inside a script (it runs one)");
         return Err(ShellError::Unknown);
     }
-    // The intro is a status line → always to the console (even when the report is being captured to
-    // a file, so the operator sees the run start). The report itself goes to `out`.
     ctx.console_writeln_fmt(format_args!(
         "selfcheck: running the embedded suite ({} bytes, in memory) — needs a flashed drive for the file tests...",
         SELFCHECK_GS.len()));
-    run_lines(ctx, cwd, SELFCHECK_GS.as_bytes(), depth, out)
+    run_lines(ctx, cwd, SELFCHECK_GS.as_bytes(), depth)
 }
 
 /// `assert ok <cmd>` / `assert fails <cmd>` — the **result** form: run `<cmd>` and check that it
@@ -2404,9 +2399,14 @@ fn is_producer_builtin(name: &str) -> bool {
     // date/help) join read/echo/tree so "anything that displays text can be saved to a file".
     // No `cat`: `read` is the one file reader (utilities/18_read.md — `read` replaces POSIX `cat`,
     // whose name describes a different operation; this OS does not carry POSIX vocabulary).
+    //
+    // NOT `selfcheck`/`run`: an orchestrator runs the suite's OWN sub-pipelines, so capturing it
+    // nests a pipe_run (64 KiB Stream) inside a pipe_run — two coexisting 64 KiB buffers overflow
+    // the tight user stack (HW-proven shell crash, [[project-shell-stack-pipe]]). They refuse
+    // loudly as non-producers instead. To capture a big file for `edit`, append a simple producer
+    // a few times: `help | write /big.txt; help | write append /big.txt; …`.
     matches!(name, "read" | "echo" | "tree"
-                 | "about" | "mem" | "cores" | "date" | "help"
-                 | "selfcheck" | "run")
+                 | "about" | "mem" | "cores" | "date" | "help")
 }
 
 /// Producer SERVICES that emit without needing input, so they can start a pipe (and follow the
@@ -2437,11 +2437,6 @@ fn run_producer(ctx: &ServiceContext, cwd: &Cwd, cmdline: &str, out: &mut Out) {
         "cores"        => { let _ = cmd_cores(ctx, out); }
         "date"         => { let _ = cmd_date(ctx, arg, out); }
         "help"         => help_to_out(ctx, out),
-        // Orchestrators — capture their RUN REPORT (the sub-commands' own output still goes to the
-        // console; see `run_lines`). Each gets its own `Cwd` so a `cd` inside can't move the
-        // interactive session. depth 0 → `selfcheck`/`run` are permitted (a pipe isn't a script).
-        "selfcheck"    => { let mut c = cwd.dup(); let _ = cmd_selfcheck(ctx, &mut c, 0, out); }
-        "run"          => { let mut c = cwd.dup(); let _ = cmd_run(ctx, &mut c, arg, 0, out); }
         _ => {}
     }
 }
@@ -2673,12 +2668,6 @@ struct Cwd {
 }
 
 impl Cwd {
-    /// A by-value copy — a pipe producer that runs commands (`run`/`selfcheck`) gets its own
-    /// mutable `Cwd` so a `cd` inside the captured run can't disturb the interactive session's.
-    fn dup(&self) -> Cwd {
-        Cwd { buf: self.buf, len: self.len, prev: self.prev, prev_len: self.prev_len }
-    }
-
     fn root() -> Self {
         let mut buf = [0u8; PATH_MAX];
         buf[0] = b'/';

@@ -306,6 +306,15 @@ pub fn run(image_path: &Path, smp: u32) {
                           "pipe: non-producer source error"),
         None    => { println!("shell-test: FAIL — timed out after non-producer pipe"); fail += 1; }
     }
+    // An ORCHESTRATOR (selfcheck/run) must refuse loudly as a non-producer — NOT run and overflow
+    // the stack by nesting captures (the HW shell-crash this guards against). Rejected before it
+    // runs, so no drive is touched.
+    send(&mut write_half, b"selfcheck | write /x.txt\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("'selfcheck' cannot start a pipe because it's not a pipe source"),
+                          "pipe: orchestrator refused as non-producer (no nested-capture crash)"),
+        None    => { println!("shell-test: FAIL — timed out after orchestrator pipe"); fail += 1; }
+    }
     send(&mut write_half, b"status | result\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("checks a command's outcome, not piped output"),

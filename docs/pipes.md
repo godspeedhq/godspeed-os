@@ -26,9 +26,8 @@ A pipeline is **one producer, zero or more filters, one sink**:
 ```
 
 - **PRODUCER** — emits text (or records), ignores input. Built-ins: `read`, `echo`, `ls`, `tree`,
-  `find`, the system-info commands `about` / `mem` / `cores` / `date` / `help`, the introspection
-  producers `status` / `caps` / `drives` / `observe now`, and the orchestrators `run` / `selfcheck`
-  (which emit their *run report* — see *What can start a pipe* below). Services: `greet` (text),
+  `find`, the system-info commands `about` / `mem` / `cores` / `date` / `help`, and the introspection
+  producers `status` / `caps` / `drives` / `observe now`. Services: `greet` (text),
   `roster` (records). *(There is no `cat`: `read` is the one file reader — `utilities/18_read.md`,
   the replacement for POSIX `cat`, whose name describes a different operation. This OS does not
   carry POSIX vocabulary for its own sake.)*
@@ -73,14 +72,11 @@ pipe source iff its job is to *emit data*. That splits the command set three way
   keeps deliberately apart. A non-producer in stage 1 is refused loudly ("… cannot start a pipe").
 - **Live / interactive → NOT sources.** The full-screen `observe` live view and `edit` own the
   screen and never yield a discrete stream; piping them is a loud refusal (use `observe now`).
-
-**Orchestrators (`run` / `selfcheck`) capture their *report*.** These run many commands; their
-visible output is two different things. The **report** they generate themselves — the `> <cmd>`
-echoes, the `PASS/FAIL` summary, the `ran N, failed M` tally — goes through `Out`, so
-`selfcheck | write /sc.txt` captures it. Each sub-command's *own* output still goes to the console
-(it is produced deep inside `execute`, which writes there directly). So a piped run saves the tidy
-report — the part worth keeping — while the sub-command chatter scrolls past on screen. This is a
-documented, deliberate split, not a silent surprise.
+- **Orchestrators (`run` / `selfcheck`) → NOT sources.** They run the suite's *own* sub-pipelines,
+  so capturing one would nest a `pipe_run` (which holds a 64 KiB `Stream` on the stack) inside
+  another — two coexisting 64 KiB buffers overflow the tight user stack (HW-proven). They refuse
+  loudly as non-producers. To build a big file (e.g. to test `edit`'s windowing), append a *simple*
+  producer a few times: `help | write /big.txt` then `help | write append /big.txt` ×N.
 
 ## The `write` sink — overwrite by default, append/prepend explicit
 
