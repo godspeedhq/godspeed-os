@@ -869,6 +869,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                         "xhci: mouse moved dx={} dy={}", dx, dy)),
                                 );
                             } else {
+                                // Ctrl+Alt+Del = secure-attention reboot, from any context. Checked
+                                // only for keyboard reports (a mouse button byte can alias the
+                                // modifier bits). reboot() does not return.
+                                if godspeed_sdk::hid::is_ctrl_alt_del(&rep) {
+                                    ctx.log("xhci: Ctrl+Alt+Del — rebooting");
+                                    ctx.reboot();
+                                }
                                 godspeed_sdk::hid::decode_keyboard(
                                     &rep, &mut kb_last[d], &mut kb_rep[d], ctx.read_tsc(),
                                     |ch| ctx.console_push(ch),

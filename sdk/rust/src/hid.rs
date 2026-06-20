@@ -203,6 +203,23 @@ pub fn report_is_valid(report: &[u8; 8]) -> bool {
     *report != [0xFF; 8]
 }
 
+/// HID usage of the Delete (forward-delete) key — the `Del` in Ctrl+Alt+Del.
+pub const KEY_DELETE: u8 = 0x4C;
+
+/// True if a **keyboard** boot report is the Ctrl+Alt+Del chord: either Ctrl (left 0x01 / right
+/// 0x10) **and** either Alt (left 0x04 / right 0x40) held, with the Delete key down. This is the
+/// secure-attention reboot combo — a driver checks it each poll for a keyboard device and, when
+/// true, issues the reboot syscall. Because reboot does not return, no edge-tracking is needed
+/// (the first detection reboots). Apply this ONLY to keyboard reports: a mouse boot report's
+/// button byte (byte 0) can alias the Ctrl/Alt modifier bits, so it must never be tested here.
+pub fn is_ctrl_alt_del(report: &[u8; 8]) -> bool {
+    if report[1] != 0 { return false; }                  // reserved byte ≠ 0 → invalid/stale report
+    let mods = report[0];
+    let ctrl = mods & 0x11 != 0;
+    let alt  = mods & 0x44 != 0;
+    ctrl && alt && report[2..8].contains(&KEY_DELETE)
+}
+
 /// Decode a keyboard boot report (modifiers in byte 0, up to six keycodes in
 /// bytes 2..8) with N-key edge detection: `emit(ascii)` is called for every key
 /// that is down now but was not in `last`, so rolling onto a new key before
@@ -384,5 +401,18 @@ mod tests {
         // Ctrl takes precedence over Shift, and a plain letter is unchanged.
         assert_eq!(hid_to_ascii(0x16, 0x01 | 0x02), Some(0x13)); // Ctrl+Shift+S → still ^S
         assert_eq!(hid_to_ascii(0x16, 0x00), Some(b's'));        // no Ctrl → 's'
+    }
+
+    #[test]
+    fn ctrl_alt_del_chord_detected() {
+        // The reboot chord: a Ctrl bit + an Alt bit + the Delete keycode (0x4C) in a key slot.
+        assert!(is_ctrl_alt_del(&[0x01 | 0x04, 0, 0x4C, 0, 0, 0, 0, 0]));  // left Ctrl + left Alt + Del
+        assert!(is_ctrl_alt_del(&[0x10 | 0x44, 0, 0, 0x4C, 0, 0, 0, 0]));  // right Ctrl + Alts + Del in slot 2
+        // Missing any leg of the chord → not detected.
+        assert!(!is_ctrl_alt_del(&[0x01, 0, 0x4C, 0, 0, 0, 0, 0]));        // Ctrl+Del, no Alt
+        assert!(!is_ctrl_alt_del(&[0x04, 0, 0x4C, 0, 0, 0, 0, 0]));        // Alt+Del, no Ctrl
+        assert!(!is_ctrl_alt_del(&[0x05, 0, 0, 0, 0, 0, 0, 0]));           // Ctrl+Alt, no Del
+        // A stale/invalid report (reserved byte ≠ 0) is rejected even if it otherwise matches.
+        assert!(!is_ctrl_alt_del(&[0x05, 0xFF, 0x4C, 0, 0, 0, 0, 0]));
     }
 }
