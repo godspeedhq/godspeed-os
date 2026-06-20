@@ -537,6 +537,27 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
+    // chaos kill-storm: the bounded resilience exerciser. Kill `registry` 5 times; the supervisor
+    // must respawn it each round (registry is auto-restarted). A pass proves: recovery held every
+    // round, AND the kernel never panicked (a panic reboots; reaching the verdict + the prompt
+    // proves it didn't). registry is the disk-free target, so this runs on the bare-metal build.
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"chaos kill-storm registry 5\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)) {
+        Some(r) => {
+            check!(r.contains("5/5 recovered"), "chaos: kill-storm registry — 5/5 recovered");
+            check!(r.contains("kernel alive"), "chaos: kill-storm — kernel alive (no panic)");
+        }
+        None => { println!("shell-test: FAIL — chaos kill-storm timed out (recovery stuck / panic?)"); fail += 2; }
+    }
+    // The shell is still responsive after the storm (registry recovered, the prompt works).
+    send(&mut write_half, b"cores\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains(&format!("cores: {smp}")), "chaos: shell still responsive after the storm"),
+        None    => { println!("shell-test: FAIL — shell unresponsive after chaos"); fail += 1; }
+    }
+
+    // -----------------------------------------------------------------------
     // Done.
     // -----------------------------------------------------------------------
     child.kill().ok();

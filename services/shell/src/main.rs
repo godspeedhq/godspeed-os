@@ -901,6 +901,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
             }
         }
         "reboot"  => cmd_reboot(ctx), // `-> !` coerces to the match arm's Result type
+        "chaos"   => cmd_chaos(ctx, &args, argc),
         "drives"  => cmd_drives(ctx, &args, argc),
         // ── file/storage commands — converted to the Result model ──
         // ("read" and "result" are on the Result model above, not here.)
@@ -1233,7 +1234,7 @@ const UTIL_VERSION: &str = "0.1.0";
 const UTILS: &[&str] = &[
     "help", "result", "run", "assert", "selfcheck",
     "echo", "clear", "about", "mem", "cores", "date", "status", "observe", "caps", "roster",
-    "spawn", "kill", "restart", "reboot", "drives", "ls", "cd", "read", "write", "edit", "fcap",
+    "spawn", "kill", "restart", "reboot", "chaos", "drives", "ls", "cd", "read", "write", "edit", "fcap",
     "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count", "sort",
     "first", "last",
     // record-pipe verbs (pipe-only stages; see docs/records.md)
@@ -1343,6 +1344,10 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         ], true),
         "reboot" => help_block(ctx, "reboot", "hardware reset", &[
             ("reboot", "reset the machine", "reboot"),
+        ], true),
+        "chaos" => help_block(ctx, "chaos", "bounded resilience exerciser — stress one invariant, report a verdict", &[
+            ("chaos kill-storm <svc> [rounds]", "kill a service N times; verify the supervisor restarts it each time", "chaos kill-storm registry 20"),
+            ("  <svc> = registry | block-driver | fs", "only the supervisor-auto-restarted services (others wouldn't recover)", "chaos kill-storm fs 10"),
         ], true),
         "drives" => help_block(ctx, "drives", "manage attached disks (records when piped)", &[
             ("drives", "list attached drive(s)", "drives"),
@@ -1566,6 +1571,7 @@ static HELP: &[HelpRow] = &[
     Gap,
     Sec("Power"),
     Row("reboot", "hardware reset"),
+    Row("chaos kill-storm <svc> [n]", "bounded resilience test: kill a service N times, verify it recovers"),
     Gap,
     Text("Type '<command> help' for usage + examples, '<command> version' for the version."),
 ];
@@ -2435,6 +2441,19 @@ fn slot_of(ctx: &ServiceContext, name: &str) -> Option<u32> {
     None
 }
 
+/// The restart generation of the live service named `name` (None if not running). A restart bumps
+/// the generation (§7.5), so a value strictly greater than a pre-kill reading proves a NEW instance
+/// came up — the recovery signal `chaos kill-storm` waits on.
+fn gen_of(ctx: &ServiceContext, name: &str) -> Option<u32> {
+    for slot in 0..256u32 {
+        let st = ctx.task_stat(slot);
+        if st.valid && st.state != 4 /* Dead */ && st.name_str() == name {
+            return Some(st.generation as u32);
+        }
+    }
+    None
+}
+
 /// `observe now` — broker a one-shot static metrics frame.
 ///
 /// `observe` is a least-authority service: it holds only INTROSPECT + log caps,
@@ -2914,6 +2933,90 @@ fn cmd_restart(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<()
         Ok(()) => { report(ctx, "restarted: ", name); Ok(()) }
         Err(_) => { report(ctx, "restart failed: ", name); Err(ShellError::Unknown) }
     }
+}
+
+// ── chaos — a BOUNDED resilience exerciser (not a generic firehose) ──────────────────────────────
+// Each mode stresses ONE named invariant through the shell's EXISTING capabilities (no new kernel
+// surface), runs a bounded number of rounds, and reports a loud verdict (§26.6). It never touches
+// the TCB (init/supervisor) — their death is a reboot, not graceful degradation, so there is nothing
+// to observe. v1 ships `kill-storm` (restartability); flooding/memory-pressure are future modes.
+
+/// Services the supervisor AUTO-restarts on unexpected death (its death-notification loop —
+/// services/supervisor). Only these recover from a bare `kill`, so only these make sense as a
+/// kill-storm target.
+const CHAOS_RESTARTABLE: [&str; 3] = ["registry", "block-driver", "fs"];
+const CHAOS_DEFAULT_ROUNDS: u32 = 20;
+const CHAOS_MAX_ROUNDS: u32 = 100;        // bounded (§26.6) — a deliberate cap, not a firehose
+const CHAOS_WAIT_YIELDS: u32 = 40_000;    // per-round recovery wait (safety bound; recovery is ~ms)
+
+fn cmd_chaos(ctx: &ServiceContext, args: &[&str], argc: usize) -> Result<(), ShellError> {
+    if argc < 2 {
+        ctx.console_writeln("usage: chaos kill-storm <service> [rounds]   (service: registry | block-driver | fs)");
+        return Err(ShellError::Unknown);
+    }
+    match args[1] {
+        "kill-storm" => chaos_kill_storm(ctx, args, argc),
+        other => {
+            ctx.console_writeln_fmt(format_args!(
+                "chaos: unknown mode '{}' (try: chaos kill-storm <service> [rounds])", other));
+            Err(ShellError::Unknown)
+        }
+    }
+}
+
+/// `chaos kill-storm <svc> [rounds]` — kill the service `rounds` times; each round, wait for the
+/// supervisor's death-notification loop to respawn it (a higher restart generation = a new
+/// instance) and count it recovered. Returns `Ok` only if every round recovered; the kernel never
+/// panicking is proven by the command *returning at all* (a panic reboots). Bounded + loud (§26.6),
+/// and capability-clean: only `kill` (SERVICE_CONTROL) + `task_stat` (INTROSPECT), both already held.
+#[inline(never)]
+fn chaos_kill_storm(ctx: &ServiceContext, args: &[&str], argc: usize) -> Result<(), ShellError> {
+    if argc < 3 {
+        ctx.console_writeln("usage: chaos kill-storm <service> [rounds]   (service: registry | block-driver | fs)");
+        return Err(ShellError::Unknown);
+    }
+    let svc = args[2];
+    if svc == "init" || svc == "supervisor" {
+        ctx.console_writeln("chaos: refusing the TCB — killing init/supervisor reboots the machine, which is not chaos to observe (§6.2).");
+        return Err(ShellError::Denied);
+    }
+    if !CHAOS_RESTARTABLE.contains(&svc) {
+        ctx.console_writeln_fmt(format_args!(
+            "chaos: '{}' is not auto-restarted on death — only registry/block-driver/fs are respawned by the supervisor, so others would not recover.", svc));
+        return Err(ShellError::Unknown);
+    }
+    let rounds = if argc >= 4 { parse_u32(args[3]).unwrap_or(CHAOS_DEFAULT_ROUNDS) } else { CHAOS_DEFAULT_ROUNDS };
+    let rounds = rounds.clamp(1, CHAOS_MAX_ROUNDS);
+    if slot_of(ctx, svc).is_none() {
+        ctx.console_writeln_fmt(format_args!("chaos: '{}' is not running", svc));
+        return Err(ShellError::Unknown);
+    }
+
+    ctx.console_writeln_fmt(format_args!(
+        "chaos kill-storm {}: {} rounds — kill, then wait for the supervisor to respawn it (higher generation)...",
+        svc, rounds));
+    let mut recovered = 0u32;
+    for r in 0..rounds {
+        let old_gen = gen_of(ctx, svc);     // generation of the live instance about to be killed
+        let _ = ctx.kill(svc);              // unexpected death → the supervisor's restart loop reacts
+        // Wait for a NEW instance: a generation strictly different from the one we killed (a respawn
+        // bumps it, §7.5). Yield so the supervisor — sharing core 0 — actually runs and respawns.
+        let mut ok = false;
+        for i in 0..CHAOS_WAIT_YIELDS {
+            ctx.yield_cpu();
+            if i % 32 == 0 {                // poll periodically (task_stat scan is not free)
+                if let Some(g) = gen_of(ctx, svc) {
+                    if old_gen.map_or(true, |o| g != o) { ok = true; break; }
+                }
+            }
+        }
+        if ok { recovered += 1; }
+        else { ctx.console_writeln_fmt(format_args!("  round {}: {} did NOT recover within the wait bound", r + 1, svc)); }
+    }
+    // Reaching here at all means the kernel did not panic (a panic reboots). Report the verdict.
+    ctx.console_writeln_fmt(format_args!(
+        "chaos kill-storm {}: {}/{} recovered, kernel alive (no panic)", svc, recovered, rounds));
+    if recovered == rounds { Ok(()) } else { Err(ShellError::Unknown) }
 }
 
 // ---------------------------------------------------------------------------
