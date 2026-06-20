@@ -73,10 +73,16 @@ pipe source iff its job is to *emit data*. That splits the command set three way
 - **Live / interactive → NOT sources.** The full-screen `observe` live view and `edit` own the
   screen and never yield a discrete stream; piping them is a loud refusal (use `observe now`).
 - **Orchestrators (`run` / `selfcheck`) → NOT sources.** They run the suite's *own* sub-pipelines,
-  so capturing one would nest a `pipe_run` (which holds a 64 KiB `Stream` on the stack) inside
-  another — two coexisting 64 KiB buffers overflow the tight user stack (HW-proven). They refuse
-  loudly as non-producers. To build a big file (e.g. to test `edit`'s windowing), append a *simple*
-  producer a few times: `help | write /big.txt` then `help | write append /big.txt` ×N.
+  so capturing one through a pipe would nest a `pipe_run` (which holds a 64 KiB `Stream` on the
+  stack) inside another — two coexisting 64 KiB buffers overflow the tight user stack (HW-proven).
+  They refuse loudly as non-producers. **To save an orchestrator's output, it writes its OWN file:**
+  `selfcheck save <path>` / `run <script> save <path>` streams the report straight to a file
+  (direct, no pipe — a small bounded buffer, not a nesting capture), then `read <path> | …` brings
+  it into the pipe world (`read` *is* a leaf producer). That is the right shape anyway: a report is
+  a **durable artifact** (keep it, re-read it, grep it, `edit` it), and a file decouples producing
+  it from consuming it — a pipe couples them in time and is for transient streams. (To build a big
+  file for `edit`'s windowing instead, append a *simple* producer a few times: `help | write
+  /big.txt` then `help | write append /big.txt` ×N.)
 
 ## The `write` sink — overwrite by default, append/prepend explicit
 

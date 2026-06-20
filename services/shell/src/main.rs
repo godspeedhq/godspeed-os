@@ -99,6 +99,12 @@ impl core::fmt::Write for Cap {
 enum Out<'a> {
     Console,
     Capture(&'a mut Cap),
+    /// A utility writing its OWN output to a file (`selfcheck save <path>`, `run … save <path>`).
+    /// Accumulates into a bounded report buffer that is written to the file in one streamed pass
+    /// when the run finishes — direct, NOT through the pipe, so an orchestrator (which runs its own
+    /// sub-pipelines) can save its output without the nested-capture stack overflow that piping it
+    /// causes. No heap; the bound is loud (§26.6).
+    File(&'a mut ReportBuf),
 }
 impl Out<'_> {
     /// Write a string, no trailing newline.
@@ -106,6 +112,7 @@ impl Out<'_> {
         match self {
             Out::Console => console_write_chunked(ctx, s.as_bytes()),
             Out::Capture(c) => c.push(s.as_bytes()),
+            Out::File(r) => r.push(s.as_bytes()),
         }
     }
     /// Write raw bytes, no trailing newline (file content may not be clean UTF-8).
@@ -113,6 +120,7 @@ impl Out<'_> {
         match self {
             Out::Console => console_write_chunked(ctx, b),
             Out::Capture(c) => c.push(b),
+            Out::File(r) => r.push(b),
         }
     }
     /// Write a string followed by a newline.
@@ -125,8 +133,38 @@ impl Out<'_> {
         match self {
             Out::Console => ctx.console_writeln_fmt(args),
             Out::Capture(c) => { let _ = core::fmt::write(c, args); c.push(b"\n"); }
+            Out::File(r) => { let _ = core::fmt::write(r, args); r.push(b"\n"); }
         }
     }
+}
+
+/// A bounded accumulator for a utility's saved report (`selfcheck save <path>`). Fixed stack array,
+/// no heap; a report exceeding `REPORT_MAX` sets `overflow` (loud, never a silent truncation —
+/// §26.6/§3.12). The size is a deliberate balance: big enough for the self-check transcript
+/// (~12 KiB), but small enough that it + a sub-pipeline's transient buffers (a `| assert` is ~128
+/// KiB) fit the 256 KiB user stack. That ceiling is the BINDING constraint — 32 KiB overflowed the
+/// stack on a `run … save` whose suite has `| assert` lines, 16 KiB fits (QEMU/HW-proven; frames are
+/// identical on both). It is the whole reason this is a direct file write, not a (nesting) pipe
+/// capture. A truly large report would want a streaming sink (append per chunk); not needed yet.
+const REPORT_MAX: usize = 16 * 1024;
+struct ReportBuf {
+    buf: [u8; REPORT_MAX],
+    len: usize,
+    overflow: bool,
+}
+impl ReportBuf {
+    fn new() -> Self { ReportBuf { buf: [0u8; REPORT_MAX], len: 0, overflow: false } }
+    fn push(&mut self, b: &[u8]) {
+        let space = REPORT_MAX - self.len;
+        let n = b.len().min(space);
+        self.buf[self.len..self.len + n].copy_from_slice(&b[..n]);
+        self.len += n;
+        if n < b.len() { self.overflow = true; }
+    }
+    fn bytes(&self) -> &[u8] { &self.buf[..self.len] }
+}
+impl core::fmt::Write for ReportBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result { self.push(s.as_bytes()); Ok(()) }
 }
 
 // Entry point called by the kernel after spawning this service.
@@ -671,14 +709,17 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
                 return Err(ShellError::Unknown);
             }
             return if argc < 2 {
-                ctx.console_writeln("usage: run <path>");
+                ctx.console_writeln("usage: run <path> [save <path>]");
                 Err(ShellError::Unknown)
             } else {
-                cmd_run(ctx, cwd, args[1], depth)
+                // Optional `save <path>` streams the run REPORT to a file (the utility writes its
+                // own file — direct, not a pipe; see cmd_selfcheck / docs/pipes.md).
+                let save = if argc >= 4 && args[2] == "save" { Some(args[3]) } else { None };
+                cmd_run(ctx, cwd, args[1], depth, save)
             };
         }
-        // `selfcheck` — write the embedded suite to the GSFS drive and run it (one-USB checkpoint).
-        "selfcheck" => return cmd_selfcheck(ctx, cwd, depth),
+        // `selfcheck [save <path>]` — run the embedded suite; `save` streams its report to a file.
+        "selfcheck" => return cmd_selfcheck(ctx, cwd, depth, s["selfcheck".len()..].trim()),
         _ => {}
     }
 
@@ -805,7 +846,7 @@ fn trim_bytes(b: &[u8]) -> &[u8] {
 /// the script buffer off the hot pipe frame, and the `fs` reply is dropped before any command
 /// runs — both bound the user stack (see the pipe stack-overflow lesson).
 #[inline(never)]
-fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8) -> Result<(), ShellError> {
+fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8, save: Option<&str>) -> Result<(), ShellError> {
     let mut pbuf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut pbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     // Read the whole script into a fixed buffer, then drop the fs reply before executing anything.
@@ -832,7 +873,7 @@ fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8) -> Result<
         script[..take].copy_from_slice(&body[..take]);
         slen = take;
     }
-    run_lines(ctx, cwd, &script[..slen], depth)
+    run_with_optional_save(ctx, cwd, &script[..slen], depth, save)
 }
 
 /// Execute a script body (already in memory): split into commands, run each, then print a
@@ -841,11 +882,15 @@ fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8) -> Result<
 /// so it is **not** bound by `MAX_FILE_BYTES`/the single-message file transfer, only by the
 /// embedded const). `#[inline(never)]`: holds the verdict array and drives `execute` in a loop
 /// (the user stack is tight — see the pipe stack-overflow lesson).
-/// Writes its report to the console. NOTE: `run`/`selfcheck` are deliberately NOT pipe producers —
-/// an orchestrator runs the suite's own sub-pipelines, and capturing it would nest a 64 KiB pipe
-/// `Stream` inside another and overflow the user stack (HW-proven, [[project-shell-stack-pipe]]).
+/// The report (the `> <cmd>` echoes, the summary, the tally) goes to `out` — `Out::Console` for a
+/// normal run, or `Out::File(&mut ReportBuf)` for `selfcheck/run … save <path>`, where the utility
+/// writes its OWN file. Each sub-command's own output still goes to the console (it is produced
+/// inside `execute`). The `save` path is a DIRECT file write, NOT a pipe: `run`/`selfcheck` stay
+/// non-producers (capturing one through a pipe nests a 64 KiB `Stream` and overflows the stack,
+/// HW-proven — [[project-shell-stack-pipe]]). The `ReportBuf` is a modest bounded buffer, so it +
+/// a sub-pipeline's transient buffers fit the user stack — the whole point of saving directly.
 #[inline(never)]
-fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8) -> Result<(), ShellError> {
+fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out) -> Result<(), ShellError> {
     let mut ran = 0u32;
     let mut failed = 0u32;
     let mut last: Result<(), ShellError> = Ok(());
@@ -860,8 +905,8 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8) -> Resu
             let cmd = trim_bytes(cmd);
             if cmd.is_empty() { continue; }
             // Echo the command so the transcript shows what produced each result.
-            ctx.console_write("> ");
-            ctx.console_writeln(str_of(cmd));
+            out.put(ctx, "> ");
+            out.line(ctx, str_of(cmd));
             last = execute(ctx, cmd, cwd, last, depth + 1);
             if vi < RUN_MAX_CMDS { verdict[vi] = last.is_ok(); }
             vi += 1;
@@ -871,7 +916,7 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8) -> Resu
     }
     // End-of-run summary: PASS/FAIL per command (re-split identically, pairing with `verdict`).
     // "FAIL  " is deliberately not the word "FAILED" the harness greens on absence of.
-    ctx.console_writeln("--- summary ---");
+    out.line(ctx, "--- summary ---");
     let mut j = 0usize;
     for line in src.split(|&b| b == b'\n') {
         let line = trim_bytes(line);
@@ -879,13 +924,76 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8) -> Resu
         for cmd in line.split(|&b| b == b';') {
             let cmd = trim_bytes(cmd);
             if cmd.is_empty() { continue; }
-            ctx.console_write(if j < RUN_MAX_CMDS && !verdict[j] { "FAIL  " } else { "PASS  " });
-            ctx.console_writeln(str_of(cmd));
+            out.put(ctx, if j < RUN_MAX_CMDS && !verdict[j] { "FAIL  " } else { "PASS  " });
+            out.line(ctx, str_of(cmd));
             j += 1;
         }
     }
-    ctx.console_writeln_fmt(format_args!("run: ran {}, failed {}", ran, failed));
+    out.line_fmt(ctx, format_args!("run: ran {}, failed {}", ran, failed));
     if failed == 0 { Ok(()) } else { Err(ShellError::Unknown) }
+}
+
+/// Run `src` and, if `save` is `Some`, stream the report to that file (the utility writes its own
+/// file — direct, not a pipe). Bare → report to the console. Shared by `run`/`selfcheck`. This
+/// dispatcher is tiny on purpose: the 32 KiB `ReportBuf` lives ONLY in `run_and_save`, called only
+/// on the save path — so a bare run/selfcheck does NOT carry 32 KiB of unused frame (which would
+/// tip its already-heavy `| assert` sub-pipelines over the user-stack ceiling).
+fn run_with_optional_save(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, save: Option<&str>)
+    -> Result<(), ShellError>
+{
+    match save {
+        None => run_lines(ctx, cwd, src, depth, &mut Out::Console),
+        Some(spath) => run_and_save(ctx, cwd, src, depth, spath),
+    }
+}
+
+/// The save path: accumulate the run report into a bounded `ReportBuf` and write it to `spath`
+/// (direct file write, no pipe). `#[inline(never)]` so the 32 KiB buffer exists only while a save
+/// is actually running, not in the frame of every bare run.
+#[inline(never)]
+fn run_and_save(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, spath: &str)
+    -> Result<(), ShellError>
+{
+    let mut pbuf = [0u8; PATH_MAX];
+    let path = match resolve_or_err(ctx, cwd, spath, &mut pbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
+    let mut ppath = [0u8; PATH_MAX];
+    let pl = path.len();
+    ppath[..pl].copy_from_slice(path);
+    let path = &ppath[..pl];
+
+    let mut rb = ReportBuf::new();
+    let result = {
+        let mut out = Out::File(&mut rb);
+        run_lines(ctx, cwd, src, depth, &mut out)
+    }; // `out` (the &mut rb borrow) ends here, so `rb` is readable below
+    if rb.overflow {
+        ctx.console_writeln_fmt(format_args!(
+            "save: report exceeded {} KiB — saved truncated to {}", REPORT_MAX / 1024, str_of(path)));
+    }
+    if !save_report(ctx, path, rb.bytes()) {
+        ctx.console_writeln_fmt(format_args!("save: could not write {} (storage, or bad path?)", str_of(path)));
+        return Err(ShellError::Unknown);
+    }
+    ctx.console_writeln_fmt(format_args!("saved report ({} bytes) to {}", rb.bytes().len(), str_of(path)));
+    result
+}
+
+/// Write a report buffer to `path`, streaming to a multi-block file (the report exceeds one
+/// message). Quiet (the caller prints the human message); returns success. Reuses the same
+/// `WriteFile` / `WriteNew`+`WriteAt` shape as the pipe `write` sink, with no intermediate copy.
+fn save_report(ctx: &ServiceContext, path: &[u8], data: &[u8]) -> bool {
+    if data.len() <= IO_CHUNK {
+        return matches!(fs_request(ctx, OP_WRITE_FILE, path, data)
+            .as_ref().map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK)));
+    }
+    if !fs_write_new(ctx, path, data.len() as u64) { return false; }
+    let mut off = 0usize;
+    while off < data.len() {
+        let end = (off + IO_CHUNK).min(data.len());
+        if !fs_write_at(ctx, path, off as u64, &data[off..end]) { return false; }
+        off = end;
+    }
+    true
 }
 
 /// Cap on per-command summary lines `run` records (the verdict array). Commands past this still
@@ -903,15 +1011,28 @@ const SELFCHECK_GS: &str = include_str!("../../../scripts/selfcheck.gsh");
 /// tests have somewhere to write), then `selfcheck`. Re-runnable (the suite creates and deletes
 /// its own files). Refused inside a script (it runs one — no nesting).
 #[inline(never)]
-fn cmd_selfcheck(ctx: &ServiceContext, cwd: &mut Cwd, depth: u8) -> Result<(), ShellError> {
+fn cmd_selfcheck(ctx: &ServiceContext, cwd: &mut Cwd, depth: u8, arg: &str) -> Result<(), ShellError> {
     if depth > 0 {
         ctx.console_writeln("selfcheck: not available inside a script (it runs one)");
         return Err(ShellError::Unknown);
     }
+    // Optional `save <path>`: stream the run REPORT to a file (the utility writes its own file —
+    // direct, not a pipe, so the orchestrator can save without the nested-capture stack overflow).
+    let save = if arg.is_empty() {
+        None
+    } else {
+        match arg.strip_prefix("save") {
+            Some(r) if r.starts_with(char::is_whitespace) && !r.trim().is_empty() => Some(r.trim()),
+            _ => {
+                ctx.console_writeln("usage: selfcheck [save <path>]");
+                return Err(ShellError::Unknown);
+            }
+        }
+    };
     ctx.console_writeln_fmt(format_args!(
         "selfcheck: running the embedded suite ({} bytes, in memory) — needs a flashed drive for the file tests...",
         SELFCHECK_GS.len()));
-    run_lines(ctx, cwd, SELFCHECK_GS.as_bytes(), depth)
+    run_with_optional_save(ctx, cwd, SELFCHECK_GS.as_bytes(), depth, save)
 }
 
 /// `assert ok <cmd>` / `assert fails <cmd>` — the **result** form: run `<cmd>` and check that it
@@ -1016,10 +1137,12 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         ], true),
         "run" => help_block(ctx, "run", "run a script of commands from a file", &[
             ("run <path>", "execute each line/command as if typed; reports ran N, failed M", "run /suite.gsh"),
+            ("run <path> save <out>", "also write the run report to a file (the utility owns the file)", "run /suite.gsh save /report.txt"),
             ("# … (in the file)", "lines starting with # are comments; ';' separates commands", "run /test.gsh"),
         ], true),
         "selfcheck" => help_block(ctx, "selfcheck", "run the built-in self-check suite (needs a flashed drive)", &[
             ("selfcheck", "run the embedded suite in memory; reports ran N, failed M", "selfcheck"),
+            ("selfcheck save <out>", "run it and write the report to a file (then read/edit/grep it)", "selfcheck save /report.txt"),
         ], true),
         "roster" => help_block(ctx, "roster", "example record-producing service (a typed table you can pipe)", &[
             ("roster", "render the table directly (name / role / core)", "roster"),
@@ -1247,8 +1370,8 @@ static HELP: &[HelpRow] = &[
     Row("clear", "clear the screen"),
     Row("echo <text>", "print text"),
     Row("result", "the last command's result (Ok / Err)"),
-    Row("run <script>", "run a script of commands (.gsh; # comments, ; separators)"),
-    Row("selfcheck", "run the built-in self-check suite"),
+    Row("run <script> [save <out>]", "run a script (.gsh); `save` writes the report to a file"),
+    Row("selfcheck [save <out>]", "run the built-in self-check suite; `save` writes the report"),
     Row("fcap", "file-as-capability self-check (diagnostic; fcap help)"),
     Row("assert ok|fails <cmd>", "verify success/failure (also: … | assert contains X)"),
     Gap,

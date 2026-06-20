@@ -2233,6 +2233,29 @@ pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u3
         None => { println!("script-test: FAIL — `run /{script_name}` timed out"); fail += 1; }
     }
 
+    // `run … save <path>` — the orchestrator writes its OWN report to a file (direct, NOT a pipe),
+    // so it can save while running its own inner pipelines (incl. `… | assert`, the heavy case)
+    // WITHOUT the nested-capture stack overflow that `<orchestrator> | write` causes. Proves: no
+    // crash/refusal, and the report file holds the tally.
+    send(&mut write_half, format!("run /{script_name} save /report.txt\r").as_bytes());
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)) {
+        Some(r) => if r.contains("saved report") && !r.contains("cannot start a pipe") && !r.contains("PUSER") {
+            println!("script-test: PASS — run save: orchestrator wrote its report file (no crash)"); pass += 1;
+        } else {
+            println!("script-test: FAIL — run save did not write the report (refused/crashed?)"); fail += 1;
+        },
+        None    => { println!("script-test: FAIL — `run … save` timed out (stack overflow?)"); fail += 1; }
+    }
+    send(&mut write_half, b"read /report.txt\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)) {
+        Some(r) => if r.contains("ran ") && r.contains("failed 0") {
+            println!("script-test: PASS — run save: report file holds the tally (ran N, failed 0)"); pass += 1;
+        } else {
+            println!("script-test: FAIL — report file missing the tally"); fail += 1;
+        },
+        None    => { println!("script-test: FAIL — read /report.txt timed out"); fail += 1; }
+    }
+
     // Embed-and-autoprovision: `selfcheck` runs the shell-embedded extensive suite IN MEMORY
     // (no host bake) — the one-USB hardware path where the operator flashes only os.img,
     // `drives flash`es the SSD, then types `selfcheck`. The big suite + many service spawns
