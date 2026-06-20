@@ -204,6 +204,12 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     let boot_info = unsafe { &*boot_info_ptr };
 
     arch::x86_64::init(boot_info);
+
+    // Record the boot wall-clock time (RTC is raw port I/O — available immediately). `uptime`
+    // reads it via InspectKernel query 12 and reports now − boot. Captured here, as early as
+    // possible, so uptime measures from true boot rather than first query.
+    arch::x86_64::rtc::capture_boot_time();
+
     memory::init(boot_info);
 
     // Hardening: unmap a guard page below each kernel-stack slot so an overflow

@@ -876,6 +876,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         "mem"     => cmd_mem(ctx, &mut Out::Console),
         "cores"   => cmd_cores(ctx, &mut Out::Console),
         "date"    => cmd_date(ctx, if argc >= 2 { args[1] } else { "" }, &mut Out::Console),
+        "uptime"  => cmd_uptime(ctx),
         "status"  => cmd_status(ctx),
         "observe" => if argc >= 2 && args[1] == "now" { cmd_observe_now(ctx) } else { cmd_observe_live(ctx) },
         // The example record SERVICE, callable bare (renders its table) as well as piped.
@@ -1233,7 +1234,7 @@ const UTIL_VERSION: &str = "0.1.0";
 /// Utilities that self-document (gates the `help`/`version` intercept in `execute`).
 const UTILS: &[&str] = &[
     "help", "result", "run", "assert", "selfcheck",
-    "echo", "clear", "about", "mem", "cores", "date", "status", "observe", "caps", "roster",
+    "echo", "clear", "about", "mem", "cores", "date", "uptime", "status", "observe", "caps", "roster",
     "spawn", "kill", "restart", "reboot", "chaos", "drives", "ls", "cd", "read", "write", "edit", "fcap",
     "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count", "sort",
     "first", "last",
@@ -1318,6 +1319,11 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "date" => help_block(ctx, "date", "date + time from the hardware clock", &[
             ("date", "full timestamp (weekday date time)", "date"),
             ("date epoch", "seconds since 1970-01-01", "date epoch"),
+        ], true),
+        "uptime" => help_block(ctx, "uptime", "how long the system has been up", &[
+            ("uptime", "uptime (Nd HH:MM:SS) + seconds since boot", "uptime"),
+            ("uptime | to json|yaml", "piped: a record with 'uptime' + 'seconds'", "uptime | to yaml"),
+            ("uptime | select seconds", "piped: just the total seconds", "uptime | select seconds"),
         ], true),
         "status" => help_block(ctx, "status", "list all live tasks", &[
             ("status", "slot, name, core, state of every task", "status"),
@@ -1529,6 +1535,7 @@ static HELP: &[HelpRow] = &[
     Row("cores", "CPU core count"),
     Row("mem", "physical memory usage"),
     Row("date [epoch]", "date + time; 'epoch' = secs since 1970"),
+    Row("uptime", "how long the system has been up (records when piped)"),
     Gap,
     Sec("Services"),
     Row("status", "list all live tasks"),
@@ -1829,6 +1836,32 @@ fn build_status_table(ctx: &ServiceContext) -> Table {
     t
 }
 
+/// `uptime` as a record producer: one row, columns `uptime` (human `Nd HH:MM:SS`) and `seconds`
+/// (total seconds since boot). Bare `uptime` renders the grid; `uptime | to json|yaml` renders the
+/// row; `uptime | select seconds` etc. work like any record stream. The clock is a wall-clock RTC
+/// delta (now − boot, InspectKernel queries 11/12), so it's correct on any APIC timer mode.
+fn build_uptime_table(ctx: &ServiceContext) -> Table {
+    let secs = ctx.uptime_secs() as u64;
+    let (d, h, m, s) = (secs / 86_400, (secs % 86_400) / 3_600, (secs % 3_600) / 60, secs % 60);
+    let mut buf = [0u8; 32];
+    let mut w = BarW { b: &mut buf, n: 0 };
+    let _ = core::fmt::write(&mut w, format_args!("{}d {:02}:{:02}:{:02}", d, h, m, s));
+    let n = w.n;
+    let mut t = Table::new(&["uptime", "seconds"]);
+    let human = t.intern(&buf[..n]);
+    t.add_row(&[human, Value::Int(secs)]);
+    t
+}
+
+/// `uptime` — how long the system has been up. Bare renders the one-row grid; pipeable as records
+/// (`uptime | to json|yaml`). See `build_uptime_table` / `utilities/37_uptime.md`.
+fn cmd_uptime(ctx: &ServiceContext) -> Result<(), ShellError> {
+    let t = build_uptime_table(ctx);
+    let mut o = Out::Console;
+    t.to_grid(&mut OutSink { ctx, out: &mut o });
+    Ok(())
+}
+
 /// `observe now` as a record producer: the task roster plus the metric `status` omits — `ticks`,
 /// each task's cumulative `run_ticks` (timer ticks it has spent running since boot). That column
 /// is what distinguishes `observe` (how busy) from `status` (who's alive): `observe now | sort
@@ -1867,7 +1900,7 @@ fn build_observe_table(ctx: &ServiceContext, arg: &str) -> Option<Table> {
 /// roster), `ls` (dir listing), `caps` (held capabilities), `drives` (attached disks), `find`
 /// (search hits) are shell-side, so no wire codec is needed — they pass by value like `status`.
 fn is_record_producer(name: &str) -> bool {
-    matches!(name, "status" | "ls" | "caps" | "drives" | "find" | "observe")
+    matches!(name, "status" | "ls" | "caps" | "drives" | "find" | "observe" | "uptime")
 }
 
 /// `ls` as a record producer: directory entries as a table (`name` / `type` / `size`). Mirrors
@@ -2099,6 +2132,7 @@ fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str) -> Result<(), ShellErro
             "drives"  => match build_drives_table(ctx)          { Some(t) => t, None => return Err(ShellError::Unknown) },
             "find"    => match build_find_table(ctx, cwd, arg)  { Some(t) => t, None => return Err(ShellError::Unknown) },
             "observe" => match build_observe_table(ctx, arg)    { Some(t) => t, None => return Err(ShellError::Unknown) },
+            "uptime"  => build_uptime_table(ctx),
             _         => build_status_table(ctx),
         };
         // Loud on the record bound (§3.12/§26.6): a producer that overran rows/arena is reported,
