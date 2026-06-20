@@ -20,8 +20,69 @@
 
 use godspeed_sdk::ServiceContext;
 
+// ───────────────────────────────────────────────────────────────────────────────
+// Phase 1 of moving naming out of the kernel (docs/naming-design.md).
+//
+// As the supervisor spawns the real services it records, in a bounded no-heap map, the
+// SEND|GRANT endpoint cap the kernel hands back from `spawn_returning_endpoint` (syscall 38,
+// Phase 0a). This proves the supervisor can hold a cap to everything it starts — the future
+// name authority. It is a SHADOW map for now: nothing reads it to wire dependents yet (that is
+// Phase 0b/3). Scoped to the real services; the 178 test probes are test infra (out of scope)
+// and keep using plain `ctx.spawn`.
+// ───────────────────────────────────────────────────────────────────────────────
+const NAME_MAP_MAX:      usize = 16;  // bounded (§26.6) — real services, not the test probes
+const NAME_MAP_NAME_MAX: usize = 16;
+
+struct NameCapMap {
+    names: [[u8; NAME_MAP_NAME_MAX]; NAME_MAP_MAX],
+    lens:  [u8; NAME_MAP_MAX],
+    caps:  [u32; NAME_MAP_MAX],       // endpoint cap slot; u32::MAX = empty
+    count: usize,
+}
+impl NameCapMap {
+    const fn new() -> Self {
+        NameCapMap {
+            names: [[0u8; NAME_MAP_NAME_MAX]; NAME_MAP_MAX],
+            lens:  [0u8; NAME_MAP_MAX],
+            caps:  [u32::MAX; NAME_MAP_MAX],
+            count: 0,
+        }
+    }
+    /// Record `name → cap_slot`. Returns false (loud, §26.6 — never a silent drop) if the map is
+    /// full or the name doesn't fit.
+    fn record(&mut self, name: &str, cap_slot: u32) -> bool {
+        let nb = name.as_bytes();
+        if self.count >= NAME_MAP_MAX || nb.len() > NAME_MAP_NAME_MAX { return false; }
+        let i = self.count;
+        self.names[i][..nb.len()].copy_from_slice(nb);
+        self.lens[i]  = nb.len() as u8;
+        self.caps[i]  = cap_slot;
+        self.count   += 1;
+        true
+    }
+}
+
+/// Spawn `name` on `core` (0xFFFF = round-robin) AND record its endpoint cap in `map` (Phase 1).
+/// The spawn itself is identical to `ctx.spawn` — the new syscall just also hands back a cap.
+fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u32) {
+    match ctx.spawn_returning_endpoint(name, core) {
+        Some(cap) => {
+            if map.record(name, cap.0) {
+                ctx.log_fmt(format_args!("supervisor: name-map + {} (endpoint cap slot {})", name, cap.0));
+            } else {
+                ctx.log_fmt(format_args!("supervisor: name-map FULL — dropped {}", name));
+            }
+        }
+        None => ctx.log_fmt(format_args!("supervisor: spawn {} returned no endpoint cap", name)),
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
+    // Phase 1 shadow map (docs/naming-design.md): name → endpoint cap, built as we spawn the
+    // real services below. Not yet read to wire anything — proving the supervisor can hold it.
+    #[allow(unused_mut)]
+    let mut name_map = NameCapMap::new();
     // Spawn pong and ping first so IPC between them is established well before
     // probe services compete for scheduler quanta.  Pong must precede ping:
     // ping's SEND cap to pong is wired by the kernel at spawn time.
@@ -106,8 +167,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // up and idle gracefully (block-driver: "no controller"; fs: raw-tolerant).
     #[cfg(any(feature = "bare-metal", feature = "blockdev"))]
     {
-        let _ = ctx.spawn("block-driver");
-        let _ = ctx.spawn("fs");
+        spawn_mapped(&ctx, &mut name_map, "block-driver", 0xFFFF);
+        spawn_mapped(&ctx, &mut name_map, "fs", 0xFFFF);
     }
 
     // shell: the interactive prompt. Spawned in bare-metal (the USB image rests
@@ -116,7 +177,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
-    let _ = ctx.spawn("shell");
+    spawn_mapped(&ctx, &mut name_map, "shell", 0xFFFF);
 
     // xhci: USB host-controller driver (§12). Spawned in bare-metal + full
     // builds; the kernel maps its controller's MMIO BAR at spawn (Stage 2).
@@ -124,7 +185,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
-    let _ = ctx.spawn("xhci");
+    spawn_mapped(&ctx, &mut name_map, "xhci", 0xFFFF);
 
     // ehci: USB 2.0 host-controller driver (§12) for the back ports. Same builds
     // as xhci; the kernel grants its MMIO/DMA at spawn (E1b+).
@@ -132,7 +193,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
-    let _ = ctx.spawn("ehci");
+    spawn_mapped(&ctx, &mut name_map, "ehci", 0xFFFF);
+
+    // Phase 1 (docs/naming-design.md): report the shadow name→cap map. Proves the supervisor now
+    // holds an endpoint cap to every real service it spawned — the future name authority. Nothing
+    // reads it yet (Phase 0b/3 wire dependents from it; Phase 4 brokers reacquisition through it).
+    ctx.log_fmt(format_args!("supervisor: name-cap map holds {} service(s)", name_map.count));
 
     ctx.log("supervisor: ready");
 

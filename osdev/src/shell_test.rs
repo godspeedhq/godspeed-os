@@ -106,6 +106,14 @@ pub fn run(image_path: &Path, smp: u32) {
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)) {
         Some(boot_out) => {
             check!(boot_out.contains("shell: ready"), "boot: shell ready message");
+            // Phase 1 of moving naming out of the kernel (docs/naming-design.md): the supervisor
+            // builds a shadow name→cap map as it spawns the real services, recording the endpoint
+            // cap the new SpawnReturningEndpoint syscall hands back. Bare-metal spawns 5 real
+            // services (block-driver, fs, shell, xhci, ehci) — the map must hold them.
+            check!(boot_out.contains("name-cap map holds 5 service(s)"),
+                   "naming Phase 1: supervisor holds an endpoint cap for every real service");
+            check!(boot_out.contains("name-map + fs") && boot_out.contains("name-map + shell"),
+                   "naming Phase 1: fs and shell recorded in the supervisor's name-cap map");
         }
         None => {
             // Print what we did receive to help diagnose failures.
