@@ -2444,6 +2444,42 @@ If a subsystem cannot explain:
 
 then the subsystem is incomplete.
 
+### 26.6.1 Bounded memory means stack and arenas, not heap (settled direction)
+
+The **default** mechanism for bounded memory is **no heap**. State lives in fixed stack arrays,
+in bounded reusable arenas (a fixed region + a bump pointer, reset between operations), or in
+immutable rodata — never behind a general allocator. The heap reflex is resisted by default.
+
+This is not asceticism; it is how the bound stays *visible*. A fixed footprint can be read off
+the source — the maximum a subsystem can use is right there. There is no allocator in the trusted
+base to fragment, to fail *in the middle* of an operation, or to turn memory use into a runtime
+mystery. And overflow fails the GodspeedOS way: loud, into a guard page, killing one service —
+never a silent slide into thrashing. A heap erases each of those properties, which is why it is
+the exception (declared, scoped) and not the default.
+
+When a working set feels too big for the stack, the move is **not** to reach for a heap — it is to
+**change the representation so the working set is small**:
+
+- **stream in fixed chunks** instead of buffering the whole thing (the `edit` piece table holds
+  one window of an arbitrarily large file, never the file; `read`/`write`/`copy` stream in
+  `IO_CHUNK` pieces);
+- **refer to data by `(offset, len)` spans** instead of copying it (piece spans; interned string
+  ids in the records `Table`);
+- **give a subsystem its own named, bounded arena** instead of a shared allocator (the records
+  arena), reset between uses;
+- **iterate with an explicit bounded stack** instead of call-stack recursion (`tree`'s walk).
+
+A hard ceiling reached *loudly* is therefore a **feature**, not a missing heap: it says "rethink
+the working set." (The `selfcheck | write` stack overflow was exactly this lesson — the fix was to
+forbid the unbounded nesting, not to add a heap.)
+
+This is **simplicity** as much as fault tolerance (§2.3). The bounded representation is usually
+*also the clearer one*, because the constraint forces you to name the working set instead of
+hand-waving it onto a heap. Per §26.13 the bar is **simple-and-bounded, not clever-and-cramped**:
+a stack-only design that is *harder to read* than a heap one is a regression, not a win. The goal
+is the right data shape — a piece table, a ring buffer, an arena — over which boring code is
+small by construction.
+
 ---
 
 ## 26.7 Loud Failure Over Hidden Recovery
