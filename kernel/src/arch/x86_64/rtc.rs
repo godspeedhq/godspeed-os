@@ -14,8 +14,28 @@
 //! device). Userspace reads it via `InspectKernel` query 11, ungated, because
 //! the time of day is task-neutral hardware info (like the TSC clock).
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 const CMOS_INDEX: u16 = 0x70;
 const CMOS_DATA: u16 = 0x71;
+
+/// The packed wall-clock datetime captured once at boot (see `read_datetime` for the layout).
+/// 0 until `capture_boot_time` runs. `uptime` reads it via InspectKernel query 12 and subtracts
+/// it from the current time — a wall-clock delta, portable across APIC timer modes (a tick
+/// counter's rate is not).
+static BOOT_DATETIME: AtomicU64 = AtomicU64::new(0);
+
+/// Record the current RTC time as the system's boot time. Called once early in `kernel_main`.
+/// Idempotent — only the first capture sticks (a 0 reading, i.e. no RTC, leaves uptime at 0).
+pub fn capture_boot_time() {
+    let now = read_datetime();
+    let _ = BOOT_DATETIME.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
+}
+
+/// The packed boot datetime (0 if not yet captured). Exposed via InspectKernel query 12.
+pub fn boot_datetime() -> u64 {
+    BOOT_DATETIME.load(Ordering::Relaxed)
+}
 
 /// Read one CMOS register.
 fn cmos_read(reg: u8) -> u8 {

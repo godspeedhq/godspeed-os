@@ -204,6 +204,41 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(r) => check!(r.contains("- slot:") && r.contains("name: shell"), "status | to yaml: YAML mapping list"),
         None    => { println!("shell-test: FAIL — status|to yaml timeout"); fail += 1; }
     }
+    // uptime — record producer: bare grid, JSON/YAML rendering, version/help.
+    send(&mut write_half, b"uptime\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        // Headers present AND a sane value: within the first hour of this short test boot it must
+        // read "0d 00:MM:SS". If boot-time capture had failed (boot=0), now−boot would be ~19000
+        // days since 1970 — so "0d 00:" also proves the RTC-delta wall clock is wired correctly.
+        Some(r) => check!(r.contains("uptime") && r.contains("seconds") && r.contains("0d 00:"),
+                          "uptime: one-row grid (uptime + seconds), sane wall-clock value"),
+        None    => { println!("shell-test: FAIL — uptime timeout"); fail += 1; }
+    }
+    send(&mut write_half, b"uptime | to json\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("\"uptime\":") && r.contains("\"seconds\":"), "uptime | to json: record with uptime + seconds"),
+        None    => { println!("shell-test: FAIL — uptime|to json timeout"); fail += 1; }
+    }
+    send(&mut write_half, b"uptime | to yaml\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("seconds:") && r.contains("uptime:"), "uptime | to yaml: YAML mapping"),
+        None    => { println!("shell-test: FAIL — uptime|to yaml timeout"); fail += 1; }
+    }
+    send(&mut write_half, b"uptime | select seconds | to json\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("\"seconds\":") && !r.contains("\"uptime\":"), "uptime | select seconds: projects the column"),
+        None    => { println!("shell-test: FAIL — uptime|select timeout"); fail += 1; }
+    }
+    send(&mut write_half, b"uptime version\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("uptime 0.1.0"), "uptime version: number"),
+        None    => { println!("shell-test: FAIL — uptime version timeout"); fail += 1; }
+    }
+    send(&mut write_half, b"uptime help\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("uptime") && r.contains("seconds since boot"), "uptime help: header + example"),
+        None    => { println!("shell-test: FAIL — uptime help timeout"); fail += 1; }
+    }
     // sort by a column (just exercise the path; ordering of the full table is host-dependent).
     send(&mut write_half, b"status | sort name | to json\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {

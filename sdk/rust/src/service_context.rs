@@ -647,6 +647,23 @@ impl ServiceContext {
         if ret < 0 { 0 } else { ret as u64 }
     }
 
+    /// The wall-clock datetime captured by the kernel at **boot** (InspectKernel query 12, ungated).
+    /// Same packed layout as `datetime`. Pairs with `datetime` to compute uptime as a wall-clock
+    /// delta — portable across timer modes (a tick counter's rate is not: periodic-mode QEMU ticks
+    /// at ~10 Hz, TSC-deadline HW at 100 Hz). Returns the epoch (all-zero fields) if not captured.
+    pub fn boot_datetime(&self) -> Datetime {
+        // SAFETY: syscall(13) = InspectKernel; query_id=12 = packed boot datetime.
+        let p = unsafe { raw_syscall(13, 12, 0, 0) } as u64;
+        Self::unpack_datetime(p)
+    }
+
+    /// System uptime in **seconds** = now − boot, both from the hardware RTC. Never negative
+    /// (saturates at 0). The `uptime` shell command renders this. Wall-clock based, so it is
+    /// correct regardless of the APIC timer mode (unlike a raw tick counter).
+    pub fn uptime_secs(&self) -> i64 {
+        (self.datetime().epoch_secs() - self.boot_datetime().epoch_secs()).max(0)
+    }
+
     /// Timer ticks the given core spent running a user task (not idle) since boot.
     ///
     /// Wraps InspectKernel query 6 (arg1 = core index).
@@ -726,6 +743,11 @@ impl ServiceContext {
     pub fn datetime(&self) -> Datetime {
         // SAFETY: syscall(13) = InspectKernel; query_id=11 = packed RTC datetime.
         let p = unsafe { raw_syscall(13, 11, 0, 0) } as u64;
+        Self::unpack_datetime(p)
+    }
+
+    /// Decode the packed RTC `u64` (the layout shared by query 11 / 12) into a `Datetime`.
+    fn unpack_datetime(p: u64) -> Datetime {
         Datetime {
             second: (p & 0x3F) as u8,
             minute: ((p >> 6) & 0x3F) as u8,
