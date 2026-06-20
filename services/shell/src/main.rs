@@ -1290,9 +1290,9 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("selfcheck save <out>", "run it and write the report to a file (then read/edit/grep it)", "selfcheck save /report.txt"),
         ], true),
         "roster" => help_block(ctx, "roster", "example record-producing service (a typed table you can pipe)", &[
-            ("roster", "render the table directly (name / role / core)", "roster"),
+            ("roster", "render the table directly (name / role / seat)", "roster"),
             ("roster | where <col><op><val>", "filter rows — it is a record source for the pipe verbs", "roster | where role=core"),
-            ("roster | select <cols> | to json", "project columns / render as JSON at the edge", "roster | select name core | to json"),
+            ("roster | select <cols> | to json", "project columns / render as JSON at the edge", "roster | select name seat | to json"),
         ], true),
         "assert" => help_block(ctx, "assert", "verify a result or output; Ok if it holds, else Err", &[
             ("assert ok <command>", "the command must succeed", "assert ok read /notes.txt"),
