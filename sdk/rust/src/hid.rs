@@ -14,8 +14,11 @@
 //! both drivers existed: the report format is identical whether the bytes arrived
 //! over xHCI transfer-event rings or EHCI split qTDs.
 
-/// Decode a HID boot-keyboard usage code to ASCII (US layout, common keys).
-pub fn hid_to_ascii(key: u8, mods: u8) -> Option<u8> {
+/// Decode a HID boot-keyboard usage code to ASCII (US layout, common keys). `caps` is the host's
+/// Caps Lock toggle state (the HID modifier byte does NOT carry it — Caps Lock is a host-tracked
+/// latch, see `decode_keyboard`). Caps Lock XORs Shift, but **only for letters** — it never affects
+/// digits or symbols (that's the difference from Shift).
+pub fn hid_to_ascii(key: u8, mods: u8, caps: bool) -> Option<u8> {
     let shift = mods & 0x22 != 0; // left or right Shift
     let ctrl  = mods & 0x11 != 0; // left or right Ctrl
     match key {
@@ -24,10 +27,12 @@ pub fn hid_to_ascii(key: u8, mods: u8) -> Option<u8> {
             // serial terminal sends. Without this a USB keyboard can't produce ^S/^Q/^C, so
             // app shortcuts (the editor's save/quit, the shell's Ctrl-C) are unreachable on
             // hardware — they only worked over the serial console, which synthesises these
-            // bytes itself. Ctrl takes precedence over Shift. (key 0x04='a' → 0x01.)
+            // bytes itself. Ctrl takes precedence over Shift/Caps. (key 0x04='a' → 0x01.)
             if ctrl { return Some(key - 0x03); }
             let base = b'a' + (key - 0x04);
-            Some(if shift { base - 32 } else { base })
+            // Uppercase iff exactly one of Shift / Caps Lock is active (Caps Lock toggles letters,
+            // and Shift inverts Caps Lock — so SHIFT+letter is lowercase while Caps is on).
+            Some(if shift ^ caps { base - 32 } else { base })
         }
         0x1E..=0x26 => {
             if shift {
@@ -97,7 +102,7 @@ fn is_typable_code(k: u8) -> bool {
 /// parser (`handle_csi` / the pager) handles USB and serial alike — this is what makes a
 /// standard extended keyboard's Home/End/Delete/PageUp/PageDown work on real hardware
 /// (without it the physical keys produce nothing).
-fn emit_key(k: u8, mods: u8, emit: &mut impl FnMut(u8)) -> bool {
+fn emit_key(k: u8, mods: u8, caps: bool, emit: &mut impl FnMut(u8)) -> bool {
     // ESC [ <body...> for a cursor/navigation key. Returns true (it produced output).
     fn csi(body: &[u8], emit: &mut impl FnMut(u8)) -> bool {
         emit(0x1B);
@@ -132,7 +137,7 @@ fn emit_key(k: u8, mods: u8, emit: &mut impl FnMut(u8)) -> bool {
         0x43 => csi(b"21~", emit), // F10
         0x44 => csi(b"23~", emit), // F11
         0x45 => csi(b"24~", emit), // F12
-        _ => match hid_to_ascii(k, mods) {
+        _ => match hid_to_ascii(k, mods, caps) {
             Some(ch) => { emit(ch); true }
             None => false,
         },
@@ -153,6 +158,7 @@ fn emit_key(k: u8, mods: u8, emit: &mut impl FnMut(u8)) -> bool {
 pub struct KeyRepeat {
     key: u8,       // HID usage of the key being repeated (0 = none armed)
     mods: u8,      // modifier byte captured at press (so Shift+key repeats the shifted form)
+    caps: bool,    // Caps Lock state captured at press (so a held letter repeats in the right case)
     next_at: u64,  // `now` value at which the next repeat is due
     initial: u64,  // delay (in the driver's `now` unit) before the first repeat
     interval: u64, // delay between subsequent repeats
@@ -161,12 +167,13 @@ pub struct KeyRepeat {
 impl KeyRepeat {
     /// `initial`/`interval` are in the same unit the driver passes as `now` (TSC cycles).
     pub const fn new(initial: u64, interval: u64) -> Self {
-        KeyRepeat { key: 0, mods: 0, next_at: 0, initial, interval }
+        KeyRepeat { key: 0, mods: 0, caps: false, next_at: 0, initial, interval }
     }
 
-    fn arm(&mut self, key: u8, mods: u8, now: u64) {
+    fn arm(&mut self, key: u8, mods: u8, caps: bool, now: u64) {
         self.key = key;
         self.mods = mods;
+        self.caps = caps;
         self.next_at = now.wrapping_add(self.initial);
     }
 
@@ -187,7 +194,7 @@ impl KeyRepeat {
         if self.key == 0 || now < self.next_at {
             return;
         }
-        emit_key(self.key, self.mods, &mut emit);
+        emit_key(self.key, self.mods, self.caps, &mut emit);
         self.next_at = now.wrapping_add(self.interval);
     }
 }
@@ -205,6 +212,9 @@ pub fn report_is_valid(report: &[u8; 8]) -> bool {
 
 /// HID usage of the Delete (forward-delete) key — the `Del` in Ctrl+Alt+Del.
 pub const KEY_DELETE: u8 = 0x4C;
+/// HID usage of the Caps Lock key. It is a host-tracked LATCH: the modifier byte never reports it,
+/// so the host toggles a `caps` flag on each fresh press (see `decode_keyboard`).
+pub const KEY_CAPS_LOCK: u8 = 0x39;
 
 /// True if a **keyboard** boot report is the Ctrl+Alt+Del chord: either Ctrl (left 0x01 / right
 /// 0x10) **and** either Alt (left 0x04 / right 0x40) held, with the Delete key down. This is the
@@ -230,10 +240,14 @@ pub fn is_ctrl_alt_del(report: &[u8; 8]) -> bool {
 /// armed (at tick `now`) so the driver's [`KeyRepeat::poll`] re-emits it while held;
 /// releasing it disarms repeat. A key we don't map is reported via `on_unmapped`
 /// (loud, not silently dropped — §3.12) so its HID usage code can be logged and added.
+/// `caps` is the host's Caps Lock latch (toggled on each fresh Caps Lock press); the driver owns it
+/// per keyboard and passes it in, so the state persists across reports. It cases letters via
+/// `hid_to_ascii` (Caps Lock XORs Shift, letters only).
 pub fn decode_keyboard(
     report: &[u8; 8],
     last: &mut [u8; 6],
     rep: &mut KeyRepeat,
+    caps: &mut bool,
     now: u64,
     mut emit: impl FnMut(u8),
     mut on_unmapped: impl FnMut(u8),
@@ -253,14 +267,17 @@ pub fn decode_keyboard(
     for &k in cur.iter() {
         if k == 0 || k == 0x01 { continue; } // 0 = empty slot, 0x01 = rollover error
         if !last.contains(&k) {
-            if emit_key(k, mods, &mut emit) {
+            // Caps Lock is a latch, not a character: a fresh press flips the host's `caps` state
+            // (which then cases letters) and emits nothing. It does NOT arm auto-repeat.
+            if k == KEY_CAPS_LOCK { *caps = !*caps; continue; }
+            if emit_key(k, mods, *caps, &mut emit) {
                 // Newest printable/cursor key held becomes the repeat key — except the
                 // one-shot control keys: Escape (0x29), whose repeat would make the shell
                 // re-disambiguate a bare ESC every tick, and the function keys F1–F12
                 // (0x3A–0x45), which are actions, not characters (holding F1 should not
                 // re-open help over and over).
                 if k != 0x29 && !(0x3A..=0x45).contains(&k) {
-                    rep.arm(k, mods, now);
+                    rep.arm(k, mods, *caps, now);
                 }
             } else if is_typable_code(k) {
                 // Modifiers/Caps/Esc (0x29, 0x39, 0xE0-E7) are not printable; only the
@@ -346,8 +363,9 @@ mod tests {
         let mut out = Vec::new();
         let mut last = [0u8; 6];
         let mut rep = KeyRepeat::new(0, 0);
+        let mut caps = false;
         let report = [0, 0, code, 0, 0, 0, 0, 0];
-        decode_keyboard(&report, &mut last, &mut rep, 0, |b| out.push(b), |_| {});
+        decode_keyboard(&report, &mut last, &mut rep, &mut caps, 0, |b| out.push(b), |_| {});
         out
     }
 
@@ -393,14 +411,48 @@ mod tests {
     fn ctrl_letter_emits_control_codes() {
         // Ctrl+letter must produce the C0 control byte a terminal sends, so USB-keyboard
         // users can reach app shortcuts (editor ^S/^Q, shell ^C). Left Ctrl = 0x01.
-        assert_eq!(hid_to_ascii(0x16, 0x01), Some(0x13)); // Ctrl-S (save)
-        assert_eq!(hid_to_ascii(0x14, 0x01), Some(0x11)); // Ctrl-Q (quit)
-        assert_eq!(hid_to_ascii(0x06, 0x01), Some(0x03)); // Ctrl-C
-        assert_eq!(hid_to_ascii(0x04, 0x10), Some(0x01)); // Ctrl-A via RIGHT Ctrl (0x10)
-        assert_eq!(hid_to_ascii(0x1D, 0x01), Some(0x1A)); // Ctrl-Z
-        // Ctrl takes precedence over Shift, and a plain letter is unchanged.
-        assert_eq!(hid_to_ascii(0x16, 0x01 | 0x02), Some(0x13)); // Ctrl+Shift+S → still ^S
-        assert_eq!(hid_to_ascii(0x16, 0x00), Some(b's'));        // no Ctrl → 's'
+        assert_eq!(hid_to_ascii(0x16, 0x01, false), Some(0x13)); // Ctrl-S (save)
+        assert_eq!(hid_to_ascii(0x14, 0x01, false), Some(0x11)); // Ctrl-Q (quit)
+        assert_eq!(hid_to_ascii(0x06, 0x01, false), Some(0x03)); // Ctrl-C
+        assert_eq!(hid_to_ascii(0x04, 0x10, false), Some(0x01)); // Ctrl-A via RIGHT Ctrl (0x10)
+        assert_eq!(hid_to_ascii(0x1D, 0x01, false), Some(0x1A)); // Ctrl-Z
+        // Ctrl takes precedence over Shift/Caps, and a plain letter is unchanged.
+        assert_eq!(hid_to_ascii(0x16, 0x01 | 0x02, true), Some(0x13)); // Ctrl+Shift+S, Caps on → still ^S
+        assert_eq!(hid_to_ascii(0x16, 0x00, false), Some(b's'));       // no Ctrl → 's'
+    }
+
+    #[test]
+    fn caps_lock_cases_letters_only() {
+        // Caps Lock XORs Shift, but ONLY for letters. (key 0x16 = 's', 0x1E = '1'/'!')
+        assert_eq!(hid_to_ascii(0x16, 0x00, true),  Some(b'S')); // Caps on → uppercase
+        assert_eq!(hid_to_ascii(0x16, 0x22, true),  Some(b's')); // Caps + Shift → lowercase (XOR)
+        assert_eq!(hid_to_ascii(0x16, 0x22, false), Some(b'S')); // Shift only → uppercase
+        assert_eq!(hid_to_ascii(0x16, 0x00, false), Some(b's')); // neither → lowercase
+        // Digits/symbols ignore Caps Lock — only Shift changes them.
+        assert_eq!(hid_to_ascii(0x1E, 0x00, true),  Some(b'1')); // Caps on, a digit → still '1'
+        assert_eq!(hid_to_ascii(0x1E, 0x22, true),  Some(b'!')); // Shift → '!' (Caps irrelevant)
+    }
+
+    #[test]
+    fn caps_lock_key_toggles_the_latch() {
+        // The Caps Lock keycode (0x39) flips the host latch and emits nothing; letters then case.
+        // Each helper decodes one fresh press (last reset to empty so the press re-triggers).
+        fn decode_one(code: u8, caps: &mut bool) -> Vec<u8> {
+            let mut out = Vec::new();
+            let mut last = [0u8; 6];
+            let mut rep = KeyRepeat::new(0, 0);
+            decode_keyboard(&[0, 0, code, 0, 0, 0, 0, 0], &mut last, &mut rep, caps, 0,
+                            |b| out.push(b), |_| {});
+            out
+        }
+        let mut caps = false;
+        assert_eq!(decode_one(0x16, &mut caps), b"s");  // off → 's'  (0x16 = 's')
+        assert_eq!(decode_one(0x39, &mut caps), b"");   // Caps press emits nothing
+        assert!(caps);
+        assert_eq!(decode_one(0x16, &mut caps), b"S");  // on → 'S'
+        assert_eq!(decode_one(0x39, &mut caps), b"");
+        assert!(!caps);
+        assert_eq!(decode_one(0x16, &mut caps), b"s");  // off again → 's'
     }
 
     #[test]

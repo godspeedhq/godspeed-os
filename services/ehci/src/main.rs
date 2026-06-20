@@ -749,6 +749,7 @@ fn poll_devices(
     // unlike the coarse kernel tick): ~300 ms before the first repeat, then ~50 ms apart
     // at ~2 GHz. The spread across 1.5–3 GHz CPUs just shifts the feel slightly.
     let mut kb_rep = godspeed_sdk::hid::KeyRepeat::new(REPEAT_INITIAL_CYCLES, REPEAT_INTERVAL_CYCLES);
+    let mut kb_caps = false; // Caps Lock latch (host-tracked toggle)
     let mut mouse = godspeed_sdk::hid::MouseTracker::new(); // mouse button/motion state
     loop {
         for i in 0..n {
@@ -777,7 +778,7 @@ fn poll_devices(
                         ctx.reboot();
                     }
                     godspeed_sdk::hid::decode_keyboard(
-                        &rep, &mut kb_last, &mut kb_rep, ctx.read_tsc(),
+                        &rep, &mut kb_last, &mut kb_rep, &mut kb_caps, ctx.read_tsc(),
                         |ch| ctx.console_push(ch),
                         |code| ctx.log_fmt(format_args!(
                             "ehci: unmapped HID key usage {:#04x} (add to sdk hid_to_ascii)", code)),
