@@ -101,7 +101,7 @@ with `StatFile` (for the size) + a sequence of `ReadAt` chunks. Stateless — ea
 self-contained (no open-file table; §8). Size is bounded only by free space: a file is a
 contiguous u64 extent when one is free, else fragmented across an extent list (GSFS0008, §6.12
 above), so a fragmented disk no longer refuses a write it has room for. The shell streams
-`cat`/`copy` and the pipe `write` sink through these ops.
+`read`/`copy` and the pipe `write` sink through these ops.
 
 ## State and persistence (§15)
 

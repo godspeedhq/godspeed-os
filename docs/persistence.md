@@ -291,7 +291,7 @@ format's birth, and never revisit the ceiling.
   one directory lookup. Bounded path depth + entries-per-directory (§26.6).
 - **Operations:** `mkdir` (allocate a dir inode + add an entry to the parent),
   create/`write` (allocate a file inode + entry), `ls` (read a directory's entries),
-  `cat`/read (walk to the file inode, read its extent), `cd` (resolve a directory,
+  `read` (walk to the file inode, read its extent), `cd` (resolve a directory,
   update the session's current-directory inode).
 - **Still bounded & loud:** fixed inode count, fixed name length, contiguous extents
   (no reclamation yet, Phase-1 carry-over); bad magic still refuses to mount (§3.12).
@@ -481,7 +481,7 @@ the size) then a sequence of `ReadAt` chunks. The streaming **chunk** is `MAX_FI
 (3584) — now the per-message size, no longer a file cap. The one-shot `WriteFile`/`ReadFile`
 remain for small files.
 
-**Clients.** The shell streams `cat`/`read`, `copy` (incl. recursive), and the pipe `write`
+**Clients.** The shell streams `read`, `copy` (incl. recursive), and the pipe `write`
 sink through these ops — so it views/copies files far larger than one message with only a
 single chunk buffer (important given the shell's tight stack). `run` (which must hold a whole
 script to parse) stays on the one-shot path, bounded by what it can hold; the embedded
@@ -493,7 +493,7 @@ metadata commit atomic.
 
 **Verified:** `osdev test fs-large` writes + reads a 200 KiB file in streaming chunks and
 re-reads it across a **reboot** (boot 1 writes, boot 2 re-verifies on the same disk); files
-130/0 and script 2/2 confirm the shell `cat`/`copy` streaming is regression-free.
+130/0 and script 2/2 confirm the shell `read`/`copy` streaming is regression-free.
 
 ### 6.8 Crash-consistency — the metadata redo-journal (Phase C)
 

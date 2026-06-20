@@ -288,13 +288,32 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
-    // pipe errors: a non-producer source, and the result/assert outcome mix-up
+    // pipe errors: loud type-mismatch in `to`, a non-producer source, and the
+    // result/assert outcome mix-up
     // -----------------------------------------------------------------------
+    // `about` is now a TEXT producer, so `about | to json` must loudly refuse (text isn't records).
     send(&mut write_half, b"about | to json\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("'about' cannot start a pipe because it's not a pipe source"),
+        Some(r) => check!(r.contains("to: input is text, not records"),
+                          "pipe: 'to json' on text loudly refuses"),
+        None    => { println!("shell-test: FAIL — timed out after to-mismatch pipe"); fail += 1; }
+    }
+    // A genuine non-producer (an action command) still can't start a pipe. `cd` never runs — the
+    // pipe is rejected before stage 1 — so there is no side effect.
+    send(&mut write_half, b"cd | to json\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("'cd' cannot start a pipe because it's not a pipe source"),
                           "pipe: non-producer source error"),
         None    => { println!("shell-test: FAIL — timed out after non-producer pipe"); fail += 1; }
+    }
+    // An ORCHESTRATOR (selfcheck/run) must refuse loudly as a non-producer — NOT run and overflow
+    // the stack by nesting captures (the HW shell-crash this guards against). Rejected before it
+    // runs, so no drive is touched.
+    send(&mut write_half, b"selfcheck | write /x.txt\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("'selfcheck' cannot start a pipe because it's not a pipe source"),
+                          "pipe: orchestrator refused as non-producer (no nested-capture crash)"),
+        None    => { println!("shell-test: FAIL — timed out after orchestrator pipe"); fail += 1; }
     }
     send(&mut write_half, b"status | result\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {

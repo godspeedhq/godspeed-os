@@ -87,10 +87,10 @@ only to disambiguate (see §4.2). Examples:
 
 ```
   ls archive/projects/2026          # 'archive' is unique → no index needed
-  cat 0:data/notes.txt              # 'data' on drive 0
-  cat 1:data/notes.txt              # 'data' on drive 1 (a different drive, same label)
-  cat /etc/boot.cfg                 # leading / → current drive, absolute path
-  cat notes.txt                     # relative to the current directory
+  read 0:data/notes.txt             # 'data' on drive 0
+  read 1:data/notes.txt             # 'data' on drive 1 (a different drive, same label)
+  read /etc/boot.cfg                # leading / → current drive, absolute path
+  read notes.txt                    # relative to the current directory
 ```
 
 Switching the *current* drive (`drives use`) changes what bare/relative paths mean;
@@ -180,7 +180,7 @@ gsh> ls 1:data/backups
   NAME           SIZE
   2026-06.tar    40 KiB
 
-gsh> cat 0:data/projects/notes.txt
+gsh> read 0:data/projects/notes.txt
   works immediately
 
 gsh> drives use 1:data
@@ -215,7 +215,7 @@ A real multi-part feature, layered:
   addressing; drives API = `list` / `flash` / `label` / `mount` / `use` / `use default`.
 - **block-driver:** enumerate *all* SATA disks; the block IPC gains a **drive index**;
   a **capacity** request so a flash sizes the filesystem to the disk.
-- **shell:** `drives` (+ subcommands) and the file commands (`ls` / `cat` / `write` /
+- **shell:** `drives` (+ subcommands) and the file commands (`ls` / `read` / `write` /
   `cd` / `mkdir`) with `[N:]label/path` addressing.
 
 ## 8. Suggested order
@@ -224,7 +224,7 @@ A real multi-part feature, layered:
    (the foundation the rest needs). `persistence.md`.
 2. **Single-drive `drives`** — `flash` / `use` / `use default` + boot auto-mount of
    the default (one disk; proves the format/mount/default loop).
-3. **File commands** — `ls` / `cat` / `write` / `cd` / `mkdir` on the current drive.
+3. **File commands** — `ls` / `read` / `write` / `cd` / `mkdir` on the current drive.
 4. **Labels** — name a drive at flash/`label`; address + select by label.
 5. **Multi-drive** — enumerate all disks; per-drive block IPC; `mount` vs `use`;
    `[N:]label/path` cross-drive addressing; bounded mounted-drive slots; duplicate

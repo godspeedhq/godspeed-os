@@ -25,13 +25,18 @@ A pipeline is **one producer, zero or more filters, one sink**:
  PRODUCER  |    FILTER | FILTER  |     SINK
 ```
 
-- **PRODUCER** — emits text, ignores input. Built-ins: `read`/`cat`, `echo`, `ls`, `tree`,
-  `find`. Services: `greet` (text), `roster` (records — builds a `Table` and emits it as JSON;
-  `docs/records.md`, `sdk/rust/CLAUDE.md`).
-- **FILTER** — consumes input, emits output. Service: `upper` (re-emits its result, so it can
-  sit *anywhere* in a chain). A future filter built-in (`match`) slots in here.
-- **SINK** — consumes the final buffer. Built-in: `write <file>`. A service filter used as the
-  last stage prints its output to the console; with no recognised sink, the buffer is printed.
+- **PRODUCER** — emits text (or records), ignores input. Built-ins: `read`, `echo`, `ls`, `tree`,
+  `find`, the system-info commands `about` / `mem` / `cores` / `date` / `help`, and the introspection
+  producers `status` / `caps` / `drives` / `observe now`. Services: `greet` (text),
+  `roster` (records). *(There is no `cat`: `read` is the one file reader — `utilities/18_read.md`,
+  the replacement for POSIX `cat`, whose name describes a different operation. This OS does not
+  carry POSIX vocabulary for its own sake.)*
+- **FILTER** — consumes input, emits output. Service: `upper`. Built-ins: `match`/`count`/`sort`/
+  `first`/`last` (text) and the record verbs `where`/`select`/`sort`/`from`/`to` (`docs/records.md`).
+- **SINK** — consumes the final buffer. Built-in: `write [append|prepend] <file>` (plain
+  overwrites; the keywords add to the end / front — see *The `write` sink* below) and `assert`
+  (the verifying sink). A service filter used as the last stage prints to the console; with no
+  recognised sink, the buffer is printed.
 
 The shell threads a bounded buffer down the chain: stage 1 fills it, each filter transforms it,
 the sink consumes it. Each inter-stage buffer is **64 KiB** (loud on overflow, §26.6); it lives
@@ -45,7 +50,76 @@ echo hello | upper                  builtin producer → service filter → cons
 tree / | write /snap.txt            builtin producer → write sink
 read /log | upper | write /up.txt   producer → filter → sink (3 stages)
 greet | upper | write /g.txt        service producer → service filter → sink
+about | write /about.txt            capture any text producer's output to a file
 ```
+
+## What can start a pipe — the producer rule
+
+The governing idea is simple: **anything that displays information can be saved.** A command is a
+pipe source iff its job is to *emit data*. That splits the command set three ways:
+
+- **Data / display commands → pipe sources.** Anything whose purpose is to show you something:
+  `about`, `mem`, `cores`, `date`, `help`, `status`, `ls`, `caps`, `drives`, `find`, `tree`,
+  `read`, `echo`, `observe now`. Each renders through an `Out` target that is the console when run
+  bare and a capture buffer when piped — so `about` prints, and `about | write /f` saves, the same
+  bytes. No new authority: a built-in already held these capabilities; the pipe just redirects its
+  text.
+- **Action / mutation commands → NOT sources.** `spawn`, `kill`, `restart`, `reboot`, `mkdir`,
+  `copy`, `move`, `rename`, `delete`, `cd`, `write`, `edit`, `drives flash`. These *do* something;
+  their one-line "ok"/error is an **acknowledgement, not data**. And that outcome already has its
+  own channel — the Result model (`result`, `assert ok <cmd>`). Piping `delete /x | write log`
+  to capture the word "ok" would blur the data channel and the outcome channel, which the shell
+  keeps deliberately apart. A non-producer in stage 1 is refused loudly ("… cannot start a pipe").
+- **Live / interactive → NOT sources.** The full-screen `observe` live view and `edit` own the
+  screen and never yield a discrete stream; piping them is a loud refusal (use `observe now`).
+- **Orchestrators (`run` / `selfcheck`) → NOT sources.** They run the suite's *own* sub-pipelines,
+  so capturing one would nest a `pipe_run` (which holds a 64 KiB `Stream` on the stack) inside
+  another — two coexisting 64 KiB buffers overflow the tight user stack (HW-proven). They refuse
+  loudly as non-producers. To build a big file (e.g. to test `edit`'s windowing), append a *simple*
+  producer a few times: `help | write /big.txt` then `help | write append /big.txt` ×N.
+
+## The `write` sink — overwrite by default, append/prepend explicit
+
+`write` is the file sink, identical in the pipe (`… | write <path>`) and standalone
+(`write <path> <text>`) forms:
+
+| Form | Effect |
+|------|--------|
+| `write <path>` | **Overwrite** (or create). The default — the common case is unqualified. |
+| `write append <path>` | Add to the **end** (create if missing). |
+| `write prepend <path>` | Add to the **front** (create if missing). |
+
+The destructive-vs-additive choice is a **visible keyword**, not a punctuation subtlety — you can
+read the line and know exactly what it does. Append/prepend stream through a temp file
+(`fs_stream_combine`): the original is read while the combined content is written to a staging file
+that then atomically replaces the target, so they work on files of any size with constant memory.
+`prepend` is honestly a **full-file rewrite** (there is no insert-at-front in the filesystem), so
+it costs the same as rewriting the file — stated, not hidden (§26.7).
+
+## Why there is no `>` redirection
+
+A POSIX reflex says "where's `>`?". The answer is that `>` would be **redundant here, not
+ergonomic**. In POSIX, `>` exists because redirection (an `fd` dup) is a *different primitive* from
+a pipe (`fork` + `pipe`). In GodspeedOS both are the **same** mechanism — a capability to a sink —
+so `| write` *is* "redirection as capability minting" (Appendix D.2). Adding `>` would be a second
+syntax for one mechanism, exactly the kind of speculative convenience surface §26.2 / §26.5 tell us
+to resist — and it drags its baggage in (`>>` vs `>`, clobber/noclobber, `2>`), plus parser
+special-casing for a literal `>` in `echo` text. The verb form is self-documenting and keeps the
+authority (the `fs` write-cap) visible at the word `write`, where it is exercised (Appendix D.4).
+
+## Type mismatches are loud (text vs records)
+
+A pipe carries text **or** records, and a stage that gets the wrong kind fails loudly and aborts
+the pipeline (§3.12) — it never silently passes garbage through:
+
+```
+about | to json   → "to: input is text, not records (parse with 'from json' first)"
+ls | to xml        → "to: unknown format (try: to json | to yaml)"
+status | match x   → "match: this is a record stream — use 'where'/'select'/'sort', or 'to json'"
+```
+
+The new text producers (`about`/`mem`/…) emit a **byte** stream, so feeding one into a record verb
+(`to json`, `where`, …) trips this guard automatically — no special-casing needed.
 
 ## How a built-in stage works
 
@@ -89,8 +163,10 @@ empty body. A filter (`upper`) forwards EOT downstream; the shell stops draining
   whitelist (`is_pipe_producer_service`, currently `greet`); anything else is refused loudly.
 - A producer built-in mid-pipe or as a sink (it ignores input), or a service that never
   registers when used as a filter, is reported, not silently mishandled.
-- A buffer larger than a **service** can take (4 KiB) or a **file** can hold (~3.5 KiB) is
-  refused loudly with the actual size and the reason — it is never silently clipped.
+- A buffer larger than a **service** stage can take (4 KiB, one message) is refused loudly with
+  the actual size and the reason — never silently clipped. (The **`write` sink** is *not* limited
+  this way: it streams the captured buffer to a multi-block file via `WriteNew`/`WriteAt`, so it
+  can save up to the full 64 KiB capture.)
 
 ## Why store-and-forward, and the chain of real limits
 
@@ -108,8 +184,11 @@ same "no streaming / no multi-block" limitation:
 | Limit | Value | Set by |
 |-------|-------|--------|
 | IPC message | 4 KiB | `MAX_PAYLOAD` (§8.5) — a stage through a *service* is one message |
-| File write | ~3.5 KiB | `fs` `MAX_FILE_BYTES` — `\| write` is one `WriteFile` (no multi-block files) |
+| Capture buffer | 64 KiB | the inter-stage buffer; a builtin-only pipeline is bounded by this |
 | Concurrency | none | stages run sequentially; data is materialised, not flowing |
+
+(The `\| write` sink is no longer a ~3.5 KiB ceiling: it streams the buffer to a multi-block file
+via `WriteNew`/`WriteAt`. The remaining hard cap is the 4 KiB *service*-stage message.)
 
 So a *builtin-only* capture can fill 64 KiB, but it can only reach a sink that can take it —
 which today nothing beyond 4 KiB can. Lifting this is the streaming work, not a constant.
@@ -128,8 +207,9 @@ pieces:
    block on a full queue until the consumer drains it — `send` already blocks, so the queue *is*
    the backpressure, but every stage must then use the **`try_send`/structured discipline** §8.9
    requires so a stall can't become a deadlock.
-3. **Multi-block files.** `\| write` of a large stream needs `fs` to write a file across many
-   blocks (chunked `WriteFile`), lifting the ~3.5 KiB ceiling — its own `fs`/block-IPC change.
+3. **Multi-block files — done.** `\| write` already streams to a multi-block file
+   (`WriteNew`/`WriteAt`); a large piped capture reaches the file. What remains is *streaming* it
+   chunk-by-chunk rather than materialising the whole buffer first.
 4. **A streaming filter contract.** A filter service reads a chunk, emits a chunk, repeats —
    `upper` is already shaped this way (chunk-in → chunk-out); the change is the shell *not*
    draining it in full but forwarding each chunk onward.
