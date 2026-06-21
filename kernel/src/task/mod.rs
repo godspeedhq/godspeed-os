@@ -3122,59 +3122,73 @@ fn spawn_service_with_config(
         [(u32::MAX, 0, [0u8; PEER_NAME_BYTES]); MAX_SEND_PEERS];
     let mut peer_count = 0usize;
 
-    match installs {
-        // Phase 0b: wire the child's send-peers from caller-supplied caps — NO name resolution.
-        // The kernel installs each cap (a copy the caller already held, GRANT-validated in the
-        // syscall handler) and records its label, so the child resolves `ctx.capability(label)`
-        // identically to the old path. This is the seam by which the supervisor owns naming.
-        Some(installs) => {
-            for entry in installs {
-                if peer_count >= MAX_SEND_PEERS { break; }
-                match caps.insert(entry.cap) {
-                    Ok(cap_slot) => {
-                        let len = (entry.name_len as usize).min(PEER_NAME_BYTES);
-                        peer_data[peer_count].0 = cap_slot as u32;
-                        peer_data[peer_count].1 = len as u32;
-                        peer_data[peer_count].2[..len].copy_from_slice(&entry.name[..len]);
-                        peer_count += 1;
-                    }
-                    Err(_) => crate::kprintln!(
-                        "task: cap table full, skipping installed cap for '{}'", name),
+    // Wiring is a MERGE (Phase 0b/2, docs/naming-design.md): install the caller-supplied caps
+    // first, then name-wire any declared send-peer the caller did NOT provide. This lets the
+    // supervisor flip peers one at a time (provide what it holds in its name→cap map; the kernel
+    // fills the rest from the name table until Phase 5 removes it). `installs == None` (every
+    // existing spawn) means the install step is skipped and ALL declared peers are name-wired —
+    // the old behaviour, verbatim. A peer is "provided" if its label matches an install entry.
+
+    // 1. Install caller-supplied caps (a copy the caller already held, GRANT-validated in the
+    //    syscall handler — non-escalating §7.3). Each becomes a send-peer under its label, so the
+    //    child resolves `ctx.capability(label)` identically. A delegated peer not in the contract
+    //    (e.g. `greet`'s sink at index 0) arrives this way too.
+    if let Some(installs) = installs {
+        for entry in installs {
+            if peer_count >= MAX_SEND_PEERS { break; }
+            match caps.insert(entry.cap) {
+                Ok(cap_slot) => {
+                    let len = (entry.name_len as usize).min(PEER_NAME_BYTES);
+                    peer_data[peer_count].0 = cap_slot as u32;
+                    peer_data[peer_count].1 = len as u32;
+                    peer_data[peer_count].2[..len].copy_from_slice(&entry.name[..len]);
+                    peer_count += 1;
                 }
+                Err(_) => crate::kprintln!(
+                    "task: cap table full, skipping installed cap for '{}'", name),
             }
         }
-        // Old path: resolve each declared send-peer name against the kernel name table.
-        None => for &peer_name in send_peers {
-            if peer_count >= MAX_SEND_PEERS { break; }
+    }
 
-            if let Some(peer_ep_id) = crate::ipc::names::lookup(peer_name) {
-                let peer_resource_id = ResourceId::from(peer_ep_id);
-                let peer_rights = if send_peers_grant {
-                    Rights::SEND | Rights::GRANT
-                } else {
-                    Rights::SEND
-                };
-                let send_cap = mint_cap(peer_resource_id, peer_rights);
-                match caps.insert(send_cap) {
-                    Ok(cap_slot) => {
-                        let nb  = peer_name.as_bytes();
-                        let len = nb.len().min(PEER_NAME_BYTES);
-                        peer_data[peer_count].0 = cap_slot as u32;
-                        peer_data[peer_count].1 = len as u32;
-                        peer_data[peer_count].2[..len].copy_from_slice(&nb[..len]);
-                        peer_count += 1;
-                    }
-                    Err(_) => crate::kprintln!(
-                        "task: cap table full, skipping SEND cap to '{}' for '{}'",
-                        peer_name, name
-                    ),
-                }
+    // 2. Name-wire each declared send-peer the caller did NOT already provide.
+    for &peer_name in send_peers {
+        if peer_count >= MAX_SEND_PEERS { break; }
+
+        // Skip peers already supplied by the install list (matched by label).
+        let provided = match installs {
+            Some(installs) => installs.iter()
+                .any(|e| &e.name[..(e.name_len as usize).min(PEER_NAME_BYTES)] == peer_name.as_bytes()),
+            None => false,
+        };
+        if provided { continue; }
+
+        if let Some(peer_ep_id) = crate::ipc::names::lookup(peer_name) {
+            let peer_resource_id = ResourceId::from(peer_ep_id);
+            let peer_rights = if send_peers_grant {
+                Rights::SEND | Rights::GRANT
             } else {
-                crate::kprintln!(
-                    "task: peer '{}' not yet registered, no SEND cap for '{}'",
+                Rights::SEND
+            };
+            let send_cap = mint_cap(peer_resource_id, peer_rights);
+            match caps.insert(send_cap) {
+                Ok(cap_slot) => {
+                    let nb  = peer_name.as_bytes();
+                    let len = nb.len().min(PEER_NAME_BYTES);
+                    peer_data[peer_count].0 = cap_slot as u32;
+                    peer_data[peer_count].1 = len as u32;
+                    peer_data[peer_count].2[..len].copy_from_slice(&nb[..len]);
+                    peer_count += 1;
+                }
+                Err(_) => crate::kprintln!(
+                    "task: cap table full, skipping SEND cap to '{}' for '{}'",
                     peer_name, name
-                );
+                ),
             }
+        } else {
+            crate::kprintln!(
+                "task: peer '{}' not yet registered, no SEND cap for '{}'",
+                peer_name, name
+            );
         }
     }
 

@@ -18,7 +18,7 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::ServiceContext;
+use godspeed_sdk::{ServiceContext, CapHandle};
 
 // ───────────────────────────────────────────────────────────────────────────────
 // Phase 1 of moving naming out of the kernel (docs/naming-design.md).
@@ -59,6 +59,36 @@ impl NameCapMap {
         self.caps[i]  = cap_slot;
         self.count   += 1;
         true
+    }
+    /// The recorded endpoint cap slot for `name`, if mapped.
+    fn get(&self, name: &str) -> Option<u32> {
+        let nb = name.as_bytes();
+        (0..self.count).find(|&i| self.lens[i] as usize == nb.len() && &self.names[i][..nb.len()] == nb)
+            .map(|i| self.caps[i])
+    }
+}
+
+/// Phase 2 (docs/naming-design.md): spawn `fs`, wiring its `block-driver` send-peer from the
+/// supervisor's name→cap map (the cap recorded when block-driver was spawned) **instead of the
+/// kernel name table**. `fs`'s other declared peer, `registry`, is still name-wired by the kernel
+/// (the merge) — peers flip one at a time. Records fs's own endpoint cap on success. The flipped
+/// wiring is proven by fs mounting + serving, which requires fs→block-driver disk I/O.
+fn spawn_fs_wired(ctx: &ServiceContext, map: &mut NameCapMap) {
+    let bd = match map.get("block-driver") {
+        Some(slot) => slot,
+        None => {
+            ctx.log("supervisor: Phase 2 — block-driver not in name-cap map; name-wiring fs instead");
+            spawn_mapped(ctx, map, "fs", 0xFFFF);
+            return;
+        }
+    };
+    match ctx.spawn_with_caps("fs", 0xFFFF, &[("block-driver", CapHandle(bd))]) {
+        Ok(Some(cap)) => {
+            let _ = map.record("fs", cap.0);
+            ctx.log("supervisor: fs wired to block-driver via the name-cap map (Phase 2; registry still name-wired)");
+        }
+        Ok(None) => ctx.log("supervisor: Phase 2 — fs spawned but returned no endpoint cap (unexpected)"),
+        Err(_)   => ctx.log("supervisor: Phase 2 — fs spawn (wired) FAILED"),
     }
 }
 
@@ -168,7 +198,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     #[cfg(any(feature = "bare-metal", feature = "blockdev"))]
     {
         spawn_mapped(&ctx, &mut name_map, "block-driver", 0xFFFF);
-        spawn_mapped(&ctx, &mut name_map, "fs", 0xFFFF);
+        // Phase 2: fs's block-driver peer is wired from the supervisor's map, not the kernel name
+        // table (registry still name-wired). Proven by the files test (real fs→block-driver I/O).
+        spawn_fs_wired(&ctx, &mut name_map);
     }
 
     // shell: the interactive prompt. Spawned in bare-metal (the USB image rests
