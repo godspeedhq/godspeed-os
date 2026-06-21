@@ -2056,6 +2056,21 @@ pub fn run_fs_restart(image_path: &Path, persist_path: &str, smp: u32) {
     }
     check!(answered, "the restarted shell answers commands (session recovered)");
 
+    // ── Directly-restartable driver/logger: kill `logger` over the control channel and confirm the
+    // supervisor respawns it on its OWN death (not only via a lucky supervisor respawn). This is the
+    // fix that keeps `chaos max-carnage` from leaving `xhci`/`ehci`/`logger` dead at the end of a run.
+    // logger is the hardware-independent stand-in for xhci/ehci (same death-notification + restart
+    // arm); the actual USB keyboard recovery is verified on real hardware (QEMU has no USB keyboard).
+    println!("fs-restart: sending 'KILL logger' over the control channel …");
+    match retry_tcp_connect(ctrl_port, Duration::from_secs(10)) {
+        Some(mut ctrl) => { thread::sleep(Duration::from_millis(100)); send(&mut ctrl, b"\nKILL logger\n");
+            let restarted = collect_until(&buf, &mut cursor, b"supervisor: logger restarted", Duration::from_secs(20));
+            check!(restarted.is_some(), "supervisor respawned logger on its own death (directly restartable)");
+            drop(ctrl);
+        }
+        None => { println!("fs-restart: FAIL — could not connect to control port (logger kill)"); fail += 1; }
+    }
+
     // No panic anywhere in the whole session.
     let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
     check!(!whole.contains("KERNEL PANIC"), "kernel never panicked across the restart");

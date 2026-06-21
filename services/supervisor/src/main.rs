@@ -349,6 +349,25 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 if spawn_wired(&ctx, &mut name_map, "shell", &["fs"]) { ctx.log("supervisor: shell restarted"); }
                 else { ctx.log("supervisor: shell restart FAILED"); }
             }
+            // The USB host drivers + logger are directly restartable now: their OWN death respawns
+            // them immediately (re-granting MMIO/DMA/IRQ caps + re-initialising the controller),
+            // instead of waiting for a lucky supervisor respawn. This is what keeps a `chaos
+            // max-carnage` that kills `xhci`/`ehci` in its last rounds from leaving the keyboard dead.
+            "xhci" => {
+                ctx.log("supervisor: xhci died, restarting");
+                if spawn_mapped(&ctx, &mut name_map, "xhci", 0xFFFF) { ctx.log("supervisor: xhci restarted"); }
+                else { ctx.log("supervisor: xhci restart FAILED"); }
+            }
+            "ehci" => {
+                ctx.log("supervisor: ehci died, restarting");
+                if spawn_mapped(&ctx, &mut name_map, "ehci", 0xFFFF) { ctx.log("supervisor: ehci restarted"); }
+                else { ctx.log("supervisor: ehci restart FAILED"); }
+            }
+            "logger" => {
+                ctx.log("supervisor: logger died, restarting");
+                if spawn_mapped(&ctx, &mut name_map, "logger", 0xFFFF) { ctx.log("supervisor: logger restarted"); }
+                else { ctx.log("supervisor: logger restart FAILED"); }
+            }
             _ => {}
         }
     }

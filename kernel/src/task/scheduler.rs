@@ -1369,18 +1369,19 @@ pub fn kill_task_by_slot(slot: usize) {
             }
         }
 
-        // Restartable-service death notification. `fs` + `block-driver` (Phase D, §6 amendment
-        // 2026-06-17) and now `shell` are restartable userspace services, not trusted root. When one
-        // dies, notify the supervisor over its death-notification endpoint so it can respawn it —
-        // their death degrades I/O / the prompt briefly, it is not a reboot. `fs` re-mounts to a
-        // consistent state via its journal (Phase C); clients reacquire by name via the kernel
-        // directory (§14.3). The `shell` is the user's interface — a crash or a deliberate
-        // `kill shell` now respawns a fresh prompt instead of leaving a dead session (invariant 6;
-        // "nothing escapes" — every service recovers, the kernel is the only unkillable thing).
-        // (`registry` was in this set until its service was retired — Path C / Phase 4.) Gated to
-        // this set so ordinary probe/app churn never floods the supervisor. `enqueue_from_interrupt`
-        // is the kernel→endpoint path (no cap needed); wake the supervisor if blocked.
-        if matches!(task_name, "fs" | "block-driver" | "shell") {
+        // Restartable-service death notification. These are restartable userspace services (not
+        // trusted root): when one dies, notify the supervisor over its death-notification endpoint so
+        // it respawns the service IMMEDIATELY — its own death, not only a lucky supervisor respawn.
+        // The set: `fs` + `block-driver` (Phase D); `shell` (the user's prompt); and the drivers
+        // `xhci` / `ehci` + `logger`. Without the drivers here, a `chaos max-carnage` that killed
+        // them in its last rounds left them dead until the supervisor happened to be respawned (it
+        // re-runs its boot sequence and re-spawns them) — so the keyboard could stay dead. Now their
+        // own death respawns them. `fs` re-mounts via its journal (Phase C); clients reacquire by
+        // name via the kernel directory (§14.3). "Nothing escapes" — every service recovers; the
+        // kernel is the only unkillable thing. (`registry` was here until it was retired — Phase 4.)
+        // Gated to this NAMED set so ordinary probe/app churn never floods the supervisor.
+        // `enqueue_from_interrupt` is the kernel→endpoint path (no cap needed); wake the supervisor.
+        if matches!(task_name, "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger") {
             if let (Some(sup_ep), Ok(msg)) = (
                 crate::ipc::names::lookup("supervisor"),
                 crate::ipc::message::Message::new(task_name.as_bytes()),
