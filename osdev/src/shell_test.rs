@@ -672,6 +672,26 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
+    // `kill shell` via the COMMAND (the interactive COM1 path the user types): the shell self-kills
+    // and the supervisor respawns a FRESH prompt. This is the same kernel self-kill path a page fault
+    // uses (deferred stack/PML4 reclaim), so the dead instance never corrupts anything; the new shell
+    // must answer input afterward. Proves a user can `kill shell` and get the session back.
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"kill shell\r");
+    match collect_until(&buf, &mut cursor, b"shell: ready", Duration::from_secs(20)) {
+        Some(_) => check!(true, "kill shell (self-kill via command) — supervisor respawned a fresh prompt"),
+        None    => { println!("shell-test: FAIL — kill shell did not respawn a fresh prompt"); fail += 1; }
+    }
+    let mut answered = false;
+    for _ in 0..4 {
+        send(&mut write_half, b"cores\r");
+        if let Some(r) = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+            if r.contains("cores:") { answered = true; break; }
+        }
+    }
+    check!(answered, "the respawned shell answers commands (session recovered after `kill shell`)");
+
+    // -----------------------------------------------------------------------
     // Done.
     // -----------------------------------------------------------------------
     child.kill().ok();

@@ -2999,6 +2999,18 @@ fn cmd_kill(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
         ctx.console_writeln(PROTECTED_MSG);
         return Err(ShellError::Denied);
     }
+    if name == "shell" {
+        // The shell is restartable now ("nothing escapes"): self-kill, and the supervisor respawns a
+        // fresh prompt. The kernel's self-kill path defers our stack/PML4 reclaim (it is exactly how
+        // every page fault already kills the running task), and our death notifies the supervisor,
+        // which respawns us. The in-flight session is lost — a re-init, not a resume (§14.2/§25). We
+        // yield forever after the kill so we never execute again as the dead instance.
+        ctx.console_writeln("kill shell: restarting this session — a fresh prompt is coming (in-flight state is lost)…");
+        match ctx.kill("shell") {
+            Ok(())  => loop { ctx.yield_cpu(); },
+            Err(_)  => { ctx.console_writeln("kill shell: failed"); return Err(ShellError::Unknown); }
+        }
+    }
     if let Some(msg) = session_critical_msg(name) {
         ctx.console_writeln(msg);
         return Err(ShellError::Denied);
