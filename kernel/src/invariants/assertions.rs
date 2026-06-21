@@ -38,11 +38,11 @@ pub fn assert_no_mid_execution_migration(original_core: u32, current_core: u32) 
 /// registry and alive in the routing table. Death of any TCB service requires
 /// an immediate system reboot — §6.2.
 pub fn assert_tcb_alive() {
-    // The non-restartable set is now just `supervisor` (Path C / Phase 5: `init` is removed — the
-    // kernel spawns the supervisor directly). `registry` (retired), `fs`, and `block-driver` are
-    // restartable services, not trusted root — their death is recovered by a supervisor restart,
-    // not a reboot, so they are not in the panic set.
-    const TCB: &[&str] = &["supervisor"];
+    // The non-restartable set is now EMPTY (Path C / Phase 6: the supervisor is restartable too —
+    // the kernel respawns it on death, §6.2). `init` was removed (Phase 5); `registry` retired
+    // (Phase 4); `fs`/`block-driver` are restartable (Phase D). The kernel is the only thing that
+    // cannot die, and it is not a task — so no task's death is a panic-on-death TCB violation.
+    const TCB: &[&str] = &[];
     const DEAD: u8 = crate::task::state::TaskState::Dead as u8;
     // §6.2 governs the *death of a service that exists*, not the *omission* of
     // one: identity-test manifests are minimal and spawn only the subset a given

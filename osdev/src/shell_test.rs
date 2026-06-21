@@ -631,6 +631,27 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
+    // chaos kill-storm SUPERVISOR (Path C / Phase 6): the supervisor is restartable too — the KERNEL
+    // respawns it on every death, unconditionally (no bound — a bound would be a reboot/DoS vector).
+    // Storming it 4× and recovering every round proves the unkillable set is now {kernel} alone: the
+    // shell (a separate task) survives killing its own spawner, and the prompt still answers after.
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"chaos kill-storm supervisor 4\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(45)) {
+        Some(r) => {
+            check!(r.contains("recovered: 4/4") && r.contains("verdict: PASS"), "chaos: kill-storm supervisor — 4/4 recovered, PASS");
+            check!(r.contains("kernel-respawned"), "chaos: supervisor target reported as kernel-respawned");
+            check!(r.contains("kernel: alive"), "chaos: kill-storm supervisor — kernel alive (no panic, no bound)");
+        }
+        None => { println!("shell-test: FAIL — chaos kill-storm supervisor timed out (recovery stuck / panic?)"); fail += 3; }
+    }
+    send(&mut write_half, b"cores\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains(&format!("cores: {smp}")), "chaos: shell responsive after storming the supervisor"),
+        None    => { println!("shell-test: FAIL — shell unresponsive after supervisor chaos"); fail += 1; }
+    }
+
+    // -----------------------------------------------------------------------
     // Done.
     // -----------------------------------------------------------------------
     child.kill().ok();

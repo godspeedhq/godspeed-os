@@ -133,6 +133,37 @@ fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u3
     }
 }
 
+/// Ensure `name` is running and recorded in the map (Path C / Phase 6 — unifies boot and recovery).
+///
+/// On a **fresh boot** nothing is running yet, so this spawns (via `spawn_mapped`/`spawn_wired`). On a
+/// **supervisor respawn** the real services are still alive (only the supervisor died), so this
+/// ADOPTS each — reacquires its endpoint cap by name from the kernel directory and records it —
+/// instead of re-spawning a duplicate (which the kernel would reject as AlreadyRunning anyway). The
+/// kernel re-points death notifications to the respawned supervisor via the directory, so after this
+/// reconciliation the restart loop works exactly as on a fresh boot.
+///
+/// Known v1 limitation: the kernel directory keeps a name even after the service dies, so a service
+/// that died *during* the supervisor's brief (~1 tick) downtime would be adopted as a stale cap
+/// rather than respawned. Narrow race; full liveness-aware reconciliation is a follow-up.
+fn ensure_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u32) -> bool {
+    if let Some(cap) = ctx.acquire_send_grant_cap(name) {
+        let _ = map.record(name, cap.0);
+        ctx.log_fmt(format_args!("supervisor: adopted running {} (slot {})", name, cap.0));
+        return true;
+    }
+    spawn_mapped(ctx, map, name, core)
+}
+
+/// `ensure_mapped` for a service with peers — adopt if already running, else `spawn_wired`.
+fn ensure_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &[&str]) -> bool {
+    if let Some(cap) = ctx.acquire_send_grant_cap(name) {
+        let _ = map.record(name, cap.0);
+        ctx.log_fmt(format_args!("supervisor: adopted running {} (slot {})", name, cap.0));
+        return true;
+    }
+    spawn_wired(ctx, map, name, peers)
+}
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Naming migration (docs/naming-design.md): `name → cap` map, built as we spawn the real
@@ -237,11 +268,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     //
     // block-driver is also spawned in `identity-only` builds — it idles harmlessly with no disk
     // (QEMU has no -drive there: "no controller"), giving §22 Test 11 a restartable victim to kill.
+    // `ensure_*` (Phase 6): spawn on a fresh boot, ADOPT the running instance on a supervisor respawn.
     #[cfg(any(feature = "bare-metal", feature = "blockdev", feature = "identity-only"))]
-    spawn_mapped(&ctx, &mut name_map, "block-driver", 0xFFFF);
+    ensure_mapped(&ctx, &mut name_map, "block-driver", 0xFFFF);
     // fs needs a disk → bare-metal / blockdev only.
     #[cfg(any(feature = "bare-metal", feature = "blockdev"))]
-    spawn_wired(&ctx, &mut name_map, "fs", &["block-driver"]);
+    ensure_wired(&ctx, &mut name_map, "fs", &["block-driver"]);
 
     // shell: the interactive prompt. Spawned in bare-metal (the USB image rests
     // here) and full builds; excluded from test-specific builds.
@@ -250,7 +282,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
     // Phase 3a: shell's `fs` peer is wired from the supervisor's map (no registry — retired).
-    spawn_wired(&ctx, &mut name_map, "shell", &["fs"]);
+    // Phase 6: ensure_wired adopts a running shell on a supervisor respawn instead of duplicating it.
+    ensure_wired(&ctx, &mut name_map, "shell", &["fs"]);
 
     // xhci: USB host-controller driver (§12). Spawned in bare-metal + full
     // builds; the kernel maps its controller's MMIO BAR at spawn (Stage 2).

@@ -1390,6 +1390,16 @@ pub fn kill_task_by_slot(slot: usize) {
             }
         }
 
+        // Path C / Phase 6: the supervisor is restartable — the KERNEL is its recovery anchor (the
+        // one thing that cannot die, §3.7). Flag a respawn to run from the next Core-0 control tick
+        // (NOT inline: we are mid-teardown of this very task). The new instance re-registers its
+        // endpoint in `ipc::names`, so death notifications re-point to it automatically, and it
+        // reconciles live services on boot. (§6.2 amended — supervisor death is no longer a panic.)
+        if task_name == "supervisor" {
+            crate::kprintln!("kernel: supervisor died");
+            crate::task::flag_supervisor_respawn();
+        }
+
         // H1: if a confined DMA driver dies, reclaim its IOMMU resources (revert
         // DTE to passthrough, free its I/O page table) so a restart does not leak
         // and re-confines cleanly. Safe call; no-op if the device wasn't confined.

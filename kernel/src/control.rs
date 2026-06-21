@@ -42,6 +42,12 @@ static LINE: SpinLock<LineBuf> = SpinLock::new(LineBuf::new());
 /// on the BSP stalls forever. The budget (256) far exceeds any real command
 /// line (BUF_SIZE = 128); a stuck LSR just drains 256 junk bytes and returns.
 pub fn process_pending() {
+    // Path C / Phase 6: if the supervisor died, the kernel respawns it here — a spawn-safe deferred
+    // point on the Core-0 control tick (the same place RESTART respawns services). The kernel is the
+    // supervisor's recovery anchor, the one thing that cannot die (§3.7, §6.2). Bounded + loud on a
+    // respawn loop. No-op when the supervisor is healthy (one atomic load).
+    crate::task::poll_supervisor_respawn();
+
     // H1 diagnostic: surface any IOMMU translation faults (device DMA blocked
     // outside its confined arena). Cheap when quiet (a head/tail compare); prints
     // the faulting device + address when a confined driver oversteps its arena.

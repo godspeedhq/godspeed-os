@@ -763,20 +763,15 @@ fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
         Ok(s)  => s,
         Err(_) => return -1,
     };
-    // §6.2 (fail-closed): the trusted root (`supervisor`) is non-restartable — its death requires a
-    // reboot, so a caller must not be able to kill it via this syscall. Reject the request *before*
-    // any kill happens. This is the primary §6.2 gate; the assert_tcb_alive sweep below is a
-    // defensive secondary check. Rejection (not panic) is deliberate: a mere kill *attempt* is not a
-    // TCB death, and panicking would hand any caller a reboot denial-of-service.
-    //
-    // `init` is gone (Path C / Phase 5 — the kernel spawns the supervisor directly). `registry`,
-    // `fs`, and `block-driver` are restartable services — killing one degrades briefly until the
-    // supervisor restarts it, it does not reboot the system, so they are killable by a
-    // SERVICE_CONTROL holder (the identity test does so). (Path C / Phase 6 will make the supervisor
-    // restartable too, at which point even this guard relaxes.)
-    if name == "supervisor" {
-        return -1;
-    }
+    // Path C / Phase 6: NO service is unkillable via this syscall — the only truly unkillable thing is
+    // the kernel itself. The `supervisor` used to be rejected here (it was the non-restartable trusted
+    // root); it is now **restartable** — the kernel respawns it on death, unconditionally and forever
+    // (a bound would just re-introduce the reboot and hand an attacker a DoS — see
+    // `task::poll_supervisor_respawn`). So a SERVICE_CONTROL holder (the `chaos` utility, the operator
+    // control channel) may kill it, and the kernel recovers it. (`init` is gone, Phase 5; `registry`
+    // retired, Phase 4; `fs`/`block-driver` were already restartable.) The shell still refuses a
+    // *casual* `kill supervisor`/`restart supervisor` at the command layer (CORE_SERVICES); deliberate
+    // chaos goes through `chaos kill-storm supervisor`.
     if crate::task::kill_by_name(name) {
         // A kill bumps the dead endpoint's generation and could (if a bug let it
         // target a trusted service) take down the TCB. Now that the kill has

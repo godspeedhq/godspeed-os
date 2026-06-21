@@ -269,7 +269,7 @@ os/
 | Kernel            | Enforces all isolation                              |
 | `arch/x86_64`     | Direct hardware access                              |
 | `kernel/smp`      | Concurrent-correctness primitives                   |
-| `supervisor`      | Holds restart authority; **spawned directly by the kernel** (init removed, Phase 5); the sole non-restartable trusted root |
+| `supervisor`      | Holds restart + name authority; **spawned directly by the kernel** (init removed, Phase 5); trusted but **restartable** — the kernel respawns it on death (Phase 6, §6.2), so the only non-restartable thing is the kernel itself |
 | `xhci`, `ehci` (DMA drivers) | **Machine-dependent (H1, §6.4):** in the TCB only on a machine with no IOMMU to confine them (DMA-anywhere = kernel-equivalent reach); **dropped** from it — least-privilege and restartable — wherever an IOMMU confines them to their arena. The case is reported loudly at boot (invariant 12). |
 
 > **Amendment 2026-06-12 (H1): DMA-capable drivers are no longer an unconditional TCB
@@ -319,32 +319,53 @@ os/
 
 ### 6.2 Failure Semantics
 
-> **Failure of the TCB service (`supervisor`) results in kernel panic and immediate system reboot. No automatic recovery is attempted.** (`init` was removed in Path C / Phase 5 — the kernel spawns the supervisor directly, so the supervisor is the sole non-restartable trusted root. Path C / Phase 6 will make even the supervisor restartable, leaving the kernel the only unkillable thing.)
+> **The only unkillable component is the kernel itself.** Every userspace service — including the
+> `supervisor` — is restartable; its death is recovered, never a reboot.
 
-> **`registry`, `block-driver`, and `fs` are restartable, not in this set.** Their runtime
-> death is recovered by the supervisor's death-notification restart loop (the kernel notifies
-> the supervisor, which respawns them); clients see a temporary `EndpointDead` / lookup miss,
-> reacquire via the registry, and retry (§14.3). `fs` re-mounts to a consistent state via its
-> crash-consistency journal (Phase C; `docs/persistence.md` §6.8). `registry` left the TCB via
-> H11; `block-driver` + `fs` via the Phase D amendment (§6.1). Only their *boot-time* spawn
-> failure is fatal (§11.3).
+> **Amendment 2026-06-21 (Path C / Phase 6): the `supervisor` is restartable; its death is no longer
+> a kernel panic.** When the supervisor dies (a fault, or a deliberate kill — `chaos kill-storm
+> supervisor`, the operator control channel), the **kernel respawns it** — the kernel is the
+> last-resort recovery anchor, the one thing that cannot die (§3.7). The respawned supervisor
+> re-registers its death-notification endpoint in the kernel directory (so notifications re-point to
+> it) and **reconciles**: it adopts the still-running services (reacquiring each by name) rather than
+> duplicating them, and respawns any that died. The non-restartable set is now **`{kernel}` alone** —
+> §6.3's goal reached at its floor. (`init` removed, Phase 5; `registry` retired, Phase 4;
+> `block-driver` + `fs` restartable, Phase D.) Pinned by §22 Test 15.
+>
+> **The respawn is unbounded — deliberately.** The kernel respawns the supervisor *unconditionally,
+> forever*; there is no cap-then-panic. A bound would re-introduce the very reboot this eliminates
+> (deferred from 1 death to N) and hand an attacker a trivial denial-of-service (kill the supervisor N
+> times to force a reboot). This is **not** unbounded-resource behaviour (§26.6): each respawn first
+> reclaims the dead instance's frames/kstack/caps, then allocates fresh, so the footprint is constant
+> and reclaimed every time — only a *count* grows, and a count is not a resource. Each respawn is loud
+> (logged with a running count, §26.4/§26.7), so a sustained loop is visible and an operator can
+> intervene, but the system stays **alive** rather than rebooting. "Assume the worst" → always recover.
+
+> **`registry`, `block-driver`, and `fs` are restartable.** Their runtime death is recovered by the
+> supervisor's death-notification restart loop (the kernel notifies the supervisor, which respawns
+> them); clients see a temporary `EndpointDead` / lookup miss, reacquire **by name via the kernel
+> directory**, and retry (§14.3). `fs` re-mounts to a consistent state via its crash-consistency
+> journal (Phase C; `docs/persistence.md` §6.8). `registry` left the TCB via H11 (then the service was
+> retired, Phase 4); `block-driver` + `fs` via the Phase D amendment (§6.1). Only their *boot-time*
+> spawn failure is fatal (§11.3).
 
 > **Failure on any core that corrupts shared kernel state (capability table, routing table) results in kernel panic on all cores.**
 
 Silent recovery of TCB state risks undefined system state. Loud failure plus clean restart is the only safe v1 option.
 
-### 6.3 Reducing TCB Over Time — **goal reached**
+### 6.3 Reducing TCB Over Time — **goal reached, at the floor**
 
-The v2 goal was: only `init`, `supervisor`, and the kernel remain non-restartable. That goal
-is now **met and exceeded**. `registry` was dropped early via H11 (a restartable userspace name
-service, then **retired entirely** in naming Phase 4 / Path C); `block-driver` and `fs` were dropped
-via the **Phase D amendment (§6.1, 2026-06-17)** once the filesystem gained crash-consistent recovery
-(the redo-journal, `docs/persistence.md` §6.8) — so an `fs` restart re-mounts to a consistent state
-rather than corrupting it. **`init` was then removed outright** (Path C / Phase 5): the kernel spawns
-the supervisor directly, so the non-restartable set is now just **`supervisor` + kernel** (plus DMA
-drivers only on a machine without an IOMMU, §6.4). **Path C / Phase 6 goes to the floor** — making the
-*supervisor itself* restartable (the kernel respawns it; it recovers from the kernel's name directory),
-leaving the **kernel the only unkillable thing** (`docs/naming-design.md` §3.7).
+The v2 goal was: only `init`, `supervisor`, and the kernel remain non-restartable. That goal is now
+**met and exceeded — the non-restartable set is `{kernel}` alone.** `registry` was dropped early via
+H11 (a restartable userspace name service, then **retired entirely** in naming Phase 4 / Path C);
+`block-driver` and `fs` were dropped via the **Phase D amendment (§6.1, 2026-06-17)** once the
+filesystem gained crash-consistent recovery (the redo-journal, `docs/persistence.md` §6.8) — so an
+`fs` restart re-mounts to a consistent state rather than corrupting it. **`init` was removed outright**
+(Path C / Phase 5): the kernel spawns the supervisor directly. And finally **the `supervisor` itself
+was made restartable** (Path C / Phase 6, §6.2): the kernel respawns it on death — unconditionally,
+forever — and it recovers from the kernel's name directory (adopting the live services). So the
+**kernel is the only unkillable thing** (`docs/naming-design.md` §3.7) — DMA drivers aside, and only
+on a machine without an IOMMU (§6.4). The floor is reached; there is nothing left to shrink.
 
 ### 6.4 DMA-Capable Drivers and the IOMMU (H1)
 
@@ -1219,7 +1240,7 @@ The bar across every category is the same as identity: **no FAIL, no BLOCKED wit
 
 #### Identity (§22) — Complete
 
-All passing (Tests 1–14; harness reports 23 cases incl. A/B + IR + Test 11). No regressions allowed. Any failure here is a constitutional violation that requires either a kernel fix or a CLAUDE.md amendment. **Test 11 (added by H11) is now *name-resolves-after-restart-via-the-kernel-directory* — the registry service was retired in naming Phase 4 / Path C (`docs/naming-design.md` §3.7), so Test 11 pins the directory's restart property instead of a registry service.** **Test 1B now corrupts the `supervisor` (the registry it used to corrupt is gone).**
+All passing (Tests 1–15; harness reports 24 cases incl. A/B + IR + Test 11 + Test 15). No regressions allowed. Any failure here is a constitutional violation that requires either a kernel fix or a CLAUDE.md amendment. **Test 11 (added by H11) is now *name-resolves-after-restart-via-the-kernel-directory* — the registry service was retired in naming Phase 4 / Path C (`docs/naming-design.md` §3.7), so Test 11 pins the directory's restart property instead of a registry service.** **Test 1B now corrupts the `supervisor` (the registry it used to corrupt is gone).** **Test 15 (Path C / Phase 6) pins that the `supervisor` itself survives its own restart — the kernel respawns it, so the unkillable set is `{kernel}` alone.**
 
 ---
 
@@ -1869,6 +1890,34 @@ field (`LastRecvBadge` syscall) — a client cannot fake a file-cap invocation o
 
 ---
 
+### Test 15: Supervisor Survives Its Own Restart (Path C / Phase 6)
+
+**Pins:** §6.2 (the supervisor is restartable — its death is a kernel respawn, not a reboot), §6.3
+(TCB-shrink reached its floor: unkillable = `{kernel}`), §3.7/§4.4 (the kernel is the recovery
+anchor), §14 (restart authority), §3.11 (identity over location).
+
+> **Amendment 2026-06-21 (Path C / Phase 6): the supervisor is restartable.** Killing it (a fault, or
+> a deliberate `chaos kill-storm supervisor` / the operator control channel) must **not** panic the
+> kernel. The kernel respawns it — unconditionally, forever (no bound: a bound would re-introduce the
+> reboot and be a DoS, §6.2) — and the respawned supervisor **reconciles**: it adopts the still-running
+> services (reacquiring each by name from the kernel directory) instead of duplicating them. The
+> running services (pong/ping cross-core IPC, the shell) keep going throughout — the shell survives
+> killing its own spawner. This is the executable proof that the unkillable set is `{kernel}` alone.
+
+```
+test supervisor_survives_own_restart:           # osdev test identity (also: chaos kill-storm supervisor)
+    wait_for_serial("supervisor: ready")
+    control.kill("supervisor")                    # was a kernel panic pre-Phase-6 (it was trusted root)
+
+    assert serial_contains("kernel: supervisor died — respawning")   # the kernel is the recovery anchor
+    assert serial_contains("supervisor: adopted running block-driver") # reconciled, not duplicated
+    assert kernel_did_not_panic()
+    # The shell-test storms it 4× (chaos kill-storm supervisor 4 → recovered 4/4, kernel alive, no
+    # bound) and the prompt still answers afterward — the system stayed up across every respawn.
+```
+
+---
+
 ### 22.6 Test Coverage Matrix
 
 | Test                              | Spec sections pinned       | Constitutional invariant      |
@@ -1887,6 +1936,7 @@ field (`LastRecvBadge` syscall) — a client cannot fake a file-cap invocation o
 | 12. Confined driver DMA faults    | §3.1, §6.4, §12            | No ambient authority (DMA)    |
 | 13. fs survives own restart       | §6.1, §6.2, §6.3, §15, §14 | Restartability / TCB shrink   |
 | 14. File is a capability          | §7.3, §7.10, §3.1, §3.3    | Authority is explicit (files) |
+| 15. Supervisor survives own restart | §6.2, §6.3, §3.7, §14, §3.11 | Restartability / unkillable = {kernel} |
 
 If any cell becomes obsolete, the corresponding spec section is being changed and the change requires a CLAUDE.md amendment.
 
@@ -2000,7 +2050,7 @@ Filesystem persistence beyond the trusted block driver, network stack, work-stea
 - **Quantum** — The 10 ms time slice after which the per-core scheduler preempts.
 - **Routing table** — Kernel structure mapping `EndpointId → (CoreId, Generation, Liveness)`.
 - **TCB** — Trusted Computing Base. Kernel + arch + smp + init + supervisor. `registry` left the TCB via H11 (and the **registry service was then retired entirely** — naming Phase 4 / Path C, `docs/naming-design.md` §3.7); `block-driver` + `fs` left via the Phase D amendment (§6.1, once `fs` gained crash-consistent recovery). DMA drivers (`xhci`/`ehci`) are in the TCB only on a machine without an IOMMU (§6.4).
-- **Trusted root** — `supervisor` (sole; `init` was removed in Path C / Phase 5 — the kernel spawns the supervisor directly). Its failure reboots the system; it is the only remaining non-restartable service. (`block-driver` + `fs` are restartable storage services.) *(Path C, §3.7, makes the supervisor restartable too — Phase 6 — leaving the kernel the only unkillable thing.)*
+- **Trusted root** — `supervisor` (sole; `init` was removed in Path C / Phase 5 — the kernel spawns the supervisor directly). It is **trusted but restartable** (Path C / Phase 6, §6.2): the kernel respawns it on death — unconditionally, forever — so its failure is recovered, not a reboot. The **only unkillable component is the kernel itself**. (`block-driver` + `fs` are restartable storage services.)
 - **Name directory** — the kernel's minimal `name → EndpointId` map (`ipc::names`) + a gated "mint a SEND cap by name" (`AcquireSendCap`). The bounded recovery anchor that **replaced the registry service** (naming Phase 4 / Path C, §3.7): the supervisor wires services from a `name → cap` map and clients reacquire names through the directory. *(The retired `registry` userspace name service is `docs/registry.md` — historical.)*
 - **Service** — Userspace component with a contract, capability table, and isolated address space.
 - **Contract** — `service.toml` declaring resource, capability, and placement requirements.

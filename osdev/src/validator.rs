@@ -1427,6 +1427,29 @@ static TESTS: &[TestSpec] = &[
             timeout_secs: 60,
         },
     },
+    TestSpec {
+        // §22 Test 15 (Path C / Phase 6): the SUPERVISOR is restartable — its death is no longer a
+        // kernel panic. Killing it (via the operator control channel) must NOT panic the kernel; the
+        // KERNEL respawns it (the last-resort recovery anchor, §3.7); the respawned supervisor
+        // RECONCILES — adopts the still-running services (e.g. block-driver) instead of duplicating
+        // them — and reaches "ready" again. Proves the unkillable set is now {kernel} alone (§6.2).
+        id: "15", name: "supervisor_survives_own_restart", spec_ref: "§22 Test 15",
+        kind: TestKind::WithRestart {
+            wait_for:     "supervisor: ready",
+            restart_cmd:  "KILL supervisor",
+            // Both markers are RESPAWN-ONLY (a fresh boot logs neither): "respawning" proves the
+            // kernel is the recovery anchor; "adopted running block-driver" proves the respawned
+            // supervisor reconciled the live services (the last step of its boot, just before it
+            // re-enters its loop) instead of panicking or duplicating them. (We avoid asserting
+            // "supervisor: ready" — that string also appears on the first boot, before the kill.)
+            expect_after: &[
+                "kernel: supervisor died — respawning",
+                "supervisor: adopted running block-driver",
+            ],
+            fail_on:      &["KERNEL PANIC"],
+            timeout_secs: 90,
+        },
+    },
 ];
 
 // ---------------------------------------------------------------------------
