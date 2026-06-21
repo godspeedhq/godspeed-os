@@ -15,16 +15,20 @@ the supervisor restartable, leaving the kernel the only unkillable thing.
 
 ## Restartable services
 
+**Directly auto-restarted** — the kernel notifies the supervisor of their death, which respawns them:
+
 | Service      | Notes |
 |--------------|-------|
 | `block-driver/` | Restartable (Phase D); holds no persistent state; re-inits the controller on respawn |
 | `fs/`        | Restartable (Phase D); re-mounts to a consistent state via its crash-consistency journal (§6.8) |
-| `logger/`    | Stateless; ring buffer preserves recent output across restarts |
-| `ping/`      | Stateless; canonical client restart pattern (§14.2) |
-| `pong/`      | Stateless; spawned first by supervisor (before probe services) |
+| `shell/`     | The user's interface — a crash or `kill shell` respawns a fresh prompt (in-flight command lost — a re-init, not a resume). "Nothing escapes" |
 
-The kernel notifies the supervisor of any restartable service's death; the supervisor respawns
-it. `block-driver` must respawn before `fs` (fs's send-peer cap to it wires at spawn).
+`block-driver` must respawn before `fs` (fs's send-peer cap to it wires at spawn).
+
+**Revived on a supervisor respawn** — `logger`, `xhci`, `ehci`, `ping`, `pong` are not watched
+individually (so probe/app churn never floods the supervisor), but a supervisor respawn re-runs its
+boot sequence and re-spawns every service it owns *fresh*. So they come back whenever the supervisor
+is restarted (hardware-proven by `chaos max-carnage`, `utilities/38_chaos.md`).
 
 ## Supervisor spawn order
 

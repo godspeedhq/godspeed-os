@@ -341,13 +341,16 @@ os/
 > (logged with a running count, §26.4/§26.7), so a sustained loop is visible and an operator can
 > intervene, but the system stays **alive** rather than rebooting. "Assume the worst" → always recover.
 
-> **`registry`, `block-driver`, and `fs` are restartable.** Their runtime death is recovered by the
+> **`block-driver`, `fs`, and `shell` are restartable.** Their runtime death is recovered by the
 > supervisor's death-notification restart loop (the kernel notifies the supervisor, which respawns
 > them); clients see a temporary `EndpointDead` / lookup miss, reacquire **by name via the kernel
 > directory**, and retry (§14.3). `fs` re-mounts to a consistent state via its crash-consistency
-> journal (Phase C; `docs/persistence.md` §6.8). `registry` left the TCB via H11 (then the service was
-> retired, Phase 4); `block-driver` + `fs` via the Phase D amendment (§6.1). Only their *boot-time*
-> spawn failure is fatal (§11.3).
+> journal (Phase C; `docs/persistence.md` §6.8). The **`shell`** is the user's interface — a crash or a
+> deliberate `kill shell` respawns a *fresh prompt* (the in-flight command is lost — a re-init, not a
+> resume, §14.2/§25 — but the session recovers) instead of leaving a dead session; closing the one
+> service that used to stay dead-forever if killed ("nothing escapes"; invariant 6). `registry` left
+> the TCB via H11 (then the service was retired, Phase 4); `block-driver` + `fs` via the Phase D
+> amendment (§6.1). Only their *boot-time* spawn failure is fatal (§11.3).
 
 > **Failure on any core that corrupts shared kernel state (capability table, routing table) results in kernel panic on all cores.**
 

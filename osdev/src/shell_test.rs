@@ -2010,6 +2010,32 @@ pub fn run_fs_restart(image_path: &Path, persist_path: &str, smp: u32) {
     }
     check!(got, "read /t.txt AFTER restart (shell reacquired fs, file persisted)");
 
+    // ── Shell restartable ("nothing escapes"): KILL the shell itself over the control channel. The
+    // shell is the user's interface — pre-Phase-this it was the one service that stayed dead forever
+    // if killed (ensure_-wired + unwatched). Now the kernel notifies the supervisor of its death and
+    // the supervisor respawns a FRESH prompt; the new shell must answer input (the session recovers,
+    // the in-flight command is lost — a re-init, not a resume, §14.2/§25). Invariant 6.
+    println!("fs-restart: sending 'KILL shell' over the control channel …");
+    match retry_tcp_connect(ctrl_port, Duration::from_secs(10)) {
+        Some(mut ctrl) => { thread::sleep(Duration::from_millis(100)); send(&mut ctrl, b"\nKILL shell\n");
+            let restarted = collect_until(&buf, &mut cursor, b"supervisor: shell restarted", Duration::from_secs(20));
+            check!(restarted.is_some(), "supervisor observed shell death and restarted it");
+            let ready = collect_until(&buf, &mut cursor, b"shell: ready", Duration::from_secs(20));
+            check!(ready.is_some(), "a fresh shell prompt came up after the kill");
+            drop(ctrl);
+        }
+        None => { println!("fs-restart: FAIL — could not connect to control port (shell kill)"); fail += 1; }
+    }
+    // The FRESH shell answers commands — proof the session recovered, not just a log line.
+    let mut answered = false;
+    for _ in 0..4 {
+        if let Some(r) = run!(b"cores\r", 10) {
+            if r.contains("cores:") { answered = true; break; }
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    check!(answered, "the restarted shell answers commands (session recovered)");
+
     // No panic anywhere in the whole session.
     let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
     check!(!whole.contains("KERNEL PANIC"), "kernel never panicked across the restart");

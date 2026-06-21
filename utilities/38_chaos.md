@@ -91,10 +91,12 @@ still be finishing its re-mount). If the save never lands in budget, the console
 
 `chaos max-carnage [rounds]` reads the **live task set** (exactly what `observe now` shows) and, each
 round, kills **one at random** — everything is fair game **except the shell** (killing it would kill
-this command) and the **kernel** (not a task, cannot be killed). Recoverable victims
-(supervisor/block-driver/fs) are confirmed back up; the rest stay dead, which is *expected* (nothing
-auto-restarts them). The victim is chosen with a tiny `xorshift64` PRNG seeded from the **TSC** (so the
-sequence differs every run).
+this very command, which runs *inside* the shell) and the **kernel** (not a task, cannot be killed).
+The shell is itself restartable — a direct `kill shell` respawns a fresh prompt — but `max-carnage`
+can't be the one to kill it, because a fresh shell wouldn't resume the in-flight carnage loop.
+Directly-restarted victims (supervisor/block-driver/fs) are confirmed back up; the rest come back on
+the next supervisor respawn (see below). The victim is chosen with a tiny `xorshift64` PRNG seeded from
+the **TSC** (so the sequence differs every run).
 
 The point is **not** per-service recovery — it is that the **kernel survives any sequence of random
 service deaths**. The verdict is therefore about kernel survival: the report existing at all proves no

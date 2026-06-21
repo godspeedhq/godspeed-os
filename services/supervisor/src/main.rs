@@ -339,6 +339,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 if spawn_wired(&ctx, &mut name_map, "fs", &["block-driver"]) { ctx.log("supervisor: fs restarted"); }
                 else { ctx.log("supervisor: fs restart FAILED"); }
             }
+            "shell" => {
+                // The user's interface is restartable too ("nothing escapes"): a crash or a
+                // deliberate `kill shell` respawns a FRESH prompt. spawn_wired spawns a new instance
+                // (the singleton guard only blocks a LIVE duplicate), re-granting its console-read +
+                // service_control caps and wiring its `fs` peer from the map. The in-flight command
+                // is lost (state is not resumed, §14.2/§25) but the session recovers.
+                ctx.log("supervisor: shell died, restarting");
+                if spawn_wired(&ctx, &mut name_map, "shell", &["fs"]) { ctx.log("supervisor: shell restarted"); }
+                else { ctx.log("supervisor: shell restart FAILED"); }
+            }
             _ => {}
         }
     }
