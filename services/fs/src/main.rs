@@ -300,9 +300,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         data_journal_test(&ctx, f);
     }
 
-    // Register our name so clients can (re)acquire a cap to us via the registry — the path
-    // that lets the shell recover after an `fs` restart (Phase D, §14.3).
-    let _ = ctx.register("fs");
+    // Path C (Phase 4): no self-registration — the kernel name-directory records "fs" at spawn
+    // (refreshed on restart), so the shell reacquires us by name via the directory (§14.3).
 
     ctx.log("fs: serving file API");
     loop {

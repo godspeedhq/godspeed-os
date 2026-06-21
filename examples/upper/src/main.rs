@@ -24,8 +24,8 @@ use godspeed_sdk::{Message, ServiceContext};
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
-    // Register so the shell can resolve our endpoint to send us a stage's input.
-    let _ = ctx.register("upper");
+    // Path C (Phase 4): no self-registration — the kernel name-directory records "upper" at spawn,
+    // so the shell resolves our endpoint by name via the directory (`acquire_send_grant_cap`).
     ctx.log("upper: ready");
 
     let mut out = [0u8; 4096]; // one message's worth (MAX_PAYLOAD)

@@ -4,7 +4,6 @@ members = [
     "kernel",
     "services/init",
     "services/supervisor",
-    "services/registry",
     "services/logger",
     "services/block-driver",
     "services/fs",

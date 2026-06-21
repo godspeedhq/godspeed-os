@@ -486,9 +486,8 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
         Err(e) => ctx.log_fmt(format_args!("block-driver: AHCI read self-test FAILED: {}", e)),
     }
 
-    // Register our name so `fs` can (re)acquire a cap to us via the registry after a
-    // block-driver restart (Phase D, §14.3).
-    let _ = ctx.register("block-driver");
+    // Path C (Phase 4): no self-registration — the kernel name-directory records "block-driver"
+    // at spawn (refreshed on restart), so `fs` reacquires us by name via the directory (§14.3).
 
     // Serve block read/write requests from `fs` over IPC (READ/WRITE DMA EXT).
     ctx.log("block-driver: AHCI serving block I/O");

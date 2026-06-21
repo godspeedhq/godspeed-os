@@ -135,22 +135,11 @@ fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u3
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
-    // Phase 1 shadow map (docs/naming-design.md): name → endpoint cap, built as we spawn the
-    // real services below. Not yet read to wire anything — proving the supervisor can hold it.
+    // Naming migration (docs/naming-design.md): `name → cap` map, built as we spawn the real
+    // services. The supervisor wires dependents from it; clients resolve/reacquire names via the
+    // kernel name-directory (Path C, §3.7 — the registry *service* is retired, Phase 4).
     #[allow(unused_mut)]
     let mut name_map = NameCapMap::new();
-
-    // Phase 3b (docs/naming-design.md, §11): the supervisor owns naming, so it spawns the name
-    // service FIRST and records its endpoint cap — then it can provide `registry` to every service
-    // it wires, with no kernel name resolution. Moved here from `init`. Boot-time failure is FATAL
-    // (§11.3): the name service must come up to bootstrap, so we abort (→ kernel panic) just as
-    // init did. Spawned in every build (ungated), before pong/ping/probes register with it.
-    ctx.log("supervisor: spawning registry (name service)...");
-    spawn_mapped(&ctx, &mut name_map, "registry", 0xFFFF);
-    if name_map.get("registry").is_none() {
-        ctx.log("supervisor: FATAL: failed to spawn registry");
-        ctx.abort("registry spawn failed");
-    }
 
     // Spawn pong and ping first so IPC between them is established well before
     // probe services compete for scheduler quanta.  Pong must precede ping:
@@ -234,15 +223,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // from the name table at fs's spawn), and BOTH must precede the shell (the shell's
     // send-peer cap to `fs` wires the same way). On a machine with no SATA disk both come
     // up and idle gracefully (block-driver: "no controller"; fs: raw-tolerant).
+    // Phase 4 (Path C): the registry service is gone. block-driver has no peers; fs's only peer is
+    // block-driver, provided from the map. Clients reacquire names via the kernel directory.
+    //
+    // block-driver is also spawned in `identity-only` builds — it idles harmlessly with no disk
+    // (QEMU has no -drive there: "no controller"), giving §22 Test 11 a restartable victim to kill.
+    #[cfg(any(feature = "bare-metal", feature = "blockdev", feature = "identity-only"))]
+    spawn_mapped(&ctx, &mut name_map, "block-driver", 0xFFFF);
+    // fs needs a disk → bare-metal / blockdev only.
     #[cfg(any(feature = "bare-metal", feature = "blockdev"))]
-    {
-        // Phase 3b: all real services are now FULLY wired from the supervisor's map — including
-        // their `registry` peer (the supervisor spawned registry above and holds its cap). No
-        // kernel name resolution at boot for these. block-driver registers itself with registry;
-        // fs reaches block-driver + registers; the shell reaches fs + reacquires it via registry.
-        spawn_wired(&ctx, &mut name_map, "block-driver", &["registry"]);
-        spawn_wired(&ctx, &mut name_map, "fs", &["block-driver", "registry"]);
-    }
+    spawn_wired(&ctx, &mut name_map, "fs", &["block-driver"]);
 
     // shell: the interactive prompt. Spawned in bare-metal (the USB image rests
     // here) and full builds; excluded from test-specific builds.
@@ -250,8 +240,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
-    // Phase 3a/3b: shell's `fs` and `registry` peers are both wired from the supervisor's map.
-    spawn_wired(&ctx, &mut name_map, "shell", &["fs", "registry"]);
+    // Phase 3a: shell's `fs` peer is wired from the supervisor's map (no registry — retired).
+    spawn_wired(&ctx, &mut name_map, "shell", &["fs"]);
 
     // xhci: USB host-controller driver (§12). Spawned in bare-metal + full
     // builds; the kernel maps its controller's MMIO BAR at spawn (Stage 2).
@@ -291,26 +281,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     loop {
         let msg = ctx.recv();
         let name = core::str::from_utf8(msg.payload_bytes()).unwrap_or("");
-        // Restartable services (§6.1 as amended): registry (H11), and fs + block-driver (Phase D).
-        // Phase 3c (docs/naming-design.md): respawn WIRED FROM THE MAP — same peers as at boot —
-        // and the spawn refreshes the map with the new instance's cap (record updates in place, so
-        // a kill-storm can't grow the map). The restarted service is supervisor-wired just like at
-        // boot (no kernel name resolution); cross-service stale peer caps are still the client's
-        // reacquire (§14.3). The "died/restarted" log lines are kept (tests + operators gate on them).
+        // Restartable services (§6.1): fs + block-driver (Phase D). Phase 3c/4 (docs/naming-design.md):
+        // respawn WIRED FROM THE MAP — same peers as at boot — and the spawn refreshes the map with
+        // the new instance's cap (record updates in place, so a kill-storm can't grow the map). The
+        // restarted service is supervisor-wired just like at boot; clients reacquire it by name via
+        // the kernel directory (§14.3). The "died/restarted" log lines are kept (tests gate on them).
         match name {
-            "registry" => {
-                ctx.log("supervisor: registry died, restarting");
-                if spawn_mapped(&ctx, &mut name_map, "registry", 0xFFFF) { ctx.log("supervisor: registry restarted"); }
-                else { ctx.log("supervisor: registry restart FAILED"); }
-            }
             "block-driver" => {
                 ctx.log("supervisor: block-driver died, restarting");
-                if spawn_wired(&ctx, &mut name_map, "block-driver", &["registry"]) { ctx.log("supervisor: block-driver restarted"); }
+                if spawn_mapped(&ctx, &mut name_map, "block-driver", 0xFFFF) { ctx.log("supervisor: block-driver restarted"); }
                 else { ctx.log("supervisor: block-driver restart FAILED"); }
             }
             "fs" => {
                 ctx.log("supervisor: fs died, restarting");
-                if spawn_wired(&ctx, &mut name_map, "fs", &["block-driver", "registry"]) { ctx.log("supervisor: fs restarted"); }
+                if spawn_wired(&ctx, &mut name_map, "fs", &["block-driver"]) { ctx.log("supervisor: fs restarted"); }
                 else { ctx.log("supervisor: fs restart FAILED"); }
             }
             _ => {}
@@ -528,8 +512,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     // iso-xlife: both victims first so they exist when the controller's first kill
     // fires; controller (core 1) then times kill/spawn of near (core 1) and far (core 2).
     #[cfg(feature = "iso-xlife")] { let _ = ctx.spawn("xlife-near"); let _ = ctx.spawn("xlife-far"); let _ = ctx.spawn("xlife"); }
-    // iso-reg: registry round-trip self-test. registry is already up (init spawns it).
-    #[cfg(feature = "iso-reg")] { let _ = ctx.spawn("reg-roundtrip"); }
+    // (iso-reg reg-roundtrip self-test removed — registry service retired, Path C / Phase 4.)
     #[cfg(feature = "iso-s9")]   {
         let _ = ctx.spawn("stress-s9-recv");
         let _ = ctx.spawn("stress-s9-send-a");
