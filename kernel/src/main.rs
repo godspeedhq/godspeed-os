@@ -1,4 +1,4 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
@@ -25,7 +25,7 @@ mod task;
 use core::panic::PanicInfo;
 
 // ---------------------------------------------------------------------------
-// Capability enforcement tests — Milestone 4 (synchronous, pre-scheduler).
+// Capability enforcement tests - Milestone 4 (synchronous, pre-scheduler).
 // ---------------------------------------------------------------------------
 
 fn test_cap_enforcement() {
@@ -44,17 +44,17 @@ fn test_cap_enforcement() {
     match tbl.get(slot, Rights::WRITE) {
         Ok(c) => {
             assert_eq!(c.resource_id, LOG_WRITE_RESOURCE);
-            kprintln!("cap-test: 2A pass — held cap validates OK");
+            kprintln!("cap-test: 2A pass - held cap validates OK");
         }
-        Err(e) => panic!("cap-test: 2A FAIL — expected Ok, got {:?}", e),
+        Err(e) => panic!("cap-test: 2A FAIL - expected Ok, got {:?}", e),
     }
 
     let empty = CapTable::empty();
     match empty.get(0, Rights::WRITE) {
         Err(CapError::CapNotHeld) =>
-            kprintln!("cap-test: 2B pass — no cap returns CapNotHeld"),
+            kprintln!("cap-test: 2B pass - no cap returns CapNotHeld"),
         other =>
-            panic!("cap-test: 2B FAIL — expected CapNotHeld, got {:?}", other),
+            panic!("cap-test: 2B FAIL - expected CapNotHeld, got {:?}", other),
     }
 
     let read_only_cap = mint_cap(LOG_WRITE_RESOURCE, Rights::READ);
@@ -62,9 +62,9 @@ fn test_cap_enforcement() {
     let slot2 = tbl2.insert(read_only_cap).expect("insert");
     match tbl2.get(slot2, Rights::WRITE) {
         Err(CapError::CapInsufficientRights) =>
-            kprintln!("cap-test: 2C pass — wrong right returns CapInsufficientRights"),
+            kprintln!("cap-test: 2C pass - wrong right returns CapInsufficientRights"),
         other =>
-            panic!("cap-test: 2C FAIL — expected CapInsufficientRights, got {:?}", other),
+            panic!("cap-test: 2C FAIL - expected CapInsufficientRights, got {:?}", other),
     }
 
     let tmp_res = ResourceId(0xDEAD);
@@ -76,9 +76,9 @@ fn test_cap_enforcement() {
     revoke_resource(tmp_res);
     match tbl3.get(slot3, Rights::WRITE) {
         Err(CapError::CapRevoked) =>
-            kprintln!("cap-test: revoke pass — stale cap returns CapRevoked"),
+            kprintln!("cap-test: revoke pass - stale cap returns CapRevoked"),
         other =>
-            panic!("cap-test: revoke FAIL — expected CapRevoked, got {:?}", other),
+            panic!("cap-test: revoke FAIL - expected CapRevoked, got {:?}", other),
     }
 
     let dead_res = ResourceId(0xDEAF);
@@ -89,9 +89,9 @@ fn test_cap_enforcement() {
     mark_dead_resource(dead_res);
     match tbl4.get(slot4, Rights::SEND) {
         Err(CapError::EndpointDead) =>
-            kprintln!("cap-test: endpoint-dead pass — dead endpoint returns EndpointDead"),
+            kprintln!("cap-test: endpoint-dead pass - dead endpoint returns EndpointDead"),
         other =>
-            panic!("cap-test: endpoint-dead FAIL — expected EndpointDead, got {:?}", other),
+            panic!("cap-test: endpoint-dead FAIL - expected EndpointDead, got {:?}", other),
     }
 
     let grant_res = ResourceId(0xABCD);
@@ -106,13 +106,13 @@ fn test_cap_enforcement() {
     let r_slot = receiver.insert(transferred).expect("insert into receiver");
     assert!(receiver.get(r_slot, Rights::READ).is_ok(),
             "cap must be valid in receiver after transfer");
-    kprintln!("cap-test: grant pass — cap moved exactly once, sender empty");
+    kprintln!("cap-test: grant pass - cap moved exactly once, sender empty");
 
     kprintln!("cap-test: all tests passed");
 }
 
 // ---------------------------------------------------------------------------
-// IPC routing tests — Milestone 5 (synchronous, pre-scheduler).
+// IPC routing tests - Milestone 5 (synchronous, pre-scheduler).
 // ---------------------------------------------------------------------------
 
 fn test_ipc_routing() {
@@ -127,14 +127,14 @@ fn test_ipc_routing() {
 
     let msg = ipc::Message::new(b"hello").expect("msg");
     match ipc::routing::enqueue(ep, msg, Generation::INITIAL, None) {
-        Ok(None) => kprintln!("ipc-test: enqueue ok — message queued"),
+        Ok(None) => kprintln!("ipc-test: enqueue ok - message queued"),
         other    => panic!("ipc-test: enqueue unexpected: {:?}", other),
     }
 
     match ipc::routing::dequeue(ep, Generation::INITIAL, None) {
         Ok((m, None)) => {
             assert_eq!(m.payload_bytes(), b"hello", "payload mismatch");
-            kprintln!("ipc-test: dequeue ok — received 'hello'");
+            kprintln!("ipc-test: dequeue ok - received 'hello'");
         }
         other => panic!("ipc-test: dequeue unexpected: {:?}", other),
     }
@@ -151,7 +151,7 @@ fn test_ipc_routing() {
     let overflow = ipc::Message::new(b"overflow").expect("overflow");
     match ipc::routing::enqueue(ep, overflow, Generation::INITIAL, None) {
         Err(IpcError::QueueFull) =>
-            kprintln!("ipc-test: queue-full ok — QueueFull after 16 msgs"),
+            kprintln!("ipc-test: queue-full ok - QueueFull after 16 msgs"),
         other => panic!("ipc-test: expected QueueFull, got: {:?}", other),
     }
 
@@ -161,7 +161,7 @@ fn test_ipc_routing() {
     let m2 = ipc::Message::new(b"dead").expect("m2");
     match ipc::routing::enqueue(ep2, m2, Generation::INITIAL, None) {
         Err(IpcError::EndpointDead) =>
-            kprintln!("ipc-test: endpoint-dead ok — EndpointDead after kill"),
+            kprintln!("ipc-test: endpoint-dead ok - EndpointDead after kill"),
         other => panic!("ipc-test: expected EndpointDead, got: {:?}", other),
     }
 
@@ -172,7 +172,7 @@ fn test_ipc_routing() {
 // Kernel entry point.
 // ---------------------------------------------------------------------------
 
-// 512 KiB BSP kernel stack — Limine's boot stack is one page (4 KiB), which
+// 512 KiB BSP kernel stack - Limine's boot stack is one page (4 KiB), which
 // overflows when pre-scheduler tests pass 4 KiB Message objects by value.
 // The linker places this in .bss, so it costs nothing in the image.
 static mut BSP_BOOT_STACK: [u8; 512 * 1024] = [0u8; 512 * 1024];
@@ -188,7 +188,7 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     // survives the RSP change.
     //
     // SAFETY: BSP_BOOT_STACK is a static 512 KiB buffer; top pointer is
-    // 16-byte aligned.  boot_info_ptr remains valid — it points to data in
+    // 16-byte aligned.  boot_info_ptr remains valid - it points to data in
     // Limine's boot-time memory, not on the old stack.
     unsafe {
         let top = (core::ptr::addr_of_mut!(BSP_BOOT_STACK) as *mut u8).add(512 * 1024);
@@ -205,7 +205,7 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
 
     arch::x86_64::init(boot_info);
 
-    // Record the boot wall-clock time (RTC is raw port I/O — available immediately). `uptime`
+    // Record the boot wall-clock time (RTC is raw port I/O - available immediately). `uptime`
     // reads it via InspectKernel query 12 and reports now − boot. Captured here, as early as
     // possible, so uptime measures from true boot rather than first query.
     arch::x86_64::rtc::capture_boot_time();
@@ -213,9 +213,9 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     memory::init(boot_info);
 
     // Hardening: unmap a guard page below each kernel-stack slot so an overflow
-    // faults loudly instead of corrupting the neighbouring stack. Done here — BSP
+    // faults loudly instead of corrupting the neighbouring stack. Done here - BSP
     // only, before APs and before any kstack is allocated, so no TLB shootdown is
-    // needed and init's stack already carries its guard. (Safe fn — boot-ordering
+    // needed and init's stack already carries its guard. (Safe fn - boot-ordering
     // contract, not UB; the page-unmap unsafe lives in the arch layer.)
     task::install_kstack_guards();
 
@@ -226,10 +226,10 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     // EHCI INTx routing needs the IOAPIC mapped; map it now (CPU MMIO, AP-independent).
     arch::x86_64::ioapic::init();
 
-    // EHCI interrupt path (§12): program it HERE — before the firmware USB handoff + IOMMU
-    // below — which is where it worked in the E2 build; deferring it past the handoff stopped
+    // EHCI interrupt path (§12): program it HERE - before the firmware USB handoff + IOMMU
+    // below - which is where it worked in the E2 build; deferring it past the handoff stopped
     // the legacy INTx from delivering on the T630. The EHCI routes to the BSP (available now,
-    // pre-smp::init — only the xHCI's core-1 MSI needs the APs up, so that one stays deferred).
+    // pre-smp::init - only the xHCI's core-1 MSI needs the APs up, so that one stays deferred).
     // The EHCI driver is pinned to the BSP (task/mod.rs) to match. Interrupters stay off until
     // each userspace driver enables them, so nothing fires yet.
     if !arch::x86_64::pci::program_ehci_msi() {
@@ -237,7 +237,7 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     }
 
     // Take a USB controller from the firmware (BIOS→OS handoff) before the IOMMU
-    // confines it — otherwise the firmware SMM keeps running its DMA out of
+    // confines it - otherwise the firmware SMM keeps running its DMA out of
     // firmware memory, which faults under confinement and breaks the keyboard.
     //
     // Handoff is only needed for a controller we confine (otherwise firmware SMM
@@ -245,17 +245,17 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     // confinement). It is gated on the same master switch as confinement: with
     // CONFINE_USB_DRIVERS off (the working daily-driver default) NO handoff runs,
     // so firmware keeps co-owning both controllers exactly as before the H1 branch
-    // — the configuration in which both keyboards work. Flip the switch to
+    // - the configuration in which both keyboards work. Flip the switch to
     // re-enable the xHCI confinement flagship (hands off + confines xHCI only).
     if task::CONFINE_USB_DRIVERS {
         arch::x86_64::pci::xhci_bios_handoff();
     }
-    // Report whether the EHCI controller supports a PCI Function-Level Reset — the
+    // Report whether the EHCI controller supports a PCI Function-Level Reset - the
     // candidate for scrubbing its stale firmware-era internal state (which HCRESET
     // doesn't clear) so it can run firmware-independent. Detection only.
     arch::x86_64::pci::ehci_flr_probe();
 
-    // H1 Phase 0: probe ACPI for an AMD-Vi IOMMU (IVRS). Detection only — reports
+    // H1 Phase 0: probe ACPI for an AMD-Vi IOMMU (IVRS). Detection only - reports
     // whether this machine can confine DMA-capable drivers to their granted
     // arena (the prerequisite for dropping xhci/ehci from the TCB).
     arch::x86_64::iommu::detect(boot_info.rsdp_addr, boot_info.hhdm_offset);
@@ -287,20 +287,20 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     #[cfg(feature = "test-bad-elf-brutal")]
     loader::run_elf_fuzz_brutal();
 
-    // Normal boot: spawn the supervisor (Path C / Phase 5 — no init), bring up APs, enter the
+    // Normal boot: spawn the supervisor (Path C / Phase 5 - no init), bring up APs, enter the
     // per-core scheduler (never returns).
     #[cfg(not(any(feature = "test-bad-elf", feature = "test-bad-elf-brutal")))]
     {
         task::spawn_supervisor();
         smp::init(boot_info);
 
-        // Hardening H4b: Limine maps the HHDM W+X (RWX direct map of all RAM — a
+        // Hardening H4b: Limine maps the HHDM W+X (RWX direct map of all RAM - a
         // kernel-wide W^X bypass). Force it NO_EXEC now that all APs are up: Limine's
         // AP long-mode bring-up runs through the executable direct map, so this must
         // come AFTER smp::init. From here nothing executes from the HHDM (the kernel
         // runs from its own .text), so the direct map is data-only for the rest of
         // runtime. audit_wx then confirms the HHDM reads NX=1.
-        // Safe fn — boot-ordering contract (must follow smp::init), not UB; the
+        // Safe fn - boot-ordering contract (must follow smp::init), not UB; the
         // CR3/PTE unsafe lives in the arch layer.
         arch::x86_64::page_tables::harden_hhdm_nx();
         arch::x86_64::boot::audit_wx();
@@ -312,7 +312,7 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
         );
 
         // Interrupt-driven USB (§12): program the xHCI's MSI now that the APs are up, so it
-        // targets the xHCI driver's core (core 1) — a keypress then wakes that core straight
+        // targets the xHCI driver's core (core 1) - a keypress then wakes that core straight
         // out of its idle `hlt`, no cross-core wake. (The EHCI was programmed earlier, before
         // the firmware handoff, routed to the BSP; see above.) The interrupter stays OFF until
         // the userspace driver enables it, so nothing fires yet.

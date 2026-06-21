@@ -1,37 +1,37 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! `osdev` — host-side developer CLI (§17).
+//! `osdev` - host-side developer CLI (§17).
 //!
 //! Commands:
-//!   osdev new <name>        — scaffold a new service
-//!   osdev build             — build kernel + all services
-//!   osdev run               — boot in QEMU (--smp N)
-//!   osdev publish           — package + serve a service
-//!   osdev restart <service> — restart a service in the running OS
-//!   osdev logs <service>    — tail service logs
-//!   osdev status <service>  — show state + assigned core
-//!   osdev caps <service>    — show held capabilities
-//!   osdev test identity         — run §22 identity test suite (20 tests)
-//!   osdev test identity-brutal  — run brutal identity tests + SMP escalation (Milestone 15)
-//!   osdev test property         — run §22 property test suite
-//!   osdev test property-brutal  — run brutal property tests BP1–BP10 (Milestone 16)
-//!   osdev test fuzz         — run §22 fuzz test suite (Milestone 10)
-//!   osdev test fuzz-brutal  — run brutal fuzz tests BF1–BF8 (Milestone 17)
-//!   osdev test stress       — run §22 stress test suite (Milestone 11)
-//!   osdev test stress-brutal — run brutal stress tests BS1–BS10 (Milestone 18)
-//!   osdev test perf         — run §22 performance benchmark suite (Milestone 12)
-//!   osdev test perf-brutal  — run brutal performance benchmarks BP1–BP10 (Milestone 19)
-//!   osdev test adv          — run §22 adversarial / red-team test suite (Milestone 13)
-//!   osdev test adv-brutal   — run brutal adversarial tests BA1–BA10 (Milestone 20)
-//!   osdev test chaos        — run §22 chaos / graceful-degradation test suite (Milestone 14)
-//!   osdev test chaos-brutal — run brutal chaos tests BC1–BC7 (Milestone 21)
-//!   osdev test shell        — scripted shell smoke-test (help, cores, status, unknown)
-//!   osdev image [--mode M]  — build + create bootable disk image (build/os.img); M=bare-metal|perf|perf-brutal|identity|stress|adv|chaos|fuzz|s8
+//!   osdev new <name>        - scaffold a new service
+//!   osdev build             - build kernel + all services
+//!   osdev run               - boot in QEMU (--smp N)
+//!   osdev publish           - package + serve a service
+//!   osdev restart <service> - restart a service in the running OS
+//!   osdev logs <service>    - tail service logs
+//!   osdev status <service>  - show state + assigned core
+//!   osdev caps <service>    - show held capabilities
+//!   osdev test identity         - run §22 identity test suite (20 tests)
+//!   osdev test identity-brutal  - run brutal identity tests + SMP escalation (Milestone 15)
+//!   osdev test property         - run §22 property test suite
+//!   osdev test property-brutal  - run brutal property tests BP1–BP10 (Milestone 16)
+//!   osdev test fuzz         - run §22 fuzz test suite (Milestone 10)
+//!   osdev test fuzz-brutal  - run brutal fuzz tests BF1–BF8 (Milestone 17)
+//!   osdev test stress       - run §22 stress test suite (Milestone 11)
+//!   osdev test stress-brutal - run brutal stress tests BS1–BS10 (Milestone 18)
+//!   osdev test perf         - run §22 performance benchmark suite (Milestone 12)
+//!   osdev test perf-brutal  - run brutal performance benchmarks BP1–BP10 (Milestone 19)
+//!   osdev test adv          - run §22 adversarial / red-team test suite (Milestone 13)
+//!   osdev test adv-brutal   - run brutal adversarial tests BA1–BA10 (Milestone 20)
+//!   osdev test chaos        - run §22 chaos / graceful-degradation test suite (Milestone 14)
+//!   osdev test chaos-brutal - run brutal chaos tests BC1–BC7 (Milestone 21)
+//!   osdev test shell        - scripted shell smoke-test (help, cores, status, unknown)
+//!   osdev image [--mode M]  - build + create bootable disk image (build/os.img); M=bare-metal|perf|perf-brutal|identity|stress|adv|chaos|fuzz|s8
 
 mod crc32;
 mod disk_image;
@@ -81,13 +81,13 @@ enum Commands {
     Image {
         /// Supervisor feature baked into the image.
         ///
-        /// bare-metal  — pong + ping + observe; no probe services (default; S6 24-hour stability)
-        /// perf        — regular perf probes B1–B10
-        /// perf-brutal — brutal perf probes BP1–BP10
-        /// identity    — identity-only probes (WatchSerial tests; WithRestart needs COM2)
-        /// stress      — S1–S10 stress probes; self-contained, no harness required
-        /// adv         — A1–A10 adversarial probes; self-contained, no harness required
-        /// chaos       — C2–C7 chaos probes; self-contained, no harness required (C1/C4 use bare-metal + HW reconfiguration)
+        /// bare-metal  - pong + ping + observe; no probe services (default; S6 24-hour stability)
+        /// perf        - regular perf probes B1–B10
+        /// perf-brutal - brutal perf probes BP1–BP10
+        /// identity    - identity-only probes (WatchSerial tests; WithRestart needs COM2)
+        /// stress      - S1–S10 stress probes; self-contained, no harness required
+        /// adv         - A1–A10 adversarial probes; self-contained, no harness required
+        /// chaos       - C2–C7 chaos probes; self-contained, no harness required (C1/C4 use bare-metal + HW reconfiguration)
         #[arg(long, default_value = "bare-metal")]
         mode: String,
     },
@@ -125,16 +125,16 @@ fn main() {
     }
 }
 
-// On-disk format — MUST match `services/fs` (docs/persistence.md §6.6/§6.10/§6.12/§6.15, GSFS0008).
+// On-disk format - MUST match `services/fs` (docs/persistence.md §6.6/§6.10/§6.12/§6.15, GSFS0008).
 // 512-byte blocks (= one AHCI sector = one block-IPC request), so block number = LBA.
 // Three structures: superblock + free bitmap + self-describing directory tree (no inode
 // table, no global file cap). All capacity-bearing fields are u64. GSFS0008: every block
-// self-verifies with a CRC32 — superblock, each directory block, and each file-data block —
+// self-verifies with a CRC32 - superblock, each directory block, and each file-data block -
 // and a BACKUP superblock copy sits at the last block (mount falls back to it). Files are a
 // contiguous extent (`type`=1) or, when no contiguous run is free, fragmented (`type`=3) with
 // `first_block` → a CRC'd extent block listing the runs. The host writer only ever bakes into
 // a fresh disk, so it always writes contiguous files (`type`=1); the fragmented path is fs-only.
-//   Superblock @ LBA 0 (and a copy @ total_blocks-1): magic[8] "GSFS0008" (FROZEN — versioning is
+//   Superblock @ LBA 0 (and a copy @ total_blocks-1): magic[8] "GSFS0008" (FROZEN - versioning is
 //     now the feature masks, never a new magic), version u32=8, block_size u32=512, total_blocks
 //     u64, bitmap_start u64=1, bitmap_blocks u64, data_start u64, root_first_block u64,
 //     root_block_count u64, free_blocks u64, flags u32, label_len u8, label[31],
@@ -155,12 +155,12 @@ const FS_BITS_PER_BMBLOCK: u64 = (FS_BLOCK_SIZE as u64) * 8; // 4096
 const FS_FEAT_COMPAT_OFF: usize = 124;
 const FS_FEAT_RO_COMPAT_OFF: usize = 128;
 const FS_FEAT_INCOMPAT_OFF: usize = 132;
-const FS_SB_CRC_OFF: usize = 136; // CRC32 over [0..136) — covers the masks
+const FS_SB_CRC_OFF: usize = 136; // CRC32 over [0..136) - covers the masks
 const FS_FEAT_COMPAT_BACKUP_SB: u32 = 0x1; // a fresh host-baked disk always has the backup superblock
 const FS_ITYPE_DIR: u8 = 2;
 const FS_JOURNAL_BLOCKS: u64 = 64; // reserved journal region (must match services/fs JOURNAL_BLOCKS)
 const FS_RECS_PER_BLOCK: usize = 7; // directory records per block (8th slot region is the CRC trailer)
-const FS_DIR_REC_REGION: usize = FS_RECS_PER_BLOCK * 64; // 448 — CRC covers [0..448)
+const FS_DIR_REC_REGION: usize = FS_RECS_PER_BLOCK * 64; // 448 - CRC covers [0..448)
 const FS_DATA_PAYLOAD: usize = 508; // file-data block payload; CRC32 trailer @508
 
 /// Stamp a directory block's CRC32 trailer (over its 448-byte record region) at offset 448.
@@ -242,7 +242,7 @@ fn cmd_mkfs(image: &str) {
     format_superblock(image);
 }
 
-/// Bake a file into a GSFS0008 image (host-side mirror of the `fs` write path) — used to ship a
+/// Bake a file into a GSFS0008 image (host-side mirror of the `fs` write path) - used to ship a
 /// `.gsh` script on a flashable data disk, so the OS can `run /suite.gsh` on hardware with no
 /// on-device authoring. Allocates a contiguous extent, writes the content, adds a root
 /// `file_record`, and updates the free count. Intended right after `format_superblock` (minimal,
@@ -288,7 +288,7 @@ fn gsfs_add_file(path: &str, name: &str, content: &[u8]) {
     }
     free_blocks -= nblocks;
     data[64..72].copy_from_slice(&free_blocks.to_le_bytes());
-    // Re-stamp the superblock CRC32 (@136, GSFS0008) — we just mutated a superblock field (free count).
+    // Re-stamp the superblock CRC32 (@136, GSFS0008) - we just mutated a superblock field (free count).
     let sb_crc = crc32::crc32(&data[..FS_SB_CRC_OFF]);
     data[FS_SB_CRC_OFF..FS_SB_CRC_OFF + 4].copy_from_slice(&sb_crc.to_le_bytes());
     // Keep the backup superblock (last block, GSFS0008) in sync with the primary.
@@ -329,8 +329,8 @@ fn gsfs_add_file(path: &str, name: &str, content: &[u8]) {
     println!("bake: wrote /{} ({} bytes, {} block(s) at {}) into {}", name, content.len(), nblocks, first, path);
 }
 
-/// `osdev script-disk <out> <script>` — produce a flashable GSFS data disk with `<script>` baked
-/// in as `/<basename>`. Boot the OS with this disk attached and `run /<basename>` — the way to
+/// `osdev script-disk <out> <script>` - produce a flashable GSFS data disk with `<script>` baked
+/// in as `/<basename>`. Boot the OS with this disk attached and `run /<basename>` - the way to
 /// ship a self-checking suite to hardware (`dd` it to the data drive). Default 16 MiB.
 fn cmd_script_disk(out: &str, script: &str) {
     let content = std::fs::read(script)
@@ -342,7 +342,7 @@ fn cmd_script_disk(out: &str, script: &str) {
         .unwrap_or_else(|e| { eprintln!("script-disk: cannot create {}: {}", out, e); std::process::exit(1); });
     format_superblock(out);
     gsfs_add_file(out, name, &content);
-    println!("script-disk: {} ready — flash it to the data drive, then `run /{}`", out, name);
+    println!("script-disk: {} ready - flash it to the data drive, then `run /{}`", out, name);
 }
 
 fn cmd_new(name: &str) {
@@ -354,7 +354,7 @@ fn cmd_new(name: &str) {
 /// Every build mode compiles the supervisor with a different spawn-set feature.
 /// When switching modes, cargo can return a `supervisor.elf` whose mtime is OLDER
 /// than a previously-built kernel, so the kernel's `rerun-if-changed` on
-/// `supervisor.elf` never fires and the kernel keeps a STALE embedded supervisor —
+/// `supervisor.elf` never fires and the kernel keeps a STALE embedded supervisor -
 /// the resulting image/test then runs the *previous* mode's spawn set. Cleaning
 /// guarantees a fresh mtime so the kernel re-embeds the supervisor this mode built.
 /// Every `cmd_build_*` calls this first; `cmd_image` therefore does not need to.
@@ -367,7 +367,7 @@ fn clean_supervisor() {
 
 pub fn cmd_build() {
     clean_supervisor();
-    // Services must be compiled before the kernel — kernel/build.rs embeds
+    // Services must be compiled before the kernel - kernel/build.rs embeds
     // the service ELF bytes via include_bytes!(env!("SVC_*_ELF")).
     let service_crates = [
         "supervisor", "logger", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs",
@@ -437,7 +437,7 @@ pub fn cmd_build_bare_metal() {
 }
 
 /// Build for S8 idle-stability run: supervisor with `--features idle-only`.
-/// Spawns only observe — no pong, no ping, no probes.  The kernel idles on all
+/// Spawns only observe - no pong, no ping, no probes.  The kernel idles on all
 /// cores; observe snapshots system state every ~500 yields.
 /// Bar: no panic, no resource leak after 24 hours.
 pub fn cmd_build_idle() {
@@ -566,7 +566,7 @@ pub fn cmd_build_perf() {
 
 /// Like `cmd_build_perf` but uses `--features stress-only` for a self-contained
 /// hardware stress run (S1–S10). All stress probes use ctx.kill/ctx.spawn
-/// internally — no QEMU control port required.
+/// internally - no QEMU control port required.
 pub fn cmd_build_stress() {
     clean_supervisor();
     let non_supervisor = ["logger", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
@@ -731,10 +731,10 @@ pub fn cmd_build_b2_only() {
 }
 
 /// BP2 brutal-isolation build: spawns only perf-bp2 + perf-bp2-echo alongside pong/ping.
-/// Brutal equivalent of b2-only — 1000-sample iteration count, same isolation rationale.
+/// Brutal equivalent of b2-only - 1000-sample iteration count, same isolation rationale.
 /// Per-probe isolation build (`perf-iso` umbrella + one `iso-bpN` sub-feature).
 /// Spawns exactly one brutal perf probe (+ its partners), no ping/pong, no other
-/// probes — for clean, uncontended per-op latency on hardware. `feature` is the
+/// probes - for clean, uncontended per-op latency on hardware. `feature` is the
 /// supervisor sub-feature, e.g. "iso-bp5".
 pub fn cmd_build_perf_iso(feature: &str) {
     let non_supervisor = ["logger", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
@@ -814,7 +814,7 @@ pub fn cmd_build_bp2_only() {
 }
 
 /// Like `cmd_build_stress` but uses `--features adv-only` for a self-contained
-/// hardware adversarial run (A1–A10). All adversarial probes are self-contained —
+/// hardware adversarial run (A1–A10). All adversarial probes are self-contained -
 /// no QEMU control port required.
 pub fn cmd_build_adv() {
     clean_supervisor();
@@ -955,7 +955,7 @@ fn cmd_image(mode: &str) {
 
     let bootx64 = limine_dir.join("BOOTX64.EFI");
     if !bootx64.exists() {
-        eprintln!("BOOTX64.EFI not found at {} — UEFI image requires it", bootx64.display());
+        eprintln!("BOOTX64.EFI not found at {} - UEFI image requires it", bootx64.display());
         std::process::exit(1);
     }
 
@@ -1013,7 +1013,7 @@ fn cmd_logs(service: &str) {
     let mut file = match std::fs::File::open(path) {
         Ok(f)  => f,
         Err(_) => {
-            eprintln!("logs: serial log not found at {} — is `osdev run` active?", path.display());
+            eprintln!("logs: serial log not found at {} - is `osdev run` active?", path.display());
             std::process::exit(1);
         }
     };
@@ -1122,7 +1122,7 @@ fn cmd_shell(smp: u32) {
 
 /// Build like bare-metal, but compile the kernel with `--features
 /// iommu-fault-test` so the first confined driver (xhci) is confined to an EMPTY
-/// IOMMU domain — its init DMA then faults, the deterministic live proof for
+/// IOMMU domain - its init DMA then faults, the deterministic live proof for
 /// §22 Test 12 / H1 §6.4.
 fn cmd_build_iommu_fault() {
     clean_supervisor();
@@ -1152,20 +1152,20 @@ fn cmd_build_iommu_fault() {
 
 /// §22 Test 12 (H1 §6.4): boot with an emulated AMD-Vi IOMMU and a USB device on
 /// qemu-xhci, and verify the confinement guarantee structurally on a live, enabled
-/// IOMMU — the confined driver's I/O page table maps **exactly** its arena and the
+/// IOMMU - the confined driver's I/O page table maps **exactly** its arena and the
 /// page just outside it is **unmapped** (so an out-of-arena DMA has no translation
 /// and would fault), AND the driver still operates *through* the confined domain
 /// (its keyboard enumerates), AND the kernel does not panic.
 ///
 /// QEMU's `amd-iommu` does not actually *enforce* translation faults (it is lenient
 /// where real AMD-Vi is strict), so the live `IO_PAGE_FAULT` cannot be reproduced in
-/// emulation — it is hardware-verified on the T630 (and reproducible there with the
+/// emulation - it is hardware-verified on the T630 (and reproducible there with the
 /// kernel `iommu-fault-test` feature, which confines xhci to an empty domain). The
 /// `selftest` line is a CPU-side page-table walk QEMU cannot fake, so it is the
 /// portable executable form of the guarantee. Requires q35 + `-device amd-iommu`,
 /// which the BIOS/i440fx test path can't provide, so this launches QEMU itself.
 fn run_iommu_test() {
-    println!("\n=== §22 Test 12: confined driver — out-of-arena is unmapped (H1 §6.4) ===");
+    println!("\n=== §22 Test 12: confined driver - out-of-arena is unmapped (H1 §6.4) ===");
     cmd_build_bare_metal();
 
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
@@ -1201,7 +1201,7 @@ fn run_iommu_test() {
     let log = log.replace('\r', "");
     let confined      = log.contains("confined BDF");
     // The selftest proves the confined page table maps exactly the arena and the
-    // page just outside it is unmapped — the structural form of "out-of-arena DMA
+    // page just outside it is unmapped - the structural form of "out-of-arena DMA
     // would fault".
     let outside_unmapped = log.contains("selftest PASS") && log.contains("(outside) unmapped");
     let works_confined   = log.contains("keyboard found");          // driver operates through the domain
@@ -1223,7 +1223,7 @@ fn run_iommu_test() {
 }
 
 /// Boot the blockdev image once with `persist` on the ATA secondary channel,
-/// capture the serial log, and return it. The persist disk is NOT recreated —
+/// capture the serial log, and return it. The persist disk is NOT recreated -
 /// the caller controls its lifecycle (key for the reboot-survival test).
 fn boot_blockdev_qemu(img_str: &str, persist_str: &str, serial: &str, secs: u64) -> String {
     let _ = std::fs::remove_file(serial);
@@ -1275,7 +1275,7 @@ fn build_blockdev_fs(fs_features: &str, bd_features: &str) {
         if !status.success() { eprintln!("build: {} FAILED", crate_name); std::process::exit(1); }
         println!("build: {} OK", crate_name);
     }
-    // fs WITH the requested test feature — the blockdev tests assert its self-test log lines.
+    // fs WITH the requested test feature - the blockdev tests assert its self-test log lines.
     // (Production `osdev image` builds fs without it, so it never writes to a real disk.)
     let status = std::process::Command::new("cargo")
         .args(["build", "--release", "-p", "fs", "--target", "x86_64-unknown-none", "--features", fs_features])
@@ -1298,7 +1298,7 @@ fn build_blockdev_fs(fs_features: &str, bd_features: &str) {
 }
 
 /// AHCI steps A-D (docs/ahci.md): boot from a legacy-IDE disk, put the persistence
-/// disk ALONE on an ich9-ahci controller (so block-driver targets it on port 0 —
+/// disk ALONE on an ich9-ahci controller (so block-driver targets it on port 0 -
 /// mirroring the T630, where the SSD is the only SATA disk and boot is elsewhere),
 /// and verify detection, IDENTIFY, and the full fs stack (mount + file round-trip)
 /// running over AHCI READ/WRITE DMA EXT.
@@ -1329,7 +1329,7 @@ fn run_blockdev_test() {
     let mut cmd = std::process::Command::new(qemu::qemu_binary());
     cmd.args([
         "-m", "512M", "-smp", "2",
-        // Boot disk on legacy IDE (PIIX3) — SeaBIOS boots it; it is NOT SATA so
+        // Boot disk on legacy IDE (PIIX3) - SeaBIOS boots it; it is NOT SATA so
         // block-driver's AHCI scan ignores it.
         "-drive", &format!("format=raw,file={img_str},if=ide"),
         // The persistence disk ALONE on an explicit AHCI controller → port 0.
@@ -1353,7 +1353,7 @@ fn run_blockdev_test() {
     let fs_mounted = log.contains("fs: mounted GSFS");            // step C: AHCI ReadBlock
     let fs_file    = log.contains("fs: file round-trip OK")       // step D: AHCI WriteBlock+ReadBlock
         || log.contains("fs: persisted file 'greeting' verified");
-    // step E: hierarchical GSFS — mkdir + a file nested inside it, walked by path.
+    // step E: hierarchical GSFS - mkdir + a file nested inside it, walked by path.
     let fs_hier = (log.contains("fs: mkdir /etc OK") && log.contains("fs: nested file round-trip OK (/etc/motd)"))
         || log.contains("fs: nested '/etc/motd' verified across boot");
     let no_panic   = !log.contains("KERNEL PANIC");
@@ -1406,7 +1406,7 @@ fn boot_ahci_qemu(img_str: &str, persist_str: &str, serial: &str, secs: u64) -> 
 }
 
 /// AHCI reboot survival: format once, boot (fs writes `greeting` over AHCI), then
-/// reboot on the SAME SATA disk image — fs must read it back over AHCI.
+/// reboot on the SAME SATA disk image - fs must read it back over AHCI.
 fn run_blockdev_reboot_test() {
     println!("\n=== AHCI reboot survival (write → reboot → read, over SATA) ===");
     cmd_build_blockdev();
@@ -1427,13 +1427,13 @@ fn run_blockdev_reboot_test() {
     let persist_abs = std::fs::canonicalize(persist).unwrap_or_else(|_| std::path::PathBuf::from(persist));
     let persist_str = persist_abs.to_string_lossy().replace('\\', "/");
 
-    println!("ahci: boot 1 — fs creates 'greeting' over AHCI, ~25s …");
+    println!("ahci: boot 1 - fs creates 'greeting' over AHCI, ~25s …");
     let log1 = boot_ahci_qemu(&img_str, &persist_str, "build/tests/ahci_reboot_1.log", 25);
     let created = log1.contains("fs: file round-trip OK (greeting)");
 
-    println!("ahci: boot 2 — SAME SATA disk, no reformat, fs reads it back, ~25s …");
+    println!("ahci: boot 2 - SAME SATA disk, no reformat, fs reads it back, ~25s …");
     let log2 = boot_ahci_qemu(&img_str, &persist_str, "build/tests/ahci_reboot_2.log", 25);
-    // Match the END of the line — the "fs:" prefix can be clobbered by a concurrent
+    // Match the END of the line - the "fs:" prefix can be clobbered by a concurrent
     // shell write on the shared serial (cosmetic interleaving), but the tail is safe.
     let survived = log2.contains("verified across boot");
     for l in log2.lines().filter(|l| l.contains("fs:") || l.contains("IDENTIFY")) {
@@ -1455,11 +1455,11 @@ fn run_blockdev_reboot_test() {
 /// back as garbage. Three cases, all observable in the boot log:
 ///   (1) corrupt a superblock byte → `fs` mount fails its CRC check → "no filesystem".
 ///   (2) corrupt the root directory block → mount OK but the first dir op logs a
-///       "directory block CRC mismatch" — never returns records from a bad block.
-///   (3) corrupt a file's data block → reading it logs a "data block CRC mismatch" — never
+///       "directory block CRC mismatch" - never returns records from a bad block.
+///   (3) corrupt a file's data block → reading it logs a "data block CRC mismatch" - never
 ///       returns bytes from a bad block (the GSFS0008 per-data-block CRC).
 fn run_fs_corruption_test() {
-    println!("\n=== fs: GSFS0008 integrity — corrupt block → loud refusal (§3.12) ===");
+    println!("\n=== fs: GSFS0008 integrity - corrupt block → loud refusal (§3.12) ===");
     cmd_build_blockdev();
 
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
@@ -1483,13 +1483,13 @@ fn run_fs_corruption_test() {
         abs.to_string_lossy().replace('\\', "/")
     };
 
-    // Case 1a (GSFS0008): corrupt ONLY the primary superblock (flip free_blocks @64 — a
+    // Case 1a (GSFS0008): corrupt ONLY the primary superblock (flip free_blocks @64 - a
     // CRC-covered byte, not the magic). Mount must RECOVER from the backup at the last block.
     let sb1_disk = make("fs_corrupt_sb1.img", &|d: &mut [u8]| d[64] ^= 0xFF);
-    println!("fs: case 1a — corrupt PRIMARY superblock only, boot (~25s) …");
+    println!("fs: case 1a - corrupt PRIMARY superblock only, boot (~25s) …");
     let log1a = boot_ahci_qemu(&img_str, &sb1_disk, "build/tests/fs_corrupt_sb1.log", 25);
     let sb1_recovered = log1a.contains("recovered from backup superblock");
-    // Match the geometry tail ("GSFS0008 (…") not "fs: mounted GSFS" — a concurrent shell write
+    // Match the geometry tail ("GSFS0008 (…") not "fs: mounted GSFS" - a concurrent shell write
     // can split the prefix on the shared serial. No "no filesystem" confirms it didn't refuse.
     let sb1_mounted = log1a.contains("GSFS0008 (") && !log1a.contains("fs: no filesystem");
     let sb1_no_panic = !log1a.contains("KERNEL PANIC");
@@ -1501,7 +1501,7 @@ fn run_fs_corruption_test() {
         d[64] ^= 0xFF;                       // primary
         d[(total - 1) * 512 + 64] ^= 0xFF;   // backup (last block)
     });
-    println!("fs: case 1b — corrupt BOTH superblock copies, boot (~25s) …");
+    println!("fs: case 1b - corrupt BOTH superblock copies, boot (~25s) …");
     let log1b = boot_ahci_qemu(&img_str, &sb2_disk, "build/tests/fs_corrupt_sb2.log", 25);
     let sb_refused = log1b.contains("checksum mismatch");
     let sb_nofs = log1b.contains("fs: no filesystem");
@@ -1514,7 +1514,7 @@ fn run_fs_corruption_test() {
         let root = u64::from_le_bytes(d[48..56].try_into().unwrap()) as usize;
         d[root * 512] ^= 0xFF; // flip a byte in the 448-byte record region → trailer CRC fails
     });
-    println!("fs: case 2 — corrupt root directory block, boot (~25s) …");
+    println!("fs: case 2 - corrupt root directory block, boot (~25s) …");
     let log2 = boot_ahci_qemu(&img_str, &dir_disk, "build/tests/fs_corrupt_dir.log", 25);
     let dir_mounted = log2.contains("fs: mounted GSFS");                 // superblock OK
     let dir_caught = log2.contains("directory block CRC mismatch");      // loud
@@ -1541,7 +1541,7 @@ fn run_fs_corruption_test() {
         let abs = std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
         abs.to_string_lossy().replace('\\', "/")
     };
-    println!("fs: case 3 — corrupt a file data block, boot (~25s) …");
+    println!("fs: case 3 - corrupt a file data block, boot (~25s) …");
     let log3 = boot_ahci_qemu(&img_str, &data_disk, "build/tests/fs_corrupt_data.log", 25);
     let data_caught = log3.contains("data block CRC mismatch");           // loud
     let data_failed = log3.contains("probe.bin read FAILED");             // read refused
@@ -1579,7 +1579,7 @@ fn run_fs_corruption_test() {
 /// Large files: a 200 KiB file (far past the 3584-byte single-message chunk) written and
 /// read in streaming chunks via WRITE_NEW/WRITE_AT/READ_AT, then verified to **persist
 /// across a reboot**. The fs self-test creates the file on boot 1 (and verifies the
-/// round-trip) and re-verifies it on boot 2 on the SAME disk — proving both the streaming
+/// round-trip) and re-verifies it on boot 2 on the SAME disk - proving both the streaming
 /// path and durability of a large file.
 fn run_fs_large_test() {
     println!("\n=== fs: large files (200 KiB streaming round-trip + reboot survival) ===");
@@ -1601,11 +1601,11 @@ fn run_fs_large_test() {
     let persist_abs = std::fs::canonicalize(persist).unwrap_or_else(|_| std::path::PathBuf::from(persist));
     let persist_str = persist_abs.to_string_lossy().replace('\\', "/");
 
-    println!("fs: boot 1 — write + read back a 200 KiB file (streaming), ~25s …");
+    println!("fs: boot 1 - write + read back a 200 KiB file (streaming), ~25s …");
     let log1 = boot_ahci_qemu(&img_str, &persist_str, "build/tests/fs_large_1.log", 25);
     let wrote = log1.contains("large-file 204800 B round-trip OK");
 
-    println!("fs: boot 2 — SAME disk, re-read the 200 KiB file, ~25s …");
+    println!("fs: boot 2 - SAME disk, re-read the 200 KiB file, ~25s …");
     let log2 = boot_ahci_qemu(&img_str, &persist_str, "build/tests/fs_large_2.log", 25);
     let survived = log2.contains("large-file 204800 B round-trip OK");
     let no_bad = !log1.contains("large-file MISMATCH") && !log2.contains("large-file MISMATCH")
@@ -1626,12 +1626,12 @@ fn run_fs_large_test() {
 
 /// Extent lists / fragmentation (Phase I, GSFS0008). A `frag-test` build fills a small SATA
 /// disk with 2-block files, deletes every other one to scatter free space into ~2-block gaps,
-/// then writes a 20-block `/frag.bin` — far bigger than any gap, so contiguous allocation must
+/// then writes a 20-block `/frag.bin` - far bigger than any gap, so contiguous allocation must
 /// fail and the file is stored FRAGMENTED across an extent list. We assert it became
 /// `ITYPE_FILE_FRAG`, that the streaming read-back matches, and (boot 2) that the extent list
 /// survives a reboot. Proves the fragmented data path + extent-block CRC + reboot durability.
 fn run_fs_frag_test() {
-    println!("\n=== fs: extent lists / fragmentation (GSFS0008 — forced fragmented file) ===");
+    println!("\n=== fs: extent lists / fragmentation (GSFS0008 - forced fragmented file) ===");
     build_blockdev_fs("frag-test", "");
 
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
@@ -1657,7 +1657,7 @@ fn run_fs_frag_test() {
         if ok { println!("  PASS … {}", label); pass += 1; } else { println!("  FAIL … {}", label); fail += 1; }
     };
 
-    println!("fs: boot 1 — fill, fragment free space, write a forced-fragmented file, ~40s …");
+    println!("fs: boot 1 - fill, fragment free space, write a forced-fragmented file, ~40s …");
     let log1 = boot_ahci_qemu(&img_str, &persist_str, "build/tests/fs_frag_1.log", 40);
     check(log1.contains("[frag] filled"), "boot1: filled the disk with small files");
     check(log1.contains("[frag] deleted"), "boot1: scattered free space (deleted every other)");
@@ -1667,7 +1667,7 @@ fn run_fs_frag_test() {
     check(!log1.contains("CRC mismatch"), "boot1: no extent/data CRC failure");
     check(!log1.contains("KERNEL PANIC"), "boot1: no kernel panic");
 
-    println!("fs: boot 2 — SAME disk, re-read the fragmented file across a reboot, ~25s …");
+    println!("fs: boot 2 - SAME disk, re-read the fragmented file across a reboot, ~25s …");
     let log2 = boot_ahci_qemu(&img_str, &persist_str, "build/tests/fs_frag_2.log", 25);
     check(log2.contains("/frag.bin present after reboot (FRAGMENTED"), "boot2: extent list persisted (still fragmented)");
     check(log2.contains("[frag] reboot re-read OK"), "boot2: re-read matches after reboot");
@@ -1685,13 +1685,13 @@ fn run_fs_frag_test() {
 
 /// Data journaling (Phase J, opt-in per write). A `data-journal-test` build creates `/jdata.bin`
 /// (its data blocks left ZERO on disk), then issues ONE **journaled** `write_at` (`OP_WRITE_AT_J`)
-/// through a transaction that halts right after the commit record — so the chunk's data lives only
+/// through a transaction that halts right after the commit record - so the chunk's data lives only
 /// in the journal, never written to its home LBAs. The next boot's mount must REPLAY it from the
 /// journal. Airtight: the home blocks were zero (a zero block fails the data CRC), so reading the
-/// file back correctly can only mean the journal supplied the data — proving the chunk was
+/// file back correctly can only mean the journal supplied the data - proving the chunk was
 /// crash-atomic, not torn. Contrast with `fs-journal` (metadata replay; here it's the DATA).
 fn run_fs_djournal_test() {
-    println!("\n=== fs: data journaling (Phase J — journaled write_at survives a crash) ===");
+    println!("\n=== fs: data journaling (Phase J - journaled write_at survives a crash) ===");
     build_blockdev_fs("data-journal-test", "");
 
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
@@ -1715,13 +1715,13 @@ fn run_fs_djournal_test() {
         if ok { println!("  PASS … {}", label); pass += 1; } else { println!("  FAIL … {}", label); fail += 1; }
     };
 
-    println!("fs: boot 1 — journaled write_at, halt after commit record (data only in journal), ~25s …");
+    println!("fs: boot 1 - journaled write_at, halt after commit record (data only in journal), ~25s …");
     let log1 = boot_ahci_qemu(&img_str, &disk_str, "build/tests/fs_djournal_1.log", 25);
     check(log1.contains("halting before checkpoint"), "boot1: crashed right after the commit record");
     check(!log1.contains("jdata write_new FAILED") && !log1.contains("did NOT crash"), "boot1: journaled write actually started + crashed");
     check(!log1.contains("KERNEL PANIC"), "boot1: no kernel panic");
 
-    println!("fs: boot 2 — SAME disk, mount must replay the DATA from the journal, ~25s …");
+    println!("fs: boot 2 - SAME disk, mount must replay the DATA from the journal, ~25s …");
     let log2 = boot_ahci_qemu(&img_str, &disk_str, "build/tests/fs_djournal_2.log", 25);
     check(log2.contains("journal recovered"), "boot2: mount replayed the committed transaction");
     check(log2.contains("jdata RECOVERED+VERIFIED"), "boot2: recovered data is exactly correct (journal supplied it, not the zero home blocks)");
@@ -1741,12 +1741,12 @@ fn run_fs_djournal_test() {
 ///   Part 1 (REPLAY): a `journal-crash-test` build writes a file through a transaction that
 ///     halts right after the commit record is durable but before the checkpoint (simulated
 ///     power loss). On the next boot, `mount`'s recovery replays the committed transaction
-///     from the journal — the file is present with the right bytes.
+///     from the journal - the file is present with the right bytes.
 ///   Part 2 (REJECT): a normal build boots a disk whose journal holds a commit record with a
-///     BAD checksum (a torn/garbage commit). Recovery must IGNORE it — no replay, mount clean.
+///     BAD checksum (a torn/garbage commit). Recovery must IGNORE it - no replay, mount clean.
 fn run_fs_journal_test() {
     println!("\n=== fs: crash-consistency (journal replay + reject invalid commit) ===");
-    const FS_JOURNAL_MAGIC: u32 = 0x474A_3034; // "GJ04" — must match services/fs JOURNAL_MAGIC
+    const FS_JOURNAL_MAGIC: u32 = 0x474A_3034; // "GJ04" - must match services/fs JOURNAL_MAGIC
 
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
     let limine_dir = std::path::Path::new("tools/limine");
@@ -1770,13 +1770,13 @@ fn run_fs_journal_test() {
     let disk_abs = std::fs::canonicalize(disk).unwrap_or_else(|_| std::path::PathBuf::from(disk));
     let disk_str = disk_abs.to_string_lossy().replace('\\', "/");
 
-    println!("fs: boot 1 — write /jcrash.txt, halt after commit record (simulated crash), ~25s …");
+    println!("fs: boot 1 - write /jcrash.txt, halt after commit record (simulated crash), ~25s …");
     let log1 = boot_ahci_qemu(&img_str, &disk_str, "build/tests/fs_journal_1.log", 25);
     check(log1.contains("halting before checkpoint"), "part1 boot1: crashed right after the commit record");
     check(!log1.contains("did NOT crash"), "part1 boot1: the crash actually fired");
     check(!log1.contains("KERNEL PANIC"), "part1 boot1: no kernel panic");
 
-    println!("fs: boot 2 — SAME disk, mount must replay the journal, ~25s …");
+    println!("fs: boot 2 - SAME disk, mount must replay the journal, ~25s …");
     let log2 = boot_ahci_qemu(&img_str, &disk_str, "build/tests/fs_journal_2.log", 25);
     check(log2.contains("journal recovered"), "part2 boot2: mount replayed the committed transaction");
     check(log2.contains("jcrash RECOVERED+VERIFIED"), "part2 boot2: recovered file has the right bytes");
@@ -1807,7 +1807,7 @@ fn run_fs_journal_test() {
     let disk2_abs = std::fs::canonicalize(disk2).unwrap_or_else(|_| std::path::PathBuf::from(disk2));
     let disk2_str = disk2_abs.to_string_lossy().replace('\\', "/");
 
-    println!("fs: boot 3 — journal has a commit record with a BAD crc; recovery must ignore it, ~22s …");
+    println!("fs: boot 3 - journal has a commit record with a BAD crc; recovery must ignore it, ~22s …");
     let log3 = boot_ahci_qemu(&img2_str, &disk2_str, "build/tests/fs_journal_bad.log", 22);
     check(log3.contains("mounted GSFS0008"), "reject: filesystem mounted cleanly");
     check(!log3.contains("journal recovered"), "reject: did NOT replay the bad-CRC commit");
@@ -1825,7 +1825,7 @@ fn run_fs_journal_test() {
 
 /// Step 3a: raw-disk tolerance. Boot with an UNFORMATTED disk on the AHCI controller
 /// (no `mkfs`): `fs` must learn the disk's capacity (OP_CAPACITY), recognise there is no
-/// filesystem, NOT auto-format (§3.12), and stay up serving — never panic, never hang.
+/// filesystem, NOT auto-format (§3.12), and stay up serving - never panic, never hang.
 fn run_drives_raw_test() {
     println!("\n=== drives 3a: raw-disk tolerance (capacity + no auto-format) ===");
     cmd_build_blockdev();
@@ -1837,7 +1837,7 @@ fn run_drives_raw_test() {
     disk_image::install_bootloader(limine_dir, &image_path);
 
     let _ = std::fs::create_dir_all("build/tests");
-    // A RAW disk — zeros, deliberately NOT formatted with `format_superblock`.
+    // A RAW disk - zeros, deliberately NOT formatted with `format_superblock`.
     let persist = "build/tests/persist_ahci_raw.img";
     std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create raw disk");
 
@@ -1910,12 +1910,12 @@ fn run_files_test() {
     crate::shell_test::run_files(&image_path, persist, 4);
 }
 
-/// `osdev test edit` — exercise the full-screen `edit` text editor over the serial console: open
+/// `osdev test edit` - exercise the full-screen `edit` text editor over the serial console: open
 /// a new file, type/backspace/newline, save (^S) + quit (^Q), read it back; edit the existing
 /// file (insert at start); and quit with unsaved changes via the discard prompt. Bare-metal shell
 /// + a RAW AHCI disk the test formats first (the editor needs a filesystem to save to).
 fn run_edit_test() {
-    println!("\n=== edit: full-screen text editor — type / save / quit / read-back (AHCI disk) ===");
+    println!("\n=== edit: full-screen text editor - type / save / quit / read-back (AHCI disk) ===");
     cmd_build_bare_metal();
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
     if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
@@ -1927,7 +1927,7 @@ fn run_edit_test() {
     std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create raw disk");
     // Pre-format GSFS and bake a MULTI-WINDOW text file (> several IO_CHUNK windows) so the editor
     // exercises the piece-table windowed-load + streaming-save path on a real large file. 400 lines
-    // of a fixed shape (no "gsh>" substring — that's the harness sentinel); first "EDITLINE 0000",
+    // of a fixed shape (no "gsh>" substring - that's the harness sentinel); first "EDITLINE 0000",
     // last "EDITLINE 0399" → asserts the start-edit and the untouched tail both survive a save.
     format_superblock(persist);
     let mut big = String::new();
@@ -1950,7 +1950,7 @@ fn run_script_test() {
     disk_image::install_bootloader(limine_dir, &image_path);
 
     // Host-baked FILE path: bake the SMALL smoke suite (an on-disk .gsh is one ≤4 KiB IPC
-    // message — MAX_FILE_BYTES — so the big extensive suite can't be a file). The extensive
+    // message - MAX_FILE_BYTES - so the big extensive suite can't be a file). The extensive
     // coverage is the embedded suite, exercised below via `selfcheck` (run in memory). This
     // file proves the script-disk → run-from-file path incl. a piped assert.
     let script_path = "scripts/smoke.gsh";
@@ -1971,7 +1971,7 @@ fn run_script_test() {
 /// harness writes a file, KILLs fs over the control channel, and reads it back after the
 /// supervisor respawns fs and the shell reacquires it via the registry.
 fn run_fs_restart_test() {
-    println!("\n=== fs: restartable — survives its own restart (Phase D, §22 Test 13) ===");
+    println!("\n=== fs: restartable - survives its own restart (Phase D, §22 Test 13) ===");
     cmd_build_bare_metal();
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
     if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
@@ -1989,7 +1989,7 @@ fn run_fs_restart_test() {
 /// still mounts), boot, and assert `drives check` rebuilds the correct free count from the tree
 /// and the file survives.
 fn run_fs_check_test() {
-    println!("\n=== fs: drives check (fsck) — rebuild a drifted free count from the tree (Phase G) ===");
+    println!("\n=== fs: drives check (fsck) - rebuild a drifted free count from the tree (Phase G) ===");
     cmd_build_bare_metal();
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
     if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
@@ -2027,10 +2027,10 @@ fn run_fs_check_test() {
 /// Phase K: `drives scrub` (read-only integrity sweep). Bake a clean file and a file with a
 /// CORRUPTED data block (a flipped payload byte), boot, and `drives scrub`: it must report the
 /// bad block (`1 bad`) without panicking, leave the disk UNCHANGED (a second scrub still reports
-/// `1 bad` — read-only, no repair), and the clean file must still read back. Proves a routine,
+/// `1 bad` - read-only, no repair), and the clean file must still read back. Proves a routine,
 /// non-destructive integrity sweep that detects bit-rot.
 fn run_fs_scrub_test() {
-    println!("\n=== fs: drives scrub (read-only integrity sweep) — detect bit-rot, change nothing (Phase K) ===");
+    println!("\n=== fs: drives scrub (read-only integrity sweep) - detect bit-rot, change nothing (Phase K) ===");
     cmd_build_bare_metal();
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
     if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
@@ -2065,12 +2065,12 @@ fn run_fs_scrub_test() {
     crate::shell_test::run_fs_scrub(&image_path, persist, 4);
 }
 
-/// §22 Test 14 — file-as-capability (P2). Boot bare-metal + an AHCI disk, create a file, then run
+/// §22 Test 14 - file-as-capability (P2). Boot bare-metal + an AHCI disk, create a file, then run
 /// the shell's `fcap` command, which opens the file as a real kernel capability and exercises every
 /// property the model promises: read/write THROUGH the cap, non-escalation (a READ-only cap cannot
-/// write — at both the kernel and fs layers), a forged handle rejected, and revocation on close.
+/// write - at both the kernel and fs layers), a forged handle rejected, and revocation on close.
 fn run_fs_filecap_test() {
-    println!("\n=== fs: file-as-capability — open→read/write via cap, non-escalation, revoke (§22 Test 14) ===");
+    println!("\n=== fs: file-as-capability - open→read/write via cap, non-escalation, revoke (§22 Test 14) ===");
     cmd_build_bare_metal();
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
     if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
@@ -2106,7 +2106,7 @@ fn set_unknown_feature(path: &str, mask_off: usize, bit: u32) {
 /// mount, an unknown `ro_compat` bit must mount READ-ONLY, an unknown `compat` bit must mount
 /// normally. This is the mechanism that lets the format evolve past 0008 without reformatting.
 fn run_fs_compat_test() {
-    println!("\n=== fs: GSFS0008 feature flags — compat / ro_compat / incompat mount policy (Phase L) ===");
+    println!("\n=== fs: GSFS0008 feature flags - compat / ro_compat / incompat mount policy (Phase L) ===");
     cmd_build_bare_metal();
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
     if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
@@ -2115,7 +2115,7 @@ fn run_fs_compat_test() {
     disk_image::install_bootloader(limine_dir, &image_path);
     let _ = std::fs::create_dir_all("build/tests");
 
-    const UNKNOWN_BIT: u32 = 0x8000_0000; // bit 31 — defined in no KNOWN_* set
+    const UNKNOWN_BIT: u32 = 0x8000_0000; // bit 31 - defined in no KNOWN_* set
     let mk = |name: &str, mask_off: usize| -> String {
         let p = format!("build/tests/persist_fs_compat_{name}.img");
         std::fs::write(&p, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
@@ -2133,11 +2133,11 @@ fn run_fs_compat_test() {
 
 /// Phase H: block I/O retry. Build block-driver with `io-error-test` (forces the first couple
 /// of read/write commands to fail), boot, and assert the driver RETRIES + RECOVERS the
-/// transient error (the boot self-test read still succeeds) — and that normal operation is
+/// transient error (the boot self-test read still succeeds) - and that normal operation is
 /// unaffected (fs mounts + round-trips). QEMU never fails a real disk read, so the fault must
 /// be injected.
 fn run_fs_ioretry_test() {
-    println!("\n=== fs: block I/O retry — transient failure retried + recovered (Phase H) ===");
+    println!("\n=== fs: block I/O retry - transient failure retried + recovered (Phase H) ===");
     build_blockdev_fs("selftest", "io-error-test");
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
     if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }

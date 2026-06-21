@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Task context save/restore — §9.
+//! Task context save/restore - §9.
 //!
 //! A context switch saves the outgoing task's callee-saved registers + RSP
 //! to its `TaskContext` and restores the incoming task's saved state.
@@ -52,8 +52,8 @@ unsafe extern "C" fn task_entry_trampoline() -> ! {
 /// First-entry trampoline for new ring-3 tasks.
 ///
 /// On entry (via `switch_context`'s `ret`), the kernel stack contains:
-///   [RSP+0]  user_rip   — ring-3 entry point
-///   [RSP+8]  user_rsp   — initial user-space stack pointer
+///   [RSP+0]  user_rip   - ring-3 entry point
+///   [RSP+8]  user_rsp   - initial user-space stack pointer
 ///
 /// GS invariant: this function always runs in ring-0 with GS.base = kernel ptr.
 /// `swapgs` restores the user's GS (0) into GS.base before IRETQ, so that the
@@ -108,9 +108,9 @@ unsafe extern "C" fn ring3_entry_trampoline() -> ! {
 impl TaskContext {
     /// Build the initial context for a kernel task.
     ///
-    /// `entry`     — function the task will start executing.
-    /// `stack_top` — one-past-end of the task's stack buffer (16-byte aligned).
-    /// `cr3`       — page-table root to load on first switch.
+    /// `entry`     - function the task will start executing.
+    /// `stack_top` - one-past-end of the task's stack buffer (16-byte aligned).
+    /// `cr3`       - page-table root to load on first switch.
     ///
     /// # Safety
     /// `stack_top` must point to writable memory with at least 24 bytes below it.
@@ -148,11 +148,11 @@ impl TaskContext {
 
     /// Build the initial context for a ring-3 task.
     ///
-    /// `kernel_stack_top` — one-past-end of the **kernel** stack for this task
+    /// `kernel_stack_top` - one-past-end of the **kernel** stack for this task
     ///                       (16-byte aligned; used for SYSCALL and hardware interrupts).
-    /// `user_entry`       — ring-3 entry point virtual address.
-    /// `user_stack_top`   — initial user-space RSP (one-past-end of user stack).
-    /// `cr3`              — user page-table root.
+    /// `user_entry`       - ring-3 entry point virtual address.
+    /// `user_stack_top`   - initial user-space RSP (one-past-end of user stack).
+    /// `cr3`              - user page-table root.
     ///
     /// # Safety
     /// `kernel_stack_top` must point to writable kernel memory with at least
@@ -166,9 +166,9 @@ impl TaskContext {
     ) -> Self {
         // Kernel-stack layout built here (high → low addresses, K0T = kernel_stack_top):
         //
-        //   [K0T-368]: user_rsp  — ring3_entry_trampoline's `pop rsp` target
-        //   [K0T-376]: user_rip  — ring3_entry_trampoline's `pop rcx` target
-        //   [K0T-384]: ring3_entry_trampoline — switch_context `ret` target; ctx.rsp
+        //   [K0T-368]: user_rsp  - ring3_entry_trampoline's `pop rsp` target
+        //   [K0T-376]: user_rip  - ring3_entry_trampoline's `pop rcx` target
+        //   [K0T-384]: ring3_entry_trampoline - switch_context `ret` target; ctx.rsp
         //
         // WHY K0T-384, not the obvious K0T-32:
         //
@@ -184,10 +184,10 @@ impl TaskContext {
         // causing the scheduler's next `ret` to jump to rip=0 → page fault → crash.
         //
         // K0T-384 is:
-        //   • Below the early-return ISR depth (~K0T-260) — the timer ISR on the
+        //   • Below the early-return ISR depth (~K0T-260) - the timer ISR on the
         //     no-switch path cannot reach it, so [K0T-384] is never overwritten
         //     before the first real context switch updates TASK_CTX[slot].rsp.
-        //   • Above the SYSCALL kernel_rsp (K0T-512) — SYSCALL grows downward
+        //   • Above the SYSCALL kernel_rsp (K0T-512) - SYSCALL grows downward
         //     from K0T-512, so it can never write upward to K0T-384.
         //   • After the first real context switch, switch_context saves the current
         //     RSP (inside the ISR frame, ~K0T-200) into TASK_CTX[slot].rsp, making

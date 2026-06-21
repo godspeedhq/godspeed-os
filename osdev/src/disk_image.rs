@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Bootable disk image creation — BIOS (MBR) and UEFI (GPT) paths.
+//! Bootable disk image creation - BIOS (MBR) and UEFI (GPT) paths.
 //!
 //! BIOS path (`create` / `create_at`):
 //!   MBR partition table + FAT32 + limine-bios.sys + limine bios-install.
@@ -16,8 +16,8 @@
 //!   Used by `osdev image` (bare-metal USB).
 //!
 //! Prerequisites: tools/limine/ must contain:
-//!   limine-bios.sys, limine.exe  — for BIOS path
-//!   BOOTX64.EFI                  — for UEFI path
+//!   limine-bios.sys, limine.exe  - for BIOS path
+//!   BOOTX64.EFI                  - for UEFI path
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -166,7 +166,7 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// OffsetFile — presents a byte range of a File as a ReadWriteSeek impl.
+// OffsetFile - presents a byte range of a File as a ReadWriteSeek impl.
 // ---------------------------------------------------------------------------
 
 struct OffsetFile {
@@ -220,22 +220,22 @@ impl Seek for OffsetFile {
 }
 
 // ---------------------------------------------------------------------------
-// UEFI image — GPT partition table + EFI System Partition
+// UEFI image - GPT partition table + EFI System Partition
 // ---------------------------------------------------------------------------
 //
 // Disk layout (64 MiB, 512-byte sectors, 131072 sectors total):
-//   LBA 0           — Protective MBR
-//   LBA 1           — Primary GPT header
-//   LBA 2–33        — Primary GPT partition entries (128 × 128 B = 32 sectors)
-//   LBA 34–2047     — Unused (alignment gap to 1 MiB)
-//   LBA 2048–131038 — EFI System Partition (FAT32, ~63 MiB)
-//   LBA 131039–131070 — Secondary GPT partition entries
-//   LBA 131071      — Secondary GPT header
+//   LBA 0           - Protective MBR
+//   LBA 1           - Primary GPT header
+//   LBA 2–33        - Primary GPT partition entries (128 × 128 B = 32 sectors)
+//   LBA 34–2047     - Unused (alignment gap to 1 MiB)
+//   LBA 2048–131038 - EFI System Partition (FAT32, ~63 MiB)
+//   LBA 131039–131070 - Secondary GPT partition entries
+//   LBA 131071      - Secondary GPT header
 //
 // The ESP contains:
-//   EFI/BOOT/BOOTX64.EFI — Limine UEFI loader
-//   limine.conf           — boot menu
-//   kernel.elf            — GodspeedOS kernel
+//   EFI/BOOT/BOOTX64.EFI - Limine UEFI loader
+//   limine.conf           - boot menu
+//   kernel.elf            - GodspeedOS kernel
 
 const TOTAL_SECTORS: u64    = IMAGE_SIZE / SECTOR_SIZE;     // 131072
 const GPT_ENTRY_SECTS: u64  = 32;                           // 128 entries × 128 B
@@ -379,7 +379,7 @@ fn build_gpt_header(
     h[0..8].copy_from_slice(b"EFI PART");                  // signature
     h[8..12].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]);   // revision 1.0
     h[12..16].copy_from_slice(&92u32.to_le_bytes());        // header size
-    // h[16..20] = CRC32 — computed below with field zeroed
+    // h[16..20] = CRC32 - computed below with field zeroed
     h[24..32].copy_from_slice(&my_lba.to_le_bytes());
     h[32..40].copy_from_slice(&alt_lba.to_le_bytes());
     h[40..48].copy_from_slice(&first_usable.to_le_bytes());

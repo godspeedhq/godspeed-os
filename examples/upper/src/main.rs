@@ -1,16 +1,16 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! `upper` — a pipe FILTER: receives text and re-emits it uppercased.
+//! `upper` - a pipe FILTER: receives text and re-emits it uppercased.
 //!
 //! A filter stage of a capability-mediated pipe. The shell sends it the previous stage's
 //! output on `upper`'s endpoint, and `upper` sends the transformed text back to the shell
 //! over the SEND cap the shell delegated at spawn (`send_peers[0]`). So `upper` can sit
-//! anywhere in a chain — `echo hi | upper | write /f` — not just at the end. It needs no
+//! anywhere in a chain - `echo hi | upper | write /f` - not just at the end. It needs no
 //! knowledge of *who* sends or *where* its output goes; the shell brokers both. That is the
 //! point: composition without coupling.
 //!
@@ -24,7 +24,7 @@ use godspeed_sdk::{Message, ServiceContext};
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
-    // Path C (Phase 4): no self-registration — the kernel name-directory records "upper" at spawn,
+    // Path C (Phase 4): no self-registration - the kernel name-directory records "upper" at spawn,
     // so the shell resolves our endpoint by name via the directory (`acquire_send_grant_cap`).
     ctx.log("upper: ready");
 
@@ -35,7 +35,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // send_peers[0] is the SEND cap to the shell (our downstream), delegated at spawn.
         let down = match ctx.send_peer_at(0) { Some(p) => p, None => continue };
         if src == [0x04] {
-            // End of this input stream — forward the EOT so the shell stops draining.
+            // End of this input stream - forward the EOT so the shell stops draining.
             let _ = ctx.send_by_handle(down, &Message::from_bytes(&[0x04]));
             continue;
         }

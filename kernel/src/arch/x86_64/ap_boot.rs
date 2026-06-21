@@ -1,15 +1,15 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! AP (Application Processor) startup — §11.1, §11.2.
+//! AP (Application Processor) startup - §11.1, §11.2.
 //!
 //! Limine has already run each AP through real mode → long mode and left them
 //! spinning on their `goto_addr` field.  We simply write the entry function
-//! address via `MpInfo::bootstrap` — no INIT+SIPI trampoline required.
+//! address via `MpInfo::bootstrap` - no INIT+SIPI trampoline required.
 
 use limine::mp::{MpGotoFunction, MpInfo};
 
@@ -60,7 +60,7 @@ pub unsafe fn start_all_aps(boot_info: &super::BootInfo) -> u32 {
     // triple fault → silent reset. A generous budget lets every AP check in
     // before the BSP proceeds, so the loop exits on ready_count (not timeout)
     // and there is no late-join race. (Spin-count is CPU-speed-dependent; a
-    // TSC-based wall-clock bound would be more robust — future work.)
+    // TSC-based wall-clock bound would be more robust - future work.)
     let expected_ready = boot_info.ap_ids.len() as u32 + 1; // +1 for BSP
     let mut spins: u64 = 0;
     while crate::smp::core::ready_count() < expected_ready && spins < 2_000_000_000 {
@@ -71,7 +71,7 @@ pub unsafe fn start_all_aps(boot_info: &super::BootInfo) -> u32 {
     let actual = crate::smp::core::ready_count().saturating_sub(1); // exclude BSP
     let expected = boot_info.ap_ids.len() as u32;
     if actual < expected {
-        crate::kprintln!("smp: warning — only {}/{} APs responded", actual, expected);
+        crate::kprintln!("smp: warning - only {}/{} APs responded", actual, expected);
     }
     actual
 }

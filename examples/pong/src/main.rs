@@ -1,4 +1,4 @@
-//! `pong` — receives messages from `ping` and logs them.
+//! `pong` - receives messages from `ping` and logs them.
 //!
 //! No contract-specified placement → supervisor places via round-robin.
 //! Initially on Core 1; after `osdev restart pong --core 2`, may land elsewhere.
@@ -14,7 +14,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // Path C (Phase 4): no self-registration. The kernel name-directory records "pong" at spawn
     // and refreshes it on every restart (in place), so ping reacquires us by name through the
-    // directory (syscall 10) with no push from us — the registry service is gone.
+    // directory (syscall 10) with no push from us - the registry service is gone.
 
     loop {
         let msg = ctx.recv();

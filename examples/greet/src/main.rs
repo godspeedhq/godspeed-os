@@ -1,7 +1,7 @@
-//! `greet` — a pipe producer: emits a few friendly lines, then idles.
+//! `greet` - a pipe producer: emits a few friendly lines, then idles.
 //!
 //! The producer side of a capability-mediated pipe (`greet | upper`). Crucially,
-//! `greet` declares **no** send peers in its contract — it has zero ambient
+//! `greet` declares **no** send peers in its contract - it has zero ambient
 //! authority to talk to anyone. Its only way to send is the SEND cap the *shell*
 //! delegated to it at spawn, which the kernel installs as `send_peers[0]`. So
 //! `greet` can only reach exactly the sink the shell wired it to. That is the
@@ -35,19 +35,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
             // End-of-stream marker: a one-byte EOT (0x04). A built-in sink (the shell draining
             // `greet | write file`) recvs until it sees this, so it knows the stream is done
-            // without waiting forever. (A zero-length message is not a reliable signal — the
+            // without waiting forever. (A zero-length message is not a reliable signal - the
             // IPC path does not deliver an empty body.) A service sink like `upper` just
             // uppercases the control byte harmlessly.
             let _ = ctx.send_by_handle(sink, &Message::from_bytes(&[0x04]));
             ctx.log("greet: sent 3 lines + EOF through the delegated pipe cap");
         }
         None => {
-            ctx.log("greet: no pipe cap was delegated — nothing to send to");
+            ctx.log("greet: no pipe cap was delegated - nothing to send to");
         }
     }
 
     // A pipe stage with no more output just idles (clean exit semantics are a
-    // later refinement — see the shell-pipes notes).
+    // later refinement - see the shell-pipes notes).
     loop {
         ctx.yield_cpu();
     }

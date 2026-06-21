@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! IPC message format — §8.5.
+//! IPC message format - §8.5.
 //!
 //! Maximum size: 4 KiB (one page). Copy semantics: kernel copies sender →
 //! receiver. Zero-copy is permanently rejected (§2.5).
@@ -27,7 +27,7 @@ pub struct Message {
     pub caps: [Option<Capability>; MAX_EMBEDDED_CAPS],
     pub cap_count: usize,
     /// Delegated-resource badge (§7.10, file-as-capability). Set **only** by the kernel's
-    /// `ResourceInvoke` handler, after it validates the caller's cap — `0` for every ordinary
+    /// `ResourceInvoke` handler, after it validates the caller's cap - `0` for every ordinary
     /// `send`/`try_send`. This is what lets the owning service trust that a badged message is a
     /// kernel-validated invocation of a real cap, not a payload a client forged over a plain send:
     /// the normal send path cannot set it. `badge_id` is the delegated `ResourceId`; `badge_right`
@@ -66,7 +66,7 @@ impl Message {
     /// Build an interrupt-event message carrying the IRQ number (§12.2).
     ///
     /// Used exclusively by the kernel IDT routing path. No capability is
-    /// involved — the kernel is the sender. Payload is one byte: the IRQ number.
+    /// involved - the kernel is the sender. Payload is one byte: the IRQ number.
     pub fn interrupt_event(irq: u8) -> Self {
         let mut msg = Self {
             payload:     [0u8; MAX_MESSAGE_SIZE],
@@ -81,7 +81,7 @@ impl Message {
     }
 }
 
-/// Errors returned by IPC syscalls — §8.6.
+/// Errors returned by IPC syscalls - §8.6.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IpcError {
     /// The endpoint no longer exists (service died or was restarted).

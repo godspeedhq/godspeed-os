@@ -1,17 +1,17 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Contract validation — §13.4.
-//! Identity test harness — §22.
+//! Contract validation - §13.4.
+//! Identity test harness - §22.
 //!
 //! Two jobs:
-//!   1. `validate_all_contracts` — structural validation of all service.toml
+//!   1. `validate_all_contracts` - structural validation of all service.toml
 //!      files against `contracts/schema/service.schema.json`.
-//!   2. `run_identity_tests` — boot the OS in QEMU and run the §22 test
+//!   2. `run_identity_tests` - boot the OS in QEMU and run the §22 test
 //!      suite, asserting serial output matches expected patterns.
 
 use std::io::Write;
@@ -183,7 +183,7 @@ static FUZZ_TESTS: &[TestSpec] = &[
                 ),
             ],
             bad: &[
-                b"",                          // empty — missing required fields
+                b"",                          // empty - missing required fields
                 b"\xFF\xFE",                  // non-UTF-8
                 b"[unclosed",                 // invalid TOML
                 // missing name
@@ -326,7 +326,7 @@ static STRESS_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["stress: S3 pass (50/50)"],
             fail_on:      &["KERNEL PANIC", "stress: S3 FAIL"],
-            timeout_secs: 400, // 50 cross-core msgs; scaled down — spawn at ~280 s leaves ~120 s for IPC
+            timeout_secs: 400, // 50 cross-core msgs; scaled down - spawn at ~280 s leaves ~120 s for IPC
         },
     },
     TestSpec {
@@ -358,7 +358,7 @@ static STRESS_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["stress: S5 pass (500/500)"],
             fail_on:      &["KERNEL PANIC", "stress: S5 FAIL"],
-            timeout_secs: 400, // 500 cycles; scaled down from 1000 — BS5 extends to 5000
+            timeout_secs: 400, // 500 cycles; scaled down from 1000 - BS5 extends to 5000
         },
     },
     TestSpec {
@@ -515,7 +515,7 @@ static ADV_TESTS: &[TestSpec] = &[
             fail_on:      &["KERNEL PANIC", "adv: A3 FAIL"],
             // adv-a3 is spawned after ~120 preceding tasks (adv-ba*, chaos-bc*,
             // prop-p*, fuzz-f*, stress-s*, chaos-c*); at burst rate ~80 lines/sec
-            // that's ~25 s just to reach the spawn — 30 s fires before spawn completes.
+            // that's ~25 s just to reach the spawn - 30 s fires before spawn completes.
             timeout_secs: 90,
         },
     },
@@ -671,7 +671,7 @@ static BRUTAL_CHAOS_TESTS: &[TestSpec] = &[
     TestSpec {
         id: "BC2", name: "five_simultaneous_faults_survive", spec_ref: "§22 Brutal Chaos BC2",
         kind: TestKind::WatchSerial {
-            expect:       &["chaos: BC2 pass — 5 simultaneous non-TCB faults; system survived"],
+            expect:       &["chaos: BC2 pass - 5 simultaneous non-TCB faults; system survived"],
             fail_on:      &["KERNEL PANIC", "chaos: BC2 FAIL"],
             timeout_secs: 120,
         },
@@ -679,7 +679,7 @@ static BRUTAL_CHAOS_TESTS: &[TestSpec] = &[
     TestSpec {
         id: "BC3", name: "alloc_deny_2500_cycles", spec_ref: "§22 Brutal Chaos BC3",
         kind: TestKind::WatchSerial {
-            expect:       &["chaos: BC3 pass — 2500 alloc-deny cycles without panic"],
+            expect:       &["chaos: BC3 pass - 2500 alloc-deny cycles without panic"],
             fail_on:      &["KERNEL PANIC", "chaos: BC3 FAIL"],
             timeout_secs: 120,
         },
@@ -705,7 +705,7 @@ static BRUTAL_CHAOS_TESTS: &[TestSpec] = &[
     TestSpec {
         id: "BC6", name: "two_hog_cores_others_unaffected", spec_ref: "§22 Brutal Chaos BC6",
         kind: TestKind::WatchSerial {
-            expect:       &["chaos: BC6 pass — 2-core hog starvation; core 0 still alive"],
+            expect:       &["chaos: BC6 pass - 2-core hog starvation; core 0 still alive"],
             fail_on:      &["KERNEL PANIC", "chaos: BC6 FAIL"],
             timeout_secs: 600,
         },
@@ -713,7 +713,7 @@ static BRUTAL_CHAOS_TESTS: &[TestSpec] = &[
     TestSpec {
         id: "BC7", name: "tlb_shootdown_15_cycles", spec_ref: "§22 Brutal Chaos BC7",
         kind: TestKind::WatchSerial {
-            expect:       &["chaos: BC7 pass — 15 cross-core TLB shootdowns survived"],
+            expect:       &["chaos: BC7 pass - 15 cross-core TLB shootdowns survived"],
             fail_on:      &["KERNEL PANIC", "chaos: BC7 FAIL"],
             timeout_secs: 900,
         },
@@ -1032,7 +1032,7 @@ static BRUTAL_PERF_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["perf: BP1 done"],
             fail_on:      &["KERNEL PANIC", "KERNEL PF:", "perf: BP1 FAIL"],
-            timeout_secs: 600, // same ceiling as BP2 — QEMU TCG variance under 200-task load
+            timeout_secs: 600, // same ceiling as BP2 - QEMU TCG variance under 200-task load
         },
     },
     TestSpec {
@@ -1040,7 +1040,7 @@ static BRUTAL_PERF_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["perf: BP2 done"],
             fail_on:      &["KERNEL PANIC", "KERNEL PF:", "perf: BP2 FAIL"],
-            timeout_secs: 600, // 2.4× B2's 250s — 5× samples + IPI overhead under load
+            timeout_secs: 600, // 2.4× B2's 250s - 5× samples + IPI overhead under load
         },
     },
     TestSpec {
@@ -1080,7 +1080,7 @@ static BRUTAL_PERF_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["perf: BP7 done"],
             fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
-            timeout_secs: 300, // 10× B7's 30s — 5× cycles × concurrent load factor
+            timeout_secs: 300, // 10× B7's 30s - 5× cycles × concurrent load factor
         },
     },
     TestSpec {
@@ -1127,7 +1127,7 @@ static BRUTAL_STRESS_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["stress: BS2 pass (200/200)"],
             fail_on:      &["KERNEL PANIC", "KERNEL PF:", "stress: BS2 FAIL"],
-            timeout_secs: 480, // 4× S2's 120s — 200 cycles under heavy concurrent load
+            timeout_secs: 480, // 4× S2's 120s - 200 cycles under heavy concurrent load
         },
     },
     TestSpec {
@@ -1151,7 +1151,7 @@ static BRUTAL_STRESS_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["stress: BS5 pass (5000/5000)"],
             fail_on:      &["KERNEL PANIC", "KERNEL PF:", "stress: BS5 FAIL"],
-            timeout_secs: 720, // 6× S5's 120s — extra margin for concurrent kill/respawn pressure
+            timeout_secs: 720, // 6× S5's 120s - extra margin for concurrent kill/respawn pressure
         },
     },
     TestSpec {
@@ -1202,7 +1202,7 @@ static TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect: &[
                 "kernel: 4 cores ready",
-                // (no "init: ready" — init is removed; the kernel spawns the supervisor directly, Phase 5)
+                // (no "init: ready" - init is removed; the kernel spawns the supervisor directly, Phase 5)
                 "supervisor: ready",
                 "logger: ready",
             ],
@@ -1215,7 +1215,7 @@ static TESTS: &[TestSpec] = &[
         kind: TestKind::WithBadTcb {
             // Path C / Phase 5: init is removed, so the KERNEL spawns the supervisor directly. A
             // corrupt supervisor ELF fails that spawn and the kernel panics (`panic!("supervisor
-            // spawn failed: ...")`) — the §6.2 TCB-failure path, now kernel-direct (no init abort,
+            // spawn failed: ...")`) - the §6.2 TCB-failure path, now kernel-direct (no init abort,
             // hence no "reason:" prefix).
             expect:       &["KERNEL PANIC", "supervisor spawn failed"],
             fail_on:      &["supervisor: ready"],
@@ -1225,7 +1225,7 @@ static TESTS: &[TestSpec] = &[
     TestSpec {
         id: "2A", name: "cap_enforcement_positive", spec_ref: "§22 Test 2A",
         kind: TestKind::WatchSerial {
-            expect:       &["cap-test: 2A pass — held cap validates OK"],
+            expect:       &["cap-test: 2A pass - held cap validates OK"],
             fail_on:      &["KERNEL PANIC", "cap-test: 2A FAIL"],
             timeout_secs: 30,
         },
@@ -1234,8 +1234,8 @@ static TESTS: &[TestSpec] = &[
         id: "2B", name: "cap_enforcement_negative", spec_ref: "§22 Test 2B",
         kind: TestKind::WatchSerial {
             expect: &[
-                "cap-test: 2B pass — no cap returns CapNotHeld",
-                "cap-test: 2C pass — wrong right returns CapInsufficientRights",
+                "cap-test: 2B pass - no cap returns CapNotHeld",
+                "cap-test: 2C pass - wrong right returns CapInsufficientRights",
             ],
             fail_on:      &["KERNEL PANIC", "cap-test: 2B FAIL", "cap-test: 2C FAIL"],
             timeout_secs: 30,
@@ -1386,7 +1386,7 @@ static TESTS: &[TestSpec] = &[
         },
     },
     // ----------------------------------------------------------------
-    // Interrupt-routing identity tests — §12.2, §12.3.
+    // Interrupt-routing identity tests - §12.2, §12.3.
     // ----------------------------------------------------------------
     TestSpec {
         id: "IR1A", name: "irq_delivery_driver_receives", spec_ref: "§12.2 §12.3",
@@ -1410,7 +1410,7 @@ static TESTS: &[TestSpec] = &[
     },
     TestSpec {
         // §22 Test 11 (repurposed for Path C / Phase 4): the registry SERVICE is retired; the
-        // kernel name-directory is the namer. This pins the directory's restart property — a
+        // kernel name-directory is the namer. This pins the directory's restart property - a
         // service killed and respawned must re-establish without a kernel panic, and the supervisor
         // re-wires it from its map (the directory records the new instance, so clients reacquire it
         // by name). `block-driver` is the disk-free restartable target.
@@ -1428,11 +1428,11 @@ static TESTS: &[TestSpec] = &[
         },
     },
     TestSpec {
-        // §22 Test 15 (Path C / Phase 6): the SUPERVISOR is restartable — its death is no longer a
+        // §22 Test 15 (Path C / Phase 6): the SUPERVISOR is restartable - its death is no longer a
         // kernel panic. Killing it (via the operator control channel) must NOT panic the kernel; the
         // KERNEL respawns it (the last-resort recovery anchor, §3.7); the respawned supervisor
-        // RECONCILES — adopts the still-running services (e.g. block-driver) instead of duplicating
-        // them — and reaches "ready" again. Proves the unkillable set is now {kernel} alone (§6.2).
+        // RECONCILES - adopts the still-running services (e.g. block-driver) instead of duplicating
+        // them - and reaches "ready" again. Proves the unkillable set is now {kernel} alone (§6.2).
         id: "15", name: "supervisor_survives_own_restart", spec_ref: "§22 Test 15",
         kind: TestKind::WithRestart {
             wait_for:     "supervisor: ready",
@@ -1441,9 +1441,9 @@ static TESTS: &[TestSpec] = &[
             // kernel is the recovery anchor; "adopted running block-driver" proves the respawned
             // supervisor reconciled the live services (the last step of its boot, just before it
             // re-enters its loop) instead of panicking or duplicating them. (We avoid asserting
-            // "supervisor: ready" — that string also appears on the first boot, before the kill.)
+            // "supervisor: ready" - that string also appears on the first boot, before the kill.)
             expect_after: &[
-                "kernel: supervisor died — respawning",
+                "kernel: supervisor died - respawning",
                 "supervisor: adopted running block-driver",
             ],
             fail_on:      &["KERNEL PANIC"],
@@ -1478,7 +1478,7 @@ pub fn validate_all_contracts() {
         match validate_contract(&schema, contract_path) {
             Ok(())  => println!("OK  {}", contract_path.display()),
             Err(e)  => {
-                eprintln!("FAIL {} — {}", contract_path.display(), e);
+                eprintln!("FAIL {} - {}", contract_path.display(), e);
                 failures += 1;
             }
         }
@@ -1849,7 +1849,7 @@ pub fn run_chaos_brutal_tests() {
 ///
 /// T11–T13 are correctness tests that must always pass.
 /// SMP-2 / SMP-8 / SMP-16 are escalation tests: they run until the machine
-/// ceiling is found — the first timeout is the hardware limit, not a failure.
+/// ceiling is found - the first timeout is the hardware limit, not a failure.
 pub fn run_brutal_identity_tests() {
     println!("identity-brutal: stopping any running QEMU instances...");
     kill_existing_qemu();
@@ -2214,7 +2214,7 @@ fn collect_perf_baseline(results: &[(&TestSpec, TestOutcome)]) {
     }
 
     let baseline = serde_json::json!({
-        "note": "QEMU TCG RDTSC cycle counts — not comparable across hosts or QEMU versions; useful for detecting large regressions within one environment",
+        "note": "QEMU TCG RDTSC cycle counts - not comparable across hosts or QEMU versions; useful for detecting large regressions within one environment",
         "regression_threshold_pct": 10,
         "metrics": metrics,
     });
@@ -2239,7 +2239,7 @@ fn run_one(test: &TestSpec, image: &Path) -> TestOutcome {
         TestKind::ContractFuzz { .. } => TestOutcome::Blocked("ContractFuzz only runs via osdev test fuzz or fuzz-brutal"),
 
         TestKind::WithBadTcb { expect, fail_on, timeout_secs } => {
-            // Build kernel with the test-bad-supervisor feature (invalid supervisor ELF) — Path C /
+            // Build kernel with the test-bad-supervisor feature (invalid supervisor ELF) - Path C /
             // Phase 4 retired the registry, so the supervisor is the corrupt-and-fail TCB now.
             let status = std::process::Command::new("cargo")
                 .args([
@@ -2361,7 +2361,7 @@ fn poll_serial(
                     continue;
                 }
                 // At deadline: wait for QEMU to flush and release, then do a
-                // final read — same grace period as the normal timeout branch.
+                // final read - same grace period as the normal timeout branch.
                 std::thread::sleep(Duration::from_millis(600));
                 let content = std::fs::read_to_string(path).unwrap_or_default();
                 let missing: Vec<String> = expect.iter()
@@ -2372,7 +2372,7 @@ fn poll_serial(
                     return TestOutcome::Pass;
                 }
                 return TestOutcome::Fail(format!(
-                    "timeout — lines not seen: {}",
+                    "timeout - lines not seen: {}",
                     missing.join(", ")
                 ));
             }
@@ -2401,7 +2401,7 @@ fn poll_serial(
                 return TestOutcome::Pass;
             }
             return TestOutcome::Fail(format!(
-                "timeout — lines not seen: {}",
+                "timeout - lines not seen: {}",
                 missing.join(", ")
             ));
         }
@@ -2833,7 +2833,7 @@ fn collect_brutal_perf_baseline(results: &[(&TestSpec, TestOutcome)]) {
     }
 
     let baseline = serde_json::json!({
-        "note": "Brutal perf — QEMU TCG RDTSC cycle counts at 5× iteration counts; not comparable across hosts",
+        "note": "Brutal perf - QEMU TCG RDTSC cycle counts at 5× iteration counts; not comparable across hosts",
         "regression_threshold_pct": 10,
         "metrics": metrics,
     });
@@ -2862,7 +2862,7 @@ static BRUTAL_ADV_TESTS: &[TestSpec] = &[
     TestSpec {
         id: "BA2", name: "slot_sweep_extended", spec_ref: "§22 Brutal Adv BA2",
         kind: TestKind::WatchSerial {
-            expect:       &["adv: BA2 pass — extended slot sweep returned defined errors"],
+            expect:       &["adv: BA2 pass - extended slot sweep returned defined errors"],
             fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
             timeout_secs: 900,
         },
@@ -2902,7 +2902,7 @@ static BRUTAL_ADV_TESTS: &[TestSpec] = &[
     TestSpec {
         id: "BA7", name: "timing_side_channel_500", spec_ref: "§22 Brutal Adv BA7",
         kind: TestKind::WatchSerial {
-            expect:       &["adv: BA7 pass — 500 timing sends completed without panic"],
+            expect:       &["adv: BA7 pass - 500 timing sends completed without panic"],
             fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
             timeout_secs: 900,
         },
@@ -2910,7 +2910,7 @@ static BRUTAL_ADV_TESTS: &[TestSpec] = &[
     TestSpec {
         id: "BA8", name: "hog_preemption_witness", spec_ref: "§22 Brutal Adv BA8",
         kind: TestKind::WatchSerial {
-            expect:       &["adv: BA8 pass — witness ran 200 yields despite tight-loop hog"],
+            expect:       &["adv: BA8 pass - witness ran 200 yields despite tight-loop hog"],
             fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
             timeout_secs: 900,
         },
@@ -2918,7 +2918,7 @@ static BRUTAL_ADV_TESTS: &[TestSpec] = &[
     TestSpec {
         id: "BA9", name: "direct_spawn_bypass_5x", spec_ref: "§22 Brutal Adv BA9",
         kind: TestKind::WatchSerial {
-            expect:       &["adv: BA9 pass — 5 direct-spawn bypasses returned Err"],
+            expect:       &["adv: BA9 pass - 5 direct-spawn bypasses returned Err"],
             fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
             timeout_secs: 900,
         },
@@ -2926,7 +2926,7 @@ static BRUTAL_ADV_TESTS: &[TestSpec] = &[
     TestSpec {
         id: "BA10", name: "kernel_addr_patterns_20x", spec_ref: "§22 Brutal Adv BA10",
         kind: TestKind::WatchSerial {
-            expect:       &["adv: BA10 pass — 20 kernel addr patterns rejected without panic"],
+            expect:       &["adv: BA10 pass - 20 kernel addr patterns rejected without panic"],
             fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
             timeout_secs: 900,
         },
@@ -3021,7 +3021,7 @@ fn kill_existing_qemu() {
 }
 
 // ---------------------------------------------------------------------------
-// Contract validation (§13.4) — stubs.
+// Contract validation (§13.4) - stubs.
 // ---------------------------------------------------------------------------
 
 fn load_schema(path: &Path) -> serde_json::Value {

@@ -1,18 +1,18 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Runtime enforcement of constitutional invariants — §3, §22.
+//! Runtime enforcement of constitutional invariants - §3, §22.
 //!
 //! These assertions are the executable form of the constitution. If any one
 //! fires in a build, the system is no longer the system the spec describes.
 //! They run in both debug and release builds; they are not behind cfg(debug).
 
 /// Assert that a syscall's cap slot is valid before any privileged action.
-/// Panic if not — this is invariant §3.1 (no ambient authority).
+/// Panic if not - this is invariant §3.1 (no ambient authority).
 #[inline(always)]
 pub fn assert_cap_validated(result: &Result<(), crate::capability::cap::CapError>) {
     if let Err(e) = result {
@@ -21,7 +21,7 @@ pub fn assert_cap_validated(result: &Result<(), crate::capability::cap::CapError
 }
 
 /// Assert that a service's core assignment does not change mid-execution.
-/// Invariant §3.11 (identity is stable; location is not — but location
+/// Invariant §3.11 (identity is stable; location is not - but location
 /// must be stable *within* a single execution lifetime).
 #[inline(always)]
 pub fn assert_no_mid_execution_migration(original_core: u32, current_core: u32) {
@@ -36,18 +36,18 @@ pub fn assert_no_mid_execution_migration(original_core: u32, current_core: u32) 
 ///
 /// Checks that each TCB service's endpoint is still registered in the IPC name
 /// registry and alive in the routing table. Death of any TCB service requires
-/// an immediate system reboot — §6.2.
+/// an immediate system reboot - §6.2.
 pub fn assert_tcb_alive() {
-    // The non-restartable set is now EMPTY (Path C / Phase 6: the supervisor is restartable too —
+    // The non-restartable set is now EMPTY (Path C / Phase 6: the supervisor is restartable too -
     // the kernel respawns it on death, §6.2). `init` was removed (Phase 5); `registry` retired
     // (Phase 4); `fs`/`block-driver` are restartable (Phase D). The kernel is the only thing that
-    // cannot die, and it is not a task — so no task's death is a panic-on-death TCB violation.
+    // cannot die, and it is not a task - so no task's death is a panic-on-death TCB violation.
     const TCB: &[&str] = &[];
     const DEAD: u8 = crate::task::state::TaskState::Dead as u8;
     // §6.2 governs the *death of a service that exists*, not the *omission* of
     // one: identity-test manifests are minimal and spawn only the subset a given
     // test needs (e.g. cross-core tests run without `registry`). So a TCB name
-    // that is simply absent from this configuration is skipped — only a service
+    // that is simply absent from this configuration is skipped - only a service
     // that exists and is Dead (or whose endpoint was killed) is a violation.
     //
     // This absence-tolerance is NOT fail-open: the only syscall that can kill a
@@ -66,7 +66,7 @@ pub fn assert_tcb_alive() {
                     panic!("invariant violation: TCB service '{}' is Dead (§6.2)", name);
                 }
                 // A TCB service that also exposes a named endpoint must have it
-                // alive — a live task with a killed endpoint is also a §6.2 break.
+                // alive - a live task with a killed endpoint is also a §6.2 break.
                 if let Some(ep_id) = crate::ipc::names::lookup(name) {
                     if !crate::ipc::routing::is_endpoint_alive(ep_id) {
                         panic!("invariant violation: TCB service '{}' endpoint is dead (§6.2)", name);
@@ -75,13 +75,13 @@ pub fn assert_tcb_alive() {
                 continue 'next;
             }
         }
-        // `name` not present in this configuration — not a §6.2 violation.
+        // `name` not present in this configuration - not a §6.2 violation.
     }
 }
 
 /// Assert the capability table is consistent: no cap carries a generation that
 /// exceeds its resource's current generation in the global table. Such a cap
-/// would be from the future — impossible under correct minting. Invariant §7.8.
+/// would be from the future - impossible under correct minting. Invariant §7.8.
 ///
 /// Stale caps (generation < current) are expected after endpoint death and are
 /// not flagged here; they fail with `EndpointDead` / `CapRevoked` on next use.

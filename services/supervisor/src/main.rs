@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! `supervisor` — restart authority. TCB member (§6.1). Non-restartable.
+//! `supervisor` - restart authority. TCB member (§6.1). Non-restartable.
 //!
 //! Phase 5:
 //!   1. Spawns `pong` on core 1 and `ping` on core 0 (§23.2 acceptance criteria).
@@ -25,12 +25,12 @@ use godspeed_sdk::{ServiceContext, CapHandle};
 //
 // As the supervisor spawns the real services it records, in a bounded no-heap map, the
 // SEND|GRANT endpoint cap the kernel hands back from `spawn_returning_endpoint` (syscall 38,
-// Phase 0a). This proves the supervisor can hold a cap to everything it starts — the future
+// Phase 0a). This proves the supervisor can hold a cap to everything it starts - the future
 // name authority. It is a SHADOW map for now: nothing reads it to wire dependents yet (that is
 // Phase 0b/3). Scoped to the real services; the 178 test probes are test infra (out of scope)
 // and keep using plain `ctx.spawn`.
 // ───────────────────────────────────────────────────────────────────────────────
-const NAME_MAP_MAX:      usize = 16;  // bounded (§26.6) — real services, not the test probes
+const NAME_MAP_MAX:      usize = 16;  // bounded (§26.6) - real services, not the test probes
 const NAME_MAP_NAME_MAX: usize = 16;
 
 struct NameCapMap {
@@ -49,7 +49,7 @@ impl NameCapMap {
         }
     }
     /// Record `name → cap_slot`, **updating in place** if `name` is already mapped (so a restart
-    /// refreshes the cap — and a kill-storm can't grow the map past its bound, §26.6). Returns
+    /// refreshes the cap - and a kill-storm can't grow the map past its bound, §26.6). Returns
     /// false (loud, never a silent drop) only if the name is new AND the map is full / too long.
     fn record(&mut self, name: &str, cap_slot: u32) -> bool {
         let nb = name.as_bytes();
@@ -81,7 +81,7 @@ impl NameCapMap {
 /// Phase 2/3 (docs/naming-design.md): spawn `name`, **providing the listed `peers` from the
 /// supervisor's name→cap map** (the caps recorded when those services were spawned) instead of the
 /// kernel name table. Any declared peer NOT listed here is still name-wired by the kernel (the
-/// merge) — peers flip one at a time. Records the new service's own endpoint cap. If none of the
+/// merge) - peers flip one at a time. Records the new service's own endpoint cap. If none of the
 /// requested peers are mapped yet, falls back to a fully name-wired spawn (loud). The flipped
 /// wiring is proven functionally (e.g. fs←block-driver by real disk I/O; shell←fs by file commands).
 /// Returns true if the service spawned (used by the restart loop).
@@ -93,15 +93,15 @@ fn spawn_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &[
         match map.get(p) {
             Some(slot) => { installs[n] = (p, CapHandle(slot)); n += 1; }
             None => ctx.log_fmt(format_args!(
-                "supervisor: {} peer '{}' not in name-cap map — kernel will name-wire it", name, p)),
+                "supervisor: {} peer '{}' not in name-cap map - kernel will name-wire it", name, p)),
         }
     }
     if n == 0 {
-        return spawn_mapped(ctx, map, name, 0xFFFF); // nothing to provide — plain name-wired spawn
+        return spawn_mapped(ctx, map, name, 0xFFFF); // nothing to provide - plain name-wired spawn
     }
     match ctx.spawn_with_caps(name, 0xFFFF, &installs[..n]) {
         Ok(Some(cap)) => {
-            // Free the dead instance's cap on a restart (see spawn_mapped) — no cap-table leak.
+            // Free the dead instance's cap on a restart (see spawn_mapped) - no cap-table leak.
             if let Some(old) = map.get(name) { ctx.remove_cap(CapHandle(old)); }
             let _ = map.record(name, cap.0);
             ctx.log_fmt(format_args!(
@@ -114,7 +114,7 @@ fn spawn_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &[
 }
 
 /// Spawn `name` on `core` (0xFFFF = round-robin) AND record its endpoint cap in `map` (Phase 1).
-/// The spawn itself is identical to `ctx.spawn` — the new syscall just also hands back a cap.
+/// The spawn itself is identical to `ctx.spawn` - the new syscall just also hands back a cap.
 /// Returns true if the service spawned with an endpoint cap (used by the restart loop).
 fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u32) -> bool {
     match ctx.spawn_returning_endpoint(name, core) {
@@ -125,7 +125,7 @@ fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u3
             if map.record(name, cap.0) {
                 ctx.log_fmt(format_args!("supervisor: name-map + {} (endpoint cap slot {})", name, cap.0));
             } else {
-                ctx.log_fmt(format_args!("supervisor: name-map FULL — dropped {}", name));
+                ctx.log_fmt(format_args!("supervisor: name-map FULL - dropped {}", name));
             }
             true
         }
@@ -133,11 +133,11 @@ fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u3
     }
 }
 
-/// Ensure `name` is running and recorded in the map (Path C / Phase 6 — unifies boot and recovery).
+/// Ensure `name` is running and recorded in the map (Path C / Phase 6 - unifies boot and recovery).
 ///
 /// On a **fresh boot** nothing is running yet, so this spawns (via `spawn_mapped`/`spawn_wired`). On a
 /// **supervisor respawn** the real services are still alive (only the supervisor died), so this
-/// ADOPTS each — reacquires its endpoint cap by name from the kernel directory and records it —
+/// ADOPTS each - reacquires its endpoint cap by name from the kernel directory and records it -
 /// instead of re-spawning a duplicate (which the kernel would reject as AlreadyRunning anyway). The
 /// kernel re-points death notifications to the respawned supervisor via the directory, so after this
 /// reconciliation the restart loop works exactly as on a fresh boot.
@@ -154,7 +154,7 @@ fn ensure_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u
     spawn_mapped(ctx, map, name, core)
 }
 
-/// `ensure_mapped` for a service with peers — adopt if already running, else `spawn_wired`.
+/// `ensure_mapped` for a service with peers - adopt if already running, else `spawn_wired`.
 fn ensure_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &[&str]) -> bool {
     if let Some(cap) = ctx.acquire_send_grant_cap(name) {
         let _ = map.record(name, cap.0);
@@ -168,12 +168,12 @@ fn ensure_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Naming migration (docs/naming-design.md): `name → cap` map, built as we spawn the real
     // services. The supervisor wires dependents from it; clients resolve/reacquire names via the
-    // kernel name-directory (Path C, §3.7 — the registry *service* is retired, Phase 4).
+    // kernel name-directory (Path C, §3.7 - the registry *service* is retired, Phase 4).
     #[allow(unused_mut)]
     let mut name_map = NameCapMap::new();
 
     // Path C / Phase 5: the kernel boots the supervisor directly (init is removed), so the
-    // supervisor now spawns the logger — moved here from init. logger is not TCB (§11.3): retry
+    // supervisor now spawns the logger - moved here from init. logger is not TCB (§11.3): retry
     // once on failure and continue without it (its output falls back to the kernel ring buffer).
     ctx.log("supervisor: spawning logger...");
     if ctx.spawn("logger").is_err() {
@@ -187,10 +187,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Skipped in idle-only builds (S8): no active workload by design.
     // Skipped in bp2-only: that mode isolates the BP2 cross-core round-trip
     // (perf-bp2 on core 0 ⇄ perf-bp2-echo on core 1) so echo is not starved by
-    // the ping→pong flood on core 1 — gives clean, fast BP2 latency numbers.
+    // the ping→pong flood on core 1 - gives clean, fast BP2 latency numbers.
     // Skipped in perf-iso: per-probe isolation builds run one benchmark alone.
     // Skipped in bare-metal: the USB-boot image settles at a quiet `gsh>` prompt.
-    // ping/pong are demo services (examples/) — spawn them on demand from the
+    // ping/pong are demo services (examples/) - spawn them on demand from the
     // shell (`spawn pong` then `spawn ping`) when you want the cross-core demo.
     #[cfg(not(any(feature = "bare-metal", feature = "idle-only", feature = "bp2-only", feature = "perf-iso")))]
     {
@@ -220,11 +220,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let _ = ctx.spawn("probe-victim");  // Test 4A kill target
         let _ = ctx.spawn("probe-4b-recv"); // Test 4B kill target
         let _ = ctx.spawn("probe-3b");      // Test 3B (has recv slot for wrong-right probe)
-        // Sender / active probes — need SEND caps to the services above.
+        // Sender / active probes - need SEND caps to the services above.
         let _ = ctx.spawn("probe-sender");  // Test 3A sender; SEND cap to probe-recv
         let _ = ctx.spawn("probe-4a");      // Test 4A; SEND cap to probe-victim
         let _ = ctx.spawn("probe-4b-send"); // Test 4B; SEND cap to probe-4b-recv
-        // Cap-transfer probes (Tests 5A and 5B) — receiver first so its endpoint
+        // Cap-transfer probes (Tests 5A and 5B) - receiver first so its endpoint
         // is registered before the senders' SEND|GRANT caps are wired.
         let _ = ctx.spawn("probe-5a-recv"); // Test 5A/5B receiver
         let _ = ctx.spawn("probe-5a-send"); // Test 5A sender (SEND|GRANT cap)
@@ -233,10 +233,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let _ = ctx.spawn("probe-yielder"); // Test 8A
         let _ = ctx.spawn("probe-hog");     // Test 8B (tight loop; preemption via ping)
         let _ = ctx.spawn("probe-9b");      // Test 9B
-        // Memory-limit probes — Tests 7A and 7B.
+        // Memory-limit probes - Tests 7A and 7B.
         let _ = ctx.spawn("probe-7a");
         let _ = ctx.spawn("probe-7b");
-        // Interrupt-routing probe — Test IR1A (§12.2, §12.3).
+        // Interrupt-routing probe - Test IR1A (§12.2, §12.3).
         let _ = ctx.spawn("probe-11a");
     }
 
@@ -249,7 +249,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // observe: spawn in full (osdev run) builds only. Excluded from test-specific
     // builds (its 224-slot scan every 500 yields adds timing noise) and from
-    // bare-metal — its periodic table dump would keep the display scrolling, but
+    // bare-metal - its periodic table dump would keep the display scrolling, but
     // the USB image rests at `gsh>`. Run `observe` from the shell on demand.
     #[cfg(not(any(feature = "bare-metal", feature = "identity-only", feature = "perf-only",
                   feature = "perf-brutal-only", feature = "stress-only",
@@ -257,7 +257,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
     let _ = ctx.spawn("observe");
 
-    // Persistence (v2; docs/persistence.md) — block-driver + fs. Spawned in bare-metal
+    // Persistence (v2; docs/persistence.md) - block-driver + fs. Spawned in bare-metal
     // (so a usable OS / Prime sees its disk and `drives flash` can format it) and in the
     // blockdev smoke-test. block-driver MUST precede fs (fs's send-peer cap to it wires
     // from the name table at fs's spawn), and BOTH must precede the shell (the shell's
@@ -266,7 +266,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Phase 4 (Path C): the registry service is gone. block-driver has no peers; fs's only peer is
     // block-driver, provided from the map. Clients reacquire names via the kernel directory.
     //
-    // block-driver is also spawned in `identity-only` builds — it idles harmlessly with no disk
+    // block-driver is also spawned in `identity-only` builds - it idles harmlessly with no disk
     // (QEMU has no -drive there: "no controller"), giving §22 Test 11 a restartable victim to kill.
     // `ensure_*` (Phase 6): spawn on a fresh boot, ADOPT the running instance on a supervisor respawn.
     #[cfg(any(feature = "bare-metal", feature = "blockdev", feature = "identity-only"))]
@@ -281,7 +281,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
-    // Phase 3a: shell's `fs` peer is wired from the supervisor's map (no registry — retired).
+    // Phase 3a: shell's `fs` peer is wired from the supervisor's map (no registry - retired).
     // Phase 6: ensure_wired adopts a running shell on a supervisor respawn instead of duplicating it.
     ensure_wired(&ctx, &mut name_map, "shell", &["fs"]);
 
@@ -302,7 +302,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     spawn_mapped(&ctx, &mut name_map, "ehci", 0xFFFF);
 
     // Phase 1 (docs/naming-design.md): report the shadow name→cap map. Proves the supervisor now
-    // holds an endpoint cap to every real service it spawned — the future name authority. Nothing
+    // holds an endpoint cap to every real service it spawned - the future name authority. Nothing
     // reads it yet (Phase 0b/3 wire dependents from it; Phase 4 brokers reacquisition through it).
     ctx.log_fmt(format_args!("supervisor: name-cap map holds {} service(s)", name_map.count));
 
@@ -312,7 +312,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // The kernel enqueues the name of a dead restartable service to our endpoint; we respawn
     // it. `recv` BLOCKS, so the core still reaches the idle/halt path and runs cool between
     // deaths (no polling). Restartable services routed here: `registry`, `block-driver`, `fs`
-    // (the trusted-root services init/supervisor remain non-restartable — their death is a
+    // (the trusted-root services init/supervisor remain non-restartable - their death is a
     // kernel panic). Other restart/kill commands still arrive via the COM2 control channel
     // (control::process_pending in the timer ISR).
     //
@@ -324,7 +324,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let msg = ctx.recv();
         let name = core::str::from_utf8(msg.payload_bytes()).unwrap_or("");
         // Restartable services (§6.1): fs + block-driver (Phase D). Phase 3c/4 (docs/naming-design.md):
-        // respawn WIRED FROM THE MAP — same peers as at boot — and the spawn refreshes the map with
+        // respawn WIRED FROM THE MAP - same peers as at boot - and the spawn refreshes the map with
         // the new instance's cap (record updates in place, so a kill-storm can't grow the map). The
         // restarted service is supervisor-wired just like at boot; clients reacquire it by name via
         // the kernel directory (§14.3). The "died/restarted" log lines are kept (tests gate on them).
@@ -374,7 +374,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 }
 
 // ---------------------------------------------------------------------------
-// Extended probes — all non-identity test categories.
+// Extended probes - all non-identity test categories.
 //
 // Feature-gated variants (in priority order):
 //   identity-only     → spawn nothing (fastest boot, used by `osdev test identity`)
@@ -383,7 +383,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 //   (none)            → spawn everything (used by `osdev build` / `osdev run`)
 // ---------------------------------------------------------------------------
 
-// bare-metal: no probes at all — spawn_extended_probes is never called, but
+// bare-metal: no probes at all - spawn_extended_probes is never called, but
 // the function must exist so the linker is happy.
 #[cfg(feature = "bare-metal")]
 #[inline(always)]
@@ -441,7 +441,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
 
 // stress-only: spawn only the S1–S10 stress probe services.
 // All stress probes are self-contained (use ctx.kill/ctx.spawn internally);
-// no QEMU control port required — safe for real hardware.
+// no QEMU control port required - safe for real hardware.
 #[cfg(all(not(feature = "bare-metal"), not(feature = "identity-only"), not(feature = "perf-only"), not(feature = "perf-brutal-only"), feature = "stress-only"))]
 fn spawn_extended_probes(ctx: &ServiceContext) {
     // Receivers/victims must register before their controllers so endpoints
@@ -450,8 +450,8 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("stress-s1");
     let _ = ctx.spawn("stress-s2-victim");
     let _ = ctx.spawn("stress-s2");
-    let _ = ctx.spawn("stress-s3-recv");    // core 1 — cross-core thrash receiver
-    let _ = ctx.spawn("stress-s3-send");    // core 0 — cross-core thrash sender
+    let _ = ctx.spawn("stress-s3-recv");    // core 1 - cross-core thrash receiver
+    let _ = ctx.spawn("stress-s3-send");    // core 0 - cross-core thrash sender
     let _ = ctx.spawn("stress-s4-victim");
     let _ = ctx.spawn("stress-s4");
     let _ = ctx.spawn("stress-s5-victim");
@@ -459,11 +459,11 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("stress-s6");         // self-referential; endpoint registered at spawn
     let _ = ctx.spawn("stress-s7");
     let _ = ctx.spawn("stress-s8");
-    let _ = ctx.spawn("stress-s9-recv");    // core 2 — IPI storm receiver
+    let _ = ctx.spawn("stress-s9-recv");    // core 2 - IPI storm receiver
     let _ = ctx.spawn("stress-s9-send-a"); // core 0 → core 2
     let _ = ctx.spawn("stress-s9-send-b"); // core 1 → core 2
-    let _ = ctx.spawn("stress-s10-victim"); // core 1 — cascading revocation target
-    let _ = ctx.spawn("stress-s10");        // core 0 — kills victim cross-core
+    let _ = ctx.spawn("stress-s10-victim"); // core 1 - cascading revocation target
+    let _ = ctx.spawn("stress-s10");        // core 0 - kills victim cross-core
 }
 
 // chaos-only: spawn only the C2–C7 chaos probe services.
@@ -474,7 +474,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     // BC7/C7 victims must be registered before their controllers so endpoints
     // exist when the controller's SEND caps are wired at spawn time.
     let _ = ctx.spawn("chaos-c2");          // non-TCB page fault, system continues
-    let _ = ctx.spawn("chaos-c2-monitor");  // witness — alive after c2 faults
+    let _ = ctx.spawn("chaos-c2-monitor");  // witness - alive after c2 faults
     let _ = ctx.spawn("chaos-c3");          // alloc-deny pressure cycles
     let _ = ctx.spawn("chaos-c5");          // recursive yields (kernel stack depth)
     let _ = ctx.spawn("chaos-c6-hog");      // tight-loop hog on core 3
@@ -484,24 +484,24 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
 }
 
 // adv-only: spawn only the A1–A10 adversarial probe services.
-// All adversarial probes are self-contained — no QEMU control port required.
+// All adversarial probes are self-contained - no QEMU control port required.
 #[cfg(all(not(feature = "bare-metal"), not(feature = "identity-only"), not(feature = "perf-only"), not(feature = "perf-brutal-only"), not(feature = "stress-only"), feature = "adv-only"))]
 fn spawn_extended_probes(ctx: &ServiceContext) {
     // adv-a11 first: it is self-contained (no peers, no IPC) and logs its pass
     // line within the first second, so it completes even when the CPU-heavy
     // attackers (A1's 10k-iteration loop, A2 brute-force) would otherwise starve
     // a TCG-throttled boot. Order is functionally irrelevant for it.
-    let _ = ctx.spawn("adv-a11"); // introspection gated — denied without INTROSPECT cap
+    let _ = ctx.spawn("adv-a11"); // introspection gated - denied without INTROSPECT cap
     // Passive/victim services before their attackers so endpoints exist when
     // attacker SEND caps are wired at spawn time.
     let _ = ctx.spawn("adv-a1");
     let _ = ctx.spawn("adv-a2");
     let _ = ctx.spawn("adv-a3");
     let _ = ctx.spawn("adv-a4");
-    let _ = ctx.spawn("adv-a5-victim"); // passive — killed by adv-a5
+    let _ = ctx.spawn("adv-a5-victim"); // passive - killed by adv-a5
     let _ = ctx.spawn("adv-a5");
     let _ = ctx.spawn("adv-a6");
-    let _ = ctx.spawn("adv-a7-recv");   // passive recv — registered before sender
+    let _ = ctx.spawn("adv-a7-recv");   // passive recv - registered before sender
     let _ = ctx.spawn("adv-a7");
     let _ = ctx.spawn("adv-a8");        // tight-loop attacker
     let _ = ctx.spawn("adv-a8-witness");
@@ -511,7 +511,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
 
 // fuzz-only: spawn only the §22 fuzz probe services (F1/F2/F5/F6/F7/F8 + brutal
 // BF1/BF2/BF5/BF6/BF7/BF8). All self-run and print "fuzz: F* pass (n/n)" over
-// serial — no QEMU control port required, safe for real hardware. Recv-endpoint
+// serial - no QEMU control port required, safe for real hardware. Recv-endpoint
 // victims/targets are spawned before their controllers so endpoints are registered
 // when the controllers' SEND caps are wired at spawn time (same ordering rule as
 // every other category). F3/BF3 (ELF-loader fuzz) need a separate test-bad-elf
@@ -528,7 +528,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("fuzz-f7-victim");
     let _ = ctx.spawn("fuzz-f7");
     let _ = ctx.spawn("fuzz-f8");
-    // Brutal fuzz probes (Milestone 17) — heavier iteration counts; run fast on
+    // Brutal fuzz probes (Milestone 17) - heavier iteration counts; run fast on
     // real silicon (no TCG throttling). Recv/victim partners first.
     let _ = ctx.spawn("fuzz-bf5-recv");
     let _ = ctx.spawn("fuzz-bf5");
@@ -542,26 +542,26 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
 }
 
 // b2-only: spawn only the regular B2 cross-core IPC probe pair (isolation build).
-// No other benchmarks running — eliminates concurrent IPI noise from B5 spawn/kill
+// No other benchmarks running - eliminates concurrent IPI noise from B5 spawn/kill
 // and B6 restart cycles so the blocking round-trip can complete on Goldmont+.
 #[cfg(all(not(feature = "bare-metal"), not(feature = "identity-only"), not(feature = "perf-only"), not(feature = "perf-brutal-only"), not(feature = "stress-only"), not(feature = "adv-only"), not(feature = "chaos-only"), feature = "b2-only"))]
 fn spawn_extended_probes(ctx: &ServiceContext) {
-    let _ = ctx.spawn("perf-b2");      // B2 sender (core 0) — registers endpoint first
-    let _ = ctx.spawn("perf-b2-echo"); // B2 echo  (core 1) — wires SEND cap to perf-b2
+    let _ = ctx.spawn("perf-b2");      // B2 sender (core 0) - registers endpoint first
+    let _ = ctx.spawn("perf-b2-echo"); // B2 echo  (core 1) - wires SEND cap to perf-b2
 }
 
 // bp2-only: spawn only the brutal BP2 cross-core IPC probe pair (isolation build).
-// Brutal equivalent of b2-only — higher iteration count, same isolation rationale.
+// Brutal equivalent of b2-only - higher iteration count, same isolation rationale.
 #[cfg(all(not(feature = "bare-metal"), not(feature = "identity-only"), not(feature = "perf-only"), not(feature = "perf-brutal-only"), not(feature = "stress-only"), not(feature = "adv-only"), not(feature = "chaos-only"), not(feature = "b2-only"), feature = "bp2-only"))]
 fn spawn_extended_probes(ctx: &ServiceContext) {
-    let _ = ctx.spawn("perf-bp2");      // BP2 sender (core 0) — registers endpoint first
-    let _ = ctx.spawn("perf-bp2-echo"); // BP2 echo  (core 1) — wires SEND cap to perf-bp2
+    let _ = ctx.spawn("perf-bp2");      // BP2 sender (core 0) - registers endpoint first
+    let _ = ctx.spawn("perf-bp2-echo"); // BP2 echo  (core 1) - wires SEND cap to perf-bp2
 }
 
-// perf-iso: isolate ONE brutal perf probe (+ its partners) — no ping/pong, no
-// other probes — for clean uncontended per-op latency on hardware. The probe is
+// perf-iso: isolate ONE brutal perf probe (+ its partners) - no ping/pong, no
+// other probes - for clean uncontended per-op latency on hardware. The probe is
 // selected by an iso-bpN sub-feature (each pulls in perf-iso). bp5 covers both
-// BP5 (spawn) and BP6 (restart) — same probe. Partners are spawned first
+// BP5 (spawn) and BP6 (restart) - same probe. Partners are spawned first
 // (victim before perf-bp5; recv before perf-bp9) so endpoints/caps are wired.
 #[cfg(feature = "perf-iso")]
 fn spawn_extended_probes(ctx: &ServiceContext) {
@@ -583,7 +583,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     // iso-xlife: both victims first so they exist when the controller's first kill
     // fires; controller (core 1) then times kill/spawn of near (core 1) and far (core 2).
     #[cfg(feature = "iso-xlife")] { let _ = ctx.spawn("xlife-near"); let _ = ctx.spawn("xlife-far"); let _ = ctx.spawn("xlife"); }
-    // (iso-reg reg-roundtrip self-test removed — registry service retired, Path C / Phase 4.)
+    // (iso-reg reg-roundtrip self-test removed - registry service retired, Path C / Phase 4.)
     #[cfg(feature = "iso-s9")]   {
         let _ = ctx.spawn("stress-s9-recv");
         let _ = ctx.spawn("stress-s9-send-a");
@@ -595,7 +595,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
 // Full build: spawn all non-identity probe categories.
 #[cfg(not(any(feature = "bare-metal", feature = "idle-only", feature = "identity-only", feature = "perf-only", feature = "perf-brutal-only", feature = "stress-only", feature = "adv-only", feature = "chaos-only", feature = "fuzz-only", feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
 fn spawn_extended_probes(ctx: &ServiceContext) {
-    // --- Brutal adversarial test probes — Milestone 20 ---
+    // --- Brutal adversarial test probes - Milestone 20 ---
     // Spawned EARLY, before property/stress kill-respawn loops start, so the
     // supervisor's spawn calls land while the system is still lightly loaded.
     // Victims/passive services must be registered before their attackers so
@@ -614,7 +614,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("adv-ba9");
     let _ = ctx.spawn("adv-ba10");
 
-    // --- Brutal chaos-test probes — Milestone 21 ---
+    // --- Brutal chaos-test probes - Milestone 21 ---
     // Spawned EARLY before property/stress kill-respawn loops start.
     // BC2: 5 simultaneous faulters registered before the monitor so all 5
     // fault concurrently before the monitor starts counting yields.
@@ -634,14 +634,14 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("chaos-bc7-victim"); // passive target on core 2
     let _ = ctx.spawn("chaos-bc7");        // controller on core 1
 
-    // Property-test probes — Milestone 9 Phase 1.
+    // Property-test probes - Milestone 9 Phase 1.
     // prop-p9-victim must register its endpoint before prop-p9 is spawned
     // (SEND caps to prop-p9-victim are wired at prop-p9 spawn time).
     let _ = ctx.spawn("prop-p9-victim");
     let _ = ctx.spawn("prop-p9");
     let _ = ctx.spawn("prop-p1");
     let _ = ctx.spawn("prop-p10");
-    // Property-test probes — Milestone 9 Phase 2.
+    // Property-test probes - Milestone 9 Phase 2.
     // P3 and P6 are spawned BEFORE the kill/respawn controllers (P2, P8) so they
     // are already running by the time P2 and P8 begin their kill/respawn loops.
     // P2 and P8 each do rapid kill/respawn cycles that compete for kernel resources;
@@ -650,11 +650,11 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("prop-p6");        // P6: self-referential queue depth test (no victims)
     // Kill/respawn victims must be registered before their controller probes start.
     let _ = ctx.spawn("prop-p2-victim"); // P2: kill/respawn generation target
-    let _ = ctx.spawn("prop-p2");        // P2 controller — starts cycling immediately
+    let _ = ctx.spawn("prop-p2");        // P2 controller - starts cycling immediately
     let _ = ctx.spawn("prop-p8-victim"); // P8: kill/respawn generation target
-    let _ = ctx.spawn("prop-p8");        // P8 controller — starts cycling immediately
+    let _ = ctx.spawn("prop-p8");        // P8 controller - starts cycling immediately
 
-    // Property-test probes — Milestone 9 Phase 3.
+    // Property-test probes - Milestone 9 Phase 3.
     // P4 has no victim. P5 and P7 victims must be registered before their
     // controllers so endpoints exist when the controllers start cycling.
     let _ = ctx.spawn("prop-p4");
@@ -663,7 +663,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("prop-p7-victim");
     let _ = ctx.spawn("prop-p7");
 
-    // --- Brutal property test probes — Milestone 16 ---
+    // --- Brutal property test probes - Milestone 16 ---
     // Victims before controllers within each pair.
     // Self-referential probes (BP3, BP6) can go in any order.
     let _ = ctx.spawn("prop-bp1");
@@ -682,7 +682,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("prop-bp9");
     let _ = ctx.spawn("prop-bp10");
 
-    // --- Fuzz-test probes — Milestone 10 Phase 1 ---
+    // --- Fuzz-test probes - Milestone 10 Phase 1 ---
     // Recv-endpoint victims/targets must be spawned before their controllers.
     let _ = ctx.spawn("fuzz-f1");
     let _ = ctx.spawn("fuzz-f2");
@@ -694,7 +694,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("fuzz-f7");
     let _ = ctx.spawn("fuzz-f8");
 
-    // --- Brutal fuzz test probes — Milestone 17 ---
+    // --- Brutal fuzz test probes - Milestone 17 ---
     // Recv-endpoint victims must be spawned before controllers so their
     // endpoints are registered when the controllers' SEND caps are wired.
     let _ = ctx.spawn("fuzz-bf5-recv");
@@ -707,39 +707,39 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("fuzz-bf2");
     let _ = ctx.spawn("fuzz-bf8");
 
-    // --- Stress-test probes — Milestone 11 Phase 1 ---
+    // --- Stress-test probes - Milestone 11 Phase 1 ---
     // Recv-endpoint victims must be spawned before their controllers so their
     // endpoints are registered before the controllers' SEND caps are wired.
     let _ = ctx.spawn("stress-s1-recv");
     let _ = ctx.spawn("stress-s1");
     let _ = ctx.spawn("stress-s2-victim");
     let _ = ctx.spawn("stress-s2");
-    let _ = ctx.spawn("stress-s3-recv");   // core 1 — cross-core thrash receiver
-    let _ = ctx.spawn("stress-s3-send");   // core 0 — cross-core thrash sender
+    let _ = ctx.spawn("stress-s3-recv");   // core 1 - cross-core thrash receiver
+    let _ = ctx.spawn("stress-s3-send");   // core 0 - cross-core thrash sender
     let _ = ctx.spawn("stress-s4-victim");
     let _ = ctx.spawn("stress-s4");
     let _ = ctx.spawn("stress-s7");
-    let _ = ctx.spawn("stress-s10-victim"); // core 1 — cascading revocation target
-    let _ = ctx.spawn("stress-s10");        // core 0 — kills victim cross-core
-    // Stress Phase 2 — S5, S6, S8, S9.
+    let _ = ctx.spawn("stress-s10-victim"); // core 1 - cascading revocation target
+    let _ = ctx.spawn("stress-s10");        // core 0 - kills victim cross-core
+    // Stress Phase 2 - S5, S6, S8, S9.
     // s5-victim must register before s5 starts cycling.
     // s9-recv must register before s9-send-a/b are wired with SEND caps.
     let _ = ctx.spawn("stress-s5-victim");
     let _ = ctx.spawn("stress-s5");
     let _ = ctx.spawn("stress-s6");        // self-referential; endpoint registered at spawn time
     let _ = ctx.spawn("stress-s8");
-    let _ = ctx.spawn("stress-s9-recv");   // core 2 — concurrent IPI storm receiver
+    let _ = ctx.spawn("stress-s9-recv");   // core 2 - concurrent IPI storm receiver
     let _ = ctx.spawn("stress-s9-send-a"); // core 0 → core 2
     let _ = ctx.spawn("stress-s9-send-b"); // core 1 → core 2
 
-    // --- Brutal stress-test probes — Milestone 18 ---
+    // --- Brutal stress-test probes - Milestone 18 ---
     // Ordering: recv-endpoint victims before their controllers.
     let _ = ctx.spawn("stress-bs1-recv");   // passive saturation target
     let _ = ctx.spawn("stress-bs1");        // 50k try_send
     let _ = ctx.spawn("stress-bs2-victim"); // passive restart victim
     let _ = ctx.spawn("stress-bs2");        // 200 kill/respawn cycles
-    let _ = ctx.spawn("stress-bs3-recv");   // core 1 — cross-core thrash receiver
-    let _ = ctx.spawn("stress-bs3-send");   // core 0 — 2000 blocking sends
+    let _ = ctx.spawn("stress-bs3-recv");   // core 1 - cross-core thrash receiver
+    let _ = ctx.spawn("stress-bs3-send");   // core 0 - 2000 blocking sends
     let _ = ctx.spawn("stress-bs4-victim"); // passive churn victim
     let _ = ctx.spawn("stress-bs4");        // 50 churn cycles; 2 cap slots
     let _ = ctx.spawn("stress-bs5-victim"); // passive generation victim
@@ -747,13 +747,13 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("stress-bs6");        // self-referential; 20000 self-ping rounds
     let _ = ctx.spawn("stress-bs7");        // 500 alloc passes
     let _ = ctx.spawn("stress-bs8");        // 3000 yields
-    let _ = ctx.spawn("stress-bs9-recv");   // core 2 — IPI storm receiver
+    let _ = ctx.spawn("stress-bs9-recv");   // core 2 - IPI storm receiver
     let _ = ctx.spawn("stress-bs9-send-a"); // core 0 → core 2; 2500 sends
     let _ = ctx.spawn("stress-bs9-send-b"); // core 1 → core 2; 2500 sends
-    let _ = ctx.spawn("stress-bs10-victim"); // core 1 — cascading revocation victim
+    let _ = ctx.spawn("stress-bs10-victim"); // core 1 - cascading revocation victim
     let _ = ctx.spawn("stress-bs10");        // core 0; 50 cycles; 3 cap slots
 
-    // --- Chaos-test probes — Milestone 14 ---
+    // --- Chaos-test probes - Milestone 14 ---
     // c7-victim must be registered on core 2 before chaos-c7 is spawned on core 1
     // so its endpoint exists when chaos-c7's SEND cap is wired at spawn time.
     let _ = ctx.spawn("chaos-c2");
@@ -762,31 +762,31 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("chaos-c5");
     let _ = ctx.spawn("chaos-c6-hog");
     let _ = ctx.spawn("chaos-c6-monitor");
-    let _ = ctx.spawn("chaos-c7-victim"); // passive recv target — spawned before controller
+    let _ = ctx.spawn("chaos-c7-victim"); // passive recv target - spawned before controller
     let _ = ctx.spawn("chaos-c7");
 
-    // --- Adversarial-test probes — Milestone 13 ---
+    // --- Adversarial-test probes - Milestone 13 ---
     // Passive/victim services must be spawned before their attackers so their
     // endpoints are registered when the attackers' SEND caps are wired.
     let _ = ctx.spawn("adv-a1");
     let _ = ctx.spawn("adv-a2");
     let _ = ctx.spawn("adv-a3");
     let _ = ctx.spawn("adv-a4");
-    let _ = ctx.spawn("adv-a5-victim"); // passive — killed by adv-a5
+    let _ = ctx.spawn("adv-a5-victim"); // passive - killed by adv-a5
     let _ = ctx.spawn("adv-a5");
     let _ = ctx.spawn("adv-a6");
-    let _ = ctx.spawn("adv-a7-recv");   // passive — recv target before sender wired
+    let _ = ctx.spawn("adv-a7-recv");   // passive - recv target before sender wired
     let _ = ctx.spawn("adv-a7");
     let _ = ctx.spawn("adv-a8");
     let _ = ctx.spawn("adv-a8-witness");
     let _ = ctx.spawn("adv-a9");
     let _ = ctx.spawn("adv-a10");
-    let _ = ctx.spawn("adv-a11"); // introspection gated — denied without INTROSPECT cap
+    let _ = ctx.spawn("adv-a11"); // introspection gated - denied without INTROSPECT cap
 
-    // --- Brutal performance-benchmark probes — Milestone 19 ---
+    // --- Brutal performance-benchmark probes - Milestone 19 ---
     // Sender/controller BEFORE echo/recv so endpoints register first.
     // bp5-victim before bp5; bp9-recv before bp9.
-    let _ = ctx.spawn("perf-bp1");         // BP1 sender (core 0) — registers endpoint first
+    let _ = ctx.spawn("perf-bp1");         // BP1 sender (core 0) - registers endpoint first
     let _ = ctx.spawn("perf-bp1-echo");    // BP1 echo (core 0)
     let _ = ctx.spawn("perf-bp2");         // BP2 sender (core 0)
     let _ = ctx.spawn("perf-bp2-echo");    // BP2 echo (core 1)
@@ -800,14 +800,14 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("perf-bp9");
     let _ = ctx.spawn("perf-bp10");
 
-    // --- Performance-benchmark probes — Milestone 12 ---
+    // --- Performance-benchmark probes - Milestone 12 ---
     // Spawn sender/controller probes BEFORE their echo/recv partners so the
     // sender's endpoint is registered when the echo partner wires its SEND cap.
     // perf-b5-victim must be registered before perf-b5 starts cycling.
-    let _ = ctx.spawn("perf-b1");         // B1 sender (core 0) — registers endpoint first
-    let _ = ctx.spawn("perf-b1-echo");    // B1 echo (core 0)   — wires SEND cap to perf-b1
-    let _ = ctx.spawn("perf-b2");         // B2 sender (core 0) — registers endpoint first
-    let _ = ctx.spawn("perf-b2-echo");    // B2 echo  (core 1)  — wires SEND cap to perf-b2
+    let _ = ctx.spawn("perf-b1");         // B1 sender (core 0) - registers endpoint first
+    let _ = ctx.spawn("perf-b1-echo");    // B1 echo (core 0)   - wires SEND cap to perf-b1
+    let _ = ctx.spawn("perf-b2");         // B2 sender (core 0) - registers endpoint first
+    let _ = ctx.spawn("perf-b2-echo");    // B2 echo  (core 1)  - wires SEND cap to perf-b2
     let _ = ctx.spawn("perf-b3");
     let _ = ctx.spawn("perf-b4");
     let _ = ctx.spawn("perf-b5-victim");  // spawned before perf-b5 so it exists to be killed
@@ -818,7 +818,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("perf-b9");
     let _ = ctx.spawn("perf-b10");
 
-    // --- Brutal identity test probes — Milestone 15 ---
+    // --- Brutal identity test probes - Milestone 15 ---
     // T12 chain: spawn C and B (recv-endpoint) before A (sender), so their
     // endpoints are registered when A's SEND cap to B is wired at spawn time.
     let _ = ctx.spawn("brutal-id-12-c"); // chain endpoint: registered first

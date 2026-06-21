@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Syscall entry point and dispatch — §8.2, §7.5.
+//! Syscall entry point and dispatch - §8.2, §7.5.
 //!
 //! Every syscall validates the supplied capability before performing any
 //! privileged action. No capability → no action; no exceptions (§3.1).
@@ -67,7 +67,7 @@ pub enum SyscallNumber {
     SpawnWithCaps          = 39,
 }
 
-/// Raw syscall dispatcher — called from the SYSCALL/SYSENTER IDT stub.
+/// Raw syscall dispatcher - called from the SYSCALL/SYSENTER IDT stub.
 ///
 /// Registers: rax = syscall number, rdi/rsi/rdx = arguments.
 ///
@@ -129,7 +129,7 @@ pub unsafe extern "C" fn syscall_handler(
 }
 
 // ---------------------------------------------------------------------------
-// Syscall: Log (5) — write a message to the kernel ring buffer.
+// Syscall: Log (5) - write a message to the kernel ring buffer.
 // ---------------------------------------------------------------------------
 
 /// arg0 = cap_slot, arg1 = pointer to UTF-8 bytes, arg2 = byte length.
@@ -162,7 +162,7 @@ fn handle_log(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Syscall: Print (22) — like Log but WITHOUT a trailing newline.
+// Syscall: Print (22) - like Log but WITHOUT a trailing newline.
 // ---------------------------------------------------------------------------
 
 /// arg0 = cap_slot, arg1 = pointer to UTF-8 bytes, arg2 = byte length.
@@ -191,15 +191,15 @@ fn handle_print(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Syscall: ConsoleWrite (23) — write to the interactive console (serial + TV).
+// Syscall: ConsoleWrite (23) - write to the interactive console (serial + TV).
 // ---------------------------------------------------------------------------
 
 /// arg0 = cap_slot, arg1 = pointer to UTF-8 bytes, arg2 = byte length.
 ///
 /// Requires `Rights::WRITE` on `LOG_WRITE_RESOURCE` (Stage 1; Stage 2 gives the
 /// console service a dedicated cap). Unlike `Log`/`Print` (which now go to the
-/// log stream = serial only), this writes the CONSOLE path — serial AND the
-/// framebuffer — for interactive output (the shell prompt, `observe`). No newline
+/// log stream = serial only), this writes the CONSOLE path - serial AND the
+/// framebuffer - for interactive output (the shell prompt, `observe`). No newline
 /// is added; the caller includes one if wanted. See `docs/console-service.md`.
 fn handle_console_write(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::WRITE) {
@@ -220,7 +220,7 @@ fn handle_console_write(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Syscall: Send / Recv / TrySend (1, 2, 3) — Milestone 5/6.
+// Syscall: Send / Recv / TrySend (1, 2, 3) - Milestone 5/6.
 // ---------------------------------------------------------------------------
 
 fn handle_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
@@ -241,7 +241,7 @@ fn handle_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 
     let my_slot = scheduler::current_task_slot();
 
-    // enqueue atomically records us as a blocked sender if QueueFull —
+    // enqueue atomically records us as a blocked sender if QueueFull -
     // no separate record_blocked_sender call needed.
     match crate::ipc::routing::enqueue(endpoint_id, msg, cap.generation, Some(my_slot)) {
         Ok(Some(receiver_slot)) => {
@@ -325,7 +325,7 @@ fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
 pub const TRY_RECV_EMPTY: i64 = -1000;
 
 /// Non-blocking `recv` (syscall 34). Identical to `handle_recv` except it returns
-/// `TRY_RECV_EMPTY` instead of blocking when the queue is empty — so a busy-polling driver
+/// `TRY_RECV_EMPTY` instead of blocking when the queue is empty - so a busy-polling driver
 /// can drain interrupt events (§12) without giving up its loop. Same args as `recv`.
 fn handle_try_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
     let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::RECV) {
@@ -391,7 +391,7 @@ fn handle_recv_timeout(packed: u64, out_buf: u64, timeout: u64) -> i64 {
 
     let my_slot = scheduler::current_task_slot();
     // 0 = no deadline (block forever); else an absolute deadline in BSP timer TICKS, not TSC
-    // cycles — the timed-wake scan runs on the BSP and compares one shared tick clock, which is
+    // cycles - the timed-wake scan runs on the BSP and compares one shared tick clock, which is
     // valid cross-core where a per-core TSC is not (see scheduler::scan_timed_wakes).
     let deadline = if timeout == 0 {
         0
@@ -428,7 +428,7 @@ fn handle_recv_timeout(packed: u64, out_buf: u64, timeout: u64) -> i64 {
                 }
                 let err = scheduler::block_and_reschedule(TaskState::BlockedOnRecv);
                 if err != 0 { break err; }
-                // Woken by a sender (message ready) or the timer (deadline) — re-check.
+                // Woken by a sender (message ready) or the timer (deadline) - re-check.
             }
             Err(e) => break ipc_err_to_i64(e),
         }
@@ -453,7 +453,7 @@ fn handle_irq_unmask(irq: u64) -> i64 {
 }
 
 /// Block the calling task for roughly `cycles` TSC cycles, then return (syscall 37). A real
-/// sleep — the core can `hlt` while the task is parked — so a service that needs to wait (e.g.
+/// sleep - the core can `hlt` while the task is parked - so a service that needs to wait (e.g.
 /// a foreground UI polling for `q` between repaints, or the shell waiting for that UI to exit)
 /// does NOT busy-`yield`, which would peg its core at ~100% and make every task on that core
 /// read as fully busy in `observe`. Like `yield`, sleeping your own task needs no capability.
@@ -488,7 +488,7 @@ fn handle_try_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     // which the lookup above enforced. Executable §3.1 checkpoint.
     crate::invariants::assertions::assert_cap_validated(&Ok(()));
 
-    // Pass None for blocked_sender_slot — QueueFull is returned directly.
+    // Pass None for blocked_sender_slot - QueueFull is returned directly.
     match crate::ipc::routing::enqueue(endpoint_id, msg, cap.generation, None) {
         Ok(Some(receiver_slot)) => {
             scheduler::wake_by_slot(receiver_slot, 0);
@@ -565,7 +565,7 @@ fn handle_spawn(packed_arg0: u64, name_ptr: u64, name_len: u64) -> i64 {
 /// cap to the new service's recv endpoint and inserts it into the **caller's** cap table,
 /// returning the slot. This is the Phase-0 seam for moving naming out of the kernel
 /// (`docs/naming-design.md`): a spawner (the supervisor) can collect a cap to every service it
-/// starts — a userspace `name → cap` map — without the kernel resolving names for third parties.
+/// starts - a userspace `name → cap` map - without the kernel resolving names for third parties.
 /// The old name-wiring path is unchanged; this is purely additive.
 ///
 /// arg0 = packed (spawn_cap_slot in low 16, core in next 16; core 0xFFFF = round-robin).
@@ -576,7 +576,7 @@ fn handle_spawn_returning_endpoint(packed_arg0: u64, name_ptr: u64, name_len: u6
     let core_raw       = ((packed_arg0 >> 16) & 0xFFFF) as u32;
     let core_override  = if core_raw == 0xFFFF { None } else { Some(core_raw) };
 
-    // Validate the SPAWN capability (same gate as Spawn — §3.1).
+    // Validate the SPAWN capability (same gate as Spawn - §3.1).
     let cap = match scheduler::current_task_lookup_cap(spawn_cap_slot, Rights::WRITE) {
         Ok(c)  => c,
         Err(e) => return cap_err_to_i64(e),
@@ -608,12 +608,12 @@ fn handle_spawn_returning_endpoint(packed_arg0: u64, name_ptr: u64, name_len: u6
                 Err(e)   => cap_err_to_i64(e),
             }
         }
-        Ok(None) => -1, // spawned, but no recv endpoint — nothing to hand back
+        Ok(None) => -1, // spawned, but no recv endpoint - nothing to hand back
         Err(_)   => -1,
     }
 }
 
-/// Syscall: SpawnWithCaps (39) — the full Phase-0 spawn protocol (`docs/naming-design.md`). Spawns
+/// Syscall: SpawnWithCaps (39) - the full Phase-0 spawn protocol (`docs/naming-design.md`). Spawns
 /// a service whose send-peers are wired from **caller-supplied caps** (not the kernel name table),
 /// then returns a `SEND|GRANT` cap to the new endpoint (like SpawnReturningEndpoint). This is how
 /// the supervisor wires a dependent from its `name → cap` map without the kernel resolving names.
@@ -629,7 +629,7 @@ fn handle_spawn_with_caps(packed_arg0: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     let core_raw       = ((packed_arg0 >> 16) & 0xFFFF) as u32;
     let core_override  = if core_raw == 0xFFFF { None } else { Some(core_raw) };
 
-    // Validate the SPAWN capability (same gate as Spawn — §3.1). Reuse it as the array filler.
+    // Validate the SPAWN capability (same gate as Spawn - §3.1). Reuse it as the array filler.
     let spawn_cap = match scheduler::current_task_lookup_cap(spawn_cap_slot, Rights::WRITE) {
         Ok(c)  => c,
         Err(e) => return cap_err_to_i64(e),
@@ -656,7 +656,7 @@ fn handle_spawn_with_caps(packed_arg0: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     p += 1;
     if count > crate::task::MAX_SEND_PEERS { return -1; }
 
-    // Build the install list — for each entry, copy the caller's cap (GRANT-validated).
+    // Build the install list - for each entry, copy the caller's cap (GRANT-validated).
     use crate::task::{InstallCap, PEER_NAME_BYTES, MAX_SEND_PEERS};
     let mut installs = [InstallCap { name: [0u8; PEER_NAME_BYTES], name_len: 0, cap: spawn_cap }; MAX_SEND_PEERS];
     for entry in installs.iter_mut().take(count) {
@@ -669,7 +669,7 @@ fn handle_spawn_with_caps(packed_arg0: u64, buf_ptr: u64, buf_len: u64) -> i64 {
         p += label_len;
         let slot = (buf[p] as usize) | ((buf[p + 1] as usize) << 8);
         p += 2;
-        // The caller must hold this cap WITH GRANT — copying it into the child is then
+        // The caller must hold this cap WITH GRANT - copying it into the child is then
         // non-escalating (§7.3): the caller could already transfer the whole cap.
         let held = match scheduler::current_task_lookup_cap(slot, Rights::GRANT) {
             Ok(c)  => c,
@@ -742,7 +742,7 @@ fn handle_spawn_pipe(packed_arg0: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 /// Phase 5: no capability check (cap check added in Phase 6 when service_control
 /// is fully wired).
 fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
-    // §3.1 / §14.4: killing a service is a privileged action — it requires the
+    // §3.1 / §14.4: killing a service is a privileged action - it requires the
     // service_control capability. Without this gate `kill` was ambient authority
     // (any service could kill any non-trusted-root service). Like the other
     // name-taking syscalls it consumes both arg registers, so it validates by
@@ -763,10 +763,10 @@ fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
         Ok(s)  => s,
         Err(_) => return -1,
     };
-    // Path C / Phase 6: NO service is unkillable via this syscall — the only truly unkillable thing is
+    // Path C / Phase 6: NO service is unkillable via this syscall - the only truly unkillable thing is
     // the kernel itself. The `supervisor` used to be rejected here (it was the non-restartable trusted
-    // root); it is now **restartable** — the kernel respawns it on death, unconditionally and forever
-    // (a bound would just re-introduce the reboot and hand an attacker a DoS — see
+    // root); it is now **restartable** - the kernel respawns it on death, unconditionally and forever
+    // (a bound would just re-introduce the reboot and hand an attacker a DoS - see
     // `task::poll_supervisor_respawn`). So a SERVICE_CONTROL holder (the `chaos` utility, the operator
     // control channel) may kill it, and the kernel recovers it. (`init` is gone, Phase 5; `registry`
     // retired, Phase 4; `fs`/`block-driver` were already restartable.) The shell still refuses a
@@ -777,9 +777,9 @@ fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
         // target a trusted service) take down the TCB. Now that the kill has
         // completed and no kernel locks are held, verify the two invariants a
         // kill is most likely to break:
-        //   §6.2 — every TCB service (init/supervisor/registry) is still alive;
+        //   §6.2 - every TCB service (init/supervisor/registry) is still alive;
         //          TCB death is a loud, unrecoverable failure, not a silent one.
-        //   §7.8 — the cap table is still consistent (no cap carries a generation
+        //   §7.8 - the cap table is still consistent (no cap carries a generation
         //          beyond its resource's current generation). The generation bump
         //          only ever moves resources forward, so all surviving caps stay
         //          stale-or-current. This is an O(active-caps) walk; the kill path
@@ -797,7 +797,7 @@ fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
 /// cap to that endpoint in the calling task's cap table, and returns the slot.
 ///
 /// Used by services to reacquire a fresh SEND cap after `EndpointDead` (§14.2)
-/// and by property-test probes that need to transfer caps (P3 — arg2=1).
+/// and by property-test probes that need to transfer caps (P3 - arg2=1).
 fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> i64 {
     let len = name_len as usize;
     if len == 0 || len > 64 { return -1; }
@@ -829,7 +829,7 @@ fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> 
     }
 }
 
-/// Syscall: DeriveCap (29) — duplicate a capability the caller holds **with GRANT**
+/// Syscall: DeriveCap (29) - duplicate a capability the caller holds **with GRANT**
 /// into a fresh slot. arg0 = held cap slot. Returns the new slot, or a negative
 /// cap-error code.
 ///
@@ -837,7 +837,7 @@ fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> 
 /// many `lookup`s from one held endpoint cap: it derives a copy per client and grants
 /// that copy away (via `SendWithCap`) while retaining the original. Sound and
 /// non-escalating (§7.3): the copy carries the *same* resource, generation, and
-/// rights — never wider — and the GRANT gate means the caller could already transfer
+/// rights - never wider - and the GRANT gate means the caller could already transfer
 /// the whole cap wholesale, so duplicating it grants no authority it lacked. Endpoint
 /// caps already permit many concurrent senders, so duplication matches the IPC model.
 /// The generation check inside `lookup_cap` also forbids deriving from a stale cap.
@@ -853,7 +853,7 @@ fn handle_derive_cap(held_slot: u64, _a1: u64, _a2: u64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Syscall: SendWithCap (11) — send a message with an embedded capability.
+// Syscall: SendWithCap (11) - send a message with an embedded capability.
 // ---------------------------------------------------------------------------
 
 /// arg0 = (grant_slot << 16) | endpoint_slot
@@ -862,7 +862,7 @@ fn handle_derive_cap(held_slot: u64, _a1: u64, _a2: u64) -> i64 {
 ///
 /// Validates SEND on the endpoint cap and GRANT on the cap to transfer.
 /// Embeds the cap in the message, enqueues, then removes the cap from the
-/// sender's table (§7.6 — cap moved exactly once).
+/// sender's table (§7.6 - cap moved exactly once).
 ///
 /// Returns `CapNotGrantable` (-4) if the grant cap lacks the GRANT right, so
 /// the sender knows the cap was NOT transferred (it remains in their table).
@@ -916,12 +916,12 @@ fn handle_send_with_cap(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
             scheduler::current_task_remove_cap(grant_slot);
             scheduler::block_and_reschedule(TaskState::BlockedOnSend)
         }
-        Err(e) => ipc_err_to_i64(e), // failure before delivery — cap stays
+        Err(e) => ipc_err_to_i64(e), // failure before delivery - cap stays
     }
 }
 
 // ---------------------------------------------------------------------------
-// Syscall: ResourceMint (30) — allocate a delegated resource + mint a cap (§7.10, P2).
+// Syscall: ResourceMint (30) - allocate a delegated resource + mint a cap (§7.10, P2).
 // ---------------------------------------------------------------------------
 
 /// arg0 = rights bitfield for the minted cap, arg1 = user ptr to receive the u64 ResourceId,
@@ -952,7 +952,7 @@ fn handle_resource_mint(rights_bits: u64, out_id_ptr: u64, _a2: u64) -> i64 {
     let cap = mint_cap(id, rights);
     let slot = match scheduler::current_task_insert_cap(cap) {
         Ok(s)  => s,
-        Err(_) => { delegated::release(id); return -1; } // cap table full — don't leak the id
+        Err(_) => { delegated::release(id); return -1; } // cap table full - don't leak the id
     };
     if !write_user_bytes(out_id_ptr, &id.0.to_le_bytes()) {
         return -1;
@@ -961,16 +961,16 @@ fn handle_resource_mint(rights_bits: u64, out_id_ptr: u64, _a2: u64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Syscall: ResourceInvoke (31) — use a delegated (file) cap (§7.10, P2).
+// Syscall: ResourceInvoke (31) - use a delegated (file) cap (§7.10, P2).
 // ---------------------------------------------------------------------------
 
 /// arg0 = (right_bits << 32) | (reply_grant_slot << 16) | file_cap_slot
 /// arg1 = msg_ptr (user VA), arg2 = msg_len.
 ///
 /// The "use = send" of a delegated resource cap. Validates the file cap carries `right_bits`
-/// (a READ-only cap invoking with WRITE fails `CapInsufficientRights` — non-escalation, §7.3),
+/// (a READ-only cap invoking with WRITE fails `CapInsufficientRights` - non-escalation, §7.3),
 /// then routes the message to the owning service's endpoint with the badge carried in the
-/// **kernel-set `Message` fields** `badge_id`/`badge_right` (unforgeable — an ordinary `send`
+/// **kernel-set `Message` fields** `badge_id`/`badge_right` (unforgeable - an ordinary `send`
 /// leaves them 0), and an embedded reply cap exactly as `SendWithCap`. The owner reads the badge
 /// (via `LastRecvBadge`) to know which resource + which right the kernel validated; it never
 /// trusts the client, and the kernel never learns the operation.
@@ -1004,7 +1004,7 @@ fn handle_resource_invoke(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 
     // 3. Build the message: the client's payload UNCHANGED, with the badge carried in
     //    kernel-set Message fields (NOT prepended to the payload). The badge is unforgeable:
-    //    only this handler — after validating the cap above — sets it; an ordinary `send`
+    //    only this handler - after validating the cap above - sets it; an ordinary `send`
     //    leaves it 0, so the owner can trust a badged message is a real cap invocation and not
     //    a payload a client crafted over a plain send (§7.10).
     let mut msg = match build_message(msg_ptr, msg_len) {
@@ -1040,7 +1040,7 @@ fn handle_resource_invoke(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Syscall: ResourceRevoke (32) — revoke a delegated resource you own (§7.10, P2).
+// Syscall: ResourceRevoke (32) - revoke a delegated resource you own (§7.10, P2).
 // ---------------------------------------------------------------------------
 
 /// arg0 = `ResourceId` (u64). Owner-gated: succeeds only if the calling task's endpoint owns
@@ -1056,7 +1056,7 @@ fn handle_resource_revoke(id_lo: u64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Syscall: TakePendingCap (12) — retrieve the next received cap slot.
+// Syscall: TakePendingCap (12) - retrieve the next received cap slot.
 // ---------------------------------------------------------------------------
 
 /// No arguments.
@@ -1072,17 +1072,17 @@ fn handle_take_pending_cap() -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Syscall: AllocMem (6) — dynamic page allocation within the task's budget.
+// Syscall: AllocMem (6) - dynamic page allocation within the task's budget.
 // ---------------------------------------------------------------------------
 
 /// arg0 = size in bytes to allocate (must be > 0).
 ///
-/// No capability required — the task's budget is implicitly granted at spawn
+/// No capability required - the task's budget is implicitly granted at spawn
 /// from the memory limit in its contract (§10.2, implicit authority).
 ///
 /// Returns the virtual address of the newly-mapped region on success, or a
 /// negative error code:
-///   -11  AllocDenied — request would exceed the task's memory limit.
+///   -11  AllocDenied - request would exceed the task's memory limit.
 ///   -1   other failure (physical memory exhausted; partial allocation left mapped).
 fn handle_alloc_mem(size: u64) -> i64 {
     if size == 0 { return -1; }
@@ -1118,7 +1118,7 @@ fn handle_alloc_mem(size: u64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Syscall: Abort (9) — TCB service reports a fatal failure; causes kernel panic.
+// Syscall: Abort (9) - TCB service reports a fatal failure; causes kernel panic.
 // ---------------------------------------------------------------------------
 
 /// arg0 = msg_ptr (user VA), arg1 = msg_len.
@@ -1137,11 +1137,11 @@ fn handle_abort(msg_ptr: u64, msg_len: u64) -> i64 {
         }
     }
     crate::kprintln!("KERNEL PANIC");
-    panic!("reason: (init abort — no message)");
+    panic!("reason: (init abort - no message)");
 }
 
 // ---------------------------------------------------------------------------
-// Syscall: InspectKernel (13) — structured kernel state queries.
+// Syscall: InspectKernel (13) - structured kernel state queries.
 // ---------------------------------------------------------------------------
 
 /// arg0 = query_id, arg1/arg2 = query-specific args.
@@ -1152,7 +1152,7 @@ fn handle_abort(msg_ptr: u64, msg_len: u64) -> i64 {
 ///   i64, or -1 if the name is not registered.
 fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     // Self-state (0 = own alloc bytes), the clock (3 = TSC), and console geometry
-    // (9 = fbcon rows/cols — task-neutral hardware info) are ungated, as are the
+    // (9 = fbcon rows/cols - task-neutral hardware info) are ungated, as are the
     // boot/RTC reads (10, 11). Every other query discloses another task's or
     // system-wide state and requires the INTROSPECT capability with READ (§3.1;
     // docs/introspection-capability.md).
@@ -1170,11 +1170,11 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // service needs this to lay out its terminal (pin the input line to the
         // bottom row). 0 if the framebuffer never initialised.
         9 => crate::arch::x86_64::fb::dims_packed() as i64,
-        // Input-ready flag — set by the xHCI driver when it finishes setup (the
+        // Input-ready flag - set by the xHCI driver when it finishes setup (the
         // last boot step). The shell watches it to auto-clear the boot screen.
         10 => crate::arch::x86_64::input_ready() as i64,
         // Wall-clock date/time from the hardware RTC, packed (see rtc.rs). Ungated
-        // — the time of day is task-neutral hardware info, like the TSC (query 3).
+        // - the time of day is task-neutral hardware info, like the TSC (query 3).
         11 => crate::arch::x86_64::rtc::read_datetime() as i64,
         // Wall-clock datetime captured at boot (same packed layout as query 11). Pairs with
         // query 11 for `uptime` = now − boot, a portable wall-clock delta (a tick counter's rate
@@ -1203,7 +1203,7 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
             };
             // Use the persistent capability table (append-only GLOBAL_RESOURCES)
             // rather than the routing table, which recycles dead slots under
-            // concurrent respawns — reading routing::get_generation after a kill
+            // concurrent respawns - reading routing::get_generation after a kill
             // can race with another service's register() overwriting that slot.
             let rid = crate::capability::cap::ResourceId::from(ep_id);
             let gen = crate::capability::get_resource_generation(rid)
@@ -1215,7 +1215,7 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Syscall: QueryCapRights (14) — read the rights bitfield of a cap slot.
+// Syscall: QueryCapRights (14) - read the rights bitfield of a cap slot.
 // ---------------------------------------------------------------------------
 
 /// arg0 = cap_slot.
@@ -1230,25 +1230,25 @@ fn handle_query_cap_rights(slot: u64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Syscall: RemoveCap (15) — remove a cap slot from the calling task's table.
+// Syscall: RemoveCap (15) - remove a cap slot from the calling task's table.
 // ---------------------------------------------------------------------------
 
 /// arg0 = cap_slot.
 ///
 /// Clears the cap at `slot`. Always returns 0; out-of-range slots are silently
-/// ignored (idempotent — the slot is already empty).
+/// ignored (idempotent - the slot is already empty).
 fn handle_remove_cap(slot: u64) -> i64 {
     scheduler::current_task_remove_cap(slot as usize);
     0
 }
 
 // ---------------------------------------------------------------------------
-// Syscall: TaskStat (16) — read task state for a given slot index.
+// Syscall: TaskStat (16) - read task state for a given slot index.
 // ---------------------------------------------------------------------------
 
 /// arg0 = slot (u32), arg1 = buf_ptr (user VA), arg2 = buf_len (must be ≥ 72).
 ///
-/// Requires the INTROSPECT capability (READ) — discloses any task's state (§3.1).
+/// Requires the INTROSPECT capability (READ) - discloses any task's state (§3.1).
 ///
 /// Buffer layout (72 bytes):
 ///   [0]       valid:       u8  (1 = live, 0 = dead/unused)
@@ -1267,7 +1267,7 @@ fn handle_remove_cap(slot: u64) -> i64 {
 /// Returns 0 on success, -1 on invalid args.
 fn handle_task_stat(slot: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     const STAT_SIZE: usize = 72;
-    // TaskStat discloses any task's full snapshot — requires INTROSPECT (READ)
+    // TaskStat discloses any task's full snapshot - requires INTROSPECT (READ)
     // (§3.1; docs/introspection-capability.md).
     if !scheduler::current_task_holds_resource(
         crate::capability::INTROSPECT_RESOURCE, Rights::READ)
@@ -1301,7 +1301,7 @@ fn handle_task_stat(slot: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Syscall: ConsoleRead (17) — block until one byte is available on COM1 RX.
+// Syscall: ConsoleRead (17) - block until one byte is available on COM1 RX.
 // ---------------------------------------------------------------------------
 
 fn handle_console_read(cap_slot: u64) -> i64 {
@@ -1340,7 +1340,7 @@ fn handle_console_read(cap_slot: u64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Syscall: TryConsoleRead (24) — non-blocking console read.
+// Syscall: TryConsoleRead (24) - non-blocking console read.
 // ---------------------------------------------------------------------------
 
 /// Pop one byte from the console ring without blocking. A foreground full-screen
@@ -1368,7 +1368,7 @@ fn handle_try_console_read(cap_slot: u64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Syscall: ConsoleEcho (25) — enable/disable keystroke echo.
+// Syscall: ConsoleEcho (25) - enable/disable keystroke echo.
 // ---------------------------------------------------------------------------
 
 /// Turn console keystroke echo on (`arg1 != 0`) or off (`arg1 == 0`). A
@@ -1390,7 +1390,7 @@ fn handle_console_echo(cap_slot: u64, on: u64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Syscall: ConsoleBootComplete (26) — end boot-log mirroring + clear the screen.
+// Syscall: ConsoleBootComplete (26) - end boot-log mirroring + clear the screen.
 // ---------------------------------------------------------------------------
 
 /// End boot-log mirroring to the framebuffer and clear the TV, handing over a
@@ -1412,7 +1412,7 @@ fn handle_console_boot_complete(cap_slot: u64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Syscall: SignalInputReady (27) — input driver reports setup complete.
+// Syscall: SignalInputReady (27) - input driver reports setup complete.
 // ---------------------------------------------------------------------------
 
 /// The USB keyboard driver (xHCI) calls this once it finishes setup, in every
@@ -1435,14 +1435,14 @@ fn handle_signal_input_ready(cap_slot: u64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Syscall: TaskCaps (28) — list the capabilities held by a task.
+// Syscall: TaskCaps (28) - list the capabilities held by a task.
 // ---------------------------------------------------------------------------
 
 /// arg0 = slot, arg1 = buf_ptr (user VA), arg2 = buf_len (bytes).
 ///
 /// Writes up to `buf_len / 16` entries describing the target task's held caps,
 /// returns the count. Each 16-byte entry: [0..8] resource_id u64 LE, [8] rights
-/// u8, [9..16] pad. Requires INTROSPECT (READ) — discloses a task's authority
+/// u8, [9..16] pad. Requires INTROSPECT (READ) - discloses a task's authority
 /// (the in-OS form of `osdev caps`, §17; makes authority visible per §26.9).
 ///
 /// Best-effort snapshot (see `scheduler::for_each_cap_of`). Returns -1 on bad args.
@@ -1477,7 +1477,7 @@ fn handle_task_caps(slot: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Syscall: ConsolePush (20) — inject a byte into the console input ring.
+// Syscall: ConsolePush (20) - inject a byte into the console input ring.
 // Gated by CONSOLE_PUSH_RESOURCE (held only by the USB keyboard driver, §12)
 // so an arbitrary service cannot forge keystrokes into the shell.
 // ---------------------------------------------------------------------------
@@ -1497,12 +1497,12 @@ fn handle_console_push(cap_slot: u64, byte: u64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Syscall: Reboot (18) — hardware reset via keyboard controller CPU reset line.
+// Syscall: Reboot (18) - hardware reset via keyboard controller CPU reset line.
 // ---------------------------------------------------------------------------
 
 /// No arguments. Does not return.
 ///
-/// Phase 5: no capability check — intended for dev-mode use by the shell
+/// Phase 5: no capability check - intended for dev-mode use by the shell
 /// service (same rationale as Kill/8). Logs to serial before resetting so
 /// the operator sees confirmation in PuTTY before the line goes silent.
 fn handle_reboot() -> i64 {

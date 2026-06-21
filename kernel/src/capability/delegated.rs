@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Delegated resource capabilities — §7.10, P2 (file-as-capability).
+//! Delegated resource capabilities - §7.10, P2 (file-as-capability).
 //!
 //! A *delegated resource* is a kernel-managed capability target whose **meaning is
 //! defined by a service**, not the kernel (§4.4 amendment 2026-06-18). The kernel
@@ -23,7 +23,7 @@
 //!
 //! **ABA-safe reuse (§7.4 decision 1).** A freed delegated id is reusable. If it
 //! re-registered at generation 0, a *stale* cap from the id's previous life (also gen 0)
-//! would spuriously re-validate — a capability-reuse hole. `allocate` therefore
+//! would spuriously re-validate - a capability-reuse hole. `allocate` therefore
 //! re-registers a reused id at `prev_gen.bump()` (`register_resource_at_gen`), keeping the
 //! generation strictly monotonic across lives, so a stale cap can never match a future life.
 
@@ -46,7 +46,7 @@ pub const DELEGATED_BASE: u64 = 4096;
 pub const DELEGATED_CAP: usize = 2048; // band = [4096, 6144)
 
 /// The owner-endpoint table for the band. `owner[i] == None` means slot `i` is free.
-/// Pure state — no global side effects — so it is unit-testable in isolation.
+/// Pure state - no global side effects - so it is unit-testable in isolation.
 struct Band {
     owner: [Option<OwnerId>; DELEGATED_CAP],
     next: usize, // bump cursor; wraps and scans for the next free slot
@@ -100,7 +100,7 @@ impl Band {
 
 static BAND: SpinLock<Band> = SpinLock::new(Band::new());
 
-/// True if `id` falls in the delegated band (an O(1) range check — the discriminator
+/// True if `id` falls in the delegated band (an O(1) range check - the discriminator
 /// `handle_resource_invoke`/`_revoke` use; `handle_send` never consults it).
 pub const fn is_delegated(id: ResourceId) -> bool {
     id.0 >= DELEGATED_BASE && id.0 < DELEGATED_BASE + DELEGATED_CAP as u64
@@ -121,8 +121,8 @@ pub fn allocate(owner: OwnerId) -> Option<ResourceId> {
     let slot = BAND.lock().claim(owner)?;
     let id = id_of(slot);
     match get_resource_generation(id) {
-        Some(g) => register_resource_at_gen(id, g.bump()), // reused id — strictly higher gen
-        None => register_resource(id),                     // first life — gen 0
+        Some(g) => register_resource_at_gen(id, g.bump()), // reused id - strictly higher gen
+        None => register_resource(id),                     // first life - gen 0
     }
     Some(id)
 }
@@ -163,12 +163,12 @@ pub fn revoke_owned(id: ResourceId, caller: OwnerId) -> bool {
     true
 }
 
-/// Reclaim **every** delegated resource owned by `owner` — called from the endpoint-death
-/// path when a service dies (e.g. an `fs` restart, which is supported — Phase D). Without
+/// Reclaim **every** delegated resource owned by `owner` - called from the endpoint-death
+/// path when a service dies (e.g. an `fs` restart, which is supported - Phase D). Without
 /// this, a restartable owner's resources would orphan in the band (the new instance gets a
 /// fresh endpoint id and never frees the old ones), leaking band capacity on every restart.
 /// Each freed resource is marked **Dead** (gen bump) so any outstanding cap to it fails its
-/// next use with `EndpointDead` (§7.5) — the same signal a client sees for any dead endpoint.
+/// next use with `EndpointDead` (§7.5) - the same signal a client sees for any dead endpoint.
 /// Returns the number reclaimed. Frees one slot per lock acquisition so the band lock is never
 /// held across the global-table lock (`mark_dead_resource`).
 pub fn release_owner(owner: OwnerId) -> u32 {
@@ -194,7 +194,7 @@ mod tests {
         n
     }
 
-    // The pure band logic is tested on a LOCAL Band (Boxed — 32 KiB), so no global
+    // The pure band logic is tested on a LOCAL Band (Boxed - 32 KiB), so no global
     // resource-table state is touched (mirrors the table.rs test convention).
 
     #[test]
@@ -233,7 +233,7 @@ mod tests {
     #[test]
     fn take_one_owned_reclaims_only_that_owner() {
         let mut b = Box::new(Band::new());
-        // Owner A claims two slots, owner B one — interleaved.
+        // Owner A claims two slots, owner B one - interleaved.
         let a1 = b.claim(ep(1)).unwrap();
         let _b1 = b.claim(ep(2)).unwrap();
         let a2 = b.claim(ep(1)).unwrap();

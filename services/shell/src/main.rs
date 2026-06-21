@@ -1,4 +1,4 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
@@ -61,7 +61,7 @@ const PATH_MAX: usize = 120; // fits in MAX_LINE; path_len is u8
 // output overflows). The captured bytes are then sent to the sink (a service endpoint or the
 // `write` built-in). Only produced *text* flows through `Out`; errors always go to the console.
 // End-of-stream marker a producer service sends to a built-in sink (the shell draining a
-// `service | write` pipe). A non-empty sentinel — the IPC path doesn't deliver an empty body.
+// `service | write` pipe). A non-empty sentinel - the IPC path doesn't deliver an empty body.
 const PIPE_EOT: u8 = 0x04; // ASCII EOT
 // One pipe stage's buffer. 64 KiB so a producer (`tree /`, `find …`) can capture a large
 // listing without being clipped at the buffer. NOTE this is no longer the *binding* limit:
@@ -101,7 +101,7 @@ enum Out<'a> {
     Capture(&'a mut Cap),
     /// A utility writing its OWN output to a file (`selfcheck save <path>`, `run … save <path>`).
     /// Accumulates into a bounded report buffer that is written to the file in one streamed pass
-    /// when the run finishes — direct, NOT through the pipe, so an orchestrator (which runs its own
+    /// when the run finishes - direct, NOT through the pipe, so an orchestrator (which runs its own
     /// sub-pipelines) can save its output without the nested-capture stack overflow that piping it
     /// causes. No heap; the bound is loud (§26.6).
     File(&'a mut ReportBuf),
@@ -139,10 +139,10 @@ impl Out<'_> {
 }
 
 /// A bounded accumulator for a utility's saved report (`selfcheck save <path>`). Fixed stack array,
-/// no heap; a report exceeding `REPORT_MAX` sets `overflow` (loud, never a silent truncation —
+/// no heap; a report exceeding `REPORT_MAX` sets `overflow` (loud, never a silent truncation -
 /// §26.6/§3.12). The size is a deliberate balance: big enough for the self-check transcript
 /// (~12 KiB), but small enough that it + a sub-pipeline's transient buffers (a `| assert` is ~128
-/// KiB) fit the 256 KiB user stack. That ceiling is the BINDING constraint — 32 KiB overflowed the
+/// KiB) fit the 256 KiB user stack. That ceiling is the BINDING constraint - 32 KiB overflowed the
 /// stack on a `run … save` whose suite has `| assert` lines, 16 KiB fits (QEMU/HW-proven; frames are
 /// identical on both). It is the whole reason this is a direct file write, not a (nesting) pipe
 /// capture. A truly large report would want a streaming sink (append per chunk); not needed yet.
@@ -169,16 +169,16 @@ impl core::fmt::Write for ReportBuf {
 
 // Entry point called by the kernel after spawning this service.
 // ctx.console_writeln() appends a newline. The kernel echoes each console keystroke to the
-// display (arch::console_push_byte), so we don't echo here — just accumulate
+// display (arch::console_push_byte), so we don't echo here - just accumulate
 // bytes until \r or \n. (On a serial terminal, turn local echo OFF to avoid
 // doubled characters.)
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // The boot sequence (kernel + every service's logs, the xHCI enumeration) is
-    // shown on the TV during startup — the user wants to see it come up. We log our
+    // shown on the TV during startup - the user wants to see it come up. We log our
     // "ready" line into that stream, then wait for the input driver to report in
     // (the deterministic end-of-boot signal) before automatically clearing the TV
-    // and presenting a clean prompt — no keypress, no timer.
+    // and presenting a clean prompt - no keypress, no timer.
     for _ in 0..256 {
         ctx.yield_cpu();
     }
@@ -195,11 +195,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // The shell owns echo from here on. The kernel's auto-echo (console_push_byte)
     // can only echo single bytes blindly, so it prints the `[` and `A` of an arrow
-    // key's `ESC [ A` sequence before the shell consumes them — smearing "[A" onto
+    // key's `ESC [ A` sequence before the shell consumes them - smearing "[A" onto
     // the line. We turn kernel echo OFF and echo printable bytes ourselves below, so
     // escape sequences are swallowed silently and line editing stays under our control.
     ctx.console_echo(false);
-    // A one-time grounding hint above the first prompt after boot — so a fresh user knows
+    // A one-time grounding hint above the first prompt after boot - so a fresh user knows
     // where to start. Only here, not on every prompt (that would be noise). Sent as ONE
     // console write so a concurrent driver boot-log can't land between the hint and the
     // prompt (it stays one atomic unit on the serial console too).
@@ -213,7 +213,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut hist = History::new();
     let mut nav = 0usize;
     // The previous command's result (the Ok/Err model), reported by `result`. Threaded as
-    // local session state — no global (services hold no global mutable state, §3.9).
+    // local session state - no global (services hold no global mutable state, §3.9).
     let mut last_result: Result<(), ShellError> = Ok(());
 
     loop {
@@ -254,13 +254,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
             0x7f | 0x08 => line.backspace(&ctx),
             0x09 => {
-                // Tab — complete the command name (first token) or a FILE PATH (a later token,
+                // Tab - complete the command name (first token) or a FILE PATH (a later token,
                 // resolved against `cwd`). One match → fill it in; several → a numbered menu (digit
                 // selects, Tab cycles). Event-driven (redraws only on this keypress).
                 complete_tab(&ctx, &mut line, &cwd);
             }
             0x03 => {
-                // Ctrl-C — clear line
+                // Ctrl-C - clear line
                 ctx.console_writeln("^C");
                 line.len = 0;
                 line.cur = 0;
@@ -301,8 +301,8 @@ fn run_help_key(
 // kernel monotonic tick (query 12), because the tick was found NOT to advance reliably on
 // real hardware (it silently broke typematic auto-repeat on the T630). read_tsc is
 // hardware-proven (§22 perf). A real escape sequence's bytes are already queued (the
-// keyboard pushes them atomically), so this wait only bounds how long a bare Escape — which
-// has nothing following — takes to resolve to "clear the line".
+// keyboard pushes them atomically), so this wait only bounds how long a bare Escape - which
+// has nothing following - takes to resolve to "clear the line".
 const ESC_WAIT_CYCLES: u64 = 200_000_000;
 fn read_escape_byte(ctx: &ServiceContext) -> Option<u8> {
     if let Some(b) = ctx.try_console_read() { return Some(b); }
@@ -318,7 +318,7 @@ fn read_escape_byte(ctx: &ServiceContext) -> Option<u8> {
 /// parameter and the final byte, then dispatches the key. Covers the arrows (history +
 /// cursor), Home/End, and the `~`-terminated navigation keys (Insert/Delete/Home/End/
 /// PageUp/PageDown) and function keys an extended keyboard sends. Unknown sequences are
-/// consumed and ignored — never smeared onto the line. Bounded: a final byte must arrive
+/// consumed and ignored - never smeared onto the line. Bounded: a final byte must arrive
 /// within `CSI_MAX` bytes or we stop (defensive against a malformed serial stream).
 fn handle_csi(ctx: &ServiceContext, line: &mut Line, hist: &History, nav: &mut usize) {
     const CSI_MAX: usize = 8;
@@ -339,17 +339,17 @@ fn handle_csi(ctx: &ServiceContext, line: &mut Line, hist: &History, nav: &mut u
         }
     }
     match final_byte {
-        b'A' => { // Up — older command
+        b'A' => { // Up - older command
             if *nav > 0 { *nav -= 1; line.set(ctx, hist.get(*nav)); }
         }
-        b'B' => { // Down — newer command (past the end → blank live line)
+        b'B' => { // Down - newer command (past the end → blank live line)
             if *nav < hist.len() {
                 *nav += 1;
                 let l: &[u8] = if *nav == hist.len() { &[] } else { hist.get(*nav) };
                 line.set(ctx, l);
             }
         }
-        b'C' => line.right(ctx), // Right — move cursor within the line
+        b'C' => line.right(ctx), // Right - move cursor within the line
         b'D' => line.left(ctx),  // Left
         b'H' => line.home(ctx),  // Home (ESC[H)
         b'F' => line.end(ctx),   // End  (ESC[F)
@@ -360,7 +360,7 @@ fn handle_csi(ctx: &ServiceContext, line: &mut Line, hist: &History, nav: &mut u
             // 2 = Insert, 5 = PageUp, 6 = PageDown, 11.. = F-keys: no shell action, ignored.
             _ => { let _ = have_param; }
         },
-        _ => {} // unknown final byte — already consumed, do nothing
+        _ => {} // unknown final byte - already consumed, do nothing
     }
 }
 
@@ -389,7 +389,7 @@ fn complete_tab(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd) {
 }
 
 /// Commands whose FIRST argument (the token right after the command, within its pipe segment) is a
-/// fixed keyword — completed only at that position. Pipe-stage verbs (`to`/`from`/`sort`/`match`) are
+/// fixed keyword - completed only at that position. Pipe-stage verbs (`to`/`from`/`sort`/`match`) are
 /// here too, so `… | to j⇥` → `json` and `… | sort r⇥` → `reverse`. Keep in sync with each command's
 /// argument parsing (verified against utilities/*.md + the `cmd_*` parsers).
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
@@ -404,7 +404,7 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("from",    &["json"]),
 ];
 
-/// Commands with a TRAILING modifier keyword that follows the variable argument(s) — completed at any
+/// Commands with a TRAILING modifier keyword that follows the variable argument(s) - completed at any
 /// position after the first arg, when it prefix-matches and is not already present (`mkdir /x p⇥` →
 /// `parents`, `copy /a /b r⇥` → `recursive`). Never offered as the first argument (that token is the
 /// path being named/operated on, not the modifier).
@@ -519,7 +519,7 @@ struct PathHit { off: usize, len: usize, is_dir: bool }
 /// resolved dir and match entries whose name starts with the leaf. One match → fill it (+ `/` for a
 /// dir, ` ` for a file); several → fill the common prefix, print a numbered menu, then **digit**
 /// selects or **Tab** cycles to the next candidate (any other key keeps the line). No new authority
-/// — the shell already holds the `fs` LIST_DIR cap (the same `ls` uses).
+/// - the shell already holds the `fs` LIST_DIR cap (the same `ls` uses).
 fn complete_path(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd, tok_start: usize) {
     let bytes = line.bytes();
     let token = &bytes[tok_start..];
@@ -576,7 +576,7 @@ fn complete_path(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd, tok_start: us
     let lcp = path_lcp(&rbuf, &hits[..n]);
     if lcp > leaf.len() {
         let h = hits[0];
-        fill_path(ctx, line, base_len, &rbuf[h.off..h.off + lcp], None); // no sep — still ambiguous
+        fill_path(ctx, line, base_len, &rbuf[h.off..h.off + lcp], None); // no sep - still ambiguous
     }
     path_menu(ctx, line, base_len, &rbuf, &hits[..n]);
 }
@@ -593,7 +593,7 @@ fn path_lcp(rbuf: &[u8; 512], hits: &[PathHit]) -> usize {
 }
 
 /// Replace the line from `base_len` to end with `name`. `sep` Some(is_dir) appends `/` (dir) or ` `
-/// (file) — a committed completion; None appends nothing — a still-ambiguous common-prefix fill.
+/// (file) - a committed completion; None appends nothing - a still-ambiguous common-prefix fill.
 fn fill_path(ctx: &ServiceContext, line: &mut Line, base_len: usize, name: &[u8], sep: Option<bool>) {
     let mut tmp = [0u8; MAX_LINE];
     let mut t = base_len.min(MAX_LINE);
@@ -608,7 +608,7 @@ fn fill_path(ctx: &ServiceContext, line: &mut Line, base_len: usize, name: &[u8]
 
 /// Print the numbered candidate menu, then run the selection loop: a **digit** (1–9) commits that
 /// entry; **Tab** cycles to the next candidate (filling it, no separator); any other key keeps the
-/// current line and returns (that key is not consumed as input — minor: re-press to use it).
+/// current line and returns (that key is not consumed as input - minor: re-press to use it).
 fn path_menu(ctx: &ServiceContext, line: &mut Line, base_len: usize, rbuf: &[u8; 512], hits: &[PathHit]) {
     let n = hits.len();
     let shown = n.min(9);
@@ -681,7 +681,7 @@ impl History {
 /// extended keyboard (Left/Right/Home/End/Delete) edits *mid-line*, not just at the
 /// end. `cur` is the insertion point in `0..=len`. Every edit echoes itself using only
 /// `\x08` (non-destructive cursor-left on both the framebuffer console and a serial
-/// terminal), character reprints (cursor-right), and `ESC[K` (erase to end of line) —
+/// terminal), character reprints (cursor-right), and `ESC[K` (erase to end of line) -
 /// the lowest common denominator both honour, so editing looks identical over HDMI and
 /// over the serial console. Bounded (§26.6): `MAX_LINE`, loud-safe (over-long input is
 /// simply not accepted).
@@ -728,7 +728,7 @@ impl Line {
         self.redraw_tail(ctx);
     }
 
-    /// Delete the character at the cursor (the Delete key — forward delete).
+    /// Delete the character at the cursor (the Delete key - forward delete).
     fn delete(&mut self, ctx: &ServiceContext) {
         if self.cur >= self.len { return; }
         for i in (self.cur + 1)..self.len { self.buf[i - 1] = self.buf[i]; }
@@ -773,11 +773,11 @@ impl Line {
     fn clear(&mut self, ctx: &ServiceContext) { self.set(ctx, &[]); }
 }
 
-/// Wait until the input subsystem reports in — the deterministic end-of-boot
+/// Wait until the input subsystem reports in - the deterministic end-of-boot
 /// signal. The xHCI driver sets `input_ready` once it finishes, in every terminal
 /// path (keyboard up, no keyboard, or no controller), and it is the last
-/// subsystem to come up. So when it reports, the boot sequence — including the
-/// asynchronous xHCI enumeration on another core — is genuinely done, and we can
+/// subsystem to come up. So when it reports, the boot sequence - including the
+/// asynchronous xHCI enumeration on another core - is genuinely done, and we can
 /// clear the boot screen without ever cutting it off mid-stream. The loop is just
 /// polling that flag; `MAX_SPINS` is a pure safety net for the impossible case
 /// where the driver never reports (it would mean xHCI hard-crashed at boot).
@@ -792,7 +792,7 @@ fn wait_for_input_ready(ctx: &ServiceContext) {
 }
 
 /// Split `s` into args with **minimal quoting**: a token wrapped in a matching pair of `'…'`
-/// or `"…"` is one argument with the surrounding pair stripped — **no escapes, no nesting, no
+/// or `"…"` is one argument with the surrounding pair stripped - **no escapes, no nesting, no
 /// expansion** (single and double behave identically). This is what lets `match "two words"`
 /// pass a multi-word pattern; unquoted tokens split on whitespace exactly as before. Returns
 /// the arg count; each arg is a slice of `s` (no allocation).
@@ -832,7 +832,7 @@ fn strip_quotes(s: &str) -> &str {
 }
 
 /// A command's typed failure (the `Err` of a command `Result`). Modelled on Rust's `Result`: the
-/// common path is just "is it `Ok`?" — callers never need to know these names. The variants exist
+/// common path is just "is it `Ok`?" - callers never need to know these names. The variants exist
 /// for when you *do* want to pin a specific failure (negative tests, a future `assert`). Unit
 /// variants (no payload): the human-readable detail stays in the command's own printed message;
 /// this enum is the category. `Unknown` is the catch-all for a failure not yet given its own
@@ -866,11 +866,11 @@ impl ShellError {
 /// `Err(ShellError)` on failure. `prev` is the previous line's result, so the `result` command
 /// can report it. `depth` is the script-nesting level (0 = interactive); `run` is refused at
 /// depth > 0 so a script can't run another script (keeps the user stack bounded). Commands are
-/// being converted to return `Result` incrementally — those not yet converted run via the legacy
+/// being converted to return `Result` incrementally - those not yet converted run via the legacy
 /// dispatch and are treated as `Ok`.
 ///
 /// `#[inline(never)]`: `cmd_run` calls `execute` per script line, so `execute` must NOT be
-/// inlined into `cmd_run` — that would fold `execute`'s whole frame (including the `pipe_run`
+/// inlined into `cmd_run` - that would fold `execute`'s whole frame (including the `pipe_run`
 /// path's 64 KiB `Stream`) into `cmd_run`'s, blowing the bounded user stack on the nested
 /// `run → cmd_run → execute` path (the same inlining-inflates-frame trap as the record builders).
 #[inline(never)]
@@ -880,15 +880,15 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         return Err(ShellError::Unknown);
     };
     let s = s.trim();
-    if s.is_empty() { return prev; } // a blank line is not a command — last result unchanged
+    if s.is_empty() { return prev; } // a blank line is not a command - last result unchanged
 
     // Capability-mediated pipe: `producer | sink`. The shell brokers the channel
     // (Appendix D.3): spawn the consumer, then spawn the producer with a SEND cap
-    // to the consumer's endpoint delegated to it — the producer has no ambient
+    // to the consumer's endpoint delegated to it - the producer has no ambient
     // authority of its own.
     if s.contains('|') {
         // One unified pipeline: threads bytes or records, with from/to bridging the two worlds.
-        // Returns the pipeline's Result — an `… | assert` sink sets it (else Ok / a stage error).
+        // Returns the pipeline's Result - an `… | assert` sink sets it (else Ok / a stage error).
         return pipe_run(ctx, cwd, s);
     }
 
@@ -917,7 +917,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         },
         // `result` reports the PREVIOUS command's result (this one always succeeds at reporting).
         "result" => { cmd_result(ctx, prev); return Ok(()); }
-        // `assert ok/fails <cmd>` — the result form (the content form `… | assert contains X` is
+        // `assert ok/fails <cmd>` - the result form (the content form `… | assert contains X` is
         // a pipe sink, handled in pipe_run). `s` is the trimmed whole line.
         "assert" => return cmd_assert(ctx, cwd, s["assert".len()..].trim(), depth),
         "run" => {
@@ -930,17 +930,17 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
                 Err(ShellError::Unknown)
             } else {
                 // Optional `save <path>` streams the run REPORT to a file (the utility writes its
-                // own file — direct, not a pipe; see cmd_selfcheck / docs/pipes.md).
+                // own file - direct, not a pipe; see cmd_selfcheck / docs/pipes.md).
                 let save = if argc >= 4 && args[2] == "save" { Some(args[3]) } else { None };
                 cmd_run(ctx, cwd, args[1], depth, save)
             };
         }
-        // `selfcheck [save <path>]` — run the embedded suite; `save` streams its report to a file.
+        // `selfcheck [save <path>]` - run the embedded suite; `save` streams its report to a file.
         "selfcheck" => return cmd_selfcheck(ctx, cwd, depth, s["selfcheck".len()..].trim()),
         _ => {}
     }
 
-    // Dispatch — every command returns its `Result` (Ok/Err); an unknown command is `Err`.
+    // Dispatch - every command returns its `Result` (Ok/Err); an unknown command is `Err`.
     // The info commands always succeed (they return `Ok`), but they are on the model uniformly.
     return match args[0] {
         "help"    => cmd_help(ctx, depth),
@@ -958,7 +958,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         // No argument → show the shell's OWN capabilities (authority is explicit; the shell can
         // inspect itself like any other service). `caps <bogus>` → Err(FileNotFound).
         "caps"    => if argc < 2 { cmd_caps(ctx, "shell") } else { cmd_caps(ctx, args[1]) },
-        // service-control — on the Result model: `assert fails spawn supervisor` holds (a
+        // service-control - on the Result model: `assert fails spawn supervisor` holds (a
         // protected core service is `Err(Denied)`); a missing arg is a usage `Err`.
         "spawn"   => {
             if argc < 2 { ctx.console_writeln("usage: spawn <name>"); Err(ShellError::Unknown) }
@@ -984,9 +984,9 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         "reboot"  => cmd_reboot(ctx), // `-> !` coerces to the match arm's Result type
         "chaos"   => cmd_chaos(ctx, cwd, s["chaos".len()..].trim()),
         "drives"  => cmd_drives(ctx, &args, argc),
-        // ── file/storage commands — converted to the Result model ──
+        // ── file/storage commands - converted to the Result model ──
         // ("read" and "result" are on the Result model above, not here.)
-        // file-as-capability (§7.10, P2): end-to-end demo + self-check on an existing file —
+        // file-as-capability (§7.10, P2): end-to-end demo + self-check on an existing file -
         // open → write/read VIA THE CAP → non-escalation (RO cap can't write) → forged-handle →
         // revoke-on-close. Prints per-step results; the harness asserts on them (Test 14).
         "fcap"    => cmd_fcap(ctx, if argc >= 2 { args[1] } else { "" }),
@@ -1020,7 +1020,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
             else { cmd_find(ctx, cwd, args[1], if argc >= 3 { args[2] } else { "/" }, &mut Out::Console) }
         }
         "tree"    => cmd_tree(ctx, cwd, if argc >= 2 { args[1] } else { "" }, &mut Out::Console),
-        // filter built-ins (direct form) — on the Result model (Err(FileNotFound) on a bad path).
+        // filter built-ins (direct form) - on the Result model (Err(FileNotFound) on a bad path).
         "match"   => cmd_match(ctx, cwd, &args, argc),
         "count"   => cmd_count(ctx, cwd, &args, argc),
         "sort"    => cmd_sort(ctx, cwd, &args, argc),
@@ -1038,7 +1038,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
     };
 }
 
-/// `result` — print the previous command's result in Rust's `Result` shape: `Ok` on success,
+/// `result` - print the previous command's result in Rust's `Result` shape: `Ok` on success,
 /// `Err(<Variant>)` on failure (the specific reason was already printed by that command). The
 /// common use is just eyeballing `Ok` vs not; a future `assert`/`run` reads the same value.
 fn cmd_result(ctx: &ServiceContext, prev: Result<(), ShellError>) {
@@ -1060,16 +1060,16 @@ fn trim_bytes(b: &[u8]) -> &[u8] {
     &b[s..e]
 }
 
-/// `run <path>` — execute a script file: each command is run exactly as if typed at the prompt.
+/// `run <path>` - execute a script file: each command is run exactly as if typed at the prompt.
 /// Lines split on `\n`; a non-comment line further splits on `;` (so a `.gsh` can be real
-/// multi-line, or `cmd ; cmd ; cmd` — the latter is how scripts are authored before a host-side
+/// multi-line, or `cmd ; cmd ; cmd` - the latter is how scripts are authored before a host-side
 /// editor exists). `#`-comment lines and blanks are skipped; each command is echoed (`> cmd`) so
 /// the serial transcript self-documents; a summary reports how many ran and how many returned
 /// `Err`. `run` itself is `Ok` iff every command was `Ok`.
 ///
 /// Scripts cannot nest: `run` at `depth > 0` is refused (in `execute`). `#[inline(never)]` keeps
 /// the script buffer off the hot pipe frame, and the `fs` reply is dropped before any command
-/// runs — both bound the user stack (see the pipe stack-overflow lesson).
+/// runs - both bound the user stack (see the pipe stack-overflow lesson).
 #[inline(never)]
 fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8, save: Option<&str>) -> Result<(), ShellError> {
     let mut pbuf = [0u8; PATH_MAX];
@@ -1103,24 +1103,24 @@ fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8, save: Opti
 
 /// Execute a script body (already in memory): split into commands, run each, then print a
 /// per-command PASS/FAIL summary and the `run: ran N, failed M` tally. Shared by `run` (file
-/// source) and `selfcheck` (the embedded suite, run straight from rodata — NOT written to disk,
+/// source) and `selfcheck` (the embedded suite, run straight from rodata - NOT written to disk,
 /// so it is **not** bound by `MAX_FILE_BYTES`/the single-message file transfer, only by the
 /// embedded const). `#[inline(never)]`: holds the verdict array and drives `execute` in a loop
-/// (the user stack is tight — see the pipe stack-overflow lesson).
-/// The report (the `> <cmd>` echoes, the summary, the tally) goes to `out` — `Out::Console` for a
+/// (the user stack is tight - see the pipe stack-overflow lesson).
+/// The report (the `> <cmd>` echoes, the summary, the tally) goes to `out` - `Out::Console` for a
 /// normal run, or `Out::File(&mut ReportBuf)` for `selfcheck/run … save <path>`, where the utility
 /// writes its OWN file. Each sub-command's own output still goes to the console (it is produced
 /// inside `execute`). The `save` path is a DIRECT file write, NOT a pipe: `run`/`selfcheck` stay
 /// non-producers (capturing one through a pipe nests a 64 KiB `Stream` and overflows the stack,
-/// HW-proven — [[project-shell-stack-pipe]]). The `ReportBuf` is a modest bounded buffer, so it +
-/// a sub-pipeline's transient buffers fit the user stack — the whole point of saving directly.
+/// HW-proven - [[project-shell-stack-pipe]]). The `ReportBuf` is a modest bounded buffer, so it +
+/// a sub-pipeline's transient buffers fit the user stack - the whole point of saving directly.
 #[inline(never)]
 fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out) -> Result<(), ShellError> {
     let mut ran = 0u32;
     let mut failed = 0u32;
     let mut last: Result<(), ShellError> = Ok(());
     // Per-command verdicts, for the end-of-run summary. Bounded; commands past the cap still run
-    // and count, they just don't get a summary line (loud, not silent — §26.6).
+    // and count, they just don't get a summary line (loud, not silent - §26.6).
     let mut verdict = [true; RUN_MAX_CMDS];
     let mut vi = 0usize;
     for line in src.split(|&b| b == b'\n') {
@@ -1159,9 +1159,9 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
 }
 
 /// Run `src` and, if `save` is `Some`, stream the report to that file (the utility writes its own
-/// file — direct, not a pipe). Bare → report to the console. Shared by `run`/`selfcheck`. This
+/// file - direct, not a pipe). Bare → report to the console. Shared by `run`/`selfcheck`. This
 /// dispatcher is tiny on purpose: the 32 KiB `ReportBuf` lives ONLY in `run_and_save`, called only
-/// on the save path — so a bare run/selfcheck does NOT carry 32 KiB of unused frame (which would
+/// on the save path - so a bare run/selfcheck does NOT carry 32 KiB of unused frame (which would
 /// tip its already-heavy `| assert` sub-pipelines over the user-stack ceiling).
 fn run_with_optional_save(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, save: Option<&str>)
     -> Result<(), ShellError>
@@ -1193,7 +1193,7 @@ fn run_and_save(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, spat
     }; // `out` (the &mut rb borrow) ends here, so `rb` is readable below
     if rb.overflow {
         ctx.console_writeln_fmt(format_args!(
-            "save: report exceeded {} KiB — saved truncated to {}", REPORT_MAX / 1024, str_of(path)));
+            "save: report exceeded {} KiB - saved truncated to {}", REPORT_MAX / 1024, str_of(path)));
     }
     if !save_report(ctx, path, rb.bytes()) {
         ctx.console_writeln_fmt(format_args!("save: could not write {} (storage, or bad path?)", str_of(path)));
@@ -1228,23 +1228,23 @@ fn save_report(ctx: &ServiceContext, path: &[u8], data: &[u8]) -> bool {
 /// run and count in the totals; only their individual PASS/FAIL line is omitted.
 const RUN_MAX_CMDS: usize = 256;
 
-/// The self-check suite, embedded in the shell binary (so it ships with the boot image — no
+/// The self-check suite, embedded in the shell binary (so it ships with the boot image - no
 /// host-side `dd` of a data disk). Run straight from rodata, so it can be far larger than an
-/// on-disk file (`MAX_FILE_BYTES` — a file is one ≤4 KiB IPC message; rodata is not).
+/// on-disk file (`MAX_FILE_BYTES` - a file is one ≤4 KiB IPC message; rodata is not).
 const SELFCHECK_GS: &str = include_str!("../../../scripts/selfcheck.gsh");
 
-/// `selfcheck` — run the embedded self-check suite IN MEMORY (straight from rodata via
+/// `selfcheck` - run the embedded self-check suite IN MEMORY (straight from rodata via
 /// `run_lines`; no file write, so it is not capped by `MAX_FILE_BYTES`). The one-USB hardware
-/// checkpoint — flash the boot image, (`drives flash` a drive if it's raw, so the file-command
+/// checkpoint - flash the boot image, (`drives flash` a drive if it's raw, so the file-command
 /// tests have somewhere to write), then `selfcheck`. Re-runnable (the suite creates and deletes
-/// its own files). Refused inside a script (it runs one — no nesting).
+/// its own files). Refused inside a script (it runs one - no nesting).
 #[inline(never)]
 fn cmd_selfcheck(ctx: &ServiceContext, cwd: &mut Cwd, depth: u8, arg: &str) -> Result<(), ShellError> {
     if depth > 0 {
         ctx.console_writeln("selfcheck: not available inside a script (it runs one)");
         return Err(ShellError::Unknown);
     }
-    // Optional `save <path>`: stream the run REPORT to a file (the utility writes its own file —
+    // Optional `save <path>`: stream the run REPORT to a file (the utility writes its own file -
     // direct, not a pipe, so the orchestrator can save without the nested-capture stack overflow).
     let save = if arg.is_empty() {
         None
@@ -1258,12 +1258,12 @@ fn cmd_selfcheck(ctx: &ServiceContext, cwd: &mut Cwd, depth: u8, arg: &str) -> R
         }
     };
     ctx.console_writeln_fmt(format_args!(
-        "selfcheck: running the embedded suite ({} bytes, in memory) — needs a flashed drive for the file tests...",
+        "selfcheck: running the embedded suite ({} bytes, in memory) - needs a flashed drive for the file tests...",
         SELFCHECK_GS.len()));
     run_with_optional_save(ctx, cwd, SELFCHECK_GS.as_bytes(), depth, save)
 }
 
-/// `assert ok <cmd>` / `assert fails <cmd>` — the **result** form: run `<cmd>` and check that it
+/// `assert ok <cmd>` / `assert fails <cmd>` - the **result** form: run `<cmd>` and check that it
 /// succeeded (`ok`) or failed (`fails`). The assertion holds → `Ok` + `assert: ok`; it doesn't →
 /// `Err(AssertFailed)` + a `FAILED` line. This is the negative-test surface (§22's negative cases
 /// on hardware): `assert fails read /nope` verifies the guardrail refuses. The *content* form
@@ -1281,7 +1281,7 @@ fn cmd_assert(ctx: &ServiceContext, cwd: &mut Cwd, rest: &str, depth: u8) -> Res
             let held = if verb == "ok" { r.is_ok() } else { r.is_err() };
             assert_verdict(ctx, held, verb, cmd)
         }
-        // `assert fails-with <Variant> <cmd>` — pin the SPECIFIC failure (precise negative test).
+        // `assert fails-with <Variant> <cmd>` - pin the SPECIFIC failure (precise negative test).
         "fails-with" => {
             let (variant, inner) = split_first(cmd);
             if variant.is_empty() || inner.is_empty() {
@@ -1294,7 +1294,7 @@ fn cmd_assert(ctx: &ServiceContext, cwd: &mut Cwd, rest: &str, depth: u8) -> Res
         }
         "contains" | "lacks" | "empty" => {
             ctx.console_writeln_fmt(format_args!(
-                "assert: '{}' checks a pipe — use: <producer> | assert {} …", verb, verb));
+                "assert: '{}' checks a pipe - use: <producer> | assert {} …", verb, verb));
             Err(ShellError::Unknown)
         }
         _ => {
@@ -1326,7 +1326,7 @@ const UTILS: &[&str] = &[
 ];
 fn is_util(name: &str) -> bool { UTILS.contains(&name) }
 
-/// `<util> version` — version number, then creator credit.
+/// `<util> version` - version number, then creator credit.
 fn util_version(ctx: &ServiceContext, util: &str) {
     ctx.console_writeln_fmt(format_args!("{} {}", util, UTIL_VERSION));
     ctx.console_writeln("Created by Bankole Ogundero.");
@@ -1335,10 +1335,10 @@ fn util_version(ctx: &ServiceContext, util: &str) {
 /// One usage row: (signature with `<placeholders>`, description, a real example).
 type Row = (&'static str, &'static str, &'static str);
 
-/// Render the standard help block: `<title> <ver> — <desc>`, each usage row followed by a
+/// Render the standard help block: `<title> <ver> - <desc>`, each usage row followed by a
 /// real example, then (for a top-level utility) the version/help footer.
 fn help_block(ctx: &ServiceContext, title: &str, desc: &str, rows: &[Row], footer: bool) {
-    ctx.console_writeln_fmt(format_args!("{} {} — {}", title, UTIL_VERSION, desc));
+    ctx.console_writeln_fmt(format_args!("{} {} - {}", title, UTIL_VERSION, desc));
     ctx.console_writeln("");
     ctx.console_writeln("usage:");
     for (sig, d, ex) in rows {
@@ -1353,7 +1353,7 @@ fn help_block(ctx: &ServiceContext, title: &str, desc: &str, rows: &[Row], foote
     }
 }
 
-/// `<util> help` — usage with examples. Returns false for an unknown name.
+/// `<util> help` - usage with examples. Returns false for an unknown name.
 fn util_help(ctx: &ServiceContext, util: &str) -> bool {
     match util {
         "help" => help_block(ctx, "help", "list all commands (or get help on one)", &[
@@ -1374,7 +1374,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         ], true),
         "roster" => help_block(ctx, "roster", "example record-producing service (a typed table you can pipe)", &[
             ("roster", "render the table directly (name / role / seat)", "roster"),
-            ("roster | where <col><op><val>", "filter rows — it is a record source for the pipe verbs", "roster | where role=core"),
+            ("roster | where <col><op><val>", "filter rows - it is a record source for the pipe verbs", "roster | where role=core"),
             ("roster | select <cols> | to json", "project columns / render as JSON at the edge", "roster | select name seat | to json"),
         ], true),
         "assert" => help_block(ctx, "assert", "verify a result or output; Ok if it holds, else Err", &[
@@ -1434,10 +1434,10 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "reboot" => help_block(ctx, "reboot", "hardware reset", &[
             ("reboot", "reset the machine", "reboot"),
         ], true),
-        "chaos" => help_block(ctx, "chaos", "bounded resilience exerciser — stress one invariant, report a verdict", &[
+        "chaos" => help_block(ctx, "chaos", "bounded resilience exerciser - stress one invariant, report a verdict", &[
             ("chaos kill-storm <svc> [rounds]", "kill a service N times; verify it recovers each time", "chaos kill-storm supervisor 20"),
             ("chaos kill-storm <svc> [n] save <path>", "also write the report to a file (recorded in memory, written at the end)", "chaos kill-storm fs 20 save /chaos.txt"),
-            ("  <svc> = supervisor | block-driver | fs", "recoverable targets: the supervisor respawns the services, the kernel respawns the supervisor — only the kernel can't be killed", "chaos kill-storm supervisor 10"),
+            ("  <svc> = supervisor | block-driver | fs", "recoverable targets: the supervisor respawns the services, the kernel respawns the supervisor - only the kernel can't be killed", "chaos kill-storm supervisor 10"),
             ("chaos max-carnage [rounds] [save <path>]", "the chaos monkey: kill a RANDOM live service each round (everything but the shell); proves the KERNEL survives arbitrary carnage", "chaos max-carnage 30"),
         ], true),
         "drives" => help_block(ctx, "drives", "manage attached disks (records when piped)", &[
@@ -1543,7 +1543,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
     true
 }
 
-/// `<util> <sub> help` — focused help for a subcommand. Returns false if not a subcommand.
+/// `<util> <sub> help` - focused help for a subcommand. Returns false if not a subcommand.
 fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
     match (util, sub) {
         ("date", "epoch") => help_block(ctx, "date epoch", "seconds since 1970-01-01", &[
@@ -1591,7 +1591,7 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
 }
 
 /// One rendered line of `help`, as static data so the pager can index it (and the
-/// whole table lives in rodata, not on the shell's tight stack — §26.6). `Sec`/`Text`
+/// whole table lives in rodata, not on the shell's tight stack - §26.6). `Sec`/`Text`
 /// are full-width lines; `Row` is the aligned "  command  description" form.
 enum HelpRow {
     Gap,
@@ -1655,7 +1655,7 @@ static HELP: &[HelpRow] = &[
     Row("  e.g. tree / | write /out", "capture output to a file"),
     Row("  e.g. greet | upper | write /g", "producer | filter | sink"),
     Gap,
-    Sec("Records (typed pipes — docs/records.md)"),
+    Sec("Records (typed pipes - docs/records.md)"),
     Row("status | where mem>0", "filter the task table by field (=,!=,>,<,~)"),
     Row("status | select name state", "keep only some columns"),
     Row("status | sort [reverse] mem", "order rows by a column"),
@@ -1669,19 +1669,19 @@ static HELP: &[HelpRow] = &[
 ];
 
 /// Render help line `idx` (0 = the versioned header, then `HELP[idx-1]`). When `clear_eol`
-/// the line ends with `ESC[K` (erase to end of line) before the newline — the pager repaints
+/// the line ends with `ESC[K` (erase to end of line) before the newline - the pager repaints
 /// each row in place over the old frame, so a shorter line must wipe the longer one's tail.
 fn help_render_line(ctx: &ServiceContext, idx: usize, clear_eol: bool) {
     let eol = if clear_eol { "\x1b[K" } else { "" };
     if idx == 0 {
         // Rule 6 (0_conventions.md): help output's first line is `<util> <version>`.
-        ctx.console_write_fmt(format_args!("help {} — GodspeedOS shell commands", UTIL_VERSION));
+        ctx.console_write_fmt(format_args!("help {} - GodspeedOS shell commands", UTIL_VERSION));
     } else {
         match &HELP[idx - 1] {
             Gap => {}
             Sec(s) | Text(s) => ctx.console_write(s),
             // One "  command  description" row, left-justified to a fixed width so the
-            // description columns line up (ASCII-only — renders the same on TV and serial).
+            // description columns line up (ASCII-only - renders the same on TV and serial).
             Row(cmd, desc) => ctx.console_write_fmt(format_args!("  {:<21}  {}", cmd, desc)),
         }
     }
@@ -1692,8 +1692,8 @@ fn help_render_line(ctx: &ServiceContext, idx: usize, clear_eol: bool) {
 fn cmd_help(ctx: &ServiceContext, depth: u8) -> Result<(), ShellError> {
     let total = HELP.len() + 1; // +1 for the header line
     // Page only for a direct interactive `help` (depth 0). When help is run from a
-    // script, `assert`, or `selfcheck` (depth > 0) there is no human to press keys —
-    // the pager would block the run — so just dump it. The framebuffer console has no
+    // script, `assert`, or `selfcheck` (depth > 0) there is no human to press keys -
+    // the pager would block the run - so just dump it. The framebuffer console has no
     // scrollback, so an interactive help longer than the screen scrolls its top off
     // forever; page it then (a serial terminal has its own scrollback, but paging there
     // is harmless and consistent). rows==0 means geometry is unknown → just print it.
@@ -1707,11 +1707,11 @@ fn cmd_help(ctx: &ServiceContext, depth: u8) -> Result<(), ShellError> {
     Ok(())
 }
 
-/// Render the full `help` reference as plain text to `out` — the pipe-producer path
+/// Render the full `help` reference as plain text to `out` - the pipe-producer path
 /// (`help | write /help.txt`). Mirrors `help_render_line`'s content but with no pager, no cursor
 /// escapes, and no `ESC[K`: just the categorised command list, capturable to a file.
 fn help_to_out(ctx: &ServiceContext, out: &mut Out) {
-    out.line_fmt(ctx, format_args!("help {} — GodspeedOS shell commands", UTIL_VERSION));
+    out.line_fmt(ctx, format_args!("help {} - GodspeedOS shell commands", UTIL_VERSION));
     for row in HELP {
         match row {
             Gap => out.line(ctx, ""),
@@ -1737,7 +1737,7 @@ fn help_pager(ctx: &ServiceContext, total: usize, rows: usize) {
     let mut top = 0usize;
     ctx.console_write("\x1b[?25l"); // hide the cursor for the whole pager session
     loop {
-        ctx.console_write("\x1b[H"); // home — repaint over the old frame, no clear-to-black
+        ctx.console_write("\x1b[H"); // home - repaint over the old frame, no clear-to-black
         let end = (top + page).min(total);
         for i in top..end { help_render_line(ctx, i, true); }
         // Status line (no trailing newline so it parks at the bottom). Scroll keys lead,
@@ -1868,7 +1868,7 @@ fn cmd_cores(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
 
 /// Wall-clock date+time from the hardware RTC. Default renders a full timestamp
 /// with weekday, e.g. `Sat 2026-06-06 22:05:09`. `date epoch` prints seconds since
-/// 1970-01-01 instead. Deliberately just these two forms — no clock-setting, format
+/// 1970-01-01 instead. Deliberately just these two forms - no clock-setting, format
 /// strings, or timezones (§26.2: minimal surface). The subcommand is `epoch`, not
 /// `unix`: this is not POSIX, so the vocabulary doesn't borrow its name.
 fn cmd_date(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellError> {
@@ -1886,7 +1886,7 @@ fn cmd_date(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-// Structured records — the typed `Table` model now lives in the SDK (`godspeed_sdk::record`,
+// Structured records - the typed `Table` model now lives in the SDK (`godspeed_sdk::record`,
 // docs/records.md) so any service can build/filter/render records, not just the shell. Imported
 // at the top of this file. The shell keeps only the *shell-specific* glue: an `OutSink` that
 // bridges the SDK renderers to the console/capture `Out`, and the producer builders below.
@@ -1937,7 +1937,7 @@ fn build_uptime_table(ctx: &ServiceContext) -> Table {
     t
 }
 
-/// `uptime` — how long the system has been up. Bare renders the one-row grid; pipeable as records
+/// `uptime` - how long the system has been up. Bare renders the one-row grid; pipeable as records
 /// (`uptime | to json|yaml`). See `build_uptime_table` / `utilities/37_uptime.md`.
 fn cmd_uptime(ctx: &ServiceContext) -> Result<(), ShellError> {
     let t = build_uptime_table(ctx);
@@ -1946,21 +1946,21 @@ fn cmd_uptime(ctx: &ServiceContext) -> Result<(), ShellError> {
     Ok(())
 }
 
-/// `observe now` as a record producer: the task roster plus the metric `status` omits — `ticks`,
+/// `observe now` as a record producer: the task roster plus the metric `status` omits - `ticks`,
 /// each task's cumulative `run_ticks` (timer ticks it has spent running since boot). That column
 /// is what distinguishes `observe` (how busy) from `status` (who's alive): `observe now | sort
-/// reverse ticks` is the native "top". It is a *snapshot*-honest value — cumulative ticks, not an
+/// reverse ticks` is the native "top". It is a *snapshot*-honest value - cumulative ticks, not an
 /// instantaneous % (a rate needs two samples, which only the live view has; observe's per-task
 /// "CPU%" is really its core's utilisation, not per-task, so it would not sort meaningfully).
 ///
-/// Only the one-shot `observe now` is pipeable. Bare `observe` is the continuous live view — it
-/// owns the screen and never yields a discrete stream — so piping it is a loud refusal, not a
+/// Only the one-shot `observe now` is pipeable. Bare `observe` is the continuous live view - it
+/// owns the screen and never yields a discrete stream - so piping it is a loud refusal, not a
 /// silent hang (the same hazard the stage-1 producer whitelist guards, docs/pipes.md). `#[inline
 /// (never)]`: like the sibling builders, its `Table` must not inflate `pipe_run`'s frame.
 #[inline(never)]
 fn build_observe_table(ctx: &ServiceContext, arg: &str) -> Option<Table> {
     if split_first(arg).0 != "now" {
-        ctx.console_writeln("observe: the live view can't be piped — use 'observe now | …'");
+        ctx.console_writeln("observe: the live view can't be piped - use 'observe now | …'");
         return None;
     }
     let mut t = Table::new(&["slot", "name", "core", "state", "mem", "queue", "restarts", "ticks"]);
@@ -1979,10 +1979,10 @@ fn build_observe_table(ctx: &ServiceContext, arg: &str) -> Option<Table> {
 }
 
 /// Producers that emit a structured TABLE rather than text. These are inherently tabular
-/// (uniform rows), so in a pipe they emit records — composed with `where`/`select`/`sort <col>`,
+/// (uniform rows), so in a pipe they emit records - composed with `where`/`select`/`sort <col>`,
 /// not the text filters. Bare (un-piped) each still prints its normal text. `status` (task
 /// roster), `ls` (dir listing), `caps` (held capabilities), `drives` (attached disks), `find`
-/// (search hits) are shell-side, so no wire codec is needed — they pass by value like `status`.
+/// (search hits) are shell-side, so no wire codec is needed - they pass by value like `status`.
 fn is_record_producer(name: &str) -> bool {
     matches!(name, "status" | "ls" | "caps" | "drives" | "find" | "observe" | "uptime")
 }
@@ -1993,8 +1993,8 @@ fn is_record_producer(name: &str) -> bool {
 ///
 /// `#[inline(never)]` (and on all the sibling builders): each holds a multi-KB `Table` (and
 /// `build_find_table` a `PathStack` too) on its stack. Inlined into `pipe_run`, those frames
-/// would inflate *every* pipeline's stack — even byte-only ones like `greet | sort` that never
-/// build a record — and overflow the bounded user stack. Out-of-line, the big frame exists only
+/// would inflate *every* pipeline's stack - even byte-only ones like `greet | sort` that never
+/// build a record - and overflow the bounded user stack. Out-of-line, the big frame exists only
 /// while the builder actually runs.
 #[inline(never)]
 fn build_ls_table(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Option<Table> {
@@ -2029,7 +2029,7 @@ fn build_ls_table(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Option<Table> {
     Some(t)
 }
 
-/// `caps` as a record producer: one row per held capability — `resource` (the target,
+/// `caps` as a record producer: one row per held capability - `resource` (the target,
 /// named for stable kernel resources, else `endpoint#N`) and `rights` (the spelled-out
 /// right words). Mirrors `cmd_caps`'s decoding. `name` empty → this shell's own caps.
 #[inline(never)]
@@ -2086,10 +2086,10 @@ fn cap_rights_str(r: u8, buf: &mut [u8]) -> usize {
     p
 }
 
-/// `drives` as a record producer: one row per attached drive — `index`, `label`, `status`
+/// `drives` as a record producer: one row per attached drive - `index`, `label`, `status`
 /// (`GSFS`/`raw`), `size_mib`, and `free_mib` (`Empty` for a raw, unformatted drive). Single
 /// drive in step 3; mirrors `drives_list`. Sizes are in MiB (so the column name carries the
-/// unit — a bare number cell can't).
+/// unit - a bare number cell can't).
 #[inline(never)]
 fn build_drives_table(ctx: &ServiceContext) -> Option<Table> {
     let reply = match ctx.request_with_reply("fs", &Message::from_bytes(&[OP_DRIVES_INFO])) {
@@ -2121,7 +2121,7 @@ fn build_drives_table(ctx: &ServiceContext) -> Option<Table> {
     Some(t)
 }
 
-/// `find` as a record producer: one row per match — `name`, `type` (`file`/`dir`), and the
+/// `find` as a record producer: one row per match - `name`, `type` (`file`/`dir`), and the
 /// full `path`. Same bounded depth-first walk as `cmd_find`, emitting rows instead of printing
 /// the path. `arg` is the producer tail (`<pattern> [start]`).
 #[inline(never)]
@@ -2170,7 +2170,7 @@ fn build_find_table(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Option<Table>
     }
     if stack.overflow {
         ctx.console_writeln_fmt(format_args!(
-            "find: search truncated — more than {} directories pending (bounded walk)", FIND_QCAP));
+            "find: search truncated - more than {} directories pending (bounded walk)", FIND_QCAP));
     }
     Some(t)
 }
@@ -2206,7 +2206,7 @@ fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str) -> Result<(), ShellErro
     }
     if n < 2 { ctx.console_writeln("usage: <producer> | <stage> [| …]"); return Err(ShellError::Unknown); }
 
-    // Stage 1 — produce a Stream.
+    // Stage 1 - produce a Stream.
     let (c0, _) = split_first(stages[0]);
     let mut s = if is_record_producer(c0) {
         let arg = split_first(stages[0]).1;
@@ -2220,22 +2220,22 @@ fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str) -> Result<(), ShellErro
             _         => build_status_table(ctx),
         };
         // Loud on the record bound (§3.12/§26.6): a producer that overran rows/arena is reported,
-        // never silently truncated — the same bar the text pipe buffer holds.
+        // never silently truncated - the same bar the text pipe buffer holds.
         if t.overflow() {
             ctx.console_writeln_fmt(format_args!(
-                "{}: result exceeded the record bound ({} rows / {} bytes) — truncated",
+                "{}: result exceeded the record bound ({} rows / {} bytes) - truncated",
                 c0, REC_MAX_ROWS, REC_ARENA));
         }
         Stream::Table(t)
     } else if is_record_producer_service(c0) {
         // A SERVICE that emits records: drain its binary wire encoding (Table::encode, §
-        // docs/records.md) and decode it back into a Table — no JSON round-trip. The transport
+        // docs/records.md) and decode it back into a Table - no JSON round-trip. The transport
         // is the same byte drain as a text service; the bytes are records, decoded here.
         let mut cap = Cap::new();
         if !drain_service(ctx, c0, None, &mut cap) { return Err(ShellError::Unknown); }
         match Table::decode(cap.bytes()) {
             Ok(t) => Stream::Table(t),
-            Err(why) => { ctx.console_writeln_fmt(format_args!("{}: bad record stream — {}", c0, why)); return Err(ShellError::Unknown); }
+            Err(why) => { ctx.console_writeln_fmt(format_args!("{}: bad record stream - {}", c0, why)); return Err(ShellError::Unknown); }
         }
     } else if is_producer_builtin(c0) {
         let mut cap = Cap::new();
@@ -2258,7 +2258,7 @@ fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str) -> Result<(), ShellErro
         return Err(ShellError::Unknown);
     };
 
-    // Stages 2..n — transform, with the last optionally a sink (`write` or `assert`).
+    // Stages 2..n - transform, with the last optionally a sink (`write` or `assert`).
     for i in 1..n {
         let last = i == n - 1;
         let (cmd, arg) = split_first(stages[i]);
@@ -2276,18 +2276,18 @@ fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str) -> Result<(), ShellErro
         }
         if cmd == "assert" {
             // The verifying sink: judge the stream and return Ok/Err so a script's `run` (and
-            // `result`) sees the verdict. Must be last — it consumes the stream.
+            // `result`) sees the verdict. Must be last - it consumes the stream.
             if !last { ctx.console_writeln("pipe: assert must be the last stage"); return Err(ShellError::Unknown); }
             return assert_stream(ctx, &s, arg);
         }
         if cmd == "result" {
-            // `result` reads the outcome channel, not a stream — same mix-up as `<cmd> | result`.
+            // `result` reads the outcome channel, not a stream - same mix-up as `<cmd> | result`.
             ctx.console_writeln("pipe: 'result' checks a command's outcome, not piped output. Run the command, then 'result', or use 'assert ok <command>'");
             return Err(ShellError::Unknown);
         }
         if !pipe_transform(ctx, stages[i], cmd, &mut s) { return Err(ShellError::Unknown); }
     }
-    // No sink — render the final stream to the console.
+    // No sink - render the final stream to the console.
     match &s {
         Stream::Bytes(c) => console_write_chunked(ctx, c.bytes()),
         Stream::Table(t) => { let mut o = Out::Console; t.to_grid(&mut OutSink { ctx, out: &mut o }); }
@@ -2295,14 +2295,14 @@ fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str) -> Result<(), ShellErro
     Ok(())
 }
 
-/// `… | assert <check> [text]` — the verifying pipe sink. Materialises the stream to text (a
+/// `… | assert <check> [text]` - the verifying pipe sink. Materialises the stream to text (a
 /// `Table` renders to its grid) and checks it, returning `Ok` if the assertion holds, else
 /// `Err(AssertFailed)`. Prints a terse verdict so a `run` transcript shows pass/fail per line.
 /// Checks: `contains <text>`, `lacks <text>` (negation), `empty`. (Content correctness; the
 /// `assert ok/fails <cmd>` *result* form is handled in `cmd_assert`, no pipe.)
 ///
 /// `#[inline(never)]`: holds a 64 KiB `Cap` (to materialise a `Table`), so it must not fold into
-/// `pipe_run`'s frame (which already carries a 64 KiB `Stream`) — the inline-frame stack rule.
+/// `pipe_run`'s frame (which already carries a 64 KiB `Stream`) - the inline-frame stack rule.
 #[inline(never)]
 fn assert_stream(ctx: &ServiceContext, s: &Stream, arg: &str) -> Result<(), ShellError> {
     let mut tmp = Cap::new();
@@ -2327,7 +2327,7 @@ fn assert_stream(ctx: &ServiceContext, s: &Stream, arg: &str) -> Result<(), Shel
     assert_verdict(ctx, held, check, want)
 }
 
-/// Print the verdict (`assert: ok` / `assert: FAILED — …`) and map it to a `Result`.
+/// Print the verdict (`assert: ok` / `assert: FAILED - …`) and map it to a `Result`.
 fn assert_verdict(ctx: &ServiceContext, held: bool, check: &str, detail: &str) -> Result<(), ShellError> {
     if held {
         ctx.console_writeln("assert: ok");
@@ -2347,12 +2347,12 @@ fn assert_verdict(ctx: &ServiceContext, held: bool, check: &str, detail: &str) -
 /// boundaries never split a multi-byte char.
 /// Bytes per console burst (≤ 256, the `console_write` syscall cap).
 const CONSOLE_BURST: usize = 256;
-/// Yields between bursts when pacing bulk output — see `console_write_chunked`.
+/// Yields between bursts when pacing bulk output - see `console_write_chunked`.
 const CONSOLE_PACE_YIELDS: u32 = 2;
 
 /// Write `bytes` to the console in ≤256-byte bursts, **pacing** between bursts so the HOST
 /// serial side can drain. A big one-shot dump (a long chaos report, `read` of a large file)
-/// otherwise overruns the host UART / USB-serial receive buffer and bytes are lost mid-stream —
+/// otherwise overruns the host UART / USB-serial receive buffer and bytes are lost mid-stream -
 /// the kernel's THRE poll is deliberately bounded (it drops a byte rather than wedge a core with
 /// IF=0, `arch/x86_64`). Yielding lets the host drain between bursts. Only the serial mirror is at
 /// risk (the framebuffer is locked per-string, so the TV is fine); this rescues the serial mirror.
@@ -2450,7 +2450,7 @@ fn pipe_transform(ctx: &ServiceContext, stage: &str, cmd: &str, s: &mut Stream) 
         // byte filters (Bytes only)
         "match" | "count" | "first" | "last" => match s {
             Stream::Bytes(_) => byte_filter(ctx, stage, s),
-            Stream::Table(_) => { ctx.console_writeln_fmt(format_args!("{}: this is a record stream — use 'where'/'select'/'sort <col>', or 'to json' for text", cmd)); false }
+            Stream::Table(_) => { ctx.console_writeln_fmt(format_args!("{}: this is a record stream - use 'where'/'select'/'sort <col>', or 'to json' for text", cmd)); false }
         },
         // anything else: a service filter stage (Bytes only)
         _ => match s {
@@ -2476,9 +2476,9 @@ fn byte_filter(ctx: &ServiceContext, stage: &str, s: &mut Stream) -> bool {
     true
 }
 
-/// `roster` (bare) — render the example record service's table directly: the same data a pipe
+/// `roster` (bare) - render the example record service's table directly: the same data a pipe
 /// sees (`roster | where role=core`). Spawns roster, drains its binary wire encoding (`Table::
-/// encode`), decodes it back into a `Table`, and renders the grid. `#[inline(never)]` — it holds a
+/// encode`), decodes it back into a `Table`, and renders the grid. `#[inline(never)]` - it holds a
 /// 64 KiB `Cap` on the user stack (USER_STACK_PAGES is tight; see [[project-shell-stack-pipe]]).
 #[inline(never)]
 fn cmd_roster(ctx: &ServiceContext) -> Result<(), ShellError> {
@@ -2487,7 +2487,7 @@ fn cmd_roster(ctx: &ServiceContext) -> Result<(), ShellError> {
     match Table::decode(cap.bytes()) {
         Ok(t) => { let mut o = Out::Console; t.to_grid(&mut OutSink { ctx, out: &mut o }); Ok(()) }
         Err(why) => {
-            ctx.console_writeln_fmt(format_args!("roster: bad record stream — {}", why));
+            ctx.console_writeln_fmt(format_args!("roster: bad record stream - {}", why));
             Err(ShellError::Unknown)
         }
     }
@@ -2502,7 +2502,7 @@ fn cmd_status(ctx: &ServiceContext) -> Result<(), ShellError> {
     Ok(())
 }
 
-/// `caps <service>` — list the capabilities a service holds. A thin broker over
+/// `caps <service>` - list the capabilities a service holds. A thin broker over
 /// the kernel's `task_caps` introspection (held via the INTROSPECT cap). Makes
 /// authority visible on the box itself (§26.9): for each cap, the resource it
 /// targets and the rights it carries.
@@ -2577,7 +2577,7 @@ fn slot_of(ctx: &ServiceContext, name: &str) -> Option<u32> {
 
 /// The restart generation of the live service named `name` (None if not running). A restart bumps
 /// the generation (§7.5), so a value strictly greater than a pre-kill reading proves a NEW instance
-/// came up — the recovery signal `chaos kill-storm` waits on.
+/// came up - the recovery signal `chaos kill-storm` waits on.
 fn gen_of(ctx: &ServiceContext, name: &str) -> Option<u32> {
     for slot in 0..256u32 {
         let st = ctx.task_stat(slot);
@@ -2588,7 +2588,7 @@ fn gen_of(ctx: &ServiceContext, name: &str) -> Option<u32> {
     None
 }
 
-/// `observe now` — broker a one-shot static metrics frame.
+/// `observe now` - broker a one-shot static metrics frame.
 ///
 /// `observe` is a least-authority service: it holds only INTROSPECT + log caps,
 /// never the shell's spawn/kill/restart. The shell spawns it; it prints one frame
@@ -2618,14 +2618,14 @@ fn cmd_observe_now(ctx: &ServiceContext) -> Result<(), ShellError> {
     Ok(())
 }
 
-/// `observe` (live) — broker the full-screen foreground view (Stage 2c).
+/// `observe` (live) - broker the full-screen foreground view (Stage 2c).
 ///
 /// The shell is the capability-broker (Appendix B.3): it lends the keyboard to
 /// the foreground child by owning `q` ourselves. We spawn `observe-live` (which paints the
-/// screen — hides the cursor, suppresses echo, repaints — but does NOT read input), then poll
+/// screen - hides the cursor, suppresses echo, repaints - but does NOT read input), then poll
 /// the console for `q` and kill it when pressed. The shell, not the child, reads the keyboard
 /// here (one reader, no race), and both we and the child SLEEP between polls so core 0 halts
-/// while `observe` is up — otherwise a busy wait would peg the core and make every task on it
+/// while `observe` is up - otherwise a busy wait would peg the core and make every task on it
 /// read as ~100% in observe's own display. Then we restore the screen and our read loop resumes.
 fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
     let _ = ctx.kill("observe-live"); // clear any stale instance
@@ -2639,7 +2639,7 @@ fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
         for _ in 0..u32::MAX {
             // Sleep (don't busy-yield) so core 0 halts between polls. ~50 ms `q` latency.
             ctx.sleep(100_000_000);
-            // Drain the console; quit on `q`/`Q` (other keys are discarded — observe takes no
+            // Drain the console; quit on `q`/`Q` (other keys are discarded - observe takes no
             // other input). Echo is off (the child disabled it), so nothing smears the frame.
             let mut quit = false;
             while let Some(b) = ctx.try_console_read() {
@@ -2651,7 +2651,7 @@ fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
     }
     let _ = ctx.kill("observe-live"); // reap the child (it never exits on its own)
     // Restore the console the child left in raw mode: show the cursor and drop below the last
-    // frame so the prompt lands cleanly. Echo stays OFF — the shell, not the kernel, owns echo.
+    // frame so the prompt lands cleanly. Echo stays OFF - the shell, not the kernel, owns echo.
     ctx.console_echo(false);
     ctx.console_write("\x1b[?25h\r\n");
     Ok(())
@@ -2675,18 +2675,18 @@ fn find_running_slot(ctx: &ServiceContext, name: &str) -> Option<u32> {
 /// The trusted root (§6.1). The kernel refuses to kill these and refuses to spawn
 /// a second instance; the shell explains why before the syscall is even tried.
 // `registry` is no longer protected (H11 ph6): it is a restartable service, so the
-// The shell permits killing restartable services (block-driver, fs — the supervisor respawns them).
+// The shell permits killing restartable services (block-driver, fs - the supervisor respawns them).
 // Only `supervisor` is the non-restartable trusted root now (Path C / Phase 5: init removed).
 const CORE_SERVICES: [&str; 1] = ["supervisor"];
 
-/// Shown when spawn/kill/restart targets a core service — "Not applicable" makes
+/// Shown when spawn/kill/restart targets a core service - "Not applicable" makes
 /// it clear the command is refused *because* the target is protected, not failed.
 /// Lists exactly `CORE_SERVICES`; `registry` is intentionally absent (H11 ph6:
 /// it is restartable, so `kill registry` is permitted).
 const PROTECTED_MSG: &str =
     "Not applicable. Core services (init, supervisor) are protected";
 
-/// Shown when spawn/kill/restart targets an observe variant — they are brokered by
+/// Shown when spawn/kill/restart targets an observe variant - they are brokered by
 /// the `observe` / `observe now` commands, not raw service operations.
 const OBSERVE_HINT: &str =
     "observe runs from a command: type 'observe' (live) or 'observe now' (snapshot)";
@@ -2695,7 +2695,7 @@ fn is_core_service(name: &str) -> bool {
     CORE_SERVICES.contains(&name)
 }
 
-/// `observe`'s variants are brokered by the `observe` / `observe now` commands —
+/// `observe`'s variants are brokered by the `observe` / `observe now` commands -
 /// not meant to be raw-spawned (the bare `observe` service is a serial-streaming
 /// dev build that scrolls forever and ignores `q`).
 fn is_observe_variant(name: &str) -> bool {
@@ -2703,16 +2703,16 @@ fn is_observe_variant(name: &str) -> bool {
 }
 
 /// Services the live console session depends on for I/O. Killing/restarting them
-/// from the shell would brick the very session issuing the command — a USB host
+/// from the shell would brick the very session issuing the command - a USB host
 /// driver (`xhci`/`ehci`, which carry whatever input devices are attached) or the
 /// shell itself. Returns the reason to show, or `None` if `name` is safe to
-/// operate on. (Not a §6.2 trusted-root guard — these are restartable in
+/// operate on. (Not a §6.2 trusted-root guard - these are restartable in
 /// principle, just not from the session that needs them.)
 fn session_critical_msg(name: &str) -> Option<&'static str> {
     match name {
-        "xhci"  => Some("Not applicable. xhci is a USB host driver — killing it disables any input device attached to it"),
-        "ehci"  => Some("Not applicable. ehci is a USB host driver — killing it disables any input device attached to it"),
-        "shell" => Some("Not applicable. that is this shell — the session you are typing in"),
+        "xhci"  => Some("Not applicable. xhci is a USB host driver - killing it disables any input device attached to it"),
+        "ehci"  => Some("Not applicable. ehci is a USB host driver - killing it disables any input device attached to it"),
+        "shell" => Some("Not applicable. that is this shell - the session you are typing in"),
         _       => None,
     }
 }
@@ -2745,7 +2745,7 @@ fn cmd_spawn(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     }
 }
 
-/// `spawncap <name>` — **Phase-0 diagnostic** (`docs/naming-design.md`). Spawns a service via the
+/// `spawncap <name>` - **Phase-0 diagnostic** (`docs/naming-design.md`). Spawns a service via the
 /// new `SpawnReturningEndpoint` syscall, which hands the caller a `SEND|GRANT` cap to the new
 /// service's endpoint, then proves that cap routes by sending a probe message through it. This is
 /// the seam that will let the supervisor build a userspace `name → cap` map; it does NOT change how
@@ -2757,8 +2757,8 @@ fn cmd_spawncap(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     }
     match ctx.spawn_returning_endpoint(name, 0xFFFF) {
         Some(h) => match ctx.try_send_by_handle(h, &Message::from_bytes(&[0x01])) {
-            Ok(())  => { ctx.console_writeln_fmt(format_args!("spawncap: {} — endpoint cap acquired; send Ok", name)); Ok(()) }
-            Err(_)  => { ctx.console_writeln_fmt(format_args!("spawncap: {} — cap acquired but send failed", name)); Err(ShellError::Unknown) }
+            Ok(())  => { ctx.console_writeln_fmt(format_args!("spawncap: {} - endpoint cap acquired; send Ok", name)); Ok(()) }
+            Err(_)  => { ctx.console_writeln_fmt(format_args!("spawncap: {} - cap acquired but send failed", name)); Err(ShellError::Unknown) }
         },
         None => {
             ctx.console_writeln_fmt(format_args!(
@@ -2768,11 +2768,11 @@ fn cmd_spawncap(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     }
 }
 
-/// `spawnwired` — **Phase-0b diagnostic** (`docs/naming-design.md`). Spawns `pong` and acquires its
+/// `spawnwired` - **Phase-0b diagnostic** (`docs/naming-design.md`). Spawns `pong` and acquires its
 /// endpoint cap (Phase 0a), then spawns `greet` wiring it to pong **via that passed cap** as
-/// `send_peer[0]` — NOT by name. `greet` sends its lines to `send_peer[0]`, so `pong` logs
+/// `send_peer[0]` - NOT by name. `greet` sends its lines to `send_peer[0]`, so `pong` logs
 /// "pong: received …". This proves the kernel installs a caller-supplied cap into the child and the
-/// child uses it — the seam by which the supervisor (not the kernel) owns naming. Removed / folded
+/// child uses it - the seam by which the supervisor (not the kernel) owns naming. Removed / folded
 /// into the supervisor in a later phase.
 fn cmd_spawnwired(ctx: &ServiceContext) -> Result<(), ShellError> {
     let pong = match ctx.spawn_returning_endpoint("pong", 0xFFFF) {
@@ -2799,7 +2799,7 @@ fn drain_service(ctx: &ServiceContext, svc: &str, input: Option<&[u8]>, out: &mu
     if let Some(inp) = input {
         if inp.len() > PIPE_MSG_MAX {
             ctx.console_writeln_fmt(format_args!(
-                "pipe: stage too large ({} bytes) for the '{}' filter — max {} KiB until pipe streaming",
+                "pipe: stage too large ({} bytes) for the '{}' filter - max {} KiB until pipe streaming",
                 inp.len(), svc, PIPE_MSG_MAX / 1024));
             return false;
         }
@@ -2818,17 +2818,17 @@ fn drain_service(ctx: &ServiceContext, svc: &str, input: Option<&[u8]>, out: &mu
             }
             None => {
                 // Distinct, honest wording: a registration TIMEOUT (filter never became ready) is
-                // not "not a filter". The new phrasing also tells stale-image runs apart — if this
+                // not "not a filter". The new phrasing also tells stale-image runs apart - if this
                 // text ever changes on hardware, the new shell is running (§26.7 loud failure).
                 ctx.console_writeln_fmt(format_args!(
-                    "pipe: '{}' never registered an input endpoint (waited ~{}s) — not a filter, or it failed to start",
+                    "pipe: '{}' never registered an input endpoint (waited ~{}s) - not a filter, or it failed to start",
                     svc, FILTER_WAIT_TICKS / 100));
                 let _ = ctx.kill(svc);
                 return false;
             }
         }
     }
-    // Drain the service's output until EOT (bounded — a conforming service always sends it).
+    // Drain the service's output until EOT (bounded - a conforming service always sends it).
     for _ in 0..512 {
         let msg = ctx.recv();
         let p = msg.payload_bytes();
@@ -2852,15 +2852,15 @@ fn split_first(s: &str) -> (&str, &str) {
 /// Built-ins that emit text and can be the producer side of a pipe.
 // `ls` and `find` are intentionally absent: they are record producers (`is_record_producer`),
 // handled on the record path in `pipe_run` before this is consulted, so listing them here would
-// be dead. `tree` stays text — a hierarchy is not a flat table.
+// be dead. `tree` stays text - a hierarchy is not a flat table.
 fn is_producer_builtin(name: &str) -> bool {
     // Text emitters that can start a pipe (captured via `Out`). The info commands (about/mem/cores/
     // date/help) join read/echo/tree so "anything that displays text can be saved to a file".
-    // No `cat`: `read` is the one file reader (utilities/18_read.md — `read` replaces POSIX `cat`,
+    // No `cat`: `read` is the one file reader (utilities/18_read.md - `read` replaces POSIX `cat`,
     // whose name describes a different operation; this OS does not carry POSIX vocabulary).
     //
     // NOT `selfcheck`/`run`: an orchestrator runs the suite's OWN sub-pipelines, so capturing it
-    // nests a pipe_run (64 KiB Stream) inside a pipe_run — two coexisting 64 KiB buffers overflow
+    // nests a pipe_run (64 KiB Stream) inside a pipe_run - two coexisting 64 KiB buffers overflow
     // the tight user stack (HW-proven shell crash, [[project-shell-stack-pipe]]). They refuse
     // loudly as non-producers instead. To capture a big file for `edit`, append a simple producer
     // a few times: `help | write /big.txt; help | write append /big.txt; …`.
@@ -2876,7 +2876,7 @@ fn is_pipe_producer_service(name: &str) -> bool {
 }
 
 /// Producer SERVICES that emit **records** (the binary wire codec, `Table::encode`) rather than
-/// text. Stage 1 drains the service's bytes and `Table::decode`s them straight into a Table —
+/// text. Stage 1 drains the service's bytes and `Table::decode`s them straight into a Table -
 /// no `from json` round-trip. Checked before the text producer-service whitelist.
 fn is_record_producer_service(name: &str) -> bool {
     matches!(name, "roster")
@@ -2890,7 +2890,7 @@ fn run_producer(ctx: &ServiceContext, cwd: &Cwd, cmdline: &str, out: &mut Out) {
         "read"         => { let _ = cmd_read(ctx, cwd, arg, out); }
         // "ls" and "find" are record producers (handled on the record path), not text here.
         "tree"         => { let _ = cmd_tree(ctx, cwd, arg, out); }
-        // Info/display commands — text emitters, capturable to a file.
+        // Info/display commands - text emitters, capturable to a file.
         "about"        => { let _ = cmd_about(ctx, out); }
         "mem"          => { let _ = cmd_mem(ctx, out); }
         "cores"        => { let _ = cmd_cores(ctx, out); }
@@ -2968,8 +2968,8 @@ fn stream_overwrite(ctx: &ServiceContext, p: &[u8], data: &[u8]) {
 /// Append or prepend `new` to file `p`, streaming through a temp file: the original is read (via
 /// `read_at`) while the combined content `[old|new]` (append) or `[new|old]` (prepend) is written
 /// to `WRITE_TMP`, which then atomically replaces the target. Constant memory (one IO_CHUNK
-/// scratch), any file size. `prepend` is a **full-file rewrite** — there is no insert-at-front in
-/// the filesystem — so it costs the same as rewriting the file (honest, §26.7). True on success.
+/// scratch), any file size. `prepend` is a **full-file rewrite** - there is no insert-at-front in
+/// the filesystem - so it costs the same as rewriting the file (honest, §26.7). True on success.
 #[inline(never)]
 fn fs_stream_combine(ctx: &ServiceContext, p: &[u8], new: &[u8], prepend: bool) -> bool {
     let old_size = fs_stat(ctx, p).map(|(sz, _)| sz as usize).unwrap_or(0);
@@ -3041,19 +3041,19 @@ fn pipe_write(ctx: &ServiceContext, cwd: &Cwd, arg: &str, data: &[u8]) {
 
 /// Look up a just-spawned service's endpoint via the registry, retrying while it registers.
 fn lookup_sink(ctx: &ServiceContext, sink: &str) -> Option<CapHandle> {
-    // A freshly-spawned filter registers its input endpoint only once it actually RUNS — which on
+    // A freshly-spawned filter registers its input endpoint only once it actually RUNS - which on
     // real multi-core hardware is up to ~1 s after spawn (it's on another core and hasn't been
     // scheduled yet). Retry the registry lookup until it appears, bounded by REAL time.
     //
-    // CRITICAL — do NOT `yield_cpu` in this wait. `CORE_TOTAL_TICKS` counts scheduler *quanta*
-    // (the timer IRQ **and** every `yield_current` — scheduler.rs), so yielding here inflates the
+    // CRITICAL - do NOT `yield_cpu` in this wait. `CORE_TOTAL_TICKS` counts scheduler *quanta*
+    // (the timer IRQ **and** every `yield_current` - scheduler.rs), so yielding here inflates the
     // very counter we use as the clock: 50 yields/iteration drove it past the budget in ~4 ms and
-    // the wait collapsed to nothing (the bug that bit the T630 twice — first as a yield-count wait,
+    // the wait collapsed to nothing (the bug that bit the T630 twice - first as a yield-count wait,
     // then as a yield-polluted tick wait). `registry_lookup` already blocks on `recv` for the
-    // registry's reply — a cooperative wait that lets the registry and the filter run and does NOT
+    // registry's reply - a cooperative wait that lets the registry and the filter run and does NOT
     // bump the tick counter (`block_and_reschedule` doesn't). So a plain retry loop is both
     // cooperative (each iteration deschedules on the IPC) and real-time-bounded: with no yields the
-    // counter advances ~only on the 100 Hz timer IRQ — a true wall-clock.
+    // counter advances ~only on the 100 Hz timer IRQ - a true wall-clock.
     // Path C (Phase 4): resolve the sink via the kernel name-directory (SEND|GRANT, so the cap can
     // be delegated to the producer) instead of the registry service. The directory is populated
     // synchronously at the sink's spawn, so this normally succeeds on the first iteration; the
@@ -3067,7 +3067,7 @@ fn lookup_sink(ctx: &ServiceContext, sink: &str) -> Option<CapHandle> {
 }
 
 /// How long `lookup_sink` waits (in 10 ms timer ticks, §9.1) for a freshly-spawned filter to
-/// register its input endpoint. ~5 s — comfortably over the observed worst-case first-run latency
+/// register its input endpoint. ~5 s - comfortably over the observed worst-case first-run latency
 /// (~1 s) on the T630 under selfcheck load, with margin.
 const FILTER_WAIT_TICKS: u64 = 500;
 
@@ -3080,9 +3080,9 @@ fn cmd_kill(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
         // The shell is restartable now ("nothing escapes"): self-kill, and the supervisor respawns a
         // fresh prompt. The kernel's self-kill path defers our stack/PML4 reclaim (it is exactly how
         // every page fault already kills the running task), and our death notifies the supervisor,
-        // which respawns us. The in-flight session is lost — a re-init, not a resume (§14.2/§25). We
+        // which respawns us. The in-flight session is lost - a re-init, not a resume (§14.2/§25). We
         // yield forever after the kill so we never execute again as the dead instance.
-        ctx.console_writeln("kill shell: restarting this session — a fresh prompt is coming (in-flight state is lost)…");
+        ctx.console_writeln("kill shell: restarting this session - a fresh prompt is coming (in-flight state is lost)…");
         match ctx.kill("shell") {
             Ok(())  => loop { ctx.yield_cpu(); },
             Err(_)  => { ctx.console_writeln("kill shell: failed"); return Err(ShellError::Unknown); }
@@ -3125,13 +3125,13 @@ fn cmd_restart(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<()
     }
 }
 
-// ── chaos — a BOUNDED resilience exerciser (not a generic firehose) ──────────────────────────────
+// ── chaos - a BOUNDED resilience exerciser (not a generic firehose) ──────────────────────────────
 // Each mode stresses ONE named invariant through the shell's EXISTING capabilities (no new kernel
 // surface), runs a bounded number of rounds, and reports a loud verdict (§26.6). It never touches
-// the TCB (init/supervisor) — their death is a reboot, not graceful degradation, so there is nothing
+// the TCB (init/supervisor) - their death is a reboot, not graceful degradation, so there is nothing
 // to observe. v1 ships `kill-storm` (restartability); flooding/memory-pressure are future modes.
 
-/// Services the supervisor AUTO-restarts on unexpected death (its death-notification loop —
+/// Services the supervisor AUTO-restarts on unexpected death (its death-notification loop -
 /// services/supervisor). Only these recover from a bare `kill`, so only these make sense as a
 /// kill-storm target.
 // Directly-restartable services: their OWN death notifies the supervisor, which respawns them
@@ -3141,16 +3141,16 @@ fn cmd_restart(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<()
 // removed Phase 5; xhci/ehci/logger made directly-restartable so max-carnage can't leave them dead.)
 const CHAOS_RESTARTABLE: [&str; 6] = ["supervisor", "block-driver", "fs", "xhci", "ehci", "logger"];
 const CHAOS_DEFAULT_ROUNDS: u32 = 20;
-const CHAOS_MAX_ROUNDS: u32 = 100;        // bounded (§26.6) — a deliberate cap, not a firehose
+const CHAOS_MAX_ROUNDS: u32 = 100;        // bounded (§26.6) - a deliberate cap, not a firehose
 // Per-round recovery wait is bounded by REAL wall-clock time (RTC seconds), not a yield count. A
 // yield count is not portable: it was generous in QEMU but too short on the T630 for the heavier,
 // kernel-driven SUPERVISOR respawn, so `chaos kill-storm supervisor` undercounted recoveries there
-// (the supervisor *did* recover every time — observe showed it — but chaos gave up waiting). 8 s is
+// (the supervisor *did* recover every time - observe showed it - but chaos gave up waiting). 8 s is
 // generous; the loop breaks early the instant a new generation appears, so fast targets (fs) stay fast.
 const CHAOS_RECOVER_SECS: i64 = 8;
 const CHAOS_POLL_EVERY: u32 = 64;         // yields between gen/clock polls (a task_stat scan isn't free)
 // After the storm, the target's task has respawned (recovery detected via its task generation),
-// but a heavy service like `fs` is not yet *serving* — it still has to re-mount and re-register,
+// but a heavy service like `fs` is not yet *serving* - it still has to re-mount and re-register,
 // and its restart log burst is still draining off the serial line. Settle before reporting (so the
 // report isn't shredded by that burst on the bounded-THRE serial path) and before saving (so an
 // `fs`-target save can actually reach a re-registered fs). Bounded (§26.6); §14.3 retry pattern.
@@ -3163,7 +3163,7 @@ const CARNAGE_MAX_CAND: usize = 32;       // bounded snapshot of live killable t
 const CARNAGE_PROGRESS_EVERY: u64 = 100;  // update the in-place progress line every N rounds
 
 /// Save `data` to the already-resolved absolute path `ppath`, retrying for up to
-/// `CHAOS_SAVE_TOTAL_SECS` of WALL-CLOCK time while `fs` finishes re-mounting after a chaos storm —
+/// `CHAOS_SAVE_TOTAL_SECS` of WALL-CLOCK time while `fs` finishes re-mounting after a chaos storm -
 /// reacquiring a fresh `fs` cap each round (it may have just respawned). Bounded: `save_report` is
 /// itself wall-clock-bounded, so this never hangs; it gives up gracefully when fs won't stabilise.
 fn chaos_save_retry(ctx: &ServiceContext, ppath: &[u8], data: &[u8]) -> bool {
@@ -3178,7 +3178,7 @@ fn chaos_save_retry(ctx: &ServiceContext, ppath: &[u8], data: &[u8]) -> bool {
 const CARNAGE_MAX_SVC: usize = 16;        // distinct services tracked in the aggregate tally (~6–8 real)
 // max-carnage takes NO round cap: it runs exactly the count you type. The report is per-SERVICE
 // AGGREGATES (killed/recovered counts), constant memory regardless of round count, and each round
-// reclaims the dead instance before respawning — so the round count is a loop counter, not a resource
+// reclaims the dead instance before respawning - so the round count is a loop counter, not a resource
 // (§26.6 bounds resources, not counters; same reasoning as the unbounded supervisor respawn, §6.2).
 // The only bound is the parsed `u32` and `q`, which aborts early. (kill-storm DOES cap rounds at
 // CHAOS_MAX_ROUNDS because it stores per-round generation detail in fixed arrays.)
@@ -3195,8 +3195,8 @@ fn chaos_wait_alive(ctx: &ServiceContext, name: &str) {
     }
 }
 
-/// Wait (real wall-clock bounded, RTC — not a yield count, which isn't portable across QEMU/hardware)
-/// for `name` to reach a generation different from `og` — proof a fresh instance came up (§7.5). Yields
+/// Wait (real wall-clock bounded, RTC - not a yield count, which isn't portable across QEMU/hardware)
+/// for `name` to reach a generation different from `og` - proof a fresh instance came up (§7.5). Yields
 /// cooperatively so the recoverer (sharing core 0) runs. Returns true on recovery, false on timeout.
 fn chaos_wait_recovery(ctx: &ServiceContext, name: &str, og: u32) -> bool {
     let t0 = ctx.datetime().epoch_secs();
@@ -3212,7 +3212,7 @@ fn chaos_wait_recovery(ctx: &ServiceContext, name: &str, og: u32) -> bool {
 }
 
 fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
-    // Tokenize the raw line ourselves — `chaos kill-storm <svc> [rounds] [save <path>]` runs past
+    // Tokenize the raw line ourselves - `chaos kill-storm <svc> [rounds] [save <path>]` runs past
     // the shell's MAX_ARGS=4 tokenizer (6 tokens), so we can't rely on the shared `args` array.
     let mut tok: [&str; 8] = [""; 8];
     let mut ntok = 0;
@@ -3222,7 +3222,7 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
     }
     if ntok == 0 {
         ctx.console_writeln("usage: chaos kill-storm <service> [rounds] [save <path>]   (service: supervisor | block-driver | fs)");
-        ctx.console_writeln("       chaos max-carnage [rounds] [save <path>]            (kill a RANDOM live service each round — all but the shell)");
+        ctx.console_writeln("       chaos max-carnage [rounds] [save <path>]            (kill a RANDOM live service each round - all but the shell)");
         return Err(ShellError::Unknown);
     }
     match tok[0] {
@@ -3236,17 +3236,17 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
     }
 }
 
-/// `chaos kill-storm <svc> [rounds] [save <path>]` — kill the service `rounds` times; each round,
+/// `chaos kill-storm <svc> [rounds] [save <path>]` - kill the service `rounds` times; each round,
 /// wait for the supervisor's death-notification loop to respawn it (a higher restart generation = a
 /// new instance) and count it recovered. Returns `Ok` only if every round recovered; the kernel
 /// never panicking is proven by the command *returning at all* (a panic reboots). Bounded + loud
 /// (§26.6), capability-clean: only `kill` (SERVICE_CONTROL) + `task_stat` (INTROSPECT), both held.
 ///
-/// **The report avoids a catch-22.** Each round is recorded in MEMORY only — chaos never touches fs
+/// **The report avoids a catch-22.** Each round is recorded in MEMORY only - chaos never touches fs
 /// during the storm, so `chaos kill-storm fs` does not write its log to the very thing it is killing.
 /// At the end the report is built in a bounded buffer and printed to the **console** (fs-independent,
 /// captured by the serial log); an optional `save <path>` then materialises it to a file once the
-/// target has recovered (best-effort — if fs was the target and is down, it falls back to the console).
+/// target has recovered (best-effort - if fs was the target and is down, it falls back to the console).
 #[inline(never)]
 fn chaos_kill_storm(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
     if ntok < 2 {
@@ -3256,7 +3256,7 @@ fn chaos_kill_storm(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize) 
     let svc = tok[1];
     if !CHAOS_RESTARTABLE.contains(&svc) {
         ctx.console_writeln_fmt(format_args!(
-            "chaos: '{}' is not a recoverable target — only supervisor/block-driver/fs recover on death (the supervisor respawns the services; the kernel respawns the supervisor). The kernel itself cannot be killed.", svc));
+            "chaos: '{}' is not a recoverable target - only supervisor/block-driver/fs recover on death (the supervisor respawns the services; the kernel respawns the supervisor). The kernel itself cannot be killed.", svc));
         return Err(ShellError::Unknown);
     }
     // Parse [rounds] and [save <path>] in any order after the service. `rounds` is a bare number;
@@ -3276,7 +3276,7 @@ fn chaos_kill_storm(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize) 
     }
 
     ctx.console_writeln_fmt(format_args!(
-        "chaos kill-storm {}: {} rounds — kill, then wait for the supervisor to respawn it...", svc, rounds));
+        "chaos kill-storm {}: {} rounds - kill, then wait for the supervisor to respawn it...", svc, rounds));
 
     // Per-round results, tracked in MEMORY (no fs while we storm). Bounded by CHAOS_MAX_ROUNDS.
     let mut old_g = [0u32; CHAOS_MAX_ROUNDS as usize];
@@ -3285,8 +3285,8 @@ fn chaos_kill_storm(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize) 
     let mut recovered = 0u32;
     for r in 0..rounds as usize {
         // Ensure the target is ALIVE before we read its generation and kill it (it may still be
-        // mid-respawn from the previous round — esp. the supervisor, Phase 6). Then kill, and wait
-        // for a NEW generation (a respawn bumps it, §7.5) — both bounded by real wall-clock time.
+        // mid-respawn from the previous round - esp. the supervisor, Phase 6). Then kill, and wait
+        // for a NEW generation (a respawn bumps it, §7.5) - both bounded by real wall-clock time.
         chaos_wait_alive(ctx, svc);
         let og = gen_of(ctx, svc).unwrap_or(0);
         old_g[r] = og;
@@ -3296,7 +3296,7 @@ fn chaos_kill_storm(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize) 
         }
     }
 
-    // Build the report in a bounded buffer (at the END — nothing was written to fs during the storm).
+    // Build the report in a bounded buffer (at the END - nothing was written to fs during the storm).
     use core::fmt::Write as _;
     let mut rb = ReportBuf::new();
     let _ = writeln!(rb, "=== chaos kill-storm {}: report ===", svc);
@@ -3309,7 +3309,7 @@ fn chaos_kill_storm(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize) 
             let _ = writeln!(rb, "round {:>3}: killed gen {} -> NOT RECOVERED (wait bound exceeded)", r + 1, old_g[r]);
         }
     }
-    let _ = writeln!(rb, "recovered: {}/{}; kernel: alive (no panic — this command returned)", recovered, rounds);
+    let _ = writeln!(rb, "recovered: {}/{}; kernel: alive (no panic - this command returned)", recovered, rounds);
     let _ = writeln!(rb, "verdict: {}", if recovered == rounds { "PASS" } else { "FAIL" });
     if rb.overflow { let _ = writeln!(rb, "(report truncated at {} KiB)", REPORT_MAX / 1024); }
 
@@ -3318,7 +3318,7 @@ fn chaos_kill_storm(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize) 
     // serial path drops bytes under a cross-core flood) and an `fs`-target save can reach a live fs.
     for _ in 0..CHAOS_SETTLE_YIELDS { ctx.yield_cpu(); }
 
-    // Always print to the console — fs-independent, so even an `fs` storm reports cleanly.
+    // Always print to the console - fs-independent, so even an `fs` storm reports cleanly.
     console_write_chunked(ctx, rb.bytes());
     // Optionally materialise to a file, now that the target has recovered. Best-effort with a bounded
     // retry: if fs was the target it may still be finishing its remount, so retry the save a few times
@@ -3332,23 +3332,23 @@ fn chaos_kill_storm(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize) 
                 ctx.console_writeln_fmt(format_args!("chaos: report saved to {}", str_of(&ppath[..pl])));
             } else {
                 ctx.console_writeln_fmt(format_args!(
-                    "chaos: could not save to {} (fs unavailable — it may have been the target; the report above stands)", str_of(&ppath[..pl])));
+                    "chaos: could not save to {} (fs unavailable - it may have been the target; the report above stands)", str_of(&ppath[..pl])));
             }
         }
     }
     if recovered == rounds { Ok(()) } else { Err(ShellError::Unknown) }
 }
 
-/// xorshift64 — a tiny, fast PRNG. Not cryptographic; just enough to pick victims at random.
+/// xorshift64 - a tiny, fast PRNG. Not cryptographic; just enough to pick victims at random.
 fn xorshift64(mut x: u64) -> u64 {
     x ^= x << 13; x ^= x >> 7; x ^= x << 17; x
 }
 
-/// `chaos max-carnage [rounds] [save <path>]` — the chaos monkey. Each round, snapshot the LIVE task
-/// set (exactly what `observe now` shows), pick one at **random**, and kill it — everything is fair
+/// `chaos max-carnage [rounds] [save <path>]` - the chaos monkey. Each round, snapshot the LIVE task
+/// set (exactly what `observe now` shows), pick one at **random**, and kill it - everything is fair
 /// game **except the shell itself** (killing it would kill this command) and the **kernel** (which is
 /// not a task and cannot be killed). Recoverable victims (supervisor/block-driver/fs) are confirmed
-/// back up; the rest stay dead (nothing auto-restarts them — expected). The headline proof is that the
+/// back up; the rest stay dead (nothing auto-restarts them - expected). The headline proof is that the
 /// **kernel survives ANY sequence of random service deaths**: the command returning at all means no
 /// panic (a panic reboots). Random source: the TSC, advanced by xorshift64. Bounded + loud (§26.6):
 /// rounds clamped 1..=100, a fixed candidate snapshot per round.
@@ -3356,7 +3356,7 @@ fn xorshift64(mut x: u64) -> u64 {
 fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
     // [rounds] [save] after tok[0] = "max-carnage". `save` is accepted but deliberately NOT honoured:
     // max-carnage destroys fs, so writing the report TO fs is a catch-22 that fights the storm (it
-    // hung/wedged the session and even cost the keyboard). The console IS the record — it is the
+    // hung/wedged the session and even cost the keyboard). The console IS the record - it is the
     // kernel's framebuffer+serial, not a service, so chaos can't touch it, and the terminal captures it.
     let mut rounds = CHAOS_DEFAULT_ROUNDS;
     let mut save_requested = false;
@@ -3368,22 +3368,26 @@ fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
         } else if let Some(n) = parse_u32(tok[i]) { rounds = n; i += 1; }
         else { i += 1; }
     }
-    let rounds = rounds.max(1) as u64;   // no upper cap — run exactly what was typed (q aborts)
+    let rounds = rounds.max(1) as u64;   // no upper cap - run exactly what was typed (q aborts)
 
     // RNG seed: the TSC (high-resolution, varies run to run), mixed with the wall clock. Never zero.
     let mut rng = ctx.read_tsc()
         ^ (ctx.datetime().epoch_secs() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     if rng == 0 { rng = 0xDEAD_BEEF_CAFE_F00D; }
 
+    // Wall-clock start (RTC), for the heartbeat's % + ETA. ETA is a running average: remaining rounds
+    // ÷ the rate so far (done ÷ elapsed seconds) - blank until ≥1 s has elapsed, then it settles.
+    let t0 = ctx.datetime().epoch_secs();
+
     ctx.console_writeln_fmt(format_args!(
-        "chaos max-carnage: {} rounds — kill a RANDOM live service each round (all but the shell). Press q to abort.", rounds));
+        "chaos max-carnage: {} rounds - kill a RANDOM live service each round (all but the shell). Press q to quit.", rounds));
     if save_requested {
-        ctx.console_writeln("(note: max-carnage doesn't save to disk — it destroys fs, so a save would fight the storm. The report below IS the record.)");
+        ctx.console_writeln("(note: max-carnage doesn't save to disk - it destroys fs, so a save would fight the storm. The report below IS the record.)");
     }
 
-    // Per-SERVICE aggregate tally (bounded — a handful of distinct services, NOT per-round). Constant
+    // Per-SERVICE aggregate tally (bounded - a handful of distinct services, NOT per-round). Constant
     // memory regardless of round count, so the run goes as long as you like and the report is always
-    // COMPLETE — never "the last N rounds", nothing silently truncated.
+    // COMPLETE - never "the last N rounds", nothing silently truncated.
     let mut sv_name:   [[u8; 24]; CARNAGE_MAX_SVC] = [[0u8; 24]; CARNAGE_MAX_SVC];
     let mut sv_nlen:   [usize;    CARNAGE_MAX_SVC] = [0usize;    CARNAGE_MAX_SVC];
     let mut sv_killed: [u64;      CARNAGE_MAX_SVC] = [0u64;      CARNAGE_MAX_SVC];
@@ -3454,8 +3458,19 @@ fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
         // framebuffer/serial (not a service), so it survives the carnage. `\r` rewrites the line in
         // place (no scroll); the trailing spaces clear the previous, shorter count.
         if done % CARNAGE_PROGRESS_EVERY == 0 {
-            ctx.console_write_fmt(format_args!(
-                "\rmax-carnage: round {} / {} — {} kills, kernel alive — press q to abort     ", done, rounds, killed));
+            // done >= CARNAGE_PROGRESS_EVERY > 0 here, so the ETA only guards on elapsed.
+            let pct = done * 100 / rounds;
+            let elapsed = (ctx.datetime().epoch_secs() - t0).max(0) as u64;
+            if elapsed > 0 {
+                let eta = (rounds - done) * elapsed / done;   // remaining / (done/elapsed) rate, seconds
+                ctx.console_write_fmt(format_args!(
+                    "\rmax-carnage: {} / {} ({}%) - {} kills - ETA {}m{:02}s - kernel alive - q to quit    ",
+                    done, rounds, pct, killed, eta / 60, eta % 60));
+            } else {
+                ctx.console_write_fmt(format_args!(
+                    "\rmax-carnage: {} / {} ({}%) - {} kills - ETA --m--s - kernel alive - q to quit    ",
+                    done, rounds, pct, killed));
+            }
         }
     }
     ctx.console_writeln("");   // end the in-place heartbeat line before the report
@@ -3466,9 +3481,9 @@ fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
     use core::fmt::Write as _;
     let mut rb = ReportBuf::new();
     let _ = writeln!(rb, "=== chaos max-carnage: report ===");
-    if aborted { let _ = writeln!(rb, "ABORTED by user (q) after {} rounds", done); }
+    if aborted { let _ = writeln!(rb, "stopped early at round {} (you pressed q)", done); }
     let _ = writeln!(rb, "rounds: {}; victims killed: {}", done, killed);
-    // Per-service aggregate — COMPLETE for any round count (bounded memory, never truncated).
+    // Per-service aggregate - COMPLETE for any round count (bounded memory, never truncated).
     for s in 0..nsv {
         let name = str_of(&sv_name[s][..sv_nlen[s]]);
         if CHAOS_RESTARTABLE.contains(&name) {
@@ -3478,8 +3493,8 @@ fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
         }
     }
     let _ = writeln!(rb, "directly-restarted recoveries confirmed: {}/{}", recovered, recoverable_killed);
-    let _ = writeln!(rb, "kernel: SURVIVED {} random kills (no panic — this command returned)", killed);
-    // Survivors live now — a built-in `observe now` so the final state is in the report itself. Bounded.
+    let _ = writeln!(rb, "kernel: SURVIVED {} random kills (no panic - this command returned)", killed);
+    // Survivors live now - a built-in `observe now` so the final state is in the report itself. Bounded.
     let _ = write!(rb, "survivors (live now):");
     let mut nlive = 0u32;
     for slot in 0..256u32 {
@@ -3492,12 +3507,12 @@ fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
             }
         }
     }
-    if nlive > 16 { let _ = write!(rb, " …"); }
+    if nlive > 16 { let _ = write!(rb, " ..."); }
     let _ = writeln!(rb, "  ({} live)", nlive);
-    // The test is that the KERNEL survives arbitrary carnage — proven by this report existing at all
+    // The test is that the KERNEL survives arbitrary carnage - proven by this report existing at all
     // (a panic would have rebooted before it printed). PASS = survived; a recoverable victim missing a
-    // recovery (the §6.2 supervisor-downtime edge case) is reported per-service but does not fail it.
-    let _ = writeln!(rb, "verdict: {}", if aborted { "ABORTED (kernel survived)" } else { "PASS (kernel survived)" });
+    // recovery (the supervisor-downtime edge case, §6.2) is reported per-service but does not fail it.
+    let _ = writeln!(rb, "verdict: PASS (kernel survived)");
     if rb.overflow { let _ = writeln!(rb, "(report truncated at {} KiB)", REPORT_MAX / 1024); }
 
     // No save: max-carnage destroys fs, so the console IS the record (kernel-owned, captured by the
@@ -3508,14 +3523,14 @@ fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
 }
 
 // ---------------------------------------------------------------------------
-// File commands — ls / read / write / mkdir / cd (utilities/16..20). Shell built-ins
+// File commands - ls / read / write / mkdir / cd (utilities/16..20). Shell built-ins
 // that send the fs file API to `fs` over IPC; `fs` holds + enforces all disk authority.
 // The shell tracks the current location (a drive+directory pointer) and resolves
-// relative / `.` / `..` paths to an absolute path before sending — fs only walks
+// relative / `.` / `..` paths to an absolute path before sending - fs only walks
 // absolute paths from root (it has no notion of "current directory").
 // ---------------------------------------------------------------------------
 
-/// The current directory on the (single) drive — an absolute path like "/" or "/etc". Also
+/// The current directory on the (single) drive - an absolute path like "/" or "/etc". Also
 /// remembers the *previous* directory so `cd -` can toggle back (both default to root).
 struct Cwd {
     buf: [u8; PATH_MAX],
@@ -3660,7 +3675,7 @@ fn fs_stat(ctx: &ServiceContext, path: &[u8]) -> Option<(u64, bool)> {
 }
 
 /// Read up to `IO_CHUNK` bytes from `path` at byte `offset` into `out`; returns bytes read
-/// (0 at EOF). One message — the building block for streaming a large file.
+/// (0 at EOF). One message - the building block for streaming a large file.
 fn fs_read_at(ctx: &ServiceContext, path: &[u8], offset: u64, out: &mut [u8]) -> Option<usize> {
     let mut tail = [0u8; 12];
     tail[..8].copy_from_slice(&offset.to_le_bytes());
@@ -3695,17 +3710,17 @@ fn fs_write_at(ctx: &ServiceContext, path: &[u8], offset: u64, chunk: &[u8]) -> 
              Some(r) if r.payload_bytes().first() == Some(&FS_OK))
 }
 
-/// True if `fs` replied "no filesystem" — print the standard hint and consume it.
+/// True if `fs` replied "no filesystem" - print the standard hint and consume it.
 fn no_fs(ctx: &ServiceContext, p: &[u8]) -> bool {
     if p.first() == Some(&FS_NOFS) {
-        ctx.console_writeln("no filesystem — run 'drives flash' first");
+        ctx.console_writeln("no filesystem - run 'drives flash' first");
         true
     } else {
         false
     }
 }
 
-/// `ls [path]` — list a directory.
+/// `ls [path]` - list a directory.
 fn cmd_ls(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
@@ -3742,7 +3757,7 @@ fn cmd_ls(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(
     Ok(())
 }
 
-/// `read <path>` — print a file's contents. The first command on the Ok/Err `Result` model:
+/// `read <path>` - print a file's contents. The first command on the Ok/Err `Result` model:
 /// `Ok(())` when the file was read, `Err(FileNotFound)` when it does not exist, `Err(Unknown)`
 /// for other failures (bad path, storage unavailable) until those get their own variants. The
 /// human-readable detail is still printed; the `Result` is the category.
@@ -3754,20 +3769,20 @@ fn fc_open(ctx: &ServiceContext, path: &[u8], rights: u8) -> Option<CapHandle> {
 
 /// Invoke a file cap (§7.10): the kernel validates `file` holds `right`, badges the request, and
 /// routes it to fs; fs replies on our endpoint. `None` means the kernel rejected the invocation
-/// (the cap lacks `right` — non-escalation — or is stale/revoked), so no reply comes back.
+/// (the cap lacks `right` - non-escalation - or is stale/revoked), so no reply comes back.
 fn fc_invoke(ctx: &ServiceContext, file: CapHandle, right: u8, payload: &[u8]) -> Option<Message> {
     let self_grant = ctx.self_grant_handle()?;
     let reply = ctx.derive_cap(self_grant)?;
     if ctx.resource_invoke(file, right, reply, &Message::from_bytes(payload)).is_err() {
-        ctx.remove_cap(reply); // kernel didn't consume it (validation failed) — don't leak the slot
+        ctx.remove_cap(reply); // kernel didn't consume it (validation failed) - don't leak the slot
         return None;
     }
     Some(ctx.recv())
 }
 
-/// `fcap` — self-contained demonstration AND self-check of file-as-capability (§7.10). It is a
+/// `fcap` - self-contained demonstration AND self-check of file-as-capability (§7.10). It is a
 /// DIAGNOSTIC, not a file tool: it creates its own throwaway file, exercises every property the
-/// capability model promises against it, then deletes it — so it never touches a file of yours
+/// capability model promises against it, then deletes it - so it never touches a file of yours
 /// and takes no argument. Each line is asserted by `osdev test file-cap` (§22 Test 14).
 const FCAP_TMP: &[u8] = b"/.fcap-selftest";
 const FCAP_TMP_RENAMED: &[u8] = b"/.fcap-selftest.renamed";
@@ -3842,7 +3857,7 @@ fn cmd_fcap(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
         Some(_) => { fail(ctx, "fcap: FAIL ro cap wrote (escalation!)"); ok = false; }
     }
 
-    // 6. Non-escalation, fs layer: declare READ (kernel passes) but send a WRITE op — fs refuses
+    // 6. Non-escalation, fs layer: declare READ (kernel passes) but send a WRITE op - fs refuses
     //    because the op needs more than the badged right (op ≤ right, FS_DENIED).
     match fc_invoke(ctx, ro, RIGHT_READ, &wbuf) {
         Some(r) if r.payload_bytes().first() == Some(&FS_DENIED) => ctx.console_writeln("fcap: fs refused write under read right (op<=right)"),
@@ -3863,7 +3878,7 @@ fn cmd_fcap(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
     }
 
     // 9. Revocable on path rebinding (confused-deputy avoidance, §7.10): renaming the file makes
-    //    the old path name something else, so fs revokes the still-open `ro` cap — it can never
+    //    the old path name something else, so fs revokes the still-open `ro` cap - it can never
     //    silently rebind to a different file later created at the old path.
     let _ = fs_request(ctx, OP_RENAME, path, b".fcap-selftest.renamed");
     match fc_invoke(ctx, ro, RIGHT_READ, &rbuf) {
@@ -3887,15 +3902,15 @@ fn cmd_fcap(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
 // A modeless full-screen editor (title bar, text area, bottom status bar), modelled after
 // Microsoft's `edit`. Files of ANY size are editable: this is a **bounded piece table** (no heap,
 // §26.6). The original file stays on disk and is read in IO_CHUNK windows (`fs_read_at`) as you
-// scroll — only the visible window is ever materialised (the "scroll millions of lines" property).
+// scroll - only the visible window is ever materialised (the "scroll millions of lines" property).
 // Edits never touch the original: typed bytes go into a fixed `add` buffer, and the document is an
 // ordered list of `Piece` spans into either the original file or the add buffer. Save streams the
 // spans out to a temp file and atomically replaces the original, then RESETS the add buffer + span
-// list — so the only bound is how much you edit *between saves*, not the file size. When the add
+// list - so the only bound is how much you edit *between saves*, not the file size. When the add
 // buffer or span list fills, the edit is refused loudly (the status bar says to save), never
 // silently dropped (§26.7). Rendering uses only the CSI subset the serial terminal AND the fbcon
 // support (`arch/x86_64/fb.rs`): cursor position, erase-to-EOL, show/hide; reverse-video bars are
-// SGR (pretty on serial, plain on the fbcon — it ignores the unsupported escape, no garbage).
+// SGR (pretty on serial, plain on the fbcon - it ignores the unsupported escape, no garbage).
 const EDIT_COLS_MAX: usize = 256;          // bar-render scratch width cap; also caps render cols
 const EDIT_TAB: usize = 4;                 // Tab inserts this many spaces
 const EDIT_ADD_MAX: usize = 32 * 1024;     // add-buffer: new typed bytes between saves (save resets)
@@ -3905,14 +3920,14 @@ const EDIT_TMP: &[u8] = b"/.edit.tmp";     // save staging file (root → no dir
 
 /// One span of the document: `len` bytes starting at `start` in either the original file on disk
 /// (`add == false`) or the in-memory add buffer (`add == true`). The document is the ordered
-/// concatenation of all live pieces. Edits never modify the original — they append typed bytes to
+/// concatenation of all live pieces. Edits never modify the original - they append typed bytes to
 /// `add` and rewrite the span list.
 #[derive(Clone, Copy)]
 struct Piece { add: bool, start: u32, len: u32 }
 
 /// A bounded piece-table editor. The original file stays on disk and is read in IO_CHUNK windows
 /// (`cache`) on demand; typed bytes accumulate in `add`; the document is `pieces[..npieces]`.
-/// Cursor/scroll are logical byte offsets into the document. Fixed-size — no heap (§26.6); when
+/// Cursor/scroll are logical byte offsets into the document. Fixed-size - no heap (§26.6); when
 /// `add` or the span list fills, the edit is refused (`full = true`) and the status bar says so
 /// rather than silently dropping it (§26.7). A save streams the spans to disk and RESETS `add` +
 /// the span list, so the only bound is how much is edited *between* saves, not the file size.
@@ -3933,7 +3948,7 @@ struct Editor {
     rows:      usize,
     cols:      usize,
     modified:  bool,
-    full:      bool,              // a recent edit was refused (add/pieces full) — drives the hint
+    full:      bool,              // a recent edit was refused (add/pieces full) - drives the hint
 }
 
 impl Editor {
@@ -4114,7 +4129,7 @@ impl Editor {
     fn move_right(&mut self) { if self.cur < self.total { self.cur += 1; } }
 
     /// Logical offset of the start of the line containing `pos` (just after the previous '\n', or
-    /// 0). Bounded by EDIT_LINE_MAX — a longer line falls back to that many bytes back.
+    /// 0). Bounded by EDIT_LINE_MAX - a longer line falls back to that many bytes back.
     fn line_start(&mut self, ctx: &ServiceContext, pos: usize) -> usize {
         let mut i = pos;
         let mut steps = 0;
@@ -4134,7 +4149,7 @@ impl Editor {
         }
         i
     }
-    /// Count of '\n' bytes in `[from, to)` — the number of line breaks between two offsets.
+    /// Count of '\n' bytes in `[from, to)` - the number of line breaks between two offsets.
     fn lines_between(&mut self, ctx: &ServiceContext, from: usize, to: usize) -> usize {
         let mut n = 0; let mut i = from;
         while i < to { if self.byte_at(ctx, i) == Some(b'\n') { n += 1; } i += 1; }
@@ -4178,7 +4193,7 @@ impl Editor {
     }
 }
 
-/// A bounded `fmt::Write` sink over a stack slice — used to format a status/title bar string
+/// A bounded `fmt::Write` sink over a stack slice - used to format a status/title bar string
 /// before padding it to the bar width. Drops anything past the slice (the bar is clipped anyway).
 struct BarW<'a> { b: &'a mut [u8], n: usize }
 impl core::fmt::Write for BarW<'_> {
@@ -4206,9 +4221,9 @@ fn edit_bar(ctx: &ServiceContext, text: &[u8], width: usize) {
 }
 
 /// Repaint the whole screen for `ed`. Adjusts scroll so the cursor stays visible (a line at a
-/// time, scanning only across the viewport — never the whole file), draws the title bar, the
+/// time, scanning only across the viewport - never the whole file), draws the title bar, the
 /// visible text rows materialised from the piece table through the window cache, the status bar,
-/// then parks the terminal cursor. Only the visible window is ever read — the iOS-scroll property.
+/// then parks the terminal cursor. Only the visible window is ever read - the iOS-scroll property.
 fn edit_render(ctx: &ServiceContext, ed: &mut Editor, name: &[u8]) {
     use core::fmt::Write as _;
     let textrows = ed.rows.saturating_sub(2).max(1); // rows between the title and status bars
@@ -4264,14 +4279,14 @@ fn edit_render(ctx: &ServiceContext, ed: &mut Editor, name: &[u8]) {
     }
 
     // Status bar (last row): key hints + position. One cell short of full width so writing it on
-    // the bottom row can never trigger an auto-wrap that scrolls the screen. No absolute "Ln" —
+    // the bottom row can never trigger an auto-wrap that scrolls the screen. No absolute "Ln" -
     // that would need a scan from offset 0 (O(file)); Col + byte offset are O(viewport).
     edit_goto(ctx, ed.rows, 1);
     {
         let mut t = [0u8; EDIT_COLS_MAX];
         let mut w = BarW { b: &mut t, n: 0 };
         if ed.full {
-            let _ = write!(w, " edit buffer full — Ctrl-S to save & continue    Col {}   {} bytes",
+            let _ = write!(w, " edit buffer full - Ctrl-S to save & continue    Col {}   {} bytes",
                 col + 1, ed.total);
         } else {
             let _ = write!(w, " Ctrl-S save   Ctrl-Q quit      Col {}   {} bytes   (buf {}/{})",
@@ -4327,7 +4342,7 @@ fn edit_save(ctx: &ServiceContext, ed: &mut Editor) -> bool {
         ed.npieces = 1;
     }
     ed.add_len = 0;
-    ed.cache_len = 0;   // the on-disk file changed — invalidate the window
+    ed.cache_len = 0;   // the on-disk file changed - invalidate the window
     ed.full = false;
     ed.modified = false;
     true
@@ -4380,7 +4395,7 @@ fn edit_try_quit(ctx: &ServiceContext, ed: &mut Editor) -> bool {
     }
 }
 
-#[inline(never)] // big stack frame (the piece table + add buffer) — keep it off hot call paths
+#[inline(never)] // big stack frame (the piece table + add buffer) - keep it off hot call paths
 fn cmd_edit(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Result<(), ShellError> {
     let arg = arg.trim();
     if arg.is_empty() {
@@ -4395,7 +4410,7 @@ fn cmd_edit(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Result<(), ShellError
     let path = &pcopy[..pl];
 
     // Stat first (existence / kind / size). A directory is refused; a missing file opens empty
-    // (created on first save); a file of ANY size opens — it's read in windows, never up front.
+    // (created on first save); a file of ANY size opens - it's read in windows, never up front.
     let mut orig_size = 0usize;
     if let Some(stat) = fs_request(ctx, OP_STAT_FILE, path, &[]) {
         let sp = stat.payload_bytes();
@@ -4452,7 +4467,7 @@ fn cmd_read(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     // Stat first (one message) to learn the size, then STREAM the content in IO_CHUNK pieces
-    // via read_at — so a file far larger than one IPC message reads back correctly without a
+    // via read_at - so a file far larger than one IPC message reads back correctly without a
     // big buffer here.
     let stat = match fs_request(ctx, OP_STAT_FILE, path, &[]) {
         Some(r) => r,
@@ -4485,9 +4500,9 @@ fn cmd_read(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result
 
 /// `write <path> [content]` overwrites; `write append|prepend <path> [content]` adds to the end /
 /// front (creating the file if missing). `append`/`prepend` are *leading* keywords because write's
-/// content is free-form — they can't trail the way `mkdir … parents` does (it would be swallowed as
+/// content is free-form - they can't trail the way `mkdir … parents` does (it would be swallowed as
 /// content). Append/prepend stream through a temp file (`fs_stream_combine`), so they are not bound
-/// by a small buffer; `prepend` is a full-file rewrite (no insert-at-front — honest, §26.7).
+/// by a small buffer; `prepend` is a full-file rewrite (no insert-at-front - honest, §26.7).
 fn cmd_write(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
     let (mode, rest) = parse_write_mode(rest);
     if rest.is_empty() {
@@ -4533,7 +4548,7 @@ fn cmd_write(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
     }
 }
 
-/// `mkdir <path> [parents]` — create a directory (with `parents`, create missing parents).
+/// `mkdir <path> [parents]` - create a directory (with `parents`, create missing parents).
 fn cmd_mkdir(ctx: &ServiceContext, cwd: &Cwd, arg: &str, parents: bool) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
@@ -4556,10 +4571,10 @@ fn cmd_mkdir(ctx: &ServiceContext, cwd: &Cwd, arg: &str, parents: bool) -> Resul
     }
 }
 
-/// `cd [path]` — change the current directory (validates it exists + is a directory).
+/// `cd [path]` - change the current directory (validates it exists + is a directory).
 fn cmd_cd(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
-    // `cd -` toggles to the previous directory (already an absolute, normalized path — use it
+    // `cd -` toggles to the previous directory (already an absolute, normalized path - use it
     // directly, then run the same stat-validated switch so a since-deleted dir errors loudly).
     let path: &[u8] = if arg == "-" {
         let pl = cwd.prev_len;
@@ -4568,7 +4583,7 @@ fn cmd_cd(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str) -> Result<(), ShellErr
     } else {
         match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) }
     };
-    // Root always exists — no need to stat it.
+    // Root always exists - no need to stat it.
     if path == b"/" {
         cwd.set(b"/");
         ctx.console_writeln("/");
@@ -4596,9 +4611,9 @@ fn cmd_cd(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str) -> Result<(), ShellErr
     }
 }
 
-/// `copy <src> <dst>` — copy a file by STREAMING it through fixed chunks (read_at/write_at),
+/// `copy <src> <dst>` - copy a file by STREAMING it through fixed chunks (read_at/write_at),
 /// so it copies files far larger than one IPC message with no whole-file buffer. File-only in
-/// this cut (no recursive dirs — that's `copy … recursive`).
+/// this cut (no recursive dirs - that's `copy … recursive`).
 fn cmd_copy(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) -> Result<(), ShellError> {
     let mut sbuf = [0u8; PATH_MAX];
     let spath = match resolve_or_err(ctx, cwd, src, &mut sbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
@@ -4637,10 +4652,10 @@ fn cmd_copy(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) -> Result<(),
     }
 }
 
-/// `copy <src> <dst> recursive` — copy a whole subtree. Reuses the SAME bounded walk
+/// `copy <src> <dst> recursive` - copy a whole subtree. Reuses the SAME bounded walk
 /// (`PathStack`) `find` uses (§26.6): pop a source dir, recreate it under `dst`, then for
 /// each child either copy the file (read+write, existing ops) or push the subdir. No new fs
-/// surface — copy already lives in the shell. Loud if the tree is wider than the walk's cap
+/// surface - copy already lives in the shell. Loud if the tree is wider than the walk's cap
 /// (§3.12), and refuses to copy a directory into its own subtree (would never terminate).
 fn cmd_copy_tree(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) -> Result<(), ShellError> {
     let mut sbuf = [0u8; PATH_MAX];
@@ -4708,7 +4723,7 @@ fn cmd_copy_tree(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) -> Resul
     }
     if stack.overflow {
         ctx.console_writeln_fmt(format_args!(
-            "copy: truncated — tree wider than {} pending directories (bounded walk)", FIND_QCAP));
+            "copy: truncated - tree wider than {} pending directories (bounded walk)", FIND_QCAP));
     }
     ctx.console_writeln_fmt(format_args!(
         "copied {} → {} ({} dirs, {} files)", str_of(&sp[..sl]), str_of(&dp[..dl]), dirs, files));
@@ -4764,7 +4779,7 @@ fn remap(dst_root: &[u8], src_root: &[u8], s: &[u8], out: &mut [u8; PATH_MAX]) -
     Some(dst_root.len() + suffix.len())
 }
 
-/// `rename <path> <newname>` — rename an entry in place (not a move; newname is one
+/// `rename <path> <newname>` - rename an entry in place (not a move; newname is one
 /// component). fs edits the directory entry; no blocks are read or freed.
 fn cmd_rename(ctx: &ServiceContext, cwd: &Cwd, path: &str, newname: &str) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
@@ -4772,7 +4787,7 @@ fn cmd_rename(ctx: &ServiceContext, cwd: &Cwd, path: &str, newname: &str) -> Res
     let mut pp = [0u8; PATH_MAX];
     let pl = abspath.len();
     pp[..pl].copy_from_slice(abspath);
-    // fs_request appends `newname` after the path — exactly the OP_RENAME wire format.
+    // fs_request appends `newname` after the path - exactly the OP_RENAME wire format.
     match fs_request(ctx, OP_RENAME, &pp[..pl], newname.as_bytes()) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
             ctx.console_writeln_fmt(format_args!("renamed {} → {}", str_of(&pp[..pl]), newname));
@@ -4784,7 +4799,7 @@ fn cmd_rename(ctx: &ServiceContext, cwd: &Cwd, path: &str, newname: &str) -> Res
     }
 }
 
-/// `delete <path>` — remove a file or empty directory; `delete <path> recursive` removes a
+/// `delete <path>` - remove a file or empty directory; `delete <path> recursive` removes a
 /// whole subtree. fs does the work either way (plain = `OP_DELETE`, recursive =
 /// `OP_DELETE_TREE`, a depth-bounded subtree free); it frees the blocks and reclaims them.
 fn cmd_delete(ctx: &ServiceContext, cwd: &Cwd, arg: &str, recursive: bool) -> Result<(), ShellError> {
@@ -4811,7 +4826,7 @@ fn cmd_delete(ctx: &ServiceContext, cwd: &Cwd, arg: &str, recursive: bool) -> Re
     }
 }
 
-/// `move <src> <dst>` — relocate an entry (same data; only the directory entries change).
+/// `move <src> <dst>` - relocate an entry (same data; only the directory entries change).
 fn cmd_move(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) -> Result<(), ShellError> {
     let mut sbuf = [0u8; PATH_MAX];
     let spath = match resolve_or_err(ctx, cwd, src, &mut sbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
@@ -4839,14 +4854,14 @@ fn cmd_move(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) -> Result<(),
     }
 }
 
-/// `find <pattern> [path]` — search a subtree (default the whole filesystem, `/`) for entries
+/// `find <pattern> [path]` - search a subtree (default the whole filesystem, `/`) for entries
 /// matching `<pattern>`, printing each match's full path. A plain word is a substring match; a
 /// pattern with `*`/`?` is a glob (anchored, whole-name). This is whole-filesystem
 /// enumeration done the disciplined way: a **tree walk** (the tree IS the index, §6.4),
 /// client-side via LIST_DIR so results stream as found and `fs` needs no new op. The walk
 /// is bounded (a fixed pending-directory stack) and **loud on truncation** (§26.6/§3.12);
 /// the `fs_index` accelerator (persistence.md §6.5) is what we'd build if this walk ever
-/// gets too slow on a huge tree — not before.
+/// gets too slow on a huge tree - not before.
 fn cmd_find(ctx: &ServiceContext, cwd: &Cwd, target: &str, start: &str, out: &mut Out) -> Result<(), ShellError> {
     let mut sbuf = [0u8; PATH_MAX];
     let start_abs = match resolve_or_err(ctx, cwd, start, &mut sbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
@@ -4893,7 +4908,7 @@ fn cmd_find(ctx: &ServiceContext, cwd: &Cwd, target: &str, start: &str, out: &mu
     }
     if stack.overflow {
         ctx.console_writeln_fmt(format_args!(
-            "find: search truncated — more than {} directories pending (bounded walk)", FIND_QCAP));
+            "find: search truncated - more than {} directories pending (bounded walk)", FIND_QCAP));
     }
     ctx.console_writeln_fmt(format_args!("find: {} match(es)", matches));
     Ok(()) // a search that finds nothing still succeeded (0 matches is not an error)
@@ -4904,13 +4919,13 @@ const TREE_MAX_DEPTH: usize = 32;
 /// Prefix scratch: up to `TREE_MAX_DEPTH` levels × the widest piece (`"│   "` = 6 bytes).
 const TREE_PREFIX_MAX: usize = TREE_MAX_DEPTH * 6;
 
-/// `tree [path]` — print the directory hierarchy with box-drawing connectors, like Unix `tree`
+/// `tree [path]` - print the directory hierarchy with box-drawing connectors, like Unix `tree`
 /// (default: the current directory). Same bounded-walk discipline as `find` (§26.6): a fixed-
 /// capacity explicit stack, depth-first, no recursion, loud on overflow (§3.12). A directory's
 /// whole subtree drains before its next sibling (LIFO + reverse-push), and each node records
 /// whether it is its parent's *last* child so the prefix draws `├──`/`└──` and `│`/blank
 /// continuation correctly. UTF-8: the fbcon decodes `├ └ │ ─` and renders light box glyphs;
-/// a trailing `/` still marks directories (the console is monochrome — no colour to lean on).
+/// a trailing `/` still marks directories (the console is monochrome - no colour to lean on).
 /// `#[inline(never)]`: holds the ~12 KiB `TreeStack` + prefix scratch off the hot pipe frame
 /// (it's a pipe producer; see [[project-shell-stack-pipe]]).
 #[inline(never)]
@@ -4985,7 +5000,7 @@ fn cmd_tree(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result
     }
     if stack.overflow {
         ctx.console_writeln_fmt(format_args!(
-            "tree: truncated — more than {} pending entries (bounded walk)", TREE_CAP));
+            "tree: truncated - more than {} pending entries (bounded walk)", TREE_CAP));
     }
     out.line(ctx, "");
     out.line_fmt(ctx, format_args!(
@@ -5066,7 +5081,7 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 
 /// Match `name` against a glob `pat`: `*` matches any run (incl. empty), `?` matches exactly
 /// one character, everything else is literal. Anchored at both ends (a glob matches the whole
-/// name, like a shell). Iterative backtracking — no recursion, no allocation (§26.6): on a
+/// name, like a shell). Iterative backtracking - no recursion, no allocation (§26.6): on a
 /// mismatch it falls back to extending the most recent `*`.
 fn glob_match(pat: &[u8], name: &[u8]) -> bool {
     let (mut p, mut s) = (0usize, 0usize);
@@ -5098,7 +5113,7 @@ fn str_of(b: &[u8]) -> &str {
     core::str::from_utf8(b).unwrap_or("?")
 }
 
-// ── match — keep the lines that match a pattern (the grep-equivalent) ────────────
+// ── match - keep the lines that match a pattern (the grep-equivalent) ────────────
 // `match [except] <pattern> <path>` filters a file; `<producer> | match <pattern>` filters
 // piped input. A built-in FILTER: it consumes input and emits the matching lines. Substring
 // by default, `*`/`?` glob like `find` (shared `contains`/`glob_match`); `except` inverts.
@@ -5120,7 +5135,7 @@ fn match_lines(ctx: &ServiceContext, input: &[u8], pattern: &[u8], invert: bool,
 }
 
 /// Parse a `match` invocation's args from index `start`: handles the leading `except` keyword
-/// and returns `(invert, pattern, path)` — `path` is "" if absent. `None` if no pattern.
+/// and returns `(invert, pattern, path)` - `path` is "" if absent. `None` if no pattern.
 fn parse_match<'a>(args: &[&'a str], argc: usize, start: usize) -> Option<(bool, &'a str, &'a str)> {
     let mut i = start;
     // `except` is the keyword only when a pattern follows it (so `match except except` still
@@ -5134,7 +5149,7 @@ fn parse_match<'a>(args: &[&'a str], argc: usize, start: usize) -> Option<(bool,
     Some((invert, pattern, path))
 }
 
-/// `match [except] <pattern> <path>` — print the lines of `<path>` that match (or, with
+/// `match [except] <pattern> <path>` - print the lines of `<path>` that match (or, with
 /// `except`, that do not). The pipe form filters piped input instead; either way `match` is a
 /// FILTER, never a pipe producer (use `read <path> | match …` to feed a pipeline from a file).
 fn cmd_match(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) -> Result<(), ShellError> {
@@ -5166,7 +5181,7 @@ fn cmd_match(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) -> Res
 }
 
 /// Run a filter built-in (`match`, `count`) over `input`, writing its output to `out`. Used
-/// when the filter sits **mid-pipe** or as the last stage — it runs in-process, so it is not
+/// when the filter sits **mid-pipe** or as the last stage - it runs in-process, so it is not
 /// subject to the 4 KiB service-boundary cap and can filter a full 64 KiB stage buffer.
 fn run_filter_builtin(ctx: &ServiceContext, stage: &str, input: &[u8], out: &mut Out) -> bool {
     let (cmd, _) = split_first(stage);
@@ -5201,12 +5216,12 @@ fn run_filter_builtin(ctx: &ServiceContext, stage: &str, input: &[u8], out: &mut
     }
 }
 
-// ── count — how many lines / words / bytes (the wc-equivalent) ───────────────────
+// ── count - how many lines / words / bytes (the wc-equivalent) ───────────────────
 // `count <path>` counts a file; `<producer> | count` counts piped input. Like `match` it is a
 // built-in FILTER (in-process, no 4 KiB cap), but it consumes many lines and emits one summary
 // line, so it usually ends a pipe. See utilities/28_count.md.
 
-/// "" for a count of 1, "s" otherwise — readable singular/plural.
+/// "" for a count of 1, "s" otherwise - readable singular/plural.
 fn plural(n: usize) -> &'static str { if n == 1 { "" } else { "s" } }
 
 /// Count `input`'s lines / words / bytes and write the labelled summary to `out`. Lines = newline
@@ -5226,7 +5241,7 @@ fn write_count(ctx: &ServiceContext, input: &[u8], out: &mut Out) {
         lines, plural(lines), words, plural(words), bytes, plural(bytes)));
 }
 
-/// `count <path>` — count the lines / words / bytes of a file. The pipe form `<producer> |
+/// `count <path>` - count the lines / words / bytes of a file. The pipe form `<producer> |
 /// count` counts piped input instead; either way `count` consumes input (never a producer).
 fn cmd_count(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) -> Result<(), ShellError> {
     let path = if argc >= 2 { args[1] } else { "" };
@@ -5253,12 +5268,12 @@ fn cmd_count(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) -> Res
     }
 }
 
-// ── sort — order the lines (ascending, or `reverse`) ─────────────────────────────
+// ── sort - order the lines (ascending, or `reverse`) ─────────────────────────────
 // `sort [reverse] <path>` sorts a file; `<producer> | sort [reverse]` sorts piped input. A
 // built-in FILTER like match/count. See utilities/29_sort.md.
 
 /// Most lines `sort` will order in one pass (§26.6 bounded). Beyond this it sorts the first
-/// `SORT_MAX_LINES` and says so — never silently drops the rest. The index array is
+/// `SORT_MAX_LINES` and says so - never silently drops the rest. The index array is
 /// `SORT_MAX_LINES × 16 bytes` on the stack.
 const SORT_MAX_LINES: usize = 1024;
 
@@ -5301,11 +5316,11 @@ fn write_sorted(ctx: &ServiceContext, input: &[u8], reverse: bool, out: &mut Out
     if reverse { for k in (0..n).rev() { emit(k); } } else { for k in 0..n { emit(k); } }
     if overflow {
         ctx.console_writeln_fmt(format_args!(
-            "sort: more than {} lines — sorted the first {} (bounded)", SORT_MAX_LINES, SORT_MAX_LINES));
+            "sort: more than {} lines - sorted the first {} (bounded)", SORT_MAX_LINES, SORT_MAX_LINES));
     }
 }
 
-/// `sort [reverse] <path>` — print a file's lines in order. The pipe form `<producer> | sort`
+/// `sort [reverse] <path>` - print a file's lines in order. The pipe form `<producer> | sort`
 /// sorts piped input instead; either way `sort` consumes input (never a producer).
 fn cmd_sort(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) -> Result<(), ShellError> {
     let (reverse, path) = parse_sort(args, argc, 1);
@@ -5332,7 +5347,7 @@ fn cmd_sort(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) -> Resu
     }
 }
 
-// ── first / last — keep the first or last N lines (the head/tail-equivalent) ──────
+// ── first / last - keep the first or last N lines (the head/tail-equivalent) ──────
 // `first [N] <path>` / `last [N] <path>` for a file; `<producer> | first [N]` for a pipe.
 // Built-in FILTERS like match/count/sort. N defaults to 10. See utilities/30_first-last.md.
 
@@ -5390,7 +5405,7 @@ fn write_last(ctx: &ServiceContext, input: &[u8], n: usize, out: &mut Out) {
     }
 }
 
-/// `first [N] <path>` / `last [N] <path>` — print a file's first/last N lines (default 10). The
+/// `first [N] <path>` / `last [N] <path>` - print a file's first/last N lines (default 10). The
 /// pipe form `<producer> | first [N]` takes from piped input; either way it consumes input.
 fn cmd_take(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize, last: bool) -> Result<(), ShellError> {
     let name = if last { "last" } else { "first" };
@@ -5452,7 +5467,7 @@ impl PathStack {
 }
 
 // ---------------------------------------------------------------------------
-// drives — manage attached disks (utilities/15_drives.md). A shell built-in that
+// drives - manage attached disks (utilities/15_drives.md). A shell built-in that
 // sends the drives API to `fs` over IPC; `fs` holds and enforces all disk authority.
 // Step 3: the data primitives `flash` / `label` / list (boot layer + multi-drive later).
 // ---------------------------------------------------------------------------
@@ -5462,28 +5477,28 @@ fn cmd_drives(ctx: &ServiceContext, args: &[&str], argc: usize) -> Result<(), Sh
     match sub {
         ""        => drives_list(ctx),
         "flash"   => {
-            // `drives flash [drive] [label]` — the drive selector is optional (one drive).
+            // `drives flash [drive] [label]` - the drive selector is optional (one drive).
             let (sel, label) = split_drive_value(args, argc);
             if drive_sel_ok(ctx, sel) { drives_flash(ctx, label) } else { Err(ShellError::Unknown) }
         }
         "label"   => {
-            // `drives label [drive] <name>` — selector optional; name required.
+            // `drives label [drive] <name>` - selector optional; name required.
             let (sel, name) = split_drive_value(args, argc);
             if name.is_empty() { ctx.console_writeln("usage: drives label [drive] <name>"); Err(ShellError::Unknown) }
             else if drive_sel_ok(ctx, sel) { drives_label(ctx, name) } else { Err(ShellError::Unknown) }
         }
         "reset"   => {
-            // `drives reset [drive]` — un-format back to raw (optional selector, no value).
+            // `drives reset [drive]` - un-format back to raw (optional selector, no value).
             let sel = if argc >= 3 { args[2] } else { "" };
             if drive_sel_ok(ctx, sel) { drives_reset(ctx) } else { Err(ShellError::Unknown) }
         }
         "check"   => {
-            // `drives check [drive]` — fsck: verify CRCs + rebuild the bitmap/free count.
+            // `drives check [drive]` - fsck: verify CRCs + rebuild the bitmap/free count.
             let sel = if argc >= 3 { args[2] } else { "" };
             if drive_sel_ok(ctx, sel) { drives_check(ctx) } else { Err(ShellError::Unknown) }
         }
         "scrub"   => {
-            // `drives scrub [drive]` — READ-ONLY integrity sweep: verify every block's CRC,
+            // `drives scrub [drive]` - READ-ONLY integrity sweep: verify every block's CRC,
             // report, change nothing (unlike `check`, which repairs). Phase K.
             let sel = if argc >= 3 { args[2] } else { "" };
             if drive_sel_ok(ctx, sel) { drives_scrub(ctx) } else { Err(ShellError::Unknown) }
@@ -5516,14 +5531,14 @@ fn drive_sel_ok(ctx: &ServiceContext, sel: &str) -> bool {
         return true;
     }
     if sel.bytes().all(|b| b.is_ascii_digit()) {
-        ctx.console_writeln_fmt(format_args!("drives: no drive {} — only drive 0 is attached", sel));
+        ctx.console_writeln_fmt(format_args!("drives: no drive {} - only drive 0 is attached", sel));
         return false;
     }
-    true // a label selector — single drive, accept
+    true // a label selector - single drive, accept
 }
 
 
-/// `drives` — list the attached drive (single-drive in step 3; index 0).
+/// `drives` - list the attached drive (single-drive in step 3; index 0).
 fn drives_list(ctx: &ServiceContext) -> Result<(), ShellError> {
     let reply = match ctx.request_with_reply("fs", &Message::from_bytes(&[OP_DRIVES_INFO])) {
         Some(r) => r,
@@ -5553,7 +5568,7 @@ fn drives_list(ctx: &ServiceContext) -> Result<(), ShellError> {
     Ok(())
 }
 
-/// `drives flash [label]` — format the drive as GSFS after a `[y/N]` confirm. Destructive.
+/// `drives flash [label]` - format the drive as GSFS after a `[y/N]` confirm. Destructive.
 fn drives_flash(ctx: &ServiceContext, label: &str) -> Result<(), ShellError> {
     if label.len() > LABEL_MAX {
         ctx.console_writeln_fmt(format_args!("drives: label too long (max {})", LABEL_MAX));
@@ -5572,7 +5587,7 @@ fn drives_flash(ctx: &ServiceContext, label: &str) -> Result<(), ShellError> {
     req[2..2 + ll].copy_from_slice(&lb[..ll]);
     match ctx.request_with_reply("fs", &Message::from_bytes(&req[..2 + ll])) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
-            ctx.console_writeln("drives: formatted as GSFS — mounted, ready to use now (no reboot)");
+            ctx.console_writeln("drives: formatted as GSFS - mounted, ready to use now (no reboot)");
             Ok(())
         }
         Some(_) => { ctx.console_writeln("drives: flash FAILED (no disk, or disk too small)"); Err(ShellError::Unknown) }
@@ -5580,7 +5595,7 @@ fn drives_flash(ctx: &ServiceContext, label: &str) -> Result<(), ShellError> {
     }
 }
 
-/// `drives reset` — un-format the drive back to raw (zero the superblock). Destructive;
+/// `drives reset` - un-format the drive back to raw (zero the superblock). Destructive;
 /// a quick clean slate for re-testing the raw→flash path. NOT a secure wipe.
 fn drives_reset(ctx: &ServiceContext) -> Result<(), ShellError> {
     ctx.console_write("This un-formats the drive back to raw (ERASES). Continue? [y/N] ");
@@ -5590,7 +5605,7 @@ fn drives_reset(ctx: &ServiceContext) -> Result<(), ShellError> {
     }
     match ctx.request_with_reply("fs", &Message::from_bytes(&[OP_RESET])) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
-            ctx.console_writeln("drives: reset to raw — 'drives flash' to use again");
+            ctx.console_writeln("drives: reset to raw - 'drives flash' to use again");
             Ok(())
         }
         Some(_) => { ctx.console_writeln("drives: reset FAILED (no disk?)"); Err(ShellError::Unknown) }
@@ -5598,9 +5613,9 @@ fn drives_reset(ctx: &ServiceContext) -> Result<(), ShellError> {
     }
 }
 
-/// `drives check` — fsck: walk the tree (the source of truth), rebuild the free bitmap + free
+/// `drives check` - fsck: walk the tree (the source of truth), rebuild the free bitmap + free
 /// count from it, and verify every block's CRC. Repairs allocation drift non-destructively;
-/// reports (does not delete) files/dirs whose blocks fail their CRC. No confirmation needed —
+/// reports (does not delete) files/dirs whose blocks fail their CRC. No confirmation needed -
 /// it never erases data. Reply: [FS_OK, files:u32, dirs:u32, bad:u32, used:u64, free:u64].
 fn drives_check(ctx: &ServiceContext) -> Result<(), ShellError> {
     match ctx.request_with_reply("fs", &Message::from_bytes(&[OP_CHECK])) {
@@ -5616,10 +5631,10 @@ fn drives_check(ctx: &ServiceContext) -> Result<(), ShellError> {
                     files, dirs, bad, used, free));
                 if bad > 0 {
                     ctx.console_writeln_fmt(format_args!(
-                        "check: WARNING — {} file(s)/dir(s) had unreadable (CRC-failed) blocks; see the log", bad));
+                        "check: WARNING - {} file(s)/dir(s) had unreadable (CRC-failed) blocks; see the log", bad));
                     Err(ShellError::Unknown)
                 } else {
-                    ctx.console_writeln("check: ok — filesystem is consistent");
+                    ctx.console_writeln("check: ok - filesystem is consistent");
                     Ok(())
                 }
             } else {
@@ -5630,7 +5645,7 @@ fn drives_check(ctx: &ServiceContext) -> Result<(), ShellError> {
     }
 }
 
-/// `drives scrub` — READ-ONLY integrity sweep (Phase K): walk the tree, verify every block's
+/// `drives scrub` - READ-ONLY integrity sweep (Phase K): walk the tree, verify every block's
 /// CRC, report, change NOTHING on disk (distinct from `check`, which repairs the bitmap). Run it
 /// on a schedule to catch latent bit-rot early; without redundancy it detects but cannot repair.
 /// Reply: [FS_OK, files:u32, dirs:u32, bad:u32, scanned:u64].
@@ -5648,10 +5663,10 @@ fn drives_scrub(ctx: &ServiceContext) -> Result<(), ShellError> {
                     scanned, files, dirs, bad));
                 if bad > 0 {
                     ctx.console_writeln_fmt(format_args!(
-                        "scrub: WARNING — {} file(s)/dir(s) had CRC-failed blocks (bit-rot); the data is lost, see the log", bad));
+                        "scrub: WARNING - {} file(s)/dir(s) had CRC-failed blocks (bit-rot); the data is lost, see the log", bad));
                     Err(ShellError::Unknown)
                 } else {
-                    ctx.console_writeln("scrub: ok — every block verified");
+                    ctx.console_writeln("scrub: ok - every block verified");
                     Ok(())
                 }
             } else {
@@ -5662,7 +5677,7 @@ fn drives_scrub(ctx: &ServiceContext) -> Result<(), ShellError> {
     }
 }
 
-/// `drives label <name>` — name / rename the drive (rewrites the superblock).
+/// `drives label <name>` - name / rename the drive (rewrites the superblock).
 fn drives_label(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     let nb = name.as_bytes();
     if nb.is_empty() || nb.len() > LABEL_MAX {
@@ -5706,7 +5721,7 @@ fn u64_le(b: &[u8]) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers — no-alloc string building into stack buffers.
+// Helpers - no-alloc string building into stack buffers.
 // ---------------------------------------------------------------------------
 
 fn write_bytes(buf: &mut [u8], pos: &mut usize, src: &[u8]) {

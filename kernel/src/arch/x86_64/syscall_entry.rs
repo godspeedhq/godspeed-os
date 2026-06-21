@@ -1,4 +1,4 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
@@ -19,11 +19,11 @@ const MAX_CORES: usize = crate::smp::core::MAX_CORES;
 /// The naked assembly stub references these fields as `gs:[0]`, `gs:[8]`.
 #[repr(C)]
 pub struct PerCoreSyscallData {
-    pub user_rsp:   u64,   // offset 0 — saved on SYSCALL entry, restored on SYSRETQ
-    pub kernel_rsp: u64,   // offset 8 — pre-loaded kernel stack top for current task
+    pub user_rsp:   u64,   // offset 0 - saved on SYSCALL entry, restored on SYSRETQ
+    pub kernel_rsp: u64,   // offset 8 - pre-loaded kernel stack top for current task
 }
 
-// Lives in .data (writable) — the stub writes user_rsp on every SYSCALL entry.
+// Lives in .data (writable) - the stub writes user_rsp on every SYSCALL entry.
 #[link_section = ".data"]
 pub static mut PER_CORE_SYSCALL: [PerCoreSyscallData; MAX_CORES] =
     [const { PerCoreSyscallData { user_rsp: 0, kernel_rsp: 0 } }; MAX_CORES];
@@ -35,8 +35,8 @@ pub static mut PER_CORE_SYSCALL: [PerCoreSyscallData; MAX_CORES] =
 ///   ring-3: GS.base = 0                             (user's GS; no ring-3 GS use)
 ///
 /// MSR layout:
-///   MSR_GS_BASE      (0xC000_0101) = kernel ptr  — active in ring-0
-///   IA32_KERNEL_GS_BASE (0xC000_0102) = 0         — active in ring-3; swapgs exchanges them
+///   MSR_GS_BASE      (0xC000_0101) = kernel ptr  - active in ring-0
+///   IA32_KERNEL_GS_BASE (0xC000_0102) = 0         - active in ring-3; swapgs exchanges them
 ///
 /// `swapgs` on SYSCALL entry: GS.base(0) ↔ KERNEL_GS_BASE(kernel_ptr) → kernel ptr in GS.base ✓
 /// `swapgs` on SYSRETQ exit:  GS.base(kernel_ptr) ↔ KERNEL_GS_BASE(0) → 0 in GS.base ✓
@@ -50,7 +50,7 @@ pub unsafe fn init_per_core_syscall(core_id: usize) {
     unsafe {
         let ptr = &raw const PER_CORE_SYSCALL[core_id] as u64;
 
-        // MSR_GS_BASE = kernel ptr — establishes the ring-0 GS invariant.
+        // MSR_GS_BASE = kernel ptr - establishes the ring-0 GS invariant.
         core::arch::asm!(
             "wrmsr",
             in("ecx") 0xC000_0101u32,
@@ -66,7 +66,7 @@ pub unsafe fn init_per_core_syscall(core_id: usize) {
         // and the #UD syscall stub's `mov %r10, %gs:0x0` writes to address 0 →
         // kernel #PF loop → reboot. The BSP stays balanced so never hit it.
         // Cost: a ring-3 task can read its core's PER_CORE_SYSCALL via gs:[...]
-        // (the kernel_rsp pointer) — a minor info leak, acceptable in v1; user
+        // (the kernel_rsp pointer) - a minor info leak, acceptable in v1; user
         // services don't use GS. Finding the imbalanced swapgs handler so this
         // can return to 0 is a follow-up.
         core::arch::asm!(
@@ -83,7 +83,7 @@ pub unsafe fn init_per_core_syscall(core_id: usize) {
 // Safe user-pointer wrappers (arch permitted layer).
 // ---------------------------------------------------------------------------
 
-/// The highest valid user virtual address (exclusive) — top of the lower half.
+/// The highest valid user virtual address (exclusive) - top of the lower half.
 const USER_END: u64 = 0x0000_8000_0000_0000;
 
 /// Return `true` iff the byte range `[ptr, ptr+len)` lies entirely within the
@@ -129,7 +129,7 @@ pub fn read_cycle_counter() -> u64 {
     unsafe { core::arch::x86_64::_rdtsc() }
 }
 
-/// CSTAR entry point — installed as the CSTAR MSR target (AMD compat-mode SYSCALL).
+/// CSTAR entry point - installed as the CSTAR MSR target (AMD compat-mode SYSCALL).
 ///
 /// On AMD processors, a `syscall` from a ring-3 task in compatibility mode
 /// (CS.L=0) dispatches here instead of LSTAR.  GodspeedOS runs all ring-3 code
@@ -150,7 +150,7 @@ pub unsafe extern "C" fn cstar_entry() {
     )
 }
 
-/// SYSCALL entry point — installed as the LSTAR MSR target.
+/// SYSCALL entry point - installed as the LSTAR MSR target.
 ///
 /// On hardware SYSCALL entry:
 ///   RCX = saved user RIP (return address for ring-3 resume)
@@ -221,12 +221,12 @@ pub unsafe extern "C" fn syscall_entry() {
     )
 }
 
-/// INT 0x80 syscall entry — kept for reference; superseded by `ud2_syscall_entry`
+/// INT 0x80 syscall entry - kept for reference; superseded by `ud2_syscall_entry`
 /// on AMD GX-420GI where int $0x80 also stalls.
 ///
 /// The CPU pushes a full hardware frame onto the kernel stack (via TSS.rsp0)
 /// before jumping here, so no manual stack switch is needed:
-///   [RSP+0]  saved RIP   (user RIP — return address)
+///   [RSP+0]  saved RIP   (user RIP - return address)
 ///   [RSP+8]  saved CS    (0x2b: user code, L=1, DPL=3)
 ///   [RSP+16] saved RFLAGS
 ///   [RSP+24] saved RSP   (user RSP)
@@ -267,12 +267,12 @@ pub unsafe extern "C" fn int80_entry() {
     )
 }
 
-/// UD2 syscall entry — IDT[6] (#UD hardware exception).
+/// UD2 syscall entry - IDT[6] (#UD hardware exception).
 ///
 /// AMD GX-420GI (Jaguar/Puma+): both `syscall` and `int N` (software interrupt
 /// dispatch) silently stall the core from ring-3.  `ud2` (0x0F 0x0B) is decoded
 /// by the CPU as an explicitly undefined instruction and takes the hardware
-/// exception pathway — the same one used by #PF and #GP — which does work on
+/// exception pathway - the same one used by #PF and #GP - which does work on
 /// this hardware.
 ///
 /// CPU frame on #UD (no error code):
@@ -321,7 +321,7 @@ pub unsafe extern "C" fn ud2_syscall_entry() {
         // The #UD frame (needed for the final iretq) stays at the top of the
         // kstack and is safe across the call: while in the syscall the task is
         // CPL0, so any interrupt uses the current (kernel_rsp) stack, never
-        // TSS.rsp0 — nothing overwrites the top-of-kstack frame.
+        // TSS.rsp0 - nothing overwrites the top-of-kstack frame.
         "mov r10, rsp",            // r10 = #UD frame ptr (top of kstack)
         "mov rsp, gs:[8]",         // rsp = kernel_rsp (dedicated syscall stack)
         "sub rsp, 16",             // reserve a 16-byte slot, keep ABI alignment

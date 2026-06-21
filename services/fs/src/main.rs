@@ -1,26 +1,26 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! `fs` — userspace filesystem service (persistence, v2; §15, docs/persistence.md).
+//! `fs` - userspace filesystem service (persistence, v2; §15, docs/persistence.md).
 //!
-//! **GSFS0008 — checksummed scalable format with extent lists (docs/persistence.md §6.4 +
+//! **GSFS0008 - checksummed scalable format with extent lists (docs/persistence.md §6.4 +
 //! §6.6 + §6.12).** Three on-disk
 //! structures and no more: a **superblock**, a **free bitmap** (1 bit/block, read on
-//! demand — the only global structure, a free *map* not a file index), and the
+//! demand - the only global structure, a free *map* not a file index), and the
 //! **directory tree** of **self-describing `file_record` entries** (`{type, name, size,
-//! first_block, block_count}` — no inode table, no inode number, no global file cap). The
+//! first_block, block_count}` - no inode table, no inode number, no global file cap). The
 //! directory tree *is* the index (walk a path from root); the bitmap is the allocation
 //! map; reclamation is intrinsic (`delete`/overwrite free bits). Directories **grow**
 //! (reallocate a bigger extent when full) so there is no per-directory entry cap either.
 //! The only ceiling is the disk. (`fs_index`, the deferred global enumeration cache, is
-//! §6.5 — not built; built when a `find`/search need pulls it in.)
+//! §6.5 - not built; built when a `find`/search need pulls it in.)
 //!
 //! `fs` is the single owner of the filesystem (§8): it serves one IPC request at a time,
-//! so every mutation is serialized — no concurrency to reconcile. All disk I/O goes through
+//! so every mutation is serialized - no concurrency to reconcile. All disk I/O goes through
 //! `block-driver` over IPC; this service touches no hardware. Raw-tolerant: a bad magic is
 //! a loud refusal, never an auto-format (§3.12).
 
@@ -32,8 +32,8 @@ use godspeed_sdk::{CapHandle, Message, ServiceContext};
 mod crc32;
 use crc32::crc32;
 
-// ── On-disk format — MUST match `osdev format_superblock` (persistence.md §6.6/§6.10/§6.15). ──
-// GSFS0008: every block self-verifies with a CRC32 — the superblock (CRC @136), each
+// ── On-disk format - MUST match `osdev format_superblock` (persistence.md §6.6/§6.10/§6.15). ──
+// GSFS0008: every block self-verifies with a CRC32 - the superblock (CRC @136), each
 // directory block (CRC trailer @448), and each **file-data block** (508-byte payload +
 // CRC32 @508). Corruption is a loud refusal (§3.12), never silent. The format reserves a
 // fixed journal region (Phase-C crash-consistency) so the on-disk geometry is baked once.
@@ -50,28 +50,28 @@ const BITS_PER_BMBLOCK: u64 = (BLOCK as u64) * 8; // 4096 bits per bitmap block
 
 // Superblock feature masks (GSFS0008, §6.15). Three u32 words after the journal geometry, under
 // the widened superblock CRC (now @136 over [0..136)). Each bit is a feature the disk USES:
-//   compat    — an older build that doesn't know the bit may still mount READ-WRITE (safe to ignore)
-//   ro_compat — ... may mount READ-ONLY (reading is safe; writing could corrupt the feature)
-//   incompat  — ... must REFUSE to mount (the on-disk structure is fundamentally different)
+//   compat    - an older build that doesn't know the bit may still mount READ-WRITE (safe to ignore)
+//   ro_compat - ... may mount READ-ONLY (reading is safe; writing could corrupt the feature)
+//   incompat  - ... must REFUSE to mount (the on-disk structure is fundamentally different)
 const FEAT_COMPAT_OFF: usize = 124;    // u32
 const FEAT_RO_COMPAT_OFF: usize = 128; // u32
 const FEAT_INCOMPAT_OFF: usize = 132;  // u32
-const SB_CRC_OFF: usize = 136;         // u32 CRC32 over [0..136) — moved from @124, covers the masks
+const SB_CRC_OFF: usize = 136;         // u32 CRC32 over [0..136) - moved from @124, covers the masks
 
 // Defined feature bits + what THIS build understands. A disk bit outside the KNOWN_* set drives the
-// mount policy above. (As features are added post-0008, define a bit here — never a new magic.)
+// mount policy above. (As features are added post-0008, define a bit here - never a new magic.)
 const FEAT_COMPAT_BACKUP_SB: u32 = 0x1; // a backup superblock sits at the last LBA (Phase F)
-const FEAT_INCOMPAT_EXTENTS: u32 = 0x1; // some file is fragmented (extent list, Phase I) — needed to read it
+const FEAT_INCOMPAT_EXTENTS: u32 = 0x1; // some file is fragmented (extent list, Phase I) - needed to read it
 const KNOWN_COMPAT: u32 = FEAT_COMPAT_BACKUP_SB;
 const KNOWN_RO_COMPAT: u32 = 0;
 const KNOWN_INCOMPAT: u32 = FEAT_INCOMPAT_EXTENTS;
 
 // Extent lists (GSFS0008). A file is normally a single contiguous extent (`ITYPE_FILE`:
-// first_block..first_block+block_count is the data — the fast path). When no contiguous run is
+// first_block..first_block+block_count is the data - the fast path). When no contiguous run is
 // free, the file becomes FRAGMENTED (`ITYPE_FILE_FRAG`): its `first_block` points to a single
 // CRC'd **extent block** and `block_count` = 1. The extent block lists the data runs, so a big
 // file can be stored across scattered free space. Bounded (§26.6): one extent block, so up to
-// EXT_MAX runs — a file fragmented into more pieces than that is refused loudly.
+// EXT_MAX runs - a file fragmented into more pieces than that is refused loudly.
 const EXT_N_OFF: usize = 0;        // u32: number of {start,len} extents
 const EXT_ENTRIES_OFF: usize = 8;  // {start:u64, len:u64} pairs
 const EXT_ENTRY_SIZE: usize = 16;
@@ -80,18 +80,18 @@ const EXT_MAX: usize = (EXT_CRC_OFF - EXT_ENTRIES_OFF) / EXT_ENTRY_SIZE; // 31 r
 
 // File-data block: 508 bytes of payload + a 4-byte CRC32 trailer @508 (GSFS0008). A file of N
 // bytes spans ceil(N/508) data blocks; each carries the CRC of its own payload, verified on
-// every read. (Directory blocks use a different split — 448 records + CRC; superblock/bitmap/
+// every read. (Directory blocks use a different split - 448 records + CRC; superblock/bitmap/
 // journal blocks are raw, with their own integrity schemes.)
 const DATA_PAYLOAD: usize = 508;
-const DATA_CRC_OFF: usize = DATA_PAYLOAD; // 508 — u32 CRC32 of the 508-byte payload
+const DATA_CRC_OFF: usize = DATA_PAYLOAD; // 508 - u32 CRC32 of the 508-byte payload
 
 // file_record entry: 64 bytes. GSFS0008 fits 7 per 512-byte directory block and reserves
 // the last 64 bytes as a trailer holding the block's CRC32 (over the 448-byte record
-// region). The record layout itself is unchanged from GSFS0003 — names stay 38 bytes.
+// region). The record layout itself is unchanged from GSFS0003 - names stay 38 bytes.
 const REC_SIZE: usize = 64;
 const RECS_PER_BLOCK: usize = 7; // 7×64 = 448 bytes of records + a 64-byte CRC trailer
-const DIR_REC_REGION: usize = RECS_PER_BLOCK * REC_SIZE; // 448 — CRC covers [0..448)
-const DIR_CRC_OFF: usize = DIR_REC_REGION; // 448 — u32 CRC32 of the record region
+const DIR_REC_REGION: usize = RECS_PER_BLOCK * REC_SIZE; // 448 - CRC covers [0..448)
+const DIR_CRC_OFF: usize = DIR_REC_REGION; // 448 - u32 CRC32 of the record region
 const NAME_MAX: usize = 38; // entry: type u8 @0, name_len u8 @1, name[38] @2, size @40, first @48, count @56
 
 // Crash-consistency journal region (GSFS0008 geometry). Fixed size, bounded (§26.6): a
@@ -99,12 +99,12 @@ const NAME_MAX: usize = 38; // entry: type u8 @0, name_len u8 @1, name[38] @2, s
 const JOURNAL_BLOCKS: u64 = 64; // 64 × 512 B = 32 KiB
 // One commit/header block + up to TXN_CAP data blocks must fit the journal region.
 const TXN_CAP: usize = 56; // max structural blocks one transaction may stage
-const JOURNAL_MAGIC: u32 = 0x474A_3034; // "GJ04" — marks a committed transaction
+const JOURNAL_MAGIC: u32 = 0x474A_3034; // "GJ04" - marks a committed transaction
 const COMMIT_CRC_OFF: usize = 508; // commit record: CRC32 of [0..8+n*8] lives at @508
 
 // Recursive-delete depth cap (§26.6). Paths are capped well below this by the wire
 // `path_len` (u8) and the shell's PATH_MAX (120), so this is a backstop, not the binding
-// limit — a too-deep tree is refused loudly rather than risking the service stack.
+// limit - a too-deep tree is refused loudly rather than risking the service stack.
 const MAX_TREE_DEPTH: u32 = 64;
 const LABEL_MAX: usize = 31; // superblock: label_len u8 @76, label[31] @77
 
@@ -113,18 +113,18 @@ const ITYPE_FILE: u8 = 1;      // inline single contiguous extent (first_block, 
 const ITYPE_DIR: u8 = 2;
 const ITYPE_FILE_FRAG: u8 = 3; // fragmented file: first_block → extent block, block_count = 1
 
-// Per-message data chunk: the most file payload bytes that travel in one IPC message — exactly
+// Per-message data chunk: the most file payload bytes that travel in one IPC message - exactly
 // 7 data-block payloads, so a streaming WRITE_AT chunk is always whole blocks (no read-modify-
 // write) and its byte offset stays block-aligned. NOT a file-size cap (large files cross many
 // of these via WRITE_NEW/WRITE_AT/READ_AT). 7×508 + a few header bytes ≤ MAX_PAYLOAD (4096).
 // The shell's IO_CHUNK must equal this.
-const MAX_FILE_BYTES: usize = 7 * DATA_PAYLOAD; // 3556 — streaming chunk size (7 data blocks)
+const MAX_FILE_BYTES: usize = 7 * DATA_PAYLOAD; // 3556 - streaming chunk size (7 data blocks)
 
 // Block IPC protocol (fs <-> block-driver). MUST match `services/block-driver`.
 const OP_READ_BLOCK: u8 = 1;
 const OP_WRITE_BLOCK: u8 = 2;
 const OP_CAPACITY: u8 = 3;
-const OP_WRITE_ZEROS: u8 = 4; // [op, lba:u64, count:u64] — zero a run of blocks (fast format)
+const OP_WRITE_ZEROS: u8 = 4; // [op, lba:u64, count:u64] - zero a run of blocks (fast format)
 const BLK_OK: u8 = 0;
 
 // fs file API (client <-> fs). `[op, path_len, path, (WriteFile: data | Rename/Move: tail)]`.
@@ -143,20 +143,20 @@ const OP_DRIVES_INFO: u8 = 20;
 const OP_FLASH: u8 = 21;
 const OP_LABEL: u8 = 22;
 const OP_RESET: u8 = 23;
-// Large-file streaming (offset-addressed; stateless — each request is self-contained, §8).
+// Large-file streaming (offset-addressed; stateless - each request is self-contained, §8).
 // A big file = WRITE_NEW (allocate the whole extent, size it) then a sequence of WRITE_AT
 // chunks; read it back with STAT (for the size) + a sequence of READ_AT chunks.
-const OP_WRITE_NEW: u8 = 24; // [op, plen, path, total:u64] — create/truncate `path` sized `total`
-const OP_WRITE_AT: u8 = 25;  // [op, plen, path, offset:u64, chunk…] — write chunk at byte offset
+const OP_WRITE_NEW: u8 = 24; // [op, plen, path, total:u64] - create/truncate `path` sized `total`
+const OP_WRITE_AT: u8 = 25;  // [op, plen, path, offset:u64, chunk…] - write chunk at byte offset
 const OP_READ_AT: u8 = 26;   // [op, plen, path, offset:u64, len:u32] → [FS_OK, n:u32, bytes]
 const OP_CHECK: u8 = 27;     // fsck: rebuild bitmap+free from the tree, report CRC failures →
                              // [FS_OK, files:u32, dirs:u32, bad:u32, used:u64, free:u64]
-const OP_WRITE_AT_J: u8 = 28; // [op, plen, path, offset:u64, chunk…] — like WRITE_AT but the
+const OP_WRITE_AT_J: u8 = 28; // [op, plen, path, offset:u64, chunk…] - like WRITE_AT but the
                              // chunk's data blocks are JOURNALED (Phase J): the chunk is applied
                              // atomically (crash → fully replayed or fully discarded, never torn).
                              // Bounded to one chunk (≤7 blocks) by the journal; default WRITE_AT
-                             // stays direct. Opt-in per write — the caller chooses the guarantee.
-const OP_SCRUB: u8 = 29;      // scrub (Phase K): READ-ONLY integrity sweep — walk the tree, verify
+                             // stays direct. Opt-in per write - the caller chooses the guarantee.
+const OP_SCRUB: u8 = 29;      // scrub (Phase K): READ-ONLY integrity sweep - walk the tree, verify
                              // every block's CRC, report → [FS_OK, files:u32, dirs:u32, bad:u32,
                              // scanned:u64]. Writes nothing (unlike CHECK, which repairs the bitmap).
 const OP_OPEN: u8 = 30;       // file-as-capability (§7.10, P2): [op, plen, path, rights:u8] → mint a
@@ -169,25 +169,25 @@ const FS_NOTFOUND: u8 = 2;
 const FS_NOFS: u8 = 3;
 const FS_DENIED: u8 = 4;     // op requires a right the file cap lacks (non-escalation, §7.3)
 
-// File-cap operations — the FIRST payload byte of a badged `ResourceInvoke` (§7.10). The kernel
+// File-cap operations - the FIRST payload byte of a badged `ResourceInvoke` (§7.10). The kernel
 // has already validated the cap holds the invoked right; fs enforces that the op needs ≤ that right.
 const FOP_READ: u8 = 1;  // [FOP_READ, offset:u64, len:u32]      → [FS_OK, n:u32, bytes]   (needs READ)
 const FOP_WRITE: u8 = 2; // [FOP_WRITE, offset:u64, chunk…]      → [FS_OK]                 (needs WRITE)
 const FOP_STAT: u8 = 3;  // [FOP_STAT]                           → [FS_OK, size:u64]       (needs READ)
 const FOP_CLOSE: u8 = 4; // [FOP_CLOSE]  → [FS_OK]; revoke the resource + free the open-file slot (any holder)
 
-// Capability right bits — MUST match the kernel `Rights` bitfield (§7.4) and the SDK `RIGHT_*`.
+// Capability right bits - MUST match the kernel `Rights` bitfield (§7.4) and the SDK `RIGHT_*`.
 const RIGHT_READ: u8 = 1 << 0;
 const RIGHT_WRITE: u8 = 1 << 1;
 const RIGHT_GRANT: u8 = 1 << 4;
 
 // Open-file table (file-as-capability): maps a delegated `ResourceId` → the file path it names, so
 // a badged invoke (which carries only the resource id) resolves to a file. Bounded (§26.6): at most
-// MAX_OPEN files open at once; the path is re-walked per op (handles the file being moved/deleted —
-// the walk simply fails then). Lives on `Fs` (owned state, not a static — §3.9), reset on mount (an
+// MAX_OPEN files open at once; the path is re-walked per op (handles the file being moved/deleted -
+// the walk simply fails then). Lives on `Fs` (owned state, not a static - §3.9), reset on mount (an
 // fs restart kills all outstanding file caps, §14.3, so the table starts empty).
 //
-// NOTE — do not naively raise these: `Fs` is a stack local returned by value from `mount`/`format`
+// NOTE - do not naively raise these: `Fs` is a stack local returned by value from `mount`/`format`
 // (it already holds the 28 KiB `txn_blk`), so bumping the table to 128 (let alone 256) overflows
 // fs's stack and kills it on boot. A bigger table needs `Fs` (or this table) OFF the stack first.
 const MAX_OPEN: usize = 64;
@@ -199,7 +199,7 @@ struct OpenFile {
     path: [u8; OPEN_PATH_MAX],
 }
 
-/// In-memory superblock view. No inode table — the tree lives on disk and is read on
+/// In-memory superblock view. No inode table - the tree lives on disk and is read on
 /// demand; the bitmap likewise (this struct holds only geometry + the maintained free
 /// count + the root's extent + drive label/flags).
 struct Fs {
@@ -223,7 +223,7 @@ struct Fs {
     feat_incompat: u32,
     read_only: bool,
     // Crash-consistency journal (Phase C). While `txn_active`, structural writes (directory,
-    // bitmap, superblock) are STAGED here — with read-your-writes — instead of going to disk,
+    // bitmap, superblock) are STAGED here - with read-your-writes - instead of going to disk,
     // then committed atomically through the on-disk journal region (`commit_txn`). Data-block
     // writes bypass this and go direct. A staged set larger than `TXN_CAP` is refused loudly.
     txn_active: bool,
@@ -260,11 +260,11 @@ struct Loc {
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("fs: starting");
 
-    // `block-driver` may still be re-initialising when we start — a chaos storm can restart it just
+    // `block-driver` may still be re-initialising when we start - a chaos storm can restart it just
     // before (or alongside) us, or our cached cap may be stale after its restart. Retry the capacity
-    // query — reacquiring its cap — until it reports a REAL disk, so we never mount a phantom
+    // query - reacquiring its cap - until it reports a REAL disk, so we never mount a phantom
     // 0-capacity disk and then "serve" a broken filesystem (every read would fail until a manual
-    // respawn — the bug `chaos max-carnage` exposed). Bounded by wall-clock time: on a genuinely
+    // respawn - the bug `chaos max-carnage` exposed). Bounded by wall-clock time: on a genuinely
     // diskless machine block-driver reports 0 forever, so we fall through and serve raw (§3.12).
     const FS_BLOCK_WAIT_SECS: i64 = 8;
     const FS_BLOCK_RETRY_YIELDS: u32 = 4000;
@@ -290,7 +290,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             Some(f)
         }
         Err(e) => {
-            ctx.log_fmt(format_args!("fs: no filesystem ({}) — awaiting drives flash", e));
+            ctx.log_fmt(format_args!("fs: no filesystem ({}) - awaiting drives flash", e));
             None
         }
     };
@@ -317,14 +317,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         data_journal_test(&ctx, f);
     }
 
-    // Path C (Phase 4): no self-registration — the kernel name-directory records "fs" at spawn
+    // Path C (Phase 4): no self-registration - the kernel name-directory records "fs" at spawn
     // (refreshed on restart), so the shell reacquires us by name via the directory (§14.3).
 
     ctx.log("fs: serving file API");
     loop {
         let msg = ctx.recv();
         // A delegated-resource badge (§7.10) is set ONLY by the kernel after it validated a real
-        // file cap — so its presence means "this is a trusted file-cap invocation", impossible to
+        // file cap - so its presence means "this is a trusted file-cap invocation", impossible to
         // forge over the ordinary fs send-cap. No badge → a name-addressed request.
         let badge = ctx.last_recv_badge();
         let reply = match ctx.take_pending_cap() {
@@ -348,7 +348,7 @@ fn self_test(ctx: &ServiceContext, fs: &mut Fs) {
     const NESTED_DATA: &[u8] = b"godspeed scalable fs";
     let mut buf = [0u8; MAX_FILE_BYTES];
 
-    // Data-integrity probe: if a host-baked `/probe.bin` exists, read it — exercising the
+    // Data-integrity probe: if a host-baked `/probe.bin` exists, read it - exercising the
     // per-data-block CRC (GSFS0008). A corrupt block is refused loudly by `data_read`, so the
     // read fails rather than returning garbage. (Used by `osdev test fs-corrupt` case 3.)
     if fs.walk(ctx, b"/probe.bin").is_some() {
@@ -392,14 +392,14 @@ fn self_test(ctx: &ServiceContext, fs: &mut Fs) {
 }
 
 /// Large-file round-trip proof (selftest only): a 200 KiB file written/read in streaming
-/// chunks via `write_new`/`write_at`/`read_at` — far past the one-message cap. The content
+/// chunks via `write_new`/`write_at`/`read_at` - far past the one-message cap. The content
 /// is a deterministic pattern generated and verified chunk-by-chunk, so no big buffer is
 /// needed anywhere. Creates the file if absent (boot 1), then always verifies (boot 2 proves
 /// it survived the reboot).
 #[cfg(feature = "selftest")]
 fn large_file_check(ctx: &ServiceContext, fs: &mut Fs) {
     const BIG: &[u8] = b"/big.bin";
-    const N: u64 = 200 * 1024; // 204800 bytes — ~57 chunks
+    const N: u64 = 200 * 1024; // 204800 bytes - ~57 chunks
     let pat = |k: u64| -> u8 { (k.wrapping_mul(131).wrapping_add(7) & 0xFF) as u8 };
 
     let present = matches!(fs.walk(ctx, BIG), Some(e) if e.itype == ITYPE_FILE && e.size == N);
@@ -437,7 +437,7 @@ fn large_file_check(ctx: &ServiceContext, fs: &mut Fs) {
 /// disk: on boot 1 the file is absent, so it writes `/jcrash.txt` through a transaction that
 /// **halts right after the commit record is durable but before the checkpoint** (simulated
 /// power loss). On boot 2 the file is absent on its home blocks, but `mount`'s recovery
-/// replays the committed transaction from the journal — so the file is present with the right
+/// replays the committed transaction from the journal - so the file is present with the right
 /// bytes, proving the write was atomic and survived the crash.
 #[cfg(feature = "journal-crash-test")]
 fn journal_crash_test(ctx: &ServiceContext, fs: &mut Fs) {
@@ -452,18 +452,18 @@ fn journal_crash_test(ctx: &ServiceContext, fs: &mut Fs) {
         }
         return;
     }
-    // Boot 1: file absent — write it, arming the crash so commit_txn halts post-commit.
-    ctx.log("fs: jcrash boot1 — writing /jcrash.txt, will halt after commit record");
+    // Boot 1: file absent - write it, arming the crash so commit_txn halts post-commit.
+    ctx.log("fs: jcrash boot1 - writing /jcrash.txt, will halt after commit record");
     fs.begin_txn();
     fs.crash_after_commit = true;
     let _ = fs.write_path(ctx, F, D);
-    let _ = fs.commit_txn(ctx); // halts inside (armed) — control does not return
+    let _ = fs.commit_txn(ctx); // halts inside (armed) - control does not return
     ctx.log("fs: jcrash boot1 did NOT crash (unexpected)");
 }
 
 /// Extent-list / fragmentation proof (`frag-test` build only). Two-boot, same binary, same
 /// disk. Boot 1: fill the disk with small files, then delete every other one so the only free
-/// space left is scattered small gaps — no contiguous run survives. Write `/frag.bin`, a file
+/// space left is scattered small gaps - no contiguous run survives. Write `/frag.bin`, a file
 /// far bigger than any gap: contiguous allocation must FAIL and the fragmented
 /// (`ITYPE_FILE_FRAG`) path engages, storing the data across the gaps via a CRC'd extent block.
 /// Verify the read-back exactly. Boot 2: the same `/frag.bin` is re-read across the reboot,
@@ -471,10 +471,10 @@ fn journal_crash_test(ctx: &ServiceContext, fs: &mut Fs) {
 #[cfg(feature = "frag-test")]
 fn frag_test(ctx: &ServiceContext, fs: &mut Fs) {
     const FRAG: &[u8] = b"/frag.bin";
-    const NB: u64 = 20 * DATA_PAYLOAD as u64; // 20 data blocks — far larger than any gap
+    const NB: u64 = 20 * DATA_PAYLOAD as u64; // 20 data blocks - far larger than any gap
     let pat = |k: u64| -> u8 { (k.wrapping_mul(151).wrapping_add(13) & 0xFF) as u8 };
 
-    // Boot 2: the proof file already exists — re-verify it survived the reboot.
+    // Boot 2: the proof file already exists - re-verify it survived the reboot.
     if let Some(e) = fs.walk(ctx, FRAG) {
         let kind = if e.itype == ITYPE_FILE_FRAG { "FRAGMENTED" } else { "contiguous" };
         ctx.log_fmt(format_args!("fs: [frag] /frag.bin present after reboot ({}, {} B)", kind, e.size));
@@ -497,7 +497,7 @@ fn frag_test(ctx: &ServiceContext, fs: &mut Fs) {
             Ok(()) => count += 1,
             Err(_) => break,
         }
-        if count >= 4000 { break; } // safety bound (§26.6) — never reached on the test disk
+        if count >= 4000 { break; } // safety bound (§26.6) - never reached on the test disk
     }
     ctx.log_fmt(format_args!("fs: [frag] filled {} files", count));
 
@@ -511,7 +511,7 @@ fn frag_test(ctx: &ServiceContext, fs: &mut Fs) {
     }
     ctx.log_fmt(format_args!("fs: [frag] deleted {} files ({} free blocks scattered)", deleted, fs.free_blocks));
 
-    // Step 3: write a 20-block file — no contiguous run that big exists, so it MUST fragment.
+    // Step 3: write a 20-block file - no contiguous run that big exists, so it MUST fragment.
     if fs.write_new(ctx, FRAG, NB).is_err() { ctx.log("fs: [frag] write_new FAILED"); return; }
     let mut chunk = [0u8; MAX_FILE_BYTES];
     let mut off = 0u64;
@@ -525,7 +525,7 @@ fn frag_test(ctx: &ServiceContext, fs: &mut Fs) {
         Some(e) if e.itype == ITYPE_FILE_FRAG =>
             ctx.log_fmt(format_args!("fs: [frag] /frag.bin is FRAGMENTED ({} B across an extent list)", e.size)),
         Some(e) =>
-            ctx.log_fmt(format_args!("fs: [frag] NOT fragmented (itype {}) — a contiguous run existed", e.itype)),
+            ctx.log_fmt(format_args!("fs: [frag] NOT fragmented (itype {}) - a contiguous run existed", e.itype)),
         None => { ctx.log("fs: [frag] /frag.bin vanished"); return; }
     }
     if frag_verify(ctx, fs, FRAG, NB, pat) {
@@ -575,39 +575,39 @@ fn frag_name(buf: &mut [u8; 12], n: u32) -> &[u8] {
 /// Data-journaling proof (`data-journal-test` build only). Two-boot, same binary, same disk.
 /// Boot 1: create `/jdata.bin` (its metadata commits, but its data blocks are still **zeros** on
 /// disk), then do ONE **journaled** `write_at` (`journal = true`) through a transaction armed to
-/// halt right after the commit record is durable but before the checkpoint — so the data blocks
+/// halt right after the commit record is durable but before the checkpoint - so the data blocks
 /// live in the journal and were NEVER written to their home LBAs. Boot 2: `mount`'s recovery
 /// replays the committed transaction, writing the data home; the file reads back exactly. This is
 /// airtight: the home blocks were zeros (a zero block fails the data CRC), so a correct read can
-/// only mean the journal supplied the data — proving the chunk was crash-atomic, not torn.
+/// only mean the journal supplied the data - proving the chunk was crash-atomic, not torn.
 #[cfg(feature = "data-journal-test")]
 fn data_journal_test(ctx: &ServiceContext, fs: &mut Fs) {
     const F: &[u8] = b"/jdata.bin";
-    const N: u64 = 4 * DATA_PAYLOAD as u64; // 4 data blocks — comfortably within the journal
+    const N: u64 = 4 * DATA_PAYLOAD as u64; // 4 data blocks - comfortably within the journal
     let pat = |k: u64| -> u8 { (k.wrapping_mul(193).wrapping_add(29) & 0xFF) as u8 };
 
-    // Boot 2: the file exists — its data must have been recovered from the journal.
+    // Boot 2: the file exists - its data must have been recovered from the journal.
     if fs.walk(ctx, F).is_some() {
         let mut buf = [0u8; MAX_FILE_BYTES];
         match fs.read_at(ctx, F, 0, N as usize, &mut buf) {
             Some(n) if n == N as usize && (0..n).all(|j| buf[j] == pat(j as u64)) =>
                 ctx.log("fs: jdata RECOVERED+VERIFIED across simulated crash"),
             Some(_) => ctx.log("fs: jdata recovered but DATA MISMATCH"),
-            None => ctx.log("fs: jdata read FAILED (data not recovered — home blocks still zero)"),
+            None => ctx.log("fs: jdata read FAILED (data not recovered - home blocks still zero)"),
         }
         return;
     }
 
     // Boot 1: create the file (metadata commits direct; data blocks remain zero on disk), then a
     // journaled write_at that halts post-commit. The data is staged → journal, not yet home.
-    ctx.log("fs: jdata boot1 — journaled write_at, will halt after commit record");
+    ctx.log("fs: jdata boot1 - journaled write_at, will halt after commit record");
     if fs.write_new(ctx, F, N).is_err() { ctx.log("fs: jdata write_new FAILED"); return; }
     let mut chunk = [0u8; N as usize];
     for j in 0..chunk.len() { chunk[j] = pat(j as u64); }
     fs.begin_txn();
     fs.crash_after_commit = true;
     let _ = fs.write_at(ctx, F, 0, &chunk, true); // stages the data blocks in the txn
-    let _ = fs.commit_txn(ctx); // halts inside (armed) — control does not return
+    let _ = fs.commit_txn(ctx); // halts inside (armed) - control does not return
     ctx.log("fs: jdata boot1 did NOT crash (unexpected)");
 }
 
@@ -619,7 +619,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
         return;
     }
 
-    // drives API — INFO/FLASH work on a raw disk; LABEL/RESET as below.
+    // drives API - INFO/FLASH work on a raw disk; LABEL/RESET as below.
     match p[0] {
         OP_DRIVES_INFO => {
             // [FS_OK, mounted, capacity:u64, used:u64, flags:u8, label_len:u8, label…]
@@ -656,7 +656,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
             let label = if p.len() >= 2 + ll { &p[2..2 + ll] } else { &[][..] };
             match vol {
                 Some(f) if f.read_only => {
-                    ctx.log("fs: label refused — filesystem mounted READ-ONLY (unsupported ro_compat feature)");
+                    ctx.log("fs: label refused - filesystem mounted READ-ONLY (unsupported ro_compat feature)");
                     send(&[FS_ERR]);
                 }
                 Some(f) => {
@@ -680,10 +680,10 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
             return;
         }
         OP_CHECK => {
-            // fsck: self-managed (not one transaction — rewrites the whole bitmap; idempotent).
+            // fsck: self-managed (not one transaction - rewrites the whole bitmap; idempotent).
             match vol {
                 Some(f) if f.read_only => {
-                    ctx.log("fs: check refused — filesystem mounted READ-ONLY (fsck writes the bitmap)");
+                    ctx.log("fs: check refused - filesystem mounted READ-ONLY (fsck writes the bitmap)");
                     send(&[FS_ERR]);
                 }
                 Some(f) => match f.check(ctx) {
@@ -704,7 +704,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
             return;
         }
         OP_SCRUB => {
-            // scrub: READ-ONLY integrity sweep — verify every referenced block's CRC, report,
+            // scrub: READ-ONLY integrity sweep - verify every referenced block's CRC, report,
             // change nothing on disk (distinct from `check`, which repairs the bitmap). Op-driven
             // (the operator/policy sets the cadence; no hidden background task, §26.4).
             match vol {
@@ -737,7 +737,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
     // Read-only mount (unknown ro_compat feature, §6.15): refuse every mutating op LOUDLY rather
     // than silently dropping the write. Reads (STAT/READ/READ_AT/LIST) pass through.
     if fs.read_only && op_is_mutating(op) {
-        ctx.log("fs: write refused — filesystem mounted READ-ONLY (unsupported ro_compat feature)");
+        ctx.log("fs: write refused - filesystem mounted READ-ONLY (unsupported ro_compat feature)");
         send(&[FS_ERR]);
         return;
     }
@@ -780,7 +780,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
             if tail.len() < 8 { send(&[FS_ERR]); return; }
             let offset = u64_at(tail, 0);
             let chunk = &tail[8..];
-            // Direct (not journaled): no transaction — the fast streaming path (§6.8 data model).
+            // Direct (not journaled): no transaction - the fast streaming path (§6.8 data model).
             send(&[match fs.write_at(ctx, path, offset, chunk, false) { Ok(()) => FS_OK, Err(_) => FS_ERR }]);
         }
         OP_WRITE_AT_J => {
@@ -830,7 +830,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
         },
         OP_RENAME => txn!(fs.rename(ctx, path, tail)),
         OP_DELETE => txn!(fs.delete(ctx, path)),
-        // delete_tree manages its own transactions (unlink + batched frees) — not wrapped.
+        // delete_tree manages its own transactions (unlink + batched frees) - not wrapped.
         OP_DELETE_TREE => send(&[match fs.delete_tree(ctx, path) { Ok(()) => FS_OK, Err(_) => FS_ERR }]),
         OP_MOVE => txn!(fs.move_path(ctx, path, tail)),
         OP_OPEN => {
@@ -845,11 +845,11 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
     }
 }
 
-/// Serve a **file-cap invocation** (§7.10) — a message the kernel badged with the delegated
+/// Serve a **file-cap invocation** (§7.10) - a message the kernel badged with the delegated
 /// `resource_id` + the `right` it validated. The badge is unforgeable (set only by the kernel
 /// after the cap check), so reaching here means the caller holds a real, live cap. We resolve the
 /// resource id → the open file's path, enforce that the operation needs **≤ the validated right**
-/// (the load-bearing non-escalation check, §7.3 — a READ cap can never write), and act.
+/// (the load-bearing non-escalation check, §7.3 - a READ cap can never write), and act.
 fn serve_filecap(ctx: &ServiceContext, vol: &mut Option<Fs>, rid: u64, right: u8, p: &[u8], reply: CapHandle) {
     let send = |bytes: &[u8]| { let _ = ctx.send_by_handle(reply, &Message::from_bytes(bytes)); };
     let fs = match vol { Some(f) => f, None => { send(&[FS_NOFS]); return; } };
@@ -916,7 +916,7 @@ fn serve_filecap(ctx: &ServiceContext, vol: &mut Option<Fs>, rid: u64, right: u8
 impl Fs {
     // ── mount / format / drive metadata ──────────────────────────────────────
     /// Validate a superblock copy: correct (frozen) magic AND CRC32 over the first `SB_CRC_OFF`
-    /// bytes — which now includes the GSFS0008 feature masks (§3.12, §6.15).
+    /// bytes - which now includes the GSFS0008 feature masks (§3.12, §6.15).
     fn sb_valid(b: &[u8; BLOCK]) -> bool {
         &b[0..8] == SB_MAGIC && u32_at(b, SB_CRC_OFF) == crc32(&b[..SB_CRC_OFF])
     }
@@ -930,12 +930,12 @@ impl Fs {
         if let Some(ref b) = primary {
             if Self::sb_valid(b) { return Ok(*b); }
         }
-        // Primary missing/corrupt — try the backup at capacity-1.
+        // Primary missing/corrupt - try the backup at capacity-1.
         let cap = block_capacity(ctx).unwrap_or(0);
         if cap >= 2 {
             if let Some(bk) = block_read(ctx, cap - 1) {
                 if Self::sb_valid(&bk) {
-                    ctx.log("fs: primary superblock bad — recovered from backup superblock");
+                    ctx.log("fs: primary superblock bad - recovered from backup superblock");
                     let _ = block_write(ctx, 0, &bk); // heal the primary copy
                     return Ok(bk);
                 }
@@ -943,8 +943,8 @@ impl Fs {
         }
         match primary {
             Some(ref b) if &b[0..8] == SB_MAGIC =>
-                Err("superblock checksum mismatch (both copies) — refusing to mount corrupt filesystem"),
-            _ => Err("bad superblock magic — disk not formatted (run drives flash)"),
+                Err("superblock checksum mismatch (both copies) - refusing to mount corrupt filesystem"),
+            _ => Err("bad superblock magic - disk not formatted (run drives flash)"),
         }
     }
 
@@ -952,8 +952,8 @@ impl Fs {
         let sb = Self::read_superblock(ctx)?;
         // Feature policy (GSFS0008, §6.15). The masks are valid because `sb_valid` (above) covers
         // them under the superblock CRC. An `incompat` bit this build doesn't know means the
-        // on-disk structure is fundamentally different — REFUSE loudly (never a risky misread). An
-        // unknown `ro_compat` bit means we can read but not safely write — mount READ-ONLY. Unknown
+        // on-disk structure is fundamentally different - REFUSE loudly (never a risky misread). An
+        // unknown `ro_compat` bit means we can read but not safely write - mount READ-ONLY. Unknown
         // `compat` bits are safe to ignore. This is what lets the format evolve without a reformat.
         let feat_compat = u32_at(&sb, FEAT_COMPAT_OFF);
         let feat_ro_compat = u32_at(&sb, FEAT_RO_COMPAT_OFF);
@@ -961,20 +961,20 @@ impl Fs {
         let unknown_incompat = feat_incompat & !KNOWN_INCOMPAT;
         if unknown_incompat != 0 {
             ctx.log_fmt(format_args!(
-                "fs: refusing to mount — disk uses incompatible features (incompat mask {:#010x}, unknown {:#010x})",
+                "fs: refusing to mount - disk uses incompatible features (incompat mask {:#010x}, unknown {:#010x})",
                 feat_incompat, unknown_incompat));
             return Err("disk uses incompatible features this build does not understand");
         }
         let read_only = (feat_ro_compat & !KNOWN_RO_COMPAT) != 0;
         if read_only {
             ctx.log_fmt(format_args!(
-                "fs: mounting READ-ONLY — disk uses ro_compat features this build doesn't support (ro_compat mask {:#010x})",
+                "fs: mounting READ-ONLY - disk uses ro_compat features this build doesn't support (ro_compat mask {:#010x})",
                 feat_ro_compat));
         }
         // Crash recovery: replay a committed-but-unfinished transaction before serving (§9).
-        // Idempotent — a clean shutdown leaves no commit record, so this is a no-op then. (A
+        // Idempotent - a clean shutdown leaves no commit record, so this is a no-op then. (A
         // read-only mount still recovers: replaying an already-committed write is not a new write,
-        // and leaving the fs torn would be worse — see §6.15.)
+        // and leaving the fs torn would be worse - see §6.15.)
         Fs::recover(ctx, u64_at(&sb, 108));
         let mut label = [0u8; LABEL_MAX];
         let ll = (sb[76] as usize).min(LABEL_MAX);
@@ -1046,7 +1046,7 @@ impl Fs {
     fn td_read(&self, ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
         let blk = self.tb_read(ctx, lba)?;
         if u32_at(&blk, DIR_CRC_OFF) != crc32(&blk[..DIR_REC_REGION]) {
-            ctx.log_fmt(format_args!("fs: directory block CRC mismatch at lba {} — refusing", lba));
+            ctx.log_fmt(format_args!("fs: directory block CRC mismatch at lba {} - refusing", lba));
             return None;
         }
         Some(blk)
@@ -1087,7 +1087,7 @@ impl Fs {
                 return Err("journal data write failed");
             }
         }
-        // 2. Write the commit record — the atomic point. magic + n + home LBAs + CRC32.
+        // 2. Write the commit record - the atomic point. magic + n + home LBAs + CRC32.
         let mut commit = [0u8; BLOCK];
         commit[0..4].copy_from_slice(&JOURNAL_MAGIC.to_le_bytes());
         commit[4..8].copy_from_slice(&(n as u32).to_le_bytes());
@@ -1097,21 +1097,21 @@ impl Fs {
         let crc = crc32(&commit[..8 + n * 8]);
         commit[COMMIT_CRC_OFF..COMMIT_CRC_OFF + 4].copy_from_slice(&crc.to_le_bytes());
         if !block_write(ctx, self.journal_start, &commit) { return Err("journal commit write failed"); }
-        // Test-only: simulate a power loss right here — commit record durable, home not yet
+        // Test-only: simulate a power loss right here - commit record durable, home not yet
         // updated. The next mount must replay this transaction. (Never set in production.)
         if self.crash_after_commit {
-            ctx.log("fs: [journal-crash-test] commit record durable — halting before checkpoint (simulated crash)");
+            ctx.log("fs: [journal-crash-test] commit record durable - halting before checkpoint (simulated crash)");
             loop { ctx.yield_cpu(); }
         }
         // 3. Checkpoint: write each staged block to its home LBA.
         for i in 0..n {
             if !block_write(ctx, self.txn_lba[i], &self.txn_blk[i]) {
                 // Commit is durable: the next mount will replay this transaction. Report, but
-                // the data is safe — no corruption, only a deferred checkpoint.
+                // the data is safe - no corruption, only a deferred checkpoint.
                 return Err("checkpoint write failed (will replay on next mount)");
             }
         }
-        // 4. Invalidate the journal (idempotent — recovery tolerates a stale commit too).
+        // 4. Invalidate the journal (idempotent - recovery tolerates a stale commit too).
         let _ = block_write(ctx, self.journal_start, &[0u8; BLOCK]);
         Ok(())
     }
@@ -1190,7 +1190,7 @@ impl Fs {
         sb[116..124].copy_from_slice(&journal_blocks.to_le_bytes());
         // Feature masks (GSFS0008): a fresh disk always has the backup superblock (compat), no
         // ro_compat feature, and no fragmented file yet (incompat gains EXTENTS lazily, on first
-        // fragmentation — see `alloc_file`).
+        // fragmentation - see `alloc_file`).
         sb[FEAT_COMPAT_OFF..FEAT_COMPAT_OFF + 4].copy_from_slice(&FEAT_COMPAT_BACKUP_SB.to_le_bytes());
         sb[FEAT_RO_COMPAT_OFF..FEAT_RO_COMPAT_OFF + 4].copy_from_slice(&0u32.to_le_bytes());
         sb[FEAT_INCOMPAT_OFF..FEAT_INCOMPAT_OFF + 4].copy_from_slice(&0u32.to_le_bytes());
@@ -1200,7 +1200,7 @@ impl Fs {
         if !block_write(ctx, 0, &sb) { return Err("superblock write failed"); }
         if !block_write(ctx, backup_lba, &sb) { return Err("backup superblock write failed"); }
 
-        // Zero the bitmap region in one batched op (driver writes multi-sector zero runs —
+        // Zero the bitmap region in one batched op (driver writes multi-sector zero runs -
         // keeps `drives flash` fast even on a 122 GB disk), then mark [0..used_through) used.
         if !block_write_zeros(ctx, bitmap_start, bitmap_blocks) { return Err("bitmap init failed"); }
         let mut b = 0u64;
@@ -1261,10 +1261,10 @@ impl Fs {
         sb[FEAT_COMPAT_OFF..FEAT_COMPAT_OFF + 4].copy_from_slice(&self.feat_compat.to_le_bytes());
         sb[FEAT_RO_COMPAT_OFF..FEAT_RO_COMPAT_OFF + 4].copy_from_slice(&self.feat_ro_compat.to_le_bytes());
         sb[FEAT_INCOMPAT_OFF..FEAT_INCOMPAT_OFF + 4].copy_from_slice(&self.feat_incompat.to_le_bytes());
-        // Re-stamp the integrity CRC over the updated superblock — now covering the masks (§3.12).
+        // Re-stamp the integrity CRC over the updated superblock - now covering the masks (§3.12).
         let sb_crc = crc32(&sb[..SB_CRC_OFF]);
         sb[SB_CRC_OFF..SB_CRC_OFF + 4].copy_from_slice(&sb_crc.to_le_bytes());
-        // Write BOTH copies — primary (LBA 0) and backup (last LBA) — staged in the same
+        // Write BOTH copies - primary (LBA 0) and backup (last LBA) - staged in the same
         // transaction, so they commit atomically and the backup never lags the primary.
         if !self.tb_write(ctx, 0, &sb) { return Err("superblock write failed"); }
         if !self.tb_write(ctx, self.total_blocks - 1, &sb) { return Err("backup superblock write failed"); }
@@ -1346,7 +1346,7 @@ impl Fs {
     fn ext_of(&self, ctx: &ServiceContext, e: &Entry) -> Option<([(u64, u64); EXT_MAX], usize)> {
         let blk = self.tb_read(ctx, e.first_block)?;
         if u32_at(&blk, EXT_CRC_OFF) != crc32(&blk[..EXT_CRC_OFF]) {
-            ctx.log_fmt(format_args!("fs: extent block CRC mismatch at lba {} — refusing", e.first_block));
+            ctx.log_fmt(format_args!("fs: extent block CRC mismatch at lba {} - refusing", e.first_block));
             return None;
         }
         let n = (u32_at(&blk, EXT_N_OFF) as usize).min(EXT_MAX);
@@ -1549,7 +1549,7 @@ impl Fs {
                 }
             }
         }
-        // No free slot — grow, then place in the fresh block.
+        // No free slot - grow, then place in the fresh block.
         self.grow_dir(ctx, dir)?;
         let block = dir.first_block + dir.block_count - 1;
         let mut blk = self.td_read(ctx, block).ok_or("dir read failed")?;
@@ -1734,7 +1734,7 @@ impl Fs {
     // ── large-file streaming (offset-addressed; the data path that lifts the one-message
     //    file-size cap). A big file is created once with `write_new` (which allocates the
     //    whole extent up front), filled by sequential `write_at` chunks, and read back with
-    //    `read_at` chunks. No open-file/session state — each call is self-contained (§8).
+    //    `read_at` chunks. No open-file/session state - each call is self-contained (§8).
 
     /// Create or truncate `path` to a file sized for `total` bytes: allocate a contiguous
     /// extent big enough, record it (size = `total`), and leave the data for `write_at` to
@@ -1761,14 +1761,14 @@ impl Fs {
     }
 
     /// Write `chunk` into an existing file at byte `offset`. The offset must be **payload-block
-    /// aligned** (a multiple of DATA_PAYLOAD — clients stream in such chunks), so whole data
+    /// aligned** (a multiple of DATA_PAYLOAD - clients stream in such chunks), so whole data
     /// blocks are written with no read-modify-write; the final block of a partial chunk is
-    /// zero-padded. Bounded to the file's allocated extent — a write past it is a loud error.
+    /// zero-padded. Bounded to the file's allocated extent - a write past it is a loud error.
     ///
     /// `journal` selects the durability contract (Phase J, §6.13): `false` writes the data
-    /// blocks **direct** (the fast streaming path — a torn chunk is caught by the data CRC on
+    /// blocks **direct** (the fast streaming path - a torn chunk is caught by the data CRC on
     /// read but not recovered); `true` **stages** them in the active transaction (`data_stage`)
-    /// so the whole chunk commits atomically — a crash replays or discards it, never tears it.
+    /// so the whole chunk commits atomically - a crash replays or discards it, never tears it.
     /// The journaled caller (`OP_WRITE_AT_J`) wraps this in `begin_txn`/`end_txn`.
     fn write_at(&mut self, ctx: &ServiceContext, path: &[u8], offset: u64, chunk: &[u8], journal: bool) -> Result<(), &'static str> {
         let e = self.walk(ctx, path).ok_or("not found")?;
@@ -1812,7 +1812,7 @@ impl Fs {
 
     /// Read up to `len` bytes from `path` starting at byte `offset` into `out` (clamped to the
     /// file's size and `out.len()`). Returns the number of bytes read (0 at/after EOF). The
-    /// offset need not be block-aligned — it reads across block boundaries as needed.
+    /// offset need not be block-aligned - it reads across block boundaries as needed.
     fn read_at(&self, ctx: &ServiceContext, path: &[u8], offset: u64, len: usize, out: &mut [u8]) -> Option<usize> {
         let e = self.walk(ctx, path)?;
         if !is_file(e.itype) { return None; }
@@ -1884,7 +1884,7 @@ impl Fs {
                     for b in &mut blk[o + 2..o + 2 + NAME_MAX] { *b = 0; }
                     blk[o + 2..o + 2 + newname.len()].copy_from_slice(newname);
                     if !self.td_write(ctx, block, &mut blk) { return Err("dir write failed"); }
-                    // The old path no longer names this file — revoke any open caps to it, so a
+                    // The old path no longer names this file - revoke any open caps to it, so a
                     // held cap can never silently rebind to a different file later created at the
                     // old path (confused-deputy avoidance; §7.10). Same discipline as delete.
                     self.revoke_open_by_path(ctx, path);
@@ -1919,7 +1919,7 @@ impl Fs {
         ctx.remove_cap(cap);
         if !granted {
             self.open_files[slot].rid = 0;
-            let _ = ctx.resource_revoke(rid); // nothing was handed out — undo the mint
+            let _ = ctx.resource_revoke(rid); // nothing was handed out - undo the mint
             return Err("grant failed");
         }
         Ok(())
@@ -1940,7 +1940,7 @@ impl Fs {
         }
     }
 
-    /// Revoke every open file cap naming `path` — called on delete, so deleting a file a client
+    /// Revoke every open file cap naming `path` - called on delete, so deleting a file a client
     /// holds open makes its cap fail with `CapRevoked` on next use (the revocable property, §7.5).
     fn revoke_open_by_path(&mut self, ctx: &ServiceContext, path: &[u8]) {
         for i in 0..MAX_OPEN {
@@ -1969,7 +1969,7 @@ impl Fs {
     /// the depth-0 case (no children), so this is a strict superset of `delete`.
     /// Manages its own transactions (so it is NOT wrapped by the serve-level transaction):
     /// the unlink is one atomic transaction, then the now-unreachable subtree is reclaimed in
-    /// bounded per-extent transactions — too many blocks to stage as a single atomic set.
+    /// bounded per-extent transactions - too many blocks to stage as a single atomic set.
     fn delete_tree(&mut self, ctx: &ServiceContext, path: &[u8]) -> Result<(), &'static str> {
         let e = self.walk(ctx, path).ok_or("not found")?;
         if e.loc.is_none() { return Err("cannot delete root"); }
@@ -1981,12 +1981,12 @@ impl Fs {
         self.end_txn(ctx, r)?;
         self.revoke_open_by_path(ctx, path); // invalidate any open file caps to the deleted entry
         // Reclaim the unreachable subtree in bounded transactions. A crash here only leaks
-        // blocks (nothing references them) — never corruption.
+        // blocks (nothing references them) - never corruption.
         self.free_subtree(ctx, e.itype, e.first_block, e.block_count, 0)
     }
 
     /// Free an entry's blocks and, if it is a directory, all of its descendants first
-    /// (post-order). Bounded two ways (§26.6): a hard **depth** cap, and small stack frames —
+    /// (post-order). Bounded two ways (§26.6): a hard **depth** cap, and small stack frames -
     /// each level extracts its block's child extents into fixed locals (≤8 per block) and
     /// drops the 512-byte block buffer *before* recursing, so a frame never carries it down.
     fn free_subtree(&mut self, ctx: &ServiceContext, itype: u8, first: u64, count: u64, depth: u32)
@@ -2026,7 +2026,7 @@ impl Fs {
     // ── fsck / `drives check` (Phase G) ───────────────────────────────────────
     // Recover after detection. The directory tree is the source of truth: rebuild the free
     // bitmap and free count from it (fixing any drift), and verify every block's CRC, reporting
-    // (not deleting) files/dirs that fail. Writes are DIRECT (not journaled) — the operation is
+    // (not deleting) files/dirs that fail. Writes are DIRECT (not journaled) - the operation is
     // far larger than one transaction and is idempotent (re-running converges), so a crash
     // mid-check is harmless: the tree is still truth and a re-run finishes the job.
 
@@ -2073,7 +2073,7 @@ impl Fs {
                             }
                             (kids, nk)
                         }
-                        None => { st.2 += 1; continue; } // corrupt dir block — already logged loudly
+                        None => { st.2 += 1; continue; } // corrupt dir block - already logged loudly
                     }
                 };
                 for k in 0..nk {
@@ -2084,7 +2084,7 @@ impl Fs {
         } else {
             st.0 += 1;
             // Verify each data block's CRC (data_read logs a mismatch loudly). Blocks stay
-            // marked used regardless — the entry references them; freeing would risk reuse.
+            // marked used regardless - the entry references them; freeing would risk reuse.
             if itype == ITYPE_FILE_FRAG {
                 // `first` (already marked above) is the extent block; its runs hold the data.
                 let frag_e = Entry { itype, size: 0, first_block: first, block_count: count, loc: None };
@@ -2099,7 +2099,7 @@ impl Fs {
                         }
                         if !ok { st.2 += 1; }
                     }
-                    None => { st.2 += 1; } // corrupt extent block — logged loudly
+                    None => { st.2 += 1; } // corrupt extent block - logged loudly
                 }
             } else {
                 let mut ok = true;
@@ -2115,10 +2115,10 @@ impl Fs {
     // ── scrub / `drives scrub` (Phase K) ──────────────────────────────────────
     // READ-ONLY integrity sweep: walk the tree and verify every referenced block's CRC,
     // reporting (files, dirs, bad, scanned). Writes NOTHING (unlike `check`, which repairs the
-    // bitmap) — so it is safe to run on a healthy filesystem at whatever cadence the operator
+    // bitmap) - so it is safe to run on a healthy filesystem at whatever cadence the operator
     // sets. Without redundancy (no RAID, by design), scrub DETECTS latent bit-rot but cannot
     // repair it: a bad block is reported (and any read of it stays a loud refusal, §3.12), the
-    // data is already lost. The cadence is operator-driven — GodspeedOS has no background-task
+    // data is already lost. The cadence is operator-driven - GodspeedOS has no background-task
     // primitive, so "periodic" is policy (run `drives scrub` on a schedule), not a hidden timer
     // (§26.4: no silent complexity). Read-only ⇒ `&self`, no transaction.
 
@@ -2176,7 +2176,7 @@ impl Fs {
                         }
                         if !ok { st.2 += 1; }
                     }
-                    None => { st.2 += 1; } // corrupt extent block — logged loudly
+                    None => { st.2 += 1; } // corrupt extent block - logged loudly
                 }
             } else {
                 st.3 += count;
@@ -2191,7 +2191,7 @@ impl Fs {
     }
 
     /// Move (relink) an entry: same data, new directory/name. Same-directory move is a
-    /// rename. No data copied — only the directory entries change.
+    /// rename. No data copied - only the directory entries change.
     fn move_path(&mut self, ctx: &ServiceContext, src: &[u8], dst: &[u8]) -> Result<(), &'static str> {
         let e = self.walk(ctx, src).ok_or("source not found")?;
         if e.loc.is_none() { return Err("cannot move root"); }
@@ -2206,7 +2206,7 @@ impl Fs {
         }
         self.dir_add(ctx, &mut dparent, dname, e.itype, e.size, e.first_block, e.block_count)?;
         self.dir_remove(ctx, &sparent, sname)?;
-        // `src` no longer names this file — revoke any open caps to it (confused-deputy
+        // `src` no longer names this file - revoke any open caps to it (confused-deputy
         // avoidance, §7.10). The same-directory case above goes through `rename`, which does this.
         self.revoke_open_by_path(ctx, src);
         Ok(())
@@ -2228,7 +2228,7 @@ fn is_file(itype: u8) -> bool {
     itype == ITYPE_FILE || itype == ITYPE_FILE_FRAG
 }
 
-/// Whether a file-API op writes the filesystem — gated on a READ-ONLY mount (§6.15). The
+/// Whether a file-API op writes the filesystem - gated on a READ-ONLY mount (§6.15). The
 /// early-match ops (LABEL/CHECK mutate; FLASH/RESET reformat-or-wipe and are allowed; INFO/SCRUB
 /// read) are guarded inline; this covers the path-addressed ops dispatched below.
 fn op_is_mutating(op: u8) -> bool {
@@ -2309,7 +2309,7 @@ fn block_read(ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
 }
 
 /// Zero a run of `count` blocks from `lba` in one batched op (the driver writes
-/// multi-sector zero commands — no per-block IPC). Used to clear the bitmap at format.
+/// multi-sector zero commands - no per-block IPC). Used to clear the bitmap at format.
 fn block_write_zeros(ctx: &ServiceContext, lba: u64, count: u64) -> bool {
     let mut req = [0u8; 17];
     req[0] = OP_WRITE_ZEROS;
@@ -2347,7 +2347,7 @@ fn block_write(ctx: &ServiceContext, lba: u64, data: &[u8; BLOCK]) -> bool {
 
 /// Write a **file-data block** at `lba`: copy ≤508 payload bytes (zero-padding the rest),
 /// stamp the CRC32 of the 508-byte payload at @508, and write the 512-byte block. Direct (not
-/// journaled) — data lands in an allocated-but-uncommitted extent, so a pre-commit crash just
+/// journaled) - data lands in an allocated-but-uncommitted extent, so a pre-commit crash just
 /// leaves harmless garbage in free space (Phase C). `payload.len()` must be ≤ DATA_PAYLOAD.
 fn data_write(ctx: &ServiceContext, lba: u64, payload: &[u8]) -> bool {
     let mut blk = [0u8; BLOCK];
@@ -2359,7 +2359,7 @@ fn data_write(ctx: &ServiceContext, lba: u64, payload: &[u8]) -> bool {
 }
 
 /// Read a **file-data block** at `lba` and verify its CRC trailer. Returns the full 512-byte
-/// block (payload is `[..DATA_PAYLOAD]`) on success; a CRC mismatch is a loud refusal (§3.12) —
+/// block (payload is `[..DATA_PAYLOAD]`) on success; a CRC mismatch is a loud refusal (§3.12) -
 /// `fs` never hands back bytes from a corrupt data block.
 fn data_read(ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
     let blk = block_read(ctx, lba)?;
@@ -2367,7 +2367,7 @@ fn data_read(ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
     let actual = crc32(&blk[..DATA_PAYLOAD]);
     if stored != actual {
         ctx.log_fmt(format_args!(
-            "fs: data block CRC mismatch at lba {} (stored {:#010x}, actual {:#010x}) — refusing",
+            "fs: data block CRC mismatch at lba {} (stored {:#010x}, actual {:#010x}) - refusing",
             lba, stored, actual
         ));
         return None;

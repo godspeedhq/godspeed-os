@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Bounded per-endpoint message queue — §8.5.
+//! Bounded per-endpoint message queue - §8.5.
 //!
 //! Fixed depth: 16 messages per endpoint (worst-case 64 KiB per queue).
 //! Not configurable per endpoint in v1; per-endpoint depth is v2 work.
@@ -72,7 +72,7 @@ impl MessageQueue {
         self.len
     }
 
-    /// Drain all messages without delivering them (called on endpoint death — §8.6).
+    /// Drain all messages without delivering them (called on endpoint death - §8.6).
     pub fn drain(&mut self) {
         while self.dequeue().is_some() {}
     }
@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn wraparound_preserves_fifo() {
-        // Fill then drain half, fill again — exercises the head/tail wrap.
+        // Fill then drain half, fill again - exercises the head/tail wrap.
         let mut q = MessageQueue::new();
         for i in 0..8u8 { q.enqueue(msg(i)).unwrap(); }
         for _ in 0..8 { q.dequeue(); }

@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Per-resource generation counters — §7.5.
+//! Per-resource generation counters - §7.5.
 //!
 //! Every capability carries a generation. Every resource in the kernel tracks
 //! its current generation. A mismatch on use means the cap is stale.
@@ -26,7 +26,7 @@ pub struct Generation(pub u32);
 impl Generation {
     pub const INITIAL: Generation = Generation(0);
 
-    /// Bump to the next generation. **Never wraps** — `checked_add` panics on
+    /// Bump to the next generation. **Never wraps** - `checked_add` panics on
     /// overflow rather than rolling over. A wrap to a low value would be a silent
     /// *authority resurrection*: a stale cap minted at that low generation would
     /// match a live resource again, defeating revocation (§7.5). A u32 gives ~4
@@ -81,9 +81,9 @@ mod tests {
         assert!(!cap_gen.matches(after_restart)); // cap is now stale
     }
 
-    /// H7 — the overflow guarantee. `bump` NEVER wraps: at `u32::MAX` it panics
+    /// H7 - the overflow guarantee. `bump` NEVER wraps: at `u32::MAX` it panics
     /// loudly rather than rolling over to a low value, which would let a stale cap
-    /// (minted at that low generation) match a live resource again — silent
+    /// (minted at that low generation) match a live resource again - silent
     /// authority resurrection. This pins the behaviour so a future change to
     /// `wrapping_add` cannot reintroduce the resurrection path unnoticed; the
     /// existing property tests deliberately exclude `u32::MAX`, leaving this the

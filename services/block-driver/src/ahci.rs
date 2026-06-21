@@ -1,4 +1,4 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
@@ -65,7 +65,7 @@ const ATA_WRITE_DMA_EXT: u8 = 0x35;
 const ATA_FLUSH_EXT: u8 = 0xEA;
 
 /// Bounded I/O retry (Phase H): a transient command error (bad/marginal sector, controller
-/// hiccup) is retried this many times — with port error-recovery between attempts — before the
+/// hiccup) is retried this many times - with port error-recovery between attempts - before the
 /// op is reported as failed. Bounded (§26.6); never an infinite retry loop.
 const MAX_IO_ATTEMPTS: u32 = 3;
 
@@ -150,7 +150,7 @@ impl<'a> Ahci<'a> {
         self.arena.write32(CMD_LIST_OFF + 8, ctba as u32);
         self.arena.write32(CMD_LIST_OFF + 12, (ctba >> 32) as u32);
 
-        // Command table — H2D Register FIS (clear the 64-byte CFIS area first).
+        // Command table - H2D Register FIS (clear the 64-byte CFIS area first).
         for i in 0..16 {
             self.arena.write32(CMD_TBL_OFF + i * 4, 0);
         }
@@ -200,13 +200,13 @@ impl<'a> Ahci<'a> {
 
     /// Clear the port's error state so a retried command can run: clear PxSERR + PxIS
     /// (write-1-to-clear), and if the command engine halted on the error (CR clear while ST is
-    /// still set), restart it (toggle ST). Best-effort — used only on the retry path.
+    /// still set), restart it (toggle ST). Best-effort - used only on the retry path.
     fn recover_port(&self) {
         self.pwrite(PX_SERR, 0xFFFF_FFFF); // W1C all SATA error bits
         self.pwrite(PX_IS, 0xFFFF_FFFF);   // W1C all port interrupt-status bits
         let cmd = self.pread(PX_CMD);
         if cmd & CMD_ST != 0 && cmd & CMD_CR == 0 {
-            // Engine halted on the error — stop fully, then restart.
+            // Engine halted on the error - stop fully, then restart.
             self.pwrite(PX_CMD, cmd & !CMD_ST);
             for _ in 0..1_000_000u32 {
                 if self.pread(PX_CMD) & CMD_CR == 0 { break; }
@@ -251,7 +251,7 @@ impl<'a> Ahci<'a> {
                 Err(e) => {
                     last = e;
                     ctx.log_fmt(format_args!(
-                        "block-driver: {} lba {} failed (attempt {}/{}): {} — recovering, will retry",
+                        "block-driver: {} lba {} failed (attempt {}/{}): {} - recovering, will retry",
                         op, lba, attempt, MAX_IO_ATTEMPTS, e));
                     self.recover_port();
                 }
@@ -316,13 +316,13 @@ impl<'a> Ahci<'a> {
     }
 
     /// Write `count` zeroed sectors from `lba`, batched into multi-sector WRITE DMA EXT
-    /// commands (up to MAX_PER sectors each — bounded by the DMA arena's data area). One
+    /// commands (up to MAX_PER sectors each - bounded by the DMA arena's data area). One
     /// IPC call zeros a whole run, so `fs` can clear a big bitmap without per-block traffic.
     fn write_zeros(&self, ctx: &ServiceContext, lba: u64, count: u64) -> Result<(), &'static str> {
         if count == 0 {
             return Ok(());
         }
-        const MAX_PER: u64 = 64; // 32 KiB — fits the arena's data area (DATA_OFF..64 KiB)
+        const MAX_PER: u64 = 64; // 32 KiB - fits the arena's data area (DATA_OFF..64 KiB)
         // Zero the data buffer once; it stays zero across the batched commands.
         for i in 0..(MAX_PER as usize * 512 / 4) {
             self.arena.write32(DATA_OFF + i * 4, 0);
@@ -389,7 +389,7 @@ impl<'a> Ahci<'a> {
                 let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[status]));
             }
             OP_WRITE_ZEROS => {
-                // [op, lba:u64, count:u64] — zero `count` blocks from `lba`.
+                // [op, lba:u64, count:u64] - zero `count` blocks from `lba`.
                 if p.len() < 17 {
                     err(ctx);
                     return;
@@ -431,7 +431,7 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
             let sig = hba.read32(base + PX_SIG);
             ctx.log_fmt(format_args!(
                 "block-driver: AHCI port {}: device present (DET=3) sig={:#010x}{}",
-                p, sig, if sig == SIG_SATA { " — SATA disk" } else { "" }
+                p, sig, if sig == SIG_SATA { " - SATA disk" } else { "" }
             ));
             if sig == SIG_SATA && disk_port.is_none() {
                 disk_port = Some(p);
@@ -442,7 +442,7 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
     let port = match disk_port {
         Some(p) => p,
         None => {
-            ctx.log("block-driver: AHCI — no SATA disk found on any implemented port");
+            ctx.log("block-driver: AHCI - no SATA disk found on any implemented port");
             loop { ctx.yield_cpu(); }
         }
     };
@@ -450,7 +450,7 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
     let arena = match ctx.dma_region() {
         Some(d) => d,
         None => {
-            ctx.log("block-driver: AHCI — no DMA arena granted");
+            ctx.log("block-driver: AHCI - no DMA arena granted");
             loop { ctx.yield_cpu(); }
         }
     };
@@ -467,26 +467,26 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
             let model_str = core::str::from_utf8(&model).unwrap_or("?");
             let mib = sectors / 2048; // 512-byte sectors → MiB
             ctx.log_fmt(format_args!(
-                "block-driver: AHCI port {} IDENTIFY OK — model='{}' sectors={} ({} MiB)",
+                "block-driver: AHCI port {} IDENTIFY OK - model='{}' sectors={} ({} MiB)",
                 port, model_str.trim_end(), sectors, mib
             ));
         }
         Err(e) => ctx.log_fmt(format_args!("block-driver: AHCI IDENTIFY FAILED: {}", e)),
     }
 
-    // Boot self-test: read sector 0 (proves the AHCI read/DMA path on this disk —
+    // Boot self-test: read sector 0 (proves the AHCI read/DMA path on this disk -
     // the key thing to confirm on real hardware). Non-destructive; write is proven
     // by the fs file round-trip (and by `drives flash` later on hardware).
     let mut s0 = [0u8; 512];
     match ahci.read_block(ctx, 0, &mut s0) {
         Ok(()) => ctx.log_fmt(format_args!(
-            "block-driver: AHCI read self-test OK — sector 0 [{:02x} {:02x} {:02x} {:02x} …]",
+            "block-driver: AHCI read self-test OK - sector 0 [{:02x} {:02x} {:02x} {:02x} …]",
             s0[0], s0[1], s0[2], s0[3]
         )),
         Err(e) => ctx.log_fmt(format_args!("block-driver: AHCI read self-test FAILED: {}", e)),
     }
 
-    // Path C (Phase 4): no self-registration — the kernel name-directory records "block-driver"
+    // Path C (Phase 4): no self-registration - the kernel name-directory records "block-driver"
     // at spawn (refreshed on restart), so `fs` reacquires us by name via the directory (§14.3).
 
     // Serve block read/write requests from `fs` over IPC (READ/WRITE DMA EXT).

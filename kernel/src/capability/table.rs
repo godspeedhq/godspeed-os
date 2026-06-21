@@ -1,19 +1,19 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Per-task capability table and the global resource generation registry — §7.8.
+//! Per-task capability table and the global resource generation registry - §7.8.
 //!
 //! Two structures live here:
 //!
-//! 1. `CapTable` — one per task; maps a slot index to a `Capability`.
+//! 1. `CapTable` - one per task; maps a slot index to a `Capability`.
 //!    Populated at spawn time from the service contract; modified only on
 //!    GRANT transfer or explicit revocation.
 //!
-//! 2. `GlobalResourceTable` — one per kernel; maps `ResourceId` to its
+//! 2. `GlobalResourceTable` - one per kernel; maps `ResourceId` to its
 //!    current generation and liveness. Consulted on every cap validation.
 //!
 //! Concurrency (§7.8): v1 uses a global RwLock. Reads (lookup + gen check)
@@ -104,14 +104,14 @@ impl CapTable {
     }
 
     /// Return true if this table holds a capability on `rid` carrying
-    /// `required_right`. Searches by resource rather than slot — used to gate
+    /// `required_right`. Searches by resource rather than slot - used to gate
     /// syscalls that consume all argument registers and so cannot pass a cap-slot
     /// (the introspection syscalls, §3.1). See `docs/introspection-capability.md`.
     ///
-    /// **Intended for STABLE kernel resources only** (generation 0 forever —
+    /// **Intended for STABLE kernel resources only** (generation 0 forever -
     /// `LOG_WRITE`, `SPAWN`, `INTROSPECT`, …). Those are never revoked, so a held
-    /// cap always matches the record; we deliberately skip the generation check —
-    /// and the `GLOBAL_RESOURCES` lock it would need — to keep this off the syscall
+    /// cap always matches the record; we deliberately skip the generation check -
+    /// and the `GLOBAL_RESOURCES` lock it would need - to keep this off the syscall
     /// hot path (the v1 global lock is the §7.8 contention point). Do NOT use for
     /// revocable/endpoint resources, where a stale cap must fail its gen check.
     pub fn holds_resource(&self, rid: ResourceId, required_right: Rights) -> bool {
@@ -146,7 +146,7 @@ pub enum Liveness {
 // IDs below this threshold are stored in a direct-indexed array for O(1) lookup.
 // All endpoint ResourceIds (monotonically allocated from ~100) and well-known
 // kernel resource IDs (LOG_WRITE, SPAWN, etc., all < 100) fall within this range.
-// P2 adds ~1000 entries, P8 adds ~2500 — both fit comfortably within 8192.
+// P2 adds ~1000 entries, P8 adds ~2500 - both fit comfortably within 8192.
 const DIRECT_CAP: usize = 8192;
 // Large IDs (e.g. cap-subsystem self-test resources like 57005, 57007) are rare
 // and handled by a small linear-scan overflow table.
@@ -213,7 +213,7 @@ impl GlobalResourceTable {
             self.present[i] = true;
         } else {
             assert!(self.overflow_len < OVERFLOW_CAP,
-                "GlobalResourceTable overflow full — increase OVERFLOW_CAP");
+                "GlobalResourceTable overflow full - increase OVERFLOW_CAP");
             self.overflow[self.overflow_len] =
                 (id, ResourceRecord { generation: gen, liveness: Liveness::Alive });
             self.overflow_len += 1;
@@ -233,7 +233,7 @@ pub fn register_resource(id: ResourceId) {
     GLOBAL_RESOURCES.lock().register(id);
 }
 
-/// Register a new resource starting at a specific generation (used on respawn — §7.5 P2/P8).
+/// Register a new resource starting at a specific generation (used on respawn - §7.5 P2/P8).
 pub fn register_resource_at_gen(id: ResourceId, gen: Generation) {
     GLOBAL_RESOURCES.lock().register_at_gen(id, gen);
 }
@@ -353,7 +353,7 @@ mod tests {
     }
 
     // --- CapTable properties ------------------------------------------------
-    // insert/remove do not touch GLOBAL_RESOURCES — entirely local state.
+    // insert/remove do not touch GLOBAL_RESOURCES - entirely local state.
 
     proptest! {
         /// Inserting n caps (n ≤ MAX_CAPS_PER_TASK) always succeeds.

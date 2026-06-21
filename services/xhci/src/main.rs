@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! `xhci` — USB host-controller driver (§12). Multi-HID: enumerates EVERY
+//! `xhci` - USB host-controller driver (§12). Multi-HID: enumerates EVERY
 //! connected port and binds up to `MAX_HID` boot-protocol HID devices (a
 //! keyboard AND a mouse) on the SAME controller at once, then polls all of them
 //! from one loop, demultiplexing transfer events by slot id. All hardware access
@@ -49,7 +49,7 @@ const PORT_RW1C: u32 = 0x00FE_0000; // change bits 17..23 (write 0 to preserve)
 
 // DMA arena layout (64 KiB). Shared controller structures up front, then a
 // per-device 4-page slice (device context + EP0 ring + interrupt ring + report
-// buffer) for each HID device we bind — so a keyboard AND a mouse can run on the
+// buffer) for each HID device we bind - so a keyboard AND a mouse can run on the
 // same controller at once. Device i occupies [DEV_BASE + i*DEV_STRIDE, +STRIDE).
 const DCBAA_OFF: usize = 0x0000;
 const CMD_RING_OFF: usize = 0x1000;
@@ -60,7 +60,7 @@ const DATA_BUF_OFF: usize = 0x5000;   // transient: control-transfer data during
 const CONFIG_BUF_OFF: usize = 0x6000; // transient: config descriptor during enumeration
 
 // Scratchpad: the controller's own runtime DMA workspace. DCBAA[0] points at the
-// Scratchpad Buffer Array (SBA) — an array of physical pointers to N page-aligned
+// Scratchpad Buffer Array (SBA) - an array of physical pointers to N page-aligned
 // scratchpad buffers, where N = HCSPARAMS2.MaxScratchpadBufs. Real AMD xHCI needs
 // 256 of them and malfunctions (devices drop, re-enumerate) without them. The SBA
 // lives at arena page 15; the buffers occupy pages 16.. (the arena's tail, sized
@@ -116,7 +116,7 @@ fn spin<F: Fn() -> bool>(cond: F) {
 /// Wait until a port reports a *newly* connected device, then return so the caller
 /// re-scans. Snapshots the ports already connected on entry (e.g. the USB boot
 /// drive, which is always present and is not a HID) and only returns when a port
-/// that was NOT connected becomes connected — otherwise an always-present non-HID
+/// that was NOT connected becomes connected - otherwise an always-present non-HID
 /// device would make the hot-plug loop spin (re-scan → not a keyboard → wait →
 /// still connected → re-scan …).
 fn wait_for_port(ctx: &ServiceContext, mmio: &Mmio, op: usize, max_ports: u32) {
@@ -146,7 +146,7 @@ fn wait_for_port(ctx: &ServiceContext, mmio: &Mmio, op: usize, max_ports: u32) {
 /// "\n" starts the notice on its own line; the injected newline supplies the
 /// terminating line break, so there is no blank line.
 fn notify(ctx: &ServiceContext, msg: &str) {
-    // Leading "\n " — the space is sacrificial: the framebuffer drops the first
+    // Leading "\n " - the space is sacrificial: the framebuffer drops the first
     // glyph drawn on a freshly-scrolled line, so we let it eat a space, not the
     // 'U' of "USB:". (Serial is unaffected.)
     ctx.console_write("\n USB: ");
@@ -156,7 +156,7 @@ fn notify(ctx: &ServiceContext, msg: &str) {
 
 fn idle(ctx: &ServiceContext) -> ! {
     // Degraded terminal path (no controller / no DMA / no keyboard). Still report
-    // input-ready so the shell's boot-screen auto-clear fires — boot is "done" as
+    // input-ready so the shell's boot-screen auto-clear fires - boot is "done" as
     // far as the input subsystem is concerned, even if there's no usable keyboard.
     ctx.signal_input_ready();
     loop {
@@ -170,7 +170,7 @@ fn idle(ctx: &ServiceContext) -> ! {
 /// Drain one event from the event ring. `max_tries` bounds how long to wait for an
 /// event whose cycle bit has flipped: the command path passes a large budget (it just
 /// rang a doorbell and expects a completion imminently); the **poll loop passes 1** so
-/// it is fully non-blocking — otherwise, while a key is held (no new transfer events),
+/// it is fully non-blocking - otherwise, while a key is held (no new transfer events),
 /// this would busy-spin millions of times before returning `None`, starving the
 /// typematic auto-repeat poll at the bottom of the loop.
 fn next_event(
@@ -336,7 +336,7 @@ fn enumerate_one(
     ));
 
     // Enable the port. USB3 (SuperSpeed) ports auto-train and are already enabled
-    // (PED=1) — issuing the USB2 port-reset (PR) bit *disables* them. So only reset
+    // (PED=1) - issuing the USB2 port-reset (PR) bit *disables* them. So only reset
     // a not-yet-enabled (USB2) port; an already-enabled port is used as-is.
     if psc & PORT_PED == 0 {
         mmio.write32(portsc_off, (psc & !PORT_RW1C) | PORT_PR);
@@ -364,7 +364,7 @@ fn enumerate_one(
     ) {
         Some(r) => r,
         None => {
-            ctx.log("xhci: Enable Slot — no completion");
+            ctx.log("xhci: Enable Slot - no completion");
             return None;
         }
     };
@@ -375,7 +375,7 @@ fn enumerate_one(
     ctx.log_fmt(format_args!("xhci: slot {} enabled", slot));
 
     // Build the Input Context for Address Device.
-    //   +0:            Input Control Context — Add flags A0(slot)|A1(ep0)
+    //   +0:            Input Control Context - Add flags A0(slot)|A1(ep0)
     //   +ctx_size:     Slot Context
     //   +2*ctx_size:   Endpoint 0 Context
     let islot = INPUT_CTX_OFF + ctx_size;
@@ -404,7 +404,7 @@ fn enumerate_one(
     ) {
         Some(r) => r,
         None => {
-            ctx.log("xhci: Address Device — no completion");
+            ctx.log("xhci: Address Device - no completion");
             return None;
         }
     };
@@ -413,7 +413,7 @@ fn enumerate_one(
         return None;
     }
     ctx.log_fmt(format_args!(
-        "xhci: Address Device OK — device on port {} addressed (slot {})",
+        "xhci: Address Device OK - device on port {} addressed (slot {})",
         port, slot
     ));
 
@@ -485,7 +485,7 @@ fn enumerate_one(
 
     // Walk the descriptors: config (bConfigurationValue), interface (HID protocol),
     // endpoint (the interrupt-IN endpoint we'll poll for reports). A composite
-    // device may expose extra interfaces with their own interrupt-IN endpoints —
+    // device may expose extra interfaces with their own interrupt-IN endpoints -
     // bind the boot keyboard (class 3, proto 1) or mouse (proto 2) interface, not
     // whichever endpoint happens to come last.
     let total = ((dma.read32(CONFIG_BUF_OFF) >> 16) & 0xFFFF) as usize;
@@ -608,14 +608,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mmio = match ctx.xhci_mmio() {
         Some(m) => m,
         None => {
-            ctx.log("xhci: no controller MMIO granted — idling");
+            ctx.log("xhci: no controller MMIO granted - idling");
             idle(&ctx);
         }
     };
     let dma = match ctx.dma_region() {
         Some(d) => d,
         None => {
-            ctx.log("xhci: no DMA arena granted — idling");
+            ctx.log("xhci: no DMA arena granted - idling");
             idle(&ctx);
         }
     };
@@ -651,7 +651,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // Hot-plug loop. Each pass FULLY re-initializes the controller (stop, reset,
     // rebuild the command/event rings + DCBAA, run) so every (re)enumeration starts
-    // from pristine state — no stale completion events or slots can survive an
+    // from pristine state - no stale completion events or slots can survive an
     // unplug/replug to desync the rings. Then it (re)scans every port, binds up to
     // MAX_HID HID devices (keyboard + mouse), and polls all of them until ANY of
     // them is unplugged (root-port CCS drops); on a drop it announces and loops,
@@ -692,7 +692,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // P2 (interrupt-driven, §12): enable the interrupter so the controller raises its
         // MSI-X (kernel-programmed to vector 0x28) when it posts an event. IMAN: IE on, write
         // 1 to IP to clear any stale pending; USBCMD.INTE gates interrupts globally. The poll
-        // loop still runs and acks (clears IMAN.IP) — belt-and-suspenders until P4.
+        // loop still runs and acks (clears IMAN.IP) - belt-and-suspenders until P4.
         mmio.write32(ir0 + 0x00, IMAN_IE | IMAN_IP);
         let c = mmio.read32(op + OP_USBCMD);
         mmio.write32(op + OP_USBCMD, c | CMD_RS | CMD_INTE);
@@ -740,7 +740,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // boot-screen clear fires (the keyboard may be on the other controller),
             // then wait for a port connection and re-scan.
             if !signaled { ctx.signal_input_ready(); signaled = true; }
-            ctx.log("xhci: no HID keyboard/mouse on any port — waiting for a connection");
+            ctx.log("xhci: no HID keyboard/mouse on any port - waiting for a connection");
             wait_for_port(&ctx, &mmio, op, max_ports);
             announce = true; // whatever connects now is a real plug event
             continue 'reenum;
@@ -751,7 +751,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Announce only devices that weren't already bound on the previous pass. A
         // hot-plug re-initializes the whole controller and re-binds EVERY surviving
         // device, but a device whose port was bound last pass wasn't physically
-        // touched — announcing it again ("keyboard connected" when only the mouse
+        // touched - announcing it again ("keyboard connected" when only the mouse
         // was unplugged) would be misleading. `announce` stays false for the boot
         // pass, so the initial devices are silent regardless.
         if announce {
@@ -789,7 +789,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         ];
         // Snapshot every connected root-hub port at poll start: the bound HID
         // devices, plus any non-HID device (e.g. a thumbdrive). A genuinely NEW
-        // connection — a port NOT in this set becoming connected — triggers a
+        // connection - a port NOT in this set becoming connected - triggers a
         // re-enumeration, so a keyboard added while the mouse stays plugged is
         // noticed. Without this the poll loop only ever reacts to disconnects, so a
         // second device added later would stay invisible until everything is
@@ -804,7 +804,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         }
         'poll: loop {
-            // (Re-)arm each device's interrupt ring as needed, BEFORE blocking — so a fresh
+            // (Re-)arm each device's interrupt ring as needed, BEFORE blocking - so a fresh
             // HID report can post a transfer event (→ MSI-X) that wakes us.
             for d in 0..ndev {
                 if !need_queue[d] { continue; }
@@ -827,8 +827,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
 
             // BUSY-POLL (§12). The CPU-reduction experiment (block on recv_timeout to idle the
-            // core, interrupt/timer to wake) introduced subtle quirks on this hardware — input
-            // lag, sluggish auto-repeat, hot-plug wedges — so we scaled it back to the model that
+            // core, interrupt/timer to wake) introduced subtle quirks on this hardware - input
+            // lag, sluggish auto-repeat, hot-plug wedges - so we scaled it back to the model that
             // worked flawlessly: yield each pass and re-scan. The MSI-X interrupt is still
             // enabled and drained below (belt-and-suspenders), it just doesn't gate the loop.
             // The core runs hot; reclaiming that idle cleanly is deferred (revisit later).
@@ -851,7 +851,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             for (j, b) in rep.iter_mut().enumerate() {
                                 *b = dma.read8(report_off(dev) + j);
                             }
-                            // Skip an all-0xff report — a failed/stale DMA read from a device
+                            // Skip an all-0xff report - a failed/stale DMA read from a device
                             // that vanished mid-transaction (e.g. a rapid unplug/replug). Decoding
                             // it would push 0xff "keystrokes" to the console; the real disconnect
                             // is caught by the PORTSC CCS check below, which re-initialises.
@@ -874,7 +874,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 // only for keyboard reports (a mouse button byte can alias the
                                 // modifier bits). reboot() does not return.
                                 if godspeed_sdk::hid::is_ctrl_alt_del(&rep) {
-                                    ctx.log("xhci: Ctrl+Alt+Del — rebooting");
+                                    ctx.log("xhci: Ctrl+Alt+Del - rebooting");
                                     ctx.reboot();
                                 }
                                 godspeed_sdk::hid::decode_keyboard(
@@ -886,13 +886,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             need_queue[d] = true;
                         }
                     }
-                    Some(_) => {} // non-transfer event (port change, command, etc.) — drained
+                    Some(_) => {} // non-transfer event (port change, command, etc.) - drained
                     None => break,
                 }
             }
 
             // Unplug detection: if ANY bound device's root-port CCS drops, break and
-            // fully re-initialize — re-binding whatever remains on the next pass.
+            // fully re-initialize - re-binding whatever remains on the next pass.
             for d in 0..ndev {
                 let portsc_off = op + OP_PORTSC_BASE + (devs[d].port as usize - 1) * 0x10;
                 if mmio.read32(portsc_off) & PORT_CCS == 0 {
@@ -907,13 +907,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
             // New-device detection: while we still have a free device slice, a port
             // that was NOT connected at poll start becoming connected is a fresh
-            // plug — break and re-enumerate to bind it alongside the existing
+            // plug - break and re-enumerate to bind it alongside the existing
             // device(s). Tracks port leaves so a re-plug into the same port counts.
             if ndev < MAX_HID {
                 for p in 1..=max_ports {
                     let c = mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10) & PORT_CCS != 0;
                     if c && present & (1 << p) == 0 {
-                        ctx.log_fmt(format_args!("xhci: new device on port {} — re-enumerating", p));
+                        ctx.log_fmt(format_args!("xhci: new device on port {} - re-enumerating", p));
                         announce = true;
                         break 'poll;
                     }

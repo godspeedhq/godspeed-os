@@ -1,17 +1,17 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Minimal PCI enumeration (§12) — Stage 1 of the USB stack.
+//! Minimal PCI enumeration (§12) - Stage 1 of the USB stack.
 //!
 //! Uses legacy PCI configuration mechanism #1 (port `0xCF8` address / `0xCFC`
 //! data) to scan the bus and locate the xHCI USB host controller. The
 //! discovered MMIO base and IRQ line are recorded so the kernel can later mint
 //! an `hw_mmio` + `hw_interrupt` capability for the userspace `xhci` driver
-//! service (§12.3) — the driver owns the controller; the kernel only routes its
+//! service (§12.3) - the driver owns the controller; the kernel only routes its
 //! interrupt and grants register access.
 //!
 //! Port I/O is hardware access, so this lives in the arch layer (§18.1).
@@ -34,7 +34,7 @@ const PROGIF_EHCI: u8 = 0x20;
 pub static XHCI_FOUND: AtomicBool = AtomicBool::new(false);
 pub static XHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
 pub static XHCI_IRQ: AtomicU8 = AtomicU8::new(0);
-/// PCI BDF (bus<<8 | dev<<3 | func) of the driver's xHCI — the index into the
+/// PCI BDF (bus<<8 | dev<<3 | func) of the driver's xHCI - the index into the
 /// IOMMU device table for DMA confinement (H1). 0xFFFF if none found.
 pub static XHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
 
@@ -45,13 +45,13 @@ pub static XHCI_BASES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 pub static XHCI_IRQS: [AtomicU8; 4] = [const { AtomicU8::new(0) }; 4];
 pub static XHCI_BDFS: [AtomicU32; 4] = [const { AtomicU32::new(0xFFFF) }; 4];
 
-/// Discovered EHCI (USB 2.0) controller — the T630's back ports hang off it
+/// Discovered EHCI (USB 2.0) controller - the T630's back ports hang off it
 /// (§12). The userspace `ehci` driver gets this BAR mapped at spawn, exactly as
 /// the `xhci` driver gets the xHCI BAR. First EHCI found wins.
 pub static EHCI_FOUND: AtomicBool = AtomicBool::new(false);
 pub static EHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
 pub static EHCI_IRQ: AtomicU8 = AtomicU8::new(0);
-/// PCI BDF of the EHCI controller — IOMMU device-table index (H1). 0xFFFF if none.
+/// PCI BDF of the EHCI controller - IOMMU device-table index (H1). 0xFFFF if none.
 pub static EHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
 
 // AHCI is PCI class 0x01 (mass storage), subclass 0x06 (SATA), progif 0x01 (AHCI).
@@ -59,16 +59,16 @@ const CLASS_MASS_STORAGE: u8 = 0x01;
 const SUBCLASS_SATA: u8 = 0x06;
 const PROGIF_AHCI: u8 = 0x01;
 
-/// Discovered AHCI (SATA) controller — the `block-driver` gets its ABAR (BAR5)
+/// Discovered AHCI (SATA) controller - the `block-driver` gets its ABAR (BAR5)
 /// mapped + a DMA arena at spawn, exactly as the USB drivers do (§12,
 /// docs/ahci.md). First AHCI found wins. ABAR is a 32-bit MMIO BAR.
 pub static AHCI_FOUND: AtomicBool = AtomicBool::new(false);
 pub static AHCI_ABAR: AtomicU64 = AtomicU64::new(0);
 pub static AHCI_IRQ: AtomicU8 = AtomicU8::new(0);
-/// PCI BDF of the AHCI controller — IOMMU device-table index (H1). 0xFFFF if none.
+/// PCI BDF of the AHCI controller - IOMMU device-table index (H1). 0xFFFF if none.
 pub static AHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
 
-/// Build a 16-bit PCI BDF (bus<<8 | dev<<3 | func) — the IOMMU device-table index.
+/// Build a 16-bit PCI BDF (bus<<8 | dev<<3 | func) - the IOMMU device-table index.
 #[inline]
 pub fn make_bdf(bus: u8, dev: u8, func: u8) -> u32 {
     ((bus as u32) << 8) | ((dev as u32) << 3) | (func as u32)
@@ -80,7 +80,7 @@ pub fn make_bdf(bus: u8, dev: u8, func: u8) -> u32 {
 /// Port I/O is ring-0 only; the caller must target a valid port.
 #[inline]
 unsafe fn outl(port: u16, val: u32) {
-    // SAFETY: `out dx, eax` — standard 32-bit port write.
+    // SAFETY: `out dx, eax` - standard 32-bit port write.
     unsafe {
         core::arch::asm!("out dx, eax", in("dx") port, in("eax") val,
             options(nomem, nostack, preserves_flags));
@@ -94,7 +94,7 @@ unsafe fn outl(port: u16, val: u32) {
 #[inline]
 unsafe fn inl(port: u16) -> u32 {
     let val: u32;
-    // SAFETY: `in eax, dx` — standard 32-bit port read.
+    // SAFETY: `in eax, dx` - standard 32-bit port read.
     unsafe {
         core::arch::asm!("in eax, dx", out("eax") val, in("dx") port,
             options(nomem, nostack, preserves_flags));
@@ -135,7 +135,7 @@ fn config_write32(bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
 /// Take ownership of the EHCI controller from the firmware (BIOS→OS handoff).
 ///
 /// EHCI's HCCPARAMS register (MMIO capability offset 0x08) carries the EHCI
-/// Extended Capabilities Pointer (EECP) — an offset into *PCI config space*
+/// Extended Capabilities Pointer (EECP) - an offset into *PCI config space*
 /// (not MMIO) where a capability list lives. The USB Legacy Support capability
 /// (ID 0x01) has a BIOS-Owned and an OS-Owned semaphore. Until the OS sets
 /// OS-Owned and the firmware clears BIOS-Owned, the firmware (SMM) keeps poking
@@ -143,7 +143,7 @@ fn config_write32(bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
 ///
 /// Without an IOMMU that firmware DMA was invisible. With H1 confinement it
 /// faults (the firmware buffers are outside the driver's arena) and breaks the
-/// back-port keyboard. This handoff makes the firmware release the controller —
+/// back-port keyboard. This handoff makes the firmware release the controller -
 /// standard OS behaviour at init. EECP lives in PCI config space, which the
 /// userspace `ehci` driver cannot reach, so the kernel must do it. Idempotent;
 /// no-op if no EHCI, no extended caps, or no USB Legacy Support capability.
@@ -237,7 +237,7 @@ pub fn ehci_bios_handoff() {
 /// Take ownership of the xHCI controller from the firmware (BIOS→OS handoff).
 ///
 /// Unlike EHCI (whose handoff register is in PCI config space), xHCI's extended
-/// capabilities — including USB Legacy Support — live in MMIO, reached via the
+/// capabilities - including USB Legacy Support - live in MMIO, reached via the
 /// xECP field of HCCPARAMS1 (MMIO cap offset 0x10). We could put this in the
 /// userspace driver, but doing it here keeps both controllers handed off
 /// uniformly before the IOMMU confines them: otherwise the firmware SMM keeps
@@ -261,7 +261,7 @@ pub fn xhci_bios_handoff() {
             | PageFlags::NO_EXEC.bits()
             | PageFlags::PWT.bits()
             | PageFlags::PCD.bits();
-        // Map 16 pages (64 KiB) — enough to reach the extended-capability list.
+        // Map 16 pages (64 KiB) - enough to reach the extended-capability list.
         for i in 0..16u64 {
             let off = i * 0x1000;
             // SAFETY: called after set_hhdm_offset; mapping the xHCI MMIO pages
@@ -339,7 +339,7 @@ pub fn xhci_bios_handoff() {
 /// Device Capabilities register (bit 28); performing it (Device Control bit 15)
 /// resets the function far more thoroughly than the EHCI `HCRESET`, which on this
 /// machine does not scrub the controller's stale firmware-era internal DMA state.
-/// Detection only — does not perform the reset. No-op if no EHCI.
+/// Detection only - does not perform the reset. No-op if no EHCI.
 pub fn ehci_flr_probe() {
     if !EHCI_FOUND.load(Ordering::Relaxed) {
         return;
@@ -392,8 +392,8 @@ pub fn ehci_flr_probe() {
 /// BSP, then enable MSI. Returns `true` if an MSI capability (id 0x05) was found and
 /// programmed. Edge-triggered, fixed delivery, a single message vector.
 ///
-/// MSI is the kernel's device-interrupt path (§12): the device writes the message —
-/// address `0xFEE00000` (LAPIC, dest BSP) and data = `vector` — straight to the local APIC,
+/// MSI is the kernel's device-interrupt path (§12): the device writes the message -
+/// address `0xFEE00000` (LAPIC, dest BSP) and data = `vector` - straight to the local APIC,
 /// so no IOAPIC or ACPI `_PRT` routing is needed. The caller must have installed an IDT
 /// handler for `vector` (→ `interrupt::route::deliver`) before the device starts raising it.
 ///
@@ -490,7 +490,7 @@ pub fn program_msix(bdf: u32, vector: u8, dest_apic: u8) -> bool {
             let tbl_phys = bar_phys + tbl_off;
 
             // Map the table's page uncached at its HHDM alias (Limine's HHDM covers RAM but
-            // not MMIO, so add the page to the active tables ourselves — like the IOMMU).
+            // not MMIO, so add the page to the active tables ourselves - like the IOMMU).
             let hhdm = crate::arch::x86_64::page_tables::get_hhdm_offset();
             let page_phys = tbl_phys & !0xFFFu64;
             let va_page = hhdm.wrapping_add(page_phys);
@@ -557,7 +557,7 @@ pub fn program_xhci_msi() -> bool {
 /// LAPIC id to deliver USB-controller interrupts to: the core the USB drivers are pinned to
 /// (core 1, per the xhci/ehci contracts' `preferred_core`). Delivering the IRQ to the driver's
 /// OWN core means a device event (a keypress) wakes that core directly out of its idle `hlt`
-/// and the wake stays core-local — no cross-core IPI or BSP scan, which an idle AP on this
+/// and the wake stays core-local - no cross-core IPI or BSP scan, which an idle AP on this
 /// hardware (ARAT `hlt` idle) does not service promptly (§12). Falls back to the BSP if there
 /// is no core 1 (single-core), where the driver runs on the BSP anyway.
 fn usb_irq_dest_lapic() -> u8 {
@@ -571,7 +571,7 @@ fn usb_irq_dest_lapic() -> u8 {
 
 /// Try to program the EHCI controller's MSI/MSI-X (interrupt-driven USB, §12). Returns true
 /// if MSI or MSI-X was found and programmed (→ the easy path, like xHCI). Logs the outcome.
-/// Classic Intel-ICH EHCI exposes neither (legacy INTx only — would need IOAPIC routing);
+/// Classic Intel-ICH EHCI exposes neither (legacy INTx only - would need IOAPIC routing);
 /// other EHCIs (e.g. AMD) may have MSI. This both does P1 (when MSI exists) AND tells us at
 /// boot which interrupt path the running machine's EHCI needs.
 pub fn program_ehci_msi() -> bool {
@@ -584,7 +584,7 @@ pub fn program_ehci_msi() -> bool {
     let ok = program_msi(bdf, vector, dest) || program_msix(bdf, vector, dest);
     if !ok {
         crate::kprintln!(
-            "ehci: no MSI/MSI-X capability — controller uses legacy INTx (IOAPIC routing needed)"
+            "ehci: no MSI/MSI-X capability - controller uses legacy INTx (IOAPIC routing needed)"
         );
     }
     ok
@@ -596,20 +596,20 @@ pub fn program_ehci_msi() -> bool {
 /// We have no ACPI `_PRT` parser, so the exact GSI the EHCI's INTx pin maps to is unknown: the
 /// PCI interrupt-line register holds the legacy 8259 IRQ (usually 11), but an AMD FCH routes PCI
 /// INTx to a *higher* GSI in the 16–23 range. Rather than gamble on one, we program a **candidate
-/// set** — the legacy line plus the platform PCI-INTx range — all to the same EHCI vector,
+/// set** - the legacy line plus the platform PCI-INTx range - all to the same EHCI vector,
 /// level-triggered + active-low (PCI INTx), destination = the real BSP local-APIC id. Only the
 /// EHCI uses INTx (AHCI polls, xHCI is MSI), so the spurious candidates never fire; the one that
-/// matches the hardware delivers. Each is registered as a level route so dispatch masks — and the
-/// driver unmasks — the whole set together. No-op if no EHCI. Call after `ioapic::init()`.
+/// matches the hardware delivers. Each is registered as a level route so dispatch masks - and the
+/// driver unmasks - the whole set together. No-op if no EHCI. Call after `ioapic::init()`.
 pub fn route_ehci_intx() {
     if !EHCI_FOUND.load(Ordering::Relaxed) {
         return;
     }
     let vector = crate::arch::x86_64::interrupts::EHCI_MSI_VECTOR;
-    // Deliver to the BSP (core 0) — a legacy PCI INTx pin routes through the IOAPIC only to the
+    // Deliver to the BSP (core 0) - a legacy PCI INTx pin routes through the IOAPIC only to the
     // BSP on this hardware (unlike an MSI, which can target any core). The EHCI driver is pinned
     // to core 0 to match (task/mod.rs), so the keypress wakes core 0 from its idle hlt, deliver()
-    // runs on core 0, and the wake to the core-0 driver is local — no cross-core wake (which an
+    // runs on core 0, and the wake to the core-0 driver is local - no cross-core wake (which an
     // idle, halted AP doesn't service promptly). Verified on the T630: INTx delivers to the BSP;
     // routing it to an AP's LAPIC id silently dropped it.
     let dest = crate::arch::x86_64::ioapic::bsp_lapic_id();
@@ -665,7 +665,7 @@ pub fn init() {
                 let subclass = (class_reg >> 16) as u8;
                 let progif = (class_reg >> 8) as u8;
                 // Log EVERY USB host controller (subclass 0x03), of any kind, so
-                // we can see the full USB topology — devices may live on a second
+                // we can see the full USB topology - devices may live on a second
                 // xHCI or an EHCI/OHCI the boot-port controller doesn't cover.
                 if class == CLASS_SERIAL_BUS && subclass == SUBCLASS_USB {
                     // BAR0 (offset 0x10). 64-bit memory BAR if bits[2:1]=10.
@@ -706,7 +706,7 @@ pub fn init() {
                         EHCI_FOUND.store(true, Ordering::Relaxed);
                     }
                 }
-                // AHCI (SATA) controller — the block driver's disk (docs/ahci.md).
+                // AHCI (SATA) controller - the block driver's disk (docs/ahci.md).
                 if class == CLASS_MASS_STORAGE && subclass == SUBCLASS_SATA
                     && progif == PROGIF_AHCI && !AHCI_FOUND.load(Ordering::Relaxed)
                 {

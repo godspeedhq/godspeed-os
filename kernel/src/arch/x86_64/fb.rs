@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Framebuffer text console (fbcon) — Phase 1: boot output mirrored to the
+//! Framebuffer text console (fbcon) - Phase 1: boot output mirrored to the
 //! display (§11.4). Output-only.
 //!
 //! Renders **antialiased Noto Sans Mono** glyphs (`noto-sans-mono-bitmap`, the
@@ -13,17 +13,17 @@
 //! pixel is a 0–255 intensity, blended against the soft-green foreground, so text
 //! is smooth rather than the blocky look of a 1-bpp bitmap font. Every byte written
 //! to the serial console is also handed to `put_byte` here, so the monitor shows
-//! exactly what the serial console shows — boot logs, `supervisor: ready`,
+//! exactly what the serial console shows - boot logs, `supervisor: ready`,
 //! ping/pong, the lot.
 //!
-//! Box-drawing glyphs (`tree`'s `├──`, `│`, …) are drawn **procedurally** — the
+//! Box-drawing glyphs (`tree`'s `├──`, `│`, …) are drawn **procedurally** - the
 //! font's Basic-Latin range carries no U+2500 block, and procedural strokes connect
 //! cell-to-cell exactly.
 //!
 //! Lives in the arch layer (§18.1) because it writes framebuffer memory
 //! directly. The framebuffer is mapped by Limine in the higher half (PML4
 //! entries 256–511), which `PageTable::new` copies into every task address
-//! space, so the pointer stays valid for the system lifetime — no explicit
+//! space, so the pointer stays valid for the system lifetime - no explicit
 //! mapping is required.
 
 use crate::smp::spinlock::SpinLock;
@@ -32,7 +32,7 @@ use noto_sans_mono_bitmap::{get_raster, get_raster_width, FontWeight, RasterHeig
 
 /// Noto weight + raster height for the console. `get_raster_width`/`RasterHeight::val`
 /// are `const fn`, so the per-cell pixel box (`CELL_W` × `CELL_H`) is known at compile
-/// time and the char-grid geometry below is computed from it. Size20 ≈ 9×20 px — a touch
+/// time and the char-grid geometry below is computed from it. Size20 ≈ 9×20 px - a touch
 /// taller than the old 16×16 bitmap cell and far smoother on a TV.
 const FONT_WEIGHT: FontWeight = FontWeight::Regular;
 const RASTER_HEIGHT: RasterHeight = RasterHeight::Size20;
@@ -46,7 +46,7 @@ const BOX_FIRST: u8 = 0xB3;
 
 /// Map a decoded Unicode codepoint to the internal **cell byte** the grid stores. ASCII
 /// passes through (rendered via Noto); the light box-drawing block (`U+2500..U+253C`)
-/// maps to the reserved high bytes (rendered procedurally); anything else becomes `?` —
+/// maps to the reserved high bytes (rendered procedurally); anything else becomes `?` -
 /// visible, never silently dropped (§3.12).
 fn cell_for_codepoint(cp: u32) -> u8 {
     if cp < 0x80 {
@@ -91,7 +91,7 @@ fn box_arms(ch: u8) -> (bool, bool, bool, bool) {
 /// Char-grid shadow bounds. Sized for up to ~4K UHD edge-to-edge at the Noto cell
 /// (3840/9 ≈ 427 cols, 2160/20 = 108 rows); larger displays clamp the text area to
 /// these bounds. The shadow holds each cell's printable content so `scroll` can
-/// redraw from RAM instead of reading the framebuffer back — uncached/WC VRAM reads
+/// redraw from RAM instead of reading the framebuffer back - uncached/WC VRAM reads
 /// run ~100x slower than writes, the fbcon scroll trap that made a respawn look 40x
 /// a cold spawn (see the iso-c7/iso-xlife investigation).
 const MAX_COLS: usize = 448;
@@ -141,7 +141,7 @@ struct Fb {
     cur_col: usize,      // column where the cursor underline was last drawn
     cur_row: usize,      // row where the cursor underline was last drawn
     // Char-grid shadow: the printable content of each text cell (the transient
-    // cursor overlay is excluded — it is always erased before a scroll). `scroll`
+    // cursor overlay is excluded - it is always erased before a scroll). `scroll`
     // shifts this in RAM and redraws the screen from it, so it never reads the
     // (uncached) framebuffer back.
     grid: [[u8; MAX_COLS]; MAX_ROWS],
@@ -161,7 +161,7 @@ static FB: SpinLock<Fb> = SpinLock::new(Fb {
 /// per edge so it all stays visible without depending on the TV's "Just Scan" / "1:1"
 /// picture mode (which most sets bury or don't offer). Set this to `0` only on a display
 /// known not to overscan, or when the TV is in a 1:1 pixel-mapping mode, for true
-/// edge-to-edge. Harmless on a monitor — just a small border.
+/// edge-to-edge. Harmless on a monitor - just a small border.
 const SAFE_PCT: usize = 5;
 
 /// Initialise the console from Limine's framebuffer descriptor. Called once in
@@ -192,7 +192,7 @@ pub fn fb_init(fb: &Framebuffer) {
     s.rows = s.rows.min(MAX_ROWS);
     s.col = 0;
     s.row = 0;
-    // soft green on black — classic console look. Keep the raw components + channel
+    // soft green on black - classic console look. Keep the raw components + channel
     // shifts so antialiased glyph intensities can be blended per channel (`blend`).
     s.fg_r = 0x80; s.fg_g = 0xFF; s.fg_b = 0x80;
     s.r_shift = rs; s.g_shift = gs; s.b_shift = bs;
@@ -247,7 +247,7 @@ pub fn put_byte(b: u8) {
 
 /// Write a whole byte sequence under a SINGLE lock, then flush once. Used by the
 /// console path so a multi-byte write (e.g. the shell's `gsh> ` prompt) is atomic
-/// with respect to another core's console output — no byte from another core can
+/// with respect to another core's console output - no byte from another core can
 /// interleave mid-string.
 pub fn put_bytes(bytes: &[u8]) {
     let mut s = FB.lock();
@@ -264,7 +264,7 @@ pub fn put_bytes(bytes: &[u8]) {
 /// the FB lock is released. The framebuffer is mapped write-combining (Limine's
 /// HHDM default); the lock's atomic release orders normal memory but NOT the WC
 /// store buffer. Without this, a scroll on one core can flush *after* the next
-/// line's first glyph drawn on another core — erasing it ("gsh>" → " s>").
+/// line's first glyph drawn on another core - erasing it ("gsh>" → " s>").
 #[inline]
 fn wc_flush() {
     // SAFETY: SFENCE is always valid in any privilege level; it only orders stores.
@@ -310,7 +310,7 @@ fn process_byte(s: &mut Fb, b: u8) {
             }
             return;
         }
-        s.utf8_remaining = 0; // malformed — abandon the sequence and reprocess this byte
+        s.utf8_remaining = 0; // malformed - abandon the sequence and reprocess this byte
     }
     if b >= 0x80 {
         // Lead byte: begin a 2/3/4-byte sequence; a stray continuation/invalid lead is a `?`.
@@ -395,7 +395,7 @@ fn handle_csi(s: &mut Fb, b: u8) {
             s.esc = 0;
         }
         _ => {
-            // Malformed — abort the sequence.
+            // Malformed - abort the sequence.
             s.esc = 0;
         }
     }
@@ -441,7 +441,7 @@ fn execute_csi(s: &mut Fb, final_byte: u8) {
         // Private mode set/reset: ESC[?25h shows the cursor, ESC[?25l hides it.
         b'h' if s.csi_priv && csi_param(s, 0, 0) == 25 => s.cursor_visible = true,
         b'l' if s.csi_priv && csi_param(s, 0, 0) == 25 => s.cursor_visible = false,
-        _ => {} // unsupported command — ignore
+        _ => {} // unsupported command - ignore
     }
     if s.cursor_visible {
         draw_cursor(s);
@@ -480,7 +480,7 @@ fn erase_to_end_of_screen(s: &mut Fb) {
 }
 
 /// Draw the text cursor as a true underline at the current write position: paint the
-/// cell's real glyph first, then overlay a thin underline beneath it — so a character the
+/// cell's real glyph first, then overlay a thin underline beneath it - so a character the
 /// cursor sits on stays visible (underlined), instead of being hidden by a `_` glyph that
 /// replaced it. Remember where it landed so `erase_cursor` can restore exactly that cell
 /// later, even after the write position has moved (e.g. a carriage return).
@@ -502,7 +502,7 @@ fn draw_cursor(s: &mut Fb) {
 }
 
 /// Erase the cursor at the cell where it was last drawn by restoring that cell's real
-/// content from the shadow grid — NOT by blanking it. The cursor underline is drawn over
+/// content from the shadow grid - NOT by blanking it. The cursor underline is drawn over
 /// whatever glyph occupies the cell (the grid is not touched), so restoring the grid glyph
 /// removes the underline without destroying text. Blanking instead would erase any
 /// character the cursor sits on, which is exactly what made moving the cursor back over
@@ -565,7 +565,7 @@ fn put_pixel(s: &Fb, x: usize, y: usize, color: u32) {
 /// Blend the foreground toward the background by an antialiasing `intensity` (0–255)
 /// and compose the result into the device's channel layout. 0 ⇒ background, 255 ⇒ full
 /// foreground; in between gives the smooth edges. Because the background is black, this
-/// is just the foreground scaled per channel — but written explicitly so a non-black
+/// is just the foreground scaled per channel - but written explicitly so a non-black
 /// background would still compose correctly.
 #[inline]
 fn blend(s: &Fb, intensity: u8) -> u32 {
@@ -583,7 +583,7 @@ fn blend(s: &Fb, intensity: u8) -> u32 {
 }
 
 /// Render one glyph at text cell (col, row). ASCII (`< 0x80`) renders via the
-/// antialiased Noto raster (every cell pixel is written — intensity 0 paints the
+/// antialiased Noto raster (every cell pixel is written - intensity 0 paints the
 /// background, so the cell is fully repainted with no stale pixels). The reserved
 /// high bytes render as procedural box-drawing strokes.
 fn draw_glyph(s: &Fb, ch: u8, col: usize, row: usize) {
@@ -661,12 +661,12 @@ fn grid_set(s: &mut Fb, c: usize, r: usize, ch: u8) {
 
 /// Scroll the display up by one text row.
 ///
-/// The old implementation `core::ptr::copy`'d the framebuffer up in place — which
+/// The old implementation `core::ptr::copy`'d the framebuffer up in place - which
 /// *reads the framebuffer back*. The framebuffer is uncached / write-combining, so
 /// those reads run at tens of MB/s; an 8 MB read-back cost ~130 ms per scrolled line
 /// on the T630, which dominated every kill/respawn-heavy workload (the iso-c7 /
 /// iso-xlife dig). Instead, shift the char-grid shadow up in normal RAM (fast) and
-/// repaint the text area from it — **write-only** to the framebuffer (WC writes are
+/// repaint the text area from it - **write-only** to the framebuffer (WC writes are
 /// ~100x faster than reads).
 fn scroll(s: &mut Fb) {
     let rows = s.rows;
@@ -683,7 +683,7 @@ fn scroll(s: &mut Fb) {
     for c in 0..cols {
         s.grid[rows - 1][c] = b' ';
     }
-    // Repaint every cell from the shadow — no framebuffer read-back.
+    // Repaint every cell from the shadow - no framebuffer read-back.
     for r in 0..rows {
         for c in 0..cols {
             let ch = s.grid[r][c];

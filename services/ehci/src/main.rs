@@ -1,14 +1,14 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! `ehci` — userspace USB 2.0 (EHCI) host-controller driver (§12).
+//! `ehci` - userspace USB 2.0 (EHCI) host-controller driver (§12).
 //!
 //! The T630's back USB sockets are wired to the EHCI controller (PCI 00:12.0),
-//! not the xHCI that the [`xhci`] driver handles — so a keyboard in the back is
+//! not the xHCI that the [`xhci`] driver handles - so a keyboard in the back is
 //! invisible to us. This service drives the EHCI to reach it, in the same spirit
 //! as the xHCI driver: a **userspace** service holding the controller's MMIO (and
 //! later DMA) capability, with the kernel only discovering the controller and
@@ -28,10 +28,10 @@
 use godspeed_sdk::ServiceContext;
 
 // EHCI capability registers (at the MMIO base; EHCI spec §2.2).
-const CAP_CAPLENGTH:  usize = 0x00; // u8  — bytes from base to the operational regs
-const CAP_HCIVERSION: usize = 0x02; // u16 — BCD interface version
-const CAP_HCSPARAMS:  usize = 0x04; // u32 — structural parameters
-const CAP_HCCPARAMS:  usize = 0x08; // u32 — capability parameters
+const CAP_CAPLENGTH:  usize = 0x00; // u8  - bytes from base to the operational regs
+const CAP_HCIVERSION: usize = 0x02; // u16 - BCD interface version
+const CAP_HCSPARAMS:  usize = 0x04; // u32 - structural parameters
+const CAP_HCCPARAMS:  usize = 0x08; // u32 - capability parameters
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
@@ -40,7 +40,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mmio = match ctx.ehci_mmio() {
         Some(m) => m,
         None => {
-            ctx.log("ehci: no controller MMIO granted — idling");
+            ctx.log("ehci: no controller MMIO granted - idling");
             ctx.park();
         }
     };
@@ -71,7 +71,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let _ = (ppc, n_cc, n_pcc, addr64, eecp);
 
     // ---------------------------------------------------------------------------
-    // E2a — reset the controller and run it, then read the port status. No BIOS
+    // E2a - reset the controller and run it, then read the port status. No BIOS
     // handoff yet (E2b adds it if the firmware fights us); every wait is bounded so
     // a firmware tug-of-war times out and reports rather than hanging.
     // ---------------------------------------------------------------------------
@@ -81,13 +81,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let cmd = mmio.read32(op + OP_USBCMD);
     mmio.write32(op + OP_USBCMD, cmd & !CMD_RS);
     if !wait(&mmio, op + OP_USBSTS, STS_HCHALTED, true) {
-        ctx.log("ehci: WARN — controller did not halt (BIOS may still own it; E2b handoff needed)");
+        ctx.log("ehci: WARN - controller did not halt (BIOS may still own it; E2b handoff needed)");
     }
 
     // Reset: set HCRESET and wait for the controller to clear it.
     mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) | CMD_HCRESET);
     if !wait(&mmio, op + OP_USBCMD, CMD_HCRESET, false) {
-        ctx.log("ehci: WARN — HCRESET did not complete (E2b handoff needed); idling");
+        ctx.log("ehci: WARN - HCRESET did not complete (E2b handoff needed); idling");
         ctx.park();
     }
     ctx.log("ehci: controller reset");
@@ -98,11 +98,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     if wait(&mmio, op + OP_USBSTS, STS_HCHALTED, false) {
         ctx.log("ehci: controller running");
     } else {
-        ctx.log("ehci: WARN — controller did not leave halted state after run");
+        ctx.log("ehci: WARN - controller did not leave halted state after run");
     }
     // Diagnostic (H1): dump the schedule registers after reset+run. If the IOMMU
     // is faulting on a garbage 0xffffffc0 pointer, one of these (or the schedule
-    // they point at) is the source — e.g. an uninitialised PERIODICLISTBASE the
+    // they point at) is the source - e.g. an uninitialised PERIODICLISTBASE the
     // controller is walking, or a stale ASYNCLISTADDR.
     ctx.log_fmt(format_args!(
         "ehci: sched regs USBCMD={:#010x} USBSTS={:#010x} ASYNCLIST={:#010x} PERIODICLIST={:#010x}",
@@ -128,9 +128,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     }
 
     // ---------------------------------------------------------------------------
-    // E3a — reset the first connected port and see if it enables. EHCI only
+    // E3a - reset the first connected port and see if it enables. EHCI only
     // enables a port for a HIGH-SPEED device; if PED comes up, the thing on that
-    // port is high-speed — for the back keyboard (low-speed) that means a
+    // port is high-speed - for the back keyboard (low-speed) that means a
     // high-speed hub (the integrated rate-matching hub), with the keyboard behind
     // it. If PED stays 0, the device is low/full-speed directly on the port.
     // ---------------------------------------------------------------------------
@@ -159,7 +159,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         ));
 
-        // E3b/E3c — the device on the port (the high-speed hub) is now enabled at
+        // E3b/E3c - the device on the port (the high-speed hub) is now enabled at
         // the default address 0. Build the async schedule, address it, configure
         // it, and read its hub descriptor.
         if enabled {
@@ -217,7 +217,7 @@ struct HidDev { addr: u8, port: u8, ep_num: u8, is_mouse: bool }
 /// Maximum HID devices polled together (keyboard + mouse covers the cases we have).
 const MAX_HID: usize = 2;
 /// Poll-phase DMA layout: one QH + qTD + report buffer per device, `POLL_STRIDE`
-/// apart, starting at `POLL_BASE` — clear of the config-phase region (QH_OFF 0x0 …
+/// apart, starting at `POLL_BASE` - clear of the config-phase region (QH_OFF 0x0 …
 /// DATA_BUF 0x200) so enumeration and polling never alias.
 const POLL_BASE:   usize = 0x400;
 const POLL_STRIDE: usize = 0x100; // QH @ +0x00, qTD @ +0x40, report buf @ +0x80
@@ -303,7 +303,7 @@ fn control(
     mmio.write32(op + OP_ASYNCLISTADDR, qh_phys & !0x1F);
     mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) | CMD_ASE);
     wait(mmio, op + OP_USBSTS, STS_ASS, true);
-    // Doorbell: set IAAD, wait for the controller to set IAA (bounded — if the
+    // Doorbell: set IAAD, wait for the controller to set IAA (bounded - if the
     // controller is wedged it simply won't fire and we proceed), then clear it.
     mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) | CMD_IAAD);
     wait(mmio, op + OP_USBSTS, STS_IAA, true);
@@ -333,13 +333,13 @@ fn control(
     Some(moved)
 }
 
-/// E3b/E3c — address and configure the high-speed hub on the port, then read its
+/// E3b/E3c - address and configure the high-speed hub on the port, then read its
 /// hub descriptor (downstream port count). The keyboard is on one of those ports;
 /// E3c-2 will power them and find it.
 fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
     let dma = match ctx.dma_region() {
         Some(d) => d,
-        None => { ctx.log("ehci: no DMA arena granted — cannot enumerate; idling"); return; }
+        None => { ctx.log("ehci: no DMA arena granted - cannot enumerate; idling"); return; }
     };
 
     // E3b: device descriptor at the default address 0.
@@ -388,7 +388,7 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
     ctx.log_fmt(format_args!(
         "ehci: HUB DESCRIPTOR ports={} characteristics={:#06x}", nports, hubchar));
 
-    // E6 — hot-plug loop. The hub stays addressed/configured for the driver's
+    // E6 - hot-plug loop. The hub stays addressed/configured for the driver's
     // lifetime; only the downstream devices come and go. Each pass: (re)scan the
     // ports for boot HID devices, announce what connected, poll until one drops,
     // announce the drop, and loop. With nothing attached we wait on the hub's port
@@ -400,7 +400,7 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
     loop {
         let (devs, ndev) = scan_devices(ctx, mmio, &dma, op, mps0, nports);
         if ndev == 0 {
-            ctx.log("ehci: no boot keyboard/mouse attached — waiting for a connection");
+            ctx.log("ehci: no boot keyboard/mouse attached - waiting for a connection");
             wait_for_connection(ctx, mmio, &dma, op, mps0, nports);
             announce = true; // whatever connects after a wait is a real plug event
             continue;
@@ -420,7 +420,7 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
 /// Power the hub's downstream ports, then reset + enumerate every connected one,
 /// configuring each boot keyboard/mouse at a unique address. Returns the device
 /// table and how many were configured. Called once per (re)scan in the hot-plug
-/// loop — addressing each device (Set_Address moves it off the default address 0)
+/// loop - addressing each device (Set_Address moves it off the default address 0)
 /// before resetting the next port is what lets two devices coexist.
 fn scan_devices(
     ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
@@ -449,20 +449,20 @@ fn scan_devices(
         if status & 1 == 0 { continue; } // nothing connected
 
         // A high-speed device on a hub port (status bit 10) is mass storage or a
-        // nested hub — never a boot keyboard/mouse, which are low/full speed. Skip
+        // nested hub - never a boot keyboard/mouse, which are low/full speed. Skip
         // it: a low-speed split descriptor read to a high-speed device fails and
         // would look like a faulty port, which it is not. This is how the USB boot
         // thumbdrive, when it sits on an EHCI port, is correctly ignored (rather
-        // than nagging "faulty port — try another").
+        // than nagging "faulty port - try another").
         if (status >> 10) & 1 != 0 {
             ctx.log_fmt(format_args!(
-                "ehci: hub port {} has a high-speed device (mass storage / hub) — not a HID, skipping",
+                "ehci: hub port {} has a high-speed device (mass storage / hub) - not a HID, skipping",
                 port));
             continue;
         }
 
         // Reset the port and read the device descriptor over SPLIT, retrying with a
-        // FULL re-reset (+ connect-debounce + longer recovery) each attempt — the
+        // FULL re-reset (+ connect-debounce + longer recovery) each attempt - the
         // Logitech keyboard's first SETUP after a single reset XactErrs, the
         // Microsoft mouse needs only one.
         let kep = Ep::low(0, 8, 1, port);
@@ -486,10 +486,10 @@ fn scan_devices(
             // mass storage or a nested hub, not a boot HID. The speed bits aren't
             // valid until the reset completes (a thumbdrive reads 0x0101 before
             // reset, 0x0503 after), so this is where we can finally tell. Abandon it
-            // without retrying or marking the port faulty — it isn't.
+            // without retrying or marking the port faulty - it isn't.
             if (pstat >> 10) & 1 != 0 {
                 ctx.log_fmt(format_args!(
-                    "ehci: hub port {} enabled high-speed (mass storage / hub) — not a HID, skipping",
+                    "ehci: hub port {} enabled high-speed (mass storage / hub) - not a HID, skipping",
                     port));
                 high_speed = true;
                 break;
@@ -500,10 +500,10 @@ fn scan_devices(
             // XactErrs, but a settle-and-retry on the same reset often succeeds.
             if control_retry(ctx, mmio, dma, op, &kep, &dd, 18, true, 6).is_some() { got = true; break; }
             ctx.log_fmt(format_args!(
-                "ehci: hub port {} attempt {} failed (post-reset status={:#06x}) — re-resetting",
+                "ehci: hub port {} attempt {} failed (post-reset status={:#06x}) - re-resetting",
                 port, attempt, pstat));
         }
-        if high_speed { continue; } // not a HID, and not faulty — skip quietly
+        if high_speed { continue; } // not a HID, and not faulty - skip quietly
         if !got {
             ctx.log_fmt(format_args!("ehci: split descriptor on hub port {} failed after 3 resets", port));
             any_failed = true;
@@ -551,11 +551,11 @@ fn scan_devices(
         let is_kbd   = iclass == 0x03 && iproto == 1;
         let is_mouse = iclass == 0x03 && iproto == 2;
         if !(is_kbd || is_mouse) {
-            ctx.log_fmt(format_args!("ehci: hub port {} is not a boot keyboard/mouse — skipping", port));
+            ctx.log_fmt(format_args!("ehci: hub port {} is not a boot keyboard/mouse - skipping", port));
             continue;
         }
         if ndev >= MAX_HID {
-            ctx.log("ehci: more HID devices than supported — ignoring the extra one");
+            ctx.log("ehci: more HID devices than supported - ignoring the extra one");
             continue;
         }
         ctx.log_fmt(format_args!(
@@ -568,10 +568,10 @@ fn scan_devices(
     }
     // A connected device we couldn't bring up means a faulty back port (the T630
     // hub has dead low-speed ports). Tell the user once so a dead-port plug isn't
-    // silent — but only when nothing else came up, so a working device alongside
+    // silent - but only when nothing else came up, so a working device alongside
     // a dead one doesn't nag.
     if any_failed && ndev == 0 {
-        notify(ctx, "a back-port device didn't enumerate (faulty port — try another)");
+        notify(ctx, "a back-port device didn't enumerate (faulty port - try another)");
     }
     (devs, ndev)
 }
@@ -579,7 +579,7 @@ fn scan_devices(
 /// Poll the hub's downstream ports until one reports a *newly* connected device,
 /// then return so the caller re-scans. Snapshots the ports already connected on
 /// entry (e.g. a device sitting on the dead port that never enumerates) and only
-/// returns on a port that was NOT connected — otherwise a connected-but-unusable
+/// returns on a port that was NOT connected - otherwise a connected-but-unusable
 /// device would make the hot-plug loop spin (re-scan → fails → wait → still
 /// connected → re-scan …). The async schedule is free for these hub control
 /// transfers while nothing usable is attached.
@@ -636,17 +636,17 @@ fn control_retry(
     None
 }
 
-/// E5a — give a low-speed HID device (currently at the default address 0 behind
+/// E5a - give a low-speed HID device (currently at the default address 0 behind
 /// hub `port`) a unique `addr` and configure it in HID boot protocol so its
 /// reports are the fixed 8-byte format. Each transfer retries (control_retry)
-/// because this hub's split control endpoint is intermittently flaky — one failed
+/// because this hub's split control endpoint is intermittently flaky - one failed
 /// SETUP must not abandon the device.
 fn setup_hid(
     ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
     op: usize, port: u8, addr: u8, cfg_val: u8, iface: u8, is_mouse: bool,
 ) -> bool {
     let what = if is_mouse { "mouse" } else { "keyboard" };
-    // Set_Address(addr) — issued while still at address 0.
+    // Set_Address(addr) - issued while still at address 0.
     let s = [0x00, 0x05, addr, 0x00, 0x00, 0x00, 0x00, 0x00];
     if control_retry(ctx, mmio, dma, op, &Ep::low(0, 8, 1, port), &s, 0, false, 5).is_none() {
         ctx.log_fmt(format_args!("ehci: {} Set_Address failed (5 tries)", what)); return false;
@@ -683,9 +683,9 @@ fn arm_int(dma: &godspeed_sdk::Dma, qh: usize, toggle: u32) {
     dma.write32(qh + 0x18, 0);                           // clear overlay token
 }
 
-/// E5b/E6 — poll every configured HID device's interrupt-IN endpoint over split
+/// E5b/E6 - poll every configured HID device's interrupt-IN endpoint over split
 /// transactions and act on the reports (keystrokes → console, mouse → log).
-/// Returns the index of the first device that stops responding — when a device is
+/// Returns the index of the first device that stops responding - when a device is
 /// unplugged its split transactions error (the hub TT gets no downstream response)
 /// instead of NAK'ing, so a run of errored completions means it's gone. The
 /// hot-plug loop announces the drop and re-scans.
@@ -693,7 +693,7 @@ fn arm_int(dma: &godspeed_sdk::Dma, qh: usize, toggle: u32) {
 /// Each device gets its own QH; the QHs are linked into one async ring (so the
 /// controller services them all every pass) with the first marked head of the
 /// reclamation list. Each QH carries the hub TT info (split), low speed, DTC=1
-/// (toggle from the qTD), and — unlike a control endpoint — `C = 0` (the Control
+/// (toggle from the qTD), and - unlike a control endpoint - `C = 0` (the Control
 /// Endpoint flag is for low-speed *control* endpoints only). One IN qTD per device
 /// is armed at a time; with NakCnt-reload = 0 the controller keeps retrying it
 /// (the device NAKs between events) until a report arrives, then the qTD retires,
@@ -704,7 +704,7 @@ fn poll_devices(
 ) -> usize {
     let n = devs.len();
     ctx.log_fmt(format_args!(
-        "ehci: polling {} device(s) — type at the gsh> prompt; mouse events log here", n));
+        "ehci: polling {} device(s) - type at the gsh> prompt; mouse events log here", n));
 
     // Build a ring of one QH per device, each with an interrupt-IN qTD armed.
     for i in 0..n {
@@ -774,7 +774,7 @@ fn poll_devices(
                     // keyboard reports (a mouse button byte can alias the modifier bits).
                     // reboot() does not return.
                     if godspeed_sdk::hid::is_ctrl_alt_del(&rep) {
-                        ctx.log("ehci: Ctrl+Alt+Del — rebooting");
+                        ctx.log("ehci: Ctrl+Alt+Del - rebooting");
                         ctx.reboot();
                     }
                     godspeed_sdk::hid::decode_keyboard(
@@ -788,7 +788,7 @@ fn poll_devices(
                 err[i] = 0;               // a good report clears the error run
             } else {
                 // Errored completion. A present, idle device NAKs (the qTD stays
-                // ACTIVE and we `continue` above) — it never completes with error.
+                // ACTIVE and we `continue` above) - it never completes with error.
                 // A sustained run of errored completions therefore means the device
                 // was unplugged: report it so the hot-plug loop re-scans.
                 err[i] += 1;
@@ -815,10 +815,10 @@ fn poll_devices(
         }
         // BUSY-POLL (not interrupt-driven). The EHCI's legacy INTx never reaches the kernel in a
         // block-and-wake model on this hardware (the controller only asserts while its async
-        // schedule is kept hot by continuous re-arming — proven across many T630 flashes: the
+        // schedule is kept hot by continuous re-arming - proven across many T630 flashes: the
         // kernel deliver() diagnostic fired ZERO times once the driver blocked). So this driver
         // keeps the proven busy-poll: yield each pass (preemption still shares the core) and scan
-        // again. The cost is its core runs hot — accepted, because it is the ONLY model in which
+        // again. The cost is its core runs hot - accepted, because it is the ONLY model in which
         // this controller's split-transaction keyboard works. It is pinned to its own core
         // (task/mod.rs) so the system core and the interrupt-driven xHCI's core stay idle.
         // (USBINTR + the drain/unmask below are belt-and-suspenders: if an INTx ever does post an
@@ -847,7 +847,7 @@ const DISCONNECT_ERR_THRESHOLD: u32 = 250;
 /// scrolled up; the leading "\n" starts it on its own line and the injected
 /// newline supplies the terminating break + triggers a fresh `gsh> `.
 fn notify(ctx: &ServiceContext, msg: &str) {
-    // Leading "\n " — the space is sacrificial: the framebuffer drops the first
+    // Leading "\n " - the space is sacrificial: the framebuffer drops the first
     // glyph drawn on a freshly-scrolled line, so we let it eat a space, not the
     // 'U' of "USB:". (Serial is unaffected.)
     ctx.console_write("\n USB: ");
@@ -862,11 +862,11 @@ fn delay_cycles(ctx: &ServiceContext, cycles: u64) {
     let start = ctx.read_tsc();
     while ctx.read_tsc().wrapping_sub(start) < cycles {}
 }
-/// ~100 ms at 2 GHz — comfortably over the 50 ms minimum reset hold.
+/// ~100 ms at 2 GHz - comfortably over the 50 ms minimum reset hold.
 const RESET_HOLD_CYCLES: u64 = 200_000_000;
-/// ~20 ms at 2 GHz — reset-recovery settle before reading the port.
+/// ~20 ms at 2 GHz - reset-recovery settle before reading the port.
 const RECOVERY_CYCLES:   u64 = 40_000_000;
-/// ~50 ms at 2 GHz — connect-debounce before resetting a hub downstream port.
+/// ~50 ms at 2 GHz - connect-debounce before resetting a hub downstream port.
 const DEBOUNCE_CYCLES:   u64 = 100_000_000;
 
 // --- EHCI operational registers (offsets from base + CAPLENGTH) + bit fields ---
@@ -896,7 +896,7 @@ const PORTSC_CCS:    u32 = 1 << 0;  // Current Connect Status
 const PORTSC_PED:    u32 = 1 << 2;  // Port Enabled/Disabled
 const PORTSC_RESET:  u32 = 1 << 8;  // Port Reset
 const PORTSC_OWNER:  u32 = 1 << 13; // Port Owner (1 = handed to a companion)
-/// Write-1-to-clear change bits (CSC, PEDC, OCC) — mask off when writing PORTSC
+/// Write-1-to-clear change bits (CSC, PEDC, OCC) - mask off when writing PORTSC
 /// so a read-modify-write does not clear them unintentionally.
 const PORTSC_W1C:    u32 = (1 << 1) | (1 << 3) | (1 << 5);
 

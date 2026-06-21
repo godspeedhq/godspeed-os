@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Kernel name registry — maps service names to recv endpoint IDs (§14.2).
+//! Kernel name registry - maps service names to recv endpoint IDs (§14.2).
 //!
 //! Populated by the kernel at spawn time for every service that gets a recv
 //! endpoint.  Queried by syscall 10 (AcquireSendCap) for post-restart cap
@@ -45,7 +45,7 @@ static NAMES: SpinLock<[NameEntry; MAX_ENTRIES]> = {
 ///
 /// Updates an existing entry if the name is already present.
 /// The generation is always the current one recorded in `ipc::routing`; callers
-/// do not need to pass it — `AcquireSendCap` reads the fresh generation from
+/// do not need to pass it - `AcquireSendCap` reads the fresh generation from
 /// the routing table when minting the cap.
 pub fn register(name: &str, endpoint_id: EndpointId) {
     let bytes = name.as_bytes();
@@ -93,15 +93,15 @@ pub fn unregister(name: &str) {
     }
 }
 
-/// Remove the entry for `name` **only if** it still maps to `endpoint_id` — the dying instance.
+/// Remove the entry for `name` **only if** it still maps to `endpoint_id` - the dying instance.
 ///
 /// Called from the task-kill path (§14.2) so a service's name stops resolving to a DEAD endpoint:
 /// the supervisor's reconcile (it re-runs its spawn sequence on its own respawn) then finds the name
-/// *missing* and respawns the service, instead of adopting the stale dead entry — the bug behind
+/// *missing* and respawns the service, instead of adopting the stale dead entry - the bug behind
 /// `fs`/`block-driver` staying dead when a storm kills them in the same window the supervisor itself
 /// is being respawned (so their death-notifications are lost). The `endpoint_id` guard is the
 /// respawn-race safety: if a fresh instance has *already* re-registered the name to a new endpoint,
-/// this is a no-op — we must never unregister the live one.
+/// this is a no-op - we must never unregister the live one.
 pub fn unregister_endpoint(name: &str, endpoint_id: EndpointId) {
     let bytes = name.as_bytes();
     if bytes.len() > NAME_MAX { return; }

@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Routing table model for property testing — §8.3, §22 P5, P8, P10.
+//! Routing table model for property testing - §8.3, §22 P5, P8, P10.
 //!
 //! `TestRoutingModel` mirrors the algorithmic invariants of `ipc/routing.rs`
 //! without `SpinLock`, global statics, or hardware dependencies.
@@ -16,7 +16,7 @@ use crate::capability::generation::Generation;
 use crate::ipc::message::{IpcError, Message};
 use crate::ipc::queue::MessageQueue;
 
-// Local model ID — structurally equivalent to ipc::endpoint::EndpointId(u64).
+// Local model ID - structurally equivalent to ipc::endpoint::EndpointId(u64).
 // Defined here because endpoint.rs depends on crate::task which is hardware-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EndpointId(pub u64);
@@ -103,7 +103,7 @@ impl TestRoutingModel {
             .map(|e| e.queue.depth())
     }
 
-    /// Enqueue a 1-byte message — models the `send` syscall path.
+    /// Enqueue a 1-byte message - models the `send` syscall path.
     pub fn enqueue(&mut self, id: EndpointId, cap_gen: Generation) -> Result<(), IpcError> {
         let entry = self.entries.iter_mut()
             .find(|e| e.alive && e.id == id)
@@ -115,7 +115,7 @@ impl TestRoutingModel {
         entry.queue.enqueue(msg).map_err(|_| IpcError::QueueFull)
     }
 
-    /// Dequeue the head message — models the `recv` syscall path.
+    /// Dequeue the head message - models the `recv` syscall path.
     pub fn dequeue(&mut self, id: EndpointId, cap_gen: Generation) -> Result<(), IpcError> {
         let entry = self.entries.iter_mut()
             .find(|e| e.alive && e.id == id)
@@ -160,7 +160,7 @@ mod tests {
 
     // Apply an op sequence, tracking the current generation per endpoint ID.
     // Register is guarded: if the endpoint is already alive it is skipped.
-    // This mirrors the kernel's usage protocol — spawn_service_with_config always
+    // This mirrors the kernel's usage protocol - spawn_service_with_config always
     // calls kill_endpoint before re-registering a service (task/mod.rs §14.1).
     // P5 holds under this protocol, and that is exactly what these tests verify.
     fn run_ops(ops: &[Op]) -> TestRoutingModel {
@@ -200,7 +200,7 @@ mod tests {
 
     proptest! {
         /// After any register/kill sequence, no endpoint ID appears twice in the
-        /// alive set — §8.3, §22 P5.
+        /// alive set - §8.3, §22 P5.
         #[test]
         fn no_duplicate_alive_endpoint_ids(ops in ops_strategy()) {
             let model = run_ops(&ops);
@@ -212,7 +212,7 @@ mod tests {
             );
         }
 
-        /// count_live always equals the iteration count of alive entries — §22 P5.
+        /// count_live always equals the iteration count of alive entries - §22 P5.
         #[test]
         fn count_live_consistent_with_iteration(ops in ops_strategy()) {
             let model = run_ops(&ops);
@@ -226,7 +226,7 @@ mod tests {
 
     proptest! {
         /// Any number of kill+reregister cycles produce strictly increasing
-        /// generations — §7.5, §14.2, §22 P8.
+        /// generations - §7.5, §14.2, §22 P8.
         #[test]
         fn kill_reregister_strictly_increases_generation(
             id_raw   in 0u64..32,
@@ -239,7 +239,7 @@ mod tests {
 
             for _ in 0..cycles {
                 let bumped = model.kill(id).unwrap();
-                // Re-register at the bumped generation — mirrors spawn_service_with_config
+                // Re-register at the bumped generation - mirrors spawn_service_with_config
                 // inheriting the bumped gen from GLOBAL_RESOURCES (task/mod.rs:2324–2335).
                 model.register(id, bumped);
                 let current = model.get_generation(id).unwrap();
@@ -252,7 +252,7 @@ mod tests {
         }
 
         /// After kill+reregister: stale cap (old gen) is rejected; fresh cap
-        /// (bumped gen) is accepted — §7.5, §14.2, §22 P8.
+        /// (bumped gen) is accepted - §7.5, §14.2, §22 P8.
         #[test]
         fn stale_cap_rejected_fresh_cap_accepted_after_restart(id_raw in 0u64..32) {
             let id = EndpointId(id_raw);
@@ -279,7 +279,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     proptest! {
-        /// Enqueue on a dead endpoint always returns EndpointDead — §8.6, §22 P10.
+        /// Enqueue on a dead endpoint always returns EndpointDead - §8.6, §22 P10.
         #[test]
         fn enqueue_dead_endpoint_returns_endpoint_dead(id_raw in 0u64..32) {
             let id = EndpointId(id_raw);
@@ -290,7 +290,7 @@ mod tests {
             prop_assert_eq!(model.enqueue(id, gen), Err(IpcError::EndpointDead));
         }
 
-        /// Enqueue on a full queue always returns QueueFull — §8.6, §22 P10.
+        /// Enqueue on a full queue always returns QueueFull - §8.6, §22 P10.
         #[test]
         fn enqueue_full_queue_returns_queue_full(id_raw in 0u64..32) {
             let id = EndpointId(id_raw);
@@ -304,7 +304,7 @@ mod tests {
             prop_assert_eq!(model.enqueue(id, gen), Err(IpcError::QueueFull));
         }
 
-        /// Enqueue on alive, non-full queue always returns Ok — §8.6, §22 P10.
+        /// Enqueue on alive, non-full queue always returns Ok - §8.6, §22 P10.
         #[test]
         fn enqueue_alive_non_full_returns_ok(id_raw in 0u64..32, depth in 0usize..16) {
             let id = EndpointId(id_raw);
@@ -318,7 +318,7 @@ mod tests {
         }
 
         /// After any mixed op sequence, enqueue always returns one of the three
-        /// defined outcomes — never panics, never an unexpected variant — §22 P10.
+        /// defined outcomes - never panics, never an unexpected variant - §22 P10.
         #[test]
         fn enqueue_result_always_one_of_defined_outcomes(ops in ops_strategy()) {
             let mut model = TestRoutingModel::new();

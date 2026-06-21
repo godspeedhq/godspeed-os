@@ -1,4 +1,4 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
@@ -7,7 +7,7 @@
 
 //! USB HID boot-protocol decoding, shared by the USB host drivers (`xhci`, `ehci`).
 //!
-//! Pure logic — no syscalls, no I/O. Each driver reads the fixed 8-byte boot
+//! Pure logic - no syscalls, no I/O. Each driver reads the fixed 8-byte boot
 //! report from its controller's DMA and hands it here; the side effects (pushing
 //! a character to the console, logging a mouse event) stay in the driver, passed
 //! in as closures. This is the controller-agnostic reuse §26.2 anticipated once
@@ -15,8 +15,8 @@
 //! over xHCI transfer-event rings or EHCI split qTDs.
 
 /// Decode a HID boot-keyboard usage code to ASCII (US layout, common keys). `caps` is the host's
-/// Caps Lock toggle state (the HID modifier byte does NOT carry it — Caps Lock is a host-tracked
-/// latch, see `decode_keyboard`). Caps Lock XORs Shift, but **only for letters** — it never affects
+/// Caps Lock toggle state (the HID modifier byte does NOT carry it - Caps Lock is a host-tracked
+/// latch, see `decode_keyboard`). Caps Lock XORs Shift, but **only for letters** - it never affects
 /// digits or symbols (that's the difference from Shift).
 pub fn hid_to_ascii(key: u8, mods: u8, caps: bool) -> Option<u8> {
     let shift = mods & 0x22 != 0; // left or right Shift
@@ -26,12 +26,12 @@ pub fn hid_to_ascii(key: u8, mods: u8, caps: bool) -> Option<u8> {
             // Ctrl+letter → the C0 control code (Ctrl+A=0x01 … Ctrl+Z=0x1A), exactly what a
             // serial terminal sends. Without this a USB keyboard can't produce ^S/^Q/^C, so
             // app shortcuts (the editor's save/quit, the shell's Ctrl-C) are unreachable on
-            // hardware — they only worked over the serial console, which synthesises these
+            // hardware - they only worked over the serial console, which synthesises these
             // bytes itself. Ctrl takes precedence over Shift/Caps. (key 0x04='a' → 0x01.)
             if ctrl { return Some(key - 0x03); }
             let base = b'a' + (key - 0x04);
             // Uppercase iff exactly one of Shift / Caps Lock is active (Caps Lock toggles letters,
-            // and Shift inverts Caps Lock — so SHIFT+letter is lowercase while Caps is on).
+            // and Shift inverts Caps Lock - so SHIFT+letter is lowercase while Caps is on).
             Some(if shift ^ caps { base - 32 } else { base })
         }
         0x1E..=0x26 => {
@@ -43,7 +43,7 @@ pub fn hid_to_ascii(key: u8, mods: u8, caps: bool) -> Option<u8> {
         }
         0x27 => Some(if shift { b')' } else { b'0' }),
         0x28 => Some(b'\n'), // Enter
-        0x29 => Some(0x1B),  // Escape — bare ESC (the shell disambiguates it from a sequence)
+        0x29 => Some(0x1B),  // Escape - bare ESC (the shell disambiguates it from a sequence)
         0x2A => Some(0x08),  // Backspace
         0x2B => Some(b'\t'), // Tab
         0x2C => Some(b' '),  // Space
@@ -85,7 +85,7 @@ pub fn hid_to_ascii(key: u8, mods: u8, caps: bool) -> Option<u8> {
     }
 }
 
-/// Codes in the printable-key ranges (letters, digits, punctuation, keypad) — but NOT the
+/// Codes in the printable-key ranges (letters, digits, punctuation, keypad) - but NOT the
 /// control keys (Enter/Esc/Backspace/Tab/Space at 0x28-0x2C) or modifiers/F-keys. Used to
 /// decide whether an unmapped key is worth reporting (a missing punctuation mapping) vs
 /// silent noise (a function/modifier key with no character). Keys in these ranges are all
@@ -99,7 +99,7 @@ fn is_typable_code(k: u8) -> bool {
 /// Shared by the first-press edge path and the auto-repeat path so a repeated key is
 /// byte-for-byte identical to its first press. The cursor and navigation-cluster keys
 /// emit the same ANSI escape sequences a serial terminal sends, so the shell's one input
-/// parser (`handle_csi` / the pager) handles USB and serial alike — this is what makes a
+/// parser (`handle_csi` / the pager) handles USB and serial alike - this is what makes a
 /// standard extended keyboard's Home/End/Delete/PageUp/PageDown work on real hardware
 /// (without it the physical keys produce nothing).
 fn emit_key(k: u8, mods: u8, caps: bool, emit: &mut impl FnMut(u8)) -> bool {
@@ -145,11 +145,11 @@ fn emit_key(k: u8, mods: u8, caps: bool, emit: &mut impl FnMut(u8)) -> bool {
 }
 
 /// Tracks the currently-held key so a driver can synthesise typematic auto-repeat.
-/// USB HID boot keyboards report only on *change* — a held key sends one down report
-/// and then nothing until release — so the host must synthesise repeat itself.
+/// USB HID boot keyboards report only on *change* - a held key sends one down report
+/// and then nothing until release - so the host must synthesise repeat itself.
 ///
 /// `now`, `initial`, and `interval` are in **whatever monotonic unit the driver feeds
-/// in** — the drivers use `ServiceContext::read_tsc()` cycles (hardware-proven to
+/// in** - the drivers use `ServiceContext::read_tsc()` cycles (hardware-proven to
 /// advance on real machines, unlike the coarse kernel tick), so `initial`/`interval`
 /// are cycle counts (e.g. ~300 ms / ~50 ms worth at the CPU's frequency). The unit is
 /// the driver's choice; this struct only compares and adds. `decode_keyboard` arms it
@@ -201,8 +201,8 @@ impl KeyRepeat {
 
 /// Is an 8-byte HID boot report real device data, or the all-`0xff` signature of a failed/stale
 /// DMA read (a device that vanished mid-transaction, or a buffer the controller never wrote)?
-/// Returns `false` only for an all-`0xff` report. This is the **universal** garbage check — safe
-/// for both keyboards and mice (a real mouse won't send all-`0xff`; a keyboard never does) —
+/// Returns `false` only for an all-`0xff` report. This is the **universal** garbage check - safe
+/// for both keyboards and mice (a real mouse won't send all-`0xff`; a keyboard never does) -
 /// which a driver uses to count a wedged endpoint toward disconnect and re-enumerate. (The
 /// keyboard decoder additionally rejects any report whose reserved byte 1 ≠ 0, a stricter check
 /// that only makes sense for keyboards.)
@@ -210,7 +210,7 @@ pub fn report_is_valid(report: &[u8; 8]) -> bool {
     *report != [0xFF; 8]
 }
 
-/// HID usage of the Delete (forward-delete) key — the `Del` in Ctrl+Alt+Del.
+/// HID usage of the Delete (forward-delete) key - the `Del` in Ctrl+Alt+Del.
 pub const KEY_DELETE: u8 = 0x4C;
 /// HID usage of the Caps Lock key. It is a host-tracked LATCH: the modifier byte never reports it,
 /// so the host toggles a `caps` flag on each fresh press (see `decode_keyboard`).
@@ -218,7 +218,7 @@ pub const KEY_CAPS_LOCK: u8 = 0x39;
 
 /// True if a **keyboard** boot report is the Ctrl+Alt+Del chord: either Ctrl (left 0x01 / right
 /// 0x10) **and** either Alt (left 0x04 / right 0x40) held, with the Delete key down. This is the
-/// secure-attention reboot combo — a driver checks it each poll for a keyboard device and, when
+/// secure-attention reboot combo - a driver checks it each poll for a keyboard device and, when
 /// true, issues the reboot syscall. Because reboot does not return, no edge-tracking is needed
 /// (the first detection reboots). Apply this ONLY to keyboard reports: a mouse boot report's
 /// button byte (byte 0) can alias the Ctrl/Alt modifier bits, so it must never be tested here.
@@ -239,7 +239,7 @@ pub fn is_ctrl_alt_del(report: &[u8; 8]) -> bool {
 /// `rep`/`now` drive typematic auto-repeat: the newest printable key still held is
 /// armed (at tick `now`) so the driver's [`KeyRepeat::poll`] re-emits it while held;
 /// releasing it disarms repeat. A key we don't map is reported via `on_unmapped`
-/// (loud, not silently dropped — §3.12) so its HID usage code can be logged and added.
+/// (loud, not silently dropped - §3.12) so its HID usage code can be logged and added.
 /// `caps` is the host's Caps Lock latch (toggled on each fresh Caps Lock press); the driver owns it
 /// per keyboard and passes it in, so the state persists across reports. It cases letters via
 /// `hid_to_ascii` (Caps Lock XORs Shift, letters only).
@@ -254,10 +254,10 @@ pub fn decode_keyboard(
 ) {
     // Reject an invalid report before decoding it. Byte 1 of a USB HID boot-keyboard report is
     // reserved and is always 0; an all-`0xff` report (byte 1 == 0xff) is the signature of a
-    // failed/stale DMA read — what the buffer returns when the device has gone (e.g. mid-unplug)
+    // failed/stale DMA read - what the buffer returns when the device has gone (e.g. mid-unplug)
     // or the endpoint's buffer wasn't refreshed. Decoding it would spew 0xff "keystrokes" to the
     // console AND corrupt `last` (poisoning edge-detection so later real keys diff wrong and
-    // never register). Drop it untouched: don't emit, don't update `last`, don't disarm repeat —
+    // never register). Drop it untouched: don't emit, don't update `last`, don't disarm repeat -
     // so the next genuine report decodes cleanly.
     if report[1] != 0 {
         return;
@@ -271,7 +271,7 @@ pub fn decode_keyboard(
             // (which then cases letters) and emits nothing. It does NOT arm auto-repeat.
             if k == KEY_CAPS_LOCK { *caps = !*caps; continue; }
             if emit_key(k, mods, *caps, &mut emit) {
-                // Newest printable/cursor key held becomes the repeat key — except the
+                // Newest printable/cursor key held becomes the repeat key - except the
                 // one-shot control keys: Escape (0x29), whose repeat would make the shell
                 // re-disambiguate a bare ESC every tick, and the function keys F1–F12
                 // (0x3A–0x45), which are actions, not characters (holding F1 should not
@@ -327,7 +327,7 @@ impl MouseTracker {
     /// Feed one boot report (byte 0 = buttons, byte 1 = dx, byte 2 = dy as signed
     /// deltas). Calls `on_button(mask, down)` for each of left/right/middle that
     /// changed, and `on_move(dx, dy)` once accumulated motion crosses a threshold
-    /// — a mouse emits far too many move reports to surface each one.
+    /// - a mouse emits far too many move reports to surface each one.
     pub fn feed(
         &mut self, report: &[u8; 8],
         mut on_button: impl FnMut(u8, bool), mut on_move: impl FnMut(i32, i32),
@@ -371,7 +371,7 @@ mod tests {
 
     #[test]
     fn nav_cluster_emits_terminal_escape_sequences() {
-        // The navigation cluster a standard extended keyboard sends — each must map to
+        // The navigation cluster a standard extended keyboard sends - each must map to
         // the exact escape sequence the shell's CSI parser / pager understands.
         assert_eq!(emit_for(0x4A), b"\x1b[H");  // Home
         assert_eq!(emit_for(0x4D), b"\x1b[F");  // End
@@ -428,7 +428,7 @@ mod tests {
         assert_eq!(hid_to_ascii(0x16, 0x22, true),  Some(b's')); // Caps + Shift → lowercase (XOR)
         assert_eq!(hid_to_ascii(0x16, 0x22, false), Some(b'S')); // Shift only → uppercase
         assert_eq!(hid_to_ascii(0x16, 0x00, false), Some(b's')); // neither → lowercase
-        // Digits/symbols ignore Caps Lock — only Shift changes them.
+        // Digits/symbols ignore Caps Lock - only Shift changes them.
         assert_eq!(hid_to_ascii(0x1E, 0x00, true),  Some(b'1')); // Caps on, a digit → still '1'
         assert_eq!(hid_to_ascii(0x1E, 0x22, true),  Some(b'!')); // Shift → '!' (Caps irrelevant)
     }

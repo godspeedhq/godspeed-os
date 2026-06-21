@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! IDT entries and IRQ dispatch stubs — §12.
+//! IDT entries and IRQ dispatch stubs - §12.
 //!
 //! The kernel IDT has two classes of entries:
 //!   - CPU exceptions (vectors 0–31): handled entirely in kernel.
@@ -25,14 +25,14 @@ pub struct ExceptionFrame {
 }
 
 // ---------------------------------------------------------------------------
-// Timer ISR (vector 32) — §9.1 preemption quantum.
+// Timer ISR (vector 32) - §9.1 preemption quantum.
 // ---------------------------------------------------------------------------
 
 /// Naked ISR stub for the APIC timer (vector 32).
 ///
 /// Saves all caller-saved registers, calls `timer_tick_from_irq`, restores,
 /// then returns from interrupt.  The scheduler's `switch_context` may change
-/// RSP inside `timer_tick_from_irq`; that is intentional — see §9.1.
+/// RSP inside `timer_tick_from_irq`; that is intentional - see §9.1.
 ///
 /// GS invariant (§8.2): ring-0 code always runs with GS.base = kernel ptr;
 /// ring-3 code runs with GS.base = 0.  An interrupt from ring-3 arrives with
@@ -94,14 +94,14 @@ pub unsafe extern "C" fn timer_isr_stub() {
 }
 
 // ---------------------------------------------------------------------------
-// UART RX ISR (vector 36 = PIC offset 32 + IRQ 4) — COM1 console input.
+// UART RX ISR (vector 36 = PIC offset 32 + IRQ 4) - COM1 console input.
 // ---------------------------------------------------------------------------
 
 /// Naked ISR stub for COM1 UART RX (IRQ 4, vector 36).
 ///
 /// Structure mirrors `timer_isr_stub`: conditional swapgs, save caller-saved
 /// registers, call handler, restore, conditional swapgs, iretq.
-/// No context switch occurs here — we just drain the FIFO, push to the ring
+/// No context switch occurs here - we just drain the FIFO, push to the ring
 /// buffer, and optionally wake a blocked ConsoleRead syscall.
 #[no_mangle]
 #[unsafe(naked)]
@@ -139,7 +139,7 @@ pub unsafe extern "C" fn uart_rx_isr_stub() {
     )
 }
 
-/// COM1 UART RX IRQ handler — drains FIFO, wakes blocked ConsoleRead task.
+/// COM1 UART RX IRQ handler - drains FIFO, wakes blocked ConsoleRead task.
 ///
 /// # Safety
 /// Called from raw interrupt context (IF=0).
@@ -160,17 +160,17 @@ unsafe extern "C" fn uart_rx_irq_handler() {
 }
 
 // ---------------------------------------------------------------------------
-// xHCI MSI ISR (vector = irq 0x28) — USB host-controller interrupt (§12).
+// xHCI MSI ISR (vector = irq 0x28) - USB host-controller interrupt (§12).
 // ---------------------------------------------------------------------------
 
 /// IDT vector AND `IRQ_TABLE` index for the xHCI controller's MSI. MSI lets us pick the
 /// vector freely (it is written into the device's message-data register), so vector and
-/// the route's pseudo-irq are the same number — no PCI interrupt-line / IOAPIC GSI mapping.
+/// the route's pseudo-irq are the same number - no PCI interrupt-line / IOAPIC GSI mapping.
 /// Chosen clear of the timer (32), COM1 (36), syscall (0x80), and the IPIs (0xF0-0xF2).
 pub const XHCI_MSI_VECTOR: u8 = 0x28;
 
 /// Naked ISR stub for the xHCI MSI. Mirrors `uart_rx_isr_stub`: save caller-saved regs,
-/// call the handler, restore, iretq. No context switch — the handler just routes the IRQ
+/// call the handler, restore, iretq. No context switch - the handler just routes the IRQ
 /// to the driver as an IPC and EOIs the APIC.
 #[no_mangle]
 #[unsafe(naked)]
@@ -208,7 +208,7 @@ pub unsafe extern "C" fn xhci_msi_isr_stub() {
     )
 }
 
-/// xHCI MSI handler — routes the interrupt to the registered driver endpoint (§12.2) and
+/// xHCI MSI handler - routes the interrupt to the registered driver endpoint (§12.2) and
 /// EOIs the local APIC (`route::deliver` does the EOI). If no driver has registered the
 /// route yet (e.g. before the xHCI driver spawns), `deliver` discards it and still EOIs.
 ///
@@ -247,7 +247,7 @@ pub unsafe extern "C" fn ehci_msi_isr_stub() {
     )
 }
 
-/// EHCI MSI handler — routes to the registered driver endpoint (§12.2) and EOIs.
+/// EHCI MSI handler - routes to the registered driver endpoint (§12.2) and EOIs.
 ///
 /// # Safety
 /// Called from raw interrupt context (IF=0).
@@ -289,11 +289,11 @@ pub fn disable_interrupts() {
 /// Used in the idle loop. On Goldmont+ (Apollo Lake / Gemini Lake), both `hlt`
 /// and `pause` trigger firmware C-state promotion that power-gates the local
 /// APIC, silencing both APIC timer ticks and cross-core IPIs.  Issuing only
-/// `sti` — with no low-power hint of any kind — keeps the core fully active
+/// `sti` - with no low-power hint of any kind - keeps the core fully active
 /// and prevents C-state entry entirely.  The outer scheduler loop's
 /// `compiler_fence(SeqCst)` ensures every iteration re-reads TASK_STATE,
 /// so wakeups written by other cores are not missed.
-/// True when idle cores may safely `hlt` — set once at boot from the ARAT CPUID
+/// True when idle cores may safely `hlt` - set once at boot from the ARAT CPUID
 /// bit (CPUID.06H:EAX[2], "Always Running APIC Timer"). ARAT is the hardware's
 /// guarantee that the LAPIC timer keeps ticking through C-states, so a halted
 /// core still receives its scheduler tick (and IPIs/IRQs wake it). When ARAT is
@@ -314,7 +314,7 @@ pub fn idle_can_halt() -> bool {
 #[inline]
 pub fn wait_for_interrupt() {
     if IDLE_CAN_HALT.load(core::sync::atomic::Ordering::Relaxed) {
-        // ARAT present: halting is safe — the LAPIC timer survives the C-state,
+        // ARAT present: halting is safe - the LAPIC timer survives the C-state,
         // so the next tick/IPI/IRQ wakes the core. Draws near-zero power, so an
         // idle core runs cool instead of spinning. `sti; hlt` is atomic w.r.t.
         // interrupt delivery (an interrupt cannot fire in the 1-instruction
@@ -323,7 +323,7 @@ pub fn wait_for_interrupt() {
         unsafe { core::arch::asm!("sti; hlt", options(nostack, nomem)) }
     } else {
         // No ARAT: HLT/PAUSE let firmware power-gate the LAPIC, dropping timer
-        // ticks and IPIs (observed on Goldmont+). Spin with STI only — keeps the
+        // ticks and IPIs (observed on Goldmont+). Spin with STI only - keeps the
         // core hot but the scheduler correct.
         // SAFETY: STI is always safe in ring-0; no other instructions follow.
         unsafe { core::arch::asm!("sti", options(nostack, nomem)) }
@@ -333,7 +333,7 @@ pub fn wait_for_interrupt() {
 /// Signal End-Of-Interrupt to the local APIC so the interrupt line is re-armed.
 ///
 /// Must be called at the end of every hardware IRQ handler (timer, device IRQs,
-/// IPIs). Calling it while interrupts are enabled is safe — it only writes
+/// IPIs). Calling it while interrupts are enabled is safe - it only writes
 /// the APIC EOI register, which has no effect on the current interrupt state.
 #[inline]
 pub fn send_eoi() {
@@ -353,7 +353,7 @@ pub fn send_eoi() {
 pub fn fire_test_irq(irq: u8) {
     disable_interrupts();
     // SAFETY: interrupts are disabled above (IF=0), satisfying deliver's calling
-    // convention. EOI to the APIC is safe outside a real IRQ — the write is
+    // convention. EOI to the APIC is safe outside a real IRQ - the write is
     // idempotent and the APIC ignores spurious EOIs.
     unsafe { crate::interrupt::route::deliver(irq); }
     enable_interrupts();

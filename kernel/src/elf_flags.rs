@@ -1,4 +1,4 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
@@ -13,7 +13,7 @@
 //!
 //! **W^X enforcement (hardening H4a):** a loaded page is executable only if its
 //! segment is executable AND not writable. A segment marked both writable and
-//! executable (`PF_W|PF_X`) is forced non-executable — the loader *enforces* the
+//! executable (`PF_W|PF_X`) is forced non-executable - the loader *enforces* the
 //! invariant rather than *mirroring* the ELF's flags, so a malformed or hostile
 //! binary cannot obtain a writable-executable mapping. Service binaries built by
 //! the toolchain never produce a W+X segment, so this is defense-in-depth.
@@ -39,7 +39,7 @@ pub fn segment_no_exec(p_flags: u32) -> bool {
     writable || !executable
 }
 
-/// Whether these flags describe a W+X segment (writable AND executable) — the
+/// Whether these flags describe a W+X segment (writable AND executable) - the
 /// anomaly the loader downgrades to `NO_EXEC` and logs.
 pub fn segment_is_wx(p_flags: u32) -> bool {
     p_flags & PF_W != 0 && p_flags & PF_X != 0

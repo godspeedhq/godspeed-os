@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! IPC endpoint — §8.1, §8.3.
+//! IPC endpoint - §8.1, §8.3.
 //!
 //! An endpoint is owned by one service, pinned to one core. Its queue lives on
 //! that core. Cross-core sends enqueue via the routing table + IPI path.

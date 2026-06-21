@@ -1,17 +1,17 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Name registry model for property testing — §14.2, §22 P8.
+//! Name registry model for property testing - §14.2, §22 P8.
 //!
 //! `TestNameModel` mirrors the algorithmic invariants of `ipc/names.rs`
 //! without `SpinLock` or global statics.  Used to verify that after a
 //! restart, a name always resolves to the most-recently registered endpoint.
 
-// Local model ID — structurally equivalent to ipc::endpoint::EndpointId(u64).
+// Local model ID - structurally equivalent to ipc::endpoint::EndpointId(u64).
 // Defined here because endpoint.rs depends on crate::task which is hardware-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EndpointId(pub u64);
@@ -79,7 +79,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     proptest! {
-        /// Registering a name twice: lookup always returns the second endpoint —
+        /// Registering a name twice: lookup always returns the second endpoint -
         /// §14.2, §22 P8 (restart updates name → new endpoint).
         #[test]
         fn lookup_returns_most_recent_registration(
@@ -95,7 +95,7 @@ mod tests {
             prop_assert_eq!(registry.lookup(&name), Some(ep2));
         }
 
-        /// A name registered once is always found — no phantom miss — §14.2, §22 P8.
+        /// A name registered once is always found - no phantom miss - §14.2, §22 P8.
         #[test]
         fn registered_name_always_found(
             name   in name_strategy(),
@@ -107,7 +107,7 @@ mod tests {
             prop_assert_eq!(registry.lookup(&name), Some(ep));
         }
 
-        /// A name that was never registered returns None — §14.2.
+        /// A name that was never registered returns None - §14.2.
         #[test]
         fn unregistered_name_returns_none(
             name      in name_strategy(),
@@ -120,8 +120,8 @@ mod tests {
             prop_assert_eq!(registry.lookup(&name), None);
         }
 
-        /// Registering N distinct names creates exactly N entries —
-        /// one slot per name, no merge or loss — §14.2.
+        /// Registering N distinct names creates exactly N entries -
+        /// one slot per name, no merge or loss - §14.2.
         #[test]
         fn distinct_names_each_get_own_entry(
             names in proptest::collection::hash_set(name_strategy(), 1..8),

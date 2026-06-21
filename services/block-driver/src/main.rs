@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! `block-driver` — userspace **AHCI (SATA)** disk driver (persistence, v2; §6.3,
+//! `block-driver` - userspace **AHCI (SATA)** disk driver (persistence, v2; §6.3,
 //! docs/ahci.md, docs/persistence.md).
 //!
 //! An MMIO + DMA driver: the kernel maps the AHCI HBA's ABAR and grants a
@@ -14,7 +14,7 @@
 //! `fs` over IPC.
 //!
 //! (ATA PIO + the `hw_pio` capability were the bring-up backend; retired once AHCI
-//! proved out — the T630's SSD is AHCI-only, so AHCI is the production path.)
+//! proved out - the T630's SSD is AHCI-only, so AHCI is the production path.)
 
 #![no_std]
 #![no_main]
