@@ -22,8 +22,9 @@ identity tests; `chaos` lets an operator reproduce the *between* cases live on r
 
 | Command | Meaning |
 |---|---|
-| `chaos kill-storm <svc> [rounds]` | Kill `<svc>` `rounds` times; verify it recovers each round (default 20). |
+| `chaos kill-storm <svc> [rounds]` | Kill one `<svc>` `rounds` times; verify it recovers each round (default 20). |
 | `chaos kill-storm <svc> [n] save <path>` | Same, and also write the report to a file at the end. |
+| `chaos max-carnage [rounds] [save <path>]` | **The chaos monkey:** kill a *random* live service each round (everything but the shell). |
 | `chaos help` / `chaos version` | Self-documentation (`0_conventions.md`). |
 
 `rounds` is clamped to `1..=100` (`CHAOS_MAX_ROUNDS`) — a deliberate cap (§26.6), not a firehose.
@@ -86,6 +87,45 @@ at the end (fs-independent, captured by the serial log). An optional `save <path
 it to a file *after* the target has recovered, with a bounded retry (if `fs` was the target it may
 still be finishing its re-mount). If the save never lands in budget, the console report stands.
 
+## 5b. `max-carnage` — the chaos monkey
+
+`chaos max-carnage [rounds]` reads the **live task set** (exactly what `observe now` shows) and, each
+round, kills **one at random** — everything is fair game **except the shell** (killing it would kill
+this command) and the **kernel** (not a task, cannot be killed). Recoverable victims
+(supervisor/block-driver/fs) are confirmed back up; the rest stay dead, which is *expected* (nothing
+auto-restarts them). The victim is chosen with a tiny `xorshift64` PRNG seeded from the **TSC** (so the
+sequence differs every run).
+
+The point is **not** per-service recovery — it is that the **kernel survives any sequence of random
+service deaths**. The verdict is therefore about kernel survival: the report existing at all proves no
+panic (a panic reboots before it could print). A recoverable victim that did not come back in budget is
+flagged per-round, but does not fail the verdict — it may be the §6.2 supervisor-downtime edge case (a
+service that died while the supervisor was itself mid-respawn), a known service-level limitation, not a
+kernel failure.
+
+```
+gsh> chaos max-carnage 8
+chaos max-carnage: 8 rounds — kill a RANDOM live service each round (everything but the shell)...
+=== chaos max-carnage: report ===
+rounds: 8; victims killed: 8
+round   1: killed fs             -> recovered
+round   2: killed ehci           -> killed (no auto-recovery — expected)
+round   3: killed supervisor     -> recovered
+round   4: killed block-driver   -> recovered
+round   5: killed logger         -> killed (no auto-recovery — expected)
+round   6: killed fs             -> recovered
+round   7: killed supervisor     -> recovered
+round   8: killed xhci           -> killed (no auto-recovery — expected)
+recoverable victims recovered: 5/5 (non-recoverable stay dead — expected)
+kernel: SURVIVED 8 random kills (no panic — this command returned)
+verdict: PASS (kernel survived)
+```
+
+> ⚠️ Carnage is real. `max-carnage` can leave the system **degraded** — e.g. if it kills `xhci`/`ehci`
+> you lose USB keyboard input afterwards, and killing `logger` loses logging — unless a later supervisor
+> respawn happens to revive them (a supervisor respawn re-runs its boot sequence, which re-spawns the
+> services it owns). It is a deliberate stress tool; reboot to restore a pristine system.
+
 ## 6. Capabilities
 
 `chaos` is capability-clean: it uses only `kill` (`SERVICE_CONTROL`, held by the shell) and
@@ -105,8 +145,8 @@ explicit, through `chaos kill-storm supervisor`.
 
 ## 8. Tested
 
-- `osdev test shell` — `chaos kill-storm block-driver 5` (5/5) and `chaos kill-storm supervisor 4`
-  (4/4), each asserting recovery + `kernel: alive`.
+- `osdev test shell` — `chaos kill-storm block-driver 5` (5/5), `chaos kill-storm supervisor 4` (4/4),
+  and `chaos max-carnage 8` (kernel survived the random carnage), each asserting the kernel stays alive.
 - `osdev test files` — `chaos kill-storm fs` storms + the directory-reacquire regression (a client
   reacquires `fs` by name after its restart).
 - Hardware-proven on the HP T630: `chaos kill-storm fs 30` → 30/30; the supervisor stormed dozens of
