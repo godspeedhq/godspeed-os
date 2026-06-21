@@ -180,6 +180,24 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(r) => check!(r.contains("write append"), "tab: menu digit 1 selects 'write append'"),
         None    => { println!("shell-test: FAIL — tab keyword menu selection timed out"); fail += 1; }
     }
+    // pipe-stage keyword: a verb after `|` completes its first-arg keyword. `status | sort r` → reverse.
+    send(&mut write_half, b"status | sort r\t\x03");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("sort reverse"), "tab: pipe-stage 'sort r' completes to 'sort reverse'"),
+        None    => { println!("shell-test: FAIL — tab pipe-stage keyword timed out"); fail += 1; }
+    }
+    // command-name completion AFTER a pipe (the segment's first word). `status | so` → `status | sort`.
+    send(&mut write_half, b"status | so\t\x03");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("status | sort"), "tab: command name completes after a pipe (so -> sort)"),
+        None    => { println!("shell-test: FAIL — tab pipe command completion timed out"); fail += 1; }
+    }
+    // trailing modifier keyword (after the path arg). `mkdir /x p` → `mkdir /x parents`.
+    send(&mut write_half, b"mkdir /x p\t\x03");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("mkdir /x parents"), "tab: trailing modifier 'mkdir /x p' -> 'parents'"),
+        None    => { println!("shell-test: FAIL — tab trailing modifier timed out"); fail += 1; }
+    }
 
     // -----------------------------------------------------------------------
     // cores

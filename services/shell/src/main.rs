@@ -364,61 +364,97 @@ fn handle_csi(ctx: &ServiceContext, line: &mut Line, hist: &History, nav: &mut u
     }
 }
 
-/// Tab completion. On the FIRST token (nothing after a space yet) it completes a **command name**
-/// against `UTILS`; on a later token it completes a **file path** against the directory that token
-/// names (`complete_path`). Both use the same numbered-menu UX (1–9, next digit selects). Operates
-/// from end-of-line so the menu reprint + replacement line up with the cursor (§26.6: bounded).
+/// Tab completion. Splits the line into pipe SEGMENTS (`a | b | c`) and completes the current token
+/// within its segment: the segment's FIRST word completes as a **command name** (`UTILS`, so it works
+/// after a `|` too); a later token completes as a **subcommand keyword** (`observe now`, `to json`,
+/// `sort reverse`, the trailing `mkdir … parents`) and otherwise as a **file path**. One match fills
+/// it; several show the numbered menu (1–9 selects, Tab cycles). Operates from end-of-line so the menu
+/// reprint lines up with the cursor (§26.6: bounded).
 fn complete_tab(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd) {
     if line.len == 0 { return; }
     line.end(ctx);
-    match line.bytes().iter().rposition(|&b| b == b' ') {
-        None => complete_command(ctx, line),
-        // A later token: if it's the command's SECOND token and the command takes a fixed
-        // subcommand keyword (e.g. `observe now`), complete that; otherwise fall back to a file path.
-        Some(sp) => {
-            if !complete_keyword(ctx, line, sp) {
-                complete_path(ctx, line, cwd, sp + 1);
-            }
-        }
+    // Current token starts after the last space (or line start); its pipe segment starts after the
+    // last '|' before it. Computed as plain indices so no borrow of `line` outlives the dispatch.
+    let bytes = line.bytes();
+    let tok_start = bytes.iter().rposition(|&b| b == b' ').map(|s| s + 1).unwrap_or(0);
+    let seg_start = bytes[..tok_start].iter().rposition(|&b| b == b'|').map(|i| i + 1).unwrap_or(0);
+    // The token is the segment's COMMAND if only spaces sit between the segment start and it.
+    let is_command = bytes[seg_start..tok_start].iter().all(|&b| b == b' ');
+
+    if is_command {
+        complete_from_list(ctx, line, tok_start, UTILS);          // command name (after a `|` too)
+    } else if !complete_keyword(ctx, line, seg_start, tok_start) {
+        complete_path(ctx, line, cwd, tok_start);                 // not a keyword → file path
     }
 }
 
-/// Fixed subcommand keywords completed for a command's SECOND token (the first argument). Only
-/// commands whose first argument is a keyword appear here; everything else (paths, names, numbers)
-/// falls through to path completion. Trailing modifiers that sit AFTER a path (`mkdir … parents`,
-/// `copy … recursive`) are not second-token keywords, so they are intentionally not listed. Keep in
-/// sync with each command's argument parsing.
-const SUBCOMMANDS: &[(&str, &[&str])] = &[
+/// Commands whose FIRST argument (the token right after the command, within its pipe segment) is a
+/// fixed keyword — completed only at that position. Pipe-stage verbs (`to`/`from`/`sort`/`match`) are
+/// here too, so `… | to j⇥` → `json` and `… | sort r⇥` → `reverse`. Keep in sync with each command's
+/// argument parsing (verified against utilities/*.md + the `cmd_*` parsers).
+const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
-    ("drives",  &["flash", "label", "reset", "check", "scrub"]),
-    ("write",   &["append", "prepend"]),
     ("date",    &["epoch"]),
+    ("drives",  &["flash", "label", "reset", "check", "scrub"]),
     ("chaos",   &["kill-storm", "max-carnage"]),
+    ("write",   &["append", "prepend"]),
+    ("sort",    &["reverse"]),
+    ("match",   &["except"]),
+    ("to",      &["json", "yaml"]),
+    ("from",    &["json"]),
 ];
 
-/// Complete the SECOND token against a command's fixed subcommand keywords (`SUBCOMMANDS`). `sp` is
-/// the index of the single space, so `line[..sp]` is the command and `line[sp+1..]` the partial. One
-/// match → fill it + a trailing space; several → the same numbered menu / Tab-cycle UX as command and
-/// path completion. Returns `true` when it handled the token (≥1 keyword matched), `false` to let the
-/// caller fall back to path completion (no keywords for this command, or the partial matched none — so
-/// a token like `write append /f`'s path still completes, and `line[..sp]` with a space — a third
-/// token — never matches a single-word command key).
-fn complete_keyword(ctx: &ServiceContext, line: &mut Line, sp: usize) -> bool {
-    let cmd = &line.bytes()[..sp];
-    let cands: &[&str] = match SUBCOMMANDS.iter().find(|(c, _)| c.as_bytes() == cmd) {
-        Some((_, k)) => k,
-        None => return false,
-    };
-    let tok_start = sp + 1;
+/// Commands with a TRAILING modifier keyword that follows the variable argument(s) — completed at any
+/// position after the first arg, when it prefix-matches and is not already present (`mkdir /x p⇥` →
+/// `parents`, `copy /a /b r⇥` → `recursive`). Never offered as the first argument (that token is the
+/// path being named/operated on, not the modifier).
+const SUBCMD_TRAILING: &[(&str, &[&str])] = &[
+    ("mkdir",  &["parents"]),
+    ("copy",   &["recursive"]),
+    ("delete", &["recursive"]),
+];
+
+/// Complete the current token (`tok_start..end`) as a subcommand keyword of its segment's command.
+/// `seg_start..tok_start` holds the command + any already-typed args, which decide the command and
+/// whether this is the first argument. Returns `true` if it completed/offered a menu, `false` to fall
+/// through to path completion.
+fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok_start: usize) -> bool {
+    let head = &line.bytes()[seg_start..tok_start];           // command + prior args (+ spaces)
+    let mut words = head.split(|&b| b == b' ').filter(|w| !w.is_empty());
+    let cmd = match words.next() { Some(c) => c, None => return false };
+    let prior = words.clone().count();                        // args typed before the current token
+
+    if let Some((_, cands)) = SUBCMD_FIRST.iter().find(|(c, _)| c.as_bytes() == cmd) {
+        // First-argument keyword only: a later arg is a path/value (e.g. `write append /f`), not a key.
+        return prior == 0 && complete_from_list(ctx, line, tok_start, cands);
+    }
+    if let Some((_, cands)) = SUBCMD_TRAILING.iter().find(|(c, _)| c.as_bytes() == cmd) {
+        if prior == 0 { return false; }                       // first arg is the path, not the modifier
+        // Offer only modifiers not already present in the segment.
+        let mut avail = [""; 8];
+        let mut a = 0usize;
+        for &k in *cands {
+            let used = head.split(|&b| b == b' ').any(|w| w == k.as_bytes());
+            if !used && a < avail.len() { avail[a] = k; a += 1; }
+        }
+        return complete_from_list(ctx, line, tok_start, &avail[..a]);
+    }
+    false
+}
+
+/// Match the current token (`tok_start..end`) against `cands`: 0 matches → `false` (no change); 1 →
+/// fill it + a trailing space; several → the numbered menu (digit selects, Tab cycles). The single
+/// completion engine shared by command-name and keyword completion. Returns `true` when it acted.
+fn complete_from_list(ctx: &ServiceContext, line: &mut Line, tok_start: usize, cands: &[&str]) -> bool {
     let token = &line.bytes()[tok_start..];
-    let mut matches = [""; 16];
+    let mut matches = [""; 64];
     let mut n = 0usize;
     for &k in cands {
         if k.as_bytes().starts_with(token) {
             if n < matches.len() { matches[n] = k; n += 1; }
         }
     }
-    if n == 0 { return false; }                          // no keyword match → path completion
+    if n == 0 { return false; }
     if n == 1 { fill_keyword(ctx, line, tok_start, matches[0], true); return true; }
     keyword_menu(ctx, line, tok_start, &matches[..n]);
     true
@@ -453,6 +489,7 @@ fn keyword_menu(ctx: &ServiceContext, line: &mut Line, tok_start: usize, cands: 
         row[p] = b' '; p += 1; row[p] = b' '; p += 1;
         ctx.console_write(core::str::from_utf8(&row[..p]).unwrap_or(""));
     }
+    if n > shown { ctx.console_write("(type more to narrow) "); }
     ctx.console_write("\r\n");
     ctx.console_write("gsh> ");
     ctx.console_write(str_of(line.bytes()));
@@ -470,54 +507,6 @@ fn keyword_menu(ctx: &ServiceContext, line: &mut Line, tok_start: usize, cands: 
             continue;
         }
         return;
-    }
-}
-
-/// Complete the command name (the first token): one match → fill it with a trailing space; several
-/// → a numbered menu, next digit selects. (Cursor is already at end-of-line.)
-fn complete_command(ctx: &ServiceContext, line: &mut Line) {
-    let mut prefix_buf = [0u8; MAX_LINE];
-    let plen = line.len;
-    prefix_buf[..plen].copy_from_slice(&line.buf[..plen]);
-    let prefix = &prefix_buf[..plen];
-
-    // Collect matching command indices (UTILS order — stable, so the menu numbering is stable).
-    let mut matches = [0usize; 64];
-    let mut n = 0usize;
-    for (i, u) in UTILS.iter().enumerate() {
-        if u.as_bytes().starts_with(prefix) {
-            if n < matches.len() { matches[n] = i; n += 1; }
-        }
-    }
-    if n == 0 { return; }                       // no candidates — leave the line as-is
-    if n == 1 { set_completed(ctx, line, UTILS[matches[0]]); return; }
-
-    // Several candidates: print a numbered menu (1..=min(9,n)), then read one selection digit.
-    let shown = n.min(9);
-    ctx.console_write("\r\n");
-    for k in 0..shown {
-        let mut row = [0u8; 40];
-        let mut p = 0usize;
-        row[p] = b'1' + k as u8; p += 1;
-        row[p] = b')';          p += 1;
-        row[p] = b' ';          p += 1;
-        let name = UTILS[matches[k]].as_bytes();
-        let take = name.len().min(row.len() - p - 2);
-        row[p..p + take].copy_from_slice(&name[..take]); p += take;
-        row[p] = b' '; p += 1; row[p] = b' '; p += 1;     // two trailing spaces between entries
-        ctx.console_write(core::str::from_utf8(&row[..p]).unwrap_or(""));
-    }
-    if n > shown { ctx.console_write("(type more to narrow) "); }
-    ctx.console_write("\r\n");
-    // Reprint the prompt + what was typed so the cursor sits where it was.
-    ctx.console_write("gsh> ");
-    ctx.console_write(core::str::from_utf8(prefix).unwrap_or(""));
-
-    // The next key selects: a digit in range completes; anything else cancels (line unchanged).
-    let sel = ctx.console_read();
-    if (b'1'..=b'9').contains(&sel) {
-        let idx = (sel - b'1') as usize;
-        if idx < shown { set_completed(ctx, line, UTILS[matches[idx]]); }
     }
 }
 
@@ -656,17 +645,6 @@ fn path_menu(ctx: &ServiceContext, line: &mut Line, base_len: usize, rbuf: &[u8;
         }
         return; // any other key: keep the current line (common-prefix or last cycled candidate)
     }
-}
-
-/// Replace the on-screen input with `cmd` followed by a trailing space. Uses `Line::set`,
-/// so the old text is erased and the new text echoed the same way history recall does.
-fn set_completed(ctx: &ServiceContext, line: &mut Line, cmd: &str) {
-    let c = cmd.as_bytes();
-    let cl = c.len().min(MAX_LINE - 1);
-    let mut tmp = [0u8; MAX_LINE];
-    tmp[..cl].copy_from_slice(&c[..cl]);
-    tmp[cl] = b' ';                              // trailing space so the user can type args
-    line.set(ctx, &tmp[..cl + 1]);
 }
 
 /// A bounded ring of recent command lines for up/down-arrow recall (§26.6: fixed size,
