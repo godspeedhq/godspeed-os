@@ -48,11 +48,21 @@ impl NameCapMap {
             count: 0,
         }
     }
-    /// Record `name → cap_slot`. Returns false (loud, §26.6 — never a silent drop) if the map is
-    /// full or the name doesn't fit.
+    /// Record `name → cap_slot`, **updating in place** if `name` is already mapped (so a restart
+    /// refreshes the cap — and a kill-storm can't grow the map past its bound, §26.6). Returns
+    /// false (loud, never a silent drop) only if the name is new AND the map is full / too long.
     fn record(&mut self, name: &str, cap_slot: u32) -> bool {
         let nb = name.as_bytes();
-        if self.count >= NAME_MAP_MAX || nb.len() > NAME_MAP_NAME_MAX { return false; }
+        if nb.len() > NAME_MAP_NAME_MAX { return false; }
+        // Update an existing entry (restart refresh).
+        for i in 0..self.count {
+            if self.lens[i] as usize == nb.len() && &self.names[i][..nb.len()] == nb {
+                self.caps[i] = cap_slot;
+                return true;
+            }
+        }
+        // Append a new entry.
+        if self.count >= NAME_MAP_MAX { return false; }
         let i = self.count;
         self.names[i][..nb.len()].copy_from_slice(nb);
         self.lens[i]  = nb.len() as u8;
@@ -74,7 +84,8 @@ impl NameCapMap {
 /// merge) — peers flip one at a time. Records the new service's own endpoint cap. If none of the
 /// requested peers are mapped yet, falls back to a fully name-wired spawn (loud). The flipped
 /// wiring is proven functionally (e.g. fs←block-driver by real disk I/O; shell←fs by file commands).
-fn spawn_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &[&str]) {
+/// Returns true if the service spawned (used by the restart loop).
+fn spawn_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &[&str]) -> bool {
     let mut installs: [(&str, CapHandle); 4] = [("", CapHandle(0)); 4];
     let mut n = 0usize;
     for &p in peers {
@@ -86,32 +97,39 @@ fn spawn_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &[
         }
     }
     if n == 0 {
-        spawn_mapped(ctx, map, name, 0xFFFF); // nothing to provide — plain name-wired spawn
-        return;
+        return spawn_mapped(ctx, map, name, 0xFFFF); // nothing to provide — plain name-wired spawn
     }
     match ctx.spawn_with_caps(name, 0xFFFF, &installs[..n]) {
         Ok(Some(cap)) => {
+            // Free the dead instance's cap on a restart (see spawn_mapped) — no cap-table leak.
+            if let Some(old) = map.get(name) { ctx.remove_cap(CapHandle(old)); }
             let _ = map.record(name, cap.0);
             ctx.log_fmt(format_args!(
                 "supervisor: {} wired from the name-cap map ({} peer(s) provided; rest name-wired)", name, n));
+            true
         }
-        Ok(None) => ctx.log_fmt(format_args!("supervisor: {} wired (no endpoint to record)", name)),
-        Err(_)   => ctx.log_fmt(format_args!("supervisor: {} wired spawn FAILED", name)),
+        Ok(None) => { ctx.log_fmt(format_args!("supervisor: {} wired (no endpoint to record)", name)); true }
+        Err(_)   => { ctx.log_fmt(format_args!("supervisor: {} wired spawn FAILED", name)); false }
     }
 }
 
 /// Spawn `name` on `core` (0xFFFF = round-robin) AND record its endpoint cap in `map` (Phase 1).
 /// The spawn itself is identical to `ctx.spawn` — the new syscall just also hands back a cap.
-fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u32) {
+/// Returns true if the service spawned with an endpoint cap (used by the restart loop).
+fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u32) -> bool {
     match ctx.spawn_returning_endpoint(name, core) {
         Some(cap) => {
+            // On a restart, free the dead instance's cap before recording the new one, so a
+            // kill-storm can't leak the supervisor's cap table (the map already updates in place).
+            if let Some(old) = map.get(name) { ctx.remove_cap(CapHandle(old)); }
             if map.record(name, cap.0) {
                 ctx.log_fmt(format_args!("supervisor: name-map + {} (endpoint cap slot {})", name, cap.0));
             } else {
                 ctx.log_fmt(format_args!("supervisor: name-map FULL — dropped {}", name));
             }
+            true
         }
-        None => ctx.log_fmt(format_args!("supervisor: spawn {} returned no endpoint cap", name)),
+        None => { ctx.log_fmt(format_args!("supervisor: spawn {} returned no endpoint cap", name)); false }
     }
 }
 
@@ -273,24 +291,26 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     loop {
         let msg = ctx.recv();
         let name = core::str::from_utf8(msg.payload_bytes()).unwrap_or("");
-        // Restartable services (§6.1 as amended): registry (H11), and fs + block-driver
-        // (Phase D). Respawn by name; the kernel re-wires send-peer caps from the name
-        // table at spawn, and the service re-registers + re-mounts itself. Clients see
-        // EndpointDead and reacquire via the registry (§14.3).
+        // Restartable services (§6.1 as amended): registry (H11), and fs + block-driver (Phase D).
+        // Phase 3c (docs/naming-design.md): respawn WIRED FROM THE MAP — same peers as at boot —
+        // and the spawn refreshes the map with the new instance's cap (record updates in place, so
+        // a kill-storm can't grow the map). The restarted service is supervisor-wired just like at
+        // boot (no kernel name resolution); cross-service stale peer caps are still the client's
+        // reacquire (§14.3). The "died/restarted" log lines are kept (tests + operators gate on them).
         match name {
             "registry" => {
                 ctx.log("supervisor: registry died, restarting");
-                if ctx.spawn("registry").is_ok() { ctx.log("supervisor: registry restarted"); }
+                if spawn_mapped(&ctx, &mut name_map, "registry", 0xFFFF) { ctx.log("supervisor: registry restarted"); }
                 else { ctx.log("supervisor: registry restart FAILED"); }
             }
             "block-driver" => {
                 ctx.log("supervisor: block-driver died, restarting");
-                if ctx.spawn("block-driver").is_ok() { ctx.log("supervisor: block-driver restarted"); }
+                if spawn_wired(&ctx, &mut name_map, "block-driver", &["registry"]) { ctx.log("supervisor: block-driver restarted"); }
                 else { ctx.log("supervisor: block-driver restart FAILED"); }
             }
             "fs" => {
                 ctx.log("supervisor: fs died, restarting");
-                if ctx.spawn("fs").is_ok() { ctx.log("supervisor: fs restarted"); }
+                if spawn_wired(&ctx, &mut name_map, "fs", &["block-driver", "registry"]) { ctx.log("supervisor: fs restarted"); }
                 else { ctx.log("supervisor: fs restart FAILED"); }
             }
             _ => {}
