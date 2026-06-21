@@ -652,6 +652,26 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
+    // chaos max-carnage: the chaos monkey — kill a RANDOM live service each round (everything but the
+    // shell). The headline invariant is that the KERNEL SURVIVES arbitrary random carnage: the command
+    // returning + reporting at all proves no panic (a panic reboots). Individual non-recoverable
+    // victims staying dead is expected, so the verdict is about kernel survival, not per-service.
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"chaos max-carnage 8\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)) {
+        Some(r) => {
+            check!(r.contains("chaos max-carnage:") && r.contains("victims killed:"), "chaos: max-carnage ran (random victims)");
+            check!(r.contains("kernel: SURVIVED") && r.contains("verdict: PASS"), "chaos: max-carnage — kernel survived the random carnage");
+        }
+        None => { println!("shell-test: FAIL — chaos max-carnage timed out (wedged / panic?)"); fail += 2; }
+    }
+    send(&mut write_half, b"cores\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains(&format!("cores: {smp}")), "chaos: shell responsive after max-carnage"),
+        None    => { println!("shell-test: FAIL — shell unresponsive after max-carnage"); fail += 1; }
+    }
+
+    // -----------------------------------------------------------------------
     // Done.
     // -----------------------------------------------------------------------
     child.kill().ok();

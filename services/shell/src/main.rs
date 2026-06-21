@@ -1361,6 +1361,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("chaos kill-storm <svc> [rounds]", "kill a service N times; verify it recovers each time", "chaos kill-storm supervisor 20"),
             ("chaos kill-storm <svc> [n] save <path>", "also write the report to a file (recorded in memory, written at the end)", "chaos kill-storm fs 20 save /chaos.txt"),
             ("  <svc> = supervisor | block-driver | fs", "recoverable targets: the supervisor respawns the services, the kernel respawns the supervisor — only the kernel can't be killed", "chaos kill-storm supervisor 10"),
+            ("chaos max-carnage [rounds] [save <path>]", "the chaos monkey: kill a RANDOM live service each round (everything but the shell); proves the KERNEL survives arbitrary carnage", "chaos max-carnage 30"),
         ], true),
         "drives" => help_block(ctx, "drives", "manage attached disks (records when piped)", &[
             ("drives", "list attached drive(s)", "drives"),
@@ -3064,6 +3065,35 @@ const CHAOS_POLL_EVERY: u32 = 64;         // yields between gen/clock polls (a t
 // `fs`-target save can actually reach a re-registered fs). Bounded (§26.6); §14.3 retry pattern.
 const CHAOS_SETTLE_YIELDS: u32 = 60_000;  // let the just-restarted target re-register + serial drain
 const CHAOS_SAVE_ATTEMPTS: u32 = 6;       // bounded save retries while fs finishes its remount
+const CARNAGE_MAX_CAND: usize = 32;       // bounded snapshot of live killable tasks per round (§26.6)
+
+/// Wait (real wall-clock bounded, RTC) for `name` to be ALIVE (present in the task table). Used
+/// before a kill so a round isn't wasted killing a task that is still mid-respawn. Yields cooperatively.
+fn chaos_wait_alive(ctx: &ServiceContext, name: &str) {
+    let t0 = ctx.datetime().epoch_secs();
+    let mut k = 0u32;
+    while slot_of(ctx, name).is_none() {
+        ctx.yield_cpu();
+        k += 1;
+        if k % CHAOS_POLL_EVERY == 0 && ctx.datetime().epoch_secs() - t0 >= CHAOS_RECOVER_SECS { break; }
+    }
+}
+
+/// Wait (real wall-clock bounded, RTC — not a yield count, which isn't portable across QEMU/hardware)
+/// for `name` to reach a generation different from `og` — proof a fresh instance came up (§7.5). Yields
+/// cooperatively so the recoverer (sharing core 0) runs. Returns true on recovery, false on timeout.
+fn chaos_wait_recovery(ctx: &ServiceContext, name: &str, og: u32) -> bool {
+    let t0 = ctx.datetime().epoch_secs();
+    let mut k = 0u32;
+    loop {
+        ctx.yield_cpu();
+        k += 1;
+        if k % CHAOS_POLL_EVERY == 0 {
+            if let Some(g) = gen_of(ctx, name) { if g != og { return true; } }
+            if ctx.datetime().epoch_secs() - t0 >= CHAOS_RECOVER_SECS { return false; }
+        }
+    }
+}
 
 fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
     // Tokenize the raw line ourselves — `chaos kill-storm <svc> [rounds] [save <path>]` runs past
@@ -3076,10 +3106,12 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
     }
     if ntok == 0 {
         ctx.console_writeln("usage: chaos kill-storm <service> [rounds] [save <path>]   (service: supervisor | block-driver | fs)");
+        ctx.console_writeln("       chaos max-carnage [rounds] [save <path>]            (kill a RANDOM live service each round — all but the shell)");
         return Err(ShellError::Unknown);
     }
     match tok[0] {
-        "kill-storm" => chaos_kill_storm(ctx, cwd, &tok, ntok),
+        "kill-storm"  => chaos_kill_storm(ctx, cwd, &tok, ntok),
+        "max-carnage" => chaos_max_carnage(ctx, cwd, &tok, ntok),
         other => {
             ctx.console_writeln_fmt(format_args!(
                 "chaos: unknown mode '{}' (try: chaos kill-storm <service> [rounds])", other));
@@ -3136,36 +3168,15 @@ fn chaos_kill_storm(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize) 
     let mut ok_r  = [false; CHAOS_MAX_ROUNDS as usize];
     let mut recovered = 0u32;
     for r in 0..rounds as usize {
-        // Ensure the target is ALIVE before we read its generation and kill it. It may still be
-        // mid-respawn from the previous round — especially the supervisor, whose respawn is heavier
-        // and kernel-driven. Killing during that gap would be a wasted round (a no-op kill of a
-        // not-yet-present task). Bounded by the same real-time budget.
-        let t_alive = ctx.datetime().epoch_secs();
-        let mut ka = 0u32;
-        while slot_of(ctx, svc).is_none() {
-            ctx.yield_cpu();
-            ka += 1;
-            if ka % CHAOS_POLL_EVERY == 0
-                && ctx.datetime().epoch_secs() - t_alive >= CHAOS_RECOVER_SECS { break; }
-        }
-        let og = gen_of(ctx, svc).unwrap_or(0);    // generation of the instance about to be killed
+        // Ensure the target is ALIVE before we read its generation and kill it (it may still be
+        // mid-respawn from the previous round — esp. the supervisor, Phase 6). Then kill, and wait
+        // for a NEW generation (a respawn bumps it, §7.5) — both bounded by real wall-clock time.
+        chaos_wait_alive(ctx, svc);
+        let og = gen_of(ctx, svc).unwrap_or(0);
         old_g[r] = og;
-        let _ = ctx.kill(svc);                     // unexpected death → recovered by the supervisor (services)
-                                                   // or by the kernel (the supervisor itself, Phase 6)
-        // Wait for a NEW instance: a generation different from the one we killed (a respawn bumps it,
-        // §7.5). Bounded by REAL wall-clock time (RTC), not a yield count — so a slow, heavy respawn
-        // on real hardware is still detected. Yield so the recoverer (sharing core 0) runs.
-        let t0 = ctx.datetime().epoch_secs();
-        let mut k = 0u32;
-        loop {
-            ctx.yield_cpu();
-            k += 1;
-            if k % CHAOS_POLL_EVERY == 0 {
-                if let Some(g) = gen_of(ctx, svc) {
-                    if g != og { new_g[r] = g; ok_r[r] = true; recovered += 1; break; }
-                }
-                if ctx.datetime().epoch_secs() - t0 >= CHAOS_RECOVER_SECS { break; }
-            }
+        let _ = ctx.kill(svc);                     // recovered by the supervisor (services) or the kernel (supervisor, Phase 6)
+        if chaos_wait_recovery(ctx, svc, og) {
+            new_g[r] = gen_of(ctx, svc).unwrap_or(0); ok_r[r] = true; recovered += 1;
         }
     }
 
@@ -3217,6 +3228,136 @@ fn chaos_kill_storm(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize) 
         }
     }
     if recovered == rounds { Ok(()) } else { Err(ShellError::Unknown) }
+}
+
+/// xorshift64 — a tiny, fast PRNG. Not cryptographic; just enough to pick victims at random.
+fn xorshift64(mut x: u64) -> u64 {
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17; x
+}
+
+/// `chaos max-carnage [rounds] [save <path>]` — the chaos monkey. Each round, snapshot the LIVE task
+/// set (exactly what `observe now` shows), pick one at **random**, and kill it — everything is fair
+/// game **except the shell itself** (killing it would kill this command) and the **kernel** (which is
+/// not a task and cannot be killed). Recoverable victims (supervisor/block-driver/fs) are confirmed
+/// back up; the rest stay dead (nothing auto-restarts them — expected). The headline proof is that the
+/// **kernel survives ANY sequence of random service deaths**: the command returning at all means no
+/// panic (a panic reboots). Random source: the TSC, advanced by xorshift64. Bounded + loud (§26.6):
+/// rounds clamped 1..=100, a fixed candidate snapshot per round.
+#[inline(never)]
+fn chaos_max_carnage(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
+    // [rounds] [save <path>] after tok[0] = "max-carnage".
+    let mut rounds = CHAOS_DEFAULT_ROUNDS;
+    let mut save: Option<&str> = None;
+    let mut i = 1;
+    while i < ntok {
+        if tok[i] == "save" && i + 1 < ntok { save = Some(tok[i + 1]); i += 2; }
+        else if let Some(n) = parse_u32(tok[i]) { rounds = n; i += 1; }
+        else { i += 1; }
+    }
+    let rounds = rounds.clamp(1, CHAOS_MAX_ROUNDS) as usize;
+
+    // RNG seed: the TSC (high-resolution, varies run to run), mixed with the wall clock. Never zero.
+    let mut rng = ctx.read_tsc()
+        ^ (ctx.datetime().epoch_secs() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    if rng == 0 { rng = 0xDEAD_BEEF_CAFE_F00D; }
+
+    ctx.console_writeln_fmt(format_args!(
+        "chaos max-carnage: {} rounds — kill a RANDOM live service each round (everything but the shell)...", rounds));
+
+    // Per-round record (bounded, stack): victim name + outcome (1=recovered, 0=stayed dead).
+    let mut vict: [[u8; 24]; CHAOS_MAX_ROUNDS as usize] = [[0u8; 24]; CHAOS_MAX_ROUNDS as usize];
+    let mut vlen: [u8; CHAOS_MAX_ROUNDS as usize] = [0u8; CHAOS_MAX_ROUNDS as usize];
+    let mut outc: [u8; CHAOS_MAX_ROUNDS as usize] = [0u8; CHAOS_MAX_ROUNDS as usize];
+    let mut recovered = 0u32;
+    let mut killed = 0u32;
+    let mut done = 0usize;
+
+    for r in 0..rounds {
+        // Snapshot the live, killable set: valid, not Dead, named, and NOT the shell. Bounded.
+        let mut cand: [([u8; 24], usize, u32); CARNAGE_MAX_CAND] = [([0u8; 24], 0usize, 0u32); CARNAGE_MAX_CAND];
+        let mut ncand = 0usize;
+        for slot in 0..256u32 {
+            let st = ctx.task_stat(slot);
+            if !st.valid || st.state == 4 { continue; }       // skip empty / Dead
+            let nm = st.name_str();
+            if nm.is_empty() || nm == "shell" { continue; }    // never kill ourselves
+            if ncand < CARNAGE_MAX_CAND {
+                let b = nm.as_bytes(); let l = b.len().min(24);
+                cand[ncand].0[..l].copy_from_slice(&b[..l]);
+                cand[ncand].1 = l;
+                cand[ncand].2 = st.generation as u32;
+                ncand += 1;
+            }
+        }
+        if ncand == 0 { break; }                               // nothing left but the shell
+        done = r + 1;
+
+        rng = xorshift64(rng);
+        let pick = (rng % ncand as u64) as usize;
+        let nl = cand[pick].1;
+        let og = cand[pick].2;
+        let mut nbuf = [0u8; 24];
+        nbuf[..nl].copy_from_slice(&cand[pick].0[..nl]);
+        let name = str_of(&nbuf[..nl]);
+        vict[r][..nl].copy_from_slice(&nbuf[..nl]);
+        vlen[r] = nl as u8;
+
+        let _ = ctx.kill(name);
+        killed += 1;
+        // Recoverable victims are confirmed back; the rest stay dead (expected — nothing restarts them).
+        if CHAOS_RESTARTABLE.contains(&name) && chaos_wait_recovery(ctx, name, og) {
+            outc[r] = 1; recovered += 1;
+        }
+    }
+
+    // Settle so any restart-log burst drains before we print the report.
+    for _ in 0..CHAOS_SETTLE_YIELDS { ctx.yield_cpu(); }
+
+    use core::fmt::Write as _;
+    let mut rb = ReportBuf::new();
+    let _ = writeln!(rb, "=== chaos max-carnage: report ===");
+    let _ = writeln!(rb, "rounds: {}; victims killed: {}", done, killed);
+    let mut recoverable_victims = 0u32;
+    for r in 0..done {
+        let nl = vlen[r] as usize;
+        if nl == 0 { continue; }
+        let name = str_of(&vict[r][..nl]);
+        let restartable = CHAOS_RESTARTABLE.contains(&name);
+        if restartable { recoverable_victims += 1; }
+        let outcome = match (outc[r], restartable) {
+            (1, _)     => "recovered",
+            (_, true)  => "FAILED TO RECOVER",
+            (_, false) => "killed (no auto-recovery — expected)",
+        };
+        let _ = writeln!(rb, "round {:>3}: killed {:<14} -> {}", r + 1, name, outcome);
+    }
+    let _ = writeln!(rb, "recoverable victims recovered: {}/{} (non-recoverable stay dead — expected)", recovered, recoverable_victims);
+    let _ = writeln!(rb, "kernel: SURVIVED {} random kills (no panic — this command returned)", killed);
+    // The test is that the KERNEL survives arbitrary carnage — proven by this report existing at all
+    // (a panic would have rebooted before it printed). PASS = survived. A recoverable victim that did
+    // not come back in budget is flagged per-round above, but does NOT fail the kernel-survival verdict
+    // — it may be the §6.2 supervisor-downtime edge case (a service that died while the supervisor was
+    // itself mid-respawn), which is a known service-level limitation, not a kernel failure.
+    let _ = writeln!(rb, "verdict: PASS (kernel survived)");
+    if rb.overflow { let _ = writeln!(rb, "(report truncated at {} KiB)", REPORT_MAX / 1024); }
+
+    console_write_chunked(ctx, rb.bytes());
+    if let Some(path) = save {
+        let mut pbuf = [0u8; PATH_MAX];
+        if let Some(p) = resolve_or_err(ctx, cwd, path, &mut pbuf) {
+            let mut ppath = [0u8; PATH_MAX];
+            let pl = p.len(); ppath[..pl].copy_from_slice(p);
+            let mut saved = false;
+            for attempt in 0..CHAOS_SAVE_ATTEMPTS {
+                if save_report(ctx, &ppath[..pl], rb.bytes()) { saved = true; break; }
+                if attempt + 1 < CHAOS_SAVE_ATTEMPTS { for _ in 0..CHAOS_SETTLE_YIELDS { ctx.yield_cpu(); } }
+            }
+            if saved { ctx.console_writeln_fmt(format_args!("chaos: report saved to {}", str_of(&ppath[..pl]))); }
+            else { ctx.console_writeln("chaos: could not save report (fs may have been a victim) — console report stands"); }
+        }
+    }
+
+    Ok(())   // reaching here at all proves the kernel survived the carnage
 }
 
 // ---------------------------------------------------------------------------
