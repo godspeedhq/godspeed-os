@@ -109,22 +109,29 @@ chaos max-carnage: 8 rounds — kill a RANDOM live service each round (everythin
 === chaos max-carnage: report ===
 rounds: 8; victims killed: 8
 round   1: killed fs             -> recovered
-round   2: killed ehci           -> killed (no auto-recovery — expected)
+round   2: killed ehci           -> killed (revives on the next supervisor respawn)
 round   3: killed supervisor     -> recovered
 round   4: killed block-driver   -> recovered
-round   5: killed logger         -> killed (no auto-recovery — expected)
+round   5: killed logger         -> killed (revives on the next supervisor respawn)
 round   6: killed fs             -> recovered
 round   7: killed supervisor     -> recovered
-round   8: killed xhci           -> killed (no auto-recovery — expected)
-recoverable victims recovered: 5/5 (non-recoverable stay dead — expected)
+round   8: killed xhci           -> killed (revives on the next supervisor respawn)
+directly-restarted victims recovered: 5/5
+(services not directly restarted — e.g. logger/xhci/ehci — come back on the next
+ supervisor respawn, which re-runs the boot sequence; run `observe now` for the live set)
 kernel: SURVIVED 8 random kills (no panic — this command returned)
 verdict: PASS (kernel survived)
 ```
 
-> ⚠️ Carnage is real. `max-carnage` can leave the system **degraded** — e.g. if it kills `xhci`/`ehci`
-> you lose USB keyboard input afterwards, and killing `logger` loses logging — unless a later supervisor
-> respawn happens to revive them (a supervisor respawn re-runs its boot sequence, which re-spawns the
-> services it owns). It is a deliberate stress tool; reboot to restore a pristine system.
+> **The whole tree regrows from the kernel.** Only the *directly*-restarted services (supervisor by
+> the kernel; block-driver/fs by the supervisor) recover on their own death. The rest (`logger`,
+> `xhci`, `ehci`, …) are not watched individually — but the moment `max-carnage` kills the
+> **supervisor** (a valid random target), the kernel respawns it, and the supervisor **re-runs its
+> boot sequence**, re-spawning every service it owns *fresh*. So a long carnage run that hits the
+> supervisor tends to **fully restore the system**. Hardware-proven on the HP T630: `chaos
+> max-carnage 30` killed the supervisor 6× and every service was alive again at the end (`observe`:
+> xhci/ehci/logger all `Ready`, no kernel panic). A *re-init*, not a resume (§14.2/§25) — a revived
+> driver re-enumerates its devices and resumes polling; in-flight state is not preserved.
 
 ## 6. Capabilities
 

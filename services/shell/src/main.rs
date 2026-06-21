@@ -3327,11 +3327,13 @@ fn chaos_max_carnage(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize)
         let outcome = match (outc[r], restartable) {
             (1, _)     => "recovered",
             (_, true)  => "FAILED TO RECOVER",
-            (_, false) => "killed (no auto-recovery — expected)",
+            (_, false) => "killed (revives on the next supervisor respawn)",
         };
         let _ = writeln!(rb, "round {:>3}: killed {:<14} -> {}", r + 1, name, outcome);
     }
-    let _ = writeln!(rb, "recoverable victims recovered: {}/{} (non-recoverable stay dead — expected)", recovered, recoverable_victims);
+    let _ = writeln!(rb, "directly-restarted victims recovered: {}/{}", recovered, recoverable_victims);
+    let _ = writeln!(rb, "(services not directly restarted — e.g. logger/xhci/ehci — come back on the next");
+    let _ = writeln!(rb, " supervisor respawn, which re-runs the boot sequence; run `observe now` for the live set)");
     let _ = writeln!(rb, "kernel: SURVIVED {} random kills (no panic — this command returned)", killed);
     // The test is that the KERNEL survives arbitrary carnage — proven by this report existing at all
     // (a panic would have rebooted before it printed). PASS = survived. A recoverable victim that did
