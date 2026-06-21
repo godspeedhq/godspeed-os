@@ -3176,11 +3176,12 @@ fn chaos_save_retry(ctx: &ServiceContext, ppath: &[u8], data: &[u8]) -> bool {
     }
 }
 const CARNAGE_MAX_SVC: usize = 16;        // distinct services tracked in the aggregate tally (~6–8 real)
-// max-carnage reports per-SERVICE AGGREGATES (killed/recovered counts), not per-round records, so its
-// memory is constant regardless of round count — the report is never truncated. The round cap is just
-// a §26.6 sanity bound (a long stress run, not infinite); `q` aborts early. (kill-storm keeps its
-// smaller CHAOS_MAX_ROUNDS because it stores per-round generation detail.)
-const CARNAGE_MAX_ROUNDS: u32 = 10_000;
+// max-carnage takes NO round cap: it runs exactly the count you type. The report is per-SERVICE
+// AGGREGATES (killed/recovered counts), constant memory regardless of round count, and each round
+// reclaims the dead instance before respawning — so the round count is a loop counter, not a resource
+// (§26.6 bounds resources, not counters; same reasoning as the unbounded supervisor respawn, §6.2).
+// The only bound is the parsed `u32` and `q`, which aborts early. (kill-storm DOES cap rounds at
+// CHAOS_MAX_ROUNDS because it stores per-round generation detail in fixed arrays.)
 
 /// Wait (real wall-clock bounded, RTC) for `name` to be ALIVE (present in the task table). Used
 /// before a kill so a round isn't wasted killing a task that is still mid-respawn. Yields cooperatively.
@@ -3367,7 +3368,7 @@ fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
         } else if let Some(n) = parse_u32(tok[i]) { rounds = n; i += 1; }
         else { i += 1; }
     }
-    let rounds = rounds.clamp(1, CARNAGE_MAX_ROUNDS) as u64;
+    let rounds = rounds.max(1) as u64;   // no upper cap — run exactly what was typed (q aborts)
 
     // RNG seed: the TSC (high-resolution, varies run to run), mixed with the wall clock. Never zero.
     let mut rng = ctx.read_tsc()

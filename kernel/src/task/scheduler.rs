@@ -1374,6 +1374,16 @@ pub fn kill_task_by_slot(slot: usize) {
             // dead endpoint still fails. Without this the id counter only climbs and a sustained
             // restart storm (`chaos max-carnage`) exhausts the [100, DELEGATED_BASE) band and panics.
             crate::ipc::free_endpoint_id(ep_id);
+
+            // Stop this name resolving to the now-dead endpoint (§14.2): unregister it from the kernel
+            // directory IF it still points here (the endpoint-id guard skips a fresh instance that
+            // already re-registered). The supervisor's reconcile then sees the name MISSING and
+            // respawns the service, instead of adopting a stale dead entry — the bug behind
+            // `fs`/`block-driver` staying dead after a storm killed them while the supervisor itself
+            // was mid-respawn (their death-notifications were lost). Normal restarts are unaffected:
+            // the service re-registers the name on respawn; clients briefly see a lookup miss and retry
+            // (same outcome as the EndpointDead they'd get from the stale entry).
+            crate::ipc::names::unregister_endpoint(task_name, ep_id);
         }
 
         // Restartable-service death notification. These are restartable userspace services (not
