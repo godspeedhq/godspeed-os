@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "kernel",
-    "services/init",
     "services/supervisor",
     "services/logger",
     "services/block-driver",

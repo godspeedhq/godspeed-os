@@ -78,12 +78,11 @@ assert fails caps nosuchservice
 assert fails-with FileNotFound caps nosuchservice
 
 # ===== lifecycle guardrails (negative only — safe, deterministic) =====
+# supervisor is the sole non-restartable TCB (init removed, Path C / Phase 5).
 assert fails spawn supervisor
 assert fails-with Denied spawn supervisor
-assert fails-with Denied spawn init
 assert fails kill supervisor
 assert fails-with Denied kill supervisor
-assert fails-with Denied kill init
 assert fails kill shell
 assert fails spawn nosuchservice
 assert fails-with Unknown spawn nosuchservice

@@ -148,7 +148,7 @@ These are the laws that bound every design choice. Any change that violates an i
   │  logger  ·  block-driver  ·  fs                  │
   ├──────────────────────────────────────────────────┤
   │  Trusted Root  (non-restartable)                 │
-  │  init  ·  supervisor  ·  registry                │
+  │  supervisor   (init removed; registry retired)   │
   ├──────────────────────────────────────────────────┤
   │  Kernel  (mechanism, not policy)                 │
   │  memory · scheduler · ipc · capability           │
@@ -223,9 +223,8 @@ os/
       log.rs               # kernel ring buffer
 
   services/
-    init/                  # PID 1 equivalent (TCB)
-    supervisor/            # restart authority (TCB)
-    registry/              # name → endpoint resolution (restartable, H11; docs/registry.md)
+    supervisor/            # restart authority + name authority (TCB); spawned directly by the kernel
+                           #   (init removed, Phase 5; registry service retired, Phase 4 — Path C §3.7)
     logger/
     block-driver/          # v1: trusted
     fs/                    # v1: trusted, depends on block-driver
@@ -270,8 +269,7 @@ os/
 | Kernel            | Enforces all isolation                              |
 | `arch/x86_64`     | Direct hardware access                              |
 | `kernel/smp`      | Concurrent-correctness primitives                   |
-| `init` service    | Spawns supervisor; first userspace authority        |
-| `supervisor`      | Holds restart authority over all other services     |
+| `supervisor`      | Holds restart authority; **spawned directly by the kernel** (init removed, Phase 5); the sole non-restartable trusted root |
 | `xhci`, `ehci` (DMA drivers) | **Machine-dependent (H1, §6.4):** in the TCB only on a machine with no IOMMU to confine them (DMA-anywhere = kernel-equivalent reach); **dropped** from it — least-privilege and restartable — wherever an IOMMU confines them to their arena. The case is reported loudly at boot (invariant 12). |
 
 > **Amendment 2026-06-12 (H1): DMA-capable drivers are no longer an unconditional TCB
@@ -321,7 +319,7 @@ os/
 
 ### 6.2 Failure Semantics
 
-> **Failure of any TCB service (`init`, `supervisor`) results in kernel panic and immediate system reboot. No automatic recovery is attempted.**
+> **Failure of the TCB service (`supervisor`) results in kernel panic and immediate system reboot. No automatic recovery is attempted.** (`init` was removed in Path C / Phase 5 — the kernel spawns the supervisor directly, so the supervisor is the sole non-restartable trusted root. Path C / Phase 6 will make even the supervisor restartable, leaving the kernel the only unkillable thing.)
 
 > **`registry`, `block-driver`, and `fs` are restartable, not in this set.** Their runtime
 > death is recovered by the supervisor's death-notification restart loop (the kernel notifies
@@ -338,13 +336,15 @@ Silent recovery of TCB state risks undefined system state. Loud failure plus cle
 ### 6.3 Reducing TCB Over Time — **goal reached**
 
 The v2 goal was: only `init`, `supervisor`, and the kernel remain non-restartable. That goal
-is now **met**. `registry` was dropped early via H11 (a restartable userspace name service);
-`block-driver` and `fs` were dropped via the **Phase D amendment (§6.1, 2026-06-17)** once the
-filesystem gained crash-consistent recovery (the redo-journal, `docs/persistence.md` §6.8) —
-so an `fs` restart re-mounts to a consistent state rather than corrupting it. The
-non-restartable set is now just **`init` + `supervisor` + kernel** (plus DMA drivers only on a
-machine without an IOMMU, §6.4). Further shrinking would require making `init`/`supervisor`
-themselves recoverable — out of scope; they are the recovery authority.
+is now **met and exceeded**. `registry` was dropped early via H11 (a restartable userspace name
+service, then **retired entirely** in naming Phase 4 / Path C); `block-driver` and `fs` were dropped
+via the **Phase D amendment (§6.1, 2026-06-17)** once the filesystem gained crash-consistent recovery
+(the redo-journal, `docs/persistence.md` §6.8) — so an `fs` restart re-mounts to a consistent state
+rather than corrupting it. **`init` was then removed outright** (Path C / Phase 5): the kernel spawns
+the supervisor directly, so the non-restartable set is now just **`supervisor` + kernel** (plus DMA
+drivers only on a machine without an IOMMU, §6.4). **Path C / Phase 6 goes to the floor** — making the
+*supervisor itself* restartable (the kernel respawns it; it recovers from the kernel's name directory),
+leaving the **kernel the only unkillable thing** (`docs/naming-design.md` §3.7).
 
 ### 6.4 DMA-Capable Drivers and the IOMMU (H1)
 
@@ -777,14 +777,10 @@ When a page is unmapped (service killed, memory reclaimed), the kernel issues a 
     ── start APs (real-mode trampoline → long mode)
          APs: enter idle scheduler loop
     ── mark all available cores ready
-    ── spawn init on Core 0
-
-  init (Core 0)
-    ── spawn supervisor on Core 0
-    ── spawn logger on Core 0
+    ── spawn supervisor on Core 0   (the kernel's ONE direct spawn — no init)
 
   supervisor (Core 0)
-    ── spawn registry on Core 0   (name service — FIRST; holds its cap)
+    ── spawn logger on Core 0
     ── read boot manifest
     ── spawn services per placement policy (§9.2),
        wiring each from its name→cap map (no kernel name resolution)
@@ -792,15 +788,17 @@ When a page is unmapped (service killed, memory reclaimed), the kernel issues a 
   ── System reaches multi-core steady state ──
 ```
 
-> **Amendment 2026-06-21 (naming Phase 3b): `registry` is spawned by the `supervisor`, not
-> `init`.** Moving name→endpoint resolution out of the kernel (`docs/naming-design.md`, §4.4/§26.10)
-> makes the supervisor the name authority. For it to wire every service's `registry` peer from a
-> capability it holds — rather than the kernel resolving the name — the supervisor must hold
-> registry's cap, so it now spawns registry **first**, before any service that registers with it.
-> `init` spawns only `supervisor` + `logger`. Registry's *boot-time* spawn failure is still **fatal**
-> (the supervisor aborts → kernel panic, same reason string), preserving §11.3; its *runtime* death is
-> still a supervisor restart (H11, §6.2). The kernel still records the name→endpoint mapping at spawn
-> (used by the restart path + the registry-bootstrap stopgap) until that path is removed in Phase 5.
+> **Amendment 2026-06-21 (naming Phases 3b–5): the kernel spawns the `supervisor` directly; `init`
+> is removed; the registry *service* is retired.** Moving name→endpoint resolution out of the kernel
+> (`docs/naming-design.md`, Path C §3.7) makes the supervisor the name authority. Phase 3b moved the
+> name service under the supervisor; Phase 4 then **retired the registry service** entirely (the
+> kernel's minimal `name → endpoint` recovery directory — `ipc::names` + the gated `AcquireSendCap` —
+> is the namer now; the supervisor wires every service from its `name → cap` map and clients reacquire
+> by name through the directory). Phase 5 **removes `init`**: the kernel's *one* direct spawn is the
+> supervisor (`task::spawn_supervisor`, using the gated `SUPERVISOR_ELF`), and the supervisor — not
+> init — spawns the logger. The supervisor's boot-time spawn failure is still **fatal** (the kernel
+> panics, `"supervisor spawn failed"`, §11.3, §6.2) — now from the kernel's direct spawn rather than
+> an init abort. The non-restartable set is now just **`supervisor` + kernel**.
 
 The bootloader is **Limine**, accessed via the Limine Boot Protocol. Limine is responsible for loading the kernel image, supplying the physical memory map, the framebuffer descriptor, kernel relocation info, and the SMP topology (APIC IDs of all available cores). See Appendix A for the bootloader rationale and installation story.
 
@@ -818,9 +816,8 @@ Because Limine supplies APIC IDs directly, the kernel does not need to probe ACP
 | Bootloader        | Hardware reset                         |
 | Kernel BSP init   | Kernel panic, halt                     |
 | AP startup        | Kernel logs warning, continues with available cores; if zero APs come up, system runs as single-core |
-| init spawn        | Kernel panic, halt                     |
-| supervisor spawn  | Kernel panic, halt (TCB)               |
-| logger spawn      | Init logs to kernel ring buffer, retry |
+| supervisor spawn (by the kernel — the one direct spawn, no init) | Kernel panic, halt (TCB) — `"supervisor spawn failed"` |
+| logger spawn (by the supervisor) | Supervisor logs to kernel ring buffer, retry once |
 | Application svc   | Supervisor logs, may retry per policy  |
 | Service contracted to unavailable core | Spawn rejected with `PlacementInvalid`; supervisor logs and skips; system runs without that service |
 
@@ -1113,7 +1110,7 @@ Bugs are classified as one of: `kernel`, `arch`, `memory`, `ipc`, `capability`, 
 
 Bug reports include: logs (kernel ring buffer + service), contract(s), QEMU repro steps including `-smp N` value, expected behavior, actual behavior, suspected classification.
 
-Kernel panics write to serial console **and** a reserved memory page that survives reboot. On next boot, init logs the stored panic reason. Panics on any core halt the system.
+Kernel panics write to serial console **and** a reserved memory page that survives reboot. On next boot, the kernel logs the stored panic reason (init, which used to, is removed — Phase 5). Panics on any core halt the system.
 
 ---
 
@@ -1391,10 +1388,10 @@ A test failing for the wrong reason (compile error, harness bug, missing cap not
 
 ```
 test bootstrap_steady_state_positive:
-    image = build_kernel(boot_manifest=[init, supervisor, logger])  # registry retired (Phase 4)
+    # Phase 5: no init — the kernel spawns the supervisor directly; the supervisor spawns logger.
+    image = build_kernel(boot_manifest=[supervisor, logger])
     qemu  = boot(image, smp=4)
 
-    assert serial_contains("init: ready",       within=5s)
     assert serial_contains("supervisor: ready", within=5s)
     assert serial_contains("logger: ready",     within=5s)
     assert serial_contains("smp: 4 cores ready", within=5s)
@@ -1405,13 +1402,13 @@ test bootstrap_steady_state_positive:
 
 ```
 test bootstrap_tcb_failure_panics:
-    # Path C / Phase 4: registry retired, so the corrupt-and-fail TCB is now the SUPERVISOR
-    # (init spawns it, observes the ELF-load error, and aborts → kernel panic, §6.2).
-    image = build_kernel(boot_manifest=[init, logger, corrupt_binary("supervisor")])
+    # Path C / Phase 5: init is removed, so the KERNEL spawns the supervisor directly. A corrupt
+    # supervisor ELF fails that spawn → the kernel panics (no init abort, so no "reason:" prefix).
+    image = build_kernel(boot_manifest=[corrupt_binary("supervisor"), logger])
     qemu = boot(image, smp=4)
 
     assert serial_contains("KERNEL PANIC", within=5s)
-    assert serial_contains("reason: supervisor spawn failed")
+    assert serial_contains("supervisor spawn failed")
     assert qemu_state == "halted"
     assert no_app_services_started()
 ```
@@ -2003,7 +2000,7 @@ Filesystem persistence beyond the trusted block driver, network stack, work-stea
 - **Quantum** — The 10 ms time slice after which the per-core scheduler preempts.
 - **Routing table** — Kernel structure mapping `EndpointId → (CoreId, Generation, Liveness)`.
 - **TCB** — Trusted Computing Base. Kernel + arch + smp + init + supervisor. `registry` left the TCB via H11 (and the **registry service was then retired entirely** — naming Phase 4 / Path C, `docs/naming-design.md` §3.7); `block-driver` + `fs` left via the Phase D amendment (§6.1, once `fs` gained crash-consistent recovery). DMA drivers (`xhci`/`ehci`) are in the TCB only on a machine without an IOMMU (§6.4).
-- **Trusted root** — `init`, `supervisor`. Failure of either reboots the system; they are the only remaining non-restartable services. (`block-driver` + `fs` are restartable storage services.) *(Path C, §3.7, makes the supervisor restartable too — Phase 6 — leaving the kernel the only unkillable thing.)*
+- **Trusted root** — `supervisor` (sole; `init` was removed in Path C / Phase 5 — the kernel spawns the supervisor directly). Its failure reboots the system; it is the only remaining non-restartable service. (`block-driver` + `fs` are restartable storage services.) *(Path C, §3.7, makes the supervisor restartable too — Phase 6 — leaving the kernel the only unkillable thing.)*
 - **Name directory** — the kernel's minimal `name → EndpointId` map (`ipc::names`) + a gated "mint a SEND cap by name" (`AcquireSendCap`). The bounded recovery anchor that **replaced the registry service** (naming Phase 4 / Path C, §3.7): the supervisor wires services from a `name → cap` map and clients reacquire names through the directory. *(The retired `registry` userspace name service is `docs/registry.md` — historical.)*
 - **Service** — Userspace component with a contract, capability table, and isolated address space.
 - **Contract** — `service.toml` declaring resource, capability, and placement requirements.

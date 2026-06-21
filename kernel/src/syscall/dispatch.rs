@@ -763,18 +763,18 @@ fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
         Ok(s)  => s,
         Err(_) => return -1,
     };
-    // §6.2 (fail-closed): the trusted root (init/supervisor) is non-restartable —
-    // its death requires a reboot, so a caller must not be able to kill it via this
-    // syscall. Reject the request *before* any kill happens. This is the primary §6.2
-    // gate; the assert_tcb_alive sweep below is a defensive secondary check. Rejection
-    // (not panic) is deliberate: a mere kill *attempt* is not a TCB death, and
-    // panicking would hand any caller of this syscall a reboot denial-of-service.
+    // §6.2 (fail-closed): the trusted root (`supervisor`) is non-restartable — its death requires a
+    // reboot, so a caller must not be able to kill it via this syscall. Reject the request *before*
+    // any kill happens. This is the primary §6.2 gate; the assert_tcb_alive sweep below is a
+    // defensive secondary check. Rejection (not panic) is deliberate: a mere kill *attempt* is not a
+    // TCB death, and panicking would hand any caller a reboot denial-of-service.
     //
-    // `registry` is NOT listed (H11 ph6): it is now a restartable userspace name
-    // service — killing it degrades name resolution until the supervisor restarts it,
-    // it does not reboot the system. It can therefore be killed by a SERVICE_CONTROL
-    // holder like any other restartable service (and the identity test does so).
-    if matches!(name, "init" | "supervisor") {
+    // `init` is gone (Path C / Phase 5 — the kernel spawns the supervisor directly). `registry`,
+    // `fs`, and `block-driver` are restartable services — killing one degrades briefly until the
+    // supervisor restarts it, it does not reboot the system, so they are killable by a
+    // SERVICE_CONTROL holder (the identity test does so). (Path C / Phase 6 will make the supervisor
+    // restartable too, at which point even this guard relaxes.)
+    if name == "supervisor" {
         return -1;
     }
     if crate::task::kill_by_name(name) {
