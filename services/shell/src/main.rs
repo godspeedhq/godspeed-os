@@ -2976,10 +2976,14 @@ fn lookup_sink(ctx: &ServiceContext, sink: &str) -> Option<CapHandle> {
     // bump the tick counter (`block_and_reschedule` doesn't). So a plain retry loop is both
     // cooperative (each iteration deschedules on the IPC) and real-time-bounded: with no yields the
     // counter advances ~only on the 100 Hz timer IRQ — a true wall-clock.
+    // Path C (Phase 4): resolve the sink via the kernel name-directory (SEND|GRANT, so the cap can
+    // be delegated to the producer) instead of the registry service. The directory is populated
+    // synchronously at the sink's spawn, so this normally succeeds on the first iteration; the
+    // bounded wall-clock retry stays as a guard for the rare not-yet-scheduled case.
     let core  = ctx.core_id();
     let start = ctx.inspect_core_total_ticks(core);
     loop {
-        if let Some(h) = ctx.registry_lookup(sink) { return Some(h); }
+        if let Some(h) = ctx.acquire_send_grant_cap(sink) { return Some(h); }
         if ctx.inspect_core_total_ticks(core).wrapping_sub(start) >= FILTER_WAIT_TICKS { return None; }
     }
 }

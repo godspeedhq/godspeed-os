@@ -496,17 +496,17 @@ impl ServiceContext {
         crate::ipc::recv(self.recv_handle()?).ok()
     }
 
-    /// Reacquire a fresh SEND cap to `peer` via the **registry service** (H11) and
-    /// point the named-peer cache at it, so subsequent `try_send(peer)` / `send(peer)`
-    /// use the new cap. This is the registry-service replacement for `reacquire_cap`
-    /// (the kernel syscall-10 path). Returns `false` if the registry cannot currently
-    /// resolve the name (e.g. the named service has not yet re-registered after its
-    /// own restart) — the caller should retry on a later tick.
+    /// Reacquire a fresh SEND cap to `peer` and point the named-peer cache at it, so subsequent
+    /// `try_send(peer)` / `send(peer)` use the new cap. Returns `false` if `peer` cannot currently
+    /// be resolved (e.g. it has not finished respawning) — the caller should retry on a later tick.
+    ///
+    /// **Path C (Phase 4):** this now resolves via the **kernel name-directory** (syscall 10,
+    /// `reacquire_cap`) rather than the registry *service*. The directory is populated synchronously
+    /// at each service's spawn, so there is no registry round-trip and no bootstrap chicken-and-egg
+    /// (the directory lives in the kernel, always reachable). `reacquire_cap` also updates the
+    /// send-cap cache. (Name kept until the registry service is fully removed, §4c.)
     pub fn reacquire_via_registry(&self, peer: &str) -> bool {
-        match self.registry_lookup(peer) {
-            Some(h) => { cache_send_slot(peer, h.0); true }
-            None    => false,
-        }
+        self.reacquire_cap(peer).is_ok()
     }
 
     /// Handle to this service's `SEND|GRANT` cap to its **own** endpoint, minted at
