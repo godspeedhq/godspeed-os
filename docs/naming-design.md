@@ -1,14 +1,23 @@
 # Design Spec: Move Naming Out of the Kernel
 
-> **Status:** Direction **signed off (2026-06-20)** — implementation proceeds in phases (§5). The
-> §3.5 open question is **DECIDED: retire `registry`** (the supervisor is the sole name authority).
-> Still non-normative as a document: the constitution amendments (§6) land *with* their phases. The
-> spec wins on any conflict; this doc trails it.
+> **Status:** Direction **signed off (2026-06-20)**; Phases 0a–3c **built + merged** (the supervisor
+> now wires every real service from a `name → cap` map at boot **and** on restart — zero kernel name
+> resolution for them). **End-state revised 2026-06-21 to Path C (§3.7)** — supersedes the original
+> §3.5 "retire registry, supervisor = sole namer." The constitution amendments (§6) land *with* their
+> phases. The spec wins on any conflict; this doc trails it.
 >
 > **Author intent (2026-06-20):** the kernel currently performs a *policy* job — resolving service
 > *names* to *endpoints* — which §26.10 says belongs in a service. Pull it out so the kernel is pure
 > mechanism, the supervisor owns naming, and there is no "the kernel already resolves names"
 > precedent for future scope creep.
+>
+> **Revised goal (2026-06-21, Path C, §3.7):** the *deeper* prize is shrinking the **unkillable set to
+> its theoretical minimum — just the kernel** (§6.3). Reaching that requires a recovery anchor that
+> *cannot* die, which only the kernel is. So the kernel keeps a **minimal name→endpoint recovery
+> directory** (one bounded exception), the registry service retires into it, **init is removed**, and
+> the **supervisor becomes restartable** (kernel respawns it; it recovers from the directory). This
+> *softens* §26.10 (a thin naming facility stays in the kernel) to *better serve* §6.3 (unkillable =
+> `{kernel}`). §§1–3.6 below record the original reasoning that got us here; §3.7 is the chosen end.
 
 ---
 
@@ -150,10 +159,12 @@ the registry's job collapses into the supervisor:
   the *registry* cap from the supervisor (bootstrap). This keeps the supervisor lean but keeps a
   service and a cache-coherence concern.
 
-**Decision (signed off 2026-06-20): retire `registry`.** The supervisor is the sole name authority;
-the bootstrap chicken-and-egg disappears (no registry cap to reacquire — only the never-stale
-supervisor cap). The alternative (front-end) is recorded above for history. `init` + `supervisor`
-remain the only non-restartable services, as intended.
+**Decision (signed off 2026-06-20): retire `registry`** — _**superseded 2026-06-21 by Path C (§3.7).**_
+The original decision retired the registry into the supervisor, leaving `{kernel, supervisor}`
+unkillable. Path C keeps the registry's *recovery* role as a minimal **kernel** directory instead, so
+the supervisor can also be restarted and the unkillable set shrinks to `{kernel}`. The registry
+*service* still retires; what changes is *where its recovery state lives* (kernel directory, not the
+supervisor). Read §3.7 for the chosen end-state; §3.1–§3.6 are the reasoning that led there.
 
 ### 3.6 Death notifications
 
@@ -162,20 +173,98 @@ by **task label** (kept) or by **task_id** (the supervisor holds `task_id → na
 is mechanism — the kernel reporting the lifecycle of its own tasks — not name resolution. No change
 required beyond what the new spawn return already gives the supervisor.
 
+### 3.7 Path C — kernel keeps a minimal recovery directory (the chosen end-state, 2026-06-21)
+
+§3.1–§3.6 make the **supervisor** the bootstrap anchor. That works for *wiring* (done, Phases 0a–3c),
+but it leaves the supervisor **unkillable**, and trying to fix *that* exposes a trap.
+
+#### 3.7.1 The trap, and why only the kernel escapes it
+
+To make the supervisor restartable it must **recover its state** after a respawn — above all, its caps
+to the already-running services. But **capabilities are not data**: a cap is an unforgeable kernel
+token (`ResourceId + Rights + Generation`, §7.3), and a service only ever holds opaque handles. You
+**cannot serialise a cap to disk and load it back** — that is cap forgery. So persistence can save
+*intent* ("`fs` should be running") but never the *caps*; those must be **re-minted from a live
+source**. And the supervisor cannot re-spawn the services to re-derive them (they are alive — the
+singleton guard rejects it).
+
+What live source? A separate **registry** could hold the caps and survive the supervisor — but the
+registry, if it dies, is respawned *by the supervisor*. Supervisor needs registry to recover; registry
+needs supervisor to recover. **Mutual dependency ⇒ both must stay up ⇒ both unkillable.** The trap.
+
+There is exactly one escape: the recovery anchor must be the one thing that **fundamentally cannot
+die — the kernel** (a kernel fault *is* the machine faulting; nothing beneath it could respawn it).
+So the kernel holds the minimal recovery state. **Everything above the kernel then becomes
+restartable, and the unkillable set is `{kernel}` — the theoretical minimum (§6.3).**
+
+#### 3.7.2 The one exception: a *minimal* directory, not the registry
+
+The kernel keeps only what recovery needs — and **it already has it**:
+
+- **`name → EndpointId`** (`ipc::names`, populated at spawn — kept), and
+- **mint a SEND cap by name** (`AcquireSendCap`, syscall 10 — kept, but now **GATED** behind a
+  recovery capability, closing the ambient surface §1.1 flagged).
+
+That is **not** the full registry — no register-permission policy, no rights-narrowing, no
+delegated-cap bookkeeping. The kernel already routes opaque endpoints; a flat name label per endpoint
+plus reacquire-by-name is a thin **recovery directory**, not naming *policy*. The registry **service
+retires** (the directory replaces it); its richer features aren't needed for recovery.
+
+#### 3.7.3 How the supervisor recovers (mechanism, checked)
+
+| State the supervisor needs | Recovery source |
+|---|---|
+| caps to running services | `AcquireSendCap` from the kernel directory (re-minted by the kernel) |
+| which services *should* run | a **persisted manifest**, reconciled against the kernel's live-task list — so a service that died *during* the supervisor's downtime is noticed and restarted |
+| its death-notification endpoint | the kernel **re-points** death notices to the new instance |
+| `service_control` + other authority caps | re-minted at spawn (the kernel grants them by name) |
+| clients finding the new supervisor | clients reacquire it **by name through the directory** — the directory *is* the bootstrap, so no special stable endpoint is needed |
+
+Capabilities are never persisted; the manifest carries intent and the kernel re-mints the caps. Clients
+that were mid-request when the supervisor died get `EndpointDead` and poll until it is back — exactly
+§14.3, already proven by the chaos double-storm.
+
+#### 3.7.4 The trade — §26.10 vs §6.3 — and why Path C is chosen
+
+Path C **softens §26.10** (a thin naming facility stays in the kernel) to **better serve §6.3**
+(*reduce the TCB over time* — here, to its theoretical floor, `{kernel}`). It chooses
+**fault-tolerance over the last increment of kernel-naming purity** — the right priority for an OS:
+*availability of everything above the kernel* outweighs the final scrap of minimalism.
+
+The §26.10 scope-creep worry (§1.2) was about *unbounded* "the kernel already does X, so my thing
+fits." Path C's exception is the opposite: **one named, documented, frozen exception** — the recovery
+directory — with a hard, non-extensible rationale (*the recovery anchor must be unkillable, and only
+the kernel is*). That is a defensible boundary, not a slippery slope. The kernel's naming role still
+**shrank dramatically**: from "resolve names to wire every service at spawn" (today) to "a flat
+recovery directory for re-minting caps after a restart." Phases 0a–3c — moving all *wiring* to the
+supervisor — **stand unchanged**; only the endgame's target moves.
+
+> **Path C in one line:** the kernel keeps a minimal, gated name→cap **recovery directory**; the
+> registry service retires into it; **init is removed**; the **supervisor is restartable** (kernel
+> respawns it, it recovers from the directory). **Unkillable = `{kernel}` only.**
+
 ---
 
-## 4. What the kernel deletes
+## 4. What the kernel deletes — and keeps (revised for Path C)
 
-- `kernel/src/ipc/names.rs` (the whole module) — *after* the migration.
-- Syscall 10 `AcquireSendCap` + handler `handle_acquire_send_cap`.
-- The `names::lookup` send-peer wiring loop in `spawn_service_with_config`.
-- `names::register` calls at spawn.
-- SDK `reacquire_cap` / `acquire_send_cap` (syscall-10 wrappers).
-- **InspectKernel query 2** ("endpoint generation by name") rides on `ipc::names::lookup` — used by a
-  test/introspection path. It must move to a name-free form (e.g. generation by `EndpointId`, or via
-  the supervisor) or be removed. Flagged as a migration sub-task, not a blocker.
+**Deletes:**
 
-The kernel keeps: routing, cap machinery, the spawn syscall (new shape), `service_config_by_name`
+- The `names::lookup` **send-peer wiring loop** in `spawn_service_with_config` — once every service
+  is supervisor-wired at boot *and* restart (Phases 3b/3c, done). The kernel no longer resolves names
+  to *wire* anyone.
+- SDK `reacquire_via_registry` / the userspace registry **lookup path**, and the **registry service**
+  itself (Path C, §3.7) — its recovery role moves to the kernel directory.
+
+**Keeps (the Path C exception — was "delete" under the original plan):**
+
+- `kernel/src/ipc/names.rs` — the flat `name → EndpointId` **recovery directory** (`names::register`
+  still runs at spawn; `names::lookup` serves recovery, not wiring).
+- Syscall 10 `AcquireSendCap` — the **re-mint-a-cap-by-name** recovery primitive, now **GATED** behind
+  a recovery capability (closing the ambient surface from §1.1). SDK keeps a thin `reacquire_cap`.
+- **InspectKernel query 2** ("endpoint generation by name") — rides on the kept directory; no longer
+  needs a name-free rewrite.
+
+Also unchanged: routing, cap machinery, the spawn syscall (new shape), `service_config_by_name`
 (ELF lookup — §7), task labels, MMIO/DMA/IRQ + endpoint + delegated-resource minting.
 
 ---
@@ -186,17 +275,28 @@ The boot/spawn path is the most load-bearing code in the system and is currently
 (selfcheck 185/0). **Do not big-bang it.** Each phase keeps the full suite green
 (identity 23/23, files 137/0, shell 67/0, script 4/0, and `selfcheck` green) before the next.
 
+| Phase | Change | Status |
+|---|---|---|
+| **0a** | New `SpawnReturningEndpoint` syscall — spawn returns the new endpoint cap to the caller. Additive. | ✅ merged |
+| **1** | Supervisor builds its `name → cap` map (`NameCapMap`) from those caps (shadow). | ✅ merged |
+| **0b** | New `SpawnWithCaps` syscall — kernel installs caller-supplied send-peer caps. Wiring becomes a **merge** (install caller caps, then name-wire any peer not provided). | ✅ merged |
+| **2** | Flip `fs ← block-driver` (wired from the map). | ✅ merged |
+| **3a** | Flip `shell ← fs`; generalize `spawn_wired(name, peers)`. | ✅ merged |
+| **3b** | Move `registry` spawn `init → supervisor` (§11); provide `registry` to all services → every real service 100% supervisor-wired **at boot**. | ✅ merged |
+| **3c** | Flip the supervisor's **restart** paths to re-wire from the map (map updates in place + frees the dead cap). Boot **and** restart now avoid kernel name resolution. | ✅ merged |
+
+**Endgame — re-scoped for Path C (§3.7).** Each phase still a mergeable, always-bootable, suite-green
+increment.
+
 | Phase | Change | Done when |
 |---|---|---|
-| **0** | Add the new spawn syscall shape (accept `install` caps, return endpoint cap) **alongside** the existing name-wiring path. `ipc::names` untouched. | New syscall works in a unit/probe; old path unchanged; suite green. |
-| **1** | Supervisor builds its `name → cap` map by collecting returned endpoint caps (shadow — not yet used to wire). | Supervisor logs it holds a cap for every spawned service; suite green. |
-| **2** | Flip **one leaf** service (e.g. `pong`) to be wired by the supervisor (caps passed in) instead of kernel name-resolution. | That service boots + does IPC via supervisor-passed caps; suite green. |
-| **3** | Flip **all** services (incl. `fs`/`block-driver`/`shell` dependency chains). Kernel spawn-time name wiring becomes dead code. | Full boot + IPC with zero `names::lookup` calls on the spawn path; suite green. |
-| **4** | Move reacquisition to the supervisor; **remove the `registry_lookup` syscall-10 stopgap**. Re-run the chaos double-storm regression (it must still pass via the supervisor path). | `chaos kill-storm registry N` → working `ls`, now through the supervisor; suite green. |
-| **5** | Retire `registry` (or convert to front-end per §3.5); **delete `ipc::names` + syscall 10** + SDK wrappers; resolve query 2. Update §22 Test 11 to pin client-resolution-after-restart through the supervisor. | No `ipc::names`, no syscall 10 in the tree; suite green; audit clean. |
+| **4 — Retire the registry service; the kernel directory becomes the namer.** | Clients reacquire via the **gated** kernel directory (`AcquireSendCap`) instead of the registry service; delete the `registry` service + its userspace lookup path. The registry-bootstrap stopgap becomes the *normal* path. **Gate `AcquireSendCap`** behind a recovery cap (close the ambient surface). | No `registry` service in the tree; clients reacquire via the gated directory; chaos double-storm green; suite green. |
+| **5 — Remove `init`; the kernel spawns the supervisor directly.** | Retarget `spawn_init` at `supervisor`; move `logger`'s spawn into the supervisor; delete `init`. −1 TCB member. | Boot via kernel→supervisor→all; suite green; §11/§6 amended. |
+| **6 — Make the supervisor restartable; unkillable = `{kernel}`.** | Kernel **respawns the supervisor on death** (instead of panic) and **re-points death notices** to the new instance. Supervisor persists a **manifest**, and on respawn rebuilds its `name → cap` map from the kernel directory + reconciles against live tasks. | Kill the supervisor → kernel respawns it → it recovers + the system continues, no reboot; new identity test pins it; §6.2 amended. |
 
 Roll-back is per-phase: each phase is a mergeable, green increment, so a regression reverts one phase,
-not the program.
+not the program. Phases 4 and 5 are mechanical; **Phase 6 is the constitutional one** (it amends §6.2:
+the supervisor's death is no longer a kernel panic) and the largest — it gets its own design pass.
 
 ---
 
@@ -204,20 +304,24 @@ not the program.
 
 To be drafted into `CLAUDE.md` at adoption (each with a commit rationale, §21):
 
-- **§4.4 (Kernel Anti-Scope):** add that **name → endpoint resolution is not in the kernel** — the
-  supervisor owns naming and cap distribution. The kernel routes opaque `EndpointId`s and installs
-  caps it is handed; it does not resolve names for third parties.
-- **§11 (Bootstrap):** document the new spawn protocol (kernel returns an endpoint cap and installs
-  handed caps; the supervisor wires dependents from its `name → cap` map in dependency order).
-- **§26.10 (Mechanism, not policy):** record this as the worked example.
-- **§6 (TCB) note:** the supervisor's role is clarified to include name authority + reacquisition
-  broker (it was already TCB and the spawn authority — no new TCB member). If `registry` is retired,
-  update §6.1/§6.2, the Glossary, and `docs/registry.md`.
+- **§4.4 (Kernel Anti-Scope):** the kernel does **not resolve names to wire services** — the supervisor
+  owns wiring and cap distribution. The kernel keeps only a **minimal name→endpoint recovery
+  directory** (Path C, §3.7), a single named, frozen exception for re-minting caps after a restart.
+  *(Done in spirit by §11 amendment, Phase 3b.)*
+- **§11 (Bootstrap):** the new spawn protocol; registry spawned by the supervisor *(✅ amended, 3b)*;
+  later, the kernel spawns the supervisor directly (Phase 5).
+- **§26.10 (Mechanism, not policy):** record the worked example **and the bounded Path-C exception** —
+  the recovery directory is the one place naming stays in the kernel, justified by §6.3 (the recovery
+  anchor must be unkillable), not a precedent for further kernel growth.
+- **§6.1/§6.2/§6.3 (TCB):** the big one (Phase 6) — **the supervisor becomes restartable**: its death
+  is no longer a kernel panic; the kernel respawns it and it recovers from the directory. The
+  non-restartable set shrinks to **`{kernel}` only** — §6.3's goal reached at its floor. Retire
+  `registry` from §6.1, the Glossary, and `docs/registry.md` (Phase 4).
 - **§13 (Contracts) note:** `send_peers` is a *requirement the supervisor fulfils*, not something the
-  kernel resolves — sharpening §13.3 (request, not permission).
-- **§22 Test 11:** extend to pin "a pre-existing client resolves a name after a service restart"
-  through the supervisor path (the property the stopgap's regression currently pins via the files
-  test).
+  kernel resolves — sharpening §13.3. *(In effect since Phase 3.)*
+- **§22:** extend Test 11 to pin client-resolution-after-restart via the directory (Phase 4); add a new
+  identity test for **supervisor-survives-its-own-restart** (Phase 6) — the executable form of
+  "unkillable = `{kernel}`."
 
 ---
 
@@ -248,7 +352,25 @@ To be drafted into `CLAUDE.md` at adoption (each with a commit rationale, §21):
    service count; well within the cap table. Worth a number in Phase 1.
 4. **Query 2 consumers.** Confirm exactly who reads "endpoint generation by name" before removing it
    (Phase 5) so a test doesn't silently lose coverage.
-5. **Retire vs front-end.** The one genuinely open design choice (§3.5) — wants a decision at sign-off.
+5. **Retire vs front-end.** ~~Open (§3.5).~~ **Resolved by Path C (§3.7):** the registry *service*
+   retires; its *recovery* role moves to the minimal kernel directory.
+
+### Path C-specific risks (Phase 6)
+
+6. **Supervisor recovery completeness.** A respawned supervisor rebuilds caps from the directory and
+   reconciles a persisted manifest against live tasks. The gap to watch: a service that dies *and is
+   itself mid-restart* exactly as the supervisor dies. Reconciliation (manifest vs live-task list)
+   should catch it on the next pass — pin this in the Phase-6 identity test.
+7. **Manifest authority + location.** The "should-run" manifest is supervisor-owned intent. Simplest:
+   a fixed compiled-in list (the current boot order) — no persistence needed for v1, since the set of
+   services is static. Persisting to `fs` would re-introduce a dependency (and `fs` is itself
+   restartable); a compiled-in manifest sidesteps it.
+8. **Gating `AcquireSendCap` (Phase 4).** It becomes the universal recovery primitive, so it must be
+   gated (a `RECOVER`/directory cap) rather than ambient — held by the supervisor and by services that
+   legitimately reacquire their own declared peers.
+9. **Kernel re-points death notices (Phase 6).** On supervisor respawn the kernel must redirect the
+   death-notification endpoint to the new instance — a small, bounded kernel mechanism (it already
+   tracks the supervisor specially).
 
 ---
 
@@ -256,20 +378,29 @@ To be drafted into `CLAUDE.md` at adoption (each with a commit rationale, §21):
 
 No new test *categories* — the existing suite is the safety net, run green at every phase (§5). Plus:
 
-- **Phase 2/3:** boot + cross-core IPC (the §23 ping/pong demo) with supervisor-passed caps — proves
-  wiring-by-cap matches wiring-by-name.
-- **Phase 4:** the chaos double-storm regression (`project_registry_bootstrap`) must pass through the
-  supervisor reacquisition path, with the syscall-10 stopgap gone.
-- **Phase 5:** `selfcheck` green on hardware; `docs/unsafe-audit.md` unchanged (this is a logic move,
-  not new `unsafe`); grep proves `ipc::names` / syscall 10 are gone.
+- **Phases 2/3 (done):** boot + cross-core IPC and the files test (real fs↔block-driver) prove
+  wiring-by-cap matches wiring-by-name; the chaos double-storm proves restart re-wiring.
+- **Phase 4:** the chaos double-storm regression must still pass with the `registry` service gone,
+  through the gated kernel directory. `AcquireSendCap` rejects callers without the recovery cap.
+- **Phase 6 (the headline test):** a new identity test — **kill the supervisor, the kernel respawns
+  it, it recovers its map + manifest, and the system keeps running with no reboot.** The executable
+  proof that the unkillable set is `{kernel}` only. `docs/unsafe-audit.md` essentially unchanged (the
+  kernel additions — gated directory, respawn-supervisor, re-point death notices — are small and in
+  permitted layers or safe `fn`s).
 
 ---
 
 ## 10. Summary
 
-The kernel stops resolving service names to endpoints — pure mechanism, no policy, no ambient
-mint-by-name, no scope-creep precedent. The supervisor (already TCB, already the spawn authority)
-becomes the name authority by construction: spawn returns endpoint caps, the supervisor wires
-dependents and brokers reacquisition. The registry service most likely retires, taking the bootstrap
-chicken-and-egg with it. The change is large and load-bearing, so it ships as an incremental,
-always-bootable migration with the full suite green at every step — never a big-bang on the boot path.
+The kernel stops **resolving names to wire services** — the supervisor owns all wiring, at boot and on
+restart (Phases 0a–3c, done: spawn returns endpoint caps; the supervisor installs caller-supplied caps
+and wires dependents from its `name → cap` map). What the kernel **keeps** is one bounded exception: a
+minimal, gated `name → endpoint` **recovery directory** (Path C, §3.7) — because the recovery anchor
+must be the one thing that cannot die, and only the kernel is. With that anchor the registry service
+retires into it (Phase 4), `init` is removed (Phase 5), and the **supervisor itself becomes
+restartable** (Phase 6: the kernel respawns it and it recovers from the directory). The result is the
+**theoretical-minimum liveness base — `{kernel}` alone** (§6.3 reached at its floor), bought by
+*softening* §26.10 (a thin naming facility stays in the kernel): a deliberate, documented,
+non-extensible trade of last-scrap minimalism for the availability of everything above the kernel. The
+change is large and load-bearing, so it ships incrementally, always-bootable, suite green at every
+step — never a big-bang on the boot path.
