@@ -3086,6 +3086,7 @@ const CHAOS_SETTLE_YIELDS: u32 = 60_000;  // let the just-restarted target re-re
 // seconds to serve again; we reacquire + retry until it does, bounded so it never hangs.
 const CHAOS_SAVE_TOTAL_SECS: i64 = 30;
 const CARNAGE_MAX_CAND: usize = 32;       // bounded snapshot of live killable tasks per round (§26.6)
+const CARNAGE_PROGRESS_EVERY: u64 = 100;  // update the in-place progress line every N rounds
 
 /// Save `data` to the already-resolved absolute path `ppath`, retrying for up to
 /// `CHAOS_SAVE_TOTAL_SECS` of WALL-CLOCK time while `fs` finishes re-mounting after a chaos storm —
@@ -3277,14 +3278,19 @@ fn xorshift64(mut x: u64) -> u64 {
 /// panic (a panic reboots). Random source: the TSC, advanced by xorshift64. Bounded + loud (§26.6):
 /// rounds clamped 1..=100, a fixed candidate snapshot per round.
 #[inline(never)]
-fn chaos_max_carnage(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
-    // [rounds] [save <path>] after tok[0] = "max-carnage".
+fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
+    // [rounds] [save] after tok[0] = "max-carnage". `save` is accepted but deliberately NOT honoured:
+    // max-carnage destroys fs, so writing the report TO fs is a catch-22 that fights the storm (it
+    // hung/wedged the session and even cost the keyboard). The console IS the record — it is the
+    // kernel's framebuffer+serial, not a service, so chaos can't touch it, and the terminal captures it.
     let mut rounds = CHAOS_DEFAULT_ROUNDS;
-    let mut save: Option<&str> = None;
+    let mut save_requested = false;
     let mut i = 1;
     while i < ntok {
-        if tok[i] == "save" && i + 1 < ntok { save = Some(tok[i + 1]); i += 2; }
-        else if let Some(n) = parse_u32(tok[i]) { rounds = n; i += 1; }
+        if tok[i] == "save" {
+            save_requested = true; i += 1;
+            if i < ntok && tok[i].starts_with('/') { i += 1; } // skip a stray path
+        } else if let Some(n) = parse_u32(tok[i]) { rounds = n; i += 1; }
         else { i += 1; }
     }
     let rounds = rounds.clamp(1, CARNAGE_MAX_ROUNDS) as u64;
@@ -3296,10 +3302,13 @@ fn chaos_max_carnage(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize)
 
     ctx.console_writeln_fmt(format_args!(
         "chaos max-carnage: {} rounds — kill a RANDOM live service each round (all but the shell). Press q to abort.", rounds));
+    if save_requested {
+        ctx.console_writeln("(note: max-carnage doesn't save to disk — it destroys fs, so a save would fight the storm. The report below IS the record.)");
+    }
 
     // Per-SERVICE aggregate tally (bounded — a handful of distinct services, NOT per-round). Constant
-    // memory regardless of round count, so the run goes as long as you like and the report (and its
-    // `save`) is always COMPLETE — never "the last N rounds", nothing silently truncated.
+    // memory regardless of round count, so the run goes as long as you like and the report is always
+    // COMPLETE — never "the last N rounds", nothing silently truncated.
     let mut sv_name:   [[u8; 24]; CARNAGE_MAX_SVC] = [[0u8; 24]; CARNAGE_MAX_SVC];
     let mut sv_nlen:   [usize;    CARNAGE_MAX_SVC] = [0usize;    CARNAGE_MAX_SVC];
     let mut sv_killed: [u64;      CARNAGE_MAX_SVC] = [0u64;      CARNAGE_MAX_SVC];
@@ -3365,7 +3374,16 @@ fn chaos_max_carnage(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize)
             None => None,
         };
         if let Some(s) = idx { sv_killed[s] += 1; if did_recover { sv_recov[s] += 1; } }
+
+        // Live heartbeat so the screen isn't frozen for a long run. The console is the kernel's
+        // framebuffer/serial (not a service), so it survives the carnage. `\r` rewrites the line in
+        // place (no scroll); the trailing spaces clear the previous, shorter count.
+        if done % CARNAGE_PROGRESS_EVERY == 0 {
+            ctx.console_write_fmt(format_args!(
+                "\rmax-carnage: round {} / {} — {} kills, kernel alive — press q to abort     ", done, rounds, killed));
+        }
     }
+    ctx.console_writeln("");   // end the in-place heartbeat line before the report
 
     // Settle so any restart-log burst drains before we print the report.
     for _ in 0..CHAOS_SETTLE_YIELDS { ctx.yield_cpu(); }
@@ -3386,25 +3404,30 @@ fn chaos_max_carnage(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize)
     }
     let _ = writeln!(rb, "directly-restarted recoveries confirmed: {}/{}", recovered, recoverable_killed);
     let _ = writeln!(rb, "kernel: SURVIVED {} random kills (no panic — this command returned)", killed);
+    // Survivors live now — a built-in `observe now` so the final state is in the report itself. Bounded.
+    let _ = write!(rb, "survivors (live now):");
+    let mut nlive = 0u32;
+    for slot in 0..256u32 {
+        let st = ctx.task_stat(slot);
+        if st.valid && st.state != 4 {
+            let nm = st.name_str();
+            if !nm.is_empty() {
+                nlive += 1;
+                if nlive <= 16 { let _ = write!(rb, " {}", nm); }
+            }
+        }
+    }
+    if nlive > 16 { let _ = write!(rb, " …"); }
+    let _ = writeln!(rb, "  ({} live)", nlive);
     // The test is that the KERNEL survives arbitrary carnage — proven by this report existing at all
     // (a panic would have rebooted before it printed). PASS = survived; a recoverable victim missing a
     // recovery (the §6.2 supervisor-downtime edge case) is reported per-service but does not fail it.
     let _ = writeln!(rb, "verdict: {}", if aborted { "ABORTED (kernel survived)" } else { "PASS (kernel survived)" });
     if rb.overflow { let _ = writeln!(rb, "(report truncated at {} KiB)", REPORT_MAX / 1024); }
 
+    // No save: max-carnage destroys fs, so the console IS the record (kernel-owned, captured by the
+    // terminal). The verdict + survivor count above are exactly what's needed.
     console_write_chunked(ctx, rb.bytes());
-    if let Some(path) = save {
-        let mut pbuf = [0u8; PATH_MAX];
-        if let Some(p) = resolve_or_err(ctx, cwd, path, &mut pbuf) {
-            let mut ppath = [0u8; PATH_MAX];
-            let pl = p.len(); ppath[..pl].copy_from_slice(p);
-            if chaos_save_retry(ctx, &ppath[..pl], rb.bytes()) {
-                ctx.console_writeln_fmt(format_args!("chaos: report saved to {}", str_of(&ppath[..pl])));
-            } else {
-                ctx.console_writeln("chaos: could not save report (fs never stabilised in budget) — console report stands");
-            }
-        }
-    }
 
     Ok(())   // reaching here at all proves the kernel survived the carnage
 }
