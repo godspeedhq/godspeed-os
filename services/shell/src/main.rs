@@ -373,7 +373,103 @@ fn complete_tab(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd) {
     line.end(ctx);
     match line.bytes().iter().rposition(|&b| b == b' ') {
         None => complete_command(ctx, line),
-        Some(sp) => complete_path(ctx, line, cwd, sp + 1),
+        // A later token: if it's the command's SECOND token and the command takes a fixed
+        // subcommand keyword (e.g. `observe now`), complete that; otherwise fall back to a file path.
+        Some(sp) => {
+            if !complete_keyword(ctx, line, sp) {
+                complete_path(ctx, line, cwd, sp + 1);
+            }
+        }
+    }
+}
+
+/// Fixed subcommand keywords completed for a command's SECOND token (the first argument). Only
+/// commands whose first argument is a keyword appear here; everything else (paths, names, numbers)
+/// falls through to path completion. Trailing modifiers that sit AFTER a path (`mkdir … parents`,
+/// `copy … recursive`) are not second-token keywords, so they are intentionally not listed. Keep in
+/// sync with each command's argument parsing.
+const SUBCOMMANDS: &[(&str, &[&str])] = &[
+    ("observe", &["now"]),
+    ("drives",  &["flash", "label", "reset", "check", "scrub"]),
+    ("write",   &["append", "prepend"]),
+    ("date",    &["epoch"]),
+    ("chaos",   &["kill-storm", "max-carnage"]),
+];
+
+/// Complete the SECOND token against a command's fixed subcommand keywords (`SUBCOMMANDS`). `sp` is
+/// the index of the single space, so `line[..sp]` is the command and `line[sp+1..]` the partial. One
+/// match → fill it + a trailing space; several → the same numbered menu / Tab-cycle UX as command and
+/// path completion. Returns `true` when it handled the token (≥1 keyword matched), `false` to let the
+/// caller fall back to path completion (no keywords for this command, or the partial matched none — so
+/// a token like `write append /f`'s path still completes, and `line[..sp]` with a space — a third
+/// token — never matches a single-word command key).
+fn complete_keyword(ctx: &ServiceContext, line: &mut Line, sp: usize) -> bool {
+    let cmd = &line.bytes()[..sp];
+    let cands: &[&str] = match SUBCOMMANDS.iter().find(|(c, _)| c.as_bytes() == cmd) {
+        Some((_, k)) => k,
+        None => return false,
+    };
+    let tok_start = sp + 1;
+    let token = &line.bytes()[tok_start..];
+    let mut matches = [""; 16];
+    let mut n = 0usize;
+    for &k in cands {
+        if k.as_bytes().starts_with(token) {
+            if n < matches.len() { matches[n] = k; n += 1; }
+        }
+    }
+    if n == 0 { return false; }                          // no keyword match → path completion
+    if n == 1 { fill_keyword(ctx, line, tok_start, matches[0], true); return true; }
+    keyword_menu(ctx, line, tok_start, &matches[..n]);
+    true
+}
+
+/// Replace the line from `tok_start` to end with `name`; `commit` appends a trailing space (a chosen
+/// completion), else nothing (a Tab-cycle preview).
+fn fill_keyword(ctx: &ServiceContext, line: &mut Line, tok_start: usize, name: &str, commit: bool) {
+    let mut tmp = [0u8; MAX_LINE];
+    let mut t = tok_start.min(MAX_LINE);
+    tmp[..t].copy_from_slice(&line.buf[..t]);
+    let c = name.as_bytes();
+    let take = c.len().min(MAX_LINE.saturating_sub(t + 1));
+    tmp[t..t + take].copy_from_slice(&c[..take]); t += take;
+    if commit && t < MAX_LINE { tmp[t] = b' '; t += 1; }
+    line.set(ctx, &tmp[..t]);
+}
+
+/// Numbered menu for keyword candidates: a digit (1–9) commits, Tab cycles, any other key keeps the
+/// line. Mirrors `path_menu`.
+fn keyword_menu(ctx: &ServiceContext, line: &mut Line, tok_start: usize, cands: &[&str]) {
+    let n = cands.len();
+    let shown = n.min(9);
+    ctx.console_write("\r\n");
+    for k in 0..shown {
+        let mut row = [0u8; 48];
+        let mut p = 0usize;
+        row[p] = b'1' + k as u8; p += 1; row[p] = b')'; p += 1; row[p] = b' '; p += 1;
+        let name = cands[k].as_bytes();
+        let take = name.len().min(row.len() - p - 3);
+        row[p..p + take].copy_from_slice(&name[..take]); p += take;
+        row[p] = b' '; p += 1; row[p] = b' '; p += 1;
+        ctx.console_write(core::str::from_utf8(&row[..p]).unwrap_or(""));
+    }
+    ctx.console_write("\r\n");
+    ctx.console_write("gsh> ");
+    ctx.console_write(str_of(line.bytes()));
+    let mut idx = usize::MAX;
+    loop {
+        let key = ctx.console_read();
+        if (b'1'..=b'9').contains(&key) {
+            let d = (key - b'1') as usize;
+            if d < shown { fill_keyword(ctx, line, tok_start, cands[d], true); }
+            return;
+        }
+        if key == 0x09 {
+            idx = if idx == usize::MAX { 0 } else { (idx + 1) % n };
+            fill_keyword(ctx, line, tok_start, cands[idx], false);
+            continue;
+        }
+        return;
     }
 }
 

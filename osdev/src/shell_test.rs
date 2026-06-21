@@ -158,6 +158,30 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
+    // tab completion of subcommand KEYWORDS (the second token). `observe n<Tab>` → `observe now`;
+    // an ambiguous prefix shows the numbered menu (a digit selects), same UX as command/path
+    // completion. Ctrl-C (0x03) clears the completed line so nothing executes — we assert on the
+    // echoed completion only.
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"observe n\t\x03");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("observe now"), "tab: 'observe n' completes to 'observe now'"),
+        None    => { println!("shell-test: FAIL — tab keyword completion timed out"); fail += 1; }
+    }
+    // The menu reprints the prompt ("gsh> write "), so collect that frame first…
+    send(&mut write_half, b"write \t");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("1) append") && r.contains("2) prepend"), "tab: ambiguous 'write ' shows a numbered keyword menu"),
+        None    => { println!("shell-test: FAIL — tab keyword menu timed out"); fail += 1; }
+    }
+    // …then the digit selects (echoes 'write append'); Ctrl-C clears so nothing executes.
+    send(&mut write_half, b"1\x03");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("write append"), "tab: menu digit 1 selects 'write append'"),
+        None    => { println!("shell-test: FAIL — tab keyword menu selection timed out"); fail += 1; }
+    }
+
+    // -----------------------------------------------------------------------
     // cores
     // -----------------------------------------------------------------------
     send(&mut write_half, b"cores\r");
