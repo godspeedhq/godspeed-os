@@ -3368,12 +3368,57 @@ fn spawn_service_with_config(
 /// The kernel's ONE direct spawn (Path C / Phase 5 — `init` is removed). The kernel boots the
 /// SUPERVISOR directly; the supervisor then spawns logger and all services. Uses `SUPERVISOR_ELF`
 /// (garbage under `test-bad-supervisor` → §22 Test 1B). `has_recv_endpoint = true` (the supervisor
-/// owns the death-notification endpoint). A spawn failure is fatal — the supervisor is TCB (§6.2).
+/// owns the death-notification endpoint). A *boot-time* spawn failure is fatal (§6.2, §11.3); a later
+/// *runtime* death is recovered by the kernel respawning it (Phase 6 — see below).
 pub fn spawn_supervisor() {
     match spawn_service_with_config("supervisor", SUPERVISOR_ELF, 0, true, &[], 0, false, 64 * 1024 * 1024, &[], false, None) {
         Ok(_) => crate::kprintln!("task: supervisor spawned on core 0"),
         Err(e) => panic!("supervisor spawn failed: {:?}", e),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Supervisor respawn (Path C / Phase 6 — the supervisor is restartable; §6.2).
+//
+// The supervisor is no longer the non-restartable trusted root: when it dies, the KERNEL respawns it
+// (the kernel is the one thing that cannot die — the last-resort recovery anchor of Path C, §3.7).
+// The death path (`kill_task`) only FLAGS the respawn — running it inline is unsafe (we are mid-
+// teardown of the dying supervisor). `control::process_pending` (Core 0 control tick, already a
+// spawn-safe deferred point that respawns services for RESTART) polls the flag and does the respawn.
+//
+// **No bound on the number of respawns — deliberately.** A cap that panicked after N respawns would
+// re-introduce the very reboot Phase 6 eliminates (just deferred from 1 death to N), and would hand
+// any attacker a trivial denial-of-service: kill the supervisor N times to force a reboot. So the
+// kernel respawns it *unconditionally, forever*. This is NOT unbounded-resource behavior (§26.6):
+// each respawn first reclaims the dead instance's frames/kstack/caps, then allocates fresh, so the
+// footprint is constant and reclaimed every time — only the *count* grows, and a count is not a
+// resource. The respawn is loud (logged with a running count, §26.4/§26.7); a sustained loop floods
+// the log and an operator intervenes, but the system stays alive rather than rebooting. The new
+// instance re-registers its endpoint in `ipc::names`, so death notifications re-point to it, and it
+// reconciles live services on boot. The only truly unkillable thing is the kernel itself.
+// ---------------------------------------------------------------------------
+static SUPERVISOR_RESPAWN_PENDING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static SUPERVISOR_RESPAWN_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Flag that the supervisor died and must be respawned. Called from the death path (`kill_task`);
+/// the actual respawn runs later from `poll_supervisor_respawn` on the Core-0 control tick.
+pub fn flag_supervisor_respawn() {
+    SUPERVISOR_RESPAWN_PENDING.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// If the supervisor died, respawn it (Path C / Phase 6). Called from `control::process_pending`
+/// (Core 0) — a spawn-safe deferred point. Always respawns; never gives up (see the note above).
+/// The count is observability only (§26.4), not a bound.
+pub fn poll_supervisor_respawn() {
+    use core::sync::atomic::Ordering;
+    if !SUPERVISOR_RESPAWN_PENDING.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let n = SUPERVISOR_RESPAWN_COUNT.fetch_add(1, Ordering::AcqRel) + 1;
+    crate::kprintln!("kernel: supervisor died — respawning (#{}) (Path C / Phase 6)", n);
+    spawn_supervisor();
 }
 
 /// Kill all running tasks with the given name.

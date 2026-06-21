@@ -1,6 +1,8 @@
 # services/supervisor/
 
-Restart authority. TCB member (§6.1). **Non-restartable.**
+Restart + name authority. TCB member (§6.1, trusted) — but **restartable** (Path C / Phase 6): the
+kernel respawns it on death, so its failure is recovered, not a reboot. The kernel is the only
+unkillable thing. Spawned directly by the kernel (init removed, Phase 5).
 
 ## Responsibilities
 
@@ -84,7 +86,12 @@ sequenceDiagram
 
 ## Failure semantics (§6.2)
 
-Supervisor death = kernel panic = system reboot. No silent recovery. This is intentional: the supervisor is the system's recovery authority; without it there is no meaningful recovery possible.
+Supervisor death = **kernel respawn** (Path C / Phase 6), not a reboot. The kernel is the supervisor's
+recovery anchor — when it dies (a fault, or `chaos kill-storm supervisor`), the kernel respawns it
+unconditionally and forever (no bound — a bound would re-introduce the reboot and be a DoS). The
+respawned supervisor reconciles: it adopts the still-running services (reacquiring each by name from
+the kernel directory) instead of duplicating them, and respawns any that died. The only unkillable
+component is the kernel itself (`{kernel}`). Pinned by §22 Test 15.
 
 ## API (§14.4)
 

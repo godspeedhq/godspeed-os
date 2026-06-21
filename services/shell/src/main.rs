@@ -1358,9 +1358,9 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("reboot", "reset the machine", "reboot"),
         ], true),
         "chaos" => help_block(ctx, "chaos", "bounded resilience exerciser — stress one invariant, report a verdict", &[
-            ("chaos kill-storm <svc> [rounds]", "kill a service N times; verify the supervisor restarts it each time", "chaos kill-storm registry 20"),
-            ("chaos kill-storm <svc> [n] save <path>", "also write the report to a file (recorded in memory, written at the end)", "chaos kill-storm registry 20 save /chaos.txt"),
-            ("  <svc> = registry | block-driver | fs", "only the supervisor-auto-restarted services (others wouldn't recover)", "chaos kill-storm fs 10"),
+            ("chaos kill-storm <svc> [rounds]", "kill a service N times; verify it recovers each time", "chaos kill-storm supervisor 20"),
+            ("chaos kill-storm <svc> [n] save <path>", "also write the report to a file (recorded in memory, written at the end)", "chaos kill-storm fs 20 save /chaos.txt"),
+            ("  <svc> = supervisor | block-driver | fs", "recoverable targets: the supervisor respawns the services, the kernel respawns the supervisor — only the kernel can't be killed", "chaos kill-storm supervisor 10"),
         ], true),
         "drives" => help_block(ctx, "drives", "manage attached disks (records when piped)", &[
             ("drives", "list attached drive(s)", "drives"),
@@ -3044,7 +3044,10 @@ fn cmd_restart(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<()
 /// Services the supervisor AUTO-restarts on unexpected death (its death-notification loop —
 /// services/supervisor). Only these recover from a bare `kill`, so only these make sense as a
 /// kill-storm target.
-const CHAOS_RESTARTABLE: [&str; 2] = ["block-driver", "fs"]; // registry retired (Path C / Phase 4)
+// Path C / Phase 6: the supervisor is restartable too — the kernel respawns it on death, forever.
+// So chaos can storm ANY recoverable service incl. the supervisor; the only unkillable thing is the
+// kernel. (registry retired, Phase 4; init removed, Phase 5.)
+const CHAOS_RESTARTABLE: [&str; 3] = ["supervisor", "block-driver", "fs"];
 const CHAOS_DEFAULT_ROUNDS: u32 = 20;
 const CHAOS_MAX_ROUNDS: u32 = 100;        // bounded (§26.6) — a deliberate cap, not a firehose
 const CHAOS_WAIT_YIELDS: u32 = 40_000;    // per-round recovery wait (safety bound; recovery is ~ms)
@@ -3066,7 +3069,7 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
         tok[ntok] = t; ntok += 1;
     }
     if ntok == 0 {
-        ctx.console_writeln("usage: chaos kill-storm <service> [rounds] [save <path>]   (service: registry | block-driver | fs)");
+        ctx.console_writeln("usage: chaos kill-storm <service> [rounds] [save <path>]   (service: supervisor | block-driver | fs)");
         return Err(ShellError::Unknown);
     }
     match tok[0] {
@@ -3093,17 +3096,13 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
 #[inline(never)]
 fn chaos_kill_storm(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
     if ntok < 2 {
-        ctx.console_writeln("usage: chaos kill-storm <service> [rounds] [save <path>]   (service: registry | block-driver | fs)");
+        ctx.console_writeln("usage: chaos kill-storm <service> [rounds] [save <path>]   (service: supervisor | block-driver | fs)");
         return Err(ShellError::Unknown);
     }
     let svc = tok[1];
-    if svc == "supervisor" {
-        ctx.console_writeln("chaos: refusing the TCB — killing the supervisor reboots the machine, which is not chaos to observe (§6.2).");
-        return Err(ShellError::Denied);
-    }
     if !CHAOS_RESTARTABLE.contains(&svc) {
         ctx.console_writeln_fmt(format_args!(
-            "chaos: '{}' is not auto-restarted on death — only registry/block-driver/fs are respawned by the supervisor, so others would not recover.", svc));
+            "chaos: '{}' is not a recoverable target — only supervisor/block-driver/fs recover on death (the supervisor respawns the services; the kernel respawns the supervisor). The kernel itself cannot be killed.", svc));
         return Err(ShellError::Unknown);
     }
     // Parse [rounds] and [save <path>] in any order after the service. `rounds` is a bare number;
@@ -3150,7 +3149,8 @@ fn chaos_kill_storm(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize) 
     use core::fmt::Write as _;
     let mut rb = ReportBuf::new();
     let _ = writeln!(rb, "=== chaos kill-storm {}: report ===", svc);
-    let _ = writeln!(rb, "target: {} (supervisor-auto-restarted); rounds: {}", svc, rounds);
+    let recoverer = if svc == "supervisor" { "kernel-respawned" } else { "supervisor-respawned" };
+    let _ = writeln!(rb, "target: {} ({}); rounds: {}", svc, recoverer, rounds);
     for r in 0..rounds as usize {
         if ok_r[r] {
             let _ = writeln!(rb, "round {:>3}: killed gen {} -> recovered gen {}", r + 1, old_g[r], new_g[r]);
