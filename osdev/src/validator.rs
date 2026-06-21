@@ -1204,7 +1204,7 @@ static TESTS: &[TestSpec] = &[
                 "kernel: 4 cores ready",
                 "init: ready",
                 "supervisor: ready",
-                "registry: ready",
+                // (no "registry: ready" — the registry service is retired, Path C / Phase 4)
                 "logger: ready",
             ],
             fail_on:      &["KERNEL PANIC"],
@@ -1214,7 +1214,9 @@ static TESTS: &[TestSpec] = &[
     TestSpec {
         id: "1B", name: "bootstrap_tcb_failure_panics", spec_ref: "§22 Test 1B",
         kind: TestKind::WithBadTcb {
-            expect:       &["KERNEL PANIC", "reason: registry spawn failed"],
+            // Path C / Phase 4: registry retired, so the corrupt-and-fail TCB is now the supervisor
+            // (init spawns it, observes the load error, and aborts → kernel panic).
+            expect:       &["KERNEL PANIC", "reason: supervisor spawn failed"],
             fail_on:      &["supervisor: ready"],
             timeout_secs: 30,
         },
@@ -1406,17 +1408,19 @@ static TESTS: &[TestSpec] = &[
         },
     },
     TestSpec {
-        // §22 Test 11 (H11 ph6): the registry is a RESTARTABLE userspace name service,
-        // not part of the non-restartable trusted root. Killing it must NOT panic the
-        // kernel; the supervisor must observe its death and respawn it.
-        id: "11", name: "registry_survives_own_restart", spec_ref: "§22 Test 11 (H11)",
+        // §22 Test 11 (repurposed for Path C / Phase 4): the registry SERVICE is retired; the
+        // kernel name-directory is the namer. This pins the directory's restart property — a
+        // service killed and respawned must re-establish without a kernel panic, and the supervisor
+        // re-wires it from its map (the directory records the new instance, so clients reacquire it
+        // by name). `block-driver` is the disk-free restartable target.
+        id: "11", name: "name_resolves_after_restart_via_directory", spec_ref: "§22 Test 11",
         kind: TestKind::WithRestart {
             wait_for:     "supervisor: ready",
-            restart_cmd:  "KILL registry",
+            restart_cmd:  "KILL block-driver",
             expect_after: &[
-                "supervisor: registry died, restarting",
-                "supervisor: registry restarted",
-                "registry: ready",
+                "supervisor: block-driver died, restarting",
+                "supervisor: block-driver restarted",
+                "name-map + block-driver",       // re-recorded → directory resolves the new instance
             ],
             fail_on:      &["KERNEL PANIC"],
             timeout_secs: 60,
@@ -2211,18 +2215,19 @@ fn run_one(test: &TestSpec, image: &Path) -> TestOutcome {
         TestKind::ContractFuzz { .. } => TestOutcome::Blocked("ContractFuzz only runs via osdev test fuzz or fuzz-brutal"),
 
         TestKind::WithBadTcb { expect, fail_on, timeout_secs } => {
-            // Build kernel with the test-bad-registry feature (invalid registry ELF).
+            // Build kernel with the test-bad-supervisor feature (invalid supervisor ELF) — Path C /
+            // Phase 4 retired the registry, so the supervisor is the corrupt-and-fail TCB now.
             let status = std::process::Command::new("cargo")
                 .args([
                     "build", "--release", "-p", "kernel",
                     "--target", "x86_64-unknown-none",
-                    "--features", "kernel/test-bad-registry",
+                    "--features", "kernel/test-bad-supervisor",
                 ])
                 .status()
-                .expect("failed to build kernel with test-bad-registry");
+                .expect("failed to build kernel with test-bad-supervisor");
             if !status.success() {
                 return TestOutcome::Fail(
-                    "kernel build with test-bad-registry feature failed".to_string()
+                    "kernel build with test-bad-supervisor feature failed".to_string()
                 );
             }
 

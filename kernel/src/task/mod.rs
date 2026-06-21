@@ -263,15 +263,16 @@ impl From<crate::loader::LoadError> for SpawnError {
 
 // ---------------------------------------------------------------------------
 // Registry ELF — conditionally replaced for §22 Test 1B.
-// When the kernel is built with --features test-bad-registry, the registry
-// binary is two garbage bytes that will fail ELF loading, causing init to
-// observe a spawn error and call Abort (syscall 9) → kernel panic (§6.2).
+// When the kernel is built with --features test-bad-supervisor, the supervisor binary is two
+// garbage bytes that fail ELF loading, so `init` observes a spawn error and calls Abort (syscall 9)
+// → kernel panic (§6.2). This is §22 Test 1B (TCB-failure-panics). It targeted `registry` until the
+// registry service was retired (Path C / Phase 4); the supervisor is now the corrupt-and-fail TCB.
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "test-bad-registry")]
-const REGISTRY_ELF: &[u8] = b"\xDE\xAD"; // invalid ELF, triggers LoadFailed
-#[cfg(not(feature = "test-bad-registry"))]
-const REGISTRY_ELF: &[u8] = include_bytes!(env!("SVC_REGISTRY_ELF"));
+#[cfg(feature = "test-bad-supervisor")]
+const SUPERVISOR_ELF: &[u8] = b"\xDE\xAD"; // invalid ELF, triggers LoadFailed
+#[cfg(not(feature = "test-bad-supervisor"))]
+const SUPERVISOR_ELF: &[u8] = include_bytes!(env!("SVC_SUPERVISOR_ELF"));
 
 /// The one shared probe ELF. Every probe/test-driver service uses this exact
 /// reference, so the spawn path can identify "is a probe" by pointer identity
@@ -305,7 +306,7 @@ struct ServiceConfig {
 fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
     match name {
         "supervisor" => Some(("supervisor", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_SUPERVISOR_ELF")),
+            elf:               SUPERVISOR_ELF, // garbage under test-bad-supervisor (Test 1B)
             has_recv_endpoint: true, // death-notification endpoint (H11 ph6 restart loop)
             send_peers:        &[],
             send_peers_grant:  false,
@@ -315,17 +316,8 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        "registry" => Some(("registry", ServiceConfig {
-            elf:               REGISTRY_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
+        // (registry service config removed — retired in Path C / Phase 4; the kernel name-directory
+        //  is the namer now.)
         "logger" => Some(("logger", ServiceConfig {
             elf:               include_bytes!(env!("SVC_LOGGER_ELF")),
             has_recv_endpoint: true,
@@ -340,7 +332,9 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         "ping" => Some(("ping", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PING_ELF")),
             has_recv_endpoint: true,
-            send_peers:        &["pong", "registry"],
+            // ping reaches pong (name-wired here, or supervisor-provided); it reacquires pong by
+            // name via the kernel directory on EndpointDead (Path C — no `registry` peer).
+            send_peers:        &["pong"],
             send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        0,
@@ -351,7 +345,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         "pong" => Some(("pong", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PONG_ELF")),
             has_recv_endpoint: true,
-            send_peers:        &["registry"], // to announce itself via the registry (H11)
+            send_peers:        &[], // Path C: recorded in the kernel directory at spawn; no peers
             send_peers_grant:  false,
             preferred_core:    1,
             probe_mode:        0,
@@ -369,10 +363,10 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         "upper" => Some(("upper", ServiceConfig {
             elf:               include_bytes!(env!("SVC_UPPER_ELF")),
             has_recv_endpoint: true,
-            // A pipe SINK service registers its name so a built-in producer (the shell) can
-            // resolve its endpoint via the registry (`builtin | service`). The shell holds no
-            // contracted cap to it — it looks it up at runtime, like any registry client.
-            send_peers:        &["registry"],
+            // A pipe SINK is recorded in the kernel name-directory at spawn; the shell resolves its
+            // endpoint by name at runtime (`builtin | service`, `acquire_send_grant_cap`) — no
+            // contracted cap, no `registry` peer (Path C).
+            send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
             probe_mode:        0,
@@ -449,7 +443,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         "block-driver" => Some(("block-driver", ServiceConfig {
             elf:               include_bytes!(env!("SVC_BLOCK_DRIVER_ELF")),
             has_recv_endpoint: true, // serves block read/write requests from fs (§4)
-            send_peers:        &["registry"], // registers its name so fs can reacquire on restart (Phase D)
+            send_peers:        &[], // Path C: recorded in the kernel directory at spawn; no peers
             send_peers_grant:  false,
             preferred_core:    1,
             probe_mode:        0,
@@ -464,7 +458,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         "fs" => Some(("fs", ServiceConfig {
             elf:               include_bytes!(env!("SVC_FS_ELF")),
             has_recv_endpoint: true, // owns an endpoint (reply target + future fs API)
-            send_peers:        &["block-driver", "registry"], // registry: register "fs" so clients reacquire on restart (Phase D)
+            send_peers:        &["block-driver"], // Path C: fs's block-driver peer (supervisor-provided/name-wired); no registry
             send_peers_grant:  false,
             preferred_core:    1,
             probe_mode:        0,
@@ -1357,20 +1351,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // Registry register/lookup round-trip self-test (H11; osdev image --mode iso-reg).
-        // Has its own endpoint (for the lookup reply + self round-trip) and a SEND cap
-        // to the registry (send_peers). The self-grant cap comes free with the endpoint.
-        "reg-roundtrip" => Some(("reg-roundtrip", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &["registry"],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        204, // REG_ROUNDTRIP
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
+        // (reg-roundtrip probe removed — the registry service is retired, Path C / Phase 4.)
         "stress-s3-recv" => Some(("stress-s3-recv", ServiceConfig {
             elf:               PROBE_ELF,
             has_recv_endpoint: true,
@@ -2769,11 +2750,11 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // Endpoint + an `fs` send-peer so the `drives`/file commands can request_with_reply
             // to `fs` (the reply-cap pattern needs the shell's own endpoint). The shell holds
             // only a narrow SEND to fs — fs enforces all disk authority. `fs` must be spawned
-            // before the shell so this cap resolves (supervisor order). `registry` lets the
-            // shell resolve a pipe sink's endpoint at runtime (`builtin | service`), so it can
-            // send captured output to a service it holds no contracted cap to.
+            // before the shell so this cap resolves (supervisor order). The shell resolves a pipe
+            // sink's endpoint at runtime via the kernel directory (`acquire_send_grant_cap`,
+            // Path C) — no contracted `registry` peer.
             has_recv_endpoint: true,
-            send_peers:        &["fs", "registry"],
+            send_peers:        &["fs"],
             send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        0,

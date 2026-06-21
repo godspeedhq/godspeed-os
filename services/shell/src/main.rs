@@ -3044,7 +3044,7 @@ fn cmd_restart(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<()
 /// Services the supervisor AUTO-restarts on unexpected death (its death-notification loop —
 /// services/supervisor). Only these recover from a bare `kill`, so only these make sense as a
 /// kill-storm target.
-const CHAOS_RESTARTABLE: [&str; 3] = ["registry", "block-driver", "fs"];
+const CHAOS_RESTARTABLE: [&str; 2] = ["block-driver", "fs"]; // registry retired (Path C / Phase 4)
 const CHAOS_DEFAULT_ROUNDS: u32 = 20;
 const CHAOS_MAX_ROUNDS: u32 = 100;        // bounded (§26.6) — a deliberate cap, not a firehose
 const CHAOS_WAIT_YIELDS: u32 = 40_000;    // per-round recovery wait (safety bound; recovery is ~ms)

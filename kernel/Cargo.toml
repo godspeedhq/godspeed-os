@@ -32,9 +32,10 @@ proptest = "1"
 panic = "abort"
 
 [features]
-# Build the kernel with a deliberately invalid registry ELF to trigger the TCB
-# failure path in init (§6.2, §22 Test 1B).  Only used by `osdev test identity`.
-test-bad-registry = []
+# Build the kernel with a deliberately invalid SUPERVISOR ELF to trigger the TCB
+# failure path in init (§6.2, §22 Test 1B). Only used by `osdev test identity`.
+# (Was test-bad-registry until the registry service was retired — Path C / Phase 4.)
+test-bad-supervisor = []
 
 # Build the kernel in ELF-loader fuzz mode (§22 Fuzz F3).  Calls loader::run_elf_fuzz()
 # on 77 malformed ELF byte sequences early in BSP init, prints "fuzz: F3 pass",

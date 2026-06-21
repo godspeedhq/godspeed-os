@@ -107,24 +107,19 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(boot_out) => {
             check!(boot_out.contains("shell: ready"), "boot: shell ready message");
             // Naming migration (docs/naming-design.md): the supervisor builds a name→cap map as it
-            // spawns the real services, then wires dependents from it. Bare-metal maps 6 services
-            // (registry, block-driver, fs, shell, xhci, ehci).
-            check!(boot_out.contains("name-cap map holds 6 service(s)"),
+            // spawns the real services, then wires dependents from it. Phase 4 (Path C) retired the
+            // registry service — bare-metal maps 5 services (block-driver, fs, shell, xhci, ehci);
+            // names resolve via the kernel directory, not a registry service.
+            check!(boot_out.contains("name-cap map holds 5 service(s)"),
                    "naming Phase 1: supervisor holds an endpoint cap for every real service");
-            // Phase 3b: registry is spawned by the SUPERVISOR (moved from init, §11), recorded in
-            // the map, and provided to every service — so nothing name-wires registry at boot.
-            check!(boot_out.contains("supervisor: spawning registry (name service)")
-                   && boot_out.contains("name-map + registry"),
-                   "naming Phase 3b: supervisor spawns + holds the registry cap");
-            // Phase 2/3: fs (block-driver + registry) and shell (fs + registry) are fully wired
-            // from the supervisor's map. Functional proof = the files test (real disk I/O, file
-            // commands reaching fs, fs reaching block-driver) and the registry-mediated reacquire.
-            check!(boot_out.contains("block-driver wired from the name-cap map"),
-                   "naming Phase 3b: block-driver's registry peer wired from the map");
+            check!(!boot_out.contains("spawning registry") && !boot_out.contains("name-map + registry"),
+                   "naming Phase 4: registry service retired (not spawned)");
+            // fs (block-driver) and shell (fs) are wired from the supervisor's map. Functional proof
+            // = the files test (real disk I/O, file commands reaching fs, fs reaching block-driver).
             check!(boot_out.contains("fs wired from the name-cap map"),
-                   "naming Phase 2/3b: fs's block-driver + registry peers wired from the map");
+                   "naming Phase 2: fs's block-driver peer wired from the map");
             check!(boot_out.contains("shell wired from the name-cap map"),
-                   "naming Phase 3a/3b: shell's fs + registry peers wired from the map");
+                   "naming Phase 3a: shell's fs peer wired from the map");
         }
         None => {
             // Print what we did receive to help diagnose failures.
@@ -614,21 +609,21 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
-    // chaos kill-storm: the bounded resilience exerciser. Kill `registry` 5 times; the supervisor
-    // must respawn it each round (registry is auto-restarted). A pass proves: recovery held every
-    // round, AND the kernel never panicked (a panic reboots; reaching the verdict + the prompt
-    // proves it didn't). registry is the disk-free target, so this runs on the bare-metal build.
+    // chaos kill-storm: the bounded resilience exerciser. Kill `block-driver` 5 times; the supervisor
+    // must respawn it each round. A pass proves: recovery held every round, AND the kernel never
+    // panicked (a panic reboots; reaching the verdict + the prompt proves it didn't). block-driver
+    // holds no disk state, so this runs cleanly on the bare-metal build (registry retired, Path C).
     // -----------------------------------------------------------------------
-    send(&mut write_half, b"chaos kill-storm registry 5\r");
+    send(&mut write_half, b"chaos kill-storm block-driver 5\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)) {
         Some(r) => {
-            check!(r.contains("recovered: 5/5") && r.contains("verdict: PASS"), "chaos: kill-storm registry — 5/5 recovered, PASS");
+            check!(r.contains("recovered: 5/5") && r.contains("verdict: PASS"), "chaos: kill-storm block-driver — 5/5 recovered, PASS");
             check!(r.contains("recovered gen"), "chaos: report has per-round detail");
             check!(r.contains("kernel: alive"), "chaos: kill-storm — kernel alive (no panic)");
         }
         None => { println!("shell-test: FAIL — chaos kill-storm timed out (recovery stuck / panic?)"); fail += 3; }
     }
-    // The shell is still responsive after the storm (registry recovered, the prompt works).
+    // The shell is still responsive after the storm (block-driver recovered, the prompt works).
     send(&mut write_half, b"cores\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains(&format!("cores: {smp}")), "chaos: shell still responsive after the storm"),
@@ -1620,8 +1615,8 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     }
 
     // chaos `save`: the report is recorded in memory during the storm, then written to fs at the
-    // END (the catch-22-safe path — registry is the target, not fs, so fs is free to be written).
-    match run!(b"chaos kill-storm registry 3 save /chaos.txt\r", 30) {
+    // END (catch-22-safe — block-driver is the target, not fs, so fs is free to be written).
+    match run!(b"chaos kill-storm block-driver 3 save /chaos.txt\r", 30) {
         Some(r) => check!(r.contains("verdict: PASS") && r.contains("report saved to /chaos.txt"),
                           "chaos: storm + save report to a file"),
         None    => { println!("files-test: FAIL — chaos save timeout"); fail += 1; }
@@ -1632,22 +1627,14 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL — read chaos report timeout"); fail += 1; }
     }
 
-    // Regression — the registry-bootstrap bug chaos exposed on hardware (the DOUBLE storm).
-    // The registry was just stormed above, so the shell's cached `registry` cap is now stale.
-    // Storm `fs` too: the shell's `fs` cap dies, so the next storage op must reacquire `fs`
-    // THROUGH the registry — which the shell must itself first reacquire from the kernel name
-    // table (the bootstrap exception: you can't look the namer up in the namer). Before the
-    // fix, the dead registry cap made fs-reacquire fail and storage stayed permanently
-    // "unavailable". `ls /` succeeding proves the client resolved a name after a registry
-    // restart — the property §22 Test 11 never pinned.
-    // Storm fs WITH a save: the report+save run when fs (the target) has just restarted and is
-    // still re-registering, so the chaos command must settle + reacquire fs THROUGH the (stale)
-    // registry to land the save. This is the catch-22-safe path (record in memory, write at the
-    // end) AND the double-storm registry-bootstrap path in one command. Generous timeout: the
-    // settle + bounded save-retry yields are slow under TCG.
+    // Path C regression (the kernel directory replaces the old registry-bootstrap stopgap): storm
+    // `fs` and the catch-22-safe save must settle + reacquire fs THROUGH THE KERNEL DIRECTORY — no
+    // registry service exists — to land the report. Then `ls /` must reacquire fs the same way
+    // (not "storage unavailable"). This pins client-resolution-after-restart via the directory, the
+    // property §22 Test 11 now also covers. Generous timeout (settle + bounded save-retry on TCG).
     match run!(b"chaos kill-storm fs 2 save /fsr.txt\r", 60) {
         Some(r) => check!(r.contains("verdict: PASS") && r.contains("report saved to /fsr.txt"),
-                          "chaos: fs storm recovers + report saved (settle + reacquire fs via stale registry)"),
+                          "chaos: fs storm recovers + report saved (settle + reacquire fs via the kernel directory)"),
         None    => { println!("files-test: FAIL — chaos fs storm+save timeout"); fail += 1; }
     }
     match run!(b"read /fsr.txt\r", 10) {
@@ -1657,8 +1644,8 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     }
     match run!(b"ls /\r", 10) {
         Some(r) => check!(!r.contains("storage unavailable"),
-                          "registry bootstrap: shell reacquires fs through a restarted registry (double-storm)"),
-        None    => { println!("files-test: FAIL — ls after double-storm timeout"); fail += 1; }
+                          "directory: shell reacquires fs after its own restart (no registry service)"),
+        None    => { println!("files-test: FAIL — ls after fs-storm timeout"); fail += 1; }
     }
 
     child.kill().ok();

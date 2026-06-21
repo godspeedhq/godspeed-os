@@ -188,7 +188,7 @@ const MODE_XLIFE:           u32 = 202; // controller (core 1): time kill/spawn o
 const MODE_XLIFE_VICTIM:    u32 = 203; // victim: idle until killed (xlife-near core 1, xlife-far core 2)
 
 // Registry register/lookup round-trip self-test (H11; osdev image --mode iso-reg).
-const MODE_REG_ROUNDTRIP:   u32 = 204; // register own name, look it up, send to the returned cap
+// (MODE_REG_ROUNDTRIP 204 removed — registry service retired, Path C / Phase 4)
 
 // Interrupt-routing test modes — Post-v1 item 9 (§12.2, §12.3).
 const MODE_IRQ_RECV:        u32 = 160; // IR1A: recv interrupt event; log pass
@@ -407,7 +407,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         MODE_XSEND_RECV      => mode_xsend_recv(&ctx),
         MODE_XLIFE           => mode_xlife(&ctx),
         MODE_XLIFE_VICTIM    => idle(&ctx),
-        MODE_REG_ROUNDTRIP   => mode_reg_roundtrip(&ctx),
         _                    => idle(&ctx),
     }
 }
@@ -2216,34 +2215,9 @@ fn mode_xlife(ctx: &ServiceContext) -> ! {
     idle(ctx)
 }
 
-fn mode_reg_roundtrip(ctx: &ServiceContext) -> ! {
-    // H11 end-to-end: announce our own name to the registry, look it up, and send a
-    // message to ourselves through the cap the registry hands back — exercising
-    // register (grant), lookup (derive + reply-grant), and using the result.
-    if !ctx.register("reg-roundtrip") {
-        ctx.log("registry: roundtrip FAIL — register failed");
-        idle(ctx);
-    }
-    let cap = match ctx.registry_lookup("reg-roundtrip") {
-        Some(c) => c,
-        None    => { ctx.log("registry: roundtrip FAIL — lookup returned None"); idle(ctx); }
-    };
-    // The looked-up cap points at our own endpoint, so this is a self round-trip.
-    let _ = ctx.send_by_handle(cap, &Message::from_bytes(b"rt"));
-    let reply = ctx.recv();
-    if reply.payload_bytes() == b"rt" {
-        ctx.log("registry: roundtrip pass");
-    } else {
-        ctx.log("registry: roundtrip FAIL — wrong payload");
-    }
-    // Negative check: a name that was never registered must resolve to None.
-    if ctx.registry_lookup("no-such-name").is_none() {
-        ctx.log("registry: not-found pass");
-    } else {
-        ctx.log("registry: not-found FAIL — got a cap for an unregistered name");
-    }
-    idle(ctx)
-}
+// (mode_reg_roundtrip removed — the registry service is retired, Path C / Phase 4. The kernel
+//  name-directory's resolve-after-restart property is pinned by §22 Test 11 + the files-test
+//  double-storm regression instead.)
 
 // ---------------------------------------------------------------------------
 // Brutal property test modes — Milestone 16

@@ -308,6 +308,17 @@ os/
 > (§11.3). Worked example of invariant 11 — identity (the name) is stable; the
 > registry instance/location is not.
 
+> **Amendment 2026-06-21 (naming Phase 4 / Path C): the `registry` SERVICE is RETIRED.**
+> Moving name→endpoint resolution to the supervisor (Phases 0a–3c, `docs/naming-design.md`)
+> left the registry's only remaining job — handing a client a cap to a service by name — to a
+> **minimal `name → endpoint` recovery directory inside the kernel** (`ipc::names` + the gated
+> `AcquireSendCap`). The supervisor wires every service from a `name → cap` map at boot and on
+> restart; clients reacquire names through the directory. So the registry *service* is deleted
+> outright (crate, config, spawn, §22 Test 11/1B moved off it). This is the bounded "one
+> exception" of Path C (§3.7): a thin naming *directory* stays in the kernel — justified by §6.3
+> (the recovery anchor must be unkillable) — even though name *policy* lives in the supervisor.
+> `docs/registry.md` is now historical.
+
 ### 6.2 Failure Semantics
 
 > **Failure of any TCB service (`init`, `supervisor`) results in kernel panic and immediate system reboot. No automatic recovery is attempted.**
@@ -809,7 +820,6 @@ Because Limine supplies APIC IDs directly, the kernel does not need to probe ACP
 | AP startup        | Kernel logs warning, continues with available cores; if zero APs come up, system runs as single-core |
 | init spawn        | Kernel panic, halt                     |
 | supervisor spawn  | Kernel panic, halt (TCB)               |
-| registry spawn (boot-time, by the **supervisor** — Phase 3b) | Kernel panic, halt — the supervisor aborts (the name service must come up to bootstrap). *Runtime* death is recovered by the supervisor (H11; §6.2), not a reboot. |
 | logger spawn      | Init logs to kernel ring buffer, retry |
 | Application svc   | Supervisor logs, may retry per policy  |
 | Service contracted to unavailable core | Spawn rejected with `PlacementInvalid`; supervisor logs and skips; system runs without that service |
@@ -1212,7 +1222,7 @@ The bar across every category is the same as identity: **no FAIL, no BLOCKED wit
 
 #### Identity (§22) — Complete
 
-All passing (Tests 1–11; harness reports 23 cases incl. A/B + IR + Test 11). No regressions allowed. Any failure here is a constitutional violation that requires either a kernel fix or a CLAUDE.md amendment. **Test 11 (registry survives restart) was added by the H11 amendment (§6.1/§6.2).**
+All passing (Tests 1–14; harness reports 23 cases incl. A/B + IR + Test 11). No regressions allowed. Any failure here is a constitutional violation that requires either a kernel fix or a CLAUDE.md amendment. **Test 11 (added by H11) is now *name-resolves-after-restart-via-the-kernel-directory* — the registry service was retired in naming Phase 4 / Path C (`docs/naming-design.md` §3.7), so Test 11 pins the directory's restart property instead of a registry service.** **Test 1B now corrupts the `supervisor` (the registry it used to corrupt is gone).**
 
 ---
 
@@ -1381,12 +1391,11 @@ A test failing for the wrong reason (compile error, harness bug, missing cap not
 
 ```
 test bootstrap_steady_state_positive:
-    image = build_kernel(boot_manifest=[init, supervisor, registry, logger])
+    image = build_kernel(boot_manifest=[init, supervisor, logger])  # registry retired (Phase 4)
     qemu  = boot(image, smp=4)
 
     assert serial_contains("init: ready",       within=5s)
     assert serial_contains("supervisor: ready", within=5s)
-    assert serial_contains("registry: ready",   within=5s)
     assert serial_contains("logger: ready",     within=5s)
     assert serial_contains("smp: 4 cores ready", within=5s)
     assert kernel_did_not_panic()
@@ -1396,14 +1405,13 @@ test bootstrap_steady_state_positive:
 
 ```
 test bootstrap_tcb_failure_panics:
-    image = build_kernel(boot_manifest=[
-        init, supervisor, logger,
-        corrupt_binary("registry")
-    ])
+    # Path C / Phase 4: registry retired, so the corrupt-and-fail TCB is now the SUPERVISOR
+    # (init spawns it, observes the ELF-load error, and aborts → kernel panic, §6.2).
+    image = build_kernel(boot_manifest=[init, logger, corrupt_binary("supervisor")])
     qemu = boot(image, smp=4)
 
     assert serial_contains("KERNEL PANIC", within=5s)
-    assert serial_contains("reason: registry spawn failed")
+    assert serial_contains("reason: supervisor spawn failed")
     assert qemu_state == "halted"
     assert no_app_services_started()
 ```
@@ -1714,25 +1722,32 @@ test client_reacquires_after_core_change:
 
 ---
 
-### Test 11: Registry Survives Its Own Restart (H11)
+### Test 11: Name Resolves After Restart, via the Kernel Directory (Path C / Phase 4)
 
-**Pins:** §6.1/§6.2 (registry is restartable, not trusted root), §14 (supervisor restart authority), §3.11 (identity over location).
+**Pins:** §6.1/§6.2 (a restartable service's death is a supervisor restart, not a panic), §14
+(supervisor restart authority), §3.11 (identity over location), §4.4/§26.10 (naming = the kernel's
+minimal recovery *directory*, not a service).
 
-The registry is a restartable userspace name service (amendment 2026-06-09). Killing
-it must NOT panic the kernel; the supervisor must observe its death (via the kernel's
-death-notification) and respawn it, and name resolution must recover.
+> **Amendment 2026-06-21 (naming Phase 4): the registry *service* is retired** (`docs/naming-design.md`
+> §3.7, "Path C"). Name→endpoint resolution is a **minimal directory inside the kernel** (`ipc::names`
+> + the gated `AcquireSendCap`); the supervisor wires services from a `name → cap` map and clients
+> reacquire names via the directory. There is no registry service to kill. This test was
+> *"registry survives its own restart"* (H11); it now pins the directory's restart property — a
+> restartable service killed and respawned must re-establish without a kernel panic, and its name
+> must resolve to the **new** instance (the directory re-records it on respawn). `block-driver` is the
+> disk-free restartable target (it idles with no disk in the identity build).
 
 ```
-test registry_survives_own_restart:
+test name_resolves_after_restart_via_directory:
     wait_for_serial("supervisor: ready")
-    control.kill("registry")                       # was rejected pre-H11 (trusted root)
+    control.kill("block-driver")                   # a restartable service (Phase D)
 
-    assert serial_contains("supervisor: registry died, restarting")
-    assert serial_contains("supervisor: registry restarted")
-    assert serial_contains("registry: ready")      # fresh instance up
+    assert serial_contains("supervisor: block-driver died, restarting")
+    assert serial_contains("supervisor: block-driver restarted")
+    assert serial_contains("name-map + block-driver")  # re-recorded → directory resolves the new instance
     assert kernel_did_not_panic()
-    # Names re-populate via push re-registration (services re-announce); clients that
-    # looked up during the gap retry (§14.3).
+    # Clients reacquire "block-driver" by name via the kernel directory (§14.3) — pinned end-to-end
+    # for fs←block-driver and shell←fs by the files-test double-storm regression.
 ```
 
 ---
@@ -1871,7 +1886,7 @@ field (`LastRecvBadge` syscall) — a client cannot fake a file-cap invocation o
 | 8. Preemption                     | §3.6, §9.1, §9.3           | No service monopoly           |
 | 9. Cross-core IPC                 | §8.3, §8.4, §9             | Identity over location        |
 | 10. Restart with core change      | §9.2, §14.2, §14.4, §11    | Identity over location        |
-| 11. Registry survives restart     | §6.1, §6.2, §14, §3.11     | Restartability / TCB shrink   |
+| 11. Name resolves after restart (directory) | §6.1, §6.2, §14, §3.11, §4.4 | Restartability / naming-out-of-kernel |
 | 12. Confined driver DMA faults    | §3.1, §6.4, §12            | No ambient authority (DMA)    |
 | 13. fs survives own restart       | §6.1, §6.2, §6.3, §15, §14 | Restartability / TCB shrink   |
 | 14. File is a capability          | §7.3, §7.10, §3.1, §3.3    | Authority is explicit (files) |
@@ -1987,9 +2002,9 @@ Filesystem persistence beyond the trusted block driver, network stack, work-stea
 - **PlacementInvalid** — Error returned when a contracted core is unavailable; spawn rejected, supervisor logs and skips.
 - **Quantum** — The 10 ms time slice after which the per-core scheduler preempts.
 - **Routing table** — Kernel structure mapping `EndpointId → (CoreId, Generation, Liveness)`.
-- **TCB** — Trusted Computing Base. Kernel + arch + smp + init + supervisor. `registry` left the TCB via H11; `block-driver` + `fs` left via the Phase D amendment (§6.1, once `fs` gained crash-consistent recovery). DMA drivers (`xhci`/`ehci`) are in the TCB only on a machine without an IOMMU (§6.4).
-- **Trusted root** — `init`, `supervisor`. Failure of either reboots the system; they are the only remaining non-restartable services. (`registry`, `block-driver`, `fs` are all restartable name/storage services now.)
-- **Registry** — Restartable userspace name service: maps stable names → current capabilities so services can find and re-find each other across restarts (H11; `docs/registry.md`).
+- **TCB** — Trusted Computing Base. Kernel + arch + smp + init + supervisor. `registry` left the TCB via H11 (and the **registry service was then retired entirely** — naming Phase 4 / Path C, `docs/naming-design.md` §3.7); `block-driver` + `fs` left via the Phase D amendment (§6.1, once `fs` gained crash-consistent recovery). DMA drivers (`xhci`/`ehci`) are in the TCB only on a machine without an IOMMU (§6.4).
+- **Trusted root** — `init`, `supervisor`. Failure of either reboots the system; they are the only remaining non-restartable services. (`block-driver` + `fs` are restartable storage services.) *(Path C, §3.7, makes the supervisor restartable too — Phase 6 — leaving the kernel the only unkillable thing.)*
+- **Name directory** — the kernel's minimal `name → EndpointId` map (`ipc::names`) + a gated "mint a SEND cap by name" (`AcquireSendCap`). The bounded recovery anchor that **replaced the registry service** (naming Phase 4 / Path C, §3.7): the supervisor wires services from a `name → cap` map and clients reacquire names through the directory. *(The retired `registry` userspace name service is `docs/registry.md` — historical.)*
 - **Service** — Userspace component with a contract, capability table, and isolated address space.
 - **Contract** — `service.toml` declaring resource, capability, and placement requirements.
 - **Supervisor** — User-space service holding restart authority over other services.

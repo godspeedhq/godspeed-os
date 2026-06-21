@@ -1369,16 +1369,15 @@ pub fn kill_task_by_slot(slot: usize) {
             }
         }
 
-        // Restartable-service death notification. `registry` (H11), and now `fs` +
-        // `block-driver` (Phase D, §6 amendment 2026-06-17): these are restartable
-        // userspace services, not trusted root. When one dies, notify the supervisor over
-        // its death-notification endpoint so it can respawn it — their death degrades I/O
-        // or name resolution briefly, it is not a reboot. `fs` re-mounts to a consistent
-        // state via its journal (Phase C); clients reacquire via the registry (§14.3).
-        // Gated to this set so ordinary probe/app churn never floods the supervisor.
-        // `enqueue_from_interrupt` is the kernel→endpoint path (no cap needed); wake the
-        // supervisor if blocked. No-op if it has no endpoint (minimal test manifests).
-        if matches!(task_name, "registry" | "fs" | "block-driver") {
+        // Restartable-service death notification. `fs` + `block-driver` (Phase D, §6 amendment
+        // 2026-06-17) are restartable userspace services, not trusted root. When one dies, notify
+        // the supervisor over its death-notification endpoint so it can respawn it — their death
+        // degrades I/O briefly, it is not a reboot. `fs` re-mounts to a consistent state via its
+        // journal (Phase C); clients reacquire by name via the kernel directory (§14.3). (`registry`
+        // was in this set until its service was retired — Path C / Phase 4.) Gated to this set so
+        // ordinary probe/app churn never floods the supervisor. `enqueue_from_interrupt` is the
+        // kernel→endpoint path (no cap needed); wake the supervisor if blocked.
+        if matches!(task_name, "fs" | "block-driver") {
             if let (Some(sup_ep), Ok(msg)) = (
                 crate::ipc::names::lookup("supervisor"),
                 crate::ipc::message::Message::new(task_name.as_bytes()),

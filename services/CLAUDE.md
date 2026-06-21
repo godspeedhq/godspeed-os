@@ -16,7 +16,6 @@ recovery. These two are the only non-restartable services — the §6.3 TCB-shri
 
 | Service      | Notes |
 |--------------|-------|
-| `registry/`  | Restartable name service (H11); supervisor respawns on death, clients reacquire (§14.3) |
 | `block-driver/` | Restartable (Phase D); holds no persistent state; re-inits the controller on respawn |
 | `fs/`        | Restartable (Phase D); re-mounts to a consistent state via its crash-consistency journal (§6.8) |
 | `logger/`    | Stateless; ring buffer preserves recent output across restarts |
