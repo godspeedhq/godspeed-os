@@ -2991,22 +2991,26 @@ fn spawn_service_with_config(
         let ep_id       = crate::ipc::alloc_endpoint_id();
         let resource_id = ResourceId::from(ep_id);
 
-        // For respawns: inherit the old (killed) endpoint's generation so the new
-        // endpoint's generation is strictly greater than any previously-issued cap
-        // generation for this name — making generation monotonic across kill/respawn (§7.5 P2).
+        // Seed the new endpoint's generation strictly above every cap previously issued for either:
+        //   (a) this NAME's prior endpoint — so a same-name restart's old caps go stale (§7.5 P2); and
+        //   (b) whatever service last held this (possibly RECLAIMED) endpoint id — the ABA guard now
+        //       that ids are reused (ipc::free_endpoint_id). A reused id MUST out-generation its
+        //       previous holder, even a different service, or a stale cap to that holder could match
+        //       the new endpoint and resurrect authority.
         //
-        // We read from GLOBAL_RESOURCES (capability table) rather than the routing
-        // table because routing entries are recycled by concurrent spawns: by the
-        // time this spawn runs, another service may have claimed the old dead routing
-        // slot and overwritten its generation.  GLOBAL_RESOURCES entries are
-        // persistent (append-only) so the old dead entry with the bumped generation
-        // remains visible until GLOBAL_RESOURCES fills up (capacity: 4096).
-        let start_gen = crate::ipc::names::lookup(name)
+        // Generations live in GLOBAL_RESOURCES (direct-indexed by ResourceId, persistent across a
+        // kill: the dead entry keeps its bumped generation until the id is reused), so both reads are
+        // exact even though routing slots are recycled by concurrent spawns.
+        let by_name_gen = crate::ipc::names::lookup(name)
             .and_then(|old_ep| {
                 let old_rid = crate::capability::cap::ResourceId::from(old_ep);
                 crate::capability::get_resource_generation(old_rid)
             })
             .unwrap_or(Generation::INITIAL);
+        let by_slot_gen = crate::capability::get_resource_generation(resource_id)
+            .map(|g| g.bump())
+            .unwrap_or(Generation::INITIAL);
+        let start_gen = if by_slot_gen.0 > by_name_gen.0 { by_slot_gen } else { by_name_gen };
 
         // Register in global cap table at the inherited generation.
         crate::capability::register_resource_at_gen(resource_id, start_gen);

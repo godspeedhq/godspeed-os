@@ -1367,6 +1367,13 @@ pub fn kill_task_by_slot(slot: usize) {
                 crate::kprintln!("delegated: reclaimed {} resource(s) from dead endpoint {}",
                     reclaimed, ep_id.0);
             }
+
+            // Reclaim the endpoint id itself for reuse (§14.2). Its routing entry is Dead and its
+            // resource generation is bumped, so handing the id out again is safe: the next endpoint to
+            // take it is seeded at a strictly higher generation (task::spawn), so a stale cap to this
+            // dead endpoint still fails. Without this the id counter only climbs and a sustained
+            // restart storm (`chaos max-carnage`) exhausts the [100, DELEGATED_BASE) band and panics.
+            crate::ipc::free_endpoint_id(ep_id);
         }
 
         // Restartable-service death notification. These are restartable userspace services (not
