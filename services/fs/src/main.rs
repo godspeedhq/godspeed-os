@@ -260,7 +260,24 @@ struct Loc {
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("fs: starting");
 
-    let capacity = block_capacity(&ctx).unwrap_or(0);
+    // `block-driver` may still be re-initialising when we start — a chaos storm can restart it just
+    // before (or alongside) us, or our cached cap may be stale after its restart. Retry the capacity
+    // query — reacquiring its cap — until it reports a REAL disk, so we never mount a phantom
+    // 0-capacity disk and then "serve" a broken filesystem (every read would fail until a manual
+    // respawn — the bug `chaos max-carnage` exposed). Bounded by wall-clock time: on a genuinely
+    // diskless machine block-driver reports 0 forever, so we fall through and serve raw (§3.12).
+    const FS_BLOCK_WAIT_SECS: i64 = 8;
+    const FS_BLOCK_RETRY_YIELDS: u32 = 4000;
+    let capacity = {
+        let start = ctx.datetime().epoch_secs();
+        let mut cap = block_capacity(&ctx).unwrap_or(0);
+        while cap == 0 && ctx.datetime().epoch_secs() - start < FS_BLOCK_WAIT_SECS {
+            let _ = ctx.reacquire_via_registry("block-driver");
+            for _ in 0..FS_BLOCK_RETRY_YIELDS { ctx.yield_cpu(); }
+            cap = block_capacity(&ctx).unwrap_or(0);
+        }
+        cap
+    };
     ctx.log_fmt(format_args!("fs: disk capacity = {} sectors ({} MiB)", capacity, capacity / 2048));
 
     // Raw-tolerant: a bad superblock is the normal state of a never-flashed drive (§3.12).

@@ -496,6 +496,36 @@ impl ServiceContext {
         crate::ipc::recv(self.recv_handle()?).ok()
     }
 
+    /// Like `request_with_reply`, but the wait for the reply is **bounded** by `max_secs` of
+    /// **wall-clock** time (the RTC). Returns `None` on timeout — so a peer that dies *after*
+    /// receiving the request but *before* replying cannot block the caller forever (the blocking
+    /// `recv` in `request_with_reply` would hang). Use it when the peer may be unstable — e.g.
+    /// writing a report to `fs` right after a chaos storm hammered `fs` + its `block-driver`.
+    ///
+    /// Uses the RTC (not a TSC-cycle deadline) deliberately: a cycle bound is not portable — under
+    /// QEMU's TCG the guest TSC races ahead and expires the deadline before the reply arrives, while
+    /// the RTC is real wall-clock on both TCG and hardware. Polls `try_recv`, yielding cooperatively.
+    pub fn request_with_reply_deadline(
+        &self,
+        peer: &str,
+        msg:  &crate::ipc::Message,
+        max_secs: i64,
+    ) -> Option<crate::ipc::Message> {
+        let target = CapHandle(self.find_send_slot(peer)?);
+        let self_grant = self.self_grant_handle()?;
+        let reply_cap = self.derive_cap(self_grant)?;
+        self.send_with_cap_by_handle(target, reply_cap, msg).ok()?;
+        let t0 = self.datetime().epoch_secs();
+        loop {
+            if let Some(r) = self.try_recv() { return Some(r); }
+            if self.datetime().epoch_secs() - t0 >= max_secs {
+                self.remove_cap(reply_cap);   // reply never consumed — reclaim its slot
+                return None;
+            }
+            self.yield_cpu();
+        }
+    }
+
     /// Reacquire a fresh SEND cap to `peer` and point the named-peer cache at it, so subsequent
     /// `try_send(peer)` / `send(peer)` use the new cap. Returns `false` if `peer` cannot currently
     /// be resolved (e.g. it has not finished respawning) — the caller should retry on a later tick.

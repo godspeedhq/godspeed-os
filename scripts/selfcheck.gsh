@@ -78,12 +78,13 @@ assert fails caps nosuchservice
 assert fails-with FileNotFound caps nosuchservice
 
 # ===== lifecycle guardrails (negative only — safe, deterministic) =====
-# supervisor is the sole non-restartable TCB (init removed, Path C / Phase 5).
+# The shell COMMAND guards spawn/kill of the supervisor (the recovery authority) — a command-layer
+# hygiene check, not "can't recover" (the supervisor is kernel-restartable, Phase 6). `kill shell` is
+# NOT tested here: the shell is restartable now, so it succeeds (self-restart) and would kill this run.
 assert fails spawn supervisor
 assert fails-with Denied spawn supervisor
 assert fails kill supervisor
 assert fails-with Denied kill supervisor
-assert fails kill shell
 assert fails spawn nosuchservice
 assert fails-with Unknown spawn nosuchservice
 assert fails kill nosuchservice

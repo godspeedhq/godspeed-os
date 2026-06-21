@@ -93,6 +93,31 @@ pub fn unregister(name: &str) {
     }
 }
 
+/// Remove the entry for `name` **only if** it still maps to `endpoint_id` — the dying instance.
+///
+/// Called from the task-kill path (§14.2) so a service's name stops resolving to a DEAD endpoint:
+/// the supervisor's reconcile (it re-runs its spawn sequence on its own respawn) then finds the name
+/// *missing* and respawns the service, instead of adopting the stale dead entry — the bug behind
+/// `fs`/`block-driver` staying dead when a storm kills them in the same window the supervisor itself
+/// is being respawned (so their death-notifications are lost). The `endpoint_id` guard is the
+/// respawn-race safety: if a fresh instance has *already* re-registered the name to a new endpoint,
+/// this is a no-op — we must never unregister the live one.
+pub fn unregister_endpoint(name: &str, endpoint_id: EndpointId) {
+    let bytes = name.as_bytes();
+    if bytes.len() > NAME_MAX { return; }
+    let len = bytes.len() as u8;
+    let mut names = NAMES.lock();
+    for entry in names.iter_mut() {
+        if entry.valid && entry.name_len == len
+            && &entry.name[..len as usize] == bytes
+            && entry.endpoint_id == endpoint_id
+        {
+            entry.valid = false;
+            return;
+        }
+    }
+}
+
 /// Look up an endpoint ID by service name.
 pub fn lookup(name: &str) -> Option<EndpointId> {
     let bytes = name.as_bytes();

@@ -364,64 +364,149 @@ fn handle_csi(ctx: &ServiceContext, line: &mut Line, hist: &History, nav: &mut u
     }
 }
 
-/// Tab completion. On the FIRST token (nothing after a space yet) it completes a **command name**
-/// against `UTILS`; on a later token it completes a **file path** against the directory that token
-/// names (`complete_path`). Both use the same numbered-menu UX (1–9, next digit selects). Operates
-/// from end-of-line so the menu reprint + replacement line up with the cursor (§26.6: bounded).
+/// Tab completion. Splits the line into pipe SEGMENTS (`a | b | c`) and completes the current token
+/// within its segment: the segment's FIRST word completes as a **command name** (`UTILS`, so it works
+/// after a `|` too); a later token completes as a **subcommand keyword** (`observe now`, `to json`,
+/// `sort reverse`, the trailing `mkdir … parents`) and otherwise as a **file path**. One match fills
+/// it; several show the numbered menu (1–9 selects, Tab cycles). Operates from end-of-line so the menu
+/// reprint lines up with the cursor (§26.6: bounded).
 fn complete_tab(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd) {
     if line.len == 0 { return; }
     line.end(ctx);
-    match line.bytes().iter().rposition(|&b| b == b' ') {
-        None => complete_command(ctx, line),
-        Some(sp) => complete_path(ctx, line, cwd, sp + 1),
+    // Current token starts after the last space (or line start); its pipe segment starts after the
+    // last '|' before it. Computed as plain indices so no borrow of `line` outlives the dispatch.
+    let bytes = line.bytes();
+    let tok_start = bytes.iter().rposition(|&b| b == b' ').map(|s| s + 1).unwrap_or(0);
+    let seg_start = bytes[..tok_start].iter().rposition(|&b| b == b'|').map(|i| i + 1).unwrap_or(0);
+    // The token is the segment's COMMAND if only spaces sit between the segment start and it.
+    let is_command = bytes[seg_start..tok_start].iter().all(|&b| b == b' ');
+
+    if is_command {
+        complete_from_list(ctx, line, tok_start, UTILS);          // command name (after a `|` too)
+    } else if !complete_keyword(ctx, line, seg_start, tok_start) {
+        complete_path(ctx, line, cwd, tok_start);                 // not a keyword → file path
     }
 }
 
-/// Complete the command name (the first token): one match → fill it with a trailing space; several
-/// → a numbered menu, next digit selects. (Cursor is already at end-of-line.)
-fn complete_command(ctx: &ServiceContext, line: &mut Line) {
-    let mut prefix_buf = [0u8; MAX_LINE];
-    let plen = line.len;
-    prefix_buf[..plen].copy_from_slice(&line.buf[..plen]);
-    let prefix = &prefix_buf[..plen];
+/// Commands whose FIRST argument (the token right after the command, within its pipe segment) is a
+/// fixed keyword — completed only at that position. Pipe-stage verbs (`to`/`from`/`sort`/`match`) are
+/// here too, so `… | to j⇥` → `json` and `… | sort r⇥` → `reverse`. Keep in sync with each command's
+/// argument parsing (verified against utilities/*.md + the `cmd_*` parsers).
+const SUBCMD_FIRST: &[(&str, &[&str])] = &[
+    ("observe", &["now"]),
+    ("date",    &["epoch"]),
+    ("drives",  &["flash", "label", "reset", "check", "scrub"]),
+    ("chaos",   &["kill-storm", "max-carnage"]),
+    ("write",   &["append", "prepend"]),
+    ("sort",    &["reverse"]),
+    ("match",   &["except"]),
+    ("to",      &["json", "yaml"]),
+    ("from",    &["json"]),
+];
 
-    // Collect matching command indices (UTILS order — stable, so the menu numbering is stable).
-    let mut matches = [0usize; 64];
+/// Commands with a TRAILING modifier keyword that follows the variable argument(s) — completed at any
+/// position after the first arg, when it prefix-matches and is not already present (`mkdir /x p⇥` →
+/// `parents`, `copy /a /b r⇥` → `recursive`). Never offered as the first argument (that token is the
+/// path being named/operated on, not the modifier).
+const SUBCMD_TRAILING: &[(&str, &[&str])] = &[
+    ("mkdir",  &["parents"]),
+    ("copy",   &["recursive"]),
+    ("delete", &["recursive"]),
+];
+
+/// Complete the current token (`tok_start..end`) as a subcommand keyword of its segment's command.
+/// `seg_start..tok_start` holds the command + any already-typed args, which decide the command and
+/// whether this is the first argument. Returns `true` if it completed/offered a menu, `false` to fall
+/// through to path completion.
+fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok_start: usize) -> bool {
+    let head = &line.bytes()[seg_start..tok_start];           // command + prior args (+ spaces)
+    let mut words = head.split(|&b| b == b' ').filter(|w| !w.is_empty());
+    let cmd = match words.next() { Some(c) => c, None => return false };
+    let prior = words.clone().count();                        // args typed before the current token
+
+    if let Some((_, cands)) = SUBCMD_FIRST.iter().find(|(c, _)| c.as_bytes() == cmd) {
+        // First-argument keyword only: a later arg is a path/value (e.g. `write append /f`), not a key.
+        return prior == 0 && complete_from_list(ctx, line, tok_start, cands);
+    }
+    if let Some((_, cands)) = SUBCMD_TRAILING.iter().find(|(c, _)| c.as_bytes() == cmd) {
+        if prior == 0 { return false; }                       // first arg is the path, not the modifier
+        // Offer only modifiers not already present in the segment.
+        let mut avail = [""; 8];
+        let mut a = 0usize;
+        for &k in *cands {
+            let used = head.split(|&b| b == b' ').any(|w| w == k.as_bytes());
+            if !used && a < avail.len() { avail[a] = k; a += 1; }
+        }
+        return complete_from_list(ctx, line, tok_start, &avail[..a]);
+    }
+    false
+}
+
+/// Match the current token (`tok_start..end`) against `cands`: 0 matches → `false` (no change); 1 →
+/// fill it + a trailing space; several → the numbered menu (digit selects, Tab cycles). The single
+/// completion engine shared by command-name and keyword completion. Returns `true` when it acted.
+fn complete_from_list(ctx: &ServiceContext, line: &mut Line, tok_start: usize, cands: &[&str]) -> bool {
+    let token = &line.bytes()[tok_start..];
+    let mut matches = [""; 64];
     let mut n = 0usize;
-    for (i, u) in UTILS.iter().enumerate() {
-        if u.as_bytes().starts_with(prefix) {
-            if n < matches.len() { matches[n] = i; n += 1; }
+    for &k in cands {
+        if k.as_bytes().starts_with(token) {
+            if n < matches.len() { matches[n] = k; n += 1; }
         }
     }
-    if n == 0 { return; }                       // no candidates — leave the line as-is
-    if n == 1 { set_completed(ctx, line, UTILS[matches[0]]); return; }
+    if n == 0 { return false; }
+    if n == 1 { fill_keyword(ctx, line, tok_start, matches[0], true); return true; }
+    keyword_menu(ctx, line, tok_start, &matches[..n]);
+    true
+}
 
-    // Several candidates: print a numbered menu (1..=min(9,n)), then read one selection digit.
+/// Replace the line from `tok_start` to end with `name`; `commit` appends a trailing space (a chosen
+/// completion), else nothing (a Tab-cycle preview).
+fn fill_keyword(ctx: &ServiceContext, line: &mut Line, tok_start: usize, name: &str, commit: bool) {
+    let mut tmp = [0u8; MAX_LINE];
+    let mut t = tok_start.min(MAX_LINE);
+    tmp[..t].copy_from_slice(&line.buf[..t]);
+    let c = name.as_bytes();
+    let take = c.len().min(MAX_LINE.saturating_sub(t + 1));
+    tmp[t..t + take].copy_from_slice(&c[..take]); t += take;
+    if commit && t < MAX_LINE { tmp[t] = b' '; t += 1; }
+    line.set(ctx, &tmp[..t]);
+}
+
+/// Numbered menu for keyword candidates: a digit (1–9) commits, Tab cycles, any other key keeps the
+/// line. Mirrors `path_menu`.
+fn keyword_menu(ctx: &ServiceContext, line: &mut Line, tok_start: usize, cands: &[&str]) {
+    let n = cands.len();
     let shown = n.min(9);
     ctx.console_write("\r\n");
     for k in 0..shown {
-        let mut row = [0u8; 40];
+        let mut row = [0u8; 48];
         let mut p = 0usize;
-        row[p] = b'1' + k as u8; p += 1;
-        row[p] = b')';          p += 1;
-        row[p] = b' ';          p += 1;
-        let name = UTILS[matches[k]].as_bytes();
-        let take = name.len().min(row.len() - p - 2);
+        row[p] = b'1' + k as u8; p += 1; row[p] = b')'; p += 1; row[p] = b' '; p += 1;
+        let name = cands[k].as_bytes();
+        let take = name.len().min(row.len() - p - 3);
         row[p..p + take].copy_from_slice(&name[..take]); p += take;
-        row[p] = b' '; p += 1; row[p] = b' '; p += 1;     // two trailing spaces between entries
+        row[p] = b' '; p += 1; row[p] = b' '; p += 1;
         ctx.console_write(core::str::from_utf8(&row[..p]).unwrap_or(""));
     }
     if n > shown { ctx.console_write("(type more to narrow) "); }
     ctx.console_write("\r\n");
-    // Reprint the prompt + what was typed so the cursor sits where it was.
     ctx.console_write("gsh> ");
-    ctx.console_write(core::str::from_utf8(prefix).unwrap_or(""));
-
-    // The next key selects: a digit in range completes; anything else cancels (line unchanged).
-    let sel = ctx.console_read();
-    if (b'1'..=b'9').contains(&sel) {
-        let idx = (sel - b'1') as usize;
-        if idx < shown { set_completed(ctx, line, UTILS[matches[idx]]); }
+    ctx.console_write(str_of(line.bytes()));
+    let mut idx = usize::MAX;
+    loop {
+        let key = ctx.console_read();
+        if (b'1'..=b'9').contains(&key) {
+            let d = (key - b'1') as usize;
+            if d < shown { fill_keyword(ctx, line, tok_start, cands[d], true); }
+            return;
+        }
+        if key == 0x09 {
+            idx = if idx == usize::MAX { 0 } else { (idx + 1) % n };
+            fill_keyword(ctx, line, tok_start, cands[idx], false);
+            continue;
+        }
+        return;
     }
 }
 
@@ -560,17 +645,6 @@ fn path_menu(ctx: &ServiceContext, line: &mut Line, base_len: usize, rbuf: &[u8;
         }
         return; // any other key: keep the current line (common-prefix or last cycled candidate)
     }
-}
-
-/// Replace the on-screen input with `cmd` followed by a trailing space. Uses `Line::set`,
-/// so the old text is erased and the new text echoed the same way history recall does.
-fn set_completed(ctx: &ServiceContext, line: &mut Line, cmd: &str) {
-    let c = cmd.as_bytes();
-    let cl = c.len().min(MAX_LINE - 1);
-    let mut tmp = [0u8; MAX_LINE];
-    tmp[..cl].copy_from_slice(&c[..cl]);
-    tmp[cl] = b' ';                              // trailing space so the user can type args
-    line.set(ctx, &tmp[..cl + 1]);
 }
 
 /// A bounded ring of recent command lines for up/down-arrow recall (§26.6: fixed size,
@@ -1133,8 +1207,11 @@ fn run_and_save(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, spat
 /// message). Quiet (the caller prints the human message); returns success. Reuses the same
 /// `WriteFile` / `WriteNew`+`WriteAt` shape as the pipe `write` sink, with no intermediate copy.
 fn save_report(ctx: &ServiceContext, path: &[u8], data: &[u8]) -> bool {
+    // Bounded fs request (wall-clock): a chaos report is saved right after the storm may have hammered
+    // fs, so the write must time out gracefully rather than hang the shell (the max-carnage aggregate
+    // report is small → this single-message path).
     if data.len() <= IO_CHUNK {
-        return matches!(fs_request(ctx, OP_WRITE_FILE, path, data)
+        return matches!(fs_request_bounded(ctx, OP_WRITE_FILE, path, data)
             .as_ref().map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK)));
     }
     if !fs_write_new(ctx, path, data.len() as u64) { return false; }
@@ -2999,6 +3076,18 @@ fn cmd_kill(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
         ctx.console_writeln(PROTECTED_MSG);
         return Err(ShellError::Denied);
     }
+    if name == "shell" {
+        // The shell is restartable now ("nothing escapes"): self-kill, and the supervisor respawns a
+        // fresh prompt. The kernel's self-kill path defers our stack/PML4 reclaim (it is exactly how
+        // every page fault already kills the running task), and our death notifies the supervisor,
+        // which respawns us. The in-flight session is lost — a re-init, not a resume (§14.2/§25). We
+        // yield forever after the kill so we never execute again as the dead instance.
+        ctx.console_writeln("kill shell: restarting this session — a fresh prompt is coming (in-flight state is lost)…");
+        match ctx.kill("shell") {
+            Ok(())  => loop { ctx.yield_cpu(); },
+            Err(_)  => { ctx.console_writeln("kill shell: failed"); return Err(ShellError::Unknown); }
+        }
+    }
     if let Some(msg) = session_critical_msg(name) {
         ctx.console_writeln(msg);
         return Err(ShellError::Denied);
@@ -3045,10 +3134,12 @@ fn cmd_restart(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<()
 /// Services the supervisor AUTO-restarts on unexpected death (its death-notification loop —
 /// services/supervisor). Only these recover from a bare `kill`, so only these make sense as a
 /// kill-storm target.
-// Path C / Phase 6: the supervisor is restartable too — the kernel respawns it on death, forever.
-// So chaos can storm ANY recoverable service incl. the supervisor; the only unkillable thing is the
-// kernel. (registry retired, Phase 4; init removed, Phase 5.)
-const CHAOS_RESTARTABLE: [&str; 3] = ["supervisor", "block-driver", "fs"];
+// Directly-restartable services: their OWN death notifies the supervisor, which respawns them
+// immediately (the supervisor itself is kernel-respawned). chaos confirms recovery for these each
+// round + labels them "recovered"; kill-storm may target them. The only unkillable thing is the
+// kernel; the shell is excluded only because chaos runs *inside* it. (registry retired Phase 4; init
+// removed Phase 5; xhci/ehci/logger made directly-restartable so max-carnage can't leave them dead.)
+const CHAOS_RESTARTABLE: [&str; 6] = ["supervisor", "block-driver", "fs", "xhci", "ehci", "logger"];
 const CHAOS_DEFAULT_ROUNDS: u32 = 20;
 const CHAOS_MAX_ROUNDS: u32 = 100;        // bounded (§26.6) — a deliberate cap, not a firehose
 // Per-round recovery wait is bounded by REAL wall-clock time (RTC seconds), not a yield count. A
@@ -3064,8 +3155,33 @@ const CHAOS_POLL_EVERY: u32 = 64;         // yields between gen/clock polls (a t
 // report isn't shredded by that burst on the bounded-THRE serial path) and before saving (so an
 // `fs`-target save can actually reach a re-registered fs). Bounded (§26.6); §14.3 retry pattern.
 const CHAOS_SETTLE_YIELDS: u32 = 60_000;  // let the just-restarted target re-register + serial drain
-const CHAOS_SAVE_ATTEMPTS: u32 = 6;       // bounded save retries while fs finishes its remount
+// Wall-clock budget (seconds) to keep retrying the report save while `fs` finishes re-mounting after a
+// storm. A heavy `max-carnage` kills `fs` AND its `block-driver` many times, so fs may take several
+// seconds to serve again; we reacquire + retry until it does, bounded so it never hangs.
+const CHAOS_SAVE_TOTAL_SECS: i64 = 30;
 const CARNAGE_MAX_CAND: usize = 32;       // bounded snapshot of live killable tasks per round (§26.6)
+const CARNAGE_PROGRESS_EVERY: u64 = 100;  // update the in-place progress line every N rounds
+
+/// Save `data` to the already-resolved absolute path `ppath`, retrying for up to
+/// `CHAOS_SAVE_TOTAL_SECS` of WALL-CLOCK time while `fs` finishes re-mounting after a chaos storm —
+/// reacquiring a fresh `fs` cap each round (it may have just respawned). Bounded: `save_report` is
+/// itself wall-clock-bounded, so this never hangs; it gives up gracefully when fs won't stabilise.
+fn chaos_save_retry(ctx: &ServiceContext, ppath: &[u8], data: &[u8]) -> bool {
+    let t0 = ctx.datetime().epoch_secs();
+    loop {
+        let _ = ctx.reacquire_via_registry("fs");
+        if save_report(ctx, ppath, data) { return true; }
+        if ctx.datetime().epoch_secs() - t0 >= CHAOS_SAVE_TOTAL_SECS { return false; }
+        for _ in 0..CHAOS_SETTLE_YIELDS { ctx.yield_cpu(); }
+    }
+}
+const CARNAGE_MAX_SVC: usize = 16;        // distinct services tracked in the aggregate tally (~6–8 real)
+// max-carnage takes NO round cap: it runs exactly the count you type. The report is per-SERVICE
+// AGGREGATES (killed/recovered counts), constant memory regardless of round count, and each round
+// reclaims the dead instance before respawning — so the round count is a loop counter, not a resource
+// (§26.6 bounds resources, not counters; same reasoning as the unbounded supervisor respawn, §6.2).
+// The only bound is the parsed `u32` and `q`, which aborts early. (kill-storm DOES cap rounds at
+// CHAOS_MAX_ROUNDS because it stores per-round generation detail in fixed arrays.)
 
 /// Wait (real wall-clock bounded, RTC) for `name` to be ALIVE (present in the task table). Used
 /// before a kill so a round isn't wasted killing a task that is still mid-respawn. Yields cooperatively.
@@ -3212,14 +3328,7 @@ fn chaos_kill_storm(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize) 
         if let Some(p) = resolve_or_err(ctx, cwd, path, &mut pbuf) {
             let mut ppath = [0u8; PATH_MAX];
             let pl = p.len(); ppath[..pl].copy_from_slice(p);
-            let mut saved = false;
-            for attempt in 0..CHAOS_SAVE_ATTEMPTS {
-                if save_report(ctx, &ppath[..pl], rb.bytes()) { saved = true; break; }
-                if attempt + 1 < CHAOS_SAVE_ATTEMPTS {
-                    for _ in 0..CHAOS_SETTLE_YIELDS { ctx.yield_cpu(); } // wait for fs, then retry
-                }
-            }
-            if saved {
+            if chaos_save_retry(ctx, &ppath[..pl], rb.bytes()) {
                 ctx.console_writeln_fmt(format_args!("chaos: report saved to {}", str_of(&ppath[..pl])));
             } else {
                 ctx.console_writeln_fmt(format_args!(
@@ -3244,17 +3353,22 @@ fn xorshift64(mut x: u64) -> u64 {
 /// panic (a panic reboots). Random source: the TSC, advanced by xorshift64. Bounded + loud (§26.6):
 /// rounds clamped 1..=100, a fixed candidate snapshot per round.
 #[inline(never)]
-fn chaos_max_carnage(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
-    // [rounds] [save <path>] after tok[0] = "max-carnage".
+fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
+    // [rounds] [save] after tok[0] = "max-carnage". `save` is accepted but deliberately NOT honoured:
+    // max-carnage destroys fs, so writing the report TO fs is a catch-22 that fights the storm (it
+    // hung/wedged the session and even cost the keyboard). The console IS the record — it is the
+    // kernel's framebuffer+serial, not a service, so chaos can't touch it, and the terminal captures it.
     let mut rounds = CHAOS_DEFAULT_ROUNDS;
-    let mut save: Option<&str> = None;
+    let mut save_requested = false;
     let mut i = 1;
     while i < ntok {
-        if tok[i] == "save" && i + 1 < ntok { save = Some(tok[i + 1]); i += 2; }
-        else if let Some(n) = parse_u32(tok[i]) { rounds = n; i += 1; }
+        if tok[i] == "save" {
+            save_requested = true; i += 1;
+            if i < ntok && tok[i].starts_with('/') { i += 1; } // skip a stray path
+        } else if let Some(n) = parse_u32(tok[i]) { rounds = n; i += 1; }
         else { i += 1; }
     }
-    let rounds = rounds.clamp(1, CHAOS_MAX_ROUNDS) as usize;
+    let rounds = rounds.max(1) as u64;   // no upper cap — run exactly what was typed (q aborts)
 
     // RNG seed: the TSC (high-resolution, varies run to run), mixed with the wall clock. Never zero.
     let mut rng = ctx.read_tsc()
@@ -3262,17 +3376,32 @@ fn chaos_max_carnage(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize)
     if rng == 0 { rng = 0xDEAD_BEEF_CAFE_F00D; }
 
     ctx.console_writeln_fmt(format_args!(
-        "chaos max-carnage: {} rounds — kill a RANDOM live service each round (everything but the shell)...", rounds));
+        "chaos max-carnage: {} rounds — kill a RANDOM live service each round (all but the shell). Press q to abort.", rounds));
+    if save_requested {
+        ctx.console_writeln("(note: max-carnage doesn't save to disk — it destroys fs, so a save would fight the storm. The report below IS the record.)");
+    }
 
-    // Per-round record (bounded, stack): victim name + outcome (1=recovered, 0=stayed dead).
-    let mut vict: [[u8; 24]; CHAOS_MAX_ROUNDS as usize] = [[0u8; 24]; CHAOS_MAX_ROUNDS as usize];
-    let mut vlen: [u8; CHAOS_MAX_ROUNDS as usize] = [0u8; CHAOS_MAX_ROUNDS as usize];
-    let mut outc: [u8; CHAOS_MAX_ROUNDS as usize] = [0u8; CHAOS_MAX_ROUNDS as usize];
-    let mut recovered = 0u32;
-    let mut killed = 0u32;
-    let mut done = 0usize;
+    // Per-SERVICE aggregate tally (bounded — a handful of distinct services, NOT per-round). Constant
+    // memory regardless of round count, so the run goes as long as you like and the report is always
+    // COMPLETE — never "the last N rounds", nothing silently truncated.
+    let mut sv_name:   [[u8; 24]; CARNAGE_MAX_SVC] = [[0u8; 24]; CARNAGE_MAX_SVC];
+    let mut sv_nlen:   [usize;    CARNAGE_MAX_SVC] = [0usize;    CARNAGE_MAX_SVC];
+    let mut sv_killed: [u64;      CARNAGE_MAX_SVC] = [0u64;      CARNAGE_MAX_SVC];
+    let mut sv_recov:  [u64;      CARNAGE_MAX_SVC] = [0u64;      CARNAGE_MAX_SVC];
+    let mut nsv = 0usize;
+    let mut killed = 0u64;
+    let mut recoverable_killed = 0u64;
+    let mut recovered = 0u64;
+    let mut done = 0u64;
+    let mut aborted = false;
 
-    for r in 0..rounds {
+    for _ in 0..rounds {
+        // `q` aborts early. The kernel buffers the keypress (it survives a momentary input-driver
+        // death), so a `q` pressed any time the keyboard was up is caught here between rounds.
+        if let Some(b) = ctx.try_console_read() {
+            if b == b'q' || b == b'Q' { aborted = true; break; }
+        }
+
         // Snapshot the live, killable set: valid, not Dead, named, and NOT the shell. Bounded.
         let mut cand: [([u8; 24], usize, u32); CARNAGE_MAX_CAND] = [([0u8; 24], 0usize, 0u32); CARNAGE_MAX_CAND];
         let mut ncand = 0usize;
@@ -3290,7 +3419,7 @@ fn chaos_max_carnage(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize)
             }
         }
         if ncand == 0 { break; }                               // nothing left but the shell
-        done = r + 1;
+        done += 1;
 
         rng = xorshift64(rng);
         let pick = (rng % ncand as u64) as usize;
@@ -3299,16 +3428,37 @@ fn chaos_max_carnage(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize)
         let mut nbuf = [0u8; 24];
         nbuf[..nl].copy_from_slice(&cand[pick].0[..nl]);
         let name = str_of(&nbuf[..nl]);
-        vict[r][..nl].copy_from_slice(&nbuf[..nl]);
-        vlen[r] = nl as u8;
 
         let _ = ctx.kill(name);
         killed += 1;
-        // Recoverable victims are confirmed back; the rest stay dead (expected — nothing restarts them).
-        if CHAOS_RESTARTABLE.contains(&name) && chaos_wait_recovery(ctx, name, og) {
-            outc[r] = 1; recovered += 1;
+        let recoverable = CHAOS_RESTARTABLE.contains(&name);
+        if recoverable { recoverable_killed += 1; }
+        // Recoverable victims are confirmed back; the rest revive on a supervisor respawn.
+        let did_recover = recoverable && chaos_wait_recovery(ctx, name, og);
+        if did_recover { recovered += 1; }
+
+        // Tally into the per-service aggregate (find-or-add; bounded).
+        let mut idx = None;
+        for s in 0..nsv { if sv_name[s][..sv_nlen[s]] == nbuf[..nl] { idx = Some(s); break; } }
+        let idx = match idx {
+            Some(s) => Some(s),
+            None if nsv < CARNAGE_MAX_SVC => {
+                sv_name[nsv][..nl].copy_from_slice(&nbuf[..nl]); sv_nlen[nsv] = nl;
+                let s = nsv; nsv += 1; Some(s)
+            }
+            None => None,
+        };
+        if let Some(s) = idx { sv_killed[s] += 1; if did_recover { sv_recov[s] += 1; } }
+
+        // Live heartbeat so the screen isn't frozen for a long run. The console is the kernel's
+        // framebuffer/serial (not a service), so it survives the carnage. `\r` rewrites the line in
+        // place (no scroll); the trailing spaces clear the previous, shorter count.
+        if done % CARNAGE_PROGRESS_EVERY == 0 {
+            ctx.console_write_fmt(format_args!(
+                "\rmax-carnage: round {} / {} — {} kills, kernel alive — press q to abort     ", done, rounds, killed));
         }
     }
+    ctx.console_writeln("");   // end the in-place heartbeat line before the report
 
     // Settle so any restart-log burst drains before we print the report.
     for _ in 0..CHAOS_SETTLE_YIELDS { ctx.yield_cpu(); }
@@ -3316,48 +3466,43 @@ fn chaos_max_carnage(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize)
     use core::fmt::Write as _;
     let mut rb = ReportBuf::new();
     let _ = writeln!(rb, "=== chaos max-carnage: report ===");
+    if aborted { let _ = writeln!(rb, "ABORTED by user (q) after {} rounds", done); }
     let _ = writeln!(rb, "rounds: {}; victims killed: {}", done, killed);
-    let mut recoverable_victims = 0u32;
-    for r in 0..done {
-        let nl = vlen[r] as usize;
-        if nl == 0 { continue; }
-        let name = str_of(&vict[r][..nl]);
-        let restartable = CHAOS_RESTARTABLE.contains(&name);
-        if restartable { recoverable_victims += 1; }
-        let outcome = match (outc[r], restartable) {
-            (1, _)     => "recovered",
-            (_, true)  => "FAILED TO RECOVER",
-            (_, false) => "killed (revives on the next supervisor respawn)",
-        };
-        let _ = writeln!(rb, "round {:>3}: killed {:<14} -> {}", r + 1, name, outcome);
-    }
-    let _ = writeln!(rb, "directly-restarted victims recovered: {}/{}", recovered, recoverable_victims);
-    let _ = writeln!(rb, "(services not directly restarted — e.g. logger/xhci/ehci — come back on the next");
-    let _ = writeln!(rb, " supervisor respawn, which re-runs the boot sequence; run `observe now` for the live set)");
-    let _ = writeln!(rb, "kernel: SURVIVED {} random kills (no panic — this command returned)", killed);
-    // The test is that the KERNEL survives arbitrary carnage — proven by this report existing at all
-    // (a panic would have rebooted before it printed). PASS = survived. A recoverable victim that did
-    // not come back in budget is flagged per-round above, but does NOT fail the kernel-survival verdict
-    // — it may be the §6.2 supervisor-downtime edge case (a service that died while the supervisor was
-    // itself mid-respawn), which is a known service-level limitation, not a kernel failure.
-    let _ = writeln!(rb, "verdict: PASS (kernel survived)");
-    if rb.overflow { let _ = writeln!(rb, "(report truncated at {} KiB)", REPORT_MAX / 1024); }
-
-    console_write_chunked(ctx, rb.bytes());
-    if let Some(path) = save {
-        let mut pbuf = [0u8; PATH_MAX];
-        if let Some(p) = resolve_or_err(ctx, cwd, path, &mut pbuf) {
-            let mut ppath = [0u8; PATH_MAX];
-            let pl = p.len(); ppath[..pl].copy_from_slice(p);
-            let mut saved = false;
-            for attempt in 0..CHAOS_SAVE_ATTEMPTS {
-                if save_report(ctx, &ppath[..pl], rb.bytes()) { saved = true; break; }
-                if attempt + 1 < CHAOS_SAVE_ATTEMPTS { for _ in 0..CHAOS_SETTLE_YIELDS { ctx.yield_cpu(); } }
-            }
-            if saved { ctx.console_writeln_fmt(format_args!("chaos: report saved to {}", str_of(&ppath[..pl]))); }
-            else { ctx.console_writeln("chaos: could not save report (fs may have been a victim) — console report stands"); }
+    // Per-service aggregate — COMPLETE for any round count (bounded memory, never truncated).
+    for s in 0..nsv {
+        let name = str_of(&sv_name[s][..sv_nlen[s]]);
+        if CHAOS_RESTARTABLE.contains(&name) {
+            let _ = writeln!(rb, "  {:<14} killed {:>6}, recovered {:>6}", name, sv_killed[s], sv_recov[s]);
+        } else {
+            let _ = writeln!(rb, "  {:<14} killed {:>6}  (revives on a supervisor respawn)", name, sv_killed[s]);
         }
     }
+    let _ = writeln!(rb, "directly-restarted recoveries confirmed: {}/{}", recovered, recoverable_killed);
+    let _ = writeln!(rb, "kernel: SURVIVED {} random kills (no panic — this command returned)", killed);
+    // Survivors live now — a built-in `observe now` so the final state is in the report itself. Bounded.
+    let _ = write!(rb, "survivors (live now):");
+    let mut nlive = 0u32;
+    for slot in 0..256u32 {
+        let st = ctx.task_stat(slot);
+        if st.valid && st.state != 4 {
+            let nm = st.name_str();
+            if !nm.is_empty() {
+                nlive += 1;
+                if nlive <= 16 { let _ = write!(rb, " {}", nm); }
+            }
+        }
+    }
+    if nlive > 16 { let _ = write!(rb, " …"); }
+    let _ = writeln!(rb, "  ({} live)", nlive);
+    // The test is that the KERNEL survives arbitrary carnage — proven by this report existing at all
+    // (a panic would have rebooted before it printed). PASS = survived; a recoverable victim missing a
+    // recovery (the §6.2 supervisor-downtime edge case) is reported per-service but does not fail it.
+    let _ = writeln!(rb, "verdict: {}", if aborted { "ABORTED (kernel survived)" } else { "PASS (kernel survived)" });
+    if rb.overflow { let _ = writeln!(rb, "(report truncated at {} KiB)", REPORT_MAX / 1024); }
+
+    // No save: max-carnage destroys fs, so the console IS the record (kernel-owned, captured by the
+    // terminal). The verdict + survivor count above are exactly what's needed.
+    console_write_chunked(ctx, rb.bytes());
 
     Ok(())   // reaching here at all proves the kernel survived the carnage
 }
@@ -3472,6 +3617,32 @@ fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<
     // finished re-registering yet, this returns None and the next command retries.
     if ctx.reacquire_via_registry("fs") {
         return ctx.request_with_reply("fs", &msg);
+    }
+    None
+}
+
+/// Wall-clock budget (seconds) for the chaos-report save's fs request. The save runs right after a
+/// chaos storm that may have hammered `fs` + its `block-driver`, so the reply could be slow or never
+/// come; this bounds it so the save can fail gracefully (console report stands) instead of hanging.
+const SAVE_FS_MAX_SECS: i64 = 8;
+
+/// `fs_request` for the report save: the reply wait is bounded by `SAVE_FS_MAX_SECS` of wall-clock
+/// time (RTC), so a still-restarting `fs` can't block the shell forever (the bug behind `chaos
+/// max-carnage … save` hanging). Reacquire + retry once on a miss, then give up.
+fn fs_request_bounded(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<Message> {
+    let pl = path.len().min(255);
+    let mut req = [0u8; 4096];
+    req[0] = op;
+    req[1] = pl as u8;
+    req[2..2 + pl].copy_from_slice(&path[..pl]);
+    let dn = data.len().min(req.len() - 2 - pl);
+    req[2 + pl..2 + pl + dn].copy_from_slice(&data[..dn]);
+    let msg = Message::from_bytes(&req[..2 + pl + dn]);
+    if let Some(r) = ctx.request_with_reply_deadline("fs", &msg, SAVE_FS_MAX_SECS) {
+        return Some(r);
+    }
+    if ctx.reacquire_via_registry("fs") {
+        return ctx.request_with_reply_deadline("fs", &msg, SAVE_FS_MAX_SECS);
     }
     None
 }

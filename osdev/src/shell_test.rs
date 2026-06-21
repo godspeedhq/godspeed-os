@@ -158,6 +158,48 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
+    // tab completion of subcommand KEYWORDS (the second token). `observe n<Tab>` → `observe now`;
+    // an ambiguous prefix shows the numbered menu (a digit selects), same UX as command/path
+    // completion. Ctrl-C (0x03) clears the completed line so nothing executes — we assert on the
+    // echoed completion only.
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"observe n\t\x03");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("observe now"), "tab: 'observe n' completes to 'observe now'"),
+        None    => { println!("shell-test: FAIL — tab keyword completion timed out"); fail += 1; }
+    }
+    // The menu reprints the prompt ("gsh> write "), so collect that frame first…
+    send(&mut write_half, b"write \t");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("1) append") && r.contains("2) prepend"), "tab: ambiguous 'write ' shows a numbered keyword menu"),
+        None    => { println!("shell-test: FAIL — tab keyword menu timed out"); fail += 1; }
+    }
+    // …then the digit selects (echoes 'write append'); Ctrl-C clears so nothing executes.
+    send(&mut write_half, b"1\x03");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("write append"), "tab: menu digit 1 selects 'write append'"),
+        None    => { println!("shell-test: FAIL — tab keyword menu selection timed out"); fail += 1; }
+    }
+    // pipe-stage keyword: a verb after `|` completes its first-arg keyword. `status | sort r` → reverse.
+    send(&mut write_half, b"status | sort r\t\x03");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("sort reverse"), "tab: pipe-stage 'sort r' completes to 'sort reverse'"),
+        None    => { println!("shell-test: FAIL — tab pipe-stage keyword timed out"); fail += 1; }
+    }
+    // command-name completion AFTER a pipe (the segment's first word). `status | so` → `status | sort`.
+    send(&mut write_half, b"status | so\t\x03");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("status | sort"), "tab: command name completes after a pipe (so -> sort)"),
+        None    => { println!("shell-test: FAIL — tab pipe command completion timed out"); fail += 1; }
+    }
+    // trailing modifier keyword (after the path arg). `mkdir /x p` → `mkdir /x parents`.
+    send(&mut write_half, b"mkdir /x p\t\x03");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("mkdir /x parents"), "tab: trailing modifier 'mkdir /x p' -> 'parents'"),
+        None    => { println!("shell-test: FAIL — tab trailing modifier timed out"); fail += 1; }
+    }
+
+    // -----------------------------------------------------------------------
     // cores
     // -----------------------------------------------------------------------
     send(&mut write_half, b"cores\r");
@@ -670,6 +712,26 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(r) => check!(r.contains(&format!("cores: {smp}")), "chaos: shell responsive after max-carnage"),
         None    => { println!("shell-test: FAIL — shell unresponsive after max-carnage"); fail += 1; }
     }
+
+    // -----------------------------------------------------------------------
+    // `kill shell` via the COMMAND (the interactive COM1 path the user types): the shell self-kills
+    // and the supervisor respawns a FRESH prompt. This is the same kernel self-kill path a page fault
+    // uses (deferred stack/PML4 reclaim), so the dead instance never corrupts anything; the new shell
+    // must answer input afterward. Proves a user can `kill shell` and get the session back.
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"kill shell\r");
+    match collect_until(&buf, &mut cursor, b"shell: ready", Duration::from_secs(20)) {
+        Some(_) => check!(true, "kill shell (self-kill via command) — supervisor respawned a fresh prompt"),
+        None    => { println!("shell-test: FAIL — kill shell did not respawn a fresh prompt"); fail += 1; }
+    }
+    let mut answered = false;
+    for _ in 0..4 {
+        send(&mut write_half, b"cores\r");
+        if let Some(r) = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+            if r.contains("cores:") { answered = true; break; }
+        }
+    }
+    check!(answered, "the respawned shell answers commands (session recovered after `kill shell`)");
 
     // -----------------------------------------------------------------------
     // Done.
@@ -2009,6 +2071,47 @@ pub fn run_fs_restart(image_path: &Path, persist_path: &str, smp: u32) {
         thread::sleep(Duration::from_millis(500));
     }
     check!(got, "read /t.txt AFTER restart (shell reacquired fs, file persisted)");
+
+    // ── Shell restartable ("nothing escapes"): KILL the shell itself over the control channel. The
+    // shell is the user's interface — pre-Phase-this it was the one service that stayed dead forever
+    // if killed (ensure_-wired + unwatched). Now the kernel notifies the supervisor of its death and
+    // the supervisor respawns a FRESH prompt; the new shell must answer input (the session recovers,
+    // the in-flight command is lost — a re-init, not a resume, §14.2/§25). Invariant 6.
+    println!("fs-restart: sending 'KILL shell' over the control channel …");
+    match retry_tcp_connect(ctrl_port, Duration::from_secs(10)) {
+        Some(mut ctrl) => { thread::sleep(Duration::from_millis(100)); send(&mut ctrl, b"\nKILL shell\n");
+            let restarted = collect_until(&buf, &mut cursor, b"supervisor: shell restarted", Duration::from_secs(20));
+            check!(restarted.is_some(), "supervisor observed shell death and restarted it");
+            let ready = collect_until(&buf, &mut cursor, b"shell: ready", Duration::from_secs(20));
+            check!(ready.is_some(), "a fresh shell prompt came up after the kill");
+            drop(ctrl);
+        }
+        None => { println!("fs-restart: FAIL — could not connect to control port (shell kill)"); fail += 1; }
+    }
+    // The FRESH shell answers commands — proof the session recovered, not just a log line.
+    let mut answered = false;
+    for _ in 0..4 {
+        if let Some(r) = run!(b"cores\r", 10) {
+            if r.contains("cores:") { answered = true; break; }
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    check!(answered, "the restarted shell answers commands (session recovered)");
+
+    // ── Directly-restartable driver/logger: kill `logger` over the control channel and confirm the
+    // supervisor respawns it on its OWN death (not only via a lucky supervisor respawn). This is the
+    // fix that keeps `chaos max-carnage` from leaving `xhci`/`ehci`/`logger` dead at the end of a run.
+    // logger is the hardware-independent stand-in for xhci/ehci (same death-notification + restart
+    // arm); the actual USB keyboard recovery is verified on real hardware (QEMU has no USB keyboard).
+    println!("fs-restart: sending 'KILL logger' over the control channel …");
+    match retry_tcp_connect(ctrl_port, Duration::from_secs(10)) {
+        Some(mut ctrl) => { thread::sleep(Duration::from_millis(100)); send(&mut ctrl, b"\nKILL logger\n");
+            let restarted = collect_until(&buf, &mut cursor, b"supervisor: logger restarted", Duration::from_secs(20));
+            check!(restarted.is_some(), "supervisor respawned logger on its own death (directly restartable)");
+            drop(ctrl);
+        }
+        None => { println!("fs-restart: FAIL — could not connect to control port (logger kill)"); fail += 1; }
+    }
 
     // No panic anywhere in the whole session.
     let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();

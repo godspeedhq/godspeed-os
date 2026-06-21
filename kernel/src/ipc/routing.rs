@@ -92,8 +92,15 @@ pub fn init() {
 /// the table.
 pub fn register(id: EndpointId, core_id: u32, generation: Generation) {
     let mut table = TABLE.lock();
-    for entry in table.iter_mut() {
-        if !entry.valid || entry.liveness == EndpointLiveness::Dead {
+    // Endpoint ids are reclaimed and reused (ipc::free_endpoint_id, §14.2). Prefer THIS id's own
+    // (now-dead) entry, so a reused id overwrites its old slot instead of creating a *second* entry
+    // with the same id — `find_index` returns the first match, so a duplicate would be ambiguous.
+    // Fall back to any free/dead slot for a never-seen id.
+    let slot = table.iter().position(|e| e.valid && e.id == id)
+        .or_else(|| table.iter().position(|e| !e.valid || e.liveness == EndpointLiveness::Dead));
+    match slot {
+        Some(idx) => {
+            let entry = &mut table[idx];
             entry.valid            = true;
             entry.id               = id;
             entry.core_id          = core_id;
@@ -103,10 +110,9 @@ pub fn register(id: EndpointId, core_id: u32, generation: Generation) {
             entry.blocked_receiver = None;
             entry.blocked_sender   = None;
             entry.pending_send     = None;
-            return;
         }
+        None => panic!("routing: endpoint table full (MAX_ENDPOINTS={})", MAX_ENDPOINTS),
     }
-    panic!("routing: endpoint table full (MAX_ENDPOINTS={})", MAX_ENDPOINTS);
 }
 
 /// Return the number of endpoints currently alive in the routing table.

@@ -15,16 +15,26 @@ the supervisor restartable, leaving the kernel the only unkillable thing.
 
 ## Restartable services
 
+**Directly auto-restarted** — the kernel notifies the supervisor of their death, which respawns them:
+
 | Service      | Notes |
 |--------------|-------|
 | `block-driver/` | Restartable (Phase D); holds no persistent state; re-inits the controller on respawn |
 | `fs/`        | Restartable (Phase D); re-mounts to a consistent state via its crash-consistency journal (§6.8) |
-| `logger/`    | Stateless; ring buffer preserves recent output across restarts |
-| `ping/`      | Stateless; canonical client restart pattern (§14.2) |
-| `pong/`      | Stateless; spawned first by supervisor (before probe services) |
+| `shell/`     | The user's interface — a crash or `kill shell` respawns a fresh prompt (in-flight command lost — a re-init, not a resume). "Nothing escapes" |
+| `xhci/` `ehci/` | USB host drivers — own-death respawn re-grants MMIO/DMA/IRQ caps + re-inits the controller + re-enumerates devices. Without this, a `chaos max-carnage` that kills them in its last rounds left the keyboard dead until a lucky supervisor respawn |
+| `logger/`    | Stateless; respawn drains the kernel ring buffer afresh |
 
-The kernel notifies the supervisor of any restartable service's death; the supervisor respawns
-it. `block-driver` must respawn before `fs` (fs's send-peer cap to it wires at spawn).
+`block-driver` must respawn before `fs` (fs's send-peer cap to it wires at spawn). The kernel notifies
+the supervisor only for this **named set** (not probes), so ordinary probe/app churn never floods it.
+
+A respawn is always a **fresh instance**: the supervisor spawns a new task with a *new* endpoint
+(generation bumped) and *fresh* caps minted from the contract — never the dead instance's. The dead
+generation goes stale, so clients get `EndpointDead` and reacquire by name (§14.3). The service never
+restarts *itself* (a dead task can't); the kernel is the messenger, the supervisor the actor.
+
+**Revived on a supervisor respawn (only)** — `ping`, `pong` (demo services, bare-metal skips them) are
+not individually watched; a supervisor respawn re-runs its boot sequence and re-spawns them fresh.
 
 ## Supervisor spawn order
 

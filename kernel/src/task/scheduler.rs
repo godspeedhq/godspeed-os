@@ -1367,17 +1367,38 @@ pub fn kill_task_by_slot(slot: usize) {
                 crate::kprintln!("delegated: reclaimed {} resource(s) from dead endpoint {}",
                     reclaimed, ep_id.0);
             }
+
+            // Reclaim the endpoint id itself for reuse (§14.2). Its routing entry is Dead and its
+            // resource generation is bumped, so handing the id out again is safe: the next endpoint to
+            // take it is seeded at a strictly higher generation (task::spawn), so a stale cap to this
+            // dead endpoint still fails. Without this the id counter only climbs and a sustained
+            // restart storm (`chaos max-carnage`) exhausts the [100, DELEGATED_BASE) band and panics.
+            crate::ipc::free_endpoint_id(ep_id);
+
+            // Stop this name resolving to the now-dead endpoint (§14.2): unregister it from the kernel
+            // directory IF it still points here (the endpoint-id guard skips a fresh instance that
+            // already re-registered). The supervisor's reconcile then sees the name MISSING and
+            // respawns the service, instead of adopting a stale dead entry — the bug behind
+            // `fs`/`block-driver` staying dead after a storm killed them while the supervisor itself
+            // was mid-respawn (their death-notifications were lost). Normal restarts are unaffected:
+            // the service re-registers the name on respawn; clients briefly see a lookup miss and retry
+            // (same outcome as the EndpointDead they'd get from the stale entry).
+            crate::ipc::names::unregister_endpoint(task_name, ep_id);
         }
 
-        // Restartable-service death notification. `fs` + `block-driver` (Phase D, §6 amendment
-        // 2026-06-17) are restartable userspace services, not trusted root. When one dies, notify
-        // the supervisor over its death-notification endpoint so it can respawn it — their death
-        // degrades I/O briefly, it is not a reboot. `fs` re-mounts to a consistent state via its
-        // journal (Phase C); clients reacquire by name via the kernel directory (§14.3). (`registry`
-        // was in this set until its service was retired — Path C / Phase 4.) Gated to this set so
-        // ordinary probe/app churn never floods the supervisor. `enqueue_from_interrupt` is the
-        // kernel→endpoint path (no cap needed); wake the supervisor if blocked.
-        if matches!(task_name, "fs" | "block-driver") {
+        // Restartable-service death notification. These are restartable userspace services (not
+        // trusted root): when one dies, notify the supervisor over its death-notification endpoint so
+        // it respawns the service IMMEDIATELY — its own death, not only a lucky supervisor respawn.
+        // The set: `fs` + `block-driver` (Phase D); `shell` (the user's prompt); and the drivers
+        // `xhci` / `ehci` + `logger`. Without the drivers here, a `chaos max-carnage` that killed
+        // them in its last rounds left them dead until the supervisor happened to be respawned (it
+        // re-runs its boot sequence and re-spawns them) — so the keyboard could stay dead. Now their
+        // own death respawns them. `fs` re-mounts via its journal (Phase C); clients reacquire by
+        // name via the kernel directory (§14.3). "Nothing escapes" — every service recovers; the
+        // kernel is the only unkillable thing. (`registry` was here until it was retired — Phase 4.)
+        // Gated to this NAMED set so ordinary probe/app churn never floods the supervisor.
+        // `enqueue_from_interrupt` is the kernel→endpoint path (no cap needed); wake the supervisor.
+        if matches!(task_name, "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger") {
             if let (Some(sup_ep), Ok(msg)) = (
                 crate::ipc::names::lookup("supervisor"),
                 crate::ipc::message::Message::new(task_name.as_bytes()),
