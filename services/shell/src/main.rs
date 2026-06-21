@@ -3081,8 +3081,25 @@ const CHAOS_POLL_EVERY: u32 = 64;         // yields between gen/clock polls (a t
 // report isn't shredded by that burst on the bounded-THRE serial path) and before saving (so an
 // `fs`-target save can actually reach a re-registered fs). Bounded (§26.6); §14.3 retry pattern.
 const CHAOS_SETTLE_YIELDS: u32 = 60_000;  // let the just-restarted target re-register + serial drain
-const CHAOS_SAVE_ATTEMPTS: u32 = 6;       // bounded save retries while fs finishes its remount
+// Wall-clock budget (seconds) to keep retrying the report save while `fs` finishes re-mounting after a
+// storm. A heavy `max-carnage` kills `fs` AND its `block-driver` many times, so fs may take several
+// seconds to serve again; we reacquire + retry until it does, bounded so it never hangs.
+const CHAOS_SAVE_TOTAL_SECS: i64 = 30;
 const CARNAGE_MAX_CAND: usize = 32;       // bounded snapshot of live killable tasks per round (§26.6)
+
+/// Save `data` to the already-resolved absolute path `ppath`, retrying for up to
+/// `CHAOS_SAVE_TOTAL_SECS` of WALL-CLOCK time while `fs` finishes re-mounting after a chaos storm —
+/// reacquiring a fresh `fs` cap each round (it may have just respawned). Bounded: `save_report` is
+/// itself wall-clock-bounded, so this never hangs; it gives up gracefully when fs won't stabilise.
+fn chaos_save_retry(ctx: &ServiceContext, ppath: &[u8], data: &[u8]) -> bool {
+    let t0 = ctx.datetime().epoch_secs();
+    loop {
+        let _ = ctx.reacquire_via_registry("fs");
+        if save_report(ctx, ppath, data) { return true; }
+        if ctx.datetime().epoch_secs() - t0 >= CHAOS_SAVE_TOTAL_SECS { return false; }
+        for _ in 0..CHAOS_SETTLE_YIELDS { ctx.yield_cpu(); }
+    }
+}
 const CARNAGE_MAX_SVC: usize = 16;        // distinct services tracked in the aggregate tally (~6–8 real)
 // max-carnage reports per-SERVICE AGGREGATES (killed/recovered counts), not per-round records, so its
 // memory is constant regardless of round count — the report is never truncated. The round cap is just
@@ -3235,14 +3252,7 @@ fn chaos_kill_storm(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize) 
         if let Some(p) = resolve_or_err(ctx, cwd, path, &mut pbuf) {
             let mut ppath = [0u8; PATH_MAX];
             let pl = p.len(); ppath[..pl].copy_from_slice(p);
-            let mut saved = false;
-            for attempt in 0..CHAOS_SAVE_ATTEMPTS {
-                if save_report(ctx, &ppath[..pl], rb.bytes()) { saved = true; break; }
-                if attempt + 1 < CHAOS_SAVE_ATTEMPTS {
-                    for _ in 0..CHAOS_SETTLE_YIELDS { ctx.yield_cpu(); } // wait for fs, then retry
-                }
-            }
-            if saved {
+            if chaos_save_retry(ctx, &ppath[..pl], rb.bytes()) {
                 ctx.console_writeln_fmt(format_args!("chaos: report saved to {}", str_of(&ppath[..pl])));
             } else {
                 ctx.console_writeln_fmt(format_args!(
@@ -3388,13 +3398,11 @@ fn chaos_max_carnage(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize)
         if let Some(p) = resolve_or_err(ctx, cwd, path, &mut pbuf) {
             let mut ppath = [0u8; PATH_MAX];
             let pl = p.len(); ppath[..pl].copy_from_slice(p);
-            let mut saved = false;
-            for attempt in 0..CHAOS_SAVE_ATTEMPTS {
-                if save_report(ctx, &ppath[..pl], rb.bytes()) { saved = true; break; }
-                if attempt + 1 < CHAOS_SAVE_ATTEMPTS { for _ in 0..CHAOS_SETTLE_YIELDS { ctx.yield_cpu(); } }
+            if chaos_save_retry(ctx, &ppath[..pl], rb.bytes()) {
+                ctx.console_writeln_fmt(format_args!("chaos: report saved to {}", str_of(&ppath[..pl])));
+            } else {
+                ctx.console_writeln("chaos: could not save report (fs never stabilised in budget) — console report stands");
             }
-            if saved { ctx.console_writeln_fmt(format_args!("chaos: report saved to {}", str_of(&ppath[..pl]))); }
-            else { ctx.console_writeln("chaos: could not save report (fs may have been a victim) — console report stands"); }
         }
     }
 
