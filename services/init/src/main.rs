@@ -7,10 +7,13 @@
 
 //! `init` — PID 1 equivalent. TCB member (§6.1).
 //!
-//! Spawns supervisor, registry, and logger in order via the Spawn syscall.
-//! Panics (→ kernel panic) if any TCB spawn fails (§6.2).
+//! Spawns the supervisor and logger via the Spawn syscall, then parks.
+//! Panics (→ kernel panic) if the supervisor spawn fails (§6.2).
 //! Logger is not TCB: a single retry is attempted before continuing without it.
-//! After startup, init loops forever yielding the CPU.
+//!
+//! **`registry` is spawned by the supervisor, not init** (naming Phase 3b,
+//! `docs/naming-design.md`, §11): the supervisor owns naming, so it spawns the name service
+//! first and holds its cap to wire every other service. init no longer touches registry.
 
 #![no_std]
 #![no_main]
@@ -29,11 +32,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         ctx.abort("supervisor spawn failed");
     }
 
-    ctx.log("init: spawning registry...");
-    if ctx.spawn("registry").is_err() {
-        ctx.log("init: FATAL: failed to spawn registry");
-        ctx.abort("registry spawn failed");
-    }
+    // registry is spawned by the supervisor now (Phase 3b) — it owns naming, so it must hold
+    // registry's cap. init no longer spawns it. Its boot-time spawn failure is still fatal,
+    // enforced by the supervisor (§11.3).
 
     // logger is not TCB (§11.3); retry once on failure and continue without it.
     ctx.log("init: spawning logger...");

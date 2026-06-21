@@ -34,7 +34,11 @@ Introspection is reached through shell **commands**, not raw spawn: `observe` (l
 
 ## Spawn order in `service_main`
 
-Pong and ping are spawned **first**, before all probe services. The probe spawn loop takes 18–120 s on Windows TCG; spawning pong/ping first ensures cross-core IPC between them is established within ~10 s of boot.
+**`registry` (the name service) is spawned FIRST** (naming Phase 3b, §11) — before pong/ping and
+every other service — so the supervisor holds its endpoint cap and can wire each service's
+`registry` peer from its name→cap map (no kernel name resolution). registry's boot-time spawn
+failure is fatal (the supervisor aborts → kernel panic, §11.3). Then pong and ping are spawned,
+before all probe services. The probe spawn loop takes 18–120 s on Windows TCG; spawning pong/ping first ensures cross-core IPC between them is established within ~10 s of boot.
 
 ```
 service_main():

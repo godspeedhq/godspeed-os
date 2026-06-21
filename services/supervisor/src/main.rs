@@ -121,6 +121,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // real services below. Not yet read to wire anything — proving the supervisor can hold it.
     #[allow(unused_mut)]
     let mut name_map = NameCapMap::new();
+
+    // Phase 3b (docs/naming-design.md, §11): the supervisor owns naming, so it spawns the name
+    // service FIRST and records its endpoint cap — then it can provide `registry` to every service
+    // it wires, with no kernel name resolution. Moved here from `init`. Boot-time failure is FATAL
+    // (§11.3): the name service must come up to bootstrap, so we abort (→ kernel panic) just as
+    // init did. Spawned in every build (ungated), before pong/ping/probes register with it.
+    ctx.log("supervisor: spawning registry (name service)...");
+    spawn_mapped(&ctx, &mut name_map, "registry", 0xFFFF);
+    if name_map.get("registry").is_none() {
+        ctx.log("supervisor: FATAL: failed to spawn registry");
+        ctx.abort("registry spawn failed");
+    }
+
     // Spawn pong and ping first so IPC between them is established well before
     // probe services compete for scheduler quanta.  Pong must precede ping:
     // ping's SEND cap to pong is wired by the kernel at spawn time.
@@ -205,10 +218,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // up and idle gracefully (block-driver: "no controller"; fs: raw-tolerant).
     #[cfg(any(feature = "bare-metal", feature = "blockdev"))]
     {
-        spawn_mapped(&ctx, &mut name_map, "block-driver", 0xFFFF);
-        // Phase 2: fs's block-driver peer is wired from the supervisor's map, not the kernel name
-        // table (registry still name-wired). Proven by the files test (real fs→block-driver I/O).
-        spawn_wired(&ctx, &mut name_map, "fs", &["block-driver"]);
+        // Phase 3b: all real services are now FULLY wired from the supervisor's map — including
+        // their `registry` peer (the supervisor spawned registry above and holds its cap). No
+        // kernel name resolution at boot for these. block-driver registers itself with registry;
+        // fs reaches block-driver + registers; the shell reaches fs + reacquires it via registry.
+        spawn_wired(&ctx, &mut name_map, "block-driver", &["registry"]);
+        spawn_wired(&ctx, &mut name_map, "fs", &["block-driver", "registry"]);
     }
 
     // shell: the interactive prompt. Spawned in bare-metal (the USB image rests
@@ -217,8 +232,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
-    // Phase 3a: shell's `fs` peer is wired from the supervisor's map (registry still name-wired).
-    spawn_wired(&ctx, &mut name_map, "shell", &["fs"]);
+    // Phase 3a/3b: shell's `fs` and `registry` peers are both wired from the supervisor's map.
+    spawn_wired(&ctx, &mut name_map, "shell", &["fs", "registry"]);
 
     // xhci: USB host-controller driver (§12). Spawned in bare-metal + full
     // builds; the kernel maps its controller's MMIO BAR at spawn (Stage 2).
