@@ -3050,7 +3050,13 @@ fn cmd_restart(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<()
 const CHAOS_RESTARTABLE: [&str; 3] = ["supervisor", "block-driver", "fs"];
 const CHAOS_DEFAULT_ROUNDS: u32 = 20;
 const CHAOS_MAX_ROUNDS: u32 = 100;        // bounded (§26.6) — a deliberate cap, not a firehose
-const CHAOS_WAIT_YIELDS: u32 = 40_000;    // per-round recovery wait (safety bound; recovery is ~ms)
+// Per-round recovery wait is bounded by REAL wall-clock time (RTC seconds), not a yield count. A
+// yield count is not portable: it was generous in QEMU but too short on the T630 for the heavier,
+// kernel-driven SUPERVISOR respawn, so `chaos kill-storm supervisor` undercounted recoveries there
+// (the supervisor *did* recover every time — observe showed it — but chaos gave up waiting). 8 s is
+// generous; the loop breaks early the instant a new generation appears, so fast targets (fs) stay fast.
+const CHAOS_RECOVER_SECS: i64 = 8;
+const CHAOS_POLL_EVERY: u32 = 64;         // yields between gen/clock polls (a task_stat scan isn't free)
 // After the storm, the target's task has respawned (recovery detected via its task generation),
 // but a heavy service like `fs` is not yet *serving* — it still has to re-mount and re-register,
 // and its restart log burst is still draining off the serial line. Settle before reporting (so the
@@ -3130,17 +3136,35 @@ fn chaos_kill_storm(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize) 
     let mut ok_r  = [false; CHAOS_MAX_ROUNDS as usize];
     let mut recovered = 0u32;
     for r in 0..rounds as usize {
-        let og = gen_of(ctx, svc).unwrap_or(0);   // generation of the instance about to be killed
-        old_g[r] = og;
-        let _ = ctx.kill(svc);                     // unexpected death → supervisor's restart loop reacts
-        // Wait for a NEW instance: a generation different from the one we killed (a respawn bumps it,
-        // §7.5). Yield so the supervisor — sharing core 0 — runs and respawns.
-        for j in 0..CHAOS_WAIT_YIELDS {
+        // Ensure the target is ALIVE before we read its generation and kill it. It may still be
+        // mid-respawn from the previous round — especially the supervisor, whose respawn is heavier
+        // and kernel-driven. Killing during that gap would be a wasted round (a no-op kill of a
+        // not-yet-present task). Bounded by the same real-time budget.
+        let t_alive = ctx.datetime().epoch_secs();
+        let mut ka = 0u32;
+        while slot_of(ctx, svc).is_none() {
             ctx.yield_cpu();
-            if j % 32 == 0 {                       // poll periodically (a task_stat scan is not free)
+            ka += 1;
+            if ka % CHAOS_POLL_EVERY == 0
+                && ctx.datetime().epoch_secs() - t_alive >= CHAOS_RECOVER_SECS { break; }
+        }
+        let og = gen_of(ctx, svc).unwrap_or(0);    // generation of the instance about to be killed
+        old_g[r] = og;
+        let _ = ctx.kill(svc);                     // unexpected death → recovered by the supervisor (services)
+                                                   // or by the kernel (the supervisor itself, Phase 6)
+        // Wait for a NEW instance: a generation different from the one we killed (a respawn bumps it,
+        // §7.5). Bounded by REAL wall-clock time (RTC), not a yield count — so a slow, heavy respawn
+        // on real hardware is still detected. Yield so the recoverer (sharing core 0) runs.
+        let t0 = ctx.datetime().epoch_secs();
+        let mut k = 0u32;
+        loop {
+            ctx.yield_cpu();
+            k += 1;
+            if k % CHAOS_POLL_EVERY == 0 {
                 if let Some(g) = gen_of(ctx, svc) {
                     if g != og { new_g[r] = g; ok_r[r] = true; recovered += 1; break; }
                 }
+                if ctx.datetime().epoch_secs() - t0 >= CHAOS_RECOVER_SECS { break; }
             }
         }
     }
