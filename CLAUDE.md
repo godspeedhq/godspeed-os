@@ -770,15 +770,26 @@ When a page is unmapped (service killed, memory reclaimed), the kernel issues a 
 
   init (Core 0)
     ── spawn supervisor on Core 0
-    ── spawn registry on Core 0
     ── spawn logger on Core 0
 
   supervisor (Core 0)
+    ── spawn registry on Core 0   (name service — FIRST; holds its cap)
     ── read boot manifest
-    ── spawn services per placement policy (§9.2)
+    ── spawn services per placement policy (§9.2),
+       wiring each from its name→cap map (no kernel name resolution)
 
   ── System reaches multi-core steady state ──
 ```
+
+> **Amendment 2026-06-21 (naming Phase 3b): `registry` is spawned by the `supervisor`, not
+> `init`.** Moving name→endpoint resolution out of the kernel (`docs/naming-design.md`, §4.4/§26.10)
+> makes the supervisor the name authority. For it to wire every service's `registry` peer from a
+> capability it holds — rather than the kernel resolving the name — the supervisor must hold
+> registry's cap, so it now spawns registry **first**, before any service that registers with it.
+> `init` spawns only `supervisor` + `logger`. Registry's *boot-time* spawn failure is still **fatal**
+> (the supervisor aborts → kernel panic, same reason string), preserving §11.3; its *runtime* death is
+> still a supervisor restart (H11, §6.2). The kernel still records the name→endpoint mapping at spawn
+> (used by the restart path + the registry-bootstrap stopgap) until that path is removed in Phase 5.
 
 The bootloader is **Limine**, accessed via the Limine Boot Protocol. Limine is responsible for loading the kernel image, supplying the physical memory map, the framebuffer descriptor, kernel relocation info, and the SMP topology (APIC IDs of all available cores). See Appendix A for the bootloader rationale and installation story.
 
@@ -798,7 +809,7 @@ Because Limine supplies APIC IDs directly, the kernel does not need to probe ACP
 | AP startup        | Kernel logs warning, continues with available cores; if zero APs come up, system runs as single-core |
 | init spawn        | Kernel panic, halt                     |
 | supervisor spawn  | Kernel panic, halt (TCB)               |
-| registry spawn (boot-time) | Kernel panic, halt — the name service must come up to bootstrap. *Runtime* death is recovered by the supervisor (H11; §6.2), not a reboot. |
+| registry spawn (boot-time, by the **supervisor** — Phase 3b) | Kernel panic, halt — the supervisor aborts (the name service must come up to bootstrap). *Runtime* death is recovered by the supervisor (H11; §6.2), not a reboot. |
 | logger spawn      | Init logs to kernel ring buffer, retry |
 | Application svc   | Supervisor logs, may retry per policy  |
 | Service contracted to unavailable core | Spawn rejected with `PlacementInvalid`; supervisor logs and skips; system runs without that service |

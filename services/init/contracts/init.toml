@@ -6,8 +6,9 @@ request = "4MiB"
 limit   = "8MiB"
 
 [capabilities]
-# init only needs to spawn the three listed services; supervisor handles the rest.
-spawn = ["supervisor", "registry", "logger"]
+# init spawns the supervisor + logger; the supervisor spawns registry and all the rest
+# (naming Phase 3b, §11 — the supervisor owns naming, so it holds registry's cap).
+spawn = ["supervisor", "logger"]
 log_write = true
 
 [placement]

@@ -106,22 +106,25 @@ pub fn run(image_path: &Path, smp: u32) {
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)) {
         Some(boot_out) => {
             check!(boot_out.contains("shell: ready"), "boot: shell ready message");
-            // Phase 1 of moving naming out of the kernel (docs/naming-design.md): the supervisor
-            // builds a shadow name→cap map as it spawns the real services, recording the endpoint
-            // cap the new SpawnReturningEndpoint syscall hands back. Bare-metal spawns 5 real
-            // services (block-driver, fs, shell, xhci, ehci) — the map must hold them.
-            check!(boot_out.contains("name-cap map holds 5 service(s)"),
+            // Naming migration (docs/naming-design.md): the supervisor builds a name→cap map as it
+            // spawns the real services, then wires dependents from it. Bare-metal maps 6 services
+            // (registry, block-driver, fs, shell, xhci, ehci).
+            check!(boot_out.contains("name-cap map holds 6 service(s)"),
                    "naming Phase 1: supervisor holds an endpoint cap for every real service");
-            check!(boot_out.contains("name-map + block-driver"),
-                   "naming Phase 1: block-driver recorded in the supervisor's name-cap map");
-            // Phase 2: fs's `block-driver` peer is wired from the supervisor's map (registry still
-            // name-wired). Functional proof = files test (real fs→block-driver disk I/O, 137/0).
+            // Phase 3b: registry is spawned by the SUPERVISOR (moved from init, §11), recorded in
+            // the map, and provided to every service — so nothing name-wires registry at boot.
+            check!(boot_out.contains("supervisor: spawning registry (name service)")
+                   && boot_out.contains("name-map + registry"),
+                   "naming Phase 3b: supervisor spawns + holds the registry cap");
+            // Phase 2/3: fs (block-driver + registry) and shell (fs + registry) are fully wired
+            // from the supervisor's map. Functional proof = the files test (real disk I/O, file
+            // commands reaching fs, fs reaching block-driver) and the registry-mediated reacquire.
+            check!(boot_out.contains("block-driver wired from the name-cap map"),
+                   "naming Phase 3b: block-driver's registry peer wired from the map");
             check!(boot_out.contains("fs wired from the name-cap map"),
-                   "naming Phase 2: supervisor wired fs's block-driver peer from its map");
-            // Phase 3a: shell's `fs` peer is wired from the supervisor's map (registry still
-            // name-wired). Functional proof = the file commands in this very test reaching fs.
+                   "naming Phase 2/3b: fs's block-driver + registry peers wired from the map");
             check!(boot_out.contains("shell wired from the name-cap map"),
-                   "naming Phase 3a: supervisor wired shell's fs peer from its map");
+                   "naming Phase 3a/3b: shell's fs + registry peers wired from the map");
         }
         None => {
             // Print what we did receive to help diagnose failures.
