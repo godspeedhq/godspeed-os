@@ -6,7 +6,7 @@ Task management and per-core scheduler (§9, §14).
 
 | File            | Responsibility |
 |-----------------|---------------|
-| `mod.rs`        | `spawn_init()`, `kill_current()`, `drain_pending_kstack()` |
+| `mod.rs`        | `spawn_supervisor()` (the kernel's one direct spawn — init removed, Phase 5), `kill_current()`, `drain_pending_kstack()` |
 | `task.rs`       | `Task` struct: id, name, core_id, state, context, page table, cap table, memory owner |
 | `state.rs`      | `TaskState` enum: Ready, Running, BlockedOnRecv, BlockedOnSend, Dead |
 | `scheduler.rs`  | `run()` (never returns), `timer_tick()`, `wake(task_id)`, `block_on_send(endpoint)` |
@@ -25,7 +25,7 @@ The 10 ms quantum is enforced by the local APIC timer. `timer_tick()` is called 
 
 ## Spawn flow (§14.1)
 
-`spawn_init()` is the only direct spawn from kernel code. All other spawns go through supervisor → syscall → kernel. The kernel side of spawn:
+`spawn_supervisor()` is the only direct spawn from kernel code (Path C / Phase 5 — init removed; the kernel boots the supervisor directly). All other spawns go through supervisor → syscall → kernel. The kernel side of spawn:
 1. Calls `smp::placement::resolve(contract_core)` to get the target core.
 2. Allocates a `Task` with a fresh `CapTable` populated from the contract.
 3. Allocates a page table and maps the service binary.

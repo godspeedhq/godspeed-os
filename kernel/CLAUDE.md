@@ -51,4 +51,4 @@ A PR adding an unsafe block without a SAFETY comment is rejected without review.
 
 ## Panic behaviour
 
-The panic handler writes to serial console and the crash page, then calls `halt_all_cores()`. There is no recovery. The system reboots on the next power cycle and init reads the stored panic reason.
+The panic handler writes to serial console and the crash page, then calls `halt_all_cores()`. There is no recovery. The system reboots on the next power cycle and the kernel reads the stored panic reason (init, which used to, is removed — Phase 5).

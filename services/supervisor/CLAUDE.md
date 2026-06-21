@@ -34,19 +34,21 @@ Introspection is reached through shell **commands**, not raw spawn: `observe` (l
 
 ## Spawn order in `service_main`
 
-**`registry` (the name service) is spawned FIRST** (naming Phase 3b, §11) — before pong/ping and
-every other service — so the supervisor holds its endpoint cap and can wire each service's
-`registry` peer from its name→cap map (no kernel name resolution). registry's boot-time spawn
-failure is fatal (the supervisor aborts → kernel panic, §11.3). Then pong and ping are spawned,
-before all probe services. The probe spawn loop takes 18–120 s on Windows TCG; spawning pong/ping first ensures cross-core IPC between them is established within ~10 s of boot.
+The kernel spawns the supervisor **directly** (Path C / Phase 5 — init is removed). The supervisor
+spawns the **logger first** (moved from init), then pong/ping, then services it wires from its
+`name → cap` map. The registry *service* is retired (Phase 4); names resolve via the kernel's
+directory (`ipc::names` + `AcquireSendCap`), not a registry service. The probe spawn loop takes
+18–120 s on Windows TCG; spawning pong/ping early ensures cross-core IPC between them is established
+within ~10 s of boot.
 
 ```
 service_main():
-  1. spawn("pong") on core 1  ← pong must precede ping (SEND cap wired at spawn)
-  2. spawn("ping") on core 0
-  3. spawn probe services (§22 test infrastructure) — skipped in bare-metal mode
-  4. log("supervisor: ready")
-  5. loop { yield_cpu() }
+  1. spawn("logger")              ← moved here from init (Phase 5); not TCB, retry once
+  2. spawn("pong") on core 1      ← pong must precede ping (SEND cap wired at spawn)
+  3. spawn("ping") on core 0
+  4. spawn probe / bare-metal services from the name→cap map (no kernel name resolution)
+  5. log("supervisor: ready")
+  6. loop { recv() }  ← death-notification restart loop
 ```
 
 `"supervisor: ready"` appears after **all** spawns complete. Identity tests that trigger a service restart use this string as the `wait_for` gate to ensure the restart fires only when supervisor is safely in its yield loop — no restart-mid-spawn conflict.

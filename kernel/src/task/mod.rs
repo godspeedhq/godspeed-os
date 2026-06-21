@@ -2973,8 +2973,7 @@ fn spawn_service_with_config(
     // service in v1") — a system-wide blast-radius widening this closes. Capture the
     // slot (u32::MAX when not granted); the SDK already treats MAX as "not held".
     let mut spawn_slot_u32 = u32::MAX;
-    if name == "init"
-        || name == "supervisor"
+    if name == "supervisor"            // init removed (Path C / Phase 5) — supervisor is the spawner
         || name == "shell"
         || core::ptr::eq(elf_bytes.as_ptr(), PROBE_ELF.as_ptr())
     {
@@ -3366,11 +3365,14 @@ fn spawn_service_with_config(
 }
 
 /// Spawn `init` on Core 0. Called once by `kernel_main` (§11.1).
-pub fn spawn_init() {
-    let elf_bytes = include_bytes!(env!("SVC_INIT_ELF"));
-    match spawn_service_with_config("init", elf_bytes, 0, false, &[], 0, false, 64 * 1024 * 1024, &[], false, None) {
-        Ok(_) => crate::kprintln!("task: init spawned on core 0"),
-        Err(e) => panic!("task: failed to spawn init: {:?}", e),
+/// The kernel's ONE direct spawn (Path C / Phase 5 — `init` is removed). The kernel boots the
+/// SUPERVISOR directly; the supervisor then spawns logger and all services. Uses `SUPERVISOR_ELF`
+/// (garbage under `test-bad-supervisor` → §22 Test 1B). `has_recv_endpoint = true` (the supervisor
+/// owns the death-notification endpoint). A spawn failure is fatal — the supervisor is TCB (§6.2).
+pub fn spawn_supervisor() {
+    match spawn_service_with_config("supervisor", SUPERVISOR_ELF, 0, true, &[], 0, false, 64 * 1024 * 1024, &[], false, None) {
+        Ok(_) => crate::kprintln!("task: supervisor spawned on core 0"),
+        Err(e) => panic!("supervisor spawn failed: {:?}", e),
     }
 }
 

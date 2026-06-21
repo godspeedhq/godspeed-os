@@ -2597,9 +2597,9 @@ fn find_running_slot(ctx: &ServiceContext, name: &str) -> Option<u32> {
 /// The trusted root (§6.1). The kernel refuses to kill these and refuses to spawn
 /// a second instance; the shell explains why before the syscall is even tried.
 // `registry` is no longer protected (H11 ph6): it is a restartable service, so the
-// shell permits `kill registry` (the supervisor respawns it). init/supervisor remain
-// the non-restartable trusted root.
-const CORE_SERVICES: [&str; 2] = ["init", "supervisor"];
+// The shell permits killing restartable services (block-driver, fs — the supervisor respawns them).
+// Only `supervisor` is the non-restartable trusted root now (Path C / Phase 5: init removed).
+const CORE_SERVICES: [&str; 1] = ["supervisor"];
 
 /// Shown when spawn/kill/restart targets a core service — "Not applicable" makes
 /// it clear the command is refused *because* the target is protected, not failed.
@@ -3097,8 +3097,8 @@ fn chaos_kill_storm(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize) 
         return Err(ShellError::Unknown);
     }
     let svc = tok[1];
-    if svc == "init" || svc == "supervisor" {
-        ctx.console_writeln("chaos: refusing the TCB — killing init/supervisor reboots the machine, which is not chaos to observe (§6.2).");
+    if svc == "supervisor" {
+        ctx.console_writeln("chaos: refusing the TCB — killing the supervisor reboots the machine, which is not chaos to observe (§6.2).");
         return Err(ShellError::Denied);
     }
     if !CHAOS_RESTARTABLE.contains(&svc) {

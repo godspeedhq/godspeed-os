@@ -141,6 +141,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     #[allow(unused_mut)]
     let mut name_map = NameCapMap::new();
 
+    // Path C / Phase 5: the kernel boots the supervisor directly (init is removed), so the
+    // supervisor now spawns the logger — moved here from init. logger is not TCB (§11.3): retry
+    // once on failure and continue without it (its output falls back to the kernel ring buffer).
+    ctx.log("supervisor: spawning logger...");
+    if ctx.spawn("logger").is_err() {
+        ctx.log("supervisor: logger spawn failed, retrying");
+        let _ = ctx.spawn("logger");
+    }
+
     // Spawn pong and ping first so IPC between them is established well before
     // probe services compete for scheduler quanta.  Pong must precede ping:
     // ping's SEND cap to pong is wired by the kernel at spawn time.

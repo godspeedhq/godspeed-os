@@ -31,9 +31,7 @@ fn main() {
 
     // (env-var suffix, binary name in target dir)
     let services: &[(&str, &str)] = &[
-        ("INIT",       "init"),
-        ("SUPERVISOR", "supervisor"),
-        ("REGISTRY",   "registry"),
+        ("SUPERVISOR", "supervisor"),  // init removed (Phase 5); registry retired (Phase 4)
         ("LOGGER",     "logger"),
         ("PING",       "ping"),
         ("PONG",       "pong"),

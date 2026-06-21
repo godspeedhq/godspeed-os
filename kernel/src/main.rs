@@ -287,10 +287,11 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     #[cfg(feature = "test-bad-elf-brutal")]
     loader::run_elf_fuzz_brutal();
 
-    // Normal boot: spawn init, bring up APs, enter per-core scheduler (never returns).
+    // Normal boot: spawn the supervisor (Path C / Phase 5 — no init), bring up APs, enter the
+    // per-core scheduler (never returns).
     #[cfg(not(any(feature = "test-bad-elf", feature = "test-bad-elf-brutal")))]
     {
-        task::spawn_init();
+        task::spawn_supervisor();
         smp::init(boot_info);
 
         // Hardening H4b: Limine maps the HHDM W+X (RWX direct map of all RAM — a

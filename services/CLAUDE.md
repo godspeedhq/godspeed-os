@@ -6,11 +6,12 @@ All userspace services. Each service is a separate Rust crate that links against
 
 | Service         | Why non-restartable |
 |-----------------|---------------------|
-| `init/`         | Spawns supervisor; first userspace authority |
-| `supervisor/`   | Holds restart authority; its own death = system reboot |
+| `supervisor/`   | Holds restart authority + name authority; **spawned directly by the kernel** (init removed, Phase 5); its own death = system reboot |
 
-Failure of `init` or `supervisor` causes a kernel panic and system reboot (§6.2). No silent
-recovery. These two are the only non-restartable services — the §6.3 TCB-shrink goal is met.
+Failure of `supervisor` causes a kernel panic and system reboot (§6.2). No silent recovery. It is the
+**sole** non-restartable service — `init` was removed (Path C / Phase 5, the kernel spawns the
+supervisor directly) and the registry service was retired (Phase 4). Path C / Phase 6 will make even
+the supervisor restartable, leaving the kernel the only unkillable thing.
 
 ## Restartable services
 

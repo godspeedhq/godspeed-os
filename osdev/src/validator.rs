@@ -1202,9 +1202,8 @@ static TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect: &[
                 "kernel: 4 cores ready",
-                "init: ready",
+                // (no "init: ready" — init is removed; the kernel spawns the supervisor directly, Phase 5)
                 "supervisor: ready",
-                // (no "registry: ready" — the registry service is retired, Path C / Phase 4)
                 "logger: ready",
             ],
             fail_on:      &["KERNEL PANIC"],
@@ -1214,9 +1213,11 @@ static TESTS: &[TestSpec] = &[
     TestSpec {
         id: "1B", name: "bootstrap_tcb_failure_panics", spec_ref: "§22 Test 1B",
         kind: TestKind::WithBadTcb {
-            // Path C / Phase 4: registry retired, so the corrupt-and-fail TCB is now the supervisor
-            // (init spawns it, observes the load error, and aborts → kernel panic).
-            expect:       &["KERNEL PANIC", "reason: supervisor spawn failed"],
+            // Path C / Phase 5: init is removed, so the KERNEL spawns the supervisor directly. A
+            // corrupt supervisor ELF fails that spawn and the kernel panics (`panic!("supervisor
+            // spawn failed: ...")`) — the §6.2 TCB-failure path, now kernel-direct (no init abort,
+            // hence no "reason:" prefix).
+            expect:       &["KERNEL PANIC", "supervisor spawn failed"],
             fail_on:      &["supervisor: ready"],
             timeout_secs: 30,
         },
