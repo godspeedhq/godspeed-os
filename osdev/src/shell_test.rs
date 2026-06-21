@@ -112,14 +112,16 @@ pub fn run(image_path: &Path, smp: u32) {
             // services (block-driver, fs, shell, xhci, ehci) — the map must hold them.
             check!(boot_out.contains("name-cap map holds 5 service(s)"),
                    "naming Phase 1: supervisor holds an endpoint cap for every real service");
-            check!(boot_out.contains("name-map + shell"),
-                   "naming Phase 1: shell recorded in the supervisor's name-cap map");
-            // Phase 2 (docs/naming-design.md): fs's `block-driver` peer is wired from the
-            // supervisor's name→cap map, not the kernel name table (registry still name-wired).
-            // The functional proof is the files test (real fs→block-driver disk I/O, 137/0); here
-            // we pin that the supervisor actually flipped fs's wiring.
-            check!(boot_out.contains("fs wired to block-driver via the name-cap map"),
+            check!(boot_out.contains("name-map + block-driver"),
+                   "naming Phase 1: block-driver recorded in the supervisor's name-cap map");
+            // Phase 2: fs's `block-driver` peer is wired from the supervisor's map (registry still
+            // name-wired). Functional proof = files test (real fs→block-driver disk I/O, 137/0).
+            check!(boot_out.contains("fs wired from the name-cap map"),
                    "naming Phase 2: supervisor wired fs's block-driver peer from its map");
+            // Phase 3a: shell's `fs` peer is wired from the supervisor's map (registry still
+            // name-wired). Functional proof = the file commands in this very test reaching fs.
+            check!(boot_out.contains("shell wired from the name-cap map"),
+                   "naming Phase 3a: supervisor wired shell's fs peer from its map");
         }
         None => {
             // Print what we did receive to help diagnose failures.

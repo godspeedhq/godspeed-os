@@ -68,27 +68,35 @@ impl NameCapMap {
     }
 }
 
-/// Phase 2 (docs/naming-design.md): spawn `fs`, wiring its `block-driver` send-peer from the
-/// supervisor's name→cap map (the cap recorded when block-driver was spawned) **instead of the
-/// kernel name table**. `fs`'s other declared peer, `registry`, is still name-wired by the kernel
-/// (the merge) — peers flip one at a time. Records fs's own endpoint cap on success. The flipped
-/// wiring is proven by fs mounting + serving, which requires fs→block-driver disk I/O.
-fn spawn_fs_wired(ctx: &ServiceContext, map: &mut NameCapMap) {
-    let bd = match map.get("block-driver") {
-        Some(slot) => slot,
-        None => {
-            ctx.log("supervisor: Phase 2 — block-driver not in name-cap map; name-wiring fs instead");
-            spawn_mapped(ctx, map, "fs", 0xFFFF);
-            return;
+/// Phase 2/3 (docs/naming-design.md): spawn `name`, **providing the listed `peers` from the
+/// supervisor's name→cap map** (the caps recorded when those services were spawned) instead of the
+/// kernel name table. Any declared peer NOT listed here is still name-wired by the kernel (the
+/// merge) — peers flip one at a time. Records the new service's own endpoint cap. If none of the
+/// requested peers are mapped yet, falls back to a fully name-wired spawn (loud). The flipped
+/// wiring is proven functionally (e.g. fs←block-driver by real disk I/O; shell←fs by file commands).
+fn spawn_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &[&str]) {
+    let mut installs: [(&str, CapHandle); 4] = [("", CapHandle(0)); 4];
+    let mut n = 0usize;
+    for &p in peers {
+        if n >= installs.len() { break; }
+        match map.get(p) {
+            Some(slot) => { installs[n] = (p, CapHandle(slot)); n += 1; }
+            None => ctx.log_fmt(format_args!(
+                "supervisor: {} peer '{}' not in name-cap map — kernel will name-wire it", name, p)),
         }
-    };
-    match ctx.spawn_with_caps("fs", 0xFFFF, &[("block-driver", CapHandle(bd))]) {
+    }
+    if n == 0 {
+        spawn_mapped(ctx, map, name, 0xFFFF); // nothing to provide — plain name-wired spawn
+        return;
+    }
+    match ctx.spawn_with_caps(name, 0xFFFF, &installs[..n]) {
         Ok(Some(cap)) => {
-            let _ = map.record("fs", cap.0);
-            ctx.log("supervisor: fs wired to block-driver via the name-cap map (Phase 2; registry still name-wired)");
+            let _ = map.record(name, cap.0);
+            ctx.log_fmt(format_args!(
+                "supervisor: {} wired from the name-cap map ({} peer(s) provided; rest name-wired)", name, n));
         }
-        Ok(None) => ctx.log("supervisor: Phase 2 — fs spawned but returned no endpoint cap (unexpected)"),
-        Err(_)   => ctx.log("supervisor: Phase 2 — fs spawn (wired) FAILED"),
+        Ok(None) => ctx.log_fmt(format_args!("supervisor: {} wired (no endpoint to record)", name)),
+        Err(_)   => ctx.log_fmt(format_args!("supervisor: {} wired spawn FAILED", name)),
     }
 }
 
@@ -200,7 +208,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         spawn_mapped(&ctx, &mut name_map, "block-driver", 0xFFFF);
         // Phase 2: fs's block-driver peer is wired from the supervisor's map, not the kernel name
         // table (registry still name-wired). Proven by the files test (real fs→block-driver I/O).
-        spawn_fs_wired(&ctx, &mut name_map);
+        spawn_wired(&ctx, &mut name_map, "fs", &["block-driver"]);
     }
 
     // shell: the interactive prompt. Spawned in bare-metal (the USB image rests
@@ -209,7 +217,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
-    spawn_mapped(&ctx, &mut name_map, "shell", 0xFFFF);
+    // Phase 3a: shell's `fs` peer is wired from the supervisor's map (registry still name-wired).
+    spawn_wired(&ctx, &mut name_map, "shell", &["fs"]);
 
     // xhci: USB host-controller driver (§12). Spawned in bare-metal + full
     // builds; the kernel maps its controller's MMIO BAR at spawn (Stage 2).
