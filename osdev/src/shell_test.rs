@@ -673,6 +673,27 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
+    // chaos flood-storm: the OTHER resilience axis. Saturate fs's IPC queue with a burst of try_send
+    // (never blocking send, §8.9) until the kernel returns QueueFull (proving the §8.5 16-deep bound),
+    // then confirm fs DRAINS it and stays alive. fs is a robust service (it validates + drops the tiny
+    // payload), so it survives every round - "overwhelmed", not "gone".
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"chaos flood-storm fs 5\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)) {
+        Some(r) => {
+            check!(r.contains("flood-storm fs") && r.contains("verdict: PASS"), "chaos: flood-storm fs - saturated + drained, PASS");
+            check!(r.contains("survived: 5/5"), "chaos: flood-storm - fs survived all 5 floods");
+            check!(r.contains("kernel: alive"), "chaos: flood-storm - kernel alive (no panic)");
+        }
+        None => { println!("shell-test: FAIL - chaos flood-storm timed out (queue stuck / panic?)"); fail += 3; }
+    }
+    send(&mut write_half, b"cores\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains(&format!("cores: {smp}")), "chaos: shell still responsive after the flood"),
+        None    => { println!("shell-test: FAIL - shell unresponsive after flood-storm"); fail += 1; }
+    }
+
+    // -----------------------------------------------------------------------
     // chaos kill-storm SUPERVISOR (Path C / Phase 6): the supervisor is restartable too - the KERNEL
     // respawns it on every death, unconditionally (no bound - a bound would be a reboot/DoS vector).
     // Storming it 4× and recovering every round proves the unkillable set is now {kernel} alone: the

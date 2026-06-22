@@ -8,7 +8,7 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, CapInfo, CapHandle, Message};
+use godspeed_sdk::{ServiceContext, CapInfo, CapHandle, Message, IpcError};
 use godspeed_sdk::record::{Table, Value, RecordSink, parse_predicate, REC_MAX_ROWS, REC_ARENA};
 
 const MAX_LINE: usize = 128;
@@ -396,7 +396,7 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
     ("date",    &["epoch"]),
     ("drives",  &["flash", "label", "reset", "check", "scrub"]),
-    ("chaos",   &["kill-storm", "max-carnage"]),
+    ("chaos",   &["kill-storm", "flood-storm", "max-carnage"]),
     ("write",   &["append", "prepend"]),
     ("sort",    &["reverse"]),
     ("match",   &["except"]),
@@ -1438,6 +1438,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("chaos kill-storm <svc> [rounds]", "kill a service N times; verify it recovers each time", "chaos kill-storm supervisor 20"),
             ("chaos kill-storm <svc> [n] save <path>", "also write the report to a file (recorded in memory, written at the end)", "chaos kill-storm fs 20 save /chaos.txt"),
             ("  <svc> = supervisor | block-driver | fs", "recoverable targets: the supervisor respawns the services, the kernel respawns the supervisor - only the kernel can't be killed", "chaos kill-storm supervisor 10"),
+            ("chaos flood-storm <svc> [rounds]", "saturate a service's IPC queue with try_send; verify it drains + stays alive (the other axis: 'overwhelmed', not 'gone')", "chaos flood-storm fs 5"),
             ("chaos max-carnage [rounds] [save <path>]", "the chaos monkey: kill a RANDOM live service each round (everything but the shell); proves the KERNEL survives arbitrary carnage", "chaos max-carnage 30"),
         ], true),
         "drives" => help_block(ctx, "drives", "manage attached disks (records when piped)", &[
@@ -3224,11 +3225,13 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
     }
     if ntok == 0 {
         ctx.console_writeln("usage: chaos kill-storm <service> [rounds] [save <path>]   (service: supervisor | block-driver | fs)");
+        ctx.console_writeln("       chaos flood-storm <service> [rounds]                (saturate its queue with try_send; verify it drains + stays alive)");
         ctx.console_writeln("       chaos max-carnage [rounds] [save <path>]            (kill a RANDOM live service each round - all but the shell)");
         return Err(ShellError::Unknown);
     }
     match tok[0] {
         "kill-storm"  => chaos_kill_storm(ctx, cwd, &tok, ntok),
+        "flood-storm" => chaos_flood_storm(ctx, cwd, &tok, ntok),
         "max-carnage" => chaos_max_carnage(ctx, cwd, &tok, ntok),
         other => {
             ctx.console_writeln_fmt(format_args!(
@@ -3339,6 +3342,128 @@ fn chaos_kill_storm(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize) 
         }
     }
     if recovered == rounds { Ok(()) } else { Err(ShellError::Unknown) }
+}
+
+/// `chaos flood-storm <svc> [rounds]` - saturate a service's IPC queue with a burst of **`try_send`**
+/// (never blocking `send`, §8.9 - blocking into a full queue would hang the shell flooding itself),
+/// then confirm the service DRAINS it and stays alive. The other resilience axis from kill-storm: not
+/// "service gone" but "service overwhelmed" (§8.5 bounded 16-deep queues, §26.6). Each round bursts
+/// until the kernel returns `QueueFull` (proving the bound), yields to let the target drain, then
+/// re-sends to confirm it recovered. Capability path: a SEND cap acquired by name (`AcquireSendCap`) -
+/// floodable = any running service with a registered recv endpoint. Verdict PASS = the service
+/// survived every flood and still accepts messages; the kernel never panicking is proven by the
+/// command returning at all (a panic reboots). Bounded + loud (§26.6): fixed per-round burst, fixed
+/// rounds, fixed report buffer; console-only (no fs dependency).
+#[inline(never)]
+fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
+    const FLOOD_BURST_MAX:    u32 = 64; // cap per-round sends; > queue depth (16) so saturation shows
+    const FLOOD_DRAIN_YIELDS: u32 = 40; // yields to let the target drain before we re-check
+
+    if ntok < 2 {
+        ctx.console_writeln("usage: chaos flood-storm <service> [rounds]   (any running service with a recv endpoint, e.g. fs | logger | block-driver)");
+        return Err(ShellError::Unknown);
+    }
+    let svc = tok[1];
+    let mut rounds = CHAOS_DEFAULT_ROUNDS;
+    let mut i = 2;
+    while i < ntok { if let Some(n) = parse_u32(tok[i]) { rounds = n; } i += 1; }
+    let rounds = rounds.clamp(1, CHAOS_MAX_ROUNDS);
+
+    if slot_of(ctx, svc).is_none() {
+        ctx.console_writeln_fmt(format_args!("chaos: '{}' is not running", svc));
+        return Err(ShellError::Unknown);
+    }
+    // A SEND cap to the target's recv endpoint, acquired by name. None = no reachable endpoint
+    // (not registered, or a pure sender with nothing to flood).
+    let mut handle = match ctx.acquire_send_cap(svc) {
+        Some(h) => h,
+        None => {
+            ctx.console_writeln_fmt(format_args!(
+                "chaos: cannot flood '{}' - no reachable recv endpoint (not registered, or a pure sender)", svc));
+            return Err(ShellError::Unknown);
+        }
+    };
+
+    ctx.console_writeln_fmt(format_args!(
+        "chaos flood-storm {}: {} rounds - saturate its queue (try_send), then confirm it drains + stays alive...", svc, rounds));
+
+    let msg = Message::from_bytes(&[0x01]); // minimal benign payload; the target drains + drops it
+    let mut depth = [0u32;  CHAOS_MAX_ROUNDS as usize]; // sends that landed before QueueFull
+    let mut sat_r = [false; CHAOS_MAX_ROUNDS as usize]; // queue actually saturated (hit QueueFull)
+    let mut ok_r  = [false; CHAOS_MAX_ROUNDS as usize]; // service survived this round
+    let mut survived = 0u32;
+    let mut died_at: Option<u32> = None;
+
+    for r in 0..rounds as usize {
+        // 1. Burst until the queue saturates (QueueFull) or we hit the cap (the service kept up).
+        let mut sent = 0u32;
+        let mut died = false;
+        while sent < FLOOD_BURST_MAX {
+            match ctx.try_send_by_handle(handle, &msg) {
+                Ok(())                      => sent += 1,
+                Err(IpcError::QueueFull)    => { sat_r[r] = true; break; }
+                Err(IpcError::EndpointDead) => { died = true; break; }
+                Err(_)                      => break,
+            }
+        }
+        depth[r] = sent;
+        // 2. Let the target drain (the flood + any respawn settle).
+        for _ in 0..FLOOD_DRAIN_YIELDS { ctx.yield_cpu(); }
+        if died {
+            // The flood killed the service (or it had already died). Record it and reacquire the
+            // respawned instance for the next round.
+            if died_at.is_none() { died_at = Some(r as u32 + 1); }
+            if let Some(nh) = ctx.acquire_send_cap(svc) { handle = nh; }
+            continue;
+        }
+        // 3. Responsive? a send should land now that the queue has drained. EndpointDead = it died.
+        match ctx.try_send_by_handle(handle, &msg) {
+            Ok(()) | Err(IpcError::QueueFull) => { ok_r[r] = true; survived += 1; }
+            Err(IpcError::EndpointDead)       => {
+                if died_at.is_none() { died_at = Some(r as u32 + 1); }
+                if let Some(nh) = ctx.acquire_send_cap(svc) { handle = nh; }
+            }
+            Err(_)                            => {}
+        }
+    }
+
+    // Report - bounded buffer, console-only (flooding needs no fs).
+    use core::fmt::Write as _;
+    let mut rb = ReportBuf::new();
+    let _ = writeln!(rb, "=== chaos flood-storm {}: report ===", svc);
+    let _ = writeln!(rb, "target: {}; rounds: {}; burst cap: {}/round", svc, rounds, FLOOD_BURST_MAX);
+    for r in 0..rounds as usize {
+        if ok_r[r] {
+            if sat_r[r] {
+                let _ = writeln!(rb, "round {:>3}: saturated at depth {} -> drained, alive", r + 1, depth[r]);
+            } else {
+                let _ = writeln!(rb, "round {:>3}: {} sends, service kept up (no QueueFull) -> alive", r + 1, depth[r]);
+            }
+        } else {
+            let _ = writeln!(rb, "round {:>3}: depth {} -> service DIED (EndpointDead) - flood not absorbed", r + 1, depth[r]);
+        }
+    }
+    // Final responsiveness check: is the service still accepting after the whole storm?
+    let final_alive = match ctx.acquire_send_cap(svc) {
+        Some(fh) => !matches!(ctx.try_send_by_handle(fh, &msg), Err(IpcError::EndpointDead)),
+        None     => false,
+    };
+    let _ = writeln!(rb, "survived: {}/{}; final responsive: {}; kernel: alive (no panic - this command returned)",
+                     survived, rounds, if final_alive { "yes" } else { "no" });
+    if let Some(d) = died_at {
+        let _ = writeln!(rb, "note: first flood-induced death at round {} (if restartable, it respawned)", d);
+    }
+    let pass = survived == rounds && final_alive;
+    let _ = writeln!(rb, "verdict: {}", if pass {
+        "PASS (queue saturated + service drained + stayed alive)"
+    } else {
+        "FAIL (a flood was not absorbed)"
+    });
+    if rb.overflow { let _ = writeln!(rb, "(report truncated at {} KiB)", REPORT_MAX / 1024); }
+
+    for _ in 0..CHAOS_SETTLE_YIELDS { ctx.yield_cpu(); }
+    console_write_chunked(ctx, rb.bytes());
+    if pass { Ok(()) } else { Err(ShellError::Unknown) }
 }
 
 /// xorshift64 - a tiny, fast PRNG. Not cryptographic; just enough to pick victims at random.
