@@ -2274,7 +2274,7 @@ fn run_one(test: &TestSpec, image: &Path) -> TestOutcome {
             let _ = std::fs::write(&serial, b"");
             let qemu   = crate::qemu::spawn_for_test(&bad_image, 4, &serial, None);
             let result = poll_serial(&serial, expect, fail_on,
-                                     Instant::now() + Duration::from_secs(*timeout_secs));
+                                     Instant::now() + Duration::from_secs(*timeout_secs * crate::qemu::timeout_scale()));
             qemu.kill();
             result
         }
@@ -2290,7 +2290,7 @@ fn run_one(test: &TestSpec, image: &Path) -> TestOutcome {
             let _ = std::fs::write(&serial, b"");
             let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
             let result = poll_serial(&serial, expect, fail_on,
-                                     Instant::now() + Duration::from_secs(*timeout_secs));
+                                     Instant::now() + Duration::from_secs(*timeout_secs * crate::qemu::timeout_scale()));
             qemu.kill();
             result
         }
@@ -2299,7 +2299,7 @@ fn run_one(test: &TestSpec, image: &Path) -> TestOutcome {
             let serial   = serial_path(test);
             // Truncate so poll_serial doesn't match stale content from a previous run.
             let _ = std::fs::write(&serial, b"");
-            let deadline = Instant::now() + Duration::from_secs(*timeout_secs);
+            let deadline = Instant::now() + Duration::from_secs(*timeout_secs * crate::qemu::timeout_scale());
             // Allocate a unique port so back-to-back WithRestart tests don't collide on
             // a socket still in TIME_WAIT from the just-killed QEMU instance.
             let ctrl_port = NEXT_CONTROL_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2426,7 +2426,7 @@ fn run_property_one(test: &TestSpec, image: &Path) -> TestOutcome {
             let _ = std::fs::write(&serial, b"");
             let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
             let result = poll_serial(&serial, expect, fail_on,
-                                     Instant::now() + Duration::from_secs(*timeout_secs));
+                                     Instant::now() + Duration::from_secs(*timeout_secs * crate::qemu::timeout_scale()));
             qemu.kill();
             result
         }
@@ -2441,7 +2441,7 @@ fn run_fuzz_one(test: &TestSpec, image: &Path) -> TestOutcome {
             let _ = std::fs::write(&serial, b"");
             let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
             let result = poll_serial(&serial, expect, fail_on,
-                                     Instant::now() + Duration::from_secs(*timeout_secs));
+                                     Instant::now() + Duration::from_secs(*timeout_secs * crate::qemu::timeout_scale()));
             qemu.kill();
             result
         }
@@ -2471,7 +2471,7 @@ fn run_fuzz_one(test: &TestSpec, image: &Path) -> TestOutcome {
             let _ = std::fs::write(&serial, b"");
             let qemu   = crate::qemu::spawn_for_test(&bad_image, 4, &serial, None);
             let result = poll_serial(&serial, expect, fail_on,
-                                     Instant::now() + Duration::from_secs(*timeout_secs));
+                                     Instant::now() + Duration::from_secs(*timeout_secs * crate::qemu::timeout_scale()));
             qemu.kill();
             result
         }
@@ -2517,7 +2517,7 @@ fn run_stress_one(test: &TestSpec, image: &Path) -> TestOutcome {
             let _ = std::fs::write(&serial, b"");
             let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
             let result = poll_serial(&serial, expect, fail_on,
-                                     Instant::now() + Duration::from_secs(*timeout_secs));
+                                     Instant::now() + Duration::from_secs(*timeout_secs * crate::qemu::timeout_scale()));
             qemu.kill();
             result
         }
@@ -2532,7 +2532,7 @@ fn run_adv_one(test: &TestSpec, image: &Path) -> TestOutcome {
             let _ = std::fs::write(&serial, b"");
             let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
             let result = poll_serial(&serial, expect, fail_on,
-                                     Instant::now() + Duration::from_secs(*timeout_secs));
+                                     Instant::now() + Duration::from_secs(*timeout_secs * crate::qemu::timeout_scale()));
             qemu.kill();
             result
         }
@@ -2547,7 +2547,7 @@ fn run_chaos_one(test: &TestSpec, image: &Path) -> TestOutcome {
             let _ = std::fs::write(&serial, b"");
             let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
             let result = poll_serial(&serial, expect, fail_on,
-                                     Instant::now() + Duration::from_secs(*timeout_secs));
+                                     Instant::now() + Duration::from_secs(*timeout_secs * crate::qemu::timeout_scale()));
             qemu.kill();
             result
         }
@@ -2556,7 +2556,7 @@ fn run_chaos_one(test: &TestSpec, image: &Path) -> TestOutcome {
             let _ = std::fs::write(&serial, b"");
             let qemu   = crate::qemu::spawn_for_test_custom(image, *smp, 512, &serial, None);
             let result = poll_serial(&serial, expect, fail_on,
-                                     Instant::now() + Duration::from_secs(*timeout_secs));
+                                     Instant::now() + Duration::from_secs(*timeout_secs * crate::qemu::timeout_scale()));
             qemu.kill();
             result
         }
@@ -2565,7 +2565,7 @@ fn run_chaos_one(test: &TestSpec, image: &Path) -> TestOutcome {
             let _ = std::fs::write(&serial, b"");
             let qemu   = crate::qemu::spawn_for_test_custom(image, *smp, *ram_mib, &serial, None);
             let result = poll_serial(&serial, expect, fail_on,
-                                     Instant::now() + Duration::from_secs(*timeout_secs));
+                                     Instant::now() + Duration::from_secs(*timeout_secs * crate::qemu::timeout_scale()));
             qemu.kill();
             result
         }
@@ -2580,7 +2580,7 @@ fn run_brutal_property_one(test: &TestSpec, image: &Path) -> TestOutcome {
             let _ = std::fs::write(&serial, b"");
             let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
             let result = poll_serial(&serial, expect, fail_on,
-                                     Instant::now() + Duration::from_secs(*timeout_secs));
+                                     Instant::now() + Duration::from_secs(*timeout_secs * crate::qemu::timeout_scale()));
             qemu.kill();
             result
         }
@@ -2595,7 +2595,7 @@ fn run_brutal_identity_one(test: &TestSpec, image: &Path) -> TestOutcome {
             let _ = std::fs::write(&serial, b"");
             let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
             let result = poll_serial(&serial, expect, fail_on,
-                                     Instant::now() + Duration::from_secs(*timeout_secs));
+                                     Instant::now() + Duration::from_secs(*timeout_secs * crate::qemu::timeout_scale()));
             qemu.kill();
             result
         }
@@ -2604,7 +2604,7 @@ fn run_brutal_identity_one(test: &TestSpec, image: &Path) -> TestOutcome {
             let _ = std::fs::write(&serial, b"");
             let qemu   = crate::qemu::spawn_for_test_custom(image, *smp, 512, &serial, None);
             let result = poll_serial(&serial, expect, fail_on,
-                                     Instant::now() + Duration::from_secs(*timeout_secs));
+                                     Instant::now() + Duration::from_secs(*timeout_secs * crate::qemu::timeout_scale()));
             qemu.kill();
             result
         }
@@ -2619,7 +2619,7 @@ fn run_brutal_fuzz_one(test: &TestSpec, image: &Path, limine_dir: &Path) -> Test
             let _ = std::fs::write(&serial, b"");
             let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
             let result = poll_serial(&serial, expect, fail_on,
-                                     Instant::now() + Duration::from_secs(*timeout_secs));
+                                     Instant::now() + Duration::from_secs(*timeout_secs * crate::qemu::timeout_scale()));
             qemu.kill();
             result
         }
@@ -2648,7 +2648,7 @@ fn run_brutal_fuzz_one(test: &TestSpec, image: &Path, limine_dir: &Path) -> Test
             let _ = std::fs::write(&serial, b"");
             let qemu   = crate::qemu::spawn_for_test(&bad_image, 4, &serial, None);
             let result = poll_serial(&serial, expect, fail_on,
-                                     Instant::now() + Duration::from_secs(*timeout_secs));
+                                     Instant::now() + Duration::from_secs(*timeout_secs * crate::qemu::timeout_scale()));
             qemu.kill();
             result
         }
@@ -2693,7 +2693,7 @@ fn run_brutal_stress_one(test: &TestSpec, image: &Path) -> TestOutcome {
             let _ = std::fs::write(&serial, b"");
             let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
             let result = poll_serial(&serial, expect, fail_on,
-                                     Instant::now() + Duration::from_secs(*timeout_secs));
+                                     Instant::now() + Duration::from_secs(*timeout_secs * crate::qemu::timeout_scale()));
             qemu.kill();
             result
         }
@@ -2708,7 +2708,7 @@ fn run_perf_one(test: &TestSpec, image: &Path) -> TestOutcome {
             let _ = std::fs::write(&serial, b"");
             let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
             let result = poll_serial(&serial, expect, fail_on,
-                                     Instant::now() + Duration::from_secs(*timeout_secs));
+                                     Instant::now() + Duration::from_secs(*timeout_secs * crate::qemu::timeout_scale()));
             qemu.kill();
             result
         }
@@ -2763,7 +2763,7 @@ fn run_chaos_brutal_one(test: &TestSpec, image: &Path) -> TestOutcome {
             let _ = std::fs::write(&serial, b"");
             let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
             let result = poll_serial(&serial, expect, fail_on,
-                                     Instant::now() + Duration::from_secs(*timeout_secs));
+                                     Instant::now() + Duration::from_secs(*timeout_secs * crate::qemu::timeout_scale()));
             qemu.kill();
             result
         }
@@ -2772,7 +2772,7 @@ fn run_chaos_brutal_one(test: &TestSpec, image: &Path) -> TestOutcome {
             let _ = std::fs::write(&serial, b"");
             let qemu   = crate::qemu::spawn_for_test_custom(image, *smp, 512, &serial, None);
             let result = poll_serial(&serial, expect, fail_on,
-                                     Instant::now() + Duration::from_secs(*timeout_secs));
+                                     Instant::now() + Duration::from_secs(*timeout_secs * crate::qemu::timeout_scale()));
             qemu.kill();
             result
         }
@@ -2781,7 +2781,7 @@ fn run_chaos_brutal_one(test: &TestSpec, image: &Path) -> TestOutcome {
             let _ = std::fs::write(&serial, b"");
             let qemu   = crate::qemu::spawn_for_test_custom(image, *smp, *ram_mib, &serial, None);
             let result = poll_serial(&serial, expect, fail_on,
-                                     Instant::now() + Duration::from_secs(*timeout_secs));
+                                     Instant::now() + Duration::from_secs(*timeout_secs * crate::qemu::timeout_scale()));
             qemu.kill();
             result
         }
@@ -2808,7 +2808,7 @@ fn run_brutal_perf_one(test: &TestSpec, image: &Path) -> TestOutcome {
             let _ = std::fs::write(&serial, b"");
             let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
             let result = poll_serial(&serial, expect, fail_on,
-                                     Instant::now() + Duration::from_secs(*timeout_secs));
+                                     Instant::now() + Duration::from_secs(*timeout_secs * crate::qemu::timeout_scale()));
             qemu.kill();
             result
         }
@@ -3000,7 +3000,7 @@ fn run_brutal_adv_one(test: &TestSpec, image: &Path) -> TestOutcome {
             let _ = std::fs::write(&serial, b"");
             let qemu   = crate::qemu::spawn_for_test(image, 4, &serial, None);
             let result = poll_serial(&serial, expect, fail_on,
-                                     Instant::now() + Duration::from_secs(*timeout_secs));
+                                     Instant::now() + Duration::from_secs(*timeout_secs * crate::qemu::timeout_scale()));
             qemu.kill();
             result
         }
