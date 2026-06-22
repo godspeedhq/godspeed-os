@@ -1,4 +1,4 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
@@ -7,7 +7,7 @@
 
 //! Memory-mapped I/O access for userspace driver services (§12, §18).
 //!
-//! This is the SDK's audited hardware-access layer — one of the two places
+//! This is the SDK's audited hardware-access layer - one of the two places
 //! outside the kernel where `unsafe` is permitted (the other being the syscall
 //! ABI, `raw_syscall`). Driver services use the safe [`Mmio`] wrapper and never
 //! write `unsafe` themselves; every volatile access below carries a SAFETY
@@ -16,7 +16,7 @@
 
 /// A mapped MMIO region granted to a driver (e.g. via
 /// [`crate::ServiceContext::xhci_mmio`]). Read/write device registers by byte
-/// offset. All accesses are volatile — never reordered or elided — and target
+/// offset. All accesses are volatile - never reordered or elided - and target
 /// the uncached device registers directly, with no kernel mediation (§12).
 #[derive(Clone, Copy)]
 pub struct Mmio {

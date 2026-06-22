@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Capability structure and validation — §7.2, §7.3, §7.5.
+//! Capability structure and validation - §7.2, §7.3, §7.5.
 
 use super::generation::Generation;
 use super::rights::Rights;
@@ -17,7 +17,7 @@ pub struct ResourceId(pub u64);
 
 /// An unforgeable capability token: `ResourceId + Rights + Generation` (§7.2).
 ///
-/// Only the kernel constructs valid capabilities (§7.3 — Unforgeable).
+/// Only the kernel constructs valid capabilities (§7.3 - Unforgeable).
 /// User-mode cannot fabricate a `Capability`; it only receives opaque handles
 /// that the kernel resolves against the per-task cap table on each syscall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +47,7 @@ impl Capability {
     /// Produce a narrowed copy of this cap for a GRANT transfer (§7.4).
     /// Panics in debug builds if `mask` would widen rights.
     pub fn narrow_for_grant(&self, mask: Rights) -> Self {
-        // Every bit in mask must already be in self.rights — no widening.
+        // Every bit in mask must already be in self.rights - no widening.
         debug_assert!(
             self.rights.narrow(mask) == mask,
             "narrow_for_grant must not widen rights"
@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn validate_subset_right_passes() {
-        // Cap has READ|WRITE; validate requires only READ — should pass.
+        // Cap has READ|WRITE; validate requires only READ - should pass.
         let cap = make_cap(Rights::READ | Rights::WRITE, 0);
         assert!(cap.validate(Rights::READ, Generation(0)).is_ok());
     }
@@ -153,7 +153,7 @@ mod tests {
             prop_assert!(cap.validate(required, Generation(gen)).is_ok());
         }
 
-        /// narrow_for_grant never widens rights — result is always a subset of original (P3).
+        /// narrow_for_grant never widens rights - result is always a subset of original (P3).
         #[test]
         fn narrow_for_grant_never_widens(
             rights_bits in 0u8..=0b0011_1111u8,

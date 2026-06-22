@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Per-core round-robin scheduler — §9.1, §9.3.
+//! Per-core round-robin scheduler - §9.1, §9.3.
 //!
 //! Each core has a static run queue of up to MAX_TASKS slots.  Tasks are
 //! pinned to cores at enqueue time and never migrate (§9.1).  The 10 ms
@@ -68,21 +68,21 @@ static mut TASK_ENDPOINT: [Option<EndpointId>; MAX_TASKS] =
 /// Timed-wake deadline (TSC cycles) for a task blocked in `recv_timeout` (§12). 0 = no
 /// timed wake. Set before the task blocks; the core-0 timer ISR scans these and wakes any
 /// blocked task whose deadline has passed (so a driver can wait on an interrupt yet still
-/// wake on a timer for auto-repeat). Wake granularity is the timer period (coarse — fine
+/// wake on a timer for auto-repeat). Wake granularity is the timer period (coarse - fine
 /// for repeat). The owning task clears its entry on every `recv_timeout` return path.
 /// Each slot's `recv_timeout` wake deadline, expressed in **BSP timer ticks** (`MONOTONIC_TICKS`),
-/// not TSC cycles — `0` = disarmed. Ticks, not cycles, because the deadline is set on the task's
+/// not TSC cycles - `0` = disarmed. Ticks, not cycles, because the deadline is set on the task's
 /// core but evaluated by core 0's scan, and AMD cores need not share a TSC (a TSC deadline set on
-/// core 1 can never be reached by core 0's TSC — this is exactly what wedged the first blocking
+/// core 1 can never be reached by core 0's TSC - this is exactly what wedged the first blocking
 /// build: the driver never woke). `MONOTONIC_TICKS` is a single counter advanced only by the BSP,
-/// so any core compares the same clock. Granularity is one quantum (~10 ms) — plenty for an I/O
+/// so any core compares the same clock. Granularity is one quantum (~10 ms) - plenty for an I/O
 /// wake. The owning task clears its entry on every `recv_timeout` return path.
 static TASK_WAKE_DEADLINE: [AtomicU64; MAX_TASKS] =
     [const { AtomicU64::new(0) }; MAX_TASKS];
 
 /// Monotonic timer-tick counter advanced once per quantum **by the BSP only** (core 0), which
 /// ticks reliably even when other cores idle. The core-independent clock the timed-wake (§12)
-/// measures deadlines against — see `TASK_WAKE_DEADLINE`. Distinct from `CORE_TOTAL_TICKS` (which
+/// measures deadlines against - see `TASK_WAKE_DEADLINE`. Distinct from `CORE_TOTAL_TICKS` (which
 /// is per-core and counts yields too).
 static MONOTONIC_TICKS: AtomicU64 = AtomicU64::new(0);
 
@@ -113,15 +113,15 @@ pub fn clear_wake_deadline(slot: usize) {
 }
 
 /// Advance the BSP tick clock and wake every task whose `recv_timeout` deadline has passed.
-/// Called from the **BSP** (core 0) timer ISR — the BSP ticks reliably even when other cores
+/// Called from the **BSP** (core 0) timer ISR - the BSP ticks reliably even when other cores
 /// idle, so it is the dependable driver of all timed wakes. Cheap: a scan of `MAX_TASKS` relaxed
 /// loads, almost all zero. Only wakes a task still `BlockedOnRecv` (one that already returned
 /// cleared its deadline; the state guard also avoids reviving one that moved on). The wake
-/// result is 0 — the woken `recv_timeout` re-checks its own deadline and returns the timeout.
+/// result is 0 - the woken `recv_timeout` re-checks its own deadline and returns the timeout.
 ///
 /// **BSP-driven, tick-clocked, by design (§9, §12).** Earlier attempts each failed on real SMP
 /// hardware (both invisible under QEMU TCG, which serialises cores and keeps TSCs in lockstep):
-/// a core-0 scan comparing a TSC deadline set on core 1 never fired (unsynchronised TSCs — the
+/// a core-0 scan comparing a TSC deadline set on core 1 never fired (unsynchronised TSCs - the
 /// driver never woke at all); a per-core scan on the task's own core fired only when that core's
 /// timer did, but an idle AP's timer is unreliable on this hardware (the driver woke, but
 /// rarely → seconds of input lag). The cure is to (1) measure deadlines in BSP **ticks** via a
@@ -228,7 +228,7 @@ static CORE_WAKE_HINT: [AtomicUsize; MAX_CORES] =
 ///
 /// When a task kills itself (CORE_CURRENT[core] == slot), RSP is still on that
 /// task's kernel stack K_a.  Freeing K_a immediately risks a concurrent alloc +
-/// crash on K_a while this core is still executing — KERNEL PF from stack
+/// crash on K_a while this core is still executing - KERNEL PF from stack
 /// corruption.  Instead, only the kstack free is deferred; the slot itself is
 /// released immediately (TASK_VALID=false) so reserve_task_slot can reuse it
 /// without the up-to-10ms slot-starvation window the zombie approach caused.
@@ -259,7 +259,7 @@ static CORE_PENDING_KSTACK_LEN: [AtomicUsize; MAX_CORES] =
 ///
 /// Fix: skip freeing the PML4 frame during the reclaim loop for self-kills;
 /// store it here and release it in drain_pending_pml4, which is called from
-/// the scheduler loop and timer tick — both run with a different CR3.
+/// the scheduler loop and timer tick - both run with a different CR3.
 ///
 /// AtomicU64 (not static mut) so reads and writes at call sites are safe.
 /// The value is always written by one core and read by the same core, so
@@ -306,7 +306,7 @@ pub fn current_core_id() -> usize {
 /// Return the calling core's ID (0-based).
 pub fn current_core() -> usize { current_core_id() }
 
-// SMP spinlock for the task-slot table — concurrent spawns on different cores
+// SMP spinlock for the task-slot table - concurrent spawns on different cores
 // (e.g. supervisor on Core 0 and a prop-p2 respawn on Core 3) both scan
 // TASK_VALID; the scan-and-set must be atomic across cores.
 static TASK_SLOT_LOCKED: AtomicBool = AtomicBool::new(false);
@@ -357,7 +357,7 @@ pub fn reserve_task_slot(core_id: u32) -> Option<usize> {
 ///
 /// Using `write_bytes(0)` avoids placing a 1 536-byte `CapTable` on the
 /// caller's kernel stack (which would corrupt the timer-interrupt return
-/// address saved at K0T-200 — the rip=0 root cause).
+/// address saved at K0T-200 - the rip=0 root cause).
 ///
 /// # Safety
 /// * `slot` must have been reserved via `reserve_task_slot`.
@@ -451,7 +451,7 @@ pub fn enqueue(
 }
 
 // ---------------------------------------------------------------------------
-// Per-task capability access — used by syscall dispatch (§8.2, §7.5).
+// Per-task capability access - used by syscall dispatch (§8.2, §7.5).
 // ---------------------------------------------------------------------------
 
 /// Validate and return a copy of the capability at `slot` in the current
@@ -519,7 +519,7 @@ pub fn current_task_remove_cap(slot: usize) -> Option<Capability> {
 
 /// Read the rights of the cap at `slot` without validating the generation.
 ///
-/// Used by `QueryCapRights` (syscall 14) — read-only, no side effects.
+/// Used by `QueryCapRights` (syscall 14) - read-only, no side effects.
 pub fn current_task_read_cap_rights(slot: usize) -> Option<Rights> {
     let cid = current_core_id();
     unsafe {
@@ -680,7 +680,7 @@ pub fn current_task_claim_alloc(size: u64) -> Option<u64> {
 
 /// Return the bytes dynamically allocated so far by the current task.
 ///
-/// Used by InspectKernel query 0 (P4 property test — §10.3).
+/// Used by InspectKernel query 0 (P4 property test - §10.3).
 pub fn current_task_alloc_bytes() -> u64 {
     let cid = current_core_id();
     // SAFETY: IF=0 in syscall context; single core reader for this slot.
@@ -715,7 +715,7 @@ pub fn task_stat(slot: usize) -> TaskStatRaw {
     }
     // SAFETY: read-only snapshot of static arrays; all reads are individually
     // naturally-atomic on x86_64 (u64/u32/pointer-width). Best-effort consistency
-    // is acceptable — same contract as for_each_active_cap.
+    // is acceptable - same contract as for_each_active_cap.
     unsafe {
         let endpoint = TASK_ENDPOINT[slot];
         let (generation, queue_depth) = match endpoint {
@@ -778,7 +778,7 @@ pub fn current_task_insert_cap(cap: Capability) -> Result<usize, CapError> {
 unsafe fn prepare_ring3_switch(core_id: usize, slot: usize) {
     // §9.1 (static placement): `pick_next` only ever returns a slot whose
     // TASK_CORE equals the running core, so a task is never resumed on a core it
-    // is not pinned to. Assert it as the executable form of the invariant — a
+    // is not pinned to. Assert it as the executable form of the invariant - a
     // mismatch here means the scheduler attempted a forbidden mid-execution
     // migration (§3.11), which is a kernel logic bug, not a recoverable state.
     crate::invariants::assertions::assert_no_mid_execution_migration(
@@ -791,8 +791,8 @@ unsafe fn prepare_ring3_switch(core_id: usize, slot: usize) {
     //
     // Both the timer ISR (via TSS.rsp0 → K0T) and the syscall path enter at the
     // top of the kstack; if the syscall chain runs there too, the timer ISR's
-    // context-switch path — which descends much deeper than once assumed: canary
-    // measurement showed it zero-writing down to ~K0T-504 — clobbers a suspended
+    // context-switch path - which descends much deeper than once assumed: canary
+    // measurement showed it zero-writing down to ~K0T-504 - clobbers a suspended
     // recv syscall's return address, causing the intermittent rip→kstack #PF.
     //
     // `ud2_syscall_entry` switches RSP to this value before calling the handler,
@@ -878,7 +878,7 @@ pub fn run(core_id: u32) -> ! {
                     crate::control::process_pending();
                 }
                 // No ready tasks; re-enable interrupts and loop.
-                // `wait_for_interrupt` issues only `sti` — no PAUSE, no HLT.
+                // `wait_for_interrupt` issues only `sti` - no PAUSE, no HLT.
                 // On Goldmont+, both are "low-power hints" that allow firmware
                 // C-state promotion, power-gating the LAPIC and dropping timer
                 // ticks and IPIs.  The compiler_fence above forces a fresh reload
@@ -961,7 +961,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                     && TASK_STATE[prev].load(Ordering::Relaxed) == TaskState::Dead as u8;
                 if is_dead {
                     CORE_CURRENT[cid].store(IDLE, Ordering::Relaxed);
-                    // Save into CORE_DEAD_CTX — not TASK_CTX[prev] — to avoid a
+                    // Save into CORE_DEAD_CTX - not TASK_CTX[prev] - to avoid a
                     // write-after-claim race if a concurrent spawn has already
                     // reserved TASK_CTX[prev] (possible now that TASK_VALID=false
                     // immediately).  CORE_DEAD_CTX is never used as a load source.
@@ -1129,7 +1129,7 @@ pub fn yield_current() {
         //   prev >= MAX_TASKS  → scheduler idle context (save to CORE_SCHED_CTX)
         //   TASK_VALID=false   → self-killed task (save to CORE_DEAD_CTX; slot
         //                        already reclaimed, TASK_CTX[prev] may be reused
-        //                        by a concurrent spawn — must not write there)
+        //                        by a concurrent spawn - must not write there)
         //   live task          → normal case (save to TASK_CTX[prev])
         // Saving a kstack RSP into CORE_SCHED_CTX would corrupt the scheduler's
         // BSP stack pointer, causing a KERNEL PF on the next scheduler resume.
@@ -1177,7 +1177,7 @@ pub fn wake_by_slot(slot: usize, result: i64) {
             //
             //   Core A loads Running, Core B loads Running.
             //   Core A's CAS(Running→Blocked) wins.
-            //   Core B's CAS(Running→Ready) fails — state is now Blocked.
+            //   Core B's CAS(Running→Ready) fails - state is now Blocked.
             //
             // Without a retry, Core B silently returns and the task stays
             // Blocked forever (confirmed on real hardware; never observed on
@@ -1261,7 +1261,7 @@ pub fn find_task_by_name(name: &str) -> Option<usize> {
 /// Free all deferred kernel stacks from a prior self-kill on this core.
 ///
 /// Safe to call from timer_tick_from_irq (IF=0, RSP on the current live task's
-/// kstack or TSS.rsp0 of the incoming timer frame — either way, NOT on any
+/// kstack or TSS.rsp0 of the incoming timer frame - either way, NOT on any
 /// pending dead kstack) and from the scheduler run() loop (RSP on the per-core
 /// BSS scheduler stack).
 ///
@@ -1314,7 +1314,7 @@ pub fn kill_task_by_slot(slot: usize) {
     // cleanup so spawn on other cores can proceed concurrently.
     task_slot_lock();
     // Lock held; exclusive access to TASK_VALID/TASK_STATE across all cores.
-    // All accesses below are atomic loads/stores — no unsafe required.
+    // All accesses below are atomic loads/stores - no unsafe required.
     let already_dead = {
         if slot >= MAX_TASKS || !TASK_VALID[slot].load(Ordering::Relaxed) {
             task_slot_unlock();
@@ -1322,7 +1322,7 @@ pub fn kill_task_by_slot(slot: usize) {
         }
         let s = TASK_STATE[slot].load(Ordering::Acquire);
         if s == TaskState::Dead as u8 {
-            // Another core is already killing this slot — bail.
+            // Another core is already killing this slot - bail.
             task_slot_unlock();
             return;
         }
@@ -1349,7 +1349,7 @@ pub fn kill_task_by_slot(slot: usize) {
             // its own slot (the task was blocked on recv of its own endpoint).
             // Calling wake_by_slot(slot, -7) would overwrite the Dead state with
             // Ready, causing the scheduler to re-animate the dying task with its
-            // freed page tables — the root cause of the use-after-free cascade.
+            // freed page tables - the root cause of the use-after-free cascade.
             if let Some(s) = rx_slot { if s != slot { wake_by_slot(s, -7); } }
             if let Some(s) = tx_slot { if s != slot { wake_by_slot(s, -7); } }
 
@@ -1361,7 +1361,7 @@ pub fn kill_task_by_slot(slot: usize) {
             // owner (e.g. `fs`, Phase D) gets a fresh endpoint id on respawn and would never
             // free the old instance's file resources, so without this they orphan in the band
             // and leak its capacity on every restart. Each is marked Dead, so a client's stale
-            // file cap fails its next use with EndpointDead — the same signal as any dead owner.
+            // file cap fails its next use with EndpointDead - the same signal as any dead owner.
             let reclaimed = crate::capability::delegated::release_owner(ep_id.0);
             if reclaimed > 0 {
                 crate::kprintln!("delegated: reclaimed {} resource(s) from dead endpoint {}",
@@ -1378,7 +1378,7 @@ pub fn kill_task_by_slot(slot: usize) {
             // Stop this name resolving to the now-dead endpoint (§14.2): unregister it from the kernel
             // directory IF it still points here (the endpoint-id guard skips a fresh instance that
             // already re-registered). The supervisor's reconcile then sees the name MISSING and
-            // respawns the service, instead of adopting a stale dead entry — the bug behind
+            // respawns the service, instead of adopting a stale dead entry - the bug behind
             // `fs`/`block-driver` staying dead after a storm killed them while the supervisor itself
             // was mid-respawn (their death-notifications were lost). Normal restarts are unaffected:
             // the service re-registers the name on respawn; clients briefly see a lookup miss and retry
@@ -1388,14 +1388,14 @@ pub fn kill_task_by_slot(slot: usize) {
 
         // Restartable-service death notification. These are restartable userspace services (not
         // trusted root): when one dies, notify the supervisor over its death-notification endpoint so
-        // it respawns the service IMMEDIATELY — its own death, not only a lucky supervisor respawn.
+        // it respawns the service IMMEDIATELY - its own death, not only a lucky supervisor respawn.
         // The set: `fs` + `block-driver` (Phase D); `shell` (the user's prompt); and the drivers
         // `xhci` / `ehci` + `logger`. Without the drivers here, a `chaos max-carnage` that killed
         // them in its last rounds left them dead until the supervisor happened to be respawned (it
-        // re-runs its boot sequence and re-spawns them) — so the keyboard could stay dead. Now their
+        // re-runs its boot sequence and re-spawns them) - so the keyboard could stay dead. Now their
         // own death respawns them. `fs` re-mounts via its journal (Phase C); clients reacquire by
-        // name via the kernel directory (§14.3). "Nothing escapes" — every service recovers; the
-        // kernel is the only unkillable thing. (`registry` was here until it was retired — Phase 4.)
+        // name via the kernel directory (§14.3). "Nothing escapes" - every service recovers; the
+        // kernel is the only unkillable thing. (`registry` was here until it was retired - Phase 4.)
         // Gated to this NAMED set so ordinary probe/app churn never floods the supervisor.
         // `enqueue_from_interrupt` is the kernel→endpoint path (no cap needed); wake the supervisor.
         if matches!(task_name, "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger") {
@@ -1411,11 +1411,11 @@ pub fn kill_task_by_slot(slot: usize) {
             }
         }
 
-        // Path C / Phase 6: the supervisor is restartable — the KERNEL is its recovery anchor (the
+        // Path C / Phase 6: the supervisor is restartable - the KERNEL is its recovery anchor (the
         // one thing that cannot die, §3.7). Flag a respawn to run from the next Core-0 control tick
         // (NOT inline: we are mid-teardown of this very task). The new instance re-registers its
         // endpoint in `ipc::names`, so death notifications re-point to it automatically, and it
-        // reconciles live services on boot. (§6.2 amended — supervisor death is no longer a panic.)
+        // reconciles live services on boot. (§6.2 amended - supervisor death is no longer a panic.)
         if task_name == "supervisor" {
             crate::kprintln!("kernel: supervisor died");
             crate::task::flag_supervisor_respawn();
@@ -1442,12 +1442,12 @@ pub fn kill_task_by_slot(slot: usize) {
         // task's cr3.  We must not free the page-table frames until that core has
         // moved on (CORE_CURRENT[c] changes to a different task), because after
         // switch_context the core is in kernel mode with the shared higher-half
-        // mappings — it will load the new cr3 next, and kernel code does not
+        // mappings - it will load the new cr3 next, and kernel code does not
         // touch user-half frames.  Bounded by one preemption quantum (~10 ms).
         //
         // We skip the calling core: either it holds a different slot (the common
         // cross-core kill path), or this is kill_current where the caller switches
-        // away immediately after returning — in both cases the skip is safe.
+        // away immediately after returning - in both cases the skip is safe.
         //
         // Send a WAKE_RECEIVER IPI to any core currently running the dead task so
         // it immediately calls yield_current → detects Dead → switches to the
@@ -1504,7 +1504,7 @@ pub fn kill_task_by_slot(slot: usize) {
         // loaded a *different* CR3 since last running this task.  A CR3 reload
         // flushes all non-global TLB entries, so no core retains stale
         // translations for this task's virtual addresses.  A separate TLB
-        // shootdown IPI would therefore be redundant — and dangerous: if a
+        // shootdown IPI would therefore be redundant - and dangerous: if a
         // remote core is mid-syscall with IF=0 (e.g. loading an ELF for a
         // concurrent spawn), it cannot ACK the IPI, causing the caller to spin
         // indefinitely (deadlock).  We skip the broadcast and rely solely on
@@ -1548,9 +1548,9 @@ pub fn kill_task_by_slot(slot: usize) {
         // Self-kill: RSP is on K_a (page-fault ISR pushed to TSS.RSP0 = K_a).
         // Freeing K_a immediately lets another core alloc K_a for a new task
         // that crashes, pushing its ISR frame to K_a while this core is still
-        // executing there — corrupting both stacks (KERNEL PF).
+        // executing there - corrupting both stacks (KERNEL PF).
         //
-        // Fix — deferred kstack only: release the slot immediately (TASK_VALID=false)
+        // Fix - deferred kstack only: release the slot immediately (TASK_VALID=false)
         // so reserve_task_slot can reuse it without the zombie 10ms starvation
         // window, but enqueue the kstack pointer for free at the next timer tick
         // or scheduler idle loop, where RSP is on a different stack.
@@ -1574,12 +1574,12 @@ pub fn kill_task_by_slot(slot: usize) {
                         CORE_PENDING_KSTACK_LEN[my_core].store(len + 1, Ordering::Relaxed);
                     } else {
                         // Queue overflow (>8 sequential self-kills): free immediately.
-                        // Bounded risk — less likely than permanently leaking the stack.
+                        // Bounded risk - less likely than permanently leaking the stack.
                         super::free_kstack(kstack);
                     }
                 }
             }
-            // Release slot now — no zombie period, no starvation.
+            // Release slot now - no zombie period, no starvation.
             task_slot_lock();
             TASK_VALID[slot].store(false, Ordering::Release);
             task_slot_unlock();
@@ -1588,7 +1588,7 @@ pub fn kill_task_by_slot(slot: usize) {
 
         // Cross-kill: free kstack immediately (RSP is on a different kstack).
         if TASK_IS_USER[slot] {
-            // SAFETY: Cross-kill — our RSP is on the supervisor's kstack, not K_a.
+            // SAFETY: Cross-kill - our RSP is on the supervisor's kstack, not K_a.
             super::free_kstack(TASK_KERNEL_STACK_TOP[slot].load(Ordering::Relaxed));
         }
 
@@ -1611,7 +1611,7 @@ pub fn kill_task_by_slot(slot: usize) {
 /// table (under its spinlock) *before* calling this function. The routing
 /// spinlock must be released *before* this call.
 /// Park the current task: block it indefinitely with no waker. Used by idle
-/// trusted-root services (init, supervisor) once their work is done — they must
+/// trusted-root services (init, supervisor) once their work is done - they must
 /// not busy-`yield`, which keeps their core off the idle (halt) path and pegs it
 /// at 100%. Parking lets the core reach the scheduler idle loop and halt (cool)
 /// where ARAT/TSC-Deadline allow it. Reuses block_and_reschedule; nothing wakes a
@@ -1717,7 +1717,7 @@ pub fn take_recv_message() -> Option<Message> {
 /// selected slot after each pick.  This guarantees every slot in [0, MAX_TASKS)
 /// is visited before the pointer wraps, preventing high-numbered slots from
 /// being permanently starved by a dense band of ready tasks at lower indices
-/// (§9.1 — no service may monopolise a core; §9.3 — yield is advisory).
+/// (§9.1 - no service may monopolise a core; §9.3 - yield is advisory).
 ///
 /// Before the RR scan, checks `CORE_WAKE_HINT`: if a task was just woken by
 /// `wake_by_slot` it is returned immediately without scanning, so a recently
@@ -1726,12 +1726,12 @@ fn pick_next(core_id: usize) -> Option<usize> {
     // Fast path: schedule the just-woken task immediately.
     let hint = CORE_WAKE_HINT[core_id].load(Ordering::Acquire);
     if hint < MAX_TASKS {
-        // Clear the hint regardless — if the slot turns out not to be
+        // Clear the hint regardless - if the slot turns out not to be
         // schedulable the RR scan below will find something else.
         CORE_WAKE_HINT[core_id].store(MAX_TASKS, Ordering::Relaxed);
         // SAFETY: hint < MAX_TASKS; TASK_VALID/TASK_STATE are AtomicBool/AtomicU8
         // arrays (no unsafe needed); TASK_CORE is static mut but read-only here
-        // after task spawn (immutable once set — see scheduler.rs §9.1 invariant).
+        // after task spawn (immutable once set - see scheduler.rs §9.1 invariant).
         let v = TASK_VALID[hint].load(Ordering::Relaxed);
         let s = TASK_STATE[hint].load(Ordering::Acquire);
         let c = unsafe { TASK_CORE[hint] };

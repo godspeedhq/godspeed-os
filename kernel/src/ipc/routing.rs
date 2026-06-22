@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Routing table: EndpointId → (CoreId, Generation, Liveness, Queue) — §8.3.
+//! Routing table: EndpointId → (CoreId, Generation, Liveness, Queue) - §8.3.
 //!
 //! Every `send` syscall consults this table to validate the target endpoint's
 //! generation and liveness before touching the queue. The generation here must
@@ -94,7 +94,7 @@ pub fn register(id: EndpointId, core_id: u32, generation: Generation) {
     let mut table = TABLE.lock();
     // Endpoint ids are reclaimed and reused (ipc::free_endpoint_id, §14.2). Prefer THIS id's own
     // (now-dead) entry, so a reused id overwrites its old slot instead of creating a *second* entry
-    // with the same id — `find_index` returns the first match, so a duplicate would be ambiguous.
+    // with the same id - `find_index` returns the first match, so a duplicate would be ambiguous.
     // Fall back to any free/dead slot for a never-seen id.
     let slot = table.iter().position(|e| e.valid && e.id == id)
         .or_else(|| table.iter().position(|e| !e.valid || e.liveness == EndpointLiveness::Dead));
@@ -117,7 +117,7 @@ pub fn register(id: EndpointId, core_id: u32, generation: Generation) {
 
 /// Return the number of endpoints currently alive in the routing table.
 ///
-/// Used by InspectKernel query 1 (P5 property test — §8.3).
+/// Used by InspectKernel query 1 (P5 property test - §8.3).
 pub fn count_live_endpoints() -> u32 {
     let table = TABLE.lock();
     table.iter()
@@ -139,17 +139,17 @@ pub fn get_generation(id: EndpointId) -> Generation {
 
 /// Try to enqueue `msg` on `endpoint`.
 ///
-/// `blocked_sender_slot`: if `Some(slot)`, this is a blocking `send` — if the
+/// `blocked_sender_slot`: if `Some(slot)`, this is a blocking `send` - if the
 /// queue is full the sender is atomically recorded as blocked (under the same
 /// lock), and the caller must immediately call `block_and_reschedule`.
 /// If `None`, behaves like `try_send`: returns `Err(QueueFull)` directly.
 ///
 /// Returns:
-/// - `Ok(Some(rx))` — blocked receiver woken; caller must call `wake_by_slot`.
-/// - `Ok(None)` — message queued; no blocked receiver.
-/// - `Err(QueueFull)` — queue full; if `blocked_sender_slot` was `Some`, the
+/// - `Ok(Some(rx))` - blocked receiver woken; caller must call `wake_by_slot`.
+/// - `Ok(None)` - message queued; no blocked receiver.
+/// - `Err(QueueFull)` - queue full; if `blocked_sender_slot` was `Some`, the
 ///   sender is now recorded as blocked and must call `block_and_reschedule`.
-/// - `Err(EndpointDead)` — dead endpoint or generation mismatch.
+/// - `Err(EndpointDead)` - dead endpoint or generation mismatch.
 pub fn enqueue(
     endpoint: EndpointId,
     msg: Message,
@@ -171,7 +171,7 @@ fn enqueue_locked(
     check_live(&table[idx], cap_gen)?;
 
     if let Some(slot) = table[idx].blocked_receiver.take() {
-        // Queue was empty; a receiver was waiting — deliver directly.
+        // Queue was empty; a receiver was waiting - deliver directly.
         table[idx].queue.enqueue(msg).ok();
         return Ok(Some(slot));
     }
@@ -193,17 +193,17 @@ fn enqueue_locked(
 
 /// Try to dequeue the oldest message from `endpoint`.
 ///
-/// `blocked_receiver_slot`: if `Some(slot)`, this is a blocking `recv` — if
+/// `blocked_receiver_slot`: if `Some(slot)`, this is a blocking `recv` - if
 /// the queue is empty the receiver is atomically recorded as blocked (under
 /// the same lock), and the caller must immediately call `block_and_reschedule`.
 /// If `None`, returns `Err(QueueEmpty)` directly.
 ///
 /// Returns:
-/// - `Ok((msg, Some(tx)))` — message dequeued; blocked sender to wake.
-/// - `Ok((msg, None))` — message dequeued; no blocked sender.
-/// - `Err(QueueEmpty)` — queue empty; if `blocked_receiver_slot` was `Some`,
+/// - `Ok((msg, Some(tx)))` - message dequeued; blocked sender to wake.
+/// - `Ok((msg, None))` - message dequeued; no blocked sender.
+/// - `Err(QueueEmpty)` - queue empty; if `blocked_receiver_slot` was `Some`,
 ///   the receiver is now recorded and must call `block_and_reschedule`.
-/// - `Err(EndpointDead)` — dead endpoint or generation mismatch.
+/// - `Err(EndpointDead)` - dead endpoint or generation mismatch.
 pub fn dequeue(
     endpoint: EndpointId,
     cap_gen: Generation,
@@ -247,7 +247,7 @@ fn dequeue_locked(
     Ok((msg, sender_slot))
 }
 
-/// Kernel-internal interrupt delivery path. No capability or generation check —
+/// Kernel-internal interrupt delivery path. No capability or generation check -
 /// the caller is the kernel IDT, not a user task holding a capability.
 ///
 /// Try-send semantics: if the queue is full the interrupt is silently discarded
@@ -291,7 +291,7 @@ pub fn endpoint_queue_depth(endpoint: EndpointId) -> u8 {
 
 /// Mark the endpoint dead: bump generation, drain queue, return blocked slots.
 ///
-/// Returns `(blocked_receiver_slot, blocked_sender_slot)` — the caller must
+/// Returns `(blocked_receiver_slot, blocked_sender_slot)` - the caller must
 /// wake both (if `Some`) with `EndpointDead` via `scheduler::wake_by_slot`.
 pub fn kill_endpoint(endpoint: EndpointId) -> (Option<usize>, Option<usize>) {
     let mut table = TABLE.lock();

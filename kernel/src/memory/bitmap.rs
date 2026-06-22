@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Bitmap allocator model for property testing — §10, §22 item 6.1.
+//! Bitmap allocator model for property testing - §10, §22 item 6.1.
 //!
 //! `TestBitmapAllocator` is a host-compilable model of `memory/allocator.rs`'s
 //! `BitmapAllocator`. It exercises the same algorithmic invariants (uniqueness,
@@ -47,7 +47,7 @@ impl TestBitmapAllocator {
     /// mirroring the real allocator's phantom-frame guard and double-free defence.
     pub fn free(&mut self, frame: usize) -> bool {
         if frame >= self.max_frames { return false; }
-        if self.free[frame] { return false; }  // already free — double-free
+        if self.free[frame] { return false; }  // already free - double-free
         self.free[frame] = true;
         self.live_count -= 1;
         true

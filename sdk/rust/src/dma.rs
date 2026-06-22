@@ -1,4 +1,4 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
@@ -16,7 +16,7 @@
 
 /// A physically-contiguous DMA arena granted to a driver (e.g. via
 /// [`crate::ServiceContext::dma_region`]). The CPU accesses it through `base`
-/// (a normal cacheable mapping — x86 DMA is cache-coherent); the device through
+/// (a normal cacheable mapping - x86 DMA is cache-coherent); the device through
 /// `phys`. Both views cover the same `len` bytes one-to-one.
 #[derive(Clone, Copy)]
 pub struct Dma {
@@ -32,7 +32,7 @@ impl Dma {
         Self { base, phys, len }
     }
 
-    /// Physical base address — program this (plus offsets) into the controller.
+    /// Physical base address - program this (plus offsets) into the controller.
     #[inline]
     pub fn phys_base(&self) -> u64 {
         self.phys

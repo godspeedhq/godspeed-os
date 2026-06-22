@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Inter-Processor Interrupts — §9.4, §8.4, §10.5.
+//! Inter-Processor Interrupts - §9.4, §8.4, §10.5.
 //!
 //! Three distinct purposes:
 //!   1. Wake a task blocked on `recv` after a cross-core `send` enqueues.
@@ -101,7 +101,7 @@ pub unsafe fn broadcast_tlb_shootdown(virt_addr: u64) {
     }
 }
 
-/// IPI handler — invoked from the IDT stub (`ipi_dispatch`) on the receiving core.
+/// IPI handler - invoked from the IDT stub (`ipi_dispatch`) on the receiving core.
 ///
 /// # Safety
 /// Called from raw interrupt context with interrupts disabled.

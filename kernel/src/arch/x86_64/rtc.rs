@@ -1,4 +1,4 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
@@ -8,8 +8,8 @@
 //! MC146818 CMOS real-time clock (§12, arch hardware boundary).
 //!
 //! Read-only wall-clock access. The RTC is a legacy device on the I/O ports
-//! 0x70 (index) / 0x71 (data); port I/O is ring-0, so — like the PIT, PIC, and
-//! serial UART — it lives in the arch layer rather than a userspace driver
+//! 0x70 (index) / 0x71 (data); port I/O is ring-0, so - like the PIT, PIC, and
+//! serial UART - it lives in the arch layer rather than a userspace driver
 //! (there is no I/O-port capability in v1, and the clock is a tiny read-only
 //! device). Userspace reads it via `InspectKernel` query 11, ungated, because
 //! the time of day is task-neutral hardware info (like the TSC clock).
@@ -21,12 +21,12 @@ const CMOS_DATA: u16 = 0x71;
 
 /// The packed wall-clock datetime captured once at boot (see `read_datetime` for the layout).
 /// 0 until `capture_boot_time` runs. `uptime` reads it via InspectKernel query 12 and subtracts
-/// it from the current time — a wall-clock delta, portable across APIC timer modes (a tick
+/// it from the current time - a wall-clock delta, portable across APIC timer modes (a tick
 /// counter's rate is not).
 static BOOT_DATETIME: AtomicU64 = AtomicU64::new(0);
 
 /// Record the current RTC time as the system's boot time. Called once early in `kernel_main`.
-/// Idempotent — only the first capture sticks (a 0 reading, i.e. no RTC, leaves uptime at 0).
+/// Idempotent - only the first capture sticks (a 0 reading, i.e. no RTC, leaves uptime at 0).
 pub fn capture_boot_time() {
     let now = read_datetime();
     let _ = BOOT_DATETIME.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
@@ -84,7 +84,7 @@ fn bcd_to_bin(v: u8) -> u8 {
 /// ```
 ///
 /// Robust against an RTC tick landing mid-read: it reads every field, reads them
-/// again, and repeats until two consecutive reads agree (the standard algorithm —
+/// again, and repeats until two consecutive reads agree (the standard algorithm -
 /// no need to disable interrupts). Decodes BCD and 12-hour mode per status
 /// register B, so the returned fields are always binary and 24-hour.
 pub fn read_datetime() -> u64 {

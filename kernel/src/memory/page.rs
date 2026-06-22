@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Virtual page type — §10.
+//! Virtual page type - §10.
 //!
 //! A `Page` is a page-aligned virtual address within a specific task's
 //! address space. The kernel never dereferences a user virtual address

@@ -1,17 +1,17 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! I/O APIC — routing legacy (pin-based, INTx) device interrupts to the local APIC (§12).
+//! I/O APIC - routing legacy (pin-based, INTx) device interrupts to the local APIC (§12).
 //!
 //! MSI-capable devices (the xHCI) deliver their interrupt straight to the LAPIC, so they
 //! need no IOAPIC. Legacy-INTx-only devices (the EHCI on the T630) assert a *level-triggered*
 //! PCI interrupt pin; the IOAPIC translates that pin (a Global System Interrupt) into a
 //! local-APIC vector. This module programs one redirection-table entry per such device and
-//! provides mask/unmask — the kernel masks a level entry while a userspace driver handles it
+//! provides mask/unmask - the kernel masks a level entry while a userspace driver handles it
 //! (so it doesn't re-fire / storm) and the driver unmasks after clearing the device's source.
 //!
 //! v1 assumes the IOAPIC at the architectural default `0xFEC00000` (true on essentially all
@@ -123,7 +123,7 @@ pub fn set_mask(gsi: u8, masked: bool) {
     }
 }
 
-/// BSP local-APIC id — the destination for level INTx routes. Captured at boot from the
+/// BSP local-APIC id - the destination for level INTx routes. Captured at boot from the
 /// Limine SMP response (`mod.rs`). `0xFF` until set; `set_redir` then falls back to 0, the
 /// BSP id on essentially all machines, so routing still works if capture is skipped.
 static BSP_LAPIC_ID: AtomicU8 = AtomicU8::new(0xFF);
@@ -142,7 +142,7 @@ pub fn bsp_lapic_id() -> u8 {
 // Level-triggered (INTx) route table: each entry binds an IDT `vector` to an IOAPIC `gsi`,
 // so the generic IRQ dispatch (`route::deliver`) can mask the source while the driver handles
 // it and the driver can unmask after acking. A *single* vector may have *several* GSI entries
-// — on a machine with no ACPI _PRT parser we route a legacy-INTx device to a candidate set of
+// - on a machine with no ACPI _PRT parser we route a legacy-INTx device to a candidate set of
 // GSIs (the real one plus the platform's PCI-INTx range) and mask/unmask the whole set, since
 // only one such device exists and the spurious entries never fire. Empty slots hold vector
 // `0xFF`. Edge MSI vectors (the xHCI's) are never registered here, so they are never masked.
@@ -174,7 +174,7 @@ pub fn mask_vector(vector: u8) {
     }
 }
 
-/// Unmask the IOAPIC source(s) for `vector` if it has level route(s) — the driver calls this
+/// Unmask the IOAPIC source(s) for `vector` if it has level route(s) - the driver calls this
 /// (via a syscall) after clearing the device's interrupt source. No-op for edge/MSI vectors.
 pub fn unmask_vector(vector: u8) {
     for i in 0..MAX_LEVEL_ROUTES {

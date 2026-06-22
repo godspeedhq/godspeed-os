@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! x86_64 four-level page table management — §10.
+//! x86_64 four-level page table management - §10.
 //!
 //! Each task gets its own CR3.  The kernel region (PML4 entries 256–511) is
 //! copied from the Limine-set-up PML4 into every new address space so that
@@ -22,7 +22,7 @@ use crate::memory::frame::{Frame, PhysAddr};
 pub const PAGE_SIZE: usize = 4096;
 
 // ---------------------------------------------------------------------------
-// HHDM offset — set once during memory::init, read-only after.
+// HHDM offset - set once during memory::init, read-only after.
 // ---------------------------------------------------------------------------
 
 static mut HHDM_OFFSET: u64 = 0;
@@ -224,7 +224,7 @@ impl PageTable {
 ///
 /// If the target PTE is already present this is a no-op (returns `Ok`).
 ///
-/// `flags` — raw PTE flag bits (e.g. PRESENT | WRITABLE | PCD | PWT for MMIO).
+/// `flags` - raw PTE flag bits (e.g. PRESENT | WRITABLE | PCD | PWT for MMIO).
 ///
 /// # Safety
 /// Must be called after `set_hhdm_offset`; `virt` and `phys` must be
@@ -259,7 +259,7 @@ const PAGE_SIZE_BIT: u64 = 1 << 7;
 
 /// Return the raw PTE (or large-page entry) currently mapping `virt` in the active
 /// page tables, or `None` if `virt` is unmapped. Walks PML4→PDPT→PD→PT and stops
-/// early at a large-page entry. Read-only — it does not modify any table. Used to
+/// early at a large-page entry. Read-only - it does not modify any table. Used to
 /// audit mapping permissions (the NX / W^X check in `boot::audit_wx`).
 pub fn entry_for_va(virt: u64) -> Option<u64> {
     let cr3: u64;
@@ -267,7 +267,7 @@ pub fn entry_for_va(virt: u64) -> Option<u64> {
     unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem)) };
     let pml4 = cr3 & !0xFFF;
 
-    // PML4 entries never map pages directly — always point to a PDPT.
+    // PML4 entries never map pages directly - always point to a PDPT.
     let pdpt = walk(pml4, pml4_idx(virt))?;
     // SAFETY: pdpt is the phys of a present PML4 entry's child table.
     let pdpt_e = unsafe { read_entry(pdpt, pdpt_idx(virt)) };
@@ -288,7 +288,7 @@ pub fn entry_for_va(virt: u64) -> Option<u64> {
 
 /// Mark the 4 KiB page mapping `virt` non-present in the active page tables, used
 /// to install kstack guard pages (hardening). Clears the PTE and invalidates the
-/// local TLB entry. The frame is NOT returned to the allocator — kstack guard
+/// local TLB entry. The frame is NOT returned to the allocator - kstack guard
 /// pages belong to the kernel image's BSS, not the frame allocator. No-op if
 /// `virt` is unmapped or mapped by a large page (the kstack BSS is 4 KiB-mapped,
 /// verified at boot).
@@ -323,9 +323,9 @@ pub unsafe fn unmap_active_4k(virt: u64) {
 }
 
 /// Unmap the low 4 KiB page of each of `count` slots laid out at `base + i*stride`
-/// — the kernel-stack guard pages (§ kstack hardening H4). Page-table manipulation
+/// - the kernel-stack guard pages (§ kstack hardening H4). Page-table manipulation
 /// is arch-layer work (§18.1), so the per-page unmap `unsafe` is contained here
-/// rather than leaking into `task/`. Safe `fn` — a **boot-ordering** contract (BSP,
+/// rather than leaking into `task/`. Safe `fn` - a **boot-ordering** contract (BSP,
 /// before APs and before any kstack alloc), the same shape as the surrounding init.
 pub fn unmap_4k_strided(base: u64, stride: u64, count: usize) {
     for i in 0..count {
@@ -339,19 +339,19 @@ pub fn unmap_4k_strided(base: u64, stride: u64, count: usize) {
 
 /// Set the NX (no-execute) bit on every present mapping in the HHDM, closing the
 /// RWX-direct-map hole (hardening H4b). Limine maps the higher-half direct map
-/// **W+X**, so every physical RAM page has an executable alias — a kernel-wide W^X
+/// **W+X**, so every physical RAM page has an executable alias - a kernel-wide W^X
 /// bypass. The kernel only ever uses the HHDM for *data* (the page-table walks
 /// above, the allocator, copying service ELFs into fresh frames); nothing executes
 /// from it (the kernel runs from its own `.text`, services from the loader's RX
 /// mappings, the AP trampoline from identity-mapped low memory). So forcing the
 /// whole HHDM `NO_EXEC` removes the executable alias without touching any code path.
 ///
-/// Walks the single PML4 entry that roots the HHDM (one entry covers 512 GiB —
+/// Walks the single PML4 entry that roots the HHDM (one entry covers 512 GiB -
 /// always enough for v1) and ORs NX into each present PDPT / PD / PT entry,
 /// handling 1 GiB and 2 MiB large pages, then reloads CR3 to flush.
 ///
 /// **Boot-ordering contract** (not a memory-safety one, so this is a safe `fn`):
-/// run on the BSP after `set_hhdm_offset` and **after `smp::init`** — Limine's AP
+/// run on the BSP after `set_hhdm_offset` and **after `smp::init`** - Limine's AP
 /// long-mode bring-up executes through the HHDM, so flipping it NX earlier wedges
 /// AP boot (a liveness bug, not UB). The genuinely-unsafe CR3 read and PTE writes
 /// stay in `unsafe {}` blocks inside.
@@ -405,7 +405,7 @@ pub fn harden_hhdm_nx() {
         }
         // Flush this core's TLB by reloading CR3. The other cores are not flushed
         // explicitly, and they do not need to be: nothing was ever *executed* from
-        // the HHDM, so no core holds an instruction-TLB entry for it — any future
+        // the HHDM, so no core holds an instruction-TLB entry for it - any future
         // execute attempt misses the I-TLB and walks the now-NX tables, faulting.
         // (Each core also flushes naturally on its next CR3-switching context
         // switch.) The data-TLB staleness this leaves is irrelevant to NX, which
@@ -446,7 +446,7 @@ fn walk_or_alloc(table_phys: u64, idx: usize, flags: u64) -> Result<u64, MapErro
     // SAFETY: table_phys valid, idx in 0..512.
     unsafe { write_entry(table_phys, idx, child_phys | flags) };
 
-    // The frame is intentionally not returned to the allocator here — page
+    // The frame is intentionally not returned to the allocator here - page
     // table frames are owned by the PageTable and freed when the whole table
     // is torn down (Milestone 5). `Frame` is `Copy`/no-Drop, so simply not
     // freeing it is the leak; an explicit `forget` would be a no-op.
@@ -466,8 +466,8 @@ bitflags::bitflags! {
         const PRESENT   = 1 << 0;
         const WRITABLE  = 1 << 1;
         const USER      = 1 << 2;
-        const PWT       = 1 << 3; // page write-through — for uncached MMIO (§12)
-        const PCD       = 1 << 4; // page cache-disable — for uncached MMIO (§12)
+        const PWT       = 1 << 3; // page write-through - for uncached MMIO (§12)
+        const PCD       = 1 << 4; // page cache-disable - for uncached MMIO (§12)
         const NO_EXEC   = 1 << 63;
     }
 }
@@ -480,7 +480,7 @@ pub enum MapError {
 }
 
 // ---------------------------------------------------------------------------
-// Frame reclaim — used at task death (§10.5).
+// Frame reclaim - used at task death (§10.5).
 // ---------------------------------------------------------------------------
 
 /// A bounded collection of physical addresses gathered during page-table teardown.
@@ -509,7 +509,7 @@ impl ReclaimBuffer {
 }
 
 /// Walk the user half (PML4 entries 0–255) of the address space rooted at
-/// `cr3` and collect every physical frame address into a `ReclaimBuffer` —
+/// `cr3` and collect every physical frame address into a `ReclaimBuffer` -
 /// both leaf data frames and intermediate page-table frames.
 ///
 /// The kernel half (entries 256–511) is shared across all address spaces and

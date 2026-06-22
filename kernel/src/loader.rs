@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! ELF64 service loader — §14.1.
+//! ELF64 service loader - §14.1.
 //!
 //! Parses ELF64 PT_LOAD segments from a flat byte slice (embedded in the
 //! kernel via `include_bytes!(env!("SVC_*_ELF"))`) and maps each segment into
@@ -73,7 +73,7 @@ struct Elf64Phdr {
 
 /// Copy `size_of::<Elf64Ehdr>()` bytes from the start of `bytes` into a local
 /// `Elf64Ehdr`.  After this call every field access is a safe copy out of a
-/// local value — no unaligned pointer dereferences at the call site.
+/// local value - no unaligned pointer dereferences at the call site.
 ///
 /// Caller must guarantee `bytes.len() >= size_of::<Elf64Ehdr>()`.
 fn read_ehdr(bytes: &[u8]) -> Elf64Ehdr {
@@ -185,14 +185,14 @@ pub fn load(bytes: &[u8]) -> Result<LoadedElf, LoadError> {
         // Derive page flags from ELF segment flags, ENFORCING W^X (hardening H4a):
         // a page is executable only if its segment is executable AND not writable.
         // The loader enforces the invariant rather than mirroring the ELF, so a
-        // W+X segment is forced NO_EXEC (and the anomaly logged) — a malformed or
+        // W+X segment is forced NO_EXEC (and the anomaly logged) - a malformed or
         // hostile binary cannot obtain a writable-executable mapping.
         let mut flags = PageFlags::PRESENT | PageFlags::USER;
         if crate::elf_flags::segment_writable(p_flags) { flags |= PageFlags::WRITABLE; }
         if crate::elf_flags::segment_no_exec(p_flags)  { flags |= PageFlags::NO_EXEC;  }
         if crate::elf_flags::segment_is_wx(p_flags) {
             crate::kprintln!(
-                "loader: W^X — segment p_flags={:#x} was W+X, forced NO_EXEC", p_flags);
+                "loader: W^X - segment p_flags={:#x} was W+X, forced NO_EXEC", p_flags);
         }
 
         // Map full page-aligned VA range covering [p_vaddr .. p_vaddr + p_memsz).
@@ -208,7 +208,7 @@ pub fn load(bytes: &[u8]) -> Result<LoadedElf, LoadError> {
             // SAFETY: phys from allocator; HHDM is set up before load() is called.
             unsafe {
                 let dst = (get_hhdm_offset() + phys) as *mut u8;
-                // Zero first — this covers BSS (memsz > filesz) for free.
+                // Zero first - this covers BSS (memsz > filesz) for free.
                 core::ptr::write_bytes(dst, 0, PAGE_SIZE);
             }
 
@@ -238,7 +238,7 @@ pub fn load(bytes: &[u8]) -> Result<LoadedElf, LoadError> {
 
             // Frame ownership passes to the page table; freed at task death
             // (Phase 5). `Frame` is `Copy`/no-Drop, so there is nothing to
-            // release here — not freeing it is the leak.
+            // release here - not freeing it is the leak.
             va += PAGE_SIZE as u64;
         }
     }
@@ -247,7 +247,7 @@ pub fn load(bytes: &[u8]) -> Result<LoadedElf, LoadError> {
 }
 
 // ---------------------------------------------------------------------------
-// ELF-loader fuzz — §22 Fuzz F3.  Compiled only with `--features test-bad-elf`.
+// ELF-loader fuzz - §22 Fuzz F3.  Compiled only with `--features test-bad-elf`.
 // ---------------------------------------------------------------------------
 
 /// Run 77 malformed-ELF inputs through `load()`, assert no kernel panic,
@@ -359,7 +359,7 @@ pub fn run_elf_fuzz() -> ! {
     crate::arch::x86_64::halt_all_cores()
 }
 
-/// Brutal ELF loader fuzz — Milestone 17 BF3.
+/// Brutal ELF loader fuzz - Milestone 17 BF3.
 ///
 /// Runs the same 13 specific bad-input cases as `run_elf_fuzz`, then adds
 /// 200 xorshift-random single-byte mutations (vs. 64 sequential flips) and

@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Per-task physical memory ownership tracking — §10.
+//! Per-task physical memory ownership tracking - §10.
 //!
 //! Every frame allocated for a task is recorded here. On task death the kernel
 //! walks this set, issues a TLB shootdown (§10.5), then returns all frames to
@@ -65,7 +65,7 @@ pub enum AllocError {
 }
 
 // Placeholder: a real implementation would use a fixed-capacity array or
-// a slab-allocated linked list — no heap allocator exists yet.
+// a slab-allocated linked list - no heap allocator exists yet.
 struct FrameSet {
     frames: [Option<Frame>; 4096],
     len: usize,

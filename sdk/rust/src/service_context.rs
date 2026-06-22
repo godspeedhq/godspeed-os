@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! ServiceContext — entry-point type handed to every service's `service_main`.
+//! ServiceContext - entry-point type handed to every service's `service_main`.
 //!
 //! Provides safe, named access to the capabilities the service declared in its
 //! contract. Capability names match the contract field names exactly.
@@ -98,7 +98,7 @@ struct ServiceContextData {
 }
 
 // ---------------------------------------------------------------------------
-// Dynamic send-cap cache — updated by `reacquire_cap` after EndpointDead.
+// Dynamic send-cap cache - updated by `reacquire_cap` after EndpointDead.
 // Safe: each service is a single-threaded process with its own BSS.
 // ---------------------------------------------------------------------------
 
@@ -121,7 +121,7 @@ static mut SEND_CAP_CACHE: [CacheEntry; CACHE_SIZE] =
     [const { CacheEntry::empty() }; CACHE_SIZE];
 
 // ---------------------------------------------------------------------------
-// TaskStat — returned by ServiceContext::task_stat.
+// TaskStat - returned by ServiceContext::task_stat.
 // ---------------------------------------------------------------------------
 
 /// Snapshot of kernel task state for a single scheduler slot.
@@ -181,7 +181,7 @@ pub struct CapInfo {
 }
 
 // ---------------------------------------------------------------------------
-// AllocError — returned by ServiceContext::alloc_mem.
+// AllocError - returned by ServiceContext::alloc_mem.
 // ---------------------------------------------------------------------------
 
 /// Error from the AllocMem syscall (6).
@@ -331,7 +331,7 @@ impl ServiceContext {
     /// the core can halt while parked, so a poll/wait loop does not busy-`yield` (which pegs the
     /// core at ~100% and makes every task on it read as fully busy in `observe`). Like `yield`,
     /// needs no capability. Granularity is one scheduler quantum (~10 ms). Use for UI repaint
-    /// pacing and "wait for child" loops — not for precise timing.
+    /// pacing and "wait for child" loops - not for precise timing.
     pub fn sleep(&self, cycles: u64) {
         // SAFETY: syscall(37) = Sleep; sleeping your own task is unprivileged (like yield).
         let _ = unsafe { raw_syscall(37, cycles, 0, 0) };
@@ -423,7 +423,7 @@ impl ServiceContext {
     /// Announce this service to the `registry` under `name` (H11). Derives a
     /// `SEND|GRANT` copy of our self-endpoint cap and grants it to the registry, which
     /// records `name → cap` and later hands SEND copies to clients that look the name
-    /// up. Idempotent — call again to re-register (e.g. after a registry restart).
+    /// up. Idempotent - call again to re-register (e.g. after a registry restart).
     /// Requires a `registry` send-peer and a self endpoint. Returns `true` on send.
     pub fn register(&self, name: &str) -> bool {
         let reg = match self.find_send_slot("registry") {
@@ -449,20 +449,20 @@ impl ServiceContext {
     /// services are cut over (Phase 5).
     pub fn registry_lookup(&self, name: &str) -> Option<CapHandle> {
         let self_grant = self.self_grant_handle()?;
-        // A SEND|GRANT copy of our own endpoint cap — the registry replies here.
+        // A SEND|GRANT copy of our own endpoint cap - the registry replies here.
         let reply_cap = self.derive_cap(self_grant)?;
         let req = registry_request(REGISTRY_OP_LOOKUP, name);
 
         // Send the lookup to the registry. Our cached `registry` cap can be stale if the
-        // registry itself has restarted (H11) — and the registry is the one name a client
+        // registry itself has restarted (H11) - and the registry is the one name a client
         // cannot resolve *through* the registry (you can't look the namer up in the namer).
         // So on a failed send, reacquire a fresh `registry` SEND cap from the **kernel name
-        // table** (syscall 10 — the bootstrap exception) and retry once. The send only fails
+        // table** (syscall 10 - the bootstrap exception) and retry once. The send only fails
         // here on a dead endpoint cap, which leaves `reply_cap` untouched (the kernel
         // validates the endpoint cap before the embedded grant), so reusing it is leak-free.
         // NOTE (stopgap): this is the one place a client falls back to the kernel name path;
         // all other reacquisition still goes through the userspace registry. The planned
-        // "move naming to the supervisor" work removes this exception — see docs.
+        // "move naming to the supervisor" work removes this exception - see docs.
         let mut reg = CapHandle(self.find_send_slot("registry")?);
         if self.send_with_cap_by_handle(reg, reply_cap, &req).is_err() {
             reg = self.reacquire_cap("registry").ok()?;
@@ -479,8 +479,8 @@ impl ServiceContext {
     }
 
     /// Send a request to a named `peer` and block for its reply (synchronous
-    /// request/response). Embeds a per-request reply cap — a `SEND|GRANT` copy of
-    /// this service's own endpoint cap — so the server can reply via
+    /// request/response). Embeds a per-request reply cap - a `SEND|GRANT` copy of
+    /// this service's own endpoint cap - so the server can reply via
     /// `take_pending_cap()` + `send_by_handle()` (the registry pattern, §8). The
     /// caller must own an endpoint and not have other traffic racing the reply.
     /// `None` if the peer is unknown, the cap cannot be derived, or the send fails.
@@ -497,12 +497,12 @@ impl ServiceContext {
     }
 
     /// Like `request_with_reply`, but the wait for the reply is **bounded** by `max_secs` of
-    /// **wall-clock** time (the RTC). Returns `None` on timeout — so a peer that dies *after*
+    /// **wall-clock** time (the RTC). Returns `None` on timeout - so a peer that dies *after*
     /// receiving the request but *before* replying cannot block the caller forever (the blocking
-    /// `recv` in `request_with_reply` would hang). Use it when the peer may be unstable — e.g.
+    /// `recv` in `request_with_reply` would hang). Use it when the peer may be unstable - e.g.
     /// writing a report to `fs` right after a chaos storm hammered `fs` + its `block-driver`.
     ///
-    /// Uses the RTC (not a TSC-cycle deadline) deliberately: a cycle bound is not portable — under
+    /// Uses the RTC (not a TSC-cycle deadline) deliberately: a cycle bound is not portable - under
     /// QEMU's TCG the guest TSC races ahead and expires the deadline before the reply arrives, while
     /// the RTC is real wall-clock on both TCG and hardware. Polls `try_recv`, yielding cooperatively.
     pub fn request_with_reply_deadline(
@@ -519,7 +519,7 @@ impl ServiceContext {
         loop {
             if let Some(r) = self.try_recv() { return Some(r); }
             if self.datetime().epoch_secs() - t0 >= max_secs {
-                self.remove_cap(reply_cap);   // reply never consumed — reclaim its slot
+                self.remove_cap(reply_cap);   // reply never consumed - reclaim its slot
                 return None;
             }
             self.yield_cpu();
@@ -528,7 +528,7 @@ impl ServiceContext {
 
     /// Reacquire a fresh SEND cap to `peer` and point the named-peer cache at it, so subsequent
     /// `try_send(peer)` / `send(peer)` use the new cap. Returns `false` if `peer` cannot currently
-    /// be resolved (e.g. it has not finished respawning) — the caller should retry on a later tick.
+    /// be resolved (e.g. it has not finished respawning) - the caller should retry on a later tick.
     ///
     /// **Path C (Phase 4):** this now resolves via the **kernel name-directory** (syscall 10,
     /// `reacquire_cap`) rather than the registry *service*. The directory is populated synchronously
@@ -541,7 +541,7 @@ impl ServiceContext {
 
     /// Handle to this service's `SEND|GRANT` cap to its **own** endpoint, minted at
     /// spawn (H11). The service announces itself to the registry by deriving a copy
-    /// (`derive_cap`) and granting it across — keeping this original so it can
+    /// (`derive_cap`) and granting it across - keeping this original so it can
     /// re-register after a registry restart. `None` if the service has no endpoint.
     pub fn self_grant_handle(&self) -> Option<crate::capability::CapHandle> {
         let slot = Self::ctx().self_grant_slot;
@@ -575,12 +575,12 @@ impl ServiceContext {
     ///
     /// The send-peer cap (which must carry the `GRANT` right) is transferred to
     /// the receiver. On success the calling service loses that cap (§7.6).
-    /// Returns `CapNotGrantable` if the cap lacks `GRANT` — the cap is kept.
+    /// Returns `CapNotGrantable` if the cap lacks `GRANT` - the cap is kept.
     pub fn send_with_cap(&self, peer: &str, msg: &crate::ipc::Message) -> Result<(), crate::ipc::IpcError> {
         let slot = self.find_send_slot(peer)
             .ok_or(crate::ipc::IpcError::CapError(crate::capability::CapError::CapNotHeld))?;
         // syscall 11 = SendWithCap
-        // arg0 = (grant_slot << 16) | endpoint_slot — same slot holds both SEND and GRANT.
+        // arg0 = (grant_slot << 16) | endpoint_slot - same slot holds both SEND and GRANT.
         let packed  = ((slot as u64) << 16) | (slot as u64);
         let payload = msg.payload_bytes();
         // SAFETY: syscall(11) = SendWithCap; packed and payload are from user space.
@@ -679,7 +679,7 @@ impl ServiceContext {
 
     /// The wall-clock datetime captured by the kernel at **boot** (InspectKernel query 12, ungated).
     /// Same packed layout as `datetime`. Pairs with `datetime` to compute uptime as a wall-clock
-    /// delta — portable across timer modes (a tick counter's rate is not: periodic-mode QEMU ticks
+    /// delta - portable across timer modes (a tick counter's rate is not: periodic-mode QEMU ticks
     /// at ~10 Hz, TSC-deadline HW at 100 Hz). Returns the epoch (all-zero fields) if not captured.
     pub fn boot_datetime(&self) -> Datetime {
         // SAFETY: syscall(13) = InspectKernel; query_id=12 = packed boot datetime.
@@ -725,7 +725,7 @@ impl ServiceContext {
     /// there is no framebuffer. The console service uses this to lay out its
     /// terminal (pin the input line to the bottom row).
     ///
-    /// Wraps InspectKernel query 9 (ambient — screen geometry is task-neutral).
+    /// Wraps InspectKernel query 9 (ambient - screen geometry is task-neutral).
     pub fn console_dims(&self) -> (u16, u16) {
         // SAFETY: syscall(13) = InspectKernel; query_id=9 = packed (rows<<16)|cols.
         let ret = unsafe { raw_syscall(13, 9, 0, 0) };
@@ -746,7 +746,7 @@ impl ServiceContext {
     }
 
     /// Report that input-subsystem setup is complete (syscall 27). Called by the
-    /// USB keyboard driver (xHCI) in every terminal path once it has finished — the
+    /// USB keyboard driver (xHCI) in every terminal path once it has finished - the
     /// end-of-boot signal. Requires the CONSOLE_PUSH cap (the input driver only).
     pub fn signal_input_ready(&self) {
         let slot = Self::ctx().console_push_slot;
@@ -767,7 +767,7 @@ impl ServiceContext {
 
     /// Read the hardware real-time clock (wall-clock date/time) via the kernel.
     ///
-    /// Ambient — the time of day is task-neutral hardware info, like the TSC.
+    /// Ambient - the time of day is task-neutral hardware info, like the TSC.
     /// Wraps InspectKernel query 11; the kernel returns the fields packed into a
     /// `u64` (see `kernel/src/arch/x86_64/rtc.rs`), which this unpacks.
     pub fn datetime(&self) -> Datetime {
@@ -826,7 +826,7 @@ impl ServiceContext {
 
     /// List the capabilities held by the task in `slot`, into `out`. Returns the
     /// number of entries written (capped at `out.len()` and 64). Requires the
-    /// INTROSPECT cap. Best-effort snapshot — see [`task_stat`](Self::task_stat).
+    /// INTROSPECT cap. Best-effort snapshot - see [`task_stat`](Self::task_stat).
     pub fn task_caps(&self, slot: u32, out: &mut [CapInfo]) -> usize {
         const ENTRY: usize = 16;
         const MAX: usize = 64;
@@ -879,7 +879,7 @@ impl ServiceContext {
     /// Send a message to `endpoint` with cap `grant` embedded.
     ///
     /// Unlike `send_with_cap` (which looks up a peer by name), this takes
-    /// explicit handles — used by P3 where the endpoint and grant slot are
+    /// explicit handles - used by P3 where the endpoint and grant slot are
     /// the same (self-referential cap transfer).  On success the grant cap is
     /// removed from the caller's table (§7.6).
     pub fn send_with_cap_by_handle(
@@ -912,9 +912,9 @@ impl ServiceContext {
         if ret < 0 { None } else { Some((id, CapHandle(ret as u32))) }
     }
 
-    /// Use a delegated resource cap (§7.10) — the "send" of file-as-capability. The kernel
+    /// Use a delegated resource cap (§7.10) - the "send" of file-as-capability. The kernel
     /// validates the cap holds `right` (a read needs `RIGHT_READ`, a write needs `RIGHT_WRITE`;
-    /// a cap lacking it fails `CapInsufficientRights` — the non-escalation check), then routes
+    /// a cap lacking it fails `CapInsufficientRights` - the non-escalation check), then routes
     /// `msg` to the owning service badged with the resource id + the validated right, embedding
     /// `reply` (a SEND|GRANT cap) so the owner can reply. `Ok(())` on delivery. Syscall 31.
     pub fn resource_invoke(&self, file: CapHandle, right: u8, reply: CapHandle, msg: &Message)
@@ -933,7 +933,7 @@ impl ServiceContext {
     /// service that owns delegated resources (e.g. `fs`) calls this right after `recv`: `Some((
     /// resource_id, right))` means the message was a **kernel-validated** invocation of a real
     /// cap on `resource_id` with `right` already checked (the owner enforces op ≤ `right`); `None`
-    /// means an ordinary message (no badge — handle it on the name-addressed path). The badge
+    /// means an ordinary message (no badge - handle it on the name-addressed path). The badge
     /// cannot be forged over a plain `send`, so its presence is trustworthy. Syscall 33.
     pub fn last_recv_badge(&self) -> Option<(u64, u8)> {
         // SAFETY: syscall(33) = LastRecvBadge; reads+clears this task's stored badge.
@@ -996,8 +996,8 @@ impl ServiceContext {
     }
 
     /// Enable (`true`) or disable (`false`) console keystroke echo (syscall 25).
-    /// A foreground full-screen app disables echo while it owns the screen — so
-    /// its raw key polls do not smear its frame — and re-enables it on exit.
+    /// A foreground full-screen app disables echo while it owns the screen - so
+    /// its raw key polls do not smear its frame - and re-enables it on exit.
     /// Requires the CONSOLE_READ cap.
     pub fn console_echo(&self, on: bool) {
         let data = Self::ctx();
@@ -1039,7 +1039,7 @@ impl ServiceContext {
 
     /// Safe MMIO handle for this service's EHCI controller, if one was granted
     /// (§12). Reads the same kernel-mapped controller-BAR window as
-    /// [`xhci_mmio`](Self::xhci_mmio) — a driver service holds exactly one
+    /// [`xhci_mmio`](Self::xhci_mmio) - a driver service holds exactly one
     /// controller, so the field is shared and unambiguous. `None` for non-drivers.
     pub fn ehci_mmio(&self) -> Option<crate::mmio::Mmio> {
         let va = Self::ctx().xhci_mmio_va;
@@ -1051,7 +1051,7 @@ impl ServiceContext {
     }
 
     /// Safe MMIO handle to this service's device register window, if one was
-    /// granted (§12) — the neutrally-named accessor for non-USB drivers (e.g. the
+    /// granted (§12) - the neutrally-named accessor for non-USB drivers (e.g. the
     /// AHCI `block-driver`, which maps its HBA ABAR here). Same kernel-mapped
     /// window as [`xhci_mmio`](Self::xhci_mmio). `None` for non-driver services.
     pub fn mmio(&self) -> Option<crate::mmio::Mmio> {
@@ -1109,7 +1109,7 @@ impl ServiceContext {
         // DIAGNOSTIC: ud2 fires if syscall returns (SYSCALL no-op on this hw).
         // "EXCEPTION: #UD" at RIP after syscall → SYSCALL fell through.
         // "KERNEL PANIC" → SYSCALL dispatched correctly; ud2 never reached.
-        // SAFETY: noreturn; ud2 is intentional — catches SYSCALL fallthrough.
+        // SAFETY: noreturn; ud2 is intentional - catches SYSCALL fallthrough.
         unsafe { core::arch::asm!("ud2", options(noreturn)) }
     }
 
@@ -1130,7 +1130,7 @@ impl ServiceContext {
     }
 
     /// Park this task forever: block with no waker. For idle services that have
-    /// no further work (init, supervisor) — far better than `loop { yield_cpu() }`,
+    /// no further work (init, supervisor) - far better than `loop { yield_cpu() }`,
     /// which keeps the core busy and prevents it from halting (so it never runs
     /// cool). Nothing wakes a parked task in v1; the loop re-parks defensively.
     pub fn park(&self) -> ! {
@@ -1193,7 +1193,7 @@ impl ServiceContext {
     /// WITHOUT a trailing newline (syscall 23, requires log_write cap in Stage 1).
     /// This is the user-facing path: the shell prompt, command results, and
     /// `observe` frames. Unlike `log`/`print` (now serial-only), this also reaches
-    /// the framebuffer/TV — the interactive surface (see docs/console-service.md).
+    /// the framebuffer/TV - the interactive surface (see docs/console-service.md).
     pub fn console_write(&self, msg: &str) {
         let data = Self::ctx();
         if data.magic != SERVICE_CTX_MAGIC { return; }
@@ -1245,7 +1245,7 @@ impl ServiceContext {
     }
 
     /// Write one console line. When `clear_eol` is true the line ends with
-    /// `ESC[K` (erase to end of line) before the newline — so a full-screen app
+    /// `ESC[K` (erase to end of line) before the newline - so a full-screen app
     /// repainting in place (cursor homed each frame) overwrites a previous,
     /// longer line without leaving stale characters, and without a full-screen
     /// clear (no flicker). When false, behaves exactly like `console_writeln`.
@@ -1295,7 +1295,7 @@ impl ServiceContext {
     /// Spawn `name` on `core` (0xFFFF = round-robin) and receive a `SEND|GRANT` cap to its recv
     /// endpoint. This is the Phase-0 seam for moving naming out of the kernel
     /// (`docs/naming-design.md`): a spawner (the supervisor) collects a cap to every service it
-    /// starts — a userspace `name → cap` map — instead of the kernel resolving names. Requires the
+    /// starts - a userspace `name → cap` map - instead of the kernel resolving names. Requires the
     /// SPAWN cap. `None` if the cap is not held, the spawn failed, or the service has no recv
     /// endpoint to hand back. The old name-wiring path is unchanged; this is purely additive.
     pub fn spawn_returning_endpoint(&self, name: &str, core: u32) -> Option<CapHandle> {
@@ -1353,7 +1353,7 @@ impl ServiceContext {
 
     /// Spawn `producer` and delegate it a SEND cap to `sink`'s endpoint
     /// (`producer | sink`). `sink` must already be spawned. Requires the spawn
-    /// capability — held only by the shell/supervisor.
+    /// capability - held only by the shell/supervisor.
     pub fn spawn_pipe(&self, producer: &str, sink: &str) -> Result<(), crate::Error> {
         self.spawn_pipe_on(producer, sink, 0xFFFF)
     }

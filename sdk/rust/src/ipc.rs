@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! IPC syscall wrappers — §8.2.
+//! IPC syscall wrappers - §8.2.
 //!
 //! Typed wrappers so service code cannot accidentally call the wrong syscall
 //! number or pass a malformed message size.
@@ -54,7 +54,7 @@ pub enum IpcError {
 // IPC syscall wrappers.
 // ---------------------------------------------------------------------------
 
-/// Block until a message is available on `endpoint`. (§8.2 — `recv`)
+/// Block until a message is available on `endpoint`. (§8.2 - `recv`)
 ///
 /// Passes a stack-allocated receive buffer to the kernel; the kernel copies the
 /// message payload there and returns the number of bytes written.
@@ -77,7 +77,7 @@ pub fn recv(endpoint: CapHandle) -> Result<Message, IpcError> {
 }
 
 /// Non-blocking `recv`: return `Ok(None)` immediately if the endpoint queue is empty,
-/// `Ok(Some(msg))` if a message was waiting. (syscall 34 — `try_recv`) Lets a busy-polling
+/// `Ok(Some(msg))` if a message was waiting. (syscall 34 - `try_recv`) Lets a busy-polling
 /// driver drain interrupt events (§12) without giving up its loop.
 pub fn try_recv(endpoint: CapHandle) -> Result<Option<Message>, IpcError> {
     const TRY_RECV_EMPTY: i64 = -1000; // kernel sentinel for an empty queue
@@ -102,8 +102,8 @@ pub fn try_recv(endpoint: CapHandle) -> Result<Option<Message>, IpcError> {
 
 /// Blocking `recv` with a timeout in TSC cycles: `Ok(Some(msg))` on a message, `Ok(None)`
 /// on timeout, `Err` on a real error. `timeout_cycles == 0` blocks forever (like `recv`).
-/// (syscall 35 — `recv_timeout`) Lets a driver idle on its interrupt yet still wake on a
-/// timer (e.g. for keyboard auto-repeat while a key is held — §12).
+/// (syscall 35 - `recv_timeout`) Lets a driver idle on its interrupt yet still wake on a
+/// timer (e.g. for keyboard auto-repeat while a key is held - §12).
 pub fn recv_timeout(endpoint: CapHandle, timeout_cycles: u64) -> Result<Option<Message>, IpcError> {
     const RECV_TIMED_OUT: i64 = -1001; // kernel sentinel for "timed out, no message"
     let mut payload = [0u8; MAX_PAYLOAD];
@@ -120,7 +120,7 @@ pub fn recv_timeout(endpoint: CapHandle, timeout_cycles: u64) -> Result<Option<M
     }
 }
 
-/// Send a message to `endpoint`; block if the queue is full. (§8.2 — `send`)
+/// Send a message to `endpoint`; block if the queue is full. (§8.2 - `send`)
 pub fn send(endpoint: CapHandle, msg: &Message) -> Result<(), IpcError> {
     let payload = msg.payload_bytes();
     // SAFETY: raw_syscall(1) = Send; payload is a valid slice within user space.
@@ -135,7 +135,7 @@ pub fn send(endpoint: CapHandle, msg: &Message) -> Result<(), IpcError> {
     if ret == 0 { Ok(()) } else { Err(i64_to_ipc_error(ret)) }
 }
 
-/// Send without blocking; return `QueueFull` immediately. (§8.2 — `try_send`)
+/// Send without blocking; return `QueueFull` immediately. (§8.2 - `try_send`)
 pub fn try_send(endpoint: CapHandle, msg: &Message) -> Result<(), IpcError> {
     let payload = msg.payload_bytes();
     // SAFETY: raw_syscall(3) = TrySend; payload is a valid slice within user space.

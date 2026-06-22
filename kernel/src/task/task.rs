@@ -1,17 +1,17 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Task structure — §9, §14.1.
+//! Task structure - §9, §14.1.
 //!
 //! A task is the kernel's unit of execution. It has:
 //!   - Its own virtual address space (page table root).
 //!   - A capability table populated from its service contract at spawn.
 //!   - A saved context for context switching.
-//!   - A fixed core assignment (never migrates — §9.1).
+//!   - A fixed core assignment (never migrates - §9.1).
 
 use crate::arch::x86_64::context_switch::TaskContext;
 use crate::arch::x86_64::page_tables::PageTable;

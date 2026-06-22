@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Hardware interrupt routing to userspace driver services — §12.
+//! Hardware interrupt routing to userspace driver services - §12.
 //!
 //! The kernel IDT invokes `deliver(irq)` for every hardware IRQ. This module
 //! looks up the registered driver endpoint for that IRQ and delivers the
@@ -73,7 +73,7 @@ pub unsafe fn deliver(irq: u8) {
         }
         // If queue full: interrupt silently discarded; driver is overloaded (§12).
     }
-    // EOI must fire unconditionally — even on discard and even on full queue.
+    // EOI must fire unconditionally - even on discard and even on full queue.
     // If the APIC is not re-armed here, the IRQ line stays masked and the system hangs.
     crate::arch::x86_64::interrupts::send_eoi();
 }

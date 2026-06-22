@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Task management — §9, §14.
+//! Task management - §9, §14.
 
 pub mod scheduler;
 pub mod state;
@@ -27,7 +27,7 @@ use crate::memory::allocator::alloc_frame;
 use crate::memory::frame::PhysAddr;
 
 // ---------------------------------------------------------------------------
-// Kernel stack pool — one 64 KiB stack per ring-3 task (§14.1).
+// Kernel stack pool - one 64 KiB stack per ring-3 task (§14.1).
 // ---------------------------------------------------------------------------
 
 const TASK_KSTACK_MAX: usize = 224; // raised from 208 to accommodate Milestone 20 brutal adversarial probes
@@ -35,7 +35,7 @@ const KSTACK_SIZE:     usize = 64 * 1024; // usable stack per slot (unchanged)
 const KSTACK_GUARD:    usize = 4096;      // unmapped guard page below each slot
 const KSTACK_STRIDE:   usize = KSTACK_SIZE + KSTACK_GUARD; // 68 KiB per slot
 
-// Page-aligned (4 KiB) so each slot starts on a page boundary — required for the
+// Page-aligned (4 KiB) so each slot starts on a page boundary - required for the
 // per-slot guard page (`install_kstack_guards`). Each slot is a 4 KiB guard page
 // followed by 64 KiB of usable stack; usable size is unchanged, the guard is extra.
 #[repr(C, align(4096))]
@@ -64,19 +64,19 @@ pub fn kstack_pool_base() -> u64 {
 /// low 4 KiB page of each 68 KiB slot is unmapped; the 64 KiB usable stack sits
 /// above it. A kernel-stack overflow grows down from the top, past the 64 KiB of
 /// usable space, and faults loudly on the unmapped guard instead of silently
-/// corrupting the slot below — the structural cause of the kstack-overlap bug.
+/// corrupting the slot below - the structural cause of the kstack-overlap bug.
 /// Usable size is unchanged (64 KiB); the guard is extra space, so no legitimate
 /// deep path can false-positive.
 ///
 /// **Boot-ordering contract** (not a memory-safety one, so this is a safe `fn`):
 /// run once on the BSP after `memory::init` (page tables live) and **before APs
-/// start and before the first kstack is allocated** — so only the BSP has a TLB
+/// start and before the first kstack is allocated** - so only the BSP has a TLB
 /// (no shootdown needed) and `init`'s stack already carries its guard. Calling it
 /// out of order wedges boot; it is not UB. Same shape as `memory::init`/`smp::init`.
 pub fn install_kstack_guards() {
     let base = kstack_pool_base();
     debug_assert!(base & (PAGE_SIZE as u64 - 1) == 0, "kstack pool not page-aligned");
-    // Page-table work lives in the arch layer (§18.1) — no `unsafe` here.
+    // Page-table work lives in the arch layer (§18.1) - no `unsafe` here.
     crate::arch::x86_64::page_tables::unmap_4k_strided(
         base, KSTACK_STRIDE as u64, TASK_KSTACK_MAX);
     // Verify: slot 0's guard is now unmapped, its usable second page still mapped.
@@ -120,7 +120,7 @@ pub fn free_kstack(kstack_top: u64) {
     // top = base + (idx + 1) * KSTACK_STRIDE  →  idx = (top - base) / KSTACK_STRIDE - 1
     if kstack_top <= base { return; }
     let offset = kstack_top - base;
-    if offset % KSTACK_STRIDE as u64 != 0 { return; } // misaligned top — ignore
+    if offset % KSTACK_STRIDE as u64 != 0 { return; } // misaligned top - ignore
     let idx_plus_one = offset / KSTACK_STRIDE as u64;
     if idx_plus_one == 0 || idx_plus_one > TASK_KSTACK_MAX as u64 { return; }
     let idx = (idx_plus_one - 1) as usize;
@@ -128,7 +128,7 @@ pub fn free_kstack(kstack_top: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// ServiceContextData page — written by kernel, read by SDK (§SDK).
+// ServiceContextData page - written by kernel, read by SDK (§SDK).
 //
 // Layout is fixed and MUST match `ServiceContextData` in
 // `sdk/rust/src/service_context.rs`.
@@ -138,14 +138,14 @@ pub const SERVICE_CTX_VA:    u64 = 0x3ff000;
 pub const SERVICE_CTX_MAGIC: u32 = 0xD0_5D_EA_D5;
 
 /// VA where the xHCI controller's MMIO BAR is mapped into the driver's address
-/// space (§12). 4 GiB — well above the user stack (0x8000_0000) and ctx page.
+/// space (§12). 4 GiB - well above the user stack (0x8000_0000) and ctx page.
 pub const XHCI_MMIO_VA:    u64 = 0x1_0000_0000;
-/// Pages of MMIO to map for the xHCI BAR (64 KiB — cap/op/runtime/doorbell regs).
+/// Pages of MMIO to map for the xHCI BAR (64 KiB - cap/op/runtime/doorbell regs).
 const XHCI_MMIO_PAGES:     u64 = 16;
 
 /// Master switch for IOMMU confinement of the USB drivers (H1).
 ///
-/// `true`  → xHCI is handed off (BIOS→OS) + confined: the proven flagship — a
+/// `true`  → xHCI is handed off (BIOS→OS) + confined: the proven flagship - a
 ///           confined front-port keyboard types on hardware. EHCI stays in
 ///           passthrough (controller stale-pointer quirk, docs/iommu.md).
 /// `false` → no handoff, no confinement. Counter-intuitively this does NOT
@@ -159,7 +159,7 @@ const XHCI_MMIO_PAGES:     u64 = 16;
 /// this branch is parked, well-characterised future work.
 ///
 /// SETTLED 2026-06-11: EHCI's regression is the IOMMU being enabled, not the xHCI
-/// handoff — with the handoff off and EHCI in passthrough, enabling the IOMMU
+/// handoff - with the handoff off and EHCI in passthrough, enabling the IOMMU
 /// still breaks it (works only on main, IOMMU off). So back to `true`: the
 /// flagship (confined xHCI keyboard) is the best the branch can do; EHCI cannot
 /// run while the IOMMU is on, by current evidence.
@@ -171,10 +171,10 @@ pub const XHCI_DMA_VA:     u64 = 0x2_0000_0000;
 /// hold the control structures (command/event rings, DCBAA, ERST, per-device
 /// slices, plus the scratchpad buffer array at page 15); the remaining 256 pages
 /// are the scratchpad buffers the controller DMAs into (real AMD xHCI reports
-/// MaxScratchpadBufs=256 — 1 MiB — and malfunctions without them). Confined
+/// MaxScratchpadBufs=256 - 1 MiB - and malfunctions without them). Confined
 /// identity-mapped, so the device reaches all of it (§12, H1).
 const XHCI_DMA_PAGES:      u64 = 16 + 256;
-/// Pages of contiguous DMA memory for the **EHCI** driver — 64 KiB, as on main.
+/// Pages of contiguous DMA memory for the **EHCI** driver - 64 KiB, as on main.
 /// EHCI has no scratchpad concept, and its driver zeroes the whole arena on every
 /// control transfer; giving it the xHCI-sized 1 MiB arena (a leftover of sharing
 /// one constant) regressed back-port enumeration. Keep it small and separate.
@@ -217,7 +217,7 @@ struct ServiceContextData {
     core_id:            u32,
     probe_mode:         u32,
     console_read_slot:  u32, // u32::MAX = not present; slot index if service has console_read cap
-    xhci_mmio_va:       u64, // 0 = not mapped; else VA of the driver's controller BAR — xHCI or EHCI (§12)
+    xhci_mmio_va:       u64, // 0 = not mapped; else VA of the driver's controller BAR - xHCI or EHCI (§12)
     xhci_dma_va:        u64, // 0 = none; else VA of the driver's DMA arena (§12)
     xhci_dma_phys:      u64, // physical base of the DMA arena (programmed into the device)
     xhci_dma_len:       u64, // length of the DMA arena in bytes
@@ -232,7 +232,7 @@ struct ServiceContextData {
 // ---------------------------------------------------------------------------
 
 const USER_STACK_TOP:   u64 = 0x8000_0000;
-const USER_STACK_PAGES: u64 = 64; // 256 KiB — enough for pf_handler running on user stack
+const USER_STACK_PAGES: u64 = 64; // 256 KiB - enough for pf_handler running on user stack
 const USER_STACK_BASE:  u64 = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE as u64;
 
 // ---------------------------------------------------------------------------
@@ -247,7 +247,7 @@ pub enum SpawnError {
     CapTableFull,
     NotFound,
     /// A live task with this name already exists. Refused to avoid duplicate
-    /// instances — in particular a second trusted-root service (§6.2).
+    /// instances - in particular a second trusted-root service (§6.2).
     AlreadyRunning,
 }
 
@@ -262,7 +262,7 @@ impl From<crate::loader::LoadError> for SpawnError {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Registry ELF — conditionally replaced for §22 Test 1B.
+// Registry ELF - conditionally replaced for §22 Test 1B.
 // When the kernel is built with --features test-bad-supervisor, the supervisor binary is two
 // garbage bytes that fail ELF loading, so `init` observes a spawn error and calls Abort (syscall 9)
 // → kernel panic (§6.2). This is §22 Test 1B (TCB-failure-panics). It targeted `registry` until the
@@ -276,7 +276,7 @@ const SUPERVISOR_ELF: &[u8] = include_bytes!(env!("SVC_SUPERVISOR_ELF"));
 
 /// The one shared probe ELF. Every probe/test-driver service uses this exact
 /// reference, so the spawn path can identify "is a probe" by pointer identity
-/// (`elf_bytes` == `PROBE_ELF`) — used to mint the service_control cap for the
+/// (`elf_bytes` == `PROBE_ELF`) - used to mint the service_control cap for the
 /// test drivers without enumerating every probe name. A single const guarantees
 /// the pointer compares equal; separate `include_bytes!` sites would not.
 const PROBE_ELF: &[u8] = include_bytes!(env!("SVC_PROBE_ELF"));
@@ -316,7 +316,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // (registry service config removed — retired in Path C / Phase 4; the kernel name-directory
+        // (registry service config removed - retired in Path C / Phase 4; the kernel name-directory
         //  is the namer now.)
         "logger" => Some(("logger", ServiceConfig {
             elf:               include_bytes!(env!("SVC_LOGGER_ELF")),
@@ -333,7 +333,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             elf:               include_bytes!(env!("SVC_PING_ELF")),
             has_recv_endpoint: true,
             // ping reaches pong (name-wired here, or supervisor-provided); it reacquires pong by
-            // name via the kernel directory on EndpointDead (Path C — no `registry` peer).
+            // name via the kernel directory on EndpointDead (Path C - no `registry` peer).
             send_peers:        &["pong"],
             send_peers_grant:  false,
             preferred_core:    0,
@@ -354,9 +354,9 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         // ----------------------------------------------------------------
-        // greet / upper — capability-mediated pipe demo (Appendix D.3).
+        // greet / upper - capability-mediated pipe demo (Appendix D.3).
         // `upper` recvs and uppercases each line. `greet` has NO static send
-        // authority (send_peers empty) — the shell delegates it a SEND cap to
+        // authority (send_peers empty) - the shell delegates it a SEND cap to
         // upper's endpoint at spawn, which becomes its send_peers[0]. Authority
         // is granted at composition time, not held by contract.
         // ----------------------------------------------------------------
@@ -364,7 +364,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             elf:               include_bytes!(env!("SVC_UPPER_ELF")),
             has_recv_endpoint: true,
             // A pipe SINK is recorded in the kernel name-directory at spawn; the shell resolves its
-            // endpoint by name at runtime (`builtin | service`, `acquire_send_grant_cap`) — no
+            // endpoint by name at runtime (`builtin | service`, `acquire_send_grant_cap`) - no
             // contracted cap, no `registry` peer (Path C).
             send_peers:        &[],
             send_peers_grant:  false,
@@ -385,7 +385,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // roster — record-producing pipe demo (docs/records.md): emits a typed Table as JSON
+        // roster - record-producing pipe demo (docs/records.md): emits a typed Table as JSON
         // through the shell-delegated SEND cap. Same zero-ambient-authority shape as greet.
         "roster" => Some(("roster", ServiceConfig {
             elf:               include_bytes!(env!("SVC_ROSTER_ELF")),
@@ -398,7 +398,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // xhci — USB host-controller driver (§12). Receives its controller's
+        // xhci - USB host-controller driver (§12). Receives its controller's
         // MMIO BAR (mapped by name in the spawn path) + later its IRQ. Trusted
         // userspace driver. has_recv_endpoint for future interrupt delivery.
         "xhci" => Some(("xhci", ServiceConfig {
@@ -416,9 +416,9 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[0x28],
             has_console_read:  false,
         })),
-        // `ehci` — userspace USB 2.0 driver (§12) for the back ports' EHCI controller. Same
+        // `ehci` - userspace USB 2.0 driver (§12) for the back ports' EHCI controller. Same
         // shape as `xhci`; the kernel grants its MMIO/DMA at spawn (E1b+). Busy-polls on core 1
-        // (alongside xHCI) — the model that worked flawlessly. The EHCI's legacy INTx can't drive
+        // (alongside xHCI) - the model that worked flawlessly. The EHCI's legacy INTx can't drive
         // a block-and-wake loop on this hardware (deliver() fired zero times once the driver
         // blocked across many T630 flashes), and the CPU-reduction attempts introduced quirks, so
         // both USB drivers are back on plain busy-poll. Core 1 runs hot; reclaiming that idle is
@@ -436,7 +436,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[0x29],
             has_console_read:  false,
         })),
-        // `block-driver` — userspace ATA PIO disk driver (persistence, v2; §6.3,
+        // `block-driver` - userspace ATA PIO disk driver (persistence, v2; §6.3,
         // docs/persistence.md). The kernel grants its ATA port window by name in
         // the spawn path (6a-pio); no MMIO, no DMA, no IRQ wired yet (polled).
         // Phase 1 reads sector 0 and logs it. Pinned to core 1, off the shell/TCB.
@@ -451,7 +451,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // `fs` — userspace filesystem (persistence, v2; §15, docs/persistence.md).
+        // `fs` - userspace filesystem (persistence, v2; §15, docs/persistence.md).
         // Phase 1: mounts by reading the superblock (LBA 0) from `block-driver`
         // over IPC and validating its magic. Spawned AFTER block-driver (its
         // send-peer cap wires from the kernel name table at spawn). Core 1.
@@ -467,7 +467,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         // ----------------------------------------------------------------
-        // Probe services — §22 Group A identity tests.
+        // Probe services - §22 Group A identity tests.
         // All use the same probe ELF; probe_mode selects the test behaviour.
         // Spawn ordering in supervisor: recv-endpoint services first, then
         // senders that need SEND caps wired to them.
@@ -478,7 +478,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    0,
-            probe_mode:        1, // MODE_ECHO_RECV — Test 3A
+            probe_mode:        1, // MODE_ECHO_RECV - Test 3A
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -489,7 +489,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    0,
-            probe_mode:        0, // MODE_PASSIVE — killed by probe-4a in Test 4A
+            probe_mode:        0, // MODE_PASSIVE - killed by probe-4a in Test 4A
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -500,7 +500,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    0,
-            probe_mode:        0, // MODE_PASSIVE — killed by harness in Test 4B
+            probe_mode:        0, // MODE_PASSIVE - killed by harness in Test 4B
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -511,7 +511,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    0,
-            probe_mode:        3, // MODE_NO_SEND_RIGHT — Test 3B
+            probe_mode:        3, // MODE_NO_SEND_RIGHT - Test 3B
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -522,7 +522,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &["probe-recv"],
             send_peers_grant:  false,
             preferred_core:    0,
-            probe_mode:        2, // MODE_ECHO_SEND — Test 3A
+            probe_mode:        2, // MODE_ECHO_SEND - Test 3A
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -533,7 +533,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &["probe-victim"],
             send_peers_grant:  false,
             preferred_core:    0,
-            probe_mode:        4, // MODE_SEND_AFTER_KILL — Test 4A
+            probe_mode:        4, // MODE_SEND_AFTER_KILL - Test 4A
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -544,7 +544,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &["probe-4b-recv"],
             send_peers_grant:  false,
             preferred_core:    0,
-            probe_mode:        5, // MODE_FILL_AND_BLOCK — Test 4B
+            probe_mode:        5, // MODE_FILL_AND_BLOCK - Test 4B
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -555,7 +555,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    0,
-            probe_mode:        6, // MODE_YIELD_LOGGER — Test 8A
+            probe_mode:        6, // MODE_YIELD_LOGGER - Test 8A
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -566,7 +566,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    0,
-            probe_mode:        7, // MODE_HOG — Test 8B (preemption proven via ping)
+            probe_mode:        7, // MODE_HOG - Test 8B (preemption proven via ping)
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -577,13 +577,13 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    0,
-            probe_mode:        8, // MODE_CAP_FORGE — Test 9B
+            probe_mode:        8, // MODE_CAP_FORGE - Test 9B
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
         })),
         // ----------------------------------------------------------------
-        // Cap-transfer probes — §22 Tests 5A and 5B.
+        // Cap-transfer probes - §22 Tests 5A and 5B.
         // probe-5a-recv must be spawned before probe-5a-send and probe-5b-send
         // so its endpoint is registered before sender caps are wired.
         // ----------------------------------------------------------------
@@ -593,7 +593,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    0,
-            probe_mode:        9, // MODE_GRANT_RECV — Test 5A receiver
+            probe_mode:        9, // MODE_GRANT_RECV - Test 5A receiver
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -604,7 +604,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &["probe-5a-recv"],
             send_peers_grant:  true,  // mints SEND|GRANT cap to probe-5a-recv
             preferred_core:    0,
-            probe_mode:        10, // MODE_GRANT_SEND — Test 5A sender
+            probe_mode:        10, // MODE_GRANT_SEND - Test 5A sender
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -613,15 +613,15 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             elf:               PROBE_ELF,
             has_recv_endpoint: false,
             send_peers:        &["probe-5a-recv"],
-            send_peers_grant:  false, // SEND only — no GRANT right; should return CapNotGrantable
+            send_peers_grant:  false, // SEND only - no GRANT right; should return CapNotGrantable
             preferred_core:    0,
-            probe_mode:        11, // MODE_NO_GRANT_SEND — Test 5B negative
+            probe_mode:        11, // MODE_NO_GRANT_SEND - Test 5B negative
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
         })),
         // ----------------------------------------------------------------
-        // Memory-limit probes — §22 Tests 7A and 7B.
+        // Memory-limit probes - §22 Tests 7A and 7B.
         // ----------------------------------------------------------------
         "probe-7a" => Some(("probe-7a", ServiceConfig {
             elf:               PROBE_ELF,
@@ -629,7 +629,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    0,
-            probe_mode:        12, // MODE_ALLOC_OK — Test 7A
+            probe_mode:        12, // MODE_ALLOC_OK - Test 7A
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -640,13 +640,13 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    0,
-            probe_mode:        13, // MODE_ALLOC_LIMIT — Test 7B
+            probe_mode:        13, // MODE_ALLOC_LIMIT - Test 7B
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
         })),
         // ----------------------------------------------------------------
-        // Interrupt-routing probe — §22 Tests IR1A (§12.2, §12.3).
+        // Interrupt-routing probe - §22 Tests IR1A (§12.2, §12.3).
         // hw_irqs registers IRQ 33 to probe-11a's recv endpoint at spawn.
         // ----------------------------------------------------------------
         "probe-11a" => Some(("probe-11a", ServiceConfig {
@@ -655,13 +655,13 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX, // round-robin
-            probe_mode:        160, // MODE_IRQ_RECV — Test IR1A
+            probe_mode:        160, // MODE_IRQ_RECV - Test IR1A
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[33],
             has_console_read:  false,
         })),
         // ----------------------------------------------------------------
-        // Property-test probes — Milestone 9 Phase 1.
+        // Property-test probes - Milestone 9 Phase 1.
         // prop-p9-victim must be listed (and spawned) before prop-p9 so its
         // endpoint is in the name registry when prop-p9's SEND caps are wired.
         // ----------------------------------------------------------------
@@ -671,7 +671,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    0,
-            probe_mode:        0,  // MODE_PASSIVE — killed by prop-p9
+            probe_mode:        0,  // MODE_PASSIVE - killed by prop-p9
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -690,7 +690,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         "prop-p9" => Some(("prop-p9", ServiceConfig {
             elf:               PROBE_ELF,
             has_recv_endpoint: false,
-            // Three SEND caps to the same endpoint — proves all cap slots are
+            // Three SEND caps to the same endpoint - proves all cap slots are
             // invalidated on endpoint death, not just the first (§7.5).
             send_peers:        &["prop-p9-victim", "prop-p9-victim", "prop-p9-victim"],
             send_peers_grant:  false,
@@ -712,17 +712,17 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         // ----------------------------------------------------------------
-        // Property-test probes — Milestone 9 Phase 2.
+        // Property-test probes - Milestone 9 Phase 2.
         // ----------------------------------------------------------------
         // P2: generation monotonic. prop-p2-victim must be listed before prop-p2.
-        // prop-p2 pinned to Core 3 — away from P8 (Core 1) and P6 (Core 2).
+        // prop-p2 pinned to Core 3 - away from P8 (Core 1) and P6 (Core 2).
         "prop-p2-victim" => Some(("prop-p2-victim", ServiceConfig {
             elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
-            probe_mode:        0,  // MODE_PASSIVE — killed/respawned by prop-p2
+            probe_mode:        0,  // MODE_PASSIVE - killed/respawned by prop-p2
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -751,7 +751,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         // P6: queue invariants. Self-referential: sends to own endpoint.
-        // Pinned to Core 2 — away from the P2 (Core 3) and P8 (Core 1) kill/spawn
+        // Pinned to Core 2 - away from the P2 (Core 3) and P8 (Core 1) kill/spawn
         // controllers whose long spawn syscalls would starve P6 of CPU time.
         "prop-p6" => Some(("prop-p6", ServiceConfig {
             elf:               PROBE_ELF,
@@ -773,7 +773,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
-            probe_mode:        0,  // MODE_PASSIVE — killed/respawned by prop-p8
+            probe_mode:        0,  // MODE_PASSIVE - killed/respawned by prop-p8
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -790,7 +790,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         // ----------------------------------------------------------------
-        // Property-test probes — Milestone 9 Phase 3.
+        // Property-test probes - Milestone 9 Phase 3.
         // ----------------------------------------------------------------
         // P4: memory accounting. No victim needed.
         "prop-p4" => Some(("prop-p4", ServiceConfig {
@@ -811,7 +811,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
-            probe_mode:        0,  // MODE_PASSIVE — killed/respawned by prop-p5
+            probe_mode:        0,  // MODE_PASSIVE - killed/respawned by prop-p5
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -834,7 +834,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
-            probe_mode:        0,  // MODE_PASSIVE — killed/respawned by prop-p7
+            probe_mode:        0,  // MODE_PASSIVE - killed/respawned by prop-p7
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -851,7 +851,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         // ----------------------------------------------------------------
-        // Brutal property test probes — Milestone 16.
+        // Brutal property test probes - Milestone 16.
         // 10 escalated-iteration variants of P1–P10, each with its own victim
         // where the original property needed one.  Victims before controllers.
         // ----------------------------------------------------------------
@@ -890,7 +890,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // BP3: cap rights never widen — 10k iterations (self-referential, like P3).
+        // BP3: cap rights never widen - 10k iterations (self-referential, like P3).
         "prop-bp3" => Some(("prop-bp3", ServiceConfig {
             elf:               PROBE_ELF,
             has_recv_endpoint: true,
@@ -902,7 +902,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // BP4: alloc accounting exact — 2k iterations.
+        // BP4: alloc accounting exact - 2k iterations.
         "prop-bp4" => Some(("prop-bp4", ServiceConfig {
             elf:               PROBE_ELF,
             has_recv_endpoint: false,
@@ -914,7 +914,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // BP5: endpoint ownership — 150 kill/respawn cycles.
+        // BP5: endpoint ownership - 150 kill/respawn cycles.
         "prop-bp5-victim" => Some(("prop-bp5-victim", ServiceConfig {
             elf:               PROBE_ELF,
             has_recv_endpoint: true,
@@ -937,7 +937,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // BP6: queue invariants — 2k iterations (self-referential, like P6).
+        // BP6: queue invariants - 2k iterations (self-referential, like P6).
         "prop-bp6" => Some(("prop-bp6", ServiceConfig {
             elf:               PROBE_ELF,
             has_recv_endpoint: true,
@@ -949,7 +949,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // BP7: TLB shootdown proxy — 150 kill/respawn cycles.
+        // BP7: TLB shootdown proxy - 150 kill/respawn cycles.
         "prop-bp7-victim" => Some(("prop-bp7-victim", ServiceConfig {
             elf:               PROBE_ELF,
             has_recv_endpoint: true,
@@ -972,7 +972,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // BP8: restart + higher-generation liveness — 20 iterations.
+        // BP8: restart + higher-generation liveness - 20 iterations.
         "prop-bp8-victim" => Some(("prop-bp8-victim", ServiceConfig {
             elf:               PROBE_ELF,
             has_recv_endpoint: true,
@@ -1018,7 +1018,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // BP10: every send returns a defined outcome — 100k iterations.
+        // BP10: every send returns a defined outcome - 100k iterations.
         "prop-bp10" => Some(("prop-bp10", ServiceConfig {
             elf:               PROBE_ELF,
             has_recv_endpoint: false,
@@ -1031,7 +1031,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         // ----------------------------------------------------------------
-        // Fuzz-test probes — Milestone 10.
+        // Fuzz-test probes - Milestone 10.
         // Recv-endpoint victims must be listed before their fuzz controllers.
         // ----------------------------------------------------------------
         "fuzz-f1" => Some(("fuzz-f1", ServiceConfig {
@@ -1056,14 +1056,14 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // F5: IPC message body fuzzing — recv target first.
+        // F5: IPC message body fuzzing - recv target first.
         "fuzz-f5-recv" => Some(("fuzz-f5-recv", ServiceConfig {
             elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
-            probe_mode:        0, // PASSIVE — soaks up random messages
+            probe_mode:        0, // PASSIVE - soaks up random messages
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -1079,14 +1079,14 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // F6: embedded cap fuzzing — recv target first.
+        // F6: embedded cap fuzzing - recv target first.
         "fuzz-f6-recv" => Some(("fuzz-f6-recv", ServiceConfig {
             elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
-            probe_mode:        0, // PASSIVE — receives (or rejects) cap-embedded messages
+            probe_mode:        0, // PASSIVE - receives (or rejects) cap-embedded messages
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -1102,14 +1102,14 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // F7: stale cap / generation fuzzing — victim first.
+        // F7: stale cap / generation fuzzing - victim first.
         "fuzz-f7-victim" => Some(("fuzz-f7-victim", ServiceConfig {
             elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
-            probe_mode:        0, // PASSIVE — killed/respawned by fuzz-f7
+            probe_mode:        0, // PASSIVE - killed/respawned by fuzz-f7
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -1125,7 +1125,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // F8: memory request size fuzzing — no peers needed.
+        // F8: memory request size fuzzing - no peers needed.
         "fuzz-f8" => Some(("fuzz-f8", ServiceConfig {
             elf:               PROBE_ELF,
             has_recv_endpoint: false,
@@ -1138,7 +1138,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         // ----------------------------------------------------------------
-        // Brutal fuzz test probes — Milestone 17.
+        // Brutal fuzz test probes - Milestone 17.
         // Victims/recv-endpoints before controllers.
         // ----------------------------------------------------------------
         "fuzz-bf5-recv" => Some(("fuzz-bf5-recv", ServiceConfig {
@@ -1158,7 +1158,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &["fuzz-bf5-recv"],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
-            probe_mode:        116, // FUZZ_BF5: random IPC bodies — 5k sends
+            probe_mode:        116, // FUZZ_BF5: random IPC bodies - 5k sends
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -1180,7 +1180,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &["fuzz-bf6-recv"],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
-            probe_mode:        117, // FUZZ_BF6: random cap slots — 5k SendWithCap
+            probe_mode:        117, // FUZZ_BF6: random cap slots - 5k SendWithCap
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -1191,7 +1191,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
-            probe_mode:        0, // passive recv — killed/respawned by fuzz-bf7
+            probe_mode:        0, // passive recv - killed/respawned by fuzz-bf7
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -1202,7 +1202,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &["fuzz-bf7-victim"],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
-            probe_mode:        118, // FUZZ_BF7: stale cap — 200 kill/respawn cycles
+            probe_mode:        118, // FUZZ_BF7: stale cap - 200 kill/respawn cycles
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -1213,7 +1213,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
-            probe_mode:        114, // FUZZ_BF1: syscall args — 500 × 10 calls
+            probe_mode:        114, // FUZZ_BF1: syscall args - 500 × 10 calls
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -1224,7 +1224,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
-            probe_mode:        115, // FUZZ_BF2: syscall numbers — 200k random
+            probe_mode:        115, // FUZZ_BF2: syscall numbers - 200k random
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -1235,13 +1235,13 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
-            probe_mode:        119, // FUZZ_BF8: memory sizes — 10 edge + 5k random
+            probe_mode:        119, // FUZZ_BF8: memory sizes - 10 edge + 5k random
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
         })),
         // ----------------------------------------------------------------
-        // Stress-test probes — Milestone 11 Phase 1.
+        // Stress-test probes - Milestone 11 Phase 1.
         // Recv-endpoint victims must be listed before their controllers.
         // ----------------------------------------------------------------
         // S1: IPC saturation. Receiver is passive (never drains).
@@ -1251,7 +1251,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
-            probe_mode:        0, // PASSIVE — queue fills; stress-s1 measures saturation
+            probe_mode:        0, // PASSIVE - queue fills; stress-s1 measures saturation
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -1274,7 +1274,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
-            probe_mode:        0, // PASSIVE — killed/respawned by stress-s2
+            probe_mode:        0, // PASSIVE - killed/respawned by stress-s2
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -1351,7 +1351,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // (reg-roundtrip probe removed — the registry service is retired, Path C / Phase 4.)
+        // (reg-roundtrip probe removed - the registry service is retired, Path C / Phase 4.)
         "stress-s3-recv" => Some(("stress-s3-recv", ServiceConfig {
             elf:               PROBE_ELF,
             has_recv_endpoint: true,
@@ -1381,7 +1381,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
-            probe_mode:        0, // PASSIVE — killed/respawned by stress-s4
+            probe_mode:        0, // PASSIVE - killed/respawned by stress-s4
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -1389,7 +1389,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         "stress-s4" => Some(("stress-s4", ServiceConfig {
             elf:               PROBE_ELF,
             has_recv_endpoint: false,
-            // Two SEND caps to the same endpoint — both must die on one kill (§7.5).
+            // Two SEND caps to the same endpoint - both must die on one kill (§7.5).
             send_peers:        &["stress-s4-victim", "stress-s4-victim"],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
@@ -1417,7 +1417,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    1, // cross-core: coordinator on 0 kills victim on 1
-            probe_mode:        0, // PASSIVE — killed by stress-s10
+            probe_mode:        0, // PASSIVE - killed by stress-s10
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -1425,7 +1425,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         "stress-s10" => Some(("stress-s10", ServiceConfig {
             elf:               PROBE_ELF,
             has_recv_endpoint: false,
-            // Three SEND caps to the same endpoint — all must die on one kill (§7.5, §8.6).
+            // Three SEND caps to the same endpoint - all must die on one kill (§7.5, §8.6).
             send_peers:        &["stress-s10-victim", "stress-s10-victim", "stress-s10-victim"],
             send_peers_grant:  false,
             preferred_core:    0, // cross-core: coordinator on 0, victim on 1
@@ -1441,7 +1441,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
-            probe_mode:        0, // PASSIVE — killed by stress-s5
+            probe_mode:        0, // PASSIVE - killed by stress-s5
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -1481,13 +1481,13 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // S9: Cross-core IPI storm — receiver on core 2; two senders on cores 0 and 1
+        // S9: Cross-core IPI storm - receiver on core 2; two senders on cores 0 and 1
         "stress-s9-recv" => Some(("stress-s9-recv", ServiceConfig {
             elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
-            preferred_core:    2, // core 2 — distinct from s3/s10 cross-core pairs on cores 0-1
+            preferred_core:    2, // core 2 - distinct from s3/s10 cross-core pairs on cores 0-1
             probe_mode:        51, // STRESS_S9_RECV: drain 1000 messages
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
@@ -1516,7 +1516,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         // ----------------------------------------------------------------
-        // Brutal stress-test probes — Milestone 18.
+        // Brutal stress-test probes - Milestone 18.
         // Ordering: recv-endpoint victims before controllers; receivers before senders.
         // ----------------------------------------------------------------
         // BS1: IPC saturation, 5× S1.
@@ -1526,7 +1526,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
-            probe_mode:        0, // PASSIVE — queue fills; bs1 measures saturation
+            probe_mode:        0, // PASSIVE - queue fills; bs1 measures saturation
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -1728,7 +1728,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         // ----------------------------------------------------------------
-        // Performance-benchmark probes — Milestone 12.
+        // Performance-benchmark probes - Milestone 12.
         // Sender services are spawned before their echo/recv partners so
         // their endpoints are registered when echo partners wire SEND caps.
         // ----------------------------------------------------------------
@@ -1809,7 +1809,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
-            probe_mode:        0, // PASSIVE — killed/respawned by perf-b5
+            probe_mode:        0, // PASSIVE - killed/respawned by perf-b5
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -1886,7 +1886,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         // ----------------------------------------------------------------
-        // Brutal performance-benchmark probes — Milestone 19 (5× iteration counts).
+        // Brutal performance-benchmark probes - Milestone 19 (5× iteration counts).
         // Sender/controller spawned before echo/recv so endpoints register first.
         // ----------------------------------------------------------------
         "perf-bp1" => Some(("perf-bp1", ServiceConfig {
@@ -1965,7 +1965,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
-            probe_mode:        0, // PASSIVE — killed/respawned by perf-bp5
+            probe_mode:        0, // PASSIVE - killed/respawned by perf-bp5
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -2041,7 +2041,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         // ----------------------------------------------------------------
-        // Adversarial-test probes — Milestone 13.
+        // Adversarial-test probes - Milestone 13.
         // Victim/passive services must be listed before their attackers so
         // their endpoints are registered when the attacker's SEND caps are wired.
         // ----------------------------------------------------------------
@@ -2077,7 +2077,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
             probe_mode:        82, // ADV_A3: alloc edge cases under 4 MiB cap
-            memory_limit:      4 * 1024 * 1024, // 4 MiB — tight limit for the test
+            memory_limit:      4 * 1024 * 1024, // 4 MiB - tight limit for the test
             hw_irqs:           &[],
             has_console_read:  false,
         })),
@@ -2093,14 +2093,14 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // A5: TOCTOU — victim must be registered before attacker's SEND cap is wired.
+        // A5: TOCTOU - victim must be registered before attacker's SEND cap is wired.
         "adv-a5-victim" => Some(("adv-a5-victim", ServiceConfig {
             elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
-            probe_mode:        0, // MODE_PASSIVE — killed by adv-a5
+            probe_mode:        0, // MODE_PASSIVE - killed by adv-a5
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -2128,14 +2128,14 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // A7: timing probe — passive recv target must be registered before sender.
+        // A7: timing probe - passive recv target must be registered before sender.
         "adv-a7-recv" => Some(("adv-a7-recv", ServiceConfig {
             elf:               PROBE_ELF,
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
-            probe_mode:        0, // MODE_PASSIVE — absorbs timing probe messages
+            probe_mode:        0, // MODE_PASSIVE - absorbs timing probe messages
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -2198,7 +2198,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // A11: introspection gated — TaskStat denied without INTROSPECT cap (§3.1).
+        // A11: introspection gated - TaskStat denied without INTROSPECT cap (§3.1).
         // Name matches no introspect grant, so adv-a11 holds no introspect cap.
         "adv-a11" => Some(("adv-a11", ServiceConfig {
             elf:               PROBE_ELF,
@@ -2212,7 +2212,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         // ----------------------------------------------------------------
-        // Chaos-test probes — Milestone 14.
+        // Chaos-test probes - Milestone 14.
         // Victim/passive services must be listed before their controllers so
         // their endpoints are registered when the controllers' SEND caps are wired.
         // ----------------------------------------------------------------
@@ -2247,7 +2247,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
             probe_mode:        93, // CHAOS_C3: 500 alloc-deny cycles without panic
-            memory_limit:      4 * 1024 * 1024, // 4 MiB — tight limit for the test
+            memory_limit:      4 * 1024 * 1024, // 4 MiB - tight limit for the test
             hw_irqs:           &[],
             has_console_read:  false,
         })),
@@ -2269,7 +2269,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
-            preferred_core:    3, // core 3 — simulates one starved core
+            preferred_core:    3, // core 3 - simulates one starved core
             probe_mode:        7, // MODE_HOG: tight loop (reused)
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
@@ -2280,7 +2280,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
-            preferred_core:    0, // core 0 — cross-core witness: proves core 0 alive
+            preferred_core:    0, // core 0 - cross-core witness: proves core 0 alive
             probe_mode:        95, // CHAOS_C6_MON: 200 yields then log pass
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
@@ -2294,7 +2294,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    2, // cross-core: controller on 1 kills victim on 2
-            probe_mode:        0, // MODE_PASSIVE — killed/respawned by chaos-c7
+            probe_mode:        0, // MODE_PASSIVE - killed/respawned by chaos-c7
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -2311,11 +2311,11 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         // ----------------------------------------------------------------
-        // Brutal identity test probes — Milestone 15.
+        // Brutal identity test probes - Milestone 15.
         // T11: self-referential queue boundary exactness.
         // T12: cap delegation chain A→B→C.
         // T13: cross-core blocked send wakes with EndpointDead.
-        // T-SMP: SMP escalation (smp=2, 8, 16 — run via osdev test identity-brutal).
+        // T-SMP: SMP escalation (smp=2, 8, 16 - run via osdev test identity-brutal).
         // ----------------------------------------------------------------
         "brutal-id-11" => Some(("brutal-id-11", ServiceConfig {
             elf:               PROBE_ELF,
@@ -2377,7 +2377,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_recv_endpoint: false,
             send_peers:        &["brutal-id-13-recv"],
             send_peers_grant:  false,
-            preferred_core:    0, // fills queue then blocks — must be on different core than recv
+            preferred_core:    0, // fills queue then blocks - must be on different core than recv
             probe_mode:        102,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
@@ -2395,7 +2395,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         // ----------------------------------------------------------------
-        // Brutal adversarial test probes — Milestone 20.
+        // Brutal adversarial test probes - Milestone 20.
         // Victim/passive services must be listed before their attackers so
         // their endpoints are registered when the attacker's SEND caps are wired.
         // ----------------------------------------------------------------
@@ -2454,7 +2454,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
-            probe_mode:        0, // MODE_PASSIVE — killed/re-killed by adv-ba5
+            probe_mode:        0, // MODE_PASSIVE - killed/re-killed by adv-ba5
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -2489,7 +2489,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
-            probe_mode:        0, // MODE_PASSIVE — absorbs timing probe messages
+            probe_mode:        0, // MODE_PASSIVE - absorbs timing probe messages
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -2554,7 +2554,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         // ----------------------------------------------------------------
-        // Brutal chaos-test services — Milestone 21.
+        // Brutal chaos-test services - Milestone 21.
         // BC2: 5 simultaneous null-deref faulters + 1 monitor proving system survival.
         // ----------------------------------------------------------------
         "chaos-bc2-a" => Some(("chaos-bc2-a", ServiceConfig {
@@ -2675,7 +2675,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
-            preferred_core:    0, // core 0 — cross-core witness
+            preferred_core:    0, // core 0 - cross-core witness
             probe_mode:        158, // MODE_CHAOS_BC6_MON: 1,000 yields then log pass
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
@@ -2689,7 +2689,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    2, // cross-core: controller on 1 kills victim on 2
-            probe_mode:        0, // MODE_PASSIVE — killed/respawned by chaos-bc7
+            probe_mode:        0, // MODE_PASSIVE - killed/respawned by chaos-bc7
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
@@ -2716,7 +2716,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // `observe now` — one-shot static metrics frame (probe_mode 1 = MODE_NOW).
+        // `observe now` - one-shot static metrics frame (probe_mode 1 = MODE_NOW).
         // Same ELF as `observe`; the shell brokers a kill-then-spawn of this.
         "observe-now" => Some(("observe-now", ServiceConfig {
             elf:               include_bytes!(env!("SVC_OBSERVE_ELF")),
@@ -2729,7 +2729,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // `observe` (live) — full-screen foreground view (probe_mode 2 = MODE_LIVE).
+        // `observe` (live) - full-screen foreground view (probe_mode 2 = MODE_LIVE).
         // Same ELF as `observe`; the shell spawns it, pauses its own read loop, and
         // resumes when it parks (the shell-brokered foreground handoff). Holds
         // CONSOLE_READ so it can poll for `q` (non-blocking) and toggle echo while
@@ -2749,10 +2749,10 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             elf:               include_bytes!(env!("SVC_SHELL_ELF")),
             // Endpoint + an `fs` send-peer so the `drives`/file commands can request_with_reply
             // to `fs` (the reply-cap pattern needs the shell's own endpoint). The shell holds
-            // only a narrow SEND to fs — fs enforces all disk authority. `fs` must be spawned
+            // only a narrow SEND to fs - fs enforces all disk authority. `fs` must be spawned
             // before the shell so this cap resolves (supervisor order). The shell resolves a pipe
             // sink's endpoint at runtime via the kernel directory (`acquire_send_grant_cap`,
-            // Path C) — no contracted `registry` peer.
+            // Path C) - no contracted `registry` peer.
             has_recv_endpoint: true,
             send_peers:        &["fs"],
             send_peers_grant:  false,
@@ -2800,11 +2800,11 @@ fn resolve_spawn_core(core_override: Option<u32>, preferred_core: u32) -> u32 {
 }
 
 /// Spawn a producer and delegate it a SEND cap to `sink`'s endpoint as its
-/// `send_peers[0]` — the capability-broker primitive behind shell pipes
+/// `send_peers[0]` - the capability-broker primitive behind shell pipes
 /// (`producer | sink`). The producer's *contract* send peers are intentionally
 /// not used: its only send authority is this runtime-delegated pipe cap, so it
 /// can reach exactly the sink the shell wired it to and nothing else (§3.1, no
-/// ambient authority — composition grants, it doesn't assume).
+/// ambient authority - composition grants, it doesn't assume).
 ///
 /// `sink` must already be spawned and have registered its endpoint, so the SEND
 /// cap can be minted against it. The shell spawns the consumer before the producer.
@@ -2816,7 +2816,7 @@ pub fn spawn_service_pipe(producer: &str, sink: &str, core_override: Option<u32>
     // The delegated pipe peer goes FIRST so the producer/filter reaches it via
     // `send_peer_at(0)` (its "downstream"); the contract's own peers follow, so a filter that
     // must `registry`-register to receive a stage's input (e.g. `upper`) still can. Bounded by
-    // MAX_SEND_PEERS — extra contract peers past the cap are dropped (the pipe peer is kept).
+    // MAX_SEND_PEERS - extra contract peers past the cap are dropped (the pipe peer is kept).
     let mut pipe_peers: [&str; MAX_SEND_PEERS] = [""; MAX_SEND_PEERS];
     pipe_peers[0] = sink;
     let mut np = 1usize;
@@ -2839,7 +2839,7 @@ pub fn spawn_service_by_name(name: &str, core_override: Option<u32>) -> Result<O
 
     // Singleton guard (§6.2, §26.6 bounded behaviour): refuse to spawn a service
     // whose name is already live. This blocks duplicate instances in general, and
-    // in particular a second trusted-root service — init/supervisor/registry are
+    // in particular a second trusted-root service - init/supervisor/registry are
     // always live while the system runs, so this always rejects spawning/restarting
     // them, the same protection `handle_kill` gives. It does NOT block boot: there
     // each service is spawned exactly once, before any instance is live. Loud
@@ -2888,7 +2888,7 @@ pub fn spawn_service_by_name_with_installs(
 /// bare-metal boot freeze; kept as a debug aid but **off by default**. They were a
 /// real performance trap: in builds with no shell (the `iso-*`/probe images) the
 /// framebuffer mirror never turns off, so every kprintln line triggers a full-screen
-/// scroll that reads back uncached VRAM — ~130 ms per line on the T630. Seven markers
+/// scroll that reads back uncached VRAM - ~130 ms per line on the T630. Seven markers
 /// per spawn made a respawn look ~40× a cold spawn (see the iso-c7/iso-xlife dig).
 /// Flip to `true` only to debug a spawn-path freeze; the compiler dead-code-eliminates
 /// the `kprintln!`s when `false`. The `task: … spawned OK` announce and `kill_task:`
@@ -2896,7 +2896,7 @@ pub fn spawn_service_by_name_with_installs(
 const SPAWN_TRACE: bool = false;
 
 /// Low-level spawn: load ELF, wire caps, enqueue on `core_id`. Returns the new task's recv
-/// `EndpointId` (`None` if it has no endpoint) — the caller (via the spawn syscall) can mint a
+/// `EndpointId` (`None` if it has no endpoint) - the caller (via the spawn syscall) can mint a
 /// cap to it. This is the Phase-0 seam for moving naming out of the kernel (`docs/naming-design.md`):
 /// a spawner can collect a cap to every service it starts without the kernel resolving names.
 fn spawn_service_with_config(
@@ -2917,7 +2917,7 @@ fn spawn_service_with_config(
     // `None` = the old name-resolution path (unchanged).
     installs:          Option<&[InstallCap]>,
 ) -> Result<Option<EndpointId>, SpawnError> {
-    // DIAG step markers (gated by SPAWN_TRACE; off by default — see its doc).
+    // DIAG step markers (gated by SPAWN_TRACE; off by default - see its doc).
     if SPAWN_TRACE { crate::kprintln!("spawn[elf]: '{}'", name); }
 
     // 1. Parse ELF.
@@ -2962,7 +2962,7 @@ fn spawn_service_with_config(
     caps.insert(mint_cap(LOG_WRITE_RESOURCE, Rights::WRITE))
         .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
 
-    // Spawn authority — least privilege (§3.1; H10 audit in
+    // Spawn authority - least privilege (§3.1; H10 audit in
     // security/hardening-strategy.md §9). Granted only to the services that
     // actually start other services: init (spawns the trusted root), supervisor
     // (spawns services + probes), the shell (brokers spawn/kill/restart), and the
@@ -2970,10 +2970,10 @@ fn spawn_service_with_config(
     // ELF identity so no probe family is missed). registry, logger, the drivers,
     // ping, pong, and observe never spawn and no longer hold the authority to.
     // Previously every service got this unconditionally ("spawn authority, every
-    // service in v1") — a system-wide blast-radius widening this closes. Capture the
+    // service in v1") - a system-wide blast-radius widening this closes. Capture the
     // slot (u32::MAX when not granted); the SDK already treats MAX as "not held".
     let mut spawn_slot_u32 = u32::MAX;
-    if name == "supervisor"            // init removed (Path C / Phase 5) — supervisor is the spawner
+    if name == "supervisor"            // init removed (Path C / Phase 5) - supervisor is the spawner
         || name == "shell"
         || core::ptr::eq(elf_bytes.as_ptr(), PROBE_ELF.as_ptr())
     {
@@ -2992,8 +2992,8 @@ fn spawn_service_with_config(
         let resource_id = ResourceId::from(ep_id);
 
         // Seed the new endpoint's generation strictly above every cap previously issued for either:
-        //   (a) this NAME's prior endpoint — so a same-name restart's old caps go stale (§7.5 P2); and
-        //   (b) whatever service last held this (possibly RECLAIMED) endpoint id — the ABA guard now
+        //   (a) this NAME's prior endpoint - so a same-name restart's old caps go stale (§7.5 P2); and
+        //   (b) whatever service last held this (possibly RECLAIMED) endpoint id - the ABA guard now
         //       that ids are reused (ipc::free_endpoint_id). A reused id MUST out-generation its
         //       previous holder, even a different service, or a stale cap to that holder could match
         //       the new endpoint and resurrect authority.
@@ -3052,7 +3052,7 @@ fn spawn_service_with_config(
     }
 
     // The USB keyboard driver gets a CONSOLE_PUSH cap so it can inject decoded
-    // keystrokes into the console input ring (§12). Both USB drivers hold it —
+    // keystrokes into the console input ring (§12). Both USB drivers hold it -
     // `xhci` for front-port keyboards, `ehci` for the back-port (USB 2.0) ones.
     let mut console_push_slot_u32 = u32::MAX;
     if name == "xhci" || name == "ehci" {
@@ -3067,7 +3067,7 @@ fn spawn_service_with_config(
     // observe utility use TaskStat + the aggregate InspectKernel queries; the
     // prop-*/stress-* test-harness probes query victim generations (InspectKernel
     // query 2). Self-state (own alloc bytes) and the TSC stay ungated, so every
-    // other service needs nothing. No slot is stored — the gate scans holdings.
+    // other service needs nothing. No slot is stored - the gate scans holdings.
     if name == "shell"
         || name.starts_with("observe") // observe + observe-now (and future modes)
         || name.starts_with("prop-")
@@ -3094,7 +3094,7 @@ fn spawn_service_with_config(
 
     // The resource-mint authority (§7.10, P2 file-as-capability): held only by services that
     // issue delegated resources whose meaning they define. `fs` mints a file cap per open file.
-    // Least-privilege (§3.1) — no other service can create delegated resources.
+    // Least-privilege (§3.1) - no other service can create delegated resources.
     if name == "fs" {
         let rm_cap = mint_cap(RESOURCE_MINT_RESOURCE, Rights::WRITE);
         caps.insert(rm_cap)
@@ -3110,11 +3110,11 @@ fn spawn_service_with_config(
     // first, then name-wire any declared send-peer the caller did NOT provide. This lets the
     // supervisor flip peers one at a time (provide what it holds in its name→cap map; the kernel
     // fills the rest from the name table until Phase 5 removes it). `installs == None` (every
-    // existing spawn) means the install step is skipped and ALL declared peers are name-wired —
+    // existing spawn) means the install step is skipped and ALL declared peers are name-wired -
     // the old behaviour, verbatim. A peer is "provided" if its label matches an install entry.
 
     // 1. Install caller-supplied caps (a copy the caller already held, GRANT-validated in the
-    //    syscall handler — non-escalating §7.3). Each becomes a send-peer under its label, so the
+    //    syscall handler - non-escalating §7.3). Each becomes a send-peer under its label, so the
     //    child resolves `ctx.capability(label)` identically. A delegated peer not in the contract
     //    (e.g. `greet`'s sink at index 0) arrives this way too.
     if let Some(installs) = installs {
@@ -3180,7 +3180,7 @@ fn spawn_service_with_config(
     // (§12). Name-gated: only the `xhci` service receives it, and only if the
     // PCI scan found a controller. Device registers must be uncached (PCD|PWT).
     // Map the USB host-controller BAR for a driver service into its address space
-    // at XHCI_MMIO_VA. Both the xhci and ehci drivers use this one window — a
+    // at XHCI_MMIO_VA. Both the xhci and ehci drivers use this one window - a
     // service holds exactly one controller, and each has its own address space, so
     // the shared VA + ctx field (`xhci_mmio_va`, read by `ctx.xhci_mmio()` /
     // `ctx.ehci_mmio()`) is unambiguous (§12).
@@ -3219,7 +3219,7 @@ fn spawn_service_with_config(
     // 6b. Allocate + map a physically-contiguous DMA arena for the xHCI driver
     // (§12). The controller DMAs into this memory (rings/contexts), so the driver
     // needs both the VA (to build structures) and the physical base (to program
-    // the controller). Normal cacheable mapping — x86 DMA is cache-coherent.
+    // the controller). Normal cacheable mapping - x86 DMA is cache-coherent.
     // Grant a physically-contiguous DMA arena to a USB driver (xhci or ehci) for
     // its queue structures. Shared VA/fields, separate address spaces (§12).
     let dma_for_driver = {
@@ -3231,7 +3231,7 @@ fn spawn_service_with_config(
     };
     // Per-driver arena size: xHCI needs room for its 256 scratchpad buffers;
     // EHCI gets the small 64 KiB arena it had on main; the AHCI block driver needs
-    // only its command list/FIS/command table + a data buffer — 64 KiB is plenty.
+    // only its command list/FIS/command table + a data buffer - 64 KiB is plenty.
     let dma_pages = if name == "ehci" || name == "block-driver" {
         EHCI_DMA_PAGES
     } else {
@@ -3264,7 +3264,7 @@ fn spawn_service_with_config(
                 // inside the arena). The xHCI driver qualifies (handoff + 256-buffer
                 // scratchpad: a confined keyboard works on hardware). The EHCI
                 // controller retains a stale internal DMA pointer into the firmware
-                // ROM region (~0xffffffc0) that survives HCRESET — its async/qTD
+                // ROM region (~0xffffffc0) that survives HCRESET - its async/qTD
                 // schedule is provably correct (verified by byte-dump), so this is a
                 // controller quirk, not a driver bug. Confining it makes that benign
                 // read fatal and breaks the keyboard, so EHCI stays in passthrough
@@ -3283,7 +3283,7 @@ fn spawn_service_with_config(
                         // benign stale read a fatal IO_PAGE_FAULT (CI stuck); in
                         // passthrough the read is harmless and AHCI works. Confinement
                         // needs an AHCI BIOS/OS handoff first (a future step, §6.4;
-                        // docs/ahci.md) — same situation the USB drivers hit.
+                        // docs/ahci.md) - same situation the USB drivers hit.
                         crate::kprintln!(
                             "spawn[dma]: '{}' left in IOMMU passthrough (CONFINE_USB_DRIVERS={})",
                             name, CONFINE_USB_DRIVERS
@@ -3369,11 +3369,11 @@ fn spawn_service_with_config(
 }
 
 /// Spawn `init` on Core 0. Called once by `kernel_main` (§11.1).
-/// The kernel's ONE direct spawn (Path C / Phase 5 — `init` is removed). The kernel boots the
+/// The kernel's ONE direct spawn (Path C / Phase 5 - `init` is removed). The kernel boots the
 /// SUPERVISOR directly; the supervisor then spawns logger and all services. Uses `SUPERVISOR_ELF`
 /// (garbage under `test-bad-supervisor` → §22 Test 1B). `has_recv_endpoint = true` (the supervisor
 /// owns the death-notification endpoint). A *boot-time* spawn failure is fatal (§6.2, §11.3); a later
-/// *runtime* death is recovered by the kernel respawning it (Phase 6 — see below).
+/// *runtime* death is recovered by the kernel respawning it (Phase 6 - see below).
 pub fn spawn_supervisor() {
     match spawn_service_with_config("supervisor", SUPERVISOR_ELF, 0, true, &[], 0, false, 64 * 1024 * 1024, &[], false, None) {
         Ok(_) => crate::kprintln!("task: supervisor spawned on core 0"),
@@ -3382,20 +3382,20 @@ pub fn spawn_supervisor() {
 }
 
 // ---------------------------------------------------------------------------
-// Supervisor respawn (Path C / Phase 6 — the supervisor is restartable; §6.2).
+// Supervisor respawn (Path C / Phase 6 - the supervisor is restartable; §6.2).
 //
 // The supervisor is no longer the non-restartable trusted root: when it dies, the KERNEL respawns it
-// (the kernel is the one thing that cannot die — the last-resort recovery anchor of Path C, §3.7).
-// The death path (`kill_task`) only FLAGS the respawn — running it inline is unsafe (we are mid-
+// (the kernel is the one thing that cannot die - the last-resort recovery anchor of Path C, §3.7).
+// The death path (`kill_task`) only FLAGS the respawn - running it inline is unsafe (we are mid-
 // teardown of the dying supervisor). `control::process_pending` (Core 0 control tick, already a
 // spawn-safe deferred point that respawns services for RESTART) polls the flag and does the respawn.
 //
-// **No bound on the number of respawns — deliberately.** A cap that panicked after N respawns would
+// **No bound on the number of respawns - deliberately.** A cap that panicked after N respawns would
 // re-introduce the very reboot Phase 6 eliminates (just deferred from 1 death to N), and would hand
 // any attacker a trivial denial-of-service: kill the supervisor N times to force a reboot. So the
 // kernel respawns it *unconditionally, forever*. This is NOT unbounded-resource behavior (§26.6):
 // each respawn first reclaims the dead instance's frames/kstack/caps, then allocates fresh, so the
-// footprint is constant and reclaimed every time — only the *count* grows, and a count is not a
+// footprint is constant and reclaimed every time - only the *count* grows, and a count is not a
 // resource. The respawn is loud (logged with a running count, §26.4/§26.7); a sustained loop floods
 // the log and an operator intervenes, but the system stays alive rather than rebooting. The new
 // instance re-registers its endpoint in `ipc::names`, so death notifications re-point to it, and it
@@ -3413,7 +3413,7 @@ pub fn flag_supervisor_respawn() {
 }
 
 /// If the supervisor died, respawn it (Path C / Phase 6). Called from `control::process_pending`
-/// (Core 0) — a spawn-safe deferred point. Always respawns; never gives up (see the note above).
+/// (Core 0) - a spawn-safe deferred point. Always respawns; never gives up (see the note above).
 /// The count is observability only (§26.4), not a bound.
 pub fn poll_supervisor_respawn() {
     use core::sync::atomic::Ordering;
@@ -3421,7 +3421,7 @@ pub fn poll_supervisor_respawn() {
         return;
     }
     let n = SUPERVISOR_RESPAWN_COUNT.fetch_add(1, Ordering::AcqRel) + 1;
-    crate::kprintln!("kernel: supervisor died — respawning (#{}) (Path C / Phase 6)", n);
+    crate::kprintln!("kernel: supervisor died - respawning (#{}) (Path C / Phase 6)", n);
     spawn_supervisor();
 }
 
@@ -3439,13 +3439,13 @@ pub fn kill_by_name(name: &str) -> bool {
     found
 }
 
-/// Kill the currently-running task (called from page-fault handler — §10.3).
+/// Kill the currently-running task (called from page-fault handler - §10.3).
 pub fn kill_current() {
     let slot = scheduler::current_task_slot();
     if slot < scheduler::MAX_TASKS {
         scheduler::kill_task_by_slot(slot);
     }
-    // Reschedule — kill_task_by_slot already sets state to Dead; the scheduler
+    // Reschedule - kill_task_by_slot already sets state to Dead; the scheduler
     // will skip this task on the next pick_next pass.
     scheduler::yield_current();
 }

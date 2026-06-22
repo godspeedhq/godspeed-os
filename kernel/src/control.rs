@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Control serial channel — receives `osdev restart` commands via COM2.
+//! Control serial channel - receives `osdev restart` commands via COM2.
 //!
 //! COM2 is connected to `tcp::5555` in the QEMU configuration.
 //! `osdev restart <name> [<core>]` sends `RESTART <name> <core>\n`.
@@ -37,12 +37,12 @@ static LINE: SpinLock<LineBuf> = SpinLock::new(LineBuf::new());
 /// idle loop. Because it runs with interrupts disabled, the drain loop MUST be
 /// bounded: on bare-metal hardware with no usable COM2 the LSR reads 0xFF, so
 /// `com2_try_read_byte` returns `Some(0xFF)` indefinitely. An unbounded loop
-/// here hard-wedges core 0 — it never returns from the timer ISR, so it can
+/// here hard-wedges core 0 - it never returns from the timer ISR, so it can
 /// never take the cross-core WAKE_RECEIVER IPI and any task blocked on `recv`
 /// on the BSP stalls forever. The budget (256) far exceeds any real command
 /// line (BUF_SIZE = 128); a stuck LSR just drains 256 junk bytes and returns.
 pub fn process_pending() {
-    // Path C / Phase 6: if the supervisor died, the kernel respawns it here — a spawn-safe deferred
+    // Path C / Phase 6: if the supervisor died, the kernel respawns it here - a spawn-safe deferred
     // point on the Core-0 control tick (the same place RESTART respawns services). The kernel is the
     // supervisor's recovery anchor, the one thing that cannot die (§3.7, §6.2). Bounded + loud on a
     // respawn loop. No-op when the supervisor is healthy (one atomic load).

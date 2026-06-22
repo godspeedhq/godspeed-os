@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Physical memory management — §10.
+//! Physical memory management - §10.
 //!
 //! Initialised once by the BSP from the bootloader memory map.
 //! Unsafe boundary: raw physical addresses are manipulated in frame.rs
@@ -28,7 +28,7 @@ pub fn init(boot_info: &BootInfo) {
     );
     allocator::init(boot_info);
     // Protect Limine's intermediate page-table frames for the kernel BSS
-    // mapping from being handed out by alloc_frame (BA2 fix — see allocator.rs).
+    // mapping from being handed out by alloc_frame (BA2 fix - see allocator.rs).
     allocator::protect_kernel_page_table_frames();
     let free_mib = allocator::free_frame_count() * 4096 / (1024 * 1024);
     crate::kprintln!("memory: frame allocator ready ({} MiB free)", free_mib);

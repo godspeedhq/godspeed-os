@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-// Pure-logic library target — only used for unit testing and coverage.
+// Pure-logic library target - only used for unit testing and coverage.
 //
 // This crate compiles for the HOST when you run `cargo test -p kernel` or
 // `cargo llvm-cov -p kernel`.  It exposes the subset of kernel modules that
@@ -48,7 +48,7 @@ pub mod capability {
 pub mod ipc {
     pub mod message;
     pub mod queue;
-    // Routing and name registry models — test-only, no SpinLock or hardware deps.
+    // Routing and name registry models - test-only, no SpinLock or hardware deps.
     // Pattern mirrors memory/bitmap.rs (item 6).
     #[cfg(test)]
     pub mod routing_model;
@@ -63,7 +63,7 @@ pub mod smp {
     pub use spinlock::SpinLock;
 }
 
-// Bitmap allocator model — compiled only in test mode.
+// Bitmap allocator model - compiled only in test mode.
 // memory/bitmap.rs has no hardware dependencies and uses std (Vec, HashSet).
 #[cfg(test)]
 mod memory {

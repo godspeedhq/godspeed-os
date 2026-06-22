@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Kernel ring buffer — §11.4.
+//! Kernel ring buffer - §11.4.
 //!
 //! 16 KiB shared sink. Written to before the logger service exists;
 //! drained by the logger service on startup. Also mirrors to the serial

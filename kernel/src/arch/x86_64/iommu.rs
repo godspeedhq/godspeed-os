@@ -1,21 +1,21 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! AMD-Vi IOMMU detection (H1 Phase 0) — DMA confinement feasibility probe.
+//! AMD-Vi IOMMU detection (H1 Phase 0) - DMA confinement feasibility probe.
 //!
 //! GodspeedOS has no IOMMU today, so a DMA-capable driver (`xhci`, `ehci`) that
 //! is programmed with a physical address can make the controller read or write
-//! *anywhere* in physical RAM — kernel-equivalent power. That is why those
+//! *anywhere* in physical RAM - kernel-equivalent power. That is why those
 //! drivers are still in the TCB (§6.1). The flagship hardening item H1 is to put
 //! an AMD-Vi IOMMU translation domain in front of each driver so it can only
 //! touch its own granted arena, then drop it from the TCB.
 //!
 //! That is a large, hardware-specific subsystem. Before building it we must know
-//! whether this machine even exposes a usable AMD-Vi IOMMU — embedded G-series
+//! whether this machine even exposes a usable AMD-Vi IOMMU - embedded G-series
 //! APUs vary and firmware often disables it. This module does **detection only**:
 //! it walks the ACPI tables (RSDP → RSDT/XSDT → IVRS) and reports whether an
 //! IVRS table exists and the IOMMU MMIO base it advertises. No behaviour change,
@@ -31,7 +31,7 @@ pub static IOMMU_PRESENT: AtomicBool = AtomicBool::new(false);
 /// MMIO base address of the first IOMMU described by IVRS (0 if none).
 pub static IOMMU_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
 
-/// ACPI System Description Table header — the common 36-byte prefix on every
+/// ACPI System Description Table header - the common 36-byte prefix on every
 /// ACPI table (RSDT, XSDT, IVRS, …).
 const SDT_HEADER_LEN: u64 = 36;
 
@@ -198,14 +198,14 @@ pub fn detect(rsdp_addr: u64, hhdm: u64) {
 }
 
 // ===========================================================================
-// H1 Phase 1a — IOMMU MMIO bring-up + capability/feature register readout
+// H1 Phase 1a - IOMMU MMIO bring-up + capability/feature register readout
 // ===========================================================================
 //
 // The IOMMU control interface is a block of memory-mapped registers at the base
 // the IVRS advertised. Before building any translation structures we map that
 // block (uncached, like the APIC) and read the Extended Feature Register and the
 // current control state. This proves the kernel can talk to the IOMMU and tells
-// us its capabilities (page-table levels, command/event-log support) — the facts
+// us its capabilities (page-table levels, command/event-log support) - the facts
 // the later phases depend on. No structures are programmed yet.
 
 /// MMIO register offsets from the IOMMU base (AMD I/O Virtualization spec).
@@ -222,7 +222,7 @@ mod reg {
     pub const STATUS:            u64 = 0x2020;
 }
 
-/// Control register (offset 0x18) enable bits — AMD-Vi spec / Linux amd_iommu.
+/// Control register (offset 0x18) enable bits - AMD-Vi spec / Linux amd_iommu.
 const CTRL_IOMMU_EN:  u64 = 1 << 0;  // master translation enable
 const CTRL_EVT_LOG_EN: u64 = 1 << 2; // event logging enable
 const CTRL_CMD_BUF_EN: u64 = 1 << 12; // command buffer enable
@@ -258,7 +258,7 @@ unsafe fn mmio_write64(va: u64, off: u64, val: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 1b — device table, command buffer, event log
+// Phase 1b - device table, command buffer, event log
 // ---------------------------------------------------------------------------
 //
 // The IOMMU checks every upstream DMA against a Device Table Entry (DTE) indexed
@@ -273,7 +273,7 @@ unsafe fn mmio_write64(va: u64, off: u64, val: u64) {
 /// One AMD-Vi Device Table Entry: 256 bits = four little-endian u64 words.
 /// Field encoding (AMD I/O Virtualization spec; matches Linux amd_iommu).
 /// IMPORTANT: IR (bit 61) and IW (bit 62) live in the FIRST 64-bit word
-/// (`data[0]`), alongside V/TV/mode/root — NOT in `data[1]`. Putting them in
+/// (`data[0]`), alongside V/TV/mode/root - NOT in `data[1]`. Putting them in
 /// `data[1]` sets DTE bits 125/126 (reserved/GCR3), which real AMD-Vi rejects as
 /// ILLEGAL_DEV_TAB_ENTRY (QEMU silently tolerated it).
 ///   data[0]: V(0) | TV(1) | (mode<<9) | (page_table_root[51:12]) | IR(61) | IW(62)
@@ -331,7 +331,7 @@ fn setup_structures(hhdm: u64, mmio_va: u64) -> bool {
     // Default every DTE to passthrough using the canonical AMD-Vi identity
     // encoding: V=1, TV=1, mode=0, page-table-root=0, IR=1, IW=1 (this is exactly
     // Linux amd_iommu's PAGE_MODE_NONE passthrough). mode=0 with TV=1 means "no
-    // translation, GPA passed straight through" — the IOMMU walks no page table.
+    // translation, GPA passed straight through" - the IOMMU walks no page table.
     // (The earlier V=1,TV=0 encoding was NOT transparent on this hardware: it
     // broke the firmware-co-owned EHCI controller even in passthrough.) The USB
     // controllers are switched to a confined domain in Phase 1d.
@@ -378,7 +378,7 @@ fn setup_structures(hhdm: u64, mmio_va: u64) -> bool {
     }
 
     crate::kprintln!(
-        "iommu: structures ready — devtab {:#x} ({} entries, passthrough), cmdbuf {:#x}, evtlog {:#x}",
+        "iommu: structures ready - devtab {:#x} ({} entries, passthrough), cmdbuf {:#x}, evtlog {:#x}",
         dt_phys, DEV_TABLE_ENTRIES, cmd_phys, evt_phys
     );
     crate::kprintln!("iommu: H1 Phase 1b OK -> device table + rings programmed (translation still off)");
@@ -387,7 +387,7 @@ fn setup_structures(hhdm: u64, mmio_va: u64) -> bool {
 
 /// Turn translation on with every device in passthrough. Enables the command
 /// buffer + event log first, then the master IOMMU enable. After this every
-/// upstream DMA is checked against the device table — but since all entries are
+/// upstream DMA is checked against the device table - but since all entries are
 /// passthrough, nothing's behaviour changes; this just proves the engine runs.
 fn enable_passthrough(mmio_va: u64) {
     // SAFETY: mmio_va mapped in bringup; control/status are valid registers.
@@ -416,14 +416,14 @@ fn enable_passthrough(mmio_va: u64) {
         );
     } else {
         crate::kprintln!(
-            "iommu: WARN Phase 1c — enabled={} but event log advanced (head {:#x} tail {:#x})",
+            "iommu: WARN Phase 1c - enabled={} but event log advanced (head {:#x} tail {:#x})",
             enabled as u8, evt_head, evt_tail
         );
     }
 }
 
 // ---------------------------------------------------------------------------
-// Phase 1d — per-device confinement: build an I/O page table for the driver's
+// Phase 1d - per-device confinement: build an I/O page table for the driver's
 // DMA arena, point the device's DTE at it, invalidate the cached DTE.
 // ---------------------------------------------------------------------------
 //
@@ -431,7 +431,7 @@ fn enable_passthrough(mmio_va: u64) {
 // "Next Level" field (bits 11:9): a non-leaf entry names the level of the table
 // it points at; a leaf entry uses Next Level 0 and names a 4 KiB page. We build
 // a private table that identity-maps (IOVA == PA) only the arena pages, so the
-// device — programmed with the same physical addresses it always was — keeps
+// device - programmed with the same physical addresses it always was - keeps
 // working, while any access outside the arena has no mapping and faults.
 
 const IO_PTE_PR: u64 = 1 << 0;   // present
@@ -444,7 +444,7 @@ const IO_PTE_IW: u64 = 1 << 62;  // write permission
 const CONFINED_DOMAIN: u64 = 1;
 
 /// Record of one confined device so its I/O page table can be reclaimed and its
-/// DTE reverted to passthrough when the driver dies (restartability — a
+/// DTE reverted to passthrough when the driver dies (restartability - a
 /// prerequisite for dropping the driver from the TCB). Up to 4 DMA drivers.
 #[derive(Clone, Copy)]
 struct Confined {
@@ -455,7 +455,7 @@ static CONFINED_TABLE: crate::smp::spinlock::SpinLock<[Option<Confined>; 4]> =
     crate::smp::spinlock::SpinLock::new([None; 4]);
 
 /// Serialises command-buffer submission across cores (spawns may confine devices
-/// on different cores). Holds nothing — the buffer state lives in MMIO.
+/// on different cores). Holds nothing - the buffer state lives in MMIO.
 static CMD_LOCK: crate::smp::spinlock::SpinLock<()> =
     crate::smp::spinlock::SpinLock::new(());
 
@@ -558,12 +558,12 @@ unsafe fn confinement_selftest(l4_phys: u64, arena_phys: u64, arena_len: u64, hh
 
     if inside_ok && outside_unmapped {
         crate::kprintln!(
-            "iommu: selftest PASS — arena {:#x}/{:#x} translate identity, {:#x} (outside) unmapped",
+            "iommu: selftest PASS - arena {:#x}/{:#x} translate identity, {:#x} (outside) unmapped",
             first, last, outside
         );
     } else {
         crate::kprintln!(
-            "iommu: selftest FAIL — inside_ok={} outside_unmapped={} (first {:#x} last {:#x} out {:#x})",
+            "iommu: selftest FAIL - inside_ok={} outside_unmapped={} (first {:#x} last {:#x} out {:#x})",
             inside_ok as u8, outside_unmapped as u8, first, last, outside
         );
     }
@@ -607,7 +607,7 @@ unsafe fn invalidate_device(mmio_va: u64, cmd_buf_va: u64, bdf: u32) {
 /// Confine a DMA-capable device (`bdf`) to its granted arena: build an I/O page
 /// table mapping only `[arena_phys, arena_phys+arena_len)` identity, switch the
 /// device's DTE from passthrough to that domain, and invalidate the cached DTE.
-/// Safe wrapper — all hardware `unsafe` is contained here (arch layer, §18.1).
+/// Safe wrapper - all hardware `unsafe` is contained here (arch layer, §18.1).
 /// No-op (returns false) if the IOMMU is not enabled or `bdf` is invalid.
 pub fn confine_device(bdf: u32, arena_phys: u64, arena_len: u64) -> bool {
     if !IOMMU_PRESENT.load(Ordering::Relaxed) || bdf == 0xFFFF || arena_len == 0 {
@@ -633,12 +633,12 @@ pub fn confine_device(bdf: u32, arena_phys: u64, arena_len: u64) -> bool {
     let last = (arena_phys + arena_len - 1) & !0xFFF;
 
     // §22 Test 12 (H1 §6.4): confine to an EMPTY domain so the device's own init
-    // DMA lands outside it and faults — a deterministic live proof that the IOMMU
+    // DMA lands outside it and faults - a deterministic live proof that the IOMMU
     // blocks + logs out-of-arena DMA. Off in every normal build (cfg feature).
     #[cfg(feature = "iommu-fault-test")]
     {
         crate::kprintln!(
-            "iommu: FAULT-TEST — confining BDF {:02x}:{:02x}.{} to an EMPTY domain (arena {:#x}..{:#x} UNMAPPED; expect IO_PAGE_FAULT)",
+            "iommu: FAULT-TEST - confining BDF {:02x}:{:02x}.{} to an EMPTY domain (arena {:#x}..{:#x} UNMAPPED; expect IO_PAGE_FAULT)",
             (bdf >> 8) & 0xff, (bdf >> 3) & 0x1f, bdf & 0x7, first, last + 0x1000
         );
     }
@@ -787,7 +787,7 @@ pub fn drain_event_log() -> u32 {
     let hhdm = crate::arch::x86_64::page_tables::get_hhdm_offset();
     let evt_va = phys_to_virt(evt_phys, hhdm);
 
-    // Recover from event-log overflow (status bit 0) SILENTLY — count it and fold
+    // Recover from event-log overflow (status bit 0) SILENTLY - count it and fold
     // it into the throttled summary, never print per-overflow (a high fault rate
     // overflows the 256-entry ring many times/sec). Disable EvtLogEn, RW1C the
     // status bit, reset head/tail, re-enable so logging resumes.
@@ -812,7 +812,7 @@ pub fn drain_event_log() -> u32 {
     let mut head = unsafe { mmio_read64(mmio_va, reg::EVENT_LOG_HEAD) } & 0xFFF;
     let tail = unsafe { mmio_read64(mmio_va, reg::EVENT_LOG_TAIL) } & 0xFFF;
 
-    // Drain the ring SILENTLY — accumulate per-controller counters, advance head.
+    // Drain the ring SILENTLY - accumulate per-controller counters, advance head.
     // Printing a line per fault (thousands/sec) would flood serial+framebuffer
     // under the console lock from the timer ISR. We emit one throttled summary.
     let mut drained = 0u32;
@@ -857,7 +857,7 @@ pub fn drain_event_log() -> u32 {
 
     // Throttled summary: at most once per ~2.5 s (256 ticks), only when new faults
     // accumulated. Per-controller counts + last faulting address (the address is
-    // the diagnostic — it says exactly where each controller's DMA overstepped).
+    // the diagnostic - it says exactly where each controller's DMA overstepped).
     if FAULT_THROTTLE.fetch_add(1, Ordering::Relaxed) % 256 == 0 {
         let xf = XHCI_FAULTS.load(Ordering::Relaxed);
         let ef = EHCI_FAULTS.load(Ordering::Relaxed);
@@ -915,7 +915,7 @@ pub fn event_log_state() -> (u64, u64) {
 }
 
 /// Map the IOMMU MMIO block and report its capabilities. Detection-and-readout
-/// only — programs nothing. Call after [`detect`]; no-op if no IOMMU was found.
+/// only - programs nothing. Call after [`detect`]; no-op if no IOMMU was found.
 pub fn bringup(hhdm: u64) {
     if !IOMMU_PRESENT.load(Ordering::Relaxed) {
         return;
@@ -926,7 +926,7 @@ pub fn bringup(hhdm: u64) {
         return;
     }
 
-    // Map the MMIO block at its HHDM alias, uncached (PCD|PWT) — exactly the
+    // Map the MMIO block at its HHDM alias, uncached (PCD|PWT) - exactly the
     // APIC pattern in boot::init_local_apic. Limine's HHDM covers RAM but not
     // MMIO, so we add the pages to the active tables ourselves.
     let va = phys_to_virt(phys, hhdm);

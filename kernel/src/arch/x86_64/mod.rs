@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! x86_64 architecture layer — the unsafe boundary (§18.1).
+//! x86_64 architecture layer - the unsafe boundary (§18.1).
 //!
 //! All `unsafe` code in the kernel that touches hardware directly lives in
 //! this module or in `memory/`, `capability/`, `smp/`. Nowhere else.
@@ -36,7 +36,7 @@ extern "C" {
 }
 
 // ---------------------------------------------------------------------------
-// Limine protocol — requests must survive to link time via #[used] + KEEP().
+// Limine protocol - requests must survive to link time via #[used] + KEEP().
 // ---------------------------------------------------------------------------
 
 #[used]
@@ -67,7 +67,7 @@ static KERNEL_ADDRESS_REQUEST: ExecutableAddressRequest = ExecutableAddressReque
 #[link_section = ".requests"]
 static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
 
-// ACPI RSDP pointer — entry point to the ACPI table tree. Needed to locate the
+// ACPI RSDP pointer - entry point to the ACPI table tree. Needed to locate the
 // IVRS table that describes the AMD-Vi IOMMU (H1: DMA confinement, §12).
 #[used]
 #[link_section = ".requests"]
@@ -203,7 +203,7 @@ fn collect_boot_info() -> BootInfo {
 }
 
 // ---------------------------------------------------------------------------
-// BootInfo — populated by collect_boot_info(), consumed by kernel_main.
+// BootInfo - populated by collect_boot_info(), consumed by kernel_main.
 // ---------------------------------------------------------------------------
 
 /// Boot information passed from the bootloader to `kernel_main`.
@@ -272,7 +272,7 @@ pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, 
 /// Halt this core. Disables interrupts and loops on hlt.
 /// Milestone 6: broadcast NMI IPI to other cores before halting.
 pub fn halt_all_cores() -> ! {
-    // SAFETY: panic path — we want to stop all execution permanently.
+    // SAFETY: panic path - we want to stop all execution permanently.
     unsafe { core::arch::asm!("cli", options(nostack, nomem)) };
     loop {
         // SAFETY: hlt with IF=0 is safe; we never exit this loop.
@@ -296,7 +296,7 @@ pub fn hardware_reset() -> ! {
             if inb(0x64) & 0x02 == 0 { break; }
             core::hint::spin_loop();
         }
-        // 0xFE on port 0x64 pulses the CPURST# line — unconditional CPU reset.
+        // 0xFE on port 0x64 pulses the CPURST# line - unconditional CPU reset.
         // SAFETY: keyboard controller command; universally supported on x86.
         outb(0x64, 0xFE);
     }
@@ -308,7 +308,7 @@ pub fn hardware_reset() -> ! {
 }
 
 // ---------------------------------------------------------------------------
-// Serial (COM1) — used by log::write_fmt for all kprintln! output.
+// Serial (COM1) - used by log::write_fmt for all kprintln! output.
 // ---------------------------------------------------------------------------
 
 const COM1: u16 = 0x3F8;
@@ -409,7 +409,7 @@ unsafe fn serial_thre_wait() -> bool {
 /// lock), but normally it serializes with `serial_write_byte` so concurrent
 /// writers can't corrupt each other's THRE poll / TX FIFO state.  Every THRE
 /// poll is bounded (drop the byte on timeout) so a stuck UART can't wedge a core
-/// with IF=0.  (Formerly bypassed the lock with an unbounded poll — a real bug.)
+/// with IF=0.  (Formerly bypassed the lock with an unbounded poll - a real bug.)
 pub fn serial_write_bytes_lockfree(s: &[u8]) {
     use core::sync::atomic::Ordering;
     let mut got = false;
@@ -445,7 +445,7 @@ pub fn serial_write_bytes_lockfree(s: &[u8]) {
     }
 }
 
-/// Write one byte to the **interactive console** — COM1 *and* the framebuffer
+/// Write one byte to the **interactive console** - COM1 *and* the framebuffer
 /// (TV). This is the CONSOLE path (the shell prompt, `observe`, keystroke echo);
 /// kept separate from the log path so logs don't smear the TV. See
 /// `docs/console-service.md` (Stage 1).
@@ -460,7 +460,7 @@ pub fn console_write_byte(b: u8) {
     }
 }
 
-/// Write bytes to the interactive console — COM1 (serialised) and the framebuffer.
+/// Write bytes to the interactive console - COM1 (serialised) and the framebuffer.
 pub fn console_write_bytes(s: &[u8]) {
     serial_write_bytes_lockfree(s);
     if !boot_log_to_fb() {
@@ -471,7 +471,7 @@ pub fn console_write_bytes(s: &[u8]) {
 }
 
 // ---------------------------------------------------------------------------
-// Serial (COM2) — control channel for `osdev restart` (§17).
+// Serial (COM2) - control channel for `osdev restart` (§17).
 // ---------------------------------------------------------------------------
 
 const COM2: u16 = 0x2F8;
@@ -505,7 +505,7 @@ pub fn com2_try_read_byte() -> Option<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// COM1 UART RX — interrupt-driven ring buffer for the shell service.
+// COM1 UART RX - interrupt-driven ring buffer for the shell service.
 // ---------------------------------------------------------------------------
 
 const COM1_RX_BUF_SIZE: usize = 64;
@@ -542,7 +542,7 @@ pub fn set_console_echo(on: bool) {
 /// Whether boot-time **log** output is also mirrored to the framebuffer (TV).
 /// True during boot so the user sees the init sequence on the display; the shell
 /// flips it false on the first keystroke and clears the screen, leaving a clean
-/// interactive console (after that, only console output reaches the TV — Stage 1).
+/// interactive console (after that, only console output reaches the TV - Stage 1).
 pub static BOOT_LOG_TO_FB: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(true);
 
@@ -552,18 +552,18 @@ fn boot_log_to_fb() -> bool {
 }
 
 /// End boot-log mirroring to the framebuffer and clear the screen. Called from
-/// the `ConsoleBootComplete` syscall once boot output has settled — the boot
+/// the `ConsoleBootComplete` syscall once boot output has settled - the boot
 /// jargon has served its purpose; hand over a clean console.
 pub fn console_boot_complete() {
     BOOT_LOG_TO_FB.store(false, core::sync::atomic::Ordering::Release);
     fb::clear_and_home();
 }
 
-/// Set true by the USB keyboard driver (xHCI) once it has finished its setup —
+/// Set true by the USB keyboard driver (xHCI) once it has finished its setup -
 /// in every terminal path: keyboard enumerated, no keyboard found, or no
 /// controller/DMA. This is the deterministic end-of-boot signal: the input driver
 /// is the last thing to come up, so when it reports in, the boot sequence is done.
-/// The shell waits on this to auto-clear the boot screen — no timer, no heuristic.
+/// The shell waits on this to auto-clear the boot screen - no timer, no heuristic.
 pub static INPUT_READY: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -603,7 +603,7 @@ pub unsafe fn uart_rx_push(b: u8) {
     let head = COM1_RX_HEAD.load(Ordering::Acquire);
     let next_tail = (tail + 1) % COM1_RX_BUF_SIZE;
     if next_tail == head {
-        return; // buffer full — drop byte
+        return; // buffer full - drop byte
     }
     // SAFETY: tail index is within COM1_RX_BUF bounds; only this producer writes to it.
     unsafe { COM1_RX_BUF[tail] = b; }
@@ -629,7 +629,7 @@ pub fn uart_rx_pop() -> Option<u8> {
 /// Poll COM1 RX and wake any task blocked in ConsoleRead.
 ///
 /// Called from the core-0 timer ISR every 10 ms.
-/// Replaces IRQ-driven reception — the legacy PIC (IRQ 4) is fully masked;
+/// Replaces IRQ-driven reception - the legacy PIC (IRQ 4) is fully masked;
 /// APIC-only kernels must poll the UART LSR instead.
 pub fn uart_rx_poll() {
     use core::sync::atomic::Ordering;
@@ -653,15 +653,15 @@ pub fn uart_rx_poll() {
 /// poll path's push + wake, so USB keystrokes reach the shell exactly like
 /// serial bytes would. On the target hardware COM1 RX is dead, so the driver is
 /// the only producer in practice; a concurrent COM1 poll would race the ring
-/// tail — acceptable while COM1 input is unused (a per-ring lock is future work).
+/// tail - acceptable while COM1 input is unused (a per-ring lock is future work).
 pub fn console_push_byte(b: u8) {
     use core::sync::atomic::Ordering;
     // Echo the keystroke to the console (serial + framebuffer) so the user sees
-    // their input inline — the framebuffer has no terminal-side local echo, so
+    // their input inline - the framebuffer has no terminal-side local echo, so
     // without this typing is invisible on a display. (On a serial terminal, turn
     // local echo OFF so characters are not doubled.) Enter advances a line;
     // backspace erases the last glyph.
-    // Echo via the CONSOLE path (serial + framebuffer) — keystrokes are part of
+    // Echo via the CONSOLE path (serial + framebuffer) - keystrokes are part of
     // the interactive session, not the log stream, so they belong on the TV.
     // Suppressed while a foreground full-screen app owns the screen (it paints the
     // display itself; its raw key polls must not smear its frame).
@@ -670,7 +670,7 @@ pub fn console_push_byte(b: u8) {
             b'\n' | b'\r' => console_write_bytes(b"\r\n"),
             // Backspace is NOT echoed here: a destructive erase (BS, space, BS)
             // would chew past the prompt when the line is empty. Line editing is
-            // the reader's policy — the shell echoes the erase only when it has a
+            // the reader's policy - the shell echoes the erase only when it has a
             // character to delete (it knows the line length; the kernel does not).
             0x20..=0x7e   => console_write_byte(b),
             _             => {}

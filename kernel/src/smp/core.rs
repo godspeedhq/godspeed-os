@@ -1,15 +1,15 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Per-core state — §9.1, §11.2.
+//! Per-core state - §9.1, §11.2.
 //!
 //! Each core has a `CoreState` that tracks liveness and its run queue.
 //! Core IDs are assigned at boot and are immutable for the system lifetime
-//! (no hotplug — §9.5).
+//! (no hotplug - §9.5).
 
 use core::sync::atomic::{AtomicU32, Ordering};
 

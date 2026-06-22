@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Physical frame allocator — §10.
+//! Physical frame allocator - §10.
 //!
 //! Bitmap allocator: one bit per 4 KiB frame.  0 = used, 1 = free.
 //! Covers up to 4 GiB of physical address space (128 KiB of bitmap in .bss).
@@ -20,7 +20,7 @@ use crate::arch::x86_64::{BootInfo, MemoryKind};
 use crate::memory::frame::{Frame, PhysAddr, FRAME_SIZE};
 
 // ---------------------------------------------------------------------------
-// Kernel-range guard — fires if alloc_frame ever returns a kernel-image frame.
+// Kernel-range guard - fires if alloc_frame ever returns a kernel-image frame.
 // ---------------------------------------------------------------------------
 
 static mut GUARD_START: u64 = 0;
@@ -28,7 +28,7 @@ static mut GUARD_END:   u64 = 0;
 
 #[inline(never)]
 fn guard_bugcheck(phys: u64) {
-    // Write directly to COM1 — no lock, no allocator, no stack growth.
+    // Write directly to COM1 - no lock, no allocator, no stack growth.
     #[inline(always)]
     fn putb(b: u8) { crate::arch::x86_64::serial_write_byte(b); }
     fn puts(s: &[u8]) { for &b in s { putb(b); } }
@@ -48,7 +48,7 @@ fn guard_bugcheck(phys: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// Bitmap — lives in .bss (zero-init = every frame starts as "used").
+// Bitmap - lives in .bss (zero-init = every frame starts as "used").
 // ---------------------------------------------------------------------------
 
 const FRAME_SIZE_USIZE: usize = FRAME_SIZE as usize;
@@ -70,7 +70,7 @@ struct BitmapAllocator {
     free_frames: usize,
     /// Total usable frames at init time. Fixed after init; never decremented.
     total_frames: usize,
-    /// Byte-index scan hint — avoids rescanning from 0 on every alloc.
+    /// Byte-index scan hint - avoids rescanning from 0 on every alloc.
     next_byte: usize,
     /// Highest frame index (exclusive) that was ever marked usable.
     /// Any frame index at or above this value was never handed out by the
@@ -311,7 +311,7 @@ pub fn alloc_frame() -> Option<Frame> {
 /// Allocate `n` physically-contiguous, page-aligned frames; return the physical
 /// address of the first, or `None` if no run that long is free. For driver DMA
 /// arenas (§12) where the device DMAs into contiguous memory. The frames are not
-/// returned as individual `Frame`s — the driver-spawn path maps them into the
+/// returned as individual `Frame`s - the driver-spawn path maps them into the
 /// driver's address space and they live for the driver's lifetime (v1: trusted
 /// drivers are effectively permanent; reclaim-on-restart is future work).
 pub fn alloc_contiguous(n: usize) -> Option<u64> {
@@ -355,7 +355,7 @@ pub fn total_frame_count() -> usize {
 ///   the kernel image guard range [kstart, kend).  `init_from_map` opens those
 ///   frames in the bitmap; `alloc_frame` then returns them; `walk_or_alloc` /
 ///   `PageTable::new` zero them, destroying the kernel's PTE for the BSS page
-///   being accessed — causing a KERNEL PF on the first write (BA2: write to
+///   being accessed - causing a KERNEL PF on the first write (BA2: write to
 ///   kstack_marker(90) at 0xffffffff80e09260 after many spawn/kill cycles).
 ///
 /// Must be called after `allocator::init` (bitmap populated) and after
@@ -363,7 +363,7 @@ pub fn total_frame_count() -> usize {
 pub fn protect_kernel_page_table_frames() {
     let hhdm = crate::arch::x86_64::page_tables::get_hhdm_offset();
     if hhdm == 0 {
-        return; // HHDM not initialised — cannot walk tables safely.
+        return; // HHDM not initialised - cannot walk tables safely.
     }
 
     // SAFETY: CR3 is always valid after Limine hands control to the kernel.
@@ -383,16 +383,16 @@ pub fn protect_kernel_page_table_frames() {
             for pdpt_i in 0..512usize {
                 let pdpte = pt_read(hhdm, pdpt_phys, pdpt_i);
                 if pdpte & 1 == 0 { continue; }
-                if pdpte & (1 << 7) != 0 { continue; } // 1 GiB huge — no PD below
+                if pdpte & (1 << 7) != 0 { continue; } // 1 GiB huge - no PD below
                 let pd_phys = pdpte & 0x000F_FFFF_FFFF_F000;
                 mark_pt_frame_used(pd_phys);
                 for pd_i in 0..512usize {
                     let pde = pt_read(hhdm, pd_phys, pd_i);
                     if pde & 1 == 0 { continue; }
-                    if pde & (1 << 7) != 0 { continue; } // 2 MiB huge — no PT below
+                    if pde & (1 << 7) != 0 { continue; } // 2 MiB huge - no PT below
                     let pt_phys = pde & 0x000F_FFFF_FFFF_F000;
                     mark_pt_frame_used(pt_phys);
-                    // PT entries are leaf mappings — the data frames they point
+                    // PT entries are leaf mappings - the data frames they point
                     // to are either already in the kernel guard range or are
                     // owned by tasks.  We do not mark them here.
                 }

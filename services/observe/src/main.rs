@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! `observe` — live task introspection (Appendix C §C.1).
+//! `observe` - live task introspection (Appendix C §C.1).
 //!
 //! Polls all 224 scheduler slots every ~500 yields and logs a summary of
 //! every live task: name, core, state, memory, restart count, queue depth,
@@ -23,9 +23,9 @@ const QUEUE_MAX:      u8  = 16;
 const MAX_CORES:      u32 = 16;
 
 // Mode passed by the kernel at spawn (ServiceConfig.probe_mode).
-const MODE_LIVE:    u32 = 0; // `observe`      — refresh forever (full-build streaming)
-const MODE_NOW:     u32 = 1; // `observe now`  — one static frame, then park
-const MODE_LIVE_FG: u32 = 2; // `observe` live — full-screen foreground view
+const MODE_LIVE:    u32 = 0; // `observe`      - refresh forever (full-build streaming)
+const MODE_NOW:     u32 = 1; // `observe now`  - one static frame, then park
+const MODE_LIVE_FG: u32 = 2; // `observe` live - full-screen foreground view
 
 /// Repaint cadence for the live view, in TSC cycles (~0.5 s at 2 GHz on the
 /// T630). `q` is polled every loop iteration regardless, so quit stays snappy.
@@ -34,20 +34,20 @@ const FRAME_CYCLES: u64 = 1_000_000_000;
 /// Per-iteration sleep for the live loop, in TSC cycles (~30 ms at 2 GHz). The loop SLEEPS this
 /// long between `q`-polls/repaints instead of busy-`yield`ing, so the core halts in between and
 /// `observe` itself does not peg its core (which would make every task on that core read as
-/// ~100% busy — the very thing observe reports). `q` latency stays ≤ this; granularity is one
+/// ~100% busy - the very thing observe reports). `q` latency stays ≤ this; granularity is one
 /// quantum (~10 ms).
 const POLL_SLEEP_CYCLES: u64 = 60_000_000;
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Per-core tick baselines for delta-based CPU%.
-    // Stack allocation — not global mutable state (§3.9).
+    // Stack allocation - not global mutable state (§3.9).
     let mut prev_core_active = [0u64; MAX_CORES as usize];
     let mut prev_core_total  = [0u64; MAX_CORES as usize];
 
     if ctx.probe_mode() == MODE_NOW {
         // `observe now`: print exactly one frame, then park. The first frame has
-        // no previous baseline, so CPU% is the cumulative share since boot — the
+        // no previous baseline, so CPU% is the cumulative share since boot - the
         // correct meaning for a point-in-time snapshot. There is no graceful
         // self-exit in v1; the shell kills any parked instance before the next
         // `observe now`, so at most one lingers. PARK (not yield) so the parked
@@ -96,8 +96,8 @@ fn run_live(
     print_state(ctx, prev_core_active, prev_core_total, true);
 
     // Paint forever; the SHELL owns `q` while we run (it polls the console and KILLS us when
-    // pressed, then restores the screen). We do NOT read input ourselves — one reader avoids a
-    // race over the keyboard — and we SLEEP between frames so we never peg our core (a busy
+    // pressed, then restores the screen). We do NOT read input ourselves - one reader avoids a
+    // race over the keyboard - and we SLEEP between frames so we never peg our core (a busy
     // refresh loop would make every task on this core read as ~100% in our own display, the
     // bug this fixes). Never returns; the shell reaps us.
     loop {
@@ -167,18 +167,18 @@ fn print_state(
     // Per-line prefix. The `observe: ` tag earns its keep in `observe now`, whose
     // lines share the log/serial stream and need to be identifiable. The live view
     // owns the whole screen and carries a title bar, so the prefix is just clutter
-    // there — dropped. (font8x8 is ASCII-only, so the title bar uses '-'/'=' not
+    // there - dropped. (font8x8 is ASCII-only, so the title bar uses '-'/'=' not
     // box-drawing or em dashes.)
     let p = if live { "" } else { "observe: " };
 
-    // --- Title bar (live only) — the quit hint up top where the eye starts ---
+    // --- Title bar (live only) - the quit hint up top where the eye starts ---
     if live {
         ctx.console_line(true, "observe - live                                      (q to quit)");
         ctx.console_line(true, "================================================================");
     }
 
     // --- Legend ---
-    // Skipped in the live view — it is static noise that wastes screen space the
+    // Skipped in the live view - it is static noise that wastes screen space the
     // repainting frame wants. `observe now` (one-shot) keeps it for reference.
     if !live {
         ctx.console_writeln("observe: legend: TASK: scheduler slot | NAME: service name");
@@ -254,7 +254,7 @@ fn print_state(
     }
 }
 
-/// Return (value, unit) for a byte count — KiB when < 1 MiB, MiB otherwise.
+/// Return (value, unit) for a byte count - KiB when < 1 MiB, MiB otherwise.
 fn bytes_fmt(bytes: u64) -> (u64, &'static str) {
     if bytes < 1024 * 1024 {
         (bytes / 1024, "KiB")

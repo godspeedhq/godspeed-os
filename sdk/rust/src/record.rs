@@ -1,12 +1,12 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
-//! Structured records — the typed `Table` that flows through GodspeedOS pipes.
+//! Structured records - the typed `Table` that flows through GodspeedOS pipes.
 //!
 //! POSIX pipes carry text, so structured data is flattened to a string and `grep`/`awk`/`cut`
 //! re-parse it back. GodspeedOS keeps the structure: a producer emits a **`Table`** (typed
 //! columns + rows); filters operate on real fields (`where mem>0`), and JSON/YAML/the grid are
 //! *renderings* of the model, not the model itself. This module is that model, lifted into the
-//! SDK so **any** service — not just the shell — can build records, filter them, and render them
+//! SDK so **any** service - not just the shell - can build records, filter them, and render them
 //! to JSON/YAML. See `docs/records.md`.
 //!
 //! ## Building a pipe-friendly service
@@ -25,12 +25,12 @@
 //!
 //! To cross a **service** boundary *as records* (skipping the JSON round-trip), use the bounded
 //! binary **wire codec** instead: [`Table::encode`] on the producer, [`Table::decode`] on the
-//! consumer. It is the `Table` itself on the wire — compact and typed, not JSON. `examples/roster`
+//! consumer. It is the `Table` itself on the wire - compact and typed, not JSON. `examples/roster`
 //! produces records this way; the shell decodes them straight into a `Table`.
 //!
 //! ## Bounds (§26.6)
 //!
-//! Everything is fixed-size and stack-resident — no heap, loud on overflow: at most
+//! Everything is fixed-size and stack-resident - no heap, loud on overflow: at most
 //! [`REC_MAX_COLS`] columns, [`REC_MAX_ROWS`] rows, a [`REC_ARENA`]-byte string arena, and
 //! [`REC_COL_NAME`]-byte column names. Overflowing any bound sets [`Table::overflow`].
 
@@ -60,14 +60,14 @@ pub enum Value {
     Empty,
 }
 
-/// A sink the renderers write bytes into — the caller's bridge to a console, a capture buffer,
+/// A sink the renderers write bytes into - the caller's bridge to a console, a capture buffer,
 /// or an IPC message. Implement it for whatever the bytes should go to.
 pub trait RecordSink {
     /// Append `bytes` to the sink.
     fn put(&mut self, bytes: &[u8]);
 }
 
-/// A bounded table of typed rows — the canonical structured-pipe value. Owned column names (so a
+/// A bounded table of typed rows - the canonical structured-pipe value. Owned column names (so a
 /// `from_json` parse can name columns dynamically), rows of [`Value`], and a byte arena holding
 /// the `Str` cells. All inline, no heap.
 pub struct Table {
@@ -234,7 +234,7 @@ impl Table {
         }
     }
 
-    /// Render as a JSON array of objects (`to json`). Values are plain ASCII today — a real
+    /// Render as a JSON array of objects (`to json`). Values are plain ASCII today - a real
     /// string-escaper is a documented follow-up.
     pub fn to_json(&self, out: &mut impl RecordSink) {
         out.put(b"[\n");
@@ -264,7 +264,7 @@ impl Table {
         out.put(b"]\n");
     }
 
-    /// Render as YAML — a list of mappings (`to yaml`). String cells render in full.
+    /// Render as YAML - a list of mappings (`to yaml`). String cells render in full.
     pub fn to_yaml(&self, out: &mut impl RecordSink) {
         let mut scratch = [0u8; 24];
         for r in 0..self.nrows {
@@ -283,7 +283,7 @@ impl Table {
 
     // ── from json (text → records bridge) ─────────────────────────────────────────────────
 
-    /// Parse a JSON array of flat objects into a `Table` — the `from json` bridge. Bounded
+    /// Parse a JSON array of flat objects into a `Table` - the `from json` bridge. Bounded
     /// subset: `[ {"k": v, …}, … ]` with string / number / `true|false` / `null` values, **no
     /// nesting**. The first object defines the columns; later objects fill known columns (new
     /// keys ignored). On malformed input, returns `Err(reason)` with a bare static reason (the
@@ -362,7 +362,7 @@ impl Table {
     // ── wire codec (records across a service boundary) ────────────────────────────────────
 
     /// Encode the table into a compact, *bounded* binary form for crossing a **service**
-    /// boundary as records (no JSON round-trip). This is emphatically **not** JSON — it is the
+    /// boundary as records (no JSON round-trip). This is emphatically **not** JSON - it is the
     /// `Table` itself on the wire. Layout:
     ///
     /// ```text
@@ -374,7 +374,7 @@ impl Table {
     ///
     /// Symmetric with [`Table::decode`]. The whole encoding is bounded by the table's own
     /// bounds; a producer sends it as one IPC message (≤ 4 KiB) for a small table, or chunks it
-    /// — the shell drains chunks until EOT, then decodes. (A chunked producer must never emit a
+    /// - the shell drains chunks until EOT, then decodes. (A chunked producer must never emit a
     /// lone `0x04` chunk, which is the EOT marker; the magic guarantees the first chunk is not.)
     pub fn encode(&self, out: &mut impl RecordSink) {
         out.put(REC_WIRE_MAGIC);
@@ -401,7 +401,7 @@ impl Table {
     }
 
     /// Decode the binary form produced by [`Table::encode`]. Validates the magic and every length
-    /// against the table bounds and the buffer end — a truncated, oversized, or non-record buffer
+    /// against the table bounds and the buffer end - a truncated, oversized, or non-record buffer
     /// is a loud `Err`, never a misparse (§3.12). Strings intern into the new table's arena.
     #[inline(never)]
     pub fn decode(bytes: &[u8]) -> Result<Table, &'static str> {

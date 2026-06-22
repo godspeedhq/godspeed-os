@@ -1,11 +1,11 @@
-// GodspeedOS — Created by Bankole Ogundero.
+// GodspeedOS - Created by Bankole Ogundero.
 //
 // This software is provided "as is", without warranty or guarantee of any kind,
 // express or implied. The author makes no guarantee of its correctness, reliability,
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! BSP/AP hardware initialisation — §11.1, §11.2.
+//! BSP/AP hardware initialisation - §11.1, §11.2.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -14,13 +14,13 @@ use super::BootInfo;
 const MAX_CORES: usize = crate::smp::core::MAX_CORES;
 
 // ---------------------------------------------------------------------------
-// GDT — eight 64-bit descriptors (per core).
+// GDT - eight 64-bit descriptors (per core).
 //
 // Slot  Selector  Descriptor
 //   0    0x00      null
 //   1    0x08      kernel code: 64-bit, ring-0, execute/read
 //   2    0x10      kernel data: ring-0, read/write
-//   3    0x18      placeholder — SYSRETQ needs the 0x18 base to derive
+//   3    0x18      placeholder - SYSRETQ needs the 0x18 base to derive
 //                  user SS (0x18+8=0x20) and CS (0x18+16=0x28)
 //   4    0x20      user data:   ring-3, read/write
 //   5    0x28      user code:   64-bit, ring-3, execute/read
@@ -30,7 +30,7 @@ const MAX_CORES: usize = crate::smp::core::MAX_CORES;
 // STAR MSR encodes kernel CS at [47:32]=0x08 and SYSRETQ base at [63:48]=0x18.
 //
 // The CPU writes the Accessed bit into segment descriptors, and `ltr` writes
-// the "busy" bit into the TSS descriptor — both require .data (writable).
+// the "busy" bit into the TSS descriptor - both require .data (writable).
 // ---------------------------------------------------------------------------
 
 const GDT_TEMPLATE: [u64; 8] = [
@@ -48,7 +48,7 @@ const GDT_TEMPLATE: [u64; 8] = [
 static mut GDT_PER_CORE: [[u64; 8]; MAX_CORES] = [GDT_TEMPLATE; MAX_CORES];
 
 // ---------------------------------------------------------------------------
-// TSS (Task State Segment) — one per core.
+// TSS (Task State Segment) - one per core.
 //
 // The CPU uses TSS.rsp0 when a ring-3 task is interrupted (hardware switches
 // to ring-0 and pushes the interrupt frame starting at rsp0).  We update rsp0
@@ -80,7 +80,7 @@ static mut TSS_PER_CORE: [Tss; MAX_CORES] = [const {
 }; MAX_CORES];
 
 // ---------------------------------------------------------------------------
-// IDT — 256 interrupt gates.
+// IDT - 256 interrupt gates.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
@@ -113,7 +113,7 @@ impl IdtEntry {
         }
     }
 
-    /// Like `new` but DPL=3 — ring-3 code may invoke this vector via `int N`.
+    /// Like `new` but DPL=3 - ring-3 code may invoke this vector via `int N`.
     fn new_user(handler: u64) -> Self {
         Self { type_attr: 0xEE, ..Self::new(handler) } // P=1, DPL=3, interrupt gate
     }
@@ -133,14 +133,14 @@ struct TableDescriptor {
 }
 
 // ---------------------------------------------------------------------------
-// Local APIC MMIO — set during init_local_apic, read by apic_send_eoi.
+// Local APIC MMIO - set during init_local_apic, read by apic_send_eoi.
 // ---------------------------------------------------------------------------
 
 static mut APIC_VIRT_BASE: u64 = 0;
 
 // APIC register offsets (xAPIC MMIO, 32-bit accesses).
 const APIC_ID:           u64 = 0x020;
-const APIC_TPR:          u64 = 0x080; // Task Priority Register — must be 0 to accept all vectors
+const APIC_TPR:          u64 = 0x080; // Task Priority Register - must be 0 to accept all vectors
 const APIC_EOI:          u64 = 0x0B0;
 const APIC_SPURIOUS:     u64 = 0x0F0;
 const APIC_LVT_TIMER:    u64 = 0x320;
@@ -161,7 +161,7 @@ pub static TSC_DEADLINE_MODE: AtomicBool = AtomicBool::new(false);
 static TSC_TICKS_PER_QUANTUM: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
-// Diagnostic exception flags — set as the very first action inside each
+// Diagnostic exception flags - set as the very first action inside each
 // exception stub, before any serial output that might stall with IF=0.
 // Reported by timer ISR ticks 10/11/12 on whichever cores are still alive.
 // ---------------------------------------------------------------------------
@@ -205,11 +205,11 @@ pub unsafe fn init_bsp(boot_info: &BootInfo) {
 /// the NO-EXECUTE (NX, bit 63) and WRITABLE (W, bit 1) status of three
 /// representative pages and then *asserts* the W^X invariant on the one that has
 /// historically been wrong:
-///   - the HHDM alias of a RAM page — a read/write alias of physical memory; after
+///   - the HHDM alias of a RAM page - a read/write alias of physical memory; after
 ///     `harden_hhdm_nx` it MUST be non-executable, else every writable page has an
 ///     executable alias (a kernel-wide W^X bypass). Asserted.
-///   - a kernel code (.text) page — expected executable (NX=0), read-only (W=0).
-///   - a kernel data (.bss) page — expected writable (W=1), non-exec (NX=1).
+///   - a kernel code (.text) page - expected executable (NX=0), read-only (W=0).
+///   - a kernel data (.bss) page - expected writable (W=1), non-exec (NX=1).
 /// Run after `harden_hhdm_nx`. A regression that left the HHDM W+X now fails the
 /// boot loudly (§3.12) rather than shipping a silent hole.
 pub fn audit_wx() {
@@ -232,7 +232,7 @@ pub fn audit_wx() {
         }
     };
     // HHDM alias of a real RAM page. One frame is allocated to guarantee a
-    // usable-RAM physical address; it is intentionally leaked — one 4 KiB page,
+    // usable-RAM physical address; it is intentionally leaked - one 4 KiB page,
     // once at boot (there is no free_frame in v1, and this runs exactly once).
     let hhdm = crate::memory::allocator::alloc_frame()
         .and_then(|f| report("hhdm-ram", get_hhdm_offset() + f.phys_addr().0));
@@ -278,7 +278,7 @@ pub unsafe fn init_local_apic() {
         unsafe { map_in_active_tables(apic_virt, apic_phys, mmio_flags) }
             .unwrap_or_else(|_| {
                 // If the mapping already exists (second core, or pre-mapped),
-                // that is fine — we just proceed.
+                // that is fine - we just proceed.
             });
     }
 
@@ -312,7 +312,7 @@ pub unsafe fn init_local_apic() {
     // fires from the always-running TSC, and ARAT (CPUID.06H:EAX[2]) means the
     // LAPIC timer keeps ticking too. The T630 uses the LAPIC periodic timer, so
     // ARAT is its signal. Without either, halting would drop ticks (Goldmont
-    // APIC power-gate) — keep the sti-only spin. Idempotent across cores.
+    // APIC power-gate) - keep the sti-only spin. Idempotent across cores.
     let arat = unsafe { cpuid_arat_supported() };
     super::interrupts::set_idle_can_halt(tsc_deadline_supported || arat);
 
@@ -375,7 +375,7 @@ unsafe fn cpuid_tsc_deadline_supported() -> bool {
     (result.ecx >> 24) & 1 != 0
 }
 
-/// Check CPUID leaf 6, EAX bit 2 for ARAT (Always Running APIC Timer) — the
+/// Check CPUID leaf 6, EAX bit 2 for ARAT (Always Running APIC Timer) - the
 /// LAPIC timer keeps ticking through C-states, so an idle core may `hlt` and
 /// still receive its scheduler tick.
 ///
@@ -478,13 +478,13 @@ unsafe fn arm_tsc_deadline_now(ticks: u64) {
 #[inline]
 pub unsafe fn rearm_tsc_deadline() {
     let ticks = TSC_TICKS_PER_QUANTUM.load(Ordering::Relaxed);
-    // SAFETY: delegated to arm_tsc_deadline_now — same preconditions.
+    // SAFETY: delegated to arm_tsc_deadline_now - same preconditions.
     unsafe { arm_tsc_deadline_now(ticks) };
 }
 
 /// TSC cycles per scheduler quantum (the timer period), or 0 before the local APIC timer is
 /// calibrated. Used to convert a cycle-based `recv_timeout` into a count of timer ticks for the
-/// core-independent timed-wake clock (§12) — a TSC deadline can't be compared across cores
+/// core-independent timed-wake clock (§12) - a TSC deadline can't be compared across cores
 /// whose TSCs need not be synchronised, so the timed-wake counts ticks of the BSP timer instead.
 #[inline]
 pub fn tsc_ticks_per_quantum() -> u64 {
@@ -507,12 +507,12 @@ fn is_intel_cpu() -> bool {
 ///
 /// On Intel Atom / Goldmont+ (Gemini Lake, Wyse 5070 J5005), the firmware
 /// autonomously promotes the SoC package to PC6+, which power-gates the local
-/// APIC — silencing both the periodic APIC timer and cross-core IPIs even when
+/// APIC - silencing both the periodic APIC timer and cross-core IPIs even when
 /// the cores are actively executing code (no PAUSE/HLT required to trigger it).
 ///
 /// MSR_PKG_CST_CONFIG_CONTROL (0xE2) bits:
 ///   [2:0] package C-state limit  (0=PC0, 1=PC1, 2=PC2, …; higher = deeper)
-///   [15]  CFG_LOCK — if set, MSR is read-only (WRMSR → #GP)
+///   [15]  CFG_LOCK - if set, MSR is read-only (WRMSR → #GP)
 ///
 /// Writes bits[2:0]=1 (PC1 limit) if the MSR is not locked.  PC1 keeps the
 /// APIC powered; PC2+ may not.  If the MSR is locked we cannot help via this
@@ -548,9 +548,9 @@ unsafe fn limit_package_cstates(core_id: u32) {
         core_id, current, (current >> 15) & 1);
 
     if current & CFG_LOCK != 0 {
-        // BIOS locked the MSR — cannot write; APIC timer may still be gated in
+        // BIOS locked the MSR - cannot write; APIC timer may still be gated in
         // deep package C-states.  A TSC-Deadline timer does not require this MSR.
-        crate::kprintln!("cstate: core {} MSR 0xE2 locked — C-state limit cannot be set via MSR", core_id);
+        crate::kprintln!("cstate: core {} MSR 0xE2 locked - C-state limit cannot be set via MSR", core_id);
         return;
     }
 
@@ -603,7 +603,7 @@ pub unsafe fn get_lapic_id() -> u32 {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Lock-free serial helpers — used in fault handlers where LOG_LOCK may
+// Lock-free serial helpers - used in fault handlers where LOG_LOCK may
 // already be held (nested kprintln → deadlock with IF=0).
 // ---------------------------------------------------------------------------
 
@@ -780,7 +780,7 @@ pub(super) unsafe fn init_gdt(core_id: u32) {
             options(nostack)
         );
         // Reload CS via far return: push [new CS selector, next RIP]; retfq pops
-        // RIP then CS — the only way to change CS in 64-bit mode.
+        // RIP then CS - the only way to change CS in 64-bit mode.
         core::arch::asm!(
             "push {sel}",
             "lea {tmp}, [rip + 99f]",
@@ -797,10 +797,10 @@ pub(super) unsafe fn init_gdt(core_id: u32) {
 /// Enable SYSCALL/SYSRETQ and configure the SYSCALL entry MSRs for this core.
 ///
 /// MSRs written:
-///   EFER.SCE   — enables SYSCALL/SYSRETQ instructions.
-///   STAR        — kernel CS (0x08) and SYSRETQ user-segment base (0x18).
-///   LSTAR       — address of `syscall_entry` (our SYSCALL handler).
-///   SFMASK      — RFLAGS bits to clear on SYSCALL entry (clears IF = bit 9).
+///   EFER.SCE   - enables SYSCALL/SYSRETQ instructions.
+///   STAR        - kernel CS (0x08) and SYSRETQ user-segment base (0x18).
+///   LSTAR       - address of `syscall_entry` (our SYSCALL handler).
+///   SFMASK      - RFLAGS bits to clear on SYSCALL entry (clears IF = bit 9).
 ///
 /// Also writes `IA32_KERNEL_GS_BASE` via `init_per_core_syscall` so the entry
 /// stub can access per-core data via `swapgs`.
@@ -846,7 +846,7 @@ pub(super) unsafe fn init_syscall(core_id: u32) {
             options(nostack, nomem),
         );
 
-        // LSTAR MSR — address of the SYSCALL entry point.
+        // LSTAR MSR - address of the SYSCALL entry point.
         let lstar = super::syscall_entry::syscall_entry as *const () as u64;
         core::arch::asm!(
             "wrmsr",
@@ -856,7 +856,7 @@ pub(super) unsafe fn init_syscall(core_id: u32) {
             options(nostack, nomem),
         );
 
-        // LSTAR readback — confirm the WRMSR took effect (AMD quirk guard).
+        // LSTAR readback - confirm the WRMSR took effect (AMD quirk guard).
         let (lstar_rd_lo, lstar_rd_hi): (u32, u32);
         core::arch::asm!(
             "rdmsr",
@@ -879,7 +879,7 @@ pub(super) unsafe fn init_syscall(core_id: u32) {
             options(nostack, nomem),
         );
 
-        // CSTAR MSR (0xC000_0083) — AMD compat-mode SYSCALL dispatch target.
+        // CSTAR MSR (0xC000_0083) - AMD compat-mode SYSCALL dispatch target.
         // On AMD CPUs a `syscall` from compat mode (CS.L=0) dispatches here, not LSTAR.
         // GodspeedOS ring-3 runs in 64-bit mode (CS.L=1) and uses `ud2` for syscalls,
         // so `cstar_entry` should never be reached; it halts loudly if it ever is.
@@ -962,7 +962,7 @@ pub unsafe fn get_tss_rsp0(core_id: usize) -> u64 {
 pub unsafe fn set_tss_rsp0(core_id: usize, rsp: u64) {
     // SAFETY: TSS_PER_CORE lives in .data; rsp0 is at byte offset 4 of the
     // packed struct. write_unaligned is used because packed structs have
-    // alignment 1 — taking a &mut reference would be UB.
+    // alignment 1 - taking a &mut reference would be UB.
     unsafe {
         let tss = &raw mut TSS_PER_CORE[core_id];
         let rsp0_ptr = core::ptr::addr_of_mut!((*tss).rsp0);
@@ -998,14 +998,14 @@ pub(super) unsafe fn init_idt() {
         }
         // IDT[6] = #UD handler: used as the syscall entry on AMD GX-420GI where
         // both SYSCALL and int $0x80 silently stall from ring-3.  DPL=0 is
-        // correct — CPU exceptions bypass the DPL check, so ud2 from ring-3
+        // correct - CPU exceptions bypass the DPL check, so ud2 from ring-3
         // always dispatches here; int 6 from ring-3 would #GP (intended).
         idt[6]    = IdtEntry::new(super::syscall_entry::ud2_syscall_entry as *const () as u64);
         idt[13]   = IdtEntry::new(gpf_stub  as *const () as u64);
         idt[14]   = IdtEntry::new(pf_stub   as *const () as u64);
         idt[32]   = IdtEntry::new(timer);
         idt[36]   = IdtEntry::new(super::interrupts::uart_rx_isr_stub as *const () as u64); // IRQ 4 = COM1 RX
-        // xHCI MSI (§12) — routed to the userspace driver via interrupt::route. The device
+        // xHCI MSI (§12) - routed to the userspace driver via interrupt::route. The device
         // delivers here once its interrupter is enabled (P2); harmless until then.
         idt[super::interrupts::XHCI_MSI_VECTOR as usize] =
             IdtEntry::new(super::interrupts::xhci_msi_isr_stub as *const () as u64);
@@ -1029,7 +1029,7 @@ pub(super) unsafe fn init_idt() {
 }
 
 // ---------------------------------------------------------------------------
-// IPI ISR stubs (§9.4) — one naked stub per vector.
+// IPI ISR stubs (§9.4) - one naked stub per vector.
 // ---------------------------------------------------------------------------
 
 /// Dispatch target called from all three IPI stubs with the vector number.
@@ -1042,7 +1042,7 @@ unsafe extern "C" fn ipi_dispatch(vector: u64) {
     unsafe { crate::smp::ipi::ipi_handler(vector as u8) }
 }
 
-/// WAKE_RECEIVER ISR stub (vector 0xF0) — cross-core task wakeup (§9.4).
+/// WAKE_RECEIVER ISR stub (vector 0xF0) - cross-core task wakeup (§9.4).
 ///
 /// Mirrors `timer_isr_stub` exactly: conditional swapgs, save caller-saved
 /// registers, call `timer_tick_from_irq` (which sends EOI and reschedules),
@@ -1112,7 +1112,7 @@ unsafe extern "C" fn ipi_tick_stub() {
 unsafe fn init_paging(_boot_info: &BootInfo) {}
 
 // ---------------------------------------------------------------------------
-// Diagnostic exception stubs — vectors 13 (GPF) and 14 (#PF).
+// Diagnostic exception stubs - vectors 13 (GPF) and 14 (#PF).
 //
 // Both exceptions push an error code before RIP on the stack, so on entry:
 //   [RSP+0]  = error_code
@@ -1160,9 +1160,9 @@ unsafe extern "C" fn pf_stub() -> ! {
     // swapgs manually when coming from ring-3 so pf_handler (and any
     // kernel code it calls, including kill_current/switch_context) can
     // access per-core data via gs:[...].  A kernel fault (CPL=0) means
-    // GS.base is already the kernel pointer — skip swapgs.
+    // GS.base is already the kernel pointer - skip swapgs.
     core::arch::naked_asm!(
-        // Raw 'P' to COM1 as absolute first instruction — fires before any
+        // Raw 'P' to COM1 as absolute first instruction - fires before any
         // flag-set or push.  A fault→iretq→fault loop produces a visible
         // flood independent of all other handler logic.  dx/al are scratch;
         // this handler never returns to the interrupted context.
@@ -1284,7 +1284,7 @@ unsafe extern "C" fn pf_handler(error_code: u64, fault_rip: u64, hw_user_rsp: u6
 }
 
 // ---------------------------------------------------------------------------
-// Exception stub — all unhandled vectors point here.
+// Exception stub - all unhandled vectors point here.
 //
 // Reads the top four stack words and passes them to exception_halt_handler,
 // which prints them over lock-free serial before halting.  This converts
@@ -1301,7 +1301,7 @@ unsafe extern "C" fn exception_halt() -> ! {
     // EXCEPTION_HALT_REACHED set BEFORE cli so timer ISR on other cores
     // can observe the flag even though Core 0 will lose its timer after cli.
     core::arch::naked_asm!(
-        // Raw '?' to COM1 as absolute first instruction — fires for every
+        // Raw '?' to COM1 as absolute first instruction - fires for every
         // unhandled exception vector before cli or flag-set.
         "mov dx, 0x3fd",
         "88: in al, dx",
