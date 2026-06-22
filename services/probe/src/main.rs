@@ -868,16 +868,21 @@ fn mode_prop_p7(ctx: &ServiceContext) -> ! {
     // Generation monotonicity via InspectKernel(2) confirms the full kill lifecycle
     // completed correctly. No kernel panic over 50 cycles = shootdown protocol
     // is sound under concurrent SMP activity.
+    //
+    // The generation is read AFTER respawn (the live instance), not after the kill:
+    // unregister-on-death (§14.2, the self-heal) clears the dead service's name, so a
+    // by-name read in the dead window returns 0. The new instance's generation comes
+    // from the global counter, so it strictly increases every cycle (§7.5).
     let mut prev_gen: u64 = 0;
     for _ in 0..50u32 {
         let _ = ctx.kill("prop-p7-victim");
+        let _ = ctx.spawn("prop-p7-victim");
         let gen = ctx.inspect_endpoint_generation("prop-p7-victim");
         if gen <= prev_gen {
-            ctx.log("prop: P7 FAIL - generation not monotonic after kill (TLB lifecycle broken)");
+            ctx.log("prop: P7 FAIL - generation not monotonic across kill/respawn (TLB lifecycle broken)");
             idle(ctx);
         }
         prev_gen = gen;
-        let _ = ctx.spawn("prop-p7-victim");
     }
     ctx.log("prop: P7 pass (50/50)");
     idle(ctx)

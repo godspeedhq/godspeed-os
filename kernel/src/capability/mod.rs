@@ -18,6 +18,7 @@ pub mod rights;
 pub mod table;
 
 pub use cap::{Capability, CapError, ResourceId};
+pub use generation::next_generation;
 pub use rights::Rights;
 pub use table::{CapTable, mint_cap, register_resource, register_resource_at_gen,
                 get_resource_generation, mark_dead_resource, revoke_resource, cap_read_rights};

@@ -3003,26 +3003,15 @@ fn spawn_service_with_config(
         let ep_id       = crate::ipc::alloc_endpoint_id();
         let resource_id = ResourceId::from(ep_id);
 
-        // Seed the new endpoint's generation strictly above every cap previously issued for either:
-        //   (a) this NAME's prior endpoint - so a same-name restart's old caps go stale (§7.5 P2); and
-        //   (b) whatever service last held this (possibly RECLAIMED) endpoint id - the ABA guard now
-        //       that ids are reused (ipc::free_endpoint_id). A reused id MUST out-generation its
-        //       previous holder, even a different service, or a stale cap to that holder could match
-        //       the new endpoint and resurrect authority.
-        //
-        // Generations live in GLOBAL_RESOURCES (direct-indexed by ResourceId, persistent across a
-        // kill: the dead entry keeps its bumped generation until the id is reused), so both reads are
-        // exact even though routing slots are recycled by concurrent spawns.
-        let by_name_gen = crate::ipc::names::lookup(name)
-            .and_then(|old_ep| {
-                let old_rid = crate::capability::cap::ResourceId::from(old_ep);
-                crate::capability::get_resource_generation(old_rid)
-            })
-            .unwrap_or(Generation::INITIAL);
-        let by_slot_gen = crate::capability::get_resource_generation(resource_id)
-            .map(|g| g.bump())
-            .unwrap_or(Generation::INITIAL);
-        let start_gen = if by_slot_gen.0 > by_name_gen.0 { by_slot_gen } else { by_name_gen };
+        // The new endpoint's generation comes from the single GLOBAL monotonic counter (§7.5): it
+        // strictly exceeds every previously-issued endpoint generation, so a respawn always
+        // out-generations the service's prior instance (per-service monotonicity, P2/P8) AND any
+        // earlier holder of a reclaimed endpoint id (the ABA guard). This replaces the old
+        // by-name/by-slot seeding, whose by-NAME source the self-heal removed: it read the prior
+        // generation through `names::lookup(name)`, but unregister-on-death (§14.2) now clears that
+        // name, so a respawn handed a *reused* id from a different service's lineage would otherwise
+        // seed below its own prior generation. A global counter needs neither the name nor the id.
+        let start_gen = crate::capability::next_generation();
 
         // Register in global cap table at the inherited generation.
         crate::capability::register_resource_at_gen(resource_id, start_gen);
