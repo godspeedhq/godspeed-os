@@ -276,9 +276,10 @@ impl From<crate::loader::LoadError> for SpawnError {
 // ---------------------------------------------------------------------------
 // Registry ELF - conditionally replaced for §22 Test 1B.
 // When the kernel is built with --features test-bad-supervisor, the supervisor binary is two
-// garbage bytes that fail ELF loading, so `init` observes a spawn error and calls Abort (syscall 9)
-// → kernel panic (§6.2). This is §22 Test 1B (TCB-failure-panics). It targeted `registry` until the
-// registry service was retired (Path C / Phase 4); the supervisor is now the corrupt-and-fail TCB.
+// garbage bytes that fail ELF loading, so the kernel's DIRECT spawn of the supervisor fails →
+// kernel panic ("supervisor spawn failed", §6.2; no `init` Abort - init was removed in Phase 5).
+// This is §22 Test 1B (TCB-failure-panics). It targeted `registry` until the registry service was
+// retired (Path C / Phase 4); the supervisor is now the corrupt-and-fail TCB.
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "test-bad-supervisor")]

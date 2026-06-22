@@ -983,8 +983,9 @@ fn mode_fuzz_f1(ctx: &ServiceContext) -> ! {
 
 fn mode_fuzz_f2(ctx: &ServiceContext) -> ! {
     // F2 - Random syscall numbers (§22 Fuzz F2).
-    // 50,000 calls with random u64 syscall numbers, all mapped away from the
-    // valid range (1-15) and from Abort (9) which intentionally panics.
+    // 50,000 calls with random u64 syscall numbers, all remapped out of the valid syscall
+    // range (1-15) into the unknown range. (Abort/9 - which used to panic the kernel - was
+    // removed by the syscall-gating audit; every number now returns UnknownSyscall, never panics.)
     // Every call must return without a kernel panic.
     let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 31;
     let mut bad = 0u32;
