@@ -593,6 +593,15 @@ static ADV_TESTS: &[TestSpec] = &[
             timeout_secs: 30,
         },
     },
+    TestSpec {
+        id: "A13", name: "acquire_send_cap_denied_without_cap",
+        spec_ref: "§3.1; ACQUIRE_ANY - syscall/dispatch.rs handle_acquire_send_cap",
+        kind: TestKind::WatchSerial {
+            expect:       &["adv: A13 pass"],
+            fail_on:      &["KERNEL PANIC", "adv: A13 FAIL"],
+            timeout_secs: 30,
+        },
+    },
 ];
 
 // ---------------------------------------------------------------------------

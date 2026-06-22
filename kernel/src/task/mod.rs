@@ -2249,6 +2249,19 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
+        // A13: AcquireSendCap gated (§3.1). adv-a13 holds NO ACQUIRE_ANY (excluded from the grant
+        // above) and declares NO send-peers, so acquiring a SEND cap to any service must be DENIED.
+        "adv-a13" => Some(("adv-a13", ServiceConfig {
+            elf:               PROBE_ELF,
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        163, // ADV_A13: AcquireSendCap denied without ACQUIRE_ANY / declared peer
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
         // ----------------------------------------------------------------
         // Chaos-test probes - Milestone 14.
         // Victim/passive services must be listed before their controllers so
@@ -3142,8 +3155,10 @@ fn spawn_service_with_config(
     // `supervisor` (reconcile-by-name), and test probes. Ordinary services get NONE: their
     // `AcquireSendCap` is restricted to their contract-declared send-peers (recovery), so they hold no
     // ambient send authority. Probes are matched by ELF identity so no probe family is missed.
+    // `adv-a13` is the §22 Test A13 negative pin: it is deliberately EXCLUDED so it holds no
+    // ACQUIRE_ANY (and declares no send-peers), proving AcquireSendCap denies a non-holder.
     if name == "shell" || name == "supervisor"
-        || core::ptr::eq(elf_bytes.as_ptr(), PROBE_ELF.as_ptr())
+        || (core::ptr::eq(elf_bytes.as_ptr(), PROBE_ELF.as_ptr()) && name != "adv-a13")
     {
         let aa_cap = mint_cap(ACQUIRE_ANY_RESOURCE, Rights::WRITE);
         caps.insert(aa_cap)

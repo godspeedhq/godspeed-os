@@ -494,6 +494,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     // a TCG-throttled boot. Order is functionally irrelevant for it.
     let _ = ctx.spawn("adv-a11"); // introspection gated - denied without INTROSPECT cap
     let _ = ctx.spawn("adv-a12"); // reboot gated - denied without REBOOT cap (self-contained)
+    let _ = ctx.spawn("adv-a13"); // AcquireSendCap gated - denied without ACQUIRE_ANY (self-contained)
     // Passive/victim services before their attackers so endpoints exist when
     // attacker SEND caps are wired at spawn time.
     let _ = ctx.spawn("adv-a1");
@@ -785,6 +786,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("adv-a10");
     let _ = ctx.spawn("adv-a11"); // introspection gated - denied without INTROSPECT cap
     let _ = ctx.spawn("adv-a12"); // reboot gated - denied without REBOOT cap
+    let _ = ctx.spawn("adv-a13"); // AcquireSendCap gated - denied without ACQUIRE_ANY
 
     // --- Brutal performance-benchmark probes - Milestone 19 ---
     // Sender/controller BEFORE echo/recv so endpoints register first.

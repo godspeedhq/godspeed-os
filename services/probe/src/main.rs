@@ -196,6 +196,7 @@ const MODE_IRQ_RECV:        u32 = 160; // IR1A: recv interrupt event; log pass
 // Introspection-gate adversarial mode (§3.1; docs/introspection-capability.md).
 const MODE_ADV_A11:         u32 = 161; // gated query denied without INTROSPECT cap
 const MODE_ADV_A12:         u32 = 162; // reboot denied without REBOOT cap
+const MODE_ADV_A13:         u32 = 163; // AcquireSendCap denied without ACQUIRE_ANY / declared peer
 
 // Brutal property test modes - Milestone 16.
 const MODE_PROP_BP1:        u32 = 104; // BP1: cap unforgeability - 100k iterations
@@ -336,6 +337,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         MODE_ADV_A10         => mode_adv_a10(&ctx),
         MODE_ADV_A11         => mode_adv_a11(&ctx),
         MODE_ADV_A12         => mode_adv_a12(&ctx),
+        MODE_ADV_A13         => mode_adv_a13(&ctx),
         MODE_CHAOS_C2        => mode_chaos_c2(&ctx),
         MODE_CHAOS_C2_MON    => mode_chaos_c2_monitor(&ctx),
         MODE_CHAOS_C3        => mode_chaos_c3(&ctx),
@@ -1847,6 +1849,19 @@ fn mode_adv_a12(ctx: &ServiceContext) -> ! {
         idle(ctx);
     }
     ctx.log("adv: A12 pass - reboot denied without REBOOT cap (CapNotHeld); machine intact");
+    idle(ctx)
+}
+
+fn mode_adv_a13(ctx: &ServiceContext) -> ! {
+    // A13 - AcquireSendCap is gated by ACQUIRE_ANY-or-declared-peer (§3.1). adv-a13 holds NO ACQUIRE_ANY
+    // (excluded from the probe grant) and declares NO send-peers, so minting a SEND cap to ANY service
+    // must be DENIED (CapNotHeld -> acquire_send_cap returns None). `logger` is a real registered
+    // service, so a `Some` here would mean the gate is open (ambient send authority).
+    if ctx.acquire_send_cap("logger").is_some() {
+        ctx.log("adv: A13 FAIL - acquired a SEND cap to a non-peer without ACQUIRE_ANY (gate open)");
+        idle(ctx);
+    }
+    ctx.log("adv: A13 pass - AcquireSendCap denied for a non-holder, non-declared service");
     idle(ctx)
 }
 
