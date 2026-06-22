@@ -3471,6 +3471,34 @@ fn xorshift64(mut x: u64) -> u64 {
     x ^= x << 13; x ^= x >> 7; x ^= x << 17; x
 }
 
+/// One flood pass for `max-carnage`: get-or-reuse a cached SEND cap to `name`, then burst `try_send`
+/// (never blocking `send`, §8.9) until the queue saturates (`QueueFull`), the service dies
+/// (`EndpointDead`), or we hit the burst cap. Returns `(sends_landed, saturated, died)`, or `None` if
+/// the service has no reachable recv endpoint (a pure sender, or the cap table is full). The cache -
+/// one handle per service - bounds cap use to the handful of live services, so a million-round storm
+/// keeps flooding instead of exhausting the 64-slot cap table after ~64 acquires.
+fn carnage_flood(ctx: &ServiceContext, name: &str, cache: &mut Option<CapHandle>) -> Option<(u32, bool, bool)> {
+    const BURST: u32 = 64; // > queue depth (16) so saturation shows
+    let h = match *cache {
+        Some(h) => h,
+        None => match ctx.acquire_send_cap(name) {
+            Some(h) => { *cache = Some(h); h }
+            None    => return None,
+        }
+    };
+    let msg = Message::from_bytes(&[0x01]); // minimal benign payload; the target drains + drops it
+    let (mut sent, mut sat, mut died) = (0u32, false, false);
+    while sent < BURST {
+        match ctx.try_send_by_handle(h, &msg) {
+            Ok(())                      => sent += 1,
+            Err(IpcError::QueueFull)    => { sat  = true; break; }
+            Err(IpcError::EndpointDead) => { died = true; *cache = None; break; }
+            Err(_)                      => break,
+        }
+    }
+    Some((sent, sat, died))
+}
+
 /// `chaos max-carnage [rounds] [save <path>]` - the chaos monkey. Each round, snapshot the LIVE task
 /// set (exactly what `observe now` shows), pick one at **random**, and kill it - everything is fair
 /// game **except the shell itself** (killing it would kill this command) and the **kernel** (which is
@@ -3507,7 +3535,7 @@ fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
     let t0 = ctx.datetime().epoch_secs();
 
     ctx.console_writeln_fmt(format_args!(
-        "chaos max-carnage: {} rounds - kill a RANDOM live service each round (all but the shell). Press q to quit.", rounds));
+        "chaos max-carnage: {} rounds - kill OR FLOOD a RANDOM live service each round (all but the shell). Press q to quit.", rounds));
     if save_requested {
         ctx.console_writeln("(note: max-carnage doesn't save to disk - it destroys fs, so a save would fight the storm. The report below IS the record.)");
     }
@@ -3519,8 +3547,14 @@ fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
     let mut sv_nlen:   [usize;    CARNAGE_MAX_SVC] = [0usize;    CARNAGE_MAX_SVC];
     let mut sv_killed: [u64;      CARNAGE_MAX_SVC] = [0u64;      CARNAGE_MAX_SVC];
     let mut sv_recov:  [u64;      CARNAGE_MAX_SVC] = [0u64;      CARNAGE_MAX_SVC];
+    let mut sv_flooded:  [u64;               CARNAGE_MAX_SVC] = [0u64; CARNAGE_MAX_SVC];
+    let mut sv_maxdepth: [u32;               CARNAGE_MAX_SVC] = [0u32; CARNAGE_MAX_SVC];
+    let mut sv_floodkill:[u64;               CARNAGE_MAX_SVC] = [0u64; CARNAGE_MAX_SVC];
+    let mut sv_floodcap: [Option<CapHandle>; CARNAGE_MAX_SVC] = [None; CARNAGE_MAX_SVC]; // cached send cap/svc
     let mut nsv = 0usize;
     let mut killed = 0u64;
+    let mut flooded = 0u64;
+    let mut flood_saturated = 0u64;
     let mut recoverable_killed = 0u64;
     let mut recovered = 0u64;
     let mut done = 0u64;
@@ -3560,15 +3594,8 @@ fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
         nbuf[..nl].copy_from_slice(&cand[pick].0[..nl]);
         let name = str_of(&nbuf[..nl]);
 
-        let _ = ctx.kill(name);
-        killed += 1;
-        let recoverable = CHAOS_RESTARTABLE.contains(&name);
-        if recoverable { recoverable_killed += 1; }
-        // Recoverable victims are confirmed back; the rest revive on a supervisor respawn.
-        let did_recover = recoverable && chaos_wait_recovery(ctx, name, og);
-        if did_recover { recovered += 1; }
-
-        // Tally into the per-service aggregate (find-or-add; bounded).
+        // Find-or-add the service in the per-service aggregate FIRST, so kill + flood tally to the same
+        // slot and share its cached flood cap (bounded).
         let mut idx = None;
         for s in 0..nsv { if sv_name[s][..sv_nlen[s]] == nbuf[..nl] { idx = Some(s); break; } }
         let idx = match idx {
@@ -3579,7 +3606,45 @@ fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
             }
             None => None,
         };
-        if let Some(s) = idx { sv_killed[s] += 1; if did_recover { sv_recov[s] += 1; } }
+
+        // Roll the action - the creative mix: 0 = kill, 1 = flood, 2 = flood-then-kill,
+        // 3 = kill-then-flood (flood the dead/respawning endpoint - EndpointDead back-pressure / the
+        // §8.6 queue-drained-on-death case). Floods that find no endpoint just no-op (None).
+        rng = xorshift64(rng);
+        let action = rng % 4;
+        if let Some(s) = idx {
+            let mut fr1 = None;
+            let mut fr2 = None;
+            // A. flood first (flood / flood-then-kill).
+            if action == 1 || action == 2 { fr1 = carnage_flood(ctx, name, &mut sv_floodcap[s]); }
+            // B. kill (kill / flood-then-kill / kill-then-flood). A kill bumps the endpoint generation,
+            //    so the cached flood cap is now stale - drop it so C/next round reacquires.
+            if action == 0 || action == 2 || action == 3 {
+                let _ = ctx.kill(name); killed += 1; sv_killed[s] += 1; sv_floodcap[s] = None;
+            }
+            // C. flood the corpse/respawn (kill-then-flood) - before the recovery wait, so it lands
+            //    while the endpoint is actually dead or mid-respawn (back-pressure under restart).
+            if action == 3 { fr2 = carnage_flood(ctx, name, &mut sv_floodcap[s]); }
+            // D. confirm recovery for any kill (recoverable services; the rest revive on a supervisor respawn).
+            if action == 0 || action == 2 || action == 3 {
+                if CHAOS_RESTARTABLE.contains(&name) {
+                    recoverable_killed += 1;
+                    if chaos_wait_recovery(ctx, name, og) { recovered += 1; sv_recov[s] += 1; }
+                }
+            }
+            // E. tally the flood(s).
+            for fr in [fr1, fr2] {
+                if let Some((depth, sat, died)) = fr {
+                    flooded += 1; sv_flooded[s] += 1;
+                    if depth > sv_maxdepth[s] { sv_maxdepth[s] = depth; }
+                    if sat  { flood_saturated += 1; }
+                    if died { sv_floodkill[s] += 1; }
+                }
+            }
+        } else {
+            // Aggregate full (>16 distinct live services - won't happen). Kill, untallied.
+            let _ = ctx.kill(name); killed += 1;
+        }
 
         // Live heartbeat so the screen isn't frozen for a long run. The console is the kernel's
         // framebuffer/serial (not a service), so it survives the carnage. `\r` rewrites the line in
@@ -3591,12 +3656,12 @@ fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
             if elapsed > 0 {
                 let eta = (rounds - done) * elapsed / done;   // remaining / (done/elapsed) rate, seconds
                 ctx.console_write_fmt(format_args!(
-                    "\rmax-carnage: {} / {} ({}%) - {} kills - ETA {}m{:02}s - kernel alive - q to quit    ",
-                    done, rounds, pct, killed, eta / 60, eta % 60));
+                    "\rmax-carnage: {} / {} ({}%) - {} kills, {} floods - ETA {}m{:02}s - kernel alive - q to quit    ",
+                    done, rounds, pct, killed, flooded, eta / 60, eta % 60));
             } else {
                 ctx.console_write_fmt(format_args!(
-                    "\rmax-carnage: {} / {} ({}%) - {} kills - ETA --m--s - kernel alive - q to quit    ",
-                    done, rounds, pct, killed));
+                    "\rmax-carnage: {} / {} ({}%) - {} kills, {} floods - ETA --m--s - kernel alive - q to quit    ",
+                    done, rounds, pct, killed, flooded));
             }
         }
     }
@@ -3609,18 +3674,24 @@ fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
     let mut rb = ReportBuf::new();
     let _ = writeln!(rb, "=== chaos max-carnage: report ===");
     if aborted { let _ = writeln!(rb, "stopped early at round {} (you pressed q)", done); }
-    let _ = writeln!(rb, "rounds: {}; victims killed: {}", done, killed);
+    let _ = writeln!(rb, "rounds: {}; kills: {}, floods: {} ({} saturated the queue)", done, killed, flooded, flood_saturated);
     // Per-service aggregate - COMPLETE for any round count (bounded memory, never truncated).
     for s in 0..nsv {
         let name = str_of(&sv_name[s][..sv_nlen[s]]);
         if CHAOS_RESTARTABLE.contains(&name) {
-            let _ = writeln!(rb, "  {:<14} killed {:>6}, recovered {:>6}", name, sv_killed[s], sv_recov[s]);
+            let _ = writeln!(rb, "  {:<14} killed {:>5}, recovered {:>5}, flooded {:>5} (peak depth {})",
+                name, sv_killed[s], sv_recov[s], sv_flooded[s], sv_maxdepth[s]);
         } else {
-            let _ = writeln!(rb, "  {:<14} killed {:>6}  (revives on a supervisor respawn)", name, sv_killed[s]);
+            let _ = writeln!(rb, "  {:<14} killed {:>5}, flooded {:>5} (peak depth {})  (revives on a supervisor respawn)",
+                name, sv_killed[s], sv_flooded[s], sv_maxdepth[s]);
         }
     }
+    let total_floodkill: u64 = sv_floodkill.iter().sum();
+    if total_floodkill > 0 {
+        let _ = writeln!(rb, "floods that crashed a service (it respawned): {}", total_floodkill);
+    }
     let _ = writeln!(rb, "directly-restarted recoveries confirmed: {}/{}", recovered, recoverable_killed);
-    let _ = writeln!(rb, "kernel: SURVIVED {} random kills (no panic - this command returned)", killed);
+    let _ = writeln!(rb, "kernel: SURVIVED {} kills + {} floods (no panic - this command returned)", killed, flooded);
     // Survivors live now - a built-in `observe now` so the final state is in the report itself. Bounded.
     let _ = write!(rb, "survivors (live now):");
     let mut nlive = 0u32;

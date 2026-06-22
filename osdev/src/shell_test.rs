@@ -723,10 +723,11 @@ pub fn run(image_path: &Path, smp: u32) {
     send(&mut write_half, b"chaos max-carnage 8\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)) {
         Some(r) => {
-            check!(r.contains("chaos max-carnage:") && r.contains("victims killed:"), "chaos: max-carnage ran (random victims)");
-            check!(r.contains("kernel: SURVIVED") && r.contains("verdict: PASS"), "chaos: max-carnage - kernel survived the random carnage");
+            check!(r.contains("chaos max-carnage:") && r.contains("kills:") && r.contains("floods:"), "chaos: max-carnage ran (random kill + flood mix)");
+            check!(r.contains("flooded") && r.contains("peak depth"), "chaos: max-carnage report has per-service flood stats");
+            check!(r.contains("kernel: SURVIVED") && r.contains("verdict: PASS"), "chaos: max-carnage - kernel survived the kill+flood carnage");
         }
-        None => { println!("shell-test: FAIL - chaos max-carnage timed out (wedged / panic?)"); fail += 2; }
+        None => { println!("shell-test: FAIL - chaos max-carnage timed out (wedged / panic?)"); fail += 3; }
     }
     send(&mut write_half, b"cores\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
