@@ -69,6 +69,14 @@ pub const SERVICE_CONTROL_RESOURCE: ResourceId = ResourceId(6);
 /// explicit authority, never ambient (§3.1). See `docs/persistence.md` §7.4.
 pub const RESOURCE_MINT_RESOURCE: ResourceId = ResourceId(7);
 
+/// The reboot authority - hardware-reset the machine via `Reboot` (syscall 18). A reset is a
+/// denial-of-service, so it is a privileged action (§3.1): a task must hold this resource with
+/// `Rights::WRITE`. Granted only to the legitimate rebooters - the `shell` (its `reboot` command) and
+/// the USB drivers `xhci`/`ehci` (the Ctrl+Alt+Del secure-attention reboot) - so no other service can
+/// reset the box. Validated by holdings (like `kill`/8 and the introspection reads), since `Reboot`
+/// takes no arguments and leaves no slot to pass.
+pub const REBOOT_RESOURCE: ResourceId = ResourceId(8);
+
 pub fn init() {
     table::init_global();
     // Register stable kernel resources (generation 0 forever - §7.5).
@@ -79,5 +87,6 @@ pub fn init() {
     table::register_resource(INTROSPECT_RESOURCE);
     table::register_resource(SERVICE_CONTROL_RESOURCE);
     table::register_resource(RESOURCE_MINT_RESOURCE);
+    table::register_resource(REBOOT_RESOURCE);
     crate::kprintln!("capability: subsystem ready");
 }
