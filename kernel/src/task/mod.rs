@@ -2223,6 +2223,19 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
+        // A12: reboot gated - Reboot/18 denied without the REBOOT cap (§3.1).
+        // Name matches no reboot grant (only shell/xhci/ehci get it), so adv-a12 holds none.
+        "adv-a12" => Some(("adv-a12", ServiceConfig {
+            elf:               PROBE_ELF,
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        162, // ADV_A12: reboot denied without REBOOT cap
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
         // ----------------------------------------------------------------
         // Chaos-test probes - Milestone 14.
         // Victim/passive services must be listed before their controllers so

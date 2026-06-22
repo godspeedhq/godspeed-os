@@ -2,16 +2,19 @@
 
 All userspace services. Each service is a separate Rust crate that links against `sdk/rust`.
 
-## TCB members (§6.1) — non-restartable
+## TCB members (§6.1) — trusted root
 
-| Service         | Why non-restartable |
-|-----------------|---------------------|
-| `supervisor/`   | Holds restart authority + name authority; **spawned directly by the kernel** (init removed, Phase 5); its own death = system reboot |
+| Service         | Role |
+|-----------------|------|
+| `supervisor/`   | Holds restart authority + name authority; **spawned directly by the kernel** (init removed, Phase 5). Trusted, but **restartable** (Phase 6) |
 
-Failure of `supervisor` causes a kernel panic and system reboot (§6.2). No silent recovery. It is the
-**sole** non-restartable service — `init` was removed (Path C / Phase 5, the kernel spawns the
-supervisor directly) and the registry service was retired (Phase 4). Path C / Phase 6 will make even
-the supervisor restartable, leaving the kernel the only unkillable thing.
+The supervisor is trusted root, but **it is restartable** (Path C / Phase 6, §6.2): when it dies (a
+fault, or `chaos kill-storm supervisor`) the **kernel respawns it** — unconditionally and forever (no
+bound; a bound would re-introduce the reboot and hand an attacker a DoS) — and the respawned supervisor
+**reconciles**, adopting the still-running services (reacquiring each by name from the kernel directory)
+instead of duplicating them. So its death is *recovered, not a reboot*. The **only unkillable component
+is the kernel itself** (`{kernel}`) — `init` was removed (Phase 5) and the registry service retired
+(Phase 4). Pinned by §22 Test 15.
 
 ## Restartable services
 

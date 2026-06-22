@@ -2672,11 +2672,12 @@ fn find_running_slot(ctx: &ServiceContext, name: &str) -> Option<u32> {
     None
 }
 
-/// The trusted root (§6.1). The kernel refuses to kill these and refuses to spawn
-/// a second instance; the shell explains why before the syscall is even tried.
-// `registry` is no longer protected (H11 ph6): it is a restartable service, so the
-// The shell permits killing restartable services (block-driver, fs - the supervisor respawns them).
-// Only `supervisor` is the non-restartable trusted root now (Path C / Phase 5: init removed).
+/// Services the shell refuses to *casually* `kill`/`restart` at the command layer (§6.1), explaining
+/// why before the syscall is even tried. Just `supervisor`: it IS restartable (Phase 6 - the kernel
+/// respawns it on death), but a casual `kill supervisor` is refused so it is not fumbled away by
+/// accident; deliberate supervisor chaos goes through `chaos kill-storm supervisor`. Ordinary
+/// restartable services (block-driver, fs, ...) are freely killable - the supervisor respawns them.
+/// (`registry` retired, Phase 4; `init` removed, Phase 5.)
 const CORE_SERVICES: [&str; 1] = ["supervisor"];
 
 /// Shown when spawn/kill/restart targets a core service - "Not applicable" makes
@@ -3127,9 +3128,10 @@ fn cmd_restart(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<()
 
 // ── chaos - a BOUNDED resilience exerciser (not a generic firehose) ──────────────────────────────
 // Each mode stresses ONE named invariant through the shell's EXISTING capabilities (no new kernel
-// surface), runs a bounded number of rounds, and reports a loud verdict (§26.6). It never touches
-// the TCB (init/supervisor) - their death is a reboot, not graceful degradation, so there is nothing
-// to observe. v1 ships `kill-storm` (restartability); flooding/memory-pressure are future modes.
+// surface) and reports a loud verdict (§26.6). It can storm ANYTHING restartable - including the
+// `supervisor`, which the kernel respawns (Phase 6) - because the only unkillable thing is the
+// kernel; the verdict is about KERNEL survival (a panic would reboot before the report could print).
+// Ships `kill-storm` + `max-carnage`; flooding/memory-pressure are future modes.
 
 /// Services the supervisor AUTO-restarts on unexpected death (its death-notification loop -
 /// services/supervisor). Only these recover from a bare `kill`, so only these make sense as a

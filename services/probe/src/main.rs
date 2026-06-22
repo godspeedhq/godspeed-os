@@ -195,6 +195,7 @@ const MODE_IRQ_RECV:        u32 = 160; // IR1A: recv interrupt event; log pass
 
 // Introspection-gate adversarial mode (§3.1; docs/introspection-capability.md).
 const MODE_ADV_A11:         u32 = 161; // gated query denied without INTROSPECT cap
+const MODE_ADV_A12:         u32 = 162; // reboot denied without REBOOT cap
 
 // Brutal property test modes - Milestone 16.
 const MODE_PROP_BP1:        u32 = 104; // BP1: cap unforgeability - 100k iterations
@@ -334,6 +335,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         MODE_ADV_A9          => mode_adv_a9(&ctx),
         MODE_ADV_A10         => mode_adv_a10(&ctx),
         MODE_ADV_A11         => mode_adv_a11(&ctx),
+        MODE_ADV_A12         => mode_adv_a12(&ctx),
         MODE_CHAOS_C2        => mode_chaos_c2(&ctx),
         MODE_CHAOS_C2_MON    => mode_chaos_c2_monitor(&ctx),
         MODE_CHAOS_C3        => mode_chaos_c3(&ctx),
@@ -1829,6 +1831,22 @@ fn mode_adv_a11(ctx: &ServiceContext) -> ! {
         idle(ctx);
     }
     ctx.log("adv: A11 pass - gated introspection denied without cap; ambient queries open");
+    idle(ctx)
+}
+
+fn mode_adv_a12(ctx: &ServiceContext) -> ! {
+    // A12 - Reboot is gated by the REBOOT capability (§3.1). adv-a12 holds NO reboot cap (its name
+    // matches no grant - only shell/xhci/ehci get it), so Reboot/18 must be DENIED with CapNotHeld
+    // and the machine must NOT reset. `try_reboot` RETURNS the error code instead of looping; if the
+    // gate were open the syscall would never return (the box hardware-resets) and the harness would
+    // see a reboot loop instead of the pass marker - a rebooting/hung run fails the test.
+    const CAP_NOT_HELD: i64 = -2; // cap_err_to_i64(CapNotHeld) - syscall/dispatch.rs
+    let rc = ctx.try_reboot();
+    if rc != CAP_NOT_HELD {
+        ctx.log("adv: A12 FAIL - reboot not denied without REBOOT cap (gate open or wrong error)");
+        idle(ctx);
+    }
+    ctx.log("adv: A12 pass - reboot denied without REBOOT cap (CapNotHeld); machine intact");
     idle(ctx)
 }
 

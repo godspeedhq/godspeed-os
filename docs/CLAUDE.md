@@ -22,7 +22,7 @@ Narrative documentation. These files explain design decisions in prose; they do 
 | `unsafe-audit.md`   | Complete inventory of every `unsafe` block in the kernel (§18.4) |
 | `introspection-capability.md` | Design note: gating `InspectKernel`/`TaskStat` behind the `INTROSPECT` cap (§3.1) — closes the ambient-introspection exception |
 | `cluster-design.md` | Cluster mode design notes (non-normative, far-future; expands Appendix C.4 of `CLAUDE.md`) |
-| `naming-design.md`  | **Adopted, in progress:** move name→endpoint *wiring* out of the kernel — supervisor wires every service from a `name → cap` map at boot + restart (Phases 0a–3c ✅ merged). **End-state = Path C (§3.7):** kernel keeps a *minimal gated recovery directory*; registry service retires into it; init removed; **supervisor made restartable** → unkillable = `{kernel}` only (§6.3 floor). Trades a sliver of §26.10 for max fault-tolerance. Phases 4/5/6 remain |
+| `naming-design.md`  | **✅ Complete (Path C, §3.7):** name→endpoint *wiring* moved out of the kernel — the supervisor wires every service from a `name → cap` map at boot + restart, and the kernel keeps only a *minimal gated recovery directory* (`ipc::names` + `AcquireSendCap`). All phases done: registry service retired into the directory (Phase 4); `init` removed (Phase 5); **supervisor made restartable** (Phase 6) → unkillable = `{kernel}` only (§6.3 floor reached). Traded a sliver of §26.10 for max fault-tolerance. |
 
 ## `unsafe-audit.md` is special
 

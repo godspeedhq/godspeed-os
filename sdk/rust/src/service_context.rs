@@ -1123,6 +1123,17 @@ impl ServiceContext {
         loop {} // unreachable
     }
 
+    /// Attempt a reboot but RETURN the syscall result instead of assuming it never comes back.
+    ///
+    /// A successful reset does not return; a denial returns a negative error code (CapNotHeld = -2
+    /// when the caller lacks the REBOOT capability, §3.1). For tests/probes that must *observe* the
+    /// denial without resetting the machine - ordinary rebooters use `reboot()`.
+    pub fn try_reboot(&self) -> i64 {
+        // SAFETY: syscall(18) = Reboot; no arguments. On success it never returns; on denial it
+        // returns the error code, which we hand back to the caller.
+        unsafe { raw_syscall(18, 0, 0, 0) }
+    }
+
     /// Advisory yield (§9.3).
     pub fn yield_cpu(&self) {
         // SAFETY: syscall(4) = Yield; always valid from ring-3.
