@@ -16,6 +16,7 @@ pub mod placement;
 pub mod spinlock;
 
 pub use spinlock::SpinLock;
+pub use spinlock::without_interrupts;
 
 use crate::arch::x86_64::BootInfo;
 
