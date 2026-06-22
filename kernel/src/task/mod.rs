@@ -88,24 +88,30 @@ pub fn install_kstack_guards() {
 }
 
 fn alloc_kstack() -> Option<*mut u8> {
-    let mut used = KSTACK_USED.lock();
-    for i in 0..TASK_KSTACK_MAX {
-        if !used[i] {
-            used[i] = true;
-            // SAFETY: i < TASK_KSTACK_MAX; offset is within KSTACK_STORAGE bounds.
-            // addr_of_mut! yields the same pointer without materialising a &mut
-            // to the `static mut` (avoids the static_mut_refs lint).
-            // Top = high end of slot i. Usable stack is the 64 KiB just below it;
-            // the slot's low 4 KiB (the guard) sits beneath the usable region.
-            let top = unsafe {
-                (core::ptr::addr_of_mut!(KSTACK_STORAGE.data) as *mut u8)
-                    .add(i * KSTACK_STRIDE + KSTACK_STRIDE)
-            };
-            return Some(top);
+    // Interrupt-safe acquisition: KSTACK_USED is ALSO taken by `drain_pending_kstack` from the timer
+    // ISR (via `free_kstack`). Without masking, a timer firing while we hold it here re-enters the
+    // lock in the ISR on this very core and self-deadlocks (freezes the machine — the `chaos
+    // max-carnage` 1-in-~60k hang). The hold is short.
+    crate::smp::without_interrupts(|| {
+        let mut used = KSTACK_USED.lock();
+        for i in 0..TASK_KSTACK_MAX {
+            if !used[i] {
+                used[i] = true;
+                // SAFETY: i < TASK_KSTACK_MAX; offset is within KSTACK_STORAGE bounds.
+                // addr_of_mut! yields the same pointer without materialising a &mut
+                // to the `static mut` (avoids the static_mut_refs lint).
+                // Top = high end of slot i. Usable stack is the 64 KiB just below it;
+                // the slot's low 4 KiB (the guard) sits beneath the usable region.
+                let top = unsafe {
+                    (core::ptr::addr_of_mut!(KSTACK_STORAGE.data) as *mut u8)
+                        .add(i * KSTACK_STRIDE + KSTACK_STRIDE)
+                };
+                return Some(top);
+            }
         }
-    }
-    crate::kprintln!("alloc_kstack: pool exhausted (all {} slots used)", TASK_KSTACK_MAX);
-    None
+        crate::kprintln!("alloc_kstack: pool exhausted (all {} slots used)", TASK_KSTACK_MAX);
+        None
+    })
 }
 
 /// Return a kstack to the pool.
@@ -124,7 +130,13 @@ pub fn free_kstack(kstack_top: u64) {
     let idx_plus_one = offset / KSTACK_STRIDE as u64;
     if idx_plus_one == 0 || idx_plus_one > TASK_KSTACK_MAX as u64 { return; }
     let idx = (idx_plus_one - 1) as usize;
-    KSTACK_USED.lock()[idx] = false;
+    // Interrupt-safe: this runs in BOTH the syscall kill path AND the timer-ISR drain
+    // (`drain_pending_kstack`). Masking interrupts while holding KSTACK_USED prevents a timer from
+    // re-entering this lock on the same core and self-deadlocking (see `alloc_kstack`). When already
+    // called from the ISR (IF=0) the mask is a no-op and IF stays disabled.
+    crate::smp::without_interrupts(|| {
+        KSTACK_USED.lock()[idx] = false;
+    });
 }
 
 // ---------------------------------------------------------------------------

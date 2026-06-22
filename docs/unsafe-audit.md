@@ -150,7 +150,7 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | smp/ipi.rs | 23 | permitted |
 | smp/mod.rs | 1 | permitted |
 | smp/placement.rs | 1 | permitted |
-| smp/spinlock.rs | 5 | permitted |
+| smp/spinlock.rs | 7 | permitted |
 | interrupt/route.rs | 1 | grandfathered |
 | loader.rs | 4 | grandfathered |
 | main.rs | 2 | grandfathered |
@@ -159,9 +159,9 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | task/scheduler.rs | 37 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 360 lines across 21 files  
+**Permitted total:** 362 lines across 21 files  
 **Grandfathered total:** 53 lines across 6 files  
-**Grand total:** 413 lines across 27 files
+**Grand total:** 415 lines across 27 files
 
 > **2026-06-13** (branch `feat/persistence`). **ATA PIO / `hw_pio` retired** — the
 > AHCI (MMIO+DMA) backend replaced ATA PIO (the T630's SSD is AHCI-only). Reverts the
@@ -561,7 +561,13 @@ core 0 ready before spawning init). `// SAFETY:` comment present in source.
 
 ### smp/spinlock.rs
 
-`SpinLock<T>` interior-mutable spinlock. Five unsafe constructs:
+`SpinLock<T>` interior-mutable spinlock. Seven unsafe constructs:
+- `without_interrupts(f)` — two blocks: `unsafe { pushfq; pop; cli }` to capture
+  RFLAGS.IF and mask interrupts on the local core, and `unsafe { sti }` to restore
+  the prior enabled state. Local-core, no memory effects, IF restored exactly (nests
+  correctly). REQUIRED for locks taken in both syscall and interrupt context
+  (`KSTACK_USED`): without it a timer firing mid-critical-section re-enters the lock
+  in the ISR on that core and self-deadlocks (the `chaos max-carnage` freeze).
 - `unsafe impl Send for SpinLock<T>`: sound because the atomic spinlock
   serialises all access to `T`; `T: Send` is required.
 - `unsafe impl Sync for SpinLock<T>`: same reasoning — mutual exclusion is
