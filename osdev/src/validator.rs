@@ -584,6 +584,15 @@ static ADV_TESTS: &[TestSpec] = &[
             timeout_secs: 30,
         },
     },
+    TestSpec {
+        id: "A12", name: "reboot_denied_without_cap",
+        spec_ref: "§3.1; REBOOT cap - syscall/dispatch.rs handle_reboot",
+        kind: TestKind::WatchSerial {
+            expect:       &["adv: A12 pass"],
+            fail_on:      &["KERNEL PANIC", "adv: A12 FAIL"],
+            timeout_secs: 30,
+        },
+    },
 ];
 
 // ---------------------------------------------------------------------------

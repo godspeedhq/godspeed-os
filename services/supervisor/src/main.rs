@@ -311,10 +311,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Death-notification restart loop (H11 ph6; extended for fs + block-driver in Phase D).
     // The kernel enqueues the name of a dead restartable service to our endpoint; we respawn
     // it. `recv` BLOCKS, so the core still reaches the idle/halt path and runs cool between
-    // deaths (no polling). Restartable services routed here: `registry`, `block-driver`, `fs`
-    // (the trusted-root services init/supervisor remain non-restartable - their death is a
-    // kernel panic). Other restart/kill commands still arrive via the COM2 control channel
-    // (control::process_pending in the timer ISR).
+    // deaths (no polling). Restartable services routed here: `block-driver`, `fs`, `shell`, `xhci`,
+    // `ehci`, `logger`. The supervisor itself is restartable too (Phase 6) but by the KERNEL - a dead
+    // task can't respawn itself; the only death that is unrecoverable is the kernel's. (`registry`
+    // retired, Phase 4; `init` removed, Phase 5.) Other restart/kill commands still arrive via the
+    // COM2 control channel (control::process_pending in the timer ISR).
     //
     // If this build gave us no endpoint (minimal test manifests), fall back to park.
     if ctx.recv_handle().is_none() {
@@ -492,6 +493,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     // attackers (A1's 10k-iteration loop, A2 brute-force) would otherwise starve
     // a TCG-throttled boot. Order is functionally irrelevant for it.
     let _ = ctx.spawn("adv-a11"); // introspection gated - denied without INTROSPECT cap
+    let _ = ctx.spawn("adv-a12"); // reboot gated - denied without REBOOT cap (self-contained)
     // Passive/victim services before their attackers so endpoints exist when
     // attacker SEND caps are wired at spawn time.
     let _ = ctx.spawn("adv-a1");
@@ -782,6 +784,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("adv-a9");
     let _ = ctx.spawn("adv-a10");
     let _ = ctx.spawn("adv-a11"); // introspection gated - denied without INTROSPECT cap
+    let _ = ctx.spawn("adv-a12"); // reboot gated - denied without REBOOT cap
 
     // --- Brutal performance-benchmark probes - Milestone 19 ---
     // Sender/controller BEFORE echo/recv so endpoints register first.
