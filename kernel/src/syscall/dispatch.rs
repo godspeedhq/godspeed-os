@@ -34,7 +34,10 @@ pub enum SyscallNumber {
     AllocMem       = 6,
     Spawn          = 7,
     Kill           = 8,
-    Abort          = 9,
+    // 9 = removed. Was `Abort`: an UNGATED syscall any task could fire to panic the kernel - the §3.1
+    //     hole found by the syscall audit. A service that hits a fatal error dies and is restarted by
+    //     the supervisor; it does not get to abort the kernel. Number 9 now falls through to
+    //     UnknownSyscall. (`init`, its only caller, was removed in Phase 5.)
     AcquireSendCap = 10,
     SendWithCap    = 11,
     TakePendingCap = 12,
@@ -99,7 +102,6 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::SpawnReturningEndpoint as u64 => handle_spawn_returning_endpoint(arg0, arg1, arg2),
         n if n == SyscallNumber::SpawnWithCaps as u64 => handle_spawn_with_caps(arg0, arg1, arg2),
         n if n == SyscallNumber::Kill           as u64 => handle_kill(arg0, arg1),
-        n if n == SyscallNumber::Abort          as u64 => handle_abort(arg0, arg1),
         n if n == SyscallNumber::AcquireSendCap as u64 => handle_acquire_send_cap(arg0, arg1, arg2),
         n if n == SyscallNumber::DeriveCap      as u64 => handle_derive_cap(arg0, arg1, arg2),
         n if n == SyscallNumber::SendWithCap    as u64 => handle_send_with_cap(arg0, arg1, arg2),
@@ -1127,29 +1129,6 @@ fn handle_alloc_mem(size: u64) -> i64 {
     }
 
     base_va as i64
-}
-
-// ---------------------------------------------------------------------------
-// Syscall: Abort (9) - TCB service reports a fatal failure; causes kernel panic.
-// ---------------------------------------------------------------------------
-
-/// arg0 = msg_ptr (user VA), arg1 = msg_len.
-///
-/// Prints "KERNEL PANIC" immediately (so the harness sees it even on minimal
-/// serial buffering), then panics with "reason: {msg}" (§6.2, §22 Test 1B).
-/// Does not return.
-fn handle_abort(msg_ptr: u64, msg_len: u64) -> i64 {
-    let len = msg_len as usize;
-    if len > 0 && len <= 128 {
-        if let Some(bytes) = read_user_bytes(msg_ptr, len) {
-            if let Ok(s) = core::str::from_utf8(bytes) {
-                crate::kprintln!("KERNEL PANIC");
-                panic!("reason: {}", s);
-            }
-        }
-    }
-    crate::kprintln!("KERNEL PANIC");
-    panic!("reason: (init abort - no message)");
 }
 
 // ---------------------------------------------------------------------------

@@ -1098,20 +1098,9 @@ impl ServiceContext {
         }
     }
 
-    /// Trigger a kernel panic with `reason` as the message.
-    ///
-    /// Called by TCB services (init) when a required service fails to spawn
-    /// (§6.2).  Does not return.
-    pub fn abort(&self, reason: &str) -> ! {
-        let bytes = reason.as_bytes();
-        // SAFETY: syscall(9) = Abort; bytes is a valid slice in user space.
-        unsafe { raw_syscall(9, bytes.as_ptr() as u64, bytes.len() as u64, 0) };
-        // DIAGNOSTIC: ud2 fires if syscall returns (SYSCALL no-op on this hw).
-        // "EXCEPTION: #UD" at RIP after syscall → SYSCALL fell through.
-        // "KERNEL PANIC" → SYSCALL dispatched correctly; ud2 never reached.
-        // SAFETY: noreturn; ud2 is intentional - catches SYSCALL fallthrough.
-        unsafe { core::arch::asm!("ud2", options(noreturn)) }
-    }
+    // `abort()` (the kernel `Abort`/9 syscall) was removed: it let any task panic the kernel, an
+    // ungated §3.1 hole, and its only caller (`init`) is gone (Phase 5). A service that hits a fatal
+    // error now simply dies (and is restarted by the supervisor) rather than aborting the kernel.
 
     /// Trigger a hardware reset via the kernel reboot syscall (18). Does not return.
     ///
