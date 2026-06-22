@@ -61,9 +61,14 @@ static mut TASK_IS_USER: [bool; MAX_TASKS] = [false; MAX_TASKS];
 /// Zero for ring-0 tasks.
 static TASK_KERNEL_STACK_TOP: [AtomicU64; MAX_TASKS] =
     [const { AtomicU64::new(0) }; MAX_TASKS];
-/// The recv endpoint owned by each task (None if the task has no endpoint).
-static mut TASK_ENDPOINT: [Option<EndpointId>; MAX_TASKS] =
-    [const { None }; MAX_TASKS];
+/// The recv endpoint owned by each task (None if the task has no endpoint). `AtomicU64` (0 = None;
+/// endpoint ids start at 100, so 0 is never a real recv endpoint) so the accessors stay unsafe-free.
+static TASK_ENDPOINT: [AtomicU64; MAX_TASKS] =
+    [const { AtomicU64::new(0) }; MAX_TASKS];
+
+/// Encode/decode `Option<EndpointId>` as the `u64` held in a `TASK_ENDPOINT` slot.
+#[inline] fn ep_to_u64(e: Option<EndpointId>) -> u64 { match e { Some(EndpointId(id)) => id, None => 0 } }
+#[inline] fn ep_from_u64(v: u64) -> Option<EndpointId> { if v == 0 { None } else { Some(EndpointId(v)) } }
 
 /// Timed-wake deadline (TSC cycles) for a task blocked in `recv_timeout` (§12). 0 = no
 /// timed wake. Set before the task blocks; the core-0 timer ISR scans these and wakes any
@@ -157,7 +162,7 @@ static mut TASK_PENDING_RECV_CAP_COUNT: [usize; MAX_TASKS] = [0; MAX_TASKS];
 // Delegated-resource badge of the most recently recv'd message (§7.10, file-as-capability).
 // Set by handle_recv when it delivers a kernel-badged (file-cap-invoke) message; read+cleared
 // by the LastRecvBadge syscall. Packed `(badge_right << 32) | badge_id`; 0 = no badge.
-static mut TASK_LAST_BADGE: [u64; MAX_TASKS] = [0u64; MAX_TASKS];
+static TASK_LAST_BADGE: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
 
 // ---------------------------------------------------------------------------
 // Per-task memory budget (§10.3, §22 Tests 7A/7B).
@@ -404,7 +409,7 @@ pub unsafe fn commit_task(
         TASK_NAME[slot]             = name;
         TASK_IS_USER[slot]          = is_user;
         TASK_KERNEL_STACK_TOP[slot].store(kernel_stack_top, Ordering::Relaxed);
-        TASK_ENDPOINT[slot]         = endpoint_id;
+        TASK_ENDPOINT[slot].store(ep_to_u64(endpoint_id), Ordering::Relaxed);
         // TASK_STATE must be last: once Ready is visible to other cores, every
         // other field in this slot must already be correctly set.  A concurrent
         // kill_task_by_slot that observes Ready will immediately read
@@ -442,7 +447,7 @@ pub fn enqueue(
                 TASK_CORE[i]             = core_id;
                 TASK_IS_USER[i]          = is_user;
                 TASK_KERNEL_STACK_TOP[i].store(kernel_stack_top, Ordering::Relaxed);
-                TASK_ENDPOINT[i]         = endpoint_id;
+                TASK_ENDPOINT[i].store(ep_to_u64(endpoint_id), Ordering::Relaxed);
                 return;
             }
         }
@@ -493,14 +498,11 @@ pub fn current_task_holds_resource(
 /// `ResourceRevoke` (§7.10) to record/check the owner of a delegated resource.
 pub fn current_task_endpoint() -> Option<EndpointId> {
     let cid = current_core_id();
-    // SAFETY: IF=0 in syscall context; CORE_CURRENT is stable for this core.
-    unsafe {
-        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
-        if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Relaxed) {
-            TASK_ENDPOINT[cur]
-        } else {
-            None
-        }
+    let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
+    if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Relaxed) {
+        ep_from_u64(TASK_ENDPOINT[cur].load(Ordering::Relaxed))
+    } else {
+        None
     }
 }
 
@@ -569,29 +571,21 @@ pub fn for_each_cap_of<F: FnMut(&Capability)>(slot: usize, mut f: F) {
 /// `LastRecvBadge` syscall returns it in one register.
 pub fn set_last_recv_badge(badge_id: u64, badge_right: u8) {
     let cid = current_core_id();
-    // SAFETY: IF=0 in syscall context; single-core writer for this task slot.
-    unsafe {
-        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
-        if cur < MAX_TASKS {
-            TASK_LAST_BADGE[cur] =
-                if badge_id == 0 { 0 } else { ((badge_right as u64) << 32) | badge_id };
-        }
+    let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
+    if cur < MAX_TASKS {
+        let v = if badge_id == 0 { 0 } else { ((badge_right as u64) << 32) | badge_id };
+        TASK_LAST_BADGE[cur].store(v, Ordering::Relaxed);
     }
 }
 
 /// Take (and clear) the current task's last-recv badge. Returns the packed value (0 = none).
 pub fn take_last_recv_badge() -> u64 {
     let cid = current_core_id();
-    // SAFETY: IF=0 in syscall context; single-core writer for this task slot.
-    unsafe {
-        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
-        if cur < MAX_TASKS {
-            let v = TASK_LAST_BADGE[cur];
-            TASK_LAST_BADGE[cur] = 0;
-            v
-        } else {
-            0
-        }
+    let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
+    if cur < MAX_TASKS {
+        TASK_LAST_BADGE[cur].swap(0, Ordering::Relaxed)
+    } else {
+        0
     }
 }
 
@@ -717,7 +711,7 @@ pub fn task_stat(slot: usize) -> TaskStatRaw {
     // naturally-atomic on x86_64 (u64/u32/pointer-width). Best-effort consistency
     // is acceptable - same contract as for_each_active_cap.
     unsafe {
-        let endpoint = TASK_ENDPOINT[slot];
+        let endpoint = ep_from_u64(TASK_ENDPOINT[slot].load(Ordering::Relaxed));
         let (generation, queue_depth) = match endpoint {
             Some(ep) => (routing::get_generation(ep).0, routing::endpoint_queue_depth(ep)),
             None     => (0, 0),
@@ -1339,7 +1333,7 @@ pub fn kill_task_by_slot(slot: usize) {
 
         // Capture identity before any slot state changes.
         let task_name = TASK_NAME[slot];
-        let task_ep   = TASK_ENDPOINT[slot];
+        let task_ep   = ep_from_u64(TASK_ENDPOINT[slot].load(Ordering::Relaxed));
 
         // Kill the task's endpoint if it has one.
         if let Some(ep_id) = task_ep {

@@ -134,11 +134,12 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | arch/x86_64/boot.rs | 81 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |
 | arch/x86_64/fb.rs | 3 | permitted |
-| arch/x86_64/interrupts.rs | 13 | permitted |
+| arch/x86_64/interrupts.rs | 21 | permitted |
+| arch/x86_64/ioapic.rs | 8 | permitted |
 | arch/x86_64/iommu.rs | 74 | permitted |
 | arch/x86_64/mod.rs | 34 | permitted |
 | arch/x86_64/page_tables.rs | 35 | permitted |
-| arch/x86_64/pci.rs | 15 | permitted |
+| arch/x86_64/pci.rs | 17 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |
 | arch/x86_64/syscall_entry.rs | 13 | permitted |
 | capability/table.rs | 7 | permitted |
@@ -159,9 +160,22 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | task/scheduler.rs | 37 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 362 lines across 21 files  
+**Permitted total:** 380 lines across 22 files  
 **Grandfathered total:** 53 lines across 6 files  
-**Grand total:** 415 lines across 27 files
+**Grand total:** 433 lines across 28 files
+
+> **2026-06-22** (branch `fix/unsafe-audit-reconcile`). **Audit reconciliation** — caught up four
+> drifted files and shrank one back under its floor. Permitted-layer count catch-ups (all `arch/`,
+> each line already carrying a SAFETY comment — no policy issue, the counts just weren't bumped as the
+> work landed): `arch/x86_64/interrupts.rs` 13 → 21 (USB MSI ISR plumbing), `arch/x86_64/pci.rs`
+> 15 → 17 (MSI-X table mapping), and the previously-unlisted file `arch/x86_64/ioapic.rs` (+8, IOAPIC
+> MMIO register reads/writes for legacy-INTx routing). `smp/spinlock.rs` 5 → 7 (the `without_interrupts`
+> cli/sti added for the kstack-lock irqsafe fix). **`task/scheduler.rs` 40 → 37 — back at floor, NO
+> §18.5 amendment:** the 3 file-as-capability (§7.10) accessors that had drifted it over —
+> `current_task_endpoint`, `set_last_recv_badge`, `take_last_recv_badge` — were converted from
+> `static mut` (`TASK_ENDPOINT`, `TASK_LAST_BADGE`) to `AtomicU64`, making them `unsafe`-free. The
+> grandfathered floor stays 37 and there are still **no** grandfathered-floor amendments. New grand
+> total: 433 / 28 files.
 
 > **2026-06-13** (branch `feat/persistence`). **ATA PIO / `hw_pio` retired** — the
 > AHCI (MMIO+DMA) backend replaced ATA PIO (the T630's SSD is AHCI-only). Reverts the
@@ -301,6 +315,16 @@ re-enabling them. Sound because IF=0 satisfies `deliver`'s calling convention;
 the surrounding `disable_interrupts()` / `enable_interrupts()` calls are safe
 arch functions; EOI inside `deliver` is idempotent outside a real hardware
 interrupt. Used only by the `FIRE_IRQ` COM2 control command (§22 Tests IR1A/IR1B).
+
+---
+
+### arch/x86_64/ioapic.rs
+
+IOAPIC programming for legacy-INTx interrupt routing. 8 unsafe lines, each with a SAFETY comment —
+uncached MMIO access to the IOAPIC index/data window (write the register selector, then read/write the
+32-bit data register) to read the IOAPIC id/version and program redirection-table entries that route a
+legacy IRQ line to a CPU vector. Permitted `arch/` layer (direct hardware access, §18.1). The file was
+not previously in the inventory; its count was correct in source, just unaudited — added 2026-06-22.
 
 ---
 
