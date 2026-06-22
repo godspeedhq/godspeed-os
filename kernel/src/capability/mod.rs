@@ -77,6 +77,14 @@ pub const RESOURCE_MINT_RESOURCE: ResourceId = ResourceId(7);
 /// takes no arguments and leaves no slot to pass.
 pub const REBOOT_RESOURCE: ResourceId = ResourceId(8);
 
+/// The broad-acquire authority - mint a SEND cap to ANY registered service by name (`AcquireSendCap`,
+/// syscall 10), bypassing the default restriction to the caller's contract-declared send-peers. A task
+/// must hold this resource with `Rights::WRITE`. Granted only to the operator/test instruments that
+/// legitimately reach arbitrary services - the `shell` (chaos flooding, pipe sinks), the `supervisor`
+/// (reconcile by name), and test probes. Without it, `AcquireSendCap` is limited to declared peers
+/// (recovery, §13/§14.2), so an ordinary service holds no ambient send authority (§3.1).
+pub const ACQUIRE_ANY_RESOURCE: ResourceId = ResourceId(9);
+
 pub fn init() {
     table::init_global();
     // Register stable kernel resources (generation 0 forever - §7.5).
@@ -88,5 +96,6 @@ pub fn init() {
     table::register_resource(SERVICE_CONTROL_RESOURCE);
     table::register_resource(RESOURCE_MINT_RESOURCE);
     table::register_resource(REBOOT_RESOURCE);
+    table::register_resource(ACQUIRE_ANY_RESOURCE);
     crate::kprintln!("capability: subsystem ready");
 }

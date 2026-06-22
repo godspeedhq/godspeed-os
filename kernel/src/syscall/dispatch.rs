@@ -796,8 +796,9 @@ fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
 /// Looks up `name` in the kernel name registry, mints a SEND (or SEND|GRANT)
 /// cap to that endpoint in the calling task's cap table, and returns the slot.
 ///
-/// Used by services to reacquire a fresh SEND cap after `EndpointDead` (§14.2)
-/// and by property-test probes that need to transfer caps (P3 - arg2=1).
+/// Reacquire a fresh SEND cap to a named service (§14.2). **Gated (§3.1, see the in-body comment):**
+/// the caller must hold `ACQUIRE_ANY` (operator/test) or declare `name` as a contract send-peer
+/// (recovery). `arg2=1` also requests the GRANT right (cap-transfer tests, P3).
 fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> i64 {
     let len = name_len as usize;
     if len == 0 || len > 64 { return -1; }
@@ -809,6 +810,17 @@ fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> 
         Ok(s)  => s,
         Err(_) => return -1,
     };
+
+    // §3.1: minting a SEND cap to a named service is privileged. Ungated, this was ambient send
+    // authority (any task could acquire send rights to any service). Allowed only if the caller holds
+    // the ACQUIRE_ANY capability (the operator/test instruments - shell, supervisor, probes - that
+    // legitimately reach arbitrary services, e.g. chaos flooding / pipe sinks), OR `name` is one of the
+    // caller's contract-declared send-peers (recovery: reacquiring a peer after it restarted, §13/§14.2).
+    let broad = scheduler::current_task_holds_resource(
+        crate::capability::ACQUIRE_ANY_RESOURCE, Rights::WRITE);
+    if !broad && !crate::task::current_task_declares_peer(name) {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
 
     let ep_id = match crate::ipc::names::lookup(name) {
         Some(id) => id,
