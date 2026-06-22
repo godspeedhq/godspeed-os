@@ -19,7 +19,7 @@ use crate::arch::x86_64::context_switch::TaskContext;
 use crate::arch::x86_64::page_tables::{
     get_hhdm_offset, PageFlags, VirtAddr, PAGE_SIZE,
 };
-use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE};
+use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE};
 use crate::capability::cap::ResourceId;
 use crate::capability::generation::Generation;
 use crate::ipc::endpoint::EndpointId;
@@ -313,6 +313,19 @@ struct ServiceConfig {
     /// If true, mint a CONSOLE_READ_RESOURCE cap and write the slot to
     /// ServiceContextData.console_read_slot. Only the shell service sets this.
     has_console_read:  bool,
+}
+
+/// True if the calling task's contract declares `peer` as a send-peer (§13) - so reacquiring a SEND
+/// cap to it (`AcquireSendCap`) is contract-authorized recovery (§14.2), not ambient authority (§3.1).
+/// The caller's name comes from the existing `task_stat` snapshot and its declared peers from the
+/// static `service_config`, so this adds no new per-task kernel state and no new `unsafe`.
+pub fn current_task_declares_peer(peer: &str) -> bool {
+    let slot = scheduler::current_task_slot();
+    let name = scheduler::task_stat(slot).name;
+    match service_config(name) {
+        Some((_, cfg)) => cfg.send_peers.iter().any(|p| *p == peer),
+        None           => false,
+    }
 }
 
 fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
@@ -2236,6 +2249,19 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
+        // A13: AcquireSendCap gated (§3.1). adv-a13 holds NO ACQUIRE_ANY (excluded from the grant
+        // above) and declares NO send-peers, so acquiring a SEND cap to any service must be DENIED.
+        "adv-a13" => Some(("adv-a13", ServiceConfig {
+            elf:               PROBE_ELF,
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        163, // ADV_A13: AcquireSendCap denied without ACQUIRE_ANY / declared peer
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
         // ----------------------------------------------------------------
         // Chaos-test probes - Milestone 14.
         // Victim/passive services must be listed before their controllers so
@@ -3121,6 +3147,21 @@ fn spawn_service_with_config(
     if name == "shell" || name == "xhci" || name == "ehci" {
         let rb_cap = mint_cap(REBOOT_RESOURCE, Rights::WRITE);
         caps.insert(rb_cap)
+            .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
+    }
+
+    // The broad-acquire authority (§3.1): the operator/test instruments that legitimately reach
+    // ARBITRARY services by name via `AcquireSendCap` - the `shell` (chaos flooding, pipe sinks), the
+    // `supervisor` (reconcile-by-name), and test probes. Ordinary services get NONE: their
+    // `AcquireSendCap` is restricted to their contract-declared send-peers (recovery), so they hold no
+    // ambient send authority. Probes are matched by ELF identity so no probe family is missed.
+    // `adv-a13` is the §22 Test A13 negative pin: it is deliberately EXCLUDED so it holds no
+    // ACQUIRE_ANY (and declares no send-peers), proving AcquireSendCap denies a non-holder.
+    if name == "shell" || name == "supervisor"
+        || (core::ptr::eq(elf_bytes.as_ptr(), PROBE_ELF.as_ptr()) && name != "adv-a13")
+    {
+        let aa_cap = mint_cap(ACQUIRE_ANY_RESOURCE, Rights::WRITE);
+        caps.insert(aa_cap)
             .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
     }
 
