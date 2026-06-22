@@ -24,10 +24,15 @@ identity tests; `chaos` lets an operator reproduce the *between* cases live on r
 |---|---|
 | `chaos kill-storm <svc> [rounds]` | Kill one `<svc>` `rounds` times; verify it recovers each round (default 20). |
 | `chaos kill-storm <svc> [n] save <path>` | Same, and also write the report to a file at the end. |
-| `chaos max-carnage [rounds] [save <path>]` | **The chaos monkey:** kill a *random* live service each round (everything but the shell). |
+| `chaos max-carnage [rounds]` | **The chaos monkey:** kill a *random* live service each round (everything but the shell). Runs exactly the count you type; a live progress line ticks `%`/ETA; `q` aborts. |
 | `chaos help` / `chaos version` | Self-documentation (`0_conventions.md`). |
 
-`rounds` is clamped to `1..=100` (`CHAOS_MAX_ROUNDS`) — a deliberate cap (§26.6), not a firehose.
+`kill-storm` clamps `rounds` to `1..=100` (`CHAOS_MAX_ROUNDS`, §26.6) — it stores per-round generation
+detail in fixed stack arrays. **`max-carnage` has no round cap**: its report is a constant-size
+per-*service* aggregate, so the round count is a loop counter, not a resource (same reasoning as the
+unbounded supervisor respawn, §6.2). It runs exactly what you type (bounded only by `u32`); `q` aborts.
+It also takes no `save` — it destroys `fs`, so a save would fight the storm; its report is
+console-only (§5b).
 
 ### Targets (`<svc>`)
 
@@ -39,6 +44,13 @@ killing a non-recoverable thing would just wedge:
 | `supervisor` | **the kernel** — Path C / Phase 6 (§6.2): the kernel respawns the supervisor on death, *unconditionally and forever* (no bound — a bound would re-introduce the reboot and be a DoS). |
 | `block-driver` | the **supervisor** (Phase D, §6.1) — re-inits the controller on respawn. |
 | `fs` | the **supervisor** (Phase D) — re-mounts to a consistent state via its crash-consistency journal (`docs/persistence.md` §6.8). |
+| `shell` | the **supervisor** — a fresh prompt (the in-flight command is lost — a re-init, not a resume, §14.2). |
+| `xhci` / `ehci` / `logger` | the **supervisor** — drivers re-grant MMIO/DMA/IRQ + re-enumerate; logger re-drains the ring buffer. |
+
+The kernel notifies the supervisor on the death of this **directly-restartable set** so it respawns
+them immediately. And on death a service's name is **unregistered from the kernel directory** (§14.2),
+so even if its death-notification is lost (e.g. the supervisor was itself mid-respawn during a storm),
+the supervisor's reconcile finds the name *missing* and respawns it — services self-heal.
 
 > The **only unkillable component is the kernel** (`{kernel}`). `chaos` can storm anything above it;
 > there is nothing it can do to bring the kernel down — "do anything except shotgun the kernel."
@@ -94,36 +106,43 @@ round, kills **one at random** — everything is fair game **except the shell** 
 this very command, which runs *inside* the shell) and the **kernel** (not a task, cannot be killed).
 The shell is itself restartable — a direct `kill shell` respawns a fresh prompt — but `max-carnage`
 can't be the one to kill it, because a fresh shell wouldn't resume the in-flight carnage loop.
-Directly-restarted victims (supervisor/block-driver/fs) are confirmed back up; the rest come back on
-the next supervisor respawn (see below). The victim is chosen with a tiny `xorshift64` PRNG seeded from
-the **TSC** (so the sequence differs every run).
+Directly-restarted victims (the whole named set — supervisor, block-driver, fs, shell, xhci, ehci,
+logger) are confirmed back up each round; only demo services like `ping`/`pong` (full build) revive on
+the next supervisor respawn (see below). The victim is chosen with a tiny `xorshift64` PRNG seeded
+from the **TSC** (so the sequence differs every run).
 
 The point is **not** per-service recovery — it is that the **kernel survives any sequence of random
 service deaths**. The verdict is therefore about kernel survival: the report existing at all proves no
 panic (a panic reboots before it could print). A recoverable victim that did not come back in budget is
-flagged per-round, but does not fail the verdict — it may be the §6.2 supervisor-downtime edge case (a
-service that died while the supervisor was itself mid-respawn), a known service-level limitation, not a
-kernel failure.
+reported per-service (`recovered < killed`), but does not fail the verdict — it may be the §6.2
+supervisor-downtime edge case (a service that died while the supervisor was itself mid-respawn), a
+known service-level limitation, not a kernel failure.
+
+While it runs, a single **self-updating heartbeat line** (so the screen isn't frozen for a long run)
+shows progress, a running ETA, and the abort hint — `q` stops it early. The final report is a
+**per-service aggregate** (constant size for any round count) plus a built-in `observe now` survivor
+line:
 
 ```
-gsh> chaos max-carnage 8
-chaos max-carnage: 8 rounds — kill a RANDOM live service each round (everything but the shell)...
+gsh> chaos max-carnage 1000000
+chaos max-carnage: 1000000 rounds - kill a RANDOM live service each round (all but the shell). Press q to quit.
+max-carnage: 250000 / 1000000 (25%) - 250000 kills - ETA 9m00s - kernel alive - q to quit   ← live, refreshes in place
 === chaos max-carnage: report ===
-rounds: 8; victims killed: 8
-round   1: killed fs             -> recovered
-round   2: killed ehci           -> killed (revives on the next supervisor respawn)
-round   3: killed supervisor     -> recovered
-round   4: killed block-driver   -> recovered
-round   5: killed logger         -> killed (revives on the next supervisor respawn)
-round   6: killed fs             -> recovered
-round   7: killed supervisor     -> recovered
-round   8: killed xhci           -> killed (revives on the next supervisor respawn)
-directly-restarted victims recovered: 5/5
-(services not directly restarted — e.g. logger/xhci/ehci — come back on the next
- supervisor respawn, which re-runs the boot sequence; run `observe now` for the live set)
-kernel: SURVIVED 8 random kills (no panic — this command returned)
+rounds: 1000000; victims killed: 1000000
+  supervisor     killed 166k, recovered 166k
+  block-driver   killed 142k, recovered 142k
+  fs             killed 143k, recovered 143k
+  xhci           killed 137k, recovered 137k
+  ehci           killed 139k, recovered 139k
+  logger         killed 133k, recovered 133k
+directly-restarted recoveries confirmed: 1000000/1000000
+kernel: SURVIVED 1000000 random kills (no panic - this command returned)
+survivors (live now): supervisor logger block-driver fs shell xhci ehci  (7 live)
 verdict: PASS (kernel survived)
 ```
+
+All output is **ASCII** (the framebuffer font has no em-dash/ellipsis — they render as `?` on the
+panel) and `q to quit` matches the rest of the shell (`observe`, the help pager).
 
 > **The whole tree regrows from the kernel.** Only the *directly*-restarted services (supervisor by
 > the kernel; block-driver/fs by the supervisor) recover on their own death. The rest (`logger`,
@@ -145,7 +164,9 @@ explicit, through `chaos kill-storm supervisor`.
 
 ## 7. Bounded & loud (§26.6 / §26.7)
 
-- Rounds clamped to `1..=100`; per-round results live in fixed stack arrays (no heap).
+- `kill-storm` clamps rounds to `1..=100`; its per-round generation detail lives in fixed stack arrays
+  (no heap). `max-carnage` is uncapped — its per-*service* aggregate is constant-size for any count, so
+  there is nothing to bound but the loop counter; `q` aborts.
 - Each kill and each recovery is logged; a `FAIL` verdict names the round that did not recover in
   budget. Nothing is silent.
 - The kernel's supervisor respawn is itself **loud and unbounded** — it logs a running count

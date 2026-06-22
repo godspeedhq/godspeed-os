@@ -739,8 +739,8 @@ fn handle_spawn_pipe(packed_arg0: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 /// arg0 = name_ptr, arg1 = name_len.
 ///
 /// Kills the named running task: marks Dead, kills endpoint, wakes blocked tasks.
-/// Phase 5: no capability check (cap check added in Phase 6 when service_control
-/// is fully wired).
+/// Requires the `SERVICE_CONTROL` capability — validated by holdings below (§3.1 / §14.4;
+/// `docs/service-control-cap.md`).
 fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
     // §3.1 / §14.4: killing a service is a privileged action - it requires the
     // service_control capability. Without this gate `kill` was ambient authority
@@ -1502,9 +1502,13 @@ fn handle_console_push(cap_slot: u64, byte: u64) -> i64 {
 
 /// No arguments. Does not return.
 ///
-/// Phase 5: no capability check - intended for dev-mode use by the shell
-/// service (same rationale as Kill/8). Logs to serial before resetting so
-/// the operator sees confirmation in PuTTY before the line goes silent.
+/// Deliberately UNGATED (no capability check) — unlike `kill`/8, which IS now gated by
+/// SERVICE_CONTROL. `reboot` is a last-resort hardware-reset escape hatch: it is called by the shell's
+/// `reboot` command AND by the USB drivers (`xhci`/`ehci`) on an unrecoverable controller fault, and
+/// the drivers do not hold SERVICE_CONTROL. A reset is a denial-of-service at most — not an authority
+/// grant or escalation — so it sits outside the §3.1 cap gate. (To close even this: make the drivers
+/// die-and-be-respawned instead of rebooting — they are restartable now — then gate `reboot` like
+/// `kill`.) Logs to serial before resetting so the operator sees confirmation before the line goes silent.
 fn handle_reboot() -> i64 {
     crate::kprintln!("reboot: hardware reset");
     crate::arch::x86_64::hardware_reset();
