@@ -1500,16 +1500,18 @@ fn handle_console_push(cap_slot: u64, byte: u64) -> i64 {
 // Syscall: Reboot (18) - hardware reset via keyboard controller CPU reset line.
 // ---------------------------------------------------------------------------
 
-/// No arguments. Does not return.
+/// No arguments. Does not return (on success).
 ///
-/// Deliberately UNGATED (no capability check) — unlike `kill`/8, which IS now gated by
-/// SERVICE_CONTROL. `reboot` is a last-resort hardware-reset escape hatch: it is called by the shell's
-/// `reboot` command AND by the USB drivers (`xhci`/`ehci`) on an unrecoverable controller fault, and
-/// the drivers do not hold SERVICE_CONTROL. A reset is a denial-of-service at most — not an authority
-/// grant or escalation — so it sits outside the §3.1 cap gate. (To close even this: make the drivers
-/// die-and-be-respawned instead of rebooting — they are restartable now — then gate `reboot` like
-/// `kill`.) Logs to serial before resetting so the operator sees confirmation before the line goes silent.
+/// A hardware reset is a denial-of-service, so it is gated by the `REBOOT` capability (§3.1) — held
+/// only by the legitimate rebooters: the `shell` (its `reboot` command) and the USB drivers
+/// `xhci`/`ehci` (the Ctrl+Alt+Del secure-attention reboot). Any other caller gets `CapNotHeld`,
+/// closing the ambient-authority gap this syscall used to have. Validated by holdings (no arguments →
+/// no slot to pass, same form as `kill`/8). Logs to serial before resetting so the operator sees
+/// confirmation before the line goes silent.
 fn handle_reboot() -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::REBOOT_RESOURCE, Rights::WRITE) {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
     crate::kprintln!("reboot: hardware reset");
     crate::arch::x86_64::hardware_reset();
 }

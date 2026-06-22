@@ -19,7 +19,7 @@ use crate::arch::x86_64::context_switch::TaskContext;
 use crate::arch::x86_64::page_tables::{
     get_hhdm_offset, PageFlags, VirtAddr, PAGE_SIZE,
 };
-use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE};
+use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE};
 use crate::capability::cap::ResourceId;
 use crate::capability::generation::Generation;
 use crate::ipc::endpoint::EndpointId;
@@ -3099,6 +3099,15 @@ fn spawn_service_with_config(
     if name == "fs" {
         let rm_cap = mint_cap(RESOURCE_MINT_RESOURCE, Rights::WRITE);
         caps.insert(rm_cap)
+            .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
+    }
+
+    // The reboot authority (§3.1): the `shell` (its `reboot` command) and the USB drivers `xhci`/`ehci`
+    // (the Ctrl+Alt+Del secure-attention reboot) are the only legitimate rebooters - no other service
+    // can hardware-reset the machine. Closes the last ambient-authority gap (`Reboot`/18 was ungated).
+    if name == "shell" || name == "xhci" || name == "ehci" {
+        let rb_cap = mint_cap(REBOOT_RESOURCE, Rights::WRITE);
+        caps.insert(rb_cap)
             .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
     }
 
