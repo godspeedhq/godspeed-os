@@ -42,6 +42,30 @@ impl Generation {
     }
 }
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
+/// The single global source for a NEW endpoint's starting generation (§7.5).
+///
+/// Every endpoint creation (service spawn/respawn) takes the next value, so a respawn's generation
+/// strictly exceeds EVERY previously-issued endpoint generation. That gives per-service monotonicity —
+/// a restart always resolves to a higher generation (property P2/P8) — **without** depending on the
+/// service's name still being in the kernel directory (the self-heal unregisters it on death, §14.2)
+/// or on which endpoint-id the reclaim free-list hands out (a higher global generation invalidates
+/// older caps regardless, subsuming the ABA guard id-reuse needed). It replaces the by-name/by-slot
+/// seeding, whose by-name source the self-heal removed.
+///
+/// Per-resource `bump()` on death/revoke is unchanged; this only sources the generation a fresh
+/// endpoint STARTS at. Starts at 1 (0 = `INITIAL`, reserved for stable kernel resources). Panics on
+/// u32 wrap rather than rolling to 0 (which would alias `INITIAL` and resurrect authority) — ~4.2B
+/// creations per boot, unreachable in practice; loud per H7.
+static NEXT_GENERATION: AtomicU32 = AtomicU32::new(1);
+
+pub fn next_generation() -> Generation {
+    let g = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
+    if g == 0 { panic!("generation counter overflow (wrapped to 0)"); }
+    Generation(g)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
