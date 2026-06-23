@@ -694,6 +694,28 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
+    // chaos mem-pressure: on-device memory pressure (§22 S7). Each round spawns the mem-hog (allocs
+    // 4 MiB chunks to its 32 MiB limit, then AllocDenied), watches free frames drop, kills it, and
+    // confirms the frames return to baseline (v1 reclaims at death). PASS = every round allocated +
+    // reclaimed; the hog must NOT report an Ok-after-Denied accounting bug.
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"chaos mem-pressure 3\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(90)) {
+        Some(r) => {
+            check!(r.contains("chaos mem-pressure:") && r.contains("verdict: PASS"), "chaos: mem-pressure - alloc-to-limit + reclaim, PASS");
+            check!(r.contains("clean cycles") && r.contains("3/3"), "chaos: mem-pressure - 3/3 clean cycles (no leak)");
+            check!(!r.contains("mem-hog: FAIL"), "chaos: mem-pressure - no Ok-after-AllocDenied accounting bug");
+            check!(r.contains("kernel: alive"), "chaos: mem-pressure - kernel alive (no panic)");
+        }
+        None => { println!("shell-test: FAIL - chaos mem-pressure timed out (alloc/reclaim stuck / panic?)"); fail += 4; }
+    }
+    send(&mut write_half, b"cores\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains(&format!("cores: {smp}")), "chaos: shell still responsive after mem-pressure"),
+        None    => { println!("shell-test: FAIL - shell unresponsive after mem-pressure"); fail += 1; }
+    }
+
+    // -----------------------------------------------------------------------
     // chaos kill-storm SUPERVISOR (Path C / Phase 6): the supervisor is restartable too - the KERNEL
     // respawns it on every death, unconditionally (no bound - a bound would be a reboot/DoS vector).
     // Storming it 4× and recovering every round proves the unkillable set is now {kernel} alone: the
@@ -720,14 +742,15 @@ pub fn run(image_path: &Path, smp: u32) {
     // returning + reporting at all proves no panic (a panic reboots). Individual non-recoverable
     // victims staying dead is expected, so the verdict is about kernel survival, not per-service.
     // -----------------------------------------------------------------------
-    send(&mut write_half, b"chaos max-carnage 8\r");
-    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)) {
+    send(&mut write_half, b"chaos max-carnage 10\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(90)) {
         Some(r) => {
             check!(r.contains("chaos max-carnage:") && r.contains("kills:") && r.contains("floods:"), "chaos: max-carnage ran (random kill + flood mix)");
             check!(r.contains("flooded") && r.contains("peak depth"), "chaos: max-carnage report has per-service flood stats");
             check!(r.contains("kernel: SURVIVED") && r.contains("verdict: PASS"), "chaos: max-carnage - kernel survived the kill+flood carnage");
+            check!(r.contains("mem-pressure cycles"), "chaos: max-carnage - mem-pressure folded into the action mix (S7)");
         }
-        None => { println!("shell-test: FAIL - chaos max-carnage timed out (wedged / panic?)"); fail += 3; }
+        None => { println!("shell-test: FAIL - chaos max-carnage timed out (wedged / panic?)"); fail += 4; }
     }
     send(&mut write_half, b"cores\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {

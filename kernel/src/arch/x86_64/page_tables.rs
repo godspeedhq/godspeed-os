@@ -483,34 +483,22 @@ pub enum MapError {
 // Frame reclaim - used at task death (§10.5).
 // ---------------------------------------------------------------------------
 
-/// A bounded collection of physical addresses gathered during page-table teardown.
-pub struct ReclaimBuffer {
-    addrs: [u64; 512],
-    len:   usize,
-}
-
-impl ReclaimBuffer {
-    fn new() -> Self {
-        Self { addrs: [0u64; 512], len: 0 }
-    }
-
-    fn push(&mut self, phys: u64) {
-        if self.len < self.addrs.len() {
-            self.addrs[self.len] = phys;
-            self.len += 1;
-        }
-        // Silent drop if buffer is full; caller sees a shorter slice and logs.
-    }
-
-    /// Collected physical addresses to free.
-    pub fn as_slice(&self) -> &[u64] {
-        &self.addrs[..self.len]
-    }
+/// Free one physical frame back to the allocator, by physical address. Used during task-death
+/// teardown to free leaf data frames and page-table structure frames.
+///
+/// # Safety
+/// `phys` must be a frame owned by a task already marked Dead, after a TLB shootdown - i.e. no
+/// core's page-walker can still reach it. Freeing a still-reachable frame is a use-after-free.
+#[inline]
+unsafe fn free_phys_frame(phys: u64) {
+    let frame = crate::memory::frame::Frame::from_phys(crate::memory::frame::PhysAddr(phys));
+    // SAFETY: per the contract above - the frame is dead-task-owned and unreachable.
+    unsafe { crate::memory::allocator::free_frame(frame); }
 }
 
 /// Walk the user half (PML4 entries 0–255) of the address space rooted at
-/// `cr3` and collect every physical frame address into a `ReclaimBuffer` -
-/// both leaf data frames and intermediate page-table frames.
+/// `cr3` and FREE every physical frame it maps - leaf data frames AND intermediate page-table
+/// frames - back to the allocator, INLINE (no collection buffer). Returns the count freed.
 ///
 /// The kernel half (entries 256–511) is shared across all address spaces and
 /// is NOT collected.
@@ -521,38 +509,42 @@ impl ReclaimBuffer {
 /// # Safety
 /// - `cr3` must be the root PML4 of a task already marked Dead.
 /// - HHDM must be initialised.
-pub unsafe fn reclaim_user_frames(cr3: u64) -> ReclaimBuffer {
-    let mut buf   = ReclaimBuffer::new();
+pub unsafe fn reclaim_user_frames(cr3: u64) -> usize {
     let pml4_phys = cr3 & !0xFFFu64;
+    let mut freed = 0usize;
 
+    // Free INLINE during the walk - no fixed-size collection buffer. The old `ReclaimBuffer`
+    // (capacity 512) SILENTLY DROPPED every frame past 512, so any task mapping more than ~2 MiB
+    // leaked the excess at death (the §10.5 / §26.7 hole `chaos mem-pressure` surfaced: a 32 MiB
+    // `alloc_mem` task leaked ~30 MiB on every kill). Inline freeing scales to any address space.
     for pml4_i in 0..256usize {
-        let pdpt_phys = match walk(pml4_phys, pml4_i) {
-            Some(p) => p,
-            None    => continue,
-        };
+        let pdpt_phys = match walk(pml4_phys, pml4_i) { Some(p) => p, None => continue };
         for pdpt_i in 0..512usize {
-            let pd_phys = match walk(pdpt_phys, pdpt_i) {
-                Some(p) => p,
-                None    => continue,
-            };
+            let pd_phys = match walk(pdpt_phys, pdpt_i) { Some(p) => p, None => continue };
             for pd_i in 0..512usize {
-                let pt_phys = match walk(pd_phys, pd_i) {
-                    Some(p) => p,
-                    None    => continue,
-                };
+                let pt_phys = match walk(pd_phys, pd_i) { Some(p) => p, None => continue };
                 for pt_i in 0..512usize {
                     // SAFETY: pt_phys is a valid page-table frame; HHDM covers it.
                     let pte = unsafe { read_entry(pt_phys, pt_i) };
                     if entry_present(pte) {
-                        buf.push(entry_phys(pte));   // leaf data frame
+                        // SAFETY: leaf data frame of this dead task, post-shootdown; not read again.
+                        unsafe { free_phys_frame(entry_phys(pte)); }
+                        freed += 1;
                     }
                 }
-                buf.push(pt_phys);   // PT frame itself
+                // SAFETY: PT frame fully processed above; the walk never reads it again.
+                unsafe { free_phys_frame(pt_phys); }
+                freed += 1;
             }
-            buf.push(pd_phys);       // PD frame
+            // SAFETY: PD frame fully processed above.
+            unsafe { free_phys_frame(pd_phys); }
+            freed += 1;
         }
-        buf.push(pdpt_phys);         // PDPT frame
+        // SAFETY: PDPT frame fully processed above.
+        unsafe { free_phys_frame(pdpt_phys); }
+        freed += 1;
     }
-    buf.push(pml4_phys);             // PML4 root frame
-    buf
+    // The PML4 root frame is NOT freed here - the caller defers it (self-kill: the dying CR3 still
+    // points to it, §10.5 / CORE_PENDING_PML4) or frees it directly.
+    freed
 }

@@ -355,6 +355,19 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
+        // mem-hog: a spawn-on-demand memory-pressure victim for `chaos mem-pressure` (allocs 4 MiB
+        // chunks up to this limit, then AllocDenied; killed to reclaim). Not in any auto-spawn set.
+        "mem-hog" => Some(("mem-hog", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_MEM_HOG_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0,
+            memory_limit:      32 * 1024 * 1024, // ~8 chunks then AllocDenied; a clear free-frames swing
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
         "ping" => Some(("ping", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PING_ELF")),
             has_recv_endpoint: true,
