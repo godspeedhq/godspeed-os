@@ -759,6 +759,28 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
+    // chaos spawn-storm: the global-ceiling test. Spawn mem-hogs until the task-pool/memory ceiling
+    // REFUSES a spawn (loud Err, no panic), then kill them all + confirm full reclaim. With 512 MiB of
+    // RAM, ~15 hogs fill memory and footprint exhaustion refuses a spawn well before 30, so the ceiling
+    // is reliably hit. The headline invariant is no panic at the ceiling + the swarm fully reclaims.
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"chaos spawn-storm 30\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(120)) {
+        Some(r) => {
+            check!(r.contains("chaos spawn-storm:") && r.contains("verdict: PASS"), "chaos: spawn-storm - ceiling held + full reclaim, PASS");
+            check!(r.contains("ceiling: HIT"), "chaos: spawn-storm - the kernel REFUSED a spawn at the ceiling (loud, no panic)");
+            check!(r.contains("kernel: alive"), "chaos: spawn-storm - kernel alive (no panic under the swarm)");
+            check!(r.contains("hogs left 0"), "chaos: spawn-storm - every hog reclaimed (no leak at scale)");
+        }
+        None => { println!("shell-test: FAIL - chaos spawn-storm timed out (ceiling panic / reclaim stuck?)"); fail += 4; }
+    }
+    send(&mut write_half, b"cores\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains(&format!("cores: {smp}")), "chaos: shell responsive after spawn-storm"),
+        None    => { println!("shell-test: FAIL - shell unresponsive after spawn-storm"); fail += 1; }
+    }
+
+    // -----------------------------------------------------------------------
     // `kill shell` via the COMMAND (the interactive COM1 path the user types): the shell self-kills
     // and the supervisor respawns a FRESH prompt. This is the same kernel self-kill path a page fault
     // uses (deferred stack/PML4 reclaim), so the dead instance never corrupts anything; the new shell

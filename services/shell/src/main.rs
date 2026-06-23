@@ -396,7 +396,7 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
     ("date",    &["epoch"]),
     ("drives",  &["flash", "label", "reset", "check", "scrub"]),
-    ("chaos",   &["kill-storm", "flood-storm", "mem-pressure", "max-carnage"]),
+    ("chaos",   &["kill-storm", "flood-storm", "mem-pressure", "spawn-storm", "max-carnage"]),
     ("write",   &["append", "prepend"]),
     ("sort",    &["reverse"]),
     ("match",   &["except"]),
@@ -1440,6 +1440,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("  <svc> = supervisor | block-driver | fs", "recoverable targets: the supervisor respawns the services, the kernel respawns the supervisor - only the kernel can't be killed", "chaos kill-storm supervisor 10"),
             ("chaos flood-storm <svc> [rounds]", "saturate a service's IPC queue with try_send; verify it drains + stays alive (the other axis: 'overwhelmed', not 'gone')", "chaos flood-storm fs 5"),
             ("chaos mem-pressure [rounds]", "spawn a mem-hog that allocs to its limit, kill it, confirm the memory is reclaimed (alloc-to-limit + no leak, S7)", "chaos mem-pressure 5"),
+            ("chaos spawn-storm [count]", "spawn mem-hogs until the task-pool/memory ceiling REFUSES one (loud Err, no panic), then kill all + confirm full reclaim", "chaos spawn-storm"),
             ("chaos max-carnage [rounds] [save <path>]", "the chaos monkey: kill a RANDOM live service each round (everything but the shell); proves the KERNEL survives arbitrary carnage", "chaos max-carnage 30"),
         ], true),
         "drives" => help_block(ctx, "drives", "manage attached disks (records when piped)", &[
@@ -3228,6 +3229,7 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
         ctx.console_writeln("usage: chaos kill-storm <service> [rounds] [save <path>]   (service: supervisor | block-driver | fs)");
         ctx.console_writeln("       chaos flood-storm <service> [rounds]                (saturate its queue with try_send; verify it drains + stays alive)");
         ctx.console_writeln("       chaos mem-pressure [rounds]                         (spawn a mem-hog, alloc to limit, kill, confirm reclaim - S7)");
+        ctx.console_writeln("       chaos spawn-storm [count]                           (spawn mem-hogs to the system ceiling, confirm loud refusal + reclaim)");
         ctx.console_writeln("       chaos max-carnage [rounds] [save <path>]            (kill a RANDOM live service each round - all but the shell)");
         return Err(ShellError::Unknown);
     }
@@ -3235,6 +3237,7 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
         "kill-storm"   => chaos_kill_storm(ctx, cwd, &tok, ntok),
         "flood-storm"  => chaos_flood_storm(ctx, cwd, &tok, ntok),
         "mem-pressure" => chaos_mem_pressure(ctx, cwd, &tok, ntok),
+        "spawn-storm"  => chaos_spawn_storm(ctx, cwd, &tok, ntok),
         "max-carnage"  => chaos_max_carnage(ctx, cwd, &tok, ntok),
         other => {
             ctx.console_writeln_fmt(format_args!(
@@ -3552,6 +3555,125 @@ fn chaos_mem_pressure(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usiz
     if rb.overflow { let _ = writeln!(rb, "(report truncated at {} KiB)", REPORT_MAX / 1024); }
 
     for _ in 0..CHAOS_SETTLE_YIELDS { ctx.yield_cpu(); }
+    console_write_chunked(ctx, rb.bytes());
+    if pass { Ok(()) } else { Err(ShellError::Unknown) }
+}
+
+/// Count currently-live, named tasks (valid + not Dead). Bounded scan of the task table.
+fn count_live(ctx: &ServiceContext) -> u32 {
+    let mut n = 0u32;
+    for slot in 0..256u32 {
+        let st = ctx.task_stat(slot);
+        if st.valid && st.state != 4 && !st.name_str().is_empty() { n += 1; }
+    }
+    n
+}
+
+/// Count currently-live tasks with a given name (there can be many - e.g. a swarm of mem-hogs).
+fn count_named(ctx: &ServiceContext, name: &str) -> u32 {
+    let mut n = 0u32;
+    for slot in 0..256u32 {
+        let st = ctx.task_stat(slot);
+        if st.valid && st.state != 4 && st.name_str() == name { n += 1; }
+    }
+    n
+}
+
+/// `chaos spawn-storm [count]` - the GLOBAL-ceiling test (§26.6 bounded behaviour). Spawns mem-hog
+/// victims in a tight loop - each grabs its 32 MiB once scheduled - to slam BOTH global ceilings at
+/// once: the task-slot pool (224 kstack slots) and the system frame allocator. Keeps spawning until a
+/// spawn is REFUSED (the ceiling, whichever binds first on this machine) or `count`, proving the limit
+/// is enforced LOUDLY - a returned `Err`, never a panic. (mem-pressure tests ONE task's limit; this
+/// tests the whole system's.) Then kills every hog and confirms full reclaim - the leak-fix's stress
+/// test at scale. Verdict PASS = the swarm spawned, the ceiling held without a panic, every hog died,
+/// memory returned to baseline, and no pre-existing service was lost. Bounded + loud: hard spawn cap,
+/// RTC-bounded reclaim wait, q aborts.
+#[inline(never)]
+fn chaos_spawn_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
+    const SPAWN_STORM_DEFAULT: u32 = 256;  // aim past most machines' ceilings; the loop stops at the wall
+    const SPAWN_STORM_MAX:     u32 = 512;
+    const SPAWN_SETTLE:        u32 = 300;  // yields after each spawn so the hog runs + grabs its 32 MiB
+    const KILL_SETTLE:         u32 = 80;   // yields after each kill so reclaim drains
+    const RECLAIM_SECS:        i64 = 12;   // RTC bound for the final reclaim wait
+    const RECLAIM_SLACK:       u64 = 2048; // 8 MiB tolerance for "back to baseline" (absorbs noise)
+
+    let mut count = SPAWN_STORM_DEFAULT;
+    let mut i = 1;
+    while i < ntok { if let Some(n) = parse_u32(tok[i]) { count = n; } i += 1; }
+    let count = count.clamp(1, SPAWN_STORM_MAX);
+
+    let total       = ctx.inspect_kernel_total_frames();
+    let baseline    = ctx.inspect_kernel_free_frames();
+    let live_before = count_live(ctx);
+
+    ctx.console_writeln_fmt(format_args!(
+        "chaos spawn-storm: spawn up to {} mem-hogs to slam the task-pool + memory ceiling, then kill them all + confirm reclaim. q to quit.", count));
+
+    // 1. Spawn until a spawn is REFUSED (the ceiling) or `count` or q.
+    let mut spawned   = 0u32;
+    let mut refused_at = 0u32;   // spawn index that got refused (0 = never; reached `count`)
+    let mut aborted   = false;
+    for n in 0..count {
+        if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { aborted = true; break; } }
+        if ctx.spawn("mem-hog").is_err() {
+            refused_at = n + 1;   // the ceiling held - graceful refusal, no panic
+            break;
+        }
+        spawned += 1;
+        for _ in 0..SPAWN_SETTLE { ctx.yield_cpu(); }   // let the hog grab its 32 MiB before the next spawn
+    }
+
+    let low       = ctx.inspect_kernel_free_frames();   // memory floor under the swarm
+    let live_peak = count_live(ctx);
+    let hogs_peak = count_named(ctx, "mem-hog");
+
+    // 2. Kill every hog (loop until none remain). Bounded by a safety cap.
+    let mut killed = 0u32;
+    while slot_of(ctx, "mem-hog").is_some() && killed < SPAWN_STORM_MAX + 16 {
+        let _ = ctx.kill("mem-hog");
+        killed += 1;
+        for _ in 0..KILL_SETTLE { ctx.yield_cpu(); }
+    }
+
+    // 3. Wait for reclaim - free frames return to ~baseline (deferred kstacks drain on timer ticks).
+    let t0 = ctx.datetime().epoch_secs();
+    let mut hi = low;
+    loop {
+        ctx.yield_cpu();
+        let f = ctx.inspect_kernel_free_frames();
+        if f > hi { hi = f; }
+        if hi + RECLAIM_SLACK >= baseline { break; }
+        if ctx.datetime().epoch_secs() - t0 >= RECLAIM_SECS { break; }
+    }
+    let recovered  = hi;
+    let live_after = count_live(ctx);
+    let hogs_after = count_named(ctx, "mem-hog");
+
+    use core::fmt::Write as _;
+    let mut rb = ReportBuf::new();
+    let _ = writeln!(rb, "=== chaos spawn-storm: report ===");
+    if aborted { let _ = writeln!(rb, "stopped early (you pressed q)"); }
+    let _ = writeln!(rb, "system frames: {} total, {} free at baseline; live tasks before: {}", total, baseline, live_before);
+    if refused_at > 0 {
+        let _ = writeln!(rb, "ceiling: HIT at spawn #{} - the kernel REFUSED the spawn (loud Err, no panic). peak hogs {}, memory floor {} frames", refused_at, hogs_peak, low);
+    } else {
+        let _ = writeln!(rb, "ceiling: not reached - spawned all {} hogs (peak hogs {}), memory floor {} frames (machine had the headroom)", spawned, hogs_peak, low);
+    }
+    let _ = writeln!(rb, "peak live tasks: {}", live_peak);
+    let _ = writeln!(rb, "killed {} hogs; reclaim: {} free now ({} below baseline), hogs left {}", killed, recovered, baseline.saturating_sub(recovered), hogs_after);
+    let _ = writeln!(rb, "live tasks after: {} (baseline was {})", live_after, live_before);
+    let _ = writeln!(rb, "kernel: alive (no panic - this command returned)");
+    let reclaimed = recovered + RECLAIM_SLACK >= baseline && hogs_after == 0;
+    let pass = !aborted && spawned > 0 && reclaimed && live_after >= live_before;
+    let _ = writeln!(rb, "verdict: {}", if aborted {
+        "ABORTED"
+    } else if pass {
+        "PASS (ceiling held loudly + full reclaim + no service lost)"
+    } else {
+        "FAIL (no reclaim, hogs left, or a service went missing)"
+    });
+    if rb.overflow { let _ = writeln!(rb, "(report truncated at {} KiB)", REPORT_MAX / 1024); }
+
     console_write_chunked(ctx, rb.bytes());
     if pass { Ok(()) } else { Err(ShellError::Unknown) }
 }
