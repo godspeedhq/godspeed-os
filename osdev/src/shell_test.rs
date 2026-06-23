@@ -743,19 +743,42 @@ pub fn run(image_path: &Path, smp: u32) {
     // victims staying dead is expected, so the verdict is about kernel survival, not per-service.
     // -----------------------------------------------------------------------
     send(&mut write_half, b"chaos max-carnage 10\r");
-    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(90)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(120)) {
         Some(r) => {
             check!(r.contains("chaos max-carnage:") && r.contains("kills:") && r.contains("floods:"), "chaos: max-carnage ran (random kill + flood mix)");
             check!(r.contains("flooded") && r.contains("peak depth"), "chaos: max-carnage report has per-service flood stats");
             check!(r.contains("kernel: SURVIVED") && r.contains("verdict: PASS"), "chaos: max-carnage - kernel survived the kill+flood carnage");
             check!(r.contains("mem-pressure cycles"), "chaos: max-carnage - mem-pressure folded into the action mix (S7)");
+            check!(r.contains("spawn-bursts"), "chaos: max-carnage - spawn-burst folded into the action mix");
         }
-        None => { println!("shell-test: FAIL - chaos max-carnage timed out (wedged / panic?)"); fail += 4; }
+        None => { println!("shell-test: FAIL - chaos max-carnage timed out (wedged / panic?)"); fail += 5; }
     }
     send(&mut write_half, b"cores\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains(&format!("cores: {smp}")), "chaos: shell responsive after max-carnage"),
         None    => { println!("shell-test: FAIL - shell unresponsive after max-carnage"); fail += 1; }
+    }
+
+    // -----------------------------------------------------------------------
+    // chaos spawn-storm: the global-ceiling test. Spawn mem-hogs until the task-pool/memory ceiling
+    // REFUSES a spawn (loud Err, no panic), then kill them all + confirm full reclaim. With 512 MiB of
+    // RAM, ~15 hogs fill memory and footprint exhaustion refuses a spawn well before 30, so the ceiling
+    // is reliably hit. The headline invariant is no panic at the ceiling + the swarm fully reclaims.
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"chaos spawn-storm 30\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(120)) {
+        Some(r) => {
+            check!(r.contains("chaos spawn-storm:") && r.contains("verdict: PASS"), "chaos: spawn-storm - ceiling held + full reclaim, PASS");
+            check!(r.contains("ceiling: HIT"), "chaos: spawn-storm - the kernel REFUSED a spawn at the ceiling (loud, no panic)");
+            check!(r.contains("kernel: alive"), "chaos: spawn-storm - kernel alive (no panic under the swarm)");
+            check!(r.contains("hogs left 0"), "chaos: spawn-storm - every hog reclaimed (no leak at scale)");
+        }
+        None => { println!("shell-test: FAIL - chaos spawn-storm timed out (ceiling panic / reclaim stuck?)"); fail += 4; }
+    }
+    send(&mut write_half, b"cores\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains(&format!("cores: {smp}")), "chaos: shell responsive after spawn-storm"),
+        None    => { println!("shell-test: FAIL - shell unresponsive after spawn-storm"); fail += 1; }
     }
 
     // -----------------------------------------------------------------------
