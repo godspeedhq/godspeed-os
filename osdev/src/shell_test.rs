@@ -694,6 +694,28 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
+    // chaos mem-pressure: on-device memory pressure (§22 S7). Each round spawns the mem-hog (allocs
+    // 4 MiB chunks to its 32 MiB limit, then AllocDenied), watches free frames drop, kills it, and
+    // confirms the frames return to baseline (v1 reclaims at death). PASS = every round allocated +
+    // reclaimed; the hog must NOT report an Ok-after-Denied accounting bug.
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"chaos mem-pressure 3\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(90)) {
+        Some(r) => {
+            check!(r.contains("chaos mem-pressure:") && r.contains("verdict: PASS"), "chaos: mem-pressure - alloc-to-limit + reclaim, PASS");
+            check!(r.contains("clean cycles") && r.contains("3/3"), "chaos: mem-pressure - 3/3 clean cycles (no leak)");
+            check!(!r.contains("mem-hog: FAIL"), "chaos: mem-pressure - no Ok-after-AllocDenied accounting bug");
+            check!(r.contains("kernel: alive"), "chaos: mem-pressure - kernel alive (no panic)");
+        }
+        None => { println!("shell-test: FAIL - chaos mem-pressure timed out (alloc/reclaim stuck / panic?)"); fail += 4; }
+    }
+    send(&mut write_half, b"cores\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains(&format!("cores: {smp}")), "chaos: shell still responsive after mem-pressure"),
+        None    => { println!("shell-test: FAIL - shell unresponsive after mem-pressure"); fail += 1; }
+    }
+
+    // -----------------------------------------------------------------------
     // chaos kill-storm SUPERVISOR (Path C / Phase 6): the supervisor is restartable too - the KERNEL
     // respawns it on every death, unconditionally (no bound - a bound would be a reboot/DoS vector).
     // Storming it 4× and recovering every round proves the unkillable set is now {kernel} alone: the

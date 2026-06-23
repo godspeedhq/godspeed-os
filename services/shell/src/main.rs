@@ -396,7 +396,7 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
     ("date",    &["epoch"]),
     ("drives",  &["flash", "label", "reset", "check", "scrub"]),
-    ("chaos",   &["kill-storm", "flood-storm", "max-carnage"]),
+    ("chaos",   &["kill-storm", "flood-storm", "mem-pressure", "max-carnage"]),
     ("write",   &["append", "prepend"]),
     ("sort",    &["reverse"]),
     ("match",   &["except"]),
@@ -1439,6 +1439,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("chaos kill-storm <svc> [n] save <path>", "also write the report to a file (recorded in memory, written at the end)", "chaos kill-storm fs 20 save /chaos.txt"),
             ("  <svc> = supervisor | block-driver | fs", "recoverable targets: the supervisor respawns the services, the kernel respawns the supervisor - only the kernel can't be killed", "chaos kill-storm supervisor 10"),
             ("chaos flood-storm <svc> [rounds]", "saturate a service's IPC queue with try_send; verify it drains + stays alive (the other axis: 'overwhelmed', not 'gone')", "chaos flood-storm fs 5"),
+            ("chaos mem-pressure [rounds]", "spawn a mem-hog that allocs to its limit, kill it, confirm the memory is reclaimed (alloc-to-limit + no leak, S7)", "chaos mem-pressure 5"),
             ("chaos max-carnage [rounds] [save <path>]", "the chaos monkey: kill a RANDOM live service each round (everything but the shell); proves the KERNEL survives arbitrary carnage", "chaos max-carnage 30"),
         ], true),
         "drives" => help_block(ctx, "drives", "manage attached disks (records when piped)", &[
@@ -3226,13 +3227,15 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
     if ntok == 0 {
         ctx.console_writeln("usage: chaos kill-storm <service> [rounds] [save <path>]   (service: supervisor | block-driver | fs)");
         ctx.console_writeln("       chaos flood-storm <service> [rounds]                (saturate its queue with try_send; verify it drains + stays alive)");
+        ctx.console_writeln("       chaos mem-pressure [rounds]                         (spawn a mem-hog, alloc to limit, kill, confirm reclaim - S7)");
         ctx.console_writeln("       chaos max-carnage [rounds] [save <path>]            (kill a RANDOM live service each round - all but the shell)");
         return Err(ShellError::Unknown);
     }
     match tok[0] {
-        "kill-storm"  => chaos_kill_storm(ctx, cwd, &tok, ntok),
-        "flood-storm" => chaos_flood_storm(ctx, cwd, &tok, ntok),
-        "max-carnage" => chaos_max_carnage(ctx, cwd, &tok, ntok),
+        "kill-storm"   => chaos_kill_storm(ctx, cwd, &tok, ntok),
+        "flood-storm"  => chaos_flood_storm(ctx, cwd, &tok, ntok),
+        "mem-pressure" => chaos_mem_pressure(ctx, cwd, &tok, ntok),
+        "max-carnage"  => chaos_max_carnage(ctx, cwd, &tok, ntok),
         other => {
             ctx.console_writeln_fmt(format_args!(
                 "chaos: unknown mode '{}' (try: chaos kill-storm <service> [rounds])", other));
@@ -3458,6 +3461,93 @@ fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
         "PASS (queue saturated + service drained + stayed alive)"
     } else {
         "FAIL (a flood was not absorbed)"
+    });
+    if rb.overflow { let _ = writeln!(rb, "(report truncated at {} KiB)", REPORT_MAX / 1024); }
+
+    for _ in 0..CHAOS_SETTLE_YIELDS { ctx.yield_cpu(); }
+    console_write_chunked(ctx, rb.bytes());
+    if pass { Ok(()) } else { Err(ShellError::Unknown) }
+}
+
+/// `chaos mem-pressure [rounds]` - on-device memory pressure (§22 S7) through the shell's legitimate
+/// caps. Each round spawns the `mem-hog` victim (which allocates 4 MiB chunks up to its contract limit,
+/// then AllocDenied - asserting the §10.3/§10.4 "denied is sticky" invariant in the hog itself), watches
+/// the kernel's free-frame count drop while the hog holds its allocation, then KILLS the hog and
+/// confirms the frames return to baseline. v1 reclaims memory only at death, so the kill IS the "free";
+/// the no-leak check is "the frames come back". Verdict PASS = every round allocated a real chunk AND
+/// fully reclaimed it, and the kernel never panicked. Bounded + loud (§26.6): fixed rounds, RTC-bounded
+/// polls (break early on success), fixed report buffer, console-only.
+#[inline(never)]
+fn chaos_mem_pressure(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
+    const MEM_DROP_MIN:  u64 = 4096; // >= 16 MiB held counts as "allocated" (limit 32 MiB = 8192 frames)
+    const MEM_SLACK:     u64 = 1024; // 4 MiB tolerance for "reclaimed to baseline" (absorbs system noise)
+    const MEM_WAIT_SECS: i64 = 5;    // per-poll wall-clock bound (RTC); polls break early on success
+
+    let mut rounds = CHAOS_DEFAULT_ROUNDS;
+    let mut i = 1;
+    while i < ntok { if let Some(n) = parse_u32(tok[i]) { rounds = n; } i += 1; }
+    let rounds = rounds.clamp(1, CHAOS_MAX_ROUNDS);
+
+    let total    = ctx.inspect_kernel_total_frames();
+    let baseline = ctx.inspect_kernel_free_frames();
+
+    ctx.console_writeln_fmt(format_args!(
+        "chaos mem-pressure: {} rounds - spawn mem-hog (allocs to its limit), then kill it and confirm the memory returns...", rounds));
+
+    let mut grabbed = [0u32;  CHAOS_MAX_ROUNDS as usize]; // frames the hog held (baseline - low)
+    let mut leaked  = [0i64;  CHAOS_MAX_ROUNDS as usize]; // baseline - recovered (>0 = not fully reclaimed)
+    let mut ok_r    = [false; CHAOS_MAX_ROUNDS as usize];
+    let mut clean   = 0u32;
+
+    for r in 0..rounds as usize {
+        // 1. Spawn the hog; it allocs to its limit on a round-robin core.
+        let _ = ctx.spawn("mem-hog");
+        // 2. Wait for the allocation to land - free frames drop. RTC-bounded; breaks early on success.
+        let t0 = ctx.datetime().epoch_secs();
+        let mut low = baseline;
+        loop {
+            ctx.yield_cpu();
+            let f = ctx.inspect_kernel_free_frames();
+            if f < low { low = f; }
+            if baseline.saturating_sub(low) >= MEM_DROP_MIN { break; }
+            if ctx.datetime().epoch_secs() - t0 >= MEM_WAIT_SECS { break; }
+        }
+        let dropped = baseline.saturating_sub(low);
+        grabbed[r] = dropped.min(u32::MAX as u64) as u32;
+        // 3. Kill the hog - the only way v1 reclaims its memory (§10.5).
+        let _ = ctx.kill("mem-hog");
+        // 4. Wait for reclaim - free frames return toward baseline. RTC-bounded.
+        let t1 = ctx.datetime().epoch_secs();
+        let mut hi = low;
+        loop {
+            ctx.yield_cpu();
+            let f = ctx.inspect_kernel_free_frames();
+            if f > hi { hi = f; }
+            if hi + MEM_SLACK >= baseline { break; }
+            if ctx.datetime().epoch_secs() - t1 >= MEM_WAIT_SECS { break; }
+        }
+        let leak = baseline as i64 - hi as i64;
+        leaked[r] = leak;
+        ok_r[r] = dropped >= MEM_DROP_MIN && leak <= MEM_SLACK as i64;
+        if ok_r[r] { clean += 1; }
+    }
+
+    use core::fmt::Write as _;
+    let mut rb = ReportBuf::new();
+    let _ = writeln!(rb, "=== chaos mem-pressure: report ===");
+    let _ = writeln!(rb, "rounds: {}; mem-hog limit 32 MiB; system frames: {} total, {} free at baseline", rounds, total, baseline);
+    for r in 0..rounds as usize {
+        let leak = leaked[r].max(0);
+        let _ = writeln!(rb, "round {:>3}: hog held {:>6} frames (~{} MiB) -> after kill, {} frames not back ({})",
+            r + 1, grabbed[r], grabbed[r] / 256, leak, if ok_r[r] { "reclaimed" } else { "CHECK" });
+    }
+    let _ = writeln!(rb, "clean cycles (alloc-to-limit + full reclaim): {}/{}", clean, rounds);
+    let _ = writeln!(rb, "kernel: alive (no panic - this command returned)");
+    let pass = clean == rounds;
+    let _ = writeln!(rb, "verdict: {}", if pass {
+        "PASS (memory pressure absorbed + reclaimed)"
+    } else {
+        "FAIL (no alloc, or memory not reclaimed)"
     });
     if rb.overflow { let _ = writeln!(rb, "(report truncated at {} KiB)", REPORT_MAX / 1024); }
 
