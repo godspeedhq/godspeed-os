@@ -138,7 +138,7 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | arch/x86_64/ioapic.rs | 8 | permitted |
 | arch/x86_64/iommu.rs | 74 | permitted |
 | arch/x86_64/mod.rs | 34 | permitted |
-| arch/x86_64/page_tables.rs | 35 | permitted |
+| arch/x86_64/page_tables.rs | 41 | permitted |
 | arch/x86_64/pci.rs | 17 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |
 | arch/x86_64/syscall_entry.rs | 13 | permitted |
@@ -426,6 +426,18 @@ Ten additional unsafe lines (count 25 → 35) from the W^X / guard-page hardenin
   every present PDPT/PD/PT, then CR3 reload) that flips the HHDM `NO_EXEC`, closing the
   Limine-mapped RWX direct map (§3.12). Boot-ordering precondition (after `smp::init`),
   not UB — hence safe; the CR3/PTE work inside stays `unsafe {}`.
+
+Six further unsafe lines (count 35 -> 41) from the `alloc_mem` reclaim-leak fix
+(2026-06-23, surfaced by `chaos mem-pressure`):
+- `free_phys_frame(phys)` (an `unsafe fn` + one `unsafe { free_frame }`) - frees one
+  physical frame by address during task-death teardown.
+- `reclaim_user_frames` now frees each leaf / PDPT / PD / PT frame INLINE via
+  `free_phys_frame` (four call sites) instead of collecting into the fixed 512-entry
+  `ReclaimBuffer`, whose `push` silently DROPPED - i.e. LEAKED - every frame past 512 (a
+  32 MiB `alloc_mem` task leaked ~30 MiB on every kill, violating §10.5 / §26.7). The walk
+  itself is unchanged; only "collect into a buffer" became "free inline". Sound for the same
+  reason as the original: called only after the TLB shootdown has been acknowledged by all
+  cores, so no core's page-walker can reach a freed frame.
 
 All sound for the same reason as the rest of the file: HHDM is live, the tables are
 reached via present entries rooted at the live CR3-referenced PML4, and these run

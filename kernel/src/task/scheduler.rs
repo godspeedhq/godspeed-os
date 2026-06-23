@@ -1511,24 +1511,25 @@ pub fn kill_task_by_slot(slot: usize) {
                 // SAFETY: cr3 is the task's PML4 set at spawn and immutable
                 // until now.  Task is Dead; all other cores have moved past this
                 // slot (spin-wait above); no core will load this cr3 hereafter.
-                let buf = crate::arch::x86_64::page_tables::reclaim_user_frames(cr3);
-                for &phys_addr in buf.as_slice() {
-                    // In the self-kill path, skip the PML4 frame: our CR3
-                    // still points to it, and freeing it now lets another core
-                    // zero it (PageTable::new) while we hold that CR3, causing
-                    // a TLB-miss → zeroed PML4 → KERNEL PF (see CORE_PENDING_PML4).
-                    if is_self_kill && phys_addr == pml4_phys { continue; }
-                    // SAFETY: phys_addr came from this task's page table, so it
-                    // was allocated from the frame allocator and is now ours to free.
+                // reclaim_user_frames frees every user frame INLINE except the PML4 root, and
+                // returns the count (no fixed buffer - it no longer leaks large allocations).
+                let freed = crate::arch::x86_64::page_tables::reclaim_user_frames(cr3);
+                if is_self_kill {
+                    // Defer the PML4 frame: our CR3 still points to it, and freeing it now lets
+                    // another core zero it (PageTable::new) while we hold that CR3, causing a
+                    // TLB-miss → zeroed PML4 → KERNEL PF (see CORE_PENDING_PML4).
+                    if pml4_phys != 0 {
+                        CORE_PENDING_PML4[my_core].store(pml4_phys, Ordering::Release);
+                    }
+                } else if pml4_phys != 0 {
+                    // Not a self-kill: no core holds this CR3, so free the PML4 root now.
+                    // (Same unsafe context as the old in-loop free_frame above.)
                     let frame = crate::memory::frame::Frame::from_phys(
-                        crate::memory::frame::PhysAddr(phys_addr)
+                        crate::memory::frame::PhysAddr(pml4_phys)
                     );
                     crate::memory::allocator::free_frame(frame);
                 }
-                if is_self_kill && pml4_phys != 0 {
-                    CORE_PENDING_PML4[my_core].store(pml4_phys, Ordering::Release);
-                }
-                freed_frames = buf.as_slice().len();
+                freed_frames = freed;
             } else {
                 freed_frames = 0;
             }
