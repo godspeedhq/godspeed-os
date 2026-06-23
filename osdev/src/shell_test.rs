@@ -743,14 +743,15 @@ pub fn run(image_path: &Path, smp: u32) {
     // victims staying dead is expected, so the verdict is about kernel survival, not per-service.
     // -----------------------------------------------------------------------
     send(&mut write_half, b"chaos max-carnage 10\r");
-    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(90)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(120)) {
         Some(r) => {
             check!(r.contains("chaos max-carnage:") && r.contains("kills:") && r.contains("floods:"), "chaos: max-carnage ran (random kill + flood mix)");
             check!(r.contains("flooded") && r.contains("peak depth"), "chaos: max-carnage report has per-service flood stats");
             check!(r.contains("kernel: SURVIVED") && r.contains("verdict: PASS"), "chaos: max-carnage - kernel survived the kill+flood carnage");
             check!(r.contains("mem-pressure cycles"), "chaos: max-carnage - mem-pressure folded into the action mix (S7)");
+            check!(r.contains("spawn-bursts"), "chaos: max-carnage - spawn-burst folded into the action mix");
         }
-        None => { println!("shell-test: FAIL - chaos max-carnage timed out (wedged / panic?)"); fail += 4; }
+        None => { println!("shell-test: FAIL - chaos max-carnage timed out (wedged / panic?)"); fail += 5; }
     }
     send(&mut write_half, b"cores\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {

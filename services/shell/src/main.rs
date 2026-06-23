@@ -3754,6 +3754,26 @@ fn carnage_mempressure(ctx: &ServiceContext) -> (u32, bool) {
     (grabbed, hi + MP_SLACK >= before)
 }
 
+/// One spawn-burst cycle for `max-carnage`: spawn a small burst of mem-hogs concurrently (stopping at
+/// the ceiling), let them grab memory, then kill them all. Concurrent-spawn churn - the spawn-storm
+/// dimension scaled down to one round (vs mem-pressure's one-hog-at-a-time). Returns hogs spawned.
+#[inline(never)]
+fn carnage_spawn_burst(ctx: &ServiceContext) -> u32 {
+    const BURST: u32 = 4;
+    let mut spawned = 0u32;
+    for _ in 0..BURST {
+        if ctx.spawn("mem-hog").is_ok() { spawned += 1; } else { break; }   // stop at the ceiling
+    }
+    for _ in 0..600 { ctx.yield_cpu(); }                                     // let the burst grab memory
+    let mut killed = 0u32;
+    while slot_of(ctx, "mem-hog").is_some() && killed < BURST + 4 {
+        let _ = ctx.kill("mem-hog");
+        killed += 1;
+        for _ in 0..60 { ctx.yield_cpu(); }
+    }
+    spawned
+}
+
 fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
     // [rounds] [save] after tok[0] = "max-carnage". `save` is accepted but deliberately NOT honoured:
     // max-carnage destroys fs, so writing the report TO fs is a catch-22 that fights the storm (it
@@ -3781,7 +3801,7 @@ fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
     let t0 = ctx.datetime().epoch_secs();
 
     ctx.console_writeln_fmt(format_args!(
-        "chaos max-carnage: {} rounds - kill, FLOOD, or MEM-PRESSURE a random target each round (all but the shell). Press q to quit.", rounds));
+        "chaos max-carnage: {} rounds - kill, FLOOD, MEM-PRESSURE, or SPAWN-BURST a random target each round (all but the shell). Press q to quit.", rounds));
     if save_requested {
         ctx.console_writeln("(note: max-carnage doesn't save to disk - it destroys fs, so a save would fight the storm. The report below IS the record.)");
     }
@@ -3806,6 +3826,8 @@ fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
     let mut mp_cycles = 0u64;     // mem-pressure cycles run (spawn mem-hog -> alloc -> kill)
     let mut mp_churned = 0u64;    // total frames the hog grabbed across all cycles
     let mut mp_reclaimed = 0u64;  // cycles whose memory returned to ~baseline after the kill
+    let mut sb_bursts = 0u64;     // spawn-burst cycles (concurrent mem-hog spawn + kill)
+    let mut sb_spawned = 0u64;    // total hogs spawned across all bursts
     let mut done = 0u64;
     let mut aborted = false;
 
@@ -3858,16 +3880,21 @@ fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
 
         // Roll the action - the creative mix: 0 = kill, 1 = flood, 2 = flood-then-kill,
         // 3 = kill-then-flood (flood the dead/respawning endpoint - EndpointDead back-pressure / the
-        // §8.6 queue-drained-on-death case), 4 = mem-pressure (spawn a mem-hog, let it grab memory,
-        // kill it - §22 S7 churn). Floods that find no endpoint just no-op (None).
+        // §8.6 queue-drained-on-death case), 4 = mem-pressure (one mem-hog: alloc-to-limit then kill -
+        // §22 S7 churn), 5 = spawn-burst (a concurrent burst of mem-hogs spawned + killed - the
+        // spawn-storm dimension, one round). Floods that find no endpoint just no-op (None).
         rng = xorshift64(rng);
-        let action = rng % 5;
+        let action = rng % 6;
         if action == 4 {
             // mem-pressure churn: this round spends its action on memory (it ignores the picked
             // victim). Folds the S7 dimension into the monkey - the kernel must survive alloc-to-limit
             // + reclaim under chaos, alongside the kill/flood storm.
             let (grabbed, reclaimed) = carnage_mempressure(ctx);
             mp_cycles += 1; mp_churned += grabbed as u64; if reclaimed { mp_reclaimed += 1; }
+        } else if action == 5 {
+            // spawn-burst churn: concurrent-spawn pressure (a burst of mem-hogs spawned at once, then
+            // all killed). The spawn-storm ceiling dimension scaled to a single carnage round.
+            sb_bursts += 1; sb_spawned += carnage_spawn_burst(ctx) as u64;
         } else if let Some(s) = idx {
             let mut fr1 = None;
             let mut fr2 = None;
@@ -3912,12 +3939,12 @@ fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
             if elapsed > 0 {
                 let eta = (rounds - done) * elapsed / done;   // remaining / (done/elapsed) rate, seconds
                 ctx.console_write_fmt(format_args!(
-                    "\rmax-carnage: {} / {} ({}%) - {} kills, {} floods, {} mem - ETA {}m{:02}s - kernel alive - q to quit    ",
-                    done, rounds, pct, killed, flooded, mp_cycles, eta / 60, eta % 60));
+                    "\rmax-carnage: {} / {} ({}%) - {} kills, {} floods, {} mem, {} spawn - ETA {}m{:02}s - kernel alive - q to quit    ",
+                    done, rounds, pct, killed, flooded, mp_cycles, sb_bursts, eta / 60, eta % 60));
             } else {
                 ctx.console_write_fmt(format_args!(
-                    "\rmax-carnage: {} / {} ({}%) - {} kills, {} floods, {} mem - ETA --m--s - kernel alive - q to quit    ",
-                    done, rounds, pct, killed, flooded, mp_cycles));
+                    "\rmax-carnage: {} / {} ({}%) - {} kills, {} floods, {} mem, {} spawn - ETA --m--s - kernel alive - q to quit    ",
+                    done, rounds, pct, killed, flooded, mp_cycles, sb_bursts));
             }
         }
     }
@@ -3935,6 +3962,9 @@ fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
         let _ = writeln!(rb, "mem-pressure: {} cycles, {} reclaimed clean, ~{} MiB churned (spawn mem-hog -> alloc-to-limit -> kill)",
             mp_cycles, mp_reclaimed, mp_churned / 256);
     }
+    if sb_bursts > 0 {
+        let _ = writeln!(rb, "spawn-burst: {} bursts, {} mem-hogs spawned + killed (concurrent-spawn churn)", sb_bursts, sb_spawned);
+    }
     // Per-service aggregate - COMPLETE for any round count (bounded memory, never truncated).
     for s in 0..nsv {
         let name = str_of(&sv_name[s][..sv_nlen[s]]);
@@ -3951,7 +3981,7 @@ fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
         let _ = writeln!(rb, "floods that crashed a service (it respawned): {}", total_floodkill);
     }
     let _ = writeln!(rb, "directly-restarted recoveries confirmed: {}/{}", recovered, recoverable_killed);
-    let _ = writeln!(rb, "kernel: SURVIVED {} kills + {} floods + {} mem-pressure cycles (no panic - this command returned)", killed, flooded, mp_cycles);
+    let _ = writeln!(rb, "kernel: SURVIVED {} kills + {} floods + {} mem-pressure cycles + {} spawn-bursts (no panic - this command returned)", killed, flooded, mp_cycles, sb_bursts);
     // Survivors live now - a built-in `observe now` so the final state is in the report itself. Bounded.
     let _ = write!(rb, "survivors (live now):");
     let mut nlive = 0u32;
