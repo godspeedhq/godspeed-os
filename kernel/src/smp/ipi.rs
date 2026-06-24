@@ -38,22 +38,33 @@ const APIC_ICR_LOW:  u64 = 0x300;
 // actually reported, NOT a fixed `[_; MAX_CORES]` - a 4-core box reserves 4 slots, not MAX_CORES.
 //
 //   SHOOTDOWN_ADDR.get(x)     - the VA core x is invalidating (`!0` = full CR3 flush).
-//   SHOOTDOWN_ACK_MASK.get(x) - bit y set = core y has serviced x's CURRENT request. The initiator
-//                               CLEARS it to publish a request (a clear bit = "service me"); each
-//                               servicer sets its own bit; the initiator waits until every expected
-//                               bit is set. One bit per (initiator, receiver) pair. Initialised
+//   SHOOTDOWN_ACK_MASK.get(x) - a MAX_WORDS-word bitmask: bit y (word y/64, bit y%64) set = core y has
+//                               serviced x's CURRENT request. The initiator CLEARS all words to
+//                               publish (a clear bit = "service me"); each servicer sets its own bit;
+//                               the initiator waits until every expected bit is set. Initialised
 //                               all-set (!0) so a never-requested slot is not spuriously serviced.
-//                               ASSUMES <= 64 cores (one u64 of bits); widening to ceil(N/64) words is
-//                               the next step before MAX_CORES is raised past 64.
-static SHOOTDOWN_ADDR:     PerCore<AtomicU64> = PerCore::new();
-static SHOOTDOWN_ACK_MASK: PerCore<AtomicU64> = PerCore::new();
+//                               MAX_WORDS = ceil(MAX_CORES/64) covers the whole sanity ceiling, so up
+//                               to MAX_CORES cores - one bit per (initiator, receiver) pair.
+
+/// u64 words a per-initiator ack bitmask needs to hold one bit per core up to the `MAX_CORES` sanity
+/// ceiling: `ceil(MAX_CORES / 64)`.
+const MAX_WORDS: usize = crate::smp::core::MAX_CORES.div_ceil(64);
+
+static SHOOTDOWN_ADDR:     PerCore<AtomicU64>              = PerCore::new();
+static SHOOTDOWN_ACK_MASK: PerCore<[AtomicU64; MAX_WORDS]> = PerCore::new();
 
 /// Allocate the per-core shootdown arenas for `n` cores. Called once at boot (`smp::percpu_init`),
 /// after the frame allocator is up and before any shootdown can run (before APs / spawn). ADDR starts
-/// 0; the ack mask starts all-set so a never-requested slot reads "already acked by everyone".
+/// 0; every ack-mask word starts all-set so a never-requested slot reads "already acked by everyone".
 pub fn init_arenas(n: usize) {
     SHOOTDOWN_ADDR.init_with(n, |_| AtomicU64::new(0));
-    SHOOTDOWN_ACK_MASK.init_with(n, |_| AtomicU64::new(!0));
+    SHOOTDOWN_ACK_MASK.init_with(n, |_| [const { AtomicU64::new(!0) }; MAX_WORDS]);
+}
+
+/// `(word index, bit mask within that word)` for core `c` in a multi-word ack bitmask.
+#[inline]
+fn word_bit(c: usize) -> (usize, u64) {
+    (c / 64, 1u64 << (c % 64))
 }
 
 /// The calling core's id - via its LAPIC, staying within smp+arch (no up-call into the scheduler).
@@ -81,11 +92,12 @@ fn invalidate(addr: u64) {
 }
 
 /// Bitmask of every ready core except `me` - the set of acks an initiator must collect.
-fn ready_mask_excluding(me: usize) -> u64 {
-    let mut mask = 0u64;
+fn ready_mask_excluding(me: usize) -> [u64; MAX_WORDS] {
+    let mut mask = [0u64; MAX_WORDS];
     for x in 0..num_cores() {
         if x != me && crate::smp::core::is_ready(x as u32) {
-            mask |= 1u64 << x;
+            let (w, b) = word_bit(x);
+            mask[w] |= b;
         }
     }
     mask
@@ -97,12 +109,12 @@ fn ready_mask_excluding(me: usize) -> u64 {
 /// polling + invlpg), so it is safe to call IF=0 mid-spin. A slot is "pending for me" exactly when my
 /// bit is clear (the initiator cleared the whole mask to publish); after I service it I set my bit.
 fn service_pending(me: usize) {
-    let mybit = 1u64 << me;
+    let (mw, mb) = word_bit(me);
     for x in 0..num_cores() {
         if x == me || !crate::smp::core::is_ready(x as u32) { continue; }
-        if SHOOTDOWN_ACK_MASK.get(x).load(Ordering::SeqCst) & mybit == 0 {
+        if SHOOTDOWN_ACK_MASK.get(x)[mw].load(Ordering::SeqCst) & mb == 0 {
             invalidate(SHOOTDOWN_ADDR.get(x).load(Ordering::SeqCst));
-            SHOOTDOWN_ACK_MASK.get(x).fetch_or(mybit, Ordering::SeqCst);
+            SHOOTDOWN_ACK_MASK.get(x)[mw].fetch_or(mb, Ordering::SeqCst);
         }
     }
 }
@@ -175,19 +187,28 @@ unsafe fn request_and_wait(addr: u64) {
     // The acks we must collect: a bit for every OTHER ready core.
     let expected = ready_mask_excluding(me);
 
-    // Publish: set the address, THEN clear my ack mask. The clear IS the "new request" signal (a
-    // servicer acts on a clear bit), so the address must land first - a servicer seeing its bit clear
-    // then reads the new address.
+    // Publish: set the address, THEN clear every ack-mask word. The clear IS the "new request" signal
+    // (a servicer acts on a clear bit), so the address must land first - a servicer seeing its bit
+    // clear then reads the new address.
     SHOOTDOWN_ADDR.get(me).store(addr, Ordering::SeqCst);
-    SHOOTDOWN_ACK_MASK.get(me).store(0, Ordering::SeqCst);
+    for w in 0..MAX_WORDS {
+        SHOOTDOWN_ACK_MASK.get(me)[w].store(0, Ordering::SeqCst);
+    }
 
     // SAFETY: APIC mapped; IF=0.
     unsafe { broadcast_shootdown_ipi(); }
 
-    // Wait until every expected core has set its bit, servicing theirs meanwhile so two cores shooting
-    // down at once ack each other instead of deadlocking.
-    while SHOOTDOWN_ACK_MASK.get(me).load(Ordering::SeqCst) & expected != expected {
+    // Wait until every expected core (across all words) has set its bit, servicing theirs meanwhile so
+    // two cores shooting down at once ack each other instead of deadlocking.
+    loop {
         service_pending(me);
+        let done = (0..MAX_WORDS).all(|w| {
+            let acked = SHOOTDOWN_ACK_MASK.get(me)[w].load(Ordering::SeqCst);
+            acked & expected[w] == expected[w]
+        });
+        if done {
+            break;
+        }
         core::hint::spin_loop();
     }
 }
