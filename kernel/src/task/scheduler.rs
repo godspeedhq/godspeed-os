@@ -25,7 +25,7 @@ use crate::capability::table::CapTable;
 use crate::ipc::endpoint::EndpointId;
 use crate::ipc::message::Message;
 use crate::ipc::routing;
-use crate::smp::percpu::PerCoreMut;
+use crate::smp::percpu::{num_cores, PerCore, PerCoreMut};
 use crate::task::state::TaskState;
 
 // ---------------------------------------------------------------------------
@@ -33,7 +33,6 @@ use crate::task::state::TaskState;
 // ---------------------------------------------------------------------------
 
 pub const MAX_TASKS: usize = 224;
-const MAX_CORES: usize = crate::smp::core::MAX_CORES;
 
 /// Sentinel meaning "no task running" (scheduler idle loop active).
 const IDLE: usize = MAX_TASKS;
@@ -189,8 +188,7 @@ static TASK_RUN_TICKS: [AtomicU64; MAX_TASKS] =
 // ---------------------------------------------------------------------------
 
 /// Index of the task currently running on each core (IDLE if none).
-static CORE_CURRENT: [AtomicUsize; MAX_CORES] =
-    [const { AtomicUsize::new(IDLE) }; MAX_CORES];
+static CORE_CURRENT: PerCore<AtomicUsize> = PerCore::new();
 /// AtomicU64 padded to one 64-byte cache line to prevent false sharing between
 /// per-core ISR hot-path writes on different cores (`lock xadd` on adjacent
 /// elements would otherwise bounce the same cache line between cores).
@@ -198,11 +196,9 @@ static CORE_CURRENT: [AtomicUsize; MAX_CORES] =
 struct CachePaddedU64(AtomicU64);
 
 /// Timer ticks each core spent running a user task (not idle).
-static CORE_ACTIVE_TICKS: [CachePaddedU64; MAX_CORES] =
-    [const { CachePaddedU64(AtomicU64::new(0)) }; MAX_CORES];
+static CORE_ACTIVE_TICKS: PerCore<CachePaddedU64> = PerCore::new();
 /// Total timer ticks seen on each core.
-static CORE_TOTAL_TICKS: [CachePaddedU64; MAX_CORES] =
-    [const { CachePaddedU64(AtomicU64::new(0)) }; MAX_CORES];
+static CORE_TOTAL_TICKS: PerCore<CachePaddedU64> = PerCore::new();
 
 /// Sticky round-robin scan pointer per core (§9.1, §9.3).
 ///
@@ -212,8 +208,7 @@ static CORE_TOTAL_TICKS: [CachePaddedU64; MAX_CORES] =
 /// before the pointer wraps back to an earlier slot, preventing high-numbered
 /// task slots (e.g. ping at slot 185) from being permanently starved by a
 /// dense band of ready tasks at lower slots (the root cause of 8B flakiness).
-static CORE_RR_SLOT: [AtomicUsize; MAX_CORES] =
-    [const { AtomicUsize::new(0) }; MAX_CORES];
+static CORE_RR_SLOT: PerCore<AtomicUsize> = PerCore::new();
 
 /// Per-core immediate-schedule hint set by `wake_by_slot`.
 ///
@@ -227,8 +222,7 @@ static CORE_RR_SLOT: [AtomicUsize; MAX_CORES] =
 /// Sentinel: `MAX_TASKS` = no hint pending.  Written with Release by
 /// `wake_by_slot` so the Ready state written before the hint is visible to
 /// `pick_next`'s subsequent Acquire load of TASK_STATE.
-static CORE_WAKE_HINT: [AtomicUsize; MAX_CORES] =
-    [const { AtomicUsize::new(MAX_TASKS) }; MAX_CORES];
+static CORE_WAKE_HINT: PerCore<AtomicUsize> = PerCore::new();
 
 /// Per-core queue of kernel stack tops awaiting deferred free after a self-kill.
 ///
@@ -250,8 +244,7 @@ static CORE_WAKE_HINT: [AtomicUsize; MAX_CORES] =
 /// ISR can only fire after that point, by which time RSP is not on K_a.
 const PENDING_KSTACK_CAP: usize = 8;
 static CORE_PENDING_KSTACK: PerCoreMut<[u64; PENDING_KSTACK_CAP]> = PerCoreMut::new();
-static CORE_PENDING_KSTACK_LEN: [AtomicUsize; MAX_CORES] =
-    [const { AtomicUsize::new(0) }; MAX_CORES];
+static CORE_PENDING_KSTACK_LEN: PerCore<AtomicUsize> = PerCore::new();
 
 /// Per-core PML4 frame (physical address) awaiting deferred free after a self-kill.
 ///
@@ -270,8 +263,7 @@ static CORE_PENDING_KSTACK_LEN: [AtomicUsize; MAX_CORES] =
 /// AtomicU64 (not static mut) so reads and writes at call sites are safe.
 /// The value is always written by one core and read by the same core, so
 /// Relaxed/Release/Acquire ordering is sufficient.
-static CORE_PENDING_PML4: [AtomicU64; MAX_CORES] =
-    [const { AtomicU64::new(0) }; MAX_CORES];
+static CORE_PENDING_PML4: PerCore<AtomicU64> = PerCore::new();
 
 /// Per-core save area for dead task context during self-kill.
 ///
@@ -295,6 +287,13 @@ pub fn init_arenas(n: usize) {
     CORE_PENDING_KSTACK.init_with(n, |_| [0u64; PENDING_KSTACK_CAP]);
     CORE_DEAD_CTX.init_with(n, |_| ZERO_CTX);
     CORE_SCHED_CTX.init_with(n, |_| ZERO_CTX);
+    CORE_CURRENT.init_with(n, |_| AtomicUsize::new(IDLE));
+    CORE_ACTIVE_TICKS.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
+    CORE_TOTAL_TICKS.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
+    CORE_RR_SLOT.init_with(n, |_| AtomicUsize::new(0));
+    CORE_WAKE_HINT.init_with(n, |_| AtomicUsize::new(MAX_TASKS));
+    CORE_PENDING_KSTACK_LEN.init_with(n, |_| AtomicUsize::new(0));
+    CORE_PENDING_PML4.init_with(n, |_| AtomicU64::new(0));
 }
 
 
@@ -472,7 +471,7 @@ pub fn current_task_lookup_cap(slot: usize, right: Rights) -> Result<Capability,
     let cid  = current_core_id();
     // SAFETY: IF=0 in syscall context; CORE_CURRENT is stable for this core.
     unsafe {
-        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
+        let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
         if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Relaxed) {
             TASK_CAP[cur].assume_init_ref().get(slot, right)
         } else {
@@ -492,7 +491,7 @@ pub fn current_task_holds_resource(
     let cid = current_core_id();
     // SAFETY: IF=0 in syscall context; CORE_CURRENT is stable for this core.
     unsafe {
-        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
+        let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
         if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Relaxed) {
             TASK_CAP[cur].assume_init_ref().holds_resource(rid, right)
         } else {
@@ -505,7 +504,7 @@ pub fn current_task_holds_resource(
 /// `ResourceRevoke` (§7.10) to record/check the owner of a delegated resource.
 pub fn current_task_endpoint() -> Option<EndpointId> {
     let cid = current_core_id();
-    let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
+    let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
     if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Relaxed) {
         ep_from_u64(TASK_ENDPOINT[cur].load(Ordering::Relaxed))
     } else {
@@ -517,7 +516,7 @@ pub fn current_task_endpoint() -> Option<EndpointId> {
 pub fn current_task_remove_cap(slot: usize) -> Option<Capability> {
     let cid = current_core_id();
     unsafe {
-        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
+        let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
         if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Relaxed) {
             TASK_CAP[cur].assume_init_mut().remove(slot)
         } else {
@@ -532,7 +531,7 @@ pub fn current_task_remove_cap(slot: usize) -> Option<Capability> {
 pub fn current_task_read_cap_rights(slot: usize) -> Option<Rights> {
     let cid = current_core_id();
     unsafe {
-        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
+        let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
         if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Relaxed) {
             crate::capability::cap_read_rights(TASK_CAP[cur].assume_init_ref(), slot)
         } else {
@@ -578,7 +577,7 @@ pub fn for_each_cap_of<F: FnMut(&Capability)>(slot: usize, mut f: F) {
 /// `LastRecvBadge` syscall returns it in one register.
 pub fn set_last_recv_badge(badge_id: u64, badge_right: u8) {
     let cid = current_core_id();
-    let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
+    let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
     if cur < MAX_TASKS {
         let v = if badge_id == 0 { 0 } else { ((badge_right as u64) << 32) | badge_id };
         TASK_LAST_BADGE[cur].store(v, Ordering::Relaxed);
@@ -588,7 +587,7 @@ pub fn set_last_recv_badge(badge_id: u64, badge_right: u8) {
 /// Take (and clear) the current task's last-recv badge. Returns the packed value (0 = none).
 pub fn take_last_recv_badge() -> u64 {
     let cid = current_core_id();
-    let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
+    let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
     if cur < MAX_TASKS {
         TASK_LAST_BADGE[cur].swap(0, Ordering::Relaxed)
     } else {
@@ -600,7 +599,7 @@ pub fn push_pending_recv_cap(cap_slot: u32) {
     let cid = current_core_id();
     // SAFETY: IF=0 in syscall context; single core writer.
     unsafe {
-        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
+        let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
         if cur < MAX_TASKS {
             let count = TASK_PENDING_RECV_CAP_COUNT[cur];
             if count < MAX_PENDING_RECV_CAPS {
@@ -617,7 +616,7 @@ pub fn pop_pending_recv_cap() -> Option<u32> {
     let cid = current_core_id();
     // SAFETY: IF=0 in syscall context; single core writer.
     unsafe {
-        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
+        let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
         if cur < MAX_TASKS {
             let count = TASK_PENDING_RECV_CAP_COUNT[cur];
             if count > 0 {
@@ -662,7 +661,7 @@ pub fn current_task_claim_alloc(size: u64) -> Option<u64> {
     let cid = current_core_id();
     // SAFETY: IF=0 in syscall context; single core writer.
     unsafe {
-        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
+        let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
         if cur >= MAX_TASKS || !TASK_VALID[cur].load(Ordering::Relaxed) { return None; }
 
         // Overflow guard: (size + 4095) wraps for very large values (e.g. u64::MAX).
@@ -686,7 +685,7 @@ pub fn current_task_alloc_bytes() -> u64 {
     let cid = current_core_id();
     // SAFETY: IF=0 in syscall context; single core reader for this slot.
     unsafe {
-        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
+        let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
         if cur >= MAX_TASKS || !TASK_VALID[cur].load(Ordering::Relaxed) { return 0; }
         TASK_ALLOC_BYTES[cur]
     }
@@ -739,21 +738,21 @@ pub fn task_stat(slot: usize) -> TaskStatRaw {
 
 /// Total timer ticks the given core spent running a user task (not idle).
 pub fn core_active_ticks(core: usize) -> u64 {
-    if core >= MAX_CORES { return 0; }
-    CORE_ACTIVE_TICKS[core].0.load(Ordering::Relaxed)
+    if core >= num_cores() { return 0; }
+    CORE_ACTIVE_TICKS.get(core).0.load(Ordering::Relaxed)
 }
 
 /// Total timer ticks seen on the given core since boot.
 pub fn core_total_ticks(core: usize) -> u64 {
-    if core >= MAX_CORES { return 0; }
-    CORE_TOTAL_TICKS[core].0.load(Ordering::Relaxed)
+    if core >= num_cores() { return 0; }
+    CORE_TOTAL_TICKS.get(core).0.load(Ordering::Relaxed)
 }
 
 /// Insert a capability into the current task's table (incoming GRANT).
 pub fn current_task_insert_cap(cap: Capability) -> Result<usize, CapError> {
     let cid = current_core_id();
     unsafe {
-        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
+        let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
         if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Relaxed) {
             TASK_CAP[cur].assume_init_mut().insert(cap)
         } else {
@@ -874,7 +873,7 @@ pub fn run(core_id: u32) -> ! {
                 unsafe {
                     core::arch::asm!("cli", options(nostack, nomem));
                     TASK_STATE[next].store(TaskState::Running as u8, Ordering::Relaxed);
-                    CORE_CURRENT[cid].store(next, Ordering::Relaxed);
+                    CORE_CURRENT.get(cid).store(next, Ordering::Relaxed);
                     if TASK_IS_USER[next] {
                         prepare_ring3_switch(cid, next);
                     }
@@ -883,7 +882,7 @@ pub fn run(core_id: u32) -> ! {
                     switch_context(sched, next_ctx);
                     // Execution returns here after the task is preempted and
                     // the scheduler loop is re-entered.
-                    CORE_CURRENT[cid].store(IDLE, Ordering::Relaxed);
+                    CORE_CURRENT.get(cid).store(IDLE, Ordering::Relaxed);
                     core::arch::asm!("sti", options(nostack, nomem));
                 }
             }
@@ -940,12 +939,12 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             scan_timed_wakes();
         }
 
-        let prev = CORE_CURRENT[cid].load(Ordering::Relaxed);
+        let prev = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
 
         // Accumulate CPU utilisation counters.
-        CORE_TOTAL_TICKS[cid].0.fetch_add(1, Ordering::Relaxed);
+        CORE_TOTAL_TICKS.get(cid).0.fetch_add(1, Ordering::Relaxed);
         if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) {
-            CORE_ACTIVE_TICKS[cid].0.fetch_add(1, Ordering::Relaxed);
+            CORE_ACTIVE_TICKS.get(cid).0.fetch_add(1, Ordering::Relaxed);
         }
 
         // Path C / Phase 6: while Core 0 is mid-supervisor-respawn at run()'s loop top, do NOT preempt
@@ -984,7 +983,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                 let is_dead = prev < MAX_TASKS
                     && TASK_STATE[prev].load(Ordering::Relaxed) == TaskState::Dead as u8;
                 if is_dead {
-                    CORE_CURRENT[cid].store(IDLE, Ordering::Relaxed);
+                    CORE_CURRENT.get(cid).store(IDLE, Ordering::Relaxed);
                     // Save into CORE_DEAD_CTX - not TASK_CTX[prev] - to avoid a
                     // write-after-claim race if a concurrent spawn has already
                     // reserved TASK_CTX[prev] (possible now that TASK_VALID=false
@@ -1035,7 +1034,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             } else {
                 TASK_CTX[prev].assume_init_mut() as *mut TaskContext
             };
-            CORE_CURRENT[cid].store(IDLE, Ordering::Relaxed);
+            CORE_CURRENT.get(cid).store(IDLE, Ordering::Relaxed);
             let sched_ctx: *const TaskContext = CORE_SCHED_CTX.as_ptr(cid);
             switch_context(current_ctx, sched_ctx);
             // Resumes here when prev is next scheduled (after run()'s loop top did the respawn).
@@ -1056,7 +1055,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         }
 
         TASK_STATE[next].store(TaskState::Running as u8, Ordering::Relaxed);
-        CORE_CURRENT[cid].store(next, Ordering::Relaxed);
+        CORE_CURRENT.get(cid).store(next, Ordering::Relaxed);
 
         // Save BEFORE prepare_ring3_switch so we capture the value from the last
         // SYSCALL entry for `prev`, not the value prepare_ring3_switch writes for `next`.
@@ -1096,12 +1095,12 @@ pub fn yield_current() {
 
     // SAFETY: IF=0.
     unsafe {
-        let prev = CORE_CURRENT[cid].load(Ordering::Relaxed);
+        let prev = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
 
         // Count each scheduler quantum (yield or timer) for CPU utilisation.
-        CORE_TOTAL_TICKS[cid].0.fetch_add(1, Ordering::Relaxed);
+        CORE_TOTAL_TICKS.get(cid).0.fetch_add(1, Ordering::Relaxed);
         if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) {
-            CORE_ACTIVE_TICKS[cid].0.fetch_add(1, Ordering::Relaxed);
+            CORE_ACTIVE_TICKS.get(cid).0.fetch_add(1, Ordering::Relaxed);
         }
 
         // CAS: preserve Dead if a cross-core kill races with this transition.
@@ -1126,7 +1125,7 @@ pub fn yield_current() {
                 let is_dead = prev < MAX_TASKS
                     && TASK_STATE[prev].load(Ordering::Relaxed) == TaskState::Dead as u8;
                 if is_dead {
-                    CORE_CURRENT[cid].store(IDLE, Ordering::Relaxed);
+                    CORE_CURRENT.get(cid).store(IDLE, Ordering::Relaxed);
                     // Save into CORE_DEAD_CTX, not TASK_CTX[prev], to avoid a
                     // write-after-claim race with a concurrent spawn that may
                     // have already reserved the now-available slot.
@@ -1166,7 +1165,7 @@ pub fn yield_current() {
         }
 
         TASK_STATE[next].store(TaskState::Running as u8, Ordering::Relaxed);
-        CORE_CURRENT[cid].store(next, Ordering::Relaxed);
+        CORE_CURRENT.get(cid).store(next, Ordering::Relaxed);
 
         // Save BEFORE prepare_ring3_switch so we capture the value from SYSCALL
         // entry, not the value prepare_ring3_switch is about to write for `next`.
@@ -1209,7 +1208,7 @@ pub fn yield_current() {
 /// Returns `IDLE` (== MAX_TASKS) if the scheduler loop is active.
 pub fn current_task_slot() -> usize {
     let cid = current_core_id();
-    CORE_CURRENT[cid].load(Ordering::Relaxed)
+    CORE_CURRENT.get(cid).load(Ordering::Relaxed)
 }
 
 /// Wake the task at `slot` with the given result code.
@@ -1284,7 +1283,7 @@ pub fn wake_by_slot(slot: usize, result: i64) {
                 // on the immediately-following pick_next call will find this slot
                 // (it starts from RR_SLOT which hint-fires advance past the hinted
                 // slot, keeping the scan pointer near this slot's index).
-                CORE_WAKE_HINT[task_core]
+                CORE_WAKE_HINT.get(task_core)
                     .compare_exchange(MAX_TASKS, slot, Ordering::Release, Ordering::Relaxed)
                     .ok();
                 // APIC is initialised; task_core is a ready core (outer unsafe).
@@ -1325,10 +1324,10 @@ pub fn find_task_by_name(name: &str) -> Option<usize> {
 /// yield_current's switch_context runs with IF=0, so the timer cannot fire
 /// during that window; after switch_context RSP is on a different stack.
 fn drain_pending_kstack(cid: usize) {
-    let n = CORE_PENDING_KSTACK_LEN[cid].load(Ordering::Relaxed);
+    let n = CORE_PENDING_KSTACK_LEN.get(cid).load(Ordering::Relaxed);
     if n != 0 {
         // Clear before processing so re-entrant callers see an empty queue.
-        CORE_PENDING_KSTACK_LEN[cid].store(0, Ordering::Relaxed);
+        CORE_PENDING_KSTACK_LEN.get(cid).store(0, Ordering::Relaxed);
         for i in 0..n {
             let kstack = unsafe { (*CORE_PENDING_KSTACK.as_mut_ptr(cid))[i] };
             // SAFETY: RSP is NOT on this kstack (see above).  kstack is the top
@@ -1341,9 +1340,9 @@ fn drain_pending_kstack(cid: usize) {
     // runs the core has switched to a different CR3, so freeing the old PML4
     // frame no longer risks a concurrent zeroing race (see CORE_PENDING_PML4).
     // AtomicU64 load/store: no unsafe needed here.
-    let pml4_phys = CORE_PENDING_PML4[cid].load(Ordering::Acquire);
+    let pml4_phys = CORE_PENDING_PML4.get(cid).load(Ordering::Acquire);
     if pml4_phys != 0 {
-        CORE_PENDING_PML4[cid].store(0, Ordering::Relaxed);
+        CORE_PENDING_PML4.get(cid).store(0, Ordering::Relaxed);
         // SAFETY: pml4_phys was the task's own PML4 frame; CR3 has since been
         // switched away so no core's page-walker will read from it.
         unsafe {
@@ -1512,8 +1511,8 @@ pub fn kill_task_by_slot(slot: usize) {
         // will observe the Dead state in its yield_current Dead-detection branch.
         {
             let my_core = current_core_id();
-            for cid in 0..MAX_CORES {
-                if cid != my_core && CORE_CURRENT[cid].load(Ordering::SeqCst) == slot {
+            for cid in 0..num_cores() {
+                if cid != my_core && CORE_CURRENT.get(cid).load(Ordering::SeqCst) == slot {
                     // cid is a valid core index (loop bound); APIC mapped (outer unsafe).
                     crate::smp::ipi::send_ipi(
                         cid as u32,
@@ -1524,13 +1523,13 @@ pub fn kill_task_by_slot(slot: usize) {
         }
         {
             let my_core = current_core_id();
-            for cid in 0..MAX_CORES {
+            for cid in 0..num_cores() {
                 if cid == my_core { continue; }
                 loop {
                     // Compiler + hardware barrier: reload CORE_CURRENT[cid] from
                     // memory on every iteration; do not use a cached register value.
                     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-                    if CORE_CURRENT[cid].load(Ordering::Relaxed) != slot { break; }
+                    if CORE_CURRENT.get(cid).load(Ordering::Relaxed) != slot { break; }
                     core::hint::spin_loop();
                 }
             }
@@ -1550,7 +1549,7 @@ pub fn kill_task_by_slot(slot: usize) {
         //   (called from the scheduler loop / timer tick) where CR3 has already
         //   been switched to a different page table.
         let my_core = current_core_id();
-        let is_self_kill = CORE_CURRENT[my_core].load(Ordering::Relaxed) == slot;
+        let is_self_kill = CORE_CURRENT.get(my_core).load(Ordering::Relaxed) == slot;
 
         // Reclaim all user-space frames: walk the page table and return each
         // frame to the allocator (§10.5).
@@ -1580,7 +1579,7 @@ pub fn kill_task_by_slot(slot: usize) {
                     // another core zero it (PageTable::new) while we hold that CR3, causing a
                     // TLB-miss → zeroed PML4 → KERNEL PF (see CORE_PENDING_PML4).
                     if pml4_phys != 0 {
-                        CORE_PENDING_PML4[my_core].store(pml4_phys, Ordering::Release);
+                        CORE_PENDING_PML4.get(my_core).store(pml4_phys, Ordering::Release);
                     }
                 } else if pml4_phys != 0 {
                     // Not a self-kill: no core holds this CR3, so free the PML4 root now.
@@ -1624,10 +1623,10 @@ pub fn kill_task_by_slot(slot: usize) {
             if TASK_IS_USER[slot] {
                 let kstack = TASK_KERNEL_STACK_TOP[slot].load(Ordering::Relaxed);
                 if kstack != 0 {
-                    let len = CORE_PENDING_KSTACK_LEN[my_core].load(Ordering::Relaxed);
+                    let len = CORE_PENDING_KSTACK_LEN.get(my_core).load(Ordering::Relaxed);
                     if len < PENDING_KSTACK_CAP {
                         (*CORE_PENDING_KSTACK.as_mut_ptr(my_core))[len] = kstack;
-                        CORE_PENDING_KSTACK_LEN[my_core].store(len + 1, Ordering::Relaxed);
+                        CORE_PENDING_KSTACK_LEN.get(my_core).store(len + 1, Ordering::Relaxed);
                     } else {
                         // Queue overflow (>8 sequential self-kills): free immediately.
                         // Bounded risk - less likely than permanently leaking the stack.
@@ -1682,7 +1681,7 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
         core::arch::asm!("cli", options(nostack, nomem));
 
         let cid  = current_core_id();
-        let slot = CORE_CURRENT[cid].load(Ordering::Relaxed);
+        let slot = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
         assert!(slot < MAX_TASKS && TASK_VALID[slot].load(Ordering::Relaxed),
                 "block_and_reschedule: no running task");
 
@@ -1718,7 +1717,7 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
         match pick_next(cid) {
             Some(next) => {
                 TASK_STATE[next].store(TaskState::Running as u8, Ordering::Relaxed);
-                CORE_CURRENT[cid].store(next, Ordering::Relaxed);
+                CORE_CURRENT.get(cid).store(next, Ordering::Relaxed);
                 if TASK_IS_USER[next] {
                     prepare_ring3_switch(cid, next);
                 }
@@ -1726,7 +1725,7 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
                 switch_context(current_ctx, next_ctx);
             }
             None => {
-                CORE_CURRENT[cid].store(IDLE, Ordering::Relaxed);
+                CORE_CURRENT.get(cid).store(IDLE, Ordering::Relaxed);
                 let sched = CORE_SCHED_CTX.as_mut_ptr(cid);
                 switch_context(current_ctx, sched);
             }
@@ -1742,7 +1741,7 @@ pub fn store_recv_message(msg: Message) {
     let cid = current_core_id();
     // SAFETY: CORE_CURRENT[cid] and TASK_RECV_BUF are written only by this core's scheduler path.
     unsafe {
-        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
+        let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
         if cur < MAX_TASKS {
             TASK_RECV_BUF[cur] = Some(msg);
         }
@@ -1754,7 +1753,7 @@ pub fn take_recv_message() -> Option<Message> {
     let cid = current_core_id();
     // SAFETY: CORE_CURRENT[cid] and TASK_RECV_BUF are written only by this core's scheduler path.
     unsafe {
-        let cur = CORE_CURRENT[cid].load(Ordering::Relaxed);
+        let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
         if cur < MAX_TASKS {
             TASK_RECV_BUF[cur].take()
         } else {
@@ -1780,11 +1779,11 @@ pub fn take_recv_message() -> Option<Message> {
 /// woken task cannot be starved by the current RR position.
 fn pick_next(core_id: usize) -> Option<usize> {
     // Fast path: schedule the just-woken task immediately.
-    let hint = CORE_WAKE_HINT[core_id].load(Ordering::Acquire);
+    let hint = CORE_WAKE_HINT.get(core_id).load(Ordering::Acquire);
     if hint < MAX_TASKS {
         // Clear the hint regardless - if the slot turns out not to be
         // schedulable the RR scan below will find something else.
-        CORE_WAKE_HINT[core_id].store(MAX_TASKS, Ordering::Relaxed);
+        CORE_WAKE_HINT.get(core_id).store(MAX_TASKS, Ordering::Relaxed);
         // SAFETY: hint < MAX_TASKS; TASK_VALID/TASK_STATE are AtomicBool/AtomicU8
         // arrays (no unsafe needed); TASK_CORE is static mut but read-only here
         // after task spawn (immutable once set - see scheduler.rs §9.1 invariant).
@@ -1811,7 +1810,7 @@ fn pick_next(core_id: usize) -> Option<usize> {
         }
     }
 
-    let start = CORE_RR_SLOT[core_id].load(Ordering::Relaxed);
+    let start = CORE_RR_SLOT.get(core_id).load(Ordering::Relaxed);
     for i in 0..MAX_TASKS {
         let idx = (start + i) % MAX_TASKS;
         // Acquire: sees the Ready write from wake_by_slot's Release store.
@@ -1826,7 +1825,7 @@ fn pick_next(core_id: usize) -> Option<usize> {
             && c2 == core_id as u32;
         if ready {
             // Advance past the selected slot so the next call starts after it.
-            CORE_RR_SLOT[core_id].store((idx + 1) % MAX_TASKS, Ordering::Relaxed);
+            CORE_RR_SLOT.get(core_id).store((idx + 1) % MAX_TASKS, Ordering::Relaxed);
             return Some(idx);
         }
     }
