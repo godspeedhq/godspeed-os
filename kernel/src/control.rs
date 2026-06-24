@@ -42,11 +42,13 @@ static LINE: SpinLock<LineBuf> = SpinLock::new(LineBuf::new());
 /// on the BSP stalls forever. The budget (256) far exceeds any real command
 /// line (BUF_SIZE = 128); a stuck LSR just drains 256 junk bytes and returns.
 pub fn process_pending() {
-    // Path C / Phase 6: if the supervisor died, the kernel respawns it here - a spawn-safe deferred
-    // point on the Core-0 control tick (the same place RESTART respawns services). The kernel is the
-    // supervisor's recovery anchor, the one thing that cannot die (§3.7, §6.2). Bounded + loud on a
-    // respawn loop. No-op when the supervisor is healthy (one atomic load).
-    crate::task::poll_supervisor_respawn();
+    // NOTE: the supervisor respawn (Path C / Phase 6) is deliberately NOT done here. process_pending
+    // runs from the Core-0 timer ISR with IF=0 (see the doc comment above), and `spawn_supervisor` is
+    // a ~22 ms service spawn that issues all-core TLB shootdowns - running it IF=0 wedged the box under
+    // a storm: Core 0 could not ACK other cores' shootdown / WAKE_RECEIVER IPIs while stuck in the IF=0
+    // spawn (the exact hazard this comment warns about - the COM2 drain below is bounded for it). The
+    // respawn now runs from the scheduler loop at an IF=1 point (`scheduler::run`, gated to Core 0).
+    // Only bounded, ISR-safe work belongs in process_pending.
 
     // H1 diagnostic: surface any IOMMU translation faults (device DMA blocked
     // outside its confined arena). Cheap when quiet (a head/tail compare); prints

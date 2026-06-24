@@ -3483,11 +3483,25 @@ static SUPERVISOR_RESPAWN_PENDING: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 static SUPERVISOR_RESPAWN_COUNT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+/// True only while `spawn_supervisor` is running at the Core-0 scheduler loop top. The timer ISR
+/// checks it and does NOT preempt (just returns) so the ~22 ms spawn runs to completion on Core 0 -
+/// it stays IF=1 (interrupts on, IPIs ACK'd, no wedge) but is not switched away (the run() context
+/// isn't reliably resumed under load, so a preempted spawn would stall - the §22 Test 15 stall).
+static SUPERVISOR_RESPAWN_IN_PROGRESS: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Flag that the supervisor died and must be respawned. Called from the death path (`kill_task`);
-/// the actual respawn runs later from `poll_supervisor_respawn` on the Core-0 control tick.
+/// the actual respawn runs later from `poll_supervisor_respawn` at the Core-0 scheduler loop top -
+/// an IF=1 point (see `scheduler::run` and the timer-ISR routing in `timer_tick_from_irq`).
 pub fn flag_supervisor_respawn() {
     SUPERVISOR_RESPAWN_PENDING.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Whether a supervisor respawn is pending. The timer ISR (`timer_tick_from_irq`) checks this to
+/// route Core 0 into the scheduler context (an IF=1 point) when a respawn is due, rather than doing
+/// the heavy ~22 ms spawn in the IF=0 ISR (which would block cross-core IPI ACKs and wedge the box).
+pub fn supervisor_respawn_pending() -> bool {
+    SUPERVISOR_RESPAWN_PENDING.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// If the supervisor died, respawn it (Path C / Phase 6). Called from `control::process_pending`
@@ -3495,12 +3509,29 @@ pub fn flag_supervisor_respawn() {
 /// The count is observability only (§26.4), not a bound.
 pub fn poll_supervisor_respawn() {
     use core::sync::atomic::Ordering;
+    // Cheap fast path: a plain load on the (very hot) Core-0 scheduler loop - no atomic RMW when the
+    // supervisor is healthy (the common case, every iteration).
+    if !SUPERVISOR_RESPAWN_PENDING.load(Ordering::Acquire) {
+        return;
+    }
+    // Pending: claim it with a swap (race-safe if ever called from two points).
     if !SUPERVISOR_RESPAWN_PENDING.swap(false, Ordering::AcqRel) {
         return;
     }
     let n = SUPERVISOR_RESPAWN_COUNT.fetch_add(1, Ordering::AcqRel) + 1;
     crate::kprintln!("kernel: supervisor died - respawning (#{}) (Path C / Phase 6)", n);
+    // Pin against preemption while the heavy spawn runs (the timer ISR sees this and returns instead
+    // of switching away). IF stays 1 throughout, so IPIs are ACK'd - it is the SWITCH we suppress,
+    // not interrupts. Without this, a preempted spawn strands in CORE_SCHED_CTX and never finishes.
+    SUPERVISOR_RESPAWN_IN_PROGRESS.store(true, Ordering::Release);
     spawn_supervisor();
+    SUPERVISOR_RESPAWN_IN_PROGRESS.store(false, Ordering::Release);
+}
+
+/// True only while `spawn_supervisor` runs at the Core-0 scheduler loop top. The timer ISR checks
+/// this and returns instead of preempting, so the spawn runs to completion (IF=1; not switched away).
+pub fn supervisor_respawn_in_progress() -> bool {
+    SUPERVISOR_RESPAWN_IN_PROGRESS.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// Kill all running tasks with the given name.

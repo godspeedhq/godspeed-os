@@ -839,6 +839,20 @@ pub fn run(core_id: u32) -> ! {
         // RSP is on CORE_SCHED_CTX's stack (per-core BSS), not any kstack.
         drain_pending_kstack(cid);
 
+        // Path C / Phase 6: respawn the supervisor here if it died - an IF=1 scheduling point, NOT the
+        // timer ISR. `spawn_supervisor` is a full ~22 ms service spawn that issues all-core TLB
+        // shootdowns; running it from the Core-0 timer ISR (IF=0, where it used to live, via
+        // process_pending) wedged the box under a storm: Core 0 could not ACK other cores' shootdown /
+        // WAKE_RECEIVER IPIs while stuck in the IF=0 spawn - the exact hazard process_pending's own
+        // comment warns about (it bounds the COM2 drain for the same reason). Here CORE_CURRENT is IDLE
+        // and interrupts are enabled (the prior iteration's `sti`/`wait_for_interrupt`), so the spawn
+        // participates in cross-core IPI protocols normally. Runs every scheduler iteration on Core 0,
+        // so it is prompt even under load (the idle branch a busy core never reaches). One relaxed
+        // atomic load when the supervisor is healthy.
+        if cid == 0 {
+            crate::task::poll_supervisor_respawn();
+        }
+
         // Compiler barrier: force a reload of all scheduler statics (TASK_STATE,
         // TASK_VALID, TASK_CORE) on every iteration.  Without this, the compiler
         // is free to cache the pick_next result across the `sti; hlt` boundary
@@ -927,6 +941,15 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             CORE_ACTIVE_TICKS[cid].0.fetch_add(1, Ordering::Relaxed);
         }
 
+        // Path C / Phase 6: while Core 0 is mid-supervisor-respawn at run()'s loop top, do NOT preempt
+        // it - just return (iret back to the spawn). The tick clock + COM2/control above still ran;
+        // we only suppress the context SWITCH. IF stays 1, so any cross-core shootdown / WAKE IPI is
+        // ACK'd between ticks (no wedge), but the ~22 ms spawn isn't switched away into the unresumable
+        // run() context (the Test-15 stall). Cleared the instant spawn_supervisor returns.
+        if cid == 0 && crate::task::supervisor_respawn_in_progress() {
+            return;
+        }
+
         // CAS instead of store: if a cross-core kill wrote Dead between our
         // load and this transition, the CAS fails and Dead is preserved.
         // An unconditional store(Ready) would silently overwrite Dead, causing
@@ -980,6 +1003,37 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                 return;
             }
         };
+
+        // Path C / Phase 6: if a supervisor respawn is pending, land Core 0 in the SCHEDULER context
+        // (run()'s loop) instead of switching to `next`, so the heavy ~22 ms spawn runs from run()'s
+        // loop top with IF=1 - NEVER here in the IF=0 ISR, where it can't ACK other cores' TLB-shootdown
+        // / WAKE_RECEIVER IPIs and wedges the box under a storm (the architectural proof; see
+        // scheduler::run + control::process_pending). `next` is left untouched (still Ready), so
+        // pick_next re-picks it after the respawn. `prev` was set Ready by the CAS above, so it too is
+        // rescheduled. This mirrors the is_dead switch above, but saves `prev` (it is live) so it resumes.
+        if cid == 0 && crate::task::supervisor_respawn_pending() {
+            if prev >= MAX_TASKS {
+                // Already in the scheduler context - just return; run()'s loop top will respawn.
+                return;
+            }
+            // Save prev's user RSP (mirror the normal switch below): other tasks run before prev is
+            // rescheduled, overwriting PER_CORE_SYSCALL.user_rsp, so capture it now.
+            if TASK_VALID[prev].load(Ordering::Relaxed) && TASK_IS_USER[prev] {
+                TASK_USER_RSP[prev] =
+                    crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[cid].user_rsp;
+            }
+            let current_ctx: *mut TaskContext = if !TASK_VALID[prev].load(Ordering::Relaxed) {
+                // prev self-killed (e.g. the supervisor itself) - discard into CORE_DEAD_CTX.
+                &raw mut CORE_DEAD_CTX[cid]
+            } else {
+                TASK_CTX[prev].assume_init_mut() as *mut TaskContext
+            };
+            CORE_CURRENT[cid].store(IDLE, Ordering::Relaxed);
+            let sched_ctx: *const TaskContext = &raw const CORE_SCHED_CTX[cid];
+            switch_context(current_ctx, sched_ctx);
+            // Resumes here when prev is next scheduled (after run()'s loop top did the respawn).
+            return;
+        }
 
         if next == prev {
             // CAS: if kill wrote Dead between pick_next and here, preserve Dead.
