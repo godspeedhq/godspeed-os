@@ -219,6 +219,9 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     // Task-layer per-core arenas (scheduler contexts + the deferred kstack-free list), sized to the
     // same N. Kept here (not inside percpu_init) so smp/ does not up-call into task/.
     task::scheduler::init_arenas(smp::percpu::num_cores());
+    // Per-AP GDT/TSS arenas (the BSP already runs on its static bootstrap). Sized to the same N; the
+    // APs load these in ap_init, which runs after this point.
+    arch::x86_64::boot::init_gdt_arenas(smp::percpu::num_cores());
 
     // Hardening: unmap a guard page below each kernel-stack slot so an overflow
     // faults loudly instead of corrupting the neighbouring stack. Done here - BSP
