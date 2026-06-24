@@ -6,9 +6,10 @@ Multi-core coordination (§9, §11). Unsafe boundary: APIC MMIO writes in `ipi.r
 
 | File            | Responsibility |
 |-----------------|---------------|
-| `mod.rs`        | `init(boot_info)`: init per-core state, start APs |
+| `mod.rs`        | `init(boot_info)`: init per-core state, start APs; `percpu_init(boot_info)`: size the per-core arenas to N |
 | `core.rs`       | `CoreState` per core; `mark_ready(core_id)`, `ready_count()`, `is_ready(core_id)` |
 | `ipi.rs`        | `send_ipi(core_id, vector)`, `broadcast_tlb_shootdown(virt)`, `ipi_handler(vector)` |
+| `percpu.rs`     | `PerCore<T>` — boot-allocated per-core arenas (§26.6.1), sized to N cores at boot from the frame allocator (not `[_; MAX_CORES]`); all `unsafe` isolated here behind safe `get()` |
 | `placement.rs`  | `resolve(contract_core)` → `Ok(core_id)` or `Err(PlacementInvalid)` |
 | `spinlock.rs`   | `SpinLock<T>` / `SpinLockGuard<T>` — RAII spinlock for safe mutable statics throughout the kernel |
 
@@ -58,7 +59,7 @@ sequenceDiagram
 
 This is a synchronous barrier. It is a real cost on every unmap. v1 minimises unmap frequency by reclaiming memory only at service death.
 
-**Concurrent shootdowns are safe (per-core requests).** Each *initiating* core has its own request slot — `SHOOTDOWN_ADDR/GEN/ACK[core]` in `ipi.rs` — and a core waiting for its own acks also services every other core's pending request (`service_pending`, called from both the IPI handler and the ack-wait spin). So two cores unmapping at the same time ack each other instead of deadlocking. The single-global `TLB_ACK`/`TLB_SHOOTDOWN_ADDR` counter this replaced **deadlocked** under concurrent reclaims: each initiator spun IF=0 waiting for the other's ack while being a target of the other's all-excluding-self broadcast, so neither could ack — the `chaos max-carnage` 71K-round wedge on the T630. The diagram above is still the single-unmapper common case; the per-core slots generalise it to N simultaneous unmappers.
+**Concurrent shootdowns are safe (per-core requests).** Each *initiating* core has its own request slot in `ipi.rs` — `SHOOTDOWN_ADDR[core]` plus a per-initiator ack **bitmask** (`SHOOTDOWN_ACK_MASK[core]`: bit *y* = receiver *y* has serviced this request; one bit per core-pair, `N²/8` bytes) — and a core waiting for its own acks also services every other core's pending request (`service_pending`, called from both the IPI handler and the ack-wait spin). So two cores unmapping at the same time ack each other instead of deadlocking. The single-global `TLB_ACK`/`TLB_SHOOTDOWN_ADDR` counter this replaced **deadlocked** under concurrent reclaims: each initiator spun IF=0 waiting for the other's ack while being a target of the other's all-excluding-self broadcast, so neither could ack — the `chaos max-carnage` 71K-round wedge on the T630. The diagram above is still the single-unmapper common case; the per-core slots generalise it to N simultaneous unmappers.
 
 ## Placement (§9.2)
 

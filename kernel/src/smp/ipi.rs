@@ -13,7 +13,7 @@
 //!   3. Cross-core scheduler preemption (timer overflow).
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use crate::smp::core::MAX_CORES;
+use crate::smp::percpu::{PerCore, num_cores};
 
 /// Vector numbers for each IPI purpose.
 pub mod vectors {
@@ -34,17 +34,27 @@ const APIC_ICR_LOW:  u64 = 0x300;
 // (`service_pending`), so concurrent shootdowns serialize cleanly instead of deadlocking. This was the
 // max-carnage wedge at 71K rounds: heavy concurrent reclaims across cores (§10.5).
 //
-//   SHOOTDOWN_ADDR[x]     - the VA core x is invalidating (`!0` = full CR3 flush).
-//   SHOOTDOWN_ACK_MASK[x] - bit y set = core y has serviced x's CURRENT request. The initiator CLEARS
-//                           it to publish a request (a clear bit = "service me"); each servicer sets
-//                           its own bit; the initiator waits until every expected bit is set. One bit
-//                           per (initiator, receiver) pair = N^2 BITS (N^2/8 bytes) - 64x smaller than
-//                           a per-pair counter+generation. Initialised all-set (!0) so a slot that has
-//                           never been requested reads "already acked by everyone" and is not
-//                           spuriously serviced. ASSUMES <= 64 cores (one u64); the per-core boot arena
-//                           (Stage 2) generalises this to ceil(N/64) words.
-static SHOOTDOWN_ADDR:     [AtomicU64; MAX_CORES] = [const { AtomicU64::new(0) }; MAX_CORES];
-static SHOOTDOWN_ACK_MASK: [AtomicU64; MAX_CORES] = [const { AtomicU64::new(!0) }; MAX_CORES];
+// Both arrays are boot-allocated per-core arenas (`PerCore`, §26.6.1) sized to the cores Limine
+// actually reported, NOT a fixed `[_; MAX_CORES]` - a 4-core box reserves 4 slots, not MAX_CORES.
+//
+//   SHOOTDOWN_ADDR.get(x)     - the VA core x is invalidating (`!0` = full CR3 flush).
+//   SHOOTDOWN_ACK_MASK.get(x) - bit y set = core y has serviced x's CURRENT request. The initiator
+//                               CLEARS it to publish a request (a clear bit = "service me"); each
+//                               servicer sets its own bit; the initiator waits until every expected
+//                               bit is set. One bit per (initiator, receiver) pair. Initialised
+//                               all-set (!0) so a never-requested slot is not spuriously serviced.
+//                               ASSUMES <= 64 cores (one u64 of bits); widening to ceil(N/64) words is
+//                               the next step before MAX_CORES is raised past 64.
+static SHOOTDOWN_ADDR:     PerCore<AtomicU64> = PerCore::new();
+static SHOOTDOWN_ACK_MASK: PerCore<AtomicU64> = PerCore::new();
+
+/// Allocate the per-core shootdown arenas for `n` cores. Called once at boot (`smp::percpu_init`),
+/// after the frame allocator is up and before any shootdown can run (before APs / spawn). ADDR starts
+/// 0; the ack mask starts all-set so a never-requested slot reads "already acked by everyone".
+pub fn init_arenas(n: usize) {
+    SHOOTDOWN_ADDR.init_with(n, |_| AtomicU64::new(0));
+    SHOOTDOWN_ACK_MASK.init_with(n, |_| AtomicU64::new(!0));
+}
 
 /// The calling core's id - via its LAPIC, staying within smp+arch (no up-call into the scheduler).
 #[inline]
@@ -73,7 +83,7 @@ fn invalidate(addr: u64) {
 /// Bitmask of every ready core except `me` - the set of acks an initiator must collect.
 fn ready_mask_excluding(me: usize) -> u64 {
     let mut mask = 0u64;
-    for x in 0..MAX_CORES {
+    for x in 0..num_cores() {
         if x != me && crate::smp::core::is_ready(x as u32) {
             mask |= 1u64 << x;
         }
@@ -88,11 +98,11 @@ fn ready_mask_excluding(me: usize) -> u64 {
 /// bit is clear (the initiator cleared the whole mask to publish); after I service it I set my bit.
 fn service_pending(me: usize) {
     let mybit = 1u64 << me;
-    for x in 0..MAX_CORES {
+    for x in 0..num_cores() {
         if x == me || !crate::smp::core::is_ready(x as u32) { continue; }
-        if SHOOTDOWN_ACK_MASK[x].load(Ordering::SeqCst) & mybit == 0 {
-            invalidate(SHOOTDOWN_ADDR[x].load(Ordering::SeqCst));
-            SHOOTDOWN_ACK_MASK[x].fetch_or(mybit, Ordering::SeqCst);
+        if SHOOTDOWN_ACK_MASK.get(x).load(Ordering::SeqCst) & mybit == 0 {
+            invalidate(SHOOTDOWN_ADDR.get(x).load(Ordering::SeqCst));
+            SHOOTDOWN_ACK_MASK.get(x).fetch_or(mybit, Ordering::SeqCst);
         }
     }
 }
@@ -168,15 +178,15 @@ unsafe fn request_and_wait(addr: u64) {
     // Publish: set the address, THEN clear my ack mask. The clear IS the "new request" signal (a
     // servicer acts on a clear bit), so the address must land first - a servicer seeing its bit clear
     // then reads the new address.
-    SHOOTDOWN_ADDR[me].store(addr, Ordering::SeqCst);
-    SHOOTDOWN_ACK_MASK[me].store(0, Ordering::SeqCst);
+    SHOOTDOWN_ADDR.get(me).store(addr, Ordering::SeqCst);
+    SHOOTDOWN_ACK_MASK.get(me).store(0, Ordering::SeqCst);
 
     // SAFETY: APIC mapped; IF=0.
     unsafe { broadcast_shootdown_ipi(); }
 
     // Wait until every expected core has set its bit, servicing theirs meanwhile so two cores shooting
     // down at once ack each other instead of deadlocking.
-    while SHOOTDOWN_ACK_MASK[me].load(Ordering::SeqCst) & expected != expected {
+    while SHOOTDOWN_ACK_MASK.get(me).load(Ordering::SeqCst) & expected != expected {
         service_pending(me);
         core::hint::spin_loop();
     }

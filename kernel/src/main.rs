@@ -212,6 +212,11 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
 
     memory::init(boot_info);
 
+    // Size the per-core arenas (§26.6.1) to the cores Limine reported, now that the frame allocator
+    // is up - before anything per-core (the supervisor spawn, the APs) can touch them. Replaces the
+    // fixed `[_; MAX_CORES]` statics with boot-sized arenas; MAX_CORES stays a loud sanity ceiling.
+    smp::percpu_init(boot_info);
+
     // Hardening: unmap a guard page below each kernel-stack slot so an overflow
     // faults loudly instead of corrupting the neighbouring stack. Done here - BSP
     // only, before APs and before any kstack is allocated, so no TLB shootdown is
