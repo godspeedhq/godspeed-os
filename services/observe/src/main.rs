@@ -240,7 +240,7 @@ fn print_state(
             stat.state_str(),
             uval, uunit,
             lval, lunit,
-            stat.generation,
+            stat.restart_count,
             stat.queue_depth, QUEUE_MAX,
             if full { " (FULL)" } else { "       " },
             task_pct,
