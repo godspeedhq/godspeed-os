@@ -25,6 +25,7 @@ use crate::capability::table::CapTable;
 use crate::ipc::endpoint::EndpointId;
 use crate::ipc::message::Message;
 use crate::ipc::routing;
+use crate::smp::percpu::PerCoreMut;
 use crate::task::state::TaskState;
 
 // ---------------------------------------------------------------------------
@@ -248,7 +249,7 @@ static CORE_WAKE_HINT: [AtomicUsize; MAX_CORES] =
 /// RSP is on a different stack; IF=1 is restored in the incoming task.  The timer
 /// ISR can only fire after that point, by which time RSP is not on K_a.
 const PENDING_KSTACK_CAP: usize = 8;
-static mut CORE_PENDING_KSTACK:     [[u64; PENDING_KSTACK_CAP]; MAX_CORES] = [[0u64; PENDING_KSTACK_CAP]; MAX_CORES];
+static CORE_PENDING_KSTACK: PerCoreMut<[u64; PENDING_KSTACK_CAP]> = PerCoreMut::new();
 static CORE_PENDING_KSTACK_LEN: [AtomicUsize; MAX_CORES] =
     [const { AtomicUsize::new(0) }; MAX_CORES];
 
@@ -279,16 +280,22 @@ static CORE_PENDING_PML4: [AtomicU64; MAX_CORES] =
 /// yield_current's switch_context runs.  Saving the dead task's registers into
 /// CORE_DEAD_CTX instead avoids the write-after-claim race.  CORE_DEAD_CTX is
 /// never used as a load source; dead tasks are never resumed.
-static mut CORE_DEAD_CTX: [TaskContext; MAX_CORES] = [const {
-    TaskContext { rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0,
-                  rip: 0, rsp: 0, cr3: 0 }
-}; MAX_CORES];
+static CORE_DEAD_CTX: PerCoreMut<TaskContext> = PerCoreMut::new();
 
 /// Saved context for each core's idle scheduler loop.
-static mut CORE_SCHED_CTX: [TaskContext; MAX_CORES] = [const {
-    TaskContext { rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0,
-                  rip: 0, rsp: 0, cr3: 0 }
-}; MAX_CORES];
+static CORE_SCHED_CTX: PerCoreMut<TaskContext> = PerCoreMut::new();
+
+/// Initialise the owner-mutable per-core scheduler arenas (§26.6.1, `smp::percpu`). Call ONCE at boot
+/// (`main`, right after `smp::percpu_init` sets the width) - before any core enters `run()`. The
+/// contexts start zeroed (`run()` seeds CR3); the pending-kstack lists start empty.
+pub fn init_arenas(n: usize) {
+    const ZERO_CTX: TaskContext = TaskContext {
+        rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rip: 0, rsp: 0, cr3: 0,
+    };
+    CORE_PENDING_KSTACK.init_with(n, |_| [0u64; PENDING_KSTACK_CAP]);
+    CORE_DEAD_CTX.init_with(n, |_| ZERO_CTX);
+    CORE_SCHED_CTX.init_with(n, |_| ZERO_CTX);
+}
 
 
 // ---------------------------------------------------------------------------
@@ -820,7 +827,7 @@ pub fn run(core_id: u32) -> ! {
     unsafe {
         let cr3: u64;
         core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem));
-        CORE_SCHED_CTX[cid].cr3 = cr3;
+        (*CORE_SCHED_CTX.as_mut_ptr(cid)).cr3 = cr3;
     }
 
     // Arm the TSC-Deadline timer now that cr3 is seeded.  The arm was deferred
@@ -871,7 +878,7 @@ pub fn run(core_id: u32) -> ! {
                     if TASK_IS_USER[next] {
                         prepare_ring3_switch(cid, next);
                     }
-                    let sched    = &raw mut CORE_SCHED_CTX[cid];
+                    let sched    = CORE_SCHED_CTX.as_mut_ptr(cid);
                     let next_ctx = TASK_CTX[next].assume_init_ref() as *const TaskContext;
                     switch_context(sched, next_ctx);
                     // Execution returns here after the task is preempted and
@@ -982,8 +989,8 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                     // write-after-claim race if a concurrent spawn has already
                     // reserved TASK_CTX[prev] (possible now that TASK_VALID=false
                     // immediately).  CORE_DEAD_CTX is never used as a load source.
-                    let dead_ctx = &raw mut CORE_DEAD_CTX[cid];
-                    let sched_ctx = &raw const CORE_SCHED_CTX[cid];
+                    let dead_ctx = CORE_DEAD_CTX.as_mut_ptr(cid);
+                    let sched_ctx = CORE_SCHED_CTX.as_ptr(cid);
                     switch_context(dead_ctx, sched_ctx);
                     // Unreachable: dead tasks are never rescheduled.
                 } else {
@@ -1024,12 +1031,12 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             }
             let current_ctx: *mut TaskContext = if !TASK_VALID[prev].load(Ordering::Relaxed) {
                 // prev self-killed (e.g. the supervisor itself) - discard into CORE_DEAD_CTX.
-                &raw mut CORE_DEAD_CTX[cid]
+                CORE_DEAD_CTX.as_mut_ptr(cid)
             } else {
                 TASK_CTX[prev].assume_init_mut() as *mut TaskContext
             };
             CORE_CURRENT[cid].store(IDLE, Ordering::Relaxed);
-            let sched_ctx: *const TaskContext = &raw const CORE_SCHED_CTX[cid];
+            let sched_ctx: *const TaskContext = CORE_SCHED_CTX.as_ptr(cid);
             switch_context(current_ctx, sched_ctx);
             // Resumes here when prev is next scheduled (after run()'s loop top did the respawn).
             return;
@@ -1063,12 +1070,12 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         }
 
         let current_ctx: *mut TaskContext = if prev >= MAX_TASKS {
-            &raw mut CORE_SCHED_CTX[cid]
+            CORE_SCHED_CTX.as_mut_ptr(cid)
         } else if !TASK_VALID[prev].load(Ordering::Relaxed) {
             // Slot was immediately released by a self-kill (deferred-kstack
             // approach).  Save into CORE_DEAD_CTX to avoid a write-after-claim
             // race with a concurrent spawn.  CORE_DEAD_CTX is never resumed.
-            &raw mut CORE_DEAD_CTX[cid]
+            CORE_DEAD_CTX.as_mut_ptr(cid)
         } else {
             TASK_CTX[prev].assume_init_mut() as *mut TaskContext
         };
@@ -1123,8 +1130,8 @@ pub fn yield_current() {
                     // Save into CORE_DEAD_CTX, not TASK_CTX[prev], to avoid a
                     // write-after-claim race with a concurrent spawn that may
                     // have already reserved the now-available slot.
-                    let dead_ctx = &raw mut CORE_DEAD_CTX[cid];
-                    let sched_ctx = &raw const CORE_SCHED_CTX[cid];
+                    let dead_ctx = CORE_DEAD_CTX.as_mut_ptr(cid);
+                    let sched_ctx = CORE_SCHED_CTX.as_ptr(cid);
                     switch_context(dead_ctx, sched_ctx);
                     // Unreachable: dead tasks are never rescheduled.
                 } else {
@@ -1183,9 +1190,9 @@ pub fn yield_current() {
         // BSP stack pointer, causing a KERNEL PF on the next scheduler resume.
         // CORE_DEAD_CTX is never used as a load source (dead tasks not resumed).
         let current_ctx: *mut TaskContext = if prev >= MAX_TASKS {
-            &raw mut CORE_SCHED_CTX[cid]
+            CORE_SCHED_CTX.as_mut_ptr(cid)
         } else if !TASK_VALID[prev].load(Ordering::Relaxed) {
-            &raw mut CORE_DEAD_CTX[cid]
+            CORE_DEAD_CTX.as_mut_ptr(cid)
         } else {
             TASK_CTX[prev].assume_init_mut() as *mut TaskContext
         };
@@ -1323,7 +1330,7 @@ fn drain_pending_kstack(cid: usize) {
         // Clear before processing so re-entrant callers see an empty queue.
         CORE_PENDING_KSTACK_LEN[cid].store(0, Ordering::Relaxed);
         for i in 0..n {
-            let kstack = unsafe { CORE_PENDING_KSTACK[cid][i] };
+            let kstack = unsafe { (*CORE_PENDING_KSTACK.as_mut_ptr(cid))[i] };
             // SAFETY: RSP is NOT on this kstack (see above).  kstack is the top
             // of a TASK_KSTACK_MAX-sized block allocated from the kstack pool.
             if kstack != 0 { super::free_kstack(kstack); }
@@ -1619,7 +1626,7 @@ pub fn kill_task_by_slot(slot: usize) {
                 if kstack != 0 {
                     let len = CORE_PENDING_KSTACK_LEN[my_core].load(Ordering::Relaxed);
                     if len < PENDING_KSTACK_CAP {
-                        CORE_PENDING_KSTACK[my_core][len] = kstack;
+                        (*CORE_PENDING_KSTACK.as_mut_ptr(my_core))[len] = kstack;
                         CORE_PENDING_KSTACK_LEN[my_core].store(len + 1, Ordering::Relaxed);
                     } else {
                         // Queue overflow (>8 sequential self-kills): free immediately.
@@ -1720,7 +1727,7 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
             }
             None => {
                 CORE_CURRENT[cid].store(IDLE, Ordering::Relaxed);
-                let sched = &raw mut CORE_SCHED_CTX[cid];
+                let sched = CORE_SCHED_CTX.as_mut_ptr(cid);
                 switch_context(current_ctx, sched);
             }
         }

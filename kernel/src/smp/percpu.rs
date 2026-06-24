@@ -7,19 +7,23 @@
 
 //! Boot-time per-core arenas (§9, §26.6.1).
 //!
-//! A [`PerCore<T>`] is one array of N elements - N = the number of cores Limine actually reported -
-//! allocated ONCE at boot from the frame allocator and never freed. It replaces the fixed
-//! `[T; MAX_CORES]` statics so per-core memory is sized to the *machine* (a 4-core box reserves 4
-//! slots, not `MAX_CORES`) instead of to a compile-time constant.
+//! [`PerCore<T>`] / [`PerCoreMut<T>`] are arrays of one element per core - N = the cores Limine
+//! actually reported - allocated ONCE at boot from the frame allocator and never freed. They replace
+//! the fixed `[T; MAX_CORES]` statics so per-core memory is sized to the *machine* (a 4-core box
+//! reserves 4 slots, not `MAX_CORES`) instead of to a compile-time constant.
 //!
 //! This is a **bounded arena, not a heap** (§26.6.1): a single carve at boot, size = `N * sizeof(T)`,
 //! no runtime alloc/free. `MAX_CORES` remains as a generous **sanity ceiling** - boot clamps N to it
-//! (loudly) and it bounds the few things that must stay static - exactly as Linux keeps `NR_CPUS`
-//! above its boot-sized per-CPU areas.
+//! (loudly) - exactly as Linux keeps `NR_CPUS` above its boot-sized per-CPU areas.
 //!
-//! All `unsafe` lives here (the carve + the pointer math), so call sites - including the grandfathered
-//! `task/scheduler.rs` (§18.5) - stay `unsafe`-free behind the safe [`PerCore::get`], the same
-//! discipline `SpinLock` uses.
+//! Two flavours by access pattern:
+//!   - [`PerCore<T>`] hands out a shared `&T` (`get`); `T: Sync`, mutation via atomics. Read-mostly
+//!     per-core state that other cores also read (e.g. shootdown slots).
+//!   - [`PerCoreMut<T>`] hands out a raw `*mut T` (`as_mut_ptr`); for state the OWNING core writes
+//!     (saved register contexts, deferred-free lists). Sound under the per-core single-owner invariant.
+//!
+//! All `unsafe` lives here (the carve + pointer math), so call sites - including the grandfathered
+//! `task/scheduler.rs` (§18.5) - stay `unsafe`-free behind the safe accessors, the `SpinLock` discipline.
 
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -39,11 +43,25 @@ pub fn num_cores() -> usize {
     NUM_CORES.load(Ordering::Acquire)
 }
 
-/// A boot-allocated array of one `T` per core.
+/// Carve `n` UNINITIALISED slots of `T` from the frame allocator and return the base pointer (in the
+/// HHDM). Shared by `PerCore` and `PerCoreMut`. Page-rounded; panics (loud halt, §26.7) if the
+/// allocator cannot back it - per-core state is mandatory. Safe: returns a raw pointer, forms no
+/// reference and reads nothing.
+fn alloc_arena<T>(n: usize) -> *mut T {
+    let bytes = n
+        .checked_mul(core::mem::size_of::<T>())
+        .expect("percpu: arena size overflow");
+    let pages = (bytes + 0xFFF) / 0x1000;
+    let phys = crate::memory::allocator::alloc_contiguous(pages.max(1))
+        .expect("percpu: frame allocator could not back a per-core arena");
+    let hhdm = crate::arch::x86_64::page_tables::get_hhdm_offset();
+    (hhdm + phys) as *mut T
+}
+
+/// A boot-allocated array of one `T` per core, accessed by SHARED reference ([`get`](PerCore::get)).
 ///
 /// `T: Sync` because a core's slot may be read by *other* cores (e.g. a shootdown address read by the
-/// servicers), so the shared `&T` must be sound across cores; per-core *mutation* goes through `T`'s
-/// own interior mutability (atomics), never `&mut`.
+/// servicers); per-core *mutation* goes through `T`'s own interior mutability (atomics), never `&mut`.
 pub struct PerCore<T: Sync + 'static> {
     base: AtomicPtr<T>,
 }
@@ -58,25 +76,13 @@ impl<T: Sync + 'static> PerCore<T> {
         Self { base: AtomicPtr::new(ptr::null_mut()) }
     }
 
-    /// Allocate `n` slots from the frame allocator and initialise slot `i` with `init(i)`.
-    ///
-    /// Call ONCE at boot, after the frame allocator is up and before any `get`. Panics (loud halt,
-    /// §26.7) if the allocator cannot back the page-rounded request - per-core state is mandatory, so
-    /// continuing without it is never safe.
+    /// Allocate `n` slots and initialise slot `i` with `init(i)`. Call ONCE at boot, after the frame
+    /// allocator is up and before any `get`.
     pub fn init_with(&self, n: usize, init: impl Fn(usize) -> T) {
-        let bytes = n
-            .checked_mul(core::mem::size_of::<T>())
-            .expect("percpu: arena size overflow");
-        let pages = (bytes + 0xFFF) / 0x1000;
-        let phys = crate::memory::allocator::alloc_contiguous(pages.max(1))
-            .expect("percpu: frame allocator could not back a per-core arena");
-        let hhdm = crate::arch::x86_64::page_tables::get_hhdm_offset();
-        let base = (hhdm + phys) as *mut T;
-        // SAFETY: `base` covers `pages` freshly-allocated, page-aligned frames = at least
-        // `n * sizeof(T)` bytes; each slot is written exactly once, here, before `base` is published,
-        // so there is no concurrent access and no read of uninitialised memory. Alignment holds: a
-        // 4 KiB page base is aligned for any `T` whose alignment is <= 4096 (every per-core type is
-        // <= 64-byte aligned).
+        let base = alloc_arena::<T>(n);
+        // SAFETY: `base` covers `n` freshly-allocated, page-aligned slots; each is written exactly
+        // once, here, before `base` is published, so there is no concurrent access and no read of
+        // uninitialised memory. Alignment holds: a 4 KiB page base suits any `T` aligned <= 4096.
         for i in 0..n {
             unsafe { ptr::write(base.add(i), init(i)); }
         }
@@ -92,5 +98,58 @@ impl<T: Sync + 'static> PerCore<T> {
         // SAFETY: `base` points to `num_cores()` initialised, never-freed slots; `core < num_cores()`
         // by the caller's contract; `T: Sync` makes the shared `&T` sound across cores.
         unsafe { &*base.add(core) }
+    }
+}
+
+/// A boot-allocated array of one `T` per core, accessed by OWNER-MUTABLE raw pointer
+/// ([`as_mut_ptr`](PerCoreMut::as_mut_ptr)).
+///
+/// For per-core state the OWNING core writes - saved register contexts, deferred-free lists - which
+/// can't use `PerCore`'s shared `&T`. Sound under the **per-core single-owner invariant**: each core
+/// only ever dereferences its OWN slot, so no two cores alias one. `T` need not be `Sync` - the
+/// invariant, not the type, provides the guarantee.
+pub struct PerCoreMut<T: 'static> {
+    base: AtomicPtr<T>,
+}
+
+// SAFETY: shared across cores only as a container; the single-owner invariant - each core dereferences
+// only `as_mut_ptr(its own core id)` - means no slot is ever aliased, so this is sound despite the
+// owner-mutable access.
+unsafe impl<T: 'static> Sync for PerCoreMut<T> {}
+
+impl<T: 'static> PerCoreMut<T> {
+    /// A not-yet-allocated arena. `init_with` must run before any `as_mut_ptr`.
+    pub const fn new() -> Self {
+        Self { base: AtomicPtr::new(ptr::null_mut()) }
+    }
+
+    /// Allocate `n` slots and initialise slot `i` with `init(i)`. Call ONCE at boot, after the frame
+    /// allocator is up and before any `as_mut_ptr`.
+    pub fn init_with(&self, n: usize, init: impl Fn(usize) -> T) {
+        let base = alloc_arena::<T>(n);
+        // SAFETY: as `PerCore::init_with` - `n` fresh page-aligned slots, each written exactly once
+        // here before `base` is published, so no concurrent access and no read of uninitialised memory.
+        for i in 0..n {
+            unsafe { ptr::write(base.add(i), init(i)); }
+        }
+        self.base.store(base, Ordering::Release);
+    }
+
+    /// Raw MUTABLE pointer to core `core`'s slot. Safe to CALL (forms no reference, reads nothing); the
+    /// DEREF is the caller's `unsafe`, sound only under the per-core single-owner invariant (only the
+    /// owning core dereferences its slot, no aliasing `&mut`).
+    #[inline]
+    pub fn as_mut_ptr(&self, core: usize) -> *mut T {
+        let base = self.base.load(Ordering::Acquire);
+        debug_assert!(!base.is_null(), "percpu: arena used before init_with");
+        debug_assert!(core < num_cores(), "percpu: core index {core} out of range");
+        // SAFETY: `base` points to `num_cores()` slots; `core < num_cores()` by the caller's contract.
+        unsafe { base.add(core) }
+    }
+
+    /// Raw const pointer to core `core`'s slot (for read-only / `next` arguments).
+    #[inline]
+    pub fn as_ptr(&self, core: usize) -> *const T {
+        self.as_mut_ptr(core) as *const T
     }
 }
