@@ -100,11 +100,15 @@ A userspace driver service, structurally identical to `block-driver` (AHCI) and 
   bounded to it. So the NIC driver is **least-privilege and restartable**, and on an IOMMU machine it
   is **not in the TCB** (same posture as the confined USB drivers). All `unsafe` lives behind the SDK's
   audited `Mmio`/`Dma` wrappers (§18.1) - the driver itself is `unsafe`-free.
-- **Model-specific, like AHCI.** First target: **e1000** (Intel 82540EM) - exhaustively documented,
-  emulated by QEMU (`-device e1000`), and a real Intel silicon family, so the *same driver* can run in
-  QEMU and on Intel hardware. (`virtio-net` is simpler but paravirtual-only - it cannot run on the
-  bare-metal T630, so it is not the dev target.) A second concrete driver is added for the T630's actual
-  chipset once Phase 0 identifies it.
+- **Model-specific, like AHCI.** The dev driver is **e1000** (Intel 82540EM) - exhaustively documented
+  and emulated by QEMU (`-device e1000`). (`virtio-net` is simpler but paravirtual-only - it cannot run
+  on bare metal, so it is not the dev target.) **Phase 0 identified the T630 as a Realtek RTL8111/8168
+  (`10ec:8168`), NOT Intel** - and QEMU has no RTL8168 model (it emulates the *old* rtl8139, e1000,
+  virtio-net, but not the 8168). So the two drivers are genuinely separate: **e1000 in QEMU** carries
+  all the stack development, and a **Realtek RTL8168 driver is Phase 4**, tested only on the T630 bench.
+  The NIC-agnostic frame interface is exactly what makes this clean - the stack never knows the
+  difference. This is the "agnostic stack, model-specific drivers" split being load-bearing, not
+  theoretical.
 - **Raw frames only.** The driver knows Ethernet framing and the ring/DMA mechanics; it knows nothing
   about IP. TX: a service hands it a frame, it enqueues a TX descriptor, rings the doorbell. RX: the
   receive IRQ (routed to the driver, §12.2) wakes it; it copies the frame out of the DMA buffer and
@@ -112,11 +116,18 @@ A userspace driver service, structurally identical to `block-driver` (AHCI) and 
 
 ### Phase 0 - identify the hardware
 
-The T630's Ethernet chipset is unknown. The kernel already enumerates PCI (`arch/x86_64/pci.rs`, used by
-`block-driver`), so the first concrete step is a probe that **enumerates PCI and prints the NIC's
-`vendor:device` + BARs + IRQ** at boot. That single boot line tells us what the T630 has (Realtek
-RTL8111? Intel? Broadcom?) and therefore which second driver Phase 4 writes. Costs almost nothing and
-de-risks the hardware target.
+The kernel already enumerates PCI (`arch/x86_64/pci.rs`, used by `block-driver`), so the first concrete
+step was a probe that **enumerates PCI and prints each NIC's `vendor:device` + BAR + IRQ** at boot.
+
+> **Done + hardware-confirmed (2026-06-24).** `pci::init` now logs network controllers (class 0x02)
+> alongside USB/AHCI. Flashed on the T630, it printed:
+> `pci: NIC (network ctrl, subclass 0x00) at 01:00.0 vendor=0x10ec device=0x8168 MMIO=0xe000 IRQ=5` -
+> **a Realtek RTL8111/8168 Gigabit NIC.** (QEMU's e1000 prints `vendor=0x8086 device=0x100e`, confirming
+> the detection path in the shell-test harness.) One follow-up for Phase 1: on the RTL8168 BAR0 is an
+> **I/O** BAR (bit 0 set) - the printed `MMIO=0xe000` is that I/O base; the real register MMIO is BAR2.
+> Phase 0 should print all BARs and flag I/O-vs-memory so the driver grabs the right one.
+
+Costs almost nothing and de-risked the hardware target: we now know Phase 4 writes a Realtek driver.
 
 ---
 
@@ -233,7 +244,7 @@ reliability on top of this best-effort substrate - not the kernel, not magic.
 | **1** | `nic-driver` (e1000): raw Ethernet TX/RX via DMA rings + RX IRQ, IOMMU-confined | Send a raw frame; receive a raw frame (host-side listener / loopback) in QEMU |
 | **2** | ARP + IPv4 + ICMP in `net-stack` | **`ping` the host** end to end - the networking ping/pong |
 | **3** | UDP + **socket-as-capability** (`resource_mint`/badge/revoke); a `net` shell utility | A service opens a UDP socket cap, send/recv a datagram; non-escalation + revoke pinned (a §22 "socket is a capability" test, mirroring Test 14) |
-| **4** | The **T630 NIC driver** (the real chipset), same frame interface | `ping` from bare metal on the T630 |
+| **4** | The **Realtek RTL8168 driver** (`10ec:8168`, the T630's NIC), same frame interface - HW-only, no QEMU model | `ping` from bare metal on the T630 |
 | **5** | (far-future) TCP | A TCP echo against a real peer |
 
 Each phase gets a design beat in this doc plus QEMU + (where it applies) T630 verification, exactly like
@@ -277,10 +288,12 @@ When a phase ships and an identity test pins it, the load-bearing decision is am
 
 ## 14. Open questions (for sign-off)
 
-1. **The T630's NIC chipset** - resolved by Phase 0's boot print. Drives what Phase 4 writes.
+1. **The T630's NIC chipset** - **RESOLVED (2026-06-24): Realtek RTL8111/8168 (`10ec:8168`).** QEMU has
+   no RTL8168 model, so dev is e1000 and the Realtek driver is Phase 4 (HW-only). See §5 Phase 0.
 2. **Static IP first** (baked config), DHCP deferred - agreed? (DHCP is later, as a UDP client.)
-3. **e1000 as the QEMU+Intel dev driver** - agreed? (vs virtio-net, which can't run on the bare-metal
-   T630.)
+3. **e1000 as the QEMU dev driver** - agreed? Note this is purely the dev NIC: the T630 is Realtek, so
+   e1000 does NOT run on it (vs virtio-net, which can't run on bare metal at all). The HW driver is the
+   Phase-4 RTL8168.
 4. **IPv4 only** to start, IPv6 far-future - agreed?
 5. **UDP + the cap model is the v2 milestone**; TCP is explicitly far-future - agreed on that boundary?
 6. **One `net-stack` service** owning IP + all protocols, vs splitting (e.g. a separate `udp` service)?
