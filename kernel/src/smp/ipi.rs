@@ -12,7 +12,7 @@
 //!   2. TLB shootdown after a page is unmapped (§10.5).
 //!   3. Cross-core scheduler preemption (timer overflow).
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 use crate::smp::core::MAX_CORES;
 
 /// Vector numbers for each IPI purpose.
@@ -34,16 +34,17 @@ const APIC_ICR_LOW:  u64 = 0x300;
 // (`service_pending`), so concurrent shootdowns serialize cleanly instead of deadlocking. This was the
 // max-carnage wedge at 71K rounds: heavy concurrent reclaims across cores (§10.5).
 //
-//   SHOOTDOWN_ADDR[x] - the VA core x is invalidating (`!0` = full CR3 flush).
-//   SHOOTDOWN_GEN[x]  - x's request generation (monotonic; a new request bumps it; 0 = never used).
-//   SHOOTDOWN_ACK[x]  - how many OTHER cores have serviced x's CURRENT request.
-//   LAST_SEEN[y][x]   - the gen of x's request that core y last serviced (y-private row), so y
-//                       services each request exactly once.
-static SHOOTDOWN_ADDR: [AtomicU64; MAX_CORES] = [const { AtomicU64::new(0) }; MAX_CORES];
-static SHOOTDOWN_GEN:  [AtomicU64; MAX_CORES] = [const { AtomicU64::new(0) }; MAX_CORES];
-static SHOOTDOWN_ACK:  [AtomicU32; MAX_CORES] = [const { AtomicU32::new(0) }; MAX_CORES];
-static LAST_SEEN: [[AtomicU64; MAX_CORES]; MAX_CORES] =
-    [const { [const { AtomicU64::new(0) }; MAX_CORES] }; MAX_CORES];
+//   SHOOTDOWN_ADDR[x]     - the VA core x is invalidating (`!0` = full CR3 flush).
+//   SHOOTDOWN_ACK_MASK[x] - bit y set = core y has serviced x's CURRENT request. The initiator CLEARS
+//                           it to publish a request (a clear bit = "service me"); each servicer sets
+//                           its own bit; the initiator waits until every expected bit is set. One bit
+//                           per (initiator, receiver) pair = N^2 BITS (N^2/8 bytes) - 64x smaller than
+//                           a per-pair counter+generation. Initialised all-set (!0) so a slot that has
+//                           never been requested reads "already acked by everyone" and is not
+//                           spuriously serviced. ASSUMES <= 64 cores (one u64); the per-core boot arena
+//                           (Stage 2) generalises this to ceil(N/64) words.
+static SHOOTDOWN_ADDR:     [AtomicU64; MAX_CORES] = [const { AtomicU64::new(0) }; MAX_CORES];
+static SHOOTDOWN_ACK_MASK: [AtomicU64; MAX_CORES] = [const { AtomicU64::new(!0) }; MAX_CORES];
 
 /// The calling core's id - via its LAPIC, staying within smp+arch (no up-call into the scheduler).
 #[inline]
@@ -69,18 +70,29 @@ fn invalidate(addr: u64) {
     }
 }
 
+/// Bitmask of every ready core except `me` - the set of acks an initiator must collect.
+fn ready_mask_excluding(me: usize) -> u64 {
+    let mut mask = 0u64;
+    for x in 0..MAX_CORES {
+        if x != me && crate::smp::core::is_ready(x as u32) {
+            mask |= 1u64 << x;
+        }
+    }
+    mask
+}
+
 /// Service every OTHER ready core's pending shootdown request once: invalidate its VA and ack it.
 /// Called from BOTH the IPI handler and the ack-wait spin, so a core waiting for its own acks still
 /// acks everyone else's request - the deadlock-breaker. Touches no interrupt state (pure shared-slot
-/// polling + invlpg), so it is safe to call IF=0 mid-spin.
+/// polling + invlpg), so it is safe to call IF=0 mid-spin. A slot is "pending for me" exactly when my
+/// bit is clear (the initiator cleared the whole mask to publish); after I service it I set my bit.
 fn service_pending(me: usize) {
+    let mybit = 1u64 << me;
     for x in 0..MAX_CORES {
         if x == me || !crate::smp::core::is_ready(x as u32) { continue; }
-        let gen = SHOOTDOWN_GEN[x].load(Ordering::SeqCst);
-        if gen > LAST_SEEN[me][x].load(Ordering::Relaxed) {
+        if SHOOTDOWN_ACK_MASK[x].load(Ordering::SeqCst) & mybit == 0 {
             invalidate(SHOOTDOWN_ADDR[x].load(Ordering::SeqCst));
-            LAST_SEEN[me][x].store(gen, Ordering::Relaxed);
-            SHOOTDOWN_ACK[x].fetch_add(1, Ordering::SeqCst);
+            SHOOTDOWN_ACK_MASK[x].fetch_or(mybit, Ordering::SeqCst);
         }
     }
 }
@@ -146,26 +158,25 @@ unsafe fn broadcast_shootdown_ipi() {
 /// The APIC must be mapped and the caller holds IF=0. The per-core request slots make concurrent
 /// shootdowns safe; the broadcast + spin run with interrupts off as the protocol requires (§10.5).
 unsafe fn request_and_wait(addr: u64) {
-    let ncores = crate::smp::core::ready_count();
-    if ncores <= 1 {
+    if crate::smp::core::ready_count() <= 1 {
         return; // single-core; no remote TLBs to invalidate
     }
     let me = this_core();
+    // The acks we must collect: a bit for every OTHER ready core.
+    let expected = ready_mask_excluding(me);
 
-    // Publish: address + reset my ack, THEN bump my generation - the gen store makes both visible to
-    // servicers (they read gen first, then addr).
+    // Publish: set the address, THEN clear my ack mask. The clear IS the "new request" signal (a
+    // servicer acts on a clear bit), so the address must land first - a servicer seeing its bit clear
+    // then reads the new address.
     SHOOTDOWN_ADDR[me].store(addr, Ordering::SeqCst);
-    SHOOTDOWN_ACK[me].store(0, Ordering::SeqCst);
-    let gen = SHOOTDOWN_GEN[me].load(Ordering::Relaxed).wrapping_add(1);
-    SHOOTDOWN_GEN[me].store(gen, Ordering::SeqCst);
+    SHOOTDOWN_ACK_MASK[me].store(0, Ordering::SeqCst);
 
     // SAFETY: APIC mapped; IF=0.
     unsafe { broadcast_shootdown_ipi(); }
 
-    // Wait for every other ready core to ack my request, servicing theirs meanwhile so two cores
-    // shooting down at once ack each other instead of deadlocking.
-    let expected = ncores - 1;
-    while SHOOTDOWN_ACK[me].load(Ordering::SeqCst) < expected {
+    // Wait until every expected core has set its bit, servicing theirs meanwhile so two cores shooting
+    // down at once ack each other instead of deadlocking.
+    while SHOOTDOWN_ACK_MASK[me].load(Ordering::SeqCst) & expected != expected {
         service_pending(me);
         core::hint::spin_loop();
     }
