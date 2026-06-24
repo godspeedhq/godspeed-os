@@ -68,6 +68,18 @@ pub static AHCI_IRQ: AtomicU8 = AtomicU8::new(0);
 /// PCI BDF of the AHCI controller - IOMMU device-table index (H1). 0xFFFF if none.
 pub static AHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
 
+// Network controller (PCI class 0x02) - the NIC. Networking Phase 0 (docs/networking.md): identify
+// what NIC hardware is present so we know whether QEMU's e1000 and the T630's chipset share a driver.
+// The first NIC found is recorded for the future `nic-driver` to receive its MMIO BAR + IRQ at spawn,
+// exactly as `block-driver` gets the AHCI ABAR. No driver is bound yet - this is pure identification.
+const CLASS_NETWORK: u8 = 0x02;
+/// Discovered network controller. First NIC found wins. 0xFFFF BDF if none.
+pub static NIC_FOUND:         AtomicBool = AtomicBool::new(false);
+pub static NIC_MMIO_BASE:     AtomicU64  = AtomicU64::new(0);     // BAR0 register space
+pub static NIC_IRQ:           AtomicU8   = AtomicU8::new(0);
+pub static NIC_BDF:           AtomicU32  = AtomicU32::new(0xFFFF); // IOMMU device-table index (H1)
+pub static NIC_VENDOR_DEVICE: AtomicU32  = AtomicU32::new(0);     // config 0x00: vendor | device<<16
+
 /// Build a 16-bit PCI BDF (bus<<8 | dev<<3 | func) - the IOMMU device-table index.
 #[inline]
 pub fn make_bdf(bus: u8, dev: u8, func: u8) -> u32 {
@@ -722,6 +734,32 @@ pub fn init() {
                         "pci: AHCI at {:02x}:{:02x}.{} vendor={:#06x} ABAR={:#x} IRQ={}",
                         bus, dev, func, vendor, abar, irq
                     );
+                }
+                // Network controller (PCI class 0x02) - networking Phase 0 (docs/networking.md):
+                // identify what NIC is present. Log EVERY one; record the first for the future nic-driver.
+                if class == CLASS_NETWORK {
+                    // BAR0 (offset 0x10): the register space. 64-bit memory BAR if bits[2:1]=10.
+                    let bar0 = config_read32(bus as u8, dev, func, 0x10);
+                    let mmio_base = if bar0 & 0x6 == 0x4 {
+                        let bar1 = config_read32(bus as u8, dev, func, 0x14);
+                        ((bar1 as u64) << 32) | ((bar0 & 0xFFFF_FFF0) as u64)
+                    } else {
+                        (bar0 & 0xFFFF_FFF0) as u64
+                    };
+                    let irq    = (config_read32(bus as u8, dev, func, 0x3C) & 0xFF) as u8;
+                    let vd     = config_read32(bus as u8, dev, func, 0x00);
+                    let device = (vd >> 16) as u16;
+                    crate::kprintln!(
+                        "pci: NIC (network ctrl, subclass {:#04x}) at {:02x}:{:02x}.{} vendor={:#06x} device={:#06x} MMIO={:#x} IRQ={}",
+                        subclass, bus, dev, func, vendor, device, mmio_base, irq
+                    );
+                    if !NIC_FOUND.load(Ordering::Relaxed) {
+                        NIC_MMIO_BASE.store(mmio_base, Ordering::Relaxed);
+                        NIC_IRQ.store(irq, Ordering::Relaxed);
+                        NIC_BDF.store(make_bdf(bus as u8, dev, func), Ordering::Relaxed);
+                        NIC_VENDOR_DEVICE.store(vd, Ordering::Relaxed);
+                        NIC_FOUND.store(true, Ordering::Relaxed);
+                    }
                 }
             }
         }
