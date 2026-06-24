@@ -141,8 +141,9 @@ pub struct TaskStat {
     pub name_len:    usize,
     /// Task name bytes (zero-padded to 32 bytes).
     pub name:        [u8; 32],
-    /// Current endpoint generation (restart counter).
-    pub generation:  u32,
+    /// Number of times this service has been restarted (0 on a fresh boot / first spawn, +1 per
+    /// respawn). Saturating u64 - effectively unbounded.
+    pub restart_count: u64,
     /// Current inbound IPC queue depth (0–16).
     pub queue_depth: u8,
     /// Timer ticks spent as the running task on its core (monotonic since boot).
@@ -802,7 +803,7 @@ impl ServiceContext {
             return TaskStat {
                 valid: false, state: 0, core: 0,
                 mem_used: 0, mem_limit: 0, name_len: 0, name: [0u8; 32],
-                generation: 0, queue_depth: 0, run_ticks: 0,
+                restart_count: 0, queue_depth: 0, run_ticks: 0,
             };
         }
         let valid       = buf[0] != 0;
@@ -816,12 +817,13 @@ impl ServiceContext {
         let mut name = [0u8; 32];
         let copy_len = name_len.min(32);
         name[..copy_len].copy_from_slice(&buf[24..24 + copy_len]);
-        let generation  = u32::from_le_bytes([buf[56], buf[57], buf[58], buf[59]]);
-        let queue_depth = buf[60];
+        let restart_count = u64::from_le_bytes([buf[56], buf[57], buf[58], buf[59],
+                                                buf[60], buf[61], buf[62], buf[63]]);
+        let queue_depth = buf[3];
         let run_ticks   = u64::from_le_bytes([buf[64], buf[65], buf[66], buf[67],
                                               buf[68], buf[69], buf[70], buf[71]]);
         TaskStat { valid, state, core, mem_used, mem_limit, name_len: copy_len, name,
-                   generation, queue_depth, run_ticks }
+                   restart_count, queue_depth, run_ticks }
     }
 
     /// List the capabilities held by the task in `slot`, into `out`. Returns the

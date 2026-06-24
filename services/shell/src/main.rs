@@ -1917,7 +1917,7 @@ fn build_status_table(ctx: &ServiceContext) -> Table {
         let state = t.intern(s.state_str().as_bytes());
         t.add_row(&[
             Value::Int(slot as u64), name, Value::Int(s.core as u64), state,
-            Value::Int(s.mem_used), Value::Int(s.queue_depth as u64), Value::Int(s.generation as u64),
+            Value::Int(s.mem_used), Value::Int(s.queue_depth as u64), Value::Int(s.restart_count),
         ]);
     }
     t
@@ -1974,7 +1974,7 @@ fn build_observe_table(ctx: &ServiceContext, arg: &str) -> Option<Table> {
         let state = t.intern(s.state_str().as_bytes());
         t.add_row(&[
             Value::Int(slot as u64), name, Value::Int(s.core as u64), state,
-            Value::Int(s.mem_used), Value::Int(s.queue_depth as u64), Value::Int(s.generation as u64),
+            Value::Int(s.mem_used), Value::Int(s.queue_depth as u64), Value::Int(s.restart_count),
             Value::Int(s.run_ticks),
         ]);
     }
@@ -2578,14 +2578,14 @@ fn slot_of(ctx: &ServiceContext, name: &str) -> Option<u32> {
     None
 }
 
-/// The restart generation of the live service named `name` (None if not running). A restart bumps
-/// the generation (§7.5), so a value strictly greater than a pre-kill reading proves a NEW instance
-/// came up - the recovery signal `chaos kill-storm` waits on.
+/// The restart count of the live service named `name` (None if not running). A respawn increments it
+/// (a fresh instance reads previous + 1), so a value strictly greater than a pre-kill reading proves a
+/// NEW instance came up - the recovery signal `chaos kill-storm` waits on.
 fn gen_of(ctx: &ServiceContext, name: &str) -> Option<u32> {
     for slot in 0..256u32 {
         let st = ctx.task_stat(slot);
         if st.valid && st.state != 4 /* Dead */ && st.name_str() == name {
-            return Some(st.generation as u32);
+            return Some(st.restart_count as u32);
         }
     }
     None
@@ -3850,7 +3850,7 @@ fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
                 let b = nm.as_bytes(); let l = b.len().min(24);
                 cand[ncand].0[..l].copy_from_slice(&b[..l]);
                 cand[ncand].1 = l;
-                cand[ncand].2 = st.generation as u32;
+                cand[ncand].2 = st.restart_count as u32;
                 ncand += 1;
             }
         }
