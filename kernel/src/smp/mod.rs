@@ -39,6 +39,7 @@ pub fn percpu_init(boot_info: &BootInfo) {
     }
     percpu::set_num_cores(n);
     ipi::init_arenas(n);
+    core::init_arenas(n);
 }
 
 pub fn init(boot_info: &BootInfo) {

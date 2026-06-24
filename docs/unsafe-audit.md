@@ -147,7 +147,6 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | memory/frame.rs | 1 | permitted |
 | memory/mod.rs | 1 | permitted |
 | memory/page.rs | 1 | permitted |
-| smp/core.rs | 6 | permitted |
 | smp/ipi.rs | 23 | permitted |
 | smp/mod.rs | 1 | permitted |
 | smp/percpu.rs | 6 | permitted |
