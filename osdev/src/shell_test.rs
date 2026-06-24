@@ -43,6 +43,10 @@ pub fn run(image_path: &Path, smp: u32) {
         // never miss output that was written before we connected.
         "-serial",  &format!("tcp::{shell_port},server"),
         "-serial",  "null",   // COM2 unused
+        // Networking Phase 0: an e1000 NIC so the kernel's PCI scan prints it (docs/networking.md).
+        // Confirms the detection works in QEMU + that the NIC doesn't disturb boot (the rest of the suite).
+        "-device",  "e1000,netdev=n0",
+        "-netdev",  "user,id=n0",
         "-display", "none",
         "-no-reboot",
         "-no-shutdown",
@@ -120,6 +124,11 @@ pub fn run(image_path: &Path, smp: u32) {
                    "naming Phase 2: fs's block-driver peer wired from the map");
             check!(boot_out.contains("shell wired from the name-cap map"),
                    "naming Phase 3a: shell's fs peer wired from the map");
+            // Networking Phase 0 (docs/networking.md): the kernel's PCI scan prints the NIC. QEMU's
+            // e1000 = Intel 82540EM (vendor 0x8086). Confirms the detection path; on the T630 the same
+            // print names whatever chipset it has.
+            check!(boot_out.contains("pci: NIC") && boot_out.contains("vendor=0x8086"),
+                   "phase0: e1000 NIC detected + printed at boot (vendor=0x8086)");
         }
         None => {
             // Print what we did receive to help diagnose failures.
