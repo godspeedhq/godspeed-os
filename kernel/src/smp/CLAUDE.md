@@ -58,6 +58,8 @@ sequenceDiagram
 
 This is a synchronous barrier. It is a real cost on every unmap. v1 minimises unmap frequency by reclaiming memory only at service death.
 
+**Concurrent shootdowns are safe (per-core requests).** Each *initiating* core has its own request slot — `SHOOTDOWN_ADDR/GEN/ACK[core]` in `ipi.rs` — and a core waiting for its own acks also services every other core's pending request (`service_pending`, called from both the IPI handler and the ack-wait spin). So two cores unmapping at the same time ack each other instead of deadlocking. The single-global `TLB_ACK`/`TLB_SHOOTDOWN_ADDR` counter this replaced **deadlocked** under concurrent reclaims: each initiator spun IF=0 waiting for the other's ack while being a target of the other's all-excluding-self broadcast, so neither could ack — the `chaos max-carnage` 71K-round wedge on the T630. The diagram above is still the single-unmapper common case; the per-core slots generalise it to N simultaneous unmappers.
+
 ## Placement (§9.2)
 
 `resolve(contract_core)` returns the core a new service instance should run on:

@@ -12,7 +12,8 @@
 //!   2. TLB shootdown after a page is unmapped (§10.5).
 //!   3. Cross-core scheduler preemption (timer overflow).
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use crate::smp::core::MAX_CORES;
 
 /// Vector numbers for each IPI purpose.
 pub mod vectors {
@@ -25,10 +26,64 @@ pub mod vectors {
 const APIC_ICR_HIGH: u64 = 0x310;
 const APIC_ICR_LOW:  u64 = 0x300;
 
-// Counts acknowledgments from remote cores during a TLB shootdown.
-static TLB_ACK: AtomicU32 = AtomicU32::new(0);
-// Virtual address being invalidated in the current shootdown broadcast.
-static mut TLB_SHOOTDOWN_ADDR: u64 = 0;
+// Per-core TLB shootdown state - one independent request slot per INITIATING core, so concurrent
+// shootdowns never share a counter or address. The single-global `TLB_ACK` / `TLB_SHOOTDOWN_ADDR`
+// this replaced DEADLOCKED when two cores unmapped at once: each spun IF=0 waiting for the other's
+// ack while being a target of the other's all-excluding-self broadcast, so neither could ack the
+// other. Now a core waiting for its own acks ALSO services every other core's pending request
+// (`service_pending`), so concurrent shootdowns serialize cleanly instead of deadlocking. This was the
+// max-carnage wedge at 71K rounds: heavy concurrent reclaims across cores (§10.5).
+//
+//   SHOOTDOWN_ADDR[x] - the VA core x is invalidating (`!0` = full CR3 flush).
+//   SHOOTDOWN_GEN[x]  - x's request generation (monotonic; a new request bumps it; 0 = never used).
+//   SHOOTDOWN_ACK[x]  - how many OTHER cores have serviced x's CURRENT request.
+//   LAST_SEEN[y][x]   - the gen of x's request that core y last serviced (y-private row), so y
+//                       services each request exactly once.
+static SHOOTDOWN_ADDR: [AtomicU64; MAX_CORES] = [const { AtomicU64::new(0) }; MAX_CORES];
+static SHOOTDOWN_GEN:  [AtomicU64; MAX_CORES] = [const { AtomicU64::new(0) }; MAX_CORES];
+static SHOOTDOWN_ACK:  [AtomicU32; MAX_CORES] = [const { AtomicU32::new(0) }; MAX_CORES];
+static LAST_SEEN: [[AtomicU64; MAX_CORES]; MAX_CORES] =
+    [const { [const { AtomicU64::new(0) }; MAX_CORES] }; MAX_CORES];
+
+/// The calling core's id - via its LAPIC, staying within smp+arch (no up-call into the scheduler).
+#[inline]
+fn this_core() -> usize {
+    // SAFETY: the APIC is mapped before any IPI path runs.
+    let lapic = unsafe { crate::arch::x86_64::boot::get_lapic_id() };
+    crate::smp::core::lapic_to_core_id(lapic) as usize
+}
+
+/// Invalidate `addr` on THIS core - a single-page `invlpg`, or a full CR3 reload for the `!0` sentinel.
+#[inline]
+fn invalidate(addr: u64) {
+    if addr == !0u64 {
+        // SAFETY: reloading CR3 with the same value is always valid in ring 0.
+        unsafe {
+            let cr3: u64;
+            core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem));
+            core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, nomem));
+        }
+    } else {
+        // SAFETY: invlpg is always valid in ring 0; `addr` is a virtual address.
+        unsafe { core::arch::asm!("invlpg [{a}]", a = in(reg) addr, options(nostack)); }
+    }
+}
+
+/// Service every OTHER ready core's pending shootdown request once: invalidate its VA and ack it.
+/// Called from BOTH the IPI handler and the ack-wait spin, so a core waiting for its own acks still
+/// acks everyone else's request - the deadlock-breaker. Touches no interrupt state (pure shared-slot
+/// polling + invlpg), so it is safe to call IF=0 mid-spin.
+fn service_pending(me: usize) {
+    for x in 0..MAX_CORES {
+        if x == me || !crate::smp::core::is_ready(x as u32) { continue; }
+        let gen = SHOOTDOWN_GEN[x].load(Ordering::SeqCst);
+        if gen > LAST_SEEN[me][x].load(Ordering::Relaxed) {
+            invalidate(SHOOTDOWN_ADDR[x].load(Ordering::SeqCst));
+            LAST_SEEN[me][x].store(gen, Ordering::Relaxed);
+            SHOOTDOWN_ACK[x].fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
 
 /// Send a fixed-delivery IPI to a specific core.
 ///
@@ -59,46 +114,70 @@ pub unsafe fn send_ipi(core_id: u32, vector: u8) {
     }
 }
 
-/// Broadcast a TLB shootdown IPI to all other cores and wait for acks (§10.5).
+/// Broadcast a `TLB_SHOOTDOWN` IPI to all OTHER cores (all-excluding-self shorthand).
 ///
 /// # Safety
-/// Interrupts should be disabled on the calling core before this call.
-pub unsafe fn broadcast_tlb_shootdown(virt_addr: u64) {
-    let ncores = crate::smp::core::ready_count();
-    if ncores <= 1 {
-        return; // single-core; no remote TLBs to invalidate
-    }
-
-    // SAFETY: single writer; caller guarantees IF=0.
-    unsafe { TLB_SHOOTDOWN_ADDR = virt_addr; }
-    TLB_ACK.store(0, Ordering::SeqCst);
-
+/// The APIC must be mapped; the caller holds IF=0 (or has saved/disabled it).
+unsafe fn broadcast_shootdown_ipi() {
     let apic_base = unsafe { crate::arch::x86_64::boot::get_apic_virt_base() };
-
-    // ICR shorthand = 0b11 (all-excluding-self, bits 19:18), fixed delivery,
-    // edge trigger, assert (bit 14).
-    // SAFETY: APIC mapped; caller holds IF=0.
+    // SAFETY: APIC mapped; IF=0.
     unsafe {
         write_apic_reg(apic_base + APIC_ICR_HIGH, 0);
-        // Poll DELIVS (bit 12) before writing the broadcast; same requirement
-        // as point-to-point IPIs per SDM §10.6.1.
+        // Poll DELIVS (bit 12) before the broadcast (SDM §10.6.1) - writing while DELIVS=1 silently
+        // drops the IPI on some xAPICs. Bounded so a wedged APIC can't spin forever.
         let mut tries = 0u32;
         while (read_apic_reg(apic_base + APIC_ICR_LOW) >> 12) & 1 != 0 {
             core::hint::spin_loop();
             tries += 1;
             if tries >= 10_000 { break; }
         }
+        // ICR shorthand 0b11 (all-excluding-self, bits 19:18), fixed delivery, edge, assert (bit 14).
         write_apic_reg(
             apic_base + APIC_ICR_LOW,
             (vectors::TLB_SHOOTDOWN as u32) | (1 << 14) | (0b11 << 18),
         );
     }
+}
 
-    // Spin until every other core has acknowledged.
+/// Publish this core's shootdown request for `addr` (`!0` = full CR3 flush), broadcast it, and wait
+/// for every other ready core to service it - servicing THEIRS in the spin (the deadlock-breaker).
+///
+/// # Safety
+/// The APIC must be mapped and the caller holds IF=0. The per-core request slots make concurrent
+/// shootdowns safe; the broadcast + spin run with interrupts off as the protocol requires (§10.5).
+unsafe fn request_and_wait(addr: u64) {
+    let ncores = crate::smp::core::ready_count();
+    if ncores <= 1 {
+        return; // single-core; no remote TLBs to invalidate
+    }
+    let me = this_core();
+
+    // Publish: address + reset my ack, THEN bump my generation - the gen store makes both visible to
+    // servicers (they read gen first, then addr).
+    SHOOTDOWN_ADDR[me].store(addr, Ordering::SeqCst);
+    SHOOTDOWN_ACK[me].store(0, Ordering::SeqCst);
+    let gen = SHOOTDOWN_GEN[me].load(Ordering::Relaxed).wrapping_add(1);
+    SHOOTDOWN_GEN[me].store(gen, Ordering::SeqCst);
+
+    // SAFETY: APIC mapped; IF=0.
+    unsafe { broadcast_shootdown_ipi(); }
+
+    // Wait for every other ready core to ack my request, servicing theirs meanwhile so two cores
+    // shooting down at once ack each other instead of deadlocking.
     let expected = ncores - 1;
-    while TLB_ACK.load(Ordering::SeqCst) < expected {
+    while SHOOTDOWN_ACK[me].load(Ordering::SeqCst) < expected {
+        service_pending(me);
         core::hint::spin_loop();
     }
+}
+
+/// Broadcast a single-page TLB shootdown to all other cores and wait for acks (§10.5).
+///
+/// # Safety
+/// Interrupts should be disabled on the calling core before this call.
+pub unsafe fn broadcast_tlb_shootdown(virt_addr: u64) {
+    // SAFETY: caller holds IF=0; per-core request slots make concurrency safe.
+    unsafe { request_and_wait(virt_addr); }
 }
 
 /// IPI handler - invoked from the IDT stub (`ipi_dispatch`) on the receiving core.
@@ -136,7 +215,7 @@ pub unsafe fn ipi_handler(vector: u8) {
 /// # Safety
 /// The local APIC must be initialised.
 pub unsafe fn broadcast_full_tlb_flush() {
-    // Save interrupt flag and disable interrupts for the shootdown protocol.
+    // Save the interrupt flag and disable interrupts for the shootdown protocol.
     // SAFETY: pushfq/cli are always valid in ring 0.
     let rflags: u64;
     unsafe {
@@ -144,47 +223,13 @@ pub unsafe fn broadcast_full_tlb_flush() {
         core::arch::asm!("cli", options(nostack, nomem));
     }
 
-    // Flush locally: reload CR3 invalidates all non-global TLB entries on this core.
-    // SAFETY: CR3 reload with the same value is always valid in ring 0.
-    unsafe {
-        let cr3: u64;
-        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem));
-        core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, nomem));
-    }
+    // Flush locally (CR3 reload invalidates all non-global TLB entries on this core).
+    invalidate(!0u64);
 
-    let ncores = crate::smp::core::ready_count();
-    if ncores > 1 {
-        // !0u64 is the sentinel that tells remote handlers to do a full CR3
-        // reload rather than a single-page invlpg.
-        // SAFETY: single writer; IF=0 prevents a racing per-page shootdown from
-        // overwriting TLB_SHOOTDOWN_ADDR between our write and the remote reads.
-        unsafe { TLB_SHOOTDOWN_ADDR = !0u64; }
-        TLB_ACK.store(0, Ordering::SeqCst);
-
-        let apic_base = unsafe { crate::arch::x86_64::boot::get_apic_virt_base() };
-
-        // All-excluding-self broadcast, fixed delivery, edge trigger, assert (bit 14).
-        // SAFETY: APIC mapped; IF=0.
-        unsafe {
-            write_apic_reg(apic_base + APIC_ICR_HIGH, 0);
-            // Poll DELIVS before the broadcast per SDM §10.6.1.
-            let mut tries = 0u32;
-            while (read_apic_reg(apic_base + APIC_ICR_LOW) >> 12) & 1 != 0 {
-                core::hint::spin_loop();
-                tries += 1;
-                if tries >= 10_000 { break; }
-            }
-            write_apic_reg(
-                apic_base + APIC_ICR_LOW,
-                (vectors::TLB_SHOOTDOWN as u32) | (1 << 14) | (0b11 << 18),
-            );
-        }
-
-        let expected = ncores - 1;
-        while TLB_ACK.load(Ordering::SeqCst) < expected {
-            core::hint::spin_loop();
-        }
-    }
+    // Broadcast a full-flush request (addr = !0) to every other core via the per-core path; remote
+    // handlers reload CR3 on the `!0` sentinel rather than invlpg one page.
+    // SAFETY: APIC mapped; IF=0 (just disabled above).
+    unsafe { request_and_wait(!0u64); }
 
     // Restore the caller's interrupt flag.
     // SAFETY: push/popfq restores exactly the flags in effect on entry.
@@ -194,22 +239,9 @@ pub unsafe fn broadcast_full_tlb_flush() {
 }
 
 fn handle_tlb_shootdown() {
-    // SAFETY: TLB_SHOOTDOWN_ADDR is written before the broadcast and read-only
-    // until TLB_ACK reaches the expected count.
-    let addr = unsafe { TLB_SHOOTDOWN_ADDR };
-    if addr == !0u64 {
-        // Full-flush sentinel: reload CR3 to invalidate all non-global TLB entries.
-        // SAFETY: CR3 reload with the same value is always valid in ring 0.
-        unsafe {
-            let cr3: u64;
-            core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem));
-            core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, nomem));
-        }
-    } else {
-        // SAFETY: invlpg is always safe in ring 0; addr is a virtual address.
-        unsafe { core::arch::asm!("invlpg [{addr}]", addr = in(reg) addr, options(nostack)); }
-    }
-    TLB_ACK.fetch_add(1, Ordering::SeqCst);
+    // Service every other core's pending request (invalidate + ack). One delivery may coalesce
+    // several initiators (the APIC IRR holds one bit per vector); the scan acks each of them once.
+    service_pending(this_core());
 }
 
 #[inline]
