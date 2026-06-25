@@ -152,8 +152,8 @@ fn print_state(
     let mut live_count: u32 = 0;
     for slot in 0..MAX_SLOTS {
         let st = ctx.task_stat(slot);
-        // Count live tasks; only a DEAD observer leftover is excluded (the live observer is shown).
-        if st.valid && !(st.name_str().starts_with("observe") && st.state == 4) { live_count += 1; }
+        // Count live tasks; among observers only the ACTIVE (Running) one counts (parked/dead excluded).
+        if st.valid && !(st.name_str().starts_with("observe") && st.state != 1) { live_count += 1; }
     }
 
     // --- RAM ---
@@ -244,10 +244,10 @@ fn print_state(
         let cdt = core_total_delta[c];
         let task_pct = if cdt > 0 { ((task_delta * 100) / cdt).min(100) as u32 } else { 0 };
 
-        // Skip only a DEAD observer leftover (a finished `observe now`/`observe` not yet reaped) -
-        // it would read as a "killed" service. The LIVE observer IS shown: it is a real running task,
-        // so you see its own CPU%/MEM. Baseline already updated above so the skip does not desync it.
-        if stat.name_str().starts_with("observe") && stat.state == 4 { continue; }
+        // Show only the ACTIVE observer (the one rendering this frame, so Running) - a parked
+        // `observe now` leftover (BlockRecv) or a dead one not yet reaped is just clutter. The active
+        // observer reads its own slot as Running. Baseline already updated above so the skip doesn't desync.
+        if stat.name_str().starts_with("observe") && stat.state != 1 { continue; }
 
         let (uval, uunit) = bytes_fmt(stat.mem_used);
         let (lval, lunit) = bytes_fmt(stat.mem_limit);
