@@ -2621,6 +2621,16 @@ fn cmd_observe_now(ctx: &ServiceContext) -> Result<(), ShellError> {
     Ok(())
 }
 
+/// This shell's own core (slot scan by name; 0 if not found). Used to place the live `observe`
+/// painter on a different core so its repaint can't starve the shell's `q`-poll.
+fn observe_shell_core(ctx: &ServiceContext) -> u32 {
+    for slot in 0..256u32 {
+        let st = ctx.task_stat(slot);
+        if st.valid && st.name_str() == "shell" { return st.core; }
+    }
+    0
+}
+
 /// `observe` (live) - broker the full-screen foreground view (Stage 2c).
 ///
 /// The shell is the capability-broker (Appendix B.3): it lends the keyboard to
@@ -2632,7 +2642,20 @@ fn cmd_observe_now(ctx: &ServiceContext) -> Result<(), ShellError> {
 /// read as ~100% in observe's own display. Then we restore the screen and our read loop resumes.
 fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
     let _ = ctx.kill("observe-live"); // clear any stale instance
-    if ctx.spawn("observe-live").is_err() {
+    // Pin the painter to a DIFFERENT core than this shell. Its framebuffer-heavy repaint must not
+    // share a core with this q-poll loop, or it starves `q` (the "stuck" that showed up once the
+    // legend made the repaint heavier - and why it was flaky before: round-robin sometimes
+    // co-located them). Fall back to round-robin only if the targeted spawn fails.
+    let shell_core = observe_shell_core(ctx);
+    let ncores = ctx.inspect_core_count();
+    let spawned = if ncores >= 2 {
+        let last = ncores - 1;
+        let target = if last == shell_core { 0 } else { last };
+        ctx.spawn_on("observe-live", target).is_ok()
+    } else {
+        false
+    };
+    if !spawned && ctx.spawn("observe-live").is_err() {
         ctx.console_writeln("observe: failed to spawn observe-live");
         return Err(ShellError::Unknown);
     }
