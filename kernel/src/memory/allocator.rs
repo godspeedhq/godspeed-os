@@ -386,7 +386,6 @@ pub fn total_frame_count() -> usize {
     // SAFETY: read-only; set once at init, never mutated after.
     unsafe { ALLOCATOR.total_frames }
 }
-
 /// Walk the kernel half of the live PML4 (entries 256–511) and mark every
 /// PDPT / PD / PT / PML4 frame as "used" in the bitmap allocator.
 ///
