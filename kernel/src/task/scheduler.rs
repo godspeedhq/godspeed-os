@@ -245,11 +245,11 @@ static mut TASK_PENDING_RECV_CAP_COUNT: [usize; MAX_TASKS] = [0; MAX_TASKS];
 // by the LastRecvBadge syscall. Packed `(badge_right << 32) | badge_id`; 0 = no badge.
 static TASK_LAST_BADGE: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
 
-/// TSC (CPU cycle counter) captured at each task's spawn. Per-service uptime = (now_tsc - this) /
-/// cycles-per-second (surfaced by `task_stat`). The TSC runs at a real wall-clock rate - unlike
-/// `MONOTONIC_TICKS`, which only advances when the BSP idles and so badly under-counts on a busy box.
-/// A restart is a fresh spawn, so uptime resets on restart - "time since the service last (re)started".
-static TASK_SPAWN_TSC: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
+/// RTC wall-clock datetime (packed, `rtc::read_datetime` format) captured at each task's spawn.
+/// Per-service uptime = `epoch_secs(now) - epoch_secs(this)` (surfaced by `task_stat`). The RTC is the
+/// only correct clock here: MONOTONIC_TICKS only advances when the BSP idles, and the TSC can't be
+/// compared across cores. A restart is a fresh spawn, so uptime resets - "since the last (re)start".
+static TASK_SPAWN_DT: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
 
 // ---------------------------------------------------------------------------
 // Per-task memory budget (§10.3, §22 Tests 7A/7B).
@@ -501,7 +501,7 @@ pub unsafe fn commit_task(
         TASK_CTX[slot].write(ctx);
         TASK_NAME[slot]             = name;
         TASK_RESTART_COUNT[slot].store(next_restart_count(name), Ordering::Relaxed);
-        TASK_SPAWN_TSC[slot].store(crate::arch::x86_64::read_cycle_counter(), Ordering::Relaxed);
+        TASK_SPAWN_DT[slot].store(crate::arch::x86_64::rtc::read_datetime(), Ordering::Relaxed);
         TASK_IS_USER[slot]          = is_user;
         TASK_KERNEL_STACK_TOP[slot].store(kernel_stack_top, Ordering::Relaxed);
         TASK_ENDPOINT[slot].store(ep_to_u64(endpoint_id), Ordering::Relaxed);
@@ -539,7 +539,7 @@ pub fn enqueue(
                 TASK_STATE[i].store(TaskState::Ready as u8, Ordering::Relaxed);
                 TASK_NAME[i]             = name;
                 TASK_RESTART_COUNT[i].store(next_restart_count(name), Ordering::Relaxed);
-                TASK_SPAWN_TSC[i].store(crate::arch::x86_64::read_cycle_counter(), Ordering::Relaxed);
+                TASK_SPAWN_DT[i].store(crate::arch::x86_64::rtc::read_datetime(), Ordering::Relaxed);
                 TASK_VALID[i].store(true, Ordering::Release);
                 TASK_CORE[i]             = core_id;
                 TASK_IS_USER[i]          = is_user;
@@ -827,11 +827,13 @@ pub fn task_stat(slot: usize) -> TaskStatRaw {
             queue_depth,
             run_ticks:   TASK_RUN_TICKS[slot].load(Ordering::Relaxed),
             uptime_secs: {
-                // TSC delta / cycles-per-second. cycles/sec = TSC-per-10ms-quantum * 100.
-                let per_sec = crate::arch::x86_64::boot::tsc_ticks_per_quantum().saturating_mul(100);
-                if per_sec == 0 { 0 } else {
-                    crate::arch::x86_64::read_cycle_counter()
-                        .saturating_sub(TASK_SPAWN_TSC[slot].load(Ordering::Relaxed)) / per_sec
+                // RTC epoch delta: seconds between the spawn datetime and now (absolute epoch cancels).
+                // 0 if never stamped (empty slot) or if the clock appears to go backwards.
+                let spawn = TASK_SPAWN_DT[slot].load(Ordering::Relaxed);
+                if spawn == 0 { 0 } else {
+                    let now = crate::arch::x86_64::rtc::read_datetime();
+                    (crate::arch::x86_64::rtc::epoch_secs(now)
+                        - crate::arch::x86_64::rtc::epoch_secs(spawn)).max(0) as u64
                 }
             },
         }

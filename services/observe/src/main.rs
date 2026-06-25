@@ -191,7 +191,7 @@ fn print_state(
     ctx.console_line_fmt(live, format_args!("{}CPU% core share since last snapshot | UPTIME since the service last (re)started", p));
 
     // --- System summary ---
-    ctx.console_line_fmt(live, format_args!("{}----------- system state ({} live) -----------", p, live_count));
+    ctx.console_line_fmt(live, format_args!("{}------------------------- system state ({} live) -------------------------", p, live_count));
 
     // Uptime since boot (resets on reboot) - wall-clock RTC, same source as the `uptime` command.
     let up = ctx.uptime_secs() as u64;
@@ -262,7 +262,7 @@ fn print_state(
             else                              { (stat.uptime_secs,         's') };
 
         ctx.console_line_fmt(live, format_args!(
-            "{}{:<4} {:<12} C{:<3} {:<10} {:>3} {:3}/{:>2} {:3}/{:>3}%  {:<8} {:>2}/{}{}  {:>3}%  {:>4}{}",
+            "{}{:<4} {:<12} C{:<3} {:<10} {:>3} {:3}/{:>2} {:3}/{:>3}%  {:<8} {:>2}/{}{}  {:>3}%  {:>5}{}",
             p,
             slot,
             stat.name_str(),
