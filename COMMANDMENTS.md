@@ -149,7 +149,7 @@ Good architecture is not the absence of complexity. It is complexity in the corr
 
 ## Final Admonition
 
-These Commandments are not independent. Violate one and thou shalt eventually violate the others.
+These Commandments are not independent. Violate one and you eventually violate all.
 
 Architectural corruption rarely begins with catastrophe. It begins with a single compromise:
 
@@ -162,3 +162,12 @@ These Commandments were not written for style, tradition, or amusement. They wer
 to real bugs, real wedges, real failures, and real lessons learned while building Godspeed.
 
 Treat them seriously. Chaos certainly will.
+
+## Blessings
+
+*Godspeed on thy journey.*
+
+* May thy architecture remain uncorrupted.
+* May thy contracts remain true.
+* May thy services endure failure.
+* May truth be uncovered through fire.
