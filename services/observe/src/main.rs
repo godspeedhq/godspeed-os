@@ -226,7 +226,7 @@ fn print_state(
 
     // --- Task table ---
     ctx.console_line_fmt(live, format_args!(
-        "{}TASK NAME         CORE STATE      MEM_USED/LIMIT/%     RESTARTS QUEUE   CPU%  UPTIME", p));
+        "{}TASK NAME         CORE STATE      MEM_USED/LIMIT/%     RESTARTS  QUEUE  CPU%  UPTIME", p));
     for slot in 0..MAX_SLOTS {
         let stat = ctx.task_stat(slot);
         if !stat.valid {
