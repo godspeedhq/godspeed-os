@@ -1010,6 +1010,10 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         CORE_TOTAL_TICKS.get(cid).0.fetch_add(1, Ordering::Relaxed);
         if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) {
             CORE_ACTIVE_TICKS.get(cid).0.fetch_add(1, Ordering::Relaxed);
+            // Credit the running task this quantum - the per-task CPU% source for `observe`
+            // (a task's run_ticks delta as a share of its core's total-tick delta). Idle quanta
+            // aren't credited (prev fails the valid check), so a blocked service reads ~0%.
+            TASK_RUN_TICKS[prev].fetch_add(1, Ordering::Relaxed);
         }
 
         // Path C / Phase 6: while Core 0 is mid-supervisor-respawn at run()'s loop top, do NOT preempt
@@ -1166,6 +1170,10 @@ pub fn yield_current() {
         CORE_TOTAL_TICKS.get(cid).0.fetch_add(1, Ordering::Relaxed);
         if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) {
             CORE_ACTIVE_TICKS.get(cid).0.fetch_add(1, Ordering::Relaxed);
+            // Credit the running task this quantum - the per-task CPU% source for `observe`
+            // (a task's run_ticks delta as a share of its core's total-tick delta). Idle quanta
+            // aren't credited (prev fails the valid check), so a blocked service reads ~0%.
+            TASK_RUN_TICKS[prev].fetch_add(1, Ordering::Relaxed);
         }
 
         // CAS: preserve Dead if a cross-core kill races with this transition.
