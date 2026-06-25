@@ -2685,10 +2685,10 @@ const CORE_SERVICES: [&str; 1] = ["supervisor"];
 
 /// Shown when spawn/kill/restart targets a core service - "Not applicable" makes
 /// it clear the command is refused *because* the target is protected, not failed.
-/// Lists exactly `CORE_SERVICES`; `registry` is intentionally absent (H11 ph6:
-/// it is restartable, so `kill registry` is permitted).
+/// Lists exactly `CORE_SERVICES` (just `supervisor`; `init` was removed in Phase 5,
+/// `registry` retired in Phase 4 - both intentionally absent).
 const PROTECTED_MSG: &str =
-    "Not applicable. Core services (init, supervisor) are protected";
+    "Not applicable. The supervisor is protected (the recovery authority); storm it deliberately via 'chaos kill-storm supervisor'";
 
 /// Shown when spawn/kill/restart targets an observe variant - they are brokered by
 /// the `observe` / `observe now` commands, not raw service operations.
