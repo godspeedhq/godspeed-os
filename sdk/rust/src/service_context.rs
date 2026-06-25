@@ -148,6 +148,8 @@ pub struct TaskStat {
     pub queue_depth: u8,
     /// Timer ticks spent as the running task on its core (monotonic since boot).
     pub run_ticks:   u64,
+    /// Seconds since this service last (re)started - resets on restart. Per-service uptime.
+    pub uptime_secs: u64,
 }
 
 impl TaskStat {
@@ -794,16 +796,16 @@ impl ServiceContext {
     /// Returns a best-effort snapshot. If `slot` is out of range or the task
     /// is dead, `valid` will be false.
     pub fn task_stat(&self, slot: u32) -> TaskStat {
-        let mut buf = [0u8; 72];
+        let mut buf = [0u8; 80];
         // SAFETY: syscall(16) = TaskStat; buf is a local array on the user stack.
         let ret = unsafe {
-            raw_syscall(16, slot as u64, buf.as_mut_ptr() as u64, 72)
+            raw_syscall(16, slot as u64, buf.as_mut_ptr() as u64, 80)
         };
         if ret != 0 {
             return TaskStat {
                 valid: false, state: 0, core: 0,
                 mem_used: 0, mem_limit: 0, name_len: 0, name: [0u8; 32],
-                restart_count: 0, queue_depth: 0, run_ticks: 0,
+                restart_count: 0, queue_depth: 0, run_ticks: 0, uptime_secs: 0,
             };
         }
         let valid       = buf[0] != 0;
@@ -822,8 +824,10 @@ impl ServiceContext {
         let queue_depth = buf[3];
         let run_ticks   = u64::from_le_bytes([buf[64], buf[65], buf[66], buf[67],
                                               buf[68], buf[69], buf[70], buf[71]]);
+        let uptime_secs = u64::from_le_bytes([buf[72], buf[73], buf[74], buf[75],
+                                              buf[76], buf[77], buf[78], buf[79]]);
         TaskStat { valid, state, core, mem_used, mem_limit, name_len: copy_len, name,
-                   restart_count, queue_depth, run_ticks }
+                   restart_count, queue_depth, run_ticks, uptime_secs }
     }
 
     /// List the capabilities held by the task in `slot`, into `out`. Returns the

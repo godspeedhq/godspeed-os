@@ -1257,7 +1257,7 @@ fn handle_remove_cap(slot: u64) -> i64 {
 ///
 /// Returns 0 on success, -1 on invalid args.
 fn handle_task_stat(slot: u64, buf_ptr: u64, buf_len: u64) -> i64 {
-    const STAT_SIZE: usize = 72;
+    const STAT_SIZE: usize = 80;
     // TaskStat discloses any task's full snapshot - requires INTROSPECT (READ)
     // (§3.1; docs/introspection-capability.md).
     if !scheduler::current_task_holds_resource(
@@ -1286,6 +1286,7 @@ fn handle_task_stat(slot: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     // restart_count is u64 (was a u32 endpoint generation at buf[56..60]); queue_depth moved to buf[3].
     buf[56..64].copy_from_slice(&stat.restart_count.to_le_bytes());
     buf[64..72].copy_from_slice(&stat.run_ticks.to_le_bytes());
+    buf[72..80].copy_from_slice(&stat.uptime_secs.to_le_bytes());
 
     if write_user_bytes(buf_ptr, &buf) { 0 } else { -1 }
 }
