@@ -2626,7 +2626,7 @@ fn cmd_observe_now(ctx: &ServiceContext) -> Result<(), ShellError> {
 fn observe_shell_core(ctx: &ServiceContext) -> u32 {
     for slot in 0..256u32 {
         let st = ctx.task_stat(slot);
-        if st.valid && st.name_str() == "shell" { return st.core; }
+        if st.valid && st.name_str() == "shell" { return st.core as u32; }
     }
     0
 }
