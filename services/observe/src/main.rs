@@ -183,12 +183,12 @@ fn print_state(
         ctx.console_line(true, "================================================================");
     }
 
-    // --- Legend (shown in every mode now, including the live view, per the column it explains) ---
-    ctx.console_line_fmt(live, format_args!("{}legend: TASK: scheduler slot | NAME: service name", p));
-    ctx.console_line_fmt(live, format_args!("{}legend: CORE: cpu core | STATE: task state", p));
-    ctx.console_line_fmt(live, format_args!("{}legend: MEM_USED/LIMIT: memory in use (binary + stack + alloc_mem) / contract limit", p));
-    ctx.console_line_fmt(live, format_args!("{}legend: RESTARTS: restart count | QUEUE/LIMIT: inbound queue depth / max", p));
-    ctx.console_line_fmt(live, format_args!("{}legend: CPU%: this task's share of its assigned core since last snapshot", p));
+    // --- Legend: a single "legend" header, then grouped entries (no repeated "legend:" prefix) ---
+    ctx.console_line_fmt(live, format_args!("{}--------------------------------- legend ---------------------------------", p));
+    ctx.console_line_fmt(live, format_args!("{}TASK scheduler slot | NAME service name | CORE cpu core | STATE task state", p));
+    ctx.console_line_fmt(live, format_args!("{}MEM_USED/LIMIT/% memory in use (binary+stack+alloc) / limit / % of limit", p));
+    ctx.console_line_fmt(live, format_args!("{}RESTARTS deaths recovered (not clean re-runs) | QUEUE/LIMIT inbound depth / max", p));
+    ctx.console_line_fmt(live, format_args!("{}CPU% core share since last snapshot | UPTIME since the service last (re)started", p));
 
     // --- System summary ---
     ctx.console_line_fmt(live, format_args!("{}----------- system state ({} live) -----------", p, live_count));
@@ -226,7 +226,7 @@ fn print_state(
 
     // --- Task table ---
     ctx.console_line_fmt(live, format_args!(
-        "{}TASK  NAME             CORE STATE        MEM_USED/LIMIT  RESTARTS  QUEUE/LIMIT  CPU%", p));
+        "{}TASK NAME         CORE STATE      MEM_USED/LIMIT/%     RESTARTS QUEUE/LIM CPU% UPTIME", p));
     for slot in 0..MAX_SLOTS {
         let stat = ctx.task_stat(slot);
         if !stat.valid {
@@ -251,21 +251,29 @@ fn print_state(
 
         let (uval, uunit) = bytes_fmt(stat.mem_used);
         let (lval, lunit) = bytes_fmt(stat.mem_limit);
-        let full = stat.queue_depth >= QUEUE_MAX;
+        let mem_pct = if stat.mem_limit > 0 { (stat.mem_used * 100 / stat.mem_limit) as u32 } else { 0 };
+        let full_mark = if stat.queue_depth >= QUEUE_MAX { "!" } else { " " };
+        // Per-service uptime as the largest unit (d/h/m/s) - compact; resets on restart, so a freshly
+        // recovered service reads a small value (pairs with RESTARTS).
+        let (up_val, up_unit) =
+            if      stat.uptime_secs >= 86400 { (stat.uptime_secs / 86400, 'd') }
+            else if stat.uptime_secs >= 3600  { (stat.uptime_secs / 3600,  'h') }
+            else if stat.uptime_secs >= 60    { (stat.uptime_secs / 60,    'm') }
+            else                              { (stat.uptime_secs,         's') };
 
         ctx.console_line_fmt(live, format_args!(
-            "{}{:<5} {:<16} C{:<3} {:<12} {:>3} {:3}/{:>2} {:3}  {:<9} {:>2}/{}{}  {:>3}%",
+            "{}{:<4} {:<12} C{:<2} {:<10} {:>3} {:3}/{:>2} {:3}/{:>3}%  {:<8} {:>2}/{}{}  {:>3}%  {:>4}{}",
             p,
             slot,
             stat.name_str(),
             stat.core,
             stat.state_str(),
             uval, uunit,
-            lval, lunit,
+            lval, lunit, mem_pct,
             stat.restart_count,
-            stat.queue_depth, QUEUE_MAX,
-            if full { " (FULL)" } else { "       " },
+            stat.queue_depth, QUEUE_MAX, full_mark,
             task_pct,
+            up_val, up_unit,
         ));
     }
 

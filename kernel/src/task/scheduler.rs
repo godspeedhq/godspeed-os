@@ -245,6 +245,13 @@ static mut TASK_PENDING_RECV_CAP_COUNT: [usize; MAX_TASKS] = [0; MAX_TASKS];
 // by the LastRecvBadge syscall. Packed `(badge_right << 32) | badge_id`; 0 = no badge.
 static TASK_LAST_BADGE: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
 
+/// `MONOTONIC_TICKS` (BSP timer ticks, ~100/s) captured at each task's spawn. Per-service uptime =
+/// now - this (surfaced by `task_stat`). A restart is a fresh spawn, so uptime resets on restart -
+/// exactly "time since the service last (re)started".
+static TASK_SPAWN_TICK: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
+/// Timer ticks per second (10 ms quantum, §9.1) - converts `TASK_SPAWN_TICK` deltas to seconds.
+const TICKS_PER_SEC: u64 = 100;
+
 // ---------------------------------------------------------------------------
 // Per-task memory budget (§10.3, §22 Tests 7A/7B).
 // ---------------------------------------------------------------------------
@@ -489,6 +496,7 @@ pub unsafe fn commit_task(
         TASK_CTX[slot].write(ctx);
         TASK_NAME[slot]             = name;
         TASK_RESTART_COUNT[slot].store(next_restart_count(name), Ordering::Relaxed);
+        TASK_SPAWN_TICK[slot].store(monotonic_ticks(), Ordering::Relaxed);
         TASK_IS_USER[slot]          = is_user;
         TASK_KERNEL_STACK_TOP[slot].store(kernel_stack_top, Ordering::Relaxed);
         TASK_ENDPOINT[slot].store(ep_to_u64(endpoint_id), Ordering::Relaxed);
@@ -526,6 +534,7 @@ pub fn enqueue(
                 TASK_STATE[i].store(TaskState::Ready as u8, Ordering::Relaxed);
                 TASK_NAME[i]             = name;
                 TASK_RESTART_COUNT[i].store(next_restart_count(name), Ordering::Relaxed);
+                TASK_SPAWN_TICK[i].store(monotonic_ticks(), Ordering::Relaxed);
                 TASK_VALID[i].store(true, Ordering::Release);
                 TASK_CORE[i]             = core_id;
                 TASK_IS_USER[i]          = is_user;
@@ -781,6 +790,7 @@ pub struct TaskStatRaw {
     pub restart_count: u64,
     pub queue_depth: u8,
     pub run_ticks:   u64,
+    pub uptime_secs: u64,
 }
 
 /// Return a best-effort snapshot of task state at `slot`.
@@ -790,7 +800,7 @@ pub struct TaskStatRaw {
 pub fn task_stat(slot: usize) -> TaskStatRaw {
     if slot >= MAX_TASKS {
         return TaskStatRaw { valid: false, state: 0, core: 0, mem_used: 0, mem_limit: 0,
-                             name: "", restart_count: 0, queue_depth: 0, run_ticks: 0 };
+                             name: "", restart_count: 0, queue_depth: 0, run_ticks: 0, uptime_secs: 0 };
     }
     // SAFETY: read-only snapshot of static arrays; all reads are individually
     // naturally-atomic on x86_64 (u64/u32/pointer-width). Best-effort consistency
@@ -811,6 +821,8 @@ pub fn task_stat(slot: usize) -> TaskStatRaw {
             restart_count: TASK_RESTART_COUNT[slot].load(Ordering::Relaxed),
             queue_depth,
             run_ticks:   TASK_RUN_TICKS[slot].load(Ordering::Relaxed),
+            uptime_secs: monotonic_ticks()
+                .saturating_sub(TASK_SPAWN_TICK[slot].load(Ordering::Relaxed)) / TICKS_PER_SEC,
         }
     }
 }

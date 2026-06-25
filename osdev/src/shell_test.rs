@@ -456,7 +456,7 @@ pub fn run(image_path: &Path, smp: u32) {
     match collect_until(&buf, &mut cursor, b"system state", Duration::from_secs(15)) {
         // `observe now` (interactive snapshot) no longer prefixes lines with "observe: " - the
         // legend line is the stable marker that the frame printed.
-        Some(r) => check!(r.contains("legend:"), "observe now: static frame printed"),
+        Some(r) => check!(r.contains("legend"), "observe now: static frame printed"),
         None    => { println!("shell-test: FAIL - timed out waiting for observe now frame"); fail += 1; }
     }
     // The frame should carry the task table header (gated task_stat working).
