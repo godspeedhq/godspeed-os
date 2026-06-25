@@ -97,22 +97,43 @@ impl NameRestartTable {
 
 static NAME_RESTART: SpinLock<NameRestartTable> = SpinLock::new(NameRestartTable::new());
 
-/// Restart count to stamp on a fresh spawn of `name`, advancing the per-name counter: the FIRST spawn
-/// of a name returns 0, each later spawn returns previous + 1 (saturating). Over-cap names return 0.
+/// Restart count to stamp on a (re)spawn of `name`: the value accrued by `bump_name_restart` at this
+/// service's prior DEATHS. A name that never died - including every transient utility, which is never
+/// bumped - reads 0. READ-ONLY: the increment happens at death and only for the restartable set, so
+/// re-running a transient command (observe-*, greet, ...) is NOT a restart ("RESTARTS = it blew up,
+/// not it was legitimately closed").
 fn next_restart_count(name: &'static str) -> u64 {
     if name.is_empty() {
         return 0;
+    }
+    let tbl = NAME_RESTART.lock();
+    for i in 0..tbl.len {
+        if tbl.entries[i].name == name {
+            return tbl.entries[i].count;
+        }
+    }
+    0
+}
+
+/// Record that restartable service `name` died (and will be respawned): bump its per-name restart
+/// count. Called ONLY from the death path for the supervisor-managed/restartable set (`fs`,
+/// `block-driver`, `shell`, `xhci`, `ehci`, `logger`, `supervisor`). Transient utilities the shell
+/// re-invokes are never bumped, so they never show a restart. The respawn reads the new count via
+/// `next_restart_count`; the first death of a name records count 1.
+fn bump_name_restart(name: &'static str) {
+    if name.is_empty() {
+        return;
     }
     let mut tbl = NAME_RESTART.lock();
     for i in 0..tbl.len {
         if tbl.entries[i].name == name {
             tbl.entries[i].count = tbl.entries[i].count.saturating_add(1);
-            return tbl.entries[i].count;
+            return;
         }
     }
     if tbl.len < NAME_RESTART_MAX {
         let len = tbl.len;
-        tbl.entries[len] = NameRestart { name, count: 0 };
+        tbl.entries[len] = NameRestart { name, count: 1 };
         tbl.len = len + 1;
     } else {
         crate::kprintln!(
@@ -120,7 +141,6 @@ fn next_restart_count(name: &'static str) -> u64 {
             NAME_RESTART_MAX, name
         );
     }
-    0
 }
 /// The recv endpoint owned by each task (None if the task has no endpoint). `AtomicU64` (0 = None;
 /// endpoint ids start at 100, so 0 is never a real recv endpoint) so the accessors stay unsafe-free.
@@ -1497,6 +1517,16 @@ pub fn kill_task_by_slot(slot: usize) {
             // the service re-registers the name on respawn; clients briefly see a lookup miss and retry
             // (same outcome as the EndpointDead they'd get from the stale entry).
             crate::ipc::names::unregister_endpoint(task_name, ep_id);
+        }
+
+        // RESTART count (the observe RESTARTS column): only the restartable/managed set accrues a
+        // restart when it dies + gets respawned. A transient utility the shell re-invokes (observe-*,
+        // greet, ...) is never bumped, so it never shows a restart - RESTARTS means "blew up and was
+        // recovered", not "legitimately closed". The respawn reads the new count via next_restart_count.
+        if matches!(task_name,
+            "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger" | "supervisor")
+        {
+            bump_name_restart(task_name);
         }
 
         // Restartable-service death notification. These are restartable userspace services (not
