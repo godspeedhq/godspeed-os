@@ -328,11 +328,19 @@ pub fn init(boot_info: &BootInfo) {
 
 /// Allocate one physical frame. Returns `None` if memory is exhausted.
 pub fn alloc_frame() -> Option<Frame> {
-    alloc_lock();
-    // SAFETY: lock held; single writer across all cores.
-    let frame = unsafe { (*core::ptr::addr_of_mut!(ALLOCATOR)).alloc() };
-    alloc_unlock();
-    frame
+    // IRQ-safe: ALLOC_LOCKED is taken from BOTH task context and interrupt context (the timer ISR's
+    // kill path → reclaim_all → free_frame), so the hold MUST mask interrupts (smp::without_interrupts
+    // contract). Otherwise a task preempted mid-alloc holds the lock, and any code that then takes it
+    // with preemption suppressed deadlocks on the unreschedulable holder - the supervisor respawn
+    // (Path C / Phase 6) pins Core 0 and its frame-alloc spun here (the §22 Test 15 wedge). Nests
+    // correctly with callers already masked. Same class of bug as the RING/kprintln fix.
+    crate::smp::without_interrupts(|| {
+        alloc_lock();
+        // SAFETY: lock held; single writer across all cores.
+        let frame = unsafe { (*core::ptr::addr_of_mut!(ALLOCATOR)).alloc() };
+        alloc_unlock();
+        frame
+    })
 }
 
 /// Allocate `n` physically-contiguous, page-aligned frames; return the physical
@@ -342,11 +350,14 @@ pub fn alloc_frame() -> Option<Frame> {
 /// driver's address space and they live for the driver's lifetime (v1: trusted
 /// drivers are effectively permanent; reclaim-on-restart is future work).
 pub fn alloc_contiguous(n: usize) -> Option<u64> {
-    alloc_lock();
-    // SAFETY: lock held; single writer across all cores.
-    let phys = unsafe { (*core::ptr::addr_of_mut!(ALLOCATOR)).alloc_contiguous(n) };
-    alloc_unlock();
-    phys
+    // IRQ-safe: see alloc_frame (ALLOC_LOCKED is also taken in interrupt context).
+    crate::smp::without_interrupts(|| {
+        alloc_lock();
+        // SAFETY: lock held; single writer across all cores.
+        let phys = unsafe { (*core::ptr::addr_of_mut!(ALLOCATOR)).alloc_contiguous(n) };
+        alloc_unlock();
+        phys
+    })
 }
 
 /// Return a frame to the allocator.
@@ -355,10 +366,13 @@ pub fn alloc_contiguous(n: usize) -> Option<u64> {
 /// The frame must have been obtained from `alloc_frame` and must not be used
 /// after this call.
 pub unsafe fn free_frame(frame: Frame) {
-    alloc_lock();
-    // SAFETY: lock held; caller guarantees exclusive ownership.
-    unsafe { (*core::ptr::addr_of_mut!(ALLOCATOR)).free(frame) }
-    alloc_unlock();
+    // IRQ-safe: see alloc_frame (ALLOC_LOCKED is also taken in interrupt context).
+    crate::smp::without_interrupts(|| {
+        alloc_lock();
+        // SAFETY: lock held; caller guarantees exclusive ownership.
+        unsafe { (*core::ptr::addr_of_mut!(ALLOCATOR)).free(frame) }
+        alloc_unlock();
+    })
 }
 
 /// Total free frames available (used for diagnostic output in memory::init).
