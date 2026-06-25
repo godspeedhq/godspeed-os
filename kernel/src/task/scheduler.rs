@@ -702,12 +702,14 @@ pub fn pop_pending_recv_cap() -> Option<u32> {
 
 /// Set the memory budget for `slot` at spawn time.
 ///
-/// Resets alloc_bytes to 0 and seeds the first heap VA.
-pub fn set_task_memory_budget(slot: usize, limit: u64) {
+/// Seeds alloc_bytes to the task's base footprint (`base_bytes` = mapped binary + user stack + ctx)
+/// so MEM_USED reflects real occupancy, not just dynamic `alloc_mem` (which most no-heap services
+/// never call). `alloc_mem` then adds on top, all bounded by `limit`. Also seeds the first heap VA.
+pub fn set_task_memory_budget(slot: usize, limit: u64, base_bytes: u64) {
     if slot >= MAX_TASKS { return; }
     // SAFETY: called from spawn path with IF=0; single writer for this slot.
     unsafe {
-        TASK_ALLOC_BYTES[slot]   = 0;
+        TASK_ALLOC_BYTES[slot]   = base_bytes;
         TASK_LIMIT_BYTES[slot]   = limit;
         TASK_NEXT_ALLOC_VA[slot] = TASK_HEAP_VA_START;
     }

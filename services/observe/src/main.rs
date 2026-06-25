@@ -44,6 +44,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Stack allocation - not global mutable state (§3.9).
     let mut prev_core_active = [0u64; MAX_CORES as usize];
     let mut prev_core_total  = [0u64; MAX_CORES as usize];
+    // Per-TASK run-tick baseline for per-task CPU% - each task's share of its core (not the core's
+    // whole busy ratio), so a service sharing a core with a busy-poller (xhci/ehci) is not tarred 100%.
+    let mut prev_task_ticks  = [0u64; MAX_SLOTS as usize];
 
     if ctx.probe_mode() == MODE_NOW {
         // `observe now`: print exactly one frame, then park. The first frame has
@@ -52,7 +55,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // self-exit in v1; the shell kills any parked instance before the next
         // `observe now`, so at most one lingers. PARK (not yield) so the parked
         // instance does not peg its core until it is killed.
-        print_state(&ctx, &mut prev_core_active, &mut prev_core_total, false);
+        print_state(&ctx, &mut prev_core_active, &mut prev_core_total, &mut prev_task_ticks, false);
         ctx.park();
     }
 
@@ -61,7 +64,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // hide the cursor, suppress keystroke echo, repaint in place every
         // FRAME_CYCLES, and poll `q` to quit. On exit we restore the console and
         // park; the shell detects the park, cleans up, and reprints its prompt.
-        run_live(&ctx, &mut prev_core_active, &mut prev_core_total);
+        run_live(&ctx, &mut prev_core_active, &mut prev_core_total, &mut prev_task_ticks);
         ctx.park();
     }
 
@@ -75,7 +78,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         tick += 1;
         if tick < YIELD_INTERVAL { continue; }
         tick = 0;
-        print_state(&ctx, &mut prev_core_active, &mut prev_core_total, false);
+        print_state(&ctx, &mut prev_core_active, &mut prev_core_total, &mut prev_task_ticks, false);
     }
 }
 
@@ -84,6 +87,7 @@ fn run_live(
     ctx:              &ServiceContext,
     prev_core_active: &mut [u64; MAX_CORES as usize],
     prev_core_total:  &mut [u64; MAX_CORES as usize],
+    prev_task_ticks:  &mut [u64; MAX_SLOTS as usize],
 ) {
     // Take the screen: stop echoing keystrokes (we paint the display ourselves),
     // hide the underline cursor, and clear once.
@@ -93,7 +97,7 @@ fn run_live(
     let mut last = ctx.read_tsc();
     // Home + paint the first frame immediately.
     ctx.console_write("\x1b[H");
-    print_state(ctx, prev_core_active, prev_core_total, true);
+    print_state(ctx, prev_core_active, prev_core_total, prev_task_ticks, true);
 
     // Paint forever; the SHELL owns `q` while we run (it polls the console and KILLS us when
     // pressed, then restores the screen). We do NOT read input ourselves - one reader avoids a
@@ -106,7 +110,7 @@ fn run_live(
         if now.wrapping_sub(last) >= FRAME_CYCLES {
             last = now;
             ctx.console_write("\x1b[H");
-            print_state(ctx, prev_core_active, prev_core_total, true);
+            print_state(ctx, prev_core_active, prev_core_total, prev_task_ticks, true);
         }
     }
 }
@@ -115,6 +119,7 @@ fn print_state(
     ctx:              &ServiceContext,
     prev_core_active: &mut [u64; MAX_CORES as usize],
     prev_core_total:  &mut [u64; MAX_CORES as usize],
+    prev_task_ticks:  &mut [u64; MAX_SLOTS as usize],
     live:             bool,
 ) {
     let num_cores = ctx.inspect_core_count().min(MAX_CORES);
@@ -146,7 +151,9 @@ fn print_state(
     // --- Count live tasks ---
     let mut live_count: u32 = 0;
     for slot in 0..MAX_SLOTS {
-        if ctx.task_stat(slot).valid { live_count += 1; }
+        let st = ctx.task_stat(slot);
+        // Count live services only - exclude the transient observer (skipped in the table below too).
+        if st.valid && !st.name_str().starts_with("observe") { live_count += 1; }
     }
 
     // --- RAM ---
@@ -183,9 +190,9 @@ fn print_state(
     if !live {
         ctx.console_writeln("observe: legend: TASK: scheduler slot | NAME: service name");
         ctx.console_writeln("observe: legend: CORE: cpu core | STATE: task state");
-        ctx.console_writeln("observe: legend: MEM_USED/LIMIT: heap memory allocated via alloc_mem syscall / contract memory limit");
+        ctx.console_writeln("observe: legend: MEM_USED/LIMIT: memory in use (binary + stack + alloc_mem) / contract memory limit");
         ctx.console_writeln("observe: legend: RESTARTS: restart count | QUEUE/LIMIT: inbound queue depth / max queue depth");
-        ctx.console_writeln("observe: legend: CPU%: percentage of assigned core used since last snapshot");
+        ctx.console_writeln("observe: legend: CPU%: this task's share of its assigned core since last snapshot");
     }
 
     // --- System summary ---
@@ -222,14 +229,29 @@ fn print_state(
         "{}TASK  NAME             CORE STATE        MEM_USED/LIMIT  RESTARTS  QUEUE/LIMIT  CPU%", p));
     for slot in 0..MAX_SLOTS {
         let stat = ctx.task_stat(slot);
-        if !stat.valid { continue; }
+        if !stat.valid {
+            prev_task_ticks[slot as usize] = 0; // slot empty - reset its baseline
+            continue;
+        }
+
+        let c = (stat.core as usize).min(MAX_CORES as usize - 1);
+        // Per-task CPU% = this task's run-tick delta as a share of its core's total-tick delta over
+        // the interval. A task blocked on recv accrues no run ticks -> 0%, even when its core is
+        // pegged by a co-resident busy-poller (xhci/ehci). First frame: no baseline -> share since
+        // boot (the right meaning for a one-shot snapshot).
+        let task_delta = stat.run_ticks.saturating_sub(prev_task_ticks[slot as usize]);
+        prev_task_ticks[slot as usize] = stat.run_ticks;
+        let cdt = core_total_delta[c];
+        let task_pct = if cdt > 0 { ((task_delta * 100) / cdt).min(100) as u32 } else { 0 };
+
+        // The observer itself is a transient command run, not a long-lived service - skip it so
+        // `observe`/`observe now` does not list itself (misleading, and now with a restart count).
+        // Baseline already updated above so the skip does not desync it.
+        if stat.name_str().starts_with("observe") { continue; }
 
         let (uval, uunit) = bytes_fmt(stat.mem_used);
         let (lval, lunit) = bytes_fmt(stat.mem_limit);
         let full = stat.queue_depth >= QUEUE_MAX;
-
-        let c = (stat.core as usize).min(MAX_CORES as usize - 1);
-        let task_pct = core_pct[c];
 
         ctx.console_line_fmt(live, format_args!(
             "{}{:<5} {:<16} C{:<3} {:<12} {:>3} {:3}/{:>2} {:3}  {:<9} {:>2}/{}{}  {:>3}%",

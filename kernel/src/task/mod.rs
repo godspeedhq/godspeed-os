@@ -2986,7 +2986,7 @@ fn spawn_service_with_config(
     if SPAWN_TRACE { crate::kprintln!("spawn[elf]: '{}'", name); }
 
     // 1. Parse ELF.
-    let crate::loader::LoadedElf { mut page_table, entry_va } =
+    let crate::loader::LoadedElf { mut page_table, entry_va, mapped_bytes: elf_mapped_bytes } =
         crate::loader::load(elf_bytes)?;
 
     if SPAWN_TRACE { crate::kprintln!("spawn[stack]: '{}'", name); }
@@ -3439,8 +3439,13 @@ fn spawn_service_with_config(
         scheduler::commit_task(task_slot, name, ctx, true, kstack_top as u64, own_endpoint);
     }
 
-    // 10. Initialise the memory budget for this task (§10.3).
-    scheduler::set_task_memory_budget(task_slot, memory_limit);
+    // 10. Initialise the memory budget for this task (§10.3). Seed it with the base footprint -
+    // the mapped binary (code+data+BSS), the 256 KiB user stack, and the ctx page - so MEM_USED
+    // reflects real occupancy, not just dynamic alloc_mem (which most no-heap services never call).
+    let base_bytes = elf_mapped_bytes
+        + USER_STACK_PAGES * PAGE_SIZE as u64
+        + PAGE_SIZE as u64; // ctx page
+    scheduler::set_task_memory_budget(task_slot, memory_limit, base_bytes);
 
     crate::kprintln!("task: '{}' spawned OK on core {} (slot {})", name, core_id, task_slot);
     Ok(own_endpoint)

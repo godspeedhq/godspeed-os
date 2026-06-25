@@ -99,6 +99,8 @@ fn read_phdr(bytes: &[u8], off: usize) -> Elf64Phdr {
 pub struct LoadedElf {
     pub page_table: PageTable,
     pub entry_va:   u64,
+    /// Total page-aligned bytes mapped for the binary's PT_LOAD segments (code + data + BSS).
+    pub mapped_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -149,6 +151,7 @@ pub fn load(bytes: &[u8]) -> Result<LoadedElf, LoadError> {
     }
 
     let mut pt = PageTable::new()?;
+    let mut mapped_bytes = 0u64;
 
     let ph_base  = ehdr.e_phoff as usize;
     let ph_step  = ehdr.e_phentsize as usize;
@@ -241,9 +244,10 @@ pub fn load(bytes: &[u8]) -> Result<LoadedElf, LoadError> {
             // release here - not freeing it is the leak.
             va += PAGE_SIZE as u64;
         }
+        mapped_bytes += va_end - va_start;
     }
 
-    Ok(LoadedElf { page_table: pt, entry_va: ehdr.e_entry })
+    Ok(LoadedElf { page_table: pt, entry_va: ehdr.e_entry, mapped_bytes })
 }
 
 // ---------------------------------------------------------------------------
