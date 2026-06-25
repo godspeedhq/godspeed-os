@@ -152,8 +152,8 @@ fn print_state(
     let mut live_count: u32 = 0;
     for slot in 0..MAX_SLOTS {
         let st = ctx.task_stat(slot);
-        // Count live services only - exclude the transient observer (skipped in the table below too).
-        if st.valid && !st.name_str().starts_with("observe") { live_count += 1; }
+        // Count live tasks; only a DEAD observer leftover is excluded (the live observer is shown).
+        if st.valid && !(st.name_str().starts_with("observe") && st.state == 4) { live_count += 1; }
     }
 
     // --- RAM ---
@@ -171,12 +171,11 @@ fn print_state(
     let used_pct     = if total_mib > 0 { (used_mib * 100) / total_mib } else { 0 };
     let (used_val, used_unit) = bytes_fmt(used_bytes);
 
-    // Per-line prefix. The `observe: ` tag earns its keep in `observe now`, whose
-    // lines share the log/serial stream and need to be identifiable. The live view
-    // owns the whole screen and carries a title bar, so the prefix is just clutter
-    // there - dropped. (font8x8 is ASCII-only, so the title bar uses '-'/'=' not
-    // box-drawing or em dashes.)
-    let p = if live { "" } else { "observe: " };
+    // Per-line prefix. Only the streamed log mode (MODE_LIVE, `osdev run`) tags lines with
+    // `observe: ` so they stay identifiable amid other services' output. The interactive views -
+    // `observe now` (snapshot) and the full-screen live view - own the display and drop the tag,
+    // which otherwise just reads busy. (font8x8 is ASCII-only, so bars use '-'/'=' not box-drawing.)
+    let p = if ctx.probe_mode() == MODE_LIVE { "observe: " } else { "" };
 
     // --- Title bar (live only) - the quit hint up top where the eye starts ---
     if live {
@@ -184,19 +183,20 @@ fn print_state(
         ctx.console_line(true, "================================================================");
     }
 
-    // --- Legend ---
-    // Skipped in the live view - it is static noise that wastes screen space the
-    // repainting frame wants. `observe now` (one-shot) keeps it for reference.
-    if !live {
-        ctx.console_writeln("observe: legend: TASK: scheduler slot | NAME: service name");
-        ctx.console_writeln("observe: legend: CORE: cpu core | STATE: task state");
-        ctx.console_writeln("observe: legend: MEM_USED/LIMIT: memory in use (binary + stack + alloc_mem) / contract memory limit");
-        ctx.console_writeln("observe: legend: RESTARTS: restart count | QUEUE/LIMIT: inbound queue depth / max queue depth");
-        ctx.console_writeln("observe: legend: CPU%: this task's share of its assigned core since last snapshot");
-    }
+    // --- Legend (shown in every mode now, including the live view, per the column it explains) ---
+    ctx.console_line_fmt(live, format_args!("{}legend: TASK: scheduler slot | NAME: service name", p));
+    ctx.console_line_fmt(live, format_args!("{}legend: CORE: cpu core | STATE: task state", p));
+    ctx.console_line_fmt(live, format_args!("{}legend: MEM_USED/LIMIT: memory in use (binary + stack + alloc_mem) / contract limit", p));
+    ctx.console_line_fmt(live, format_args!("{}legend: RESTARTS: restart count | QUEUE/LIMIT: inbound queue depth / max", p));
+    ctx.console_line_fmt(live, format_args!("{}legend: CPU%: this task's share of its assigned core since last snapshot", p));
 
     // --- System summary ---
     ctx.console_line_fmt(live, format_args!("{}----------- system state ({} live) -----------", p, live_count));
+
+    // Uptime since boot (resets on reboot) - wall-clock RTC, same source as the `uptime` command.
+    let up = ctx.uptime_secs() as u64;
+    ctx.console_line_fmt(live, format_args!(
+        "{}UPTIME: {}d {:02}:{:02}:{:02}", p, up / 86400, (up / 3600) % 24, (up / 60) % 60, up % 60));
 
     // Build CPU summary line: "C0  98%  C1  99%  ...  total (49%)"
     let mut cpu_line = [0u8; 128];
@@ -244,10 +244,10 @@ fn print_state(
         let cdt = core_total_delta[c];
         let task_pct = if cdt > 0 { ((task_delta * 100) / cdt).min(100) as u32 } else { 0 };
 
-        // The observer itself is a transient command run, not a long-lived service - skip it so
-        // `observe`/`observe now` does not list itself (misleading, and now with a restart count).
-        // Baseline already updated above so the skip does not desync it.
-        if stat.name_str().starts_with("observe") { continue; }
+        // Skip only a DEAD observer leftover (a finished `observe now`/`observe` not yet reaped) -
+        // it would read as a "killed" service. The LIVE observer IS shown: it is a real running task,
+        // so you see its own CPU%/MEM. Baseline already updated above so the skip does not desync it.
+        if stat.name_str().starts_with("observe") && stat.state == 4 { continue; }
 
         let (uval, uunit) = bytes_fmt(stat.mem_used);
         let (lval, lunit) = bytes_fmt(stat.mem_limit);

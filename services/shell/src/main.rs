@@ -2640,8 +2640,10 @@ fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
         // Own `q` while the child paints. The bound is a paranoid safety net so a hung child can
         // never wedge the shell forever; normally we break on `q` (or if the child dies).
         for _ in 0..u32::MAX {
-            // Sleep (don't busy-yield) so core 0 halts between polls. ~50 ms `q` latency.
-            ctx.sleep(100_000_000);
+            // Sleep (don't busy-yield) so the core still halts between polls. The tick-based sleep
+            // floors at one 10 ms scheduler quantum, so a sub-quantum value gives the minimum ~1-tick
+            // (~10 ms) `q` latency - down from ~50 ms - while keeping the idle-between-polls (not a spin).
+            ctx.sleep(5_000_000);
             // Drain the console; quit on `q`/`Q` (other keys are discarded - observe takes no
             // other input). Echo is off (the child disabled it), so nothing smears the frame.
             let mut quit = false;
