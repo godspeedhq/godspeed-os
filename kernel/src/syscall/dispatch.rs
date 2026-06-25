@@ -1278,14 +1278,13 @@ fn handle_task_stat(slot: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     buf[0] = stat.valid as u8;
     buf[1] = stat.state;
     buf[2] = stat.core as u8;
-    // buf[3] = 0 (pad, already zeroed)
+    buf[3] = stat.queue_depth; // moved here (was buf[60]) to free 8 contiguous bytes for restart_count
     buf[4..8].copy_from_slice(&name_len.to_le_bytes());
     buf[8..16].copy_from_slice(&stat.mem_used.to_le_bytes());
     buf[16..24].copy_from_slice(&stat.mem_limit.to_le_bytes());
     buf[24..24 + copy_len].copy_from_slice(&name_bytes[..copy_len]);
-    buf[56..60].copy_from_slice(&stat.generation.to_le_bytes());
-    buf[60] = stat.queue_depth;
-    // buf[61..64] = 0 (pad, already zeroed)
+    // restart_count is u64 (was a u32 endpoint generation at buf[56..60]); queue_depth moved to buf[3].
+    buf[56..64].copy_from_slice(&stat.restart_count.to_le_bytes());
     buf[64..72].copy_from_slice(&stat.run_ticks.to_le_bytes());
 
     if write_user_bytes(buf_ptr, &buf) { 0 } else { -1 }

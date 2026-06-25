@@ -26,6 +26,7 @@ use crate::ipc::endpoint::EndpointId;
 use crate::ipc::message::Message;
 use crate::ipc::routing;
 use crate::smp::percpu::{num_cores, PerCore, PerCoreMut};
+use crate::smp::SpinLock;
 use crate::task::state::TaskState;
 
 // ---------------------------------------------------------------------------
@@ -61,6 +62,66 @@ static mut TASK_IS_USER: [bool; MAX_TASKS] = [false; MAX_TASKS];
 /// Zero for ring-0 tasks.
 static TASK_KERNEL_STACK_TOP: [AtomicU64; MAX_TASKS] =
     [const { AtomicU64::new(0) }; MAX_TASKS];
+
+/// Per-slot restart count of the service occupying this slot - 0 on the first spawn of a name, +1 on
+/// each respawn. Set from `next_restart_count` at spawn; surfaced by `task_stat` as the `observe`/
+/// `status` RESTARTS column. u64 so it is effectively unbounded (saturating - ~580M years at 1/ms).
+static TASK_RESTART_COUNT: [AtomicU64; MAX_TASKS] =
+    [const { AtomicU64::new(0) }; MAX_TASKS];
+
+/// Per-service-NAME restart counter. The first spawn of a name yields 0; each later spawn yields the
+/// previous value + 1 (saturating at u64::MAX). Bounded to `NAME_RESTART_MAX` distinct names - past
+/// that a name is untracked (reads 0) and we say so loudly (§26.7). Transient per-command utility
+/// services (greet, roster, ...) also land here, but `observe`/`status` only ever show persistent
+/// services, whose value is the true restart count.
+const NAME_RESTART_MAX: usize = 64;
+
+struct NameRestart {
+    name:  &'static str,
+    count: u64,
+}
+
+struct NameRestartTable {
+    entries: [NameRestart; NAME_RESTART_MAX],
+    len:     usize,
+}
+
+impl NameRestartTable {
+    const fn new() -> Self {
+        Self {
+            entries: [const { NameRestart { name: "", count: 0 } }; NAME_RESTART_MAX],
+            len:     0,
+        }
+    }
+}
+
+static NAME_RESTART: SpinLock<NameRestartTable> = SpinLock::new(NameRestartTable::new());
+
+/// Restart count to stamp on a fresh spawn of `name`, advancing the per-name counter: the FIRST spawn
+/// of a name returns 0, each later spawn returns previous + 1 (saturating). Over-cap names return 0.
+fn next_restart_count(name: &'static str) -> u64 {
+    if name.is_empty() {
+        return 0;
+    }
+    let mut tbl = NAME_RESTART.lock();
+    for i in 0..tbl.len {
+        if tbl.entries[i].name == name {
+            tbl.entries[i].count = tbl.entries[i].count.saturating_add(1);
+            return tbl.entries[i].count;
+        }
+    }
+    if tbl.len < NAME_RESTART_MAX {
+        let len = tbl.len;
+        tbl.entries[len] = NameRestart { name, count: 0 };
+        tbl.len = len + 1;
+    } else {
+        crate::kprintln!(
+            "scheduler: NAME_RESTART table full ({} names) - '{}' restart count not tracked",
+            NAME_RESTART_MAX, name
+        );
+    }
+    0
+}
 /// The recv endpoint owned by each task (None if the task has no endpoint). `AtomicU64` (0 = None;
 /// endpoint ids start at 100, so 0 is never a real recv endpoint) so the accessors stay unsafe-free.
 static TASK_ENDPOINT: [AtomicU64; MAX_TASKS] =
@@ -413,6 +474,7 @@ pub unsafe fn commit_task(
     unsafe {
         TASK_CTX[slot].write(ctx);
         TASK_NAME[slot]             = name;
+        TASK_RESTART_COUNT[slot].store(next_restart_count(name), Ordering::Relaxed);
         TASK_IS_USER[slot]          = is_user;
         TASK_KERNEL_STACK_TOP[slot].store(kernel_stack_top, Ordering::Relaxed);
         TASK_ENDPOINT[slot].store(ep_to_u64(endpoint_id), Ordering::Relaxed);
@@ -449,6 +511,7 @@ pub fn enqueue(
                 TASK_CAP[i].write(caps);
                 TASK_STATE[i].store(TaskState::Ready as u8, Ordering::Relaxed);
                 TASK_NAME[i]             = name;
+                TASK_RESTART_COUNT[i].store(next_restart_count(name), Ordering::Relaxed);
                 TASK_VALID[i].store(true, Ordering::Release);
                 TASK_CORE[i]             = core_id;
                 TASK_IS_USER[i]          = is_user;
@@ -699,7 +762,7 @@ pub struct TaskStatRaw {
     pub mem_used:    u64,
     pub mem_limit:   u64,
     pub name:        &'static str,
-    pub generation:  u32,
+    pub restart_count: u64,
     pub queue_depth: u8,
     pub run_ticks:   u64,
 }
@@ -711,16 +774,16 @@ pub struct TaskStatRaw {
 pub fn task_stat(slot: usize) -> TaskStatRaw {
     if slot >= MAX_TASKS {
         return TaskStatRaw { valid: false, state: 0, core: 0, mem_used: 0, mem_limit: 0,
-                             name: "", generation: 0, queue_depth: 0, run_ticks: 0 };
+                             name: "", restart_count: 0, queue_depth: 0, run_ticks: 0 };
     }
     // SAFETY: read-only snapshot of static arrays; all reads are individually
     // naturally-atomic on x86_64 (u64/u32/pointer-width). Best-effort consistency
     // is acceptable - same contract as for_each_active_cap.
     unsafe {
         let endpoint = ep_from_u64(TASK_ENDPOINT[slot].load(Ordering::Relaxed));
-        let (generation, queue_depth) = match endpoint {
-            Some(ep) => (routing::get_generation(ep).0, routing::endpoint_queue_depth(ep)),
-            None     => (0, 0),
+        let queue_depth = match endpoint {
+            Some(ep) => routing::endpoint_queue_depth(ep),
+            None     => 0,
         };
         TaskStatRaw {
             valid:       TASK_VALID[slot].load(Ordering::Relaxed),
@@ -729,7 +792,7 @@ pub fn task_stat(slot: usize) -> TaskStatRaw {
             mem_used:    TASK_ALLOC_BYTES[slot],
             mem_limit:   TASK_LIMIT_BYTES[slot],
             name:        TASK_NAME[slot],
-            generation,
+            restart_count: TASK_RESTART_COUNT[slot].load(Ordering::Relaxed),
             queue_depth,
             run_ticks:   TASK_RUN_TICKS[slot].load(Ordering::Relaxed),
         }
