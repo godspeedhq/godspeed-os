@@ -131,7 +131,7 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
 | arch/x86_64/ap_boot.rs | 2 | permitted |
-| arch/x86_64/boot.rs | 81 | permitted |
+| arch/x86_64/boot.rs | 80 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |
 | arch/x86_64/fb.rs | 3 | permitted |
 | arch/x86_64/interrupts.rs | 21 | permitted |
@@ -147,9 +147,9 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | memory/frame.rs | 1 | permitted |
 | memory/mod.rs | 1 | permitted |
 | memory/page.rs | 1 | permitted |
-| smp/core.rs | 6 | permitted |
 | smp/ipi.rs | 23 | permitted |
 | smp/mod.rs | 1 | permitted |
+| smp/percpu.rs | 6 | permitted |
 | smp/placement.rs | 1 | permitted |
 | smp/spinlock.rs | 7 | permitted |
 | interrupt/route.rs | 1 | grandfathered |

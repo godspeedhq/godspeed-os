@@ -212,6 +212,17 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
 
     memory::init(boot_info);
 
+    // Size the per-core arenas (§26.6.1) to the cores Limine reported, now that the frame allocator
+    // is up - before anything per-core (the supervisor spawn, the APs) can touch them. Replaces the
+    // fixed `[_; MAX_CORES]` statics with boot-sized arenas; MAX_CORES stays a loud sanity ceiling.
+    smp::percpu_init(boot_info);
+    // Task-layer per-core arenas (scheduler contexts + the deferred kstack-free list), sized to the
+    // same N. Kept here (not inside percpu_init) so smp/ does not up-call into task/.
+    task::scheduler::init_arenas(smp::percpu::num_cores());
+    // Per-AP GDT/TSS arenas (the BSP already runs on its static bootstrap). Sized to the same N; the
+    // APs load these in ap_init, which runs after this point.
+    arch::x86_64::boot::init_gdt_arenas(smp::percpu::num_cores());
+
     // Hardening: unmap a guard page below each kernel-stack slot so an overflow
     // faults loudly instead of corrupting the neighbouring stack. Done here - BSP
     // only, before APs and before any kstack is allocated, so no TLB shootdown is

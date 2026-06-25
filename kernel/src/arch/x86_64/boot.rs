@@ -10,8 +10,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::BootInfo;
-
-const MAX_CORES: usize = crate::smp::core::MAX_CORES;
+use crate::smp::percpu::PerCoreMut;
 
 // ---------------------------------------------------------------------------
 // GDT - eight 64-bit descriptors (per core).
@@ -44,8 +43,13 @@ const GDT_TEMPLATE: [u64; 8] = [
     0x0000_0000_0000_0000, // TSS high     (0x38): filled by init_gdt(core_id)
 ];
 
+/// The BSP's single-core bootstrap GDT, set up in `init_gdt(0)` BEFORE the frame allocator exists and
+/// used by the BSP for its lifetime. Only the BSP needs a static; the APs use `GDT_ARENA` (§26.6.1),
+/// boot-sized to the real core count instead of `[_; MAX_CORES]`.
 #[link_section = ".data"]
-static mut GDT_PER_CORE: [[u64; 8]; MAX_CORES] = [GDT_TEMPLATE; MAX_CORES];
+static mut BSP_GDT: [u64; 8] = GDT_TEMPLATE;
+/// Per-AP GDT arena, boot-allocated, sized to N (slot 0 unused - the BSP uses `BSP_GDT`).
+static GDT_ARENA: PerCoreMut<[u64; 8]> = PerCoreMut::new();
 
 // ---------------------------------------------------------------------------
 // TSS (Task State Segment) - one per core.
@@ -70,14 +74,37 @@ struct Tss {
 
 // io_map_base = 104: the IOPB base is past the TSS limit (103), so the CPU
 // denies all port I/O from ring-3 (services must use MMIO caps instead).
+/// Initial TSS: `io_map_base = 104` (past the limit -> ring-3 port I/O faults). Shared by the BSP
+/// bootstrap and each AP arena slot.
+const TSS_INIT: Tss = Tss {
+    _res0: 0, rsp0: 0, rsp1: 0, rsp2: 0,
+    _res1: 0, ist: [0; 7], _res2: 0, _res3: 0,
+    io_map_base: 104,
+};
+/// The BSP's single-core bootstrap TSS (see `BSP_GDT`). The APs use `TSS_ARENA`.
 #[link_section = ".data"]
-static mut TSS_PER_CORE: [Tss; MAX_CORES] = [const {
-    Tss {
-        _res0: 0, rsp0: 0, rsp1: 0, rsp2: 0,
-        _res1: 0, ist: [0; 7], _res2: 0, _res3: 0,
-        io_map_base: 104,
-    }
-}; MAX_CORES];
+static mut BSP_TSS: Tss = TSS_INIT;
+/// Per-AP TSS arena, boot-allocated, sized to N (slot 0 unused).
+static TSS_ARENA: PerCoreMut<Tss> = PerCoreMut::new();
+
+/// Allocate the per-AP GDT/TSS arenas for `n` cores. Call ONCE at boot after the frame allocator is up
+/// and before any AP starts (the BSP already runs on `BSP_GDT`/`BSP_TSS`). Slot 0 is unused.
+pub fn init_gdt_arenas(n: usize) {
+    GDT_ARENA.init_with(n, |_| GDT_TEMPLATE);
+    TSS_ARENA.init_with(n, |_| TSS_INIT);
+}
+
+/// `*mut` to core `cid`'s GDT - the BSP's static bootstrap for core 0, the arena for an AP.
+#[inline]
+fn gdt_for(cid: usize) -> *mut [u64; 8] {
+    if cid == 0 { core::ptr::addr_of_mut!(BSP_GDT) } else { GDT_ARENA.as_mut_ptr(cid) }
+}
+
+/// `*mut` to core `cid`'s TSS - the BSP's static bootstrap for core 0, the arena for an AP.
+#[inline]
+fn tss_for(cid: usize) -> *mut Tss {
+    if cid == 0 { core::ptr::addr_of_mut!(BSP_TSS) } else { TSS_ARENA.as_mut_ptr(cid) }
+}
 
 // ---------------------------------------------------------------------------
 // IDT - 256 interrupt gates.
@@ -738,23 +765,24 @@ fn make_tss_descriptor(tss_ptr: *const Tss) -> (u64, u64) {
 /// valid stack. Invalidates the current CS/DS/ES/SS until they are reloaded.
 pub(super) unsafe fn init_gdt(core_id: u32) {
     let cid = core_id as usize;
+    // BSP bootstrap for core 0 (the arena does not exist yet), this AP's arena slot otherwise.
+    let gdt = gdt_for(cid); // *mut [u64; 8]
+    let tss = tss_for(cid); // *mut Tss
 
     // Fill the TSS descriptor into slots 6 and 7 of this core's GDT.
-    // SAFETY: GDT_PER_CORE and TSS_PER_CORE live in .data; single writer per
-    // core (only this core touches its own slot during init).
+    // SAFETY: single writer per core during init; gdt/tss point to this core's own GDT/TSS.
     unsafe {
-        let tss_ptr = &raw const TSS_PER_CORE[cid];
-        let (lo, hi) = make_tss_descriptor(tss_ptr);
-        GDT_PER_CORE[cid][6] = lo;
-        GDT_PER_CORE[cid][7] = hi;
+        let (lo, hi) = make_tss_descriptor(tss as *const Tss);
+        (*gdt)[6] = lo;
+        (*gdt)[7] = hi;
     }
 
     let desc = TableDescriptor {
         limit: (core::mem::size_of::<[u64; 8]>() - 1) as u16,
-        base:  unsafe { GDT_PER_CORE[cid].as_ptr() } as u64,
+        base:  gdt as u64,
     };
 
-    // SAFETY: GDT_PER_CORE[cid] is valid .data memory; desc outlives the lgdt.
+    // SAFETY: gdt points to valid GDT memory; desc outlives the lgdt.
     unsafe {
         core::arch::asm!(
             "lgdt [{desc}]",
@@ -938,13 +966,12 @@ pub(super) unsafe fn init_syscall(core_id: u32) {
 /// Read TSS.rsp0 for `core_id`.
 ///
 /// # Safety
-/// Caller must ensure `core_id < MAX_CORES`.
+/// Caller must ensure `core_id < num_cores()`.
 pub unsafe fn get_tss_rsp0(core_id: usize) -> u64 {
-    // SAFETY: TSS_PER_CORE lives in .data; rsp0 is at byte offset 4 of the
-    // packed struct. read_unaligned is used because packed structs have
-    // alignment 1.
+    // SAFETY: tss_for returns this core's TSS (BSP bootstrap or its arena slot); rsp0 is at byte
+    // offset 4 of the packed struct. read_unaligned is used because packed structs have alignment 1.
     unsafe {
-        let tss = &raw const TSS_PER_CORE[core_id];
+        let tss = tss_for(core_id);
         let rsp0_ptr = core::ptr::addr_of!((*tss).rsp0);
         rsp0_ptr.read_unaligned()
     }
@@ -957,14 +984,14 @@ pub unsafe fn get_tss_rsp0(core_id: usize) -> u64 {
 /// correct per-task kernel stack (§9.2, §14.1).
 ///
 /// # Safety
-/// Caller must ensure `core_id < MAX_CORES` and `rsp` is a valid kernel stack
+/// Caller must ensure `core_id < num_cores()` and `rsp` is a valid kernel stack
 /// top for the incoming ring-3 task.
 pub unsafe fn set_tss_rsp0(core_id: usize, rsp: u64) {
-    // SAFETY: TSS_PER_CORE lives in .data; rsp0 is at byte offset 4 of the
-    // packed struct. write_unaligned is used because packed structs have
-    // alignment 1 - taking a &mut reference would be UB.
+    // SAFETY: tss_for returns this core's TSS (BSP bootstrap or its arena slot); rsp0 is at byte
+    // offset 4 of the packed struct. write_unaligned is used because packed structs have alignment
+    // 1 - taking a &mut reference would be UB.
     unsafe {
-        let tss = &raw mut TSS_PER_CORE[core_id];
+        let tss = tss_for(core_id);
         let rsp0_ptr = core::ptr::addr_of_mut!((*tss).rsp0);
         rsp0_ptr.write_unaligned(rsp);
     }

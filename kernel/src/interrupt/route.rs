@@ -64,14 +64,22 @@ pub unsafe fn deliver(irq: u8) {
 
     let endpoint = IRQ_TABLE.lock()[irq as usize];
     if let Some(ep) = endpoint {
-        let msg = crate::ipc::message::Message::interrupt_event(irq);
-        if let Some(receiver_slot) = crate::ipc::routing::enqueue_from_interrupt(ep, msg) {
-            // wake_by_slot marks the receiver Ready and sends a WAKE_RECEIVER IPI
-            // to its core if it lives on a different core than the one handling
-            // this IRQ (§12.2 cross-core delivery path).
-            crate::task::scheduler::wake_by_slot(receiver_slot, 0);
+        // COALESCE interrupt notifications. A busy-poll driver (xhci/ehci) reads its device's event
+        // ring directly every pass, so it needs at most ONE pending "IRQ fired" IPC; extra ones just
+        // pile up in its queue (which then reads as full / "can't accept work" in `observe`, even
+        // though the driver is fine - the symptom seen after a max-carnage interrupt storm). If a
+        // notification is already queued, skip this one: the driver polls the device anyway, and the
+        // kernel re-notifies once the queue drains. A driver BLOCKED on recv always has an empty
+        // queue, so it never loses a wakeup. (The EOI below still fires unconditionally.)
+        if crate::ipc::routing::endpoint_queue_depth(ep) == 0 {
+            let msg = crate::ipc::message::Message::interrupt_event(irq);
+            if let Some(receiver_slot) = crate::ipc::routing::enqueue_from_interrupt(ep, msg) {
+                // wake_by_slot marks the receiver Ready and sends a WAKE_RECEIVER IPI
+                // to its core if it lives on a different core than the one handling
+                // this IRQ (§12.2 cross-core delivery path).
+                crate::task::scheduler::wake_by_slot(receiver_slot, 0);
+            }
         }
-        // If queue full: interrupt silently discarded; driver is overloaded (§12).
     }
     // EOI must fire unconditionally - even on discard and even on full queue.
     // If the APIC is not re-armed here, the IRQ line stays masked and the system hangs.

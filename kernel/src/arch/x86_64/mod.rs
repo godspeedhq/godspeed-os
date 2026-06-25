@@ -153,21 +153,36 @@ fn collect_boot_info() -> BootInfo {
         .unwrap_or(0);
 
     // Collect non-BSP LAPIC IDs from the SMP response.
-    const MAX_AP_IDS: usize = 16;
+    // The AP-id buffer holds up to the MAX_CORES sanity ceiling worth of APs (BSP excluded). A machine
+    // with more cores is capped here - loudly (§26.7), never silently.
+    const MAX_AP_IDS: usize = crate::smp::core::MAX_CORES - 1;
     static mut AP_ID_BUF: [u32; MAX_AP_IDS] = [0u32; MAX_AP_IDS];
     let mut ap_count = 0usize;
+    let mut dropped = 0usize;
 
     if let Some(mp) = SMP_REQUEST.response() {
         let bsp_lapic = mp.bsp_lapic_id;
         // Record the BSP local-APIC id so legacy-INTx (EHCI) routes target the right LAPIC.
         crate::arch::x86_64::ioapic::set_bsp_lapic_id(bsp_lapic as u8);
         for cpu in mp.cpus() {
-            if cpu.lapic_id != bsp_lapic && ap_count < MAX_AP_IDS {
-                // SAFETY: single-threaded boot path.
-                unsafe { AP_ID_BUF[ap_count] = cpu.lapic_id; }
-                ap_count += 1;
+            if cpu.lapic_id != bsp_lapic {
+                if ap_count < MAX_AP_IDS {
+                    // SAFETY: single-threaded boot path.
+                    unsafe { AP_ID_BUF[ap_count] = cpu.lapic_id; }
+                    ap_count += 1;
+                } else {
+                    dropped += 1;
+                }
             }
         }
+    }
+    if dropped > 0 {
+        crate::kprintln!(
+            "smp: machine has {} cores; this build handles {} (MAX_CORES) - {} unused",
+            ap_count + 1 + dropped,
+            crate::smp::core::MAX_CORES,
+            dropped
+        );
     }
 
     // Compute the physical range of the kernel image so the frame allocator

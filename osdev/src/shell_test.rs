@@ -454,7 +454,9 @@ pub fn run(image_path: &Path, smp: u32) {
     // -----------------------------------------------------------------------
     send(&mut write_half, b"observe now\r");
     match collect_until(&buf, &mut cursor, b"system state", Duration::from_secs(15)) {
-        Some(r) => check!(r.contains("observe:"), "observe now: static frame printed"),
+        // `observe now` (interactive snapshot) no longer prefixes lines with "observe: " - the
+        // legend line is the stable marker that the frame printed.
+        Some(r) => check!(r.contains("legend"), "observe now: static frame printed"),
         None    => { println!("shell-test: FAIL - timed out waiting for observe now frame"); fail += 1; }
     }
     // The frame should carry the task table header (gated task_stat working).
@@ -544,7 +546,7 @@ pub fn run(image_path: &Path, smp: u32) {
     // -----------------------------------------------------------------------
     send(&mut write_half, b"spawn supervisor\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("Core services") && r.contains("protected"),
+        Some(r) => check!(r.contains("supervisor") && r.contains("protected"),
                           "spawn: trusted-root refused with reason"),
         None    => { println!("shell-test: FAIL - timed out after spawn supervisor"); fail += 1; }
     }

@@ -96,10 +96,20 @@ impl fmt::Write for LogSink<'_> {
 }
 
 pub fn write_fmt(args: fmt::Arguments) {
-    let mut ring = RING.lock();
-    let mut sink = LogSink { ring: &mut ring, stage: [0u8; SERIAL_STAGE], n: 0 };
-    let _ = sink.write_fmt(args);
-    sink.flush();
+    // RING is taken from BOTH task context and interrupt context (the timer ISR's control-channel
+    // drains log lines like "control: KILL supervisor"), so its hold MUST mask interrupts - the
+    // `smp::without_interrupts` contract. Without it, a task preempted mid-kprintln holds RING, and any
+    // code that then takes RING with preemption suppressed deadlocks forever waiting on the unreschedulable
+    // holder. That is exactly the supervisor respawn (Path C / Phase 6): it pins Core 0 (no context
+    // switch) and its own kprintln spun on RING held by a preempted Core-0 task - the §22 Test 15 wedge
+    // under QEMU. The serial flush is bounded (THRE poll drops on timeout, SERIAL_LOCK spin is capped),
+    // so the interrupts-off window stays bounded.
+    crate::smp::without_interrupts(|| {
+        let mut ring = RING.lock();
+        let mut sink = LogSink { ring: &mut ring, stage: [0u8; SERIAL_STAGE], n: 0 };
+        let _ = sink.write_fmt(args);
+        sink.flush();
+    });
 }
 
 /// Drain the ring buffer into the logger service endpoint once it is ready.

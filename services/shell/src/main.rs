@@ -2621,6 +2621,16 @@ fn cmd_observe_now(ctx: &ServiceContext) -> Result<(), ShellError> {
     Ok(())
 }
 
+/// This shell's own core (slot scan by name; 0 if not found). Used to place the live `observe`
+/// painter on a different core so its repaint can't starve the shell's `q`-poll.
+fn observe_shell_core(ctx: &ServiceContext) -> u32 {
+    for slot in 0..256u32 {
+        let st = ctx.task_stat(slot);
+        if st.valid && st.name_str() == "shell" { return st.core as u32; }
+    }
+    0
+}
+
 /// `observe` (live) - broker the full-screen foreground view (Stage 2c).
 ///
 /// The shell is the capability-broker (Appendix B.3): it lends the keyboard to
@@ -2632,7 +2642,20 @@ fn cmd_observe_now(ctx: &ServiceContext) -> Result<(), ShellError> {
 /// read as ~100% in observe's own display. Then we restore the screen and our read loop resumes.
 fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
     let _ = ctx.kill("observe-live"); // clear any stale instance
-    if ctx.spawn("observe-live").is_err() {
+    // Pin the painter to a DIFFERENT core than this shell. Its framebuffer-heavy repaint must not
+    // share a core with this q-poll loop, or it starves `q` (the "stuck" that showed up once the
+    // legend made the repaint heavier - and why it was flaky before: round-robin sometimes
+    // co-located them). Fall back to round-robin only if the targeted spawn fails.
+    let shell_core = observe_shell_core(ctx);
+    let ncores = ctx.inspect_core_count();
+    let spawned = if ncores >= 2 {
+        let last = ncores - 1;
+        let target = if last == shell_core { 0 } else { last };
+        ctx.spawn_on("observe-live", target).is_ok()
+    } else {
+        false
+    };
+    if !spawned && ctx.spawn("observe-live").is_err() {
         ctx.console_writeln("observe: failed to spawn observe-live");
         return Err(ShellError::Unknown);
     }
@@ -2640,8 +2663,10 @@ fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
         // Own `q` while the child paints. The bound is a paranoid safety net so a hung child can
         // never wedge the shell forever; normally we break on `q` (or if the child dies).
         for _ in 0..u32::MAX {
-            // Sleep (don't busy-yield) so core 0 halts between polls. ~50 ms `q` latency.
-            ctx.sleep(100_000_000);
+            // Sleep (don't busy-yield) so the core still halts between polls. The tick-based sleep
+            // floors at one 10 ms scheduler quantum, so a sub-quantum value gives the minimum ~1-tick
+            // (~10 ms) `q` latency - down from ~50 ms - while keeping the idle-between-polls (not a spin).
+            ctx.sleep(5_000_000);
             // Drain the console; quit on `q`/`Q` (other keys are discarded - observe takes no
             // other input). Echo is off (the child disabled it), so nothing smears the frame.
             let mut quit = false;
@@ -2685,10 +2710,10 @@ const CORE_SERVICES: [&str; 1] = ["supervisor"];
 
 /// Shown when spawn/kill/restart targets a core service - "Not applicable" makes
 /// it clear the command is refused *because* the target is protected, not failed.
-/// Lists exactly `CORE_SERVICES`; `registry` is intentionally absent (H11 ph6:
-/// it is restartable, so `kill registry` is permitted).
+/// Lists exactly `CORE_SERVICES` (just `supervisor`; `init` was removed in Phase 5,
+/// `registry` retired in Phase 4 - both intentionally absent).
 const PROTECTED_MSG: &str =
-    "Not applicable. Core services (init, supervisor) are protected";
+    "Not applicable. The supervisor is protected (the recovery authority); storm it deliberately via 'chaos kill-storm supervisor'";
 
 /// Shown when spawn/kill/restart targets an observe variant - they are brokered by
 /// the `observe` / `observe now` commands, not raw service operations.
