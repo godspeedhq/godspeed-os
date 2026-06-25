@@ -76,11 +76,15 @@ struct BitmapAllocator {
     /// Any frame index at or above this value was never handed out by the
     /// allocator and must not be accepted by `free`.
     max_valid_frame: usize,
+    /// Count of double-free attempts (a frame freed while already free). The bitmap absorbs these
+    /// idempotently, but they must not inflate `free_frames` (else it exceeds `total_frames` and
+    /// observe's RAM read underflows). Counted so the loud log can be rate-limited.
+    double_frees: usize,
 }
 
 impl BitmapAllocator {
     const fn new() -> Self {
-        Self { free_frames: 0, total_frames: 0, next_byte: 0, max_valid_frame: 0 }
+        Self { free_frames: 0, total_frames: 0, next_byte: 0, max_valid_frame: 0, double_frees: 0 }
     }
 
     // SAFETY: caller must guarantee single-threaded access; called once by BSP during memory::init.
@@ -226,7 +230,20 @@ impl BitmapAllocator {
             return;
         }
         // SAFETY: idx within bounds; caller guarantees exclusive ownership.
-        unsafe { bitmap_set_free(idx) };
+        if unsafe { bitmap_set_free(idx) } {
+            // Double-free: the frame is already free. The bitmap absorbed it idempotently (no
+            // duplicate in the pool, so no double-allocation), but counting it again would push
+            // free_frames past total_frames and underflow observe's RAM read. Don't re-count; log
+            // loudly (§26.7), rate-limited so a burst (e.g. chaos max-carnage) can't bury the console.
+            self.double_frees += 1;
+            if self.double_frees == 1 || self.double_frees % 512 == 0 {
+                crate::kprintln!(
+                    "free_frame: double-free idx={} (already free; bitmap idempotent, count #{})",
+                    idx, self.double_frees
+                );
+            }
+            return;
+        }
         self.free_frames += 1;
         if idx / 8 < self.next_byte {
             self.next_byte = idx / 8;
@@ -251,8 +268,18 @@ fn scan_free(bitmap: &[u8], start: usize, end: usize) -> Option<usize> {
 }
 
 // SAFETY: must be called with exclusive access to BITMAP.
-unsafe fn bitmap_set_free(idx: usize) {
-    unsafe { BITMAP[idx / 8] |= 1u8 << (idx % 8) };
+/// Mark frame `idx` free in the bitmap. Returns `true` if it was ALREADY free - a double-free; the
+/// set is idempotent (the frame is not duplicated in the pool, so no double-allocation), but the
+/// caller must not re-count it in `free_frames`.
+unsafe fn bitmap_set_free(idx: usize) -> bool {
+    let byte = idx / 8;
+    let bit  = 1u8 << (idx % 8);
+    // SAFETY: idx < MAX_FRAMES (caller-checked); BITMAP is the frame bitmap, mutated under ALLOC_LOCKED.
+    unsafe {
+        let was_free = BITMAP[byte] & bit != 0;
+        BITMAP[byte] |= bit;
+        was_free
+    }
 }
 
 fn frame_align_up(addr: u64) -> u64 {

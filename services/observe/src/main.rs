@@ -159,7 +159,9 @@ fn print_state(
     // --- RAM ---
     let free_frames  = ctx.inspect_kernel_free_frames();
     let total_frames = ctx.inspect_kernel_total_frames();
-    let used_bytes   = (total_frames - free_frames) * FRAME_SIZE;
+    // saturating_sub: defensive against free_frames ever exceeding total (a kernel accounting
+    // slip would otherwise underflow to a ~2^44 MiB garbage value, as seen after a heavy carnage).
+    let used_bytes   = total_frames.saturating_sub(free_frames) * FRAME_SIZE;
     let total_mib    = (total_frames * FRAME_SIZE) / (1024 * 1024);
     // Show total in MiB under 1 GiB, GiB otherwise (avoids "0 GiB" for small RAM).
     let (total_val, total_unit) = if total_mib >= 1024 {
