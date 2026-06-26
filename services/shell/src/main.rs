@@ -2859,7 +2859,7 @@ fn drain_service(ctx: &ServiceContext, svc: &str, input: Option<&[u8]>, out: &mu
                 // text ever changes on hardware, the new shell is running (§26.7 loud failure).
                 ctx.console_writeln_fmt(format_args!(
                     "pipe: '{}' never registered an input endpoint (waited ~{}s) - not a filter, or it failed to start",
-                    svc, FILTER_WAIT_TICKS / 100));
+                    svc, FILTER_WAIT_SECS));
                 let _ = ctx.kill(svc);
                 return false;
             }
@@ -3080,33 +3080,27 @@ fn pipe_write(ctx: &ServiceContext, cwd: &Cwd, arg: &str, data: &[u8]) {
 fn lookup_sink(ctx: &ServiceContext, sink: &str) -> Option<CapHandle> {
     // A freshly-spawned filter registers its input endpoint only once it actually RUNS - which on
     // real multi-core hardware is up to ~1 s after spawn (it's on another core and hasn't been
-    // scheduled yet). Retry the registry lookup until it appears, bounded by REAL time.
+    // scheduled yet). Retry until it appears, bounded by REAL wall-clock time (the RTC).
     //
-    // CRITICAL - do NOT `yield_cpu` in this wait. `CORE_TOTAL_TICKS` counts scheduler *quanta*
-    // (the timer IRQ **and** every `yield_current` - scheduler.rs), so yielding here inflates the
-    // very counter we use as the clock: 50 yields/iteration drove it past the budget in ~4 ms and
-    // the wait collapsed to nothing (the bug that bit the T630 twice - first as a yield-count wait,
-    // then as a yield-polluted tick wait). `registry_lookup` already blocks on `recv` for the
-    // registry's reply - a cooperative wait that lets the registry and the filter run and does NOT
-    // bump the tick counter (`block_and_reschedule` doesn't). So a plain retry loop is both
-    // cooperative (each iteration deschedules on the IPC) and real-time-bounded: with no yields the
-    // counter advances ~only on the 100 Hz timer IRQ - a true wall-clock.
-    // Path C (Phase 4): resolve the sink via the kernel name-directory (SEND|GRANT, so the cap can
-    // be delegated to the producer) instead of the registry service. The directory is populated
-    // synchronously at the sink's spawn, so this normally succeeds on the first iteration; the
-    // bounded wall-clock retry stays as a guard for the rare not-yet-scheduled case.
-    let core  = ctx.core_id();
-    let start = ctx.inspect_core_total_ticks(core);
+    // Use the RTC, NOT `inspect_core_total_ticks`. CORE_TOTAL_TICKS is a scheduler-quanta counter,
+    // not a clock: after a storm (chaos max-carnage) it advanced ~100x slower than wall-time, so a
+    // "~5 s" tick budget actually ran for ~8 minutes (the T630 selfcheck stall). The RTC is a true
+    // clock and immune to scheduler weirdness, so we also `yield_cpu` cooperatively while waiting.
+    // Path C (Phase 4): the sink resolves via the kernel name-directory (SEND|GRANT, so the cap can
+    // be delegated to the producer); it is populated synchronously at the sink's spawn, so this
+    // normally succeeds on the first iteration - the bounded wait is just a guard.
+    let t0 = ctx.datetime().epoch_secs();
     loop {
         if let Some(h) = ctx.acquire_send_grant_cap(sink) { return Some(h); }
-        if ctx.inspect_core_total_ticks(core).wrapping_sub(start) >= FILTER_WAIT_TICKS { return None; }
+        if ctx.datetime().epoch_secs() - t0 >= FILTER_WAIT_SECS { return None; }
+        ctx.yield_cpu();
     }
 }
 
 /// How long `lookup_sink` waits (in 10 ms timer ticks, §9.1) for a freshly-spawned filter to
 /// register its input endpoint. ~5 s - comfortably over the observed worst-case first-run latency
 /// (~1 s) on the T630 under selfcheck load, with margin.
-const FILTER_WAIT_TICKS: u64 = 500;
+const FILTER_WAIT_SECS: i64 = 5;
 
 fn cmd_kill(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     if is_core_service(name) {

@@ -378,23 +378,39 @@ impl ServiceContext {
         if ret < 0 { return Err(CapError::CapNotHeld); }
         let new_slot = ret as u32;
 
-        // Update dynamic cache.
-        // SAFETY: single-threaded service; no concurrent cache writes. addr_of_mut!
-        // avoids a direct &mut to the static (static_mut_refs lint).
+        // Update the dynamic cache. Reuse this peer's EXISTING entry if it has one (and reclaim its
+        // now-stale cap), otherwise take a free slot. Reclaiming the old cap is essential: without it
+        // every restart-reacquire orphans the previous cap, and a storm (e.g. `chaos max-carnage`)
+        // fills the cap table until `derive_cap`/`acquire_send_cap` start returning None - which shows
+        // up as "storage unavailable" (fs) and "never registered" (pipe filters). Searching the peer's
+        // entry first also prevents creating a duplicate entry when a free slot precedes it.
+        // SAFETY: single-threaded service; no concurrent cache writes. addr_of_mut! avoids a direct
+        // &mut to the static (static_mut_refs lint).
+        let mut stale: Option<u32> = None;
+        let mut placed = false;
         unsafe {
-            for entry in (*core::ptr::addr_of_mut!(SEND_CAP_CACHE)).iter_mut() {
-                if entry.slot == u32::MAX
-                    || (entry.name_len as usize == len
-                        && &entry.name[..len] == bytes)
-                {
-                    entry.slot     = new_slot;
-                    entry.name_len = len as u8;
-                    entry.name     = [0u8; PEER_NAME_BYTES];
-                    entry.name[..len].copy_from_slice(bytes);
+            let cache = &mut *core::ptr::addr_of_mut!(SEND_CAP_CACHE);
+            for entry in cache.iter_mut() {
+                if entry.name_len as usize == len && &entry.name[..len] == bytes {
+                    if entry.slot != u32::MAX && entry.slot != new_slot { stale = Some(entry.slot); }
+                    entry.slot = new_slot;
+                    placed = true;
                     break;
                 }
             }
+            if !placed {
+                for entry in cache.iter_mut() {
+                    if entry.slot == u32::MAX {
+                        entry.slot     = new_slot;
+                        entry.name_len = len as u8;
+                        entry.name     = [0u8; PEER_NAME_BYTES];
+                        entry.name[..len].copy_from_slice(bytes);
+                        break;
+                    }
+                }
+            }
         }
+        if let Some(old) = stale { self.remove_cap(CapHandle(old)); }
 
         Ok(CapHandle(new_slot))
     }
@@ -495,7 +511,13 @@ impl ServiceContext {
         let target = CapHandle(self.find_send_slot(peer)?);
         let self_grant = self.self_grant_handle()?;
         let reply_cap = self.derive_cap(self_grant)?;
-        self.send_with_cap_by_handle(target, reply_cap, msg).ok()?;
+        if self.send_with_cap_by_handle(target, reply_cap, msg).is_err() {
+            // Send failed (dead endpoint): the embedded reply cap was NOT transferred (the kernel
+            // validates the endpoint cap before the grant), so reclaim it here. Without this, a storm
+            // of failed sends leaks reply caps until the table fills and every request returns None.
+            self.remove_cap(reply_cap);
+            return None;
+        }
         crate::ipc::recv(self.recv_handle()?).ok()
     }
 
@@ -517,7 +539,10 @@ impl ServiceContext {
         let target = CapHandle(self.find_send_slot(peer)?);
         let self_grant = self.self_grant_handle()?;
         let reply_cap = self.derive_cap(self_grant)?;
-        self.send_with_cap_by_handle(target, reply_cap, msg).ok()?;
+        if self.send_with_cap_by_handle(target, reply_cap, msg).is_err() {
+            self.remove_cap(reply_cap);   // send failed: reclaim the untransferred reply cap (no leak)
+            return None;
+        }
         let t0 = self.datetime().epoch_secs();
         loop {
             if let Some(r) = self.try_recv() { return Some(r); }
