@@ -1063,14 +1063,13 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             TASK_RUN_TICKS[prev].fetch_add(1, Ordering::Relaxed);
         }
 
-        // Path C / Phase 6: while Core 0 is mid-supervisor-respawn at run()'s loop top, do NOT preempt
-        // it - just return (iret back to the spawn). The tick clock + COM2/control above still ran;
-        // we only suppress the context SWITCH. IF stays 1, so any cross-core shootdown / WAKE IPI is
-        // ACK'd between ticks (no wedge), but the ~22 ms spawn isn't switched away into the unresumable
-        // run() context (the Test-15 stall). Cleared the instant spawn_supervisor returns.
-        if cid == 0 && crate::task::supervisor_respawn_in_progress() {
-            return;
-        }
+        // Path C / Phase 6: the supervisor respawn is NO LONGER pinned here. The old code returned
+        // (suppressing the switch) so the ~22 ms spawn ran uninterrupted - but that STARVED any Core-0
+        // task holding a lock the spawn needed, deadlocking it under load (§22 Test 15). The respawn is
+        // now ROUND-ROBINED instead: see the in-progress RESUME block just after the CAS below, plus the
+        // preempt via the normal switch when prev == IDLE (the spawn currently running). Its locks are
+        // IRQ-safe, so the spawn is only ever preempted BETWEEN holds; a lock-holder gets a quantum and
+        // releases, then the spawn resumes and acquires.
 
         // CAS instead of store: if a cross-core kill wrote Dead between our
         // load and this transition, the CAS fails and Dead is preserved.
@@ -1083,6 +1082,32 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             );
+        }
+
+        // Path C / Phase 6 (round-robin respawn): if a supervisor respawn is IN PROGRESS and a TASK is
+        // running here, switch it OUT to the scheduler context (CORE_SCHED_CTX) - where the preempted
+        // spawn was saved - so the spawn gets THIS quantum and RESUMES. `prev` was set Ready by the CAS
+        // above, so it is rescheduled. Combined with the preempt path (when prev == IDLE the spawn is
+        // running, and the normal switch below saves it into CORE_SCHED_CTX and runs a ready task), this
+        // round-robins the spawn with ready tasks: a lock-holder runs and releases, the spawn resumes and
+        // acquires - no pin, no deadlock, no strand. Mirrors the pending switch-to-scheduler-context below.
+        if cid == 0 && crate::task::supervisor_respawn_in_progress() && prev < MAX_TASKS {
+            // Capture prev's user RSP now (other tasks run before prev is rescheduled, overwriting it).
+            if TASK_VALID[prev].load(Ordering::Relaxed) && TASK_IS_USER[prev] {
+                TASK_USER_RSP[prev] =
+                    crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[cid].user_rsp;
+            }
+            let current_ctx: *mut TaskContext = if !TASK_VALID[prev].load(Ordering::Relaxed) {
+                // prev self-killed - discard into CORE_DEAD_CTX (never resumed).
+                CORE_DEAD_CTX.as_mut_ptr(cid)
+            } else {
+                TASK_CTX[prev].assume_init_mut() as *mut TaskContext
+            };
+            CORE_CURRENT.get(cid).store(IDLE, Ordering::Relaxed);
+            let sched_ctx: *const TaskContext = CORE_SCHED_CTX.as_ptr(cid);
+            switch_context(current_ctx, sched_ctx);
+            // Resumes here when prev is next scheduled (after the spawn yields its quantum back).
+            return;
         }
 
         let next = match pick_next(cid) {
