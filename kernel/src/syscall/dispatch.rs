@@ -1149,7 +1149,7 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     // boot/RTC reads (10, 11). Every other query discloses another task's or
     // system-wide state and requires the INTROSPECT capability with READ (§3.1;
     // docs/introspection-capability.md).
-    if !matches!(query_id, 0 | 3 | 9 | 10 | 11 | 12)
+    if !matches!(query_id, 0 | 3 | 9 | 10 | 11 | 12 | 13)
         && !scheduler::current_task_holds_resource(
             crate::capability::INTROSPECT_RESOURCE, Rights::READ)
     {
@@ -1173,6 +1173,11 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // query 11 for `uptime` = now − boot, a portable wall-clock delta (a tick counter's rate
         // varies with the APIC timer mode). Task-neutral hardware info like the RTC, so ungated.
         12 => crate::arch::x86_64::rtc::boot_datetime() as i64,
+        // Is the CALLING task the console foreground owner (may its console reads return bytes)? 1 if
+        // foreground or unclaimed (normal), 0 if a foreground app (e.g. `chaos`, syscall 40) owns it.
+        // Caller-specific, so ungated (like query 0). The muted shell polls this to stay quiet + redraw
+        // its prompt only when it regains the keyboard.
+        13 => crate::arch::x86_64::console_foreground_allows(scheduler::current_task_slot() as u32) as i64,
         4 => crate::memory::allocator::free_frame_count() as i64,
         5 => crate::memory::allocator::total_frame_count() as i64,
         6 => scheduler::core_active_ticks(arg1 as usize) as i64,

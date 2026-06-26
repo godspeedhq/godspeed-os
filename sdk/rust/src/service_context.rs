@@ -1052,6 +1052,15 @@ impl ServiceContext {
         let _ = unsafe { raw_syscall(26, slot as u64, 0, 0) };
     }
 
+    /// Whether THIS task currently owns (or shares, when unclaimed) console input - i.e. its console
+    /// reads return bytes. False when another task holds the foreground (syscall 40, e.g. `chaos`): a
+    /// backgrounded task should then stay quiet (not draw, not read) and redraw its prompt only when
+    /// this returns true again. InspectKernel query 13 (ungated, caller-specific).
+    pub fn is_console_foreground(&self) -> bool {
+        // SAFETY: syscall(13) = InspectKernel; query 13 = is-foreground for the caller.
+        unsafe { raw_syscall(13, 13, 0, 0) != 0 }
+    }
+
     /// Claim exclusive console input (syscall 40, op = 1): after this, only THIS task's
     /// `try_console_read` returns bytes; every other task reads empty. The `chaos` service
     /// claims it for the duration of a run so a resurrected shell cannot swallow its
