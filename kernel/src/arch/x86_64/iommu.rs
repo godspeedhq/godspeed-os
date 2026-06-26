@@ -595,11 +595,18 @@ unsafe fn invalidate_device(mmio_va: u64, cmd_buf_va: u64, bdf: u32) {
         core::arch::asm!("sfence", options(nostack, nomem, preserves_flags));
         mmio_write64(mmio_va, reg::COMMAND_BUF_TAIL, tail);
         // Poll head until it catches the tail (commands consumed), bounded.
+        let mut drained = false;
         for _ in 0..1_000_000 {
             if mmio_read64(mmio_va, reg::COMMAND_BUF_HEAD) & 0xFFF == tail {
+                drained = true;
                 break;
             }
             core::hint::spin_loop();
+        }
+        if !drained {
+            // Loud rather than a silent return: the IOMMU didn't consume the invalidation, so a stale
+            // DTE / page mapping may linger - the operator needs to see it (§26.7).
+            crate::kprintln!("iommu: command-buffer drain timed out - invalidation may be incomplete");
         }
     }
 }

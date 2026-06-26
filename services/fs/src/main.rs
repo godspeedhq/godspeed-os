@@ -979,7 +979,7 @@ impl Fs {
         let mut label = [0u8; LABEL_MAX];
         let ll = (sb[76] as usize).min(LABEL_MAX);
         label[..ll].copy_from_slice(&sb[77..77 + ll]);
-        Ok(Fs {
+        let mut fs = Fs {
             total_blocks: u64_at(&sb, 16),
             bitmap_start: u64_at(&sb, 24),
             data_start: u64_at(&sb, 40),
@@ -987,7 +987,7 @@ impl Fs {
             journal_blocks: u64_at(&sb, 116),
             root_first_block: u64_at(&sb, 48),
             root_block_count: u64_at(&sb, 56),
-            free_blocks: u64_at(&sb, 64),
+            free_blocks: 0, // derived from the bitmap below — Commandment III (sb[64] is not trusted)
             flags: u32_at(&sb, 72),
             label,
             label_len: ll as u8,
@@ -1002,7 +1002,12 @@ impl Fs {
             txn_blk: [[0u8; BLOCK]; TXN_CAP],
             crash_after_commit: false,
             open_files: [OpenFile { rid: 0, plen: 0, path: [0u8; OPEN_PATH_MAX] }; MAX_OPEN],
-        })
+        };
+        // Commandment III: derive the free count from the bitmap (the one truth for which blocks are
+        // free) rather than the persisted sb[64], which could drift and lie. Re-derived every mount,
+        // after the journal recovery above, so a drifted count can never persist across a restart.
+        fs.free_blocks = fs.count_free_blocks(ctx)?;
+        Ok(fs)
     }
 
     // ── crash-consistency journal (Phase C) ──────────────────────────────────
@@ -1111,8 +1116,12 @@ impl Fs {
                 return Err("checkpoint write failed (will replay on next mount)");
             }
         }
-        // 4. Invalidate the journal (idempotent - recovery tolerates a stale commit too).
-        let _ = block_write(ctx, self.journal_start, &[0u8; BLOCK]);
+        // 4. Invalidate the journal. The checkpoint above already landed every block home, so a
+        // failure here is safe (the next mount re-replays this committed transaction idempotently) -
+        // but log it loudly rather than silently re-replaying on every future mount (§26.7).
+        if !block_write(ctx, self.journal_start, &[0u8; BLOCK]) {
+            ctx.log("fs: journal invalidation failed post-commit (txn re-replays next mount; data safe)");
+        }
         Ok(())
     }
 
@@ -1140,14 +1149,25 @@ impl Fs {
         let n = u32_at(&commit, 4) as usize;
         if n == 0 || n > TXN_CAP || 8 + n * 8 > COMMIT_CRC_OFF { return; }
         if crc32(&commit[..8 + n * 8]) != u32_at(&commit, COMMIT_CRC_OFF) { return; }
+        let mut replayed_ok = true;
         for i in 0..n {
             let lba = u64_at(&commit, 8 + i * 8);
-            if let Some(blk) = block_read(ctx, journal_start + 1 + i as u64) {
-                let _ = block_write(ctx, lba, &blk);
+            match block_read(ctx, journal_start + 1 + i as u64) {
+                Some(blk) => if !block_write(ctx, lba, &blk) { replayed_ok = false; },
+                None => replayed_ok = false,
             }
         }
-        let _ = block_write(ctx, journal_start, &[0u8; BLOCK]); // invalidate
-        ctx.log_fmt(format_args!("fs: journal recovered {} block(s) from an interrupted write", n));
+        if replayed_ok {
+            // Invalidate ONLY once every block landed home. On a replay I/O failure, leave the journal
+            // intact so the next mount re-replays (idempotent) - never clear a half-applied commit
+            // (§26.7: a silent clear here would lose a committed transaction).
+            if !block_write(ctx, journal_start, &[0u8; BLOCK]) {
+                ctx.log("fs: journal invalidation failed after recovery (re-replays next mount)");
+            }
+            ctx.log_fmt(format_args!("fs: journal recovered {} block(s) from an interrupted write", n));
+        } else {
+            ctx.log("fs: journal replay hit a block I/O error - left intact, re-replays on next mount");
+        }
     }
 
     /// Format the disk as an empty GSFS0008 sized to `capacity`, then mount. Same layout
@@ -1313,6 +1333,32 @@ impl Fs {
         self.bm_set_range(ctx, first, count, false)?;
         self.free_blocks += count;
         self.persist_super(ctx)
+    }
+
+    /// Derive the free-block count by scanning the bitmap — Commandment III: the bitmap is the ONE
+    /// truth for which blocks are free, so the count is *derived* from it, never trusted from a
+    /// persisted copy that could drift. Counts clear (free) bits over `[data_start, total_blocks)`,
+    /// exactly the region `alloc_run` allocates from (so it agrees with `format`'s initial count and
+    /// every alloc/free since). Called at mount, after journal recovery, so a drift can never persist
+    /// across a restart; the in-memory count is then maintained incrementally by alloc_run/free_run.
+    fn count_free_blocks(&self, ctx: &ServiceContext) -> Result<u64, &'static str> {
+        let mut free = 0u64;
+        let mut b = self.data_start;
+        while b < self.total_blocks {
+            let bm_blk = self.bitmap_start + b / BITS_PER_BMBLOCK;
+            let blk = self.tb_read(ctx, bm_blk).ok_or("bitmap read failed (free-count)")?;
+            let base = (b / BITS_PER_BMBLOCK) * BITS_PER_BMBLOCK;
+            let mut within = b - base;
+            while within < BITS_PER_BMBLOCK {
+                let idx = base + within;
+                if idx >= self.total_blocks { break; }
+                let used = (blk[(within / 8) as usize] >> (within % 8)) & 1 != 0;
+                if !used { free += 1; }
+                within += 1;
+            }
+            b = base + BITS_PER_BMBLOCK;
+        }
+        Ok(free)
     }
 
     /// Set/clear the bits for blocks `[first, first+count)`, one bitmap block at a time.

@@ -2842,8 +2842,16 @@ fn drain_service(ctx: &ServiceContext, svc: &str, input: Option<&[u8]>, out: &mu
         // Filter/sink: resolve the service's input endpoint (it must register) and feed it.
         match lookup_sink(ctx, svc) {
             Some(h) => {
-                let _ = ctx.send_by_handle(h, &Message::from_bytes(inp));
-                let _ = ctx.send_by_handle(h, &Message::from_bytes(&[PIPE_EOT]));
+                // Report a failed feed loudly rather than silently draining nothing (§26.7): if the
+                // filter died after registering, the user must see it, not get a silent empty result.
+                if ctx.send_by_handle(h, &Message::from_bytes(inp)).is_err()
+                    || ctx.send_by_handle(h, &Message::from_bytes(&[PIPE_EOT])).is_err()
+                {
+                    ctx.console_writeln_fmt(format_args!(
+                        "pipe: failed to send input to '{}' (it died after registering?)", svc));
+                    let _ = ctx.kill(svc);
+                    return false;
+                }
             }
             None => {
                 // Distinct, honest wording: a registration TIMEOUT (filter never became ready) is
