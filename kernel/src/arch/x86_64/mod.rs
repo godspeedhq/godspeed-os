@@ -307,9 +307,14 @@ pub fn hardware_reset() -> ! {
     // Wait for KBC input buffer empty (status bit 1 = 0).
     // SAFETY: port 0x64 is the standard keyboard controller status/command port.
     unsafe {
-        loop {
-            if inb(0x64) & 0x02 == 0 { break; }
+        // Bounded: if the KBC is wedged and never clears its input buffer, pulse the reset ANYWAY -
+        // the reset is the goal, and a stuck controller must never turn a reboot into a hang
+        // (§26.6 bounded behaviour; the hlt-spin below backstops a reset that doesn't fire).
+        let mut spins = 0u32;
+        while inb(0x64) & 0x02 != 0 {
             core::hint::spin_loop();
+            spins += 1;
+            if spins >= 1_000_000 { break; }
         }
         // 0xFE on port 0x64 pulses the CPURST# line - unconditional CPU reset.
         // SAFETY: keyboard controller command; universally supported on x86.

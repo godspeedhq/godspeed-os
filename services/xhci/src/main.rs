@@ -585,10 +585,17 @@ fn enumerate_one(
     } else {
         ctx.log("xhci: Set Configuration failed");
     }
-    let _ = control(
+    // SET_PROTOCOL: boot (wValue=0) on the HID interface. Best-effort (most keyboards default to boot
+    // mode), but log the outcome - a keyboard that needs it and didn't get it is otherwise an
+    // undiagnosable dead keyboard (§26.7).
+    if control(
         dma, mmio, dboff, ir0, slot, dev_idx, 128,
         ev_idx, ev_cycle, 0x21, 0x0B, 0, kbd_iface as u32, 0, 0,
-    ); // SET_PROTOCOL: boot (wValue=0) on the HID interface
+    ) {
+        ctx.log("xhci: Set Protocol (boot) OK");
+    } else {
+        ctx.log("xhci: Set Protocol (boot) failed - keyboard may report in non-boot mode");
+    }
 
     // Arm the interrupt transfer ring: the Link TRB closes the 16-entry ring.
     let ring_phys = dma.phys_at(int_tr_off(dev_idx));

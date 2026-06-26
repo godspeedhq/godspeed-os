@@ -63,12 +63,6 @@ static mut TASK_IS_USER: [bool; MAX_TASKS] = [false; MAX_TASKS];
 static TASK_KERNEL_STACK_TOP: [AtomicU64; MAX_TASKS] =
     [const { AtomicU64::new(0) }; MAX_TASKS];
 
-/// Per-slot restart count of the service occupying this slot - 0 on the first spawn of a name, +1 on
-/// each respawn. Set from `next_restart_count` at spawn; surfaced by `task_stat` as the `observe`/
-/// `status` RESTARTS column. u64 so it is effectively unbounded (saturating - ~580M years at 1/ms).
-static TASK_RESTART_COUNT: [AtomicU64; MAX_TASKS] =
-    [const { AtomicU64::new(0) }; MAX_TASKS];
-
 /// Per-service-NAME restart counter. The first spawn of a name yields 0; each later spawn yields the
 /// previous value + 1 (saturating at u64::MAX). Bounded to `NAME_RESTART_MAX` distinct names - past
 /// that a name is untracked (reads 0) and we say so loudly (§26.7). Transient per-command utility
@@ -508,7 +502,6 @@ pub unsafe fn commit_task(
     unsafe {
         TASK_CTX[slot].write(ctx);
         TASK_NAME[slot]             = name;
-        TASK_RESTART_COUNT[slot].store(next_restart_count(name), Ordering::Relaxed);
         TASK_SPAWN_DT[slot].store(crate::arch::x86_64::rtc::read_datetime(), Ordering::Relaxed);
         TASK_IS_USER[slot]          = is_user;
         TASK_KERNEL_STACK_TOP[slot].store(kernel_stack_top, Ordering::Relaxed);
@@ -546,7 +539,6 @@ pub fn enqueue(
                 TASK_CAP[i].write(caps);
                 TASK_STATE[i].store(TaskState::Ready as u8, Ordering::Relaxed);
                 TASK_NAME[i]             = name;
-                TASK_RESTART_COUNT[i].store(next_restart_count(name), Ordering::Relaxed);
                 TASK_SPAWN_DT[i].store(crate::arch::x86_64::rtc::read_datetime(), Ordering::Relaxed);
                 TASK_VALID[i].store(true, Ordering::Release);
                 TASK_CORE[i]             = core_id;
@@ -831,7 +823,10 @@ pub fn task_stat(slot: usize) -> TaskStatRaw {
             mem_used:    TASK_ALLOC_BYTES[slot],
             mem_limit:   TASK_LIMIT_BYTES[slot],
             name:        TASK_NAME[slot],
-            restart_count: TASK_RESTART_COUNT[slot].load(Ordering::Relaxed),
+            // DERIVED, not stored (Commandment III): the restart lineage's one truth is NAME_RESTART
+            // (the per-name counter). A live instance's count IS its name's count - so we recompute it
+            // here rather than cache a per-slot copy that could drift from the source.
+            restart_count: next_restart_count(TASK_NAME[slot]),
             queue_depth,
             run_ticks:   TASK_RUN_TICKS[slot].load(Ordering::Relaxed),
             uptime_secs: {

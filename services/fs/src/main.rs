@@ -1111,8 +1111,12 @@ impl Fs {
                 return Err("checkpoint write failed (will replay on next mount)");
             }
         }
-        // 4. Invalidate the journal (idempotent - recovery tolerates a stale commit too).
-        let _ = block_write(ctx, self.journal_start, &[0u8; BLOCK]);
+        // 4. Invalidate the journal. The checkpoint above already landed every block home, so a
+        // failure here is safe (the next mount re-replays this committed transaction idempotently) -
+        // but log it loudly rather than silently re-replaying on every future mount (§26.7).
+        if !block_write(ctx, self.journal_start, &[0u8; BLOCK]) {
+            ctx.log("fs: journal invalidation failed post-commit (txn re-replays next mount; data safe)");
+        }
         Ok(())
     }
 
@@ -1140,14 +1144,25 @@ impl Fs {
         let n = u32_at(&commit, 4) as usize;
         if n == 0 || n > TXN_CAP || 8 + n * 8 > COMMIT_CRC_OFF { return; }
         if crc32(&commit[..8 + n * 8]) != u32_at(&commit, COMMIT_CRC_OFF) { return; }
+        let mut replayed_ok = true;
         for i in 0..n {
             let lba = u64_at(&commit, 8 + i * 8);
-            if let Some(blk) = block_read(ctx, journal_start + 1 + i as u64) {
-                let _ = block_write(ctx, lba, &blk);
+            match block_read(ctx, journal_start + 1 + i as u64) {
+                Some(blk) => if !block_write(ctx, lba, &blk) { replayed_ok = false; },
+                None => replayed_ok = false,
             }
         }
-        let _ = block_write(ctx, journal_start, &[0u8; BLOCK]); // invalidate
-        ctx.log_fmt(format_args!("fs: journal recovered {} block(s) from an interrupted write", n));
+        if replayed_ok {
+            // Invalidate ONLY once every block landed home. On a replay I/O failure, leave the journal
+            // intact so the next mount re-replays (idempotent) - never clear a half-applied commit
+            // (§26.7: a silent clear here would lose a committed transaction).
+            if !block_write(ctx, journal_start, &[0u8; BLOCK]) {
+                ctx.log("fs: journal invalidation failed after recovery (re-replays next mount)");
+            }
+            ctx.log_fmt(format_args!("fs: journal recovered {} block(s) from an interrupted write", n));
+        } else {
+            ctx.log("fs: journal replay hit a block I/O error - left intact, re-replays on next mount");
+        }
     }
 
     /// Format the disk as an empty GSFS0008 sized to `capacity`, then mount. Same layout

@@ -15,8 +15,8 @@ A capability-based microkernel OS written in Rust. Every privileged action requi
   │  System Services                                 │
   │  logger  ·  block-driver  ·  fs                  │
   ├──────────────────────────────────────────────────┤
-  │  Trusted Root  (non-restartable)                 │
-  │  init  ·  supervisor  ·  registry                │
+  │  Trusted Root  (restartable; kernel respawns it) │
+  │  supervisor                                      │
   ├──────────────────────────────────────────────────┤
   │  Kernel  (mechanism, not policy)                 │
   │  memory · scheduler · ipc · capability           │
@@ -39,7 +39,7 @@ The kernel is strictly bounded: memory isolation, scheduling, IPC routing, capab
 
 **IPC** — synchronous message passing with bounded queues (16 messages per endpoint). Services are pinned to CPU cores. Cross-core sends route through the kernel's routing table and wake the receiver via IPI. Zero-copy is permanently rejected — isolation is more important.
 
-**Supervisor** — the only service with restart authority. When a service is killed, its endpoint generation is bumped. All outstanding capabilities immediately become stale. Clients detect `EndpointDead`, look up the new instance via registry, and resume. The new instance may be on a different core — that's invisible to callers.
+**Supervisor:** the service with restart authority. When a service is killed, its endpoint generation is bumped. All outstanding capabilities immediately become stale. Clients detect `EndpointDead`, look up the new instance by name via the kernel's name directory, and resume. The new instance may be on a different core, which is invisible to callers. The supervisor is itself restartable: if it dies, the **kernel respawns it** and it reconciles with the still-running services. The only unkillable component is the kernel.
 
 **Scheduler** — per-core run queues, round-robin, 10 ms preemption quantum enforced by the local timer. Services are placed at spawn and never migrate. Yield is advisory; preemption is not.
 
@@ -54,7 +54,10 @@ The kernel is strictly bounded: memory isolation, scheduling, IPC routing, capab
 | Bounded behavior | Queues, tables, memory, and messages all have fixed limits |
 | Loud failures | `EndpointDead`, `CapRevoked`, `AllocDenied` — never silent fallback |
 | Identity over location | Service names are stable; core assignments are not |
-| Restartability | Every non-TCB service must survive kill + respawn |
+| One irreducible truth | Store the minimal source; derive (and reconcile) every cache, index, or count |
+| Restartability | Every service survives kill + respawn, even the supervisor; only the kernel is unkillable |
+
+These distil into the **[Ten Commandments of Godspeed](COMMANDMENTS.md)**, the human-readable form of the constitution.
 
 ---
 
@@ -64,7 +67,7 @@ GodspeedOS treats testing as architecture. The suite is layered — each layer m
 
 | Suite | Purpose | Status |
 |-------|---------|--------|
-| Identity (20 tests) | Pin constitutional invariants | 20/20 ✅ |
+| Identity (15 tests, 24 cases) | Pin constitutional invariants | 24/24 ✅ |
 | Property (P1–P10) | Universal correctness under random inputs | Active |
 | Fuzz (F1–F8) | Kernel never panics on user-controllable input | Active |
 | Stress (S1–S10) | No drift, leaks, or corruption over time | Active |
@@ -113,11 +116,11 @@ The full `osdev` CLI reference is in `CLAUDE.md §17`.
 
 ```
 kernel/       bare-metal microkernel
-services/     system services (init, supervisor, registry, logger, ...)
+services/     system services (supervisor, logger, block-driver, fs, shell, ...)
 sdk/rust/     Rust SDK for service development
 osdev/        build / test / run tooling
 contracts/    service contracts and JSON schema
-examples/     demonstration services (ping, pong)
+examples/     demonstration services (ping, pong, greet, upper, roster)
 tests/        identity, property, fuzz, stress, chaos suites
 docs/         architecture notes and design docs
 ```
@@ -126,6 +129,6 @@ docs/         architecture notes and design docs
 
 ## Design reference
 
-The full specification — capability model, IPC semantics, scheduler rules, memory enforcement, bootstrap sequence, unsafe policy, and constitutional invariants — is in `CLAUDE.md`.
+The full specification (capability model, IPC semantics, scheduler rules, memory enforcement, bootstrap sequence, unsafe policy, and constitutional invariants) is in `CLAUDE.md`. Its human-readable distillation is **[`COMMANDMENTS.md`](COMMANDMENTS.md)**: ten laws that bound every design choice.
 
 The system is defined there first. The implementation exists to satisfy it.
