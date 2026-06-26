@@ -1562,22 +1562,28 @@ pub fn kill_task_by_slot(slot: usize) {
                     reclaimed, ep_id.0);
             }
 
+            // Stop this name resolving to the now-dead endpoint (§14.2), BEFORE freeing the id. The
+            // ORDER here is load-bearing. free_endpoint_id makes ep_id reusable, and a fresh instance
+            // on another core can immediately alloc it and re-register the SAME name to that id. If we
+            // freed first and unregistered second, this dead instance's unregister - which matches only
+            // the (now-reused) id - would clear the LIVE new entry, so the name vanishes from the
+            // directory and clients get "storage unavailable" though the service is alive (the
+            // post-max-carnage bug: the endpoint-id guard alone is NOT enough once ids are reused).
+            // Unregistering while the id is still ours, then freeing, means a reused id can never clear
+            // the new instance's entry (free is the barrier: nobody can alloc the id until after the
+            // unregister). The supervisor's reconcile then sees the name MISSING and respawns the
+            // service, instead of adopting a stale dead entry - the original reason this exists
+            // (fs/block-driver staying dead after a storm killed them while the supervisor was
+            // mid-respawn, their death-notifications lost). Normal restarts are unaffected: the service
+            // re-registers on respawn; clients briefly see a lookup miss and retry.
+            crate::ipc::names::unregister_endpoint(task_name, ep_id);
+
             // Reclaim the endpoint id itself for reuse (§14.2). Its routing entry is Dead and its
             // resource generation is bumped, so handing the id out again is safe: the next endpoint to
             // take it is seeded at a strictly higher generation (task::spawn), so a stale cap to this
             // dead endpoint still fails. Without this the id counter only climbs and a sustained
             // restart storm (`chaos max-carnage`) exhausts the [100, DELEGATED_BASE) band and panics.
             crate::ipc::free_endpoint_id(ep_id);
-
-            // Stop this name resolving to the now-dead endpoint (§14.2): unregister it from the kernel
-            // directory IF it still points here (the endpoint-id guard skips a fresh instance that
-            // already re-registered). The supervisor's reconcile then sees the name MISSING and
-            // respawns the service, instead of adopting a stale dead entry - the bug behind
-            // `fs`/`block-driver` staying dead after a storm killed them while the supervisor itself
-            // was mid-respawn (their death-notifications were lost). Normal restarts are unaffected:
-            // the service re-registers the name on respawn; clients briefly see a lookup miss and retry
-            // (same outcome as the EndpointDead they'd get from the stale entry).
-            crate::ipc::names::unregister_endpoint(task_name, ep_id);
         }
 
         // RESTART count (the observe RESTARTS column): only the restartable/managed set accrues a
