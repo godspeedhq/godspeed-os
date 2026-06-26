@@ -3946,7 +3946,13 @@ fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
             // B. kill (kill / flood-then-kill / kill-then-flood). A kill bumps the endpoint generation,
             //    so the cached flood cap is now stale - drop it so C/next round reacquires.
             if action == 0 || action == 2 || action == 3 {
-                let _ = ctx.kill(name); killed += 1; sv_killed[s] += 1; sv_floodcap[s] = None;
+                let _ = ctx.kill(name); killed += 1; sv_killed[s] += 1;
+                // The kill bumps the endpoint generation, so the cached flood cap is now stale. RECLAIM
+                // it (take + remove_cap), don't just drop the handle - else every flood-then-kill leaks
+                // a cap slot, and a long storm fills the 64-slot cap table, after which the shell can no
+                // longer mint/reacquire caps and live services read as "storage unavailable" (the
+                // post-max-carnage bug; a fresh shell works only because its table starts empty).
+                if let Some(h) = sv_floodcap[s].take() { ctx.remove_cap(h); }
             }
             // C. flood the corpse/respawn (kill-then-flood) - before the recovery wait, so it lands
             //    while the endpoint is actually dead or mid-respawn (back-pressure under restart).
@@ -3992,6 +3998,9 @@ fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
         }
     }
     ctx.console_writeln("");   // end the in-place heartbeat line before the report
+    // Reclaim any flood caps still cached (a service not killed on its last interaction), so the storm
+    // leaves the shell's cap table as it found it.
+    for c in sv_floodcap.iter_mut() { if let Some(h) = c.take() { ctx.remove_cap(h); } }
 
     // Settle so any restart-log burst drains before we print the report.
     for _ in 0..CHAOS_SETTLE_YIELDS { ctx.yield_cpu(); }
