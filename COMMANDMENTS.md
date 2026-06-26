@@ -170,7 +170,7 @@ becomes difficult to reason about.
 These Commandments were not written for style, tradition, or amusement. They were written in response
 to real bugs, real wedges, real failures, and real lessons learned while building Godspeed.
 
-Treat them seriously. Chaos certainly will.
+Treat them very seriously.
 
 ## Blessings
 
@@ -180,3 +180,5 @@ Treat them seriously. Chaos certainly will.
 * May thy contracts remain true.
 * May thy services endure failure.
 * May truth be uncovered through fire.
+
+Bankole Ogundero.
