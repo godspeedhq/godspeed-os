@@ -2785,9 +2785,13 @@ fn cmd_spawncap(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
         return Err(ShellError::Denied);
     }
     match ctx.spawn_returning_endpoint(name, 0xFFFF) {
-        Some(h) => match ctx.try_send_by_handle(h, &Message::from_bytes(&[0x01])) {
-            Ok(())  => { ctx.console_writeln_fmt(format_args!("spawncap: {} - endpoint cap acquired; send Ok", name)); Ok(()) }
-            Err(_)  => { ctx.console_writeln_fmt(format_args!("spawncap: {} - cap acquired but send failed", name)); Err(ShellError::Unknown) }
+        Some(h) => {
+            let r = ctx.try_send_by_handle(h, &Message::from_bytes(&[0x01]));
+            ctx.remove_cap(h);   // reclaim the probe endpoint cap (no leak)
+            match r {
+                Ok(())  => { ctx.console_writeln_fmt(format_args!("spawncap: {} - endpoint cap acquired; send Ok", name)); Ok(()) }
+                Err(_)  => { ctx.console_writeln_fmt(format_args!("spawncap: {} - cap acquired but send failed", name)); Err(ShellError::Unknown) }
+            }
         },
         None => {
             ctx.console_writeln_fmt(format_args!(
@@ -2844,9 +2848,13 @@ fn drain_service(ctx: &ServiceContext, svc: &str, input: Option<&[u8]>, out: &mu
             Some(h) => {
                 // Report a failed feed loudly rather than silently draining nothing (§26.7): if the
                 // filter died after registering, the user must see it, not get a silent empty result.
-                if ctx.send_by_handle(h, &Message::from_bytes(inp)).is_err()
-                    || ctx.send_by_handle(h, &Message::from_bytes(&[PIPE_EOT])).is_err()
-                {
+                let fed = ctx.send_by_handle(h, &Message::from_bytes(inp)).is_ok()
+                    && ctx.send_by_handle(h, &Message::from_bytes(&[PIPE_EOT])).is_ok();
+                // The sink cap is done after the feed (the drain reads on our OWN endpoint), so reclaim
+                // it - else every pipe leaks a cap slot and a pipe-heavy run (selfcheck) fills the
+                // 64-slot cap table, making live services look unreachable ("storage unavailable").
+                ctx.remove_cap(h);
+                if !fed {
                     ctx.console_writeln_fmt(format_args!(
                         "pipe: failed to send input to '{}' (it died after registering?)", svc));
                     let _ = ctx.kill(svc);
@@ -2859,7 +2867,7 @@ fn drain_service(ctx: &ServiceContext, svc: &str, input: Option<&[u8]>, out: &mu
                 // text ever changes on hardware, the new shell is running (§26.7 loud failure).
                 ctx.console_writeln_fmt(format_args!(
                     "pipe: '{}' never registered an input endpoint (waited ~{}s) - not a filter, or it failed to start",
-                    svc, FILTER_WAIT_TICKS / 100));
+                    svc, FILTER_WAIT_SECS));
                 let _ = ctx.kill(svc);
                 return false;
             }
@@ -3080,33 +3088,27 @@ fn pipe_write(ctx: &ServiceContext, cwd: &Cwd, arg: &str, data: &[u8]) {
 fn lookup_sink(ctx: &ServiceContext, sink: &str) -> Option<CapHandle> {
     // A freshly-spawned filter registers its input endpoint only once it actually RUNS - which on
     // real multi-core hardware is up to ~1 s after spawn (it's on another core and hasn't been
-    // scheduled yet). Retry the registry lookup until it appears, bounded by REAL time.
+    // scheduled yet). Retry until it appears, bounded by REAL wall-clock time (the RTC).
     //
-    // CRITICAL - do NOT `yield_cpu` in this wait. `CORE_TOTAL_TICKS` counts scheduler *quanta*
-    // (the timer IRQ **and** every `yield_current` - scheduler.rs), so yielding here inflates the
-    // very counter we use as the clock: 50 yields/iteration drove it past the budget in ~4 ms and
-    // the wait collapsed to nothing (the bug that bit the T630 twice - first as a yield-count wait,
-    // then as a yield-polluted tick wait). `registry_lookup` already blocks on `recv` for the
-    // registry's reply - a cooperative wait that lets the registry and the filter run and does NOT
-    // bump the tick counter (`block_and_reschedule` doesn't). So a plain retry loop is both
-    // cooperative (each iteration deschedules on the IPC) and real-time-bounded: with no yields the
-    // counter advances ~only on the 100 Hz timer IRQ - a true wall-clock.
-    // Path C (Phase 4): resolve the sink via the kernel name-directory (SEND|GRANT, so the cap can
-    // be delegated to the producer) instead of the registry service. The directory is populated
-    // synchronously at the sink's spawn, so this normally succeeds on the first iteration; the
-    // bounded wall-clock retry stays as a guard for the rare not-yet-scheduled case.
-    let core  = ctx.core_id();
-    let start = ctx.inspect_core_total_ticks(core);
+    // Use the RTC, NOT `inspect_core_total_ticks`. CORE_TOTAL_TICKS is a scheduler-quanta counter,
+    // not a clock: after a storm (chaos max-carnage) it advanced ~100x slower than wall-time, so a
+    // "~5 s" tick budget actually ran for ~8 minutes (the T630 selfcheck stall). The RTC is a true
+    // clock and immune to scheduler weirdness, so we also `yield_cpu` cooperatively while waiting.
+    // Path C (Phase 4): the sink resolves via the kernel name-directory (SEND|GRANT, so the cap can
+    // be delegated to the producer); it is populated synchronously at the sink's spawn, so this
+    // normally succeeds on the first iteration - the bounded wait is just a guard.
+    let t0 = ctx.datetime().epoch_secs();
     loop {
         if let Some(h) = ctx.acquire_send_grant_cap(sink) { return Some(h); }
-        if ctx.inspect_core_total_ticks(core).wrapping_sub(start) >= FILTER_WAIT_TICKS { return None; }
+        if ctx.datetime().epoch_secs() - t0 >= FILTER_WAIT_SECS { return None; }
+        ctx.yield_cpu();
     }
 }
 
 /// How long `lookup_sink` waits (in 10 ms timer ticks, §9.1) for a freshly-spawned filter to
 /// register its input endpoint. ~5 s - comfortably over the observed worst-case first-run latency
 /// (~1 s) on the T630 under selfcheck load, with margin.
-const FILTER_WAIT_TICKS: u64 = 500;
+const FILTER_WAIT_SECS: i64 = 5;
 
 fn cmd_kill(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     if is_core_service(name) {
@@ -3452,7 +3454,7 @@ fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
             // The flood killed the service (or it had already died). Record it and reacquire the
             // respawned instance for the next round.
             if died_at.is_none() { died_at = Some(r as u32 + 1); }
-            if let Some(nh) = ctx.acquire_send_cap(svc) { handle = nh; }
+            if let Some(nh) = ctx.acquire_send_cap(svc) { ctx.remove_cap(handle); handle = nh; }
             continue;
         }
         // 3. Responsive? a send should land now that the queue has drained. EndpointDead = it died.
@@ -3460,7 +3462,7 @@ fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
             Ok(()) | Err(IpcError::QueueFull) => { ok_r[r] = true; survived += 1; }
             Err(IpcError::EndpointDead)       => {
                 if died_at.is_none() { died_at = Some(r as u32 + 1); }
-                if let Some(nh) = ctx.acquire_send_cap(svc) { handle = nh; }
+                if let Some(nh) = ctx.acquire_send_cap(svc) { ctx.remove_cap(handle); handle = nh; }
             }
             Err(_)                            => {}
         }
@@ -3484,9 +3486,14 @@ fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
     }
     // Final responsiveness check: is the service still accepting after the whole storm?
     let final_alive = match ctx.acquire_send_cap(svc) {
-        Some(fh) => !matches!(ctx.try_send_by_handle(fh, &msg), Err(IpcError::EndpointDead)),
+        Some(fh) => {
+            let alive = !matches!(ctx.try_send_by_handle(fh, &msg), Err(IpcError::EndpointDead));
+            ctx.remove_cap(fh);   // reclaim the probe cap
+            alive
+        }
         None     => false,
     };
+    ctx.remove_cap(handle);   // reclaim the flood handle before returning (no leak across calls)
     let _ = writeln!(rb, "survived: {}/{}; final responsive: {}; kernel: alive (no panic - this command returned)",
                      survived, rounds, if final_alive { "yes" } else { "no" });
     if let Some(d) = died_at {
@@ -3737,7 +3744,10 @@ fn carnage_flood(ctx: &ServiceContext, name: &str, cache: &mut Option<CapHandle>
         match ctx.try_send_by_handle(h, &msg) {
             Ok(())                      => sent += 1,
             Err(IpcError::QueueFull)    => { sat  = true; break; }
-            Err(IpcError::EndpointDead) => { died = true; *cache = None; break; }
+            // The target died: reclaim the now-dead cap BEFORE clearing the cache, else every
+            // service-death-during-flood leaks a slot and a long max-carnage fills the 64-slot cap
+            // table (the post-storm "storage unavailable" bug). The next call re-acquires a fresh cap.
+            Err(IpcError::EndpointDead) => { died = true; ctx.remove_cap(h); *cache = None; break; }
             Err(_)                      => break,
         }
     }
@@ -3936,7 +3946,13 @@ fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
             // B. kill (kill / flood-then-kill / kill-then-flood). A kill bumps the endpoint generation,
             //    so the cached flood cap is now stale - drop it so C/next round reacquires.
             if action == 0 || action == 2 || action == 3 {
-                let _ = ctx.kill(name); killed += 1; sv_killed[s] += 1; sv_floodcap[s] = None;
+                let _ = ctx.kill(name); killed += 1; sv_killed[s] += 1;
+                // The kill bumps the endpoint generation, so the cached flood cap is now stale. RECLAIM
+                // it (take + remove_cap), don't just drop the handle - else every flood-then-kill leaks
+                // a cap slot, and a long storm fills the 64-slot cap table, after which the shell can no
+                // longer mint/reacquire caps and live services read as "storage unavailable" (the
+                // post-max-carnage bug; a fresh shell works only because its table starts empty).
+                if let Some(h) = sv_floodcap[s].take() { ctx.remove_cap(h); }
             }
             // C. flood the corpse/respawn (kill-then-flood) - before the recovery wait, so it lands
             //    while the endpoint is actually dead or mid-respawn (back-pressure under restart).
@@ -3982,6 +3998,9 @@ fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
         }
     }
     ctx.console_writeln("");   // end the in-place heartbeat line before the report
+    // Reclaim any flood caps still cached (a service not killed on its last interaction), so the storm
+    // leaves the shell's cap table as it found it.
+    for c in sv_floodcap.iter_mut() { if let Some(h) = c.take() { ctx.remove_cap(h); } }
 
     // Settle so any restart-log burst drains before we print the report.
     for _ in 0..CHAOS_SETTLE_YIELDS { ctx.yield_cpu(); }
