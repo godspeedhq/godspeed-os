@@ -26,6 +26,9 @@ unsafe impl<T: Send> Sync for SpinLock<T> {}
 
 pub struct SpinLockGuard<'a, T> {
     lock: &'a SpinLock<T>,
+    /// True only for a guard from `lock_irq`: interrupts were enabled and were masked for the hold,
+    /// so they must be re-enabled on drop. `lock`/`try_lock` leave this false (they don't touch IF).
+    irq_restore: bool,
 }
 
 impl<T> SpinLock<T> {
@@ -56,7 +59,32 @@ impl<T> SpinLock<T> {
         {
             core::hint::spin_loop();
         }
-        SpinLockGuard { lock: self }
+        SpinLockGuard { lock: self, irq_restore: false }
+    }
+
+    /// Interrupt-safe acquire: mask interrupts for the whole hold (restored on guard drop). REQUIRED
+    /// for a lock ALSO taken in interrupt context on the same core (the §contract in
+    /// `without_interrupts`) - without it a task preempted mid-hold leaves the lock held by an
+    /// un-reschedulable holder, which then deadlocks the supervisor respawn (it pins Core 0). All
+    /// acquisitions of such a lock must use `lock_irq`, so no holder is ever preemptible. Nests
+    /// correctly: a nested acquire captures IF=0 and skips the re-enable.
+    #[inline]
+    pub fn lock_irq(&self) -> SpinLockGuard<'_, T> {
+        // SAFETY: reading RFLAGS + cli are local-core, no memory effects; the prior IF (bit 9) is
+        // captured and restored exactly on drop. Disable BEFORE spinning so the hold is never preempted.
+        let was_enabled = unsafe {
+            let rflags: u64;
+            core::arch::asm!("pushfq; pop {}", out(reg) rflags, options(nostack));
+            core::arch::asm!("cli", options(nomem, nostack));
+            (rflags & (1 << 9)) != 0
+        };
+        while self.locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        SpinLockGuard { lock: self, irq_restore: was_enabled }
     }
 
     #[inline]
@@ -65,7 +93,7 @@ impl<T> SpinLock<T> {
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
-            Some(SpinLockGuard { lock: self })
+            Some(SpinLockGuard { lock: self, irq_restore: false })
         } else {
             None
         }
@@ -118,5 +146,9 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
 impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.locked.store(false, Ordering::Release);
+        if self.irq_restore {
+            // SAFETY: restore the prior (enabled) interrupt state that lock_irq masked.
+            unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+        }
     }
 }

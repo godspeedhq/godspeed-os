@@ -91,7 +91,7 @@ pub fn init() {
 /// Dead entries are recycled, so kill + respawn of a service does not exhaust
 /// the table.
 pub fn register(id: EndpointId, core_id: u32, generation: Generation) {
-    let mut table = TABLE.lock();
+    let mut table = TABLE.lock_irq();
     // Endpoint ids are reclaimed and reused (ipc::free_endpoint_id, §14.2). Prefer THIS id's own
     // (now-dead) entry, so a reused id overwrites its old slot instead of creating a *second* entry
     // with the same id - `find_index` returns the first match, so a duplicate would be ambiguous.
@@ -119,7 +119,7 @@ pub fn register(id: EndpointId, core_id: u32, generation: Generation) {
 ///
 /// Used by InspectKernel query 1 (P5 property test - §8.3).
 pub fn count_live_endpoints() -> u32 {
-    let table = TABLE.lock();
+    let table = TABLE.lock_irq();
     table.iter()
         .filter(|e| e.valid && e.liveness == EndpointLiveness::Alive)
         .count() as u32
@@ -130,7 +130,7 @@ pub fn count_live_endpoints() -> u32 {
 /// Used by `spawn_service_with_config` to seed the new endpoint's generation from the
 /// killed endpoint's bumped generation, ensuring monotonicity across kill/respawn (P2, §7.5).
 pub fn get_generation(id: EndpointId) -> Generation {
-    let table = TABLE.lock();
+    let table = TABLE.lock_irq();
     table.iter()
         .find(|e| e.valid && e.id == id)
         .map(|e| e.generation)
@@ -156,7 +156,7 @@ pub fn enqueue(
     cap_gen: Generation,
     blocked_sender_slot: Option<usize>,
 ) -> Result<Option<usize>, IpcError> {
-    let mut table = TABLE.lock();
+    let mut table = TABLE.lock_irq();
     enqueue_locked(&mut *table, endpoint, msg, cap_gen, blocked_sender_slot)
 }
 
@@ -209,7 +209,7 @@ pub fn dequeue(
     cap_gen: Generation,
     blocked_receiver_slot: Option<usize>,
 ) -> Result<(Message, Option<usize>), IpcError> {
-    let mut table = TABLE.lock();
+    let mut table = TABLE.lock_irq();
     dequeue_locked(&mut *table, endpoint, cap_gen, blocked_receiver_slot)
 }
 
@@ -256,7 +256,7 @@ fn dequeue_locked(
 /// Returns the blocked receiver slot if a task was waiting on `recv`, so the
 /// caller can call `scheduler::wake_by_slot` (which handles the cross-core IPI).
 pub fn enqueue_from_interrupt(endpoint: EndpointId, msg: Message) -> Option<usize> {
-    let mut table = TABLE.lock();
+    let mut table = TABLE.lock_irq();
     let idx = find_index(&*table, endpoint)?;
 
     if table[idx].liveness == EndpointLiveness::Dead {
@@ -276,13 +276,13 @@ pub fn enqueue_from_interrupt(endpoint: EndpointId, msg: Message) -> Option<usiz
 ///
 /// Used by `invariants::assertions::assert_tcb_alive` (§6.2).
 pub fn is_endpoint_alive(endpoint: EndpointId) -> bool {
-    let table = TABLE.lock();
+    let table = TABLE.lock_irq();
     table.iter().any(|e| e.valid && e.id == endpoint && e.liveness == EndpointLiveness::Alive)
 }
 
 /// Return the current queue depth for `endpoint`, or 0 if not found.
 pub fn endpoint_queue_depth(endpoint: EndpointId) -> u8 {
-    let table = TABLE.lock();
+    let table = TABLE.lock_irq();
     table.iter()
         .find(|e| e.valid && e.id == endpoint)
         .map(|e| e.queue.depth() as u8)
@@ -294,7 +294,7 @@ pub fn endpoint_queue_depth(endpoint: EndpointId) -> u8 {
 /// Returns `(blocked_receiver_slot, blocked_sender_slot)` - the caller must
 /// wake both (if `Some`) with `EndpointDead` via `scheduler::wake_by_slot`.
 pub fn kill_endpoint(endpoint: EndpointId) -> (Option<usize>, Option<usize>) {
-    let mut table = TABLE.lock();
+    let mut table = TABLE.lock_irq();
     let idx = match find_index(&*table, endpoint) {
         Some(i) => i,
         None    => return (None, None),

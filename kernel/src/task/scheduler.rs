@@ -106,7 +106,7 @@ fn next_restart_count(name: &'static str) -> u64 {
     if name.is_empty() {
         return 0;
     }
-    let tbl = NAME_RESTART.lock();
+    let tbl = NAME_RESTART.lock_irq();
     for i in 0..tbl.len {
         if tbl.entries[i].name == name {
             return tbl.entries[i].count;
@@ -124,7 +124,7 @@ fn bump_name_restart(name: &'static str) {
     if name.is_empty() {
         return;
     }
-    let mut tbl = NAME_RESTART.lock();
+    let mut tbl = NAME_RESTART.lock_irq();
     for i in 0..tbl.len {
         if tbl.entries[i].name == name {
             tbl.entries[i].count = tbl.entries[i].count.saturating_add(1);
@@ -432,22 +432,27 @@ fn task_slot_unlock() {
 ///
 /// Returns `None` if all slots are occupied.
 pub fn reserve_task_slot(core_id: u32) -> Option<usize> {
-    task_slot_lock();
-    // SAFETY: lock held; exclusive access to TASK_VALID/TASK_CORE across all cores.
-    let result = unsafe {
-        let mut found = None;
-        for i in 0..MAX_TASKS {
-            if !TASK_VALID[i].load(Ordering::Relaxed) {
-                TASK_VALID[i].store(true, Ordering::Release);
-                TASK_CORE[i]  = core_id;
-                found = Some(i);
-                break;
+    // IRQ-safe: TASK_SLOT_LOCKED is also taken from the kill path (which runs in the timer ISR), so the
+    // hold must mask interrupts - else a task preempted mid-reserve holds it and the pinned supervisor
+    // respawn deadlocks reserving its own slot. without_interrupts is a safe smp/ call (no task/ unsafe).
+    crate::smp::without_interrupts(|| {
+        task_slot_lock();
+        // SAFETY: lock held; exclusive access to TASK_VALID/TASK_CORE across all cores.
+        let result = unsafe {
+            let mut found = None;
+            for i in 0..MAX_TASKS {
+                if !TASK_VALID[i].load(Ordering::Relaxed) {
+                    TASK_VALID[i].store(true, Ordering::Release);
+                    TASK_CORE[i]  = core_id;
+                    found = Some(i);
+                    break;
+                }
             }
-        }
-        found
-    };
-    task_slot_unlock();
-    result
+            found
+        };
+        task_slot_unlock();
+        result
+    })
 }
 
 /// Initialise the CapTable for a reserved slot **in-place in BSS** and return
@@ -478,9 +483,12 @@ pub unsafe fn task_cap_init_empty(slot: usize) -> &'static mut CapTable {
 
 /// Release a previously-reserved slot without committing (called on spawn error).
 pub fn release_task_slot(slot: usize) {
-    task_slot_lock();
-    TASK_VALID[slot].store(false, Ordering::Release);
-    task_slot_unlock();
+    // IRQ-safe: see reserve_task_slot (TASK_SLOT_LOCKED is also taken in the timer ISR's kill path).
+    crate::smp::without_interrupts(|| {
+        task_slot_lock();
+        TASK_VALID[slot].store(false, Ordering::Release);
+        task_slot_unlock();
+    });
 }
 
 /// Finalise a reserved task slot: write context + metadata and mark Ready.
