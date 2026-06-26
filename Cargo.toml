@@ -5,6 +5,7 @@ members = [
     "services/supervisor",
     "services/logger",
     "services/mem-hog",
+    "services/chaos",
     "services/block-driver",
     "services/fs",
     "sdk/rust",

@@ -368,6 +368,22 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
+        // chaos: the spawn-on-demand system-stress orchestrator for `chaos max-carnage`. It kills +
+        // floods other services and is the one program a run never kills (it excludes ITSELF). Holds
+        // SERVICE_CONTROL (kill), INTROSPECT (task_stat victim selection), ACQUIRE_ANY (flood), SPAWN
+        // (mem-hog spawn-burst), CONSOLE_READ (q-poll + the foreground claim, syscall 40), LOG_WRITE
+        // (the TUI, via ConsoleWrite). Excluded from auto-spawn; the shell spawns it by name on demand.
+        "chaos" => Some(("chaos", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_CHAOS_ELF")),
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    0,
+            probe_mode:        0,
+            memory_limit:      8 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  true,
+        })),
         "ping" => Some(("ping", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PING_ELF")),
             has_recv_endpoint: true,
@@ -3040,6 +3056,7 @@ fn spawn_service_with_config(
     let mut spawn_slot_u32 = u32::MAX;
     if name == "supervisor"            // init removed (Path C / Phase 5) - supervisor is the spawner
         || name == "shell"
+        || name == "chaos"             // spawns mem-hogs for the spawn-burst dimension of max-carnage
         || core::ptr::eq(elf_bytes.as_ptr(), PROBE_ELF.as_ptr())
     {
         let sp_slot = caps.insert(mint_cap(SPAWN_RESOURCE, Rights::WRITE))
@@ -3123,6 +3140,7 @@ fn spawn_service_with_config(
     // query 2). Self-state (own alloc bytes) and the TSC stay ungated, so every
     // other service needs nothing. No slot is stored - the gate scans holdings.
     if name == "shell"
+        || name == "chaos"             // task_stat: victim selection + recovery checks in max-carnage
         || name.starts_with("observe") // observe + observe-now (and future modes)
         || name.starts_with("prop-")
         || name.starts_with("stress-")
@@ -3139,6 +3157,7 @@ fn spawn_service_with_config(
     // (elf_bytes == PROBE_ELF) so no probe family is missed by name.
     if name == "shell"
         || name == "supervisor"
+        || name == "chaos"             // kills victim services (the whole point of max-carnage)
         || core::ptr::eq(elf_bytes.as_ptr(), PROBE_ELF.as_ptr())
     {
         let sc_cap = mint_cap(SERVICE_CONTROL_RESOURCE, Rights::WRITE);
@@ -3171,7 +3190,7 @@ fn spawn_service_with_config(
     // ambient send authority. Probes are matched by ELF identity so no probe family is missed.
     // `adv-a13` is the §22 Test A13 negative pin: it is deliberately EXCLUDED so it holds no
     // ACQUIRE_ANY (and declares no send-peers), proving AcquireSendCap denies a non-holder.
-    if name == "shell" || name == "supervisor"
+    if name == "shell" || name == "supervisor" || name == "chaos"  // chaos floods arbitrary services by name
         || (core::ptr::eq(elf_bytes.as_ptr(), PROBE_ELF.as_ptr()) && name != "adv-a13")
     {
         let aa_cap = mint_cap(ACQUIRE_ANY_RESOURCE, Rights::WRITE);

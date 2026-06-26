@@ -34,6 +34,7 @@ fn main() {
         ("SUPERVISOR", "supervisor"),  // init removed (Phase 5); registry retired (Phase 4)
         ("LOGGER",     "logger"),
         ("MEM_HOG",    "mem-hog"),
+        ("CHAOS",      "chaos"),
         ("PING",       "ping"),
         ("PONG",       "pong"),
         ("GREET",      "greet"),
