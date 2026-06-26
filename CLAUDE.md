@@ -62,6 +62,8 @@ When this document and the code disagree, the document wins and the code is wron
 
 The appendices at the end of this document collect forward-looking design notes. Appendix A documents a v1 commitment (the bootloader choice). Appendices B, C, and D are explicitly non-normative — they record design intent and discussion, not commitments. Their content does not amend the constitution.
 
+This constitution has a human-readable distillation: `COMMANDMENTS.md`, the **Ten Commandments of Godspeed**. Each commandment is grounded in the invariants and sections it enforces here. Where a commandment and this document disagree, this document is the law and the commandment is amended to match (it is the distillation, not the source).
+
 ---
 
 ## 2. Project Identity
@@ -2479,6 +2481,8 @@ The system should always make it possible to answer:
 - and what recovery obligations now exist.
 
 If those questions become difficult to answer, the abstraction is too opaque.
+
+**Visible caching is not silent complexity.** The rejection above is of *invisible* caches: ones that can drift and lie with no way to tell. A derived view (a cache, index, or precomputed count) is legitimate when it reduces to a single **irreducible** source, is **reconciled** when it drifts (a repair path rebuilds it from that source), and is **subordinate** (the source wins; the view is never authoritative). The free **bitmap** and free **count** of `fs` are exactly such views of the file tree: stored, but not a second truth. The line this section draws is between a *visible, reconcilable* derived view (allowed) and a *hidden, unreconcilable* one (rejected). This is Commandment III (`COMMANDMENTS.md`); see also §3.8 and §3.9 / Invariant 9.
 
 ---
 
