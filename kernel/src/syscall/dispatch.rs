@@ -68,6 +68,7 @@ pub enum SyscallNumber {
     Sleep               = 37,
     SpawnReturningEndpoint = 38,
     SpawnWithCaps          = 39,
+    ConsoleForeground      = 40,
 }
 
 /// Raw syscall dispatcher - called from the SYSCALL/SYSENTER IDT stub.
@@ -119,6 +120,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::ConsoleWrite  as u64 => handle_console_write(arg0, arg1, arg2),
         n if n == SyscallNumber::TryConsoleRead as u64 => handle_try_console_read(arg0),
         n if n == SyscallNumber::ConsoleEcho   as u64 => handle_console_echo(arg0, arg1),
+        n if n == SyscallNumber::ConsoleForeground as u64 => handle_console_foreground(arg0, arg1),
         n if n == SyscallNumber::ConsoleBootComplete as u64 => handle_console_boot_complete(arg0),
         n if n == SyscallNumber::SignalInputReady as u64 => handle_signal_input_ready(arg0),
         n if n == SyscallNumber::TaskCaps as u64 => handle_task_caps(arg0, arg1, arg2),
@@ -1352,10 +1354,45 @@ fn handle_try_console_read(cap_slot: u64) -> i64 {
     if cap.resource_id != CONSOLE_READ_RESOURCE {
         return cap_err_to_i64(CapError::CapWrongScope);
     }
+    // Console foreground exclusivity: while another task owns the foreground (e.g. the `chaos`
+    // service running its TUI), a poll from any OTHER task reads empty - so a resurrected shell
+    // cannot swallow the foreground app's `q`. Unclaimed (the normal state) allows everyone, so
+    // ordinary shell input is unchanged.
+    if !crate::arch::x86_64::console_foreground_allows(scheduler::current_task_slot() as u32) {
+        return NO_CONSOLE_BYTE;
+    }
     match crate::arch::x86_64::uart_rx_pop() {
         Some(b) => b as i64,
         None    => NO_CONSOLE_BYTE,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Syscall: ConsoleForeground (40) - claim/release exclusive console input.
+// ---------------------------------------------------------------------------
+
+/// Claim (`op == 1`) or release (`op == 0`) exclusive console input for the calling
+/// task. While claimed, only this task's console polls return bytes; every other task
+/// reads empty (see `handle_try_console_read`). The reusable primitive behind the
+/// `chaos` TUI owning the keyboard while it kills and resurrects the shell, and a
+/// future foreground/TUI switcher. Gated by CONSOLE_READ (only a task that may consume
+/// the keyboard may seize it exclusively). Returns 0 on success.
+fn handle_console_foreground(cap_slot: u64, op: u64) -> i64 {
+    use crate::capability::CONSOLE_READ_RESOURCE;
+
+    let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::READ) {
+        Ok(c)  => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    if cap.resource_id != CONSOLE_READ_RESOURCE {
+        return cap_err_to_i64(CapError::CapWrongScope);
+    }
+    if op == 0 {
+        crate::arch::x86_64::release_console_foreground();
+    } else {
+        crate::arch::x86_64::claim_console_foreground(scheduler::current_task_slot() as u32);
+    }
+    0
 }
 
 // ---------------------------------------------------------------------------

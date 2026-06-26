@@ -559,6 +559,42 @@ pub fn set_console_echo(on: bool) {
     CONSOLE_ECHO_ENABLED.store(on, core::sync::atomic::Ordering::Release);
 }
 
+/// The task slot that currently owns console input (keyboard) **exclusively**, or
+/// `u32::MAX` for "unclaimed" - the normal state, in which any task holding the
+/// CONSOLE_READ cap may read (today's behaviour, no regression). A full-screen
+/// foreground app (e.g. the chaos runner) claims it for the duration of a run so
+/// that input goes to exactly one task: while it is claimed, a console read from
+/// any OTHER task returns empty. This is the kernel half of console foreground
+/// ownership - the reusable primitive behind chaos's q-to-quit (the shell becomes
+/// a chaos target without stealing the runner's keystrokes) and, later, a TUI
+/// switcher. Echo suppression (CONSOLE_ECHO_ENABLED) already exists for the
+/// paint-yourself half; this adds the missing exclusivity.
+pub static CONSOLE_FOREGROUND: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Claim exclusive console input for `task_slot`. After this, only that task's
+/// console reads return bytes; every other task reads empty. Gated upstream by the
+/// CONSOLE_READ cap (the `ConsoleForeground` syscall).
+pub fn claim_console_foreground(task_slot: u32) {
+    CONSOLE_FOREGROUND.store(task_slot, core::sync::atomic::Ordering::Release);
+}
+
+/// Release exclusive console input back to the unclaimed state (any CONSOLE_READ
+/// holder may read again). Idempotent; the runner calls it on finish or `q`,
+/// after it has ensured a live shell exists to hand control back to.
+pub fn release_console_foreground() {
+    CONSOLE_FOREGROUND.store(u32::MAX, core::sync::atomic::Ordering::Release);
+}
+
+/// Whether `task_slot` may currently read console input: true if foreground is
+/// unclaimed (normal) or this task is the claimant; false if another task holds it.
+/// The single gate consulted by both console-read syscalls and the is-foreground
+/// query.
+pub fn console_foreground_allows(task_slot: u32) -> bool {
+    let owner = CONSOLE_FOREGROUND.load(core::sync::atomic::Ordering::Acquire);
+    owner == u32::MAX || owner == task_slot
+}
+
 /// Whether boot-time **log** output is also mirrored to the framebuffer (TV).
 /// True during boot so the user sees the init sequence on the display; the shell
 /// flips it false on the first keystroke and clears the screen, leaving a clean

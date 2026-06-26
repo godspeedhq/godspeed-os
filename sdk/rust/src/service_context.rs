@@ -1052,6 +1052,31 @@ impl ServiceContext {
         let _ = unsafe { raw_syscall(26, slot as u64, 0, 0) };
     }
 
+    /// Claim exclusive console input (syscall 40, op = 1): after this, only THIS task's
+    /// `try_console_read` returns bytes; every other task reads empty. The `chaos` service
+    /// claims it for the duration of a run so a resurrected shell cannot swallow its
+    /// `q`-to-quit. Pair with `release_console_foreground` on exit, after ensuring a live
+    /// shell exists to hand the keyboard back to. Requires the CONSOLE_READ cap.
+    pub fn claim_console_foreground(&self) {
+        let data = Self::ctx();
+        if data.magic != SERVICE_CTX_MAGIC { return; }
+        let slot = data.console_read_slot;
+        if slot == u32::MAX { return; }
+        // SAFETY: syscall(40) = ConsoleForeground; op 1 = claim; slot is kernel-written cap index.
+        let _ = unsafe { raw_syscall(40, slot as u64, 1, 0) };
+    }
+
+    /// Release exclusive console input (syscall 40, op = 0) back to the unclaimed state, so
+    /// any CONSOLE_READ holder (the shell) reads normally again. Idempotent.
+    pub fn release_console_foreground(&self) {
+        let data = Self::ctx();
+        if data.magic != SERVICE_CTX_MAGIC { return; }
+        let slot = data.console_read_slot;
+        if slot == u32::MAX { return; }
+        // SAFETY: syscall(40) = ConsoleForeground; op 0 = release; slot is kernel-written cap index.
+        let _ = unsafe { raw_syscall(40, slot as u64, 0, 0) };
+    }
+
     /// Return the core this service was spawned on.
     pub fn core_id(&self) -> u32 { Self::ctx().core_id }
 
