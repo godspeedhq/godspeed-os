@@ -211,6 +211,10 @@ struct Fs {
     root_first_block: u64,
     root_block_count: u64,
     free_blocks: u64,
+    /// Whether `free_blocks` has been derived from the bitmap yet (Commandment III — derived lazily,
+    /// never trusted from a persisted copy). False from mount until the first `ensure_free_count`;
+    /// the incremental alloc/free updates apply only once it is true.
+    free_known: bool,
     flags: u32,
     label: [u8; LABEL_MAX],
     label_len: u8,
@@ -284,8 +288,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut fs: Option<Fs> = match Fs::mount(&ctx) {
         Ok(f) => {
             ctx.log_fmt(format_args!(
-                "fs: mounted GSFS0008 ({} blocks, bitmap {}..{}, root@{}, {} free)",
-                f.total_blocks, f.bitmap_start, f.data_start, f.root_first_block, f.free_blocks
+                "fs: mounted GSFS0008 ({} blocks, bitmap {}..{}, root@{}, free count derived on demand)",
+                f.total_blocks, f.bitmap_start, f.data_start, f.root_first_block
             ));
             Some(f)
         }
@@ -628,6 +632,10 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
             out[2..10].copy_from_slice(&capacity.to_le_bytes());
             if let Some(f) = vol {
                 out[1] = 1;
+                // Derive the free count on demand (Commandment III, lazy). At interactive `drives` time
+                // block-driver is up, so this succeeds; if it can't (transiently down) the count is
+                // simply not-yet-known and is reported once a later query can read the bitmap.
+                f.ensure_free_count(ctx);
                 let used = f.total_blocks.saturating_sub(f.free_blocks);
                 out[10..18].copy_from_slice(&f.total_blocks.to_le_bytes());
                 out[18..26].copy_from_slice(&used.to_le_bytes());
@@ -979,7 +987,7 @@ impl Fs {
         let mut label = [0u8; LABEL_MAX];
         let ll = (sb[76] as usize).min(LABEL_MAX);
         label[..ll].copy_from_slice(&sb[77..77 + ll]);
-        let mut fs = Fs {
+        let fs = Fs {
             total_blocks: u64_at(&sb, 16),
             bitmap_start: u64_at(&sb, 24),
             data_start: u64_at(&sb, 40),
@@ -987,7 +995,11 @@ impl Fs {
             journal_blocks: u64_at(&sb, 116),
             root_first_block: u64_at(&sb, 48),
             root_block_count: u64_at(&sb, 56),
-            free_blocks: 0, // derived from the bitmap below — Commandment III (sb[64] is not trusted)
+            free_blocks: 0,
+            // Derived LAZILY from the bitmap on first use (ensure_free_count) — Commandment III: the
+            // bitmap is the one truth; sb[64] is not trusted. Deferring the scan keeps mount fast and
+            // robust to a transient block-driver outage (a free-count read never fails the mount).
+            free_known: false,
             flags: u32_at(&sb, 72),
             label,
             label_len: ll as u8,
@@ -1003,10 +1015,6 @@ impl Fs {
             crash_after_commit: false,
             open_files: [OpenFile { rid: 0, plen: 0, path: [0u8; OPEN_PATH_MAX] }; MAX_OPEN],
         };
-        // Commandment III: derive the free count from the bitmap (the one truth for which blocks are
-        // free) rather than the persisted sb[64], which could drift and lie. Re-derived every mount,
-        // after the journal recovery above, so a drifted count can never persist across a restart.
-        fs.free_blocks = fs.count_free_blocks(ctx)?;
         Ok(fs)
     }
 
@@ -1316,7 +1324,7 @@ impl Fs {
                     if run_len == n {
                         let start = run_start.unwrap();
                         self.bm_set_range(ctx, start, n, true)?;
-                        self.free_blocks = self.free_blocks.saturating_sub(n);
+                        if self.free_known { self.free_blocks = self.free_blocks.saturating_sub(n); }
                         self.persist_super(ctx)?;
                         return Ok(start);
                     }
@@ -1331,7 +1339,7 @@ impl Fs {
     fn free_run(&mut self, ctx: &ServiceContext, first: u64, count: u64) -> Result<(), &'static str> {
         if count == 0 { return Ok(()); }
         self.bm_set_range(ctx, first, count, false)?;
-        self.free_blocks += count;
+        if self.free_known { self.free_blocks += count; }
         self.persist_super(ctx)
     }
 
@@ -1359,6 +1367,18 @@ impl Fs {
             b = base + BITS_PER_BMBLOCK;
         }
         Ok(free)
+    }
+
+    /// Ensure `free_blocks` is known, deriving it from the bitmap on first use (Commandment III — the
+    /// count is derived, never trusted from a persisted copy). Returns false if the derive can't run
+    /// (block-driver transiently down); callers then show a deferred count rather than failing. Cheap
+    /// once known — the incremental alloc/free updates keep it current after this.
+    fn ensure_free_count(&mut self, ctx: &ServiceContext) -> bool {
+        if self.free_known { return true; }
+        match self.count_free_blocks(ctx) {
+            Ok(c) => { self.free_blocks = c; self.free_known = true; true }
+            Err(_) => false,
+        }
     }
 
     /// Set/clear the bits for blocks `[first, first+count)`, one bitmap block at a time.
@@ -1475,7 +1495,7 @@ impl Fs {
             need -= take;
             from = start + len;
         }
-        self.free_blocks = self.free_blocks.saturating_sub(blocks);
+        if self.free_known { self.free_blocks = self.free_blocks.saturating_sub(blocks); }
         self.persist_super(ctx)?;
         Ok(n)
     }
@@ -2092,6 +2112,7 @@ impl Fs {
         // Recompute the free count from what the tree actually uses, and persist BOTH superblock
         // copies (heals a drifted free count + refreshes the backup).
         self.free_blocks = self.total_blocks - st.3;
+        self.free_known = true; // fsck recomputed it from the tree
         self.persist_super(ctx)?;
         Ok((st.0, st.1, st.2, st.3))
     }
