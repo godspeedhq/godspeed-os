@@ -39,16 +39,25 @@ If Chaos finds a bug, **the bug already existed.** Treat Chaos as your teacher, 
 
 ---
 
-### III. Thou shalt not duplicate truth. Store facts. Derive the rest.
+### III. Thou shalt not duplicate truth. Store irreducible facts. Derive the rest.
 
-Truth must exist in exactly one place. Everything else is derived from it. Duplicated truth
-eventually diverges, producing inconsistency, needless complexity, and subtle bugs.
+There must be exactly one **irreducible** source of truth — the minimal state from which everything
+else can be reconstructed, and which cannot itself be reduced to anything smaller. Everything else is
+a **derived view** of it.
 
-Store only what is necessary. Derive everything else. A counter that can be recomputed is not a
-fact; a cache that can drift is a second truth waiting to lie.
+This is not a ban on caches, indexes, or precomputed counts. A derived view may be stored, and may
+even drift, **provided** it is **reconstructible** from the source, **reconciled** when it drifts (a
+repair path rebuilds it from the source), and **subordinate** — on any disagreement the source wins;
+the view is never authoritative. A filesystem's free **bitmap** is a stored index of its file tree
+(`fsck` rebuilds it from the tree); the free **count** is a stored index of the bitmap. Neither is a
+second truth — both reduce to the tree.
 
-> *Grounded in:* §3.8 (state must be explicit and owned), §3.9 / Invariant 9 (no unowned global
-> mutable state; immutable globals are fine), §26.4 (no invisible caching layers).
+What is forbidden is a **second irreducible truth**: two stored facts that can diverge with no way to
+decide which is right, or trusting a derived view *as if* it were the source. The test is not "is it
+stored?" nor "can it drift?" — it is **"does it reduce to one source, and does that source win?"**
+
+> *Grounded in:* §3.8 (state explicit and owned), §3.9 / Invariant 9 (no unowned global mutable
+> state), §26.4 (caching must be visible and reconcilable, never hidden).
 
 ---
 
