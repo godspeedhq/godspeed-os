@@ -826,16 +826,8 @@ fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> 
 
     let ep_id = match crate::ipc::names::lookup(name) {
         Some(id) => id,
-        None     => {
-            if name == "fs" || name == "block-driver" {
-                crate::kprintln!("DIAG acquire '{}': MISS (not in directory)", name);
-            }
-            return -1; // service not registered
-        }
+        None     => return -1, // service not registered
     };
-    if name == "fs" || name == "block-driver" {
-        crate::kprintln!("DIAG acquire '{}': resolved ep {}", name, ep_id.0);
-    }
 
     let resource_id = crate::capability::cap::ResourceId::from(ep_id);
     let rights = if include_grant != 0 {
@@ -847,12 +839,7 @@ fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> 
 
     match scheduler::current_task_insert_cap(cap) {
         Ok(slot) => slot as i64,
-        Err(_)   => {
-            if name == "fs" || name == "block-driver" {
-                crate::kprintln!("DIAG acquire '{}': insert FAILED (cap table FULL)", name);
-            }
-            -1 // cap table full
-        }
+        Err(_)   => -1, // cap table full
     }
 }
 
