@@ -1,0 +1,36 @@
+# Line-ending policy: store ALL text files as LF in the repository.
+#
+# `text=auto` lets Git detect text vs binary and normalize text to LF on commit
+# (a Windows working tree still checks out CRLF when core.autocrlf=true, but the
+# repo always holds LF). Putting it here makes the policy repo-enforced and
+# portable, rather than depending on each contributor's `core.autocrlf` setting.
+* text=auto
+
+# ─── Explicit text types (stored as LF) ──────────────────────────────────────
+*.rs     text
+*.toml   text
+*.lock   text
+*.md     text
+*.json   text
+*.py     text
+*.ld     text
+*.conf   text
+*.gsh    text
+*.gs     text
+
+# ─── Scripts that MUST stay LF even on a Windows checkout ─────────────────────
+*.sh     text eol=lf
+
+# ─── Binary: never normalize line endings, never diff as text ─────────────────
+*.img    binary
+*.bin    binary
+*.elf    binary
+*.efi    binary
+*.iso    binary
+*.o      binary
+*.a      binary
+*.png    binary
+*.bmp    binary
+*.ppm    binary
+*.zip    binary
+*.gz     binary

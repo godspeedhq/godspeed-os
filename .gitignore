@@ -36,3 +36,33 @@ nographic_out.txt
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ─── More build artifacts (kernel / bootloader / objects) ────────────────────
+*.elf
+*.bin
+*.efi
+*.iso
+*.o
+*.a
+*.d
+*.rs.bk
+*.pdb
+
+# ─── Host tooling caches (Python: scripts/*.py) ──────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+
+# ─── Screenshots / framebuffer dumps ─────────────────────────────────────────
+*.bmp
+fb_shot*.png
+screendump*
+
+# ─── Backups, merge leftovers, temp, crash dumps ─────────────────────────────
+*.bak
+*.orig
+*.rej
+*.tmp
+*.temp
+*.core
+*.dmp
