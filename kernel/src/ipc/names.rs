@@ -52,7 +52,7 @@ pub fn register(name: &str, endpoint_id: EndpointId) {
     if bytes.len() > NAME_MAX { return; }
     let len = bytes.len() as u8;
 
-    let mut names = NAMES.lock();
+    let mut names = NAMES.lock_irq();
     // Update existing entry.
     for entry in names.iter_mut() {
         if entry.valid && entry.name_len == len
@@ -82,7 +82,7 @@ pub fn unregister(name: &str) {
     let bytes = name.as_bytes();
     if bytes.len() > NAME_MAX { return; }
     let len = bytes.len() as u8;
-    let mut names = NAMES.lock();
+    let mut names = NAMES.lock_irq();
     for entry in names.iter_mut() {
         if entry.valid && entry.name_len == len
             && &entry.name[..len as usize] == bytes
@@ -106,7 +106,7 @@ pub fn unregister_endpoint(name: &str, endpoint_id: EndpointId) {
     let bytes = name.as_bytes();
     if bytes.len() > NAME_MAX { return; }
     let len = bytes.len() as u8;
-    let mut names = NAMES.lock();
+    let mut names = NAMES.lock_irq();
     for entry in names.iter_mut() {
         if entry.valid && entry.name_len == len
             && &entry.name[..len as usize] == bytes
@@ -124,7 +124,7 @@ pub fn lookup(name: &str) -> Option<EndpointId> {
     if bytes.len() > NAME_MAX { return None; }
     let len = bytes.len() as u8;
 
-    let names = NAMES.lock();
+    let names = NAMES.lock_irq();
     names.iter().find(|e| {
         e.valid && e.name_len == len && &e.name[..len as usize] == bytes
     }).map(|e| e.endpoint_id)

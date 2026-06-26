@@ -512,6 +512,12 @@ unsafe fn free_phys_frame(phys: u64) {
 pub unsafe fn reclaim_user_frames(cr3: u64) -> usize {
     let pml4_phys = cr3 & !0xFFFu64;
     let mut freed = 0usize;
+    // Device MMIO is mapped UNCACHED (PCD|PWT, §12) - a driver's register BAR is NOT an allocator RAM
+    // frame. The walk MUST skip those leaves: freeing one injects a device MMIO page into the RAM pool,
+    // which the next driver kill frees again - the chaos double-free (a driver's BAR freed on every
+    // kill, e.g. phys 0xFEB6C000 seen repeating in the T630 log). The DMA arena is cacheable (x86 DMA
+    // is cache-coherent), so it has neither bit and is reclaimed normally below.
+    const UNCACHED: u64 = (1 << 3) | (1 << 4); // PWT | PCD (PageFlags)
 
     // Free INLINE during the walk - no fixed-size collection buffer. The old `ReclaimBuffer`
     // (capacity 512) SILENTLY DROPPED every frame past 512, so any task mapping more than ~2 MiB
@@ -527,6 +533,8 @@ pub unsafe fn reclaim_user_frames(cr3: u64) -> usize {
                     // SAFETY: pt_phys is a valid page-table frame; HHDM covers it.
                     let pte = unsafe { read_entry(pt_phys, pt_i) };
                     if entry_present(pte) {
+                        // Skip device MMIO (uncached BAR) - not an allocator frame, must not be freed.
+                        if pte & UNCACHED == UNCACHED { continue; }
                         // SAFETY: leaf data frame of this dead task, post-shootdown; not read again.
                         unsafe { free_phys_frame(entry_phys(pte)); }
                         freed += 1;

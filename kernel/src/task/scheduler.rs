@@ -106,7 +106,7 @@ fn next_restart_count(name: &'static str) -> u64 {
     if name.is_empty() {
         return 0;
     }
-    let tbl = NAME_RESTART.lock();
+    let tbl = NAME_RESTART.lock_irq();
     for i in 0..tbl.len {
         if tbl.entries[i].name == name {
             return tbl.entries[i].count;
@@ -124,7 +124,7 @@ fn bump_name_restart(name: &'static str) {
     if name.is_empty() {
         return;
     }
-    let mut tbl = NAME_RESTART.lock();
+    let mut tbl = NAME_RESTART.lock_irq();
     for i in 0..tbl.len {
         if tbl.entries[i].name == name {
             tbl.entries[i].count = tbl.entries[i].count.saturating_add(1);
@@ -432,22 +432,27 @@ fn task_slot_unlock() {
 ///
 /// Returns `None` if all slots are occupied.
 pub fn reserve_task_slot(core_id: u32) -> Option<usize> {
-    task_slot_lock();
-    // SAFETY: lock held; exclusive access to TASK_VALID/TASK_CORE across all cores.
-    let result = unsafe {
-        let mut found = None;
-        for i in 0..MAX_TASKS {
-            if !TASK_VALID[i].load(Ordering::Relaxed) {
-                TASK_VALID[i].store(true, Ordering::Release);
-                TASK_CORE[i]  = core_id;
-                found = Some(i);
-                break;
+    // IRQ-safe: TASK_SLOT_LOCKED is also taken from the kill path (which runs in the timer ISR), so the
+    // hold must mask interrupts - else a task preempted mid-reserve holds it and the pinned supervisor
+    // respawn deadlocks reserving its own slot. without_interrupts is a safe smp/ call (no task/ unsafe).
+    crate::smp::without_interrupts(|| {
+        task_slot_lock();
+        // SAFETY: lock held; exclusive access to TASK_VALID/TASK_CORE across all cores.
+        let result = unsafe {
+            let mut found = None;
+            for i in 0..MAX_TASKS {
+                if !TASK_VALID[i].load(Ordering::Relaxed) {
+                    TASK_VALID[i].store(true, Ordering::Release);
+                    TASK_CORE[i]  = core_id;
+                    found = Some(i);
+                    break;
+                }
             }
-        }
-        found
-    };
-    task_slot_unlock();
-    result
+            found
+        };
+        task_slot_unlock();
+        result
+    })
 }
 
 /// Initialise the CapTable for a reserved slot **in-place in BSS** and return
@@ -478,9 +483,12 @@ pub unsafe fn task_cap_init_empty(slot: usize) -> &'static mut CapTable {
 
 /// Release a previously-reserved slot without committing (called on spawn error).
 pub fn release_task_slot(slot: usize) {
-    task_slot_lock();
-    TASK_VALID[slot].store(false, Ordering::Release);
-    task_slot_unlock();
+    // IRQ-safe: see reserve_task_slot (TASK_SLOT_LOCKED is also taken in the timer ISR's kill path).
+    crate::smp::without_interrupts(|| {
+        task_slot_lock();
+        TASK_VALID[slot].store(false, Ordering::Release);
+        task_slot_unlock();
+    });
 }
 
 /// Finalise a reserved task slot: write context + metadata and mark Ready.
@@ -1055,14 +1063,13 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             TASK_RUN_TICKS[prev].fetch_add(1, Ordering::Relaxed);
         }
 
-        // Path C / Phase 6: while Core 0 is mid-supervisor-respawn at run()'s loop top, do NOT preempt
-        // it - just return (iret back to the spawn). The tick clock + COM2/control above still ran;
-        // we only suppress the context SWITCH. IF stays 1, so any cross-core shootdown / WAKE IPI is
-        // ACK'd between ticks (no wedge), but the ~22 ms spawn isn't switched away into the unresumable
-        // run() context (the Test-15 stall). Cleared the instant spawn_supervisor returns.
-        if cid == 0 && crate::task::supervisor_respawn_in_progress() {
-            return;
-        }
+        // Path C / Phase 6: the supervisor respawn is NO LONGER pinned here. The old code returned
+        // (suppressing the switch) so the ~22 ms spawn ran uninterrupted - but that STARVED any Core-0
+        // task holding a lock the spawn needed, deadlocking it under load (§22 Test 15). The respawn is
+        // now ROUND-ROBINED instead: see the in-progress RESUME block just after the CAS below, plus the
+        // preempt via the normal switch when prev == IDLE (the spawn currently running). Its locks are
+        // IRQ-safe, so the spawn is only ever preempted BETWEEN holds; a lock-holder gets a quantum and
+        // releases, then the spawn resumes and acquires.
 
         // CAS instead of store: if a cross-core kill wrote Dead between our
         // load and this transition, the CAS fails and Dead is preserved.
@@ -1075,6 +1082,32 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             );
+        }
+
+        // Path C / Phase 6 (round-robin respawn): if a supervisor respawn is IN PROGRESS and a TASK is
+        // running here, switch it OUT to the scheduler context (CORE_SCHED_CTX) - where the preempted
+        // spawn was saved - so the spawn gets THIS quantum and RESUMES. `prev` was set Ready by the CAS
+        // above, so it is rescheduled. Combined with the preempt path (when prev == IDLE the spawn is
+        // running, and the normal switch below saves it into CORE_SCHED_CTX and runs a ready task), this
+        // round-robins the spawn with ready tasks: a lock-holder runs and releases, the spawn resumes and
+        // acquires - no pin, no deadlock, no strand. Mirrors the pending switch-to-scheduler-context below.
+        if cid == 0 && crate::task::supervisor_respawn_in_progress() && prev < MAX_TASKS {
+            // Capture prev's user RSP now (other tasks run before prev is rescheduled, overwriting it).
+            if TASK_VALID[prev].load(Ordering::Relaxed) && TASK_IS_USER[prev] {
+                TASK_USER_RSP[prev] =
+                    crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[cid].user_rsp;
+            }
+            let current_ctx: *mut TaskContext = if !TASK_VALID[prev].load(Ordering::Relaxed) {
+                // prev self-killed - discard into CORE_DEAD_CTX (never resumed).
+                CORE_DEAD_CTX.as_mut_ptr(cid)
+            } else {
+                TASK_CTX[prev].assume_init_mut() as *mut TaskContext
+            };
+            CORE_CURRENT.get(cid).store(IDLE, Ordering::Relaxed);
+            let sched_ctx: *const TaskContext = CORE_SCHED_CTX.as_ptr(cid);
+            switch_context(current_ctx, sched_ctx);
+            // Resumes here when prev is next scheduled (after the spawn yields its quantum back).
+            return;
         }
 
         let next = match pick_next(cid) {

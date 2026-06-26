@@ -3488,10 +3488,14 @@ static SUPERVISOR_RESPAWN_PENDING: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 static SUPERVISOR_RESPAWN_COUNT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
-/// True only while `spawn_supervisor` is running at the Core-0 scheduler loop top. The timer ISR
-/// checks it and does NOT preempt (just returns) so the ~22 ms spawn runs to completion on Core 0 -
-/// it stays IF=1 (interrupts on, IPIs ACK'd, no wedge) but is not switched away (the run() context
-/// isn't reliably resumed under load, so a preempted spawn would stall - the §22 Test 15 stall).
+/// True while a supervisor respawn is in flight (from just before PENDING is claimed in
+/// `poll_supervisor_respawn` until `spawn_supervisor` returns). The timer ISR uses it to ROUND-ROBIN
+/// the spawn with ready tasks (see `scheduler::timer_tick_from_irq`): when a task is running it
+/// switches OUT to the scheduler context to RESUME the spawn; when the spawn is running (prev==IDLE)
+/// the normal switch PREEMPTS it and runs a ready task. So the spawn is preemptible (lock-holders run
+/// and release) and resumable (it gets quanta) - replacing the old IF=1 pin, which suppressed the
+/// switch to keep the spawn running but STARVED any Core-0 lock-holder and deadlocked under load
+/// (§22 Test 15). The spawn's locks are IRQ-safe, so it is only ever preempted between holds.
 static SUPERVISOR_RESPAWN_IN_PROGRESS: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -3519,16 +3523,20 @@ pub fn poll_supervisor_respawn() {
     if !SUPERVISOR_RESPAWN_PENDING.load(Ordering::Acquire) {
         return;
     }
-    // Pending: claim it with a swap (race-safe if ever called from two points).
+    // Mark IN_PROGRESS *before* claiming PENDING, so the (now preemptible) scheduler context is ALWAYS
+    // covered by PENDING-or-IN_PROGRESS — no gap where a timer preemption would strand the poll and lose
+    // the respawn (between the PENDING.load above and here, PENDING is still set, so the timer ISR's
+    // pending branch keeps us; from here on IN_PROGRESS keeps us). The respawn is no longer pinned: the
+    // timer ROUND-ROBINS it (see scheduler::timer_tick_from_irq) so it is preemptible (lock-holders run)
+    // and resumable (it gets quanta) — the spawn no longer strands in CORE_SCHED_CTX under load.
+    SUPERVISOR_RESPAWN_IN_PROGRESS.store(true, Ordering::Release);
+    // Claim PENDING. Core-0-only, so the swap always succeeds; the guard is defensive.
     if !SUPERVISOR_RESPAWN_PENDING.swap(false, Ordering::AcqRel) {
+        SUPERVISOR_RESPAWN_IN_PROGRESS.store(false, Ordering::Release);
         return;
     }
     let n = SUPERVISOR_RESPAWN_COUNT.fetch_add(1, Ordering::AcqRel) + 1;
     crate::kprintln!("kernel: supervisor died - respawning (#{}) (Path C / Phase 6)", n);
-    // Pin against preemption while the heavy spawn runs (the timer ISR sees this and returns instead
-    // of switching away). IF stays 1 throughout, so IPIs are ACK'd - it is the SWITCH we suppress,
-    // not interrupts. Without this, a preempted spawn strands in CORE_SCHED_CTX and never finishes.
-    SUPERVISOR_RESPAWN_IN_PROGRESS.store(true, Ordering::Release);
     spawn_supervisor();
     SUPERVISOR_RESPAWN_IN_PROGRESS.store(false, Ordering::Release);
 }
