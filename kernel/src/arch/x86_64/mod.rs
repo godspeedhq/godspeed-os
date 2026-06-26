@@ -581,9 +581,36 @@ pub fn claim_console_foreground(task_slot: u32) {
 
 /// Release exclusive console input back to the unclaimed state (any CONSOLE_READ
 /// holder may read again). Idempotent; the runner calls it on finish or `q`,
-/// after it has ensured a live shell exists to hand control back to.
+/// after it has ensured a live shell exists to hand control back to. Wakes any task
+/// parked in a muted blocking read so it resumes at once.
 pub fn release_console_foreground() {
     CONSOLE_FOREGROUND.store(u32::MAX, core::sync::atomic::Ordering::Release);
+    wake_console_waiter();
+}
+
+/// Release the console foreground IF `task_slot` is the current owner. A dying owner must release so a
+/// dead TUI app (e.g. a killed or crashed `chaos`) cannot leave the system muted forever; a dying
+/// NON-owner must not clobber a live owner's claim (the compare-exchange guards that). Wakes a parked
+/// muted reader on success. Called from the task-kill path for every death - a cheap no-op for the
+/// common case of a non-owner.
+pub fn release_console_foreground_if_owner(task_slot: u32) {
+    use core::sync::atomic::Ordering;
+    if CONSOLE_FOREGROUND
+        .compare_exchange(task_slot, u32::MAX, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        wake_console_waiter();
+    }
+}
+
+/// Wake any task parked in a muted blocking `ConsoleRead` (it stops popping bytes while backgrounded,
+/// so a foreground app's keystrokes reach the app) so it re-checks the foreground and resumes. result =
+/// 0: its read loop simply re-runs and pops normally. No-op if nobody is parked.
+fn wake_console_waiter() {
+    let waiter = CONSOLE_READ_WAITER.load(core::sync::atomic::Ordering::Acquire);
+    if waiter != u32::MAX {
+        crate::task::scheduler::wake_by_slot(waiter as usize, 0);
+    }
 }
 
 /// Whether `task_slot` may currently read console input: true if foreground is

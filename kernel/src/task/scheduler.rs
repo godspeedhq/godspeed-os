@@ -1535,6 +1535,12 @@ pub fn kill_task_by_slot(slot: usize) {
         let task_name = TASK_NAME[slot];
         let task_ep   = ep_from_u64(TASK_ENDPOINT[slot].load(Ordering::Relaxed));
 
+        // If this task owned the console foreground (a TUI app like `chaos`), release it so a dead owner
+        // cannot leave the system muted forever, and wake any shell parked in a muted blocking read.
+        // Unconditional (before the endpoint cleanup) since the owner need not have an endpoint; the
+        // if-owner guard is a cheap no-op for the common case of a non-owner death.
+        crate::arch::x86_64::release_console_foreground_if_owner(slot as u32);
+
         // Kill the task's endpoint if it has one.
         if let Some(ep_id) = task_ep {
             // Bump generation in routing table and wake any blocked tasks.

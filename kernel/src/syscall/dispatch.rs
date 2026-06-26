@@ -1321,13 +1321,18 @@ fn handle_console_read(cap_slot: u64) -> i64 {
     crate::arch::x86_64::CONSOLE_READ_WAITER.store(my_slot as u32, Ordering::Release);
 
     loop {
-        // Try to consume a byte from the ring buffer.
-        if let Some(b) = crate::arch::x86_64::uart_rx_pop() {
-            crate::arch::x86_64::CONSOLE_READ_WAITER.store(u32::MAX, Ordering::Release);
-            return b as i64;
+        // Only consume a byte while we own (or share) the console foreground. While a foreground app
+        // (e.g. `chaos`, syscall 40) owns it, stay blocked so ITS keystrokes (its `q`) reach it, not us.
+        // This closes the race where the shell's loop gate passed is-foreground, then it blocked here
+        // just as the app claimed. We are woken by the RX IRQ (a byte) OR by release/owner-death.
+        if crate::arch::x86_64::console_foreground_allows(my_slot as u32) {
+            if let Some(b) = crate::arch::x86_64::uart_rx_pop() {
+                crate::arch::x86_64::CONSOLE_READ_WAITER.store(u32::MAX, Ordering::Release);
+                return b as i64;
+            }
         }
 
-        // Block until the IRQ handler wakes us.
+        // Block until the IRQ handler (a byte) or release/owner-death (foreground changed) wakes us.
         let err = scheduler::block_and_reschedule(TaskState::BlockedOnRecv);
         if err != 0 {
             crate::arch::x86_64::CONSOLE_READ_WAITER.store(u32::MAX, Ordering::Release);
