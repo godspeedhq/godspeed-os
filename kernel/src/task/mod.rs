@@ -375,7 +375,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // (the TUI, via ConsoleWrite). Excluded from auto-spawn; the shell spawns it by name on demand.
         "chaos" => Some(("chaos", ServiceConfig {
             elf:               include_bytes!(env!("SVC_CHAOS_ELF")),
-            has_recv_endpoint: false,
+            has_recv_endpoint: true,  // recv the round count from the shell launcher at startup
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    0,

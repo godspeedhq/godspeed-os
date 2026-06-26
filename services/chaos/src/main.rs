@@ -99,6 +99,23 @@ fn flood(ctx: &ServiceContext, name: &str, cache: &mut Option<CapHandle>) -> Opt
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
+    // The shell launcher sends the round count right after spawning us (0 = run until q). Wait briefly
+    // (RTC-bounded) for it BEFORE claiming the foreground - the shell is still live to send it. Default
+    // to run-until-q if it never arrives (e.g. the launcher's send failed), so we never block forever.
+    let mut rounds: u64 = 0;
+    {
+        let t0 = ctx.datetime().epoch_secs();
+        loop {
+            if let Some(msg) = ctx.try_recv() {
+                let b = msg.payload_bytes();
+                if b.len() >= 4 { rounds = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64; }
+                break;
+            }
+            if ctx.datetime().epoch_secs() - t0 >= 2 { break; }
+            ctx.yield_cpu();
+        }
+    }
+
     // Take the keyboard so a resurrected shell cannot steal our `q`. This is the moment the shell goes
     // "muted" for the duration of the run (unclaimed is the normal state, so this changes nothing else).
     ctx.claim_console_foreground();
@@ -124,6 +141,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     loop {
         // `q` aborts. The kernel buffers the keypress across input-driver churn, so it is caught here.
         if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { break; } }
+        if rounds > 0 && round >= rounds { break; } // a bounded `max-carnage N` run is complete
 
         // Snapshot the live, killable set: valid, not Dead, named, and NOT chaos itself (the one program
         // a run never kills - it is the thing doing the killing).
@@ -222,9 +240,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.release_console_foreground();
     ctx.console_writeln("chaos: done - foreground returned to the shell");
 
-    // Self-terminate (we hold SERVICE_CONTROL). chaos is not in any auto-restart set, so it stays dead
-    // until the next `chaos max-carnage` spawns a fresh one. The park() is an unreachable safety net for
-    // the `-> !` return type (a successful self-kill never returns here).
-    let _ = ctx.kill("chaos");
+    // Park (idle). We do NOT self-kill: a self-kill via the kill syscall returns to the now-dead task,
+    // and the following park's block_and_reschedule then panics ("no running task" - the shell's `kill
+    // shell` avoids this via a dedicated session-restart path). Instead we park: harmless and idle, the
+    // foreground already released, and the next `chaos max-carnage` launcher reaps this instance with
+    // its kill-prior step (exactly the `observe now` pattern). At most one idle chaos lingers between runs.
     ctx.park();
 }

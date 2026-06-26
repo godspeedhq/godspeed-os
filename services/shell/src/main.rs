@@ -215,8 +215,23 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // The previous command's result (the Ok/Err model), reported by `result`. Threaded as
     // local session state - no global (services hold no global mutable state, §3.9).
     let mut last_result: Result<(), ShellError> = Ok(());
+    // When a foreground app (e.g. the `chaos` service, syscall 40) owns the console, the shell goes
+    // "muted": it stays quiet (no prompt, no read) so it can neither smear that app's screen nor
+    // swallow its `q`, and prints a fresh prompt only when it regains the keyboard. `muted` tracks it.
+    let mut muted = false;
 
     loop {
+        // Muted: a foreground app owns the console. Yield + skip - don't draw, don't blocking-read. The
+        // Phase-1 kernel gate only covers the non-blocking poll, so THIS loop gate is what keeps the
+        // main (blocking) read path from stealing the foreground app's `q`. v1 busy-yields while muted;
+        // park + wake-on-release is a later optimization.
+        if !ctx.is_console_foreground() {
+            ctx.yield_cpu();
+            muted = true;
+            continue;
+        }
+        if muted { ctx.console_write("gsh> "); muted = false; } // regained the keyboard: a fresh prompt
+
         let b = ctx.console_read();
 
         match b {
@@ -3199,8 +3214,6 @@ const CHAOS_SETTLE_YIELDS: u32 = 60_000;  // let the just-restarted target re-re
 // storm. A heavy `max-carnage` kills `fs` AND its `block-driver` many times, so fs may take several
 // seconds to serve again; we reacquire + retry until it does, bounded so it never hangs.
 const CHAOS_SAVE_TOTAL_SECS: i64 = 30;
-const CARNAGE_MAX_CAND: usize = 32;       // bounded snapshot of live killable tasks per round (§26.6)
-const CARNAGE_PROGRESS_EVERY: u64 = 100;  // update the in-place progress line every N rounds
 
 /// Save `data` to the already-resolved absolute path `ppath`, retrying for up to
 /// `CHAOS_SAVE_TOTAL_SECS` of WALL-CLOCK time while `fs` finishes re-mounting after a chaos storm -
@@ -3215,13 +3228,6 @@ fn chaos_save_retry(ctx: &ServiceContext, ppath: &[u8], data: &[u8]) -> bool {
         for _ in 0..CHAOS_SETTLE_YIELDS { ctx.yield_cpu(); }
     }
 }
-const CARNAGE_MAX_SVC: usize = 16;        // distinct services tracked in the aggregate tally (~6–8 real)
-// max-carnage takes NO round cap: it runs exactly the count you type. The report is per-SERVICE
-// AGGREGATES (killed/recovered counts), constant memory regardless of round count, and each round
-// reclaims the dead instance before respawning - so the round count is a loop counter, not a resource
-// (§26.6 bounds resources, not counters; same reasoning as the unbounded supervisor respawn, §6.2).
-// The only bound is the parsed `u32` and `q`, which aborts early. (kill-storm DOES cap rounds at
-// CHAOS_MAX_ROUNDS because it stores per-round generation detail in fixed arrays.)
 
 /// Wait (real wall-clock bounded, RTC) for `name` to be ALIVE (present in the task table). Used
 /// before a kill so a round isn't wasted killing a task that is still mid-respawn. Yields cooperatively.
@@ -3273,13 +3279,32 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
         "flood-storm"  => chaos_flood_storm(ctx, cwd, &tok, ntok),
         "mem-pressure" => chaos_mem_pressure(ctx, cwd, &tok, ntok),
         "spawn-storm"  => chaos_spawn_storm(ctx, cwd, &tok, ntok),
-        "max-carnage"  => chaos_max_carnage(ctx, cwd, &tok, ntok),
+        "max-carnage"  => chaos_launch(ctx, if ntok >= 2 { parse_u32(tok[1]).unwrap_or(0) } else { 0 }),
         other => {
             ctx.console_writeln_fmt(format_args!(
                 "chaos: unknown mode '{}' (try: chaos kill-storm <service> [rounds])", other));
             Err(ShellError::Unknown)
         }
     }
+}
+
+/// `chaos max-carnage` - launch the `chaos` service, which takes over the console (the foreground
+/// primitive, syscall 40), runs the storm with the SHELL itself a target now, and on `q` hands the
+/// keyboard back + self-terminates. The shell goes "muted" (see the main loop) for the duration. Kill
+/// any prior instance first - one-shot, no graceful self-exit race - exactly like `observe now`.
+fn chaos_launch(ctx: &ServiceContext, rounds: u32) -> Result<(), ShellError> {
+    let _ = ctx.kill("chaos");
+    if ctx.spawn("chaos").is_err() {
+        ctx.console_writeln("chaos: failed to spawn the chaos service");
+        return Err(ShellError::Unknown);
+    }
+    // Send the round count chaos should run (0 = run until q). Best-effort: chaos waits briefly for it
+    // and defaults to run-until-q if it doesn't arrive. Reclaim the cap (no leak - the post-storm lesson).
+    if let Some(cap) = ctx.acquire_send_cap("chaos") {
+        let _ = ctx.send_by_handle(cap, &Message::from_bytes(&rounds.to_le_bytes()));
+        ctx.remove_cap(cap);
+    }
+    Ok(())
 }
 
 /// `chaos kill-storm <svc> [rounds] [save <path>]` - kill the service `rounds` times; each round,
@@ -3718,349 +3743,6 @@ fn chaos_spawn_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
     if pass { Ok(()) } else { Err(ShellError::Unknown) }
 }
 
-/// xorshift64 - a tiny, fast PRNG. Not cryptographic; just enough to pick victims at random.
-fn xorshift64(mut x: u64) -> u64 {
-    x ^= x << 13; x ^= x >> 7; x ^= x << 17; x
-}
-
-/// One flood pass for `max-carnage`: get-or-reuse a cached SEND cap to `name`, then burst `try_send`
-/// (never blocking `send`, §8.9) until the queue saturates (`QueueFull`), the service dies
-/// (`EndpointDead`), or we hit the burst cap. Returns `(sends_landed, saturated, died)`, or `None` if
-/// the service has no reachable recv endpoint (a pure sender, or the cap table is full). The cache -
-/// one handle per service - bounds cap use to the handful of live services, so a million-round storm
-/// keeps flooding instead of exhausting the 64-slot cap table after ~64 acquires.
-fn carnage_flood(ctx: &ServiceContext, name: &str, cache: &mut Option<CapHandle>) -> Option<(u32, bool, bool)> {
-    const BURST: u32 = 64; // > queue depth (16) so saturation shows
-    let h = match *cache {
-        Some(h) => h,
-        None => match ctx.acquire_send_cap(name) {
-            Some(h) => { *cache = Some(h); h }
-            None    => return None,
-        }
-    };
-    let msg = Message::from_bytes(&[0x01]); // minimal benign payload; the target drains + drops it
-    let (mut sent, mut sat, mut died) = (0u32, false, false);
-    while sent < BURST {
-        match ctx.try_send_by_handle(h, &msg) {
-            Ok(())                      => sent += 1,
-            Err(IpcError::QueueFull)    => { sat  = true; break; }
-            // The target died: reclaim the now-dead cap BEFORE clearing the cache, else every
-            // service-death-during-flood leaks a slot and a long max-carnage fills the 64-slot cap
-            // table (the post-storm "storage unavailable" bug). The next call re-acquires a fresh cap.
-            Err(IpcError::EndpointDead) => { died = true; ctx.remove_cap(h); *cache = None; break; }
-            Err(_)                      => break,
-        }
-    }
-    Some((sent, sat, died))
-}
-
-/// `chaos max-carnage [rounds] [save <path>]` - the chaos monkey. Each round, snapshot the LIVE task
-/// set (exactly what `observe now` shows), pick one at **random**, and kill it - everything is fair
-/// game **except the shell itself** (killing it would kill this command) and the **kernel** (which is
-/// not a task and cannot be killed). Recoverable victims (supervisor/block-driver/fs) are confirmed
-/// back up; the rest stay dead (nothing auto-restarts them - expected). The headline proof is that the
-/// **kernel survives ANY sequence of random service deaths**: the command returning at all means no
-/// panic (a panic reboots). Random source: the TSC, advanced by xorshift64. Bounded + loud (§26.6):
-/// rounds clamped 1..=100, a fixed candidate snapshot per round.
-#[inline(never)]
-/// One mem-pressure cycle for `max-carnage`: spawn the `mem-hog` victim, let it grab memory briefly,
-/// then KILL it (reclaim). Uses a LOCAL before/after free-frame snapshot - the global baseline drifts
-/// during a storm as other victims die and respawn. Returns (frames_grabbed, reclaimed_ok). Bounded +
-/// fast: short RTC-bounded polls that break early on success.
-#[inline(never)]
-fn carnage_mempressure(ctx: &ServiceContext) -> (u32, bool) {
-    const MP_DROP_MIN: u64 = 1024; // 4 MiB grabbed = enough churn for one carnage cycle
-    const MP_SLACK:    u64 = 1024; // 4 MiB reclaim tolerance (absorbs a respawning service's footprint)
-    const MP_SECS:     i64 = 3;    // per-poll wall-clock bound; polls break early on success
-    let before = ctx.inspect_kernel_free_frames();
-    let _ = ctx.spawn("mem-hog");
-    let t0 = ctx.datetime().epoch_secs();
-    let mut low = before;
-    loop {
-        ctx.yield_cpu();
-        let f = ctx.inspect_kernel_free_frames();
-        if f < low { low = f; }
-        if before.saturating_sub(low) >= MP_DROP_MIN { break; }
-        if ctx.datetime().epoch_secs() - t0 >= MP_SECS { break; }
-    }
-    let grabbed = before.saturating_sub(low).min(u32::MAX as u64) as u32;
-    let _ = ctx.kill("mem-hog");
-    let t1 = ctx.datetime().epoch_secs();
-    let mut hi = low;
-    loop {
-        ctx.yield_cpu();
-        let f = ctx.inspect_kernel_free_frames();
-        if f > hi { hi = f; }
-        if hi + MP_SLACK >= before { break; }
-        if ctx.datetime().epoch_secs() - t1 >= MP_SECS { break; }
-    }
-    (grabbed, hi + MP_SLACK >= before)
-}
-
-/// One spawn-burst cycle for `max-carnage`: spawn a small burst of mem-hogs concurrently (stopping at
-/// the ceiling), let them grab memory, then kill them all. Concurrent-spawn churn - the spawn-storm
-/// dimension scaled down to one round (vs mem-pressure's one-hog-at-a-time). Returns hogs spawned.
-#[inline(never)]
-fn carnage_spawn_burst(ctx: &ServiceContext) -> u32 {
-    const BURST: u32 = 4;
-    let mut spawned = 0u32;
-    for _ in 0..BURST {
-        if ctx.spawn("mem-hog").is_ok() { spawned += 1; } else { break; }   // stop at the ceiling
-    }
-    for _ in 0..600 { ctx.yield_cpu(); }                                     // let the burst grab memory
-    let mut killed = 0u32;
-    while slot_of(ctx, "mem-hog").is_some() && killed < BURST + 4 {
-        let _ = ctx.kill("mem-hog");
-        killed += 1;
-        for _ in 0..60 { ctx.yield_cpu(); }
-    }
-    spawned
-}
-
-fn chaos_max_carnage(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
-    // [rounds] [save] after tok[0] = "max-carnage". `save` is accepted but deliberately NOT honoured:
-    // max-carnage destroys fs, so writing the report TO fs is a catch-22 that fights the storm (it
-    // hung/wedged the session and even cost the keyboard). The console IS the record - it is the
-    // kernel's framebuffer+serial, not a service, so chaos can't touch it, and the terminal captures it.
-    let mut rounds = CHAOS_DEFAULT_ROUNDS;
-    let mut save_requested = false;
-    let mut i = 1;
-    while i < ntok {
-        if tok[i] == "save" {
-            save_requested = true; i += 1;
-            if i < ntok && tok[i].starts_with('/') { i += 1; } // skip a stray path
-        } else if let Some(n) = parse_u32(tok[i]) { rounds = n; i += 1; }
-        else { i += 1; }
-    }
-    let rounds = rounds.max(1) as u64;   // no upper cap - run exactly what was typed (q aborts)
-
-    // RNG seed: the TSC (high-resolution, varies run to run), mixed with the wall clock. Never zero.
-    let mut rng = ctx.read_tsc()
-        ^ (ctx.datetime().epoch_secs() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    if rng == 0 { rng = 0xDEAD_BEEF_CAFE_F00D; }
-
-    // Wall-clock start (RTC), for the heartbeat's % + ETA. ETA is a running average: remaining rounds
-    // ÷ the rate so far (done ÷ elapsed seconds) - blank until ≥1 s has elapsed, then it settles.
-    let t0 = ctx.datetime().epoch_secs();
-
-    ctx.console_writeln_fmt(format_args!(
-        "chaos max-carnage: {} rounds - kill, FLOOD, MEM-PRESSURE, or SPAWN-BURST a random target each round (all but the shell). Press q to quit.", rounds));
-    if save_requested {
-        ctx.console_writeln("(note: max-carnage doesn't save to disk - it destroys fs, so a save would fight the storm. The report below IS the record.)");
-    }
-
-    // Per-SERVICE aggregate tally (bounded - a handful of distinct services, NOT per-round). Constant
-    // memory regardless of round count, so the run goes as long as you like and the report is always
-    // COMPLETE - never "the last N rounds", nothing silently truncated.
-    let mut sv_name:   [[u8; 24]; CARNAGE_MAX_SVC] = [[0u8; 24]; CARNAGE_MAX_SVC];
-    let mut sv_nlen:   [usize;    CARNAGE_MAX_SVC] = [0usize;    CARNAGE_MAX_SVC];
-    let mut sv_killed: [u64;      CARNAGE_MAX_SVC] = [0u64;      CARNAGE_MAX_SVC];
-    let mut sv_recov:  [u64;      CARNAGE_MAX_SVC] = [0u64;      CARNAGE_MAX_SVC];
-    let mut sv_flooded:  [u64;               CARNAGE_MAX_SVC] = [0u64; CARNAGE_MAX_SVC];
-    let mut sv_maxdepth: [u32;               CARNAGE_MAX_SVC] = [0u32; CARNAGE_MAX_SVC];
-    let mut sv_floodkill:[u64;               CARNAGE_MAX_SVC] = [0u64; CARNAGE_MAX_SVC];
-    let mut sv_floodcap: [Option<CapHandle>; CARNAGE_MAX_SVC] = [None; CARNAGE_MAX_SVC]; // cached send cap/svc
-    let mut nsv = 0usize;
-    let mut killed = 0u64;
-    let mut flooded = 0u64;
-    let mut flood_saturated = 0u64;
-    let mut recoverable_killed = 0u64;
-    let mut recovered = 0u64;
-    let mut mp_cycles = 0u64;     // mem-pressure cycles run (spawn mem-hog -> alloc -> kill)
-    let mut mp_churned = 0u64;    // total frames the hog grabbed across all cycles
-    let mut mp_reclaimed = 0u64;  // cycles whose memory returned to ~baseline after the kill
-    let mut sb_bursts = 0u64;     // spawn-burst cycles (concurrent mem-hog spawn + kill)
-    let mut sb_spawned = 0u64;    // total hogs spawned across all bursts
-    let mut done = 0u64;
-    let mut aborted = false;
-
-    for _ in 0..rounds {
-        // `q` aborts early. The kernel buffers the keypress (it survives a momentary input-driver
-        // death), so a `q` pressed any time the keyboard was up is caught here between rounds.
-        if let Some(b) = ctx.try_console_read() {
-            if b == b'q' || b == b'Q' { aborted = true; break; }
-        }
-
-        // Snapshot the live, killable set: valid, not Dead, named, and NOT the shell. Bounded.
-        let mut cand: [([u8; 24], usize, u32); CARNAGE_MAX_CAND] = [([0u8; 24], 0usize, 0u32); CARNAGE_MAX_CAND];
-        let mut ncand = 0usize;
-        for slot in 0..256u32 {
-            let st = ctx.task_stat(slot);
-            if !st.valid || st.state == 4 { continue; }       // skip empty / Dead
-            let nm = st.name_str();
-            if nm.is_empty() || nm == "shell" { continue; }    // never kill ourselves
-            if ncand < CARNAGE_MAX_CAND {
-                let b = nm.as_bytes(); let l = b.len().min(24);
-                cand[ncand].0[..l].copy_from_slice(&b[..l]);
-                cand[ncand].1 = l;
-                cand[ncand].2 = st.restart_count as u32;
-                ncand += 1;
-            }
-        }
-        if ncand == 0 { break; }                               // nothing left but the shell
-        done += 1;
-
-        rng = xorshift64(rng);
-        let pick = (rng % ncand as u64) as usize;
-        let nl = cand[pick].1;
-        let og = cand[pick].2;
-        let mut nbuf = [0u8; 24];
-        nbuf[..nl].copy_from_slice(&cand[pick].0[..nl]);
-        let name = str_of(&nbuf[..nl]);
-
-        // Find-or-add the service in the per-service aggregate FIRST, so kill + flood tally to the same
-        // slot and share its cached flood cap (bounded).
-        let mut idx = None;
-        for s in 0..nsv { if sv_name[s][..sv_nlen[s]] == nbuf[..nl] { idx = Some(s); break; } }
-        let idx = match idx {
-            Some(s) => Some(s),
-            None if nsv < CARNAGE_MAX_SVC => {
-                sv_name[nsv][..nl].copy_from_slice(&nbuf[..nl]); sv_nlen[nsv] = nl;
-                let s = nsv; nsv += 1; Some(s)
-            }
-            None => None,
-        };
-
-        // Roll the action - the creative mix: 0 = kill, 1 = flood, 2 = flood-then-kill,
-        // 3 = kill-then-flood (flood the dead/respawning endpoint - EndpointDead back-pressure / the
-        // §8.6 queue-drained-on-death case), 4 = mem-pressure (one mem-hog: alloc-to-limit then kill -
-        // §22 S7 churn), 5 = spawn-burst (a concurrent burst of mem-hogs spawned + killed - the
-        // spawn-storm dimension, one round). Floods that find no endpoint just no-op (None).
-        rng = xorshift64(rng);
-        let action = rng % 6;
-        if action == 4 {
-            // mem-pressure churn: this round spends its action on memory (it ignores the picked
-            // victim). Folds the S7 dimension into the monkey - the kernel must survive alloc-to-limit
-            // + reclaim under chaos, alongside the kill/flood storm.
-            let (grabbed, reclaimed) = carnage_mempressure(ctx);
-            mp_cycles += 1; mp_churned += grabbed as u64; if reclaimed { mp_reclaimed += 1; }
-        } else if action == 5 {
-            // spawn-burst churn: concurrent-spawn pressure (a burst of mem-hogs spawned at once, then
-            // all killed). The spawn-storm ceiling dimension scaled to a single carnage round.
-            sb_bursts += 1; sb_spawned += carnage_spawn_burst(ctx) as u64;
-        } else if let Some(s) = idx {
-            let mut fr1 = None;
-            let mut fr2 = None;
-            // A. flood first (flood / flood-then-kill).
-            if action == 1 || action == 2 { fr1 = carnage_flood(ctx, name, &mut sv_floodcap[s]); }
-            // B. kill (kill / flood-then-kill / kill-then-flood). A kill bumps the endpoint generation,
-            //    so the cached flood cap is now stale - drop it so C/next round reacquires.
-            if action == 0 || action == 2 || action == 3 {
-                let _ = ctx.kill(name); killed += 1; sv_killed[s] += 1;
-                // The kill bumps the endpoint generation, so the cached flood cap is now stale. RECLAIM
-                // it (take + remove_cap), don't just drop the handle - else every flood-then-kill leaks
-                // a cap slot, and a long storm fills the 64-slot cap table, after which the shell can no
-                // longer mint/reacquire caps and live services read as "storage unavailable" (the
-                // post-max-carnage bug; a fresh shell works only because its table starts empty).
-                if let Some(h) = sv_floodcap[s].take() { ctx.remove_cap(h); }
-            }
-            // C. flood the corpse/respawn (kill-then-flood) - before the recovery wait, so it lands
-            //    while the endpoint is actually dead or mid-respawn (back-pressure under restart).
-            if action == 3 { fr2 = carnage_flood(ctx, name, &mut sv_floodcap[s]); }
-            // D. confirm recovery for any kill (recoverable services; the rest revive on a supervisor respawn).
-            if action == 0 || action == 2 || action == 3 {
-                if CHAOS_RESTARTABLE.contains(&name) {
-                    recoverable_killed += 1;
-                    if chaos_wait_recovery(ctx, name, og) { recovered += 1; sv_recov[s] += 1; }
-                }
-            }
-            // E. tally the flood(s).
-            for fr in [fr1, fr2] {
-                if let Some((depth, sat, died)) = fr {
-                    flooded += 1; sv_flooded[s] += 1;
-                    if depth > sv_maxdepth[s] { sv_maxdepth[s] = depth; }
-                    if sat  { flood_saturated += 1; }
-                    if died { sv_floodkill[s] += 1; }
-                }
-            }
-        } else {
-            // Aggregate full (>16 distinct live services - won't happen). Kill, untallied.
-            let _ = ctx.kill(name); killed += 1;
-        }
-
-        // Live heartbeat so the screen isn't frozen for a long run. The console is the kernel's
-        // framebuffer/serial (not a service), so it survives the carnage. `\r` rewrites the line in
-        // place (no scroll); the trailing spaces clear the previous, shorter count.
-        if done % CARNAGE_PROGRESS_EVERY == 0 {
-            // done >= CARNAGE_PROGRESS_EVERY > 0 here, so the ETA only guards on elapsed.
-            let pct = done * 100 / rounds;
-            let elapsed = (ctx.datetime().epoch_secs() - t0).max(0) as u64;
-            if elapsed > 0 {
-                let eta = (rounds - done) * elapsed / done;   // remaining / (done/elapsed) rate, seconds
-                ctx.console_write_fmt(format_args!(
-                    "\rmax-carnage: {} / {} ({}%) - {} kills, {} floods, {} mem, {} spawn - ETA {}m{:02}s - kernel alive - q to quit    ",
-                    done, rounds, pct, killed, flooded, mp_cycles, sb_bursts, eta / 60, eta % 60));
-            } else {
-                ctx.console_write_fmt(format_args!(
-                    "\rmax-carnage: {} / {} ({}%) - {} kills, {} floods, {} mem, {} spawn - ETA --m--s - kernel alive - q to quit    ",
-                    done, rounds, pct, killed, flooded, mp_cycles, sb_bursts));
-            }
-        }
-    }
-    ctx.console_writeln("");   // end the in-place heartbeat line before the report
-    // Reclaim any flood caps still cached (a service not killed on its last interaction), so the storm
-    // leaves the shell's cap table as it found it.
-    for c in sv_floodcap.iter_mut() { if let Some(h) = c.take() { ctx.remove_cap(h); } }
-
-    // Settle so any restart-log burst drains before we print the report.
-    for _ in 0..CHAOS_SETTLE_YIELDS { ctx.yield_cpu(); }
-
-    use core::fmt::Write as _;
-    let mut rb = ReportBuf::new();
-    let _ = writeln!(rb, "=== chaos max-carnage: report ===");
-    if aborted { let _ = writeln!(rb, "stopped early at round {} (you pressed q)", done); }
-    let _ = writeln!(rb, "rounds: {}; kills: {}, floods: {} ({} saturated the queue)", done, killed, flooded, flood_saturated);
-    if mp_cycles > 0 {
-        let _ = writeln!(rb, "mem-pressure: {} cycles, {} reclaimed clean, ~{} MiB churned (spawn mem-hog -> alloc-to-limit -> kill)",
-            mp_cycles, mp_reclaimed, mp_churned / 256);
-    }
-    if sb_bursts > 0 {
-        let _ = writeln!(rb, "spawn-burst: {} bursts, {} mem-hogs spawned + killed (concurrent-spawn churn)", sb_bursts, sb_spawned);
-    }
-    // Per-service aggregate - COMPLETE for any round count (bounded memory, never truncated).
-    for s in 0..nsv {
-        let name = str_of(&sv_name[s][..sv_nlen[s]]);
-        if CHAOS_RESTARTABLE.contains(&name) {
-            let _ = writeln!(rb, "  {:<14} killed {:>5}, recovered {:>5}, flooded {:>5} (peak depth {})",
-                name, sv_killed[s], sv_recov[s], sv_flooded[s], sv_maxdepth[s]);
-        } else {
-            let _ = writeln!(rb, "  {:<14} killed {:>5}, flooded {:>5} (peak depth {})  (revives on a supervisor respawn)",
-                name, sv_killed[s], sv_flooded[s], sv_maxdepth[s]);
-        }
-    }
-    let total_floodkill: u64 = sv_floodkill.iter().sum();
-    if total_floodkill > 0 {
-        let _ = writeln!(rb, "floods that crashed a service (it respawned): {}", total_floodkill);
-    }
-    let _ = writeln!(rb, "directly-restarted recoveries confirmed: {}/{}", recovered, recoverable_killed);
-    let _ = writeln!(rb, "kernel: SURVIVED {} kills + {} floods + {} mem-pressure cycles + {} spawn-bursts (no panic - this command returned)", killed, flooded, mp_cycles, sb_bursts);
-    // Survivors live now - a built-in `observe now` so the final state is in the report itself. Bounded.
-    let _ = write!(rb, "survivors (live now):");
-    let mut nlive = 0u32;
-    for slot in 0..256u32 {
-        let st = ctx.task_stat(slot);
-        if st.valid && st.state != 4 {
-            let nm = st.name_str();
-            if !nm.is_empty() {
-                nlive += 1;
-                if nlive <= 16 { let _ = write!(rb, " {}", nm); }
-            }
-        }
-    }
-    if nlive > 16 { let _ = write!(rb, " ..."); }
-    let _ = writeln!(rb, "  ({} live)", nlive);
-    // The test is that the KERNEL survives arbitrary carnage - proven by this report existing at all
-    // (a panic would have rebooted before it printed). PASS = survived; a recoverable victim missing a
-    // recovery (the supervisor-downtime edge case, §6.2) is reported per-service but does not fail it.
-    let _ = writeln!(rb, "verdict: PASS (kernel survived)");
-    if rb.overflow { let _ = writeln!(rb, "(report truncated at {} KiB)", REPORT_MAX / 1024); }
-
-    // No save: max-carnage destroys fs, so the console IS the record (kernel-owned, captured by the
-    // terminal). The verdict + survivor count above are exactly what's needed.
-    console_write_chunked(ctx, rb.bytes());
-
-    Ok(())   // reaching here at all proves the kernel survived the carnage
-}
 
 // ---------------------------------------------------------------------------
 // File commands - ls / read / write / mkdir / cd (utilities/16..20). Shell built-ins

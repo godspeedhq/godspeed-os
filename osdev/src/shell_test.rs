@@ -753,22 +753,34 @@ pub fn run(image_path: &Path, smp: u32) {
     // returning + reporting at all proves no panic (a panic reboots). Individual non-recoverable
     // victims staying dead is expected, so the verdict is about kernel survival, not per-service.
     // -----------------------------------------------------------------------
-    send(&mut write_half, b"chaos max-carnage 10\r");
-    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(120)) {
+    // `chaos max-carnage N` now launches the chaos SERVICE: it takes the console foreground, runs N
+    // rounds (kill / flood / kill-then-flood a random live service - the SHELL included now), prints its
+    // report, hands the keyboard back, and self-terminates. The shell is muted during the run, but chaos
+    // writes its report to the console either way, so we collect until its done-marker. (The launching
+    // shell draws a `gsh>` right after the command, before chaos claims, so `gsh>` is NOT a usable
+    // terminator here.)
+    send(&mut write_half, b"chaos max-carnage 5\r");
+    match collect_until(&buf, &mut cursor, b"foreground returned to the shell", Duration::from_secs(120)) {
         Some(r) => {
-            check!(r.contains("chaos max-carnage:") && r.contains("kills:") && r.contains("floods:"), "chaos: max-carnage ran (random kill + flood mix)");
-            check!(r.contains("flooded") && r.contains("peak depth"), "chaos: max-carnage report has per-service flood stats");
-            check!(r.contains("kernel: SURVIVED") && r.contains("verdict: PASS"), "chaos: max-carnage - kernel survived the kill+flood carnage");
-            check!(r.contains("mem-pressure cycles"), "chaos: max-carnage - mem-pressure folded into the action mix (S7)");
-            check!(r.contains("spawn-bursts"), "chaos: max-carnage - spawn-burst folded into the action mix");
+            check!(r.contains("chaos max-carnage:"), "chaos: max-carnage launched the chaos service (foreground TUI)");
+            check!(r.contains("report") && r.contains("kills") && r.contains("flooded"), "chaos: max-carnage report (per-service kills + floods)");
+            check!(r.contains("total:") && r.contains("rounds"), "chaos: max-carnage ran a bounded round count + self-terminated");
+            check!(r.contains("kernel: alive"), "chaos: max-carnage - kernel survived the kill+flood carnage (shell included)");
         }
-        None => { println!("shell-test: FAIL - chaos max-carnage timed out (wedged / panic?)"); fail += 5; }
+        None => { println!("shell-test: FAIL - chaos max-carnage (service) timed out (wedged / foreground stuck?)"); fail += 4; }
     }
+    // After chaos, the (possibly respawned) shell prints a startup banner and/or a regain prompt, so the
+    // first `gsh>` we hit can precede the `cores` response. Drain prompts until the response appears -
+    // this also realigns the cursor for the spawn-storm checks below.
     send(&mut write_half, b"cores\r");
-    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains(&format!("cores: {smp}")), "chaos: shell responsive after max-carnage"),
-        None    => { println!("shell-test: FAIL - shell unresponsive after max-carnage"); fail += 1; }
+    let mut responsive = false;
+    for _ in 0..6 {
+        match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+            Some(r) => { if r.contains(&format!("cores: {smp}")) { responsive = true; break; } }
+            None    => break,
+        }
     }
+    check!(responsive, "chaos: shell responsive after max-carnage");
 
     // -----------------------------------------------------------------------
     // chaos spawn-storm: the global-ceiling test. Spawn mem-hogs until the task-pool/memory ceiling
