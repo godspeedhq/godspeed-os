@@ -2785,9 +2785,13 @@ fn cmd_spawncap(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
         return Err(ShellError::Denied);
     }
     match ctx.spawn_returning_endpoint(name, 0xFFFF) {
-        Some(h) => match ctx.try_send_by_handle(h, &Message::from_bytes(&[0x01])) {
-            Ok(())  => { ctx.console_writeln_fmt(format_args!("spawncap: {} - endpoint cap acquired; send Ok", name)); Ok(()) }
-            Err(_)  => { ctx.console_writeln_fmt(format_args!("spawncap: {} - cap acquired but send failed", name)); Err(ShellError::Unknown) }
+        Some(h) => {
+            let r = ctx.try_send_by_handle(h, &Message::from_bytes(&[0x01]));
+            ctx.remove_cap(h);   // reclaim the probe endpoint cap (no leak)
+            match r {
+                Ok(())  => { ctx.console_writeln_fmt(format_args!("spawncap: {} - endpoint cap acquired; send Ok", name)); Ok(()) }
+                Err(_)  => { ctx.console_writeln_fmt(format_args!("spawncap: {} - cap acquired but send failed", name)); Err(ShellError::Unknown) }
+            }
         },
         None => {
             ctx.console_writeln_fmt(format_args!(
@@ -2844,9 +2848,13 @@ fn drain_service(ctx: &ServiceContext, svc: &str, input: Option<&[u8]>, out: &mu
             Some(h) => {
                 // Report a failed feed loudly rather than silently draining nothing (§26.7): if the
                 // filter died after registering, the user must see it, not get a silent empty result.
-                if ctx.send_by_handle(h, &Message::from_bytes(inp)).is_err()
-                    || ctx.send_by_handle(h, &Message::from_bytes(&[PIPE_EOT])).is_err()
-                {
+                let fed = ctx.send_by_handle(h, &Message::from_bytes(inp)).is_ok()
+                    && ctx.send_by_handle(h, &Message::from_bytes(&[PIPE_EOT])).is_ok();
+                // The sink cap is done after the feed (the drain reads on our OWN endpoint), so reclaim
+                // it - else every pipe leaks a cap slot and a pipe-heavy run (selfcheck) fills the
+                // 64-slot cap table, making live services look unreachable ("storage unavailable").
+                ctx.remove_cap(h);
+                if !fed {
                     ctx.console_writeln_fmt(format_args!(
                         "pipe: failed to send input to '{}' (it died after registering?)", svc));
                     let _ = ctx.kill(svc);
@@ -3446,7 +3454,7 @@ fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
             // The flood killed the service (or it had already died). Record it and reacquire the
             // respawned instance for the next round.
             if died_at.is_none() { died_at = Some(r as u32 + 1); }
-            if let Some(nh) = ctx.acquire_send_cap(svc) { handle = nh; }
+            if let Some(nh) = ctx.acquire_send_cap(svc) { ctx.remove_cap(handle); handle = nh; }
             continue;
         }
         // 3. Responsive? a send should land now that the queue has drained. EndpointDead = it died.
@@ -3454,7 +3462,7 @@ fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
             Ok(()) | Err(IpcError::QueueFull) => { ok_r[r] = true; survived += 1; }
             Err(IpcError::EndpointDead)       => {
                 if died_at.is_none() { died_at = Some(r as u32 + 1); }
-                if let Some(nh) = ctx.acquire_send_cap(svc) { handle = nh; }
+                if let Some(nh) = ctx.acquire_send_cap(svc) { ctx.remove_cap(handle); handle = nh; }
             }
             Err(_)                            => {}
         }
@@ -3478,9 +3486,14 @@ fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
     }
     // Final responsiveness check: is the service still accepting after the whole storm?
     let final_alive = match ctx.acquire_send_cap(svc) {
-        Some(fh) => !matches!(ctx.try_send_by_handle(fh, &msg), Err(IpcError::EndpointDead)),
+        Some(fh) => {
+            let alive = !matches!(ctx.try_send_by_handle(fh, &msg), Err(IpcError::EndpointDead));
+            ctx.remove_cap(fh);   // reclaim the probe cap
+            alive
+        }
         None     => false,
     };
+    ctx.remove_cap(handle);   // reclaim the flood handle before returning (no leak across calls)
     let _ = writeln!(rb, "survived: {}/{}; final responsive: {}; kernel: alive (no panic - this command returned)",
                      survived, rounds, if final_alive { "yes" } else { "no" });
     if let Some(d) = died_at {
@@ -3731,7 +3744,10 @@ fn carnage_flood(ctx: &ServiceContext, name: &str, cache: &mut Option<CapHandle>
         match ctx.try_send_by_handle(h, &msg) {
             Ok(())                      => sent += 1,
             Err(IpcError::QueueFull)    => { sat  = true; break; }
-            Err(IpcError::EndpointDead) => { died = true; *cache = None; break; }
+            // The target died: reclaim the now-dead cap BEFORE clearing the cache, else every
+            // service-death-during-flood leaks a slot and a long max-carnage fills the 64-slot cap
+            // table (the post-storm "storage unavailable" bug). The next call re-acquires a fresh cap.
+            Err(IpcError::EndpointDead) => { died = true; ctx.remove_cap(h); *cache = None; break; }
             Err(_)                      => break,
         }
     }
