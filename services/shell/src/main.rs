@@ -1461,8 +1461,8 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("chaos kill-storm <svc> [n] save <path>", "also write the report to a file (recorded in memory, written at the end)", "chaos kill-storm fs 20 save /chaos.txt"),
             ("  <svc> = supervisor | block-driver | fs", "recoverable targets: the supervisor respawns the services, the kernel respawns the supervisor - only the kernel can't be killed", "chaos kill-storm supervisor 10"),
             ("chaos flood-storm <svc> [rounds]", "saturate a service's IPC queue with try_send; verify it drains + stays alive (the other axis: 'overwhelmed', not 'gone')", "chaos flood-storm fs 5"),
-            ("chaos mem-pressure [rounds]", "spawn a mem-hog that allocs to its limit, kill it, confirm the memory is reclaimed (alloc-to-limit + no leak, S7)", "chaos mem-pressure 5"),
-            ("chaos spawn-storm [count]", "spawn mem-hogs until the task-pool/memory ceiling REFUSES one (loud Err, no panic), then kill all + confirm full reclaim", "chaos spawn-storm"),
+            ("chaos mem-pressure [rounds]", "spawn a mem-pressure that allocs to its limit, kill it, confirm the memory is reclaimed (alloc-to-limit + no leak, S7)", "chaos mem-pressure 5"),
+            ("chaos spawn-storm [count]", "spawn mem-pressure tasks until the task-pool/memory ceiling REFUSES one (loud Err, no panic), then kill all + confirm full reclaim", "chaos spawn-storm"),
             ("chaos max-carnage <all-services|svc> [n]", "the chaos monkey: storm RANDOM services (all-services) or aim every round at ONE (e.g. fs), under system-wide mem-pressure + spawn-storm; proves the KERNEL survives. Needs a SERIAL console - 'q' there aborts", "chaos max-carnage all-services 50"),
         ], true),
         "drives" => help_block(ctx, "drives", "manage attached disks (records when piped)", &[
@@ -3277,8 +3277,8 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
         ctx.console_writeln("chaos - bounded resilience exerciser. modes:");
         ctx.console_writeln("  kill-storm  <svc> [n]   kill a service n times; verify recovery");
         ctx.console_writeln("  flood-storm <svc> [n]   saturate its queue; verify it drains");
-        ctx.console_writeln("  mem-pressure      [n]   a mem-hog allocs to its limit, then reclaim");
-        ctx.console_writeln("  spawn-storm       [n]   spawn mem-hogs to the ceiling; loud refusal");
+        ctx.console_writeln("  mem-pressure      [n]   a mem-pressure allocs to its limit, then reclaim");
+        ctx.console_writeln("  spawn-storm       [n]   spawn mem-pressure tasks to the ceiling; loud refusal");
         ctx.console_writeln("  max-carnage <all-services|svc> [n]  all-services (random) or aim at one");
         ctx.console_writeln("                          (serial console required; 'q' there aborts)");
         ctx.console_writeln("  svc: supervisor | block-driver | fs | logger | xhci | ehci | shell");
@@ -3594,7 +3594,7 @@ fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
 }
 
 /// `chaos mem-pressure [rounds]` - on-device memory pressure (§22 S7) through the shell's legitimate
-/// caps. Each round spawns the `mem-hog` victim (which allocates 4 MiB chunks up to its contract limit,
+/// caps. Each round spawns the `mem-pressure` victim (which allocates 4 MiB chunks up to its contract limit,
 /// then AllocDenied - asserting the §10.3/§10.4 "denied is sticky" invariant in the hog itself), watches
 /// the kernel's free-frame count drop while the hog holds its allocation, then KILLS the hog and
 /// confirms the frames return to baseline. v1 reclaims memory only at death, so the kill IS the "free";
@@ -3616,7 +3616,7 @@ fn chaos_mem_pressure(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usiz
     let baseline = ctx.inspect_kernel_free_frames();
 
     ctx.console_writeln_fmt(format_args!(
-        "chaos mem-pressure: {} rounds - spawn mem-hog (allocs to its limit), then kill it and confirm the memory returns...", rounds));
+        "chaos mem-pressure: {} rounds - spawn mem-pressure (allocs to its limit), then kill it and confirm the memory returns...", rounds));
 
     let mut grabbed = [0u32;  CHAOS_MAX_ROUNDS as usize]; // frames the hog held (baseline - low)
     let mut leaked  = [0i64;  CHAOS_MAX_ROUNDS as usize]; // baseline - recovered (>0 = not fully reclaimed)
@@ -3625,7 +3625,7 @@ fn chaos_mem_pressure(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usiz
 
     for r in 0..rounds as usize {
         // 1. Spawn the hog; it allocs to its limit on a round-robin core.
-        let _ = ctx.spawn("mem-hog");
+        let _ = ctx.spawn("mem-pressure");
         // 2. Wait for the allocation to land - free frames drop. RTC-bounded; breaks early on success.
         let t0 = ctx.datetime().epoch_secs();
         let mut low = baseline;
@@ -3639,7 +3639,7 @@ fn chaos_mem_pressure(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usiz
         let dropped = baseline.saturating_sub(low);
         grabbed[r] = dropped.min(u32::MAX as u64) as u32;
         // 3. Kill the hog - the only way v1 reclaims its memory (§10.5).
-        let _ = ctx.kill("mem-hog");
+        let _ = ctx.kill("mem-pressure");
         // 4. Wait for reclaim - free frames return toward baseline. RTC-bounded.
         let t1 = ctx.datetime().epoch_secs();
         let mut hi = low;
@@ -3659,7 +3659,7 @@ fn chaos_mem_pressure(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usiz
     use core::fmt::Write as _;
     let mut rb = ReportBuf::new();
     let _ = writeln!(rb, "=== chaos mem-pressure: report ===");
-    let _ = writeln!(rb, "rounds: {}; mem-hog limit 32 MiB; system frames: {} total, {} free at baseline", rounds, total, baseline);
+    let _ = writeln!(rb, "rounds: {}; mem-pressure limit 32 MiB; system frames: {} total, {} free at baseline", rounds, total, baseline);
     for r in 0..rounds as usize {
         let leak = leaked[r].max(0);
         let _ = writeln!(rb, "round {:>3}: hog held {:>6} frames (~{} MiB) -> after kill, {} frames not back ({})",
@@ -3690,7 +3690,7 @@ fn count_live(ctx: &ServiceContext) -> u32 {
     n
 }
 
-/// Count currently-live tasks with a given name (there can be many - e.g. a swarm of mem-hogs).
+/// Count currently-live tasks with a given name (there can be many - e.g. a swarm of mem-pressure tasks).
 fn count_named(ctx: &ServiceContext, name: &str) -> u32 {
     let mut n = 0u32;
     for slot in 0..256u32 {
@@ -3700,7 +3700,7 @@ fn count_named(ctx: &ServiceContext, name: &str) -> u32 {
     n
 }
 
-/// `chaos spawn-storm [count]` - the GLOBAL-ceiling test (§26.6 bounded behaviour). Spawns mem-hog
+/// `chaos spawn-storm [count]` - the GLOBAL-ceiling test (§26.6 bounded behaviour). Spawns mem-pressure
 /// victims in a tight loop - each grabs its 32 MiB once scheduled - to slam BOTH global ceilings at
 /// once: the task-slot pool (224 kstack slots) and the system frame allocator. Keeps spawning until a
 /// spawn is REFUSED (the ceiling, whichever binds first on this machine) or `count`, proving the limit
@@ -3728,7 +3728,7 @@ fn chaos_spawn_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
     let live_before = count_live(ctx);
 
     ctx.console_writeln_fmt(format_args!(
-        "chaos spawn-storm: spawn up to {} mem-hogs to slam the task-pool + memory ceiling, then kill them all + confirm reclaim. q to quit.", count));
+        "chaos spawn-storm: spawn up to {} mem-pressure tasks to slam the task-pool + memory ceiling, then kill them all + confirm reclaim. q to quit.", count));
 
     // 1. Spawn until a spawn is REFUSED (the ceiling) or `count` or q.
     let mut spawned   = 0u32;
@@ -3736,7 +3736,7 @@ fn chaos_spawn_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
     let mut aborted   = false;
     for n in 0..count {
         if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { aborted = true; break; } }
-        if ctx.spawn("mem-hog").is_err() {
+        if ctx.spawn("mem-pressure").is_err() {
             refused_at = n + 1;   // the ceiling held - graceful refusal, no panic
             break;
         }
@@ -3746,12 +3746,12 @@ fn chaos_spawn_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
 
     let low       = ctx.inspect_kernel_free_frames();   // memory floor under the swarm
     let live_peak = count_live(ctx);
-    let hogs_peak = count_named(ctx, "mem-hog");
+    let hogs_peak = count_named(ctx, "mem-pressure");
 
     // 2. Kill every hog (loop until none remain). Bounded by a safety cap.
     let mut killed = 0u32;
-    while slot_of(ctx, "mem-hog").is_some() && killed < SPAWN_STORM_MAX + 16 {
-        let _ = ctx.kill("mem-hog");
+    while slot_of(ctx, "mem-pressure").is_some() && killed < SPAWN_STORM_MAX + 16 {
+        let _ = ctx.kill("mem-pressure");
         killed += 1;
         for _ in 0..KILL_SETTLE { ctx.yield_cpu(); }
     }
@@ -3768,7 +3768,7 @@ fn chaos_spawn_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
     }
     let recovered  = hi;
     let live_after = count_live(ctx);
-    let hogs_after = count_named(ctx, "mem-hog");
+    let hogs_after = count_named(ctx, "mem-pressure");
 
     use core::fmt::Write as _;
     let mut rb = ReportBuf::new();

@@ -355,10 +355,10 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // mem-hog: a spawn-on-demand memory-pressure victim for `chaos mem-pressure` (allocs 4 MiB
+        // mem-pressure: a spawn-on-demand memory-pressure victim for `chaos mem-pressure` (allocs 4 MiB
         // chunks up to this limit, then AllocDenied; killed to reclaim). Not in any auto-spawn set.
-        "mem-hog" => Some(("mem-hog", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_MEM_HOG_ELF")),
+        "mem-pressure" => Some(("mem-pressure", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_MEM_PRESSURE_ELF")),
             has_recv_endpoint: false,
             send_peers:        &[],
             send_peers_grant:  false,
@@ -371,7 +371,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // chaos: the spawn-on-demand system-stress orchestrator for `chaos max-carnage`. It kills +
         // floods other services and is the one program a run never kills (it excludes ITSELF). Holds
         // SERVICE_CONTROL (kill), INTROSPECT (task_stat victim selection), ACQUIRE_ANY (flood), SPAWN
-        // (mem-hog spawn-burst), CONSOLE_READ (q-poll + the foreground claim, syscall 40), LOG_WRITE
+        // (mem-pressure spawn-burst), CONSOLE_READ (q-poll + the foreground claim, syscall 40), LOG_WRITE
         // (the TUI, via ConsoleWrite). Excluded from auto-spawn; the shell spawns it by name on demand.
         "chaos" => Some(("chaos", ServiceConfig {
             elf:               include_bytes!(env!("SVC_CHAOS_ELF")),
@@ -3056,7 +3056,7 @@ fn spawn_service_with_config(
     let mut spawn_slot_u32 = u32::MAX;
     if name == "supervisor"            // init removed (Path C / Phase 5) - supervisor is the spawner
         || name == "shell"
-        || name == "chaos"             // spawns mem-hogs for the spawn-burst dimension of max-carnage
+        || name == "chaos"             // spawns mem-pressure tasks for the spawn-burst dimension of max-carnage
         || core::ptr::eq(elf_bytes.as_ptr(), PROBE_ELF.as_ptr())
     {
         let sp_slot = caps.insert(mint_cap(SPAWN_RESOURCE, Rights::WRITE))

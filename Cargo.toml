@@ -4,7 +4,7 @@ members = [
     "kernel",
     "services/supervisor",
     "services/logger",
-    "services/mem-hog",
+    "services/mem-pressure",
     "services/chaos",
     "services/block-driver",
     "services/fs",

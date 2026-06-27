@@ -20,7 +20,7 @@
 //! `max-carnage` takes an explicit TARGET: `all` aims kill/flood at random live services, a service
 //! name aims them at THAT service every round. Attacks split two ways: AIMED (kill-storm, flood-storm)
 //! are directed at a victim and shown as per-service table rows; SYSTEM-WIDE (mem-pressure = chaos's own
-//! alloc_mem, spawn-storm = mem-hogs) pressure the shared allocator + task pool, so they cannot be aimed
+//! alloc_mem, spawn-storm = mem-pressure tasks) pressure the shared allocator + task pool, so they cannot be aimed
 //! at one service and show as a single `system:` footer line. It does NOT track "recovered": that would
 //! mean asking the (also pummeled) supervisor for ground truth mid-storm. The one truth it fetches is the
 //! live victim list (for "all-services"). Each round it logs a one-line trail to the serial: the panel
@@ -57,16 +57,17 @@ fn slot_of(ctx: &ServiceContext, name: &str) -> Option<u32> {
 }
 
 /// A bounded frame buffer. The whole panel is built into one of these, then flushed in a couple of
-/// `console_write`s (not one per line), so the framebuffer redraws without flicker. `console_write` caps
-/// at 256 bytes, so `flush` writes <=240-byte chunks broken AT A NEWLINE, so a CSI escape / line is never
-/// split across two writes.
+/// `console_write`s (not one per line), so the framebuffer redraws without flicker. `console_write` now
+/// caps at 4096 bytes (one page), so the whole <=2048-byte panel flushes in ONE write and the framebuffer
+/// repaints in a single pass instead of ~4 bursts - that single pass is what removes the flicker. The
+/// newline-break below still applies if a frame ever exceeds the cap, so a CSI escape is never split.
 struct FrameBuf { buf: [u8; 2048], len: usize }
 impl FrameBuf {
     fn new() -> Self { Self { buf: [0; 2048], len: 0 } }
     fn flush(&self, ctx: &ServiceContext) {
         let mut s = 0;
         while s < self.len {
-            let mut e = (s + 240).min(self.len);
+            let mut e = (s + self.buf.len()).min(self.len);
             if e < self.len {
                 let mut b = e;
                 while b > s && self.buf[b - 1] != b'\n' { b -= 1; }
@@ -170,7 +171,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Roll ONE attack. KILL/FLOOD are AIMED at a victim (per-service tally); MEM-PRESSURE + SPAWN-STORM
         // are SYSTEM-WIDE (they pressure the shared frame allocator + task pool, which cannot be aimed at one
         // service), so they are global counters only. Pick the aimed victim: for "all-services" a random live
-        // service (the ONLY truth chaos fetches), excluding chaos itself, the mem-hog it spawns, and
+        // service (the ONLY truth chaos fetches), excluding chaos itself, the mem-pressure it spawns, and
         // transient observe-* tools; for a specific target, THAT service every round.
         rng = xorshift64(rng);
         let action = rng % 4;
@@ -184,7 +185,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     let st = ctx.task_stat(slot);
                     if !st.valid || st.state == 4 { continue; }
                     let nm = st.name_str();
-                    if nm.is_empty() || nm == "chaos" || nm == "mem-hog" || nm.starts_with("observe") { continue; }
+                    if nm.is_empty() || nm == "chaos" || nm == "mem-pressure" || nm.starts_with("observe") { continue; }
                     if ncand < MAX_CAND {
                         let b = nm.as_bytes(); let l = b.len().min(24);
                         cand[ncand].0[..l].copy_from_slice(&b[..l]); cand[ncand].1 = l; ncand += 1;
@@ -246,8 +247,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // contract limit bounds it (later allocs return AllocDenied - still count the attempt) and the
             // footprint is reclaimed when chaos self-kills. A global counter only.
             2 => { let _ = ctx.alloc_mem(MEMP_CHUNK); mempr += 1; victim_label = "system"; }
-            // SPAWN-STORM (system-wide): spawn a mem-hog (a no-op if one already runs; reclaimed at end).
-            _ => { let _ = ctx.spawn("mem-hog"); spawns += 1; victim_label = "system"; }
+            // SPAWN-STORM (system-wide): spawn a mem-pressure (a no-op if one already runs; reclaimed at end).
+            _ => { let _ = ctx.spawn("mem-pressure"); spawns += 1; victim_label = "system"; }
         }
 
         // Redraw the per-service TABLE in place. We build the whole frame into one buffer and flush it in
@@ -258,9 +259,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // shows only what chaos FIRED - the kills + floods it itself counted - plus the global spawn count.
         let mut f = FrameBuf::new();
         let _ = write!(f, "\x1b[H");
-        let _ = write!(f, "  C H A O S   max-carnage    target: {}    (q via SERIAL)\x1b[K\r\n", target);
+        let _ = write!(f, "  C H A O S   max-carnage    target: {}    ('q' to quit via SERIAL)\x1b[K\r\n", target);
         if rounds > 0 {
-            let _ = write!(f, "  round {} / {}\x1b[K\r\n", round, rounds);
+            let pct = round * 100 / rounds; // round <= rounds, so 1..=100; rounds>0 guards the divide
+            let _ = write!(f, "  round {} / {} ({}%)\x1b[K\r\n", round, rounds, pct);
         } else {
             let _ = write!(f, "  round {}  (until q)\x1b[K\r\n", round);
         }
@@ -306,8 +308,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // Reclaim any flood caps still cached, so the run leaves the cap table as it found it.
     for c in sv_floodcap.iter_mut() { if let Some(h) = c.take() { ctx.remove_cap(h); } }
-    // Reclaim the last spawn-storm mem-hog (one runs at a time), so the run leaves memory as it found it.
-    let _ = ctx.kill("mem-hog");
+    // Reclaim the last spawn-storm mem-pressure (one runs at a time), so the run leaves memory as it found it.
+    let _ = ctx.kill("mem-pressure");
 
     // HANDOFF - the order is load-bearing. Our last kill may have just taken the shell, so FIRST wait
     // (bounded) for a live shell to hand the keyboard back to, THEN release the foreground so that shell

@@ -7,7 +7,7 @@
 
 fn main() {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    // services/mem-hog → services/ → workspace root
+    // services/mem-pressure → services/ → workspace root
     let workspace = std::path::Path::new(&manifest)
         .parent().unwrap()
         .parent().unwrap();

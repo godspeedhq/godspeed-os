@@ -33,7 +33,7 @@ fn main() {
     let services: &[(&str, &str)] = &[
         ("SUPERVISOR", "supervisor"),  // init removed (Phase 5); registry retired (Phase 4)
         ("LOGGER",     "logger"),
-        ("MEM_HOG",    "mem-hog"),
+        ("MEM_PRESSURE",    "mem-pressure"),
         ("CHAOS",      "chaos"),
         ("PING",       "ping"),
         ("PONG",       "pong"),
