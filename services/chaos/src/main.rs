@@ -152,6 +152,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut sv_killed:  [u64;      MAX_SVC] = [0u64;      MAX_SVC]; // AIMED, per-service
     let mut sv_flooded: [u64;      MAX_SVC] = [0u64;      MAX_SVC]; // AIMED, per-service
     let mut sv_floodcap:[Option<CapHandle>; MAX_SVC] = [None; MAX_SVC];
+    // Why a service's flood column is N/A rather than a misleading 0: 0 = floodable (show the count),
+    // 1 = reply-style (we kill it instead - flooding corrupts its reply stream), 2 = no acquirable send
+    // endpoint (acquire_send_cap returned None). Discovered at runtime, not hardcoded.
+    let mut sv_flood_na: [u8; MAX_SVC] = [0u8; MAX_SVC];
     let mut nsv = 0usize;
 
     let (mut round, mut killed, mut flooded, mut mempr, mut spawns) = (0u64, 0u64, 0u64, 0u64, 0u64);
@@ -229,8 +233,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         killed += 1; sv_killed[s] += 1;
                         if let Some(h) = sv_floodcap[s].take() { ctx.remove_cap(h); }
                         attack_name = "kill-storm";
-                    } else if flood(&ctx, name, &mut sv_floodcap[s]).is_some() {
-                        flooded += 1; sv_flooded[s] += 1;
+                        sv_flood_na[s] = 1; // reply-style: flood is N/A, we killed it instead
+                    } else {
+                        match flood(&ctx, name, &mut sv_floodcap[s]) {
+                            Some(_) => { flooded += 1; sv_flooded[s] += 1; } // floodable: na stays 0
+                            None    => { sv_flood_na[s] = 2; } // acquire_send_cap failed: no floodable endpoint
+                        }
                     }
                 }
             }
@@ -260,9 +268,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let _ = write!(f, "  {:<16} {:>10} {:>11}\x1b[K\r\n", "service", "kill-storm", "flood-storm");
         for s in 0..nsv {
             let nm = str_of(&sv_name[s][..sv_nlen[s]]);
-            let _ = write!(f, "  {:<16} {:>10} {:>11}\x1b[K\r\n", nm, sv_killed[s], sv_flooded[s]);
+            // flood cell: a LOUD N/A (with the reason) where flooding does not apply, else the count. A
+            // bare 0 reads as "tried, got nothing"; this says "not applicable, and why".
+            match sv_flood_na[s] {
+                1 => { let _ = write!(f, "  {:<16} {:>10} {:>11}\x1b[K\r\n", nm, sv_killed[s], "N/A (reply)"); }
+                2 => { let _ = write!(f, "  {:<16} {:>10} {:>11}\x1b[K\r\n", nm, sv_killed[s], "N/A (no-ep)"); }
+                _ => { let _ = write!(f, "  {:<16} {:>10} {:>11}\x1b[K\r\n", nm, sv_killed[s], sv_flooded[s]); }
+            }
         }
         let _ = write!(f, "  ----------------------------------------------------\x1b[K\r\n");
+        let _ = write!(f, "  flood N/A: reply = killed instead (reply-style); no-ep = no send endpoint\x1b[K\r\n");
         let _ = write!(f, "  system:  mem-pressure {}   spawn-storm {}\x1b[K\r\n", mempr, spawns);
         let _ = write!(f, "  kernel: ALIVE   abort: 'q' in the SERIAL console (keyboard dead)\x1b[K\r\n");
         f.flush(&ctx);
