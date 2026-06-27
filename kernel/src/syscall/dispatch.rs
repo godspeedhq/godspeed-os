@@ -219,7 +219,11 @@ fn handle_console_write(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
         Some(b) => b,
         None    => return -1,
     };
-    crate::arch::x86_64::console_write_bytes(bytes);
+    // Console foreground gate: while a TUI app (e.g. `chaos`, syscall 40) owns the screen, a
+    // backgrounded task's output goes to serial only - it must not smear the app's framebuffer. The
+    // owner (or unclaimed = the normal case) writes to both.
+    let to_fb = crate::arch::x86_64::console_foreground_allows(scheduler::current_task_slot() as u32);
+    crate::arch::x86_64::console_write_bytes_gated(bytes, to_fb);
     0
 }
 

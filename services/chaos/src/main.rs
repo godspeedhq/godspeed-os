@@ -119,8 +119,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Take the keyboard so a resurrected shell cannot steal our `q`. This is the moment the shell goes
     // "muted" for the duration of the run (unclaimed is the normal state, so this changes nothing else).
     ctx.claim_console_foreground();
-    ctx.console_writeln(
-        "chaos max-carnage: kill / FLOOD / kill-then-flood a random LIVE service each round - the SHELL included now. Press q to quit.");
+    // chaos owns the screen now: the foreground gate sends every backgrounded task's console output to
+    // serial only, so the muted shell can no longer smear our display. Clear it for a fresh canvas.
+    ctx.console_write("\x1b[2J\x1b[H");
 
     // RNG seed: the TSC mixed with the wall clock; never zero.
     let mut rng = ctx.read_tsc()
@@ -186,33 +187,52 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Roll the action: 0 = kill, 1 = flood, 2 = kill-then-flood.
         rng = xorshift64(rng);
         let action = rng % 3;
+        let (mut did_kill, mut did_flood, mut rec) = (false, false, false);
         if let Some(s) = idx {
             if action == 1 || action == 2 {
-                if flood(&ctx, name, &mut sv_floodcap[s]).is_some() { flooded += 1; sv_flooded[s] += 1; }
+                if flood(&ctx, name, &mut sv_floodcap[s]).is_some() { flooded += 1; sv_flooded[s] += 1; did_flood = true; }
             }
             if action == 0 || action == 2 {
                 let _ = ctx.kill(name);
-                killed += 1; sv_killed[s] += 1;
+                killed += 1; sv_killed[s] += 1; did_kill = true;
                 // The kill bumped the endpoint generation; the cached flood cap is now stale. RECLAIM it
                 // (don't just drop the handle) so a long run does not fill the 64-slot cap table.
                 if let Some(h) = sv_floodcap[s].take() { ctx.remove_cap(h); }
                 // Confirm recovery for the restartable set (shell included - it respawns a fresh prompt).
                 if RESTARTABLE.contains(&name) && wait_recovery(&ctx, name, og) {
-                    recovered += 1; sv_recov[s] += 1;
+                    recovered += 1; sv_recov[s] += 1; rec = true;
                 }
             }
         }
 
-        // In-place heartbeat. The console is the kernel's framebuffer/serial (not a service), so it
-        // survives the carnage; `\r` rewrites the line in place, trailing spaces clear the previous one.
-        if round % 16 == 0 {
-            ctx.console_write_fmt(format_args!(
-                "\rmax-carnage: {} rounds - {} kills, {} recovered, {} floods - kernel alive - q to quit    ",
-                round, killed, recovered, flooded));
+        // Redraw the status frame in place every round. chaos owns the framebuffer (the foreground gate
+        // sends every backgrounded task's output to serial only), so nothing smears it. CSI home +
+        // erase-down clears the previous frame; the serial log keeps the full per-round stream regardless.
+        let last = if did_kill && rec { "killed -> recovered" }
+                   else if did_kill && RESTARTABLE.contains(&name) { "killed -> down (recovering)" }
+                   else if did_kill { "killed (not restartable - stays down)" }
+                   else if did_flood { "flooded" }
+                   else { "no reachable victim" };
+        ctx.console_write("\x1b[H\x1b[J");
+        ctx.console_writeln("  C H A O S   max-carnage          press q to quit");
+        ctx.console_writeln("  --------------------------------------------------");
+        if rounds > 0 {
+            ctx.console_writeln_fmt(format_args!("    round        {} / {}", round, rounds));
+        } else {
+            ctx.console_writeln_fmt(format_args!("    round        {}   (until q)", round));
         }
+        ctx.console_writeln_fmt(format_args!("    killed       {}", killed));
+        ctx.console_writeln_fmt(format_args!("    recovered    {}", recovered));
+        ctx.console_writeln_fmt(format_args!("    flooded      {}", flooded));
+        ctx.console_writeln("");
+        ctx.console_writeln_fmt(format_args!("    last victim  {}  ({})", name, last));
+        ctx.console_writeln("");
+        ctx.console_writeln("  kernel: ALIVE   (this frame still updating = no panic)");
     }
 
-    ctx.console_writeln(""); // end the in-place heartbeat line before the report
+    // Clear the live frame and print the final report as normal scrolling text, so it stays readable and
+    // the shell's prompt continues below it once we release the foreground.
+    ctx.console_write("\x1b[2J\x1b[H");
     ctx.console_writeln("=== chaos max-carnage: report ===");
     for s in 0..nsv {
         let nm = str_of(&sv_name[s][..sv_nlen[s]]);

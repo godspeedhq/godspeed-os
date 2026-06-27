@@ -482,8 +482,16 @@ pub fn console_write_byte(b: u8) {
 
 /// Write bytes to the interactive console - COM1 (serialised) and the framebuffer.
 pub fn console_write_bytes(s: &[u8]) {
+    console_write_bytes_gated(s, true);
+}
+
+/// As `console_write_bytes`, but `to_fb` controls whether the FRAMEBUFFER is written (serial always
+/// is). The console foreground gate passes `false` for a backgrounded task while a TUI app (e.g.
+/// `chaos`, syscall 40) owns the screen, so a muted task's output reaches serial only and never smears
+/// the foreground app's display - the owner owns the screen for output as well as input.
+pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {
     serial_write_bytes_lockfree(s);
-    if !boot_log_to_fb() {
+    if to_fb && !boot_log_to_fb() {
         // One lock + one WC flush for the whole string, so it is atomic against
         // another core's console output (no interleaving mid-string).
         fb::put_bytes(s);
