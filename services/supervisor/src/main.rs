@@ -173,6 +173,37 @@ fn ensure_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &
     spawn_wired(ctx, map, name, peers)
 }
 
+/// Reconcile to desired state: respawn any managed restartable service that is NOT actually alive. A
+/// death notification can be DROPPED under a storm - our death-notification endpoint is 16-deep, so a
+/// burst of deaths (or chaos flooding us) overflows it and a dropped name is silently never restarted
+/// (the "fs gone from observe after a storm" bug). `acquire_*_cap` cannot detect this (the kernel
+/// directory keeps a dead service's name), so we scan REAL liveness via `task_stat`. Order matters:
+/// block-driver before fs before shell (each wires to the previous). Returns how many it respawned.
+fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap) -> u32 {
+    const MANAGED: [&str; 6] = ["block-driver", "fs", "shell", "xhci", "ehci", "logger"];
+    let mut alive = [false; 6];
+    for slot in 0..256u32 {
+        let st = ctx.task_stat(slot);
+        if !st.valid || st.state == 4 { continue; } // 4 = Dead
+        let nm = st.name_str();
+        for i in 0..MANAGED.len() { if nm == MANAGED[i] { alive[i] = true; } }
+    }
+    let mut n = 0;
+    for i in 0..MANAGED.len() {
+        if alive[i] { continue; }
+        let ok = match MANAGED[i] {
+            "fs"    => spawn_wired(ctx, map, "fs", &["block-driver"]),
+            "shell" => spawn_wired(ctx, map, "shell", &["fs"]),
+            other   => spawn_mapped(ctx, map, other, 0xFFFF),
+        };
+        if ok {
+            n += 1;
+            ctx.log_fmt(format_args!("supervisor: reconcile respawned {} (missed death notification)", MANAGED[i]));
+        }
+    }
+    n
+}
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Naming migration (docs/naming-design.md): `name → cap` map, built as we spawn the real
@@ -380,6 +411,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
             _ => {}
         }
+        // Reconcile backstop: catch any managed service whose death notification was DROPPED under the
+        // storm (our 16-deep endpoint overflowed, or a flood clogged it) - it would otherwise stay dead
+        // forever (the "fs gone from observe after a storm" bug). A storm always has a next death to
+        // ride, so a dropped one is recovered on the following notification. Cheap when nothing is dead.
+        reconcile(&ctx, &mut name_map);
     }
 }
 

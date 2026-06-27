@@ -3140,6 +3140,8 @@ fn spawn_service_with_config(
     // query 2). Self-state (own alloc bytes) and the TSC stay ungated, so every
     // other service needs nothing. No slot is stored - the gate scans holdings.
     if name == "shell"
+        || name == "supervisor"        // task_stat: the reconcile loop scans real liveness to respawn a
+                                       //   service whose death notification was dropped under a storm
         || name == "chaos"             // task_stat: victim selection + recovery checks in max-carnage
         || name.starts_with("observe") // observe + observe-now (and future modes)
         || name.starts_with("prop-")
