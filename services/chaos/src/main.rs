@@ -137,7 +137,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut sv_floodcap:[Option<CapHandle>; MAX_SVC] = [None; MAX_SVC];
     let mut nsv = 0usize;
 
-    let (mut round, mut killed, mut recovered, mut flooded) = (0u64, 0u64, 0u64, 0u64);
+    let (mut round, mut killed, mut recovered, mut flooded, mut spawns) = (0u64, 0u64, 0u64, 0u64, 0u64);
 
     loop {
         // `q` aborts. The kernel buffers the keypress across input-driver churn, so it is caught here.
@@ -184,11 +184,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             None => None,
         };
 
-        // Roll the action: 0 = kill, 1 = flood, 2 = kill-then-flood.
+        // Roll the action: 0 = kill, 1 = flood, 2 = kill-then-flood, 3 = spawn a mem-hog. One counter per
+        // kind; we just record what chaos fired (the act is the test, not the target or the outcome).
         rng = xorshift64(rng);
-        let action = rng % 3;
-        let (mut did_kill, mut did_flood, mut rec) = (false, false, false);
-        if let Some(s) = idx {
+        let action = rng % 4;
+        if action == 3 {
+            // Spawn storm: fire a mem-hog. A no-op if one is already running (one name -> one instance);
+            // it allocs to its own contract limit and is reclaimed at the end. We count the firing either
+            // way - accuracy is not required (per design: "chaos is the one firing it, just record it").
+            let _ = ctx.spawn("mem-hog");
+            spawns += 1;
+        } else if let Some(s) = idx {
             // Do NOT flood REPLY-STYLE services (shell, fs). They block on their recv endpoint for a
             // SPECIFIC reply - the shell for an fs reply / pipe input, fs for block-driver's superblock /
             // data reply - not a drain loop, so flood junk is read AS that reply: the shell's 16/16 clog,
@@ -197,17 +203,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // just corrupts a reply they cannot disambiguate. (Drain-style servers like block-driver and
             // logger consume + drop junk, so they stay floodable.)
             if (action == 1 || action == 2) && name != "shell" && name != "fs" {
-                if flood(&ctx, name, &mut sv_floodcap[s]).is_some() { flooded += 1; sv_flooded[s] += 1; did_flood = true; }
+                if flood(&ctx, name, &mut sv_floodcap[s]).is_some() { flooded += 1; sv_flooded[s] += 1; }
             }
             if action == 0 || action == 2 {
                 let _ = ctx.kill(name);
-                killed += 1; sv_killed[s] += 1; did_kill = true;
+                killed += 1; sv_killed[s] += 1;
                 // The kill bumped the endpoint generation; the cached flood cap is now stale. RECLAIM it
                 // (don't just drop the handle) so a long run does not fill the 64-slot cap table.
                 if let Some(h) = sv_floodcap[s].take() { ctx.remove_cap(h); }
                 // Confirm recovery for the restartable set (shell included - it respawns a fresh prompt).
                 if RESTARTABLE.contains(&name) && wait_recovery(&ctx, name, og) {
-                    recovered += 1; sv_recov[s] += 1; rec = true;
+                    recovered += 1; sv_recov[s] += 1;
                 }
             }
         }
@@ -218,11 +224,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // it and reads as heavy flicker on the framebuffer). Each line ends in `\x1b[K` (erase to end of
         // line) so a shorter value cleanly overwrites a longer previous one. The screen was cleared once
         // on claim; the frame is always the same height, so nothing stale lingers below it.
-        let last = if did_kill && rec { "killed -> recovered" }
-                   else if did_kill && RESTARTABLE.contains(&name) { "killed -> down (recovering)" }
-                   else if did_kill { "killed (not restartable - stays down)" }
-                   else if did_flood { "flooded" }
-                   else { "no reachable victim" };
         ctx.console_write("\x1b[H");
         ctx.console_write("  C H A O S   max-carnage          press q to quit\x1b[K\r\n");
         ctx.console_write("  --------------------------------------------------\x1b[K\r\n");
@@ -231,11 +232,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         } else {
             ctx.console_write_fmt(format_args!("    round        {}   (until q)\x1b[K\r\n", round));
         }
-        ctx.console_write_fmt(format_args!("    killed       {}\x1b[K\r\n", killed));
+        // One counter per kind of carnage chaos fires - just what it did, not the target or the outcome.
+        ctx.console_write_fmt(format_args!("    kill storm   {}\x1b[K\r\n", killed));
+        ctx.console_write_fmt(format_args!("    flood storm  {}\x1b[K\r\n", flooded));
+        ctx.console_write_fmt(format_args!("    spawn storm  {}\x1b[K\r\n", spawns));
         ctx.console_write_fmt(format_args!("    recovered    {}\x1b[K\r\n", recovered));
-        ctx.console_write_fmt(format_args!("    flooded      {}\x1b[K\r\n", flooded));
-        ctx.console_write("\x1b[K\r\n");
-        ctx.console_write_fmt(format_args!("    last victim  {}  ({})\x1b[K\r\n", name, last));
         ctx.console_write("\x1b[K\r\n");
         ctx.console_write("  kernel: ALIVE   (this frame still updating = no panic)\x1b[K\r\n");
     }
@@ -250,11 +251,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             "  {:<14} killed {:>5}  recovered {:>5}  flooded {:>5}", nm, sv_killed[s], sv_recov[s], sv_flooded[s]));
     }
     ctx.console_writeln_fmt(format_args!(
-        "total: {} rounds, {} kills, {} recovered, {} floods. kernel: alive (this command returned).",
-        round, killed, recovered, flooded));
+        "total: {} rounds, {} kills, {} recovered, {} floods, {} spawns. kernel: alive (this command returned).",
+        round, killed, recovered, flooded, spawns));
 
     // Reclaim any flood caps still cached, so the run leaves the cap table as it found it.
     for c in sv_floodcap.iter_mut() { if let Some(h) = c.take() { ctx.remove_cap(h); } }
+    // Reclaim the last spawn-storm mem-hog (one runs at a time), so the run leaves memory as it found it.
+    let _ = ctx.kill("mem-hog");
 
     // HANDOFF - the order is load-bearing. Our last kill may have just taken the shell, so FIRST wait
     // (bounded) for a live shell to hand the keyboard back to, THEN release the foreground so that shell
