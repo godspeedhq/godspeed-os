@@ -214,11 +214,7 @@ fn handle_console_write(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
         return cap_err_to_i64(CapError::CapWrongScope);
     }
     let len = msg_len as usize;
-    // One page (matches the §8.5 max message size). Raised from 256 so a full-screen TUI panel (e.g.
-    // `chaos`, up to ~2 KiB) lands in ONE console_write and the framebuffer repaints in a single pass
-    // instead of several bursts - that single pass is what removes the on-screen flicker. read_user_bytes
-    // is zero-copy (a validated slice into user VA), so a larger len needs no bigger kernel buffer.
-    if len == 0 || len > 4096 { return -1; }
+    if len == 0 || len > 256 { return -1; }
     let bytes = match read_user_bytes(msg_ptr, len) {
         Some(b) => b,
         None    => return -1,

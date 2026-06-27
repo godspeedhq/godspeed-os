@@ -57,17 +57,18 @@ fn slot_of(ctx: &ServiceContext, name: &str) -> Option<u32> {
 }
 
 /// A bounded frame buffer. The whole panel is built into one of these, then flushed in a couple of
-/// `console_write`s (not one per line), so the framebuffer redraws without flicker. `console_write` now
-/// caps at 4096 bytes (one page), so the whole <=2048-byte panel flushes in ONE write and the framebuffer
-/// repaints in a single pass instead of ~4 bursts - that single pass is what removes the flicker. The
-/// newline-break below still applies if a frame ever exceeds the cap, so a CSI escape is never split.
+/// `console_write`s (not one per line), in <=240-byte chunks broken AT A NEWLINE: `console_write` caps at
+/// 256 bytes (BOTH the SDK wrapper and the kernel syscall), and a chunk must never split a CSI escape /
+/// line across two writes. NOTE: do NOT collapse this to one whole-panel write to "stop flicker" - the
+/// per-round redraw showing the counters change IS the intended feedback, not a rendering bug, and a
+/// >256B write is silently dropped by the SDK cap so the panel vanishes (tried 2026-06-27, reverted).
 struct FrameBuf { buf: [u8; 2048], len: usize }
 impl FrameBuf {
     fn new() -> Self { Self { buf: [0; 2048], len: 0 } }
     fn flush(&self, ctx: &ServiceContext) {
         let mut s = 0;
         while s < self.len {
-            let mut e = (s + self.buf.len()).min(self.len);
+            let mut e = (s + 240).min(self.len);
             if e < self.len {
                 let mut b = e;
                 while b > s && self.buf[b - 1] != b'\n' { b -= 1; }
