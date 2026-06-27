@@ -439,6 +439,13 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
     let cmd = match words.next() { Some(c) => c, None => return false };
     let prior = words.clone().count();                        // args typed before the current token
 
+    // `chaos max-carnage <target>`: complete the 2nd arg as the target (all-services + the service names).
+    if "chaos".as_bytes() == cmd && prior == 1 && words.clone().next() == Some("max-carnage".as_bytes()) {
+        const TARGETS: &[&str] =
+            &["all-services", "supervisor", "block-driver", "fs", "logger", "xhci", "ehci", "shell"];
+        return complete_from_list(ctx, line, tok_start, TARGETS);
+    }
+
     if let Some((_, cands)) = SUBCMD_FIRST.iter().find(|(c, _)| c.as_bytes() == cmd) {
         // First-argument keyword only: a later arg is a path/value (e.g. `write append /f`), not a key.
         return prior == 0 && complete_from_list(ctx, line, tok_start, cands);
@@ -1456,7 +1463,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("chaos flood-storm <svc> [rounds]", "saturate a service's IPC queue with try_send; verify it drains + stays alive (the other axis: 'overwhelmed', not 'gone')", "chaos flood-storm fs 5"),
             ("chaos mem-pressure [rounds]", "spawn a mem-hog that allocs to its limit, kill it, confirm the memory is reclaimed (alloc-to-limit + no leak, S7)", "chaos mem-pressure 5"),
             ("chaos spawn-storm [count]", "spawn mem-hogs until the task-pool/memory ceiling REFUSES one (loud Err, no panic), then kill all + confirm full reclaim", "chaos spawn-storm"),
-            ("chaos max-carnage [rounds] [save <path>]", "the chaos monkey: kill a RANDOM live service each round (everything but the shell); proves the KERNEL survives arbitrary carnage", "chaos max-carnage 30"),
+            ("chaos max-carnage <all-services|svc> [n]", "the chaos monkey: storm RANDOM services (all-services) or aim every round at ONE (e.g. fs), under system-wide mem-pressure + spawn-storm; proves the KERNEL survives. Needs a SERIAL console - 'q' there aborts", "chaos max-carnage all-services 50"),
         ], true),
         "drives" => help_block(ctx, "drives", "manage attached disks (records when piped)", &[
             ("drives", "list attached drive(s)", "drives"),
@@ -3272,7 +3279,7 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
         ctx.console_writeln("  flood-storm <svc> [n]   saturate its queue; verify it drains");
         ctx.console_writeln("  mem-pressure      [n]   a mem-hog allocs to its limit, then reclaim");
         ctx.console_writeln("  spawn-storm       [n]   spawn mem-hogs to the ceiling; loud refusal");
-        ctx.console_writeln("  max-carnage <all-services|svc> [n]  random services, or one named");
+        ctx.console_writeln("  max-carnage <all-services|svc> [n]  all-services (random) or aim at one");
         ctx.console_writeln("                          (serial console required; 'q' there aborts)");
         ctx.console_writeln("  svc: supervisor | block-driver | fs | logger | xhci | ehci | shell");
         return Ok(());
@@ -3284,8 +3291,12 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
         "spawn-storm"  => chaos_spawn_storm(ctx, cwd, &tok, ntok),
         "max-carnage"  => {
             // The target is required now: <all-services|service>. tok[1] = target, tok[2] = rounds.
-            if ntok < 2 {
+            // No target, or an explicit `help`, prints the usage + the two modes.
+            if ntok < 2 || tok[1] == "help" {
                 ctx.console_writeln("usage: chaos max-carnage <all-services|service> [rounds]");
+                ctx.console_writeln("  all-services   storm a RANDOM live service each round");
+                ctx.console_writeln("  <service>      aim every round at one service (e.g. fs, logger)");
+                ctx.console_writeln("  both run under system-wide mem-pressure + spawn-storm. q in SERIAL aborts.");
                 Ok(())
             } else {
                 let rounds = if ntok >= 3 { parse_u32(tok[2]).unwrap_or(0) } else { 0 };
