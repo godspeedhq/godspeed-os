@@ -33,6 +33,15 @@ const CAP_HCIVERSION: usize = 0x02; // u16 - BCD interface version
 const CAP_HCSPARAMS:  usize = 0x04; // u32 - structural parameters
 const CAP_HCCPARAMS:  usize = 0x08; // u32 - capability parameters
 
+/// Idle forever by DRAINING our IPC endpoint, never `ctx.park()`. A registered driver that parks
+/// never recv's, so a flood-storm (or any stray send) fills its 16-deep queue and it sits at 16/16
+/// FOREVER - the logger stub bug in another guise. recv() parks the task between messages, so the
+/// core still idles; it just no longer clogs. Used at every dead end where ehci has nothing left to
+/// do (no controller MMIO, reset failed, or no high-speed device present at boot).
+fn idle_draining(ctx: &ServiceContext) -> ! {
+    loop { let _ = ctx.recv(); }
+}
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("ehci: driver starting");
@@ -41,7 +50,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         Some(m) => m,
         None => {
             ctx.log("ehci: no controller MMIO granted - idling");
-            ctx.park();
+            idle_draining(&ctx);
         }
     };
 
@@ -88,7 +97,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) | CMD_HCRESET);
     if !wait(&mmio, op + OP_USBCMD, CMD_HCRESET, false) {
         ctx.log("ehci: WARN - HCRESET did not complete (E2b handoff needed); idling");
-        ctx.park();
+        idle_draining(&ctx);
     }
     ctx.log("ehci: controller reset");
 
@@ -167,7 +176,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         }
     }
 
-    ctx.park();
+    idle_draining(&ctx);
 }
 
 // --- EHCI async-schedule registers + DMA layout for the control transfer ---
@@ -614,6 +623,9 @@ fn wait_for_connection(
             }
         }
         delay_cycles(ctx, DEBOUNCE_CYCLES); // ~50 ms between polls
+        // Drain our IPC endpoint while we idle here with no HID attached (the active path drains in
+        // poll_devices). Without it a flood-storm clogs our 16-deep queue permanently - see xhci.
+        while ctx.try_recv().is_some() {}
         ctx.yield_cpu();
     }
 }

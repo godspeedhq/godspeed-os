@@ -135,6 +135,11 @@ fn wait_for_port(ctx: &ServiceContext, mmio: &Mmio, op: usize, max_ports: u32) {
             }
             if !c { base &= !(1 << p); } // a known device left; its port can be reused
         }
+        // Drain our IPC endpoint while we idle here. This wait - NOT the 'poll loop - is where a driver
+        // with no HID attached lives, and 'poll is the only other place we drain. Without this, a chaos
+        // flood-storm (or any stray send) fills our 16-deep queue and it sits at 16/16 FOREVER, exactly
+        // the logger stub bug in another guise. try_recv is non-blocking, so the port poll is unaffected.
+        while ctx.try_recv().is_some() {}
         ctx.yield_cpu();
     }
 }
