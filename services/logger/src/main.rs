@@ -23,9 +23,13 @@ use godspeed_sdk::ServiceContext;
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("logger: ready");
 
-    // Stub: no IPC log draining yet (services log via the kernel ring buffer, not
-    // by sending to this service). Park instead of busy-yielding so core 0 can
-    // reach the idle loop and halt. A real recv loop replaces this once the logger
-    // gains an input endpoint (see CLAUDE.md).
-    ctx.park();
+    // No IPC log protocol yet (services log via the kernel ring buffer, not by sending to this service).
+    // But the endpoint EXISTS, so we MUST drain it: otherwise anything sent here - a chaos flood-storm, a
+    // stray send - fills the 16-deep queue and it sits at 16/16 FOREVER (a stub that just parks never
+    // recv's). Block on recv and drop each message; recv parks the task between messages, so the core
+    // still idles (no busy-loop), exactly as the old park did - it just no longer clogs. A real recv loop
+    // that decodes + writes log records replaces the drop once the input format lands (see CLAUDE.md).
+    loop {
+        let _ = ctx.recv();
+    }
 }
