@@ -72,6 +72,28 @@ fn bcd_to_bin(v: u8) -> u8 {
     (v & 0x0F) + ((v >> 4) * 10)
 }
 
+/// Read the RTC wall-clock, retrying for a plausible result. A glitched year/century register (a rare
+/// CMOS misread) would otherwise stamp a wild datetime; because the boot stamp and each task's spawn
+/// stamp are captured ONCE and stick, a single bad read makes every uptime delta from it enormous - the
+/// ~1.7e9-second values seen in `observe`/`uptime`. `read_datetime_raw`'s double-read already rejects a
+/// tick landing mid-read; this outer guard additionally rejects a decoded year outside a plausible
+/// window and re-reads (bounded). If every attempt is implausible (a truly stuck RTC) it returns the
+/// last read - the per-service uptime is still capped at the system uptime downstream (scheduler).
+pub fn read_datetime() -> u64 {
+    let mut dt = read_datetime_raw();
+    let mut tries = 0;
+    while !year_plausible(dt) && tries < 8 {
+        dt = read_datetime_raw();
+        tries += 1;
+    }
+    dt
+}
+
+/// A decoded year inside the window this build can sanely run in; a read outside it is a glitch.
+fn year_plausible(packed: u64) -> bool {
+    (2020..=2100).contains(&((packed >> 26) & 0xFFF))
+}
+
 /// Read the RTC and return the wall-clock date/time packed into a `u64`:
 ///
 /// ```text
@@ -87,7 +109,7 @@ fn bcd_to_bin(v: u8) -> u8 {
 /// again, and repeats until two consecutive reads agree (the standard algorithm -
 /// no need to disable interrupts). Decodes BCD and 12-hour mode per status
 /// register B, so the returned fields are always binary and 24-hour.
-pub fn read_datetime() -> u64 {
+fn read_datetime_raw() -> u64 {
     while update_in_progress() {}
     let (mut sec, mut min, mut hour) = (cmos_read(0), cmos_read(2), cmos_read(4));
     let (mut day, mut month, mut year, mut century) =
