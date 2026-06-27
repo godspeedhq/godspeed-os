@@ -830,13 +830,18 @@ pub fn task_stat(slot: usize) -> TaskStatRaw {
             queue_depth,
             run_ticks:   TASK_RUN_TICKS[slot].load(Ordering::Relaxed),
             uptime_secs: {
-                // RTC epoch delta: seconds between the spawn datetime and now (absolute epoch cancels).
-                // 0 if never stamped (empty slot) or if the clock appears to go backwards.
+                // RTC epoch delta from the spawn stamp to now. Two clamps so a single bad CMOS read can
+                // never surface a wild value: `.max(0)` floors a backwards clock at 0, and the result is
+                // capped at the SYSTEM uptime (now - boot) - a service cannot be older than the system,
+                // so a garbage-low spawn stamp (a rare RTC misread, captured once and sticky) is bounded
+                // to a sane number instead of ~1.7e9 seconds. 0 if never stamped (empty slot).
                 let spawn = TASK_SPAWN_DT[slot].load(Ordering::Relaxed);
                 if spawn == 0 { 0 } else {
-                    let now = crate::arch::x86_64::rtc::read_datetime();
-                    (crate::arch::x86_64::rtc::epoch_secs(now)
-                        - crate::arch::x86_64::rtc::epoch_secs(spawn)).max(0) as u64
+                    let now  = crate::arch::x86_64::rtc::epoch_secs(crate::arch::x86_64::rtc::read_datetime());
+                    let svc  = (now - crate::arch::x86_64::rtc::epoch_secs(spawn)).max(0);
+                    let boot = crate::arch::x86_64::rtc::boot_datetime();
+                    let sys  = if boot == 0 { svc } else { (now - crate::arch::x86_64::rtc::epoch_secs(boot)).max(0) };
+                    svc.min(sys) as u64
                 }
             },
         }
