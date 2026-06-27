@@ -205,29 +205,32 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         }
 
-        // Redraw the status frame in place every round. chaos owns the framebuffer (the foreground gate
-        // sends every backgrounded task's output to serial only), so nothing smears it. CSI home +
-        // erase-down clears the previous frame; the serial log keeps the full per-round stream regardless.
+        // Redraw the status frame IN PLACE every round. chaos owns the framebuffer (the foreground gate
+        // sends every backgrounded task's output to serial only), so nothing smears it. Home the cursor
+        // and overwrite the fixed-height frame - do NOT erase the whole screen each frame (`\x1b[J` blanks
+        // it and reads as heavy flicker on the framebuffer). Each line ends in `\x1b[K` (erase to end of
+        // line) so a shorter value cleanly overwrites a longer previous one. The screen was cleared once
+        // on claim; the frame is always the same height, so nothing stale lingers below it.
         let last = if did_kill && rec { "killed -> recovered" }
                    else if did_kill && RESTARTABLE.contains(&name) { "killed -> down (recovering)" }
                    else if did_kill { "killed (not restartable - stays down)" }
                    else if did_flood { "flooded" }
                    else { "no reachable victim" };
-        ctx.console_write("\x1b[H\x1b[J");
-        ctx.console_writeln("  C H A O S   max-carnage          press q to quit");
-        ctx.console_writeln("  --------------------------------------------------");
+        ctx.console_write("\x1b[H");
+        ctx.console_write("  C H A O S   max-carnage          press q to quit\x1b[K\r\n");
+        ctx.console_write("  --------------------------------------------------\x1b[K\r\n");
         if rounds > 0 {
-            ctx.console_writeln_fmt(format_args!("    round        {} / {}", round, rounds));
+            ctx.console_write_fmt(format_args!("    round        {} / {}\x1b[K\r\n", round, rounds));
         } else {
-            ctx.console_writeln_fmt(format_args!("    round        {}   (until q)", round));
+            ctx.console_write_fmt(format_args!("    round        {}   (until q)\x1b[K\r\n", round));
         }
-        ctx.console_writeln_fmt(format_args!("    killed       {}", killed));
-        ctx.console_writeln_fmt(format_args!("    recovered    {}", recovered));
-        ctx.console_writeln_fmt(format_args!("    flooded      {}", flooded));
-        ctx.console_writeln("");
-        ctx.console_writeln_fmt(format_args!("    last victim  {}  ({})", name, last));
-        ctx.console_writeln("");
-        ctx.console_writeln("  kernel: ALIVE   (this frame still updating = no panic)");
+        ctx.console_write_fmt(format_args!("    killed       {}\x1b[K\r\n", killed));
+        ctx.console_write_fmt(format_args!("    recovered    {}\x1b[K\r\n", recovered));
+        ctx.console_write_fmt(format_args!("    flooded      {}\x1b[K\r\n", flooded));
+        ctx.console_write("\x1b[K\r\n");
+        ctx.console_write_fmt(format_args!("    last victim  {}  ({})\x1b[K\r\n", name, last));
+        ctx.console_write("\x1b[K\r\n");
+        ctx.console_write("  kernel: ALIVE   (this frame still updating = no panic)\x1b[K\r\n");
     }
 
     // Clear the live frame and print the final report as normal scrolling text, so it stays readable and
