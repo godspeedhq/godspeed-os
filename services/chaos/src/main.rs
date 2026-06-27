@@ -17,15 +17,16 @@
 //! live shell exists, releases the foreground, and self-terminates so a finished run leaves nothing
 //! behind. You watch the per-service kill/flood counts climb and the shell's `gsh>` blink out and back.
 //!
-//! The panel is a live per-service TABLE of what chaos FIRED - one column per attack type it sends:
-//! kill-storm, flood-storm, mem-pressure (chaos's own alloc_mem), and spawn-storm (mem-hogs), each
-//! counted by chaos itself per victim. It does NOT track "recovered": that would mean asking the
-//! (also pummeled) supervisor for ground truth mid-storm, which is unreliable, and the panel shows what
-//! chaos DID, not fetched truth. The one truth it fetches is the live victim list (who to hit). Each
-//! round it also logs a one-line trail to the serial: the in-place panel overwrites itself, so the
-//! SERIAL log is the scrolling history for troubleshooting. `q` to abort must come from the SERIAL
-//! console - chaos kills the USB keyboard drivers, so the kernel-owned UART is the only surviving input
-//! (a loud `[y/N]` warning precedes the run).
+//! `max-carnage` takes an explicit TARGET: `all` aims kill/flood at random live services, a service
+//! name aims them at THAT service every round. Attacks split two ways: AIMED (kill-storm, flood-storm)
+//! are directed at a victim and shown as per-service table rows; SYSTEM-WIDE (mem-pressure = chaos's own
+//! alloc_mem, spawn-storm = mem-hogs) pressure the shared allocator + task pool, so they cannot be aimed
+//! at one service and show as a single `system:` footer line. It does NOT track "recovered": that would
+//! mean asking the (also pummeled) supervisor for ground truth mid-storm. The one truth it fetches is the
+//! live victim list (for "all-services"). Each round it logs a one-line trail to the serial: the panel
+//! overwrites itself, so the SERIAL log is the scrolling history for troubleshooting. `q` to abort must
+//! come from the SERIAL console - chaos kills the USB keyboard drivers, so the kernel-owned UART is the
+//! only surviving input (a loud `[y/N]` warning precedes the run).
 
 #![no_std]
 #![no_main]
@@ -112,18 +113,26 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // (RTC-bounded) for it BEFORE claiming the foreground - the shell is still live to send it. Default
     // to run-until-q if it never arrives (e.g. the launcher's send failed), so we never block forever.
     let mut rounds: u64 = 0;
+    let mut tbuf = [0u8; 24];
+    let mut tlen = 0usize;
     {
         let t0 = ctx.datetime().epoch_secs();
         loop {
             if let Some(msg) = ctx.try_recv() {
                 let b = msg.payload_bytes();
                 if b.len() >= 4 { rounds = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64; }
+                if b.len() > 4 { let n = (b.len() - 4).min(24); tbuf[..n].copy_from_slice(&b[4..4 + n]); tlen = n; }
                 break;
             }
             if ctx.datetime().epoch_secs() - t0 >= 2 { break; }
             ctx.yield_cpu();
         }
     }
+    // The TARGET: "all-services" = aim kill/flood at random live services; a service name = aim them at
+    // THAT service every round. mem-pressure + spawn-storm are system-wide in both modes. Default
+    // "all-services" (named so it can never clash with a real service that someone calls "all").
+    let target: &str = if tlen == 0 { "all-services" } else { str_of(&tbuf[..tlen]) };
+    let target_all = target == "all-services";
 
     // Take the keyboard so a resurrected shell cannot steal our `q`. This is the moment the shell goes
     // "muted" for the duration of the run (unclaimed is the normal state, so this changes nothing else).
@@ -140,10 +149,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Per-service aggregate tally (bounded; constant memory regardless of round count).
     let mut sv_name:    [[u8; 24]; MAX_SVC] = [[0u8; 24]; MAX_SVC];
     let mut sv_nlen:    [usize;    MAX_SVC] = [0usize;    MAX_SVC];
-    let mut sv_killed:  [u64;      MAX_SVC] = [0u64;      MAX_SVC];
-    let mut sv_flooded: [u64;      MAX_SVC] = [0u64;      MAX_SVC];
-    let mut sv_mempr:   [u64;      MAX_SVC] = [0u64;      MAX_SVC]; // mem-pressure (chaos's own alloc_mem)
-    let mut sv_spawned: [u64;      MAX_SVC] = [0u64;      MAX_SVC]; // spawn-storm (mem-hog spawns)
+    let mut sv_killed:  [u64;      MAX_SVC] = [0u64;      MAX_SVC]; // AIMED, per-service
+    let mut sv_flooded: [u64;      MAX_SVC] = [0u64;      MAX_SVC]; // AIMED, per-service
     let mut sv_floodcap:[Option<CapHandle>; MAX_SVC] = [None; MAX_SVC];
     let mut nsv = 0usize;
 
@@ -154,65 +161,69 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { break; } }
         if rounds > 0 && round >= rounds { break; } // a bounded `max-carnage N` run is complete
 
-        // Snapshot the live, killable set: valid, not Dead, named, and NOT chaos itself (the one program
-        // a run never kills - it is the thing doing the killing). This live set is the ONLY truth chaos
-        // fetches; everything else in the panel is just what chaos itself fired.
-        let mut cand: [([u8; 24], usize); MAX_CAND] = [([0u8; 24], 0usize); MAX_CAND];
-        let mut ncand = 0usize;
-        for slot in 0..256u32 {
-            let st = ctx.task_stat(slot);
-            if !st.valid || st.state == 4 { continue; }
-            let nm = st.name_str();
-            if nm.is_empty() || nm == "chaos" { continue; }
-            if ncand < MAX_CAND {
-                let b = nm.as_bytes(); let l = b.len().min(24);
-                cand[ncand].0[..l].copy_from_slice(&b[..l]);
-                cand[ncand].1 = l;
-                ncand += 1;
-            }
-        }
-        if ncand == 0 { ctx.yield_cpu(); continue; } // nothing but us
         round += 1;
 
-        rng = xorshift64(rng);
-        let pick = (rng % ncand as u64) as usize;
-        let nl = cand[pick].1;
-        let mut nbuf = [0u8; 24];
-        nbuf[..nl].copy_from_slice(&cand[pick].0[..nl]);
-        let name = str_of(&nbuf[..nl]);
-
-        // Find-or-add the per-service tally slot (so kill + flood tally to one slot and share its cap).
-        let mut idx = None;
-        for s in 0..nsv { if sv_name[s][..sv_nlen[s]] == nbuf[..nl] { idx = Some(s); break; } }
-        let idx = match idx {
-            Some(s) => Some(s),
-            None if nsv < MAX_SVC => {
-                sv_name[nsv][..nl].copy_from_slice(&nbuf[..nl]); sv_nlen[nsv] = nl;
-                let s = nsv; nsv += 1; Some(s)
-            }
-            None => None,
-        };
-
-        // Roll ONE attack per round and fire it at the picked victim, tallying it both globally and in the
-        // victim's per-service row: 0 = kill-storm, 1 = flood-storm, 2 = mem-pressure, 3 = spawn-storm. The
-        // panel shows what chaos FIRED (not the outcome, never fetched truth) - the act is the test.
+        // Roll ONE attack. KILL/FLOOD are AIMED at a victim (per-service tally); MEM-PRESSURE + SPAWN-STORM
+        // are SYSTEM-WIDE (they pressure the shared frame allocator + task pool, which cannot be aimed at one
+        // service), so they are global counters only. Pick the aimed victim: for "all-services" a random live
+        // service (the ONLY truth chaos fetches), excluding chaos itself, the mem-hog it spawns, and
+        // transient observe-* tools; for a specific target, THAT service every round.
         rng = xorshift64(rng);
         let action = rng % 4;
+        let mut nbuf = [0u8; 24];
+        let mut nl = 0usize;
+        if action == 0 || action == 1 {
+            if target_all {
+                let mut cand: [([u8; 24], usize); MAX_CAND] = [([0u8; 24], 0usize); MAX_CAND];
+                let mut ncand = 0usize;
+                for slot in 0..256u32 {
+                    let st = ctx.task_stat(slot);
+                    if !st.valid || st.state == 4 { continue; }
+                    let nm = st.name_str();
+                    if nm.is_empty() || nm == "chaos" || nm == "mem-hog" || nm.starts_with("observe") { continue; }
+                    if ncand < MAX_CAND {
+                        let b = nm.as_bytes(); let l = b.len().min(24);
+                        cand[ncand].0[..l].copy_from_slice(&b[..l]); cand[ncand].1 = l; ncand += 1;
+                    }
+                }
+                if ncand > 0 {
+                    rng = xorshift64(rng);
+                    let pick = (rng % ncand as u64) as usize;
+                    nl = cand[pick].1; nbuf[..nl].copy_from_slice(&cand[pick].0[..nl]);
+                }
+            } else {
+                let tb = target.as_bytes(); nl = tb.len().min(24); nbuf[..nl].copy_from_slice(&tb[..nl]);
+            }
+        }
+        let name = str_of(&nbuf[..nl]);
+
+        // Find-or-add the per-service tally slot for an aimed victim (kill + flood share its slot + cap).
+        let mut idx = None;
+        if nl > 0 {
+            for s in 0..nsv { if sv_name[s][..sv_nlen[s]] == nbuf[..nl] { idx = Some(s); break; } }
+            if idx.is_none() && nsv < MAX_SVC {
+                sv_name[nsv][..nl].copy_from_slice(&nbuf[..nl]); sv_nlen[nsv] = nl;
+                idx = Some(nsv); nsv += 1;
+            }
+        }
+
         let mut attack_name = match action { 0 => "kill-storm", 1 => "flood-storm", 2 => "mem-pressure", _ => "spawn-storm" };
-        if let Some(s) = idx {
-            match action {
-                // KILL-STORM. Reclaim the cached flood cap (the kill bumped the endpoint generation, so it
-                // is now stale): RECLAIM, don't drop, else a long run fills the 64-slot cap table.
-                0 => {
+        let mut victim_label: &str = if nl > 0 { name } else { "(none alive)" };
+        match action {
+            // KILL-STORM (aimed). Reclaim the cached flood cap (the kill bumped the endpoint generation, so
+            // it is now stale): RECLAIM, don't drop, else a long run fills the 64-slot cap table.
+            0 => {
+                if let Some(s) = idx {
                     let _ = ctx.kill(name);
                     killed += 1; sv_killed[s] += 1;
                     if let Some(h) = sv_floodcap[s].take() { ctx.remove_cap(h); }
                 }
-                // FLOOD-STORM, but only at DRAIN-style services. The shell + fs are reply-style: they block
-                // on their endpoint for a SPECIFIC reply, so flood junk is read AS that reply (the shell's
-                // 16/16 clog; fs reading junk-as-superblock -> "disk raw/unformatted"). Kill them instead
-                // (still a hit, counted as kill-storm) - flooding corrupts a reply they cannot disambiguate.
-                1 => {
+            }
+            // FLOOD-STORM (aimed), DRAIN-style only. shell + fs are reply-style: flooding corrupts their
+            // reply stream (the shell's 16/16 clog; fs reading junk-as-superblock), so KILL them instead
+            // (still a hit, counted as kill-storm).
+            1 => {
+                if let Some(s) = idx {
                     if name == "shell" || name == "fs" {
                         let _ = ctx.kill(name);
                         killed += 1; sv_killed[s] += 1;
@@ -222,13 +233,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         flooded += 1; sv_flooded[s] += 1;
                     }
                 }
-                // MEM-PRESSURE: chaos allocates memory ITSELF (distinct from spawn-storm's mem-hog task).
-                // Held (no free syscall); chaos's contract limit bounds it (later allocs return AllocDenied
-                // - still count the attempt) and the whole footprint is reclaimed when chaos self-kills.
-                2 => { let _ = ctx.alloc_mem(MEMP_CHUNK); mempr += 1; sv_mempr[s] += 1; }
-                // SPAWN-STORM: spawn a mem-hog (a no-op if one already runs; reclaimed at the end).
-                _ => { let _ = ctx.spawn("mem-hog"); spawns += 1; sv_spawned[s] += 1; }
             }
+            // MEM-PRESSURE (system-wide): chaos allocates its OWN memory. Held (no free syscall); chaos's
+            // contract limit bounds it (later allocs return AllocDenied - still count the attempt) and the
+            // footprint is reclaimed when chaos self-kills. A global counter only.
+            2 => { let _ = ctx.alloc_mem(MEMP_CHUNK); mempr += 1; victim_label = "system"; }
+            // SPAWN-STORM (system-wide): spawn a mem-hog (a no-op if one already runs; reclaimed at end).
+            _ => { let _ = ctx.spawn("mem-hog"); spawns += 1; victim_label = "system"; }
         }
 
         // Redraw the per-service TABLE in place. We build the whole frame into one buffer and flush it in
@@ -239,29 +250,27 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // shows only what chaos FIRED - the kills + floods it itself counted - plus the global spawn count.
         let mut f = FrameBuf::new();
         let _ = write!(f, "\x1b[H");
-        let _ = write!(f, "  C H A O S   max-carnage          (q via SERIAL to quit)\x1b[K\r\n");
+        let _ = write!(f, "  C H A O S   max-carnage    target: {}    (q via SERIAL)\x1b[K\r\n", target);
         if rounds > 0 {
             let _ = write!(f, "  round {} / {}\x1b[K\r\n", round, rounds);
         } else {
             let _ = write!(f, "  round {}  (until q)\x1b[K\r\n", round);
         }
-        let _ = write!(f, "  --------------------------------------------------------------------------\x1b[K\r\n");
-        let _ = write!(f, "  {:<14} {:>10} {:>11} {:>12} {:>11}\x1b[K\r\n",
-            "service", "kill-storm", "flood-storm", "mem-pressure", "spawn-storm");
+        let _ = write!(f, "  ----------------------------------------------------\x1b[K\r\n");
+        let _ = write!(f, "  {:<16} {:>10} {:>11}\x1b[K\r\n", "service", "kill-storm", "flood-storm");
         for s in 0..nsv {
             let nm = str_of(&sv_name[s][..sv_nlen[s]]);
-            let _ = write!(f, "  {:<14} {:>10} {:>11} {:>12} {:>11}\x1b[K\r\n",
-                nm, sv_killed[s], sv_flooded[s], sv_mempr[s], sv_spawned[s]);
+            let _ = write!(f, "  {:<16} {:>10} {:>11}\x1b[K\r\n", nm, sv_killed[s], sv_flooded[s]);
         }
-        let _ = write!(f, "  --------------------------------------------------------------------------\x1b[K\r\n");
-        let _ = write!(f, "  kernel: ALIVE  (this frame still updating = no panic)\x1b[K\r\n");
-        let _ = write!(f, "  abort: 'q' in the SERIAL console (keyboard is dead)\x1b[K\r\n");
+        let _ = write!(f, "  ----------------------------------------------------\x1b[K\r\n");
+        let _ = write!(f, "  system:  mem-pressure {}   spawn-storm {}\x1b[K\r\n", mempr, spawns);
+        let _ = write!(f, "  kernel: ALIVE   abort: 'q' in the SERIAL console (keyboard dead)\x1b[K\r\n");
         f.flush(&ctx);
         // Per-round line to the kernel LOG (serial + ring buffer, NOT the in-place framebuffer panel), so
         // the SERIAL LOG keeps a scrolling history of the storm for troubleshooting. The CSI panel above
         // overwrites itself in place each round; without this the serial would show only the latest frame.
         // This records the per-round ATTACK + victim - the trail the operator relies on.
-        ctx.log_fmt(format_args!("chaos round {}: {} -> {}", round, attack_name, name));
+        ctx.log_fmt(format_args!("chaos round {}: {} -> {}", round, attack_name, victim_label));
 
         // Pace the round. With the recovery wait gone the loop would otherwise spin in milliseconds,
         // flooding the serial log and outrunning the eye. Yield a modest beat, still polling `q` (from the

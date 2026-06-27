@@ -3272,7 +3272,7 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
         ctx.console_writeln("  flood-storm <svc> [n]   saturate its queue; verify it drains");
         ctx.console_writeln("  mem-pressure      [n]   a mem-hog allocs to its limit, then reclaim");
         ctx.console_writeln("  spawn-storm       [n]   spawn mem-hogs to the ceiling; loud refusal");
-        ctx.console_writeln("  max-carnage       [n]   fire ALL of the above at random services");
+        ctx.console_writeln("  max-carnage <all-services|svc> [n]  random services, or one named");
         ctx.console_writeln("                          (serial console required; 'q' there aborts)");
         ctx.console_writeln("  svc: supervisor | block-driver | fs | logger | xhci | ehci | shell");
         return Ok(());
@@ -3282,7 +3282,16 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
         "flood-storm"  => chaos_flood_storm(ctx, cwd, &tok, ntok),
         "mem-pressure" => chaos_mem_pressure(ctx, cwd, &tok, ntok),
         "spawn-storm"  => chaos_spawn_storm(ctx, cwd, &tok, ntok),
-        "max-carnage"  => chaos_launch(ctx, if ntok >= 2 { parse_u32(tok[1]).unwrap_or(0) } else { 0 }),
+        "max-carnage"  => {
+            // The target is required now: <all-services|service>. tok[1] = target, tok[2] = rounds.
+            if ntok < 2 {
+                ctx.console_writeln("usage: chaos max-carnage <all-services|service> [rounds]");
+                Ok(())
+            } else {
+                let rounds = if ntok >= 3 { parse_u32(tok[2]).unwrap_or(0) } else { 0 };
+                chaos_launch(ctx, tok[1], rounds)
+            }
+        }
         other => {
             ctx.console_writeln_fmt(format_args!(
                 "chaos: unknown mode '{}' (try: chaos kill-storm <service> [rounds])", other));
@@ -3295,7 +3304,7 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
 /// primitive, syscall 40), runs the storm with the SHELL itself a target now, and on `q` hands the
 /// keyboard back + self-terminates. The shell goes "muted" (see the main loop) for the duration. Kill
 /// any prior instance first - one-shot, no graceful self-exit race - exactly like `observe now`.
-fn chaos_launch(ctx: &ServiceContext, rounds: u32) -> Result<(), ShellError> {
+fn chaos_launch(ctx: &ServiceContext, target: &str, rounds: u32) -> Result<(), ShellError> {
     // Loud pre-flight warning + confirm. max-carnage attacks EVERY service including the USB keyboard
     // drivers (xhci/ehci), so the keyboard goes DEAD mid-run and the ONLY abort is 'q' in a SERIAL
     // console (the kernel-owned UART survives any driver death; the USB keyboard does not - it is itself
@@ -3330,10 +3339,14 @@ fn chaos_launch(ctx: &ServiceContext, rounds: u32) -> Result<(), ShellError> {
         ctx.console_writeln("chaos: failed to spawn the chaos service");
         return Err(ShellError::Unknown);
     }
-    // Send the round count chaos should run (0 = run until q). Best-effort: chaos waits briefly for it
-    // and defaults to run-until-q if it doesn't arrive. Reclaim the cap (no leak - the post-storm lesson).
+    // Send the round count (0 = run until q) AND the target (all | service name). Best-effort: chaos waits
+    // briefly for it, defaults to all / run-until-q if it doesn't arrive. Reclaim the cap (no leak).
     if let Some(cap) = ctx.acquire_send_cap("chaos") {
-        let _ = ctx.send_by_handle(cap, &Message::from_bytes(&rounds.to_le_bytes()));
+        let mut buf = [0u8; 4 + 24];
+        buf[..4].copy_from_slice(&rounds.to_le_bytes());
+        let tb = target.as_bytes(); let n = tb.len().min(24);
+        buf[4..4 + n].copy_from_slice(&tb[..n]);
+        let _ = ctx.send_by_handle(cap, &Message::from_bytes(&buf[..4 + n]));
         ctx.remove_cap(cap);
     }
     Ok(())
