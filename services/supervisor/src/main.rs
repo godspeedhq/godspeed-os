@@ -109,7 +109,16 @@ fn spawn_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &[
             true
         }
         Ok(None) => { ctx.log_fmt(format_args!("supervisor: {} wired (no endpoint to record)", name)); true }
-        Err(_)   => { ctx.log_fmt(format_args!("supervisor: {} wired spawn FAILED", name)); false }
+        Err(_)   => {
+            // A provided peer cap was stale/dead: the peer respawned under heavy restart churn (e.g.
+            // `chaos max-carnage`), leaving the map cap pointing at a dead instance, so spawn_with_caps
+            // rejected the whole spawn. Retry FULLY NAME-WIRED - the kernel resolves live peers by name
+            // from its directory and the new service reacquires any down peer on EndpointDead (§14.3).
+            // This is what makes fs/shell recover after a storm instead of staying dead on a stale cap.
+            ctx.log_fmt(format_args!(
+                "supervisor: {} wired spawn FAILED (stale peer cap) - retrying name-wired", name));
+            spawn_mapped(ctx, map, name, 0xFFFF)
+        }
     }
 }
 

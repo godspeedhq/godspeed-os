@@ -189,7 +189,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let action = rng % 3;
         let (mut did_kill, mut did_flood, mut rec) = (false, false, false);
         if let Some(s) = idx {
-            if action == 1 || action == 2 {
+            // Do NOT flood the shell. Its recv endpoint is reply-style (it blocks there only to read an
+            // fs reply or a pipe input), not a drain loop, so flood junk sits in it permanently (16/16)
+            // and the next `ls`/`drives` reads the junk instead of fs's reply. Killing the shell is fine
+            // (the fresh instance gets a clean queue); flooding it is the one harmful action.
+            if (action == 1 || action == 2) && name != "shell" {
                 if flood(&ctx, name, &mut sv_floodcap[s]).is_some() { flooded += 1; sv_flooded[s] += 1; did_flood = true; }
             }
             if action == 0 || action == 2 {
