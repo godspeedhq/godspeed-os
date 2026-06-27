@@ -3293,6 +3293,26 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
 /// keyboard back + self-terminates. The shell goes "muted" (see the main loop) for the duration. Kill
 /// any prior instance first - one-shot, no graceful self-exit race - exactly like `observe now`.
 fn chaos_launch(ctx: &ServiceContext, rounds: u32) -> Result<(), ShellError> {
+    // Loud pre-flight warning + confirm. max-carnage attacks EVERY service including the USB keyboard
+    // drivers (xhci/ehci), so the keyboard goes DEAD mid-run and the ONLY abort is 'q' in a SERIAL
+    // console (the kernel-owned UART survives any driver death; the USB keyboard does not - it is itself
+    // a chaos target). The contributor acknowledges that before it is unleashed; the keyboard still works
+    // here, pre-storm, so the Enter confirm lands fine.
+    ctx.console_writeln("");
+    ctx.console_writeln("============ MAXIMUM CARNAGE - READ THIS ============");
+    ctx.console_writeln(" This attacks EVERY service, the USB keyboard drivers");
+    ctx.console_writeln(" included. Once it starts your keyboard goes DEAD, so");
+    ctx.console_writeln(" 'q' on the keyboard will NOT stop the run.");
+    ctx.console_writeln("");
+    ctx.console_writeln(" The ONLY way to abort is 'q' in a SERIAL console");
+    ctx.console_writeln(" (PuTTY on COM1). Connect serial before continuing.");
+    ctx.console_writeln("");
+    ctx.console_writeln(" Press ENTER to unleash it, any other key to cancel.");
+    ctx.console_writeln("=====================================================");
+    if !matches!(ctx.console_read(), b'\r' | b'\n') {
+        ctx.console_writeln("max-carnage: cancelled.");
+        return Ok(());
+    }
     let _ = ctx.kill("chaos");
     if ctx.spawn("chaos").is_err() {
         ctx.console_writeln("chaos: failed to spawn the chaos service");

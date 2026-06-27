@@ -760,6 +760,10 @@ pub fn run(image_path: &Path, smp: u32) {
     // shell draws a `gsh>` right after the command, before chaos claims, so `gsh>` is NOT a usable
     // terminator here.)
     send(&mut write_half, b"chaos max-carnage 5\r");
+    // max-carnage now shows a loud serial-required warning and waits for a confirm key. Sync on the
+    // prompt, then press ENTER to proceed.
+    let _ = collect_until(&buf, &mut cursor, b"Press ENTER", Duration::from_secs(15));
+    send(&mut write_half, b"\r");
     match collect_until(&buf, &mut cursor, b"foreground returned to the shell", Duration::from_secs(120)) {
         Some(r) => {
             check!(r.contains("chaos max-carnage:"), "chaos: max-carnage launched the chaos service (foreground TUI)");
