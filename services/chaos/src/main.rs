@@ -17,8 +17,9 @@
 //! live shell exists, releases the foreground, and self-terminates so a finished run leaves nothing
 //! behind. You watch the per-service kill/flood counts climb and the shell's `gsh>` blink out and back.
 //!
-//! The panel is a live per-service TABLE of what chaos FIRED - the kills + floods it counted itself -
-//! plus a global spawn-storm (mem-hog) count. It does NOT track "recovered": that would mean asking the
+//! The panel is a live per-service TABLE of what chaos FIRED - one column per attack type it sends:
+//! kill-storm, flood-storm, mem-pressure (chaos's own alloc_mem), and spawn-storm (mem-hogs), each
+//! counted by chaos itself per victim. It does NOT track "recovered": that would mean asking the
 //! (also pummeled) supervisor for ground truth mid-storm, which is unreliable, and the panel shows what
 //! chaos DID, not fetched truth. The one truth it fetches is the live victim list (who to hit). Each
 //! round it also logs a one-line trail to the serial: the in-place panel overwrites itself, so the
@@ -39,6 +40,7 @@ const MAX_CAND: usize = 32;         // bounded snapshot of live killable tasks p
 const MAX_SVC: usize = 16;          // distinct services in the aggregate tally (~6-8 real)
 const SHELL_SETTLE_YIELDS: u32 = 4000; // let a freshly-respawned shell settle before we hand back
 const PACE_YIELDS: u32 = 3000;      // a beat between rounds so the panel/log stay readable + `q` lands
+const MEMP_CHUNK: usize = 64 * 1024; // one mem-pressure round allocs this (held; chaos's limit bounds it)
 
 fn xorshift64(mut x: u64) -> u64 { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x }
 
@@ -57,9 +59,9 @@ fn slot_of(ctx: &ServiceContext, name: &str) -> Option<u32> {
 /// `console_write`s (not one per line), so the framebuffer redraws without flicker. `console_write` caps
 /// at 256 bytes, so `flush` writes <=240-byte chunks broken AT A NEWLINE, so a CSI escape / line is never
 /// split across two writes.
-struct FrameBuf { buf: [u8; 1280], len: usize }
+struct FrameBuf { buf: [u8; 2048], len: usize }
 impl FrameBuf {
-    fn new() -> Self { Self { buf: [0; 1280], len: 0 } }
+    fn new() -> Self { Self { buf: [0; 2048], len: 0 } }
     fn flush(&self, ctx: &ServiceContext) {
         let mut s = 0;
         while s < self.len {
@@ -140,10 +142,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut sv_nlen:    [usize;    MAX_SVC] = [0usize;    MAX_SVC];
     let mut sv_killed:  [u64;      MAX_SVC] = [0u64;      MAX_SVC];
     let mut sv_flooded: [u64;      MAX_SVC] = [0u64;      MAX_SVC];
+    let mut sv_mempr:   [u64;      MAX_SVC] = [0u64;      MAX_SVC]; // mem-pressure (chaos's own alloc_mem)
+    let mut sv_spawned: [u64;      MAX_SVC] = [0u64;      MAX_SVC]; // spawn-storm (mem-hog spawns)
     let mut sv_floodcap:[Option<CapHandle>; MAX_SVC] = [None; MAX_SVC];
     let mut nsv = 0usize;
 
-    let (mut round, mut killed, mut flooded, mut spawns) = (0u64, 0u64, 0u64, 0u64);
+    let (mut round, mut killed, mut flooded, mut mempr, mut spawns) = (0u64, 0u64, 0u64, 0u64, 0u64);
 
     'carnage: loop {
         // `q` aborts. The kernel buffers the keypress across input-driver churn, so it is caught here.
@@ -189,35 +193,41 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             None => None,
         };
 
-        // Roll the action: 0 = kill, 1 = flood, 2 = kill-then-flood, 3 = spawn a mem-hog. One counter per
-        // kind; we just record what chaos fired (the act is the test, not the target or the outcome).
+        // Roll ONE attack per round and fire it at the picked victim, tallying it both globally and in the
+        // victim's per-service row: 0 = kill-storm, 1 = flood-storm, 2 = mem-pressure, 3 = spawn-storm. The
+        // panel shows what chaos FIRED (not the outcome, never fetched truth) - the act is the test.
         rng = xorshift64(rng);
         let action = rng % 4;
-        if action == 3 {
-            // Spawn storm: fire a mem-hog. A no-op if one is already running (one name -> one instance);
-            // it allocs to its own contract limit and is reclaimed at the end. We count the firing either
-            // way - accuracy is not required (per design: "chaos is the one firing it, just record it").
-            let _ = ctx.spawn("mem-hog");
-            spawns += 1;
-        } else if let Some(s) = idx {
-            // Do NOT flood REPLY-STYLE services (shell, fs). They block on their recv endpoint for a
-            // SPECIFIC reply - the shell for an fs reply / pipe input, fs for block-driver's superblock /
-            // data reply - not a drain loop, so flood junk is read AS that reply: the shell's 16/16 clog,
-            // and fs reading junk-as-superblock if a flood lands mid-mount ("disk raw/unformatted" after a
-            // storm, even though the disk is fine). Killing them IS the real restart test; flooding them
-            // just corrupts a reply they cannot disambiguate. (Drain-style servers like block-driver and
-            // logger consume + drop junk, so they stay floodable.)
-            if (action == 1 || action == 2) && name != "shell" && name != "fs" {
-                if flood(&ctx, name, &mut sv_floodcap[s]).is_some() { flooded += 1; sv_flooded[s] += 1; }
-            }
-            if action == 0 || action == 2 {
-                let _ = ctx.kill(name);
-                killed += 1; sv_killed[s] += 1;
-                // The kill bumped the endpoint generation; the cached flood cap is now stale. RECLAIM it
-                // (don't just drop the handle) so a long run does not fill the 64-slot cap table. We do
-                // NOT wait to confirm recovery: knowing what came back means asking the (also pummeled)
-                // supervisor for truth - unreliable, and the panel shows what chaos DID, not fetched truth.
-                if let Some(h) = sv_floodcap[s].take() { ctx.remove_cap(h); }
+        let mut attack_name = match action { 0 => "kill-storm", 1 => "flood-storm", 2 => "mem-pressure", _ => "spawn-storm" };
+        if let Some(s) = idx {
+            match action {
+                // KILL-STORM. Reclaim the cached flood cap (the kill bumped the endpoint generation, so it
+                // is now stale): RECLAIM, don't drop, else a long run fills the 64-slot cap table.
+                0 => {
+                    let _ = ctx.kill(name);
+                    killed += 1; sv_killed[s] += 1;
+                    if let Some(h) = sv_floodcap[s].take() { ctx.remove_cap(h); }
+                }
+                // FLOOD-STORM, but only at DRAIN-style services. The shell + fs are reply-style: they block
+                // on their endpoint for a SPECIFIC reply, so flood junk is read AS that reply (the shell's
+                // 16/16 clog; fs reading junk-as-superblock -> "disk raw/unformatted"). Kill them instead
+                // (still a hit, counted as kill-storm) - flooding corrupts a reply they cannot disambiguate.
+                1 => {
+                    if name == "shell" || name == "fs" {
+                        let _ = ctx.kill(name);
+                        killed += 1; sv_killed[s] += 1;
+                        if let Some(h) = sv_floodcap[s].take() { ctx.remove_cap(h); }
+                        attack_name = "kill-storm";
+                    } else if flood(&ctx, name, &mut sv_floodcap[s]).is_some() {
+                        flooded += 1; sv_flooded[s] += 1;
+                    }
+                }
+                // MEM-PRESSURE: chaos allocates memory ITSELF (distinct from spawn-storm's mem-hog task).
+                // Held (no free syscall); chaos's contract limit bounds it (later allocs return AllocDenied
+                // - still count the attempt) and the whole footprint is reclaimed when chaos self-kills.
+                2 => { let _ = ctx.alloc_mem(MEMP_CHUNK); mempr += 1; sv_mempr[s] += 1; }
+                // SPAWN-STORM: spawn a mem-hog (a no-op if one already runs; reclaimed at the end).
+                _ => { let _ = ctx.spawn("mem-hog"); spawns += 1; sv_spawned[s] += 1; }
             }
         }
 
@@ -235,23 +245,23 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         } else {
             let _ = write!(f, "  round {}  (until q)\x1b[K\r\n", round);
         }
-        let _ = write!(f, "  --------------------------------------------------\x1b[K\r\n");
-        let _ = write!(f, "  {:<16} {:>5}  {:>6}\x1b[K\r\n", "service", "kills", "floods");
+        let _ = write!(f, "  --------------------------------------------------------------------------\x1b[K\r\n");
+        let _ = write!(f, "  {:<14} {:>10} {:>11} {:>12} {:>11}\x1b[K\r\n",
+            "service", "kill-storm", "flood-storm", "mem-pressure", "spawn-storm");
         for s in 0..nsv {
             let nm = str_of(&sv_name[s][..sv_nlen[s]]);
-            let _ = write!(f, "  {:<16} {:>5}  {:>6}\x1b[K\r\n", nm, sv_killed[s], sv_flooded[s]);
+            let _ = write!(f, "  {:<14} {:>10} {:>11} {:>12} {:>11}\x1b[K\r\n",
+                nm, sv_killed[s], sv_flooded[s], sv_mempr[s], sv_spawned[s]);
         }
-        let _ = write!(f, "  --------------------------------------------------\x1b[K\r\n");
-        let _ = write!(f, "  spawn storm (mem-hog): {}\x1b[K\r\n", spawns);
+        let _ = write!(f, "  --------------------------------------------------------------------------\x1b[K\r\n");
         let _ = write!(f, "  kernel: ALIVE  (this frame still updating = no panic)\x1b[K\r\n");
         let _ = write!(f, "  abort: 'q' in the SERIAL console (keyboard is dead)\x1b[K\r\n");
         f.flush(&ctx);
         // Per-round line to the kernel LOG (serial + ring buffer, NOT the in-place framebuffer panel), so
         // the SERIAL LOG keeps a scrolling history of the storm for troubleshooting. The CSI panel above
-        // overwrites itself in place each round, so without this the serial would show only the latest
-        // frame - this restores the per-round kill/flood/spawn trail the operator relies on.
-        ctx.log_fmt(format_args!(
-            "chaos round {}: kill {} flood {} spawn {} (kernel alive)", round, killed, flooded, spawns));
+        // overwrites itself in place each round; without this the serial would show only the latest frame.
+        // This records the per-round ATTACK + victim - the trail the operator relies on.
+        ctx.log_fmt(format_args!("chaos round {}: {} -> {}", round, attack_name, name));
 
         // Pace the round. With the recovery wait gone the loop would otherwise spin in milliseconds,
         // flooding the serial log and outrunning the eye. Yield a modest beat, still polling `q` (from the
@@ -262,18 +272,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         }
     }
 
-    // Clear the live frame and print the final report as normal scrolling text, so it stays readable and
-    // the shell's prompt continues below it once we release the foreground.
-    ctx.console_write("\x1b[2J\x1b[H");
+    // The live per-service TABLE above IS the report - the user wanted the end to LOOK like the table, not
+    // switch to a separate screen. So leave the final frame in place (no `\x1b[2J`) and just append one
+    // summary line below it (which also carries the substrings the shell test greps for).
     ctx.console_writeln("=== chaos max-carnage: report ===");
-    for s in 0..nsv {
-        let nm = str_of(&sv_name[s][..sv_nlen[s]]);
-        ctx.console_writeln_fmt(format_args!(
-            "  {:<14} killed {:>5}  flooded {:>5}", nm, sv_killed[s], sv_flooded[s]));
-    }
     ctx.console_writeln_fmt(format_args!(
-        "total: {} rounds, {} kills, {} floods, {} spawns. kernel: alive (this command returned).",
-        round, killed, flooded, spawns));
+        "total: {} rounds, {} kills, {} flooded, {} mem-pressure, {} spawns. kernel: alive (this command returned).",
+        round, killed, flooded, mempr, spawns));
 
     // Reclaim any flood caps still cached, so the run leaves the cap table as it found it.
     for c in sv_floodcap.iter_mut() { if let Some(h) = c.take() { ctx.remove_cap(h); } }

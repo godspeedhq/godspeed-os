@@ -3266,13 +3266,16 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
         if ntok == tok.len() { break; }
         tok[ntok] = t; ntok += 1;
     }
-    if ntok == 0 {
-        ctx.console_writeln("usage: chaos kill-storm <service> [rounds] [save <path>]   (service: supervisor | block-driver | fs)");
-        ctx.console_writeln("       chaos flood-storm <service> [rounds]                (saturate its queue with try_send; verify it drains + stays alive)");
-        ctx.console_writeln("       chaos mem-pressure [rounds]                         (spawn a mem-hog, alloc to limit, kill, confirm reclaim - S7)");
-        ctx.console_writeln("       chaos spawn-storm [count]                           (spawn mem-hogs to the system ceiling, confirm loud refusal + reclaim)");
-        ctx.console_writeln("       chaos max-carnage [rounds] [save <path>]            (kill a RANDOM live service each round - all but the shell)");
-        return Err(ShellError::Unknown);
+    if ntok == 0 || tok[0] == "help" {
+        ctx.console_writeln("chaos - bounded resilience exerciser. modes:");
+        ctx.console_writeln("  kill-storm  <svc> [n]   kill a service n times; verify recovery");
+        ctx.console_writeln("  flood-storm <svc> [n]   saturate its queue; verify it drains");
+        ctx.console_writeln("  mem-pressure      [n]   a mem-hog allocs to its limit, then reclaim");
+        ctx.console_writeln("  spawn-storm       [n]   spawn mem-hogs to the ceiling; loud refusal");
+        ctx.console_writeln("  max-carnage       [n]   fire ALL of the above at random services");
+        ctx.console_writeln("                          (serial console required; 'q' there aborts)");
+        ctx.console_writeln("  svc: supervisor | block-driver | fs | logger | xhci | ehci | shell");
+        return Ok(());
     }
     match tok[0] {
         "kill-storm"   => chaos_kill_storm(ctx, cwd, &tok, ntok),
@@ -3310,12 +3313,14 @@ fn chaos_launch(ctx: &ServiceContext, rounds: u32) -> Result<(), ShellError> {
     ctx.console_writeln("=====================================================");
     ctx.console_write(" Start maximum carnage? [y/N]: ");
     let c = ctx.console_read();
-    // Echo the keypress (console_read does not echo), so the operator SEES what they typed, then newline.
+    // Echo the keypress (console_read does not echo) so the operator sees what they typed - but do NOT
+    // print the newline yet. Wait for ENTER first, THEN newline. Printing the newline right after the
+    // keypress made it look like the choice had registered when it had not (you still had to press Enter).
     if let Ok(s) = core::str::from_utf8(&[c]) { ctx.console_write(s); }
-    ctx.console_writeln("");
-    // Drain the rest of the typed line up to Enter, so a stray key after the first doesn't bleed into the
-    // next prompt. A bare Enter (the default = N = cancel) has nothing to drain.
+    // Drain the rest of the line up to Enter (a stray key after the first won't bleed into the next
+    // prompt). A bare Enter (the default = N = cancel) has nothing to drain.
     if c != b'\r' && c != b'\n' { loop { let n = ctx.console_read(); if n == b'\r' || n == b'\n' { break; } } }
+    ctx.console_writeln("");
     if c != b'y' && c != b'Y' {
         ctx.console_writeln("max-carnage: cancelled.");
         return Ok(());
