@@ -762,7 +762,7 @@ pub fn run(image_path: &Path, smp: u32) {
     send(&mut write_half, b"chaos max-carnage 5\r");
     // max-carnage shows a loud serial-required warning and waits for a y/N confirm (a bare Enter
     // cancels). Sync on the prompt, then type 'y' + Enter to proceed.
-    let _ = collect_until(&buf, &mut cursor, b"unleash it", Duration::from_secs(15));
+    let _ = collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(15));
     send(&mut write_half, b"y\r");
     match collect_until(&buf, &mut cursor, b"foreground returned to the shell", Duration::from_secs(120)) {
         Some(r) => {

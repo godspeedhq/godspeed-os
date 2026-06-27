@@ -239,6 +239,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         ctx.console_write_fmt(format_args!("    recovered    {}\x1b[K\r\n", recovered));
         ctx.console_write("\x1b[K\r\n");
         ctx.console_write("  kernel: ALIVE   (this frame still updating = no panic)\x1b[K\r\n");
+        // Per-round line to the kernel LOG (serial + ring buffer, NOT the in-place framebuffer panel),
+        // so the SERIAL LOG keeps a scrolling history of the storm for troubleshooting. The CSI panel
+        // above overwrites itself in place each round, so without this the serial would show only the
+        // latest frame - this restores the per-round kills/floods/spawns trail the operator relies on.
+        ctx.log_fmt(format_args!(
+            "chaos round {}: kill-storm {} flood-storm {} spawn-storm {} recovered {} (kernel alive)",
+            round, killed, flooded, spawns, recovered));
     }
 
     // Clear the live frame and print the final report as normal scrolling text, so it stays readable and
@@ -270,8 +277,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         if k % POLL_EVERY == 0 && ctx.datetime().epoch_secs() - t0 >= RECOVER_SECS { break; }
     }
     for _ in 0..SHELL_SETTLE_YIELDS { ctx.yield_cpu(); } // let the fresh shell settle
-    ctx.release_console_foreground();
+    // Print our last line FIRST, then release. The muted shell only draws its prompt once it regains the
+    // foreground, so releasing BEFORE this printed "done" made the shell's `gsh>` land before the text
+    // (the "switches screen, press Enter to see the prompt" glitch). done -> release -> the shell draws a
+    // clean prompt right below.
     ctx.console_writeln("chaos: done - foreground returned to the shell");
+    ctx.release_console_foreground();
 
     // Self-terminate so chaos does not linger in the task list (`observe` showed a parked chaos long
     // after a run). The kernel's kill syscall now switches away on a self-kill (handle_kill ->

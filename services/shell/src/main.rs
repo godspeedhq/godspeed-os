@@ -3307,12 +3307,14 @@ fn chaos_launch(ctx: &ServiceContext, rounds: u32) -> Result<(), ShellError> {
     ctx.console_writeln(" The ONLY way to abort is 'q' in a SERIAL console");
     ctx.console_writeln(" (PuTTY on COM1). Connect serial before continuing.");
     ctx.console_writeln("");
-    ctx.console_writeln(" Type 'y' then ENTER to unleash it. Anything else - a bare");
-    ctx.console_writeln(" ENTER included - cancels, so a stray Enter cannot start it.");
     ctx.console_writeln("=====================================================");
+    ctx.console_write(" Start maximum carnage? [y/N]: ");
     let c = ctx.console_read();
-    // Drain the rest of the typed line up to Enter, so "y<Enter>" is consumed whole and a stray key does
-    // not bleed into the next prompt. A bare Enter (the default = cancel) has nothing left to drain.
+    // Echo the keypress (console_read does not echo), so the operator SEES what they typed, then newline.
+    if let Ok(s) = core::str::from_utf8(&[c]) { ctx.console_write(s); }
+    ctx.console_writeln("");
+    // Drain the rest of the typed line up to Enter, so a stray key after the first doesn't bleed into the
+    // next prompt. A bare Enter (the default = N = cancel) has nothing to drain.
     if c != b'\r' && c != b'\n' { loop { let n = ctx.console_read(); if n == b'\r' || n == b'\n' { break; } } }
     if c != b'y' && c != b'Y' {
         ctx.console_writeln("max-carnage: cancelled.");
