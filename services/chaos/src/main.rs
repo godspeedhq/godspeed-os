@@ -15,25 +15,30 @@
 //! It claims exclusive console input (the foreground primitive, syscall 40) so a resurrected shell
 //! polling the keyboard cannot swallow its `q`-to-quit, runs the carnage loop, and on `q` ensures a
 //! live shell exists, releases the foreground, and self-terminates so a finished run leaves nothing
-//! behind. You watch the kills/recoveries climb and the shell's `gsh>` blink out and back.
+//! behind. You watch the per-service kill/flood counts climb and the shell's `gsh>` blink out and back.
 //!
-//! Phase 2b (this commit): the kill / flood / kill-then-flood loop with recovery confirmation, the
-//! per-service tally + report, and the handoff. Run-until-`q`. Deferred, clearly scoped follow-ups:
-//! the mem-pressure + spawn-burst dimensions, a round-count (an IPC handshake from the shell), and
-//! the nicer 20-line scrolling TUI ring (the heartbeat + report is the functional first display).
+//! The panel is a live per-service TABLE of what chaos FIRED - the kills + floods it counted itself -
+//! plus a global spawn-storm (mem-hog) count. It does NOT track "recovered": that would mean asking the
+//! (also pummeled) supervisor for ground truth mid-storm, which is unreliable, and the panel shows what
+//! chaos DID, not fetched truth. The one truth it fetches is the live victim list (who to hit). Each
+//! round it also logs a one-line trail to the serial: the in-place panel overwrites itself, so the
+//! SERIAL log is the scrolling history for troubleshooting. `q` to abort must come from the SERIAL
+//! console - chaos kills the USB keyboard drivers, so the kernel-owned UART is the only surviving input
+//! (a loud `[y/N]` warning precedes the run).
 
 #![no_std]
 #![no_main]
 
 use godspeed_sdk::{ServiceContext, CapHandle, Message, IpcError};
+use core::fmt::Write as _;
 
 // Tuning - mirrors the shell's former max-carnage, bounded (§26.6).
-const RESTARTABLE: [&str; 7] = ["supervisor", "block-driver", "fs", "xhci", "ehci", "logger", "shell"];
-const RECOVER_SECS: i64 = 8;        // wall-clock bound (RTC, portable) to confirm a victim respawned
-const POLL_EVERY: u32 = 64;         // yields between recovery/clock polls
+const RECOVER_SECS: i64 = 8;        // wall-clock bound (RTC, portable) for the handoff's shell-wait
+const POLL_EVERY: u32 = 64;         // yields between clock polls in the handoff wait
 const MAX_CAND: usize = 32;         // bounded snapshot of live killable tasks per round
 const MAX_SVC: usize = 16;          // distinct services in the aggregate tally (~6-8 real)
 const SHELL_SETTLE_YIELDS: u32 = 4000; // let a freshly-respawned shell settle before we hand back
+const PACE_YIELDS: u32 = 3000;      // a beat between rounds so the panel/log stay readable + `q` lands
 
 fn xorshift64(mut x: u64) -> u64 { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x }
 
@@ -48,29 +53,31 @@ fn slot_of(ctx: &ServiceContext, name: &str) -> Option<u32> {
     None
 }
 
-/// Restart count of the live task named `name` - the recovery signal: a value different from a pre-kill
-/// reading proves a NEW instance came up (§7.5). None if not running.
-fn restart_of(ctx: &ServiceContext, name: &str) -> Option<u32> {
-    for slot in 0..256u32 {
-        let st = ctx.task_stat(slot);
-        if st.valid && st.state != 4 && st.name_str() == name { return Some(st.restart_count as u32); }
-    }
-    None
-}
-
-/// Wait (wall-clock bounded, RTC - portable across QEMU/hardware) for `name` to reach a restart count
-/// different from `og`, proving a fresh instance came up. Yields cooperatively so the recoverer (which
-/// shares core 0) runs. Returns true on recovery, false on timeout.
-fn wait_recovery(ctx: &ServiceContext, name: &str, og: u32) -> bool {
-    let t0 = ctx.datetime().epoch_secs();
-    let mut k = 0u32;
-    loop {
-        ctx.yield_cpu();
-        k += 1;
-        if k % POLL_EVERY == 0 {
-            if let Some(g) = restart_of(ctx, name) { if g != og { return true; } }
-            if ctx.datetime().epoch_secs() - t0 >= RECOVER_SECS { return false; }
+/// A bounded frame buffer. The whole panel is built into one of these, then flushed in a couple of
+/// `console_write`s (not one per line), so the framebuffer redraws without flicker. `console_write` caps
+/// at 256 bytes, so `flush` writes <=240-byte chunks broken AT A NEWLINE, so a CSI escape / line is never
+/// split across two writes.
+struct FrameBuf { buf: [u8; 1280], len: usize }
+impl FrameBuf {
+    fn new() -> Self { Self { buf: [0; 1280], len: 0 } }
+    fn flush(&self, ctx: &ServiceContext) {
+        let mut s = 0;
+        while s < self.len {
+            let mut e = (s + 240).min(self.len);
+            if e < self.len {
+                let mut b = e;
+                while b > s && self.buf[b - 1] != b'\n' { b -= 1; }
+                if b > s { e = b; }
+            }
+            if let Ok(st) = core::str::from_utf8(&self.buf[s..e]) { ctx.console_write(st); }
+            s = e;
         }
+    }
+}
+impl core::fmt::Write for FrameBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() { if self.len < self.buf.len() { self.buf[self.len] = b; self.len += 1; } }
+        Ok(())
     }
 }
 
@@ -132,21 +139,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut sv_name:    [[u8; 24]; MAX_SVC] = [[0u8; 24]; MAX_SVC];
     let mut sv_nlen:    [usize;    MAX_SVC] = [0usize;    MAX_SVC];
     let mut sv_killed:  [u64;      MAX_SVC] = [0u64;      MAX_SVC];
-    let mut sv_recov:   [u64;      MAX_SVC] = [0u64;      MAX_SVC];
     let mut sv_flooded: [u64;      MAX_SVC] = [0u64;      MAX_SVC];
     let mut sv_floodcap:[Option<CapHandle>; MAX_SVC] = [None; MAX_SVC];
     let mut nsv = 0usize;
 
-    let (mut round, mut killed, mut recovered, mut flooded, mut spawns) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut round, mut killed, mut flooded, mut spawns) = (0u64, 0u64, 0u64, 0u64);
 
-    loop {
+    'carnage: loop {
         // `q` aborts. The kernel buffers the keypress across input-driver churn, so it is caught here.
         if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { break; } }
         if rounds > 0 && round >= rounds { break; } // a bounded `max-carnage N` run is complete
 
         // Snapshot the live, killable set: valid, not Dead, named, and NOT chaos itself (the one program
-        // a run never kills - it is the thing doing the killing).
-        let mut cand: [([u8; 24], usize, u32); MAX_CAND] = [([0u8; 24], 0usize, 0u32); MAX_CAND];
+        // a run never kills - it is the thing doing the killing). This live set is the ONLY truth chaos
+        // fetches; everything else in the panel is just what chaos itself fired.
+        let mut cand: [([u8; 24], usize); MAX_CAND] = [([0u8; 24], 0usize); MAX_CAND];
         let mut ncand = 0usize;
         for slot in 0..256u32 {
             let st = ctx.task_stat(slot);
@@ -157,7 +164,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 let b = nm.as_bytes(); let l = b.len().min(24);
                 cand[ncand].0[..l].copy_from_slice(&b[..l]);
                 cand[ncand].1 = l;
-                cand[ncand].2 = st.restart_count as u32;
                 ncand += 1;
             }
         }
@@ -167,7 +173,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         rng = xorshift64(rng);
         let pick = (rng % ncand as u64) as usize;
         let nl = cand[pick].1;
-        let og = cand[pick].2;
         let mut nbuf = [0u8; 24];
         nbuf[..nl].copy_from_slice(&cand[pick].0[..nl]);
         let name = str_of(&nbuf[..nl]);
@@ -209,43 +214,52 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 let _ = ctx.kill(name);
                 killed += 1; sv_killed[s] += 1;
                 // The kill bumped the endpoint generation; the cached flood cap is now stale. RECLAIM it
-                // (don't just drop the handle) so a long run does not fill the 64-slot cap table.
+                // (don't just drop the handle) so a long run does not fill the 64-slot cap table. We do
+                // NOT wait to confirm recovery: knowing what came back means asking the (also pummeled)
+                // supervisor for truth - unreliable, and the panel shows what chaos DID, not fetched truth.
                 if let Some(h) = sv_floodcap[s].take() { ctx.remove_cap(h); }
-                // Confirm recovery for the restartable set (shell included - it respawns a fresh prompt).
-                if RESTARTABLE.contains(&name) && wait_recovery(&ctx, name, og) {
-                    recovered += 1; sv_recov[s] += 1;
-                }
             }
         }
 
-        // Redraw the status frame IN PLACE every round. chaos owns the framebuffer (the foreground gate
-        // sends every backgrounded task's output to serial only), so nothing smears it. Home the cursor
-        // and overwrite the fixed-height frame - do NOT erase the whole screen each frame (`\x1b[J` blanks
-        // it and reads as heavy flicker on the framebuffer). Each line ends in `\x1b[K` (erase to end of
-        // line) so a shorter value cleanly overwrites a longer previous one. The screen was cleared once
-        // on claim; the frame is always the same height, so nothing stale lingers below it.
-        ctx.console_write("\x1b[H");
-        ctx.console_write("  C H A O S   max-carnage          press q to quit\x1b[K\r\n");
-        ctx.console_write("  --------------------------------------------------\x1b[K\r\n");
+        // Redraw the per-service TABLE in place. We build the whole frame into one buffer and flush it in
+        // a couple of writes (not ~one per line), so the framebuffer redraws without flicker. Home the
+        // cursor (NOT `\x1b[J`, which blanks the screen and flickers); each line erases to its end
+        // (`\x1b[K`) so a shorter value overwrites cleanly. The table only GROWS (a service appends the
+        // first time chaos hits it), so the in-place redraw never leaves a stale row below it. The table
+        // shows only what chaos FIRED - the kills + floods it itself counted - plus the global spawn count.
+        let mut f = FrameBuf::new();
+        let _ = write!(f, "\x1b[H");
+        let _ = write!(f, "  C H A O S   max-carnage          (q via SERIAL to quit)\x1b[K\r\n");
         if rounds > 0 {
-            ctx.console_write_fmt(format_args!("    round        {} / {}\x1b[K\r\n", round, rounds));
+            let _ = write!(f, "  round {} / {}\x1b[K\r\n", round, rounds);
         } else {
-            ctx.console_write_fmt(format_args!("    round        {}   (until q)\x1b[K\r\n", round));
+            let _ = write!(f, "  round {}  (until q)\x1b[K\r\n", round);
         }
-        // One counter per kind of carnage chaos fires - just what it did, not the target or the outcome.
-        ctx.console_write_fmt(format_args!("    kill storm   {}\x1b[K\r\n", killed));
-        ctx.console_write_fmt(format_args!("    flood storm  {}\x1b[K\r\n", flooded));
-        ctx.console_write_fmt(format_args!("    spawn storm  {}\x1b[K\r\n", spawns));
-        ctx.console_write_fmt(format_args!("    recovered    {}\x1b[K\r\n", recovered));
-        ctx.console_write("\x1b[K\r\n");
-        ctx.console_write("  kernel: ALIVE   (this frame still updating = no panic)\x1b[K\r\n");
-        // Per-round line to the kernel LOG (serial + ring buffer, NOT the in-place framebuffer panel),
-        // so the SERIAL LOG keeps a scrolling history of the storm for troubleshooting. The CSI panel
-        // above overwrites itself in place each round, so without this the serial would show only the
-        // latest frame - this restores the per-round kills/floods/spawns trail the operator relies on.
+        let _ = write!(f, "  --------------------------------------------------\x1b[K\r\n");
+        let _ = write!(f, "  {:<16} {:>5}  {:>6}\x1b[K\r\n", "service", "kills", "floods");
+        for s in 0..nsv {
+            let nm = str_of(&sv_name[s][..sv_nlen[s]]);
+            let _ = write!(f, "  {:<16} {:>5}  {:>6}\x1b[K\r\n", nm, sv_killed[s], sv_flooded[s]);
+        }
+        let _ = write!(f, "  --------------------------------------------------\x1b[K\r\n");
+        let _ = write!(f, "  spawn storm (mem-hog): {}\x1b[K\r\n", spawns);
+        let _ = write!(f, "  kernel: ALIVE  (this frame still updating = no panic)\x1b[K\r\n");
+        let _ = write!(f, "  abort: 'q' in the SERIAL console (keyboard is dead)\x1b[K\r\n");
+        f.flush(&ctx);
+        // Per-round line to the kernel LOG (serial + ring buffer, NOT the in-place framebuffer panel), so
+        // the SERIAL LOG keeps a scrolling history of the storm for troubleshooting. The CSI panel above
+        // overwrites itself in place each round, so without this the serial would show only the latest
+        // frame - this restores the per-round kill/flood/spawn trail the operator relies on.
         ctx.log_fmt(format_args!(
-            "chaos round {}: kill-storm {} flood-storm {} spawn-storm {} recovered {} (kernel alive)",
-            round, killed, flooded, spawns, recovered));
+            "chaos round {}: kill {} flood {} spawn {} (kernel alive)", round, killed, flooded, spawns));
+
+        // Pace the round. With the recovery wait gone the loop would otherwise spin in milliseconds,
+        // flooding the serial log and outrunning the eye. Yield a modest beat, still polling `q` (from the
+        // SERIAL console - the keyboard is a chaos target) so an abort lands promptly.
+        for _ in 0..PACE_YIELDS {
+            if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { break 'carnage; } }
+            ctx.yield_cpu();
+        }
     }
 
     // Clear the live frame and print the final report as normal scrolling text, so it stays readable and
@@ -255,11 +269,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     for s in 0..nsv {
         let nm = str_of(&sv_name[s][..sv_nlen[s]]);
         ctx.console_writeln_fmt(format_args!(
-            "  {:<14} killed {:>5}  recovered {:>5}  flooded {:>5}", nm, sv_killed[s], sv_recov[s], sv_flooded[s]));
+            "  {:<14} killed {:>5}  flooded {:>5}", nm, sv_killed[s], sv_flooded[s]));
     }
     ctx.console_writeln_fmt(format_args!(
-        "total: {} rounds, {} kills, {} recovered, {} floods, {} spawns. kernel: alive (this command returned).",
-        round, killed, recovered, flooded, spawns));
+        "total: {} rounds, {} kills, {} floods, {} spawns. kernel: alive (this command returned).",
+        round, killed, flooded, spawns));
 
     // Reclaim any flood caps still cached, so the run leaves the cap table as it found it.
     for c in sv_floodcap.iter_mut() { if let Some(h) = c.take() { ctx.remove_cap(h); } }
