@@ -1356,6 +1356,13 @@ pub fn current_task_slot() -> usize {
     CORE_CURRENT.get(cid).load(Ordering::Relaxed)
 }
 
+/// True if the calling task's own slot is Dead - i.e. it just killed itself via the kill syscall. Lets
+/// `handle_kill` switch away after a self-kill (the tail `kill_current` already uses) instead of
+/// returning into a dead task, whose next syscall would panic "no running task" in block_and_reschedule.
+pub fn current_task_is_dead() -> bool {
+    TASK_STATE[current_task_slot()].load(Ordering::Acquire) == TaskState::Dead as u8
+}
+
 /// Wake the task at `slot` with the given result code.
 ///
 /// If the task lives on a different core, sends a WAKE_RECEIVER IPI to that

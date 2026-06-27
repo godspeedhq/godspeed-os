@@ -795,6 +795,13 @@ fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
         //          the §7.8 check (see invariants/CLAUDE.md).
         crate::invariants::assertions::assert_tcb_alive();
         crate::invariants::assertions::assert_cap_table_consistent();
+        // If the caller killed ITSELF (a SERVICE_CONTROL holder self-terminating - e.g. `chaos` at the
+        // end of a run, so it does not linger in `observe`), it is now Dead. Do NOT return into the dead
+        // task: its next instruction would hit "no running task" in block_and_reschedule. Switch away,
+        // exactly like kill_current's tail; this never returns. A non-self kill falls through to Ok.
+        if scheduler::current_task_is_dead() {
+            scheduler::yield_current();
+        }
         0
     } else { -1 }
 }

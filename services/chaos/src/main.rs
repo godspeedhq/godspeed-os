@@ -189,11 +189,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let action = rng % 3;
         let (mut did_kill, mut did_flood, mut rec) = (false, false, false);
         if let Some(s) = idx {
-            // Do NOT flood the shell. Its recv endpoint is reply-style (it blocks there only to read an
-            // fs reply or a pipe input), not a drain loop, so flood junk sits in it permanently (16/16)
-            // and the next `ls`/`drives` reads the junk instead of fs's reply. Killing the shell is fine
-            // (the fresh instance gets a clean queue); flooding it is the one harmful action.
-            if (action == 1 || action == 2) && name != "shell" {
+            // Do NOT flood REPLY-STYLE services (shell, fs). They block on their recv endpoint for a
+            // SPECIFIC reply - the shell for an fs reply / pipe input, fs for block-driver's superblock /
+            // data reply - not a drain loop, so flood junk is read AS that reply: the shell's 16/16 clog,
+            // and fs reading junk-as-superblock if a flood lands mid-mount ("disk raw/unformatted" after a
+            // storm, even though the disk is fine). Killing them IS the real restart test; flooding them
+            // just corrupts a reply they cannot disambiguate. (Drain-style servers like block-driver and
+            // logger consume + drop junk, so they stay floodable.)
+            if (action == 1 || action == 2) && name != "shell" && name != "fs" {
                 if flood(&ctx, name, &mut sv_floodcap[s]).is_some() { flooded += 1; sv_flooded[s] += 1; did_flood = true; }
             }
             if action == 0 || action == 2 {
@@ -267,10 +270,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.release_console_foreground();
     ctx.console_writeln("chaos: done - foreground returned to the shell");
 
-    // Park (idle). We do NOT self-kill: a self-kill via the kill syscall returns to the now-dead task,
-    // and the following park's block_and_reschedule then panics ("no running task" - the shell's `kill
-    // shell` avoids this via a dedicated session-restart path). Instead we park: harmless and idle, the
-    // foreground already released, and the next `chaos max-carnage` launcher reaps this instance with
-    // its kill-prior step (exactly the `observe now` pattern). At most one idle chaos lingers between runs.
+    // Self-terminate so chaos does not linger in the task list (`observe` showed a parked chaos long
+    // after a run). The kernel's kill syscall now switches away on a self-kill (handle_kill ->
+    // current_task_is_dead -> yield_current), so this never returns - no "no running task" panic (the
+    // bug that forced the earlier park-and-reap). The park is an unreachable safety net for `-> !`.
+    let _ = ctx.kill("chaos");
     ctx.park();
 }
