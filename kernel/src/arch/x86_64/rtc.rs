@@ -89,6 +89,24 @@ pub fn read_datetime() -> u64 {
     dt
 }
 
+/// A DEGLITCHED "now" in epoch seconds: monotonic + forward-jump-bounded, for time-DELTA uses (per-service
+/// uptime). `read_datetime` already rejects an implausible YEAR and a mid-update read, but a CMOS misread
+/// landing on an in-range year (e.g. 2039) still slips through and, because uptime = now - stamp, surfaces
+/// as a wild value (the "4987d" bug). This high-water-mark drops any read that goes BACKWARDS or jumps
+/// FORWARD by more than a day - always a glitch for a delta sampled every observe frame - and holds the last
+/// good value instead. A single kernel-owned clock cache (like MONOTONIC_TICKS or the boot stamp), not
+/// service state. `date` keeps the raw read (an on-demand display tolerates a rare one-off).
+static LAST_NOW_EPOCH: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+pub fn now_epoch_monotonic() -> i64 {
+    use core::sync::atomic::Ordering;
+    let raw  = epoch_secs(read_datetime());
+    let last = LAST_NOW_EPOCH.load(Ordering::Relaxed);
+    if last == 0 { LAST_NOW_EPOCH.store(raw, Ordering::Relaxed); return raw; }
+    if raw < last || raw > last + 86_400 { return last; } // backwards, or >1-day jump = glitch: hold last
+    LAST_NOW_EPOCH.store(raw, Ordering::Relaxed);
+    raw
+}
+
 /// A decoded year inside the window this build can sanely run in; a read outside it is a glitch.
 fn year_plausible(packed: u64) -> bool {
     (2020..=2100).contains(&((packed >> 26) & 0xFFF))

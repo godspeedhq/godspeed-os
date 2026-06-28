@@ -239,10 +239,13 @@ static mut TASK_PENDING_RECV_CAP_COUNT: [usize; MAX_TASKS] = [0; MAX_TASKS];
 // by the LastRecvBadge syscall. Packed `(badge_right << 32) | badge_id`; 0 = no badge.
 static TASK_LAST_BADGE: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
 
-/// RTC wall-clock datetime (packed, `rtc::read_datetime` format) captured at each task's spawn.
-/// Per-service uptime = `epoch_secs(now) - epoch_secs(this)` (surfaced by `task_stat`). The RTC is the
-/// only correct clock here: MONOTONIC_TICKS only advances when the BSP idles, and the TSC can't be
-/// compared across cores. A restart is a fresh spawn, so uptime resets - "since the last (re)start".
+/// RTC wall-clock datetime (packed, `rtc::read_datetime` format) captured at each task's spawn. Per-service
+/// uptime = `now_epoch_monotonic() - epoch_secs(this)` (surfaced by `task_stat`). The RTC gives PORTABLE
+/// real seconds; the monotonic BSP tick counter does NOT - its rate is the timer-IRQ rate, ~100 Hz only in
+/// TSC-deadline mode; on periodic-APIC HW (the T630, QEMU) it is ~10-20 Hz and not even known to the kernel,
+/// so ticks->seconds would be platform-dependent. The "now" read is DEGLITCHED (`now_epoch_monotonic`) so a
+/// transient CMOS misread landing on an in-range year can no longer inflate uptime to thousands of days (the
+/// "4987d" bug). A restart is a fresh spawn, so uptime resets - "since the last (re)start".
 static TASK_SPAWN_DT: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
 
 // ---------------------------------------------------------------------------
@@ -830,14 +833,14 @@ pub fn task_stat(slot: usize) -> TaskStatRaw {
             queue_depth,
             run_ticks:   TASK_RUN_TICKS[slot].load(Ordering::Relaxed),
             uptime_secs: {
-                // RTC epoch delta from the spawn stamp to now. Two clamps so a single bad CMOS read can
-                // never surface a wild value: `.max(0)` floors a backwards clock at 0, and the result is
-                // capped at the SYSTEM uptime (now - boot) - a service cannot be older than the system,
-                // so a garbage-low spawn stamp (a rare RTC misread, captured once and sticky) is bounded
-                // to a sane number instead of ~1.7e9 seconds. 0 if never stamped (empty slot).
+                // RTC epoch delta from the spawn stamp to a DEGLITCHED now. now_epoch_monotonic rejects a
+                // backwards step or an implausible (>1 day) forward jump, so a transient CMOS misread of
+                // "now" can no longer inflate this to thousands of days (the "4987d" bug). Two further
+                // clamps: .max(0) floors a backwards delta, and the result is capped at the system uptime
+                // (a service is never older than the system). 0 if never stamped (empty slot).
                 let spawn = TASK_SPAWN_DT[slot].load(Ordering::Relaxed);
                 if spawn == 0 { 0 } else {
-                    let now  = crate::arch::x86_64::rtc::epoch_secs(crate::arch::x86_64::rtc::read_datetime());
+                    let now  = crate::arch::x86_64::rtc::now_epoch_monotonic();
                     let svc  = (now - crate::arch::x86_64::rtc::epoch_secs(spawn)).max(0);
                     let boot = crate::arch::x86_64::rtc::boot_datetime();
                     let sys  = if boot == 0 { svc } else { (now - crate::arch::x86_64::rtc::epoch_secs(boot)).max(0) };

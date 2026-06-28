@@ -642,10 +642,18 @@ fn boot_log_to_fb() -> bool {
     BOOT_LOG_TO_FB.load(core::sync::atomic::Ordering::Acquire)
 }
 
-/// End boot-log mirroring to the framebuffer and clear the screen. Called from
-/// the `ConsoleBootComplete` syscall once boot output has settled - the boot
-/// jargon has served its purpose; hand over a clean console.
+/// Set once the boot screen has been dismissed (first `console_boot_complete`), so a respawned shell's
+/// repeat call is a no-op and cannot wipe the screen. See console_boot_complete.
+static BOOT_DISMISSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// End boot-log mirroring to the framebuffer and clear the screen. Called from the `ConsoleBootComplete`
+/// syscall once boot output has settled - the boot jargon has served its purpose; hand over a clean
+/// console. IDEMPOTENT: only the FIRST call (cold boot, first shell) clears. A respawned shell - e.g. after
+/// a `chaos max-carnage` sweep that kills the shell every round - calls this again on startup, but there is
+/// no boot screen to dismiss then, and re-clearing would wipe whatever is on screen (the operator's chaos
+/// panel). So every later call is a no-op: the screen is left exactly as it is.
 pub fn console_boot_complete() {
+    if BOOT_DISMISSED.swap(true, core::sync::atomic::Ordering::AcqRel) { return; }
     BOOT_LOG_TO_FB.store(false, core::sync::atomic::Ordering::Release);
     fb::clear_and_home();
 }
