@@ -187,22 +187,9 @@ fn read_datetime_raw() -> u64 {
         | ((full_year & 0xFFF) << 26)
 }
 
-/// Seconds since the Unix epoch for a `read_datetime`/`boot_datetime`-packed value (leap-year correct,
-/// Howard Hinnant's days_from_civil - matches the SDK's `Datetime::epoch_secs`). The absolute epoch
-/// cancels in a difference, so this is the clock for per-service uptime: a real wall-clock (unlike the
-/// BSP-idle-gated MONOTONIC_TICKS) and single-sourced (unlike the cross-core-skewed TSC).
-pub fn epoch_secs(packed: u64) -> i64 {
-    let sec   = (packed & 0x3F) as i64;
-    let min   = ((packed >> 6) & 0x3F) as i64;
-    let hour  = ((packed >> 12) & 0x1F) as i64;
-    let day   = ((packed >> 17) & 0x1F) as i64;
-    let month = ((packed >> 22) & 0x0F) as i64;
-    let mut y = ((packed >> 26) & 0xFFF) as i64;
-    y -= (month <= 2) as i64;
-    let era = (if y >= 0 { y } else { y - 399 }) / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-    days * 86_400 + hour * 3_600 + min * 60 + sec
-}
+/// Seconds since the Unix epoch for a `read_datetime`/`boot_datetime`-packed value. The pure civil-date math
+/// (leap-year correct, Howard Hinnant's days_from_civil - matches the SDK's `Datetime::epoch_secs`) lives in
+/// the host-testable `crate::clock` and is re-exported here; this arch module supplies only the live RTC
+/// reads. The absolute epoch cancels in a difference, so this is the clock for per-service uptime: a real
+/// wall-clock (unlike the BSP-idle-gated MONOTONIC_TICKS) and single-sourced (unlike the cross-core-skewed TSC).
+pub use crate::clock::epoch_secs;
