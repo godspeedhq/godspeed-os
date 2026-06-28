@@ -386,6 +386,17 @@ pub fn total_frame_count() -> usize {
     // SAFETY: read-only; set once at init, never mutated after.
     unsafe { ALLOCATOR.total_frames }
 }
+
+/// True if `phys` lies within physical RAM the HHDM covers - i.e. its frame index is below the highest
+/// usable frame recorded at boot. The read-side companion to `free_frame`'s phantom-reject (line ~209):
+/// a page-table walk must never DEREFERENCE an entry whose frame is outside RAM (a corrupted or stale
+/// entry), or it page-faults the kernel via the HHDM (the chaos `max-carnage` ~68 GB KERNEL PF in
+/// `reclaim_user_frames`). `max_valid_frame` is set once at init and immutable after, so this is lock-free.
+pub fn phys_in_ram(phys: u64) -> bool {
+    // SAFETY: read-only; max_valid_frame is set once at init, never mutated after.
+    let idx = (phys / FRAME_SIZE) as usize;
+    unsafe { idx < ALLOCATOR.max_valid_frame }
+}
 /// Walk the kernel half of the live PML4 (entries 256–511) and mark every
 /// PDPT / PD / PT / PML4 frame as "used" in the bitmap allocator.
 ///

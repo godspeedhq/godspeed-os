@@ -417,9 +417,25 @@ pub fn harden_hhdm_nx() {
 /// Follow an existing entry in `table_phys` at `idx`.
 /// Returns `Some(child_phys)` if present, `None` if absent.
 fn walk(table_phys: u64, idx: usize) -> Option<u64> {
-    // SAFETY: table_phys from a chain that started with a valid page table.
+    // A page-table entry must point at real RAM. A corrupted/stale entry - or a bad cr3 - naming a frame
+    // OUTSIDE RAM would be dereferenced here via the HHDM and FAULT the kernel: this is the chaos
+    // `max-carnage` KERNEL PF (reclaim_user_frames followed an entry to phys ~68 GB on an 8 GB box, round
+    // 4286). Refuse to read an out-of-RAM table, and refuse to return an out-of-RAM child; log loudly
+    // (§26.7) and treat it as absent so the walk SKIPS the corrupt subtree instead of dying. free_frame
+    // already rejects the phantom FREE - this is the missing read-side guard.
+    if !crate::memory::allocator::phys_in_ram(table_phys) {
+        crate::kprintln!("page_tables: walk on out-of-RAM table {:#x}[{}] - skipped (corrupt parent entry or cr3)", table_phys, idx);
+        return None;
+    }
+    // SAFETY: table_phys validated to be RAM the HHDM covers; the walk only ever recurses into validated children.
     let entry = unsafe { read_entry(table_phys, idx) };
-    if entry_present(entry) { Some(entry_phys(entry)) } else { None }
+    if !entry_present(entry) { return None; }
+    let child = entry_phys(entry);
+    if !crate::memory::allocator::phys_in_ram(child) {
+        crate::kprintln!("page_tables: corrupt entry {:#x}[{}]={:#x} -> phys {:#x} outside RAM - skipped", table_phys, idx, entry, child);
+        return None;
+    }
+    Some(child)
 }
 
 /// Follow an existing entry or allocate a new child table.
