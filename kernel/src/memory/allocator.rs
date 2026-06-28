@@ -80,11 +80,24 @@ struct BitmapAllocator {
     /// idempotently, but they must not inflate `free_frames` (else it exceeds `total_frames` and
     /// observe's RAM read underflows). Counted so the loud log can be rate-limited.
     double_frees: usize,
+    /// DMA-arena permanent reservations (§12, the DMA-safety net). Frames backing a driver's DMA arena
+    /// are recorded here by `alloc_dma_arena` and NEVER returned to the general pool by `free` - so a
+    /// stray device DMA (if the kill-path bus-master quiesce ever fails) lands in a reserved DMA frame,
+    /// corrupting only DMA data (caught by AHCI/USB CRC), never a page table or kernel struct. The
+    /// per-driver arena is reused across respawns, so this is bounded (one arena per driver). Each entry
+    /// is (base_frame_index, n_frames); (0, 0) = empty. Mirrors the KERNEL_PT_PROTECTED guard below.
+    dma_reserves: [(usize, usize); MAX_DMA_RESERVES],
 }
+
+/// Max distinct DMA-arena reservations: xhci, ehci, block-driver, + headroom for a future NIC driver.
+const MAX_DMA_RESERVES: usize = 4;
 
 impl BitmapAllocator {
     const fn new() -> Self {
-        Self { free_frames: 0, total_frames: 0, next_byte: 0, max_valid_frame: 0, double_frees: 0 }
+        Self {
+            free_frames: 0, total_frames: 0, next_byte: 0, max_valid_frame: 0, double_frees: 0,
+            dma_reserves: [(0, 0); MAX_DMA_RESERVES],
+        }
     }
 
     // SAFETY: caller must guarantee single-threaded access; called once by BSP during memory::init.
@@ -198,6 +211,36 @@ impl BitmapAllocator {
         Some(start as u64 * FRAME_SIZE)
     }
 
+    /// Like `alloc_contiguous`, but RECORDS the run as a permanent DMA reservation (§12, the
+    /// DMA-safety net): `free` then skips every frame in it, so the arena is never returned to the
+    /// general pool to be recycled as a page table. For driver DMA arenas; the per-driver arena is
+    /// allocated once and reused across respawns (the spawn path keeps the phys), so the reservation
+    /// is bounded - one arena per driver. None if no run is free, or the reservation table is full.
+    ///
+    /// SAFETY: caller must hold ALLOC_LOCKED.
+    unsafe fn alloc_dma_arena(&mut self, n: usize) -> Option<u64> {
+        // SAFETY: lock held (caller contract).
+        let phys = unsafe { self.alloc_contiguous(n)? };
+        let base = (phys / FRAME_SIZE) as usize;
+        for slot in self.dma_reserves.iter_mut() {
+            if slot.1 == 0 {
+                *slot = (base, n);
+                return Some(phys);
+            }
+        }
+        // Reservation table full (should never happen: MAX_DMA_RESERVES >= the DMA-driver count). We
+        // already took the run; without a slot, `free` would later hand it back to the general pool -
+        // the exact hazard this guards. Refuse loudly and return the run rather than leave it exposed.
+        crate::kprintln!(
+            "alloc_dma_arena: reservation table full ({}); refusing arena", MAX_DMA_RESERVES);
+        for i in base..base + n {
+            // SAFETY: idx within bounds (just allocated); lock held.
+            let _ = unsafe { bitmap_set_free(i) };
+        }
+        self.free_frames += n;
+        None
+    }
+
     // SAFETY: caller must hold ALLOC_LOCKED and have exclusive ownership of `frame`.
     unsafe fn free(&mut self, frame: Frame) {
         let idx = frame.frame_number() as usize;
@@ -228,6 +271,17 @@ impl BitmapAllocator {
                 idx, idx as u64 * FRAME_SIZE
             );
             return;
+        }
+        // DMA permanent-reserve (§12): frames backing a driver's DMA arena are never returned to the
+        // general pool, so they can never be recycled into a page table. A stray device DMA (if the
+        // kill-path bus-master quiesce ever fails) then lands in a reserved DMA frame - corrupting only
+        // DMA data, never a PTE or kernel struct. Reused across the driver's respawns, so this is
+        // bounded (one arena per driver), not a leak. Silent (a reclaim walking the arena hits it every
+        // kill - it is a reservation, not corruption), unlike the loud rejects above.
+        for &(base, n) in self.dma_reserves.iter() {
+            if n != 0 && idx >= base && idx < base + n {
+                return;
+            }
         }
         // SAFETY: idx within bounds; caller guarantees exclusive ownership.
         if unsafe { bitmap_set_free(idx) } {
@@ -355,6 +409,22 @@ pub fn alloc_contiguous(n: usize) -> Option<u64> {
         alloc_lock();
         // SAFETY: lock held; single writer across all cores.
         let phys = unsafe { (*core::ptr::addr_of_mut!(ALLOCATOR)).alloc_contiguous(n) };
+        alloc_unlock();
+        phys
+    })
+}
+
+/// Allocate a physically-contiguous DMA arena and RESERVE it permanently (§12, the DMA-safety net):
+/// the frames are never returned to the general pool, so a stray device DMA can never land in a frame
+/// later recycled as a page table - it lands in DMA-reserved memory (corrupting only DMA data, caught
+/// by AHCI/USB CRC). The per-driver arena is allocated once and reused across the driver's respawns
+/// (the spawn path keeps the phys), so this is bounded: one arena per driver.
+pub fn alloc_dma_arena(n: usize) -> Option<u64> {
+    // IRQ-safe: see alloc_contiguous (ALLOC_LOCKED is also taken in interrupt context).
+    crate::smp::without_interrupts(|| {
+        alloc_lock();
+        // SAFETY: lock held; single writer across all cores.
+        let phys = unsafe { (*core::ptr::addr_of_mut!(ALLOCATOR)).alloc_dma_arena(n) };
         alloc_unlock();
         phys
     })

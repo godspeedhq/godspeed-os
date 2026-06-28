@@ -139,11 +139,11 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | arch/x86_64/iommu.rs | 74 | permitted |
 | arch/x86_64/mod.rs | 34 | permitted |
 | arch/x86_64/page_tables.rs | 41 | permitted |
-| arch/x86_64/pci.rs | 17 | permitted |
+| arch/x86_64/pci.rs | 19 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |
 | arch/x86_64/syscall_entry.rs | 13 | permitted |
 | capability/table.rs | 7 | permitted |
-| memory/allocator.rs | 32 | permitted |
+| memory/allocator.rs | 37 | permitted |
 | memory/frame.rs | 1 | permitted |
 | memory/mod.rs | 1 | permitted |
 | memory/page.rs | 1 | permitted |
@@ -151,7 +151,7 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | smp/mod.rs | 1 | permitted |
 | smp/percpu.rs | 6 | permitted |
 | smp/placement.rs | 1 | permitted |
-| smp/spinlock.rs | 7 | permitted |
+| smp/spinlock.rs | 9 | permitted |
 | interrupt/route.rs | 1 | grandfathered |
 | loader.rs | 4 | grandfathered |
 | main.rs | 2 | grandfathered |
@@ -160,9 +160,19 @@ CI script: `scripts/unsafe_check.py` — parses the table between the markers.
 | task/scheduler.rs | 37 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 380 lines across 22 files  
+**Permitted total:** 394 lines across 22 files  
 **Grandfathered total:** 53 lines across 6 files  
-**Grand total:** 433 lines across 28 files
+**Grand total:** 447 lines across 28 files
+
+> **2026-06-28** (branch `hardening/dma-reserve-pool`). **Audit reconciliation** — three permitted-layer
+> files drifted (each line already carrying a `// SAFETY:` comment; the counts just weren't bumped as the
+> work landed). `arch/x86_64/pci.rs` 17 → 19: `clear_bus_master` + `set_bus_master`, the PCI bus-master
+> quiesce on DMA-driver kill/spawn that cures the max-carnage DMA-after-free (commit `ffe1a0f`).
+> `memory/allocator.rs` 32 → 37: one from the page-table reclaim guard (`phys_in_ram`, commit `b9dbc4c`)
+> and four from the DMA permanent-reserve net (§12) added on this branch — `alloc_dma_arena` (the reserving
+> allocator + its public wrapper + the table-full undo) so a driver's DMA arena is never recycled into a
+> page table. `smp/spinlock.rs` 7 → 9: a second `without_interrupts` guard from the per-core shootdown work.
+> New grand total: 447 / 28 files (also corrects the prose totals, which had drifted ~5 low vs the inventory sum).
 
 > **2026-06-22** (branch `fix/unsafe-audit-reconcile`). **Audit reconciliation** — caught up four
 > drifted files and shrank one back under its floor. Permitted-layer count catch-ups (all `arch/`,
@@ -534,6 +544,16 @@ for driver DMA arenas (§12) — the `unsafe fn alloc_contiguous` method, its in
 as the rest of the allocator: every access holds `ALLOC_LOCKED` (single writer
 across all cores), and the bitmap scan is bounds-checked against
 `max_valid_frame`. `// SAFETY:` comments present in source for all three.
+
+Five further `unsafe` lines (count 32 → 37): one from the page-table reclaim guard
+(`phys_in_ram`'s `ALLOCATOR.max_valid_frame` read, commit `b9dbc4c`) and four from the
+DMA permanent-reserve net (§12, the DMA-safety net): `unsafe fn alloc_dma_arena`, its
+inner `self.alloc_contiguous(n)` call, the table-full `bitmap_set_free` undo, and the
+public `alloc_dma_arena` wrapper's `(*addr_of_mut!(ALLOCATOR)).alloc_dma_arena(n)` call.
+`alloc_dma_arena` records the run in `dma_reserves` so `free` skips it — the arena is
+never returned to the general pool to be recycled as a page table (a stray DMA then hits
+DMA-reserved memory, not a PTE). Sound for the same reason as the rest of the allocator:
+every access holds `ALLOC_LOCKED`. `// SAFETY:` comments present in source for all five.
 
 ---
 

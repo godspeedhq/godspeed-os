@@ -179,6 +179,16 @@ pub const CONFINE_USB_DRIVERS: bool = true;
 
 /// VA where the driver's physically-contiguous DMA arena is mapped (8 GiB).
 pub const XHCI_DMA_VA:     u64 = 0x2_0000_0000;
+
+/// Per-driver DMA-arena physical base, allocated ONCE on the first spawn and REUSED across every
+/// respawn (§12, the DMA permanent-reserve net). `allocator::alloc_dma_arena` reserves the run out of
+/// the general pool so it is never recycled into a page table; keeping the phys here makes the
+/// reservation bounded - one arena per driver, reused, rather than one allocated per spawn. So a stray
+/// device DMA (if the kill-path bus-master quiesce ever fails) always lands in DMA-reserved memory,
+/// never a PTE or kernel struct. 0 = not yet allocated. (xhci/ehci/block-driver; a future NIC = 4th.)
+pub static XHCI_DMA_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static EHCI_DMA_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static AHCI_DMA_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Pages of contiguous DMA memory for the **xHCI** driver. The first 16 pages
 /// hold the control structures (command/event rings, DCBAA, ERST, per-device
 /// slices, plus the scratchpad buffer array at page 15); the remaining 256 pages
@@ -3337,7 +3347,26 @@ fn spawn_service_with_config(
         XHCI_DMA_PAGES
     };
     let (xhci_dma_va, xhci_dma_phys, xhci_dma_len) = if dma_for_driver {
-        match crate::memory::allocator::alloc_contiguous(dma_pages as usize) {
+        // DMA permanent-reserve (§12): allocate this driver's arena ONCE, then reuse the same physical
+        // frames across every respawn. `alloc_dma_arena` reserves the run out of the general pool (so it
+        // is never recycled into a page table); keeping the phys keeps the reservation bounded - one
+        // arena per driver, not one per spawn. So a stray DMA (if the kill-path bus-master quiesce ever
+        // fails) always lands in DMA-reserved memory, never a PTE or kernel struct.
+        let kept = match name {
+            "xhci"         => &XHCI_DMA_PHYS,
+            "ehci"         => &EHCI_DMA_PHYS,
+            "block-driver" => &AHCI_DMA_PHYS,
+            _              => &XHCI_DMA_PHYS, // unreachable: dma_for_driver gates these three names
+        };
+        let arena = match kept.load(core::sync::atomic::Ordering::Relaxed) {
+            0 => {
+                let p = crate::memory::allocator::alloc_dma_arena(dma_pages as usize);
+                if let Some(phys) = p { kept.store(phys, core::sync::atomic::Ordering::Relaxed); }
+                p
+            }
+            p => Some(p), // reuse the permanent arena allocated on a prior spawn
+        };
+        match arena {
             Some(phys) => {
                 let flags = PageFlags::PRESENT
                     | PageFlags::WRITABLE
