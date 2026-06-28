@@ -164,9 +164,12 @@ fn idle(ctx: &ServiceContext) -> ! {
     // input-ready so the shell's boot-screen auto-clear fires - boot is "done" as
     // far as the input subsystem is concerned, even if there's no usable keyboard.
     ctx.signal_input_ready();
-    loop {
-        ctx.yield_cpu();
-    }
+    // DRAIN our IPC endpoint forever, never just yield: a registered driver that idles here without
+    // recv'ing lets a flood-storm (or any stray send) fill its 16-deep queue and sit at 16/16 FOREVER -
+    // the logger stub bug, and the exact gap the flood-endpoint sweep missed for xhci's no-controller path.
+    // recv() parks between messages, so the core still idles; it just no longer clogs (mirrors ehci's
+    // idle_draining). Pinned by the shell-test `chaos flood-storm xhci` step (xhci has no controller in QEMU).
+    loop { let _ = ctx.recv(); }
 }
 
 /// Poll the event ring for the next event TRB. Returns (trb_type, completion,

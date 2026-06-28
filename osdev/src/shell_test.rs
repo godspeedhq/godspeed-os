@@ -705,6 +705,39 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
+    // FLOOD-ENDPOINT DRAIN regression. The disease: a registered service that idles without recv'ing lets a
+    // flood (or any stray send) fill its 16-deep queue and sit at 16/16 FOREVER. It recurred in logger (a
+    // park stub) and the USB drivers' idle paths - including xhci's NO-CONTROLLER idle, which the original
+    // sweep missed and this very pin caught. In QEMU there is no USB controller, so xhci/ehci sit in exactly
+    // that no-controller idle path. Each must DRAIN under flood and survive; a regression here means a
+    // non-draining idle loop came back.
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"chaos flood-storm logger 5\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)) {
+        Some(r) => {
+            check!(r.contains("flood-storm logger") && r.contains("verdict: PASS"), "chaos: flood-storm logger - idle endpoint drains, PASS (was a park stub)");
+            check!(r.contains("survived: 5/5"), "chaos: flood-storm logger - survived all 5 (drained, not clogged)");
+        }
+        None => { println!("shell-test: FAIL - chaos flood-storm logger timed out (endpoint clogged / panic?)"); fail += 2; }
+    }
+    send(&mut write_half, b"chaos flood-storm xhci 5\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)) {
+        Some(r) => {
+            check!(r.contains("flood-storm xhci") && r.contains("verdict: PASS"), "chaos: flood-storm xhci - no-controller idle drains, PASS (the gap the sweep missed)");
+            check!(r.contains("survived: 5/5"), "chaos: flood-storm xhci - survived all 5 (drained, not clogged)");
+        }
+        None => { println!("shell-test: FAIL - chaos flood-storm xhci timed out (endpoint clogged / panic?)"); fail += 2; }
+    }
+    send(&mut write_half, b"chaos flood-storm ehci 5\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)) {
+        Some(r) => {
+            check!(r.contains("flood-storm ehci") && r.contains("verdict: PASS"), "chaos: flood-storm ehci - no-controller idle drains, PASS");
+            check!(r.contains("survived: 5/5"), "chaos: flood-storm ehci - survived all 5 (drained, not clogged)");
+        }
+        None => { println!("shell-test: FAIL - chaos flood-storm ehci timed out (endpoint clogged / panic?)"); fail += 2; }
+    }
+
+    // -----------------------------------------------------------------------
     // chaos mem-pressure: on-device memory pressure (§22 S7). Each round spawns the mem-pressure (allocs
     // 4 MiB chunks to its 32 MiB limit, then AllocDenied), watches free frames drop, kills it, and
     // confirms the frames return to baseline (v1 reclaims at death). PASS = every round allocated +
