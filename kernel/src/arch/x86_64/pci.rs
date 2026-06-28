@@ -17,9 +17,18 @@
 //! Port I/O is hardware access, so this lives in the arch layer (§18.1).
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use crate::smp::SpinLock;
 
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
+
+/// Serializes PCI config access. The 0xCF8 (address) / 0xCFC (data) pair is a single global register
+/// pair: an access is "latch address, then read/write data". Boot access is single-threaded, but the
+/// runtime kill path now clears bus-mastering on a dying DMA driver while another core may be
+/// re-initialising a respawned one - an unserialized interleave would latch one core's address and then
+/// read/write it with the other core's data, hitting the WRONG register. The lock makes each access (and
+/// `clear_bus_master`'s read-modify-write) atomic.
+static PCI_CONFIG_LOCK: SpinLock<()> = SpinLock::new(());
 
 // xHCI is PCI class 0x0C (serial-bus controller), subclass 0x03 (USB),
 // programming interface 0x30 (eXtensible Host Controller Interface).
@@ -122,7 +131,8 @@ fn config_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
         | ((dev as u32) << 11)
         | ((func as u32) << 8)
         | ((offset as u32) & 0xFC);
-    // SAFETY: standard PCI config mechanism #1; ring-0 port I/O.
+    // Lock held across the address+data pair (§ PCI_CONFIG_LOCK). SAFETY: mechanism #1; ring-0 port I/O.
+    let _g = PCI_CONFIG_LOCK.lock();
     unsafe {
         outl(CONFIG_ADDRESS, addr);
         inl(CONFIG_DATA)
@@ -137,10 +147,78 @@ fn config_write32(bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
         | ((dev as u32) << 11)
         | ((func as u32) << 8)
         | ((offset as u32) & 0xFC);
-    // SAFETY: standard PCI config mechanism #1; ring-0 port I/O.
+    // Lock held across the address+data pair (§ PCI_CONFIG_LOCK). SAFETY: mechanism #1; ring-0 port I/O.
+    let _g = PCI_CONFIG_LOCK.lock();
     unsafe {
         outl(CONFIG_ADDRESS, addr);
         outl(CONFIG_DATA, val);
+    }
+}
+
+/// Clear PCI Bus Master Enable (Command register bit 2) for `bdf` - stop the device issuing ANY DMA.
+/// Called on a DMA-capable driver's death BEFORE its frames are reclaimed: a controller whose DMA frames
+/// are about to be freed + reused (e.g. as a page table) would otherwise scribble a stale/in-flight DMA
+/// into them - the chaos `max-carnage` page-table corruption (a freed DMA frame realloc'd as a page table,
+/// written by EHCI's still-running periodic schedule or an in-flight AHCI command). On the T630 ehci +
+/// block-driver run in IOMMU PASSTHROUGH, so nothing else stops the stray write. The respawned driver
+/// re-enables bus-mastering during init. Device-agnostic (any PCI DMA device). `bdf == 0xFFFF` = no-op.
+pub fn clear_bus_master(bdf: u32) {
+    if bdf == 0xFFFF { return; }
+    let addr = 0x8000_0000u32
+        | (((bdf >> 8) & 0xFF) << 16)  // bus
+        | (((bdf >> 3) & 0x1F) << 11)  // device
+        | ((bdf & 0x07) << 8)          // function
+        | 0x04;                        // Command register
+    // Hold the lock across the whole read-modify-write so it is atomic vs a concurrent respawn's
+    // bus-master ENABLE on another core. SAFETY: ring-0 port I/O, PCI mechanism #1.
+    let changed = {
+        let _g = PCI_CONFIG_LOCK.lock();
+        unsafe {
+            outl(CONFIG_ADDRESS, addr);
+            let cmd = inl(CONFIG_DATA);
+            let new = cmd & !(1u32 << 2); // clear Bus Master Enable (bit 2)
+            if new != cmd {
+                outl(CONFIG_ADDRESS, addr);
+                outl(CONFIG_DATA, new);
+                true
+            } else {
+                false
+            }
+        }
+    };
+    if changed {
+        crate::kprintln!("pci: BDF {:#06x} bus-master DISABLED on driver death (DMA quiesced)", bdf & 0xFFFF);
+    }
+}
+
+/// Set PCI Bus Master Enable (Command bit 2) for `bdf` - allow the device to issue DMA. The counterpart to
+/// `clear_bus_master`: the kill path clears it, so a DMA driver's spawn/respawn re-enables it here.
+/// Firmware sets it once at boot, but a respawned driver would otherwise have it cleared + its DMA would
+/// silently never start. Idempotent (no-op if already set). `bdf == 0xFFFF` = no-op.
+pub fn set_bus_master(bdf: u32) {
+    if bdf == 0xFFFF { return; }
+    let addr = 0x8000_0000u32
+        | (((bdf >> 8) & 0xFF) << 16)  // bus
+        | (((bdf >> 3) & 0x1F) << 11)  // device
+        | ((bdf & 0x07) << 8)          // function
+        | 0x04;                        // Command register
+    let changed = {
+        let _g = PCI_CONFIG_LOCK.lock();
+        unsafe {
+            outl(CONFIG_ADDRESS, addr);
+            let cmd = inl(CONFIG_DATA);
+            let new = cmd | (1u32 << 2); // set Bus Master Enable (bit 2)
+            if new != cmd {
+                outl(CONFIG_ADDRESS, addr);
+                outl(CONFIG_DATA, new);
+                true
+            } else {
+                false
+            }
+        }
+    };
+    if changed {
+        crate::kprintln!("pci: BDF {:#06x} bus-master ENABLED for DMA driver spawn", bdf & 0xFFFF);
     }
 }
 

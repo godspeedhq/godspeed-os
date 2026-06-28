@@ -3388,6 +3388,17 @@ fn spawn_service_with_config(
                             name, CONFINE_USB_DRIVERS
                         );
                     }
+                    // Re-enable PCI bus-mastering for this DMA driver. The kill path CLEARS it to quiesce the
+                    // controller before the frame reclaim (the max-carnage corruption fix), and firmware sets
+                    // it only once at boot - so a RESPAWN must re-enable it or the new instance's DMA silently
+                    // never starts. Idempotent (no-op if already set). Per-driver BDF.
+                    let bdf = match name {
+                        "xhci"         => pci::XHCI_BDF.load(Relaxed),
+                        "ehci"         => pci::EHCI_BDF.load(Relaxed),
+                        "block-driver" => pci::AHCI_BDF.load(Relaxed),
+                        _              => 0xFFFF,
+                    };
+                    pci::set_bus_master(bdf);
                 }
                 (XHCI_DMA_VA, phys, len)
             }

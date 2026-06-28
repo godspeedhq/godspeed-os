@@ -1652,17 +1652,32 @@ pub fn kill_task_by_slot(slot: usize) {
             crate::task::flag_supervisor_respawn();
         }
 
-        // H1: if a confined DMA driver dies, reclaim its IOMMU resources (revert
-        // DTE to passthrough, free its I/O page table) so a restart does not leak
-        // and re-confines cleanly. Safe call; no-op if the device wasn't confined.
-        if task_name == "xhci" || task_name == "ehci" {
+        // A dying DMA-capable driver: QUIESCE its DMA, then (H1) reclaim its IOMMU resources.
+        //
+        // DMA quiesce is the cure for the chaos `max-carnage` page-table corruption (the round-4286 KERNEL
+        // PF, then caught + skipped by page_tables::walk's guard): under the kill/respawn churn a driver's
+        // DMA frames get freed and REUSED (e.g. as a page table), and the controller's still-live engine -
+        // EHCI's continuous periodic schedule, or an in-flight AHCI command - scribbles foreign data into
+        // them, landing a non-PTE value in a PTE slot. On the T630 ehci + block-driver are IOMMU-PASSTHROUGH,
+        // so nothing else stops the stray write. We clear PCI Bus-Master-Enable BEFORE the frame reclaim
+        // below (the controller cannot start new DMA; any in-flight transaction drains during the kill's
+        // remaining work + the spin-wait); the respawned driver re-enables bus-mastering during init.
+        // block-driver (AHCI) is included; xhci is confined (its stray DMA would fault, not corrupt) but
+        // quiescing it too is harmless + correct on a no-IOMMU machine where it is passthrough as well.
+        if task_name == "xhci" || task_name == "ehci" || task_name == "block-driver" {
             use core::sync::atomic::Ordering::Relaxed;
-            let bdf = if task_name == "xhci" {
-                crate::arch::x86_64::pci::XHCI_BDF.load(Relaxed)
-            } else {
-                crate::arch::x86_64::pci::EHCI_BDF.load(Relaxed)
+            use crate::arch::x86_64::pci;
+            let bdf = match task_name {
+                "xhci" => pci::XHCI_BDF.load(Relaxed),
+                "ehci" => pci::EHCI_BDF.load(Relaxed),
+                _      => pci::AHCI_BDF.load(Relaxed), // block-driver
             };
-            crate::arch::x86_64::iommu::release_device(bdf);
+            pci::clear_bus_master(bdf);
+            // H1: revert the IOMMU DTE to passthrough + free the I/O page table so a restart re-confines
+            // cleanly (no-op if the device wasn't confined). xhci/ehci only; AHCI has no IOMMU domain yet.
+            if task_name != "block-driver" {
+                crate::arch::x86_64::iommu::release_device(bdf);
+            }
         }
 
         // SMP safety: spin until no other core has CORE_CURRENT[c] == slot.
