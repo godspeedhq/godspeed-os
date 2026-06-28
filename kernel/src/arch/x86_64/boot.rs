@@ -227,18 +227,17 @@ pub unsafe fn init_bsp(boot_info: &BootInfo) {
     }
 }
 
-/// Boot-time W^X audit + lock-in assertion (hardening H4b). The kernel inherits
-/// all of its own page tables from Limine (`init_paging` is a no-op), so this logs
-/// the NO-EXECUTE (NX, bit 63) and WRITABLE (W, bit 1) status of three
-/// representative pages and then *asserts* the W^X invariant on the one that has
-/// historically been wrong:
-///   - the HHDM alias of a RAM page - a read/write alias of physical memory; after
-///     `harden_hhdm_nx` it MUST be non-executable, else every writable page has an
-///     executable alias (a kernel-wide W^X bypass). Asserted.
+/// Boot-time W^X audit + lock-in assertion (hardening H4b). The kernel inherits all of its own page
+/// tables from Limine (`init_paging` is a no-op), so this logs the NO-EXECUTE (NX, bit 63) and WRITABLE
+/// (W, bit 1) status of three representative pages and *asserts* the W^X invariant on EACH - no mapped
+/// page may be both writable AND executable:
+///   - the HHDM alias of a RAM page - a read/write alias of physical memory; after `harden_hhdm_nx` it
+///     MUST be non-executable, else every writable page has an executable alias (a kernel-wide bypass).
 ///   - a kernel code (.text) page - expected executable (NX=0), read-only (W=0).
 ///   - a kernel data (.bss) page - expected writable (W=1), non-exec (NX=1).
-/// Run after `harden_hhdm_nx`. A regression that left the HHDM W+X now fails the
-/// boot loudly (§3.12) rather than shipping a silent hole.
+/// Run after `harden_hhdm_nx`. A regression that leaves ANY of them W+X now fails the boot loudly (§3.12)
+/// rather than shipping a silent hole. (The W^X FOUNDATION - EFER.NXE, without which these NX bits are
+/// ignored - is set + asserted per-core in `init_syscall`.)
 pub fn audit_wx() {
     use crate::arch::x86_64::page_tables::{entry_for_va, get_hhdm_offset};
     const NX: u64 = 1 << 63;
@@ -250,6 +249,12 @@ pub fn audit_wx() {
                     "wx-audit: {:<11} va={:#018x} W={} NX={} {}",
                     name, va, (e & W != 0) as u8, (e & NX != 0) as u8,
                     if e & W != 0 && e & NX == 0 { "<<< W+X" } else { "ok" });
+                // W^X (H4): NO sampled page may be both writable AND executable. Assert EVERY page now,
+                // not only the HHDM - a regression that leaves one W+X fails the boot loudly (§3.12)
+                // instead of shipping a silent hole. (kernel-text is RX: W=0; kernel-data + HHDM are
+                // RW-NX: NX=1 - all pass today.)
+                assert!(!(e & W != 0 && e & NX == 0),
+                    "W^X violation: {} (va={:#018x}) is WRITABLE and EXECUTABLE", name, va);
                 Some(e)
             }
             None => {
@@ -261,14 +266,12 @@ pub fn audit_wx() {
     // HHDM alias of a real RAM page. One frame is allocated to guarantee a
     // usable-RAM physical address; it is intentionally leaked - one 4 KiB page,
     // once at boot (there is no free_frame in v1, and this runs exactly once).
-    let hhdm = crate::memory::allocator::alloc_frame()
+    let _ = crate::memory::allocator::alloc_frame()
         .and_then(|f| report("hhdm-ram", get_hhdm_offset() + f.phys_addr().0));
     report("kernel-text", audit_wx as usize as u64);
     report("kernel-data", core::ptr::addr_of!(TSC_DEADLINE_MODE) as usize as u64);
-    // Lock-in: the direct map must be non-executable. Fail loudly, not silently.
-    if let Some(e) = hhdm {
-        assert!(e & NX != 0, "W^X violation: HHDM is W+X (harden_hhdm_nx failed)");
-    }
+    // Every page sampled above is asserted W^X inside `report` (no W+X) - the HHDM, historically the
+    // one left W+X, is covered there too (it runs after harden_hhdm_nx).
 }
 
 /// Program the local APIC timer for a ~10 ms periodic interrupt on vector 32.
@@ -847,7 +850,10 @@ pub(super) unsafe fn init_syscall(core_id: u32) {
 
     // SAFETY: all WRMSR/RDMSR in ring-0 are always valid on x86_64.
     unsafe {
-        // Enable SYSCALL/SYSRETQ in EFER (bit 0 = SCE).
+        // EFER bit 0 (SCE) enables SYSCALL/SYSRETQ. Bit 11 (NXE) is the W^X FOUNDATION: without it the
+        // NO_EXEC bit (63) in every PTE is IGNORED, so the whole W^X scheme silently does not hold. The
+        // kernel SETS it explicitly here rather than trusting the bootloader - a security invariant must
+        // not depend on the boot environment. (Limine does set it today; asserted at the readback below.)
         let (efer_lo, efer_hi): (u32, u32);
         core::arch::asm!(
             "rdmsr",
@@ -856,7 +862,7 @@ pub(super) unsafe fn init_syscall(core_id: u32) {
             out("edx") efer_hi,
             options(nostack, nomem),
         );
-        let efer = ((efer_hi as u64) << 32) | (efer_lo as u64) | 1u64;
+        let efer = ((efer_hi as u64) << 32) | (efer_lo as u64) | 1u64 | (1u64 << 11);
         core::arch::asm!(
             "wrmsr",
             in("ecx") 0xC000_0080u32,
@@ -941,6 +947,11 @@ pub(super) unsafe fn init_syscall(core_id: u32) {
             (efer_rd >> 8) & 1,
             (efer_rd >> 10) & 1,
         );
+        // W^X foundation enforcement (H4): we just set NXE; refuse to boot if it did not take, rather than
+        // run with every PTE NO_EXEC bit silently ignored (§3.12, loud failure). All x86_64 support NX, so
+        // this passes on real hardware - it is the backstop against a boot environment that doesn't.
+        assert!((efer_rd >> 11) & 1 == 1,
+            "W^X foundation missing: EFER.NXE not enabled on core {} (EFER={:#010x})", core_id, efer_rd);
     }
 
     // Set IA32_KERNEL_GS_BASE for this core's SYSCALL stub (§8.2).
