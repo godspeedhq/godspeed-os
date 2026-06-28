@@ -39,7 +39,10 @@ const CAP_HCCPARAMS:  usize = 0x08; // u32 - capability parameters
 /// core still idles; it just no longer clogs. Used at every dead end where ehci has nothing left to
 /// do (no controller MMIO, reset failed, or no high-speed device present at boot).
 fn idle_draining(ctx: &ServiceContext) -> ! {
-    loop { let _ = ctx.recv(); }
+    // Drain by POLLING (try_recv), not a blocking recv: a cross-core flood that must WAKE a deeply-blocked
+    // recv on an AP is unreliable under QEMU TCG (the drain flaked in the flood-storm pin); the self-driven
+    // poll drains every quantum with no wake needed. Busy-yield is fine for this rare no-controller path.
+    loop { while ctx.try_recv().is_some() {} ctx.yield_cpu(); }
 }
 
 #[no_mangle]

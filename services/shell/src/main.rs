@@ -3555,7 +3555,8 @@ fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
     let msg = Message::from_bytes(&[0x01]); // minimal benign payload; the target drains + drops it
     let mut depth = [0u32;  CHAOS_MAX_ROUNDS as usize]; // sends that landed before QueueFull
     let mut sat_r = [false; CHAOS_MAX_ROUNDS as usize]; // queue actually saturated (hit QueueFull)
-    let mut ok_r  = [false; CHAOS_MAX_ROUNDS as usize]; // service survived this round
+    let mut ok_r  = [false; CHAOS_MAX_ROUNDS as usize]; // service DRAINED this round (a re-send LANDED)
+    let mut clog_r = [false; CHAOS_MAX_ROUNDS as usize]; // saturated but did NOT drain (re-send still QueueFull)
     let mut survived = 0u32;
     let mut died_at: Option<u32> = None;
 
@@ -3581,14 +3582,18 @@ fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
             if let Some(nh) = ctx.acquire_send_cap(svc) { ctx.remove_cap(handle); handle = nh; }
             continue;
         }
-        // 3. Responsive? a send should land now that the queue has drained. EndpointDead = it died.
+        // 3. Did it DRAIN? After the yield a fresh send must LAND (Ok) - proof a slot freed, i.e. the service
+        // actually recv'd. QueueFull means the queue is STILL full: the service did NOT drain (it is clogged -
+        // the flood-endpoint disease), which is a FAIL, not a pass. EndpointDead = it died. (Counting
+        // QueueFull as "survived" here was a real bug - it let a permanently-clogged service pass.)
         match ctx.try_send_by_handle(handle, &msg) {
-            Ok(()) | Err(IpcError::QueueFull) => { ok_r[r] = true; survived += 1; }
-            Err(IpcError::EndpointDead)       => {
+            Ok(())                      => { ok_r[r] = true; survived += 1; }
+            Err(IpcError::QueueFull)    => { clog_r[r] = true; } // still full: did NOT drain (clogged)
+            Err(IpcError::EndpointDead) => {
                 if died_at.is_none() { died_at = Some(r as u32 + 1); }
                 if let Some(nh) = ctx.acquire_send_cap(svc) { ctx.remove_cap(handle); handle = nh; }
             }
-            Err(_)                            => {}
+            Err(_)                      => {}
         }
     }
 
@@ -3604,6 +3609,8 @@ fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
             } else {
                 let _ = writeln!(rb, "round {:>3}: {} sends, service kept up (no QueueFull) -> alive", r + 1, depth[r]);
             }
+        } else if clog_r[r] {
+            let _ = writeln!(rb, "round {:>3}: saturated at depth {} -> did NOT drain, CLOGGED (still full) - flood-endpoint disease", r + 1, depth[r]);
         } else {
             let _ = writeln!(rb, "round {:>3}: depth {} -> service DIED (EndpointDead) - flood not absorbed", r + 1, depth[r]);
         }
@@ -3627,7 +3634,7 @@ fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
     let _ = writeln!(rb, "verdict: {}", if pass {
         "PASS (queue saturated + service drained + stayed alive)"
     } else {
-        "FAIL (a flood was not absorbed)"
+        "FAIL (a flood was not absorbed - a round clogged without draining, or the service died)"
     });
     if rb.overflow { let _ = writeln!(rb, "(report truncated at {} KiB)", REPORT_MAX / 1024); }
 

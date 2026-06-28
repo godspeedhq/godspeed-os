@@ -167,9 +167,11 @@ fn idle(ctx: &ServiceContext) -> ! {
     // DRAIN our IPC endpoint forever, never just yield: a registered driver that idles here without
     // recv'ing lets a flood-storm (or any stray send) fill its 16-deep queue and sit at 16/16 FOREVER -
     // the logger stub bug, and the exact gap the flood-endpoint sweep missed for xhci's no-controller path.
-    // recv() parks between messages, so the core still idles; it just no longer clogs (mirrors ehci's
-    // idle_draining). Pinned by the shell-test `chaos flood-storm xhci` step (xhci has no controller in QEMU).
-    loop { let _ = ctx.recv(); }
+    // We POLL (try_recv) rather than block on recv: a cross-core flood that must WAKE a deeply-blocked recv
+    // on an AP is unreliable under QEMU TCG (the drain flaked in the flood-storm pin); the self-driven poll
+    // drains every quantum with no wake needed (mirrors wait_for_port above + ehci idle_draining). Pinned by
+    // the shell-test `chaos flood-storm xhci` step (xhci has no controller in QEMU, so it sits in this path).
+    loop { while ctx.try_recv().is_some() {} ctx.yield_cpu(); }
 }
 
 /// Poll the event ring for the next event TRB. Returns (trb_type, completion,

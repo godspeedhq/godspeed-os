@@ -46,9 +46,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         Some(hba) => ahci::run(&ctx, &hba),
         None => {
             ctx.log("block-driver: no AHCI controller found (no SATA disk?)");
-            loop {
-                ctx.yield_cpu();
-            }
+            // DRAIN our IPC endpoint forever, never just yield: a registered service that idles here without
+            // recv'ing lets a flood (or any stray send) fill its 16-deep queue and sit at 16/16 FOREVER - the
+            // flood-endpoint disease (the logger stub / xhci idle()). recv() parks between messages, so the
+            // core still idles. We POLL (try_recv) rather than block on recv: a cross-core flood that must
+            // WAKE a deeply-blocked recv on an AP is unreliable under QEMU TCG (the drain flaked in the
+            // flood-storm pin); the self-driven poll drains every quantum with no wake needed. Pinned by the
+            // shell-test `chaos flood-storm block-driver` step (QEMU's pc machine has no AHCI, so it sits here).
+            loop { while ctx.try_recv().is_some() {} ctx.yield_cpu(); }
         }
     }
 }
