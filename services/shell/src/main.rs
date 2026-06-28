@@ -1463,7 +1463,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("chaos flood-storm <svc> [rounds]", "saturate a service's IPC queue with try_send; verify it drains + stays alive (the other axis: 'overwhelmed', not 'gone')", "chaos flood-storm fs 5"),
             ("chaos mem-pressure [rounds]", "spawn a mem-pressure that allocs to its limit, kill it, confirm the memory is reclaimed (alloc-to-limit + no leak, S7)", "chaos mem-pressure 5"),
             ("chaos spawn-storm [count]", "spawn mem-pressure tasks until the task-pool/memory ceiling REFUSES one (loud Err, no panic), then kill all + confirm full reclaim", "chaos spawn-storm"),
-            ("chaos max-carnage <all-services|svc> [n]", "the chaos monkey: storm RANDOM services (all-services) or aim every round at ONE (e.g. fs), under system-wide mem-pressure + spawn-storm; proves the KERNEL survives. Needs a SERIAL console - 'q' there aborts", "chaos max-carnage all-services 50"),
+            ("chaos max-carnage <all-services|svc> [n]", "the chaos monkey: storm RANDOM services (all-services) or aim every round at ONE (e.g. fs), under system-wide mem-pressure + spawn-storm; proves the KERNEL survives. 'q' aborts (via SERIAL if it storms the USB keyboard drivers)", "chaos max-carnage all-services 50"),
         ], true),
         "drives" => help_block(ctx, "drives", "manage attached disks (records when piped)", &[
             ("drives", "list attached drive(s)", "drives"),
@@ -3280,7 +3280,7 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
         ctx.console_writeln("  mem-pressure      [n]   a mem-pressure allocs to its limit, then reclaim");
         ctx.console_writeln("  spawn-storm       [n]   spawn mem-pressure tasks to the ceiling; loud refusal");
         ctx.console_writeln("  max-carnage <all-services|svc> [n]  all-services (random) or aim at one");
-        ctx.console_writeln("                          (serial console required; 'q' there aborts)");
+        ctx.console_writeln("                          ('q' aborts; SERIAL only if the run kills the keyboard)");
         ctx.console_writeln("  svc: supervisor | block-driver | fs | logger | xhci | ehci | shell");
         return Ok(());
     }
@@ -3296,9 +3296,26 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
                 ctx.console_writeln("usage: chaos max-carnage <all-services|service> [rounds]");
                 ctx.console_writeln("  all-services   storm a RANDOM live service each round");
                 ctx.console_writeln("  <service>      aim every round at one service (e.g. fs, logger)");
-                ctx.console_writeln("  both run under system-wide mem-pressure + spawn-storm. q in SERIAL aborts.");
+                ctx.console_writeln("  both run system-wide mem-pressure + spawn-storm. 'q' aborts (SERIAL if kbd dies).");
                 Ok(())
             } else {
+                // Validate the TARGET before launching. The syntax is <target> [rounds], so a bare number
+                // like `max-carnage 1000` parses 1000 as the TARGET - without this it silently storms a
+                // service "1000" that does not exist. Reject anything that is neither "all-services" nor a
+                // live service, loudly (invariant 12), with a SPECIFIC hint for the numeric mix-up.
+                let target = tok[1];
+                if target != "all-services" && slot_of(ctx, target).is_none() {
+                    if !target.is_empty() && target.bytes().all(|b| b.is_ascii_digit()) {
+                        ctx.console_writeln_fmt(format_args!(
+                            "max-carnage: '{}' is not a service. For {} rounds of EVERYTHING, run:", target, target));
+                        ctx.console_writeln_fmt(format_args!("  chaos max-carnage all-services {}", target));
+                    } else {
+                        ctx.console_writeln_fmt(format_args!("max-carnage: no live service '{}'.", target));
+                        ctx.console_writeln("  target: all-services, or a live service");
+                        ctx.console_writeln("  (block-driver | fs | logger | xhci | ehci | shell | supervisor)");
+                    }
+                    return Ok(());
+                }
                 let rounds = if ntok >= 3 { parse_u32(tok[2]).unwrap_or(0) } else { 0 };
                 chaos_launch(ctx, tok[1], rounds)
             }
@@ -3316,19 +3333,33 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
 /// keyboard back + self-terminates. The shell goes "muted" (see the main loop) for the duration. Kill
 /// any prior instance first - one-shot, no graceful self-exit race - exactly like `observe now`.
 fn chaos_launch(ctx: &ServiceContext, target: &str, rounds: u32) -> Result<(), ShellError> {
-    // Loud pre-flight warning + confirm. max-carnage attacks EVERY service including the USB keyboard
-    // drivers (xhci/ehci), so the keyboard goes DEAD mid-run and the ONLY abort is 'q' in a SERIAL
-    // console (the kernel-owned UART survives any driver death; the USB keyboard does not - it is itself
-    // a chaos target). The contributor acknowledges that before it is unleashed; the keyboard still works
-    // here, pre-storm, so the Enter confirm lands fine.
+    // Loud pre-flight warning + confirm, TAILORED to the target in three cases. all-services storms EVERY
+    // driver, so the keyboard dies for sure (serial only). A single USB host driver (xhci/ehci) kills the
+    // keyboard ONLY if it is the controller yours is on - we cannot know which, so we state the proviso.
+    // Anything else leaves the keyboard alive. The keyboard works HERE, pre-storm, so the confirm lands.
+    let target_all = target == "all-services";
+    let target_usb = target == "xhci" || target == "ehci";
     ctx.console_writeln("");
     ctx.console_writeln("============ MAXIMUM CARNAGE - READ THIS ============");
-    ctx.console_writeln(" This attacks EVERY service, the USB keyboard drivers");
-    ctx.console_writeln(" included. Once it starts your keyboard goes DEAD, so");
-    ctx.console_writeln(" 'q' on the keyboard will NOT stop the run.");
-    ctx.console_writeln("");
-    ctx.console_writeln(" The ONLY way to abort is 'q' in a SERIAL console");
-    ctx.console_writeln(" (PuTTY on COM1). Connect serial before continuing.");
+    if target_all {
+        ctx.console_writeln(" This storm KILLS the USB keyboard drivers (xhci/");
+        ctx.console_writeln(" ehci), so your keyboard goes DEAD mid-run and 'q'");
+        ctx.console_writeln(" on the keyboard will NOT stop the run.");
+        ctx.console_writeln("");
+        ctx.console_writeln(" The ONLY way to abort is 'q' in a SERIAL console");
+        ctx.console_writeln(" (PuTTY on COM1). Connect serial before continuing.");
+    } else if target_usb {
+        ctx.console_writeln_fmt(format_args!(" This kills the {} USB driver. If that is the", target));
+        ctx.console_writeln(" controller your keyboard is on, it goes DEAD: abort");
+        ctx.console_writeln(" with 'q' in a SERIAL console (PuTTY/COM1). If not,");
+        ctx.console_writeln(" the keyboard stays alive and 'q' there aborts.");
+        ctx.console_writeln(" Use serial if you are not sure.");
+    } else {
+        ctx.console_writeln(" This storms one service plus system-wide memory +");
+        ctx.console_writeln(" task-pool pressure, to prove the KERNEL survives.");
+        ctx.console_writeln(" Your keyboard is NOT a target and stays alive, so");
+        ctx.console_writeln(" 'q' on the keyboard aborts.");
+    }
     ctx.console_writeln("");
     ctx.console_writeln("=====================================================");
     ctx.console_write(" Start maximum carnage? [y/N]: ");
@@ -3359,6 +3390,18 @@ fn chaos_launch(ctx: &ServiceContext, target: &str, rounds: u32) -> Result<(), S
         buf[4..4 + n].copy_from_slice(&tb[..n]);
         let _ = ctx.send_by_handle(cap, &Message::from_bytes(&buf[..4 + n]));
         ctx.remove_cap(cap);
+    }
+    // Wait (bounded) for chaos to TAKE the console foreground before returning. Otherwise the shell loops
+    // back and blocks in console_read BEFORE chaos claims, then sits blocked there for the whole run (never
+    // its muted-poll path); on chaos's release that read just re-blocks with no byte, so no fresh `gsh>`
+    // repaints on the framebuffer until the user presses Enter (the intermittent "no prompt after chaos
+    // done" glitch). Once chaos owns the foreground the shell's loop goes muted and reliably reprints the
+    // prompt on regain. Bounded (chaos waits up to 2 s for this count first), so a chaos that never claims
+    // still returns and the shell carries on.
+    let t0 = ctx.datetime().epoch_secs();
+    while ctx.is_console_foreground() {
+        ctx.yield_cpu();
+        if ctx.datetime().epoch_secs() - t0 >= 3 { break; }
     }
     Ok(())
 }

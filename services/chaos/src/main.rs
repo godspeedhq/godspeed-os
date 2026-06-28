@@ -42,6 +42,7 @@ const MAX_SVC: usize = 16;          // distinct services in the aggregate tally 
 const SHELL_SETTLE_YIELDS: u32 = 4000; // let a freshly-respawned shell settle before we hand back
 const PACE_YIELDS: u32 = 3000;      // a beat between rounds so the panel/log stay readable + `q` lands
 const MEMP_CHUNK: usize = 64 * 1024; // one mem-pressure round allocs this (held; chaos's limit bounds it)
+const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]; // matches the `date` utility
 
 fn xorshift64(mut x: u64) -> u64 { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x }
 
@@ -84,6 +85,16 @@ impl core::fmt::Write for FrameBuf {
         for &b in s.as_bytes() { if self.len < self.buf.len() { self.buf[self.len] = b; self.len += 1; } }
         Ok(())
     }
+}
+
+/// Write a compact, bounded duration ("45s", "1m23s", "2h05m", "3d04h") into the frame: a chaos run can
+/// span days, so cascade d/h/m/s and show the two most-significant units. Seconds come from the RTC
+/// (year-guarded), so the value is plausible by construction.
+fn write_dur(f: &mut FrameBuf, secs: u64) {
+    if secs >= 86400 { let _ = write!(f, "{}d{:02}h", secs / 86400, (secs % 86400) / 3600); }
+    else if secs >= 3600 { let _ = write!(f, "{}h{:02}m", secs / 3600, (secs % 3600) / 60); }
+    else if secs >= 60 { let _ = write!(f, "{}m{:02}s", secs / 60, secs % 60); }
+    else { let _ = write!(f, "{}s", secs); }
 }
 
 /// One flood pass: get-or-reuse a cached SEND cap to `name`, then burst `try_send` (never blocking
@@ -135,6 +146,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // "all-services" (named so it can never clash with a real service that someone calls "all").
     let target: &str = if tlen == 0 { "all-services" } else { str_of(&tbuf[..tlen]) };
     let target_all = target == "all-services";
+    // Three keyboard-abort cases. all-services storms EVERY driver, so the keyboard dies for sure (serial
+    // only). A single USB host driver (xhci/ehci) kills the keyboard ONLY if it is the controller yours is
+    // on - we cannot know which (two controllers + hot-plug make detection unreliable), so we state the
+    // proviso honestly rather than guess. Anything else leaves the keyboard alive (plain keyboard `q`).
+    let target_usb = target == "xhci" || target == "ehci";
 
     // Take the keyboard so a resurrected shell cannot steal our `q`. This is the moment the shell goes
     // "muted" for the duration of the run (unclaimed is the normal state, so this changes nothing else).
@@ -161,6 +177,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut nsv = 0usize;
 
     let (mut round, mut killed, mut flooded, mut mempr, mut spawns) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    // Wall-clock start (RTC, year-guarded): the datetime for the "started HH:MM:SS" readout, and its epoch
+    // for elapsed + the linear ETA (a pure extrapolation of elapsed over round progress, no outside truth).
+    let start_dt = ctx.datetime();
+    let start_epoch = start_dt.epoch_secs();
 
     'carnage: loop {
         // `q` aborts. The kernel buffers the keypress across input-driver churn, so it is caught here.
@@ -260,13 +280,28 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // shows only what chaos FIRED - the kills + floods it itself counted - plus the global spawn count.
         let mut f = FrameBuf::new();
         let _ = write!(f, "\x1b[H");
-        let _ = write!(f, "  C H A O S   max-carnage    target: {}    ('q' to quit via SERIAL)\x1b[K\r\n", target);
+        let _ = write!(f, "  C H A O S   max-carnage    target: {}    ({})\x1b[K\r\n",
+            target, if target_all { "'q' to quit via SERIAL" } else { "'q' to quit" });
         if rounds > 0 {
             let pct = round * 100 / rounds; // round <= rounds, so 1..=100; rounds>0 guards the divide
             let _ = write!(f, "  round {} / {} ({}%)\x1b[K\r\n", round, rounds, pct);
         } else {
             let _ = write!(f, "  round {}  (until q)\x1b[K\r\n", round);
         }
+        // Wall-clock status line: when it began, how long it has run, and a linear ETA (no outside truth -
+        // a pure extrapolation of elapsed over round progress). until-q has no total, so remains is n/a.
+        let elapsed = (ctx.datetime().epoch_secs() - start_epoch).max(0) as u64;
+        let _ = write!(f, "  started {} {:04}-{:02}-{:02} {:02}:{:02}:{:02}  |  elapsed ",
+            WEEKDAYS[(start_dt.weekday() as usize) % 7], start_dt.year, start_dt.month, start_dt.day,
+            start_dt.hour, start_dt.minute, start_dt.second);
+        write_dur(&mut f, elapsed);
+        if rounds > 0 && round > 0 {
+            let _ = write!(f, "  |  remains ~");
+            write_dur(&mut f, elapsed * rounds.saturating_sub(round) / round);
+        } else {
+            let _ = write!(f, "  |  remains n/a");
+        }
+        let _ = write!(f, "\x1b[K\r\n");
         let _ = write!(f, "  ----------------------------------------------------\x1b[K\r\n");
         let _ = write!(f, "  {:<16} {:>10} {:>11}\x1b[K\r\n", "service", "kill-storm", "flood-storm");
         for s in 0..nsv {
@@ -282,7 +317,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let _ = write!(f, "  ----------------------------------------------------\x1b[K\r\n");
         let _ = write!(f, "  flood N/A: reply = killed instead (reply-style); no-ep = no send endpoint\x1b[K\r\n");
         let _ = write!(f, "  system:  mem-pressure {}   spawn-storm {}\x1b[K\r\n", mempr, spawns);
-        let _ = write!(f, "  kernel: ALIVE   abort: 'q' in the SERIAL console (keyboard dead)\x1b[K\r\n");
+        if target_all {
+            let _ = write!(f, "  kernel: ALIVE   abort: 'q' in the SERIAL console (keyboard dead)\x1b[K\r\n");
+        } else if target_usb {
+            let _ = write!(f, "  kernel: ALIVE   abort: 'q' on the keyboard, or SERIAL if it's on {}\x1b[K\r\n", target);
+        } else {
+            let _ = write!(f, "  kernel: ALIVE   abort: 'q' (keyboard alive)\x1b[K\r\n");
+        }
         f.flush(&ctx);
         // Per-round line to the kernel LOG (serial + ring buffer, NOT the in-place framebuffer panel), so
         // the SERIAL LOG keeps a scrolling history of the storm for troubleshooting. The CSI panel above
