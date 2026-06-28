@@ -10,6 +10,7 @@
 
 mod arch;
 mod capability;
+mod clock;
 mod control;
 mod elf_flags;
 mod interrupt;

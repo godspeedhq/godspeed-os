@@ -21,6 +21,10 @@
 // dependencies, so it is host-testable here and also used by the bin's loader.rs.
 pub mod elf_flags;
 
+// Pure clock-deglitch logic (the "4987d" uptime guard). No hardware deps, so it is host-testable here and
+// is also used by the bin's arch/x86_64/rtc.rs::now_epoch_monotonic. Same pattern as elf_flags above.
+pub mod clock;
+
 // capability/table.rs emits diagnostic messages via crate::kprintln!.
 // The binary target defines the real kprintln! in log.rs; the lib (host)
 // target provides this no-op stub so table.rs compiles without hardware.

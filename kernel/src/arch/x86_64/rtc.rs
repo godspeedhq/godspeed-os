@@ -99,12 +99,12 @@ pub fn read_datetime() -> u64 {
 static LAST_NOW_EPOCH: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
 pub fn now_epoch_monotonic() -> i64 {
     use core::sync::atomic::Ordering;
-    let raw  = epoch_secs(read_datetime());
-    let last = LAST_NOW_EPOCH.load(Ordering::Relaxed);
-    if last == 0 { LAST_NOW_EPOCH.store(raw, Ordering::Relaxed); return raw; }
-    if raw < last || raw > last + 86_400 { return last; } // backwards, or >1-day jump = glitch: hold last
-    LAST_NOW_EPOCH.store(raw, Ordering::Relaxed);
-    raw
+    let last     = LAST_NOW_EPOCH.load(Ordering::Relaxed);
+    // The pure decision lives in `crate::clock` (hardware-free, host-unit-tested); this wrapper just
+    // supplies the live RTC read and the high-water-mark store.
+    let accepted = crate::clock::deglitch_epoch(epoch_secs(read_datetime()), last);
+    LAST_NOW_EPOCH.store(accepted, Ordering::Relaxed);
+    accepted
 }
 
 /// A decoded year inside the window this build can sanely run in; a read outside it is a glitch.
