@@ -60,6 +60,79 @@ impl Datetime {
     }
 }
 
+#[cfg(test)]
+mod datetime_tests {
+    use super::Datetime;
+
+    fn dt(year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8) -> Datetime {
+        Datetime { year, month, day, hour, minute, second }
+    }
+
+    fn is_leap(y: i64) -> bool { (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 }
+    fn days_in_month(y: i64, m: i64) -> i64 {
+        match m {
+            1 => 31, 2 => if is_leap(y) { 29 } else { 28 }, 3 => 31, 4 => 30, 5 => 31, 6 => 30,
+            7 => 31, 8 => 31, 9 => 30, 10 => 31, 11 => 30, 12 => 31, _ => 0,
+        }
+    }
+
+    /// A deliberately naive, obviously-correct reference: count days from 1970 by iterating years +
+    /// months. It cannot share a bug with Hinnant's closed form - which is what makes the cross-check valid.
+    fn reference_epoch(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64) -> i64 {
+        let mut days: i64 = 0;
+        for yy in 1970..y { days += if is_leap(yy) { 366 } else { 365 }; }
+        for mm in 1..mo  { days += days_in_month(y, mm); }
+        days += d - 1;
+        days * 86_400 + h * 3_600 + mi * 60 + s
+    }
+
+    #[test]
+    fn reference_matches_known_unix_anchors() {
+        // Validate the REFERENCE itself against well-known Unix epochs first, so the cross-check is trustworthy.
+        assert_eq!(reference_epoch(1970, 1, 1, 0, 0, 0), 0);
+        assert_eq!(reference_epoch(2000, 1, 1, 0, 0, 0), 946_684_800);
+        assert_eq!(reference_epoch(2038, 1, 19, 3, 14, 8), 2_147_483_648); // Y2038 (2^31)
+        assert_eq!(reference_epoch(2000, 2, 29, 0, 0, 0), 951_782_400);    // leap day
+    }
+
+    #[test]
+    fn epoch_secs_matches_known_unix_anchors() {
+        assert_eq!(dt(1970, 1, 1, 0, 0, 0).epoch_secs(), 0);
+        assert_eq!(dt(2000, 1, 1, 0, 0, 0).epoch_secs(), 946_684_800);
+        assert_eq!(dt(2038, 1, 19, 3, 14, 8).epoch_secs(), 2_147_483_648);
+    }
+
+    #[test]
+    fn epoch_secs_matches_reference_over_a_multi_century_sweep() {
+        // Cross-check Hinnant (the SDK's epoch_secs - the twin every SERVICE uses) vs the naive reference for
+        // every month of 1971..=2100: div-4 leaps, the 2100 century non-leap, the 2000 leap-400. This is the
+        // drift guard - if a future edit to the SDK's days_since_epoch diverges from the kernel's (pinned in
+        // kernel/src/clock.rs), this catches it.
+        for y in 1971..=2100i64 {
+            for mo in 1..=12i64 {
+                let last = days_in_month(y, mo);
+                for &d in &[1i64, 15, 28, last] {
+                    for &(h, mi, s) in &[(0i64, 0i64, 0i64), (23, 59, 59), (12, 30, 15)] {
+                        assert_eq!(
+                            dt(y as u16, mo as u8, d as u8, h as u8, mi as u8, s as u8).epoch_secs(),
+                            reference_epoch(y, mo, d, h, mi, s),
+                            "SDK epoch_secs mismatch at {}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, mi, s);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn weekday_matches_known_anchors() {
+        // weekday() shares days_since_epoch with epoch_secs. 0=Sun..6=Sat. Known: 1970-01-01 Thursday (4),
+        // 2000-01-01 Saturday (6), 2026-06-06 Saturday (6) - the T630 `date` HW example.
+        assert_eq!(dt(1970, 1, 1, 0, 0, 0).weekday(), 4);
+        assert_eq!(dt(2000, 1, 1, 0, 0, 0).weekday(), 6);
+        assert_eq!(dt(2026, 6, 6, 0, 0, 0).weekday(), 6);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ServiceContextData page layout.
 // MUST match `ServiceContextData` in `kernel/src/task/mod.rs`.
