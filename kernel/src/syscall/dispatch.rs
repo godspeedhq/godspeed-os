@@ -1255,23 +1255,22 @@ fn handle_remove_cap(slot: u64) -> i64 {
 // Syscall: TaskStat (16) - read task state for a given slot index.
 // ---------------------------------------------------------------------------
 
-/// arg0 = slot (u32), arg1 = buf_ptr (user VA), arg2 = buf_len (must be ≥ 72).
+/// arg0 = slot (u32), arg1 = buf_ptr (user VA), arg2 = buf_len (must be ≥ 80).
 ///
 /// Requires the INTROSPECT capability (READ) - discloses any task's state (§3.1).
 ///
-/// Buffer layout (72 bytes):
-///   [0]       valid:       u8  (1 = live, 0 = dead/unused)
-///   [1]       state:       u8  (0=Ready, 1=Running, 2=BlockedOnRecv, 3=BlockedOnSend, 4=Dead)
-///   [2]       core:        u8
-///   [3]       pad:         u8
-///   [4..8]    name_len:    u32 LE
-///   [8..16]   mem_used:    u64 LE
-///   [16..24]  mem_limit:   u64 LE
-///   [24..56]  name:        [u8; 32] (truncated; zero-padded)
-///   [56..60]  generation:  u32 LE
-///   [60]      queue_depth: u8
-///   [61..64]  pad:         [u8; 3]
-///   [64..72]  run_ticks:   u64 LE
+/// Buffer layout (80 bytes = STAT_SIZE - kept in sync with the writes below):
+///   [0]       valid:         u8  (1 = live, 0 = dead/unused)
+///   [1]       state:         u8  (0=Ready, 1=Running, 2=BlockedOnRecv, 3=BlockedOnSend, 4=Dead)
+///   [2]       core:          u8
+///   [3]       queue_depth:   u8
+///   [4..8]    name_len:      u32 LE
+///   [8..16]   mem_used:      u64 LE
+///   [16..24]  mem_limit:     u64 LE
+///   [24..56]  name:          [u8; 32] (truncated; zero-padded)
+///   [56..64]  restart_count: u64 LE
+///   [64..72]  run_ticks:     u64 LE
+///   [72..80]  uptime_secs:   u64 LE
 ///
 /// Returns 0 on success, -1 on invalid args.
 fn handle_task_stat(slot: u64, buf_ptr: u64, buf_len: u64) -> i64 {
