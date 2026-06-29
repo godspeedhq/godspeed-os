@@ -226,10 +226,10 @@ impl Seek for OffsetFile {
 // Disk layout (64 MiB, 512-byte sectors, 131072 sectors total):
 //   LBA 0           - Protective MBR
 //   LBA 1           - Primary GPT header
-//   LBA 2–33        - Primary GPT partition entries (128 × 128 B = 32 sectors)
-//   LBA 34–2047     - Unused (alignment gap to 1 MiB)
-//   LBA 2048–131038 - EFI System Partition (FAT32, ~63 MiB)
-//   LBA 131039–131070 - Secondary GPT partition entries
+//   LBA 2-33        - Primary GPT partition entries (128 × 128 B = 32 sectors)
+//   LBA 34-2047     - Unused (alignment gap to 1 MiB)
+//   LBA 2048-131038 - EFI System Partition (FAT32, ~63 MiB)
+//   LBA 131039-131070 - Secondary GPT partition entries
 //   LBA 131071      - Secondary GPT header
 //
 // The ESP contains:
@@ -313,7 +313,7 @@ pub fn create_uefi_at(kernel_elf: &Path, limine_dir: &Path, image_path: &Path) -
     );
     write_at(image_path, SECTOR_SIZE, &primary_hdr);
 
-    // Sectors 2–33: Primary GPT entries.
+    // Sectors 2-33: Primary GPT entries.
     write_at(image_path, 2 * SECTOR_SIZE, &gpt_entries);
 
     // Format EFI System Partition as FAT32.

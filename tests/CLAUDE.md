@@ -9,7 +9,7 @@ tests/
   qemu/
     identity/    # Constitutional identity tests (§22) - 20/20 complete ✅
     harness/     # QEMU launcher, serial parser, test runner
-    perf/        # Performance benchmarks - ✅ 10/10 complete (§22 B1–B10), ✅ 10/10 brutal (BP1–BP10)
+    perf/        # Performance benchmarks - ✅ 10/10 complete (§22 B1-B10), ✅ 10/10 brutal (BP1-BP10)
     property/    # Property tests - Active (§22)
     fuzz/        # Fuzz tests - Active (§22)
     stress/      # Stress tests - Active (§22)
@@ -48,10 +48,10 @@ The bar across every category is identical: **no FAIL, no BLOCKED**. A failure m
 
 ```bash
 osdev test identity          # run §22 identity suite (20 tests)
-osdev test property          # run property tests (P1–P10)
-osdev test fuzz              # run fuzz corpus (F1–F8)
-osdev test stress            # run stress scenarios (S1–S10)
-osdev test perf              # run benchmarks (B1–B10)
-osdev test adversarial       # run red-team tests (A1–A10)
-osdev test chaos             # run chaos scenarios (C1–C7)
+osdev test property          # run property tests (P1-P10)
+osdev test fuzz              # run fuzz corpus (F1-F8)
+osdev test stress            # run stress scenarios (S1-S10)
+osdev test perf              # run benchmarks (B1-B10)
+osdev test adversarial       # run red-team tests (A1-A10)
+osdev test chaos             # run chaos scenarios (C1-C7)
 ```

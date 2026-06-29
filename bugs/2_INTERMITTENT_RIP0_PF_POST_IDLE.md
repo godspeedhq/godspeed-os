@@ -86,7 +86,7 @@ PF-ctx: saved_rsp=0xffffffff80293060  saved_rip=0x408298(user entry)  cr3=0xa100
 PF-stk[rsp-16..+40]: 8013ef50 0 0 0 ffffffff00000000 0 ffffffff8010bed5 ffffffff80101288
 ```
 - **fault rip 0x80295200 = K0T-32 for slot 4** (slot-4 kstack top = 0x80295220). That is *exactly*
-  the ring-3 interrupt-frame CS slot the `context_switch.rs::new_user` comment (lines 166–187)
+  the ring-3 interrupt-frame CS slot the `context_switch.rs::new_user` comment (lines 166-187)
   documents as hazardous. So a `ret` jumped to that address.
 - The two valid return addresses in the dump map to **`pf_handler` (0x8010bed5)** and **`pf_stub`
   (0x80101288)** - i.e. `TASK_CTX[4].rsp` (suspend-time) sits just below the **current fault
@@ -130,7 +130,7 @@ Dug through the ring-3 kstack/interrupt management (no hardware):
 - **REFUTED - stale TSS.rsp0 / kernel_rsp.** `prepare_ring3_switch` (scheduler.rs:653) re-points
   both `PER_CORE_SYSCALL[core].kernel_rsp` (→ K0T-512) and `TSS.rsp0` (→ K0T) to the incoming
   task's kstack before **every** ring-3 resume. Not a stale-pointer omission.
-- **The bug class is documented in `prepare_ring3_switch` (lines 656–667):** a timer-ISR return
+- **The bug class is documented in `prepare_ring3_switch` (lines 656-667):** a timer-ISR return
   address saved at ~K0T-200 gets clobbered by an overlapping frame → rip=0. Mitigation: SYSCALL
   frames start at K0T-512 so they never reach K0T-200. **But the comment's depth bound (K0T-260)
   is for the timer ISR's _early-return_ path only.** The timer-ISR _context-switch_ path

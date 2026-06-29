@@ -1,7 +1,7 @@
 # tests/qemu/perf/
 
-Performance benchmarks (§22.2, B1–B10). **Complete - 10/10 passing.**
-Brutal performance benchmarks (§22.2, BP1–BP10). **Complete - 10/10 passing.**
+Performance benchmarks (§22.2, B1-B10). **Complete - 10/10 passing.**
+Brutal performance benchmarks (§22.2, BP1-BP10). **Complete - 10/10 passing.**
 
 ## Status
 
@@ -21,7 +21,7 @@ Benchmarks for the IPC fast path and syscall paths. Per §20:
 - No performance claim is valid without a benchmark in this directory.
 - Any change to the IPC fast path (`ipc/`, `syscall/dispatch.rs`) requires a before/after benchmark run.
 
-## Benchmarks (§22 B1–B10)
+## Benchmarks (§22 B1-B10)
 
 | ID  | Benchmark                  | Metric                          |
 |-----|----------------------------|---------------------------------|

@@ -1,6 +1,6 @@
 # Hardware: Chaos Tests
 
-Mirrors §22 Chaos Tests (C1–C7). Graceful degradation under partial failures on real silicon.
+Mirrors §22 Chaos Tests (C1-C7). Graceful degradation under partial failures on real silicon.
 
 **Status: 5/5 PASS (4-core, post-placement-fix) - 2026-05-24. C1 partial (2-core degraded boot verified). C4 skipped.**
 

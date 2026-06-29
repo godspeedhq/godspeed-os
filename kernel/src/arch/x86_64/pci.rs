@@ -685,7 +685,7 @@ pub fn program_ehci_msi() -> bool {
 ///
 /// We have no ACPI `_PRT` parser, so the exact GSI the EHCI's INTx pin maps to is unknown: the
 /// PCI interrupt-line register holds the legacy 8259 IRQ (usually 11), but an AMD FCH routes PCI
-/// INTx to a *higher* GSI in the 16–23 range. Rather than gamble on one, we program a **candidate
+/// INTx to a *higher* GSI in the 16-23 range. Rather than gamble on one, we program a **candidate
 /// set** - the legacy line plus the platform PCI-INTx range - all to the same EHCI vector,
 /// level-triggered + active-low (PCI INTx), destination = the real BSP local-APIC id. Only the
 /// EHCI uses INTx (AHCI polls, xHCI is MSI), so the spurious candidates never fire; the one that

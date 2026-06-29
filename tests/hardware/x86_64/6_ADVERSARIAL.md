@@ -1,6 +1,6 @@
 # Hardware: Adversarial Tests
 
-Mirrors §22 Adversarial Tests (A1–A10). Capability isolation under direct attack on real silicon.
+Mirrors §22 Adversarial Tests (A1-A10). Capability isolation under direct attack on real silicon.
 
 **Reference:** `tests/qemu/adversarial/CLAUDE.md` for full spec.
 
@@ -32,7 +32,7 @@ osdev image --mode adv
 # Rufus DD Image mode → USB → reboot hardware, observe PuTTY
 ```
 
-`adv-only` supervisor spawns pong + ping + all 13 adversarial probe tasks (A1–A10 with passive victims). No QEMU harness required - all probes are self-contained.
+`adv-only` supervisor spawns pong + ping + all 13 adversarial probe tasks (A1-A10 with passive victims). No QEMU harness required - all probes are self-contained.
 
 **Expected serial lines (any order, 10/10):**
 ```

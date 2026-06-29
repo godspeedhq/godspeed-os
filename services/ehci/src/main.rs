@@ -762,7 +762,7 @@ fn poll_devices(
     let mut sts_logged = false;                          // log when USBSTS first shows USBINT
     // Typematic auto-repeat, timed in TSC cycles (read_tsc is hardware-proven to advance,
     // unlike the coarse kernel tick): ~300 ms before the first repeat, then ~50 ms apart
-    // at ~2 GHz. The spread across 1.5–3 GHz CPUs just shifts the feel slightly.
+    // at ~2 GHz. The spread across 1.5-3 GHz CPUs just shifts the feel slightly.
     let mut kb_rep = godspeed_sdk::hid::KeyRepeat::new(REPEAT_INITIAL_CYCLES, REPEAT_INTERVAL_CYCLES);
     let mut kb_caps = false; // Caps Lock latch (host-tracked toggle)
     let mut mouse = godspeed_sdk::hid::MouseTracker::new(); // mouse button/motion state

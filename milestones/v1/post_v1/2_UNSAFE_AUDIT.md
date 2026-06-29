@@ -255,7 +255,7 @@ When adding an `unsafe` block anywhere in the kernel:
 4. All three changes must land in the same commit - CI will catch a mismatch.
 
 For out-of-policy files (grandfathered list above): adding `unsafe` requires
-both steps 1–4 AND a CLAUDE.md §18 amendment with a written rationale.
+both steps 1-4 AND a CLAUDE.md §18 amendment with a written rationale.
 
 ---
 

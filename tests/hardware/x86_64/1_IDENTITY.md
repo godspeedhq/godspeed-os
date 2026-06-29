@@ -1,6 +1,6 @@
 # Hardware: Identity Tests
 
-Mirrors §22 (Tests 1–10 + IR1A/IR1B). Verifies constitutional invariants on real silicon.
+Mirrors §22 (Tests 1-10 + IR1A/IR1B). Verifies constitutional invariants on real silicon.
 
 **Build mode:** `osdev image --mode identity`
 

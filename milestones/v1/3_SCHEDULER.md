@@ -36,13 +36,13 @@ task-a: 3
 
 ## Context Switch
 
-- ✅ `switch_context` saves/restores callee-saved registers (rbx/rbp/r12–r15) + RSP + CR3
+- ✅ `switch_context` saves/restores callee-saved registers (rbx/rbp/r12-r15) + RSP + CR3
 - ✅ RSP field at offset 0x38 (layout verified against struct)
 - ✅ Verified: switching between two tasks executes both
 
 ## Preemption
 
-- ✅ Legacy 8259 PIC remapped (IRQ0–7 → vectors 32–39) and fully masked before IDT live
+- ✅ Legacy 8259 PIC remapped (IRQ0-7 → vectors 32-39) and fully masked before IDT live
 - ✅ Local APIC timer: periodic mode, vector 32, ÷16, 625,000 ticks (~10 ms at 1 GHz bus)
 - ✅ APIC MMIO mapped explicitly via `map_in_active_tables` with PCD+PWT (Limine HHDM
       covers RAM only, not MMIO at 0xFEE00000)

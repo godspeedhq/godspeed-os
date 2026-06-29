@@ -111,7 +111,7 @@ Stage it so each step is useful on its own.
 ### Stage 3 - `logger` becomes real (optional, parallel)
 - Route `ctx.log` to the `logger` service (today a stub) so logs have a real home
   (a queryable buffer, `osdev logs <svc>`, later a file via `fs`). Independent of
-  Stages 1–2; makes the log stream first-class.
+  Stages 1-2; makes the log stream first-class.
 
 ---
 

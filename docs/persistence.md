@@ -151,7 +151,7 @@ performance). We optimize transfer width later, never at the cost of clarity.
 
 ### 5.2 The new mechanism it needs: `hw_pio`
 
-ATA PIO uses **port-mapped I/O** (ports `0x1F0–0x1F7` / `0x3F6` for the primary channel),
+ATA PIO uses **port-mapped I/O** (ports `0x1F0-0x1F7` / `0x3F6` for the primary channel),
 not memory-mapped I/O. Today the SDK exposes MMIO (`Mmio::read32` etc.) but not port I/O.
 So Phase 1 adds a small, audited mechanism, mirroring the existing MMIO story:
 
@@ -610,7 +610,7 @@ byte in its data block, boot: `fs` logs a "data block CRC mismatch" and the read
 
 ### 6.11 Further robustness - roadmap (recovery layer)
 
-> **Adopted 2026-06-17.** Phases A–E gave the filesystem **detection** (every block self-verifies),
+> **Adopted 2026-06-17.** Phases A-E gave the filesystem **detection** (every block self-verifies),
 > **crash-consistency** (the metadata journal), **restartability**, and **persistence** - all
 > hardware-proven on the T630. The remaining robustness work is mostly the *next* layer:
 > **recover after detection**, and remove the **single fatal block**. These are pulled in
@@ -860,7 +860,7 @@ compatibility once you actually use the new capability. (Backup-superblock, Phas
 bit - an old reader ignoring it is harmless.)
 
 **The honest caveat.** This is forward-looking *from 0008*. It cannot retroactively rescue pre-0008
-disks (0003–0007 predate the masks, and 0004/0005 genuinely changed per-block layout), so those need
+disks (0003-0007 predate the masks, and 0004/0005 genuinely changed per-block layout), so those need
 one last reflash. But 0008 is the last time the format ever *forces* that - every future GSFS
 feature is additive, governed by the masks. "GSFS00014" never happens; it would just be "GSFS0008
 with more feature bits set."
@@ -1053,7 +1053,7 @@ All replies are exactly one of `{Ok-with-data, defined error}` - never silent
    files: `write_file` allocates an extent, writes the data blocks + entry table +
    superblock through block-driver `WriteBlock`; `read_file` walks the entry's extent via
    `ReadBlock`. Verified by a mount-time round-trip (`greeting`). `fs` also serves the
-   client API (`WriteFile`/`ReadFile`/`StatFile`, ops 10–12) over IPC via the reply-cap
+   client API (`WriteFile`/`ReadFile`/`StatFile`, ops 10-12) over IPC via the reply-cap
    pattern.
 5. **Reboot survival (the headline). ✅ done** (`osdev test blockdev-reboot`, case P1.5).
    Format once; boot 1 - `fs` creates `greeting`; **reboot on the same disk image without

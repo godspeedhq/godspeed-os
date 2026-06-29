@@ -281,7 +281,7 @@ to Limine's linear framebuffer at `base + y*pitch + x*bpp`:
 - `put_pixel`: writes `bpp` bytes at a bounds-checked offset (`x<width`, `y<height`).
 
 Sound because the framebuffer is the region Limine mapped and sized
-(`height*pitch` bytes), it lives in the higher half (PML4 256–511) that every
+(`height*pitch` bytes), it lives in the higher half (PML4 256-511) that every
 address space inherits via `PageTable::new`, so it is valid for writes for the
 system lifetime; every offset is bounds-checked against the reported geometry.
 

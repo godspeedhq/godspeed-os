@@ -276,7 +276,7 @@ document describes.
 **Output dir:** `build/tests/8_IDENTITY_BRUTAL/`
 
 These tests push the exact boundary of the guarantees already proved by
-Phase 1–5. Where the original tests show the happy path works, the brutal
+Phase 1-5. Where the original tests show the happy path works, the brutal
 tests probe the exact edge cases: boundary values, multi-hop delegation,
 and cross-core timing interactions.
 
@@ -343,7 +343,7 @@ SMP escalation verifies that the kernel handles more cores than the nominal
 4-core test configuration. Tests run at smp=2, smp=8, and smp=16 - the full
 range of `MAX_CORES = 16`. The first test to time out is the machine ceiling;
 that is not a bug, it is the hardware limit of the developer's QEMU environment.
-Correctness tests T11–T13 are unaffected by which SMP tier times out.
+Correctness tests T11-T13 are unaffected by which SMP tier times out.
 
 | ID     | smp | Result      | Notes                                    |
 |--------|-----|-------------|------------------------------------------|
@@ -370,7 +370,7 @@ and T13 failures cause a non-zero exit.
 
 ## Implementation - Milestone 15
 
-- ✅ `services/probe/src/main.rs` - modes 97–103; constants, dispatch arms, 7 functions
+- ✅ `services/probe/src/main.rs` - modes 97-103; constants, dispatch arms, 7 functions
 - ✅ `kernel/src/task/mod.rs` - 7 new service configs; `TASK_KSTACK_MAX` raised 100→120
 - ✅ `kernel/src/task/scheduler.rs` - `MAX_TASKS` raised 80→120
 - ✅ `services/supervisor/src/main.rs` - 7 brutal-id spawns (C/B before A, recv before send/kill)

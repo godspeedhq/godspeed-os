@@ -128,8 +128,8 @@ Prefer (a) if feasible; it's miss-proof.
 ### Verification bar (mandatory before merge)
 Because this rewrites how a core syscall is authorized, **all** suites must be green
 afterward, not just shell-test:
-`osdev test identity` (20), `property` (P1–P10), `fuzz` (F1–F8), `stress`
-(S1–S10), `perf`/`perf-brutal`, `adv`/`adv-brutal`, `chaos`/`chaos-brutal`. A
+`osdev test identity` (20), `property` (P1-P10), `fuzz` (F1-F8), `stress`
+(S1-S10), `perf`/`perf-brutal`, `adv`/`adv-brutal`, `chaos`/`chaos-brutal`. A
 missed mint shows up as a kill-denied failure in exactly one of these. Run on a
 rested box (TCG throttles under back-to-back suites) or in CI.
 

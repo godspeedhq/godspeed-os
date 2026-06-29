@@ -113,7 +113,7 @@ Commit `d41b418`.
 - ✅ Logs `"supervisor: ready"` and yields in a loop.
 - ✅ Service spawn per placement policy - done in Phase 5 as hardcoded `ctx.spawn_on()`
   calls (pong on core 1, ping on core 0). No manifest file; policy lives in
-  `service_config()` in `kernel/src/task/mod.rs`. Evidence: `supervisor/src/main.rs:21–30`.
+  `service_config()` in `kernel/src/task/mod.rs`. Evidence: `supervisor/src/main.rs:21-30`.
 - ✅ kill/restart authority - exercised via the `osdev restart` → COM2 → `control.rs`
   path rather than a supervisor IPC API. `control.rs` calls `kill_by_name` +
   `spawn_service_by_name` directly in the kernel. A supervisor-facing IPC API is
@@ -142,14 +142,14 @@ proving the IPC fast path and SMP scheduler are sound). The Phase 4 service vers
 (below) need wiring once supervisor spawns them in Phase 5.
 
 - ✅ Supervisor spawns pong on core 1, then ping on core 0 - done in Phase 5.
-  Evidence: `supervisor/src/main.rs:21–30`.
+  Evidence: `supervisor/src/main.rs:21-30`.
 - ✅ ping sends to pong via `ctx.try_send("pong", &msg)` in a tight yield loop,
-  logging every 100 messages. Evidence: `examples/ping/src/main.rs:22–37`.
+  logging every 100 messages. Evidence: `examples/ping/src/main.rs:22-37`.
 - ✅ pong receives and logs each message via blocking `ctx.recv()`.
-  Evidence: `examples/pong/src/main.rs:13–21`.
+  Evidence: `examples/pong/src/main.rs:13-21`.
 - ✅ ping handles `EndpointDead` via `ctx.reacquire_cap("pong")` (syscall 10),
   routing to whatever core the new pong instance was placed on.
-  Evidence: `examples/ping/src/main.rs:28–34`.
+  Evidence: `examples/ping/src/main.rs:28-34`.
 
 ---
 
@@ -161,13 +161,13 @@ proving the IPC fast path and SMP scheduler are sound). The Phase 4 service vers
   `task::kill_by_name` → `scheduler::kill_task_by_slot`: marks Dead atomically,
   calls `ipc::routing::kill_endpoint` (bumps generation, drains queue, returns
   blocked rx/tx slots), wakes both with -7 (EndpointDead), marks resource dead in
-  cap table. Evidence: `syscall/dispatch.rs:302–313`, `task/scheduler.rs:554–578`.
+  cap table. Evidence: `syscall/dispatch.rs:302-313`, `task/scheduler.rs:554-578`.
 - ✅ `task::kill_current` - page-fault path; calls `kill_task_by_slot` then
-  `yield_current`. Evidence: `task/mod.rs:374–382`.
+  `yield_current`. Evidence: `task/mod.rs:374-382`.
 - ✅ Per-service IPC endpoint creation at spawn - `spawn_service_with_config` in
   `task/mod.rs` creates an `EndpointId` when `has_recv_endpoint=true`, registers it
   in `ipc::routing`, publishes name→id in `ipc::names`, mints a RECV cap (slot 2),
-  writes `recv_slot` into the `ServiceContextData` page. Evidence: `task/mod.rs:247–268`.
+  writes `recv_slot` into the `ServiceContextData` page. Evidence: `task/mod.rs:247-268`.
 - ✅ `ipc/names.rs` (new file) - kernel name registry; `register(name, endpoint_id)`
   (update-or-insert, spinlock-protected) and `lookup(name)`. Updated at every spawn so
   `AcquireSendCap` always resolves to the newest instance's endpoint.
@@ -175,15 +175,15 @@ proving the IPC fast path and SMP scheduler are sound). The Phase 4 service vers
 - ✅ `control.rs` (new file) - COM2 control channel; `process_pending()` drains COM2
   bytes into a line buffer and executes complete `\n`-terminated commands.
   `RESTART <name> [<core>]` → `kill_by_name` + `spawn_service_by_name`. Called from
-  Core 0's scheduler idle loop. Evidence: `kernel/src/control.rs`, `scheduler.rs:354–356`.
+  Core 0's scheduler idle loop. Evidence: `kernel/src/control.rs`, `scheduler.rs:354-356`.
 - ✅ Syscall 10 (`AcquireSendCap`) - looks up name in `ipc::names`, mints a SEND cap,
   inserts into calling task's cap table, returns slot index. Used by ping after
   `EndpointDead` to get a fresh cap without going through the registry service.
-  Evidence: `syscall/dispatch.rs:321–344`.
+  Evidence: `syscall/dispatch.rs:321-344`.
 - ✅ Send-peer SEND caps wired at spawn time - `spawn_service_with_config` iterates
   `send_peers`, looks each up in `ipc::names`, mints SEND cap, writes slot + name
   into `ServiceContextData.send_peers[]`. ping gets SEND caps to "pong" and "registry"
-  at spawn (if pong is already registered). Evidence: `task/mod.rs:272–302`.
+  at spawn (if pong is already registered). Evidence: `task/mod.rs:272-302`.
 - ✅ COM2 initialised - `com2_init()` called from `kernel_main` before scheduler starts;
   `com2_try_read_byte()` polled in Core 0 idle loop. Evidence: `kernel/src/main.rs:199`.
 - [ ] Memory reclaim on kill (TLB shootdown, frame free) - not implemented; will be
@@ -194,17 +194,17 @@ proving the IPC fast path and SMP scheduler are sound). The Phase 4 service vers
 
 - ✅ `ServiceContext::send` / `try_send` - `find_send_slot(peer)` searches the dynamic
   cap cache first (post-restart reacquisitions), then `ServiceContextData.send_peers[]`
-  (wired at spawn). Evidence: `sdk/rust/src/service_context.rs:108–117, 255–285`.
+  (wired at spawn). Evidence: `sdk/rust/src/service_context.rs:108-117, 255-285`.
 - ✅ `ServiceContext::reacquire_cap(peer)` - issues syscall 10 (AcquireSendCap), updates
   the per-service dynamic cap cache so future `try_send` calls use the new slot without
-  another syscall. Evidence: `sdk/rust/src/service_context.rs:124–153`.
+  another syscall. Evidence: `sdk/rust/src/service_context.rs:124-153`.
 - ✅ `ServiceContext::kill` - syscall 8 (Kill) with name pointer.
-  Evidence: `service_context.rs:217–224`.
+  Evidence: `service_context.rs:217-224`.
 - ✅ `ServiceContext::restart(name, core_override)` - kill + spawn_on; `kill` error
-  is ignored (service may already be dead). Evidence: `service_context.rs:227–231`.
+  is ignored (service may already be dead). Evidence: `service_context.rs:227-231`.
 - ✅ `ServiceContext::log_fmt` - `StackWriter` (impl `fmt::Write` over a 256-byte stack
   buffer) so services can format messages without a heap allocator.
-  Evidence: `service_context.rs:180–190, 292–305`.
+  Evidence: `service_context.rs:180-190, 292-305`.
 - ✅ `drain_kernel_ring_buffer` - no-op stub; ring buffer is already mirrored to serial
   at all times (§11.4). Full drain syscall not implemented; will be implemented when
   a test requires it.
@@ -213,8 +213,8 @@ proving the IPC fast path and SMP scheduler are sound). The Phase 4 service vers
 
 - ✅ Spawns pong on core 1 **first** - ensures `ipc::names` records "pong" before ping
   is spawned; ping's spawn then gets a SEND cap to pong wired into its cap table.
-  Evidence: `services/supervisor/src/main.rs:21–23`.
-- ✅ Spawns ping on core 0. Evidence: `services/supervisor/src/main.rs:25–28`.
+  Evidence: `services/supervisor/src/main.rs:21-23`.
+- ✅ Spawns ping on core 0. Evidence: `services/supervisor/src/main.rs:25-28`.
 - ✅ Logs `"supervisor: ready"`. Evidence: `services/supervisor/src/main.rs:30`.
 - [ ] Death-notification restart loop (auto-restart on crash) - not implemented; will be
   implemented when a test requires it. Restart is triggered externally via
@@ -236,23 +236,23 @@ proving the IPC fast path and SMP scheduler are sound). The Phase 4 service vers
 ### ping ✅
 
 - ✅ Sends to pong via `ctx.try_send("pong", &msg)` in a tight yield loop; logs
-  every 100 messages. Evidence: `examples/ping/src/main.rs:22–37`.
+  every 100 messages. Evidence: `examples/ping/src/main.rs:22-37`.
 - ✅ Handles `EndpointDead` → `ctx.reacquire_cap("pong")` → resumes. Fresh cap
-  routes to whatever core the new pong instance is on. Evidence: `ping/src/main.rs:28–34`.
+  routes to whatever core the new pong instance is on. Evidence: `ping/src/main.rs:28-34`.
 - ✅ Handles `QueueFull` → yields and retries (avoids mutual-blocking anti-pattern §8.9).
 
 ### pong ✅
 
 - ✅ Logs `"pong: ready"` on startup. Evidence: `examples/pong/src/main.rs:13`.
 - ✅ Blocking `ctx.recv()` loop; logs each received message via `ctx.log_fmt`.
-  Evidence: `examples/pong/src/main.rs:15–21`.
+  Evidence: `examples/pong/src/main.rs:15-21`.
 
 ### osdev restart ✅
 
 - ✅ `cmd_restart` connects to `127.0.0.1:5555` (COM2 TCP), sends
-  `RESTART <name> [<core>]\n`. Evidence: `osdev/src/main.rs:133–158`.
+  `RESTART <name> [<core>]\n`. Evidence: `osdev/src/main.rs:133-158`.
 - ✅ QEMU launched with `-serial tcp::5555,server,nowait` for COM2.
-  Evidence: `osdev/src/qemu.rs:38–39`.
+  Evidence: `osdev/src/qemu.rs:38-39`.
 
 ### Restart flow acceptance (`osdev restart pong --core 2`) - **awaiting boot run**
 

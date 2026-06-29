@@ -446,7 +446,7 @@ fn spawn_extended_probes(_ctx: &ServiceContext) {}
 fn spawn_extended_probes(_ctx: &ServiceContext) {}
 
 // perf-only: spawn only the regular performance benchmark probe services.
-// Cuts spawn wait from ~18–120 s (178 probes) to ~2–5 s (~30 services) on TCG.
+// Cuts spawn wait from ~18-120 s (178 probes) to ~2-5 s (~30 services) on TCG.
 #[cfg(all(not(feature = "bare-metal"), not(feature = "identity-only"), feature = "perf-only"))]
 fn spawn_extended_probes(ctx: &ServiceContext) {
     // Sender/controller before echo/recv so the sender's endpoint is registered
@@ -485,7 +485,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("perf-bp10");
 }
 
-// stress-only: spawn only the S1–S10 stress probe services.
+// stress-only: spawn only the S1-S10 stress probe services.
 // All stress probes are self-contained (use ctx.kill/ctx.spawn internally);
 // no QEMU control port required - safe for real hardware.
 #[cfg(all(not(feature = "bare-metal"), not(feature = "identity-only"), not(feature = "perf-only"), not(feature = "perf-brutal-only"), feature = "stress-only"))]
@@ -512,7 +512,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("stress-s10");        // core 0 - kills victim cross-core
 }
 
-// chaos-only: spawn only the C2–C7 chaos probe services.
+// chaos-only: spawn only the C2-C7 chaos probe services.
 // C1 (degraded SMP boot) and C4 (minimal RAM) use bare-metal + hardware
 // reconfiguration instead of probes.  All probes here are self-contained.
 #[cfg(all(not(feature = "bare-metal"), not(feature = "identity-only"), not(feature = "perf-only"), not(feature = "perf-brutal-only"), not(feature = "stress-only"), not(feature = "adv-only"), feature = "chaos-only"))]
@@ -529,7 +529,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("chaos-c7");          // TLB shootdown controller on core 1
 }
 
-// adv-only: spawn only the A1–A10 adversarial probe services.
+// adv-only: spawn only the A1-A10 adversarial probe services.
 // All adversarial probes are self-contained - no QEMU control port required.
 #[cfg(all(not(feature = "bare-metal"), not(feature = "identity-only"), not(feature = "perf-only"), not(feature = "perf-brutal-only"), not(feature = "stress-only"), feature = "adv-only"))]
 fn spawn_extended_probes(ctx: &ServiceContext) {

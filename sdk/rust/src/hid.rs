@@ -121,8 +121,8 @@ fn emit_key(k: u8, mods: u8, caps: bool, emit: &mut impl FnMut(u8)) -> bool {
         0x4C => csi(b"3~", emit), // Delete (forward delete)
         0x4B => csi(b"5~", emit), // PageUp
         0x4E => csi(b"6~", emit), // PageDown
-        // Function keys F1–F12: the standard xterm sequences (F1–F4 are SS3 `ESC O P/Q/R/S`,
-        // F5–F12 are `ESC[<n>~`). The shell acts on F1 (help); the rest are recognised and
+        // Function keys F1-F12: the standard xterm sequences (F1-F4 are SS3 `ESC O P/Q/R/S`,
+        // F5-F12 are `ESC[<n>~`). The shell acts on F1 (help); the rest are recognised and
         // consumed by its escape parser, so the physical keys are no longer dead and never
         // smear stray characters onto the line.
         0x3A => { emit(0x1B); emit(b'O'); emit(b'P'); true } // F1
@@ -273,8 +273,8 @@ pub fn decode_keyboard(
             if emit_key(k, mods, *caps, &mut emit) {
                 // Newest printable/cursor key held becomes the repeat key - except the
                 // one-shot control keys: Escape (0x29), whose repeat would make the shell
-                // re-disambiguate a bare ESC every tick, and the function keys F1–F12
-                // (0x3A–0x45), which are actions, not characters (holding F1 should not
+                // re-disambiguate a bare ESC every tick, and the function keys F1-F12
+                // (0x3A-0x45), which are actions, not characters (holding F1 should not
                 // re-open help over and over).
                 if k != 0x29 && !(0x3A..=0x45).contains(&k) {
                     rep.arm(k, mods, *caps, now);
@@ -383,7 +383,7 @@ mod tests {
 
     #[test]
     fn function_keys_emit_xterm_sequences() {
-        // F1–F4 are SS3 (ESC O P/Q/R/S); F5–F12 are ESC[<n>~. F1 is the one the shell acts
+        // F1-F4 are SS3 (ESC O P/Q/R/S); F5-F12 are ESC[<n>~. F1 is the one the shell acts
         // on (help); the rest are recognised + consumed (no stray characters).
         assert_eq!(emit_for(0x3A), b"\x1bOP");   // F1
         assert_eq!(emit_for(0x3D), b"\x1bOS");   // F4

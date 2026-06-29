@@ -96,7 +96,7 @@ Two kernel bugs were found and fixed during Phase 3 implementation: task re-anim
 
 ### Brutal (10/10)
 
-Same properties at 2–10× iteration counts under full concurrent probe load (~140 tasks). Timeout: 180s per test.
+Same properties at 2-10× iteration counts under full concurrent probe load (~140 tasks). Timeout: 180s per test.
 
 | ID | Property | Brutal iterations | Result |
 |----|----------|------------------|--------|
@@ -130,14 +130,14 @@ One bug was found and fixed pre-run: `(size + 4095) & !4095` integer overflow fo
 | F2 | Random u64 as syscall number → UnknownSyscall (-1) | 50,000 random numbers | ✅ PASS |
 | F3 | ELF loader - 13 specific bad inputs + 64 single-byte flips | 77 mutations | ✅ PASS |
 | F4 | Service contract validator - malformed TOML and JSON Schema violations | 3 valid + 14 invalid inputs | ✅ PASS |
-| F5 | IPC message bodies - random bytes, random sizes 0–4096 | 1,000 try_send calls | ✅ PASS |
+| F5 | IPC message bodies - random bytes, random sizes 0-4096 | 1,000 try_send calls | ✅ PASS |
 | F6 | Embedded cap slots in SendWithCap - random u32 pairs | 1,000 calls | ✅ PASS |
 | F7 | Stale cap after kill/respawn - generation check | 50 kill cycles | ✅ PASS |
 | F8 | AllocMem edge-case sizes: 0, u64::MAX, overflow values, randoms | 10 edge + 1,000 random | ✅ PASS |
 
 ### Brutal (8/8)
 
-4–5× escalated iterations under full concurrent load. BF3 uses 263 inputs (13 specific + 200 single-byte + 50 multi-byte ELF mutations). BF4 uses 5 valid and 31 bad contract inputs.
+4-5× escalated iterations under full concurrent load. BF3 uses 263 inputs (13 specific + 200 single-byte + 50 multi-byte ELF mutations). BF4 uses 5 valid and 31 bad contract inputs.
 
 | ID | Brutal iterations | Result |
 |----|-----------------|--------|
@@ -178,7 +178,7 @@ One kernel fix during brutal implementation: USER PF / KERNEL PF split in the pa
 
 ### Brutal (10/10)
 
-4–5× escalated counts under full concurrent suite (~190 tasks total). Notable timeouts: BS2 at 480s, BS3 at 1200s, BS5 at 720s.
+4-5× escalated counts under full concurrent suite (~190 tasks total). Notable timeouts: BS2 at 480s, BS3 at 1200s, BS5 at 720s.
 
 | ID | Brutal scenario | Iterations | Result |
 |----|----------------|------------|--------|
@@ -269,7 +269,7 @@ One kernel fix during brutal implementation: `KERNEL_PT_PROTECTED` bitmap in the
 
 ### Brutal (10/10)
 
-5–50× attack intensity under full concurrent brutal suite. Witness for BA8 reduced to 200 yields (same reasoning as BC6/BS8: scheduler cycle time grows with concurrent task count).
+5-50× attack intensity under full concurrent brutal suite. Witness for BA8 reduced to 200 yields (same reasoning as BC6/BS8: scheduler cycle time grows with concurrent task count).
 
 | ID | Brutal attack | Intensity | Result |
 |----|--------------|-----------|--------|
@@ -299,7 +299,7 @@ Each test runs in its own QEMU session with the standard 4-core image (except C1
 
 | ID | Failure injected | What is verified | Result |
 |----|-----------------|-----------------|--------|
-| C1 | QEMU `-smp 2` - 2 of 4 cores boot | Kernel reports 2 cores ready; services contracted to cores 2–3 fail with PlacementInvalid; cores 0–1 continue | ✅ PASS |
+| C1 | QEMU `-smp 2` - 2 of 4 cores boot | Kernel reports 2 cores ready; services contracted to cores 2-3 fail with PlacementInvalid; cores 0-1 continue | ✅ PASS |
 | C2 | `chaos-c2` null-dereferences on startup | Kernel kills the faulting service; `chaos-c2-monitor` completes 1,000 yields proving system continues | ✅ PASS |
 | C3 | 500 rounds of impossible AllocMem requests (usize::MAX, 4 GiB, 0) | Every request returns AllocDenied; no panic; zero-size requests safe | ✅ PASS |
 | C4 | QEMU `-m 192M` - minimal RAM | Kernel boots and allocates structures; supervisor reaches ready; no silent OOM | ✅ PASS |

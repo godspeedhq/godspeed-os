@@ -1,6 +1,6 @@
 # Hardware: Fuzz Tests
 
-Mirrors §22 Fuzz Tests (F1–F8). Crash resistance under adversarial inputs.
+Mirrors §22 Fuzz Tests (F1-F8). Crash resistance under adversarial inputs.
 
 **Reference:** `tests/qemu/fuzz/CLAUDE.md` for full spec.
 

@@ -259,7 +259,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     None => { line.clear(&ctx); nav = hist.len(); } // bare ESC → clear line
                     Some(b'[') => handle_csi(&ctx, &mut line, &mut hist, &mut nav),
                     Some(b'O') => {
-                        // SS3 (F1–F4 = ESC O P/Q/R/S). F1 opens help; F2–F4 have no action.
+                        // SS3 (F1-F4 = ESC O P/Q/R/S). F1 opens help; F2-F4 have no action.
                         if ctx.console_read() == b'P' {
                             run_help_key(&ctx, &mut cwd, &mut last_result, &mut line);
                         }
@@ -383,7 +383,7 @@ fn handle_csi(ctx: &ServiceContext, line: &mut Line, hist: &History, nav: &mut u
 /// within its segment: the segment's FIRST word completes as a **command name** (`UTILS`, so it works
 /// after a `|` too); a later token completes as a **subcommand keyword** (`observe now`, `to json`,
 /// `sort reverse`, the trailing `mkdir … parents`) and otherwise as a **file path**. One match fills
-/// it; several show the numbered menu (1–9 selects, Tab cycles). Operates from end-of-line so the menu
+/// it; several show the numbered menu (1-9 selects, Tab cycles). Operates from end-of-line so the menu
 /// reprint lines up with the cursor (§26.6: bounded).
 fn complete_tab(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd) {
     if line.len == 0 { return; }
@@ -495,7 +495,7 @@ fn fill_keyword(ctx: &ServiceContext, line: &mut Line, tok_start: usize, name: &
     line.set(ctx, &tmp[..t]);
 }
 
-/// Numbered menu for keyword candidates: a digit (1–9) commits, Tab cycles, any other key keeps the
+/// Numbered menu for keyword candidates: a digit (1-9) commits, Tab cycles, any other key keeps the
 /// line. Mirrors `path_menu`.
 fn keyword_menu(ctx: &ServiceContext, line: &mut Line, tok_start: usize, cands: &[&str]) {
     let n = cands.len();
@@ -628,7 +628,7 @@ fn fill_path(ctx: &ServiceContext, line: &mut Line, base_len: usize, name: &[u8]
     line.set(ctx, &tmp[..t]);
 }
 
-/// Print the numbered candidate menu, then run the selection loop: a **digit** (1–9) commits that
+/// Print the numbered candidate menu, then run the selection loop: a **digit** (1-9) commits that
 /// entry; **Tab** cycles to the next candidate (filling it, no separator); any other key keeps the
 /// current line and returns (that key is not consumed as input - minor: re-press to use it).
 fn path_menu(ctx: &ServiceContext, line: &mut Line, base_len: usize, rbuf: &[u8; 512], hits: &[PathHit]) {

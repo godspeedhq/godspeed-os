@@ -113,7 +113,7 @@ extern "C" fn _start() -> ! {
 fn collect_boot_info() -> BootInfo {
     // Static buffer: memory map entries are written here once and referenced
     // for the kernel's lifetime.  64 slots is far more than any real system
-    // returns (typical count is 10–20).
+    // returns (typical count is 10-20).
     const MAX_REGIONS: usize = 64;
     static mut MAP_BUF: [MemoryRegion; MAX_REGIONS] = [MemoryRegion {
         base: 0,

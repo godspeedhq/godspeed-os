@@ -19,17 +19,17 @@
 //!   osdev test identity         - run §22 identity test suite (20 tests)
 //!   osdev test identity-brutal  - run brutal identity tests + SMP escalation (Milestone 15)
 //!   osdev test property         - run §22 property test suite
-//!   osdev test property-brutal  - run brutal property tests BP1–BP10 (Milestone 16)
+//!   osdev test property-brutal  - run brutal property tests BP1-BP10 (Milestone 16)
 //!   osdev test fuzz         - run §22 fuzz test suite (Milestone 10)
-//!   osdev test fuzz-brutal  - run brutal fuzz tests BF1–BF8 (Milestone 17)
+//!   osdev test fuzz-brutal  - run brutal fuzz tests BF1-BF8 (Milestone 17)
 //!   osdev test stress       - run §22 stress test suite (Milestone 11)
-//!   osdev test stress-brutal - run brutal stress tests BS1–BS10 (Milestone 18)
+//!   osdev test stress-brutal - run brutal stress tests BS1-BS10 (Milestone 18)
 //!   osdev test perf         - run §22 performance benchmark suite (Milestone 12)
-//!   osdev test perf-brutal  - run brutal performance benchmarks BP1–BP10 (Milestone 19)
+//!   osdev test perf-brutal  - run brutal performance benchmarks BP1-BP10 (Milestone 19)
 //!   osdev test adv          - run §22 adversarial / red-team test suite (Milestone 13)
-//!   osdev test adv-brutal   - run brutal adversarial tests BA1–BA10 (Milestone 20)
+//!   osdev test adv-brutal   - run brutal adversarial tests BA1-BA10 (Milestone 20)
 //!   osdev test chaos        - run §22 chaos / graceful-degradation test suite (Milestone 14)
-//!   osdev test chaos-brutal - run brutal chaos tests BC1–BC7 (Milestone 21)
+//!   osdev test chaos-brutal - run brutal chaos tests BC1-BC7 (Milestone 21)
 //!   osdev test shell        - scripted shell smoke-test (help, cores, status, unknown)
 //!   osdev image [--mode M]  - build + create bootable disk image (build/os.img); M=bare-metal|perf|perf-brutal|identity|stress|adv|chaos|fuzz|s8
 
@@ -82,12 +82,12 @@ enum Commands {
         /// Supervisor feature baked into the image.
         ///
         /// bare-metal  - pong + ping + observe; no probe services (default; S6 24-hour stability)
-        /// perf        - regular perf probes B1–B10
-        /// perf-brutal - brutal perf probes BP1–BP10
+        /// perf        - regular perf probes B1-B10
+        /// perf-brutal - brutal perf probes BP1-BP10
         /// identity    - identity-only probes (WatchSerial tests; WithRestart needs COM2)
-        /// stress      - S1–S10 stress probes; self-contained, no harness required
-        /// adv         - A1–A10 adversarial probes; self-contained, no harness required
-        /// chaos       - C2–C7 chaos probes; self-contained, no harness required (C1/C4 use bare-metal + HW reconfiguration)
+        /// stress      - S1-S10 stress probes; self-contained, no harness required
+        /// adv         - A1-A10 adversarial probes; self-contained, no harness required
+        /// chaos       - C2-C7 chaos probes; self-contained, no harness required (C1/C4 use bare-metal + HW reconfiguration)
         #[arg(long, default_value = "bare-metal")]
         mode: String,
     },
@@ -480,7 +480,7 @@ pub fn cmd_build_idle() {
 
 /// Like `cmd_build` but compiles supervisor with `--features identity-only`.
 /// Used by `run_identity_tests` so the supervisor spawn loop takes < 10 s on
-/// TCG instead of 30–200 s with the full 160+ probe service set.
+/// TCG instead of 30-200 s with the full 160+ probe service set.
 pub fn cmd_build_identity() {
     clean_supervisor();
     // Build every service crate except supervisor first.
@@ -524,7 +524,7 @@ pub fn cmd_build_identity() {
 
 /// Like `cmd_build` but compiles supervisor with `--features perf-only`.
 /// Spawns only the ~13 regular perf probe services instead of all 178, cutting
-/// the TCG spawn-wait from 18–120 s down to ~2–5 s and giving each benchmark
+/// the TCG spawn-wait from 18-120 s down to ~2-5 s and giving each benchmark
 /// maximum headroom before its timeout fires.
 pub fn cmd_build_perf() {
     clean_supervisor();
@@ -565,7 +565,7 @@ pub fn cmd_build_perf() {
 }
 
 /// Like `cmd_build_perf` but uses `--features stress-only` for a self-contained
-/// hardware stress run (S1–S10). All stress probes use ctx.kill/ctx.spawn
+/// hardware stress run (S1-S10). All stress probes use ctx.kill/ctx.spawn
 /// internally - no QEMU control port required.
 pub fn cmd_build_stress() {
     clean_supervisor();
@@ -650,7 +650,7 @@ pub fn cmd_build_fuzz() {
 }
 
 /// Like `cmd_build_adv` but uses `--features chaos-only` for a self-contained
-/// hardware chaos run (C2–C7). C1 and C4 use bare-metal + hardware reconfiguration.
+/// hardware chaos run (C2-C7). C1 and C4 use bare-metal + hardware reconfiguration.
 pub fn cmd_build_chaos() {
     clean_supervisor();
     let non_supervisor = ["logger", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];
@@ -814,7 +814,7 @@ pub fn cmd_build_bp2_only() {
 }
 
 /// Like `cmd_build_stress` but uses `--features adv-only` for a self-contained
-/// hardware adversarial run (A1–A10). All adversarial probes are self-contained -
+/// hardware adversarial run (A1-A10). All adversarial probes are self-contained -
 /// no QEMU control port required.
 pub fn cmd_build_adv() {
     clean_supervisor();
@@ -855,7 +855,7 @@ pub fn cmd_build_adv() {
 }
 
 /// Like `cmd_build_perf` but uses `--features perf-brutal-only` for the brutal
-/// benchmark suite (BP1–BP10).
+/// benchmark suite (BP1-BP10).
 pub fn cmd_build_brutal_perf() {
     clean_supervisor();
     let non_supervisor = ["logger", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "fs"];

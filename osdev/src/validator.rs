@@ -399,7 +399,7 @@ static PERF_TESTS: &[TestSpec] = &[
             fail_on:      &["KERNEL PANIC", "perf: B1 FAIL"],
             // N reduced 200→50 in probe. Same-core round-trips need two scheduler
             // context switches; with 160+ tasks each costs ~800ms wall.
-            // Spawn at ~48–150s + 50×800ms ≈ 40s work → worst-case ~190s < 300s.
+            // Spawn at ~48-150s + 50×800ms ≈ 40s work → worst-case ~190s < 300s.
             timeout_secs: 300,
         },
     },
@@ -419,7 +419,7 @@ static PERF_TESTS: &[TestSpec] = &[
             expect:       &["perf: B3 done"],
             fail_on:      &["KERNEL PANIC", "perf: B3 FAIL"],
             // N reduced 1000→10 in probe. Brutal stress tasks make each yield cost
-            // 3–5s wall; 10×3.5s = 35s work + spawn ~128s ≪ 300s timeout.
+            // 3-5s wall; 10×3.5s = 35s work + spawn ~128s ≪ 300s timeout.
             timeout_secs: 300,
         },
     },
@@ -460,7 +460,7 @@ static PERF_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["perf: B8 done"],
             fail_on:      &["KERNEL PANIC", "perf: B8 FAIL"],
-            // perf-b8 (slot ~160) spawns 4–120s depending on QEMU TCG load from
+            // perf-b8 (slot ~160) spawns 4-120s depending on QEMU TCG load from
             // brutal tests. Work itself is fast (16384 allocs). 300s covers worst case.
             timeout_secs: 300,
         },
@@ -470,7 +470,7 @@ static PERF_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["perf: B9 done"],
             fail_on:      &["KERNEL PANIC", "perf: B9 FAIL"],
-            // perf-b9 (slot ~160) spawns 12–163s depending on QEMU TCG load.
+            // perf-b9 (slot ~160) spawns 12-163s depending on QEMU TCG load.
             // 200 blocking sends are fast once running. 300s covers worst-case boot.
             timeout_secs: 300,
         },
@@ -480,7 +480,7 @@ static PERF_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["perf: B10 done"],
             fail_on:      &["KERNEL PANIC", "perf: B10 FAIL"],
-            // N reduced 1000→10 in probe. Mirrors B3: brutal stress tasks cost 3–5s/yield;
+            // N reduced 1000→10 in probe. Mirrors B3: brutal stress tasks cost 3-5s/yield;
             // 10×3.5s = 35s work + spawn ~128s ≪ 300s timeout.
             timeout_secs: 300,
         },
@@ -1512,7 +1512,7 @@ pub fn run_identity_tests() {
     kill_existing_qemu();
 
     // Build with identity-only supervisor: spawns only the 15 identity probe
-    // services so supervisor: ready appears in < 10 s on TCG (vs 30–200 s with
+    // services so supervisor: ready appears in < 10 s on TCG (vs 30-200 s with
     // the full 160+ probe set).  This is the primary flakiness fix for
     // WithRestart tests whose deadline budget was being eaten by the spawn loop.
     println!("identity: building (identity-only supervisor)...");
@@ -1715,7 +1715,7 @@ pub fn run_adv_tests() {
 
     println!("adv: building...");
     // Build the LEAN adv-only supervisor (11 self-contained probes), not the full
-    // ~180-probe set. The full boot takes 18–120 s under TCG, far past the 30 s
+    // ~180-probe set. The full boot takes 18-120 s under TCG, far past the 30 s
     // per-test timeout, so every adv test would time out before `supervisor: ready`.
     // (Mirrors run_identity_tests → cmd_build_identity.)
     crate::cmd_build_adv();
@@ -1763,7 +1763,7 @@ pub fn run_adv_tests() {
 /// Boot the OS in QEMU and run the Milestone 14 chaos test suite.
 ///
 /// C1 and C4 use degraded QEMU environments (fewer cores, less RAM).
-/// C2–C3, C5–C7 use the standard 4-core 512M image.
+/// C2-C3, C5-C7 use the standard 4-core 512M image.
 /// Pass criterion: each scenario logs its `chaos: CN pass` marker without a kernel panic.
 pub fn run_chaos_tests() {
     println!("chaos: stopping any running QEMU instances...");
@@ -1814,7 +1814,7 @@ pub fn run_chaos_tests() {
 /// Boot the OS in QEMU and run the Milestone 21 brutal chaos test suite.
 ///
 /// BC1 and BC4 use degraded QEMU environments (fewer cores, less RAM).
-/// BC2–BC3, BC5–BC7 use the standard 4-core image.
+/// BC2-BC3, BC5-BC7 use the standard 4-core image.
 /// Pass criterion: each scenario logs its `chaos: BCN pass` marker without a kernel panic.
 pub fn run_chaos_brutal_tests() {
     println!("chaos-brutal: stopping any running QEMU instances...");
@@ -1865,7 +1865,7 @@ pub fn run_chaos_brutal_tests() {
 
 /// Boot the OS in QEMU and run the Milestone 15 brutal identity test suite.
 ///
-/// T11–T13 are correctness tests that must always pass.
+/// T11-T13 are correctness tests that must always pass.
 /// SMP-2 / SMP-8 / SMP-16 are escalation tests: they run until the machine
 /// ceiling is found - the first timeout is the hardware limit, not a failure.
 pub fn run_brutal_identity_tests() {
@@ -1913,7 +1913,7 @@ pub fn run_brutal_identity_tests() {
 
     println!("\n  {passed} passed  {failed} failed  {blocked} blocked");
 
-    // Only the correctness tests (T11–T13) are hard failures.
+    // Only the correctness tests (T11-T13) are hard failures.
     // SMP escalation timeouts are expected at the machine ceiling.
     let correctness_failed = results.iter().filter(|(t, o)| {
         !t.id.starts_with("SMP") && matches!(o, TestOutcome::Fail(_))
@@ -1924,7 +1924,7 @@ pub fn run_brutal_identity_tests() {
 
 /// Boot the OS in QEMU and run the Milestone 16 brutal property test suite.
 ///
-/// BP1–BP10 are 5–10× escalated-iteration variants of P1–P10. All must pass.
+/// BP1-BP10 are 5-10× escalated-iteration variants of P1-P10. All must pass.
 pub fn run_brutal_property_tests() {
     println!("property-brutal: stopping any running QEMU instances...");
     kill_existing_qemu();
@@ -1974,7 +1974,7 @@ pub fn run_brutal_property_tests() {
 
 /// Boot the OS in QEMU and run the Milestone 17 brutal fuzz test suite.
 ///
-/// BF1/BF2/BF5–BF8 are QEMU-based fuzz probes (5–10× iteration escalation).
+/// BF1/BF2/BF5-BF8 are QEMU-based fuzz probes (5-10× iteration escalation).
 /// BF3 builds with `test-bad-elf-brutal` and halts after 263 inputs.
 /// BF4 is host-side contract validator fuzz with 30+ bad inputs.
 /// All must pass (no kernel panic, no FAIL marker).
@@ -2027,7 +2027,7 @@ pub fn run_brutal_fuzz_tests() {
 
 /// Boot the OS in QEMU and run the Milestone 18 brutal stress test suite.
 ///
-/// BS1–BS10 are 4–5× escalated-iteration variants of S1–S10. All must pass
+/// BS1-BS10 are 4-5× escalated-iteration variants of S1-S10. All must pass
 /// (no kernel panic, no FAIL marker, no resource leak).
 pub fn run_brutal_stress_tests() {
     println!("stress-brutal: stopping any running QEMU instances...");

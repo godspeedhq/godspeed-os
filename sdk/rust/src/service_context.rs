@@ -217,7 +217,7 @@ pub struct TaskStat {
     /// Number of times this service has been restarted (0 on a fresh boot / first spawn, +1 per
     /// respawn). Saturating u64 - effectively unbounded.
     pub restart_count: u64,
-    /// Current inbound IPC queue depth (0–16).
+    /// Current inbound IPC queue depth (0-16).
     pub queue_depth: u8,
     /// Timer ticks spent as the running task on its core (monotonic since boot).
     pub run_ticks:   u64,
@@ -859,7 +859,7 @@ impl ServiceContext {
     /// Read the hardware TSC (Time Stamp Counter) via the kernel.
     ///
     /// Returns RDTSC cycle count. Useful for measuring kernel operation latencies
-    /// in benchmark probes (§22 Perf B1–B10). Not comparable across hosts.
+    /// in benchmark probes (§22 Perf B1-B10). Not comparable across hosts.
     pub fn read_tsc(&self) -> u64 {
         // SAFETY: syscall(13) = InspectKernel; query_id=3 = read TSC.
         let ret = unsafe { raw_syscall(13, 3, 0, 0) };

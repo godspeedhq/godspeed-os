@@ -1,16 +1,16 @@
 # Hardware: Performance Benchmarks (Regular)
 
-Mirrors §22 B1–B10. Real cycle counts on ~3 GHz silicon.
+Mirrors §22 B1-B10. Real cycle counts on ~3 GHz silicon.
 
 **Build mode:** `osdev image --mode perf` (`perf-only` supervisor)
 
 **Hardware baseline supersedes QEMU TCG numbers** for all absolute timing claims. QEMU TCG is used only for regression detection (relative change), not for quoting actual latencies.
 
-For brutal benchmarks (BP1–BP10) see `12_PERFORMANCE_BRUTAL.md`.
+For brutal benchmarks (BP1-BP10) see `12_PERFORMANCE_BRUTAL.md`.
 
-## Benchmarks - B1–B10
+## Benchmarks - B1-B10
 
-**Status: 9/10** - B1–B10 except B2; hardware run 2026-05-24 (perf-only build, all probes concurrent).
+**Status: 9/10** - B1-B10 except B2; hardware run 2026-05-24 (perf-only build, all probes concurrent).
 
 | ID | Benchmark | Metric | HW result | ~ns at 3 GHz | Date | Status |
 |----|-----------|--------|-----------|--------------|------|--------|

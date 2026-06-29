@@ -74,7 +74,7 @@ const MAX_HID: usize = 2;
 
 /// Typematic auto-repeat delays, in TSC cycles (`ctx.read_tsc()` units). Sized for a
 /// ~2 GHz CPU (the T630): ~300 ms before the first repeat, then ~50 ms apart (~20/s).
-/// Auto-repeat is forgiving, so a 1.5–3 GHz spread just shifts the feel a little; no
+/// Auto-repeat is forgiving, so a 1.5-3 GHz spread just shifts the feel a little; no
 /// per-machine calibration needed. read_tsc is hardware-proven to advance (perf §22).
 const REPEAT_INITIAL_CYCLES: u64 = 600_000_000;
 const REPEAT_INTERVAL_CYCLES: u64 = 100_000_000;

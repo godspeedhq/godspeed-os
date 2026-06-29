@@ -8,7 +8,7 @@
 #          ipc/message.rs, ipc/queue.rs
 #
 # Test command: cargo test -p kernel --lib
-# Approximate run time: ~5–10 min (50–100 mutations × ~3 s each).
+# Approximate run time: ~5-10 min (50-100 mutations × ~3 s each).
 #
 # NOTE: cargo-mutants matches exclude_globs against workspace-root-relative
 # paths (kernel/src/...), so all patterns must use the kernel/src/ prefix.

@@ -24,7 +24,7 @@ PROPTEST_CASES=10000 cargo test -p kernel --lib
 
 ## Test count
 
-50 tests from items 1–5, plus 14 new property tests from item 6 = **64 tests total**.
+50 tests from items 1-5, plus 14 new property tests from item 6 = **64 tests total**.
 
 ## Notes
 

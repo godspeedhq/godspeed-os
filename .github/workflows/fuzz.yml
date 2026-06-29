@@ -16,7 +16,7 @@ on:
 
 jobs:
   fuzz:
-    name: Fuzz test suite (§22 F1–F8, BF1–BF8)
+    name: Fuzz test suite (§22 F1-F8, BF1-BF8)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -47,10 +47,10 @@ jobs:
           make -C tools/limine limine
           chmod +x tools/limine/limine
 
-      - name: Run fuzz tests (F1–F8)
+      - name: Run fuzz tests (F1-F8)
         run: cargo run -p osdev -- test fuzz
 
-      - name: Run brutal fuzz tests (BF1–BF8)
+      - name: Run brutal fuzz tests (BF1-BF8)
         run: cargo run -p osdev -- test fuzz-brutal
 
       - name: Upload serial logs on failure

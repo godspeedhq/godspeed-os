@@ -367,7 +367,7 @@ pub fn run_elf_fuzz() -> ! {
 ///
 /// Runs the same 13 specific bad-input cases as `run_elf_fuzz`, then adds
 /// 200 xorshift-random single-byte mutations (vs. 64 sequential flips) and
-/// 50 random multi-byte corruption cases (2–4 bytes flipped per variant).
+/// 50 random multi-byte corruption cases (2-4 bytes flipped per variant).
 /// Total: 13 + 200 + 50 = 263 inputs.
 #[cfg(feature = "test-bad-elf-brutal")]
 pub fn run_elf_fuzz_brutal() -> ! {
@@ -416,7 +416,7 @@ pub fn run_elf_fuzz_brutal() -> ! {
         let _ = load(&b); n += 1;
     }
 
-    // ── 50 random multi-byte (2–4 byte) mutations ─────────────────────────────
+    // ── 50 random multi-byte (2-4 byte) mutations ─────────────────────────────
     for _ in 0..50usize {
         rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
         let count = 2 + (rng % 3) as usize; // 2, 3, or 4 bytes

@@ -10,7 +10,7 @@
 //!
 //! Renders **antialiased Noto Sans Mono** glyphs (`noto-sans-mono-bitmap`, the
 //! Regular weight at a 20 px raster) into Limine's linear framebuffer. Each glyph
-//! pixel is a 0–255 intensity, blended against the soft-green foreground, so text
+//! pixel is a 0-255 intensity, blended against the soft-green foreground, so text
 //! is smooth rather than the blocky look of a 1-bpp bitmap font. Every byte written
 //! to the serial console is also handed to `put_byte` here, so the monitor shows
 //! exactly what the serial console shows - boot logs, `supervisor: ready`,
@@ -22,7 +22,7 @@
 //!
 //! Lives in the arch layer (§18.1) because it writes framebuffer memory
 //! directly. The framebuffer is mapped by Limine in the higher half (PML4
-//! entries 256–511), which `PageTable::new` copies into every task address
+//! entries 256-511), which `PageTable::new` copies into every task address
 //! space, so the pointer stays valid for the system lifetime - no explicit
 //! mapping is required.
 
@@ -114,8 +114,8 @@ struct Fb {
     row: usize,    // cursor row
     fg: u32,       // foreground pixel value (already in the device's channel layout)
     bg: u32,       // background pixel value
-    // Foreground as raw 0–255 channel components plus the device's channel shifts,
-    // so a glyph pixel's 0–255 antialiasing intensity can be blended toward the
+    // Foreground as raw 0-255 channel components plus the device's channel shifts,
+    // so a glyph pixel's 0-255 antialiasing intensity can be blended toward the
     // background per channel (`blend`) and composed into the device pixel layout.
     fg_r: u32,
     fg_g: u32,
@@ -156,7 +156,7 @@ static FB: SpinLock<Fb> = SpinLock::new(Fb {
     grid: [[b' '; MAX_COLS]; MAX_ROWS],
 });
 
-/// Safe-area inset per edge, as a percentage of each dimension. TVs overscan (crop ~3–5%
+/// Safe-area inset per edge, as a percentage of each dimension. TVs overscan (crop ~3-5%
 /// off every edge), which clips the outermost characters at `0`. `5` insets the text by 5%
 /// per edge so it all stays visible without depending on the TV's "Just Scan" / "1:1"
 /// picture mode (which most sets bury or don't offer). Set this to `0` only on a display
@@ -562,7 +562,7 @@ fn put_pixel(s: &Fb, x: usize, y: usize, color: u32) {
     }
 }
 
-/// Blend the foreground toward the background by an antialiasing `intensity` (0–255)
+/// Blend the foreground toward the background by an antialiasing `intensity` (0-255)
 /// and compose the result into the device's channel layout. 0 ⇒ background, 255 ⇒ full
 /// foreground; in between gives the smooth edges. Because the background is black, this
 /// is just the foreground scaled per channel - but written explicitly so a non-black

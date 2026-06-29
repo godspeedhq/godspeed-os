@@ -68,12 +68,12 @@ GodspeedOS treats testing as architecture. The suite is layered - each layer mus
 | Suite | Purpose | Status |
 |-------|---------|--------|
 | Identity (15 tests, 24 cases) | Pin constitutional invariants | 24/24 ✅ |
-| Property (P1–P10) | Universal correctness under random inputs | Active |
-| Fuzz (F1–F8) | Kernel never panics on user-controllable input | Active |
-| Stress (S1–S10) | No drift, leaks, or corruption over time | Active |
-| Performance (B1–B10) | Latency / throughput baselines | Active |
-| Adversarial (A1–A10) | Capability isolation under direct attack | Active |
-| Chaos (C1–C7) | Graceful degradation under partial failures | Active |
+| Property (P1-P10) | Universal correctness under random inputs | Active |
+| Fuzz (F1-F8) | Kernel never panics on user-controllable input | Active |
+| Stress (S1-S10) | No drift, leaks, or corruption over time | Active |
+| Performance (B1-B10) | Latency / throughput baselines | Active |
+| Adversarial (A1-A10) | Capability isolation under direct attack | Active |
+| Chaos (C1-C7) | Graceful degradation under partial failures | Active |
 
 ### Static analysis & unsafe audit
 

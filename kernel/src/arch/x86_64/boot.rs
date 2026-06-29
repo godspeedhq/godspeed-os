@@ -702,7 +702,7 @@ unsafe fn outb(port: u16, val: u8) {
     }
 }
 
-/// Remap the legacy 8259 PIC to vectors 0x20–0x2F then mask all IRQs.
+/// Remap the legacy 8259 PIC to vectors 0x20-0x2F then mask all IRQs.
 ///
 /// Without remapping, the PIC's IRQ0 (system timer) fires at vector 8, which
 /// is the double-fault entry.  We use the APIC for all timing so the 8259
@@ -714,8 +714,8 @@ unsafe fn mask_pic() {
     unsafe {
         outb(0x20, 0x11);     // ICW1: init master PIC with ICW4
         outb(0xA0, 0x11);     // ICW1: init slave  PIC with ICW4
-        outb(0x21, 0x20);     // ICW2: master IRQ0–7 → vectors 32–39
-        outb(0xA1, 0x28);     // ICW2: slave  IRQ8–15 → vectors 40–47
+        outb(0x21, 0x20);     // ICW2: master IRQ0-7 → vectors 32-39
+        outb(0xA1, 0x28);     // ICW2: slave  IRQ8-15 → vectors 40-47
         outb(0x21, 0x04);     // ICW3: master has slave on IRQ2
         outb(0xA1, 0x02);     // ICW3: slave cascade identity = 2
         outb(0x21, 0x01);     // ICW4: 8086 mode

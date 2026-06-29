@@ -39,4 +39,4 @@ Proposed architecture:
 
 Benefits: eliminates cross-core SpinLock contention on the kernel log path; UART is owned by a single writer; dropped-log counter makes buffer pressure visible.
 
-Work estimate: ~200–300 lines across `kernel/src/log.rs`, `kernel/src/syscall/dispatch.rs`, and `services/logger/src/main.rs`.
+Work estimate: ~200-300 lines across `kernel/src/log.rs`, `kernel/src/syscall/dispatch.rs`, and `services/logger/src/main.rs`.

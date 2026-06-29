@@ -1,4 +1,4 @@
-# Post-v1 Item 11 - Fuzz Tests (F1–F8)
+# Post-v1 Item 11 - Fuzz Tests (F1-F8)
 
 **Status:** ✅ Complete  
 **CI:** `osdev test fuzz` - runs as part of the `fuzz` workflow  
@@ -9,7 +9,7 @@
 ## Overview
 
 Fuzz tests verify that the kernel never panics on user-controllable input (§22,
-Fuzz Tests table). The bar is absolute: any panic discovered by F1–F8 is a kernel
+Fuzz Tests table). The bar is absolute: any panic discovered by F1-F8 is a kernel
 bug requiring a mandatory fix.
 
 All eight fuzz surfaces were already fully implemented across three subsystems
@@ -37,7 +37,7 @@ item confirms and documents them as a complete, named milestone.
 
 | Fuzz test | Where it lives |
 |-----------|---------------|
-| F1, F2, F5, F6, F7, F8 | `services/probe/src/main.rs` - modes 30–35 |
+| F1, F2, F5, F6, F7, F8 | `services/probe/src/main.rs` - modes 30-35 |
 | F3 | `kernel` - `test-bad-elf` feature gate in `src/loader.rs`; bad ELF injected at build time |
 | F4 | `osdev/src/validator.rs` - `ContractFuzz` test kind; valid/invalid TOML generated in-process |
 
@@ -69,7 +69,7 @@ Expected output: `8 passed  0 failed`
 
 ## Also verified at the brutal level
 
-The brutal property tests (BP1–BP10, item 12 scope) run F1/F2/F5–F8 at 5× the
+The brutal property tests (BP1-BP10, item 12 scope) run F1/F2/F5-F8 at 5× the
 iteration count under concurrent load from the stress test supervisor. That
 additional verification is tracked separately; this item covers the base 1×
 coverage that must always pass.

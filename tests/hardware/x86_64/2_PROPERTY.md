@@ -1,6 +1,6 @@
 # Hardware: Property Tests
 
-Mirrors §22 Property Tests (P1–P10). Universal invariants under randomised inputs.
+Mirrors §22 Property Tests (P1-P10). Universal invariants under randomised inputs.
 
 **Reference:** `tests/qemu/property/CLAUDE.md` for full spec.
 

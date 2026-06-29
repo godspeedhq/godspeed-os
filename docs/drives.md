@@ -6,7 +6,7 @@
 > Trails `CLAUDE.md`; does not amend it.
 >
 > **Command surface superseded by `utilities/15_drives.md`** (+ the file commands
-> `utilities/16`–`24`), which are authoritative for the user-facing verbs. Three POSIX
+> `utilities/16`-`24`), which are authoritative for the user-facing verbs. Three POSIX
 > reflexes shown in this doc's older examples were **dropped** when the utility surface
 > was settled: **`mount`** (GodspeedOS has no global tree to graft into - a drive is
 > reachable on demand by `[index:]label/path` whenever it's plugged in; `15_drives.md`
@@ -124,7 +124,7 @@ UUID. Identity (label) names it; location (index) disambiguates when identity re
 ## 5. Command set
 
 > Authoritative command surface: `utilities/15_drives.md` (drive lifecycle) +
-> `utilities/16`–`24` (file commands). This table reflects the settled vocabulary.
+> `utilities/16`-`24` (file commands). This table reflects the settled vocabulary.
 
 | Command | Effect | Persists? |
 |---------|--------|-----------|
@@ -136,7 +136,7 @@ UUID. Identity (label) names it; location (index) disambiguates when identity re
 | `drives godspeed default <drive>` | which installed GodspeedOS the machine boots | **yes** |
 | `drives godspeed` | list installed GodspeedOS drives / help | - |
 | `cd <path>` · `mkdir <path>` | change current location / create a directory (`utilities/17`,`20`) | - |
-| `ls [path]` · `read <path>` · `write <path> …` · `copy`/`move`/`rename`/`delete` | navigate / read / write / manage files (`utilities/16`–`24`) | - |
+| `ls [path]` · `read <path>` · `write <path> …` · `copy`/`move`/`rename`/`delete` | navigate / read / write / manage files (`utilities/16`-`24`) | - |
 
 `<drive> = index | label | index:label` (§4.1/§4.2). No `mount`/`use` - the current
 location is a `cd` pointer (§4 note, `utilities/15_drives.md` §3.2).

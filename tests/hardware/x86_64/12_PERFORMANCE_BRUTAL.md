@@ -1,12 +1,12 @@
 # Hardware: Performance Benchmarks (Brutal)
 
-Mirrors §22 BP1–BP10. Same metrics as `5_PERFORMANCE.md` but at higher iteration counts with only the benchmark probes on the machine - no concurrent probe noise.
+Mirrors §22 BP1-BP10. Same metrics as `5_PERFORMANCE.md` but at higher iteration counts with only the benchmark probes on the machine - no concurrent probe noise.
 
 **Build mode:** `osdev image --mode perf-brutal` (`perf-brutal-only` supervisor)
 
-**Status: 9/10** - BP1–BP10 except BP2; from second bare-metal boot 2026-05-21 (perf-brutal-only build).
+**Status: 9/10** - BP1-BP10 except BP2; from second bare-metal boot 2026-05-21 (perf-brutal-only build).
 
-## Benchmarks - BP1–BP10
+## Benchmarks - BP1-BP10
 
 Expected serial format: `perf: BPX mean=N cycles/...` followed by `perf: BPX done`
 

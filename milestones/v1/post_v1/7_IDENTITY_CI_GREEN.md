@@ -7,7 +7,7 @@
 ## Root Cause
 
 QEMU was running in pure TCG (software emulation) mode - no `-enable-kvm` flag.
-With ~185 services spawned during boot, the supervisor sequence consumed 20–25 s of
+With ~185 services spawned during boot, the supervisor sequence consumed 20-25 s of
 wall-clock time in TCG, exhausting the 30 s per-test timeout before ping/pong could
 exchange their first message.
 
@@ -38,7 +38,7 @@ to make `/dev/kvm` world-accessible on the GitHub runner) and serial log upload
 artifact on failure for post-mortem diagnosis.
 
 GitHub Actions `ubuntu-latest` runners have had KVM support since 2023.
-With KVM, boot takes ~3–5 s, well within the 30 s per-test timeout.
+With KVM, boot takes ~3-5 s, well within the 30 s per-test timeout.
 
 ## Status
 
@@ -61,9 +61,9 @@ in the test sequence, making the 60 s deadline unreachable.
 ### Additional fixes (session 3 - Windows TCG determinism)
 
 Root cause of remaining flakiness: supervisor spawns 100+ probe services before pong/ping,
-consuming ~25–30 s on Windows TCG. Tests with `timeout_secs: 120` that depended on
-`"pong: received"` could see that string appear at t=80–100 s, leaving too little margin for
-the `WithRestart` expect_after phase (another 30–40 s for kill + spawn + reacquisition on TCG).
+consuming ~25-30 s on Windows TCG. Tests with `timeout_secs: 120` that depended on
+`"pong: received"` could see that string appear at t=80-100 s, leaving too little margin for
+the `WithRestart` expect_after phase (another 30-40 s for kill + spawn + reacquisition on TCG).
 
 Confirmed failing patterns from diagnostic runs:
 - 6A: `wait_for` satisfied but `"control: pong restarted"` not seen before deadline
@@ -98,7 +98,7 @@ Windows TCG: generous ceiling covers variance without impacting fast runs.
 Root cause of back-to-back run failures: even with 300s timeouts, 3+ consecutive full suite runs
 accumulate system load (60 QEMU instances) that could push `"pong: received"` to t≈175-180s, leaving
 only ~120s for the restart phase of `WithRestart` tests. Occasionally the restart phase itself took
->120s under extreme load, causing 1–4 failures per batch on run 1.
+>120s under extreme load, causing 1-4 failures per batch on run 1.
 
 **Structural fix applied:**
 
@@ -131,10 +131,10 @@ Total per-run wall time on Windows TCG (fresh system): drops from ~2100s to ~120
 
 ### Additional fixes (session 5 - 200/200 deterministic)
 
-**Problem:** even after the session 4 structural fix, 3–4 failures per 200 tests remained under
+**Problem:** even after the session 4 structural fix, 3-4 failures per 200 tests remained under
 extreme accumulated back-to-back host load. The `WithRestart` tests (6A, 6B, 10A, 10B) still used
 `"supervisor: ready"` as their gate, which required waiting for all 160+ non-identity probe services
-to finish spawning on TCG - occasionally taking close to the full 240–300s deadline, leaving
+to finish spawning on TCG - occasionally taking close to the full 240-300s deadline, leaving
 insufficient margin for the restart phase.
 
 **Root cause identified:** `osdev test identity` was building and booting the full supervisor binary
@@ -145,7 +145,7 @@ probe spawn loop was the source of all timing variance.
 - New `identity-only = []` feature excludes all non-identity probes at compile time.
 - `spawn_extended_probes()` helper contains all 160+ non-identity spawns, compiled out when
   `identity-only` is enabled.
-- Result: `"supervisor: ready"` appears in ~3 s on TCG instead of 30–200 s.
+- Result: `"supervisor: ready"` appears in ~3 s on TCG instead of 30-200 s.
 
 **Fix 2 - `cmd_build_identity()` (`osdev/src/main.rs`):**
 - New build function builds supervisor with `--features supervisor/identity-only`.
@@ -158,18 +158,18 @@ probe spawn loop was the source of all timing variance.
 - Prevents accumulation of memory pressure across 20 sequential QEMU instances.
 
 **Result:** 200/200 across 10 consecutive back-to-back runs on Windows TCG. Zero failures.
-Previous best was 197/200 (1–2% failure rate under extreme load). Now fully deterministic.
+Previous best was 197/200 (1-2% failure rate under extreme load). Now fully deterministic.
 
 | Metric | Before session 5 | After session 5 |
 |--------|-----------------|-----------------|
-| `"supervisor: ready"` time on TCG | 30–200 s | ~3 s |
-| Back-to-back 10-run score | 196–197/200 | 200/200 |
-| WithRestart test margin | ~0–40 s | ~237 s |
+| `"supervisor: ready"` time on TCG | 30-200 s | ~3 s |
+| Back-to-back 10-run score | 196-197/200 | 200/200 |
+| WithRestart test margin | ~0-40 s | ~237 s |
 | Per-test isolation | none | 500 ms OS reclaim pause |
 
 ### Session 6 - timeout cleanup and documentation
 
-**Context:** session 5 fixed the root cause (identity-only supervisor). The inflated timeouts from sessions 3–4 were compensation for a problem that no longer exists. Session 6 trimmed them to reflect actual operation and recorded the verified deterministic result.
+**Context:** session 5 fixed the root cause (identity-only supervisor). The inflated timeouts from sessions 3-4 were compensation for a problem that no longer exists. Session 6 trimmed them to reflect actual operation and recorded the verified deterministic result.
 
 **Timeout reductions (`osdev/src/validator.rs`):**
 
@@ -185,7 +185,7 @@ Previous best was 197/200 (1–2% failure rate under extreme load). Now fully de
 
 | Run | Passed | Failed |
 |-----|--------|--------|
-| 1–10 (each) | 20 | 0 |
+| 1-10 (each) | 20 | 0 |
 | **Total** | **200** | **0** |
 
 **Documentation updates:**

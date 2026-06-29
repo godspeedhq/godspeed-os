@@ -40,7 +40,7 @@ avoid placing its ~73 KiB body on the test stack.
 |----------|-------------|
 | `registered_resource_is_findable_at_gen_zero` | After `register(id)`, `get_record(id)` returns `Some` with gen=0, liveness=Alive (§7.5) |
 | `unregistered_resource_not_found` | Before `register`, `get_record` returns `None` - no phantom lookups |
-| `bump_generation_is_strictly_monotonic` | 1–8 consecutive bumps are strictly increasing per resource (§7.5 P2) |
+| `bump_generation_is_strictly_monotonic` | 1-8 consecutive bumps are strictly increasing per resource (§7.5 P2) |
 | `bump_to_dead_sets_liveness_dead` | After `bump_generation(Dead)`, liveness is `Dead` → `EndpointDead` on next cap use |
 | `bump_to_revoked_sets_liveness_revoked` | After `bump_generation(Revoked)`, liveness is `Revoked` → `CapRevoked` on next cap use |
 
@@ -83,7 +83,7 @@ in `lib.rs`).
 
 Each property test runs 256 random cases per CI run. The bitmap tests use operation
 sequences up to length 128 against a 64-frame allocator; the table tests vary IDs
-across the full `DIRECT_CAP` (8192) range and bump counts 1–8.
+across the full `DIRECT_CAP` (8192) range and bump counts 1-8.
 
 ---
 

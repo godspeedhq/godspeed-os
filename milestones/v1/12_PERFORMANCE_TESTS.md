@@ -145,7 +145,7 @@ runs compare against baseline and flag regressions ≥ 10%.
 
 - ✅ `kernel/src/syscall/dispatch.rs` - `InspectKernel` query 3 reads RDTSC
 - ✅ `sdk/rust/src/service_context.rs` - `ctx.read_tsc()`, `ctx.send_by_handle()`
-- ✅ `services/probe/src/main.rs` - modes 60–71 (12 modes across 10 benchmarks)
+- ✅ `services/probe/src/main.rs` - modes 60-71 (12 modes across 10 benchmarks)
 - ✅ `kernel/src/task/mod.rs` - 13 perf service configs
 - ✅ `services/supervisor/src/main.rs` - perf service spawns
 - ✅ `osdev/src/validator.rs` - `PERF_TESTS`, `run_perf_tests()`, `run_perf_one()`, `perf_serial_path()`, `collect_perf_baseline()`
@@ -185,7 +185,7 @@ All values are QEMU TCG RDTSC cycle counts - not comparable across hosts or QEMU
 Runs the same 10 benchmarks at 5× iteration counts under the full ~220-task concurrent
 probe suite. Validates that the benchmark measurements hold under realistic system load
 (every other probe service running simultaneously). `adv-ba8` (tight-loop hog) is pinned
-to core 3 to avoid starving IPC/yield probes on cores 0–2.
+to core 3 to avoid starving IPC/yield probes on cores 0-2.
 
 **Command:** `osdev test perf-brutal`  
 **Output:** `build/tests/12_PERFORMANCE_BRUTAL/`  
@@ -226,8 +226,8 @@ to core 3 to avoid starving IPC/yield probes on cores 0–2.
 
 ### Implementation checklist
 
-- ✅ `services/probe/src/main.rs` - modes 120–131 (12 modes, BP1–BP10)
-- ✅ `kernel/src/task/mod.rs` - 13 brutal perf service configs (probe_mode 120–131)
+- ✅ `services/probe/src/main.rs` - modes 120-131 (12 modes, BP1-BP10)
+- ✅ `kernel/src/task/mod.rs` - 13 brutal perf service configs (probe_mode 120-131)
 - ✅ `services/supervisor/src/main.rs` - brutal perf service spawns
 - ✅ `osdev/src/validator.rs` - `BRUTAL_PERF_TESTS`, `run_brutal_perf_tests()`, `collect_brutal_perf_baseline()`
 - ✅ `osdev/src/main.rs` - `"perf-brutal"` branch in `cmd_test`

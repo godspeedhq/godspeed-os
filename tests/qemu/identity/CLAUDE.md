@@ -46,7 +46,7 @@ Tests are expressed as one of three harness kinds, defined in `osdev/src/validat
 
 ## Timeout rationale
 
-`osdev test identity` builds supervisor with `--features supervisor/identity-only`, which compiles out the 160+ non-identity probe spawns and leaves only the 16 identity probe services. This cuts `"supervisor: ready"` time from 30–200 s (full build) to ~3 s on Windows TCG. KVM (CI) completes every test well inside 30 s.
+`osdev test identity` builds supervisor with `--features supervisor/identity-only`, which compiles out the 160+ non-identity probe spawns and leaves only the 16 identity probe services. This cuts `"supervisor: ready"` time from 30-200 s (full build) to ~3 s on Windows TCG. KVM (CI) completes every test well inside 30 s.
 
 | Test    | Timeout | Reason |
 |---------|---------|--------|
@@ -54,7 +54,7 @@ Tests are expressed as one of three harness kinds, defined in `osdev/src/validat
 | 7A/7B   | 60s     | 15 identity probes still compete; 30s was marginal on loaded TCG |
 | 8A      | 120s    | Yielder competes with concurrent probe services for scheduler quanta |
 | 8B      | 120s    | Pong/ping spawn first; no queue-full stall; 120s is conservative |
-| 9A      | 60s     | "pong: received" at t≈5–10s with identity-only; 60s is 6× margin |
+| 9A      | 60s     | "pong: received" at t≈5-10s with identity-only; 60s is 6× margin |
 | 6A/6B   | 60s     | identity-only: supervisor ready ~3s; restart phase ~5s; 60s is 6× margin |
 | 10A/10B | 60s     | Same as 6A/6B |
 
@@ -70,10 +70,10 @@ Recorded after the `identity-only` supervisor feature and per-test isolation sle
 
 | Run | Passed | Failed | Blocked |
 |-----|--------|--------|---------|
-| 1–10 | 20 each | 0 | 0 |
+| 1-10 | 20 each | 0 | 0 |
 | **Total** | **200** | **0** | **0** |
 
-Zero failures across 200 consecutive tests (20 tests × 10 runs). Confirmed reduced timeouts (6A/6B/10A/10B: 240–300s → 60s) with comfortable margin.
+Zero failures across 200 consecutive tests (20 tests × 10 runs). Confirmed reduced timeouts (6A/6B/10A/10B: 240-300s → 60s) with comfortable margin.
 
 ### Post-IR1A/IR1B (Windows TCG, 2026-05-18) - 22 tests
 

@@ -2716,7 +2716,7 @@ fn pick_free_port() -> u16 {
 }
 
 /// Retry connecting to `127.0.0.1:port` every 100 ms until `timeout` expires.
-/// QEMU needs ~50–200 ms to open the port after launch.
+/// QEMU needs ~50-200 ms to open the port after launch.
 fn retry_tcp_connect(port: u16, timeout: Duration) -> Option<TcpStream> {
     let deadline = Instant::now() + timeout;
     loop {

@@ -24,7 +24,7 @@ This *softens* §26.10 (a thin naming facility stays in the kernel) precisely to
 
 - ✅ **Naming wiring moved out of the kernel (Path C).** The supervisor wires every real service from a
   `name → cap` map at boot **and** on restart - zero kernel name resolution for them
-  (`docs/naming-design.md`, Phases 0a–3c). The kernel retains only a **minimal gated recovery
+  (`docs/naming-design.md`, Phases 0a-3c). The kernel retains only a **minimal gated recovery
   directory**: `ipc::names` (a bounded `name → EndpointId` map) plus the gated `AcquireSendCap`. Clients
   reacquire a name through the directory after a restart.
 - ✅ **The `registry` service was retired entirely (Phase 4).** It had already left the TCB via H11 (a

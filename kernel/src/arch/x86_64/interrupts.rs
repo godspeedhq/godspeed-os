@@ -8,7 +8,7 @@
 //! IDT entries and IRQ dispatch stubs - §12.
 //!
 //! The kernel IDT has two classes of entries:
-//!   - CPU exceptions (vectors 0–31): handled entirely in kernel.
+//!   - CPU exceptions (vectors 0-31): handled entirely in kernel.
 //!   - Hardware IRQs (vectors 32+): dispatched to `interrupt::route` which
 //!     forwards them to the registered driver service via IPC.
 //!

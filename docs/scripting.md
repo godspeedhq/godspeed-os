@@ -1,6 +1,6 @@
 # gsh - the GodspeedOS shell language (design)
 
-> **Status:** design sketch, not yet built. Scope is Tier 1–2 below. Scripts use the `.gsh`
+> **Status:** design sketch, not yet built. Scope is Tier 1-2 below. Scripts use the `.gsh`
 > extension (GodspeedOS shell; `.gs` is reserved for the future general-purpose Godspeed
 > language). Builds on the existing `run`/`run_lines` interpreter and the command **Result**
 > model (`execute` already returns `Ok`/`Err`). Not POSIX - see CLAUDE.md Appendix B.3 / D.
@@ -495,9 +495,9 @@ These are the genuinely balloon-prone parts, or they belong to the general-purpo
 
 ## 11. Tiers and effort
 
-- **Tier 1** (~2–4 days): `let`/`let mut` + `$`-expansion + params, `if`/`else if`/`else`,
+- **Tier 1** (~2-4 days): `let`/`let mut` + `$`-expansion + params, `if`/`else if`/`else`,
   comparisons + `in`, `result`/`fail`, `switch`.
-- **Tier 2** (~6–8 days): `$( )` capture, multi-line `"""…"""`, **inline integer arithmetic**
+- **Tier 2** (~6-8 days): `$( )` capture, multi-line `"""…"""`, **inline integer arithmetic**
   (`+ - * / %`, precedence, `( )`, checked), `for` (lines / rows / words / `range`), `loop`,
   `break`/`continue`, **functions** (`fn`, pre-scan index, call-frame stack, `return`), `defer`,
   and the **record aggregators** (`count`/`sum`/`min`/`max`/`avg`).
@@ -530,7 +530,7 @@ echo "greet emitted $lines"
 
 ## 13. Example programs
 
-Complete scripts - the kind the language is *for*, using only Tier 1–2 features. The bar for each
+Complete scripts - the kind the language is *for*, using only Tier 1-2 features. The bar for each
 milestone is "these run."
 
 ### 13.1 setup.gsh

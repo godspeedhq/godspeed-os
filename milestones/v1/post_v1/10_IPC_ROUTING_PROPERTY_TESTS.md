@@ -12,7 +12,7 @@ Items 5 and 6 added property tests for the primitive types (`Generation`, `Right
 `Capability`, `Message`, `Queue`) and composite structures (`CapTable`,
 `GlobalResourceTable`, `TestBitmapAllocator`).
 
-This item closes the remaining gaps in the P1–P10 property matrix by adding model-based
+This item closes the remaining gaps in the P1-P10 property matrix by adding model-based
 property tests for the IPC routing table (P5, P8, P10) and the name registry (P8).
 
 | Property | Previously covered? | This item |

@@ -785,7 +785,7 @@ fn mode_prop_p6(ctx: &ServiceContext) -> ! {
 
 fn mode_prop_p8(ctx: &ServiceContext) -> ! {
     // P8 - After restart, name resolves to a higher-generation endpoint (§14.2).
-    // 5 iterations with rng-varied cycles (1–2 per iter, ~7–8 total).
+    // 5 iterations with rng-varied cycles (1-2 per iter, ~7-8 total).
     // Together with P2's 6 cycles (~13 total kill/spawn ops) these delay
     // prop-p8-victim's initial ELF load late enough that prop-p1/p9/p10 get
     // sufficient Core 0 time to complete their 10,000-iteration loops before
@@ -1513,7 +1513,7 @@ fn mode_perf_b2_echo(ctx: &ServiceContext) -> ! {
 fn mode_perf_b3(ctx: &ServiceContext) -> ! {
     // B3: syscall yield floor - round-trip time for advisory yield (§22 Perf B3).
     // N=10: brutal stress tests (stress-bs4/bs5 kill/respawn cycling) make each yield
-    // cost 3–5s wall under full QEMU TCG load; 50×3.4s ≈ 170s > post-spawn headroom.
+    // cost 3-5s wall under full QEMU TCG load; 50×3.4s ≈ 170s > post-spawn headroom.
     // 10 samples still produce a valid TSC mean for baseline tracking.
     const N: u64 = 10;
     let t0 = ctx.read_tsc();
@@ -1636,7 +1636,7 @@ fn mode_perf_b9_recv(ctx: &ServiceContext) -> ! {
 fn mode_perf_b10(ctx: &ServiceContext) -> ! {
     // B10: scheduler pick-next cost - same as B3 but labelled separately for
     // baseline tracking (§22 Perf B10).
-    // N=10: mirrors B3 - brutal stress tasks make each yield cost 3–5s wall;
+    // N=10: mirrors B3 - brutal stress tasks make each yield cost 3-5s wall;
     // 10 samples fit within post-spawn headroom and still produce a valid mean.
     const N: u64 = 10;
     let t0 = ctx.read_tsc();

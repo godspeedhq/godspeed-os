@@ -11,7 +11,7 @@ Completed at commit `2e0dc13` - tagged `v1.0`.
 Evidence from walkthrough boot (`build/serial.log`, commit `0c7ac98`):
 
 - ✅ `osdev run --smp 4` boots with 4 cores; init, supervisor, registry, logger, ping, pong reach steady state
-  - serial lines 33–41: `kernel: 4 cores ready`, all six services print ready/starting
+  - serial lines 33-41: `kernel: 4 cores ready`, all six services print ready/starting
 - ✅ ping placed on core 0; pong placed on core 1
   - service config `preferred_core = 0 / 1`; confirmed by `pong: ready on core 1` (line 40)
 - ✅ `osdev logs ping` shows ping sending a message every second

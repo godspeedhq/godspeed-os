@@ -1,6 +1,6 @@
 # Design Spec: Move Naming Out of the Kernel
 
-> **Status:** Direction **signed off (2026-06-20)**; Phases 0a–3c **built + merged** (the supervisor
+> **Status:** Direction **signed off (2026-06-20)**; Phases 0a-3c **built + merged** (the supervisor
 > now wires every real service from a `name → cap` map at boot **and** on restart - zero kernel name
 > resolution for them). **End-state revised 2026-06-21 to Path C (§3.7)** - supersedes the original
 > §3.5 "retire registry, supervisor = sole namer." The constitution amendments (§6) land *with* their
@@ -17,7 +17,7 @@
 > directory** (one bounded exception), the registry service retires into it, **init is removed**, and
 > the **supervisor becomes restartable** (kernel respawns it; it recovers from the directory). This
 > *softens* §26.10 (a thin naming facility stays in the kernel) to *better serve* §6.3 (unkillable =
-> `{kernel}`). §§1–3.6 below record the original reasoning that got us here; §3.7 is the chosen end.
+> `{kernel}`). §§1-3.6 below record the original reasoning that got us here; §3.7 is the chosen end.
 
 ---
 
@@ -164,7 +164,7 @@ The original decision retired the registry into the supervisor, leaving `{kernel
 unkillable. Path C keeps the registry's *recovery* role as a minimal **kernel** directory instead, so
 the supervisor can also be restarted and the unkillable set shrinks to `{kernel}`. The registry
 *service* still retires; what changes is *where its recovery state lives* (kernel directory, not the
-supervisor). Read §3.7 for the chosen end-state; §3.1–§3.6 are the reasoning that led there.
+supervisor). Read §3.7 for the chosen end-state; §3.1-§3.6 are the reasoning that led there.
 
 ### 3.6 Death notifications
 
@@ -175,7 +175,7 @@ required beyond what the new spawn return already gives the supervisor.
 
 ### 3.7 Path C - kernel keeps a minimal recovery directory (the chosen end-state, 2026-06-21)
 
-§3.1–§3.6 make the **supervisor** the bootstrap anchor. That works for *wiring* (done, Phases 0a–3c),
+§3.1-§3.6 make the **supervisor** the bootstrap anchor. That works for *wiring* (done, Phases 0a-3c),
 but it leaves the supervisor **unkillable**, and trying to fix *that* exposes a trap.
 
 #### 3.7.1 The trap, and why only the kernel escapes it
@@ -236,7 +236,7 @@ fits." Path C's exception is the opposite: **one named, documented, frozen excep
 directory - with a hard, non-extensible rationale (*the recovery anchor must be unkillable, and only
 the kernel is*). That is a defensible boundary, not a slippery slope. The kernel's naming role still
 **shrank dramatically**: from "resolve names to wire every service at spawn" (today) to "a flat
-recovery directory for re-minting caps after a restart." Phases 0a–3c - moving all *wiring* to the
+recovery directory for re-minting caps after a restart." Phases 0a-3c - moving all *wiring* to the
 supervisor - **stand unchanged**; only the endgame's target moves.
 
 > **Path C in one line:** the kernel keeps a minimal, gated name→cap **recovery directory**; the
@@ -393,7 +393,7 @@ No new test *categories* - the existing suite is the safety net, run green at ev
 ## 10. Summary
 
 The kernel stops **resolving names to wire services** - the supervisor owns all wiring, at boot and on
-restart (Phases 0a–3c, done: spawn returns endpoint caps; the supervisor installs caller-supplied caps
+restart (Phases 0a-3c, done: spawn returns endpoint caps; the supervisor installs caller-supplied caps
 and wires dependents from its `name → cap` map). What the kernel **keeps** is one bounded exception: a
 minimal, gated `name → endpoint` **recovery directory** (Path C, §3.7) - because the recovery anchor
 must be the one thing that cannot die, and only the kernel is. With that anchor the registry service

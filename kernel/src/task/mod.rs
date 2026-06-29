@@ -917,7 +917,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         })),
         // ----------------------------------------------------------------
         // Brutal property test probes - Milestone 16.
-        // 10 escalated-iteration variants of P1–P10, each with its own victim
+        // 10 escalated-iteration variants of P1-P10, each with its own victim
         // where the original property needed one.  Victims before controllers.
         // ----------------------------------------------------------------
         // BP1: cap unforgeability at 100k iterations.

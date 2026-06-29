@@ -15,16 +15,16 @@ Host-side developer CLI (§17). Builds for the developer's machine, not the kern
 | `osdev status <service>`    | Show service state + assigned core |
 | `osdev caps <service>`      | Show held capabilities |
 | `osdev test identity`       | Run §22 identity test suite (20 tests) |
-| `osdev test property`       | Run property tests (P1–P10) |
-| `osdev test fuzz`           | Run fuzz tests (F1–F8) |
-| `osdev test stress`         | Run stress tests (S1–S10) |
-| `osdev test perf`           | Run performance benchmarks (B1–B10) ✅ 10/10 |
+| `osdev test property`       | Run property tests (P1-P10) |
+| `osdev test fuzz`           | Run fuzz tests (F1-F8) |
+| `osdev test stress`         | Run stress tests (S1-S10) |
+| `osdev test perf`           | Run performance benchmarks (B1-B10) ✅ 10/10 |
 | `osdev test perf:<ID>`      | Run a single benchmark (e.g. `perf:B2`) |
-| `osdev test perf-brutal`    | Run brutal performance benchmarks (BP1–BP10) ✅ 10/10 |
-| `osdev test adv`            | Run adversarial / red-team tests (A1–A10) ✅ 10/10 |
-| `osdev test adv-brutal`     | Run brutal adversarial tests (BA1–BA10) ✅ 10/10 |
-| `osdev test chaos`          | Run chaos / partial-failure tests (C1–C7) ✅ 7/7 |
-| `osdev test chaos-brutal`   | Run brutal chaos tests (BC1–BC7) ✅ 7/7 |
+| `osdev test perf-brutal`    | Run brutal performance benchmarks (BP1-BP10) ✅ 10/10 |
+| `osdev test adv`            | Run adversarial / red-team tests (A1-A10) ✅ 10/10 |
+| `osdev test adv-brutal`     | Run brutal adversarial tests (BA1-BA10) ✅ 10/10 |
+| `osdev test chaos`          | Run chaos / partial-failure tests (C1-C7) ✅ 7/7 |
+| `osdev test chaos-brutal`   | Run brutal chaos tests (BC1-BC7) ✅ 7/7 |
 | `osdev test shell`          | Scripted shell smoke-test: boot, help, cores, status, unknown |
 | `osdev test files`          | Files/records/pipes/`result`/`run`/`assert` over a RAW AHCI disk (129 checks) |
 | `osdev test edit`           | Full-screen `edit` text editor (bounded piece table - files of any size): small-file open/type/backspace/newline/save (^S)/quit (^Q)/`read`-back, edit-existing, quit-with-discard, no-arg usage; **large-file** (pre-baked multi-window `/big.txt`) windowed open + insert-at-start + PageDown mid-file insert + streaming save, verified by reading the saved bytes back off the disk. 15 checks |
@@ -45,10 +45,10 @@ Host-side developer CLI (§17). Builds for the developer's machine, not the kern
 | `osdev validate`            | Validate all contracts against the JSON schema |
 | `osdev shell [--smp N]`     | Boot in QEMU with the interactive shell on stdin/stdout (bare-metal build - no probe services; type `help` at `gsh>` prompt; Ctrl-A X to quit) |
 | `osdev image`               | Build with `bare-metal` supervisor + create UEFI-bootable `build/os.img` (GPT + ESP + BOOTX64.EFI) |
-| `osdev image --mode perf`   | Same image, `perf-only` supervisor (B1–B10 probes) |
-| `osdev image --mode perf-brutal` | Same image, `perf-brutal-only` supervisor (BP1–BP10 probes) |
+| `osdev image --mode perf`   | Same image, `perf-only` supervisor (B1-B10 probes) |
+| `osdev image --mode perf-brutal` | Same image, `perf-brutal-only` supervisor (BP1-BP10 probes) |
 | `osdev image --mode identity` | Same image, `identity-only` supervisor (WatchSerial identity tests) |
-| `osdev image --mode fuzz`   | Same image, `fuzz-only` supervisor (§22 F1–F8 + BF1–BF8 self-run over serial; F3/BF3 need test-bad-elf, F4 is host-only) |
+| `osdev image --mode fuzz`   | Same image, `fuzz-only` supervisor (§22 F1-F8 + BF1-BF8 self-run over serial; F3/BF3 need test-bad-elf, F4 is host-only) |
 
 ## Files
 
@@ -103,8 +103,8 @@ Creates a UEFI-bootable disk image at `build/os.img` for writing to a USB drive.
 build/os.img (64 MiB, GPT)
   Protective MBR (LBA 0)
   Primary GPT header (LBA 1)
-  GPT partition entries (LBA 2–33)
-  EFI System Partition - FAT32 (LBA 2048–131038)
+  GPT partition entries (LBA 2-33)
+  EFI System Partition - FAT32 (LBA 2048-131038)
     EFI/BOOT/BOOTX64.EFI   ← Limine UEFI bootloader
     limine.conf             ← timeout: -1, kernel_path: boot():/kernel.elf
     kernel.elf              ← kernel binary

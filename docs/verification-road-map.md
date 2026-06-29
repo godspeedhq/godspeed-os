@@ -4,7 +4,7 @@
 >
 > **Context:** GodspeedOS v1 shipped with all 130 tests passing across seven categories (identity, property, fuzz, stress, performance, adversarial, chaos), each with brutal variants. The kernel is correct against its spec. The work below sharpens what is already there: finding what the tests miss, what QEMU hides, and what only emerges over time.
 >
-> **Progress (2026-05-16):** Items 1, 3–6 complete. Item 2 and items 7–9 deferred pending hardware arrival.
+> **Progress (2026-05-16):** Items 1, 3-6 complete. Item 2 and items 7-9 deferred pending hardware arrival.
 
 ---
 
@@ -51,7 +51,7 @@ The list is in priority order for a solo developer. Each item compounds with the
 
 **Time.** 1 day to wire up. A few more days to triage the first report and act on it.
 
-**Expected findings.** Most kernel codebases find 10–20% dead code on first measurement. Expect to delete a meaningful amount.
+**Expected findings.** Most kernel codebases find 10-20% dead code on first measurement. Expect to delete a meaningful amount.
 
 ---
 
@@ -71,7 +71,7 @@ The list is in priority order for a solo developer. Each item compounds with the
 
 **Hardware shopping list.**
 
-- Used x86_64 machine. Any ThinkPad from the X220 onwards works (~$50–80 on eBay). Intel NUC family is the cheap-but-modern option (~$150 used). A spare desktop is free.
+- Used x86_64 machine. Any ThinkPad from the X220 onwards works (~$50-80 on eBay). Intel NUC family is the cheap-but-modern option (~$150 used). A spare desktop is free.
 - USB-to-serial adapter (~$15). FTDI-based ones are reliable.
 - USB stick (any 4 GB+ will do).
 
@@ -212,7 +212,7 @@ Extract pure-logic subsystems as unit-testable units if they aren't already. Run
 
 **Time.** Hours to set up. The full suite runs slowly (each mutation requires a full test pass). Set it to run overnight or weekly.
 
-**Expected findings.** A kernel with 130 tests typically has 10–30 mutation holes on first measurement. This is the closest thing available to MC/DC coverage without paying for avionics-grade tooling.
+**Expected findings.** A kernel with 130 tests typically has 10-30 mutation holes on first measurement. This is the closest thing available to MC/DC coverage without paying for avionics-grade tooling.
 
 ---
 
@@ -220,7 +220,7 @@ Extract pure-logic subsystems as unit-testable units if they aren't already. Run
 
 **Intent.** Augment the existing property tests with algebraic assertions about specific subsystems, run in unit-test form rather than through the full kernel.
 
-**Why.** The existing P1–P10 tests are *behavioral*: they spawn services and check outcomes. Algebraic property tests target a subsystem in isolation, run thousands of times faster, and exercise far more states. The bugs they find - order-of-operations issues, boundary conditions, state-explosion paths - are different from what behavioral tests catch.
+**Why.** The existing P1-P10 tests are *behavioral*: they spawn services and check outcomes. Algebraic property tests target a subsystem in isolation, run thousands of times faster, and exercise far more states. The bugs they find - order-of-operations issues, boundary conditions, state-explosion paths - are different from what behavioral tests catch.
 
 ### 6.1 Bitmap allocator
 

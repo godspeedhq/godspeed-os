@@ -467,7 +467,7 @@ pub fn phys_in_ram(phys: u64) -> bool {
     let idx = (phys / FRAME_SIZE) as usize;
     unsafe { idx < ALLOCATOR.max_valid_frame }
 }
-/// Walk the kernel half of the live PML4 (entries 256–511) and mark every
+/// Walk the kernel half of the live PML4 (entries 256-511) and mark every
 /// PDPT / PD / PT / PML4 frame as "used" in the bitmap allocator.
 ///
 /// Root cause this closes (BA2):

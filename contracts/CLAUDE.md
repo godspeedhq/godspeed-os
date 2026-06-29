@@ -35,7 +35,7 @@ core = 0    # optional; omit for round-robin
 - Version: SemVer `N.N.N`.
 - Memory sizes: `NNN(KiB|MiB|GiB)`.
 - Capability names: known set only (no arbitrary keys).
-- Core IDs: integer 0–15 (range check only; availability is runtime).
+- Core IDs: integer 0-15 (range check only; availability is runtime).
 
 ## What the schema does NOT validate (§13.4)
 

@@ -1,4 +1,4 @@
-# Milestone 14 - Chaos Tests (§22 Chaos C1–C7)
+# Milestone 14 - Chaos Tests (§22 Chaos C1-C7)
 
 **Status:** ✅ 7/7 implemented - all pass  
 **Command:** `osdev test chaos`  
@@ -6,7 +6,7 @@
 
 ---
 
-# Milestone 21 - Brutal Chaos Tests (BC1–BC7)
+# Milestone 21 - Brutal Chaos Tests (BC1-BC7)
 
 **Status:** ✅ 7/7 implemented - all pass  
 **Command:** `osdev test chaos-brutal`  
@@ -29,7 +29,7 @@ continued with degraded capacity or panicked loudly with a defined reason.
 
 ---
 
-## Probe Modes Added (91–96)
+## Probe Modes Added (91-96)
 
 New modes complement the existing probe binary (single ELF, many configs).
 
@@ -205,7 +205,7 @@ never acceptable.
 ## Implementation Checklist
 
 - ✅ `milestones/v1/14_CHAOS_TESTS.md` - this file
-- ✅ `services/probe/src/main.rs` - modes 91–96, dispatch arms, implementations
+- ✅ `services/probe/src/main.rs` - modes 91-96, dispatch arms, implementations
 - ✅ `kernel/src/task/mod.rs` - 8 new service configs (chaos-c2 through chaos-c7)
 - ✅ `services/supervisor/src/main.rs` - chaos probe spawns (victim-before-controller)
 - ✅ `osdev/src/validator.rs` - `CHAOS_TESTS`, `run_chaos_tests()`, `run_chaos_one()`, `DegradedSmp`/`DegradedEnv` test kinds
@@ -220,7 +220,7 @@ never acceptable.
 
 Brutal chaos repeats each degradation scenario at higher intensity - more simultaneous
 faults, deeper recursion, more TLB cycles, more extreme resource constraints - while
-the full brutal suite (BS1–BS10, BA1–BA10) runs concurrently.
+the full brutal suite (BS1-BS10, BA1-BA10) runs concurrently.
 
 ### Attacks
 
@@ -254,7 +254,7 @@ the full brutal suite (BS1–BS10, BA1–BA10) runs concurrently.
 
 ### Implementation checklist
 
-- ✅ `services/probe/src/main.rs` - modes 155–159 (BC2 monitor, BC3, BC5, BC6 monitor, BC7)
+- ✅ `services/probe/src/main.rs` - modes 155-159 (BC2 monitor, BC3, BC5, BC6 monitor, BC7)
 - ✅ `kernel/src/task/mod.rs` - 13 brutal chaos service configs
 - ✅ `services/supervisor/src/main.rs` - brutal chaos probe spawns (EARLY, before property tests)
 - ✅ `osdev/src/validator.rs` - `BRUTAL_CHAOS_TESTS`, `run_chaos_brutal_tests()`, `chaos_brutal_serial_path()`, `run_chaos_brutal_one()`

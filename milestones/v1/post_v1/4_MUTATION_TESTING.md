@@ -89,7 +89,7 @@ Expected approximate mutation counts on first run:
 | `message.rs` | ~8 | new() size check, payload copy |
 | `queue.rs` | ~25 | enqueue/dequeue/drain ring buffer arithmetic |
 
-Total: ~80 mutations. Expected survivors on first run: 0–16 (80% kill rate floor).
+Total: ~80 mutations. Expected survivors on first run: 0-16 (80% kill rate floor).
 A clean run (100%) is the real goal; 80% is the "fix before merging" threshold.
 
 ---

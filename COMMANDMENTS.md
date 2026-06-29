@@ -22,7 +22,7 @@ new CPU architectures, and bug fixes are welcome. New *responsibilities* are not
 Before proposing a kernel change, ask: **"Why isn't this a service?"** If the answer is "because it
 is more convenient," it belongs outside the kernel.
 
-> *Grounded in:* §4.3–§4.4 (kernel scope and anti-scope), §26.10 (the kernel is mechanism, not
+> *Grounded in:* §4.3-§4.4 (kernel scope and anti-scope), §26.10 (the kernel is mechanism, not
 > policy), Invariant 4 (the kernel remains tiny).
 
 ---
@@ -81,7 +81,7 @@ exempt. If the Supervisor itself must survive its own death - and it must, for t
 The only unkillable component is the kernel. Everything above it is identity, not location, and
 identity survives restart.
 
-> *Grounded in:* §6.2–§6.3 (the supervisor is restartable; the unkillable set is `{kernel}` alone),
+> *Grounded in:* §6.2-§6.3 (the supervisor is restartable; the unkillable set is `{kernel}` alone),
 > Invariant 6 (services must be restartable), Invariant 11 (identity is stable; location is not).
 
 ---

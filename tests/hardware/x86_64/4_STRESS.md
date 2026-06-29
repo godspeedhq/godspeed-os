@@ -1,6 +1,6 @@
 # Hardware: Stress Tests
 
-Mirrors §22 Stress Tests (S1–S10). No drift, leak, or corruption under sustained load.
+Mirrors §22 Stress Tests (S1-S10). No drift, leak, or corruption under sustained load.
 
 **Reference:** `tests/qemu/stress/CLAUDE.md` for full spec.
 
@@ -44,7 +44,7 @@ osdev image --mode stress
 # Rufus DD Image mode → USB → reboot hardware, observe PuTTY
 ```
 
-`stress-only` supervisor spawns pong + ping + all 18 stress probe tasks (S1–S10 with
+`stress-only` supervisor spawns pong + ping + all 18 stress probe tasks (S1-S10 with
 their recv/victim partners). No QEMU harness required - all probes are self-contained.
 
 **Expected serial lines (any order, 8/10 on Goldmont+):**

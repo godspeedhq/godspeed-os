@@ -1,7 +1,7 @@
 # Milestone - Chaos Engineering (`max-carnage`) ✅
 
 **Status:** ✅ Complete - built, merged, and soaked on the HP T630 at 1M-round scale (0 panics).
-**Where:** `services/chaos/` (a userspace program), driven from the shell; `osdev test chaos` (C1–C7) + the shell flood-storm regressions.
+**Where:** `services/chaos/` (a userspace program), driven from the shell; `osdev test chaos` (C1-C7) + the shell flood-storm regressions.
 **Constitutional anchor:** §22 (Chaos), §26 (Architectural Discipline - bounded behavior, loud failure), §4.4 / §26.10 (kernel is mechanism; chaos is policy).
 
 ---

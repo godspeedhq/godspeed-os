@@ -69,7 +69,7 @@ Dev-dependencies are only compiled when running `cargo test`; the bare-metal
 |----------|-------------|
 | `depth_never_exceeds_capacity` | `depth() ≤ QUEUE_DEPTH` after any enqueue/dequeue sequence |
 | `full_and_empty_flags_consistent_with_depth` | `is_full() == (depth == 16)` and `is_empty() == (depth == 0)` always |
-| `fifo_order_preserved_for_any_fill` | FIFO order holds for any fill level 1–16 |
+| `fifo_order_preserved_for_any_fill` | FIFO order holds for any fill level 1-16 |
 | `drain_always_yields_empty` | `drain()` always leaves `is_empty() == true` |
 
 ---

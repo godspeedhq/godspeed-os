@@ -53,12 +53,12 @@ sequenceDiagram
 
 ## Per-test timeouts
 
-Timeouts are per-test, not a global 30 s. On Linux KVM (CI), all tests complete in <30 s. On Windows TCG (no hardware virtualisation), the supervisor spawns 178+ probe services before logging "supervisor: ready", taking 18–120 s. Timeouts are sized to cover the TCG worst case:
+Timeouts are per-test, not a global 30 s. On Linux KVM (CI), all tests complete in <30 s. On Windows TCG (no hardware virtualisation), the supervisor spawns 178+ probe services before logging "supervisor: ready", taking 18-120 s. Timeouts are sized to cover the TCG worst case:
 
 | Category            | Typical timeout |
 |---------------------|-----------------|
 | Simple WatchSerial  | 30s             |
-| Probe-dependent     | 60–120s         |
+| Probe-dependent     | 60-120s         |
 | WithRestart (pong)  | 180s            |
 
 ## KVM detection

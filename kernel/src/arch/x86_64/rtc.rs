@@ -115,11 +115,11 @@ fn year_plausible(packed: u64) -> bool {
 /// Read the RTC and return the wall-clock date/time packed into a `u64`:
 ///
 /// ```text
-///   bits  0..6   second (0–59)
-///   bits  6..12  minute (0–59)
-///   bits 12..17  hour   (0–23)
-///   bits 17..22  day    (1–31)
-///   bits 22..26  month  (1–12)
+///   bits  0..6   second (0-59)
+///   bits  6..12  minute (0-59)
+///   bits 12..17  hour   (0-23)
+///   bits 17..22  day    (1-31)
+///   bits 22..26  month  (1-12)
 ///   bits 26..38  year   (full, e.g. 2026)
 /// ```
 ///
@@ -167,7 +167,7 @@ fn read_datetime_raw() -> u64 {
     }
     if !is_24h {
         if pm {
-            hour = (hour % 12) + 12; // 1–11 PM → 13–23, 12 PM → 12
+            hour = (hour % 12) + 12; // 1-11 PM → 13-23, 12 PM → 12
         } else if hour == 12 {
             hour = 0; // 12 AM → 00
         }

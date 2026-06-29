@@ -142,7 +142,7 @@ appear within their timeout without a `KERNEL PANIC`.
 
 ## Implementation checklist
 
-- ✅ `services/probe/src/main.rs` - modes 80–90 (11 modes across 10 attacks)
+- ✅ `services/probe/src/main.rs` - modes 80-90 (11 modes across 10 attacks)
 - ✅ `kernel/src/task/mod.rs` - 13 adversarial service configs; `TASK_KSTACK_MAX` raised to 100
 - ✅ `services/supervisor/src/main.rs` - adversarial probe spawns
 - ✅ `osdev/src/validator.rs` - `ADV_TESTS`, `run_adv_tests()`, `run_adv_one()`, `adv_serial_path()`
@@ -156,9 +156,9 @@ appear within their timeout without a `KERNEL PANIC`.
 **Status:** [x] 10/10 implemented - all pass
 **Command:** `osdev test adv-brutal`
 
-The brutal phase repeats each adversarial attack at 5–50× intensity, combined with the
-full brutal stress suite (BS1–BS8) running concurrently in the same QEMU session.
-BA1–BA10 correspond to A1–A10 but with higher iteration counts and longer running times.
+The brutal phase repeats each adversarial attack at 5-50× intensity, combined with the
+full brutal stress suite (BS1-BS8) running concurrently in the same QEMU session.
+BA1-BA10 correspond to A1-A10 but with higher iteration counts and longer running times.
 
 ### Attacks
 
@@ -195,7 +195,7 @@ BA1–BA10 correspond to A1–A10 but with higher iteration counts and longer ru
 
 ### Implementation checklist
 
-- ✅ `services/probe/src/main.rs` - modes 144–154 (11 modes across 10 attacks)
+- ✅ `services/probe/src/main.rs` - modes 144-154 (11 modes across 10 attacks)
 - ✅ `kernel/src/task/mod.rs` - 14 brutal adversarial service configs
 - ✅ `services/supervisor/src/main.rs` - brutal adversarial probe spawns
 - ✅ `osdev/src/validator.rs` - `ADV_BRUTAL_TESTS`, timeouts 900 s for BA4/BA5/BA8/BA9

@@ -1,6 +1,6 @@
 # IOMMU-backed DMA confinement (H1)
 
-> **Status:** Phase 0 + Phase 1 (a–f) implemented and QEMU-verified on branch
+> **Status:** Phase 0 + Phase 1 (a-f) implemented and QEMU-verified on branch
 > `feat/iommu-dma-confinement`. Phase 2 (dropping the drivers from the TCB) is a
 > **proposal pending sign-off** - see the end of this document. Real-hardware
 > (T630 / AMD GX-420GI) IVRS presence is still unconfirmed (needs a flash).

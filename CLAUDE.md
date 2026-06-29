@@ -257,7 +257,7 @@ os/
     qemu/
       identity/            # identity test suite (§22)
       harness/             # shared test infrastructure
-      perf/                # performance benchmarks (§22 B1–B10) - 10/10 ✅
+      perf/                # performance benchmarks (§22 B1-B10) - 10/10 ✅
 ```
 
 ---
@@ -309,7 +309,7 @@ os/
 > registry instance/location is not.
 
 > **Amendment 2026-06-21 (naming Phase 4 / Path C): the `registry` SERVICE is RETIRED.**
-> Moving name→endpoint resolution to the supervisor (Phases 0a–3c, `docs/naming-design.md`)
+> Moving name→endpoint resolution to the supervisor (Phases 0a-3c, `docs/naming-design.md`)
 > left the registry's only remaining job - handing a client a cap to a service by name - to a
 > **minimal `name → endpoint` recovery directory inside the kernel** (`ipc::names` + the gated
 > `AcquireSendCap`). The supervisor wires every service from a `name → cap` map at boot and on
@@ -814,7 +814,7 @@ When a page is unmapped (service killed, memory reclaimed), the kernel issues a 
   ── System reaches multi-core steady state ──
 ```
 
-> **Amendment 2026-06-21 (naming Phases 3b–5): the kernel spawns the `supervisor` directly; `init`
+> **Amendment 2026-06-21 (naming Phases 3b-5): the kernel spawns the `supervisor` directly; `init`
 > is removed; the registry *service* is retired.** Moving name→endpoint resolution out of the kernel
 > (`docs/naming-design.md`, Path C §3.7) makes the supervisor the name authority. Phase 3b moved the
 > name service under the supervisor; Phase 4 then **retired the registry service** entirely (the
@@ -1196,7 +1196,7 @@ The test suite is layered. Each layer answers a different question about kernel 
 ```text
   ┌─────────────────────────────────────────────────────────────────────┐
   │  Foundation - must pass before anything else                        │
-  │  Identity (§22) - Tests 1–11 ✅ - Constitutional invariants        │
+  │  Identity (§22) - Tests 1-11 ✅ - Constitutional invariants        │
   └──────────────────────┬──────────────────────────────────────────────┘
           ┌──────────────┴─────────────────┐
           ▼                                ▼
@@ -1227,7 +1227,7 @@ Tests live under `tests/qemu/`, organized by category:
 
 ```
 tests/qemu/
-  identity/      # §22.5–§22.6 (complete)
+  identity/      # §22.5-§22.6 (complete)
   property/      # see Property Tests below
   fuzz/          # see Fuzz Tests below
   stress/        # see Stress Tests below
@@ -1245,7 +1245,7 @@ The bar across every category is the same as identity: **no FAIL, no BLOCKED wit
 
 #### Identity (§22) - Complete
 
-All passing (Tests 1–15; harness reports 24 cases incl. A/B + IR + Test 11 + Test 15). No regressions allowed. Any failure here is a constitutional violation that requires either a kernel fix or a CLAUDE.md amendment. **Test 11 (added by H11) is now *name-resolves-after-restart-via-the-kernel-directory* - the registry service was retired in naming Phase 4 / Path C (`docs/naming-design.md` §3.7), so Test 11 pins the directory's restart property instead of a registry service.** **Test 1B now corrupts the `supervisor` (the registry it used to corrupt is gone).** **Test 15 (Path C / Phase 6) pins that the `supervisor` itself survives its own restart - the kernel respawns it, so the unkillable set is `{kernel}` alone.**
+All passing (Tests 1-15; harness reports 24 cases incl. A/B + IR + Test 11 + Test 15). No regressions allowed. Any failure here is a constitutional violation that requires either a kernel fix or a CLAUDE.md amendment. **Test 11 (added by H11) is now *name-resolves-after-restart-via-the-kernel-directory* - the registry service was retired in naming Phase 4 / Path C (`docs/naming-design.md` §3.7), so Test 11 pins the directory's restart property instead of a registry service.** **Test 1B now corrupts the `supervisor` (the registry it used to corrupt is gone).** **Test 15 (Path C / Phase 6) pins that the `supervisor` itself survives its own restart - the kernel respawns it, so the unkillable set is `{kernel}` alone.**
 
 ---
 
@@ -1285,7 +1285,7 @@ Fuzz tests find the inputs that crash the kernel that no one would write by hand
 | F7  | Cap generation field             | Random u64 as generation in cap usage; must return `CapRevoked` or `EndpointDead` |
 | F8  | Memory request values            | Random sizes including > total RAM, `0`, and `u64::MAX`                           |
 
-Any panic discovered by F1–F8 is a kernel bug. The fix is mandatory and includes a regression test added to the relevant identity or property suite.
+Any panic discovered by F1-F8 is a kernel bug. The fix is mandatory and includes a regression test added to the relevant identity or property suite.
 
 ---
 
@@ -2027,7 +2027,7 @@ All cycle counts. † = perf-brutal in-suite p50 (already low-variance); the res
 single-probe isolation builds (`osdev image --mode iso-bp{3,5,7,9,10}`; bp5 covers BP5+BP6).
 The two columns are **not** a clean head-to-head: J5005 was perf-brutal (contended), the T630
 column is isolated (uncontended), so they compare fairly only where both were clean -
-BP1/BP4/BP8 at ~1.9–2.5×, genuine Jaguar-vs-Goldmont IPC. Where the T630 number is *lower*
+BP1/BP4/BP8 at ~1.9-2.5×, genuine Jaguar-vs-Goldmont IPC. Where the T630 number is *lower*
 (BP3) the J5005 figure was itself contention-inflated. BP5/BP6 (spawn/restart) are
 memory-bandwidth-bound - the low-power thin client lags most there. The full investigation
 behind BP2 (the COM2 timer-ISR wedge, fixed `a306fd3`) is in `bugs/1_FINDINGS_AP_TO_BSP_IPI.md`.

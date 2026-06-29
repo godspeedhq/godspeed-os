@@ -111,7 +111,7 @@ was effectively live-locked in the timer ISR.
 **Fix:** Raise `APIC_TIMER_INIT` from `625_000` to **`6_250_000`** - a ~50 ms
 period on the GX-420GI (and ~100 ms on QEMU's slower modelled clock), comfortably
 longer than the worst-case ISR output time. This broke the cascade and gave
-userspace ~30–45 ms of run time per quantum, after which the full service stack
+userspace ~30-45 ms of run time per quantum, after which the full service stack
 came up immediately.
 
 > Lesson: a periodic-APIC init count is **not portable across vendors** - the
@@ -151,7 +151,7 @@ methodology that cracked it:
   `R` distinguished "userspace executes" from "userspace never runs" without
   depending on the syscall path working.
 - **First-instruction RSP watch.** The timer ISR printed the interrupted CPL/RIP/RSP
-  for core 0 on ticks 14–18. `RSP` pinned at `0x80000000` across every tick was
+  for core 0 on ticks 14-18. `RSP` pinned at `0x80000000` across every tick was
   the smoking gun: the CPU was in ring-3 but `push` never executed → the timer was
   firing before the first instruction retired → cascade.
 - **Flag-based "reached?" reporting.** Atomic flags set as the very first
@@ -193,7 +193,7 @@ no longer carries unnecessary privilege:
 - Removed all per-syscall serial output (`[sc]`, `[log-enter]`, `[ring-try]`,
   the `S`/`K`/`U`/`I`/`!X`/`C` entry-stub prints) and the `*_REACHED` flags + the
   `syscall_entry_diag` helper.
-- Removed the per-tick / tick-windowed timer-ISR diagnostics (ticks 0–30:
+- Removed the per-tick / tick-windowed timer-ISR diagnostics (ticks 0-30:
   `[lXX cY]`, `SYSCALL/CSTAR/EXC/PF/GP/INT80-NO`, `late20/late30`, per-core RIP dumps).
 - Removed the first-ring3-switch page-table dump (`entry64`, `ctx16`,
   `cod[…]`, `stk[…]`, `pml4/pdpt/pd/pte`) and the `rsp0=` readback.
@@ -234,7 +234,7 @@ first time on this hardware.
 | BP4 cap validation         | 495         | ~1,258                | clean (~2.5×) |
 | BP5 spawn                  | 8,121,378   | 75,106,731            | contention |
 | BP6 restart                | 14,462,309  | 87,574,924            | contention |
-| BP7 cap table              | 1,168       | 5,290 – 526,316       | high variance (preemption) |
+| BP7 cap table              | 1,168       | 5,290 - 526,316       | high variance (preemption) |
 | BP8 allocator (4 KiB)      | 616         | ~1,472                | clean (~2.4×) |
 | BP9 message copy 4 KiB     | 20,073      | ~149,000              | contention |
 | BP10 scheduler decision    | 2,323       | ~10,100               | contention |
@@ -242,7 +242,7 @@ first time on this hardware.
 *All figures in CPU cycles; T630 values are the cleanest across re-runs.*
 
 **Reading the numbers honestly.** They split in two. The compute-bound,
-single-shot-per-iteration probes (BP1, BP4, BP8) land at a steady **~1.9–2.5×**
+single-shot-per-iteration probes (BP1, BP4, BP8) land at a steady **~1.9-2.5×**
 the J5005 cycle counts - genuine microarchitecture (Jaguar/Puma+ is a 2-wide
 low-power core with lower IPC than Goldmont). The large/variable figures (BP5,
 BP6, BP9, BP3, BP10, and BP7's 100× spread) are **contention/preemption-inflated,
@@ -323,7 +323,7 @@ and would catch a future handler that performs a privileged action without valid
 
 The last known kernel bug: an intermittent `rip → kstack` `#PF` under heavy cross-core
 `recv` load on real hardware (root-caused earlier, banked; full history in
-`bugs/2_INTERMITTENT_RIP0_PF_POST_IDLE.md`, Updates 1–9).
+`bugs/2_INTERMITTENT_RIP0_PF_POST_IDLE.md`, Updates 1-9).
 
 **Root cause.** On the GX-420GI the live syscall path is `ud2`/#UD, which enters on
 `TSS.rsp0 = K0T` - the same top-of-kstack region the timer ISR's context-switch path
@@ -363,8 +363,8 @@ pre-fix ~50% fault rate. Cross-core-heavy workloads are now safe on hardware.
 - **Isolated per-probe perf numbers.** ✅ Done. Added `perf-iso` per-probe isolation
   builds (`osdev image --mode iso-bp{3,5,7,9,10}`; bp5 covers BP5+BP6) - one benchmark
   alone, no ping/pong - giving clean, uncontended T630 latencies. The full isolated
-  column is now in CLAUDE.md §23.3. Headline: isolation stripped 7–100× of contention
-  noise (e.g. BP7 5,290–526,316 in-suite → a stable 2,932; BP9 149k–280k → 21,796, ≈
+  column is now in CLAUDE.md §23.3. Headline: isolation stripped 7-100× of contention
+  noise (e.g. BP7 5,290-526,316 in-suite → a stable 2,932; BP9 149k-280k → 21,796, ≈
   the J5005's 20,073 - proving its apparent "regression" was pure scheduling noise).
   (Build note: a cargo cache-mtime quirk could embed a stale supervisor in the kernel
   for these single-feature builds; fixed in `ed8a151` by force-cleaning the supervisor.)

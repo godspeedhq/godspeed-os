@@ -28,13 +28,13 @@ perf-only = []
 # Spawn only the brutal performance-benchmark probe services (perf-bp1…perf-bp10
 # and their echo/victim partners).  Used by `osdev test perf-brutal`.
 perf-brutal-only = []
-# Spawn only the S1–S10 stress probe services (and pong/ping).
+# Spawn only the S1-S10 stress probe services (and pong/ping).
 # Used by `osdev image --mode stress` for a self-contained hardware stress run.
 stress-only = []
-# Spawn only the A1–A10 adversarial probe services (and pong/ping).
+# Spawn only the A1-A10 adversarial probe services (and pong/ping).
 # Used by `osdev image --mode adv` for a self-contained hardware adversarial run.
 adv-only = []
-# Spawn only the C2–C7 chaos probe services (and pong/ping).
+# Spawn only the C2-C7 chaos probe services (and pong/ping).
 # C1 uses bare-metal + BIOS core disable; C4 uses bare-metal + RAM removal.
 # Used by `osdev image --mode chaos` for a self-contained hardware chaos run.
 chaos-only = []

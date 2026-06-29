@@ -7,7 +7,7 @@
 
 //! x86_64 four-level page table management - §10.
 //!
-//! Each task gets its own CR3.  The kernel region (PML4 entries 256–511) is
+//! Each task gets its own CR3.  The kernel region (PML4 entries 256-511) is
 //! copied from the Limine-set-up PML4 into every new address space so that
 //! syscall entry/exit never needs a CR3 switch.
 //!
@@ -125,7 +125,7 @@ impl PageTable {
             }
         }
 
-        // Copy the kernel half (entries 256–511) from the active PML4 so the
+        // Copy the kernel half (entries 256-511) from the active PML4 so the
         // new address space can run kernel code immediately.
         // SAFETY: CR3 always valid after boot; HHDM covers the active PML4.
         unsafe {
@@ -219,7 +219,7 @@ impl PageTable {
 ///
 /// Designed for boot-time kernel MMIO mappings (e.g. APIC) that must exist
 /// in Limine's tables before our per-task `PageTable`s are created.  Because
-/// `PageTable::new()` copies PML4 entries 256–511, any mapping added here at
+/// `PageTable::new()` copies PML4 entries 256-511, any mapping added here at
 /// a kernel virtual address automatically propagates to future address spaces.
 ///
 /// If the target PTE is already present this is a no-op (returns `Ok`).
@@ -512,11 +512,11 @@ unsafe fn free_phys_frame(phys: u64) {
     unsafe { crate::memory::allocator::free_frame(frame); }
 }
 
-/// Walk the user half (PML4 entries 0–255) of the address space rooted at
+/// Walk the user half (PML4 entries 0-255) of the address space rooted at
 /// `cr3` and FREE every physical frame it maps - leaf data frames AND intermediate page-table
 /// frames - back to the allocator, INLINE (no collection buffer). Returns the count freed.
 ///
-/// The kernel half (entries 256–511) is shared across all address spaces and
+/// The kernel half (entries 256-511) is shared across all address spaces and
 /// is NOT collected.
 ///
 /// The caller must issue a full TLB flush on all cores before freeing the

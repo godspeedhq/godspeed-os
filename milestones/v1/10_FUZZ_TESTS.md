@@ -2,7 +2,7 @@
 
 ## Goal
 
-The kernel must never panic on user-controllable input. Any panic discovered by F1–F8 is a mandatory kernel fix; the fix must include a regression test added to the identity or property suite before any other work proceeds.
+The kernel must never panic on user-controllable input. Any panic discovered by F1-F8 is a mandatory kernel fix; the fix must include a regression test added to the identity or property suite before any other work proceeds.
 
 ## Spec reference
 
@@ -16,7 +16,7 @@ CLAUDE.md §22 Fuzz Tests.
 |-------|-------|--------|
 | Phase 1 | F1, F2, F5, F6, F7, F8 | ✅ 6/6 PASS |
 | Phase 2 | F3, F4 | ✅ 2/2 PASS |
-| Phase 3 (Brutal) | BF1–BF8 | ✅ 8/8 PASS |
+| Phase 3 (Brutal) | BF1-BF8 | ✅ 8/8 PASS |
 
 ---
 
@@ -24,7 +24,7 @@ CLAUDE.md §22 Fuzz Tests.
 
 ### Architecture
 
-Fuzz tests reuse the probe service binary (`services/probe`) with new probe modes 30–35. The harness (`osdev/src/validator.rs`) boots QEMU fresh for each test, watches for the PASS string, and fails immediately on `KERNEL PANIC`. The same `osdev test fuzz` command runs all Phase 1 tests sequentially.
+Fuzz tests reuse the probe service binary (`services/probe`) with new probe modes 30-35. The harness (`osdev/src/validator.rs`) boots QEMU fresh for each test, watches for the PASS string, and fails immediately on `KERNEL PANIC`. The same `osdev test fuzz` command runs all Phase 1 tests sequentially.
 
 ### New probe modes
 
@@ -32,7 +32,7 @@ Fuzz tests reuse the probe service binary (`services/probe`) with new probe mode
 |------|------|---------|
 | 30 | F1 | Random args (a0/a1/a2) for each known non-abort syscall number |
 | 31 | F2 | Random u64 values as syscall numbers; all must return -1 (UnknownSyscall) |
-| 32 | F5 | Random-content IPC message bodies; sizes 0–4096 bytes |
+| 32 | F5 | Random-content IPC message bodies; sizes 0-4096 bytes |
 | 33 | F6 | SendWithCap with random endpoint and grant cap slot indices |
 | 34 | F7 | try_send via stale cap after kill/respawn cycles |
 | 35 | F8 | AllocMem with edge-case sizes: 0, u64::MAX, overflow values |
@@ -77,7 +77,7 @@ Fuzz tests reuse the probe service binary (`services/probe`) with new probe mode
 
 **Surface:** The dispatch table's catch-all `_ => -1` arm.
 
-**Generator:** 50,000 random u64 syscall numbers. Any value in 1–15 (valid) is remapped by adding 100 (ensuring every call hits the unknown path). All calls use zero arguments.
+**Generator:** 50,000 random u64 syscall numbers. Any value in 1-15 (valid) is remapped by adding 100 (ensuring every call hits the unknown path). All calls use zero arguments.
 
 **Expected:** every call returns -1 (UnknownSyscall). If any returns a non-(-1) value, `fuzz: F2 FAIL` is logged (wrong dispatch, not a panic - still caught). Any `KERNEL PANIC` is the primary failure mode.
 
@@ -88,7 +88,7 @@ Fuzz tests reuse the probe service binary (`services/probe`) with new probe mode
 
 **Surface:** `build_message` → kernel copy path in `handle_send` / `handle_try_send`.
 
-**Generator:** 1,000 `try_send` calls to `fuzz-f5-recv` with random byte content, random sizes 0–4096 bytes. After the queue fills (depth 16), remaining calls return `QueueFull` - also acceptable.
+**Generator:** 1,000 `try_send` calls to `fuzz-f5-recv` with random byte content, random sizes 0-4096 bytes. After the queue fills (depth 16), remaining calls return `QueueFull` - also acceptable.
 
 **Pass:** `fuzz: F5 pass (1000/1000)` seen on serial.
 **Timeout:** 60 s.
@@ -168,7 +168,7 @@ The margin is tight on task slots. If further probes are added for later milesto
 
 ## Phase 3: Brutal Fuzz Tests (Milestone 17)
 
-BF1–BF8 are 4–5× escalated-iteration variants of F1–F8. All must pass with no panic and no FAIL marker.
+BF1-BF8 are 4-5× escalated-iteration variants of F1-F8. All must pass with no panic and no FAIL marker.
 
 ### New probe modes (Milestone 17)
 
@@ -226,7 +226,7 @@ Builds once, then runs all 8 F-tests. F1/F2/F5/F6/F7/F8 boot QEMU with the stand
 osdev test fuzz-brutal
 ```
 
-Runs BF1–BF8. BF1/BF2/BF5–BF8 boot QEMU with the standard image. BF3 rebuilds the kernel with `test-bad-elf-brutal` and boots a separate image. BF4 runs inline. Logs are written to `build/tests/10_FUZZ_BRUTAL/<id>-<name>.log`.
+Runs BF1-BF8. BF1/BF2/BF5-BF8 boot QEMU with the standard image. BF3 rebuilds the kernel with `test-bad-elf-brutal` and boots a separate image. BF4 runs inline. Logs are written to `build/tests/10_FUZZ_BRUTAL/<id>-<name>.log`.
 
 ---
 

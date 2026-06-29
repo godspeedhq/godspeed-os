@@ -3,7 +3,7 @@
 ## Goal
 
 The kernel must not drift, leak resources, or corrupt shared state under sustained load. Any failure
-discovered by S1–S10 is a mandatory kernel fix; the fix must include a regression test added to the
+discovered by S1-S10 is a mandatory kernel fix; the fix must include a regression test added to the
 identity or property suite before any other work proceeds.
 
 ## Spec reference
@@ -18,7 +18,7 @@ CLAUDE.md §22 Stress Tests.
 |-------|-------|--------|
 | Phase 1 | S1, S2, S3, S4, S7, S10 | ✅ 6/6 implemented |
 | Phase 2 | S5, S6, S8, S9 | ✅ 4/4 implemented |
-| Phase 3 (Brutal - M18) | BS1–BS10 | ✅ 10/10 passing |
+| Phase 3 (Brutal - M18) | BS1-BS10 | ✅ 10/10 passing |
 
 ---
 
@@ -26,7 +26,7 @@ CLAUDE.md §22 Stress Tests.
 
 ### Architecture
 
-Stress tests reuse the probe service binary (`services/probe`) with new probe modes 40–46. The
+Stress tests reuse the probe service binary (`services/probe`) with new probe modes 40-46. The
 harness (`osdev/src/validator.rs`) boots QEMU fresh for each Phase 1 test, watches for the PASS
 string, and fails immediately on `KERNEL PANIC`. All Phase 1 tests run via `osdev test stress
 phase1` sequentially. Logs are written to `build/tests/4_STRESS/<id>-<name>.log`.
@@ -212,7 +212,7 @@ Sequence:
 5. `try_send` via C → `EndpointDead`.
 6. Log pass.
 
-The critical property is step 3–5: a single `kill_endpoint` must invalidate **all** slots pointing
+The critical property is step 3-5: a single `kill_endpoint` must invalidate **all** slots pointing
 at the same resource, not just the first one used. If any slot survives the generation bump and
 returns `Ok`, the cap system has a correctness violation.
 
@@ -332,8 +332,8 @@ this phase, providing 17 spare slots for future milestones.
 
 ### `services/probe/src/main.rs` ✅
 
-Added constants and match arms for modes 40–46, and `mode_stress_s1` through `mode_stress_s10`
-functions following the pattern of the fuzz modes (30–35).
+Added constants and match arms for modes 40-46, and `mode_stress_s1` through `mode_stress_s10`
+functions following the pattern of the fuzz modes (30-35).
 
 ### `kernel/src/task/mod.rs` ✅
 
@@ -391,11 +391,11 @@ their `Blocked` reason and are counted as skipped, not failed. Logs are written 
 
 ---
 
-## Phase 3 (Brutal): BS1–BS10 (Milestone 18)
+## Phase 3 (Brutal): BS1-BS10 (Milestone 18)
 
 ### Goal
 
-Escalated variants of S1–S10 at 4–5× iteration counts, running concurrently alongside all other
+Escalated variants of S1-S10 at 4-5× iteration counts, running concurrently alongside all other
 probe suites (identity, property, fuzz, stress, perf, adversarial, chaos - ~190 tasks total).
 Any failure is a mandatory kernel fix.
 
@@ -483,4 +483,4 @@ accurately detect real kernel crashes.
 
 ## Bugs found and fixed during Milestone 11
 
-*(None - all S1–S10 tests passed without kernel changes.)*
+*(None - all S1-S10 tests passed without kernel changes.)*

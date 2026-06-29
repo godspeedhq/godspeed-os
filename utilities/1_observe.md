@@ -121,7 +121,7 @@ endpoints: 14
 | CORE | `core` | pinned core (§9.1) |
 | STATE | `state` | Ready / Running / BlockedRecv / BlockedSend / Dead |
 | MEM | `mem_used` / `mem_limit` | shown in KiB |
-| Q | `queue_depth` | inbound IPC queue depth, 0–16 |
+| Q | `queue_depth` | inbound IPC queue depth, 0-16 |
 | RST | `generation` | endpoint generation = restart counter (§7.5, §14.2) |
 
 Only slots with `valid == true` are listed.
