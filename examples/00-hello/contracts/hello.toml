@@ -1,0 +1,14 @@
+name    = "hello"
+version = "0.1.0"
+
+[resources.memory]
+request = "32MiB"
+limit   = "64MiB"
+
+[capabilities]
+# The ONLY authority hello holds: write to the logger. Declaring nothing else is
+# the whole point - a service can do only what its contract grants (Commandment VII).
+log_write = true
+
+[placement]
+core = 0

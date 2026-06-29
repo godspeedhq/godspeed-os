@@ -1,0 +1,18 @@
+[package]
+name = "driver-skeleton"
+version = "0.1.0"
+edition = "2021"
+
+# NOTE: this crate is an illustrative TEMPLATE. It COMPILES and is a workspace
+# member, so `cargo build -p driver-skeleton` checks an adaptation - but it is not
+# runnable as-is: the kernel wires a driver's MMIO/DMA/IRQ per recognised driver at
+# spawn (granting a hardware capability is a kernel act, Commandment VII), so
+# `ctx.mmio()` returns None here and the service idles degraded. See examples/e1000
+# for a real, runnable driver. Read this folder top to bottom to learn the pattern.
+
+[[bin]]
+name = "driver-skeleton"
+path = "src/main.rs"
+
+[dependencies]
+godspeed-sdk = { path = "../../sdk/rust" }

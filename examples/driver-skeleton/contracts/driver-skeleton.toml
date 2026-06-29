@@ -1,0 +1,32 @@
+name    = "driver-skeleton"
+version = "0.1.0"
+
+# A userspace device driver. It declares EXACTLY the hardware it touches and
+# nothing more (Commandment VII: no ambient authority). The kernel validates
+# these fields at spawn and grants capabilities ONLY for the named MMIO range and
+# IRQ line (CLAUDE.md §12.3, §13.6); the driver can reach nothing else on the
+# machine. Declare only what your device actually needs.
+
+[resources.memory]
+request = "8MiB"
+limit   = "16MiB"
+
+[capabilities]
+# The device's MMIO register window, as "<base>+<len>". The kernel maps THIS range
+# (and only this range) into the driver's address space; reach it via ctx.mmio().
+hw_mmio      = ["0xfeb00000+0x1000"]
+
+# The device's IRQ line. The kernel routes this interrupt to the driver's interrupt
+# endpoint as an IPC message (§12.2); the driver recv()s it and re-arms with
+# ctx.irq_unmask(vector).
+hw_interrupt = [11]
+
+# A physically-contiguous DMA arena for the device's ring/buffer structures is
+# granted at spawn to recognised DMA drivers (reach it via ctx.dma_region()); see
+# the e1000 example for the kernel-side wiring that recognises a new driver.
+log_write    = true
+
+[placement]
+# Pin the driver to a core. The device's interrupt routes to whichever core the
+# driver runs on (§12.2); pinning keeps that deterministic.
+core = 1

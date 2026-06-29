@@ -3302,6 +3302,14 @@ fn spawn_service_with_config(
             pci::EHCI_MMIO_BASE.load(Relaxed)
         } else if name == "block-driver" && pci::AHCI_FOUND.load(Relaxed) {
             pci::AHCI_ABAR.load(Relaxed) // AHCI HBA registers (docs/ahci.md)
+        } else if name == "e1000" && pci::NIC_FOUND.load(Relaxed)
+            && pci::NIC_VENDOR_DEVICE.load(Relaxed) == 0x100E_8086 {
+            // Intel 82540EM e1000 BAR0, mapped ONLY for the `e1000` example driver and
+            // ONLY when the discovered NIC is actually an Intel e1000. On any other NIC
+            // (e.g. the T630's chipset) this is false, so the driver gets no mapping and
+            // idles - it never touches foreign hardware (examples/e1000; Commandment VII:
+            // a hardware capability is granted explicitly, for exactly the device asked for).
+            pci::NIC_MMIO_BASE.load(Relaxed)
         } else {
             0
         };

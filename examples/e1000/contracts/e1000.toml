@@ -1,0 +1,17 @@
+name    = "e1000"
+version = "0.1.0"
+
+[resources.memory]
+request = "8MiB"
+limit   = "16MiB"
+
+[capabilities]
+# The kernel maps this driver's NIC BAR (MMIO) at spawn IF the discovered NIC is a
+# real Intel e1000 - granting a hardware capability is a kernel act (Commandment VII),
+# wired by name in kernel/src/task/mod.rs exactly like the xhci/ehci/block-driver
+# controllers. This read-only example needs no DMA arena and no hw_interrupt; a full
+# NIC driver would declare both.
+log_write = true
+
+[placement]
+core = 1

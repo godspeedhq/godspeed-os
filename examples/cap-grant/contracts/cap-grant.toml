@@ -1,0 +1,18 @@
+name    = "cap-grant"
+version = "0.1.0"
+
+[resources.memory]
+request = "32MiB"
+limit   = "64MiB"
+
+[capabilities]
+# Everything this service can do is listed here and nowhere else (Commandment VII:
+# no ambient authority). It owns an endpoint others may call - which is what lets
+# it hand out a SEND|GRANT cap to itself via `self_grant_handle()` - and a SEND cap
+# to the peer it grants that cap to ("receiver"). Nothing more.
+ipc_receive = ["cap-grant"]   # our own endpoint (the cap we give away points here)
+ipc_send    = ["receiver"]    # the peer we transfer the grantable cap to
+log_write   = true
+
+[placement]
+core = 0
