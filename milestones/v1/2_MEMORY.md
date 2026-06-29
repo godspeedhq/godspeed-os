@@ -1,12 +1,12 @@
-# Milestone 2 — Memory Management ✅
+# Milestone 2 - Memory Management ✅
 
 > Physical frame allocator and page tables working. Kernel can hand out and reclaim memory.
 
-**Status: COMPLETE — 2026-05-09**
+**Status: COMPLETE - 2026-05-09**
 
 ## Frame Allocator
 
-- ✅ Parse memory map from `BootInfo` — identify usable regions
+- ✅ Parse memory map from `BootInfo` - identify usable regions
 - ✅ `frame::alloc()` returns a free 4 KiB `Frame`
 - ✅ `frame::free(frame)` returns a frame to the pool
 - ✅ Kernel image and boot data excluded from the free pool
@@ -41,7 +41,7 @@ kernel: all cores ready
 
 - limine-rs 0.6.3 uses `entry.type_: u64` with `limine::memmap::MEMMAP_*` constants (not an enum),
   and `Request::response()` not `get_response()`. HHDM offset is `resp.offset` (public field).
-- Bitmap is BSS-zero-init (all frames = used) so usable regions must be explicitly freed during init —
+- Bitmap is BSS-zero-init (all frames = used) so usable regions must be explicitly freed during init -
   this is the correct conservative default.
 - Intermediate page table frames are `mem::forget()`-ed inside `walk_or_alloc`; they are owned by
   `PageTable` and will be freed during table teardown (Milestone 5).

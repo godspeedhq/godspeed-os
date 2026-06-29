@@ -13,14 +13,14 @@
 The list is in priority order for a solo developer. Each item compounds with the previous one. Don't skip ahead.
 
 1. [Code coverage](#1-code-coverage) ✅
-2. [Real hardware boot](#2-real-hardware-boot) — *deferred pending hardware*
+2. [Real hardware boot](#2-real-hardware-boot) - *deferred pending hardware*
 3. [Unsafe audit](#3-unsafe-audit) ✅
 4. [Static analysis](#4-static-analysis) ✅
 5. [Mutation testing](#5-mutation-testing) ✅
 6. [Subsystem-level property tests](#6-subsystem-level-property-tests) ✅
-7. [Long-running soak](#7-long-running-soak) — *deferred pending hardware*
-8. [External documentation pass](#8-external-documentation-pass) — *deferred*
-9. [Formal subset analysis](#9-formal-subset-analysis) — *deferred*
+7. [Long-running soak](#7-long-running-soak) - *deferred pending hardware*
+8. [External documentation pass](#8-external-documentation-pass) - *deferred*
+9. [Formal subset analysis](#9-formal-subset-analysis) - *deferred*
 
 ---
 
@@ -182,7 +182,7 @@ Extract pure-logic subsystems as unit-testable units if they aren't already. Run
 
 **Done when.** Each tool runs in CI on every commit. Failures block merge.
 
-**Time.** 1 day to set up all four. Ongoing maintenance is trivial — fix issues as they arise.
+**Time.** 1 day to set up all four. Ongoing maintenance is trivial - fix issues as they arise.
 
 **Expected findings.** clippy finds dozens of issues. miri will likely find at least one UB issue in code that "passed all tests" because the compiler happened to handle it benignly. Those are real bugs.
 
@@ -190,7 +190,7 @@ Extract pure-logic subsystems as unit-testable units if they aren't already. Run
 
 ## 5. Mutation Testing
 
-**Intent.** Verify the tests actually test what they claim to. Mutation testing introduces tiny changes to the source — flipping `<` to `<=`, replacing `&&` with `||`, removing a line — and reports which mutations the test suite *fails to catch*. Each surviving mutation is a hole.
+**Intent.** Verify the tests actually test what they claim to. Mutation testing introduces tiny changes to the source - flipping `<` to `<=`, replacing `&&` with `||`, removing a line - and reports which mutations the test suite *fails to catch*. Each surviving mutation is a hole.
 
 **Tool.** `cargo-mutants`.
 
@@ -220,7 +220,7 @@ Extract pure-logic subsystems as unit-testable units if they aren't already. Run
 
 **Intent.** Augment the existing property tests with algebraic assertions about specific subsystems, run in unit-test form rather than through the full kernel.
 
-**Why.** The existing P1–P10 tests are *behavioral*: they spawn services and check outcomes. Algebraic property tests target a subsystem in isolation, run thousands of times faster, and exercise far more states. The bugs they find — order-of-operations issues, boundary conditions, state-explosion paths — are different from what behavioral tests catch.
+**Why.** The existing P1–P10 tests are *behavioral*: they spawn services and check outcomes. Algebraic property tests target a subsystem in isolation, run thousands of times faster, and exercise far more states. The bugs they find - order-of-operations issues, boundary conditions, state-explosion paths - are different from what behavioral tests catch.
 
 ### 6.1 Bitmap allocator
 
@@ -344,7 +344,7 @@ Properties to assert with `proptest` (single-threaded model first, then a concur
 
 ## What This Roadmap Is Not
 
-This document is not a path to DO-178C Level A certification, nor anywhere close. That requires formal requirements decomposition, tool qualification, independent verification by people other than the author, worst-case execution time bounds, and real-hardware testing on the actual target avionics platform — all of which are out of scope for a solo project.
+This document is not a path to DO-178C Level A certification, nor anywhere close. That requires formal requirements decomposition, tool qualification, independent verification by people other than the author, worst-case execution time bounds, and real-hardware testing on the actual target avionics platform - all of which are out of scope for a solo project.
 
 This document *is* a path to "top 5% of OS hobby projects for verification rigor" without any of the cost overhead of formal certification. Most of the activities take days, not months. Most of the findings will be small. The compounding effect is large.
 

@@ -1,4 +1,4 @@
-# Post-v1 Item 2 — Unsafe Audit CI Check
+# Post-v1 Item 2 - Unsafe Audit CI Check
 
 **Status:** ✅ Complete  
 **Command:** `python3 scripts/unsafe_check.py`  
@@ -34,9 +34,9 @@ not in the audit fail CI unconditionally.
 | Non-comment lines with `unsafe` keyword | 319 | 267 |
 | Total files with `unsafe` | 26 | 23 |
 | Lines in permitted layers (§18.1) | 206 | 215 |
-| — Files in permitted layers | 16 | 17 |
+| - Files in permitted layers | 16 | 17 |
 | Lines outside permitted layers (grandfathered) | 113 | 52 |
-| — Files outside permitted layers | 10 | 6 |
+| - Files outside permitted layers | 10 | 6 |
 
 See [Grandfathered reduction](#grandfathered-reduction) below for the full
 account of what changed and why.
@@ -73,7 +73,7 @@ account of what changed and why.
 | loader.rs | 4 | Segment copy (`write_bytes` + `copy_nonoverlapping`) |
 | syscall/dispatch.rs | 2 | `syscall_handler` entry point + `map_in_active_tables` |
 | main.rs | 2 | BSP stack switch + boot_info deref |
-| interrupt/route.rs | 1 | `pub unsafe fn deliver` — IDT calling convention |
+| interrupt/route.rs | 1 | `pub unsafe fn deliver` - IDT calling convention |
 
 Grandfathered counts are frozen. They may decrease (cleanup welcome) but
 cannot increase. Any increase to a grandfathered file also requires a policy
@@ -88,8 +88,8 @@ amendment to CLAUDE.md §18 before CI will accept it.
 | **Total distinct unsafe constructs** | **291** |
 | Keyword lines counted by CI | 319 |
 | Files with unsafe | 26 |
-| — in permitted layers | 16 |
-| — grandfathered (outside policy) | 10 |
+| - in permitted layers | 16 |
+| - grandfathered (outside policy) | 10 |
 
 ---
 
@@ -110,12 +110,12 @@ Files that were already complete: `capability/table.rs`, `smp/core.rs`,
 
 Commit `53a7e79` reduced grandfathered unsafe from 113 to 70 lines (−38%)
 across three groups of related changes. The unsafe itself was not removed from
-the kernel — it was moved to where the policy says it belongs: the permitted
+the kernel - it was moved to where the policy says it belongs: the permitted
 arch/smp layers.
 
-### Group 1 — `static mut` + manual spinlock → `SpinLock<T>`
+### Group 1 - `static mut` + manual spinlock → `SpinLock<T>`
 
-**New file:** `smp/spinlock.rs` — `SpinLock<T>` / `SpinLockGuard<T>` RAII
+**New file:** `smp/spinlock.rs` - `SpinLock<T>` / `SpinLockGuard<T>` RAII
 type. The `unsafe impl Send/Sync` and the two `UnsafeCell::get()` dereferences
 inside `Deref` / `DerefMut` live here in the permitted `smp/` layer. All call
 sites throughout the kernel are unsafe-free.
@@ -133,7 +133,7 @@ Five files converted:
 Net: −18 grandfathered lines. Five files removed from audit; one file reduced.
 Permitted layer gains +4 for `smp/spinlock.rs`.
 
-### Group 2 — Inline `asm!` in wrong layer → arch safe wrappers
+### Group 2 - Inline `asm!` in wrong layer → arch safe wrappers
 
 `arch/x86_64/interrupts.rs` gained three new safe functions:
 
@@ -150,7 +150,7 @@ wrappers: 38 → 36 lines.
 
 Net: −2 grandfathered lines. Permitted layer gains +3 for the new wrappers.
 
-### Group 3 — User-pointer unsafe in wrong layer → arch safe wrappers
+### Group 3 - User-pointer unsafe in wrong layer → arch safe wrappers
 
 `arch/x86_64/syscall_entry.rs` gained four new safe functions:
 
@@ -166,15 +166,15 @@ pub fn read_cycle_counter() -> u64
 - 13 `unsafe fn handle_*` → `fn` (no unsafe needed after wrappers absorb it)
 - All `from_raw_parts` / `copy_nonoverlapping` / `_rdtsc` calls replaced
 - Only 2 lines remain: `pub unsafe extern "C" fn syscall_handler` (ring-3
-  boundary — must stay unsafe) and one `unsafe { map_in_active_tables(...) }`
+  boundary - must stay unsafe) and one `unsafe { map_in_active_tables(...) }`
   inside `handle_alloc_mem` (arch call, cannot be wrapped away)
 
 Net: −24 grandfathered lines. Permitted layer gains +3 for the new wrappers.
 
-### Group 4 — ELF header/program-header reads → `read_ehdr` / `read_phdr` helpers
+### Group 4 - ELF header/program-header reads → `read_ehdr` / `read_phdr` helpers
 
 `loader.rs` previously had 14 individual `addr_of!((*ptr).field).read_unaligned()`
-calls scattered through `load()` — one per accessed field.  These were
+calls scattered through `load()` - one per accessed field.  These were
 consolidated into two private helpers:
 
 ```rust
@@ -184,7 +184,7 @@ fn read_phdr(bytes: &[u8], off: usize) -> Elf64Phdr { unsafe { (bytes.as_ptr().a
 
 Each helper copies the entire packed struct into a local value in one
 `read_unaligned` call.  All field accesses in `load()` then go through safe
-local copies — zero unsafe at the call site.  The two segment-copy blocks
+local copies - zero unsafe at the call site.  The two segment-copy blocks
 (`write_bytes` for BSS zeroing, `copy_nonoverlapping` for file data) remain
 because they are inherently unsafe arch calls with bounds that cannot be
 checked at compile time.
@@ -196,7 +196,7 @@ is now unsafe-free.
 Net: −12 grandfathered lines (loader 16 → 4, main 3 → 2) and −1 permitted line
 (mod.rs 22 → 21 after `unsafe fn com2_init` became `fn com2_init`).
 
-### Group 5 — kstack magic-word tracking → `SpinLock<[bool; TASK_KSTACK_MAX]>`
+### Group 5 - kstack magic-word tracking → `SpinLock<[bool; TASK_KSTACK_MAX]>`
 
 `task/mod.rs` previously tracked liveness by writing a magic constant
 (`0xCA11_CA11`) to the first 4 bytes of each 64 KiB stack slot via
@@ -223,10 +223,10 @@ Net: −5 grandfathered lines (task/mod.rs 12 → 7).
 |---|---|---|
 | `task/scheduler.rs` | 36 | Per-core `static mut` arrays indexed by slot/core_id; large refactor needed to replace with `SpinLock` or per-core ownership type |
 | `task/mod.rs` | 7 | 2 kstack pointer-arithmetic lines; 5 spawn-path arch calls (`write_bytes`, `task_cap_init_empty`, ctx-page cast, `TaskContext::new_user`, `commit_task`) |
-| `loader.rs` | 4 | `write_bytes` (BSS zeroing) + `copy_nonoverlapping` (segment copy) — inherently unsafe HHDM pointer arithmetic |
+| `loader.rs` | 4 | `write_bytes` (BSS zeroing) + `copy_nonoverlapping` (segment copy) - inherently unsafe HHDM pointer arithmetic |
 | `syscall/dispatch.rs` | 2 | `syscall_handler` (ring-3 entry point, must be `unsafe extern "C"`) + one `map_in_active_tables` call |
 | `main.rs` | 2 | BSP stack switch ASM (unavoidable), `boot_info_ptr` deref (Limine contract) |
-| `interrupt/route.rs` | 1 | `pub unsafe fn deliver` — called from IDT with IF=0; the `unsafe` communicates the calling-convention constraint |
+| `interrupt/route.rs` | 1 | `pub unsafe fn deliver` - called from IDT with IF=0; the `unsafe` communicates the calling-convention constraint |
 
 ---
 
@@ -252,7 +252,7 @@ When adding an `unsafe` block anywhere in the kernel:
 1. Add `// SAFETY: <argument>` on the line immediately above it.
 2. Increase the count for that file in `docs/unsafe-audit.md`.
 3. Add a SAFETY argument entry under that file in the Entries section.
-4. All three changes must land in the same commit — CI will catch a mismatch.
+4. All three changes must land in the same commit - CI will catch a mismatch.
 
 For out-of-policy files (grandfathered list above): adding `unsafe` requires
 both steps 1–4 AND a CLAUDE.md §18 amendment with a written rationale.
@@ -261,16 +261,16 @@ both steps 1–4 AND a CLAUDE.md §18 amendment with a written rationale.
 
 ## Implementation checklist
 
-- ✅ `scripts/unsafe_check.py` — count-based audit script
-- ✅ `docs/unsafe-audit.md` — full inventory (23 files, 267 lines), SAFETY
+- ✅ `scripts/unsafe_check.py` - count-based audit script
+- ✅ `docs/unsafe-audit.md` - full inventory (23 files, 267 lines), SAFETY
   arguments for every file, grandfathered list with rationale
-- ✅ `.github/workflows/build.yml` — `Unsafe audit check` step added before
+- ✅ `.github/workflows/build.yml` - `Unsafe audit check` step added before
   unit tests; runs on every push and PR
-- ✅ `build/tests/post_v1/2_UNSAFE_AUDIT/` — output directory
-- ✅ `smp/spinlock.rs` — `SpinLock<T>` eliminates `static mut` in 5 files
-- ✅ `arch/x86_64/interrupts.rs` — `disable_interrupts()` / `wait_for_interrupt()` wrappers
-- ✅ `arch/x86_64/syscall_entry.rs` — `read_user_bytes()` / `write_user_bytes()` / `read_cycle_counter()` wrappers
+- ✅ `build/tests/post_v1/2_UNSAFE_AUDIT/` - output directory
+- ✅ `smp/spinlock.rs` - `SpinLock<T>` eliminates `static mut` in 5 files
+- ✅ `arch/x86_64/interrupts.rs` - `disable_interrupts()` / `wait_for_interrupt()` wrappers
+- ✅ `arch/x86_64/syscall_entry.rs` - `read_user_bytes()` / `write_user_bytes()` / `read_cycle_counter()` wrappers
 - ✅ Grandfathered reduced: 113 → 52 lines, 10 → 6 files
-- ✅ `loader.rs` — `read_ehdr`/`read_phdr` helpers consolidate 14 scattered `read_unaligned` calls into 2 (16 → 4 lines)
-- ✅ `main.rs` — `com2_init` made safe; one unsafe call site removed (3 → 2 lines)
-- ✅ `task/mod.rs` — kstack magic-word volatile tracking replaced by `SpinLock<[bool; TASK_KSTACK_MAX]>` (12 → 7 lines)
+- ✅ `loader.rs` - `read_ehdr`/`read_phdr` helpers consolidate 14 scattered `read_unaligned` calls into 2 (16 → 4 lines)
+- ✅ `main.rs` - `com2_init` made safe; one unsafe call site removed (3 → 2 lines)
+- ✅ `task/mod.rs` - kstack magic-word volatile tracking replaced by `SpinLock<[bool; TASK_KSTACK_MAX]>` (12 → 7 lines)

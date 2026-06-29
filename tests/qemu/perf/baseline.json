@@ -34,6 +34,6 @@
       "mean": 1810549
     }
   },
-  "note": "QEMU TCG RDTSC cycle counts — not comparable across hosts or QEMU versions; useful for detecting large regressions within one environment",
+  "note": "QEMU TCG RDTSC cycle counts - not comparable across hosts or QEMU versions; useful for detecting large regressions within one environment",
   "regression_threshold_pct": 10
 }

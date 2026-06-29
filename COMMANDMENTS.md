@@ -4,7 +4,7 @@ These Commandments define the architectural boundaries of Godspeed. They are **n
 guidelines or stylistic preferences. They exist to preserve a system that remains **simple,
 recoverable, and understandable** as it grows.
 
-They are the human-readable distillation of the constitution in [`CLAUDE.md`](./CLAUDE.md) — each is
+They are the human-readable distillation of the constitution in [`CLAUDE.md`](./CLAUDE.md) - each is
 grounded in the invariants and sections it enforces. Where a Commandment and the code disagree, the
 code is wrong (`CLAUDE.md` §1). Where a Commandment and the constitution disagree, the constitution
 is the law and this document is amended to match.
@@ -16,7 +16,7 @@ is the law and this document is amended to match.
 ### I. Thou shalt not expand the responsibilities of the kernel. It is complete. Use a service.
 
 The kernel's responsibilities are complete: memory isolation, scheduling, IPC, capability
-enforcement, interrupt routing, and cross-core routing — and **nothing else**. New hardware support,
+enforcement, interrupt routing, and cross-core routing - and **nothing else**. New hardware support,
 new CPU architectures, and bug fixes are welcome. New *responsibilities* are not.
 
 Before proposing a kernel change, ask: **"Why isn't this a service?"** If the answer is "because it
@@ -34,27 +34,27 @@ pressure, restart storms, spawn storms, queue floods, and whatever new forms Cha
 
 If Chaos finds a bug, **the bug already existed.** Treat Chaos as your teacher, not your enemy.
 
-> *Grounded in:* §22 (the identity, stress, adversarial, and chaos suites — and `chaos
+> *Grounded in:* §22 (the identity, stress, adversarial, and chaos suites - and `chaos
 > max-carnage`), §2.3 (execution over theory), §26.7 (loud failure over hidden recovery).
 
 ---
 
 ### III. Thou shalt not duplicate truth. Store irreducible facts. Derive the rest.
 
-There must be exactly one **irreducible** source of truth — the minimal state from which everything
+There must be exactly one **irreducible** source of truth - the minimal state from which everything
 else can be reconstructed, and which cannot itself be reduced to anything smaller. Everything else is
 a **derived view** of it.
 
 This is not a ban on caches, indexes, or precomputed counts. A derived view may be stored, and may
 even drift, **provided** it is **reconstructible** from the source, **reconciled** when it drifts (a
-repair path rebuilds it from the source), and **subordinate** — on any disagreement the source wins;
+repair path rebuilds it from the source), and **subordinate** - on any disagreement the source wins;
 the view is never authoritative. A filesystem's free **bitmap** is a stored index of its file tree
 (`fsck` rebuilds it from the tree); the free **count** is a stored index of the bitmap. Neither is a
-second truth — both reduce to the tree.
+second truth - both reduce to the tree.
 
 What is forbidden is a **second irreducible truth**: two stored facts that can diverge with no way to
 decide which is right, or trusting a derived view *as if* it were the source. The test is not "is it
-stored?" nor "can it drift?" — it is **"does it reduce to one source, and does that source win?"**
+stored?" nor "can it drift?" - it is **"does it reduce to one source, and does that source win?"**
 
 > *Grounded in:* §3.8 (state explicit and owned), §3.9 / Invariant 9 (no unowned global mutable
 > state), §26.4 (caching must be visible and reconcilable, never hidden).
@@ -65,7 +65,7 @@ stored?" nor "can it drift?" — it is **"does it reduce to one source, and does
 
 Services communicate through explicit contracts. Do not bypass a contract. Do not invent hidden
 communication paths. If a service cannot express its needs through its declared contract, **redesign
-the contract — not the architecture.**
+the contract - not the architecture.**
 
 > *Grounded in:* §13 (service contracts), §3.7 / Invariant 7 (contracts are enforced, not
 > interpreted), §13.6 (runtime enforcement from the contract at spawn).
@@ -75,8 +75,8 @@ the contract — not the architecture.**
 ### V. Thou shalt not assume thy service is special. Only the kernel is special.
 
 Every service must be prepared to fail. Every service must be prepared to restart. No service is
-exempt. If the Supervisor itself must survive its own death — and it must, for the kernel respawns it
-— so must yours.
+exempt. If the Supervisor itself must survive its own death - and it must, for the kernel respawns it
+- so must yours.
 
 The only unkillable component is the kernel. Everything above it is identity, not location, and
 identity survives restart.
@@ -92,7 +92,7 @@ identity survives restart.
 
 Services communicate through IPC. Shared mutable state creates invisible coupling, destroys
 isolation, complicates recovery, and makes failure unpredictable. If multiple services require the
-same information, expose it **through a service — not through shared memory.**
+same information, expose it **through a service - not through shared memory.**
 
 > *Grounded in:* Invariant 2 (no shared mutable memory by default), Invariant 9 (no unowned global
 > mutable state), §2.5 (zero-copy IPC is permanently rejected for this reason).
@@ -104,7 +104,7 @@ same information, expose it **through a service — not through shared memory.**
 Authority must always be explicit. A service may perform only the actions its capabilities grant.
 Hidden privilege eventually becomes both a security vulnerability and an architectural dependency.
 
-There is no authority by identity, ancestry, or inheritance — only by capability.
+There is no authority by identity, ancestry, or inheritance - only by capability.
 
 > *Grounded in:* Invariant 1 (no ambient authority), Invariant 3 (all authority is explicit), §7 (the
 > capability system), §26.9 (authority must remain visible).
@@ -124,7 +124,7 @@ come from observable truth:
 
 Time may conserve CPU. It must **never** determine correctness.
 
-> *Grounded in:* §8.6 (a successful `send` means queued, not processed — acknowledgement is explicit),
+> *Grounded in:* §8.6 (a successful `send` means queued, not processed - acknowledgement is explicit),
 > §7.5 (the generation check, not a delay, settles a restart race), §9.3 (yield is advisory), §22.4
 > (a test waits for observable output, never a fixed sleep).
 

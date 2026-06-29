@@ -1,10 +1,10 @@
-# Milestone 9 — Property Test Suite ✅
+# Milestone 9 - Property Test Suite ✅
 
 > Property tests assert *universal* claims over randomised inputs.
 > Identity tests prove the system *can* satisfy each invariant; property tests
 > prove it *always* does.
 > `osdev test property` reports each property as PASS or FAIL.
-> No FAIL results. A FAIL means a real logic bug — fix it before any other
+> No FAIL results. A FAIL means a real logic bug - fix it before any other
 > work proceeds.
 
 ---
@@ -45,7 +45,7 @@ single outcome line per property on completion:
 
 ```
 prop: P<N> pass (<iters>/<iters>)
-prop: P<N> FAIL — iter <k>: <reason>
+prop: P<N> FAIL - iter <k>: <reason>
 ```
 
 The harness (`WatchSerial`) watches for the pass line and fails immediately
@@ -57,7 +57,7 @@ New sub-command added to `osdev`. Follows the same flow as `osdev test
 identity`:
 
 1. Kill existing QEMU.
-2. Build (reuses the normal kernel — no feature flags needed).
+2. Build (reuses the normal kernel - no feature flags needed).
 3. Create `build/os.img` and install bootloader.
 4. Run one QEMU per property, writing serial to
    `build/tests/2_PROPERTY/P<N>-<name>.log`.
@@ -68,12 +68,12 @@ tests; 30 s was tight).
 
 ---
 
-## Phase 1 — Syscall-observable properties (no new kernel code)
+## Phase 1 - Syscall-observable properties (no new kernel code)
 
 Properties P1, P9, and P10 are fully testable with the existing syscall
 surface and probe infrastructure. No new kernel code is required.
 
-### P1 — Random cap bytes never accepted as a valid cap
+### P1 - Random cap bytes never accepted as a valid cap
 
 **Pins:** §7.3 (unforgeable), §3.1 (no ambient authority).
 
@@ -88,14 +88,14 @@ so most in-range values are also unheld.
 **Implementation:**
 - Probe iterates 10,000 times.
 - Each iteration: draw random `slot: u64`, issue `TrySend(slot, msg)`.
-- Assert response ∈ {`CapNotHeld`, `CapNotHeld` (out of range)} — never `Ok`.
+- Assert response ∈ {`CapNotHeld`, `CapNotHeld` (out of range)} - never `Ok`.
 - Known-held slots (recv, log_write, spawn) are skipped to avoid confounding.
 
 **Pass line:** `prop: P1 pass (10000/10000)`
 
 ---
 
-### P9 — Generation bump invalidates ALL holders, not just some
+### P9 - Generation bump invalidates ALL holders, not just some
 
 **Pins:** §7.5 (generation check), §8.6 (endpoint death).
 
@@ -116,7 +116,7 @@ that holds a SEND cap to that endpoint receives `EndpointDead` on its next
 
 ---
 
-### P10 — Every `send` returns exactly one defined outcome
+### P10 - Every `send` returns exactly one defined outcome
 
 **Pins:** §8.6 (failure semantics), §8.2 (IPC model).
 
@@ -145,13 +145,13 @@ undefined value, and never returns more than one outcome.
 
 ---
 
-## Phase 2 — Properties requiring minor new kernel capability
+## Phase 2 - Properties requiring minor new kernel capability
 
 Properties P2, P3, P6, and P8 need either a small new introspection surface
 (generation query) or careful multi-service orchestration (rights transfer,
 queue fill/drain).
 
-### P2 — Generation is strictly monotonic across a service's lifetime
+### P2 - Generation is strictly monotonic across a service's lifetime
 
 **Pins:** §7.5 (generation semantics), §14.2 (restart bumps generation).
 
@@ -160,7 +160,7 @@ of its endpoint is strictly greater than all previous generations for that
 name. Generation never goes backwards and never repeats.
 
 **New kernel surface:** A `QueryGeneration(name)` syscall (or piggybacked onto
-the existing `AcquireSendCap` return value — the slot already encodes the
+the existing `AcquireSendCap` return value - the slot already encodes the
 generation implicitly via the cap table entry). The probe reads the generation
 from the cap it holds and verifies it increases each cycle.
 
@@ -176,7 +176,7 @@ from the cap it holds and verifies it increases each cycle.
 
 ---
 
-### P3 — Cap rights never widen during transfer
+### P3 - Cap rights never widen during transfer
 
 **Pins:** §7.3 (non-escalating), §7.6 (transfer rule).
 
@@ -198,7 +198,7 @@ REVOKE}; 5,000 iterations.
 
 ---
 
-### P6 — Queue invariants hold at all depths
+### P6 - Queue invariants hold at all depths
 
 **Pins:** §8.5 (queue depth = 16), §8.6 (defined failure on full queue).
 
@@ -219,7 +219,7 @@ immediately, (c) every message successfully sent is exactly once receivable.
 
 ---
 
-### P8 — After restart, name resolves to same name and higher generation
+### P8 - After restart, name resolves to same name and higher generation
 
 **Pins:** §14.2 (restart flow), §8.3 (routing table), §11 (identity stable).
 
@@ -250,13 +250,13 @@ restart, and (c) routes to a live task.
 
 ---
 
-## Phase 3 — Introspection-required properties
+## Phase 3 - Introspection-required properties
 
 Properties P4, P5, and P7 cannot be verified from user space with the current
 syscall surface. Each requires a new introspection syscall or kernel-side
 assertion that surfaces internal state to the test harness.
 
-### New: `InspectKernel(query_id, arg)` — syscall 13
+### New: `InspectKernel(query_id, arg)` - syscall 13
 
 A single multiplexed read-only introspection syscall. Only available when the
 kernel is built with `--features kernel/test-introspect`. Returns structured
@@ -270,7 +270,7 @@ data about kernel-internal state to the calling service. Never modifies state.
 
 ---
 
-### P4 — ∑ alloc_bytes ≡ pages mapped, after any sequence of alloc
+### P4 - ∑ alloc_bytes ≡ pages mapped, after any sequence of alloc
 
 **Pins:** §10.3 (enforcement), §10.4 (AllocDenied is recoverable).
 
@@ -296,7 +296,7 @@ calling task.
 
 ---
 
-### P5 — Every live endpoint has exactly one owning task
+### P5 - Every live endpoint has exactly one owning task
 
 **Pins:** §8.3 (routing table), §14.1 (spawn registers endpoint).
 
@@ -319,7 +319,7 @@ endpoints, the invariant holds.
 
 ---
 
-### P7 — After unmap + TLB shootdown, page unreadable from every core
+### P7 - After unmap + TLB shootdown, page unreadable from every core
 
 **Pins:** §10.5 (TLB coherence), §10.4 (protection violation kills service).
 
@@ -333,15 +333,15 @@ UB and potentially corrupt the frame allocator). Instead the test verifies the
 *kernel's assertion path*: after kill + shootdown, the frame is returned to the
 allocator and reallocated to a new task. The new task writes a known sentinel.
 If the old virtual address (in a different address space) would have returned
-stale data, the sentinel would not be visible there — but the kernel's page
+stale data, the sentinel would not be visible there - but the kernel's page
 fault handler would fire. The test observes that the page fault handler fires
 correctly on the stale address and that no stale data bleeds through.
 
 **New kernel surface:** `InspectKernel(2, name_ptr, name_len)` returns the
-current generation of the named endpoint — used to confirm the killed service's
+current generation of the named endpoint - used to confirm the killed service's
 generation was bumped, which is the proxy for "shootdown happened".
 
-**Generator:** 50 iterations (TLB tests are slow — each needs a kill/respawn
+**Generator:** 50 iterations (TLB tests are slow - each needs a kill/respawn
 cycle with deliberate inter-core delay to expose races).
 
 **Implementation:**
@@ -349,7 +349,7 @@ cycle with deliberate inter-core delay to expose races).
 - Supervisor kills A (triggers shootdown).
 - Service B is spawned; allocator may reuse the frame.
 - B writes `0x0` to its allocation.
-- A's virtual address range no longer maps to anything — any access from any
+- A's virtual address range no longer maps to anything - any access from any
   surviving task should page-fault, not return stale data.
 - Harness asserts: B's write succeeded (`Ok`), A's generation bumped
   (`InspectKernel` confirms), no kernel panic (shootdown completed cleanly).
@@ -417,7 +417,7 @@ reaches identity.
 
 ---
 
-## Phase 4 — Brutal property tests (Milestone 16)
+## Phase 4 - Brutal property tests (Milestone 16)
 
 Brutal variants of all 10 property tests. Each BP test runs at a significantly
 higher iteration count than the corresponding P test, under full system load
@@ -450,7 +450,7 @@ an absolute live-endpoint threshold of 32. This was valid when the system had
 ~17 live endpoints at peak (written during Phase 3). With 100+ services
 spawned for Milestones 10–16, the system legitimately has > 32 live endpoints
 from concurrent probes. The fix: rely solely on spawn-success as the
-observable — if orphaned endpoints were accumulating, the 64-slot routing table
+observable - if orphaned endpoints were accumulating, the 64-slot routing table
 would fill up within ~34 cycles and spawn would return `Err`.
 
 **BP9 serial garbling (harness fix):** The BP9 pass message was occasionally
@@ -468,7 +468,7 @@ tight.
 
 Brutal property tests were validated at **smp=4** (same ceiling as brutal
 identity tests, Milestone 15). At smp=8 the boot hangs before
-"supervisor: ready" — the system with 140+ services cannot boot within the
+"supervisor: ready" - the system with 140+ services cannot boot within the
 60-second window on this hardware at smp=8. This is a hardware capacity
 ceiling, not a kernel correctness issue.
 

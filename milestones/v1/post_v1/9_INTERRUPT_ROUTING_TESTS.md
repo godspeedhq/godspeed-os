@@ -1,6 +1,6 @@
-# Post-v1 Item 9 — Interrupt Routing Tests
+# Post-v1 Item 9 - Interrupt Routing Tests
 
-**Status:** ✅ Complete (identity tests IR1A/IR1B — 2026-05-18)
+**Status:** ✅ Complete (identity tests IR1A/IR1B - 2026-05-18)
 
 ---
 
@@ -14,11 +14,11 @@ Verify the §12 interrupt routing path with executable tests. The implementation
 
 ## Spec reference
 
-**§12.2 Routing** — `deliver(irq)` must enqueue an interrupt-event message to
+**§12.2 Routing** - `deliver(irq)` must enqueue an interrupt-event message to
 the registered driver endpoint; discard silently when no driver is registered;
 EOI unconditionally.
 
-**§12.3 Driver Capabilities** — a driver service that declares `hw_interrupt =
+**§12.3 Driver Capabilities** - a driver service that declares `hw_interrupt =
 [N]` in its contract must receive interrupt events on its recv endpoint.
 
 ---
@@ -37,7 +37,7 @@ FIRE_IRQ <N>\n
 which:
 
 1. Disables interrupts (satisfying `deliver`'s IF=0 requirement).
-2. Calls `interrupt::route::deliver(N)` — enqueues the event, wakes the receiver,
+2. Calls `interrupt::route::deliver(N)` - enqueues the event, wakes the receiver,
    EOIs the APIC.
 3. Re-enables interrupts.
 
@@ -47,12 +47,12 @@ is touched.
 
 ---
 
-## Identity tests (IR1A / IR1B) — §12.2, §12.3
+## Identity tests (IR1A / IR1B) - §12.2, §12.3
 
 These are the two tests added in this milestone. They are part of the core
 `TESTS` array and run as part of `osdev test identity`.
 
-### IR1A — Positive: driver receives interrupt event
+### IR1A - Positive: driver receives interrupt event
 
 ```
 test irq_delivery_driver_receives:
@@ -70,7 +70,7 @@ test irq_delivery_driver_receives:
     assert kernel_did_not_panic()
 ```
 
-### IR1B — Negative: unregistered IRQ is discarded, no panic
+### IR1B - Negative: unregistered IRQ is discarded, no panic
 
 ```
 test irq_unregistered_discard_no_panic:
@@ -100,7 +100,7 @@ test irq_unregistered_discard_no_panic:
 
 ---
 
-## Gap — property / fuzz / stress / adversarial tests
+## Gap - property / fuzz / stress / adversarial tests
 
 The following test categories are NOT implemented in this milestone:
 

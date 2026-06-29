@@ -1,6 +1,6 @@
 # Utility: `clear`
 
-**Utility:** `clear` — clear the screen
+**Utility:** `clear` - clear the screen
 **Status:** Built. As-built reference.
 **Shape:** shell built-in (see `0_conventions.md` §2).
 
@@ -32,7 +32,7 @@ surfaces clear. The shell loop reprints the prompt afterward.
 - **No scrollback / alternate-screen restore.** The framebuffer console has no
   alternate-screen buffer; `clear` erases in place. (This is the same reason
   `observe` leaves its final frame on screen rather than restoring the prior
-  screen — `1_observe.md` §5.2.)
+  screen - `1_observe.md` §5.2.)
 
 ## 6. Conformance
 

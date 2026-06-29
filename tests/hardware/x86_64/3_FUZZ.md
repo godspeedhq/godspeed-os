@@ -10,14 +10,14 @@ Fuzz tests require rapid iteration (millions of inputs per surface). The flash-b
 
 | Fuzz surface | HW approach | Notes |
 |---|---|---|
-| F1 — Syscall args (1M iters) | Flash with high-count probe, observe for panic | Long runtime; one flash covers it |
-| F2 — Syscall numbers | Same | |
-| F3 — ELF binaries | Bake specific bit-flip mutations into image | One mutation per flash |
-| F4 — Service contracts | Bake malformed contracts into image at build | Build-time; verifiable at boot |
-| F5 — IPC message bodies | Flash with fuzz-IPC probe | |
-| F6 — Embedded caps | Same | |
-| F7 — Cap generation field | Same | |
-| F8 — Memory request values | Same | |
+| F1 - Syscall args (1M iters) | Flash with high-count probe, observe for panic | Long runtime; one flash covers it |
+| F2 - Syscall numbers | Same | |
+| F3 - ELF binaries | Bake specific bit-flip mutations into image | One mutation per flash |
+| F4 - Service contracts | Bake malformed contracts into image at build | Build-time; verifiable at boot |
+| F5 - IPC message bodies | Flash with fuzz-IPC probe | |
+| F6 - Embedded caps | Same | |
+| F7 - Cap generation field | Same | |
+| F8 - Memory request values | Same | |
 
 **Primary vehicle:** QEMU (fast iteration). Hardware is a regression-confirmation platform.
 
@@ -31,4 +31,4 @@ All pending. Hardware fuzz runs not yet attempted.
 
 | Date | Surface | Inputs | Panics | Notes |
 |------|---------|--------|--------|-------|
-| — | — | — | — | No hardware fuzz runs yet |
+| - | - | - | - | No hardware fuzz runs yet |

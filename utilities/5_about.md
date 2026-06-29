@@ -1,6 +1,6 @@
 # Utility: `about`
 
-**Utility:** `about` — system identity and credits
+**Utility:** `about` - system identity and credits
 **Status:** Built. As-built reference.
 **Shape:** shell built-in (see `0_conventions.md` §2).
 
@@ -8,7 +8,7 @@
 
 ## 1. Purpose
 
-`about` answers **what is this system?** — a one-shot identity card: what the OS is,
+`about` answers **what is this system?** - a one-shot identity card: what the OS is,
 how many cores it is running on, and who made it.
 
 ## 2. Invocation
@@ -26,7 +26,7 @@ GodspeedOS: a capability-based microkernel (v1 milestone)
   Created by Bankole Ogundero.
 ```
 
-ASCII only — the framebuffer console's font is ASCII, so no em-dashes or other
+ASCII only - the framebuffer console's font is ASCII, so no em-dashes or other
 non-ASCII glyphs (they render blank on the TV).
 
 ## 4. Data source
@@ -36,7 +36,7 @@ core count.
 
 ## 5. Capabilities
 
-- **`INTROSPECT`** (READ) — for the core count (query 8); the shell holds it.
+- **`INTROSPECT`** (READ) - for the core count (query 8); the shell holds it.
 - **Console output** to print the block.
 
 ## 6. Non-goals

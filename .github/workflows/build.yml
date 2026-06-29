@@ -63,13 +63,13 @@ jobs:
           cargo install cargo-audit --locked 2>/dev/null || true
           cargo audit
 
-      - name: Miri — kernel pure-logic
+      - name: Miri - kernel pure-logic
         env:
           # proptest's FileFailurePersistence calls getcwd; disable Miri's
           # filesystem isolation so it can resolve the path without aborting.
           MIRIFLAGS: -Zmiri-disable-isolation
           # Miri is ~100-1000x slower than native. Set cases to 1 per
-          # property — enough for UB detection. Full 256 cases run in the
+          # property - enough for UB detection. Full 256 cases run in the
           # regular cargo test step.
           PROPTEST_CASES: 1
         run: cargo miri test -p kernel --lib

@@ -1,8 +1,8 @@
-# Milestone 3 — Scheduler (Single Core) ✅
+# Milestone 3 - Scheduler (Single Core) ✅
 
 > Per-core run queue, context switching, and timer preemption working on one core.
 
-**Status: COMPLETE** — 2026-05-09
+**Status: COMPLETE** - 2026-05-09
 
 Serial output (SMP=1 and SMP=4 both pass):
 ```
@@ -55,7 +55,7 @@ task-a: 3
 ## Key bugs fixed
 
 - **IF=0 on first task run**: `scheduler::run()` calls `cli` before `switch_context`;
-  new tasks started with interrupts disabled.  Fix: `task_entry_trampoline` — a naked
+  new tasks started with interrupts disabled.  Fix: `task_entry_trampoline` - a naked
   `sti` + `ret` stub pushed below the real entry on each task's initial stack.
 - **APIC MMIO page fault**: Limine's HHDM does not map physical MMIO regions.
   Fix: `map_in_active_tables()` in `page_tables.rs` adds the APIC frame to the live

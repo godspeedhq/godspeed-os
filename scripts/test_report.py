@@ -88,7 +88,7 @@ def render(events):
         return f"║ {phase:<{PW}} │ {test:<{TW}} │ {result:^{RW}} │ {ms:>{MW}} ║"
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    title = f"GodspeedOS — Kernel Unit Tests   {now}"
+    title = f"GodspeedOS - Kernel Unit Tests   {now}"
 
     out = []
     out.append("╔" + "═" * IW + "╗")

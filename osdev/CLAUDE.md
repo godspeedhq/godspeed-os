@@ -27,23 +27,23 @@ Host-side developer CLI (§17). Builds for the developer's machine, not the kern
 | `osdev test chaos-brutal`   | Run brutal chaos tests (BC1–BC7) ✅ 7/7 |
 | `osdev test shell`          | Scripted shell smoke-test: boot, help, cores, status, unknown |
 | `osdev test files`          | Files/records/pipes/`result`/`run`/`assert` over a RAW AHCI disk (129 checks) |
-| `osdev test edit`           | Full-screen `edit` text editor (bounded piece table — files of any size): small-file open/type/backspace/newline/save (^S)/quit (^Q)/`read`-back, edit-existing, quit-with-discard, no-arg usage; **large-file** (pre-baked multi-window `/big.txt`) windowed open + insert-at-start + PageDown mid-file insert + streaming save, verified by reading the saved bytes back off the disk. 15 checks |
+| `osdev test edit`           | Full-screen `edit` text editor (bounded piece table - files of any size): small-file open/type/backspace/newline/save (^S)/quit (^Q)/`read`-back, edit-existing, quit-with-discard, no-arg usage; **large-file** (pre-baked multi-window `/big.txt`) windowed open + insert-at-start + PageDown mid-file insert + streaming save, verified by reading the saved bytes back off the disk. 15 checks |
 | `osdev test fs-corrupt`     | GSFS0008 integrity + backup superblock: corrupt the primary superblock (→ **recovers from the backup**), both copies (→ loud "no filesystem"), a root directory block (→ loud dir-CRC mismatch, no garbage), and a file **data block** (→ loud data-CRC mismatch, read refused); asserts no panic (§3.12). 14 checks |
 | `osdev test fs-check`       | fsck / `drives check` (Phase G): boot a disk whose superblock free count was drifted host-side (both copies, CRC re-stamped); `drives check` rebuilds the correct free count + bitmap from the tree, reports 0 bad, the file survives. 5 checks |
 | `osdev test fs-ioretry`     | block I/O retry (Phase H): `io-error-test` build forces the first read/write commands to fail; block-driver retries + recovers the transient (boot self-test read succeeds, fs round-trips), no panic. 5 checks |
 | `osdev test fs-large`       | Large files: write + read a 200 KiB file in streaming chunks (WriteNew/WriteAt/ReadAt), then re-verify it across a reboot on the same disk (boot 1 writes, boot 2 re-reads). Proves the streaming path + durability |
-| `osdev test fs-frag`        | Extent lists / fragmentation (Phase I, GSFS0008): a `frag-test` build fills a small disk, deletes every other file to scatter free space into ~2-block gaps, then writes a 20-block file that can't fit contiguously — forcing the fragmented (`ITYPE_FILE_FRAG`) extent-list path; asserts it became fragmented, reads back exactly, and the extent list survives a reboot. 11 checks |
+| `osdev test fs-frag`        | Extent lists / fragmentation (Phase I, GSFS0008): a `frag-test` build fills a small disk, deletes every other file to scatter free space into ~2-block gaps, then writes a 20-block file that can't fit contiguously - forcing the fragmented (`ITYPE_FILE_FRAG`) extent-list path; asserts it became fragmented, reads back exactly, and the extent list survives a reboot. 11 checks |
 | `osdev test fs-journal`     | Crash-consistency: (1) a `journal-crash-test` build halts right after a transaction's commit record is durable; the next boot's mount REPLAYS it from the journal (file recovered exactly). (2) a normal build REJECTS a journal commit with a bad CRC (no replay, mounts clean). 11 checks |
-| `osdev test file-cap`       | File-as-capability (§7.10, P2 / §22 Test 14): boot bare-metal + AHCI disk, create a file, run the shell `fcap <file>` self-check — open the file as a real kernel cap, read/write THROUGH it, non-escalation at the kernel layer (RO cap's WRITE invoke → CapInsufficientRights) AND the fs layer (write op under a read-validated badge → FS_DENIED), forged-handle rejected, revoke-on-close. 9 checks |
-| `osdev test fs-compat`      | GSFS0008 feature-flag policy (Phase L): three disks each carry an unknown bit in a different superblock feature mask (CRC re-stamped) — an unknown `incompat` bit → mount REFUSED loudly; an unknown `ro_compat` bit → mount READ-ONLY (reads work, writes refused); an unknown `compat` bit → mount NORMALLY. Proves the format can evolve past 0008 without a reformat. 12 checks |
-| `osdev test fs-scrub`       | Read-only integrity sweep (Phase K): a disk with one clean file + one whose data block was flipped host-side; `drives scrub` reports `1 bad`, a second scrub still reports `1 bad` (proves it's read-only — repaired nothing), the clean file is untouched, no panic. 6 checks |
-| `osdev test fs-djournal`    | Opt-in data journaling (Phase J): a `data-journal-test` build issues a **journaled** `write_at` (`OP_WRITE_AT_J`) that halts right after its commit record — the chunk's data lives only in the journal, home blocks still zero — and the next boot REPLAYS the data home. A correct read proves the journal supplied it (a zero block fails the data CRC), so the chunk was crash-atomic, not torn. 7 checks |
+| `osdev test file-cap`       | File-as-capability (§7.10, P2 / §22 Test 14): boot bare-metal + AHCI disk, create a file, run the shell `fcap <file>` self-check - open the file as a real kernel cap, read/write THROUGH it, non-escalation at the kernel layer (RO cap's WRITE invoke → CapInsufficientRights) AND the fs layer (write op under a read-validated badge → FS_DENIED), forged-handle rejected, revoke-on-close. 9 checks |
+| `osdev test fs-compat`      | GSFS0008 feature-flag policy (Phase L): three disks each carry an unknown bit in a different superblock feature mask (CRC re-stamped) - an unknown `incompat` bit → mount REFUSED loudly; an unknown `ro_compat` bit → mount READ-ONLY (reads work, writes refused); an unknown `compat` bit → mount NORMALLY. Proves the format can evolve past 0008 without a reformat. 12 checks |
+| `osdev test fs-scrub`       | Read-only integrity sweep (Phase K): a disk with one clean file + one whose data block was flipped host-side; `drives scrub` reports `1 bad`, a second scrub still reports `1 bad` (proves it's read-only - repaired nothing), the clean file is untouched, no panic. 6 checks |
+| `osdev test fs-djournal`    | Opt-in data journaling (Phase J): a `data-journal-test` build issues a **journaled** `write_at` (`OP_WRITE_AT_J`) that halts right after its commit record - the chunk's data lives only in the journal, home blocks still zero - and the next boot REPLAYS the data home. A correct read proves the journal supplied it (a zero block fails the data CRC), so the chunk was crash-atomic, not torn. 7 checks |
 | `osdev test fs-restart`     | §22 Test 13 (Phase D): fs survives its own restart. Shell writes a file, `KILL fs` over the control channel, supervisor respawns fs, fs re-mounts + re-registers, the shell reacquires fs via the registry and reads the file back; no panic. 7 checks |
-| `osdev test script`         | Two paths: (1) bake `scripts/smoke.gsh` into a GSFS disk and `run /smoke.gsh` (host-baked-file path, incl. a piped assert); (2) `selfcheck` — run the shell-embedded extensive suite (`scripts/selfcheck.gsh`) IN MEMORY. Both assert `ran N, failed 0`. The embedded suite isn't a disk file because an on-disk file is one ≤4 KiB IPC message (`MAX_FILE_BYTES`); rodata is not. |
+| `osdev test script`         | Two paths: (1) bake `scripts/smoke.gsh` into a GSFS disk and `run /smoke.gsh` (host-baked-file path, incl. a piped assert); (2) `selfcheck` - run the shell-embedded extensive suite (`scripts/selfcheck.gsh`) IN MEMORY. Both assert `ran N, failed 0`. The embedded suite isn't a disk file because an on-disk file is one ≤4 KiB IPC message (`MAX_FILE_BYTES`); rodata is not. |
 | `osdev mkfs <image>`        | Format a disk image as GSFS0008 (empty) |
-| `osdev script-disk <out> <script.gsh>` | Build a flashable GSFS data disk with `<script>` baked in as `/<basename>` — `dd` it to the data drive, boot, `run /<basename>` (the hardware self-check) |
+| `osdev script-disk <out> <script.gsh>` | Build a flashable GSFS data disk with `<script>` baked in as `/<basename>` - `dd` it to the data drive, boot, `run /<basename>` (the hardware self-check) |
 | `osdev validate`            | Validate all contracts against the JSON schema |
-| `osdev shell [--smp N]`     | Boot in QEMU with the interactive shell on stdin/stdout (bare-metal build — no probe services; type `help` at `gsh>` prompt; Ctrl-A X to quit) |
+| `osdev shell [--smp N]`     | Boot in QEMU with the interactive shell on stdin/stdout (bare-metal build - no probe services; type `help` at `gsh>` prompt; Ctrl-A X to quit) |
 | `osdev image`               | Build with `bare-metal` supervisor + create UEFI-bootable `build/os.img` (GPT + ESP + BOOTX64.EFI) |
 | `osdev image --mode perf`   | Same image, `perf-only` supervisor (B1–B10 probes) |
 | `osdev image --mode perf-brutal` | Same image, `perf-brutal-only` supervisor (BP1–BP10 probes) |
@@ -56,15 +56,15 @@ Host-side developer CLI (§17). Builds for the developer's machine, not the kern
 |------------------|---------------|
 | `src/main.rs`    | CLI parsing (`clap`), dispatch to handlers |
 | `src/validator.rs`| Contract validation + all test suite runners (identity, property, fuzz, stress, perf, adversarial, chaos, and their brutal variants) |
-| `src/qemu.rs`    | QEMU launch helpers (`spawn_for_test`, `spawn_for_test_custom`) — file-based serial (`-serial file:`) on all platforms |
+| `src/qemu.rs`    | QEMU launch helpers (`spawn_for_test`, `spawn_for_test_custom`) - file-based serial (`-serial file:`) on all platforms |
 | `src/disk_image.rs` | UEFI GPT disk image creation: protective MBR, GPT headers (CRC32), EFI System Partition (FAT32), `BOOTX64.EFI`, `limine.conf`, `kernel.elf` |
 
 ### GSFS host-side writer (`src/main.rs`)
 
 `format_superblock` writes an empty GSFS0008 (superblock + free bitmap + root dir), and
 `gsfs_add_file` bakes a file into it (allocate a contiguous extent, write content, add a root
-`file_record`, update the free count) — always a contiguous `ITYPE_FILE` file, since it only ever
-bakes into a fresh disk (the fragmented extent-list path is `fs`-only) — a host-side mirror of the
+`file_record`, update the free count) - always a contiguous `ITYPE_FILE` file, since it only ever
+bakes into a fresh disk (the fragmented extent-list path is `fs`-only) - a host-side mirror of the
 `fs` write path, kept in lockstep
 with the on-disk format documented at the top of `main.rs` and in `docs/persistence.md` §6.4. This
 is what lets `osdev script-disk` ship a `.gsh` suite to hardware: bake → `dd` to the data drive →
@@ -77,7 +77,7 @@ script file can carry but on-device typing can't).
 cargo build -p osdev
 ```
 
-No `--target` flag — this is a host binary.
+No `--target` flag - this is a host binary.
 
 ## QEMU path
 
@@ -95,7 +95,7 @@ Only the changed service restarts; the kernel and other services keep running.
 
 Creates a UEFI-bootable disk image at `build/os.img` for writing to a USB drive.
 
-**Build mode:** Uses `supervisor/bare-metal` feature — spawns only TCB services + ping + pong. Probe services are excluded because they require the QEMU control port (COM2/TCP:5555) to complete and would stall indefinitely on real hardware.
+**Build mode:** Uses `supervisor/bare-metal` feature - spawns only TCB services + ping + pong. Probe services are excluded because they require the QEMU control port (COM2/TCP:5555) to complete and would stall indefinitely on real hardware.
 
 **Image layout:**
 
@@ -104,7 +104,7 @@ build/os.img (64 MiB, GPT)
   Protective MBR (LBA 0)
   Primary GPT header (LBA 1)
   GPT partition entries (LBA 2–33)
-  EFI System Partition — FAT32 (LBA 2048–131038)
+  EFI System Partition - FAT32 (LBA 2048–131038)
     EFI/BOOT/BOOTX64.EFI   ← Limine UEFI bootloader
     limine.conf             ← timeout: -1, kernel_path: boot():/kernel.elf
     kernel.elf              ← kernel binary

@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [features]
 # Run the mount-time self-test (writes /greeting + /etc/motd to verify the hierarchy
-# and reboot survival). TEST BUILDS ONLY — it writes to the disk, so it must never be
+# and reboot survival). TEST BUILDS ONLY - it writes to the disk, so it must never be
 # enabled in a production/bare-metal build where the disk is the user's. Enabled by
 # `osdev test blockdev`/`blockdev-reboot`; absent from `osdev image`.
 selftest = []
@@ -22,14 +22,14 @@ journal-crash-test = []
 
 # Extent-list / fragmentation proof (GSFS0007). Runs `frag_test` at mount: fills the disk
 # with small files, deletes every other one to scatter free space into small gaps, then
-# writes a multi-block file that CANNOT fit contiguously — forcing the fragmented
-# (`ITYPE_FILE_FRAG`) path — and verifies the read-back (and across a reboot). TEST BUILDS
+# writes a multi-block file that CANNOT fit contiguously - forcing the fragmented
+# (`ITYPE_FILE_FRAG`) path - and verifies the read-back (and across a reboot). TEST BUILDS
 # ONLY (it writes to the disk). Enabled by `osdev test fs-frag`.
 frag-test = []
 
 # Data-journaling proof (Phase J). Runs `data_journal_test` at mount: creates a file (data blocks
 # left zero on disk), then a JOURNALED write_at through a transaction that halts after the commit
-# record — so the chunk's data lives only in the journal. The next boot must replay it from the
+# record - so the chunk's data lives only in the journal. The next boot must replay it from the
 # journal (home blocks were zero → a correct read proves recovery). TEST BUILDS ONLY (writes to
 # the disk and deliberately hangs the service). Enabled by `osdev test fs-djournal`.
 data-journal-test = []

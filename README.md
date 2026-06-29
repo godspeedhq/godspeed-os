@@ -35,13 +35,13 @@ The kernel is strictly bounded: memory isolation, scheduling, IPC routing, capab
 
 ## How it works
 
-**Capabilities** — every privileged action requires an explicit, unforgeable token. A capability carries a resource ID, a rights set, and a generation number. Stale capabilities return `EndpointDead`. Forged ones return `CapNotHeld`. There is no ambient authority.
+**Capabilities** - every privileged action requires an explicit, unforgeable token. A capability carries a resource ID, a rights set, and a generation number. Stale capabilities return `EndpointDead`. Forged ones return `CapNotHeld`. There is no ambient authority.
 
-**IPC** — synchronous message passing with bounded queues (16 messages per endpoint). Services are pinned to CPU cores. Cross-core sends route through the kernel's routing table and wake the receiver via IPI. Zero-copy is permanently rejected — isolation is more important.
+**IPC** - synchronous message passing with bounded queues (16 messages per endpoint). Services are pinned to CPU cores. Cross-core sends route through the kernel's routing table and wake the receiver via IPI. Zero-copy is permanently rejected - isolation is more important.
 
 **Supervisor:** the service with restart authority. When a service is killed, its endpoint generation is bumped. All outstanding capabilities immediately become stale. Clients detect `EndpointDead`, look up the new instance by name via the kernel's name directory, and resume. The new instance may be on a different core, which is invisible to callers. The supervisor is itself restartable: if it dies, the **kernel respawns it** and it reconciles with the still-running services. The only unkillable component is the kernel.
 
-**Scheduler** — per-core run queues, round-robin, 10 ms preemption quantum enforced by the local timer. Services are placed at spawn and never migrate. Yield is advisory; preemption is not.
+**Scheduler** - per-core run queues, round-robin, 10 ms preemption quantum enforced by the local timer. Services are placed at spawn and never migrate. Yield is advisory; preemption is not.
 
 ---
 
@@ -52,7 +52,7 @@ The kernel is strictly bounded: memory isolation, scheduling, IPC routing, capab
 | No ambient authority | Every privileged action requires a capability |
 | Explicit authority | Authority comes from holding a cap, not from identity or ancestry |
 | Bounded behavior | Queues, tables, memory, and messages all have fixed limits |
-| Loud failures | `EndpointDead`, `CapRevoked`, `AllocDenied` — never silent fallback |
+| Loud failures | `EndpointDead`, `CapRevoked`, `AllocDenied` - never silent fallback |
 | Identity over location | Service names are stable; core assignments are not |
 | One irreducible truth | Store the minimal source; derive (and reconcile) every cache, index, or count |
 | Restartability | Every service survives kill + respawn, even the supervisor; only the kernel is unkillable |
@@ -63,7 +63,7 @@ These distil into the **[Ten Commandments of Godspeed](COMMANDMENTS.md)**, the h
 
 ## Test suite
 
-GodspeedOS treats testing as architecture. The suite is layered — each layer must pass before the next is meaningful.
+GodspeedOS treats testing as architecture. The suite is layered - each layer must pass before the next is meaningful.
 
 | Suite | Purpose | Status |
 |-------|---------|--------|
@@ -78,7 +78,7 @@ GodspeedOS treats testing as architecture. The suite is layered — each layer m
 ### Static analysis & unsafe audit
 
 Every `unsafe` block is inventoried in `docs/unsafe-audit.md` and enforced by
-`scripts/unsafe_check.py` — counts may not grow without a written SAFETY argument.
+`scripts/unsafe_check.py` - counts may not grow without a written SAFETY argument.
 Latest pass (2026-05-31, boot-verified on AMD T630; `milestones/v2/STATIC_ANALYSIS_AUDIT.md`):
 
 | Check | Result |
@@ -86,7 +86,7 @@ Latest pass (2026-05-31, boot-verified on AMD T630; `milestones/v2/STATIC_ANALYS
 | Unsafe confined to permitted layers (§18.1) | ✅ `ipc/` violation fixed; audit passes (302 lines / 23 files) |
 | Safety / correctness lints (static-mut refs, fn-casts, redundant `unsafe`) | ✅ 0 |
 | Kernel build warnings | 104 → 57 (remaining are intentional unwired architecture) |
-| Hardware boot regression | ✅ clean — 4 cores, cross-core ping/pong to 83k+ msgs, zero faults |
+| Hardware boot regression | ✅ clean - 4 cores, cross-core ping/pong to 83k+ msgs, zero faults |
 
 ---
 

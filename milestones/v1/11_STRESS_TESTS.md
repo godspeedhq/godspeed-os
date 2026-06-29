@@ -18,7 +18,7 @@ CLAUDE.md §22 Stress Tests.
 |-------|-------|--------|
 | Phase 1 | S1, S2, S3, S4, S7, S10 | ✅ 6/6 implemented |
 | Phase 2 | S5, S6, S8, S9 | ✅ 4/4 implemented |
-| Phase 3 (Brutal — M18) | BS1–BS10 | ✅ 10/10 passing |
+| Phase 3 (Brutal - M18) | BS1–BS10 | ✅ 10/10 passing |
 
 ---
 
@@ -56,22 +56,22 @@ and must be run manually when native hardware is available.
 
 | Name | Mode | has_recv | send_peers | preferred_core |
 |------|------|----------|------------|----------------|
-| `stress-s1-recv` | 0 (passive) | yes | — | any |
+| `stress-s1-recv` | 0 (passive) | yes | - | any |
 | `stress-s1` | 40 | no | `stress-s1-recv` | any |
-| `stress-s2-victim` | 0 (passive) | yes | — | any |
+| `stress-s2-victim` | 0 (passive) | yes | - | any |
 | `stress-s2` | 41 | no | `stress-s2-victim` | any |
-| `stress-s3-recv` | 43 | yes | — | 1 |
+| `stress-s3-recv` | 43 | yes | - | 1 |
 | `stress-s3-send` | 42 | no | `stress-s3-recv` | 0 |
-| `stress-s4-victim` | 0 (passive) | yes | — | any |
+| `stress-s4-victim` | 0 (passive) | yes | - | any |
 | `stress-s4` | 44 | no | `stress-s4-victim` × 2 | any |
-| `stress-s7` | 45 | no | — | any |
-| `stress-s10-victim` | 0 (passive) | yes | — | 1 |
+| `stress-s7` | 45 | no | - | any |
+| `stress-s10-victim` | 0 (passive) | yes | - | 1 |
 | `stress-s10` | 46 | no | `stress-s10-victim` × 3 | 0 |
-| `stress-s5-victim` | 0 (passive) | yes | — | any |
-| `stress-s5` | 47 | no | — | any |
+| `stress-s5-victim` | 0 (passive) | yes | - | any |
+| `stress-s5` | 47 | no | - | any |
 | `stress-s6` | 48 | yes | `stress-s6` (self) | any |
-| `stress-s8` | 49 | no | — | any |
-| `stress-s9-recv` | 51 | yes | — | 2 |
+| `stress-s8` | 49 | no | - | any |
+| `stress-s9-recv` | 51 | yes | - | 2 |
 | `stress-s9-send-a` | 50 | no | `stress-s9-recv` | 0 |
 | `stress-s9-send-b` | 50 | no | `stress-s9-recv` | 1 |
 
@@ -88,7 +88,7 @@ values. Phase 2 tests use the existing `Blocked` variant.
 
 ## Phase 1: S1, S2, S3, S4, S7, S10
 
-### S1 — IPC saturation
+### S1 - IPC saturation
 
 **Surface:** `handle_try_send` → `enqueue` → `QueueFull` path, sustained under continuous caller
 pressure.
@@ -107,7 +107,7 @@ routing-table corruption visible via `InspectKernel`, no panic on any core.
 
 ---
 
-### S2 — Restart storm
+### S2 - Restart storm
 
 **Surface:** `kill_task` → kstack free → `spawn_task` → kstack alloc; repeated 100 times against
 the same victim.
@@ -128,7 +128,7 @@ pool exhausts somewhere around cycle 24 (with all other running probes occupying
 
 ---
 
-### S3 — Cross-core thrash
+### S3 - Cross-core thrash
 
 **Surface:** cross-core `enqueue` path in `routing.rs` → IPI wakeup → receiver dequeue, sustained
 across 1,000 rounds.
@@ -150,7 +150,7 @@ no dropped messages, no routing-table corruption, no IPI delivery failure, no pa
 
 ---
 
-### S4 — Cap table churn
+### S4 - Cap table churn
 
 **Surface:** cap-table invalidation path: `kill_endpoint` bumps generation → subsequent cap lookup
 returns `EndpointDead` for all matching slots; after respawn, old slots remain stale (no
@@ -164,7 +164,7 @@ generation increments strictly and that both stale caps remain `EndpointDead` th
 **Scaled from spec:** 50 cycles (spec: 100k).
 
 **Key property:** cap slots A and B are independent entries; both must be invalidated by a single
-`kill_endpoint` call. If only one is invalidated, B remains usable — a kernel correctness bug.
+`kill_endpoint` call. If only one is invalidated, B remains usable - a kernel correctness bug.
 
 **Pass:** `stress: S4 pass (50/50)` seen on serial.
 **Fail:** `KERNEL PANIC` or `stress: S4 FAIL`.
@@ -172,7 +172,7 @@ generation increments strictly and that both stale caps remain `EndpointDead` th
 
 ---
 
-### S7 — Memory pressure
+### S7 - Memory pressure
 
 **Surface:** `handle_alloc_mem` → `current_task_claim_alloc` budget accounting across many
 allocations; `AllocDenied` returned consistently when budget exhausted.
@@ -196,7 +196,7 @@ services, reclaiming frames via the kill path).
 
 ---
 
-### S10 — Cascading revocation
+### S10 - Cascading revocation
 
 **Surface:** `kill_endpoint` → generation bump → all cap-table slots pointing at the victim become
 stale simultaneously, regardless of which core holds them.
@@ -228,11 +228,11 @@ are on different cores.
 
 ## Phase 2: S5, S6, S8, S9
 
-### S5 — Generation counter integrity (1000 cycles)
+### S5 - Generation counter integrity (1000 cycles)
 
 **Surface:** `generation::bump()` in `capability/generation.rs` and `ipc::routing::kill_endpoint`.
 
-**Original blocker:** the spec called for forcing a u64 generation counter to wrap — impractical
+**Original blocker:** the spec called for forcing a u64 generation counter to wrap - impractical
 (2^64 cycles). Investigation revealed that endpoint IDs are monotonically increasing u64 values
 that are never reused (`NEXT_ENDPOINT_ID` counter in `ipc/mod.rs`). This makes the "old cap
 re-validates after generation wrap" attack structurally impossible: a killed endpoint's ID is
@@ -250,11 +250,11 @@ non-monotonic result is a FAIL.
 
 ---
 
-### S6 — Long-running IPC self-ping stability (5000 rounds)
+### S6 - Long-running IPC self-ping stability (5000 rounds)
 
 **Surface:** IPC `send` and `recv` paths against a self-referential endpoint over an extended run.
 
-**Original blocker:** 24-hour run — unreliable under QEMU TCG. Reframed: the meaningful property
+**Original blocker:** 24-hour run - unreliable under QEMU TCG. Reframed: the meaningful property
 is that the IPC path does not drift or corrupt state over many iterations, which is validatable in
 minutes.
 
@@ -269,7 +269,7 @@ indicates IPC state corruption.
 
 ---
 
-### S8 — Idle scheduler heartbeat (600 yields)
+### S8 - Idle scheduler heartbeat (600 yields)
 
 **Surface:** scheduler idle loop, timer interrupt delivery, context-switch return path.
 
@@ -287,13 +287,13 @@ the scheduler verifies the idle path is not corrupted.
 
 ---
 
-### S9 — Cross-core IPI storm (1000 messages, dual sender)
+### S9 - Cross-core IPI storm (1000 messages, dual sender)
 
 **Surface:** cross-core `enqueue` path in `routing.rs` → IPI wakeup, under concurrent pressure
 from two senders on different cores simultaneously.
 
 **Original blocker:** 10 kHz timer override requiring KVM. Reframed: the IPI cross-fire property
-is better tested by having multiple concurrent senders targeting a single receiver — each delivery
+is better tested by having multiple concurrent senders targeting a single receiver - each delivery
 from either core generates an IPI to core 2, and timer interrupts from cores 0, 1, and 2 fire
 concurrently during the transfers.
 
@@ -396,7 +396,7 @@ their `Blocked` reason and are counted as skipped, not failed. Logs are written 
 ### Goal
 
 Escalated variants of S1–S10 at 4–5× iteration counts, running concurrently alongside all other
-probe suites (identity, property, fuzz, stress, perf, adversarial, chaos — ~190 tasks total).
+probe suites (identity, property, fuzz, stress, perf, adversarial, chaos - ~190 tasks total).
 Any failure is a mandatory kernel fix.
 
 ### Probe modes
@@ -418,23 +418,23 @@ Any failure is a mandatory kernel fix.
 
 | Name | Mode | send_peers | preferred_core |
 |------|------|------------|----------------|
-| `stress-bs1-recv` | 0 (passive) | — | any |
+| `stress-bs1-recv` | 0 (passive) | - | any |
 | `stress-bs1` | 120 | `stress-bs1-recv` | any |
-| `stress-bs2-victim` | 0 (passive) | — | any |
+| `stress-bs2-victim` | 0 (passive) | - | any |
 | `stress-bs2` | 121 | `stress-bs2-victim` | any |
-| `stress-bs3-recv` | 123 | — | 1 |
+| `stress-bs3-recv` | 123 | - | 1 |
 | `stress-bs3-send` | 122 | `stress-bs3-recv` | 0 |
-| `stress-bs4-victim` | 0 (passive) | — | any |
+| `stress-bs4-victim` | 0 (passive) | - | any |
 | `stress-bs4` | 124 | `stress-bs4-victim` × 2 | any |
-| `stress-bs5-victim` | 0 (passive) | — | any |
-| `stress-bs5` | 125 | — | any |
+| `stress-bs5-victim` | 0 (passive) | - | any |
+| `stress-bs5` | 125 | - | any |
 | `stress-bs6` | 126 | `stress-bs6` (self) | any |
-| `stress-bs7` | 127 | — | any |
-| `stress-bs8` | 128 | — | any |
-| `stress-bs9-recv` | 130 | — | 2 |
+| `stress-bs7` | 127 | - | any |
+| `stress-bs8` | 128 | - | any |
+| `stress-bs9-recv` | 130 | - | 2 |
 | `stress-bs9-send-a` | 129 | `stress-bs9-recv` | 0 |
 | `stress-bs9-send-b` | 129 | `stress-bs9-recv` | 1 |
-| `stress-bs10-victim` | 0 (passive) | — | 1 |
+| `stress-bs10-victim` | 0 (passive) | - | 1 |
 | `stress-bs10` | 131 | `stress-bs10-victim` × 3 | 0 |
 
 ### Timeouts
@@ -483,4 +483,4 @@ accurately detect real kernel crashes.
 
 ## Bugs found and fixed during Milestone 11
 
-*(None — all S1–S10 tests passed without kernel changes.)*
+*(None - all S1–S10 tests passed without kernel changes.)*

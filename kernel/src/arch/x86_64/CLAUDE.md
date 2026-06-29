@@ -15,13 +15,13 @@ The unsafe hardware boundary (§18.1). All direct hardware access in the kernel 
 
 ## Safe wrappers (call these instead of writing new unsafe blocks)
 
-These functions in `arch::x86_64` expose hardware operations as a safe API. If you need one of these operations outside the arch layer, use the wrapper — do not write a new `unsafe` block.
+These functions in `arch::x86_64` expose hardware operations as a safe API. If you need one of these operations outside the arch layer, use the wrapper - do not write a new `unsafe` block.
 
 | Function                     | What it wraps |
 |------------------------------|---------------|
 | `disable_interrupts()`       | `cli` |
 | `enable_interrupts()`        | `sti` |
-| `wait_for_interrupt()`       | `sti` only — no C-state hint; avoids Goldmont+ APIC power-gate from both `hlt` and `pause` |
+| `wait_for_interrupt()`       | `sti` only - no C-state hint; avoids Goldmont+ APIC power-gate from both `hlt` and `pause` |
 | `validate_user_ptr(ptr, len)`| Range check: ptr..ptr+len must be below `USER_END` (0x0000_8000_0000_0000) |
 | `read_user_bytes(ptr, len)`  | Validated `from_raw_parts` into user VA |
 | `write_user_bytes(dst, src)` | Validated `copy_nonoverlapping` to user VA |
@@ -31,11 +31,11 @@ These functions in `arch::x86_64` expose hardware operations as a safe API. If y
 ## Boot protocol: Limine
 
 `boot.rs` uses the Limine Boot Protocol (`limine` crate). Request structures are declared as Rust statics; Limine fills them in before jumping to `kernel_main`. Requests consumed:
-- `MemoryMapRequest` — physical memory layout
-- `HhdmRequest` — higher-half direct map base address
-- `SmpRequest` — AP APIC IDs (eliminates need for ACPI/MADT parsing)
-- `FramebufferRequest` — early output
-- `KernelAddressRequest` — physical/virtual base for KASLR handling
+- `MemoryMapRequest` - physical memory layout
+- `HhdmRequest` - higher-half direct map base address
+- `SmpRequest` - AP APIC IDs (eliminates need for ACPI/MADT parsing)
+- `FramebufferRequest` - early output
+- `KernelAddressRequest` - physical/virtual base for KASLR handling
 
 ## Invariants
 

@@ -1,7 +1,7 @@
 # CLAUDE.md
 ## Capability-Based Microkernel OS
 
-**Status:** v3.7 — SMP-Integrated Spec, Reviewed, with Forward-Looking Appendices
+**Status:** v3.7 - SMP-Integrated Spec, Reviewed, with Forward-Looking Appendices
 **Scope:** v1 milestone (multi-core kernel, two services, cross-core IPC, supervisor restart with core reassignment)
 **Audience:** Contributors, reviewers, future maintainers
 
@@ -60,7 +60,7 @@ It exists to:
 
 When this document and the code disagree, the document wins and the code is wrong. When this document and reality disagree, the document is amended and the change is recorded.
 
-The appendices at the end of this document collect forward-looking design notes. Appendix A documents a v1 commitment (the bootloader choice). Appendices B, C, and D are explicitly non-normative — they record design intent and discussion, not commitments. Their content does not amend the constitution.
+The appendices at the end of this document collect forward-looking design notes. Appendix A documents a v1 commitment (the bootloader choice). Appendices B, C, and D are explicitly non-normative - they record design intent and discussion, not commitments. Their content does not amend the constitution.
 
 This constitution has a human-readable distillation: `COMMANDMENTS.md`, the **Ten Commandments of Godspeed**. Each commandment is grounded in the invariants and sections it enforces here. Where a commandment and this document disagree, this document is the law and the commandment is amended to match (it is the distillation, not the source).
 
@@ -116,11 +116,11 @@ A deliberately small, fully-understood capability microkernel, built to internal
 
 ## 3. Constitution: Non-Negotiable Invariants
 
-These are the laws that bound every design choice. Any change that violates an invariant must first amend the invariant — and amendments require a written rationale.
+These are the laws that bound every design choice. Any change that violates an invariant must first amend the invariant - and amendments require a written rationale.
 
 1. **No ambient authority.** Every privileged action requires an explicit capability.
    > **Amendment 2026-06-12 (H1):** DMA-capable devices were an unstated exception
-   > to this invariant — a driver could direct its controller's DMA engine at any
+   > to this invariant - a driver could direct its controller's DMA engine at any
    > physical address, kernel-equivalent reach the capability model never granted.
    > H1 (IOMMU confinement) closes the gap: a confined device reaches only its
    > granted arena. See §6.4.
@@ -198,7 +198,7 @@ The kernel does **not** contain filesystem logic, network stack, drivers (beyond
 > for resources whose *meaning is defined by a service* (§7.10). It still contains **no filesystem
 > logic**: it tracks an opaque `ResourceId` and its owning endpoint and nothing more; the owning
 > service (`fs`) alone maps `ResourceId → file`. "A file is a capability" thus becomes literally
-> true while this anti-scope holds — the kernel never learns what a file *is*.
+> true while this anti-scope holds - the kernel never learns what a file *is*.
 
 ---
 
@@ -226,7 +226,7 @@ os/
 
   services/
     supervisor/            # restart authority + name authority (TCB); spawned directly by the kernel
-                           #   (init removed, Phase 5; registry service retired, Phase 4 — Path C §3.7)
+                           #   (init removed, Phase 5; registry service retired, Phase 4 - Path C §3.7)
     logger/
     block-driver/          # v1: trusted
     fs/                    # v1: trusted, depends on block-driver
@@ -257,7 +257,7 @@ os/
     qemu/
       identity/            # identity test suite (§22)
       harness/             # shared test infrastructure
-      perf/                # performance benchmarks (§22 B1–B10) — 10/10 ✅
+      perf/                # performance benchmarks (§22 B1–B10) - 10/10 ✅
 ```
 
 ---
@@ -271,12 +271,12 @@ os/
 | Kernel            | Enforces all isolation                              |
 | `arch/x86_64`     | Direct hardware access                              |
 | `kernel/smp`      | Concurrent-correctness primitives                   |
-| `supervisor`      | Holds restart + name authority; **spawned directly by the kernel** (init removed, Phase 5); trusted but **restartable** — the kernel respawns it on death (Phase 6, §6.2), so the only non-restartable thing is the kernel itself |
-| `xhci`, `ehci` (DMA drivers) | **Machine-dependent (H1, §6.4):** in the TCB only on a machine with no IOMMU to confine them (DMA-anywhere = kernel-equivalent reach); **dropped** from it — least-privilege and restartable — wherever an IOMMU confines them to their arena. The case is reported loudly at boot (invariant 12). |
+| `supervisor`      | Holds restart + name authority; **spawned directly by the kernel** (init removed, Phase 5); trusted but **restartable** - the kernel respawns it on death (Phase 6, §6.2), so the only non-restartable thing is the kernel itself |
+| `xhci`, `ehci` (DMA drivers) | **Machine-dependent (H1, §6.4):** in the TCB only on a machine with no IOMMU to confine them (DMA-anywhere = kernel-equivalent reach); **dropped** from it - least-privilege and restartable - wherever an IOMMU confines them to their arena. The case is reported loudly at boot (invariant 12). |
 
 > **Amendment 2026-06-12 (H1): DMA-capable drivers are no longer an unconditional TCB
 > member.** Before H1 they were an *implicit, unstated* member: with no IOMMU a driver
-> directs its controller's DMA engine at any physical address — kernel-equivalent power
+> directs its controller's DMA engine at any physical address - kernel-equivalent power
 > the capability model never granted (see the invariant 1 amendment). H1 makes their
 > trust **machine-dependent**: confined by an IOMMU, a compromise is bounded to the
 > granted arena, so the driver is genuinely least-privilege and restartable and **leaves
@@ -286,7 +286,7 @@ os/
 
 > **Amendment 2026-06-17 (Phase D / FS robustness): `block-driver` and `fs` are no longer
 > TCB members.** They were a v1 simplification (§6.3): `fs` owned persistent state it could
-> not recover after a crash, so its death — and that of the `block-driver` it depends on —
+> not recover after a crash, so its death - and that of the `block-driver` it depends on -
 > was a panic+reboot. The filesystem robustness program closes that gap: `fs` now commits
 > every metadata mutation through a **crash-consistent redo-journal** and **recovers to a
 > consistent state on mount** (Phase C; `docs/persistence.md` §6.8). With recovery in hand,
@@ -301,45 +301,45 @@ os/
 
 > **Amendment 2026-06-09 (H11): `registry` is no longer a TCB member.** It became a
 > real userspace name service (register/lookup over IPC, holding only delegated caps
-> and deriving copies — `docs/registry.md`). It owns no kernel-critical state, so its
+> and deriving copies - `docs/registry.md`). It owns no kernel-critical state, so its
 > *runtime* death degrades name resolution temporarily rather than corrupting the
 > system, and it is now **restartable** (see §6.2, §6.3). Its *boot-time* spawn must
 > still succeed (the name service must come up to bootstrap), which remains fatal
-> (§11.3). Worked example of invariant 11 — identity (the name) is stable; the
+> (§11.3). Worked example of invariant 11 - identity (the name) is stable; the
 > registry instance/location is not.
 
 > **Amendment 2026-06-21 (naming Phase 4 / Path C): the `registry` SERVICE is RETIRED.**
 > Moving name→endpoint resolution to the supervisor (Phases 0a–3c, `docs/naming-design.md`)
-> left the registry's only remaining job — handing a client a cap to a service by name — to a
+> left the registry's only remaining job - handing a client a cap to a service by name - to a
 > **minimal `name → endpoint` recovery directory inside the kernel** (`ipc::names` + the gated
 > `AcquireSendCap`). The supervisor wires every service from a `name → cap` map at boot and on
 > restart; clients reacquire names through the directory. So the registry *service* is deleted
 > outright (crate, config, spawn, §22 Test 11/1B moved off it). This is the bounded "one
-> exception" of Path C (§3.7): a thin naming *directory* stays in the kernel — justified by §6.3
-> (the recovery anchor must be unkillable) — even though name *policy* lives in the supervisor.
+> exception" of Path C (§3.7): a thin naming *directory* stays in the kernel - justified by §6.3
+> (the recovery anchor must be unkillable) - even though name *policy* lives in the supervisor.
 > `docs/registry.md` is now historical.
 
 ### 6.2 Failure Semantics
 
-> **The only unkillable component is the kernel itself.** Every userspace service — including the
-> `supervisor` — is restartable; its death is recovered, never a reboot.
+> **The only unkillable component is the kernel itself.** Every userspace service - including the
+> `supervisor` - is restartable; its death is recovered, never a reboot.
 
 > **Amendment 2026-06-21 (Path C / Phase 6): the `supervisor` is restartable; its death is no longer
-> a kernel panic.** When the supervisor dies (a fault, or a deliberate kill — `chaos kill-storm
-> supervisor`, the operator control channel), the **kernel respawns it** — the kernel is the
+> a kernel panic.** When the supervisor dies (a fault, or a deliberate kill - `chaos kill-storm
+> supervisor`, the operator control channel), the **kernel respawns it** - the kernel is the
 > last-resort recovery anchor, the one thing that cannot die (§3.7). The respawned supervisor
 > re-registers its death-notification endpoint in the kernel directory (so notifications re-point to
 > it) and **reconciles**: it adopts the still-running services (reacquiring each by name) rather than
-> duplicating them, and respawns any that died. The non-restartable set is now **`{kernel}` alone** —
+> duplicating them, and respawns any that died. The non-restartable set is now **`{kernel}` alone** -
 > §6.3's goal reached at its floor. (`init` removed, Phase 5; `registry` retired, Phase 4;
 > `block-driver` + `fs` restartable, Phase D.) Pinned by §22 Test 15.
 >
-> **The respawn is unbounded — deliberately.** The kernel respawns the supervisor *unconditionally,
+> **The respawn is unbounded - deliberately.** The kernel respawns the supervisor *unconditionally,
 > forever*; there is no cap-then-panic. A bound would re-introduce the very reboot this eliminates
 > (deferred from 1 death to N) and hand an attacker a trivial denial-of-service (kill the supervisor N
 > times to force a reboot). This is **not** unbounded-resource behaviour (§26.6): each respawn first
 > reclaims the dead instance's frames/kstack/caps, then allocates fresh, so the footprint is constant
-> and reclaimed every time — only a *count* grows, and a count is not a resource. Each respawn is loud
+> and reclaimed every time - only a *count* grows, and a count is not a resource. Each respawn is loud
 > (logged with a running count, §26.4/§26.7), so a sustained loop is visible and an operator can
 > intervene, but the system stays **alive** rather than rebooting. "Assume the worst" → always recover.
 
@@ -347,9 +347,9 @@ os/
 > supervisor's death-notification restart loop (the kernel notifies the supervisor, which respawns
 > them); clients see a temporary `EndpointDead` / lookup miss, reacquire **by name via the kernel
 > directory**, and retry (§14.3). `fs` re-mounts to a consistent state via its crash-consistency
-> journal (Phase C; `docs/persistence.md` §6.8). The **`shell`** is the user's interface — a crash or a
-> deliberate `kill shell` respawns a *fresh prompt* (the in-flight command is lost — a re-init, not a
-> resume, §14.2/§25 — but the session recovers) instead of leaving a dead session; closing the one
+> journal (Phase C; `docs/persistence.md` §6.8). The **`shell`** is the user's interface - a crash or a
+> deliberate `kill shell` respawns a *fresh prompt* (the in-flight command is lost - a re-init, not a
+> resume, §14.2/§25 - but the session recovers) instead of leaving a dead session; closing the one
 > service that used to stay dead-forever if killed ("nothing escapes"; invariant 6). `registry` left
 > the TCB via H11 (then the service was retired, Phase 4); `block-driver` + `fs` via the Phase D
 > amendment (§6.1). Only their *boot-time* spawn failure is fatal (§11.3).
@@ -358,18 +358,18 @@ os/
 
 Silent recovery of TCB state risks undefined system state. Loud failure plus clean restart is the only safe v1 option.
 
-### 6.3 Reducing TCB Over Time — **goal reached, at the floor**
+### 6.3 Reducing TCB Over Time - **goal reached, at the floor**
 
 The v2 goal was: only `init`, `supervisor`, and the kernel remain non-restartable. That goal is now
-**met and exceeded — the non-restartable set is `{kernel}` alone.** `registry` was dropped early via
+**met and exceeded - the non-restartable set is `{kernel}` alone.** `registry` was dropped early via
 H11 (a restartable userspace name service, then **retired entirely** in naming Phase 4 / Path C);
 `block-driver` and `fs` were dropped via the **Phase D amendment (§6.1, 2026-06-17)** once the
-filesystem gained crash-consistent recovery (the redo-journal, `docs/persistence.md` §6.8) — so an
+filesystem gained crash-consistent recovery (the redo-journal, `docs/persistence.md` §6.8) - so an
 `fs` restart re-mounts to a consistent state rather than corrupting it. **`init` was removed outright**
 (Path C / Phase 5): the kernel spawns the supervisor directly. And finally **the `supervisor` itself
-was made restartable** (Path C / Phase 6, §6.2): the kernel respawns it on death — unconditionally,
-forever — and it recovers from the kernel's name directory (adopting the live services). So the
-**kernel is the only unkillable thing** (`docs/naming-design.md` §3.7) — DMA drivers aside, and only
+was made restartable** (Path C / Phase 6, §6.2): the kernel respawns it on death - unconditionally,
+forever - and it recovers from the kernel's name directory (adopting the live services). So the
+**kernel is the only unkillable thing** (`docs/naming-design.md` §3.7) - DMA drivers aside, and only
 on a machine without an IOMMU (§6.4). The floor is reached; there is nothing left to shrink.
 
 ### 6.4 DMA-Capable Drivers and the IOMMU (H1)
@@ -389,14 +389,14 @@ status is **machine-dependent**, and which case holds is reported loudly at boot
 - **With an IOMMU confining it (H1)**, the device can reach only the driver's granted
   DMA arena; a DMA outside it faults rather than corrupting memory. A compromise is
   then bounded to the arena the capability model already granted, so the driver is
-  **genuinely least-privilege and restartable** — exactly as ordinary services are.
+  **genuinely least-privilege and restartable** - exactly as ordinary services are.
   (Boot reports `iommu: ... confined BDF ...`; out-of-arena DMA is pinned by §22
   Test 12.)
 
 This machine-dependent posture is deliberate: the same driver binary is least-privilege
 on a machine whose IOMMU confines it and trust-critical on one without, and the
 difference is a printed boot fact rather than a hidden assumption. Confinement is applied
-**per driver** and only where it fits the driver's DMA shape — `xhci` is confined to its
+**per driver** and only where it fits the driver's DMA shape - `xhci` is confined to its
 arena; `ehci` (which legitimately reaches firmware/hub regions and a low-speed device only
 through a hub's transaction translator) runs in transparent IOMMU passthrough. See
 `docs/iommu.md`.
@@ -411,7 +411,7 @@ official, not the runtime behaviour.
 
 ### 7.1 Concept
 
-A capability is an unforgeable token granting specific rights to a specific resource at a specific generation. Holding a cap is necessary and sufficient authority for the actions it permits — provided its generation still matches the kernel's record.
+A capability is an unforgeable token granting specific rights to a specific resource at a specific generation. Holding a cap is necessary and sufficient authority for the actions it permits - provided its generation still matches the kernel's record.
 
 ### 7.2 Capability Structure
 
@@ -419,9 +419,9 @@ A capability is an unforgeable token granting specific rights to a specific reso
 Capability = ResourceId + Rights + Generation
 ```
 
-- **ResourceId** — identifies the target resource (endpoint, memory region, MMIO range).
-- **Rights** — bitfield of permitted actions (READ, WRITE, SEND, RECV, GRANT, REVOKE).
-- **Generation** — monotonic counter assigned by the kernel when the resource is created or replaced.
+- **ResourceId** - identifies the target resource (endpoint, memory region, MMIO range).
+- **Rights** - bitfield of permitted actions (READ, WRITE, SEND, RECV, GRANT, REVOKE).
+- **Generation** - monotonic counter assigned by the kernel when the resource is created or replaced.
 
 ### 7.3 Properties
 
@@ -541,7 +541,7 @@ fn main(ctx: ServiceContext) -> Result<()> {
 }
 ```
 
-### 7.10 Delegated Resource Capabilities (P2 — file-as-capability)
+### 7.10 Delegated Resource Capabilities (P2 - file-as-capability)
 
 > **Amendment 2026-06-18 (P2).** Extends the capability model so a resource's *meaning* can be
 > owned by a service while the kernel still mints, validates, routes, and revokes its caps. This is
@@ -549,7 +549,7 @@ fn main(ctx: ServiceContext) -> Result<()> {
 
 The kernel mints unforgeable caps (§7.3) but has no concept of a file (§4.4). Delegated resource
 capabilities bridge the two: a service **owns a band of `ResourceId`s** whose meaning only it knows,
-and the kernel treats each as an **opaque** resource — identical machinery to an endpoint cap.
+and the kernel treats each as an **opaque** resource - identical machinery to an endpoint cap.
 
 - **Mint.** A service asks the kernel (`resource_mint`) to allocate a fresh `ResourceId` in its
   band, register it (generation 0, Alive), record the service's endpoint as its **owner**, and mint
@@ -557,7 +557,7 @@ and the kernel treats each as an **opaque** resource — identical machinery to 
   the existing embedded-cap transfer (§8.5). `fs` does this on `Open`, recording `ResourceId → file`.
 - **Use = send.** A holder uses the cap by `send`ing on it. The kernel validates it (generation +
   required right) and routes the message to the **owning service's endpoint, badged with the
-  `ResourceId`** — so the owner knows which resource without the kernel knowing what it means. A
+  `ResourceId`** - so the owner knows which resource without the kernel knowing what it means. A
   read/write to a file is then a first-class capability operation: validated, denied, or revoked by
   the same code path as any cap.
 - **Revoke = generation bump (§7.5).** The owner revokes a resource it owns (`resource_revoke`);
@@ -666,7 +666,7 @@ The kernel does not detect or break deadlocks.
 
 > **Design rule:** In any protocol where A and B both send to each other, at least one direction MUST use `try_send`. Mutual blocking sends are an anti-pattern the kernel will not detect and will not recover from. The supervisor's quantum-starvation watchdog is a last resort, not a primary mitigation.
 
-The classic deadlock — A and B both call `send` to a full queue — is the developer's responsibility to prevent at the protocol level. Use `try_send`, structure as request/response, or apply explicit timeouts.
+The classic deadlock - A and B both call `send` to a full queue - is the developer's responsibility to prevent at the protocol level. Use `try_send`, structure as request/response, or apply explicit timeouts.
 
 ---
 
@@ -721,7 +721,7 @@ When the supervisor spawns a service:
 
 **On restart:** the placement decision is re-evaluated from scratch using the rules above. The supervisor does not remember the previous core.
 
-- If the contract specified a core, that core is required again. If it is unavailable, the restart fails with `PlacementInvalid` — the same strict rule as initial spawn.
+- If the contract specified a core, that core is required again. If it is unavailable, the restart fails with `PlacementInvalid` - the same strict rule as initial spawn.
 - If the contract did not specify a core, round-robin selects a fresh core, which may differ from the previous one.
 
 This is consistent with invariant 11 (identity is stable; location is not). Sticky placement would make location stable across restart, contradicting the principle. Mid-execution migration remains forbidden.
@@ -803,7 +803,7 @@ When a page is unmapped (service killed, memory reclaimed), the kernel issues a 
     ── start APs (real-mode trampoline → long mode)
          APs: enter idle scheduler loop
     ── mark all available cores ready
-    ── spawn supervisor on Core 0   (the kernel's ONE direct spawn — no init)
+    ── spawn supervisor on Core 0   (the kernel's ONE direct spawn - no init)
 
   supervisor (Core 0)
     ── spawn logger on Core 0
@@ -818,20 +818,20 @@ When a page is unmapped (service killed, memory reclaimed), the kernel issues a 
 > is removed; the registry *service* is retired.** Moving name→endpoint resolution out of the kernel
 > (`docs/naming-design.md`, Path C §3.7) makes the supervisor the name authority. Phase 3b moved the
 > name service under the supervisor; Phase 4 then **retired the registry service** entirely (the
-> kernel's minimal `name → endpoint` recovery directory — `ipc::names` + the gated `AcquireSendCap` —
+> kernel's minimal `name → endpoint` recovery directory - `ipc::names` + the gated `AcquireSendCap` -
 > is the namer now; the supervisor wires every service from its `name → cap` map and clients reacquire
 > by name through the directory). Phase 5 **removes `init`**: the kernel's *one* direct spawn is the
-> supervisor (`task::spawn_supervisor`, using the gated `SUPERVISOR_ELF`), and the supervisor — not
-> init — spawns the logger. The supervisor's boot-time spawn failure is still **fatal** (the kernel
-> panics, `"supervisor spawn failed"`, §11.3, §6.2) — now from the kernel's direct spawn rather than
+> supervisor (`task::spawn_supervisor`, using the gated `SUPERVISOR_ELF`), and the supervisor - not
+> init - spawns the logger. The supervisor's boot-time spawn failure is still **fatal** (the kernel
+> panics, `"supervisor spawn failed"`, §11.3, §6.2) - now from the kernel's direct spawn rather than
 > an init abort. The non-restartable set is now just **`supervisor` + kernel**.
 
 The bootloader is **Limine**, accessed via the Limine Boot Protocol. Limine is responsible for loading the kernel image, supplying the physical memory map, the framebuffer descriptor, kernel relocation info, and the SMP topology (APIC IDs of all available cores). See Appendix A for the bootloader rationale and installation story.
 
 ### 11.2 BSP and APs
 
-- **BSP (Bootstrap Processor)** — the first core to execute kernel code. Responsible for kernel init and bringing APs online.
-- **APs (Application Processors)** — secondary cores. Brought up via real-mode trampoline (`arch/x86_64/ap_boot.rs`), then jump to long-mode kernel code, then enter idle.
+- **BSP (Bootstrap Processor)** - the first core to execute kernel code. Responsible for kernel init and bringing APs online.
+- **APs (Application Processors)** - secondary cores. Brought up via real-mode trampoline (`arch/x86_64/ap_boot.rs`), then jump to long-mode kernel code, then enter idle.
 
 Because Limine supplies APIC IDs directly, the kernel does not need to probe ACPI/MADT for SMP topology. This removes a non-trivial subsystem from `arch/x86_64/ap_boot.rs`.
 
@@ -842,7 +842,7 @@ Because Limine supplies APIC IDs directly, the kernel does not need to probe ACP
 | Bootloader        | Hardware reset                         |
 | Kernel BSP init   | Kernel panic, halt                     |
 | AP startup        | Kernel logs warning, continues with available cores; if zero APs come up, system runs as single-core |
-| supervisor spawn (by the kernel — the one direct spawn, no init) | Kernel panic, halt (TCB) — `"supervisor spawn failed"` |
+| supervisor spawn (by the kernel - the one direct spawn, no init) | Kernel panic, halt (TCB) - `"supervisor spawn failed"` |
 | logger spawn (by the supervisor) | Supervisor logs to kernel ring buffer, retry once |
 | Application svc   | Supervisor logs, may retry per policy  |
 | Service contracted to unavailable core | Spawn rejected with `PlacementInvalid`; supervisor logs and skips; system runs without that service |
@@ -979,25 +979,25 @@ Every syscall checks the calling task's capability table, populated *from* the c
 ```text
   Steady state: Service A (Core 0) holds cap to Service B gen=4 (Core 1)
 
-  Step 1 — Supervisor kills B:
+  Step 1 - Supervisor kills B:
     Kernel closes B's endpoints, drains queues
     Kernel bumps B's generation: 4 → 5
     Kernel reclaims B's memory (TLB shootdown on all cores)
 
-  Step 2 — A tries to send via stale cap:
+  Step 2 - A tries to send via stale cap:
     A ── send(gen=4 cap) ──▶ Kernel ── EndpointDead ──▶ A
                               (gen mismatch: held=4, current=5)
 
-  Step 3 — Supervisor spawns B on Core 2:
+  Step 3 - Supervisor spawns B on Core 2:
     Kernel starts B with fresh cap table (gen=5)
     B registers endpoint with registry
 
-  Step 4 — A reacquires:
+  Step 4 - A reacquires:
     A ── registry.lookup("B") ──▶ fresh cap (gen=5, Core 2)
     A ── send(gen=5 cap) ──▶ Ok  (routes to Core 2)
 ```
 
-**Key principle:** the new instance may run on a different core than the old one. Clients never know — they see only `EndpointDead`, look up via registry, and resume.
+**Key principle:** the new instance may run on a different core than the old one. Clients never know - they see only `EndpointDead`, look up via registry, and resume.
 
 ### 14.3 Cascading Failure
 
@@ -1012,10 +1012,10 @@ supervisor.restart(service_name, placement_override?: CoreId) -> Result<()>
 
 Required capability: `service_control` (held only by supervisor).
 
-- **`kill`** — immediate. The killed service does not get a chance to clean up. Clean shutdown is a separate codepath.
-- **`restart`** — kill followed by spawn. Placement is determined as follows:
+- **`kill`** - immediate. The killed service does not get a chance to clean up. Clean shutdown is a separate codepath.
+- **`restart`** - kill followed by spawn. Placement is determined as follows:
   - If `placement_override` is provided, the supervisor requires that core (subject to the strict rules of §9.2; rejected if the core is unavailable).
-  - If `placement_override` is omitted, the placement decision is re-evaluated from scratch per §9.2 — contract-specified placement re-applies (and may fail with `PlacementInvalid` if unavailable); unspecified placement gets a fresh round-robin choice.
+  - If `placement_override` is omitted, the placement decision is re-evaluated from scratch per §9.2 - contract-specified placement re-applies (and may fail with `PlacementInvalid` if unavailable); unspecified placement gets a fresh round-robin choice.
   - **The previous core is not remembered.** A service that ran on core 1 before the restart has no implicit affinity for core 1 after.
 
 ### 14.5 Kill Semantics
@@ -1028,9 +1028,9 @@ Kill is for misbehaving services and for restart. It is not a graceful shutdown 
 
 State belongs to services, not the kernel. Services that need to survive restart must persist externally and reconstruct on startup.
 
-The filesystem service is the externalization mechanism for everyone else and cannot persist *to itself*. Resolution: the block driver holds a direct hardware capability and stores fs metadata. `fs` gives itself **transactional metadata recovery** — every mutation commits through a crash-consistent redo-journal and `fs` recovers to a consistent state on mount (`docs/persistence.md` §6.8). With that, `block-driver` and `fs` are **restartable** and no longer in the TCB (§6.1 Phase D amendment, 2026-06-17); their death is a supervisor restart, not a reboot.
+The filesystem service is the externalization mechanism for everyone else and cannot persist *to itself*. Resolution: the block driver holds a direct hardware capability and stores fs metadata. `fs` gives itself **transactional metadata recovery** - every mutation commits through a crash-consistent redo-journal and `fs` recovers to a consistent state on mount (`docs/persistence.md` §6.8). With that, `block-driver` and `fs` are **restartable** and no longer in the TCB (§6.1 Phase D amendment, 2026-06-17); their death is a supervisor restart, not a reboot.
 
-Stateless services (logger in v1) restart trivially. Example application services (ping, pong) are also stateless and restart trivially — but they are demonstration services in `examples/`, not permanent architectural components.
+Stateless services (logger in v1) restart trivially. Example application services (ping, pong) are also stateless and restart trivially - but they are demonstration services in `examples/`, not permanent architectural components.
 
 ---
 
@@ -1048,7 +1048,7 @@ Stateless services (logger in v1) restart trivially. Example application service
     Supervisor restarts service with new binary
 ```
 
-Push vs pull is irrelevant — verification is the security property. Live code update is permanently rejected (§2.5); the only update mechanism is restart-with-new-binary.
+Push vs pull is irrelevant - verification is the security property. Live code update is permanently rejected (§2.5); the only update mechanism is restart-with-new-binary.
 
 ---
 
@@ -1082,8 +1082,8 @@ Iteration loop: edit → `build` → `publish` → `restart` → `logs`. Only th
 **Plus the SDK's audited hardware/ABI layer:** the syscall ABI (`raw_syscall`,
 inline `asm!`) and the MMIO/DMA accessor modules (`sdk/rust/src/mmio.rs` and
 `sdk/rust/src/dma.rs`). Userspace drivers (§12) cannot touch device registers or
-DMA memory without `unsafe`; isolating it to these designated SDK modules — each
-block carrying a `// SAFETY:` comment — keeps the *driver services themselves*
+DMA memory without `unsafe`; isolating it to these designated SDK modules - each
+block carrying a `// SAFETY:` comment - keeps the *driver services themselves*
 `unsafe`-free behind safe wrappers (`Mmio::read32`, `Dma::write32`, etc.), exactly
 as the kernel isolates its `unsafe` to the four layers above. This is a recognition
 of what the syscall ABI already required, extended to the hardware access §12 needs.
@@ -1091,7 +1091,7 @@ of what the syscall ABI already required, extended to the hardware access §12 n
 ### 18.2 Forbidden
 
 All userspace services, `osdev/`, and all of `sdk/` **except** the audited
-hardware/ABI layer named in §18.1 — and all kernel code outside the four
+hardware/ABI layer named in §18.1 - and all kernel code outside the four
 permitted layers. A driver service that writes `unsafe` directly (rather than
 going through the SDK's safe `Mmio`/`Dma` wrappers) is rejected.
 
@@ -1120,11 +1120,11 @@ safety + necessity rationale.
 
 New `unsafe` that a feature or hardening needs must first try to live in a permitted
 layer (`arch/`, `memory/`, `capability/`, `smp/`) rather than grow a grandfathered
-file. A precondition that is merely *boot-ordering* (violating it wedges boot — a
+file. A precondition that is merely *boot-ordering* (violating it wedges boot - a
 liveness bug, not UB) does **not** justify an `unsafe fn`; make it a safe `fn` with a
 documented contract, like `memory::init` / `smp::init`. Worked example: the H4
 kstack-guard / W^X hardening (2026-06-08) was structured so its page-table `unsafe`
-lives in `arch/` and the boot call sites are safe `fn`s — `main.rs` and `task/mod.rs`
+lives in `arch/` and the boot call sites are safe `fn`s - `main.rs` and `task/mod.rs`
 stayed at their floors with **no amendment needed**. There are currently no
 amendments to the grandfathered floors.
 
@@ -1136,7 +1136,7 @@ Bugs are classified as one of: `kernel`, `arch`, `memory`, `ipc`, `capability`, 
 
 Bug reports include: logs (kernel ring buffer + service), contract(s), QEMU repro steps including `-smp N` value, expected behavior, actual behavior, suspected classification.
 
-Kernel panics write to serial console **and** a reserved memory page that survives reboot. On next boot, the kernel logs the stored panic reason (init, which used to, is removed — Phase 5). Panics on any core halt the system.
+Kernel panics write to serial console **and** a reserved memory page that survives reboot. On next boot, the kernel logs the stored panic reason (init, which used to, is removed - Phase 5). Panics on any core halt the system.
 
 ---
 
@@ -1195,8 +1195,8 @@ The test suite is layered. Each layer answers a different question about kernel 
 
 ```text
   ┌─────────────────────────────────────────────────────────────────────┐
-  │  Foundation — must pass before anything else                        │
-  │  Identity (§22) — Tests 1–11 ✅ — Constitutional invariants        │
+  │  Foundation - must pass before anything else                        │
+  │  Identity (§22) - Tests 1–11 ✅ - Constitutional invariants        │
   └──────────────────────┬──────────────────────────────────────────────┘
           ┌──────────────┴─────────────────┐
           ▼                                ▼
@@ -1239,13 +1239,13 @@ tests/qemu/
 
 The base harness (§22.3) boots the OS with a configurable `-smp N` value; multi-core tests assert on N ≥ 2. The battle-hardening categories extend it with longer timeouts (stress, perf), metric collection (perf), and fault injection (chaos).
 
-The bar across every category is the same as identity: **no FAIL, no BLOCKED with a vague reason**. A failure means a real bug — fix it, add a regression test to the appropriate suite, then move on.
+The bar across every category is the same as identity: **no FAIL, no BLOCKED with a vague reason**. A failure means a real bug - fix it, add a regression test to the appropriate suite, then move on.
 
 ---
 
-#### Identity (§22) — Complete
+#### Identity (§22) - Complete
 
-All passing (Tests 1–15; harness reports 24 cases incl. A/B + IR + Test 11 + Test 15). No regressions allowed. Any failure here is a constitutional violation that requires either a kernel fix or a CLAUDE.md amendment. **Test 11 (added by H11) is now *name-resolves-after-restart-via-the-kernel-directory* — the registry service was retired in naming Phase 4 / Path C (`docs/naming-design.md` §3.7), so Test 11 pins the directory's restart property instead of a registry service.** **Test 1B now corrupts the `supervisor` (the registry it used to corrupt is gone).** **Test 15 (Path C / Phase 6) pins that the `supervisor` itself survives its own restart — the kernel respawns it, so the unkillable set is `{kernel}` alone.**
+All passing (Tests 1–15; harness reports 24 cases incl. A/B + IR + Test 11 + Test 15). No regressions allowed. Any failure here is a constitutional violation that requires either a kernel fix or a CLAUDE.md amendment. **Test 11 (added by H11) is now *name-resolves-after-restart-via-the-kernel-directory* - the registry service was retired in naming Phase 4 / Path C (`docs/naming-design.md` §3.7), so Test 11 pins the directory's restart property instead of a registry service.** **Test 1B now corrupts the `supervisor` (the registry it used to corrupt is gone).** **Test 15 (Path C / Phase 6) pins that the `supervisor` itself survives its own restart - the kernel respawns it, so the unkillable set is `{kernel}` alone.**
 
 ---
 
@@ -1264,7 +1264,7 @@ Property tests assert *universal* claims over randomized inputs. Identity tests 
 | P7  | After unmap + TLB shootdown, the page is unreadable from every core            | §10.5                 |
 | P8  | After restart, name resolves to a task with the same name and higher generation | §14.2                 |
 | P9  | Generation bump invalidates ALL holders, not just some                         | §7.5                  |
-| P10 | Every `send` returns exactly one of {Ok, defined error} — never both, never neither | §8.6              |
+| P10 | Every `send` returns exactly one of {Ok, defined error} - never both, never neither | §8.6              |
 
 Bar: any property failure is a logic bug. Kernel must be fixed before any other work proceeds.
 
@@ -1327,7 +1327,7 @@ Performance benchmarks lock in numbers so regressions are detected commit-to-com
 | B9  | Message copy cost: 4 KiB upper-bound copy             |
 | B10 | Scheduler decision cost: time to pick next task       |
 
-Results are committed to `tests/qemu/perf/baseline.json`. CI compares each run against baseline and flags regressions ≥ 10%. The §7.8 single global `RwLock` will surface most visibly in B7 — record the number now so the v2 sharded/RCU migration has a target.
+Results are committed to `tests/qemu/perf/baseline.json`. CI compares each run against baseline and flags regressions ≥ 10%. The §7.8 single global `RwLock` will surface most visibly in B7 - record the number now so the v2 sharded/RCU migration has a target.
 
 ---
 
@@ -1410,11 +1410,11 @@ A test failing for the wrong reason (compile error, harness bug, missing cap not
 
 **Pins:** §11 (Bootstrap), §6 (TCB).
 
-#### 1.A — Positive: Healthy Multi-Core Boot
+#### 1.A - Positive: Healthy Multi-Core Boot
 
 ```
 test bootstrap_steady_state_positive:
-    # Phase 5: no init — the kernel spawns the supervisor directly; the supervisor spawns logger.
+    # Phase 5: no init - the kernel spawns the supervisor directly; the supervisor spawns logger.
     image = build_kernel(boot_manifest=[supervisor, logger])
     qemu  = boot(image, smp=4)
 
@@ -1424,7 +1424,7 @@ test bootstrap_steady_state_positive:
     assert kernel_did_not_panic()
 ```
 
-#### 1.B — Negative: TCB Failure Panics
+#### 1.B - Negative: TCB Failure Panics
 
 ```
 test bootstrap_tcb_failure_panics:
@@ -1445,7 +1445,7 @@ test bootstrap_tcb_failure_panics:
 
 **Pins:** §3.1 (no ambient authority), §7 (use validation).
 
-#### 2.A — Positive
+#### 2.A - Positive
 
 ```
 test cap_enforcement_positive:
@@ -1454,7 +1454,7 @@ test cap_enforcement_positive:
     assert logger_received("hello")
 ```
 
-#### 2.B — Negative
+#### 2.B - Negative
 
 ```
 test cap_enforcement_negative:
@@ -1470,7 +1470,7 @@ test cap_enforcement_negative:
 
 **Pins:** §8 (IPC), §7.4 (`SEND` right).
 
-#### 3.A — Positive
+#### 3.A - Positive
 
 ```
 test ipc_send_recv_positive:
@@ -1482,7 +1482,7 @@ test ipc_send_recv_positive:
     assert msg.payload == "ping"
 ```
 
-#### 3.B — Negative
+#### 3.B - Negative
 
 ```
 test ipc_send_without_send_right:
@@ -1498,7 +1498,7 @@ test ipc_send_without_send_right:
 
 **Pins:** §8.6 (failure semantics), §14.2 (restart drops endpoints), §8.5 (queue depth = 16).
 
-#### 4.A — Positive: Send-After-Death Returns EndpointDead
+#### 4.A - Positive: Send-After-Death Returns EndpointDead
 
 ```
 test endpoint_death_send_returns_dead:
@@ -1511,7 +1511,7 @@ test endpoint_death_send_returns_dead:
     assert a.try_send(b.endpoint, "after death") == Err(EndpointDead)
 ```
 
-#### 4.B — Negative: Blocked Sender Wakes With EndpointDead
+#### 4.B - Negative: Blocked Sender Wakes With EndpointDead
 
 The queue depth is 16 (§8.5), so this test fills it deterministically.
 
@@ -1539,7 +1539,7 @@ test blocked_sender_wakes_on_endpoint_death:
 
 **Pins:** §7.6 (transfer rule), §7.4 (`GRANT` right).
 
-#### 5.A — Positive
+#### 5.A - Positive
 
 ```
 test grant_positive:
@@ -1554,7 +1554,7 @@ test grant_positive:
     assert sender.has_cap("X") == false
 ```
 
-#### 5.B — Negative
+#### 5.B - Negative
 
 ```
 test grant_negative:
@@ -1573,7 +1573,7 @@ test grant_negative:
 
 **Pins:** §14.2 (restart flow), §14.3 (cascading failure).
 
-#### 6.A — Positive
+#### 6.A - Positive
 
 ```
 test supervisor_restart_positive:
@@ -1588,7 +1588,7 @@ test supervisor_restart_positive:
     assert all_other_services_alive()
 ```
 
-#### 6.B — Negative
+#### 6.B - Negative
 
 ```
 test stale_cap_revoked_after_restart:
@@ -1610,7 +1610,7 @@ test stale_cap_revoked_after_restart:
 
 **Pins:** §10.3 (enforcement), §10.4 (two failure modes).
 
-#### 7.A — Positive
+#### 7.A - Positive
 
 ```
 test memory_alloc_within_limit:
@@ -1620,7 +1620,7 @@ test memory_alloc_within_limit:
     assert s.is_alive()
 ```
 
-#### 7.B — Negative (Two Modes)
+#### 7.B - Negative (Two Modes)
 
 ```
 test memory_alloc_beyond_limit_recoverable:
@@ -1645,7 +1645,7 @@ test memory_protection_violation_kills_service:
 
 **Pins:** §3.6 (no service can monopolize), §9.1 (10 ms quantum), §9.3 (yield is advisory).
 
-#### 8.A — Positive
+#### 8.A - Positive
 
 ```
 test yield_advisory_works:
@@ -1657,7 +1657,7 @@ test yield_advisory_works:
     assert yielder.tick_count >= 50
 ```
 
-#### 8.B — Negative
+#### 8.B - Negative
 
 ```
 test non_yielding_service_is_preempted:
@@ -1677,7 +1677,7 @@ test non_yielding_service_is_preempted:
 
 **Pins:** §8.3 (routing), §8.4 (send flow), §9 (per-core scheduler).
 
-#### 9.A — Positive
+#### 9.A - Positive
 
 ```
 test cross_core_ipc_positive:
@@ -1692,7 +1692,7 @@ test cross_core_ipc_positive:
     assert msg.payload == "hello from core 0"
 ```
 
-#### 9.B — Negative
+#### 9.B - Negative
 
 ```
 test cross_core_no_authority_leak:
@@ -1710,7 +1710,7 @@ test cross_core_no_authority_leak:
 
 **Pins:** §9.2 (placement, strict), §14.2 (restart can change core), §14.4 (placement override), §11 (identity stable; location not).
 
-#### 10.A — Positive
+#### 10.A - Positive
 
 ```
 test restart_changes_core_transparently:
@@ -1725,7 +1725,7 @@ test restart_changes_core_transparently:
     assert pong.generation     > pong_gen_old
 ```
 
-#### 10.B — Negative
+#### 10.B - Negative
 
 ```
 test client_reacquires_after_core_change:
@@ -1755,7 +1755,7 @@ minimal recovery *directory*, not a service).
 > §3.7, "Path C"). Name→endpoint resolution is a **minimal directory inside the kernel** (`ipc::names`
 > + the gated `AcquireSendCap`); the supervisor wires services from a `name → cap` map and clients
 > reacquire names via the directory. There is no registry service to kill. This test was
-> *"registry survives its own restart"* (H11); it now pins the directory's restart property — a
+> *"registry survives its own restart"* (H11); it now pins the directory's restart property - a
 > restartable service killed and respawned must re-establish without a kernel panic, and its name
 > must resolve to the **new** instance (the directory re-records it on respawn). `block-driver` is the
 > disk-free restartable target (it idles with no disk in the identity build).
@@ -1769,7 +1769,7 @@ test name_resolves_after_restart_via_directory:
     assert serial_contains("supervisor: block-driver restarted")
     assert serial_contains("name-map + block-driver")  # re-recorded → directory resolves the new instance
     assert kernel_did_not_panic()
-    # Clients reacquire "block-driver" by name via the kernel directory (§14.3) — pinned end-to-end
+    # Clients reacquire "block-driver" by name via the kernel directory (§14.3) - pinned end-to-end
     # for fs←block-driver and shell←fs by the files-test double-storm regression.
 ```
 
@@ -1777,13 +1777,13 @@ test name_resolves_after_restart_via_directory:
 
 ### Test 12: Confined Driver Cannot DMA Outside Its Arena (H1)
 
-**Pins:** §3.1 / invariant 1 (no ambient authority — the DMA gap), §6.4 (DMA-capable
+**Pins:** §3.1 / invariant 1 (no ambient authority - the DMA gap), §6.4 (DMA-capable
 drivers are least-privilege when IOMMU-confined), §12 (drivers).
 
 The point of H1: a confined DMA-capable driver's device can reach only its granted
 arena. A DMA outside it must be **blocked at the IOMMU** (a logged `IO_PAGE_FAULT` on
 real hardware), never silently read/write other memory. This is the executable form of
-the §6.4 trust claim — without it, "confined" is a word, not a guarantee.
+the §6.4 trust claim - without it, "confined" is a word, not a guarantee.
 
 Runs only where an IOMMU is present (`osdev test iommu` launches QEMU with
 `-device amd-iommu`); on a machine with no IVRS the driver is trusted (§6.4) and the
@@ -1791,10 +1791,10 @@ test is not applicable.
 
 **Verification is structural, not a live fault, and the reason is a QEMU limitation.**
 QEMU's emulated `amd-iommu` installs the device tables and page tables but does **not**
-enforce translation faults on unmapped I/O addresses — a device DMA to an unmapped page
+enforce translation faults on unmapped I/O addresses - a device DMA to an unmapped page
 is silently allowed through. So a live `IO_PAGE_FAULT` cannot be observed under QEMU.
 The harness therefore asserts the property QEMU *can* be made to prove: the kernel's
-confinement **selftest** — a CPU-side walk of the device's I/O page table — confirms the
+confinement **selftest** - a CPU-side walk of the device's I/O page table - confirms the
 arena translates identity and the page one past it is **unmapped** (so a DMA there has no
 translation and *would* fault on conforming silicon). That selftest is exactly the
 structure an `IO_PAGE_FAULT` is raised from; pinning it pins the guarantee. (The live
@@ -1808,7 +1808,7 @@ test confined_driver_dma_faults:           # osdev test iommu
     assert serial_contains("iommu: ... confined BDF")         # driver is confined to its arena
 
     # The kernel's confinement selftest walks the device's I/O page table: the arena
-    # maps identity, and the page one past arena_end has NO mapping — the structural
+    # maps identity, and the page one past arena_end has NO mapping - the structural
     # form of "out-of-arena DMA would fault" (QEMU can't raise the fault itself).
     assert serial_contains("iommu: selftest PASS")
     assert serial_contains("(outside) unmapped")
@@ -1860,7 +1860,7 @@ test fs_survives_own_restart:                     # osdev test fs-restart
 authority), §3.3 (authority by capability, not identity).
 
 The P2 amendment (2026-06-18) makes a file a real, kernel-minted capability via delegated resource
-caps. This test pins that the file cap is a *genuine* capability — not a service-level token — by
+caps. This test pins that the file cap is a *genuine* capability - not a service-level token - by
 exercising the three properties that distinguish one: unforgeable, revocable, non-escalating.
 
 ```
@@ -1888,25 +1888,25 @@ test file_is_a_capability:
 **Implemented (2026-06-18) as `osdev test file-cap` (9/9 ✅).** The shell `fcap <file>` command opens a
 file as a real kernel capability and exercises every property above end-to-end: read/write *through*
 the cap; non-escalation at **both** layers (the kernel rejects a READ-only cap's WRITE invocation with
-`CapInsufficientRights`, and `fs` refuses a write op carried under a read-validated badge — `op ≤ right`);
+`CapInsufficientRights`, and `fs` refuses a write op carried under a read-validated badge - `op ≤ right`);
 a fabricated handle is rejected (unforgeable); and the cap is `CapRevoked` after close/delete (revocable).
 The badge that carries the validated `(resource_id, right)` to `fs` is an unforgeable kernel-set `Message`
-field (`LastRecvBadge` syscall) — a client cannot fake a file-cap invocation over its ordinary `fs` send cap.
+field (`LastRecvBadge` syscall) - a client cannot fake a file-cap invocation over its ordinary `fs` send cap.
 
 ---
 
 ### Test 15: Supervisor Survives Its Own Restart (Path C / Phase 6)
 
-**Pins:** §6.2 (the supervisor is restartable — its death is a kernel respawn, not a reboot), §6.3
+**Pins:** §6.2 (the supervisor is restartable - its death is a kernel respawn, not a reboot), §6.3
 (TCB-shrink reached its floor: unkillable = `{kernel}`), §3.7/§4.4 (the kernel is the recovery
 anchor), §14 (restart authority), §3.11 (identity over location).
 
 > **Amendment 2026-06-21 (Path C / Phase 6): the supervisor is restartable.** Killing it (a fault, or
 > a deliberate `chaos kill-storm supervisor` / the operator control channel) must **not** panic the
-> kernel. The kernel respawns it — unconditionally, forever (no bound: a bound would re-introduce the
-> reboot and be a DoS, §6.2) — and the respawned supervisor **reconciles**: it adopts the still-running
+> kernel. The kernel respawns it - unconditionally, forever (no bound: a bound would re-introduce the
+> reboot and be a DoS, §6.2) - and the respawned supervisor **reconciles**: it adopts the still-running
 > services (reacquiring each by name from the kernel directory) instead of duplicating them. The
-> running services (pong/ping cross-core IPC, the shell) keep going throughout — the shell survives
+> running services (pong/ping cross-core IPC, the shell) keep going throughout - the shell survives
 > killing its own spawner. This is the executable proof that the unkillable set is `{kernel}` alone.
 
 ```
@@ -1914,11 +1914,11 @@ test supervisor_survives_own_restart:           # osdev test identity (also: cha
     wait_for_serial("supervisor: ready")
     control.kill("supervisor")                    # was a kernel panic pre-Phase-6 (it was trusted root)
 
-    assert serial_contains("kernel: supervisor died — respawning")   # the kernel is the recovery anchor
+    assert serial_contains("kernel: supervisor died - respawning")   # the kernel is the recovery anchor
     assert serial_contains("supervisor: adopted running block-driver") # reconciled, not duplicated
     assert kernel_did_not_panic()
     # The shell-test storms it 4× (chaos kill-storm supervisor 4 → recovered 4/4, kernel alive, no
-    # bound) and the prompt still answers afterward — the system stayed up across every respawn.
+    # bound) and the prompt still answers afterward - the system stayed up across every respawn.
 ```
 
 ---
@@ -1987,7 +1987,7 @@ GodspeedOS has booted on real x86_64 hardware (4-core CPU, 4 GB RAM) via UEFI US
 failed 0`**. That run includes the full persistence stack (GSFS0008 format, journal, fsck/`drives check`,
 read-only `drives scrub`) and the **file-as-capability** self-check (`fcap`, §22 Test 14): a file opened
 as a real kernel capability, read/written *through* the cap, non-escalation enforced at both the kernel
-and fs layers, a forged handle rejected, and the cap revoked on close and on rename — all green on real
+and fs layers, a forged handle rejected, and the cap revoked on close and on rename - all green on real
 hardware, no panic. The §7 "north star" (a file *is* a capability, true not approximate) is hardware-
 validated, not just QEMU. Serial in `build/putty_serial_output.log`.
 
@@ -2004,9 +2004,9 @@ Hardware performance data (perf-brutal-only build, ~3 GHz CPU, 2026-05-21):
 | BP8 allocator | 616 cycles/4KiB page (~205 ns) |
 | BP9 message copy 4KiB | 20,073 cycles (~6.7 µs) |
 | BP10 scheduler decision | 2,323 cycles (~774 ns) |
-| BP2 IPC cross-core | Not measured on J5005 (Goldmont+ stalled cross-core under load) — measured on the T630, see table below |
+| BP2 IPC cross-core | Not measured on J5005 (Goldmont+ stalled cross-core under load) - measured on the T630, see table below |
 
-HP T630 (AMD GX-420GI, Jaguar/Puma+, ~2 GHz) — per-probe **isolated** measurements
+HP T630 (AMD GX-420GI, Jaguar/Puma+, ~2 GHz) - per-probe **isolated** measurements
 (one benchmark alone: no ping/pong, no competing probes; 2026-05-31, build `ed8a151`).
 µs/ms at ~2 GHz:
 
@@ -2026,10 +2026,10 @@ HP T630 (AMD GX-420GI, Jaguar/Puma+, ~2 GHz) — per-probe **isolated** measurem
 All cycle counts. † = perf-brutal in-suite p50 (already low-variance); the rest are
 single-probe isolation builds (`osdev image --mode iso-bp{3,5,7,9,10}`; bp5 covers BP5+BP6).
 The two columns are **not** a clean head-to-head: J5005 was perf-brutal (contended), the T630
-column is isolated (uncontended), so they compare fairly only where both were clean —
+column is isolated (uncontended), so they compare fairly only where both were clean -
 BP1/BP4/BP8 at ~1.9–2.5×, genuine Jaguar-vs-Goldmont IPC. Where the T630 number is *lower*
 (BP3) the J5005 figure was itself contention-inflated. BP5/BP6 (spawn/restart) are
-memory-bandwidth-bound — the low-power thin client lags most there. The full investigation
+memory-bandwidth-bound - the low-power thin client lags most there. The full investigation
 behind BP2 (the COM2 timer-ISR wedge, fixed `a306fd3`) is in `bugs/1_FINDINGS_AP_TO_BSP_IPI.md`.
 
 ### 23.4 Out of Scope for v1
@@ -2040,27 +2040,27 @@ Filesystem persistence beyond the trusted block driver, network stack, work-stea
 
 ## 24. Glossary
 
-- **AP** — Application Processor. Any core other than the BSP.
-- **BSP** — Bootstrap Processor. The first core to execute kernel code.
-- **Capability** — Unforgeable token: ResourceId + Rights + Generation.
-- **Delegated resource capability** — A capability for a resource whose *meaning* is defined by a service (e.g. a file owned by `fs`), not the kernel. The owning service mints and revokes it (`resource_mint`/`resource_revoke`, gated by a `RESOURCE_MINT` cap); the kernel validates and routes it as for any cap, badging a send with the opaque `ResourceId` so the owner knows which resource. The mechanism behind file-as-capability (§7.10, P2).
-- **Endpoint** — IPC destination owned by a service. Bounded queue, depth 16 in v1.
-- **Generation** — Monotonic counter on resources; mismatch on cap use indicates the resource was destroyed or replaced.
-- **Grant** — The right to transfer a capability via IPC.
-- **Identity test** — A test that pins a constitutional decision (§22).
-- **IPI** — Inter-Processor Interrupt. Mechanism for a core to wake another core.
-- **Limine** — The bootloader used in v1. See Appendix A.
-- **Placement** — Strict assignment of a service to a specific core at spawn time. Re-evaluated from scratch on every spawn, including post-restart spawns; the previous core is not remembered.
-- **PlacementInvalid** — Error returned when a contracted core is unavailable; spawn rejected, supervisor logs and skips.
-- **Quantum** — The 10 ms time slice after which the per-core scheduler preempts.
-- **Routing table** — Kernel structure mapping `EndpointId → (CoreId, Generation, Liveness)`.
-- **TCB** — Trusted Computing Base. Kernel + arch + smp + init + supervisor. `registry` left the TCB via H11 (and the **registry service was then retired entirely** — naming Phase 4 / Path C, `docs/naming-design.md` §3.7); `block-driver` + `fs` left via the Phase D amendment (§6.1, once `fs` gained crash-consistent recovery). DMA drivers (`xhci`/`ehci`) are in the TCB only on a machine without an IOMMU (§6.4).
-- **Trusted root** — `supervisor` (sole; `init` was removed in Path C / Phase 5 — the kernel spawns the supervisor directly). It is **trusted but restartable** (Path C / Phase 6, §6.2): the kernel respawns it on death — unconditionally, forever — so its failure is recovered, not a reboot. The **only unkillable component is the kernel itself**. (`block-driver` + `fs` are restartable storage services.)
-- **Name directory** — the kernel's minimal `name → EndpointId` map (`ipc::names`) + a gated "mint a SEND cap by name" (`AcquireSendCap`). The bounded recovery anchor that **replaced the registry service** (naming Phase 4 / Path C, §3.7): the supervisor wires services from a `name → cap` map and clients reacquire names through the directory. *(The retired `registry` userspace name service is `docs/registry.md` — historical.)*
-- **Service** — Userspace component with a contract, capability table, and isolated address space.
-- **Contract** — `service.toml` declaring resource, capability, and placement requirements.
-- **Supervisor** — User-space service holding restart authority over other services.
-- **`osdev`** — Host-side CLI for building, publishing, and controlling the OS in QEMU.
+- **AP** - Application Processor. Any core other than the BSP.
+- **BSP** - Bootstrap Processor. The first core to execute kernel code.
+- **Capability** - Unforgeable token: ResourceId + Rights + Generation.
+- **Delegated resource capability** - A capability for a resource whose *meaning* is defined by a service (e.g. a file owned by `fs`), not the kernel. The owning service mints and revokes it (`resource_mint`/`resource_revoke`, gated by a `RESOURCE_MINT` cap); the kernel validates and routes it as for any cap, badging a send with the opaque `ResourceId` so the owner knows which resource. The mechanism behind file-as-capability (§7.10, P2).
+- **Endpoint** - IPC destination owned by a service. Bounded queue, depth 16 in v1.
+- **Generation** - Monotonic counter on resources; mismatch on cap use indicates the resource was destroyed or replaced.
+- **Grant** - The right to transfer a capability via IPC.
+- **Identity test** - A test that pins a constitutional decision (§22).
+- **IPI** - Inter-Processor Interrupt. Mechanism for a core to wake another core.
+- **Limine** - The bootloader used in v1. See Appendix A.
+- **Placement** - Strict assignment of a service to a specific core at spawn time. Re-evaluated from scratch on every spawn, including post-restart spawns; the previous core is not remembered.
+- **PlacementInvalid** - Error returned when a contracted core is unavailable; spawn rejected, supervisor logs and skips.
+- **Quantum** - The 10 ms time slice after which the per-core scheduler preempts.
+- **Routing table** - Kernel structure mapping `EndpointId → (CoreId, Generation, Liveness)`.
+- **TCB** - Trusted Computing Base. Kernel + arch + smp + init + supervisor. `registry` left the TCB via H11 (and the **registry service was then retired entirely** - naming Phase 4 / Path C, `docs/naming-design.md` §3.7); `block-driver` + `fs` left via the Phase D amendment (§6.1, once `fs` gained crash-consistent recovery). DMA drivers (`xhci`/`ehci`) are in the TCB only on a machine without an IOMMU (§6.4).
+- **Trusted root** - `supervisor` (sole; `init` was removed in Path C / Phase 5 - the kernel spawns the supervisor directly). It is **trusted but restartable** (Path C / Phase 6, §6.2): the kernel respawns it on death - unconditionally, forever - so its failure is recovered, not a reboot. The **only unkillable component is the kernel itself**. (`block-driver` + `fs` are restartable storage services.)
+- **Name directory** - the kernel's minimal `name → EndpointId` map (`ipc::names`) + a gated "mint a SEND cap by name" (`AcquireSendCap`). The bounded recovery anchor that **replaced the registry service** (naming Phase 4 / Path C, §3.7): the supervisor wires services from a `name → cap` map and clients reacquire names through the directory. *(The retired `registry` userspace name service is `docs/registry.md` - historical.)*
+- **Service** - Userspace component with a contract, capability table, and isolated address space.
+- **Contract** - `service.toml` declaring resource, capability, and placement requirements.
+- **Supervisor** - User-space service holding restart authority over other services.
+- **`osdev`** - Host-side CLI for building, publishing, and controlling the OS in QEMU.
 
 ---
 
@@ -2091,12 +2091,12 @@ The v1 bootloader is **Limine**, accessed by the kernel via the **Limine Boot Pr
 
 At handoff, Limine supplies the kernel with:
 
-- **Physical memory map** — usable, reserved, ACPI, framebuffer regions all classified.
-- **Framebuffer descriptor** — base address, dimensions, pixel format. Avoids ever needing VGA text mode.
-- **Kernel relocation info** — physical and virtual base addresses of where the kernel was loaded.
-- **SMP topology** — APIC IDs of all available processors, used by `kernel/smp` and `arch/x86_64/ap_boot.rs`. This removes the need to probe ACPI/MADT in v1.
-- **Higher-half direct map** — physical memory pre-mapped at a known high-half virtual address, available immediately.
-- **Boot-time module list** — ability to load additional binaries (e.g., the initial service manifest) alongside the kernel.
+- **Physical memory map** - usable, reserved, ACPI, framebuffer regions all classified.
+- **Framebuffer descriptor** - base address, dimensions, pixel format. Avoids ever needing VGA text mode.
+- **Kernel relocation info** - physical and virtual base addresses of where the kernel was loaded.
+- **SMP topology** - APIC IDs of all available processors, used by `kernel/smp` and `arch/x86_64/ap_boot.rs`. This removes the need to probe ACPI/MADT in v1.
+- **Higher-half direct map** - physical memory pre-mapped at a known high-half virtual address, available immediately.
+- **Boot-time module list** - ability to load additional binaries (e.g., the initial service manifest) alongside the kernel.
 
 ## A.3 Why Limine for v1
 
@@ -2167,12 +2167,12 @@ The syscall ABI follows System V AMD64. Any language that can produce a freestan
 
 Plausible second-fits:
 
-- **C** — would need a `sdk/c/` of thin syscall wrappers. Capability handles become opaque integers; the type-safety of the Rust SDK is lost.
-- **Zig** — bare-metal-capable, no runtime, comparable ergonomics to C with better safety. A `sdk/zig/` is a future possibility.
+- **C** - would need a `sdk/c/` of thin syscall wrappers. Capability handles become opaque integers; the type-safety of the Rust SDK is lost.
+- **Zig** - bare-metal-capable, no runtime, comparable ergonomics to C with better safety. A `sdk/zig/` is a future possibility.
 
 Out of scope:
 
-- **Languages with substantial runtimes** (Go, Python, JavaScript, Java) — would require porting their runtime as a GodspeedOS service. Each is a multi-month project on its own.
+- **Languages with substantial runtimes** (Go, Python, JavaScript, Java) - would require porting their runtime as a GodspeedOS service. Each is a multi-month project on its own.
 
 ## B.3 Shell ≠ Unix Shell
 
@@ -2186,11 +2186,11 @@ A "shell" in this system is a capability-broker service. It:
 
 This means there is no `stdin`, only an IPC endpoint to a console service. There is no `fork`, only an authenticated request to the supervisor. There is no inherited environment, only the caps the parent explicitly granted.
 
-The full mechanics of how Unix-style scripting maps onto this model — pipes as capability-mediated endpoints, redirection as cap minting, etc. — are explored in Appendix D.
+The full mechanics of how Unix-style scripting maps onto this model - pipes as capability-mediated endpoints, redirection as cap minting, etc. - are explored in Appendix D.
 
 ## B.4 Open Question for Later
 
-When real userspace work begins, the first user-facing design decision is **how Unix-flavored the interface should feel** — Genode-style superficial familiarity (`ls /data` works, even though `ls` is a capability-bearing service) versus a fully fresh vocabulary. Either is defensible. Picking deliberately matters because retrofitting later is painful.
+When real userspace work begins, the first user-facing design decision is **how Unix-flavored the interface should feel** - Genode-style superficial familiarity (`ls /data` works, even though `ls` is a capability-bearing service) versus a fully fresh vocabulary. Either is defensible. Picking deliberately matters because retrofitting later is painful.
 
 Not a v1 decision.
 
@@ -2200,7 +2200,7 @@ Not a v1 decision.
 
 > **Status:** Non-normative. Records design intent for post-v1 directions. Items may be deferred indefinitely, redesigned, or rejected when their time comes. This appendix does not amend the constitution.
 
-## C.1 `observe` — Native Top/Htop Equivalent
+## C.1 `observe` - Native Top/Htop Equivalent
 
 **Tentative timeline:** v2 candidate.
 
@@ -2208,7 +2208,7 @@ A native introspection tool, distinct from any third-party utility, that surface
 
 The architecture makes this easier than the equivalent on Unix. Per-service state is already structured: caps held, assigned core, memory request/limit, current allocation, IPC queue depths, generation, liveness. The supervisor already knows about every service. The kernel already tracks per-task state.
 
-`observe` would be a service holding capabilities to query the supervisor and a kernel-provided introspection endpoint, formatting the result for display. There is no need to parse a `/proc`-style text interface — the data is already structured.
+`observe` would be a service holding capabilities to query the supervisor and a kernel-provided introspection endpoint, formatting the result for display. There is no need to parse a `/proc`-style text interface - the data is already structured.
 
 ## C.2 Native Metrics Emission
 
@@ -2216,7 +2216,7 @@ The architecture makes this easier than the equivalent on Unix. Per-service stat
 
 The system should emit metrics by default, without requiring third-party agents.
 
-Architectural intent: the kernel emits structured events (IPC volume, cap denials, scheduler statistics, restart events) on a known endpoint. This is a publication, not a feature baked into kernel logic — the kernel does not know what format consumers want. A separate metrics service holds the consuming capability and exports in whatever format is appropriate (Prometheus exposition, OpenTelemetry, statsd, custom).
+Architectural intent: the kernel emits structured events (IPC volume, cap denials, scheduler statistics, restart events) on a known endpoint. This is a publication, not a feature baked into kernel logic - the kernel does not know what format consumers want. A separate metrics service holds the consuming capability and exports in whatever format is appropriate (Prometheus exposition, OpenTelemetry, statsd, custom).
 
 Constraint: this must not pollute kernel scope. The kernel publishes; the metrics service interprets.
 
@@ -2236,7 +2236,7 @@ The ambition: multiple GodspeedOS instances, possibly identified by a shared tok
 
 - Synchronous IPC does not survive network latency. Either remote IPC must be a different primitive (loses transparency), or "blocking send" must mean something different cross-node (semantic fork in the API).
 - Cluster membership, leader election, and consensus are real distributed-systems problems (Raft / Paxos territory).
-- Cryptographic capability transfer over a network — caps must remain unforgeable when crossing the wire.
+- Cryptographic capability transfer over a network - caps must remain unforgeable when crossing the wire.
 - Cross-node TCB definition: does the supervisor on node A have authority over services on node B? If yes, a compromised supervisor compromises the cluster. If no, what coordinates restarts?
 - Failure semantics expand: not just node crashes, but network partitions, split-brain, and partial failures.
 
@@ -2244,7 +2244,7 @@ The ambition: multiple GodspeedOS instances, possibly identified by a shared tok
 
 - Plan 9 from Bell Labs achieved network-transparent files and processes 30+ years ago.
 - Barrelfish (Microsoft Research) explored "the OS as a distributed system" via the multikernel model.
-- MOSIX, OpenSSI, LOCUS — Linux/Unix attempts at SSI; useful for understanding what didn't work and why.
+- MOSIX, OpenSSI, LOCUS - Linux/Unix attempts at SSI; useful for understanding what didn't work and why.
 
 The architectural primitives in this constitution are unusually well-suited for revisiting these ideas. Whether and when to attempt it is open.
 
@@ -2252,11 +2252,11 @@ The architectural primitives in this constitution are unusually well-suited for 
 
 > Full design notes, failure semantics, flow control, ordering, registry scope, transport options, and TCB authority model live in `docs/cluster-design.md`. This section records the headline conclusions.
 
-The routing table generalizes from `EndpointId → CoreId` to `EndpointId → (NodeId, CoreId)`. The invariant "identity is stable; location is not" already encodes this — cluster mode extends the definition of location without changing the philosophy. The generation mechanism handles cross-node service mobility identically to how it handles cross-core restarts today.
+The routing table generalizes from `EndpointId → CoreId` to `EndpointId → (NodeId, CoreId)`. The invariant "identity is stable; location is not" already encodes this - cluster mode extends the definition of location without changing the philosophy. The generation mechanism handles cross-node service mobility identically to how it handles cross-core restarts today.
 
 The remote IPC API uses a distinct call surface (`send_remote` with explicit timeout) rather than transparent routing. The existing constitution invariants settle this: a successful local `send` guarantees queue delivery on this machine; a successful remote `send` guarantees handoff to a transport. These are different contracts with different durability and failure obligations, and pretending otherwise is the architectural mistake transparent-clustering systems have historically made. The network boundary is visible at three layers: contract (`ipc_send_remote`), type system (`RemoteSendCap` vs `LocalSendCap`), and call site. Applications that never declare `ipc_send_remote` are entirely unaffected by cluster membership.
 
-Three questions must be resolved before cluster mode can ship: the transport protocol (which shapes failure semantics and ordering guarantees), the registry consistency model (distributed name resolution is the largest single piece of work, comparable in scope to most of v1), and cross-node TCB authority (whether a supervisor on node A governs services on node B — the central security question for clustering).
+Three questions must be resolved before cluster mode can ship: the transport protocol (which shapes failure semantics and ordering guarantees), the registry consistency model (distributed name resolution is the largest single piece of work, comparable in scope to most of v1), and cross-node TCB authority (whether a supervisor on node A governs services on node B - the central security question for clustering).
 
 ---
 
@@ -2283,7 +2283,7 @@ The fundamental abstraction of a shell script is "compose a sequence of commands
 
 ## D.3 The Pipe Pattern
 
-The interesting case is the pipe, because Unix pipes rely on fork and inherited file descriptors — neither of which exists.
+The interesting case is the pipe, because Unix pipes rely on fork and inherited file descriptors - neither of which exists.
 
 In GodspeedOS, `cmd1 | cmd2` becomes:
 
@@ -2311,7 +2311,7 @@ Capability-mediated scripting is meaningfully safer than POSIX shell *by constru
 
 There is no equivalent of "ambient authority leaked through fork-exec and now the wrong process deleted everything."
 
-## D.5 Language Design — Open Question
+## D.5 Language Design - Open Question
 
 The script language syntax does not fall out of the architecture. Three plausible directions:
 
@@ -2366,7 +2366,7 @@ None of this is v1, v2, or v3 work. It is what becomes possible once:
 
 - The kernel and TCB are stable.
 - A real userspace exists (logger, fs, network).
-- A supervisor API for service-initiated spawn (with cap delegation) exists — currently `supervisor.spawn` is supervisor-internal.
+- A supervisor API for service-initiated spawn (with cap delegation) exists - currently `supervisor.spawn` is supervisor-internal.
 - The userspace community has formed enough to have opinions on what shell language to design.
 
 This appendix exists so that, when that time comes, the design intent is on record and the architectural reasoning is preserved.
@@ -2528,16 +2528,16 @@ then the subsystem is incomplete.
 
 The **default** mechanism for bounded memory is **no heap**. State lives in fixed stack arrays,
 in bounded reusable arenas (a fixed region + a bump pointer, reset between operations), or in
-immutable rodata — never behind a general allocator. The heap reflex is resisted by default.
+immutable rodata - never behind a general allocator. The heap reflex is resisted by default.
 
 This is not asceticism; it is how the bound stays *visible*. A fixed footprint can be read off
-the source — the maximum a subsystem can use is right there. There is no allocator in the trusted
+the source - the maximum a subsystem can use is right there. There is no allocator in the trusted
 base to fragment, to fail *in the middle* of an operation, or to turn memory use into a runtime
-mystery. And overflow fails the GodspeedOS way: loud, into a guard page, killing one service —
+mystery. And overflow fails the GodspeedOS way: loud, into a guard page, killing one service -
 never a silent slide into thrashing. A heap erases each of those properties, which is why it is
 the exception (declared, scoped) and not the default.
 
-When a working set feels too big for the stack, the move is **not** to reach for a heap — it is to
+When a working set feels too big for the stack, the move is **not** to reach for a heap - it is to
 **change the representation so the working set is small**:
 
 - **stream in fixed chunks** instead of buffering the whole thing (the `edit` piece table holds
@@ -2550,14 +2550,14 @@ When a working set feels too big for the stack, the move is **not** to reach for
 - **iterate with an explicit bounded stack** instead of call-stack recursion (`tree`'s walk).
 
 A hard ceiling reached *loudly* is therefore a **feature**, not a missing heap: it says "rethink
-the working set." (The `selfcheck | write` stack overflow was exactly this lesson — the fix was to
+the working set." (The `selfcheck | write` stack overflow was exactly this lesson - the fix was to
 forbid the unbounded nesting, not to add a heap.)
 
 This is **simplicity** as much as fault tolerance (§2.3). The bounded representation is usually
 *also the clearer one*, because the constraint forces you to name the working set instead of
 hand-waving it onto a heap. Per §26.13 the bar is **simple-and-bounded, not clever-and-cramped**:
 a stack-only design that is *harder to read* than a heap one is a regression, not a win. The goal
-is the right data shape — a piece table, a ring buffer, an arena — over which boring code is
+is the right data shape - a piece table, a ring buffer, an arena - over which boring code is
 small by construction.
 
 ---

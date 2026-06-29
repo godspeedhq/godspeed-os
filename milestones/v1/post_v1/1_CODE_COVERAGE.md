@@ -1,4 +1,4 @@
-# Post-v1 Item 1 — Code Coverage
+# Post-v1 Item 1 - Code Coverage
 
 **Status:** ✅ Complete  
 **Commands:**
@@ -8,13 +8,13 @@ cargo llvm-cov --package kernel --summary-only  # print coverage summary
 python3 scripts/test_report.py                # rendered table (used by CI)
 ```
 **CI workflow:** `.github/workflows/coverage.yml` (push to `main`)  
-**Evidence:** `build/tests/post_v1/1_CODE_COVERAGE/` — local output directory; HTML report uploaded as `coverage-html` artifact in GitHub Actions
+**Evidence:** `build/tests/post_v1/1_CODE_COVERAGE/` - local output directory; HTML report uploaded as `coverage-html` artifact in GitHub Actions
 
 ---
 
 ## Overview
 
-Code coverage for GodspeedOS targets the **pure-logic kernel modules** only — the
+Code coverage for GodspeedOS targets the **pure-logic kernel modules** only - the
 subset of the kernel that has no dependency on hardware, architecture, or bare-metal
 primitives and can therefore be compiled and executed on the host machine.
 
@@ -29,7 +29,7 @@ Anything that fails to compile on the host does not belong in the lib target.
 
 ---
 
-## Phase 1 — Kernel lib target ✅
+## Phase 1 - Kernel lib target ✅
 
 **Commit:** `e602794`
 
@@ -39,15 +39,15 @@ cannot run on the host at all.
 
 ### Changes
 
-- ✅ `kernel/src/lib.rs` — created; `#![cfg_attr(not(test), no_std)]`; re-exports
+- ✅ `kernel/src/lib.rs` - created; `#![cfg_attr(not(test), no_std)]`; re-exports
   `capability::{cap, generation, rights}` and `ipc::{message, queue}`
-- ✅ `kernel/Cargo.toml` — added `[lib]` section (`name = "kernel"`, `path = "src/lib.rs"`);
+- ✅ `kernel/Cargo.toml` - added `[lib]` section (`name = "kernel"`, `path = "src/lib.rs"`);
   added `test = false` to `[[bin]]` so `cargo test` targets the lib, not the binary
-- ✅ `kernel/build.rs` — linker script emission (`-Tkernel.ld`) made conditional on
+- ✅ `kernel/build.rs` - linker script emission (`-Tkernel.ld`) made conditional on
   `TARGET == "x86_64-unknown-none"`; prevents a linker warning when `cargo test` runs
   on the host with the MSVC or GNU linker
 
-### Modules in scope (pure logic — no hardware deps)
+### Modules in scope (pure logic - no hardware deps)
 
 | Module | Path | Unsafe? |
 |---|---|---|
@@ -61,17 +61,17 @@ cannot run on the host at all.
 
 | Module | Reason |
 |---|---|
-| `arch/x86_64` | Direct hardware access — APIC, GDT, IDT, page tables |
-| `memory/` | Physical addresses, frame allocator — x86-64 bare metal |
+| `arch/x86_64` | Direct hardware access - APIC, GDT, IDT, page tables |
+| `memory/` | Physical addresses, frame allocator - x86-64 bare metal |
 | `capability/table.rs` | Uses a global `RwLock` backed by `smp/` spinlock |
-| `smp/` | APIC MMIO, IPI — no-op outside bare metal |
+| `smp/` | APIC MMIO, IPI - no-op outside bare metal |
 | `syscall/` | Dispatches into arch and memory layers |
 | `task/` | Embeds service ELF bytes via `include_bytes!` at compile time |
-| `interrupt/` | IDT registration — arch-only |
+| `interrupt/` | IDT registration - arch-only |
 
 ---
 
-## Phase 2 — Unit tests ✅
+## Phase 2 - Unit tests ✅
 
 **Commit:** `e602794`
 
@@ -80,7 +80,7 @@ cannot run on the host at all.
 positive path (the system permits what it should) and the negative path (the system
 refuses what it shouldn't), matching the convention of the §22 identity tests.
 
-### `capability::rights` — 9 tests
+### `capability::rights` - 9 tests
 
 | Test | What it pins |
 |---|---|
@@ -94,7 +94,7 @@ refuses what it shouldn't), matching the convention of the §22 identity tests.
 | `bitor_operator_matches_union` | `|` operator is equivalent to `union()` |
 | `empty_contains_nothing` | `EMPTY` contains no right |
 
-### `capability::generation` — 6 tests
+### `capability::generation` - 6 tests
 
 | Test | What it pins |
 |---|---|
@@ -105,7 +105,7 @@ refuses what it shouldn't), matching the convention of the §22 identity tests.
 | `stale_cap_detected_after_bump` | A cap at old generation fails after a bump |
 | `many_bumps_stay_monotonic` | 1,000 bumps remain strictly increasing |
 
-### `capability::cap` — 7 tests
+### `capability::cap` - 7 tests
 
 | Test | What it pins |
 |---|---|
@@ -117,7 +117,7 @@ refuses what it shouldn't), matching the convention of the §22 identity tests.
 | `narrow_for_grant_preserves_resource_and_gen` | Narrowing does not alter `ResourceId` or generation |
 | `validate_subset_right_passes` | A cap with a superset of rights satisfies a subset check |
 
-### `ipc::queue` — 10 tests
+### `ipc::queue` - 10 tests
 
 | Test | What it pins |
 |---|---|
@@ -134,11 +134,11 @@ refuses what it shouldn't), matching the convention of the §22 identity tests.
 
 ---
 
-## Phase 3 — CI workflows ✅
+## Phase 3 - CI workflows ✅
 
 **Commits:** `e602794`, `12d6e20`
 
-### `coverage.yml` — coverage on push to main
+### `coverage.yml` - coverage on push to main
 
 - ✅ Installs `cargo-llvm-cov` (locked version)
 - ✅ Generates LCOV report → `build/coverage.lcov`
@@ -147,12 +147,12 @@ refuses what it shouldn't), matching the convention of the §22 identity tests.
 - ✅ Prints summary table to the CI log via `--summary-only`
 - ✅ Trigger: push to `main` and `workflow_dispatch`
 
-### `build.yml` — unit tests on every push
+### `build.yml` - unit tests on every push
 
 - ✅ Unit test step replaced with `python3 scripts/test_report.py`
 - ✅ Renders a Unicode-bordered table in the CI log:
-  Phase | Test | Result | ms — one row per test, grouped by module
-- ✅ Exit 0 on all-pass, exit 1 on any failure — CI step fails correctly
+  Phase | Test | Result | ms - one row per test, grouped by module
+- ✅ Exit 0 on all-pass, exit 1 on any failure - CI step fails correctly
 
 ### `scripts/test_report.py`
 
@@ -164,11 +164,11 @@ refuses what it shouldn't), matching the convention of the §22 identity tests.
 
 ---
 
-## Phase 4 — README ✅
+## Phase 4 - README ✅
 
 **Commit:** `7ce6108`
 
-- ✅ `README.md` — replaced two-line stub with full project introduction:
+- ✅ `README.md` - replaced two-line stub with full project introduction:
   what GodspeedOS is, five core principles, what it is not, how it works,
   repo layout, getting started commands, CI table, pointer to `CLAUDE.md`
 
@@ -183,25 +183,25 @@ refuses what it shouldn't), matching the convention of the §22 identity tests.
 | `capability::cap` | ✅ 7 tests | ✅ cap validation on every syscall |
 | `ipc::message` | (lib target; no dedicated tests yet) | ✅ IPC send/recv (§22 Tests 3, 4, 9) |
 | `ipc::queue` | ✅ 10 tests | ✅ queue depth, full, drain (§22 Tests 4, 9) |
-| `arch/x86_64` | — not host-testable | ✅ entire boot sequence |
-| `memory/` | — not host-testable | ✅ alloc limit (§22 Tests 7A, 7B) |
-| `smp/` | — not host-testable | ✅ 4-core boot (§22 Test 1A) |
-| `syscall/` | — not host-testable | ✅ every kernel call path |
-| `task/` | — not host-testable | ✅ spawn, kill, restart (§22 Tests 1, 6, 10) |
+| `arch/x86_64` | - not host-testable | ✅ entire boot sequence |
+| `memory/` | - not host-testable | ✅ alloc limit (§22 Tests 7A, 7B) |
+| `smp/` | - not host-testable | ✅ 4-core boot (§22 Test 1A) |
+| `syscall/` | - not host-testable | ✅ every kernel call path |
+| `task/` | - not host-testable | ✅ spawn, kill, restart (§22 Tests 1, 6, 10) |
 
 ---
 
 ## Implementation checklist
 
-- ✅ `kernel/src/lib.rs` — pure-logic lib target
-- ✅ `kernel/Cargo.toml` — `[lib]` section; `test = false` on `[[bin]]`
-- ✅ `kernel/build.rs` — linker arg conditional on `TARGET`
-- ✅ `kernel/src/capability/rights.rs` — 9 unit tests
-- ✅ `kernel/src/capability/generation.rs` — 6 unit tests
-- ✅ `kernel/src/capability/cap.rs` — 7 unit tests
-- ✅ `kernel/src/ipc/queue.rs` — 10 unit tests
-- ✅ `.github/workflows/coverage.yml` — `cargo-llvm-cov` CI workflow
-- ✅ `.github/workflows/build.yml` — unit test step calls `scripts/test_report.py`
-- ✅ `scripts/test_report.py` — Unicode table renderer
-- ✅ `README.md` — project identity and philosophy
-- ✅ `build/tests/post_v1/1_CODE_COVERAGE/` — output directory for local reports
+- ✅ `kernel/src/lib.rs` - pure-logic lib target
+- ✅ `kernel/Cargo.toml` - `[lib]` section; `test = false` on `[[bin]]`
+- ✅ `kernel/build.rs` - linker arg conditional on `TARGET`
+- ✅ `kernel/src/capability/rights.rs` - 9 unit tests
+- ✅ `kernel/src/capability/generation.rs` - 6 unit tests
+- ✅ `kernel/src/capability/cap.rs` - 7 unit tests
+- ✅ `kernel/src/ipc/queue.rs` - 10 unit tests
+- ✅ `.github/workflows/coverage.yml` - `cargo-llvm-cov` CI workflow
+- ✅ `.github/workflows/build.yml` - unit test step calls `scripts/test_report.py`
+- ✅ `scripts/test_report.py` - Unicode table renderer
+- ✅ `README.md` - project identity and philosophy
+- ✅ `build/tests/post_v1/1_CODE_COVERAGE/` - output directory for local reports

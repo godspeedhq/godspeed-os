@@ -1,6 +1,6 @@
-# Bare-Metal Boot Freeze — Intel J5005 (Goldmont+, Wyse 5070)
+# Bare-Metal Boot Freeze - Intel J5005 (Goldmont+, Wyse 5070)
 
-## Status: Backburner — blocked by firmware
+## Status: Backburner - blocked by firmware
 
 ## Symptom
 
@@ -28,7 +28,7 @@ but did not resolve it.
 MSR_PKG_CST_CONFIG_CONTROL (0xE2) is **locked by firmware** at boot:
 ```
 cstate: core 0 MSR 0xE2 = 0x0000000014008072 (lock=1)
-cstate: core 0 MSR 0xE2 locked — C-state limit cannot be set via MSR
+cstate: core 0 MSR 0xE2 locked - C-state limit cannot be set via MSR
 ```
 
 Value 0x14008072: bits[2:0]=010 (PC2 limit), bit 15=1 (locked).
@@ -42,7 +42,7 @@ getting CPU time.
 
 - Lock bit prevents OS from raising the C-state limit via RDMSR/WRMSR.
 - Firmware does not expose the setting in BIOS/UEFI setup.
-- Would require custom BIOS/microcode or an ACPI override — out of scope.
+- Would require custom BIOS/microcode or an ACPI override - out of scope.
 
 ## Workaround for testing
 

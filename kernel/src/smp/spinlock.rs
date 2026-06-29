@@ -102,11 +102,11 @@ impl<T> SpinLock<T> {
 
 /// Run `f` with interrupts disabled on the local core, restoring the prior interrupt state afterward.
 ///
-/// REQUIRED when acquiring a `SpinLock` that is ALSO taken in interrupt context on the same core —
+/// REQUIRED when acquiring a `SpinLock` that is ALSO taken in interrupt context on the same core -
 /// e.g. `KSTACK_USED`, held by `alloc_kstack`/`free_kstack` in the syscall spawn/kill paths AND by
 /// `drain_pending_kstack` from the timer ISR. Without masking, a timer firing mid-critical-section
 /// re-enters the same lock in the ISR on that very core and **self-deadlocks** (the lock is never
-/// released → the whole machine freezes — observed once per ~60k kills under `chaos max-carnage`).
+/// released → the whole machine freezes - observed once per ~60k kills under `chaos max-carnage`).
 /// The protected sections are short, so the interrupts-off window is negligible. Nests correctly: an
 /// inner call captures IF=0 and skips the re-enable, so the outermost restorer owns the re-enable.
 #[inline]

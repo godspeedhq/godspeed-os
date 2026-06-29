@@ -6,7 +6,7 @@ Task management and per-core scheduler (§9, §14).
 
 | File            | Responsibility |
 |-----------------|---------------|
-| `mod.rs`        | `spawn_supervisor()` (the kernel's one direct spawn — init removed, Phase 5), `kill_current()`, `drain_pending_kstack()` |
+| `mod.rs`        | `spawn_supervisor()` (the kernel's one direct spawn - init removed, Phase 5), `kill_current()`, `drain_pending_kstack()` |
 | `task.rs`       | `Task` struct: id, name, core_id, state, context, page table, cap table, memory owner |
 | `state.rs`      | `TaskState` enum: Ready, Running, BlockedOnRecv, BlockedOnSend, Dead |
 | `scheduler.rs`  | `run()` (never returns), `timer_tick()`, `wake(task_id)`, `block_on_send(endpoint)` |
@@ -17,15 +17,15 @@ A task's `core_id` is set at spawn and never changes. Mid-execution migration is
 
 ## Preemption (§9.1, §9.3)
 
-The 10 ms quantum is enforced by the local APIC timer. `timer_tick()` is called from the timer ISR on every core independently. `yield()` is advisory — it calls `timer_tick()` immediately but preemption happens regardless of whether the service yields.
+The 10 ms quantum is enforced by the local APIC timer. `timer_tick()` is called from the timer ISR on every core independently. `yield()` is advisory - it calls `timer_tick()` immediately but preemption happens regardless of whether the service yields.
 
 ## Kernel stack pool
 
-224 slots × 64 KiB = 14 MiB of static BSS. Liveness is tracked by `SpinLock<[bool; TASK_KSTACK_MAX]>` — a boolean flag per slot, locked for the duration of alloc/free. `alloc_kstack()` returns the top pointer; `free_kstack(kstack_top)` reverse-computes the slot index from the pointer and clears the flag. The pool uses two unavoidable unsafe lines: one pointer-arithmetic `as_mut_ptr().add(...)` to locate the slot top, and one `as_ptr() as u64` to compute the base address for reverse-index in `free_kstack`.
+224 slots × 64 KiB = 14 MiB of static BSS. Liveness is tracked by `SpinLock<[bool; TASK_KSTACK_MAX]>` - a boolean flag per slot, locked for the duration of alloc/free. `alloc_kstack()` returns the top pointer; `free_kstack(kstack_top)` reverse-computes the slot index from the pointer and clears the flag. The pool uses two unavoidable unsafe lines: one pointer-arithmetic `as_mut_ptr().add(...)` to locate the slot top, and one `as_ptr() as u64` to compute the base address for reverse-index in `free_kstack`.
 
 ## Spawn flow (§14.1)
 
-`spawn_supervisor()` is the only direct spawn from kernel code (Path C / Phase 5 — init removed; the kernel boots the supervisor directly). All other spawns go through supervisor → syscall → kernel. The kernel side of spawn:
+`spawn_supervisor()` is the only direct spawn from kernel code (Path C / Phase 5 - init removed; the kernel boots the supervisor directly). All other spawns go through supervisor → syscall → kernel. The kernel side of spawn:
 1. Calls `smp::placement::resolve(contract_core)` to get the target core.
 2. Allocates a `Task` with a fresh `CapTable` populated from the contract.
 3. Allocates a page table and maps the service binary.
@@ -37,7 +37,7 @@ The 10 ms quantum is enforced by the local APIC timer. `timer_tick()` is called 
 1. Set `task.state = Dead`.
 2. Bump the generation of all endpoints owned by the task (via `ipc::routing::kill_endpoint`).
 3. Call `smp::ipi::broadcast_tlb_shootdown` for any mapped pages.
-4. Call `memory::ownership::reclaim_all` to return frames — **skipping the PML4 frame** (see below).
+4. Call `memory::ownership::reclaim_all` to return frames - **skipping the PML4 frame** (see below).
 5. Notify supervisor via its death-notification endpoint.
 6. Call `scheduler::pick_next()` to resume another task.
 

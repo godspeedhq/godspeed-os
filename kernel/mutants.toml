@@ -1,4 +1,4 @@
-# cargo-mutants configuration — kernel crate.
+# cargo-mutants configuration - kernel crate.
 #
 # Only the five pure-logic modules in the lib target are mutated.
 # Everything else either requires the no_std/hardware environment or

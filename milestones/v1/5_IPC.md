@@ -1,8 +1,8 @@
-# Milestone 5 — IPC (Same Core) ✅
+# Milestone 5 - IPC (Same Core) ✅
 
 > `send`/`recv`/`try_send` working between two tasks on the same core.
 
-**Status: COMPLETE** — verified 2026-05-09
+**Status: COMPLETE** - verified 2026-05-09
 
 ## Endpoints
 
@@ -13,14 +13,14 @@
 ## Routing Table
 
 - ✅ `RoutingTable`: `EndpointId → (CoreId, Generation, Liveness)`
-- ✅ `enqueue(endpoint_id, msg, cap_gen)` — validates generation, enqueues message
-- ✅ `kill_endpoint(id)` — bumps generation, drains queue, wakes blocked senders
+- ✅ `enqueue(endpoint_id, msg, cap_gen)` - validates generation, enqueues message
+- ✅ `kill_endpoint(id)` - bumps generation, drains queue, wakes blocked senders
 
 ## Syscall Path
 
-- ✅ `send(endpoint_cap, message)` — blocks if queue full
-- ✅ `recv(endpoint_cap)` — blocks until message available
-- ✅ `try_send(endpoint_cap, message)` — returns `QueueFull` immediately if full
+- ✅ `send(endpoint_cap, message)` - blocks if queue full
+- ✅ `recv(endpoint_cap)` - blocks until message available
+- ✅ `try_send(endpoint_cap, message)` - returns `QueueFull` immediately if full
 - ✅ Message copy: sender buffer → kernel `Message` struct → receiver buffer
 
 ## Blocking and Waking
@@ -44,19 +44,19 @@ capability: subsystem ready
 ipc: routing table ready
 kernel: all cores ready
 cap-test: starting capability enforcement tests
-cap-test: 2A pass — held cap validates OK
-cap-test: 2B pass — no cap returns CapNotHeld
-cap-test: 2C pass — wrong right returns CapInsufficientRights
-cap-test: revoke pass — stale cap returns CapRevoked
-cap-test: endpoint-dead pass — dead endpoint returns EndpointDead
-cap-test: grant pass — cap moved exactly once, sender empty
+cap-test: 2A pass - held cap validates OK
+cap-test: 2B pass - no cap returns CapNotHeld
+cap-test: 2C pass - wrong right returns CapInsufficientRights
+cap-test: revoke pass - stale cap returns CapRevoked
+cap-test: endpoint-dead pass - dead endpoint returns EndpointDead
+cap-test: grant pass - cap moved exactly once, sender empty
 cap-test: all tests passed
 ipc-test: starting routing table tests
-ipc-test: enqueue ok — message queued
-ipc-test: dequeue ok — received 'hello'
+ipc-test: enqueue ok - message queued
+ipc-test: dequeue ok - received 'hello'
 ipc-test: queue-empty ok
-ipc-test: queue-full ok — QueueFull after 16 msgs
-ipc-test: endpoint-dead ok — EndpointDead after kill
+ipc-test: queue-full ok - QueueFull after 16 msgs
+ipc-test: endpoint-dead ok - EndpointDead after kill
 ipc-test: all routing tests passed
 scheduler: ping and pong enqueued
 ping: sent 1

@@ -1,6 +1,6 @@
 # Utility: `uptime`
 
-**Utility:** `uptime` — how long the system has been up
+**Utility:** `uptime` - how long the system has been up
 **Status:** Built. As-built reference.
 **Shape:** shell built-in (see `0_conventions.md` §2).
 
@@ -10,7 +10,7 @@
 
 `uptime` answers **how long has the system been running since boot?** It reports a
 human-readable elapsed time (`Nd HH:MM:SS`) and the raw total in seconds. It is a **wall-clock
-delta** — the kernel records the RTC time at boot, and `uptime` subtracts it from the current
+delta** - the kernel records the RTC time at boot, and `uptime` subtracts it from the current
 RTC time. This is portable and accurate regardless of the APIC timer mode (a raw timer-tick
 counter is *not*: it runs at ~100 Hz on TSC-deadline hardware but ~10 Hz under QEMU's periodic
 timer, so ticks→seconds would be platform-dependent).
@@ -53,7 +53,7 @@ timer at ~10 Hz), which would make a ticks→seconds conversion platform-depende
 
 ## 5. Capabilities
 
-- **None gating the read.** Query 12 is **ungated** — uptime is task-neutral hardware-ish
+- **None gating the read.** Query 12 is **ungated** - uptime is task-neutral hardware-ish
   info, like the TSC (query 3) and RTC (query 11). No `INTROSPECT` cap required.
 - **Console output** to print the grid.
 

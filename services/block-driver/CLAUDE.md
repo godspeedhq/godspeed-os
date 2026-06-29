@@ -3,12 +3,12 @@
 Userspace **AHCI (SATA)** disk driver (persistence, v2; §6.3, `docs/ahci.md`,
 `docs/persistence.md`). **Restartable, NOT a TCB member** (Phase D amendment, §6.1,
 2026-06-17): it holds no persistent state, so its death is a supervisor restart (re-init the
-controller, re-register), not a reboot — `fs` reacquires it via the registry and retries (§14.3).
+controller, re-register), not a reboot - `fs` reacquires it via the registry and retries (§14.3).
 
 ## Device: AHCI, MMIO + DMA
 
 The driver talks to a SATA disk through an AHCI HBA: the kernel maps the HBA's ABAR
-(MMIO) and grants a physically-contiguous DMA arena at spawn — the same path the USB
+(MMIO) and grants a physically-contiguous DMA arena at spawn - the same path the USB
 drivers use. It brings up port 0, IDENTIFYs the disk, runs a boot read self-test, then
 serves block read/write to `fs` over IPC. It uses the SDK's safe `Mmio`/`Dma` wrappers,
 so the driver itself is `unsafe`-free (§18.1).
@@ -27,7 +27,7 @@ never fails a real disk read); off in production.
 
 ## Why AHCI (not ATA PIO, not virtio-blk)
 
-The T630's SSD is **AHCI-only** — no legacy/IDE mode — so AHCI is the production path.
+The T630's SSD is **AHCI-only** - no legacy/IDE mode - so AHCI is the production path.
 ATA PIO was the bring-up backend (simplest correct device, no DMA); it was retired once
 AHCI proved out on real hardware. virtio-blk is a QEMU-only paravirtual device that runs
 on no real hardware, so it was never a candidate.
@@ -37,8 +37,8 @@ on no real hardware, so it was never a candidate.
 AHCI is a DMA-capable driver, so on a machine with an IOMMU it should be confined to its
 granted arena. On the T630 the firmware hands the SATA controller over with a stale DMA
 pointer (`0xffffffc0`, the same quirk `ehci` hits), so confining it faults a benign init
-read — block-driver runs in **IOMMU passthrough** there. Full confinement needs an AHCI
-BIOS/OS handoff (BOHC) — a future step (`docs/ahci.md` step E).
+read - block-driver runs in **IOMMU passthrough** there. Full confinement needs an AHCI
+BIOS/OS handoff (BOHC) - a future step (`docs/ahci.md` step E).
 
 ## Block IPC protocol (fs ↔ block-driver)
 
@@ -50,7 +50,7 @@ OP_READ_BLOCK = 1, OP_WRITE_BLOCK = 2; STATUS_OK = 0, STATUS_ERR = 1
 
 The LBA is **u64** (persistence §6.3) so GSFS's u64 capacity fields reach the device at
 full width. One request moves one 512-byte block (= one sector). `fs` owns file layout;
-`block-driver` only moves sectors — policy above, mechanism below.
+`block-driver` only moves sectors - policy above, mechanism below.
 
 ## Failure semantics (§6.2)
 

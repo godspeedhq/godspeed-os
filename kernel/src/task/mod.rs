@@ -90,7 +90,7 @@ pub fn install_kstack_guards() {
 fn alloc_kstack() -> Option<*mut u8> {
     // Interrupt-safe acquisition: KSTACK_USED is ALSO taken by `drain_pending_kstack` from the timer
     // ISR (via `free_kstack`). Without masking, a timer firing while we hold it here re-enters the
-    // lock in the ISR on this very core and self-deadlocks (freezes the machine — the `chaos
+    // lock in the ISR on this very core and self-deadlocks (freezes the machine - the `chaos
     // max-carnage` 1-in-~60k hang). The hold is short.
     crate::smp::without_interrupts(|| {
         let mut used = KSTACK_USED.lock();
@@ -3585,11 +3585,11 @@ pub fn poll_supervisor_respawn() {
         return;
     }
     // Mark IN_PROGRESS *before* claiming PENDING, so the (now preemptible) scheduler context is ALWAYS
-    // covered by PENDING-or-IN_PROGRESS — no gap where a timer preemption would strand the poll and lose
+    // covered by PENDING-or-IN_PROGRESS - no gap where a timer preemption would strand the poll and lose
     // the respawn (between the PENDING.load above and here, PENDING is still set, so the timer ISR's
     // pending branch keeps us; from here on IN_PROGRESS keeps us). The respawn is no longer pinned: the
     // timer ROUND-ROBINS it (see scheduler::timer_tick_from_irq) so it is preemptible (lock-holders run)
-    // and resumable (it gets quanta) — the spawn no longer strands in CORE_SCHED_CTX under load.
+    // and resumable (it gets quanta) - the spawn no longer strands in CORE_SCHED_CTX under load.
     SUPERVISOR_RESPAWN_IN_PROGRESS.store(true, Ordering::Release);
     // Claim PENDING. Core-0-only, so the swap always succeeds; the guard is defensive.
     if !SUPERVISOR_RESPAWN_PENDING.swap(false, Ordering::AcqRel) {

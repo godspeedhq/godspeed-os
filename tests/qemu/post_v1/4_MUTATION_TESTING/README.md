@@ -14,10 +14,10 @@ Download from the GitHub Actions "Artifacts" tab.
 
 ```json
 {
-  "missed":  [...],   // mutants the tests did NOT catch — fix these
-  "caught":  [...],   // mutants the tests caught — evidence of coverage
-  "timeout": [...],   // mutants that timed out — usually slow compile paths
-  "unviable": [...]   // mutants that didn't compile — not informative
+  "missed":  [...],   // mutants the tests did NOT catch - fix these
+  "caught":  [...],   // mutants the tests caught - evidence of coverage
+  "timeout": [...],   // mutants that timed out - usually slow compile paths
+  "unviable": [...]   // mutants that didn't compile - not informative
 }
 ```
 

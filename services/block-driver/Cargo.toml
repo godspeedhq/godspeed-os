@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [features]
 # Force the first couple of read/write commands to fail, to exercise the bounded I/O
-# retry + port-recovery path (Phase H) — QEMU never fails a real disk read. TEST BUILDS
+# retry + port-recovery path (Phase H) - QEMU never fails a real disk read. TEST BUILDS
 # ONLY; production never injects faults. Enabled by `osdev test fs-ioretry`.
 io-error-test = []
 

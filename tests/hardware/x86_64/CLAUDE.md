@@ -10,7 +10,7 @@ Hardware test suite for GodspeedOS on real x86_64 silicon. Mirrors the QEMU test
 | RAM | 4 GB |
 | Boot | UEFI USB (`osdev image --mode X` → `dd` to USB) |
 | Serial | Null modem COM1 → PuTTY 115200 8N1, logged to `build/putty_serial_output.log` |
-| Control | COM2 — not yet wired (blocks WithRestart tests) |
+| Control | COM2 - not yet wired (blocks WithRestart tests) |
 
 ## Build modes
 
@@ -74,4 +74,4 @@ For each WatchSerial test, after booting:
 
 ## COM2 control channel (future)
 
-WithRestart tests (identity 4B, 6A, 6B, 10A, 10B) need a second serial port wired as a control channel — the hardware equivalent of QEMU's COM2 TCP port. When available, the dev machine sends `RESTART <name> <core>\n` over COM2 to trigger supervisor restarts mid-test.
+WithRestart tests (identity 4B, 6A, 6B, 10A, 10B) need a second serial port wired as a control channel - the hardware equivalent of QEMU's COM2 TCP port. When available, the dev machine sends `RESTART <name> <core>\n` over COM2 to trigger supervisor restarts mid-test.

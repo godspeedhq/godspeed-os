@@ -3,7 +3,7 @@ ENTRY(_start)
 /* Explicit program headers so lld never splits .got and .requests into
    separate PT_LOAD segments.  When they share a page but live in different
    PT_LOADs, Limine's ELF loader maps page 0 for the first segment and then
-   tries to map the same page again for the second — it silently stops
+   tries to map the same page again for the second - it silently stops
    processing subsequent segments, so .rodata and .bss are never mapped. */
 PHDRS {
     requests PT_LOAD FLAGS(6) ;   /* rw-  GOT + Limine request structs      */
@@ -22,7 +22,7 @@ SECTIONS {
        .requests instead of getting its own segment header. */
     .got : { *(.got .got.*) } :requests
 
-    /* Limine request structs — KEEP so the linker never discards them.
+    /* Limine request structs - KEEP so the linker never discards them.
        RequestsStartMarker and RequestsEndMarker bracket the requests region. */
     .requests : {
         KEEP(*(.requests_start))

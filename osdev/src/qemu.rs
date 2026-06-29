@@ -265,11 +265,11 @@ pub fn kvm_available() -> bool {
 
 /// Multiplier applied to every test's `timeout_secs`.
 ///
-/// The per-test timeouts are calibrated for KVM. Without it (TCG — e.g. Windows, no `/dev/kvm`) QEMU
+/// The per-test timeouts are calibrated for KVM. Without it (TCG - e.g. Windows, no `/dev/kvm`) QEMU
 /// boots and runs several times slower, and the heaviest suites (chaos's fault-injection boots, fuzz)
 /// false-FAIL on timeout even though the build is healthy and the markers do eventually appear. So
 /// scale the budgets up on the no-KVM path. A passing test still completes the instant its marker is
-/// seen and `fail_on` is still detected immediately — this only gives slow boots room; it never slows
+/// seen and `fail_on` is still detected immediately - this only gives slow boots room; it never slows
 /// a pass or masks a real failure signal. Override with `GODSPEED_TIMEOUT_SCALE=<n>` to tune per host.
 pub fn timeout_scale() -> u64 {
     if let Ok(v) = std::env::var("GODSPEED_TIMEOUT_SCALE") {

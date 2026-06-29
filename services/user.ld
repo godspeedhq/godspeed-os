@@ -1,4 +1,4 @@
-/* services/user.ld — linker script for GodspeedOS ring-3 services.
+/* services/user.ld - linker script for GodspeedOS ring-3 services.
  *
  * All userspace services load at 0x400000 (traditional ELF base).
  * Each service gets its own page table (separate CR3), so multiple services
@@ -39,7 +39,7 @@ SECTIONS {
 
     _end = .;
 
-    /* Discard unwinding tables — services use panic = "abort". */
+    /* Discard unwinding tables - services use panic = "abort". */
     /DISCARD/ : {
         *(.eh_frame)
         *(.eh_frame_hdr)

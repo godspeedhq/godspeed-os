@@ -1,6 +1,6 @@
 # Utility Spec: `observe`
 
-**Utility:** `observe` — system metrics viewer
+**Utility:** `observe` - system metrics viewer
 **Version:** 0.1.0
 **Status:** SPEC (not yet built). This document is written before implementation, per the utility-spec-first rule.
 **Last updated:** 2026-06-03
@@ -14,7 +14,7 @@ the per-task and per-core metrics the kernel already tracks (state, core, memory
 queue depth, restarts, CPU time) plus a system summary (frames, per-core CPU%,
 endpoint count).
 
-`observe` reports raw metrics. It does **not** render a verdict — "is everything
+`observe` reports raw metrics. It does **not** render a verdict - "is everything
 OK?" is the future job of a separate `status` utility (see §9). Keeping the two
 apart is deliberate: `observe` = *what is happening*; `status` = *is it healthy*.
 
@@ -30,7 +30,7 @@ apart is deliberate: `observe` = *what is happening*; `status` = *is it healthy*
 | `observe now help` | Usage for the static subcommand (what the columns mean). |
 | `observe version` | Prints `observe 0.1.0`. |
 
-`observe` (bare verb) means *ongoing observation* — that is why the live view is
+`observe` (bare verb) means *ongoing observation* - that is why the live view is
 the default and the static one is the modified form. The word after the verb picks
 the cadence: nothing = ongoing, `now` = a single instant. No flags, no interval
 math, no `--`.
@@ -38,7 +38,7 @@ math, no `--`.
 ### 2.1 `observe now` as a record producer (typed pipes)
 
 Piped, **`observe now`** is a record producer (`docs/records.md`,
-`utilities/31_records.md`): it emits the task roster plus the metric `status` omits —
+`utilities/31_records.md`): it emits the task roster plus the metric `status` omits -
 **`ticks`**, each task's cumulative `run_ticks` (timer ticks spent running since boot).
 That column is what distinguishes `observe` (how busy) from `status` (who's alive):
 
@@ -49,27 +49,27 @@ observe now | select name ticks      just the cpu-time view
 observe now | to json                a snapshot frame as JSON
 ```
 
-`ticks` is a **snapshot-honest** value — cumulative ticks, not an instantaneous %.
+`ticks` is a **snapshot-honest** value - cumulative ticks, not an instantaneous %.
 A true rate needs two samples, which only the live view has (and the live view's
 per-task "CPU%" is in fact its *core's* utilisation, so it would not sort
 meaningfully per task anyway). **Only `observe now` is pipeable.** Bare `observe` is
-the live, screen-owning loop — it never yields a discrete stream, so `observe | …`
-is a **loud refusal** (`observe: the live view can't be piped — use 'observe now |
+the live, screen-owning loop - it never yields a discrete stream, so `observe | …`
+is a **loud refusal** (`observe: the live view can't be piped - use 'observe now |
 …'`), never a silent hang. This is the general rule: a live-loop utility's *snapshot*
 form is the record producer; its *live* form is not (`docs/records.md`).
 
-> **Build-order note:** `observe now` (static) is built first — it needs no kernel
+> **Build-order note:** `observe now` (static) is built first - it needs no kernel
 > or console change. Until the live view exists, bare `observe` prints
-> `live view coming soon — try 'observe now'`. `observe`'s *meaning* never changes
+> `live view coming soon - try 'observe now'`. `observe`'s *meaning* never changes
 > later (it is "the live view" from day one); it only stops being unfinished.
 
 ---
 
 ## 3. Utility conventions
 
-The general rules that apply to **every** GodspeedOS utility — `help` is the only
+The general rules that apply to **every** GodspeedOS utility - `help` is the only
 help form (no `-h`/`--help`), subcommands are words not single-letter flags,
-per-utility `version`, raw-facts-only (no editorializing), non-POSIX vocabulary —
+per-utility `version`, raw-facts-only (no editorializing), non-POSIX vocabulary -
 now live in **`0_conventions.md`**. They were hoisted there once a second utility
 existed, exactly as this section originally anticipated (§26.2: pull the
 abstraction into existence, don't build it speculatively). `observe` follows all of
@@ -78,7 +78,7 @@ them; what remains below is `observe`'s own normative help output.
 ### Help output shape (normative)
 
 ```
-observe 0.1.0 — system metrics viewer
+observe 0.1.0 - system metrics viewer
 
 usage:
   observe          watch live metrics (refreshes until you press q)
@@ -92,7 +92,7 @@ subcommand help:
 
 ---
 
-## 4. `observe now` — static frame (build first)
+## 4. `observe now` - static frame (build first)
 
 ### 4.1 Layout
 
@@ -136,12 +136,12 @@ Only slots with `valid == true` are listed.
 | memory free/total | `inspect_kernel_free_frames()`, `inspect_kernel_total_frames()` | |
 | endpoints | `inspect_kernel_endpoint_count()` | |
 
-**No kernel changes are required for the static frame** — every value above is an
+**No kernel changes are required for the static frame** - every value above is an
 existing introspection syscall the shell already has authority to call.
 
 ---
 
-## 5. `observe` — continuous view (build second)
+## 5. `observe` - continuous view (build second)
 
 ### 5.1 Behaviour
 
@@ -154,17 +154,17 @@ On `q`: stop refreshing, **leave the last frame on screen**, print `gsh>` beneat
 it. The display does NOT vanish. Rationale: (a) the framebuffer console has no
 alternate-screen buffer to restore from, so htop-style "restore previous screen"
 is not a capability that exists; (b) the final frame persisting on the TV is
-strictly better for hand-transcription — you quit, then read at your own pace,
+strictly better for hand-transcription - you quit, then read at your own pace,
 with the prompt right there confirming the shell is back.
 
-### 5.3 CPU% — cumulative vs instantaneous
+### 5.3 CPU% - cumulative vs instantaneous
 
 The static frame shows cumulative-since-boot CPU share (active/total ticks). The
-live view SHOULD show *instantaneous* CPU% — the delta in active/total ticks
-between successive frames — so the numbers reflect current load, not lifetime
+live view SHOULD show *instantaneous* CPU% - the delta in active/total ticks
+between successive frames - so the numbers reflect current load, not lifetime
 average. This requires the utility to remember the previous frame's tick counts.
 
-### 5.4 Console prerequisite (kernel/console work — gates the live view)
+### 5.4 Console prerequisite (kernel/console work - gates the live view)
 
 A live in-place repaint needs the framebuffer console to support **clear-screen +
 cursor-home**. Today the fbcon only streams glyphs and scrolls; it has no
@@ -180,7 +180,7 @@ input ring that the USB keyboard pushes into (closing the loop with the xHCI wor
 
 All present today in `sdk/rust/src/service_context.rs`:
 
-- `task_stat(slot) -> TaskStat` — per-task: `valid, state, core, mem_used,
+- `task_stat(slot) -> TaskStat` - per-task: `valid, state, core, mem_used,
   mem_limit, name, generation, queue_depth, run_ticks`.
 - `inspect_core_count()`, `inspect_core_active_ticks(c)`, `inspect_core_total_ticks(c)`.
 - `inspect_kernel_free_frames()`, `inspect_kernel_total_frames()`,
@@ -190,16 +190,16 @@ All present today in `sdk/rust/src/service_context.rs`:
 
 ## 7. Architecture: standalone utility service (DECIDED 2026-06-03)
 
-`observe` is a **standalone utility service brokered by the shell** — NOT a shell
+`observe` is a **standalone utility service brokered by the shell** - NOT a shell
 built-in.
 
 **Rationale (the spirit of GodspeedOS):**
 
-- **Least authority — the decisive one.** The shell holds `spawn`/`kill`/`restart`
+- **Least authority - the decisive one.** The shell holds `spawn`/`kill`/`restart`
   authority; it is one of the most dangerous userspace authorities. `observe` needs
   only to *read* metrics. A built-in would run the metrics code in the same
   protection domain as kill/restart authority. As its own service, `observe` holds
-  an introspection cap and nothing else — it cannot kill or restart anything *by
+  an introspection cap and nothing else - it cannot kill or restart anything *by
   construction*, not by being careful (§3.1 no ambient authority, §3.3 authority is
   explicit, §26.9 authority stays visible and scoped).
 - **The shell's role.** Appendix B.3 defines the shell as a capability *broker*: it
@@ -215,15 +215,15 @@ built-in.
 here: the service is not speculative (it already exists on hardware), and the
 least-authority requirement is real today, not hypothetical.
 
-**Cost accepted:** more plumbing (spawn-on-demand, console output, and — for the
-live view — a console-ownership/input handoff for the `q` keypress) and a
-spawn-per-invocation (~ms, fine — performance is third, §20).
+**Cost accepted:** more plumbing (spawn-on-demand, console output, and - for the
+live view - a console-ownership/input handoff for the `q` keypress) and a
+spawn-per-invocation (~ms, fine - performance is third, §20).
 
 **Introspection capability (resolved 2026-06-03).** Introspection is now gated by
 `INTROSPECT_RESOURCE` (READ): `TaskStat` and the system-state `InspectKernel`
 queries require it; self-state and the TSC stay ambient. `observe` is granted the
 cap at spawn (name-gated, like `shell`), so its least-authority story is now
-literal — it holds the introspection cap plus a console cap, never the shell's
+literal - it holds the introspection cap plus a console cap, never the shell's
 `spawn`/`kill`/`restart`. Done on branch `feat/introspect-cap`; see
 `docs/introspection-capability.md`.
 
@@ -234,12 +234,12 @@ literal — it holds the introspection cap plus a console cap, never the shell's
 `observe` runs as a standalone service (§7), so its **contract declares exactly what
 it needs and nothing more**:
 
-- an **introspection capability** — read-only access to the `inspect_*` / `task_stat`
+- an **introspection capability** - read-only access to the `inspect_*` / `task_stat`
   surface (see the §7 note on making this explicit if it is currently ambient);
 - a **console output capability** to render its frame;
 - for the live view only, a **console input capability** to read the `q` keypress.
 
-It does NOT hold `spawn`/`kill`/`restart` — that authority stays with the shell. The
+It does NOT hold `spawn`/`kill`/`restart` - that authority stays with the shell. The
 shell brokers the spawn; the kernel mints these caps from the contract at spawn time
 (§13, §14.1).
 
@@ -260,18 +260,18 @@ shell brokers the spawn; the kernel mints these caps from the contract at spawn 
 ## 10. Open questions
 
 1. Live-view refresh cadence: fixed 1 s, or `observe <interval>` to tune it later?
-   (Deferred — `now` vs bare covers the static/live split; interval tuning is a
+   (Deferred - `now` vs bare covers the static/live split; interval tuning is a
    possible future addition, not v1.)
 
 ### Resolved
 
-- **Help form (2026-06-03):** the word `help` is the *only* form — no `-h`, no
+- **Help form (2026-06-03):** the word `help` is the *only* form - no `-h`, no
   `--help`, no tolerated synonyms. An undocumented synonym would be a hidden, unsaid
   rule, which the system forbids; `-h` is simply `unknown:` and the response teaches
-  the real word (§3 rule 3). Subcommands stay words — no single-letter flags
+  the real word (§3 rule 3). Subcommands stay words - no single-letter flags
   (§3 rule 4).
 - **Architecture (2026-06-03):** standalone utility service brokered by the shell,
-  not a built-in (§7) — least authority + the shell's broker role.
+  not a built-in (§7) - least authority + the shell's broker role.
 - **Typing economy (2026-06-03):** addressed by future shell ergonomics
   (tab-completion, command history), NOT by abbreviating the utility vocabulary.
   Not to be relitigated per-utility.
@@ -280,12 +280,12 @@ shell brokers the spawn; the kernel mints these caps from the contract at spawn 
 
 ## 11. Build order
 
-1. **Console: clear+home control** — only needed for the live view; static does
+1. **Console: clear+home control** - only needed for the live view; static does
    not need it. (Gates step 3, not step 2.)
-2. **`observe now` static frame** — as the brokered standalone service (§7), §4.
+2. **`observe now` static frame** - as the brokered standalone service (§7), §4.
    The shell spawns `observe` in `now` mode; it prints one frame via its
    introspection + console caps and exits. Wire `observe now`, `observe version`,
    `observe help`, `observe now help`, and bare `observe` → "live view coming soon
-   — try 'observe now'". QEMU-verify (screendump).
-3. **`observe` live view** — §5, after step 1. Delta CPU%, `q`-to-quit, persist on
+   - try 'observe now'". QEMU-verify (screendump).
+3. **`observe` live view** - §5, after step 1. Delta CPU%, `q`-to-quit, persist on
    exit.

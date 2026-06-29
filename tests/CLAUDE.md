@@ -7,16 +7,16 @@ All tests for the OS. Tests run on two platforms: QEMU (automated harness) and r
 ```
 tests/
   qemu/
-    identity/    # Constitutional identity tests (§22) — 20/20 complete ✅
+    identity/    # Constitutional identity tests (§22) - 20/20 complete ✅
     harness/     # QEMU launcher, serial parser, test runner
-    perf/        # Performance benchmarks — ✅ 10/10 complete (§22 B1–B10), ✅ 10/10 brutal (BP1–BP10)
-    property/    # Property tests — Active (§22)
-    fuzz/        # Fuzz tests — Active (§22)
-    stress/      # Stress tests — Active (§22)
-    adversarial/ # Red-team / capability isolation tests — ✅ 10/10 complete + 10/10 brutal (§22)
-    chaos/       # Chaos / partial-failure tests — ✅ 7/7 complete + 7/7 brutal (§22)
+    perf/        # Performance benchmarks - ✅ 10/10 complete (§22 B1–B10), ✅ 10/10 brutal (BP1–BP10)
+    property/    # Property tests - Active (§22)
+    fuzz/        # Fuzz tests - Active (§22)
+    stress/      # Stress tests - Active (§22)
+    adversarial/ # Red-team / capability isolation tests - ✅ 10/10 complete + 10/10 brutal (§22)
+    chaos/       # Chaos / partial-failure tests - ✅ 7/7 complete + 7/7 brutal (§22)
   hardware/
-    x86_64/      # Real hardware — 4-core x86_64, ~3 GHz, UEFI USB boot, null modem serial
+    x86_64/      # Real hardware - 4-core x86_64, ~3 GHz, UEFI USB boot, null modem serial
       1_identity.md
       2_property.md
       3_fuzz.md
@@ -42,7 +42,7 @@ tests/
 
 Identity tests are the minimum set that, if any one fails, means the system is no longer the system `CLAUDE.md` describes. They are a prerequisite for all other categories: do not start property/fuzz/stress work until identity is 20/20.
 
-The bar across every category is identical: **no FAIL, no BLOCKED**. A failure means a real bug — fix it, add a regression test, then move on.
+The bar across every category is identical: **no FAIL, no BLOCKED**. A failure means a real bug - fix it, add a regression test, then move on.
 
 ## Running
 

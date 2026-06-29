@@ -36,6 +36,6 @@
       "mean": 2406717
     }
   },
-  "note": "Brutal perf — QEMU TCG RDTSC cycle counts at 5× iteration counts; not comparable across hosts",
+  "note": "Brutal perf - QEMU TCG RDTSC cycle counts at 5× iteration counts; not comparable across hosts",
   "regression_threshold_pct": 10
 }

@@ -41,31 +41,31 @@ Fuzz tests reuse the probe service binary (`services/probe`) with new probe mode
 
 | Name | Mode | has_recv | send_peers |
 |------|------|----------|------------|
-| fuzz-f1 | 30 | no | — |
-| fuzz-f2 | 31 | no | — |
-| fuzz-f5-recv | 0 (passive) | yes | — |
+| fuzz-f1 | 30 | no | - |
+| fuzz-f2 | 31 | no | - |
+| fuzz-f5-recv | 0 (passive) | yes | - |
 | fuzz-f5 | 32 | no | fuzz-f5-recv |
-| fuzz-f6-recv | 0 (passive) | yes | — |
+| fuzz-f6-recv | 0 (passive) | yes | - |
 | fuzz-f6 | 33 | no | fuzz-f6-recv |
-| fuzz-f7-victim | 0 (passive) | yes | — |
+| fuzz-f7-victim | 0 (passive) | yes | - |
 | fuzz-f7 | 34 | no | fuzz-f7-victim |
-| fuzz-f8 | 35 | no | — |
+| fuzz-f8 | 35 | no | - |
 
 ---
 
 ## Phase 1: F1, F2, F5, F6, F7, F8
 
-### F1 — Syscall args
+### F1 - Syscall args
 
 **Surface:** `syscall_handler(number, arg0, arg1, arg2)` for all known non-abort syscall numbers.
 
-**Generator:** 10,000 calls per syscall number. `a0` cycles through: our valid cap slots (0, 1), out-of-range slots (64, 0xFFFF, u64::MAX), and random u32 values. `a1`/`a2` are restricted to values that fail `validate_user_slice` (null = 0, kernel-space addresses ≥ 0xffff800000000000) — this prevents kernel-mode page faults from unmapped user pages.
+**Generator:** 10,000 calls per syscall number. `a0` cycles through: our valid cap slots (0, 1), out-of-range slots (64, 0xFFFF, u64::MAX), and random u32 values. `a1`/`a2` are restricted to values that fail `validate_user_slice` (null = 0, kernel-space addresses ≥ 0xffff800000000000) - this prevents kernel-mode page faults from unmapped user pages.
 
 **Syscall numbers tested:** 1, 2, 3, 5, 7, 8, 10, 11, 12, 14. Four numbers excluded:
 - nr=4 (Yield): causes a real scheduler context switch per call; no cap argument to exercise.
 - nr=6 (AllocMem): small a0 values cause real physical frame allocations before budget is exhausted; page-table overhead makes the loop prohibitively slow on QEMU TCG. Covered by F8.
 - nr=13 (InspectKernel): query_id=1 (hit when a0=1) calls `count_live_endpoints()` which acquires `ROUTE_LOCKED`, the same spinlock held by ping/pong IPC sends. Spinning on a contended atomic under QEMU TCG burns the full CPU quantum. Covered by property probes P4/P5/P7.
-- nr=15 (RemoveCap): `iter%8==0` produces `a0=0`, removing slot 0 (log_write cap). `ctx.log` at the end then fails silently — pass string never appears and the test times out. RemoveCap cannot panic regardless of slot index (empty/out-of-range slots are an idempotent no-op returning 0), so excluding it does not reduce panic-safety coverage.
+- nr=15 (RemoveCap): `iter%8==0` produces `a0=0`, removing slot 0 (log_write cap). `ctx.log` at the end then fails silently - pass string never appears and the test times out. RemoveCap cannot panic regardless of slot index (empty/out-of-range slots are an idempotent no-op returning 0), so excluding it does not reduce panic-safety coverage.
 
 **Iteration count:** 100 × 10 syscalls = 1,000 total. Scaled down from the 1M/nr spec target to fit QEMU TCG emulation speed on Windows without KVM. Scale-up is straightforward on native hardware with KVM.
 
@@ -73,27 +73,27 @@ Fuzz tests reuse the probe service binary (`services/probe`) with new probe mode
 **Fail:** `KERNEL PANIC` seen on serial.
 **Timeout:** 120 s.
 
-### F2 — Syscall numbers
+### F2 - Syscall numbers
 
 **Surface:** The dispatch table's catch-all `_ => -1` arm.
 
 **Generator:** 50,000 random u64 syscall numbers. Any value in 1–15 (valid) is remapped by adding 100 (ensuring every call hits the unknown path). All calls use zero arguments.
 
-**Expected:** every call returns -1 (UnknownSyscall). If any returns a non-(-1) value, `fuzz: F2 FAIL` is logged (wrong dispatch, not a panic — still caught). Any `KERNEL PANIC` is the primary failure mode.
+**Expected:** every call returns -1 (UnknownSyscall). If any returns a non-(-1) value, `fuzz: F2 FAIL` is logged (wrong dispatch, not a panic - still caught). Any `KERNEL PANIC` is the primary failure mode.
 
 **Pass:** `fuzz: F2 pass (50000/50000)` seen on serial.
 **Timeout:** 60 s.
 
-### F5 — IPC message bodies
+### F5 - IPC message bodies
 
 **Surface:** `build_message` → kernel copy path in `handle_send` / `handle_try_send`.
 
-**Generator:** 1,000 `try_send` calls to `fuzz-f5-recv` with random byte content, random sizes 0–4096 bytes. After the queue fills (depth 16), remaining calls return `QueueFull` — also acceptable.
+**Generator:** 1,000 `try_send` calls to `fuzz-f5-recv` with random byte content, random sizes 0–4096 bytes. After the queue fills (depth 16), remaining calls return `QueueFull` - also acceptable.
 
 **Pass:** `fuzz: F5 pass (1000/1000)` seen on serial.
 **Timeout:** 60 s.
 
-### F6 — Embedded cap slots
+### F6 - Embedded cap slots
 
 **Surface:** `handle_send_with_cap` validation path (endpoint cap check + grant cap check).
 
@@ -102,7 +102,7 @@ Fuzz tests reuse the probe service binary (`services/probe`) with new probe mode
 **Pass:** `fuzz: F6 pass (1000/1000)` seen on serial.
 **Timeout:** 60 s.
 
-### F7 — Cap generation / stale-cap sends
+### F7 - Cap generation / stale-cap sends
 
 **Surface:** `enqueue` → generation check path in `routing.rs`.
 
@@ -112,7 +112,7 @@ Fuzz tests reuse the probe service binary (`services/probe`) with new probe mode
 **Fail:** `fuzz: F7 FAIL` (stale-cap send succeeded) or `KERNEL PANIC`.
 **Timeout:** 120 s.
 
-### F8 — Memory request sizes
+### F8 - Memory request sizes
 
 **Surface:** `handle_alloc_mem` → `current_task_claim_alloc` budget check.
 
@@ -127,7 +127,7 @@ Fuzz tests reuse the probe service binary (`services/probe`) with new probe mode
 
 ## Phase 2: F3, F4
 
-### F3 — ELF mutation
+### F3 - ELF mutation
 
 **Surface:** The kernel's ELF loader (`kernel/src/loader.rs`), called at spawn time.
 
@@ -140,11 +140,11 @@ After running all 77 inputs through `load()` with `let _ = load(...)`, prints `f
 **Pass:** `fuzz: F3 pass (77/77)` seen on serial.
 **Timeout:** 30 s.
 
-### F4 — Service contracts
+### F4 - Service contracts
 
 **Surface:** `osdev validate` (the host-side JSON Schema validator in `osdev/src/validator.rs`).
 
-**Implementation:** `validate_contract_source()` implements UTF-8 check → TOML parse → JSON serialize → JSON validate against schema. `find_contracts()` walks the repo for `*/contracts/*.toml` files. `validate_contract()` reads a file and calls `validate_contract_source()`. The `ContractFuzz` test kind is host-side only (no QEMU): 3 valid TOML inputs must return Ok; 14 invalid inputs (empty, non-UTF-8, invalid TOML, missing fields, wrong types, bad patterns, extra fields, out-of-range core) are wrapped in `catch_unwind` — a panic is a FAIL, any other result (Ok or Err) is acceptable.
+**Implementation:** `validate_contract_source()` implements UTF-8 check → TOML parse → JSON serialize → JSON validate against schema. `find_contracts()` walks the repo for `*/contracts/*.toml` files. `validate_contract()` reads a file and calls `validate_contract_source()`. The `ContractFuzz` test kind is host-side only (no QEMU): 3 valid TOML inputs must return Ok; 14 invalid inputs (empty, non-UTF-8, invalid TOML, missing fields, wrong types, bad patterns, extra fields, out-of-range core) are wrapped in `catch_unwind` - a panic is a FAIL, any other result (Ok or Err) is acceptable.
 
 **Pass:** All 3 good inputs return Ok; all 14 bad inputs complete without panicking.
 **Timeout:** N/A (host-side, no QEMU).
@@ -187,15 +187,15 @@ BF3 uses `kernel/test-bad-elf-brutal` feature: 263 inputs (13 specific + 200 xor
 
 | Name | Mode | has_recv | send_peers |
 |------|------|----------|------------|
-| fuzz-bf5-recv | 0 (passive) | yes | — |
+| fuzz-bf5-recv | 0 (passive) | yes | - |
 | fuzz-bf5 | 116 | no | fuzz-bf5-recv |
-| fuzz-bf6-recv | 0 (passive) | yes | — |
+| fuzz-bf6-recv | 0 (passive) | yes | - |
 | fuzz-bf6 | 117 | no | fuzz-bf6-recv |
-| fuzz-bf7-victim | 0 (passive) | yes | — |
+| fuzz-bf7-victim | 0 (passive) | yes | - |
 | fuzz-bf7 | 118 | no | fuzz-bf7-victim |
-| fuzz-bf1 | 114 | no | — |
-| fuzz-bf2 | 115 | no | — |
-| fuzz-bf8 | 119 | no | — |
+| fuzz-bf1 | 114 | no | - |
+| fuzz-bf2 | 115 | no | - |
+| fuzz-bf8 | 119 | no | - |
 
 `TASK_KSTACK_MAX` and `MAX_TASKS` raised from 140 → 160 to accommodate new probes.
 
@@ -253,7 +253,7 @@ Runs BF1–BF8. BF1/BF2/BF5–BF8 boot QEMU with the standard image. BF3 rebuild
 
 **Bug:** `(size + 4095) & !4095` wraps to 0 for `size = u64::MAX`. The subsequent `saturating_add(0)` budget check passes, and `handle_alloc_mem` maps 0 pages but returns a "valid" VA. The task gets a phantom VA with no backing pages.
 
-**Impact:** Not a kernel panic (the probe doesn't write to the returned VA), but a silent correctness violation — the probe gets an unusable VA. Could become a page-fault kill if the probe tries to use it.
+**Impact:** Not a kernel panic (the probe doesn't write to the returned VA), but a silent correctness violation - the probe gets an unusable VA. Could become a page-fault kill if the probe tries to use it.
 
 **Fix:** `size.checked_add(4095).map(|v| v & !4095).unwrap_or(u64::MAX)`. Overflow saturates `aligned` to `u64::MAX`, which the `saturating_add` budget check correctly rejects with `AllocDenied`.
 

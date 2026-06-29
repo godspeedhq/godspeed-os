@@ -23,7 +23,7 @@ Provide typed, safe wrappers around kernel syscalls so service code:
 
 `ServiceContext` is the single entry point for all OS interaction:
 - Passed by the kernel to `service_main` at spawn.
-- Non-`Copy` — one instance per service; cannot be duplicated.
+- Non-`Copy` - one instance per service; cannot be duplicated.
 - The only way to invoke syscalls (no raw `asm!` in service code).
 
 ```
@@ -45,9 +45,9 @@ ctx.spawn_on("pong", 1)?;
 ## Records and pipe-friendly services (`record.rs`)
 
 GodspeedOS pipes carry a **typed `Table`**, not text (`docs/records.md`). The model lives here in
-the SDK so any service — not just the shell — can build records, filter them
+the SDK so any service - not just the shell - can build records, filter them
 (`where`/`select`/`sort`), and render them to JSON/YAML. All bounded and `no_std` (fixed
-cols/rows/arena, loud on overflow — §26.6).
+cols/rows/arena, loud on overflow - §26.6).
 
 A service participates in a record pipe **with no new kernel surface**: build a `Table`, send it
 through the shell-delegated pipe cap (EOT-terminated, like any byte producer, `docs/pipes.md`).
@@ -66,18 +66,18 @@ impl RecordSink for MsgSink<'_> {
 }
 
 t.encode(&mut sink);   // ← the binary WIRE CODEC: the Table itself, compact & typed.
-                       //   The shell decodes it straight into records — no round-trip.
+                       //   The shell decodes it straight into records - no round-trip.
 t.to_json(&mut sink);  // ← or JSON text; the shell's `| from json` lifts it back.
 ```
 
-- **`encode`/`decode`** — the bounded binary codec. Use it for a service that *is* a record
+- **`encode`/`decode`** - the bounded binary codec. Use it for a service that *is* a record
   producer (the shell knows it and `Table::decode`s its stream into a `Table`). Compact, typed,
   not JSON. `examples/roster` does this.
-- **`to_json`** — render JSON at the edge; the shell's `| from json` parses external/text JSON
+- **`to_json`** - render JSON at the edge; the shell's `| from json` parses external/text JSON
   back into records. Use it for human-facing output and interop, not service→service transport.
 
 Both are bounded (§26.6) and fit the byte-pipe transport. The codec is what makes a service-side
-producer first-class — `roster | where role=core` with no `from json` in sight.
+producer first-class - `roster | where role=core` with no `from json` in sight.
 
 ## no_std
 
@@ -89,4 +89,4 @@ The SDK is `#![no_std]`. It does not depend on any allocator. Services that need
 - A network API (not in v1 scope).
 - Threads (services are single-threaded; parallelism is via multi-service composition).
 - A heap allocator (services must manage their own memory if they need it).
-- Raw syscall wrappers (intentionally absent — always go through `ServiceContext`).
+- Raw syscall wrappers (intentionally absent - always go through `ServiceContext`).

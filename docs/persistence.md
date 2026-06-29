@@ -8,7 +8,7 @@
 
 ## 1. Scope and milestone
 
-This is **v2 work**, not v1. The v1 milestone (§23) is complete — multi-core boot,
+This is **v2 work**, not v1. The v1 milestone (§23) is complete - multi-core boot,
 ping↔pong cross-core IPC, supervisor restart. Real persistence was explicitly **out of
 scope for v1** (§23.4, "Filesystem persistence beyond the trusted block driver"), and
 §6.3 names the remaining v2 work directly: *"the remaining v2 work is block-driver / fs."*
@@ -29,19 +29,19 @@ name.
 | Filesystem | **Our own, from first principles** | ext4/btrfs are POSIX + enormous; both fights the constitution (§2.4, §3.3, §26.11). No interop requirement to justify the cost. |
 | Authority model | **File = capability** (north star) | Authority by capability, not by mode bits (§3.3). Extends the capability model instead of bolting a permission model beside it. |
 | Block device | **ATA PIO (legacy IDE)** | Simplest correct device; **no DMA → least-privilege by construction**; works in QEMU and has a hardware path; stepping-stone to AHCI. |
-| Namespace | **Hierarchical (directories + paths)** — adopted; Phase 1 shipped *flat* | Flat name→blob isn't realistic for real use; real directories from the start (§6.2). Still no links/permissions (authority is by capability, §3.3). |
+| Namespace | **Hierarchical (directories + paths)** - adopted; Phase 1 shipped *flat* | Flat name→blob isn't realistic for real use; real directories from the start (§6.2). Still no links/permissions (authority is by capability, §3.3). |
 | Bounds | **Fixed, bounded** | Like the rest of the system (queue depth 16, MAX_ENDPOINTS): fixed file count / name length, no unbounded trees (§26.6). |
 | Crash model (Phase 1) | **Write-through, honest loss** | A crash mid-write may lose that write; refuse to mount on bad magic (§3.12). Transactional recovery is Phase 3 (§6.3). |
 
 ## 3. Why not ext4 / btrfs / a standard filesystem
 
-A standard on-disk format buys exactly one thing — **interop** (read Linux's disks, let
-Linux read ours) — and GodspeedOS has no interop requirement (it runs on a dedicated
+A standard on-disk format buys exactly one thing - **interop** (read Linux's disks, let
+Linux read ours) - and GodspeedOS has no interop requirement (it runs on a dedicated
 machine/VM, Appendix A.5, storing its own services' state). Against zero benefit, the
 costs are disqualifying:
 
 1. **They encode identity-based authority.** Every ext4 inode carries `uid/gid/mode`.
-   That is *"user X may read this file"* — precisely the identity-based authority §3.3
+   That is *"user X may read this file"* - precisely the identity-based authority §3.3
    forbids (*"All authority is explicit. Capabilities, not identity."*). In our world the
    authority to touch a file is *holding the capability to it*; those inode fields would
    be dead, contradictory machinery.
@@ -49,42 +49,42 @@ costs are disqualifying:
    minutes" a hard requirement. ext4 is tens of thousands of lines (extent trees, htree
    directories, journaling); btrfs is ~140k lines of CoW B-trees, checksums, subvolumes,
    snapshots, RAID. Neither is whiteboardable. Importing either violates the one thing §26
-   exists to protect — *"The Model Is The Product"* (§26.1).
+   exists to protect - *"The Model Is The Product"* (§26.1).
 3. **"Porting" is really a rewrite** (the Appendix D.6 argument, applied to a filesystem):
    they assume a POSIX VFS, a page cache, kernel locking, `errno`. You reimplement from
-   the on-disk-format spec — and that format is the part you marry forever.
+   the on-disk-format spec - and that format is the part you marry forever.
 
 So: a deliberately minimal filesystem, **pulled into existence by what §15 needs**
 (§26.2), not by what "a real filesystem has."
 
 ### 3.1 Why not just FAT (we already need it for the boot ESP)?
 
-FAT is the sharpest version of the question — the UEFI boot ESP *must* be FAT, so
+FAT is the sharpest version of the question - the UEFI boot ESP *must* be FAT, so
 why not use FAT (or exFAT) for data too and skip GSFS? Note first that the §3
 *permission* argument does **not** apply here: FAT has no `uid/gid/mode`, so it
 does not clash with capability authority the way ext4 does. The real reasons:
 
 1. **"We already need FAT" is softer than it looks.** GodspeedOS implements **zero
-   FAT** today — the ESP is built by host tooling (`osdev image`) and read by Limine;
+   FAT** today - the ESP is built by host tooling (`osdev image`) and read by Limine;
    the kernel has never touched a FAT byte. And a **minimal, write-once boot ESP**
    (a few static files, or a stamped prebuilt blob) is *far* simpler than a **general
    read/write/grow/delete data filesystem**. Making a boot ESP does not hand us a free
    general FAT.
-2. **A *correct* FAT is not "simple."** It carries 40 years of compatibility cruft —
+2. **A *correct* FAT is not "simple."** It carries 40 years of compatibility cruft -
    8.3 names, the VFAT long-filename + checksum scheme, FAT-chain allocation, FSInfo,
    two FAT copies. A clean inode+directory GSFS is **comparable-or-less** code than a
    correct VFAT, and it is *ours*: our fields (the `drives` `DEFAULT` flag + drive
    `label`), our evolution path (file-as-capability, §7), no legacy, no exFAT patents.
-3. **No interop requirement** (§3) — FAT's one real win is universal readability on
+3. **No interop requirement** (§3) - FAT's one real win is universal readability on
    other OSes, which we do not need.
 
-> **Reconsider-if:** the deciding factor is *not* "FAT is bad" — it is that we'd have
+> **Reconsider-if:** the deciding factor is *not* "FAT is bad" - it is that we'd have
 > to implement FAT inside the OS anyway and a correct one isn't simpler, plus we have
 > no interop need. **If reading GodspeedOS data drives on Windows/Mac/Linux ever
 > becomes a goal, FAT/exFAT deserve a serious second look.** Recorded so a future
 > contributor sees the trade was made with eyes open, not by reflex.
 
-### 3.2 Capacity is the wrong axis — the real difference is features
+### 3.2 Capacity is the wrong axis - the real difference is features
 
 A natural question is "how much can GSFS hold vs ext4/NTFS/APFS/ZFS?" The honest
 answer is that **capacity is just field width** and a poor way to compare:
@@ -103,9 +103,9 @@ answer is that **capacity is just field width** and a poor way to compare:
 GSFS is FAT32-class **today only because Phase-1 chose 32-bit fields**; widening
 `size` + `total_blocks` to `u64` is a one-line change that vaults it past ext4. So
 capacity does not distinguish these filesystems. What ext4/NTFS/APFS/ZFS actually buy
-is **features** — journaling (crash-safety), checksums (bit-rot), snapshots,
+is **features** - journaling (crash-safety), checksums (bit-rot), snapshots,
 copy-on-write, B-tree metadata that stays fast at millions of files. **GSFS
-deliberately has none yet** — that, not size, is its real trade-off: §26.6/§20
+deliberately has none yet** - that, not size, is its real trade-off: §26.6/§20
 minimalism now, with journaling arriving as the Phase-3 transactional-recovery work
 (§6.3) only when a real need pulls it in.
 
@@ -129,13 +129,13 @@ The line between `fs` and `block-driver` is the same line every microkernel draw
 **policy (file layout) above, mechanism (move sectors) below.** `block-driver` never
 learns what a file is; `fs` never touches a port.
 
-## 5. Block driver — ATA PIO
+## 5. Block driver - ATA PIO
 
 ### 5.1 Why ATA PIO
 
 - **No DMA → least-privilege by construction.** A PIO driver moves sectors through I/O
   ports one 16-bit word at a time; it *cannot* DMA anywhere. So it never holds the
-  DMA-anywhere reach that forced H1 (the IOMMU work) into existence — it is not
+  DMA-anywhere reach that forced H1 (the IOMMU work) into existence - it is not
   kernel-equivalent *even without an IOMMU*. That is a strictly cleaner TCB story than a
   DMA block driver, and it is what eventually lets `block-driver` leave the TCB on its own
   merits (§6.3), independent of IOMMU presence.
@@ -146,7 +146,7 @@ learns what a file is; `fs` never touches a port.
   LBA) carries directly into a future AHCI driver. (virtio-blk, by contrast, is a
   QEMU-only paravirtual device that runs on no real hardware.)
 
-The cost — PIO is slow — is irrelevant for v2 persistence (§20: correctness over
+The cost - PIO is slow - is irrelevant for v2 persistence (§20: correctness over
 performance). We optimize transfer width later, never at the cost of clarity.
 
 ### 5.2 The new mechanism it needs: `hw_pio`
@@ -158,7 +158,7 @@ So Phase 1 adds a small, audited mechanism, mirroring the existing MMIO story:
 - A **`hw_pio` capability** in the contract: a port range the driver may touch, validated
   and granted at spawn exactly like `hw_mmio`.
 - **SDK port-I/O wrappers** (`Pio::inb/outb/inw/outw/insw/outsw`) in an audited
-  `sdk/rust/src/pio.rs`, each block carrying a `// SAFETY:` comment — the same isolation
+  `sdk/rust/src/pio.rs`, each block carrying a `// SAFETY:` comment - the same isolation
   §18.1 already grants the MMIO/DMA accessor modules. The driver service itself stays
   `unsafe`-free behind the safe wrappers.
 
@@ -185,7 +185,7 @@ Polled completion in Phase 1 (no interrupt handler) keeps it dead simple; the
 `hw_interrupt` cap in the contract can stay unused until we want interrupt-driven
 completion (a later optimization, not a correctness need).
 
-## 6. Filesystem — on-disk format
+## 6. Filesystem - on-disk format
 
 A flat **name → blob** store. Proposed geometry (concrete but tunable in Phase 1):
 
@@ -201,21 +201,21 @@ A flat **name → blob** store. Proposed geometry (concrete but tunable in Phase
   └───────────────┴──────────────────┴───────────────┴────────────────────────┘
 ```
 
-**Superblock** — `magic` (refuse to mount if wrong — loud failure, never auto-reformat,
+**Superblock** - `magic` (refuse to mount if wrong - loud failure, never auto-reformat,
 §3.12), `version`, `block_size`, `total_blocks`, `entry_table_blocks`, `bitmap_blocks`,
 `data_start`, and a `checksum` over the superblock.
 
-**Entry** (fixed-size, fills the entry table) — `name[NAME_MAX]`, `size_bytes`,
+**Entry** (fixed-size, fills the entry table) - `name[NAME_MAX]`, `size_bytes`,
 `first_block`, `block_count`, `generation`, `flags` (in-use / free).
 
 **Allocation (Phase 1): contiguous extents.** Each file occupies a contiguous run of data
 blocks (`first_block .. first_block+block_count`). This is the whiteboard-simplest scheme
-and a perfect fit for the actual workload — mostly write-once blobs (service binaries,
+and a perfect fit for the actual workload - mostly write-once blobs (service binaries,
 state snapshots). The known limitation is fragmentation and that growing a file may
 require relocation; both are acceptable Phase 1 and revisited only if a real need pulls
 (block lists / extents) into existence (§26.2).
 
-**Proposed bounds** (in the spirit of queue-depth-16, MAX_ENDPOINTS — bounded everything,
+**Proposed bounds** (in the spirit of queue-depth-16, MAX_ENDPOINTS - bounded everything,
 §26.6): `BLOCK_SIZE = 4096`, `NAME_MAX = 64`, `MAX_FILES = 256`. Final numbers set in
 Phase 1; the point is they are *fixed and stated*, not elastic.
 
@@ -224,22 +224,22 @@ Phase 1; the point is they are *fixed and stated*, not elastic.
 Two invariants shape the data path and are worth making explicit:
 
 - **§8.5:** max IPC message is 4 KiB, kernel-copied.
-- **§2.5:** zero-copy IPC is *permanently rejected* — so `fs` and `block-driver` may **not**
+- **§2.5:** zero-copy IPC is *permanently rejected* - so `fs` and `block-driver` may **not**
   share a buffer; bulk data crosses between them as copied messages.
 
 Therefore a large read (e.g. a 200 KiB service binary) is inherently a sequence of
-message-sized, copied transfers — `fs` requests blocks from `block-driver` in chunks that
+message-sized, copied transfers - `fs` requests blocks from `block-driver` in chunks that
 fit one message (≤ ~4 KiB minus header; Phase 1 may start at a single 512 B sector per
 message for simplicity, widening later to several sectors per message). This is slower
 than a shared-buffer design *by construction*, and that is the accepted cost of the
-no-shared-memory invariant — a clean illustration of §20 (correctness and clarity over
+no-shared-memory invariant - a clean illustration of §20 (correctness and clarity over
 performance) and §26.7 (the copy is the honest, bounded behavior).
 
-### 6.2 Hierarchical evolution — real directories (adopted; **built**)
+### 6.2 Hierarchical evolution - real directories (adopted; **built**)
 
 The flat single-entry-table format above shipped in **Phase 1** (mount, named files,
-reboot survival — all working). It was **evolved to a real hierarchical filesystem**
-(magic `GSFS0002`) — flat name→blob isn't realistic for actual use, so GSFS gets **real
+reboot survival - all working). It was **evolved to a real hierarchical filesystem**
+(magic `GSFS0002`) - flat name→blob isn't realistic for actual use, so GSFS gets **real
 directories from the start**. (See `docs/drives.md` for the user-facing path/addressing
 model, `[N:]label/path/to/file`.)
 
@@ -251,10 +251,10 @@ model, `[N:]label/path/to/file`.)
 > Geometry: 256 inodes (64 B each, 32 blocks), one 512-B block per directory (16 entries,
 > `name[27]`), files = contiguous extents via the bump allocator.
 
-The hierarchical format, still GodSpeed-minimal (bounded, no POSIX permissions —
-authority is by capability, §3.3 — and no hard links). **All capacity-bearing fields
+The hierarchical format, still GodSpeed-minimal (bounded, no POSIX permissions -
+authority is by capability, §3.3 - and no hard links). **All capacity-bearing fields
 are `u64` from the start** (block counts, file sizes, block pointers, the block-IPC
-LBA) — see §6.3:
+LBA) - see §6.3:
 
 ```text
   Superblock (LBA 0): magic "GSFS…", version, block_size, total_blocks:u64,
@@ -269,15 +269,15 @@ LBA) — see §6.3:
 
 ### 6.3 Capacity: `u64` fields from day one (decided)
 
-Phase 1 used `u32` for block counts + file size — FAT32-class limits (2 TiB volume,
+Phase 1 used `u32` for block counts + file size - FAT32-class limits (2 TiB volume,
 4 GiB file, §3.2). The hierarchical format **widens every capacity-bearing field to
 `u64`**: `total_blocks`, `next_free_block`, inode `size_bytes`/`first_block`/
 `block_count`, **and the block-IPC `lba`** (`ReadBlock`/`WriteBlock` carry an 8-byte
-LBA, and `block-driver`/AHCI already use a `u64` LBA). These must move *together* —
+LBA, and `block-driver`/AHCI already use a `u64` LBA). These must move *together* -
 widening only some unlocks nothing.
 
 The resulting ceiling is effectively unlimited: **~8 ZiB volume** (2⁶⁴ × 512 B) and a
-**16 EiB max file** — past ext4, into ZFS territory. The cost is a handful of bytes per
+**16 EiB max file** - past ext4, into ZFS territory. The cost is a handful of bytes per
 superblock/inode; the bound is *stated and fixed*, not elastic (§26.6). This is the
 "capacity is field width" point (§3.2) acted on: pick the wide field once, at the
 format's birth, and never revisit the ceiling.
@@ -301,26 +301,26 @@ format's birth, and never revisit the ceiling.
 This supersedes the flat §6 format as the target; the flat version remains the
 historical Phase-1 record.
 
-### 6.4 Phase 3 — the scalable format (GSFS0003): free bitmap + self-describing entries, no inode table
+### 6.4 Phase 3 - the scalable format (GSFS0003): free bitmap + self-describing entries, no inode table
 
 > **Decided 2026-06-14, from first principles.** The §6.2 inode-table format shipped and
 > works, but it reaches for two POSIX ideas it doesn't need and one that doesn't scale:
-> the word/concept **`inode`** (a metadata "node" — index-node — kept apart from the name,
+> the word/concept **`inode`** (a metadata "node" - index-node - kept apart from the name,
 > which exists in Unix mainly for **hard links**, which GSFS doesn't have), and a **fixed
-> global inode cap (256)** — absurdly small on a 122 GB disk. This phase replaces both.
+> global inode cap (256)** - absurdly small on a 122 GB disk. This phase replaces both.
 
-**First-principles structure set — exactly three things on disk:**
+**First-principles structure set - exactly three things on disk:**
 
 1. **Superblock.**
-2. **Free bitmap** — one bit per block (set = used). The *only* global structure, and it is
+2. **Free bitmap** - one bit per block (set = used). The *only* global structure, and it is
    a **free map, not a file index**. Read **on demand** (one ~512-byte bitmap block covers
    4096 data blocks) + a small "last allocated" hint, so the allocator's RAM footprint is a
-   few hundred bytes regardless of file count. This is *not* a POSIX reflex — it answers a
+   few hundred bytes regardless of file count. This is *not* a POSIX reflex - it answers a
    **physical** constraint (you cannot cheaply enumerate N allocations by walking the tree
    or caching every record in RAM) that applies to any OS. Battle-tested because of physics,
    not because Unix.
 3. **The directory tree.** A directory is a file (type = dir) whose blocks hold
-   **self-describing entries** — each entry carries its own metadata, so there is **no inode
+   **self-describing entries** - each entry carries its own metadata, so there is **no inode
    table and no inode number**:
    ```
    Superblock (LBA 0): magic "GSFS0003", version, block_size, total_blocks:u64,
@@ -333,10 +333,10 @@ historical Phase-1 record.
 
 **Why no separate `file_record` and no global index** (the questions that drove this):
 
-- **No separate record** — the self-describing entry *is* the record. Name and metadata
+- **No separate record** - the self-describing entry *is* the record. Name and metadata
   travel together; there is no second copy to reconcile (on-disk duplication is what
   creates inconsistency, so we keep a single on-disk truth).
-- **No global index** — its two possible jobs are already covered. *Finding* a file = walk
+- **No global index** - its two possible jobs are already covered. *Finding* a file = walk
   the path from root: **the directory tree is the index**, hierarchical and distributed
   (each directory indexes its own children). *Free space* = the bitmap. Nothing needs a
   flat global list.
@@ -345,111 +345,111 @@ historical Phase-1 record.
   never RAM-resident, never authoritative** (the tree stays truth) and **visible, not a
   hidden layer** (§26.4). Not built now.
 
-**Bounds (still bounded, §26.6) — but local, not a global wall:** the only ceiling is the
+**Bounds (still bounded, §26.6) - but local, not a global wall:** the only ceiling is the
 disk itself (the bitmap). Directories **grow** (allocate a bigger extent when full), so
 there is no per-directory entry cap either; name length is fixed (38). Reclamation is
 intrinsic: `delete`/overwrite flip bits free; the allocator finds a free run in the bitmap.
 
-**Renaming:** the metadata record is a **`file_record`** (self-justifying — it says what it
+**Renaming:** the metadata record is a **`file_record`** (self-justifying - it says what it
 is), never an `inode`. "Index node" hid implementation jargon ("node") in a user-facing word.
 
 This supersedes §6.2 as the target. §6.2 (GSFS0002, inode table) and the flat §6 (GSFS0001)
 remain the historical record.
 
-### 6.5 `fs_index` — the deferred global index (built when search pulls it in)
+### 6.5 `fs_index` - the deferred global index (built when search pulls it in)
 
 > **Specified 2026-06-14, deliberately NOT built (§26.2).** A design the conversation
 > converged on and want on record, so the day it's needed it snaps on cleanly.
 
-**Two distinct things, two names — keep them apart:**
+**Two distinct things, two names - keep them apart:**
 
-- **`file_record`** — the *per-file/dir* metadata: the self-describing directory entry
+- **`file_record`** - the *per-file/dir* metadata: the self-describing directory entry
   `{type, name, size, first_block, block_count}` of §6.4. One record per file, lives in the
-  tree. This is the **unit** (never `inode` — "index node" smuggled impl-jargon into a user
+  tree. This is the **unit** (never `inode` - "index node" smuggled impl-jargon into a user
   word; `file_record` says what it is).
-- **`fs_index`** — a global index built *over all* `file_records`, for fast
+- **`fs_index`** - a global index built *over all* `file_records`, for fast
   **whole-filesystem enumeration**. This is the **aggregate**. (`fs_index`, not `fs_record`:
   "index" is the honest word for an aggregate lookup structure and doesn't collide with the
-  per-file `file_record`; it also keeps the half of "inode" that made sense — *index* — and
-  drops the half that didn't — *node*.)
+  per-file `file_record`; it also keeps the half of "inode" that made sense - *index* - and
+  drops the half that didn't - *node*.)
 
 **Why it's deferred.** The three GSFS0003 structures already serve every *current*
 operation: mount (superblock + bitmap), path lookup (walk the path), `ls` (one directory),
-free space (the bitmap). The **only** thing `fs_index` accelerates is whole-FS enumeration —
-a `find`, a global search, an "every file" view — which GodspeedOS does not have yet. So by
+free space (the bitmap). The **only** thing `fs_index` accelerates is whole-FS enumeration -
+a `find`, a global search, an "every file" view - which GodspeedOS does not have yet. So by
 §26.2 it is built the day such a command pulls it into existence, not before.
 
 **How it works when built** (the part worth recording now):
 
 - **Single owner, single-threaded → no concurrency to reconcile.** `fs` serves one IPC
   request at a time; "operations in different places" are just different *clients*, but they
-  **queue at `fs` and run serialized**. No structure is ever mutated in parallel — no races
+  **queue at `fs` and run serialized**. No structure is ever mutated in parallel - no races
   on the tree, the bitmap, or the index (the §8-ownership simplifier).
-- **The truth — tree + bitmap — is ALWAYS strongly consistent.** `fs` updates them inline,
+- **The truth - tree + bitmap - is ALWAYS strongly consistent.** `fs` updates them inline,
   per op, before serving the next request. A million ops = a million serialized; there is
   *never* an eventual window on the truth. Any reader needing the authoritative answer reads
   the tree, always current.
-- **`fs_index` is lazy, version-invalidated, rebuilt-from-truth — and *that* is the eventual
+- **`fs_index` is lazy, version-invalidated, rebuilt-from-truth - and *that* is the eventual
   part, safely.** Writes do **not** touch the index; each mutation just bumps a cheap
   tree-version counter, so the hot path is untaxed even under a million ops. When the index
   is actually *read* (a `find`), `fs` compares versions; if stale, it **rebuilds the index by
-  walking the tree once** — bounded by *tree size*, not by the churn that invalidated it.
+  walking the tree once** - bounded by *tree size*, not by the churn that invalidated it.
   Eventual consistency is harmless here because the index is **never authoritative**: a
   fresh index, a stale index, or a fallback to the tree all yield a correct answer. (This
-  refines an earlier "update inline on every write" framing — taxing every write to keep a
+  refines an earlier "update inline on every write" framing - taxing every write to keep a
   *rarely-read* index live is the wrong trade; mark-stale + rebuild-on-read keeps writes fast
   and is still always-correct.)
 - **No events, interrupts, or new caps.** `fs` is the sole mutation point, so "the index
   changed" is just "`fs` did an op + bumped the version." Crash repair is the *same*
   mechanism: a stale/dirty version → rebuild from the tree.
-- **On disk, disposable, rebuildable, non-authoritative, and visible** (§26.4) — never
+- **On disk, disposable, rebuildable, non-authoritative, and visible** (§26.4) - never
   RAM-resident (a trillion 64-byte records won't fit), never the source of truth, never a
   hidden layer.
 - **Cross-instance falls out for free.** Unplug a drive, replug into another GodspeedOS
   instance: it reads `fs_index`, trusts it if the version matches, rebuilds from the tree if
-  stale — a fast remount without re-walking the whole tree.
+  stale - a fast remount without re-walking the whole tree.
 - **Escape hatch for a giant tree:** if even the rebuild-on-`find` walk ever gets too slow,
-  *then* add incremental maintenance — an append-only change log + a background applier that
+  *then* add incremental maintenance - an append-only change log + a background applier that
   drains it into the index (classic write-ahead-log eventual consistency). A heavier machine
   pulled in only by a measured need (§26.2), not now.
 
 Specified, not built. GSFS0003 ships the three structures (§6.4); `fs_index` is the layer
 that snaps on when search arrives.
 
-### 6.6 GSFS0004 — integrity checksums (the "robust filesystem" Phase A)
+### 6.6 GSFS0004 - integrity checksums (the "robust filesystem" Phase A)
 
 > **Built 2026-06-17.** The first phase of the robustness program (crash-consistency +
-> large files + checksums + restartability — all four selected). GSFS0004 keeps the three
+> large files + checksums + restartability - all four selected). GSFS0004 keeps the three
 > GSFS0003 structures and the whole directory-tree/bitmap design **unchanged**; it adds
 > **integrity checksums** and **bakes the final geometry once** so later phases add
 > behaviour, not new on-disk formats.
 
 **What changed vs GSFS0003 (magic `GSFS0004`, version 4):**
 
-1. **Superblock CRC32** — a `sb_crc32` (u32 @124) over the superblock's first 124 bytes,
+1. **Superblock CRC32** - a `sb_crc32` (u32 @124) over the superblock's first 124 bytes,
    **verified on mount**. A corrupt superblock is a loud refusal (§3.12), never trusted or
-   silently repaired — alongside the existing bad-magic refusal. Re-stamped on every
+   silently repaired - alongside the existing bad-magic refusal. Re-stamped on every
    superblock write (`persist_super`).
-2. **Per-directory-block CRC32** — each 512-byte directory block now holds **7**
+2. **Per-directory-block CRC32** - each 512-byte directory block now holds **7**
    `file_record`s (was 8) and reserves its last 64 bytes as a trailer; the first 4 trailer
    bytes are a CRC32 over the block's 448-byte record region. Verified on **every**
    directory read (`dir_read`) and stamped on every write (`dir_write`), so corruption in
    the metadata that *defines the tree* surfaces loudly instead of returning garbage
-   records. The `file_record` layout is otherwise unchanged — **names stay 38 bytes**.
-3. **Reserved journal region** — `journal_start`/`journal_blocks` (u64 @108/@116) carve a
+   records. The `file_record` layout is otherwise unchanged - **names stay 38 bytes**.
+3. **Reserved journal region** - `journal_start`/`journal_blocks` (u64 @108/@116) carve a
    fixed 64-block (32 KiB) region between the bitmap and the data region. **Empty and
    unused in Phase A**; it is where Phase C's crash-consistency redo-journal lives. Baking
    it now means the on-disk geometry is fixed once, not churned across phases.
 
 **Scope of Phase A checksums:** the superblock and the directory tree (the structural
 metadata whose corruption breaks the whole filesystem). **Bitmap blocks and file *data*
-blocks are not yet checksummed** — a corrupt bitmap is reconstructible from the tree, and
+blocks are not yet checksummed** - a corrupt bitmap is reconstructible from the tree, and
 per-file data integrity is a deferred follow-on (a per-file-record data CRC), pulled in
 only when a need does (§26.2). The CRC32 is the standard IEEE 802.3 algorithm
 (`services/fs/src/crc32.rs`); `osdev` carries a byte-identical copy (`osdev/src/crc32.rs`)
 so host-baked images (`mkfs`, `script-disk`) checksum exactly as `fs` would.
 
-**Migration:** GSFS0004 is **reformat-only** — there is no GSFS0003→0004 upgrader. There is
+**Migration:** GSFS0004 is **reformat-only** - there is no GSFS0003→0004 upgrader. There is
 no interop requirement (§3) and `flash` is user-initiated, so an existing GSFS0003 data
 drive is simply re-flashed. (Mounting a GSFS0003 image under GSFS0004 fails loudly on the
 magic check, as it should.)
@@ -458,46 +458,46 @@ This supersedes §6.4 (GSFS0003) as the on-disk target; §6.4/§6.2/§6 remain t
 record. The remaining robustness phases (B large files, C crash-consistency, D
 restartable/TCB-drop) build on this format.
 
-### 6.7 Large files — streaming offset-addressed I/O (Phase B)
+### 6.7 Large files - streaming offset-addressed I/O (Phase B)
 
 > **Built 2026-06-17.** Phase B of the robustness program. The 3584-byte file ceiling was
 > never an *on-disk* limit (a file is already a contiguous u64 extent; `block-driver` moves
-> one sector per IPC) — it was the **client↔fs message** boundary: the whole file rode in one
+> one sector per IPC) - it was the **client↔fs message** boundary: the whole file rode in one
 > ≤4 KiB IPC message and one stack buffer. Phase B lifts it with a **streaming API**, no
 > on-disk format change.
 
-**Mechanism — stateless offset-addressed ops** (fit the single-owner, per-request model, §8;
+**Mechanism - stateless offset-addressed ops** (fit the single-owner, per-request model, §8;
 no open-file/session state):
 
-- `WriteNew(path, total)` (op 24) — create/truncate `path` to a file sized `total` bytes,
+- `WriteNew(path, total)` (op 24) - create/truncate `path` to a file sized `total` bytes,
   allocating the whole contiguous extent up front (record size = `total`; data filled next).
-- `WriteAt(path, offset, chunk)` (op 25) — write `chunk` at a **block-aligned** byte offset;
+- `WriteAt(path, offset, chunk)` (op 25) - write `chunk` at a **block-aligned** byte offset;
   whole blocks only (the last block of a partial chunk is zero-padded), so no
-  read-modify-write. Bounded to the file's extent — a write past it is a loud error.
-- `ReadAt(path, offset, len)` (op 26) — read up to `len` bytes from `offset` (clamped to size).
+  read-modify-write. Bounded to the file's extent - a write past it is a loud error.
+- `ReadAt(path, offset, len)` (op 26) - read up to `len` bytes from `offset` (clamped to size).
 
 A large write = `WriteNew` then a sequence of `WriteAt` chunks; a large read = `StatFile` (for
 the size) then a sequence of `ReadAt` chunks. The streaming **chunk** is `MAX_FILE_BYTES`
-(3584) — now the per-message size, no longer a file cap. The one-shot `WriteFile`/`ReadFile`
+(3584) - now the per-message size, no longer a file cap. The one-shot `WriteFile`/`ReadFile`
 remain for small files.
 
 **Clients.** The shell streams `read`, `copy` (incl. recursive), and the pipe `write`
-sink through these ops — so it views/copies files far larger than one message with only a
+sink through these ops - so it views/copies files far larger than one message with only a
 single chunk buffer (important given the shell's tight stack). `run` (which must hold a whole
 script to parse) stays on the one-shot path, bounded by what it can hold; the embedded
 `selfcheck` continues to run from rodata, not from a disk file.
 
 **Crash behaviour (until Phase C).** A large write is many separate writes; a crash mid-write
-leaves a partial file — the same honest-loss as any write today. Phase C's journal makes the
+leaves a partial file - the same honest-loss as any write today. Phase C's journal makes the
 metadata commit atomic.
 
 **Verified:** `osdev test fs-large` writes + reads a 200 KiB file in streaming chunks and
 re-reads it across a **reboot** (boot 1 writes, boot 2 re-verifies on the same disk); files
 130/0 and script 2/2 confirm the shell `read`/`copy` streaming is regression-free.
 
-### 6.8 Crash-consistency — the metadata redo-journal (Phase C)
+### 6.8 Crash-consistency - the metadata redo-journal (Phase C)
 
-> **Built 2026-06-17.** Phase C of the robustness program — the headline property: **any
+> **Built 2026-06-17.** Phase C of the robustness program - the headline property: **any
 > single power loss leaves the filesystem consistent.** Every metadata mutation runs as one
 > atomic transaction through the reserved journal region (§6.6); a crash either leaves the
 > filesystem entirely unchanged or, once a transaction has committed, is replayed to
@@ -506,11 +506,11 @@ re-reads it across a **reboot** (boot 1 writes, boot 2 re-verifies on the same d
 
 **The transaction.** A metadata-mutating op (write, mkdir, mkdir -p, rename, move, delete,
 label) STAGES all its structural block writes (directory blocks, bitmap blocks, superblock)
-in an in-memory buffer instead of writing them to disk — with **read-your-writes**, so the
+in an in-memory buffer instead of writing them to disk - with **read-your-writes**, so the
 op sees its own staged changes. `commit_txn` then:
 
 1. writes the staged blocks into the journal region;
-2. writes a **checksummed commit record** (magic + the home LBAs + a CRC32) — *the atomic
+2. writes a **checksummed commit record** (magic + the home LBAs + a CRC32) - *the atomic
    point*;
 3. checkpoints each staged block to its home LBA;
 4. invalidates the commit record.
@@ -529,26 +529,26 @@ it is completed. There is no third outcome.
 before replying (`FLUSH EXT`), and `fs` serializes requests, so the journal-data → commit →
 checkpoint ordering the protocol needs holds without any extra barrier op.
 
-**Bounds (§26.6).** A transaction stages at most `TXN_CAP` (56) blocks — comfortably more
+**Bounds (§26.6).** A transaction stages at most `TXN_CAP` (56) blocks - comfortably more
 than any single op needs; an op that would exceed it fails loudly rather than committing
 partially. `delete` of a whole subtree (`delete_tree`) is the one unbounded case: it commits
 the **unlink as one atomic transaction** (after which the subtree is unreachable), then
-reclaims the subtree's blocks in **bounded per-extent transactions** — a crash mid-reclaim
+reclaims the subtree's blocks in **bounded per-extent transactions** - a crash mid-reclaim
 only leaks blocks (safe, never corruption).
 
 **Verified:** `osdev test fs-journal` (11 checks). Part 1 (REPLAY): a `journal-crash-test`
 build writes a file through a transaction that halts right after the commit record is durable
 (simulated power loss); the next boot's mount replays it from the journal and the file is
 present with the exact bytes. Part 2 (REJECT): a journal whose commit record has a bad CRC is
-ignored — the fs mounts clean and serves normally, no spurious replay. All five earlier
+ignored - the fs mounts clean and serves normally, no spurious replay. All five earlier
 suites (files, blockdev-reboot, fs-large, fs-corrupt, script) stay green with the journal
 active on every mutation.
 
-### 6.9 Restartable — `fs` + `block-driver` leave the TCB (Phase D)
+### 6.9 Restartable - `fs` + `block-driver` leave the TCB (Phase D)
 
 > **Built 2026-06-17, with a `CLAUDE.md` §6 amendment (signed off).** The §6.3 / §9 goal: with
 > crash-consistent recovery in hand (§6.8), `fs` and `block-driver` no longer need to be
-> trusted root — their death becomes a **supervisor restart, not a panic+reboot**. The
+> trusted root - their death becomes a **supervisor restart, not a panic+reboot**. The
 > non-restartable set shrinks to just `init` + `supervisor` + kernel.
 
 **Mechanism (mirrors the H11 registry path).**
@@ -559,13 +559,13 @@ active on every mutation.
   before `fs` (fs's send-peer cap to it wires from the kernel name table at spawn).
 - `fs` and `block-driver` **register** their names with the registry at startup, so clients can
   reacquire a fresh cap after a restart.
-- On restart, `fs` re-mounts — replaying the journal if the crash interrupted a commit (§6.8) —
+- On restart, `fs` re-mounts - replaying the journal if the crash interrupted a commit (§6.8) -
   so it always comes back consistent. The persisted data is intact.
 - Clients reacquire + retry on `EndpointDead` (§14.3): the shell's `fs_request` reacquires `fs`,
   and `fs`'s block I/O (`block_rpc`) reacquires `block-driver`. One retry covers the common
   case; the next command covers the window before the service has re-registered.
 
-**Verified:** `osdev test fs-restart` (§22 Test 13, 7 checks) — the shell writes a file, `KILL
+**Verified:** `osdev test fs-restart` (§22 Test 13, 7 checks) - the shell writes a file, `KILL
 fs` over the control channel, the supervisor respawns `fs`, `fs` re-mounts + re-registers, and
 the shell reacquires `fs` and reads the file back; the kernel never panics. The journal suite
 and all file suites stay green.
@@ -574,54 +574,54 @@ This completes the four-part filesystem robustness program (A integrity, B large
 crash-consistency, D restartable). The earlier "Phase 1/Phase 3 TCB trajectory" framing in §9
 is now realized.
 
-### 6.10 Data-block checksums — every block self-verifies (GSFS0005)
+### 6.10 Data-block checksums - every block self-verifies (GSFS0005)
 
 > **Built 2026-06-17.** Phase A checksummed the *structural* metadata (superblock + directory
 > tree); file **data** blocks were the one thing still unchecksummed (a noted follow-on). This
 > closes it: each file-data block now carries its own CRC32, so silent bit-rot in file content
-> is caught loudly on read (§3.12) — exactly like the superblock and directory blocks.
+> is caught loudly on read (§3.12) - exactly like the superblock and directory blocks.
 
 **Format change (magic `GSFS0004` → `GSFS0005`, reformat-only).** A file-data block is now
 **508 bytes of payload + a 4-byte CRC32 trailer @508** (mirroring the directory-block trailer).
 A file of N bytes spans `ceil(N/508)` data blocks; each block's CRC covers its own 508-byte
 payload, verified on every read (`data_read`) and stamped on every write (`data_write`). This
-makes **every block in the filesystem self-verifying** — superblock (CRC @124), directory block
-(CRC @448), data block (CRC @508) — a uniform, whiteboardable model with no side structure and
+makes **every block in the filesystem self-verifying** - superblock (CRC @124), directory block
+(CRC @448), data block (CRC @508) - a uniform, whiteboardable model with no side structure and
 no read-modify-write.
 
 **Consequences, all localized:**
 - The per-message streaming chunk is now `7 × 508 = 3556` bytes (`MAX_FILE_BYTES`, and the
-  shell's `IO_CHUNK`) — 7 whole data-block payloads, so a streaming `WRITE_AT` offset stays
+  shell's `IO_CHUNK`) - 7 whole data-block payloads, so a streaming `WRITE_AT` offset stays
   block-aligned (no RMW). The offset-addressed ops and the shell streaming loops are otherwise
   unchanged.
 - Data writes stay **direct** (not journaled), so the Phase-C crash model is unchanged: a
-  pre-commit crash leaves the data (and its CRCs) in an unreferenced extent — harmless.
+  pre-commit crash leaves the data (and its CRCs) in an unreferenced extent - harmless.
 - ~0.8% space overhead (4 bytes per 512). The host baker (`osdev` `gsfs_add_file`) writes data
   the same 508-payload-+-CRC way, so baked files (`script-disk`, `mkfs`) verify identically.
 
-**Scope.** Bitmap blocks remain unchecksummed — they are reconstructible from the tree, and a
+**Scope.** Bitmap blocks remain unchecksummed - they are reconstructible from the tree, and a
 bitmap bit-flip is a space-accounting error, not data loss; a dedicated bitmap CRC is a future
 add only if a need arises (§26.2).
 
-**Verified:** `osdev test fs-corrupt` case 3 (now 11 checks total) — bake a file, flip a payload
+**Verified:** `osdev test fs-corrupt` case 3 (now 11 checks total) - bake a file, flip a payload
 byte in its data block, boot: `fs` logs a "data block CRC mismatch" and the read is refused
 (never returns the corrupt bytes), no panic. files 130/0, fs-large, fs-journal 11/0, fs-restart
 7/0, script 2/2, blockdev-reboot all stay green with 508-byte data blocks.
 
-### 6.11 Further robustness — roadmap (recovery layer)
+### 6.11 Further robustness - roadmap (recovery layer)
 
 > **Adopted 2026-06-17.** Phases A–E gave the filesystem **detection** (every block self-verifies),
-> **crash-consistency** (the metadata journal), **restartability**, and **persistence** — all
+> **crash-consistency** (the metadata journal), **restartability**, and **persistence** - all
 > hardware-proven on the T630. The remaining robustness work is mostly the *next* layer:
 > **recover after detection**, and remove the **single fatal block**. These are pulled in
 > cheap-first; the heavy items stay deferred until a real need pulls them (§26.2).
 
 **Doing now (cheap, high value):**
 
-- **Phase F — Backup superblock (GSFS0006). ✅ Built + verified 2026-06-17.** The superblock is a
+- **Phase F - Backup superblock (GSFS0006). ✅ Built + verified 2026-06-17.** The superblock is a
   single block at LBA 0; if its CRC fails the whole volume won't mount. A **second copy at the
   last LBA** (`total_blocks-1`, reserved in the bitmap at format) lets `mount` fall back to it
-  when the primary fails — and heal the primary from it. The backup is located via the
+  when the primary fails - and heal the primary from it. The backup is located via the
   block-driver's reported capacity, so it works even when the primary is unreadable (no
   chicken-and-egg). `format` writes both; `persist_super` keeps them in sync (staged in the same
   transaction, so they commit atomically); `drives reset` wipes both. Removes the single most
@@ -629,34 +629,34 @@ byte in its data block, boot: `fs` logs a "data block CRC mismatch" and the read
   `osdev test fs-corrupt` (now 14 checks): corrupt the primary → recovers from backup; corrupt
   both → loud refusal. No regression (files 130/0, fs-journal 11/0, fs-restart 7/0, drives 9/0,
   script 2/2, blockdev-reboot).
-- **Phase G — `drives check` (fsck / repair). ✅ Built + verified 2026-06-17.** A CRC failure is
+- **Phase G - `drives check` (fsck / repair). ✅ Built + verified 2026-06-17.** A CRC failure is
   *detected loudly* but was not *recoverable*, and a drifted bitmap/free-count had no repair.
   Because **the directory tree is the source of truth**, fsck falls out: zero the bitmap, mark
-  the system blocks + backup, then walk the tree marking every referenced extent — **rebuilding
-  the free bitmap + free count from the tree** (healing drift) — verifying every block's CRC and
+  the system blocks + backup, then walk the tree marking every referenced extent - **rebuilding
+  the free bitmap + free count from the tree** (healing drift) - verifying every block's CRC and
   **reporting** (not deleting) files/dirs that fail, and refreshing both superblock copies via
   `persist_super`. Turns "detected, dead" into "detected, repaired." A new `drives check` shell
   command (op `OP_CHECK`); no on-disk format change. Writes are DIRECT (not journaled): the
   rewrite is larger than one transaction and idempotent, so a crash mid-check is harmless (the
-  tree is still truth; re-running converges). **This subsumes a dedicated bitmap-block CRC** — if
+  tree is still truth; re-running converges). **This subsumes a dedicated bitmap-block CRC** - if
   the bitmap is rebuildable from the tree, checksumming it is redundant (§6.10's deferred
   bitmap-CRC is folded into fsck, not built separately). Verified by `osdev test fs-check` (5/0):
   drift the free count host-side (both copies, CRC re-stamped), boot, `drives check` rebuilds the
   correct value, 0 bad, the file survives. `selfcheck.gsh` also runs `assert ok drives check` on
   a populated tree (in the script test). No regression (files 130/0).
-- **Phase H — block I/O error handling. ✅ Built + verified 2026-06-17.** A failed block
+- **Phase H - block I/O error handling. ✅ Built + verified 2026-06-17.** A failed block
   read/write just failed the op. Now `block-driver` issues every read/write/zero through
   `issue_io`, a **bounded retry** (`MAX_IO_ATTEMPTS = 3`) with **port recovery between attempts**
   (`recover_port` clears PxSERR/PxIS and restarts the command engine if it halted): a transient
   error (marginal sector, controller hiccup) is recovered transparently and logged; a persistent
   one is **reported loudly** (§3.12) and returns an error. `fs` also logs the failing LBA on a
-  block error. Bounded (§26.6) — never an infinite retry. No format change. Verified by
+  block error. Bounded (§26.6) - never an infinite retry. No format change. Verified by
   `osdev test fs-ioretry` (5/0): a `io-error-test` build forces the first read/write commands to
   fail (QEMU never fails a real disk), and the driver retries + recovers (the boot self-test read
   still succeeds; fs mounts + round-trips), no panic. The persistent-failure branch (report +
   Err after N attempts) is the same loop's exhaustion path. No regression (files 130/0, reboot).
-- **Phase I — Extent lists (GSFS0007). ✅ Built + verified 2026-06-17.** Files were a single
-  contiguous run, so a big file needed a big *contiguous* free span — fragmentation could refuse a
+- **Phase I - Extent lists (GSFS0007). ✅ Built + verified 2026-06-17.** Files were a single
+  contiguous run, so a big file needed a big *contiguous* free span - fragmentation could refuse a
   write the disk had room for. Now a file is contiguous (`ITYPE_FILE`, the fast path, byte-for-byte
   unchanged) **or**, when no contiguous run is free, **fragmented** (`ITYPE_FILE_FRAG`): its
   `first_block` points to a single CRC'd **extent block** (`block_count` = 1) that lists up to
@@ -666,70 +666,70 @@ byte in its data block, boot: `fs` logs a "data block CRC mismatch" and the read
   file that *cannot* fit contiguously → it lands fragmented, reads back exactly, and survives a
   reboot. No regression (files 130/0, fs-large 1/1, fs-journal 11/0, fs-check 5/0, fs-ioretry 5/0,
   fs-corrupt 14/0, fs-restart 7/0, drives 9/0, script 2/2, blockdev-reboot).
-- **Phase J — Opt-in data journaling. ✅ Built + verified 2026-06-17.** The metadata journal made
+- **Phase J - Opt-in data journaling. ✅ Built + verified 2026-06-17.** The metadata journal made
   every *structural* mutation atomic, but streaming `write_at` wrote data **direct** with no
-  transaction — a crash mid-chunk left torn data (caught by the data CRC on read, but not
+  transaction - a crash mid-chunk left torn data (caught by the data CRC on read, but not
   recovered). Phase J adds a **journaled `write_at` variant** (`OP_WRITE_AT_J`) that stages the
-  chunk's data blocks in a transaction so the chunk commits **atomically** — a crash replays or
+  chunk's data blocks in a transaction so the chunk commits **atomically** - a crash replays or
   discards it whole, never torn. **Opt-in per write**: the caller picks the contract; default
   `WRITE_AT` stays direct (the fast path). **Bounded** to one chunk (≤ 7 blocks) by the 64-block
-  journal — whole-file atomicity across chunks is out of scope and stays honest (§20/§26.6).
-  (`WriteFile` and overwrite were *already* crash-atomic — copy-on-write to a fresh extent, data
-  flushed before the metadata commit — so only the streaming path had a torn-data window.) Full
+  journal - whole-file atomicity across chunks is out of scope and stays honest (§20/§26.6).
+  (`WriteFile` and overwrite were *already* crash-atomic - copy-on-write to a fresh extent, data
+  flushed before the metadata commit - so only the streaming path had a torn-data window.) Full
   §6.13. No on-disk format change, no amendment. Verified by `osdev test fs-djournal` (7/0): a
   journaled `write_at` halts right after its commit record (data only in the journal, home blocks
-  still zero), and the next boot replays the data home — a correct read proves the journal supplied
+  still zero), and the next boot replays the data home - a correct read proves the journal supplied
   it. No regression (fs-large 1/1, fs-frag 11/0, fs-journal 11/0, files 130/0, script 2/2).
 
-- **Phase K — Scrub (read-only integrity sweep). ✅ Built + verified 2026-06-17.** Every block
+- **Phase K - Scrub (read-only integrity sweep). ✅ Built + verified 2026-06-17.** Every block
   already self-verifies *on read*, but rarely-read blocks could rot undetected until you needed
   them. `drives scrub` (`OP_SCRUB`) walks the tree and verifies **every** referenced block's CRC,
-  reporting `(files, dirs, bad, scanned)` and **changing nothing** — distinct from `check`, which
+  reporting `(files, dirs, bad, scanned)` and **changing nothing** - distinct from `check`, which
   *repairs* the bitmap (writes). Read-only ⇒ safe to run at any cadence on a healthy filesystem.
   Without redundancy (no RAID, by design) scrub **detects** bit-rot but cannot repair it: a bad
   block is reported and any read of it stays a loud refusal (§3.12), the data is already lost. The
-  cadence is **operator-driven** — GodspeedOS has no background-task primitive, so "periodic" is
+  cadence is **operator-driven** - GodspeedOS has no background-task primitive, so "periodic" is
   policy (run `drives scrub` on a schedule), not a hidden timer (§26.4: no silent complexity). Full
   §6.14. No format change, no amendment. Verified by `osdev test fs-scrub` (6/0): a corrupt data
-  block is reported (`1 bad`), a second scrub still reports it (read-only — no repair), and the
+  block is reported (`1 bad`), a second scrub still reports it (read-only - no repair), and the
   clean file is untouched; `selfcheck.gsh` also runs `assert ok drives scrub` on a clean tree.
 
 **Deferred (heavier; pulled in only when a real need arises, §26.2 / §26.11):**
 
-- **Snapshots / copy-on-write / mirroring (RAID)** — real features, but each strains the
+- **Snapshots / copy-on-write / mirroring (RAID)** - real features, but each strains the
   30-minute-whiteboard rule (§26.11); revisit only with a concrete need. (RAID would also let scrub
-  *repair*, not just detect — but it needs a second disk and is out of scope.)
+  *repair*, not just detect - but it needs a second disk and is out of scope.)
 
-### 6.12 Extent lists — files across scattered free space (GSFS0007)
+### 6.12 Extent lists - files across scattered free space (GSFS0007)
 
 > **Adopted 2026-06-17 (Phase I).** Lifts the contiguous-extent fragmentation limit (§6.11
 > roadmap) while leaving the common case untouched.
 
 Through GSFS0006 a file was always a single contiguous run: `first_block ..
 first_block + block_count`. Simple and fast, but it meant a file needed a *contiguous* free
-span as large as itself — on a fragmented disk a write could be refused for lack of one big run
+span as large as itself - on a fragmented disk a write could be refused for lack of one big run
 even when the total free space was ample. GSFS0007 removes that limit with a minimal, opt-in
 second representation, chosen so the existing fast path is **byte-for-byte unchanged**:
 
-- **Contiguous file — `ITYPE_FILE` (= 1), the fast path.** Exactly as before: the record's
+- **Contiguous file - `ITYPE_FILE` (= 1), the fast path.** Exactly as before: the record's
   `first_block`/`block_count` are the data extent; the *n*-th data block is `first_block + n`.
   Every existing test exercises this path, and the allocator still tries it first.
-- **Fragmented file — `ITYPE_FILE_FRAG` (= 3).** Engaged **only when no contiguous run is free**
+- **Fragmented file - `ITYPE_FILE_FRAG` (= 3).** Engaged **only when no contiguous run is free**
   (`alloc_run` returns "no space"). The record's `first_block` points to a single **extent
   block** and `block_count` is 1. The extent block is a normal 512-byte block:
   `n_extents:u32 @0`, then up to `EXT_MAX = 31` `(start:u64, len:u64)` runs from `@8`, and a
-  **CRC32 @508** over `[0..508)` — verified on every read, loud refusal on mismatch (§3.12),
+  **CRC32 @508** over `[0..508)` - verified on every read, loud refusal on mismatch (§3.12),
   exactly like a data or directory block. The *n*-th data block is found by walking the runs.
 
 **Allocation (`alloc_file`).** Try one contiguous run (fast path). On failure, `alloc_extents`
 grabs free runs greedily (`find_free_run` scans the bitmap; `take = len.min(need)`) until the
-request is satisfied — bounded to `EXT_MAX` runs, beyond which the write is refused loudly
-(§26.6) — then one more block holds the CRC'd extent block. A file fragmented into more than 31
+request is satisfied - bounded to `EXT_MAX` runs, beyond which the write is refused loudly
+(§26.6) - then one more block holds the CRC'd extent block. A file fragmented into more than 31
 pieces is rejected, not silently mishandled. **Freeing (`free_file`)** mirrors it: a contiguous
 file frees its one run; a fragmented file frees each listed run, then the extent block.
 
 **Where it plugs in.** The extent block is *metadata*, so it is staged in the crash-consistency
-transaction (`ext_write` via `tb_write`) and commits atomically with the record and bitmap — a
+transaction (`ext_write` via `tb_write`) and commits atomically with the record and bitmap - a
 pre-commit crash leaves the data blocks unreferenced and the bitmap unchanged, identical to the
 contiguous case (§6.8). `read_path`/`read_at`/`write_at` resolve the extent list **once** per
 op when fragmented (a contiguous file maps by arithmetic, zero overhead), and `delete` /
@@ -737,56 +737,56 @@ recursive `delete_tree` / `drives check` (fsck) all walk the runs so blocks are 
 and accounted for whichever representation a file uses. The host writer (`osdev`) only ever bakes
 into a fresh disk, so it always produces contiguous files; the fragmented path is `fs`-only.
 
-**Bounds & honesty (§26.6).** One extent block ⇒ ≤ 31 runs per file — a hard, loud ceiling, not
+**Bounds & honesty (§26.6).** One extent block ⇒ ≤ 31 runs per file - a hard, loud ceiling, not
 an unbounded indirection tree. This is deliberately *not* a btree/multi-level extent map: it
 fixes the fragmentation limit that can actually bite while staying inside the 30-minute
 whiteboard rule (§26.11). A file too fragmented for 31 runs fails loudly; `drives check` can
 report it. Verified by `osdev test fs-frag` (11/0) + full regression green.
 
-### 6.13 Opt-in data journaling — atomic streaming chunks (Phase J)
+### 6.13 Opt-in data journaling - atomic streaming chunks (Phase J)
 
-> **Adopted 2026-06-17 (Phase J).** Closes the one torn-data window left by the §6.8 model — the
-> streaming `write_at` path — without pretending to whole-file atomicity the 64-block journal
+> **Adopted 2026-06-17 (Phase J).** Closes the one torn-data window left by the §6.8 model - the
+> streaming `write_at` path - without pretending to whole-file atomicity the 64-block journal
 > cannot give.
 
 The crash-consistency journal (§6.8) makes every **metadata** mutation atomic, and the common file
-operations are already crash-safe for *data* too — almost by accident of the design:
+operations are already crash-safe for *data* too - almost by accident of the design:
 
 - **`WriteFile`** allocates a fresh extent, writes its data (flushed), *then* commits the metadata.
   A crash before the commit discards the metadata and leaks the data; after it, the data was already
   durably home. The file either fully appears with correct bytes or not at all.
 - **Overwrite** is copy-on-write: a new extent is filled, the record is re-pointed, the old extent
-  freed — so the same "data-before-commit" ordering holds, and the old file survives a crash intact.
+  freed - so the same "data-before-commit" ordering holds, and the old file survives a crash intact.
 
 The exception is the **streaming large-file path**: `write_new` commits the metadata (file sized,
 extent allocated) up front, then a sequence of `write_at` chunks fills the data **direct**, outside
-any transaction. A crash mid-chunk leaves some blocks new and some stale — *torn data*, caught by the
-per-block CRC on read (a loud refusal, never silent — §3.12) but **not recovered**.
+any transaction. A crash mid-chunk leaves some blocks new and some stale - *torn data*, caught by the
+per-block CRC on read (a loud refusal, never silent - §3.12) but **not recovered**.
 
 Phase J makes that recoverable, **opt-in per write**:
 
-- **`OP_WRITE_AT_J`** — a journaled `write_at`. It stages the chunk's data blocks in a transaction
+- **`OP_WRITE_AT_J`** - a journaled `write_at`. It stages the chunk's data blocks in a transaction
   (`data_stage`: stamp the CRC, `tb_write` into the staged set) and commits through the journal, so
   the chunk's data rides the same atomic mechanism as metadata: `commit_txn` writes it to the
   journal, lands the checksummed commit record (the atomic point), checkpoints it home, and
   invalidates. A crash before the commit record discards the chunk; after it, the next mount's
-  `recover` replays it home. The chunk is applied **whole or not at all** — never torn.
-- **Default `WRITE_AT` stays direct** — the fast streaming path is unchanged. The caller chooses the
+  `recover` replays it home. The chunk is applied **whole or not at all** - never torn.
+- **Default `WRITE_AT` stays direct** - the fast streaming path is unchanged. The caller chooses the
   guarantee: pay the double-write (journal + home) for atomicity, or take the fast path and rely on
   the read-time CRC. The durability contract is explicit, not hidden (§26.5/§26.7).
 
 **Bounded & honest (§26.6/§20).** The journal is 64 blocks (`TXN_CAP` = 56 staged), and a chunk is at
-most `7 × 508` payload bytes (7 data blocks), so a journaled chunk always fits — but **whole-file**
+most `7 × 508` payload bytes (7 data blocks), so a journaled chunk always fits - but **whole-file**
 data journaling does **not**, and Phase J does not pretend otherwise. The guarantee is *per-chunk*
 atomicity; a multi-chunk file written with `OP_WRITE_AT_J` is a sequence of individually-atomic
 chunks, not one atomic file. That is the honest ceiling of a fixed 64-block journal, stated plainly
 rather than papered over. Verified by `osdev test fs-djournal` (7/0): a journaled `write_at` halts
-right after its commit record — the data is only in the journal, the home blocks are still zero — and
+right after its commit record - the data is only in the journal, the home blocks are still zero - and
 the next boot replays it; because a zero block fails the data CRC, reading the file back correctly can
 *only* mean the journal supplied the data. No on-disk format change; no constitutional amendment
 (within §15/§26.6, no TCB or §7 change).
 
-### 6.14 Scrub — a read-only integrity sweep (Phase K)
+### 6.14 Scrub - a read-only integrity sweep (Phase K)
 
 > **Adopted 2026-06-17 (Phase K).** Turns the per-block CRC from a *read-time* guard into a
 > *proactive* one, honestly bounded by what GodspeedOS actually has.
@@ -796,18 +796,18 @@ garbage. But a block you never read can rot undetected until the day you need it
 that window: read everything periodically and verify it, so bit-rot surfaces early.
 
 `drives scrub` (`OP_SCRUB`) walks the directory tree from root and verifies **every** referenced
-block's CRC — directory blocks (`td_read`), extent blocks and the data runs they list (`ext_of` +
-`data_read`), and contiguous file data (`data_read`) — reporting `(files, dirs, bad, scanned)`. It
+block's CRC - directory blocks (`td_read`), extent blocks and the data runs they list (`ext_of` +
+`data_read`), and contiguous file data (`data_read`) - reporting `(files, dirs, bad, scanned)`. It
 **writes nothing**: `scrub`/`scrub_subtree` are `&self`, no transaction. This is the deliberate
-difference from `check` (fsck, §6.11 Phase G), which *repairs* — rebuilds the bitmap and free count
+difference from `check` (fsck, §6.11 Phase G), which *repairs* - rebuilds the bitmap and free count
 (and so must write). Scrub only **detects and reports**, which makes it safe to run routinely on a
 healthy mounted filesystem without churning the disk.
 
 Two honesty points the constitution forces (§26.4/§26.7):
 
-- **Detect, not repair.** GodspeedOS has no redundancy (no RAID — §6.11, deliberately out of scope),
+- **Detect, not repair.** GodspeedOS has no redundancy (no RAID - §6.11, deliberately out of scope),
   so there is no second copy to heal a rotted block from. Scrub reports `N bad`; the data is already
-  lost and the read stays a loud refusal. (RAID is exactly what would let scrub *repair* — and
+  lost and the read stays a loud refusal. (RAID is exactly what would let scrub *repair* - and
   exactly what the whiteboard rule keeps out for now.)
 - **Operator-driven cadence, not a hidden background task.** "Periodic scrubbing" in other systems
   rides a background scheduler GodspeedOS does not have, and inventing a silent kernel/daemon timer
@@ -816,20 +816,20 @@ Two honesty points the constitution forces (§26.4/§26.7):
   trigger is explicit and visible, which is the point.
 
 Verified by `osdev test fs-scrub` (6/0): a disk with one clean file and one whose data block was
-flipped host-side — scrub reports `1 bad`, a second scrub still reports `1 bad` (proving it is
+flipped host-side - scrub reports `1 bad`, a second scrub still reports `1 bad` (proving it is
 read-only and repaired nothing), and the clean file is untouched. `selfcheck.gsh` runs
 `assert ok drives scrub` over a populated clean tree (the 0-bad path). No on-disk format change; no
 constitutional amendment (within §15/§26.6, no TCB or §7 change).
 
-### 6.15 Versioning & compatibility — feature flags, and the last magic (GSFS0008)
+### 6.15 Versioning & compatibility - feature flags, and the last magic (GSFS0008)
 
 > **Adopted 2026-06-18 (Phase L).** The final monolithic format bump. After this, the format
-> evolves by **feature bits**, not by minting a new magic — so a version difference no longer
+> evolves by **feature bits**, not by minting a new magic - so a version difference no longer
 > forces a reformat.
 
 **The problem.** Through GSFS0007 the 8-byte magic did two jobs at once: "is this our filesystem?"
 *and* "which exact version?" Because all 8 bytes changed on every bump, **any** version difference
-failed the magic check, which made every bump **reformat-only** — upgrade the OS and your old disk
+failed the magic check, which made every bump **reformat-only** - upgrade the OS and your old disk
 won't mount. Fine for a learning OS with no production data, but it doesn't scale: there is no
 "GSFS00014" worth minting.
 
@@ -840,13 +840,13 @@ won't mount. Fine for a learning OS with no production data, but it doesn't scal
   incompat, all under the widened CRC `@136`) answer "what does this disk *use*?" Each bit is a
   feature, set on disk **only when actually used**. Future capabilities are new bits, not new magic.
 
-**The mount policy** — explicit and loud (invariant 12), the opposite of a silent fallback:
+**The mount policy** - explicit and loud (invariant 12), the opposite of a silent fallback:
 
 | Mask | A bit this build doesn't recognise means… |
 |------|-------------------------------------------|
-| `compat` | mount **read-write normally** — ignoring the feature is safe |
-| `ro_compat` | mount **READ-ONLY** — reading is safe, but writing could corrupt the feature (every mutating op is refused loudly; reads pass) |
-| `incompat` | **REFUSE to mount, loudly** — the on-disk structure is fundamentally different |
+| `compat` | mount **read-write normally** - ignoring the feature is safe |
+| `ro_compat` | mount **READ-ONLY** - reading is safe, but writing could corrupt the feature (every mutating op is refused loudly; reads pass) |
+| `incompat` | **REFUSE to mount, loudly** - the on-disk structure is fundamentally different |
 
 This is *more* honest than the old scheme, not less: an old build meeting a newer disk gets a
 precise reason (refuse / read-only / fine) instead of a version mismatch indistinguishable from a
@@ -854,19 +854,19 @@ foreign disk.
 
 **Features earn forward-compatibility by being lazy.** The bit is set only when the feature is
 exercised. Extent lists (Phase I) are an `incompat` feature, but the `FEAT_INCOMPAT_EXTENTS` bit is
-set **the first time a file actually fragments** — a freshly-formatted disk that never fragments
+set **the first time a file actually fragments** - a freshly-formatted disk that never fragments
 anything has the bit *clear*, so a build that predates extents could still mount it. You only lose
 compatibility once you actually use the new capability. (Backup-superblock, Phase F, is a `compat`
-bit — an old reader ignoring it is harmless.)
+bit - an old reader ignoring it is harmless.)
 
 **The honest caveat.** This is forward-looking *from 0008*. It cannot retroactively rescue pre-0008
 disks (0003–0007 predate the masks, and 0004/0005 genuinely changed per-block layout), so those need
-one last reflash. But 0008 is the last time the format ever *forces* that — every future GSFS
+one last reflash. But 0008 is the last time the format ever *forces* that - every future GSFS
 feature is additive, governed by the masks. "GSFS00014" never happens; it would just be "GSFS0008
 with more feature bits set."
 
 Verified by `osdev test fs-compat` (12/0): three disks, each carrying an unknown bit in a different
-mask (CRC re-stamped so they still validate) — the unknown `incompat` disk is refused, the unknown
+mask (CRC re-stamped so they still validate) - the unknown `incompat` disk is refused, the unknown
 `ro_compat` disk mounts read-only (reads work, writes refused), the unknown `compat` disk mounts
 normally read-write. No regression across the whole suite.
 
@@ -877,15 +877,15 @@ and reached **by capability**, consistent with §3.3 and §7.
 
 ### 7.1 The mechanism problem
 
-The kernel has **no concept of a file** (§4.4 anti-scope — no filesystem logic in the
+The kernel has **no concept of a file** (§4.4 anti-scope - no filesystem logic in the
 kernel), yet **only the kernel can mint unforgeable capabilities** (§7.3). "A file is a
 capability" must bridge those two facts. Three options were weighed:
 
 | Option | What it is | Verdict |
 |--------|-----------|---------|
-| Bearer token | `fs` returns a 128-bit unguessable handle, presented per call | A *service-level token*, not a kernel cap — forgeable by guessing, sits beside the capability model. Rejected as the north star (weak claim). |
-| Endpoint-per-open-file | `fs` creates a kernel endpoint per open file; client holds a real SEND cap | Genuinely unforgeable, but every endpoint costs ~64 KiB (our own efficiency measurement) — heavy with many open files. Rejected for cost. |
-| **Kernel-delegated resource caps** | Extend the kernel's `ResourceId+Rights+Generation` model so a service can ask the kernel to mint a cap for a *service-defined* resource it owns | **Chosen.** Real kernel caps (unforgeable, revocable, generationed) with **no file logic in the kernel** — it tracks an opaque resource owned by `fs`. Generalizes the capability model; useful beyond files. |
+| Bearer token | `fs` returns a 128-bit unguessable handle, presented per call | A *service-level token*, not a kernel cap - forgeable by guessing, sits beside the capability model. Rejected as the north star (weak claim). |
+| Endpoint-per-open-file | `fs` creates a kernel endpoint per open file; client holds a real SEND cap | Genuinely unforgeable, but every endpoint costs ~64 KiB (our own efficiency measurement) - heavy with many open files. Rejected for cost. |
+| **Kernel-delegated resource caps** | Extend the kernel's `ResourceId+Rights+Generation` model so a service can ask the kernel to mint a cap for a *service-defined* resource it owns | **Chosen.** Real kernel caps (unforgeable, revocable, generationed) with **no file logic in the kernel** - it tracks an opaque resource owned by `fs`. Generalizes the capability model; useful beyond files. |
 
 ### 7.2 How kernel-delegated resource caps work
 
@@ -893,12 +893,12 @@ The kernel already keys capabilities on `ResourceId` with a `Generation` (§7.2,
 extension: a service (`fs`) **owns** a band of resource IDs and asks the kernel to mint
 caps for them with chosen `Rights`. The kernel:
 
-- mints/validates/revokes exactly as for any resource — generation bump invalidates every
+- mints/validates/revokes exactly as for any resource - generation bump invalidates every
   outstanding file cap at once (§7.5), giving `fs` clean revocation (delete a file → bump
   → all its caps go stale, surfacing as the usual `CapRevoked`/`EndpointDead`-class error);
 - never learns what the resource *means*. `fs` maps `ResourceId → file`. A read/write cap
   to a file is then a first-class capability the holder can validate, be denied, or have
-  revoked — identical machinery to endpoint caps.
+  revoked - identical machinery to endpoint caps.
 
 This keeps every capability property (§7.3: unforgeable, non-escalating, scoped,
 revocable, generationed) true for files, while honoring §4.4 (kernel stays file-agnostic).
@@ -909,19 +909,19 @@ revocable, generationed) true for files, while honoring §4.4 (kernel stays file
 
 ### 7.3 Phasing
 
-- **Phase 1 — authority = the cap to `fs`.** Holding `ipc_send=["fs"]` is the authority;
+- **Phase 1 - authority = the cap to `fs`.** Holding `ipc_send=["fs"]` is the authority;
   files are addressed by name in the request. This ships *working, reboot-surviving
   persistence* without the new kernel mechanism.
-- **Phase 2 — per-file capabilities** via §7.2. ✅ **Built + verified end-to-end + HARDWARE-PROVEN on the
+- **Phase 2 - per-file capabilities** via §7.2. ✅ **Built + verified end-to-end + HARDWARE-PROVEN on the
   T630 2026-06-18** (`osdev test file-cap` 9/9; on-hardware shell `selfcheck` = `ran 163, failed 0`, which
-  includes the `fcap` self-check — `CLAUDE.md` §23.3). `fs` `Open(path, rights)` mints a delegated resource
+  includes the `fcap` self-check - `CLAUDE.md` §23.3). `fs` `Open(path, rights)` mints a delegated resource
   and returns a real **file capability**; the holder operates the file by **invoking** that cap
   (`ResourceInvoke`), the kernel badges the request with `(resource_id, right)` via an unforgeable
   `Message` field, and `fs` resolves it through its open-file table, enforcing `op ≤ right`. Unforgeable,
   non-escalating (kernel *and* fs layers), revocable on close/delete/rename. File-as-capability is now
   *true*, not approximate. See §7.4 (kernel mechanism) and §22 Test 14.
 
-### 7.4 Phase 2 — concrete kernel mechanism (design, amendment-approved 2026-06-18)
+### 7.4 Phase 2 - concrete kernel mechanism (design, amendment-approved 2026-06-18)
 
 > The `CLAUDE.md` §4.4/§7.10 amendment is **landed and signed off**. This section is the
 > implementation spec, grounded in the actual kernel (`capability/table.rs`, `ipc/routing.rs`,
@@ -932,7 +932,7 @@ revocable, generationed) true for files, while honoring §4.4 (kernel stays file
 `register_resource(_at_gen)`, `revoke_resource` (gen bump + Revoked liveness), the per-task
 `CapTable`, and lazy generation invalidation. The global table is pre-sized (`DIRECT_CAP = 8192`,
 "P2 adds ~1000 entries"). Embedded-cap transfer (`SendWithCap`/`TakePendingCap`) already moves a cap
-to a client — that's how `fs` will hand over a file cap. An endpoint cap's `resource_id.0` is reused
+to a client - that's how `fs` will hand over a file cap. An endpoint cap's `resource_id.0` is reused
 directly as its `EndpointId`.
 
 **The delegated band.** Reserve `ResourceId`s `[DELEGATED_BASE, DELEGATED_BASE+DELEGATED_CAP)`
@@ -941,22 +941,22 @@ owns: a `[Option<EndpointId>; DELEGATED_CAP]` owner array + an allocation cursor
 `allocate(owner) -> ResourceId` finds a free slot, records the owner, registers the id in the global
 table, and returns it. `is_delegated(id)`, `owner_of(id)`, `revoke_owned(id, caller)`.
 
-> **Correctness decision 1 — ABA-safe id reuse.** A freed delegated id may be reallocated. If it
+> **Correctness decision 1 - ABA-safe id reuse.** A freed delegated id may be reallocated. If it
 > re-registered at generation 0, a *stale* file cap (also gen 0 from the id's previous life) would
-> spuriously re-validate — a cap-reuse hole. So `allocate` re-registers a reused id at
+> spuriously re-validate - a cap-reuse hole. So `allocate` re-registers a reused id at
 > `get_resource_generation(id).bump()` (via `register_resource_at_gen`), keeping the generation
 > **monotonic across lives**. A stale cap can never match a future life of the same id. (First use of
 > a never-allocated id starts at gen 0.)
 
-**Three syscalls** (each validates a capability first — §3.1, no exceptions):
+**Three syscalls** (each validates a capability first - §3.1, no exceptions):
 
-- **`ResourceMint(rights_bits, out_id_ptr) -> cap_slot`** — gated by a new **`RESOURCE_MINT`**
+- **`ResourceMint(rights_bits, out_id_ptr) -> cap_slot`** - gated by a new **`RESOURCE_MINT`**
   stable resource (`ResourceId(7)`, gen 0 forever, granted only to `fs` + a test probe; validated by
   `holds_resource`, like `SPAWN`). Allocates a delegated id owned by the caller's endpoint, mints a
   cap with `rights_bits` into the caller's table, writes the id to `*out_id_ptr`, returns the slot.
   `fs` calls this on `Open`, recording `ResourceId → file`, then GRANT-transfers a narrowed copy to
   the client in the reply (existing embedded-cap path).
-- **`ResourceInvoke(cap_slot, right_bits, msg_ptr, msg_len, reply_cap…) -> i64`** — the "use = send"
+- **`ResourceInvoke(cap_slot, right_bits, msg_ptr, msg_len, reply_cap…) -> i64`** - the "use = send"
   of §7.10, but as its **own** syscall rather than overloading `send`. It validates the cap carries
   `right_bits` (`CapTable::get(slot, right)`), then routes the message to the owning endpoint with
   the badge **`[resource_id:u64, right:u8]` prepended to the payload**, reusing `routing::enqueue`
@@ -964,15 +964,15 @@ table, and returns it. `is_delegated(id)`, `owner_of(id)`, `revoke_owned(id, cal
   already validated against the global table). A reply cap is embedded exactly as `SendWithCap` does
   today, so `fs` replies on the normal path.
 
-> **Correctness decision 2 — rights are enforced by the kernel, per operation, without the kernel
+> **Correctness decision 2 - rights are enforced by the kernel, per operation, without the kernel
 > knowing what a file is.** A read needs `READ`, a write needs `WRITE`. The kernel can't read the
 > file op, so the *caller declares the right it intends* (`right_bits`) and the kernel validates the
-> cap actually holds it — a READ-only cap doing `ResourceInvoke(.., WRITE, ..)` fails
+> cap actually holds it - a READ-only cap doing `ResourceInvoke(.., WRITE, ..)` fails
 > `CapInsufficientRights` at the kernel (this is the non-escalation enforcement, §7.3). The kernel
 > then badges the message with the **validated** right, and `fs` refuses any op whose required right
 > exceeds the badged right. So `fs` never has to trust the client, and the kernel never learns the op.
 
-- **`ResourceRevoke(resource_id) -> i64`** — **owner-gated** (ownership *is* the capability check:
+- **`ResourceRevoke(resource_id) -> i64`** - **owner-gated** (ownership *is* the capability check:
   `revoke_owned` only proceeds if the calling task's endpoint owns the id). Bumps the generation
   (Revoked) so every outstanding file cap to it goes stale → next `ResourceInvoke` returns
   `CapRevoked` (§7.5). Frees the owner slot. `fs` calls this on delete/close.
@@ -984,7 +984,7 @@ meaning exactly the file operations, and keeps `handle_send` untouched (lower TC
 
 **Phase 2a deliverable:** the three syscalls + `delegated.rs` + the `RESOURCE_MINT` grant, exercised
 by two probe services (mint → grant a cap → invoke with READ ok / WRITE denied on a read-only cap →
-revoke → invoke returns `CapRevoked`) — **no `fs` needed**, so the mechanism is proven in isolation
+revoke → invoke returns `CapRevoked`) - **no `fs` needed**, so the mechanism is proven in isolation
 before 2b wires `fs` onto it. Then 2b (`fs` issues file caps), 2c (SDK `File` + shell demo), 2d (§22
 Test 14).
 
@@ -997,7 +997,7 @@ Test 14).
 | `WriteFile` | name, data (chunked) | `Ok` / `NoSpace` / `IoError` |
 | `ReadFile` | name | data (chunked) / `NotFound` / `IoError` |
 | `StatFile` | name | `{exists, size}` |
-| `ListFiles` | — | names (chunked) |
+| `ListFiles` | - | names (chunked) |
 | `DeleteFile` | name | `Ok` / `NotFound` |
 
 **fs ↔ block-driver:**
@@ -1007,7 +1007,7 @@ Test 14).
 | `ReadBlocks` | lba, count (message-bounded) | sector data / `IoError` |
 | `WriteBlocks` | lba, data (message-bounded) | `Ok` / `IoError` |
 
-All replies are exactly one of `{Ok-with-data, defined error}` — never silent
+All replies are exactly one of `{Ok-with-data, defined error}` - never silent
 (§3.12, mirrors the IPC `send` discipline of §8.6).
 
 ## 9. Crash, restart, and the TCB trajectory (§6.3)
@@ -1016,14 +1016,14 @@ All replies are exactly one of `{Ok-with-data, defined error}` — never silent
   mid-write can corrupt the file being written (and the entry table if it strikes during a
   metadata update). On mount, a bad superblock magic/checksum is a **loud refusal**, never
   a silent reformat. `block-driver` and `fs` remain TCB members (§6.1); their death is a
-  panic+reboot (§6.2) — the v1 posture, carried because nothing transactional exists yet.
+  panic+reboot (§6.2) - the v1 posture, carried because nothing transactional exists yet.
 - **Phase 3 (transactional, out of the TCB).** The §6.3 goal: give `fs` atomic-commit
   semantics so a restart can recover to a consistent state, then **drop `fs` and
   `block-driver` from the TCB** (a recorded `CLAUDE.md` §6 amendment with sign-off). A
-  **log-structured** layout is the natural route — appends with an atomic commit record
+  **log-structured** layout is the natural route - appends with an atomic commit record
   make crash-consistency fall out for free, and pair well with the no-overwrite discipline.
   Because the ATA PIO driver has no DMA reach (§5.1), `block-driver` can leave the TCB on
-  its own merits without depending on IOMMU presence — a cleaner exit than the DMA drivers
+  its own merits without depending on IOMMU presence - a cleaner exit than the DMA drivers
   had.
 
 ## 10. Phased build plan
@@ -1031,12 +1031,12 @@ All replies are exactly one of `{Ok-with-data, defined error}` — never silent
 1. **Block driver read path. ✅ done** (`osdev test blockdev`). Added the `hw_pio`
    grant (kernel-mediated `PortRead`/`PortWrite` syscalls validated per access,
    grant store in `capability/hw_pio.rs`), SDK `pio.rs` (`Pio`), and `block-driver`
-   ATA-PIO reads sector 0 of a QEMU secondary-channel `if=ide` disk and logs it —
+   ATA-PIO reads sector 0 of a QEMU secondary-channel `if=ide` disk and logs it -
    verified by reading back a host-written magic. Port I/O is kernel-mediated because
    ring-3 drivers cannot run `in`/`out` (granting IOPL would be ambient authority).
 2. **Block driver write + round-trip. ✅ done** (`osdev test blockdev`, case P1.2). The
    driver writes a known pattern to a scratch LBA (WRITE SECTORS + FLUSH CACHE), reads it
-   back, and asserts equal — proving the device read/write path end to end. All in the
+   back, and asserts equal - proving the device read/write path end to end. All in the
    driver via the existing `Pio` wrapper; no new kernel surface.
 3. **Filesystem mount + format. ✅ done** (`osdev test blockdev`, case P1.3). Host-side
    `osdev mkfs <image>` writes the superblock (magic `GSFS0001`, version, block_size,
@@ -1056,14 +1056,14 @@ All replies are exactly one of `{Ok-with-data, defined error}` — never silent
    client API (`WriteFile`/`ReadFile`/`StatFile`, ops 10–12) over IPC via the reply-cap
    pattern.
 5. **Reboot survival (the headline). ✅ done** (`osdev test blockdev-reboot`, case P1.5).
-   Format once; boot 1 — `fs` creates `greeting`; **reboot on the same disk image without
-   reformatting** — boot 2 mounts (superblock persisted: `next_free=3, 1 files`) and reads
+   Format once; boot 1 - `fs` creates `greeting`; **reboot on the same disk image without
+   reformatting** - boot 2 mounts (superblock persisted: `next_free=3, 1 files`) and reads
    the file back byte-for-byte (`fs: persisted file 'greeting' verified across boot`). The
    disk is a host file, so this is the real durability guarantee. **Phase 1 complete.**
 6. **Phase 2: file-as-capability.** Kernel-delegated resource caps (after the §7 amendment
    is signed off); `fs` returns/validates per-file caps.
 
-## 11. Test plan — QEMU is sufficient (and authoritative here)
+## 11. Test plan - QEMU is sufficient (and authoritative here)
 
 Unlike the H1 IO_PAGE_FAULT (which QEMU's lenient `amd-iommu` could not show), persistence
 is a case where **QEMU gives a real, trustworthy answer** and the whole feature can be
@@ -1072,12 +1072,12 @@ built and verified headless, away from the T630:
 - **The disk is a host file** (`-drive file=disk.img,if=ide`). It survives across QEMU
   runs by definition, so reboot-survival is the real thing: boot → write → quit → boot →
   read. No flashing.
-- **ATA PIO is faithfully emulated** — real BSY/DRQ handshake, real status/error bits, real
+- **ATA PIO is faithfully emulated** - real BSY/DRQ handshake, real status/error bits, real
   sector semantics. What passes in QEMU behaves the same on an ATA controller.
-- **Format + filesystem logic are hardware-independent** — bytes in blocks.
+- **Format + filesystem logic are hardware-independent** - bytes in blocks.
 
 The single thing QEMU cannot answer is whether the **T630's storage controller speaks ATA
-PIO in legacy mode** — a separate, later hardware bring-up question, not a filesystem
+PIO in legacy mode** - a separate, later hardware bring-up question, not a filesystem
 question. Test layout follows the §22 pattern: an identity-style **reboot-survival** test
 (write, reboot, read, assert) is the executable form of "persistence persists," plus
 property tests (round-trip any bytes), fuzz (malformed superblock → loud refuse, never
@@ -1091,4 +1091,4 @@ panic), and chaos (crash mid-write → mount refuses or recovers, never silently
 - Whether Phase 3 is log-structured or journaled-update (decide when transactional
   recovery is actually built; both reach the §6.3 goal).
 - Bare-metal storage controller for the T630 (ATA legacy mode vs. an eventual AHCI driver)
-  — deferred; does not block any QEMU phase.
+  - deferred; does not block any QEMU phase.

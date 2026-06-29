@@ -87,12 +87,12 @@ def main() -> int:
 
         if rel not in audit:
             failures.append(
-                f"  FAIL  {rel}: {actual} unsafe line(s) not in audit — "
+                f"  FAIL  {rel}: {actual} unsafe line(s) not in audit - "
                 f"add a // SAFETY: comment and an entry to docs/unsafe-audit.md"
             )
         elif actual > audit[rel]:
             failures.append(
-                f"  FAIL  {rel}: unsafe count grew {audit[rel]} → {actual} — "
+                f"  FAIL  {rel}: unsafe count grew {audit[rel]} → {actual} - "
                 f"add // SAFETY: comment(s) and update docs/unsafe-audit.md"
             )
         elif actual < audit[rel]:
@@ -102,13 +102,13 @@ def main() -> int:
             )
 
     if infos:
-        print("Unsafe audit — reductions detected (update audit to capture them):")
+        print("Unsafe audit - reductions detected (update audit to capture them):")
         for msg in infos:
             print(msg)
         print()
 
     if failures:
-        print("Unsafe audit — FAILURES:")
+        print("Unsafe audit - FAILURES:")
         for msg in failures:
             print(msg)
         print()
@@ -120,7 +120,7 @@ def main() -> int:
 
     total = sum(audit.values())
     print(
-        f"Unsafe audit passed — {len(audit)} audited files, "
+        f"Unsafe audit passed - {len(audit)} audited files, "
         f"{total} total unsafe lines, no unaccounted additions."
     )
     return 0

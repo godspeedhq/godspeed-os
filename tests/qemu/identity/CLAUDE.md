@@ -1,6 +1,6 @@
 # tests/qemu/identity/
 
-The identity test suite (§22). **22/22 tests passing — no regressions allowed.**
+The identity test suite (§22). **22/22 tests passing - no regressions allowed.**
 
 If any test in this directory fails, the system is no longer the system the spec describes.
 
@@ -42,7 +42,7 @@ Tests are expressed as one of three harness kinds, defined in `osdev/src/validat
 | `WithRestart`  | Wait for `wait_for` string, send `restart_cmd` via COM2, then look for `expect_after` | 4B, 6A/B, 10A/B |
 | `WithBadTcb`   | Boot with a corrupted TCB binary, look for `KERNEL PANIC` | 1B |
 
-`WithRestart` tests use `"supervisor: ready"` as the `wait_for` guard on all tests that restart pong/ping. This ensures the restart fires only after the supervisor's spawn loop is complete — no risk of restart-mid-spawn on the timer ISR.
+`WithRestart` tests use `"supervisor: ready"` as the `wait_for` guard on all tests that restart pong/ping. This ensures the restart fires only after the supervisor's spawn loop is complete - no risk of restart-mid-spawn on the timer ISR.
 
 ## Timeout rationale
 
@@ -64,7 +64,7 @@ The supervisor spawns pong and ping **first** (before all probe services). In th
 
 ## Pass record
 
-### Pre-IR1A/IR1B baseline (Windows TCG, 2026-05-18) — 20 tests
+### Pre-IR1A/IR1B baseline (Windows TCG, 2026-05-18) - 20 tests
 
 Recorded after the `identity-only` supervisor feature and per-test isolation sleep were introduced.
 
@@ -75,7 +75,7 @@ Recorded after the `identity-only` supervisor feature and per-test isolation sle
 
 Zero failures across 200 consecutive tests (20 tests × 10 runs). Confirmed reduced timeouts (6A/6B/10A/10B: 240–300s → 60s) with comfortable margin.
 
-### Post-IR1A/IR1B (Windows TCG, 2026-05-18) — 22 tests
+### Post-IR1A/IR1B (Windows TCG, 2026-05-18) - 22 tests
 
 IR1A and IR1B added as part of post-v1 item 9 (interrupt routing tests). Verification run to be recorded here after the next full identity suite run.
 

@@ -1,8 +1,8 @@
-# Milestone 1 — Boot Visibility ✅
+# Milestone 1 - Boot Visibility ✅
 
 > Kernel boots in QEMU and writes to the serial console. No services yet.
 
-**Status: COMPLETE** — commit `dc0aed9`, 2026-05-08
+**Status: COMPLETE** - commit `dc0aed9`, 2026-05-08
 
 ## Bootloader
 
@@ -19,7 +19,7 @@
 ## Minimal Arch Init
 
 - ✅ GDT: null segment, kernel code (ring 0), kernel data (ring 0)
-- ✅ IDT: minimal entries — catch-all halt handler in all 256 slots
+- ✅ IDT: minimal entries - catch-all halt handler in all 256 slots
 - ✅ `arch::x86_64::init(boot_info)` completes without panic
 
 ## QEMU Integration
@@ -42,7 +42,7 @@ kernel: all cores ready
 
 Two non-obvious bugs required to reach this milestone:
 
-1. **Linker script — explicit PHDRS required.** Without them, lld emitted `.got`
+1. **Linker script - explicit PHDRS required.** Without them, lld emitted `.got`
    and `.requests` as separate `PT_LOAD` segments sharing the same 4 KB page.
    Limine's ELF loader silently stopped mapping segments after the conflict,
    leaving `.rodata` and `.bss` unmapped.

@@ -1,6 +1,6 @@
 # examples/pong/
 
-Demonstration service — receives messages from `ping` (§23.1).
+Demonstration service - receives messages from `ping` (§23.1).
 
 ## Milestone role (§23.2)
 
@@ -11,7 +11,7 @@ Demonstration service — receives messages from `ping` (§23.1).
 
 ## Spawn order
 
-Pong is the **first** service spawned by the supervisor — before ping and before all 178 probe services. This ensures pong's endpoint is registered and ready before ping starts sending, and before probe services compete for scheduler quanta. Cross-core IPC between ping and pong is established within ~10 s of boot.
+Pong is the **first** service spawned by the supervisor - before ping and before all 178 probe services. This ensures pong's endpoint is registered and ready before ping starts sending, and before probe services compete for scheduler quanta. Cross-core IPC between ping and pong is established within ~10 s of boot.
 
 ## Why pong has no placement
 
@@ -22,12 +22,12 @@ The placement-free design exercises the round-robin path and demonstrates that i
 On startup pong calls `ctx.register("pong")`, granting the registry a `SEND|GRANT`
 cap to its endpoint. This is what lets ping `reacquire_via_registry("pong")` after a
 restart. Because `register` re-runs on every spawn, the restarted pong overwrites the
-registry's entry with its fresh endpoint/core — so ping's next lookup resolves to the
+registry's entry with its fresh endpoint/core - so ping's next lookup resolves to the
 new instance. Requires a `registry` send-peer (kernel-wired at spawn).
 
 ## Restartability
 
-Pong is stateless — it logs each received message. No state to reconstruct on restart.
+Pong is stateless - it logs each received message. No state to reconstruct on restart.
 
 ## Log strings observed by identity tests
 

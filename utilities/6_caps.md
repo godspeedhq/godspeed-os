@@ -1,6 +1,6 @@
 # Utility: `caps`
 
-**Utility:** `caps` — capability viewer
+**Utility:** `caps` - capability viewer
 **Status:** Built. As-built reference.
 **Shape:** shell built-in (see `0_conventions.md` §2).
 
@@ -8,7 +8,7 @@
 
 ## 1. Purpose
 
-`caps` answers **what authority does a service hold?** — it lists the capabilities
+`caps` answers **what authority does a service hold?** - it lists the capabilities
 in a task's table. Authority in GodspeedOS is explicit and inspectable (§26.9); this
 is the command that surfaces it.
 
@@ -19,7 +19,7 @@ is the command that surfaces it.
 | `caps` | List **this shell's** own held capabilities (default). |
 | `caps <service>` | List the named service's held capabilities. |
 
-No argument shows the shell itself — a service can inspect its own authority like
+No argument shows the shell itself - a service can inspect its own authority like
 any other (authority is explicit, not hidden).
 
 ## 3. Output
@@ -60,7 +60,7 @@ same `task_caps` reply into `resource`/`rights` rows.
 
 ## 5. Capabilities
 
-- **`INTROSPECT`** (READ) — reading another task's cap table is gated; the shell
+- **`INTROSPECT`** (READ) - reading another task's cap table is gated; the shell
   holds the cap.
 - **Console output** to print the list.
 

@@ -1,6 +1,6 @@
-# Milestone 13 — Adversarial / Red-Team Tests ✅
+# Milestone 13 - Adversarial / Red-Team Tests ✅
 
-**Status:** [x] 10/10 implemented — all pass
+**Status:** [x] 10/10 implemented - all pass
 **Spec ref:** §22 Adversarial / Red-Team Test
 **Command:** `osdev test adv`
 
@@ -20,11 +20,11 @@ any attack that panics the kernel is a kernel bug. Both are mandatory fixes.
 
 | ID  | Attack                                                                                | Expected outcome                             |
 |-----|---------------------------------------------------------------------------------------|----------------------------------------------|
-| A1  | Service crafts random u64 values and tries to use them as caps                        | `CapNotHeld` or other `Err` — never `Ok`     |
+| A1  | Service crafts random u64 values and tries to use them as caps                        | `CapNotHeld` or other `Err` - never `Ok`     |
 | A2  | Service brute-forces cap slot range 0..=127 and extreme values                        | Defined errors for every slot; no panic      |
 | A3  | Service allocates beyond its 4 MiB contract limit via every path                      | `AllocDenied` when over limit; no panic      |
 | A4  | Service uses its RECV-right cap handle as a SEND target                               | `CapInsufficientRights`; send rejected       |
-| A5  | TOCTOU: kill victim, then send via now-stale cap                                      | `EndpointDead` — not `Ok`; no panic         |
+| A5  | TOCTOU: kill victim, then send via now-stale cap                                      | `EndpointDead` - not `Ok`; no panic         |
 | A6  | Service fills its own cap table via `acquire_send_cap` loop                           | `None` when table full; no panic            |
 | A7  | Service measures IPC timing to detect partner identity via timing side-channel         | No panic; all sends return defined outcomes  |
 | A8  | Service tight-loops without yielding on a core                                        | Preemption fires; witness service logs pass  |
@@ -35,56 +35,56 @@ any attack that panics the kernel is a kernel bug. Both are mandatory fixes.
 
 ## Design
 
-### A1 — Cap Unforgeability Under Adversarial Input
+### A1 - Cap Unforgeability Under Adversarial Input
 
 10,000 random u32 values used as cap slot indices. `adv-a1` holds no SEND caps (no
 `send_peers`). Every `try_send_by_handle` must return `Err`. Any `Ok` proves a cap was
-forged — a constitutional violation (§7.3, §3.1).
+forged - a constitutional violation (§7.3, §3.1).
 
-### A2 — Endpoint ID Brute Force
+### A2 - Endpoint ID Brute Force
 
 Iterate cap slots 0..=127 (covering the 64-slot cap table and well beyond), plus
 `u32::MAX`. All must return defined errors. Cap slots 0 (log_write, WRITE right) and
 1 (spawn, WRITE right) are not SEND caps → `CapInsufficientRights`. Out-of-range slots
 return `CapNotHeld`. No panic on any value.
 
-### A3 — Memory Limit Enforcement Under Adversarial Alloc
+### A3 - Memory Limit Enforcement Under Adversarial Alloc
 
 `adv-a3` has a 4 MiB `memory_limit`. The first 2 MiB allocation succeeds. The next
 3 MiB allocation would push total to 5 MiB > limit → `AllocDenied`. Edge cases
-(0, `usize::MAX`, 1 TiB) must not panic — `claim_alloc` must reject them cleanly.
+(0, `usize::MAX`, 1 TiB) must not panic - `claim_alloc` must reject them cleanly.
 
-### A4 — Insufficient Rights Enforcement
+### A4 - Insufficient Rights Enforcement
 
 `adv-a4` has a recv endpoint. Its recv cap sits in slot 2 with `Rights::RECV`.
 Using that slot handle as the endpoint argument to `try_send_by_handle` must return
 `CapInsufficientRights` (§7.4). No SEND right = no send authority, regardless of which
 slot is used.
 
-### A5 — TOCTOU Race: Kill Then Send
+### A5 - TOCTOU Race: Kill Then Send
 
 `adv-a5` holds a SEND cap to `adv-a5-victim`. It kills the victim (bumping the endpoint
 generation to `gen+1`), then immediately issues `try_send` via the now-stale cap. The
 kernel's generation check (§8.7, §7.5) must catch this and return `EndpointDead`. The
 cap's recorded generation `gen` ≠ routing-table's current generation `gen+1` → reject.
 
-### A6 — Cap Table Exhaustion
+### A6 - Cap Table Exhaustion
 
 `adv-a6` calls `acquire_send_cap("adv-a6")` in a loop, inserting SEND caps to itself.
 Starting from 3 pre-filled slots (log_write=0, spawn=1, recv=2), 61 dynamic caps can
 be inserted before the 64-slot cap table is full. The 62nd `acquire_send_cap` must
-return `None` — the kernel returns an error from the cap-insert path, which the SDK
+return `None` - the kernel returns an error from the cap-insert path, which the SDK
 translates to `None`. No panic on cap table exhaustion. The count of slots filled is
 logged.
 
-### A7 — Timing Side-Channel Probe
+### A7 - Timing Side-Channel Probe
 
 100 `try_send` calls to `adv-a7-recv` (passive, never draining). Queue fills after
 16 sends; subsequent calls return `QueueFull`. TSC brackets the entire loop; mean
 cycles/try_send is logged. No panic; all return values are defined. Verifies the kernel
 does not expose undocumented behavior under sustained timing analysis.
 
-### A8 — Preemption of Monopolizing Service
+### A8 - Preemption of Monopolizing Service
 
 `adv-a8` runs a tight `loop { core::hint::spin_loop(); }` without yielding.
 `adv-a8-witness` is round-robin placed (potentially on the same core as `adv-a8`) and
@@ -92,15 +92,15 @@ yields 1,000 times then logs `adv: A8 pass`. Timer-driven preemption (§9.1, §3
 must give the witness enough CPU quanta to complete all yields and log. If preemption
 fails, the witness never logs and the test times out.
 
-### A9 — Direct Spawn Bypassing Supervisor
+### A9 - Direct Spawn Bypassing Supervisor
 
 `adv-a9` calls `ctx.spawn("nonexistent-does-not-exist")`. The kernel's `service_config`
 lookup returns `None` → `SpawnError::NotFound` → `Err`. No panic. Note: all v1 services
 hold a `spawn` cap (SPAWN_RESOURCE), so the attempt is authorised; the rejected name is
 the defined-error path. The kernel enforces capability rights but not service-name policy
-— that is a v2 concern.
+- that is a v2 concern.
 
-### A10 — Kernel Address Rejection
+### A10 - Kernel Address Rejection
 
 Raw syscalls for Send (nr=2) and Recv (nr=3) with `a1` (the buffer pointer argument)
 set to kernel-space addresses (`0xffff_8000_0000_0000`, `0xffff_ffff_ffff_fff0`) and
@@ -142,18 +142,18 @@ appear within their timeout without a `KERNEL PANIC`.
 
 ## Implementation checklist
 
-- ✅ `services/probe/src/main.rs` — modes 80–90 (11 modes across 10 attacks)
-- ✅ `kernel/src/task/mod.rs` — 13 adversarial service configs; `TASK_KSTACK_MAX` raised to 100
-- ✅ `services/supervisor/src/main.rs` — adversarial probe spawns
-- ✅ `osdev/src/validator.rs` — `ADV_TESTS`, `run_adv_tests()`, `run_adv_one()`, `adv_serial_path()`
-- ✅ `osdev/src/main.rs` — `"adv"` branch in `cmd_test`
+- ✅ `services/probe/src/main.rs` - modes 80–90 (11 modes across 10 attacks)
+- ✅ `kernel/src/task/mod.rs` - 13 adversarial service configs; `TASK_KSTACK_MAX` raised to 100
+- ✅ `services/supervisor/src/main.rs` - adversarial probe spawns
+- ✅ `osdev/src/validator.rs` - `ADV_TESTS`, `run_adv_tests()`, `run_adv_one()`, `adv_serial_path()`
+- ✅ `osdev/src/main.rs` - `"adv"` branch in `cmd_test`
 - ✅ `build/tests/6_ADVERSARIAL/.gitkeep`
 
 ---
 
 ## Brutal Adversarial Phase (adv-brutal)
 
-**Status:** [x] 10/10 implemented — all pass
+**Status:** [x] 10/10 implemented - all pass
 **Command:** `osdev test adv-brutal`
 
 The brutal phase repeats each adversarial attack at 5–50× intensity, combined with the
@@ -195,10 +195,10 @@ BA1–BA10 correspond to A1–A10 but with higher iteration counts and longer ru
 
 ### Implementation checklist
 
-- ✅ `services/probe/src/main.rs` — modes 144–154 (11 modes across 10 attacks)
-- ✅ `kernel/src/task/mod.rs` — 14 brutal adversarial service configs
-- ✅ `services/supervisor/src/main.rs` — brutal adversarial probe spawns
-- ✅ `osdev/src/validator.rs` — `ADV_BRUTAL_TESTS`, timeouts 900 s for BA4/BA5/BA8/BA9
+- ✅ `services/probe/src/main.rs` - modes 144–154 (11 modes across 10 attacks)
+- ✅ `kernel/src/task/mod.rs` - 14 brutal adversarial service configs
+- ✅ `services/supervisor/src/main.rs` - brutal adversarial probe spawns
+- ✅ `osdev/src/validator.rs` - `ADV_BRUTAL_TESTS`, timeouts 900 s for BA4/BA5/BA8/BA9
 - ✅ `build/tests/13_ADVERSARIAL_BRUTAL/.gitkeep`
-- ✅ `kernel/src/memory/allocator.rs` — `KERNEL_PT_PROTECTED` bitmap prevents kernel PT
+- ✅ `kernel/src/memory/allocator.rs` - `KERNEL_PT_PROTECTED` bitmap prevents kernel PT
   frame theft under sustained stress; `protect_kernel_page_table_frames()` called at boot

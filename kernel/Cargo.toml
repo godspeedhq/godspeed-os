@@ -6,7 +6,7 @@ edition = "2021"
 [[bin]]
 name = "kernel"
 path = "src/main.rs"
-# Do not attempt to compile the no_std binary for cargo test — only the lib
+# Do not attempt to compile the no_std binary for cargo test - only the lib
 # target (pure-logic modules, host-compiled) is unit-testable.
 test = false
 
@@ -34,7 +34,7 @@ panic = "abort"
 [features]
 # Build the kernel with a deliberately invalid SUPERVISOR ELF to trigger the TCB
 # failure path in init (§6.2, §22 Test 1B). Only used by `osdev test identity`.
-# (Was test-bad-registry until the registry service was retired — Path C / Phase 4.)
+# (Was test-bad-registry until the registry service was retired - Path C / Phase 4.)
 test-bad-supervisor = []
 
 # Build the kernel in ELF-loader fuzz mode (§22 Fuzz F3).  Calls loader::run_elf_fuzz()
@@ -48,7 +48,7 @@ test-bad-elf = []
 test-bad-elf-brutal = []
 
 # Confine the first DMA-capable driver (xhci) to an EMPTY IOMMU domain instead of
-# its arena, so its normal init DMA faults — a deterministic live proof that the
+# its arena, so its normal init DMA faults - a deterministic live proof that the
 # IOMMU blocks + logs out-of-arena DMA (§22 Test 12, H1 §6.4). Only used by
 # `osdev test iommu` (boots with -device amd-iommu); off in every normal build.
 iommu-fault-test = []

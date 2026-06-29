@@ -747,7 +747,7 @@ fn handle_spawn_pipe(packed_arg0: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 /// arg0 = name_ptr, arg1 = name_len.
 ///
 /// Kills the named running task: marks Dead, kills endpoint, wakes blocked tasks.
-/// Requires the `SERVICE_CONTROL` capability — validated by holdings below (§3.1 / §14.4;
+/// Requires the `SERVICE_CONTROL` capability - validated by holdings below (§3.1 / §14.4;
 /// `docs/service-control-cap.md`).
 fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
     // §3.1 / §14.4: killing a service is a privileged action - it requires the
@@ -1550,7 +1550,7 @@ fn handle_console_push(cap_slot: u64, byte: u64) -> i64 {
 
 /// No arguments. Does not return (on success).
 ///
-/// A hardware reset is a denial-of-service, so it is gated by the `REBOOT` capability (§3.1) — held
+/// A hardware reset is a denial-of-service, so it is gated by the `REBOOT` capability (§3.1) - held
 /// only by the legitimate rebooters: the `shell` (its `reboot` command) and the USB drivers
 /// `xhci`/`ehci` (the Ctrl+Alt+Del secure-attention reboot). Any other caller gets `CapNotHeld`,
 /// closing the ambient-authority gap this syscall used to have. Validated by holdings (no arguments →

@@ -1,4 +1,4 @@
-# GodspeedOS v1 — Test Suite Summary
+# GodspeedOS v1 - Test Suite Summary
 
 **Total: 130 tests across 7 categories, all passing.**  
 All normal and brutal variants complete. v1 milestone closed at commit `b8a079b`.
@@ -21,7 +21,7 @@ All normal and brutal variants complete. v1 milestone closed at commit `b8a079b`
 
 ---
 
-## Category 1 — Identity Tests
+## Category 1 - Identity Tests
 
 **Spec:** §22 Identity  
 **Purpose:** Pin constitutional decisions. If any identity test fails, the system is no longer the system CLAUDE.md describes. These are the executable form of the constitution.  
@@ -65,12 +65,12 @@ Three tests that probe the exact boundary of constitutional guarantees:
 | T12 | cap_delegation_chain_a_b_c | Two-hop cap-mediated message relay A→B→C | ✅ PASS |
 | T13 | cross_core_blocked_send_wakes_endpointdead | Cross-core kill via IPI wakes blocked sender with EndpointDead | ✅ PASS |
 | SMP-2 | degraded_smp_2_core | Boot with 2 cores; supervisor reaches ready | ✅ PASS |
-| SMP-8 | — | Machine ceiling — QEMU cannot schedule 97 services at smp=8 in 60s | timeout (expected) |
-| SMP-16 | — | Above machine ceiling | timeout (expected) |
+| SMP-8 | - | Machine ceiling - QEMU cannot schedule 97 services at smp=8 in 60s | timeout (expected) |
+| SMP-16 | - | Above machine ceiling | timeout (expected) |
 
 ---
 
-## Category 2 — Property Tests
+## Category 2 - Property Tests
 
 **Spec:** §22 Property Tests  
 **Purpose:** Prove universal invariants hold for every input, not just the happy path. Identity proves the system *can* satisfy each invariant; property tests prove it *always* does.  
@@ -113,7 +113,7 @@ Same properties at 2–10× iteration counts under full concurrent probe load (~
 
 ---
 
-## Category 3 — Fuzz Tests
+## Category 3 - Fuzz Tests
 
 **Spec:** §22 Fuzz Tests  
 **Purpose:** The kernel must never panic on user-controllable input. Any panic discovered is a mandatory kernel fix with a required regression test.  
@@ -128,11 +128,11 @@ One bug was found and fixed pre-run: `(size + 4095) & !4095` integer overflow fo
 |----|---------|--------|--------|
 | F1 | Syscall args (a0/a1/a2) for all non-abort syscall numbers | 100 iter × 10 syscalls | ✅ PASS |
 | F2 | Random u64 as syscall number → UnknownSyscall (-1) | 50,000 random numbers | ✅ PASS |
-| F3 | ELF loader — 13 specific bad inputs + 64 single-byte flips | 77 mutations | ✅ PASS |
-| F4 | Service contract validator — malformed TOML and JSON Schema violations | 3 valid + 14 invalid inputs | ✅ PASS |
-| F5 | IPC message bodies — random bytes, random sizes 0–4096 | 1,000 try_send calls | ✅ PASS |
-| F6 | Embedded cap slots in SendWithCap — random u32 pairs | 1,000 calls | ✅ PASS |
-| F7 | Stale cap after kill/respawn — generation check | 50 kill cycles | ✅ PASS |
+| F3 | ELF loader - 13 specific bad inputs + 64 single-byte flips | 77 mutations | ✅ PASS |
+| F4 | Service contract validator - malformed TOML and JSON Schema violations | 3 valid + 14 invalid inputs | ✅ PASS |
+| F5 | IPC message bodies - random bytes, random sizes 0–4096 | 1,000 try_send calls | ✅ PASS |
+| F6 | Embedded cap slots in SendWithCap - random u32 pairs | 1,000 calls | ✅ PASS |
+| F7 | Stale cap after kill/respawn - generation check | 50 kill cycles | ✅ PASS |
 | F8 | AllocMem edge-case sizes: 0, u64::MAX, overflow values, randoms | 10 edge + 1,000 random | ✅ PASS |
 
 ### Brutal (8/8)
@@ -152,7 +152,7 @@ One bug was found and fixed pre-run: `(size + 4095) & !4095` integer overflow fo
 
 ---
 
-## Category 4 — Stress Tests
+## Category 4 - Stress Tests
 
 **Spec:** §22 Stress Tests  
 **Purpose:** The kernel must not drift, leak resources, or corrupt shared state under sustained load. Failures here are mandatory kernel fixes.  
@@ -165,16 +165,16 @@ One kernel fix during brutal implementation: USER PF / KERNEL PF split in the pa
 
 | ID | Scenario | Iterations | Result |
 |----|----------|------------|--------|
-| S1 | IPC saturation — sustained try_send to a never-draining queue | 10,000 try_send | ✅ PASS |
-| S2 | Restart storm — kill/respawn cycles; kstack pool must not exhaust | 50 cycles | ✅ PASS |
-| S3 | Cross-core thrash — blocking sends core 0 → core 1 | 500 messages | ✅ PASS |
-| S4 | Cap table churn — 2 SEND caps to same victim; both must go dead per kill | 50 cycles | ✅ PASS |
-| S5 | Generation monotonicity — strict increment over many kill/respawn cycles | 1,000 cycles | ✅ PASS |
-| S6 | IPC self-ping stability — send to own endpoint, recv back | 5,000 rounds | ✅ PASS |
-| S7 | Memory pressure — alloc to near limit, verify AllocDenied boundary | 100 passes | ✅ PASS |
-| S8 | Idle scheduler heartbeat — yields complete under concurrent load | 600 yields | ✅ PASS |
-| S9 | Cross-core IPI storm — dual senders (cores 0+1) → single receiver (core 2) | 1,000 messages | ✅ PASS |
-| S10 | Cascading revocation — 3 SEND caps to one victim; all return EndpointDead | 3 cap slots | ✅ PASS |
+| S1 | IPC saturation - sustained try_send to a never-draining queue | 10,000 try_send | ✅ PASS |
+| S2 | Restart storm - kill/respawn cycles; kstack pool must not exhaust | 50 cycles | ✅ PASS |
+| S3 | Cross-core thrash - blocking sends core 0 → core 1 | 500 messages | ✅ PASS |
+| S4 | Cap table churn - 2 SEND caps to same victim; both must go dead per kill | 50 cycles | ✅ PASS |
+| S5 | Generation monotonicity - strict increment over many kill/respawn cycles | 1,000 cycles | ✅ PASS |
+| S6 | IPC self-ping stability - send to own endpoint, recv back | 5,000 rounds | ✅ PASS |
+| S7 | Memory pressure - alloc to near limit, verify AllocDenied boundary | 100 passes | ✅ PASS |
+| S8 | Idle scheduler heartbeat - yields complete under concurrent load | 600 yields | ✅ PASS |
+| S9 | Cross-core IPI storm - dual senders (cores 0+1) → single receiver (core 2) | 1,000 messages | ✅ PASS |
+| S10 | Cascading revocation - 3 SEND caps to one victim; all return EndpointDead | 3 cap slots | ✅ PASS |
 
 ### Brutal (10/10)
 
@@ -195,15 +195,15 @@ One kernel fix during brutal implementation: USER PF / KERNEL PF split in the pa
 
 ---
 
-## Category 5 — Performance Benchmarks
+## Category 5 - Performance Benchmarks
 
 **Spec:** §22 Performance Benchmarks  
-**Purpose:** Lock in baseline numbers so regressions are detected commit-to-commit. Absolute values are QEMU TCG cycle counts — not comparable across hosts; useful for detecting ≥10% regressions within one environment.  
+**Purpose:** Lock in baseline numbers so regressions are detected commit-to-commit. Absolute values are QEMU TCG cycle counts - not comparable across hosts; useful for detecting ≥10% regressions within one environment.  
 **Commands:** `osdev test perf` · `osdev test perf-brutal`  
 **Logs:** `build/tests/5_PERFORMANCE/` · `build/tests/12_PERFORMANCE_BRUTAL/`  
 **Baselines:** `tests/qemu/perf/baseline.json` · `build/tests/12_PERFORMANCE_BRUTAL/baseline.json`
 
-### Normal (10/10) — Baselines
+### Normal (10/10) - Baselines
 
 | ID | Metric | Baseline (QEMU TCG cycles) |
 |----|--------|---------------------------|
@@ -222,7 +222,7 @@ One kernel fix during brutal implementation: USER PF / KERNEL PF split in the pa
 
 All 10 benchmarks log `perf: BN done` without KERNEL PANIC. ✅ PASS.
 
-### Brutal (10/10) — Baselines under 220-task load
+### Brutal (10/10) - Baselines under 220-task load
 
 Same benchmarks at 5× iterations under the full concurrent probe suite. Notable load factors: yield round-trip 29.9× slower (scheduling latency under 220 tasks), message copy 4.98× slower, spawn 7.0× slower.
 
@@ -243,7 +243,7 @@ All 10 brutal benchmarks pass. ✅ PASS.
 
 ---
 
-## Category 6 — Adversarial / Red-Team Tests
+## Category 6 - Adversarial / Red-Team Tests
 
 **Spec:** §22 Adversarial / Red-Team Tests  
 **Purpose:** Verify capability isolation holds under direct attack. Every attack must return a defined error. An attack that succeeds is a security hole; an attack that panics the kernel is a kernel bug.  
@@ -286,7 +286,7 @@ One kernel fix during brutal implementation: `KERNEL_PT_PROTECTED` bitmap in the
 
 ---
 
-## Category 7 — Chaos Tests
+## Category 7 - Chaos Tests
 
 **Spec:** §22 Chaos Tests  
 **Purpose:** Verify graceful degradation when infrastructure the kernel depends on is partially unavailable or hostile. The bar: the system either continues correctly with degraded capacity, or panics loudly with a defined reason. Silent corruption is never acceptable (invariant 12).  
@@ -299,24 +299,24 @@ Each test runs in its own QEMU session with the standard 4-core image (except C1
 
 | ID | Failure injected | What is verified | Result |
 |----|-----------------|-----------------|--------|
-| C1 | QEMU `-smp 2` — 2 of 4 cores boot | Kernel reports 2 cores ready; services contracted to cores 2–3 fail with PlacementInvalid; cores 0–1 continue | ✅ PASS |
+| C1 | QEMU `-smp 2` - 2 of 4 cores boot | Kernel reports 2 cores ready; services contracted to cores 2–3 fail with PlacementInvalid; cores 0–1 continue | ✅ PASS |
 | C2 | `chaos-c2` null-dereferences on startup | Kernel kills the faulting service; `chaos-c2-monitor` completes 1,000 yields proving system continues | ✅ PASS |
 | C3 | 500 rounds of impossible AllocMem requests (usize::MAX, 4 GiB, 0) | Every request returns AllocDenied; no panic; zero-size requests safe | ✅ PASS |
-| C4 | QEMU `-m 192M` — minimal RAM | Kernel boots and allocates structures; supervisor reaches ready; no silent OOM | ✅ PASS |
+| C4 | QEMU `-m 192M` - minimal RAM | Kernel boots and allocates structures; supervisor reaches ready; no silent OOM | ✅ PASS |
 | C5 | 100-level recursive yield_cpu() | All 100 levels complete; no kernel stack overflow | ✅ PASS |
 | C6 | `chaos-c6-hog` tight-loops on core 3 | `chaos-c6-monitor` on core 0 completes 200 yields; cross-core isolation holds | ✅ PASS |
 | C7 | 30 cross-core kill/respawn cycles triggering TLB shootdowns | All 30 cycles complete; no stale TLB entry; no corruption | ✅ PASS |
 
 ### Brutal (7/7)
 
-Higher intensity variants, each running with the full brutal suite (~220 tasks) concurrently in the same QEMU session. The concurrent suite load is itself part of the brutal pressure. Notable calibration: each TLB shootdown cycle takes ~45s under full concurrent load, so BC7 uses 15 cycles (vs C7's 30) — the brutal intensity is the concurrent suite, not the cycle count.
+Higher intensity variants, each running with the full brutal suite (~220 tasks) concurrently in the same QEMU session. The concurrent suite load is itself part of the brutal pressure. Notable calibration: each TLB shootdown cycle takes ~45s under full concurrent load, so BC7 uses 15 cycles (vs C7's 30) - the brutal intensity is the concurrent suite, not the cycle count.
 
 | ID | Failure injected | Intensity vs normal | Result |
 |----|-----------------|-------------------|--------|
-| BC1 | QEMU `-smp 1` — single BSP, zero APs | More extreme than C1 (smp=2 → smp=1) | ✅ PASS |
+| BC1 | QEMU `-smp 1` - single BSP, zero APs | More extreme than C1 (smp=2 → smp=1) | ✅ PASS |
 | BC2 | 5 simultaneous null-deref faults; monitor proves survival | 5× C2 (1 fault → 5 concurrent) | ✅ PASS |
 | BC3 | 2,500 alloc-deny cycles (usize::MAX requests per cycle) | 5× C3 (500 → 2,500 cycles) | ✅ PASS |
-| BC4 | QEMU `-m 96M` — extreme low memory | More extreme than C4 (192M → 96M) | ✅ PASS |
+| BC4 | QEMU `-m 96M` - extreme low memory | More extreme than C4 (192M → 96M) | ✅ PASS |
 | BC5 | 500-level recursive yield_cpu() | 5× C5 (100 → 500 levels); timeout 600s | ✅ PASS |
 | BC6 | 2 hog cores (cores 2+3); monitor on core 0 runs 200 yields | 2× hog cores vs C6's 1 | ✅ PASS |
 | BC7 | 15 cross-core kill/respawn TLB-shootdown cycles | Under full concurrent suite; ~45s/cycle | ✅ PASS |
@@ -327,7 +327,7 @@ Higher intensity variants, each running with the full brutal suite (~220 tasks) 
 
 | Bug | Category found | Fix |
 |-----|---------------|-----|
-| Stale serial log — harness appended to existing log; old pass strings triggered instant false positives | Identity (Phase 2) | Truncate log file to zero bytes before each QEMU boot |
+| Stale serial log - harness appended to existing log; old pass strings triggered instant false positives | Identity (Phase 2) | Truncate log file to zero bytes before each QEMU boot |
 | `kill_by_name` killed only first matching task | Identity (Phase 2) | Loop until `find_task_by_name` returns None |
 | Task re-animation: `wake_by_slot` on a dying slot overwrote `Dead` state with `Ready` | Property (Phase 3) | Skip wake if target slot == dying slot; force Dead as final write |
 | Phantom frame poisoning: reclaim of corrupt PTE wrote out-of-bounds bits into allocator bitmap | Property (Phase 3) | `BitmapAllocator` tracks `max_valid_frame`; silently discards out-of-range frees |
@@ -354,7 +354,7 @@ All tests use the **probe service pattern**: a single ELF binary (`services/prob
 The **`WatchSerial` harness** (`osdev/src/validator.rs`): boots QEMU, truncates the log file, pipes serial to the log, scans for pass/fail strings, enforces per-test timeouts, kills QEMU on match. Each test runs in its own fresh QEMU boot session.
 
 Special harness variants:
-- `WithBadTcb` — builds kernel with `test-bad-registry` Cargo feature; runs separate image
-- `WithBadElf` / `WithBadElfBrutal` — builds kernel with `test-bad-elf[-brutal]` feature
-- `ContractFuzz` — host-side only; no QEMU; uses `catch_unwind`
-- `DegradedSmp` / `DegradedEnv` — custom QEMU `-smp N` or `-m NM` via `spawn_for_test_custom()`
+- `WithBadTcb` - builds kernel with `test-bad-registry` Cargo feature; runs separate image
+- `WithBadElf` / `WithBadElfBrutal` - builds kernel with `test-bad-elf[-brutal]` feature
+- `ContractFuzz` - host-side only; no QEMU; uses `catch_unwind`
+- `DegradedSmp` / `DegradedEnv` - custom QEMU `-smp N` or `-m NM` via `spawn_for_test_custom()`

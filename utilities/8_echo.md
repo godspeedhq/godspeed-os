@@ -1,6 +1,6 @@
 # Utility: `echo`
 
-**Utility:** `echo` — print text
+**Utility:** `echo` - print text
 **Status:** Built. As-built reference.
 **Shape:** shell built-in (see `0_conventions.md` §2).
 
@@ -9,7 +9,7 @@
 ## 1. Purpose
 
 `echo` prints the rest of its line back to the console, verbatim. The simplest
-utility — useful as a console-output sanity check and a building block once
+utility - useful as a console-output sanity check and a building block once
 scripting and pipes exist (Appendix D).
 
 ## 2. Invocation
@@ -18,8 +18,8 @@ scripting and pipes exist (Appendix D).
 |---|---|
 | `echo <text>` | Print `<text>` (the remainder of the line) and a newline. |
 
-The argument is the whole remainder of the line after `echo `, trimmed — not split
-into words — so spacing inside the text is preserved as typed.
+The argument is the whole remainder of the line after `echo `, trimmed - not split
+into words - so spacing inside the text is preserved as typed.
 
 ## 3. Output
 

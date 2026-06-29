@@ -1,8 +1,8 @@
-# Milestone 9 — v1 Complete (§23)
+# Milestone 9 - v1 Complete (§23)
 
 > All §23.2 acceptance criteria met. The system is done.
 
-Completed at commit `2e0dc13` — tagged `v1.0`.
+Completed at commit `2e0dc13` - tagged `v1.0`.
 
 ---
 
@@ -17,7 +17,7 @@ Evidence from walkthrough boot (`build/serial.log`, commit `0c7ac98`):
 - ✅ `osdev logs ping` shows ping sending a message every second
   - `cmd_logs` implemented (commit `0c7ac98`); ping messages visible as pong receipts
 - ✅ `osdev logs pong` shows pong receiving each message (cross-core IPC confirmed)
-  - serial lines 41+: `pong: received "1"` … `pong: received "152197"` — 150k+ messages, no gaps
+  - serial lines 41+: `pong: received "1"` … `pong: received "152197"` - 150k+ messages, no gaps
 - ✅ `osdev restart pong --core 2` kills pong on core 1, respawns on core 2
   - serial line 97836: `control: RESTART pong core=Some(2)`
   - serial line 97841: `control: pong restarted`

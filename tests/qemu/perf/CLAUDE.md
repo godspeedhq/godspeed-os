@@ -1,7 +1,7 @@
 # tests/qemu/perf/
 
-Performance benchmarks (§22.2, B1–B10). **Complete — 10/10 passing.**
-Brutal performance benchmarks (§22.2, BP1–BP10). **Complete — 10/10 passing.**
+Performance benchmarks (§22.2, B1–B10). **Complete - 10/10 passing.**
+Brutal performance benchmarks (§22.2, BP1–BP10). **Complete - 10/10 passing.**
 
 ## Status
 
@@ -38,11 +38,11 @@ Benchmarks for the IPC fast path and syscall paths. Per §20:
 
 ## Baseline
 
-Results are committed to `tests/qemu/perf/baseline.json`. CI compares each run against baseline and flags regressions ≥ 10%. The §7.8 single global `RwLock` on the capability table will surface most visibly in B7 — record the baseline now so the v2 sharding migration has a concrete regression target.
+Results are committed to `tests/qemu/perf/baseline.json`. CI compares each run against baseline and flags regressions ≥ 10%. The §7.8 single global `RwLock` on the capability table will surface most visibly in B7 - record the baseline now so the v2 sharding migration has a concrete regression target.
 
 ## Windows / TCG harness note
 
-On Windows, QEMU's `-serial file:path` backend holds an exclusive write lock on the serial log file while QEMU is running. `poll_serial` (in `osdev/src/validator.rs`) handles this by retrying read failures until the deadline, then applying the same 600 ms QEMU-flush grace period used for normal content timeouts. The final error reported is always `"timeout — lines not seen: ..."` regardless of whether the failure was a read error or a content miss — this avoids masking real content failures with a confusing "serial file unreadable" message.
+On Windows, QEMU's `-serial file:path` backend holds an exclusive write lock on the serial log file while QEMU is running. `poll_serial` (in `osdev/src/validator.rs`) handles this by retrying read failures until the deadline, then applying the same 600 ms QEMU-flush grace period used for normal content timeouts. The final error reported is always `"timeout - lines not seen: ..."` regardless of whether the failure was a read error or a content miss - this avoids masking real content failures with a confusing "serial file unreadable" message.
 
 B2 and B4 are the benchmarks most sensitive to this: they are spawned late in the supervisor sequence (~165 services ahead of them) and have lower iteration counts, so the serial log is produced close to the timeout boundary.
 

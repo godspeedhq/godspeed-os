@@ -9,8 +9,8 @@
 | Component | License | Why |
 |-----------|---------|-----|
 | **Kernel** (and the trusted root: `init`, `supervisor`, `registry`, arch, smp) | **GPL copyleft** (like Linux) | The OS itself stays free and open; improvements flow back. |
-| **SDK** (`sdk/rust`) | **Permissive** (MIT or Apache-2.0) — *to decide* | Services link it; permissive keeps the app ecosystem free to choose any license. |
-| **Userspace services / apps** | **Any license** (their authors' choice) | They are separate programs over IPC — not derivative works of the kernel. |
+| **SDK** (`sdk/rust`) | **Permissive** (MIT or Apache-2.0) - *to decide* | Services link it; permissive keeps the app ecosystem free to choose any license. |
+| **Userspace services / apps** | **Any license** (their authors' choice) | They are separate programs over IPC - not derivative works of the kernel. |
 | **Bundled bootloader** (Limine) | **BSD-2-Clause** (upstream; preserve its notice) | A separate program; GPL-compatible (§3). |
 
 The one-line summary: **copyleft OS, permissive ecosystem.** GodspeedOS-the-OS is
@@ -29,7 +29,7 @@ non-derivative line.**
   to userspace.
 - Linux needs a "userspace programs that use syscalls are not derivative works" clarifying
   note because its boundary is fuzzier (in-kernel modules, etc.). GodspeedOS's strict
-  isolation makes the boundary **structural**, not a promise — the IPC edge *is* the
+  isolation makes the boundary **structural**, not a promise - the IPC edge *is* the
   license edge.
 
 **The SDK is the one thing that needs care,** because services *link* it. A GPL SDK could
@@ -42,7 +42,7 @@ copyleft, but linking the SDK imposes nothing on the app. This is what keeps the
 - **Limine is BSD-2-Clause** (permissive). BSD-2-Clause is **GPL-compatible**: permissive
   code may be bundled with and distributed alongside a GPL project; the only obligation is
   preserving Limine's copyright notice.
-- Limine is a **separate program** (the bootloader binary), not linked into the kernel —
+- Limine is a **separate program** (the bootloader binary), not linked into the kernel -
   they communicate via the Limine Boot Protocol (a data handoff at boot, `arch/x86_64/
   boot.rs`). So the licenses do not entangle, exactly as a GPL Linux booted by GPL GRUB or
   by a BSD bootloader is fine.
@@ -54,7 +54,7 @@ copyleft, but linking the SDK imposes nothing on the app. This is what keeps the
 ## 4. Why copyleft for the OS
 
 - GodspeedOS's value is the **coherence of the model** (§26.1, *"the model is the
-  product"*). Copyleft keeps that model — and every improvement to it — open and shared,
+  product"*). Copyleft keeps that model - and every improvement to it - open and shared,
   which is the point of building a small, fully-understood system in the open.
 - Copyleft on the *kernel* + permissive *ecosystem* is a deliberate balance: the commons
   (the OS) stays a commons; the frontier (apps) stays free. It is the opposite of a
@@ -64,19 +64,19 @@ copyleft, but linking the SDK imposes nothing on the app. This is what keeps the
 
 1. **GPLv2 vs GPLv3.** "Like Linux" usually means **GPLv2-only**. **GPLv3** adds
    anti-tivoization (you can't lock users out of running modified firmware) and explicit
-   patent grants — which may actually fit an OS that self-updates and runs on devices
+   patent grants - which may actually fit an OS that self-updates and runs on devices
    (`docs/prime.md`). Decide deliberately.
 2. **SDK permissive license: MIT vs Apache-2.0.** Apache-2.0 adds an explicit patent grant
    and is GPLv3-compatible (but *not* GPLv2-compatible); MIT is simplest and broadly
    compatible. The SDK choice interacts with the GPLv2/v3 choice above.
 3. **Where the `LICENSE` files live:** repo-root `LICENSE` (kernel GPL) + `sdk/rust/LICENSE`
    (permissive) + a `NOTICE`/`THIRD-PARTY` for Limine's BSD notice and any other deps.
-4. **Contributor terms:** a `CONTRIBUTING`/DCO (sign-off) vs a CLA — how inbound
+4. **Contributor terms:** a `CONTRIBUTING`/DCO (sign-off) vs a CLA - how inbound
    contributions are licensed.
 
 ## 6. What this is not
 
 This document is **intent**, not the license. Until the `LICENSE` files exist with real
-text, nothing here grants or restricts rights. It exists so the *strategy* — copyleft OS,
-permissive ecosystem, IPC as the boundary — is on record and the eventual legal text
+text, nothing here grants or restricts rights. It exists so the *strategy* - copyleft OS,
+permissive ecosystem, IPC as the boundary - is on record and the eventual legal text
 matches the architecture rather than fighting it.

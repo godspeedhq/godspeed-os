@@ -1,17 +1,17 @@
 # examples/ping/
 
-Demonstration service — sends one message to `pong` per second (§23.1).
+Demonstration service - sends one message to `pong` per second (§23.1).
 
 ## Milestone role (§23.2)
 
 - Pinned to Core 0.
 - `osdev logs ping` shows a send every second.
 - After `osdev restart pong`, ping sees `EndpointDead`, looks up via the **registry service** (H11: `reacquire_via_registry("pong")`), and continues.
-- The resumed send crosses to whatever core pong landed on — transparently.
+- The resumed send crosses to whatever core pong landed on - transparently.
 
 ## Spawn order
 
-Ping is spawned by the supervisor **before** any probe services — second only to pong (pong must precede ping because ping's SEND cap to pong is wired at spawn time). This means ping starts sending within seconds of boot, well before the 178 probe services compete for scheduler quanta on Core 0.
+Ping is spawned by the supervisor **before** any probe services - second only to pong (pong must precede ping because ping's SEND cap to pong is wired at spawn time). This means ping starts sending within seconds of boot, well before the 178 probe services compete for scheduler quanta on Core 0.
 
 ## Cap-rebinding pattern
 

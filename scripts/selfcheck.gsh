@@ -1,15 +1,15 @@
 # GodspeedOS extensive self-check suite.
-# Run it with:  gsh> selfcheck      (runs this embedded suite IN MEMORY — no disk write,
+# Run it with:  gsh> selfcheck      (runs this embedded suite IN MEMORY - no disk write,
 # so it is not capped by the on-disk file size; it just needs a flashed GSFS drive for
 # the file-command tests). Passes iff the summary says "failed 0".
 #
 # Covers every shell utility's main functions + negative cases, EXCEPT:
 #   - observe : it is a live full-screen view (only `observe now` is a snapshot; tested).
-#   - drives  : flashing/relabel/reset touch disks and prompt y/N — not scriptable.
+#   - drives  : flashing/relabel/reset touch disks and prompt y/N - not scriptable.
 # Re-runnable: everything is created under /sc and deleted at the end.
 #
 # Rules this suite obeys (so it self-grades correctly):
-#   - `assert ok|fails|fails-with <cmd>` is the RESULT form — only for NON-piped commands
+#   - `assert ok|fails|fails-with <cmd>` is the RESULT form - only for NON-piped commands
 #     (a line with '|' is a pipeline; the trailing `assert` is its sink instead).
 #   - `<producer> | … | assert contains|lacks|empty <text>` is the CONTENT form.
 #   - match/count/first/last are byte filters; where/select/sort/to/from work on records.
@@ -39,7 +39,7 @@ assert ok find version
 assert ok read version
 assert ok clear help
 
-# ===== system info — now PIPE PRODUCERS (text emitters captured via Out), bare + piped =====
+# ===== system info - now PIPE PRODUCERS (text emitters captured via Out), bare + piped =====
 assert ok about
 assert ok cores
 assert ok mem
@@ -50,7 +50,7 @@ cores | assert contains cores
 mem | assert contains used
 date | assert contains :
 help | assert contains status
-# uptime — a record producer (wall-clock RTC delta): bare grid + json + column projection.
+# uptime - a record producer (wall-clock RTC delta): bare grid + json + column projection.
 assert ok uptime
 uptime | assert contains seconds
 uptime | to json | assert contains seconds
@@ -77,8 +77,8 @@ caps shell | select resource | assert contains introspect
 assert fails caps nosuchservice
 assert fails-with FileNotFound caps nosuchservice
 
-# ===== lifecycle guardrails (negative only — safe, deterministic) =====
-# The shell COMMAND guards spawn/kill of the supervisor (the recovery authority) — a command-layer
+# ===== lifecycle guardrails (negative only - safe, deterministic) =====
+# The shell COMMAND guards spawn/kill of the supervisor (the recovery authority) - a command-layer
 # hygiene check, not "can't recover" (the supervisor is kernel-restartable, Phase 6). `kill shell` is
 # NOT tested here: the shell is restartable now, so it succeeds (self-restart) and would kill this run.
 assert fails spawn supervisor
@@ -198,7 +198,7 @@ greet | sort | last 1 | assert contains ambient
 echo lower CASE | upper | assert contains LOWER CASE
 echo alpha beta gamma | match beta | assert contains beta
 
-# ===== record service over the binary wire codec (roster) — lean operator sample =====
+# ===== record service over the binary wire codec (roster) - lean operator sample =====
 assert ok roster
 roster | where role=core | assert contains Matthew
 roster | where role!=core | assert lacks Matthew
@@ -210,7 +210,7 @@ roster | to json | assert contains role
 roster | to json | from json | where role=core | assert contains Matthew
 roster | select name seat | to json | assert contains Luke
 
-# ===== json <-> records bridge (exhaustive where/select/sort — no service spawn) =====
+# ===== json <-> records bridge (exhaustive where/select/sort - no service spawn) =====
 write /sc/data.json [{"name":"x","n":1},{"name":"y","n":2},{"name":"z","n":3}]
 read /sc/data.json | from json | assert contains y
 read /sc/data.json | from json | where n>1 | assert contains z
@@ -233,7 +233,7 @@ assert ok drives check
 assert ok drives scrub
 
 # ===== file-as-capability (§7.10, P2): open a file as a REAL kernel cap and exercise every
-# property — read/write THROUGH the cap, non-escalation (a read-only cap can't write, at both
+# property - read/write THROUGH the cap, non-escalation (a read-only cap can't write, at both
 # the kernel and fs layers), unforgeable handle, revoke-on-close. `fcap` is Ok only if all hold.
 # It is self-contained: it creates and deletes its own throwaway file, so it takes no argument. =====
 assert ok fcap

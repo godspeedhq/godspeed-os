@@ -1,8 +1,8 @@
-# Bug 1 — Findings: AP→BSP wake IPI is sent-but-not-serviced (misrouting refuted)
+# Bug 1 - Findings: AP→BSP wake IPI is sent-but-not-serviced (misrouting refuted)
 
 **Date:** 2026-05-30 · **Hardware:** AMD GX-420GI (HP T630) · **Branch:** `debug/bug-a-bsp-timer` @ `f07d7aa`
 **Parent bug:** `1_CROSS_CORE_IPC_REPLY_TO_BSP_STALLS.md` (on `main` @ `d74db3d`)
-**Purpose:** relay package for external analysis — captures the decisive `lapidmap` + `ipidiag` result.
+**Purpose:** relay package for external analysis - captures the decisive `lapidmap` + `ipidiag` result.
 
 ---
 
@@ -11,19 +11,19 @@
 A blocking `recv` on **core 0 (BSP)** never receives a reply enqueued by an AP; **BSP→AP works,
 AP→BSP fails**, deterministically (0/1000 in `bp2-only`; occasionally rescued under heavy churn).
 A prior probe (`irrwatch`) proved the BSP's **own LVT timer** fires and latches into IRR exactly
-like the APs — so it is not a dead-APIC issue. The leading hypothesis was that the `WAKE_RECEIVER`
+like the APs - so it is not a dead-APIC issue. The leading hypothesis was that the `WAKE_RECEIVER`
 IPI to the BSP is **misrouted** (wrong destination APIC id, possibly via the `lapic_to_core_id`
 "returns 0 if no match" fallback).
 
 ## Probes added (memory-based; the serial path was fixed first)
 
 Serial fix prerequisite: `serial_write_byte` had an **unbounded THRE poll** and
-`serial_write_bytes_lockfree` **bypassed `SERIAL_LOCK`** — together they induced false IF=0 serial
+`serial_write_bytes_lockfree` **bypassed `SERIAL_LOCK`** - together they induced false IF=0 serial
 wedges that had been contaminating earlier diagnostics. Both now bound the THRE poll (drop byte on
 timeout); the lockfree writer best-effort-acquires `SERIAL_LOCK`. So the counters below are trustworthy.
 
-- `IPI_SENT_TO[core]` — incremented in `send_ipi`, indexed by **target** logical core, right before the ICR write.
-- `IPI_RECVD[core]` — incremented in the `WAKE_RECEIVER` ISR path (a small Rust wrapper, `ipi_wake_received`, that the stub now calls), indexed by the **receiving** core.
+- `IPI_SENT_TO[core]` - incremented in `send_ipi`, indexed by **target** logical core, right before the ICR write.
+- `IPI_RECVD[core]` - incremented in the `WAKE_RECEIVER` ISR path (a small Rust wrapper, `ipi_wake_received`, that the stub now calls), indexed by the **receiving** core.
 - Boot dump comparing Limine's `bsp_lapic_id`, the BSP's hardware APIC id (`get_lapic_id()`), and the full `CORE_LAPIC_ID` map.
 
 ## Results (clean boot: `init: ready`, `supervisor: ready`, ping→pong to 42,458, no panic/PF)
@@ -35,11 +35,11 @@ ipidiag:  sent=[1,3,0,0]  recvd=[0,3,0,0]
 
 ## Interpretation
 
-1. **Destination is correct — misrouting refuted.** `bsp_lapic_id (16) == get_lapic_id() (16)`,
+1. **Destination is correct - misrouting refuted.** `bsp_lapic_id (16) == get_lapic_id() (16)`,
    and `CORE_LAPIC_ID[0] = 16`. `send_ipi(0)` writes `ICR_HIGH = (16 & 0xFF) << 24`,
    `ICR_LOW = vector | (1<<14)` → fixed delivery, **physical** dest mode, edge, assert, dest = APIC 16 = BSP.
-2. **The AP services IPIs:** core 1 — 3 sent → 3 received.
-3. **The BSP does not:** core 0 — the one `WAKE_RECEIVER` IPI was correctly addressed and sent,
+2. **The AP services IPIs:** core 1 - 3 sent → 3 received.
+3. **The BSP does not:** core 0 - the one `WAKE_RECEIVER` IPI was correctly addressed and sent,
    but `recvd[0] = 0`. The BSP never ran the handler. The IDT is shared and `IDT[0xF0]` is wired
    (the AP services 0xF0 using the same table).
 
@@ -57,7 +57,7 @@ LVT timer fires. The BSP is alive throughout (ping runs 42k+).
   stall it → bug shifts toward `pick_next` not selecting the Ready BSP-resident receiver. (Planned
   probe: `TICK_ON[cid]` at the top of `timer_tick_from_irq`.)
 
-## Update 2 (2026-05-30) — timer is HEALTHY; it's an IF=0 kernel wedge of core 0
+## Update 2 (2026-05-30) - timer is HEALTHY; it's an IF=0 kernel wedge of core 0
 
 Two more probes (memory-based; serial fix in place):
 
@@ -94,7 +94,7 @@ partly a short-capture artifact (the timer simply hadn't fired yet). Corrected p
 - Conclusion: no obvious unbounded IF=0 spin in the bp2-only recv path → likely a subtle
   real-SMP race, or an unexpected trigger of one of the blind-spot spins.
 
-### Next: NMI-RIP  — BUILT (this flash)
+### Next: NMI-RIP  - BUILT (this flash)
 
 Core 1 sends core 0 an NMI (delivered even with IF=0); core 0's NMI handler records its
 interrupted RIP; map via `rust-nm` to the exact wedged instruction. Definitive regardless of
@@ -109,28 +109,28 @@ Serial line to watch (emitted from core 1's idle loop):
 
 Symbols (release ELF): `nmi_stub`=0xffffffff801012b8, `nmi_record`=0xffffffff8010c3ab.
 
-## Update 3 (2026-05-30) — the wedge model is WRONG; core 0 is alive
+## Update 3 (2026-05-30) - the wedge model is WRONG; core 0 is alive
 
 The NMI-RIP probe returned a **null result** (`nmi0: rip=0x0 count=0`), and the log around the
 stall shows why: **core 0 is fully alive.** The regular one-way ping→pong runs to
 `pong: received "30089"` and climbing, `ipidiag` dumps 19×, `apicst0` counter keeps moving.
 Core 0 schedules, preempts, and runs ping the entire time. Update 2's "IF=0 wedge of core 0"
-is **refuted** — there is nothing wedged for the NMI to catch.
+is **refuted** - there is nothing wedged for the NMI to catch.
 
 What actually stalls is one specific task. `bp2-only` runs two independent flows on core 0:
-- **ping → pong** (one-way, no reply) — never needs an AP→BSP wake → runs forever. ✓
-- **perf-bp2 measurer (BSP) ⇄ perf-bp2-echo (AP)** — round-trip. `perf: BP2 echo sent-0` shows
+- **ping → pong** (one-way, no reply) - never needs an AP→BSP wake → runs forever. ✓
+- **perf-bp2 measurer (BSP) ⇄ perf-bp2-echo (AP)** - round-trip. `perf: BP2 echo sent-0` shows
   echo received msg 0 and **sent its AP→BSP reply**, then nothing. The measurer, blocked on
   `recv` on the BSP, **never receives reply 0**, so BP2 stalls at iteration 0.
 
-Smoking gun: `ipidiag: sent=[0,3,0,0]` — `IPI_SENT_TO[0] = 0`. When echo enqueued its reply for
+Smoking gun: `ipidiag: sent=[0,3,0,0]` - `IPI_SENT_TO[0] = 0`. When echo enqueued its reply for
 the BSP-blocked measurer, the `WAKE_RECEIVER` IPI to core 0 was **never even sent** (run-to-run
 it is sometimes sent-once-not-serviced, sometimes not sent at all → a **race**, not a dead APIC
 and not an IF=0 wedge). So the bug is in the **send→wake handshake / routing**, not core 0's
 health, and it is isolated to **AP→BSP** wakeups (BSP→AP via ping→pong works: `sent[1]=recvd[1]=3`).
 
 The lock-serialised enqueue/dequeue handshake and `block_and_reschedule`'s CAS both *look*
-correct on audit, so rather than theorise: **`rtdiag` probe** — routing outcomes keyed by the
+correct on audit, so rather than theorise: **`rtdiag` probe** - routing outcomes keyed by the
 endpoint's owning core (index 0 = measurer's BSP reply endpoint, isolated from core-1 ping→pong),
 dumped from pong's `handle_recv` on core 1 (a reliable busy-core dump site; the idle loop is not,
 which is why only one `nmi0` line printed). Watch:
@@ -139,7 +139,7 @@ which is why only one `nmi0` line printed). Watch:
 - `queued` climbs but `msg` stays 0 → replies pile in the measurer's queue, never dequeued.
 - `dead` climbs → echo's reply hits a dead/gen-mismatch endpoint.
 
-## Update 4 (2026-05-30) — echo's reply is CORRECT; the delay is STARVATION
+## Update 4 (2026-05-30) - echo's reply is CORRECT; the delay is STARVATION
 
 A long instrumentation chain (per-slot send/recv endpoint map, per-core entry
 counts, raw-LAPIC histogram, and finally a synchronous immediate log) converged:
@@ -148,27 +148,27 @@ counts, raw-LAPIC histogram, and finally a synchronous immediate log) converged:
 ECHOTX: lapic=17 core=1 slot=7 capslot=3 ep=104 epcore=0
 ```
 
-echo's reply runs on **core 1, slot 7** (correct — no core misread, no migration),
-uses the **correct cap (slot 3)**, and targets **endpoint 104 on core 0** — exactly the
+echo's reply runs on **core 1, slot 7** (correct - no core misread, no migration),
+uses the **correct cap (slot 3)**, and targets **endpoint 104 on core 0** - exactly the
 sender's recv endpoint. So the "endpoint mismatch", "core-id misread", and "cap-wiring"
 theories are all **refuted**. The reply is correctly addressed AP→BSP.
 
-The real symptom: echo replies **once, very late** — `echo recv-0` at log line 118,
+The real symptom: echo replies **once, very late** - `echo recv-0` at log line 118,
 `ECHOTX`/`echo sent-0` at line ~307, with ~189 lines of ping→pong + dumps in between.
 echo shares **core 1 with pong**, and ping floods pong (30k+ msgs), so **echo is starved
 of scheduler quanta** and its `try_send` retry loop barely advances. Every prior
-`c0 sent=0`/`woke=0` was recorded *before* echo's single late send — they did not prove
+`c0 sent=0`/`woke=0` was recorded *before* echo's single late send - they did not prove
 a wake failure, only that echo hadn't replied yet. The whole "AP→BSP wake never sent"
 framing was an artifact of sampling before the send.
 
 Open question (next probe): when echo's late reply enqueues to ep 104 and the sender is
 blocked there, does the wake fire and the sender receive? Immediate logs added:
-`WAKE0:` (any wake of a core-0 task — slot/task_core/my_core/cross) and
+`WAKE0:` (any wake of a core-0 task - slot/task_core/my_core/cross) and
 `SENDER_GOT_REPLY:` (sender slot 6 dequeues). If WAKE0 shows cross=true and the sender
 still never logs recv-0, the AP→BSP wake is real; if SENDER_GOT_REPLY appears, BP2 is
 merely glacially slow under pong starvation, not stuck.
 
-## Update 5 (2026-05-30) — CONFIRMED: AP->BSP wake IPI sent but never serviced by BSP
+## Update 5 (2026-05-30) - CONFIRMED: AP->BSP wake IPI sent but never serviced by BSP
 
 With echo's reply now proven correct, immediate synchronous logs captured the whole chain
 the instant it happens:
@@ -177,7 +177,7 @@ the instant it happens:
 ECHOTX: lapic=17 core=1 slot=7 capslot=3 ep=104 epcore=0   ← echo's reply, correctly addressed
 WAKE0:  slot=6 task_core=0 my_core=1 cross=true result=0   ← wake_by_slot fires send_ipi(0, 0xF0)
 perf: BP2 echo sent-0
-(silence — IPIRECV0 never appears; IPIRECV0 count = 0)
+(silence - IPIRECV0 never appears; IPIRECV0 count = 0)
 ```
 
 `IPIRECV0` is logged at the very top of `ipi_wake_received` (core 0's WAKE_RECEIVER handler),
@@ -185,7 +185,7 @@ before the reschedule. It NEVER fires → **core 0 never vectors into IDT[0xF0]*
 →BSP(core0) `WAKE_RECEIVER` IPI is correctly **sent** (`WAKE0 cross=true`, `send_ipi(0,0xF0)`) but
 **never serviced** by the BSP. Everything upstream is correct (echo reply target ep=104 core 0,
 cap slot 3, wake decision cross=true). The failure is purely **AP→BSP IPI acceptance at the BSP**.
-Output also stops entirely after this point (pong on core 1 ceases) — consistent with a hard wedge
+Output also stops entirely after this point (pong on core 1 ceases) - consistent with a hard wedge
 once the wake IPI is fired at core 0.
 
 Next probe (built): core 1's idle loop NMIs core 0 (NMI ignores IF), and core 0's NMI handler
@@ -195,7 +195,7 @@ samples its OWN `IRR[0xF0]` + RIP. `nmi0: rip=.. count=.. irrf0=..`:
   (APIC accept asymmetry AP→BSP for fixed IPIs).
 - `count=0` ⇒ core 0 takes neither NMI nor IPI (fully hung).
 
-## Update 6 (2026-05-30) — ROOT CAUSE FOUND + FIXED: unbounded COM2 drain in core 0's timer ISR
+## Update 6 (2026-05-30) - ROOT CAUSE FOUND + FIXED: unbounded COM2 drain in core 0's timer ISR
 
 NMI-into-core-0 (which ignores IF) caught the wedge directly:
 
@@ -205,14 +205,14 @@ NMI-into-core-0 (which ignores IF) caught the wedge directly:
                      nmi0: rip=0xffffffff80107c44 irrf0=1 ...            ← alternating, stuck
 ```
 
-- `irrf0=1` ⇒ the AP→BSP wake IPI **does** reach core 0's IRR — **APIC delivery is fine**.
+- `irrf0=1` ⇒ the AP→BSP wake IPI **does** reach core 0's IRR - **APIC delivery is fine**.
 - `ipi_recvd0=0` + NMI `count` climbing ⇒ core 0 takes NMIs but never the 0xF0 ⇒ **IF=0**.
 - Both wedge RIPs map (via `rust-nm`) into **`kernel::control::process_pending`** (sym 0x80107832).
 
 `process_pending` (control.rs) drained COM2 with an **unbounded** `while let Some(b) =
 com2_try_read_byte()` loop, and it is called from `timer_tick_from_irq` (scheduler.rs:790) on
 every core-0 tick **with IF=0**. `com2_try_read_byte` returns `Some` whenever COM2's LSR
-Data-Ready bit (port COM2+5, bit 0) is set — and on the HP T630 **there is no usable COM2, so
+Data-Ready bit (port COM2+5, bit 0) is set - and on the HP T630 **there is no usable COM2, so
 that port floats to 0xFF**, leaving DR permanently set. The loop never terminates → core 0 spins
 IF=0 inside the timer ISR → it can never take the latched 0xF0 WAKE_RECEIVER IPI → the perf-bp2
 sender blocked on `recv` on the BSP is never woken → BP2 stalls (and the system hard-wedges).
@@ -233,9 +233,9 @@ completes and core 0 stays interruptible. Status: built, pending hardware verifi
 - `send_ipi` (smp/ipi.rs): writes `ICR_HIGH` (dest) first, polls Delivery-Status (ICR_LOW bit 12,
   capped 10k iters), then writes `ICR_LOW = vector | (1<<14)`. Each core uses its own APIC MMIO base.
 - xAPIC mode (IDs fit in 8 bits; all APIC access is MMIO). **DFR/LDR (logical destination) not
-  configured — delivery is physical mode throughout.**
+  configured - delivery is physical mode throughout.**
 - `ipi_wake_stub` (IDT[0xF0]) does conditional `swapgs`, saves caller-saved regs, now `call
   ipi_wake_received` (counts receipt, then `timer_tick_from_irq`), restores, conditional `swapgs`, `iretq`.
-- `lapic_to_core_id` returns 0 on no-match (fallback) — would mask a wrong `CORE_LAPIC_ID[0]`
+- `lapic_to_core_id` returns 0 on no-match (fallback) - would mask a wrong `CORE_LAPIC_ID[0]`
   everywhere except the IPI destination; here `CORE_LAPIC_ID[0]` is confirmed correct (16), so the
   fallback is not in play.

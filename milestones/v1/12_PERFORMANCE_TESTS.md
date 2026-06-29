@@ -1,6 +1,6 @@
-# Milestone 12 — Performance Benchmarks
+# Milestone 12 - Performance Benchmarks
 
-**Status:** ✅ Phase 1 (10/10) + ✅ Phase 3 Brutal (10/10) — all pass, baselines committed  
+**Status:** ✅ Phase 1 (10/10) + ✅ Phase 3 Brutal (10/10) - all pass, baselines committed  
 **Spec ref:** §22 Performance Benchmarks  
 **Commands:** `osdev test perf` · `osdev test perf-brutal`
 
@@ -47,7 +47,7 @@ lines (pass criterion). After all benchmarks pass, extracted metrics are written
 RDTSC in ring 0 and returns the value. Services cannot call RDTSC directly (no unsafe
 in service code per §18.2), so the syscall is the canonical interface.
 
-### B1 / B2 — IPC roundtrip latency
+### B1 / B2 - IPC roundtrip latency
 
 Two probe services form a ping-pong pair. The **sender** dynamically acquires a SEND
 cap to the **echo** partner (which registers its endpoint at spawn). The sender sends
@@ -60,18 +60,18 @@ percentiles are logged.
 
 B2−B1 isolates the IPI overhead of cross-core wakeups (§8.8).
 
-### B3 — Syscall yield floor
+### B3 - Syscall yield floor
 
 N=1,000 `yield_cpu()` calls are bracketed by RDTSC reads. Mean cycles/yield is reported.
 In a busy system this includes scheduler overhead and time other tasks spend running
-before control returns — this is the "round-trip" cost as seen by the caller (§9.3).
+before control returns - this is the "round-trip" cost as seen by the caller (§9.3).
 
-### B4 — Cap validation throughput
+### B4 - Cap validation throughput
 
 N=10,000 `query_cap_rights()` calls on the service's own recv cap. Each call invokes
 the full cap-lookup + generation-check path in ring 0 (§7.5). Mean cycles/check.
 
-### B5 / B6 — Spawn and restart cost
+### B5 / B6 - Spawn and restart cost
 
 B5 and B6 share one probe (mode 66, `perf-b5`). A victim service (`perf-b5-victim`)
 is cycled N=10 times.
@@ -81,26 +81,26 @@ is cycled N=10 times.
 - **B6**: kill+spawn together as one TSC-bracketed operation → repeat.
   Reports mean cycles for a complete restart (kill + spawn in sequence).
 
-### B7 — Cap table insert/remove throughput
+### B7 - Cap table insert/remove throughput
 
 N=1,000 cycles of `acquire_send_cap("perf-b7")` (self-referential, inserting one cap
 slot) followed by `remove_cap(handle)`. Measures the cap table allocator and the
 generation-mint path (§7.5, §7.8) under no contention (single task, own table).
 
-### B8 — Allocator throughput
+### B8 - Allocator throughput
 
 Allocates 4 KiB pages via `alloc_mem(4096)` until `AllocDenied` (contract limit
 64 MiB → ~16,384 allocs). Total time / successful allocs = mean cycles/alloc.
 Memory is reclaimed at service death; no explicit free syscall is needed.
 
-### B9 — 4 KiB message copy cost
+### B9 - 4 KiB message copy cost
 
 `perf-b9` sends N=200 maximum-size (4096-byte) messages to `perf-b9-recv`. Both
 services are pinned to **core 0** to isolate copy cost from cross-core IPI overhead.
 The kernel copies sender→receiver on every send (zero-copy permanently rejected,
 §2.5). Mean cycles/send is the kernel-side memcpy + IPC enqueue cost.
 
-### B10 — Scheduler pick-next cost
+### B10 - Scheduler pick-next cost
 
 Identical measurement to B3 (N=1,000 yields, mean cycles/yield) but tracked
 separately for baseline regression detection. In a round-robin scheduler with K
@@ -135,7 +135,7 @@ back to this task.
 Each benchmark logs `perf: BN done` on success. The harness passes if all 10 "done"
 lines appear within their timeout without a KERNEL PANIC.
 
-**No minimum threshold is enforced** — any number is acceptable as a QEMU baseline.
+**No minimum threshold is enforced** - any number is acceptable as a QEMU baseline.
 The stored `tests/qemu/perf/baseline.json` documents the first run's values. Future CI
 runs compare against baseline and flag regressions ≥ 10%.
 
@@ -143,22 +143,22 @@ runs compare against baseline and flag regressions ≥ 10%.
 
 ## Implementation checklist
 
-- ✅ `kernel/src/syscall/dispatch.rs` — `InspectKernel` query 3 reads RDTSC
-- ✅ `sdk/rust/src/service_context.rs` — `ctx.read_tsc()`, `ctx.send_by_handle()`
-- ✅ `services/probe/src/main.rs` — modes 60–71 (12 modes across 10 benchmarks)
-- ✅ `kernel/src/task/mod.rs` — 13 perf service configs
-- ✅ `services/supervisor/src/main.rs` — perf service spawns
-- ✅ `osdev/src/validator.rs` — `PERF_TESTS`, `run_perf_tests()`, `run_perf_one()`, `perf_serial_path()`, `collect_perf_baseline()`
-- ✅ `osdev/src/main.rs` — `"perf"` branch in `cmd_test`
+- ✅ `kernel/src/syscall/dispatch.rs` - `InspectKernel` query 3 reads RDTSC
+- ✅ `sdk/rust/src/service_context.rs` - `ctx.read_tsc()`, `ctx.send_by_handle()`
+- ✅ `services/probe/src/main.rs` - modes 60–71 (12 modes across 10 benchmarks)
+- ✅ `kernel/src/task/mod.rs` - 13 perf service configs
+- ✅ `services/supervisor/src/main.rs` - perf service spawns
+- ✅ `osdev/src/validator.rs` - `PERF_TESTS`, `run_perf_tests()`, `run_perf_one()`, `perf_serial_path()`, `collect_perf_baseline()`
+- ✅ `osdev/src/main.rs` - `"perf"` branch in `cmd_test`
 - ✅ `build/tests/5_PERFORMANCE/.gitkeep`
-- ✅ `tests/qemu/perf/baseline.json` — placeholder; updated by harness after first run
+- ✅ `tests/qemu/perf/baseline.json` - placeholder; updated by harness after first run
 
 ---
 
-## Baseline results (Phase 1 — Milestone 12)
+## Baseline results (Phase 1 - Milestone 12)
 
 `tests/qemu/perf/baseline.json` is committed. Regression threshold: ≥ 10% change flags a failure.
-All values are QEMU TCG RDTSC cycle counts — not comparable across hosts or QEMU versions.
+All values are QEMU TCG RDTSC cycle counts - not comparable across hosts or QEMU versions.
 
 | ID  | Metric           | Baseline (cycles) | Notes                        |
 |-----|------------------|-------------------|------------------------------|
@@ -178,9 +178,9 @@ All values are QEMU TCG RDTSC cycle counts — not comparable across hosts or QE
 
 ---
 
-## Phase 3 — Brutal Performance Benchmarks (Milestone 19)
+## Phase 3 - Brutal Performance Benchmarks (Milestone 19)
 
-**Status:** ✅ 10/10 — all pass
+**Status:** ✅ 10/10 - all pass
 
 Runs the same 10 benchmarks at 5× iteration counts under the full ~220-task concurrent
 probe suite. Validates that the benchmark measurements hold under realistic system load
@@ -226,26 +226,26 @@ to core 3 to avoid starving IPC/yield probes on cores 0–2.
 
 ### Implementation checklist
 
-- ✅ `services/probe/src/main.rs` — modes 120–131 (12 modes, BP1–BP10)
-- ✅ `kernel/src/task/mod.rs` — 13 brutal perf service configs (probe_mode 120–131)
-- ✅ `services/supervisor/src/main.rs` — brutal perf service spawns
-- ✅ `osdev/src/validator.rs` — `BRUTAL_PERF_TESTS`, `run_brutal_perf_tests()`, `collect_brutal_perf_baseline()`
-- ✅ `osdev/src/main.rs` — `"perf-brutal"` branch in `cmd_test`
-- ✅ `build/tests/12_PERFORMANCE_BRUTAL/baseline.json` — written by harness after first passing run
+- ✅ `services/probe/src/main.rs` - modes 120–131 (12 modes, BP1–BP10)
+- ✅ `kernel/src/task/mod.rs` - 13 brutal perf service configs (probe_mode 120–131)
+- ✅ `services/supervisor/src/main.rs` - brutal perf service spawns
+- ✅ `osdev/src/validator.rs` - `BRUTAL_PERF_TESTS`, `run_brutal_perf_tests()`, `collect_brutal_perf_baseline()`
+- ✅ `osdev/src/main.rs` - `"perf-brutal"` branch in `cmd_test`
+- ✅ `build/tests/12_PERFORMANCE_BRUTAL/baseline.json` - written by harness after first passing run
 
 ### Brutal baseline results
 
-`build/tests/12_PERFORMANCE_BRUTAL/baseline.json` — QEMU TCG cycle counts under 220-task load.
+`build/tests/12_PERFORMANCE_BRUTAL/baseline.json` - QEMU TCG cycle counts under 220-task load.
 Values are higher than Phase 1 due to background probe activity; ratio to Phase 1 reflects system load factor.
 
 | ID   | Metric           | Brutal baseline (cycles) | Phase 1 baseline (cycles) | Load factor |
 |------|------------------|--------------------------|---------------------------|-------------|
 | BP1  | p50 roundtrip    | 52,358,204               | 51,330,536                | 1.02×       |
 | BP1  | p99 roundtrip    | 286,059,685              | 104,634,106               | 2.73×       |
-| BP1  | p999 roundtrip   | 350,215,046              | —                         | —           |
+| BP1  | p999 roundtrip   | 350,215,046              | -                         | -           |
 | BP2  | p50 roundtrip    | 52,394,940               | 28,077,512                | 1.87×       |
 | BP2  | p99 roundtrip    | 234,375,226              | 181,409,927               | 1.29×       |
-| BP2  | p999 roundtrip   | 418,680,259              | —                         | —           |
+| BP2  | p999 roundtrip   | 418,680,259              | -                         | -           |
 | BP3  | mean yield       | 104,792,428              | 3,505,831                 | 29.9×       |
 | BP4  | mean cap check   | 94,831                   | 88,611                    | 1.07×       |
 | BP5  | mean spawn       | 24,142,019               | 3,446,155                 | 7.0×        |

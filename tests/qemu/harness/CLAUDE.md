@@ -18,19 +18,19 @@ The harness supports three test kinds, each with its own drive loop:
 
 ```
 WatchSerial { expect, fail_on, timeout_secs }
-  — polls serial until all expect strings appear (in any order within the line stream)
-  — fails immediately if any fail_on string appears
+  - polls serial until all expect strings appear (in any order within the line stream)
+  - fails immediately if any fail_on string appears
 
 WithRestart { wait_for, restart_cmd, expect_after, fail_on, timeout_secs }
-  — Phase 1: poll_serial until wait_for string appears
-  — 500 ms settle pause
-  — Send restart_cmd to QEMU COM2 control port
-  — Phase 2: poll_serial until all expect_after strings appear
-  — Same deadline covers both phases
+  - Phase 1: poll_serial until wait_for string appears
+  - 500 ms settle pause
+  - Send restart_cmd to QEMU COM2 control port
+  - Phase 2: poll_serial until all expect_after strings appear
+  - Same deadline covers both phases
 
 WithBadTcb { expect, fail_on, timeout_secs }
-  — Boots a kernel image with a deliberately corrupted TCB binary
-  — Expects KERNEL PANIC + reason string
+  - Boots a kernel image with a deliberately corrupted TCB binary
+  - Expects KERNEL PANIC + reason string
 ```
 
 ## `WithRestart` flow
@@ -77,7 +77,7 @@ If KVM is present, `-enable-kvm -cpu host` is appended to the QEMU args. Falls b
 
 The harness looks for `qemu-system-x86_64` on PATH.
 - Linux: typically `/usr/bin/qemu-system-x86_64`
-- Windows: typically `C:\Program Files\qemu\qemu-system-x86_64.exe` — ensure this is on PATH.
+- Windows: typically `C:\Program Files\qemu\qemu-system-x86_64.exe` - ensure this is on PATH.
 
 ## Failure modes
 

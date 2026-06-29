@@ -1,6 +1,6 @@
 # Design Note: Gating Introspection Behind a Capability (§3.1)
 
-**Status:** DESIGN — approved, not yet implemented.
+**Status:** DESIGN - approved, not yet implemented.
 **Branch:** `feat/introspect-cap` (off `feat/observe`).
 **Date:** 2026-06-03
 **Pins:** §3.1 (no ambient authority), §3.3 (authority is explicit), invariant 1, §26.9 (authority stays visible and scoped).
@@ -9,23 +9,23 @@
 
 ## 1. Problem
 
-The two kernel introspection syscalls are **ambient** — any task can call them
+The two kernel introspection syscalls are **ambient** - any task can call them
 holding no capability:
 
-- `InspectKernel` (syscall 13) — alloc bytes, live-endpoint count, frame counts,
+- `InspectKernel` (syscall 13) - alloc bytes, live-endpoint count, frame counts,
   per-core ticks, core count, endpoint generation by name, TSC.
-- `TaskStat` (syscall 16) — full per-task snapshot for *any* scheduler slot: name,
+- `TaskStat` (syscall 16) - full per-task snapshot for *any* scheduler slot: name,
   core, state, memory used/limit, queue depth, restart generation.
 
-`handle_task_stat` says so explicitly in source: *"No capability required —
+`handle_task_stat` says so explicitly in source: *"No capability required -
 read-only kernel state."* This was a deliberate convenience for the §22
 property/perf harness, which calls these from many `probe` instances.
 
 But it is a standing exception to the constitution. Invariant 1 (§3.1) is "no
-ambient authority — every privileged action requires an explicit capability," and
+ambient authority - every privileged action requires an explicit capability," and
 `kernel/src/syscall/CLAUDE.md` states the rule with "there are no exceptions."
 Enumerating *every* task's name, memory, and restart count, or probing another
-named service's lifecycle generation, is information-disclosure authority — a
+named service's lifecycle generation, is information-disclosure authority - a
 confidentiality boundary the capability model is supposed to mediate. Today it is
 not mediated. This note closes that gap.
 
@@ -41,12 +41,12 @@ authority" is hollow if the authority it needs (read system metrics) is somethin
 | # | Decision | Choice |
 |---|----------|--------|
 | 1 | What to gate | Disclosure of **another task's or system-wide** state requires the cap; reading **only your own** state or a **hardware clock** stays ambient. |
-| 2 | Mechanism | A **holds-resource check** — the kernel verifies the calling task holds `INTROSPECT_RESOURCE` (READ) — not a passed cap-slot. |
+| 2 | Mechanism | A **holds-resource check** - the kernel verifies the calling task holds `INTROSPECT_RESOURCE` (READ) - not a passed cap-slot. |
 | 3 | Denial | Return a **distinct denied code** (`CapNotHeld`); SDK wrappers are unchanged (legitimate holders never see it). |
 
 ---
 
-## 3. Scope — what is gated, what stays ambient
+## 3. Scope - what is gated, what stays ambient
 
 **Rule:** *disclosing another task's or system-wide state requires `INTROSPECT`;
 reading only your own state, or a hardware clock, does not.*
@@ -68,8 +68,8 @@ reading only your own state, or a hardware clock, does not.*
 
 | Syscall / query | Why it stays open |
 |---|---|
-| `InspectKernel` 0 | the caller's **own** allocated bytes — its own state |
-| `InspectKernel` 3 | `read_tsc` — a hardware clock, not anyone's state |
+| `InspectKernel` 0 | the caller's **own** allocated bytes - its own state |
+| `InspectKernel` 3 | `read_tsc` - a hardware clock, not anyone's state |
 
 This line is chosen so the migration cost is identical to a narrower line (the
 same three services need the cap regardless), making the complete version free:
@@ -77,7 +77,7 @@ gate the whole cross-task/system surface, keep self-state and the clock open.
 
 ---
 
-## 4. Mechanism — holds-resource gate, not a cap-slot
+## 4. Mechanism - holds-resource gate, not a cap-slot
 
 ### Why not the existing slot pattern
 
@@ -95,7 +95,7 @@ Add a stable kernel resource:
 
 ```rust
 // kernel/src/capability/mod.rs
-/// Introspection authority — read another task's or system-wide kernel state
+/// Introspection authority - read another task's or system-wide kernel state
 /// via InspectKernel (13, system queries) and TaskStat (16). Self-state queries
 /// (own alloc bytes, TSC) remain ungated. Gating prevents an arbitrary service
 /// from enumerating every task's name/memory/restart count (§3.1).
@@ -112,16 +112,16 @@ if !scheduler::current_task_holds_resource(INTROSPECT_RESOURCE, Rights::READ) {
 }
 ```
 
-This needs one new scheduler/`CapTable` helper —
-`current_task_holds_resource(rid, right) -> bool` — that scans the calling task's
+This needs one new scheduler/`CapTable` helper -
+`current_task_holds_resource(rid, right) -> bool` - that scans the calling task's
 cap table for a live cap on `rid` carrying `right`. (The cap table already
 supports per-slot iteration via `for_each_active_cap`.)
 
 ### Deviation, documented
 
 This is a **holds-resource** check rather than the documented
-`CapTable::get(slot, right)` slot check. The intent of the §3.1 rule — *validate
-a capability before performing the privileged action* — is fully satisfied; only
+`CapTable::get(slot, right)` slot check. The intent of the §3.1 rule - *validate
+a capability before performing the privileged action* - is fully satisfied; only
 the calling convention differs, because read syscalls that consume all argument
 registers have no slot to pass. `kernel/src/syscall/CLAUDE.md` will be updated to
 record this as the sanctioned form for argument-saturated read syscalls.
@@ -136,7 +136,7 @@ bodies. No caller code changes except declaring the capability (§6).
 
 ## 5. Denial semantics
 
-A denied call returns `cap_err_to_i64(CapError::CapNotHeld)` — a distinct negative,
+A denied call returns `cap_err_to_i64(CapError::CapNotHeld)` - a distinct negative,
 separable from the existing `-1` "not found / invalid args" the inspect handlers
 already use.
 
@@ -148,7 +148,7 @@ legitimate caller hits it.
 
 > **Follow-up (logged, out of scope here):** "loud over silent" (§26.7) argues for
 > making the introspection wrappers fallible (`Result`/`Option`) so a denied call
-> is surfaced rather than coerced to a default. Deferred — it is SDK API churn
+> is surfaced rather than coerced to a default. Deferred - it is SDK API churn
 > with no current consumer, and would be pulled into existence by the first service
 > that must distinguish "denied" from "zero."
 
@@ -179,13 +179,13 @@ in-kernel `ServiceConfig` table, consistent with how `has_console_read` /
 
 ## 7. Constitutional & doc impact
 
-- **Not an amendment — an alignment.** This *removes* a standing exception to
+- **Not an amendment - an alignment.** This *removes* a standing exception to
   §3.1; it strengthens conformance rather than changing an invariant, so no
   CLAUDE.md invariant change is needed. (A one-line note may be added to the §7
   capability section listing `INTROSPECT_RESOURCE` among the stable resources.)
 - **`kernel/src/syscall/CLAUDE.md`:** add `INTROSPECT_RESOURCE` to the syscall
   table and document the holds-resource form for argument-saturated read syscalls.
-- **`docs/unsafe-audit.md`:** unaffected — no new `unsafe` (the gate is safe Rust).
+- **`docs/unsafe-audit.md`:** unaffected - no new `unsafe` (the gate is safe Rust).
 - **`utilities/1_observe.md` §7/§8:** update from "introspection is currently
   ambient (verify)" to "introspection is gated by `INTROSPECT_RESOURCE`; `observe`'s
   contract declares it," restoring the accuracy of observe's least-authority story.
@@ -194,14 +194,14 @@ in-kernel `ServiceConfig` table, consistent with how `has_console_read` /
 
 ## 8. Testing
 
-- **Regression (must stay green):** the full §22 suite — identity, property
-  (P2/P4/P5/P8 use the gated/ambient queries), perf (TSC stays ambient), stress —
+- **Regression (must stay green):** the full §22 suite - identity, property
+  (P2/P4/P5/P8 use the gated/ambient queries), perf (TSC stays ambient), stress -
   with the three services now holding the cap. A pass proves the gate is
   transparent to legitimate holders.
 - **New adversarial test (the property this unlocks):** a service that does **not**
   declare `introspect` calls `task_stat` / a gated `InspectKernel` query and is
   denied (`CapNotHeld`), while a self query (own alloc bytes) and TSC still
-  succeed. This is the first test that can assert introspection is *not* ambient —
+  succeed. This is the first test that can assert introspection is *not* ambient -
   it was impossible to write before. Fits the §22 Adversarial (A-series) bar.
 
 ---

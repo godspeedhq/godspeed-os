@@ -1,6 +1,6 @@
 # Utility: `mem`
 
-**Utility:** `mem` — physical memory usage
+**Utility:** `mem` - physical memory usage
 **Status:** Built. As-built reference.
 **Shape:** shell built-in (see `0_conventions.md` §2).
 
@@ -8,7 +8,7 @@
 
 ## 1. Purpose
 
-`mem` answers **how much physical RAM is in use?** — one line, system-wide. It
+`mem` answers **how much physical RAM is in use?** - one line, system-wide. It
 reports raw facts and renders no verdict (`0_conventions.md` §1 rule 7).
 
 ## 2. Invocation
@@ -30,13 +30,13 @@ tiny footprint shows as e.g. `0.04%` rather than rounding to `0%`.
 ## 4. Data source
 
 Frames are 4 KiB pages, from the kernel frame allocator via introspection:
-- `inspect_kernel_total_frames()` — total frames (× 4 KiB = total).
-- `inspect_kernel_free_frames()` — free frames.
+- `inspect_kernel_total_frames()` - total frames (× 4 KiB = total).
+- `inspect_kernel_free_frames()` - free frames.
 - used = total − free; KiB = frames × 4; MiB = frames ÷ 256.
 
 ## 5. Capabilities
 
-- **`INTROSPECT`** (READ) — the frame-count queries are gated (`InspectKernel`
+- **`INTROSPECT`** (READ) - the frame-count queries are gated (`InspectKernel`
   4/5). The shell holds this cap, so the built-in can call them.
 - **Console output** to print the line.
 

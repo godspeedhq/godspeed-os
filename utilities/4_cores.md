@@ -1,6 +1,6 @@
 # Utility: `cores`
 
-**Utility:** `cores` — CPU core count
+**Utility:** `cores` - CPU core count
 **Status:** Built. As-built reference.
 **Shape:** shell built-in (see `0_conventions.md` §2).
 
@@ -8,7 +8,7 @@
 
 ## 1. Purpose
 
-`cores` answers **how many cores came up?** — the number of CPUs the kernel brought
+`cores` answers **how many cores came up?** - the number of CPUs the kernel brought
 online at boot (§9, §11.2). SMP is static in v1, so this is fixed for the system's
 lifetime.
 
@@ -31,7 +31,7 @@ cores: 4
 
 ## 5. Capabilities
 
-- **`INTROSPECT`** (READ) — query 8 is gated; the shell holds the cap.
+- **`INTROSPECT`** (READ) - query 8 is gated; the shell holds the cap.
 - **Console output** to print the line.
 
 ## 6. Non-goals

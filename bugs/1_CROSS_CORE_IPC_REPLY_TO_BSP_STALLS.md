@@ -1,8 +1,8 @@
-# Bug 1 — Cross-core IPC reply to the BSP (core 0) never reaches a blocked receiver
+# Bug 1 - Cross-core IPC reply to the BSP (core 0) never reaches a blocked receiver
 
 **Status:** Open · confirmed real (reproduces on a clean, diagnostic-free kernel)
-**Severity:** High — blocks the cross-core IPC round-trip (BP2 benchmark / any request→reply where the requester is on the BSP)
-**Hardware:** HP T630 thin client — AMD GX-420GI (Jaguar/Puma+, Family 22h), 4 cores ~2 GHz, 8 GB RAM. LAPIC IDs 16/17/18/19 (BSP = LAPIC 16 = logical core 0).
+**Severity:** High - blocks the cross-core IPC round-trip (BP2 benchmark / any request→reply where the requester is on the BSP)
+**Hardware:** HP T630 thin client - AMD GX-420GI (Jaguar/Puma+, Family 22h), 4 cores ~2 GHz, 8 GB RAM. LAPIC IDs 16/17/18/19 (BSP = LAPIC 16 = logical core 0).
 **First seen:** 2026-05-29 · last reproduced clean: 2026-05-30
 **Affected branch/commit:** reproduces on `main` @ `059b104` (the ring-3 AMD userspace milestone). Debug instrumentation lives on branch `debug/bug-a-bsp-timer`.
 
@@ -11,7 +11,7 @@
 ## One-line summary
 
 A task that performs a blocking `recv` **on core 0 (the BSP)** is never delivered a
-message that another core (`AP`) enqueues for it — the receiver stays starved/stalled.
+message that another core (`AP`) enqueues for it - the receiver stays starved/stalled.
 Traffic in the other direction (BSP → AP) works perfectly. This is a software bug, **not**
 an APIC/timer hardware limitation (proven below).
 
@@ -55,7 +55,7 @@ pong: received "42905"       <- meanwhile ping(core0) -> pong(core1) one-way run
   so it was enqueued / handed to the blocked-receiver path), but the sender blocked on
   `recv` on core 0 **never receives it** and never resumes.
 - Under heavy ambient churn (full `perf-brutal`, many cross-core IPIs), the round-trip
-  occasionally completes — **4/1000** in one run — but **0/1000** in isolation (`bp2-only`).
+  occasionally completes - **4/1000** in one run - but **0/1000** in isolation (`bp2-only`).
   Racy, not a hard failure.
 
 ## What runs on which core (bp2-only)
@@ -65,7 +65,7 @@ core 0: init(0) supervisor(1) registry(2) logger(3) ping(5) perf-bp2/sender(6)
 core 1: pong(4) perf-bp2-echo(7)
 ```
 ping (core 0) calls `yield_cpu()` every loop iteration (~40k+ yields observed), so core 0's
-`pick_next` runs tens of thousands of times — yet the Ready sender (slot 6) is not serviced
+`pick_next` runs tens of thousands of times - yet the Ready sender (slot 6) is not serviced
 to completion.
 
 ---
@@ -92,7 +92,7 @@ to completion.
    correct ids.
 
 4. **NOT my diagnostics causing the BP2 stall.** The clean `main` kernel (zero diagnostics)
-   reproduces the stall exactly. (However the diagnostics DID confound other runs — see below.)
+   reproduces the stall exactly. (However the diagnostics DID confound other runs - see below.)
 
 5. **NOT a `SpinLock<T>` deadlock.** A stuck-lock detector (prints `LOCKSTUCK <addr>` after
    80M spins inside `SpinLock::lock`) never fired during the stall.
@@ -105,7 +105,7 @@ At runtime, **core 0 services no interrupts** while stalled (`c0=0`: `timer_tick
 ran 0 times on logical core 0 across many runs, while core 1 logged dozens). Since the timer
 provably *fires* (fact 1), the only explanation is that **core 0 runs with `IF=0` (interrupts
 disabled) for long/indefinite stretches**, so the pending timer (and any `WAKE_RECEIVER` IPI)
-is never taken — hence no preemption and no cross-core wake servicing on the BSP.
+is never taken - hence no preemption and no cross-core wake servicing on the BSP.
 
 Two distinct manifestations were seen, run-to-run (it's a race):
 - **(common)** ping runs on core 0 (40k+ sends, yielding each time) and the woken sender
@@ -123,7 +123,7 @@ IPC/scheduler logic was audited statically and appears correct for every interle
 `SpinLock` uses Acquire/Release). So the defect is either a real-SMP memory-ordering/race that
 the static reading misses, or an `IF=0` wedge in a path not yet instrumented.
 
-QEMU note: never reproduces under QEMU TCG (which serializes cores) — real-SMP only. This
+QEMU note: never reproduces under QEMU TCG (which serializes cores) - real-SMP only. This
 matches prior `feedback-cas-not-store` findings.
 
 ---
@@ -147,18 +147,18 @@ fixing on its own (bound the THRE poll; make the lockfree writer respect `SERIAL
 
 ## Code locations to examine
 
-- `kernel/src/syscall/dispatch.rs` — `handle_recv` (block loop), `handle_send`/`handle_try_send`.
-- `kernel/src/ipc/routing.rs` — `enqueue_locked` / `dequeue_locked` (blocked_receiver recording,
+- `kernel/src/syscall/dispatch.rs` - `handle_recv` (block loop), `handle_send`/`handle_try_send`.
+- `kernel/src/ipc/routing.rs` - `enqueue_locked` / `dequeue_locked` (blocked_receiver recording,
   the `TABLE` SpinLock), `endpoint_queue_depth`.
-- `kernel/src/task/scheduler.rs` — `block_and_reschedule`, `wake_by_slot` (cross-core CAS-retry
+- `kernel/src/task/scheduler.rs` - `block_and_reschedule`, `wake_by_slot` (cross-core CAS-retry
   + `CORE_WAKE_HINT` + `send_ipi`), `pick_next` (hint fast-path + RR scan), `yield_current`,
   `timer_tick_from_irq`.
-- `kernel/src/smp/ipi.rs` — `send_ipi` (ICR write + DELIVS poll), `WAKE_RECEIVER` (0xF0) path.
-- `kernel/src/arch/x86_64/boot.rs` — `ipi_wake_stub` (IDT[0xF0] → `timer_tick_from_irq`),
+- `kernel/src/smp/ipi.rs` - `send_ipi` (ICR write + DELIVS poll), `WAKE_RECEIVER` (0xF0) path.
+- `kernel/src/arch/x86_64/boot.rs` - `ipi_wake_stub` (IDT[0xF0] → `timer_tick_from_irq`),
   `init_local_apic` (TPR zero, LVT timer, periodic vs TSC-deadline), `apic_send_eoi`.
-- `kernel/src/smp/core.rs` — `lapic_to_core_id`, `current_core_id` source.
-- `kernel/src/arch/x86_64/mod.rs` — `serial_write_byte` (unbounded THRE), `serial_write_bytes_lockfree`
-  (SERIAL_LOCK bypass) — the confound / latent bug.
+- `kernel/src/smp/core.rs` - `lapic_to_core_id`, `current_core_id` source.
+- `kernel/src/arch/x86_64/mod.rs` - `serial_write_byte` (unbounded THRE), `serial_write_bytes_lockfree`
+  (SERIAL_LOCK bypass) - the confound / latent bug.
 
 ---
 
@@ -169,7 +169,7 @@ fixing on its own (bound the THRE poll; make the lockfree writer respect `SERIAL
    the timer *fires into IRR*; the question is why the BSP appears to run `IF=0` so long that it
    never takes it.)
 2. Is there a kernel path on the `recv`/reply side that disables interrupts (`cli`, interrupt-gate
-   syscall entry, a spinlock acquired with IF=0) and can spin indefinitely on real SMP — i.e. a
+   syscall entry, a spinlock acquired with IF=0) and can spin indefinitely on real SMP - i.e. a
    genuine deadlock/livelock distinct from the (ruled-out) `SpinLock<T>` and serial cases?
 3. Does the cross-core `wake_by_slot` → `CORE_WAKE_HINT[0]` + `WAKE_RECEIVER` IPI to the BSP
    actually get serviced? (Needs a memory-counter probe: count `wake_by_slot(slot=6)` calls vs
@@ -185,15 +185,15 @@ Memory-based only (no serial flood): add atomic counters
 - `DBG_WAKE6` (incremented in `wake_by_slot` when `slot == 6`),
 - `DBG_PICK6` (incremented in `pick_next` when it returns slot 6 on core 0),
 and dump `wake6 / pick6 / TASK_STATE[6]` once every ~128 timer ticks (~6 s) from core 1 via a
-single bounded `kprintln`. This answers: is the sender ever woken? ever scheduled? — without
+single bounded `kprintln`. This answers: is the sender ever woken? ever scheduled? - without
 touching the confounded lockfree-serial path.
 
 ---
 
 ## Cross-references
 
-- `milestones/v2/MILESTONE.md` — the ring-3 AMD userspace milestone (the working baseline).
-- `docs/hw-bare-metal-freeze-j5005.md` — earlier Goldmont+ (Wyse 5070) APIC freeze (different
+- `milestones/v2/MILESTONE.md` - the ring-3 AMD userspace milestone (the working baseline).
+- `docs/hw-bare-metal-freeze-j5005.md` - earlier Goldmont+ (Wyse 5070) APIC freeze (different
   hardware; the TSC-deadline path is a related APIC workaround).
-- Branch `debug/bug-a-bsp-timer` (commit `3f69a3b`) — all the diagnostic probes (irrwatch,
+- Branch `debug/bug-a-bsp-timer` (commit `3f69a3b`) - all the diagnostic probes (irrwatch,
   per-core DIAG, APIC0 readback, LOCKSTUCK detector).

@@ -1,4 +1,4 @@
-# Utility: `tree` — print the directory hierarchy
+# Utility: `tree` - print the directory hierarchy
 
 **Status:** **Built + QEMU-verified** (`osdev test files`) as a shell built-in. On hierarchical
 GSFS (`docs/persistence.md`). Trails `CLAUDE.md`; does not amend it.
@@ -8,13 +8,13 @@ GSFS (`docs/persistence.md`). Trails `CLAUDE.md`; does not amend it.
 ## 1. What it is
 
 `tree [path]` prints the directory hierarchy under `path` (default: the current directory) as
-an indented tree — the read-only companion to `ls` for seeing structure at a glance. It keeps
+an indented tree - the read-only companion to `ls` for seeing structure at a glance. It keeps
 the same name as the POSIX/util `tree` because the name is already plain and not cryptic.
 
 ## 2. Usage
 
 ```
-tree 0.1.0 — print the directory hierarchy
+tree 0.1.0 - print the directory hierarchy
 
 usage:
   tree            tree of the current directory
@@ -29,9 +29,9 @@ usage:
 
 - **Box-drawing, like Unix `tree`.** Connectors `├── ` / `└── ` mark each entry and `│` / blank
   draw the continuation lines, so structure reads at a glance. A trailing `/` still marks
-  directories (the console is monochrome — there's no colour to lean on).
+  directories (the console is monochrome - there's no colour to lean on).
 - **UTF-8.** The box glyphs (`U+2500..U+253C`) are emitted as UTF-8 and render on **both** the
-  serial terminal and the framebuffer console — the fbcon decodes UTF-8 and draws the box
+  serial terminal and the framebuffer console - the fbcon decodes UTF-8 and draws the box
   glyphs with **procedural strokes** (the antialiased Noto font it uses for text has no U+2500
   block; procedural strokes also connect cell-to-cell exactly). See `kernel/src/arch/x86_64/fb.rs`.
   Unsupported codepoints render as `?`, never silently dropped (§3.12).
@@ -56,7 +56,7 @@ gsh> tree /docs
 
 Read-only, so no capability beyond the `fs` `ListDir` (op 14) it already uses for `ls`/`find`.
 It adds **no new `fs` surface**: the hierarchy is reconstructed client-side with the **same
-bounded-walk discipline** `find` uses (§26.6) — a fixed-capacity explicit stack, depth-first,
+bounded-walk discipline** `find` uses (§26.6) - a fixed-capacity explicit stack, depth-first,
 **no recursion**. Every child (file or dir) is pushed so siblings nest correctly, and a
 directory's whole subtree drains before its next sibling (LIFO + reverse-push). If a tree is
 wider than the walk's capacity it reports truncation rather than silently dropping branches
@@ -66,7 +66,7 @@ real depth to ~60 levels, well within the walk.
 The connectors come for free from the same DFS: each node carries whether it is its parent's
 **last** child (drives `└──` vs `├──`), and a small `level_last[depth]` array records each
 ancestor's last-child flag for the `│`/blank prefix. Because the DFS finishes a subtree before
-its siblings, that array is always valid when a node prints — no recursion, no per-node prefix
+its siblings, that array is always valid when a node prints - no recursion, no per-node prefix
 storage.
 
 ## 5. Later (separate doc so it can grow)

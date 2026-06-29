@@ -1,4 +1,4 @@
-# Post-v1 Item 7 — Identity CI Green (20/20) ✅
+# Post-v1 Item 7 - Identity CI Green (20/20) ✅
 
 **Goal:** All 20 identity tests pass consistently in GitHub Actions CI.
 
@@ -6,7 +6,7 @@
 
 ## Root Cause
 
-QEMU was running in pure TCG (software emulation) mode — no `-enable-kvm` flag.
+QEMU was running in pure TCG (software emulation) mode - no `-enable-kvm` flag.
 With ~185 services spawned during boot, the supervisor sequence consumed 20–25 s of
 wall-clock time in TCG, exhausting the 30 s per-test timeout before ping/pong could
 exchange their first message.
@@ -24,16 +24,16 @@ and pong (core 1):
 | 10B `client_reacquires_after_core_change` | `"pong: received"` then restart | timeout |
 
 Confirming signal: `"pong: ready on core"` appeared in test 9A serial output but
-`"pong: received"` did not — pong started but ping never got a CPU turn before the clock expired.
+`"pong: received"` did not - pong started but ping never got a CPU turn before the clock expired.
 
 ## Fix
 
-**`osdev/src/qemu.rs`** — `kvm_available()` detects `/dev/kvm` at runtime;
+**`osdev/src/qemu.rs`** - `kvm_available()` detects `/dev/kvm` at runtime;
 `spawn_for_test`, `spawn_for_test_custom`, and `run` all pass
 `-enable-kvm -cpu host` when KVM is accessible.  Falls back silently to TCG
 on Windows and on Linux hosts without KVM (e.g., nested VMs).
 
-**`.github/workflows/identity.yml`** — Added "Enable KVM access" step (udev rule
+**`.github/workflows/identity.yml`** - Added "Enable KVM access" step (udev rule
 to make `/dev/kvm` world-accessible on the GitHub runner) and serial log upload
 artifact on failure for post-mortem diagnosis.
 
@@ -42,11 +42,11 @@ With KVM, boot takes ~3–5 s, well within the 30 s per-test timeout.
 
 ## Status
 
-✅ **Complete** — 20/20 identity tests passing locally (Windows TCG, 3/3 consecutive rounds) and in CI (Linux KVM).
+✅ **Complete** - 20/20 identity tests passing locally (Windows TCG, 3/3 consecutive rounds) and in CI (Linux KVM).
 
 ### Additional fixes (session 2)
 
-**`kernel/src/task/scheduler.rs`** — Deferred PML4 frame free in self-kill path to prevent
+**`kernel/src/task/scheduler.rs`** - Deferred PML4 frame free in self-kill path to prevent
 CR3 UAF KERNEL PF. Root cause: in the self-kill path the dying task's CR3 is still active
 on the core when `reclaim_user_frames` hands the PML4 frame to `free_frame`. Another core's
 `PageTable::new()` can immediately alloc and zero that frame. On a TLB miss on any kernel VA
@@ -55,10 +55,10 @@ entry 511 = 0 → "not present" → KERNEL PF. Fix: skip the PML4 frame in the s
 loop; store it in `CORE_PENDING_PML4[my_core]`; free it at the next `drain_pending_kstack`
 call (timer tick or scheduler idle) when a different CR3 is already loaded.
 
-**`osdev/src/validator.rs`** — Fixed test 10B `timeout_secs` 60 → 120. Pong spawns at ~70 s
+**`osdev/src/validator.rs`** - Fixed test 10B `timeout_secs` 60 → 120. Pong spawns at ~70 s
 in the test sequence, making the 60 s deadline unreachable.
 
-### Additional fixes (session 3 — Windows TCG determinism)
+### Additional fixes (session 3 - Windows TCG determinism)
 
 Root cause of remaining flakiness: supervisor spawns 100+ probe services before pong/ping,
 consuming ~25–30 s on Windows TCG. Tests with `timeout_secs: 120` that depended on
@@ -70,7 +70,7 @@ Confirmed failing patterns from diagnostic runs:
 - 6B: `wait_for` satisfied but ping reacquisition strings not seen before deadline
 - 10A: `"pong: received"` itself timed out on a slow TCG run
 
-**`osdev/src/validator.rs`** — Increased timeouts for all pong-communication-dependent tests:
+**`osdev/src/validator.rs`** - Increased timeouts for all pong-communication-dependent tests:
 
 | Test | Old | Final | Reason |
 |------|-----|-------|--------|
@@ -93,7 +93,7 @@ system load. The 300s ceiling covers all observed cases with substantial margin.
 KVM (CI): tests complete in <30s each; the 300s ceiling is never reached.
 Windows TCG: generous ceiling covers variance without impacting fast runs.
 
-### Additional fixes (session 4 — structural fix)
+### Additional fixes (session 4 - structural fix)
 
 Root cause of back-to-back run failures: even with 300s timeouts, 3+ consecutive full suite runs
 accumulate system load (60 QEMU instances) that could push `"pong: received"` to t≈175-180s, leaving
@@ -102,14 +102,14 @@ only ~120s for the restart phase of `WithRestart` tests. Occasionally the restar
 
 **Structural fix applied:**
 
-**`services/supervisor/src/main.rs`** — Moved pong/ping spawns to the **beginning** of `service_main`,
+**`services/supervisor/src/main.rs`** - Moved pong/ping spawns to the **beginning** of `service_main`,
 before all 178 probe spawns. `"supervisor: ready"` remains logged after all probes complete.
 - Before: pong and ping spawned at lines 281-287 (after 178 probe spawns)
 - After: pong and ping spawned first (lines 17-27), `"supervisor: ready"` still after all probes
 
 With this change, `"pong: received"` appears at t≈5-10s instead of t≈40-180s on any load level.
 
-**`osdev/src/validator.rs`** — `WithRestart` tests changed to trigger restart on `"supervisor: ready"`
+**`osdev/src/validator.rs`** - `WithRestart` tests changed to trigger restart on `"supervisor: ready"`
 (after probe-spawn loop ends, supervisor safely in yield loop) instead of `"pong: received"` (could
 fire mid-spawn-loop). Timeouts cut significantly:
 
@@ -125,34 +125,34 @@ fire mid-spawn-loop). Timeouts cut significantly:
 **Why `"supervisor: ready"` as the trigger (not `"pong: received"`):** if restart fires while supervisor is
 still in spawn loop (mid-`ctx.spawn()` sequence), the supervisor can re-encounter pong's name during
 a subsequent probe spawn. Using `"supervisor: ready"` as the gate guarantees supervisor is in its
-`loop { ctx.yield_cpu(); }` idle path — no spawns in flight, no possible ordering conflict.
+`loop { ctx.yield_cpu(); }` idle path - no spawns in flight, no possible ordering conflict.
 
 Total per-run wall time on Windows TCG (fresh system): drops from ~2100s to ~1200s.
 
-### Additional fixes (session 5 — 200/200 deterministic)
+### Additional fixes (session 5 - 200/200 deterministic)
 
 **Problem:** even after the session 4 structural fix, 3–4 failures per 200 tests remained under
 extreme accumulated back-to-back host load. The `WithRestart` tests (6A, 6B, 10A, 10B) still used
 `"supervisor: ready"` as their gate, which required waiting for all 160+ non-identity probe services
-to finish spawning on TCG — occasionally taking close to the full 240–300s deadline, leaving
+to finish spawning on TCG - occasionally taking close to the full 240–300s deadline, leaving
 insufficient margin for the restart phase.
 
 **Root cause identified:** `osdev test identity` was building and booting the full supervisor binary
 (160+ probe services) even for the 20 identity tests that only need 15 probe services. The 160+
 probe spawn loop was the source of all timing variance.
 
-**Fix 1 — `identity-only` Cargo feature (`services/supervisor/Cargo.toml`, `src/main.rs`):**
+**Fix 1 - `identity-only` Cargo feature (`services/supervisor/Cargo.toml`, `src/main.rs`):**
 - New `identity-only = []` feature excludes all non-identity probes at compile time.
 - `spawn_extended_probes()` helper contains all 160+ non-identity spawns, compiled out when
   `identity-only` is enabled.
 - Result: `"supervisor: ready"` appears in ~3 s on TCG instead of 30–200 s.
 
-**Fix 2 — `cmd_build_identity()` (`osdev/src/main.rs`):**
+**Fix 2 - `cmd_build_identity()` (`osdev/src/main.rs`):**
 - New build function builds supervisor with `--features supervisor/identity-only`.
 - `run_identity_tests()` calls `cmd_build_identity()` instead of `cmd_build()`.
 - Full `cmd_build()` (all probes) is unchanged for property/fuzz/stress/perf/etc. test suites.
 
-**Fix 3 — per-test QEMU isolation sleep (`osdev/src/validator.rs`):**
+**Fix 3 - per-test QEMU isolation sleep (`osdev/src/validator.rs`):**
 - 500 ms sleep after each test in the identity loop.
 - Gives Windows time to reclaim the 512 MiB QEMU pages before the next QEMU instance starts.
 - Prevents accumulation of memory pressure across 20 sequential QEMU instances.
@@ -167,7 +167,7 @@ Previous best was 197/200 (1–2% failure rate under extreme load). Now fully de
 | WithRestart test margin | ~0–40 s | ~237 s |
 | Per-test isolation | none | 500 ms OS reclaim pause |
 
-### Session 6 — timeout cleanup and documentation
+### Session 6 - timeout cleanup and documentation
 
 **Context:** session 5 fixed the root cause (identity-only supervisor). The inflated timeouts from sessions 3–4 were compensation for a problem that no longer exists. Session 6 trimmed them to reflect actual operation and recorded the verified deterministic result.
 
@@ -190,6 +190,6 @@ Previous best was 197/200 (1–2% failure rate under extreme load). Now fully de
 
 **Documentation updates:**
 
-- **`tests/qemu/identity/CLAUDE.md`** — updated timeout rationale section to reference `identity-only` build, corrected timeout table, added 10-run consecutive pass record.
-- **`CLAUDE.md` (root)** — replaced all 14 mermaid diagram blocks with ASCII art `text` blocks (renders in any viewer); removed ping/pong from §4.1 architectural layered view (they are demo services in `examples/`, not architectural components); clarified §15 note on stateless services.
-- **`README.md`** — full refactor: ASCII architecture diagram (no ping/pong), concise principle and test-suite tables, trimmed philosophy prose.
+- **`tests/qemu/identity/CLAUDE.md`** - updated timeout rationale section to reference `identity-only` build, corrected timeout table, added 10-run consecutive pass record.
+- **`CLAUDE.md` (root)** - replaced all 14 mermaid diagram blocks with ASCII art `text` blocks (renders in any viewer); removed ping/pong from §4.1 architectural layered view (they are demo services in `examples/`, not architectural components); clarified §15 note on stateless services.
+- **`README.md`** - full refactor: ASCII architecture diagram (no ping/pong), concise principle and test-suite tables, trimmed philosophy prose.

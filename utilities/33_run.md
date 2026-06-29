@@ -1,6 +1,6 @@
-# Utility: `run` — execute a script of commands
+# Utility: `run` - execute a script of commands
 
-**Status:** **Built + QEMU-verified** (`osdev test files`). The shell script runner — the way to
+**Status:** **Built + QEMU-verified** (`osdev test files`). The shell script runner - the way to
 replay a suite of commands without typing them (the point: validate on hardware). Trails
 `CLAUDE.md`; does not amend it.
 
@@ -9,7 +9,7 @@ replay a suite of commands without typing them (the point: validate on hardware)
 ## 1. What it is
 
 `run <path>` reads a script file and executes **each command exactly as if you typed it** at the
-prompt. It is the trivial, sequential case of Appendix D.2 ("`cmd1; cmd2`") — a **command-list
+prompt. It is the trivial, sequential case of Appendix D.2 ("`cmd1; cmd2`") - a **command-list
 runner**, deliberately **not** a scripting *language* (no variables, no `if`/`while`; those are
 far-future, Appendix D).
 
@@ -27,24 +27,24 @@ run: ran 4, failed 1
 ```
 
 Each command is **echoed** (`> cmd`) before it runs, so the serial transcript is
-self-documenting — exactly what you want when eyeballing a run on the T630.
+self-documenting - exactly what you want when eyeballing a run on the T630.
 
 ## 2. The script format (`.gsh`)
 
 - **Lines** are split on newline; a non-comment line is further split on **`;`** into commands.
-  So a script is either real multi-line, *or* `cmd ; cmd ; cmd` on one line — the latter is how
+  So a script is either real multi-line, *or* `cmd ; cmd ; cmd` on one line - the latter is how
   scripts are authored today (the shell can't yet type a newline into a file; a host-side editor
   / image-baked `.gsh` is the companion step).
-- **`#` comments** — a line whose first non-blank character is `#` is skipped. Annotate freely.
+- **`#` comments** - a line whose first non-blank character is `#` is skipped. Annotate freely.
 - **Blank lines** are skipped.
 - `.gsh` is a naming **convention** (GodspeedOS shell; `.gs` is reserved for the future
-  general-purpose Godspeed language), not a mechanism — `run` does not care about the extension
+  general-purpose Godspeed language), not a mechanism - `run` does not care about the extension
   (extension-driven behaviour is the hidden magic §26.5 forbids; cf. `read` not auto-parsing).
 
 ## 3. Result and the summary
 
 `run` uses the command **`Result`** model (`32_result.md`): after every command it tracks
-`Ok`/`Err`, and prints a summary —
+`Ok`/`Err`, and prints a summary -
 
 ```
 run: ran N, failed M
@@ -53,23 +53,23 @@ run: ran N, failed M
 `run` itself is `Ok` iff **every** command was `Ok` (so `result` after a `run` tells you whether
 the whole script passed). Today a failing line is one that *errors* (a missing file, a bad
 column, …). Verifying *correct output* (not just "didn't error") is the job of a future
-**`assert`** — `… | assert contains X`, `assert fails read /nope` — which reads the same `Result`.
+**`assert`** - `… | assert contains X`, `assert fails read /nope` - which reads the same `Result`.
 
-## 4. Bounds & safety (loud, never silent — §26.6 / §3.12)
+## 4. Bounds & safety (loud, never silent - §26.6 / §3.12)
 
 - A script is one `fs` file, buffered whole; over `SCRIPT_MAX` (4 KiB) is reported, not silently
   truncated.
 - **Scripts cannot nest.** A `run` inside a script is refused (`run` at depth > 0). This is a
   hard rule, not a nicety: unbounded `run`-calls-`run` recursion would overflow the bounded user
-  stack (`execute`/`pipe_run` are `#[inline(never)]` so the per-line nesting stays shallow — the
+  stack (`execute`/`pipe_run` are `#[inline(never)]` so the per-line nesting stays shallow - the
   same stack discipline the record builders needed).
 - A missing script is `Err(FileNotFound)`; storage unavailable is `Err(Unknown)`.
 
 ## 5. Later (separate so it can grow)
 
-- **`assert`** — **built** (`utilities/34_assert.md`): `assert ok/fails <cmd>` and
+- **`assert`** - **built** (`utilities/34_assert.md`): `assert ok/fails <cmd>` and
   `… | assert contains X`, so a script self-verifies instead of being eyeballed.
-- **Image-baked `.gsh`** — **built**: `osdev script-disk <out> <script>` bakes a script into a
+- **Image-baked `.gsh`** - **built**: `osdev script-disk <out> <script>` bakes a script into a
   GSFS data disk host-side (`gsfs_add_file`); `dd` it to the data drive and `run /suite.gsh` on
   hardware, no on-device authoring. `osdev test script` proves the loop (incl. piped asserts).
 - Multi-line authoring on-device (a tiny editor, or newline-capable write).
@@ -77,7 +77,7 @@ column, …). Verifying *correct output* (not just "didn't error") is the job of
 ## 6. Implementation shape & conformance
 
 A shell built-in: reads the file via `fs` (op 11, like `read`), copies it off the `fs` reply,
-then runs each command through the same `execute()` the prompt uses — so pipes, record verbs,
+then runs each command through the same `execute()` the prompt uses - so pipes, record verbs,
 everything compose for free. Threads the per-line `Result` as local state (no global, §3.9).
 Conforms to `0_conventions.md`: its own `run help` / `run version` via the shared `help_block`,
 listed under **Console** in the top-level `help`.

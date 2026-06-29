@@ -11,7 +11,7 @@ Runtime enforcement of constitutional invariants (§3, §22).
 
 ## Philosophy
 
-These are not debug-only checks. They run in release builds. If one fires, the system is in a state the spec says cannot exist — panic is the correct response (§25: "If an identity test fails, the system is no longer this system").
+These are not debug-only checks. They run in release builds. If one fires, the system is in a state the spec says cannot exist - panic is the correct response (§25: "If an identity test fails, the system is no longer this system").
 
 ## When to add an assertion
 
@@ -28,7 +28,7 @@ Do NOT add assertions that:
 
 | Function                            | Invariant pinned               |
 |-------------------------------------|-------------------------------|
-| `assert_cap_validated`              | §3.1 — no ambient authority   |
+| `assert_cap_validated`              | §3.1 - no ambient authority   |
 | `assert_no_mid_execution_migration` | §3.11 / §9.1                  |
 | `assert_tcb_alive`                  | §6.2                          |
 | `assert_cap_table_consistent`       | §7.8                          |

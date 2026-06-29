@@ -1,18 +1,18 @@
-# Milestone 4 — Capability System ✅
+# Milestone 4 - Capability System ✅
 
 > Capability table enforces rights and generation checks on every syscall.
 
-**Status: COMPLETE** — 2026-05-09
+**Status: COMPLETE** - 2026-05-09
 
 Serial output:
 ```
 cap-test: starting capability enforcement tests
-cap-test: 2A pass — held cap validates OK
-cap-test: 2B pass — no cap returns CapNotHeld
-cap-test: 2C pass — wrong right returns CapInsufficientRights
-cap-test: revoke pass — stale cap returns CapRevoked
-cap-test: endpoint-dead pass — dead endpoint returns EndpointDead
-cap-test: grant pass — cap moved exactly once, sender empty
+cap-test: 2A pass - held cap validates OK
+cap-test: 2B pass - no cap returns CapNotHeld
+cap-test: 2C pass - wrong right returns CapInsufficientRights
+cap-test: revoke pass - stale cap returns CapRevoked
+cap-test: endpoint-dead pass - dead endpoint returns EndpointDead
+cap-test: grant pass - cap moved exactly once, sender empty
 cap-test: all tests passed
 ```
 
@@ -25,9 +25,9 @@ cap-test: all tests passed
 ## Global Resource Table
 
 - ✅ `GlobalResourceTable` tracks `(ResourceId → (Generation, Liveness))`
-- ✅ `revoke_resource(id)` — sets `Liveness::Revoked`, invalidates caps → `CapRevoked`
-- ✅ `mark_dead_resource(id)` — sets `Liveness::Dead`, invalidates caps → `EndpointDead`
-- ✅ `mint_cap(id, rights)` — mints a cap at the resource's current generation
+- ✅ `revoke_resource(id)` - sets `Liveness::Revoked`, invalidates caps → `CapRevoked`
+- ✅ `mark_dead_resource(id)` - sets `Liveness::Dead`, invalidates caps → `EndpointDead`
+- ✅ `mint_cap(id, rights)` - mints a cap at the resource's current generation
 
 ## Syscall Validation
 

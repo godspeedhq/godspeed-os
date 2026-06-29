@@ -10,7 +10,7 @@ Mirrors §22 (Tests 1–10 + IR1A/IR1B). Verifies constitutional invariants on r
 
 | Kind | Hardware status | Blocker |
 |------|----------------|---------|
-| `WatchSerial` | Verifiable now — read PuTTY log for expected strings | None |
+| `WatchSerial` | Verifiable now - read PuTTY log for expected strings | None |
 | `WithRestart` | Blocked | COM2 physical control port not yet wired |
 | `WithBadTcb` | Blocked | Needs a separate corrupt-TCB image build |
 
@@ -20,37 +20,37 @@ Mirrors §22 (Tests 1–10 + IR1A/IR1B). Verifies constitutional invariants on r
 
 | Test | Positive | Negative | Expected serial strings | HW status |
 |------|----------|----------|------------------------|-----------|
-| 1A — Bootstrap | ✓ | — | `kernel: 4 cores ready`, `supervisor: ready`, `registry: ready`, `logger: ready` | ✅ 2026-05-24 |
-| 2A — Cap held | ✓ | — | `cap-test: 2A pass` | ✅ 2026-05-24 |
-| 2B — No cap | — | ✓ | `cap-test: 2B pass` | ✅ 2026-05-24 |
-| 2C — Wrong right | — | ✓ | `cap-test: 2C pass` | ✅ 2026-05-24 |
-| 2D — Revoke | — | ✓ | `cap-test: revoke pass` | ✅ 2026-05-24 |
-| 2E — Endpoint dead | — | ✓ | `cap-test: endpoint-dead pass` | ✅ 2026-05-24 |
-| 2F — Grant | ✓ | — | `cap-test: grant pass` | ✅ 2026-05-24 |
-| 3A — IPC send | ✓ | — | `ipc-test: enqueue ok`, `ipc-test: dequeue ok` | ✅ 2026-05-24 |
-| 3B — IPC negative | — | ✓ | `ipc-test: queue-empty ok`, `ipc-test: queue-full ok`, `ipc-test: endpoint-dead ok` | ✅ 2026-05-24 |
-| 4A — EndpointDead | ✓ | — | `probe: 4A pass — EndpointDead after kill` | ✅ 2026-05-24 |
-| 5A — Grant positive | ✓ | — | `probe: 5A send OK` | ✅ 2026-05-24 |
-| 5B — Grant negative | — | ✓ | `probe: 5B pass — CapNotGrantable` | ✅ 2026-05-24 |
-| 3B probe — CapInsufficient | — | ✓ | `probe: 3B pass — CapInsufficientRights` | ✅ 2026-05-24 |
+| 1A - Bootstrap | ✓ | - | `kernel: 4 cores ready`, `supervisor: ready`, `registry: ready`, `logger: ready` | ✅ 2026-05-24 |
+| 2A - Cap held | ✓ | - | `cap-test: 2A pass` | ✅ 2026-05-24 |
+| 2B - No cap | - | ✓ | `cap-test: 2B pass` | ✅ 2026-05-24 |
+| 2C - Wrong right | - | ✓ | `cap-test: 2C pass` | ✅ 2026-05-24 |
+| 2D - Revoke | - | ✓ | `cap-test: revoke pass` | ✅ 2026-05-24 |
+| 2E - Endpoint dead | - | ✓ | `cap-test: endpoint-dead pass` | ✅ 2026-05-24 |
+| 2F - Grant | ✓ | - | `cap-test: grant pass` | ✅ 2026-05-24 |
+| 3A - IPC send | ✓ | - | `ipc-test: enqueue ok`, `ipc-test: dequeue ok` | ✅ 2026-05-24 |
+| 3B - IPC negative | - | ✓ | `ipc-test: queue-empty ok`, `ipc-test: queue-full ok`, `ipc-test: endpoint-dead ok` | ✅ 2026-05-24 |
+| 4A - EndpointDead | ✓ | - | `probe: 4A pass - EndpointDead after kill` | ✅ 2026-05-24 |
+| 5A - Grant positive | ✓ | - | `probe: 5A send OK` | ✅ 2026-05-24 |
+| 5B - Grant negative | - | ✓ | `probe: 5B pass - CapNotGrantable` | ✅ 2026-05-24 |
+| 3B probe - CapInsufficient | - | ✓ | `probe: 3B pass - CapInsufficientRights` | ✅ 2026-05-24 |
 
-### Blocked — WithRestart (COM2 required)
-
-| Test | Blocked by |
-|------|-----------|
-| 4B — Blocked sender wakes EndpointDead | No COM2 control port — probe-4b-recv never killed (`probe: 4B sender blocked` seen on serial — probe correctly blocked, waiting for kill) |
-| 6A — Supervisor restart positive | No COM2 control port |
-| 6B — Stale cap after restart | No COM2 control port |
-| 10A — Restart changes core | No COM2 control port |
-| 10B — Client reacquires after core change | No COM2 control port |
-| IR1A — Interrupt delivery | No COM2 control port — `FIRE_IRQ 33` command never sent |
-| IR1B — No-driver discard | No COM2 control port — `FIRE_IRQ 34` command never sent |
-
-### Blocked — WithBadTcb
+### Blocked - WithRestart (COM2 required)
 
 | Test | Blocked by |
 |------|-----------|
-| 1B — TCB failure panics | Needs `osdev image` to embed corrupted registry binary |
+| 4B - Blocked sender wakes EndpointDead | No COM2 control port - probe-4b-recv never killed (`probe: 4B sender blocked` seen on serial - probe correctly blocked, waiting for kill) |
+| 6A - Supervisor restart positive | No COM2 control port |
+| 6B - Stale cap after restart | No COM2 control port |
+| 10A - Restart changes core | No COM2 control port |
+| 10B - Client reacquires after core change | No COM2 control port |
+| IR1A - Interrupt delivery | No COM2 control port - `FIRE_IRQ 33` command never sent |
+| IR1B - No-driver discard | No COM2 control port - `FIRE_IRQ 34` command never sent |
+
+### Blocked - WithBadTcb
+
+| Test | Blocked by |
+|------|-----------|
+| 1B - TCB failure panics | Needs `osdev image` to embed corrupted registry binary |
 
 ## How to verify (WatchSerial tests)
 
@@ -65,7 +65,7 @@ Mirrors §22 (Tests 1–10 + IR1A/IR1B). Verifies constitutional invariants on r
 
 | Date | Tests run | Passed | Failed | Notes |
 |------|-----------|--------|--------|-------|
-| 2026-05-24 | 13 WatchSerial | 13 | 0 | identity-only build; all cap/IPC/probe WatchSerial tests pass; WithRestart (4B/6A/6B/10A/10B/IR1A/IR1B) blocked — no COM2; WithBadTcb (1B) blocked |
+| 2026-05-24 | 13 WatchSerial | 13 | 0 | identity-only build; all cap/IPC/probe WatchSerial tests pass; WithRestart (4B/6A/6B/10A/10B/IR1A/IR1B) blocked - no COM2; WithBadTcb (1B) blocked |
 
 ## Unblocking WithRestart
 

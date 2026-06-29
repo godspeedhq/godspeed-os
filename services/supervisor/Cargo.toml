@@ -11,7 +11,7 @@ path = "src/main.rs"
 # Spawn only the 15 identity-test probe services; skip property/fuzz/stress/perf/
 # adversarial/chaos probes.  Used by `osdev test identity` to keep the supervisor
 # spawn loop under 10 s on TCG so WithRestart tests have plenty of deadline margin.
-# Spawn only pong + ping — no probe services at all.  Used by `osdev image`
+# Spawn only pong + ping - no probe services at all.  Used by `osdev image`
 # (bare-metal USB) so core 0 is not loaded with harness-driven probes that
 # require the QEMU control port to complete (e.g. probe-4b, probe-hog).
 bare-metal = []
@@ -40,7 +40,7 @@ adv-only = []
 chaos-only = []
 # Spawn only the §22 fuzz probe services (F1/F2/F5/F6/F7/F8 + brutal BF1/BF2/BF5/
 # BF6/BF7/BF8, with pong/ping). All self-run and print "fuzz: F* pass" over serial
-# with no QEMU control port — safe for real hardware. F3/BF3 (ELF-loader fuzz) need
+# with no QEMU control port - safe for real hardware. F3/BF3 (ELF-loader fuzz) need
 # a separate kernel build (test-bad-elf); F4 is host-side contract validation only.
 # Used by `osdev image --mode fuzz` for a self-contained hardware fuzz run.
 fuzz-only = []
@@ -53,18 +53,18 @@ b2-only = []
 # Brutal-isolation equivalent of b2-only at higher iteration count.
 # Used by `osdev image --mode bp2-only`.
 bp2-only = []
-# Spawn only observe — no pong, no ping, no probe services.
+# Spawn only observe - no pong, no ping, no probe services.
 # Used by `osdev image --mode s8` for the S8 24-hour idle stability run:
 # kernel idles on all cores; observe reports system state every ~500 yields.
 idle-only = []
 # perf-iso: per-probe isolation builds for clean, uncontended T630 latency.
 # `perf-iso` is the umbrella (no ping/pong, no other probes); each `iso-bpN`
 # sub-feature pulls it in and selects exactly one brutal perf probe (+ partners).
-# bp5 covers BP5 (spawn) and BP6 (restart) — same probe. Used by
+# bp5 covers BP5 (spawn) and BP6 (restart) - same probe. Used by
 # `osdev image --mode iso-bp{3,5,7,9,10}`.
 # perf-iso is the generic single-probe isolation umbrella (no ping/pong, no other
 # probes). iso-s3/iso-s9 reuse it to isolate the cross-core STRESS tests (S3
-# thrash, S9 IPI storm) — pass/fail robustness runs without the restart-churn
+# thrash, S9 IPI storm) - pass/fail robustness runs without the restart-churn
 # probes (S2/S4/S10). Used by `osdev image --mode iso-s{3,9}`.
 perf-iso = []
 iso-bp3  = ["perf-iso"]
@@ -76,21 +76,21 @@ iso-s3   = ["perf-iso"]
 iso-s9   = ["perf-iso"]
 # iso-s5: isolate the S5 generation-integrity test (500 kill/respawn cycles of
 # stress-s5-victim) with no ping/pong and no competing restart-storm probes
-# (S2/S10), so it runs uncontended — a clean diagnostic for whether S5 is merely
+# (S2/S10), so it runs uncontended - a clean diagnostic for whether S5 is merely
 # starved under the full stress load or genuinely slow/stuck on its own.
 iso-s5   = ["perf-iso"]
 # iso-c7: isolate the C7 cross-core TLB-shootdown test (30 kill/respawn cycles of
 # chaos-c7-victim on core 2, driven by chaos-c7 on core 1) with no ping/pong and
-# no other probes — measures the uncontended per-cycle cost of the cross-core
+# no other probes - measures the uncontended per-cycle cost of the cross-core
 # kill → IPI → TLB-shootdown → respawn path (it ran ~52s/cycle under full chaos
 # load on the T630; this isolates whether that is coordination cost or contention).
 iso-c7   = ["perf-iso"]
 # iso-xsend: isolate a single cross-core try_send (sender core 1 → xsend-recv core 2,
-# receiver drains forever) with no ping/pong and nothing else — measures the bare
+# receiver drains forever) with no ping/pong and nothing else - measures the bare
 # one-way cross-core send cost (by-handle, tight, by-name) that C7's "send" section
 # conflated with sending to a just-killed victim. Attributes the cross-core premium.
 iso-xsend = ["perf-iso"]
-# iso-xlife: isolate cross-core task lifecycle — a controller (core 1) kills/respawns
+# iso-xlife: isolate cross-core task lifecycle - a controller (core 1) kills/respawns
 # a same-core victim (xlife-near, core 1) and a cross-core victim (xlife-far, core 2),
 # timing each kill/spawn. far−near isolates cross-core coordination from task creation;
 # attributes C7's ~1.04 s respawn. No ping/pong, nothing else.

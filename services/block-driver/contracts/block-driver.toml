@@ -8,7 +8,7 @@ limit   = "16MiB"
 [capabilities]
 # ATA secondary channel via kernel-mediated port I/O (docs/persistence.md §5):
 # command block 0x170-0x177 (+0x8) and the 0x376 control port (+0x1). No DMA,
-# no MMIO — a PIO driver is least-privilege by construction (§5.1).
+# no MMIO - a PIO driver is least-privilege by construction (§5.1).
 hw_pio    = ["0x170+0x8", "0x376+0x1"]
 log_write = true
 

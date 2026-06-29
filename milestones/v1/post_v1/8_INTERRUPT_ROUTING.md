@@ -1,4 +1,4 @@
-# Post-v1 Item 8 — Interrupt Routing to Userspace
+# Post-v1 Item 8 - Interrupt Routing to Userspace
 
 **Status:** ✅ Complete
 
@@ -15,12 +15,12 @@ and enqueue call inside `deliver()`.
 
 ## Spec reference
 
-**§12.2 Routing** — kernel IDT dispatches to `interrupt::route::deliver(irq)`, which
+**§12.2 Routing** - kernel IDT dispatches to `interrupt::route::deliver(irq)`, which
 enqueues an IPC message to the registered driver endpoint. If the driver is on a
 different core than the IRQ-receiving core, delivery uses the cross-core IPC path
 (IPI wake).
 
-**§12.3 Driver Capabilities** — `hw_interrupt = [N]` in a service contract causes the
+**§12.3 Driver Capabilities** - `hw_interrupt = [N]` in a service contract causes the
 kernel to call `interrupt::route::register(irq, endpoint)` at spawn time.
 
 ---
@@ -61,7 +61,7 @@ pub unsafe fn deliver(irq: u8) {
         // because it holds the endpoint spinlock for a bounded critical section.
         crate::ipc::routing::enqueue(ep, msg);
     }
-    // discard if no driver registered — driver may not have started yet
+    // discard if no driver registered - driver may not have started yet
 }
 ```
 
@@ -75,7 +75,7 @@ APIC so the interrupt line is re-armed. The APIC EOI register write belongs in
 
 `interrupt::route::register(irq, endpoint)` already exists but nothing calls it.
 The spawn path in `task/scheduler.rs` or `syscall/dispatch.rs` processes a service's
-contract capabilities at spawn time — the `hw_interrupt` capability must trigger a
+contract capabilities at spawn time - the `hw_interrupt` capability must trigger a
 `register()` call there.
 
 ### 5. Extend the spawn syscall to accept `hw_interrupt` caps
@@ -113,7 +113,7 @@ be done in the same pass.
 ## Implementation notes
 
 - `deliver()` is called with IF=0 (interrupts disabled). The enqueue must not block
-  — use `try_enqueue` semantics. If the driver's queue is full, discard the interrupt
+  - use `try_enqueue` semantics. If the driver's queue is full, discard the interrupt
   (same "loud failure, bounded behaviour" policy as a full IPC queue).
 - The APIC EOI must happen unconditionally (even on discard and even on full queue)
   or the interrupt line stays masked and the system hangs.
@@ -145,7 +145,7 @@ be done in the same pass.
 - **No generation check in interrupt delivery**: `enqueue_from_interrupt` skips the cap generation check because the kernel IDT is the sender, not a user task. Liveness is still checked (Dead endpoints discard).
 - **EOI through safe wrapper**: `arch::x86_64::interrupts::send_eoi()` hides `apic_send_eoi()` so `deliver()` needs no new `unsafe` block (grandfathered count stays at 1).
 - **Cross-core IPI handled by `wake_by_slot`**: The scheduler's `wake_by_slot` already sends a `WAKE_RECEIVER` IPI when the receiver is on a different core. No extra IPI logic needed in `deliver()`.
-- **Try-send on full queue**: Full queue = driver overloaded. Interrupt silently discarded. EOI still fires — the IRQ line must be re-armed regardless.
+- **Try-send on full queue**: Full queue = driver overloaded. Interrupt silently discarded. EOI still fires - the IRQ line must be re-armed regardless.
 
 ### Verification
 

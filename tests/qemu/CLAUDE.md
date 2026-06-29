@@ -6,8 +6,8 @@ All QEMU-based tests. Tests in this tree boot the OS in QEMU; they are integrati
 
 | Directory     | Purpose                                        | Status          |
 |---------------|------------------------------------------------|-----------------|
-| `identity/`   | Constitutional identity tests (§22) — 20/20 ✅ | Complete        |
-| `harness/`    | Shared QEMU launcher, serial reader, runner    | —               |
+| `identity/`   | Constitutional identity tests (§22) - 20/20 ✅ | Complete        |
+| `harness/`    | Shared QEMU launcher, serial reader, runner    | -               |
 | `perf/`       | Performance benchmarks (B1–B10, BP1–BP10)      | ✅ 10/10 + 10/10 brutal |
 | `property/`   | Property tests (P1–P10, §22)                   | Active          |
 | `fuzz/`       | Fuzz tests (F1–F8, §22)                        | Active          |
@@ -34,4 +34,4 @@ A test failing due to a compile error or harness bug is a test failure, not a ke
 
 ## KVM vs TCG
 
-The harness detects `/dev/kvm` at runtime. When KVM is available it passes `-enable-kvm -cpu host` to QEMU; otherwise it falls back silently to TCG. On GitHub Actions `ubuntu-latest` runners KVM has been available since 2023 — CI always runs KVM. On Windows, TCG is the only option; per-test timeouts are generous enough to cover worst-case TCG timing.
+The harness detects `/dev/kvm` at runtime. When KVM is available it passes `-enable-kvm -cpu host` to QEMU; otherwise it falls back silently to TCG. On GitHub Actions `ubuntu-latest` runners KVM has been available since 2023 - CI always runs KVM. On Windows, TCG is the only option; per-test timeouts are generous enough to cover worst-case TCG timing.
