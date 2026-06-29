@@ -1,5 +1,9 @@
 # Example: reply-server
 
+> **Verified by `osdev test reply-server`** - it spawns reply-server with its client `asker`, drives a
+> request carrying an embedded reply cap, and asserts `asker` logs `reply = N (echo OK)` (the reply
+> round-tripped back over the cap) and `reply-server: replied to a request`. Run it yourself to re-confirm.
+
 The **request/reply (RPC)** IPC pattern - the dominant shape of a real GodspeedOS service. A client
 sends a request and waits for an answer; the server does work and replies. `fs` and `block-driver`
 are exactly this. The capability twist: the server has no ambient way to call anyone back - it can
@@ -58,7 +62,8 @@ let _ = reply.payload_bytes();   // "echo me"
 
 (The SDK packages this exact dance as `ctx.request_with_reply("reply-server", &request)` - read it in
 `sdk/rust/src/service_context.rs` to see the same three steps, plus reply-cap reclamation on a failed
-send. The block above is spelled out so the mechanism is visible.)
+send. The block above is spelled out so the mechanism is visible.) The runnable client is
+`examples/asker`, spawned next to this server by `osdev test reply-server`.
 
 ## Why it is built this way (the Commandments)
 
@@ -107,9 +112,12 @@ the code block above (or call `ctx.request_with_reply`).
 
 ## Status
 
-A compilable **template**, like a driver skeleton: it builds and runs, but needs a client wired to be
-exercised. Standalone it blocks on `recv()` (idle) - its graceful degrade. The runnable proof of this
-pattern in production is `services/fs` and `services/block-driver`.
+**Real and QEMU-proven by `osdev test reply-server`.** Its client, `examples/asker`, is spawned
+alongside it; asker sends a request carrying an embedded reply cap, reply-server replies over that cap,
+and the test asserts the round-trip closed - asker logs `asker: reply = <N> (echo OK)` and reply-server
+logs `reply-server: replied to a request`, with no kernel panic. Standalone (no client wired) it still
+blocks on `recv()` (idle) - its graceful degrade. The runnable proof of this pattern in production is
+`services/fs` and `services/block-driver`.
 
 ## See also
 

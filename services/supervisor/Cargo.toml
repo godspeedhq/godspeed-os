@@ -24,6 +24,12 @@ blockdev = []
 # used by `osdev test counter`. Kept OUT of the daily-driver image and identity build (which use
 # `bare-metal` / `identity-only` without this) so counter's per-tick disk writes are test-only noise.
 counter-test = []
+# Additionally spawn `reply-server` + its client `asker` (examples/) on top of the bare-metal set.
+# `asker` sends `reply-server` a request carrying an embedded reply cap; reply-server replies over it;
+# the round-trip is asserted by `osdev test reply-server`. Kept OUT of the daily-driver image and
+# identity build (which use `bare-metal` / `identity-only` without this) so asker's per-tick RPC log
+# lines are test-only noise.
+reply-test = []
 identity-only = []
 # Spawn only the regular performance-benchmark probe services (perf-b1…perf-b10
 # and their echo/victim partners).  Used by `osdev test perf` to eliminate the

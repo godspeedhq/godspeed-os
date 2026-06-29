@@ -548,6 +548,35 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
+        // reply-server (examples/reply-server): the request/reply (RPC) SERVER. Owns its endpoint
+        // (clients send requests here) and has NO named send peer - it replies only over the reply
+        // capability each request embeds (§7.10/§8.5). Spawned only in the reply-test build (`osdev
+        // test reply-server`); idle/absent everywhere else - standalone it just blocks on recv().
+        "reply-server" => Some(("reply-server", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_REPLY_SERVER_ELF")),
+            has_recv_endpoint: true,            // clients send requests here; replies via embedded cap
+            send_peers:        &[],             // no named peer: it answers over the client's reply cap
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,        // round-robin (no [placement] in its contract)
+            probe_mode:        0,
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
+        // asker (examples/asker): the request/reply CLIENT that exercises reply-server. Owns its
+        // endpoint (reply-server replies there via the embedded reply cap) and sends to `reply-server`.
+        // Spawned only in the reply-test build (`osdev test reply-server`); idle/absent elsewhere.
+        "asker" => Some(("asker", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_ASKER_ELF")),
+            has_recv_endpoint: true,            // reply target (request_with_reply blocks on this endpoint)
+            send_peers:        &["reply-server"], // sends requests to reply-server; reacquired by name on EndpointDead
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,        // round-robin (no [placement] in its contract)
+            probe_mode:        0,
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
         // ----------------------------------------------------------------
         // Probe services - §22 Group A identity tests.
         // All use the same probe ELF; probe_mode selects the test behaviour.

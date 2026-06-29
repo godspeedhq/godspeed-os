@@ -2384,6 +2384,76 @@ fn digits_after(text: &str, marker: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
+/// `examples/reply-server` exercised by `examples/asker` - the request/reply (RPC) round-trip (§8,
+/// §8.9). Boots the bare-metal set + reply-server + asker (reply-test build). The pair runs
+/// autonomously: asker sends reply-server a request carrying an embedded REPLY capability,
+/// reply-server replies over that cap, and asker checks that the reply echoes the exact request it
+/// sent. No disk and no control channel - we only read COM1 and assert the round-trip happened.
+///
+/// THE PROOF is the line `asker: reply = <N> (echo OK)`: asker logs it only when a request it sent
+/// (with an embedded reply cap) came back from reply-server with the identical payload - i.e. the
+/// request reached the server AND its reply reached the client over the embedded cap. We also assert
+/// the server logged `reply-server: replied to a request`, and that the kernel never panicked.
+pub fn run_reply_server(image_path: &Path, smp: u32) {
+    let sc = crate::qemu::timeout_scale();
+    println!("reply-server: booting (smp={smp}) bare-metal + reply-server + asker; serial on COM1");
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{shell_port},server"),   // COM1: shell I/O + logs (QEMU waits for us)
+        "-serial",  "null",                                  // COM2: unused in this test
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("reply-server: QEMU launch failed at {qemu}: {e}"); std::process::exit(1); });
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => { eprintln!("reply-server: could not connect to serial {shell_port}"); child.kill().ok(); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone tcp stream");
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+
+    let mut pass = 0usize; let mut fail = 0usize; let mut cursor = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("reply-server: PASS - {}", $label); pass += 1; } else { println!("reply-server: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    // The reply-server comes up and parks on recv() (idle) until asker sends it a request.
+    check!(collect_until(&buf, &mut cursor, b"reply-server: ready", Duration::from_secs(60 * sc)).is_some(),
+           "reply-server came up and owns its endpoint");
+
+    // THE PROOF: asker sent a request carrying an embedded reply cap, reply-server replied over it,
+    // and the reply echoed the EXACT request payload - asker logs "(echo OK)" only then. One line is
+    // the whole round-trip (request reached the server AND its reply reached the client back).
+    let echo = collect_until(&buf, &mut cursor, b"(echo OK)", Duration::from_secs(60 * sc));
+    check!(echo.as_deref().map_or(false, |c| c.contains("asker: reply =")),
+           "asker got the reply back and it echoed the request (round-trip closed)");
+
+    // And the server logged that it answered a request over the embedded reply cap - the other half.
+    check!(collect_until(&buf, &mut cursor, b"reply-server: replied to a request", Duration::from_secs(20 * sc)).is_some(),
+           "reply-server replied to a request over the client's embedded cap");
+
+    let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    check!(!whole.contains("KERNEL PANIC"), "no kernel panic across the round-trip");
+    let _ = std::fs::write("build/tests/reply_server_serial.log", whole.as_bytes());
+
+    child.kill().ok(); child.wait().ok();
+    println!("\nreply-server: {pass} passed, {fail} failed");
+    if fail > 0 { std::process::exit(1); }
+}
+
 /// §22 Test 14 - file-as-capability (P2). Boot a pre-formatted disk, then run the shell's argless
 /// `fcap` command, which creates its own throwaway file, opens it as a real kernel capability, and
 /// self-checks every property: read/write via the cap, non-escalation (RO cap can't write at the

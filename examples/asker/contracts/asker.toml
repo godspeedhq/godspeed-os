@@ -1,0 +1,26 @@
+# Service contract for `asker` - the request/reply CLIENT (the request side of the RPC pattern;
+# `reply-server` is the reply side). The supervisor reads this at spawn and the kernel mints
+# EXACTLY these capabilities; `asker` can do ONLY what is listed here (Commandment VII).
+name    = "asker"
+version = "0.1.0"
+
+[resources.memory]
+# request = the minimum to START; limit = the most it may ever allocate. Past `limit` ->
+# AllocDenied (recoverable); touching unmapped memory -> page fault (fatal). CLAUDE.md §10.2-§10.4.
+request = "32MiB"
+limit   = "64MiB"
+
+[capabilities]
+# Explicit grants only - `asker` can do ONLY what is listed (Commandment VII, no ambient authority).
+# The FULL set of declarable capabilities is in `contracts/schema/service.schema.json` (validated by
+# `osdev validate`) and `contracts/CLAUDE.md`: ipc_send, ipc_receive, log_write, hw_mmio,
+# hw_interrupt, hw_pio (+ service_control, supervisor-only).
+ipc_send    = ["reply-server"]   # may SEND a request to reply-server (the peer it calls)
+ipc_receive = ["asker"]          # OWNS its endpoint - where reply-server sends the reply back. The
+                                 # reply cap asker embeds in each request is a SEND copy of THIS
+                                 # endpoint's cap (derived at runtime, granted per request, §8.5).
+log_write   = true               # may write to the logger
+
+# No [placement] section: the supervisor ROUND-ROBINS asker across the ready cores - the right
+# default. (Omitting does NOT mean "core 0".) A request/reply round-trip works the same on any core;
+# the kernel routes the reply to whatever core asker landed on (identity over location, Invariant 11).

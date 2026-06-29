@@ -20,6 +20,7 @@ members = [
     "examples/driver-skeleton",
     "examples/e1000",
     "examples/reply-server",
+    "examples/asker",
     "examples/resource-server",
     "examples/counter",
     "services/probe",

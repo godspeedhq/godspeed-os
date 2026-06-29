@@ -48,6 +48,8 @@ fn main() {
         ("BLOCK_DRIVER", "block-driver"),
         ("FS",         "fs"),
         ("COUNTER",    "counter"),  // examples/counter: stateful service, survives its own restart
+        ("REPLY_SERVER", "reply-server"), // examples/reply-server: request/reply (RPC) server
+        ("ASKER",      "asker"),    // examples/asker: the request/reply CLIENT that exercises reply-server
     ];
 
     for (env_name, bin_name) in services {

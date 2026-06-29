@@ -334,6 +334,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     #[cfg(feature = "counter-test")]
     ensure_wired(&ctx, &mut name_map, "counter", &["fs"]);
 
+    // reply-server + asker (examples/): the request/reply (RPC) pair. Spawned ONLY in the
+    // `reply-test` build (`osdev test reply-server`); idle/absent everywhere else. reply-server owns
+    // its endpoint and has no send peer (it replies over each request's embedded reply cap), so it is
+    // recorded in the name-cap map (ensure_mapped) and MUST precede asker - asker's SEND cap to
+    // reply-server is wired from the map at asker's spawn (like ping after pong). asker sends a
+    // request, reply-server replies, asker checks the echo (§8/§8.9). On a supervisor respawn
+    // ensure_* adopts the running instances instead of duplicating them.
+    #[cfg(feature = "reply-test")]
+    {
+        ensure_mapped(&ctx, &mut name_map, "reply-server", 0xFFFF);
+        ensure_wired(&ctx, &mut name_map, "asker", &["reply-server"]);
+    }
+
     // xhci: USB host-controller driver (§12). Spawned in bare-metal + full
     // builds; the kernel maps its controller's MMIO BAR at spawn (Stage 2).
     #[cfg(not(any(feature = "identity-only", feature = "perf-only",

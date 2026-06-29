@@ -23,7 +23,7 @@ so you learn the *rule*, see it enforced in code, and learn the failure it preve
 |---|---|---|
 | `00-hello` | The minimal service | **I** (it is a service, not a kernel change), **IV** (declares its needs via a contract), **VII** (gets only the caps it declares) |
 | `ping` / `pong` | Cross-core one-way IPC + restart/reacquire | **VI** (IPC, not shared memory), **V** (every service is restartable), **VIII** (the generation check settles the restart race, not a sleep), **IX** (reacquire by name + retry on `EndpointDead`) |
-| `reply-server` | Request/reply (RPC) + the deadlock rule | **VII** (the server replies only via the client's embedded reply cap), **VIII** (a send is queued, not processed; the reply uses non-blocking `try_send`, §8.9), **X** (request/reply is service policy; the kernel only routes) |
+| `reply-server` / `asker` | Request/reply (RPC) + the deadlock rule - server (`reply-server`) and its client (`asker`), paired like `pong`/`ping` | **VII** (the server replies only via the client's embedded reply cap), **VIII** (a send is queued, not processed; the reply uses non-blocking `try_send`, §8.9), **IX** (the client reacquires the server by name + retries), **X** (request/reply is service policy; the kernel only routes) |
 | `cap-grant` | Transfer a capability over IPC (the GRANT right) | **VII** (authority by capability + the GRANT right), **VI**, **IX**, **X** |
 | `resource-server` | Mint a delegated resource cap ("a file is a capability", §7.10) | **VII** (minting is gated, never ambient), **III** (the service owns the resource's meaning; the kernel tracks only an opaque id), **X** (kernel mints/routes/revokes; the service defines meaning) |
 | `greet` | Pipe **producer** (text) | **VI**, **VII** (authority granted at composition, not held), **X** (the shell brokers; the producer just produces) |
@@ -41,7 +41,7 @@ a bug, the bug already existed. Each `CLAUDE.md` notes this; it is the universal
 
 1. **`00-hello`** - the anatomy of a service: `Cargo.toml`, `build.rs`, the contract, `service_main`.
 2. **`ping` / `pong`** - one-way IPC and the canonical restart/reacquire pattern (Commandments V, VIII, IX).
-3. **`reply-server`** - the other IPC direction: request/reply (RPC) and the §8.9 deadlock rule.
+3. **`reply-server`** (+ its client **`asker`**) - the other IPC direction: request/reply (RPC) and the §8.9 deadlock rule. `osdev test reply-server` boots the pair and proves the round-trip.
 4. **`cap-grant`** - how authority *moves*: transferring a capability over IPC (the GRANT right).
 5. **`resource-server`** - how authority is *born*: minting a delegated resource cap ("a file is a capability", §7.10).
 6. **`greet` -> `upper` -> `roster`** - composition: capability-mediated pipes, ending with typed records.
@@ -53,7 +53,7 @@ a bug, the bug already existed. Each `CLAUDE.md` notes this; it is the universal
 These examples cover the full *vocabulary* of GodspeedOS, not a sample of cases:
 
 - a **service** (`00-hello`);
-- both **IPC directions** - one-way (`ping`/`pong`) and request/reply (`reply-server`);
+- both **IPC directions** - one-way (`ping`/`pong`) and request/reply (`reply-server` + its client `asker`);
 - all three **capability operations** - *use* (`hello`/`ping`), *transfer* (`cap-grant`), *mint* (`resource-server`);
 - **composition** (`greet` -> `upper` -> `roster`);
 - **state across restart** (`counter`);
