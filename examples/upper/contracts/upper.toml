@@ -1,0 +1,21 @@
+# Service contract for `upper` - a pipe-stage FILTER (examples/upper). It runs in the middle of a
+# shell pipe (e.g. `echo hi | upper | write /f`). The kernel mints EXACTLY these capabilities at spawn.
+name    = "upper"
+version = "0.1.0"
+
+[resources.memory]
+# request = the minimum to START; limit = the most it may ever allocate. Past `limit` ->
+# AllocDenied (recoverable); touching unmapped memory -> page fault (fatal). CLAUDE.md §10.2-§10.4.
+request = "32MiB"
+limit   = "64MiB"
+
+[capabilities]
+# A pipe FILTER declares only `log_write` and NO peers - neither `ipc_send` nor `ipc_receive`. The
+# lesson: it holds ZERO standing authority, and the SHELL brokers BOTH ends (Commandment VII). Its
+# INPUT arrives on its own endpoint, which the kernel name directory records under "upper" at spawn
+# (no self-registration); its OUTPUT goes over the SEND cap the shell delegates at spawn (send_peers[0],
+# via ctx.send_peer_at(0)). (`log_write` is a v1 default minted to every service; listed for clarity.)
+# Full capability list: contracts/schema/service.schema.json + contracts/CLAUDE.md.
+log_write = true   # the only STATIC capability a pipe stage needs (both pipe ends are brokered by the shell)
+
+# No [placement] section: round-robin across cores - the right default. CLAUDE.md §9.2/§13.2, contracts/CLAUDE.md.

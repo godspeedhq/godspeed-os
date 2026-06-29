@@ -37,10 +37,15 @@ handed the producer at composition time.
 
 ## The contract, annotated
 
-`greet` has **no `contracts/` directory and declares no send peers** - and that is the lesson,
-not an omission. A producer that declared a fixed peer would hold standing authority to reach
-it (a small violation of VII). Instead the shell delegates the SEND cap dynamically at spawn,
-installed as `send_peers[0]`. The only static capability a pipe stage needs is `log_write`.
+`greet` has a **minimal contract** (`examples/greet/contracts/greet.toml`) declaring **only
+`log_write` and - the lesson - no send peers** (no `ipc_send`). A producer that declared a fixed
+peer would hold standing authority to reach it (a small violation of VII). Instead the shell
+delegates the SEND cap dynamically at spawn, installed as `send_peers[0]` (reached via
+`ctx.send_peer_at(0)`); authority is granted at composition time, never held. `log_write` is itself
+a v1 default minted to every service - the contract lists it for clarity and consistency. Every
+service should have a contract (CLAUDE.md §13), so a minimal contract is the conformant, clearer way
+to teach "no standing send authority": the contract is *present*, and it pointedly grants nothing to
+send with.
 
 ## What you must NOT do
 

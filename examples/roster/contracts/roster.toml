@@ -1,0 +1,23 @@
+# Service contract for `roster` - a pipe-stage RECORD PRODUCER (examples/roster). It emits a typed
+# `Table` over the binary record codec into a shell pipe (e.g. `roster | where role=core`). The
+# kernel mints EXACTLY these capabilities at spawn.
+name    = "roster"
+version = "0.1.0"
+
+[resources.memory]
+# request = the minimum to START; limit = the most it may ever allocate. Past `limit` ->
+# AllocDenied (recoverable); touching unmapped memory -> page fault (fatal). CLAUDE.md §10.2-§10.4.
+request = "32MiB"
+limit   = "64MiB"
+
+[capabilities]
+# Like `greet`, a record producer declares only `log_write` and NO send peers (no `ipc_send`): zero
+# standing authority to send (Commandment VII); its only way out is the SEND cap the SHELL delegates
+# at spawn (send_peers[0], via ctx.send_peer_at(0)). The record typing/codec is pure SDK
+# (sdk/rust/src/record.rs) and needs NO extra capability and NO kernel change - so a record producer
+# is no more privileged than `greet` (Commandment X / §4.4). (`log_write` is a v1 default minted to
+# every service; listed for clarity.) Full capability list: contracts/schema/service.schema.json +
+# contracts/CLAUDE.md.
+log_write = true   # the only STATIC capability a pipe stage needs (the pipe SEND cap is delegated)
+
+# No [placement] section: round-robin across cores - the right default. CLAUDE.md §9.2/§13.2, contracts/CLAUDE.md.

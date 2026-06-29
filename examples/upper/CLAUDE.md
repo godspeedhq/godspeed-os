@@ -38,11 +38,16 @@ That is composition without coupling.
 
 ## The contract, annotated
 
-`upper` has **no `contracts/` directory and declares no send peers**. Its only standing capability
-is `log_write`. The input endpoint is named by the kernel directory at spawn; the output SEND cap
-is delegated by the shell at spawn (`send_peers[0]`). Declaring a fixed downstream peer would be
-held authority (a small breach of **VII**) and would freeze the stage into one position in one
-chain - exactly what a composable filter must avoid.
+`upper` has a **minimal contract** (`examples/upper/contracts/upper.toml`) declaring **only
+`log_write` and no send peers** (no `ipc_send`). Its input endpoint is named by the kernel name
+directory at spawn, so it declares no `ipc_receive` either; the output SEND cap is delegated by the
+shell at spawn (`send_peers[0]`, via `ctx.send_peer_at(0)`). The shell brokers **both** ends, so the
+filter holds zero standing authority. Declaring a fixed downstream peer would be held authority (a
+small breach of **VII**) and would freeze the stage into one position in one chain - exactly what a
+composable filter must avoid. `log_write` is itself a v1 default minted to every service - the
+contract lists it for clarity and consistency. Every service should have a contract (CLAUDE.md §13),
+so a minimal contract is the conformant, clearer way to teach "no standing send authority" than
+omitting the contract: it is *present*, and it pointedly grants nothing to send with.
 
 ## What you must NOT do
 

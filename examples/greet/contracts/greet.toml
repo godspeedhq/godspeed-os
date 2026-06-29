@@ -1,0 +1,23 @@
+# Service contract for `greet` - a pipe-stage PRODUCER (examples/greet). It runs as a stage of a
+# shell pipe (e.g. `greet | upper`). The kernel mints EXACTLY these capabilities at spawn.
+name    = "greet"
+version = "0.1.0"
+
+[resources.memory]
+# request = the minimum to START; limit = the most it may ever allocate. Past `limit` ->
+# AllocDenied (recoverable); touching unmapped memory -> page fault (fatal). CLAUDE.md §10.2-§10.4.
+request = "32MiB"
+limit   = "64MiB"
+
+[capabilities]
+# A pipe stage declares only `log_write` and - the lesson - NO send peers (no `ipc_send`). A producer
+# holds ZERO standing authority to send to anyone (Commandment VII); its only way to send is the SEND
+# cap the SHELL delegates at spawn (installed as send_peers[0], reached via ctx.send_peer_at(0)) -
+# authority granted at COMPOSITION time, not held. (`log_write` itself is a v1 default minted to every
+# service; it is listed here for clarity and consistency.) The full set of declarable capabilities is
+# in contracts/schema/service.schema.json + contracts/CLAUDE.md (ipc_send, ipc_receive, log_write,
+# hw_mmio, hw_interrupt, hw_pio, service_control).
+log_write = true   # the only STATIC capability a pipe stage needs (the pipe SEND cap is delegated)
+
+# No [placement] section: the supervisor/shell round-robins the stage across cores - the right
+# default. CLAUDE.md §9.2/§13.2, contracts/CLAUDE.md.

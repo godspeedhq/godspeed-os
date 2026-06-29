@@ -40,10 +40,15 @@ the stream straight back into a `Table`, so `where`/`select`/`sort` work on a ge
 
 ## The contract, annotated
 
-`roster` has **no `contracts/` directory and declares no send peers**; its only standing capability
-is `log_write`. The SEND cap to the sink is delegated by the shell at spawn (`send_peers[0]`). The
-record machinery needs **no** extra capability and **no** kernel change - it is pure SDK, so a
-record producer is no more privileged than `greet`.
+`roster` has a **minimal contract** (`examples/roster/contracts/roster.toml`) declaring **only
+`log_write` and no send peers** (no `ipc_send`): zero standing authority to send. The SEND cap to the
+sink is delegated by the shell at spawn (`send_peers[0]`, via `ctx.send_peer_at(0)`) - authority
+granted at composition time, never held (Commandment VII). The record machinery needs **no** extra
+capability and **no** kernel change - it is pure SDK, so a record producer is no more privileged than
+`greet`. `log_write` is itself a v1 default minted to every service - the contract lists it for
+clarity and consistency. Every service should have a contract (CLAUDE.md §13), so a minimal contract
+is the conformant, clearer way to teach "no standing send authority" than omitting the contract: it
+is *present*, and it pointedly grants nothing to send with.
 
 ## What you must NOT do
 
