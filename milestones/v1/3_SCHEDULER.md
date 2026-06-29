@@ -1,4 +1,4 @@
-# Milestone 3 — Scheduler (Single Core)
+# Milestone 3 — Scheduler (Single Core) ✅
 
 > Per-core run queue, context switching, and timer preemption working on one core.
 

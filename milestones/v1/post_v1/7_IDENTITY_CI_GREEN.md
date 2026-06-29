@@ -1,4 +1,4 @@
-# Post-v1 Item 7 — Identity CI Green (20/20)
+# Post-v1 Item 7 — Identity CI Green (20/20) ✅
 
 **Goal:** All 20 identity tests pass consistently in GitHub Actions CI.
 

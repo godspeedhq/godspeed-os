@@ -1,4 +1,4 @@
-# Milestone 9 — Property Test Suite
+# Milestone 9 — Property Test Suite ✅
 
 > Property tests assert *universal* claims over randomised inputs.
 > Identity tests prove the system *can* satisfy each invariant; property tests

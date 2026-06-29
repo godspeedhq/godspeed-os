@@ -1,4 +1,4 @@
-# Milestone 8 — Identity Test Suite (§22)
+# Milestone 8 — Identity Test Suite (§22) ✅
 
 > Build and run the §22 identity test suite.
 > `osdev test identity` reports each test as PASS, FAIL, or BLOCKED.

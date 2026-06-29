@@ -1,4 +1,4 @@
-# Milestone 1 — Boot Visibility
+# Milestone 1 — Boot Visibility ✅
 
 > Kernel boots in QEMU and writes to the serial console. No services yet.
 

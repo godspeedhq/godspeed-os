@@ -1,4 +1,4 @@
-# Milestone 4 — Capability System
+# Milestone 4 — Capability System ✅
 
 > Capability table enforces rights and generation checks on every syscall.
 

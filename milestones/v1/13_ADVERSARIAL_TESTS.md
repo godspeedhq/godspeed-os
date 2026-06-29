@@ -1,4 +1,4 @@
-# Milestone 13 — Adversarial / Red-Team Tests
+# Milestone 13 — Adversarial / Red-Team Tests ✅
 
 **Status:** [x] 10/10 implemented — all pass
 **Spec ref:** §22 Adversarial / Red-Team Test

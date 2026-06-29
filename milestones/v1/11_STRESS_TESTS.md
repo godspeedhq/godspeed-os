@@ -1,4 +1,4 @@
-# Milestone 11: Stress Tests (§22 Stress)
+# Milestone 11: Stress Tests (§22 Stress) ✅
 
 ## Goal
 

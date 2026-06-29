@@ -1,4 +1,4 @@
-# Milestone 2 — Memory Management
+# Milestone 2 — Memory Management ✅
 
 > Physical frame allocator and page tables working. Kernel can hand out and reclaim memory.
 

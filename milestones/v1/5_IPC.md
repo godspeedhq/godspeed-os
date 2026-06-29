@@ -1,4 +1,4 @@
-# Milestone 5 — IPC (Same Core)
+# Milestone 5 — IPC (Same Core) ✅
 
 > `send`/`recv`/`try_send` working between two tasks on the same core.
 

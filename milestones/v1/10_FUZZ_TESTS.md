@@ -1,4 +1,4 @@
-# Milestone 10: Fuzz Tests (§22 Fuzz)
+# Milestone 10: Fuzz Tests (§22 Fuzz) ✅
 
 ## Goal
 
