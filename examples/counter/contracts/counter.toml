@@ -1,0 +1,26 @@
+# Service contract for `counter` - a STATEFUL service that survives its own restart by persisting
+# state externally to `fs` (CLAUDE.md §14 restart, §15 state/persistence). The supervisor reads this
+# at spawn and the kernel mints EXACTLY these capabilities (Commandment VII, no ambient authority).
+name    = "counter"
+version = "0.1.0"
+
+[resources.memory]
+# request = the minimum to START; limit = the most it may ever allocate. Past `limit` ->
+# AllocDenied (recoverable); touching unmapped memory -> page fault (fatal). CLAUDE.md §10.2-§10.4.
+request = "32MiB"
+limit   = "64MiB"
+
+[capabilities]
+# Explicit grants only - this service can do ONLY what is listed (Commandment VII, no ambient
+# authority). The FULL set of declarable capabilities is in `contracts/schema/service.schema.json`
+# (validated by `osdev validate`) and `contracts/CLAUDE.md`. The options are: ipc_send,
+# ipc_receive, log_write, hw_mmio, hw_interrupt, hw_pio (+ service_control, supervisor-only).
+ipc_send    = ["fs"]        # send file-API ops (read/write /counter.dat) to the fs service
+ipc_receive = ["counter"]   # OWNS its endpoint - fs replies here (load needs the reply round-trip)
+log_write   = true          # may write progress + recovery messages to the logger
+
+# No [placement] section - omit it (as here) and the supervisor ROUND-ROBINS this service across
+# the ready cores: the right default for almost every service. (Omitting does NOT mean "core 0".)
+# Pin a core only with a real reason (cross-core parallelism, a driver's interrupt locality, or
+# isolation) by adding `[placement]` with `core = N` (0-15); a pin is STRICT (honored, never
+# rerouted; an unavailable core rejects the spawn). CLAUDE.md §9.2/§13.2, contracts/CLAUDE.md.

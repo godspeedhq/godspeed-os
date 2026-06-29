@@ -1,0 +1,11 @@
+[package]
+name = "reply-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "reply-server"
+path = "src/main.rs"
+
+[dependencies]
+godspeed-sdk = { path = "../../sdk/rust" }

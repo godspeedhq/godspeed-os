@@ -21,14 +21,17 @@ so you learn the *rule*, see it enforced in code, and learn the failure it preve
 
 | Example | What it is | Commandments it teaches |
 |---|---|---|
-| `ping` / `pong` | Cross-core IPC + restart/reacquire | **VI** (IPC, not shared memory), **V** (every service is restartable), **VIII** (the generation check settles the restart race, not a sleep), **IX** (reacquire by name + retry on `EndpointDead`) |
+| `00-hello` | The minimal service | **I** (it is a service, not a kernel change), **IV** (declares its needs via a contract), **VII** (gets only the caps it declares) |
+| `ping` / `pong` | Cross-core one-way IPC + restart/reacquire | **VI** (IPC, not shared memory), **V** (every service is restartable), **VIII** (the generation check settles the restart race, not a sleep), **IX** (reacquire by name + retry on `EndpointDead`) |
+| `reply-server` | Request/reply (RPC) + the deadlock rule | **VII** (the server replies only via the client's embedded reply cap), **VIII** (a send is queued, not processed; the reply uses non-blocking `try_send`, §8.9), **X** (request/reply is service policy; the kernel only routes) |
+| `cap-grant` | Transfer a capability over IPC (the GRANT right) | **VII** (authority by capability + the GRANT right), **VI**, **IX**, **X** |
+| `resource-server` | Mint a delegated resource cap ("a file is a capability", §7.10) | **VII** (minting is gated, never ambient), **III** (the service owns the resource's meaning; the kernel tracks only an opaque id), **X** (kernel mints/routes/revokes; the service defines meaning) |
 | `greet` | Pipe **producer** (text) | **VI**, **VII** (authority granted at composition, not held), **X** (the shell brokers; the producer just produces) |
 | `upper` | Pipe **filter** (transform) | **VI**, **VII**, **X** |
 | `roster` | Pipe **record producer** (typed `Table`) | **III** (the table is the one truth; JSON/grid are derived views), **VI**, **VII**, **X** |
-| `00-hello` *(planned)* | The minimal service | **I** (it is a service, not a kernel change), **IV** (declares its needs via a contract), **VII** (gets only the caps it declares) |
-| `cap-grant` *(planned)* | Mint a cap, grant it over IPC | **VII** (authority by capability + the GRANT right), **VI**, **X** |
-| `driver-skeleton` *(planned)* | A userspace driver (MMIO/DMA/IRQ), `unsafe`-free | **I** + **X** (a driver is a service; `unsafe` isolated to the SDK), **VII** (only the granted MMIO + IRQ), **VI** (an owned DMA arena), **V** + **IX** (restartable, re-inits on spawn), **VIII** (wait on the interrupt, not a sleep) |
-| `e1000` *(planned)* | A real minimal NIC driver that runs in QEMU | same as `driver-skeleton`, proven against actual hardware |
+| `counter` | Restart-with-state: persist to `fs`, recover on spawn | **V** (restartable like any service), **IX** (persist externally, reconstruct on startup), **VIII** (load the persisted truth), **III** (`fs` owns the durable copy) |
+| `driver-skeleton` | A userspace driver (MMIO/DMA/IRQ), `unsafe`-free | **I** + **X** (a driver is a service; `unsafe` isolated to the SDK), **VII** (only the granted MMIO + IRQ), **VI** (an owned DMA arena), **V** + **IX** (restartable, re-inits on spawn), **VIII** (wait on the interrupt, not a sleep) |
+| `e1000` | A real minimal NIC driver that runs in QEMU | same as `driver-skeleton`, proven against actual hardware |
 
 **Cross-cutting: Commandment II (love Chaos).** *Every* service here, before it is "done", must
 survive `chaos max-carnage` - kill storms, flood storms, mem pressure, spawn storms. If Chaos finds
@@ -37,17 +40,28 @@ a bug, the bug already existed. Each `CLAUDE.md` notes this; it is the universal
 ## Start here (reading order)
 
 1. **`00-hello`** - the anatomy of a service: `Cargo.toml`, `build.rs`, the contract, `service_main`.
-2. **`ping` / `pong`** - IPC and the canonical restart/reacquire pattern (Commandments V, VIII, IX).
-3. **`cap-grant`** - how authority moves: minting and granting a capability.
-4. **`greet` -> `upper` -> `roster`** - composition: capability-mediated pipes, ending with typed records.
-5. **`driver-skeleton` -> `e1000`** - driving hardware as an ordinary, restartable, least-privilege service.
+2. **`ping` / `pong`** - one-way IPC and the canonical restart/reacquire pattern (Commandments V, VIII, IX).
+3. **`reply-server`** - the other IPC direction: request/reply (RPC) and the §8.9 deadlock rule.
+4. **`cap-grant`** - how authority *moves*: transferring a capability over IPC (the GRANT right).
+5. **`resource-server`** - how authority is *born*: minting a delegated resource cap ("a file is a capability", §7.10).
+6. **`greet` -> `upper` -> `roster`** - composition: capability-mediated pipes, ending with typed records.
+7. **`counter`** - state that survives restart: persist via `fs`, reconstruct on spawn (Commandments V, IX).
+8. **`driver-skeleton` -> `e1000`** - driving hardware as an ordinary, restartable, least-privilege service.
 
-## Planned follow-ups
+## The set is complete
 
-`00-hello`, `cap-grant`, `driver-skeleton`, and the real `e1000` driver are in progress. A
-`resource-server` (delegated resource capabilities - the same mechanism that makes a file a
-capability, §7.10) and a `persistent-service` (persist via `fs`, recover on restart - Commandments
-V/IX) are the next additions.
+These examples cover the full *vocabulary* of GodspeedOS, not a sample of cases:
+
+- a **service** (`00-hello`);
+- both **IPC directions** - one-way (`ping`/`pong`) and request/reply (`reply-server`);
+- all three **capability operations** - *use* (`hello`/`ping`), *transfer* (`cap-grant`), *mint* (`resource-server`);
+- **composition** (`greet` -> `upper` -> `roster`);
+- **state across restart** (`counter`);
+- and **hardware** (`driver-skeleton` -> `e1000`).
+
+Because the system is small on purpose, there is no fourth IPC direction or fifth capability
+operation waiting to be shown. Past this point you are writing *variations*, not new lessons - which
+is exactly the point: a small, complete set beats a large one.
 
 ## The rules every example obeys (the short version)
 

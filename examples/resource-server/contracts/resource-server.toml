@@ -1,0 +1,31 @@
+# Service contract for `resource-server` - demonstrates MINTING delegated resource capabilities
+# (§7.10, "a file is a capability"). The supervisor reads this at spawn and the kernel mints
+# EXACTLY these capabilities (Commandment VII, no ambient authority).
+name    = "resource-server"
+version = "0.1.0"
+
+[resources.memory]
+# request = the minimum to START; limit = the most it may ever allocate. Past `limit` ->
+# AllocDenied (recoverable); touching unmapped memory -> page fault (fatal). CLAUDE.md §10.2-§10.4.
+request = "32MiB"
+limit   = "64MiB"
+
+[capabilities]
+# Explicit grants only - this service can do ONLY what is listed (Commandment VII, no ambient
+# authority). The FULL set of declarable capabilities is in `contracts/schema/service.schema.json`
+# (validated by `osdev validate`) and `contracts/CLAUDE.md`. The options are: ipc_send,
+# ipc_receive, log_write, hw_mmio, hw_interrupt, hw_pio (+ service_control, supervisor-only).
+ipc_receive = ["resource-server"]  # OWNS its endpoint - a cap holder's `resource_invoke` is routed here, badged
+log_write   = true                 # may write to the logger
+
+# IMPORTANT: the authority to MINT resources (RESOURCE_MINT) is NOT a contract capability field -
+# it is not in the schema and cannot be requested here. Like a driver's MMIO BAR, it is granted BY
+# NAME inside the kernel, only to authorized minters (today: `fs`); see examples/e1000 for that same
+# by-name kernel-grant mechanism. Without that grant `ctx.resource_mint` returns None and this
+# example idles (graceful degrade, §7.10 / §3.12). Enabling this example for real means adding that
+# kernel grant for the name "resource-server" - exactly as the e1000 example adds its BAR hook.
+
+# No [placement] section - omit it (as here) and the supervisor ROUND-ROBINS this service across the
+# ready cores: the right default for almost every service. (Omitting does NOT mean "core 0".) Pin a
+# core only with a real reason by adding `[placement]` with `core = N` (0-15); a pin is STRICT
+# (honored, never rerouted; an unavailable core rejects the spawn). CLAUDE.md §9.2/§13.2.
