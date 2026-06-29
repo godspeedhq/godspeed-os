@@ -6,7 +6,7 @@ Demonstration service - sends one message to `pong` per second (§23.1).
 
 - Pinned to Core 0.
 - `osdev logs ping` shows a send every second.
-- After `osdev restart pong`, ping sees `EndpointDead`, looks up via the **registry service** (H11: `reacquire_via_registry("pong")`), and continues.
+- After `osdev restart pong`, ping sees `EndpointDead`, reacquires pong by name through the **kernel name directory** (`reacquire_via_registry("pong")`, a thin shim over `reacquire_cap` - the registry service is retired, naming Path C / Phase 4), and continues.
 - The resumed send crosses to whatever core pong landed on - transparently.
 
 ## Spawn order
@@ -21,11 +21,11 @@ This service demonstrates the canonical client pattern for handling service rest
 loop:
   result = try_send("pong", msg)
   if EndpointDead:
-    log("pong endpoint dead, reacquiring via registry service")
-    reacquire_via_registry("pong")   // lookup via the registry service; updates the
-                                     // named-peer cache so try_send("pong") uses the
-                                     // fresh cap (possibly on a new core). Retries on a
-                                     // later tick if pong has not re-registered yet.
+    log("pong endpoint dead, reacquiring via the kernel name directory")
+    reacquire_via_registry("pong")   // a thin shim over reacquire_cap (syscall 10): looks pong up
+                                     // in the kernel NAME DIRECTORY and updates the named-peer cache
+                                     // so try_send("pong") uses the fresh cap (possibly on a new
+                                     // core). NOT a registry service - that is retired (Path C).
     log("pong cap reacquired, resuming")
     retry
   if QueueFull:
@@ -41,5 +41,5 @@ The following strings appear on the serial console and are matched by validator 
 | String                                          | Test    |
 |-------------------------------------------------|---------|
 | `"ping: sent 20 messages"`                      | 8B      |
-| `"ping: pong endpoint dead, reacquiring via registry service"` | 6B, 10B |
+| `"ping: pong endpoint dead, reacquiring via the kernel name directory"` | 6B, 10B |
 | `"ping: pong cap reacquired, resuming"`         | 6B, 10B |

@@ -51,8 +51,9 @@ limit   = "64MiB"   # maximum it may ever allocate (AllocDenied past this)
 [capabilities]
 log_write = true    # the ONLY authority hello holds: write to the logger
 
-[placement]
-core = 0            # pin to core 0 (omit this section for round-robin placement)
+# No [placement] section: omitting it (as hello does) makes the supervisor ROUND-ROBIN the service
+# across the ready cores - the right default. (Omitting does NOT mean "core 0".) Pin a core only with
+# a real reason: cross-core parallelism, a driver's interrupt locality, or isolation.
 ```
 
 Read the contract as a request, not a grant: the developer says what the service needs; the OS decides

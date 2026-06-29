@@ -30,12 +30,10 @@ limit   = "64MiB"
 # Declare the MINIMUM your service needs - that minimum IS its security boundary.
 log_write = true   # the ONLY authority hello holds
 
-[placement]
-# OPTIONAL. Omit this whole section and the supervisor ROUND-ROBINS the service across the
-# ready cores - the right default for almost every service, and what you should normally do.
-# (Omitting does NOT mean "core 0"; it means "supervisor, spread me out.") Set `core = N`
-# (0-15) ONLY when you have a real reason to PIN: cross-core parallelism (see ping/pong),
-# a driver's interrupt locality (see driver-skeleton/e1000), or isolation. A pin is STRICT:
-# the supervisor honors it and never silently reroutes (Commandment IV); if core N is
-# unavailable the spawn is REJECTED (PlacementInvalid), not moved. CLAUDE.md §9.2/§13.2.
-core = 0   # pinned ONLY so this example's output is deterministic; a real first service should OMIT this section
+# No [placement] section - and that is deliberate. Omit it (as here) and the supervisor
+# ROUND-ROBINS this service across the ready cores: the right default for almost every service,
+# and what a first service should do. (Omitting does NOT mean "core 0"; it means "supervisor,
+# spread me out.") Pin a core only with a real reason - cross-core parallelism (see examples/ping),
+# a driver's interrupt locality (see examples/driver-skeleton and examples/e1000), or isolation -
+# by adding a `[placement]` section with `core = N` (0-15); the supervisor then STRICTLY honors it
+# (never reroutes; an unavailable core rejects the spawn). CLAUDE.md §9.2/§13.2, contracts/CLAUDE.md.

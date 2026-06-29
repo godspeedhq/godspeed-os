@@ -1,7 +1,7 @@
 //! `ping` - sends a message to `pong` on every scheduler tick.
 //!
 //! Pinned to Core 0 (§23.1). On `EndpointDead`, reacquires a fresh SEND cap
-//! via the kernel name registry and resumes (§14.2, test 10).
+//! via the kernel name directory and resumes (§14.2, test 10).
 
 #![no_std]
 #![no_main]
@@ -28,7 +28,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 }
             }
             Err(IpcError::EndpointDead) => {
-                ctx.log("ping: pong endpoint dead, reacquiring via registry service");
+                ctx.log("ping: pong endpoint dead, reacquiring via the kernel name directory");
                 if ctx.reacquire_via_registry("pong") {
                     ctx.log("ping: pong cap reacquired, resuming");
                 } else {

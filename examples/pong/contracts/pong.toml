@@ -13,8 +13,10 @@ limit   = "64MiB"
 # Explicit grants only (Commandment VII). The FULL set of declarable capabilities is in
 # `contracts/schema/service.schema.json` (validated by `osdev validate`) and `contracts/CLAUDE.md`:
 # ipc_send, ipc_receive, log_write, hw_mmio, hw_interrupt, hw_pio (+ service_control, supervisor-only).
+# pong is a PURE RECEIVER (recv + log), so it declares NO ipc_send. The kernel name directory
+# records "pong" at spawn (and refreshes it on restart), so clients reacquire it by name through
+# the directory with no push from pong - the registry service is retired (naming Path C / Phase 4).
 ipc_receive = ["pong"]        # OWNS and receives on its own "pong" endpoint
-ipc_send    = ["registry"]    # may SEND to registry (to register its endpoint under its name)
 log_write   = true            # may write to the logger
 
 # No [placement] section: the supervisor ROUND-ROBINS pong across the ready cores - the right
