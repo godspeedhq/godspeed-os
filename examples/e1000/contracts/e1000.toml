@@ -1,17 +1,27 @@
+# Service contract for `e1000` - a real, read-only Intel e1000 NIC driver example. The supervisor
+# reads this at spawn and the kernel mints EXACTLY these capabilities (Commandment VII).
 name    = "e1000"
 version = "0.1.0"
 
 [resources.memory]
+# request = the minimum to START; limit = the most it may ever allocate. Past `limit` ->
+# AllocDenied (recoverable); touching unmapped memory -> page fault (fatal). CLAUDE.md §10.2-§10.4.
 request = "8MiB"
 limit   = "16MiB"
 
 [capabilities]
-# The kernel maps this driver's NIC BAR (MMIO) at spawn IF the discovered NIC is a
-# real Intel e1000 - granting a hardware capability is a kernel act (Commandment VII),
-# wired by name in kernel/src/task/mod.rs exactly like the xhci/ehci/block-driver
-# controllers. This read-only example needs no DMA arena and no hw_interrupt; a full
-# NIC driver would declare both.
-log_write = true
+# Explicit grants only (Commandment VII). The FULL set of declarable capabilities is in
+# `contracts/schema/service.schema.json` (validated by `osdev validate`) and `contracts/CLAUDE.md`:
+# ipc_send, ipc_receive, log_write, hw_mmio, hw_interrupt, hw_pio (+ service_control, supervisor-only).
+#
+# This driver declares NO hw_mmio: its NIC BAR is granted by the kernel BY NAME at spawn - the
+# same mechanism the xhci/ehci/block-driver controllers use (kernel/src/task/mod.rs), gated on
+# the discovered NIC actually being an Intel e1000. Reach it via ctx.mmio(). A read-only driver
+# needs no DMA arena and no hw_interrupt; a full NIC driver would add both (see driver-skeleton).
+log_write = true   # may write to the logger
 
 [placement]
-core = 1
+# OPTIONAL (omit -> the supervisor round-robins across cores). A driver usually pins for
+# interrupt locality (§12.2). A pin is STRICT: honored, never rerouted; an unavailable core
+# REJECTS the spawn. core is 0-15. CLAUDE.md §9.2/§13.2.
+core = 1   # a driver pins for interrupt locality (harmless here: this read-only example takes no interrupt)

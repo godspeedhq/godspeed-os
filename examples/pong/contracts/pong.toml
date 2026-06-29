@@ -1,14 +1,25 @@
+# Service contract for `pong` - the demo server. The supervisor reads this at spawn and the
+# kernel mints EXACTLY these capabilities; `pong` can do only what is listed here (Commandment VII).
 name    = "pong"
 version = "0.1.0"
 
 [resources.memory]
+# request = the minimum to START; limit = the most it may ever allocate. Past `limit` ->
+# AllocDenied (recoverable); touching unmapped memory -> page fault (fatal). CLAUDE.md §10.2-§10.4.
 request = "32MiB"
 limit   = "64MiB"
 
 [capabilities]
-ipc_receive = ["pong"]
-ipc_send    = ["registry"]
-log_write   = true
+# Explicit grants only (Commandment VII). The FULL set of declarable capabilities is in
+# `contracts/schema/service.schema.json` (validated by `osdev validate`) and `contracts/CLAUDE.md`:
+# ipc_send, ipc_receive, log_write, hw_mmio, hw_interrupt, hw_pio (+ service_control, supervisor-only).
+ipc_receive = ["pong"]        # OWNS and receives on its own "pong" endpoint
+ipc_send    = ["registry"]    # may SEND to registry (to register its endpoint under its name)
+log_write   = true            # may write to the logger
 
-# No [placement] block: supervisor assigns via round-robin.
-# pong may land on any available core, including a different one after restart.
+# No [placement] section: the supervisor ROUND-ROBINS pong across the ready cores - the right
+# default for almost every service. So pong may land on ANY core, and a DIFFERENT one after a
+# restart, while its NAME stays stable (identity over location, Commandment V / Invariant 11).
+# Add `[placement] core = N` (0-15) only with a real reason to pin (cross-core parallelism, a
+# driver's interrupt locality, or isolation); a pin is STRICT (honored, never rerouted; an
+# unavailable core rejects the spawn). CLAUDE.md §9.2/§13.2, contracts/CLAUDE.md.

@@ -1,14 +1,41 @@
+# Service contract for `hello` - the minimal service (your first one; copy this folder).
+# The supervisor reads this at spawn and the kernel mints EXACTLY these capabilities. A
+# service can do ONLY what its contract grants, nothing else (Commandment VII).
 name    = "hello"
 version = "0.1.0"
 
 [resources.memory]
+# request = the minimum to START (the supervisor will not spawn it with less).
+# limit   = the most it may ever allocate.
+# Asking past `limit` returns AllocDenied (RECOVERABLE: the service can back off and
+# degrade). Touching UNMAPPED memory is a page fault (FATAL: the service is killed).
+# CLAUDE.md §10.2-§10.4.
 request = "32MiB"
 limit   = "64MiB"
 
 [capabilities]
-# The ONLY authority hello holds: write to the logger. Declaring nothing else is
-# the whole point - a service can do only what its contract grants (Commandment VII).
-log_write = true
+# Each line is an explicit grant - `hello` can do ONLY what is listed (Commandment VII,
+# no ambient authority). Declaring nothing but log_write is the whole point.
+#
+# WHERE TO FIND THE FULL LIST: the declarable capabilities are defined in
+# `contracts/schema/service.schema.json` (the JSON Schema that `osdev validate` enforces)
+# and documented in `contracts/CLAUDE.md`. The complete set of options:
+#   ipc_send     = ["peer", ...]      services this service may SEND IPC to
+#   ipc_receive  = ["myname", ...]    endpoint names this service OWNS and receives on
+#   log_write    = true               write to the logger service
+#   hw_mmio      = ["0xBASE+0xSIZE"]  a device MMIO register window (drivers; CLAUDE.md §12.3)
+#   hw_interrupt = [IRQ, ...]         IRQ lines (0-255) routed to this service (drivers; §12.2)
+#   hw_pio       = ["0xBASE+0xLEN"]   kernel-mediated I/O port ranges (drivers)
+#   service_control = true            supervisor-only: authority to kill/restart services
+# Declare the MINIMUM your service needs - that minimum IS its security boundary.
+log_write = true   # the ONLY authority hello holds
 
 [placement]
-core = 0
+# OPTIONAL. Omit this whole section and the supervisor ROUND-ROBINS the service across the
+# ready cores - the right default for almost every service, and what you should normally do.
+# (Omitting does NOT mean "core 0"; it means "supervisor, spread me out.") Set `core = N`
+# (0-15) ONLY when you have a real reason to PIN: cross-core parallelism (see ping/pong),
+# a driver's interrupt locality (see driver-skeleton/e1000), or isolation. A pin is STRICT:
+# the supervisor honors it and never silently reroutes (Commandment IV); if core N is
+# unavailable the spawn is REJECTED (PlacementInvalid), not moved. CLAUDE.md §9.2/§13.2.
+core = 0   # pinned ONLY so this example's output is deterministic; a real first service should OMIT this section

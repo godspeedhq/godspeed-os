@@ -1,32 +1,41 @@
+# A userspace device driver contract. It declares EXACTLY the hardware it touches and nothing
+# more (Commandment VII: no ambient authority). The kernel validates these fields at spawn and
+# grants capabilities ONLY for the named MMIO range and IRQ line (CLAUDE.md §12.3, §13.6); the
+# driver can reach nothing else on the machine. Declare only what your device actually needs.
 name    = "driver-skeleton"
 version = "0.1.0"
 
-# A userspace device driver. It declares EXACTLY the hardware it touches and
-# nothing more (Commandment VII: no ambient authority). The kernel validates
-# these fields at spawn and grants capabilities ONLY for the named MMIO range and
-# IRQ line (CLAUDE.md §12.3, §13.6); the driver can reach nothing else on the
-# machine. Declare only what your device actually needs.
-
 [resources.memory]
+# request = the minimum to START; limit = the most it may ever allocate. Past `limit` ->
+# AllocDenied (recoverable); touching unmapped memory -> page fault (fatal). CLAUDE.md §10.2-§10.4.
 request = "8MiB"
 limit   = "16MiB"
 
 [capabilities]
-# The device's MMIO register window, as "<base>+<len>". The kernel maps THIS range
-# (and only this range) into the driver's address space; reach it via ctx.mmio().
+# Explicit grants only (Commandment VII). The FULL set of declarable capabilities is in
+# `contracts/schema/service.schema.json` (validated by `osdev validate`) and `contracts/CLAUDE.md`.
+# The complete set of options: ipc_send, ipc_receive, log_write, hw_mmio, hw_interrupt, hw_pio
+# (+ service_control, supervisor-only). A driver uses the hw_* options:
+
+# hw_mmio: the device's MMIO register window(s), as "0xBASE+0xSIZE" in hex. The kernel maps THIS
+# range (and only this range) into the driver's address space; reach it via ctx.mmio().
 hw_mmio      = ["0xfeb00000+0x1000"]
 
-# The device's IRQ line. The kernel routes this interrupt to the driver's interrupt
-# endpoint as an IPC message (§12.2); the driver recv()s it and re-arms with
+# hw_interrupt: the device's IRQ line(s), each 0-255. The kernel routes this interrupt to the
+# driver's endpoint as an IPC message (§12.2); the driver recv()s it and re-arms with
 # ctx.irq_unmask(vector).
 hw_interrupt = [11]
 
-# A physically-contiguous DMA arena for the device's ring/buffer structures is
-# granted at spawn to recognised DMA drivers (reach it via ctx.dma_region()); see
-# the e1000 example for the kernel-side wiring that recognises a new driver.
-log_write    = true
+# hw_pio = ["0xBASE+0xLEN"] is the option for kernel-mediated I/O PORTS (not used here).
+# NOTE: a DMA arena is NOT a contract field - it is granted at spawn to recognised DMA drivers
+# (reach it via ctx.dma_region()); recognising a NEW driver is a small kernel-side hook, shown
+# working in the e1000 example.
+log_write    = true   # may write to the logger
 
 [placement]
-# Pin the driver to a core. The device's interrupt routes to whichever core the
-# driver runs on (§12.2); pinning keeps that deterministic.
-core = 1
+# OPTIONAL in general (omit -> the supervisor round-robins across cores), but a driver usually
+# DOES pin: the device's interrupt routes to whichever core the driver runs on (§12.2), so
+# pinning keeps interrupt handling deterministic - a legitimate reason to set `core`. A pin is
+# STRICT: honored, never rerouted; an unavailable core REJECTS the spawn. core is 0-15.
+# CLAUDE.md §9.2/§13.2, §12.2.
+core = 1   # a driver pins to the core its IRQ routes to (interrupt locality)

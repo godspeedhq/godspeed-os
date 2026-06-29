@@ -1,14 +1,28 @@
+# Service contract for `ping` - the demo client. The supervisor reads this at spawn and the
+# kernel mints EXACTLY these capabilities; `ping` can do only what is listed here (Commandment VII).
 name    = "ping"
 version = "0.1.0"
 
 [resources.memory]
+# request = the minimum to START (won't spawn with less); limit = the most it may ever
+# allocate. Past `limit` -> AllocDenied (recoverable: back off); touching unmapped memory
+# -> page fault (fatal: the service is killed). CLAUDE.md §10.2-§10.4.
 request = "32MiB"
 limit   = "64MiB"
 
 [capabilities]
-ipc_send    = ["pong", "registry"]
-ipc_receive = ["ping"]
-log_write   = true
+# Explicit grants only - `ping` can do ONLY what is listed (Commandment VII, no ambient
+# authority). The FULL set of declarable capabilities is in `contracts/schema/service.schema.json`
+# (what `osdev validate` checks) and `contracts/CLAUDE.md`. The options are: ipc_send,
+# ipc_receive, log_write, hw_mmio, hw_interrupt, hw_pio (+ service_control, supervisor-only).
+ipc_send    = ["pong", "registry"]   # may SEND to pong (the peer) and registry (to reacquire after a restart)
+ipc_receive = ["ping"]               # OWNS and receives on its own "ping" endpoint
+log_write   = true                   # may write to the logger
 
 [placement]
-core = 0
+# OPTIONAL. Omit this whole section and the supervisor ROUND-ROBINS the service across the
+# ready cores - the right default for almost every service. (Omitting does NOT mean "core 0";
+# it means "supervisor, spread me.") Set `core = N` (0-15) ONLY with a real reason to PIN. A
+# pin is STRICT: the supervisor honors it and never reroutes (Commandment IV); an unavailable
+# core REJECTS the spawn (PlacementInvalid), it is not moved. CLAUDE.md §9.2/§13.2.
+core = 0   # pinned to force the cross-core IPC demo (ping on core 0, pong elsewhere); a normal service omits this

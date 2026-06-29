@@ -1,18 +1,27 @@
+# Service contract for `cap-grant` - demonstrates capability transfer over IPC. The supervisor
+# reads this at spawn and the kernel mints EXACTLY these capabilities (Commandment VII).
 name    = "cap-grant"
 version = "0.1.0"
 
 [resources.memory]
+# request = the minimum to START; limit = the most it may ever allocate. Past `limit` ->
+# AllocDenied (recoverable); touching unmapped memory -> page fault (fatal). CLAUDE.md §10.2-§10.4.
 request = "32MiB"
 limit   = "64MiB"
 
 [capabilities]
-# Everything this service can do is listed here and nowhere else (Commandment VII:
-# no ambient authority). It owns an endpoint others may call - which is what lets
-# it hand out a SEND|GRANT cap to itself via `self_grant_handle()` - and a SEND cap
-# to the peer it grants that cap to ("receiver"). Nothing more.
-ipc_receive = ["cap-grant"]   # our own endpoint (the cap we give away points here)
-ipc_send    = ["receiver"]    # the peer we transfer the grantable cap to
-log_write   = true
+# Explicit grants only - this service can do ONLY what is listed (Commandment VII, no ambient
+# authority). The FULL set of declarable capabilities is in `contracts/schema/service.schema.json`
+# (validated by `osdev validate`) and `contracts/CLAUDE.md`. The options are: ipc_send,
+# ipc_receive, log_write, hw_mmio, hw_interrupt, hw_pio (+ service_control, supervisor-only).
+ipc_receive = ["cap-grant"]   # OWNS its endpoint - the grantable SEND|GRANT cap it hands out points here
+ipc_send    = ["receiver"]    # the peer it transfers the grantable cap to
+log_write   = true            # may write to the logger
 
 [placement]
-core = 0
+# OPTIONAL. Omit this whole section and the supervisor ROUND-ROBINS the service across the ready
+# cores - the right default for almost every service. (Omitting does NOT mean "core 0".) Set
+# `core = N` (0-15) ONLY with a real reason to PIN (cross-core parallelism, a driver's interrupt
+# locality, or isolation). A pin is STRICT: honored, never rerouted; an unavailable core REJECTS
+# the spawn (PlacementInvalid). CLAUDE.md §9.2/§13.2, contracts/CLAUDE.md.
+core = 0   # pinned only for deterministic example output; a real service omits this section
