@@ -325,6 +325,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Phase 6: ensure_wired adopts a running shell on a supervisor respawn instead of duplicating it.
     ensure_wired(&ctx, &mut name_map, "shell", &["fs"]);
 
+    // counter (examples/counter): a STATEFUL example that survives its OWN restart by persisting its
+    // running count to `fs` and reconstructing it on spawn (§14 restart, §15 persistence). Spawned
+    // ONLY in the `counter-test` build (`osdev test counter`) - its per-tick writes to /counter.dat
+    // would be disk-write noise in the daily-driver image and identity build. Wired from the map
+    // like the shell (its `fs` send peer); on a supervisor respawn ensure_wired adopts the running
+    // instance instead of duplicating it. block-driver + fs are spawned above (bare-metal set).
+    #[cfg(feature = "counter-test")]
+    ensure_wired(&ctx, &mut name_map, "counter", &["fs"]);
+
     // xhci: USB host-controller driver (§12). Spawned in bare-metal + full
     // builds; the kernel maps its controller's MMIO BAR at spawn (Stage 2).
     #[cfg(not(any(feature = "identity-only", feature = "perf-only",
@@ -408,6 +417,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 ctx.log("supervisor: logger died, restarting");
                 if spawn_mapped(&ctx, &mut name_map, "logger", 0xFFFF) { ctx.log("supervisor: logger restarted"); }
                 else { ctx.log("supervisor: logger restart FAILED"); }
+            }
+            // counter (examples/counter, counter-test build): respawn it wired to `fs` - the fresh
+            // instance reconstructs its count from /counter.dat (§14/§15). The "died/restarted" lines
+            // are what `osdev test counter` gates on. (Only ever sent when counter is actually live.)
+            "counter" => {
+                ctx.log("supervisor: counter died, restarting");
+                if spawn_wired(&ctx, &mut name_map, "counter", &["fs"]) { ctx.log("supervisor: counter restarted"); }
+                else { ctx.log("supervisor: counter restart FAILED"); }
             }
             _ => {}
         }

@@ -19,6 +19,11 @@ bare-metal = []
 # Phase 1). Combined with `bare-metal` by `osdev test blockdev`, which attaches a
 # disk on the ATA secondary channel; block-driver reads sector 0 and logs it.
 blockdev = []
+# Additionally spawn `counter` (examples/counter) on top of the bare-metal set (shell + block-driver
+# + fs). `counter` persists a running count to `fs` and recovers it across its OWN restart (§14/§15);
+# used by `osdev test counter`. Kept OUT of the daily-driver image and identity build (which use
+# `bare-metal` / `identity-only` without this) so counter's per-tick disk writes are test-only noise.
+counter-test = []
 identity-only = []
 # Spawn only the regular performance-benchmark probe services (perf-b1…perf-b10
 # and their echo/victim partners).  Used by `osdev test perf` to eliminate the

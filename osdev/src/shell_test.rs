@@ -2258,6 +2258,132 @@ pub fn run_fs_restart(image_path: &Path, persist_path: &str, smp: u32) {
     if fail > 0 { std::process::exit(1); }
 }
 
+/// `examples/counter` survives its OWN restart (§14 restart, §15 persistence). Bare-metal shell +
+/// AHCI disk + the `counter` service (counter-test build). Flash the disk so `fs` mounts, let
+/// `counter` persist a couple of increments to /counter.dat, KILL counter over the control channel,
+/// and - after the supervisor respawns it - assert the fresh instance RECOVERED a non-zero count
+/// from the file (not "starting at 0"). That single assertion is the proof the state survived.
+pub fn run_counter(image_path: &Path, persist_path: &str, smp: u32) {
+    let sc = crate::qemu::timeout_scale();
+    println!("counter: booting (smp={smp}) bare-metal + AHCI disk + counter; shell on COM1, control on COM2");
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let persist   = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let persist_str = persist.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+    let ctrl_port  = pick_free_port();
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(),
+        "-m",       "512M",
+        "-serial",  &format!("tcp::{shell_port},server"),         // COM1: shell I/O + logs (QEMU waits for us)
+        "-serial",  &format!("tcp::{ctrl_port},server,nowait"),   // COM2: control channel - nowait (we connect later)
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ])
+    .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("counter: QEMU launch failed at {qemu}: {e}"); std::process::exit(1); });
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => { eprintln!("counter: could not connect to shell serial {shell_port}"); child.kill().ok(); std::process::exit(1); }
+    };
+    let mut read_half  = stream.try_clone().expect("clone tcp stream");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop {
+                match read_half.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]),
+                }
+            }
+        });
+    }
+
+    let mut pass = 0usize;
+    let mut fail = 0usize;
+    let mut cursor = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("counter: PASS - {}", $label); pass += 1; }
+        else   { println!("counter: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40 * sc)).is_none() {
+        println!("counter: FAIL - timed out waiting for first gsh>");
+        child.kill().ok(); child.wait().ok(); std::process::exit(1);
+    }
+
+    // Format the data disk so `fs` mounts a filesystem - counter's saves succeed only once one exists
+    // (before this they fail loudly with FS_NOFS and the count lives only in RAM).
+    send(&mut write_half, b"drives flash data\r");
+    if collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(10 * sc)).is_some() {
+        send(&mut write_half, b"y\r");
+        match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20 * sc)) {
+            Some(r) => check!(r.contains("formatted as GSFS"), "setup: flashed GSFS"),
+            None    => { println!("counter: FAIL - flash timeout"); fail += 1; }
+        }
+    } else { println!("counter: FAIL - no flash confirm"); fail += 1; }
+
+    // Let counter persist at least one increment. The first "counter: count=N saved" line AFTER the
+    // format is the first SUCCESSFUL save (N >= 1) - pre-flash attempts logged "(save failed …)".
+    let saved_n = collect_until(&buf, &mut cursor, b" saved", Duration::from_secs(40 * sc))
+        .and_then(|chunk| digits_after(&chunk, "counter: count="));
+    check!(matches!(saved_n, Some(n) if n >= 1), "counter persisted an increment to /counter.dat (count >= 1)");
+    // Wait for a second successful save so the durable value is solidly > 0 before we kill.
+    let _ = collect_until(&buf, &mut cursor, b" saved", Duration::from_secs(20 * sc));
+
+    // KILL counter over the COM2 control channel; the supervisor must observe the death and respawn it.
+    println!("counter: sending 'KILL counter' over the control channel …");
+    match retry_tcp_connect(ctrl_port, Duration::from_secs(10)) {
+        Some(mut ctrl) => { thread::sleep(Duration::from_millis(100)); send(&mut ctrl, b"\nKILL counter\n");
+            let restarted = collect_until(&buf, &mut cursor, b"supervisor: counter restarted", Duration::from_secs(20 * sc));
+            check!(restarted.is_some(), "supervisor observed counter death and restarted it");
+            drop(ctrl);
+        }
+        None => { println!("counter: FAIL - could not connect to control port"); fail += 1; }
+    }
+
+    // THE PROOF: the respawned counter reconstructs its count from /counter.dat - it logs
+    // "counter: recovered count=M from /counter.dat" with M > 0, NOT "starting at 0". The persisted
+    // state survived a kill + respawn, which is the whole point of examples/counter (§14/§15).
+    let recovered = collect_until(&buf, &mut cursor, b" from /counter.dat", Duration::from_secs(30 * sc))
+        .and_then(|chunk| digits_after(&chunk, "counter: recovered count="));
+    check!(matches!(recovered, Some(m) if m >= 1),
+           "respawned counter RECOVERED a non-zero count from fs (survived its own restart)");
+    if let Some(m) = recovered {
+        println!("counter:   recovered count = {m} (the persisted value survived the restart)");
+    }
+
+    // No panic anywhere in the whole session.
+    let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    check!(!whole.contains("KERNEL PANIC"), "kernel never panicked across the restart");
+
+    // Always dump the raw serial for inspection (counter + shell share COM1).
+    let _ = std::fs::write("build/tests/counter_serial.log", whole.as_bytes());
+
+    child.kill().ok();
+    child.wait().ok();
+    println!("\ncounter: {pass} passed, {fail} failed");
+    if fail > 0 { std::process::exit(1); }
+}
+
+/// Parse the unsigned integer immediately following the LAST occurrence of `marker` in `text` (a
+/// serial chunk may hold several lines; the last is the most recent). None if marker/digits absent.
+/// Reads counter's persisted/recovered count out of a "counter: …=N …" line.
+fn digits_after(text: &str, marker: &str) -> Option<u64> {
+    let start = text.rfind(marker)? + marker.len();
+    let digits: String = text[start..].chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
 /// §22 Test 14 - file-as-capability (P2). Boot a pre-formatted disk, then run the shell's argless
 /// `fcap` command, which creates its own throwaway file, opens it as a real kernel capability, and
 /// self-checks every property: read/write via the cap, non-escalation (RO cap can't write at the

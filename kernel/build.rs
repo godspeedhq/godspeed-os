@@ -47,6 +47,7 @@ fn main() {
         ("EHCI",       "ehci"),
         ("BLOCK_DRIVER", "block-driver"),
         ("FS",         "fs"),
+        ("COUNTER",    "counter"),  // examples/counter: stateful service, survives its own restart
     ];
 
     for (env_name, bin_name) in services {

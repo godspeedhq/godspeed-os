@@ -1,5 +1,10 @@
 # Example: counter
 
+> **Verified by `osdev test counter`** - it boots counter on a real AHCI disk, persists its count to
+> `/counter.dat`, kills it over the control channel, and asserts the respawned instance logs
+> `recovered count=M` with M >= 1 (not "starting at 0") - the state survived its own restart (§14/§15).
+> Run it yourself to re-confirm.
+
 A STATEFUL service that survives its **own** restart. Every other example is stateless - it restarts
 trivially because it owns nothing to lose. `counter` owns a running count, the one thing a restart
 would erase if it lived only in RAM. This example is the missing lifecycle: how a stateful service

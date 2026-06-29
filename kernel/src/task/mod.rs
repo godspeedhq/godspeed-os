@@ -531,6 +531,23 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
+        // counter (examples/counter): a STATEFUL service that survives its OWN restart by
+        // persisting its running count to `fs` and reconstructing it on spawn (§14 restart, §15
+        // persistence). Owns its endpoint (fs replies there via the per-request reply cap) and sends
+        // to `fs` (read/write /counter.dat). Spawned only in the counter-test build (`osdev test
+        // counter`); idle/absent everywhere else. Restartable: its death notifies the supervisor,
+        // which respawns it (scheduler death-notification set + supervisor restart loop).
+        "counter" => Some(("counter", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_COUNTER_ELF")),
+            has_recv_endpoint: true,            // fs reply target (request_with_reply embeds a reply cap)
+            send_peers:        &["fs"],         // file-API ops to fs; reacquired by name on EndpointDead
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,        // round-robin (no [placement] in its contract)
+            probe_mode:        0,
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
         // ----------------------------------------------------------------
         // Probe services - §22 Group A identity tests.
         // All use the same probe ELF; probe_mode selects the test behaviour.
