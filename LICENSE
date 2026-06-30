@@ -1,36 +1,3 @@
-                                 GodspeedOS
-
-              A capability-based microkernel operating system.
-     Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors.
-
-SPDX-License-Identifier: GPL-2.0-only
-
-GodspeedOS is free software. You may redistribute it and/or modify it under the
-terms of the GNU General Public License, version 2 (GPL-2.0-only) as published by
-the Free Software Foundation - the same license as the Linux kernel. The complete
-text of that license follows this notice.
-
-  COMMERCIAL USE IS WELCOME. The copyleft of the GPL applies to the OPERATING
-  SYSTEM itself: if you modify the kernel, the trusted root (the supervisor), or
-  the system services and distribute your version, you must release those changes
-  under this same license, so the community keeps them.
-
-  USERSPACE IS FREE. This copyright does NOT cover userspace services that use the
-  kernel through its normal syscall / capability / IPC boundary. Writing a service
-  against the GodspeedOS SDK and running it on the kernel is ordinary use of the
-  system and does NOT make that service a derived work of the kernel - exactly as a
-  userspace program calling Linux syscalls is not a derived work of Linux. You may
-  therefore build and distribute services, including proprietary and commercial
-  ones, on GodspeedOS freely. The SDK (under sdk/) is licensed under Apache-2.0
-  (see sdk/LICENSE), so this boundary is explicit and proprietary services are
-  unambiguous.
-
-This program is distributed in the hope that it will be useful, but WITHOUT ANY
-WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-PARTICULAR PURPOSE. See the GNU General Public License below for more details.
-
-================================================================================
-
                     GNU GENERAL PUBLIC LICENSE
                        Version 2, June 1991
 
