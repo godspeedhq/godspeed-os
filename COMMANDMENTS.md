@@ -172,6 +172,26 @@ to real bugs, real wedges, real failures, and real lessons learned while buildin
 
 Treat them very seriously.
 
+## Tried by Fire
+
+A contribution is not considered proven until it has passed through the fire.
+
+The fire of Godspeed consists of seven complementary trials:
+
+1. **Identity** - Does it remain itself?
+2. **Property** - Does it preserve its invariants?
+3. **Fuzz** - Does unexpected input reveal hidden assumptions?
+4. **Stress** - Does pressure change correctness?
+5. **Performance** - Does it remain efficient under sustained load?
+6. **Adversarial** - Can deliberate attack break its guarantees?
+7. **Chaos** - Can it recover when the unexpected becomes reality?
+
+Each trial has increasingly brutal variants. Passing one trial does not excuse failing another.
+
+> *Grounded in:* §22 - these seven are the categories of the test suite: the Identity tests and the
+> six battle-hardening layers, each with a harsher "brutal" variant. A green check from one trial is
+> necessary; it is never sufficient. This is Commandment II made into a gauntlet.
+
 ## Blessings
 
 *Godspeed on thy journey.*
