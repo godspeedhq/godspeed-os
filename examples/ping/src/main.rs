@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `ping` - sends a message to `pong` on every scheduler tick.
 //!
 //! Pinned to Core 0 (§23.1). On `EndpointDead`, reacquires a fresh SEND cap

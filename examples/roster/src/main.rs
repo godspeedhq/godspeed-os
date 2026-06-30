@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `roster` - an example **record-producing** pipe service (Appendix D, `docs/records.md`).
 //!
 //! Where `greet` emits text lines, `roster` emits **structured records**: it builds a typed

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! CRC32 (IEEE 802.3, reflected, poly `0xEDB88320`) - host-side copy of the GSFS0004
 //! checksum used by `services/fs/src/crc32.rs`. Byte-identical to the on-disk writer so a
 //! host-baked image (`osdev mkfs` / `script-disk`) checksums exactly as `fs` would. The

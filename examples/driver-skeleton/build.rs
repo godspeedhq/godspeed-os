@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 fn main() {
     // Every userspace service links with the ring-3 service linker script and
     // enters at `service_main`. Identical to every other example/service.

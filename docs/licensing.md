@@ -1,20 +1,22 @@
 # GodspeedOS Licensing
 
-> **Status:** Licensing **intent / policy**, decided in conversation. This records
-> the *strategy* and the *rationale*; the actual `LICENSE` files (full legal text)
-> are added when the choices below are finalized. Not yet a legal instrument.
+> **Status:** **Settled.** This is the recorded licensing decision, now backed by real
+> `LICENSE` files: the OS is **GPL-2.0-only** (repo-root `LICENSE`) and the SDK + examples
+> are **Apache-2.0** (`sdk/LICENSE`). Per-file `SPDX-License-Identifier` tags mark every
+> source file's zone. This document records the *strategy* and *rationale* behind that text.
 
 ## 1. The decision
 
 | Component | License | Why |
 |-----------|---------|-----|
-| **Kernel** (and the trusted root: `init`, `supervisor`, `registry`, arch, smp) | **GPL copyleft** (like Linux) | The OS itself stays free and open; improvements flow back. |
-| **SDK** (`sdk/rust`) | **Permissive** (MIT or Apache-2.0) - *to decide* | Services link it; permissive keeps the app ecosystem free to choose any license. |
-| **Userspace services / apps** | **Any license** (their authors' choice) | They are separate programs over IPC - not derivative works of the kernel. |
+| **The OS** - kernel + trusted root (`supervisor`, arch, smp) + system services (`logger`, `block-driver`, `fs`, drivers, `shell`) + host tooling (`osdev`) + tests | **GPL-2.0-only** (like Linux) | The OS itself stays free and open; improvements flow back. |
+| **SDK** (`sdk/rust`) | **Apache-2.0** | Services link it; permissive keeps the app ecosystem free to choose any license. Apache-2.0 adds an explicit patent grant over plain MIT. |
+| **Examples** (`examples/`) | **Apache-2.0** | They are reference apps meant to be copied as the starting point for real services; permissive keeps that copy unencumbered. |
+| **Userspace services / apps** | **Any license** (their authors' choice) | They are separate programs over IPC - not derivative works of the kernel. A service built against the SDK carries **no copyleft**, so proprietary commercial services are fine. |
 | **Bundled bootloader** (Limine) | **BSD-2-Clause** (upstream; preserve its notice) | A separate program; GPL-compatible (§3). |
 
 The one-line summary: **copyleft OS, permissive ecosystem.** GodspeedOS-the-OS is
-GPL and open; what you build *on* it is yours.
+GPL-2.0-only and open; what you build *on* it (against the Apache-2.0 SDK) is yours.
 
 ## 2. The license boundary is the capability/IPC boundary
 
@@ -60,23 +62,27 @@ copyleft, but linking the SDK imposes nothing on the app. This is what keeps the
   (the OS) stays a commons; the frontier (apps) stays free. It is the opposite of a
   permissive kernel that can be taken closed.
 
-## 5. Open choices (to finalize before writing the `LICENSE` files)
+## 5. The recorded choices
 
-1. **GPLv2 vs GPLv3.** "Like Linux" usually means **GPLv2-only**. **GPLv3** adds
-   anti-tivoization (you can't lock users out of running modified firmware) and explicit
-   patent grants - which may actually fit an OS that self-updates and runs on devices
-   (`docs/prime.md`). Decide deliberately.
-2. **SDK permissive license: MIT vs Apache-2.0.** Apache-2.0 adds an explicit patent grant
-   and is GPLv3-compatible (but *not* GPLv2-compatible); MIT is simplest and broadly
-   compatible. The SDK choice interacts with the GPLv2/v3 choice above.
-3. **Where the `LICENSE` files live:** repo-root `LICENSE` (kernel GPL) + `sdk/rust/LICENSE`
-   (permissive) + a `NOTICE`/`THIRD-PARTY` for Limine's BSD notice and any other deps.
+These were the open questions; they are now decided:
+
+1. **GPLv2 vs GPLv3 → GPL-2.0-only.** "Like Linux" - the OS is **GPL-2.0-only**. This is the
+   plain, broadly-understood copyleft for a kernel; the anti-tivoization and patent clauses of
+   GPLv3 were not worth the narrower compatibility surface for v1.
+2. **SDK permissive license → Apache-2.0** (for both the SDK *and* the examples). Apache-2.0
+   adds an explicit patent grant over plain MIT. Note the well-known one-way edge: Apache-2.0 is
+   GPLv3-compatible but *not* GPLv2-compatible - which is exactly why the SDK is a **separate,
+   permissively-licensed** component a service merely links, never code pulled into the
+   GPL-2.0-only kernel. The capability/IPC boundary (§2) keeps the two zones from entangling.
+3. **Where the `LICENSE` files live:** repo-root `LICENSE` (the OS, GPL-2.0-only) + `sdk/LICENSE`
+   (the SDK + examples, Apache-2.0). Every source file additionally carries a one-line
+   `// SPDX-License-Identifier: <id>` tag naming its zone.
 4. **Contributor terms:** a `CONTRIBUTING`/DCO (sign-off) vs a CLA - how inbound
-   contributions are licensed.
+   contributions are licensed. *(Still to formalize; does not affect the license of the code in tree.)*
 
-## 6. What this is not
+## 6. Scope of this document
 
-This document is **intent**, not the license. Until the `LICENSE` files exist with real
-text, nothing here grants or restricts rights. It exists so the *strategy* - copyleft OS,
-permissive ecosystem, IPC as the boundary - is on record and the eventual legal text
-matches the architecture rather than fighting it.
+The `LICENSE` files (repo-root GPL-2.0-only, `sdk/LICENSE` Apache-2.0) are the legal
+instruments; this document records the *strategy* behind them - copyleft OS, permissive
+ecosystem, IPC as the boundary - so the architecture and the license stay aligned rather than
+fighting each other.

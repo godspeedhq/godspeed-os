@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `asker` - the request/reply (RPC) CLIENT. The request-side counterpart to
 //! `examples/reply-server` (the reply side), exactly as `ping` is to `pong`.
 //!

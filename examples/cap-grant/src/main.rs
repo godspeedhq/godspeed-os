@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! cap-grant - transfer a capability to another service over IPC (§7.4, §8.5).
 //!
 //! Authority on Godspeed is a capability: an unforgeable token you HOLD. To let

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! e1000 - a real, runnable userspace driver for the Intel 82540EM ("e1000") NIC.
 //!
 //! This is the runnable counterpart to `examples/driver-skeleton`. It is a SERVICE

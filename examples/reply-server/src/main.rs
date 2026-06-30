@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! reply-server - the request/reply (RPC) IPC pattern (§8, §8.9).
 //!
 //! The dominant shape of a real GodspeedOS service (`fs`, `block-driver`): own an

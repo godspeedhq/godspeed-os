@@ -1,10 +1,4 @@
-// GodspeedOS - Created by Bankole Ogundero.
-//
-// This software is provided "as is", without warranty or guarantee of any kind,
-// express or implied. The author makes no guarantee of its correctness, reliability,
-// or fitness for any purpose, and accepts no liability for any damages arising from
-// its use. Use at your own risk.
-
+// SPDX-License-Identifier: GPL-2.0-only
 //! `mem-pressure` - a spawn-on-demand memory pressure victim for the shell's `chaos mem-pressure`
 //! command. Idle until spawned; on spawn it allocates 4 MiB chunks up to its contract memory
 //! limit, asserting the §22 S7 invariant - once `AllocDenied` appears it must be STICKY (an `Ok`

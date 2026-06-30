@@ -1,10 +1,4 @@
-// GodspeedOS - Created by Bankole Ogundero.
-//
-// This software is provided "as is", without warranty or guarantee of any kind,
-// express or implied. The author makes no guarantee of its correctness, reliability,
-// or fitness for any purpose, and accepts no liability for any damages arising from
-// its use. Use at your own risk.
-
+// SPDX-License-Identifier: GPL-2.0-only
 //! CRC32 (IEEE 802.3, reflected, poly `0xEDB88320`) - integrity checksums for GSFS0004
 //! (the superblock and every directory block). Pure const table, `no_std`, no alloc, no
 //! float. The host formatter (`osdev`) carries a byte-identical copy so a host-baked image

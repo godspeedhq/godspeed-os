@@ -1,10 +1,4 @@
-// GodspeedOS - Created by Bankole Ogundero.
-//
-// This software is provided "as is", without warranty or guarantee of any kind,
-// express or implied. The author makes no guarantee of its correctness, reliability,
-// or fitness for any purpose, and accepts no liability for any damages arising from
-// its use. Use at your own risk.
-
+// SPDX-License-Identifier: GPL-2.0-only
 //! Pure ELF-segment → page-permission logic, factored out of `loader.rs` so the
 //! W^X decision is unit-testable on the host. `loader.rs` itself is
 //! hardware-coupled (allocator, page tables, HHDM) and excluded from the test lib;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `pong` - receives messages from `ping` and logs them.
 //!
 //! No contract-specified placement → supervisor places via round-robin.

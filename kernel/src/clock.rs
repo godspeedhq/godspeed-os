@@ -1,10 +1,4 @@
-// GodspeedOS - Created by Bankole Ogundero.
-//
-// This software is provided "as is", without warranty or guarantee of any kind,
-// express or implied. The author makes no guarantee of its correctness, reliability,
-// or fitness for any purpose, and accepts no liability for any damages arising from
-// its use. Use at your own risk.
-
+// SPDX-License-Identifier: GPL-2.0-only
 //! Pure clock-deglitch logic - no hardware dependencies, so it is host-unit-testable. Declared in BOTH
 //! `lib.rs` (the host test target) and `main.rs` (the bin), the same shared-pure-module pattern as
 //! `elf_flags`. The arch-side RTC reader (`arch/x86_64/rtc.rs::now_epoch_monotonic`) supplies the live

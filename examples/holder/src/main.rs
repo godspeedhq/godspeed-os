@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `holder` - the CLIENT half of delegated resource capabilities (§7.10, P2). The use-side
 //! counterpart to `examples/resource-server` (the owner/mint side), exactly as `ping` is to `pong`.
 //!

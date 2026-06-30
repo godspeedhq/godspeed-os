@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! resource-server - MINT a delegated resource capability a service OWNS (§7.10, P2).
 //!
 //! This is the third capability operation the examples teach. Capability USE is in

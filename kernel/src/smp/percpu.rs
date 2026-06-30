@@ -1,10 +1,4 @@
-// GodspeedOS - Created by Bankole Ogundero.
-//
-// This software is provided "as is", without warranty or guarantee of any kind,
-// express or implied. The author makes no guarantee of its correctness, reliability,
-// or fitness for any purpose, and accepts no liability for any damages arising from
-// its use. Use at your own risk.
-
+// SPDX-License-Identifier: GPL-2.0-only
 //! Boot-time per-core arenas (§9, §26.6.1).
 //!
 //! [`PerCore<T>`] / [`PerCoreMut<T>`] are arrays of one element per core - N = the cores Limine

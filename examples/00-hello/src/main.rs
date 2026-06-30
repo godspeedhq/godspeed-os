@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `hello` - the minimal GodspeedOS service: it holds only `log_write` and logs
 //! a heartbeat. Your first service starts here.
 //!

@@ -1,5 +1,4 @@
-// GodspeedOS - Created by Bankole Ogundero.
-//
+// SPDX-License-Identifier: Apache-2.0
 //! Structured records - the typed `Table` that flows through GodspeedOS pipes.
 //!
 //! POSIX pipes carry text, so structured data is flattened to a string and `grep`/`awk`/`cut`

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! counter - a STATEFUL service that survives its own restart by persisting
 //! state externally (§14 restart, §15 state/persistence).
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `greet` - a pipe producer: emits a few friendly lines, then idles.
 //!
 //! The producer side of a capability-mediated pipe (`greet | upper`). Crucially,

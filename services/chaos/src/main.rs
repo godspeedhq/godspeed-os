@@ -1,10 +1,4 @@
-// GodspeedOS - Created by Bankole Ogundero.
-//
-// This software is provided "as is", without warranty or guarantee of any kind,
-// express or implied. The author makes no guarantee of its correctness, reliability,
-// or fitness for any purpose, and accepts no liability for any damages arising from
-// its use. Use at your own risk.
-
+// SPDX-License-Identifier: GPL-2.0-only
 //! `chaos` - the system-stress orchestrator, spawned on demand by the shell's `chaos max-carnage`
 //! command. It exists so the SHELL can be a chaos target: the loop that kills and resurrects services
 //! cannot live inside the shell (a shell killing itself dies on round one), so it lives here, in a

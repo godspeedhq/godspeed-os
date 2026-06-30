@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 fn main() {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     // examples/asker -> examples/ -> workspace root
