@@ -11,10 +11,15 @@
 //!
 //! Minting is GATED (Commandment VII, §7.10): `resource_mint` needs a RESOURCE_MINT
 //! authority, granted BY NAME inside the kernel only to authorized minters like `fs` - the
-//! same by-name kernel-grant mechanism examples/e1000 uses for its NIC BAR. In this plain
-//! example that grant is absent, so `resource_mint` returns None and the service idles
-//! (loud, bounded degradation - Commandment V). The full serve flow is written below so the
-//! template is real; `fs` is the runnable proof (shell `fcap`, §22 Test 14).
+//! same by-name kernel-grant mechanism examples/e1000 uses for its NIC BAR. The kernel grants
+//! it to "resource-server" too, but ONLY in the `resource-test` build (`osdev test
+//! resource-server`), which is the only build that spawns this service; in every other build
+//! it is never spawned, so the grant never takes effect. With the grant, this example is REAL
+//! and QEMU-PROVEN: it mints a resource, narrows a READ-ONLY copy, grants it to its client
+//! `examples/holder`, and serves holder's invocations - holder then proves use / non-escalation
+//! / revoke (`osdev test resource-server`). Without the grant (a plain `cargo build` of this
+//! crate alone) `resource_mint` returns None and the service idles (loud, bounded degradation -
+//! Commandment V). `fs` is the production proof of the same pattern (shell `fcap`, §22 Test 14).
 
 #![no_std]
 #![no_main]
@@ -39,11 +44,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // Mint a delegated resource this service OWNS. The kernel registers a fresh opaque
     // ResourceId at generation 0, records THIS service's endpoint as its owner, and returns
-    // a real cap carrying the rights we asked for. We include GRANT so we can derive a copy
-    // to hand to a client (mirrors fs's `want | RIGHT_GRANT`). Minting is gated: without the
-    // RESOURCE_MINT authority (granted by name in the kernel to minters like fs), this
-    // returns None and we degrade gracefully.
-    let (resource_id, cap) = match ctx.resource_mint(RIGHT_READ | RIGHT_WRITE | RIGHT_GRANT) {
+    // a real cap carrying the rights we asked for. We mint it READ-ONLY (plus GRANT so we can
+    // derive a copy to hand to a client - mirrors fs's `want | RIGHT_GRANT`): the copy `holder`
+    // gets therefore CANNOT widen to WRITE (§7.3), which is what makes holder's write-denial a
+    // REAL non-escalation rather than an arbitrary refusal. Minting is gated: without the
+    // RESOURCE_MINT authority (granted by name in the kernel to minters like fs - and, in the
+    // resource-test build, to us), this returns None and we degrade gracefully.
+    let (resource_id, cap) = match ctx.resource_mint(RIGHT_READ | RIGHT_GRANT) {
         Some(minted) => minted,
         None => {
             ctx.log("resource-server: no RESOURCE_MINT cap (gated, §7.10) - idling. fs is the real resource server; see examples/e1000 for the by-name kernel grant.");
@@ -55,23 +62,24 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         resource_id
     ));
 
-    // Hand a client a copy of the cap. `derive_cap` duplicates it into a fresh slot; rights
-    // can only NARROW on transfer, never widen (§7.3) - the copy can never out-reach the
-    // original. (To issue a strictly read-only client cap, mint the resource with just
-    // RIGHT_READ | RIGHT_GRANT; the client's copy then cannot write at all.) We keep the
-    // owned resource (we serve it via the kernel-set badge, not the cap) and drop our copy
-    // of the handed-out cap on success - authority MOVES, it does not silently duplicate.
+    // Hand the client (`holder`) a copy of the cap. `derive_cap` duplicates it into a fresh slot;
+    // rights can only NARROW on transfer, never widen (§7.3) - the copy carries exactly our
+    // READ | GRANT and can never out-reach the original, so holder genuinely cannot WRITE. We keep
+    // the owned resource (we serve it via the kernel-set badge, not the cap) and drop our copy of
+    // the handed-out cap on success - authority MOVES, it does not silently duplicate. `holder` is a
+    // contract-declared send-peer, so `acquire_send_cap` is allowed (not ambient, §3.1); the
+    // supervisor spawns holder BEFORE us, so by here it is registered in the kernel directory.
     if let Some(copy) = ctx.derive_cap(cap) {
-        match ctx.acquire_send_cap("client") {
-            Some(client) => {
+        match ctx.acquire_send_cap("holder") {
+            Some(holder) => {
                 let note = Message::from_bytes(b"a cap to a resource I own");
-                match ctx.send_with_cap_by_handle(client, copy, &note) {
-                    Ok(())  => ctx.log("resource-server: granted a resource cap to client"),
+                match ctx.send_with_cap_by_handle(holder, copy, &note) {
+                    Ok(())  => ctx.log("resource-server: granted a resource cap to holder"),
                     Err(_)  => ctx.remove_cap(copy), // send failed: reclaim the untransferred copy (no leak)
                 }
             }
             None => {
-                ctx.log("resource-server: no 'client' to grant to (expected when run standalone)");
+                ctx.log("resource-server: no 'holder' to grant to (expected when run standalone)");
                 ctx.remove_cap(copy);
             }
         }

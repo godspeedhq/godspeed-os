@@ -1,0 +1,11 @@
+[package]
+name = "holder"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "holder"
+path = "src/main.rs"
+
+[dependencies]
+godspeed-sdk = { path = "../../sdk/rust" }

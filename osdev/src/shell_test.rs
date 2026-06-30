@@ -2454,6 +2454,83 @@ pub fn run_reply_server(image_path: &Path, smp: u32) {
     if fail > 0 { std::process::exit(1); }
 }
 
+/// `examples/resource-server` exercised by `examples/holder` - delegated resource capabilities
+/// (§7.10, P2 file-as-capability). Boots the bare-metal set + resource-server + holder (resource-test
+/// build). The pair runs autonomously: resource-server MINTs a resource it owns, narrows a READ-ONLY
+/// copy of the cap, and GRANTs it to holder; holder then proves the three §7.3 properties that make a
+/// delegated resource cap a GENUINE capability. No disk and no control channel - we only read COM1 and
+/// assert holder's three receipts.
+///
+/// THE THREE PROOFS, all from holder's serial log:
+///   1. USE            - `holder: read OK`                       (the cap is usable for what it permits)
+///   2. NON-ESCALATION - `holder: write denied (non-escalation)` (a READ-ONLY cap cannot WRITE, §7.3)
+///   3. REVOCABLE      - `holder: revoked (CapRevoked)`          (after the owner revokes, the next use
+///                                                                is stale, §7.5)
+/// Plus: resource-server came up and granted the cap, and the kernel never panicked.
+pub fn run_resource_server(image_path: &Path, smp: u32) {
+    let sc = crate::qemu::timeout_scale();
+    println!("resource-server: booting (smp={smp}) bare-metal + resource-server + holder; serial on COM1");
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{shell_port},server"),   // COM1: shell I/O + logs (QEMU waits for us)
+        "-serial",  "null",                                  // COM2: unused in this test
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("resource-server: QEMU launch failed at {qemu}: {e}"); std::process::exit(1); });
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => { eprintln!("resource-server: could not connect to serial {shell_port}"); child.kill().ok(); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone tcp stream");
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+
+    let mut pass = 0usize; let mut fail = 0usize; let mut cursor = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("resource-server: PASS - {}", $label); pass += 1; } else { println!("resource-server: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    // The owner comes up, mints a resource it owns, and GRANTs holder a READ-ONLY copy of the cap.
+    check!(collect_until(&buf, &mut cursor, b"resource-server: granted a resource cap to holder", Duration::from_secs(90 * sc)).is_some(),
+           "resource-server minted a resource and granted holder a (read-only) cap to it");
+
+    // PROOF 1 - USE: holder invoked the cap (READ) and the owner served it. A real cap is usable for
+    // what it permits.
+    check!(collect_until(&buf, &mut cursor, b"holder: read OK", Duration::from_secs(60 * sc)).is_some(),
+           "holder USED the granted cap (read OK)");
+
+    // PROOF 2 - NON-ESCALATION: holder invoked WRITE on its READ-ONLY cap; the KERNEL refused it
+    // (CapInsufficientRights). Rights cannot widen on transfer (§7.3) - the cap is read-only, mechanically.
+    check!(collect_until(&buf, &mut cursor, b"holder: write denied (non-escalation)", Duration::from_secs(30 * sc)).is_some(),
+           "NON-ESCALATION: a READ-ONLY cap was denied a WRITE (§7.3)");
+
+    // PROOF 3 - REVOCABLE: the owner revoked the resource (a generation bump), so holder's next use is
+    // stale and returns CapRevoked (§7.5). The same mechanism fs uses to revoke a file cap on delete.
+    check!(collect_until(&buf, &mut cursor, b"holder: revoked (CapRevoked)", Duration::from_secs(30 * sc)).is_some(),
+           "REVOCABLE: after the owner revoked, the next use returned CapRevoked (§7.5)");
+
+    let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    check!(!whole.contains("KERNEL PANIC"), "no kernel panic across mint / use / revoke");
+    let _ = std::fs::write("build/tests/resource_server_serial.log", whole.as_bytes());
+
+    child.kill().ok(); child.wait().ok();
+    println!("\nresource-server: {pass} passed, {fail} failed");
+    if fail > 0 { std::process::exit(1); }
+}
+
 /// §22 Test 14 - file-as-capability (P2). Boot a pre-formatted disk, then run the shell's argless
 /// `fcap` command, which creates its own throwaway file, opens it as a real kernel capability, and
 /// self-checks every property: read/write via the cap, non-escalation (RO cap can't write at the

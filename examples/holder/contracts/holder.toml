@@ -1,0 +1,34 @@
+# Service contract for `holder` - the CLIENT half of the delegated-resource-capability example
+# (`examples/resource-server` is the owner half). resource-server MINTS a resource it owns, narrows
+# a READ-ONLY copy of the cap, and GRANTS it to `holder`; holder then exercises the three §7.3
+# properties a real capability keeps: USE (read works), NON-ESCALATION (a read-only cap cannot
+# write), REVOCABLE (after the owner revokes, the next use is CapRevoked). The supervisor reads this
+# at spawn and the kernel mints EXACTLY these capabilities; holder can do ONLY what is listed here
+# (Commandment VII, no ambient authority).
+name    = "holder"
+version = "0.1.0"
+
+[resources.memory]
+# request = the minimum to START; limit = the most it may ever allocate. Past `limit` ->
+# AllocDenied (recoverable); touching unmapped memory -> page fault (fatal). CLAUDE.md §10.2-§10.4.
+request = "32MiB"
+limit   = "64MiB"
+
+[capabilities]
+# Explicit grants only - holder can do ONLY what is listed (Commandment VII, no ambient authority).
+# The FULL set of declarable capabilities is in `contracts/schema/service.schema.json` (validated by
+# `osdev validate`) and `contracts/CLAUDE.md`: ipc_send, ipc_receive, log_write, hw_mmio,
+# hw_interrupt, hw_pio (+ service_control, supervisor-only).
+ipc_receive = ["holder"]   # OWNS its endpoint. resource-server GRANTs the resource cap here (an
+                           # embedded cap on a message), and resource-server's REPLIES to holder's
+                           # cap invocations land here too (the reply cap holder embeds per invoke is
+                           # a SEND copy of THIS endpoint, derived at runtime, §8.5).
+log_write   = true         # may write to the logger (its read-OK / write-denied / revoked receipts)
+
+# NOTE: holder declares NO `ipc_send`. It never name-addresses anyone: it USES a capability it was
+# GRANTED. A `resource_invoke` is routed by the KERNEL to the resource's owner (resource-server) by
+# the cap itself - authority by capability, not by identity or a named channel (Commandments VII/IX).
+
+# No [placement] section: the supervisor ROUND-ROBINS holder across the ready cores - the right
+# default. (Omitting does NOT mean "core 0".) Using a capability works the same on any core; the
+# kernel routes the invocation to wherever the owner landed (identity over location, Invariant 11).

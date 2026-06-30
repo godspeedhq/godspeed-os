@@ -16,6 +16,9 @@ limit   = "64MiB"
 # (validated by `osdev validate`) and `contracts/CLAUDE.md`. The options are: ipc_send,
 # ipc_receive, log_write, hw_mmio, hw_interrupt, hw_pio (+ service_control, supervisor-only).
 ipc_receive = ["resource-server"]  # OWNS its endpoint - a cap holder's `resource_invoke` is routed here, badged
+ipc_send    = ["holder"]           # may SEND to `holder` - so it can GRANT holder the minted resource cap
+                                   # (an embedded cap, §8.5). holder is the client half (examples/holder);
+                                   # the supervisor spawns holder FIRST so this peer resolves at our spawn.
 log_write   = true                 # may write to the logger
 
 # IMPORTANT: the authority to MINT resources (RESOURCE_MINT) is NOT a contract capability field -

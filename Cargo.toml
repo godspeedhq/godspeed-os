@@ -22,6 +22,7 @@ members = [
     "examples/reply-server",
     "examples/asker",
     "examples/resource-server",
+    "examples/holder",
     "examples/counter",
     "services/probe",
     "services/observe",

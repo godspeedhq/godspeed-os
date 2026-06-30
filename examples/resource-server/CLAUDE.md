@@ -1,5 +1,11 @@
 # Example: resource-server
 
+> **Real and QEMU-proven by `osdev test resource-server`** - it spawns resource-server with its client
+> `examples/holder`. resource-server mints a resource it owns, narrows a READ-ONLY copy of the cap, and
+> grants it to holder; holder then proves all three §7.3 properties and logs `holder: read OK` (use),
+> `holder: write denied (non-escalation)`, and `holder: revoked (CapRevoked)`. Run it yourself to
+> re-confirm.
+
 MINT a brand-new capability for a resource your service **owns** - the mechanism that makes "a file
 is a capability" literally true (§7.10). The kernel mints, validates, routes, and revokes the cap
 exactly as it does an endpoint cap, yet it never learns what the resource *means*. Only your service
@@ -35,10 +41,14 @@ file, and delete/close revokes it.
 `resource_mint` is **not** ambient. It requires a `RESOURCE_MINT` authority granted **by name inside
 the kernel** only to authorized minters (today: `fs`) - the same by-name kernel-grant mechanism
 `examples/e1000` uses for its NIC BAR. It is deliberately NOT a contract capability field (not in the
-schema): a service cannot ask for it; the kernel decides who may issue resources. In this plain
-example that grant is absent, so `ctx.resource_mint` returns `None` and the service logs and idles -
-loud, bounded degradation (Commandment V). It is a compilable **template**, like
-`examples/driver-skeleton` without its kernel hook; `fs` is the runnable proof.
+schema): a service cannot ask for it; the kernel decides who may issue resources. The kernel grants it
+to `resource-server` too - but ONLY in the `resource-test` build (`osdev test resource-server`), the
+only build that spawns this service - so the grant is effectively test-only, exactly as
+`reply-server`/`asker` are spawned only in the `reply-test` build (the kernel always embeds them; the
+supervisor feature gates whether they run). Built that way, the grant is present and the example runs
+for real against its client `examples/holder`. Built standalone (a plain `cargo build` of this crate
+alone, never spawned), the grant is absent, so `ctx.resource_mint` returns `None` and the service logs
+and idles - loud, bounded degradation (Commandment V); `fs` is the production proof.
 
 ## Why it is built this way (the Commandments)
 
@@ -98,6 +108,8 @@ resource per client, hand each client a `derive_cap` copy, then serve invocation
 
 ## See also
 
+- **`examples/holder`** - the client half this server grants to, spawned next to it by
+  `osdev test resource-server`. It proves use / non-escalation / revoke against the granted cap.
 - `services/fs` - the real resource server: a file is a delegated resource cap, minted on `Open`,
   served via the badge, revoked on delete/close.
 - The shell `fcap <file>` command + **CLAUDE.md §22 Test 14** (file-is-a-capability) - proves every

@@ -50,6 +50,8 @@ fn main() {
         ("COUNTER",    "counter"),  // examples/counter: stateful service, survives its own restart
         ("REPLY_SERVER", "reply-server"), // examples/reply-server: request/reply (RPC) server
         ("ASKER",      "asker"),    // examples/asker: the request/reply CLIENT that exercises reply-server
+        ("RESOURCE_SERVER", "resource-server"), // examples/resource-server: MINTs a delegated resource cap (§7.10)
+        ("HOLDER",     "holder"),   // examples/holder: the CLIENT that USEs the granted resource cap
     ];
 
     for (env_name, bin_name) in services {

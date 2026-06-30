@@ -30,6 +30,13 @@ counter-test = []
 # identity build (which use `bare-metal` / `identity-only` without this) so asker's per-tick RPC log
 # lines are test-only noise.
 reply-test = []
+# Additionally spawn `holder` + `resource-server` (examples/) on top of the bare-metal set - the
+# delegated-resource-capability pair (§7.10). resource-server MINTs a resource it owns, narrows a
+# READ-ONLY copy of the cap, and GRANTs it to `holder`; holder proves use / non-escalation / revoke.
+# Asserted by `osdev test resource-server`. `holder` is spawned FIRST so resource-server's SEND cap
+# to it wires at spawn (it grants the cap to holder). Kept OUT of the daily-driver image and identity
+# build so the example's per-boot mint/grant log lines are test-only noise.
+resource-test = []
 identity-only = []
 # Spawn only the regular performance-benchmark probe services (perf-b1…perf-b10
 # and their echo/victim partners).  Used by `osdev test perf` to eliminate the

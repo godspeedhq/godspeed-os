@@ -347,6 +347,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         ensure_wired(&ctx, &mut name_map, "asker", &["reply-server"]);
     }
 
+    // holder + resource-server (examples/): the delegated-resource-capability pair (§7.10). Spawned
+    // ONLY in the `resource-test` build (`osdev test resource-server`); idle/absent everywhere else.
+    // `holder` owns its endpoint and is the GRANT target, so it is recorded in the name-cap map
+    // (ensure_mapped) and MUST precede resource-server - resource-server's SEND cap to `holder` is
+    // wired from the map at its spawn (it GRANTs holder the minted resource cap). resource-server then
+    // mints a resource, narrows a READ-ONLY copy, grants it to holder, and serves holder's invocations;
+    // holder proves use / non-escalation / revoke. This is the REVERSE order of reply/asker (here the
+    // server sends to the client). On a supervisor respawn ensure_* adopts the running instances.
+    #[cfg(feature = "resource-test")]
+    {
+        ensure_mapped(&ctx, &mut name_map, "holder", 0xFFFF);
+        ensure_wired(&ctx, &mut name_map, "resource-server", &["holder"]);
+    }
+
     // xhci: USB host-controller driver (§12). Spawned in bare-metal + full
     // builds; the kernel maps its controller's MMIO BAR at spawn (Stage 2).
     #[cfg(not(any(feature = "identity-only", feature = "perf-only",

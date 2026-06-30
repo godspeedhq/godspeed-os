@@ -577,6 +577,37 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
+        // resource-server (examples/resource-server): the delegated-resource-capability OWNER (§7.10).
+        // Owns its endpoint (a cap holder's `resource_invoke` is routed here, badged) and SENDs to
+        // `holder` to GRANT it the minted resource cap. Holds RESOURCE_MINT (granted by name below,
+        // like fs). Spawned only in the resource-test build (`osdev test resource-server`); idle/absent
+        // everywhere else - standalone, without the mint grant, it just idles (graceful degrade, §7.10).
+        "resource-server" => Some(("resource-server", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_RESOURCE_SERVER_ELF")),
+            has_recv_endpoint: true,            // resource_invoke is routed here, badged with (rid, right)
+            send_peers:        &["holder"],     // sends the GRANT (the resource cap) to holder
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,        // round-robin (no [placement] in its contract)
+            probe_mode:        0,
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
+        // holder (examples/holder): the delegated-resource-capability CLIENT. Owns its endpoint (the
+        // GRANT lands here, and resource-server's replies to its cap invocations come back here). It
+        // declares NO send-peer: it acts only through the granted cap (the kernel routes a
+        // resource_invoke to the owner). Spawned only in the resource-test build; idle/absent elsewhere.
+        "holder" => Some(("holder", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_HOLDER_ELF")),
+            has_recv_endpoint: true,            // grant target + reply target for its resource_invokes
+            send_peers:        &[],             // names no one; uses the granted cap, routed by the kernel
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,        // round-robin (no [placement] in its contract)
+            probe_mode:        0,
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
         // ----------------------------------------------------------------
         // Probe services - §22 Group A identity tests.
         // All use the same probe ELF; probe_mode selects the test behaviour.
@@ -3226,7 +3257,12 @@ fn spawn_service_with_config(
     // The resource-mint authority (§7.10, P2 file-as-capability): held only by services that
     // issue delegated resources whose meaning they define. `fs` mints a file cap per open file.
     // Least-privilege (§3.1) - no other service can create delegated resources.
-    if name == "fs" {
+    // `resource-server` (examples/) is also granted it BY NAME (the same e1000-BAR-style by-name
+    // kernel grant, never a contract field): this turns the example from a compile-only template
+    // into the real, QEMU-proven `osdev test resource-server`. It only takes effect in the
+    // resource-test build, the only build that spawns `resource-server` - in every other build it
+    // is never spawned, so the grant never fires.
+    if name == "fs" || name == "resource-server" {
         let rm_cap = mint_cap(RESOURCE_MINT_RESOURCE, Rights::WRITE);
         caps.insert(rm_cap)
             .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
