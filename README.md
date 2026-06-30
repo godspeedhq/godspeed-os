@@ -92,23 +92,29 @@ Latest pass (2026-05-31, boot-verified on AMD T630; `milestones/v2/STATIC_ANALYS
 
 ## Getting started
 
-**Requirements:** Rust nightly (pinned in `rust-toolchain.toml`), QEMU, x86_64 host.
+**Requirements:** Rust nightly (pinned in `rust-toolchain.toml`), QEMU on your PATH, an x86_64 host, and the Limine bootloader binaries (one-time setup below). The same commands work on Linux, macOS, and Windows - `osdev` handles the platform differences, and there is no Makefile to keep in sync.
+
+**Set up Limine (once).** GodspeedOS boots via the Limine bootloader, whose binaries are not committed (`tools/` is gitignored). Download a Limine binary release (https://github.com/limine-bootloader/limine/releases - the project tracks the 12.x line) and copy these into `tools/limine/`:
+
+- `BOOTX64.EFI` - the UEFI bootloader (used by `osdev image`),
+- `limine-bios.sys` - the BIOS stage,
+- the host install tool: `limine` on Linux/macOS, `limine.exe` on Windows.
 
 ```bash
-# Build
+# Build the kernel + all services
 cargo run -p osdev -- build
 
 # Boot in QEMU with 4 cores
 cargo run -p osdev -- run --smp 4
 
-# Run identity test suite
+# Run the identity test suite
 cargo run -p osdev -- test identity
 
 # Run property tests
 cargo run -p osdev -- test property
 ```
 
-The full `osdev` CLI reference is in `CLAUDE.md §17`.
+The build is pure Cargo plus the `osdev` CLI - identical on every platform. The full `osdev` CLI reference is in `CLAUDE.md §17` and `osdev/CLAUDE.md`.
 
 ---
 
