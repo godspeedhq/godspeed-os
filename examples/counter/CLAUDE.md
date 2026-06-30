@@ -26,7 +26,7 @@ Two halves, using only real `ServiceContext` methods:
 | Reach `fs` | `ctx.acquire_send_cap("fs")` | resolve `fs` by name via the kernel directory; `None` -> degrade |
 | **Load-on-spawn** | `ctx.request_with_reply("fs", read_op)` | read `/counter.dat` and parse the saved count (reconstruct from the durable copy) |
 | **Save-on-change** | `ctx.request_with_reply("fs", write_op)` | after each increment, overwrite `/counter.dat` with the new count |
-| Recover from `fs` restart | `ctx.reacquire_via_registry("fs")` | on a missed reply (cap went `EndpointDead`), reacquire by name and retry once (§14.3) |
+| Recover from `fs` restart | `ctx.reacquire_by_name("fs")` | on a missed reply (cap went `EndpointDead`), reacquire by name and retry once (§14.3) |
 
 The shape of the lifecycle:
 

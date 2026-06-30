@@ -29,7 +29,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
             Err(IpcError::EndpointDead) => {
                 ctx.log("ping: pong endpoint dead, reacquiring via the kernel name directory");
-                if ctx.reacquire_via_registry("pong") {
+                if ctx.reacquire_by_name("pong") {
                     ctx.log("ping: pong cap reacquired, resuming");
                 } else {
                     ctx.log("ping: reacquire failed, retrying next tick");

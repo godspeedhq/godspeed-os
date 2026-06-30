@@ -273,32 +273,9 @@ pub enum AllocError {
 // ServiceContext.
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Registry wire protocol (H11). Shared by the `registry` service and the
-// `register`/`registry_lookup` client helpers above.
-//
-//   Register request : payload [REGISTER, name_len, name…] + embedded SEND|GRANT
-//                       cap to the registrant's endpoint.
-//   Lookup request   : payload [LOOKUP, name_len, name…]   + embedded SEND cap to
-//                       the client's reply endpoint.
-//   Lookup reply     : payload [FOUND]      + embedded SEND cap to the named service,
-//                    or payload [NOT_FOUND]  (no cap).
-// ---------------------------------------------------------------------------
-
-/// Registry op: announce `name → my endpoint`.
-pub const REGISTRY_OP_REGISTER: u8 = 0;
-/// Registry op: resolve `name`, reply with a SEND cap.
-pub const REGISTRY_OP_LOOKUP:   u8 = 1;
-/// Lookup reply: name found; a cap is embedded.
-pub const REGISTRY_FOUND:       u8 = 0;
-/// Lookup reply: name not registered; no cap.
-pub const REGISTRY_NOT_FOUND:   u8 = 1;
-/// Max registry name length (matches the kernel name registry).
-pub const REGISTRY_NAME_MAX:    usize = 32;
-
 /// Point the dynamic send-cap cache entry for `name` at `new_slot`, so the next
-/// `find_send_slot(name)` resolves to the freshly-acquired cap. Shared by the
-/// registry reacquire path; mirrors the inline update in `reacquire_cap`.
+/// `find_send_slot(name)` resolves to the freshly-acquired cap. Mirrors the inline
+/// update in `reacquire_cap`.
 fn cache_send_slot(name: &str, new_slot: u32) {
     let bytes = name.as_bytes();
     let len   = bytes.len().min(PEER_NAME_BYTES);
@@ -318,17 +295,6 @@ fn cache_send_slot(name: &str, new_slot: u32) {
             }
         }
     }
-}
-
-/// Encode a register/lookup request payload: `[op, name_len, name…]`.
-fn registry_request(op: u8, name: &str) -> Message {
-    let nb  = name.as_bytes();
-    let len = nb.len().min(REGISTRY_NAME_MAX);
-    let mut buf = [0u8; 2 + REGISTRY_NAME_MAX];
-    buf[0] = op;
-    buf[1] = len as u8;
-    buf[2..2 + len].copy_from_slice(&nb[..len]);
-    Message::from_bytes(&buf[..2 + len])
 }
 
 /// Passed by the kernel to `service_main`. Non-Copy; one per service instance.
@@ -512,68 +478,10 @@ impl ServiceContext {
         if slot == u32::MAX { None } else { Some(crate::capability::CapHandle(slot)) }
     }
 
-    /// Announce this service to the `registry` under `name` (H11). Derives a
-    /// `SEND|GRANT` copy of our self-endpoint cap and grants it to the registry, which
-    /// records `name → cap` and later hands SEND copies to clients that look the name
-    /// up. Idempotent - call again to re-register (e.g. after a registry restart).
-    /// Requires a `registry` send-peer and a self endpoint. Returns `true` on send.
-    pub fn register(&self, name: &str) -> bool {
-        let reg = match self.find_send_slot("registry") {
-            Some(s) => CapHandle(s),
-            None    => return false,
-        };
-        let self_grant = match self.self_grant_handle() {
-            Some(h) => h,
-            None    => return false,
-        };
-        let to_grant = match self.derive_cap(self_grant) {
-            Some(h) => h,
-            None    => return false,
-        };
-        let msg = registry_request(REGISTRY_OP_REGISTER, name);
-        self.send_with_cap_by_handle(reg, to_grant, &msg).is_ok()
-    }
-
-    /// Look `name` up via the registry; return a fresh SEND cap to it, or `None` if
-    /// the name is not registered (H11). **Blocks** on this service's own endpoint
-    /// for the registry's reply, so the service must have an endpoint and not expect
-    /// other traffic to race the reply. Replaces the kernel `reacquire_cap` path once
-    /// services are cut over (Phase 5).
-    pub fn registry_lookup(&self, name: &str) -> Option<CapHandle> {
-        let self_grant = self.self_grant_handle()?;
-        // A SEND|GRANT copy of our own endpoint cap - the registry replies here.
-        let reply_cap = self.derive_cap(self_grant)?;
-        let req = registry_request(REGISTRY_OP_LOOKUP, name);
-
-        // Send the lookup to the registry. Our cached `registry` cap can be stale if the
-        // registry itself has restarted (H11) - and the registry is the one name a client
-        // cannot resolve *through* the registry (you can't look the namer up in the namer).
-        // So on a failed send, reacquire a fresh `registry` SEND cap from the **kernel name
-        // table** (syscall 10 - the bootstrap exception) and retry once. The send only fails
-        // here on a dead endpoint cap, which leaves `reply_cap` untouched (the kernel
-        // validates the endpoint cap before the embedded grant), so reusing it is leak-free.
-        // NOTE (stopgap): this is the one place a client falls back to the kernel name path;
-        // all other reacquisition still goes through the userspace registry. The planned
-        // "move naming to the supervisor" work removes this exception - see docs.
-        let mut reg = CapHandle(self.find_send_slot("registry")?);
-        if self.send_with_cap_by_handle(reg, reply_cap, &req).is_err() {
-            reg = self.reacquire_cap("registry").ok()?;
-            self.send_with_cap_by_handle(reg, reply_cap, &req).ok()?;
-        }
-
-        // The registry always replies (found or not-found).
-        let reply = crate::ipc::recv(self.recv_handle()?).ok()?;
-        if reply.payload_bytes().first() == Some(&REGISTRY_FOUND) {
-            self.take_pending_cap()
-        } else {
-            None
-        }
-    }
-
     /// Send a request to a named `peer` and block for its reply (synchronous
     /// request/response). Embeds a per-request reply cap - a `SEND|GRANT` copy of
     /// this service's own endpoint cap - so the server can reply via
-    /// `take_pending_cap()` + `send_by_handle()` (the registry pattern, §8). The
+    /// `take_pending_cap()` + `send_by_handle()` (the request/reply pattern, §8). The
     /// caller must own an endpoint and not have other traffic racing the reply.
     /// `None` if the peer is unknown, the cap cannot be derived, or the send fails.
     pub fn request_with_reply(
@@ -631,19 +539,18 @@ impl ServiceContext {
     /// `try_send(peer)` / `send(peer)` use the new cap. Returns `false` if `peer` cannot currently
     /// be resolved (e.g. it has not finished respawning) - the caller should retry on a later tick.
     ///
-    /// **Path C (Phase 4):** this now resolves via the **kernel name-directory** (syscall 10,
-    /// `reacquire_cap`) rather than the registry *service*. The directory is populated synchronously
-    /// at each service's spawn, so there is no registry round-trip and no bootstrap chicken-and-egg
-    /// (the directory lives in the kernel, always reachable). `reacquire_cap` also updates the
-    /// send-cap cache. (Name kept until the registry service is fully removed, §4c.)
-    pub fn reacquire_via_registry(&self, peer: &str) -> bool {
+    /// A thin shim over `reacquire_cap` (syscall 10): name resolution is the **kernel name
+    /// directory**, not a service. The directory is populated synchronously at each service's spawn,
+    /// so there is no round-trip and no bootstrap chicken-and-egg (the directory lives in the kernel,
+    /// always reachable). `reacquire_cap` also updates the send-cap cache.
+    pub fn reacquire_by_name(&self, peer: &str) -> bool {
         self.reacquire_cap(peer).is_ok()
     }
 
     /// Handle to this service's `SEND|GRANT` cap to its **own** endpoint, minted at
-    /// spawn (H11). The service announces itself to the registry by deriving a copy
-    /// (`derive_cap`) and granting it across - keeping this original so it can
-    /// re-register after a registry restart. `None` if the service has no endpoint.
+    /// spawn. A service hands a copy of its endpoint to a peer by deriving one
+    /// (`derive_cap`) and granting it across - keeping this original so it can derive
+    /// again later. `None` if the service has no endpoint.
     pub fn self_grant_handle(&self) -> Option<crate::capability::CapHandle> {
         let slot = Self::ctx().self_grant_slot;
         if slot == u32::MAX { None } else { Some(crate::capability::CapHandle(slot)) }

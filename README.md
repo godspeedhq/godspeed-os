@@ -120,7 +120,7 @@ services/     system services (supervisor, logger, block-driver, fs, shell, ...)
 sdk/rust/     Rust SDK for service development
 osdev/        build / test / run tooling
 contracts/    service contracts and JSON schema
-examples/     demonstration services (ping, pong, greet, upper, roster)
+examples/     annotated, Commandment-grounded teaching examples (start at examples/README.md)
 tests/        identity, property, fuzz, stress, chaos suites
 docs/         architecture notes and design docs
 ```

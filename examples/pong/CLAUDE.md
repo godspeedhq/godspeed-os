@@ -23,7 +23,7 @@ pong does NOT self-register - there is no `ctx.register` call, and the registry 
 retired (naming Path C / Phase 4). Instead the kernel **name directory** (`ipc::names`) records
 `"pong" -> its endpoint` synchronously at spawn, and refreshes that entry on every restart with
 the fresh endpoint/core. So ping reacquires pong by name through the directory
-(`reacquire_via_registry("pong")`, a thin shim over `reacquire_cap` / syscall 10) with **no push
+(`reacquire_by_name("pong")`, a thin shim over `reacquire_cap` / syscall 10) with **no push
 from pong** - the restarted pong's new endpoint is already in the directory, so ping's next lookup
 resolves to the new instance. pong therefore declares no `ipc_send` peer at all; it only receives.
 

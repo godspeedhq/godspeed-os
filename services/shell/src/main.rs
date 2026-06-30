@@ -3229,7 +3229,7 @@ const CHAOS_SAVE_TOTAL_SECS: i64 = 30;
 fn chaos_save_retry(ctx: &ServiceContext, ppath: &[u8], data: &[u8]) -> bool {
     let t0 = ctx.datetime().epoch_secs();
     loop {
-        let _ = ctx.reacquire_via_registry("fs");
+        let _ = ctx.reacquire_by_name("fs");
         if save_report(ctx, ppath, data) { return true; }
         if ctx.datetime().epoch_secs() - t0 >= CHAOS_SAVE_TOTAL_SECS { return false; }
         for _ in 0..CHAOS_SETTLE_YIELDS { ctx.yield_cpu(); }
@@ -3958,7 +3958,7 @@ fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<
     // No reply usually means `fs` restarted and our cached cap is now EndpointDead (Phase D,
     // §14.3). Reacquire a fresh `fs` cap via the registry and retry once; if `fs` hasn't
     // finished re-registering yet, this returns None and the next command retries.
-    if ctx.reacquire_via_registry("fs") {
+    if ctx.reacquire_by_name("fs") {
         return ctx.request_with_reply("fs", &msg);
     }
     None
@@ -3984,7 +3984,7 @@ fn fs_request_bounded(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) ->
     if let Some(r) = ctx.request_with_reply_deadline("fs", &msg, SAVE_FS_MAX_SECS) {
         return Some(r);
     }
-    if ctx.reacquire_via_registry("fs") {
+    if ctx.reacquire_by_name("fs") {
         return ctx.request_with_reply_deadline("fs", &msg, SAVE_FS_MAX_SECS);
     }
     None

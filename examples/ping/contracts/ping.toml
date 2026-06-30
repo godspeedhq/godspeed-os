@@ -16,7 +16,7 @@ limit   = "64MiB"
 # (what `osdev validate` checks) and `contracts/CLAUDE.md`. The options are: ipc_send,
 # ipc_receive, log_write, hw_mmio, hw_interrupt, hw_pio (+ service_control, supervisor-only).
 ipc_send    = ["pong"]   # may SEND to pong (the peer). Reacquiring pong after a restart goes through the
-                         # kernel NAME DIRECTORY (a syscall: ctx.reacquire_via_registry -> reacquire_cap), not a
+                         # kernel NAME DIRECTORY (a syscall: ctx.reacquire_by_name -> reacquire_cap), not a
                          # "registry" send-peer - the registry service is retired (naming Path C / Phase 4).
 ipc_receive = ["ping"]               # OWNS and receives on its own "ping" endpoint
 log_write   = true                   # may write to the logger

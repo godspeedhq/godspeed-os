@@ -34,7 +34,7 @@ embeds it in the request, sends it to reply-server, and blocks on asker's endpoi
 | Build a request | `Message::from_bytes(...)` | the payload (an incrementing decimal here) |
 | Round-trip | `ctx.request_with_reply("reply-server", &req)` | derive reply cap from our endpoint, GRANT it embedded in the request, block for the reply |
 | Check the echo | `reply.payload_bytes() == request` | the reply must equal the request - proof the round-trip closed |
-| Recover | `ctx.reacquire_via_registry("reply-server")` | on `None` (peer still spawning / restarted) reacquire by name and retry |
+| Recover | `ctx.reacquire_by_name("reply-server")` | on `None` (peer still spawning / restarted) reacquire by name and retry |
 
 ## Why it is built this way (the Commandments)
 

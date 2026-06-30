@@ -29,10 +29,6 @@ pub use ipc::{Message, IpcError};
 pub use mmio::Mmio;
 pub use record::{Table, Value, RecordSink, parse_predicate};
 pub use service_context::{ServiceContext, TaskStat, CapInfo, Datetime};
-pub use service_context::{
-    REGISTRY_OP_REGISTER, REGISTRY_OP_LOOKUP, REGISTRY_FOUND, REGISTRY_NOT_FOUND,
-    REGISTRY_NAME_MAX,
-};
 
 pub type Result<T> = core::result::Result<T, Error>;
 

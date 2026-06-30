@@ -1,8 +1,10 @@
-# The Registry: why a name service exists (§14.2, §3.11, §26.10)
+# The Registry: why a name service existed (HISTORICAL) (§14.2, §3.11, §26.10)
 
-> Narrative design doc. Explains *why* GodspeedOS has a `registry` service at all -
-> the reasoning behind name → capability resolution. The spec (`CLAUDE.md`) is the
-> authority; this trails it as a courtesy to readers.
+> **HISTORICAL - the `registry` SERVICE is RETIRED** (naming Path C / Phase 4). Name -> endpoint
+> resolution now lives in the kernel's minimal name DIRECTORY (`ipc::names` + the gated
+> `AcquireSendCap`); the supervisor wires each service from a `name -> cap` map at boot and restart.
+> See `docs/naming-design.md` for the current design. This doc is kept ONLY to explain *why* a name
+> service was ever needed - nothing in it is live. The spec (`CLAUDE.md`) is the authority.
 
 ## The fundamental problem: how do you get the *first* capability?
 

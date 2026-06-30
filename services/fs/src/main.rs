@@ -272,7 +272,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let start = ctx.datetime().epoch_secs();
         let mut cap = block_capacity(&ctx).unwrap_or(0);
         while cap == 0 && ctx.datetime().epoch_secs() - start < FS_BLOCK_WAIT_SECS {
-            let _ = ctx.reacquire_via_registry("block-driver");
+            let _ = ctx.reacquire_by_name("block-driver");
             for _ in 0..FS_BLOCK_RETRY_YIELDS { ctx.yield_cpu(); }
             cap = block_capacity(&ctx).unwrap_or(0);
         }
@@ -2293,7 +2293,7 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
     if let Some(r) = ctx.request_with_reply("block-driver", &msg) {
         return Some(r);
     }
-    if ctx.reacquire_via_registry("block-driver") {
+    if ctx.reacquire_by_name("block-driver") {
         return ctx.request_with_reply("block-driver", &msg);
     }
     None

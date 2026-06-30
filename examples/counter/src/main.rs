@@ -67,7 +67,7 @@ fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<
     if let Some(r) = ctx.request_with_reply("fs", &msg) {
         return Some(r);
     }
-    if ctx.reacquire_via_registry("fs") {
+    if ctx.reacquire_by_name("fs") {
         return ctx.request_with_reply("fs", &msg);
     }
     None

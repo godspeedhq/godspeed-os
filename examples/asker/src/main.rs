@@ -60,7 +60,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // Reacquire it by name through the kernel directory and retry next tick
                 // (§14.3) - wait for truth, not a sleep (Commandment VIII/IX).
                 ctx.log("asker: no reply (reply-server unreachable) - reacquiring by name");
-                ctx.reacquire_via_registry("reply-server");
+                ctx.reacquire_by_name("reply-server");
             }
         }
 
