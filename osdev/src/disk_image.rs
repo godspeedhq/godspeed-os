@@ -99,7 +99,7 @@ pub fn install_bootloader(limine_dir: &Path, image_path: &Path) {
         eprintln!("  1. Download a release from:");
         eprintln!("     https://github.com/limine-bootloader/limine/releases");
         eprintln!("  2. Extract to tools/limine/");
-        eprintln!("  3. Ensure limine-bios.sys and limine.exe are present");
+        eprintln!("  3. Ensure limine-bios.sys and the limine host tool are present (limine on Linux/macOS, limine.exe on Windows)");
         std::process::exit(1);
     }
 
