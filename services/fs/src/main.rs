@@ -262,70 +262,60 @@ const E_IO: &str = "storage unreadable (I/O error)";
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("fs: starting");
 
-    // `block-driver` may still be re-initialising when we start - a chaos storm can restart it just
-    // before (or alongside) us, or our cached cap may be stale after its restart. Retry the capacity
-    // query - reacquiring its cap - until it reports a REAL disk, so we never mount a phantom
-    // 0-capacity disk and then "serve" a broken filesystem (every read would fail until a manual
-    // respawn - the bug `chaos max-carnage` exposed). Bounded by wall-clock time: on a genuinely
-    // diskless machine block-driver reports 0 forever, so we fall through and serve raw (§3.12).
-    const FS_BLOCK_WAIT_SECS: i64 = 8;
-    const FS_BLOCK_RETRY_YIELDS: u32 = 4000;
-    let mut capacity = {
-        let start = ctx.datetime().epoch_secs();
-        let mut cap = block_capacity(&ctx).unwrap_or(0);
-        while cap == 0 && ctx.datetime().epoch_secs() - start < FS_BLOCK_WAIT_SECS {
-            let _ = ctx.reacquire_by_name("block-driver");
-            for _ in 0..FS_BLOCK_RETRY_YIELDS { ctx.yield_cpu(); }
-            cap = block_capacity(&ctx).unwrap_or(0);
+    // Wait on block-driver's TRUTH, never on a clock (Commandment VIII). `block_capacity` returns
+    // None only while block-driver is not answering yet - still registering, or our cached cap went
+    // stale after its restart (a chaos storm can restart it just before or alongside us). A `Some`
+    // is its authoritative reply: a real sector count, or a true 0 = genuinely no disk. block-driver
+    // serves requests only AFTER its own init (the AHCI COMRESET + IDENTIFY), so a `Some` reflects a
+    // settled controller, never a phantom 0. Reacquire and retry until it answers - no timeout.
+    let mut capacity = loop {
+        match block_capacity(&ctx) {
+            Some(cap) => break cap,
+            None => {
+                let _ = ctx.reacquire_by_name("block-driver");
+                ctx.yield_cpu();
+            }
         }
-        cap
     };
     ctx.log_fmt(format_args!("fs: disk capacity = {} sectors ({} MiB)", capacity, capacity / 2048));
 
-    // Self-reconciling mount (the bug `chaos max-carnage` exposed): after thousands of mid-command
-    // kills the AHCI controller can be left wedged BSY, so the FIRST mount's superblock read fails
-    // with a device I/O error even though the disk is intact. With the block-driver COMRESET
-    // (services/block-driver/src/ahci.rs) a re-init hard-resets the port the way a cold boot does,
-    // so the controller recovers within a couple of attempts - we RE-QUERY capacity (never reuse a
-    // latched 0) and RE-ATTEMPT the mount with NO external/client poke. We retry ONLY a device I/O
-    // error: a genuine bad-magic / blank superblock is a legitimately raw (never-formatted) disk
-    // and must NOT spin (§3.12). Bounded by wall-clock (§26.6); on a truly dead device we fall
-    // through and serve raw, telling the truth (and never inviting a data-destroying reformat).
-    const FS_MOUNT_WAIT_SECS: i64 = 8;
-    let mut mount_io_error = false;
-    let mut fs: Option<Fs> = {
-        let start = ctx.datetime().epoch_secs();
-        loop {
-            match Fs::mount(&ctx) {
-                Ok(f) => {
-                    ctx.log_fmt(format_args!(
-                        "fs: mounted GSFS0008 ({} blocks, bitmap {}..{}, root@{}, {} free)",
-                        f.total_blocks, f.bitmap_start, f.data_start, f.root_first_block, f.free_blocks
-                    ));
-                    break Some(f);
-                }
-                Err(e) if e == E_IO && ctx.datetime().epoch_secs() - start < FS_MOUNT_WAIT_SECS => {
-                    // Device unreadable: the controller may be mid-reset. Reacquire block-driver,
-                    // yield, re-query capacity (do not latch a stale 0), and re-attempt the mount -
-                    // the block-driver COMRESET clears a wedged port so this resolves at startup.
-                    ctx.log("fs: storage unreadable (I/O error) - controller may be resetting, retrying mount");
-                    let _ = ctx.reacquire_by_name("block-driver");
-                    for _ in 0..FS_BLOCK_RETRY_YIELDS { ctx.yield_cpu(); }
-                    capacity = block_capacity(&ctx).unwrap_or(capacity);
-                }
-                Err(e) => {
-                    if e == E_IO {
-                        // I/O error past the window: tell the truth and NEVER suggest a reformat
-                        // (the data is intact, awaiting storage recovery - a flash would destroy it).
-                        mount_io_error = true;
+    // Self-reconciling mount, waiting on TRUTH not time (Commandment VIII). After thousands of
+    // mid-command kills the AHCI controller can be left wedged BSY, so a superblock read can fail
+    // with a device I/O error (E_IO) though the disk is intact; the block-driver COMRESET
+    // (services/block-driver/src/ahci.rs) hard-resets the port the way a cold boot does, so a
+    // re-attempt succeeds once the controller settles. We never time out: on E_IO we reacquire and
+    // ask block-driver itself. If it has gone quiet (`block_capacity` None) it is restarting, so we
+    // wait on its truth and retry the mount. If it ANSWERS, the read failed AFTER its own COMRESET +
+    // retries, so the failure is authoritative - we serve raw, honestly, and NEVER invite a reformat
+    // (§3.12, the data is intact). A genuine bad-magic / blank superblock is a legitimately raw
+    // (never-formatted) disk and serves raw at once - no spin.
+    let mut fs: Option<Fs> = loop {
+        match Fs::mount(&ctx) {
+            Ok(f) => {
+                ctx.log_fmt(format_args!(
+                    "fs: mounted GSFS0008 ({} blocks, bitmap {}..{}, root@{}, {} free)",
+                    f.total_blocks, f.bitmap_start, f.data_start, f.root_first_block, f.free_blocks
+                ));
+                break Some(f);
+            }
+            Err(e) if e == E_IO => {
+                let _ = ctx.reacquire_by_name("block-driver");
+                match block_capacity(&ctx) {
+                    // block-driver is not answering: it is restarting. Wait on its truth, retry.
+                    None => ctx.yield_cpu(),
+                    // block-driver answered yet the read still failed (after its COMRESET + retries):
+                    // authoritative. Serve raw, honestly - never invite a data-destroying flash.
+                    Some(cap) => {
+                        capacity = cap;
                         ctx.log("fs: storage unreadable (I/O error) - not serving a filesystem; do NOT run 'drives flash' (data is intact, awaiting storage recovery)");
-                    } else {
-                        // A genuinely raw/blank or corrupt disk - the normal state of a never-flashed
-                        // drive. This is the only path that may invite a flash.
-                        ctx.log_fmt(format_args!("fs: no filesystem ({}) - awaiting drives flash", e));
+                        break None;
                     }
-                    break None;
                 }
+            }
+            Err(e) => {
+                // A genuinely raw/blank or corrupt disk - the normal state of a never-flashed drive.
+                ctx.log_fmt(format_args!("fs: no filesystem ({}) - awaiting drives flash", e));
+                break None;
             }
         }
     };
@@ -355,44 +345,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Path C (Phase 4): no self-registration - the kernel name-directory records "fs" at spawn
     // (refreshed on restart), so the shell reacquires us by name via the directory (§14.3).
 
-    // Background self-reconcile (§26.7): if we came up UNMOUNTED because storage was unreadable (a
-    // wedged controller), the SDK's timed receive (`recv_timeout`, already in the SDK - no new
-    // kernel surface) lets us re-attempt the mount on our OWN initiative, so a LATER controller
-    // recovery heals fs with no client poke and no restart. While unmounted-for-I/O we idle for a
-    // request on `recv_timeout`; on each timeout we retry the mount. When mounted (or on a genuinely
-    // raw/corrupt disk) we use a plain blocking recv - no polling, no wasted wakeups.
-    const FS_RECONCILE_CYCLES: u64 = 4_000_000_000; // ~2 s at ~2 GHz (the xhci/ehci cycle-clock idiom)
-
+    // Serve loop: block on the next request - wait on truth (an actual message), never a clock
+    // (Commandment VIII). The mount above already self-reconciled on block-driver's truth, so we
+    // come up either mounted or on a genuinely raw/unreadable disk; if block-driver restarts at run
+    // time, `serve` reacquires it by name and the client retries (§14.3).
     ctx.log("fs: serving file API");
     loop {
-        let msg = if fs.is_none() && mount_io_error {
-            match ctx.recv_timeout(FS_RECONCILE_CYCLES) {
-                Some(m) => m,
-                None => {
-                    // Idle timeout while unmounted-for-I/O: re-attempt the mount ourselves. The
-                    // block-driver COMRESET may have healed the controller since boot.
-                    let _ = ctx.reacquire_by_name("block-driver");
-                    match Fs::mount(&ctx) {
-                        Ok(f) => {
-                            capacity = block_capacity(&ctx).unwrap_or(capacity);
-                            ctx.log_fmt(format_args!(
-                                "fs: storage recovered - mounted GSFS0008 ({} blocks, {} free)",
-                                f.total_blocks, f.free_blocks));
-                            fs = Some(f);
-                            mount_io_error = false;
-                        }
-                        // Still unreadable: keep idling and retrying on the next timeout.
-                        Err(e) if e == E_IO => {}
-                        // No longer an I/O error (now reads as raw/corrupt): stop reconciling - it is
-                        // no longer the wedged-controller case, so periodic remount would be pointless.
-                        Err(_) => mount_io_error = false,
-                    }
-                    continue;
-                }
-            }
-        } else {
-            ctx.recv()
-        };
+        let msg = ctx.recv();
         // A delegated-resource badge (§7.10) is set ONLY by the kernel after it validated a real
         // file cap - so its presence means "this is a trusted file-cap invocation", impossible to
         // forge over the ordinary fs send-cap. No badge → a name-addressed request.
