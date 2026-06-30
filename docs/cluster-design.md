@@ -22,7 +22,7 @@ EndpointId → (NodeId, CoreId)
 
 This extends "location" from a core to a (node, core) pair while leaving everything else - EndpointId, generation, liveness, capability structure - unchanged. The invariant "identity is stable; location is not" already encodes this. SMP taught the system that identity and execution location are separate concepts. Cluster mode extends the definition of location; it does not change the philosophy.
 
-The generation mechanism already handles service mobility across nodes correctly. When a service moves to a new node, its endpoint generation is bumped. Clients receive `EndpointDead` on their next send, look up the new endpoint via the registry, and resume with a new cap that routes to `(NodeId=2, CoreId=0)` instead of `(NodeId=0, CoreId=1)`. Client code does not change - the pattern is identical to the existing cross-core restart flow demonstrated by `restart_changes_core_transparently` (§22 Test 10 in CLAUDE.md).
+The generation mechanism already handles service mobility across nodes correctly. When a service moves to a new node, its endpoint generation is bumped. Clients receive `EndpointDead` on their next send, look up the new endpoint via the name directory, and resume with a new cap that routes to `(NodeId=2, CoreId=0)` instead of `(NodeId=0, CoreId=1)`. Client code does not change - the pattern is identical to the existing cross-core restart flow demonstrated by `restart_changes_core_transparently` (§22 Test 10 in CLAUDE.md).
 
 ---
 
@@ -76,9 +76,9 @@ ledger.send_remote(msg, Duration::from_millis(500))?;
 
 `RemoteSendCap` is a distinct type from `LocalSendCap`. The compiler prevents calling `send()` on a remote endpoint. That is "explicit authority" applied to the network boundary at compile time - the network boundary is visible at three layers: contract review, code review, and compiler.
 
-**The registry is the cluster-aware component, not the application.** When the app calls `ctx.remote_send_cap("ledger")`, the SDK queries the registry, which resolves `"ledger"` to `(NodeId=2, CoreId=0, EndpointId=7, Generation=3)`. The application receives a cap and does not need to know which node.
+**The name directory is the cluster-aware component, not the application.** When the app calls `ctx.remote_send_cap("ledger")`, the SDK queries the name directory, which resolves `"ledger"` to `(NodeId=2, CoreId=0, EndpointId=7, Generation=3)`. The application receives a cap and does not need to know which node.
 
-**Mobility.** If `ledger` restarts on node 3, the client receives `RemoteEndpointDead`, queries the registry, and gets a new cap. The reacquire pattern is identical to the local restart flow. No new error-handling primitives are required.
+**Mobility.** If `ledger` restarts on node 3, the client receives `RemoteEndpointDead`, queries the name directory, and gets a new cap. The reacquire pattern is identical to the local restart flow. No new error-handling primitives are required.
 
 **Local-only services are unaffected.** An application that never declares `ipc_send_remote` compiles and runs identically whether or not the machine is part of a cluster. Cluster semantics do not leak in.
 
@@ -137,17 +137,17 @@ This should be stated explicitly in the API documentation for `send_remote` so d
 
 ---
 
-## 7. The registry problem
+## 7. The naming problem
 
-The bullet "the registry must become cluster-aware" in the current spec is doing enormous work in one sentence. It covers at minimum:
+The bullet "the name directory must become cluster-aware" in the current spec is doing enormous work in one sentence. It covers at minimum:
 
 1. **Distributed name resolution.** How does node A learn about endpoints on node B? Push (nodes announce services on join), pull (query a central directory), or gossip? Each has failure modes.
 2. **Node membership tracking.** What nodes are in the cluster? Who decides? How is the membership list kept consistent across nodes?
-3. **Handling unreachable nodes.** If the node hosting `"ledger"` is unreachable, what does the registry return? Stale data? An error? How long before a node is declared dead vs partitioned?
-4. **Consistency vs availability.** If the registry is the cluster-aware component, it is also the distributed-systems component. A partitioned registry either returns stale data (availability) or blocks (consistency). Neither is free.
-5. **Possible consensus requirement.** If multiple nodes can register services, the registry may need distributed consensus (Raft or equivalent) to prevent split-brain registration of the same service name on two nodes simultaneously.
+3. **Handling unreachable nodes.** If the node hosting `"ledger"` is unreachable, what does the name directory return? Stale data? An error? How long before a node is declared dead vs partitioned?
+4. **Consistency vs availability.** If the name directory is the cluster-aware component, it is also the distributed-systems component. A partitioned name directory either returns stale data (availability) or blocks (consistency). Neither is free.
+5. **Possible consensus requirement.** If multiple nodes can register services, the name directory may need distributed consensus (Raft or equivalent) to prevent split-brain registration of the same service name on two nodes simultaneously.
 
-Making the registry cluster-aware is likely the largest single piece of work in cluster mode - comparable in effort to most of v1. It is not an incremental extension of the existing name-lookup table. It is a new distributed system component. Future design work should scope this explicitly rather than treating it as a one-sentence prerequisite.
+Making the name directory cluster-aware is likely the largest single piece of work in cluster mode - comparable in effort to most of v1. It is not an incremental extension of the existing name-lookup table. It is a new distributed system component. Future design work should scope this explicitly rather than treating it as a one-sentence prerequisite.
 
 ---
 
@@ -181,7 +181,7 @@ However, mTLS solves authentication between two endpoints, not cluster membershi
 2. **Certificate revocation.** When a node is compromised or decommissioned, its certificate must be revoked and that revocation must propagate to all peers. Standard revocation (OCSP, CRL) has latency; during the propagation window a revoked cert remains valid.
 3. **Former members with valid certs.** A node that has been removed from the cluster may still hold certificates that pass mTLS validation until they expire. mTLS alone does not prevent a decommissioned node from re-authenticating - cluster membership must be checked at the application layer as well.
 
-These three problems interact directly with §7 (the registry controls which nodes are legitimate sources of name registrations) and §9 (TCB authority defines which nodes can issue restarts). Certificate trust, name authority, and restart authority are the same trust system viewed from three angles. They cannot be designed in isolation from each other.
+These three problems interact directly with §7 (the name directory controls which nodes are legitimate sources of name registrations) and §9 (TCB authority defines which nodes can issue restarts). Certificate trust, name authority, and restart authority are the same trust system viewed from three angles. They cannot be designed in isolation from each other.
 
 ---
 
@@ -221,10 +221,10 @@ No option is obviously correct. The choice shapes the entire cluster security mo
 |----------|----------------|-----------|
 | Transport protocol choice | §8 | Yes - shapes failure semantics and ordering |
 | Cluster membership and cert trust model | §8.1 | Yes - mTLS alone is insufficient; membership check needed |
-| Registry consistency model | §7 | Yes - defines what `remote_send_cap("name")` can guarantee |
+| Name-directory consistency model | §7 | Yes - defines what `remote_send_cap("name")` can guarantee |
 | TCB authority model across nodes | §9 | Yes - cannot ship without this resolved |
 | Flow control / backpressure primitive | §5 | No - deferral forces app-level rate limiting; tradeoff stated |
 | Ordering guarantee level | §6 | No - "transport-dependent" with documentation is acceptable |
 | Delivery acknowledgment semantics | §4 | No - "Unknown" is a valid stated answer |
 
-The three blocking questions (transport, registry, TCB authority) are interdependent: the cert trust model in §8.1 connects all three. They cannot be resolved independently and should be addressed together in a dedicated threat-model exercise before any cluster implementation begins.
+The three blocking questions (transport, naming, TCB authority) are interdependent: the cert trust model in §8.1 connects all three. They cannot be resolved independently and should be addressed together in a dedicated threat-model exercise before any cluster implementation begins.

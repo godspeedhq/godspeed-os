@@ -551,14 +551,14 @@ active on every mutation.
 > trusted root - their death becomes a **supervisor restart, not a panic+reboot**. The
 > non-restartable set shrinks to just `init` + `supervisor` + kernel.
 
-**Mechanism (mirrors the H11 registry path).**
-- The kernel's death path notifies the supervisor for `registry`, `fs`, and `block-driver`
-  (sending the dead service's name); `assert_tcb_alive` guards only `init`/`supervisor`, so
+**Mechanism (mirrors the kernel name-directory recovery path).**
+- The kernel's death path notifies the supervisor for `fs` and `block-driver`
+  (sending the dead service's name); `assert_tcb_alive` guards only `supervisor`, so
   killing `fs`/`block-driver` never panics.
 - The supervisor's death-notification loop respawns the named service. `block-driver` respawns
   before `fs` (fs's send-peer cap to it wires from the kernel name table at spawn).
-- `fs` and `block-driver` **register** their names with the registry at startup, so clients can
-  reacquire a fresh cap after a restart.
+- `fs` and `block-driver` are **recorded in the kernel name directory** at spawn, so clients can
+  reacquire a fresh cap by name after a restart.
 - On restart, `fs` re-mounts - replaying the journal if the crash interrupted a commit (§6.8) -
   so it always comes back consistent. The persisted data is intact.
 - Clients reacquire + retry on `EndpointDead` (§14.3): the shell's `fs_request` reacquires `fs`,

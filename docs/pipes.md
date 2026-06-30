@@ -170,10 +170,10 @@ A service stage is wired with **no new syscall**:
 
 1. The shell spawns the service with `spawn_pipe(service, "shell")`. The delegated SEND cap to
    the shell's own endpoint is installed **first** (`send_peer_at(0)`) - that is the service's
-   "downstream". The service's contracted peers (e.g. `registry`) follow, so a filter that must
-   register to receive input still can.
+   "downstream". The service's contracted peers (e.g. `fs`) follow, so a filter that must
+   reach them to receive input still can.
 2. If the stage has input (a filter/sink, not stage 1), the shell resolves the service's
-   endpoint with `registry_lookup` (the service self-registers) and sends the input buffer as
+   endpoint by name via the kernel directory (the kernel records the name at spawn) and sends the input buffer as
    **one message**, then an **EOT**.
 3. The service processes and sends its output back to the shell (`send_peer_at(0)`), ending with
    an **EOT**.

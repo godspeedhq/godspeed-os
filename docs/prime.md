@@ -18,7 +18,7 @@ utilities needed to run and to make itself portable** - nothing more:
 | Layer | Members | Why it's in Prime |
 |-------|---------|-------------------|
 | Kernel + arch + smp | the microkernel | the mechanism (§6.1) |
-| `init` · `supervisor` · `registry` | trusted root | bootstrap + lifecycle + naming (§6.1) |
+| `supervisor` | trusted root (restartable; the kernel respawns it) | lifecycle + naming via the kernel name directory (§6.1) |
 | `block-driver` · `fs` · AHCI | storage stack | read/write drives - needed to install & carry state |
 | console + keyboard driver | interaction | a usable prompt (§B.3) |
 | `shell` | the prompt | where you type commands |
@@ -330,7 +330,7 @@ survive.** Recovery needs no special handshake - it is the ordinary restart path
   2. new kernel boots → supervisor RESPAWNS the services (per the manifest/contracts,
         §14.1; or from the GSFS world, §5) → kernel RE-MINTS each cap per the contract
   3. each service RECONSTRUCTS its state from GSFS (§15) and RE-ACQUIRES any runtime
-        caps via the registry (§14.2) → carries on
+        caps by name via the kernel name directory (§14.2) → carries on
 ```
 
 The apps do **not** survive in memory across the swap. What crosses the seam is
