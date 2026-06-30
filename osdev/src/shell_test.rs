@@ -559,7 +559,7 @@ pub fn run(image_path: &Path, smp: u32) {
     }
     send(&mut write_half, b"ls version\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("ls 0.1.0") && r.contains("Created by Bankole Ogundero"), "ls version: number + creator credit"),
+        Some(r) => check!(r.contains("ls 0.1.0") && r.contains("Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors"), "ls version: number + creator credit"),
         None    => { println!("shell-test: FAIL - timed out after `ls version`"); fail += 1; }
     }
     send(&mut write_half, b"drives flash help\r");
@@ -581,7 +581,7 @@ pub fn run(image_path: &Path, smp: u32) {
     }
     send(&mut write_half, b"from version\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("from 0.1.0") && r.contains("Created by Bankole Ogundero"), "from version: number + creator credit"),
+        Some(r) => check!(r.contains("from 0.1.0") && r.contains("Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors"), "from version: number + creator credit"),
         None    => { println!("shell-test: FAIL - timed out after `from version`"); fail += 1; }
     }
     send(&mut write_half, b"select help\r");
@@ -594,7 +594,7 @@ pub fn run(image_path: &Path, smp: u32) {
     // resolve like any other utility.
     send(&mut write_half, b"help version\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("help 0.1.0") && r.contains("Created by Bankole Ogundero"), "help version: number + creator credit"),
+        Some(r) => check!(r.contains("help 0.1.0") && r.contains("Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors"), "help version: number + creator credit"),
         None    => { println!("shell-test: FAIL - timed out after `help version`"); fail += 1; }
     }
     send(&mut write_half, b"help help\r");

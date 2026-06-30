@@ -56,6 +56,15 @@ operational problem - never added speculatively because another system has them 
 default answer to "should we add this?" is to simplify, reduce scope, and preserve the invariants. A
 smaller coherent system is preferred over a larger impressive one.
 
+## Credit and attribution
+
+Contributors are credited through **git history** - every commit carries its author, permanently and
+accurately. Please do **not** add personal names to source files or program output. GodspeedOS shows a
+single collective notice everywhere - `Copyright (C) 2026 Bankole Ogundero and the GodspeedOS
+contributors` - and the phrase "and the GodspeedOS contributors" already includes you. Under the
+project's licensing (the Linux model: no copyright assignment) you keep the copyright to what you
+write; the collective notice is the project's shared face, not a transfer of your ownership.
+
 ## License
 
 By contributing, you agree your contributions are licensed under the project's terms: the OS is

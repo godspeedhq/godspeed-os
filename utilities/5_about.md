@@ -23,7 +23,7 @@ how many cores it is running on, and who made it.
 gsh> about
 GodspeedOS: a capability-based microkernel (v1 milestone)
   running on 4 core(s)
-  Created by Bankole Ogundero.
+  Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors.
 ```
 
 ASCII only - the framebuffer console's font is ASCII, so no em-dashes or other

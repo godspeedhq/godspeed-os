@@ -65,7 +65,7 @@ subcommand help:
 
 ```
 <util> <version>
-Created by Bankole Ogundero.
+Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors.
 ```
 
 ---
@@ -96,7 +96,7 @@ the same domain as `spawn`/`kill`/`restart`, prefer a standalone service.
 
 **As of 2026-06-14, every utility conforms.** Each one implements its own
 `<util> help` (usage with a real example per row) and `<util> version` (number +
-"Created by Bankole Ogundero."), and each real subcommand (`date epoch`,
+"Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors."), and each real subcommand (`date epoch`,
 `observe now`, `drives flash` / `label` / `reset`) has its own `<util> <subcmd> help`.
 
 The shell built-ins are driven by a single `help_block` helper (the format lives in

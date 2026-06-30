@@ -1345,7 +1345,7 @@ fn is_util(name: &str) -> bool { UTILS.contains(&name) }
 /// `<util> version` - version number, then creator credit.
 fn util_version(ctx: &ServiceContext, util: &str) {
     ctx.console_writeln_fmt(format_args!("{} {}", util, UTIL_VERSION));
-    ctx.console_writeln("Created by Bankole Ogundero.");
+    ctx.console_writeln("Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors.");
 }
 
 /// One usage row: (signature with `<placeholders>`, description, a real example).
@@ -1856,7 +1856,7 @@ fn cmd_echo(ctx: &ServiceContext, text: &str, out: &mut Out) -> Result<(), Shell
 fn cmd_about(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
     out.line(ctx, "GodspeedOS: a capability-based microkernel (v1 milestone)");
     out.line_fmt(ctx, format_args!("  running on {} core(s)", ctx.inspect_core_count()));
-    out.line(ctx, "  Created by Bankole Ogundero.");
+    out.line(ctx, "  Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors.");
     Ok(())
 }
 
