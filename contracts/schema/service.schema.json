@@ -10,7 +10,7 @@
     "name": {
       "type": "string",
       "pattern": "^[a-z][a-z0-9-]*$",
-      "description": "Service name. Stable identifier; used as the registry key."
+      "description": "Service name. Stable identifier; used as the name-directory key."
     },
     "version": {
       "type": "string",

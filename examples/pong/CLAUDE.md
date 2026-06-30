@@ -17,10 +17,10 @@ Pong is the **first** service spawned by the supervisor - before ping and before
 
 The placement-free design exercises the round-robin path and demonstrates that identity (the name "pong") is stable while location (the core) is not (invariant §3.11). After restart, ping gets a fresh cap pointing to the new core but never learns which core that is.
 
-## Resolvable through the kernel name directory (Path C / Phase 4)
+## Resolvable through the kernel name directory
 
-pong does NOT self-register - there is no `ctx.register` call, and the registry service was
-retired (naming Path C / Phase 4). Instead the kernel **name directory** (`ipc::names`) records
+pong does NOT self-register - there is no `ctx.register` call. Instead the kernel **name
+directory** (`ipc::names`) records
 `"pong" -> its endpoint` synchronously at spawn, and refreshes that entry on every restart with
 the fresh endpoint/core. So ping reacquires pong by name through the directory
 (`reacquire_by_name("pong")`, a thin shim over `reacquire_cap` / syscall 10) with **no push

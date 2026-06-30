@@ -245,7 +245,7 @@ struct ServiceContextData {
     xhci_dma_len:       u64, // length of the DMA arena in bytes
     console_push_slot:  u32, // u32::MAX = none; else CONSOLE_PUSH cap slot (input driver)
     self_grant_slot:    u32, // u32::MAX = none; else SEND|GRANT cap to this service's OWN
-                             // endpoint, so it can register with the registry (H11).
+                             // endpoint, so it can register its name in the kernel directory.
     send_peers:         [SendPeerEntry; MAX_SEND_PEERS],
 }
 
@@ -284,12 +284,11 @@ impl From<crate::loader::LoadError> for SpawnError {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Registry ELF - conditionally replaced for §22 Test 1B.
+// Supervisor ELF - conditionally replaced for §22 Test 1B.
 // When the kernel is built with --features test-bad-supervisor, the supervisor binary is two
 // garbage bytes that fail ELF loading, so the kernel's DIRECT spawn of the supervisor fails →
-// kernel panic ("supervisor spawn failed", §6.2; no `init` Abort - init was removed in Phase 5).
-// This is §22 Test 1B (TCB-failure-panics). It targeted `registry` until the registry service was
-// retired (Path C / Phase 4); the supervisor is now the corrupt-and-fail TCB.
+// kernel panic ("supervisor spawn failed", §6.2). This is §22 Test 1B (TCB-failure-panics):
+// the supervisor is the corrupt-and-fail TCB.
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "test-bad-supervisor")]
@@ -352,8 +351,6 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // (registry service config removed - retired in Path C / Phase 4; the kernel name-directory
-        //  is the namer now.)
         "logger" => Some(("logger", ServiceConfig {
             elf:               include_bytes!(env!("SVC_LOGGER_ELF")),
             has_recv_endpoint: true,
@@ -398,7 +395,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             elf:               include_bytes!(env!("SVC_PING_ELF")),
             has_recv_endpoint: true,
             // ping reaches pong (name-wired here, or supervisor-provided); it reacquires pong by
-            // name via the kernel directory on EndpointDead (Path C - no `registry` peer).
+            // name via the kernel directory on EndpointDead.
             send_peers:        &["pong"],
             send_peers_grant:  false,
             preferred_core:    0,
@@ -430,7 +427,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_recv_endpoint: true,
             // A pipe SINK is recorded in the kernel name-directory at spawn; the shell resolves its
             // endpoint by name at runtime (`builtin | service`, `acquire_send_grant_cap`) - no
-            // contracted cap, no `registry` peer (Path C).
+            // contracted cap.
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
@@ -523,7 +520,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         "fs" => Some(("fs", ServiceConfig {
             elf:               include_bytes!(env!("SVC_FS_ELF")),
             has_recv_endpoint: true, // owns an endpoint (reply target + future fs API)
-            send_peers:        &["block-driver"], // Path C: fs's block-driver peer (supervisor-provided/name-wired); no registry
+            send_peers:        &["block-driver"], // fs's block-driver peer (supervisor-provided / name-wired)
             send_peers_grant:  false,
             preferred_core:    1,
             probe_mode:        0,
@@ -805,7 +802,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // ----------------------------------------------------------------
         // Property-test probes - Milestone 9 Phase 1.
         // prop-p9-victim must be listed (and spawned) before prop-p9 so its
-        // endpoint is in the name registry when prop-p9's SEND caps are wired.
+        // endpoint is in the name directory when prop-p9's SEND caps are wired.
         // ----------------------------------------------------------------
         "prop-p9-victim" => Some(("prop-p9-victim", ServiceConfig {
             elf:               PROBE_ELF,
@@ -1493,7 +1490,6 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // (reg-roundtrip probe removed - the registry service is retired, Path C / Phase 4.)
         "stress-s3-recv" => Some(("stress-s3-recv", ServiceConfig {
             elf:               PROBE_ELF,
             has_recv_endpoint: true,
@@ -2919,8 +2915,8 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // to `fs` (the reply-cap pattern needs the shell's own endpoint). The shell holds
             // only a narrow SEND to fs - fs enforces all disk authority. `fs` must be spawned
             // before the shell so this cap resolves (supervisor order). The shell resolves a pipe
-            // sink's endpoint at runtime via the kernel directory (`acquire_send_grant_cap`,
-            // Path C) - no contracted `registry` peer.
+            // sink's endpoint at runtime via the kernel directory (`acquire_send_grant_cap`) -
+            // no contracted peer.
             has_recv_endpoint: true,
             send_peers:        &["fs"],
             send_peers_grant:  false,
@@ -2983,7 +2979,7 @@ pub fn spawn_service_pipe(producer: &str, sink: &str, core_override: Option<u32>
     let core_id = resolve_spawn_core(core_override, cfg.preferred_core);
     // The delegated pipe peer goes FIRST so the producer/filter reaches it via
     // `send_peer_at(0)` (its "downstream"); the contract's own peers follow, so a filter that
-    // must `registry`-register to receive a stage's input (e.g. `upper`) still can. Bounded by
+    // must register its name to receive a stage's input (e.g. `upper`) still can. Bounded by
     // MAX_SEND_PEERS - extra contract peers past the cap are dropped (the pipe peer is kept).
     let mut pipe_peers: [&str; MAX_SEND_PEERS] = [""; MAX_SEND_PEERS];
     pipe_peers[0] = sink;
@@ -3007,7 +3003,7 @@ pub fn spawn_service_by_name(name: &str, core_override: Option<u32>) -> Result<O
 
     // Singleton guard (§6.2, §26.6 bounded behaviour): refuse to spawn a service
     // whose name is already live. This blocks duplicate instances in general, and
-    // in particular a second trusted-root service - init/supervisor/registry are
+    // in particular a second trusted-root service - the supervisor is
     // always live while the system runs, so this always rejects spawning/restarting
     // them, the same protection `handle_kill` gives. It does NOT block boot: there
     // each service is spawned exactly once, before any instance is live. Loud
@@ -3135,7 +3131,7 @@ fn spawn_service_with_config(
     // actually start other services: init (spawns the trusted root), supervisor
     // (spawns services + probes), the shell (brokers spawn/kill/restart), and the
     // test-driver probes (property/stress/perf/chaos modes spawn victims; matched by
-    // ELF identity so no probe family is missed). registry, logger, the drivers,
+    // ELF identity so no probe family is missed). logger, the drivers,
     // ping, pong, and observe never spawn and no longer hold the authority to.
     // Previously every service got this unconditionally ("spawn authority, every
     // service in v1") - a system-wide blast-radius widening this closes. Capture the
@@ -3187,9 +3183,9 @@ fn spawn_service_with_config(
         own_endpoint  = Some(ep_id);
 
         // Self-grant cap: a SEND|GRANT cap to this service's OWN endpoint, so it can
-        // announce itself to the registry by granting a derived copy (H11). GRANT is
+        // announce its name to the kernel directory by granting a derived copy. GRANT is
         // required for the cap to be transferable via SendWithCap; the service keeps
-        // this original and derives copies for re-registration after a registry restart.
+        // this original and derives copies for re-registration after a restart.
         if let Ok(sg) = caps.insert(mint_cap(resource_id, Rights::SEND | Rights::GRANT)) {
             self_grant_slot_u32 = sg as u32;
         }
@@ -3292,7 +3288,7 @@ fn spawn_service_with_config(
             .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
     }
 
-    // 5. Send-peer SEND caps (wired at spawn from the name registry).
+    // 5. Send-peer SEND caps (wired at spawn from the name directory).
     let mut peer_data: [(u32, u32, [u8; PEER_NAME_BYTES]); MAX_SEND_PEERS] =
         [(u32::MAX, 0, [0u8; PEER_NAME_BYTES]); MAX_SEND_PEERS];
     let mut peer_count = 0usize;

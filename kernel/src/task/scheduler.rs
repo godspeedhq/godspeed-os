@@ -1626,7 +1626,7 @@ pub fn kill_task_by_slot(slot: usize) {
         // re-runs its boot sequence and re-spawns them) - so the keyboard could stay dead. Now their
         // own death respawns them. `fs` re-mounts via its journal (Phase C); clients reacquire by
         // name via the kernel directory (§14.3). "Nothing escapes" - every service recovers; the
-        // kernel is the only unkillable thing. (`registry` was here until it was retired - Phase 4.)
+        // kernel is the only unkillable thing.
         // Gated to this NAMED set so ordinary probe/app churn never floods the supervisor.
         // `enqueue_from_interrupt` is the kernel→endpoint path (no cap needed); wake the supervisor.
         // `counter` (examples/counter) is restartable too: it persists its state to `fs` and

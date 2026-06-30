@@ -2286,8 +2286,8 @@ fn u64_at(b: &[u8], off: usize) -> u64 {
 }
 
 /// One block-driver RPC with restart recovery: if the reply is missing (block-driver may have
-/// restarted, leaving our cached cap EndpointDead), reacquire a fresh cap via the registry and
-/// retry once (Phase D, §14.3). All block I/O goes through here.
+/// restarted, leaving our cached cap EndpointDead), reacquire a fresh cap by name (via the kernel
+/// directory) and retry once (Phase D, §14.3). All block I/O goes through here.
 fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
     let msg = Message::from_bytes(req);
     if let Some(r) = ctx.request_with_reply("block-driver", &msg) {

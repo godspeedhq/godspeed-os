@@ -187,9 +187,6 @@ const MODE_XSEND_RECV:      u32 = 201; // receiver (core 2): drain forever
 const MODE_XLIFE:           u32 = 202; // controller (core 1): time kill/spawn of near+far victims
 const MODE_XLIFE_VICTIM:    u32 = 203; // victim: idle until killed (xlife-near core 1, xlife-far core 2)
 
-// Registry register/lookup round-trip self-test (H11; osdev image --mode iso-reg).
-// (MODE_REG_ROUNDTRIP 204 removed - registry service retired, Path C / Phase 4)
-
 // Interrupt-routing test modes - Post-v1 item 9 (§12.2, §12.3).
 const MODE_IRQ_RECV:        u32 = 160; // IR1A: recv interrupt event; log pass
 
@@ -2253,10 +2250,6 @@ fn mode_xlife(ctx: &ServiceContext) -> ! {
     ctx.log("xlife: done");
     idle(ctx)
 }
-
-// (mode_reg_roundtrip removed - the registry service is retired, Path C / Phase 4. The kernel
-//  name-directory's resolve-after-restart property is pinned by §22 Test 11 + the files-test
-//  double-storm regression instead.)
 
 // ---------------------------------------------------------------------------
 // Brutal property test modes - Milestone 16

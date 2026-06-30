@@ -8,13 +8,13 @@ fs owns persistent state (§15) and for v1 was trusted because it could not reco
 mid-write. The crash-consistency journal (Phase C, `docs/persistence.md` §6.8) closes that: every
 metadata mutation commits atomically and fs **recovers to a consistent state on mount**. So fs is
 now restartable - the kernel notifies the supervisor of its death, which respawns it; fs re-mounts
-(recovering via the journal), re-registers with the registry, and clients reacquire it and retry
-(§14.3). Only its *boot-time* spawn must succeed (§11.3). Pinned by §22 Test 13.
+(recovering via the journal), re-registers its name in the kernel directory, and clients reacquire it
+and retry (§14.3). Only its *boot-time* spawn must succeed (§11.3). Pinned by §22 Test 13.
 
 ## Dependencies
 
 - `block-driver`: all I/O goes through block-driver IPC.
-- `registry`: registers its endpoint so supervisor and other services can find it.
+- kernel name directory: fs registers its endpoint name so the supervisor and other services can resolve it.
 
 ## On-disk format: GSFS, hierarchical (magic `GSFS0008`, frozen)
 

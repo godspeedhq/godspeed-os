@@ -38,8 +38,8 @@ Introspection is reached through shell **commands**, not raw spawn: `observe` (l
 
 The kernel spawns the supervisor **directly** (Path C / Phase 5 - init is removed). The supervisor
 spawns the **logger first** (moved from init), then pong/ping, then services it wires from its
-`name → cap` map. The registry *service* is retired (Phase 4); names resolve via the kernel's
-directory (`ipc::names` + `AcquireSendCap`), not a registry service. The probe spawn loop takes
+`name → cap` map. Names resolve via the kernel's directory (`ipc::names` + `AcquireSendCap`). The
+probe spawn loop takes
 18-120 s on Windows TCG; spawning pong/ping early ensures cross-core IPC between them is established
 within ~10 s of boot.
 
@@ -74,13 +74,12 @@ sequenceDiagram
     participant K as Kernel
     participant OldSvc as Old Service (gen N)
     participant NewSvc as New Service (gen N+1)
-    participant R as Registry
 
     Ctrl->>K: RESTART <name> <core>
     K->>OldSvc: kill - bump generation to N+1
     K->>K: drain endpoint queue, reclaim memory
     K->>NewSvc: spawn on target core with gen N+1 caps
-    NewSvc->>R: register endpoint (gen N+1)
+    NewSvc->>K: register endpoint name (gen N+1)
     K->>Ctrl: log "control: <name> restarted"
 ```
 

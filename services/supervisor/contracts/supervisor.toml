@@ -10,7 +10,7 @@ limit   = "16MiB"
 service_control = true
 log_write       = true
 # supervisor reads service binaries and contracts from the filesystem.
-ipc_send        = ["fs", "registry"]
+ipc_send        = ["fs"]
 ipc_receive     = ["supervisor"]
 
 [placement]

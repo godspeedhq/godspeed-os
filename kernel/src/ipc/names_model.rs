@@ -5,7 +5,7 @@
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Name registry model for property testing - §14.2, §22 P8.
+//! Name directory model for property testing - §14.2, §22 P8.
 //!
 //! `TestNameModel` mirrors the algorithmic invariants of `ipc/names.rs`
 //! without `SpinLock` or global statics.  Used to verify that after a
@@ -89,10 +89,10 @@ mod tests {
         ) {
             let ep1 = EndpointId(ep1_raw);
             let ep2 = EndpointId(ep2_raw);
-            let mut registry = TestNameModel::new();
-            registry.register(&name, ep1);
-            registry.register(&name, ep2);
-            prop_assert_eq!(registry.lookup(&name), Some(ep2));
+            let mut dir = TestNameModel::new();
+            dir.register(&name, ep1);
+            dir.register(&name, ep2);
+            prop_assert_eq!(dir.lookup(&name), Some(ep2));
         }
 
         /// A name registered once is always found - no phantom miss - §14.2, §22 P8.
@@ -102,9 +102,9 @@ mod tests {
             ep_raw in ep_strategy(),
         ) {
             let ep = EndpointId(ep_raw);
-            let mut registry = TestNameModel::new();
-            registry.register(&name, ep);
-            prop_assert_eq!(registry.lookup(&name), Some(ep));
+            let mut dir = TestNameModel::new();
+            dir.register(&name, ep);
+            prop_assert_eq!(dir.lookup(&name), Some(ep));
         }
 
         /// A name that was never registered returns None - §14.2.
@@ -115,9 +115,9 @@ mod tests {
             ep_raw    in ep_strategy(),
         ) {
             prop_assume!(name != other);
-            let mut registry = TestNameModel::new();
-            registry.register(&other, EndpointId(ep_raw));
-            prop_assert_eq!(registry.lookup(&name), None);
+            let mut dir = TestNameModel::new();
+            dir.register(&other, EndpointId(ep_raw));
+            prop_assert_eq!(dir.lookup(&name), None);
         }
 
         /// Registering N distinct names creates exactly N entries -
@@ -127,13 +127,13 @@ mod tests {
             names in proptest::collection::hash_set(name_strategy(), 1..8),
         ) {
             let names: Vec<String> = names.into_iter().collect();
-            let mut registry = TestNameModel::new();
+            let mut dir = TestNameModel::new();
             for (i, name) in names.iter().enumerate() {
-                registry.register(name, EndpointId(i as u64));
+                dir.register(name, EndpointId(i as u64));
             }
-            prop_assert_eq!(registry.len(), names.len());
+            prop_assert_eq!(dir.len(), names.len());
             for (i, name) in names.iter().enumerate() {
-                prop_assert_eq!(registry.lookup(name), Some(EndpointId(i as u64)));
+                prop_assert_eq!(dir.lookup(name), Some(EndpointId(i as u64)));
             }
         }
     }

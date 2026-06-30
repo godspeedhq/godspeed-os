@@ -36,7 +36,7 @@ const LIMINE_CONF: &str = r#"timeout: -1
 /// Build a bootable disk image at `image_path`.
 ///
 /// Lower-level version of `create`; used when a non-default image path is
-/// needed (e.g. the bad-registry test image for §22 Test 1B).
+/// needed (e.g. the bad-supervisor test image for §22 Test 1B).
 pub fn create_at(kernel_elf: &Path, limine_dir: &Path, image_path: &Path) -> PathBuf {
     if let Some(parent) = image_path.parent() {
         std::fs::create_dir_all(parent).expect("failed to create image parent dir");

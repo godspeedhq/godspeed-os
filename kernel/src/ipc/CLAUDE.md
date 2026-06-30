@@ -11,7 +11,7 @@ Synchronous message-passing IPC (§8). No unsafe code lives here; physical memor
 | `queue.rs`     | `MessageQueue`: fixed-depth FIFO, 16 messages, `enqueue`/`dequeue`/`drain` |
 | `endpoint.rs`  | `Endpoint`: owner, core pin, queue, blocked-receiver field |
 | `routing.rs`   | `RoutingTable`: `EndpointId → (CoreId, Generation, Liveness)`; `enqueue`, `kill_endpoint`. Protected by `SpinLock<[RoutingEntry; MAX_ENDPOINTS]>`. |
-| `names.rs`     | Name → `EndpointId` registry. `register(name, ep)`, `lookup(name)`. Protected by `SpinLock<[NameEntry; MAX_ENTRIES]>`. |
+| `names.rs`     | Name → `EndpointId` directory. `register(name, ep)`, `lookup(name)`. Protected by `SpinLock<[NameEntry; MAX_ENTRIES]>`. |
 
 ## Message size and queue depth (§8.5)
 

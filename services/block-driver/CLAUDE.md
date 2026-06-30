@@ -3,7 +3,7 @@
 Userspace **AHCI (SATA)** disk driver (persistence, v2; §6.3, `docs/ahci.md`,
 `docs/persistence.md`). **Restartable, NOT a TCB member** (Phase D amendment, §6.1,
 2026-06-17): it holds no persistent state, so its death is a supervisor restart (re-init the
-controller, re-register), not a reboot - `fs` reacquires it via the registry and retries (§14.3).
+controller, re-register), not a reboot - `fs` reacquires it by name and retries (§14.3).
 
 ## Device: AHCI, MMIO + DMA
 
@@ -57,5 +57,5 @@ full width. One request moves one 512-byte block (= one sector). `fs` owns file 
 **Restartable (Phase D, §6.1 amendment 2026-06-17).** block-driver death is no longer a
 panic+reboot: the kernel notifies the supervisor, which respawns it; death reclaims its
 DMA/IOMMU resources and the fresh instance re-inits the controller and re-registers. `fs`
-reacquires it via the registry and retries its block I/O (§14.3). Only its *boot-time* spawn
+reacquires it by name and retries its block I/O (§14.3). Only its *boot-time* spawn
 must succeed to bootstrap persistence (§11.3).

@@ -8,7 +8,7 @@
 //! IPC subsystem - §8.
 //!
 //! Exposes `send`, `recv`, and `try_send` to the syscall dispatcher.
-//! Internally owns the routing table, per-endpoint queues, and name registry.
+//! Internally owns the routing table, per-endpoint queues, and name directory.
 
 pub mod endpoint;
 pub mod message;

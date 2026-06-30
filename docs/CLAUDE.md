@@ -10,7 +10,6 @@ Narrative documentation. These files explain design decisions in prose; they do 
 | `ipc.md`            | IPC deep-dive: queue discipline, cross-core send flow, deadlock patterns, examples |
 | `capability.md`     | Capability model: generation mechanism, rights model, transfer protocol, lifecycle examples |
 | `restart.md`        | Service restart flow: cap rebinding, core reassignment, client recovery pattern |
-| `registry.md`       | **HISTORICAL (registry SERVICE retired into the kernel directory - see `naming-design.md`).** Why a name service existed: name → capability resolution, the rendezvous problem, identity-over-location (§14.2, §3.11, §26.10) |
 | `pipes.md`          | Composing built-ins and services with `A \| B`: capability-mediated pipes (not POSIX fd inheritance), the four shapes (builtin/service × write/service), directory-resolved sinks, the EOT end-of-stream marker (Appendix D.3) |
 | `smp.md`            | SMP design: per-core run queues, IPI vectors, TLB shootdown protocol, placement algorithm |
 | `iommu.md`          | IOMMU-backed DMA confinement (H1): why DMA-capable drivers are kernel-equivalent without an IOMMU, AMD-Vi detection/setup/confinement/reclaim, Phase 2 TCB-drop proposal (§6, §12, §18.1) |

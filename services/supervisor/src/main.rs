@@ -208,7 +208,7 @@ fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap) -> u32 {
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Naming migration (docs/naming-design.md): `name → cap` map, built as we spawn the real
     // services. The supervisor wires dependents from it; clients resolve/reacquire names via the
-    // kernel name-directory (Path C, §3.7 - the registry *service* is retired, Phase 4).
+    // kernel name-directory (Path C, §3.7).
     #[allow(unused_mut)]
     let mut name_map = NameCapMap::new();
 
@@ -303,8 +303,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // from the name table at fs's spawn), and BOTH must precede the shell (the shell's
     // send-peer cap to `fs` wires the same way). On a machine with no SATA disk both come
     // up and idle gracefully (block-driver: "no controller"; fs: raw-tolerant).
-    // Phase 4 (Path C): the registry service is gone. block-driver has no peers; fs's only peer is
-    // block-driver, provided from the map. Clients reacquire names via the kernel directory.
+    // block-driver has no peers; fs's only peer is block-driver, provided from the map. Clients
+    // reacquire names via the kernel directory.
     //
     // block-driver is also spawned in `identity-only` builds - it idles harmlessly with no disk
     // (QEMU has no -drive there: "no controller"), giving §22 Test 11 a restartable victim to kill.
@@ -321,7 +321,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
-    // Phase 3a: shell's `fs` peer is wired from the supervisor's map (no registry - retired).
+    // shell's `fs` peer is wired from the supervisor's map.
     // Phase 6: ensure_wired adopts a running shell on a supervisor respawn instead of duplicating it.
     ensure_wired(&ctx, &mut name_map, "shell", &["fs"]);
 
@@ -389,8 +389,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // it. `recv` BLOCKS, so the core still reaches the idle/halt path and runs cool between
     // deaths (no polling). Restartable services routed here: `block-driver`, `fs`, `shell`, `xhci`,
     // `ehci`, `logger`. The supervisor itself is restartable too (Phase 6) but by the KERNEL - a dead
-    // task can't respawn itself; the only death that is unrecoverable is the kernel's. (`registry`
-    // retired, Phase 4; `init` removed, Phase 5.) Other restart/kill commands still arrive via the
+    // task can't respawn itself; the only death that is unrecoverable is the kernel's. Other
+    // restart/kill commands still arrive via the
     // COM2 control channel (control::process_pending in the timer ISR).
     //
     // If this build gave us no endpoint (minimal test manifests), fall back to park.
@@ -675,7 +675,6 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     // iso-xlife: both victims first so they exist when the controller's first kill
     // fires; controller (core 1) then times kill/spawn of near (core 1) and far (core 2).
     #[cfg(feature = "iso-xlife")] { let _ = ctx.spawn("xlife-near"); let _ = ctx.spawn("xlife-far"); let _ = ctx.spawn("xlife"); }
-    // (iso-reg reg-roundtrip self-test removed - registry service retired, Path C / Phase 4.)
     #[cfg(feature = "iso-s9")]   {
         let _ = ctx.spawn("stress-s9-recv");
         let _ = ctx.spawn("stress-s9-send-a");

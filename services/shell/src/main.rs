@@ -2727,13 +2727,11 @@ fn find_running_slot(ctx: &ServiceContext, name: &str) -> Option<u32> {
 /// respawns it on death), but a casual `kill supervisor` is refused so it is not fumbled away by
 /// accident; deliberate supervisor chaos goes through `chaos kill-storm supervisor`. Ordinary
 /// restartable services (block-driver, fs, ...) are freely killable - the supervisor respawns them.
-/// (`registry` retired, Phase 4; `init` removed, Phase 5.)
 const CORE_SERVICES: [&str; 1] = ["supervisor"];
 
 /// Shown when spawn/kill/restart targets a core service - "Not applicable" makes
 /// it clear the command is refused *because* the target is protected, not failed.
-/// Lists exactly `CORE_SERVICES` (just `supervisor`; `init` was removed in Phase 5,
-/// `registry` retired in Phase 4 - both intentionally absent).
+/// Lists exactly `CORE_SERVICES` (just `supervisor`).
 const PROTECTED_MSG: &str =
     "Not applicable. The supervisor is protected (the recovery authority); storm it deliberately via 'chaos kill-storm supervisor'";
 
@@ -3106,7 +3104,7 @@ fn pipe_write(ctx: &ServiceContext, cwd: &Cwd, arg: &str, data: &[u8]) {
     }
 }
 
-/// Look up a just-spawned service's endpoint via the registry, retrying while it registers.
+/// Look up a just-spawned service's endpoint via the kernel name directory, retrying while it registers.
 fn lookup_sink(ctx: &ServiceContext, sink: &str) -> Option<CapHandle> {
     // A freshly-spawned filter registers its input endpoint only once it actually RUNS - which on
     // real multi-core hardware is up to ~1 s after spawn (it's on another core and hasn't been
@@ -3199,8 +3197,8 @@ fn cmd_restart(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<()
 // Directly-restartable services: their OWN death notifies the supervisor, which respawns them
 // immediately (the supervisor itself is kernel-respawned). chaos confirms recovery for these each
 // round + labels them "recovered"; kill-storm may target them. The only unkillable thing is the
-// kernel; the shell is excluded only because chaos runs *inside* it. (registry retired Phase 4; init
-// removed Phase 5; xhci/ehci/logger made directly-restartable so max-carnage can't leave them dead.)
+// kernel; the shell is excluded only because chaos runs *inside* it. (xhci/ehci/logger are
+// directly-restartable so max-carnage can't leave them dead.)
 const CHAOS_RESTARTABLE: [&str; 6] = ["supervisor", "block-driver", "fs", "xhci", "ehci", "logger"];
 const CHAOS_DEFAULT_ROUNDS: u32 = 20;
 const CHAOS_MAX_ROUNDS: u32 = 100;        // bounded (§26.6) - a deliberate cap, not a firehose
@@ -3956,7 +3954,7 @@ fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<
         return Some(r);
     }
     // No reply usually means `fs` restarted and our cached cap is now EndpointDead (Phase D,
-    // §14.3). Reacquire a fresh `fs` cap via the registry and retry once; if `fs` hasn't
+    // §14.3). Reacquire a fresh `fs` cap by name and retry once; if `fs` hasn't
     // finished re-registering yet, this returns None and the next command retries.
     if ctx.reacquire_by_name("fs") {
         return ctx.request_with_reply("fs", &msg);

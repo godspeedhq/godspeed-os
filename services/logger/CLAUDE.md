@@ -5,7 +5,7 @@ Structured log sink (§11.4). **Restartable.** Not a TCB member.
 ## Startup sequence
 
 1. Call `ctx.drain_kernel_ring_buffer()` - read all bytes from the 16 KiB kernel ring buffer accumulated before logger started (§11.4).
-2. Register with registry.
+2. Register its name in the kernel directory.
 3. Print `"logger: ready"`.
 4. Enter recv loop.
 

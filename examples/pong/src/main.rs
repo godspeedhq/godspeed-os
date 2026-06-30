@@ -12,9 +12,9 @@ use godspeed_sdk::ServiceContext;
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log_fmt(format_args!("pong: ready on core {}", ctx.core_id()));
 
-    // Path C (Phase 4): no self-registration. The kernel name-directory records "pong" at spawn
-    // and refreshes it on every restart (in place), so ping reacquires us by name through the
-    // directory (syscall 10) with no push from us - the registry service is gone.
+    // No self-registration. The kernel name-directory records "pong" at spawn and refreshes it on
+    // every restart (in place), so ping reacquires us by name through the directory (syscall 10)
+    // with no push from us.
 
     loop {
         let msg = ctx.recv();

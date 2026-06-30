@@ -13,8 +13,7 @@ fault, or `chaos kill-storm supervisor`) the **kernel respawns it** - unconditio
 bound; a bound would re-introduce the reboot and hand an attacker a DoS) - and the respawned supervisor
 **reconciles**, adopting the still-running services (reacquiring each by name from the kernel directory)
 instead of duplicating them. So its death is *recovered, not a reboot*. The **only unkillable component
-is the kernel itself** (`{kernel}`) - `init` was removed (Phase 5) and the registry service retired
-(Phase 4). Pinned by §22 Test 15.
+is the kernel itself** (`{kernel}`). Pinned by §22 Test 15.
 
 ## Restartable services
 

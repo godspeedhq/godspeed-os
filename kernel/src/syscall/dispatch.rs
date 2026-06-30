@@ -776,8 +776,8 @@ fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
     // root); it is now **restartable** - the kernel respawns it on death, unconditionally and forever
     // (a bound would just re-introduce the reboot and hand an attacker a DoS - see
     // `task::poll_supervisor_respawn`). So a SERVICE_CONTROL holder (the `chaos` utility, the operator
-    // control channel) may kill it, and the kernel recovers it. (`init` is gone, Phase 5; `registry`
-    // retired, Phase 4; `fs`/`block-driver` were already restartable.) The shell still refuses a
+    // control channel) may kill it, and the kernel recovers it. (`fs` and `block-driver` are
+    // restartable too.) The shell still refuses a
     // *casual* `kill supervisor`/`restart supervisor` at the command layer (CORE_SERVICES); deliberate
     // chaos goes through `chaos kill-storm supervisor`.
     if crate::task::kill_by_name(name) {
@@ -785,7 +785,7 @@ fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
         // target a trusted service) take down the TCB. Now that the kill has
         // completed and no kernel locks are held, verify the two invariants a
         // kill is most likely to break:
-        //   §6.2 - every TCB service (init/supervisor/registry) is still alive;
+        //   §6.2 - every TCB service (the supervisor) is still alive;
         //          TCB death is a loud, unrecoverable failure, not a silent one.
         //   §7.8 - the cap table is still consistent (no cap carries a generation
         //          beyond its resource's current generation). The generation bump
@@ -808,7 +808,7 @@ fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
 
 /// arg0 = name_ptr, arg1 = name_len, arg2 = include_grant (0 = SEND only, 1 = SEND|GRANT).
 ///
-/// Looks up `name` in the kernel name registry, mints a SEND (or SEND|GRANT)
+/// Looks up `name` in the kernel name directory, mints a SEND (or SEND|GRANT)
 /// cap to that endpoint in the calling task's cap table, and returns the slot.
 ///
 /// Reacquire a fresh SEND cap to a named service (§14.2). **Gated (§3.1, see the in-body comment):**
@@ -860,9 +860,9 @@ fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> 
 /// into a fresh slot. arg0 = held cap slot. Returns the new slot, or a negative
 /// cap-error code.
 ///
-/// This is the primitive that lets a userspace name service (the `registry`) serve
-/// many `lookup`s from one held endpoint cap: it derives a copy per client and grants
-/// that copy away (via `SendWithCap`) while retaining the original. Sound and
+/// This is the primitive that lets a service hand out many copies of one held endpoint
+/// cap: it derives a copy per recipient and grants that copy away (via `SendWithCap`)
+/// while retaining the original. Sound and
 /// non-escalating (§7.3): the copy carries the *same* resource, generation, and
 /// rights - never wider - and the GRANT gate means the caller could already transfer
 /// the whole cap wholesale, so duplicating it grants no authority it lacked. Endpoint

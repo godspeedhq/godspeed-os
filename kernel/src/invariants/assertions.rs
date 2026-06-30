@@ -35,18 +35,18 @@ pub fn assert_no_mid_execution_migration(original_core: u32, current_core: u32) 
 /// Invariant §6.2.
 ///
 /// Checks that each TCB service's endpoint is still registered in the IPC name
-/// registry and alive in the routing table. Death of any TCB service requires
+/// directory and alive in the routing table. Death of any TCB service requires
 /// an immediate system reboot - §6.2.
 pub fn assert_tcb_alive() {
     // The non-restartable set is now EMPTY (Path C / Phase 6: the supervisor is restartable too -
-    // the kernel respawns it on death, §6.2). `init` was removed (Phase 5); `registry` retired
-    // (Phase 4); `fs`/`block-driver` are restartable (Phase D). The kernel is the only thing that
-    // cannot die, and it is not a task - so no task's death is a panic-on-death TCB violation.
+    // the kernel respawns it on death, §6.2). `fs`/`block-driver` are restartable (Phase D). The
+    // kernel is the only thing that cannot die, and it is not a task - so no task's death is a
+    // panic-on-death TCB violation.
     const TCB: &[&str] = &[];
     const DEAD: u8 = crate::task::state::TaskState::Dead as u8;
     // §6.2 governs the *death of a service that exists*, not the *omission* of
     // one: identity-test manifests are minimal and spawn only the subset a given
-    // test needs (e.g. cross-core tests run without `registry`). So a TCB name
+    // test needs (e.g. cross-core tests run without `fs`). So a TCB name
     // that is simply absent from this configuration is skipped - only a service
     // that exists and is Dead (or whose endpoint was killed) is a violation.
     //

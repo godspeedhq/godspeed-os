@@ -15,7 +15,7 @@ limit   = "64MiB"
 # ipc_send, ipc_receive, log_write, hw_mmio, hw_interrupt, hw_pio (+ service_control, supervisor-only).
 # pong is a PURE RECEIVER (recv + log), so it declares NO ipc_send. The kernel name directory
 # records "pong" at spawn (and refreshes it on restart), so clients reacquire it by name through
-# the directory with no push from pong - the registry service is retired (naming Path C / Phase 4).
+# the directory with no push from pong.
 ipc_receive = ["pong"]        # OWNS and receives on its own "pong" endpoint
 log_write   = true            # may write to the logger
 

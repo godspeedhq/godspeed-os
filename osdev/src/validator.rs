@@ -46,7 +46,7 @@ enum TestKind {
         fail_on:      &'static [&'static str],
         timeout_secs: u64,
     },
-    /// Build kernel with `test-bad-registry` feature, create a separate
+    /// Build kernel with `test-bad-supervisor` feature, create a separate
     /// image, boot QEMU with it, and watch for `expect` lines (e.g. a panic).
     WithBadTcb {
         expect:       &'static [&'static str],
@@ -1427,9 +1427,9 @@ static TESTS: &[TestSpec] = &[
         },
     },
     TestSpec {
-        // §22 Test 11 (repurposed for Path C / Phase 4): the registry SERVICE is retired; the
-        // kernel name-directory is the namer. This pins the directory's restart property - a
-        // service killed and respawned must re-establish without a kernel panic, and the supervisor
+        // §22 Test 11: the kernel name-directory is the namer. This pins the directory's restart
+        // property - a service killed and respawned must re-establish without a kernel panic, and
+        // the supervisor
         // re-wires it from its map (the directory records the new instance, so clients reacquire it
         // by name). `block-driver` is the disk-free restartable target.
         id: "11", name: "name_resolves_after_restart_via_directory", spec_ref: "§22 Test 11",
@@ -2257,8 +2257,8 @@ fn run_one(test: &TestSpec, image: &Path) -> TestOutcome {
         TestKind::ContractFuzz { .. } => TestOutcome::Blocked("ContractFuzz only runs via osdev test fuzz or fuzz-brutal"),
 
         TestKind::WithBadTcb { expect, fail_on, timeout_secs } => {
-            // Build kernel with the test-bad-supervisor feature (invalid supervisor ELF) - Path C /
-            // Phase 4 retired the registry, so the supervisor is the corrupt-and-fail TCB now.
+            // Build kernel with the test-bad-supervisor feature (invalid supervisor ELF): the
+            // supervisor is the corrupt-and-fail TCB.
             let status = std::process::Command::new("cargo")
                 .args([
                     "build", "--release", "-p", "kernel",

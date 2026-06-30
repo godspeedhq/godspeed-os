@@ -52,7 +52,7 @@ pub mod capability {
 pub mod ipc {
     pub mod message;
     pub mod queue;
-    // Routing and name registry models - test-only, no SpinLock or hardware deps.
+    // Routing and name directory models - test-only, no SpinLock or hardware deps.
     // Pattern mirrors memory/bitmap.rs (item 6).
     #[cfg(test)]
     pub mod routing_model;

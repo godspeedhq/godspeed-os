@@ -5,7 +5,7 @@
 // or fitness for any purpose, and accepts no liability for any damages arising from
 // its use. Use at your own risk.
 
-//! Kernel name registry - maps service names to recv endpoint IDs (§14.2).
+//! Kernel name directory - maps service names to recv endpoint IDs (§14.2).
 //!
 //! Populated by the kernel at spawn time for every service that gets a recv
 //! endpoint.  Queried by syscall 10 (AcquireSendCap) for post-restart cap

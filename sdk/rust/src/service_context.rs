@@ -400,7 +400,7 @@ impl ServiceContext {
         crate::ipc::try_send(CapHandle(slot), msg)
     }
 
-    /// Acquire a fresh SEND cap to `peer` via the kernel name registry.
+    /// Acquire a fresh SEND cap to `peer` via the kernel name directory.
     ///
     /// Called after `try_send` returns `EndpointDead` (§14.2). Updates the
     /// per-service dynamic cap cache so subsequent `try_send` calls use the
@@ -458,10 +458,10 @@ impl ServiceContext {
     /// into a fresh slot (syscall 29 = `DeriveCap`). The copy carries the same
     /// resource, generation, and (non-widened) rights.
     ///
-    /// Used by the `registry` to serve many `lookup`s from the one endpoint cap it
-    /// holds per name: it derives a copy per client and grants that copy away (via
-    /// `send_with_cap_by_handle`) while keeping the original. Returns `None` if the
-    /// cap lacks GRANT, is stale, or the cap table is full.
+    /// Used to hand out many copies of a held endpoint cap: derive a copy per
+    /// recipient and grant that copy away (via `send_with_cap_by_handle`) while
+    /// keeping the original. Returns `None` if the cap lacks GRANT, is stale, or the
+    /// cap table is full.
     pub fn derive_cap(&self, held: CapHandle) -> Option<CapHandle> {
         // SAFETY: syscall(29) = DeriveCap; `held.0` is a slot index into this task's
         // own cap table. The kernel validates GRANT + generation before duplicating.
@@ -609,7 +609,7 @@ impl ServiceContext {
         if ret >= 0 { Some(CapHandle(ret as u32)) } else { None }
     }
 
-    /// Acquire a fresh SEND|GRANT cap to `peer` via the kernel name registry.
+    /// Acquire a fresh SEND|GRANT cap to `peer` via the kernel name directory.
     ///
     /// Used by property-test probes that need to transfer capabilities (P3).
     /// Returns `None` if the service is not registered or the cap table is full.
@@ -622,7 +622,7 @@ impl ServiceContext {
         if ret < 0 { None } else { Some(CapHandle(ret as u32)) }
     }
 
-    /// Acquire a fresh SEND cap to `peer` via the kernel name registry.
+    /// Acquire a fresh SEND cap to `peer` via the kernel name directory.
     ///
     /// Returns the new cap handle, or `None` if the name is not registered.
     pub fn acquire_send_cap(&self, peer: &str) -> Option<CapHandle> {

@@ -111,13 +111,13 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(boot_out) => {
             check!(boot_out.contains("shell: ready"), "boot: shell ready message");
             // Naming migration (docs/naming-design.md): the supervisor builds a name→cap map as it
-            // spawns the real services, then wires dependents from it. Phase 4 (Path C) retired the
-            // registry service - bare-metal maps 5 services (block-driver, fs, shell, xhci, ehci);
-            // names resolve via the kernel directory, not a registry service.
+            // spawns the real services, then wires dependents from it. Bare-metal maps 5 services
+            // (block-driver, fs, shell, xhci, ehci); names resolve via the kernel directory, with no
+            // separate name service spawned.
             check!(boot_out.contains("name-cap map holds 5 service(s)"),
-                   "naming Phase 1: supervisor holds an endpoint cap for every real service");
+                   "naming: supervisor holds an endpoint cap for every real service");
             check!(!boot_out.contains("spawning registry") && !boot_out.contains("name-map + registry"),
-                   "naming Phase 4: registry service retired (not spawned)");
+                   "naming: no separate name service is spawned (the kernel directory resolves names)");
             // fs (block-driver) and shell (fs) are wired from the supervisor's map. Functional proof
             // = the files test (real disk I/O, file commands reaching fs, fs reaching block-driver).
             check!(boot_out.contains("fs wired from the name-cap map"),
@@ -665,7 +665,7 @@ pub fn run(image_path: &Path, smp: u32) {
     // chaos kill-storm: the bounded resilience exerciser. Kill `block-driver` 5 times; the supervisor
     // must respawn it each round. A pass proves: recovery held every round, AND the kernel never
     // panicked (a panic reboots; reaching the verdict + the prompt proves it didn't). block-driver
-    // holds no disk state, so this runs cleanly on the bare-metal build (registry retired, Path C).
+    // holds no disk state, so this runs cleanly on the bare-metal build.
     // -----------------------------------------------------------------------
     send(&mut write_half, b"chaos kill-storm block-driver 5\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)) {
@@ -1865,11 +1865,10 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL - read chaos report timeout"); fail += 1; }
     }
 
-    // Path C regression (the kernel directory replaces the old registry-bootstrap stopgap): storm
-    // `fs` and the catch-22-safe save must settle + reacquire fs THROUGH THE KERNEL DIRECTORY - no
-    // registry service exists - to land the report. Then `ls /` must reacquire fs the same way
-    // (not "storage unavailable"). This pins client-resolution-after-restart via the directory, the
-    // property §22 Test 11 now also covers. Generous timeout (settle + bounded save-retry on TCG).
+    // Regression: storm `fs` and the catch-22-safe save must settle + reacquire fs THROUGH THE
+    // KERNEL DIRECTORY to land the report. Then `ls /` must reacquire fs the same way (not "storage
+    // unavailable"). This pins client-resolution-after-restart via the directory, the property §22
+    // Test 11 covers. Generous timeout (settle + bounded save-retry on TCG).
     match run!(b"chaos kill-storm fs 2 save /fsr.txt\r", 60) {
         Some(r) => check!(r.contains("verdict: PASS") && r.contains("report saved to /fsr.txt"),
                           "chaos: fs storm recovers + report saved (settle + reacquire fs via the kernel directory)"),
@@ -1882,7 +1881,7 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     }
     match run!(b"ls /\r", 10) {
         Some(r) => check!(!r.contains("storage unavailable"),
-                          "directory: shell reacquires fs after its own restart (no registry service)"),
+                          "directory: shell reacquires fs after its own restart"),
         None    => { println!("files-test: FAIL - ls after fs-storm timeout"); fail += 1; }
     }
 
@@ -2099,7 +2098,7 @@ pub fn run_edit(image_path: &Path, persist_path: &str, smp: u32) {
 /// §22 Test 13 - **fs survives its own restart** (Phase D). Drive the shell on COM1 to write a
 /// file, KILL `fs` over the COM2 control channel, then read the file back: the supervisor
 /// respawns `fs`, `fs` re-mounts (the data persisted on disk), and the shell reacquires a fresh
-/// `fs` cap via the registry (§14.3) - the file reads back, the kernel never panics. This is
+/// `fs` cap by name (§14.3) - the file reads back, the kernel never panics. This is
 /// the executable proof of the §6 amendment that made `fs`/`block-driver` restartable.
 pub fn run_fs_restart(image_path: &Path, persist_path: &str, smp: u32) {
     println!("fs-restart: booting (smp={smp}) bare-metal + AHCI disk; shell on COM1, control on COM2");
@@ -2195,7 +2194,7 @@ pub fn run_fs_restart(image_path: &Path, persist_path: &str, smp: u32) {
         None => { println!("fs-restart: FAIL - could not connect to control port"); fail += 1; }
     }
 
-    // Read the file back: the shell must reacquire a fresh fs cap via the registry, and the
+    // Read the file back: the shell must reacquire a fresh fs cap by name, and the
     // file must still be there (persisted on disk, recovered on remount). The headline check.
     // Retry a couple of times - reacquire returns None until fs has finished re-registering.
     let mut got = false;
