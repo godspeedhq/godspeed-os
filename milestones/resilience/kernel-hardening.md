@@ -35,4 +35,4 @@ v1/v2 established the capability model and the ring-3 boundary. This milestone i
 | H9 syscall-surface audit | `syscall/dispatch.rs`, `syscall/CLAUDE.md` | verdict CLEAN; doc fixes commit `7601b34` |
 | Unsafe-audit CI | `scripts/unsafe_check.py`, `docs/unsafe-audit.md` | §18.4; passes (447 lines / 28 files) |
 
-> The DMA-after-free safety stack (page-table reclaim guard, BME-quiesce cure, DMA permanent-reserve) and the IOMMU DMA-confinement (H1) are their own milestones - see the sibling files in `milestones/post_v2/`.
+> The DMA-after-free safety stack (page-table reclaim guard, BME-quiesce cure, DMA permanent-reserve) and the IOMMU DMA-confinement (H1) are their own milestones - see the sibling milestone `milestones/hardware/iommu-and-dma.md`.

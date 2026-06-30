@@ -83,7 +83,7 @@ counted by `scripts/unsafe_check.py`, which scans `kernel/src/` only.
 
 ## 2026-05-31 - static-analysis + unsafe-audit pass (boot-verified, T630)
 
-Full write-up: `milestones/v2/STATIC_ANALYSIS_AUDIT.md`. Branch
+Full write-up: `milestones/testing/static-analysis-audit.md`. Branch
 `verify/static-analysis-unsafe-audit`, commit `d276566`.
 
 | Area | Result |

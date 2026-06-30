@@ -189,7 +189,7 @@ GX-420GI the live syscall mechanism is **`ud2`/#UD** (IDT[6]), a CPU exception. 
 **`TSS.rsp0 = K0T`** (IDT[6] has `ist=0`), and `ud2_syscall_entry` is verified to **NOT** re-base
 RSP to `kernel_rsp` - it processes the exception frame in place on the `K0T-40`-down stack. The
 `PER_CORE_SYSCALL.kernel_rsp = K0T-512` separation only ever protected the **LSTAR `SYSCALL`**
-path, which is dead here (§ milestones/v2 issue #2). So **the syscall call-chain and the timer
+path, which is dead here (§ milestones/hardware/ring3-bringup.md issue #2). So **the syscall call-chain and the timer
 interrupt + context-switch path both grow down from K0T-40 with no separation**, and they
 overlap: a deep recv syscall's return addresses sit in [K0T-280, K0T-512], exactly where the
 timer-switch zero-writes → the task later `ret`s into zeroed/garbage → wild jump into the kstack.

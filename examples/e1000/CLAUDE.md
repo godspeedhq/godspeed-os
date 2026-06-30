@@ -53,7 +53,7 @@ so the driver contains **no `unsafe`**.
   max-carnage` and corrupted a kernel page table. It was fixed at the layer that owns it: the kernel
   quiesces a DMA driver's bus-mastering before reclaiming its frames, and each driver's DMA arena is
   permanently reserved so a stray write can never reach a page table. A NIC driver you grow from this
-  must survive that. *(COMMANDMENTS.md II; `milestones/post_v2/4_IOMMU_AND_DMA_SAFETY.md`.)*
+  must survive that. *(COMMANDMENTS.md II; `milestones/hardware/iommu-and-dma.md`.)*
 
 ## The contract, annotated
 
@@ -120,4 +120,4 @@ template for the device-bringup shape.
 - `docs/networking.md` - the future NIC driver and socket-as-capability.
 - **Commandments I, II, V, VI, VII, X** in `COMMANDMENTS.md`.
 - **CLAUDE.md** §12 (drivers and interrupts), §18.1 (the SDK hardware/ABI layer), §6.4 (IOMMU
-  confinement); `milestones/post_v2/4_IOMMU_AND_DMA_SAFETY.md` (the DMA-safety story).
+  confinement); `milestones/hardware/iommu-and-dma.md` (the DMA-safety story).

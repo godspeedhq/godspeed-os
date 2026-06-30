@@ -376,4 +376,4 @@ and T13 failures cause a non-zero exit.
 - ✅ `services/supervisor/src/main.rs` - 7 brutal-id spawns (C/B before A, recv before send/kill)
 - ✅ `osdev/src/validator.rs` - `BRUTAL_IDENTITY_TESTS` static; `run_brutal_identity_tests()`; `run_brutal_identity_one()`; `brutal_identity_serial_path()`
 - ✅ `osdev/src/main.rs` - `"identity-brutal" =>` arm in `cmd_test`; docstring updated
-- ✅ `milestones/v1/8_IDENTITY_TESTS.md` - Phase 6 and Phase 7 sections
+- ✅ `milestones/testing/identity.md` - Phase 6 and Phase 7 sections

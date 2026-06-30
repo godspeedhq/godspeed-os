@@ -1,72 +1,98 @@
 # GodspeedOS Milestones
 
-The master index of what has been built, in order, with a green tick on every completed milestone.
-GodspeedOS is a deliberately small, fully-understood capability microkernel; the constitution is in
-the repo-root `CLAUDE.md`. Each row below links to a detailed milestone write-up.
+The master index of what has been built, organized by subsystem. GodspeedOS is a deliberately small,
+fully-understood capability microkernel; the constitution is the repo-root `CLAUDE.md`, and the *why
+behind the what* - the history of understanding, including the days the design overruled its author -
+is in [`ALMANAC.md`](ALMANAC.md). Each row links to a detailed write-up.
 
-> ✅ = done and, unless noted, hardware-proven on the HP T630 (AMD GX-420GI, 4-core, real AHCI SSD).
-
----
-
-## v1: the capability microkernel (✅ complete, tagged `v1.0`)
-
-Boot multi-core; run two services; pass a message over cross-core IPC; kill one; the supervisor
-restarts it (possibly on a different core); the system keeps running. Every §23 acceptance criterion
-met. Summary: [`v1/_V1_MILESTONE.md`](v1/_V1_MILESTONE.md).
-
-| # | Milestone | Status |
-|---|-----------|:------:|
-| 0 | [Scaffold and build infrastructure](v1/0_SCAFFOLD_AND_BUILD.md) | ✅ |
-| 1 | [Boot visibility](v1/1_BOOT_VISIBILITY.md) | ✅ |
-| 2 | [Memory management](v1/2_MEMORY.md) | ✅ |
-| 3 | [Scheduler (single core)](v1/3_SCHEDULER.md) | ✅ |
-| 4 | [Capability system](v1/4_CAPABILITIES.md) | ✅ |
-| 5 | [IPC (same core)](v1/5_IPC.md) | ✅ |
-| 6 | [SMP and cross-core IPC](v1/6_SMP.md) | ✅ |
-| 7 | [Services and supervisor restart](v1/7_SERVICES.md) | ✅ |
-| 8 | [Identity test suite (§22)](v1/8_IDENTITY_TESTS.md) | ✅ |
-| 9 | [Property test suite](v1/9_PROPERTY_TESTS.md) | ✅ |
-| 10 | [Fuzz tests](v1/10_FUZZ_TESTS.md) | ✅ |
-| 11 | [Stress tests](v1/11_STRESS_TESTS.md) | ✅ |
-| 12 | [Performance benchmarks](v1/12_PERFORMANCE_TESTS.md) | ✅ |
-| 13 | [Adversarial / red-team](v1/13_ADVERSARIAL_TESTS.md) | ✅ |
-| 14 | [Chaos tests](v1/14_CHAOS_TESTS.md) | ✅ |
-
-**Post-v1 verification** (the test apparatus and CI, items 1 to 11): code coverage, unsafe-audit CI,
-static analysis, mutation testing, property and subsystem-property tests, identity CI green (20/20),
-and interrupt routing to userspace plus its tests. All ✅. Folder: [`v1/post_v1/`](v1/post_v1/).
+> All milestones below are done and, unless noted, hardware-proven on the HP T630 (AMD GX-420GI,
+> 4-core, real AHCI SSD). This folder is the "what"; the ALMANAC is the "when and why".
 
 ---
 
-## v2: userspace (ring-3) on AMD hardware (✅)
+## Kernel
 
-Bare-metal ring-3 bring-up on the T630. Three distinct AMD-only root causes, each producing the same
-"no userspace ever runs" symptom, isolated and fixed: the SYSRETQ SS RPL bug (enter ring-3 via an
-explicit IRETQ frame), the `syscall`/`int N` stall (use `ud2`/#UD as the syscall mechanism), and the
-APIC-timer-ISR cascade that starved ring-3 of every instruction (resize the periodic count). Outcome:
-full multi-core boot to steady state, cross-core ping/pong, and the shell prompt live on hardware.
+The microkernel itself: mechanism, not policy (memory, scheduling, IPC, capabilities, interrupts,
+cross-core routing).
 
-- [`v2/MILESTONE.md`](v2/MILESTONE.md): the AMD bring-up, the diagnostic methodology, Bug 2 fix, perf.
-- [`v2/STATIC_ANALYSIS_AUDIT.md`](v2/STATIC_ANALYSIS_AUDIT.md): the static-analysis + unsafe-audit pass.
+| Milestone | In one line |
+|-----------|-------------|
+| [Scaffold and build](kernel/scaffold-and-build.md) | The workspace, the `osdev` CLI, the bare-metal build target |
+| [Boot visibility](kernel/boot.md) | Limine handoff, BSP + AP bring-up, the kernel ring buffer |
+| [Memory management](kernel/memory.md) | Frame allocator, per-task page tables, isolation and limits |
+| [Scheduler](kernel/scheduler.md) | Per-core run queues, round-robin, 10 ms preemption |
+| [Capability system](kernel/capabilities.md) | Unforgeable ResourceId + Rights + Generation; the generation check |
+| [IPC](kernel/ipc.md) | Synchronous, bounded-queue message passing (same core) |
+| [SMP and cross-core IPC](kernel/smp.md) | Per-core scheduling, the routing table, IPI wakeups |
+| [Services and supervisor restart](kernel/services.md) | Contracts, spawn, the supervisor's restart authority |
+| [Interrupt routing](kernel/interrupt-routing.md) | Hardware IRQs delivered to userspace driver endpoints via IPC |
+| [Interrupt routing tests](kernel/interrupt-routing-tests.md) | The tests pinning that delivery |
+| [The first milestone](kernel/first-milestone.md) | §23 reached: boot multi-core, two services, cross-core IPC, kill and restart |
 
 ---
 
-## post-v2: a real operating system (✅)
+## Testing
 
-With userspace solid, the system grew real hardware drivers, crash-consistent persistence, a security
-model that confines DMA, fault-tolerance down to a single unkillable kernel, chaos-hardening, and a
-usable shell with utilities. All hardware-proven on the T630.
+The seven trials by fire (§22) plus the verification apparatus and CI that keep them honest.
 
-| # | Milestone | In one line | Status |
-|---|-----------|-------------|:------:|
-| 1 | [Userspace drivers](post_v2/1_USERSPACE_DRIVERS.md) | Framebuffer console + USB: keyboard and mouse on both xHCI and EHCI, hot-plug, `unsafe`-free driver services via the audited SDK | ✅ |
-| 2 | [Persistence](post_v2/2_PERSISTENCE.md) | AHCI block driver + the GSFS0008 filesystem: redo-journal crash-consistency, fsck/scrub, extents; `fs`/`block-driver` restartable; reboot survival on a real SSD | ✅ |
-| 3 | [A file is a capability](post_v2/3_FILE_AS_CAPABILITY.md) | P2 delegated resource capabilities: a file is a genuine kernel cap, unforgeable, non-escalating, and revocable | ✅ |
-| 4 | [IOMMU + DMA safety](post_v2/4_IOMMU_AND_DMA_SAFETY.md) | H1 IOMMU confinement, and the max-carnage DMA-after-free closed at three layers: contain, prevent, confine | ✅ |
-| 5 | [Kernel hardening](post_v2/5_KERNEL_HARDENING.md) | W^X/NXE foundation, generation-overflow guarantee, introspection and service-control capabilities, the clean H9 syscall-surface audit | ✅ |
-| 6 | [Fault tolerance](post_v2/6_FAULT_TOLERANCE.md) | Naming moved out of the kernel; registry retired, `init` removed, supervisor made restartable. The unkillable set is `{kernel}` alone | ✅ |
-| 7 | [Chaos (max-carnage)](post_v2/7_CHAOS_MAX_CARNAGE.md) | A userspace resilience-stressor that sweeps every live service, and the deep-soak kernel bugs it revealed and got fixed | ✅ |
-| 8 | [Shell + utilities](post_v2/8_SHELL_AND_UTILITIES.md) | The `gsh` capability-broker shell, `observe`, `edit` (any-size piece table), records, scripting + `selfcheck`, pipes, `date` | ✅ |
+| Milestone | In one line |
+|-----------|-------------|
+| [Identity](testing/identity.md) | The §22 identity suite: the executable constitution |
+| [Property](testing/property.md) | P1-P10: universal invariants under randomized inputs |
+| [Fuzz](testing/fuzz.md) | F1-F8: the kernel must never panic on user-controllable input |
+| [Stress](testing/stress.md) | S1-S10: no drift, leak, or corruption under sustained load |
+| [Performance](testing/performance.md) | B1-B10: latency and throughput baselines |
+| [Adversarial](testing/adversarial.md) | A1-A10: capability isolation under direct attack |
+| [Chaos](testing/chaos.md) | C1-C7: graceful degradation under partial failures |
+| [Code coverage](testing/code-coverage.md) | Coverage instrumentation and reporting |
+| [Unsafe audit](testing/unsafe-audit.md) | The CI check that every `unsafe` block is accounted for |
+| [Static analysis](testing/static-analysis.md) | Static-analysis CI |
+| [Static-analysis audit](testing/static-analysis-audit.md) | A combined static-analysis + unsafe-audit cleanup pass |
+| [Mutation testing](testing/mutation-testing.md) | Mutation testing of the suite |
+| [Subsystem property tests](testing/property-subsystem.md) | Property tests at the subsystem boundary |
+| [Subsystem-level property tests](testing/property-subsystem-level.md) | A deeper subsystem-level property pass |
+| [IPC-routing property tests](testing/property-ipc-routing.md) | P5, P8, P10 over the routing layer |
+| [Additional fuzz tests](testing/fuzz-additional.md) | A second F1-F8 fuzz pass |
+| [Identity CI green](testing/identity-ci.md) | The identity suite green in CI (20/20) |
+
+---
+
+## Hardware
+
+Getting the kernel onto real silicon and driving real devices.
+
+| Milestone | In one line |
+|-----------|-------------|
+| [Ring-3 bring-up](hardware/ring3-bringup.md) | Userspace on AMD hardware: three AMD-only root causes isolated and fixed (SYSRETQ SS RPL, the syscall/int stall, the APIC-timer cascade) |
+| [Userspace drivers](hardware/userspace-drivers.md) | Framebuffer console + USB: keyboard and mouse on both xHCI and EHCI, hot-plug, `unsafe`-free driver services via the audited SDK |
+| [IOMMU + DMA safety](hardware/iommu-and-dma.md) | H1 IOMMU confinement, and the max-carnage DMA-after-free closed at three layers: contain, prevent, confine |
+
+---
+
+## Storage
+
+| Milestone | In one line |
+|-----------|-------------|
+| [Persistence](storage/persistence.md) | AHCI block driver + the GSFS0008 filesystem: redo-journal crash-consistency, fsck/scrub, extents; `fs` and `block-driver` restartable; reboot survival on a real SSD |
+| [A file is a capability](storage/file-as-capability.md) | P2 delegated resource capabilities: a file is a genuine kernel cap, unforgeable, non-escalating, and revocable |
+
+---
+
+## Resilience
+
+| Milestone | In one line |
+|-----------|-------------|
+| [Kernel hardening](resilience/kernel-hardening.md) | W^X/NXE foundation, generation-overflow guarantee, introspection and service-control capabilities, the clean H9 syscall-surface audit |
+| [Fault tolerance](resilience/fault-tolerance.md) | Naming moved out of the kernel; registry retired, `init` removed, supervisor made restartable. The unkillable set is `{kernel}` alone |
+| [Chaos (max-carnage)](resilience/chaos-max-carnage.md) | A userspace resilience-stressor that sweeps every live service, and the deep-soak kernel bugs it revealed and got fixed |
+
+---
+
+## Shell
+
+| Milestone | In one line |
+|-----------|-------------|
+| [Shell + utilities](shell/shell-and-utilities.md) | The `gsh` capability-broker shell, `observe`, `edit` (any-size piece table), records, scripting + `selfcheck`, pipes, `date` |
 
 ---
 
@@ -86,4 +112,5 @@ usable shell with utilities. All hardware-proven on the T630.
 
 > Forward-looking, designed but not built: networking (a socket is a capability), GodspeedOS Prime (a
 > self-installing portable core), and cluster mode (`EndpointId -> (NodeId, CoreId)`). See `docs/` and
-> `CLAUDE.md` Appendix C.
+> `CLAUDE.md` Appendix C. None of this is "v-numbered" - it lands when a real need pulls it into
+> existence (§26.2).

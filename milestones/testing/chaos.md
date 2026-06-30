@@ -204,7 +204,7 @@ never acceptable.
 
 ## Implementation Checklist
 
-- ✅ `milestones/v1/14_CHAOS_TESTS.md` - this file
+- ✅ `milestones/testing/chaos.md` - this file
 - ✅ `services/probe/src/main.rs` - modes 91-96, dispatch arms, implementations
 - ✅ `kernel/src/task/mod.rs` - 8 new service configs (chaos-c2 through chaos-c7)
 - ✅ `services/supervisor/src/main.rs` - chaos probe spawns (victim-before-controller)

@@ -55,7 +55,7 @@ Every integrity failure mode is detected (CRC), reported, and refused rather tha
 |------|-------|
 | AHCI backend | `services/block-driver/`, `docs/ahci.md` |
 | Filesystem + journal | `services/fs/`, `docs/persistence.md` |
-| File-as-capability (delegated resource caps) | see `milestones/post_v2/3_FILE_AS_CAPABILITY.md` |
+| File-as-capability (delegated resource caps) | see `milestones/storage/file-as-capability.md` |
 | TCB-drop amendment | CLAUDE.md §6.1 (Phase D, 2026-06-17), §15 |
 
 **Test suite** (all green; counts per `osdev/CLAUDE.md`): `osdev test files` (records/pipes/`result`/

@@ -64,7 +64,7 @@ where the discipline matters most.
   found by `chaos max-carnage` and corrupted a kernel page table. It was fixed at the layer that owns
   it: the kernel quiesces a DMA driver's bus-mastering before reclaiming its frames, and a DMA arena
   is permanently reserved so a stray write can never land in a page table. A driver that respects V,
-  VI, VIII, and IX is one that survives this. *(COMMANDMENTS.md II; `milestones/post_v2/4_IOMMU_AND_DMA_SAFETY.md`.)*
+  VI, VIII, and IX is one that survives this. *(COMMANDMENTS.md II; `milestones/hardware/iommu-and-dma.md`.)*
 
 ## The contract, annotated
 
@@ -107,4 +107,4 @@ step is shown working in `examples/e1000`.
   confinement).
 - `examples/e1000` - a real, runnable driver (reads a live NIC's MAC over MMIO).
 - `services/block-driver`, `services/xhci`, `services/ehci` - production drivers.
-- `docs/iommu.md`, `milestones/post_v2/4_IOMMU_AND_DMA_SAFETY.md` - the DMA-safety story.
+- `docs/iommu.md`, `milestones/hardware/iommu-and-dma.md` - the DMA-safety story.

@@ -192,7 +192,7 @@ touching the confounded lockfree-serial path.
 
 ## Cross-references
 
-- `milestones/v2/MILESTONE.md` - the ring-3 AMD userspace milestone (the working baseline).
+- `milestones/hardware/ring3-bringup.md` - the ring-3 AMD userspace milestone (the working baseline).
 - `docs/hw-bare-metal-freeze-j5005.md` - earlier Goldmont+ (Wyse 5070) APIC freeze (different
   hardware; the TSC-deadline path is a related APIC workaround).
 - Branch `debug/bug-a-bsp-timer` (commit `3f69a3b`) - all the diagnostic probes (irrwatch,

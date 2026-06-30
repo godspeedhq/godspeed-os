@@ -79,7 +79,7 @@ GodspeedOS treats testing as architecture. The suite is layered - each layer mus
 
 Every `unsafe` block is inventoried in `docs/unsafe-audit.md` and enforced by
 `scripts/unsafe_check.py` - counts may not grow without a written SAFETY argument.
-Latest pass (2026-05-31, boot-verified on AMD T630; `milestones/v2/STATIC_ANALYSIS_AUDIT.md`):
+Latest pass (2026-05-31, boot-verified on AMD T630; `milestones/testing/static-analysis-audit.md`):
 
 | Check | Result |
 |-------|--------|

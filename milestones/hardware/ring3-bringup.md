@@ -261,7 +261,7 @@ No regression: the run completed clean on all four cores.
 ## Static-analysis + unsafe-audit cleanup (2026-05-31)
 
 A local static-analysis pass over the kernel after the AMD ring-3 / APIC / COM1 /
-shell work. No CI minutes consumed. Full write-up: `milestones/v2/STATIC_ANALYSIS_AUDIT.md`.
+shell work. No CI minutes consumed. Full write-up: `milestones/testing/static-analysis-audit.md`.
 
 | Area | Result |
 |------|--------|
