@@ -16,6 +16,33 @@
 
 ---
 
+## Contents
+
+- [2026-05-08 - The day the screen first said the machine was alive](#2026-05-08---the-day-the-screen-first-said-the-machine-was-alive)
+- [2026-05-09 - The day the nouns became verbs](#2026-05-09---the-day-the-nouns-became-verbs)
+- [2026-05-10 - The day two services talked across a boundary](#2026-05-10---the-day-two-services-talked-across-a-boundary)
+- [2026-05-12 - The day a service died and came back](#2026-05-12---the-day-a-service-died-and-came-back)
+- [2026-05-21 - The day the model met a real machine](#2026-05-21---the-day-the-model-met-a-real-machine)
+- [~2026-05-30 - The day the thin client taught me about real concurrency](#2026-05-30---the-day-the-thin-client-taught-me-about-real-concurrency)
+- [2026-06-09 - The day a trusted service stopped being trusted (H11)](#2026-06-09---the-day-a-trusted-service-stopped-being-trusted-h11)
+- [2026-06-12 - The day I found kernel-equivalent power hiding in a driver (H1)](#2026-06-12---the-day-i-found-kernel-equivalent-power-hiding-in-a-driver-h1)
+- [2026-06-17 - The day a crash stopped meaning a reboot (Phase D)](#2026-06-17---the-day-a-crash-stopped-meaning-a-reboot-phase-d)
+- [2026-06-18 - The day a file became a real capability (P2)](#2026-06-18---the-day-a-file-became-a-real-capability-p2)
+- [2026-06-20 to 2026-06-21 - The day I deleted the registry and learned what is truly irreducible](#2026-06-20-to-2026-06-21---the-day-i-deleted-the-registry-and-learned-what-is-truly-irreducible)
+- [2026-06-21 - The day nothing was allowed to be unkillable but the kernel](#2026-06-21---the-day-nothing-was-allowed-to-be-unkillable-but-the-kernel)
+- [2026-06-21 - The day Maximum Carnage was born](#2026-06-21---the-day-maximum-carnage-was-born)
+- [2026-06-22 to 2026-06-28 - The days Carnage found the wedges no one would write by hand](#2026-06-22-to-2026-06-28---the-days-carnage-found-the-wedges-no-one-would-write-by-hand)
+- [2026-06-25 - The day I wrote the constitution down as ten lines](#2026-06-25---the-day-i-wrote-the-constitution-down-as-ten-lines)
+- [2026-06-29 - The day the examples had to teach the truth](#2026-06-29---the-day-the-examples-had-to-teach-the-truth)
+- [2026-06-30 - The day a private discipline became a public one](#2026-06-30---the-day-a-private-discipline-became-a-public-one)
+- [The Days I Was Wrong](#the-days-i-was-wrong)
+  - [~2026-06-21 - The day the constitution rejected its author](#2026-06-21---the-day-the-constitution-rejected-its-author)
+  - [~2026-06-27 - The day I reached for a heap](#2026-06-27---the-day-i-reached-for-a-heap)
+  - [2026-06-28 - The day my own test lied to me](#2026-06-28---the-day-my-own-test-lied-to-me)
+- [The Named Bugs - the teachers](#the-named-bugs---the-teachers)
+
+---
+
 ## 2026-05-08 - The day the screen first said the machine was alive
 
 The repository opened, and by the end of the day the kernel booted to a steady state under
@@ -281,21 +308,27 @@ worth keeping most are the ones where the architecture had to beat the author. A
 only ever agreed with my instinct would be a mirror, not a law. These are the days it told me no,
 and was right to. They are the proof that the rules bind the founder first.
 
-### ~2026-06-21 - The day I nearly put Chaos in the kernel
+### ~2026-06-21 - The day the constitution rejected its author
 
-The chaos engine that became Maximum Carnage mattered so much to trusting the system that the
-obvious move was to build it *into* the kernel, where it could reach everything and break anything.
+While hardening Maximum Carnage, I noticed an apparent contradiction: Chaos exempted itself while
+running. Earlier, the shell had been exempt from Chaos so that I would always have a way back into the
+system, and that exemption had later proved to be hiding bugs. My first instinct was simple: if no
+service is special, then perhaps Chaos itself belonged in the kernel, so it could destroy every
+service, including itself.
 
-**What I came to understand:** Chaos is fundamental to *verification*, not to *operation*. A kernel
-that contains its own destroyer has made destruction a kernel feature - and that is exactly the
-ambient, reach-everything power the whole system exists to forbid. I nearly violated Commandment I
-(the kernel is complete; use a service) in order to serve Commandment II (love Chaos), and the two
-are only free of conflict because Chaos lives in userspace and kills services from the outside, like
-any attacker would.
+**What I came to understand:** the apparent contradiction came from confusing *operation* with
+*verification*. Chaos is fundamental to verifying the system, but it is not fundamental to operating
+it. A test harness cannot terminate itself while coordinating the test, any more than a scheduler can
+deschedule itself out of existence. Chaos remaining alive during a run is not privilege; it is the
+logical consequence of the role it performs. The kernel already provides the escape path through the
+serial console, so Chaos needs no special authority beyond the capabilities it already holds.
 
-**What it produced:** chaos stayed a userspace service (§4.4, §26.10), and a lesson worth more than
-the code - the commandments constrained the founder before they ever constrained a contributor. If
-the rules do not bind me when they are inconvenient, they are not rules; they are decoration.
+Moving Chaos into the kernel would have violated Commandment I: the kernel's responsibility is to
+*operate* the system; Chaos exists to *challenge* it.
+
+**What it produced:** perhaps the strongest proof yet that the Commandments are not written only for
+contributors - they constrained the project's own author. The idea was rejected, Chaos remained a
+userspace service (§4.4, §26.10), and the constitution proved that it governs principles, not people.
 
 ### ~2026-06-27 - The day I reached for a heap
 
