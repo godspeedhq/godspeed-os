@@ -250,7 +250,6 @@ os/
     capability.md
     restart.md
     smp.md
-    bootloader.md          # Limine integration notes
     unsafe-audit.md
 
   tests/
@@ -2143,7 +2142,7 @@ Out of scope for v1. If pursued later, Limine supports chainloading other bootlo
 
 - The integration code lives in `kernel/src/arch/x86_64/boot.rs`.
 - The Limine protocol version used is pinned in the workspace `Cargo.toml`. Protocol version bumps are PR-reviewed.
-- A short narrative of the boot handoff (Limine → kernel main) lives in `docs/bootloader.md`.
+- A short narrative of the boot handoff (Limine → kernel main) lives in `docs/bootstrap.md` (the §11 walkthrough).
 
 ---
 
