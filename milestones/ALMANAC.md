@@ -274,6 +274,99 @@ earned them. The work of keeping the architecture uncorrupted does not end here;
 
 ---
 
+## The Days I Was Wrong
+
+The entries above are mostly victories - the days understanding clicked into place. But the days
+worth keeping most are the ones where the architecture had to beat the author. A constitution that
+only ever agreed with my instinct would be a mirror, not a law. These are the days it told me no,
+and was right to. They are the proof that the rules bind the founder first.
+
+### ~2026-06-21 - The day I nearly put Chaos in the kernel
+
+The chaos engine that became Maximum Carnage mattered so much to trusting the system that the
+obvious move was to build it *into* the kernel, where it could reach everything and break anything.
+
+**What I came to understand:** Chaos is fundamental to *verification*, not to *operation*. A kernel
+that contains its own destroyer has made destruction a kernel feature - and that is exactly the
+ambient, reach-everything power the whole system exists to forbid. I nearly violated Commandment I
+(the kernel is complete; use a service) in order to serve Commandment II (love Chaos), and the two
+are only free of conflict because Chaos lives in userspace and kills services from the outside, like
+any attacker would.
+
+**What it produced:** chaos stayed a userspace service (§4.4, §26.10), and a lesson worth more than
+the code - the commandments constrained the founder before they ever constrained a contributor. If
+the rules do not bind me when they are inconvenient, they are not rules; they are decoration.
+
+### ~2026-06-27 - The day I reached for a heap
+
+A working set felt too big for the stack - an editor meant to open files of any size - and the
+reflex was instant: add an allocator.
+
+**What I came to understand:** "too big for the stack" is almost never a reason to add a heap. It is
+a reason to change the *representation* until the working set is small - a piece table, a streaming
+window, spans instead of copies. A heap would have hidden the bound; the constraint forced me to
+find the right data shape instead, and the right shape was simpler than the allocator would have been.
+
+**What it produced:** §26.6.1 (bounded memory means stack and arenas, not heap) and the habit of
+reading a hard ceiling reached *loudly* as a feature - a prompt to rethink the working set - not as a
+missing allocator.
+
+### 2026-06-28 - The day my own test lied to me
+
+A chaos flood-storm passed, and I believed it. Then I looked closer: it had been counting a full
+queue as "drained," so it had been passing a target that was actually broken. I had overstated a fix
+on the strength of a test that could not fail.
+
+**What I came to understand:** a test that passes a known-broken target is not a clean test, it is a
+weak one - and a green check from a weak test is worse than no test, because it sells false
+confidence. Fix the verdict before you trust the result.
+
+**What it produced:** the verification was rebuilt to demand that a re-sent message actually *land*,
+which immediately exposed three real clogs the old test had been hiding. Trust a system only as far
+as you trust the test that watched it.
+
+---
+
+## The Named Bugs - the teachers
+
+Some bugs are worth naming, because a name turns a failure into shorthand. Years from now someone
+will say *"do not repeat the Registry Illusion,"* and everyone in the room will know exactly what
+that means. These are not listed because they were bugs. They are here because they were teachers.
+
+- **The Registry Illusion** (2026-06-21) - an entire service existed to *store* a name-to-cap mapping
+  that turned out to be almost entirely derivable: the supervisor already held the caps, the kernel
+  needed only a tiny recovery anchor. *Taught:* most of what looks like irreducible truth is a derived
+  view dressed up as a source. (Commandment III.)
+- **The Sleeper on Core Zero** (~2026-05-30) - on the Dell Wyse, a service blocked on `recv` on the
+  bootstrap core was never woken: core 0 sat with interrupts disabled, and the cross-core wake IPI had
+  nowhere to land. *Taught:* a cross-core wake is only as good as the target core's willingness to be
+  interrupted. The first appearance of the IF=0 family.
+- **The IF=0 Respawn Wedge** (2026-06-23) - the kernel respawned the supervisor from inside an
+  interrupts-disabled timer ISR, so it could not acknowledge the TLB-shootdown IPIs it depended on, and
+  the whole machine froze. *Taught:* a recovery path that runs where it cannot be interrupted cannot
+  recover; privileged work belongs where interrupts are enabled.
+- **The Global TLB ACK Wedge** (2026-06-24) - at 71,000 carnage rounds, two cores each waited on the
+  other to acknowledge a global TLB shootdown, and both stopped. *Taught:* a global barrier under true
+  concurrency is a deadlock waiting for the one interleaving that triggers it; make it per-core.
+- **The DMA After Death** (2026-06-28) - a driver was killed and its memory reclaimed, but its device's
+  DMA engine kept writing into the freed-and-reused frame, and eventually scribbled over a kernel page
+  table. *Taught:* a device's DMA outlives the driver that aimed it; quiesce the hardware before
+  reclaiming its memory, and reserve the arena so a stray write can never reach a page table.
+- **The Mortal Shell** (2026-06-21) - the shell, the user's own interface, was the last thing that
+  stayed dead if you killed it. *Taught:* nothing escapes restartability, not even the face of the
+  system. (Invariant 6; identity over location applies to the shell too.)
+- **The Test That Lied** (2026-06-28) - a flood-storm counted a full queue as "drained" and passed a
+  target that was broken. *Taught:* a green check from a test that cannot fail is false confidence; fix
+  the verdict first. (The bug behind "the day my own test lied to me," above.)
+- **The Four-Thousand-Year Uptime** (2026-06-28) - uptime briefly reported ~4,987 days because the
+  clock was derived from a momentarily-glitched source. *Taught:* a derived view is only as honest as
+  its source; deglitch at the source, never paper over the symptom.
+
+*Add to this list as the project earns new names. A bug that taught something deserves to be
+remembered by name.*
+
+---
+
 *Compiled once, looking back - a record of what was understood, and the rules that understanding
 produced.*
 
