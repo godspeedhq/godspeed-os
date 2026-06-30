@@ -1166,6 +1166,7 @@ A PR is rejected without further review if it:
 - Adds a syscall that does not validate a capability.
 - Changes the IPC fast path without a benchmark.
 - Edits CLAUDE.md without a rationale in the commit message.
+- Introduces an em-dash (U+2014) or en-dash (U+2013) anywhere - in prose, code, comments, string literals, commit messages, or docs. Only the plain ASCII hyphen (-) is permitted as a dash; box-drawing characters are fine. This is a house writing convention, enforced repo-wide for consistency.
 
 Reviewers ask: does this respect the constitution, leave the kernel small, present a convincing unsafe argument, include a test, make the system more or less understandable?
 
