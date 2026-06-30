@@ -33,6 +33,7 @@ const PX_CMD: usize = 0x18;
 const PX_TFD: usize = 0x20;
 const PX_SIG: usize = 0x24;
 const PX_SSTS: usize = 0x28;
+const PX_SCTL: usize = 0x2C;
 const PX_SERR: usize = 0x30;
 const PX_CI: usize = 0x38;
 
@@ -63,6 +64,15 @@ const ATA_FLUSH_EXT: u8 = 0xEA;
 /// op is reported as failed. Bounded (§26.6); never an infinite retry loop.
 const MAX_IO_ATTEMPTS: u32 = 3;
 
+/// COMRESET DET-hold delay (`port_comreset` step 2), in `read_tsc` cycles. The AHCI spec wants DET
+/// held asserted >= 1 ms; ~4M cycles is ~2 ms at ~2 GHz (the T630), comfortably over the minimum on
+/// real silicon. A TSC delay (the ehci `delay_cycles` idiom) is used, NOT an MMIO-read spin: an
+/// MMIO read costs microseconds on real hardware AND under QEMU TCG, so a fixed read-count over- or
+/// under-shoots wildly; a TSC bound is the portable way to hold for a real interval. Under TCG the
+/// guest TSC races ahead so the wall-clock hold is shorter, which is fine - QEMU's emulated COMRESET
+/// is instant, it needs no real hold. read_tsc is hardware-proven to advance (perf §22).
+const COMRESET_HOLD_CYCLES: u64 = 4_000_000;
+
 struct Ahci<'a> {
     hba: &'a Mmio,
     arena: Dma,
@@ -85,9 +95,67 @@ impl<'a> Ahci<'a> {
         self.hba.write32(self.preg(off), v);
     }
 
-    /// Stop the port, point it at our command list / FIS in the arena, restart it.
-    fn init_port(&self) {
-        // Stop: clear ST + FRE, wait for CR + FR to clear.
+    /// DET-hold delay for COMRESET: spin on `read_tsc` until `COMRESET_HOLD_CYCLES` elapse. A real
+    /// timed hold (the ehci `delay_cycles` idiom), portable across real hardware and QEMU TCG -
+    /// unlike a fixed MMIO-read count, which costs seconds at microseconds-per-read. Bounded (§26.6).
+    fn comreset_delay(&self, ctx: &ServiceContext) {
+        let start = ctx.read_tsc();
+        while ctx.read_tsc().wrapping_sub(start) < COMRESET_HOLD_CYCLES {}
+    }
+
+    /// Hard PORT RESET (COMRESET) - what a cold boot does. A wedged port (a controller left BSY
+    /// by, e.g., thousands of mid-command kills in a `chaos max-carnage` soak) cannot be cleared
+    /// by the soft recovery in `init_port`/`recover_port`; only re-running the SATA OOB sequence
+    /// frees it. Stop the command engine, pulse PxSCTL.DET (1 -> hold -> 0) to force COMRESET,
+    /// wait for the PHY to re-establish communication, clear latched error/interrupt state, then
+    /// restart the command engine. Every spin is bounded and proceeds after its bound exactly
+    /// like `init_port` does (§26.6), so a missing/slow device can never wedge boot.
+    ///
+    /// **FIS-receive (FRE) is kept ON across the reset and CLB/FB must already be programmed.**
+    /// The device posts an initial D2H Register FIS right after a COMRESET; the HBA only latches
+    /// it (and clears PxTFD.BSY) when the receive area is armed (AHCI 10.1.2). If FRE were off /
+    /// FB unset during the reset, that FIS is dropped and the port is stuck BSY forever - which is
+    /// exactly what a wedge looks like. So both callers arm the receive area first: `init_port`
+    /// programs CLB/FB before calling this; `recover_port` runs on an already-initialised port.
+    fn port_comreset(&self, ctx: &ServiceContext) {
+        // 1. Stop command processing (clear ST, wait CR clears) but keep FIS-receive ON (set FRE)
+        //    so the device's post-reset initial D2H FIS is captured and PxTFD clears BSY.
+        let cmd = self.pread(PX_CMD);
+        self.pwrite(PX_CMD, (cmd & !CMD_ST) | CMD_FRE);
+        for _ in 0..1_000_000u32 {
+            if self.pread(PX_CMD) & CMD_CR == 0 {
+                break;
+            }
+        }
+        // 2. Assert COMRESET: PxSCTL.DET = 1, hold >= 1 ms.
+        let sctl = self.pread(PX_SCTL);
+        self.pwrite(PX_SCTL, (sctl & !0xF) | 0x1);
+        self.comreset_delay(ctx);
+        // 3. De-assert: PxSCTL.DET = 0 (the controller runs COMRESET; the device re-establishes).
+        let sctl = self.pread(PX_SCTL);
+        self.pwrite(PX_SCTL, sctl & !0xF);
+        // 4. Wait for the PHY to (re)establish communication: PxSSTS.DET == 3.
+        for _ in 0..1_000_000u32 {
+            if self.pread(PX_SSTS) & 0xF == 3 {
+                break;
+            }
+        }
+        // 5. Clear latched SATA error + interrupt status (write-1-to-clear).
+        self.pwrite(PX_SERR, 0xFFFF_FFFF);
+        self.pwrite(PX_IS, 0xFFFF_FFFF);
+        // 6. Wait for the device's initial D2H FIS to clear PxTFD.BSY, then restart the engine (ST).
+        for _ in 0..1_000_000u32 {
+            if self.pread(PX_TFD) & TFD_BSY == 0 {
+                break;
+            }
+        }
+        let cmd = self.pread(PX_CMD);
+        self.pwrite(PX_CMD, cmd | CMD_ST);
+    }
+
+    /// Stop the port, point it at our command list / FIS in the arena, COMRESET it, restart it.
+    fn init_port(&self, ctx: &ServiceContext) {
+        // Idle: clear ST + FRE, wait for CR + FR to clear.
         let cmd = self.pread(PX_CMD);
         self.pwrite(PX_CMD, cmd & !(CMD_ST | CMD_FRE));
         for _ in 0..1_000_000u32 {
@@ -95,21 +163,19 @@ impl<'a> Ahci<'a> {
                 break;
             }
         }
-        // Program the command-list + received-FIS base (physical addresses).
+        // Program the command-list + received-FIS base (physical addresses) BEFORE the reset, so
+        // the device's post-COMRESET initial D2H FIS lands in a valid receive area and PxTFD clears
+        // BSY (AHCI 10.1.2 port-init order: arm FB/CLB before bringing the engine up).
         let cl = self.arena.phys_at(CMD_LIST_OFF);
         self.pwrite(PX_CLB, cl as u32);
         self.pwrite(PX_CLBU, (cl >> 32) as u32);
         let fb = self.arena.phys_at(RX_FIS_OFF);
         self.pwrite(PX_FB, fb as u32);
         self.pwrite(PX_FBU, (fb >> 32) as u32);
-        // Clear any latched error/interrupt state.
-        self.pwrite(PX_SERR, 0xFFFF_FFFF);
-        self.pwrite(PX_IS, 0xFFFF_FFFF);
-        // Start: FRE first, then ST.
-        let cmd = self.pread(PX_CMD);
-        self.pwrite(PX_CMD, cmd | CMD_FRE);
-        let cmd = self.pread(PX_CMD);
-        self.pwrite(PX_CMD, cmd | CMD_ST);
+        // Hard-reset the port (COMRESET) so EVERY (re)start clears a wedged port the way a cold boot
+        // does - the soft path can't, and a chaos-soaked controller can boot BSY. With CLB/FB armed
+        // above, port_comreset captures the reset's initial FIS and restarts the engine (FRE + ST).
+        self.port_comreset(ctx);
     }
 
     /// Issue a single-PRDT command (slot 0) transferring `data_bytes` to/from the
@@ -195,7 +261,7 @@ impl<'a> Ahci<'a> {
     /// Clear the port's error state so a retried command can run: clear PxSERR + PxIS
     /// (write-1-to-clear), and if the command engine halted on the error (CR clear while ST is
     /// still set), restart it (toggle ST). Best-effort - used only on the retry path.
-    fn recover_port(&self) {
+    fn recover_port(&self, ctx: &ServiceContext) {
         self.pwrite(PX_SERR, 0xFFFF_FFFF); // W1C all SATA error bits
         self.pwrite(PX_IS, 0xFFFF_FFFF);   // W1C all port interrupt-status bits
         let cmd = self.pread(PX_CMD);
@@ -208,6 +274,13 @@ impl<'a> Ahci<'a> {
             self.pwrite(PX_SERR, 0xFFFF_FFFF);
             let cmd2 = self.pread(PX_CMD);
             self.pwrite(PX_CMD, cmd2 | CMD_ST);
+        }
+        // ESCALATE: if the port is STILL stuck BSY after the soft recovery above, the controller
+        // is wedged in a way only a real port reset clears (the `chaos max-carnage` failure mode:
+        // a COMRESET is what a cold boot does). Do it so a RUNNING driver self-heals a wedged port
+        // without waiting for a restart.
+        if self.pread(PX_TFD) & TFD_BSY != 0 {
+            self.port_comreset(ctx);
         }
     }
 
@@ -247,7 +320,7 @@ impl<'a> Ahci<'a> {
                     ctx.log_fmt(format_args!(
                         "block-driver: {} lba {} failed (attempt {}/{}): {} - recovering, will retry",
                         op, lba, attempt, MAX_IO_ATTEMPTS, e));
-                    self.recover_port();
+                    self.recover_port(ctx);
                 }
             }
         }
@@ -453,7 +526,7 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
     // mount exercise the retry/recovery path. Always 0 (no injection) in production.
     let forced = if cfg!(feature = "io-error-test") { 2 } else { 0 };
     let ahci = Ahci { hba, arena, port, sectors: Cell::new(0), forced_fails: Cell::new(forced) };
-    ahci.init_port();
+    ahci.init_port(ctx);
 
     match ahci.identify() {
         Ok((model, sectors)) => {
