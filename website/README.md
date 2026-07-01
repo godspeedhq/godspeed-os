@@ -34,9 +34,11 @@ mdbook serve      # live preview at http://localhost:3000
 
 ## Screenshots
 
-The gallery images are captured from the real OS in QEMU. `build/fb_shot.py` boots `build/os.img`
-headless with an emulated GPU, grabs the framebuffer via the QEMU monitor's `screendump` (PPM), and
-converts it to PNG with the Python standard library. Copy the result into `src/images/`.
+The gallery images are captured from the real OS in QEMU by the scripts in `tools/`. `fb_shot.py`
+boots `build/os.img` headless with an emulated GPU, grabs the framebuffer via the QEMU monitor's
+`screendump` (PPM), and converts it to PNG with the Python standard library; `fb_capture.py` also
+drives the shell over COM1 serial to reach a chosen state (observe, chaos) before the screendump.
+Copy the result into `src/images/`.
 
 ## Known wrinkle: relative links inside included files
 

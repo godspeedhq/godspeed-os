@@ -1,9 +1,10 @@
 # The System, Running
 
 Every image on this page is a capture of the real GodspeedOS, booted in QEMU with an emulated
-framebuffer and photographed straight from the guest's video memory. `build/fb_shot.py` grabs a
-single boot frame; `build/fb_capture.py` drives the shell over the COM1 serial line (where the shell
-reads input) and screendumps the framebuffer at a chosen state. Nothing here is a mockup.
+framebuffer and photographed straight from the guest's video memory. `website/tools/fb_shot.py`
+grabs a single boot frame; `website/tools/fb_capture.py` drives the shell over the COM1 serial line
+(where the shell reads input) and screendumps the framebuffer at a chosen state. Nothing here is a
+mockup.
 
 ## Boot to steady state
 
@@ -42,7 +43,7 @@ serial-console `q`, because the storm will kill the keyboard driver too.
 ![chaos max-carnage mid-storm, kernel still alive](images/chaos.png)
 
 <!--
-Next captures to add (each a real run, driven by build/fb_capture.py):
+Next captures to add (each a real run, driven by website/tools/fb_capture.py):
 - The gsh> shell prompt with a few commands run (drives, date, ls).
 - An edit session in the full-screen editor.
 These just need the guest driven to the state before the screendump, exactly as above.
