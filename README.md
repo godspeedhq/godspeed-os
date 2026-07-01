@@ -129,7 +129,29 @@ contracts/    service contracts and JSON schema
 examples/     annotated, Commandment-grounded teaching examples (start at examples/README.md)
 tests/        identity, property, fuzz, stress, chaos suites
 docs/         architecture notes and design docs
+website/      documentation site (mdBook; renders this repo's docs)
 ```
+
+---
+
+## Documentation site
+
+The docs in this repo also render as a browsable site built with
+[mdBook](https://rust-lang.github.io/mdBook/) (with the SDK API reference from rustdoc). The site is a
+**derived view**: every page is an `{{#include}}` of the real file, so it never duplicates or drifts
+from the source. A GitHub Action rebuilds and republishes it on every push to `main` that touches a
+doc, so editing `CLAUDE.md` or a `docs/` file updates the site automatically.
+
+Preview or update it locally:
+
+```bash
+cargo install mdbook          # one-time
+cd website
+mdbook serve --open           # live-reload preview at http://localhost:3000
+```
+
+How the includes work, how the gallery screenshots are captured, and the launch checklist are in
+[`website/README.md`](website/README.md).
 
 ---
 
