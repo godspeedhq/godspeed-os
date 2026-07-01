@@ -1,9 +1,10 @@
 # gsh - the GodspeedOS shell language (design)
 
-> **Status:** Tier 1 in progress. **Slice 1 (foundation) is BUILT** - `let`/`let mut` +
+> **Status:** Tier 1 in progress. **Slices 1-2 are BUILT** - Slice 1: `let`/`let mut` +
 > reassignment, `$`-expansion (`$name`, `"..."`) + params (`$1..$9`, `$@`, `$#`, `$0`), and `fail`
-> (§3, §8; pinned by `osdev test files`). The rest of Tier 1 (`if`/`else` + comparisons + `in` +
-> `result`, §4; `switch`, §6) and all of Tier 2 remain design-only. Scripts use the `.gsh` extension
+> (§3, §8); Slice 2: `if`/`else if`/`else` with comparisons (`== != < > <= >=`), `in`, `!`, and
+> `result` as a comparable value (§4). Both pinned by `osdev test files`. The remainder of Tier 1
+> (`switch`, §6) and all of Tier 2 remain design-only. Scripts use the `.gsh` extension
 > (GodspeedOS shell; `.gs` is reserved for the future general-purpose Godspeed language). Builds on
 > the `run`/`run_lines` interpreter and the command **Result** model (`execute` returns `Ok`/`Err`).
 > Not POSIX - see CLAUDE.md Appendix B.3 / D.
@@ -50,6 +51,9 @@
 - `#` to end of line is a comment; blank lines are ignored.
 - Tokens: bare words (no spaces, literal), `"double quoted"` (spaces ok, `$var` expands),
   `'single quoted'` (literal, no expansion).
+- **`{` and `}` are structural** - they delimit blocks (`if`/`else`, and later `for`/`loop`/`fn`/
+  `switch`). To use a brace *literally* in a value or command argument (e.g. a JSON literal), **quote
+  it**: `write /f '[{"n":1}]'`. Inside `'...'`/`"..."` a brace is literal, never a block.
 - **Multi-line content** uses a triple-quoted block - for writing real files. It expands `$vars`
   like `"…"`. It is for a command argument (bounded by `MAX_FILE_BYTES`); storing one in a `let`
   var that exceeds the value-size bound (§9) is a loud error, not a silent truncation.

@@ -211,7 +211,7 @@ roster | to json | from json | where role=core | assert contains Matthew
 roster | select name seat | to json | assert contains Luke
 
 # ===== json <-> records bridge (exhaustive where/select/sort - no service spawn) =====
-write /sc/data.json [{"name":"x","n":1},{"name":"y","n":2},{"name":"z","n":3}]
+write /sc/data.json '[{"name":"x","n":1},{"name":"y","n":2},{"name":"z","n":3}]'
 read /sc/data.json | from json | assert contains y
 read /sc/data.json | from json | where n>1 | assert contains z
 read /sc/data.json | from json | where n>1 | assert lacks x

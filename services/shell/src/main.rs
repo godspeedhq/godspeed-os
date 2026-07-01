@@ -1410,52 +1410,258 @@ fn run_stmt(ctx: &ServiceContext, cwd: &mut Cwd, stmt: &str, prev: Result<(), Sh
     StmtOutcome::Cont(execute(ctx, exp.as_bytes(), cwd, prev, depth))
 }
 
-/// A quote-aware statement walker over a resident script buffer. A statement ends at an UNQUOTED
-/// `;` or newline; `'`/`"` protect a `;`/`#`/newline inside them (quote state resets at a newline,
-/// per docs/scripting.md §2); `#` starts a comment-to-end-of-line only when unquoted at the start of
-/// a statement or after whitespace (so `write /f a#b` keeps its `#`). Yields trimmed, non-empty,
-/// non-comment statement slices of the buffer (no copies) - the direct replacement for the old
-/// `split('\n')` + `split(';')`.
-struct StmtReader<'a> { src: &'a [u8], pos: usize }
-impl<'a> StmtReader<'a> {
-    fn new(src: &'a [u8]) -> Self { StmtReader { src, pos: 0 } }
-    fn next_stmt(&mut self) -> Option<&'a [u8]> {
-        let b = self.src;
-        while self.pos < b.len() {
-            let start = self.pos;
-            let mut i = start;
-            let mut quote: u8 = 0;
-            let mut seg_end = b.len();
-            let mut next = b.len();
-            while i < b.len() {
-                let c = b[i];
-                if quote != 0 {
-                    // A newline resets quote state (docs/scripting.md §2) and ends the statement.
-                    if c == b'\n' { seg_end = i; next = i + 1; break; }
-                    if c == quote { quote = 0; }
-                    i += 1;
-                    continue;
-                }
-                match c {
-                    b'\'' | b'"' => { quote = c; i += 1; }
-                    b';' => { seg_end = i; next = i + 1; break; }
-                    b'\n' => { seg_end = i; next = i + 1; break; }
-                    b'#' if i == start || b[i - 1].is_ascii_whitespace() => {
-                        seg_end = i;
-                        let mut k = i;
-                        while k < b.len() && b[k] != b'\n' { k += 1; }
-                        next = if k < b.len() { k + 1 } else { k };
-                        break;
-                    }
-                    _ => { i += 1; }
-                }
-            }
-            self.pos = next;
-            let seg = trim_bytes(&b[start..seg_end]);
-            if !seg.is_empty() { return Some(seg); }
-        }
-        None
+// ── Slice 2: conditions (comparisons, `in`, command, `result`) + `if`/`else if`/`else` blocks. ──
+
+const IF_DEPTH_MAX: usize = 32;
+
+/// Parse a byte slice as a signed integer (optional leading `-`). `None` if it is not an integer.
+fn parse_i64(b: &[u8]) -> Option<i64> {
+    if b.is_empty() { return None; }
+    let (neg, digits) = if b[0] == b'-' { (true, &b[1..]) } else { (false, b) };
+    if digits.is_empty() { return None; }
+    let mut n: i64 = 0;
+    for &c in digits {
+        if !c.is_ascii_digit() { return None; }
+        n = n.checked_mul(10)?.checked_add((c - b'0') as i64)?;
     }
+    Some(if neg { -n } else { n })
+}
+
+fn is_cmp_op(t: &str) -> bool { matches!(t, "==" | "!=" | "<" | ">" | "<=" | ">=") }
+
+/// Compare two already-expanded operands with `op`. Numeric if BOTH parse as integers, else a
+/// byte-wise (lexicographic) comparison. `None` on a bad operator.
+fn compare(l: &[u8], r: &[u8], op: &str) -> Option<bool> {
+    use core::cmp::Ordering;
+    let ord = match (parse_i64(l), parse_i64(r)) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        _ => l.cmp(r),
+    };
+    Some(match op {
+        "==" => ord == Ordering::Equal,
+        "!=" => ord != Ordering::Equal,
+        "<"  => ord == Ordering::Less,
+        ">"  => ord == Ordering::Greater,
+        "<=" => ord != Ordering::Greater,
+        ">=" => ord != Ordering::Less,
+        _ => return None,
+    })
+}
+
+/// Does the previous statement's result match a result tag (`Ok`, `Err` = any failure, or a specific
+/// variant)? `None` if `tag` is not a known result kind.
+fn result_matches(prev: Result<(), ShellError>, tag: &[u8]) -> Option<bool> {
+    Some(match tag {
+        b"Ok" => prev.is_ok(),
+        b"Err" => prev.is_err(),
+        b"FileNotFound" => matches!(prev, Err(ShellError::FileNotFound)),
+        b"Denied" => matches!(prev, Err(ShellError::Denied)),
+        b"AssertFailed" => matches!(prev, Err(ShellError::AssertFailed)),
+        b"Unknown" => matches!(prev, Err(ShellError::Unknown)),
+        _ => return None,
+    })
+}
+
+/// Read one raw token (KEEPING any surrounding quotes) from `s` at `from`; returns `(token, end)`.
+fn raw_token(s: &str, from: usize) -> (&str, usize) {
+    let b = s.as_bytes();
+    let mut i = from;
+    while i < b.len() && b[i].is_ascii_whitespace() { i += 1; }
+    let start = i;
+    if i < b.len() && (b[i] == b'\'' || b[i] == b'"') {
+        let q = b[i]; i += 1;
+        while i < b.len() && b[i] != q { i += 1; }
+        if i < b.len() { i += 1; }
+    } else {
+        while i < b.len() && !b[i].is_ascii_whitespace() { i += 1; }
+    }
+    (&s[start..i], i)
+}
+
+/// `$x in w1 w2 ...` - true if the expanded `lhs` equals any expanded word in `words`.
+fn membership(ctx: &ServiceContext, lhs: &[u8], words: &str, vars: &Vars, params: &Params) -> bool {
+    let b = words.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        while i < b.len() && b[i].is_ascii_whitespace() { i += 1; }
+        if i >= b.len() { break; }
+        let (raw, end) = raw_token(words, i);
+        i = end;
+        let mut wb = ExpBuf::new();
+        if expand_val(ctx, raw, vars, params, &mut wb).is_ok() && wb.as_bytes() == lhs { return true; }
+    }
+    false
+}
+
+/// Evaluate a condition to a bool. A condition is: `!<cond>` (negated), `<lhs> in <words...>`
+/// (membership), `<lhs> <op> <rhs>` (comparison; `result` compares by kind), or a command (true iff
+/// it returns `Ok`). A command condition does NOT update `result` - only real statements do.
+fn eval_cond(ctx: &ServiceContext, cwd: &mut Cwd, cond: &str, vars: &Vars, params: &Params, prev: Result<(), ShellError>, depth: u8) -> bool {
+    let cond = cond.trim();
+    if cond.is_empty() { ctx.console_writeln("gsh: empty condition"); return false; }
+    if let Some(rest) = cond.strip_prefix('!') {
+        return !eval_cond(ctx, cwd, rest.trim(), vars, params, prev, depth);
+    }
+    let (t0, e0) = raw_token(cond, 0);
+    let rest1 = &cond[e0..];
+    let (t1, e1) = raw_token(rest1, 0);
+    // membership: `<lhs> in w1 w2 ...`
+    if t1 == "in" {
+        let mut lb = ExpBuf::new();
+        if expand_val(ctx, t0, vars, params, &mut lb).is_err() { return false; }
+        return membership(ctx, lb.as_bytes(), rest1[e1..].trim_start(), vars, params);
+    }
+    // comparison: `<lhs> <op> <rhs>`
+    if is_cmp_op(t1) {
+        let rhs = rest1[e1..].trim();
+        // `result` compares by kind (Ok / Err / specific variant), with == / != only.
+        if t0 == "result" || rhs == "result" {
+            let tag = if t0 == "result" { rhs } else { t0 };
+            return match result_matches(prev, tag.as_bytes()) {
+                Some(m) => match t1 {
+                    "==" => m,
+                    "!=" => !m,
+                    _ => { ctx.console_writeln("gsh: result compares only with == / !="); false }
+                },
+                None => { ctx.console_writeln_fmt(format_args!("gsh: '{}' is not a result kind (Ok/Err/FileNotFound/Denied/AssertFailed/Unknown)", tag)); false }
+            };
+        }
+        let mut lb = ExpBuf::new();
+        let mut rb = ExpBuf::new();
+        if expand_val(ctx, t0, vars, params, &mut lb).is_err() { return false; }
+        if expand_val(ctx, rhs, vars, params, &mut rb).is_err() { return false; }
+        return match compare(lb.as_bytes(), rb.as_bytes(), t1) {
+            Some(x) => x,
+            None => { ctx.console_writeln("gsh: bad comparison operator"); false }
+        };
+    }
+    // command condition: expand + run, true iff Ok (result is NOT updated by a condition).
+    let mut exp = ExpBuf::new();
+    if expand_cmd(ctx, cond, vars, params, &mut exp).is_err() { return false; }
+    execute(ctx, exp.as_bytes(), cwd, prev, depth).is_ok()
+}
+
+/// Skip ASCII whitespace from `i`.
+fn skip_ws(b: &[u8], mut i: usize) -> usize { while i < b.len() && b[i].is_ascii_whitespace() { i += 1; } i }
+
+/// Skip statement separators: whitespace, `;`, and whole-line `#` comments.
+fn skip_seps(b: &[u8], mut i: usize) -> usize {
+    loop {
+        while i < b.len() && (b[i].is_ascii_whitespace() || b[i] == b';') { i += 1; }
+        if i < b.len() && b[i] == b'#' { while i < b.len() && b[i] != b'\n' { i += 1; } continue; }
+        return i;
+    }
+}
+
+/// True if `b[pos..]` begins with keyword `kw` followed by a word boundary (whitespace, `{`, or end).
+fn matches_kw(b: &[u8], pos: usize, kw: &[u8]) -> bool {
+    if pos + kw.len() > b.len() || &b[pos..pos + kw.len()] != kw { return false; }
+    let after = pos + kw.len();
+    after >= b.len() || b[after].is_ascii_whitespace() || b[after] == b'{'
+}
+
+/// Find the next UNQUOTED `{` at/after `i` (quote state resets at a newline, §2).
+fn find_open_brace(b: &[u8], mut i: usize) -> Option<usize> {
+    let mut quote: u8 = 0;
+    while i < b.len() {
+        let c = b[i];
+        if quote != 0 { if c == b'\n' || c == quote { quote = 0; } i += 1; continue; }
+        match c { b'\'' | b'"' => quote = c, b'{' => return Some(i), _ => {} }
+        i += 1;
+    }
+    None
+}
+
+/// Given `open` at a `{`, find the position of its matching `}` (quote-aware brace counting).
+fn find_matching_brace(b: &[u8], open: usize) -> Option<usize> {
+    let mut i = open + 1;
+    let mut depth = 1usize;
+    let mut quote: u8 = 0;
+    while i < b.len() {
+        let c = b[i];
+        if quote != 0 { if c == b'\n' || c == quote { quote = 0; } i += 1; continue; }
+        match c {
+            b'\'' | b'"' => quote = c,
+            b'{' => depth += 1,
+            b'}' => { depth -= 1; if depth == 0 { return Some(i); } }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// After a TAKEN if/else-if block's `}` (at `pos`), skip any trailing `else if {...}` / `else {...}`
+/// (a taken branch means no further branch runs). Returns the position just past the whole chain.
+fn skip_else_chain(b: &[u8], mut pos: usize) -> usize {
+    loop {
+        let p = skip_ws(b, pos);
+        if !matches_kw(b, p, b"else") { return pos; }
+        let after_else = skip_ws(b, p + 4);
+        let is_elif = matches_kw(b, after_else, b"if");
+        let cond_start = if is_elif { after_else + 2 } else { after_else };
+        let open = match find_open_brace(b, cond_start) { Some(o) => o, None => return b.len() };
+        let end = match find_matching_brace(b, open) { Some(e) => e, None => return b.len() };
+        pos = end + 1;
+        if !is_elif { return pos; } // a plain `else` terminates the chain
+    }
+}
+
+/// The result of processing an `if` construct.
+enum IfStep { Enter(usize), Done(usize), Malformed(usize) }
+
+/// Handle an `if`/`else if`/`else` chain starting just after the `if` keyword (at `pos`). Evaluates
+/// each condition in turn: on the first true one, returns `Enter(body)` (the executor runs that
+/// block, then its `}` skips the rest of the chain); if none is true, takes a trailing `else` if
+/// present, else returns `Done(next)`.
+fn handle_if(b: &[u8], mut pos: usize, ctx: &ServiceContext, cwd: &mut Cwd, vars: &Vars, params: &Params, prev: Result<(), ShellError>, depth: u8) -> IfStep {
+    loop {
+        let open = match find_open_brace(b, pos) { Some(o) => o, None => { ctx.console_writeln("gsh: if: missing '{'"); return IfStep::Malformed(b.len()); } };
+        let end = match find_matching_brace(b, open) { Some(e) => e, None => { ctx.console_writeln("gsh: if: unbalanced braces"); return IfStep::Malformed(b.len()); } };
+        let cond = str_of(trim_bytes(&b[pos..open]));
+        if eval_cond(ctx, cwd, cond, vars, params, prev, depth) {
+            return IfStep::Enter(open + 1);
+        }
+        // false: skip this block; look for `else` / `else if`.
+        pos = end + 1;
+        let p = skip_ws(b, pos);
+        if !matches_kw(b, p, b"else") { return IfStep::Done(pos); }
+        let after_else = skip_ws(b, p + 4);
+        if matches_kw(b, after_else, b"if") { pos = after_else + 2; continue; } // else if -> re-loop
+        // plain `else` -> take it (no prior branch was true).
+        let eopen = match find_open_brace(b, after_else) { Some(o) => o, None => { ctx.console_writeln("gsh: else: missing '{'"); return IfStep::Malformed(b.len()); } };
+        return IfStep::Enter(eopen + 1);
+    }
+}
+
+/// Read a simple (non-block) statement starting at `start`: up to an unquoted `;`, newline, `{`,
+/// `}`, or an inline `#` comment. Returns `(trimmed statement, resume position)`; a `{`/`}` is NOT
+/// consumed (the executor handles braces), `;`/newline/comment ARE stepped past.
+fn read_statement(b: &[u8], start: usize) -> (&[u8], usize) {
+    let mut i = start;
+    let mut quote: u8 = 0;
+    while i < b.len() {
+        let c = b[i];
+        if quote != 0 {
+            if c == b'\n' { return (trim_bytes(&b[start..i]), i + 1); }
+            if c == quote { quote = 0; }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' | b'"' => { quote = c; i += 1; }
+            b';' | b'\n' => return (trim_bytes(&b[start..i]), i + 1),
+            b'{' | b'}' => return (trim_bytes(&b[start..i]), i),
+            b'#' if i == start || b[i - 1].is_ascii_whitespace() => {
+                let s = trim_bytes(&b[start..i]);
+                let mut k = i;
+                while k < b.len() && b[k] != b'\n' { k += 1; }
+                return (s, if k < b.len() { k + 1 } else { k });
+            }
+            _ => { i += 1; }
+        }
+    }
+    (trim_bytes(&b[start..i]), i)
 }
 
 /// Execute a script body (already in memory): split into commands, run each, then print a
@@ -1479,41 +1685,88 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
     let mut ran = 0u32;
     let mut failed = 0u32;
     let mut last: Result<(), ShellError> = Ok(());
-    // Per-statement verdicts, for the end-of-run summary. Bounded; statements past the cap still run
-    // and count, they just don't get a summary line (loud, not silent - §26.6).
+    // Per-statement verdicts + spans for the end-of-run summary. With control flow, the executed
+    // statements are no longer a simple prefix of the source, so record each one's (offset, len) as it
+    // runs. Bounded; statements past the cap still run and count in the totals, they just get no
+    // summary line (loud, not silent - §26.6).
     let mut verdict = [true; RUN_MAX_CMDS];
-    let mut vi = 0usize;
-    let mut executed = 0usize;
-    // PASS 1: run each statement in order (a `let`/reassignment/`fail`, or an expanded command). A
-    // `fail` stops the run. Statements run at `depth + 1` so a nested `run` inside a script is refused.
-    let mut reader = StmtReader::new(src);
-    while let Some(stmt) = reader.next_stmt() {
+    let mut soff = [0u16; RUN_MAX_CMDS];
+    let mut slng = [0u16; RUN_MAX_CMDS];
+    let mut nrec = 0usize;
+    let b = src;
+    let sdepth = depth + 1; // statements/conditions run one level deeper (a nested `run` is refused)
+    // Explicit position-based executor (no native recursion, §9): a flat cursor over the resident
+    // buffer plus a `{`/`}` depth counter. `if` seeks over untaken blocks; a taken block's `}` skips
+    // the rest of its else-chain. Nesting is handled by brace-scanning, not by the native stack.
+    let mut pos = 0usize;
+    let mut blockdepth = 0usize;
+    loop {
+        pos = skip_seps(b, pos);
+        if pos >= b.len() { break; }
+        // `}` closes the current (taken) if/else block; skip any trailing else-chain.
+        if b[pos] == b'}' {
+            if blockdepth == 0 { ctx.console_writeln("gsh: unexpected '}'"); last = Err(ShellError::Unknown); failed += 1; break; }
+            blockdepth -= 1;
+            pos = skip_else_chain(b, pos + 1);
+            continue;
+        }
+        // a stray `{` outside an `if`/`else` is malformed (a literal `{` in a command must be quoted).
+        if b[pos] == b'{' {
+            ctx.console_writeln("gsh: unexpected '{'");
+            pos = find_matching_brace(b, pos).map(|e| e + 1).unwrap_or(b.len());
+            last = Err(ShellError::Unknown); failed += 1;
+            continue;
+        }
+        // an `if` construct.
+        if matches_kw(b, pos, b"if") {
+            match handle_if(b, pos + 2, ctx, cwd, &vars, params, last, sdepth) {
+                IfStep::Enter(body) => {
+                    if blockdepth >= IF_DEPTH_MAX { ctx.console_writeln("gsh: block nesting too deep"); last = Err(ShellError::Unknown); failed += 1; break; }
+                    blockdepth += 1;
+                    pos = body;
+                }
+                IfStep::Done(next) => { pos = next; }
+                IfStep::Malformed(next) => { last = Err(ShellError::Unknown); failed += 1; pos = next; }
+            }
+            continue;
+        }
+        // a stray `else` (its `if` was taken and the chain already skipped) - malformed; skip its block.
+        if matches_kw(b, pos, b"else") {
+            ctx.console_writeln("gsh: unexpected 'else'");
+            let after = skip_ws(b, pos + 4);
+            let cs = if matches_kw(b, after, b"if") { after + 2 } else { after };
+            pos = find_open_brace(b, cs).and_then(|o| find_matching_brace(b, o)).map(|e| e + 1).unwrap_or(b.len());
+            last = Err(ShellError::Unknown); failed += 1;
+            continue;
+        }
+        // a simple statement (let / reassignment / fail / command).
+        let (stmt, next) = read_statement(b, pos);
+        if next <= pos { pos += 1; continue; } // defensive: never stall
+        let stmt_off = stmt.as_ptr() as usize - b.as_ptr() as usize;
+        pos = next;
+        if stmt.is_empty() { continue; }
         let s = str_of(stmt);
         // Echo the statement so the transcript shows what produced each result.
         out.put(ctx, "> ");
         out.line(ctx, s);
-        let (res, stop) = match run_stmt(ctx, cwd, s, last, depth + 1, &mut vars, params) {
+        let (res, stop) = match run_stmt(ctx, cwd, s, last, sdepth, &mut vars, params) {
             StmtOutcome::Cont(r) => (r, false),
             StmtOutcome::Stop(r) => (r, true),
         };
         last = res;
-        if vi < RUN_MAX_CMDS { verdict[vi] = last.is_ok(); }
-        vi += 1;
+        if nrec < RUN_MAX_CMDS { verdict[nrec] = last.is_ok(); soff[nrec] = stmt_off as u16; slng[nrec] = stmt.len() as u16; }
+        nrec += 1;
         ran += 1;
-        executed += 1;
         if last.is_err() { failed += 1; }
         if stop { break; }
     }
-    // End-of-run summary: PASS/FAIL per EXECUTED statement (re-walk identically, pair with `verdict`).
+    // End-of-run summary: PASS/FAIL per EXECUTED statement, from the recorded spans.
     // "FAIL  " is deliberately not the word "FAILED" the harness greens on absence of.
     out.line(ctx, "--- summary ---");
-    let mut reader2 = StmtReader::new(src);
-    let mut j = 0usize;
-    while j < executed {
-        let stmt = match reader2.next_stmt() { Some(s) => s, None => break };
-        out.put(ctx, if j < RUN_MAX_CMDS && !verdict[j] { "FAIL  " } else { "PASS  " });
-        out.line(ctx, str_of(stmt));
-        j += 1;
+    let shown = nrec.min(RUN_MAX_CMDS);
+    for j in 0..shown {
+        out.put(ctx, if !verdict[j] { "FAIL  " } else { "PASS  " });
+        out.line(ctx, str_of(&b[soff[j] as usize..soff[j] as usize + slng[j] as usize]));
     }
     out.line_fmt(ctx, format_args!("run: ran {}, failed {}", ran, failed));
     if failed == 0 { Ok(()) } else { Err(ShellError::Unknown) }

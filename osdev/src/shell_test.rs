@@ -1777,6 +1777,53 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None => { println!("files-test: FAIL - gsh fail timeout"); fail += 1; }
     }
 
+    // ── gsh Slice 2: if/else, comparisons, `in`, command conditions, `result` (docs/scripting.md §4).
+    // numeric comparison, then-branch taken; the else block is skipped (never echoed).
+    let _ = run!(b"write /g2a.gsh let n = 5 ; if $n > 3 { echo big } else { echo small }\r", 10);
+    match run!(b"run /g2a.gsh\r", 16) {
+        Some(r) => check!(r.contains("big") && !r.contains("small") && r.contains("run: ran 2, failed 0"),
+                          "gsh: if takes the then-branch on a true comparison (else skipped, counted right)"),
+        None => { println!("files-test: FAIL - gsh if-then timeout"); fail += 1; }
+    }
+    // false comparison → else-branch.
+    let _ = run!(b"write /g2b.gsh let n = 2 ; if $n > 3 { echo big } else { echo small }\r", 10);
+    match run!(b"run /g2b.gsh\r", 14) {
+        Some(r) => check!(r.contains("small") && !r.contains("big"), "gsh: if takes the else-branch on a false comparison"),
+        None => { println!("files-test: FAIL - gsh if-else timeout"); fail += 1; }
+    }
+    // else-if chain + string equality: only the matching arm runs.
+    let _ = run!(b"write /g2c.gsh let g = B ; if $g == A { echo is-a } else if $g == B { echo is-b } else { echo other }\r", 10);
+    match run!(b"run /g2c.gsh\r", 14) {
+        Some(r) => check!(r.contains("is-b") && !r.contains("is-a") && !r.contains("other"),
+                          "gsh: else-if chain runs only the matching arm"),
+        None => { println!("files-test: FAIL - gsh else-if timeout"); fail += 1; }
+    }
+    // membership: `$x in a b c`.
+    let _ = run!(b"write /g2d.gsh let role = core ; if $role in worker core courier { echo known } else { echo unknown }\r", 10);
+    match run!(b"run /g2d.gsh\r", 14) {
+        Some(r) => check!(r.contains("known") && !r.contains("unknown"), "gsh: `$x in ...` membership condition"),
+        None => { println!("files-test: FAIL - gsh in timeout"); fail += 1; }
+    }
+    // negated command condition: `!read <missing>` is true (the read errors).
+    let _ = run!(b"write /g2e.gsh if !read /nope_xyz.txt { echo absent } else { echo present }\r", 10);
+    match run!(b"run /g2e.gsh\r", 16) {
+        Some(r) => check!(r.contains("absent") && !r.contains("present"), "gsh: `!<command>` negates a command condition"),
+        None => { println!("files-test: FAIL - gsh negate timeout"); fail += 1; }
+    }
+    // result comparison: branch on the previous statement's specific failure kind.
+    let _ = run!(b"write /g2f.gsh read /nope_xyz.txt ; if result == FileNotFound { echo caught }\r", 10);
+    match run!(b"run /g2f.gsh\r", 14) {
+        Some(r) => check!(r.contains("caught") && r.contains("run: ran 2, failed 1"),
+                          "gsh: `if result == FileNotFound` branches on the prior result kind"),
+        None => { println!("files-test: FAIL - gsh result timeout"); fail += 1; }
+    }
+    // nested if: the executor handles block nesting (no native recursion).
+    let _ = run!(b"write /g2h.gsh let x = 1 ; if $x == 1 { if $x < 5 { echo nested-ok } }\r", 10);
+    match run!(b"run /g2h.gsh\r", 14) {
+        Some(r) => check!(r.contains("nested-ok") && r.contains("run: ran 2, failed 0"), "gsh: nested if blocks execute"),
+        None => { println!("files-test: FAIL - gsh nested timeout"); fail += 1; }
+    }
+
     // ── assert: the verifying command. Content form (the pipe sink) is tested interactively -
     //    a `|` can't yet be authored into a script via `write` (the shell pipes the write line).
     match run!(b"roster | where role=core | assert contains Matthew\r", 16) {
