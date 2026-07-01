@@ -9,6 +9,8 @@
 //! This is the "single global RwLock" approach approved for v1. The lock is
 //! never held across a `block_and_reschedule` call.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use crate::capability::generation::Generation;
 use crate::ipc::endpoint::EndpointId;
 use crate::ipc::message::{IpcError, Message};
@@ -71,6 +73,53 @@ impl RoutingEntry {
 // zeroes `.bss` before entry.
 #[link_section = ".bss"]
 static TABLE: SpinLock<[RoutingEntry; MAX_ENDPOINTS]> = SpinLock::ZEROED;
+
+// ---------------------------------------------------------------------------
+// Synchronous-CALL reply tracking (§8.6 reply-side death-wake; Commandment VIII).
+// ---------------------------------------------------------------------------
+
+/// The endpoint id each task is blocked-in-CALL awaiting a reply from (0 = no in-flight call),
+/// indexed by the caller's task slot. **Bounded**: exactly one entry per task - a blocked task has at
+/// most one in-flight call - so it never grows (no allocation, no list).
+///
+/// This is the reply-side twin of `RoutingEntry::blocked_sender`. When a task makes a synchronous
+/// CALL (send request + block awaiting the reply), it records the **target** endpoint here. If that
+/// endpoint later dies, `take_call_waiter` finds the caller and the kill path wakes it with
+/// `ReplyDead` - exactly as `kill_endpoint` returns a blocked *sender* to wake with `EndpointDead`.
+///
+/// Race-freedom mirrors `blocked_sender` (no new lock): every read and write below happens while the
+/// `TABLE` lock is held, so registration (`call_dequeue`) and the death scan (`take_call_waiter`) are
+/// mutually exclusive and ordered with `kill_endpoint`'s liveness bump. A registration only happens
+/// after observing the target **alive** under the lock; once `kill_endpoint` has marked it dead, a
+/// later registration refuses (returns `ReplyDead`) - so no caller can register-then-miss the wake.
+/// `AtomicU64` (not `static mut`) keeps `ipc/` unsafe-free (see ipc/CLAUDE.md).
+static CALL_AWAIT_EP: [AtomicU64; crate::task::scheduler::MAX_TASKS] =
+    [const { AtomicU64::new(0) }; crate::task::scheduler::MAX_TASKS];
+
+/// Record that `caller_slot` is now blocked-in-CALL awaiting a reply from `target` (TABLE held).
+#[inline]
+fn set_call_await(caller_slot: usize, target: EndpointId) {
+    if caller_slot < CALL_AWAIT_EP.len() {
+        CALL_AWAIT_EP[caller_slot].store(target.0, Ordering::Relaxed);
+    }
+}
+
+/// Clear `caller_slot`'s outstanding-call record (TABLE held, or a lone store on the kill path).
+#[inline]
+fn clear_call_await_inner(caller_slot: usize) {
+    if caller_slot < CALL_AWAIT_EP.len() {
+        CALL_AWAIT_EP[caller_slot].store(0, Ordering::Relaxed);
+    }
+}
+
+/// Clear a task's outstanding-call record. Called from the task-kill path so a dying caller's stale
+/// entry cannot, after its slot is reused, cause a future `take_call_waiter` to spuriously wake the
+/// slot's new occupant. A lone relaxed store is sufficient: the slot is not reused until `TASK_VALID`
+/// is set false later in the kill path (with its own release fence), and a stale entry is otherwise
+/// harmless (`wake_by_slot` guards on `TASK_VALID`).
+pub fn clear_call_await(caller_slot: usize) {
+    clear_call_await_inner(caller_slot);
+}
 
 // ---------------------------------------------------------------------------
 // Public API.
@@ -239,6 +288,79 @@ fn dequeue_locked(
     };
 
     Ok((msg, sender_slot))
+}
+
+/// Dequeue a CALL reply, or register the caller as blocked-in-CALL awaiting `target` (§8.6
+/// reply-side death-wake). Like `dequeue` on the caller's own endpoint `recv_ep`, but with the
+/// reply-side liveness guarantee that closes the hang:
+///
+/// 1. If a reply is already queued on `recv_ep`, return it (`Ok`) - a delivered reply always wins,
+///    even if `target` has since died.
+/// 2. Else, if `target` (the would-be replier) is already dead, return `Err(ReplyDead)` at once -
+///    the reply can never come, so the caller must not block.
+/// 3. Else, record the caller as `blocked_receiver` of `recv_ep` AND register the outstanding call
+///    against `target`, then return `Err(QueueEmpty)` so the caller blocks. A subsequent death of
+///    `target` is caught by `take_call_waiter` (called from the kill path) which wakes the caller.
+///
+/// All three steps run under the one `TABLE` lock, so they are atomic with respect to
+/// `kill_endpoint(target)` - the registration-vs-death race is closed exactly as it is for a blocked
+/// sender. `Err(EndpointDead)` here means the caller's *own* endpoint died (it is being killed).
+pub fn call_dequeue(
+    recv_ep: EndpointId,
+    recv_gen: Generation,
+    target: EndpointId,
+    caller_slot: usize,
+) -> Result<(Message, Option<usize>), IpcError> {
+    let mut table = TABLE.lock_irq();
+
+    // 1. Take an already-delivered reply WITHOUT registering as blocked (pass None).
+    match dequeue_locked(&mut *table, recv_ep, recv_gen, None) {
+        Ok(got) => {
+            clear_call_await_inner(caller_slot);
+            return Ok(got);
+        }
+        Err(IpcError::QueueEmpty) => {}                 // fall through to block-or-die
+        Err(e) => {                                     // our own endpoint died, etc.
+            clear_call_await_inner(caller_slot);
+            return Err(e);
+        }
+    }
+
+    // 2. Queue empty: if the would-be replier is already dead, the reply can never arrive.
+    let target_alive = matches!(
+        find_index(&*table, target),
+        Some(i) if table[i].liveness == EndpointLiveness::Alive
+    );
+    if !target_alive {
+        clear_call_await_inner(caller_slot);
+        return Err(IpcError::ReplyDead);
+    }
+
+    // 3. Register as blocked receiver of our own endpoint AND record the outstanding call, both under
+    //    this lock - ordered with kill_endpoint(target) + take_call_waiter (the death-wake).
+    if let Some(j) = find_index(&*table, recv_ep) {
+        table[j].blocked_receiver = Some(caller_slot);
+    }
+    set_call_await(caller_slot, target);
+    Err(IpcError::QueueEmpty)
+}
+
+/// Pop one task slot blocked-in-CALL awaiting a reply from `dead_ep`, clearing its record; `None`
+/// when none remain. Called repeatedly from the task-kill path (after `kill_endpoint` has marked
+/// `dead_ep` dead) to wake every such caller with `ReplyDead` - the reply-side twin of the
+/// blocked-sender wake `kill_endpoint` returns. Bounded: at most one entry per task, so the kill
+/// path's drain loop runs at most `MAX_TASKS` times. Holding `TABLE` orders this scan after every
+/// registration that observed `dead_ep` alive (those happened before the liveness bump), and any
+/// registration racing in after the bump refuses (sees `dead_ep` dead in `call_dequeue` step 2).
+pub fn take_call_waiter(dead_ep: EndpointId) -> Option<usize> {
+    let _table = TABLE.lock_irq(); // ordering with call_dequeue registration; guards the scan
+    for slot in 0..CALL_AWAIT_EP.len() {
+        if CALL_AWAIT_EP[slot].load(Ordering::Relaxed) == dead_ep.0 {
+            CALL_AWAIT_EP[slot].store(0, Ordering::Relaxed);
+            return Some(slot);
+        }
+    }
+    None
 }
 
 /// Kernel-internal interrupt delivery path. No capability or generation check -

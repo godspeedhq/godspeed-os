@@ -32,6 +32,33 @@ with a harsher "brutal" variant (see the "Tried by Fire" section of `COMMANDMENT
 test is necessary, never sufficient. In particular, every service must survive `chaos max-carnage`
 (Commandment II): if Chaos finds a bug, the bug already existed.
 
+## Interdependent services wait on truth, not time
+
+When one service depends on another - `fs` on `block-driver`, the shell on `fs`, any client on any
+server - the dependent **blocks on its dependency's reply, never on a fixed amount of time.** This is
+Commandment VIII made concrete: wait on truth (the reply, or the loud fact of the peer's death), never
+on a timer, a yield count, or a tick.
+
+The standard pattern is the SDK's `request_with_reply` (`sdk/rust/src/service_context.rs`): it sends
+the request carrying a one-shot reply cap and blocks for the reply. It now waits on truth **without
+ever hanging** - it is a synchronous kernel CALL (syscall 41), so if the peer dies after receiving the
+request but before replying, the kernel wakes the caller with `ReplyDead` (the reply-side twin of
+`EndpointDead`, CLAUDE.md section 8.6) instead of blocking it forever. On either `EndpointDead` or
+`ReplyDead` the caller gets `None`, reacquires the peer **by name** through the kernel directory
+(section 14.3), and retries. That is the whole discipline: block on the reply, and on failure
+reacquire-by-name and retry.
+
+Do **not** paper over a dependency that might be slow or restarting with `yield` a fixed number of
+times, a `sleep`, or a tick-count deadline "to give it time to come up". That is waiting on time, and
+it is always wrong here: too short and you give up on a peer that was about to answer; too long and you
+have hung the system on a peer that already died. The cautionary tale is `fs` <-> `block-driver`: `fs`
+issues every block read/write as a synchronous request and blocks for the reply. Before the reply-side
+death-wake, a `block-driver` that died mid-request left `fs` blocked on a reply that would never
+arrive - a hang that a timer would only have converted into a guess. The fix was to wait on the
+*truth* of the peer's liveness (the generation/liveness the kernel already tracks), so `fs` wakes the
+instant `block-driver` dies, reacquires it by name, and retries. Follow that shape; if you find
+yourself reaching for a sleep to coordinate two services, you are solving the wrong problem.
+
 ## What gets a pull request rejected (CLAUDE.md section 21)
 
 A pull request is rejected without further review if it:

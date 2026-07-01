@@ -477,7 +477,14 @@ impl ServiceContext {
     /// this service's own endpoint cap - so the server can reply via
     /// `take_pending_cap()` + `send_by_handle()` (the request/reply pattern, §8). The
     /// caller must own an endpoint and not have other traffic racing the reply.
-    /// `None` if the peer is unknown, the cap cannot be derived, or the send fails.
+    /// `None` if the peer is unknown, the cap cannot be derived, or the call fails.
+    ///
+    /// **Waits on truth, not on time (Commandment VIII).** The wait for the reply is a synchronous
+    /// kernel CALL (syscall 41): if `peer` dies *after* receiving the request but *before* replying,
+    /// the kernel wakes this caller with `ReplyDead` (the reply-side twin of `EndpointDead`, §8.6)
+    /// instead of hanging it forever - no timer, no fixed yield count. On any failure (send failed,
+    /// or `ReplyDead`) this returns `None`, so a caller like `fs`'s `block_rpc` reacquires the peer
+    /// by name and retries exactly as it does for a failed send.
     pub fn request_with_reply(
         &self,
         peer: &str,
@@ -486,14 +493,19 @@ impl ServiceContext {
         let target = CapHandle(self.find_send_slot(peer)?);
         let self_grant = self.self_grant_handle()?;
         let reply_cap = self.derive_cap(self_grant)?;
-        if self.send_with_cap_by_handle(target, reply_cap, msg).is_err() {
-            // Send failed (dead endpoint): the embedded reply cap was NOT transferred (the kernel
-            // validates the endpoint cap before the grant), so reclaim it here. Without this, a storm
-            // of failed sends leaks reply caps until the table fills and every request returns None.
-            self.remove_cap(reply_cap);
-            return None;
+        let recv = self.recv_handle()?;
+        match crate::ipc::call(target, reply_cap, recv, msg) {
+            Ok(reply) => Some(reply),
+            Err(_) => {
+                // Send failed (dead endpoint) or the peer died before replying (ReplyDead): the
+                // embedded reply cap may not have been transferred, so reclaim it (remove_cap is
+                // idempotent if the kernel already moved it out on a successful send). Without this, a
+                // storm of failed calls would leak reply caps until the table fills and every request
+                // returns None.
+                self.remove_cap(reply_cap);
+                None
+            }
         }
-        crate::ipc::recv(self.recv_handle()?).ok()
     }
 
     /// Like `request_with_reply`, but the wait for the reply is **bounded** by `max_secs` of

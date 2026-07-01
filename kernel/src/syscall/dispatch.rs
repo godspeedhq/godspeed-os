@@ -63,6 +63,7 @@ pub enum SyscallNumber {
     SpawnReturningEndpoint = 38,
     SpawnWithCaps          = 39,
     ConsoleForeground      = 40,
+    Call                   = 41,
 }
 
 /// Raw syscall dispatcher - called from the SYSCALL/SYSENTER IDT stub.
@@ -87,6 +88,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::IrqUnmask      as u64 => handle_irq_unmask(arg0),
         n if n == SyscallNumber::Sleep          as u64 => handle_sleep(arg0),
         n if n == SyscallNumber::TrySend        as u64 => handle_try_send(arg0, arg1, arg2),
+        n if n == SyscallNumber::Call           as u64 => handle_call(arg0, arg1, arg2),
         n if n == SyscallNumber::Yield          as u64 => {
             crate::task::scheduler::yield_current();
             0
@@ -942,6 +944,127 @@ fn handle_send_with_cap(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// Syscall: Call (41) - synchronous request + death-aware wait for the reply (§8, §8.6).
+// ---------------------------------------------------------------------------
+
+/// arg0 = (recv_slot << 32) | (reply_grant_slot << 16) | target_endpoint_slot
+/// arg1 = buf_ptr (in/out, MAX_MESSAGE_SIZE): the request payload on entry; the reply is written
+///        back into the same buffer on return.
+/// arg2 = request length (bytes, <= MAX_MESSAGE_SIZE).
+///
+/// seL4-style synchronous CALL. Sends the request to the `target` endpoint carrying `reply_grant`
+/// as a one-shot reply cap (the caller's own endpoint, so the peer can reply to it), then blocks on
+/// the caller's own endpoint (`recv_slot`) for the reply. It wakes with the reply (normal), or - if
+/// `target` dies before replying - with `ReplyDead` (returns -12). This is the reply-side twin of
+/// the existing "blocked sender wakes with `EndpointDead` when its target endpoint closes" (§8.6):
+/// same generation/liveness mechanism, surfaced on the *reply* wait. The kernel learns only about a
+/// **reply cap** and its death semantics - never "request/reply" (§26.10): it tracks the target
+/// endpoint a blocked caller awaits and wakes it if that endpoint dies. Lets an interdependent
+/// service wait on truth without hanging (Commandment VIII).
+///
+/// Returns the reply length (>= 0), or a negative error: -12 `ReplyDead` (peer died awaiting reply),
+/// -7 `EndpointDead` (peer dead before the request was delivered), or a cap error.
+fn handle_call(packed: u64, buf_ptr: u64, req_len: u64) -> i64 {
+    let target_slot = (packed & 0xFFFF) as usize;
+    let reply_slot  = ((packed >> 16) & 0xFFFF) as usize;
+    let recv_slot   = ((packed >> 32) & 0xFFFF) as usize;
+
+    // 1. Validate the three caps: SEND to the peer, GRANT on the reply cap, RECV on our own endpoint.
+    let target_cap = match scheduler::current_task_lookup_cap(target_slot, Rights::SEND) {
+        Ok(c)  => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    let target_ep = EndpointId(target_cap.resource_id.0);
+
+    // CapInsufficientRights -> CapNotGrantable so the caller learns the reply cap was NOT transferred.
+    let reply_cap = match scheduler::current_task_lookup_cap(reply_slot, Rights::GRANT) {
+        Ok(c)  => c,
+        Err(CapError::CapInsufficientRights) => return cap_err_to_i64(CapError::CapNotGrantable),
+        Err(e) => return cap_err_to_i64(e),
+    };
+
+    let recv_cap = match scheduler::current_task_lookup_cap(recv_slot, Rights::RECV) {
+        Ok(c)  => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    let recv_ep = EndpointId(recv_cap.resource_id.0);
+
+    // §3.1 (no ambient authority): every leg below required a validated cap (SEND/GRANT/RECV).
+    crate::invariants::assertions::assert_cap_validated(&Ok(()));
+
+    // 2. The buffer is in/out: read the request from it now, write the reply back into it later, so
+    //    validate it for the full reply capacity (the SDK always passes a MAX_MESSAGE_SIZE buffer).
+    if req_len as usize > MAX_MESSAGE_SIZE { return ipc_err_to_i64(IpcError::MessageTooLarge); }
+    if !validate_user_ptr(buf_ptr, MAX_MESSAGE_SIZE) { return -1; }
+
+    // 3. Build the request with the reply cap embedded (mirrors SendWithCap).
+    let mut msg = match build_message(buf_ptr, req_len) {
+        Ok(m)  => m,
+        Err(e) => return e,
+    };
+    msg.caps[0]   = Some(reply_cap);
+    msg.cap_count = 1;
+
+    let my_slot = scheduler::current_task_slot();
+
+    // 4. Send the request to the peer, removing the reply cap once it is delivered/enqueued (exactly
+    //    as SendWithCap). On a full queue we block as a sender; the peer dying there wakes us with
+    //    EndpointDead via the existing kill_endpoint blocked-sender path (§8.6).
+    match crate::ipc::routing::enqueue(target_ep, msg, target_cap.generation, Some(my_slot)) {
+        Ok(Some(receiver_slot)) => {
+            scheduler::current_task_remove_cap(reply_slot);
+            scheduler::wake_by_slot(receiver_slot, 0);
+        }
+        Ok(None) => {
+            scheduler::current_task_remove_cap(reply_slot);
+        }
+        Err(IpcError::QueueFull) => {
+            // The request (with reply cap) is now the routing table's pending-send; remove our copy.
+            scheduler::current_task_remove_cap(reply_slot);
+            let err = scheduler::block_and_reschedule(TaskState::BlockedOnSend);
+            if err != 0 { return err; }   // peer died before the request was delivered
+            // else: queue drained, request delivered - fall through to await the reply.
+        }
+        // Failure before delivery (peer already dead): the reply cap was NOT transferred and stays in
+        // the caller's table; the SDK reclaims it.
+        Err(e) => return ipc_err_to_i64(e),
+    }
+
+    // 5. Await the reply on our own endpoint, waking on the reply OR on the peer's death (ReplyDead).
+    //    The loop re-evaluates after every wake, so a reply that arrived just before the peer died
+    //    still wins over ReplyDead (call_dequeue returns the queued reply first).
+    loop {
+        match crate::ipc::routing::call_dequeue(recv_ep, recv_cap.generation, target_ep, my_slot) {
+            Ok((reply, sender_to_wake)) => {
+                if let Some(slot) = sender_to_wake {
+                    scheduler::wake_by_slot(slot, 0);
+                }
+                scheduler::set_last_recv_badge(reply.badge_id, reply.badge_right);
+                let n_caps = reply.cap_count.min(reply.caps.len());
+                for i in 0..n_caps {
+                    if let Some(embedded_cap) = reply.caps[i] {
+                        if let Ok(new_slot) = scheduler::current_task_insert_cap(embedded_cap) {
+                            scheduler::push_pending_recv_cap(new_slot as u32);
+                        }
+                    }
+                }
+                let payload  = reply.payload_bytes();
+                let copy_len = payload.len().min(MAX_MESSAGE_SIZE);
+                if !write_user_bytes(buf_ptr, &payload[..copy_len]) { return -1; }
+                return copy_len as i64;
+            }
+            Err(IpcError::QueueEmpty) => {
+                // call_dequeue recorded us as blocked-in-call awaiting target_ep; block now. The wake
+                // result is intentionally ignored: we loop and let call_dequeue re-derive the terminal
+                // condition (queued reply -> Ok; target dead -> ReplyDead; our endpoint dead -> EndpointDead).
+                let _ = scheduler::block_and_reschedule(TaskState::BlockedOnRecv);
+            }
+            Err(e) => return ipc_err_to_i64(e),   // ReplyDead (-12) or EndpointDead (-7)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Syscall: ResourceMint (30) - allocate a delegated resource + mint a cap (§7.10, P2).
 // ---------------------------------------------------------------------------
 
@@ -1564,6 +1687,7 @@ fn ipc_err_to_i64(e: IpcError) -> i64 {
         IpcError::QueueFull       => -8,
         IpcError::QueueEmpty      => -9,
         IpcError::MessageTooLarge => -10,
+        IpcError::ReplyDead       => -12,
         IpcError::Cap(ce)         => cap_err_to_i64(ce),
     }
 }

@@ -44,6 +44,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         };
 
+        // Peer-death test hook (Commandment VIII / §8.6 reply-side death-wake). A request of exactly
+        // b"HANG" is deliberately NOT answered: we consume its reply cap and loop, leaving the client
+        // blocked awaiting a reply that never comes. `osdev test reply-dead` then kills this server and
+        // asserts the kernel wakes the blocked client with `ReplyDead` (`request_with_reply` -> None)
+        // rather than hanging it forever. This is inert in every other build - no real client sends
+        // "HANG" (`asker` sends it only in the reply-test build, once, to drive exactly this test).
+        if request.payload_bytes() == b"HANG" {
+            ctx.log("reply-server: HANG received - withholding reply (peer-death test hook)");
+            ctx.remove_cap(reply_cap);   // consume the cap but send NO reply - the client stays blocked
+            continue;
+        }
+
         // 3. Compute the reply. Here we echo the request payload straight back; a real
         //    server would parse the request and act on it (read a block, open a file).
         //    Policy lives HERE, in the service - the kernel only routes (Commandment X).

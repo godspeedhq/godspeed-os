@@ -642,6 +642,24 @@ Queue depth is not configurable per endpoint in v1. Per-endpoint depth is a v2 c
 | `recv` on closed endpoint                   | Returns `EndpointDead`       |
 | Sender already blocked when endpoint closes | Wakes with `EndpointDead` (cross-core IPI) |
 | Send-during-restart race                    | Generation check catches it; returns `EndpointDead` |
+| Replier dies while the caller is blocked awaiting its reply | Caller wakes with `ReplyDead` (cross-core IPI) |
+
+> **Amendment 2026-06-30 (reply-side death-wake): a caller blocked awaiting a reply wakes with
+> `ReplyDead`, completing the sender side of this table.** The rows above already wake a blocked
+> *sender* when its target endpoint closes (`EndpointDead`); the reply side was the missing twin. A
+> synchronous request/reply caller (the SDK `request_with_reply`, on which `fs`'s `block_rpc` rides)
+> sends a request carrying a one-shot **reply cap** and then blocks awaiting the reply on its own
+> endpoint. If the replier died after receiving the request but before replying, that blocked `recv`
+> hung forever - a reply that will never come. The kernel now tracks, for a caller blocked in a
+> synchronous CALL, the endpoint it awaits; the endpoint-death path finds any such caller (its
+> outstanding reply cap's holder has died) and wakes it with the new `ReplyDead` code, mirroring the
+> blocked-sender wake exactly (same generation/liveness mechanism, same cross-core IPI). This is
+> **mechanism, not policy** (§26.10): the kernel learns only about a *reply cap* and its death
+> semantics - never "request/reply" or "RPC". It is bounded (a blocked task has at most one in-flight
+> call, so one tracking slot per task). It is the executable form of Commandment VIII for
+> interdependent services: a dependent waits on its dependency's reply (truth), and a dependency that
+> dies wakes it loudly rather than hanging it. Pinned by `osdev test reply-dead` (the reply-side twin
+> of §22 Test 4).
 
 > **No delivery guarantee.** A successful `send` means the message was queued, not processed. Protocols requiring acknowledgment must build it explicitly.
 

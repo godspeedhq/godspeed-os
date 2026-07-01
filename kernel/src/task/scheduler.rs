@@ -1544,6 +1544,11 @@ pub fn kill_task_by_slot(slot: usize) {
         let task_name = TASK_NAME[slot];
         let task_ep   = ep_from_u64(TASK_ENDPOINT[slot].load(Ordering::Relaxed));
 
+        // If this task was itself blocked in a synchronous CALL, drop its outstanding-call record so
+        // that - once this slot is reused - a later death of the endpoint it was awaiting cannot
+        // spuriously wake the slot's new occupant with ReplyDead (§8.6 reply-side death-wake).
+        crate::ipc::routing::clear_call_await(slot);
+
         // If this task owned the console foreground (a TUI app like `chaos`), release it so a dead owner
         // cannot leave the system muted forever, and wake any shell parked in a muted blocking read.
         // Unconditional (before the endpoint cleanup) since the owner need not have an endpoint; the
@@ -1561,6 +1566,16 @@ pub fn kill_task_by_slot(slot: usize) {
             // freed page tables - the root cause of the use-after-free cascade.
             if let Some(s) = rx_slot { if s != slot { wake_by_slot(s, -7); } }
             if let Some(s) = tx_slot { if s != slot { wake_by_slot(s, -7); } }
+
+            // Reply-side death-wake (§8.6, Commandment VIII): wake every caller blocked in a
+            // synchronous CALL awaiting a reply from this now-dead endpoint, with ReplyDead (-12) -
+            // the twin of the blocked-sender EndpointDead wake just above. kill_endpoint has already
+            // bumped this endpoint's generation/liveness, so no new caller can register against it;
+            // take_call_waiter drains the callers that registered while it was alive, one per loop
+            // (bounded by one entry per task). Skip `slot` itself defensively (as rx/tx do).
+            while let Some(waiter) = crate::ipc::routing::take_call_waiter(ep_id) {
+                if waiter != slot { wake_by_slot(waiter, -12); }
+            }
 
             // Mark resource dead in global cap table so generation check fails.
             let resource_id = crate::capability::cap::ResourceId::from(ep_id);

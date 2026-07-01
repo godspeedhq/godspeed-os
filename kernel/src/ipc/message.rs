@@ -86,6 +86,13 @@ pub enum IpcError {
     QueueEmpty,
     /// Payload exceeds 4 KiB.
     MessageTooLarge,
+    /// A caller blocked in a synchronous CALL was woken because the endpoint it sent the request to
+    /// (the would-be replier) died before replying (§8.6). The reply-side twin of `EndpointDead`:
+    /// the same generation/liveness mechanism, surfaced on the *reply* wait rather than the *send*.
+    /// Lets a synchronous request/reply wait on truth (the peer's liveness) without hanging
+    /// (Commandment VIII); the kernel never learns "request/reply" - only that a reply cap's holder
+    /// died with an outstanding call.
+    ReplyDead,
     /// Capability error during send.
     Cap(CapError),
 }
