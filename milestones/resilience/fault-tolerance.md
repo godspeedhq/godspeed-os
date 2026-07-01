@@ -48,6 +48,26 @@ This *softens* §26.10 (a thin naming facility stays in the kernel) precisely to
   the kernel directory) and respawns only those that died. A dropped death notification no longer strands
   a service - the supervisor reconciles to the desired state (`560ee2c`), and a restart storm recovers via
   a name-wire fallback without flooding the shell (`8e7d837`).
+- ✅ **The respawn is un-starvable (yield-driven, hardware-found).** The kernel respawns the dead
+  supervisor from `poll_supervisor_respawn`, which runs at the scheduler loop's top - an `IF=1` point
+  Core 0 reaches by *blocking* or via the *timer ISR*. Under `chaos max-carnage` the foreground task
+  never blocks (it paces with `yield`), so recovery hinged solely on the timer ISR - which a storm
+  starves on real hardware, draining the live set to 0 with no respawn. Fix (`675082c`): drive the
+  pending respawn from the **yield path** too (`yield_current` mirrors the timer ISR's pending-respawn
+  routing), so the storm's own hot path drives recovery. Zero cost when healthy (one relaxed load),
+  guarded by the same PENDING/IN-PROGRESS handshake, and no new `unsafe` (inside `yield_current`'s
+  existing block). Confirmed on hardware: a 5000-round max-carnage soak sustains the live set instead of
+  draining to 0.
+- ✅ **Interdependent services wait on truth without hanging (`Call` / `ReplyDead`).** A dependent that
+  issues a synchronous request (the SDK `request_with_reply`, on which `fs`'s `block_rpc` rides) blocks
+  for the reply via a kernel `Call` (syscall 41). If the replier dies *after* receiving the request but
+  *before* replying, the kernel wakes the caller with `ReplyDead` - the reply-side twin of `EndpointDead`
+  (CLAUDE.md §8.6), on the same generation/liveness mechanism - instead of hanging it on a reply that
+  will never come. The caller then reacquires the peer by name and retries. This closes the last hang in
+  the recovery loop: `fs ← block-driver`, `shell ← fs`, any client ← any server now wait on the *truth*
+  of the peer's liveness (Commandment VIII, "the truth must include failure"), never on a timer.
+  Mechanism, not policy: the kernel learns only a **reply cap**, never "RPC" (§26.10). Pinned by
+  `osdev test reply-dead` (the reply-side twin of §22 Test 4).
 - ✅ **The shell survives killing its own spawner.** In the chaos kill-storm the shell prompt keeps
   answering across every supervisor respawn - the system stays *alive* rather than rebooting.
 - ✅ **Floor reached and exceeded.** `block-driver`, `fs`, and `shell` are restartable; `registry` is
@@ -65,6 +85,8 @@ This *softens* §26.10 (a thin naming facility stays in the kernel) precisely to
 | Registry service retired; name resolves after restart via the kernel directory | CLAUDE.md §6.1 amendment + **§22 Test 11**; H11 (TCB drop) precursor |
 | `init` removed; kernel spawns supervisor directly; boot-spawn failure fatal | CLAUDE.md §11.1/§11.3; **§22 Test 1B** |
 | Supervisor restartable; kernel respawns unconditionally; reconciles not duplicates | CLAUDE.md §6.2/§6.3 amendments + **§22 Test 15**; commits `560ee2c`, `8e7d837` |
+| Respawn un-starvable (yield-driven, not only timer ISR) | commit `675082c`; `yield_current` mirrors the timer-ISR pending-respawn routing; 5000-round hardware soak |
+| Interdependent services wait on truth without hanging (`Call` / `ReplyDead`) | CLAUDE.md §7.7/§8.2/§8.6 (reply-side death-wake); `osdev test reply-dead`; COMMANDMENTS.md VIII |
 | Unkillable set = `{kernel}` | CLAUDE.md §6.3 ("goal reached, at the floor"); §24 glossary (Name directory, Trusted root) |
 | Shell survives killing its spawner; storm recovery | chaos kill-storm `supervisor` (4× recovered, kernel alive, no bound) |
 

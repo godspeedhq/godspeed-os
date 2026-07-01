@@ -371,6 +371,17 @@ To be drafted into `CLAUDE.md` at adoption (each with a commit rationale, §21):
 9. **Kernel re-points death notices (Phase 6).** On supervisor respawn the kernel must redirect the
    death-notification endpoint to the new instance - a small, bounded kernel mechanism (it already
    tracks the supervisor specially).
+10. **The respawn must be un-starvable (Phase 6, hardware-found).** The kernel respawns the dead
+    supervisor from `poll_supervisor_respawn`, which runs at the scheduler loop's top - an `IF=1`
+    point Core 0 reaches by *blocking* or via the *timer ISR*. Under `chaos max-carnage` the foreground
+    task never blocks (it paces with `yield`), so recovery hinged solely on the timer ISR - which a
+    storm starves on real hardware (slow tick + long `IF=0` console writes + IPI/shootdown pressure),
+    draining the live set to 0 with no respawn. Fix: drive the pending respawn from the **yield path**
+    too (`yield_current` mirrors the timer ISR's pending-respawn routing), so the storm's own hot path
+    drives recovery - un-starvable. Zero cost when healthy (one relaxed load), guarded by the same
+    PENDING/IN-PROGRESS handshake (no double-respawn), and no new `unsafe` (it lives inside
+    `yield_current`'s existing block). Confirmed on hardware: a 5000-round max-carnage soak sustains
+    the live set instead of draining to 0.
 
 ---
 

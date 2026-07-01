@@ -24,7 +24,9 @@ let reply = ctx.request_with_reply("reply-server", &request);   // Some(reply) |
 ```
 
 which (see `sdk/rust/src/service_context.rs`) derives a per-request reply cap from asker's OWN endpoint,
-embeds it in the request, sends it to reply-server, and blocks on asker's endpoint for the reply.
+embeds it in the request, sends it to reply-server, and blocks on asker's endpoint for the reply. It is
+a synchronous kernel `Call` (§8.2), so it waits on truth **without hanging**: if reply-server dies
+mid-request the kernel wakes asker with `ReplyDead` and the call returns `None`, never an infinite wait.
 
 ## What it demonstrates
 
@@ -42,10 +44,15 @@ embeds it in the request, sends it to reply-server, and blocks on asker's endpoi
   embedding a reply cap - a SEND|GRANT copy of its OWN endpoint cap (`derive_cap` of `self_grant_handle`,
   packaged inside `request_with_reply`). The server gets exactly that cap and nothing else; there is no
   "reply to the sender" channel in the kernel. *(COMMANDMENTS.md VII; CLAUDE.md §7, §8.5, §8.9.)*
-- **Commandment VIII (wait on truth, not time).** asker blocks for the *reply* - the truth that the work
-  is done - never for a fixed sleep. And it never assumes a send arrived: a successful send is *queued*,
-  not processed (§8.6). A reply-server restart is settled by the generation check (a stale peer cap
-  returns `None`), not by a delay. *(COMMANDMENTS.md VIII; CLAUDE.md §8.6, §7.5.)*
+- **Commandment VIII (wait on truth, not time - and the truth must include failure).** asker blocks for
+  the *reply* - the truth that the work is done - never for a fixed sleep. And it never assumes a send
+  arrived: a successful send is *queued*, not processed (§8.6). Crucially, the truth it waits on includes
+  **failure**: `request_with_reply` is a synchronous `Call`, so if reply-server dies mid-request the
+  kernel wakes asker with `ReplyDead` (the reply-side twin of `EndpointDead`, §8.6) and the call returns
+  `None` instead of hanging forever - asker's `b"HANG"` path (a request reply-server deliberately never
+  answers) drives exactly this in the reply-test build. A reply-server restart is settled by the
+  generation check (a stale peer cap returns `None`), not by a delay. *(COMMANDMENTS.md VIII; CLAUDE.md
+  §8.6, §7.5.)*
 - **Commandment IX (assume you will be killed; recover by reacquiring).** When reply-server is not yet up,
   or has just restarted, the exchange returns `None`; asker reacquires "reply-server" **by name** through
   the kernel directory and retries on the next tick - it does not hang or die. *(COMMANDMENTS.md IX;
@@ -84,4 +91,6 @@ richer protocols, badge the request payload with an operation code and have the 
 - **CLAUDE.md** §8 (IPC), §8.5 (embedded capabilities), §8.6 (queued, not processed), §8.9 (deadlock
   avoidance), §14.3 (reacquire by name on `EndpointDead`).
 - `sdk/rust/src/service_context.rs` - `request_with_reply`, `derive_cap`, `self_grant_handle`.
+- `osdev test reply-dead` - pins the peer-death path (the `b"HANG"` request: asker wakes with `ReplyDead`,
+  returns `None`, and does NOT hang when reply-server is killed mid-request).
 - `examples/ping` + `examples/pong` - the one-way-IPC contrast (a producer, no reply).

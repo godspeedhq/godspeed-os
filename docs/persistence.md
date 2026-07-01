@@ -561,9 +561,14 @@ active on every mutation.
   reacquire a fresh cap by name after a restart.
 - On restart, `fs` re-mounts - replaying the journal if the crash interrupted a commit (§6.8) -
   so it always comes back consistent. The persisted data is intact.
-- Clients reacquire + retry on `EndpointDead` (§14.3): the shell's `fs_request` reacquires `fs`,
-  and `fs`'s block I/O (`block_rpc`) reacquires `block-driver`. One retry covers the common
-  case; the next command covers the window before the service has re-registered.
+- Clients reacquire + retry on `EndpointDead` **or `ReplyDead`** (§14.3): the shell's `fs_request`
+  reacquires `fs`, and `fs`'s block I/O (`block_rpc`) reacquires `block-driver`. `block_rpc` is a
+  synchronous request/reply (`request_with_reply`), so if `block-driver` dies *after* receiving the
+  request but *before* replying, the kernel wakes `fs` with `ReplyDead` (the reply-side twin of
+  `EndpointDead`, §8.6) instead of hanging it on a reply that will never come - `fs` then reacquires
+  `block-driver` by name and retries, exactly as for a failed send. It waits on truth (the peer's
+  liveness), never on a timer (Commandment VIII). One retry covers the common case; the next command
+  covers the window before the service has re-registered.
 
 **Verified:** `osdev test fs-restart` (§22 Test 13, 7 checks) - the shell writes a file, `KILL
 fs` over the control channel, the supervisor respawns `fs`, `fs` re-mounts + re-registers, and
