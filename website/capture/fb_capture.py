@@ -174,8 +174,18 @@ try:
         screendump(mon, "edit")
         ser.send(b"\x11"); time.sleep(0.4); ser.send(b"d")  # Ctrl-Q -> discard, to exit clean
 
+    def cap_run():
+        print("cmd: run /demo.gsh")
+        send_cmd("clear"); drain(1)
+        # author a small .gsh on one line (; separates statements), then run it
+        send_cmd("write /demo.gsh echo GodspeedOS gsh ; date ; cores ; echo done")
+        print("  write:", repr(drain(2).strip()[-120:]))
+        send_cmd("run /demo.gsh")
+        print("  run:", repr(drain(4).strip()[-260:]))
+        screendump(mon, "run")
+
     steps = {"observe": cap_observe, "chaos": cap_chaos, "shell": cap_shell,
-             "drives": cap_drives, "edit": cap_edit}
+             "drives": cap_drives, "edit": cap_edit, "run": cap_run}
     for name in WANT:
         fn = steps.get(name)
         if fn is None:

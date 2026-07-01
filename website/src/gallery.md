@@ -53,6 +53,16 @@ fills - never a silent truncation.
 
 ![An edit session, a note open in the full-screen editor](images/edit.png)
 
+## Scripting: a `.gsh` script via `run`
+
+Commands compose into scripts. Here a small script is authored in one line (statements separated by
+`;`), saved as `/demo.gsh`, and executed with `run`: the runner echoes each statement, shows its
+output, and prints a pass/fail summary - `run: ran 4, failed 0`. This is the same mechanism the
+shell's own suites use - a `.gsh` file, run and checked. And like everything else, a script is
+capability-scoped: `run` can do only what the shell already holds.
+
+![A gsh script authored and run via run, ending in a pass summary](images/run.png)
+
 ## Maximum carnage: `chaos max-carnage`
 
 This is the fire (Commandment II). `chaos max-carnage all-services` storms every live service at
@@ -72,7 +82,7 @@ serial-console `q`, because the storm will kill the keyboard driver too.
 ![chaos max-carnage mid-storm, kernel still alive](images/chaos.png)
 
 <!--
-Next captures to add (each a real run, driven by website/capture/fb_capture.py):
-- A gsh script (.gsh) running via `run`.
-These just need the guest driven to the state before the screendump, exactly as above.
+Every image above is produced by website/capture/fb_capture.py (states: observe, chaos, shell,
+drives, edit, run). To add another, teach it a new state and drive the guest to it before the
+screendump, exactly as these do.
 -->
