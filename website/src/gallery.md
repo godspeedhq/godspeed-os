@@ -14,15 +14,33 @@ shell is ready. The framebuffer console mirrors the serial log.
 
 ![GodspeedOS booting to steady state](images/boot.png)
 
+## The shell, and exactly what it may do
+
+`gsh` is not a Unix shell - it is a capability-broker service. It holds a console capability and a
+handful of others, and it can do precisely what those grant, nothing more. Here it answers `date`,
+`cores`, and `uptime`, and then `caps` prints its own capability table: the resource each cap targets
+and the rights on it (`log_write`, `spawn`, `console_read`, `introspect`, `service_control`, and its
+IPC endpoints). Authority is never ambient or inherited - it is this list, and only this list.
+
+![The gsh shell listing its own capabilities](images/shell.png)
+
 ## Live introspection: `observe`
 
-`observe` is a live, full-screen view of every service the system is running - scheduler slot,
-name, core, state, memory against its contract limit, restart count, IPC queue depth, CPU share, and
+`observe` is a live, full-screen view of every service the system is running - scheduler slot, name,
+core, state, memory against its contract limit, restart count, IPC queue depth, CPU share, and
 uptime. It reads structured per-service state the kernel and supervisor already track; there is no
-`/proc` text to parse. Here all eight services are healthy: `supervisor` and `logger` on core 0,
-`block-driver`/`fs`/`xhci`/`ehci` spread across cores, the `shell`, and `observe` itself.
+`/proc` text to parse. Here all eight services are healthy, spread across the four cores.
 
 ![The observe live view](images/observe.png)
+
+## Persistent storage: `drives`
+
+State that must survive a reboot lives on disk, reached only through the `fs` service, which reaches
+the disk only through the `block-driver`, which alone holds the hardware capability. `drives` lists
+the mounted volumes: one GSFS filesystem, 16 MiB, with its free space. Every byte crossed an IPC
+boundary and a capability check to get there - there is no ambient file access anywhere in the system.
+
+![The drives view showing a mounted GSFS volume](images/drives.png)
 
 ## Maximum carnage: `chaos max-carnage`
 
@@ -44,7 +62,7 @@ serial-console `q`, because the storm will kill the keyboard driver too.
 
 <!--
 Next captures to add (each a real run, driven by website/capture/fb_capture.py):
-- The gsh> shell prompt with a few commands run (drives, date, ls).
 - An edit session in the full-screen editor.
+- A gsh script (.gsh) running via `run`.
 These just need the guest driven to the state before the screendump, exactly as above.
 -->

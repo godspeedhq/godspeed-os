@@ -1,16 +1,25 @@
 """Boot os.img headless in QEMU, drive the shell over COM1 serial (where the shell
-polls RX), and screendump the framebuffer at chosen states (observe, chaos, ...).
-Same PPM->PNG conversion as fb_shot.py. This is how the observe/chaos gallery
-images are made. ROOT is derived from this file's location; QEMU/OVMF paths are the
-Windows dev defaults (override via the QEMU/OVMF env vars)."""
-import socket, subprocess, time, os, struct, zlib, re
+polls RX), and screendump the framebuffer at chosen states. This is how the
+observe/chaos/shell/drives gallery images are made.
+
+Usage:
+    python fb_capture.py [state ...]      # default: observe chaos
+    states: observe | chaos | shell | drives
+
+`drives` needs a formatted GSFS disk on the AHCI controller; set GALLERY_DISK to a
+disk image path (a throwaway copy of a persist image) and it is attached as an
+ich9-ahci data disk. ROOT is derived from this file's location; QEMU/OVMF paths are
+the Windows dev defaults (override via the QEMU/OVMF env vars)."""
+import socket, subprocess, time, os, sys, struct, zlib, re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 OVMF = os.environ.get("OVMF", r"C:\Program Files\qemu\share\edk2-x86_64-code.fd")
 QEMU = os.environ.get("QEMU", r"C:\Program Files\qemu\qemu-system-x86_64.exe")
+DISK = os.environ.get("GALLERY_DISK", "")
 IMG  = os.path.join(ROOT, "build", "os.img")
 OUT  = os.path.join(ROOT, "build")
 MON_PORT, SER_PORT = 55560, 55561
+WANT = sys.argv[1:] or ["observe", "chaos"]
 
 
 def ppm_to_png(ppm_local, png_local):
@@ -44,9 +53,19 @@ def ppm_to_png(ppm_local, png_local):
     return w, h
 
 
+# Boot disk on legacy IDE + (optionally) a data disk ALONE on ich9-ahci so the
+# AHCI block-driver targets it on port 0, exactly like osdev's storage tests.
+boot_drive = f"format=raw,file={IMG}"
+disk_args = []
+if DISK:
+    boot_drive = f"format=raw,file={IMG},if=ide"
+    disk_args = ["-device", "ich9-ahci,id=ahci",
+                 "-drive", f"id=data,format=raw,file={DISK},if=none",
+                 "-device", "ide-hd,drive=data,bus=ahci.0"]
+
 args = [QEMU,
     "-drive", f"if=pflash,format=raw,readonly=on,file={OVMF}",
-    "-drive", f"format=raw,file={IMG}",
+    "-drive", boot_drive, *disk_args,
     "-vga", "std", "-display", "none",
     "-device", "qemu-xhci", "-device", "usb-kbd",
     "-monitor", f"tcp:127.0.0.1:{MON_PORT},server,nowait",
@@ -107,23 +126,40 @@ try:
     time.sleep(1)
     mon = mon_connect()
 
-    # --- observe ---
-    print("cmd: observe")
-    send_cmd("observe")
-    print("  serial:", repr(drain(4).strip()[-200:]))
-    screendump(mon, "observe")
-    ser.send(b"q"); time.sleep(1.0); ser.send(b"\r")    # exit observe -> prompt
-    print("  after-q:", repr(drain(2).strip()[-160:]))
+    def cap_observe():
+        print("cmd: observe")
+        send_cmd("observe"); print("  serial:", repr(drain(4).strip()[-160:]))
+        screendump(mon, "observe")
+        ser.send(b"q"); time.sleep(1.0); ser.send(b"\r"); drain(2)
 
-    # --- chaos max-carnage (guarded by a [y/N] confirm) ---
-    print("cmd: chaos max-carnage all-services")
-    send_cmd("chaos max-carnage all-services")
-    print("  prompt:", repr(drain(2).strip()[-140:]))
-    ser.send(b"y\r")                                     # confirm the [y/N] gate
-    print("  serial:", repr(drain(14).strip()[-300:]))  # let several rounds run
-    screendump(mon, "chaos")
-    ser.send(b"q"); time.sleep(2.0)                      # abort the storm (serial q)
-    print("  after-q:", repr(drain(2).strip()[-160:]))
+    def cap_chaos():
+        print("cmd: chaos max-carnage all-services")
+        send_cmd("chaos max-carnage all-services"); drain(2)
+        ser.send(b"y\r"); print("  serial:", repr(drain(14).strip()[-220:]))
+        screendump(mon, "chaos")
+        ser.send(b"q"); time.sleep(2.0); drain(2)
+
+    def cap_shell():
+        print("cmd: shell session")
+        send_cmd("clear"); drain(1)
+        for c in ["date", "cores", "uptime", "caps"]:
+            send_cmd(c); print(f"  {c}:", repr(drain(2).strip()[-120:]))
+        screendump(mon, "shell")
+
+    def cap_drives():
+        print("cmd: drives")
+        send_cmd("clear"); drain(1)
+        send_cmd("drives"); print("  serial:", repr(drain(3).strip()[-260:]))
+        screendump(mon, "drives")
+
+    steps = {"observe": cap_observe, "chaos": cap_chaos, "shell": cap_shell, "drives": cap_drives}
+    for name in WANT:
+        fn = steps.get(name)
+        if fn is None:
+            print(f"WARN: unknown state '{name}'"); continue
+        if name == "drives" and not DISK:
+            print("SKIP drives: set GALLERY_DISK to a formatted GSFS image"); continue
+        fn()
 
     mon.send(b"quit\n"); time.sleep(0.5)
 finally:
