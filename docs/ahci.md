@@ -70,10 +70,22 @@ once read/write/fs/reboot are verified on it. Test: `osdev test blockdev-ahci`.
   on a machine without an IOMMU (block-driver then stays trust-critical, §6.4).
   Verified: `osdev test blockdev` 3/3 + identity 23/23; unsafe audit back to 413/27
   (the `hw_pio` arch wrappers + `capability/hw_pio.rs` + SDK `pio.rs` removed).
+- **Step F - port recovery (COMRESET). ✅ done** (`f069c85`, hardware-found by the million-round soak).
+  A soak that kills `block-driver` mid-command can leave the port stuck `BSY` (the kernel clears PCI
+  bus-master on kill before the in-flight command drains), and the soft port-restart of Step B cannot
+  clear it - only re-running the SATA OOB sequence does. `port_comreset` (`ahci.rs`) does what a cold
+  boot does: idle the port keeping FIS-receive armed (so the device's post-reset initial D2H FIS is
+  captured and clears `PxTFD.BSY`, AHCI 10.1.2), pulse `PxSCTL.DET` 1 -> hold -> 0, wait for the PHY
+  (`PxSSTS.DET == 3`), clear `PxSERR`/`PxIS`, restart the engine. `init_port` runs it on every
+  (re)start; `recover_port` (the Phase H per-I/O retry path) escalates to it when a soft recovery leaves
+  `BSY` set, so a running driver self-heals a wedged port with no restart. This is what lets `fs`'s
+  mount-on-truth get a truthful answer: `block-driver`'s reply reflects a settled controller, never a
+  wedged-`BSY` false 0 (Commandment VIII).
 
 ## 5. Register cheat-sheet
 
 HBA (from ABAR): `CAP` 0x00, `GHC` 0x04 (bit31 AE), `IS` 0x08, `PI` 0x0C, `VS` 0x10.
 Port *n* (base 0x100 + n·0x80): `PxCLB` 0x00, `PxFB` 0x08, `PxIS` 0x10, `PxIE` 0x14,
 `PxCMD` 0x18 (bit0 ST, bit4 FRE, bit14 FR, bit15 CR), `PxTFD` 0x20, `PxSIG` 0x24,
-`PxSSTS` 0x28 (DET in 3:0), `PxSERR` 0x30, `PxCI` 0x38 (command-issue bitmask).
+`PxSSTS` 0x28 (DET in 3:0), `PxSCTL` 0x2C (DET in 3:0, the COMRESET control), `PxSERR` 0x30,
+`PxCI` 0x38 (command-issue bitmask).
