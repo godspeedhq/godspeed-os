@@ -23,3 +23,10 @@ preferred-dark-theme = "navy"
 [output.html.fold]
 enable = true
 level = 1
+
+# Rewrite repo-relative links inside included docs (CLAUDE.md, docs/*.md) so they
+# resolve within the book instead of 404ing. Runs after {{#include}} expansion.
+# See website/link-fixup.py. Needs `python` on PATH (CI uses actions/setup-python).
+[preprocessor.godspeed-links]
+command = "python link-fixup.py"
+after = ["links"]

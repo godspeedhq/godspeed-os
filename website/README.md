@@ -40,12 +40,14 @@ boots `build/os.img` headless with an emulated GPU, grabs the framebuffer via th
 drives the shell over COM1 serial to reach a chosen state (observe, chaos) before the screendump.
 Copy the result into `src/images/`.
 
-## Known wrinkle: relative links inside included files
+## Cross-doc links inside included files
 
 `CLAUDE.md` and the `docs/` files link to each other with repo-relative paths (`./COMMANDMENTS.md`,
-`docs/ahci.md`) and internal anchors. Anchors resolve fine (each included file becomes one page).
-Cross-file relative links need a light rewrite pass to point at the rendered pages - a small mdBook
-preprocessor or a link convention. Tracked as a follow-up; it does not block the site building.
+`docs/ahci.md`). The `link-fixup.py` mdBook preprocessor rewrites these at build time so they resolve
+within the book: a link to a repo doc that is a book page becomes the page URL; a link to a repo file
+that is not a page (`README.md`, `examples/`) becomes a GitHub URL. The source docs are never edited.
+In-page anchors already resolve (each included file is one page). Set `GODSPEED_REPO_URL` to change
+the GitHub base used for non-page links (defaults to the current repo).
 
 ## Launch checklist (do once, when the org/repo names are final)
 
