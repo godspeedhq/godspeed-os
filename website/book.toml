@@ -1,0 +1,25 @@
+# GodspeedOS documentation site (mdBook).
+#
+# This book contains almost NO CONTENT OF ITS OWN. Every chapter that shows the
+# constitution, a commandment, the glossary, the almanac, or a design doc is a
+# two-line {{#include}} stub that pulls the real file from the repo at build time.
+# The source of truth stays where it lives (CLAUDE.md, COMMANDMENTS.md, docs/, ...);
+# this book is a DERIVED VIEW of it, reconciled on every build (Commandment III).
+# Do not paste content into these pages - edit the source file and rebuild.
+[book]
+title = "GodspeedOS"
+description = "A capability-based microkernel OS. Small enough to understand. Rigorous enough to trust."
+authors = ["Bankole Ogundero and the GodspeedOS contributors"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+# git-repository-url / edit-url are deliberately omitted until the org/repo names
+# are finalized (launch checklist). The included pages are not editable from their
+# stubs anyway - edits belong in the source file, so no "edit this page" link.
+
+[output.html.fold]
+enable = true
+level = 1
