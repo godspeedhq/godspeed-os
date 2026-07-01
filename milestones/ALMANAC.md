@@ -35,6 +35,7 @@
 - [2026-06-25 - The day I wrote the constitution down as ten lines](#2026-06-25---the-day-i-wrote-the-constitution-down-as-ten-lines)
 - [2026-06-29 - The day the examples had to teach the truth](#2026-06-29---the-day-the-examples-had-to-teach-the-truth)
 - [2026-06-30 - The day a private discipline became a public one](#2026-06-30---the-day-a-private-discipline-became-a-public-one)
+- [2026-06-30 to 2026-07-01 - The day "wait on truth" turned out to be half a truth](#2026-06-30-to-2026-07-01---the-day-wait-on-truth-turned-out-to-be-half-a-truth)
 - [The Days I Was Wrong](#the-days-i-was-wrong)
   - [~2026-06-21 - The day the constitution rejected its author](#2026-06-21---the-day-the-constitution-rejected-its-author)
   - [~2026-06-27 - The day I reached for a heap](#2026-06-27---the-day-i-reached-for-a-heap)
@@ -298,6 +299,52 @@ written for.
 **What it produced:** the moment the invariants stop being a personal practice and become a public
 contract - held by the same identity tests, the same chaos bar, and the same ten commandments that
 earned them. The work of keeping the architecture uncorrupted does not end here; it opens.
+
+---
+
+## 2026-06-30 to 2026-07-01 - The day "wait on truth" turned out to be half a truth
+
+A million-round `chaos max-carnage` soak finished with the system alive but the filesystem gone -
+`ls` said "no filesystem," `drives` read raw, and a cold reboot brought it all back. No data was lost;
+the disk was intact the whole time. So the bug was not corruption. It was a recovery that never
+happened.
+
+The cause was a single wall-clock timer. `fs` waited eight seconds for `block-driver` to report a
+readable disk, then gave up. Under a soak that had wedged the AHCI controller, eight seconds was never
+going to be enough - the controller needed a hard reset, not more waiting - so `fs` latched "no
+filesystem" and sat there. The timer *felt* like the safe, obvious way to wait for a dependency. It
+was the trap. Commandment VIII, exactly: wait on truth, not time.
+
+**What I came to understand, and it had a turn in it.** Removing the timer and waiting on
+`block-driver`'s actual reply fixed the soak - but following that discipline *rigorously* exposed
+something deeper. The request/reply primitive itself could hang: a blocking wait on a reply hangs
+forever if the reply never comes, and it never comes if the peer dies mid-request. "Wait on truth" had
+quietly become "wait forever" for the one truth it could not see: the peer's *death*. The easy version
+of a principle ("do not use timers") and the complete version of it are not the same thing.
+
+So the fix was not only in `fs`; it was in what "truth" means. We taught the kernel that a peer's
+death is a truth too - a synchronous Call whose caller wakes with `ReplyDead` the instant its replier
+dies, the reply-side twin of the sender-side wake §8.6 already had. seL4's Call/Reply, borrowed for
+exactly this. And the principled part, which was the owner's call: putting it in the kernel grows its
+*code* but not its *responsibility* - IPC death-semantics were always the kernel's job (Commandment I
+is about scope, not line count). Mechanism, not policy: the kernel learned about a *reply cap*, never
+about "RPC."
+
+**And then the fix had a hidden failure of its own.** The kernel change passed every green test -
+identity, fs-restart, a new ReplyDead pin - and still drained the whole system to zero on the first
+hardware soak: recovery of the dead supervisor hung on a single trigger, the timer ISR, which the
+storm starves, and the new code's latency was just enough to lose a race main had narrowly won. The
+lesson turned on itself. A fix I believed was complete was again only half-satisfied, and the half
+missing was the failure case - caught by exactly the fire this whole entry is about. The repair drove
+recovery from the storm's own hot path, the yield, making it *un-starvable* - stronger than it had
+ever been.
+
+**What it produced.** Commandment VIII, deepened: *wait for truth, not time - but ensure the truth
+includes failure.* A wait that cannot observe failure has quietly become an infinite wait on time. A
+standard for every contributor (`CONTRIBUTING.md`): interdependent services wait on each other's truth,
+the reply or the loud fact of death, never on a clock. And the lesson I keep relearning, now with
+teeth: a principle you believe you have satisfied is usually only half-satisfied, and the half you are
+missing is what happens when things fail.
 
 ---
 
