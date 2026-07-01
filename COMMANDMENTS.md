@@ -111,7 +111,7 @@ There is no authority by identity, ancestry, or inheritance - only by capability
 
 ---
 
-### VIII. Thou shalt not rely upon timing for correctness. Wait for truth, not time.
+### VIII. Thou shalt not rely upon timing for correctness. Wait for truth, not time. But ensure the truth includes failure.
 
 Time does not prove correctness. Sleeping longer does not make a race disappear. Correctness must
 come from observable truth:
@@ -124,8 +124,17 @@ come from observable truth:
 
 Time may conserve CPU. It must **never** determine correctness.
 
-> *Grounded in:* §8.6 (a successful `send` means queued, not processed - acknowledgement is explicit),
-> §7.5 (the generation check, not a delay, settles a restart race), §9.3 (yield is advisory), §22.4
+**And the truth must include failure.** Waiting on the truth of *success* alone - the reply, the
+acknowledgement - is only half the discipline. If the thing you wait for dies or never comes, that
+truth never arrives and a pure success-wait hangs forever: a wait that cannot observe failure has
+quietly become an infinite wait on time. So failure is a first-class truth - a peer's death, a dead
+endpoint, a broken contract, a revoked capability - and you must wake on it exactly as you would on
+success. A caller blocked awaiting a reply must wake the instant its replier dies (`ReplyDead`), never
+hang. Only a truth that includes failure makes "wait on truth" complete.
+
+> *Grounded in:* §8.6 (acknowledgement is explicit - a successful `send` means queued, not processed;
+> and failure is explicit - a caller blocked awaiting a reply wakes with `ReplyDead` when its replier
+> dies), §7.5 (the generation check, not a delay, settles a restart race), §9.3 (yield is advisory), §22.4
 > (a test waits for observable output, never a fixed sleep).
 
 ---
