@@ -42,6 +42,17 @@ boundary and a capability check to get there - there is no ambient file access a
 
 ![The drives view showing a mounted GSFS volume](images/drives.png)
 
+## Editing a file: `edit`
+
+`edit` is a full-screen, modeless text editor - a title bar with the filename and a dirty mark, the
+text area, and a status bar showing the two keys you need (`^S` save, `^Q` quit), the column, the
+byte count, and the edit-buffer fill (`buf 106/32768`). It opens a file of *any* size without loading
+it whole: the original stays on disk, read in fixed windows as you scroll, while edits accumulate in
+a bounded add-buffer and a save streams the pieces back out. Bounded, no heap, loud when the buffer
+fills - never a silent truncation.
+
+![An edit session, a note open in the full-screen editor](images/edit.png)
+
 ## Maximum carnage: `chaos max-carnage`
 
 This is the fire (Commandment II). `chaos max-carnage all-services` storms every live service at
@@ -62,7 +73,6 @@ serial-console `q`, because the storm will kill the keyboard driver too.
 
 <!--
 Next captures to add (each a real run, driven by website/capture/fb_capture.py):
-- An edit session in the full-screen editor.
 - A gsh script (.gsh) running via `run`.
 These just need the guest driven to the state before the screendump, exactly as above.
 -->

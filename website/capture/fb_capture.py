@@ -152,7 +152,30 @@ try:
         send_cmd("drives"); print("  serial:", repr(drain(3).strip()[-260:]))
         screendump(mon, "drives")
 
-    steps = {"observe": cap_observe, "chaos": cap_chaos, "shell": cap_shell, "drives": cap_drives}
+    def cap_edit():
+        print("cmd: edit /notes.txt")
+        send_cmd("clear"); drain(1)
+        send_cmd("edit /notes.txt"); print("  open:", repr(drain(2).strip()[-140:]))
+        lines = [
+            "GodspeedOS notes",
+            "",
+            "edit: a full-screen editor.",
+            "Files of any size open windowed.",
+            "The original stays on disk.",
+        ]
+        # Type slower than the guest's per-key full-screen redraw (slow under TCG),
+        # else the UART FIFO overflows and characters scramble.
+        for i, ln in enumerate(lines):
+            for ch in ln:
+                ser.send(ch.encode()); time.sleep(0.12)
+            if i != len(lines) - 1:
+                ser.send(b"\r"); time.sleep(0.35)   # Enter splits the line (new line)
+        drain(4)
+        screendump(mon, "edit")
+        ser.send(b"\x11"); time.sleep(0.4); ser.send(b"d")  # Ctrl-Q -> discard, to exit clean
+
+    steps = {"observe": cap_observe, "chaos": cap_chaos, "shell": cap_shell,
+             "drives": cap_drives, "edit": cap_edit}
     for name in WANT:
         fn = steps.get(name)
         if fn is None:
