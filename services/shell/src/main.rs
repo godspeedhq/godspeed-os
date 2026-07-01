@@ -941,15 +941,16 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
                 ctx.console_writeln("run: a script cannot run another script (no nesting)");
                 return Err(ShellError::Unknown);
             }
-            return if argc < 2 {
-                ctx.console_writeln("usage: run <path> [save <path>]");
-                Err(ShellError::Unknown)
-            } else {
-                // Optional `save <path>` streams the run REPORT to a file (the utility writes its
-                // own file - direct, not a pipe; see cmd_selfcheck / docs/pipes.md).
-                let save = if argc >= 4 && args[2] == "save" { Some(args[3]) } else { None };
-                cmd_run(ctx, cwd, args[1], depth, save)
-            };
+            if argc < 2 {
+                ctx.console_writeln("usage: run <path> [args...]  |  run <path> save <path>");
+                return Err(ShellError::Unknown);
+            }
+            // Optional `save <path>` streams the run REPORT to a file (the utility writes its own
+            // file - direct, not a pipe; see cmd_selfcheck / docs/pipes.md). Otherwise the tokens
+            // after the path are the script's params ($1.., $@, $#); $0 is the path.
+            let save = if argc >= 4 && args[2] == "save" { Some(args[3]) } else { None };
+            let params = if save.is_some() { Params::empty(args[1]) } else { parse_params(s, args[1], 2) };
+            return cmd_run(ctx, cwd, args[1], depth, save, &params);
         }
         // `selfcheck [save <path>]` - run the embedded suite; `save` streams its report to a file.
         "selfcheck" => return cmd_selfcheck(ctx, cwd, depth, s["selfcheck".len()..].trim()),
@@ -1087,7 +1088,7 @@ fn trim_bytes(b: &[u8]) -> &[u8] {
 /// the script buffer off the hot pipe frame, and the `fs` reply is dropped before any command
 /// runs - both bound the user stack (see the pipe stack-overflow lesson).
 #[inline(never)]
-fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8, save: Option<&str>) -> Result<(), ShellError> {
+fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8, save: Option<&str>, params: &Params) -> Result<(), ShellError> {
     let mut pbuf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut pbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     // Read the whole script into a fixed buffer, then drop the fs reply before executing anything.
@@ -1114,7 +1115,347 @@ fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8, save: Opti
         script[..take].copy_from_slice(&body[..take]);
         slen = take;
     }
-    run_with_optional_save(ctx, cwd, &script[..slen], depth, save)
+    run_with_optional_save(ctx, cwd, &script[..slen], depth, save, params)
+}
+
+// ───────────────────────── gsh interpreter (Slice 1: vars + expansion + params + fail) ─────────
+// docs/scripting.md. Bounded, no-heap (§26.6): every structure below is a fixed array, loud on
+// overflow. The interpreter lives ENTIRELY at the `run_lines` layer and does `$`-expansion BEFORE
+// calling `execute`, so `execute`/`pipe_run` stay byte-identical to the flat-runner path - the only
+// new persistent per-run frame is `Vars` (~5 KiB), well inside the run-path stack headroom.
+
+const VAR_MAX: usize = 32;
+const VAR_NAME_MAX: usize = 24;
+const VAR_ARENA: usize = 4096;
+const PARAM_MAX: usize = 9;
+const EXP_MAX: usize = 1024;
+
+/// A gsh run's variable table: a fixed name array + a value bump-arena + one overflow flag (modeled
+/// on the record `Table`). Immutable by default; `let mut` opts into reassignment. Loud on a full
+/// table/arena, a redeclare, or an undeclared/immutable reassign - never silent (§26.7).
+struct Vars {
+    names: [[u8; VAR_NAME_MAX]; VAR_MAX],
+    name_len: [u8; VAR_MAX],
+    val_off: [u16; VAR_MAX],
+    val_len: [u16; VAR_MAX],
+    mutable: [bool; VAR_MAX],
+    count: usize,
+    arena: [u8; VAR_ARENA],
+    alen: usize,
+}
+
+/// Why a variable operation failed (each maps to a loud console line).
+#[derive(Clone, Copy)]
+enum VarErr { TableFull, ArenaFull, NameTooLong, Redeclare, Undeclared, Immutable }
+
+impl Vars {
+    fn new() -> Self {
+        Vars {
+            names: [[0u8; VAR_NAME_MAX]; VAR_MAX], name_len: [0; VAR_MAX],
+            val_off: [0; VAR_MAX], val_len: [0; VAR_MAX], mutable: [false; VAR_MAX],
+            count: 0, arena: [0u8; VAR_ARENA], alen: 0,
+        }
+    }
+    fn lookup(&self, name: &[u8]) -> Option<usize> {
+        (0..self.count).find(|&i| &self.names[i][..self.name_len[i] as usize] == name)
+    }
+    fn value(&self, i: usize) -> &[u8] {
+        let off = self.val_off[i] as usize;
+        &self.arena[off..off + self.val_len[i] as usize]
+    }
+    /// Copy `val` into the arena; `None` if it would not fit (arena full or len > u16).
+    fn intern(&mut self, val: &[u8]) -> Option<(u16, u16)> {
+        if val.len() > u16::MAX as usize || self.alen + val.len() > VAR_ARENA { return None; }
+        let off = self.alen as u16;
+        self.arena[self.alen..self.alen + val.len()].copy_from_slice(val);
+        self.alen += val.len();
+        Some((off, val.len() as u16))
+    }
+    fn define(&mut self, name: &[u8], val: &[u8], mutable: bool) -> Result<(), VarErr> {
+        if name.len() > VAR_NAME_MAX { return Err(VarErr::NameTooLong); }
+        if self.lookup(name).is_some() { return Err(VarErr::Redeclare); }
+        if self.count >= VAR_MAX { return Err(VarErr::TableFull); }
+        let (off, len) = self.intern(val).ok_or(VarErr::ArenaFull)?;
+        let i = self.count;
+        self.names[i][..name.len()].copy_from_slice(name);
+        self.name_len[i] = name.len() as u8;
+        self.val_off[i] = off; self.val_len[i] = len; self.mutable[i] = mutable;
+        self.count += 1;
+        Ok(())
+    }
+    fn reassign(&mut self, name: &[u8], val: &[u8]) -> Result<(), VarErr> {
+        let i = self.lookup(name).ok_or(VarErr::Undeclared)?;
+        if !self.mutable[i] { return Err(VarErr::Immutable); }
+        // Bump-append the new value (old bytes stranded - fine for Slice 1; no loops yet, so a
+        // mutable var is reassigned a bounded number of times. Loops (Tier 2) will need per-var slots.)
+        let (off, len) = self.intern(val).ok_or(VarErr::ArenaFull)?;
+        self.val_off[i] = off; self.val_len[i] = len;
+        Ok(())
+    }
+}
+
+/// Print the loud message for a variable error (`name` is the offending binding).
+fn var_err_msg(ctx: &ServiceContext, name: &str, e: VarErr) {
+    match e {
+        VarErr::TableFull => ctx.console_writeln_fmt(format_args!("gsh: too many variables (max {}) at '{}'", VAR_MAX, name)),
+        VarErr::ArenaFull => ctx.console_writeln_fmt(format_args!("gsh: variable storage full at '{}'", name)),
+        VarErr::NameTooLong => ctx.console_writeln_fmt(format_args!("gsh: variable name too long (max {}): '{}'", VAR_NAME_MAX, name)),
+        VarErr::Redeclare => ctx.console_writeln_fmt(format_args!("gsh: '{}' already declared (mutate with 'let mut' + '{} = ...')", name, name)),
+        VarErr::Undeclared => ctx.console_writeln_fmt(format_args!("gsh: cannot reassign undeclared '{}'", name)),
+        VarErr::Immutable => ctx.console_writeln_fmt(format_args!("gsh: cannot reassign immutable '{}' (declare it 'let mut')", name)),
+    }
+}
+
+/// A gsh run's parameters: `$0` (script name), `$1..$9`, `$@` (all), `$#` (count). Zero-copy - the
+/// slices borrow the `run` line.
+struct Params<'a> {
+    argv: [&'a str; PARAM_MAX],
+    argc: usize,
+    name: &'a str,
+}
+impl<'a> Params<'a> {
+    fn empty(name: &'a str) -> Self { Params { argv: [""; PARAM_MAX], argc: 0, name } }
+}
+
+/// Scan one quote-aware word from `b` starting at `i`; returns `(value_start, value_end, next_i)`
+/// with any surrounding quote pair stripped from the value span.
+fn scan_word(b: &[u8], mut i: usize) -> (usize, usize, usize) {
+    if i < b.len() && (b[i] == b'\'' || b[i] == b'"') {
+        let q = b[i]; let s = i + 1; let mut j = s;
+        while j < b.len() && b[j] != q { j += 1; }
+        (s, j, if j < b.len() { j + 1 } else { j })
+    } else {
+        let s = i;
+        while i < b.len() && !b[i].is_ascii_whitespace() { i += 1; }
+        (s, i, i)
+    }
+}
+
+/// Parse script params from a raw `run` line: skip `skip` leading words (the `run` verb + the path),
+/// then collect up to `PARAM_MAX` quote-aware tokens. `name` becomes `$0`.
+fn parse_params<'a>(line: &'a str, name: &'a str, skip: usize) -> Params<'a> {
+    let b = line.as_bytes();
+    let mut i = 0usize;
+    let mut p = Params::empty(name);
+    for _ in 0..skip {
+        while i < b.len() && b[i].is_ascii_whitespace() { i += 1; }
+        if i >= b.len() { return p; }
+        let (_, _, next) = scan_word(b, i); i = next;
+    }
+    while p.argc < PARAM_MAX {
+        while i < b.len() && b[i].is_ascii_whitespace() { i += 1; }
+        if i >= b.len() { break; }
+        let (s, e, next) = scan_word(b, i);
+        p.argv[p.argc] = &line[s..e]; p.argc += 1; i = next;
+    }
+    p
+}
+
+/// A bounded expansion output buffer (one command line's worth). Loud overflow (§26.6).
+struct ExpBuf { buf: [u8; EXP_MAX], len: usize, overflow: bool }
+impl ExpBuf {
+    fn new() -> Self { ExpBuf { buf: [0u8; EXP_MAX], len: 0, overflow: false } }
+    fn push(&mut self, c: u8) { if self.len < EXP_MAX { self.buf[self.len] = c; self.len += 1; } else { self.overflow = true; } }
+    fn push_bytes(&mut self, b: &[u8]) { for &c in b { self.push(c); } }
+    fn push_u32(&mut self, mut n: u32) {
+        if n == 0 { self.push(b'0'); return; }
+        let mut tmp = [0u8; 10]; let mut k = 0;
+        while n > 0 { tmp[k] = b'0' + (n % 10) as u8; n /= 10; k += 1; }
+        while k > 0 { k -= 1; self.push(tmp[k]); }
+    }
+    fn as_bytes(&self) -> &[u8] { &self.buf[..self.len] }
+}
+
+/// Resolve one `$...` reference at `b[i]` (`b[i] == b'$'`) and push its value into `out`. Returns
+/// the index just past the reference, or `Err` (loud) on an undefined var/param or unsupported `$(`.
+fn push_ref(ctx: &ServiceContext, b: &[u8], i: usize, vars: &Vars, params: &Params, out: &mut ExpBuf) -> Result<usize, ()> {
+    let j = i + 1; // past '$'
+    if j >= b.len() { ctx.console_writeln("gsh: lone '$'"); return Err(()); }
+    if b[j] == b'(' { ctx.console_writeln("gsh: $( ) command capture is not supported yet"); return Err(()); }
+    match b[j] {
+        b'@' => { for k in 0..params.argc { if k > 0 { out.push(b' '); } out.push_bytes(params.argv[k].as_bytes()); } return Ok(j + 1); }
+        b'#' => { out.push_u32(params.argc as u32); return Ok(j + 1); }
+        b'0' => { out.push_bytes(params.name.as_bytes()); return Ok(j + 1); }
+        b'1'..=b'9' => {
+            let idx = (b[j] - b'1') as usize;
+            if idx >= params.argc {
+                ctx.console_writeln_fmt(format_args!("gsh: ${} not provided ($# = {})", (b[j] - b'0') as u32, params.argc));
+                return Err(());
+            }
+            out.push_bytes(params.argv[idx].as_bytes()); return Ok(j + 1);
+        }
+        _ => {}
+    }
+    let start = j;
+    let mut k = j;
+    while k < b.len() && (b[k] == b'_' || b[k].is_ascii_alphanumeric()) { k += 1; }
+    if k == start { ctx.console_writeln("gsh: '$' must be followed by a name, digit, @ or #"); return Err(()); }
+    let name = &b[start..k];
+    match vars.lookup(name) {
+        Some(vi) => { out.push_bytes(vars.value(vi)); Ok(k) }
+        None => { ctx.console_writeln_fmt(format_args!("gsh: undefined variable '${}'", str_of(name))); Err(()) }
+    }
+}
+
+/// Expand `$...` refs in a COMMAND line, PRESERVING quotes so `execute`'s tokenizer still works.
+/// Single-quoted spans copy literally (no expansion); double-quoted spans keep their quotes and
+/// expand `$` inside; a bare `$` expands. Loud on undefined refs / overflow.
+fn expand_cmd(ctx: &ServiceContext, s: &str, vars: &Vars, params: &Params, out: &mut ExpBuf) -> Result<(), ()> {
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => { out.push(b'\''); i += 1; while i < b.len() && b[i] != b'\'' { out.push(b[i]); i += 1; } if i < b.len() { out.push(b'\''); i += 1; } }
+            b'"' => {
+                out.push(b'"'); i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    if b[i] == b'$' { i = push_ref(ctx, b, i, vars, params, out)?; } else { out.push(b[i]); i += 1; }
+                }
+                if i < b.len() { out.push(b'"'); i += 1; }
+            }
+            b'$' => { i = push_ref(ctx, b, i, vars, params, out)?; }
+            c => { out.push(c); i += 1; }
+        }
+    }
+    if out.overflow { ctx.console_writeln("gsh: expanded line too long"); return Err(()); }
+    Ok(())
+}
+
+/// Expand a VALUE (the RHS of `let`/reassignment, or a `fail` message): a `'literal'`, an
+/// interpolated `"..."`, or a bare word (whole, spaces kept) with `$` expanded. Quotes are consumed
+/// (the value is their content). Loud on undefined refs / overflow.
+fn expand_val(ctx: &ServiceContext, s: &str, vars: &Vars, params: &Params, out: &mut ExpBuf) -> Result<(), ()> {
+    let s = s.trim();
+    let b = s.as_bytes();
+    if b.len() >= 2 && b[0] == b'\'' && b[b.len() - 1] == b'\'' {
+        out.push_bytes(&b[1..b.len() - 1]);
+    } else if b.len() >= 2 && b[0] == b'"' && b[b.len() - 1] == b'"' {
+        let inner = &b[1..b.len() - 1]; let mut i = 0;
+        while i < inner.len() { if inner[i] == b'$' { i = push_ref(ctx, inner, i, vars, params, out)?; } else { out.push(inner[i]); i += 1; } }
+    } else {
+        let mut i = 0;
+        while i < b.len() { if b[i] == b'$' { i = push_ref(ctx, b, i, vars, params, out)?; } else { out.push(b[i]); i += 1; } }
+    }
+    if out.overflow { ctx.console_writeln("gsh: value too long"); return Err(()); }
+    Ok(())
+}
+
+/// A gsh identifier: starts with a letter or `_`, then letters/digits/`_`, bounded length.
+fn valid_var_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    if b.is_empty() || b.len() > VAR_NAME_MAX { return false; }
+    if !(b[0] == b'_' || b[0].is_ascii_alphabetic()) { return false; }
+    b.iter().all(|&c| c == b'_' || c.is_ascii_alphanumeric())
+}
+
+/// `let [mut] <name> = <value>` - declare a binding.
+fn stmt_let(ctx: &ServiceContext, rest: &str, vars: &mut Vars, params: &Params) -> Result<(), ShellError> {
+    let (mutable, rest) = match rest.strip_prefix("mut ") { Some(r) => (true, r.trim_start()), None => (false, rest) };
+    let (name, after) = split_first(rest);
+    let after = after.trim_start();
+    let value = match after.strip_prefix('=') {
+        Some(v) => v.trim_start(),
+        None => { ctx.console_writeln("gsh: let: expected '=' (let [mut] <name> = <value>)"); return Err(ShellError::Unknown); }
+    };
+    if !valid_var_name(name) { ctx.console_writeln_fmt(format_args!("gsh: invalid variable name '{}'", name)); return Err(ShellError::Unknown); }
+    let mut exp = ExpBuf::new();
+    if expand_val(ctx, value, vars, params, &mut exp).is_err() { return Err(ShellError::Unknown); }
+    match vars.define(name.as_bytes(), exp.as_bytes(), mutable) {
+        Ok(()) => Ok(()),
+        Err(e) => { var_err_msg(ctx, name, e); Err(ShellError::Unknown) }
+    }
+}
+
+/// `<name> = <value>` - reassign a mutable binding.
+fn stmt_reassign(ctx: &ServiceContext, name: &str, value: &str, vars: &mut Vars, params: &Params) -> Result<(), ShellError> {
+    let mut exp = ExpBuf::new();
+    if expand_val(ctx, value, vars, params, &mut exp).is_err() { return Err(ShellError::Unknown); }
+    match vars.reassign(name.as_bytes(), exp.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(e) => { var_err_msg(ctx, name, e); Err(ShellError::Unknown) }
+    }
+}
+
+/// The outcome of one gsh statement: continue to the next, or stop the run (a `fail`).
+enum StmtOutcome { Cont(Result<(), ShellError>), Stop(Result<(), ShellError>) }
+
+/// Run one gsh statement: a `let`/reassignment/`fail`, or - after `$`-expansion - a plain command
+/// handed to the existing `execute`. `vars` is the run's variable table; `params` its parameters.
+fn run_stmt(ctx: &ServiceContext, cwd: &mut Cwd, stmt: &str, prev: Result<(), ShellError>, depth: u8, vars: &mut Vars, params: &Params) -> StmtOutcome {
+    let (head, rest) = split_first(stmt);
+    // `fail <msg>` - print loudly and stop the run with Err.
+    if head == "fail" {
+        let mut exp = ExpBuf::new();
+        if expand_val(ctx, rest, vars, params, &mut exp).is_ok() {
+            ctx.console_writeln_fmt(format_args!("fail: {}", str_of(exp.as_bytes())));
+        } else {
+            ctx.console_writeln("fail");
+        }
+        return StmtOutcome::Stop(Err(ShellError::Unknown));
+    }
+    // `let [mut] name = value`
+    if head == "let" {
+        return StmtOutcome::Cont(stmt_let(ctx, rest, vars, params));
+    }
+    // reassignment: the second token is exactly `=` (the one disambiguation rule, docs/scripting.md §3).
+    if rest == "=" || rest.starts_with("= ") {
+        let value = rest[1..].trim_start();
+        return StmtOutcome::Cont(stmt_reassign(ctx, head, value, vars, params));
+    }
+    // a plain command: `$`-expand, then run it exactly as the flat runner did.
+    let mut exp = ExpBuf::new();
+    if expand_cmd(ctx, stmt, vars, params, &mut exp).is_err() {
+        return StmtOutcome::Cont(Err(ShellError::Unknown));
+    }
+    StmtOutcome::Cont(execute(ctx, exp.as_bytes(), cwd, prev, depth))
+}
+
+/// A quote-aware statement walker over a resident script buffer. A statement ends at an UNQUOTED
+/// `;` or newline; `'`/`"` protect a `;`/`#`/newline inside them (quote state resets at a newline,
+/// per docs/scripting.md §2); `#` starts a comment-to-end-of-line only when unquoted at the start of
+/// a statement or after whitespace (so `write /f a#b` keeps its `#`). Yields trimmed, non-empty,
+/// non-comment statement slices of the buffer (no copies) - the direct replacement for the old
+/// `split('\n')` + `split(';')`.
+struct StmtReader<'a> { src: &'a [u8], pos: usize }
+impl<'a> StmtReader<'a> {
+    fn new(src: &'a [u8]) -> Self { StmtReader { src, pos: 0 } }
+    fn next_stmt(&mut self) -> Option<&'a [u8]> {
+        let b = self.src;
+        while self.pos < b.len() {
+            let start = self.pos;
+            let mut i = start;
+            let mut quote: u8 = 0;
+            let mut seg_end = b.len();
+            let mut next = b.len();
+            while i < b.len() {
+                let c = b[i];
+                if quote != 0 {
+                    // A newline resets quote state (docs/scripting.md §2) and ends the statement.
+                    if c == b'\n' { seg_end = i; next = i + 1; break; }
+                    if c == quote { quote = 0; }
+                    i += 1;
+                    continue;
+                }
+                match c {
+                    b'\'' | b'"' => { quote = c; i += 1; }
+                    b';' => { seg_end = i; next = i + 1; break; }
+                    b'\n' => { seg_end = i; next = i + 1; break; }
+                    b'#' if i == start || b[i - 1].is_ascii_whitespace() => {
+                        seg_end = i;
+                        let mut k = i;
+                        while k < b.len() && b[k] != b'\n' { k += 1; }
+                        next = if k < b.len() { k + 1 } else { k };
+                        break;
+                    }
+                    _ => { i += 1; }
+                }
+            }
+            self.pos = next;
+            let seg = trim_bytes(&b[start..seg_end]);
+            if !seg.is_empty() { return Some(seg); }
+        }
+        None
+    }
 }
 
 /// Execute a script body (already in memory): split into commands, run each, then print a
@@ -1131,44 +1472,48 @@ fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8, save: Opti
 /// HW-proven - [[project-shell-stack-pipe]]). The `ReportBuf` is a modest bounded buffer, so it +
 /// a sub-pipeline's transient buffers fit the user stack - the whole point of saving directly.
 #[inline(never)]
-fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out) -> Result<(), ShellError> {
+fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out, params: &Params) -> Result<(), ShellError> {
+    // Per-run interpreter state: a bounded variable table, allocated once HERE (above `execute`) and
+    // threaded by &mut into `run_stmt` - it never reaches `execute`/`pipe_run`'s frame. No heap (§26.6).
+    let mut vars = Vars::new();
     let mut ran = 0u32;
     let mut failed = 0u32;
     let mut last: Result<(), ShellError> = Ok(());
-    // Per-command verdicts, for the end-of-run summary. Bounded; commands past the cap still run
+    // Per-statement verdicts, for the end-of-run summary. Bounded; statements past the cap still run
     // and count, they just don't get a summary line (loud, not silent - §26.6).
     let mut verdict = [true; RUN_MAX_CMDS];
     let mut vi = 0usize;
-    for line in src.split(|&b| b == b'\n') {
-        let line = trim_bytes(line);
-        if line.is_empty() || line[0] == b'#' { continue; } // blank or whole-line comment
-        for cmd in line.split(|&b| b == b';') {
-            let cmd = trim_bytes(cmd);
-            if cmd.is_empty() { continue; }
-            // Echo the command so the transcript shows what produced each result.
-            out.put(ctx, "> ");
-            out.line(ctx, str_of(cmd));
-            last = execute(ctx, cmd, cwd, last, depth + 1);
-            if vi < RUN_MAX_CMDS { verdict[vi] = last.is_ok(); }
-            vi += 1;
-            ran += 1;
-            if last.is_err() { failed += 1; }
-        }
+    let mut executed = 0usize;
+    // PASS 1: run each statement in order (a `let`/reassignment/`fail`, or an expanded command). A
+    // `fail` stops the run. Statements run at `depth + 1` so a nested `run` inside a script is refused.
+    let mut reader = StmtReader::new(src);
+    while let Some(stmt) = reader.next_stmt() {
+        let s = str_of(stmt);
+        // Echo the statement so the transcript shows what produced each result.
+        out.put(ctx, "> ");
+        out.line(ctx, s);
+        let (res, stop) = match run_stmt(ctx, cwd, s, last, depth + 1, &mut vars, params) {
+            StmtOutcome::Cont(r) => (r, false),
+            StmtOutcome::Stop(r) => (r, true),
+        };
+        last = res;
+        if vi < RUN_MAX_CMDS { verdict[vi] = last.is_ok(); }
+        vi += 1;
+        ran += 1;
+        executed += 1;
+        if last.is_err() { failed += 1; }
+        if stop { break; }
     }
-    // End-of-run summary: PASS/FAIL per command (re-split identically, pairing with `verdict`).
+    // End-of-run summary: PASS/FAIL per EXECUTED statement (re-walk identically, pair with `verdict`).
     // "FAIL  " is deliberately not the word "FAILED" the harness greens on absence of.
     out.line(ctx, "--- summary ---");
+    let mut reader2 = StmtReader::new(src);
     let mut j = 0usize;
-    for line in src.split(|&b| b == b'\n') {
-        let line = trim_bytes(line);
-        if line.is_empty() || line[0] == b'#' { continue; }
-        for cmd in line.split(|&b| b == b';') {
-            let cmd = trim_bytes(cmd);
-            if cmd.is_empty() { continue; }
-            out.put(ctx, if j < RUN_MAX_CMDS && !verdict[j] { "FAIL  " } else { "PASS  " });
-            out.line(ctx, str_of(cmd));
-            j += 1;
-        }
+    while j < executed {
+        let stmt = match reader2.next_stmt() { Some(s) => s, None => break };
+        out.put(ctx, if j < RUN_MAX_CMDS && !verdict[j] { "FAIL  " } else { "PASS  " });
+        out.line(ctx, str_of(stmt));
+        j += 1;
     }
     out.line_fmt(ctx, format_args!("run: ran {}, failed {}", ran, failed));
     if failed == 0 { Ok(()) } else { Err(ShellError::Unknown) }
@@ -1179,12 +1524,12 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
 /// dispatcher is tiny on purpose: the 32 KiB `ReportBuf` lives ONLY in `run_and_save`, called only
 /// on the save path - so a bare run/selfcheck does NOT carry 32 KiB of unused frame (which would
 /// tip its already-heavy `| assert` sub-pipelines over the user-stack ceiling).
-fn run_with_optional_save(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, save: Option<&str>)
+fn run_with_optional_save(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, save: Option<&str>, params: &Params)
     -> Result<(), ShellError>
 {
     match save {
-        None => run_lines(ctx, cwd, src, depth, &mut Out::Console),
-        Some(spath) => run_and_save(ctx, cwd, src, depth, spath),
+        None => run_lines(ctx, cwd, src, depth, &mut Out::Console, params),
+        Some(spath) => run_and_save(ctx, cwd, src, depth, spath, params),
     }
 }
 
@@ -1192,7 +1537,7 @@ fn run_with_optional_save(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth
 /// (direct file write, no pipe). `#[inline(never)]` so the 32 KiB buffer exists only while a save
 /// is actually running, not in the frame of every bare run.
 #[inline(never)]
-fn run_and_save(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, spath: &str)
+fn run_and_save(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, spath: &str, params: &Params)
     -> Result<(), ShellError>
 {
     let mut pbuf = [0u8; PATH_MAX];
@@ -1205,7 +1550,7 @@ fn run_and_save(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, spat
     let mut rb = ReportBuf::new();
     let result = {
         let mut out = Out::File(&mut rb);
-        run_lines(ctx, cwd, src, depth, &mut out)
+        run_lines(ctx, cwd, src, depth, &mut out, params)
     }; // `out` (the &mut rb borrow) ends here, so `rb` is readable below
     if rb.overflow {
         ctx.console_writeln_fmt(format_args!(
@@ -1276,7 +1621,7 @@ fn cmd_selfcheck(ctx: &ServiceContext, cwd: &mut Cwd, depth: u8, arg: &str) -> R
     ctx.console_writeln_fmt(format_args!(
         "selfcheck: running the embedded suite ({} bytes, in memory) - needs a flashed drive for the file tests...",
         SELFCHECK_GS.len()));
-    run_with_optional_save(ctx, cwd, SELFCHECK_GS.as_bytes(), depth, save)
+    run_with_optional_save(ctx, cwd, SELFCHECK_GS.as_bytes(), depth, save, &Params::empty("selfcheck"))
 }
 
 /// `assert ok <cmd>` / `assert fails <cmd>` - the **result** form: run `<cmd>` and check that it

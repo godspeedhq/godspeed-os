@@ -1,9 +1,12 @@
 # gsh - the GodspeedOS shell language (design)
 
-> **Status:** design sketch, not yet built. Scope is Tier 1-2 below. Scripts use the `.gsh`
-> extension (GodspeedOS shell; `.gs` is reserved for the future general-purpose Godspeed
-> language). Builds on the existing `run`/`run_lines` interpreter and the command **Result**
-> model (`execute` already returns `Ok`/`Err`). Not POSIX - see CLAUDE.md Appendix B.3 / D.
+> **Status:** Tier 1 in progress. **Slice 1 (foundation) is BUILT** - `let`/`let mut` +
+> reassignment, `$`-expansion (`$name`, `"..."`) + params (`$1..$9`, `$@`, `$#`, `$0`), and `fail`
+> (§3, §8; pinned by `osdev test files`). The rest of Tier 1 (`if`/`else` + comparisons + `in` +
+> `result`, §4; `switch`, §6) and all of Tier 2 remain design-only. Scripts use the `.gsh` extension
+> (GodspeedOS shell; `.gs` is reserved for the future general-purpose Godspeed language). Builds on
+> the `run`/`run_lines` interpreter and the command **Result** model (`execute` returns `Ok`/`Err`).
+> Not POSIX - see CLAUDE.md Appendix B.3 / D.
 
 ## Contents
 

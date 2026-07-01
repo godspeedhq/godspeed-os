@@ -1735,6 +1735,48 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL - run(nest) timeout"); fail += 1; }
     }
 
+    // ── gsh language (Slice 1: variables, $-expansion, params, fail). docs/scripting.md. Authored
+    //    on one line with `;` (the file stores the `;`; `run` splits it into statements).
+    // let + $-interpolation: `v=$n` prints `v=7` ONLY if $n expanded (the raw statement is `echo v=$n`).
+    let _ = run!(b"write /gsh_a.gsh let n = 7 ; echo v=$n\r", 10);
+    match run!(b"run /gsh_a.gsh\r", 14) {
+        Some(r) => {
+            check!(r.contains("v=7"), "gsh: let binds and $var interpolates");
+            check!(r.contains("run: ran 2, failed 0"), "gsh: a let + echo run passes clean");
+        }
+        None => { println!("files-test: FAIL - gsh let timeout"); fail += 2; }
+    }
+    // undefined variable is a LOUD error (not a silent empty string) and fails the statement.
+    let _ = run!(b"write /gsh_u.gsh echo $missing\r", 10);
+    match run!(b"run /gsh_u.gsh\r", 14) {
+        Some(r) => {
+            check!(r.contains("undefined variable"), "gsh: undefined $var is loud");
+            check!(r.contains("run: ran 1, failed 1"), "gsh: undefined $var fails the statement");
+        }
+        None => { println!("files-test: FAIL - gsh undefined timeout"); fail += 2; }
+    }
+    // immutable by default: reassigning a `let` binding is a loud error.
+    let _ = run!(b"write /gsh_i.gsh let x = 1 ; x = 2\r", 10);
+    match run!(b"run /gsh_i.gsh\r", 14) {
+        Some(r) => check!(r.contains("cannot reassign immutable") && r.contains("run: ran 2, failed 1"),
+                          "gsh: reassigning an immutable binding is loud"),
+        None => { println!("files-test: FAIL - gsh immutable timeout"); fail += 1; }
+    }
+    // let mut + reassignment + params: `run … alpha beta` → $1/$2; who=alpha then who=beta.
+    let _ = run!(b"write /gsh_m.gsh let mut who = $1 ; who = $2 ; echo picked-$who\r", 10);
+    match run!(b"run /gsh_m.gsh alpha beta\r", 14) {
+        Some(r) => check!(r.contains("picked-beta") && r.contains("run: ran 3, failed 0"),
+                          "gsh: let mut reassigns; $1/$2 params expand"),
+        None => { println!("files-test: FAIL - gsh mut/params timeout"); fail += 1; }
+    }
+    // fail stops the run: the statement after `fail` does not execute.
+    let _ = run!(b"write /gsh_f.gsh echo one ; fail stop-here ; echo two\r", 10);
+    match run!(b"run /gsh_f.gsh\r", 14) {
+        Some(r) => check!(r.contains("fail: stop-here") && r.contains("run: ran 2, failed 1") && !r.contains("> echo two"),
+                          "gsh: fail prints loudly and stops the run"),
+        None => { println!("files-test: FAIL - gsh fail timeout"); fail += 1; }
+    }
+
     // ── assert: the verifying command. Content form (the pipe sink) is tested interactively -
     //    a `|` can't yet be authored into a script via `write` (the shell pipes the write line).
     match run!(b"roster | where role=core | assert contains Matthew\r", 16) {
