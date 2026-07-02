@@ -1344,6 +1344,13 @@ const EXP_MAX: usize = 1024;
 /// Max gsh function call depth (recursion bound). Each level is a scope frame in `Vars` + a `Call`
 /// block frame in the executor - explicit stacks, no native recursion (§9). Loud on overflow.
 const CALL_DEPTH_MAX: usize = 16;
+/// A MUTABLE variable's value lives in a fixed per-var slot, overwritten IN PLACE on reassign - so a
+/// loop counter (`i = $i + 1`) never grows the value arena (§26.6.1). A mutable value past this is
+/// loud. Immutable values still use the (larger) bump arena, since they are written once.
+const MUT_SLOT: usize = 48;
+/// Hard iteration backstop for the unbounded `loop` (§5): a runaway is a loud stop, never a silent
+/// hang (invariant 12). `for` is self-bounded by its iterator; this guards `loop`.
+const LOOP_CAP: u32 = 100_000;
 
 /// A gsh run's variable table: a fixed name array + a value bump-arena + one overflow flag (modeled
 /// on the record `Table`). Immutable by default; `let mut` opts into reassignment. Loud on a full
@@ -1362,6 +1369,9 @@ struct Vars {
     count: usize,
     arena: [u8; VAR_ARENA],
     alen: usize,
+    // Mutable values live in fixed slots (overwritten in place on reassign - no arena growth in loops).
+    mut_slots: [[u8; MUT_SLOT]; VAR_MAX],
+    mut_len: [u8; VAR_MAX],
     // Scope stack: scope_count[i]/scope_alen[i] = the table/arena base of the i-th open function.
     scope_count: [usize; CALL_DEPTH_MAX],
     scope_alen: [usize; CALL_DEPTH_MAX],
@@ -1370,7 +1380,7 @@ struct Vars {
 
 /// Why a variable operation failed (each maps to a loud console line).
 #[derive(Clone, Copy)]
-enum VarErr { TableFull, ArenaFull, NameTooLong, Redeclare, Undeclared, Immutable }
+enum VarErr { TableFull, ArenaFull, NameTooLong, Redeclare, Undeclared, Immutable, ValueTooLong }
 
 impl Vars {
     fn new() -> Self {
@@ -1378,6 +1388,7 @@ impl Vars {
             names: [[0u8; VAR_NAME_MAX]; VAR_MAX], name_len: [0; VAR_MAX],
             val_off: [0; VAR_MAX], val_len: [0; VAR_MAX], mutable: [false; VAR_MAX],
             count: 0, arena: [0u8; VAR_ARENA], alen: 0,
+            mut_slots: [[0u8; MUT_SLOT]; VAR_MAX], mut_len: [0; VAR_MAX],
             scope_count: [0; CALL_DEPTH_MAX], scope_alen: [0; CALL_DEPTH_MAX], sp: 0,
         }
     }
@@ -1413,8 +1424,12 @@ impl Vars {
         None
     }
     fn value(&self, i: usize) -> &[u8] {
-        let off = self.val_off[i] as usize;
-        &self.arena[off..off + self.val_len[i] as usize]
+        if self.mutable[i] {
+            &self.mut_slots[i][..self.mut_len[i] as usize]
+        } else {
+            let off = self.val_off[i] as usize;
+            &self.arena[off..off + self.val_len[i] as usize]
+        }
     }
     /// Copy `val` into the arena; `None` if it would not fit (arena full or len > u16).
     fn intern(&mut self, val: &[u8]) -> Option<(u16, u16)> {
@@ -1430,22 +1445,44 @@ impl Vars {
         let base = self.base();
         for i in base..self.count { if self.name_eq(i, name) { return Err(VarErr::Redeclare); } }
         if self.count >= VAR_MAX { return Err(VarErr::TableFull); }
-        let (off, len) = self.intern(val).ok_or(VarErr::ArenaFull)?;
         let i = self.count;
+        if mutable {
+            // A mutable value lives in a fixed slot (overwritten in place on reassign - no arena growth).
+            if val.len() > MUT_SLOT { return Err(VarErr::ValueTooLong); }
+            self.mut_slots[i][..val.len()].copy_from_slice(val);
+            self.mut_len[i] = val.len() as u8;
+        } else {
+            let (off, len) = self.intern(val).ok_or(VarErr::ArenaFull)?;
+            self.val_off[i] = off; self.val_len[i] = len;
+        }
         self.names[i][..name.len()].copy_from_slice(name);
         self.name_len[i] = name.len() as u8;
-        self.val_off[i] = off; self.val_len[i] = len; self.mutable[i] = mutable;
+        self.mutable[i] = mutable;
         self.count += 1;
         Ok(())
     }
     fn reassign(&mut self, name: &[u8], val: &[u8]) -> Result<(), VarErr> {
         let i = self.lookup(name).ok_or(VarErr::Undeclared)?;
+        self.set_slot(i, val)
+    }
+    /// Overwrite a mutable variable's slot IN PLACE (no arena growth). Loud if immutable or too long.
+    fn set_slot(&mut self, i: usize, val: &[u8]) -> Result<(), VarErr> {
         if !self.mutable[i] { return Err(VarErr::Immutable); }
-        // Bump-append the new value (old bytes stranded - fine for Slice 1; no loops yet, so a
-        // mutable var is reassigned a bounded number of times. Loops (Tier 2) will need per-var slots.)
-        let (off, len) = self.intern(val).ok_or(VarErr::ArenaFull)?;
-        self.val_off[i] = off; self.val_len[i] = len;
+        if val.len() > MUT_SLOT { return Err(VarErr::ValueTooLong); }
+        self.mut_slots[i][..val.len()].copy_from_slice(val);
+        self.mut_len[i] = val.len() as u8;
         Ok(())
+    }
+    /// Ensure a mutable loop variable `name` holds `val`: reassign if it exists (must be mutable),
+    /// else define it fresh. Returns its index.
+    fn set_loop_var(&mut self, name: &[u8], val: &[u8]) -> Result<usize, VarErr> {
+        if let Some(i) = self.lookup(name) { self.set_slot(i, val)?; Ok(i) }
+        else { self.define(name, val, true)?; Ok(self.count - 1) }
+    }
+    /// Reset the table + arena to a saved base (drops a loop body's per-iteration locals, so a `let`
+    /// inside the body is fresh each iteration, while variables below the base stay visible).
+    fn reset_to(&mut self, count: usize, alen: usize) {
+        if count <= self.count { self.count = count; self.alen = alen; }
     }
 }
 
@@ -1458,6 +1495,7 @@ fn var_err_msg(ctx: &ServiceContext, name: &str, e: VarErr) {
         VarErr::Redeclare => ctx.console_writeln_fmt(format_args!("gsh: '{}' already declared (mutate with 'let mut' + '{} = ...')", name, name)),
         VarErr::Undeclared => ctx.console_writeln_fmt(format_args!("gsh: cannot reassign undeclared '{}'", name)),
         VarErr::Immutable => ctx.console_writeln_fmt(format_args!("gsh: cannot reassign immutable '{}' (declare it 'let mut')", name)),
+        VarErr::ValueTooLong => ctx.console_writeln_fmt(format_args!("gsh: value for mutable '{}' too long (max {} bytes)", name, MUT_SLOT)),
     }
 }
 
@@ -1990,11 +2028,30 @@ fn skip_else_chain(b: &[u8], mut pos: usize) -> usize {
     }
 }
 
-/// A block frame's kind. An `if`/`else` block closes by skipping its else-chain; a `switch` arm
-/// closes by jumping past the whole switch (carrying its end); a function `Call` closes by returning
-/// to the caller (carrying the resume position) and dropping the call's scope.
+/// What a `for` loop iterates: literal/`$var` WORDS in the buffer, an integer RANGE, or the script's
+/// PARAMS (`$@`). The advancing state lives in the frame - no materialized list (a big `range` never
+/// becomes text).
 #[derive(Clone, Copy)]
-enum BlockKind { If, SwitchArm(usize), Call(usize) }
+enum ForIter {
+    Words { pos: usize, end: usize }, // byte positions of the remaining word list (after `in`)
+    Range { cur: i64, end: i64 },
+    Params { idx: usize },
+}
+
+/// A block frame's kind. `If`/`else` closes by skipping its else-chain; a `switch` arm closes by
+/// jumping past the whole switch (carrying its end); a function `Call` closes by returning to the
+/// caller (carrying the resume position) and dropping the call's scope; `For`/`Loop` close by
+/// advancing (re-running the body) or, when exhausted / at the cap, by exiting past the body. Both
+/// loops carry `base`/`abase` (the var-table/arena base restored each iteration, so a `let` in the
+/// body is fresh each pass) and `body_end` (where `break` jumps to).
+#[derive(Clone, Copy)]
+enum BlockKind {
+    If,
+    SwitchArm(usize),
+    Call(usize),
+    For { var: usize, body: usize, body_end: usize, base: usize, abase: usize, it: ForIter },
+    Loop { body: usize, body_end: usize, base: usize, abase: usize, iter: u32 },
+}
 
 /// The result of processing an `if` or `switch` construct.
 enum Step { Enter(usize, BlockKind), Done(usize), Malformed(usize) }
@@ -2100,6 +2157,67 @@ fn read_statement(b: &[u8], start: usize) -> (&[u8], usize) {
         }
     }
     (trim_bytes(&b[start..i]), i)
+}
+
+// ── Loops (§5): `for <var> in <words|range|$@> { … }` and unbounded `loop { … }`. ──
+
+/// Parse the source of a `for` (the text between `in` and `{`) into an iterator: `range N` / `range A
+/// B` counts; `$@` alone walks the params; anything else is a whitespace-separated word list (each
+/// word `$`-expanded per step).
+fn parse_for_iter(b: &[u8], rest_start: usize, rest_end: usize) -> ForIter {
+    let s = skip_ws(b, rest_start);
+    if matches_kw(b, s, b"range") {
+        let mut nums = [0i64; 2];
+        let mut nn = 0usize;
+        let mut i = s + 5;
+        while i < rest_end && nn < 2 {
+            while i < rest_end && b[i].is_ascii_whitespace() { i += 1; }
+            if i >= rest_end { break; }
+            let ts = i;
+            while i < rest_end && !b[i].is_ascii_whitespace() { i += 1; }
+            match parse_i64(&b[ts..i]) { Some(v) => { nums[nn] = v; nn += 1; } None => break }
+        }
+        match nn {
+            1 => ForIter::Range { cur: 0, end: nums[0] },
+            2 => ForIter::Range { cur: nums[0], end: nums[1] },
+            _ => ForIter::Range { cur: 0, end: 0 }, // malformed -> empty
+        }
+    } else if trim_bytes(&b[rest_start..rest_end]) == b"$@" {
+        ForIter::Params { idx: 0 }
+    } else {
+        ForIter::Words { pos: rest_start, end: rest_end }
+    }
+}
+
+/// Advance a `for` iterator by one: if a next item exists, set the loop var (`var`) to it and return
+/// the advanced iterator; else `None` (loop done). Words are `$`-expanded in the current scope.
+fn for_step(ctx: &ServiceContext, b: &[u8], vars: &mut Vars, var: usize, it: ForIter, params: &Params) -> Option<ForIter> {
+    match it {
+        ForIter::Range { cur, end } => {
+            if cur >= end { return None; }
+            let mut eb = ExpBuf::new();
+            eb.push_i64(cur);
+            vars.set_slot(var, eb.as_bytes()).ok()?;
+            Some(ForIter::Range { cur: cur + 1, end })
+        }
+        ForIter::Params { idx } => {
+            if idx >= params.argc { return None; }
+            let a = params.argv[idx];
+            vars.set_slot(var, a.as_bytes()).ok()?;
+            Some(ForIter::Params { idx: idx + 1 })
+        }
+        ForIter::Words { pos, end } => {
+            let mut i = pos;
+            while i < end && b[i].is_ascii_whitespace() { i += 1; }
+            if i >= end { return None; }
+            let s = i;
+            while i < end && !b[i].is_ascii_whitespace() { i += 1; }
+            let mut eb = ExpBuf::new();
+            if expand_val(ctx, str_of(&b[s..i]), vars, params, &mut eb).is_err() { return None; }
+            vars.set_slot(var, eb.as_bytes()).ok()?;
+            Some(ForIter::Words { pos: i, end })
+        }
+    }
 }
 
 // ── Functions (§7): `fn name params { body }`, called like a command, bounded recursion. ──
@@ -2274,12 +2392,28 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
         // `}` closes the current block.
         if b[pos] == b'}' {
             if sp == 0 { ctx.console_writeln("gsh: unexpected '}'"); failed += 1; break; }
-            sp -= 1;
-            pos = match frames[sp] {
-                BlockKind::If => skip_else_chain(b, pos + 1),
-                BlockKind::SwitchArm(end) => end + 1,
-                BlockKind::Call(ret) => { vars.exit_scope(); ret } // function body done: drop scope, resume
-            };
+            match frames[sp - 1] {
+                BlockKind::If => { sp -= 1; pos = skip_else_chain(b, pos + 1); }
+                BlockKind::SwitchArm(end) => { sp -= 1; pos = end + 1; }
+                BlockKind::Call(ret) => { sp -= 1; vars.exit_scope(); pos = ret; } // body done: drop scope, resume
+                BlockKind::For { var, body, body_end, base, abase, it } => {
+                    vars.reset_to(base, abase); // drop this pass's body locals
+                    match for_step(ctx, b, &mut vars, var, it, params) {
+                        Some(next_it) => { frames[sp - 1] = BlockKind::For { var, body, body_end, base, abase, it: next_it }; pos = body; }
+                        None => { sp -= 1; pos = body_end + 1; }
+                    }
+                }
+                BlockKind::Loop { body, body_end, base, abase, iter } => {
+                    vars.reset_to(base, abase);
+                    if iter + 1 >= LOOP_CAP {
+                        ctx.console_writeln_fmt(format_args!("gsh: loop hit the {} iteration cap - stopping (needs a break)", LOOP_CAP));
+                        sp -= 1; pos = body_end + 1;
+                    } else {
+                        frames[sp - 1] = BlockKind::Loop { body, body_end, base, abase, iter: iter + 1 };
+                        pos = body;
+                    }
+                }
+            }
             continue;
         }
         // a stray `{` outside an `if`/`else`/`switch` is malformed (a literal `{` must be quoted).
@@ -2305,6 +2439,49 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
                 Step::Done(next) => { pos = next; }
                 Step::Malformed(next) => { last = Err(ShellError::Unknown); failed += 1; pos = next; }
             }
+            continue;
+        }
+        // a `for` loop: for <var> in <words | range N | range A B | $@> { body }
+        if matches_kw(b, pos, b"for") {
+            let vs = skip_ws(b, pos + 3);
+            let mut ve = vs;
+            while ve < b.len() && !b[ve].is_ascii_whitespace() { ve += 1; }
+            let in_pos = skip_ws(b, ve);
+            if ve <= vs || !matches_kw(b, in_pos, b"in") {
+                ctx.console_writeln("gsh: for: expected 'for <var> in <list> { … }'");
+                failed += 1;
+                pos = find_open_brace(b, pos + 3).and_then(|o| find_matching_brace(b, o)).map(|e| e + 1).unwrap_or(b.len());
+                continue;
+            }
+            let rest_start = skip_ws(b, in_pos + 2);
+            let open = match find_open_brace(b, rest_start) { Some(o) => o, None => { ctx.console_writeln("gsh: for: missing '{'"); failed += 1; pos = b.len(); continue; } };
+            let end = match find_matching_brace(b, open) { Some(e) => e, None => { ctx.console_writeln("gsh: for: unbalanced braces"); failed += 1; pos = b.len(); continue; } };
+            let var = match vars.set_loop_var(&b[vs..ve], b"") {
+                Ok(i) => i,
+                Err(e) => { var_err_msg(ctx, str_of(&b[vs..ve]), e); failed += 1; pos = end + 1; continue; }
+            };
+            let base = vars.count;
+            let abase = vars.alen;
+            let it0 = parse_for_iter(b, rest_start, open);
+            match for_step(ctx, b, &mut vars, var, it0, params) {
+                Some(next_it) => {
+                    if sp >= IF_DEPTH_MAX { ctx.console_writeln("gsh: block nesting too deep"); failed += 1; break; }
+                    frames[sp] = BlockKind::For { var, body: open + 1, body_end: end, base, abase, it: next_it };
+                    sp += 1;
+                    pos = open + 1;
+                }
+                None => { pos = end + 1; } // empty iteration: skip the body entirely
+            }
+            continue;
+        }
+        // an unbounded `loop { body }` - repeats until `break` (LOOP_CAP is the loud backstop).
+        if matches_kw(b, pos, b"loop") {
+            let open = match find_open_brace(b, pos + 4) { Some(o) => o, None => { ctx.console_writeln("gsh: loop: missing '{'"); failed += 1; pos = b.len(); continue; } };
+            let end = match find_matching_brace(b, open) { Some(e) => e, None => { ctx.console_writeln("gsh: loop: unbalanced braces"); failed += 1; pos = b.len(); continue; } };
+            if sp >= IF_DEPTH_MAX { ctx.console_writeln("gsh: block nesting too deep"); failed += 1; break; }
+            frames[sp] = BlockKind::Loop { body: open + 1, body_end: end, base: vars.count, abase: vars.alen, iter: 0 };
+            sp += 1;
+            pos = open + 1;
             continue;
         }
         // a stray `else` (its `if` was taken and the chain already skipped) - malformed; skip its block.
@@ -2350,6 +2527,27 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
                 if let BlockKind::Call(ret) = frames[sp] { vars.exit_scope(); pos = ret; found = true; break; }
             }
             if !found { ctx.console_writeln("gsh: 'return' outside a function"); }
+            continue;
+        }
+        // `break` / `continue` - affect the nearest enclosing loop (never across a function boundary).
+        if head == "break" || head == "continue" {
+            let is_break = head == "break";
+            let mut done = false;
+            let mut i = sp;
+            while i > 0 {
+                i -= 1;
+                match frames[i] {
+                    BlockKind::For { body_end, .. } | BlockKind::Loop { body_end, .. } => {
+                        if is_break { sp = i; pos = body_end + 1; }   // pop loop + inner frames, exit past `}`
+                        else { sp = i + 1; pos = body_end; }           // keep loop; jump to `}` -> next iteration
+                        done = true;
+                        break;
+                    }
+                    BlockKind::Call(_) => break, // a loop can't be broken from inside a called function
+                    _ => {}                       // if/switch - discarded on the way out
+                }
+            }
+            if !done { ctx.console_writeln_fmt(format_args!("gsh: '{}' outside a loop", head)); }
             continue;
         }
         // a FUNCTION CALL - the head names a defined function; run its body in a fresh scope.

@@ -2021,6 +2021,42 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None => { println!("files-test: FAIL - gsh import-as-resolve timeout"); fail += 1; }
     }
 
+    // ── gsh Slice 8 (Tier 2): loops - `for … in words|range|$@`, unbounded `loop`, break/continue.
+    let _ = run!(b"write /fl1.gsh for x in a b c { echo w-$x }\r", 10);
+    match run!(b"run /fl1.gsh\r", 14) {
+        Some(r) => check!(r.contains("w-a") && r.contains("w-b") && r.contains("w-c"), "gsh: for … in <words>"),
+        None => { println!("files-test: FAIL - gsh for-words timeout"); fail += 1; }
+    }
+    let _ = run!(b"write /fl2.gsh for i in range 3 { echo n-$i }\r", 10);
+    match run!(b"run /fl2.gsh\r", 14) {
+        Some(r) => check!(r.contains("n-0") && r.contains("n-1") && r.contains("n-2") && !r.contains("n-3"), "gsh: for i in range N"),
+        None => { println!("files-test: FAIL - gsh for-range timeout"); fail += 1; }
+    }
+    let _ = run!(b"write /fl3.gsh for i in range 2 5 { echo r-$i }\r", 10);
+    match run!(b"run /fl3.gsh\r", 14) {
+        Some(r) => check!(r.contains("r-2") && r.contains("r-4") && !r.contains("r-5") && !r.contains("r-1"), "gsh: for i in range A B"),
+        None => { println!("files-test: FAIL - gsh for-range-ab timeout"); fail += 1; }
+    }
+    // unbounded loop + break, with a mutable slot counter (in place - no arena growth).
+    let _ = run!(b"write /fl4.gsh let mut i = 0 ; loop { i = $i + 1 ; if $i > 3 { break } ; echo L-$i }\r", 10);
+    match run!(b"run /fl4.gsh\r", 14) {
+        Some(r) => check!(r.contains("L-1") && r.contains("L-3") && !r.contains("L-4"), "gsh: loop + break (slot counter)"),
+        None => { println!("files-test: FAIL - gsh loop-break timeout"); fail += 1; }
+    }
+    // continue skips the rest of the body.
+    let _ = run!(b"write /fl5.gsh for i in range 4 { if $i == 1 { continue } ; echo c-$i }\r", 10);
+    match run!(b"run /fl5.gsh\r", 14) {
+        Some(r) => check!(r.contains("c-0") && r.contains("c-2") && r.contains("c-3") && !r.contains("c-1"), "gsh: continue skips the rest of the body"),
+        None => { println!("files-test: FAIL - gsh continue timeout"); fail += 1; }
+    }
+    // Reassign a mutable var to a 24-byte value 200x (~4.8 KiB cumulative): the fixed slot holds, but
+    // the old bump-append would overflow the 4 KiB arena partway - so reaching -199 proves the slot fix.
+    let _ = run!(b"write /fl6.gsh let mut n = z ; for i in range 200 { n = 12345678901234567890-$i } ; echo done-$n\r", 10);
+    match run!(b"run /fl6.gsh\r", 25) {
+        Some(r) => check!(r.contains("-199") && !r.contains("storage full"), "gsh: 200 long mutable reassignments (fixed slot, no arena blowup)"),
+        None => { println!("files-test: FAIL - gsh slot-stress timeout"); fail += 1; }
+    }
+
     // ── assert: the verifying command. Content form (the pipe sink) is tested interactively -
     //    a `|` can't yet be authored into a script via `write` (the shell pipes the write line).
     match run!(b"roster | where role=core | assert contains Matthew\r", 16) {

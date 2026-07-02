@@ -17,8 +17,13 @@
 > deferred follow-ons. **Libraries** are BUILT too: `import <path>` (all functions) and
 > `from <path> import <name> [as <alias>] …` (selective, aliased) - resolved at LOAD time (each lib is
 > minified + its requested functions appended to the buffer so the pre-scan indexes them), explicit
-> paths, flat namespace, loud on a name collision (`as` resolves it). The rest of Tier 2 (`for`/`loop`,
-> `defer`, record aggregators - §11) remains design-only. Scripts use the `.gsh` extension
+> paths, flat namespace, loud on a name collision (`as` resolves it). **Loops** are BUILT too (§5):
+> `for <var> in <words | range N | range A B | $@> { … }`, unbounded `loop { … }` (100k-iteration
+> backstop), and `break`/`continue`; a mutable loop counter lives in a fixed slot (overwritten in
+> place - no arena growth over a long loop), and each pass resets the body's locals so a `let` inside
+> is fresh. The stream/record forms (`for line in (producer)`) are a deferred follow-on (they need the
+> same output-capture as `$(fn)`). The rest of Tier 2 (`defer`, record aggregators - §11) remains
+> design-only. Scripts use the `.gsh` extension
 > (GodspeedOS shell; `.gs` is reserved for the future general-purpose Godspeed language). Builds on
 > the `run`/`run_lines` interpreter and the command **Result** model (`execute` returns `Ok`/`Err`).
 > Not POSIX - see CLAUDE.md Appendix B.3 / D.
