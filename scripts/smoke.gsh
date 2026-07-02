@@ -9,6 +9,10 @@ write /sm/f.txt data
 read /sm/f.txt | assert contains data
 ls /sm | where type=file | assert contains f.txt
 greet | count | assert contains 3 lines
+# $( ) capture stages a pipeline through a file (a direct pipeline capture would overflow the stack):
+greet | count | write /sm/c.txt
+let cnt = $(read /sm/c.txt)
+echo cnt-is:$cnt | assert contains 3 lines
 roster | where role=core | assert contains Matthew
 assert fails read /sm/nope
 assert fails-with FileNotFound read /sm/nope

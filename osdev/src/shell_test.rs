@@ -1915,6 +1915,41 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None => { println!("files-test: FAIL - gsh arith path timeout"); fail += 1; }
     }
 
+    // ── gsh Slice 5 (Tier 2): $( ) command capture as a value (docs/scripting.md §3).
+    // capture a producer builtin's output.
+    let _ = run!(b"write /c1.gsh let x = $(echo hello) ; echo cap=$x\r", 10);
+    match run!(b"run /c1.gsh\r", 14) {
+        Some(r) => check!(r.contains("cap=hello"), "gsh: $(cmd) captures a builtin's output"),
+        None => { println!("files-test: FAIL - gsh capture builtin timeout"); fail += 1; }
+    }
+    // capture date (non-empty, real).
+    let _ = run!(b"write /c2.gsh let d = $(date) ; echo when:$d\r", 10);
+    match run!(b"run /c2.gsh\r", 14) {
+        Some(r) => check!(r.contains("when:") && r.contains("2026"), "gsh: $(date) captures the date stamp"),
+        None => { println!("files-test: FAIL - gsh capture date timeout"); fail += 1; }
+    }
+    // capture $(read <file>) - a bare producer, and the file-staging idiom for a pipeline (run the
+    // pipeline to a file, then capture the file). A `$(greet | count)` PIPELINE capture is refused
+    // loudly (bounded stack); it can't be authored inline (the `|` in the write line is intercepted),
+    // so the file-staging path is exercised in the baked scripts/smoke.gsh (osdev test script).
+    let _ = run!(b"write /c3.gsh write /rr.txt captured-content ; let z = $(read /rr.txt) ; echo z=$z\r", 10);
+    match run!(b"run /c3.gsh\r", 16) {
+        Some(r) => check!(r.contains("z=captured-content"), "gsh: $(read <file>) captures file content"),
+        None => { println!("files-test: FAIL - gsh capture read timeout"); fail += 1; }
+    }
+    // capture into a reassignment.
+    let _ = run!(b"write /c4.gsh let mut x = a ; x = $(echo zed) ; echo x=$x\r", 10);
+    match run!(b"run /c4.gsh\r", 14) {
+        Some(r) => check!(r.contains("x=zed"), "gsh: $(cmd) captures into a reassignment"),
+        None => { println!("files-test: FAIL - gsh capture reassign timeout"); fail += 1; }
+    }
+    // a bare non-producer is refused loudly (pipe it instead).
+    let _ = run!(b"write /c5.gsh let x = $(status)\r", 10);
+    match run!(b"run /c5.gsh\r", 14) {
+        Some(r) => check!(r.contains("cannot capture") && r.contains("run: ran 1, failed 1"), "gsh: $(bare-non-producer) refused loudly"),
+        None => { println!("files-test: FAIL - gsh capture refuse timeout"); fail += 1; }
+    }
+
     // ── assert: the verifying command. Content form (the pipe sink) is tested interactively -
     //    a `|` can't yet be authored into a script via `write` (the shell pipes the write line).
     match run!(b"roster | where role=core | assert contains Matthew\r", 16) {

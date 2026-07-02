@@ -6,9 +6,13 @@
 > `switch` with multiple values per arm + `_` default, including `switch result` (§6). Pinned by
 > `osdev test files` (a greet-shape param+if+in+switch script runs end to end, both paths).
 > **Tier 2 in progress:** checked integer arithmetic (`+ - * / %`, `( )` grouping, precedence - §3)
-> is BUILT, in value position and comparison operands (pinned by `osdev test files`). The rest of
-> Tier 2 (`$( )` capture, `for`/`loop`, functions, `defer`, record aggregators - §11) remains
-> design-only. Scripts use the `.gsh` extension
+> and `$( )` command capture (§3) are BUILT. `$( )` captures a **bare producer** (`$(date)`,
+> `$(read /f)`, `$(greet)`); a **pipeline** capture (`$(greet | count)`) is refused loudly - its
+> nested pipe buffers would overflow the bounded 256 KiB user stack (§26.6) - and is staged through a
+> file instead (`greet | count | write /t.txt` then `let n = $(read /t.txt)`, the materialize-then-
+> capture idiom). Both pinned by `osdev test files` + the baked `osdev test script`. The rest of
+> Tier 2 (`for`/`loop`, functions, `defer`, record aggregators - §11) remains design-only. Scripts
+> use the `.gsh` extension
 > (GodspeedOS shell; `.gs` is reserved for the future general-purpose Godspeed language). Builds on
 > the `run`/`run_lines` interpreter and the command **Result** model (`execute` returns `Ok`/`Err`).
 > Not POSIX - see CLAUDE.md Appendix B.3 / D.

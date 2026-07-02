@@ -905,7 +905,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
     if s.contains('|') {
         // One unified pipeline: threads bytes or records, with from/to bridging the two worlds.
         // Returns the pipeline's Result - an `… | assert` sink sets it (else Ok / a stage error).
-        return pipe_run(ctx, cwd, s);
+        return pipe_run(ctx, cwd, s, &mut Out::Console);
     }
 
     let mut args = [""; MAX_ARGS];
@@ -1279,7 +1279,7 @@ impl ExpBuf {
 fn push_ref(ctx: &ServiceContext, b: &[u8], i: usize, vars: &Vars, params: &Params, out: &mut ExpBuf) -> Result<usize, ()> {
     let j = i + 1; // past '$'
     if j >= b.len() { ctx.console_writeln("gsh: lone '$'"); return Err(()); }
-    if b[j] == b'(' { ctx.console_writeln("gsh: $( ) command capture is not supported yet"); return Err(()); }
+    if b[j] == b'(' { ctx.console_writeln("gsh: $( ) capture works as a whole value (let x = $(cmd)), not embedded"); return Err(()); }
     match b[j] {
         b'@' => { for k in 0..params.argc { if k > 0 { out.push(b' '); } out.push_bytes(params.argv[k].as_bytes()); } return Ok(j + 1); }
         b'#' => { out.push_u32(params.argc as u32); return Ok(j + 1); }
@@ -1360,7 +1360,7 @@ fn valid_var_name(name: &str) -> bool {
 }
 
 /// `let [mut] <name> = <value>` - declare a binding.
-fn stmt_let(ctx: &ServiceContext, rest: &str, vars: &mut Vars, params: &Params) -> Result<(), ShellError> {
+fn stmt_let(ctx: &ServiceContext, cwd: &Cwd, rest: &str, vars: &mut Vars, params: &Params) -> Result<(), ShellError> {
     let (mutable, rest) = match rest.strip_prefix("mut ") { Some(r) => (true, r.trim_start()), None => (false, rest) };
     let (name, after) = split_first(rest);
     let after = after.trim_start();
@@ -1369,6 +1369,10 @@ fn stmt_let(ctx: &ServiceContext, rest: &str, vars: &mut Vars, params: &Params) 
         None => { ctx.console_writeln("gsh: let: expected '=' (let [mut] <name> = <value>)"); return Err(ShellError::Unknown); }
     };
     if !valid_var_name(name) { ctx.console_writeln_fmt(format_args!("gsh: invalid variable name '{}'", name)); return Err(ShellError::Unknown); }
+    // `let x = $( cmd )` - capture command output as the value.
+    if let Some(inner) = capture_form(value) {
+        return capture_define(ctx, cwd, name, inner, mutable, vars);
+    }
     let mut exp = ExpBuf::new();
     if expand_val(ctx, value, vars, params, &mut exp).is_err() { return Err(ShellError::Unknown); }
     match vars.define(name.as_bytes(), exp.as_bytes(), mutable) {
@@ -1378,7 +1382,11 @@ fn stmt_let(ctx: &ServiceContext, rest: &str, vars: &mut Vars, params: &Params) 
 }
 
 /// `<name> = <value>` - reassign a mutable binding.
-fn stmt_reassign(ctx: &ServiceContext, name: &str, value: &str, vars: &mut Vars, params: &Params) -> Result<(), ShellError> {
+fn stmt_reassign(ctx: &ServiceContext, cwd: &Cwd, name: &str, value: &str, vars: &mut Vars, params: &Params) -> Result<(), ShellError> {
+    // `x = $( cmd )` - capture command output as the new value.
+    if let Some(inner) = capture_form(value) {
+        return capture_reassign(ctx, cwd, name, inner, vars);
+    }
     let mut exp = ExpBuf::new();
     if expand_val(ctx, value, vars, params, &mut exp).is_err() { return Err(ShellError::Unknown); }
     match vars.reassign(name.as_bytes(), exp.as_bytes()) {
@@ -1406,12 +1414,12 @@ fn run_stmt(ctx: &ServiceContext, cwd: &mut Cwd, stmt: &str, prev: Result<(), Sh
     }
     // `let [mut] name = value`
     if head == "let" {
-        return StmtOutcome::Cont(stmt_let(ctx, rest, vars, params));
+        return StmtOutcome::Cont(stmt_let(ctx, cwd, rest, vars, params));
     }
     // reassignment: the second token is exactly `=` (the one disambiguation rule, docs/scripting.md §3).
     if rest == "=" || rest.starts_with("= ") {
         let value = rest[1..].trim_start();
-        return StmtOutcome::Cont(stmt_reassign(ctx, head, value, vars, params));
+        return StmtOutcome::Cont(stmt_reassign(ctx, cwd, head, value, vars, params));
     }
     // a plain command: `$`-expand, then run it exactly as the flat runner did.
     let mut exp = ExpBuf::new();
@@ -2998,7 +3006,7 @@ enum Stream {
 /// `execute` (which would carry that 64 KiB into every command's frame, and via a nested
 /// `run → execute` chain overflow the user stack).
 #[inline(never)]
-fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str) -> Result<(), ShellError> {
+fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str, out: &mut Out) -> Result<(), ShellError> {
     let mut stages = [""; MAX_STAGES];
     let mut n = 0usize;
     for part in line.split('|') {
@@ -3091,10 +3099,10 @@ fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str) -> Result<(), ShellErro
         }
         if !pipe_transform(ctx, stages[i], cmd, &mut s) { return Err(ShellError::Unknown); }
     }
-    // No sink - render the final stream to the console.
+    // No sink - render the final stream to `out` (the console, or a capture buffer for `$( )`).
     match &s {
-        Stream::Bytes(c) => console_write_chunked(ctx, c.bytes()),
-        Stream::Table(t) => { let mut o = Out::Console; t.to_grid(&mut OutSink { ctx, out: &mut o }); }
+        Stream::Bytes(c) => out.put_bytes(ctx, c.bytes()),
+        Stream::Table(t) => t.to_grid(&mut OutSink { ctx, out }),
     }
     Ok(())
 }
@@ -3741,6 +3749,83 @@ fn run_producer(ctx: &ServiceContext, cwd: &Cwd, cmdline: &str, out: &mut Out) {
         "date"         => { let _ = cmd_date(ctx, arg, out); }
         "help"         => help_to_out(ctx, out),
         _ => {}
+    }
+}
+
+/// Run `inner` (a command or pipeline) with its output written to `out` - the machinery behind
+/// `$( )` value capture (docs/scripting.md §3). A pipeline routes through `pipe_run` (whose final
+/// stream renders to `out`); a bare producer builtin captures directly. A bare producer SERVICE
+/// drains through a local `Cap` (no coexisting pipe buffer, so it fits). A non-producer bare command
+/// is refused loudly. `out` is a small (16 KiB `ReportBuf`-backed) sink so it does NOT stack up
+/// against `pipe_run`'s own 64 KiB buffers on the pipeline path - the nested-capture overflow trap
+/// ([[project-shell-stack-pipe]]). Returns true on success.
+fn run_captured(ctx: &ServiceContext, cwd: &Cwd, inner: &str, out: &mut Out) -> bool {
+    let inner = inner.trim();
+    if inner.is_empty() { ctx.console_writeln("gsh: $( ) needs a command"); return false; }
+    // A PIPELINE capture would stack its 128 KiB of pipe buffers on top of the interpreter's live
+    // frame and overflow the bounded 256 KiB user stack (the nested-capture trap,
+    // [[project-shell-stack-pipe]]). Refuse it loudly and point at the file-staging idiom: run the
+    // pipeline to a file, then capture the file with `$(read …)` (materialize, then capture).
+    if inner.contains('|') {
+        ctx.console_writeln("gsh: $( ) cannot capture a pipeline (bounded stack). Stage it: 'greet | count | write /t.txt' then 'let n = $(read /t.txt)'");
+        return false;
+    }
+    let (c0, _) = split_first(inner);
+    if is_producer_builtin(c0) {
+        run_producer(ctx, cwd, inner, out);
+        return true;
+    }
+    if is_pipe_producer_service(c0) {
+        // A bare producer service has no coexisting pipe_run Stream, so a 64 KiB drain Cap fits.
+        let mut cap = Cap::new();
+        if !drain_service(ctx, c0, None, &mut cap) { return false; }
+        out.put_bytes(ctx, cap.bytes());
+        return true;
+    }
+    ctx.console_writeln_fmt(format_args!(
+        "gsh: cannot capture '{}' with $( ) - pipe it (e.g. '{} | count') or use a producer", c0, c0));
+    false
+}
+
+/// If `v` is exactly a single `$( ... )` capture spanning the whole value, return the inner command.
+fn capture_form(v: &str) -> Option<&str> {
+    let v = v.trim();
+    let b = v.as_bytes();
+    if b.len() < 3 || b[0] != b'$' || b[1] != b'(' { return None; }
+    let mut depth = 0usize;
+    let mut i = 1usize;
+    while i < b.len() {
+        match b[i] { b'(' => depth += 1, b')' => { depth -= 1; if depth == 0 { break; } }, _ => {} }
+        i += 1;
+    }
+    // the matching ')' must be the last char - otherwise it is not a whole-value capture.
+    if depth == 0 && i == b.len() - 1 { Some(&v[2..i]) } else { None }
+}
+
+/// `let [mut] name = $( cmd )` - define a binding from captured command output (trailing whitespace
+/// trimmed). `#[inline(never)]`: the 16 KiB capture buffer lives ONLY here, off the common let path.
+/// A ReportBuf (16 KiB), not a Cap (64 KiB), so on the `$(pipe)` path it does not overflow the stack
+/// against pipe_run's own 64 KiB buffers. A value larger than the var arena is refused by `define`.
+#[inline(never)]
+fn capture_define(ctx: &ServiceContext, cwd: &Cwd, name: &str, inner: &str, mutable: bool, vars: &mut Vars) -> Result<(), ShellError> {
+    let mut rb = ReportBuf::new();
+    let ok = { let mut o = Out::File(&mut rb); run_captured(ctx, cwd, inner, &mut o) };
+    if !ok { return Err(ShellError::Unknown); }
+    match vars.define(name.as_bytes(), trim_bytes(rb.bytes()), mutable) {
+        Ok(()) => Ok(()),
+        Err(e) => { var_err_msg(ctx, name, e); Err(ShellError::Unknown) }
+    }
+}
+
+/// `name = $( cmd )` - reassign a mutable binding from captured command output.
+#[inline(never)]
+fn capture_reassign(ctx: &ServiceContext, cwd: &Cwd, name: &str, inner: &str, vars: &mut Vars) -> Result<(), ShellError> {
+    let mut rb = ReportBuf::new();
+    let ok = { let mut o = Out::File(&mut rb); run_captured(ctx, cwd, inner, &mut o) };
+    if !ok { return Err(ShellError::Unknown); }
+    match vars.reassign(name.as_bytes(), trim_bytes(rb.bytes())) {
+        Ok(()) => Ok(()),
+        Err(e) => { var_err_msg(ctx, name, e); Err(ShellError::Unknown) }
     }
 }
 
