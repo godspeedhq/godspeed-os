@@ -1204,10 +1204,18 @@ const VAR_NAME_MAX: usize = 24;
 const VAR_ARENA: usize = 4096;
 const PARAM_MAX: usize = 9;
 const EXP_MAX: usize = 1024;
+/// Max gsh function call depth (recursion bound). Each level is a scope frame in `Vars` + a `Call`
+/// block frame in the executor - explicit stacks, no native recursion (§9). Loud on overflow.
+const CALL_DEPTH_MAX: usize = 16;
 
 /// A gsh run's variable table: a fixed name array + a value bump-arena + one overflow flag (modeled
 /// on the record `Table`). Immutable by default; `let mut` opts into reassignment. Loud on a full
 /// table/arena, a redeclare, or an undeclared/immutable reassign - never silent (§26.7).
+///
+/// SCOPING (§7): a function call opens a scope with `enter_scope` (records the current count/alen as
+/// the local base); its `let`s land above the base. A lookup inside a function sees its own locals
+/// [base..count) then the IMMUTABLE globals [0..scope_count[0]) - never mutable globals or a caller's
+/// locals (invariant 9, one layer up). `exit_scope` truncates back to the base, reclaiming the locals.
 struct Vars {
     names: [[u8; VAR_NAME_MAX]; VAR_MAX],
     name_len: [u8; VAR_MAX],
@@ -1217,6 +1225,10 @@ struct Vars {
     count: usize,
     arena: [u8; VAR_ARENA],
     alen: usize,
+    // Scope stack: scope_count[i]/scope_alen[i] = the table/arena base of the i-th open function.
+    scope_count: [usize; CALL_DEPTH_MAX],
+    scope_alen: [usize; CALL_DEPTH_MAX],
+    sp: usize, // 0 = global scope only
 }
 
 /// Why a variable operation failed (each maps to a loud console line).
@@ -1229,10 +1241,39 @@ impl Vars {
             names: [[0u8; VAR_NAME_MAX]; VAR_MAX], name_len: [0; VAR_MAX],
             val_off: [0; VAR_MAX], val_len: [0; VAR_MAX], mutable: [false; VAR_MAX],
             count: 0, arena: [0u8; VAR_ARENA], alen: 0,
+            scope_count: [0; CALL_DEPTH_MAX], scope_alen: [0; CALL_DEPTH_MAX], sp: 0,
         }
     }
+    fn name_eq(&self, i: usize, name: &[u8]) -> bool {
+        &self.names[i][..self.name_len[i] as usize] == name
+    }
+    /// The current scope's local base (0 at global scope).
+    fn base(&self) -> usize { if self.sp > 0 { self.scope_count[self.sp - 1] } else { 0 } }
+    /// Open a function scope: `let`s from here live only until `exit_scope`. Loud on depth overflow.
+    fn enter_scope(&mut self) -> Result<(), VarErr> {
+        if self.sp >= CALL_DEPTH_MAX { return Err(VarErr::TableFull); }
+        self.scope_count[self.sp] = self.count;
+        self.scope_alen[self.sp] = self.alen;
+        self.sp += 1;
+        Ok(())
+    }
+    /// Close the current function scope, reclaiming its locals (table + arena) back to the base.
+    fn exit_scope(&mut self) {
+        if self.sp == 0 { return; }
+        self.sp -= 1;
+        self.count = self.scope_count[self.sp];
+        self.alen = self.scope_alen[self.sp];
+    }
+    /// Scope-aware lookup (§7): the current scope's locals (newest first), then only the IMMUTABLE
+    /// globals - never a mutable global or a caller's locals. At global scope this is just the table.
     fn lookup(&self, name: &[u8]) -> Option<usize> {
-        (0..self.count).find(|&i| &self.names[i][..self.name_len[i] as usize] == name)
+        let base = self.base();
+        for i in (base..self.count).rev() { if self.name_eq(i, name) { return Some(i); } }
+        if self.sp > 0 {
+            let gcount = self.scope_count[0];
+            for i in (0..gcount).rev() { if !self.mutable[i] && self.name_eq(i, name) { return Some(i); } }
+        }
+        None
     }
     fn value(&self, i: usize) -> &[u8] {
         let off = self.val_off[i] as usize;
@@ -1248,7 +1289,9 @@ impl Vars {
     }
     fn define(&mut self, name: &[u8], val: &[u8], mutable: bool) -> Result<(), VarErr> {
         if name.len() > VAR_NAME_MAX { return Err(VarErr::NameTooLong); }
-        if self.lookup(name).is_some() { return Err(VarErr::Redeclare); }
+        // Redeclare is scope-LOCAL: a function's local may shadow a global of the same name.
+        let base = self.base();
+        for i in base..self.count { if self.name_eq(i, name) { return Err(VarErr::Redeclare); } }
         if self.count >= VAR_MAX { return Err(VarErr::TableFull); }
         let (off, len) = self.intern(val).ok_or(VarErr::ArenaFull)?;
         let i = self.count;
@@ -1811,9 +1854,10 @@ fn skip_else_chain(b: &[u8], mut pos: usize) -> usize {
 }
 
 /// A block frame's kind. An `if`/`else` block closes by skipping its else-chain; a `switch` arm
-/// closes by jumping past the whole switch (it carries the switch's end position).
+/// closes by jumping past the whole switch (carrying its end); a function `Call` closes by returning
+/// to the caller (carrying the resume position) and dropping the call's scope.
 #[derive(Clone, Copy)]
-enum BlockKind { If, SwitchArm(usize) }
+enum BlockKind { If, SwitchArm(usize), Call(usize) }
 
 /// The result of processing an `if` or `switch` construct.
 enum Step { Enter(usize, BlockKind), Done(usize), Malformed(usize) }
@@ -1921,6 +1965,126 @@ fn read_statement(b: &[u8], start: usize) -> (&[u8], usize) {
     (trim_bytes(&b[start..i]), i)
 }
 
+// ── Functions (§7): `fn name params { body }`, called like a command, bounded recursion. ──
+
+const FN_MAX: usize = 24;
+
+/// Index of the `fn` definitions in a script (built by a one-pass pre-scan, so a call may precede its
+/// definition, §7). Stores only OFFSETS into the resident script buffer - tiny, no name copies.
+struct FnTable {
+    name_off: [u16; FN_MAX],
+    name_len: [u8; FN_MAX],
+    params_off: [u16; FN_MAX], // param-list span (after the name, up to the `{`)
+    params_end: [u16; FN_MAX],
+    body_start: [u16; FN_MAX], // just after the `{`
+    body_end: [u16; FN_MAX],   // at the matching `}`
+    count: usize,
+}
+impl FnTable {
+    fn new() -> Self {
+        FnTable { name_off: [0; FN_MAX], name_len: [0; FN_MAX], params_off: [0; FN_MAX],
+                  params_end: [0; FN_MAX], body_start: [0; FN_MAX], body_end: [0; FN_MAX], count: 0 }
+    }
+    fn lookup(&self, b: &[u8], name: &[u8]) -> Option<usize> {
+        (0..self.count).find(|&i| &b[self.name_off[i] as usize..self.name_off[i] as usize + self.name_len[i] as usize] == name)
+    }
+}
+
+/// One pass over the buffer, recording every top-level `fn name params { … }`. Skips over the bodies
+/// of `fn`/`if`/`switch` blocks so a `fn` nested in a block is not indexed (functions are top-level).
+fn prescan_fns(ctx: &ServiceContext, b: &[u8]) -> FnTable {
+    let mut t = FnTable::new();
+    let mut pos = 0usize;
+    while pos < b.len() {
+        pos = skip_seps(b, pos);
+        if pos >= b.len() { break; }
+        if b[pos] == b'}' { pos += 1; continue; }
+        if matches_kw(b, pos, b"fn") {
+            let ns = skip_ws(b, pos + 2);
+            let mut ne = ns;
+            while ne < b.len() && !b[ne].is_ascii_whitespace() && b[ne] != b'{' { ne += 1; }
+            let open = match find_open_brace(b, ne) { Some(o) => o, None => { ctx.console_writeln("gsh: fn: missing '{'"); break; } };
+            let end = match find_matching_brace(b, open) { Some(e) => e, None => { ctx.console_writeln("gsh: fn: unbalanced braces"); break; } };
+            if ne > ns && t.count < FN_MAX {
+                let i = t.count;
+                t.name_off[i] = ns as u16; t.name_len[i] = (ne - ns) as u8;
+                t.params_off[i] = ne as u16; t.params_end[i] = open as u16;
+                t.body_start[i] = (open + 1) as u16; t.body_end[i] = end as u16;
+                t.count += 1;
+            } else if t.count >= FN_MAX {
+                ctx.console_writeln_fmt(format_args!("gsh: too many functions (max {})", FN_MAX));
+            }
+            pos = end + 1;
+            continue;
+        }
+        // Not a fn - step over this statement, and if it opens a block, over the whole block.
+        let (_, next) = read_statement(b, pos);
+        if next < b.len() && b[next] == b'{' {
+            pos = find_matching_brace(b, next).map(|e| e + 1).unwrap_or(b.len());
+        } else {
+            pos = next;
+        }
+    }
+    t
+}
+
+/// Bind a function call's args to its params in a FRESH scope: expand each arg in the CALLER's scope,
+/// then `enter_scope` and define the params as immutable locals. Loud + `false` on a bad arg, too few
+/// args, or call-depth overflow (recursion bound). `#[inline(never)]` - the arg buffer stays off the
+/// executor's hot loop frame.
+#[inline(never)]
+fn dispatch_call(ctx: &ServiceContext, b: &[u8], stmt: &str, ft: &FnTable, fi: usize, vars: &mut Vars, params: &Params) -> bool {
+    // Expand the call's args (everything after the fn name), in the caller's scope, into argbuf.
+    let mut argbuf = [0u8; 512];
+    let mut aoff = [0u16; PARAM_MAX];
+    let mut alen = [0u16; PARAM_MAX];
+    let mut nargs = 0usize;
+    let (_name, rest) = split_first(stmt);
+    let rb = rest.as_bytes();
+    let mut i = 0usize;
+    let mut w = 0usize;
+    while i < rb.len() && nargs < PARAM_MAX {
+        while i < rb.len() && rb[i].is_ascii_whitespace() { i += 1; }
+        if i >= rb.len() { break; }
+        let (raw, end) = raw_token(rest, i);
+        i = end;
+        let mut eb = ExpBuf::new();
+        if expand_val(ctx, raw, vars, params, &mut eb).is_err() { return false; }
+        let bytes = eb.as_bytes();
+        if w + bytes.len() > argbuf.len() { ctx.console_writeln("gsh: call args too long"); return false; }
+        aoff[nargs] = w as u16;
+        argbuf[w..w + bytes.len()].copy_from_slice(bytes);
+        w += bytes.len();
+        alen[nargs] = bytes.len() as u16;
+        nargs += 1;
+    }
+    // Open the function scope, then bind params positionally.
+    if vars.enter_scope().is_err() { ctx.console_writeln("gsh: call depth too deep (unbounded recursion?)"); return false; }
+    let (ps, pe) = (ft.params_off[fi] as usize, ft.params_end[fi] as usize);
+    let mut pi = 0usize;
+    let mut j = ps;
+    while j < pe {
+        while j < pe && b[j].is_ascii_whitespace() { j += 1; }
+        if j >= pe { break; }
+        let s = j;
+        while j < pe && !b[j].is_ascii_whitespace() { j += 1; }
+        let pname = &b[s..j];
+        if pi >= nargs {
+            ctx.console_writeln_fmt(format_args!("gsh: missing argument for parameter '{}'", str_of(pname)));
+            vars.exit_scope();
+            return false;
+        }
+        let av = &argbuf[aoff[pi] as usize..aoff[pi] as usize + alen[pi] as usize];
+        if let Err(e) = vars.define(pname, av, false) {
+            var_err_msg(ctx, str_of(pname), e);
+            vars.exit_scope();
+            return false;
+        }
+        pi += 1;
+    }
+    true
+}
+
 /// Execute a script body (already in memory): split into commands, run each, then print a
 /// per-command PASS/FAIL summary and the `run: ran N, failed M` tally. Shared by `run` (file
 /// source) and `selfcheck` (the embedded suite, run straight from rodata - NOT written to disk,
@@ -1951,6 +2115,7 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
     let mut slng = [0u16; RUN_MAX_CMDS];
     let mut nrec = 0usize;
     let b = src;
+    let ft = prescan_fns(ctx, b); // index `fn` definitions so a call may precede its definition (§7)
     let sdepth = depth + 1; // statements/conditions run one level deeper (a nested `run` is refused)
     // Explicit position-based executor (no native recursion, §9): a flat cursor over the resident
     // buffer plus a `{`/`}` depth counter. `if` seeks over untaken blocks; a taken block's `}` skips
@@ -1967,11 +2132,12 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
         if pos >= b.len() { break; }
         // `}` closes the current block.
         if b[pos] == b'}' {
-            if sp == 0 { ctx.console_writeln("gsh: unexpected '}'"); last = Err(ShellError::Unknown); failed += 1; break; }
+            if sp == 0 { ctx.console_writeln("gsh: unexpected '}'"); failed += 1; break; }
             sp -= 1;
             pos = match frames[sp] {
                 BlockKind::If => skip_else_chain(b, pos + 1),
                 BlockKind::SwitchArm(end) => end + 1,
+                BlockKind::Call(ret) => { vars.exit_scope(); ret } // function body done: drop scope, resume
             };
             continue;
         }
@@ -1991,7 +2157,7 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
             };
             match step {
                 Step::Enter(body, kind) => {
-                    if sp >= IF_DEPTH_MAX { ctx.console_writeln("gsh: block nesting too deep"); last = Err(ShellError::Unknown); failed += 1; break; }
+                    if sp >= IF_DEPTH_MAX { ctx.console_writeln("gsh: block nesting too deep"); failed += 1; break; }
                     frames[sp] = kind; sp += 1;
                     pos = body;
                 }
@@ -2009,13 +2175,48 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
             last = Err(ShellError::Unknown); failed += 1;
             continue;
         }
-        // a simple statement (let / reassignment / fail / command).
+        // a `fn` DEFINITION - skip it inline (pre-scanned; runs only when called).
+        if matches_kw(b, pos, b"fn") {
+            pos = find_open_brace(b, pos).and_then(|o| find_matching_brace(b, o)).map(|e| e + 1).unwrap_or(b.len());
+            continue;
+        }
+        // a simple statement (let / reassignment / fail / return / a function call / a command).
         let (stmt, next) = read_statement(b, pos);
         if next <= pos { pos += 1; continue; } // defensive: never stall
         let stmt_off = stmt.as_ptr() as usize - b.as_ptr() as usize;
         pos = next;
         if stmt.is_empty() { continue; }
         let s = str_of(stmt);
+        let (head, hrest) = split_first(s);
+        // `return [cmd]` - end the current function early; its result is `cmd`'s (else the last result).
+        if head == "return" {
+            if !hrest.is_empty() {
+                let mut eb = ExpBuf::new();
+                last = if expand_cmd(ctx, hrest, &vars, params, &mut eb).is_ok() {
+                    execute(ctx, eb.as_bytes(), cwd, last, sdepth)
+                } else { Err(ShellError::Unknown) };
+            }
+            // Unwind to the nearest enclosing Call frame, discarding any if/switch frames inside it.
+            let mut found = false;
+            while sp > 0 {
+                sp -= 1;
+                if let BlockKind::Call(ret) = frames[sp] { vars.exit_scope(); pos = ret; found = true; break; }
+            }
+            if !found { ctx.console_writeln("gsh: 'return' outside a function"); }
+            continue;
+        }
+        // a FUNCTION CALL - the head names a defined function; run its body in a fresh scope.
+        if let Some(fi) = ft.lookup(b, head.as_bytes()) {
+            if sp >= IF_DEPTH_MAX { ctx.console_writeln("gsh: call/block nesting too deep"); failed += 1; break; }
+            if dispatch_call(ctx, b, s, &ft, fi, &mut vars, params) {
+                frames[sp] = BlockKind::Call(next); // resume after the call when the body returns
+                sp += 1;
+                pos = ft.body_start[fi] as usize;
+            } else {
+                last = Err(ShellError::Unknown);
+            }
+            continue;
+        }
         // Echo the statement so the transcript shows what produced each result.
         out.put(ctx, "> ");
         out.line(ctx, s);

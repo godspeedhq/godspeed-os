@@ -1950,6 +1950,43 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None => { println!("files-test: FAIL - gsh capture refuse timeout"); fail += 1; }
     }
 
+    // ── gsh Slice 6 (Tier 2): functions (docs/scripting.md §7). Called like a command, named params.
+    let _ = run!(b"write /fn1.gsh fn greet name { echo hi-$name } ; greet Ada\r", 10);
+    match run!(b"run /fn1.gsh\r", 14) {
+        Some(r) => check!(r.contains("hi-Ada"), "gsh: fn defined + called with a named param"),
+        None => { println!("files-test: FAIL - gsh fn call timeout"); fail += 1; }
+    }
+    // a call may precede its definition (the pre-scan indexes it).
+    let _ = run!(b"write /fn2.gsh doit ; fn doit { echo doit-ok }\r", 10);
+    match run!(b"run /fn2.gsh\r", 14) {
+        Some(r) => check!(r.contains("doit-ok"), "gsh: a call may precede the fn definition"),
+        None => { println!("files-test: FAIL - gsh fn prescan timeout"); fail += 1; }
+    }
+    // a function sees an IMMUTABLE global (scope = params + locals + immutable globals, §7).
+    let _ = run!(b"write /fn3.gsh let g = GLOB ; fn showg { echo saw-$g } ; showg\r", 10);
+    match run!(b"run /fn3.gsh\r", 14) {
+        Some(r) => check!(r.contains("saw-GLOB"), "gsh: fn reads an immutable global"),
+        None => { println!("files-test: FAIL - gsh fn global timeout"); fail += 1; }
+    }
+    // `return` ends the function early - the statement after it does not run.
+    let _ = run!(b"write /fn4.gsh fn early { echo AA ; return ; echo BB } ; early\r", 10);
+    match run!(b"run /fn4.gsh\r", 14) {
+        Some(r) => check!(r.contains("AA") && !r.contains("BB"), "gsh: return ends the function early"),
+        None => { println!("files-test: FAIL - gsh fn return timeout"); fail += 1; }
+    }
+    // recursion (bounded, no native recursion): each frame has its own scope + arithmetic.
+    let _ = run!(b"write /fn5.gsh fn rec n { if $n > 0 { let m = $n - 1 ; rec $m } else { echo bottom-$n } } ; rec 3\r", 12);
+    match run!(b"run /fn5.gsh\r", 16) {
+        Some(r) => check!(r.contains("bottom-0"), "gsh: recursion (scoped params + arithmetic, explicit frames)"),
+        None => { println!("files-test: FAIL - gsh fn recursion timeout"); fail += 1; }
+    }
+    // a missing argument is loud.
+    let _ = run!(b"write /fn6.gsh fn need x { echo have-$x } ; need\r", 10);
+    match run!(b"run /fn6.gsh\r", 14) {
+        Some(r) => check!(r.contains("missing argument"), "gsh: a missing function argument is loud"),
+        None => { println!("files-test: FAIL - gsh fn missing-arg timeout"); fail += 1; }
+    }
+
     // ── assert: the verifying command. Content form (the pipe sink) is tested interactively -
     //    a `|` can't yet be authored into a script via `write` (the shell pipes the write line).
     match run!(b"roster | where role=core | assert contains Matthew\r", 16) {

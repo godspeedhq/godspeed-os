@@ -10,9 +10,12 @@
 > `$(read /f)`, `$(greet)`); a **pipeline** capture (`$(greet | count)`) is refused loudly - its
 > nested pipe buffers would overflow the bounded 256 KiB user stack (§26.6) - and is staged through a
 > file instead (`greet | count | write /t.txt` then `let n = $(read /t.txt)`, the materialize-then-
-> capture idiom). Both pinned by `osdev test files` + the baked `osdev test script`. The rest of
-> Tier 2 (`for`/`loop`, functions, `defer`, record aggregators - §11) remains design-only. Scripts
-> use the `.gsh` extension
+> capture idiom). Both pinned by `osdev test files` + the baked `osdev test script`. **Functions**
+> are BUILT (§7): `fn name params { … }` called like a command, named params, scoped locals +
+> immutable-global access, `return`, and bounded recursion via explicit call frames (no native
+> recursion, §9); function output-capture `$(fn …)` and function-valued conditions (`if fn { }`) are
+> deferred follow-ons. The rest of Tier 2 (`for`/`loop`, `defer`, record aggregators, and library
+> `import` layered on functions - §11) remains design-only. Scripts use the `.gsh` extension
 > (GodspeedOS shell; `.gs` is reserved for the future general-purpose Godspeed language). Builds on
 > the `run`/`run_lines` interpreter and the command **Result** model (`execute` returns `Ok`/`Err`).
 > Not POSIX - see CLAUDE.md Appendix B.3 / D.
