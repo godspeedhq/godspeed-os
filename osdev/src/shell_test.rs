@@ -1863,6 +1863,58 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None => { println!("files-test: FAIL - gsh greet-fail timeout"); fail += 1; }
     }
 
+    // ── gsh Slice 4 (Tier 2): integer arithmetic in value position (docs/scripting.md §3).
+    let _ = run!(b"write /a1.gsh let x = 2 + 3 * 4 ; echo x=$x\r", 10);
+    match run!(b"run /a1.gsh\r", 14) {
+        Some(r) => check!(r.contains("x=14"), "gsh: arithmetic precedence (* before +)"),
+        None => { println!("files-test: FAIL - gsh arith prec timeout"); fail += 1; }
+    }
+    let _ = run!(b"write /a2.gsh let x = ( 2 + 3 ) * 4 ; echo x=$x\r", 10);
+    match run!(b"run /a2.gsh\r", 14) {
+        Some(r) => check!(r.contains("x=20"), "gsh: arithmetic parentheses group"),
+        None => { println!("files-test: FAIL - gsh arith paren timeout"); fail += 1; }
+    }
+    let _ = run!(b"write /a3.gsh let a = 5 ; let b = 3 ; let s = $a + $b ; echo s=$s\r", 10);
+    match run!(b"run /a3.gsh\r", 14) {
+        Some(r) => check!(r.contains("s=8"), "gsh: arithmetic over $vars"),
+        None => { println!("files-test: FAIL - gsh arith vars timeout"); fail += 1; }
+    }
+    let _ = run!(b"write /a4.gsh let q = 17 / 5 ; let r = 17 % 5 ; echo $q-$r\r", 10);
+    match run!(b"run /a4.gsh\r", 14) {
+        Some(r) => check!(r.contains("3-2"), "gsh: integer division and modulo"),
+        None => { println!("files-test: FAIL - gsh arith divmod timeout"); fail += 1; }
+    }
+    // the loop idiom: reassign a mutable via arithmetic.
+    let _ = run!(b"write /a5.gsh let mut i = 0 ; i = $i + 1 ; i = $i + 1 ; echo i=$i\r", 10);
+    match run!(b"run /a5.gsh\r", 14) {
+        Some(r) => check!(r.contains("i=2"), "gsh: reassign a mutable via arithmetic (i = $i + 1)"),
+        None => { println!("files-test: FAIL - gsh arith reassign timeout"); fail += 1; }
+    }
+    // divide by zero is loud.
+    let _ = run!(b"write /a6.gsh let x = 5 / 0\r", 10);
+    match run!(b"run /a6.gsh\r", 14) {
+        Some(r) => check!(r.contains("divide by zero") && r.contains("run: ran 1, failed 1"), "gsh: divide by zero is loud"),
+        None => { println!("files-test: FAIL - gsh arith div0 timeout"); fail += 1; }
+    }
+    // a non-integer operand is loud.
+    let _ = run!(b"write /a7.gsh let n = abc ; let x = $n + 1\r", 10);
+    match run!(b"run /a7.gsh\r", 14) {
+        Some(r) => check!(r.contains("not an integer") && r.contains("failed 1"), "gsh: non-integer arithmetic operand is loud"),
+        None => { println!("files-test: FAIL - gsh arith nonint timeout"); fail += 1; }
+    }
+    // arithmetic on the left of a comparison.
+    let _ = run!(b"write /a8.gsh let i = 4 ; if $i + 1 >= 5 { echo reached }\r", 10);
+    match run!(b"run /a8.gsh\r", 14) {
+        Some(r) => check!(r.contains("reached"), "gsh: arithmetic in a comparison condition"),
+        None => { println!("files-test: FAIL - gsh arith cond timeout"); fail += 1; }
+    }
+    // a path with `/` and no spaces is NOT arithmetic (the space rule keeps paths and math distinct).
+    let _ = run!(b"write /a9.gsh let d = /work ; echo $d/logs\r", 10);
+    match run!(b"run /a9.gsh\r", 14) {
+        Some(r) => check!(r.contains("/work/logs"), "gsh: `$dir/sub` is a path, not division (space rule)"),
+        None => { println!("files-test: FAIL - gsh arith path timeout"); fail += 1; }
+    }
+
     // ── assert: the verifying command. Content form (the pipe sink) is tested interactively -
     //    a `|` can't yet be authored into a script via `write` (the shell pipes the write line).
     match run!(b"roster | where role=core | assert contains Matthew\r", 16) {

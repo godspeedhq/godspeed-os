@@ -4,9 +4,11 @@
 > (`$name`, `"..."`) + params (`$1..$9`, `$@`, `$#`, `$0`), `fail` (§3, §8); `if`/`else if`/`else`
 > with comparisons (`== != < > <= >=`), `in`, `!`, and `result` as a comparable value (§4); and
 > `switch` with multiple values per arm + `_` default, including `switch result` (§6). Pinned by
-> `osdev test files` (a greet-shape param+if+in+switch script runs end to end, both paths). Tier 2
-> (`$( )` capture, integer arithmetic, `for`/`loop`, functions, `defer`, record aggregators - §11)
-> remains design-only. Scripts use the `.gsh` extension
+> `osdev test files` (a greet-shape param+if+in+switch script runs end to end, both paths).
+> **Tier 2 in progress:** checked integer arithmetic (`+ - * / %`, `( )` grouping, precedence - §3)
+> is BUILT, in value position and comparison operands (pinned by `osdev test files`). The rest of
+> Tier 2 (`$( )` capture, `for`/`loop`, functions, `defer`, record aggregators - §11) remains
+> design-only. Scripts use the `.gsh` extension
 > (GodspeedOS shell; `.gs` is reserved for the future general-purpose Godspeed language). Builds on
 > the `run`/`run_lines` interpreter and the command **Result** model (`execute` returns `Ok`/`Err`).
 > Not POSIX - see CLAUDE.md Appendix B.3 / D.

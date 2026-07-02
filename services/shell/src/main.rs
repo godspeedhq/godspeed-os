@@ -1263,6 +1263,14 @@ impl ExpBuf {
         while n > 0 { tmp[k] = b'0' + (n % 10) as u8; n /= 10; k += 1; }
         while k > 0 { k -= 1; self.push(tmp[k]); }
     }
+    fn push_i64(&mut self, v: i64) {
+        if v < 0 { self.push(b'-'); }
+        let mut n = (v as i128).unsigned_abs(); // i128 abs is safe even for i64::MIN
+        if n == 0 { self.push(b'0'); return; }
+        let mut tmp = [0u8; 24]; let mut k = 0;
+        while n > 0 { tmp[k] = b'0' + (n % 10) as u8; n /= 10; k += 1; }
+        while k > 0 { k -= 1; self.push(tmp[k]); }
+    }
     fn as_bytes(&self) -> &[u8] { &self.buf[..self.len] }
 }
 
@@ -1332,6 +1340,9 @@ fn expand_val(ctx: &ServiceContext, s: &str, vars: &Vars, params: &Params, out: 
     } else if b.len() >= 2 && b[0] == b'"' && b[b.len() - 1] == b'"' {
         let inner = &b[1..b.len() - 1]; let mut i = 0;
         while i < inner.len() { if inner[i] == b'$' { i = push_ref(ctx, inner, i, vars, params, out)?; } else { out.push(inner[i]); i += 1; } }
+    } else if is_arith(s) {
+        // an integer arithmetic expression (value position, docs/scripting.md §3).
+        match eval_arith(ctx, s, vars, params) { Some(v) => out.push_i64(v), None => return Err(()) }
     } else {
         let mut i = 0;
         while i < b.len() { if b[i] == b'$' { i = push_ref(ctx, b, i, vars, params, out)?; } else { out.push(b[i]); i += 1; } }
@@ -1493,6 +1504,102 @@ fn membership(ctx: &ServiceContext, lhs: &[u8], words: &str, vars: &Vars, params
     false
 }
 
+/// True if `s` is an integer arithmetic expression: a whitespace-separated `+ - * / %` operator or a
+/// `(`/`)` grouping token appears. (A single operand, or `$dir/sub` with no spaces, is NOT arithmetic
+/// - the space rule keeps paths and math distinct, docs/scripting.md §3.)
+fn is_arith(s: &str) -> bool {
+    s.split_ascii_whitespace().any(|t| matches!(t, "+" | "-" | "*" | "/" | "%" | "(" | ")"))
+}
+
+fn arith_prec(op: u8) -> u8 { match op { b'*' | b'/' | b'%' => 2, b'+' | b'-' => 1, _ => 0 } }
+
+/// Apply a binary operator, checked. `None` on overflow or divide/modulo by zero (a loud error).
+fn arith_apply(a: i64, b: i64, op: u8) -> Option<i64> {
+    match op {
+        b'+' => a.checked_add(b),
+        b'-' => a.checked_sub(b),
+        b'*' => a.checked_mul(b),
+        b'/' => if b == 0 { None } else { a.checked_div(b) },
+        b'%' => if b == 0 { None } else { a.checked_rem(b) },
+        _ => None,
+    }
+}
+
+/// Resolve an operand token (an integer literal, or a `$var`/`$param` that expands to an integer) to
+/// an `i64`. A non-integer operand is a loud error (`None`).
+fn arith_operand(ctx: &ServiceContext, tok: &str, vars: &Vars, params: &Params) -> Option<i64> {
+    let bytes = if tok.as_bytes().first() == Some(&b'$') {
+        let mut eb = ExpBuf::new();
+        if expand_val(ctx, tok, vars, params, &mut eb).is_err() { return None; }
+        // parse from a copy (eb borrows can't outlive), so read into a small stack buffer
+        return match parse_i64(eb.as_bytes()) {
+            Some(v) => Some(v),
+            None => { ctx.console_writeln_fmt(format_args!("gsh: '{}' is not an integer", tok)); None }
+        };
+    } else {
+        tok.as_bytes()
+    };
+    match parse_i64(bytes) {
+        Some(v) => Some(v),
+        None => { ctx.console_writeln_fmt(format_args!("gsh: '{}' is not an integer", tok)); None }
+    }
+}
+
+/// Evaluate an integer arithmetic expression with `+ - * / %` and `( )` grouping (usual precedence,
+/// left-associative), checked. Shunting-yard over fixed operand/operator stacks - iterative, no
+/// native recursion (§9). Loud (`None`) on overflow, divide-by-zero, a non-integer operand, an
+/// unbalanced paren, or too-complex an expression.
+fn eval_arith(ctx: &ServiceContext, expr: &str, vars: &Vars, params: &Params) -> Option<i64> {
+    const AST: usize = 32;
+    let mut nums = [0i64; AST]; let mut ns = 0usize;
+    let mut ops = [0u8; AST]; let mut os = 0usize;
+    // pop one operator and apply it to the top two operands.
+    fn reduce(nums: &mut [i64], ns: &mut usize, op: u8, ctx: &ServiceContext) -> bool {
+        if *ns < 2 { ctx.console_writeln("gsh: malformed arithmetic"); return false; }
+        let b = nums[*ns - 1]; let a = nums[*ns - 2]; *ns -= 2;
+        match arith_apply(a, b, op) {
+            Some(v) => { nums[*ns] = v; *ns += 1; true }
+            None => { ctx.console_writeln("gsh: arithmetic overflow or divide by zero"); false }
+        }
+    }
+    for tok in expr.split_ascii_whitespace() {
+        let tb = tok.as_bytes();
+        if tok == "(" {
+            if os >= AST { ctx.console_writeln("gsh: expression too complex"); return None; }
+            ops[os] = b'('; os += 1;
+        } else if tok == ")" {
+            loop {
+                if os == 0 { ctx.console_writeln("gsh: unbalanced ')'"); return None; }
+                os -= 1;
+                let op = ops[os];
+                if op == b'(' { break; }
+                if !reduce(&mut nums, &mut ns, op, ctx) { return None; }
+            }
+        } else if tb.len() == 1 && matches!(tb[0], b'+' | b'-' | b'*' | b'/' | b'%') {
+            let op = tb[0];
+            while os > 0 && ops[os - 1] != b'(' && arith_prec(ops[os - 1]) >= arith_prec(op) {
+                os -= 1;
+                let o = ops[os];
+                if !reduce(&mut nums, &mut ns, o, ctx) { return None; }
+            }
+            if os >= AST { ctx.console_writeln("gsh: expression too complex"); return None; }
+            ops[os] = op; os += 1;
+        } else {
+            let v = arith_operand(ctx, tok, vars, params)?;
+            if ns >= AST { ctx.console_writeln("gsh: expression too long"); return None; }
+            nums[ns] = v; ns += 1;
+        }
+    }
+    while os > 0 {
+        os -= 1;
+        let op = ops[os];
+        if op == b'(' { ctx.console_writeln("gsh: unbalanced '('"); return None; }
+        if !reduce(&mut nums, &mut ns, op, ctx) { return None; }
+    }
+    if ns != 1 { ctx.console_writeln("gsh: malformed arithmetic"); return None; }
+    Some(nums[0])
+}
+
 /// Evaluate a condition to a bool. A condition is: `!<cond>` (negated), `<lhs> in <words...>`
 /// (membership), `<lhs> <op> <rhs>` (comparison; `result` compares by kind), or a command (true iff
 /// it returns `Ok`). A command condition does NOT update `result` - only real statements do.
@@ -1502,23 +1609,36 @@ fn eval_cond(ctx: &ServiceContext, cwd: &mut Cwd, cond: &str, vars: &Vars, param
     if let Some(rest) = cond.strip_prefix('!') {
         return !eval_cond(ctx, cwd, rest.trim(), vars, params, prev, depth);
     }
-    let (t0, e0) = raw_token(cond, 0);
-    let rest1 = &cond[e0..];
-    let (t1, e1) = raw_token(rest1, 0);
+    // Scan tokens for `in` (membership) or a comparison operator, so either side may be a multi-token
+    // arithmetic expression (`$i + 1 > $max`), not just a single token (docs/scripting.md §3-§4).
+    let cb = cond.as_bytes();
+    let mut i = 0usize;
+    let mut cmp: Option<(usize, usize, &str)> = None; // (op_start, op_end, op)
+    let mut inpos: Option<(usize, usize)> = None;      // (in_start, in_end)
+    while i < cb.len() {
+        while i < cb.len() && cb[i].is_ascii_whitespace() { i += 1; }
+        if i >= cb.len() { break; }
+        let start = i;
+        let (tok, end) = raw_token(cond, i);
+        if tok == "in" { inpos = Some((start, end)); break; }
+        if is_cmp_op(tok) { cmp = Some((start, end, tok)); break; }
+        i = end;
+    }
     // membership: `<lhs> in w1 w2 ...`
-    if t1 == "in" {
+    if let Some((s, e)) = inpos {
         let mut lb = ExpBuf::new();
-        if expand_val(ctx, t0, vars, params, &mut lb).is_err() { return false; }
-        return membership(ctx, lb.as_bytes(), rest1[e1..].trim_start(), vars, params);
+        if expand_val(ctx, cond[..s].trim(), vars, params, &mut lb).is_err() { return false; }
+        return membership(ctx, lb.as_bytes(), cond[e..].trim_start(), vars, params);
     }
     // comparison: `<lhs> <op> <rhs>`
-    if is_cmp_op(t1) {
-        let rhs = rest1[e1..].trim();
+    if let Some((s, e, op)) = cmp {
+        let lhs = cond[..s].trim();
+        let rhs = cond[e..].trim();
         // `result` compares by kind (Ok / Err / specific variant), with == / != only.
-        if t0 == "result" || rhs == "result" {
-            let tag = if t0 == "result" { rhs } else { t0 };
+        if lhs == "result" || rhs == "result" {
+            let tag = if lhs == "result" { rhs } else { lhs };
             return match result_matches(prev, tag.as_bytes()) {
-                Some(m) => match t1 {
+                Some(m) => match op {
                     "==" => m,
                     "!=" => !m,
                     _ => { ctx.console_writeln("gsh: result compares only with == / !="); false }
@@ -1528,9 +1648,9 @@ fn eval_cond(ctx: &ServiceContext, cwd: &mut Cwd, cond: &str, vars: &Vars, param
         }
         let mut lb = ExpBuf::new();
         let mut rb = ExpBuf::new();
-        if expand_val(ctx, t0, vars, params, &mut lb).is_err() { return false; }
+        if expand_val(ctx, lhs, vars, params, &mut lb).is_err() { return false; }
         if expand_val(ctx, rhs, vars, params, &mut rb).is_err() { return false; }
-        return match compare(lb.as_bytes(), rb.as_bytes(), t1) {
+        return match compare(lb.as_bytes(), rb.as_bytes(), op) {
             Some(x) => x,
             None => { ctx.console_writeln("gsh: bad comparison operator"); false }
         };
