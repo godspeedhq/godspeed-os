@@ -1066,7 +1066,13 @@ fn cmd_result(ctx: &ServiceContext, prev: Result<(), ShellError>) {
 }
 
 /// Largest script `run` will read (one `fs` file; the whole thing is buffered on the stack).
-const SCRIPT_MAX: usize = 4096;
+/// Largest whole-resident `.gsh` file `run` will load. Bumped from one fs message (~3.5 KiB) to
+/// 4 IO_CHUNKs (~14 KiB) - the most the bounded user stack allows while the script buffer coexists
+/// with the heaviest run path (a `run … save` whose script has a `| assert` pipe: script + 16 KiB
+/// report + a 64 KiB pipe stream + a 64 KiB assert cap). A larger script is truncated LOUDLY (a huge
+/// script is a program - the `.gsh` -> `.gs` line, §26.6.1 / docs/scripting.md §9). Multiple of
+/// IO_CHUNK so each streamed read lands on a chunk boundary.
+const SCRIPT_MAX: usize = 2 * IO_CHUNK; // 7112
 
 /// Trim leading/trailing ASCII whitespace from a byte slice (lines/commands in a script).
 fn trim_bytes(b: &[u8]) -> &[u8] {
@@ -1091,29 +1097,27 @@ fn trim_bytes(b: &[u8]) -> &[u8] {
 fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8, save: Option<&str>, params: &Params) -> Result<(), ShellError> {
     let mut pbuf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut pbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    // Read the whole script into a fixed buffer, then drop the fs reply before executing anything.
+    // Stream the script in IO_CHUNK pieces DIRECTLY into the resident buffer (no extra chunk buffer
+    // on the frame) until EOF or the buffer fills - so a script larger than one fs message loads
+    // whole, up to SCRIPT_MAX. EOF is a short read; a full buffer with a full final chunk means the
+    // file is larger than SCRIPT_MAX (truncated loudly, §26.6). Each fs reply is dropped inside
+    // fs_read_at before the next, so only `script` lives on the frame.
     let mut script = [0u8; SCRIPT_MAX];
-    let slen;
-    {
-        let reply = match fs_request(ctx, OP_READ_FILE, path, &[]) {
-            Some(r) => r,
-            None => { ctx.console_writeln("run: storage unavailable"); return Err(ShellError::Unknown); }
-        };
-        let p = reply.payload_bytes();
-        if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-        if !(p.first() == Some(&FS_OK) && p.len() >= 5) {
-            ctx.console_writeln_fmt(format_args!("run: not found: {}", str_of(path)));
-            return Err(ShellError::FileNotFound);
+    let mut slen = 0usize;
+    let mut last_n = 0usize;
+    while slen + IO_CHUNK <= SCRIPT_MAX {
+        match fs_read_at(ctx, path, slen as u64, &mut script[slen..slen + IO_CHUNK]) {
+            Some(0) => { last_n = 0; break; }
+            Some(n) => { slen += n; last_n = n; if n < IO_CHUNK { break; } }
+            None => break,
         }
-        let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
-        let end = (5 + n).min(p.len());
-        let body = &p[5..end];
-        let take = body.len().min(SCRIPT_MAX);
-        if take < body.len() {
-            ctx.console_writeln_fmt(format_args!("run: script truncated at {} bytes (max {})", take, SCRIPT_MAX));
-        }
-        script[..take].copy_from_slice(&body[..take]);
-        slen = take;
+    }
+    if slen == 0 {
+        ctx.console_writeln_fmt(format_args!("run: not found or unreadable: {}", str_of(path)));
+        return Err(ShellError::FileNotFound);
+    }
+    if slen == SCRIPT_MAX && last_n == IO_CHUNK {
+        ctx.console_writeln_fmt(format_args!("run: script larger than {} bytes - truncated (a huge script is a program)", SCRIPT_MAX));
     }
     run_with_optional_save(ctx, cwd, &script[..slen], depth, save, params)
 }
