@@ -1824,6 +1824,45 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None => { println!("files-test: FAIL - gsh nested timeout"); fail += 1; }
     }
 
+    // ── gsh Slice 3: switch (docs/scripting.md §6). No fallthrough; `_` default; multi-value arms.
+    let _ = run!(b"write /g3a.gsh let cmd = start ; switch $cmd { start { echo starting } stop { echo stopping } _ { echo unknownc } }\r", 10);
+    match run!(b"run /g3a.gsh\r", 16) {
+        Some(r) => check!(r.contains("starting") && !r.contains("stopping") && !r.contains("unknownc") && r.contains("run: ran 2, failed 0"),
+                          "gsh: switch runs the matching arm (others skipped, counted right)"),
+        None => { println!("files-test: FAIL - gsh switch timeout"); fail += 1; }
+    }
+    // multiple values per arm.
+    let _ = run!(b"write /g3b.gsh let r = courier ; switch $r { core { echo iscore } worker courier { echo helper } _ { echo otherr } }\r", 10);
+    match run!(b"run /g3b.gsh\r", 16) {
+        Some(r) => check!(r.contains("helper") && !r.contains("iscore") && !r.contains("otherr"), "gsh: switch multi-value arm matches"),
+        None => { println!("files-test: FAIL - gsh switch multi timeout"); fail += 1; }
+    }
+    // `_` default arm.
+    let _ = run!(b"write /g3c.gsh let x = zzz ; switch $x { a { echo isa } _ { echo fellthrough } }\r", 10);
+    match run!(b"run /g3c.gsh\r", 16) {
+        Some(r) => check!(r.contains("fellthrough") && !r.contains("isa"), "gsh: switch `_` default arm"),
+        None => { println!("files-test: FAIL - gsh switch default timeout"); fail += 1; }
+    }
+    // switch on `result`.
+    let _ = run!(b"write /g3d.gsh read /nope_xyz.txt ; switch result { Ok { echo wasok } FileNotFound { echo wasmissing } _ { echo otherr } }\r", 10);
+    match run!(b"run /g3d.gsh\r", 16) {
+        Some(r) => check!(r.contains("wasmissing") && !r.contains("wasok"), "gsh: `switch result` matches by result kind"),
+        None => { println!("files-test: FAIL - gsh switch result timeout"); fail += 1; }
+    }
+    // Tier 1 complete: a greet-shape script (param + if + in + switch + else/fail) runs end to end.
+    // Kept short so the `write` line fits the 128-char interactive input buffer (MAX_LINE).
+    let _ = run!(b"write /g.gsh let r = $1 ; if $r in a b { switch $r { a { echo gotA } b { echo gotB } } } else { fail nomatch }\r", 12);
+    match run!(b"run /g.gsh a\r", 16) {
+        Some(r) => check!(r.contains("gotA") && !r.contains("gotB") && r.contains("failed 0"),
+                          "gsh: Tier-1 greet-shape script (param+if+in+switch) runs"),
+        None => { println!("files-test: FAIL - gsh greet timeout"); fail += 1; }
+    }
+    // the same script's failure path: a non-member arg takes the else and fails loudly.
+    match run!(b"run /g.gsh z\r", 16) {
+        Some(r) => check!(r.contains("fail: nomatch"), "gsh: greet-shape script fails loudly on a bad arg"),
+        None => { println!("files-test: FAIL - gsh greet-fail timeout"); fail += 1; }
+    }
+
     // ── assert: the verifying command. Content form (the pipe sink) is tested interactively -
     //    a `|` can't yet be authored into a script via `write` (the shell pipes the write line).
     match run!(b"roster | where role=core | assert contains Matthew\r", 16) {

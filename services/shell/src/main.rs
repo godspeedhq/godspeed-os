@@ -1607,31 +1607,85 @@ fn skip_else_chain(b: &[u8], mut pos: usize) -> usize {
     }
 }
 
-/// The result of processing an `if` construct.
-enum IfStep { Enter(usize), Done(usize), Malformed(usize) }
+/// A block frame's kind. An `if`/`else` block closes by skipping its else-chain; a `switch` arm
+/// closes by jumping past the whole switch (it carries the switch's end position).
+#[derive(Clone, Copy)]
+enum BlockKind { If, SwitchArm(usize) }
+
+/// The result of processing an `if` or `switch` construct.
+enum Step { Enter(usize, BlockKind), Done(usize), Malformed(usize) }
 
 /// Handle an `if`/`else if`/`else` chain starting just after the `if` keyword (at `pos`). Evaluates
-/// each condition in turn: on the first true one, returns `Enter(body)` (the executor runs that
+/// each condition in turn: on the first true one, returns `Enter(body, If)` (the executor runs that
 /// block, then its `}` skips the rest of the chain); if none is true, takes a trailing `else` if
 /// present, else returns `Done(next)`.
-fn handle_if(b: &[u8], mut pos: usize, ctx: &ServiceContext, cwd: &mut Cwd, vars: &Vars, params: &Params, prev: Result<(), ShellError>, depth: u8) -> IfStep {
+fn handle_if(b: &[u8], mut pos: usize, ctx: &ServiceContext, cwd: &mut Cwd, vars: &Vars, params: &Params, prev: Result<(), ShellError>, depth: u8) -> Step {
     loop {
-        let open = match find_open_brace(b, pos) { Some(o) => o, None => { ctx.console_writeln("gsh: if: missing '{'"); return IfStep::Malformed(b.len()); } };
-        let end = match find_matching_brace(b, open) { Some(e) => e, None => { ctx.console_writeln("gsh: if: unbalanced braces"); return IfStep::Malformed(b.len()); } };
+        let open = match find_open_brace(b, pos) { Some(o) => o, None => { ctx.console_writeln("gsh: if: missing '{'"); return Step::Malformed(b.len()); } };
+        let end = match find_matching_brace(b, open) { Some(e) => e, None => { ctx.console_writeln("gsh: if: unbalanced braces"); return Step::Malformed(b.len()); } };
         let cond = str_of(trim_bytes(&b[pos..open]));
         if eval_cond(ctx, cwd, cond, vars, params, prev, depth) {
-            return IfStep::Enter(open + 1);
+            return Step::Enter(open + 1, BlockKind::If);
         }
         // false: skip this block; look for `else` / `else if`.
         pos = end + 1;
         let p = skip_ws(b, pos);
-        if !matches_kw(b, p, b"else") { return IfStep::Done(pos); }
+        if !matches_kw(b, p, b"else") { return Step::Done(pos); }
         let after_else = skip_ws(b, p + 4);
         if matches_kw(b, after_else, b"if") { pos = after_else + 2; continue; } // else if -> re-loop
         // plain `else` -> take it (no prior branch was true).
-        let eopen = match find_open_brace(b, after_else) { Some(o) => o, None => { ctx.console_writeln("gsh: else: missing '{'"); return IfStep::Malformed(b.len()); } };
-        return IfStep::Enter(eopen + 1);
+        let eopen = match find_open_brace(b, after_else) { Some(o) => o, None => { ctx.console_writeln("gsh: else: missing '{'"); return Step::Malformed(b.len()); } };
+        return Step::Enter(eopen + 1, BlockKind::If);
     }
+}
+
+/// True if the switch value matches any pattern word in `patterns`: `_` is the default (matches
+/// anything); a `switch result` matches result kinds; otherwise it is expanded-word equality.
+fn arm_matches(ctx: &ServiceContext, patterns: &str, is_result: bool, val: &[u8], prev: Result<(), ShellError>, vars: &Vars, params: &Params) -> bool {
+    let b = patterns.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        while i < b.len() && b[i].is_ascii_whitespace() { i += 1; }
+        if i >= b.len() { break; }
+        let (raw, end) = raw_token(patterns, i);
+        i = end;
+        if raw == "_" { return true; }
+        if is_result {
+            if result_matches(prev, raw.as_bytes()) == Some(true) { return true; }
+        } else {
+            let mut wb = ExpBuf::new();
+            if expand_val(ctx, raw, vars, params, &mut wb).is_ok() && wb.as_bytes() == val { return true; }
+        }
+    }
+    false
+}
+
+/// Handle `switch <val> { <pat...> { block } ... _ { block } }` starting just after the `switch`
+/// keyword (at `pos`). Matches the value against each arm's patterns; the first match's block is
+/// entered (its `}` then jumps past the whole switch). No fallthrough; `_` is the default; a
+/// `switch result` matches by result kind. No native recursion - arm scanning is brace-seeking.
+fn handle_switch(b: &[u8], pos: usize, ctx: &ServiceContext, vars: &Vars, params: &Params, prev: Result<(), ShellError>) -> Step {
+    let body_open = match find_open_brace(b, pos) { Some(o) => o, None => { ctx.console_writeln("gsh: switch: missing '{'"); return Step::Malformed(b.len()); } };
+    let switch_end = match find_matching_brace(b, body_open) { Some(e) => e, None => { ctx.console_writeln("gsh: switch: unbalanced braces"); return Step::Malformed(b.len()); } };
+    let val_src = str_of(trim_bytes(&b[pos..body_open]));
+    let is_result = val_src == "result";
+    let mut valbuf = ExpBuf::new();
+    if !is_result && expand_val(ctx, val_src, vars, params, &mut valbuf).is_err() {
+        return Step::Malformed(switch_end + 1);
+    }
+    let mut ap = body_open + 1;
+    while ap < switch_end {
+        ap = skip_seps(b, ap);
+        if ap >= switch_end { break; }
+        let arm_open = match find_open_brace(b, ap) { Some(o) if o < switch_end => o, _ => { ctx.console_writeln("gsh: switch: arm missing '{'"); break; } };
+        let patterns = str_of(trim_bytes(&b[ap..arm_open]));
+        let arm_end = match find_matching_brace(b, arm_open) { Some(e) => e, None => return Step::Malformed(switch_end + 1) };
+        if arm_matches(ctx, patterns, is_result, valbuf.as_bytes(), prev, vars, params) {
+            return Step::Enter(arm_open + 1, BlockKind::SwitchArm(switch_end));
+        }
+        ap = arm_end + 1;
+    }
+    Step::Done(switch_end + 1) // no arm matched
 }
 
 /// Read a simple (non-block) statement starting at `start`: up to an unquoted `;`, newline, `{`,
@@ -1699,34 +1753,47 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
     // buffer plus a `{`/`}` depth counter. `if` seeks over untaken blocks; a taken block's `}` skips
     // the rest of its else-chain. Nesting is handled by brace-scanning, not by the native stack.
     let mut pos = 0usize;
-    let mut blockdepth = 0usize;
+    // Explicit block-frame stack (no native recursion, §9): each open `if`/`else` block or
+    // `switch`-arm block is a frame. On its `}` an if-block skips its else-chain; a switch-arm block
+    // jumps past the whole switch. Nesting is handled by this stack + brace-scanning, not the native
+    // stack.
+    let mut frames = [BlockKind::If; IF_DEPTH_MAX];
+    let mut sp = 0usize;
     loop {
         pos = skip_seps(b, pos);
         if pos >= b.len() { break; }
-        // `}` closes the current (taken) if/else block; skip any trailing else-chain.
+        // `}` closes the current block.
         if b[pos] == b'}' {
-            if blockdepth == 0 { ctx.console_writeln("gsh: unexpected '}'"); last = Err(ShellError::Unknown); failed += 1; break; }
-            blockdepth -= 1;
-            pos = skip_else_chain(b, pos + 1);
+            if sp == 0 { ctx.console_writeln("gsh: unexpected '}'"); last = Err(ShellError::Unknown); failed += 1; break; }
+            sp -= 1;
+            pos = match frames[sp] {
+                BlockKind::If => skip_else_chain(b, pos + 1),
+                BlockKind::SwitchArm(end) => end + 1,
+            };
             continue;
         }
-        // a stray `{` outside an `if`/`else` is malformed (a literal `{` in a command must be quoted).
+        // a stray `{` outside an `if`/`else`/`switch` is malformed (a literal `{` must be quoted).
         if b[pos] == b'{' {
             ctx.console_writeln("gsh: unexpected '{'");
             pos = find_matching_brace(b, pos).map(|e| e + 1).unwrap_or(b.len());
             last = Err(ShellError::Unknown); failed += 1;
             continue;
         }
-        // an `if` construct.
-        if matches_kw(b, pos, b"if") {
-            match handle_if(b, pos + 2, ctx, cwd, &vars, params, last, sdepth) {
-                IfStep::Enter(body) => {
-                    if blockdepth >= IF_DEPTH_MAX { ctx.console_writeln("gsh: block nesting too deep"); last = Err(ShellError::Unknown); failed += 1; break; }
-                    blockdepth += 1;
+        // an `if` or `switch` construct.
+        if matches_kw(b, pos, b"if") || matches_kw(b, pos, b"switch") {
+            let step = if matches_kw(b, pos, b"if") {
+                handle_if(b, pos + 2, ctx, cwd, &vars, params, last, sdepth)
+            } else {
+                handle_switch(b, pos + 6, ctx, &vars, params, last)
+            };
+            match step {
+                Step::Enter(body, kind) => {
+                    if sp >= IF_DEPTH_MAX { ctx.console_writeln("gsh: block nesting too deep"); last = Err(ShellError::Unknown); failed += 1; break; }
+                    frames[sp] = kind; sp += 1;
                     pos = body;
                 }
-                IfStep::Done(next) => { pos = next; }
-                IfStep::Malformed(next) => { last = Err(ShellError::Unknown); failed += 1; pos = next; }
+                Step::Done(next) => { pos = next; }
+                Step::Malformed(next) => { last = Err(ShellError::Unknown); failed += 1; pos = next; }
             }
             continue;
         }

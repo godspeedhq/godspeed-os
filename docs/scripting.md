@@ -1,10 +1,12 @@
 # gsh - the GodspeedOS shell language (design)
 
-> **Status:** Tier 1 in progress. **Slices 1-2 are BUILT** - Slice 1: `let`/`let mut` +
-> reassignment, `$`-expansion (`$name`, `"..."`) + params (`$1..$9`, `$@`, `$#`, `$0`), and `fail`
-> (§3, §8); Slice 2: `if`/`else if`/`else` with comparisons (`== != < > <= >=`), `in`, `!`, and
-> `result` as a comparable value (§4). Both pinned by `osdev test files`. The remainder of Tier 1
-> (`switch`, §6) and all of Tier 2 remain design-only. Scripts use the `.gsh` extension
+> **Status:** **Tier 1 is BUILT** (Slices 1-3): `let`/`let mut` + reassignment, `$`-expansion
+> (`$name`, `"..."`) + params (`$1..$9`, `$@`, `$#`, `$0`), `fail` (§3, §8); `if`/`else if`/`else`
+> with comparisons (`== != < > <= >=`), `in`, `!`, and `result` as a comparable value (§4); and
+> `switch` with multiple values per arm + `_` default, including `switch result` (§6). Pinned by
+> `osdev test files` (a greet-shape param+if+in+switch script runs end to end, both paths). Tier 2
+> (`$( )` capture, integer arithmetic, `for`/`loop`, functions, `defer`, record aggregators - §11)
+> remains design-only. Scripts use the `.gsh` extension
 > (GodspeedOS shell; `.gs` is reserved for the future general-purpose Godspeed language). Builds on
 > the `run`/`run_lines` interpreter and the command **Result** model (`execute` returns `Ok`/`Err`).
 > Not POSIX - see CLAUDE.md Appendix B.3 / D.
