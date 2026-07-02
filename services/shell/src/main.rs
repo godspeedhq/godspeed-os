@@ -1156,33 +1156,11 @@ fn compact_step(buf: &mut [u8], start: usize, dataend: usize, eof: bool) -> (usi
 fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8, save: Option<&str>, params: &Params) -> Result<(), ShellError> {
     let mut pbuf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut pbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    // Stream the script in, MINIFYING as we go: read a raw IO_CHUNK directly into the buffer, then
-    // compact_step strips its comments / blank lines / indentation IN PLACE. Because compaction frees
-    // space, a heavily-commented file whose real CODE fits SCRIPT_MAX loads whole even if its raw
-    // size is larger. `code` = finalized code; `hold` = the partial last line carried across a chunk
-    // boundary. No scratch buffer: each read lands after the held line and compacts left, in place.
+    // Stream + MINIFY the script into the buffer (comments / blank lines / indentation stripped as it
+    // loads, so a heavily-commented source loads whole even when its raw size exceeds SCRIPT_MAX),
+    // then resolve `import` / `from … import` at LOAD time (append the libs' functions in place).
     let mut script = [0u8; SCRIPT_MAX];
-    let mut code = 0usize;
-    let mut hold = 0usize;
-    let mut raw_off = 0u64;
-    let mut truncated = false;
-    loop {
-        let region = code + hold;
-        if region + IO_CHUNK > SCRIPT_MAX { truncated = true; break; } // no room for another chunk
-        let n = fs_read_at(ctx, path, raw_off, &mut script[region..region + IO_CHUNK]).unwrap_or(0);
-        raw_off += n as u64;
-        let eof = n < IO_CHUNK;
-        let (nc, nh) = compact_step(&mut script, code, code + hold + n, eof);
-        code = nc;
-        hold = nh;
-        if eof { break; }
-    }
-    // A truncation break leaves the last line held un-finalized; finalize it so no code is dropped
-    // mid-line (EOF already finalized it, leaving hold = 0).
-    if hold > 0 {
-        let (nc, _) = compact_step(&mut script, code, code + hold, true);
-        code = nc;
-    }
+    let (mut code, truncated) = stream_minify(ctx, path, &mut script);
     if code == 0 {
         ctx.console_writeln_fmt(format_args!("run: not found or empty: {}", str_of(path)));
         return Err(ShellError::FileNotFound);
@@ -1190,7 +1168,166 @@ fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8, save: Opti
     if truncated {
         ctx.console_writeln_fmt(format_args!("run: script CODE exceeds {} bytes - truncated (a huge script is a program)", SCRIPT_MAX));
     }
+    resolve_imports(ctx, &mut script, &mut code);
     run_with_optional_save(ctx, cwd, &script[..code], depth, save, params)
+}
+
+const IMPORT_MAX: usize = 16; // max names in one `from … import a b c …`
+
+/// Stream a file into `dst`, MINIFYING on the fly (`compact_step`): comments / blank lines /
+/// indentation stripped as it loads. Returns `(code_len, truncated)`. Used for both the main script
+/// and each imported lib; `dst` is a sub-slice of the resident buffer, so no second big buffer.
+fn stream_minify(ctx: &ServiceContext, path: &[u8], dst: &mut [u8]) -> (usize, bool) {
+    let cap = dst.len();
+    if cap < IO_CHUNK { return (0, true); } // no room even for one chunk
+    let mut code = 0usize;
+    let mut hold = 0usize;
+    let mut raw_off = 0u64;
+    let mut truncated = false;
+    loop {
+        let region = code + hold;
+        if region + IO_CHUNK > cap { truncated = true; break; }
+        let n = fs_read_at(ctx, path, raw_off, &mut dst[region..region + IO_CHUNK]).unwrap_or(0);
+        raw_off += n as u64;
+        let eof = n < IO_CHUNK;
+        let (nc, nh) = compact_step(dst, code, code + hold + n, eof);
+        code = nc;
+        hold = nh;
+        if eof { break; }
+    }
+    if hold > 0 { let (nc, _) = compact_step(dst, code, code + hold, true); code = nc; }
+    (code, truncated)
+}
+
+/// Reconstruct one function's definition as `fn <alias><params>{<body>}` into `scratch`, reading the
+/// original text from the loaded lib in `script` (offsets via `ft`). `alias` renames only the entry
+/// binding (the `import … as …` rename); params + body are copied verbatim (nested braces preserved).
+/// Returns the byte length, or 0 if it would not fit `scratch` (a function too large to import).
+fn build_fn_def(scratch: &mut [u8], alias: &[u8], script: &[u8], base: usize, ft: &FnTable, fi: usize) -> usize {
+    let mut w = 0usize;
+    let hdr = b"fn ";
+    let ps = base + ft.params_off[fi] as usize;
+    let pe = base + ft.params_end[fi] as usize;
+    let bs = base + ft.body_start[fi] as usize;
+    let be = base + ft.body_end[fi] as usize;
+    let total = hdr.len() + alias.len() + (pe - ps) + 1 + (be - bs) + 1;
+    if total > scratch.len() { return 0; }
+    scratch[w..w + hdr.len()].copy_from_slice(hdr); w += hdr.len();
+    scratch[w..w + alias.len()].copy_from_slice(alias); w += alias.len();
+    scratch[w..w + (pe - ps)].copy_from_slice(&script[ps..pe]); w += pe - ps;
+    scratch[w] = b'{'; w += 1;
+    scratch[w..w + (be - bs)].copy_from_slice(&script[bs..be]); w += be - bs;
+    scratch[w] = b'}'; w += 1;
+    w
+}
+
+/// Resolve ONE import statement (`stmt`, copied out of `script`): `import <path>` (all functions) or
+/// `from <path> import <name> [as <alias>] …` (selective). Loads the lib into the buffer tail, extracts
+/// the requested functions (renamed on `as`) after it, then moves them down to `*code` - so only the
+/// requested (renamed) functions remain, indexed by the run's pre-scan. Loud + no-op on any error.
+#[inline(never)]
+fn resolve_one_import(ctx: &ServiceContext, stmt: &[u8], is_from: bool, script: &mut [u8], code: &mut usize) {
+    let s = str_of(stmt);
+    let mut toks = [""; 40];
+    let mut nt = 0usize;
+    for t in s.split_ascii_whitespace() { if nt < toks.len() { toks[nt] = t; nt += 1; } }
+    if nt < 2 { ctx.console_writeln("import: missing path"); return; }
+    let mut path = [0u8; PATH_MAX];
+    let pb = toks[1].as_bytes();
+    let plen = pb.len().min(PATH_MAX);
+    path[..plen].copy_from_slice(&pb[..plen]);
+    // Selective specs: name [as alias] … (empty for the whole-lib `import <path>` form).
+    let mut names = [[0u8; VAR_NAME_MAX]; IMPORT_MAX];
+    let mut aliases = [[0u8; VAR_NAME_MAX]; IMPORT_MAX];
+    let mut nlen = [0u8; IMPORT_MAX];
+    let mut alen = [0u8; IMPORT_MAX];
+    let mut nreq = 0usize;
+    if is_from {
+        if nt < 4 || toks[2] != "import" { ctx.console_writeln("import: expected 'from <path> import <name> …'"); return; }
+        let mut i = 3;
+        while i < nt && nreq < IMPORT_MAX {
+            let name = toks[i]; i += 1;
+            let mut alias = name;
+            if i < nt && toks[i] == "as" {
+                if i + 1 >= nt { ctx.console_writeln("import: 'as' needs an alias"); return; }
+                alias = toks[i + 1]; i += 2;
+            }
+            let nb = name.as_bytes(); let nl = nb.len().min(VAR_NAME_MAX);
+            names[nreq][..nl].copy_from_slice(&nb[..nl]); nlen[nreq] = nl as u8;
+            let ab = alias.as_bytes(); let al = ab.len().min(VAR_NAME_MAX);
+            aliases[nreq][..al].copy_from_slice(&ab[..al]); alen[nreq] = al as u8;
+            nreq += 1;
+        }
+        if nreq == 0 { ctx.console_writeln("import: 'from <path> import' needs at least one name"); return; }
+    }
+    // Load the lib (minified) into the tail, pre-scan it, extract the wanted functions after it.
+    let libstart = *code;
+    let (liblen, _) = stream_minify(ctx, &path[..plen], &mut script[libstart..]);
+    if liblen == 0 { ctx.console_writeln_fmt(format_args!("import: cannot load '{}'", str_of(&path[..plen]))); return; }
+    let lib_ft = prescan_fns(ctx, &script[libstart..libstart + liblen]);
+    let extstart = libstart + liblen;
+    let mut w = extstart;
+    let mut scratch = [0u8; 512];
+    for fi in 0..lib_ft.count {
+        let no = libstart + lib_ft.name_off[fi] as usize;
+        let nl = lib_ft.name_len[fi] as usize;
+        // Is this function wanted, and under what (aliased) name? Copy the alias out of `script` first.
+        let mut abuf = [0u8; VAR_NAME_MAX];
+        let mut al = 0usize;
+        let want = if !is_from {
+            abuf[..nl].copy_from_slice(&script[no..no + nl]); al = nl; true
+        } else {
+            let mut hit = false;
+            for j in 0..nreq {
+                if names[j][..nlen[j] as usize] == script[no..no + nl] {
+                    al = alen[j] as usize;
+                    abuf[..al].copy_from_slice(&aliases[j][..al]);
+                    hit = true; break;
+                }
+            }
+            hit
+        };
+        if !want { continue; }
+        let dl = build_fn_def(&mut scratch, &abuf[..al], script, libstart, &lib_ft, fi);
+        if dl == 0 { ctx.console_writeln("import: a function is too large to import"); continue; }
+        if w + dl + 1 > script.len() { ctx.console_writeln("import: buffer full"); break; }
+        script[w..w + dl].copy_from_slice(&scratch[..dl]);
+        w += dl;
+        script[w] = b'\n'; w += 1;
+    }
+    // Move the extracted functions [extstart..w] down over the loaded lib scratch to [libstart..].
+    let extlen = w - extstart;
+    for k in 0..extlen { script[libstart + k] = script[extstart + k]; }
+    *code = libstart + extlen;
+}
+
+/// Load-time import resolution (§7 libraries): scan the main script for `import` / `from … import`
+/// statements and, for each, append the requested (optionally `as`-renamed) library functions to the
+/// buffer so the run's pre-scan indexes them. Explicit paths, flat namespace, loud on error. Runs
+/// BEFORE any pipe/report buffers exist, so the small parse scratch is well inside the stack.
+fn resolve_imports(ctx: &ServiceContext, script: &mut [u8], code: &mut usize) {
+    let scan_end = *code; // only the MAIN script is scanned (a lib importing a lib is not resolved)
+    let mut pos = 0usize;
+    while pos < scan_end {
+        pos = skip_seps(script, pos);
+        if pos >= scan_end { break; }
+        let is_import = matches_kw(script, pos, b"import");
+        let is_from = matches_kw(script, pos, b"from");
+        if !(is_import || is_from) {
+            let (_, next) = read_statement(script, pos);
+            pos = if next < scan_end && script[next] == b'{' {
+                find_matching_brace(script, next).map(|e| e + 1).unwrap_or(scan_end)
+            } else if next > pos { next } else { pos + 1 };
+            continue;
+        }
+        // Copy the import statement OUT of `script`, then mutate `script` to load its lib.
+        let (stmt, next) = read_statement(script, pos);
+        let mut sb = [0u8; 256];
+        let sl = stmt.len().min(sb.len());
+        sb[..sl].copy_from_slice(&stmt[..sl]);
+        pos = if next > pos { next } else { pos + 1 };
+        resolve_one_import(ctx, &sb[..sl], is_from, script, code);
+    }
 }
 
 // ───────────────────────── gsh interpreter (Slice 1: vars + expansion + params + fail) ─────────
@@ -2006,11 +2143,15 @@ fn prescan_fns(ctx: &ServiceContext, b: &[u8]) -> FnTable {
             let open = match find_open_brace(b, ne) { Some(o) => o, None => { ctx.console_writeln("gsh: fn: missing '{'"); break; } };
             let end = match find_matching_brace(b, open) { Some(e) => e, None => { ctx.console_writeln("gsh: fn: unbalanced braces"); break; } };
             if ne > ns && t.count < FN_MAX {
-                let i = t.count;
-                t.name_off[i] = ns as u16; t.name_len[i] = (ne - ns) as u8;
-                t.params_off[i] = ne as u16; t.params_end[i] = open as u16;
-                t.body_start[i] = (open + 1) as u16; t.body_end[i] = end as u16;
-                t.count += 1;
+                if t.lookup(b, &b[ns..ne]).is_some() {
+                    ctx.console_writeln_fmt(format_args!("gsh: function '{}' already defined (import it 'as' another name)", str_of(&b[ns..ne])));
+                } else {
+                    let i = t.count;
+                    t.name_off[i] = ns as u16; t.name_len[i] = (ne - ns) as u8;
+                    t.params_off[i] = ne as u16; t.params_end[i] = open as u16;
+                    t.body_start[i] = (open + 1) as u16; t.body_end[i] = end as u16;
+                    t.count += 1;
+                }
             } else if t.count >= FN_MAX {
                 ctx.console_writeln_fmt(format_args!("gsh: too many functions (max {})", FN_MAX));
             }
@@ -2173,6 +2314,12 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
             let cs = if matches_kw(b, after, b"if") { after + 2 } else { after };
             pos = find_open_brace(b, cs).and_then(|o| find_matching_brace(b, o)).map(|e| e + 1).unwrap_or(b.len());
             last = Err(ShellError::Unknown); failed += 1;
+            continue;
+        }
+        // `import` / `from … import` - resolved at LOAD time (resolve_imports); a no-op at runtime.
+        if matches_kw(b, pos, b"import") || matches_kw(b, pos, b"from") {
+            let (_, next) = read_statement(b, pos);
+            pos = if next > pos { next } else { pos + 1 };
             continue;
         }
         // a `fn` DEFINITION - skip it inline (pre-scanned; runs only when called).

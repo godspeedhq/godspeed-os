@@ -14,8 +14,11 @@
 > are BUILT (§7): `fn name params { … }` called like a command, named params, scoped locals +
 > immutable-global access, `return`, and bounded recursion via explicit call frames (no native
 > recursion, §9); function output-capture `$(fn …)` and function-valued conditions (`if fn { }`) are
-> deferred follow-ons. The rest of Tier 2 (`for`/`loop`, `defer`, record aggregators, and library
-> `import` layered on functions - §11) remains design-only. Scripts use the `.gsh` extension
+> deferred follow-ons. **Libraries** are BUILT too: `import <path>` (all functions) and
+> `from <path> import <name> [as <alias>] …` (selective, aliased) - resolved at LOAD time (each lib is
+> minified + its requested functions appended to the buffer so the pre-scan indexes them), explicit
+> paths, flat namespace, loud on a name collision (`as` resolves it). The rest of Tier 2 (`for`/`loop`,
+> `defer`, record aggregators - §11) remains design-only. Scripts use the `.gsh` extension
 > (GodspeedOS shell; `.gs` is reserved for the future general-purpose Godspeed language). Builds on
 > the `run`/`run_lines` interpreter and the command **Result** model (`execute` returns `Ok`/`Err`).
 > Not POSIX - see CLAUDE.md Appendix B.3 / D.

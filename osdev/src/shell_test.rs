@@ -1987,6 +1987,40 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None => { println!("files-test: FAIL - gsh fn missing-arg timeout"); fail += 1; }
     }
 
+    // ── gsh Slice 7 (Tier 2): libraries via `import` / `from … import … as …` (§7, load-time).
+    // A shared library on disk, then main scripts that import from it.
+    let _ = run!(b"write /liba.gsh fn hi { echo hi-lib } ; fn add2 n { echo got-$n }\r", 10);
+    // whole-lib import: every function becomes callable.
+    let _ = run!(b"write /mi1.gsh import /liba.gsh ; hi\r", 10);
+    match run!(b"run /mi1.gsh\r", 14) {
+        Some(r) => check!(r.contains("hi-lib"), "gsh: import <path> makes a lib function callable"),
+        None => { println!("files-test: FAIL - gsh import-all timeout"); fail += 1; }
+    }
+    // selective import + a param.
+    let _ = run!(b"write /mi2.gsh from /liba.gsh import add2 ; add2 Z\r", 10);
+    match run!(b"run /mi2.gsh\r", 14) {
+        Some(r) => check!(r.contains("got-Z"), "gsh: from <path> import <name> (selective) + param"),
+        None => { println!("files-test: FAIL - gsh import-selective timeout"); fail += 1; }
+    }
+    // aliased import (`as`) renames the binding.
+    let _ = run!(b"write /mi3.gsh from /liba.gsh import hi as greet ; greet\r", 10);
+    match run!(b"run /mi3.gsh\r", 14) {
+        Some(r) => check!(r.contains("hi-lib"), "gsh: from … import … as <alias> renames the binding"),
+        None => { println!("files-test: FAIL - gsh import-as timeout"); fail += 1; }
+    }
+    // a name collision is LOUD (first definition wins) - `as` is how you resolve it.
+    let _ = run!(b"write /mi4.gsh fn hi { echo main-hi } ; import /liba.gsh ; hi\r", 10);
+    match run!(b"run /mi4.gsh\r", 14) {
+        Some(r) => check!(r.contains("already defined") && r.contains("main-hi"), "gsh: an import name collision is loud"),
+        None => { println!("files-test: FAIL - gsh import-collision timeout"); fail += 1; }
+    }
+    // `as` resolves the collision: both names coexist, no loud clash.
+    let _ = run!(b"write /mi5.gsh fn hi { echo mine } ; from /liba.gsh import hi as libhi ; hi ; libhi\r", 12);
+    match run!(b"run /mi5.gsh\r", 16) {
+        Some(r) => check!(r.contains("mine") && r.contains("hi-lib") && !r.contains("already defined"), "gsh: `as` resolves a collision (both names coexist)"),
+        None => { println!("files-test: FAIL - gsh import-as-resolve timeout"); fail += 1; }
+    }
+
     // ── assert: the verifying command. Content form (the pipe sink) is tested interactively -
     //    a `|` can't yet be authored into a script via `write` (the shell pipes the write line).
     match run!(b"roster | where role=core | assert contains Matthew\r", 16) {
