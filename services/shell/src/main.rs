@@ -1066,12 +1066,13 @@ fn cmd_result(ctx: &ServiceContext, prev: Result<(), ShellError>) {
 }
 
 /// Largest script `run` will read (one `fs` file; the whole thing is buffered on the stack).
-/// Largest whole-resident `.gsh` file `run` will load. Bumped from one fs message (~3.5 KiB) to
-/// 4 IO_CHUNKs (~14 KiB) - the most the bounded user stack allows while the script buffer coexists
-/// with the heaviest run path (a `run … save` whose script has a `| assert` pipe: script + 16 KiB
-/// report + a 64 KiB pipe stream + a 64 KiB assert cap). A larger script is truncated LOUDLY (a huge
-/// script is a program - the `.gsh` -> `.gs` line, §26.6.1 / docs/scripting.md §9). Multiple of
-/// IO_CHUNK so each streamed read lands on a chunk boundary.
+/// Largest resident `.gsh` CODE `run` will hold. `cmd_run` streams the file in and MINIFIES it on
+/// load (comments / blank lines / indentation stripped, `compact_step`), so this bounds the *code*,
+/// not the raw file - a heavily-commented source can be much larger on disk and still fit. 2 IO_CHUNKs
+/// (~7 KiB) is the most the bounded user stack allows while this buffer coexists with the heaviest run
+/// path (a `run … save` whose script has a `| assert` pipe: buffer + 16 KiB report + a 64 KiB pipe
+/// stream + a 64 KiB assert cap; `4 x` was MEASURED to overflow it). Code past this truncates LOUDLY -
+/// a huge script is a program (the `.gsh` -> `.gs` line, §26.6.1 / docs/scripting.md §9).
 const SCRIPT_MAX: usize = 2 * IO_CHUNK; // 7112
 
 /// Trim leading/trailing ASCII whitespace from a byte slice (lines/commands in a script).
@@ -1081,6 +1082,64 @@ fn trim_bytes(b: &[u8]) -> &[u8] {
     while s < e && b[s].is_ascii_whitespace() { s += 1; }
     while e > s && b[e - 1].is_ascii_whitespace() { e -= 1; }
     &b[s..e]
+}
+
+/// The code span of a single line `buf[ls..le)`: strip a `#` comment (quote-aware: a `#` inside
+/// `'…'`/`"…"`, or one not preceded by whitespace like `a#b`, is literal) and trim leading/trailing
+/// whitespace. Returns `(code_start, code_end)`. INTERNAL whitespace is preserved - rest-of-line
+/// commands (`echo`, `write`) stay byte-faithful.
+fn compact_line(buf: &[u8], ls: usize, le: usize) -> (usize, usize) {
+    let mut quote: u8 = 0;
+    let mut ce = le;
+    let mut i = ls;
+    while i < le {
+        let c = buf[i];
+        if quote != 0 { if c == quote { quote = 0; } i += 1; continue; }
+        match c {
+            b'\'' | b'"' => quote = c,
+            b'#' if i == ls || buf[i - 1].is_ascii_whitespace() => { ce = i; break; }
+            _ => {}
+        }
+        i += 1;
+    }
+    let mut cs = ls;
+    while cs < ce && buf[cs].is_ascii_whitespace() { cs += 1; }
+    let mut e = ce;
+    while e > cs && buf[e - 1].is_ascii_whitespace() { e -= 1; }
+    (cs, e)
+}
+
+/// In-place streaming minifier step: compact the region `buf[start..dataend)` (a held partial line
+/// plus a freshly-read raw chunk) by finalizing every COMPLETE line (comment/blank/indent stripped)
+/// into `buf[start..]`, and - unless `eof` - leaving the trailing partial line moved up right after
+/// the finalized code as the new hold. Compaction only ever shrinks, so the write cursor stays behind
+/// the read cursor: purely in place, no scratch buffer (§26.6.1 - change the representation, not the
+/// memory). Returns `(finalized_end, hold_len)`.
+fn compact_step(buf: &mut [u8], start: usize, dataend: usize, eof: bool) -> (usize, usize) {
+    let mut w = start;
+    let mut ls = start;
+    while ls < dataend {
+        let mut le = ls;
+        while le < dataend && buf[le] != b'\n' { le += 1; }
+        let has_nl = le < dataend;
+        if !has_nl && !eof {
+            // trailing partial line - carry it forward as the new hold (moved up behind `w`).
+            let plen = dataend - ls;
+            if w != ls { for k in 0..plen { buf[w + k] = buf[ls + k]; } }
+            return (w, plen);
+        }
+        let (cs, e) = compact_line(buf, ls, le);
+        if e > cs {
+            let n = e - cs;
+            if w != cs { for k in 0..n { buf[w + k] = buf[cs + k]; } }
+            w += n;
+            buf[w] = b'\n';
+            w += 1;
+        }
+        if !has_nl { break; } // eof, last line had no newline
+        ls = le + 1;
+    }
+    (w, 0)
 }
 
 /// `run <path>` - execute a script file: each command is run exactly as if typed at the prompt.
@@ -1097,29 +1156,41 @@ fn trim_bytes(b: &[u8]) -> &[u8] {
 fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8, save: Option<&str>, params: &Params) -> Result<(), ShellError> {
     let mut pbuf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut pbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    // Stream the script in IO_CHUNK pieces DIRECTLY into the resident buffer (no extra chunk buffer
-    // on the frame) until EOF or the buffer fills - so a script larger than one fs message loads
-    // whole, up to SCRIPT_MAX. EOF is a short read; a full buffer with a full final chunk means the
-    // file is larger than SCRIPT_MAX (truncated loudly, §26.6). Each fs reply is dropped inside
-    // fs_read_at before the next, so only `script` lives on the frame.
+    // Stream the script in, MINIFYING as we go: read a raw IO_CHUNK directly into the buffer, then
+    // compact_step strips its comments / blank lines / indentation IN PLACE. Because compaction frees
+    // space, a heavily-commented file whose real CODE fits SCRIPT_MAX loads whole even if its raw
+    // size is larger. `code` = finalized code; `hold` = the partial last line carried across a chunk
+    // boundary. No scratch buffer: each read lands after the held line and compacts left, in place.
     let mut script = [0u8; SCRIPT_MAX];
-    let mut slen = 0usize;
-    let mut last_n = 0usize;
-    while slen + IO_CHUNK <= SCRIPT_MAX {
-        match fs_read_at(ctx, path, slen as u64, &mut script[slen..slen + IO_CHUNK]) {
-            Some(0) => { last_n = 0; break; }
-            Some(n) => { slen += n; last_n = n; if n < IO_CHUNK { break; } }
-            None => break,
-        }
+    let mut code = 0usize;
+    let mut hold = 0usize;
+    let mut raw_off = 0u64;
+    let mut truncated = false;
+    loop {
+        let region = code + hold;
+        if region + IO_CHUNK > SCRIPT_MAX { truncated = true; break; } // no room for another chunk
+        let n = fs_read_at(ctx, path, raw_off, &mut script[region..region + IO_CHUNK]).unwrap_or(0);
+        raw_off += n as u64;
+        let eof = n < IO_CHUNK;
+        let (nc, nh) = compact_step(&mut script, code, code + hold + n, eof);
+        code = nc;
+        hold = nh;
+        if eof { break; }
     }
-    if slen == 0 {
-        ctx.console_writeln_fmt(format_args!("run: not found or unreadable: {}", str_of(path)));
+    // A truncation break leaves the last line held un-finalized; finalize it so no code is dropped
+    // mid-line (EOF already finalized it, leaving hold = 0).
+    if hold > 0 {
+        let (nc, _) = compact_step(&mut script, code, code + hold, true);
+        code = nc;
+    }
+    if code == 0 {
+        ctx.console_writeln_fmt(format_args!("run: not found or empty: {}", str_of(path)));
         return Err(ShellError::FileNotFound);
     }
-    if slen == SCRIPT_MAX && last_n == IO_CHUNK {
-        ctx.console_writeln_fmt(format_args!("run: script larger than {} bytes - truncated (a huge script is a program)", SCRIPT_MAX));
+    if truncated {
+        ctx.console_writeln_fmt(format_args!("run: script CODE exceeds {} bytes - truncated (a huge script is a program)", SCRIPT_MAX));
     }
-    run_with_optional_save(ctx, cwd, &script[..slen], depth, save, params)
+    run_with_optional_save(ctx, cwd, &script[..code], depth, save, params)
 }
 
 // ───────────────────────── gsh interpreter (Slice 1: vars + expansion + params + fail) ─────────
