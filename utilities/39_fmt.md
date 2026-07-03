@@ -1,8 +1,10 @@
 # Utility: `fmt` - format a script to the GodspeedOS standard
 
-**Status:** **Spec-first; building on `feat/gsh-fmt`.** The `.gsh` formatter - one canonical layout,
-non-negotiable, applied in place. Written before the code (as `observe` was, per `0_conventions.md` §3).
-Trails `CLAUDE.md`; does not amend it.
+**Status:** **BUILT on `feat/gsh-fmt`** - the `.gsh` formatter, one canonical layout, non-negotiable,
+applied in place. STREAMING (no file-size cap), semantics-preserving, and idempotent. Pinned by
+`osdev test files` (207/0), `osdev test fmt-demo` (6/0 - jar before/after, a medium multi-flush file,
+and a **10 MB** file formatted with `fmt check` = `Ok`), and `osdev test fmt-idem` (format-twice diff
+= IDENTICAL). Trails `CLAUDE.md`; does not amend it.
 
 ---
 
@@ -31,9 +33,9 @@ for i in range 1 5 {
 }
 ```
 
-(Note the scope: `fmt` fixes *layout* - the `;` becomes newlines, inline blocks expand and
-indent, a space is inserted before `{`, runs of whitespace between tokens collapse. It does not
-re-space *inside* a token, so `$n>5` written without spaces would stay `$n>5` - see below.)
+(`fmt` fixes *layout* - the `;` becomes newlines, inline blocks expand and indent, a space is inserted
+before `{`, runs of whitespace between tokens collapse. It does not re-space *inside* a token, so a
+`$n>5` written without spaces would stay `$n>5` - see the scope note in §2.)
 
 ### Boring on purpose - zero style options
 
@@ -57,7 +59,8 @@ none of them change *how* the code is formatted - only *what fmt does with the r
 7. **Strings are sacred.** Content inside `'…'` / `"…"` is never touched - not its spacing, not its
    case, nothing.
 8. **Idempotent.** `fmt` of already-formatted text is a no-op. `fmt(fmt(x)) == fmt(x)` is an
-   acceptance test, not an aspiration.
+   acceptance test - **met**, proven from 8 KB to 10 MB by `osdev test fmt-idem` (format a
+   chunk-spanning file twice and diff = IDENTICAL).
 
 > **Scope note (honest).** `fmt` canonicalizes *layout* - indentation, statement-per-line, brace
 > placement, inter-token whitespace, blank lines. It does **not** re-space the insides of a token
@@ -89,14 +92,15 @@ fmt help              print usage
 ## 4. Guardrails & safety (loud, never silent - §26.7)
 
 Because the default writes in place with no preview, `fmt` is **all-or-nothing** and never leaves a
-damaged file:
+damaged file. It streams (constant memory, **no file-size cap**), and the write is temp-then-rename, so
+a failed write can never touch the original:
 
 - **Won't parse -> refuse, file untouched.** A syntactically broken script (unbalanced braces, a bad
   block header) gets a loud error and **no** write. `fmt` never lays a half-formatted result over a
   broken one; fix the syntax, then format.
-- **Too big to format in bounds -> refuse, file untouched.** Unlike `run` (which may truncate for
-  *execution* - harmless), writing a truncated format back would *delete* script content. So an
-  over-large script gets a loud refusal, never a silent chop.
+- **One statement too long -> refuse, file untouched.** The streamer holds one statement across a read
+  boundary; a single statement bigger than the hold buffer is refused loudly. This is a per-*statement*
+  bound, not a per-*file* one - **the file itself can be any size** (a 10 MB script formats fine).
 
 Neither guardrail is an option - they are the safety that lets the zero-preview default be trusted.
 
@@ -110,13 +114,18 @@ Neither guardrail is an option - they are the safety that lets the zero-preview 
 
 ## 6. Implementation shape & conformance
 
-A **shell built-in** (`0_conventions.md` §2): it reads the file via `fs` (like `read`/`run`), formats
-the bytes, and writes them back via `fs` - using caps the shell already holds, no widened authority.
-The formatter is a bounded, streaming **token-level re-emitter**: it reuses `read_statement` (the
-quote-aware statement boundary), `find_open_brace`/`find_matching_brace` (quote-aware brace matching),
-and `raw_token`, and tracks an explicit indent depth on `{`/`}` (no native recursion, like the
-executor's `frames` stack) - emitting into a bounded buffer, loud on overflow (§26.6). It never
-evaluates the script; it only re-lays-out its tokens, which is why it is provably semantics-preserving.
+A **shell built-in** (`0_conventions.md` §2), using caps the shell already holds - no widened
+authority. It is a **fully streaming, token-level re-emitter**: `fmt_stream_pass` reads the source in
+chunks (`fs_read_at`) and `fmt_walk_window` formats each, emitting to a closure - holding only ONE
+partial statement + the indent depth across a read boundary (no native recursion). Constant memory,
+any file size. It never evaluates the script; it only re-lays-out its tokens, which is why it is
+provably semantics-preserving.
 
-Conforms to `0_conventions.md`: its own `fmt help` / `fmt version` via the shared `help_block`,
-`fmt check help` for the subcommand, listed under **Console** in the top-level `help`.
+The write is two streaming passes: pass 1 counts the output size (for `OP_WRITE_NEW`), pass 2
+stream-writes **508-aligned** chunks (`OP_WRITE_AT`) into a temp, which is then renamed over the
+original - so a failed write leaves the original intact. `fmt check` formats to a temp and compares the
+two files *sequentially* (never two concurrent reads of the same file). Pinned by `osdev test fmt-idem`
+(the format-twice boundary diff) and `osdev test fmt-demo` (the 10 MB).
+
+Conforms to `0_conventions.md`: its own `fmt help` / `fmt version` via the shared `help_block`, listed
+under **Console** in the top-level `help`.
