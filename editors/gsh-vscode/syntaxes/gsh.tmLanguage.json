@@ -1,0 +1,114 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "gsh",
+  "scopeName": "source.gsh",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#string" },
+    { "include": "#capture" },
+    { "include": "#function-def" },
+    { "include": "#keyword" },
+    { "include": "#constant" },
+    { "include": "#builtin" },
+    { "include": "#variable" },
+    { "include": "#number" },
+    { "include": "#operator" }
+  ],
+  "repository": {
+    "comment": {
+      "match": "(?<!\\S)#.*$",
+      "name": "comment.line.number-sign.gsh"
+    },
+    "string": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.gsh",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            { "include": "#capture" },
+            { "include": "#variable" }
+          ]
+        },
+        {
+          "name": "string.quoted.single.gsh",
+          "begin": "'",
+          "end": "'"
+        }
+      ]
+    },
+    "capture": {
+      "name": "meta.capture.gsh",
+      "begin": "\\$\\(",
+      "beginCaptures": { "0": { "name": "keyword.operator.capture.gsh" } },
+      "end": "\\)",
+      "endCaptures": { "0": { "name": "keyword.operator.capture.gsh" } },
+      "patterns": [ { "include": "$self" } ]
+    },
+    "function-def": {
+      "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.control.gsh" },
+        "2": { "name": "entity.name.function.gsh" }
+      }
+    },
+    "keyword": {
+      "match": "\\b(let|mut|if|else|switch|for|in|loop|break|continue|fn|return|defer|import|from|as|range)\\b",
+      "name": "keyword.control.gsh"
+    },
+    "constant": {
+      "patterns": [
+        { "match": "\\b(Ok|Err|true|false)\\b", "name": "constant.language.gsh" },
+        { "match": "\\b(FileNotFound|Denied|AssertFailed|CapRevoked|CapNotHeld|EndpointDead|PlacementInvalid|Unknown)\\b", "name": "constant.language.result.gsh" },
+        { "match": "(?<!\\S)_(?!\\S)", "name": "constant.language.default.gsh" }
+      ]
+    },
+    "builtin": {
+      "patterns": [
+        {
+          "comment": "core statement + file/command builtins",
+          "match": "\\b(echo|input|read|write|assert|result|fail|mkdir|copy|move|rename|delete|find|tree|ls|cd|edit|run|selfcheck|fcap|clear)\\b",
+          "name": "support.function.builtin.gsh"
+        },
+        {
+          "comment": "modifier keywords (input secret, write append, delete recursive, run save, ...)",
+          "match": "\\b(secret|sealed|append|prepend|save|recursive|parents|reverse|except)\\b",
+          "name": "storage.modifier.gsh"
+        },
+        {
+          "comment": "record + byte pipe stages (docs/records.md)",
+          "match": "\\b(where|select|sort|count|sum|min|max|avg|to|match|first|last)\\b",
+          "name": "support.function.pipe.gsh"
+        },
+        {
+          "comment": "introspection / info producers",
+          "match": "\\b(about|mem|cores|date|uptime|help|status|caps|roster|observe|drives|greet|upper|version)\\b",
+          "name": "support.function.info.gsh"
+        },
+        {
+          "comment": "lifecycle / operator control",
+          "match": "\\b(spawn|kill|restart|reboot|chaos)\\b",
+          "name": "support.function.control.gsh"
+        }
+      ]
+    },
+    "variable": {
+      "patterns": [
+        { "match": "\\$[A-Za-z_][A-Za-z0-9_]*", "name": "variable.other.gsh" },
+        { "match": "\\$([0-9]|@|#)", "name": "variable.parameter.gsh" }
+      ]
+    },
+    "number": {
+      "match": "(?<![A-Za-z0-9_])-?[0-9]+\\b",
+      "name": "constant.numeric.gsh"
+    },
+    "operator": {
+      "patterns": [
+        { "match": "\\|", "name": "keyword.operator.pipe.gsh" },
+        { "match": "(==|!=|<=|>=|<|>)", "name": "keyword.operator.comparison.gsh" },
+        { "match": "(?<=\\s)=(?=\\s)", "name": "keyword.operator.assignment.gsh" },
+        { "match": "(\\+|\\-|\\*|/|%)", "name": "keyword.operator.arithmetic.gsh" }
+      ]
+    }
+  }
+}

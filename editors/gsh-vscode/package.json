@@ -1,0 +1,28 @@
+{
+  "name": "gsh",
+  "displayName": "gsh (GodspeedOS shell)",
+  "description": "Syntax highlighting for gsh (.gsh) - the GodspeedOS shell scripting language. Not bash.",
+  "version": "0.1.0",
+  "publisher": "godspeed-os",
+  "license": "Apache-2.0",
+  "engines": { "vscode": "^1.60.0" },
+  "categories": ["Programming Languages"],
+  "keywords": ["gsh", "godspeedos", "shell", "scripting"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "gsh",
+        "aliases": ["gsh", "GodspeedOS shell"],
+        "extensions": [".gsh"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "gsh",
+        "scopeName": "source.gsh",
+        "path": "./syntaxes/gsh.tmLanguage.json"
+      }
+    ]
+  }
+}
