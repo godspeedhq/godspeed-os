@@ -3559,20 +3559,20 @@ pub fn run_fmt_demo(image_path: &Path, disk_path: &str, smp: u32) {
     println!("\n========== AFTER (read /jar.gsh) ==========\n{}", after.trim());
     println!("\n---------- fmt /huge_fmt.gsh (10 MB, streamed) ----------\n{}\n==========", huge.trim());
 
+    // The 10 MB format is slow in TCG; its "(N bytes)" success can land just after the window above,
+    // so drain the tail here - the shell only answers this echo once the format has finished.
+    send(&mut write_half, b"echo STILL-ALIVE\r");
+    let alive = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(240)).unwrap_or_default();
+    let formatted = huge.contains("bytes)") || alive.contains("bytes)");
+
     check!(after.contains("if $n > 5 {") && after.contains("    echo big") && after.contains("} else {"),
            "jar.gsh reformatted to canonical layout (4-space indent, one/line, K&R braces)");
     check!(!before.contains("    echo big"), "the before was genuinely jarring (inline blocks, not indented)");
     check!(!again.contains("not canonical") && !again.contains("won't parse"), "fmt is idempotent (jar.gsh canonical after fmt)");
-    check!(huge.contains("bytes)") && !huge.contains("won't parse") && !huge.contains("too long") && !huge.contains("write failed"),
+    check!(formatted && !huge.contains("won't parse") && !huge.contains("too long") && !huge.contains("write failed"),
            "10 MB script FORMATTED via streaming (no file-size cap)");
-    check!(!after.contains("KERNEL PANIC") && !huge.contains("KERNEL PANIC"), "no kernel panic on the 10 MB format");
-
-    // Shell still answers after all that.
-    send(&mut write_half, b"echo STILL-ALIVE\r");
-    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
-        Some(r) => check!(r.contains("STILL-ALIVE"), "shell responsive after the demo"),
-        None => { println!("fmt-demo: FAIL - shell unresponsive"); fail += 1; }
-    }
+    check!(!huge.contains("KERNEL PANIC") && !alive.contains("KERNEL PANIC"), "no kernel panic on the 10 MB format");
+    check!(alive.contains("STILL-ALIVE"), "shell responsive after the 10 MB format");
 
     child.kill().ok(); child.wait().ok();
     println!("\nfmt-demo: {pass} passed, {fail} failed");
