@@ -59,6 +59,14 @@ pub enum Value {
     Empty,
 }
 
+/// A numeric-column reducer (the `sum`/`min`/`max`/`avg` pipe aggregators, docs/scripting.md §5).
+#[derive(Clone, Copy)]
+pub enum AggOp { Sum, Min, Max, Avg }
+
+/// Why an aggregate failed - each maps to a loud shell notice, never a silent 0.
+#[derive(Clone, Copy)]
+pub enum AggErr { NoColumn, NonNumeric }
+
 /// A sink the renderers write bytes into - the caller's bridge to a console, a capture buffer,
 /// or an IPC message. Implement it for whatever the bytes should go to.
 pub trait RecordSink {
@@ -200,6 +208,46 @@ impl Table {
             if reverse { o.reverse() } else { o }
         });
         true
+    }
+
+    /// A cell as a number: an `Int` directly, or a `Str` of ASCII digits; `None` otherwise (a
+    /// non-numeric or empty cell - the caller turns that into a loud [`AggErr::NonNumeric`]).
+    fn cell_num(&self, v: Value) -> Option<u64> {
+        match v {
+            Value::Int(n) => Some(n),
+            Value::Str { off, len } => {
+                let b = &self.arena[off as usize..(off + len) as usize];
+                if b.is_empty() { return None; }
+                let mut acc: u64 = 0;
+                for &c in b {
+                    if !c.is_ascii_digit() { return None; }
+                    acc = acc.saturating_mul(10).saturating_add((c - b'0') as u64);
+                }
+                Some(acc)
+            }
+            Value::Empty => None,
+        }
+    }
+
+    /// Reduce a numeric column to a scalar (§5). Loud: `NoColumn` if `col` is not a column,
+    /// `NonNumeric` if any cell is not a number - never a silent 0. Empty table reduces to 0.
+    /// `avg` is integer (floor).
+    pub fn aggregate(&self, col: &str, op: AggOp) -> Result<u64, AggErr> {
+        let ci = self.col_index(col).ok_or(AggErr::NoColumn)?;
+        if self.nrows == 0 { return Ok(0); }
+        let (mut sum, mut mn, mut mx) = (0u64, u64::MAX, 0u64);
+        for r in 0..self.nrows {
+            let n = self.cell_num(self.rows[r][ci]).ok_or(AggErr::NonNumeric)?;
+            sum = sum.saturating_add(n);
+            if n < mn { mn = n; }
+            if n > mx { mx = n; }
+        }
+        Ok(match op {
+            AggOp::Sum => sum,
+            AggOp::Min => mn,
+            AggOp::Max => mx,
+            AggOp::Avg => sum / self.nrows as u64,
+        })
     }
 
     // ── renderers (edge formats) ──────────────────────────────────────────────────────────

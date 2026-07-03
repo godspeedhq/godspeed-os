@@ -3,7 +3,7 @@
 #![no_main]
 
 use godspeed_sdk::{ServiceContext, CapInfo, CapHandle, Message, IpcError};
-use godspeed_sdk::record::{Table, Value, RecordSink, parse_predicate, REC_MAX_ROWS, REC_ARENA};
+use godspeed_sdk::record::{Table, Value, RecordSink, parse_predicate, AggOp, AggErr, REC_MAX_ROWS, REC_ARENA};
 
 const MAX_LINE: usize = 128;
 const MAX_ARGS: usize = 4;
@@ -2804,7 +2804,7 @@ const UTILS: &[&str] = &[
     "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count", "sort",
     "first", "last",
     // record-pipe verbs (pipe-only stages; see docs/records.md)
-    "where", "select", "to", "from",
+    "where", "select", "to", "from", "sum", "min", "max", "avg",
 ];
 fn is_util(name: &str) -> bool { UTILS.contains(&name) }
 
@@ -2991,8 +2991,8 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("match except <pattern> [path]", "keep the lines that do NOT match", "read /log | match except debug"),
             ("match \"<two words>\" …", "quote a multi-word pattern", "match \"out of memory\" /log"),
         ], true),
-        "count" => help_block(ctx, "count", "count lines, words, and bytes", &[
-            ("<producer> | count", "count piped input", "find *.txt | count"),
+        "count" => help_block(ctx, "count", "count lines/words/bytes (byte stream) or ROWS (record stream)", &[
+            ("<producer> | count", "count piped bytes, or rows of a record stream", "status | count"),
             ("count <path>", "count a file", "count /log"),
         ], true),
         "sort" => help_block(ctx, "sort", "order the lines (ascending, or reverse)", &[
@@ -3022,6 +3022,10 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "from" => help_block(ctx, "from", "parse text into records (record-pipe stage)", &[
             ("<text> | from json", "parse a flat JSON array of objects", "read /svc.json | from json"),
             ("read x.json | from json | …", "bridge text → records, then filter", "read /svc.json | from json | where core=1"),
+        ], true),
+        c @ ("sum" | "min" | "max" | "avg") => help_block(ctx, c, "reduce a numeric column of a record stream (record-pipe stage)", &[
+            ("<records> | sum <col>", "total / min / max / mean of a numeric column", "status | sum mem"),
+            ("… | avg <col>", "a non-numeric or missing column is loud, never a silent 0", "status | avg queue"),
         ], true),
         _ => return false,
     }
@@ -3932,8 +3936,38 @@ fn pipe_transform(ctx: &ServiceContext, stage: &str, cmd: &str, s: &mut Stream) 
             }
             Stream::Bytes(_) => byte_filter(ctx, stage, s),
         },
+        // count is dual: ROW count on a Table (a bare number), the line/word/byte summary on Bytes
+        "count" => match s {
+            Stream::Table(t) => {
+                let mut c = Cap::new();
+                { let mut o = Out::Capture(&mut c); o.line_fmt(ctx, format_args!("{}", t.nrows())); }
+                *s = Stream::Bytes(c);
+                true
+            }
+            Stream::Bytes(_) => byte_filter(ctx, stage, s),
+        },
+        // numeric-column reducers (Table only): sum / min / max / avg -> a bare number
+        "sum" | "min" | "max" | "avg" => match s {
+            Stream::Table(t) => {
+                let mut sa = [""; MAX_ARGS];
+                let sc = tokenize(stage, &mut sa);
+                if sc < 2 { ctx.console_writeln_fmt(format_args!("usage: … | {} <col>", cmd)); return false; }
+                let op = match cmd { "sum" => AggOp::Sum, "min" => AggOp::Min, "max" => AggOp::Max, _ => AggOp::Avg };
+                match t.aggregate(sa[1], op) {
+                    Ok(v) => {
+                        let mut c = Cap::new();
+                        { let mut o = Out::Capture(&mut c); o.line_fmt(ctx, format_args!("{}", v)); }
+                        *s = Stream::Bytes(c);
+                        true
+                    }
+                    Err(AggErr::NoColumn) => { ctx.console_writeln_fmt(format_args!("{}: no such column '{}'", cmd, sa[1])); false }
+                    Err(AggErr::NonNumeric) => { ctx.console_writeln_fmt(format_args!("{}: column '{}' is not numeric (never a silent 0)", cmd, sa[1])); false }
+                }
+            }
+            Stream::Bytes(_) => { ctx.console_writeln_fmt(format_args!("{}: needs records (a numeric column) - try 'from json'", cmd)); false }
+        },
         // byte filters (Bytes only)
-        "match" | "count" | "first" | "last" => match s {
+        "match" | "first" | "last" => match s {
             Stream::Bytes(_) => byte_filter(ctx, stage, s),
             Stream::Table(_) => { ctx.console_writeln_fmt(format_args!("{}: this is a record stream - use 'where'/'select'/'sort <col>', or 'to json' for text", cmd)); false }
         },

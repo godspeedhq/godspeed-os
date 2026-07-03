@@ -2085,6 +2085,34 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None => { println!("files-test: FAIL - gsh defer-lifo timeout"); fail += 1; }
     }
 
+    // ── gsh Slice 10 (Tier 2): record aggregators - count (dual) + sum/min/max/avg (§5).
+    let _ = run!(b"write /agg.json '[{\"n\":\"a\",\"v\":10},{\"n\":\"b\",\"v\":20},{\"n\":\"c\",\"v\":30}]'\r", 10);
+    match run!(b"read /agg.json | from json | count\r", 14) {
+        Some(r) => check!(r.contains("3"), "gsh: count rows of a record stream"),
+        None => { println!("files-test: FAIL - agg count timeout"); fail += 1; }
+    }
+    match run!(b"read /agg.json | from json | sum v\r", 14) {
+        Some(r) => check!(r.contains("60"), "gsh: sum a numeric column"),
+        None => { println!("files-test: FAIL - agg sum timeout"); fail += 1; }
+    }
+    match run!(b"read /agg.json | from json | min v\r", 14) {
+        Some(r) => check!(r.contains("10"), "gsh: min of a numeric column"),
+        None => { println!("files-test: FAIL - agg min timeout"); fail += 1; }
+    }
+    match run!(b"read /agg.json | from json | max v\r", 14) {
+        Some(r) => check!(r.contains("30"), "gsh: max of a numeric column"),
+        None => { println!("files-test: FAIL - agg max timeout"); fail += 1; }
+    }
+    match run!(b"read /agg.json | from json | avg v\r", 14) {
+        Some(r) => check!(r.contains("20"), "gsh: avg of a numeric column"),
+        None => { println!("files-test: FAIL - agg avg timeout"); fail += 1; }
+    }
+    // reducing a NON-numeric column is loud, never a silent 0.
+    match run!(b"read /agg.json | from json | sum n\r", 14) {
+        Some(r) => check!(r.contains("not numeric"), "gsh: sum of a non-numeric column is loud"),
+        None => { println!("files-test: FAIL - agg non-numeric timeout"); fail += 1; }
+    }
+
     // ── assert: the verifying command. Content form (the pipe sink) is tested interactively -
     //    a `|` can't yet be authored into a script via `write` (the shell pipes the write line).
     match run!(b"roster | where role=core | assert contains Matthew\r", 16) {

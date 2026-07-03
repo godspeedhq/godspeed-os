@@ -24,8 +24,11 @@
 > is fresh. The stream/record forms (`for line in (producer)`) are a deferred follow-on (they need the
 > same output-capture as `$(fn)`). **`defer`** is BUILT too (§5): `defer <command>` runs cleanup when
 > the current scope exits (a function's return, or the whole script), LIFO, **even on `fail`** - each
-> defer records only a (offset, len, scope-depth) into the resident script. The rest of Tier 2 (record
-> aggregators - §11) remains design-only. Scripts use the `.gsh` extension
+> defer records only a (offset, len, scope-depth) into the resident script. **Record aggregators** are
+> BUILT too (§5): `count` is dual (rows of a record stream, lines of a byte stream), and
+> `sum`/`min`/`max`/`avg <col>` reduce a numeric column - loud on a non-numeric/missing column, never a
+> silent 0. **Tier 2 is now complete** (the only follow-ons deferred are the output-capture forms:
+> `$(fn …)`, `if fn { }`, `for line in (producer)`). Scripts use the `.gsh` extension
 > (GodspeedOS shell; `.gs` is reserved for the future general-purpose Godspeed language). Builds on
 > the `run`/`run_lines` interpreter and the command **Result** model (`execute` returns `Ok`/`Err`).
 > Not POSIX - see CLAUDE.md Appendix B.3 / D.
