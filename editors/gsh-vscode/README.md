@@ -31,24 +31,38 @@ so most of what diagnostics would catch is caught when you run the script).
 
 The extension is self-contained (no build step - it is pure grammar + config).
 
-**A. Drop it in your extensions folder (quickest):** copy the whole `gsh-vscode` folder to
+**A. Drop it in your extensions folder (quickest).** Copy the whole `gsh-vscode` folder to
 - Linux/macOS: `~/.vscode/extensions/gsh-vscode`
 - Windows: `%USERPROFILE%\.vscode\extensions\gsh-vscode`
 
-then reload VS Code (`Developer: Reload Window`). `.gsh` files light up automatically.
+then **fully quit and reopen VS Code**. A hand-copied extension is only picked up on startup, and a
+plain `Developer: Reload Window` is sometimes not enough - a full restart always is.
 
-**B. Package a `.vsix` and install it** (needs [`vsce`](https://github.com/microsoft/vscode-vsce)):
+**B. Package a `.vsix` and install it** (needs [`vsce`](https://github.com/microsoft/vscode-vsce)) - a
+single file you can install anywhere, or later publish to the Marketplace:
 ```
 cd editors/gsh-vscode
 npx @vscode/vsce package          # -> gsh-0.1.0.vsix
 code --install-extension gsh-0.1.0.vsix
 ```
 
-**C. Just associate the file type** (if you only want it in one workspace and the extension is
-already loaded), add to `.vscode/settings.json`:
-```json
-{ "files.associations": { "*.gsh": "gsh" } }
-```
+## Verify it worked
+
+1. Open any `.gsh` file - e.g. `scripts/smoke.gsh` or `scripts/selfcheck.gsh`.
+2. Look at the **bottom-right of the status bar**: it should read **`gsh`** (not "Shell Script" or
+   "Plain Text").
+3. Keywords, builtins, `$vars`, `"…"` / `'…'` strings, and `#` comments should all be colored.
+
+## If `.gsh` still shows the wrong language
+
+- Click the language name in the status bar -> **"Configure File Association for '.gsh'"** -> pick
+  **gsh**, or
+- add to your `settings.json` (per-workspace, or global once the extension is loaded):
+  ```json
+  { "files.associations": { "*.gsh": "gsh" } }
+  ```
+- if a token looks uncolored, your color theme simply does not style that TextMate scope - the grammar
+  is fine; try another theme.
 
 ## Other editors
 
