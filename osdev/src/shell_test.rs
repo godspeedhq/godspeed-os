@@ -2057,6 +2057,34 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None => { println!("files-test: FAIL - gsh slot-stress timeout"); fail += 1; }
     }
 
+    // ── gsh Slice 9 (Tier 2): defer - cleanup that runs on scope exit, LIFO, even on fail (§5).
+    let _ = run!(b"write /df1.gsh defer echo deferred-ran ; echo main-ran\r", 10);
+    match run!(b"run /df1.gsh\r", 14) {
+        Some(r) => check!(r.contains("main-ran") && r.contains("deferred-ran"), "gsh: defer runs at script end"),
+        None => { println!("files-test: FAIL - gsh defer timeout"); fail += 1; }
+    }
+    // defer runs even when the script `fail`s.
+    let _ = run!(b"write /df2.gsh defer echo clean-on-fail ; fail boom\r", 10);
+    match run!(b"run /df2.gsh\r", 14) {
+        Some(r) => check!(r.contains("clean-on-fail"), "gsh: defer runs even on fail"),
+        None => { println!("files-test: FAIL - gsh defer-on-fail timeout"); fail += 1; }
+    }
+    // defer is function-scoped: it runs when the function returns, before the caller continues.
+    let _ = run!(b"write /df3.gsh fn f { defer echo fn-cleanup ; echo in-fn } ; f ; echo after\r", 10);
+    match run!(b"run /df3.gsh\r", 14) {
+        Some(r) => check!(r.contains("fn-cleanup") && r.contains("after"), "gsh: defer is function-scoped (runs on return)"),
+        None => { println!("files-test: FAIL - gsh defer-fn timeout"); fail += 1; }
+    }
+    // defers run LIFO (the last registered runs first).
+    let _ = run!(b"write /df4.gsh defer echo d-one ; defer echo d-two ; echo body\r", 10);
+    match run!(b"run /df4.gsh\r", 14) {
+        Some(r) => {
+            let lifo = match (r.find("d-two"), r.find("d-one")) { (Some(t), Some(o)) => t < o, _ => false };
+            check!(lifo, "gsh: defers run LIFO");
+        }
+        None => { println!("files-test: FAIL - gsh defer-lifo timeout"); fail += 1; }
+    }
+
     // ── assert: the verifying command. Content form (the pipe sink) is tested interactively -
     //    a `|` can't yet be authored into a script via `write` (the shell pipes the write line).
     match run!(b"roster | where role=core | assert contains Matthew\r", 16) {

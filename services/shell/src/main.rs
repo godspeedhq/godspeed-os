@@ -1351,6 +1351,9 @@ const MUT_SLOT: usize = 48;
 /// Hard iteration backstop for the unbounded `loop` (§5): a runaway is a loud stop, never a silent
 /// hang (invariant 12). `for` is self-bounded by its iterator; this guards `loop`.
 const LOOP_CAP: u32 = 100_000;
+/// Max `defer`red commands live at once (§5): each records only a (offset, len, scope-depth) into the
+/// resident script - fixed, cheap. Loud past this.
+const DEFER_MAX: usize = 16;
 
 /// A gsh run's variable table: a fixed name array + a value bump-arena + one overflow flag (modeled
 /// on the record `Table`). Immutable by default; `let mut` opts into reassignment. Loud on a full
@@ -2220,6 +2223,26 @@ fn for_step(ctx: &ServiceContext, b: &[u8], vars: &mut Vars, var: usize, it: For
     }
 }
 
+/// Run + remove every `defer`red command whose scope depth >= `min_depth`, LIFO (§5). Called on a
+/// function's return (`min_depth` = that function's scope) and at script end / `fail` (`min_depth` =
+/// 0 = all). A deferred command runs like any statement; its result does NOT affect the script's
+/// control flow - defers are cleanup, run even on `fail`.
+fn run_defers(ctx: &ServiceContext, cwd: &mut Cwd, b: &[u8], defers: &mut [(usize, usize, usize)], ndefer: &mut usize, min_depth: usize, vars: &mut Vars, params: &Params, out: &mut Out, sdepth: u8) {
+    loop {
+        let mut idx = None;
+        let mut i = *ndefer;
+        while i > 0 { i -= 1; if defers[i].2 >= min_depth { idx = Some(i); break; } }
+        let i = match idx { Some(i) => i, None => break };
+        let (off, len, _) = defers[i];
+        for k in i..*ndefer - 1 { defers[k] = defers[k + 1]; }
+        *ndefer -= 1;
+        let s = str_of(&b[off..off + len]);
+        out.put(ctx, "defer> ");
+        out.line(ctx, s);
+        let _ = run_stmt(ctx, cwd, s, Ok(()), sdepth, vars, params);
+    }
+}
+
 // ── Functions (§7): `fn name params { body }`, called like a command, bounded recursion. ──
 
 const FN_MAX: usize = 24;
@@ -2386,6 +2409,9 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
     // stack.
     let mut frames = [BlockKind::If; IF_DEPTH_MAX];
     let mut sp = 0usize;
+    // `defer`red commands: (buffer offset, len, scope depth). Run LIFO on scope exit (§5).
+    let mut defers: [(usize, usize, usize); DEFER_MAX] = [(0, 0, 0); DEFER_MAX];
+    let mut ndefer = 0usize;
     loop {
         pos = skip_seps(b, pos);
         if pos >= b.len() { break; }
@@ -2395,7 +2421,12 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
             match frames[sp - 1] {
                 BlockKind::If => { sp -= 1; pos = skip_else_chain(b, pos + 1); }
                 BlockKind::SwitchArm(end) => { sp -= 1; pos = end + 1; }
-                BlockKind::Call(ret) => { sp -= 1; vars.exit_scope(); pos = ret; } // body done: drop scope, resume
+                BlockKind::Call(ret) => { // function body done: run its defers, drop scope, resume
+                    sp -= 1;
+                    run_defers(ctx, cwd, b, &mut defers, &mut ndefer, vars.sp, &mut vars, params, out, sdepth);
+                    vars.exit_scope();
+                    pos = ret;
+                }
                 BlockKind::For { var, body, body_end, base, abase, it } => {
                     vars.reset_to(base, abase); // drop this pass's body locals
                     match for_step(ctx, b, &mut vars, var, it, params) {
@@ -2524,7 +2555,13 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
             let mut found = false;
             while sp > 0 {
                 sp -= 1;
-                if let BlockKind::Call(ret) = frames[sp] { vars.exit_scope(); pos = ret; found = true; break; }
+                if let BlockKind::Call(ret) = frames[sp] {
+                    run_defers(ctx, cwd, b, &mut defers, &mut ndefer, vars.sp, &mut vars, params, out, sdepth);
+                    vars.exit_scope();
+                    pos = ret;
+                    found = true;
+                    break;
+                }
             }
             if !found { ctx.console_writeln("gsh: 'return' outside a function"); }
             continue;
@@ -2548,6 +2585,19 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
                 }
             }
             if !done { ctx.console_writeln_fmt(format_args!("gsh: '{}' outside a loop", head)); }
+            continue;
+        }
+        // `defer <command>` - register cleanup to run when this scope exits (LIFO, even on fail, §5).
+        if head == "defer" {
+            if hrest.is_empty() {
+                ctx.console_writeln("gsh: defer needs a command");
+            } else if ndefer >= DEFER_MAX {
+                ctx.console_writeln_fmt(format_args!("gsh: too many defers (max {})", DEFER_MAX));
+            } else {
+                let off = hrest.as_ptr() as usize - b.as_ptr() as usize;
+                defers[ndefer] = (off, hrest.len(), vars.sp);
+                ndefer += 1;
+            }
             continue;
         }
         // a FUNCTION CALL - the head names a defined function; run its body in a fresh scope.
@@ -2576,6 +2626,8 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
         if last.is_err() { failed += 1; }
         if stop { break; }
     }
+    // Script exit (normal end OR `fail`): run any remaining defers - LIFO, across all scopes (§5).
+    run_defers(ctx, cwd, b, &mut defers, &mut ndefer, 0, &mut vars, params, out, sdepth);
     // End-of-run summary: PASS/FAIL per EXECUTED statement, from the recorded spans.
     // "FAIL  " is deliberately not the word "FAILED" the harness greens on absence of.
     out.line(ctx, "--- summary ---");

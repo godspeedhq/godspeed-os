@@ -22,8 +22,10 @@
 > backstop), and `break`/`continue`; a mutable loop counter lives in a fixed slot (overwritten in
 > place - no arena growth over a long loop), and each pass resets the body's locals so a `let` inside
 > is fresh. The stream/record forms (`for line in (producer)`) are a deferred follow-on (they need the
-> same output-capture as `$(fn)`). The rest of Tier 2 (`defer`, record aggregators - §11) remains
-> design-only. Scripts use the `.gsh` extension
+> same output-capture as `$(fn)`). **`defer`** is BUILT too (§5): `defer <command>` runs cleanup when
+> the current scope exits (a function's return, or the whole script), LIFO, **even on `fail`** - each
+> defer records only a (offset, len, scope-depth) into the resident script. The rest of Tier 2 (record
+> aggregators - §11) remains design-only. Scripts use the `.gsh` extension
 > (GodspeedOS shell; `.gs` is reserved for the future general-purpose Godspeed language). Builds on
 > the `run`/`run_lines` interpreter and the command **Result** model (`execute` returns `Ok`/`Err`).
 > Not POSIX - see CLAUDE.md Appendix B.3 / D.
