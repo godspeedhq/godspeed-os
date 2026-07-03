@@ -2600,17 +2600,22 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
             }
             continue;
         }
-        // a FUNCTION CALL - the head names a defined function; run its body in a fresh scope.
-        if let Some(fi) = ft.lookup(b, head.as_bytes()) {
-            if sp >= IF_DEPTH_MAX { ctx.console_writeln("gsh: call/block nesting too deep"); failed += 1; break; }
-            if dispatch_call(ctx, b, s, &ft, fi, &mut vars, params) {
-                frames[sp] = BlockKind::Call(next); // resume after the call when the body returns
-                sp += 1;
-                pos = ft.body_start[fi] as usize;
-            } else {
-                last = Err(ShellError::Unknown);
+        // a FUNCTION CALL - the head names a defined function; run its body in a fresh scope. A
+        // function is NOT a pipe producer (it writes to the console, not a pipe), so `name | …` is a
+        // command/producer pipe - never a call. Guard on the absence of a pipe so a function can't
+        // shadow a piped producer (e.g. defining `fn count` must not break `echo x | count`).
+        if !s.contains('|') {
+            if let Some(fi) = ft.lookup(b, head.as_bytes()) {
+                if sp >= IF_DEPTH_MAX { ctx.console_writeln("gsh: call/block nesting too deep"); failed += 1; break; }
+                if dispatch_call(ctx, b, s, &ft, fi, &mut vars, params) {
+                    frames[sp] = BlockKind::Call(next); // resume after the call when the body returns
+                    sp += 1;
+                    pos = ft.body_start[fi] as usize;
+                } else {
+                    last = Err(ShellError::Unknown);
+                }
+                continue;
             }
-            continue;
         }
         // Echo the statement so the transcript shows what produced each result.
         out.put(ctx, "> ");

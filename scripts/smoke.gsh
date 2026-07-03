@@ -8,6 +8,9 @@ mkdir /sm
 write /sm/f.txt data
 read /sm/f.txt | assert contains data
 ls /sm | where type=file | assert contains f.txt
+# guard (Tier 2): a function must NOT shadow a piped producer - defining `fn greet` must not
+# hijack `greet | ...`, which still runs the greet SERVICE (a function is not a pipe source).
+fn greet { echo FN-GREET-BUG }
 greet | count | assert contains 3 lines
 # $( ) capture stages a pipeline through a file (a direct pipeline capture would overflow the stack):
 greet | count | write /sm/c.txt

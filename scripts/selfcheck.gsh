@@ -16,6 +16,123 @@
 #   - exhaustive operator coverage runs on FREE producers (status, ls, json) to avoid
 #     spawning a service per line; roster/greet/upper lines are kept lean.
 
+# ##########################################################################
+# #  gsh LANGUAGE TOUR                                                      #
+# #  A guided, self-checking demo of EVERY gsh feature (Tier 1 + Tier 2).   #
+# #  Each step asserts its own result or feeds a later assert, so the whole #
+# #  tour must finish "failed 0" - the syntax below is executable proof,    #
+# #  not pseudocode. Read top-to-bottom to learn the language. Works under  #
+# #  /tour (removed at the end). `import` is a `run <file>`-time feature, so #
+# #  it is shown (not run) here - see the note near the bottom.             #
+# ##########################################################################
+
+mkdir /tour                              # a scratch directory for the tour's files
+
+# -- 1. VARIABLES ----------------------------------------------------------
+#  `let` binds an IMMUTABLE variable; `let mut` a mutable one (reassign it later
+#  with `name = ...`). `$name` expands anywhere; "..." interpolates, '...' is raw.
+let name = Ada                           # immutable binding
+let mut hits = 0                         # mutable counter (bumped in a loop below)
+echo "hello, $name" | assert contains hello, Ada     # double quotes interpolate
+echo 'raw text - $name stays literal'                # single quotes: no expansion
+
+# -- 2. ARITHMETIC (inline, space-separated, NOT a command) ----------------
+#  Operators + - * / % with ( ) grouping and real precedence.
+let total = 2 + 3 * 4                    # * binds tighter than + -> 14
+echo $total | assert contains 14
+let grouped = ( 2 + 3 ) * 4              # parentheses override precedence -> 20
+echo $grouped | assert contains 20
+
+# -- 3. RESULT + IF / ELSE, comparisons, `in` ------------------------------
+#  Every command yields Ok/Err; `result` is the previous one's outcome. `if`
+#  takes a command OR a comparison (== != < > <= >=), plus `<val> in a b c`.
+write /tour/a.txt hi                     # a real command...
+if result == Ok { echo wrote-ok | assert contains wrote-ok }   # ...check its result
+if $total > 10 { echo big | assert contains big } else { fail "math broke" }
+if $name in Ada Bob Cy { echo known-name | assert contains known-name }
+
+# -- 4. SWITCH (several values per arm, `_` default) -----------------------
+switch $name {
+    Bob Cy   { fail "wrong arm" }        # an arm may list multiple values
+    Ada      { echo matched-ada | assert contains matched-ada }
+    _        { fail "default must not run" }
+}
+
+# -- 5. $( ) CAPTURE (a producer's output into a variable) -----------------
+#  Capture a BARE producer: $(echo ...), $(date), $(read /file), $(greet)...
+let phrase = $(echo hi there)            # -> "hi there"
+echo got:$phrase | assert contains got:hi
+
+# -- 6. FOR LOOPS (words, range, mutable accumulation) ---------------------
+for fruit in apple pear plum {           # iterate a literal word list
+    echo fruit-$fruit
+}
+for i in range 3 {                       # range N -> 0 1 2
+    echo idx-$i
+}
+for i in range 1 5 {                     # range A B -> 1 2 3 4
+    hits = $hits + 1                     # reassigned each pass: a fixed slot, no arena growth
+}
+echo hits-$hits | assert contains hits-4
+
+# -- 7. UNBOUNDED loop + break / continue ----------------------------------
+let mut k = 0
+loop {                                   # runs until `break` (100k-iteration backstop)
+    k = $k + 1
+    if $k == 2 { continue }              # skip the rest of THIS pass
+    if $k > 4  { break }                 # leave the loop entirely
+    echo pass-$k                         # prints pass-1, pass-3, pass-4
+}
+
+# -- 8. FUNCTIONS (named params, return, bounded recursion) ----------------
+fn sayhi who {                           # `who` is a parameter (named, positional)
+    echo "hi, $who"                      # a function sees its params + immutable globals
+}
+sayhi $name                              # call it like a command -> "hi, Ada"
+if result == Ok { echo sayhi-ok | assert contains sayhi-ok }   # a function's result is checkable
+
+fn clamp n {                             # `return` ends a function early
+    if $n > 100 { echo clamped ; return }
+    echo n-is-$n
+}
+clamp 50                                 # -> n-is-50
+clamp 250                                # -> clamped (early return; "n-is-250" never prints)
+
+fn countdown n {                         # recursion via an explicit call stack (no native recursion)
+    if $n <= 0 { echo liftoff } else { echo t-$n ; let m = $n - 1 ; countdown $m }
+}
+countdown 3                              # -> t-3, t-2, t-1, liftoff
+
+# -- 9. DEFER (cleanup on scope exit - LIFO, even on fail) ------------------
+fn build_thing {
+    mkdir /tour/work
+    defer delete /tour/work recursive    # runs when this function returns, however we leave it
+    write /tour/work/out done
+    read /tour/work/out | assert contains done
+}                                        # <-- the deferred delete fires HERE, on return
+build_thing
+ls /tour | assert lacks work             # proof the defer ran: /tour/work is gone
+
+# -- 10. RECORD AGGREGATORS (typed-pipe reducers) --------------------------
+#  Pipes carry TYPED records, so a pipeline can REDUCE - impossible for byte pipes.
+write /tour/inv.json '[{"item":"a","qty":10},{"item":"b","qty":20},{"item":"c","qty":30}]'
+read /tour/inv.json | from json | count   | assert contains 3    # row count (dual: rows|lines)
+read /tour/inv.json | from json | sum qty | assert contains 60   # 10 + 20 + 30
+read /tour/inv.json | from json | min qty | assert contains 10
+read /tour/inv.json | from json | max qty | assert contains 30
+read /tour/inv.json | from json | avg qty | assert contains 20
+
+# -- IMPORT (shown, not run: libraries load at `run <file>` time) ----------
+#  A .gsh run from disk can pull functions from a library file:
+#      from /lib/assert.gsh import ok fails as denied   # selective, with `as` rename
+#      import /lib/math.gsh                              # all of a lib's functions
+#  Names collide loudly (resolve with `as`); the run's pre-scan then indexes
+#  the imported functions. Exercised end-to-end by `osdev test files`.
+
+# -- tour cleanup: leave nothing behind ------------------------------------
+delete /tour recursive
+assert fails ls /tour                    # the tour dir is gone
+
 # ===== meta: the result model + the assert forms themselves =====
 assert ok echo hello
 assert fails totallybogus
