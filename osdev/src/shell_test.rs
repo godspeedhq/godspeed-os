@@ -3326,8 +3326,10 @@ pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u3
     send(&mut write_half, b"selfcheck\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(150)) {
         Some(r) => {
+            // Always save the full live transcript so the run can be inspected line-by-line.
+            let _ = std::fs::write("build/selfcheck-transcript.txt", r.as_bytes());
             if r.contains("failed 0") && !r.contains("FAILED") {
-                println!("script-test: PASS - embedded `selfcheck` ran green (failed 0)"); pass += 1;
+                println!("script-test: PASS - embedded `selfcheck` ran green (failed 0) - transcript -> build/selfcheck-transcript.txt"); pass += 1;
             } else {
                 println!("\n=== selfcheck transcript ===\n{}\n=== end ===", r.trim());
                 println!("script-test: FAIL - embedded `selfcheck` not green"); fail += 1;
