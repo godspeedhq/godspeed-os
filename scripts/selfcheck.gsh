@@ -20,50 +20,54 @@
 # #  gsh LANGUAGE TOUR                                                      #
 # #  A guided, self-checking demo of EVERY gsh feature (Tier 1 + Tier 2).   #
 # #  Each step asserts its own result or feeds a later assert, so the whole #
-# #  tour must finish "failed 0" - the syntax below is executable proof,    #
-# #  not pseudocode. Read top-to-bottom to learn the language. Works under  #
-# #  /tour (removed at the end). `import` is a `run <file>`-time feature, so #
-# #  it is shown (not run) here - see the note near the bottom.             #
+# #  tour must finish "failed 0". Each section ECHOES a banner first, so the #
+# #  live transcript reads as a labelled, spaced-out walkthrough. `import`   #
+# #  is a `run <file>`-time feature, shown (not run) near the bottom.       #
 # ##########################################################################
 
+echo ''
+echo '#################### gsh LANGUAGE TOUR ####################'
 mkdir /tour                              # a scratch directory for the tour's files
 
-# -- 1. VARIABLES ----------------------------------------------------------
-#  `let` binds an IMMUTABLE variable; `let mut` a mutable one (reassign it later
-#  with `name = ...`). `$name` expands anywhere; "..." interpolates, '...' is raw.
+echo ''
+echo '===== 1. VARIABLES - let (immutable), let mut (mutable), expansion ====='
+#  `let` binds an IMMUTABLE variable; `let mut` a mutable one (reassign with `name = ...`).
+#  "..." interpolates $vars; '...' is raw.
 let name = Ada                           # immutable binding
 let mut hits = 0                         # mutable counter (bumped in a loop below)
 echo "hello, $name" | assert contains hello, Ada     # double quotes interpolate
 echo 'raw text - $name stays literal'                # single quotes: no expansion
 
-# -- 2. ARITHMETIC (inline, space-separated, NOT a command) ----------------
-#  Operators + - * / % with ( ) grouping and real precedence.
+echo ''
+echo '===== 2. ARITHMETIC - inline + - * / % with ( ) and precedence ====='
 let total = 2 + 3 * 4                    # * binds tighter than + -> 14
 echo $total | assert contains 14
 let grouped = ( 2 + 3 ) * 4              # parentheses override precedence -> 20
 echo $grouped | assert contains 20
 
-# -- 3. RESULT + IF / ELSE, comparisons, `in` ------------------------------
-#  Every command yields Ok/Err; `result` is the previous one's outcome. `if`
-#  takes a command OR a comparison (== != < > <= >=), plus `<val> in a b c`.
+echo ''
+echo '===== 3. RESULT + IF / ELSE, comparisons, in ====='
+#  Every command yields Ok/Err; `result` is the previous one's outcome.
 write /tour/a.txt hi                     # a real command...
 if result == Ok { echo wrote-ok | assert contains wrote-ok }   # ...check its result
 if $total > 10 { echo big | assert contains big } else { fail "math broke" }
 if $name in Ada Bob Cy { echo known-name | assert contains known-name }
 
-# -- 4. SWITCH (several values per arm, `_` default) -----------------------
+echo ''
+echo '===== 4. SWITCH - several values per arm, _ default ====='
 switch $name {
     Bob Cy   { fail "wrong arm" }        # an arm may list multiple values
     Ada      { echo matched-ada | assert contains matched-ada }
     _        { fail "default must not run" }
 }
 
-# -- 5. $( ) CAPTURE (a producer's output into a variable) -----------------
-#  Capture a BARE producer: $(echo ...), $(date), $(read /file), $(greet)...
+echo ''
+echo '===== 5. CAPTURE - $( ) puts a producers output into a variable ====='
 let phrase = $(echo hi there)            # -> "hi there"
 echo got:$phrase | assert contains got:hi
 
-# -- 6. FOR LOOPS (words, range, mutable accumulation) ---------------------
+echo ''
+echo '===== 6. FOR LOOPS - words, range, mutable accumulation ====='
 for fruit in apple pear plum {           # iterate a literal word list
     echo fruit-$fruit
 }
@@ -75,7 +79,8 @@ for i in range 1 5 {                     # range A B -> 1 2 3 4
 }
 echo hits-$hits | assert contains hits-4
 
-# -- 7. UNBOUNDED loop + break / continue ----------------------------------
+echo ''
+echo '===== 7. UNBOUNDED loop + break / continue ====='
 let mut k = 0
 loop {                                   # runs until `break` (100k-iteration backstop)
     k = $k + 1
@@ -84,26 +89,26 @@ loop {                                   # runs until `break` (100k-iteration ba
     echo pass-$k                         # prints pass-1, pass-3, pass-4
 }
 
-# -- 8. FUNCTIONS (named params, return, bounded recursion) ----------------
+echo ''
+echo '===== 8. FUNCTIONS - named params, return, recursion ====='
 fn sayhi who {                           # `who` is a parameter (named, positional)
     echo "hi, $who"                      # a function sees its params + immutable globals
 }
 sayhi $name                              # call it like a command -> "hi, Ada"
 if result == Ok { echo sayhi-ok | assert contains sayhi-ok }   # a function's result is checkable
-
 fn clamp n {                             # `return` ends a function early
     if $n > 100 { echo clamped ; return }
     echo n-is-$n
 }
 clamp 50                                 # -> n-is-50
 clamp 250                                # -> clamped (early return; "n-is-250" never prints)
-
 fn countdown n {                         # recursion via an explicit call stack (no native recursion)
     if $n <= 0 { echo liftoff } else { echo t-$n ; let m = $n - 1 ; countdown $m }
 }
 countdown 3                              # -> t-3, t-2, t-1, liftoff
 
-# -- 9. DEFER (cleanup on scope exit - LIFO, even on fail) ------------------
+echo ''
+echo '===== 9. DEFER - cleanup on scope exit, LIFO, even on fail ====='
 fn build_thing {
     mkdir /tour/work
     defer delete /tour/work recursive    # runs when this function returns, however we leave it
@@ -113,7 +118,8 @@ fn build_thing {
 build_thing
 ls /tour | assert lacks work             # proof the defer ran: /tour/work is gone
 
-# -- 10. RECORD AGGREGATORS (typed-pipe reducers) --------------------------
+echo ''
+echo '===== 10. RECORD AGGREGATORS - count / sum / min / max / avg ====='
 #  Pipes carry TYPED records, so a pipeline can REDUCE - impossible for byte pipes.
 write /tour/inv.json '[{"item":"a","qty":10},{"item":"b","qty":20},{"item":"c","qty":30}]'
 read /tour/inv.json | from json | count   | assert contains 3    # row count (dual: rows|lines)
@@ -122,18 +128,25 @@ read /tour/inv.json | from json | min qty | assert contains 10
 read /tour/inv.json | from json | max qty | assert contains 30
 read /tour/inv.json | from json | avg qty | assert contains 20
 
-# -- IMPORT (shown, not run: libraries load at `run <file>` time) ----------
-#  A .gsh run from disk can pull functions from a library file:
-#      from /lib/assert.gsh import ok fails as denied   # selective, with `as` rename
-#      import /lib/math.gsh                              # all of a lib's functions
-#  Names collide loudly (resolve with `as`); the run's pre-scan then indexes
-#  the imported functions. Exercised end-to-end by `osdev test files`.
+echo ''
+echo '===== IMPORT - shown, not run (libraries load at run <file> time) ====='
+echo '  from /lib/assert.gsh import ok fails as denied   (selective, with as-rename)'
+echo '  import /lib/math.gsh                             (all of a libs functions)'
+#  Names collide loudly (resolve with `as`); the run's pre-scan then indexes them.
+#  Exercised end-to-end by `osdev test files`.
 
-# -- tour cleanup: leave nothing behind ------------------------------------
+echo ''
+echo '===== tour cleanup - leave nothing behind ====='
 delete /tour recursive
 assert fails ls /tour                    # the tour dir is gone
 
+echo ''
+echo '#################### gsh LANGUAGE TOUR complete ####################'
+echo ''
+
 # ===== meta: the result model + the assert forms themselves =====
+echo ''
+echo '===== meta: the result model + the assert forms themselves ====='
 assert ok echo hello
 assert fails totallybogus
 assert fails-with Unknown totallybogus
@@ -144,6 +157,8 @@ echo "spaced words stay" | assert contains spaced words stay
 echo nothing | match zzz | assert empty
 
 # ===== self-documentation: <util> help / <util> version =====
+echo ''
+echo '===== self-documentation: <util> help / <util> version ====='
 assert ok help
 assert ok status help
 assert ok read help
@@ -157,6 +172,8 @@ assert ok read version
 assert ok clear help
 
 # ===== system info - now PIPE PRODUCERS (text emitters captured via Out), bare + piped =====
+echo ''
+echo '===== system info - now PIPE PRODUCERS (text emitters captured via Out), bare + piped ====='
 assert ok about
 assert ok cores
 assert ok mem
@@ -174,6 +191,8 @@ uptime | to json | assert contains seconds
 uptime | select seconds | to json | assert lacks uptime
 
 # ===== introspection producers: status / caps (+ every where operator, no spawn) =====
+echo ''
+echo '===== introspection producers: status / caps (+ every where operator, no spawn) ====='
 assert ok status
 status | assert contains shell
 status | where name=shell | assert contains shell
@@ -195,6 +214,8 @@ assert fails caps nosuchservice
 assert fails-with FileNotFound caps nosuchservice
 
 # ===== lifecycle guardrails (negative only - safe, deterministic) =====
+echo ''
+echo '===== lifecycle guardrails (negative only - safe, deterministic) ====='
 # The shell COMMAND guards spawn/kill of the supervisor (the recovery authority) - a command-layer
 # hygiene check, not "can't recover" (the supervisor is kernel-restartable, Phase 6). `kill shell` is
 # NOT tested here: the shell is restartable now, so it succeeds (self-restart) and would kill this run.
@@ -209,6 +230,8 @@ assert fails restart supervisor
 assert fails restart nosuchservice
 
 # ===== files: create / read / overwrite / append / empty / quoted =====
+echo ''
+echo '===== files: create / read / overwrite / append / empty / quoted ====='
 mkdir /sc
 assert ok ls /sc
 assert fails mkdir /sc
@@ -245,6 +268,8 @@ assert fails read /sc/missing.txt
 assert fails-with FileNotFound read /sc/missing.txt
 
 # ===== directories: mkdir (parents) + delete guard =====
+echo ''
+echo '===== directories: mkdir (parents) + delete guard ====='
 assert fails mkdir /sc/x/y/z
 mkdir /sc/x/y/z parents
 assert ok ls /sc/x/y/z
@@ -256,6 +281,8 @@ assert fails delete /sc/d1
 assert ok read /sc/d1/f.txt
 
 # ===== copy / move / rename (positive + negative) =====
+echo ''
+echo '===== copy / move / rename (positive + negative) ====='
 copy /sc/a.txt /sc/b.txt
 read /sc/b.txt | assert contains worldMORE
 assert ok read /sc/a.txt
@@ -272,6 +299,8 @@ write /sc/keep.txt x
 assert fails rename /sc/renamed.txt keep.txt
 
 # ===== cd: absolute / relative / parent / negative =====
+echo ''
+echo '===== cd: absolute / relative / parent / negative ====='
 cd /sc
 assert ok read a.txt
 ls | assert contains a.txt
@@ -284,6 +313,8 @@ assert fails cd /sc/a.txt
 cd /
 
 # ===== ls / find / tree as record producers (still referencing d1/d2) =====
+echo ''
+echo '===== ls / find / tree as record producers (still referencing d1/d2) ====='
 ls /sc | where type=file | assert contains a.txt
 ls /sc | where type=dir | assert contains d1
 ls /sc | where type=file | assert lacks d1
@@ -299,6 +330,8 @@ tree /sc | assert contains d2
 tree /sc | assert contains x
 
 # ===== directory move / rename (after the d1/d2 checks above) =====
+echo ''
+echo '===== directory move / rename (after the d1/d2 checks above) ====='
 move /sc/d2 /sc/d3
 assert ok read /sc/d3/f.txt
 assert fails read /sc/d2/f.txt
@@ -307,6 +340,8 @@ assert ok read /sc/dd1/f.txt
 assert fails read /sc/d1/f.txt
 
 # ===== byte pipes: producers + filters (each line spawns a service; kept lean) =====
+echo ''
+echo '===== byte pipes: producers + filters (each line spawns a service; kept lean) ====='
 greet | assert contains hello
 greet | match capability | assert contains capability
 greet | count | assert contains 3 lines
@@ -316,6 +351,8 @@ echo lower CASE | upper | assert contains LOWER CASE
 echo alpha beta gamma | match beta | assert contains beta
 
 # ===== record service over the binary wire codec (roster) - lean operator sample =====
+echo ''
+echo '===== record service over the binary wire codec (roster) - lean operator sample ====='
 assert ok roster
 roster | where role=core | assert contains Matthew
 roster | where role!=core | assert lacks Matthew
@@ -328,6 +365,8 @@ roster | to json | from json | where role=core | assert contains Matthew
 roster | select name seat | to json | assert contains Luke
 
 # ===== json <-> records bridge (exhaustive where/select/sort - no service spawn) =====
+echo ''
+echo '===== json <-> records bridge (exhaustive where/select/sort - no service spawn) ====='
 write /sc/data.json '[{"name":"x","n":1},{"name":"y","n":2},{"name":"z","n":3}]'
 read /sc/data.json | from json | assert contains y
 read /sc/data.json | from json | where n>1 | assert contains z
@@ -344,9 +383,13 @@ read /sc/data.json | from json | sort n | assert contains x
 read /sc/data.json | from json | sort reverse n | assert contains z
 
 # ===== fsck: drives check rebuilds bitmap/free from the populated tree, finds no corruption =====
+echo ''
+echo '===== fsck: drives check rebuilds bitmap/free from the populated tree, finds no corruption ====='
 assert ok drives check
 
 # ===== scrub: read-only CRC integrity sweep over the populated tree finds no bit-rot =====
+echo ''
+echo '===== scrub: read-only CRC integrity sweep over the populated tree finds no bit-rot ====='
 assert ok drives scrub
 
 # ===== file-as-capability (§7.10, P2): open a file as a REAL kernel cap and exercise every
@@ -356,6 +399,8 @@ assert ok drives scrub
 assert ok fcap
 
 # ===== cleanup: proves delete + delete recursive =====
+echo ''
+echo '===== cleanup: proves delete + delete recursive ====='
 delete /sc/a.txt
 assert fails read /sc/a.txt
 delete /sc recursive
