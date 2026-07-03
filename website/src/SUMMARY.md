@@ -12,6 +12,7 @@
 # The gsh Language
 
 - [The gsh scripting language](design/scripting.md)
+- [The gsh formatter (fmt)](design/fmt.md)
 
 # Design Notes
 
