@@ -17,18 +17,29 @@ duplicate truth") applies to docs as much as to code. Concretely:
   (navigation), `introduction.md` (a thin landing page that frames and links, never restates),
   `gallery.md` (framing around captured screenshots), and the images under `src/images/`.
 
-The `docs` GitHub Action (`.github/workflows/pages.yml`) rebuilds and republishes on every push to
-`main` that touches a source file. That push-triggered rebuild **is** the reconcile step that keeps
-the derived view honest.
+Regenerating the site is a **local** step: run `bash website/sync.sh` (below), then push. That sync
+**is** the reconcile step that keeps the derived view honest - after editing a source doc, re-run it
+so the site follows. (There is no CI build: the `docs` GitHub Action was removed to save Actions
+minutes, so the reconcile is a deliberate local command, not an automatic one.)
 
-## Build locally
+## Build locally - one command for both docs and website
+
+`website/sync.sh` regenerates the **whole site in one command**: the mdBook narrative (from the
+`{{#include}}` source-of-truth stubs) *and* the SDK rustdoc under `/api`. It is exactly what used to
+run in CI, so what you preview locally is what you publish.
 
 ```bash
-# one-time: install mdBook (matches the pinned CI version)
+# one-time: install mdBook (need python3 too, for the link-fixup preprocessor)
 cargo install mdbook --version 0.4.40
 
-# from this directory
-mdbook build      # -> website/book/
+# regenerate everything into website/book/ (+ /api) - run from anywhere:
+bash website/sync.sh
+```
+
+For fast iteration on the narrative alone, use mdBook directly from this directory:
+
+```bash
+mdbook build      # -> website/book/   (narrative only, no /api)
 mdbook serve      # live preview at http://localhost:3000
 ```
 
@@ -49,8 +60,12 @@ that is not a page (`README.md`, `examples/`) becomes a GitHub URL. The source d
 In-page anchors already resolve (each included file is one page). Set `GODSPEED_REPO_URL` to change
 the GitHub base used for non-page links (defaults to the current repo).
 
-## Launch checklist (do once, when the org/repo names are final)
+## Publishing (manual - no CI)
 
-- Set `git-repository-url` in `book.toml`.
-- Repo Settings -> Pages -> Source = "GitHub Actions".
-- Confirm the first `workflow_dispatch` run deploys, then let push-to-`main` drive it.
+The `docs` GitHub Action was removed to save Actions minutes, so you build and push:
+
+1. `bash website/sync.sh` - build the full site into `website/book/` (+ `/api`).
+2. Publish `website/book/` to GitHub Pages. To keep generated HTML off `main`, push it to a
+   `gh-pages` branch - e.g. with [`ghp-import`](https://github.com/c-w/ghp-import):
+   `ghp-import -n -p website/book` - and set repo Settings -> Pages -> Source to that branch.
+3. Set `git-repository-url` in `book.toml` once the org/repo names are final.
