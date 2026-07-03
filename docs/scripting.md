@@ -27,8 +27,11 @@
 > defer records only a (offset, len, scope-depth) into the resident script. **Record aggregators** are
 > BUILT too (§5): `count` is dual (rows of a record stream, lines of a byte stream), and
 > `sum`/`min`/`max`/`avg <col>` reduce a numeric column - loud on a non-numeric/missing column, never a
-> silent 0. **Tier 2 is now complete** (the only follow-ons deferred are the output-capture forms:
-> `$(fn …)`, `if fn { }`, `for line in (producer)`). Scripts use the `.gsh` extension
+> silent 0. **Tier 2 is now complete**, and **console input** is BUILT (§8): `input "prompt"` and
+> `input secret "prompt"` - invisible entry + an echo-taint guard rail (`sealed` reserved). The
+> remaining **deferred follow-ons** - the output-capture cluster (`$(fn …)`, `if fn { }`,
+> `for line in (producer)`), `sealed` enforcement + a secret consumer, and `input` pipe-else-prompt -
+> are collected as future work under §11. Scripts use the `.gsh` extension
 > (GodspeedOS shell; `.gs` is reserved for the future general-purpose Godspeed language). Builds on
 > the `run`/`run_lines` interpreter and the command **Result** model (`execute` returns `Ok`/`Err`).
 > Not POSIX - see CLAUDE.md Appendix B.3 / D.
@@ -578,6 +581,41 @@ These are the genuinely balloon-prone parts, or they belong to the general-purpo
   and the **record aggregators** (`count`/`sum`/`min`/`max`/`avg`).
 - **Tier 3** (resist): a string toolkit (length/slice/split), cross-file include / `source`,
   record-valued variables.
+
+### Deferred follow-ons (future ergonomics)
+
+These are **intended** for gsh (unlike §10, which is genuinely out of scope), but not built yet - the
+language is already complete enough to work in fully without them. They are recorded here so the intent
+is not lost; each is pulled into existence when a real script wants it (§26.2), not before.
+
+**The output-capture cluster** - three features that share one blocker. Each redirects a
+sub-computation's console output into a capture / stream buffer, which is a nested ~64 KiB buffer on top
+of a call frame - the exact stack pressure the heaviest run path already fights (§9: ~148 KiB
+co-resident against a 256 KiB user stack). Deferred until a chunk-streaming representation exists that
+does not buffer the whole sub-output (§26.6.1 - *change the representation, do not reach for more stack
+or a heap*):
+
+- **`$(fn …)`** - capture a *function's* output into a value: `let g = $(make_greeting Ada)`. Today
+  `$( )` captures only a bare producer (`$(read /f)`, `$(date)`).
+- **Function-valued conditions** - `if myfn { … }`, branching on a function's outcome directly instead
+  of calling it as a statement then checking `result`.
+- **Stream loops** - `for line in (producer) { … }`, iterating the lines a producer emits. Today `for`
+  takes words / `range` / `$@`.
+
+  *Current workaround (a working house pattern): **materialize-then-pipe** - the producer or function
+  writes a file, then `read <file> | …` or `let x = $(read <file>)`. Less inline, fully functional.*
+
+**Secret handling** - `input secret` today is a guard rail that only blocks console **echo** (not a
+vault - once a value may be written to a file it can be read back). Deferred until a real consumer
+exists to justify more (§26.2):
+
+- **`sealed` enforcement** - `input secret sealed` would additionally refuse **write + assign** of the
+  secret, not just echo. A reserved keyword today, currently a no-op.
+- **A secret consumer** - e.g. `auth` / `secret-eq`: something that *compares* a secret without
+  exposing it. This is the use that would make `sealed` worth enforcing.
+
+**Automation input** - **`input` pipe-else-prompt**: `input` reads from a connected pipe if one is
+present, else prompts - so the same script can run interactively or be fed non-interactively.
 
 ## 12. Worked example
 
