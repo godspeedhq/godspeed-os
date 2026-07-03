@@ -1224,6 +1224,7 @@ fn cmd_test(suite: &str) {
         "script"       => run_script_test(),
         "big-script"   => run_big_script_test(),
         "fmt-demo"     => run_fmt_demo_test(),
+        "fmt-idem"     => run_fmt_idem_test(),
         other => eprintln!("unknown test suite: {}", other),
     }
 }
@@ -2208,6 +2209,32 @@ fn run_big_script_test() {
     gsfs_add_file(disk, name, &content);
 
     crate::shell_test::run_big_script(&image_path, disk, name, 4);
+}
+
+/// fmt-idem: localize the streaming-formatter chunk-boundary bug. Bake a jarring file whose formatted
+/// output spans several read-chunks, format it TWICE, and diff the two outputs - the first differing
+/// byte is at (or just after) a chunk boundary. Fast (no 10 MB).
+fn run_fmt_idem_test() {
+    println!("\n=== fmt-idem: format-twice diff to localize the chunk-boundary bug ===");
+    cmd_build_bare_metal();
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+
+    // ~8 KB jarring: formats to ~10 KB, spanning ~3 read-chunks (~3556 each) -> a couple of boundaries.
+    let mut fi: Vec<u8> = Vec::new();
+    for i in 0..150 {
+        fi.extend_from_slice(format!("n = {0} ;   if $n > 3 {{echo a-{0}}} else {{echo b-{0}}}\n", i).as_bytes());
+    }
+    println!("fmt-idem: baking fi.gsh ({} bytes jarring)...", fi.len());
+    let _ = std::fs::create_dir_all("build/tests");
+    let disk = "build/tests/fmt_idem_disk.img";
+    std::fs::write(disk, vec![0u8; 16 * 1024 * 1024]).expect("failed to create disk");
+    format_superblock(disk);
+    gsfs_add_file(disk, "fi.gsh", &fi);
+    crate::shell_test::run_fmt_idem(&image_path, disk, 4);
 }
 
 /// fmt-demo: bake a jarring `jar.gsh` + a 10 MB `huge_fmt.gsh`, boot, and run `fmt` on each - the

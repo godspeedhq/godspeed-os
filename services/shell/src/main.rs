@@ -2342,7 +2342,11 @@ fn fmt_walk_window(win: &[u8], eof: bool, depth: &mut usize, first: &mut bool,
         if c == b'}' {
             let after = np + 1;
             let p = skip_ws(win, after);
-            if p >= win.len() && !eof { return Ok(entry); } // can't see past } yet -> hold
+            // Decide `} else {` vs a plain close only when the window shows enough PAST the `}` to
+            // confirm the `else` keyword (4 chars + a boundary char = 5). If it ends inside/right after
+            // a possible `else`, HOLD - otherwise a `} else {` split across a read is mis-emitted as a
+            // plain `}` plus a new `else {` block (the chunk-boundary idempotency bug).
+            if p + 5 > win.len() && !eof { return Ok(entry); }
             if matches_kw(win, p, b"else") {
                 match fmt_find_brace_win(win, p + 4) {
                     Some(ob) => {

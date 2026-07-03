@@ -3588,6 +3588,63 @@ pub fn run_fmt_demo(image_path: &Path, disk_path: &str, smp: u32) {
     if fail > 0 { std::process::exit(1); }
 }
 
+/// Boot bare-metal with a jarring `fi.gsh` baked in, format it TWICE, read both results, and diff
+/// them - the first differing byte localizes the streaming chunk-boundary bug.
+pub fn run_fmt_idem(image_path: &Path, disk_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let disk      = std::fs::canonicalize(disk_path).unwrap_or_else(|_| std::path::PathBuf::from(disk_path));
+    let disk_str  = disk.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(),
+        "-m",       "512M",
+        "-serial",  &format!("tcp::{shell_port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("fmt-idem: QEMU launch failed: {e}"); std::process::exit(1); });
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
+        Some(s) => s, None => { eprintln!("fmt-idem: no serial"); child.kill().ok(); std::process::exit(1); }
+    };
+    let mut read_half  = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    { let buf2 = Arc::clone(&buf); thread::spawn(move || {
+        let mut tmp = [0u8; 256];
+        loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+    }); }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).is_none() {
+        println!("fmt-idem: FAIL - no first gsh>"); child.kill().ok(); child.wait().ok(); std::process::exit(1);
+    }
+    send(&mut write_half, b"fmt /fi.gsh\r");   let _  = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(90));
+    send(&mut write_half, b"read /fi.gsh\r");   let a  = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(90)).unwrap_or_default();
+    send(&mut write_half, b"fmt /fi.gsh\r");   let _  = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(90));
+    send(&mut write_half, b"read /fi.gsh\r");   let b  = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(90)).unwrap_or_default();
+    child.kill().ok(); child.wait().ok();
+
+    let _ = std::fs::write("build/fmt-A.txt", a.as_bytes());
+    let _ = std::fs::write("build/fmt-B.txt", b.as_bytes());
+    let (ab, bb) = (a.as_bytes(), b.as_bytes());
+    let n = ab.len().min(bb.len());
+    let mut i = 0usize; while i < n && ab[i] == bb[i] { i += 1; }
+    if i == n && ab.len() == bb.len() {
+        println!("fmt-idem: IDENTICAL - fmt IS idempotent on this file ({} bytes)", ab.len());
+    } else {
+        println!("fmt-idem: DIFFER at byte {} (A={} bytes, B={} bytes)", i, ab.len(), bb.len());
+        let lo = i.saturating_sub(60);
+        println!("  A[{}..]: {:?}", lo, String::from_utf8_lossy(&ab[lo..(i + 60).min(ab.len())]));
+        println!("  B[{}..]: {:?}", lo, String::from_utf8_lossy(&bb[lo..(i + 60).min(bb.len())]));
+    }
+    println!("(full A/B saved to build/fmt-A.txt, build/fmt-B.txt)");
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
