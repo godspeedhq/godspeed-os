@@ -1222,6 +1222,7 @@ fn cmd_test(suite: &str) {
         "files"        => run_files_test(),
         "edit"         => run_edit_test(),
         "script"       => run_script_test(),
+        "big-script"   => run_big_script_test(),
         other => eprintln!("unknown test suite: {}", other),
     }
 }
@@ -2091,6 +2092,35 @@ fn run_script_test() {
     gsfs_add_file(disk, name, &suite);
 
     crate::shell_test::run_script(&image_path, disk, name, 4);
+}
+
+/// 10 MB `.gsh` stress: bake a 10 MB complex script into a GSFS disk, boot, and `run` it. Proves the
+/// run-from-file BOUND (SCRIPT_MAX): the streaming minifier reads ~7 KiB of CODE and truncates
+/// LOUDLY, the complex tour still runs, and the kernel never panics or OOMs on a 10 MB file (§26.6.1,
+/// docs/scripting.md §9). `a huge script is a program` - handled gracefully, not catastrophically.
+fn run_big_script_test() {
+    println!("\n=== big-script: a 10 MB .gsh, run on boot (bounded-load stress) ===");
+    cmd_build_bare_metal();
+
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+
+    let script_path = "scripts/10_meg_shell_script_test.gsh";
+    let content = std::fs::read(script_path)
+        .unwrap_or_else(|e| { eprintln!("big-script: cannot read {}: {}", script_path, e); std::process::exit(1); });
+    let name = std::path::Path::new(script_path).file_name().and_then(|s| s.to_str()).unwrap_or("big.gsh");
+    println!("big-script: baking {} ({:.2} MiB) into a GSFS disk...", name, content.len() as f64 / 1024.0 / 1024.0);
+
+    let _ = std::fs::create_dir_all("build/tests");
+    let disk = "build/tests/big_script_disk.img";
+    std::fs::write(disk, vec![0u8; 16 * 1024 * 1024]).expect("failed to create disk"); // 16 MiB fits a 10 MB file
+    format_superblock(disk);
+    gsfs_add_file(disk, name, &content);
+
+    crate::shell_test::run_big_script(&image_path, disk, name, 4);
 }
 
 /// §22 Test 13 (Phase D): fs survives its own restart. Bare-metal shell + AHCI disk; the

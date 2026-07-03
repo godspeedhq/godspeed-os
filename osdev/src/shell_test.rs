@@ -3362,6 +3362,90 @@ pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u3
     if fail > 0 { std::process::exit(1); }
 }
 
+/// Boot bare-metal with a 10 MB `.gsh` baked in and `run` it - proving the run-from-file BOUND
+/// (SCRIPT_MAX): the streaming minifier reads ~7 KiB of CODE and truncates LOUDLY, the complex tour
+/// still runs, and the kernel never panics or OOMs on a 10 MB file (§26.6.1, docs/scripting.md §9).
+pub fn run_big_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u32) {
+    println!("big-script: booting (smp={smp}) with a 10 MB GSFS-baked .gsh");
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let disk      = std::fs::canonicalize(disk_path).unwrap_or_else(|_| std::path::PathBuf::from(disk_path));
+    let disk_str  = disk.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(),
+        "-m",       "512M",
+        "-serial",  &format!("tcp::{shell_port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("big-script: QEMU launch failed at {qemu}: {e}"); std::process::exit(1); });
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => { eprintln!("big-script: could not connect to serial {shell_port}"); child.kill().ok(); std::process::exit(1); }
+    };
+    let mut read_half  = stream.try_clone().expect("clone tcp stream");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+
+    let mut pass = 0usize;
+    let mut fail = 0usize;
+    let mut cursor = 0usize;
+    macro_rules! check {
+        ($ok:expr, $label:expr) => {
+            if $ok { println!("big-script: PASS - {}", $label); pass += 1; }
+            else   { println!("big-script: FAIL - {}", $label); fail += 1; }
+        };
+    }
+
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).is_none() {
+        println!("big-script: FAIL - timed out waiting for first gsh>");
+        child.kill().ok(); child.wait().ok(); std::process::exit(1);
+    }
+
+    // Run the 10 MB script. It loads BOUNDED (~7 KiB), truncates loudly, runs the tour + some blocks.
+    send(&mut write_half, format!("run /{script_name}\r").as_bytes());
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(120)) {
+        Some(r) => {
+            let _ = std::fs::write("build/big-script-transcript.txt", r.as_bytes()); // full transcript for inspection
+            let tail: String = r.lines().rev().take(50).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+            println!("\n=== 10 MB run transcript (last 50 lines; full -> build/big-script-transcript.txt) ===\n{}\n=== end ===", tail.trim());
+            check!(r.contains("===TEN-MEG-STRESS-BEGIN==="), "the run started (10 MB script loaded, not rejected)");
+            check!(r.contains("===TEN-MEG-TOUR-DONE==="), "the complex feature-tour ran to completion (all features green)");
+            check!(r.contains("truncated") || r.contains("CODE exceeds"), "the 10 MB script truncated LOUDLY at SCRIPT_MAX");
+            check!(r.contains("blk-"), "dynamic blocks ran past the tour, up to the truncation point");
+            check!(!r.contains("KERNEL PANIC"), "no kernel panic on a 10 MB file");
+        }
+        None => { println!("big-script: FAIL - `run /{script_name}` timed out (hang on 10 MB?)"); fail += 1; }
+    }
+
+    // The shell SURVIVED - it still answers after loading + truncating a 10 MB file (no wedge/OOM).
+    send(&mut write_half, b"echo STILL-ALIVE\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("STILL-ALIVE"), "shell is responsive after the 10 MB run"),
+        None => { println!("big-script: FAIL - shell unresponsive after the 10 MB run"); fail += 1; }
+    }
+
+    child.kill().ok();
+    child.wait().ok();
+    println!("\nbig-script: {pass} passed, {fail} failed");
+    if fail > 0 { std::process::exit(1); }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
