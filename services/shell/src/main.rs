@@ -2208,48 +2208,53 @@ fn read_statement(b: &[u8], start: usize) -> (&[u8], usize) {
 }
 
 // ── `fmt` (utilities/39_fmt.md): the .gsh formatter. One canonical layout, applied in place. A
-// bounded, token-level RE-EMITTER: it never evaluates the script, it only re-lays-out its tokens
-// (indent by brace depth, one statement per line, K&R braces, single inter-token space, `#`-comment
-// spacing, blank-line collapse), so it is semantics-preserving by construction and idempotent. It
-// shares the minifier's quote-aware whitespace discipline - fmt and minify are one operation with
-// opposite emit policies (fmt expands, minify contracts). ──
+// STREAMING, token-level RE-EMITTER: it reads the script in chunks and formats each (indent by brace
+// depth, one statement per line, K&R braces, single inter-token space, `#`-comment spacing, blank-line
+// collapse), emitting to a closure - holding only ONE partial statement + the indent depth across
+// chunk boundaries. Constant memory, NO file-size limit. It never evaluates, only re-lays-out, so it
+// is semantics-preserving + idempotent. fmt and minify are one operation, opposite emit policies. ──
 
-/// Why a `fmt` run produced no output.
-enum FmtErr { Unparseable, TooBig }
+/// Why a `fmt` run stopped. `UnitTooLong` = a single statement/header exceeds the hold buffer; `Write`
+/// = the output sink (temp file) rejected a write.
+enum FmtErr { Unparseable, UnitTooLong, Write }
 
-const FMT_TAB: usize = 4; // spaces per block depth
+const FMT_TAB: usize = 4;       // spaces per block depth
+const FMT_HOLD: usize = 4096;   // max size of ONE statement/header/comment carried across a chunk
+const FMT_RCHUNK: usize = 4096; // source read chunk
 
-/// Append `bytes` to `out[..*w]`, or `TooBig` if it would overflow (never a truncated write).
-fn fmt_push(out: &mut [u8], w: &mut usize, bytes: &[u8]) -> Result<(), FmtErr> {
-    if *w + bytes.len() > out.len() { return Err(FmtErr::TooBig); }
-    out[*w..*w + bytes.len()].copy_from_slice(bytes);
-    *w += bytes.len();
-    Ok(())
+/// Emit a run of bytes to the sink; `Write` if the sink rejected it.
+fn femit(emit: &mut dyn FnMut(&[u8]) -> bool, b: &[u8]) -> Result<(), FmtErr> {
+    if emit(b) { Ok(()) } else { Err(FmtErr::Write) }
 }
 
 /// Emit `depth` levels of indentation (capped so a pathological nesting can't run away).
-fn fmt_indent(out: &mut [u8], w: &mut usize, depth: usize) -> Result<(), FmtErr> {
+fn femit_indent(emit: &mut dyn FnMut(&[u8]) -> bool, depth: usize) -> Result<(), FmtErr> {
     const SPACES: [u8; 64] = [b' '; 64];
-    fmt_push(out, w, &SPACES[..(depth * FMT_TAB).min(64)])
+    femit(emit, &SPACES[..(depth * FMT_TAB).min(64)])
 }
 
 /// Emit one already-trimmed statement/header, collapsing runs of whitespace OUTSIDE quotes to a
 /// single space (gsh tokenizes on whitespace) while copying quoted content verbatim. Same discipline
 /// as the minifier's collapse - the shared whitespace policy of the two tools.
-fn fmt_stmt(out: &mut [u8], w: &mut usize, s: &[u8]) -> Result<(), FmtErr> {
-    let mut quote: u8 = 0;
+fn femit_stmt(emit: &mut dyn FnMut(&[u8]) -> bool, s: &[u8]) -> Result<(), FmtErr> {
+    let mut i = 0usize;
     let mut prev_ws = false;
-    for &c in s {
-        if quote != 0 {
-            fmt_push(out, w, &[c])?;
-            if c == quote { quote = 0; }
+    while i < s.len() {
+        let c = s[i];
+        if c == b'\'' || c == b'"' {
+            let start = i; i += 1;
+            while i < s.len() && s[i] != c { i += 1; }
+            if i < s.len() { i += 1; } // include the closing quote
+            femit(emit, &s[start..i])?;
             prev_ws = false;
-        } else if c == b'\'' || c == b'"' {
-            quote = c; fmt_push(out, w, &[c])?; prev_ws = false;
         } else if c.is_ascii_whitespace() {
-            if !prev_ws { fmt_push(out, w, b" ")?; prev_ws = true; }
+            while i < s.len() && s[i].is_ascii_whitespace() { i += 1; }
+            if !prev_ws { femit(emit, b" ")?; prev_ws = true; }
         } else {
-            fmt_push(out, w, &[c])?; prev_ws = false;
+            let start = i;
+            while i < s.len() && !s[i].is_ascii_whitespace() && s[i] != b'\'' && s[i] != b'"' { i += 1; }
+            femit(emit, &s[start..i])?;
+            prev_ws = false;
         }
     }
     Ok(())
@@ -2271,97 +2276,150 @@ fn fmt_skip_layout(b: &[u8], pos: usize) -> (usize, bool) {
     (i, nl >= 2)
 }
 
-/// Scan one statement from `start`, PRESERVING a trailing `#` comment (unlike `read_statement`, which
-/// drops it). Returns `(statement, comment, stopped_at_open_brace, resume)`: a `{` (block header) and
-/// `}` are not consumed; `;`/newline/comment are stepped past. Quote-aware.
-fn fmt_scan(b: &[u8], start: usize) -> (&[u8], &[u8], bool, usize) {
+/// Find the next `{` from `pos` (quote-aware); `None` if none appears before the window end. Unlike
+/// `find_open_brace` it does NOT stop at a `}` - an `else if <cond>` header contains none.
+fn fmt_find_brace_win(b: &[u8], mut pos: usize) -> Option<usize> {
+    let mut q: u8 = 0;
+    while pos < b.len() {
+        let c = b[pos];
+        if q != 0 { if c == q { q = 0; } }
+        else if c == b'\'' || c == b'"' { q = c; }
+        else if c == b'{' { return Some(pos); }
+        pos += 1;
+    }
+    None
+}
+
+/// How a window statement scan ended.
+#[derive(Clone, Copy)]
+enum ScanEnd { Brace(usize), Term(usize), End } // Brace(`{` pos) / Term(resume) / End (window ran out)
+
+/// Scan one statement from `start` within a window, preserving a trailing `#` comment. `End` means the
+/// window ran out before a terminator (`;`/newline/`{`/`}`/complete comment) - a partial unit to hold.
+/// A `{`/`}` is not consumed (the caller handles them).
+fn fmt_scan_window(b: &[u8], start: usize) -> (&[u8], &[u8], ScanEnd) {
     let mut i = start;
     let mut quote: u8 = 0;
     while i < b.len() {
         let c = b[i];
         if quote != 0 {
-            if c == b'\n' { return (trim_bytes(&b[start..i]), &b[start..start], false, i + 1); }
+            if c == b'\n' { return (trim_bytes(&b[start..i]), &b[start..start], ScanEnd::Term(i + 1)); }
             if c == quote { quote = 0; }
             i += 1;
             continue;
         }
         match c {
             b'\'' | b'"' => { quote = c; i += 1; }
-            b';' | b'\n' => return (trim_bytes(&b[start..i]), &b[start..start], false, i + 1),
-            b'{' => return (trim_bytes(&b[start..i]), &b[start..start], true, i),
-            b'}' => return (trim_bytes(&b[start..i]), &b[start..start], false, i),
+            b';' | b'\n' => return (trim_bytes(&b[start..i]), &b[start..start], ScanEnd::Term(i + 1)),
+            b'{' => return (trim_bytes(&b[start..i]), &b[start..start], ScanEnd::Brace(i)),
+            b'}' => return (trim_bytes(&b[start..i]), &b[start..start], ScanEnd::Term(i)),
             b'#' if i == start || b[i - 1].is_ascii_whitespace() => {
                 let stmt = trim_bytes(&b[start..i]);
                 let cs = i + 1;
                 let mut k = cs;
                 while k < b.len() && b[k] != b'\n' { k += 1; }
-                return (stmt, trim_bytes(&b[cs..k]), false, if k < b.len() { k + 1 } else { k });
+                if k >= b.len() { return (stmt, trim_bytes(&b[cs..k]), ScanEnd::End); } // comment ran off window
+                return (stmt, trim_bytes(&b[cs..k]), ScanEnd::Term(k + 1));
             }
             _ => i += 1,
         }
     }
-    (trim_bytes(&b[start..i]), &b[start..start], false, i)
+    (trim_bytes(&b[start..i]), &b[start..start], ScanEnd::End) // no terminator in window -> partial
 }
 
-/// Format `src` into `out`, returning the formatted length. Never evaluates; only re-lays-out. Loud
-/// (Err) on unbalanced braces (`Unparseable`) or an output that would overflow `out` (`TooBig`) - the
-/// caller then refuses and leaves the file untouched.
-fn fmt_bytes(src: &[u8], out: &mut [u8]) -> Result<usize, FmtErr> {
-    let mut w = 0usize;
-    let mut depth: usize = 0;
+/// Format the window `win`, emitting formatted runs via `emit`. Tracks `depth`/`first` across calls.
+/// Returns bytes safely CONSUMED; when `!eof` and a unit needs data past the window (partial statement,
+/// a `}` whose `else`/`{` look-ahead isn't present, a partial comment) it stops BEFORE that unit so the
+/// caller can hold it. Errors: `Unparseable` (stray `}`), `Write` (sink failed).
+fn fmt_walk_window(win: &[u8], eof: bool, depth: &mut usize, first: &mut bool,
+                   emit: &mut dyn FnMut(&[u8]) -> bool) -> Result<usize, FmtErr> {
     let mut pos = 0usize;
-    let mut first = true;
     loop {
-        let (np, blank) = fmt_skip_layout(src, pos);
-        pos = np;
-        if pos >= src.len() { break; }
-        let c = src[pos];
-        if blank && !first && c != b'}' { fmt_push(out, &mut w, b"\n")?; } // one preserved blank line
-        first = false;
+        let entry = pos; // loop entry (before layout) - the point to hold from
+        let (np, blank) = fmt_skip_layout(win, pos);
+        if np >= win.len() { return Ok(np); } // consumed trailing layout (not emitted)
+        let c = win[np];
         if c == b'}' {
-            if depth == 0 { return Err(FmtErr::Unparseable); } // stray closing brace
-            depth -= 1;
-            fmt_indent(out, &mut w, depth)?;
-            fmt_push(out, &mut w, b"}")?;
-            pos += 1;
-            let p = skip_ws(src, pos);
-            if matches_kw(src, p, b"else") {
-                fmt_push(out, &mut w, b" else")?;
-                pos = p + 4;
-                let ob = match find_open_brace(src, pos) { Some(o) => o, None => return Err(FmtErr::Unparseable) };
-                let hdr = trim_bytes(&src[pos..ob]); // "" for plain else, "if <cond>" for else-if
-                if !hdr.is_empty() { fmt_push(out, &mut w, b" ")?; fmt_stmt(out, &mut w, hdr)?; }
-                fmt_push(out, &mut w, b" {\n")?;
-                depth += 1;
-                pos = ob + 1;
+            let after = np + 1;
+            let p = skip_ws(win, after);
+            if p >= win.len() && !eof { return Ok(entry); } // can't see past } yet -> hold
+            if matches_kw(win, p, b"else") {
+                match fmt_find_brace_win(win, p + 4) {
+                    Some(ob) => {
+                        if *depth == 0 { return Err(FmtErr::Unparseable); }
+                        *depth -= 1;
+                        femit_indent(emit, *depth)?; femit(emit, b"}")?; femit(emit, b" else")?;
+                        let hdr = trim_bytes(&win[p + 4..ob]); // "" plain else / "if <cond>"
+                        if !hdr.is_empty() { femit(emit, b" ")?; femit_stmt(emit, hdr)?; }
+                        femit(emit, b" {\n")?;
+                        *depth += 1; *first = false;
+                        pos = ob + 1;
+                    }
+                    None => {
+                        if !eof { return Ok(entry); } // else-header `{` not here yet -> hold
+                        if *depth == 0 { return Err(FmtErr::Unparseable); }
+                        *depth -= 1; femit_indent(emit, *depth)?; femit(emit, b"}\n")?; *first = false;
+                        pos = after;
+                    }
+                }
             } else {
-                fmt_push(out, &mut w, b"\n")?;
+                if *depth == 0 { return Err(FmtErr::Unparseable); }
+                *depth -= 1; femit_indent(emit, *depth)?; femit(emit, b"}\n")?; *first = false;
+                pos = after;
             }
             continue;
         }
-        let (stmt, comment, at_brace, resume) = fmt_scan(src, pos);
-        if at_brace {
-            fmt_indent(out, &mut w, depth)?;
-            if !stmt.is_empty() { fmt_stmt(out, &mut w, stmt)?; fmt_push(out, &mut w, b" ")?; }
-            fmt_push(out, &mut w, b"{\n")?;
-            depth += 1;
-            pos = resume + 1; // step past the '{'
-        } else {
-            if !stmt.is_empty() || !comment.is_empty() {
-                fmt_indent(out, &mut w, depth)?;
-                if !stmt.is_empty() { fmt_stmt(out, &mut w, stmt)?; }
-                if !comment.is_empty() {
-                    if !stmt.is_empty() { fmt_push(out, &mut w, b" ")?; }
-                    fmt_push(out, &mut w, b"# ")?;
-                    fmt_push(out, &mut w, comment)?;
-                }
-                fmt_push(out, &mut w, b"\n")?;
+        let (stmt, comment, end) = fmt_scan_window(win, np);
+        if let ScanEnd::End = end { if !eof { return Ok(entry); } } // partial unit -> hold
+        if blank && !*first { femit(emit, b"\n")?; } // preserved paragraph break (never before a `}`)
+        *first = false;
+        match end {
+            ScanEnd::Brace(bp) => {
+                femit_indent(emit, *depth)?;
+                if !stmt.is_empty() { femit_stmt(emit, stmt)?; femit(emit, b" ")?; }
+                femit(emit, b"{\n")?;
+                *depth += 1;
+                pos = bp + 1;
             }
-            pos = resume;
+            _ => { // Term, or End at eof: a simple statement (+ optional trailing comment)
+                if !stmt.is_empty() || !comment.is_empty() {
+                    femit_indent(emit, *depth)?;
+                    if !stmt.is_empty() { femit_stmt(emit, stmt)?; }
+                    if !comment.is_empty() {
+                        if !stmt.is_empty() { femit(emit, b" ")?; }
+                        femit(emit, b"# ")?; femit(emit, comment)?;
+                    }
+                    femit(emit, b"\n")?;
+                }
+                pos = match end { ScanEnd::Term(r) => r, _ => win.len() };
+            }
         }
     }
+}
+
+/// Stream `path` through the formatter, calling `emit` for each formatted run - constant memory (reads
+/// in chunks, holds only ONE partial statement). `UnitTooLong` if a single statement exceeds the hold;
+/// `Unparseable` if a block is left unclosed. No file-size limit.
+fn fmt_stream_pass(ctx: &ServiceContext, path: &[u8], emit: &mut dyn FnMut(&[u8]) -> bool) -> Result<(), FmtErr> {
+    let mut work = [0u8; FMT_HOLD + FMT_RCHUNK];
+    let mut hold = 0usize;
+    let mut depth = 0usize;
+    let mut first = true;
+    let mut src_off = 0u64;
+    loop {
+        let got = fs_read_at(ctx, path, src_off, &mut work[hold..hold + FMT_RCHUNK]).unwrap_or(0);
+        src_off += got as u64;
+        let avail = hold + got;
+        let eof = got == 0;
+        let consumed = fmt_walk_window(&work[..avail], eof, &mut depth, &mut first, emit)?;
+        if eof { break; }
+        let tail = avail - consumed;
+        if tail >= FMT_HOLD { return Err(FmtErr::UnitTooLong); } // one statement bigger than the hold
+        work.copy_within(consumed..avail, 0);
+        hold = tail;
+    }
     if depth != 0 { return Err(FmtErr::Unparseable); } // unclosed block
-    Ok(w)
+    Ok(())
 }
 
 // ── Loops (§5): `for <var> in <words|range|$@> { … }` and unbounded `loop { … }`. ──
@@ -6744,65 +6802,66 @@ fn cmd_write(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
     }
 }
 
-const FMT_RAW_MAX: usize = 12288; // largest raw script fmt will load (streamed read, offsets)
-const FMT_OUT_MAX: usize = 20480; // formatted output cap (streamed write, offsets; layout expands source)
-const FMT_CHUNK: usize = 2048;    // streamed-write chunk (well within one IPC message)
+const FMT_IOBUF: usize = 4096; // fmt's write / compare chunk buffer
 
-/// Read a whole file into `buf`. `Ok(n)` = read n bytes; `Err(true)` = larger than `buf` (too big to
-/// format in bounds); `Err(false)` = not found / storage. Bounded: never reads past `buf`.
-fn fmt_read_raw(ctx: &ServiceContext, path: &[u8], buf: &mut [u8]) -> Result<usize, bool> {
-    let mut total = 0usize;
+/// Stream-format `src` into a fresh temp `tmp` (2-pass: count the size for `OP_WRITE_NEW`, then
+/// stream-write). Reads `src` and writes `tmp` - DIFFERENT files, never `src` twice at once. Returns
+/// the formatted byte count. On failure deletes the temp; the caller leaves `src` untouched.
+fn fmt_to_temp(ctx: &ServiceContext, src: &[u8], tmp: &[u8]) -> Result<u64, FmtErr> {
+    let mut total = 0u64;
+    {
+        let mut count = |bytes: &[u8]| -> bool { total += bytes.len() as u64; true };
+        fmt_stream_pass(ctx, src, &mut count)?; // no temp exists yet - safe to `?`
+    }
+    let _ = fs_request(ctx, OP_DELETE, tmp, &[]); // clear any stale temp
+    if !fs_write_new(ctx, tmp, total) { return Err(FmtErr::Write); }
+    let mut wlen = 0usize;
+    let mut woff = 0u64;
+    let mut werr = false;
+    let r = {
+        let mut wbuf = [0u8; FMT_IOBUF];
+        let mut write = |bytes: &[u8]| -> bool {
+            let mut o = 0usize;
+            while o < bytes.len() {
+                if wlen == wbuf.len() {
+                    if !fs_write_at(ctx, tmp, woff, &wbuf[..wlen]) { werr = true; return false; }
+                    woff += wlen as u64; wlen = 0;
+                }
+                let take = (bytes.len() - o).min(wbuf.len() - wlen);
+                wbuf[wlen..wlen + take].copy_from_slice(&bytes[o..o + take]);
+                wlen += take; o += take;
+            }
+            true
+        };
+        let rr = fmt_stream_pass(ctx, src, &mut write);
+        if !werr && wlen > 0 && !fs_write_at(ctx, tmp, woff, &wbuf[..wlen]) { werr = true; } // final flush
+        rr
+    };
+    if let Err(e) = r { let _ = fs_request(ctx, OP_DELETE, tmp, &[]); return Err(e); }
+    if werr { let _ = fs_request(ctx, OP_DELETE, tmp, &[]); return Err(FmtErr::Write); }
+    Ok(total)
+}
+
+/// Stream-compare two files; true iff byte-identical. Reads them SEQUENTIALLY (one then the other),
+/// so it is safe even when one path is the source (no two concurrent reads of the same file).
+fn fmt_compare_files(ctx: &ServiceContext, a: &[u8], b: &[u8]) -> bool {
+    let mut off = 0u64;
+    let mut ba = [0u8; FMT_IOBUF];
+    let mut bb = [0u8; FMT_IOBUF];
     loop {
-        if total == buf.len() {
-            let mut probe = [0u8; 1];
-            return match fs_read_at(ctx, path, total as u64, &mut probe) {
-                Some(0) | None => Ok(total),
-                Some(_) => Err(true), // more data past the cap -> too big
-            };
-        }
-        match fs_read_at(ctx, path, total as u64, &mut buf[total..]) {
-            Some(0) => return Ok(total),
-            Some(k) => total += k,
-            None => return if total == 0 { Err(false) } else { Ok(total) },
-        }
+        let ka = fs_read_at(ctx, a, off, &mut ba).unwrap_or(0);
+        let kb = fs_read_at(ctx, b, off, &mut bb).unwrap_or(0);
+        if ka != kb { return false; }
+        if ka == 0 { return true; }
+        if ba[..ka] != bb[..ka] { return false; }
+        off += ka as u64;
     }
 }
 
-/// Write `data` to `path` by STREAMING to a temp with offsets (`OP_WRITE_NEW` + chunked
-/// `OP_WRITE_AT`), then committing (delete original, rename temp into place). The multi-chunk data
-/// write lands on the TEMP, so the original stays intact through it - a data-write failure leaves the
-/// original untouched (the guardrail). Not capped by the single-message `OP_WRITE_FILE` size.
-fn fmt_write_streamed(ctx: &ServiceContext, path: &[u8], data: &[u8]) -> bool {
-    const SUF: &[u8] = b".fmt~";
-    if path.len() + SUF.len() > PATH_MAX { return false; }
-    let mut tbuf = [0u8; PATH_MAX];
-    tbuf[..path.len()].copy_from_slice(path);
-    tbuf[path.len()..path.len() + SUF.len()].copy_from_slice(SUF);
-    let tmp = &tbuf[..path.len() + SUF.len()];
-
-    let _ = fs_request(ctx, OP_DELETE, tmp, &[]); // clear any stale temp from a prior aborted run
-    if !fs_write_new(ctx, tmp, data.len() as u64) { return false; }
-    let mut off = 0usize;
-    while off < data.len() {
-        let end = (off + FMT_CHUNK).min(data.len());
-        if !fs_write_at(ctx, tmp, off as u64, &data[off..end]) {
-            let _ = fs_request(ctx, OP_DELETE, tmp, &[]); // clean up; original untouched
-            return false;
-        }
-        off = end;
-    }
-    // Commit: the original is still whole up to here. Delete it, then rename the temp into its
-    // basename (OP_RENAME renames within the temp's own directory, and won't overwrite a live name).
-    let mut bstart = 0usize;
-    for (i, &c) in path.iter().enumerate() { if c == b'/' { bstart = i + 1; } }
-    let base = &path[bstart..];
-    let _ = fs_request(ctx, OP_DELETE, path, &[]);
-    matches!(fs_request(ctx, OP_RENAME, tmp, base), Some(r) if r.payload_bytes().first() == Some(&FS_OK))
-}
-
-/// `fmt <path>` - format a `.gsh` script to the GodspeedOS standard, in place (utilities/39_fmt.md).
-/// `fmt check <path>` - report (loud + `Err`) whether it is canonical, without writing. Guardrails:
-/// won't-parse and too-big both refuse loudly and leave the file UNTOUCHED (never a damaged file).
+/// `fmt <path>` - format a `.gsh` script to the GodspeedOS standard, IN PLACE, STREAMED (any size, no
+/// cap). `fmt check <path>` - report (loud + `Err`) whether it is already canonical, without writing.
+/// Guardrails (loud, file UNTOUCHED): won't-parse (unbalanced braces), or a single statement too long
+/// to hold. The format write streams into a temp then renames, so a failure never damages the original.
 fn cmd_fmt(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
     let rest = rest.trim();
     let (check, pathstr) = match rest.split_once(char::is_whitespace) {
@@ -6818,33 +6877,40 @@ fn cmd_fmt(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellError
     let mut pcopy = [0u8; PATH_MAX];
     let pl = path.len(); pcopy[..pl].copy_from_slice(path); let p = &pcopy[..pl];
 
-    let mut raw = [0u8; FMT_RAW_MAX];
-    let n = match fmt_read_raw(ctx, p, &mut raw) {
-        Ok(n) => n,
-        Err(true)  => { ctx.console_writeln_fmt(format_args!("fmt: {} is too large to format (bounded) - left untouched", str_of(p))); return Err(ShellError::Unknown); }
-        Err(false) => { ctx.console_writeln_fmt(format_args!("fmt: cannot read {}", str_of(p))); return Err(ShellError::FileNotFound); }
-    };
-    let mut outbuf = [0u8; FMT_OUT_MAX];
-    let m = match fmt_bytes(&raw[..n], &mut outbuf) {
-        Ok(m) => m,
+    const SUF: &[u8] = b".fmt~";
+    if p.len() + SUF.len() > PATH_MAX { ctx.console_writeln("fmt: path too long"); return Err(ShellError::Unknown); }
+    let mut tbuf = [0u8; PATH_MAX];
+    tbuf[..p.len()].copy_from_slice(p);
+    tbuf[p.len()..p.len() + SUF.len()].copy_from_slice(SUF);
+    let tmp = &tbuf[..p.len() + SUF.len()];
+
+    let total = match fmt_to_temp(ctx, p, tmp) {
+        Ok(t) => t,
         Err(FmtErr::Unparseable) => { ctx.console_writeln_fmt(format_args!("fmt: {} won't parse (unbalanced braces?) - left untouched", str_of(p))); return Err(ShellError::Unknown); }
-        Err(FmtErr::TooBig)      => { ctx.console_writeln_fmt(format_args!("fmt: {} formats too large (bounded) - left untouched", str_of(p))); return Err(ShellError::Unknown); }
+        Err(FmtErr::UnitTooLong) => { ctx.console_writeln_fmt(format_args!("fmt: {} has a statement too long to format - left untouched", str_of(p))); return Err(ShellError::Unknown); }
+        Err(FmtErr::Write)       => { ctx.console_writeln_fmt(format_args!("fmt: write failed - {} left untouched", str_of(p))); return Err(ShellError::Unknown); }
     };
-    let already = &outbuf[..m] == &raw[..n];
+
     if check {
-        if already { return Ok(()); } // canonical: silent Ok
+        // Compare the freshly-formatted temp against the original (two DIFFERENT files, read
+        // sequentially), then discard the temp. `check` never modifies the file.
+        let canonical = fmt_compare_files(ctx, tmp, p);
+        let _ = fs_request(ctx, OP_DELETE, tmp, &[]);
+        if canonical { return Ok(()); } // silent Ok
         ctx.console_writeln_fmt(format_args!("fmt: {} is not canonical (run: fmt {})", str_of(p), str_of(p)));
         return Err(ShellError::Unknown);
     }
-    if already {
-        ctx.console_writeln_fmt(format_args!("fmt: {} already canonical", str_of(p)));
-        return Ok(());
-    }
-    if fmt_write_streamed(ctx, p, &outbuf[..m]) {
-        ctx.console_writeln_fmt(format_args!("fmt {} ({} bytes)", str_of(p), m));
+
+    // Commit: the temp holds the whole formatted output; delete the original, rename the temp in.
+    let mut bstart = 0usize;
+    for (i, &c) in p.iter().enumerate() { if c == b'/' { bstart = i + 1; } }
+    let base = &p[bstart..];
+    let _ = fs_request(ctx, OP_DELETE, p, &[]);
+    if matches!(fs_request(ctx, OP_RENAME, tmp, base), Some(r) if r.payload_bytes().first() == Some(&FS_OK)) {
+        ctx.console_writeln_fmt(format_args!("fmt {} ({} bytes)", str_of(p), total));
         Ok(())
     } else {
-        ctx.console_writeln_fmt(format_args!("fmt: write failed - {}", str_of(p)));
+        ctx.console_writeln_fmt(format_args!("fmt: rename failed - formatted content is in {}.fmt~", str_of(p)));
         Err(ShellError::Unknown)
     }
 }

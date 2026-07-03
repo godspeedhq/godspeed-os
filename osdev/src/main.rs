@@ -2236,7 +2236,8 @@ fn run_fmt_demo_test() {
 
     let _ = std::fs::create_dir_all("build/tests");
     let disk = "build/tests/fmt_disk.img";
-    std::fs::write(disk, vec![0u8; 16 * 1024 * 1024]).expect("failed to create disk");
+    // 64 MiB: the 10 MB source and its (larger) formatted output coexist during the temp+rename.
+    std::fs::write(disk, vec![0u8; 64 * 1024 * 1024]).expect("failed to create disk");
     format_superblock(disk);
     gsfs_add_file(disk, "jar.gsh", jar);
     gsfs_add_file(disk, "huge_fmt.gsh", &huge);

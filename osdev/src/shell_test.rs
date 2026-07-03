@@ -1894,9 +1894,9 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         Some(r) => check!(r.contains("big") && r.contains("failed 0"), "fmt: formatted script still runs (layout-only, semantics preserved)"),
         None => { println!("files-test: FAIL - fmt run timeout"); fail += 1; }
     }
-    // Idempotent: formatting the already-canonical file is a no-op.
-    match run!(b"fmt /fm.gsh\r", 12) {
-        Some(r) => check!(r.contains("already canonical"), "fmt: idempotent (fmt of formatted output is a no-op)"),
+    // Idempotent: after formatting, `fmt check` reports it canonical (a re-format would be a no-op).
+    match run!(b"fmt check /fm.gsh\r", 12) {
+        Some(r) => check!(!r.contains("not canonical") && !r.contains("won't parse"), "fmt: idempotent (fmt check on formatted output = canonical)"),
         None => { println!("files-test: FAIL - fmt idempotent timeout"); fail += 1; }
     }
     // check mode: flags a non-canonical file loudly, never writes.
@@ -3547,23 +3547,27 @@ pub fn run_fmt_demo(image_path: &Path, disk_path: &str, smp: u32) {
     let fmtres = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)).unwrap_or_default();
     send(&mut write_half, b"read /jar.gsh\r");
     let after  = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)).unwrap_or_default();
-    send(&mut write_half, b"fmt /jar.gsh\r"); // idempotency
+    send(&mut write_half, b"fmt check /jar.gsh\r"); // idempotency: canonical after fmt
     let again  = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)).unwrap_or_default();
-    send(&mut write_half, b"fmt /huge_fmt.gsh\r"); // 10 MB guardrail
-    let huge   = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).unwrap_or_default();
+    send(&mut write_half, b"fmt /huge_fmt.gsh\r"); // 10 MB: STREAMED format, NO size cap
+    let huge   = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(300)).unwrap_or_default();
+    send(&mut write_half, b"fmt check /huge_fmt.gsh\r"); // and it comes out canonical (idempotent at scale)
+    let hugechk = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(240)).unwrap_or_default();
 
     let _ = std::fs::write("build/fmt-before.txt", before.as_bytes());
     let _ = std::fs::write("build/fmt-after.txt", after.as_bytes());
     println!("\n========== BEFORE (read /jar.gsh) ==========\n{}", before.trim());
     println!("\n---------- fmt /jar.gsh ----------\n{}", fmtres.trim());
     println!("\n========== AFTER (read /jar.gsh) ==========\n{}", after.trim());
-    println!("\n---------- fmt /huge_fmt.gsh (10 MB) ----------\n{}\n==========", huge.trim());
+    println!("\n---------- fmt /huge_fmt.gsh (10 MB, streamed) ----------\n{}\n==========", huge.trim());
 
     check!(after.contains("if $n > 5 {") && after.contains("    echo big") && after.contains("} else {"),
            "jar.gsh reformatted to canonical layout (4-space indent, one/line, K&R braces)");
     check!(!before.contains("    echo big"), "the before was genuinely jarring (inline blocks, not indented)");
-    check!(again.contains("already canonical"), "fmt is idempotent (second run is a no-op)");
-    check!(huge.contains("too large") && huge.contains("untouched"), "10 MB script refused, left untouched (guardrail)");
+    check!(!again.contains("not canonical") && !again.contains("won't parse"), "fmt is idempotent (jar.gsh canonical after fmt)");
+    check!(huge.contains("bytes)") && !huge.contains("won't parse") && !huge.contains("too long") && !huge.contains("write failed"),
+           "10 MB script FORMATTED via streaming (no file-size cap)");
+    check!(!hugechk.contains("not canonical") && !hugechk.contains("won't parse"), "the formatted 10 MB is canonical (idempotent at scale)");
     check!(!after.contains("KERNEL PANIC") && !huge.contains("KERNEL PANIC"), "no kernel panic through any of it");
 
     // Shell still answers after all that.
