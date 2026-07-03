@@ -3549,6 +3549,14 @@ pub fn run_fmt_demo(image_path: &Path, disk_path: &str, smp: u32) {
     let after  = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)).unwrap_or_default();
     send(&mut write_half, b"fmt check /jar.gsh\r"); // idempotency: canonical after fmt
     let again  = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)).unwrap_or_default();
+    // Medium file: formats past one write buffer (multiple block-aligned flushes) - the case the tiny
+    // files miss. Prove via fmt check -> result Ok. Fast, so it catches the alignment bug quickly.
+    send(&mut write_half, b"fmt /med.gsh\r");
+    let _med    = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(120)).unwrap_or_default();
+    send(&mut write_half, b"fmt check /med.gsh\r");
+    let medchk  = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(120)).unwrap_or_default();
+    send(&mut write_half, b"result\r");
+    let medres  = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)).unwrap_or_default();
     send(&mut write_half, b"fmt /huge_fmt.gsh\r"); // 10 MB: STREAMED format, NO size cap (slow in TCG)
     let huge   = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(600)).unwrap_or_default();
     // Prove it FORMATTED, positively and race-free: `fmt check` on the result, then `result` must be
@@ -3569,6 +3577,8 @@ pub fn run_fmt_demo(image_path: &Path, disk_path: &str, smp: u32) {
            "jar.gsh reformatted to canonical layout (4-space indent, one/line, K&R braces)");
     check!(!before.contains("    echo big"), "the before was genuinely jarring (inline blocks, not indented)");
     check!(!again.contains("not canonical") && !again.contains("won't parse"), "fmt is idempotent (jar.gsh canonical after fmt)");
+    check!(medres.contains("Ok") && !medchk.contains("not canonical") && !medchk.contains("won't parse"),
+           "medium file formats correctly (multi-flush, block-aligned streamed write)");
     check!(chkres.contains("Ok") && !hugechk.contains("not canonical") && !hugechk.contains("won't parse"),
            "10 MB script FORMATTED via streaming - fmt check reports canonical (Ok), no file-size cap");
     check!(!huge.contains("KERNEL PANIC") && !hugechk.contains("KERNEL PANIC"), "no kernel panic on the 10 MB format");

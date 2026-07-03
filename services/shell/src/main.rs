@@ -6802,7 +6802,11 @@ fn cmd_write(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
     }
 }
 
-const FMT_IOBUF: usize = 4096; // fmt's write / compare chunk buffer
+// fmt's write / compare chunk buffer. MUST be a multiple of the fs payload block (DATA_PAYLOAD = 508):
+// fs_write_at requires block-aligned offsets, and the streamed write flushes full buffers, so each
+// offset is a multiple of this. 7*508 = 3556 (the fs's own streaming chunk). A non-multiple (e.g. 4096)
+// makes the SECOND flush land on an unaligned offset and the write fails - only visible past one buffer.
+const FMT_IOBUF: usize = 3556;
 
 /// Stream-format `src` into a fresh temp `tmp` (2-pass: count the size for `OP_WRITE_NEW`, then
 /// stream-write). Reads `src` and writes `tmp` - DIFFERENT files, never `src` twice at once. Returns

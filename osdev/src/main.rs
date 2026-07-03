@@ -2224,6 +2224,12 @@ fn run_fmt_demo_test() {
 
     // A valid but VERY jarring script (stray indent, inline blocks, `;`-joins, erratic spacing).
     let jar: &[u8] = b"let n = 7\n   if $n > 5 {echo big} else {echo small}\nfor i in range 1 4 {   echo item-$i }\n    fn greet who {echo hi-$who}\ngreet world\nswitch $n { 7 {echo seven} _ {echo other} }\nif $n > 0 { if $n < 10 {   echo mid   } }\nlet mut acc = 0 ; for i in range 1 5 { acc = $acc + $i } ; echo sum-$acc\nloop { acc = $acc - 1 ; if $acc < 8 { break } }\necho done-$acc\n";
+    // A MEDIUM jarring file (~15 KB) that formats well past one write buffer, so it exercises the
+    // multi-flush, block-aligned streamed write (the tiny files above are a single flush).
+    let mut med: Vec<u8> = Vec::new();
+    for i in 0..300 {
+        med.extend_from_slice(format!("n = {0} ;   if $n > 3 {{echo a-{0}}} else {{echo b-{0}}}\n", i).as_bytes());
+    }
     // A 10 MB jarring monster (fmt refuses it - past the format bound).
     let mut huge: Vec<u8> = Vec::with_capacity(10 * 1024 * 1024 + 4096);
     huge.extend_from_slice(b"let n = 0\n");
@@ -2240,6 +2246,7 @@ fn run_fmt_demo_test() {
     std::fs::write(disk, vec![0u8; 64 * 1024 * 1024]).expect("failed to create disk");
     format_superblock(disk);
     gsfs_add_file(disk, "jar.gsh", jar);
+    gsfs_add_file(disk, "med.gsh", &med);
     gsfs_add_file(disk, "huge_fmt.gsh", &huge);
 
     crate::shell_test::run_fmt_demo(&image_path, disk, 4);
