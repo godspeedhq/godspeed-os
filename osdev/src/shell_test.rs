@@ -3544,35 +3544,34 @@ pub fn run_fmt_demo(image_path: &Path, disk_path: &str, smp: u32) {
     send(&mut write_half, b"read /jar.gsh\r");
     let before = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)).unwrap_or_default();
     send(&mut write_half, b"fmt /jar.gsh\r");
-    let fmtres = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)).unwrap_or_default();
+    let _fmtres = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)).unwrap_or_default();
     send(&mut write_half, b"read /jar.gsh\r");
     let after  = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)).unwrap_or_default();
     send(&mut write_half, b"fmt check /jar.gsh\r"); // idempotency: canonical after fmt
     let again  = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)).unwrap_or_default();
     send(&mut write_half, b"fmt /huge_fmt.gsh\r"); // 10 MB: STREAMED format, NO size cap (slow in TCG)
-    let huge   = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(560)).unwrap_or_default();
+    let huge   = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(600)).unwrap_or_default();
+    // Prove it FORMATTED, positively and race-free: `fmt check` on the result, then `result` must be
+    // `Ok` (a fmt that failed or didn't run would leave the file jarring -> `fmt check` = Err). An
+    // empty/timed-out capture yields no "Ok", so this can't false-pass.
+    send(&mut write_half, b"fmt check /huge_fmt.gsh\r");
+    let hugechk = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(600)).unwrap_or_default();
+    send(&mut write_half, b"result\r");
+    let chkres = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).unwrap_or_default();
 
     let _ = std::fs::write("build/fmt-before.txt", before.as_bytes());
     let _ = std::fs::write("build/fmt-after.txt", after.as_bytes());
     println!("\n========== BEFORE (read /jar.gsh) ==========\n{}", before.trim());
-    println!("\n---------- fmt /jar.gsh ----------\n{}", fmtres.trim());
     println!("\n========== AFTER (read /jar.gsh) ==========\n{}", after.trim());
-    println!("\n---------- fmt /huge_fmt.gsh (10 MB, streamed) ----------\n{}\n==========", huge.trim());
-
-    // The 10 MB format is slow in TCG; its "(N bytes)" success can land just after the window above,
-    // so drain the tail here - the shell only answers this echo once the format has finished.
-    send(&mut write_half, b"echo STILL-ALIVE\r");
-    let alive = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(240)).unwrap_or_default();
-    let formatted = huge.contains("bytes)") || alive.contains("bytes)");
+    println!("\n---------- 10 MB: fmt then fmt check ----------\n{}\n{}\nresult: {}\n==========", huge.trim(), hugechk.trim(), chkres.trim());
 
     check!(after.contains("if $n > 5 {") && after.contains("    echo big") && after.contains("} else {"),
            "jar.gsh reformatted to canonical layout (4-space indent, one/line, K&R braces)");
     check!(!before.contains("    echo big"), "the before was genuinely jarring (inline blocks, not indented)");
     check!(!again.contains("not canonical") && !again.contains("won't parse"), "fmt is idempotent (jar.gsh canonical after fmt)");
-    check!(formatted && !huge.contains("won't parse") && !huge.contains("too long") && !huge.contains("write failed"),
-           "10 MB script FORMATTED via streaming (no file-size cap)");
-    check!(!huge.contains("KERNEL PANIC") && !alive.contains("KERNEL PANIC"), "no kernel panic on the 10 MB format");
-    check!(alive.contains("STILL-ALIVE"), "shell responsive after the 10 MB format");
+    check!(chkres.contains("Ok") && !hugechk.contains("not canonical") && !hugechk.contains("won't parse"),
+           "10 MB script FORMATTED via streaming - fmt check reports canonical (Ok), no file-size cap");
+    check!(!huge.contains("KERNEL PANIC") && !hugechk.contains("KERNEL PANIC"), "no kernel panic on the 10 MB format");
 
     child.kill().ok(); child.wait().ok();
     println!("\nfmt-demo: {pass} passed, {fail} failed");
