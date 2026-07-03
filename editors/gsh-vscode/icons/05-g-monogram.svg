@@ -1,0 +1,5 @@
+<svg viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="gsh">
+  <rect width="128" height="128" rx="28" fill="#0d1117"/>
+  <text x="50" y="94" font-family="ui-monospace, 'SF Mono', Menlo, Consolas, monospace" font-size="96" font-weight="700" fill="#22d3ee" text-anchor="middle">g</text>
+  <path d="M78 50 L96 64 L78 78" fill="none" stroke="#e6edf3" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

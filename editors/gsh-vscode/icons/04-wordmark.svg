@@ -1,0 +1,5 @@
+<svg viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="gsh">
+  <rect width="128" height="128" rx="28" fill="#0d1117"/>
+  <text x="64" y="80" font-family="ui-monospace, 'SF Mono', Menlo, Consolas, monospace" font-size="46" font-weight="700" fill="#e6edf3" text-anchor="middle" letter-spacing="-1">gsh</text>
+  <rect x="30" y="92" width="68" height="5" rx="2.5" fill="#3ddc84"/>
+</svg>

@@ -14,7 +14,8 @@
         "id": "gsh",
         "aliases": ["gsh", "GodspeedOS shell"],
         "extensions": [".gsh"],
-        "configuration": "./language-configuration.json"
+        "configuration": "./language-configuration.json",
+        "icon": { "light": "./icons/gsh.svg", "dark": "./icons/gsh.svg" }
       }
     ],
     "grammars": [

@@ -27,6 +27,15 @@ so most of what diagnostics would catch is caught when you run the script).
 - **Comments** - `#` to end of line (respecting quotes, so a `#` inside a string is literal)
 - **Function names** - the name after `fn`
 
+## File icon
+
+`.gsh` files carry a wordmark icon (`icons/gsh.svg`) - "gsh" outlined from Consolas Bold on the
+terminal-dark ground with the shell-prompt green bar - contributed via `contributes.languages[].icon`.
+It shows in the explorer, tabs, and breadcrumbs under any file-icon theme that uses language icons
+(VS Code's default *Seti* theme does). The letters are real vector paths, not live SVG text, so they
+render identically on every OS and stay crisp at 16px. The eight directions it was picked from are the
+numbered files in `icons/`.
+
 ## Install
 
 The extension is self-contained (no build step - it is pure grammar + config).
