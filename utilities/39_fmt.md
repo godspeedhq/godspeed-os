@@ -15,13 +15,12 @@ bikeshedding and makes diffs mean something - you can see what *changed* instead
 differently-cramped lines.
 
 ```
-# before  (real sysadmin energy)
-let   mut n=0
-if $n>5{echo big}else{echo small}
+# before  (valid gsh, but jarring - crammed onto lines with ; and inline blocks)
+let n = 7 ; if $n > 5 { echo big } else { echo small }
   for i in range 1 5{echo $i}
 
 # after   fmt /script.gsh
-let mut n = 0
+let n = 7
 if $n > 5 {
     echo big
 } else {
@@ -31,6 +30,10 @@ for i in range 1 5 {
     echo $i
 }
 ```
+
+(Note the scope: `fmt` fixes *layout* - the `;` becomes newlines, inline blocks expand and
+indent, a space is inserted before `{`, runs of whitespace between tokens collapse. It does not
+re-space *inside* a token, so `$n>5` written without spaces would stay `$n>5` - see below.)
 
 ### Boring on purpose - zero style options
 

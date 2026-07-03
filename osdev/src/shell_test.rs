@@ -1880,6 +1880,38 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None => { println!("files-test: FAIL - gsh greet-fail timeout"); fail += 1; }
     }
 
+    // ── fmt (utilities/39_fmt.md): one canonical layout, in place, semantics-preserving + idempotent.
+    // A valid but jarring one-liner (`;`-joined, inline blocks) expands to canonical layout.
+    let _ = run!(b"write /fm.gsh let n = 7 ; if $n > 5 { echo big } else { echo small }\r", 12);
+    let _ = run!(b"fmt /fm.gsh\r", 12);
+    match run!(b"read /fm.gsh\r", 12) {
+        Some(r) => check!(r.contains("if $n > 5 {") && r.contains("    echo big") && r.contains("} else {"),
+                          "fmt: cramped one-liner expands to canonical layout (4-space indent, one/line, K&R braces)"),
+        None => { println!("files-test: FAIL - fmt layout timeout"); fail += 1; }
+    }
+    // Semantics preserved: the formatted script still runs and produces the same result.
+    match run!(b"run /fm.gsh\r", 14) {
+        Some(r) => check!(r.contains("big") && r.contains("failed 0"), "fmt: formatted script still runs (layout-only, semantics preserved)"),
+        None => { println!("files-test: FAIL - fmt run timeout"); fail += 1; }
+    }
+    // Idempotent: formatting the already-canonical file is a no-op.
+    match run!(b"fmt /fm.gsh\r", 12) {
+        Some(r) => check!(r.contains("already canonical"), "fmt: idempotent (fmt of formatted output is a no-op)"),
+        None => { println!("files-test: FAIL - fmt idempotent timeout"); fail += 1; }
+    }
+    // check mode: flags a non-canonical file loudly, never writes.
+    let _ = run!(b"write /fm2.gsh echo a ; echo b\r", 10);
+    match run!(b"fmt check /fm2.gsh\r", 12) {
+        Some(r) => check!(r.contains("not canonical"), "fmt check: flags a non-canonical file loudly (Err, never writes)"),
+        None => { println!("files-test: FAIL - fmt check timeout"); fail += 1; }
+    }
+    // Guardrail: an unparseable script (unbalanced braces) is refused, file left untouched.
+    let _ = run!(b"write /fmb.gsh if $x { echo hi\r", 10);
+    match run!(b"fmt /fmb.gsh\r", 12) {
+        Some(r) => check!(r.contains("won't parse") && r.contains("untouched"), "fmt: refuses an unparseable script, file untouched (guardrail)"),
+        None => { println!("files-test: FAIL - fmt guardrail timeout"); fail += 1; }
+    }
+
     // ── gsh Slice 4 (Tier 2): integer arithmetic in value position (docs/scripting.md §3).
     let _ = run!(b"write /a1.gsh let x = 2 + 3 * 4 ; echo x=$x\r", 10);
     match run!(b"run /a1.gsh\r", 14) {
