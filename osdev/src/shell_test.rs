@@ -2113,6 +2113,24 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None => { println!("files-test: FAIL - agg non-numeric timeout"); fail += 1; }
     }
 
+    // ── gsh Slice 11 (Tier 2): console input (§8). `input` reads a line; the harness feeds the
+    // answer as keystrokes (input blocks, so send the run WITHOUT waiting, then send the reply).
+    let _ = run!(b"write /in1.gsh let x = $(input \"Name: \") ; echo got-$x\r", 10);
+    send(&mut write_half, b"run /in1.gsh\r");
+    match run!(b"Alice\r", 14) {
+        Some(r) => check!(r.contains("got-Alice"), "gsh: input reads a console line, captured via $( )"),
+        None => { println!("files-test: FAIL - gsh input timeout"); fail += 1; }
+    }
+    // input secret: the value is captured but TAINTED - echoing it is refused, and the secret never
+    // reaches the console (invisible entry means the typed reply is not echoed either).
+    let _ = run!(b"write /in2.gsh let pw = $(input secret \"Pass: \") ; echo pw-$pw\r", 10);
+    send(&mut write_half, b"run /in2.gsh\r");
+    match run!(b"hunter2\r", 14) {
+        Some(r) => check!(r.contains("refusing to echo a secret") && !r.contains("hunter2"),
+                          "gsh: input secret taints - echo refused, value stays off the console"),
+        None => { println!("files-test: FAIL - gsh input-secret timeout"); fail += 1; }
+    }
+
     // ── assert: the verifying command. Content form (the pipe sink) is tested interactively -
     //    a `|` can't yet be authored into a script via `write` (the shell pipes the write line).
     match run!(b"roster | where role=core | assert contains Matthew\r", 16) {

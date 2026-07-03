@@ -963,6 +963,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         "help"    => cmd_help(ctx, depth),
         "clear"   => cmd_clear(ctx),
         "echo"    => cmd_echo(ctx, strip_quotes(s["echo".len()..].trim()), &mut Out::Console),
+        "input"   => { run_input(ctx, s["input".len()..].trim(), &mut Out::Console); Ok(()) }
         "about"   => cmd_about(ctx, &mut Out::Console),
         "mem"     => cmd_mem(ctx, &mut Out::Console),
         "cores"   => cmd_cores(ctx, &mut Out::Console),
@@ -1375,6 +1376,9 @@ struct Vars {
     // Mutable values live in fixed slots (overwritten in place on reassign - no arena growth in loops).
     mut_slots: [[u8; MUT_SLOT]; VAR_MAX],
     mut_len: [u8; VAR_MAX],
+    // Secret taint (from `input secret`): the value may not be echoed to the console (§8). Rides along
+    // on assignment. A guard rail against the accidental `echo`, not a vault (write/assign are allowed).
+    secret: [bool; VAR_MAX],
     // Scope stack: scope_count[i]/scope_alen[i] = the table/arena base of the i-th open function.
     scope_count: [usize; CALL_DEPTH_MAX],
     scope_alen: [usize; CALL_DEPTH_MAX],
@@ -1391,12 +1395,20 @@ impl Vars {
             names: [[0u8; VAR_NAME_MAX]; VAR_MAX], name_len: [0; VAR_MAX],
             val_off: [0; VAR_MAX], val_len: [0; VAR_MAX], mutable: [false; VAR_MAX],
             count: 0, arena: [0u8; VAR_ARENA], alen: 0,
-            mut_slots: [[0u8; MUT_SLOT]; VAR_MAX], mut_len: [0; VAR_MAX],
+            mut_slots: [[0u8; MUT_SLOT]; VAR_MAX], mut_len: [0; VAR_MAX], secret: [false; VAR_MAX],
             scope_count: [0; CALL_DEPTH_MAX], scope_alen: [0; CALL_DEPTH_MAX], sp: 0,
         }
     }
     fn name_eq(&self, i: usize, name: &[u8]) -> bool {
         &self.names[i][..self.name_len[i] as usize] == name
+    }
+    /// Is variable `name` secret-tainted (from `input secret`)?
+    fn is_secret_name(&self, name: &[u8]) -> bool {
+        self.lookup(name).map(|i| self.secret[i]).unwrap_or(false)
+    }
+    /// Mark variable `name` secret-tainted (after a `$(input secret …)` capture, or taint propagation).
+    fn mark_secret_name(&mut self, name: &[u8]) {
+        if let Some(i) = self.lookup(name) { self.secret[i] = true; }
     }
     /// The current scope's local base (0 at global scope).
     fn base(&self) -> usize { if self.sp > 0 { self.scope_count[self.sp - 1] } else { 0 } }
@@ -1461,6 +1473,7 @@ impl Vars {
         self.names[i][..name.len()].copy_from_slice(name);
         self.name_len[i] = name.len() as u8;
         self.mutable[i] = mutable;
+        self.secret[i] = false; // a fresh define clears any stale taint on a reused slot
         self.count += 1;
         Ok(())
     }
@@ -1671,8 +1684,9 @@ fn stmt_let(ctx: &ServiceContext, cwd: &Cwd, rest: &str, vars: &mut Vars, params
     }
     let mut exp = ExpBuf::new();
     if expand_val(ctx, value, vars, params, &mut exp).is_err() { return Err(ShellError::Unknown); }
+    let tainted = refs_secret(value, vars); // secret taint rides along on assignment (§8)
     match vars.define(name.as_bytes(), exp.as_bytes(), mutable) {
-        Ok(()) => Ok(()),
+        Ok(()) => { if tainted { vars.mark_secret_name(name.as_bytes()); } Ok(()) }
         Err(e) => { var_err_msg(ctx, name, e); Err(ShellError::Unknown) }
     }
 }
@@ -1685,8 +1699,9 @@ fn stmt_reassign(ctx: &ServiceContext, cwd: &Cwd, name: &str, value: &str, vars:
     }
     let mut exp = ExpBuf::new();
     if expand_val(ctx, value, vars, params, &mut exp).is_err() { return Err(ShellError::Unknown); }
+    let tainted = refs_secret(value, vars); // secret taint rides along on assignment (§8)
     match vars.reassign(name.as_bytes(), exp.as_bytes()) {
-        Ok(()) => Ok(()),
+        Ok(()) => { if tainted { vars.mark_secret_name(name.as_bytes()); } Ok(()) }
         Err(e) => { var_err_msg(ctx, name, e); Err(ShellError::Unknown) }
     }
 }
@@ -1716,6 +1731,13 @@ fn run_stmt(ctx: &ServiceContext, cwd: &mut Cwd, stmt: &str, prev: Result<(), Sh
     if rest == "=" || rest.starts_with("= ") {
         let value = rest[1..].trim_start();
         return StmtOutcome::Cont(stmt_reassign(ctx, cwd, head, value, vars, params));
+    }
+    // Secret taint (§8): a secret value may NOT be echoed to the console. Refuse loudly; the value
+    // never reaches expansion, so it cannot print. (write/assign/use are allowed - it is a guard rail
+    // against the accidental echo, not a vault.)
+    if head == "echo" && refs_secret(rest, vars) {
+        ctx.console_writeln("gsh: refusing to echo a secret value - it stays off the console");
+        return StmtOutcome::Cont(Err(ShellError::Unknown));
     }
     // a plain command: `$`-expand, then run it exactly as the flat runner did.
     let mut exp = ExpBuf::new();
@@ -2804,7 +2826,7 @@ const UTIL_VERSION: &str = "0.1.0";
 /// Utilities that self-document (gates the `help`/`version` intercept in `execute`).
 const UTILS: &[&str] = &[
     "help", "result", "run", "assert", "selfcheck",
-    "echo", "clear", "about", "mem", "cores", "date", "uptime", "status", "observe", "caps", "roster",
+    "echo", "input", "clear", "about", "mem", "cores", "date", "uptime", "status", "observe", "caps", "roster",
     "spawn", "kill", "restart", "reboot", "chaos", "drives", "ls", "cd", "read", "write", "edit", "fcap",
     "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count", "sort",
     "first", "last",
@@ -2873,6 +2895,10 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         ], true),
         "echo" => help_block(ctx, "echo", "print text", &[
             ("echo <text>", "print text verbatim", "echo hello world"),
+        ], true),
+        "input" => help_block(ctx, "input", "read one line from the user (a producer; capture with $( ))", &[
+            ("input \"prompt\"", "prompt, then read a visible line", "let name = $(input \"Name: \")"),
+            ("input secret \"prompt\"", "invisible entry; the value is tainted (never echoed to console)", "let pw = $(input secret \"Password: \")"),
         ], true),
         "clear" => help_block(ctx, "clear", "clear the screen", &[
             ("clear", "clear the screen and home the cursor", "clear"),
@@ -3321,6 +3347,89 @@ fn cmd_clear(ctx: &ServiceContext) -> Result<(), ShellError> {
 }
 
 /// Print the rest of the line verbatim.
+/// Max bytes read by `input` (one console line). Bounded (§26.6); chars past this are dropped.
+const INPUT_MAX: usize = 256;
+
+/// Read one console line into `buf` (until Enter). Printable chars are echoed UNLESS `secret`
+/// (invisible entry, like `sudo`). Backspace erases the last char (and un-echoes it for a visible
+/// line). Returns bytes read. Blocks for a real user - `input` is interactive (docs/scripting.md §8).
+fn read_input_line(ctx: &ServiceContext, secret: bool, buf: &mut [u8]) -> usize {
+    let mut len = 0usize;
+    loop {
+        let c = ctx.console_read();
+        match c {
+            b'\r' | b'\n' => { ctx.console_write("\r\n"); break; }
+            0x7f | 0x08 => { if len > 0 { len -= 1; if !secret { ctx.console_write("\x08 \x08"); } } }
+            b if (0x20..0x7f).contains(&b) => {
+                if len < buf.len() {
+                    buf[len] = b; len += 1;
+                    if !secret { let one = [b]; if let Ok(t) = core::str::from_utf8(&one) { ctx.console_write(t); } }
+                }
+            }
+            _ => {} // ignore control / escape bytes
+        }
+    }
+    len
+}
+
+/// `input [secret] "prompt"` - print the prompt to the CONSOLE, read one line, emit it to `out`
+/// (captured by `$( )`, or piped). `secret` = invisible entry; the captured value is tainted at the
+/// `let`/reassign site. Only the typed value goes to `out`, so `$(input …)` captures the reply, not
+/// the prompt.
+fn cmd_input(ctx: &ServiceContext, prompt: &str, out: &mut Out, secret: bool) -> Result<(), ShellError> {
+    let p = strip_quotes(prompt.trim());
+    if !p.is_empty() { ctx.console_write(p); }
+    let mut buf = [0u8; INPUT_MAX];
+    let n = read_input_line(ctx, secret, &mut buf);
+    out.put_bytes(ctx, &buf[..n]);
+    Ok(())
+}
+
+/// Parse `input [secret [sealed]] "prompt"` and read one console line into `out`. `sealed` is a
+/// reserved escalation (docs/scripting.md §8); until its consumer exists it is treated as `secret`.
+fn run_input(ctx: &ServiceContext, arg: &str, out: &mut Out) {
+    let a = arg.trim();
+    let (first, rest) = split_first(a);
+    let (secret, prompt) = if first == "secret" {
+        let (second, rest2) = split_first(rest);
+        if second == "sealed" {
+            ctx.console_writeln("input: 'sealed' is reserved (treated as 'secret' for now)");
+            (true, rest2)
+        } else { (true, rest) }
+    } else { (false, a) };
+    let _ = cmd_input(ctx, prompt, out, secret);
+}
+
+/// Does a `$( )` capture read a secret (`input secret …`)? Its value is tainted.
+fn capture_is_secret(inner: &str) -> bool {
+    let (first, rest) = split_first(inner.trim());
+    first == "input" && split_first(rest).0 == "secret"
+}
+
+/// Does `text` reference a secret-tainted variable via `$name`? Single-quoted `$` is literal (no
+/// expansion), so it does not count. Used to refuse echoing a secret and to propagate the taint
+/// across an assignment (§8).
+fn refs_secret(text: &str, vars: &Vars) -> bool {
+    let b = text.as_bytes();
+    let mut i = 0usize;
+    let mut quote = 0u8;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\'' { quote = if quote == b'\'' { 0 } else if quote == 0 { b'\'' } else { quote }; i += 1; continue; }
+        if c == b'"' { quote = if quote == b'"' { 0 } else if quote == 0 { b'"' } else { quote }; i += 1; continue; }
+        if c == b'$' && quote != b'\'' {
+            let s = i + 1;
+            let mut j = s;
+            while j < b.len() && (b[j] == b'_' || b[j].is_ascii_alphanumeric()) { j += 1; }
+            if j > s && vars.is_secret_name(&b[s..j]) { return true; }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
 fn cmd_echo(ctx: &ServiceContext, text: &str, out: &mut Out) -> Result<(), ShellError> {
     out.line(ctx, text);
     Ok(())
@@ -4428,7 +4537,7 @@ fn is_producer_builtin(name: &str) -> bool {
     // the tight user stack (HW-proven shell crash, [[project-shell-stack-pipe]]). They refuse
     // loudly as non-producers instead. To capture a big file for `edit`, append a simple producer
     // a few times: `help | write /big.txt; help | write append /big.txt; …`.
-    matches!(name, "read" | "echo" | "tree"
+    matches!(name, "read" | "echo" | "tree" | "input"
                  | "about" | "mem" | "cores" | "date" | "help")
 }
 
@@ -4460,6 +4569,7 @@ fn run_producer(ctx: &ServiceContext, cwd: &Cwd, cmdline: &str, out: &mut Out) {
         "cores"        => { let _ = cmd_cores(ctx, out); }
         "date"         => { let _ = cmd_date(ctx, arg, out); }
         "help"         => help_to_out(ctx, out),
+        "input"        => run_input(ctx, arg, out),
         _ => {}
     }
 }
@@ -4524,7 +4634,7 @@ fn capture_define(ctx: &ServiceContext, cwd: &Cwd, name: &str, inner: &str, muta
     let ok = { let mut o = Out::File(&mut rb); run_captured(ctx, cwd, inner, &mut o) };
     if !ok { return Err(ShellError::Unknown); }
     match vars.define(name.as_bytes(), trim_bytes(rb.bytes()), mutable) {
-        Ok(()) => Ok(()),
+        Ok(()) => { if capture_is_secret(inner) { vars.mark_secret_name(name.as_bytes()); } Ok(()) }
         Err(e) => { var_err_msg(ctx, name, e); Err(ShellError::Unknown) }
     }
 }
@@ -4536,7 +4646,7 @@ fn capture_reassign(ctx: &ServiceContext, cwd: &Cwd, name: &str, inner: &str, va
     let ok = { let mut o = Out::File(&mut rb); run_captured(ctx, cwd, inner, &mut o) };
     if !ok { return Err(ShellError::Unknown); }
     match vars.reassign(name.as_bytes(), trim_bytes(rb.bytes())) {
-        Ok(()) => Ok(()),
+        Ok(()) => { if capture_is_secret(inner) { vars.mark_secret_name(name.as_bytes()); } Ok(()) }
         Err(e) => { var_err_msg(ctx, name, e); Err(ShellError::Unknown) }
     }
 }

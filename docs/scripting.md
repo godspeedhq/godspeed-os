@@ -468,6 +468,50 @@ let avgq  = $(status | avg queue)        # average a column
 - `sum <col>` `min <col>` `max <col>` `avg <col>` - reduce a numeric column; a non-numeric or
   missing column is a loud error, never a silent 0.
 
+**Console input (`input` / `secret`).** A script reads a line from the user with `input`, a producer
+captured like any other with `$( )`:
+
+```
+let name = $(input "Your name: ")        # prompt to the console, capture the reply
+echo "hi, $name"
+```
+
+- `input "prompt"` - print the prompt, read one line from the console, emit it (captured, or piped).
+- `input secret "prompt"` - the same, but keystrokes are **invisible** (nothing echoes as you type,
+  like `sudo`). The captured value is **tainted** (below).
+- `input secret sealed "prompt"` - **reserved, not built** (the maximum-lockdown escalation; below).
+
+The value is *captured*, not written into a variable by side effect, so it follows gsh's one binding
+model (`let x = $(…)`) - there is no bash-style `read var` reaching in to set a variable.
+
+**Secret taint (a guard rail, honestly labelled).** A value from `input secret` is marked, and the
+mark does exactly one thing: **it may not be printed to the console.** Expanding it into an `echo` is
+refused loudly and masked as `[secret]`; everything else - writing it to a file, assigning it,
+passing it to a command - is allowed, and the taint **rides along on assignment** (`let y = $pw`
+gives `y` the same mark, so it cannot be laundered to the console in one hop):
+
+```
+let pw = $(input secret "Password: ")
+echo $pw          # refused, loud: "refusing to echo secret 'pw'"   ->  [secret]
+write /vault $pw  # allowed (your disk, your call)
+let y = $pw       # allowed; y is also secret, so `echo $y` is refused too
+```
+
+This is a **guard rail against the accidental `echo`, not a vault** - and honest about it: because
+write and assign are allowed, a determined author can always move the value back out (write, then
+read it back), so airtight non-leakage is impossible here *by construction*. We catch the common
+accident loudly and claim nothing more - no general taint tracking; propagation stops at assignment.
+
+**`sealed` (reserved).** `input secret sealed` will additionally forbid *write* and *assignment*, so
+the value can only ever be consumed through a designated secret-aware door (a future `login`/auth
+command, or a `secret-eq` compare). Until such a consumer exists a sealed value would be a black box
+you cannot use, so the keyword is **reserved and not yet built** (§26.2) - the escalation is on
+record, to be built the day a real crown-jewel consumer justifies it.
+
+**Interactive only.** `input` blocks for a real person, so an automated suite cannot use it (it would
+hang). It is tested by injecting keystrokes over the console - the way the harness already injects
+commands - not by a bypass.
+
 `assert` and the whole existing command set are unchanged, and a script's own result is still `Ok`
 iff every top-level statement was `Ok` (the PASS/FAIL summary keeps working).
 
