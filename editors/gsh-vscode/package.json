@@ -7,7 +7,7 @@
   "license": "Apache-2.0",
   "engines": { "vscode": "^1.60.0" },
   "categories": ["Programming Languages"],
-  "keywords": ["gsh", "godspeedos", "shell", "scripting"],
+  "keywords": ["gsh", "godspeed shell", "godspeedos", "shell", "scripting"],
   "contributes": {
     "languages": [
       {
