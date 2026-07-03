@@ -1223,6 +1223,7 @@ fn cmd_test(suite: &str) {
         "edit"         => run_edit_test(),
         "script"       => run_script_test(),
         "big-script"   => run_big_script_test(),
+        "fmt-demo"     => run_fmt_demo_test(),
         other => eprintln!("unknown test suite: {}", other),
     }
 }
@@ -2207,6 +2208,40 @@ fn run_big_script_test() {
     gsfs_add_file(disk, name, &content);
 
     crate::shell_test::run_big_script(&image_path, disk, name, 4);
+}
+
+/// fmt-demo: bake a jarring `jar.gsh` + a 10 MB `huge_fmt.gsh`, boot, and run `fmt` on each - the
+/// REAL before/after of the formatter, plus the 10 MB guardrail (refused, untouched).
+fn run_fmt_demo_test() {
+    println!("\n=== fmt-demo: real before/after of fmt + the 10 MB guardrail ===");
+    cmd_build_bare_metal();
+
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+
+    // A valid but VERY jarring script (stray indent, inline blocks, `;`-joins, erratic spacing).
+    let jar: &[u8] = b"let n = 7\n   if $n > 5 {echo big} else {echo small}\nfor i in range 1 4 {   echo item-$i }\n    fn greet who {echo hi-$who}\ngreet world\nswitch $n { 7 {echo seven} _ {echo other} }\nif $n > 0 { if $n < 10 {   echo mid   } }\nlet mut acc = 0 ; for i in range 1 5 { acc = $acc + $i } ; echo sum-$acc\nloop { acc = $acc - 1 ; if $acc < 8 { break } }\necho done-$acc\n";
+    // A 10 MB jarring monster (fmt refuses it - past the format bound).
+    let mut huge: Vec<u8> = Vec::with_capacity(10 * 1024 * 1024 + 4096);
+    huge.extend_from_slice(b"let n = 0\n");
+    let mut i: u64 = 0;
+    while huge.len() < 10 * 1024 * 1024 {
+        huge.extend_from_slice(format!("n = {0} ;   if $n > 3 {{echo a-{1}}} else {{echo b-{1}}}\n  for j in range 0 3 {{echo blk-{1}-$j}}\n", i % 9, i).as_bytes());
+        i += 1;
+    }
+    println!("fmt-demo: baking jar.gsh ({} B) + huge_fmt.gsh ({:.1} MiB)...", jar.len(), huge.len() as f64 / 1024.0 / 1024.0);
+
+    let _ = std::fs::create_dir_all("build/tests");
+    let disk = "build/tests/fmt_disk.img";
+    std::fs::write(disk, vec![0u8; 16 * 1024 * 1024]).expect("failed to create disk");
+    format_superblock(disk);
+    gsfs_add_file(disk, "jar.gsh", jar);
+    gsfs_add_file(disk, "huge_fmt.gsh", &huge);
+
+    crate::shell_test::run_fmt_demo(&image_path, disk, 4);
 }
 
 /// §22 Test 13 (Phase D): fs survives its own restart. Bare-metal shell + AHCI disk; the

@@ -3495,6 +3495,89 @@ pub fn run_big_script(image_path: &Path, disk_path: &str, script_name: &str, smp
     if fail > 0 { std::process::exit(1); }
 }
 
+/// Boot bare-metal with a jarring `jar.gsh` + a 10 MB `huge_fmt.gsh` baked in, run `fmt` on each,
+/// and capture the REAL before/after (proving the formatter on-device) plus the 10 MB guardrail.
+pub fn run_fmt_demo(image_path: &Path, disk_path: &str, smp: u32) {
+    println!("fmt-demo: booting (smp={smp}) with jar.gsh + a 10 MB huge_fmt.gsh");
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let disk      = std::fs::canonicalize(disk_path).unwrap_or_else(|_| std::path::PathBuf::from(disk_path));
+    let disk_str  = disk.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(),
+        "-m",       "512M",
+        "-serial",  &format!("tcp::{shell_port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("fmt-demo: QEMU launch failed at {qemu}: {e}"); std::process::exit(1); });
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => { eprintln!("fmt-demo: could not connect to serial {shell_port}"); child.kill().ok(); std::process::exit(1); }
+    };
+    let mut read_half  = stream.try_clone().expect("clone tcp stream");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut pass = 0usize; let mut fail = 0usize; let mut cursor = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fmt-demo: PASS - {}", $label); pass += 1; } else { println!("fmt-demo: FAIL - {}", $label); fail += 1; }
+    }; }
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).is_none() {
+        println!("fmt-demo: FAIL - timed out waiting for first gsh>"); child.kill().ok(); child.wait().ok(); std::process::exit(1);
+    }
+
+    send(&mut write_half, b"read /jar.gsh\r");
+    let before = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)).unwrap_or_default();
+    send(&mut write_half, b"fmt /jar.gsh\r");
+    let fmtres = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)).unwrap_or_default();
+    send(&mut write_half, b"read /jar.gsh\r");
+    let after  = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)).unwrap_or_default();
+    send(&mut write_half, b"fmt /jar.gsh\r"); // idempotency
+    let again  = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)).unwrap_or_default();
+    send(&mut write_half, b"fmt /huge_fmt.gsh\r"); // 10 MB guardrail
+    let huge   = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).unwrap_or_default();
+
+    let _ = std::fs::write("build/fmt-before.txt", before.as_bytes());
+    let _ = std::fs::write("build/fmt-after.txt", after.as_bytes());
+    println!("\n========== BEFORE (read /jar.gsh) ==========\n{}", before.trim());
+    println!("\n---------- fmt /jar.gsh ----------\n{}", fmtres.trim());
+    println!("\n========== AFTER (read /jar.gsh) ==========\n{}", after.trim());
+    println!("\n---------- fmt /huge_fmt.gsh (10 MB) ----------\n{}\n==========", huge.trim());
+
+    check!(after.contains("if $n > 5 {") && after.contains("    echo big") && after.contains("} else {"),
+           "jar.gsh reformatted to canonical layout (4-space indent, one/line, K&R braces)");
+    check!(!before.contains("    echo big"), "the before was genuinely jarring (inline blocks, not indented)");
+    check!(again.contains("already canonical"), "fmt is idempotent (second run is a no-op)");
+    check!(huge.contains("too large") && huge.contains("untouched"), "10 MB script refused, left untouched (guardrail)");
+    check!(!after.contains("KERNEL PANIC") && !huge.contains("KERNEL PANIC"), "no kernel panic through any of it");
+
+    // Shell still answers after all that.
+    send(&mut write_half, b"echo STILL-ALIVE\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("STILL-ALIVE"), "shell responsive after the demo"),
+        None => { println!("fmt-demo: FAIL - shell unresponsive"); fail += 1; }
+    }
+
+    child.kill().ok(); child.wait().ok();
+    println!("\nfmt-demo: {pass} passed, {fail} failed");
+    if fail > 0 { std::process::exit(1); }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
