@@ -2094,10 +2094,94 @@ fn run_script_test() {
     crate::shell_test::run_script(&image_path, disk, name, 4);
 }
 
-/// 10 MB `.gsh` stress: bake a 10 MB complex script into a GSFS disk, boot, and `run` it. Proves the
-/// run-from-file BOUND (SCRIPT_MAX): the streaming minifier reads ~7 KiB of CODE and truncates
-/// LOUDLY, the complex tour still runs, and the kernel never panics or OOMs on a 10 MB file (§26.6.1,
-/// docs/scripting.md §9). `a huge script is a program` - handled gracefully, not catastrophically.
+/// Regenerate the 10 MB complex stress script into `path` (build/ is gitignored - the huge file is
+/// NOT committed; the test is self-contained). A green feature-tour prefix (every non-interactive gsh
+/// feature) + a safe-to-repeat dynamic block padded to 10 MiB. Deterministic.
+fn generate_big_script(path: &str) {
+    use std::io::Write;
+    let tour = r#"# ============================================================================
+#  10 MB gsh STRESS TEST - a COMPLEX, DYNAMIC program using every gsh feature,
+#  padded to 10 MB. The run-from-file CODE buffer is SCRIPT_MAX (~7 KiB), so a
+#  10 MB script MUST truncate LOUDLY (docs/scripting.md §9, §26.6.1): only the
+#  first ~7 KiB runs. The tour is up front (runs, self-checks green); a SAFE-TO-
+#  REPEAT dynamic block fills the rest. (No `input` - it would block an automated
+#  run; no `import` - the baked disk carries no library file.)
+# ============================================================================
+echo ===TEN-MEG-STRESS-BEGIN===
+
+fn label kind {
+    if $kind == big { echo LABEL-big } else { echo LABEL-small }
+}
+fn checkpos n {
+    if $n < 0 { echo NEG ; return }
+    echo POS-$n
+}
+fn countdown n {
+    if $n <= 0 { echo liftoff } else { echo t-$n ; let m = $n - 1 ; countdown $m }
+}
+
+let name = Ada
+let mut acc = 0
+echo hi-$name
+let x = 2 + 3 * 4
+let y = ( 2 + 3 ) * 4
+echo arith-$x-$y | assert contains arith-14-20
+
+if $x == 14 { echo x-ok } else { fail "x wrong" }
+if $x in 12 13 14 15 { echo x-in-set }
+write /tenmeg-probe.txt hi
+if result == Ok { echo wrote-ok } else { fail "probe write failed" }
+delete /tenmeg-probe.txt
+
+for w in alpha beta gamma { echo word-$w }
+for i in range 1 11 { acc = $acc + $i }
+echo sum-1to10-$acc | assert contains sum-1to10-55
+let mut k = 0
+loop { k = $k + 1 ; if $k == 2 { continue } ; if $k > 4 { break } ; echo pass-$k }
+
+switch $acc {
+    54 55 56 { echo acc-near-55 }
+    _        { fail "acc unexpected" }
+}
+
+label big
+label small
+checkpos 7
+countdown 3
+let cap = $(echo captured-text)
+echo got-$cap | assert contains got-captured-text
+
+mkdir /tenmeg
+defer delete /tenmeg recursive
+write /tenmeg/nums.json '[{"item":"a","v":10},{"item":"b","v":20},{"item":"c","v":30}]'
+read /tenmeg/nums.json | from json | count   | assert contains 3
+read /tenmeg/nums.json | from json | sum v   | assert contains 60
+read /tenmeg/nums.json | from json | max v   | assert contains 30
+read /tenmeg/nums.json | from json | avg v   | assert contains 20
+echo ===TEN-MEG-TOUR-DONE===
+
+let mut n = 0
+"#;
+    let mut f = std::fs::File::create(path)
+        .unwrap_or_else(|e| { eprintln!("big-script: cannot create {}: {}", path, e); std::process::exit(1); });
+    f.write_all(tour.as_bytes()).unwrap();
+    let mut written = tour.len();
+    let target = 10 * 1024 * 1024;
+    let mut i: u64 = 0;
+    while written < target {
+        let b = format!(
+            "# --- dynamic block {0} ---\nn = {0} ; acc = $acc + $n ; if $n > 5 {{ label big }} else {{ label small }}\nfor j in range 0 2 {{ echo blk-{0}-j-$j }}\n",
+            i);
+        f.write_all(b.as_bytes()).unwrap();
+        written += b.len();
+        i += 1;
+    }
+}
+
+/// 10 MB `.gsh` stress: generate + bake a 10 MB complex script into a GSFS disk, boot, and `run` it.
+/// Proves the run-from-file BOUND (SCRIPT_MAX): the streaming minifier reads ~7 KiB of CODE and
+/// truncates LOUDLY, the complex tour still runs, and the kernel never panics or OOMs on a 10 MB file
+/// (§26.6.1, docs/scripting.md §9). `a huge script is a program` - graceful, not catastrophic.
 fn run_big_script_test() {
     println!("\n=== big-script: a 10 MB .gsh, run on boot (bounded-load stress) ===");
     cmd_build_bare_metal();
@@ -2108,7 +2192,9 @@ fn run_big_script_test() {
     let image_path = disk_image::create(kernel_elf, limine_dir);
     disk_image::install_bootloader(limine_dir, &image_path);
 
-    let script_path = "scripts/10_meg_shell_script_test.gsh";
+    let _ = std::fs::create_dir_all("build");
+    let script_path = "build/10_meg_shell_script_test.gsh";
+    generate_big_script(script_path); // regenerate the 10 MB script (build/ is gitignored, not committed)
     let content = std::fs::read(script_path)
         .unwrap_or_else(|e| { eprintln!("big-script: cannot read {}: {}", script_path, e); std::process::exit(1); });
     let name = std::path::Path::new(script_path).file_name().and_then(|s| s.to_str()).unwrap_or("big.gsh");

@@ -34,7 +34,8 @@
 - [2026-06-22 to 2026-06-28 - The days Carnage found the wedges no one would write by hand](#2026-06-22-to-2026-06-28---the-days-carnage-found-the-wedges-no-one-would-write-by-hand)
 - [2026-06-25 - The day I wrote the constitution down as ten lines](#2026-06-25---the-day-i-wrote-the-constitution-down-as-ten-lines)
 - [2026-06-29 - The day the examples had to teach the truth](#2026-06-29---the-day-the-examples-had-to-teach-the-truth)
-- [2026-06-30 - The day a private discipline became a public one](#2026-06-30---the-day-a-private-discipline-became-a-public-one)
+- [2026-07-03 - The day the shell became a language, and a 10 MB script was a non-event](#2026-07-03---the-day-the-shell-became-a-language-and-a-10-mb-script-was-a-non-event)
+- [TBA - The day a private discipline becomes a public one](#tba---the-day-a-private-discipline-becomes-a-public-one)
 - [The Days I Was Wrong](#the-days-i-was-wrong)
   - [~2026-06-21 - The day the constitution rejected its author](#2026-06-21---the-day-the-constitution-rejected-its-author)
   - [~2026-06-27 - The day I reached for a heap](#2026-06-27---the-day-i-reached-for-a-heap)
@@ -285,19 +286,49 @@ documentation that executes; if they are not tested, they are not true.
 does not exist* - applied to teaching material, and a reaffirmation that the model is only as honest
 as the smallest program that claims to follow it.
 
-## 2026-06-30 - The day a private discipline became a public one
+## 2026-07-03 - The day the shell became a language, and a 10 MB script was a non-event
 
-The licenses were added - **GPL-2.0-only** for the OS, **Apache-2.0** for the SDK - and the
-repository goes public. This is the almanac's present edge.
+gsh grew from a flat command-runner into a real programming language - variables, arithmetic,
+conditionals, `switch`, loops, functions with bounded recursion, libraries (`import`), `defer`,
+typed-pipe aggregators, `$( )` capture, and console input with a secret-taint guard rail - built the
+way everything here is built: fixed stacks, bounded arenas, streaming, no heap, loud on every ceiling.
+Then a **10 MB script was run, and nothing happened.** That is the whole point.
+
+**What I came to understand:** the ~7 KiB cap on a run-from-file script had felt like a limitation to
+apologize for. The 10 MB test inverted it. A heap-backed loader meeting a 10 MB file has a bad day - it
+allocates, it fragments, maybe it runs out of memory mid-parse. The streaming minifier meets the same
+file, reads about 7 KiB of it, prints one loud line - *a huge script is a program* - and carries on. The
+bound is not the wall the language hits; it is the thing that lets the language meet a pathological input
+and shrug. "Handled gracefully" and "bounded" turned out to be the same sentence.
+
+The design of the language taught that lesson twice more, in miniature, by refusing to let me claim more
+than the system could honestly deliver. A secret from `input secret` is a *guard rail against the
+accidental echo, not a vault* - because once you may write it to a file, you can always read it back, so
+airtight secrecy is impossible by construction, and pretending otherwise would have been a lie the
+console told the user. And a function is *not a pipe source* - a boundary I found only by writing a real
+program (the selfcheck tour) that tripped over it, `fn greet` quietly shadowing the greet service.
+
+**What it produced:** the proof that §26.6.1 is not a kernel rule - it is *the* rule. The same "change
+the representation, do not reach for a heap" that governs the piece table and the record arena governs a
+whole userspace language, and it holds from a 7 KiB script to a 10 MB one with no special case. A bounded
+system does not fear scale; it renders scale boring. (§26.6.1; Commandment III and the loud-failure
+discipline.)
+
+---
+
+## TBA - The day a private discipline becomes a public one
+
+The licenses are chosen - **GPL-2.0-only** for the OS, **Apache-2.0** for the SDK - and the groundwork
+for going public is laid. The launch date itself is still **to be announced**.
 
 **What I came to understand:** every lesson above was learned in private, where the only person the
-discipline had to convince was me. Public means the constitution now has to hold against
-contributors who did not live through the wedges - which is precisely what the Commandments were
-written for.
+discipline had to convince was me. Public will mean the constitution has to hold against contributors
+who did not live through the wedges - which is precisely what the Commandments were written for.
 
-**What it produced:** the moment the invariants stop being a personal practice and become a public
+**What it will produce:** the moment the invariants stop being a personal practice and become a public
 contract - held by the same identity tests, the same chaos bar, and the same ten commandments that
-earned them. The work of keeping the architecture uncorrupted does not end here; it opens.
+earned them. The work of keeping the architecture uncorrupted does not end there; it opens. This entry
+is dated forward on purpose: it is the almanac's one anticipated day, waiting on the launch to make it real.
 
 ---
 

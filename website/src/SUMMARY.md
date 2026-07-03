@@ -9,13 +9,16 @@
 - [Glossary](glossary.md)
 - [The Almanac](almanac.md)
 
+# The gsh Language
+
+- [The gsh scripting language](design/scripting.md)
+
 # Design Notes
 
 - [Persistence and the filesystem](design/persistence.md)
 - [AHCI block driver](design/ahci.md)
 - [IOMMU and DMA confinement](design/iommu.md)
 - [Naming out of the kernel](design/naming.md)
-- [The gsh scripting language](design/scripting.md)
 - [Typed pipes](design/pipes.md)
 - [Records](design/records.md)
 - [The console service](design/console-service.md)
