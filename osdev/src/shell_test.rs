@@ -1824,6 +1824,23 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None => { println!("files-test: FAIL - gsh nested timeout"); fail += 1; }
     }
 
+    // ── gsh minifier: collapse whitespace OUTSIDE quotes, PRESERVE it inside (aggressive minify).
+    // Heavy internal padding must still tokenize correctly (collapse is semantics-neutral outside
+    // quotes, since gsh separates tokens by whitespace).
+    let _ = run!(b"write /gmw.gsh let    x   =   7 ;   echo   val-$x\r", 10);
+    match run!(b"run /gmw.gsh\r", 14) {
+        Some(r) => check!(r.contains("val-7") && r.contains("run: ran 2, failed 0"),
+                          "gsh: minifier collapses padded whitespace outside quotes (still tokenizes right)"),
+        None => { println!("files-test: FAIL - gsh minify-collapse timeout"); fail += 1; }
+    }
+    // The harness expected string carries TWO spaces and is NOT itself minified, so a bug that
+    // collapsed whitespace INSIDE quotes would drop a space and fail this.
+    let _ = run!(b"write /gmq.gsh echo \"keep  gap\"\r", 10);
+    match run!(b"run /gmq.gsh\r", 14) {
+        Some(r) => check!(r.contains("keep  gap"), "gsh: minifier preserves whitespace INSIDE quotes"),
+        None => { println!("files-test: FAIL - gsh minify-quote timeout"); fail += 1; }
+    }
+
     // ── gsh Slice 3: switch (docs/scripting.md §6). No fallthrough; `_` default; multi-value arms.
     let _ = run!(b"write /g3a.gsh let cmd = start ; switch $cmd { start { echo starting } stop { echo stopping } _ { echo unknownc } }\r", 10);
     match run!(b"run /g3a.gsh\r", 16) {

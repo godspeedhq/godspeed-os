@@ -1111,8 +1111,9 @@ fn compact_line(buf: &[u8], ls: usize, le: usize) -> (usize, usize) {
 }
 
 /// In-place streaming minifier step: compact the region `buf[start..dataend)` (a held partial line
-/// plus a freshly-read raw chunk) by finalizing every COMPLETE line (comment/blank/indent stripped)
-/// into `buf[start..]`, and - unless `eof` - leaving the trailing partial line moved up right after
+/// plus a freshly-read raw chunk) by finalizing every COMPLETE line (comment/blank/indent stripped,
+/// internal whitespace collapsed to single spaces outside quotes) into `buf[start..]`, and - unless
+/// `eof` - leaving the trailing partial line moved up right after
 /// the finalized code as the new hold. Compaction only ever shrinks, so the write cursor stays behind
 /// the read cursor: purely in place, no scratch buffer (§26.6.1 - change the representation, not the
 /// memory). Returns `(finalized_end, hold_len)`.
@@ -1131,9 +1132,29 @@ fn compact_step(buf: &mut [u8], start: usize, dataend: usize, eof: bool) -> (usi
         }
         let (cs, e) = compact_line(buf, ls, le);
         if e > cs {
-            let n = e - cs;
-            if w != cs { for k in 0..n { buf[w + k] = buf[cs + k]; } }
-            w += n;
+            // Copy the trimmed content into buf[w..], COLLAPSING runs of whitespace OUTSIDE quotes
+            // to a single space (gsh separates tokens by whitespace, so N spaces tokenize as one;
+            // inside '..' / ".." whitespace is LITERAL and copied verbatim). Compaction only ever
+            // shrinks, so w stays behind cs - purely in place, no scratch (§26.6.1). Leading/trailing
+            // whitespace is already gone (compact_line trimmed it), so no stray edge space is emitted.
+            let mut quote: u8 = 0;
+            let mut prev_ws = false;
+            let mut k = cs;
+            while k < e {
+                let c = buf[k];
+                if quote != 0 {
+                    buf[w] = c; w += 1;
+                    if c == quote { quote = 0; }
+                    prev_ws = false;
+                } else if c == b'\'' || c == b'"' {
+                    quote = c; buf[w] = c; w += 1; prev_ws = false;
+                } else if c.is_ascii_whitespace() {
+                    if !prev_ws { buf[w] = b' '; w += 1; prev_ws = true; }
+                } else {
+                    buf[w] = c; w += 1; prev_ws = false;
+                }
+                k += 1;
+            }
             buf[w] = b'\n';
             w += 1;
         }
@@ -1157,8 +1178,9 @@ fn compact_step(buf: &mut [u8], start: usize, dataend: usize, eof: bool) -> (usi
 fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8, save: Option<&str>, params: &Params) -> Result<(), ShellError> {
     let mut pbuf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut pbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    // Stream + MINIFY the script into the buffer (comments / blank lines / indentation stripped as it
-    // loads, so a heavily-commented source loads whole even when its raw size exceeds SCRIPT_MAX),
+    // Stream + MINIFY the script into the buffer (comments / blank lines / indentation stripped and
+    // internal whitespace collapsed as it loads, so a heavily-commented or padded source loads whole
+    // even when its raw size exceeds SCRIPT_MAX),
     // then resolve `import` / `from … import` at LOAD time (append the libs' functions in place).
     let mut script = [0u8; SCRIPT_MAX];
     let (mut code, truncated) = stream_minify(ctx, path, &mut script);
