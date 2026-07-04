@@ -4,6 +4,8 @@
 
 A capability-based microkernel OS written in Rust. Every privileged action requires an explicit capability. Services are isolated. Failures are visible. Authority is never inherited or ambient.
 
+📖 **[Documentation](https://godspeedhq.github.io/godspeed-os/)** · **[SDK API reference](https://godspeedhq.github.io/godspeed-os/api/godspeed_sdk/)** · **[Releases](https://github.com/godspeedhq/godspeed-os/releases)**
+
 ---
 
 ## Architecture
@@ -136,8 +138,11 @@ website/      documentation site (mdBook; renders this repo's docs)
 
 ## Documentation site
 
+**Live at [godspeedhq.github.io/godspeed-os](https://godspeedhq.github.io/godspeed-os/)**, with the
+[SDK API reference](https://godspeedhq.github.io/godspeed-os/api/godspeed_sdk/) under `/api`.
+
 The docs in this repo also render as a browsable site built with
-[mdBook](https://rust-lang.github.io/mdBook/) (with the SDK API reference from rustdoc). The site is a
+[mdBook](https://rust-lang.github.io/mdBook/). The site is a
 **derived view**: every page is an `{{#include}}` of the real file, so it never duplicates or drifts
 from the source. A GitHub Action rebuilds and republishes it on every push to `main` that touches a
 doc, so editing `CLAUDE.md` or a `docs/` file updates the site automatically.
