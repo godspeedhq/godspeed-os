@@ -52,22 +52,32 @@ write /tour/a.txt hi                     # a real command...
 if result == Ok { echo wrote-ok | assert contains wrote-ok }   # ...check its result
 if $total > 10 { echo big | assert contains big } else { fail "math broke" }
 if $name in Ada Bob Cy { echo known-name | assert contains known-name }
+# an else-if chain: the first true branch wins
+if $total < 0 { fail "else-if: A wrong" } else if $total > 10 { echo elif-ok | assert contains elif-ok } else { fail "else-if: C wrong" }
 
 echo ''
-echo '===== 4. SWITCH - several values per arm, _ default ====='
+echo '===== 4. SWITCH - several values per arm, _ default, and `switch result` ====='
 switch $name {
     Bob Cy   { fail "wrong arm" }        # an arm may list multiple values
     Ada      { echo matched-ada | assert contains matched-ada }
     _        { fail "default must not run" }
 }
+echo probe-for-switch-result             # a command -> result = Ok
+switch result {                          # `switch result` matches the previous result's KIND
+    Ok  { echo swr-ok | assert contains swr-ok }
+    _   { fail "switch result: Ok not matched" }
+}
 
 echo ''
-echo '===== 5. CAPTURE - $( ) puts a producers output into a variable ====='
+echo '===== 5. CAPTURE - $( ) puts a producer OR a function ($(fn)) output into a variable ====='
 let phrase = $(echo hi there)            # -> "hi there"
 echo got:$phrase | assert contains got:hi
+fn greeting who { echo hello-$who }      # $(fn): capture a FUNCTION's output (bounded 4 KiB, no heap)
+let g = $(greeting Ada)
+echo capfn:$g | assert contains capfn:hello-Ada
 
 echo ''
-echo '===== 6. FOR LOOPS - words, range, mutable accumulation ====='
+echo '===== 6. FOR LOOPS - words, range, mutable accumulation, and lines of a producer ====='
 for fruit in apple pear plum {           # iterate a literal word list
     echo fruit-$fruit
 }
@@ -78,6 +88,11 @@ for i in range 1 5 {                     # range A B -> 1 2 3 4
     hits = $hits + 1                     # reassigned each pass: a fixed slot, no arena growth
 }
 echo hits-$hits | assert contains hits-4
+write /sc_fl.txt oneline                 # for line in (producer): iterate a producer's output lines
+let mut nlines = 0
+for line in (read /sc_fl.txt) { nlines = $nlines + 1 }
+if $nlines > 0 { echo forline-ok | assert contains forline-ok } else { fail "for line: empty" }
+delete /sc_fl.txt
 
 echo ''
 echo '===== 7. UNBOUNDED loop + break / continue ====='
@@ -90,7 +105,7 @@ loop {                                   # runs until `break` (100k-iteration ba
 }
 
 echo ''
-echo '===== 8. FUNCTIONS - named params, return, recursion ====='
+echo '===== 8. FUNCTIONS - named params, return, recursion, and as an `if` condition ====='
 fn sayhi who {                           # `who` is a parameter (named, positional)
     echo "hi, $who"                      # a function sees its params + immutable globals
 }
@@ -106,6 +121,9 @@ fn countdown n {                         # recursion via an explicit call stack 
     if $n <= 0 { echo liftoff } else { echo t-$n ; let m = $n - 1 ; countdown $m }
 }
 countdown 3                              # -> t-3, t-2, t-1, liftoff
+fn is_ready { echo yes }                 # a function used AS an `if` condition: if myfn (branch on result)
+if is_ready { echo iffn-then | assert contains iffn-then } else { fail "if myfn: Ok must take then" }
+if !is_ready { fail "if !myfn must take else" } else { echo iffn-neg | assert contains iffn-neg }
 
 echo ''
 echo '===== 9. DEFER - cleanup on scope exit, LIFO, even on fail ====='
@@ -397,6 +415,16 @@ assert ok drives scrub
 # the kernel and fs layers), unforgeable handle, revoke-on-close. `fcap` is Ok only if all hold.
 # It is self-contained: it creates and deletes its own throwaway file, so it takes no argument. =====
 assert ok fcap
+
+# ===== fmt: format a .gsh script to the canonical layout, then verify it (fmt check) =====
+echo ''
+echo '===== fmt: format a .gsh script to canonical layout, then fmt check ====='
+write /sc_fmt.gsh "echo aaa ; echo bbb"  # a ;-joined one-liner - NOT canonical
+fmt /sc_fmt.gsh                          # format IN PLACE -> one statement per line
+fmt check /sc_fmt.gsh                    # now canonical -> Ok (silent)
+if result == Ok { echo fmt-ok | assert contains fmt-ok } else { fail "fmt: not canonical after format" }
+read /sc_fmt.gsh | assert contains bbb   # semantics-preserving: the content survived the format
+delete /sc_fmt.gsh
 
 # ===== cleanup: proves delete + delete recursive =====
 echo ''
