@@ -153,6 +153,15 @@ pub fn run(image_path: &Path, smp: u32) {
         }
     }
 
+    // Networking Phase 1 step 4 (docs/networking.md): the ARP reply arrives just AFTER the shell
+    // prompt (the round-trip completes as boot finishes), so it lands past boot_out - check for it
+    // here. nic-driver set up an RX ring + enabled the receiver, sent a broadcast ARP request that
+    // QEMU's user-net gateway answers, and RECEIVED the reply out of the arena. The marker
+    // "ethertype 0x0806" (ARP) is unique to nic-driver's RX log, so finding it proves the full path
+    // both ways: arena <-> ring <-> the wire.
+    let rx_ok = collect_until(&buf, &mut cursor, b"ethertype 0x0806", Duration::from_secs(10)).is_some();
+    check!(rx_ok, "phase1 step4: nic-driver received a frame (the ARP reply - RX ring works)");
+
     // -----------------------------------------------------------------------
     // help
     // -----------------------------------------------------------------------
