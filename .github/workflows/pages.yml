@@ -70,6 +70,15 @@ jobs:
       - name: Build the site
         run: bash website/sync.sh
 
+      # Enable Pages (source = GitHub Actions) via the API if it is not already, so the
+      # deploy has a target without a manual Settings -> Pages change. Uses the pages:write
+      # permission above. If your org forbids Actions-enabling Pages, set the source by hand
+      # instead and drop `enablement`.
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
       - name: Upload the Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
