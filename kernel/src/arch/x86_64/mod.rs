@@ -123,6 +123,7 @@ fn collect_boot_info() -> BootInfo {
                 limine::memmap::MEMMAP_USABLE             => MemoryKind::Usable,
                 limine::memmap::MEMMAP_ACPI_RECLAIMABLE   => MemoryKind::AcpiReclaimable,
                 limine::memmap::MEMMAP_EXECUTABLE_AND_MODULES => MemoryKind::KernelImage,
+                limine::memmap::MEMMAP_BOOTLOADER_RECLAIMABLE => MemoryKind::BootloaderReclaimable,
                 _ => MemoryKind::Reserved,
             };
             // SAFETY: single-threaded boot path; no concurrent access.
@@ -245,6 +246,10 @@ pub enum MemoryKind {
     Reserved        = 2,
     AcpiReclaimable = 3,
     KernelImage     = 4,
+    /// RAM the bootloader used (Limine's own structures + the kernel's INITIAL page tables).
+    /// Reclaimable, but it IS RAM the HHDM covers, and it sits ABOVE usable RAM - so a legit
+    /// page table can live here and `phys_in_ram` must accept it (else the walk guard floods).
+    BootloaderReclaimable = 5,
 }
 
 // ---------------------------------------------------------------------------

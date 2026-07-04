@@ -70,6 +70,12 @@ struct BitmapAllocator {
     /// Any frame index at or above this value was never handed out by the
     /// allocator and must not be accepted by `free`.
     max_valid_frame: usize,
+    /// Highest frame index (exclusive) across ALL RAM-backed regions the HHDM covers (usable +
+    /// bootloader-reclaimable + kernel + acpi-reclaimable). `phys_in_ram` uses THIS, not
+    /// `max_valid_frame`: Limine puts the kernel's initial page tables in bootloader-reclaimable RAM
+    /// ABOVE usable RAM, so walking a legit page table there must not false-positive as corrupt. A
+    /// truly corrupt entry (phys far beyond total RAM, e.g. ~68 GB) is still caught.
+    max_ram_frame: usize,
     /// Count of double-free attempts (a frame freed while already free). The bitmap absorbs these
     /// idempotently, but they must not inflate `free_frames` (else it exceeds `total_frames` and
     /// observe's RAM read underflows). Counted so the loud log can be rate-limited.
@@ -83,13 +89,13 @@ struct BitmapAllocator {
     dma_reserves: [(usize, usize); MAX_DMA_RESERVES],
 }
 
-/// Max distinct DMA-arena reservations: xhci, ehci, block-driver, + headroom for a future NIC driver.
-const MAX_DMA_RESERVES: usize = 4;
+/// Max distinct DMA-arena reservations: xhci, ehci, block-driver, nic-driver, + headroom for one more.
+const MAX_DMA_RESERVES: usize = 6;
 
 impl BitmapAllocator {
     const fn new() -> Self {
         Self {
-            free_frames: 0, total_frames: 0, next_byte: 0, max_valid_frame: 0, double_frees: 0,
+            free_frames: 0, total_frames: 0, next_byte: 0, max_valid_frame: 0, max_ram_frame: 0, double_frees: 0,
             dma_reserves: [(0, 0); MAX_DMA_RESERVES],
         }
     }
@@ -100,6 +106,15 @@ impl BitmapAllocator {
         let kend   = boot_info.kernel_phys_end;
 
         for region in boot_info.memory_map {
+            // Track the RAM extent for `phys_in_ram` (the page-table walk guard): include ALL
+            // RAM-backed regions the HHDM covers, not just usable, so a legit page table Limine
+            // placed in bootloader-reclaimable / kernel RAM (above usable RAM) is not flagged as
+            // out-of-RAM. A truly corrupt entry (phys far beyond total RAM) is still caught.
+            if matches!(region.kind, MemoryKind::Usable | MemoryKind::AcpiReclaimable
+                                   | MemoryKind::KernelImage | MemoryKind::BootloaderReclaimable) {
+                let ram_last = ((region.base + region.len + FRAME_SIZE - 1) / FRAME_SIZE) as usize;
+                if ram_last > self.max_ram_frame { self.max_ram_frame = ram_last; }
+            }
             if !matches!(region.kind, MemoryKind::Usable) {
                 continue;
             }
@@ -452,14 +467,17 @@ pub fn total_frame_count() -> usize {
 }
 
 /// True if `phys` lies within physical RAM the HHDM covers - i.e. its frame index is below the highest
-/// usable frame recorded at boot. The read-side companion to `free_frame`'s phantom-reject (line ~209):
+/// RAM-backed frame recorded at boot. The read-side companion to `free_frame`'s phantom-reject (line ~209):
 /// a page-table walk must never DEREFERENCE an entry whose frame is outside RAM (a corrupted or stale
 /// entry), or it page-faults the kernel via the HHDM (the chaos `max-carnage` ~68 GB KERNEL PF in
-/// `reclaim_user_frames`). `max_valid_frame` is set once at init and immutable after, so this is lock-free.
+/// `reclaim_user_frames`). Uses `max_ram_frame` (ALL RAM: usable + bootloader-reclaimable + kernel) NOT
+/// `max_valid_frame` (usable only) - Limine places the kernel's initial page tables in bootloader-
+/// reclaimable RAM above usable RAM, and walking those legit tables must not false-positive (else the
+/// guard floods). Set once at init, immutable after, so this is lock-free.
 pub fn phys_in_ram(phys: u64) -> bool {
-    // SAFETY: read-only; max_valid_frame is set once at init, never mutated after.
+    // SAFETY: read-only; max_ram_frame is set once at init, never mutated after.
     let idx = (phys / FRAME_SIZE) as usize;
-    unsafe { idx < ALLOCATOR.max_valid_frame }
+    unsafe { idx < ALLOCATOR.max_ram_frame }
 }
 /// Walk the kernel half of the live PML4 (entries 256-511) and mark every
 /// PDPT / PD / PT / PML4 frame as "used" in the bitmap allocator.
