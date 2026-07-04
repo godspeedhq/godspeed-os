@@ -235,7 +235,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 ctx.console_write("\r\n");
                 if line.len > 0 {
                     hist.push(line.bytes());
-                    last_result = execute(&ctx, line.bytes(), &mut cwd, last_result, 0);
+                    last_result = execute(&ctx, line.bytes(), &mut cwd, last_result, 0, &mut Out::Console);
                     line.len = 0;
                     line.cur = 0;
                 }
@@ -292,7 +292,7 @@ fn run_help_key(
     line: &mut Line,
 ) {
     ctx.console_write("\r\n");
-    *last_result = execute(ctx, b"help", cwd, *last_result, 0);
+    *last_result = execute(ctx, b"help", cwd, *last_result, 0, &mut Out::Console);
     ctx.console_write("gsh> ");
     line.cur = line.len; // cursor at end after the reprint
     if line.len > 0 {
@@ -890,7 +890,7 @@ impl ShellError {
 /// path's 64 KiB `Stream`) into `cmd_run`'s, blowing the bounded user stack on the nested
 /// `run → cmd_run → execute` path (the same inlining-inflates-frame trap as the record builders).
 #[inline(never)]
-fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellError>, depth: u8) -> Result<(), ShellError> {
+fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellError>, depth: u8, out: &mut Out) -> Result<(), ShellError> {
     let Ok(s) = core::str::from_utf8(line) else {
         ctx.console_writeln("shell: invalid input");
         return Err(ShellError::Unknown);
@@ -905,7 +905,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
     if s.contains('|') {
         // One unified pipeline: threads bytes or records, with from/to bridging the two worlds.
         // Returns the pipeline's Result - an `… | assert` sink sets it (else Ok / a stage error).
-        return pipe_run(ctx, cwd, s, &mut Out::Console);
+        return pipe_run(ctx, cwd, s, out);
     }
 
     let mut args = [""; MAX_ARGS];
@@ -929,7 +929,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
             ctx.console_writeln("usage: read <path>");
             Err(ShellError::Unknown)
         } else {
-            cmd_read(ctx, cwd, args[1], &mut Out::Console)
+            cmd_read(ctx, cwd, args[1], out)
         },
         // `result` reports the PREVIOUS command's result (this one always succeeds at reporting).
         "result" => { cmd_result(ctx, prev); return Ok(()); }
@@ -962,12 +962,12 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
     return match args[0] {
         "help"    => cmd_help(ctx, depth),
         "clear"   => cmd_clear(ctx),
-        "echo"    => cmd_echo(ctx, strip_quotes(s["echo".len()..].trim()), &mut Out::Console),
-        "input"   => { run_input(ctx, s["input".len()..].trim(), &mut Out::Console); Ok(()) }
-        "about"   => cmd_about(ctx, &mut Out::Console),
-        "mem"     => cmd_mem(ctx, &mut Out::Console),
-        "cores"   => cmd_cores(ctx, &mut Out::Console),
-        "date"    => cmd_date(ctx, if argc >= 2 { args[1] } else { "" }, &mut Out::Console),
+        "echo"    => cmd_echo(ctx, strip_quotes(s["echo".len()..].trim()), out),
+        "input"   => { run_input(ctx, s["input".len()..].trim(), out); Ok(()) }
+        "about"   => cmd_about(ctx, out),
+        "mem"     => cmd_mem(ctx, out),
+        "cores"   => cmd_cores(ctx, out),
+        "date"    => cmd_date(ctx, if argc >= 2 { args[1] } else { "" }, out),
         "uptime"  => cmd_uptime(ctx),
         "status"  => cmd_status(ctx),
         "observe" => if argc >= 2 && args[1] == "now" { cmd_observe_now(ctx) } else { cmd_observe_live(ctx) },
@@ -1008,7 +1008,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         // open → write/read VIA THE CAP → non-escalation (RO cap can't write) → forged-handle →
         // revoke-on-close. Prints per-step results; the harness asserts on them (Test 14).
         "fcap"    => cmd_fcap(ctx, if argc >= 2 { args[1] } else { "" }),
-        "ls"      => cmd_ls(ctx, cwd, if argc >= 2 { args[1] } else { "" }, &mut Out::Console),
+        "ls"      => cmd_ls(ctx, cwd, if argc >= 2 { args[1] } else { "" }, out),
         "edit"    => cmd_edit(ctx, cwd, s["edit".len()..].trim()),
         "write"   => cmd_write(ctx, cwd, s["write".len()..].trim()),
         "fmt"     => cmd_fmt(ctx, cwd, s["fmt".len()..].trim()),
@@ -1036,9 +1036,9 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         }
         "find"    => {
             if argc < 2 { ctx.console_writeln("usage: find <name> [path]"); Err(ShellError::Unknown) }
-            else { cmd_find(ctx, cwd, args[1], if argc >= 3 { args[2] } else { "/" }, &mut Out::Console) }
+            else { cmd_find(ctx, cwd, args[1], if argc >= 3 { args[2] } else { "/" }, out) }
         }
-        "tree"    => cmd_tree(ctx, cwd, if argc >= 2 { args[1] } else { "" }, &mut Out::Console),
+        "tree"    => cmd_tree(ctx, cwd, if argc >= 2 { args[1] } else { "" }, out),
         // filter built-ins (direct form) - on the Result model (Err(FileNotFound) on a bad path).
         "match"   => cmd_match(ctx, cwd, &args, argc),
         "count"   => cmd_count(ctx, cwd, &args, argc),
@@ -1734,7 +1734,7 @@ enum StmtOutcome { Cont(Result<(), ShellError>), Stop(Result<(), ShellError>) }
 
 /// Run one gsh statement: a `let`/reassignment/`fail`, or - after `$`-expansion - a plain command
 /// handed to the existing `execute`. `vars` is the run's variable table; `params` its parameters.
-fn run_stmt(ctx: &ServiceContext, cwd: &mut Cwd, stmt: &str, prev: Result<(), ShellError>, depth: u8, vars: &mut Vars, params: &Params) -> StmtOutcome {
+fn run_stmt(ctx: &ServiceContext, cwd: &mut Cwd, stmt: &str, prev: Result<(), ShellError>, depth: u8, vars: &mut Vars, params: &Params, out: &mut Out) -> StmtOutcome {
     let (head, rest) = split_first(stmt);
     // `fail <msg>` - print loudly and stop the run with Err.
     if head == "fail" {
@@ -1767,7 +1767,7 @@ fn run_stmt(ctx: &ServiceContext, cwd: &mut Cwd, stmt: &str, prev: Result<(), Sh
     if expand_cmd(ctx, stmt, vars, params, &mut exp).is_err() {
         return StmtOutcome::Cont(Err(ShellError::Unknown));
     }
-    StmtOutcome::Cont(execute(ctx, exp.as_bytes(), cwd, prev, depth))
+    StmtOutcome::Cont(execute(ctx, exp.as_bytes(), cwd, prev, depth, out))
 }
 
 // ── Slice 2: conditions (comparisons, `in`, command, `result`) + `if`/`else if`/`else` blocks. ──
@@ -2022,7 +2022,7 @@ fn eval_cond(ctx: &ServiceContext, cwd: &mut Cwd, cond: &str, vars: &Vars, param
     // command condition: expand + run, true iff Ok (result is NOT updated by a condition).
     let mut exp = ExpBuf::new();
     if expand_cmd(ctx, cond, vars, params, &mut exp).is_err() { return false; }
-    execute(ctx, exp.as_bytes(), cwd, prev, depth).is_ok()
+    execute(ctx, exp.as_bytes(), cwd, prev, depth, &mut Out::Console).is_ok()
 }
 
 /// Skip ASCII whitespace from `i`.
@@ -2613,7 +2613,7 @@ fn run_defers(ctx: &ServiceContext, cwd: &mut Cwd, b: &[u8], defers: &mut [(usiz
         let s = str_of(&b[off..off + len]);
         out.put(ctx, "defer> ");
         out.line(ctx, s);
-        let _ = run_stmt(ctx, cwd, s, Ok(()), sdepth, vars, params);
+        let _ = run_stmt(ctx, cwd, s, Ok(()), sdepth, vars, params, &mut Out::Console);
     }
 }
 
@@ -2984,7 +2984,7 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
             if !hrest.is_empty() {
                 let mut eb = ExpBuf::new();
                 last = if expand_cmd(ctx, hrest, &vars, params, &mut eb).is_ok() {
-                    execute(ctx, eb.as_bytes(), cwd, last, sdepth)
+                    execute(ctx, eb.as_bytes(), cwd, last, sdepth, &mut Out::Console)
                 } else { Err(ShellError::Unknown) };
             }
             // Unwind to the nearest enclosing Call frame, discarding any if/switch frames inside it.
@@ -3069,7 +3069,7 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
         // Echo the statement so the transcript shows what produced each result.
         out.put(ctx, "> ");
         out.line(ctx, s);
-        let (res, stop) = match run_stmt(ctx, cwd, s, last, sdepth, &mut vars, params) {
+        let (res, stop) = match run_stmt(ctx, cwd, s, last, sdepth, &mut vars, params, &mut Out::Console) {
             StmtOutcome::Cont(r) => (r, false),
             StmtOutcome::Stop(r) => (r, true),
         };
@@ -3213,7 +3213,7 @@ fn cmd_assert(ctx: &ServiceContext, cwd: &mut Cwd, rest: &str, depth: u8) -> Res
                 return Err(ShellError::Unknown);
             }
             // Run the command (its own output/errors print as usual), then judge its Result.
-            let r = execute(ctx, cmd.as_bytes(), cwd, Ok(()), depth + 1);
+            let r = execute(ctx, cmd.as_bytes(), cwd, Ok(()), depth + 1, &mut Out::Console);
             let held = if verb == "ok" { r.is_ok() } else { r.is_err() };
             assert_verdict(ctx, held, verb, cmd)
         }
@@ -3224,7 +3224,7 @@ fn cmd_assert(ctx: &ServiceContext, cwd: &mut Cwd, rest: &str, depth: u8) -> Res
                 ctx.console_writeln("usage: assert fails-with <Variant> <command>  (e.g. FileNotFound, Denied)");
                 return Err(ShellError::Unknown);
             }
-            let r = execute(ctx, inner.as_bytes(), cwd, Ok(()), depth + 1);
+            let r = execute(ctx, inner.as_bytes(), cwd, Ok(()), depth + 1, &mut Out::Console);
             let held = matches!(r, Err(e) if e.name() == variant);
             assert_verdict(ctx, held, "fails-with", variant)
         }
