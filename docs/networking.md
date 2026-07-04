@@ -1,8 +1,21 @@
 # Networking: a Capability-Mediated Userspace Service
 
-> **Status:** Design, not built. **v2** (networking is out of v1 scope - §23.4). Non-normative until
-> built and pinned by an identity test, at which point the relevant decisions are amended into
-> `CLAUDE.md`. This doc records the architecture and the phased plan, mirroring `docs/persistence.md`.
+> **Status:** Design, being built (branch `feat/networking`). **v2** (networking is out of v1 scope -
+> §23.4). Non-normative until built and pinned by an identity test, at which point the relevant
+> decisions are amended into `CLAUDE.md`. This doc records the architecture and the phased plan,
+> mirroring `docs/persistence.md`.
+
+> **Decision (2026-07-04, owner): TCP/IPv4 is committed from the start, not far-future.** The build
+> order is unchanged - the layers still stack NIC -> ARP -> IPv4 -> ICMP (ping) -> transport - but TCP
+> is now a first-class goal of this effort, not a deferred maybe. The motivation is Commandment VIII
+> made literal: TCP *is* "wait on truth, including the truth of failure" - an ACK is a truth, a peer's
+> RST is a truth, and a retransmission timeout that fires is failure surfaced, not a guess. (TCP's own
+> protocol timers - RTO, retransmission, TIME_WAIT - are *protocol-mandated timing*, the same exempt
+> category as USB/AHCI hardware timing, not the correctness-by-timing that VIII forbids.) UDP (Phase 3)
+> stays in as TCP's stateless stepping-stone - it proves the socket-cap model with no state machine -
+> and TCP (Phase 5, brought forward) builds the state machine, retransmission, and ordered teardown on
+> that same socket-cap foundation. Everything below the transport layer (Phases 0-2) is shared and
+> identical either way, so work starts there regardless.
 
 ---
 
