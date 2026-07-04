@@ -22,7 +22,7 @@ import json, sys, re, os
 if len(sys.argv) > 1 and sys.argv[1] == "supports":
     sys.exit(0)
 
-REPO = os.environ.get("GODSPEED_REPO_URL", "https://github.com/godspeed-os/godspeed").rstrip("/")
+REPO = os.environ.get("GODSPEED_REPO_URL", "https://github.com/godspeedhq/godspeed-os").rstrip("/")
 BLOB, TREE = REPO + "/blob/main", REPO + "/tree/main"
 
 # repo-doc basename -> book page (relative to book root, no leading slash)

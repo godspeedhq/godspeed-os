@@ -16,9 +16,10 @@ src = "src"
 [output.html]
 default-theme = "navy"
 preferred-dark-theme = "navy"
-# git-repository-url / edit-url are deliberately omitted until the org/repo names
-# are finalized (launch checklist). The included pages are not editable from their
-# stubs anyway - edits belong in the source file, so no "edit this page" link.
+git-repository-url = "https://github.com/godspeedhq/godspeed-os"
+# edit-url is deliberately omitted: the included pages are {{#include}} stubs, so an
+# "edit this page" link would point at the stub, not the real source. The repo link
+# (git-repository-url, above) is enough.
 
 [output.html.fold]
 enable = true
