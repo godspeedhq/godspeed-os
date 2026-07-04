@@ -444,7 +444,7 @@ gsh started as a batch runner: `run_lines` split a file on `;` and `\n` and hand
 function's output into a value. That last one closed the set. gsh is complete.
 
 **And it never once reached for a heap.** Every part of it lives on the stack or in a fixed, named
-arena: the ~5 KiB variable table, the ~7 KiB script buffer, the 4 KiB capture buffer, the 16-frame
+arena: the ~5 KiB variable table, the ~7 KiB script buffer, the 512 B capture buffer, the 16-frame
 block stack. Not one general allocator in the whole interpreter. When a working set felt too big for
 the stack, the answer was never "add a heap" - it was "change the representation": stream a file in
 fixed chunks, refer to data by `(offset, len)` spans, give a subsystem its own bounded arena, iterate
@@ -454,7 +454,7 @@ it improved it. Every limit in gsh is a number you can read off the source.
 **The proof is a 10 MB script.** A shell that malloc'd its way through source would choke on it or take
 the machine down with it. gsh reads ~7 KiB, truncates the rest *loudly*, runs the tour it can hold -
 functions, captures, error paths and all - and leaves the prompt answering. Overflow is not a crash
-here; it is a feature. Every bound fails the same honest way: a value too big for the 4 KiB capture, a
+here; it is a feature. Every bound fails the same honest way: a value too big for the 512 B capture, a
 script too big for the 7 KiB buffer, a statement too long to hold across a read - each is a loud,
 specific refusal, never a silent truncation and never a corrupted result. The system tells you the
 truth about its limits.
@@ -463,9 +463,10 @@ truth about its limits.
 a function's output looked like it wanted a big buffer, and the question came out loud: *"is this a cool
 place to use a heap - throw the function on a heap, get the result, throw the heap away?"* That is the
 reflex, caught in mid-air - because "scratch space, filled, then discarded" is not a heap, it is a
-bounded stack buffer, which is exactly what we used (4 KiB, because a captured value goes into a
-variable and a variable can hold no more). The heap is a *shape of thought*, and the shape can almost
-always be had without the allocator. gsh is that argument, made in code, 4 KiB at a time.
+bounded stack buffer, which is exactly what we used (512 bytes - it lives in the executor's own frame,
+so it must stay small enough to coexist with everything else on a 256 KiB stack; a captured value is a
+name, a number, a short line). The heap is a *shape of thought*, and the shape can almost always be had
+without the allocator. gsh is that argument, made in code, half a kilobyte at a time.
 
 ---
 

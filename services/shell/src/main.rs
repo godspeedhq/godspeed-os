@@ -146,7 +146,7 @@ impl Out<'_> {
 /// stack on a `run … save` whose suite has `| assert` lines, 16 KiB fits (QEMU/HW-proven; frames are
 /// identical on both). It is the whole reason this is a direct file write, not a (nesting) pipe
 /// capture. A truly large report would want a streaming sink (append per chunk); not needed yet.
-const REPORT_MAX: usize = 16 * 1024;
+const REPORT_MAX: usize = 12 * 1024;
 struct ReportBuf {
     buf: [u8; REPORT_MAX],
     len: usize,
@@ -168,11 +168,12 @@ impl core::fmt::Write for ReportBuf {
 }
 
 /// Bounded accumulator for `$(fn)` output capture (the `CaptureCall` frame routes a function body's
-/// output here). 4 KiB on purpose: a captured value goes into a *variable* (the var arena is 4 KiB),
-/// so a bigger capture could never be stored anyway - and it lives in the executor frame while a
-/// capture is active, so it must stay small enough to coexist with the pipe path. Overflow is loud
-/// (§26.6). No heap: scratch space, filled then dropped - the "throw it away" without an allocator.
-const FNCAP_MAX: usize = 4096;
+/// output here). 512 B: this buffer lives in the `run_lines` frame for the WHOLE run (not just during
+/// a capture), so it must be small enough to coexist with the heaviest path - `run … save` with a
+/// `| assert` line already peaks ~148 KiB co-resident against a 256 KiB user stack (a 4 KiB buffer
+/// here overflowed it). 512 B holds the typical captured value (a name, a number, a short line); a
+/// bigger one overflows LOUDLY (§26.6), never silently. No heap: scratch space, filled then dropped.
+const FNCAP_MAX: usize = 512;
 struct FnCapBuf {
     buf: [u8; FNCAP_MAX],
     len: usize,

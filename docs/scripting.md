@@ -623,7 +623,8 @@ the representation, do not reach for more stack or a heap*).
 
 - **`$(fn …)`** - **BUILT.** Capture a *function's* output into a value: `let g = $(make_greeting Ada)`.
   The function runs via the Call machinery under a `CaptureCall` frame, with its body output routed to a
-  bounded **4 KiB** buffer (a captured value goes into a variable, so it can never be bigger); the
+  bounded **512 B** buffer (it lives in the executor frame for the whole run, so it stays small to
+  coexist with the pipe path - a captured value is a name, a number, a short line); the
   trimmed buffer becomes the value. One capture at a time (a nested `$(fn)` is refused loudly). No heap
   - scratch space, filled then dropped. (`$( )` also still captures a bare producer: `$(read /f)`.)
 - **Function-valued conditions** - **BUILT.** `if myfn args { … } [else { … }]` and `if !myfn { … }`
