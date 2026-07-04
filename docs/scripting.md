@@ -13,8 +13,8 @@
 > capture idiom). Both pinned by `osdev test files` + the baked `osdev test script`. **Functions**
 > are BUILT (§7): `fn name params { … }` called like a command, named params, scoped locals +
 > immutable-global access, `return`, and bounded recursion via explicit call frames (no native
-> recursion, §9); **function-valued conditions** (`if fn { }`, §4) are BUILT too; function output-capture
-> `$(fn …)` is a deferred follow-on. **Libraries** are BUILT too: `import <path>` (all functions) and
+> recursion, §9); **function-valued conditions** (`if fn { }`, §4) and **function output-capture**
+> (`$(fn …)`, §3) are BUILT too. **Libraries** are BUILT too: `import <path>` (all functions) and
 > `from <path> import <name> [as <alias>] …` (selective, aliased) - resolved at LOAD time (each lib is
 > minified + its requested functions appended to the buffer so the pre-scan indexes them), explicit
 > paths, flat namespace, loud on a name collision (`as` resolves it). **Loops** are BUILT too (§5):
@@ -29,9 +29,8 @@
 > `sum`/`min`/`max`/`avg <col>` reduce a numeric column - loud on a non-numeric/missing column, never a
 > silent 0. **Tier 2 is now complete**, and **console input** is BUILT (§8): `input "prompt"` and
 > `input secret "prompt"` - invisible entry + an echo-taint guard rail (`sealed` reserved). The
-> remaining **deferred follow-ons** - function output-capture `$(fn …)` and the record-row
-> `for row in (pipeline)`, `sealed` enforcement + a secret consumer, and `input` pipe-else-prompt -
-> are collected as future work under §11. Scripts use the `.gsh` extension
+> remaining **deferred follow-ons** - the record-row `for row in (pipeline)`, `sealed` enforcement + a
+> secret consumer, and `input` pipe-else-prompt - are collected as future work under §11. Scripts use the `.gsh` extension
 > (GodspeedOS shell; `.gs` is reserved for the future general-purpose Godspeed language). Builds on
 > the `run`/`run_lines` interpreter and the command **Result** model (`execute` returns `Ok`/`Err`).
 > Not POSIX - see CLAUDE.md Appendix B.3 / D.
@@ -131,6 +130,10 @@ let count = $(greet | count)               # 3
 let when  = $(date)                         # the date stamp
 let live  = $(status | where state=Running | count)
 echo "running: $live, at $when"
+
+fn make_greeting name { echo "Hello, $name!" }
+let msg = $(make_greeting Ada)             # capture a FUNCTION's output: "Hello, Ada!"
+echo $msg
 ```
 
 **Immutable by default.** `let x = …` is an **immutable** binding - reassigning it is a loud error.
@@ -608,22 +611,22 @@ These are **intended** for gsh (unlike §10, which is genuinely out of scope), b
 language is already complete enough to work in fully without them. They are recorded here so the intent
 is not lost; each is pulled into existence when a real script wants it (§26.2), not before.
 
-**The output-capture cluster** - three features that share one blocker. Each redirects a
-sub-computation's console output into a capture / stream buffer, which is a nested ~64 KiB buffer on top
-of a call frame - the exact stack pressure the heaviest run path already fights (§9: ~148 KiB
-co-resident against a 256 KiB user stack). Deferred until a chunk-streaming representation exists that
-does not buffer the whole sub-output (§26.6.1 - *change the representation, do not reach for more stack
-or a heap*):
+**The output-capture cluster - COMPLETE.** Three features that let a script *use* what a sub-computation
+produces. Each was deferred while it looked like it needed a nested ~64 KiB capture buffer on the stack;
+each turned out to need something smaller once actually built - the constitution's own lesson (§26.2):
+pull a feature into existence, then size it to the *real* need, not the feared one (§26.6.1 - *change
+the representation, do not reach for more stack or a heap*).
 
-- **`$(fn …)`** - capture a *function's* output into a value: `let g = $(make_greeting Ada)`. Today
-  `$( )` captures only a bare producer (`$(read /f)`, `$(date)`).
+- **`$(fn …)`** - **BUILT.** Capture a *function's* output into a value: `let g = $(make_greeting Ada)`.
+  The function runs via the Call machinery under a `CaptureCall` frame, with its body output routed to a
+  bounded **4 KiB** buffer (a captured value goes into a variable, so it can never be bigger); the
+  trimmed buffer becomes the value. One capture at a time (a nested `$(fn)` is refused loudly). No heap
+  - scratch space, filled then dropped. (`$( )` also still captures a bare producer: `$(read /f)`.)
 - **Function-valued conditions** - **BUILT.** `if myfn args { … } [else { … }]` and `if !myfn { … }`
   branch on the function's RESULT directly (Ok -> then, Err -> else), instead of calling it as a
   statement then checking `result`. The function runs via the executor's Call machinery under an
   `IfCall` frame; a comparison `else if` after a function-if still works. This one needs *no* capture
-  buffer - it branches on the result, not the output - so none of the stack pressure above applies; it
-  was the tractable one of the three. (`$(fn)` remains, and it is the one that truly needs the streaming
-  representation.)
+  buffer - it branches on the result, not the output.
 - **Stream loops** - **BUILT for byte-line producers.** `for line in (producer) { … }` captures the
   producer's output and iterates its lines: `for line in (read /f) { echo "> $line" }`. The producer
   must be a *bare* producer (`read`, `date`, `tree`, a producer service, …); a pipeline `(a | b)` is
