@@ -41,6 +41,9 @@ pub fn run(image_path: &Path, smp: u32) {
         // Confirms the detection works in QEMU + that the NIC doesn't disturb boot (the rest of the suite).
         "-device",  "e1000,netdev=n0",
         "-netdev",  "user,id=n0",
+        // Phase 1 step 3: dump every frame on the NIC backend to a pcap, so we can confirm
+        // nic-driver's TX frame actually left the card, not just that the NIC set DD.
+        "-object",  "filter-dump,id=nicdump,netdev=n0,file=build/net-tx.pcap",
         "-display", "none",
         "-no-reboot",
         "-no-shutdown",
@@ -129,6 +132,12 @@ pub fn run(image_path: &Path, smp: u32) {
             // end to end - the foundation the whole stack (ARP/IP/ICMP/UDP/TCP) builds on.
             check!(boot_out.contains("nic-driver: e1000 up") && boot_out.contains("MAC 52:54:00"),
                    "phase1 step2: nic-driver brought the e1000 up (reset + read the MAC)");
+            // Networking Phase 1 step 3 (docs/networking.md): nic-driver set up a TX descriptor
+            // ring in its DMA arena and transmitted a raw frame; the NIC confirmed it with the DD
+            // (descriptor-done) bit. Proves the DMA path: arena -> ring -> the card puts it on the
+            // wire. (The pcap check after the run confirms it host-side.)
+            check!(boot_out.contains("nic-driver: TX ok"),
+                   "phase1 step3: nic-driver transmitted a frame (NIC set the DD bit)");
         }
         None => {
             // Print what we did receive to help diagnose failures.

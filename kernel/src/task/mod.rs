@@ -183,6 +183,7 @@ pub const XHCI_DMA_VA:     u64 = 0x2_0000_0000;
 pub static XHCI_DMA_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static EHCI_DMA_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static AHCI_DMA_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static NIC_DMA_PHYS:  core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Pages of contiguous DMA memory for the **xHCI** driver. The first 16 pages
 /// hold the control structures (command/event rings, DCBAA, ERST, per-device
 /// slices, plus the scratchpad buffer array at page 15); the remaining 256 pages
@@ -3432,11 +3433,12 @@ fn spawn_service_with_config(
         (name == "xhci" && pci::XHCI_FOUND.load(Relaxed))
             || (name == "ehci" && pci::EHCI_FOUND.load(Relaxed))
             || (name == "block-driver" && pci::AHCI_FOUND.load(Relaxed)) // AHCI (docs/ahci.md)
+            || (name == "nic-driver" && pci::NIC_FOUND.load(Relaxed)) // e1000 TX/RX rings (docs/networking.md)
     };
     // Per-driver arena size: xHCI needs room for its 256 scratchpad buffers;
     // EHCI gets the small 64 KiB arena it had on main; the AHCI block driver needs
     // only its command list/FIS/command table + a data buffer - 64 KiB is plenty.
-    let dma_pages = if name == "ehci" || name == "block-driver" {
+    let dma_pages = if name == "ehci" || name == "block-driver" || name == "nic-driver" {
         EHCI_DMA_PAGES
     } else {
         XHCI_DMA_PAGES
@@ -3451,7 +3453,8 @@ fn spawn_service_with_config(
             "xhci"         => &XHCI_DMA_PHYS,
             "ehci"         => &EHCI_DMA_PHYS,
             "block-driver" => &AHCI_DMA_PHYS,
-            _              => &XHCI_DMA_PHYS, // unreachable: dma_for_driver gates these three names
+            "nic-driver"   => &NIC_DMA_PHYS,
+            _              => &XHCI_DMA_PHYS, // unreachable: dma_for_driver gates these names
         };
         let arena = match kept.load(core::sync::atomic::Ordering::Relaxed) {
             0 => {
@@ -3520,6 +3523,7 @@ fn spawn_service_with_config(
                         "xhci"         => pci::XHCI_BDF.load(Relaxed),
                         "ehci"         => pci::EHCI_BDF.load(Relaxed),
                         "block-driver" => pci::AHCI_BDF.load(Relaxed),
+                        "nic-driver"   => pci::NIC_BDF.load(Relaxed),
                         _              => 0xFFFF,
                     };
                     pci::set_bus_master(bdf);
