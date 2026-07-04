@@ -17,16 +17,17 @@ duplicate truth") applies to docs as much as to code. Concretely:
   (navigation), `introduction.md` (a thin landing page that frames and links, never restates),
   `gallery.md` (framing around captured screenshots), and the images under `src/images/`.
 
-Regenerating the site is a **local** step: run `bash website/sync.sh` (below), then push. That sync
-**is** the reconcile step that keeps the derived view honest - after editing a source doc, re-run it
-so the site follows. (There is no CI build: the `docs` GitHub Action was removed to save Actions
-minutes, so the reconcile is a deliberate local command, not an automatic one.)
+Regenerating the site is automatic: the **`docs` GitHub Action** (`.github/workflows/pages.yml`) runs
+`website/sync.sh` on the runner and deploys to GitHub Pages on every push to `main` that touches a
+source doc, the SDK, or the site. That build **is** the reconcile step that keeps the derived view
+honest - edit a source doc, push, and the site follows. Run `bash website/sync.sh` locally (below)
+only to **preview** the exact same output before you push.
 
 ## Build locally - one command for both docs and website
 
 `website/sync.sh` regenerates the **whole site in one command**: the mdBook narrative (from the
-`{{#include}}` source-of-truth stubs) *and* the SDK rustdoc under `/api`. It is exactly what used to
-run in CI, so what you preview locally is what you publish.
+`{{#include}}` source-of-truth stubs) *and* the SDK rustdoc under `/api`. It is exactly what runs in
+CI (`pages.yml`), so what you preview locally is what you publish.
 
 ```bash
 # one-time: install mdBook (need python3 too, for the link-fixup preprocessor)
@@ -60,12 +61,22 @@ that is not a page (`README.md`, `examples/`) becomes a GitHub URL. The source d
 In-page anchors already resolve (each included file is one page). Set `GODSPEED_REPO_URL` to change
 the GitHub base used for non-page links (defaults to the current repo).
 
-## Publishing (manual - no CI)
+## Publishing (automatic, via GitHub Actions)
 
-The `docs` GitHub Action was removed to save Actions minutes, so you build and push:
+The **`docs` workflow** (`.github/workflows/pages.yml`) builds and deploys the site to GitHub Pages
+automatically - no `gh-pages` branch, no generated HTML committed to `main`. It runs `website/sync.sh`
+on the runner and publishes `website/book/` through the official Pages deployment
+(`upload-pages-artifact` + `deploy-pages`).
 
-1. `bash website/sync.sh` - build the full site into `website/book/` (+ `/api`).
-2. Publish `website/book/` to GitHub Pages. To keep generated HTML off `main`, push it to a
-   `gh-pages` branch - e.g. with [`ghp-import`](https://github.com/c-w/ghp-import):
-   `ghp-import -n -p website/book` - and set repo Settings -> Pages -> Source to that branch.
-3. Set `git-repository-url` in `book.toml` once the org/repo names are final.
+**One-time setup:** in the repo, **Settings -> Pages -> Build and deployment -> Source: "GitHub
+Actions"**. Without it, the deploy step has nowhere to publish.
+
+After that:
+
+1. Edit a source doc (or the SDK, or the site) and push to `main` - the workflow rebuilds and
+   republishes. It is scoped to run only when `website/`, `docs/`, `sdk/`, or an included root doc
+   changes, so ordinary code pushes do not spend Actions minutes here.
+2. For the **first** deploy (right after setting the source), trigger it by hand: the Actions tab ->
+   "docs" -> Run workflow.
+3. To preview before pushing: `bash website/sync.sh`, then open `website/book/index.html` (or
+   `mdbook serve` for live reload).

@@ -1305,7 +1305,7 @@ impl ServiceContext {
         self.console_write(if clear_eol { "\x1b[K\n" } else { "\n" });
     }
 
-    /// Formatted variant of [`console_line`].
+    /// Formatted variant of [`Self::console_line`].
     pub fn console_line_fmt(&self, clear_eol: bool, args: core::fmt::Arguments) {
         let mut buf    = [0u8; 256];
         let mut cursor = 0usize;

@@ -1,0 +1,88 @@
+name: docs
+
+# Rebuild and deploy the documentation site to GitHub Pages.
+#
+# The site is the mdBook narrative (which {{#include}}s the source-of-truth docs -
+# CLAUDE.md, COMMANDMENTS.md, docs/, the ALMANAC, ...) plus the SDK rustdoc under /api.
+# This job runs `website/sync.sh`, so what you preview locally with `bash website/sync.sh`
+# is exactly what ships here - one build, no drift.
+#
+# ONE-TIME SETUP: in the repo, Settings -> Pages -> Build and deployment -> Source:
+# "GitHub Actions". Without that, the deploy step has nowhere to publish.
+
+on:
+  push:
+    branches: [main]
+    # Only rebuild when something the site is made of actually changes (the other
+    # workflows are paused to conserve CI minutes; this one stays cheap by scoping).
+    paths:
+      - 'website/**'
+      - 'docs/**'
+      - 'sdk/**'
+      - 'CLAUDE.md'
+      - 'COMMANDMENTS.md'
+      - 'GLOSSARY.md'
+      - 'CONTRIBUTING.md'
+      - 'README.md'
+      - 'milestones/ALMANAC.md'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:  # manual rebuild (use this for the first deploy, after setting the Pages source)
+
+# Least privilege: read the repo, write Pages, mint the OIDC token deploy-pages needs.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One publish at a time; never cancel an in-flight deploy midway.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build the site (mdBook + rustdoc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins nightly + the x86_64-unknown-none target, so `rustup
+      # show` installs exactly what the SDK rustdoc needs (same as the build workflow).
+      - name: Install Rust toolchain
+        run: rustup show
+
+      # python3 backs the link-fixup mdBook preprocessor (book.toml [preprocessor.godspeed-links]).
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install mdBook 0.4.40
+        run: |
+          curl -sSL --fail \
+            "https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C "$HOME/.cargo/bin"
+          mdbook --version
+
+      # The single source of truth for the build: mdBook narrative + SDK rustdoc -> website/book/api.
+      # rustdoc is best-effort inside sync.sh (the book still ships if it can't build); the mdBook
+      # build itself is not - a broken include or preprocessor fails the job, loudly.
+      - name: Build the site
+        run: bash website/sync.sh
+
+      - name: Upload the Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: website/book
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
