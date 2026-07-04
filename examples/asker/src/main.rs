@@ -39,6 +39,25 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     loop {
         counter += 1;
+
+        // Commandment VIII / §8.6 peer-death demonstration (driven by `osdev test reply-dead`). Once,
+        // after the round-trip has proven itself, send a request the server deliberately never answers
+        // (b"HANG") and block for the reply. If the server is killed while we wait, the kernel wakes us
+        // with `ReplyDead` - `request_with_reply` returns None - instead of hanging us forever. We
+        // survive it and carry on. (In the plain reply-server test the server stays alive and this
+        // simply parks asker here after its echoes - by then the round-trip is already proven.)
+        if counter == 3 {
+            ctx.log("asker: sending HANG - blocking for a reply the server withholds (peer-death test)");
+            let hang = Message::from_bytes(b"HANG");
+            match ctx.request_with_reply("reply-server", &hang) {
+                Some(_) => ctx.log("asker: HANG unexpectedly answered"),
+                None    => ctx.log("asker: HANG woke with no reply - peer died, did NOT hang (ReplyDead recovered)"),
+            }
+            ctx.reacquire_by_name("reply-server");
+            ctx.yield_cpu();
+            continue;
+        }
+
         let payload = make_payload(counter);
         let req = Message::from_bytes(&payload[..payload_len(&payload)]);
 

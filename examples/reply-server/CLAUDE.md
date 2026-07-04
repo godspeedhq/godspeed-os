@@ -71,10 +71,14 @@ send. The block above is spelled out so the mechanism is visible.) The runnable 
   reply capability. There is no `ipc_send` in the contract, no "reply to whoever called", no identity
   lookup - the cap retrieved by `take_pending_cap` *is* the authority to call back, and nothing else
   grants it. *(COMMANDMENTS.md VII; CLAUDE.md §7, §7.10, §8.5, Invariant 1.)*
-- **Commandment VIII (wait on truth, not time).** A successful reply send means the message was
-  *queued*, not *processed* (§8.6) - so a protocol needing confirmation builds an explicit ack. And the
-  reply uses `try_send`, which waits on no one: the server returns immediately whether or not the client
-  is ready, so it can never block on a peer. *(COMMANDMENTS.md VIII; CLAUDE.md §8.6, §8.9.)*
+- **Commandment VIII (wait on truth, not time - and the truth must include failure).** A successful
+  reply send means the message was *queued*, not *processed* (§8.6) - so a protocol needing confirmation
+  builds an explicit ack. And the reply uses `try_send`, which waits on no one: the server returns
+  immediately whether or not the client is ready, so it can never block on a peer. The *client* side
+  waits on truth too, and that truth now includes **failure**: it blocks for the reply with a
+  synchronous `Call`, and if this server dies mid-request the kernel wakes it with `ReplyDead` (the
+  reply-side twin of `EndpointDead`, §8.6) rather than hanging it forever. This server carries the
+  peer-death test hook that proves it - see below. *(COMMANDMENTS.md VIII; CLAUDE.md §8.6, §8.9.)*
 - **Commandment X (place complexity where it belongs).** Request/reply is *policy* - what a request
   means and what answer it deserves - and policy lives in the service. The kernel only routes the
   message and validates the cap; it has no idea this is an "RPC". *(COMMANDMENTS.md X; CLAUDE.md §26.10.)*
@@ -89,6 +93,20 @@ the server - both would block forever. Using `try_send_by_handle` for the reply 
 server never blocks on the client, so the mutual-blocking deadlock cannot form. The cost is that a reply
 to a full/dead client is dropped (returns an error) rather than waited on - which is exactly the
 loud-failure trade GodspeedOS wants (§26.7). The client retries; it does not hang.
+
+### The peer-death hook: the reply waits on truth without hanging
+
+This server carries a deliberate test hook (`src/main.rs`): a request whose payload is exactly `b"HANG"`
+is **never answered** - the server consumes the reply cap and loops, leaving the client blocked awaiting
+a reply that will never come. This is the case that used to hang a caller forever. It no longer does.
+The client's `request_with_reply` is a synchronous kernel `Call` (§8.2), so when `osdev test reply-dead`
+kills this server while the client is blocked on the withheld reply, the kernel wakes the client with
+`ReplyDead` - `request_with_reply` returns `None` - instead of hanging it. The client then reacquires
+by name and retries (Commandment IX). This is the executable form of **Commandment VIII**: the client
+waits on the *truth* of the reply, and that truth includes the server's **death** - a wait that could
+not observe failure would have quietly become an infinite wait on time (CLAUDE.md §8.6). The hook is
+inert in every other build; no real client sends `b"HANG"`. Pinned by `osdev test reply-dead`, the
+reply-side twin of §22 Test 4 (blocked sender wakes with `EndpointDead`).
 
 ## What you must NOT do
 
@@ -116,8 +134,9 @@ the code block above (or call `ctx.request_with_reply`).
 alongside it; asker sends a request carrying an embedded reply cap, reply-server replies over that cap,
 and the test asserts the round-trip closed - asker logs `asker: reply = <N> (echo OK)` and reply-server
 logs `reply-server: replied to a request`, with no kernel panic. Standalone (no client wired) it still
-blocks on `recv()` (idle) - its graceful degrade. The runnable proof of this pattern in production is
-`services/fs` and `services/block-driver`.
+blocks on `recv()` (idle) - its graceful degrade. The peer-death path is pinned separately by `osdev
+test reply-dead` (the `b"HANG"` hook above: the blocked client wakes with `ReplyDead`, never hangs). The
+runnable proof of this pattern in production is `services/fs` and `services/block-driver`.
 
 ## See also
 

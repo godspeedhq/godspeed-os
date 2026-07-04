@@ -512,8 +512,9 @@ Both error codes are kept; they share a mechanism but communicate different inte
 | `CapWrongScope`          | Cap targets a different resource than the action     |
 | `CapRevoked`             | Authority explicitly invalidated                     |
 | `EndpointDead`           | Endpoint/service lifecycle terminated                |
+| `ReplyDead`              | Replier died while the caller was blocked awaiting its reply (the reply-side twin of `EndpointDead`; §8.6) |
 
-Same generation-mismatch mechanism underlies `CapRevoked` and `EndpointDead`; the kernel returns the more specific code based on whether the resource was destroyed (endpoint dead) or had its cap explicitly revoked.
+Same generation-mismatch mechanism underlies `CapRevoked` and `EndpointDead`; the kernel returns the more specific code based on whether the resource was destroyed (endpoint dead) or had its cap explicitly revoked. `ReplyDead` shares that mechanism on the *reply* side: a caller blocked in a synchronous `Call` (§8.2) wakes with `ReplyDead` the instant its replier's endpoint dies (§8.6).
 
 ### 7.8 Capability Table Concurrency
 
@@ -584,7 +585,16 @@ Synchronous message passing with bounded per-endpoint queues. Endpoints are owne
 send(endpoint_cap, message)     -> Result<(), IpcError>   // blocks if full
 recv(endpoint_cap)              -> Result<Message, IpcError>  // blocks until msg
 try_send(endpoint_cap, message) -> Result<(), IpcError>   // non-blocking
+call(target_cap, reply_cap, recv_cap, message)
+                                -> Result<Message, IpcError>  // send request + block for reply
 ```
+
+`call` is the synchronous request/reply primitive (syscall 41). It sends the request to `target`
+carrying a one-shot **reply cap** (the caller's own endpoint), then blocks awaiting the reply. It
+wakes with the reply, or - if the replier dies before replying - with `ReplyDead` (§8.6), so it never
+hangs. This is **mechanism, not policy** (§26.10): the kernel learns only about a reply cap and its
+death semantics, never "request/reply" or "RPC". It is the primitive behind the SDK's
+`request_with_reply`; the reply-side twin of the blocked-sender `EndpointDead` wake.
 
 ### 8.3 Routing
 
@@ -642,6 +652,24 @@ Queue depth is not configurable per endpoint in v1. Per-endpoint depth is a v2 c
 | `recv` on closed endpoint                   | Returns `EndpointDead`       |
 | Sender already blocked when endpoint closes | Wakes with `EndpointDead` (cross-core IPI) |
 | Send-during-restart race                    | Generation check catches it; returns `EndpointDead` |
+| Replier dies while the caller is blocked awaiting its reply | Caller wakes with `ReplyDead` (cross-core IPI) |
+
+> **Amendment 2026-06-30 (reply-side death-wake): a caller blocked awaiting a reply wakes with
+> `ReplyDead`, completing the sender side of this table.** The rows above already wake a blocked
+> *sender* when its target endpoint closes (`EndpointDead`); the reply side was the missing twin. A
+> synchronous request/reply caller (the SDK `request_with_reply`, on which `fs`'s `block_rpc` rides)
+> sends a request carrying a one-shot **reply cap** and then blocks awaiting the reply on its own
+> endpoint. If the replier died after receiving the request but before replying, that blocked `recv`
+> hung forever - a reply that will never come. The kernel now tracks, for a caller blocked in a
+> synchronous CALL, the endpoint it awaits; the endpoint-death path finds any such caller (its
+> outstanding reply cap's holder has died) and wakes it with the new `ReplyDead` code, mirroring the
+> blocked-sender wake exactly (same generation/liveness mechanism, same cross-core IPI). This is
+> **mechanism, not policy** (§26.10): the kernel learns only about a *reply cap* and its death
+> semantics - never "request/reply" or "RPC". It is bounded (a blocked task has at most one in-flight
+> call, so one tracking slot per task). It is the executable form of Commandment VIII for
+> interdependent services: a dependent waits on its dependency's reply (truth), and a dependency that
+> dies wakes it loudly rather than hanging it. Pinned by `osdev test reply-dead` (the reply-side twin
+> of §22 Test 4).
 
 > **No delivery guarantee.** A successful `send` means the message was queued, not processed. Protocols requiring acknowledgment must build it explicitly.
 
@@ -2042,6 +2070,7 @@ Filesystem persistence beyond the trusted block driver, network stack, work-stea
 
 - **AP** - Application Processor. Any core other than the BSP.
 - **BSP** - Bootstrap Processor. The first core to execute kernel code.
+- **Call** - The synchronous request/reply IPC syscall (§8.2, syscall 41): send a request carrying a one-shot **reply cap**, then block awaiting the reply; wakes with the reply or with `ReplyDead` if the replier dies first, so it never hangs. Mechanism, not policy - the kernel learns a reply cap, not "RPC". The primitive behind the SDK `request_with_reply`.
 - **Capability** - Unforgeable token: ResourceId + Rights + Generation.
 - **Delegated resource capability** - A capability for a resource whose *meaning* is defined by a service (e.g. a file owned by `fs`), not the kernel. The owning service mints and revokes it (`resource_mint`/`resource_revoke`, gated by a `RESOURCE_MINT` cap); the kernel validates and routes it as for any cap, badging a send with the opaque `ResourceId` so the owner knows which resource. The mechanism behind file-as-capability (§7.10, P2).
 - **Endpoint** - IPC destination owned by a service. Bounded queue, depth 16 in v1.
@@ -2053,6 +2082,8 @@ Filesystem persistence beyond the trusted block driver, network stack, work-stea
 - **Placement** - Strict assignment of a service to a specific core at spawn time. Re-evaluated from scratch on every spawn, including post-restart spawns; the previous core is not remembered.
 - **PlacementInvalid** - Error returned when a contracted core is unavailable; spawn rejected, supervisor logs and skips.
 - **Quantum** - The 10 ms time slice after which the per-core scheduler preempts.
+- **Reply cap** - A one-shot capability to the caller's own endpoint, sent inside a `Call` request so the replier can reply to it. The kernel tracks, per blocked caller, the target endpoint it awaits; if that endpoint dies, the caller is woken with `ReplyDead`. The reply-side twin of the blocked-sender record (§8.2, §8.6).
+- **ReplyDead** - Error returned when the replier's endpoint dies while the caller is blocked in a `Call` awaiting its reply (value -12; §7.7, §8.6). The reply-side twin of `EndpointDead`, on the same generation/liveness mechanism.
 - **Routing table** - Kernel structure mapping `EndpointId → (CoreId, Generation, Liveness)`.
 - **TCB** - Trusted Computing Base. Kernel + arch + smp + init + supervisor. `registry` left the TCB via H11 (and the **registry service was then retired entirely** - naming Phase 4 / Path C, `docs/naming-design.md` §3.7); `block-driver` + `fs` left via the Phase D amendment (§6.1, once `fs` gained crash-consistent recovery). DMA drivers (`xhci`/`ehci`) are in the TCB only on a machine without an IOMMU (§6.4).
 - **Trusted root** - `supervisor` (sole; `init` was removed in Path C / Phase 5 - the kernel spawns the supervisor directly). It is **trusted but restartable** (Path C / Phase 6, §6.2): the kernel respawns it on death - unconditionally, forever - so its failure is recovered, not a reboot. The **only unkillable component is the kernel itself**. (`block-driver` + `fs` are restartable storage services.)

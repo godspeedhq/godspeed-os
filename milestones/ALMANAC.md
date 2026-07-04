@@ -34,7 +34,9 @@
 - [2026-06-22 to 2026-06-28 - The days Carnage found the wedges no one would write by hand](#2026-06-22-to-2026-06-28---the-days-carnage-found-the-wedges-no-one-would-write-by-hand)
 - [2026-06-25 - The day I wrote the constitution down as ten lines](#2026-06-25---the-day-i-wrote-the-constitution-down-as-ten-lines)
 - [2026-06-29 - The day the examples had to teach the truth](#2026-06-29---the-day-the-examples-had-to-teach-the-truth)
+- [2026-06-30 to 2026-07-01 - The day "wait on truth" turned out to be half a truth](#2026-06-30-to-2026-07-01---the-day-wait-on-truth-turned-out-to-be-half-a-truth)
 - [2026-07-03 - The day the shell became a language, and a 10 MB script was a non-event](#2026-07-03---the-day-the-shell-became-a-language-and-a-10-mb-script-was-a-non-event)
+- [2026-07-04 - The day the system survived a million acts of violence](#2026-07-04---the-day-the-system-survived-a-million-acts-of-violence)
 - [TBA - The day a private discipline becomes a public one](#tba---the-day-a-private-discipline-becomes-a-public-one)
 - [The Days I Was Wrong](#the-days-i-was-wrong)
   - [~2026-06-21 - The day the constitution rejected its author](#2026-06-21---the-day-the-constitution-rejected-its-author)
@@ -329,6 +331,79 @@ who did not live through the wedges - which is precisely what the Commandments w
 contract - held by the same identity tests, the same chaos bar, and the same ten commandments that
 earned them. The work of keeping the architecture uncorrupted does not end there; it opens. This entry
 is dated forward on purpose: it is the almanac's one anticipated day, waiting on the launch to make it real.
+
+---
+
+## 2026-06-30 to 2026-07-01 - The day "wait on truth" turned out to be half a truth
+
+A million-round `chaos max-carnage` soak finished with the system alive but the filesystem gone -
+`ls` said "no filesystem," `drives` read raw, and a cold reboot brought it all back. No data was lost;
+the disk was intact the whole time. So the bug was not corruption. It was a recovery that never
+happened.
+
+The cause was a single wall-clock timer. `fs` waited eight seconds for `block-driver` to report a
+readable disk, then gave up. Under a soak that had wedged the AHCI controller, eight seconds was never
+going to be enough - the controller needed a hard reset, not more waiting - so `fs` latched "no
+filesystem" and sat there. The timer *felt* like the safe, obvious way to wait for a dependency. It
+was the trap. Commandment VIII, exactly: wait on truth, not time.
+
+**What I came to understand, and it had a turn in it.** Removing the timer and waiting on
+`block-driver`'s actual reply fixed the soak - but following that discipline *rigorously* exposed
+something deeper. The request/reply primitive itself could hang: a blocking wait on a reply hangs
+forever if the reply never comes, and it never comes if the peer dies mid-request. "Wait on truth" had
+quietly become "wait forever" for the one truth it could not see: the peer's *death*. The easy version
+of a principle ("do not use timers") and the complete version of it are not the same thing.
+
+So the fix was not only in `fs`; it was in what "truth" means. We taught the kernel that a peer's
+death is a truth too - a synchronous Call whose caller wakes with `ReplyDead` the instant its replier
+dies, the reply-side twin of the sender-side wake §8.6 already had. seL4's Call/Reply, borrowed for
+exactly this. And the principled part, which was the owner's call: putting it in the kernel grows its
+*code* but not its *responsibility* - IPC death-semantics were always the kernel's job (Commandment I
+is about scope, not line count). Mechanism, not policy: the kernel learned about a *reply cap*, never
+about "RPC."
+
+**And then the fix had a hidden failure of its own.** The kernel change passed every green test -
+identity, fs-restart, a new ReplyDead pin - and still drained the whole system to zero on the first
+hardware soak: recovery of the dead supervisor hung on a single trigger, the timer ISR, which the
+storm starves, and the new code's latency was just enough to lose a race main had narrowly won. The
+lesson turned on itself. A fix I believed was complete was again only half-satisfied, and the half
+missing was the failure case - caught by exactly the fire this whole entry is about. The repair drove
+recovery from the storm's own hot path, the yield, making it *un-starvable* - stronger than it had
+ever been.
+
+**What it produced.** Commandment VIII, deepened: *wait for truth, not time - but ensure the truth
+includes failure.* A wait that cannot observe failure has quietly become an infinite wait on time. A
+standard for every contributor (`CONTRIBUTING.md`): interdependent services wait on each other's truth,
+the reply or the loud fact of death, never on a clock. And the lesson I keep relearning, now with
+teeth: a principle you believe you have satisfied is usually only half-satisfied, and the half you are
+missing is what happens when things fail.
+
+---
+
+## 2026-07-04 - The day the system survived a million acts of violence
+
+`chaos max-carnage all-services 1000000` ran to completion, and the system works as expected.
+
+A million rounds. Each round is not a gentle probe - it kills every restartable service, floods every
+endpoint it can reach, storms memory and the spawner, and rotates a kill through whatever is left. This
+is the same soak that, in the entry just above, drained the system to "no filesystem" on its first
+hardware run and taught the hardest version of Commandment VIII. This time it finished. Nothing had to
+be rebooted. The prompt still answered.
+
+**A million is not a number you reach by luck.** Fault tolerance that is 99.99% correct dies long
+before round ten thousand: leak one frame per kill, fail to reclaim one capability, leave one lock
+wedged, and the footprint grows without bound until something falls over. To reach 1,000,000 every
+recovery path has to be not merely correct but *conserving* - each respawn reclaims the dead instance's
+frames, kstack, and caps *before* it allocates fresh, so the footprint is flat and only a count grows
+(§6.2). The kernel respawns the supervisor unconditionally, forever; the supervisor reconciles - adopts
+the survivors, respawns the dead; clients see `EndpointDead`, reacquire by name, and retry. `unkillable
+= {kernel}`, and the kernel held a million times over.
+
+**This is the entry above, vindicated.** The wait-on-truth fix, the un-starvable respawn driven from
+the yield path, the `ReplyDead` reply-side twin - each was built to survive exactly this fire, and now
+the fire has burned a million times and the house still stands. Fault tolerance stopped being a claim
+in a constitution and became a measured fact. The model was right; the proof is a number with six
+zeroes.
 
 ---
 

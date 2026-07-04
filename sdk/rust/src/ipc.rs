@@ -41,6 +41,11 @@ pub enum IpcError {
     EndpointDead,
     QueueFull,
     MessageTooLarge,
+    /// A synchronous `call` was woken because the peer (the would-be replier) died before replying
+    /// (§8.6). The reply-side twin of `EndpointDead`: the caller waited on the peer's liveness, not a
+    /// timer, and so never hangs (Commandment VIII). Reacquire the peer by name and retry, exactly as
+    /// for a failed send.
+    ReplyDead,
     CapError(crate::capability::CapError),
 }
 
@@ -144,6 +149,37 @@ pub fn try_send(endpoint: CapHandle, msg: &Message) -> Result<(), IpcError> {
     if ret == 0 { Ok(()) } else { Err(i64_to_ipc_error(ret)) }
 }
 
+/// Synchronous CALL (syscall 41): send `request` to `target` carrying `reply_grant` as a one-shot
+/// reply cap, then block on `recv` (the caller's own endpoint, where the reply lands) until the peer
+/// replies OR the peer's endpoint dies. Returns the reply, `Err(ReplyDead)` if the peer died before
+/// replying, `Err(EndpointDead)` if the peer was already dead when the request was sent, or another
+/// `IpcError` on a failed send.
+///
+/// This **waits on truth, not on time** (Commandment VIII): a peer that dies mid-request wakes the
+/// caller with `ReplyDead` (the reply-side twin of `EndpointDead`, §8.6) instead of hanging it - no
+/// timer, no fixed yield count. The buffer is in/out: the request is read from it, and the kernel
+/// writes the reply back into the same buffer.
+pub fn call(
+    target:      CapHandle,
+    reply_grant: CapHandle,
+    recv:        CapHandle,
+    request:     &Message,
+) -> Result<Message, IpcError> {
+    let mut buf = [0u8; MAX_PAYLOAD];
+    let req = request.payload_bytes();
+    buf[..req.len()].copy_from_slice(req);
+    let packed = ((recv.0 as u64) << 32) | ((reply_grant.0 as u64) << 16) | (target.0 as u64);
+    // SAFETY: raw_syscall(41) = Call; `buf` is a valid in/out stack buffer in user space (request in,
+    // reply written back), `req.len() <= MAX_PAYLOAD`. The kernel validates every cap slot and the
+    // buffer pointer before use.
+    let ret = unsafe { raw_syscall(41, packed, buf.as_mut_ptr() as u64, req.len() as u64) };
+    if ret < 0 {
+        Err(i64_to_ipc_error(ret))
+    } else {
+        Ok(Message::from_bytes(&buf[..ret as usize]))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Error conversion.
 // ---------------------------------------------------------------------------
@@ -157,6 +193,7 @@ pub(crate) fn i64_to_ipc_error(code: i64) -> IpcError {
         -8  => IpcError::QueueFull,
         -9  => IpcError::QueueFull, // QueueEmpty on caller side == retry
         -10 => IpcError::MessageTooLarge,
+        -12 => IpcError::ReplyDead,
         _   => IpcError::EndpointDead,
     }
 }

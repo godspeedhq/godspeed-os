@@ -2933,6 +2933,92 @@ pub fn run_reply_server(image_path: &Path, smp: u32) {
     if fail > 0 { std::process::exit(1); }
 }
 
+/// Reply-side death-wake: a caller blocked awaiting a reply wakes with `ReplyDead`, it does NOT hang
+/// (§8.6, Commandment VIII; `sdk/rust/src/service_context.rs::request_with_reply` -> kernel syscall 41
+/// `Call`). Reuses the reply-test build (bare-metal set + reply-server + asker), COM1 for logs, COM2
+/// for the control channel. `asker` (see examples/asker) sends one request the server never answers
+/// (b"HANG") and blocks for the reply; we then KILL `reply-server` over COM2. Before this change the
+/// blocked `recv` would hang forever; now the kernel finds the outstanding reply cap of the blocked
+/// caller in the endpoint-death path and wakes it with `ReplyDead`, so `request_with_reply` returns
+/// None and `asker` carries on.
+///
+/// THE PROOF is asker logging `HANG woke with no reply ... (ReplyDead recovered)` AFTER the server was
+/// killed while it was demonstrably blocked (server logged it withheld the reply first). No hang, no
+/// panic. This is the reply-side twin of §22 Test 4 (a blocked *sender* wakes with `EndpointDead`).
+pub fn run_reply_dead(image_path: &Path, smp: u32) {
+    let sc = crate::qemu::timeout_scale();
+    println!("reply-dead: booting (smp={smp}) bare-metal + reply-server + asker; logs on COM1, control on COM2");
+    let qemu       = crate::qemu::qemu_binary();
+    let image_str  = image_path.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+    let ctrl_port  = pick_free_port();
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{shell_port},server"),         // COM1: logs (QEMU waits for us)
+        "-serial",  &format!("tcp::{ctrl_port},server,nowait"),   // COM2: control channel (connect later)
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("reply-dead: QEMU launch failed at {qemu}: {e}"); std::process::exit(1); });
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => { eprintln!("reply-dead: could not connect to serial {shell_port}"); child.kill().ok(); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone tcp stream");
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+
+    let mut pass = 0usize; let mut fail = 0usize; let mut cursor = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("reply-dead: PASS - {}", $label); pass += 1; } else { println!("reply-dead: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    // 1. The round-trip works first (asker got a real echo back) - the happy path is intact.
+    check!(collect_until(&buf, &mut cursor, b"(echo OK)", Duration::from_secs(90 * sc)).is_some(),
+           "asker got a normal reply back (Call happy path works)");
+
+    // 2. asker sends the request the server never answers and blocks for the reply.
+    check!(collect_until(&buf, &mut cursor, b"asker: sending HANG", Duration::from_secs(30 * sc)).is_some(),
+           "asker sent the HANG request and is blocking for a reply");
+    // 3. The server confirms it received the request but is withholding the reply - so asker is
+    //    genuinely blocked awaiting a reply that will never come (the exact state that used to hang).
+    check!(collect_until(&buf, &mut cursor, b"reply-server: HANG received", Duration::from_secs(30 * sc)).is_some(),
+           "reply-server received the request and withheld its reply (asker now blocked)");
+
+    // 4. KILL reply-server over the COM2 control channel while asker is blocked awaiting its reply.
+    println!("reply-dead: sending 'KILL reply-server' over the control channel …");
+    match retry_tcp_connect(ctrl_port, Duration::from_secs(10)) {
+        Some(mut ctrl) => {
+            thread::sleep(Duration::from_millis(100));
+            send(&mut ctrl, b"\nKILL reply-server\n");
+            // THE PROOF: the kernel found the blocked caller's outstanding reply cap in the
+            // endpoint-death path and woke it with ReplyDead, so request_with_reply returned None and
+            // asker logged its recovery - instead of hanging forever (the pre-change behaviour).
+            let woke = collect_until(&buf, &mut cursor, b"asker: HANG woke with no reply", Duration::from_secs(30 * sc));
+            check!(woke.is_some(), "asker woke with ReplyDead (blocked caller did NOT hang on peer death)");
+            drop(ctrl);
+        }
+        None => { println!("reply-dead: FAIL - could not connect to control port"); fail += 1; }
+    }
+
+    let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    check!(!whole.contains("KERNEL PANIC"), "no kernel panic across the reply-side death-wake");
+    let _ = std::fs::write("build/tests/reply_dead_serial.log", whole.as_bytes());
+
+    child.kill().ok(); child.wait().ok();
+    println!("\nreply-dead: {pass} passed, {fail} failed");
+    if fail > 0 { std::process::exit(1); }
+}
+
 /// `examples/resource-server` exercised by `examples/holder` - delegated resource capabilities
 /// (§7.10, P2 file-as-capability). Boots the bare-metal set + resource-server + holder (resource-test
 /// build). The pair runs autonomously: resource-server MINTs a resource it owns, narrows a READ-ONLY

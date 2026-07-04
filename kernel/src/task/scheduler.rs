@@ -1294,6 +1294,33 @@ pub fn yield_current() {
             }
         };
 
+        // Path C / Phase 6: route a pending supervisor respawn from the YIELD path too, not only the
+        // timer ISR (mirror of timer_tick_from_irq's pending block). `poll_supervisor_respawn` runs at
+        // run()'s loop top (an IF=1 point); Core 0 reaches it by BLOCKING or via the timer ISR routing.
+        // Under `chaos max-carnage` the foreground task never blocks - it paces with `yield_cpu`, whose
+        // `yield_current` has its own pick_next+switch and never reaches the run loop - so recovery would
+        // hinge SOLELY on the timer ISR, which the storm starves on real hardware (slow tick + long IF=0
+        // console writes + IPI/shootdown pressure), draining the live set to 0 with no respawn. Driving
+        // the respawn from the storm's own hot path (yield) makes recovery un-starvable: `next`/`prev`
+        // stay Ready and are re-picked after the run-loop top runs poll. Zero cost when healthy (one
+        // relaxed load). Skipped when already in the scheduler context (prev == IDLE).
+        if cid == 0 && prev < MAX_TASKS && crate::task::supervisor_respawn_pending() {
+            if TASK_VALID[prev].load(Ordering::Relaxed) && TASK_IS_USER[prev] {
+                TASK_USER_RSP[prev] =
+                    crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[cid].user_rsp;
+            }
+            let current_ctx: *mut TaskContext = if !TASK_VALID[prev].load(Ordering::Relaxed) {
+                CORE_DEAD_CTX.as_mut_ptr(cid)   // prev self-killed - discard (never resumed)
+            } else {
+                TASK_CTX[prev].assume_init_mut() as *mut TaskContext
+            };
+            CORE_CURRENT.get(cid).store(IDLE, Ordering::Relaxed);
+            let sched_ctx: *const TaskContext = CORE_SCHED_CTX.as_ptr(cid);
+            switch_context(current_ctx, sched_ctx);
+            // Resumes here when prev is next scheduled (after run()'s loop top did the respawn).
+            return;
+        }
+
         if next == prev {
             // CAS: preserve Dead if kill raced between pick_next and here.
             let _ = TASK_STATE[prev].compare_exchange(
@@ -1544,6 +1571,11 @@ pub fn kill_task_by_slot(slot: usize) {
         let task_name = TASK_NAME[slot];
         let task_ep   = ep_from_u64(TASK_ENDPOINT[slot].load(Ordering::Relaxed));
 
+        // If this task was itself blocked in a synchronous CALL, drop its outstanding-call record so
+        // that - once this slot is reused - a later death of the endpoint it was awaiting cannot
+        // spuriously wake the slot's new occupant with ReplyDead (§8.6 reply-side death-wake).
+        crate::ipc::routing::clear_call_await(slot);
+
         // If this task owned the console foreground (a TUI app like `chaos`), release it so a dead owner
         // cannot leave the system muted forever, and wake any shell parked in a muted blocking read.
         // Unconditional (before the endpoint cleanup) since the owner need not have an endpoint; the
@@ -1561,6 +1593,16 @@ pub fn kill_task_by_slot(slot: usize) {
             // freed page tables - the root cause of the use-after-free cascade.
             if let Some(s) = rx_slot { if s != slot { wake_by_slot(s, -7); } }
             if let Some(s) = tx_slot { if s != slot { wake_by_slot(s, -7); } }
+
+            // Reply-side death-wake (§8.6, Commandment VIII): wake every caller blocked in a
+            // synchronous CALL awaiting a reply from this now-dead endpoint, with ReplyDead (-12) -
+            // the twin of the blocked-sender EndpointDead wake just above. kill_endpoint has already
+            // bumped this endpoint's generation/liveness, so no new caller can register against it;
+            // take_call_waiter drains the callers that registered while it was alive, one per loop
+            // (bounded by one entry per task). Skip `slot` itself defensively (as rx/tx do).
+            while let Some(waiter) = crate::ipc::routing::take_call_waiter(ep_id) {
+                if waiter != slot { wake_by_slot(waiter, -12); }
+            }
 
             // Mark resource dead in global cap table so generation check fails.
             let resource_id = crate::capability::cap::ResourceId::from(ep_id);

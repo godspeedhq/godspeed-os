@@ -15,9 +15,9 @@ Provide typed, safe wrappers around kernel syscalls so service code:
 |-----------------------|---------------|
 | `lib.rs`              | Crate root: re-exports, `Error` enum |
 | `capability.rs`       | `CapHandle` (opaque slot index), `CapError` (mirrors kernel errors) |
-| `ipc.rs`              | `Message`, `recv`, `send`, `try_send`, `IpcError` |
+| `ipc.rs`              | `Message`, `recv`, `send`, `try_send`, `call` (synchronous request/reply), `IpcError` (incl. `ReplyDead`) |
 | `record.rs`           | `Table` (the typed structured-pipe value), `Value`, `RecordSink`; `where`/`select`/`sort` ops, `to_json`/`to_yaml`/`to_grid` renderers, `from_json`. The model behind typed pipes (`docs/records.md`), shared so any service can produce records |
-| `service_context.rs`  | `ServiceContext`: handed to `service_main`; named cap lookup; log helpers; spawn helpers (TCB-only) |
+| `service_context.rs`  | `ServiceContext`: handed to `service_main`; named cap lookup; log helpers; spawn helpers (TCB-only); `request_with_reply` (synchronous request/reply, waits on truth without hanging) |
 
 ## `ServiceContext` contract
 
@@ -34,6 +34,12 @@ let pong_cap = ctx.capability("ipc_send.pong")?;
 // IPC
 pong_cap.send(Message::text("hello"))?;
 let msg = my_endpoint.recv()?;
+
+// Synchronous request/reply (waits on truth, never hangs): sends the request carrying a
+// one-shot reply cap and blocks for the reply. If the peer dies mid-request the kernel wakes
+// the caller with ReplyDead (CLAUDE.md §8.6) instead of hanging; the caller gets None,
+// reacquires the peer by name, and retries. This is the primitive fs's block_rpc rides on.
+let reply = ctx.request_with_reply("fs", &request_msg);   // Option<Message>
 
 // Logging
 ctx.log("ping: starting");
