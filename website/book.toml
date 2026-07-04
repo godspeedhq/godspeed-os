@@ -17,6 +17,10 @@ src = "src"
 default-theme = "navy"
 preferred-dark-theme = "navy"
 git-repository-url = "https://github.com/godspeedhq/godspeed-os"
+# Served as a GitHub Pages *project* site under /godspeed-os/, so the 404 page and any
+# absolute references resolve against that base. If a custom domain at root is added
+# later, change this to "/".
+site-url = "/godspeed-os/"
 # edit-url is deliberately omitted: the included pages are {{#include}} stubs, so an
 # "edit this page" link would point at the stub, not the real source. The repo link
 # (git-repository-url, above) is enough.
