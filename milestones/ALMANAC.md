@@ -406,6 +406,32 @@ the fire has burned a million times and the house still stands. Fault tolerance 
 in a constitution and became a measured fact. The model was right; the proof is a number with six
 zeroes.
 
+**The receipt.** When the storm was called off, `observe now` on the T630 put the whole truth on one
+screen:
+
+```text
+--------------------------- system state (8 live) ---------------------------
+UPTIME: 3d 03:07:34     CPU: C0 99% C1 99% C2 0% C3 0% (49%)     RAM: 5 MiB used / 7 GiB total (0%)
+TASK  NAME          CORE  STATE      RESTARTS   QUEUE   UPTIME
+ 3    supervisor    C0    BlockRecv    142829    0/16      9h
+ 4    block-driver  C1    BlockRecv    142826    0/16      9h
+ 5    fs            C1    BlockRecv    997721    0/16      9h
+ 6    shell         C0    Running      997721    0/16      9h
+ 7    logger        C0    BlockRecv    143706    0/16      9h
+ 8    xhci          C1    Running      143704    0/16      9h
+ 9    ehci          C1    Ready        143706    0/16      9h
+drives:  0  data  GSFS  122104 MiB (122074 MiB free)
+```
+
+`RESTARTS` is what `observe` calls *deaths recovered, not clean re-runs* - the soak's odometer. `fs` and
+`shell` had each come back from death **997,721** times; `supervisor`, `block-driver`, `logger`, and the
+two USB drivers each sat near **142,000-143,000** - together roughly **2.7 million** individual service
+deaths, every one recovered, not one escalated. And the number that settles it is two lines up: **`RAM:
+5 MiB used`**. Flat. After 2.7 million deaths and resurrections and three days of uptime, memory had not
+grown by a single page - one leaked frame per death would have bled ~11 GiB; the machine used 5 MiB of
+its 7 GiB, and the 122 GiB SSD sat untouched at `122074 MiB free`. That is what "conserving, not merely
+correct" (§6.2) looks like the moment you finally read the meter.
+
 ---
 
 ## 2026-07-04 - The day gsh was finished, and never once reached for a heap
