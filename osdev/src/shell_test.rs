@@ -2182,6 +2182,32 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None => { println!("files-test: FAIL - gsh if-cmd timeout"); fail += 1; }
     }
 
+    // ── gsh: $(fn) - capture a FUNCTION's output into a variable. The body's echo goes to the capture
+    // buffer (not the console); the trimmed buffer becomes the value. (Scripts kept short - the write
+    // line length limit.)
+    let _ = run!(b"write /cf1.gsh fn g n { echo Hi-$n } ; let m = $(g Ada) ; echo GOT-$m\r", 10);
+    match run!(b"run /cf1.gsh\r", 14) {
+        Some(r) => check!(r.contains("GOT-Hi-Ada"), "gsh: $(fn) captures a function's output into a variable"),
+        None => { println!("files-test: FAIL - gsh fn-cap timeout"); fail += 1; }
+    }
+    let _ = run!(b"write /cf2.gsh fn f { echo 42 } ; let n = $(f) ; echo N-$n\r", 10);
+    match run!(b"run /cf2.gsh\r", 14) {
+        Some(r) => check!(r.contains("N-42"), "gsh: $(fn) with no args"),
+        None => { println!("files-test: FAIL - gsh fn-cap noarg timeout"); fail += 1; }
+    }
+    // The captured value is usable like any variable (here in a condition).
+    let _ = run!(b"write /cf3.gsh fn f { echo yes } ; let v = $(f) ; if $v == yes { echo CMATCH } else { echo CMISS }\r", 10);
+    match run!(b"run /cf3.gsh\r", 14) {
+        Some(r) => check!(r.contains("CMATCH") && !r.contains("CMISS"), "gsh: a $(fn)-captured value is usable downstream"),
+        None => { println!("files-test: FAIL - gsh fn-cap use timeout"); fail += 1; }
+    }
+    // A nested $(fn) (a captured function capturing another) is refused loudly, not silently wrong.
+    let _ = run!(b"write /cf4.gsh fn b { echo x } ; fn a { let y = $(b) ; echo done } ; let z = $(a) ; echo Z-$z\r", 10);
+    match run!(b"run /cf4.gsh\r", 14) {
+        Some(r) => check!(r.contains("nested") && r.contains("Z-done"), "gsh: nested $(fn) capture is refused loudly"),
+        None => { println!("files-test: FAIL - gsh fn-cap nested timeout"); fail += 1; }
+    }
+
     // ── gsh Slice 9 (Tier 2): defer - cleanup that runs on scope exit, LIFO, even on fail (§5).
     let _ = run!(b"write /df1.gsh defer echo deferred-ran ; echo main-ran\r", 10);
     match run!(b"run /df1.gsh\r", 14) {

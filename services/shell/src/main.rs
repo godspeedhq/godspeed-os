@@ -99,6 +99,9 @@ enum Out<'a> {
     /// sub-pipelines) can save its output without the nested-capture stack overflow that piping it
     /// causes. No heap; the bound is loud (§26.6).
     File(&'a mut ReportBuf),
+    /// A captured function body's output (`let x = $(myfn …)`). The CaptureCall frame points a
+    /// statement's `out` here; on the function's return the buffer becomes the variable's value.
+    FnCap(&'a mut FnCapBuf),
 }
 impl Out<'_> {
     /// Write a string, no trailing newline.
@@ -107,6 +110,7 @@ impl Out<'_> {
             Out::Console => console_write_chunked(ctx, s.as_bytes()),
             Out::Capture(c) => c.push(s.as_bytes()),
             Out::File(r) => r.push(s.as_bytes()),
+            Out::FnCap(c) => c.push(s.as_bytes()),
         }
     }
     /// Write raw bytes, no trailing newline (file content may not be clean UTF-8).
@@ -115,6 +119,7 @@ impl Out<'_> {
             Out::Console => console_write_chunked(ctx, b),
             Out::Capture(c) => c.push(b),
             Out::File(r) => r.push(b),
+            Out::FnCap(c) => c.push(b),
         }
     }
     /// Write a string followed by a newline.
@@ -128,6 +133,7 @@ impl Out<'_> {
             Out::Console => ctx.console_writeln_fmt(args),
             Out::Capture(c) => { let _ = core::fmt::write(c, args); c.push(b"\n"); }
             Out::File(r) => { let _ = core::fmt::write(r, args); r.push(b"\n"); }
+            Out::FnCap(c) => { let _ = core::fmt::write(c, args); c.push(b"\n"); }
         }
     }
 }
@@ -158,6 +164,33 @@ impl ReportBuf {
     fn bytes(&self) -> &[u8] { &self.buf[..self.len] }
 }
 impl core::fmt::Write for ReportBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result { self.push(s.as_bytes()); Ok(()) }
+}
+
+/// Bounded accumulator for `$(fn)` output capture (the `CaptureCall` frame routes a function body's
+/// output here). 4 KiB on purpose: a captured value goes into a *variable* (the var arena is 4 KiB),
+/// so a bigger capture could never be stored anyway - and it lives in the executor frame while a
+/// capture is active, so it must stay small enough to coexist with the pipe path. Overflow is loud
+/// (§26.6). No heap: scratch space, filled then dropped - the "throw it away" without an allocator.
+const FNCAP_MAX: usize = 4096;
+struct FnCapBuf {
+    buf: [u8; FNCAP_MAX],
+    len: usize,
+    overflow: bool,
+}
+impl FnCapBuf {
+    fn new() -> Self { FnCapBuf { buf: [0u8; FNCAP_MAX], len: 0, overflow: false } }
+    fn reset(&mut self) { self.len = 0; self.overflow = false; }
+    fn push(&mut self, b: &[u8]) {
+        let space = FNCAP_MAX - self.len;
+        let n = b.len().min(space);
+        self.buf[self.len..self.len + n].copy_from_slice(&b[..n]);
+        self.len += n;
+        if n < b.len() { self.overflow = true; }
+    }
+    fn bytes(&self) -> &[u8] { &self.buf[..self.len] }
+}
+impl core::fmt::Write for FnCapBuf {
     fn write_str(&mut self, s: &str) -> core::fmt::Result { self.push(s.as_bytes()); Ok(()) }
 }
 
@@ -2124,6 +2157,11 @@ enum BlockKind {
     /// if-body at `body` (via an `If` frame, so the body's `}` skips the else-chain), else we take the
     /// else-chain from just past `body_end`. Carries the same scope-drop as a Call on return.
     IfCall { body: usize, body_end: usize, negate: bool },
+    /// `let [mut] <name> = $(myfn …)` - capture a function's OUTPUT into a variable. The function was
+    /// called like any Call, but its body's output was routed to the capture buffer (via `out`); on
+    /// return we bind `name` (byte range in the script) to that buffer instead of resuming a caller,
+    /// then continue at `resume` (just past the `let` statement). Same scope-drop as a Call.
+    CaptureCall { name_off: usize, name_len: usize, mutable: bool, resume: usize },
 }
 
 /// The result of processing an `if` or `switch` construct. `CallThen` = the `if` condition is a
@@ -2755,6 +2793,24 @@ fn dispatch_call(ctx: &ServiceContext, b: &[u8], stmt: &str, ft: &FnTable, fi: u
 /// HW-proven - [[project-shell-stack-pipe]]). The `ReportBuf` is a modest bounded buffer, so it +
 /// a sub-pipeline's transient buffers fit the user stack - the whole point of saving directly.
 #[inline(never)]
+/// Parse `let [mut] <name> = $( inner )` for the `$(fn)` capture fast path: returns (name, mutable,
+/// inner) if the statement is a `let` whose WHOLE value is a `$( )` capture, else None (the ordinary
+/// let / producer-capture path handles it). `name` must be a single bare word.
+fn let_capture_form(s: &str) -> Option<(&str, bool, &str)> {
+    let rest = s.strip_prefix("let")?;
+    if !rest.starts_with(char::is_whitespace) { return None; }
+    let rest = rest.trim_start();
+    let (mutable, rest) = match rest.strip_prefix("mut") {
+        Some(r) if r.starts_with(char::is_whitespace) => (true, r.trim_start()),
+        _ => (false, rest),
+    };
+    let eq = rest.find('=')?;
+    let name = rest[..eq].trim();
+    if name.is_empty() || name.contains(char::is_whitespace) { return None; }
+    let inner = capture_form(rest[eq + 1..].trim())?;
+    Some((name, mutable, inner))
+}
+
 fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out, params: &Params) -> Result<(), ShellError> {
     // Per-run interpreter state: a bounded variable table, allocated once HERE (above `execute`) and
     // threaded by &mut into `run_stmt` - it never reaches `execute`/`pipe_run`'s frame. No heap (§26.6).
@@ -2786,6 +2842,12 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
     // `defer`red commands: (buffer offset, len, scope depth). Run LIFO on scope exit (§5).
     let mut defers: [(usize, usize, usize); DEFER_MAX] = [(0, 0, 0); DEFER_MAX];
     let mut ndefer = 0usize;
+    // `$(fn)` capture: while a CaptureCall frame is active, `capturing` is true and each statement's
+    // command output is routed to `fncap` (a bounded 4 KiB buffer) instead of the console; on the
+    // function's return the buffer becomes the `let` variable's value. One buffer -> one capture at a
+    // time (a nested `$(fn)` is refused loudly).
+    let mut fncap = FnCapBuf::new();
+    let mut capturing = false;
     // Apply a Step from handle_if/handle_switch to the executor state. A macro (not a fn) so it mutates
     // the frame stack / cursor in place. `CallThen` is the function-valued condition (`if myfn { … }`):
     // RUN the function under an `IfCall` frame; the branch happens when that frame's `}` is reached.
@@ -2873,6 +2935,27 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
                             pos = body_end + 1;
                         }
                     }
+                }
+                BlockKind::CaptureCall { name_off, name_len, mutable, resume } => {
+                    // The captured function returned: drop its scope + defers like a Call, stop
+                    // capturing, and bind its OUTPUT (now in fncap) to the `let` variable.
+                    sp -= 1;
+                    run_defers(ctx, cwd, b, &mut defers, &mut ndefer, vars.sp, &mut vars, params, out, sdepth);
+                    vars.exit_scope();
+                    capturing = false;
+                    if fncap.overflow {
+                        ctx.console_writeln("gsh: $(fn) output too large to capture (4 KiB)");
+                        last = Err(ShellError::Unknown); failed += 1;
+                    } else {
+                        let name = str_of(&b[name_off..name_off + name_len]);
+                        let r = vars.define(name.as_bytes(), trim_bytes(fncap.bytes()), mutable);
+                        match r {
+                            Ok(()) => last = Ok(()),
+                            Err(e) => { var_err_msg(ctx, name, e); last = Err(ShellError::Unknown); failed += 1; }
+                        }
+                    }
+                    fncap.reset();
+                    pos = resume;
                 }
             }
             continue;
@@ -2991,12 +3074,36 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
             let mut found = false;
             while sp > 0 {
                 sp -= 1;
-                if let BlockKind::Call(ret) = frames[sp] {
-                    run_defers(ctx, cwd, b, &mut defers, &mut ndefer, vars.sp, &mut vars, params, out, sdepth);
-                    vars.exit_scope();
-                    pos = ret;
-                    found = true;
-                    break;
+                match frames[sp] {
+                    BlockKind::Call(ret) => {
+                        run_defers(ctx, cwd, b, &mut defers, &mut ndefer, vars.sp, &mut vars, params, out, sdepth);
+                        vars.exit_scope();
+                        pos = ret;
+                        found = true;
+                        break;
+                    }
+                    // A function used as an `if` condition (IfCall) or a `$( )` capture (CaptureCall) is
+                    // a function boundary too, but its return needs branch/bind logic that `return`
+                    // cannot reproduce here. Refuse it LOUDLY (never leak the scope): exit cleanly, mark
+                    // the run failed, and stop.
+                    BlockKind::IfCall { body_end, .. } => {
+                        run_defers(ctx, cwd, b, &mut defers, &mut ndefer, vars.sp, &mut vars, params, out, sdepth);
+                        vars.exit_scope();
+                        ctx.console_writeln("gsh: 'return' inside a function used as an 'if' condition is not supported");
+                        last = Err(ShellError::Unknown); failed += 1; pos = body_end + 1;
+                        found = true;
+                        break;
+                    }
+                    BlockKind::CaptureCall { resume, .. } => {
+                        run_defers(ctx, cwd, b, &mut defers, &mut ndefer, vars.sp, &mut vars, params, out, sdepth);
+                        vars.exit_scope();
+                        capturing = false; fncap.reset();
+                        ctx.console_writeln("gsh: 'return' inside a captured function is not supported");
+                        last = Err(ShellError::Unknown); failed += 1; pos = resume;
+                        found = true;
+                        break;
+                    }
+                    _ => {}
                 }
             }
             if !found { ctx.console_writeln("gsh: 'return' outside a function"); }
@@ -3029,7 +3136,9 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
                         done = true;
                         break;
                     }
-                    BlockKind::Call(_) => break, // a loop can't be broken from inside a called function
+                    // A loop can't be broken across a function boundary - a plain call, or a function
+                    // used as an `if` condition (IfCall) or a `$( )` capture (CaptureCall).
+                    BlockKind::Call(_) | BlockKind::IfCall { .. } | BlockKind::CaptureCall { .. } => break,
                     _ => {}                       // if/switch - discarded on the way out
                 }
             }
@@ -3066,12 +3175,42 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
                 continue;
             }
         }
+        // `let [mut] x = $(myfn …)` - capture a FUNCTION's output into the variable. Run the function
+        // via the Call machinery under a CaptureCall frame, with its body output routed to `fncap`; on
+        // its return we bind `x`. (A `$(producer)` capture is NOT a function - it falls through to
+        // run_stmt's existing producer-capture path below.)
+        if let Some((name, mutable, inner)) = let_capture_form(s) {
+            let (w0, _) = split_first(inner);
+            if let Some(fi) = ft.lookup(b, w0.as_bytes()) {
+                if capturing {
+                    ctx.console_writeln("gsh: nested $(fn) capture is not supported");
+                    last = Err(ShellError::Unknown); failed += 1; pos = next;
+                } else if sp >= IF_DEPTH_MAX {
+                    ctx.console_writeln("gsh: call/block nesting too deep"); failed += 1; break;
+                } else if dispatch_call(ctx, b, inner, &ft, fi, &mut vars, params) {
+                    let name_off = name.as_ptr() as usize - b.as_ptr() as usize;
+                    frames[sp] = BlockKind::CaptureCall { name_off, name_len: name.len(), mutable, resume: next };
+                    sp += 1;
+                    capturing = true;
+                    fncap.reset();
+                    pos = ft.body_start[fi] as usize;
+                } else {
+                    last = Err(ShellError::Unknown); failed += 1; pos = next;
+                }
+                continue;
+            }
+        }
         // Echo the statement so the transcript shows what produced each result.
         out.put(ctx, "> ");
         out.line(ctx, s);
-        let (res, stop) = match run_stmt(ctx, cwd, s, last, sdepth, &mut vars, params, &mut Out::Console) {
-            StmtOutcome::Cont(r) => (r, false),
-            StmtOutcome::Stop(r) => (r, true),
+        let (res, stop) = {
+            // While a $(fn) capture is active, the command's OUTPUT goes to the capture buffer, not
+            // the console (the transcript `> stmt` above still goes to `out`).
+            let mut cmd_out = if capturing { Out::FnCap(&mut fncap) } else { Out::Console };
+            match run_stmt(ctx, cwd, s, last, sdepth, &mut vars, params, &mut cmd_out) {
+                StmtOutcome::Cont(r) => (r, false),
+                StmtOutcome::Stop(r) => (r, true),
+            }
         };
         last = res;
         if nrec < RUN_MAX_CMDS { verdict[nrec] = last.is_ok(); soff[nrec] = stmt_off as u16; slng[nrec] = stmt.len() as u16; }
