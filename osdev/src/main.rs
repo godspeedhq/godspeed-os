@@ -2106,9 +2106,12 @@ fn generate_big_script(path: &str) {
 #  10 MB gsh STRESS TEST - a COMPLEX, DYNAMIC program using every gsh feature,
 #  padded to 10 MB. The run-from-file CODE buffer is SCRIPT_MAX (~7 KiB), so a
 #  10 MB script MUST truncate LOUDLY (docs/scripting.md §9, §26.6.1): only the
-#  first ~7 KiB runs. The tour is up front (runs, self-checks green); a SAFE-TO-
-#  REPEAT dynamic block fills the rest. (No `input` - it would block an automated
-#  run; no `import` - the baked disk carries no library file.)
+#  first ~7 KiB runs. The tour is up front; a SAFE-TO-REPEAT dynamic block fills
+#  the rest. EXPECTED `failed` count: the two DELIBERATE `read /nope_zzz.txt`
+#  misses (they demo `if myfn` taking its else-branch on an Err - you cannot show
+#  error-handling without an error) plus the one statement the truncation cuts.
+#  (No `input` - it would block an automated run; no `import` - the baked disk
+#  carries no library file.)
 # ============================================================================
 echo ===TEN-MEG-STRESS-BEGIN===
 
@@ -2161,6 +2164,20 @@ read /tenmeg/nums.json | from json | count   | assert contains 3
 read /tenmeg/nums.json | from json | sum v   | assert contains 60
 read /tenmeg/nums.json | from json | max v   | assert contains 30
 read /tenmeg/nums.json | from json | avg v   | assert contains 20
+
+# --- output-capture cluster (the three newest features) ---
+fn greet who { echo hello-$who }
+let g = $(greet Ada)                        # $(fn): capture a FUNCTION's output into a value
+echo cap-fn-$g | assert contains cap-fn-hello-Ada
+fn always_ok { echo probe }
+fn always_bad { read /nope_zzz.txt }
+if always_ok { echo IF-FN-THEN } else { fail "if myfn: Ok took else" }
+if always_bad { fail "if myfn: Err took then" } else { echo IF-FN-ELSE }
+if !always_bad { echo IF-FN-NEG } else { fail "if !myfn wrong" }
+write /tenmeg/lines.txt L1
+let mut flc = 0
+for line in (tree /tenmeg) { flc = $flc + 1 }   # for line in (producer): iterate a producer's lines
+if $flc > 0 { echo forline-ran } else { fail "for line: empty" }
 echo ===TEN-MEG-TOUR-DONE===
 
 let mut n = 0
