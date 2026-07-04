@@ -1,6 +1,10 @@
-# gsh - the GodspeedOS shell language (design)
+# gsh - the GodspeedOS shell language
 
-> **Status:** **Tier 1 is BUILT** (Slices 1-3): `let`/`let mut` + reassignment, `$`-expansion
+> **Status: COMPLETE.** The whole language is built - and it lives entirely on the stack (no heap,
+> anywhere in the interpreter), with a fixed, readable bound on every buffer and a LOUD refusal on every
+> overflow (a 10 MB script truncates at ~7 KiB and runs, never OOMs - `osdev test big-script` 6/6). The
+> output-capture cluster (`for line in (producer)`, `if myfn`, `$(fn)`) closed the set. Tier 1 (Slices
+> 1-3): `let`/`let mut` + reassignment, `$`-expansion
 > (`$name`, `"..."`) + params (`$1..$9`, `$@`, `$#`, `$0`), `fail` (§3, §8); `if`/`else if`/`else`
 > with comparisons (`== != < > <= >=`), `in`, `!`, and `result` as a comparable value (§4); and
 > `switch` with multiple values per arm + `_` default, including `switch result` (§6). Pinned by

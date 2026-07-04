@@ -37,6 +37,7 @@
 - [2026-06-30 to 2026-07-01 - The day "wait on truth" turned out to be half a truth](#2026-06-30-to-2026-07-01---the-day-wait-on-truth-turned-out-to-be-half-a-truth)
 - [2026-07-03 - The day the shell became a language, and a 10 MB script was a non-event](#2026-07-03---the-day-the-shell-became-a-language-and-a-10-mb-script-was-a-non-event)
 - [2026-07-04 - The day the system survived a million acts of violence](#2026-07-04---the-day-the-system-survived-a-million-acts-of-violence)
+- [2026-07-04 - The day gsh was finished, and never once reached for a heap](#2026-07-04---the-day-gsh-was-finished-and-never-once-reached-for-a-heap)
 - [TBA - The day a private discipline becomes a public one](#tba---the-day-a-private-discipline-becomes-a-public-one)
 - [The Days I Was Wrong](#the-days-i-was-wrong)
   - [~2026-06-21 - The day the constitution rejected its author](#2026-06-21---the-day-the-constitution-rejected-its-author)
@@ -404,6 +405,41 @@ the yield path, the `ReplyDead` reply-side twin - each was built to survive exac
 the fire has burned a million times and the house still stands. Fault tolerance stopped being a claim
 in a constitution and became a measured fact. The model was right; the proof is a number with six
 zeroes.
+
+---
+
+## 2026-07-04 - The day gsh was finished, and never once reached for a heap
+
+gsh started as a batch runner: `run_lines` split a file on `;` and `\n` and handed each line to
+`execute`. It is now a language. Variables and arithmetic, `if` / `switch`, `for` / `loop` with
+`break` / `continue`, functions with parameters and bounded recursion, libraries via `import`,
+`defer`, record aggregators, typed pipes - and, last, the output-capture cluster: `for line in
+(producer)` to walk a stream, `if myfn` to branch on a function's result, and `$(fn)` to capture a
+function's output into a value. That last one closed the set. gsh is complete.
+
+**And it never once reached for a heap.** Every part of it lives on the stack or in a fixed, named
+arena: the ~5 KiB variable table, the ~7 KiB script buffer, the 4 KiB capture buffer, the 16-frame
+block stack. Not one general allocator in the whole interpreter. When a working set felt too big for
+the stack, the answer was never "add a heap" - it was "change the representation": stream a file in
+fixed chunks, refer to data by `(offset, len)` spans, give a subsystem its own bounded arena, iterate
+with an explicit stack instead of native recursion (§26.6.1). The constraint did not cramp the design;
+it improved it. Every limit in gsh is a number you can read off the source.
+
+**The proof is a 10 MB script.** A shell that malloc'd its way through source would choke on it or take
+the machine down with it. gsh reads ~7 KiB, truncates the rest *loudly*, runs the tour it can hold -
+functions, captures, error paths and all - and leaves the prompt answering. Overflow is not a crash
+here; it is a feature. Every bound fails the same honest way: a value too big for the 4 KiB capture, a
+script too big for the 7 KiB buffer, a statement too long to hold across a read - each is a loud,
+specific refusal, never a silent truncation and never a corrupted result. The system tells you the
+truth about its limits.
+
+**The last feature nearly went the other way, and the honesty of the ask is the whole point.** Capturing
+a function's output looked like it wanted a big buffer, and the question came out loud: *"is this a cool
+place to use a heap - throw the function on a heap, get the result, throw the heap away?"* That is the
+reflex, caught in mid-air - because "scratch space, filled, then discarded" is not a heap, it is a
+bounded stack buffer, which is exactly what we used (4 KiB, because a captured value goes into a
+variable and a variable can hold no more). The heap is a *shape of thought*, and the shape can almost
+always be had without the allocator. gsh is that argument, made in code, 4 KiB at a time.
 
 ---
 
