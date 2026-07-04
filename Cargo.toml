@@ -7,6 +7,7 @@ members = [
     "services/mem-pressure",
     "services/chaos",
     "services/block-driver",
+    "services/nic-driver",
     "services/fs",
     "sdk/rust",
     "osdev",

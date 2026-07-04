@@ -1,0 +1,11 @@
+[package]
+name = "nic-driver"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "nic-driver"
+path = "src/main.rs"
+
+[dependencies]
+godspeed-sdk = { path = "../../sdk/rust" }

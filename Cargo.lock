@@ -900,6 +900,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nic-driver"
+version = "0.1.0"
+dependencies = [
+ "godspeed-sdk",
+]
+
+[[package]]
 name = "nom"
 version = "8.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -371,6 +371,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
     spawn_mapped(&ctx, &mut name_map, "ehci", 0xFFFF);
 
+    // nic-driver: the userspace NIC driver (§12, docs/networking.md, Phase 1). Same builds as the
+    // USB drivers; the kernel maps the Intel e1000's BAR0 by name at spawn. On a non-e1000 NIC
+    // (the T630's Realtek) it gets no mapping and idles. Restart-on-death wiring (the MANAGED set)
+    // lands with the DMA/IRQ phase, when it holds device state worth recovering.
+    #[cfg(not(any(feature = "identity-only", feature = "perf-only",
+                  feature = "perf-brutal-only", feature = "stress-only",
+                  feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
+                  feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
+    spawn_mapped(&ctx, &mut name_map, "nic-driver", 0xFFFF);
+
     // Phase 1 (docs/naming-design.md): report the shadow name→cap map. Proves the supervisor now
     // holds an endpoint cap to every real service it spawned - the future name authority. Nothing
     // reads it yet (Phase 0b/3 wire dependents from it; Phase 4 brokers reacquisition through it).

@@ -105,10 +105,10 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(boot_out) => {
             check!(boot_out.contains("shell: ready"), "boot: shell ready message");
             // Naming migration (docs/naming-design.md): the supervisor builds a name→cap map as it
-            // spawns the real services, then wires dependents from it. Bare-metal maps 5 services
-            // (block-driver, fs, shell, xhci, ehci); names resolve via the kernel directory, with no
-            // separate name service spawned.
-            check!(boot_out.contains("name-cap map holds 5 service(s)"),
+            // spawns the real services, then wires dependents from it. Bare-metal maps 6 services
+            // (block-driver, fs, shell, xhci, ehci, nic-driver); names resolve via the kernel
+            // directory, with no separate name service spawned.
+            check!(boot_out.contains("name-cap map holds 6 service(s)"),
                    "naming: supervisor holds an endpoint cap for every real service");
             check!(!boot_out.contains("spawning registry") && !boot_out.contains("name-map + registry"),
                    "naming: no separate name service is spawned (the kernel directory resolves names)");
@@ -123,6 +123,12 @@ pub fn run(image_path: &Path, smp: u32) {
             // print names whatever chipset it has.
             check!(boot_out.contains("pci: NIC") && boot_out.contains("vendor=0x8086"),
                    "phase0: e1000 NIC detected + printed at boot (vendor=0x8086)");
+            // Networking Phase 1 step 2 (docs/networking.md): nic-driver receives the e1000's BAR by
+            // name, RESETS the controller, and reads the MAC it reloaded from EEPROM. QEMU's default
+            // e1000 MAC is 52:54:00:12:34:56. This proves PCI -> MMIO cap -> register R/W -> reset,
+            // end to end - the foundation the whole stack (ARP/IP/ICMP/UDP/TCP) builds on.
+            check!(boot_out.contains("nic-driver: e1000 up") && boot_out.contains("MAC 52:54:00"),
+                   "phase1 step2: nic-driver brought the e1000 up (reset + read the MAC)");
         }
         None => {
             // Print what we did receive to help diagnose failures.
