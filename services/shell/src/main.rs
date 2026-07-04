@@ -1789,6 +1789,21 @@ fn parse_i64(b: &[u8]) -> Option<i64> {
 
 fn is_cmp_op(t: &str) -> bool { matches!(t, "==" | "!=" | "<" | ">" | "<=" | ">=") }
 
+/// True if `cond` contains a top-level comparison operator or an `in` membership token - i.e. it is a
+/// value condition, not a bare `fnname args` function call. Used to tell `if x == y` from `if myfn x`.
+fn cond_has_operator(cond: &str) -> bool {
+    let mut i = 0usize;
+    let cb = cond.as_bytes();
+    while i < cb.len() {
+        while i < cb.len() && cb[i].is_ascii_whitespace() { i += 1; }
+        if i >= cb.len() { break; }
+        let (tok, end) = raw_token(cond, i);
+        if tok == "in" || is_cmp_op(tok) { return true; }
+        i = end;
+    }
+    false
+}
+
 /// Compare two already-expanded operands with `op`. Numeric if BOTH parse as integers, else a
 /// byte-wise (lexicographic) comparison. `None` on a bad operator.
 fn compare(l: &[u8], r: &[u8], op: &str) -> Option<bool> {
@@ -2104,20 +2119,46 @@ enum BlockKind {
     Call(usize),
     For { var: usize, body: usize, body_end: usize, base: usize, abase: usize, it: ForIter },
     Loop { body: usize, body_end: usize, base: usize, abase: usize, iter: u32 },
+    /// `if <function> { … }` (Slice: function-valued conditions). The function was called like any
+    /// Call; on return we branch on its result instead of resuming: Ok (XOR `negate`) enters the
+    /// if-body at `body` (via an `If` frame, so the body's `}` skips the else-chain), else we take the
+    /// else-chain from just past `body_end`. Carries the same scope-drop as a Call on return.
+    IfCall { body: usize, body_end: usize, negate: bool },
 }
 
-/// The result of processing an `if` or `switch` construct.
-enum Step { Enter(usize, BlockKind), Done(usize), Malformed(usize) }
+/// The result of processing an `if` or `switch` construct. `CallThen` = the `if` condition is a
+/// function call (`if myfn args { … }`): the executor must RUN it (a control-flow jump, not a value)
+/// and branch on its result. `cond_off`/`cond_len` bound the call text (`myfn args`) in the script.
+enum Step {
+    Enter(usize, BlockKind),
+    Done(usize),
+    Malformed(usize),
+    CallThen { fi: usize, cond_off: usize, cond_len: usize, body: usize, body_end: usize, negate: bool },
+}
 
 /// Handle an `if`/`else if`/`else` chain starting just after the `if` keyword (at `pos`). Evaluates
 /// each condition in turn: on the first true one, returns `Enter(body, If)` (the executor runs that
 /// block, then its `}` skips the rest of the chain); if none is true, takes a trailing `else` if
 /// present, else returns `Done(next)`.
-fn handle_if(b: &[u8], mut pos: usize, ctx: &ServiceContext, cwd: &mut Cwd, vars: &Vars, params: &Params, prev: Result<(), ShellError>, depth: u8) -> Step {
+fn handle_if(b: &[u8], mut pos: usize, ctx: &ServiceContext, cwd: &mut Cwd, vars: &Vars, params: &Params, prev: Result<(), ShellError>, depth: u8, ft: &FnTable) -> Step {
     loop {
         let open = match find_open_brace(b, pos) { Some(o) => o, None => { ctx.console_writeln("gsh: if: missing '{'"); return Step::Malformed(b.len()); } };
         let end = match find_matching_brace(b, open) { Some(e) => e, None => { ctx.console_writeln("gsh: if: unbalanced braces"); return Step::Malformed(b.len()); } };
         let cond = str_of(trim_bytes(&b[pos..open]));
+        // A FUNCTION-valued condition: `[!] fnname [args]` with no comparison / `in` operator. The
+        // executor must RUN the function (a Call jump) and branch on its result - `eval_cond` can't
+        // (it runs builtins via `execute`, not functions). Detected here, before `eval_cond`, so it
+        // works for the leading `if` and for any `else if`. A comparison / `in` is NOT a call.
+        {
+            let (negate, core) = match cond.strip_prefix('!') { Some(r) => (true, r.trim()), None => (false, cond) };
+            let (w0, _) = split_first(core);
+            if !w0.is_empty() && !cond_has_operator(core) {
+                if let Some(fi) = ft.lookup(b, w0.as_bytes()) {
+                    let coff = core.as_ptr() as usize - b.as_ptr() as usize;
+                    return Step::CallThen { fi, cond_off: coff, cond_len: core.len(), body: open + 1, body_end: end, negate };
+                }
+            }
+        }
         if eval_cond(ctx, cwd, cond, vars, params, prev, depth) {
             return Step::Enter(open + 1, BlockKind::If);
         }
@@ -2745,6 +2786,34 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
     // `defer`red commands: (buffer offset, len, scope depth). Run LIFO on scope exit (§5).
     let mut defers: [(usize, usize, usize); DEFER_MAX] = [(0, 0, 0); DEFER_MAX];
     let mut ndefer = 0usize;
+    // Apply a Step from handle_if/handle_switch to the executor state. A macro (not a fn) so it mutates
+    // the frame stack / cursor in place. `CallThen` is the function-valued condition (`if myfn { … }`):
+    // RUN the function under an `IfCall` frame; the branch happens when that frame's `}` is reached.
+    macro_rules! process_step {
+        ($st:expr) => {
+            match $st {
+                Step::Enter(body_, kind_) => {
+                    if sp >= IF_DEPTH_MAX { ctx.console_writeln("gsh: block nesting too deep"); failed += 1; pos = b.len(); }
+                    else { frames[sp] = kind_; sp += 1; pos = body_; }
+                }
+                Step::Done(next_) => { pos = next_; }
+                Step::Malformed(next_) => { last = Err(ShellError::Unknown); failed += 1; pos = next_; }
+                Step::CallThen { fi: fi_, cond_off: co_, cond_len: cl_, body: bd_, body_end: be_, negate: ng_ } => {
+                    if sp >= IF_DEPTH_MAX { ctx.console_writeln("gsh: block nesting too deep"); failed += 1; pos = b.len(); }
+                    else {
+                        let stmt_ = str_of(&b[co_..co_ + cl_]);
+                        if dispatch_call(ctx, b, stmt_, &ft, fi_, &mut vars, params) {
+                            frames[sp] = BlockKind::IfCall { body: bd_, body_end: be_, negate: ng_ };
+                            sp += 1;
+                            pos = ft.body_start[fi_] as usize;
+                        } else {
+                            last = Err(ShellError::Unknown); failed += 1; pos = be_ + 1;
+                        }
+                    }
+                }
+            }
+        };
+    }
     loop {
         pos = skip_seps(b, pos);
         if pos >= b.len() { break; }
@@ -2777,6 +2846,34 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
                         pos = body;
                     }
                 }
+                BlockKind::IfCall { body, body_end, negate } => {
+                    // The function that was the `if` condition just returned. Drop its scope + defers
+                    // like a Call, then BRANCH on its result instead of resuming.
+                    sp -= 1;
+                    run_defers(ctx, cwd, b, &mut defers, &mut ndefer, vars.sp, &mut vars, params, out, sdepth);
+                    vars.exit_scope();
+                    if last.is_ok() ^ negate {
+                        // true -> enter the if-body via an If frame (its `}` skips the else-chain, as usual).
+                        if sp >= IF_DEPTH_MAX { ctx.console_writeln("gsh: block nesting too deep"); failed += 1; pos = b.len(); }
+                        else { frames[sp] = BlockKind::If; sp += 1; pos = body; }
+                    } else {
+                        // false -> take the else-chain just past the if-body, if any (mirrors handle_if).
+                        let p = skip_ws(b, body_end + 1);
+                        if matches_kw(b, p, b"else") {
+                            let ae = skip_ws(b, p + 4);
+                            if matches_kw(b, ae, b"if") {
+                                process_step!(handle_if(b, ae + 2, ctx, cwd, &vars, params, last, sdepth, &ft));
+                            } else {
+                                match find_open_brace(b, ae) {
+                                    Some(eo) => { if sp >= IF_DEPTH_MAX { ctx.console_writeln("gsh: block nesting too deep"); failed += 1; pos = b.len(); } else { frames[sp] = BlockKind::If; sp += 1; pos = eo + 1; } }
+                                    None => { ctx.console_writeln("gsh: else: missing '{'"); failed += 1; pos = b.len(); }
+                                }
+                            }
+                        } else {
+                            pos = body_end + 1;
+                        }
+                    }
+                }
             }
             continue;
         }
@@ -2790,19 +2887,11 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
         // an `if` or `switch` construct.
         if matches_kw(b, pos, b"if") || matches_kw(b, pos, b"switch") {
             let step = if matches_kw(b, pos, b"if") {
-                handle_if(b, pos + 2, ctx, cwd, &vars, params, last, sdepth)
+                handle_if(b, pos + 2, ctx, cwd, &vars, params, last, sdepth, &ft)
             } else {
                 handle_switch(b, pos + 6, ctx, &vars, params, last)
             };
-            match step {
-                Step::Enter(body, kind) => {
-                    if sp >= IF_DEPTH_MAX { ctx.console_writeln("gsh: block nesting too deep"); failed += 1; break; }
-                    frames[sp] = kind; sp += 1;
-                    pos = body;
-                }
-                Step::Done(next) => { pos = next; }
-                Step::Malformed(next) => { last = Err(ShellError::Unknown); failed += 1; pos = next; }
-            }
+            process_step!(step);
             continue;
         }
         // a `for` loop: for <var> in <words | range N | range A B | $@> { body }

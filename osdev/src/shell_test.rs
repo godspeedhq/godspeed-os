@@ -2147,6 +2147,41 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None => { println!("files-test: FAIL - gsh for-line nest timeout"); fail += 1; }
     }
 
+    // ── gsh: if myfn { … } - function-valued conditions. The function is RUN (a control-flow jump);
+    // we branch on its result. `f` ends in echo (Ok) -> then; `g` reads a missing file (Err) -> else.
+    // A marker appears iff its echo executed, so contains/!contains is exact. (Scripts kept short - the
+    // `write <path> <content>` line has a length limit; a too-long script is silently truncated.)
+    let _ = run!(b"write /fc1.gsh fn f { echo IN } ; if f { echo THEN1 } else { echo ELSE1 }\r", 10);
+    match run!(b"run /fc1.gsh\r", 14) {
+        Some(r) => check!(r.contains("IN") && r.contains("THEN1") && !r.contains("ELSE1"), "gsh: if myfn - Ok result takes the then-branch"),
+        None => { println!("files-test: FAIL - gsh if-fn then timeout"); fail += 1; }
+    }
+    let _ = run!(b"write /fc2.gsh fn g { read /nz } ; if g { echo THEN2 } else { echo ELSE2 }\r", 10);
+    match run!(b"run /fc2.gsh\r", 14) {
+        Some(r) => check!(r.contains("ELSE2") && !r.contains("THEN2"), "gsh: if myfn - Err result takes the else-branch"),
+        None => { println!("files-test: FAIL - gsh if-fn else timeout"); fail += 1; }
+    }
+    let _ = run!(b"write /fc3.gsh fn g { read /nz } ; if !g { echo NEG3 }\r", 10);
+    match run!(b"run /fc3.gsh\r", 14) {
+        Some(r) => check!(r.contains("NEG3"), "gsh: if !myfn - negation of a function condition"),
+        None => { println!("files-test: FAIL - gsh if-fn neg timeout"); fail += 1; }
+    }
+    let _ = run!(b"write /fc4.gsh fn h a { echo ARG-$a } ; if h hi { echo AFT4 }\r", 10);
+    match run!(b"run /fc4.gsh\r", 14) {
+        Some(r) => check!(r.contains("ARG-hi") && r.contains("AFT4"), "gsh: args pass to a function condition"),
+        None => { println!("files-test: FAIL - gsh if-fn arg timeout"); fail += 1; }
+    }
+    let _ = run!(b"write /fc5.gsh fn g { read /nz } ; if g { echo A5 } else if 1 < 2 { echo EI5 } else { echo C5 }\r", 10);
+    match run!(b"run /fc5.gsh\r", 14) {
+        Some(r) => check!(r.contains("EI5") && !r.contains("A5") && !r.contains("C5"), "gsh: else if (comparison) after a function-if"),
+        None => { println!("files-test: FAIL - gsh if-fn elseif timeout"); fail += 1; }
+    }
+    let _ = run!(b"write /fc6.gsh if read /nz { echo CMD1 } else { echo CMD2 }\r", 10);
+    match run!(b"run /fc6.gsh\r", 14) {
+        Some(r) => check!(r.contains("CMD2") && !r.contains("CMD1"), "gsh: a non-function condition is still a command condition"),
+        None => { println!("files-test: FAIL - gsh if-cmd timeout"); fail += 1; }
+    }
+
     // ── gsh Slice 9 (Tier 2): defer - cleanup that runs on scope exit, LIFO, even on fail (§5).
     let _ = run!(b"write /df1.gsh defer echo deferred-ran ; echo main-ran\r", 10);
     match run!(b"run /df1.gsh\r", 14) {
