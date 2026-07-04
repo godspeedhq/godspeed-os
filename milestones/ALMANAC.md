@@ -38,7 +38,7 @@
 - [2026-07-03 - The day the shell became a language, and a 10 MB script was a non-event](#2026-07-03---the-day-the-shell-became-a-language-and-a-10-mb-script-was-a-non-event)
 - [2026-07-04 - The day the system survived a million acts of violence](#2026-07-04---the-day-the-system-survived-a-million-acts-of-violence)
 - [2026-07-04 - The day gsh was finished, and never once reached for a heap](#2026-07-04---the-day-gsh-was-finished-and-never-once-reached-for-a-heap)
-- [TBA - The day a private discipline becomes a public one](#tba---the-day-a-private-discipline-becomes-a-public-one)
+- [2026-07-04 - The day a private discipline became a public one](#2026-07-04---the-day-a-private-discipline-became-a-public-one)
 - [The Days I Was Wrong](#the-days-i-was-wrong)
   - [~2026-06-21 - The day the constitution rejected its author](#2026-06-21---the-day-the-constitution-rejected-its-author)
   - [~2026-06-27 - The day I reached for a heap](#2026-06-27---the-day-i-reached-for-a-heap)
@@ -319,19 +319,23 @@ discipline.)
 
 ---
 
-## TBA - The day a private discipline becomes a public one
+## 2026-07-04 - The day a private discipline became a public one
 
-The licenses are chosen - **GPL-2.0-only** for the OS, **Apache-2.0** for the SDK - and the groundwork
-for going public is laid. The launch date itself is still **to be announced**.
+The licenses were chosen - **GPL-2.0-only** for the OS, **Apache-2.0** for the SDK - the tree swept for
+secrets and stray dashes, and on 2026-07-04 it went public: **github.com/godspeedhq/godspeed-os**. (The
+org is `godspeedhq` because plain `godspeed` was already taken - by a personal account that hosts, of
+all things, Android *kernel* repos; the project is `godspeed-os`, leaving room for a `godspeed-lang`
+beside it when the language comes.) 939 commits of private practice, opened in one setting change.
 
 **What I came to understand:** every lesson above was learned in private, where the only person the
-discipline had to convince was me. Public will mean the constitution has to hold against contributors
+discipline had to convince was me. Public means the constitution now has to hold against contributors
 who did not live through the wedges - which is precisely what the Commandments were written for.
 
-**What it will produce:** the moment the invariants stop being a personal practice and become a public
+**What it produced:** the moment the invariants stopped being a personal practice and became a public
 contract - held by the same identity tests, the same chaos bar, and the same ten commandments that
-earned them. The work of keeping the architecture uncorrupted does not end there; it opens. This entry
-is dated forward on purpose: it is the almanac's one anticipated day, waiting on the launch to make it real.
+earned them. The work of keeping the architecture uncorrupted does not end here; it opens. This was the
+almanac's one entry dated forward on purpose - the anticipated day, kept blank until the launch could
+make it real. It is real now.
 
 ---
 
