@@ -2106,6 +2106,47 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None => { println!("files-test: FAIL - gsh slot-stress timeout"); fail += 1; }
     }
 
+    // ── gsh: for line in (producer) - capture a producer's output, iterate its lines.
+    // (1) Content binding: a single-line producer binds its line to $line (G-hello is expanded output,
+    // so it can appear only via the loop body, never in the literal `> echo G-$line` transcript echo).
+    let _ = run!(b"write /flsrc.txt hello\r", 10);
+    let _ = run!(b"write /flp1.gsh for line in (read /flsrc.txt) { echo G-$line }\r", 10);
+    match run!(b"run /flp1.gsh\r", 14) {
+        Some(r) => check!(r.contains("G-hello"), "gsh: for line in (producer) binds each line to the loop var"),
+        None => { println!("files-test: FAIL - gsh for-line bind timeout"); fail += 1; }
+    }
+    // (2) Multi-line: a producer with several lines iterates each. Count via a var and print it with an
+    // `=END` delimiter (so CNT=1= can't substring-match CNT=10=); >= 2 proves real multi-line iteration.
+    let _ = run!(b"mkdir /fld\r", 10);
+    let _ = run!(b"write /fld/a.txt xxx\r", 10);
+    let _ = run!(b"write /fld/b.txt yyy\r", 10);
+    let _ = run!(b"write /flp2.gsh let mut c = 0 ; for line in (tree /fld) { c = $c + 1 } ; echo CNT=$c=END\r", 10);
+    match run!(b"run /flp2.gsh\r", 14) {
+        Some(r) => check!(r.contains("CNT=") && !r.contains("CNT=0=") && !r.contains("CNT=1="), "gsh: for line in (producer) iterates every line"),
+        None => { println!("files-test: FAIL - gsh for-line count timeout"); fail += 1; }
+    }
+    // (3) break exits a for-line loop (and deletes the temp): the statement after break never runs.
+    let _ = run!(b"write /flp3.gsh for line in (tree /fld) { break ; echo LEAK }\r", 10);
+    match run!(b"run /flp3.gsh\r", 14) {
+        Some(r) => check!(!r.contains("LEAK"), "gsh: break exits a for-line loop"),
+        None => { println!("files-test: FAIL - gsh for-line break timeout"); fail += 1; }
+    }
+    // (4) A non-producer iter is refused loudly - the body never runs (XX appears nowhere).
+    let _ = run!(b"write /flp4.gsh for line in (frobnicate) { echo XX }\r", 10);
+    match run!(b"run /flp4.gsh\r", 14) {
+        Some(r) => check!(!r.contains("XX"), "gsh: for line in (non-producer) refused, body skipped"),
+        None => { println!("files-test: FAIL - gsh for-line refuse timeout"); fail += 1; }
+    }
+    // (5) Nested for-line loops must use DISTINCT temp files (id = each loop's `{` position), so the
+    // inner loop's capture doesn't clobber the outer's. NEST-XY is expanded output only.
+    let _ = run!(b"write /flx.txt X\r", 10);
+    let _ = run!(b"write /fly.txt Y\r", 10);
+    let _ = run!(b"write /flp5.gsh for a in (read /flx.txt) { for b in (read /fly.txt) { echo NEST-$a$b } }\r", 10);
+    match run!(b"run /flp5.gsh\r", 14) {
+        Some(r) => check!(r.contains("NEST-XY"), "gsh: nested for-line loops use distinct temps"),
+        None => { println!("files-test: FAIL - gsh for-line nest timeout"); fail += 1; }
+    }
+
     // ── gsh Slice 9 (Tier 2): defer - cleanup that runs on scope exit, LIFO, even on fail (§5).
     let _ = run!(b"write /df1.gsh defer echo deferred-ran ; echo main-ran\r", 10);
     match run!(b"run /df1.gsh\r", 14) {

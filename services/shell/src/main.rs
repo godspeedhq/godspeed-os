@@ -2084,6 +2084,11 @@ enum ForIter {
     Words { pos: usize, end: usize }, // byte positions of the remaining word list (after `in`)
     Range { cur: i64, end: i64 },
     Params { idx: usize },
+    /// `for line in (producer)` - the producer's output was captured to a temp file `/.fl<id>~`
+    /// (`id` = the loop's `{` position, unique + stable); `off` is the read cursor. Each step reads
+    /// the next line at `off`. Kept in a FILE, not a buffer, so the (Copy) iterator stays tiny and no
+    /// 16 KiB capture lives in the executor frame. The temp is deleted on exhaustion + on `break`.
+    FileLines { off: u32, id: u32 },
 }
 
 /// A block frame's kind. `If`/`else` closes by skipping its else-chain; a `switch` arm closes by
@@ -2484,7 +2489,71 @@ fn for_step(ctx: &ServiceContext, b: &[u8], vars: &mut Vars, var: usize, it: For
             vars.set_slot(var, eb.as_bytes()).ok()?;
             Some(ForIter::Words { pos: i, end })
         }
+        ForIter::FileLines { off, id } => forlines_step(ctx, vars, var, off, id),
     }
+}
+
+/// The temp-file path for a `for line in (producer)` loop: `/.fl<id>~` (id = the loop's `{` position,
+/// unique + stable). Written into `buf`; returns the used slice.
+fn forlines_temp(id: u32, buf: &mut [u8; 24]) -> &[u8] {
+    buf[..4].copy_from_slice(b"/.fl");
+    let mut n = 4usize;
+    let mut d = [0u8; 10];
+    let mut di = 0usize;
+    let mut v = id;
+    if v == 0 { d[0] = b'0'; di = 1; } else { while v > 0 { d[di] = b'0' + (v % 10) as u8; di += 1; v /= 10; } }
+    while di > 0 { di -= 1; buf[n] = d[di]; n += 1; }
+    buf[n] = b'~'; n += 1;
+    &buf[..n]
+}
+
+/// One step of a `for line in (producer)` loop: read the next line of the temp file at `off`, set the
+/// loop var, and advance. `#[inline(never)]` so its `IO_CHUNK` read buffer stays off the common
+/// `for_step` frame (Range/Words don't pay for it). On EOF (or a set-var error) the temp is deleted
+/// and the loop ends. A line is bytes up to `\n`; a final line without a trailing `\n` still counts;
+/// a trailing `\n` does not yield an extra empty line.
+#[inline(never)]
+fn forlines_step(ctx: &ServiceContext, vars: &mut Vars, var: usize, off: u32, id: u32) -> Option<ForIter> {
+    let mut tb = [0u8; 24];
+    let temp = forlines_temp(id, &mut tb);
+    let mut rbuf = [0u8; IO_CHUNK];
+    let n = fs_read_at(ctx, temp, off as u64, &mut rbuf).unwrap_or(0);
+    if n == 0 { let _ = fs_request(ctx, OP_DELETE, temp, &[]); return None; } // exhausted -> clean up
+    let mut k = 0usize;
+    while k < n && rbuf[k] != b'\n' { k += 1; }
+    let (line_end, next_off) = if k < n { (k, off + k as u32 + 1) } else { (n, off + n as u32) };
+    if vars.set_slot(var, &rbuf[..line_end]).is_err() {
+        let _ = fs_request(ctx, OP_DELETE, temp, &[]);
+        return None;
+    }
+    Some(ForIter::FileLines { off: next_off, id })
+}
+
+/// Capture `inner` (a producer) to the `for line in (…)` temp file. `#[inline(never)]` so the 16 KiB
+/// `ReportBuf` lives ONLY here, not in the executor frame. Delete-first is idempotent (clears a temp
+/// leaked by an errored prior run). Empty output -> no file (an empty loop). Loud + `Err` on a refused
+/// producer (run_captured said why), an over-16-KiB output, or a write failure.
+#[inline(never)]
+fn forlines_capture(ctx: &ServiceContext, cwd: &Cwd, inner: &str, temp: &[u8]) -> Result<(), ()> {
+    let _ = fs_request(ctx, OP_DELETE, temp, &[]);
+    let mut rb = ReportBuf::new();
+    let ok = { let mut o = Out::File(&mut rb); run_captured(ctx, cwd, inner, &mut o) };
+    if !ok { return Err(()); }
+    if rb.overflow { ctx.console_writeln("gsh: for line: producer output too large (16 KiB cap)"); return Err(()); }
+    let data = rb.bytes();
+    if data.is_empty() { return Ok(()); } // no file -> forlines_step's first read returns None -> empty loop
+    if !fs_write_new(ctx, temp, data.len() as u64) { ctx.console_writeln("gsh: for line: capture write failed"); return Err(()); }
+    let mut w = 0usize;
+    while w < data.len() {
+        let m = (data.len() - w).min(IO_CHUNK); // IO_CHUNK is 508-aligned, so each offset is block-aligned
+        if !fs_write_at(ctx, temp, w as u64, &data[w..w + m]) {
+            let _ = fs_request(ctx, OP_DELETE, temp, &[]);
+            ctx.console_writeln("gsh: for line: capture write failed");
+            return Err(());
+        }
+        w += m;
+    }
+    Ok(())
 }
 
 /// Run + remove every `defer`red command whose scope depth >= `min_depth`, LIFO (§5). Called on a
@@ -2757,7 +2826,21 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
             };
             let base = vars.count;
             let abase = vars.alen;
-            let it0 = parse_for_iter(b, rest_start, open);
+            // `for line in (producer) { … }` - capture the producer's output to a temp file, iterate
+            // its lines (docs/scripting.md). A parenthesized iter is the producer form; anything else
+            // is the existing range / $@ / word-list.
+            let rest = trim_bytes(&b[rest_start..open]);
+            let it0 = if rest.len() >= 2 && rest[0] == b'(' && rest[rest.len() - 1] == b')' {
+                let inner = trim_bytes(&rest[1..rest.len() - 1]);
+                let mut tb = [0u8; 24];
+                let temp = forlines_temp(open as u32, &mut tb);
+                match forlines_capture(ctx, cwd, str_of(inner), temp) {
+                    Ok(()) => ForIter::FileLines { off: 0, id: open as u32 },
+                    Err(()) => { failed += 1; pos = end + 1; continue; } // loud already; skip the loop
+                }
+            } else {
+                parse_for_iter(b, rest_start, open)
+            };
             match for_step(ctx, b, &mut vars, var, it0, params) {
                 Some(next_it) => {
                     if sp >= IF_DEPTH_MAX { ctx.console_writeln("gsh: block nesting too deep"); failed += 1; break; }
@@ -2838,7 +2921,20 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
             while i > 0 {
                 i -= 1;
                 match frames[i] {
-                    BlockKind::For { body_end, .. } | BlockKind::Loop { body_end, .. } => {
+                    BlockKind::For { body_end, it, .. } => {
+                        if is_break {
+                            // exiting a for-line loop for good -> delete its captured temp file.
+                            if let ForIter::FileLines { id, .. } = it {
+                                let mut tb = [0u8; 24];
+                                let t = forlines_temp(id, &mut tb);
+                                let _ = fs_request(ctx, OP_DELETE, t, &[]);
+                            }
+                            sp = i; pos = body_end + 1;               // pop loop + inner frames, exit past `}`
+                        } else { sp = i + 1; pos = body_end; }        // keep loop; jump to `}` -> next iteration
+                        done = true;
+                        break;
+                    }
+                    BlockKind::Loop { body_end, .. } => {
                         if is_break { sp = i; pos = body_end + 1; }   // pop loop + inner frames, exit past `}`
                         else { sp = i + 1; pos = body_end; }           // keep loop; jump to `}` -> next iteration
                         done = true;

@@ -18,7 +18,7 @@
 > `from <path> import <name> [as <alias>] …` (selective, aliased) - resolved at LOAD time (each lib is
 > minified + its requested functions appended to the buffer so the pre-scan indexes them), explicit
 > paths, flat namespace, loud on a name collision (`as` resolves it). **Loops** are BUILT too (§5):
-> `for <var> in <words | range N | range A B | $@> { … }`, unbounded `loop { … }` (100k-iteration
+> `for <var> in <words | range N | range A B | $@ | (producer)> { … }`, unbounded `loop { … }` (100k-iteration
 > backstop), and `break`/`continue`; a mutable loop counter lives in a fixed slot (overwritten in
 > place - no arena growth over a long loop), and each pass resets the body's locals so a `let` inside
 > is fresh. The stream/record forms (`for line in (producer)`) are a deferred follow-on (they need the
@@ -291,6 +291,10 @@ for row in (status | where state=Running) {   # the ROWS of a record stream
     echo "$row.name on core $row.core"
 }
 ```
+
+> **Built:** the byte-line form `for line in (producer)` - a *bare* producer, iterated line by line.
+> The **record-row** form (`for row in (pipeline) { $row.col }`) is a design sketch, still deferred
+> (see §11): it needs a capturable pipeline and `$row.<col>` field access.
 
 Iterate params or a literal word list:
 
@@ -599,11 +603,15 @@ or a heap*):
   `$( )` captures only a bare producer (`$(read /f)`, `$(date)`).
 - **Function-valued conditions** - `if myfn { … }`, branching on a function's outcome directly instead
   of calling it as a statement then checking `result`.
-- **Stream loops** - `for line in (producer) { … }`, iterating the lines a producer emits. Today `for`
-  takes words / `range` / `$@`.
+- **Stream loops** - **BUILT for byte-line producers.** `for line in (producer) { … }` captures the
+  producer's output and iterates its lines: `for line in (read /f) { echo "> $line" }`. The producer
+  must be a *bare* producer (`read`, `date`, `tree`, a producer service, …); a pipeline `(a | b)` is
+  not captured (bounded stack) - stage it to a file first. Bounded to a 16 KiB capture; loud if larger.
+  The **record-row** form (`for row in (pipeline) { $row.col }`) is still deferred: it needs a
+  capturable pipeline and `$row.<col>` field access.
 
-  *Current workaround (a working house pattern): **materialize-then-pipe** - the producer or function
-  writes a file, then `read <file> | …` or `let x = $(read <file>)`. Less inline, fully functional.*
+  *For the record-row case, the workaround stands: **materialize-then-pipe** - write the pipeline to a
+  file, then `for line in (read <file>) { … }`.*
 
 **Secret handling** - `input secret` today is a guard rail that only blocks console **echo** (not a
 vault - once a value may be written to a file it can be read back). Deferred until a real consumer
