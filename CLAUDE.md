@@ -149,7 +149,7 @@ These are the laws that bound every design choice. Any change that violates an i
   │  System Services                                 │
   │  logger  ·  block-driver  ·  fs                  │
   ├──────────────────────────────────────────────────┤
-  │  Trusted Root  (non-restartable)                 │
+  │  Trusted Root  (trusted, restartable)            │
   │  supervisor   (init removed; registry retired)   │
   ├──────────────────────────────────────────────────┤
   │  Kernel  (mechanism, not policy)                 │
