@@ -39,6 +39,7 @@
 - [2026-07-04 - The day the system survived a million acts of violence](#2026-07-04---the-day-the-system-survived-a-million-acts-of-violence)
 - [2026-07-04 - The day gsh was finished, and never once reached for a heap](#2026-07-04---the-day-gsh-was-finished-and-never-once-reached-for-a-heap)
 - [2026-07-04 - The day a private discipline became a public one](#2026-07-04---the-day-a-private-discipline-became-a-public-one)
+- [2026-07-04 - The day it shipped, and called itself 0.1](#2026-07-04---the-day-it-shipped-and-called-itself-01)
 - [The Days I Was Wrong](#the-days-i-was-wrong)
   - [~2026-06-21 - The day the constitution rejected its author](#2026-06-21---the-day-the-constitution-rejected-its-author)
   - [~2026-06-27 - The day I reached for a heap](#2026-06-27---the-day-i-reached-for-a-heap)
@@ -471,6 +472,28 @@ bounded stack buffer, which is exactly what we used (512 bytes - it lives in the
 so it must stay small enough to coexist with everything else on a 256 KiB stack; a captured value is a
 name, a number, a short line). The heap is a *shape of thought*, and the shape can almost always be had
 without the allocator. gsh is that argument, made in code, half a kilobyte at a time.
+
+---
+
+## 2026-07-04 - The day it shipped, and called itself 0.1
+
+Hours after the repository went public, GodspeedOS cut its first release: **v0.1.0** - a tagged,
+checksummed, bootable UEFI image on the releases page. The old `v1.0` tag - the marker left when the
+first cross-core ping/pong survived a restart - was deleted to make room for it. A system that had
+called itself "v1" for two months shipped its first release numbered **0.1.0**.
+
+**What I came to understand:** a version number is not a trophy for a milestone reached; it is a
+*claim about maturity*, and the honest claim was 0.x. "v1" was the name of a goal met - two services,
+cross-core IPC, restart. But the software underneath is still moving fast - a whole language landed the
+same week - and SemVer 0.x means precisely that: anything may still change. Numbering it 1.0.0 would
+have promised a stability the system does not yet owe anyone. The crates already knew; they had said
+`0.1.0` all along. The release only spoke the truth the code was already telling.
+
+**What it produced:** the system's own honesty discipline, turned on its own version string - say what
+is true, even when a larger number would flatter. The milestone was v1; the software is 0.1; both are
+true, and the release states the one that matters to a person about to boot it. (A smaller truth rode
+along: the 64 MiB image is 99.4% empty space, so it ships compressed to under half a megabyte - honest
+about its size, too.)
 
 ---
 
