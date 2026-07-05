@@ -673,6 +673,15 @@ impl ServiceContext {
         if ret < 0 { 0 } else { ret as u32 }
     }
 
+    /// The discovered NIC's PCI identity as `vendor | device<<16` (0 if no NIC), via InspectKernel
+    /// query 14. A NIC driver reads it to know which chip it is driving (e.g. Intel e1000 =
+    /// 0x100E_8086 vs Realtek RTL8168 = 0x8168_10EC). Ungated - task-neutral hardware info.
+    pub fn nic_vendor_device(&self) -> u32 {
+        // SAFETY: syscall(13) = InspectKernel; query_id=14 = NIC vendor|device.
+        let ret = unsafe { raw_syscall(13, 14, 0, 0) };
+        if ret < 0 { 0 } else { ret as u32 }
+    }
+
     /// Return the number of free physical frames.
     ///
     /// Wraps InspectKernel query 4.

@@ -84,13 +84,61 @@ const RX_POLL_MAX:    u32 = 1_000_000; // a reply arrives in ms (caught in the f
 
 const FRAME_MAX: usize = 1600; // one Ethernet frame (<= 1518) with headroom
 
+/// Realtek RTL8168 (the T630's NIC). Networking Phase 4, STAGE A: reset the controller, read the MAC
+/// (IDR0-5) and link (PHYSTATUS), and log them - proving the MMIO BAR + register access work on real
+/// hardware. TX/RX descriptor rings are Stage B; until then it serves the frame interface with EMPTY
+/// replies so net-stack degrades rather than hanging (§26.7). Never returns.
+fn realtek_main(ctx: ServiceContext) -> ! {
+    const R_CR:        usize = 0x37; // Command: RST=0x10, RE=0x08, TE=0x04
+    const R_PHYSTATUS: usize = 0x6C; // PHY status: LinkSts = 0x02
+    const CR_RST:      u8    = 0x10;
+
+    let mmio = match ctx.mmio() {
+        Some(m) => m,
+        None => { ctx.log("nic-driver: RTL8168 found but no MMIO mapped - serving empty replies"); idle_empty(&ctx); }
+    };
+    // Reset: set CR.RST, wait on the TRUTH of the bit self-clearing (bounded + loud, exempt timing).
+    mmio.write8(R_CR, CR_RST);
+    let mut spins = 0u32;
+    while spins < RESET_POLL_MAX && mmio.read8(R_CR) & CR_RST != 0 { ctx.yield_cpu(); spins += 1; }
+    // MAC = IDR0-5 (two 32-bit reads); link = PHYSTATUS bit 1.
+    let lo = mmio.read32(0x00);
+    let hi = mmio.read32(0x04);
+    let mac = [lo as u8, (lo >> 8) as u8, (lo >> 16) as u8, (lo >> 24) as u8, hi as u8, (hi >> 8) as u8];
+    let link_up = mmio.read8(R_PHYSTATUS) & 0x02 != 0;
+    ctx.log_fmt(format_args!(
+        "nic-driver: RTL8168 up  link {}  MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        if link_up { "UP" } else { "down" },
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]));
+    ctx.log("nic-driver: serving the frame interface");
+    idle_empty(&ctx); // Stage A: empty replies. Stage B adds the RTL8168 C+ TX/RX rings.
+}
+
+/// Serve the frame interface with EMPTY replies (a driver with no working TX/RX yet, or no NIC):
+/// net-stack gets an empty frame and degrades - it never hangs on a reply (§26.7). Never returns.
+fn idle_empty(ctx: &ServiceContext) -> ! {
+    loop {
+        let _ = ctx.recv();
+        if let Some(rc) = ctx.take_pending_cap() {
+            let _ = ctx.try_send_by_handle(rc, &Message::from_bytes(&[]));
+            ctx.remove_cap(rc);
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
-    ctx.log("nic-driver: starting (e1000)");
+    ctx.log("nic-driver: starting");
 
-    // The kernel mapped our BAR + DMA arena only if the discovered NIC is a real Intel e1000
-    // (Commandment VII). On any other NIC (the T630's Realtek) or none, we still SERVE the frame
-    // interface - with empty replies - so net-stack degrades instead of hanging on a reply (§26.7).
+    // Which NIC did the kernel find? nic-driver drives an Intel e1000 (the QEMU dev NIC) or a Realtek
+    // RTL8168 (the T630); the kernel maps whichever one's BAR. Dispatch on the PCI identity (Phase 4).
+    if ctx.nic_vendor_device() == 0x8168_10EC {
+        realtek_main(ctx); // RTL8168 - a separate path that never returns
+    }
+
+    // --- Intel e1000 path. The kernel mapped our BAR + DMA arena only if the discovered NIC is a real
+    // Intel e1000 (Commandment VII). On any other NIC or none, we still SERVE the frame interface -
+    // with empty replies - so net-stack degrades instead of hanging on a reply (§26.7).
     let mmio  = ctx.mmio();
     let arena = ctx.dma_region();
     let active = mmio.is_some() && arena.is_some();

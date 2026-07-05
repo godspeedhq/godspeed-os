@@ -810,14 +810,26 @@ pub fn init() {
                 // Network controller (PCI class 0x02) - networking Phase 0 (docs/networking.md):
                 // identify what NIC is present. Log EVERY one; record the first for the future nic-driver.
                 if class == CLASS_NETWORK {
-                    // BAR0 (offset 0x10): the register space. 64-bit memory BAR if bits[2:1]=10.
-                    let bar0 = config_read32(bus as u8, dev, func, 0x10);
-                    let mmio_base = if bar0 & 0x6 == 0x4 {
-                        let bar1 = config_read32(bus as u8, dev, func, 0x14);
-                        ((bar1 as u64) << 32) | ((bar0 & 0xFFFF_FFF0) as u64)
-                    } else {
-                        (bar0 & 0xFFFF_FFF0) as u64
-                    };
+                    // The NIC's register space = its first MEMORY BAR. The e1000's is BAR0; the
+                    // RTL8168's BAR0 is an I/O port and its MMIO lives in BAR2 - so SCAN the BARs for
+                    // the first mapped memory BAR rather than assuming BAR0 (networking Phase 4).
+                    let mut mmio_base = 0u64;
+                    let mut off = 0x10u8;
+                    while off <= 0x24 {
+                        let bar = config_read32(bus as u8, dev, func, off);
+                        let is_64 = bar & 0x6 == 0x4;
+                        if bar & 0x1 == 0 && bar & 0xFFFF_FFF0 != 0 {
+                            // a mapped 32- or 64-bit memory BAR
+                            mmio_base = if is_64 {
+                                let hi = config_read32(bus as u8, dev, func, off + 4);
+                                ((hi as u64) << 32) | ((bar & 0xFFFF_FFF0) as u64)
+                            } else {
+                                (bar & 0xFFFF_FFF0) as u64
+                            };
+                            break;
+                        }
+                        off += if is_64 { 8 } else { 4 };
+                    }
                     let irq    = (config_read32(bus as u8, dev, func, 0x3C) & 0xFF) as u8;
                     let vd     = config_read32(bus as u8, dev, func, 0x00);
                     let device = (vd >> 16) as u16;
