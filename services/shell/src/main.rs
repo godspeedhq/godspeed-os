@@ -4159,18 +4159,20 @@ fn net_status(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
     // net-stack is NOT a wired send-peer, so the first request can miss the cap cache. The shell holds
     // ACQUIRE_ANY, so reacquire by name and retry, then give up loudly (Commandment VIII / IX). The
     // request body is ignored by net-stack - the embedded reply cap IS the ask (§8.2).
+    // Bounded (3s): net-stack can wedge (e.g. on a degraded NIC), and a plain request_with_reply would
+    // freeze the shell. With a deadline it times out and `net` still prints the NIC diagnostic above.
     let req = Message::from_bytes(&[0u8]);
-    let reply = match ctx.request_with_reply("net-stack", &req) {
+    let reply = match ctx.request_with_reply_deadline("net-stack", &req, 3) {
         Some(r) => Some(r),
         None => if ctx.reacquire_by_name("net-stack") {
-            ctx.request_with_reply("net-stack", &req)
+            ctx.request_with_reply_deadline("net-stack", &req, 3)
         } else {
             None
         },
     };
     let reply = match reply {
         Some(r) => r,
-        None => { ctx.console_writeln("net: net-stack unavailable"); return Err(ShellError::Unknown); }
+        None => { ctx.console_writeln("net: net-stack unavailable (no reply within 3s)"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
     if p.len() < 15 {
