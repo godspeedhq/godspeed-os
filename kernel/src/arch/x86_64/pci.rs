@@ -220,6 +220,35 @@ pub fn set_bus_master(bdf: u32) {
     }
 }
 
+/// Bring a device to power state D0 (fully on). Firmware may leave a non-boot device (e.g. the T630's
+/// RTL8168) in D3hot, where its memory-mapped registers are INACCESSIBLE - MMIO reads return 0xff and a
+/// driver hangs (its reset bit looks permanently set). Walk the PCI capability list for the Power
+/// Management cap (ID 0x01) and clear PMCSR's PowerState field to D0. Idempotent. `bdf == 0xFFFF` = no-op.
+pub fn set_power_d0(bdf: u32) {
+    if bdf == 0xFFFF { return; }
+    let bus  = ((bdf >> 8) & 0xFF) as u8;
+    let dev  = ((bdf >> 3) & 0x1F) as u8;
+    let func = (bdf & 0x07) as u8;
+    // Status register bit 4 (= bit 20 of the 0x04 dword) = capability list present.
+    if config_read32(bus, dev, func, 0x04) & (1 << 20) == 0 { return; }
+    let mut cap = (config_read32(bus, dev, func, 0x34) & 0xFC) as u8;
+    let mut guard = 0;
+    while cap != 0 && guard < 48 {
+        let dw = config_read32(bus, dev, func, cap);
+        if (dw & 0xFF) as u8 == 0x01 {
+            // Power Management cap: PMCSR is at cap+4, PowerState = bits 1:0.
+            let pm = config_read32(bus, dev, func, cap + 4);
+            if pm & 0x3 != 0 {
+                config_write32(bus, dev, func, cap + 4, pm & !0x3); // -> D0
+                crate::kprintln!("pci: BDF {:#06x} power D{} -> D0", bdf & 0xFFFF, pm & 0x3);
+            }
+            return;
+        }
+        cap = ((dw >> 8) & 0xFC) as u8; // next cap pointer
+        guard += 1;
+    }
+}
+
 /// Take ownership of the EHCI controller from the firmware (BIOS→OS handoff).
 ///
 /// EHCI's HCCPARAMS register (MMIO capability offset 0x08) carries the EHCI

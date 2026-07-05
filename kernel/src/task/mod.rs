@@ -3543,6 +3543,7 @@ fn spawn_service_with_config(
                         "nic-driver"   => pci::NIC_BDF.load(Relaxed),
                         _              => 0xFFFF,
                     };
+                    pci::set_power_d0(bdf);  // bring the device to D0 first - firmware may park a non-boot NIC in D3
                     pci::set_bus_master(bdf);
                 }
                 (XHCI_DMA_VA, phys, len)

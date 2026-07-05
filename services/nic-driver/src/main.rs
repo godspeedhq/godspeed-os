@@ -93,36 +93,50 @@ fn realtek_main(ctx: ServiceContext) -> ! {
     const R_PHYSTATUS: usize = 0x6C; // PHY status: LinkSts = 0x02
     const CR_RST:      u8    = 0x10;
 
+    const REALTEK_RESET_MAX: u32 = 300_000; // SMALL - a wedged chip must not freeze the box for minutes
+
     let mmio = match ctx.mmio() {
         Some(m) => m,
-        None => { ctx.log("nic-driver: RTL8168 found but no MMIO mapped - serving empty replies"); idle_empty(&ctx); }
+        None => { ctx.log("nic-driver: RTL8168 found but no MMIO mapped - serving empty replies"); serve_status(&ctx, &[0u8; 7]); }
     };
-    // Reset: set CR.RST, wait on the TRUTH of the bit self-clearing (bounded + loud, exempt timing).
+    // Reset: set CR.RST, wait on the bit self-clearing (bounded SMALL + loud). If MMIO is not reaching
+    // the chip (D3 / no memory-space) every read is 0xff, so RST never clears - we TIME OUT, not spin.
     mmio.write8(R_CR, CR_RST);
     let mut spins = 0u32;
-    while spins < RESET_POLL_MAX && mmio.read8(R_CR) & CR_RST != 0 { ctx.yield_cpu(); spins += 1; }
+    while spins < REALTEK_RESET_MAX && mmio.read8(R_CR) & CR_RST != 0 { ctx.yield_cpu(); spins += 1; }
+    let reset_ok = spins < REALTEK_RESET_MAX;
     // MAC = IDR0-5 (two 32-bit reads); link = PHYSTATUS bit 1.
     let lo = mmio.read32(0x00);
     let hi = mmio.read32(0x04);
     let mac = [lo as u8, (lo >> 8) as u8, (lo >> 16) as u8, (lo >> 24) as u8, hi as u8, (hi >> 8) as u8];
     let link_up = mmio.read8(R_PHYSTATUS) & 0x02 != 0;
     ctx.log_fmt(format_args!(
-        "nic-driver: RTL8168 up  link {}  MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        if link_up { "UP" } else { "down" },
+        "nic-driver: RTL8168 reset {}  link {}  MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        if reset_ok { "OK" } else { "TIMEOUT" }, if link_up { "UP" } else { "down" },
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]));
     ctx.log("nic-driver: serving the frame interface");
-    idle_empty(&ctx); // Stage A: empty replies. Stage B adds the RTL8168 C+ TX/RX rings.
+    // Serve. A 1-byte `[3]` STATUS query gets [reset_ok, mac(6)] back - the `net` nic-mac diagnostic.
+    // Stage B adds the real C+ TX/RX rings.
+    let mut sreply = [0u8; 7];
+    sreply[0] = reset_ok as u8;
+    sreply[1..7].copy_from_slice(&mac);
+    serve_status(&ctx, &sreply);
 }
 
-/// Serve the frame interface with EMPTY replies (a driver with no working TX/RX yet, or no NIC):
-/// net-stack gets an empty frame and degrades - it never hangs on a reply (§26.7). Never returns.
-fn idle_empty(ctx: &ServiceContext) -> ! {
+/// Serve the frame interface. A 1-byte `[3]` STATUS query gets `sreply` ([ok, mac(6)]) back - the
+/// `net` nic-mac diagnostic. Every other request (a frame from net-stack) gets an EMPTY reply, so
+/// net-stack degrades rather than hangs (§26.7). Never returns.
+fn serve_status(ctx: &ServiceContext, sreply: &[u8]) -> ! {
     loop {
-        let _ = ctx.recv();
-        if let Some(rc) = ctx.take_pending_cap() {
-            let _ = ctx.try_send_by_handle(rc, &Message::from_bytes(&[]));
-            ctx.remove_cap(rc);
+        let req = ctx.recv();
+        let reply_cap = match ctx.take_pending_cap() { Some(c) => c, None => continue };
+        let p = req.payload_bytes();
+        if p.len() == 1 && p[0] == 3 {
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(sreply));
+        } else {
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[]));
         }
+        ctx.remove_cap(reply_cap);
     }
 }
 
@@ -142,6 +156,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mmio  = ctx.mmio();
     let arena = ctx.dma_region();
     let active = mmio.is_some() && arena.is_some();
+    let mut e1000_mac = [0u8; 6];
 
     if active {
         let m = mmio.as_ref().unwrap();
@@ -158,14 +173,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let link_up = (status >> 1) & 1 == 1;
         let ral = m.read32(REG_RAL0);
         let rah = m.read32(REG_RAH0);
-        let mac = [
+        e1000_mac = [
             (ral & 0xff) as u8, ((ral >> 8) & 0xff) as u8, ((ral >> 16) & 0xff) as u8,
             ((ral >> 24) & 0xff) as u8, (rah & 0xff) as u8, ((rah >> 8) & 0xff) as u8,
         ];
         ctx.log_fmt(format_args!(
             "nic-driver: e1000 up  link {}  MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
             if link_up { "UP" } else { "down" },
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]));
+            e1000_mac[0], e1000_mac[1], e1000_mac[2], e1000_mac[3], e1000_mac[4], e1000_mac[5]));
 
         a.zero();
         // TX ring registers (set up once; descriptors are written per request).
@@ -206,6 +221,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             Some(c) => c,
             None => { ctx.log("nic-driver: frame request had no reply cap - dropping"); continue; }
         };
+
+        // A 1-byte `[3]` STATUS query (the `net` nic-mac diagnostic) is answered with [ok, mac], NOT
+        // treated as a frame to transmit (which would stall the caller on the RX poll).
+        if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 3 } {
+            let mut sreply = [0u8; 7];
+            sreply[0] = 1; // e1000 is up
+            sreply[1..7].copy_from_slice(&e1000_mac);
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&sreply));
+            ctx.remove_cap(reply_cap);
+            continue;
+        }
 
         let mut n = 0usize;
         if active {

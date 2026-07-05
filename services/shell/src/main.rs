@@ -4139,6 +4139,23 @@ fn net_status(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
     out.line_fmt(ctx, format_args!(
         "nic      {:04x}:{:04x}  mmio {:#x}  ({})", vd & 0xFFFF, vd >> 16, ctx.nic_mmio_base(), chip));
 
+    // Query nic-driver directly (the shell holds ACQUIRE_ANY) for its MAC + reset result - this proves
+    // whether MMIO register access to the NIC actually works on this hardware (Phase 4 diagnostic).
+    let nreq = Message::from_bytes(&[3u8]);
+    let nrep = match ctx.request_with_reply("nic-driver", &nreq) {
+        Some(r) => Some(r),
+        None => if ctx.reacquire_by_name("nic-driver") { ctx.request_with_reply("nic-driver", &nreq) } else { None },
+    };
+    if let Some(r) = nrep {
+        let p = r.payload_bytes();
+        if p.len() >= 7 {
+            out.line_fmt(ctx, format_args!(
+                "nic-mac  {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}  reset {}",
+                p[1], p[2], p[3], p[4], p[5], p[6],
+                if p[0] == 1 { "ok" } else { "TIMEOUT (MMIO not reaching the chip)" }));
+        }
+    }
+
     // net-stack is NOT a wired send-peer, so the first request can miss the cap cache. The shell holds
     // ACQUIRE_ANY, so reacquire by name and retry, then give up loudly (Commandment VIII / IX). The
     // request body is ignored by net-stack - the embedded reply cap IS the ask (§8.2).
