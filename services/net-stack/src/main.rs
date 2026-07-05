@@ -47,6 +47,63 @@ fn checksum(data: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+/// Phase 3: a DHCP DISCOVER over UDP - ask QEMU slirp's built-in DHCP server for our IP and read the
+/// OFFER. This proves the UDP transport (the layer the socket capability sits on) over the frame
+/// interface. Returns the offered IP, or None (no NIC / nothing answered). A real net-stack would use
+/// this to LEARN its own IP instead of hardcoding it; here it demonstrates the round-trip.
+fn dhcp_discover(ctx: &ServiceContext) -> Option<[u8; 4]> {
+    // Ethernet(14) + IPv4(20) + UDP(8) + DHCP/BOOTP(244) = 286 bytes.
+    let mut frame = [0u8; 286];
+    for b in frame[0..6].iter_mut() { *b = 0xff; }       // eth dest = broadcast
+    frame[6..12].copy_from_slice(&OUR_MAC);              // eth src
+    frame[12] = 0x08; frame[13] = 0x00;                  // ethertype = IPv4
+    // IPv4 header.
+    frame[14] = 0x45; frame[15] = 0x00;
+    let total: u16 = 20 + 8 + 244;                       // 272
+    frame[16] = (total >> 8) as u8; frame[17] = total as u8;
+    frame[22] = 64;                                      // TTL
+    frame[23] = 17;                                      // protocol = UDP
+    for b in frame[30..34].iter_mut() { *b = 0xff; }     // dst = 255.255.255.255 (src 0.0.0.0 = zero)
+    let ip_ck = checksum(&frame[14..34]);
+    frame[24] = (ip_ck >> 8) as u8; frame[25] = ip_ck as u8;
+    // UDP header (src port 68 bootpc, dst port 67 bootps; checksum 0 = optional over IPv4).
+    frame[34] = 0; frame[35] = 68;
+    frame[36] = 0; frame[37] = 67;
+    let udp_len: u16 = 8 + 244;                          // 252
+    frame[38] = (udp_len >> 8) as u8; frame[39] = udp_len as u8;
+    // DHCP / BOOTP.
+    frame[42] = 1;                                       // op = BOOTREQUEST
+    frame[43] = 1;                                       // htype = Ethernet
+    frame[44] = 6;                                       // hlen
+    frame[46] = 0x39; frame[47] = 0x03; frame[48] = 0xf3; frame[49] = 0x26; // xid (arbitrary)
+    frame[52] = 0x80;                                    // flags = broadcast (OFFER comes back broadcast)
+    frame[70..76].copy_from_slice(&OUR_MAC);             // chaddr (client hardware address)
+    frame[278] = 0x63; frame[279] = 0x82; frame[280] = 0x53; frame[281] = 0x63; // DHCP magic cookie
+    frame[282] = 53; frame[283] = 1; frame[284] = 1;     // option 53 (message type) = DISCOVER
+    frame[285] = 255;                                    // option end
+
+    let req = Message::from_bytes(&frame);
+    match ctx.request_with_reply("nic-driver", &req) {
+        Some(reply) => {
+            let f = reply.payload_bytes();
+            // A DHCP reply: IPv4 (0x0800, IHL 5), UDP (proto 17), BOOTP op = 2 (BOOTREPLY). yiaddr
+            // (our offered IP) sits at BOOTP offset 16 = frame offset 58.
+            if f.len() >= 62 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45
+                && f[23] == 17 && f[42] == 2 {
+                let ip = [f[58], f[59], f[60], f[61]];
+                ctx.log_fmt(format_args!(
+                    "net-stack: DHCP - offered {}.{}.{}.{} (UDP works)", ip[0], ip[1], ip[2], ip[3]));
+                Some(ip)
+            } else {
+                ctx.log_fmt(format_args!(
+                    "net-stack: DHCP - {}-byte reply, no offer (no NIC, or nothing answered)", f.len()));
+                None
+            }
+        }
+        None => { ctx.log("net-stack: DHCP - nic-driver unreachable"); None }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("net-stack: starting");
@@ -148,7 +205,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         }
     }
 
-    // ARP + ICMP proven over the frame interface. UDP + the socket capability build on this seam next.
+    // ---- Phase 3: UDP - obtain our IP from slirp's DHCP server (proves the UDP transport).
+    dhcp_discover(&ctx);
+
+    // ARP + ICMP + DHCP proven over the frame interface. The SOCKET CAPABILITY (a socket is a
+    // delegated resource cap, minted/revoked by net-stack, §7.10) builds on this seam next.
     loop {
         while ctx.try_recv().is_some() {}
         ctx.yield_cpu();

@@ -171,6 +171,12 @@ pub fn run(image_path: &Path, smp: u32) {
     let icmp_ok = collect_until(&buf, &mut cursor, b"net-stack: ICMP - 10.0.2.2 echo reply", Duration::from_secs(12)).is_some();
     check!(icmp_ok, "phase2 icmp: net-stack pinged the gateway (ICMP echo reply received)");
 
+    // Networking Phase 3 (docs/networking.md): net-stack obtains its IP from slirp's DHCP server over
+    // UDP - the transport layer the socket capability sits on. A DHCP DISCOVER goes out over the frame
+    // interface and the OFFER comes back; a pass proves the UDP round-trip both ways, all in net-stack.
+    let dhcp_ok = collect_until(&buf, &mut cursor, b"net-stack: DHCP - offered", Duration::from_secs(12)).is_some();
+    check!(dhcp_ok, "phase3 udp: net-stack got a DHCP offer (UDP over the frame interface)");
+
     // -----------------------------------------------------------------------
     // help
     // -----------------------------------------------------------------------
