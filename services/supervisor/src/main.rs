@@ -381,6 +381,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
     spawn_mapped(&ctx, &mut name_map, "nic-driver", 0xFFFF);
 
+    // net-stack: the model-agnostic half of networking (docs/networking.md). Speaks ARP/IP over raw
+    // frames THROUGH nic-driver's frame interface, so it is spawned right AFTER nic-driver and WIRED
+    // to it (its SEND cap to nic-driver comes from the name-cap map). Same builds as nic-driver; on a
+    // non-e1000 NIC, nic-driver serves empty replies, so net-stack degrades (no hang) rather than
+    // resolving. Restart-on-death wiring (the MANAGED set) lands with Phase 2, when it holds protocol
+    // state worth recovering.
+    #[cfg(not(any(feature = "identity-only", feature = "perf-only",
+                  feature = "perf-brutal-only", feature = "stress-only",
+                  feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
+                  feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
+    spawn_wired(&ctx, &mut name_map, "net-stack", &["nic-driver"]);
+
     // Phase 1 (docs/naming-design.md): report the shadow name→cap map. Proves the supervisor now
     // holds an endpoint cap to every real service it spawned - the future name authority. Nothing
     // reads it yet (Phase 0b/3 wire dependents from it; Phase 4 brokers reacquisition through it).

@@ -8,6 +8,7 @@ members = [
     "services/chaos",
     "services/block-driver",
     "services/nic-driver",
+    "services/net-stack",
     "services/fs",
     "sdk/rust",
     "osdev",

@@ -41,6 +41,7 @@ fn main() {
         ("EHCI",       "ehci"),
         ("BLOCK_DRIVER", "block-driver"),
         ("NIC_DRIVER",  "nic-driver"),
+        ("NET_STACK",   "net-stack"),
         ("FS",         "fs"),
         ("COUNTER",    "counter"),  // examples/counter: stateful service, survives its own restart
         ("REPLY_SERVER", "reply-server"), // examples/reply-server: request/reply (RPC) server

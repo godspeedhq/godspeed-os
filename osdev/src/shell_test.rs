@@ -111,7 +111,7 @@ pub fn run(image_path: &Path, smp: u32) {
             // spawns the real services, then wires dependents from it. Bare-metal maps 6 services
             // (block-driver, fs, shell, xhci, ehci, nic-driver); names resolve via the kernel
             // directory, with no separate name service spawned.
-            check!(boot_out.contains("name-cap map holds 6 service(s)"),
+            check!(boot_out.contains("name-cap map holds 7 service(s)"),
                    "naming: supervisor holds an endpoint cap for every real service");
             check!(!boot_out.contains("spawning registry") && !boot_out.contains("name-map + registry"),
                    "naming: no separate name service is spawned (the kernel directory resolves names)");
@@ -132,12 +132,13 @@ pub fn run(image_path: &Path, smp: u32) {
             // end to end - the foundation the whole stack (ARP/IP/ICMP/UDP/TCP) builds on.
             check!(boot_out.contains("nic-driver: e1000 up") && boot_out.contains("MAC 52:54:00"),
                    "phase1 step2: nic-driver brought the e1000 up (reset + read the MAC)");
-            // Networking Phase 1 step 3 (docs/networking.md): nic-driver set up a TX descriptor
-            // ring in its DMA arena and transmitted a raw frame; the NIC confirmed it with the DD
-            // (descriptor-done) bit. Proves the DMA path: arena -> ring -> the card puts it on the
-            // wire. (The pcap check after the run confirms it host-side.)
-            check!(boot_out.contains("nic-driver: TX ok"),
-                   "phase1 step3: nic-driver transmitted a frame (NIC set the DD bit)");
+            // Networking Phase 1 step 5 (docs/networking.md): nic-driver reached its serve loop - it
+            // offers the FRAME INTERFACE (a request/reply where a request payload is a frame to
+            // transmit and the reply is the frame that came back). ARP/IP now live in net-stack, not
+            // here; nic-driver is pure mechanism (Commandment X). The full TX+RX round-trip is proven
+            // end to end by net-stack's ARP resolution below.
+            check!(boot_out.contains("nic-driver: serving the frame interface"),
+                   "phase1 step5: nic-driver serves the frame interface (mechanism, not protocol)");
         }
         None => {
             // Print what we did receive to help diagnose failures.
@@ -153,14 +154,15 @@ pub fn run(image_path: &Path, smp: u32) {
         }
     }
 
-    // Networking Phase 1 step 4 (docs/networking.md): the ARP reply arrives just AFTER the shell
-    // prompt (the round-trip completes as boot finishes), so it lands past boot_out - check for it
-    // here. nic-driver set up an RX ring + enabled the receiver, sent a broadcast ARP request that
-    // QEMU's user-net gateway answers, and RECEIVED the reply out of the arena. The marker
-    // "ethertype 0x0806" (ARP) is unique to nic-driver's RX log, so finding it proves the full path
-    // both ways: arena <-> ring <-> the wire.
-    let rx_ok = collect_until(&buf, &mut cursor, b"ethertype 0x0806", Duration::from_secs(10)).is_some();
-    check!(rx_ok, "phase1 step4: nic-driver received a frame (the ARP reply - RX ring works)");
+    // Networking Phase 2 (docs/networking.md): net-stack resolves the QEMU user-net gateway
+    // (10.0.2.2) by ARP - the first real protocol on the wire, and the proof of the frame interface
+    // END TO END. net-stack builds the ARP request, sends it THROUGH nic-driver (request/reply), the
+    // gateway answers, nic-driver hands the reply frame back, and net-stack parses the gateway's MAC.
+    // This completes as boot finishes, so it lands just past boot_out - check for it here. A pass
+    // means: net-stack -> nic-driver -> TX on the wire -> reply -> RX -> back to net-stack, all over
+    // the capability-mediated frame interface (ARP is policy in net-stack; the driver is mechanism).
+    let arp_ok = collect_until(&buf, &mut cursor, b"net-stack: ARP - 10.0.2.2 is at", Duration::from_secs(12)).is_some();
+    check!(arp_ok, "phase2 arp: net-stack resolved the gateway by ARP over the frame interface");
 
     // -----------------------------------------------------------------------
     // help

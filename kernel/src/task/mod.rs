@@ -523,6 +523,21 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[], // Phase 1 step 2: reset + MAC only; RX IRQ wired later
             has_console_read:  false,
         })),
+        // net-stack (services/net-stack): the model-AGNOSTIC half of networking (docs/networking.md).
+        // Owns its endpoint (nic-driver replies frames there via the per-request reply cap) and sends
+        // to nic-driver (the frame interface). Spawned AFTER nic-driver so its send-peer cap wires from
+        // the kernel name table at spawn. Core 1. No hardware - it speaks ARP/IP over raw frames.
+        "net-stack" => Some(("net-stack", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_NET_STACK_ELF")),
+            has_recv_endpoint: true,               // nic-driver replies frames here (per-request reply cap)
+            send_peers:        &["nic-driver"],    // the frame interface; reacquired by name on death
+            send_peers_grant:  false,
+            preferred_core:    1,
+            probe_mode:        0,
+            memory_limit:      16 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
         // `fs` - userspace filesystem (persistence, v2; §15, docs/persistence.md).
         // Phase 1: mounts by reading the superblock (LBA 0) from `block-driver`
         // over IPC and validating its magic. Spawned AFTER block-driver (its
