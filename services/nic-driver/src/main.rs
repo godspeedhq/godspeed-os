@@ -22,7 +22,7 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, Message};
+use godspeed_sdk::{ServiceContext, Message, Mmio, Dma};
 
 // Intel 82540EM register offsets (byte offsets into the BAR0 MMIO window).
 const REG_CTRL:   usize = 0x0000; // Device Control
@@ -84,6 +84,35 @@ const RX_POLL_MAX:    u32 = 1_000_000; // a reply arrives in ms (caught in the f
 
 const FRAME_MAX: usize = 1600; // one Ethernet frame (<= 1518) with headroom
 
+// --- Realtek RTL8168 C+ mode: register offsets into the MMIO BAR + 16-byte descriptor bits (Phase 4,
+// Stage B). The RTL8168 has no e1000-style head/tail registers - the NIC walks the ring by the OWN bit.
+const RTL_TNPDS:     usize = 0x20; // TX Normal Priority Descriptor Start Address (64-bit phys, 256B aligned)
+const RTL_CR:        usize = 0x37; // Command: RST=0x10, RE=0x08, TE=0x04
+const RTL_TPPOLL:    usize = 0x38; // TX Poll (write-only): NPQ=0x40 kicks the normal-priority TX queue
+const RTL_TCR:       usize = 0x40; // Transmit Config
+const RTL_RCR:       usize = 0x44; // Receive Config
+const RTL_9346CR:    usize = 0x50; // EEPROM cmd: 0xC0 = config write ENABLE (unlock), 0x00 = lock
+const RTL_PHYSTATUS: usize = 0x6C; // PHY status: LinkSts = 0x02
+const RTL_RMS:       usize = 0xDA; // RX Max packet Size (16-bit)
+const RTL_RDSAR:     usize = 0xE4; // RX Descriptor Start Address (64-bit phys, 256B aligned)
+
+const RTL_CR_RE:  u8 = 0x08;
+const RTL_CR_TE:  u8 = 0x04;
+const RTL_TPPOLL_NPQ: u8 = 0x40;
+
+// C+ 16-byte descriptor word 0 (opts1): flags in the high bits, length/size in the low 14 bits.
+const RTL_DESC_OWN: u32 = 1 << 31; // owned by the NIC (set = NIC's; it clears the bit when done)
+const RTL_DESC_EOR: u32 = 1 << 30; // end of ring (the last descriptor - the NIC wraps here)
+const RTL_DESC_FS:  u32 = 1 << 29; // first segment (TX)
+const RTL_DESC_LS:  u32 = 1 << 28; // last segment (TX)
+
+// RCR: AB (broadcast) | AM (multicast) | APM (physical match) | AAP (all = promiscuous), MXDMA=7
+// (unlimited burst), RXFTH=7 (no FIFO threshold - DMA on whole-frame). Promiscuous so a reply lands
+// whatever sender MAC net-stack advertised.
+const RTL_RCR_VALUE: u32 = 0x0F | (7 << 8) | (7 << 13);
+const RTL_TCR_VALUE: u32 = 7 << 8;      // MXDMA unlimited
+const RTL_RMS_VALUE: u16 = RX_BUF_SIZE as u16; // accept up to one buffer (2 KiB >> a 1518-byte frame)
+
 /// Realtek RTL8168 (the T630's NIC). Networking Phase 4, STAGE A: reset the controller, read the MAC
 /// (IDR0-5) and link (PHYSTATUS), and log them - proving the MMIO BAR + register access work on real
 /// hardware. TX/RX descriptor rings are Stage B; until then it serves the frame interface with EMPTY
@@ -114,13 +143,135 @@ fn realtek_main(ctx: ServiceContext) -> ! {
         "nic-driver: RTL8168 reset {}  link {}  MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         if reset_ok { "OK" } else { "TIMEOUT" }, if link_up { "UP" } else { "down" },
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]));
-    ctx.log("nic-driver: serving the frame interface");
-    // Serve. A 1-byte `[3]` STATUS query gets [reset_ok, mac(6)] back - the `net` nic-mac diagnostic.
-    // Stage B adds the real C+ TX/RX rings.
+    // Stage B: set up the C+ TX/RX rings and serve REAL frames. Without a DMA arena, degrade to the
+    // status-only server (net-stack still degrades cleanly rather than hanging, §26.7).
+    match ctx.dma_region() {
+        Some(arena) => realtek_serve(&ctx, &mmio, &arena, reset_ok, &mac),
+        None => {
+            ctx.log("nic-driver: RTL8168 has no DMA arena - serving empty replies");
+            let mut sreply = [0u8; 7];
+            sreply[0] = reset_ok as u8;
+            sreply[1..7].copy_from_slice(&mac);
+            serve_status(&ctx, &sreply);
+        }
+    }
+}
+
+/// Arm RX descriptor `i`: point it at its 2 KiB buffer and hand ownership to the NIC (OWN set), with
+/// EOR on the last descriptor so the NIC wraps the ring. Written OWN-last (the addr is valid first).
+fn rtl_arm_rx(arena: &Dma, i: usize) {
+    let d = RX_RING_OFF + i * 16;
+    let buf = arena.phys_at(RX_BUF_OFF + i * RX_BUF_SIZE);
+    arena.write32(d + 8, (buf & 0xffff_ffff) as u32);
+    arena.write32(d + 12, (buf >> 32) as u32);
+    arena.write32(d + 4, 0);
+    let mut o1 = RTL_DESC_OWN | (RX_BUF_SIZE as u32 & 0x3FFF);
+    if i == RX_RING_COUNT - 1 { o1 |= RTL_DESC_EOR; }
+    arena.write32(d, o1);
+}
+
+/// Realtek RTL8168 C+ TX/RX (Phase 4, STAGE B): set up the C+ descriptor rings in the DMA arena, enable
+/// the receiver + transmitter, and serve the frame interface FOR REAL - transmit each request frame and
+/// hand back whatever arrives on the wire (§8.2, mirroring the e1000 serve loop with RTL8168 registers
+/// and 16-byte C+ descriptors). A 1-byte `[3]` STATUS query still returns [reset_ok, mac(6)] (the `net`
+/// nic-mac diagnostic). The receiver stays on, so background broadcasts are DRAINED before each TX.
+/// Never returns.
+fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool, mac: &[u8; 6]) -> ! {
+    arena.zero();
+    mmio.write8(RTL_9346CR, 0xC0);              // unlock the config registers
+    mmio.write16(RTL_RMS, RTL_RMS_VALUE);       // max RX packet size
+
+    // TX ring base (descriptors are written per frame).
+    let tx_ring = arena.phys_at(TX_RING_OFF);
+    mmio.write32(RTL_TNPDS, (tx_ring & 0xffff_ffff) as u32);
+    mmio.write32(RTL_TNPDS + 4, (tx_ring >> 32) as u32);
+    // RX ring: arm every descriptor to the NIC, then program its base.
+    for i in 0..RX_RING_COUNT { rtl_arm_rx(arena, i); }
+    let rx_ring = arena.phys_at(RX_RING_OFF);
+    mmio.write32(RTL_RDSAR, (rx_ring & 0xffff_ffff) as u32);
+    mmio.write32(RTL_RDSAR + 4, (rx_ring >> 32) as u32);
+
+    mmio.write32(RTL_TCR, RTL_TCR_VALUE);
+    mmio.write32(RTL_RCR, RTL_RCR_VALUE);
+    mmio.write8(RTL_CR, RTL_CR_RE | RTL_CR_TE); // enable receiver + transmitter
+    mmio.write8(RTL_9346CR, 0x00);              // lock the config registers again
+
+    let link_up = mmio.read8(RTL_PHYSTATUS) & 0x02 != 0;
+    ctx.log_fmt(format_args!(
+        "nic-driver: RTL8168 C+ TX/RX rings up (link {}) - serving real frames",
+        if link_up { "UP" } else { "down (no cable?)" }));
+
     let mut sreply = [0u8; 7];
     sreply[0] = reset_ok as u8;
-    sreply[1..7].copy_from_slice(&mac);
-    serve_status(&ctx, &sreply);
+    sreply[1..7].copy_from_slice(mac);
+
+    let mut rxbuf = [0u8; FRAME_MAX];
+    let mut tx_idx = 0usize;
+    let mut rx_idx = 0usize;
+    let mut diag = true; // log the first real frame's TX/RX outcome once, for blind bring-up
+    loop {
+        let req = ctx.recv();
+        let reply_cap = match ctx.take_pending_cap() { Some(c) => c, None => continue };
+        // [3] STATUS query (the `net` nic-mac diagnostic) - answer the MAC, do NOT treat it as a frame.
+        if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 3 } {
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&sreply));
+            ctx.remove_cap(reply_cap);
+            continue;
+        }
+
+        // Drain stale/background frames so the next RX we poll is our reply (the promiscuous receiver
+        // on a live network catches broadcasts). Bounded to one ring pass.
+        for _ in 0..RX_RING_COUNT {
+            if arena.read32(RX_RING_OFF + rx_idx * 16) & RTL_DESC_OWN != 0 { break; }
+            rtl_arm_rx(arena, rx_idx);
+            rx_idx = (rx_idx + 1) % RX_RING_COUNT;
+        }
+
+        // --- Transmit: copy the frame in, point descriptor tx_idx at it, kick TPPoll, wait on OWN
+        // clearing (Commandment VIII, bounded + loud). ---
+        let frame = req.payload_bytes();
+        let flen = frame.len().min(RX_BUF_SIZE);
+        for i in 0..flen { arena.write8(TX_BUF_OFF + i, frame[i]); }
+        let td = TX_RING_OFF + tx_idx * 16;
+        let tx_buf = arena.phys_at(TX_BUF_OFF);
+        arena.write32(td + 8, (tx_buf & 0xffff_ffff) as u32);
+        arena.write32(td + 12, (tx_buf >> 32) as u32);
+        arena.write32(td + 4, 0);
+        let mut o1 = RTL_DESC_OWN | RTL_DESC_FS | RTL_DESC_LS | (flen as u32 & 0x3FFF);
+        if tx_idx == TX_RING_COUNT - 1 { o1 |= RTL_DESC_EOR; }
+        arena.write32(td, o1);                  // OWN set LAST (the NIC may read the descriptor at once)
+        mmio.write8(RTL_TPPOLL, RTL_TPPOLL_NPQ);
+        let mut ts = 0u32;
+        while ts < TX_POLL_MAX && arena.read32(td) & RTL_DESC_OWN != 0 { ctx.yield_cpu(); ts += 1; }
+        let tx_done = ts < TX_POLL_MAX;
+        tx_idx = (tx_idx + 1) % TX_RING_COUNT;
+
+        // --- Receive a reply: poll the current RX descriptor's OWN bit (bounded), copy it out, re-arm. ---
+        let mut n = 0usize;
+        let mut rs = 0u32;
+        while rs < RX_POLL_MAX {
+            let rd = RX_RING_OFF + rx_idx * 16;
+            let o1 = arena.read32(rd);
+            if o1 & RTL_DESC_OWN == 0 {
+                n = ((o1 & 0x3FFF) as usize).min(FRAME_MAX);
+                for i in 0..n { rxbuf[i] = arena.read8(RX_BUF_OFF + rx_idx * RX_BUF_SIZE + i); }
+                rtl_arm_rx(arena, rx_idx);       // give the descriptor back to the NIC
+                rx_idx = (rx_idx + 1) % RX_RING_COUNT;
+                break;
+            }
+            ctx.yield_cpu();
+            rs += 1;
+        }
+        if diag {
+            ctx.log_fmt(format_args!(
+                "nic-driver: RTL8168 first frame - TX {} ({}B), RX {}B",
+                if tx_done { "done" } else { "TIMEOUT" }, flen, n));
+            diag = false;
+        }
+
+        let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n]));
+        ctx.remove_cap(reply_cap);
+    }
 }
 
 /// Serve the frame interface. A 1-byte `[3]` STATUS query gets `sreply` ([ok, mac(6)]) back - the
