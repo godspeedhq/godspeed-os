@@ -192,7 +192,7 @@ pub fn run(image_path: &Path, smp: u32) {
     // proves it (count is an in-process filter, no disk needed).
     send(&mut write_half, b"net | count\r");
     let netcount = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
-    check!(netcount.contains("3 lines"), "net: is a pipe producer (net | count = 3 lines)");
+    check!(netcount.contains("4 lines"), "net: is a pipe producer (net | count = 4 lines)");
 
     // net version (utilities/0_conventions.md rule 5).
     send(&mut write_half, b"net version\r");

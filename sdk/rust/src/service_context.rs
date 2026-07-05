@@ -682,6 +682,14 @@ impl ServiceContext {
         if ret < 0 { 0 } else { ret as u32 }
     }
 
+    /// The NIC's register-space MMIO base (the BAR the PCI scan chose), 0 if none. InspectKernel query
+    /// 15, ungated. A diagnostic - a driver reads it to confirm which BAR it was handed.
+    pub fn nic_mmio_base(&self) -> u64 {
+        // SAFETY: syscall(13) = InspectKernel; query_id=15 = NIC MMIO base.
+        let ret = unsafe { raw_syscall(13, 15, 0, 0) };
+        if ret < 0 { 0 } else { ret as u64 }
+    }
+
     /// Return the number of free physical frames.
     ///
     /// Wraps InspectKernel query 4.

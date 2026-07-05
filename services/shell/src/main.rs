@@ -4130,6 +4130,15 @@ fn net_dns(ctx: &ServiceContext, host: &str, out: &mut Out) -> Result<(), ShellE
 /// `net` (bare) - the network status: IP, gateway (+MAC), and whether the gateway pings. Raw facts,
 /// no verdict (utilities/0_conventions.md rule 7).
 fn net_status(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
+    // Diagnostic FIRST (independent of net-stack, so it shows even if net-stack is down): the NIC the
+    // KERNEL discovered - vendor:device and which register BAR it mapped. This is which chip nic-driver
+    // should be driving (Phase 4).
+    let vd = ctx.nic_vendor_device();
+    let chip = if vd == 0x8168_10EC { "RTL8168" } else if vd == 0x100E_8086 { "e1000" }
+               else if vd == 0 { "none" } else { "unknown" };
+    out.line_fmt(ctx, format_args!(
+        "nic      {:04x}:{:04x}  mmio {:#x}  ({})", vd & 0xFFFF, vd >> 16, ctx.nic_mmio_base(), chip));
+
     // net-stack is NOT a wired send-peer, so the first request can miss the cap cache. The shell holds
     // ACQUIRE_ANY, so reacquire by name and retry, then give up loudly (Commandment VIII / IX). The
     // request body is ignored by net-stack - the embedded reply cap IS the ask (§8.2).
