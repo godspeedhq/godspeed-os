@@ -164,6 +164,13 @@ pub fn run(image_path: &Path, smp: u32) {
     let arp_ok = collect_until(&buf, &mut cursor, b"net-stack: ARP - 10.0.2.2 is at", Duration::from_secs(12)).is_some();
     check!(arp_ok, "phase2 arp: net-stack resolved the gateway by ARP over the frame interface");
 
+    // Networking Phase 2 step 2 (docs/networking.md): net-stack PINGS the gateway - the networking
+    // analogue of v1's ping/pong. It builds an ICMP echo request (ICMP inside IPv4 inside Ethernet)
+    // to the MAC ARP resolved, sends it THROUGH nic-driver, and reads back the echo REPLY. A pass
+    // proves three protocol layers on the wire, both ways, all in net-stack over the frame interface.
+    let icmp_ok = collect_until(&buf, &mut cursor, b"net-stack: ICMP - 10.0.2.2 echo reply", Duration::from_secs(12)).is_some();
+    check!(icmp_ok, "phase2 icmp: net-stack pinged the gateway (ICMP echo reply received)");
+
     // -----------------------------------------------------------------------
     // help
     // -----------------------------------------------------------------------

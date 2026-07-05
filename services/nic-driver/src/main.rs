@@ -80,7 +80,7 @@ const RX_BUF_SIZE:   usize = 2048;
 // correctness-by-time Commandment VIII forbids): wait on the TRUTH of a bit, give up LOUDLY.
 const RESET_POLL_MAX: u32 = 1_000_000;
 const TX_POLL_MAX:    u32 = 1_000_000;
-const RX_POLL_MAX:    u32 = 3_000_000; // a round-trip through QEMU's user-net gateway (arrives in ms)
+const RX_POLL_MAX:    u32 = 1_000_000; // a reply arrives in ms (caught in the first iterations); a miss gives up loudly
 
 const FRAME_MAX: usize = 1600; // one Ethernet frame (<= 1518) with headroom
 
@@ -151,7 +151,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // payload is a frame to transmit; we reply with the frame that came back (empty if none / no NIC).
     let mut rxbuf = [0u8; FRAME_MAX];
     let mut tx_idx = 0usize;
-    let mut rx_idx = 0usize;
     loop {
         let req = ctx.recv();
         // The reply cap is the ONLY authority to answer net-stack (Commandment VII, §8.5).
@@ -167,6 +166,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             let frame = req.payload_bytes();
             let flen = frame.len().min(FRAME_MAX);
 
+            // --- Arm the RECEIVER FIRST (reset the ring to head 0, then enable), BEFORE transmitting.
+            // The reply can come back faster than we could otherwise switch the receiver on - slirp's
+            // ICMP echo is a trivial src/dst swap, quicker than its ARP-table reply - and a frame that
+            // arrives with the receiver off is DROPPED (this is exactly why the ping's echo reply, on
+            // the wire in the pcap, was never seen). Resetting head/tail per request keeps each RX
+            // independent; RDH/RDT are written while the receiver is briefly off, which is safe.
+            for i in 0..RX_RING_COUNT { a.write8(RX_RING_OFF + i * 16 + 12, 0); } // clear all DD bits
+            m.write32(REG_RDH, 0);
+            m.write32(REG_RDT, (RX_RING_COUNT - 1) as u32);
+            m.write32(REG_RCTL, RCTL_VALUE);
+
             // --- Transmit: copy the frame into the TX buffer, point descriptor tx_idx at it, hand it
             // to the NIC (advance TDT), wait on the DD bit (Commandment VIII, bounded + loud).
             for i in 0..flen { a.write8(TX_BUF_OFF + i, frame[i]); }
@@ -180,19 +190,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             while s < TX_POLL_MAX && a.read8(td + 12) & TXD_STA_DD == 0 { ctx.yield_cpu(); s += 1; }
             tx_idx = (tx_idx + 1) % TX_RING_COUNT;
 
-            // --- Receive: enable the receiver, wait on the TRUTH of a received frame (bounded), copy
-            // it out of the arena, re-arm the buffer, then QUIESCE the receiver (TCG-overhead note).
-            m.write32(REG_RCTL, RCTL_VALUE);
+            // --- Receive: the receiver is already armed, so wait on the TRUTH of a frame landing in
+            // descriptor 0 (bounded), copy it out, then QUIESCE (the step-4 TCG-overhead lesson).
             let mut s = 0u32;
             while s < RX_POLL_MAX {
-                let rd = RX_RING_OFF + rx_idx * 16;
-                if a.read8(rd + 12) & RXD_STA_DD != 0 {
-                    let len = a.read16(rd + 8) as usize;
+                if a.read8(RX_RING_OFF + 12) & RXD_STA_DD != 0 {
+                    let len = a.read16(RX_RING_OFF + 8) as usize;
                     n = len.min(FRAME_MAX);
-                    for i in 0..n { rxbuf[i] = a.read8(RX_BUF_OFF + rx_idx * RX_BUF_SIZE + i); }
-                    a.write8(rd + 12, 0);                 // clear DD
-                    m.write32(REG_RDT, rx_idx as u32);    // hand this buffer back to the NIC
-                    rx_idx = (rx_idx + 1) % RX_RING_COUNT;
+                    for i in 0..n { rxbuf[i] = a.read8(RX_BUF_OFF + i); }
                     break;
                 }
                 ctx.yield_cpu();
