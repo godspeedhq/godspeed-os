@@ -47,6 +47,14 @@ fn checksum(data: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+/// Bounded dance (§26.7): a frame round-trip is a synchronous call that blocks until nic-driver
+/// replies. A driver with no working TX/RX (Stage A) may never answer a *frame* (even while it answers
+/// other requests), so the dance uses a wall-clock deadline + a finite retry - a silent driver DEGRADES
+/// the dance instead of wedging the whole service before it can serve (the T630 hang). The call returns
+/// the instant a reply arrives (QEMU is unaffected); the deadline only bounds the no-reply case.
+const DANCE_SECS:  i64 = 2;
+const DANCE_TRIES: u32 = 2;
+
 /// Phase 3: a DHCP DISCOVER over UDP - ask QEMU slirp's built-in DHCP server for our IP and read the
 /// OFFER. This proves the UDP transport (the layer the socket capability sits on) over the frame
 /// interface. Returns the offered IP, or None (no NIC / nothing answered). A real net-stack would use
@@ -83,8 +91,8 @@ fn dhcp_discover(ctx: &ServiceContext) -> Option<[u8; 4]> {
     frame[285] = 255;                                    // option end
 
     let req = Message::from_bytes(&frame);
-    loop {
-        match ctx.request_with_reply("nic-driver", &req) {
+    for _ in 0..DANCE_TRIES {
+        match ctx.request_with_reply_deadline("nic-driver", &req, DANCE_SECS) {
             Some(reply) => {
                 let f = reply.payload_bytes();
                 // A DHCP reply: IPv4 (0x0800, IHL 5), UDP (proto 17), BOOTP op = 2 (BOOTREPLY). yiaddr
@@ -101,14 +109,15 @@ fn dhcp_discover(ctx: &ServiceContext) -> Option<[u8; 4]> {
                 return None;
             }
             None => {
-                // nic-driver still spawning (or restarted): reacquire by name and retry (Commandment
-                // IX). This is the FIRST request net-stack makes, so it is where we wait for the driver.
-                ctx.log("net-stack: DHCP - nic-driver unreachable, reacquiring, retrying");
+                // No reply within the deadline: nic-driver still spawning, or (Stage A) not answering
+                // frames yet. Reacquire and retry within the finite budget, then degrade.
+                ctx.log("net-stack: DHCP - no reply (timeout), reacquiring, retrying");
                 ctx.reacquire_by_name("nic-driver");
-                ctx.yield_cpu();
             }
         }
     }
+    ctx.log("net-stack: DHCP - nic-driver never answered a frame (bounded) - degrading");
+    None
 }
 
 /// Resolve a hostname to an IPv4 address via DNS (UDP to slirp's resolver at 10.0.2.3). Builds a
@@ -274,8 +283,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let arp_req = Message::from_bytes(&arp);
     let mut gw_mac = [0u8; 6];
     let mut have_mac = false;
-    loop {
-        match ctx.request_with_reply("nic-driver", &arp_req) {
+    for _ in 0..DANCE_TRIES {
+        match ctx.request_with_reply_deadline("nic-driver", &arp_req, DANCE_SECS) {
             Some(reply) => {
                 let f = reply.payload_bytes();
                 if f.len() >= 42 && f[12] == 0x08 && f[13] == 0x06 && f[20] == 0x00 && f[21] == 0x02 {
@@ -292,9 +301,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 break;
             }
             None => {
-                ctx.log("net-stack: nic-driver unreachable - reacquiring by name, retrying");
+                ctx.log("net-stack: ARP - no reply (timeout) - reacquiring by name, retrying");
                 ctx.reacquire_by_name("nic-driver");
-                ctx.yield_cpu();
             }
         }
     }
@@ -334,7 +342,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         frame[36] = (icmp_ck >> 8) as u8; frame[37] = icmp_ck as u8;
 
         let ping = Message::from_bytes(&frame);
-        match ctx.request_with_reply("nic-driver", &ping) {
+        match ctx.request_with_reply_deadline("nic-driver", &ping, DANCE_SECS) {
             Some(reply) => {
                 let f = reply.payload_bytes();
                 // A valid echo reply: IPv4 (0x0800), IHL 5, protocol 1 (ICMP), ICMP type 0 (reply).
@@ -365,6 +373,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     status[8..14].copy_from_slice(&gw_mac);
     status[14] = (have_mac as u8) | ((ping_ok as u8) << 1);
     let mut sockets = [Socket { rid: 0, port: 0 }; MAX_SOCKETS];
+    ctx.log("net-stack: serving the client API (status/dns/socket)");
     loop {
         let req = ctx.recv();                   // block for a client request
         // A nonzero badge = a SOCKET-CAPABILITY invocation the kernel validated (§7.10). A plain
