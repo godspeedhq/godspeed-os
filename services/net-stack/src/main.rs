@@ -53,13 +53,15 @@ fn checksum(data: &[u8]) -> u16 {
 /// the dance instead of wedging the whole service before it can serve (the T630 hang). The call returns
 /// the instant a reply arrives (QEMU is unaffected); the deadline only bounds the no-reply case.
 const DANCE_SECS:  i64 = 2;
-const DANCE_TRIES: u32 = 2;
+// A few tries per step: on a LIVE network the first frame back can be a background broadcast, so a step
+// retries past stray frames (each retry is fast - a frame is already waiting) to find its real reply.
+const DANCE_TRIES: u32 = 6;
 
 /// Phase 3: a DHCP DISCOVER over UDP - ask QEMU slirp's built-in DHCP server for our IP and read the
 /// OFFER. This proves the UDP transport (the layer the socket capability sits on) over the frame
 /// interface. Returns the offered IP, or None (no NIC / nothing answered). A real net-stack would use
 /// this to LEARN its own IP instead of hardcoding it; here it demonstrates the round-trip.
-fn dhcp_discover(ctx: &ServiceContext) -> Option<[u8; 4]> {
+fn dhcp_discover(ctx: &ServiceContext) -> Option<([u8; 4], [u8; 4])> {
     // Ethernet(14) + IPv4(20) + UDP(8) + DHCP/BOOTP(244) = 286 bytes.
     let mut frame = [0u8; 286];
     for b in frame[0..6].iter_mut() { *b = 0xff; }       // eth dest = broadcast
@@ -100,23 +102,36 @@ fn dhcp_discover(ctx: &ServiceContext) -> Option<[u8; 4]> {
                 if f.len() >= 62 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45
                     && f[23] == 17 && f[42] == 2 {
                     let ip = [f[58], f[59], f[60], f[61]];
+                    // Learn the GATEWAY from the offer's options (magic cookie at frame offset 278 ->
+                    // options at 282), option 3 = router. This is what makes it work on a REAL network
+                    // (the gateway is 192.168.x.1, not QEMU's 10.0.2.2). Fall back to <subnet>.1.
+                    let mut gw = [ip[0], ip[1], ip[2], 1];
+                    let mut o = 282usize;
+                    while o + 1 < f.len() {
+                        let opt = f[o];
+                        if opt == 255 { break; }          // options end
+                        if opt == 0 { o += 1; continue; } // pad
+                        let len = f[o + 1] as usize;
+                        if opt == 3 && len >= 4 && o + 6 <= f.len() {
+                            gw = [f[o + 2], f[o + 3], f[o + 4], f[o + 5]];
+                        }
+                        o += 2 + len;
+                    }
                     ctx.log_fmt(format_args!(
-                        "net-stack: DHCP - offered {}.{}.{}.{} (UDP works)", ip[0], ip[1], ip[2], ip[3]));
-                    return Some(ip);
+                        "net-stack: DHCP - offered {}.{}.{}.{}, gateway {}.{}.{}.{} (UDP works)",
+                        ip[0], ip[1], ip[2], ip[3], gw[0], gw[1], gw[2], gw[3]));
+                    return Some((ip, gw));
                 }
-                ctx.log_fmt(format_args!(
-                    "net-stack: DHCP - {}-byte reply, no offer (no NIC, or nothing answered)", f.len()));
-                return None;
+                // A frame came back but not our offer (a background broadcast on a live network) - retry
+                // within the budget rather than giving up on the first stray frame.
             }
             None => {
-                // No reply within the deadline: nic-driver still spawning, or (Stage A) not answering
-                // frames yet. Reacquire and retry within the finite budget, then degrade.
-                ctx.log("net-stack: DHCP - no reply (timeout), reacquiring, retrying");
+                // No reply within the deadline: nic-driver still spawning, or not answering frames.
                 ctx.reacquire_by_name("nic-driver");
             }
         }
     }
-    ctx.log("net-stack: DHCP - nic-driver never answered a frame (bounded) - degrading");
+    ctx.log("net-stack: DHCP - no offer within the budget - degrading to the fallback IP");
     None
 }
 
@@ -262,7 +277,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // request until the driver answers). Falls back to a default only if there is no NIC / no offer
     // (a non-e1000 host, where nic-driver serves empty replies). The IP it returns is the one ARP +
     // ICMP use below - so DHCP is no longer a hollow demo; it configures the stack.
-    let our_ip = dhcp_discover(&ctx).unwrap_or(FALLBACK_IP);
+    let (our_ip, gateway) = dhcp_discover(&ctx).unwrap_or((FALLBACK_IP, GATEWAY_IP));
 
     // ---- Phase 2 step 1: ARP - who-has GATEWAY_IP, tell our_ip (a broadcast request).
     let mut arp = [0u8; 42];
@@ -275,7 +290,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     arp[20] = 0x00; arp[21] = 0x01;                  // oper = request
     arp[22..28].copy_from_slice(&OUR_MAC);           // sender hw
     arp[28..32].copy_from_slice(&our_ip);           // sender ip (learned via DHCP)
-    arp[38..42].copy_from_slice(&GATEWAY_IP);        // target ip (target hw stays 0 - the question)
+    arp[38..42].copy_from_slice(&gateway);           // target ip = DHCP-learned gateway (0 hw = the question)
 
     // Send it THROUGH nic-driver's frame interface, waiting on the TRUTH of the reply (Commandment
     // VIII): request_with_reply is a synchronous Call, so a dead/absent nic-driver wakes us with None
@@ -287,24 +302,23 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         match ctx.request_with_reply_deadline("nic-driver", &arp_req, DANCE_SECS) {
             Some(reply) => {
                 let f = reply.payload_bytes();
+                // An ARP REPLY (oper = 2). On a live network the first frame back may be a background
+                // broadcast; keep trying (skip it) rather than giving up on one stray frame.
                 if f.len() >= 42 && f[12] == 0x08 && f[13] == 0x06 && f[20] == 0x00 && f[21] == 0x02 {
                     gw_mac.copy_from_slice(&f[22..28]);
                     have_mac = true;
                     ctx.log_fmt(format_args!(
                         "net-stack: ARP - {}.{}.{}.{} is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                        GATEWAY_IP[0], GATEWAY_IP[1], GATEWAY_IP[2], GATEWAY_IP[3],
+                        gateway[0], gateway[1], gateway[2], gateway[3],
                         gw_mac[0], gw_mac[1], gw_mac[2], gw_mac[3], gw_mac[4], gw_mac[5]));
-                } else {
-                    ctx.log_fmt(format_args!(
-                        "net-stack: no ARP reply ({}-byte frame back) - no NIC, or nothing answered", f.len()));
+                    break;
                 }
-                break;
             }
-            None => {
-                ctx.log("net-stack: ARP - no reply (timeout) - reacquiring by name, retrying");
-                ctx.reacquire_by_name("nic-driver");
-            }
+            None => { ctx.reacquire_by_name("nic-driver"); }
         }
+    }
+    if !have_mac {
+        ctx.log("net-stack: ARP - no reply for the gateway within the budget - degrading");
     }
 
     // ---- Phase 2 step 2: ICMP - ping the gateway (echo request -> echo reply). Only once ARP gave us
@@ -328,7 +342,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         frame[23] = 1;                               // protocol = ICMP
         // frame[24..26] header checksum: left 0, filled after.
         frame[26..30].copy_from_slice(&our_ip);      // source (learned via DHCP)
-        frame[30..34].copy_from_slice(&GATEWAY_IP);  // destination
+        frame[30..34].copy_from_slice(&gateway);     // destination = DHCP-learned gateway
         let ip_ck = checksum(&frame[14..34]);
         frame[24] = (ip_ck >> 8) as u8; frame[25] = ip_ck as u8;
         // ICMP echo request (frame[34..50]).
@@ -342,23 +356,26 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         frame[36] = (icmp_ck >> 8) as u8; frame[37] = icmp_ck as u8;
 
         let ping = Message::from_bytes(&frame);
-        match ctx.request_with_reply_deadline("nic-driver", &ping, DANCE_SECS) {
-            Some(reply) => {
-                let f = reply.payload_bytes();
-                // A valid echo reply: IPv4 (0x0800), IHL 5, protocol 1 (ICMP), ICMP type 0 (reply).
-                // f[26..30] is the source IP - the host that answered our ping.
-                if f.len() >= 42 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45
-                    && f[23] == 1 && f[34] == 0 {
-                    ping_ok = true;
-                    ctx.log_fmt(format_args!(
-                        "net-stack: ICMP - {}.{}.{}.{} echo reply (ping OK, {} bytes on the wire)",
-                        f[26], f[27], f[28], f[29], f.len()));
-                } else {
-                    ctx.log_fmt(format_args!(
-                        "net-stack: ping - {}-byte frame back, not an echo reply (gateway silent?)", f.len()));
+        for _ in 0..DANCE_TRIES {
+            match ctx.request_with_reply_deadline("nic-driver", &ping, DANCE_SECS) {
+                Some(reply) => {
+                    let f = reply.payload_bytes();
+                    // A valid echo reply: IPv4 (0x0800), IHL 5, protocol 1 (ICMP), ICMP type 0 (reply).
+                    // f[26..30] is the source IP - the host that answered. Skip stray frames, keep trying.
+                    if f.len() >= 42 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45
+                        && f[23] == 1 && f[34] == 0 {
+                        ping_ok = true;
+                        ctx.log_fmt(format_args!(
+                            "net-stack: ICMP - {}.{}.{}.{} echo reply (ping OK, {} bytes on the wire)",
+                            f[26], f[27], f[28], f[29], f.len()));
+                        break;
+                    }
                 }
+                None => { ctx.reacquire_by_name("nic-driver"); }
             }
-            None => ctx.log("net-stack: nic-driver unreachable during ping - reacquire needed"),
+        }
+        if !ping_ok {
+            ctx.log("net-stack: ICMP - no echo reply from the gateway within the budget - degrading");
         }
     }
 
@@ -369,7 +386,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // facts (utilities/0_conventions.md rule 7). The SOCKET CAPABILITY builds on this seam next.
     let mut status = [0u8; 15];
     status[0..4].copy_from_slice(&our_ip);
-    status[4..8].copy_from_slice(&GATEWAY_IP);
+    status[4..8].copy_from_slice(&gateway);
     status[8..14].copy_from_slice(&gw_mac);
     status[14] = (have_mac as u8) | ((ping_ok as u8) << 1);
     let mut sockets = [Socket { rid: 0, port: 0 }; MAX_SOCKETS];
