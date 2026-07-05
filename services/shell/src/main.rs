@@ -438,6 +438,7 @@ fn complete_tab(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd) {
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
     ("date",    &["epoch"]),
+    ("net",     &["dns"]),
     ("drives",  &["flash", "label", "reset", "check", "scrub"]),
     ("chaos",   &["kill-storm", "flood-storm", "mem-pressure", "spawn-storm", "max-carnage"]),
     ("write",   &["append", "prepend"]),
@@ -1002,7 +1003,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         "mem"     => cmd_mem(ctx, out),
         "cores"   => cmd_cores(ctx, out),
         "date"    => cmd_date(ctx, if argc >= 2 { args[1] } else { "" }, out),
-        "net"     => cmd_net(ctx, out),
+        "net"     => cmd_net(ctx, s["net".len()..].trim(), out),
         "uptime"  => cmd_uptime(ctx),
         "status"  => cmd_status(ctx),
         "observe" => if argc >= 2 && args[1] == "now" { cmd_observe_now(ctx) } else { cmd_observe_live(ctx) },
@@ -3488,8 +3489,9 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("date", "full timestamp (weekday date time)", "date"),
             ("date epoch", "seconds since 1970-01-01", "date epoch"),
         ], true),
-        "net" => help_block(ctx, "net", "network status (IP, gateway, reachability)", &[
+        "net" => help_block(ctx, "net", "network status + DNS resolution", &[
             ("net", "IP, gateway (+MAC), and whether the gateway pings", "net"),
+            ("net dns <host>", "resolve a hostname to an IPv4 address", "net dns example.com"),
             ("net | write <path>", "snapshot the status to a file", "net | write /netstat.txt"),
         ], true),
         "uptime" => help_block(ctx, "uptime", "how long the system has been up", &[
@@ -3644,6 +3646,9 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
     match (util, sub) {
         ("date", "epoch") => help_block(ctx, "date epoch", "seconds since 1970-01-01", &[
             ("date epoch", "print epoch seconds (not POSIX 'unix')", "date epoch"),
+        ], false),
+        ("net", "dns") => help_block(ctx, "net dns", "resolve a hostname to an IPv4 address", &[
+            ("net dns <host>", "DNS A-record lookup via net-stack (slirp resolver)", "net dns example.com"),
         ], false),
         ("observe", "now") => help_block(ctx, "observe now", "one-shot metrics frame", &[
             ("observe now", "print a single metrics frame and return", "observe now"),
@@ -4065,10 +4070,62 @@ fn cmd_date(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
     Ok(())
 }
 
-/// `net` - network status, brokered from the `net-stack` service (utilities/40_net.md). Reports the
-/// IP net-stack configured, the gateway it resolved by ARP, and whether that gateway answered a ping -
-/// raw facts, no verdict (utilities/0_conventions.md rule 7). A pipe PRODUCER: `net | write /f`.
-fn cmd_net(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
+/// `net` - network status + DNS, brokered from the `net-stack` service (utilities/40_net.md). Dispatches
+/// `net` (status) vs `net dns <host>` (resolve a hostname). A pipe PRODUCER: `net | write /f`.
+fn cmd_net(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+    let arg = arg.trim();
+    if arg == "dns" {
+        ctx.console_writeln("net: usage: net dns <hostname>  (e.g. net dns example.com)");
+        return Err(ShellError::Unknown);
+    }
+    if let Some(host) = arg.strip_prefix("dns ") {
+        let host = host.trim();
+        if host.is_empty() {
+            ctx.console_writeln("net: usage: net dns <hostname>  (e.g. net dns example.com)");
+            return Err(ShellError::Unknown);
+        }
+        return net_dns(ctx, host, out);
+    }
+    if !arg.is_empty() {
+        ctx.console_writeln("net: unknown subcommand - try 'net', 'net dns <host>', or 'net help'");
+        return Err(ShellError::Unknown);
+    }
+    net_status(ctx, out)
+}
+
+/// `net dns <host>` - resolve a hostname to an IPv4 address. net-stack sends the DNS query to slirp's
+/// resolver; DNS depends on the host's own resolver, so "no answer" is a legitimate result, not a bug.
+fn net_dns(ctx: &ServiceContext, host: &str, out: &mut Out) -> Result<(), ShellError> {
+    // Request byte 0 = 1 (DNS), then the hostname. net-stack replies 5 bytes: [ok, ip0, ip1, ip2, ip3].
+    let hb = host.as_bytes();
+    if hb.len() > 255 {
+        ctx.console_writeln("net: hostname too long");
+        return Err(ShellError::Unknown);
+    }
+    let mut req = [0u8; 256];
+    req[0] = 1;
+    req[1..1 + hb.len()].copy_from_slice(hb);
+    let msg = Message::from_bytes(&req[..1 + hb.len()]);
+    let reply = match ctx.request_with_reply("net-stack", &msg) {
+        Some(r) => Some(r),
+        None => if ctx.reacquire_by_name("net-stack") { ctx.request_with_reply("net-stack", &msg) } else { None },
+    };
+    let reply = match reply {
+        Some(r) => r,
+        None => { ctx.console_writeln("net: net-stack unavailable"); return Err(ShellError::Unknown); }
+    };
+    let p = reply.payload_bytes();
+    if p.len() >= 5 && p[0] == 1 {
+        out.line_fmt(ctx, format_args!("{} is {}.{}.{}.{}", host, p[1], p[2], p[3], p[4]));
+    } else {
+        out.line_fmt(ctx, format_args!("{}: no answer (DNS goes via slirp to the host resolver)", host));
+    }
+    Ok(())
+}
+
+/// `net` (bare) - the network status: IP, gateway (+MAC), and whether the gateway pings. Raw facts,
+/// no verdict (utilities/0_conventions.md rule 7).
+fn net_status(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
     // net-stack is NOT a wired send-peer, so the first request can miss the cap cache. The shell holds
     // ACQUIRE_ANY, so reacquire by name and retry, then give up loudly (Commandment VIII / IX). The
     // request body is ignored by net-stack - the embedded reply cap IS the ask (§8.2).
@@ -5185,7 +5242,7 @@ fn run_producer(ctx: &ServiceContext, cwd: &Cwd, cmdline: &str, out: &mut Out) {
         "mem"          => { let _ = cmd_mem(ctx, out); }
         "cores"        => { let _ = cmd_cores(ctx, out); }
         "date"         => { let _ = cmd_date(ctx, arg, out); }
-        "net"          => { let _ = cmd_net(ctx, out); }
+        "net"          => { let _ = cmd_net(ctx, arg, out); }
         "help"         => help_to_out(ctx, out),
         "input"        => run_input(ctx, arg, out),
         _ => {}

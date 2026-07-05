@@ -199,6 +199,15 @@ pub fn run(image_path: &Path, smp: u32) {
     let netver = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
     check!(netver.contains("net 0.1.0"), "net: version reports net 0.1.0");
 
+    // net dns <host> (utilities/40_net.md): resolve a hostname via slirp's DNS. This is external-
+    // dependent - slirp forwards to the HOST's resolver - so the check is LENIENT: it verifies the
+    // command ran end to end and produced a well-formed line, EITHER a resolved IP ("example.com is
+    // a.b.c.d") OR a clean "no answer", never a hang or crash. A real resolution is a bonus, not required.
+    send(&mut write_half, b"net dns example.com\r");
+    let dns_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)).unwrap_or_default();
+    check!(dns_out.contains("example.com is ") || dns_out.contains("example.com: no answer"),
+           "net dns: resolves a hostname or reports no-answer cleanly (DNS via slirp)");
+
     // -----------------------------------------------------------------------
     // help
     // -----------------------------------------------------------------------

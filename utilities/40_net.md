@@ -23,11 +23,13 @@ serves it. `net` is the window onto it: the shell acquires `net-stack` by name a
 | Command | Meaning |
 |---|---|
 | `net` | Print the current network status (IP, gateway, ping). |
+| `net dns <host>` | Resolve a hostname to an IPv4 address (a DNS A-record lookup). |
 | `net version` | Print the version. |
 | `net help` | Print usage. |
 
-There are no subcommands yet - `net` has exactly one thing to say. `net` never *changes*
-anything; it reads (`0_conventions.md` §7, and `net`'s non-goals below).
+Bare `net` reports the status net-stack froze at boot; `net dns <host>` is a live query. `net`
+never *changes* the network - it reads and resolves (`0_conventions.md` §7, and the non-goals
+below).
 
 ## 3. Output
 
@@ -54,6 +56,18 @@ ping     no
 - **gateway** - the gateway IP and the MAC ARP resolved for it, or `unresolved` if ARP got
   no answer.
 - **ping** - `ok` if the gateway answered an ICMP echo; `no` otherwise.
+
+`net dns <host>` resolves a name through net-stack's DNS query (to slirp's resolver):
+
+```
+gsh> net dns example.com
+example.com is 104.20.23.154
+gsh> net dns nope.invalid
+nope.invalid: no answer (DNS goes via slirp to the host resolver)
+```
+
+DNS depends on the host's resolver - slirp forwards the query to it - so `no answer` is a
+legitimate result (the query worked; nothing came back), not a bug.
 
 ## 4. Pipe behaviour (`to` / `from` / `where`)
 
@@ -94,8 +108,9 @@ the shell. `net` performs no network I/O itself - it asks the service that does.
 
 - **No configuration.** `net` reads; it never sets an IP, route, or DNS server. Those are
   `net-stack`'s job, and a future `net set ...` would be a separate, deliberate surface.
-- **No live re-ping (yet).** v1 shows the status `net-stack` froze at boot. A `net ping
-  <host>` that resolves and pings on demand is a natural next subcommand once sockets exist.
+- **No live re-ping (yet).** the *status* (`net`) is what net-stack froze at boot; `net dns`
+  is a live query, but a `net ping <host>` that pings on demand is a natural next subcommand
+  once sockets exist.
 - **No socket surface.** `net` is a status window. Opening a socket is the socket-capability
   work (`docs/networking.md`, a socket *is* a delegated resource cap, §7.10), reached through
   a different verb when it lands.

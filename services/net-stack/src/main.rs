@@ -111,6 +111,96 @@ fn dhcp_discover(ctx: &ServiceContext) -> Option<[u8; 4]> {
     }
 }
 
+/// Resolve a hostname to an IPv4 address via DNS (UDP to slirp's resolver at 10.0.2.3). Builds a
+/// standard A-record query, sends it THROUGH nic-driver, and parses the first A answer. Returns the
+/// IP, or None (no gateway, malformed name, or no answer - DNS depends on the host's resolver, which
+/// slirp forwards to, so a failure here is a real "no answer", not a bug).
+fn dns_resolve(ctx: &ServiceContext, hostname: &[u8], gw_mac: &[u8; 6], our_ip: &[u8; 4]) -> Option<[u8; 4]> {
+    let mut frame = [0u8; 512];
+    // Ethernet: to the gateway; slirp routes the datagram to its DNS at 10.0.2.3.
+    frame[0..6].copy_from_slice(gw_mac);
+    frame[6..12].copy_from_slice(&OUR_MAC);
+    frame[12] = 0x08; frame[13] = 0x00;              // IPv4
+    // --- DNS message at offset 42 (14 Ethernet + 20 IPv4 + 8 UDP). Build it first to size the rest.
+    const D: usize = 42;
+    frame[D] = 0x13; frame[D + 1] = 0x37;            // transaction id (arbitrary)
+    frame[D + 2] = 0x01; frame[D + 3] = 0x00;        // flags: standard query, recursion desired
+    frame[D + 4] = 0x00; frame[D + 5] = 0x01;        // qdcount = 1 (an/ns/ar counts stay 0)
+    // Question: QNAME (length-prefixed labels + 0), QTYPE = A, QCLASS = IN.
+    let mut pos = D + 12;
+    let mut label_start = 0usize;
+    let mut i = 0usize;
+    while i <= hostname.len() {
+        if i == hostname.len() || hostname[i] == b'.' {
+            let len = i - label_start;
+            if len == 0 || len > 63 || pos + 1 + len >= frame.len() - 8 { return None; }
+            frame[pos] = len as u8; pos += 1;
+            frame[pos..pos + len].copy_from_slice(&hostname[label_start..i]);
+            pos += len;
+            label_start = i + 1;
+        }
+        i += 1;
+    }
+    frame[pos] = 0; pos += 1;                         // QNAME terminator
+    frame[pos] = 0x00; frame[pos + 1] = 0x01;        // QTYPE = A
+    frame[pos + 2] = 0x00; frame[pos + 3] = 0x01;    // QCLASS = IN
+    pos += 4;
+    let dns_len = pos - D;
+    let frame_len = pos;
+    // --- IPv4 header.
+    frame[14] = 0x45; frame[15] = 0x00;
+    let total = (20 + 8 + dns_len) as u16;
+    frame[16] = (total >> 8) as u8; frame[17] = total as u8;
+    frame[22] = 64; frame[23] = 17;                  // TTL, protocol = UDP
+    frame[26..30].copy_from_slice(our_ip);
+    frame[30] = 10; frame[31] = 0; frame[32] = 2; frame[33] = 3; // dst = 10.0.2.3 (slirp DNS)
+    let ip_ck = checksum(&frame[14..34]);
+    frame[24] = (ip_ck >> 8) as u8; frame[25] = ip_ck as u8;
+    // --- UDP header (src port 5353, dst port 53; checksum 0 = optional over IPv4).
+    frame[34] = 0x14; frame[35] = 0xe9;
+    frame[36] = 0x00; frame[37] = 0x35;
+    let udp_len = (8 + dns_len) as u16;
+    frame[38] = (udp_len >> 8) as u8; frame[39] = udp_len as u8;
+
+    // Send THROUGH nic-driver and read the response frame back.
+    let reply = ctx.request_with_reply("nic-driver", &Message::from_bytes(&frame[..frame_len]))?;
+    let f = reply.payload_bytes();
+    // Must be IPv4/UDP with a DNS body. Answer parsing starts at the DNS header (offset 42).
+    if f.len() < D + 12 || f[12] != 0x08 || f[13] != 0x00 || f[23] != 17 { return None; }
+    let ancount = ((f[D + 6] as usize) << 8) | (f[D + 7] as usize);
+    if ancount == 0 { return None; }
+    // Skip the echoed question: QNAME (labels to 0, or a compression pointer) + QTYPE + QCLASS.
+    let mut p = D + 12;
+    while p < f.len() {
+        let len = f[p];
+        if len == 0 { p += 1; break; }
+        if len & 0xc0 == 0xc0 { p += 2; break; }     // compression pointer
+        p += 1 + len as usize;
+    }
+    p += 4;                                           // QTYPE + QCLASS
+    // Answers: find the first A record (TYPE 1, RDLENGTH 4).
+    let mut n = 0;
+    while n < ancount {
+        // NAME: a compression pointer (2 bytes) or inline labels.
+        if p >= f.len() { return None; }
+        if f[p] & 0xc0 == 0xc0 {
+            p += 2;
+        } else {
+            while p < f.len() { let len = f[p]; if len == 0 { p += 1; break; } p += 1 + len as usize; }
+        }
+        if p + 10 > f.len() { return None; }
+        let atype = ((f[p] as usize) << 8) | (f[p + 1] as usize);
+        let rdlength = ((f[p + 8] as usize) << 8) | (f[p + 9] as usize);
+        p += 10;
+        if atype == 1 && rdlength == 4 && p + 4 <= f.len() {
+            return Some([f[p], f[p + 1], f[p + 2], f[p + 3]]);
+        }
+        p += rdlength;
+        n += 1;
+    }
+    None
+}
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("net-stack: starting");
@@ -232,12 +322,23 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     status[8..14].copy_from_slice(&gw_mac);
     status[14] = (have_mac as u8) | ((ping_ok as u8) << 1);
     loop {
-        let _ = ctx.recv();                     // block for a status request
+        let req = ctx.recv();                   // block for a client request
         let reply_cap = match ctx.take_pending_cap() {
             Some(c) => c,
             None => continue,                   // a request with no reply cap - drop it
         };
-        let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&status));
+        let p = req.payload_bytes();
+        if p.first() == Some(&1) {
+            // DNS request (byte 0 = 1, then the hostname). Resolve it via slirp's DNS and reply with
+            // 5 bytes: [ok, ip0, ip1, ip2, ip3]. Needs a resolved gateway to send through.
+            let ip = if have_mac { dns_resolve(&ctx, &p[1..], &gw_mac, &our_ip) } else { None };
+            let mut rb = [0u8; 5];
+            if let Some(a) = ip { rb[0] = 1; rb[1..5].copy_from_slice(&a); }
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rb));
+        } else {
+            // Status request (default): reply the frozen 15-byte record.
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&status));
+        }
         ctx.remove_cap(reply_cap);
     }
 }
