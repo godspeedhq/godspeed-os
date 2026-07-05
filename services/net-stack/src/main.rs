@@ -61,7 +61,7 @@ const DANCE_TRIES: u32 = 6;
 /// OFFER. This proves the UDP transport (the layer the socket capability sits on) over the frame
 /// interface. Returns the offered IP, or None (no NIC / nothing answered). A real net-stack would use
 /// this to LEARN its own IP instead of hardcoding it; here it demonstrates the round-trip.
-fn dhcp_discover(ctx: &ServiceContext) -> Option<([u8; 4], [u8; 4])> {
+fn dhcp_discover(ctx: &ServiceContext) -> Option<([u8; 4], [u8; 4], [u8; 4])> {
     // Ethernet(14) + IPv4(20) + UDP(8) + DHCP/BOOTP(244) = 286 bytes.
     let mut frame = [0u8; 286];
     for b in frame[0..6].iter_mut() { *b = 0xff; }       // eth dest = broadcast
@@ -106,21 +106,28 @@ fn dhcp_discover(ctx: &ServiceContext) -> Option<([u8; 4], [u8; 4])> {
                     // options at 282), option 3 = router. This is what makes it work on a REAL network
                     // (the gateway is 192.168.x.1, not QEMU's 10.0.2.2). Fall back to <subnet>.1.
                     let mut gw = [ip[0], ip[1], ip[2], 1];
+                    let mut dns = [0u8; 4];
+                    let mut have_dns = false;
                     let mut o = 282usize;
                     while o + 1 < f.len() {
                         let opt = f[o];
                         if opt == 255 { break; }          // options end
                         if opt == 0 { o += 1; continue; } // pad
                         let len = f[o + 1] as usize;
-                        if opt == 3 && len >= 4 && o + 6 <= f.len() {
+                        if opt == 3 && len >= 4 && o + 6 <= f.len() {           // router = gateway
                             gw = [f[o + 2], f[o + 3], f[o + 4], f[o + 5]];
+                        }
+                        if opt == 6 && len >= 4 && o + 6 <= f.len() {           // domain name server
+                            dns = [f[o + 2], f[o + 3], f[o + 4], f[o + 5]];
+                            have_dns = true;
                         }
                         o += 2 + len;
                     }
+                    if !have_dns { dns = gw; }            // no DNS option: the gateway usually forwards DNS
                     ctx.log_fmt(format_args!(
-                        "net-stack: DHCP - offered {}.{}.{}.{}, gateway {}.{}.{}.{} (UDP works)",
-                        ip[0], ip[1], ip[2], ip[3], gw[0], gw[1], gw[2], gw[3]));
-                    return Some((ip, gw));
+                        "net-stack: DHCP - offered {}.{}.{}.{}, gw {}.{}.{}.{}, dns {}.{}.{}.{}",
+                        ip[0], ip[1], ip[2], ip[3], gw[0], gw[1], gw[2], gw[3], dns[0], dns[1], dns[2], dns[3]));
+                    return Some((ip, gw, dns));
                 }
                 // A frame came back but not our offer (a background broadcast on a live network) - retry
                 // within the budget rather than giving up on the first stray frame.
@@ -139,7 +146,8 @@ fn dhcp_discover(ctx: &ServiceContext) -> Option<([u8; 4], [u8; 4])> {
 /// standard A-record query, sends it THROUGH nic-driver, and parses the first A answer. Returns the
 /// IP, or None (no gateway, malformed name, or no answer - DNS depends on the host's resolver, which
 /// slirp forwards to, so a failure here is a real "no answer", not a bug).
-fn dns_resolve(ctx: &ServiceContext, hostname: &[u8], gw_mac: &[u8; 6], our_ip: &[u8; 4]) -> Option<[u8; 4]> {
+fn dns_resolve(ctx: &ServiceContext, hostname: &[u8], gw_mac: &[u8; 6], our_ip: &[u8; 4],
+               dns_server: &[u8; 4]) -> Option<[u8; 4]> {
     let mut frame = [0u8; 512];
     // Ethernet: to the gateway; slirp routes the datagram to its DNS at 10.0.2.3.
     frame[0..6].copy_from_slice(gw_mac);
@@ -177,7 +185,7 @@ fn dns_resolve(ctx: &ServiceContext, hostname: &[u8], gw_mac: &[u8; 6], our_ip: 
     frame[16] = (total >> 8) as u8; frame[17] = total as u8;
     frame[22] = 64; frame[23] = 17;                  // TTL, protocol = UDP
     frame[26..30].copy_from_slice(our_ip);
-    frame[30] = 10; frame[31] = 0; frame[32] = 2; frame[33] = 3; // dst = 10.0.2.3 (slirp DNS)
+    frame[30..34].copy_from_slice(dns_server);       // dst = the DHCP-learned DNS server
     let ip_ck = checksum(&frame[14..34]);
     frame[24] = (ip_ck >> 8) as u8; frame[25] = ip_ck as u8;
     // --- UDP header (src port 5353, dst port 53; checksum 0 = optional over IPv4).
@@ -186,41 +194,52 @@ fn dns_resolve(ctx: &ServiceContext, hostname: &[u8], gw_mac: &[u8; 6], our_ip: 
     let udp_len = (8 + dns_len) as u16;
     frame[38] = (udp_len >> 8) as u8; frame[39] = udp_len as u8;
 
-    // Send THROUGH nic-driver and read the response frame back.
-    let reply = ctx.request_with_reply("nic-driver", &Message::from_bytes(&frame[..frame_len]))?;
-    let f = reply.payload_bytes();
-    // Must be IPv4/UDP with a DNS body. Answer parsing starts at the DNS header (offset 42).
-    if f.len() < D + 12 || f[12] != 0x08 || f[13] != 0x00 || f[23] != 17 { return None; }
-    let ancount = ((f[D + 6] as usize) << 8) | (f[D + 7] as usize);
-    if ancount == 0 { return None; }
-    // Skip the echoed question: QNAME (labels to 0, or a compression pointer) + QTYPE + QCLASS.
-    let mut p = D + 12;
-    while p < f.len() {
-        let len = f[p];
-        if len == 0 { p += 1; break; }
-        if len & 0xc0 == 0xc0 { p += 2; break; }     // compression pointer
-        p += 1 + len as usize;
-    }
-    p += 4;                                           // QTYPE + QCLASS
-    // Answers: find the first A record (TYPE 1, RDLENGTH 4).
-    let mut n = 0;
-    while n < ancount {
-        // NAME: a compression pointer (2 bytes) or inline labels.
-        if p >= f.len() { return None; }
-        if f[p] & 0xc0 == 0xc0 {
-            p += 2;
-        } else {
-            while p < f.len() { let len = f[p]; if len == 0 { p += 1; break; } p += 1 + len as usize; }
+    // Send THROUGH nic-driver, bounded + retrying past stray frames (Stage B: never block on a busy/
+    // silent driver). Match the reply to OUR query: a UDP packet to our source port 5353 (0x14e9).
+    let req = Message::from_bytes(&frame[..frame_len]);
+    for _ in 0..DANCE_TRIES {
+        let reply = match ctx.request_with_reply_deadline("nic-driver", &req, DANCE_SECS) {
+            Some(r) => r,
+            None => { ctx.reacquire_by_name("nic-driver"); continue; }
+        };
+        let f = reply.payload_bytes();
+        // IPv4/UDP to our DNS query port. Skip stray frames and keep waiting.
+        if f.len() < D + 12 || f[12] != 0x08 || f[13] != 0x00 || f[23] != 17
+            || f[36] != 0x14 || f[37] != 0xe9 {
+            continue;
         }
-        if p + 10 > f.len() { return None; }
-        let atype = ((f[p] as usize) << 8) | (f[p + 1] as usize);
-        let rdlength = ((f[p + 8] as usize) << 8) | (f[p + 9] as usize);
-        p += 10;
-        if atype == 1 && rdlength == 4 && p + 4 <= f.len() {
-            return Some([f[p], f[p + 1], f[p + 2], f[p + 3]]);
+        let ancount = ((f[D + 6] as usize) << 8) | (f[D + 7] as usize);
+        if ancount == 0 { return None; }
+        // Skip the echoed question: QNAME (labels to 0, or a compression pointer) + QTYPE + QCLASS.
+        let mut p = D + 12;
+        while p < f.len() {
+            let len = f[p];
+            if len == 0 { p += 1; break; }
+            if len & 0xc0 == 0xc0 { p += 2; break; }     // compression pointer
+            p += 1 + len as usize;
         }
-        p += rdlength;
-        n += 1;
+        p += 4;                                           // QTYPE + QCLASS
+        // Answers: find the first A record (TYPE 1, RDLENGTH 4).
+        let mut n = 0;
+        while n < ancount {
+            // NAME: a compression pointer (2 bytes) or inline labels.
+            if p >= f.len() { return None; }
+            if f[p] & 0xc0 == 0xc0 {
+                p += 2;
+            } else {
+                while p < f.len() { let len = f[p]; if len == 0 { p += 1; break; } p += 1 + len as usize; }
+            }
+            if p + 10 > f.len() { return None; }
+            let atype = ((f[p] as usize) << 8) | (f[p + 1] as usize);
+            let rdlength = ((f[p + 8] as usize) << 8) | (f[p + 9] as usize);
+            p += 10;
+            if atype == 1 && rdlength == 4 && p + 4 <= f.len() {
+                return Some([f[p], f[p + 1], f[p + 2], f[p + 3]]);
+            }
+            p += rdlength;
+            n += 1;
+        }
+        return None;   // a valid DNS reply but no A record - done, don't retry
     }
     None
 }
@@ -259,13 +278,25 @@ fn udp_roundtrip(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], src_p
     let ulen = (8 + dlen) as u16;
     frame[38] = (ulen >> 8) as u8; frame[39] = ulen as u8;
     frame[42..42 + dlen].copy_from_slice(&data[..dlen]);
-    let reply = ctx.request_with_reply("nic-driver", &Message::from_bytes(&frame[..42 + dlen]))?;
-    let f = reply.payload_bytes();
-    if f.len() < 42 || f[12] != 0x08 || f[13] != 0x00 || f[23] != 17 { return None; }
-    let payload_len = (((f[38] as usize) << 8) | (f[39] as usize)).saturating_sub(8);
-    let n = payload_len.min(f.len() - 42).min(out.len());
-    out[..n].copy_from_slice(&f[42..42 + n]);
-    Some(n)
+    let req = Message::from_bytes(&frame[..42 + dlen]);
+    // Bounded + retry past stray frames (Stage B: never block on a busy/silent driver). Match the reply
+    // to OUR datagram: a UDP packet FROM dest_ip back TO our src_port.
+    for _ in 0..DANCE_TRIES {
+        let reply = match ctx.request_with_reply_deadline("nic-driver", &req, DANCE_SECS) {
+            Some(r) => r,
+            None => { ctx.reacquire_by_name("nic-driver"); continue; }
+        };
+        let f = reply.payload_bytes();
+        if f.len() >= 42 && f[12] == 0x08 && f[13] == 0x00 && f[23] == 17
+            && f[26] == dest_ip[0] && f[27] == dest_ip[1] && f[28] == dest_ip[2] && f[29] == dest_ip[3]
+            && f[36] == (src_port >> 8) as u8 && f[37] == src_port as u8 {
+            let payload_len = (((f[38] as usize) << 8) | (f[39] as usize)).saturating_sub(8);
+            let n = payload_len.min(f.len() - 42).min(out.len());
+            out[..n].copy_from_slice(&f[42..42 + n]);
+            return Some(n);
+        }
+    }
+    None
 }
 
 #[no_mangle]
@@ -277,7 +308,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // request until the driver answers). Falls back to a default only if there is no NIC / no offer
     // (a non-e1000 host, where nic-driver serves empty replies). The IP it returns is the one ARP +
     // ICMP use below - so DHCP is no longer a hollow demo; it configures the stack.
-    let (our_ip, gateway) = dhcp_discover(&ctx).unwrap_or((FALLBACK_IP, GATEWAY_IP));
+    let (our_ip, gateway, dns_server) = dhcp_discover(&ctx).unwrap_or((FALLBACK_IP, GATEWAY_IP, GATEWAY_IP));
 
     // ---- Phase 2 step 1: ARP - who-has GATEWAY_IP, tell our_ip (a broadcast request).
     let mut arp = [0u8; 42];
@@ -435,7 +466,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         } else if pl.first() == Some(&1) {
             // DNS request (byte 0 = 1, then the hostname) - net-stack-internal resolution.
-            let ip = if have_mac { dns_resolve(&ctx, &pl[1..], &gw_mac, &our_ip) } else { None };
+            let ip = if have_mac { dns_resolve(&ctx, &pl[1..], &gw_mac, &our_ip, &dns_server) } else { None };
             let mut rb = [0u8; 5];
             if let Some(a) = ip { rb[0] = 1; rb[1..5].copy_from_slice(&a); }
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rb));
