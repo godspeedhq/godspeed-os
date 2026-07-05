@@ -26,8 +26,8 @@ use godspeed_sdk::{ServiceContext, Message};
 // received whatever sender MAC we advertise - this keeps the focus on the protocols.
 const OUR_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 // QEMU user-net: the guest is 10.0.2.15, the virtual gateway (which answers ARP + ICMP) is 10.0.2.2.
-const OUR_IP:     [u8; 4] = [10, 0, 2, 15];
-const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
+const FALLBACK_IP: [u8; 4] = [10, 0, 2, 15]; // used ONLY if DHCP returns no offer (no NIC)
+const GATEWAY_IP:  [u8; 4] = [10, 0, 2, 2];
 
 /// The 16-bit one's-complement checksum used by IPv4 and ICMP (RFC 1071): sum the 16-bit big-endian
 /// words, fold the carries, invert. The field being covered must be zero when this is computed.
@@ -83,24 +83,31 @@ fn dhcp_discover(ctx: &ServiceContext) -> Option<[u8; 4]> {
     frame[285] = 255;                                    // option end
 
     let req = Message::from_bytes(&frame);
-    match ctx.request_with_reply("nic-driver", &req) {
-        Some(reply) => {
-            let f = reply.payload_bytes();
-            // A DHCP reply: IPv4 (0x0800, IHL 5), UDP (proto 17), BOOTP op = 2 (BOOTREPLY). yiaddr
-            // (our offered IP) sits at BOOTP offset 16 = frame offset 58.
-            if f.len() >= 62 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45
-                && f[23] == 17 && f[42] == 2 {
-                let ip = [f[58], f[59], f[60], f[61]];
-                ctx.log_fmt(format_args!(
-                    "net-stack: DHCP - offered {}.{}.{}.{} (UDP works)", ip[0], ip[1], ip[2], ip[3]));
-                Some(ip)
-            } else {
+    loop {
+        match ctx.request_with_reply("nic-driver", &req) {
+            Some(reply) => {
+                let f = reply.payload_bytes();
+                // A DHCP reply: IPv4 (0x0800, IHL 5), UDP (proto 17), BOOTP op = 2 (BOOTREPLY). yiaddr
+                // (our offered IP) sits at BOOTP offset 16 = frame offset 58.
+                if f.len() >= 62 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45
+                    && f[23] == 17 && f[42] == 2 {
+                    let ip = [f[58], f[59], f[60], f[61]];
+                    ctx.log_fmt(format_args!(
+                        "net-stack: DHCP - offered {}.{}.{}.{} (UDP works)", ip[0], ip[1], ip[2], ip[3]));
+                    return Some(ip);
+                }
                 ctx.log_fmt(format_args!(
                     "net-stack: DHCP - {}-byte reply, no offer (no NIC, or nothing answered)", f.len()));
-                None
+                return None;
+            }
+            None => {
+                // nic-driver still spawning (or restarted): reacquire by name and retry (Commandment
+                // IX). This is the FIRST request net-stack makes, so it is where we wait for the driver.
+                ctx.log("net-stack: DHCP - nic-driver unreachable, reacquiring, retrying");
+                ctx.reacquire_by_name("nic-driver");
+                ctx.yield_cpu();
             }
         }
-        None => { ctx.log("net-stack: DHCP - nic-driver unreachable"); None }
     }
 }
 
@@ -108,7 +115,14 @@ fn dhcp_discover(ctx: &ServiceContext) -> Option<[u8; 4]> {
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("net-stack: starting");
 
-    // ---- Phase 2 step 1: ARP - who-has GATEWAY_IP, tell OUR_IP (a broadcast request).
+    // ---- Phase 3: DHCP FIRST, so net-stack LEARNS its own IP (self-configuring) instead of
+    // hardcoding it. This is also where we wait for nic-driver (dhcp_discover retries the first
+    // request until the driver answers). Falls back to a default only if there is no NIC / no offer
+    // (a non-e1000 host, where nic-driver serves empty replies). The IP it returns is the one ARP +
+    // ICMP use below - so DHCP is no longer a hollow demo; it configures the stack.
+    let our_ip = dhcp_discover(&ctx).unwrap_or(FALLBACK_IP);
+
+    // ---- Phase 2 step 1: ARP - who-has GATEWAY_IP, tell our_ip (a broadcast request).
     let mut arp = [0u8; 42];
     for b in arp.iter_mut().take(6) { *b = 0xff; }   // eth dest = broadcast
     arp[6..12].copy_from_slice(&OUR_MAC);            // eth src
@@ -118,7 +132,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     arp[18] = 0x06; arp[19] = 0x04;                  // hlen 6, plen 4
     arp[20] = 0x00; arp[21] = 0x01;                  // oper = request
     arp[22..28].copy_from_slice(&OUR_MAC);           // sender hw
-    arp[28..32].copy_from_slice(&OUR_IP);            // sender ip
+    arp[28..32].copy_from_slice(&our_ip);           // sender ip (learned via DHCP)
     arp[38..42].copy_from_slice(&GATEWAY_IP);        // target ip (target hw stays 0 - the question)
 
     // Send it THROUGH nic-driver's frame interface, waiting on the TRUTH of the reply (Commandment
@@ -171,7 +185,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         frame[22] = 64;                              // TTL
         frame[23] = 1;                               // protocol = ICMP
         // frame[24..26] header checksum: left 0, filled after.
-        frame[26..30].copy_from_slice(&OUR_IP);      // source
+        frame[26..30].copy_from_slice(&our_ip);      // source (learned via DHCP)
         frame[30..34].copy_from_slice(&GATEWAY_IP);  // destination
         let ip_ck = checksum(&frame[14..34]);
         frame[24] = (ip_ck >> 8) as u8; frame[25] = ip_ck as u8;
@@ -205,11 +219,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         }
     }
 
-    // ---- Phase 3: UDP - obtain our IP from slirp's DHCP server (proves the UDP transport).
-    dhcp_discover(&ctx);
-
-    // ARP + ICMP + DHCP proven over the frame interface. The SOCKET CAPABILITY (a socket is a
-    // delegated resource cap, minted/revoked by net-stack, §7.10) builds on this seam next.
+    // DHCP + ARP + ICMP proven over the frame interface, and net-stack now SELF-CONFIGURES its IP
+    // (learned via DHCP above, used by ARP + ICMP). The SOCKET CAPABILITY (a socket is a delegated
+    // resource cap, minted/revoked by net-stack, §7.10) builds on this seam next.
     loop {
         while ctx.try_recv().is_some() {}
         ctx.yield_cpu();

@@ -154,28 +154,30 @@ pub fn run(image_path: &Path, smp: u32) {
         }
     }
 
-    // Networking Phase 2 (docs/networking.md): net-stack resolves the QEMU user-net gateway
-    // (10.0.2.2) by ARP - the first real protocol on the wire, and the proof of the frame interface
-    // END TO END. net-stack builds the ARP request, sends it THROUGH nic-driver (request/reply), the
-    // gateway answers, nic-driver hands the reply frame back, and net-stack parses the gateway's MAC.
-    // This completes as boot finishes, so it lands just past boot_out - check for it here. A pass
-    // means: net-stack -> nic-driver -> TX on the wire -> reply -> RX -> back to net-stack, all over
-    // the capability-mediated frame interface (ARP is policy in net-stack; the driver is mechanism).
+    // These land just past the shell prompt (the protocol dance completes as boot finishes), so they
+    // are checked here, in the order net-stack now runs them: DHCP first (self-config), then ARP, then
+    // ICMP. collect_until advances the cursor, so the check order MUST match the log order.
+
+    // Networking Phase 3 (docs/networking.md): net-stack now SELF-CONFIGURES - it does DHCP FIRST, so
+    // the IP it learns is the one ARP + ICMP then use. A DHCP DISCOVER goes out over the frame
+    // interface and slirp's OFFER comes back; a pass proves the UDP round-trip both ways, in net-stack.
+    let dhcp_ok = collect_until(&buf, &mut cursor, b"net-stack: DHCP - offered", Duration::from_secs(12)).is_some();
+    check!(dhcp_ok, "phase3 udp: net-stack got a DHCP offer (UDP; self-configures its IP)");
+
+    // Networking Phase 2 (docs/networking.md): net-stack resolves the gateway (10.0.2.2) by ARP - the
+    // proof of the frame interface END TO END. It builds the request, sends it THROUGH nic-driver
+    // (request/reply), the gateway answers, nic-driver hands the reply frame back, and net-stack parses
+    // the gateway's MAC. A pass means net-stack -> nic-driver -> TX -> reply -> RX -> net-stack, all
+    // over the capability-mediated frame interface (ARP is policy in net-stack; the driver is mechanism).
     let arp_ok = collect_until(&buf, &mut cursor, b"net-stack: ARP - 10.0.2.2 is at", Duration::from_secs(12)).is_some();
     check!(arp_ok, "phase2 arp: net-stack resolved the gateway by ARP over the frame interface");
 
     // Networking Phase 2 step 2 (docs/networking.md): net-stack PINGS the gateway - the networking
-    // analogue of v1's ping/pong. It builds an ICMP echo request (ICMP inside IPv4 inside Ethernet)
-    // to the MAC ARP resolved, sends it THROUGH nic-driver, and reads back the echo REPLY. A pass
-    // proves three protocol layers on the wire, both ways, all in net-stack over the frame interface.
+    // analogue of v1's ping/pong. It builds an ICMP echo request (ICMP inside IPv4 inside Ethernet) to
+    // the MAC ARP resolved, sends it THROUGH nic-driver, and reads back the echo REPLY. A pass proves
+    // three protocol layers on the wire, both ways, all in net-stack over the frame interface.
     let icmp_ok = collect_until(&buf, &mut cursor, b"net-stack: ICMP - 10.0.2.2 echo reply", Duration::from_secs(12)).is_some();
     check!(icmp_ok, "phase2 icmp: net-stack pinged the gateway (ICMP echo reply received)");
-
-    // Networking Phase 3 (docs/networking.md): net-stack obtains its IP from slirp's DHCP server over
-    // UDP - the transport layer the socket capability sits on. A DHCP DISCOVER goes out over the frame
-    // interface and the OFFER comes back; a pass proves the UDP round-trip both ways, all in net-stack.
-    let dhcp_ok = collect_until(&buf, &mut cursor, b"net-stack: DHCP - offered", Duration::from_secs(12)).is_some();
-    check!(dhcp_ok, "phase3 udp: net-stack got a DHCP offer (UDP over the frame interface)");
 
     // -----------------------------------------------------------------------
     // help
