@@ -1004,6 +1004,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         "cores"   => cmd_cores(ctx, out),
         "date"    => cmd_date(ctx, if argc >= 2 { args[1] } else { "" }, out),
         "net"     => cmd_net(ctx, s["net".len()..].trim(), out),
+        "sock"    => cmd_sock(ctx, out),
         "uptime"  => cmd_uptime(ctx),
         "status"  => cmd_status(ctx),
         "observe" => if argc >= 2 && args[1] == "now" { cmd_observe_now(ctx) } else { cmd_observe_live(ctx) },
@@ -3395,7 +3396,7 @@ const UTIL_VERSION: &str = "0.1.0";
 /// Utilities that self-document (gates the `help`/`version` intercept in `execute`).
 const UTILS: &[&str] = &[
     "help", "result", "run", "assert", "selfcheck",
-    "echo", "input", "clear", "about", "mem", "cores", "date", "net", "uptime", "status", "observe", "caps", "roster",
+    "echo", "input", "clear", "about", "mem", "cores", "date", "net", "sock", "uptime", "status", "observe", "caps", "roster",
     "spawn", "kill", "restart", "reboot", "chaos", "drives", "ls", "cd", "read", "write", "edit", "fcap",
     "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count", "sort",
     "first", "last",
@@ -3493,6 +3494,9 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("net", "IP, gateway (+MAC), and whether the gateway pings", "net"),
             ("net dns <host>", "resolve a hostname to an IPv4 address", "net dns example.com"),
             ("net | write <path>", "snapshot the status to a file", "net | write /netstat.txt"),
+        ], true),
+        "sock" => help_block(ctx, "sock", "a UDP socket as a capability (demo)", &[
+            ("sock", "open a socket cap, send a datagram through it, report the round-trip", "sock"),
         ], true),
         "uptime" => help_block(ctx, "uptime", "how long the system has been up", &[
             ("uptime", "uptime (Nd HH:MM:SS) + seconds since boot", "uptime"),
@@ -4159,6 +4163,78 @@ fn net_status(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
         out.line(ctx, "gateway  unresolved");
     }
     out.line(ctx, if flags & 2 != 0 { "ping     ok" } else { "ping     no" });
+    Ok(())
+}
+
+/// A name-addressed request to net-stack, with the reacquire-on-miss prime (net-stack is not a wired
+/// send-peer; the shell holds ACQUIRE_ANY). Mirrors `fs_request`.
+fn netstack_request(ctx: &ServiceContext, payload: &[u8]) -> Option<Message> {
+    let msg = Message::from_bytes(payload);
+    match ctx.request_with_reply("net-stack", &msg) {
+        Some(r) => Some(r),
+        None => if ctx.reacquire_by_name("net-stack") { ctx.request_with_reply("net-stack", &msg) } else { None },
+    }
+}
+
+/// Open a UDP socket: net-stack mints a socket cap and grants it to us (mirrors `fc_open`).
+fn sock_open(ctx: &ServiceContext) -> Option<CapHandle> {
+    let r = netstack_request(ctx, &[2])?;
+    if r.payload_bytes().first() == Some(&1) { ctx.take_pending_cap() } else { None }
+}
+
+/// Invoke a socket cap - send a datagram through it and receive the response (mirrors `fc_invoke`).
+fn sock_invoke(ctx: &ServiceContext, sock: CapHandle, right: u8, payload: &[u8]) -> Option<Message> {
+    let self_grant = ctx.self_grant_handle()?;
+    let reply = ctx.derive_cap(self_grant)?;
+    if ctx.resource_invoke(sock, right, reply, &Message::from_bytes(payload)).is_err() {
+        ctx.remove_cap(reply);
+        return None;
+    }
+    Some(ctx.recv())
+}
+
+/// Build a minimal DNS A-query for `host` into `buf`; returns the length. Just enough to elicit a UDP
+/// response - the `sock` demo reports the round-trip, it does not parse DNS.
+fn dns_query_bytes(host: &str, buf: &mut [u8]) -> usize {
+    buf[0] = 0x13; buf[1] = 0x37;           // id
+    buf[2] = 0x01; buf[3] = 0x00;           // recursion desired
+    buf[4] = 0x00; buf[5] = 0x01;           // qdcount = 1
+    for b in buf[6..12].iter_mut() { *b = 0; }
+    let mut pos = 12;
+    for label in host.as_bytes().split(|&b| b == b'.') {
+        if label.is_empty() || pos + 1 + label.len() >= buf.len() - 5 { break; }
+        buf[pos] = label.len() as u8; pos += 1;
+        buf[pos..pos + label.len()].copy_from_slice(label); pos += label.len();
+    }
+    buf[pos] = 0; pos += 1;                  // qname terminator
+    buf[pos] = 0x00; buf[pos + 1] = 0x01;    // QTYPE A
+    buf[pos + 2] = 0x00; buf[pos + 3] = 0x01; // QCLASS IN
+    pos + 4
+}
+
+/// `sock` - demonstrate a UDP socket as a CAPABILITY (utilities/41_sock.md). Opens a socket cap from
+/// net-stack, sends a datagram through it, and reports the round-trip - proving a socket is a real
+/// kernel capability the client holds and invokes (§7.10), not an ambient channel. A pipe producer.
+fn cmd_sock(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
+    let sock = match sock_open(ctx) {
+        Some(c) => c,
+        None => { ctx.console_writeln("sock: net-stack would not open a socket (no NIC?)"); return Err(ShellError::Unknown); }
+    };
+    // Send a datagram through the socket cap to the DNS server (a DNS query is just data that gets a
+    // reply); we report the round-trip, which proves the cap does real UDP I/O.
+    let mut query = [0u8; 64];
+    let qlen = dns_query_bytes("example.com", &mut query);
+    let mut payload = [0u8; 96];
+    payload[0] = 10; payload[1] = 0; payload[2] = 2; payload[3] = 3;   // dest ip 10.0.2.3
+    payload[4] = 0; payload[5] = 53;                                    // dest port 53
+    payload[6..6 + qlen].copy_from_slice(&query[..qlen]);
+    match sock_invoke(ctx, sock, RIGHT_WRITE, &payload[..6 + qlen]) {
+        Some(resp) => out.line_fmt(ctx, format_args!(
+            "sock: UDP socket cap - sent {} bytes to 10.0.2.3:53, received {} bytes back (a round-trip through a capability)",
+            qlen, resp.payload_bytes().len())),
+        None => out.line(ctx, "sock: socket cap invocation returned nothing (no NIC, or nothing answered)"),
+    }
+    ctx.remove_cap(sock);
     Ok(())
 }
 
@@ -5212,7 +5288,7 @@ fn is_producer_builtin(name: &str) -> bool {
     // loudly as non-producers instead. To capture a big file for `edit`, append a simple producer
     // a few times: `help | write /big.txt; help | write append /big.txt; …`.
     matches!(name, "read" | "echo" | "tree" | "input"
-                 | "about" | "mem" | "cores" | "date" | "net" | "help")
+                 | "about" | "mem" | "cores" | "date" | "net" | "sock" | "help")
 }
 
 /// Producer SERVICES that emit without needing input, so they can start a pipe (and follow the
@@ -5243,6 +5319,7 @@ fn run_producer(ctx: &ServiceContext, cwd: &Cwd, cmdline: &str, out: &mut Out) {
         "cores"        => { let _ = cmd_cores(ctx, out); }
         "date"         => { let _ = cmd_date(ctx, arg, out); }
         "net"          => { let _ = cmd_net(ctx, arg, out); }
+        "sock"         => { let _ = cmd_sock(ctx, out); }
         "help"         => help_to_out(ctx, out),
         "input"        => run_input(ctx, arg, out),
         _ => {}

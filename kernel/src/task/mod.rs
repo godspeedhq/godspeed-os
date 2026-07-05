@@ -3283,7 +3283,9 @@ fn spawn_service_with_config(
     // into the real, QEMU-proven `osdev test resource-server`. It only takes effect in the
     // resource-test build, the only build that spawns `resource-server` - in every other build it
     // is never spawned, so the grant never fires.
-    if name == "fs" || name == "resource-server" {
+    // `net-stack` mints SOCKET capabilities (a socket is a delegated resource cap, §7.10, the same
+    // mechanism `fs` uses for files) - so it needs the same minting authority.
+    if name == "fs" || name == "resource-server" || name == "net-stack" {
         let rm_cap = mint_cap(RESOURCE_MINT_RESOURCE, Rights::WRITE);
         caps.insert(rm_cap)
             .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;

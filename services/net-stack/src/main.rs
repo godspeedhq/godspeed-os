@@ -201,6 +201,49 @@ fn dns_resolve(ctx: &ServiceContext, hostname: &[u8], gw_mac: &[u8; 6], our_ip: 
     None
 }
 
+// --- Socket as capability (§7.10): a UDP socket is a delegated resource cap minted by net-stack,
+// the SAME mechanism `fs` uses for a file. A client opens a socket (net-stack mints + grants the cap),
+// then INVOKES the cap to send a datagram - the kernel badges the invocation with the socket's
+// ResourceId so net-stack knows which socket, without the kernel knowing what a socket is.
+const MAX_SOCKETS: usize = 8;
+const RIGHT_READ:  u8 = 1 << 0;
+const RIGHT_WRITE: u8 = 1 << 1;
+const RIGHT_GRANT: u8 = 1 << 4;
+
+#[derive(Clone, Copy)]
+struct Socket { rid: u64, port: u16 }
+
+/// Send a UDP datagram (src_port -> dest_ip:dest_port carrying `data`) THROUGH nic-driver and copy the
+/// response's UDP payload into `out`. Returns the payload length, or None (no gateway / no reply).
+fn udp_roundtrip(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], src_port: u16,
+                 dest_ip: &[u8; 4], dest_port: u16, data: &[u8], out: &mut [u8]) -> Option<usize> {
+    let mut frame = [0u8; 1600];
+    let dlen = data.len().min(frame.len() - 42);
+    frame[0..6].copy_from_slice(gw_mac);
+    frame[6..12].copy_from_slice(&OUR_MAC);
+    frame[12] = 0x08; frame[13] = 0x00;                  // IPv4
+    frame[14] = 0x45;
+    let total = (20 + 8 + dlen) as u16;
+    frame[16] = (total >> 8) as u8; frame[17] = total as u8;
+    frame[22] = 64; frame[23] = 17;                      // TTL, UDP
+    frame[26..30].copy_from_slice(our_ip);
+    frame[30..34].copy_from_slice(dest_ip);
+    let ip_ck = checksum(&frame[14..34]);
+    frame[24] = (ip_ck >> 8) as u8; frame[25] = ip_ck as u8;
+    frame[34] = (src_port >> 8) as u8; frame[35] = src_port as u8;
+    frame[36] = (dest_port >> 8) as u8; frame[37] = dest_port as u8;
+    let ulen = (8 + dlen) as u16;
+    frame[38] = (ulen >> 8) as u8; frame[39] = ulen as u8;
+    frame[42..42 + dlen].copy_from_slice(&data[..dlen]);
+    let reply = ctx.request_with_reply("nic-driver", &Message::from_bytes(&frame[..42 + dlen]))?;
+    let f = reply.payload_bytes();
+    if f.len() < 42 || f[12] != 0x08 || f[13] != 0x00 || f[23] != 17 { return None; }
+    let payload_len = (((f[38] as usize) << 8) | (f[39] as usize)).saturating_sub(8);
+    let n = payload_len.min(f.len() - 42).min(out.len());
+    out[..n].copy_from_slice(&f[42..42 + n]);
+    Some(n)
+}
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("net-stack: starting");
@@ -321,17 +364,52 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     status[4..8].copy_from_slice(&GATEWAY_IP);
     status[8..14].copy_from_slice(&gw_mac);
     status[14] = (have_mac as u8) | ((ping_ok as u8) << 1);
+    let mut sockets = [Socket { rid: 0, port: 0 }; MAX_SOCKETS];
     loop {
         let req = ctx.recv();                   // block for a client request
+        // A nonzero badge = a SOCKET-CAPABILITY invocation the kernel validated (§7.10). A plain
+        // name-addressed request (status / DNS / open-socket) carries no badge.
+        let badge = ctx.last_recv_badge();
         let reply_cap = match ctx.take_pending_cap() {
             Some(c) => c,
             None => continue,                   // a request with no reply cap - drop it
         };
-        let p = req.payload_bytes();
-        if p.first() == Some(&1) {
-            // DNS request (byte 0 = 1, then the hostname). Resolve it via slirp's DNS and reply with
-            // 5 bytes: [ok, ip0, ip1, ip2, ip3]. Needs a resolved gateway to send through.
-            let ip = if have_mac { dns_resolve(&ctx, &p[1..], &gw_mac, &our_ip) } else { None };
+        let pl = req.payload_bytes();
+        if let Some((rid, right)) = badge {
+            // Socket-cap invocation - SOP_SEND: transmit a UDP datagram through this socket. Payload =
+            // [dest_ip(4), dest_port(2), data...]. Reply = the response's UDP payload (empty on none).
+            // Sending needs WRITE; the kernel already checked the cap holds `right`, we enforce op<=right.
+            let mut resp = [0u8; 1500];
+            let n = if right & RIGHT_WRITE != 0 && pl.len() >= 6 && have_mac {
+                if let Some(s) = sockets.iter().find(|s| s.rid == rid && s.rid != 0) {
+                    let dip = [pl[0], pl[1], pl[2], pl[3]];
+                    let dport = ((pl[4] as u16) << 8) | pl[5] as u16;
+                    udp_roundtrip(&ctx, &gw_mac, &our_ip, s.port, &dip, dport, &pl[6..], &mut resp)
+                } else { None }
+            } else { None };
+            match n {
+                Some(len) => { let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&resp[..len])); }
+                None      => { let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[])); }
+            }
+        } else if pl.first() == Some(&2) {
+            // OPEN a UDP socket: mint a delegated socket cap (READ|WRITE) and GRANT it to the client -
+            // the fs `open_file` pattern (§7.10). Reply carries [1] + the embedded cap on success.
+            let slot = sockets.iter().position(|s| s.rid == 0);
+            let minted = slot.and_then(|sl| ctx.resource_mint(RIGHT_READ | RIGHT_WRITE | RIGHT_GRANT).map(|m| (sl, m)));
+            match minted {
+                Some((sl, (rid, cap))) => {
+                    sockets[sl] = Socket { rid, port: 40000 + sl as u16 };
+                    let granted = ctx.derive_cap(cap)
+                        .map(|c| ctx.send_with_cap_by_handle(reply_cap, c, &Message::from_bytes(&[1])).is_ok())
+                        .unwrap_or(false);
+                    ctx.remove_cap(cap);        // net-stack drops its own copy; the client holds it now
+                    if !granted { sockets[sl].rid = 0; let _ = ctx.resource_revoke(rid); }
+                }
+                None => { let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0])); }
+            }
+        } else if pl.first() == Some(&1) {
+            // DNS request (byte 0 = 1, then the hostname) - net-stack-internal resolution.
+            let ip = if have_mac { dns_resolve(&ctx, &pl[1..], &gw_mac, &our_ip) } else { None };
             let mut rb = [0u8; 5];
             if let Some(a) = ip { rb[0] = 1; rb[1..5].copy_from_slice(&a); }
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rb));

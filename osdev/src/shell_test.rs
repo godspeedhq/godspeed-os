@@ -208,6 +208,15 @@ pub fn run(image_path: &Path, smp: u32) {
     check!(dns_out.contains("example.com is ") || dns_out.contains("example.com: no answer"),
            "net dns: resolves a hostname or reports no-answer cleanly (DNS via slirp)");
 
+    // sock (utilities/41_sock.md): a UDP socket as a CAPABILITY. The shell opens a socket cap from
+    // net-stack and sends a datagram THROUGH it - proving a socket is a real kernel cap (§7.10) the
+    // client holds and invokes, not an ambient channel. Lenient on the UDP response (external), but
+    // the open + invoke (the cap mechanism itself) must succeed - "would not open" would be a failure.
+    send(&mut write_half, b"sock\r");
+    let sock_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)).unwrap_or_default();
+    check!(sock_out.contains("sock: UDP socket cap - sent") || sock_out.contains("socket cap invocation returned nothing"),
+           "sock: opened + invoked a UDP socket capability (socket = capability, §7.10)");
+
     // -----------------------------------------------------------------------
     // help
     // -----------------------------------------------------------------------
@@ -259,10 +268,12 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(r) => check!(r.contains("sort reverse"), "tab: pipe-stage 'sort r' completes to 'sort reverse'"),
         None    => { println!("shell-test: FAIL - tab pipe-stage keyword timed out"); fail += 1; }
     }
-    // command-name completion AFTER a pipe (the segment's first word). `status | so` → `status | sort`.
-    send(&mut write_half, b"status | so\t\x03");
+    // command-name completion AFTER a pipe (the segment's first word). `status | sor` → `status | sort`.
+    // ("so" is now ambiguous - `sock` (the socket utility) and `sort` both start with it - so this uses
+    // the unique prefix "sor" instead.)
+    send(&mut write_half, b"status | sor\t\x03");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("status | sort"), "tab: command name completes after a pipe (so -> sort)"),
+        Some(r) => check!(r.contains("status | sort"), "tab: command name completes after a pipe (sor -> sort)"),
         None    => { println!("shell-test: FAIL - tab pipe command completion timed out"); fail += 1; }
     }
     // trailing modifier keyword (after the path arg). `mkdir /x p` → `mkdir /x parents`.
