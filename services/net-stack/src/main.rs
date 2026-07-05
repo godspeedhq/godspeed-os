@@ -384,10 +384,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             None => continue,                   // a request with no reply cap - drop it
         };
         let pl = req.payload_bytes();
-        // DIAGNOSTIC (Phase 4): prove whether a client request even reaches this serve loop, and via
-        // which branch. `net` on the T630 times out here though nic-driver's identical query works.
-        ctx.log_fmt(format_args!("net-stack: serve pl0={} badge={} len={}",
-            pl.first().copied().unwrap_or(255), badge.is_some() as u8, pl.len()));
         if let Some((rid, right)) = badge {
             // Socket-cap invocation - SOP_SEND: transmit a UDP datagram through this socket. Payload =
             // [dest_ip(4), dest_port(2), data...]. Reply = the response's UDP payload (empty on none).
@@ -428,8 +424,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rb));
         } else {
             // Status request (default): reply the frozen 15-byte record.
-            let ok = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&status)).is_ok();
-            ctx.log_fmt(format_args!("net-stack: status reply {}", if ok { "OK" } else { "SEND-FAIL" }));
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&status));
         }
         ctx.remove_cap(reply_cap);
     }
