@@ -201,7 +201,11 @@ pub fn set_bus_master(bdf: u32) {
         unsafe {
             outl(CONFIG_ADDRESS, addr);
             let cmd = inl(CONFIG_DATA);
-            let new = cmd | (1u32 << 2); // set Bus Master Enable (bit 2)
+            // Enable Memory Space (bit 1) AND Bus Master (bit 2). A real chipset IGNORES MMIO to a
+            // device's memory BAR unless Memory Space is set - QEMU is lenient (so the e1000 worked
+            // without it), but on the T630 the RTL8168 returned 0xff for every register read, so its
+            // reset bit looked permanently set and the driver spun forever. Setting bit 1 fixes it.
+            let new = cmd | (1u32 << 2) | (1u32 << 1);
             if new != cmd {
                 outl(CONFIG_ADDRESS, addr);
                 outl(CONFIG_DATA, new);
@@ -212,7 +216,7 @@ pub fn set_bus_master(bdf: u32) {
         }
     };
     if changed {
-        crate::kprintln!("pci: BDF {:#06x} bus-master ENABLED for DMA driver spawn", bdf & 0xFFFF);
+        crate::kprintln!("pci: BDF {:#06x} bus-master + memory-space ENABLED for DMA driver spawn", bdf & 0xFFFF);
     }
 }
 
