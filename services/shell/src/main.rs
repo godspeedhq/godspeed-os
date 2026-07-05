@@ -1002,6 +1002,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         "mem"     => cmd_mem(ctx, out),
         "cores"   => cmd_cores(ctx, out),
         "date"    => cmd_date(ctx, if argc >= 2 { args[1] } else { "" }, out),
+        "net"     => cmd_net(ctx, out),
         "uptime"  => cmd_uptime(ctx),
         "status"  => cmd_status(ctx),
         "observe" => if argc >= 2 && args[1] == "now" { cmd_observe_now(ctx) } else { cmd_observe_live(ctx) },
@@ -3393,7 +3394,7 @@ const UTIL_VERSION: &str = "0.1.0";
 /// Utilities that self-document (gates the `help`/`version` intercept in `execute`).
 const UTILS: &[&str] = &[
     "help", "result", "run", "assert", "selfcheck",
-    "echo", "input", "clear", "about", "mem", "cores", "date", "uptime", "status", "observe", "caps", "roster",
+    "echo", "input", "clear", "about", "mem", "cores", "date", "net", "uptime", "status", "observe", "caps", "roster",
     "spawn", "kill", "restart", "reboot", "chaos", "drives", "ls", "cd", "read", "write", "edit", "fcap",
     "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count", "sort",
     "first", "last",
@@ -3486,6 +3487,10 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "date" => help_block(ctx, "date", "date + time from the hardware clock", &[
             ("date", "full timestamp (weekday date time)", "date"),
             ("date epoch", "seconds since 1970-01-01", "date epoch"),
+        ], true),
+        "net" => help_block(ctx, "net", "network status (IP, gateway, reachability)", &[
+            ("net", "IP, gateway (+MAC), and whether the gateway pings", "net"),
+            ("net | write <path>", "snapshot the status to a file", "net | write /netstat.txt"),
         ], true),
         "uptime" => help_block(ctx, "uptime", "how long the system has been up", &[
             ("uptime", "uptime (Nd HH:MM:SS) + seconds since boot", "uptime"),
@@ -3711,6 +3716,7 @@ static HELP: &[HelpRow] = &[
     Row("mem", "physical memory usage"),
     Row("date [epoch]", "date + time; 'epoch' = secs since 1970"),
     Row("uptime", "how long the system has been up (records when piped)"),
+    Row("net", "network status: IP, gateway, ping"),
     Gap,
     Sec("Services"),
     Row("status", "list all live tasks"),
@@ -4056,6 +4062,46 @@ fn cmd_date(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
             "{} {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
             wd, dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second));
     }
+    Ok(())
+}
+
+/// `net` - network status, brokered from the `net-stack` service (utilities/40_net.md). Reports the
+/// IP net-stack configured, the gateway it resolved by ARP, and whether that gateway answered a ping -
+/// raw facts, no verdict (utilities/0_conventions.md rule 7). A pipe PRODUCER: `net | write /f`.
+fn cmd_net(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
+    // net-stack is NOT a wired send-peer, so the first request can miss the cap cache. The shell holds
+    // ACQUIRE_ANY, so reacquire by name and retry, then give up loudly (Commandment VIII / IX). The
+    // request body is ignored by net-stack - the embedded reply cap IS the ask (§8.2).
+    let req = Message::from_bytes(&[0u8]);
+    let reply = match ctx.request_with_reply("net-stack", &req) {
+        Some(r) => Some(r),
+        None => if ctx.reacquire_by_name("net-stack") {
+            ctx.request_with_reply("net-stack", &req)
+        } else {
+            None
+        },
+    };
+    let reply = match reply {
+        Some(r) => r,
+        None => { ctx.console_writeln("net: net-stack unavailable"); return Err(ShellError::Unknown); }
+    };
+    let p = reply.payload_bytes();
+    if p.len() < 15 {
+        ctx.console_writeln("net: net-stack gave a short reply");
+        return Err(ShellError::Unknown);
+    }
+    // 15-byte record: ip[0..4], gateway ip[4..8], gateway mac[8..14], flags[14] (bit0 gw resolved,
+    // bit1 ping ok). Formatting is the shell's job; net-stack reports raw facts.
+    let flags = p[14];
+    out.line_fmt(ctx, format_args!("ip       {}.{}.{}.{}", p[0], p[1], p[2], p[3]));
+    if flags & 1 != 0 {
+        out.line_fmt(ctx, format_args!(
+            "gateway  {}.{}.{}.{} at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13]));
+    } else {
+        out.line(ctx, "gateway  unresolved");
+    }
+    out.line(ctx, if flags & 2 != 0 { "ping     ok" } else { "ping     no" });
     Ok(())
 }
 
@@ -5109,7 +5155,7 @@ fn is_producer_builtin(name: &str) -> bool {
     // loudly as non-producers instead. To capture a big file for `edit`, append a simple producer
     // a few times: `help | write /big.txt; help | write append /big.txt; …`.
     matches!(name, "read" | "echo" | "tree" | "input"
-                 | "about" | "mem" | "cores" | "date" | "help")
+                 | "about" | "mem" | "cores" | "date" | "net" | "help")
 }
 
 /// Producer SERVICES that emit without needing input, so they can start a pipe (and follow the
@@ -5139,6 +5185,7 @@ fn run_producer(ctx: &ServiceContext, cwd: &Cwd, cmdline: &str, out: &mut Out) {
         "mem"          => { let _ = cmd_mem(ctx, out); }
         "cores"        => { let _ = cmd_cores(ctx, out); }
         "date"         => { let _ = cmd_date(ctx, arg, out); }
+        "net"          => { let _ = cmd_net(ctx, out); }
         "help"         => help_to_out(ctx, out),
         "input"        => run_input(ctx, arg, out),
         _ => {}

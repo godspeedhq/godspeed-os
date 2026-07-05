@@ -168,6 +168,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // ---- Phase 2 step 2: ICMP - ping the gateway (echo request -> echo reply). Only once ARP gave us
     // the gateway's MAC (an IPv4 packet to it needs a destination hardware address).
+    let mut ping_ok = false;
     if have_mac {
         // Ethernet (14) + IPv4 (20) + ICMP header (8) + 8-byte payload = 50 bytes.
         let mut frame = [0u8; 50];
@@ -207,6 +208,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // f[26..30] is the source IP - the host that answered our ping.
                 if f.len() >= 42 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45
                     && f[23] == 1 && f[34] == 0 {
+                    ping_ok = true;
                     ctx.log_fmt(format_args!(
                         "net-stack: ICMP - {}.{}.{}.{} echo reply (ping OK, {} bytes on the wire)",
                         f[26], f[27], f[28], f[29], f.len()));
@@ -219,11 +221,23 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         }
     }
 
-    // DHCP + ARP + ICMP proven over the frame interface, and net-stack now SELF-CONFIGURES its IP
-    // (learned via DHCP above, used by ARP + ICMP). The SOCKET CAPABILITY (a socket is a delegated
-    // resource cap, minted/revoked by net-stack, §7.10) builds on this seam next.
+    // DHCP + ARP + ICMP proven over the frame interface, and net-stack SELF-CONFIGURES its IP. Now
+    // freeze the result and SERVE it: a client (the shell's `net` command) sends a status request and
+    // we reply with a fixed 15-byte record - our IP (4), the gateway IP (4), the gateway MAC (6), and
+    // a flags byte (bit0 = gateway resolved, bit1 = ping OK). The client formats it; we report raw
+    // facts (utilities/0_conventions.md rule 7). The SOCKET CAPABILITY builds on this seam next.
+    let mut status = [0u8; 15];
+    status[0..4].copy_from_slice(&our_ip);
+    status[4..8].copy_from_slice(&GATEWAY_IP);
+    status[8..14].copy_from_slice(&gw_mac);
+    status[14] = (have_mac as u8) | ((ping_ok as u8) << 1);
     loop {
-        while ctx.try_recv().is_some() {}
-        ctx.yield_cpu();
+        let _ = ctx.recv();                     // block for a status request
+        let reply_cap = match ctx.take_pending_cap() {
+            Some(c) => c,
+            None => continue,                   // a request with no reply cap - drop it
+        };
+        let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&status));
+        ctx.remove_cap(reply_cap);
     }
 }

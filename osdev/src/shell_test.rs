@@ -179,6 +179,26 @@ pub fn run(image_path: &Path, smp: u32) {
     let icmp_ok = collect_until(&buf, &mut cursor, b"net-stack: ICMP - 10.0.2.2 echo reply", Duration::from_secs(12)).is_some();
     check!(icmp_ok, "phase2 icmp: net-stack pinged the gateway (ICMP echo reply received)");
 
+    // The `net` utility (utilities/40_net.md): the shell queries net-stack BY NAME (it holds
+    // ACQUIRE_ANY) and prints its status - the user-facing window onto the whole stack, and a pipe
+    // producer. It runs after the boot dance, so net-stack is serving its frozen 15-byte record by now.
+    send(&mut write_half, b"net\r");
+    let net_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    check!(net_out.contains("ip       10.0.2.15"), "net: reports the DHCP-learned IP (10.0.2.15)");
+    check!(net_out.contains("gateway  10.0.2.2 at 52:55:"), "net: reports the ARP-resolved gateway + MAC");
+    check!(net_out.contains("ping     ok"), "net: reports the gateway ping OK");
+
+    // net is a pipe PRODUCER (utilities/40_net.md §4): its three lines flow onward. `net | count`
+    // proves it (count is an in-process filter, no disk needed).
+    send(&mut write_half, b"net | count\r");
+    let netcount = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    check!(netcount.contains("3 lines"), "net: is a pipe producer (net | count = 3 lines)");
+
+    // net version (utilities/0_conventions.md rule 5).
+    send(&mut write_half, b"net version\r");
+    let netver = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    check!(netver.contains("net 0.1.0"), "net: version reports net 0.1.0");
+
     // -----------------------------------------------------------------------
     // help
     // -----------------------------------------------------------------------
