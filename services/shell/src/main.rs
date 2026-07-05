@@ -4129,6 +4129,24 @@ fn net_dns(ctx: &ServiceContext, host: &str, out: &mut Out) -> Result<(), ShellE
 
 /// `net` (bare) - the network status: IP, gateway (+MAC), and whether the gateway pings. Raw facts,
 /// no verdict (utilities/0_conventions.md rule 7).
+/// The outcome of a `net` query that a keypress can interrupt.
+enum NetQ { Reply(Message), Timeout, Aborted }
+
+/// A bounded request to `peer` that a `q`/`Q`/ESC keypress ABORTS - so a slow or stuck `net` can always
+/// be escaped back to the prompt. Sends the (idempotent) query once per second, checking the console for
+/// an abort key between tries, up to `max_secs`. Returns the reply, a timeout, or Aborted. (Safe under
+/// the piped shell-test: it waits for the prompt between commands, so no input is pending during `net`.)
+fn net_query(ctx: &ServiceContext, peer: &str, msg: &Message, max_secs: i64) -> NetQ {
+    for _ in 0..=max_secs {
+        while let Some(b) = ctx.try_console_read() {
+            if b == b'q' || b == b'Q' || b == 0x1b { return NetQ::Aborted; }
+        }
+        if let Some(r) = ctx.request_with_reply_deadline(peer, msg, 1) { return NetQ::Reply(r); }
+        ctx.reacquire_by_name(peer);
+    }
+    NetQ::Timeout
+}
+
 fn net_status(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
     // Diagnostic FIRST (independent of net-stack, so it shows even if net-stack is down): the NIC the
     // KERNEL discovered - vendor:device and which register BAR it mapped. This is which chip nic-driver
@@ -4139,51 +4157,46 @@ fn net_status(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
     out.line_fmt(ctx, format_args!(
         "nic      {:04x}:{:04x}  mmio {:#x}  ({})", vd & 0xFFFF, vd >> 16, ctx.nic_mmio_base(), chip));
 
-    // Query nic-driver directly (the shell holds ACQUIRE_ANY) for its MAC + reset result - this proves
-    // whether MMIO register access to the NIC actually works on this hardware (Phase 4 diagnostic).
+    // Query nic-driver directly (the shell holds ACQUIRE_ANY) for its MAC + link/TX/RX - proves whether
+    // MMIO reaches the NIC (Phase 4). Abortable: press q if it stalls.
     let nreq = Message::from_bytes(&[3u8]);
-    let nrep = match ctx.request_with_reply("nic-driver", &nreq) {
-        Some(r) => Some(r),
-        None => if ctx.reacquire_by_name("nic-driver") { ctx.request_with_reply("nic-driver", &nreq) } else { None },
-    };
-    if let Some(r) = nrep {
-        let p = r.payload_bytes();
-        if p.len() >= 7 {
-            out.line_fmt(ctx, format_args!(
-                "nic-mac  {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}  reset {}",
-                p[1], p[2], p[3], p[4], p[5], p[6],
-                if p[0] == 1 { "ok" } else { "TIMEOUT (MMIO not reaching the chip)" }));
-        }
-        // Extended status (RTL8168 Stage B, 15 bytes): live link + TX/RX counts, so the TV shows the
-        // whole bring-up story without the serial log.
-        if p.len() >= 15 {
-            let rx_len = u16::from_le_bytes([p[9], p[10]]);
-            let tx_cnt = u16::from_le_bytes([p[11], p[12]]);
-            let rx_cnt = u16::from_le_bytes([p[13], p[14]]);
-            out.line_fmt(ctx, format_args!(
-                "nic-link {}  |  tx {} ({} sent)  |  rx {}B ({} recv)",
-                if p[7] != 0 { "UP" } else { "down (no cable/PHY)" },
-                if p[8] != 0 { "ok" } else { "TIMEOUT" }, tx_cnt, rx_len, rx_cnt));
+    match net_query(ctx, "nic-driver", &nreq, 3) {
+        NetQ::Aborted => { ctx.console_writeln("net: aborted"); return Ok(()); }
+        NetQ::Timeout => {} // no nic diagnostic this time - fall through to the net-stack status
+        NetQ::Reply(r) => {
+            let p = r.payload_bytes();
+            if p.len() >= 7 {
+                out.line_fmt(ctx, format_args!(
+                    "nic-mac  {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}  reset {}",
+                    p[1], p[2], p[3], p[4], p[5], p[6],
+                    if p[0] == 1 { "ok" } else { "TIMEOUT (MMIO not reaching the chip)" }));
+            }
+            // Extended status (RTL8168 Stage B, 15 bytes): live link + TX/RX counts, so the TV shows the
+            // whole bring-up story without the serial log.
+            if p.len() >= 15 {
+                let rx_len = u16::from_le_bytes([p[9], p[10]]);
+                let tx_cnt = u16::from_le_bytes([p[11], p[12]]);
+                let rx_cnt = u16::from_le_bytes([p[13], p[14]]);
+                out.line_fmt(ctx, format_args!(
+                    "nic-link {}  |  tx {} ({} sent)  |  rx {}B ({} recv)",
+                    if p[7] != 0 { "UP" } else { "down (no cable/PHY)" },
+                    if p[8] != 0 { "ok" } else { "TIMEOUT" }, tx_cnt, rx_len, rx_cnt));
+            }
         }
     }
 
     // net-stack is NOT a wired send-peer, so the first request can miss the cap cache. The shell holds
     // ACQUIRE_ANY, so reacquire by name and retry, then give up loudly (Commandment VIII / IX). The
     // request body is ignored by net-stack - the embedded reply cap IS the ask (§8.2).
-    // Bounded (3s): net-stack can wedge (e.g. on a degraded NIC), and a plain request_with_reply would
-    // freeze the shell. With a deadline it times out and `net` still prints the NIC diagnostic above.
+    // Abortable, bounded (3s): net-stack can wedge (e.g. on a degraded NIC); press q to escape a stall.
     let req = Message::from_bytes(&[0u8]);
-    let reply = match ctx.request_with_reply_deadline("net-stack", &req, 3) {
-        Some(r) => Some(r),
-        None => if ctx.reacquire_by_name("net-stack") {
-            ctx.request_with_reply_deadline("net-stack", &req, 3)
-        } else {
-            None
-        },
-    };
-    let reply = match reply {
-        Some(r) => r,
-        None => { ctx.console_writeln("net: net-stack unavailable (no reply within 3s)"); return Err(ShellError::Unknown); }
+    let reply = match net_query(ctx, "net-stack", &req, 3) {
+        NetQ::Reply(r) => r,
+        NetQ::Aborted => { ctx.console_writeln("net: aborted"); return Ok(()); }
+        NetQ::Timeout => {
+            ctx.console_writeln("net: net-stack unavailable (no reply within 3s)");
+            return Err(ShellError::Unknown);
+        }
     };
     let p = reply.payload_bytes();
     if p.len() < 15 {
