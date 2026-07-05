@@ -4154,6 +4154,17 @@ fn net_status(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
                 p[1], p[2], p[3], p[4], p[5], p[6],
                 if p[0] == 1 { "ok" } else { "TIMEOUT (MMIO not reaching the chip)" }));
         }
+        // Extended status (RTL8168 Stage B, 15 bytes): live link + TX/RX counts, so the TV shows the
+        // whole bring-up story without the serial log.
+        if p.len() >= 15 {
+            let rx_len = u16::from_le_bytes([p[9], p[10]]);
+            let tx_cnt = u16::from_le_bytes([p[11], p[12]]);
+            let rx_cnt = u16::from_le_bytes([p[13], p[14]]);
+            out.line_fmt(ctx, format_args!(
+                "nic-link {}  |  tx {} ({} sent)  |  rx {}B ({} recv)",
+                if p[7] != 0 { "UP" } else { "down (no cable/PHY)" },
+                if p[8] != 0 { "ok" } else { "TIMEOUT" }, tx_cnt, rx_len, rx_cnt));
+        }
     }
 
     // net-stack is NOT a wired send-peer, so the first request can miss the cap cache. The shell holds

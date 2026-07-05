@@ -201,20 +201,31 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
         "nic-driver: RTL8168 C+ TX/RX rings up (link {}) - serving real frames",
         if link_up { "UP" } else { "down (no cable?)" }));
 
-    let mut sreply = [0u8; 7];
-    sreply[0] = reset_ok as u8;
-    sreply[1..7].copy_from_slice(mac);
-
     let mut rxbuf = [0u8; FRAME_MAX];
     let mut tx_idx = 0usize;
     let mut rx_idx = 0usize;
-    let mut diag = true; // log the first real frame's TX/RX outcome once, for blind bring-up
+    // Live stats surfaced through the [3] status query so `net` shows link/TX/RX on the TV (no serial).
+    let mut last_tx_done = false;
+    let mut last_rx_len  = 0u16;
+    let mut tx_count     = 0u16;
+    let mut rx_count     = 0u16;
     loop {
         let req = ctx.recv();
         let reply_cap = match ctx.take_pending_cap() { Some(c) => c, None => continue };
         // [3] STATUS query (the `net` nic-mac diagnostic) - answer the MAC, do NOT treat it as a frame.
         if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 3 } {
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&sreply));
+            // Fresh 15-byte status: reset_ok, mac(6), CURRENT link, last-TX-done, last-RX len, TX/RX
+            // counts. The link is read LIVE (it negotiates over a few seconds after reset).
+            let link_up = mmio.read8(RTL_PHYSTATUS) & 0x02 != 0;
+            let mut s = [0u8; 15];
+            s[0] = reset_ok as u8;
+            s[1..7].copy_from_slice(mac);
+            s[7]  = link_up as u8;
+            s[8]  = last_tx_done as u8;
+            s[9..11].copy_from_slice(&last_rx_len.to_le_bytes());
+            s[11..13].copy_from_slice(&tx_count.to_le_bytes());
+            s[13..15].copy_from_slice(&rx_count.to_le_bytes());
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&s));
             ctx.remove_cap(reply_cap);
             continue;
         }
@@ -262,12 +273,9 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
             ctx.yield_cpu();
             rs += 1;
         }
-        if diag {
-            ctx.log_fmt(format_args!(
-                "nic-driver: RTL8168 first frame - TX {} ({}B), RX {}B",
-                if tx_done { "done" } else { "TIMEOUT" }, flen, n));
-            diag = false;
-        }
+        last_tx_done = tx_done;
+        tx_count = tx_count.saturating_add(1);
+        if n > 0 { last_rx_len = n as u16; rx_count = rx_count.saturating_add(1); }
 
         let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n]));
         ctx.remove_cap(reply_cap);
