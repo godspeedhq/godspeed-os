@@ -255,6 +255,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
                 rs += 1;
             }
             if n > 0 { last_rx_len = n as u16; rx_count = rx_count.saturating_add(1); }
+            ctx.log_fmt(format_args!("nic: rx4 rx_it={} n={}", rs, n));   // DIAGNOSTIC (serial)
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n]));
             ctx.remove_cap(reply_cap);
             continue;
@@ -312,6 +313,11 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
         last_tx_done = tx_done;
         tx_count = tx_count.saturating_add(1);
         if n > 0 { last_rx_len = n as u16; rx_count = rx_count.saturating_add(1); }
+
+        // DIAGNOSTIC (serial): what did this frame request actually do? tx_it near TX_POLL_MAX => the TX
+        // wedged; rx_it near RX_POLL_MAX with n=0 => the receiver captured nothing.
+        ctx.log_fmt(format_args!("nic: frame len={} tx_it={} tx_ok={} rx_it={} n={}",
+            flen, ts, tx_done, rs, n));
 
         let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n]));
         ctx.remove_cap(reply_cap);
