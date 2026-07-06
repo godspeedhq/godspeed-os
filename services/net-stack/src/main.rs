@@ -470,11 +470,22 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         } else if pl.first() == Some(&1) {
             // DNS request (byte 0 = 1, then the hostname) - net-stack-internal resolution.
-            let mut got_reply = false;
-            let ip = if have_mac { dns_resolve(&ctx, &pl[1..], &gw_mac, &our_ip, &dns_server, &mut got_reply) } else { None };
+            // Try the DHCP-learned server, then a public fallback (8.8.8.8). A home router may do DHCP +
+            // ICMP but NOT run a DNS forwarder on its LAN IP (the T630: 192.168.4.1 answered ping but was
+            // silent on 53), so fall back to a public resolver reached through the gateway.
+            let mut any_reply = false;
+            let mut ip = None;
+            if have_mac {
+                for server in [dns_server, [8, 8, 8, 8]] {
+                    let mut got = false;
+                    ip = dns_resolve(&ctx, &pl[1..], &gw_mac, &our_ip, &server, &mut got);
+                    any_reply |= got;
+                    if ip.is_some() { break; }
+                }
+            }
             let mut rb = [0u8; 5];
             if let Some(a) = ip { rb[0] = 1; rb[1..5].copy_from_slice(&a); }
-            else if got_reply { rb[0] = 2; }   // the DNS server replied, but no A record
+            else if any_reply { rb[0] = 2; }   // a server replied, but no A record
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rb));
         } else {
             // Status request (default): reply the frozen 15-byte record.
