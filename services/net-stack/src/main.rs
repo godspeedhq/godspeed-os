@@ -218,14 +218,6 @@ fn dns_resolve(ctx: &ServiceContext, hostname: &[u8], gw_mac: &[u8; 6], our_ip: 
             if !f.is_empty() {
                 *frames += 1;
                 if f.len() >= 24 && f[23] == 17 { *udp += 1; }
-                // DIAGNOSTIC (serial): ARP shows oper + who it asks for; IPv4 shows proto/src/L4 dport.
-                if f.len() >= 42 && f[12] == 0x08 && f[13] == 0x06 {
-                    ctx.log_fmt(format_args!("ns dns-rx ARP oper={} tgt={}.{}.{}.{}",
-                        f[21], f[38], f[39], f[40], f[41]));
-                } else if f.len() >= 38 {
-                    ctx.log_fmt(format_args!("ns dns-rx et={:02x}{:02x} p={} src={}.{}.{}.{} dp={:02x}{:02x}",
-                        f[12], f[13], f[23], f[26], f[27], f[28], f[29], f[36], f[37]));
-                }
             }
             // IPv4/UDP to OUR DNS query port (49153)?
             let m = f.len() >= D + 12 && f[12] == 0x08 && f[13] == 0x00 && f[23] == 17
@@ -269,7 +261,6 @@ fn dns_resolve(ctx: &ServiceContext, hostname: &[u8], gw_mac: &[u8; 6], our_ip: 
         // Not our reply. If we owe an ARP reply (the gateway asked for us), send it - its request also
         // returns the next frame; otherwise collect the NEXT frame WITHOUT re-TX.
         reply = if answer_arp {
-            ctx.log("ns arp-answer: told the asker our MAC");
             ctx.request_with_reply_deadline("nic-driver", &Message::from_bytes(&arp_out), DANCE_SECS)
         } else {
             ctx.request_with_reply_deadline("nic-driver", &rx_only, DANCE_SECS)
@@ -396,17 +387,7 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8;
     for _ in 0..DNS_RX_TRIES {
         let (matched, answer_arp) = {
             let f: &[u8] = match &reply { Some(r) => r.payload_bytes(), None => { *timeouts += 1; &[] } };
-            if !f.is_empty() {
-                *frames += 1;
-                // DIAGNOSTIC (serial): ARP shows oper + who it asks for; IPv4 shows proto/src/icmp-type.
-                if f.len() >= 42 && f[12] == 0x08 && f[13] == 0x06 {
-                    ctx.log_fmt(format_args!("ns ping-rx ARP oper={} tgt={}.{}.{}.{}",
-                        f[21], f[38], f[39], f[40], f[41]));
-                } else if f.len() >= 38 {
-                    ctx.log_fmt(format_args!("ns ping-rx et={:02x}{:02x} p={} src={}.{}.{}.{} icmp={:02x}{:02x}",
-                        f[12], f[13], f[23], f[26], f[27], f[28], f[29], f[34], f[35]));
-                }
-            }
+            if !f.is_empty() { *frames += 1; }
             // Echo REPLY (type 0) from dest_ip. Match the source so a gateway ping and an internet ping
             // cannot be confused, and skip stray frames.
             let m = f.len() >= 42 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45
@@ -419,7 +400,6 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8;
         if matched { return true; }
         // Owe an ARP reply? Send it (its request also returns the next frame). Else just poll RX-only.
         reply = if answer_arp {
-            ctx.log("ns arp-answer: told the asker our MAC");
             ctx.request_with_reply_deadline("nic-driver", &Message::from_bytes(&arp_out), DANCE_SECS)
         } else {
             ctx.request_with_reply_deadline("nic-driver", &rx_only, DANCE_SECS)
