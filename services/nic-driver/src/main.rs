@@ -80,7 +80,9 @@ const RX_BUF_SIZE:   usize = 2048;
 // correctness-by-time Commandment VIII forbids): wait on the TRUTH of a bit, give up LOUDLY.
 const RESET_POLL_MAX: u32 = 1_000_000;
 const TX_POLL_MAX:    u32 = 1_000_000;
-const RX_POLL_MAX:    u32 = 1_000_000; // a reply arrives in ms (caught in the first iterations); a miss gives up loudly
+const RX_POLL_MAX:    u32 = 50_000;    // a reply arrives in ms (caught in the first hundreds of iterations);
+                                       // a MISS must give up FAST so a no-reply frame (e.g. a silent DNS
+                                       // server) does not stall nic-driver and back up its inbound queue
 
 const FRAME_MAX: usize = 1600; // one Ethernet frame (<= 1518) with headroom
 

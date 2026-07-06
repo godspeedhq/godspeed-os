@@ -147,7 +147,9 @@ fn dhcp_discover(ctx: &ServiceContext) -> Option<([u8; 4], [u8; 4], [u8; 4])> {
 /// IP, or None (no gateway, malformed name, or no answer - DNS depends on the host's resolver, which
 /// slirp forwards to, so a failure here is a real "no answer", not a bug).
 fn dns_resolve(ctx: &ServiceContext, hostname: &[u8], gw_mac: &[u8; 6], our_ip: &[u8; 4],
-               dns_server: &[u8; 4]) -> Option<[u8; 4]> {
+               dns_server: &[u8; 4], got_reply: &mut bool) -> Option<[u8; 4]> {
+    *got_reply = false;   // set true once a matching DNS reply arrives - lets the caller tell
+                          // "server did not reply" from "server replied but had no A record".
     let mut frame = [0u8; 512];
     // Ethernet: to the gateway; slirp routes the datagram to its DNS at 10.0.2.3.
     frame[0..6].copy_from_slice(gw_mac);
@@ -208,6 +210,7 @@ fn dns_resolve(ctx: &ServiceContext, hostname: &[u8], gw_mac: &[u8; 6], our_ip: 
             || f[36] != 0x14 || f[37] != 0xe9 {
             continue;
         }
+        *got_reply = true;   // a matching DNS reply arrived (whatever it contains)
         let ancount = ((f[D + 6] as usize) << 8) | (f[D + 7] as usize);
         if ancount == 0 { return None; }
         // Skip the echoed question: QNAME (labels to 0, or a compression pointer) + QTYPE + QCLASS.
@@ -467,9 +470,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         } else if pl.first() == Some(&1) {
             // DNS request (byte 0 = 1, then the hostname) - net-stack-internal resolution.
-            let ip = if have_mac { dns_resolve(&ctx, &pl[1..], &gw_mac, &our_ip, &dns_server) } else { None };
+            let mut got_reply = false;
+            let ip = if have_mac { dns_resolve(&ctx, &pl[1..], &gw_mac, &our_ip, &dns_server, &mut got_reply) } else { None };
             let mut rb = [0u8; 5];
             if let Some(a) = ip { rb[0] = 1; rb[1..5].copy_from_slice(&a); }
+            else if got_reply { rb[0] = 2; }   // the DNS server replied, but no A record
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rb));
         } else {
             // Status request (default): reply the frozen 15-byte record.

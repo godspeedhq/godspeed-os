@@ -4124,8 +4124,10 @@ fn net_dns(ctx: &ServiceContext, host: &str, out: &mut Out) -> Result<(), ShellE
     let p = reply.payload_bytes();
     if p.len() >= 5 && p[0] == 1 {
         out.line_fmt(ctx, format_args!("{} is {}.{}.{}.{}", host, p[1], p[2], p[3], p[4]));
+    } else if p.first() == Some(&2) {
+        out.line_fmt(ctx, format_args!("{}: the DNS server replied but returned no A record", host));
     } else {
-        out.line_fmt(ctx, format_args!("{}: no answer (no A record, or the DNS server did not reply)", host));
+        out.line_fmt(ctx, format_args!("{}: no reply from the DNS server (see `net`'s dns line)", host));
     }
     Ok(())
 }
