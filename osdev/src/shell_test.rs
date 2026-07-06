@@ -208,6 +208,14 @@ pub fn run(image_path: &Path, smp: u32) {
     check!(dns_out.contains("example.com is ") || dns_out.contains("example.com: no answer"),
            "net dns: resolves a hostname or reports no-answer cleanly (DNS via slirp)");
 
+    // ping <ip>: ICMP echo to a raw IPv4, no DNS. Runs through net-stack's serve loop (unlike the boot
+    // dance), so it doubles as a check that the post-boot request path works. 10.0.2.2 is slirp's gateway
+    // (it answered ICMP during the dance). Lenient: alive OR a clean no-reply, never a hang.
+    send(&mut write_half, b"ping 10.0.2.2\r");
+    let ping_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)).unwrap_or_default();
+    check!(ping_out.contains("10.0.2.2 is alive") || ping_out.contains("10.0.2.2: no reply"),
+           "ping: ICMP echo to a raw IP runs end to end (ping <gateway>)");
+
     // sock (utilities/41_sock.md): a UDP socket as a CAPABILITY. The shell opens a socket cap from
     // net-stack and sends a datagram THROUGH it - proving a socket is a real kernel cap (§7.10) the
     // client holds and invokes, not an ambient channel. Lenient on the UDP response (external), but

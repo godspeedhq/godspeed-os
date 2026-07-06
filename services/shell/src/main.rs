@@ -1004,6 +1004,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         "cores"   => cmd_cores(ctx, out),
         "date"    => cmd_date(ctx, if argc >= 2 { args[1] } else { "" }, out),
         "net"     => cmd_net(ctx, s["net".len()..].trim(), out),
+        "ping"    => cmd_ping(ctx, s["ping".len()..].trim(), out),
         "sock"    => cmd_sock(ctx, out),
         "uptime"  => cmd_uptime(ctx),
         "status"  => cmd_status(ctx),
@@ -4076,6 +4077,59 @@ fn cmd_date(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
 
 /// `net` - network status + DNS, brokered from the `net-stack` service (utilities/40_net.md). Dispatches
 /// `net` (status) vs `net dns <host>` (resolve a hostname). A pipe PRODUCER: `net | write /f`.
+/// Parse "a.b.c.d" into 4 octets (no_std, no allocation). None if not a well-formed IPv4 literal.
+fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+    let mut out = [0u8; 4];
+    let mut n = 0usize;
+    for part in s.split('.') {
+        if n >= 4 || part.is_empty() || part.len() > 3 { return None; }
+        let mut v: u32 = 0;
+        for b in part.bytes() {
+            if !b.is_ascii_digit() { return None; }
+            v = v * 10 + (b - b'0') as u32;
+        }
+        if v > 255 { return None; }
+        out[n] = v as u8;
+        n += 1;
+    }
+    if n == 4 { Some(out) } else { None }
+}
+
+/// `ping <ip>` - send one ICMP echo to a raw IPv4 via net-stack and report if it answers. No DNS. Runs
+/// through net-stack's serve loop, so `ping <gateway>` also proves the post-boot request path works.
+fn cmd_ping(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+    let host = arg.trim();
+    if host.is_empty() {
+        ctx.console_writeln("usage: ping <ip>   e.g. ping 8.8.8.8   (a raw IPv4; names need DNS)");
+        return Ok(());
+    }
+    let ip = match parse_ipv4(host) {
+        Some(ip) => ip,
+        None => {
+            out.line_fmt(ctx, format_args!("ping: '{}' is not an IPv4 address - try a raw IP like 8.8.8.8 (names need DNS)", host));
+            return Ok(());
+        }
+    };
+    let msg = Message::from_bytes(&[3, ip[0], ip[1], ip[2], ip[3]]);
+    ctx.console_writeln("ping: sending echo request ...");
+    let reply = match ctx.request_with_reply("net-stack", &msg) {
+        Some(r) => Some(r),
+        None => if ctx.reacquire_by_name("net-stack") { ctx.request_with_reply("net-stack", &msg) } else { None },
+    };
+    let reply = match reply {
+        Some(r) => r,
+        None => { ctx.console_writeln("ping: net-stack unavailable"); return Err(ShellError::Unknown); }
+    };
+    let p = reply.payload_bytes();
+    if p.first() == Some(&1) {
+        out.line_fmt(ctx, format_args!("{}.{}.{}.{} is alive (ICMP echo reply)", ip[0], ip[1], ip[2], ip[3]));
+    } else {
+        let (fr, to) = if p.len() >= 3 { (p[1], p[2]) } else { (0, 0) };
+        out.line_fmt(ctx, format_args!("{}.{}.{}.{}: no reply ({} frames, {} timeouts)", ip[0], ip[1], ip[2], ip[3], fr, to));
+    }
+    Ok(())
+}
+
 fn cmd_net(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     let arg = arg.trim();
     if arg == "dns" {

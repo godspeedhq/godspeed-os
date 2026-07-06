@@ -314,7 +314,8 @@ fn udp_roundtrip(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], src_p
 
 /// Send an ICMP echo request to `dest_ip` (via the gateway's MAC) and return true if the matching echo
 /// REPLY comes back. Used to probe the gateway (LAN) and a public IP (internet reachability through NAT).
-fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8; 4]) -> bool {
+fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8; 4],
+        frames: &mut u16, timeouts: &mut u16) -> bool {
     let mut frame = [0u8; 50];
     frame[0..6].copy_from_slice(gw_mac);
     frame[6..12].copy_from_slice(&OUR_MAC);
@@ -341,6 +342,7 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8;
         match ctx.request_with_reply_deadline("nic-driver", &req, DANCE_SECS) {
             Some(reply) => {
                 let f = reply.payload_bytes();
+                if !f.is_empty() { *frames += 1; }
                 // Echo REPLY (type 0) FROM dest_ip. Match the source so a gateway ping and an internet
                 // ping cannot be confused, and skip stray frames.
                 if f.len() >= 42 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45
@@ -349,7 +351,7 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8;
                     return true;
                 }
             }
-            None => { ctx.reacquire_by_name("nic-driver"); }
+            None => { *timeouts += 1; ctx.reacquire_by_name("nic-driver"); }
         }
     }
     false
@@ -411,7 +413,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // ---- Phase 2 step 2: ICMP - ping the gateway, then a public IP (8.8.8.8) THROUGH the gateway to
     // probe internet reachability. Only once ARP gave us the gateway's MAC. internet_ok distinguishes
     // "no internet / the gateway does not route out" from a DNS-specific failure.
-    let ping_ok = have_mac && ping(&ctx, &gw_mac, &our_ip, &gateway);
+    let (mut _pf, mut _pt) = (0u16, 0u16);
+    let ping_ok = have_mac && ping(&ctx, &gw_mac, &our_ip, &gateway, &mut _pf, &mut _pt);
     if ping_ok {
         ctx.log_fmt(format_args!("net-stack: ICMP - {}.{}.{}.{} echo reply (ping OK)",
             gateway[0], gateway[1], gateway[2], gateway[3]));
@@ -499,6 +502,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             rb[5] = frames.min(255) as u8;
             rb[6] = udp.min(255) as u8;
             rb[7] = timeouts.min(255) as u8;
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rb));
+        } else if pl.first() == Some(&3) && pl.len() >= 5 {
+            // Ping an IP (byte 0 = 3, then 4 IP bytes): ICMP echo, no DNS. Reuses the gateway-ping path,
+            // but runs HERE in the serve loop - so `ping <gateway>` proves the post-boot request path
+            // works, and `ping 8.8.8.8` probes the internet directly. Reply: [alive, frames, timeouts].
+            let dip = [pl[1], pl[2], pl[3], pl[4]];
+            let mut frames = 0u16;
+            let mut timeouts = 0u16;
+            let alive = have_mac && ping(&ctx, &gw_mac, &our_ip, &dip, &mut frames, &mut timeouts);
+            let rb = [alive as u8, frames.min(255) as u8, timeouts.min(255) as u8];
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rb));
         } else {
             // Status request (default): reply the frozen 15-byte record.
