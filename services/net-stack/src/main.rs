@@ -151,9 +151,10 @@ fn dhcp_discover(ctx: &ServiceContext) -> Option<([u8; 4], [u8; 4], [u8; 4])> {
 /// slirp forwards to, so a failure here is a real "no answer", not a bug).
 fn dns_resolve(ctx: &ServiceContext, hostname: &[u8], gw_mac: &[u8; 6], our_ip: &[u8; 4],
                dns_server: &[u8; 4], got_reply: &mut bool,
-               frames: &mut u16, udp: &mut u16) -> Option<[u8; 4]> {
-    // frames/udp accumulate a DIAGNOSTIC: how many non-empty frames we collected and how many were UDP -
-    // so `net dns` can tell "no reply arrived at all" from "replies arrived but did not match our port".
+               frames: &mut u16, udp: &mut u16, timeouts: &mut u16) -> Option<[u8; 4]> {
+    // frames/udp/timeouts accumulate a DIAGNOSTIC: non-empty frames collected, how many were UDP, and how
+    // many nic-driver requests TIMED OUT (net-stack's deadline fired before nic-driver replied). Timeouts
+    // dominating => the deadline is too short (a timing bug); empties dominating => the receiver is dead.
     *got_reply = false;   // set true once a matching DNS reply arrives - lets the caller tell
                           // "server did not reply" from "server replied but had no A record".
     let mut frame = [0u8; 512];
@@ -212,7 +213,7 @@ fn dns_resolve(ctx: &ServiceContext, hostname: &[u8], gw_mac: &[u8; 6], our_ip: 
     let mut reply = ctx.request_with_reply_deadline("nic-driver", &req, DANCE_SECS);
     for _ in 0..DNS_RX_TRIES {
         let matched = {
-            let f: &[u8] = match &reply { Some(r) => r.payload_bytes(), None => &[] };
+            let f: &[u8] = match &reply { Some(r) => r.payload_bytes(), None => { *timeouts += 1; &[] } };
             if !f.is_empty() { *frames += 1; if f.len() >= 24 && f[23] == 17 { *udp += 1; } }
             // IPv4/UDP to OUR DNS query port (49153)?
             f.len() >= D + 12 && f[12] == 0x08 && f[13] == 0x00 && f[23] == 17
@@ -480,21 +481,24 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // silent on 53), so fall back to a public resolver reached through the gateway.
             let mut any_reply = false;
             let mut ip = None;
-            let mut frames = 0u16;   // DIAGNOSTIC: non-empty frames collected across both servers
-            let mut udp = 0u16;      //   ... and how many were UDP - surfaced in `net dns`'s no-reply line
+            let mut frames = 0u16;    // DIAGNOSTIC: non-empty frames collected across both servers
+            let mut udp = 0u16;       //   ... how many were UDP
+            let mut timeouts = 0u16;  //   ... how many nic-driver requests timed out (deadline vs poll)
             if have_mac {
                 for server in [dns_server, [8, 8, 8, 8]] {
                     let mut got = false;
-                    ip = dns_resolve(&ctx, &pl[1..], &gw_mac, &our_ip, &server, &mut got, &mut frames, &mut udp);
+                    ip = dns_resolve(&ctx, &pl[1..], &gw_mac, &our_ip, &server, &mut got,
+                                     &mut frames, &mut udp, &mut timeouts);
                     any_reply |= got;
                     if ip.is_some() { break; }
                 }
             }
-            let mut rb = [0u8; 7];
+            let mut rb = [0u8; 8];
             if let Some(a) = ip { rb[0] = 1; rb[1..5].copy_from_slice(&a); }
             else if any_reply { rb[0] = 2; }   // a server replied, but no A record
             rb[5] = frames.min(255) as u8;
             rb[6] = udp.min(255) as u8;
+            rb[7] = timeouts.min(255) as u8;
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rb));
         } else {
             // Status request (default): reply the frozen 15-byte record.
