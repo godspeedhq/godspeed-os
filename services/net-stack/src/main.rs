@@ -190,8 +190,9 @@ fn dns_resolve(ctx: &ServiceContext, hostname: &[u8], gw_mac: &[u8; 6], our_ip: 
     frame[30..34].copy_from_slice(dns_server);       // dst = the DHCP-learned DNS server
     let ip_ck = checksum(&frame[14..34]);
     frame[24] = (ip_ck >> 8) as u8; frame[25] = ip_ck as u8;
-    // --- UDP header (src port 5353, dst port 53; checksum 0 = optional over IPv4).
-    frame[34] = 0x14; frame[35] = 0xe9;
+    // --- UDP header (src port 49153 - a PRIVATE port, deliberately NOT 5353/mDNS: a live LAN's constant
+    // mDNS traffic to port 5353 would otherwise get matched as our DNS reply; dst port 53; cksum 0 opt).
+    frame[34] = 0xc0; frame[35] = 0x01;
     frame[36] = 0x00; frame[37] = 0x35;
     let udp_len = (8 + dns_len) as u16;
     frame[38] = (udp_len >> 8) as u8; frame[39] = udp_len as u8;
@@ -205,9 +206,9 @@ fn dns_resolve(ctx: &ServiceContext, hostname: &[u8], gw_mac: &[u8; 6], our_ip: 
             None => { ctx.reacquire_by_name("nic-driver"); continue; }
         };
         let f = reply.payload_bytes();
-        // IPv4/UDP to our DNS query port. Skip stray frames and keep waiting.
+        // IPv4/UDP to OUR DNS query port (49153). Skip stray frames - incl. mDNS on 5353 - keep waiting.
         if f.len() < D + 12 || f[12] != 0x08 || f[13] != 0x00 || f[23] != 17
-            || f[36] != 0x14 || f[37] != 0xe9 {
+            || f[36] != 0xc0 || f[37] != 0x01 {
             continue;
         }
         *got_reply = true;   // a matching DNS reply arrived (whatever it contains)
