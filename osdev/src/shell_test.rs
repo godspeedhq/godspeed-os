@@ -208,6 +208,11 @@ pub fn run(image_path: &Path, smp: u32) {
     check!(dns_out.contains("example.com is ") || dns_out.contains("example.com: no answer"),
            "net dns: resolves a hostname or reports no-answer cleanly (DNS via slirp)");
 
+    // ping is a full utility (mirrors net): version/help self-documentation.
+    send(&mut write_half, b"ping version\r");
+    let pingver = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    check!(pingver.contains("ping 0.1.0"), "ping: version reports ping 0.1.0");
+
     // ping <ip>: ICMP echo to a raw IPv4, no DNS. Runs through net-stack's serve loop (unlike the boot
     // dance), so it doubles as a check that the post-boot request path works. 10.0.2.2 is slirp's gateway
     // (it answered ICMP during the dance). Lenient: alive OR a clean no-reply, never a hang.

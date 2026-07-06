@@ -3397,7 +3397,7 @@ const UTIL_VERSION: &str = "0.1.0";
 /// Utilities that self-document (gates the `help`/`version` intercept in `execute`).
 const UTILS: &[&str] = &[
     "help", "result", "run", "assert", "selfcheck",
-    "echo", "input", "clear", "about", "mem", "cores", "date", "net", "sock", "uptime", "status", "observe", "caps", "roster",
+    "echo", "input", "clear", "about", "mem", "cores", "date", "net", "ping", "sock", "uptime", "status", "observe", "caps", "roster",
     "spawn", "kill", "restart", "reboot", "chaos", "drives", "ls", "cd", "read", "write", "edit", "fcap",
     "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count", "sort",
     "first", "last",
@@ -3495,6 +3495,11 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("net", "IP, gateway (+MAC), and whether the gateway pings", "net"),
             ("net dns <host>", "resolve a hostname to an IPv4 address", "net dns example.com"),
             ("net | write <path>", "snapshot the status to a file", "net | write /netstat.txt"),
+        ], true),
+        "ping" => help_block(ctx, "ping", "ICMP echo to a raw IPv4 address (no DNS)", &[
+            ("ping <ip>", "send one ICMP echo request and report if the host answers", "ping 8.8.8.8"),
+            ("ping <gateway>", "reach your own gateway (from `net`'s gateway line)", "ping 192.168.4.1"),
+            ("ping <ip> | write <path>", "capture the result to a file", "ping 8.8.8.8 | write /ping.txt"),
         ], true),
         "sock" => help_block(ctx, "sock", "a UDP socket as a capability (demo)", &[
             ("sock", "open a socket cap, send a datagram through it, report the round-trip", "sock"),
@@ -3727,6 +3732,7 @@ static HELP: &[HelpRow] = &[
     Row("date [epoch]", "date + time; 'epoch' = secs since 1970"),
     Row("uptime", "how long the system has been up (records when piped)"),
     Row("net", "network status: IP, gateway, ping"),
+    Row("ping", "ICMP echo to a raw IP: ping 8.8.8.8"),
     Gap,
     Sec("Services"),
     Row("status", "list all live tasks"),
@@ -5406,7 +5412,7 @@ fn is_producer_builtin(name: &str) -> bool {
     // loudly as non-producers instead. To capture a big file for `edit`, append a simple producer
     // a few times: `help | write /big.txt; help | write append /big.txt; …`.
     matches!(name, "read" | "echo" | "tree" | "input"
-                 | "about" | "mem" | "cores" | "date" | "net" | "sock" | "help")
+                 | "about" | "mem" | "cores" | "date" | "net" | "ping" | "sock" | "help")
 }
 
 /// Producer SERVICES that emit without needing input, so they can start a pipe (and follow the
@@ -5437,6 +5443,7 @@ fn run_producer(ctx: &ServiceContext, cwd: &Cwd, cmdline: &str, out: &mut Out) {
         "cores"        => { let _ = cmd_cores(ctx, out); }
         "date"         => { let _ = cmd_date(ctx, arg, out); }
         "net"          => { let _ = cmd_net(ctx, arg, out); }
+        "ping"         => { let _ = cmd_ping(ctx, arg, out); }
         "sock"         => { let _ = cmd_sock(ctx, out); }
         "help"         => help_to_out(ctx, out),
         "input"        => run_input(ctx, arg, out),
