@@ -3497,10 +3497,11 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("net stats", "dump the NIC's raw registers (chip state: RE/RCR/RX ring)", "net stats"),
             ("net | write <path>", "snapshot the status to a file", "net | write /netstat.txt"),
         ], true),
-        "ping" => help_block(ctx, "ping", "ICMP echo to a raw IPv4 address (no DNS)", &[
-            ("ping <ip>", "send one ICMP echo request and report if the host answers", "ping 8.8.8.8"),
-            ("ping <gateway>", "reach your own gateway (from `net`'s gateway line)", "ping 192.168.4.1"),
-            ("ping <ip> | write <path>", "capture the result to a file", "ping 8.8.8.8 | write /ping.txt"),
+        "ping" => help_block(ctx, "ping", "continuous ICMP echo to a raw IPv4 address (no DNS)", &[
+            ("ping <ip>", "ping continuously (round-trip time + TTL per reply); q quits, then stats", "ping 192.168.4.1"),
+            ("ping count <N> <ip>", "send N echoes then stop and print statistics", "ping count 4 8.8.8.8"),
+            ("ping bytes <N> <ip>", "set the ICMP data size (default 32, max 1024)", "ping bytes 64 8.8.8.8"),
+            ("ping count <N> <ip> | write <path>", "capture a bounded run to a file", "ping count 4 8.8.8.8 | write /ping.txt"),
         ], true),
         "sock" => help_block(ctx, "sock", "a UDP socket as a capability (demo)", &[
             ("sock", "open a socket cap, send a datagram through it, report the round-trip", "sock"),
@@ -3733,7 +3734,7 @@ static HELP: &[HelpRow] = &[
     Row("date [epoch]", "date + time; 'epoch' = secs since 1970"),
     Row("uptime", "how long the system has been up (records when piped)"),
     Row("net", "network status: IP, gateway, ping"),
-    Row("ping", "ICMP echo to a raw IP: ping 8.8.8.8"),
+    Row("ping", "continuous ICMP echo (q quits): ping 8.8.8.8"),
     Gap,
     Sec("Services"),
     Row("status", "list all live tasks"),
@@ -4102,37 +4103,94 @@ fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     if n == 4 { Some(out) } else { None }
 }
 
-/// `ping <ip>` - send one ICMP echo to a raw IPv4 via net-stack and report if it answers. No DNS. Runs
-/// through net-stack's serve loop, so `ping <gateway>` also proves the post-boot request path works.
-fn cmd_ping(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellError> {
-    let host = arg.trim();
-    if host.is_empty() {
-        ctx.console_writeln("usage: ping <ip>   e.g. ping 8.8.8.8   (a raw IPv4; names need DNS)");
-        return Ok(());
-    }
-    let ip = match parse_ipv4(host) {
-        Some(ip) => ip,
-        None => {
-            out.line_fmt(ctx, format_args!("ping: '{}' is not an IPv4 address - try a raw IP like 8.8.8.8 (names need DNS)", host));
-            return Ok(());
+/// Spin ~`cycles` TSC cycles to pace continuous `ping`, returning early with `true` if the user presses
+/// `q`/`Q`/ESC so a quit is caught within one interval. `cycles == 0` (uncalibrated TSC) just polls once.
+fn ping_wait_or_quit(ctx: &ServiceContext, cycles: u64) -> bool {
+    let start = ctx.read_tsc();
+    loop {
+        if let Some(b) = ctx.try_console_read() {
+            if b == b'q' || b == b'Q' || b == 0x1b { return true; }
         }
+        if cycles == 0 || ctx.read_tsc().wrapping_sub(start) >= cycles { return false; }
+        ctx.yield_cpu();
+    }
+}
+
+/// `ping [bytes N] [count N] <ip>` - a Windows-style continuous ICMP echo to a raw IPv4, via net-stack.
+/// One `Reply from ...` line per echo (round-trip time + TTL), `q` quits, then a statistics summary.
+/// `count N` sends N and stops; `bytes N` sets the ICMP data size (default 32). No DNS - raw IP only.
+fn cmd_ping(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+    let usage = "usage: ping [bytes N] [count N] <ip>   e.g. ping 8.8.8.8   ping bytes 64 192.168.4.1   (q quits)";
+    let mut bytes: usize = 32;
+    let mut count: Option<u32> = None;
+    let mut ip_str: &str = "";
+    let mut toks = arg.split_whitespace();
+    while let Some(t) = toks.next() {
+        match t {
+            "bytes" | "size" => match toks.next().and_then(|s| s.parse::<usize>().ok()) {
+                Some(v) => bytes = v,
+                None => { ctx.console_writeln(usage); return Ok(()); }
+            },
+            "count" | "n" => match toks.next().and_then(|s| s.parse::<u32>().ok()) {
+                Some(v) => count = Some(v),
+                None => { ctx.console_writeln(usage); return Ok(()); }
+            },
+            other => ip_str = other,
+        }
+    }
+    if ip_str.is_empty() { ctx.console_writeln(usage); return Ok(()); }
+    let ip = match parse_ipv4(ip_str) {
+        Some(ip) => ip,
+        None => { out.line_fmt(ctx, format_args!("ping: '{}' is not an IPv4 address - try a raw IP like 8.8.8.8 (names need DNS)", ip_str)); return Ok(()); }
     };
-    let msg = Message::from_bytes(&[3, ip[0], ip[1], ip[2], ip[3]]);
-    ctx.console_writeln("ping: sending echo request ...");
-    let reply = match ctx.request_with_reply("net-stack", &msg) {
-        Some(r) => Some(r),
-        None => if ctx.reacquire_by_name("net-stack") { ctx.request_with_reply("net-stack", &msg) } else { None },
-    };
-    let reply = match reply {
-        Some(r) => r,
-        None => { ctx.console_writeln("ping: net-stack unavailable"); return Err(ShellError::Unknown); }
-    };
-    let p = reply.payload_bytes();
-    if p.first() == Some(&1) {
-        out.line_fmt(ctx, format_args!("{}.{}.{}.{} is alive (ICMP echo reply)", ip[0], ip[1], ip[2], ip[3]));
-    } else {
-        let (fr, to) = if p.len() >= 3 { (p[1], p[2]) } else { (0, 0) };
-        out.line_fmt(ctx, format_args!("{}.{}.{}.{}: no reply ({} frames, {} timeouts)", ip[0], ip[1], ip[2], ip[3], fr, to));
+    let b = bytes.min(1024);                          // matches net-stack's PING_MAX_PAYLOAD
+    let bl = (b as u16).to_le_bytes();
+    let msg = Message::from_bytes(&[3, ip[0], ip[1], ip[2], ip[3], bl[0], bl[1]]);
+    let interval = ctx.tsc_ticks_per_10ms().saturating_mul(100);   // ~1 second between echoes
+
+    out.line_fmt(ctx, format_args!("Pinging {}.{}.{}.{} with {} bytes of data:", ip[0], ip[1], ip[2], ip[3], b));
+
+    let mut sent = 0u32; let mut recv = 0u32;
+    let mut rmin = u16::MAX; let mut rmax = 0u16; let mut rsum = 0u64;
+    while count.map_or(true, |c| sent < c) {
+        sent += 1;
+        let reply = match ctx.request_with_reply("net-stack", &msg) {
+            Some(r) => Some(r),
+            None => if ctx.reacquire_by_name("net-stack") { ctx.request_with_reply("net-stack", &msg) } else { None },
+        };
+        match reply {
+            Some(r) => {
+                let p = r.payload_bytes();
+                if p.first() == Some(&1) && p.len() >= 4 {
+                    let rtt = u16::from_le_bytes([p[1], p[2]]);
+                    let ttl = p[3];
+                    recv += 1;
+                    if rtt < rmin { rmin = rtt; }
+                    if rtt > rmax { rmax = rtt; }
+                    rsum += rtt as u64;
+                    if rtt == 0 {
+                        out.line_fmt(ctx, format_args!("Reply from {}.{}.{}.{}: bytes={} time<1ms TTL={}", ip[0], ip[1], ip[2], ip[3], b, ttl));
+                    } else {
+                        out.line_fmt(ctx, format_args!("Reply from {}.{}.{}.{}: bytes={} time={}ms TTL={}", ip[0], ip[1], ip[2], ip[3], b, rtt, ttl));
+                    }
+                } else {
+                    out.line_fmt(ctx, format_args!("Request timed out."));
+                }
+            }
+            None => { out.line_fmt(ctx, format_args!("ping: net-stack unavailable")); break; }
+        }
+        if count.map_or(false, |c| sent >= c) { break; }   // last echo done: no trailing interval
+        if ping_wait_or_quit(ctx, interval) { break; }      // q/ESC during the ~1s pace
+    }
+
+    let lost = sent.saturating_sub(recv);
+    let loss = if sent > 0 { lost * 100 / sent } else { 0 };
+    out.line_fmt(ctx, format_args!(""));
+    out.line_fmt(ctx, format_args!("Ping statistics for {}.{}.{}.{}:", ip[0], ip[1], ip[2], ip[3]));
+    out.line_fmt(ctx, format_args!("    Packets: Sent = {}, Received = {}, Lost = {} ({}% loss)", sent, recv, lost, loss));
+    if recv > 0 {
+        out.line_fmt(ctx, format_args!("Approximate round trip times in milli-seconds:"));
+        out.line_fmt(ctx, format_args!("    Minimum = {}ms, Maximum = {}ms, Average = {}ms", rmin, rmax, rsum / recv as u64));
     }
     Ok(())
 }

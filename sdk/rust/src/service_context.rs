@@ -796,6 +796,16 @@ impl ServiceContext {
         if ret < 0 { 0 } else { ret as u64 }
     }
 
+    /// TSC ticks per 10 ms, from the kernel's boot-time CPUID calibration (InspectKernel query 16).
+    /// Convert a TSC delta to milliseconds with `delta_cycles * 10 / tsc_ticks_per_10ms()`. Returns 0
+    /// if the TSC was not calibrated (callers should then skip the millisecond conversion). `ping` uses
+    /// it to report round-trip time.
+    pub fn tsc_ticks_per_10ms(&self) -> u64 {
+        // SAFETY: syscall(13) = InspectKernel; query_id=16 = TSC ticks per 10 ms quantum.
+        let ret = unsafe { raw_syscall(13, 16, 0, 0) };
+        if ret < 0 { 0 } else { ret as u64 }
+    }
+
     /// Read the hardware real-time clock (wall-clock date/time) via the kernel.
     ///
     /// Ambient - the time of day is task-neutral hardware info, like the TSC.

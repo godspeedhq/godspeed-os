@@ -1277,7 +1277,7 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     // boot/RTC reads (10, 11). Every other query discloses another task's or
     // system-wide state and requires the INTROSPECT capability with READ (§3.1;
     // docs/introspection-capability.md).
-    if !matches!(query_id, 0 | 3 | 9 | 10 | 11 | 12 | 13 | 14 | 15)
+    if !matches!(query_id, 0 | 3 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16)
         && !scheduler::current_task_holds_resource(
             crate::capability::INTROSPECT_RESOURCE, Rights::READ)
     {
@@ -1312,6 +1312,10 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // NIC MMIO base (the register-space BAR the PCI scan chose), 0 if none. Ungated hardware fact;
         // a diagnostic for the driver (which BAR did the memory-BAR scan pick). Networking Phase 4.
         15 => crate::arch::x86_64::pci::NIC_MMIO_BASE.load(core::sync::atomic::Ordering::Relaxed) as i64,
+        // TSC ticks per 10 ms quantum, from the boot-time CPUID calibration (boot.rs). Ungated,
+        // task-neutral timing (like the raw TSC, query 3): userspace turns a TSC delta into milliseconds
+        // as `delta * 10 / this`. `ping` uses it for round-trip time. 0 if the TSC was not calibrated.
+        16 => crate::arch::x86_64::boot::tsc_ticks_per_quantum() as i64,
         4 => crate::memory::allocator::free_frame_count() as i64,
         5 => crate::memory::allocator::total_frame_count() as i64,
         6 => scheduler::core_active_ticks(arg1 as usize) as i64,

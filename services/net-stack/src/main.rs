@@ -59,6 +59,8 @@ const DANCE_TRIES: u32 = 6;
 // DNS collects frames after ONE query TX (the [4] RX-only path): up to this many frames pulled without
 // re-transmitting, so a reply behind stray broadcasts is caught (a re-TX would drain+discard it).
 const DNS_RX_TRIES: u32 = 12;
+/// Max ICMP echo DATA bytes `ping` will send (the Windows default is 32). Bounds the frame buffer.
+const PING_MAX_PAYLOAD: usize = 1024;
 
 /// Phase 3: a DHCP DISCOVER over UDP - ask QEMU slirp's built-in DHCP server for our IP and read the
 /// OFFER. This proves the UDP transport (the layer the socket capability sits on) over the frame
@@ -354,38 +356,44 @@ fn build_arp_reply(f: &[u8], our_ip: &[u8; 4], out: &mut [u8; 42]) -> bool {
     true
 }
 
+/// Send one ICMP echo of `payload_len` data bytes to `dest_ip` and wait for the reply. Returns
+/// `Some((rtt_ms, reply_ttl))` on an echo reply, `None` on timeout. The round trip is timed with the TSC
+/// and converted to milliseconds via the kernel's boot-calibrated ticks-per-10ms (0 -> reported as 0).
+/// Sends ONCE then RX-only polls ([4]) so a reply behind stray broadcasts is caught without re-TX.
 fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8; 4],
-        frames: &mut u16, timeouts: &mut u16) -> bool {
-    let mut frame = [0u8; 50];
+        payload_len: usize, frames: &mut u16, timeouts: &mut u16) -> Option<(u16, u8)> {
+    let plen = payload_len.min(PING_MAX_PAYLOAD);
+    let flen = 42 + plen;
+    let mut frame = [0u8; 42 + PING_MAX_PAYLOAD];
     frame[0..6].copy_from_slice(gw_mac);
     frame[6..12].copy_from_slice(&OUR_MAC);
     frame[12] = 0x08; frame[13] = 0x00;              // IPv4
     frame[14] = 0x45;
-    let total_len: u16 = 20 + 8 + 8;
+    let total_len = (20 + 8 + plen) as u16;
     frame[16] = (total_len >> 8) as u8; frame[17] = total_len as u8;
     frame[18] = 0x00; frame[19] = 0x01;
-    frame[22] = 64;                                  // TTL
+    frame[22] = 64;                                  // TTL (ours, outbound)
     frame[23] = 1;                                   // ICMP
     frame[26..30].copy_from_slice(our_ip);
     frame[30..34].copy_from_slice(dest_ip);
     let ip_ck = checksum(&frame[14..34]);
     frame[24] = (ip_ck >> 8) as u8; frame[25] = ip_ck as u8;
     frame[34] = 8;                                   // echo request
-    frame[38] = 0x00; frame[39] = 0x01;
-    frame[40] = 0x00; frame[41] = 0x01;
-    for i in 0..8 { frame[42 + i] = b"godspeed"[i]; }
-    let icmp_ck = checksum(&frame[34..50]);
+    frame[38] = 0x00; frame[39] = 0x01;              // id
+    frame[40] = 0x00; frame[41] = 0x01;              // seq
+    // Data pattern (Windows sends the lowercase alphabet cycling); the reply echoes it back.
+    for i in 0..plen { frame[42 + i] = b'a' + (i % 23) as u8; }
+    let icmp_ck = checksum(&frame[34..42 + plen]);
     frame[36] = (icmp_ck >> 8) as u8; frame[37] = icmp_ck as u8;
 
-    // Send the echo request ONCE, then RX-ONLY poll ([4]) for subsequent frames - so the echo reply
-    // arriving BEHIND stray broadcasts (an ARP flood on a busy LAN) is caught WITHOUT re-transmitting; a
-    // re-TX drains+discards the reply (why the old retry loop only ever saw ARP). Mirrors dns_resolve.
-    let req     = Message::from_bytes(&frame);
+    let ticks10 = ctx.tsc_ticks_per_10ms();
+    let t1 = ctx.read_tsc();
+    let req     = Message::from_bytes(&frame[..flen]);
     let rx_only = Message::from_bytes(&[4u8]);
     let mut arp_out = [0u8; 42];
     let mut reply = ctx.request_with_reply_deadline("nic-driver", &req, DANCE_SECS);
     for _ in 0..DNS_RX_TRIES {
-        let (matched, answer_arp) = {
+        let (matched, ttl, answer_arp) = {
             let f: &[u8] = match &reply { Some(r) => r.payload_bytes(), None => { *timeouts += 1; &[] } };
             if !f.is_empty() { *frames += 1; }
             // Echo REPLY (type 0) from dest_ip. Match the source so a gateway ping and an internet ping
@@ -393,11 +401,16 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8;
             let m = f.len() >= 42 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45
                 && f[23] == 1 && f[34] == 0
                 && f[26] == dest_ip[0] && f[27] == dest_ip[1] && f[28] == dest_ip[2] && f[29] == dest_ip[3];
+            let ttl = if m { f[22] } else { 0 };     // the reply's TTL (the pinged host's)
             // Otherwise: is this the gateway ARPing for US? Answer it so it can address the echo reply.
             let a = !m && build_arp_reply(f, our_ip, &mut arp_out);
-            (m, a)
+            (m, ttl, a)
         };
-        if matched { return true; }
+        if matched {
+            let dt = ctx.read_tsc().wrapping_sub(t1);
+            let rtt_ms = if ticks10 > 0 { (dt.saturating_mul(10) / ticks10).min(65535) as u16 } else { 0 };
+            return Some((rtt_ms, ttl));
+        }
         // Owe an ARP reply? Send it (its request also returns the next frame). Else just poll RX-only.
         reply = if answer_arp {
             ctx.request_with_reply_deadline("nic-driver", &Message::from_bytes(&arp_out), DANCE_SECS)
@@ -405,7 +418,7 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8;
             ctx.request_with_reply_deadline("nic-driver", &rx_only, DANCE_SECS)
         };
     }
-    false
+    None
 }
 
 #[no_mangle]
@@ -465,7 +478,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // probe internet reachability. Only once ARP gave us the gateway's MAC. internet_ok distinguishes
     // "no internet / the gateway does not route out" from a DNS-specific failure.
     let (mut _pf, mut _pt) = (0u16, 0u16);
-    let ping_ok = have_mac && ping(&ctx, &gw_mac, &our_ip, &gateway, &mut _pf, &mut _pt);
+    let ping_ok = have_mac && ping(&ctx, &gw_mac, &our_ip, &gateway, 32, &mut _pf, &mut _pt).is_some();
     if ping_ok {
         ctx.log_fmt(format_args!("net-stack: ICMP - {}.{}.{}.{} echo reply (ping OK)",
             gateway[0], gateway[1], gateway[2], gateway[3]));
@@ -555,14 +568,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             rb[7] = timeouts.min(255) as u8;
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rb));
         } else if pl.first() == Some(&3) && pl.len() >= 5 {
-            // Ping an IP (byte 0 = 3, then 4 IP bytes): ICMP echo, no DNS. Reuses the gateway-ping path,
-            // but runs HERE in the serve loop - so `ping <gateway>` proves the post-boot request path
-            // works, and `ping 8.8.8.8` probes the internet directly. Reply: [alive, frames, timeouts].
+            // Ping an IP (byte 0 = 3, then 4 IP bytes, then an OPTIONAL le-u16 payload size): ICMP echo,
+            // no DNS. Runs HERE in the serve loop, so `ping <gateway>` proves the post-boot request path
+            // and `ping 8.8.8.8` probes the internet. Reply: [alive, rtt_ms(le u16), reply_ttl].
             let dip = [pl[1], pl[2], pl[3], pl[4]];
+            let bytes = if pl.len() >= 7 { u16::from_le_bytes([pl[5], pl[6]]) as usize } else { 32 };
             let mut frames = 0u16;
             let mut timeouts = 0u16;
-            let alive = have_mac && ping(&ctx, &gw_mac, &our_ip, &dip, &mut frames, &mut timeouts);
-            let rb = [alive as u8, frames.min(255) as u8, timeouts.min(255) as u8];
+            let result = if have_mac { ping(&ctx, &gw_mac, &our_ip, &dip, bytes, &mut frames, &mut timeouts) }
+                         else { None };
+            let rb = match result {
+                Some((rtt, ttl)) => { let r = rtt.to_le_bytes(); [1u8, r[0], r[1], ttl] }
+                None => [0u8, 0, 0, 0],
+            };
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rb));
         } else {
             // Status request (default): reply the frozen 15-byte record.

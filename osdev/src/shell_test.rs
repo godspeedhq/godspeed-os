@@ -213,13 +213,16 @@ pub fn run(image_path: &Path, smp: u32) {
     let pingver = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
     check!(pingver.contains("ping 0.1.0"), "ping: version reports ping 0.1.0");
 
-    // ping <ip>: ICMP echo to a raw IPv4, no DNS. Runs through net-stack's serve loop (unlike the boot
-    // dance), so it doubles as a check that the post-boot request path works. 10.0.2.2 is slirp's gateway
-    // (it answered ICMP during the dance). Lenient: alive OR a clean no-reply, never a hang.
-    send(&mut write_half, b"ping 10.0.2.2\r");
-    let ping_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)).unwrap_or_default();
-    check!(ping_out.contains("10.0.2.2 is alive") || ping_out.contains("10.0.2.2: no reply"),
-           "ping: ICMP echo to a raw IP runs end to end (ping <gateway>)");
+    // ping [count N] <ip>: continuous Windows-style ICMP echo, no DNS. `count` bounds it (bare `ping`
+    // runs until `q`). Runs through net-stack's serve loop (unlike the boot dance), so it doubles as a
+    // check that the post-boot request path works. 10.0.2.2 is slirp's gateway (it answered ICMP during
+    // the dance). Lenient on Reply-vs-timeout, but must print the header + the statistics summary.
+    send(&mut write_half, b"ping count 3 10.0.2.2\r");
+    let ping_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)).unwrap_or_default();
+    check!(ping_out.contains("Pinging 10.0.2.2 with 32 bytes of data")
+           && ping_out.contains("Ping statistics for 10.0.2.2")
+           && (ping_out.contains("Reply from 10.0.2.2") || ping_out.contains("Request timed out")),
+           "ping: continuous ICMP echo (count-limited) prints Windows-style output + stats (ping <gateway>)");
 
     // net stats: raw NIC register dump (chip state). On QEMU the e1000 path answers with CTRL/STATUS/etc.
     send(&mut write_half, b"net stats\r");
