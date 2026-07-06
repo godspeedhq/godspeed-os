@@ -210,22 +210,29 @@ fn dns_resolve(ctx: &ServiceContext, hostname: &[u8], gw_mac: &[u8; 6], our_ip: 
     // stray broadcasts on a busy LAN is caught WITHOUT re-transmitting (a re-TX drains+discards it).
     let req     = Message::from_bytes(&frame[..frame_len]);
     let rx_only = Message::from_bytes(&[4u8]);
+    let mut arp_out = [0u8; 42];
     let mut reply = ctx.request_with_reply_deadline("nic-driver", &req, DANCE_SECS);
     for _ in 0..DNS_RX_TRIES {
-        let matched = {
+        let (matched, answer_arp) = {
             let f: &[u8] = match &reply { Some(r) => r.payload_bytes(), None => { *timeouts += 1; &[] } };
             if !f.is_empty() {
                 *frames += 1;
                 if f.len() >= 24 && f[23] == 17 { *udp += 1; }
-                // DIAGNOSTIC (serial): what did we actually collect? ethertype, IP proto, src IP, L4 dport.
-                if f.len() >= 38 {
+                // DIAGNOSTIC (serial): ARP shows oper + who it asks for; IPv4 shows proto/src/L4 dport.
+                if f.len() >= 42 && f[12] == 0x08 && f[13] == 0x06 {
+                    ctx.log_fmt(format_args!("ns dns-rx ARP oper={} tgt={}.{}.{}.{}",
+                        f[21], f[38], f[39], f[40], f[41]));
+                } else if f.len() >= 38 {
                     ctx.log_fmt(format_args!("ns dns-rx et={:02x}{:02x} p={} src={}.{}.{}.{} dp={:02x}{:02x}",
                         f[12], f[13], f[23], f[26], f[27], f[28], f[29], f[36], f[37]));
                 }
             }
             // IPv4/UDP to OUR DNS query port (49153)?
-            f.len() >= D + 12 && f[12] == 0x08 && f[13] == 0x00 && f[23] == 17
-                && f[36] == 0xc0 && f[37] == 0x01
+            let m = f.len() >= D + 12 && f[12] == 0x08 && f[13] == 0x00 && f[23] == 17
+                && f[36] == 0xc0 && f[37] == 0x01;
+            // Otherwise: is this someone (the gateway) ARPing for US? Answer so it can address the reply.
+            let a = !m && build_arp_reply(f, our_ip, &mut arp_out);
+            (m, a)
         };
         if matched {
             *got_reply = true;   // a matching DNS reply arrived (whatever it contains)
@@ -259,8 +266,14 @@ fn dns_resolve(ctx: &ServiceContext, hostname: &[u8], gw_mac: &[u8; 6], our_ip: 
             }
             return None;   // a matching DNS reply but no A record (got_reply=true -> NoRecord)
         }
-        // Not our reply (a stray or empty) - collect the NEXT frame WITHOUT re-TX.
-        reply = ctx.request_with_reply_deadline("nic-driver", &rx_only, DANCE_SECS);
+        // Not our reply. If we owe an ARP reply (the gateway asked for us), send it - its request also
+        // returns the next frame; otherwise collect the NEXT frame WITHOUT re-TX.
+        reply = if answer_arp {
+            ctx.log("ns arp-answer: told the asker our MAC");
+            ctx.request_with_reply_deadline("nic-driver", &Message::from_bytes(&arp_out), DANCE_SECS)
+        } else {
+            ctx.request_with_reply_deadline("nic-driver", &rx_only, DANCE_SECS)
+        };
     }
     None
 }
@@ -322,6 +335,34 @@ fn udp_roundtrip(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], src_p
 
 /// Send an ICMP echo request to `dest_ip` (via the gateway's MAC) and return true if the matching echo
 /// REPLY comes back. Used to probe the gateway (LAN) and a public IP (internet reachability through NAT).
+/// If `f` is an inbound ARP REQUEST for `our_ip`, build the matching ARP REPLY into `out` and return
+/// true. net-stack MUST answer these: once the gateway's ARP entry for us (the OUR_MAC we advertise)
+/// ages out it re-ARPs before it can address our UNICAST replies - stay silent and it only ever reaches
+/// us with broadcasts, so the echo/DNS reply never arrives (exactly the T630 serve-loop symptom: 20
+/// frames collected, all broadcast, no reply). This fires ONLY when someone is actively asking for us,
+/// so on QEMU (slirp already learned us from our own query) it emits nothing - which is why it is safe
+/// where a blind gratuitous ARP before every query was not.
+fn build_arp_reply(f: &[u8], our_ip: &[u8; 4], out: &mut [u8; 42]) -> bool {
+    if f.len() < 42 { return false; }
+    if f[12] != 0x08 || f[13] != 0x06 { return false; }              // not ARP
+    if f[20] != 0x00 || f[21] != 0x01 { return false; }              // not a REQUEST (oper 1)
+    if f[38] != our_ip[0] || f[39] != our_ip[1]
+        || f[40] != our_ip[2] || f[41] != our_ip[3] { return false; } // not asking for us
+    for b in out.iter_mut() { *b = 0; }
+    out[0..6].copy_from_slice(&f[22..28]);   // eth dst = the asker (its sender MAC)
+    out[6..12].copy_from_slice(&OUR_MAC);    // eth src = us
+    out[12] = 0x08; out[13] = 0x06;          // ethertype = ARP
+    out[14] = 0x00; out[15] = 0x01;          // htype = Ethernet
+    out[16] = 0x08; out[17] = 0x00;          // ptype = IPv4
+    out[18] = 0x06; out[19] = 0x04;          // hlen 6, plen 4
+    out[20] = 0x00; out[21] = 0x02;          // oper = reply
+    out[22..28].copy_from_slice(&OUR_MAC);   // sender hw = us
+    out[28..32].copy_from_slice(our_ip);     // sender ip = us
+    out[32..38].copy_from_slice(&f[22..28]); // target hw = the asker
+    out[38..42].copy_from_slice(&f[28..32]); // target ip = the asker's ip
+    true
+}
+
 fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8; 4],
         frames: &mut u16, timeouts: &mut u16) -> bool {
     let mut frame = [0u8; 50];
@@ -350,26 +391,39 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8;
     // re-TX drains+discards the reply (why the old retry loop only ever saw ARP). Mirrors dns_resolve.
     let req     = Message::from_bytes(&frame);
     let rx_only = Message::from_bytes(&[4u8]);
+    let mut arp_out = [0u8; 42];
     let mut reply = ctx.request_with_reply_deadline("nic-driver", &req, DANCE_SECS);
     for _ in 0..DNS_RX_TRIES {
-        let matched = {
+        let (matched, answer_arp) = {
             let f: &[u8] = match &reply { Some(r) => r.payload_bytes(), None => { *timeouts += 1; &[] } };
             if !f.is_empty() {
                 *frames += 1;
-                // DIAGNOSTIC (serial): ethertype, IP proto, src IP, and the ICMP type/code (f[34..36]).
-                if f.len() >= 38 {
+                // DIAGNOSTIC (serial): ARP shows oper + who it asks for; IPv4 shows proto/src/icmp-type.
+                if f.len() >= 42 && f[12] == 0x08 && f[13] == 0x06 {
+                    ctx.log_fmt(format_args!("ns ping-rx ARP oper={} tgt={}.{}.{}.{}",
+                        f[21], f[38], f[39], f[40], f[41]));
+                } else if f.len() >= 38 {
                     ctx.log_fmt(format_args!("ns ping-rx et={:02x}{:02x} p={} src={}.{}.{}.{} icmp={:02x}{:02x}",
                         f[12], f[13], f[23], f[26], f[27], f[28], f[29], f[34], f[35]));
                 }
             }
             // Echo REPLY (type 0) from dest_ip. Match the source so a gateway ping and an internet ping
             // cannot be confused, and skip stray frames.
-            f.len() >= 42 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45
+            let m = f.len() >= 42 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45
                 && f[23] == 1 && f[34] == 0
-                && f[26] == dest_ip[0] && f[27] == dest_ip[1] && f[28] == dest_ip[2] && f[29] == dest_ip[3]
+                && f[26] == dest_ip[0] && f[27] == dest_ip[1] && f[28] == dest_ip[2] && f[29] == dest_ip[3];
+            // Otherwise: is this the gateway ARPing for US? Answer it so it can address the echo reply.
+            let a = !m && build_arp_reply(f, our_ip, &mut arp_out);
+            (m, a)
         };
         if matched { return true; }
-        reply = ctx.request_with_reply_deadline("nic-driver", &rx_only, DANCE_SECS);
+        // Owe an ARP reply? Send it (its request also returns the next frame). Else just poll RX-only.
+        reply = if answer_arp {
+            ctx.log("ns arp-answer: told the asker our MAC");
+            ctx.request_with_reply_deadline("nic-driver", &Message::from_bytes(&arp_out), DANCE_SECS)
+        } else {
+            ctx.request_with_reply_deadline("nic-driver", &rx_only, DANCE_SECS)
+        };
     }
     false
 }
