@@ -101,6 +101,8 @@ const RTL_TPPOLL:    usize = 0x38; // TX Poll (write-only): NPQ=0x40 kicks the n
 const RTL_TCR:       usize = 0x40; // Transmit Config
 const RTL_RCR:       usize = 0x44; // Receive Config
 const RTL_9346CR:    usize = 0x50; // EEPROM cmd: 0xC0 = config write ENABLE (unlock), 0x00 = lock
+const RTL_IMR:       usize = 0x3C; // Interrupt Mask Register (16-bit)
+const RTL_ISR:       usize = 0x3E; // Interrupt Status Register (16-bit)
 const RTL_PHYSTATUS: usize = 0x6C; // PHY status: LinkSts = 0x02
 const RTL_RMS:       usize = 0xDA; // RX Max packet Size (16-bit)
 const RTL_RDSAR:     usize = 0xE4; // RX Descriptor Start Address (64-bit phys, 256B aligned)
@@ -289,8 +291,34 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
                 rs += 1;
             }
             if n > 0 { last_rx_len = n as u16; rx_count = rx_count.saturating_add(1); }
-            ctx.log_fmt(format_args!("nic: rx4 rx_it={} n={}", rs, n));   // DIAGNOSTIC (serial)
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n]));
+            ctx.remove_cap(reply_cap);
+            continue;
+        }
+
+        // [5] REGISTER DUMP: the raw RTL8168 chip state for `net stats` - CR (RE/TE), config regs, ring
+        // bases, and each RX descriptor's OWN/len (are frames waiting, or is the ring armed?). Chip-tagged
+        // (byte 0 = 0 realtek). No TX, no RX poll - just reads.
+        if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 5 } {
+            let mut s = [0u8; 43];
+            s[0] = 0;                                     // chip: realtek
+            s[1] = mmio.read8(RTL_CR);
+            s[2] = mmio.read8(RTL_9346CR);
+            s[3] = mmio.read8(RTL_PHYSTATUS);
+            s[4] = rx_idx as u8;
+            s[5..7].copy_from_slice(&mmio.read16(RTL_IMR).to_le_bytes());
+            s[7..9].copy_from_slice(&mmio.read16(RTL_ISR).to_le_bytes());
+            s[9..11].copy_from_slice(&mmio.read16(RTL_RMS).to_le_bytes());
+            s[11..15].copy_from_slice(&mmio.read32(RTL_RCR).to_le_bytes());
+            s[15..19].copy_from_slice(&mmio.read32(RTL_TCR).to_le_bytes());
+            s[19..23].copy_from_slice(&mmio.read32(RTL_TNPDS).to_le_bytes());
+            s[23..27].copy_from_slice(&mmio.read32(RTL_RDSAR).to_le_bytes());
+            for i in 0..RX_RING_COUNT {
+                let opts1 = arena.read32(RX_RING_OFF + i * 16);
+                let o = 27 + i * 4;
+                s[o..o + 4].copy_from_slice(&opts1.to_le_bytes());
+            }
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&s));
             ctx.remove_cap(reply_cap);
             continue;
         }
@@ -347,11 +375,6 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
         last_tx_done = tx_done;
         tx_count = tx_count.saturating_add(1);
         if n > 0 { last_rx_len = n as u16; rx_count = rx_count.saturating_add(1); }
-
-        // DIAGNOSTIC (serial): what did this frame request actually do? tx_it near TX_POLL_MAX => the TX
-        // wedged; rx_it near RX_POLL_MAX with n=0 => the receiver captured nothing.
-        ctx.log_fmt(format_args!("nic: frame len={} tx_it={} tx_ok={} rx_it={} n={}",
-            flen, ts, tx_done, rs, n));
 
         let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n]));
         ctx.remove_cap(reply_cap);
@@ -494,6 +517,24 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 m.write32(REG_RCTL, 0);
             }
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n]));
+            ctx.remove_cap(reply_cap);
+            continue;
+        }
+
+        // [5] REGISTER DUMP (e1000): CTRL/STATUS/RCTL/TCTL/RDH/RDT - chip-tagged (byte 0 = 1 e1000).
+        if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 5 } {
+            let mut s = [0u8; 25];
+            s[0] = 1;                                     // chip: e1000
+            if active {
+                let m = mmio.as_ref().unwrap();
+                s[1..5].copy_from_slice(&m.read32(REG_CTRL).to_le_bytes());
+                s[5..9].copy_from_slice(&m.read32(REG_STATUS).to_le_bytes());
+                s[9..13].copy_from_slice(&m.read32(REG_RCTL).to_le_bytes());
+                s[13..17].copy_from_slice(&m.read32(REG_TCTL).to_le_bytes());
+                s[17..21].copy_from_slice(&m.read32(REG_RDH).to_le_bytes());
+                s[21..25].copy_from_slice(&m.read32(REG_RDT).to_le_bytes());
+            }
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&s));
             ctx.remove_cap(reply_cap);
             continue;
         }

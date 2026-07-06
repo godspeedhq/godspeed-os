@@ -221,6 +221,11 @@ pub fn run(image_path: &Path, smp: u32) {
     check!(ping_out.contains("10.0.2.2 is alive") || ping_out.contains("10.0.2.2: no reply"),
            "ping: ICMP echo to a raw IP runs end to end (ping <gateway>)");
 
+    // net stats: raw NIC register dump (chip state). On QEMU the e1000 path answers with CTRL/STATUS/etc.
+    send(&mut write_half, b"net stats\r");
+    let statsout = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)).unwrap_or_default();
+    check!(statsout.contains("NIC registers"), "net stats: dumps raw NIC registers (chip state)");
+
     // sock (utilities/41_sock.md): a UDP socket as a CAPABILITY. The shell opens a socket cap from
     // net-stack and sends a datagram THROUGH it - proving a socket is a real kernel cap (§7.10) the
     // client holds and invokes, not an ambient channel. Lenient on the UDP response (external), but

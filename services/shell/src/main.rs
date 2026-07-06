@@ -3494,6 +3494,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "net" => help_block(ctx, "net", "network status + DNS resolution", &[
             ("net", "IP, gateway (+MAC), and whether the gateway pings", "net"),
             ("net dns <host>", "resolve a hostname to an IPv4 address", "net dns example.com"),
+            ("net stats", "dump the NIC's raw registers (chip state: RE/RCR/RX ring)", "net stats"),
             ("net | write <path>", "snapshot the status to a file", "net | write /netstat.txt"),
         ], true),
         "ping" => help_block(ctx, "ping", "ICMP echo to a raw IPv4 address (no DNS)", &[
@@ -4136,6 +4137,61 @@ fn cmd_ping(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
     Ok(())
 }
 
+/// `net stats` - dump the NIC's raw registers (chip state) to the console. Queries nic-driver ([5]);
+/// the reply is chip-tagged (0 = RTL8168, 1 = e1000). Reads only - shows CR (RE/TE), config, ring
+/// bases, and each RX descriptor's OWN/len, so you can see whether the receiver is even enabled and
+/// whether frames are sitting in the ring.
+fn net_stats_dump(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
+    let req = Message::from_bytes(&[5u8]);
+    let reply = match net_query(ctx, "nic-driver", &req, 3) {
+        NetQ::Reply(r) => r,
+        NetQ::Aborted => { ctx.console_writeln("net: aborted"); return Ok(()); }
+        NetQ::Timeout => { ctx.console_writeln("net: nic-driver did not answer the register dump"); return Ok(()); }
+    };
+    let p = reply.payload_bytes();
+    if p.first() == Some(&0) && p.len() >= 43 {
+        let cr = p[1]; let c9346 = p[2]; let phy = p[3]; let rx_idx = p[4];
+        let imr = u16::from_le_bytes([p[5], p[6]]);
+        let isr = u16::from_le_bytes([p[7], p[8]]);
+        let rms = u16::from_le_bytes([p[9], p[10]]);
+        let rcr = u32::from_le_bytes([p[11], p[12], p[13], p[14]]);
+        let tcr = u32::from_le_bytes([p[15], p[16], p[17], p[18]]);
+        let tnpds = u32::from_le_bytes([p[19], p[20], p[21], p[22]]);
+        let rdsar = u32::from_le_bytes([p[23], p[24], p[25], p[26]]);
+        let spd = if phy & 0x10 != 0 { "1000M" } else if phy & 0x08 != 0 { "100M" }
+                  else if phy & 0x04 != 0 { "10M" } else { "?" };
+        out.line(ctx, "NIC registers (RTL8168):");
+        out.line_fmt(ctx, format_args!("  CR        0x{:02x}   RE={} TE={} RST={}", cr, (cr>>3)&1, (cr>>2)&1, (cr>>4)&1));
+        out.line_fmt(ctx, format_args!("  9346CR    0x{:02x}   {}", c9346, if c9346 == 0xC0 { "unlocked" } else { "locked" }));
+        out.line_fmt(ctx, format_args!("  PHYSTATUS 0x{:02x}   link={} spd={} dup={}", phy, (phy>>1)&1, spd, if phy&1!=0 {"full"} else {"half"}));
+        out.line_fmt(ctx, format_args!("  IMR       0x{:04x}", imr));
+        out.line_fmt(ctx, format_args!("  ISR       0x{:04x}", isr));
+        out.line_fmt(ctx, format_args!("  RMS       0x{:04x}   ({} bytes)", rms, rms));
+        out.line_fmt(ctx, format_args!("  RCR       0x{:08x}   AAP={} APM={} AM={} AB={}", rcr, rcr&1, (rcr>>1)&1, (rcr>>2)&1, (rcr>>3)&1));
+        out.line_fmt(ctx, format_args!("  TCR       0x{:08x}", tcr));
+        out.line_fmt(ctx, format_args!("  TNPDS.lo  0x{:08x}   TX ring base", tnpds));
+        out.line_fmt(ctx, format_args!("  RDSAR.lo  0x{:08x}   RX ring base", rdsar));
+        out.line_fmt(ctx, format_args!("  RX ring (rx_idx={}):", rx_idx));
+        for i in 0..4 {
+            let o = 27 + i * 4;
+            let d = u32::from_le_bytes([p[o], p[o+1], p[o+2], p[o+3]]);
+            out.line_fmt(ctx, format_args!("    [{}] opts1=0x{:08x}  OWN={} len={}", i, d, (d>>31)&1, d & 0x3FFF));
+        }
+    } else if p.first() == Some(&1) && p.len() >= 25 {
+        let g = |o: usize| u32::from_le_bytes([p[o], p[o+1], p[o+2], p[o+3]]);
+        out.line(ctx, "NIC registers (Intel e1000):");
+        out.line_fmt(ctx, format_args!("  CTRL   0x{:08x}", g(1)));
+        out.line_fmt(ctx, format_args!("  STATUS 0x{:08x}   LU={}", g(5), (g(5)>>1)&1));
+        out.line_fmt(ctx, format_args!("  RCTL   0x{:08x}   EN={}", g(9), (g(9)>>1)&1));
+        out.line_fmt(ctx, format_args!("  TCTL   0x{:08x}", g(13)));
+        out.line_fmt(ctx, format_args!("  RDH    0x{:08x}", g(17)));
+        out.line_fmt(ctx, format_args!("  RDT    0x{:08x}", g(21)));
+    } else {
+        ctx.console_writeln("net: no register dump available for this NIC");
+    }
+    Ok(())
+}
+
 fn cmd_net(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     let arg = arg.trim();
     if arg == "dns" {
@@ -4150,8 +4206,11 @@ fn cmd_net(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellEr
         }
         return net_dns(ctx, host, out);
     }
+    if arg == "stats" {
+        return net_stats_dump(ctx, out);
+    }
     if !arg.is_empty() {
-        ctx.console_writeln("net: unknown subcommand - try 'net', 'net dns <host>', or 'net help'");
+        ctx.console_writeln("net: unknown subcommand - try 'net', 'net dns <host>', 'net stats', or 'net help'");
         return Err(ShellError::Unknown);
     }
     net_status(ctx, out)
