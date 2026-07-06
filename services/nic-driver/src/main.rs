@@ -207,6 +207,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
     mmio.write32(RTL_TCR, RTL_TCR_VALUE);
     mmio.write32(RTL_RCR, RTL_RCR_VALUE);
     mmio.write8(RTL_CR, RTL_CR_RE | RTL_CR_TE); // enable receiver + transmitter
+    mmio.write16(RTL_ISR, 0xFFFF);              // clear any latched interrupt status (RDU/FOVW would halt RX)
     mmio.write8(RTL_9346CR, 0x00);              // lock the config registers again
 
     let link_up = mmio.read8(RTL_PHYSTATUS) & 0x02 != 0;
@@ -225,6 +226,11 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
     loop {
         let req = ctx.recv();
         let reply_cap = match ctx.take_pending_cap() { Some(c) => c, None => continue };
+        // ACK any latched RX/TX interrupt status before servicing. We POLL (IMR=0), and an UNCLEARED RDU
+        // (Rx Descriptor Unavailable) or FOVW (Rx FIFO Overflow) HALTS the RTL8168 receiver until it is
+        // acked - `net stats` showed ISR=0x95 (RDU+TDU latched) with an armed-but-empty RX ring, exactly
+        // this halt. Clearing the ISR every request lets RX (and TX) resume. This is the Layer-1 stall fix.
+        mmio.write16(RTL_ISR, 0xFFFF);
         // [3] STATUS query (the `net` nic-mac diagnostic) - answer the MAC, do NOT treat it as a frame.
         if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 3 } {
             // Fresh 15-byte status: reset_ok, mac(6), CURRENT link, last-TX-done, last-RX len, TX/RX
