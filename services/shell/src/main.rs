@@ -4246,10 +4246,29 @@ fn net_status(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
                 let rx_len = u16::from_le_bytes([p[9], p[10]]);
                 let tx_cnt = u16::from_le_bytes([p[11], p[12]]);
                 let rx_cnt = u16::from_le_bytes([p[13], p[14]]);
+                // Speed/duplex from the 32-byte hardware status; a 15-byte (e1000/older) reply omits it.
+                let (spd, dup) = if p.len() >= 32 {
+                    (match p[15] & 0x03 { 3 => "1000M", 2 => "100M", 1 => "10M", _ => "?" },
+                     if p[15] & 0x04 != 0 { "full" } else { "half" })
+                } else { ("", "") };
                 out.line_fmt(ctx, format_args!(
-                    "nic-link {}  |  tx {} ({} sent)  |  rx {}B ({} recv)",
-                    if p[7] != 0 { "UP" } else { "down (no cable/PHY)" },
+                    "nic-link {} {} {}  |  tx {} ({} sent)  |  rx {}B ({} recv)",
+                    if p[7] != 0 { "UP" } else { "down (no cable/PHY)" }, spd, dup,
                     if p[8] != 0 { "ok" } else { "TIMEOUT" }, tx_cnt, rx_len, rx_cnt));
+            }
+            // Chip hardware tally counters (RTL8168 DTCCR dump) - Layer-1 GROUND TRUTH: the NIC's OWN
+            // cumulative counts, read off silicon regardless of net-stack. RxOk climbing between two
+            // `net`s => the receiver is alive; flat => the NIC is not receiving (a Layer-1 fault, not
+            // a scheduling one). RxBcast answers "do we receive broadcasts?" directly.
+            if p.len() >= 32 {
+                let rx_ok  = u32::from_le_bytes([p[16], p[17], p[18], p[19]]);
+                let tx_ok  = u32::from_le_bytes([p[20], p[21], p[22], p[23]]);
+                let rx_brd = u32::from_le_bytes([p[24], p[25], p[26], p[27]]);
+                let rx_er  = u16::from_le_bytes([p[28], p[29]]);
+                let miss   = u16::from_le_bytes([p[30], p[31]]);
+                out.line_fmt(ctx, format_args!(
+                    "nic-hw   RxOk={} TxOk={} RxBcast={} RxErr={} Miss={}",
+                    rx_ok, tx_ok, rx_brd, rx_er, miss));
             }
         }
     }

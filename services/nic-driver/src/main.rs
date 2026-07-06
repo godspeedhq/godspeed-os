@@ -75,6 +75,10 @@ const RX_RING_COUNT: usize = 4;
 const RX_RING_BYTES: u32   = (RX_RING_COUNT * 16) as u32;
 const RX_BUF_OFF:    usize = 0x3000;
 const RX_BUF_SIZE:   usize = 2048;
+// After RX_BUF (ends at 0x5000): a 64-byte, 64-byte-aligned buffer the NIC DMAs its hardware tally
+// counters into (DTCCR dump). Layer-1 ground truth - the chip's OWN RX/TX/error counts, read straight
+// off silicon and INDEPENDENT of net-stack.
+const TALLY_OFF:     usize = 0x5000;
 
 // Bounded hardware/protocol-timing polls (the exempt category, like AHCI/USB spins - NOT the
 // correctness-by-time Commandment VIII forbids): wait on the TRUTH of a bit, give up LOUDLY.
@@ -100,6 +104,8 @@ const RTL_9346CR:    usize = 0x50; // EEPROM cmd: 0xC0 = config write ENABLE (un
 const RTL_PHYSTATUS: usize = 0x6C; // PHY status: LinkSts = 0x02
 const RTL_RMS:       usize = 0xDA; // RX Max packet Size (16-bit)
 const RTL_RDSAR:     usize = 0xE4; // RX Descriptor Start Address (64-bit phys, 256B aligned)
+const RTL_DTCCR:     usize = 0x10; // Dump Tally Counter Command Register (64-bit): buf phys | bit3 (Dump)
+const TALLY_POLL_MAX: u32  = 100_000; // the NIC dumps the counters in ~us; bound the wait loudly
 
 const RTL_CR_RE:  u8 = 0x08;
 const RTL_CR_TE:  u8 = 0x04;
@@ -221,8 +227,30 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
         if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 3 } {
             // Fresh 15-byte status: reset_ok, mac(6), CURRENT link, last-TX-done, last-RX len, TX/RX
             // counts. The link is read LIVE (it negotiates over a few seconds after reset).
-            let link_up = mmio.read8(RTL_PHYSTATUS) & 0x02 != 0;
-            let mut s = [0u8; 15];
+            // 32-byte NIC hardware status (Layer-1 ground truth). [0] reset_ok, [1..7] mac, [7] link,
+            // [8] last-TX-done, [9..11] last-RX len, [11..13] TX req count, [13..15] RX req count,
+            // [15] speed|duplex, then the CHIP's OWN cumulative tally counters (DTCCR dump, independent
+            // of net-stack): [16..20] RxOk, [20..24] TxOk, [24..28] RxBroadcast, [28..30] RxErr,
+            // [30..32] MissedPkt.
+            let phy = mmio.read8(RTL_PHYSTATUS);
+            let link_up = phy & 0x02 != 0;
+            // PHYSTATUS speed bits: 0x10=1000M, 0x08=100M, 0x04=10M; 0x01=FullDuplex.
+            let speed = if phy & 0x10 != 0 { 3u8 } else if phy & 0x08 != 0 { 2 }
+                        else if phy & 0x04 != 0 { 1 } else { 0 };
+            // DTCCR dump: point the NIC at our 64-byte buffer and set bit 3; it DMAs its counters there.
+            let tbuf = arena.phys_at(TALLY_OFF);
+            for i in 0..64 { arena.write8(TALLY_OFF + i, 0); }
+            mmio.write32(RTL_DTCCR + 4, (tbuf >> 32) as u32);
+            mmio.write32(RTL_DTCCR, ((tbuf as u32) & !0x3F) | 0x08);   // 64B-aligned addr | Dump
+            let mut td = 0u32;
+            while td < TALLY_POLL_MAX && mmio.read32(RTL_DTCCR) & 0x08 != 0 { ctx.yield_cpu(); td += 1; }
+            let rx_ok  = arena.read32(TALLY_OFF + 0x08);
+            let tx_ok  = arena.read32(TALLY_OFF + 0x00);
+            let rx_brd = arena.read32(TALLY_OFF + 0x30);
+            let rx_er  = (arena.read32(TALLY_OFF + 0x18) & 0xFFFF) as u16;
+            let miss   = (arena.read32(TALLY_OFF + 0x1C) & 0xFFFF) as u16;
+
+            let mut s = [0u8; 32];
             s[0] = reset_ok as u8;
             s[1..7].copy_from_slice(mac);
             s[7]  = link_up as u8;
@@ -230,6 +258,12 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
             s[9..11].copy_from_slice(&last_rx_len.to_le_bytes());
             s[11..13].copy_from_slice(&tx_count.to_le_bytes());
             s[13..15].copy_from_slice(&rx_count.to_le_bytes());
+            s[15] = speed | ((phy & 0x01) << 2);          // bits 0-1 = speed, bit 2 = full duplex
+            s[16..20].copy_from_slice(&rx_ok.to_le_bytes());
+            s[20..24].copy_from_slice(&tx_ok.to_le_bytes());
+            s[24..28].copy_from_slice(&rx_brd.to_le_bytes());
+            s[28..30].copy_from_slice(&rx_er.to_le_bytes());
+            s[30..32].copy_from_slice(&miss.to_le_bytes());
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&s));
             ctx.remove_cap(reply_cap);
             continue;
