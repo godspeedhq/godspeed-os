@@ -303,6 +303,49 @@ fn udp_roundtrip(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], src_p
     None
 }
 
+/// Send an ICMP echo request to `dest_ip` (via the gateway's MAC) and return true if the matching echo
+/// REPLY comes back. Used to probe the gateway (LAN) and a public IP (internet reachability through NAT).
+fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8; 4]) -> bool {
+    let mut frame = [0u8; 50];
+    frame[0..6].copy_from_slice(gw_mac);
+    frame[6..12].copy_from_slice(&OUR_MAC);
+    frame[12] = 0x08; frame[13] = 0x00;              // IPv4
+    frame[14] = 0x45;
+    let total_len: u16 = 20 + 8 + 8;
+    frame[16] = (total_len >> 8) as u8; frame[17] = total_len as u8;
+    frame[18] = 0x00; frame[19] = 0x01;
+    frame[22] = 64;                                  // TTL
+    frame[23] = 1;                                   // ICMP
+    frame[26..30].copy_from_slice(our_ip);
+    frame[30..34].copy_from_slice(dest_ip);
+    let ip_ck = checksum(&frame[14..34]);
+    frame[24] = (ip_ck >> 8) as u8; frame[25] = ip_ck as u8;
+    frame[34] = 8;                                   // echo request
+    frame[38] = 0x00; frame[39] = 0x01;
+    frame[40] = 0x00; frame[41] = 0x01;
+    for i in 0..8 { frame[42 + i] = b"godspeed"[i]; }
+    let icmp_ck = checksum(&frame[34..50]);
+    frame[36] = (icmp_ck >> 8) as u8; frame[37] = icmp_ck as u8;
+
+    let req = Message::from_bytes(&frame);
+    for _ in 0..DANCE_TRIES {
+        match ctx.request_with_reply_deadline("nic-driver", &req, DANCE_SECS) {
+            Some(reply) => {
+                let f = reply.payload_bytes();
+                // Echo REPLY (type 0) FROM dest_ip. Match the source so a gateway ping and an internet
+                // ping cannot be confused, and skip stray frames.
+                if f.len() >= 42 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45
+                    && f[23] == 1 && f[34] == 0
+                    && f[26] == dest_ip[0] && f[27] == dest_ip[1] && f[28] == dest_ip[2] && f[29] == dest_ip[3] {
+                    return true;
+                }
+            }
+            None => { ctx.reacquire_by_name("nic-driver"); }
+        }
+    }
+    false
+}
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("net-stack: starting");
@@ -356,62 +399,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         ctx.log("net-stack: ARP - no reply for the gateway within the budget - degrading");
     }
 
-    // ---- Phase 2 step 2: ICMP - ping the gateway (echo request -> echo reply). Only once ARP gave us
-    // the gateway's MAC (an IPv4 packet to it needs a destination hardware address).
-    let mut ping_ok = false;
-    if have_mac {
-        // Ethernet (14) + IPv4 (20) + ICMP header (8) + 8-byte payload = 50 bytes.
-        let mut frame = [0u8; 50];
-        // Ethernet: unicast to the gateway's MAC.
-        frame[0..6].copy_from_slice(&gw_mac);
-        frame[6..12].copy_from_slice(&OUR_MAC);
-        frame[12] = 0x08; frame[13] = 0x00;          // ethertype = IPv4
-        // IPv4 header (frame[14..34]).
-        frame[14] = 0x45;                            // version 4, IHL 5 (20-byte header, no options)
-        frame[15] = 0x00;                            // DSCP/ECN
-        let total_len: u16 = 20 + 8 + 8;             // IP + ICMP header + payload = 36
-        frame[16] = (total_len >> 8) as u8; frame[17] = total_len as u8;
-        frame[18] = 0x00; frame[19] = 0x01;          // identification
-        frame[20] = 0x00; frame[21] = 0x00;          // flags / fragment offset
-        frame[22] = 64;                              // TTL
-        frame[23] = 1;                               // protocol = ICMP
-        // frame[24..26] header checksum: left 0, filled after.
-        frame[26..30].copy_from_slice(&our_ip);      // source (learned via DHCP)
-        frame[30..34].copy_from_slice(&gateway);     // destination = DHCP-learned gateway
-        let ip_ck = checksum(&frame[14..34]);
-        frame[24] = (ip_ck >> 8) as u8; frame[25] = ip_ck as u8;
-        // ICMP echo request (frame[34..50]).
-        frame[34] = 8;                               // type = echo request
-        frame[35] = 0;                               // code
-        // frame[36..38] checksum: left 0, filled after.
-        frame[38] = 0x00; frame[39] = 0x01;          // identifier
-        frame[40] = 0x00; frame[41] = 0x01;          // sequence
-        for i in 0..8 { frame[42 + i] = b"godspeed"[i]; }  // an identifiable payload
-        let icmp_ck = checksum(&frame[34..50]);
-        frame[36] = (icmp_ck >> 8) as u8; frame[37] = icmp_ck as u8;
-
-        let ping = Message::from_bytes(&frame);
-        for _ in 0..DANCE_TRIES {
-            match ctx.request_with_reply_deadline("nic-driver", &ping, DANCE_SECS) {
-                Some(reply) => {
-                    let f = reply.payload_bytes();
-                    // A valid echo reply: IPv4 (0x0800), IHL 5, protocol 1 (ICMP), ICMP type 0 (reply).
-                    // f[26..30] is the source IP - the host that answered. Skip stray frames, keep trying.
-                    if f.len() >= 42 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45
-                        && f[23] == 1 && f[34] == 0 {
-                        ping_ok = true;
-                        ctx.log_fmt(format_args!(
-                            "net-stack: ICMP - {}.{}.{}.{} echo reply (ping OK, {} bytes on the wire)",
-                            f[26], f[27], f[28], f[29], f.len()));
-                        break;
-                    }
-                }
-                None => { ctx.reacquire_by_name("nic-driver"); }
-            }
-        }
-        if !ping_ok {
-            ctx.log("net-stack: ICMP - no echo reply from the gateway within the budget - degrading");
-        }
+    // ---- Phase 2 step 2: ICMP - ping the gateway, then a public IP (8.8.8.8) THROUGH the gateway to
+    // probe internet reachability. Only once ARP gave us the gateway's MAC. internet_ok distinguishes
+    // "no internet / the gateway does not route out" from a DNS-specific failure.
+    let ping_ok = have_mac && ping(&ctx, &gw_mac, &our_ip, &gateway);
+    if ping_ok {
+        ctx.log_fmt(format_args!("net-stack: ICMP - {}.{}.{}.{} echo reply (ping OK)",
+            gateway[0], gateway[1], gateway[2], gateway[3]));
+    } else if have_mac {
+        ctx.log("net-stack: ICMP - no echo reply from the gateway");
     }
 
     // DHCP + ARP + ICMP proven over the frame interface, and net-stack SELF-CONFIGURES its IP. Now
