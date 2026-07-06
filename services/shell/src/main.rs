@@ -4127,7 +4127,10 @@ fn net_dns(ctx: &ServiceContext, host: &str, out: &mut Out) -> Result<(), ShellE
     } else if p.first() == Some(&2) {
         out.line_fmt(ctx, format_args!("{}: the DNS server replied but returned no A record", host));
     } else {
-        out.line_fmt(ctx, format_args!("{}: no reply from the DNS server (see `net`'s dns line)", host));
+        // Diagnostic: how many frames net-stack collected while waiting, and how many were UDP. Tells
+        // us "no reply arrived" (0 UDP) from "a reply arrived but did not match our port" (UDP > 0).
+        let (fr, ud) = if p.len() >= 7 { (p[5], p[6]) } else { (0, 0) };
+        out.line_fmt(ctx, format_args!("{}: no reply from the DNS server ({} frames seen, {} UDP)", host, fr, ud));
     }
     Ok(())
 }
