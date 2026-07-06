@@ -232,6 +232,31 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
             continue;
         }
 
+        // [4] RX-ONLY: poll the RX ring for ONE frame and return it (or empty) - NO drain, NO TX. Lets
+        // net-stack collect frames AFTER a single query TX, so a reply arriving behind stray broadcasts
+        // (mDNS etc. on a busy LAN) is caught WITHOUT re-transmitting - a re-TX drains+discards the reply.
+        if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 4 } {
+            let mut n = 0usize;
+            let mut rs = 0u32;
+            while rs < RX_POLL_MAX {
+                let rd = RX_RING_OFF + rx_idx * 16;
+                let o1 = arena.read32(rd);
+                if o1 & RTL_DESC_OWN == 0 {
+                    n = ((o1 & 0x3FFF) as usize).min(FRAME_MAX);
+                    for i in 0..n { rxbuf[i] = arena.read8(RX_BUF_OFF + rx_idx * RX_BUF_SIZE + i); }
+                    rtl_arm_rx(arena, rx_idx);
+                    rx_idx = (rx_idx + 1) % RX_RING_COUNT;
+                    break;
+                }
+                ctx.yield_cpu();
+                rs += 1;
+            }
+            if n > 0 { last_rx_len = n as u16; rx_count = rx_count.saturating_add(1); }
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n]));
+            ctx.remove_cap(reply_cap);
+            continue;
+        }
+
         // Drain stale/background frames so the next RX we poll is our reply (the promiscuous receiver
         // on a live network catches broadcasts). Bounded to one ring pass.
         for _ in 0..RX_RING_COUNT {
@@ -390,6 +415,36 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             sreply[0] = 1; // e1000 is up
             sreply[1..7].copy_from_slice(&e1000_mac);
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&sreply));
+            ctx.remove_cap(reply_cap);
+            continue;
+        }
+
+        // [4] RX-ONLY: arm the receiver, poll for ONE frame, quiesce - NO TX. Mirrors the realtek RX-only
+        // so net-stack's collect-frames-after-one-TX DNS path works on both NICs (on QEMU/slirp there are
+        // no stray frames, so net-stack's first request already matches and this stays a safe no-op).
+        if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 4 } {
+            let mut n = 0usize;
+            if active {
+                let m = mmio.as_ref().unwrap();
+                let a = arena.as_ref().unwrap();
+                for i in 0..RX_RING_COUNT { a.write8(RX_RING_OFF + i * 16 + 12, 0); }
+                m.write32(REG_RDH, 0);
+                m.write32(REG_RDT, (RX_RING_COUNT - 1) as u32);
+                m.write32(REG_RCTL, RCTL_VALUE);
+                let mut s = 0u32;
+                while s < RX_POLL_MAX {
+                    if a.read8(RX_RING_OFF + 12) & RXD_STA_DD != 0 {
+                        let len = a.read16(RX_RING_OFF + 8) as usize;
+                        n = len.min(FRAME_MAX);
+                        for i in 0..n { rxbuf[i] = a.read8(RX_BUF_OFF + i); }
+                        break;
+                    }
+                    ctx.yield_cpu();
+                    s += 1;
+                }
+                m.write32(REG_RCTL, 0);
+            }
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n]));
             ctx.remove_cap(reply_cap);
             continue;
         }

@@ -56,6 +56,9 @@ const DANCE_SECS:  i64 = 2;
 // A few tries per step: on a LIVE network the first frame back can be a background broadcast, so a step
 // retries past stray frames (each retry is fast - a frame is already waiting) to find its real reply.
 const DANCE_TRIES: u32 = 6;
+// DNS collects frames after ONE query TX (the [4] RX-only path): up to this many frames pulled without
+// re-transmitting, so a reply behind stray broadcasts is caught (a re-TX would drain+discard it).
+const DNS_RX_TRIES: u32 = 12;
 
 /// Phase 3: a DHCP DISCOVER over UDP - ask QEMU slirp's built-in DHCP server for our IP and read the
 /// OFFER. This proves the UDP transport (the layer the socket capability sits on) over the frame
@@ -199,51 +202,52 @@ fn dns_resolve(ctx: &ServiceContext, hostname: &[u8], gw_mac: &[u8; 6], our_ip: 
 
     // Send THROUGH nic-driver, bounded + retrying past stray frames (Stage B: never block on a busy/
     // silent driver). Match the reply to OUR query: a UDP packet to our source port 5353 (0x14e9).
-    let req = Message::from_bytes(&frame[..frame_len]);
-    for _ in 0..DANCE_TRIES {
-        let reply = match ctx.request_with_reply_deadline("nic-driver", &req, DANCE_SECS) {
-            Some(r) => r,
-            None => { ctx.reacquire_by_name("nic-driver"); continue; }
+    // Send the query ONCE, then RX-ONLY poll ([4]) for subsequent frames - so a reply arriving BEHIND
+    // stray broadcasts on a busy LAN is caught WITHOUT re-transmitting (a re-TX drains+discards it).
+    let req     = Message::from_bytes(&frame[..frame_len]);
+    let rx_only = Message::from_bytes(&[4u8]);
+    let mut reply = ctx.request_with_reply_deadline("nic-driver", &req, DANCE_SECS);
+    for _ in 0..DNS_RX_TRIES {
+        let matched = {
+            let f: &[u8] = match &reply { Some(r) => r.payload_bytes(), None => &[] };
+            // IPv4/UDP to OUR DNS query port (49153)?
+            f.len() >= D + 12 && f[12] == 0x08 && f[13] == 0x00 && f[23] == 17
+                && f[36] == 0xc0 && f[37] == 0x01
         };
-        let f = reply.payload_bytes();
-        // IPv4/UDP to OUR DNS query port (49153). Skip stray frames - incl. mDNS on 5353 - keep waiting.
-        if f.len() < D + 12 || f[12] != 0x08 || f[13] != 0x00 || f[23] != 17
-            || f[36] != 0xc0 || f[37] != 0x01 {
-            continue;
-        }
-        *got_reply = true;   // a matching DNS reply arrived (whatever it contains)
-        let ancount = ((f[D + 6] as usize) << 8) | (f[D + 7] as usize);
-        if ancount == 0 { return None; }
-        // Skip the echoed question: QNAME (labels to 0, or a compression pointer) + QTYPE + QCLASS.
-        let mut p = D + 12;
-        while p < f.len() {
-            let len = f[p];
-            if len == 0 { p += 1; break; }
-            if len & 0xc0 == 0xc0 { p += 2; break; }     // compression pointer
-            p += 1 + len as usize;
-        }
-        p += 4;                                           // QTYPE + QCLASS
-        // Answers: find the first A record (TYPE 1, RDLENGTH 4).
-        let mut n = 0;
-        while n < ancount {
-            // NAME: a compression pointer (2 bytes) or inline labels.
-            if p >= f.len() { return None; }
-            if f[p] & 0xc0 == 0xc0 {
-                p += 2;
-            } else {
-                while p < f.len() { let len = f[p]; if len == 0 { p += 1; break; } p += 1 + len as usize; }
+        if matched {
+            *got_reply = true;   // a matching DNS reply arrived (whatever it contains)
+            let f = reply.as_ref().unwrap().payload_bytes();
+            let ancount = ((f[D + 6] as usize) << 8) | (f[D + 7] as usize);
+            if ancount != 0 {
+                // Skip the echoed question (QNAME + QTYPE + QCLASS), then walk answers for an A record.
+                let mut p = D + 12;
+                while p < f.len() {
+                    let len = f[p];
+                    if len == 0 { p += 1; break; }
+                    if len & 0xc0 == 0xc0 { p += 2; break; }   // compression pointer
+                    p += 1 + len as usize;
+                }
+                p += 4;                                        // QTYPE + QCLASS
+                let mut n = 0;
+                while n < ancount {
+                    if p >= f.len() { break; }
+                    if f[p] & 0xc0 == 0xc0 { p += 2; }
+                    else { while p < f.len() { let len = f[p]; if len == 0 { p += 1; break; } p += 1 + len as usize; } }
+                    if p + 10 > f.len() { break; }
+                    let atype = ((f[p] as usize) << 8) | (f[p + 1] as usize);
+                    let rdlength = ((f[p + 8] as usize) << 8) | (f[p + 9] as usize);
+                    p += 10;
+                    if atype == 1 && rdlength == 4 && p + 4 <= f.len() {
+                        return Some([f[p], f[p + 1], f[p + 2], f[p + 3]]);
+                    }
+                    p += rdlength;
+                    n += 1;
+                }
             }
-            if p + 10 > f.len() { return None; }
-            let atype = ((f[p] as usize) << 8) | (f[p + 1] as usize);
-            let rdlength = ((f[p + 8] as usize) << 8) | (f[p + 9] as usize);
-            p += 10;
-            if atype == 1 && rdlength == 4 && p + 4 <= f.len() {
-                return Some([f[p], f[p + 1], f[p + 2], f[p + 3]]);
-            }
-            p += rdlength;
-            n += 1;
+            return None;   // a matching DNS reply but no A record (got_reply=true -> NoRecord)
         }
-        return None;   // a valid DNS reply but no A record - done, don't retry
+        // Not our reply (a stray or empty) - collect the NEXT frame WITHOUT re-TX.
+        reply = ctx.request_with_reply_deadline("nic-driver", &rx_only, DANCE_SECS);
     }
     None
 }
