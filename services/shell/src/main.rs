@@ -4218,6 +4218,9 @@ fn net_status(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
         out.line(ctx, "gateway  unresolved");
     }
     out.line(ctx, if flags & 2 != 0 { "ping     ok" } else { "ping     no" });
+    if p.len() >= 19 {
+        out.line_fmt(ctx, format_args!("dns      {}.{}.{}.{}", p[15], p[16], p[17], p[18]));
+    }
     Ok(())
 }
 

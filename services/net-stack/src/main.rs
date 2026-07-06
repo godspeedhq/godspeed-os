@@ -415,11 +415,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // we reply with a fixed 15-byte record - our IP (4), the gateway IP (4), the gateway MAC (6), and
     // a flags byte (bit0 = gateway resolved, bit1 = ping OK). The client formats it; we report raw
     // facts (utilities/0_conventions.md rule 7). The SOCKET CAPABILITY builds on this seam next.
-    let mut status = [0u8; 15];
+    let mut status = [0u8; 19];
     status[0..4].copy_from_slice(&our_ip);
     status[4..8].copy_from_slice(&gateway);
     status[8..14].copy_from_slice(&gw_mac);
     status[14] = (have_mac as u8) | ((ping_ok as u8) << 1);
+    status[15..19].copy_from_slice(&dns_server);   // the DHCP-learned DNS server (a `net` diagnostic)
     let mut sockets = [Socket { rid: 0, port: 0 }; MAX_SOCKETS];
     ctx.log("net-stack: serving the client API (status/dns/socket)");
     loop {
