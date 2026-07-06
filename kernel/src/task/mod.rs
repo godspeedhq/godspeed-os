@@ -463,8 +463,13 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
-            // Pin to core 1: keep the driver off core 0 where the shell + TCB live (§9.2).
-            preferred_core:    1,
+            // Core 2: the USB drivers busy-poll their controllers at ~100% CPU, so co-locating both
+            // on core 1 (with nic-driver + net-stack + fs + block-driver) SATURATED it - starving the
+            // networking (net-stack's frame requests to nic-driver timed out) and the keyboard itself
+            // (input garbled then died on the T630). Spreading the two busy-pollers onto the idle cores
+            // (xhci=2, ehci=3) leaves core 1 for the request-driven services. Falls back to round-robin
+            // if core 2 is not ready.
+            preferred_core:    2,
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
             // Route the xHCI MSI (interrupts::XHCI_MSI_VECTOR = 0x28) to this driver's recv
@@ -485,7 +490,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
-            preferred_core:    1,
+            preferred_core:    3,   // core 3: the other busy-poller, off the saturated core 1 (see xhci)
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
             // Route the EHCI INTx (interrupts::EHCI_MSI_VECTOR = 0x29, IOAPIC-routed) to this
