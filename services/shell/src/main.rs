@@ -4103,15 +4103,17 @@ fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     if n == 4 { Some(out) } else { None }
 }
 
-/// Spin ~`cycles` TSC cycles to pace continuous `ping`, returning early with `true` if the user presses
-/// `q`/`Q`/ESC so a quit is caught within one interval. `cycles == 0` (uncalibrated TSC) just polls once.
-fn ping_wait_or_quit(ctx: &ServiceContext, cycles: u64) -> bool {
-    let start = ctx.read_tsc();
+/// Pace continuous `ping` ~1 s by the WALL CLOCK (RTC seconds), returning early with `true` on q/Q/ESC.
+/// The TSC is unreliable for this on some hardware: the AMD T630's CPUID-based TSC calibration is wrong,
+/// so a TSC interval collapsed to ~0 and the ping FLOODED (200 lines in a blink). The RTC second is
+/// portable and never floods - it just waits for the wall-clock second to tick over.
+fn ping_wait_or_quit(ctx: &ServiceContext) -> bool {
+    let start = ctx.datetime().epoch_secs();
     loop {
         if let Some(b) = ctx.try_console_read() {
             if b == b'q' || b == b'Q' || b == 0x1b { return true; }
         }
-        if cycles == 0 || ctx.read_tsc().wrapping_sub(start) >= cycles { return false; }
+        if ctx.datetime().epoch_secs() != start { return false; }   // wall-clock second ticked (~1 s)
         ctx.yield_cpu();
     }
 }
@@ -4146,12 +4148,15 @@ fn cmd_ping(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
     let b = bytes.min(1024);                          // matches net-stack's PING_MAX_PAYLOAD
     let bl = (b as u16).to_le_bytes();
     let msg = Message::from_bytes(&[3, ip[0], ip[1], ip[2], ip[3], bl[0], bl[1]]);
-    let interval = ctx.tsc_ticks_per_10ms().saturating_mul(100);   // ~1 second between echoes
-
-    out.line_fmt(ctx, format_args!("Pinging {}.{}.{}.{} with {} bytes of data:", ip[0], ip[1], ip[2], ip[3], b));
+    // Continuous mode shows the q hint up front so it is obvious BEFORE the replies start scrolling.
+    if count.is_none() {
+        out.line_fmt(ctx, format_args!("Pinging {}.{}.{}.{} with {} bytes of data (press q to quit):", ip[0], ip[1], ip[2], ip[3], b));
+    } else {
+        out.line_fmt(ctx, format_args!("Pinging {}.{}.{}.{} with {} bytes of data:", ip[0], ip[1], ip[2], ip[3], b));
+    }
 
     let mut sent = 0u32; let mut recv = 0u32;
-    let mut rmin = u16::MAX; let mut rmax = 0u16; let mut rsum = 0u64;
+    let mut rmin = u16::MAX; let mut rmax = 0u16; let mut rsum = 0u64; let mut vcount = 0u32;
     while count.map_or(true, |c| sent < c) {
         sent += 1;
         let reply = match ctx.request_with_reply("net-stack", &msg) {
@@ -4165,13 +4170,18 @@ fn cmd_ping(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
                     let rtt = u16::from_le_bytes([p[1], p[2]]);
                     let ttl = p[3];
                     recv += 1;
-                    if rtt < rmin { rmin = rtt; }
-                    if rtt > rmax { rmax = rtt; }
-                    rsum += rtt as u64;
-                    if rtt == 0 {
+                    // A ping RTT over ~10 s is impossible - it means this host's TSC calibration is bogus
+                    // (the AMD T630's CPUID leaves are wrong), so report the reply but not a garbage time.
+                    if rtt > 10000 {
+                        out.line_fmt(ctx, format_args!("Reply from {}.{}.{}.{}: bytes={} time=? TTL={}", ip[0], ip[1], ip[2], ip[3], b, ttl));
+                    } else if rtt == 0 {
                         out.line_fmt(ctx, format_args!("Reply from {}.{}.{}.{}: bytes={} time<1ms TTL={}", ip[0], ip[1], ip[2], ip[3], b, ttl));
+                        rmin = 0; vcount += 1;
                     } else {
                         out.line_fmt(ctx, format_args!("Reply from {}.{}.{}.{}: bytes={} time={}ms TTL={}", ip[0], ip[1], ip[2], ip[3], b, rtt, ttl));
+                        if rtt < rmin { rmin = rtt; }
+                        if rtt > rmax { rmax = rtt; }
+                        rsum += rtt as u64; vcount += 1;
                     }
                 } else {
                     out.line_fmt(ctx, format_args!("Request timed out."));
@@ -4180,7 +4190,7 @@ fn cmd_ping(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
             None => { out.line_fmt(ctx, format_args!("ping: net-stack unavailable")); break; }
         }
         if count.map_or(false, |c| sent >= c) { break; }   // last echo done: no trailing interval
-        if ping_wait_or_quit(ctx, interval) { break; }      // q/ESC during the ~1s pace
+        if ping_wait_or_quit(ctx) { break; }                // ~1 s pace (RTC), q/ESC quits
     }
 
     let lost = sent.saturating_sub(recv);
@@ -4188,9 +4198,11 @@ fn cmd_ping(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
     out.line_fmt(ctx, format_args!(""));
     out.line_fmt(ctx, format_args!("Ping statistics for {}.{}.{}.{}:", ip[0], ip[1], ip[2], ip[3]));
     out.line_fmt(ctx, format_args!("    Packets: Sent = {}, Received = {}, Lost = {} ({}% loss)", sent, recv, lost, loss));
-    if recv > 0 {
+    if vcount > 0 {
         out.line_fmt(ctx, format_args!("Approximate round trip times in milli-seconds:"));
-        out.line_fmt(ctx, format_args!("    Minimum = {}ms, Maximum = {}ms, Average = {}ms", rmin, rmax, rsum / recv as u64));
+        out.line_fmt(ctx, format_args!("    Minimum = {}ms, Maximum = {}ms, Average = {}ms", rmin, rmax, rsum / vcount as u64));
+    } else if recv > 0 {
+        out.line_fmt(ctx, format_args!("    (round-trip time unavailable - this host's TSC clock is uncalibrated)"));
     }
     Ok(())
 }
@@ -5318,10 +5330,11 @@ fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
         }
     }
     let _ = ctx.kill("observe-live"); // reap the child (it never exits on its own)
-    // Restore the console the child left in raw mode: show the cursor and drop below the last
-    // frame so the prompt lands cleanly. Echo stays OFF - the shell, not the kernel, owns echo.
+    // Restore the console the child left in raw mode: show the cursor and CLEAR the screen so the
+    // prompt lands on a fresh empty screen - not interleaved on top of the last live frame (which is
+    // what smeared the prompt and your typing). Echo stays OFF - the shell, not the kernel, owns echo.
     ctx.console_echo(false);
-    ctx.console_write("\x1b[?25h\r\n");
+    ctx.console_write("\x1b[?25h\x1b[2J\x1b[H");
     Ok(())
 }
 
