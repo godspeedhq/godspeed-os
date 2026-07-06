@@ -4110,6 +4110,9 @@ fn net_dns(ctx: &ServiceContext, host: &str, out: &mut Out) -> Result<(), ShellE
     req[0] = 1;
     req[1..1 + hb.len()].copy_from_slice(hb);
     let msg = Message::from_bytes(&req[..1 + hb.len()]);
+    // A DNS resolve sends a query and waits for the server, which can take a moment - show a working
+    // hint so a brief pause does not look like a hang.
+    ctx.console_writeln("net: resolving ...");
     let reply = match ctx.request_with_reply("net-stack", &msg) {
         Some(r) => Some(r),
         None => if ctx.reacquire_by_name("net-stack") { ctx.request_with_reply("net-stack", &msg) } else { None },
@@ -4122,7 +4125,7 @@ fn net_dns(ctx: &ServiceContext, host: &str, out: &mut Out) -> Result<(), ShellE
     if p.len() >= 5 && p[0] == 1 {
         out.line_fmt(ctx, format_args!("{} is {}.{}.{}.{}", host, p[1], p[2], p[3], p[4]));
     } else {
-        out.line_fmt(ctx, format_args!("{}: no answer (DNS goes via slirp to the host resolver)", host));
+        out.line_fmt(ctx, format_args!("{}: no answer (no A record, or the DNS server did not reply)", host));
     }
     Ok(())
 }
