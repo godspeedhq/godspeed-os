@@ -345,29 +345,31 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8;
     let icmp_ck = checksum(&frame[34..50]);
     frame[36] = (icmp_ck >> 8) as u8; frame[37] = icmp_ck as u8;
 
-    let req = Message::from_bytes(&frame);
-    for _ in 0..DANCE_TRIES {
-        match ctx.request_with_reply_deadline("nic-driver", &req, DANCE_SECS) {
-            Some(reply) => {
-                let f = reply.payload_bytes();
-                if !f.is_empty() {
-                    *frames += 1;
-                    // DIAGNOSTIC (serial): ethertype, IP proto, src IP, and the ICMP type/code (f[34..36]).
-                    if f.len() >= 38 {
-                        ctx.log_fmt(format_args!("ns ping-rx et={:02x}{:02x} p={} src={}.{}.{}.{} icmp={:02x}{:02x}",
-                            f[12], f[13], f[23], f[26], f[27], f[28], f[29], f[34], f[35]));
-                    }
-                }
-                // Echo REPLY (type 0) FROM dest_ip. Match the source so a gateway ping and an internet
-                // ping cannot be confused, and skip stray frames.
-                if f.len() >= 42 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45
-                    && f[23] == 1 && f[34] == 0
-                    && f[26] == dest_ip[0] && f[27] == dest_ip[1] && f[28] == dest_ip[2] && f[29] == dest_ip[3] {
-                    return true;
+    // Send the echo request ONCE, then RX-ONLY poll ([4]) for subsequent frames - so the echo reply
+    // arriving BEHIND stray broadcasts (an ARP flood on a busy LAN) is caught WITHOUT re-transmitting; a
+    // re-TX drains+discards the reply (why the old retry loop only ever saw ARP). Mirrors dns_resolve.
+    let req     = Message::from_bytes(&frame);
+    let rx_only = Message::from_bytes(&[4u8]);
+    let mut reply = ctx.request_with_reply_deadline("nic-driver", &req, DANCE_SECS);
+    for _ in 0..DNS_RX_TRIES {
+        let matched = {
+            let f: &[u8] = match &reply { Some(r) => r.payload_bytes(), None => { *timeouts += 1; &[] } };
+            if !f.is_empty() {
+                *frames += 1;
+                // DIAGNOSTIC (serial): ethertype, IP proto, src IP, and the ICMP type/code (f[34..36]).
+                if f.len() >= 38 {
+                    ctx.log_fmt(format_args!("ns ping-rx et={:02x}{:02x} p={} src={}.{}.{}.{} icmp={:02x}{:02x}",
+                        f[12], f[13], f[23], f[26], f[27], f[28], f[29], f[34], f[35]));
                 }
             }
-            None => { *timeouts += 1; ctx.reacquire_by_name("nic-driver"); }
-        }
+            // Echo REPLY (type 0) from dest_ip. Match the source so a gateway ping and an internet ping
+            // cannot be confused, and skip stray frames.
+            f.len() >= 42 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45
+                && f[23] == 1 && f[34] == 0
+                && f[26] == dest_ip[0] && f[27] == dest_ip[1] && f[28] == dest_ip[2] && f[29] == dest_ip[3]
+        };
+        if matched { return true; }
+        reply = ctx.request_with_reply_deadline("nic-driver", &rx_only, DANCE_SECS);
     }
     false
 }
