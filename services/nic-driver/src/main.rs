@@ -257,13 +257,19 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
             continue;
         }
 
-        // Drain stale/background frames so the next RX we poll is our reply (the promiscuous receiver
-        // on a live network catches broadcasts). Bounded to one ring pass.
-        for _ in 0..RX_RING_COUNT {
-            if arena.read32(RX_RING_OFF + rx_idx * 16) & RTL_DESC_OWN != 0 { break; }
-            rtl_arm_rx(arena, rx_idx);
-            rx_idx = (rx_idx + 1) % RX_RING_COUNT;
-        }
+        // RESET THE RECEIVER per frame request (mirrors the e1000 path). nic-driver is request-driven,
+        // so between requests the idle RX ring FILLS with background broadcasts and the NIC hits
+        // descriptor-exhaustion (RDU) and stops - and merely re-arming does NOT restart it. Disabling RX,
+        // re-arming ALL descriptors, re-pointing RDSAR, and re-enabling clears that stall, so the reply we
+        // are about to solicit lands in a FRESH ring. (This is exactly why DNS - which runs long after the
+        // boot dance had already drained one ring's worth - saw "0 frames": the ring had stalled full.)
+        mmio.write8(RTL_CR, RTL_CR_TE);                     // RX off (keep TX) while we re-arm
+        for i in 0..RX_RING_COUNT { rtl_arm_rx(arena, i); }
+        let rx_ring = arena.phys_at(RX_RING_OFF);
+        mmio.write32(RTL_RDSAR, (rx_ring & 0xffff_ffff) as u32);
+        mmio.write32(RTL_RDSAR + 4, (rx_ring >> 32) as u32);
+        mmio.write8(RTL_CR, RTL_CR_RE | RTL_CR_TE);         // RX back on, from descriptor 0
+        rx_idx = 0;
 
         // --- Transmit: copy the frame in, point descriptor tx_idx at it, kick TPPoll, wait on OWN
         // clearing (Commandment VIII, bounded + loud). ---
