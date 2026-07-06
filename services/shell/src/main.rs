@@ -5329,13 +5329,16 @@ fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
             if !ctx.task_stat(slot).valid { break; } // child died unexpectedly
         }
     }
-    let _ = ctx.kill("observe-live"); // reap the child (it never exits on its own)
-    // Restore the console the child left in raw mode: show the cursor and CLEAR the screen so the
-    // prompt lands on a fresh empty screen - not interleaved on top of the last live frame (which is
-    // what smeared the prompt and your typing). Echo stays OFF - the shell, not the kernel, owns echo.
+    let _ = ctx.kill("observe-live"); // reap the live painter (it never exits on its own)
+    // The painter may have been killed MID-repaint, leaving the cursor mid-frame - THAT is what smeared
+    // the prompt into the observe output. Repaint ONE complete static frame (`observe now` clears, paints
+    // a whole frame, and parks its cursor cleanly BELOW it), so the prompt lands on a fresh line UNDER the
+    // snapshot - the behaviour you liked. Then show the cursor. (Earlier I wrongly full-cleared, which
+    // dropped the snapshot entirely.) Echo stays OFF - the shell, not the kernel, owns echo.
     ctx.console_echo(false);
-    ctx.console_write("\x1b[?25h\x1b[2J\x1b[H");
-    Ok(())
+    let r = cmd_observe_now(ctx);
+    ctx.console_write("\x1b[?25h");
+    r
 }
 
 /// Slot of a just-spawned, still-live service by name (not a killed/dead one),
