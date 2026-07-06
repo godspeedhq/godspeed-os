@@ -22,56 +22,96 @@ serves it. `net` is the window onto it: the shell acquires `net-stack` by name a
 
 | Command | Meaning |
 |---|---|
-| `net` | Print the current network status (IP, gateway, ping). |
+| `net` | Print the current network status: NIC (link/speed/MAC/hardware counters), IP, gateway, ping, DNS. |
 | `net dns <host>` | Resolve a hostname to an IPv4 address (a DNS A-record lookup). |
+| `net stats` | Dump the NIC's raw registers (chip state) - is the receiver enabled, is the ring armed? |
 | `net version` | Print the version. |
 | `net help` | Print usage. |
 
-Bare `net` reports the status net-stack froze at boot; `net dns <host>` is a live query. `net`
-never *changes* the network - it reads and resolves (`0_conventions.md` §7, and the non-goals
-below).
+Bare `net` reports the status net-stack froze at boot (plus a live read of the NIC's own hardware
+counters); `net dns <host>` is a live query; `net stats` is a live register read. `net` never
+*changes* the network - it reads and resolves (`0_conventions.md` §7, and the non-goals below).
+
+Related utilities: **`ping <ip>`** (a one-shot ICMP echo to a raw IP, no DNS - see `42_ping.md`) and
+**`sock`** (a UDP socket as a capability - see `41_sock.md`).
 
 ## 3. Output
 
+On hardware with the RTL8168 (T630), `net` reports the full picture - the NIC, its live link,
+the chip's own hardware counters, then the L3 status:
+
 ```
 gsh> net
-ip       10.0.2.15
-gateway  10.0.2.2 at 52:55:0a:00:02:02
+nic      10ec:8168  mmio 0xfea04000  (RTL8168)
+nic-mac  7c:d3:0a:2b:b0:e3  reset ok
+nic-link UP 1000M full  |  tx ok (4 sent)  |  rx 90B (4 recv)
+nic-hw   RxOk=1832 TxOk=7 RxBcast=1210 RxErr=0 Miss=0
+ip       192.168.4.80
+gateway  192.168.4.1 at 00:ab:48:da:1b:0d
 ping     ok
+dns      192.168.4.1
 ```
 
-Three labelled lines. When there is no NIC (a non-e1000 host, where `nic-driver` serves
-empty replies and `net-stack` falls back to a default IP and resolves no gateway), the
-truth is reported plainly rather than faked:
-
-```
-gsh> net
-ip       10.0.2.15
-gateway  unresolved
-ping     no
-```
-
-- **ip** - the address `net-stack` holds (learned by DHCP, or the fallback if there was no
-  offer).
-- **gateway** - the gateway IP and the MAC ARP resolved for it, or `unresolved` if ARP got
-  no answer.
+- **nic** - PCI vendor:device, the MMIO register base, and the chip name (from the kernel).
+- **nic-mac** - the MAC read off the chip, and whether the chip reset succeeded (queries
+  `nic-driver`; `TIMEOUT` here means MMIO is not reaching the chip).
+- **nic-link** - link up/down, negotiated speed/duplex, and the driver's TX/RX request counts.
+- **nic-hw** - the **chip's own** cumulative hardware tally counters, read straight off silicon
+  (DTCCR dump), independent of net-stack: RxOk, TxOk, RxBcast (broadcasts received), RxErr,
+  Miss. **Layer-1 ground truth** - if `RxOk`/`RxBcast` climb between two `net`s, the receiver is
+  alive; if they stay flat, the NIC is not receiving.
+- **ip** - the address `net-stack` holds (learned by DHCP, or the fallback if there was no offer).
+- **gateway** - the gateway IP and the MAC ARP resolved for it, or `unresolved` if ARP got no answer.
 - **ping** - `ok` if the gateway answered an ICMP echo; `no` otherwise.
+- **dns** - the DNS server `net-stack` will use (DHCP option 6, or the gateway as a fallback).
 
-`net dns <host>` resolves a name through net-stack's DNS query (to slirp's resolver):
+On QEMU's e1000 the `[3]` status reply is shorter, so only `nic` + `nic-mac` show (no link/hw lines);
+and when there is no drivable NIC, `nic-driver` serves empty replies and `net-stack` reports
+`gateway unresolved` / `ping no` plainly rather than faking it.
+
+`net dns <host>` resolves a name; `net-stack` tries the DHCP-learned server, then a public resolver
+(8.8.8.8) reached through the gateway (a home router may do DHCP + ICMP yet not run a DNS forwarder):
 
 ```
 gsh> net dns example.com
 example.com is 104.20.23.154
 gsh> net dns nope.invalid
-nope.invalid: no answer (DNS goes via slirp to the host resolver)
+nope.invalid: no reply from the DNS server (0 frames, 0 UDP, 6 timeouts)
 ```
 
-DNS depends on the host's resolver - slirp forwards the query to it - so `no answer` is a
-legitimate result (the query worked; nothing came back), not a bug.
+The no-reply line carries a diagnostic - frames seen, how many were UDP, and how many driver requests
+timed out - so a failure says *where* it failed, not just that it did.
+
+`net stats` dumps the NIC's raw registers - the chip state, for when you need to know whether the
+receiver is even enabled (`CR.RE`), whether the receiver is promiscuous (`RCR`), and whether frames
+are sitting in the RX ring (each descriptor's `OWN` bit):
+
+```
+gsh> net stats
+NIC registers (RTL8168):
+  CR        0x0c   RE=1 TE=1 RST=0
+  9346CR    0x00   locked
+  PHYSTATUS 0x2f   link=1 spd=1000M dup=full
+  IMR       0x0000
+  ISR       0x0005
+  RMS       0x0800   (2048 bytes)
+  RCR       0x0000e70f   AAP=1 APM=1 AM=1 AB=1
+  TCR       0x03000700
+  TNPDS.lo  0x1f2c0000   TX ring base
+  RDSAR.lo  0x1f2c2000   RX ring base
+  RX ring (rx_idx=0):
+    [0] opts1=0x80000800  OWN=1 len=2048
+    [1] opts1=0x80000800  OWN=1 len=2048
+    [2] opts1=0x80000800  OWN=1 len=2048
+    [3] opts1=0xc0000800  OWN=1 len=2048
+```
+
+`OWN=1` means the NIC owns that descriptor (armed, waiting for a frame); `OWN=0` means a frame has
+landed and the driver has not consumed it yet. (On QEMU the e1000 path prints CTRL/STATUS/RCTL/etc.)
 
 ## 4. Pipe behaviour (`to` / `from` / `where`)
 
-`net` is a pipe **producer**, never a consumer or filter. Its three lines are ordinary
+`net` is a pipe **producer**, never a consumer or filter. Its labelled lines are ordinary
 output, so they flow onward like any producer's:
 
 - **to a file** - `net | write /netstat.txt` snapshots the status to disk (redirection is
@@ -88,14 +128,17 @@ the shell. `net` performs no network I/O itself - it asks the service that does.
 
 ## 5. Data source
 
-- **Service:** `net-stack` (`services/net-stack`). After its boot dance (DHCP -> ARP ->
-  ICMP) it freezes a 15-byte record - our IP (4), gateway IP (4), gateway MAC (6), and a
-  flags byte (bit 0 = gateway resolved, bit 1 = ping OK) - and serves it: any request
-  carrying a reply cap gets that record back.
-- **Shell:** the `net` built-in acquires `net-stack` by name (the kernel name directory,
-  §14.3), sends a status request with `request_with_reply`, and formats the reply. On
-  `EndpointDead` / no reply it reacquires by name and retries, then reports plainly if
-  `net-stack` is still unreachable (Commandment VIII / IX).
+- **Service:** `net-stack` (`services/net-stack`). After its boot dance (DHCP -> ARP -> ICMP)
+  it freezes a 19-byte record - our IP (4), gateway IP (4), gateway MAC (6), a flags byte (bit 0
+  = gateway resolved, bit 1 = ping OK), and the learned DNS server (4) - and serves it. It also
+  answers a live `net dns` request (byte 0 = 1, then the hostname) and a live `ping <ip>` request
+  (byte 0 = 3, then the 4 IP bytes).
+- **Driver:** `nic-driver` answers two diagnostic queries directly (the shell holds `ACQUIRE_ANY`
+  and asks it by name): `[3]` returns the 32-byte hardware status (MAC, link, speed, and the chip's
+  tally counters via a DTCCR dump); `[5]` returns the raw register dump for `net stats`.
+- **Shell:** the `net` built-in acquires `net-stack` (and `nic-driver`) by name (the kernel name
+  directory, §14.3), sends each query bounded (`net_query`, abortable with `q`), and formats the
+  replies. On no reply it reacquires by name and retries, then reports plainly (Commandment VIII / IX).
 
 ## 6. Capabilities
 
@@ -108,12 +151,10 @@ the shell. `net` performs no network I/O itself - it asks the service that does.
 
 - **No configuration.** `net` reads; it never sets an IP, route, or DNS server. Those are
   `net-stack`'s job, and a future `net set ...` would be a separate, deliberate surface.
-- **No live re-ping (yet).** the *status* (`net`) is what net-stack froze at boot; `net dns`
-  is a live query, but a `net ping <host>` that pings on demand is a natural next subcommand
-  once sockets exist.
-- **No socket surface.** `net` is a status window. Opening a socket is the socket-capability
-  work (`docs/networking.md`, a socket *is* a delegated resource cap, §7.10), reached through
-  a different verb when it lands.
+- **Ping-on-demand is its own utility.** ICMP to an arbitrary IP is `ping <ip>` (`42_ping.md`),
+  not a `net` subcommand - `net` reports the gateway ping net-stack froze at boot.
+- **Sockets are their own utility.** Opening a UDP socket is `sock` (`41_sock.md`) - a socket
+  *is* a delegated resource cap (`docs/networking.md`, §7.10). `net` stays a status/diagnostic window.
 
 ## 8. Conformance
 
