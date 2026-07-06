@@ -214,7 +214,15 @@ fn dns_resolve(ctx: &ServiceContext, hostname: &[u8], gw_mac: &[u8; 6], our_ip: 
     for _ in 0..DNS_RX_TRIES {
         let matched = {
             let f: &[u8] = match &reply { Some(r) => r.payload_bytes(), None => { *timeouts += 1; &[] } };
-            if !f.is_empty() { *frames += 1; if f.len() >= 24 && f[23] == 17 { *udp += 1; } }
+            if !f.is_empty() {
+                *frames += 1;
+                if f.len() >= 24 && f[23] == 17 { *udp += 1; }
+                // DIAGNOSTIC (serial): what did we actually collect? ethertype, IP proto, src IP, L4 dport.
+                if f.len() >= 38 {
+                    ctx.log_fmt(format_args!("ns dns-rx et={:02x}{:02x} p={} src={}.{}.{}.{} dp={:02x}{:02x}",
+                        f[12], f[13], f[23], f[26], f[27], f[28], f[29], f[36], f[37]));
+                }
+            }
             // IPv4/UDP to OUR DNS query port (49153)?
             f.len() >= D + 12 && f[12] == 0x08 && f[13] == 0x00 && f[23] == 17
                 && f[36] == 0xc0 && f[37] == 0x01
@@ -342,7 +350,14 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8;
         match ctx.request_with_reply_deadline("nic-driver", &req, DANCE_SECS) {
             Some(reply) => {
                 let f = reply.payload_bytes();
-                if !f.is_empty() { *frames += 1; }
+                if !f.is_empty() {
+                    *frames += 1;
+                    // DIAGNOSTIC (serial): ethertype, IP proto, src IP, and the ICMP type/code (f[34..36]).
+                    if f.len() >= 38 {
+                        ctx.log_fmt(format_args!("ns ping-rx et={:02x}{:02x} p={} src={}.{}.{}.{} icmp={:02x}{:02x}",
+                            f[12], f[13], f[23], f[26], f[27], f[28], f[29], f[34], f[35]));
+                    }
+                }
                 // Echo REPLY (type 0) FROM dest_ip. Match the source so a gateway ping and an internet
                 // ping cannot be confused, and skip stray frames.
                 if f.len() >= 42 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45
