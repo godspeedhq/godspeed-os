@@ -80,9 +80,12 @@ const RX_BUF_SIZE:   usize = 2048;
 // correctness-by-time Commandment VIII forbids): wait on the TRUTH of a bit, give up LOUDLY.
 const RESET_POLL_MAX: u32 = 1_000_000;
 const TX_POLL_MAX:    u32 = 1_000_000;
-const RX_POLL_MAX:    u32 = 50_000;    // a reply arrives in ms (caught in the first hundreds of iterations);
-                                       // a MISS must give up FAST so a no-reply frame (e.g. a silent DNS
-                                       // server) does not stall nic-driver and back up its inbound queue
+const RX_POLL_MAX:    u32 = 8_000;     // a reply arrives in ms (caught in the first hundreds of iterations).
+                                       // A MISS must give up FAST: on the T630, 50k iterations took >2s -
+                                       // LONGER than net-stack's per-request deadline, so every DNS request
+                                       // TIMED OUT before nic-driver could answer. Keep the no-frame poll
+                                       // well under that deadline so net-stack hears back and can re-poll
+                                       // ([4] collect) rather than give up (the "24 timeouts" diagnosis).
 
 const FRAME_MAX: usize = 1600; // one Ethernet frame (<= 1518) with headroom
 
