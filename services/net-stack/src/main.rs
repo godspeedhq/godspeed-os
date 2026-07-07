@@ -655,40 +655,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 None    => [0u8; 7],
             };
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rb));
-        } else if pl.first() == Some(&7) {
-            // SCAN (op 7): ARP-sweep our /24 - broadcast an ARP for every host, catch replies INLINE (a
-            // reply for .x usually lands by the next send's RX poll), then drain stragglers. Reply = a
-            // 32-byte bitmap, bit .x set = host .x answered. One op, ~one round-trip per host.
-            let net = [our_ip[0], our_ip[1], our_ip[2]];
-            let mut up = [0u8; 32];
-            let mut a = [0u8; 42];
-            for b in a.iter_mut().take(6) { *b = 0xff; }
-            a[6..12].copy_from_slice(&OUR_MAC);
-            a[12] = 0x08; a[13] = 0x06; a[14] = 0x00; a[15] = 0x01; a[16] = 0x08; a[17] = 0x00;
-            a[18] = 0x06; a[19] = 0x04; a[20] = 0x00; a[21] = 0x01;
-            a[22..28].copy_from_slice(&OUR_MAC);
-            a[28..32].copy_from_slice(&our_ip);
-            let rx_only = Message::from_bytes(&[4u8]);
-            let record = |f: &[u8], up: &mut [u8; 32]| {
-                if f.len() >= 42 && f[12] == 0x08 && f[13] == 0x06 && f[20] == 0x00 && f[21] == 0x02
-                    && f[28] == net[0] && f[29] == net[1] && f[30] == net[2] {
-                    let ux = f[31]; up[(ux >> 3) as usize] |= 1 << (ux & 7);
-                }
-            };
-            if have_mac {
-                for x in 1..=254u8 {
-                    a[38..42].copy_from_slice(&[net[0], net[1], net[2], x]);
-                    if let Some(r) = ctx.request_with_reply_deadline("nic-driver", &Message::from_bytes(&a), DANCE_SECS) {
-                        record(r.payload_bytes(), &mut up);
-                    }
-                }
-                for _ in 0..DNS_RX_TRIES {   // drain stragglers (the last hosts' replies)
-                    if let Some(r) = ctx.request_with_reply_deadline("nic-driver", &rx_only, DANCE_SECS) {
-                        record(r.payload_bytes(), &mut up);
-                    }
-                }
-            }
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&up));
         } else {
             // Status request (default): reply the frozen 19-byte record.
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&status));

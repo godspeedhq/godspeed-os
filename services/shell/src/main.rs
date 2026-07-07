@@ -4358,23 +4358,29 @@ fn net_arp(ctx: &ServiceContext, ip_str: &str, out: &mut Out) -> Result<(), Shel
 /// ARP-based, so it is fast and LAN-reliable. net-stack does the whole sweep in one op (op 7) and
 /// returns a 32-byte up-bitmap - one round trip per host, not a per-host poll from the shell.
 fn net_scan(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
-    let our = match ctx.request_with_reply("net-stack", &Message::from_bytes(&[0u8])) {
-        Some(r) => { let p = r.payload_bytes(); if p.len() >= 4 { [p[0], p[1], p[2], p[3]] } else { [0u8; 4] } }
-        None => { out.line_fmt(ctx, format_args!("net: net-stack unavailable")); return Ok(()); }
+    let our = match ctx.request_with_reply_abortable("net-stack", &Message::from_bytes(&[0u8]), 5) {
+        ReqOutcome::Reply(r) => { let p = r.payload_bytes(); if p.len() >= 4 { [p[0], p[1], p[2], p[3]] } else { [0u8; 4] } }
+        ReqOutcome::Aborted  => { out.line_fmt(ctx, format_args!("net scan: aborted")); return Ok(()); }
+        ReqOutcome::Timeout  => { out.line_fmt(ctx, format_args!("net: net-stack unavailable")); return Ok(()); }
     };
     out.line_fmt(ctx, format_args!("Scanning {}.{}.{}.0/24 for live hosts (press q to abort):", our[0], our[1], our[2]));
-    // The sweep runs inside net-stack (~one round trip per host). ABORTABLE: q stops the wait (net-stack
-    // finishes but its reply is discarded), so a long sweep on a quiet link is never a dead end.
-    let up = match ctx.request_with_reply_abortable("net-stack", &Message::from_bytes(&[7u8]), 30) {
-        ReqOutcome::Reply(r) => { let p = r.payload_bytes(); let mut b = [0u8; 32]; if p.len() >= 32 { b.copy_from_slice(&p[..32]); } b }
-        ReqOutcome::Aborted  => { out.line_fmt(ctx, format_args!("net scan: aborted")); return Ok(()); }
-        ReqOutcome::Timeout  => { out.line_fmt(ctx, format_args!("net: net-stack did not answer the scan")); return Ok(()); }
-    };
+    // Walk the /24 host-by-host (net-stack op 6 = one ARP resolve), driven FROM THE SHELL so an abort
+    // actually STOPS the work: q ends the loop and net-stack is only ever mid-ONE resolve (fast), never
+    // wedged finishing a 254-host sweep (which is why a batch op 7 left the NEXT command stuck). Each
+    // host's wait is itself abortable, so q lands instantly, and responders print as they are found.
     let mut found = 0u32;
     for x in 1..=254u16 {
-        if up[(x >> 3) as usize] & (1 << (x & 7)) != 0 {
-            out.line_fmt(ctx, format_args!("  {}.{}.{}.{}", our[0], our[1], our[2], x));
-            found += 1;
+        let req = Message::from_bytes(&[6, our[0], our[1], our[2], x as u8]);
+        match ctx.request_with_reply_abortable("net-stack", &req, 3) {
+            ReqOutcome::Reply(r) => {
+                let p = r.payload_bytes();
+                if p.first() == Some(&1) && p.len() >= 7 {
+                    out.line_fmt(ctx, format_args!("  {}.{}.{}.{}", our[0], our[1], our[2], x));
+                    found += 1;
+                }
+            }
+            ReqOutcome::Aborted => { out.line_fmt(ctx, format_args!("net scan: aborted ({} found)", found)); return Ok(()); }
+            ReqOutcome::Timeout => {}   // this host did not answer in time; move on
         }
     }
     out.line_fmt(ctx, format_args!("{} host(s) responded.", found));

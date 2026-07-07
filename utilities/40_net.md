@@ -125,11 +125,12 @@ Scanning 192.168.4.0/24 for live hosts (press q to abort):
 3 host(s) responded.
 ```
 
-`net scan` runs the whole sweep inside `net-stack` (one broadcast ARP per host, replies caught inline) and
-returns a bitmap of responders - one op, not a per-host round trip from the shell. It is quick on a real
-LAN (broadcast traffic keeps the receiver busy so each poll lands fast); on a quiet link it is slower, so
-`q`/ESC aborts the wait (the "any blocking command is escapable" convention, `0_conventions.md` §1.10).
-`net arp` is likewise abortable.
+`net scan` walks the /24 host-by-host, **driven from the shell** (one ARP resolve per host, the same op
+`net arp` uses), printing responders as it finds them. Driving it from the shell is deliberate: `q`/ESC
+then actually **stops the work** - net-stack is only ever resolving one host, never wedged finishing a
+254-host sweep - so a *second* `net scan` never finds net-stack busy (a single batch op left the next
+command stuck). Quick on a real LAN; slower on a quiet link, but always abortable (`0_conventions.md`
+§1.10). `net arp` is likewise abortable.
 
 ## 4. Pipe behaviour (`to` / `from` / `where`)
 
@@ -154,8 +155,8 @@ the shell. `net` performs no network I/O itself - it asks the service that does.
   it freezes a 19-byte record - our IP (4), gateway IP (4), gateway MAC (6), a flags byte (bit 0
   = gateway resolved, bit 1 = ping OK), and the learned DNS server (4) - and serves it. It also
   answers live requests: `net dns` (byte 0 = 1, then the hostname), `ping <ip>` (byte 0 = 3, then the 4 IP
-  bytes), `net arp <ip>` (byte 0 = 6, then the 4 IP bytes -> `[found, mac(6)]`), and `net scan` (byte 0 = 7
-  -> a 32-byte up-bitmap, bit `.x` set = host `.x` answered). `arp`/`scan` share one `arp_resolve` helper.
+  bytes), and `net arp <ip>` (byte 0 = 6, then the 4 IP bytes -> `[found, mac(6)]`). `net scan` reuses op 6
+  host-by-host - the shell walks the /24 itself, so aborting it actually stops the work (no batch op).
 - **Driver:** `nic-driver` answers two diagnostic queries directly (the shell holds `ACQUIRE_ANY`
   and asks it by name): `[3]` returns the 32-byte hardware status (MAC, link, speed, and the chip's
   tally counters via a DTCCR dump); `[5]` returns the raw register dump for `net stats`.
