@@ -51,7 +51,10 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     that can wedge the shell with no way out is forbidden (§26.7: loud + escapable over silent +
     stuck). The primitive is `ServiceContext::request_with_reply_abortable` (send once, poll `q`
     while waiting); never block an interactive command on a bare `request_with_reply` to a peer
-    that can be slow.
+    that can be slow. **Escaping must stop the WORK, not just the wait:** if a command drives a
+    multi-step peer operation (a sweep, a batch), drive it **step-by-step from the shell** so `q`
+    ends the loop and the peer is only ever mid-ONE step - a single batch op that keeps running
+    after you stop waiting just wedges the *next* command (the `net scan` op-7-to-op-6 fix).
 11. **Output is a pipeable structure.** A utility's result is data, not decoration: a producer
     emits either a typed record `Table` (`docs/records.md`, so `| where` / `| select` /
     `| to json` compose) or plain labelled lines (so `| match` / `| count` compose). Piping is
