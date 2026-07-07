@@ -4186,12 +4186,14 @@ fn cmd_ping(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
     let mut rmin = u16::MAX; let mut rmax = 0u16; let mut rsum = 0u64; let mut vcount = 0u32;
     while count.map_or(true, |c| sent < c) {
         sent += 1;
-        let reply = match ctx.request_with_reply("net-stack", &msg) {
-            Some(r) => Some(r),
-            None => if ctx.reacquire_by_name("net-stack") { ctx.request_with_reply("net-stack", &msg) } else { None },
+        // ABORTABLE per echo, so q quits DURING the wait for a reply, not only in the pace between echoes
+        // (a blocking request_with_reply here left q feeling unresponsive). Reacquire once on a timeout.
+        let outcome = match ctx.request_with_reply_abortable("net-stack", &msg, 5) {
+            ReqOutcome::Timeout if ctx.reacquire_by_name("net-stack") => ctx.request_with_reply_abortable("net-stack", &msg, 5),
+            other => other,
         };
-        match reply {
-            Some(r) => {
+        match outcome {
+            ReqOutcome::Reply(r) => {
                 let p = r.payload_bytes();
                 if p.first() == Some(&1) && p.len() >= 4 {
                     let rtt = u16::from_le_bytes([p[1], p[2]]);   // MICROSECONDS (net-stack reports us now)
@@ -4212,7 +4214,8 @@ fn cmd_ping(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
                     out.line_fmt(ctx, format_args!("Request timed out."));
                 }
             }
-            None => { out.line_fmt(ctx, format_args!("ping: net-stack unavailable")); break; }
+            ReqOutcome::Aborted => { sent = sent.saturating_sub(1); break; }   // q pressed mid-echo
+            ReqOutcome::Timeout => { out.line_fmt(ctx, format_args!("ping: net-stack unavailable")); break; }
         }
         if count.map_or(false, |c| sent >= c) { break; }   // last echo done: no trailing interval
         if ping_wait_or_quit(ctx) { break; }                // ~1 s pace (RTC), q/ESC quits
