@@ -4358,7 +4358,15 @@ fn net_arp(ctx: &ServiceContext, ip_str: &str, out: &mut Out) -> Result<(), Shel
 /// ARP-based, so it is fast and LAN-reliable. net-stack does the whole sweep in one op (op 7) and
 /// returns a 32-byte up-bitmap - one round trip per host, not a per-host poll from the shell.
 fn net_scan(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
-    let our = match ctx.request_with_reply_abortable("net-stack", &Message::from_bytes(&[0u8]), 5) {
+    // Reacquire net-stack by name on a clean miss/timeout - it may have come up late (its boot dance
+    // stalls ~26s on a dead link) and not be in our cap cache yet, exactly as net_arp does. Without this,
+    // running `net scan` before any other net command reported a bogus "net-stack unavailable".
+    let status0 = Message::from_bytes(&[0u8]);
+    let our0 = match ctx.request_with_reply_abortable("net-stack", &status0, 5) {
+        ReqOutcome::Timeout if ctx.reacquire_by_name("net-stack") => ctx.request_with_reply_abortable("net-stack", &status0, 5),
+        other => other,
+    };
+    let our = match our0 {
         ReqOutcome::Reply(r) => { let p = r.payload_bytes(); if p.len() >= 4 { [p[0], p[1], p[2], p[3]] } else { [0u8; 4] } }
         ReqOutcome::Aborted  => { out.line_fmt(ctx, format_args!("net scan: aborted")); return Ok(()); }
         ReqOutcome::Timeout  => { out.line_fmt(ctx, format_args!("net: net-stack unavailable")); return Ok(()); }
