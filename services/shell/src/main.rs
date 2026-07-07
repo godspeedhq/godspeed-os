@@ -4219,7 +4219,9 @@ fn cmd_ping(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
                 }
             }
             ReqOutcome::Aborted => { sent = sent.saturating_sub(1); break; }   // q pressed mid-echo
-            ReqOutcome::Timeout => { out.line_fmt(ctx, format_args!("ping: net-stack unavailable")); break; }
+            // Do NOT quit on a slow/unavailable net-stack - a continuous ping has no end. Print and keep
+            // going; the user quits with q. (With the shorter ping budget this is now rare.)
+            ReqOutcome::Timeout => { out.line_fmt(ctx, format_args!("No reply from {}.{}.{}.{}: net-stack not responding", ip[0], ip[1], ip[2], ip[3])); }
         }
         if count.map_or(false, |c| sent >= c) { break; }   // last echo done: no trailing interval
         if ping_wait_or_quit(ctx) { break; }                // ~1 s pace (RTC), q/ESC quits

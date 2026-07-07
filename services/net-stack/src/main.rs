@@ -59,6 +59,10 @@ const DANCE_TRIES: u32 = 6;
 // DNS collects frames after ONE query TX (the [4] RX-only path): up to this many frames pulled without
 // re-transmitting, so a reply behind stray broadcasts is caught (a re-TX would drain+discard it).
 const DNS_RX_TRIES: u32 = 12;
+/// ICMP echo RX budget - fewer tries than DNS so an interactive `ping` stays ~1s-cadence: a live reply
+/// lands in the first try or two, and if the link drops mid-poll this bounds the wait to ~3s (not ~9s)
+/// so the shell never times the ping out. The link is checked BEFORE the ICMP, so this only runs link-up.
+const PING_RX_TRIES: u32 = 4;
 /// Max ICMP echo DATA bytes `ping` will send (the Windows default is 32). Bounds the frame buffer.
 const PING_MAX_PAYLOAD: usize = 1024;
 
@@ -448,7 +452,7 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8;
     let rx_only = Message::from_bytes(&[4u8]);
     let mut arp_out = [0u8; 42];
     let mut reply = ctx.request_with_reply_deadline("nic-driver", &req, DANCE_SECS);
-    for _ in 0..DNS_RX_TRIES {
+    for _ in 0..PING_RX_TRIES {
         let (matched, ttl, answer_arp) = {
             let f: &[u8] = match &reply { Some(r) => r.payload_bytes(), None => { *timeouts += 1; &[] } };
             if !f.is_empty() { *frames += 1; }
