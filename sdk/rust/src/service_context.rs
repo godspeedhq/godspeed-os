@@ -552,10 +552,13 @@ impl ServiceContext {
     }
 
     /// Like [`Self::request_with_reply_deadline`] but ABORTABLE: while waiting it also drains the console
-    /// and returns [`ReqOutcome::Aborted`] the instant the user presses q/Q/ESC. Sends the request ONCE,
-    /// so aborting just stops waiting (the peer still finishes; its reply lands on the abandoned cap and is
-    /// discarded) - no re-trigger. Use for any interactive command that blocks on a peer (the "q to quit"
-    /// rule, `utilities/0_conventions.md`). A service with no console foreground never sees input, so this
+    /// and, on q/Q/ESC, stops waiting *for the user* - but it still **consumes the peer's reply** before
+    /// returning [`ReqOutcome::Aborted`]. This matters: the request is already in flight, so the peer will
+    /// reply into our endpoint whether or not we are still listening; if we bailed out without consuming
+    /// it, that stale reply would sit in the mailbox and the *next* command would read it as its own (the
+    /// `net scan` -> `net`/`net stats` "0.0.0.0 / 00:00 MAC / no register dump" bug). Sends the request
+    /// ONCE (no re-trigger). Use for any interactive command that blocks on a peer (the "q to quit" rule,
+    /// `utilities/0_conventions.md`). A service with no console foreground never sees input, so this
     /// degrades to the plain deadline wait for it.
     pub fn request_with_reply_abortable(
         &self,
@@ -571,14 +574,24 @@ impl ServiceContext {
             return ReqOutcome::Timeout;
         }
         let t0 = self.epoch_secs_monotonic();
+        let mut aborting = false;
         loop {
-            if let Some(r) = self.try_recv() { return ReqOutcome::Reply(r); }
-            while let Some(b) = self.try_console_read() {
-                if b == b'q' || b == b'Q' || b == 0x1b { self.remove_cap(reply_cap); return ReqOutcome::Aborted; }
+            if let Some(r) = self.try_recv() {
+                // Reply arrived. Even if the user pressed q we consume it HERE - never leave it in our
+                // endpoint for the next command to misread - and report Aborted; otherwise deliver it.
+                self.remove_cap(reply_cap);
+                return if aborting { ReqOutcome::Aborted } else { ReqOutcome::Reply(r) };
+            }
+            if !aborting {
+                while let Some(b) = self.try_console_read() {
+                    if b == b'q' || b == b'Q' || b == 0x1b { aborting = true; break; }
+                }
             }
             if self.epoch_secs_monotonic() - t0 >= max_secs {
+                // Timed out before a reply. (On abort we keep waiting up to the same deadline so the
+                // in-flight reply is consumed; only a genuinely unresponsive peer reaches here.)
                 self.remove_cap(reply_cap);
-                return ReqOutcome::Timeout;
+                return if aborting { ReqOutcome::Aborted } else { ReqOutcome::Timeout };
             }
             self.yield_cpu();
         }
