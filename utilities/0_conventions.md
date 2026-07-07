@@ -51,15 +51,22 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     that can wedge the shell with no way out is forbidden (§26.7: loud + escapable over silent +
     stuck). The primitive is `ServiceContext::request_with_reply_abortable` (send once, poll `q`
     while waiting); never block an interactive command on a bare `request_with_reply` to a peer
-    that can be slow. **Escaping must stop the WORK, not just the wait:** if a command drives a
-    multi-step peer operation (a sweep, a batch), drive it **step-by-step from the shell** so `q`
-    ends the loop and the peer is only ever mid-ONE step - a single batch op that keeps running
-    after you stop waiting just wedges the *next* command (the `net scan` op-7-to-op-6 fix).
-11. **Output is a pipeable structure.** A utility's result is data, not decoration: a producer
+    that can be slow.
+11. **Quitting stops the TASK, not just the shell.** When a utility is escaped (rule 10), the
+    escape must abort the actual WORK the utility set in motion - not merely stop the shell from
+    *waiting* on it. If the utility handed a long job to a peer service and the escape only stops
+    the shell listening, the peer keeps grinding and the very *next* command blocks behind it: the
+    shell looks free but is not. So a command that drives a multi-step peer operation (a sweep, a
+    batch) drives it **step-by-step from the shell**, so `q` ends the loop and the peer is only
+    ever mid-ONE step. Worked example: `net scan` began as one batch `net-stack` op (sweep all 254
+    hosts); pressing `q` unblocked the shell, but net-stack kept sweeping, so a *second* `net scan`
+    hung waiting for it. The fix made the shell drive the sweep one host at a time (op 7 -> per-host
+    op 6). Escaping the wait is not enough; escape the work.
+12. **Output is a pipeable structure.** A utility's result is data, not decoration: a producer
     emits either a typed record `Table` (`docs/records.md`, so `| where` / `| select` /
     `| to json` compose) or plain labelled lines (so `| match` / `| count` compose). Piping is
     the composition model; output that cannot flow onward is a dead end.
-12. **If it does not fit the common pipes, `write` still captures it.** Any producer's output
+13. **If it does not fit the common pipes, `write` still captures it.** Any producer's output
     snapshots to a file with `| write <path>` (redirection is `| write`; there is no `>`, see
     `19_write.md`). So even a utility that is not a record source is never trapped on screen -
     its bytes always have somewhere to go.
