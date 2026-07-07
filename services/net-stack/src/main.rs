@@ -361,7 +361,7 @@ fn build_arp_reply(f: &[u8], our_ip: &[u8; 4], out: &mut [u8; 42]) -> bool {
 /// and converted to milliseconds via the kernel's boot-calibrated ticks-per-10ms (0 -> reported as 0).
 /// Sends ONCE then RX-only polls ([4]) so a reply behind stray broadcasts is caught without re-TX.
 fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8; 4],
-        payload_len: usize, frames: &mut u16, timeouts: &mut u16) -> Option<(u16, u8)> {
+        payload_len: usize, seq: u16, frames: &mut u16, timeouts: &mut u16) -> Option<(u16, u8)> {
     let plen = payload_len.min(PING_MAX_PAYLOAD);
     let flen = 42 + plen;
     let mut frame = [0u8; 42 + PING_MAX_PAYLOAD];
@@ -380,7 +380,8 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8;
     frame[24] = (ip_ck >> 8) as u8; frame[25] = ip_ck as u8;
     frame[34] = 8;                                   // echo request
     frame[38] = 0x00; frame[39] = 0x01;              // id
-    frame[40] = 0x00; frame[41] = 0x01;              // seq
+    frame[40] = (seq >> 8) as u8; frame[41] = seq as u8;  // seq: UNIQUE per ping so a stale echo reply
+                                                          // from a prior ping cannot match (RTT accuracy)
     // Data pattern (Windows sends the lowercase alphabet cycling); the reply echoes it back.
     for i in 0..plen { frame[42 + i] = b'a' + (i % 23) as u8; }
     let icmp_ck = checksum(&frame[34..42 + plen]);
@@ -400,7 +401,8 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8;
             // cannot be confused, and skip stray frames.
             let m = f.len() >= 42 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45
                 && f[23] == 1 && f[34] == 0
-                && f[26] == dest_ip[0] && f[27] == dest_ip[1] && f[28] == dest_ip[2] && f[29] == dest_ip[3];
+                && f[26] == dest_ip[0] && f[27] == dest_ip[1] && f[28] == dest_ip[2] && f[29] == dest_ip[3]
+                && f[40] == (seq >> 8) as u8 && f[41] == seq as u8;  // reply must echo THIS ping's seq
             let ttl = if m { f[22] } else { 0 };     // the reply's TTL (the pinged host's)
             // Otherwise: is this the gateway ARPing for US? Answer it so it can address the echo reply.
             let a = !m && build_arp_reply(f, our_ip, &mut arp_out);
@@ -478,7 +480,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // probe internet reachability. Only once ARP gave us the gateway's MAC. internet_ok distinguishes
     // "no internet / the gateway does not route out" from a DNS-specific failure.
     let (mut _pf, mut _pt) = (0u16, 0u16);
-    let ping_ok = have_mac && ping(&ctx, &gw_mac, &our_ip, &gateway, 32, &mut _pf, &mut _pt).is_some();
+    let ping_ok = have_mac && ping(&ctx, &gw_mac, &our_ip, &gateway, 32, 0, &mut _pf, &mut _pt).is_some();
     if ping_ok {
         ctx.log_fmt(format_args!("net-stack: ICMP - {}.{}.{}.{} echo reply (ping OK)",
             gateway[0], gateway[1], gateway[2], gateway[3]));
@@ -498,6 +500,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     status[14] = (have_mac as u8) | ((ping_ok as u8) << 1);
     status[15..19].copy_from_slice(&dns_server);   // the DHCP-learned DNS server (a `net` diagnostic)
     let mut sockets = [Socket { rid: 0, port: 0 }; MAX_SOCKETS];
+    let mut ping_seq: u16 = 0;                    // unique ICMP seq per ping - see ping() (RTT accuracy)
     ctx.log("net-stack: serving the client API (status/dns/socket)");
     loop {
         let req = ctx.recv();                   // block for a client request
@@ -575,7 +578,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             let bytes = if pl.len() >= 7 { u16::from_le_bytes([pl[5], pl[6]]) as usize } else { 32 };
             let mut frames = 0u16;
             let mut timeouts = 0u16;
-            let result = if have_mac { ping(&ctx, &gw_mac, &our_ip, &dip, bytes, &mut frames, &mut timeouts) }
+            ping_seq = ping_seq.wrapping_add(1);   // distinct per echo so a stale reply can't match
+            let result = if have_mac { ping(&ctx, &gw_mac, &our_ip, &dip, bytes, ping_seq, &mut frames, &mut timeouts) }
                          else { None };
             let rb = match result {
                 Some((rtt, ttl)) => { let r = rtt.to_le_bytes(); [1u8, r[0], r[1], ttl] }
