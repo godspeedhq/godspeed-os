@@ -721,8 +721,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             status = d.status;
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&status));
         } else {
-            // Status request (default): reply the frozen 19-byte record.
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&status));
+            // Status request (default): reply the CURRENT state, not just the frozen record. Read the link
+            // and, if it is down (cable out), clear the "gateway resolved / ping OK" flags so `net` reflects
+            // reality instead of stale boot-time info - as adaptable as `ping`. have_mac is NOT cleared (the
+            // gateway MAC persists, so `net`/`ping` resume on replug without re-dancing).
+            let mut s = status;
+            if !link_is_up(&ctx) { s[14] = 0; }
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&s));
         }
         ctx.remove_cap(reply_cap);
     }
