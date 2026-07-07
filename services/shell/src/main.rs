@@ -5318,12 +5318,12 @@ fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
         // Own `q` while the child paints. The bound is a paranoid safety net so a hung child can
         // never wedge the shell forever; normally we break on `q` (or if the child dies).
         for _ in 0..u32::MAX {
-            // Sleep (don't busy-yield) so the core still halts between polls. The tick-based sleep
-            // floors at one 10 ms scheduler quantum, so a sub-quantum value gives the minimum ~1-tick
-            // (~10 ms) `q` latency - down from ~50 ms - while keeping the idle-between-polls (not a spin).
-            ctx.sleep(5_000_000);
-            // Drain the console; quit on `q`/`Q` (other keys are discarded - observe takes no
-            // other input). Echo is off (the child disabled it), so nothing smears the frame.
+            // Poll `q` by YIELDING, not ctx.sleep. The tick-based sleep converts through the TSC
+            // calibration, which is WRONG on the AMD T630 (CPUID exposes no usable TSC frequency) - a
+            // ctx.sleep there can stretch to many seconds, so `q` appeared dead and the user had to
+            // reboot. yield_cpu polls every scheduler round on ANY hardware; the painter is on another
+            // core, so this does not starve it. Drain the console; quit on q/Q. Echo is off (child owns it).
+            ctx.yield_cpu();
             let mut quit = false;
             while let Some(b) = ctx.try_console_read() {
                 if b == b'q' || b == b'Q' { quit = true; }
@@ -5342,6 +5342,12 @@ fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
     // Echo stays OFF - the shell, not the kernel, owns echo.
     ctx.console_echo(false);
     ctx.console_write("\x1b[H");
+    // `observe now` paints only the body; reprint the live view's title bar above it so the exit
+    // snapshot is the WHOLE frame - top not cut off, a faithful freeze of what you were watching. These
+    // two strings are byte-for-byte the painter's (services/observe title bar); \x1b[K clears whatever
+    // the partial frame left on these two rows.
+    ctx.console_write("observe - live                                      (q to quit)\x1b[K\r\n");
+    ctx.console_write("================================================================\x1b[K\r\n");
     let r = cmd_observe_now(ctx);
     ctx.console_write("\x1b[J\x1b[?25h");
     r
