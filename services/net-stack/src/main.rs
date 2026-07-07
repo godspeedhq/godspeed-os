@@ -356,12 +356,27 @@ fn build_arp_reply(f: &[u8], our_ip: &[u8; 4], out: &mut [u8; 42]) -> bool {
     true
 }
 
+/// Calibrate the TSC frequency (Hz) against the RTC - the portable ground truth. The kernel's CPUID/PIT
+/// calibration yields 0 on the AMD T630 (CPUID has no usable leaf; the PIT channel-2 output bit misbehaves),
+/// but the RTC and `read_tsc` both work, so measure directly: align to a wall-clock second boundary, sample
+/// the TSC, wait one more second, sample again - the delta is one second of TSC. Uses the DEGLITCHED epoch
+/// so a CMOS misread cannot shorten the window; returns 0 (RTT then shows 0) if the result is implausible.
+fn calibrate_tsc_hz(ctx: &ServiceContext) -> u64 {
+    let s0 = ctx.epoch_secs_monotonic();
+    while ctx.epoch_secs_monotonic() == s0 { ctx.yield_cpu(); }   // align to a second boundary
+    let t0 = ctx.read_tsc();
+    let s1 = ctx.epoch_secs_monotonic();
+    while ctx.epoch_secs_monotonic() == s1 { ctx.yield_cpu(); }   // exactly one second later
+    let hz = ctx.read_tsc().wrapping_sub(t0);
+    if (100_000_000..=10_000_000_000).contains(&hz) { hz } else { 0 }   // 100 MHz .. 10 GHz is sane
+}
+
 /// Send one ICMP echo of `payload_len` data bytes to `dest_ip` and wait for the reply. Returns
-/// `Some((rtt_ms, reply_ttl))` on an echo reply, `None` on timeout. The round trip is timed with the TSC
-/// and converted to milliseconds via the kernel's boot-calibrated ticks-per-10ms (0 -> reported as 0).
+/// `Some((rtt_us, reply_ttl))` on an echo reply, `None` on timeout. The round trip is timed with the TSC
+/// and converted to microseconds via `tsc_hz` (RTC-calibrated; 0 -> reported as 0).
 /// Sends ONCE then RX-only polls ([4]) so a reply behind stray broadcasts is caught without re-TX.
 fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8; 4],
-        payload_len: usize, seq: u16, frames: &mut u16, timeouts: &mut u16) -> Option<(u16, u8)> {
+        payload_len: usize, seq: u16, tsc_hz: u64, frames: &mut u16, timeouts: &mut u16) -> Option<(u16, u8)> {
     let plen = payload_len.min(PING_MAX_PAYLOAD);
     let flen = 42 + plen;
     let mut frame = [0u8; 42 + PING_MAX_PAYLOAD];
@@ -387,7 +402,6 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8;
     let icmp_ck = checksum(&frame[34..42 + plen]);
     frame[36] = (icmp_ck >> 8) as u8; frame[37] = icmp_ck as u8;
 
-    let ticks10 = ctx.tsc_ticks_per_10ms();
     let t1 = ctx.read_tsc();
     let req     = Message::from_bytes(&frame[..flen]);
     let rx_only = Message::from_bytes(&[4u8]);
@@ -412,7 +426,9 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8;
             let dt = ctx.read_tsc().wrapping_sub(t1);
             // MICROSECONDS: dt cycles * 10000 / cycles-per-10ms. Finer than ms so a sub-millisecond LAN RTT
             // is visible and distinguishable from a WAN one; capped at 65 ms (u16).
-            let rtt_us = if ticks10 > 0 { (dt.saturating_mul(10000) / ticks10).min(65535) as u16 } else { 0 };
+            // us = cycles * 1e6 / tsc_hz. tsc_hz is calibrated against the RTC (the kernel's CPUID/PIT
+            // calibration yields 0 on the AMD T630), so this holds when q16 does not.
+            let rtt_us = if tsc_hz > 0 { (dt.saturating_mul(1_000_000) / tsc_hz).min(65535) as u16 } else { 0 };
             return Some((rtt_us, ttl));
         }
         // Owe an ARP reply? Send it (its request also returns the next frame). Else just poll RX-only.
@@ -482,7 +498,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // probe internet reachability. Only once ARP gave us the gateway's MAC. internet_ok distinguishes
     // "no internet / the gateway does not route out" from a DNS-specific failure.
     let (mut _pf, mut _pt) = (0u16, 0u16);
-    let ping_ok = have_mac && ping(&ctx, &gw_mac, &our_ip, &gateway, 32, 0, &mut _pf, &mut _pt).is_some();
+    let ping_ok = have_mac && ping(&ctx, &gw_mac, &our_ip, &gateway, 32, 0, 0, &mut _pf, &mut _pt).is_some();
     if ping_ok {
         ctx.log_fmt(format_args!("net-stack: ICMP - {}.{}.{}.{} echo reply (ping OK)",
             gateway[0], gateway[1], gateway[2], gateway[3]));
@@ -503,6 +519,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     status[15..19].copy_from_slice(&dns_server);   // the DHCP-learned DNS server (a `net` diagnostic)
     let mut sockets = [Socket { rid: 0, port: 0 }; MAX_SOCKETS];
     let mut ping_seq: u16 = 0;                    // unique ICMP seq per ping - see ping() (RTT accuracy)
+    let tsc_hz = calibrate_tsc_hz(&ctx);          // RTC-calibrated TSC Hz for RTT (kernel calib is 0 on T630)
     ctx.log("net-stack: serving the client API (status/dns/socket)");
     loop {
         let req = ctx.recv();                   // block for a client request
@@ -581,7 +598,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             let mut frames = 0u16;
             let mut timeouts = 0u16;
             ping_seq = ping_seq.wrapping_add(1);   // distinct per echo so a stale reply can't match
-            let result = if have_mac { ping(&ctx, &gw_mac, &our_ip, &dip, bytes, ping_seq, &mut frames, &mut timeouts) }
+            let result = if have_mac { ping(&ctx, &gw_mac, &our_ip, &dip, bytes, ping_seq, tsc_hz, &mut frames, &mut timeouts) }
                          else { None };
             let rb = match result {
                 Some((rtt, ttl)) => { let r = rtt.to_le_bytes(); [1u8, r[0], r[1], ttl] }

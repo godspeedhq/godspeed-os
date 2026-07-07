@@ -4172,8 +4172,7 @@ fn cmd_ping(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
                     let rtt = u16::from_le_bytes([p[1], p[2]]);   // MICROSECONDS (net-stack reports us now)
                     let ttl = p[3];
                     recv += 1;
-                    // Show us under a millisecond (so a LAN reply and a WAN reply are distinguishable),
-                    // ms.d above it. 0 = below the clock's resolution.
+                    // us under a millisecond (LAN), ms.d above it (WAN). 0 = below the clock's resolution.
                     if rtt == 0 {
                         out.line_fmt(ctx, format_args!("Reply from {}.{}.{}.{}: bytes={} time<1us TTL={}", ip[0], ip[1], ip[2], ip[3], b, ttl));
                     } else if rtt < 1000 {
