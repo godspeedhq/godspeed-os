@@ -678,14 +678,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // and `ping 8.8.8.8` probes the internet. Reply: [alive, rtt_ms(le u16), reply_ttl].
             let dip = [pl[1], pl[2], pl[3], pl[4]];
             let bytes = if pl.len() >= 7 { u16::from_le_bytes([pl[5], pl[6]]) as usize } else { 32 };
-            let mut frames = 0u16;
-            let mut timeouts = 0u16;
-            ping_seq = ping_seq.wrapping_add(1);   // distinct per echo so a stale reply can't match
-            let result = if have_mac { ping(&ctx, &gw_mac, &our_ip, &dip, bytes, ping_seq, tsc_hz, &mut frames, &mut timeouts) }
-                         else { None };
-            let rb = match result {
-                Some((rtt, ttl)) => { let r = rtt.to_le_bytes(); [1u8, r[0], r[1], ttl] }
-                None => [0u8, 0, 0, 0],
+            // Check the link FIRST. With the cable out, an ICMP polls its FULL budget (~seconds) and the
+            // ping looks FROZEN - one line every several seconds. A fast [2] "no link" reply keeps the
+            // shell's ~1s cadence: it prints "no link" each second and RESUMES real replies the moment the
+            // cable is back (the gateway MAC persists, so the ICMP just flows again). Byte 0: 1=reply,
+            // 0=timeout (link up, no answer), 2=no link.
+            let rb = if !link_is_up(&ctx) {
+                [2u8, 0, 0, 0]
+            } else {
+                let mut frames = 0u16;
+                let mut timeouts = 0u16;
+                ping_seq = ping_seq.wrapping_add(1);   // distinct per echo so a stale reply can't match
+                match if have_mac { ping(&ctx, &gw_mac, &our_ip, &dip, bytes, ping_seq, tsc_hz, &mut frames, &mut timeouts) } else { None } {
+                    Some((rtt, ttl)) => { let r = rtt.to_le_bytes(); [1u8, r[0], r[1], ttl] }
+                    None => [0u8, 0, 0, 0],
+                }
             };
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rb));
         } else if pl.first() == Some(&6) && pl.len() >= 5 {

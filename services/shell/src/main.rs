@@ -4210,6 +4210,10 @@ fn cmd_ping(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
                     if rtt < rmin { rmin = rtt; }
                     if rtt > rmax { rmax = rtt; }
                     rsum += rtt as u64; vcount += 1;
+                } else if p.first() == Some(&2) {
+                    // net-stack reports the NIC link is down - keep pinging at the same cadence so it is
+                    // clearly still trying, and it resumes the moment the cable is back.
+                    out.line_fmt(ctx, format_args!("No reply from {}.{}.{}.{}: no link (cable unplugged?)", ip[0], ip[1], ip[2], ip[3]));
                 } else {
                     out.line_fmt(ctx, format_args!("Request timed out."));
                 }
