@@ -438,7 +438,7 @@ fn complete_tab(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd) {
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
     ("date",    &["epoch"]),
-    ("net",     &["dns"]),
+    ("net",     &["dns", "stats"]),
     ("drives",  &["flash", "label", "reset", "check", "scrub"]),
     ("chaos",   &["kill-storm", "flood-storm", "mem-pressure", "spawn-storm", "max-carnage"]),
     ("write",   &["append", "prepend"]),
@@ -473,6 +473,19 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
         const TARGETS: &[&str] =
             &["all-services", "supervisor", "block-driver", "fs", "logger", "xhci", "ehci", "shell"];
         return complete_from_list(ctx, line, tok_start, TARGETS);
+    }
+
+    // `ping [count N] [bytes N] <ip>`: the option keywords may appear in either order before the IP, so
+    // complete them at ANY position where the token prefix-matches one not already used (not just first).
+    if "ping".as_bytes() == cmd {
+        const PING_OPTS: &[&str] = &["count", "bytes"];
+        let mut avail = [""; 2];
+        let mut a = 0usize;
+        for &k in PING_OPTS {
+            let used = head.split(|&b| b == b' ').any(|w| w == k.as_bytes());
+            if !used && a < avail.len() { avail[a] = k; a += 1; }
+        }
+        return complete_from_list(ctx, line, tok_start, &avail[..a]);
     }
 
     if let Some((_, cands)) = SUBCMD_FIRST.iter().find(|(c, _)| c.as_bytes() == cmd) {
