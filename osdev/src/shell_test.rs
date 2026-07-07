@@ -236,6 +236,15 @@ pub fn run(image_path: &Path, smp: u32) {
     check!(arp_out.contains("10.0.2.2 is at") || arp_out.contains("10.0.2.2: no ARP reply"),
            "net arp: resolves a host MAC by ARP (op 6 no longer hangs)");
 
+    // net renew (op 8): re-run the DHCP/ARP/ICMP dance IN PLACE - the recovery path for a link that came
+    // up after boot (Commandment IX: recovery must be testable). On QEMU slirp the link is up, so a renew
+    // reconfigures and reports "network up"; the point is that the dance is re-runnable (not boot-once) and
+    // returns without hanging. The link-down -> up transition itself is HW-verified on the T630.
+    send(&mut write_half, b"net renew\r");
+    let renew_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)).unwrap_or_default();
+    check!(renew_out.contains("network up") || renew_out.contains("still no gateway"),
+           "net renew: re-runs the dance in place and reports (recover a link, no reboot - op 8)");
+
     // net scan (op 7) is deliberately NOT tested here: it broadcasts an ARP to all 254 /24 hosts, and on
     // QEMU's quiet slirp (only the gateway answers, no broadcast chatter) each non-responding host burns
     // nic-driver's full RX_POLL_MAX wait, so the sweep runs ~100s - unfair to gate on. It is fast on a
