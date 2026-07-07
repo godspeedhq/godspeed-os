@@ -39,6 +39,27 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
    Concretely: the clock's epoch subcommand is `date epoch` ("seconds since 1970"),
    not `date unix`; there is no `time` clock (in Unix `time` measures command
    duration). Pick words that say what the thing *is* in this system.
+9. **Every utility and subcommand tab-completes.** The name completes from the command
+   list; each subcommand keyword completes at its position (`net a` -> `net arp`, `net ver`
+   -> `net version`, `ping c` -> `count`). Rule 4 makes words the vocabulary; completion is
+   what makes typing words as cheap as flags. A subcommand that does not complete is one the
+   user cannot discover without reading the source. Wire it in the shell's completion tables
+   (`SUBCMD_FIRST` / the per-command case) the same commit that adds the subcommand.
+10. **Anything that blocks or waits is escapable with `q`.** If a utility can sit waiting - on
+    a peer service, on the network, on a long sweep - then `q`/`Q`/ESC MUST abort it and return
+    to the prompt, and a wait of more than a moment advertises `(press q to abort)`. A command
+    that can wedge the shell with no way out is forbidden (§26.7: loud + escapable over silent +
+    stuck). The primitive is `ServiceContext::request_with_reply_abortable` (send once, poll `q`
+    while waiting); never block an interactive command on a bare `request_with_reply` to a peer
+    that can be slow.
+11. **Output is a pipeable structure.** A utility's result is data, not decoration: a producer
+    emits either a typed record `Table` (`docs/records.md`, so `| where` / `| select` /
+    `| to json` compose) or plain labelled lines (so `| match` / `| count` compose). Piping is
+    the composition model; output that cannot flow onward is a dead end.
+12. **If it does not fit the common pipes, `write` still captures it.** Any producer's output
+    snapshots to a file with `| write <path>` (redirection is `| write`; there is no `>`, see
+    `19_write.md`). So even a utility that is not a record source is never trapped on screen -
+    its bytes always have somewhere to go.
 
 ### Help output shape (normative)
 

@@ -118,7 +118,7 @@ landed and the driver has not consumed it yet. (On QEMU the e1000 path prints CT
 gsh> net arp 192.168.4.1
 192.168.4.1 is at 00:ab:48:da:1b:0d
 gsh> net scan
-Scanning 192.168.4.0/24 for live hosts (a few seconds):
+Scanning 192.168.4.0/24 for live hosts (press q to abort):
   192.168.4.1
   192.168.4.80
   192.168.4.107
@@ -127,7 +127,9 @@ Scanning 192.168.4.0/24 for live hosts (a few seconds):
 
 `net scan` runs the whole sweep inside `net-stack` (one broadcast ARP per host, replies caught inline) and
 returns a bitmap of responders - one op, not a per-host round trip from the shell. It is quick on a real
-LAN (broadcast traffic keeps the receiver busy so each poll lands fast); on a quiet link it is slower.
+LAN (broadcast traffic keeps the receiver busy so each poll lands fast); on a quiet link it is slower, so
+`q`/ESC aborts the wait (the "any blocking command is escapable" convention, `0_conventions.md` §1.10).
+`net arp` is likewise abortable.
 
 ## 4. Pipe behaviour (`to` / `from` / `where`)
 

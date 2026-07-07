@@ -9,6 +9,14 @@ use crate::capability::{CapError, CapHandle};
 use crate::ipc::{IpcError, Message};
 use crate::syscall::raw_syscall;
 
+/// Outcome of an abortable request/reply ([`ServiceContext::request_with_reply_abortable`]): the reply
+/// arrived, the user pressed `q`/`Q`/ESC to abort the wait, or the deadline expired with no reply.
+pub enum ReqOutcome {
+    Reply(Message),
+    Aborted,
+    Timeout,
+}
+
 /// Wall-clock date/time read from the hardware RTC, fully decoded (binary,
 /// 24-hour). See [`ServiceContext::datetime`].
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -538,6 +546,39 @@ impl ServiceContext {
             if self.epoch_secs_monotonic() - t0 >= max_secs {
                 self.remove_cap(reply_cap);   // reply never consumed - reclaim its slot
                 return None;
+            }
+            self.yield_cpu();
+        }
+    }
+
+    /// Like [`Self::request_with_reply_deadline`] but ABORTABLE: while waiting it also drains the console
+    /// and returns [`ReqOutcome::Aborted`] the instant the user presses q/Q/ESC. Sends the request ONCE,
+    /// so aborting just stops waiting (the peer still finishes; its reply lands on the abandoned cap and is
+    /// discarded) - no re-trigger. Use for any interactive command that blocks on a peer (the "q to quit"
+    /// rule, `utilities/0_conventions.md`). A service with no console foreground never sees input, so this
+    /// degrades to the plain deadline wait for it.
+    pub fn request_with_reply_abortable(
+        &self,
+        peer: &str,
+        msg:  &crate::ipc::Message,
+        max_secs: i64,
+    ) -> ReqOutcome {
+        let target = match self.find_send_slot(peer) { Some(s) => CapHandle(s), None => return ReqOutcome::Timeout };
+        let self_grant = match self.self_grant_handle() { Some(g) => g, None => return ReqOutcome::Timeout };
+        let reply_cap = match self.derive_cap(self_grant) { Some(c) => c, None => return ReqOutcome::Timeout };
+        if self.send_with_cap_by_handle(target, reply_cap, msg).is_err() {
+            self.remove_cap(reply_cap);
+            return ReqOutcome::Timeout;
+        }
+        let t0 = self.epoch_secs_monotonic();
+        loop {
+            if let Some(r) = self.try_recv() { return ReqOutcome::Reply(r); }
+            while let Some(b) = self.try_console_read() {
+                if b == b'q' || b == b'Q' || b == 0x1b { self.remove_cap(reply_cap); return ReqOutcome::Aborted; }
+            }
+            if self.epoch_secs_monotonic() - t0 >= max_secs {
+                self.remove_cap(reply_cap);
+                return ReqOutcome::Timeout;
             }
             self.yield_cpu();
         }

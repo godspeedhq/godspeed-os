@@ -2,7 +2,7 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, CapInfo, CapHandle, Message, IpcError};
+use godspeed_sdk::{ServiceContext, CapInfo, CapHandle, Message, IpcError, ReqOutcome};
 use godspeed_sdk::record::{Table, Value, RecordSink, parse_predicate, AggOp, AggErr, REC_MAX_ROWS, REC_ARENA};
 
 const MAX_LINE: usize = 128;
@@ -438,7 +438,7 @@ fn complete_tab(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd) {
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
     ("date",    &["epoch"]),
-    ("net",     &["dns", "stats", "arp", "scan"]),
+    ("net",     &["dns", "stats", "arp", "scan", "version", "help"]),
     ("drives",  &["flash", "label", "reset", "check", "scrub"]),
     ("chaos",   &["kill-storm", "flood-storm", "mem-pressure", "spawn-storm", "max-carnage"]),
     ("write",   &["append", "prepend"]),
@@ -478,7 +478,7 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
     // `ping [count N] [bytes N] <ip>`: the option keywords may appear in either order before the IP, so
     // complete them at ANY position where the token prefix-matches one not already used (not just first).
     if "ping".as_bytes() == cmd {
-        const PING_OPTS: &[&str] = &["count", "bytes"];
+        const PING_OPTS: &[&str] = &["count", "bytes", "version", "help"];
         let mut avail = [""; 2];
         let mut a = 0usize;
         for &k in PING_OPTS {
@@ -4333,12 +4333,13 @@ fn net_arp(ctx: &ServiceContext, ip_str: &str, out: &mut Out) -> Result<(), Shel
         None => { out.line_fmt(ctx, format_args!("net arp: '{}' is not an IPv4 address", ip_str)); return Ok(()); }
     };
     let req = Message::from_bytes(&[6, ip[0], ip[1], ip[2], ip[3]]);
-    let reply = match ctx.request_with_reply("net-stack", &req) {
-        Some(r) => Some(r),
-        None => if ctx.reacquire_by_name("net-stack") { ctx.request_with_reply("net-stack", &req) } else { None },
+    // ABORTABLE (q). Reacquire once on a clean timeout (net-stack may have restarted).
+    let outcome = match ctx.request_with_reply_abortable("net-stack", &req, 8) {
+        ReqOutcome::Timeout if ctx.reacquire_by_name("net-stack") => ctx.request_with_reply_abortable("net-stack", &req, 8),
+        other => other,
     };
-    match reply {
-        Some(r) => {
+    match outcome {
+        ReqOutcome::Reply(r) => {
             let p = r.payload_bytes();
             if p.first() == Some(&1) && p.len() >= 7 {
                 out.line_fmt(ctx, format_args!("{}.{}.{}.{} is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -4347,7 +4348,8 @@ fn net_arp(ctx: &ServiceContext, ip_str: &str, out: &mut Out) -> Result<(), Shel
                 out.line_fmt(ctx, format_args!("{}.{}.{}.{}: no ARP reply (not on this subnet, or down)", ip[0], ip[1], ip[2], ip[3]));
             }
         }
-        None => out.line_fmt(ctx, format_args!("net: net-stack did not answer the ARP query")),
+        ReqOutcome::Aborted => out.line_fmt(ctx, format_args!("net arp: aborted")),
+        ReqOutcome::Timeout => out.line_fmt(ctx, format_args!("net: net-stack did not answer the ARP query")),
     }
     Ok(())
 }
@@ -4360,11 +4362,13 @@ fn net_scan(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
         Some(r) => { let p = r.payload_bytes(); if p.len() >= 4 { [p[0], p[1], p[2], p[3]] } else { [0u8; 4] } }
         None => { out.line_fmt(ctx, format_args!("net: net-stack unavailable")); return Ok(()); }
     };
-    out.line_fmt(ctx, format_args!("Scanning {}.{}.{}.0/24 for live hosts (a few seconds):", our[0], our[1], our[2]));
-    // The sweep runs inside net-stack (~one round trip per host); block for the single reply.
-    let up = match ctx.request_with_reply("net-stack", &Message::from_bytes(&[7u8])) {
-        Some(r) => { let p = r.payload_bytes(); let mut b = [0u8; 32]; if p.len() >= 32 { b.copy_from_slice(&p[..32]); } b }
-        None => { out.line_fmt(ctx, format_args!("net: net-stack did not answer the scan")); return Ok(()); }
+    out.line_fmt(ctx, format_args!("Scanning {}.{}.{}.0/24 for live hosts (press q to abort):", our[0], our[1], our[2]));
+    // The sweep runs inside net-stack (~one round trip per host). ABORTABLE: q stops the wait (net-stack
+    // finishes but its reply is discarded), so a long sweep on a quiet link is never a dead end.
+    let up = match ctx.request_with_reply_abortable("net-stack", &Message::from_bytes(&[7u8]), 30) {
+        ReqOutcome::Reply(r) => { let p = r.payload_bytes(); let mut b = [0u8; 32]; if p.len() >= 32 { b.copy_from_slice(&p[..32]); } b }
+        ReqOutcome::Aborted  => { out.line_fmt(ctx, format_args!("net scan: aborted")); return Ok(()); }
+        ReqOutcome::Timeout  => { out.line_fmt(ctx, format_args!("net: net-stack did not answer the scan")); return Ok(()); }
     };
     let mut found = 0u32;
     for x in 1..=254u16 {
