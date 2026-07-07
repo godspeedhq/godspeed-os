@@ -567,6 +567,16 @@ fn run_dance(ctx: &ServiceContext) -> NetState {
     NetState { our_ip, gw_mac, have_mac, dns_server, status }
 }
 
+/// Read the NIC link state from nic-driver's `[3]` status. RTL8168: byte 7 = link up. On the QEMU e1000
+/// path the reply is short (no link byte) - a non-empty reply means "up" (slirp's virtual link is always
+/// up). Cheap; lets net-stack notice a cable plugged in after boot and self-configure without `net renew`.
+fn link_is_up(ctx: &ServiceContext) -> bool {
+    match ctx.request_with_reply_deadline("nic-driver", &Message::from_bytes(&[3u8]), DANCE_SECS) {
+        Some(r) => { let p = r.payload_bytes(); if p.len() > 7 { p[7] != 0 } else { !p.is_empty() } }
+        None    => false,
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("net-stack: starting");
@@ -593,6 +603,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             None => continue,                   // a request with no reply cap - drop it
         };
         let pl = req.payload_bytes();
+        // AUTO-CONFIGURE: while UNCONFIGURED (no gateway - booted with no cable, or a boot dance that met a
+        // dead link), a `net` (op 0) or `ping` (op 3) request first checks the NIC link; if it has come up
+        // (cable plugged in), re-run the dance IN PLACE so the network self-configures - no `net renew`.
+        // Gated on !have_mac so a configured stack pays nothing, and retried per request so the PHY's
+        // few-second post-cable auto-negotiation eventually catches. Once configured the gateway MAC
+        // persists, so a later unplug/replug just resumes (the ICMP flows again) without re-dancing.
+        if badge.is_none() && !have_mac && matches!(pl.first(), Some(&0) | Some(&3)) && link_is_up(&ctx) {
+            ctx.log("net-stack: link up while unconfigured - auto-configuring");
+            let d = run_dance(&ctx);
+            our_ip = d.our_ip; gw_mac = d.gw_mac; have_mac = d.have_mac; dns_server = d.dns_server; status = d.status;
+        }
         if let Some((rid, right)) = badge {
             // Socket-cap invocation - SOP_SEND: transmit a UDP datagram through this socket. Payload =
             // [dest_ip(4), dest_port(2), data...]. Reply = the response's UDP payload (empty on none).
