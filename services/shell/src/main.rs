@@ -4178,7 +4178,7 @@ fn cmd_ping(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
                     } else if rtt < 1000 {
                         out.line_fmt(ctx, format_args!("Reply from {}.{}.{}.{}: bytes={} time={}us TTL={}", ip[0], ip[1], ip[2], ip[3], b, rtt, ttl));
                     } else {
-                        out.line_fmt(ctx, format_args!("Reply from {}.{}.{}.{}: bytes={} time={}.{}ms TTL={}", ip[0], ip[1], ip[2], ip[3], b, rtt / 1000, (rtt % 1000) / 100, ttl));
+                        out.line_fmt(ctx, format_args!("Reply from {}.{}.{}.{}: bytes={} time={}ms TTL={}", ip[0], ip[1], ip[2], ip[3], b, (rtt as u32 + 500) / 1000, ttl));
                     }
                     if rtt < rmin { rmin = rtt; }
                     if rtt > rmax { rmax = rtt; }
@@ -4199,8 +4199,17 @@ fn cmd_ping(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
     out.line_fmt(ctx, format_args!("Ping statistics for {}.{}.{}.{}:", ip[0], ip[1], ip[2], ip[3]));
     out.line_fmt(ctx, format_args!("    Packets: Sent = {}, Received = {}, Lost = {} ({}% loss)", sent, recv, lost, loss));
     if vcount > 0 {
-        out.line_fmt(ctx, format_args!("Approximate round trip times in microseconds:"));
-        out.line_fmt(ctx, format_args!("    Minimum = {}us, Maximum = {}us, Average = {}us", rmin, rmax, rsum / vcount as u64));
+        let avg = rsum / vcount as u64;
+        // Same unit for the whole summary, chosen by the average (a session's replies cluster together):
+        // us for a LAN-scale ping, integer ms for a WAN-scale one.
+        if avg < 1000 {
+            out.line_fmt(ctx, format_args!("Approximate round trip times in microseconds:"));
+            out.line_fmt(ctx, format_args!("    Minimum = {}us, Maximum = {}us, Average = {}us", rmin, rmax, avg));
+        } else {
+            out.line_fmt(ctx, format_args!("Approximate round trip times in milliseconds:"));
+            out.line_fmt(ctx, format_args!("    Minimum = {}ms, Maximum = {}ms, Average = {}ms",
+                (rmin as u64 + 500) / 1000, (rmax as u64 + 500) / 1000, (avg + 500) / 1000));
+        }
     } else if recv > 0 {
         out.line_fmt(ctx, format_args!("    (round-trip time unavailable - this host's TSC clock is uncalibrated)"));
     }
