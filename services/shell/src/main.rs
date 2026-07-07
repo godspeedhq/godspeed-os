@@ -3504,10 +3504,12 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("date", "full timestamp (weekday date time)", "date"),
             ("date epoch", "seconds since 1970-01-01", "date epoch"),
         ], true),
-        "net" => help_block(ctx, "net", "network status + DNS resolution", &[
+        "net" => help_block(ctx, "net", "network status, DNS, and ARP host discovery", &[
             ("net", "IP, gateway (+MAC), and whether the gateway pings", "net"),
             ("net dns <host>", "resolve a hostname to an IPv4 address", "net dns example.com"),
             ("net stats", "dump the NIC's raw registers (chip state: RE/RCR/RX ring)", "net stats"),
+            ("net arp <ip>", "resolve one host's MAC by ARP", "net arp 192.168.4.1"),
+            ("net scan", "ARP-sweep the local /24 for live hosts", "net scan"),
             ("net | write <path>", "snapshot the status to a file", "net | write /netstat.txt"),
         ], true),
         "ping" => help_block(ctx, "ping", "continuous ICMP echo to a raw IPv4 address (no DNS)", &[
@@ -3674,6 +3676,12 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
         ], false),
         ("net", "dns") => help_block(ctx, "net dns", "resolve a hostname to an IPv4 address", &[
             ("net dns <host>", "DNS A-record lookup via net-stack (slirp resolver)", "net dns example.com"),
+        ], false),
+        ("net", "arp") => help_block(ctx, "net arp", "resolve one host's MAC by ARP", &[
+            ("net arp <ip>", "broadcast a who-has and print the responder's MAC", "net arp 192.168.4.1"),
+        ], false),
+        ("net", "scan") => help_block(ctx, "net scan", "ARP-sweep the local /24 for live hosts", &[
+            ("net scan", "list every host on your /24 that answers ARP", "net scan"),
         ], false),
         ("observe", "now") => help_block(ctx, "observe now", "one-shot metrics frame", &[
             ("observe now", "print a single metrics frame and return", "observe now"),

@@ -25,6 +25,8 @@ serves it. `net` is the window onto it: the shell acquires `net-stack` by name a
 | `net` | Print the current network status: NIC (link/speed/MAC/hardware counters), IP, gateway, ping, DNS. |
 | `net dns <host>` | Resolve a hostname to an IPv4 address (a DNS A-record lookup). |
 | `net stats` | Dump the NIC's raw registers (chip state) - is the receiver enabled, is the ring armed? |
+| `net arp <ip>` | Resolve one host's hardware (MAC) address by ARP. |
+| `net scan` | ARP-sweep the local /24 and list the hosts that answer. |
 | `net version` | Print the version. |
 | `net help` | Print usage. |
 
@@ -109,6 +111,24 @@ NIC registers (RTL8168):
 `OWN=1` means the NIC owns that descriptor (armed, waiting for a frame); `OWN=0` means a frame has
 landed and the driver has not consumed it yet. (On QEMU the e1000 path prints CTRL/STATUS/RCTL/etc.)
 
+`net arp <ip>` resolves one host's MAC by ARP, and `net scan` sweeps the whole /24 - both live queries
+(like `net dns`), for "who else is on this LAN?":
+
+```
+gsh> net arp 192.168.4.1
+192.168.4.1 is at 00:ab:48:da:1b:0d
+gsh> net scan
+Scanning 192.168.4.0/24 for live hosts (a few seconds):
+  192.168.4.1
+  192.168.4.80
+  192.168.4.107
+3 host(s) responded.
+```
+
+`net scan` runs the whole sweep inside `net-stack` (one broadcast ARP per host, replies caught inline) and
+returns a bitmap of responders - one op, not a per-host round trip from the shell. It is quick on a real
+LAN (broadcast traffic keeps the receiver busy so each poll lands fast); on a quiet link it is slower.
+
 ## 4. Pipe behaviour (`to` / `from` / `where`)
 
 `net` is a pipe **producer**, never a consumer or filter. Its labelled lines are ordinary
@@ -131,8 +151,9 @@ the shell. `net` performs no network I/O itself - it asks the service that does.
 - **Service:** `net-stack` (`services/net-stack`). After its boot dance (DHCP -> ARP -> ICMP)
   it freezes a 19-byte record - our IP (4), gateway IP (4), gateway MAC (6), a flags byte (bit 0
   = gateway resolved, bit 1 = ping OK), and the learned DNS server (4) - and serves it. It also
-  answers a live `net dns` request (byte 0 = 1, then the hostname) and a live `ping <ip>` request
-  (byte 0 = 3, then the 4 IP bytes).
+  answers live requests: `net dns` (byte 0 = 1, then the hostname), `ping <ip>` (byte 0 = 3, then the 4 IP
+  bytes), `net arp <ip>` (byte 0 = 6, then the 4 IP bytes -> `[found, mac(6)]`), and `net scan` (byte 0 = 7
+  -> a 32-byte up-bitmap, bit `.x` set = host `.x` answered). `arp`/`scan` share one `arp_resolve` helper.
 - **Driver:** `nic-driver` answers two diagnostic queries directly (the shell holds `ACQUIRE_ANY`
   and asks it by name): `[3]` returns the 32-byte hardware status (MAC, link, speed, and the chip's
   tally counters via a DTCCR dump); `[5]` returns the raw register dump for `net stats`.

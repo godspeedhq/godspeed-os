@@ -199,7 +199,8 @@ construction.
 Each layer is small and testable; the milestone for each is a concrete wire event.
 
 - **ARP** - resolve `IP <-> MAC` on the local segment (a tiny cache + request/reply). Needed before any
-  IP frame can be addressed on the LAN.
+  IP frame can be addressed on the LAN. The shell surfaces it as `net arp <ip>` (resolve one host) and
+  `net scan` (ARP-sweep the local /24 for live hosts).
 - **IPv4** - parse/emit headers, checksum, fragmentation we **refuse loudly** rather than implement at
   first (datagrams over MTU are an error, §26.7), a single static default gateway (no routing table).
   IPv6 is far-future.
