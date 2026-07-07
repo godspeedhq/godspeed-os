@@ -754,31 +754,34 @@ pub fn uart_rx_poll() {
 /// tail - acceptable while COM1 input is unused (a per-ring lock is future work).
 pub fn console_push_byte(b: u8) {
     use core::sync::atomic::Ordering;
-    // Echo the keystroke to the console (serial + framebuffer) so the user sees
-    // their input inline - the framebuffer has no terminal-side local echo, so
-    // without this typing is invisible on a display. (On a serial terminal, turn
-    // local echo OFF so characters are not doubled.) Enter advances a line;
-    // backspace erases the last glyph.
-    // Echo via the CONSOLE path (serial + framebuffer) - keystrokes are part of
-    // the interactive session, not the log stream, so they belong on the TV.
-    // Suppressed while a foreground full-screen app owns the screen (it paints the
-    // display itself; its raw key polls must not smear its frame).
-    if CONSOLE_ECHO_ENABLED.load(Ordering::Acquire) {
-        match b {
-            b'\n' | b'\r' => console_write_bytes(b"\r\n"),
-            // Backspace is NOT echoed here: a destructive erase (BS, space, BS)
-            // would chew past the prompt when the line is empty. Line editing is
-            // the reader's policy - the shell echoes the erase only when it has a
-            // character to delete (it knows the line length; the kernel does not).
-            0x20..=0x7e   => console_write_byte(b),
-            _             => {}
-        }
-    }
+    // Capture the byte into the input ring + wake any reader FIRST, before the echo.
+    // The echo writes to the framebuffer (a slow, locked scroll); if a foreground
+    // command is ALSO scrolling heavily (e.g. `ping` printing a line a second), the
+    // echo stalls on that contention - and with the ring push AFTER it, the keystroke
+    // would never become readable, so `q` could not quit the command. Ring-first makes
+    // input capture independent of the display: the byte is readable immediately and
+    // the echo (display only) happens after and may block harmlessly.
     // SAFETY: single-producer ring push in practice (see note above).
     unsafe { uart_rx_push(b) };
     let waiter = CONSOLE_READ_WAITER.load(Ordering::Acquire);
     if waiter != u32::MAX {
         crate::task::scheduler::wake_by_slot(waiter as usize, 0);
+    }
+    // Echo the keystroke to the console (serial + framebuffer) so the user sees their
+    // input inline - the framebuffer has no terminal-side local echo, so without this
+    // typing is invisible on a display. (On a serial terminal, turn local echo OFF so
+    // characters are not doubled.) Enter advances a line. Suppressed while a foreground
+    // full-screen app owns the screen (it paints the display itself; its raw key polls
+    // must not smear its frame).
+    if CONSOLE_ECHO_ENABLED.load(Ordering::Acquire) {
+        match b {
+            b'\n' | b'\r' => console_write_bytes(b"\r\n"),
+            // Backspace is NOT echoed here: a destructive erase (BS, space, BS) would
+            // chew past the prompt when the line is empty. Line editing is the reader's
+            // policy - the shell echoes the erase only when it has a character to delete.
+            0x20..=0x7e   => console_write_byte(b),
+            _             => {}
+        }
     }
 }
 
