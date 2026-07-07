@@ -4169,22 +4169,21 @@ fn cmd_ping(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
             Some(r) => {
                 let p = r.payload_bytes();
                 if p.first() == Some(&1) && p.len() >= 4 {
-                    let rtt = u16::from_le_bytes([p[1], p[2]]);
+                    let rtt = u16::from_le_bytes([p[1], p[2]]);   // MICROSECONDS (net-stack reports us now)
                     let ttl = p[3];
                     recv += 1;
-                    // A ping RTT over ~10 s is impossible - it means this host's TSC calibration is bogus
-                    // (the AMD T630's CPUID leaves are wrong), so report the reply but not a garbage time.
-                    if rtt > 10000 {
-                        out.line_fmt(ctx, format_args!("Reply from {}.{}.{}.{}: bytes={} time=? TTL={}", ip[0], ip[1], ip[2], ip[3], b, ttl));
-                    } else if rtt == 0 {
-                        out.line_fmt(ctx, format_args!("Reply from {}.{}.{}.{}: bytes={} time<1ms TTL={}", ip[0], ip[1], ip[2], ip[3], b, ttl));
-                        rmin = 0; vcount += 1;
+                    // Show us under a millisecond (so a LAN reply and a WAN reply are distinguishable),
+                    // ms.d above it. 0 = below the clock's resolution.
+                    if rtt == 0 {
+                        out.line_fmt(ctx, format_args!("Reply from {}.{}.{}.{}: bytes={} time<1us TTL={}", ip[0], ip[1], ip[2], ip[3], b, ttl));
+                    } else if rtt < 1000 {
+                        out.line_fmt(ctx, format_args!("Reply from {}.{}.{}.{}: bytes={} time={}us TTL={}", ip[0], ip[1], ip[2], ip[3], b, rtt, ttl));
                     } else {
-                        out.line_fmt(ctx, format_args!("Reply from {}.{}.{}.{}: bytes={} time={}ms TTL={}", ip[0], ip[1], ip[2], ip[3], b, rtt, ttl));
-                        if rtt < rmin { rmin = rtt; }
-                        if rtt > rmax { rmax = rtt; }
-                        rsum += rtt as u64; vcount += 1;
+                        out.line_fmt(ctx, format_args!("Reply from {}.{}.{}.{}: bytes={} time={}.{}ms TTL={}", ip[0], ip[1], ip[2], ip[3], b, rtt / 1000, (rtt % 1000) / 100, ttl));
                     }
+                    if rtt < rmin { rmin = rtt; }
+                    if rtt > rmax { rmax = rtt; }
+                    rsum += rtt as u64; vcount += 1;
                 } else {
                     out.line_fmt(ctx, format_args!("Request timed out."));
                 }
@@ -4201,8 +4200,8 @@ fn cmd_ping(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
     out.line_fmt(ctx, format_args!("Ping statistics for {}.{}.{}.{}:", ip[0], ip[1], ip[2], ip[3]));
     out.line_fmt(ctx, format_args!("    Packets: Sent = {}, Received = {}, Lost = {} ({}% loss)", sent, recv, lost, loss));
     if vcount > 0 {
-        out.line_fmt(ctx, format_args!("Approximate round trip times in milli-seconds:"));
-        out.line_fmt(ctx, format_args!("    Minimum = {}ms, Maximum = {}ms, Average = {}ms", rmin, rmax, rsum / vcount as u64));
+        out.line_fmt(ctx, format_args!("Approximate round trip times in microseconds:"));
+        out.line_fmt(ctx, format_args!("    Minimum = {}us, Maximum = {}us, Average = {}us", rmin, rmax, rsum / vcount as u64));
     } else if recv > 0 {
         out.line_fmt(ctx, format_args!("    (round-trip time unavailable - this host's TSC clock is uncalibrated)"));
     }

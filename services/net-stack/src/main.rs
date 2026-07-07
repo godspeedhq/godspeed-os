@@ -410,8 +410,10 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8;
         };
         if matched {
             let dt = ctx.read_tsc().wrapping_sub(t1);
-            let rtt_ms = if ticks10 > 0 { (dt.saturating_mul(10) / ticks10).min(65535) as u16 } else { 0 };
-            return Some((rtt_ms, ttl));
+            // MICROSECONDS: dt cycles * 10000 / cycles-per-10ms. Finer than ms so a sub-millisecond LAN RTT
+            // is visible and distinguishable from a WAN one; capped at 65 ms (u16).
+            let rtt_us = if ticks10 > 0 { (dt.saturating_mul(10000) / ticks10).min(65535) as u16 } else { 0 };
+            return Some((rtt_us, ttl));
         }
         // Owe an ARP reply? Send it (its request also returns the next frame). Else just poll RX-only.
         reply = if answer_arp {
