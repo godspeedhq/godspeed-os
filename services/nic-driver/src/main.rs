@@ -113,6 +113,9 @@ const RTL_CR_RE:  u8 = 0x08;
 const RTL_CR_TE:  u8 = 0x04;
 const RTL_TPPOLL_NPQ: u8 = 0x40;
 
+const RTL_ISR_RDU:  u16 = 1 << 4;  // Rx Descriptor Unavailable - the ring filled; RX HALTS until recovered
+const RTL_ISR_FOVW: u16 = 1 << 6;  // Rx FIFO Overflow - also halts RX until the ring is re-armed
+
 // C+ 16-byte descriptor word 0 (opts1): flags in the high bits, length/size in the low 14 bits.
 const RTL_DESC_OWN: u32 = 1 << 31; // owned by the NIC (set = NIC's; it clears the bit when done)
 const RTL_DESC_EOR: u32 = 1 << 30; // end of ring (the last descriptor - the NIC wraps here)
@@ -227,10 +230,19 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
         let req = ctx.recv();
         let reply_cap = match ctx.take_pending_cap() { Some(c) => c, None => continue };
         // ACK any latched RX/TX interrupt status before servicing. We POLL (IMR=0), and an UNCLEARED RDU
-        // (Rx Descriptor Unavailable) or FOVW (Rx FIFO Overflow) HALTS the RTL8168 receiver until it is
-        // acked - `net stats` showed ISR=0x95 (RDU+TDU latched) with an armed-but-empty RX ring, exactly
-        // this halt. Clearing the ISR every request lets RX (and TX) resume. This is the Layer-1 stall fix.
+        // (Rx Descriptor Unavailable) or FOVW (Rx FIFO Overflow) HALTS the RTL8168 receiver - `net stats`
+        // showed ISR=0x95 (RDU+TDU latched). But acking ALONE does not un-halt it once the ring actually
+        // FILLED: while net-stack sits idle between operations, background broadcasts pile the ring full and
+        // the receiver stops (works first session, dead the next). So on RDU/FOVW, re-arm EVERY descriptor
+        // (empty the ring, dropping stale broadcasts) and RESTART the receiver, so the next real frame
+        // lands. Mid-session this cannot fire - net-stack drains frame-by-frame, so the ring never fills.
+        let isr = mmio.read16(RTL_ISR);
         mmio.write16(RTL_ISR, 0xFFFF);
+        if isr & (RTL_ISR_RDU | RTL_ISR_FOVW) != 0 {
+            for i in 0..RX_RING_COUNT { rtl_arm_rx(arena, i); }
+            rx_idx = 0;
+            mmio.write8(RTL_CR, RTL_CR_RE | RTL_CR_TE);
+        }
         // [3] STATUS query (the `net` nic-mac diagnostic) - answer the MAC, do NOT treat it as a frame.
         if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 3 } {
             // Fresh 15-byte status: reset_ok, mac(6), CURRENT link, last-TX-done, last-RX len, TX/RX
