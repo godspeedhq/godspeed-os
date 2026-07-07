@@ -900,6 +900,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "net-stack"
+version = "0.1.0"
+dependencies = [
+ "godspeed-sdk",
+]
+
+[[package]]
 name = "nic-driver"
 version = "0.1.0"
 dependencies = [
