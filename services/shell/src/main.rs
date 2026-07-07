@@ -438,7 +438,7 @@ fn complete_tab(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd) {
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
     ("date",    &["epoch"]),
-    ("net",     &["dns", "stats"]),
+    ("net",     &["dns", "stats", "arp", "scan"]),
     ("drives",  &["flash", "label", "reset", "check", "scrub"]),
     ("chaos",   &["kill-storm", "flood-storm", "mem-pressure", "spawn-storm", "max-carnage"]),
     ("write",   &["append", "prepend"]),
@@ -4301,11 +4301,72 @@ fn cmd_net(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellEr
     if arg == "stats" {
         return net_stats_dump(ctx, out);
     }
+    if arg == "arp" {
+        ctx.console_writeln("net: usage: net arp <ip>   (e.g. net arp 192.168.4.1)");
+        return Err(ShellError::Unknown);
+    }
+    if let Some(ips) = arg.strip_prefix("arp ") {
+        return net_arp(ctx, ips.trim(), out);
+    }
+    if arg == "scan" {
+        return net_scan(ctx, out);
+    }
     if !arg.is_empty() {
-        ctx.console_writeln("net: unknown subcommand - try 'net', 'net dns <host>', 'net stats', or 'net help'");
+        ctx.console_writeln("net: unknown subcommand - try net, net dns <host>, net stats, net arp <ip>, net scan, or net help");
         return Err(ShellError::Unknown);
     }
     net_status(ctx, out)
+}
+
+/// `net arp <ip>` - resolve one host's hardware address by ARP (net-stack op 6).
+fn net_arp(ctx: &ServiceContext, ip_str: &str, out: &mut Out) -> Result<(), ShellError> {
+    let ip = match parse_ipv4(ip_str) {
+        Some(ip) => ip,
+        None => { out.line_fmt(ctx, format_args!("net arp: '{}' is not an IPv4 address", ip_str)); return Ok(()); }
+    };
+    let req = Message::from_bytes(&[6, ip[0], ip[1], ip[2], ip[3]]);
+    let reply = match ctx.request_with_reply("net-stack", &req) {
+        Some(r) => Some(r),
+        None => if ctx.reacquire_by_name("net-stack") { ctx.request_with_reply("net-stack", &req) } else { None },
+    };
+    match reply {
+        Some(r) => {
+            let p = r.payload_bytes();
+            if p.first() == Some(&1) && p.len() >= 7 {
+                out.line_fmt(ctx, format_args!("{}.{}.{}.{} is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    ip[0], ip[1], ip[2], ip[3], p[1], p[2], p[3], p[4], p[5], p[6]));
+            } else {
+                out.line_fmt(ctx, format_args!("{}.{}.{}.{}: no ARP reply (not on this subnet, or down)", ip[0], ip[1], ip[2], ip[3]));
+            }
+        }
+        None => out.line_fmt(ctx, format_args!("net: net-stack did not answer the ARP query")),
+    }
+    Ok(())
+}
+
+/// `net scan` - ARP-sweep the local /24 (derived from our own IP) and list the hosts that answer.
+/// ARP-based, so it is fast and LAN-reliable. net-stack does the whole sweep in one op (op 7) and
+/// returns a 32-byte up-bitmap - one round trip per host, not a per-host poll from the shell.
+fn net_scan(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
+    let our = match ctx.request_with_reply("net-stack", &Message::from_bytes(&[0u8])) {
+        Some(r) => { let p = r.payload_bytes(); if p.len() >= 4 { [p[0], p[1], p[2], p[3]] } else { [0u8; 4] } }
+        None => { out.line_fmt(ctx, format_args!("net: net-stack unavailable")); return Ok(()); }
+    };
+    out.line_fmt(ctx, format_args!("Scanning {}.{}.{}.0/24 for live hosts (a few seconds):", our[0], our[1], our[2]));
+    // The sweep runs inside net-stack (~one round trip per host); block for the single reply.
+    let up = match ctx.request_with_reply("net-stack", &Message::from_bytes(&[7u8])) {
+        Some(r) => { let p = r.payload_bytes(); let mut b = [0u8; 32]; if p.len() >= 32 { b.copy_from_slice(&p[..32]); } b }
+        None => { out.line_fmt(ctx, format_args!("net: net-stack did not answer the scan")); return Ok(()); }
+    };
+    let mut found = 0u32;
+    for x in 1..=254u16 {
+        if up[(x >> 3) as usize] & (1 << (x & 7)) != 0 {
+            out.line_fmt(ctx, format_args!("  {}.{}.{}.{}", our[0], our[1], our[2], x));
+            found += 1;
+        }
+    }
+    out.line_fmt(ctx, format_args!("{} host(s) responded.", found));
+    Ok(())
 }
 
 /// `net dns <host>` - resolve a hostname to an IPv4 address. net-stack sends the DNS query to slirp's

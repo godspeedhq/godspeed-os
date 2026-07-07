@@ -356,6 +356,47 @@ fn build_arp_reply(f: &[u8], our_ip: &[u8; 4], out: &mut [u8; 42]) -> bool {
     true
 }
 
+/// Resolve one host's MAC by ARP: broadcast a who-has, poll for the reply whose SENDER IP is the target
+/// (answering any inbound ARP for us in the meantime, so the gateway can still address us). `None` if no
+/// reply within the budget. Used by `net arp` (any host) and `net scan` (across the subnet). Same frame
+/// path and bound as `ping`/`dns_resolve`, which is why it is reliable now that the receiver no longer
+/// stalls (RTL8168 RDU recovery) and the deadline no longer glitches (deglitched RTC).
+fn arp_resolve(ctx: &ServiceContext, our_ip: &[u8; 4], target: &[u8; 4]) -> Option<[u8; 6]> {
+    let mut arp = [0u8; 42];
+    for b in arp.iter_mut().take(6) { *b = 0xff; }   // eth dst = broadcast
+    arp[6..12].copy_from_slice(&OUR_MAC);
+    arp[12] = 0x08; arp[13] = 0x06;                  // ARP
+    arp[14] = 0x00; arp[15] = 0x01;                  // htype Ethernet
+    arp[16] = 0x08; arp[17] = 0x00;                  // ptype IPv4
+    arp[18] = 0x06; arp[19] = 0x04;                  // hlen 6, plen 4
+    arp[20] = 0x00; arp[21] = 0x01;                  // oper = request
+    arp[22..28].copy_from_slice(&OUR_MAC);
+    arp[28..32].copy_from_slice(our_ip);
+    arp[38..42].copy_from_slice(target);             // target ip = who we ask for
+    let req     = Message::from_bytes(&arp);
+    let rx_only = Message::from_bytes(&[4u8]);
+    let mut arp_out = [0u8; 42];
+    let mut reply = ctx.request_with_reply_deadline("nic-driver", &req, DANCE_SECS);
+    for _ in 0..DNS_RX_TRIES {
+        let (mac, answer_arp) = {
+            let f: &[u8] = match &reply { Some(r) => r.payload_bytes(), None => &[] };
+            // An ARP REPLY (oper 2) whose SENDER IP is the target we asked for (not some other host's).
+            let hit = f.len() >= 42 && f[12] == 0x08 && f[13] == 0x06 && f[20] == 0x00 && f[21] == 0x02
+                && f[28] == target[0] && f[29] == target[1] && f[30] == target[2] && f[31] == target[3];
+            let mac = if hit { let mut m = [0u8; 6]; m.copy_from_slice(&f[22..28]); Some(m) } else { None };
+            let a = mac.is_none() && build_arp_reply(f, our_ip, &mut arp_out);
+            (mac, a)
+        };
+        if let Some(m) = mac { return Some(m); }
+        reply = if answer_arp {
+            ctx.request_with_reply_deadline("nic-driver", &Message::from_bytes(&arp_out), DANCE_SECS)
+        } else {
+            ctx.request_with_reply_deadline("nic-driver", &rx_only, DANCE_SECS)
+        };
+    }
+    None
+}
+
 /// Calibrate the TSC frequency (Hz) against the RTC - the portable ground truth. The kernel's CPUID/PIT
 /// calibration yields 0 on the AMD T630 (CPUID has no usable leaf; the PIT channel-2 output bit misbehaves),
 /// but the RTC and `read_tsc` both work, so measure directly: align to a wall-clock second boundary, sample
@@ -605,8 +646,51 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 None => [0u8, 0, 0, 0],
             };
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rb));
+        } else if pl.first() == Some(&6) && pl.len() >= 5 {
+            // ARP (op 6, then 4 IP bytes): resolve one host's MAC. Reply [found, mac(6)]. `net arp` uses
+            // it directly; `net scan` calls it across the subnet.
+            let target = [pl[1], pl[2], pl[3], pl[4]];
+            let rb = match arp_resolve(&ctx, &our_ip, &target) {
+                Some(m) => [1u8, m[0], m[1], m[2], m[3], m[4], m[5]],
+                None    => [0u8; 7],
+            };
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rb));
+        } else if pl.first() == Some(&7) {
+            // SCAN (op 7): ARP-sweep our /24 - broadcast an ARP for every host, catch replies INLINE (a
+            // reply for .x usually lands by the next send's RX poll), then drain stragglers. Reply = a
+            // 32-byte bitmap, bit .x set = host .x answered. One op, ~one round-trip per host.
+            let net = [our_ip[0], our_ip[1], our_ip[2]];
+            let mut up = [0u8; 32];
+            let mut a = [0u8; 42];
+            for b in a.iter_mut().take(6) { *b = 0xff; }
+            a[6..12].copy_from_slice(&OUR_MAC);
+            a[12] = 0x08; a[13] = 0x06; a[14] = 0x00; a[15] = 0x01; a[16] = 0x08; a[17] = 0x00;
+            a[18] = 0x06; a[19] = 0x04; a[20] = 0x00; a[21] = 0x01;
+            a[22..28].copy_from_slice(&OUR_MAC);
+            a[28..32].copy_from_slice(&our_ip);
+            let rx_only = Message::from_bytes(&[4u8]);
+            let record = |f: &[u8], up: &mut [u8; 32]| {
+                if f.len() >= 42 && f[12] == 0x08 && f[13] == 0x06 && f[20] == 0x00 && f[21] == 0x02
+                    && f[28] == net[0] && f[29] == net[1] && f[30] == net[2] {
+                    let ux = f[31]; up[(ux >> 3) as usize] |= 1 << (ux & 7);
+                }
+            };
+            if have_mac {
+                for x in 1..=254u8 {
+                    a[38..42].copy_from_slice(&[net[0], net[1], net[2], x]);
+                    if let Some(r) = ctx.request_with_reply_deadline("nic-driver", &Message::from_bytes(&a), DANCE_SECS) {
+                        record(r.payload_bytes(), &mut up);
+                    }
+                }
+                for _ in 0..DNS_RX_TRIES {   // drain stragglers (the last hosts' replies)
+                    if let Some(r) = ctx.request_with_reply_deadline("nic-driver", &rx_only, DANCE_SECS) {
+                        record(r.payload_bytes(), &mut up);
+                    }
+                }
+            }
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&up));
         } else {
-            // Status request (default): reply the frozen 15-byte record.
+            // Status request (default): reply the frozen 19-byte record.
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&status));
         }
         ctx.remove_cap(reply_cap);

@@ -229,6 +229,18 @@ pub fn run(image_path: &Path, smp: u32) {
     let statsout = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)).unwrap_or_default();
     check!(statsout.contains("NIC registers"), "net stats: dumps raw NIC registers (chip state)");
 
+    // net arp <ip>: resolve one host's MAC by ARP (op 6). slirp answers for its gateway (10.0.2.2). This
+    // form HUNG in the serve loop on the pre-robustness base; verify it now returns cleanly.
+    send(&mut write_half, b"net arp 10.0.2.2\r");
+    let arp_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)).unwrap_or_default();
+    check!(arp_out.contains("10.0.2.2 is at") || arp_out.contains("10.0.2.2: no ARP reply"),
+           "net arp: resolves a host MAC by ARP (op 6 no longer hangs)");
+
+    // net scan (op 7) is deliberately NOT tested here: it broadcasts an ARP to all 254 /24 hosts, and on
+    // QEMU's quiet slirp (only the gateway answers, no broadcast chatter) each non-responding host burns
+    // nic-driver's full RX_POLL_MAX wait, so the sweep runs ~100s - unfair to gate on. It is fast on a
+    // real LAN (broadcasts land in the poll) and is HW-verified on the T630.
+
     // sock (utilities/41_sock.md): a UDP socket as a CAPABILITY. The shell opens a socket cap from
     // net-stack and sends a datagram THROUGH it - proving a socket is a real kernel cap (§7.10) the
     // client holds and invokes, not an ambient channel. Lenient on the UDP response (external), but
