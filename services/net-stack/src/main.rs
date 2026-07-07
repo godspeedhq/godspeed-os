@@ -482,7 +482,6 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8;
     None
 }
 
-#[no_mangle]
 /// What one run of the boot dance (DHCP -> ARP -> ICMP) learns: our IP, the gateway's MAC, whether ARP
 /// resolved it, the DNS server, and the frozen 19-byte status record served to clients. Produced by
 /// [`run_dance`] at boot AND re-produced on `net renew` (op 8), so a link that comes up AFTER boot is
@@ -568,6 +567,7 @@ fn run_dance(ctx: &ServiceContext) -> NetState {
     NetState { our_ip, gw_mac, have_mac, dns_server, status }
 }
 
+#[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("net-stack: starting");
 
