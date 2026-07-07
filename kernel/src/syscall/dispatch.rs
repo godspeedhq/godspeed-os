@@ -1277,7 +1277,7 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     // boot/RTC reads (10, 11). Every other query discloses another task's or
     // system-wide state and requires the INTROSPECT capability with READ (§3.1;
     // docs/introspection-capability.md).
-    if !matches!(query_id, 0 | 3 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16)
+    if !matches!(query_id, 0 | 3 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17)
         && !scheduler::current_task_holds_resource(
             crate::capability::INTROSPECT_RESOURCE, Rights::READ)
     {
@@ -1316,6 +1316,11 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // task-neutral timing (like the raw TSC, query 3): userspace turns a TSC delta into milliseconds
         // as `delta * 10 / this`. `ping` uses it for round-trip time. 0 if the TSC was not calibrated.
         16 => crate::arch::x86_64::boot::tsc_ticks_per_quantum() as i64,
+        // Deglitched monotonic "now" in epoch seconds (rtc.rs now_epoch_monotonic): the wall clock with
+        // backward / huge-forward CMOS misreads dropped. For time-DELTA deadlines
+        // (request_with_reply_deadline) and pacing, where a raw RTC glitch (the "4383d" misread) would
+        // expire a deadline instantly. Ungated task-neutral timing, like the raw RTC (query 11).
+        17 => crate::arch::x86_64::rtc::now_epoch_monotonic(),
         4 => crate::memory::allocator::free_frame_count() as i64,
         5 => crate::memory::allocator::total_frame_count() as i64,
         6 => scheduler::core_active_ticks(arg1 as usize) as i64,

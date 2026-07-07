@@ -530,10 +530,12 @@ impl ServiceContext {
             self.remove_cap(reply_cap);   // send failed: reclaim the untransferred reply cap (no leak)
             return None;
         }
-        let t0 = self.datetime().epoch_secs();
+        // Deglitched monotonic clock, not the raw RTC: a single CMOS misread (the "4383d" glitch on the
+        // T630) would otherwise make `now - t0` read huge and expire the deadline instantly.
+        let t0 = self.epoch_secs_monotonic();
         loop {
             if let Some(r) = self.try_recv() { return Some(r); }
-            if self.datetime().epoch_secs() - t0 >= max_secs {
+            if self.epoch_secs_monotonic() - t0 >= max_secs {
                 self.remove_cap(reply_cap);   // reply never consumed - reclaim its slot
                 return None;
             }
@@ -815,6 +817,14 @@ impl ServiceContext {
         // SAFETY: syscall(13) = InspectKernel; query_id=11 = packed RTC datetime.
         let p = unsafe { raw_syscall(13, 11, 0, 0) } as u64;
         Self::unpack_datetime(p)
+    }
+
+    /// Deglitched monotonic "now" in epoch seconds (kernel query 17). Unlike `datetime().epoch_secs()`
+    /// (the raw RTC, query 11 - a CMOS misread on an in-range year slips through and reads years off), this
+    /// drops backward / huge-forward glitches. Use it for time-DELTA deadlines and pacing, NOT for display.
+    pub fn epoch_secs_monotonic(&self) -> i64 {
+        // SAFETY: syscall(13) = InspectKernel; query 17 = deglitched monotonic epoch seconds.
+        unsafe { raw_syscall(13, 17, 0, 0) }
     }
 
     /// Decode the packed RTC `u64` (the layout shared by query 11 / 12) into a `Datetime`.

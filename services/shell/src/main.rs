@@ -4108,12 +4108,14 @@ fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
 /// so a TSC interval collapsed to ~0 and the ping FLOODED (200 lines in a blink). The RTC second is
 /// portable and never floods - it just waits for the wall-clock second to tick over.
 fn ping_wait_or_quit(ctx: &ServiceContext) -> bool {
-    let start = ctx.datetime().epoch_secs();
+    // Deglitched monotonic seconds, not the raw RTC: a single CMOS misread (the T630's "4383d" glitch)
+    // would otherwise skip or stall a pace interval.
+    let start = ctx.epoch_secs_monotonic();
     loop {
         if let Some(b) = ctx.try_console_read() {
             if b == b'q' || b == b'Q' || b == 0x1b { return true; }
         }
-        if ctx.datetime().epoch_secs() != start { return false; }   // wall-clock second ticked (~1 s)
+        if ctx.epoch_secs_monotonic() != start { return false; }   // wall-clock second ticked (~1 s)
         ctx.yield_cpu();
     }
 }
