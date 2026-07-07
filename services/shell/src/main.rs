@@ -4335,11 +4335,14 @@ enum NetQ { Reply(Message), Timeout, Aborted }
 /// an abort key between tries, up to `max_secs`. Returns the reply, a timeout, or Aborted. (Safe under
 /// the piped shell-test: it waits for the prompt between commands, so no input is pending during `net`.)
 fn net_query(ctx: &ServiceContext, peer: &str, msg: &Message, max_secs: i64) -> NetQ {
-    for _ in 0..=max_secs {
+    for i in 0..=max_secs {
         while let Some(b) = ctx.try_console_read() {
             if b == b'q' || b == b'Q' || b == 0x1b { return NetQ::Aborted; }
         }
         if let Some(r) = ctx.request_with_reply_deadline(peer, msg, 1) { return NetQ::Reply(r); }
+        // Only tell the user about q if the reply DIDN'T come in the first second (a stall) - so a fast
+        // query stays clean, but a wedged one advertises how to escape it.
+        if i == 0 { ctx.console_writeln("net: waiting for a reply - press q to abort"); }
         ctx.reacquire_by_name(peer);
     }
     NetQ::Timeout
@@ -5330,14 +5333,17 @@ fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
         }
     }
     let _ = ctx.kill("observe-live"); // reap the live painter (it never exits on its own)
-    // The painter may have been killed MID-repaint, leaving the cursor mid-frame - THAT is what smeared
-    // the prompt into the observe output. Repaint ONE complete static frame (`observe now` clears, paints
-    // a whole frame, and parks its cursor cleanly BELOW it), so the prompt lands on a fresh line UNDER the
-    // snapshot - the behaviour you liked. Then show the cursor. (Earlier I wrongly full-cleared, which
-    // dropped the snapshot entirely.) Echo stays OFF - the shell, not the kernel, owns echo.
+    // The painter is usually killed MID-repaint (each frame is ~100 ms of serial paint), leaving a
+    // PARTIAL frame and the cursor mid-screen - that was the smear, and why it regressed: on a busier
+    // core the paint takes longer, so a q lands mid-frame more often. `observe now` paints from the
+    // CURSOR (not home) and does not clear, so it must be aimed: HOME first, repaint one complete static
+    // frame OVER the partial one, then erase any rows left below. The cursor ends on a fresh line below
+    // the whole frame, so the prompt lands cleanly under the snapshot - every time, the way you liked it.
+    // Echo stays OFF - the shell, not the kernel, owns echo.
     ctx.console_echo(false);
+    ctx.console_write("\x1b[H");
     let r = cmd_observe_now(ctx);
-    ctx.console_write("\x1b[?25h");
+    ctx.console_write("\x1b[J\x1b[?25h");
     r
 }
 
