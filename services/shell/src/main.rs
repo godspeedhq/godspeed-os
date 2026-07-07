@@ -438,7 +438,7 @@ fn complete_tab(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd) {
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
     ("date",    &["epoch"]),
-    ("net",     &["dns", "stats", "arp", "scan", "version", "help"]),
+    ("net",     &["dns", "stats", "arp", "scan", "renew", "version", "help"]),
     ("drives",  &["flash", "label", "reset", "check", "scrub"]),
     ("chaos",   &["kill-storm", "flood-storm", "mem-pressure", "spawn-storm", "max-carnage"]),
     ("write",   &["append", "prepend"]),
@@ -3510,6 +3510,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("net stats", "dump the NIC's raw registers (chip state: RE/RCR/RX ring)", "net stats"),
             ("net arp <ip>", "resolve one host's MAC by ARP", "net arp 192.168.4.1"),
             ("net scan", "ARP-sweep the local /24 for live hosts", "net scan"),
+            ("net renew", "re-run DHCP/ARP after plugging in a cable (recover without a reboot)", "net renew"),
             ("net | write <path>", "snapshot the status to a file", "net | write /netstat.txt"),
         ], true),
         "ping" => help_block(ctx, "ping", "continuous ICMP echo to a raw IPv4 address (no DNS)", &[
@@ -3682,6 +3683,9 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
         ], false),
         ("net", "scan") => help_block(ctx, "net scan", "ARP-sweep the local /24 for live hosts", &[
             ("net scan", "list every host on your /24 that answers ARP", "net scan"),
+        ], false),
+        ("net", "renew") => help_block(ctx, "net renew", "reconfigure the network without a reboot", &[
+            ("net renew", "re-run DHCP + ARP (recover a link that came up after boot)", "net renew"),
         ], false),
         ("observe", "now") => help_block(ctx, "observe now", "one-shot metrics frame", &[
             ("observe now", "print a single metrics frame and return", "observe now"),
@@ -4319,11 +4323,43 @@ fn cmd_net(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellEr
     if arg == "scan" {
         return net_scan(ctx, out);
     }
+    if arg == "renew" {
+        return net_renew(ctx, out);
+    }
     if !arg.is_empty() {
-        ctx.console_writeln("net: unknown subcommand - try net, net dns <host>, net stats, net arp <ip>, net scan, or net help");
+        ctx.console_writeln("net: unknown subcommand - try net, net dns <host>, net stats, net arp <ip>, net scan, net renew, or net help");
         return Err(ShellError::Unknown);
     }
     net_status(ctx, out)
+}
+
+/// `net renew` - re-run net-stack's DHCP/ARP/ICMP dance (op 8) so a link that came up AFTER boot (a
+/// cable plugged in later) reconfigures the stack without a reboot. Bounded + abortable with q.
+fn net_renew(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
+    out.line_fmt(ctx, format_args!("renewing (DHCP + ARP + ping the gateway, press q to abort)"));
+    let req = Message::from_bytes(&[8u8]);
+    let outcome = match ctx.request_with_reply_abortable("net-stack", &req, 30) {
+        ReqOutcome::Timeout if ctx.reacquire_by_name("net-stack") => ctx.request_with_reply_abortable("net-stack", &req, 30),
+        other => other,
+    };
+    match outcome {
+        ReqOutcome::Reply(r) => {
+            let p = r.payload_bytes();
+            // status: our_ip(4) gateway(4) gw_mac(6) flags(1) dns(4); flags bit 0 = gateway resolved.
+            if p.len() >= 15 && (p[14] & 1) != 0 {
+                out.line_fmt(ctx, format_args!("network up - {}.{}.{}.{}, gateway {}.{}.{}.{}{}",
+                    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
+                    if p[14] & 2 != 0 { " (ping ok)" } else { "" }));
+            } else if p.len() >= 15 {
+                out.line_fmt(ctx, format_args!("still no gateway - is the cable in and the link up?"));
+            } else {
+                out.line_fmt(ctx, format_args!("net: net-stack gave a short reply"));
+            }
+        }
+        ReqOutcome::Aborted => out.line_fmt(ctx, format_args!("net renew: aborted")),
+        ReqOutcome::Timeout => out.line_fmt(ctx, format_args!("net: net-stack unavailable")),
+    }
+    Ok(())
 }
 
 /// `net arp <ip>` - resolve one host's hardware address by ARP (net-stack op 6).
@@ -4332,6 +4368,7 @@ fn net_arp(ctx: &ServiceContext, ip_str: &str, out: &mut Out) -> Result<(), Shel
         Some(ip) => ip,
         None => { out.line_fmt(ctx, format_args!("net arp: '{}' is not an IPv4 address", ip_str)); return Ok(()); }
     };
+    out.line_fmt(ctx, format_args!("resolving {}.{}.{}.{} (press q to abort)", ip[0], ip[1], ip[2], ip[3]));
     let req = Message::from_bytes(&[6, ip[0], ip[1], ip[2], ip[3]]);
     // ABORTABLE (q). Reacquire once on a clean timeout (net-stack may have restarted).
     let outcome = match ctx.request_with_reply_abortable("net-stack", &req, 8) {

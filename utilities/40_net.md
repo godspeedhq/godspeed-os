@@ -27,6 +27,7 @@ serves it. `net` is the window onto it: the shell acquires `net-stack` by name a
 | `net stats` | Dump the NIC's raw registers (chip state) - is the receiver enabled, is the ring armed? |
 | `net arp <ip>` | Resolve one host's hardware (MAC) address by ARP. |
 | `net scan` | ARP-sweep the local /24 and list the hosts that answer. |
+| `net renew` | Re-run DHCP/ARP to reconfigure the network in place - recover a link that came up after boot (a cable plugged in later), no reboot. |
 | `net version` | Print the version. |
 | `net help` | Print usage. |
 
@@ -155,8 +156,12 @@ the shell. `net` performs no network I/O itself - it asks the service that does.
   it freezes a 19-byte record - our IP (4), gateway IP (4), gateway MAC (6), a flags byte (bit 0
   = gateway resolved, bit 1 = ping OK), and the learned DNS server (4) - and serves it. It also
   answers live requests: `net dns` (byte 0 = 1, then the hostname), `ping <ip>` (byte 0 = 3, then the 4 IP
-  bytes), and `net arp <ip>` (byte 0 = 6, then the 4 IP bytes -> `[found, mac(6)]`). `net scan` reuses op 6
+  bytes), `net arp <ip>` (byte 0 = 6, then the 4 IP bytes -> `[found, mac(6)]`), and `net renew` (byte 0 = 8
+  -> re-runs the boot dance `run_dance` in place and replies the fresh status). `net scan` reuses op 6
   host-by-host - the shell walks the /24 itself, so aborting it actually stops the work (no batch op).
+- **Recovery:** the boot dance (DHCP -> ARP -> ICMP) is `run_dance`, run once at boot AND again on `net
+  renew`, so a link that comes up after boot reconfigures the stack without a reboot (nothing is special;
+  the link recovers like any restartable thing).
 - **Driver:** `nic-driver` answers two diagnostic queries directly (the shell holds `ACQUIRE_ANY`
   and asks it by name): `[3]` returns the 32-byte hardware status (MAC, link, speed, and the chip's
   tally counters via a DTCCR dump); `[5]` returns the raw register dump for `net stats`.

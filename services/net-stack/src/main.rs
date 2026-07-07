@@ -483,15 +483,26 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8;
 }
 
 #[no_mangle]
-pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
-    ctx.log("net-stack: starting");
+/// What one run of the boot dance (DHCP -> ARP -> ICMP) learns: our IP, the gateway's MAC, whether ARP
+/// resolved it, the DNS server, and the frozen 19-byte status record served to clients. Produced by
+/// [`run_dance`] at boot AND re-produced on `net renew` (op 8), so a link that comes up AFTER boot is
+/// recovered without a reboot - nothing is special; the LINK recovers like any restartable thing.
+struct NetState {
+    our_ip: [u8; 4],
+    gw_mac: [u8; 6],
+    have_mac: bool,
+    dns_server: [u8; 4],
+    status: [u8; 19],
+}
 
-    // ---- Phase 3: DHCP FIRST, so net-stack LEARNS its own IP (self-configuring) instead of
-    // hardcoding it. This is also where we wait for nic-driver (dhcp_discover retries the first
-    // request until the driver answers). Falls back to a default only if there is no NIC / no offer
-    // (a non-e1000 host, where nic-driver serves empty replies). The IP it returns is the one ARP +
-    // ICMP use below - so DHCP is no longer a hollow demo; it configures the stack.
-    let (our_ip, gateway, dns_server) = dhcp_discover(&ctx).unwrap_or((FALLBACK_IP, GATEWAY_IP, GATEWAY_IP));
+/// Run the DHCP -> ARP -> ICMP dance once and freeze the 19-byte status. Called at boot, and again by the
+/// `net renew` op so a cable plugged in after boot (or a link that came up late) reconfigures the stack in
+/// place. Bounded (DHCP/ARP each have their own budget) and loud on each degrade, like the boot path.
+fn run_dance(ctx: &ServiceContext) -> NetState {
+    // ---- Phase 3: DHCP FIRST, so net-stack LEARNS its own IP (self-configuring). Falls back to a default
+    // only if there is no NIC / no offer (nic-driver serves empty replies). The IP it returns is the one
+    // ARP + ICMP use below.
+    let (our_ip, gateway, dns_server) = dhcp_discover(ctx).unwrap_or((FALLBACK_IP, GATEWAY_IP, GATEWAY_IP));
 
     // ---- Phase 2 step 1: ARP - who-has GATEWAY_IP, tell our_ip (a broadcast request).
     let mut arp = [0u8; 42];
@@ -535,11 +546,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         ctx.log("net-stack: ARP - no reply for the gateway within the budget - degrading");
     }
 
-    // ---- Phase 2 step 2: ICMP - ping the gateway, then a public IP (8.8.8.8) THROUGH the gateway to
-    // probe internet reachability. Only once ARP gave us the gateway's MAC. internet_ok distinguishes
-    // "no internet / the gateway does not route out" from a DNS-specific failure.
+    // ---- Phase 2 step 2: ICMP - ping the gateway to confirm it answers. Only once ARP gave us its MAC.
     let (mut _pf, mut _pt) = (0u16, 0u16);
-    let ping_ok = have_mac && ping(&ctx, &gw_mac, &our_ip, &gateway, 32, 0, 0, &mut _pf, &mut _pt).is_some();
+    let ping_ok = have_mac && ping(ctx, &gw_mac, &our_ip, &gateway, 32, 0, 0, &mut _pf, &mut _pt).is_some();
     if ping_ok {
         ctx.log_fmt(format_args!("net-stack: ICMP - {}.{}.{}.{} echo reply (ping OK)",
             gateway[0], gateway[1], gateway[2], gateway[3]));
@@ -547,17 +556,29 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         ctx.log("net-stack: ICMP - no echo reply from the gateway");
     }
 
-    // DHCP + ARP + ICMP proven over the frame interface, and net-stack SELF-CONFIGURES its IP. Now
-    // freeze the result and SERVE it: a client (the shell's `net` command) sends a status request and
-    // we reply with a fixed 15-byte record - our IP (4), the gateway IP (4), the gateway MAC (6), and
-    // a flags byte (bit0 = gateway resolved, bit1 = ping OK). The client formats it; we report raw
-    // facts (utilities/0_conventions.md rule 7). The SOCKET CAPABILITY builds on this seam next.
+    // Freeze the result: our IP (4), the gateway IP (4), the gateway MAC (6), a flags byte (bit0 = gateway
+    // resolved, bit1 = ping OK), and the DHCP-learned DNS server (4). The client formats it; we report raw
+    // facts (utilities/0_conventions.md rule 7).
     let mut status = [0u8; 19];
     status[0..4].copy_from_slice(&our_ip);
     status[4..8].copy_from_slice(&gateway);
     status[8..14].copy_from_slice(&gw_mac);
     status[14] = (have_mac as u8) | ((ping_ok as u8) << 1);
-    status[15..19].copy_from_slice(&dns_server);   // the DHCP-learned DNS server (a `net` diagnostic)
+    status[15..19].copy_from_slice(&dns_server);
+    NetState { our_ip, gw_mac, have_mac, dns_server, status }
+}
+
+pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
+    ctx.log("net-stack: starting");
+
+    // Configure the stack (DHCP -> ARP -> ICMP). These are `mut` because `net renew` (op 8) re-runs the
+    // dance in place - a link that comes up after boot recovers without a reboot.
+    let d = run_dance(&ctx);
+    let mut our_ip = d.our_ip;
+    let mut gw_mac = d.gw_mac;
+    let mut have_mac = d.have_mac;
+    let mut dns_server = d.dns_server;
+    let mut status = d.status;
     let mut sockets = [Socket { rid: 0, port: 0 }; MAX_SOCKETS];
     let mut ping_seq: u16 = 0;                    // unique ICMP seq per ping - see ping() (RTT accuracy)
     let tsc_hz = calibrate_tsc_hz(&ctx);          // RTC-calibrated TSC Hz for RTT (kernel calib is 0 on T630)
@@ -655,6 +676,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 None    => [0u8; 7],
             };
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rb));
+        } else if pl.first() == Some(&8) {
+            // RENEW (op 8): re-run the boot dance IN PLACE so a link that came up after boot - a cable
+            // plugged in later - reconfigures the stack without a reboot. Nothing is special; the link
+            // recovers like any restartable thing. Re-assign the mutable state, reply the FRESH status.
+            ctx.log("net-stack: renew - re-running DHCP/ARP/ICMP");
+            let d = run_dance(&ctx);
+            our_ip = d.our_ip;
+            gw_mac = d.gw_mac;
+            have_mac = d.have_mac;
+            dns_server = d.dns_server;
+            status = d.status;
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&status));
         } else {
             // Status request (default): reply the frozen 19-byte record.
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&status));
