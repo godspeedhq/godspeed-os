@@ -4299,16 +4299,15 @@ fn net_dns(ctx: &ServiceContext, host: &str, out: &mut Out) -> Result<(), ShellE
     req[0] = 1;
     req[1..1 + hb.len()].copy_from_slice(hb);
     let msg = Message::from_bytes(&req[..1 + hb.len()]);
-    // A DNS resolve sends a query and waits for the server, which can take a moment - show a working
-    // hint so a brief pause does not look like a hang.
+    // A DNS resolve waits on the server, which can take a moment. Route it through net_query (not a
+    // blocking send) so it is ABORTABLE: net_query polls q each round and advertises "press q to abort"
+    // if the reply does not come in the first second - so a slow or wedged resolve is escapable, not a
+    // silent hang.
     ctx.console_writeln("net: resolving ...");
-    let reply = match ctx.request_with_reply("net-stack", &msg) {
-        Some(r) => Some(r),
-        None => if ctx.reacquire_by_name("net-stack") { ctx.request_with_reply("net-stack", &msg) } else { None },
-    };
-    let reply = match reply {
-        Some(r) => r,
-        None => { ctx.console_writeln("net: net-stack unavailable"); return Err(ShellError::Unknown); }
+    let reply = match net_query(ctx, "net-stack", &msg, 8) {
+        NetQ::Reply(r)   => r,
+        NetQ::Aborted    => { ctx.console_writeln("net: aborted"); return Ok(()); }
+        NetQ::Timeout    => { ctx.console_writeln("net: net-stack did not answer the resolve"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
     if p.len() >= 5 && p[0] == 1 {
