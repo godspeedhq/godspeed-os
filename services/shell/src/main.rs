@@ -242,7 +242,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Reconstruct history from the fs so a `kill shell` respawn recovers it (§15). Best-effort: a
     // missing file or a not-yet-ready fs (e.g. cold boot) just leaves the ring empty - no error, no wait.
     hist.load(&ctx);
-    let mut nav = 0usize;
+    // Start at the live line ABOVE the loaded ring (nav == hist.len()), so the FIRST up-arrow recalls the
+    // most-recent recovered command right away - not only after an Enter resets nav. (The "history only
+    // works after pressing enter" bug on a `kill shell` respawn: nav was 0, so `if nav > 0` no-oped on a
+    // freshly loaded ring until the first Enter set nav = hist.len().)
+    let mut nav = hist.len();
     // The previous command's result (the Ok/Err model), reported by `result`. Threaded as
     // local session state - no global (services hold no global mutable state, §3.9).
     let mut last_result: Result<(), ShellError> = Ok(());

@@ -53,6 +53,11 @@ fn checksum(data: &[u8]) -> u16 {
 /// the dance instead of wedging the whole service before it can serve (the T630 hang). The call returns
 /// the instant a reply arrives (QEMU is unaffected); the deadline only bounds the no-reply case.
 const DANCE_SECS:  i64 = 2;
+/// Short deadline for INTERACTIVE nic-driver queries - the link check and the ICMP echo wait. A healthy
+/// nic-driver answers in ms and a live 8.8.8.8 reply is ~15 ms, so 1 s is generous; the point is that when
+/// the cable is unplugged (the nic-driver goes slow on RDU-recovery) `ping` gives up in ~1 s per query and
+/// shows "no link" fast, instead of each query stalling at the 2 s DANCE budget. The boot DANCE keeps 2 s.
+const LINK_SECS:   i64 = 1;
 // A few tries per step: on a LIVE network the first frame back can be a background broadcast, so a step
 // retries past stray frames (each retry is fast - a frame is already waiting) to find its real reply.
 const DANCE_TRIES: u32 = 6;
@@ -453,7 +458,7 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8;
     let req     = Message::from_bytes(&frame[..flen]);
     let rx_only = Message::from_bytes(&[4u8]);
     let mut arp_out = [0u8; 42];
-    let mut reply = ctx.request_with_reply_deadline("nic-driver", &req, DANCE_SECS);
+    let mut reply = ctx.request_with_reply_deadline("nic-driver", &req, LINK_SECS);
     for _ in 0..PING_RX_TRIES {
         let (matched, ttl, answer_arp) = {
             let f: &[u8] = match &reply { Some(r) => r.payload_bytes(), None => { *timeouts += 1; &[] } };
@@ -479,10 +484,11 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8;
             return Some((rtt_us, ttl));
         }
         // Owe an ARP reply? Send it (its request also returns the next frame). Else just poll RX-only.
+        // Both at the SHORT LINK_SECS deadline so a link-down ping gives up fast (~1 s), not the 2 s dance.
         reply = if answer_arp {
-            ctx.request_with_reply_deadline("nic-driver", &Message::from_bytes(&arp_out), DANCE_SECS)
+            ctx.request_with_reply_deadline("nic-driver", &Message::from_bytes(&arp_out), LINK_SECS)
         } else {
-            ctx.request_with_reply_deadline("nic-driver", &rx_only, DANCE_SECS)
+            ctx.request_with_reply_deadline("nic-driver", &rx_only, LINK_SECS)
         };
     }
     None
@@ -577,7 +583,7 @@ fn run_dance(ctx: &ServiceContext) -> NetState {
 /// path the reply is short (no link byte) - a non-empty reply means "up" (slirp's virtual link is always
 /// up). Cheap; lets net-stack notice a cable plugged in after boot and self-configure without `net renew`.
 fn link_is_up(ctx: &ServiceContext) -> bool {
-    match ctx.request_with_reply_deadline("nic-driver", &Message::from_bytes(&[3u8]), DANCE_SECS) {
+    match ctx.request_with_reply_deadline("nic-driver", &Message::from_bytes(&[3u8]), LINK_SECS) {
         Some(r) => { let p = r.payload_bytes(); if p.len() > 7 { p[7] != 0 } else { !p.is_empty() } }
         None    => false,
     }
