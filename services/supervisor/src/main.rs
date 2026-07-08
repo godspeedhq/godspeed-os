@@ -410,8 +410,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // Death-notification restart loop (H11 ph6; extended for fs + block-driver in Phase D).
     // The kernel enqueues the name of a dead restartable service to our endpoint; we respawn
-    // it. `recv` BLOCKS, so the core still reaches the idle/halt path and runs cool between
-    // deaths (no polling). Restartable services routed here: `block-driver`, `fs`, `shell`, `xhci`,
+    // it. We drive this on `recv_timeout`, not a blocking `recv`, so the reconcile backstop below runs
+    // on a TIMER too - not only on a notification. The supervisor thus ALWAYS reconverges to its managed
+    // set, recovering even a DROPPED notification (a storm overflowing our endpoint, or the shell orphaned
+    // in the `kill all-services` window). The core still idles between the short timed wakes. Restartable
+    // services routed here: `block-driver`, `fs`, `shell`, `xhci`,
     // `ehci`, `logger`. The supervisor itself is restartable too (Phase 6) but by the KERNEL - a dead
     // task can't respawn itself; the only death that is unrecoverable is the kernel's. Other
     // restart/kill commands still arrive via the
@@ -421,8 +424,25 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     if ctx.recv_handle().is_none() {
         ctx.park();
     }
+    // `recv_timeout` resolves RECV_WAKE_CYCLES to ~1 tick on both the PIT-calibrated T630 and QEMU's
+    // 1-tick fallback; the RTC (portable, unlike the miscalibrated TSC) paces the reconcile so we do not
+    // scan every tick. A dead task's own notification still wakes us immediately (the fast path below).
+    const RECV_WAKE_CYCLES: u64 = 1;
+    const RECONCILE_SECS: i64 = 3;
+    let mut last_reconcile = ctx.datetime().epoch_secs();
     loop {
-        let msg = ctx.recv();
+        let msg = match ctx.recv_timeout(RECV_WAKE_CYCLES) {
+            Some(m) => m,
+            None => {
+                // Timer wake: reconcile the managed set if it is due, so a DROPPED death-notification
+                // (with no following death to ride) is still recovered within RECONCILE_SECS.
+                if ctx.datetime().epoch_secs().wrapping_sub(last_reconcile) >= RECONCILE_SECS {
+                    reconcile(&ctx, &mut name_map);
+                    last_reconcile = ctx.datetime().epoch_secs();
+                }
+                continue;
+            }
+        };
         let name = core::str::from_utf8(msg.payload_bytes()).unwrap_or("");
         // Restartable services (§6.1): fs + block-driver (Phase D). Phase 3c/4 (docs/naming-design.md):
         // respawn WIRED FROM THE MAP - same peers as at boot - and the spawn refreshes the map with
@@ -493,11 +513,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
             _ => {}
         }
-        // Reconcile backstop: catch any managed service whose death notification was DROPPED under the
-        // storm (our 16-deep endpoint overflowed, or a flood clogged it) - it would otherwise stay dead
-        // forever (the "fs gone from observe after a storm" bug). A storm always has a next death to
-        // ride, so a dropped one is recovered on the following notification. Cheap when nothing is dead.
+        // Reconcile backstop after a handled death (fast path). The timer wake above additionally covers
+        // a dropped notification with NO following death to ride - e.g. the `kill all-services`
+        // shell-orphan (the shell's notify was lost in the supervisor-respawn window, and nothing else
+        // died afterward to trigger this). Cheap when nothing is dead.
         reconcile(&ctx, &mut name_map);
+        last_reconcile = ctx.datetime().epoch_secs();
     }
 }
 
