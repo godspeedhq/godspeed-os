@@ -70,6 +70,16 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     snapshots to a file with `| write <path>` (redirection is `| write`; there is no `>`, see
     `19_write.md`). So even a utility that is not a record source is never trapped on screen -
     its bytes always have somewhere to go.
+14. **Multiple same-type targets are a COMMA-separated list, never spaced.** `kill ehci,xhci,fs`,
+    `spawn ping,pong`, `restart fs,logger`, `delete /a,/b`, `mkdir docs,tmp`, `fmt a.gsh,b.gsh`,
+    `chaos max-carnage nic-driver,net-stack` - one argument, comma-delimited. NOT spaced
+    (`kill ehci xhci fs`): the shell tokenizes a line to a small fixed arg count (`MAX_ARGS = 4`), so a
+    spaced list silently caps at ~3 targets, while a comma-list is a SINGLE token and is therefore
+    unbounded. Comma is also the one uniform rule - the same separator on every command - so the user
+    never has to guess which verb wants which shape. Each target runs the command's normal
+    single-target path (same guards, same per-target report); a failure on one does not abort the
+    rest; the set is bounded. A single target with no comma behaves exactly as before. The keyword
+    `all-services` (kill only) is the whole system set expressed as one target.
 
 ### Help output shape (normative)
 
