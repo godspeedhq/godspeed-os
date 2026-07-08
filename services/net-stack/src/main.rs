@@ -60,9 +60,10 @@ const DANCE_TRIES: u32 = 6;
 // re-transmitting, so a reply behind stray broadcasts is caught (a re-TX would drain+discard it).
 const DNS_RX_TRIES: u32 = 12;
 /// ICMP echo RX budget - fewer tries than DNS so an interactive `ping` stays ~1s-cadence: a live reply
-/// lands in the first try or two, and if the link drops mid-poll this bounds the wait to ~3s (not ~9s)
-/// so the shell never times the ping out. The link is checked BEFORE the ICMP, so this only runs link-up.
-const PING_RX_TRIES: u32 = 4;
+/// lands in the first try or two, and if the link drops mid-poll this bounds the wait to ~1.5s (not ~9s).
+/// The link is checked BEFORE the ICMP and AGAIN on a timeout, so a mid-poll drop reports "no link", not
+/// "Request timed out", and recovers to the ~1s cadence immediately.
+const PING_RX_TRIES: u32 = 2;
 /// Max ICMP echo DATA bytes `ping` will send (the Windows default is 32). Bounds the frame buffer.
 const PING_MAX_PAYLOAD: usize = 1024;
 
@@ -695,7 +696,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 ping_seq = ping_seq.wrapping_add(1);   // distinct per echo so a stale reply can't match
                 match if have_mac { ping(&ctx, &gw_mac, &our_ip, &dip, bytes, ping_seq, tsc_hz, &mut frames, &mut timeouts) } else { None } {
                     Some((rtt, ttl)) => { let r = rtt.to_le_bytes(); [1u8, r[0], r[1], ttl] }
-                    None => [0u8, 0, 0, 0],
+                    // No reply: re-check the link. If it dropped DURING the poll it is "no link" (fast
+                    // recovery to the 1s cadence), not a real "Request timed out" on a live link.
+                    None => if link_is_up(&ctx) { [0u8, 0, 0, 0] } else { [2u8, 0, 0, 0] },
                 }
             };
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rb));

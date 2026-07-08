@@ -4581,21 +4581,27 @@ fn net_status(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
     }
     // 15-byte record: ip[0..4], gateway ip[4..8], gateway mac[8..14], flags[14] (bit0 gw resolved,
     // bit1 ping ok). Formatting is the shell's job; net-stack reports raw facts.
-    // Reflect the LIVE link, not the frozen record: if the cable is out (nic_link_up=false) the gateway is
-    // unreachable regardless of what net-stack last resolved, so show it degraded - `net` tracks reality.
-    let flags = if nic_link_up { p[14] } else { 0 };
-    out.line_fmt(ctx, format_args!("ip       {}.{}.{}.{}{}",
-        p[0], p[1], p[2], p[3], if nic_link_up { "" } else { "   (link down)" }));
-    if flags & 1 != 0 {
-        out.line_fmt(ctx, format_args!(
-            "gateway  {}.{}.{}.{} at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13]));
+    // Reflect the LIVE link, not the frozen record. If the cable is out, EVERY net-stack line is degraded -
+    // showing the stale (often fallback, e.g. 10.0.2.x) IP/gateway/DNS as if current is the "stale info" bug.
+    if nic_link_up {
+        let flags = p[14];
+        out.line_fmt(ctx, format_args!("ip       {}.{}.{}.{}", p[0], p[1], p[2], p[3]));
+        if flags & 1 != 0 {
+            out.line_fmt(ctx, format_args!(
+                "gateway  {}.{}.{}.{} at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13]));
+        } else {
+            out.line(ctx, "gateway  unresolved");
+        }
+        out.line(ctx, if flags & 2 != 0 { "ping     ok" } else { "ping     no" });
+        if p.len() >= 19 {
+            out.line_fmt(ctx, format_args!("dns      {}.{}.{}.{}", p[15], p[16], p[17], p[18]));
+        }
     } else {
+        out.line(ctx, "ip       unassigned (link down - cable unplugged?)");
         out.line(ctx, "gateway  unresolved");
-    }
-    out.line(ctx, if flags & 2 != 0 { "ping     ok" } else { "ping     no" });
-    if p.len() >= 19 {
-        out.line_fmt(ctx, format_args!("dns      {}.{}.{}.{}", p[15], p[16], p[17], p[18]));
+        out.line(ctx, "ping     no");
+        out.line(ctx, "dns      unresolved");
     }
     Ok(())
 }
