@@ -59,11 +59,12 @@ const DANCE_TRIES: u32 = 6;
 // DNS collects frames after ONE query TX (the [4] RX-only path): up to this many frames pulled without
 // re-transmitting, so a reply behind stray broadcasts is caught (a re-TX would drain+discard it).
 const DNS_RX_TRIES: u32 = 12;
-/// ICMP echo RX budget - fewer tries than DNS so an interactive `ping` stays ~1s-cadence: a live reply
-/// lands in the first try or two, and if the link drops mid-poll this bounds the wait to ~1.5s (not ~9s).
-/// The link is checked BEFORE the ICMP and AGAIN on a timeout, so a mid-poll drop reports "no link", not
+/// ICMP echo RX budget (loop iterations AFTER the initial send-and-wait). Kept tight so an interactive
+/// `ping` pauses as little as possible on a lost echo: a live reply lands in the initial wait or the first
+/// extra try, so the total no-reply wait is ~1.5s (initial + 1), not ~2.25s (initial + 2) or ~9s. The link
+/// is checked BEFORE the ICMP and AGAIN on a timeout, so a mid-poll drop reports "no link", not a stalled
 /// "Request timed out", and recovers to the ~1s cadence immediately.
-const PING_RX_TRIES: u32 = 2;
+const PING_RX_TRIES: u32 = 1;
 /// Max ICMP echo DATA bytes `ping` will send (the Windows default is 32). Bounds the frame buffer.
 const PING_MAX_PAYLOAD: usize = 1024;
 
