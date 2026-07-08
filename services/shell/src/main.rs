@@ -239,6 +239,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut cwd = Cwd::root();
     // Command history for up/down-arrow recall. `nav == hist.len()` means the live line.
     let mut hist = History::new();
+    // Reconstruct history from the fs so a `kill shell` respawn recovers it (§15). Best-effort: a
+    // missing file or a not-yet-ready fs (e.g. cold boot) just leaves the ring empty - no error, no wait.
+    hist.load(&ctx);
     let mut nav = 0usize;
     // The previous command's result (the Ok/Err model), reported by `result`. Threaded as
     // local session state - no global (services hold no global mutable state, §3.9).
@@ -269,6 +272,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 ctx.console_write("\r\n");
                 if line.len > 0 {
                     hist.push(line.bytes());
+                    hist.save(&ctx); // write-through to the fs (best-effort; never stalls the prompt)
                     last_result = execute(&ctx, line.bytes(), &mut cwd, last_result, 0, &mut Out::Console);
                     line.len = 0;
                     line.cur = 0;
@@ -469,10 +473,16 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
     let prior = words.clone().count();                        // args typed before the current token
 
     // `chaos max-carnage <target>`: complete the 2nd arg as the target (all-services + the service names).
+    // The target may be a comma-separated list, so complete the segment after the LAST comma - so
+    // `nic-driver,net-<tab>` finishes `net-stack` while the earlier listed targets are preserved verbatim.
     if "chaos".as_bytes() == cmd && prior == 1 && words.clone().next() == Some("max-carnage".as_bytes()) {
         const TARGETS: &[&str] =
-            &["all-services", "supervisor", "block-driver", "fs", "logger", "xhci", "ehci", "shell"];
-        return complete_from_list(ctx, line, tok_start, TARGETS);
+            &["all-services", "supervisor", "block-driver", "fs", "logger", "xhci", "ehci", "shell", "nic-driver", "net-stack"];
+        let seg_start = {
+            let tok = &line.bytes()[tok_start..];
+            tok.iter().rposition(|&b| b == b',').map(|i| tok_start + i + 1).unwrap_or(tok_start)
+        };
+        return complete_from_list(ctx, line, seg_start, TARGETS);
     }
 
     // `ping [count N] [bytes N] <ip>`: the option keywords may appear in either order before the IP, so
@@ -738,6 +748,32 @@ impl History {
         self.lines[self.n][..l].copy_from_slice(&line[..l]);
         self.lens[self.n] = l;
         self.n += 1;
+    }
+    /// Best-effort persistence to `/.gsh_history` (§15: history is shell-OWNED state, externalized to the
+    /// fs so a `kill shell` respawn reconstructs it - the same reload-or-empty + write-through shape as
+    /// `examples/counter`). Both paths are SILENT on any failure: a missing file or a down/slow fs is not
+    /// an error (§26.7), and the write must never stall the prompt. Bounded by construction (the file is
+    /// just the <=16-line ring serialized), so no unbounded growth and one OP_WRITE_FILE per command.
+    fn load(&mut self, ctx: &ServiceContext) {
+        let path = b"/.gsh_history";
+        let sz = match fs_stat(ctx, path) { Some((s, false)) if s > 0 => s as usize, _ => return };
+        let sz = sz.min(HIST_MAX * (MAX_LINE + 1));
+        let mut buf = [0u8; HIST_MAX * (MAX_LINE + 1)];
+        if !read_file_exact(ctx, path, 0, &mut buf[..sz]) { return; }
+        for line in buf[..sz].split(|&b| b == b'\n') {
+            if !line.is_empty() { self.push(line); }
+        }
+    }
+    fn save(&self, ctx: &ServiceContext) {
+        let path = b"/.gsh_history";
+        let mut buf = [0u8; HIST_MAX * (MAX_LINE + 1)];
+        let mut pos = 0usize;
+        for i in 0..self.n {
+            let l = self.get(i);
+            buf[pos..pos + l.len()].copy_from_slice(l); pos += l.len();
+            buf[pos] = b'\n'; pos += 1;
+        }
+        let _ = fs_request_bounded(ctx, OP_WRITE_FILE, path, &buf[..pos], HIST_SAVE_SECS);
     }
 }
 
@@ -3304,7 +3340,7 @@ fn save_report(ctx: &ServiceContext, path: &[u8], data: &[u8]) -> bool {
     // fs, so the write must time out gracefully rather than hang the shell (the max-carnage aggregate
     // report is small → this single-message path).
     if data.len() <= IO_CHUNK {
-        return matches!(fs_request_bounded(ctx, OP_WRITE_FILE, path, data)
+        return matches!(fs_request_bounded(ctx, OP_WRITE_FILE, path, data, SAVE_FS_MAX_SECS)
             .as_ref().map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK)));
     }
     if !fs_write_new(ctx, path, data.len() as u64) { return false; }
@@ -6096,7 +6132,7 @@ fn cmd_restart(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<()
 // round + labels them "recovered"; kill-storm may target them. The only unkillable thing is the
 // kernel; the shell is excluded only because chaos runs *inside* it. (xhci/ehci/logger are
 // directly-restartable so max-carnage can't leave them dead.)
-const CHAOS_RESTARTABLE: [&str; 6] = ["supervisor", "block-driver", "fs", "xhci", "ehci", "logger"];
+const CHAOS_RESTARTABLE: [&str; 8] = ["supervisor", "block-driver", "fs", "xhci", "ehci", "logger", "nic-driver", "net-stack"];
 const CHAOS_DEFAULT_ROUNDS: u32 = 20;
 const CHAOS_MAX_ROUNDS: u32 = 100;        // bounded (§26.6) - a deliberate cap, not a firehose
 // Per-round recovery wait is bounded by REAL wall-clock time (RTC seconds), not a yield count. A
@@ -6199,15 +6235,28 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
                 // service "1000" that does not exist. Reject anything that is neither "all-services" nor a
                 // live service, loudly (invariant 12), with a SPECIFIC hint for the numeric mix-up.
                 let target = tok[1];
-                if target != "all-services" && slot_of(ctx, target).is_none() {
+                if target.contains(',') {
+                    // A comma-separated list (e.g. "nic-driver,net-stack") is a MULTI-TARGET run: EVERY
+                    // listed service is killed each round (semantics B - the cascade stress). Each segment
+                    // must be a live service; reject an unknown one loudly (invariant 12).
+                    for seg in target.split(',') {
+                        if seg.is_empty() { continue; }
+                        if slot_of(ctx, seg).is_none() {
+                            ctx.console_writeln_fmt(format_args!("max-carnage: no live service '{}' in the list", seg));
+                            ctx.console_writeln("  every comma-separated target must be a live service");
+                            ctx.console_writeln("  (block-driver | fs | logger | xhci | ehci | shell | supervisor | nic-driver | net-stack)");
+                            return Ok(());
+                        }
+                    }
+                } else if target != "all-services" && slot_of(ctx, target).is_none() {
                     if !target.is_empty() && target.bytes().all(|b| b.is_ascii_digit()) {
                         ctx.console_writeln_fmt(format_args!(
                             "max-carnage: '{}' is not a service. For {} rounds of EVERYTHING, run:", target, target));
                         ctx.console_writeln_fmt(format_args!("  chaos max-carnage all-services {}", target));
                     } else {
                         ctx.console_writeln_fmt(format_args!("max-carnage: no live service '{}'.", target));
-                        ctx.console_writeln("  target: all-services, or a live service");
-                        ctx.console_writeln("  (block-driver | fs | logger | xhci | ehci | shell | supervisor)");
+                        ctx.console_writeln("  target: all-services, one service, or a comma-separated list");
+                        ctx.console_writeln("  (block-driver | fs | logger | xhci | ehci | shell | supervisor | nic-driver | net-stack)");
                     }
                     return Ok(());
                 }
@@ -6279,9 +6328,11 @@ fn chaos_launch(ctx: &ServiceContext, target: &str, rounds: u32) -> Result<(), S
     // Send the round count (0 = run until q) AND the target (all | service name). Best-effort: chaos waits
     // briefly for it, defaults to all / run-until-q if it doesn't arrive. Reclaim the cap (no leak).
     if let Some(cap) = ctx.acquire_send_cap("chaos") {
-        let mut buf = [0u8; 4 + 24];
+        // rounds(4) + target string. The target may be a comma-separated list (e.g. "nic-driver,net-stack"),
+        // so the buffer is sized for a bounded list, not one name.
+        let mut buf = [0u8; 4 + 128];
         buf[..4].copy_from_slice(&rounds.to_le_bytes());
-        let tb = target.as_bytes(); let n = tb.len().min(24);
+        let tb = target.as_bytes(); let n = tb.len().min(128);
         buf[4..4 + n].copy_from_slice(&tb[..n]);
         let _ = ctx.send_by_handle(cap, &Message::from_bytes(&buf[..4 + n]));
         ctx.remove_cap(cap);
@@ -6863,11 +6914,14 @@ fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<
 /// chaos storm that may have hammered `fs` + its `block-driver`, so the reply could be slow or never
 /// come; this bounds it so the save can fail gracefully (console report stands) instead of hanging.
 const SAVE_FS_MAX_SECS: i64 = 8;
+/// Short deadline for the best-effort history write-through (§26.7): a quick try, then shrug. A slow or
+/// mid-restart fs must never freeze the prompt, so this is far shorter than the report save's 8 s.
+const HIST_SAVE_SECS: i64 = 2;
 
 /// `fs_request` for the report save: the reply wait is bounded by `SAVE_FS_MAX_SECS` of wall-clock
 /// time (RTC), so a still-restarting `fs` can't block the shell forever (the bug behind `chaos
 /// max-carnage … save` hanging). Reacquire + retry once on a miss, then give up.
-fn fs_request_bounded(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<Message> {
+fn fs_request_bounded(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8], max_secs: i64) -> Option<Message> {
     let pl = path.len().min(255);
     let mut req = [0u8; 4096];
     req[0] = op;
@@ -6876,11 +6930,11 @@ fn fs_request_bounded(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) ->
     let dn = data.len().min(req.len() - 2 - pl);
     req[2 + pl..2 + pl + dn].copy_from_slice(&data[..dn]);
     let msg = Message::from_bytes(&req[..2 + pl + dn]);
-    if let Some(r) = ctx.request_with_reply_deadline("fs", &msg, SAVE_FS_MAX_SECS) {
+    if let Some(r) = ctx.request_with_reply_deadline("fs", &msg, max_secs) {
         return Some(r);
     }
     if ctx.reacquire_by_name("fs") {
-        return ctx.request_with_reply_deadline("fs", &msg, SAVE_FS_MAX_SECS);
+        return ctx.request_with_reply_deadline("fs", &msg, max_secs);
     }
     None
 }

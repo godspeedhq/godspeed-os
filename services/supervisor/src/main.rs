@@ -211,7 +211,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // supervisor now spawns the logger - moved here from init. logger is not TCB (§11.3): retry
     // once on failure and continue without it (its output falls back to the kernel ring buffer).
     ctx.log("supervisor: spawning logger...");
-    if ctx.spawn("logger").is_err() {
+    if let Some(cap) = ctx.acquire_send_grant_cap("logger") {
+        // Supervisor RESPAWN: the logger is still alive (only the supervisor died). Adopt it - reacquire
+        // its endpoint by name - instead of trying to spawn a duplicate the kernel's singleton guard
+        // rejects, which used to print a misleading "logger spawn failed" on every `kill supervisor`.
+        // Mirrors the block-driver/fs/shell adopt lines in the reconcile path.
+        let _ = name_map.record("logger", cap.0);
+        ctx.log("supervisor: adopted running logger");
+    } else if ctx.spawn("logger").is_err() {
         ctx.log("supervisor: logger spawn failed, retrying");
         let _ = ctx.spawn("logger");
     }

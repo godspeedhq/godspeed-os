@@ -118,7 +118,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // (RTC-bounded) for it BEFORE claiming the foreground - the shell is still live to send it. Default
     // to run-until-q if it never arrives (e.g. the launcher's send failed), so we never block forever.
     let mut rounds: u64 = 0;
-    let mut tbuf = [0u8; 24];
+    let mut tbuf = [0u8; 128];   // target string; may be a comma-separated list, so sized for a bounded list
     let mut tlen = 0usize;
     {
         let t0 = ctx.datetime().epoch_secs();
@@ -126,7 +126,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             if let Some(msg) = ctx.try_recv() {
                 let b = msg.payload_bytes();
                 if b.len() >= 4 { rounds = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64; }
-                if b.len() > 4 { let n = (b.len() - 4).min(24); tbuf[..n].copy_from_slice(&b[4..4 + n]); tlen = n; }
+                if b.len() > 4 { let n = (b.len() - 4).min(128); tbuf[..n].copy_from_slice(&b[4..4 + n]); tlen = n; }
                 break;
             }
             if ctx.datetime().epoch_secs() - t0 >= 2 { break; }
@@ -138,6 +138,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // "all-services" (named so it can never clash with a real service that someone calls "all").
     let target: &str = if tlen == 0 { "all-services" } else { str_of(&tbuf[..tlen]) };
     let target_all = target == "all-services";
+    // A comma-separated target ("nic-driver,net-stack") is a MULTI-TARGET run: EVERY listed service is
+    // killed each round (semantics B - the cascade stress). Parse it once into a bounded fixed array.
+    const MAX_TLIST: usize = 8;
+    let mut tlist: [[u8; 24]; MAX_TLIST] = [[0u8; 24]; MAX_TLIST];
+    let mut tlist_len: [usize; MAX_TLIST] = [0usize; MAX_TLIST];
+    let mut ntlist = 0usize;
+    let target_list = target.contains(',');
+    if target_list {
+        for seg in target.split(',') {
+            if seg.is_empty() || ntlist >= MAX_TLIST { continue; }
+            let sb = seg.as_bytes(); let l = sb.len().min(24);
+            tlist[ntlist][..l].copy_from_slice(&sb[..l]); tlist_len[ntlist] = l; ntlist += 1;
+        }
+    }
     // Three keyboard-abort cases. all-services storms EVERY driver, so the keyboard dies for sure (serial
     // only). A single USB host driver (xhci/ehci) kills the keyboard ONLY if it is the controller yours is
     // on - we cannot know which (two controllers + hot-plug make detection unreliable), so we state the
@@ -194,6 +208,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     cand[ncand].0[..l].copy_from_slice(&b[..l]); cand[ncand].1 = l; ncand += 1;
                 }
             }
+        } else if target_list {
+            // Multi-target: every listed service is a candidate this round (all killed below).
+            for t in 0..ntlist {
+                if ncand < MAX_CAND {
+                    let l = tlist_len[t];
+                    cand[ncand].0[..l].copy_from_slice(&tlist[t][..l]); cand[ncand].1 = l; ncand += 1;
+                }
+            }
         } else {
             let tb = target.as_bytes(); let l = tb.len().min(24);
             cand[0].0[..l].copy_from_slice(&tb[..l]); cand[0].1 = l; ncand = 1;
@@ -236,8 +258,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     Some(_) => { flooded += 1; sv_flooded[s] += 1; sweep_flooded += 1; sv_flood_na[s] = 0; }
                     None    => { if sv_flood_na[s] == 0 { sv_flood_na[s] = 2; } } // no endpoint right now
                 }
-                // ...and, when the rotor lands here, KILL it too (restart-test the floodable set).
-                if c == kill_pick {
+                // ...and KILL it: when the rotor lands here (all-services / single target), OR always in a
+                // multi-target list run (semantics B: every listed service goes down EVERY round).
+                if c == kill_pick || target_list {
                     let _ = ctx.kill(name);
                     killed += 1; sv_killed[s] += 1; sweep_killed += 1;
                     if let Some(h) = sv_floodcap[s].take() { ctx.remove_cap(h); }
