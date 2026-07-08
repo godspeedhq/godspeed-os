@@ -787,11 +787,15 @@ impl History {
     /// an error (§26.7), and the write must never stall the prompt. Bounded by construction (the file is
     /// just the <=16-line ring serialized), so no unbounded growth and one OP_WRITE_FILE per command.
     fn load(&mut self, ctx: &ServiceContext) {
+        // BOUNDED (§26.7): this runs before the input loop, so it must never hang the prompt. A fs that is
+        // alive-but-not-serving (respawned, still re-mounting) would block an unbounded request forever and
+        // the shell would come up with a visible prompt but a dead keyboard. Cap each fs call at
+        // HIST_LOAD_SECS; on any timeout/miss just return with empty history and let console_read proceed.
         let path = b"/.gsh_history";
-        let sz = match fs_stat(ctx, path) { Some((s, false)) if s > 0 => s as usize, _ => return };
+        let sz = match fs_stat_bounded(ctx, path, HIST_LOAD_SECS) { Some((s, false)) if s > 0 => s as usize, _ => return };
         let sz = sz.min(HIST_MAX * (MAX_LINE + 1));
         let mut buf = [0u8; HIST_MAX * (MAX_LINE + 1)];
-        if !read_file_exact(ctx, path, 0, &mut buf[..sz]) { return; }
+        if !read_file_exact_bounded(ctx, path, 0, &mut buf[..sz], HIST_LOAD_SECS) { return; }
         for line in buf[..sz].split(|&b| b == b'\n') {
             if !line.is_empty() { self.push(line); }
         }
@@ -5984,6 +5988,26 @@ fn read_file_exact(ctx: &ServiceContext, path: &[u8], off: usize, out: &mut [u8]
     true
 }
 
+/// Deadline-bounded twin of `read_file_exact` for the startup history load: each chunk read is capped at
+/// `max_secs` (RTC) via `fs_read_at_bounded`, so a wedged/slow fs times out per chunk instead of blocking
+/// the shell before its input loop. False on short read, timeout, or any miss - the caller treats that as
+/// "no history" (§26.7). Only the startup load uses this; ordinary file commands keep the unbounded path.
+fn read_file_exact_bounded(ctx: &ServiceContext, path: &[u8], off: usize, out: &mut [u8], max_secs: i64) -> bool {
+    let mut done = 0usize;
+    let mut tmp = [0u8; IO_CHUNK];
+    while done < out.len() {
+        match fs_read_at_bounded(ctx, path, (off + done) as u64, &mut tmp, max_secs) {
+            Some(n) if n > 0 => {
+                let take = n.min(out.len() - done);
+                out[done..done + take].copy_from_slice(&tmp[..take]);
+                done += take;
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Overwrite `p` (resolved path) with `data`. Small payload → one WriteFile; larger → write_new +
 /// streamed write_at chunks (so a piped payload up to the capture buffer reaches the file).
 fn stream_overwrite(ctx: &ServiceContext, p: &[u8], data: &[u8]) {
@@ -7032,6 +7056,11 @@ const SAVE_FS_MAX_SECS: i64 = 8;
 /// Short deadline for the best-effort history write-through (§26.7): a quick try, then shrug. A slow or
 /// mid-restart fs must never freeze the prompt, so this is far shorter than the report save's 8 s.
 const HIST_SAVE_SECS: i64 = 2;
+/// Short deadline for the best-effort history *load* at startup (§26.7). The load runs before the input
+/// loop, so a fs that is alive-but-not-serving (respawned but still re-mounting) would otherwise hang the
+/// prompt forever on an unbounded request - the whole shell wedges and the keyboard looks dead. Bound it:
+/// a quick try, then "no history", so the prompt + `console_read` always come up regardless of fs health.
+const HIST_LOAD_SECS: i64 = 2;
 
 /// `fs_request` for the report save: the reply wait is bounded by `SAVE_FS_MAX_SECS` of wall-clock
 /// time (RTC), so a still-restarting `fs` can't block the shell forever (the bug behind `chaos
@@ -7073,6 +7102,38 @@ fn fs_read_at(ctx: &ServiceContext, path: &[u8], offset: u64, out: &mut [u8]) ->
     tail[..8].copy_from_slice(&offset.to_le_bytes());
     tail[8..12].copy_from_slice(&(IO_CHUNK as u32).to_le_bytes());
     let reply = fs_request(ctx, OP_READ_AT, path, &tail)?;
+    let p = reply.payload_bytes();
+    if p.first() == Some(&FS_OK) && p.len() >= 5 {
+        let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
+        let end = (5 + n).min(p.len());
+        let n = end - 5;
+        out[..n].copy_from_slice(&p[5..end]);
+        Some(n)
+    } else {
+        None
+    }
+}
+
+/// Deadline-bounded twin of `fs_stat` for the startup history load: the reply wait is capped at
+/// `max_secs` (RTC) via `fs_request_bounded`, so an alive-but-not-serving fs (respawned, still
+/// re-mounting) cannot hang the prompt. `None` on timeout/miss/absent, treated as "no file".
+fn fs_stat_bounded(ctx: &ServiceContext, path: &[u8], max_secs: i64) -> Option<(u64, bool)> {
+    let reply = fs_request_bounded(ctx, OP_STAT_FILE, path, &[], max_secs)?;
+    let p = reply.payload_bytes();
+    if p.first() == Some(&FS_OK) && p.len() >= 11 && p[1] == 1 {
+        Some((u64::from_le_bytes([p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9]]), p[10] == 1))
+    } else {
+        None
+    }
+}
+
+/// Deadline-bounded twin of `fs_read_at` for the startup history load - same per-chunk deadline
+/// discipline as `fs_stat_bounded`, so a stalled fs times out instead of blocking the shell.
+fn fs_read_at_bounded(ctx: &ServiceContext, path: &[u8], offset: u64, out: &mut [u8], max_secs: i64) -> Option<usize> {
+    let mut tail = [0u8; 12];
+    tail[..8].copy_from_slice(&offset.to_le_bytes());
+    tail[8..12].copy_from_slice(&(IO_CHUNK as u32).to_le_bytes());
+    let reply = fs_request_bounded(ctx, OP_READ_AT, path, &tail, max_secs)?;
     let p = reply.payload_bytes();
     if p.first() == Some(&FS_OK) && p.len() >= 5 {
         let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
