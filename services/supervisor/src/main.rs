@@ -174,8 +174,8 @@ fn ensure_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &
 /// directory keeps a dead service's name), so we scan REAL liveness via `task_stat`. Order matters:
 /// block-driver before fs before shell (each wires to the previous). Returns how many it respawned.
 fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap) -> u32 {
-    const MANAGED: [&str; 6] = ["block-driver", "fs", "shell", "xhci", "ehci", "logger"];
-    let mut alive = [false; 6];
+    const MANAGED: [&str; 8] = ["block-driver", "fs", "shell", "xhci", "ehci", "logger", "nic-driver", "net-stack"];
+    let mut alive = [false; 8];
     for slot in 0..256u32 {
         let st = ctx.task_stat(slot);
         if !st.valid || st.state == 4 { continue; } // 4 = Dead
@@ -186,9 +186,10 @@ fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap) -> u32 {
     for i in 0..MANAGED.len() {
         if alive[i] { continue; }
         let ok = match MANAGED[i] {
-            "fs"    => spawn_wired(ctx, map, "fs", &["block-driver"]),
-            "shell" => spawn_wired(ctx, map, "shell", &["fs"]),
-            other   => spawn_mapped(ctx, map, other, 0xFFFF),
+            "fs"        => spawn_wired(ctx, map, "fs", &["block-driver"]),
+            "shell"     => spawn_wired(ctx, map, "shell", &["fs"]),
+            "net-stack" => spawn_wired(ctx, map, "net-stack", &["nic-driver"]),
+            other       => spawn_mapped(ctx, map, other, 0xFFFF),
         };
         if ok {
             n += 1;
@@ -468,6 +469,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 ctx.log("supervisor: counter died, restarting");
                 if spawn_wired(&ctx, &mut name_map, "counter", &["fs"]) { ctx.log("supervisor: counter restarted"); }
                 else { ctx.log("supervisor: counter restart FAILED"); }
+            }
+            // The NIC stack is restartable too: nic-driver re-grants its MMIO/DMA/IRQ (its DMA arena is
+            // reserved once and reused, NIC_DMA_PHYS) + re-inits the controller; net-stack re-runs its
+            // DHCP/ARP/ICMP dance and re-registers. Clients (the shell's net/ping) reacquire net-stack by
+            // name (§14.3). net-stack also reacquires nic-driver by name, so either death order recovers.
+            "nic-driver" => {
+                ctx.log("supervisor: nic-driver died, restarting");
+                if spawn_mapped(&ctx, &mut name_map, "nic-driver", 0xFFFF) { ctx.log("supervisor: nic-driver restarted"); }
+                else { ctx.log("supervisor: nic-driver restart FAILED"); }
+            }
+            "net-stack" => {
+                ctx.log("supervisor: net-stack died, restarting");
+                if spawn_wired(&ctx, &mut name_map, "net-stack", &["nic-driver"]) { ctx.log("supervisor: net-stack restarted"); }
+                else { ctx.log("supervisor: net-stack restart FAILED"); }
             }
             _ => {}
         }

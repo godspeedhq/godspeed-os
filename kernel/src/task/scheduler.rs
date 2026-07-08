@@ -1648,7 +1648,8 @@ pub fn kill_task_by_slot(slot: usize) {
         // greet, ...) is never bumped, so it never shows a restart - RESTARTS means "blew up and was
         // recovered", not "legitimately closed". The respawn reads the new count via next_restart_count.
         if matches!(task_name,
-            "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger" | "supervisor" | "counter")
+            "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger" | "supervisor" | "counter"
+            | "nic-driver" | "net-stack")
         {
             bump_name_restart(task_name);
         }
@@ -1668,7 +1669,8 @@ pub fn kill_task_by_slot(slot: usize) {
         // `counter` (examples/counter) is restartable too: it persists its state to `fs` and
         // reconstructs it on respawn (§14/§15), so its own death notifies the supervisor, which
         // respawns it (counter-test build only - it is absent elsewhere, so this never fires there).
-        if matches!(task_name, "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger" | "counter") {
+        if matches!(task_name, "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger" | "counter"
+            | "nic-driver" | "net-stack") {
             if let (Some(sup_ep), Ok(msg)) = (
                 crate::ipc::names::lookup("supervisor"),
                 crate::ipc::message::Message::new(task_name.as_bytes()),

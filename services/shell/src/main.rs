@@ -4514,6 +4514,7 @@ fn net_status(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
 
     // Query nic-driver directly (the shell holds ACQUIRE_ANY) for its MAC + link/TX/RX - proves whether
     // MMIO reaches the NIC (Phase 4). Abortable: press q if it stalls.
+    let mut nic_link_up = true;   // the LIVE link (p[7]); ties net-stack's gateway/ping lines to reality
     let nreq = Message::from_bytes(&[3u8]);
     match net_query(ctx, "nic-driver", &nreq, 3) {
         NetQ::Aborted => { ctx.console_writeln("net: aborted"); return Ok(()); }
@@ -4529,6 +4530,7 @@ fn net_status(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
             // Extended status (RTL8168 Stage B, 15 bytes): live link + TX/RX counts, so the TV shows the
             // whole bring-up story without the serial log.
             if p.len() >= 15 {
+                nic_link_up = p[7] != 0;   // remember the live link for the net-stack lines below
                 let rx_len = u16::from_le_bytes([p[9], p[10]]);
                 let tx_cnt = u16::from_le_bytes([p[11], p[12]]);
                 let rx_cnt = u16::from_le_bytes([p[13], p[14]]);
@@ -4579,8 +4581,11 @@ fn net_status(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
     }
     // 15-byte record: ip[0..4], gateway ip[4..8], gateway mac[8..14], flags[14] (bit0 gw resolved,
     // bit1 ping ok). Formatting is the shell's job; net-stack reports raw facts.
-    let flags = p[14];
-    out.line_fmt(ctx, format_args!("ip       {}.{}.{}.{}", p[0], p[1], p[2], p[3]));
+    // Reflect the LIVE link, not the frozen record: if the cable is out (nic_link_up=false) the gateway is
+    // unreachable regardless of what net-stack last resolved, so show it degraded - `net` tracks reality.
+    let flags = if nic_link_up { p[14] } else { 0 };
+    out.line_fmt(ctx, format_args!("ip       {}.{}.{}.{}{}",
+        p[0], p[1], p[2], p[3], if nic_link_up { "" } else { "   (link down)" }));
     if flags & 1 != 0 {
         out.line_fmt(ctx, format_args!(
             "gateway  {}.{}.{}.{} at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
