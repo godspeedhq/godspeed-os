@@ -275,8 +275,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // to echo the Enter as "\r\n").
                 ctx.console_write("\r\n");
                 if line.len > 0 {
-                    hist.push(line.bytes());
-                    hist.save(&ctx); // write-through to the fs (best-effort; never stalls the prompt)
+                    // A line that READS a secret (`input secret ...`) never enters the recall ring or
+                    // /.gsh_history (§8 secret taint): a password recovered on up-arrow would defeat the
+                    // whole point of invisible entry. It still EXECUTES below; it just isn't remembered.
+                    if !line_reads_secret(line.bytes()) {
+                        hist.push(line.bytes());
+                        hist.save(&ctx); // write-through to the fs (best-effort; never stalls the prompt)
+                    }
                     last_result = execute(&ctx, line.bytes(), &mut cwd, last_result, 0, &mut Out::Console);
                     line.len = 0;
                     line.cur = 0;
@@ -487,6 +492,29 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
             tok.iter().rposition(|&b| b == b',').map(|i| tok_start + i + 1).unwrap_or(tok_start)
         };
         return complete_from_list(ctx, line, seg_start, TARGETS);
+    }
+
+    // `kill <svc>[,svc,...]`: complete a service name plus the `all-services` keyword. kill takes a
+    // comma-separated list, so complete the segment after the LAST comma (like chaos max-carnage) - so
+    // `ehci,xh<tab>` finishes `ehci,xhci` while the earlier listed targets are preserved verbatim.
+    if "kill".as_bytes() == cmd && prior == 0 {
+        const KILL_TARGETS: &[&str] =
+            &["all-services", "supervisor", "block-driver", "fs", "logger", "xhci", "ehci", "shell", "nic-driver", "net-stack"];
+        let seg_start = {
+            let tok = &line.bytes()[tok_start..];
+            tok.iter().rposition(|&b| b == b',').map(|i| tok_start + i + 1).unwrap_or(tok_start)
+        };
+        return complete_from_list(ctx, line, seg_start, KILL_TARGETS);
+    }
+
+    // `spawn <svc>[,svc,...]`: complete the demo/app services, comma-list aware (segment after last comma).
+    if "spawn".as_bytes() == cmd && prior == 0 {
+        const SPAWN_TARGETS: &[&str] = &["ping", "pong"];
+        let seg_start = {
+            let tok = &line.bytes()[tok_start..];
+            tok.iter().rposition(|&b| b == b',').map(|i| tok_start + i + 1).unwrap_or(tok_start)
+        };
+        return complete_from_list(ctx, line, seg_start, SPAWN_TARGETS);
     }
 
     // `ping [count N] [bytes N] <ip>`: the option keywords may appear in either order before the IP, so
@@ -1070,7 +1098,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         // service-control - on the Result model: `assert fails spawn supervisor` holds (a
         // protected core service is `Err(Denied)`); a missing arg is a usage `Err`.
         "spawn"   => {
-            if argc < 2 { ctx.console_writeln("usage: spawn <name>"); Err(ShellError::Unknown) }
+            if argc < 2 { ctx.console_writeln("usage: spawn <svc> | <svc>,<svc>,...   (e.g. spawn ping,pong)"); Err(ShellError::Unknown) }
             else { cmd_spawn(ctx, args[1]) }
         }
         // Phase-0 naming-migration diagnostics (docs/naming-design.md).
@@ -1080,7 +1108,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         }
         "spawnwired" => cmd_spawnwired(ctx),
         "kill"    => {
-            if argc < 2 { ctx.console_writeln("usage: kill <name>"); Err(ShellError::Unknown) }
+            if argc < 2 { ctx.console_writeln("usage: kill <svc> | <svc>,<svc>,... | all-services   ('help kill' for detail)"); Err(ShellError::Unknown) }
             else { cmd_kill(ctx, args[1]) }
         }
         "restart" => {
@@ -3504,6 +3532,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "fmt" => help_block(ctx, "fmt", "format a .gsh script to the GodspeedOS standard (in place)", &[
             ("fmt <path>", "format the script IN PLACE - one canonical layout, no options", "fmt /script.gsh"),
             ("fmt check <path>", "Ok if already canonical, else loud + Err; never writes", "fmt check /script.gsh"),
+            ("fmt <a>,<b>,...", "format (or check) several files - comma-separated, done one at a time", "fmt /x.gsh,/y.gsh"),
         ], true),
         "selfcheck" => help_block(ctx, "selfcheck", "run the built-in self-check suite (needs a flashed drive)", &[
             ("selfcheck", "run the embedded suite in memory; reports ran N, failed M", "selfcheck"),
@@ -3581,14 +3610,19 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("caps [service] | <verb>", "piped: records resource/rights", "caps logger | where rights~send"),
         ], true),
         "spawn" => help_block(ctx, "spawn", "start a service", &[
-            ("spawn <name>", "start the service <name>", "spawn pong"),
+            ("spawn <svc>", "start the service <svc>", "spawn pong"),
+            ("spawn <svc>,<svc>,...", "start several at once (comma-separated, NO spaces)", "spawn ping,pong"),
         ], true),
-        "kill" => help_block(ctx, "kill", "stop a service", &[
-            ("kill <name>", "stop the running service <name>", "kill pong"),
+        "kill" => help_block(ctx, "kill", "stop a service (it self-heals - the supervisor respawns it)", &[
+            ("kill <svc>", "kill one service; it recovers (only the kernel never dies)", "kill pong"),
+            ("kill <svc>,<svc>,...", "kill several at once (comma-separated, NO spaces)", "kill ehci,xhci,fs"),
+            ("kill all-services", "nuke EVERY service - drivers, storage, net, logger, supervisor, and this shell last; each self-heals", "kill all-services"),
+            ("(per-service rules still apply)", "supervisor is killable + kernel-respawned; spawn/restart of it stay refused", "kill supervisor"),
         ], true),
         "restart" => help_block(ctx, "restart", "restart a service", &[
             ("restart <name>", "restart (re-placed per contract)", "restart pong"),
             ("restart <name> <core>", "restart on core <core>", "restart pong 2"),
+            ("restart <a>,<b>,...", "restart several, each per its own contract (no core override)", "restart fs,logger"),
         ], true),
         "reboot" => help_block(ctx, "reboot", "hardware reset", &[
             ("reboot", "reset the machine", "reboot"),
@@ -3637,6 +3671,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "mkdir" => help_block(ctx, "mkdir", "create a directory", &[
             ("mkdir <path>", "create the directory <path>", "mkdir /docs"),
             ("mkdir <path> parents", "create missing parent dirs too", "mkdir /a/b/c parents"),
+            ("mkdir <a>,<b>,...", "create several directories (comma-separated)", "mkdir /docs,/tmp"),
         ], true),
         "copy" => help_block(ctx, "copy", "copy a file or a whole subtree", &[
             ("copy <src> <dst>", "copy file <src> to <dst>", "copy /docs/a.txt /docs/b.txt"),
@@ -3651,6 +3686,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "delete" => help_block(ctx, "delete", "remove a file, empty directory, or whole subtree", &[
             ("delete <path>", "remove the file/empty dir <path>", "delete /docs/old.txt"),
             ("delete <path> recursive", "remove directory <path> and everything under it", "delete /docs recursive"),
+            ("delete <a>,<b>,...", "remove several (comma-separated; recursive applies to all)", "delete /a.txt,/b.txt"),
         ], true),
         "find" => help_block(ctx, "find", "search the tree by name (substring/glob; records when piped)", &[
             ("find <name>", "matches names containing <name>", "find report"),
@@ -3806,9 +3842,9 @@ static HELP: &[HelpRow] = &[
     Row("observe [now]", "live view (q to quit) / one-shot frame"),
     Row("caps [service]", "capabilities (default: this shell)"),
     Row("roster", "example record service (a typed table; try roster | where role=core)"),
-    Row("spawn <name>", "start a service"),
-    Row("kill <name>", "stop a service"),
-    Row("restart <name> [core]", "restart a service"),
+    Row("spawn <svc>[,svc,...]", "start a service or a comma-list"),
+    Row("kill <svc>[,svc,...] | all-services", "stop a service, a comma-list, or every service"),
+    Row("restart <name>[,name,...] [core]", "restart a service or a comma-list"),
     Gap,
     Sec("Storage"),
     Row("drives [flash|label|reset|check]", "manage attached disks (drives help)"),
@@ -3817,11 +3853,11 @@ static HELP: &[HelpRow] = &[
     Row("read <path>", "print a file"),
     Row("write [append|prepend] <path>", "create/overwrite/append/prepend (also: <prod> | write …)"),
     Row("edit <path>", "full-screen text editor (^S save, ^Q quit)"),
-    Row("mkdir <path> [parents]", "create a directory"),
+    Row("mkdir <path>[,path,...] [parents]", "create a directory or a comma-list"),
     Row("copy <src> <dst> [recursive]", "copy a file or subtree"),
     Row("move <src> <dst>", "relocate a file/dir"),
     Row("rename <path> <name>", "rename an entry in place"),
-    Row("delete <path> [recursive]", "remove a file/dir/subtree"),
+    Row("delete <path>[,path,...] [recursive]", "remove a file/dir/subtree or a comma-list"),
     Row("find <pattern> [path]", "search by name (substring or *? glob)"),
     Row("tree [path]", "print the directory hierarchy"),
     Row("match <pattern> [path]", "keep lines matching (also: <prod> | match)"),
@@ -5625,6 +5661,23 @@ fn report(ctx: &ServiceContext, prefix: &str, name: &str) {
 }
 
 fn cmd_spawn(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
+    // `spawn a,b,c` is a comma list; a single name behaves EXACTLY as before. (No `all-services` for
+    // spawn - system services are supervisor-owned; this is for demo/app services like `ping,pong`.)
+    if name.contains(',') {
+        let mut n = 0usize;
+        for s in name.split(',') {
+            if s.is_empty() || n >= 16 { continue; }
+            n += 1;
+            let _ = spawn_one(ctx, s);   // report each; a failure/duplicate does NOT abort the rest
+        }
+        return Ok(());
+    }
+    spawn_one(ctx, name)
+}
+
+/// Start ONE service, with the observe / core-service / already-running guards. Used directly for a bare
+/// `spawn <svc>` and per-segment by the comma-list path in cmd_spawn.
+fn spawn_one(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     if is_observe_variant(name) {
         ctx.console_writeln(OBSERVE_HINT);
         return Err(ShellError::Unknown);
@@ -6060,7 +6113,47 @@ fn lookup_sink(ctx: &ServiceContext, sink: &str) -> Option<CapHandle> {
 /// (~1 s) on the T630 under selfcheck load, with margin.
 const FILTER_WAIT_SECS: i64 = 5;
 
+/// Does this line READ a secret (`input secret ...`, incl. `$(input secret ...)`)? Such a line is never
+/// saved to the recall ring or /.gsh_history (§8 secret taint) - a password recovered on up-arrow would
+/// defeat invisible entry. Erring toward not-saving is safe: a false positive drops one recall entry.
+fn line_reads_secret(line: &[u8]) -> bool {
+    line.windows(12).any(|w| w == b"input secret")
+}
+
 fn cmd_kill(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
+    // `kill all-services` (nuke every service but this shell) or `kill a,b,c` (a comma list) are
+    // multi-target; a single name behaves EXACTLY as before. Per-service guards live in kill_one.
+    if name == "all-services" || name.contains(',') {
+        return kill_list(ctx, name);
+    }
+    kill_one(ctx, name)
+}
+
+/// Kill a bounded set: the `all-services` keyword (-> CHAOS_RESTARTABLE + the shell: a complete system
+/// reset where everything dies and recovers, only the kernel never dies) or a comma-separated list. Each
+/// segment runs the full kill_one guard path; a denied / dead / absent one does NOT abort the rest. ORDER:
+/// everything except supervisor and shell first, then supervisor (so the kernel-respawned supervisor
+/// reconciles AFTER the nuke and respawns the fresh prompt, not mid-storm), then the shell LAST via its
+/// self-kill (it never returns), so every per-service report has printed before the session re-inits.
+fn kill_list(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
+    let mut segs: [&str; 16] = [""; 16];
+    let mut n = 0usize;
+    if name == "all-services" {
+        ctx.console_writeln("kill all-services: nuking every service - including this shell (a fresh prompt returns)");
+        for &s in CHAOS_RESTARTABLE.iter() { if n < segs.len() { segs[n] = s; n += 1; } }
+        if n < segs.len() { segs[n] = "shell"; n += 1; }   // shell dies LAST (the third pass below)
+    } else {
+        for s in name.split(',') { if !s.is_empty() && n < segs.len() { segs[n] = s; n += 1; } }
+    }
+    for &s in segs[..n].iter() { if s != "supervisor" && s != "shell" { let _ = kill_one(ctx, s); } }
+    for &s in segs[..n].iter() { if s == "supervisor" { let _ = kill_one(ctx, s); } }
+    for &s in segs[..n].iter() { if s == "shell" { let _ = kill_one(ctx, s); } } // never returns if present
+    Ok(())
+}
+
+/// Kill ONE service, with all the session / authority guards. Used directly for a bare `kill <svc>` and
+/// per-segment by kill_list.
+fn kill_one(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     // The supervisor is killable from the shell now (the operator's call): the KERNEL respawns it
     // (Phase 6) and it reconciles - adopts the running services by name, respawns any that died. Only
     // `spawn`/`restart` of the supervisor stay refused (a duplicate or a self-restart of the restart
@@ -6103,6 +6196,23 @@ fn cmd_kill(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
 }
 
 fn cmd_restart(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<(), ShellError> {
+    // `restart a,b,c` restarts each per its OWN contract placement. A single `[core]` override is
+    // SINGLE-service only - a list plus one core is ambiguous, so the core arg is ignored for a list.
+    if name.contains(',') {
+        let mut n = 0usize;
+        for s in name.split(',') {
+            if s.is_empty() || n >= 16 { continue; }
+            n += 1;
+            let _ = restart_one(ctx, s, None);   // report each; a failure does NOT abort the rest
+        }
+        return Ok(());
+    }
+    restart_one(ctx, name, core)
+}
+
+/// Restart ONE service. Used directly for a bare `restart <svc> [core]` and per-segment by the comma-list
+/// path in cmd_restart (which passes core=None, since a list + one core is ambiguous).
+fn restart_one(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<(), ShellError> {
     if is_core_service(name) {
         ctx.console_writeln(PROTECTED_MSG);
         return Err(ShellError::Denied);
@@ -6214,9 +6324,9 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
         ctx.console_writeln("  flood-storm <svc> [n]   saturate its queue; verify it drains");
         ctx.console_writeln("  mem-pressure      [n]   a mem-pressure allocs to its limit, then reclaim");
         ctx.console_writeln("  spawn-storm       [n]   spawn mem-pressure tasks to the ceiling; loud refusal");
-        ctx.console_writeln("  max-carnage <all-services|svc> [n]  all-services (random) or aim at one");
+        ctx.console_writeln("  max-carnage <all-services|svc|svc,svc,...> [n]  random / aim at one / kill a list each round");
         ctx.console_writeln("                          ('q' aborts; SERIAL only if the run kills the keyboard)");
-        ctx.console_writeln("  svc: supervisor | block-driver | fs | logger | xhci | ehci | shell");
+        ctx.console_writeln("  svc: supervisor | block-driver | fs | logger | xhci | ehci | shell | nic-driver | net-stack");
         return Ok(());
     }
     match tok[0] {
@@ -6228,10 +6338,11 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
             // The target is required now: <all-services|service>. tok[1] = target, tok[2] = rounds.
             // No target, or an explicit `help`, prints the usage + the two modes.
             if ntok < 2 || tok[1] == "help" {
-                ctx.console_writeln("usage: chaos max-carnage <all-services|service> [rounds]");
+                ctx.console_writeln("usage: chaos max-carnage <all-services | svc | svc,svc,...> [rounds]");
                 ctx.console_writeln("  all-services   storm a RANDOM live service each round");
                 ctx.console_writeln("  <service>      aim every round at one service (e.g. fs, logger)");
-                ctx.console_writeln("  both run system-wide mem-pressure + spawn-storm. 'q' aborts (SERIAL if kbd dies).");
+                ctx.console_writeln("  svc,svc,...    a comma-separated list: kill EVERY listed service each round (cascade stress)");
+                ctx.console_writeln("  all run system-wide mem-pressure + spawn-storm. 'q' aborts (SERIAL if kbd dies).");
                 Ok(())
             } else {
                 // Validate the TARGET before launching. The syntax is <target> [rounds], so a bare number
@@ -7903,6 +8014,22 @@ fn cmd_fmt(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellError
         ctx.console_writeln("usage: fmt <path>   |   fmt check <path>   (see: fmt help)");
         return Err(ShellError::Unknown);
     }
+    // `fmt a,b` / `fmt check a,b`: process each file SEQUENTIALLY (never concurrently - a concurrent
+    // same-file read once hung the shell). Report each, continue past a failure.
+    if pathstr.contains(',') {
+        let mut n = 0usize;
+        for s in pathstr.split(',') {
+            if s.is_empty() || n >= 16 { continue; }
+            n += 1;
+            let _ = fmt_one(ctx, cwd, check, s);
+        }
+        return Ok(());
+    }
+    fmt_one(ctx, cwd, check, pathstr)
+}
+
+/// Format or check ONE file. Bare `fmt [check] <path>`, and per-file (sequentially) for a comma-list.
+fn fmt_one(ctx: &ServiceContext, cwd: &Cwd, check: bool, pathstr: &str) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, pathstr, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let mut pcopy = [0u8; PATH_MAX];
@@ -7948,6 +8075,21 @@ fn cmd_fmt(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellError
 
 /// `mkdir <path> [parents]` - create a directory (with `parents`, create missing parents).
 fn cmd_mkdir(ctx: &ServiceContext, cwd: &Cwd, arg: &str, parents: bool) -> Result<(), ShellError> {
+    // `mkdir a,b,c` creates each; `parents` applies to every segment. Report each, continue past a failure.
+    if arg.contains(',') {
+        let mut n = 0usize;
+        for s in arg.split(',') {
+            if s.is_empty() || n >= 16 { continue; }
+            n += 1;
+            let _ = mkdir_one(ctx, cwd, s, parents);
+        }
+        return Ok(());
+    }
+    mkdir_one(ctx, cwd, arg, parents)
+}
+
+/// Create ONE directory. Bare `mkdir <path> [parents]`, and per-segment for a comma-list.
+fn mkdir_one(ctx: &ServiceContext, cwd: &Cwd, arg: &str, parents: bool) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let op = if parents { OP_MKDIR_P } else { OP_MKDIR };
@@ -8201,6 +8343,22 @@ fn cmd_rename(ctx: &ServiceContext, cwd: &Cwd, path: &str, newname: &str) -> Res
 /// whole subtree. fs does the work either way (plain = `OP_DELETE`, recursive =
 /// `OP_DELETE_TREE`, a depth-bounded subtree free); it frees the blocks and reclaims them.
 fn cmd_delete(ctx: &ServiceContext, cwd: &Cwd, arg: &str, recursive: bool) -> Result<(), ShellError> {
+    // `delete /a,/b` deletes each; `recursive` applies to every segment. Report each, continue past one
+    // that is missing / fails.
+    if arg.contains(',') {
+        let mut n = 0usize;
+        for s in arg.split(',') {
+            if s.is_empty() || n >= 16 { continue; }
+            n += 1;
+            let _ = delete_one(ctx, cwd, s, recursive);
+        }
+        return Ok(());
+    }
+    delete_one(ctx, cwd, arg, recursive)
+}
+
+/// Delete ONE path. Bare `delete <path> [recursive]`, and per-segment for a comma-list.
+fn delete_one(ctx: &ServiceContext, cwd: &Cwd, arg: &str, recursive: bool) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     if path == b"/" {
