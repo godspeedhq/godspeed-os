@@ -5540,11 +5540,11 @@ fn find_running_slot(ctx: &ServiceContext, name: &str) -> Option<u32> {
 /// restartable services (block-driver, fs, ...) are freely killable - the supervisor respawns them.
 const CORE_SERVICES: [&str; 1] = ["supervisor"];
 
-/// Shown when spawn/kill/restart targets a core service - "Not applicable" makes
-/// it clear the command is refused *because* the target is protected, not failed.
-/// Lists exactly `CORE_SERVICES` (just `supervisor`).
+/// Shown when `spawn`/`restart` targets the supervisor - "Not applicable" makes it clear the command is
+/// refused *because* of what the target is, not because it failed. (`kill supervisor` is ALLOWED now -
+/// the kernel respawns it; only spawning a duplicate or restarting the restart authority are refused.)
 const PROTECTED_MSG: &str =
-    "Not applicable. The supervisor is protected (the recovery authority); storm it deliberately via 'chaos kill-storm supervisor'";
+    "Not applicable. The supervisor is the restart authority - it cannot be spawned or restarted directly. To recycle it: 'kill supervisor' (the kernel respawns it) or 'chaos kill-storm supervisor'";
 
 /// Shown when spawn/kill/restart targets an observe variant - they are brokered by
 /// the `observe` / `observe now` commands, not raw service operations.
@@ -6021,7 +6021,11 @@ fn lookup_sink(ctx: &ServiceContext, sink: &str) -> Option<CapHandle> {
 const FILTER_WAIT_SECS: i64 = 5;
 
 fn cmd_kill(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
-    if is_core_service(name) {
+    // The supervisor is killable from the shell now (the operator's call): the KERNEL respawns it
+    // (Phase 6) and it reconciles - adopts the running services by name, respawns any that died. Only
+    // `spawn`/`restart` of the supervisor stay refused (a duplicate or a self-restart of the restart
+    // authority is nonsensical); a bare `kill` is the clean recycle path.
+    if is_core_service(name) && name != "supervisor" {
         ctx.console_writeln(PROTECTED_MSG);
         return Err(ShellError::Denied);
     }
@@ -6048,6 +6052,9 @@ fn cmd_kill(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     if slot_of(ctx, name).is_none() {
         report(ctx, "not running: ", name);
         return Err(ShellError::Unknown);
+    }
+    if name == "supervisor" {
+        ctx.console_writeln("kill supervisor: the kernel respawns it (Phase 6); it reconciles - adopts the running services, respawns any that died");
     }
     match ctx.kill(name) {
         Ok(())  => { report(ctx, "killed: ", name); Ok(()) }
