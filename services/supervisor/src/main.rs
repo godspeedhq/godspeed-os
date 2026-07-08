@@ -230,7 +230,7 @@ fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap) -> u32 {
 /// truth. Once consistent it returns to the recv loop and the live-supervisor notification path carries
 /// every future death.
 fn converge(ctx: &ServiceContext, map: &mut NameCapMap) {
-    const MAX_TRIES: u32 = 5;
+    const MAX_TRIES: u32 = 7;
     let mut attempts = [0u32; MANAGED_N];
     let mut given_up = [false; MANAGED_N];
     loop {
