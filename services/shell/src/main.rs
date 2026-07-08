@@ -5562,16 +5562,14 @@ fn is_observe_variant(name: &str) -> bool {
     matches!(name, "observe" | "observe-now" | "observe-live")
 }
 
-/// Services the live console session depends on for I/O. Killing/restarting them
-/// from the shell would brick the very session issuing the command - a USB host
-/// driver (`xhci`/`ehci`, which carry whatever input devices are attached) or the
-/// shell itself. Returns the reason to show, or `None` if `name` is safe to
-/// operate on. (Not a §6.2 trusted-root guard - these are restartable in
-/// principle, just not from the session that needs them.)
+/// The one thing the shell refuses to operate on from within itself: the shell task
+/// issuing the command. `xhci`/`ehci` USED to be guarded here too, but they respawn and
+/// re-enumerate their devices on death - proven across millions of `chaos max-carnage`
+/// rounds with the session intact - so killing a USB host driver only blips input for
+/// ~a second, it does not brick the session. They are killable now (the operator's call).
+/// Returns the reason to show, or `None` if `name` is safe to operate on.
 fn session_critical_msg(name: &str) -> Option<&'static str> {
     match name {
-        "xhci"  => Some("Not applicable. xhci is a USB host driver - killing it disables any input device attached to it"),
-        "ehci"  => Some("Not applicable. ehci is a USB host driver - killing it disables any input device attached to it"),
         "shell" => Some("Not applicable. that is this shell - the session you are typing in"),
         _       => None,
     }
