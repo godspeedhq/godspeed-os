@@ -167,36 +167,92 @@ fn ensure_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &
     spawn_wired(ctx, map, name, peers)
 }
 
-/// Reconcile to desired state: respawn any managed restartable service that is NOT actually alive. A
-/// death notification can be DROPPED under a storm - our death-notification endpoint is 16-deep, so a
-/// burst of deaths (or chaos flooding us) overflows it and a dropped name is silently never restarted
-/// (the "fs gone from observe after a storm" bug). `acquire_*_cap` cannot detect this (the kernel
-/// directory keeps a dead service's name), so we scan REAL liveness via `task_stat`. Order matters:
-/// block-driver before fs before shell (each wires to the previous). Returns how many it respawned.
-fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap) -> u32 {
-    const MANAGED: [&str; 8] = ["block-driver", "fs", "shell", "xhci", "ehci", "logger", "nic-driver", "net-stack"];
-    let mut alive = [false; 8];
+/// The restartable services the supervisor is responsible for (§6.1). Hoisted so the scan, `reconcile`,
+/// and `converge` share ONE roster. Order matters: block-driver before fs before shell (each wires to
+/// the previous); nic-driver before net-stack.
+const MANAGED_N: usize = 8;
+const MANAGED: [&str; MANAGED_N] =
+    ["block-driver", "fs", "shell", "xhci", "ehci", "logger", "nic-driver", "net-stack"];
+
+/// Scan REAL liveness via `task_stat` (NOT a cap-acquire, which the kernel directory keeps succeeding
+/// for a dead name - the `ensure_*` stale-cap-adopt race, line ~149): which MANAGED services have a live
+/// task (valid AND not Dead) right now. Index-aligned to `MANAGED`.
+fn managed_alive(ctx: &ServiceContext) -> [bool; MANAGED_N] {
+    let mut alive = [false; MANAGED_N];
     for slot in 0..256u32 {
         let st = ctx.task_stat(slot);
         if !st.valid || st.state == 4 { continue; } // 4 = Dead
         let nm = st.name_str();
-        for i in 0..MANAGED.len() { if nm == MANAGED[i] { alive[i] = true; } }
+        for i in 0..MANAGED_N { if nm == MANAGED[i] { alive[i] = true; } }
     }
+    alive
+}
+
+/// Respawn one managed service WIRED to its peers (block-driver before fs before shell; nic before net).
+fn respawn_managed(ctx: &ServiceContext, map: &mut NameCapMap, name: &str) -> bool {
+    match name {
+        "fs"        => spawn_wired(ctx, map, "fs", &["block-driver"]),
+        "shell"     => spawn_wired(ctx, map, "shell", &["fs"]),
+        "net-stack" => spawn_wired(ctx, map, "net-stack", &["nic-driver"]),
+        other       => spawn_mapped(ctx, map, other, 0xFFFF),
+    }
+}
+
+/// Reconcile to desired state: respawn any managed restartable service that is NOT actually alive. A
+/// death notification can be DROPPED under a storm - our endpoint is 16-deep, so a burst overflows it
+/// and a dropped name is silently never restarted (the "fs gone from observe after a storm" bug).
+/// `acquire_*_cap` cannot detect this (the kernel directory keeps a dead name), so we scan REAL liveness
+/// via `task_stat`. Returns how many it respawned. (One pass; the death-loop backstop.)
+fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap) -> u32 {
+    let alive = managed_alive(ctx);
     let mut n = 0;
-    for i in 0..MANAGED.len() {
+    for i in 0..MANAGED_N {
         if alive[i] { continue; }
-        let ok = match MANAGED[i] {
-            "fs"        => spawn_wired(ctx, map, "fs", &["block-driver"]),
-            "shell"     => spawn_wired(ctx, map, "shell", &["fs"]),
-            "net-stack" => spawn_wired(ctx, map, "net-stack", &["nic-driver"]),
-            other       => spawn_mapped(ctx, map, other, 0xFFFF),
-        };
-        if ok {
+        if respawn_managed(ctx, map, MANAGED[i]) {
             n += 1;
             ctx.log_fmt(format_args!("supervisor: reconcile respawned {} (missed death notification)", MANAGED[i]));
         }
     }
     n
+}
+
+/// Reconverge to consistency after the supervisor's OWN death (Path C / Phase 6). `all-services` (and
+/// any nuke that includes the supervisor) is the ONE case the notification path cannot cover: a LIVE
+/// supervisor never drops a death notification, but while the supervisor is itself dead+respawning a
+/// death arriving then finds a dead endpoint and is lost - the shell, killed last, was orphaned exactly
+/// this way. So on coming back, before it drops into the blocking recv loop and starts trusting
+/// notifications again, the supervisor reconverges its managed set to TRUTH: every service it manages is
+/// actually non-Dead. Wait for the roster to be satisfied, NOT for a timer - the re-check catches a
+/// service that dies mid-convergence (a cascade). A NO-OP on a fresh boot (`ensure_*` already brought
+/// everything up, so the first scan is all-alive) and scoped to the services THIS build manages
+/// (recorded in `map`), so it never spawns one the build never had. Bounded (invariant 12): a service
+/// that will not come up after `MAX_TRIES` is given up LOUDLY, so this can never hang on an impossible
+/// truth. Once consistent it returns to the recv loop and the live-supervisor notification path carries
+/// every future death.
+fn converge(ctx: &ServiceContext, map: &mut NameCapMap) {
+    const MAX_TRIES: u32 = 5;
+    let mut attempts = [0u32; MANAGED_N];
+    let mut given_up = [false; MANAGED_N];
+    loop {
+        let alive = managed_alive(ctx);
+        let mut all_settled = true;
+        for i in 0..MANAGED_N {
+            // Only reconverge a service this build actually manages (`ensure_*` recorded it in the map).
+            if given_up[i] || alive[i] || map.get(MANAGED[i]).is_none() { continue; }
+            all_settled = false;
+            attempts[i] += 1;
+            if attempts[i] > MAX_TRIES {
+                ctx.log_fmt(format_args!(
+                    "supervisor: could not bring up {} after {} tries - run 'spawn {}'",
+                    MANAGED[i], MAX_TRIES, MANAGED[i]));
+                given_up[i] = true;
+                continue;
+            }
+            respawn_managed(ctx, map, MANAGED[i]);
+        }
+        if all_settled { break; }
+        ctx.yield_cpu(); // let respawns/reclaims settle before the next truth check
+    }
 }
 
 #[no_mangle]
@@ -406,15 +462,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // reads it yet (Phase 0b/3 wire dependents from it; Phase 4 brokers reacquisition through it).
     ctx.log_fmt(format_args!("supervisor: name-cap map holds {} service(s)", name_map.count));
 
+    // Reconverge to consistency before trusting the notification stream (Path C / Phase 6). A no-op on a
+    // fresh boot (everything above just came up); on a supervisor RESPAWN (`kill all-services`) this
+    // catches any managed service still Dead/settling in the churn - including a shell that `ensure_*`
+    // adopted as a stale cap - and only returns once the roster is truly satisfied. From here the recv
+    // loop plus the live-supervisor notification path carry every future death.
+    converge(&ctx, &mut name_map);
+
     ctx.log("supervisor: ready");
 
     // Death-notification restart loop (H11 ph6; extended for fs + block-driver in Phase D).
     // The kernel enqueues the name of a dead restartable service to our endpoint; we respawn
-    // it. We drive this on `recv_timeout`, not a blocking `recv`, so the reconcile backstop below runs
-    // on a TIMER too - not only on a notification. The supervisor thus ALWAYS reconverges to its managed
-    // set, recovering even a DROPPED notification (a storm overflowing our endpoint, or the shell orphaned
-    // in the `kill all-services` window). The core still idles between the short timed wakes. Restartable
-    // services routed here: `block-driver`, `fs`, `shell`, `xhci`,
+    // it. `recv` BLOCKS, so the core still reaches the idle/halt path and runs cool between
+    // deaths (no polling). Restartable services routed here: `block-driver`, `fs`, `shell`, `xhci`,
     // `ehci`, `logger`. The supervisor itself is restartable too (Phase 6) but by the KERNEL - a dead
     // task can't respawn itself; the only death that is unrecoverable is the kernel's. Other
     // restart/kill commands still arrive via the
@@ -424,25 +484,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     if ctx.recv_handle().is_none() {
         ctx.park();
     }
-    // `recv_timeout` resolves RECV_WAKE_CYCLES to ~1 tick on both the PIT-calibrated T630 and QEMU's
-    // 1-tick fallback; the RTC (portable, unlike the miscalibrated TSC) paces the reconcile so we do not
-    // scan every tick. A dead task's own notification still wakes us immediately (the fast path below).
-    const RECV_WAKE_CYCLES: u64 = 1;
-    const RECONCILE_SECS: i64 = 3;
-    let mut last_reconcile = ctx.datetime().epoch_secs();
     loop {
-        let msg = match ctx.recv_timeout(RECV_WAKE_CYCLES) {
-            Some(m) => m,
-            None => {
-                // Timer wake: reconcile the managed set if it is due, so a DROPPED death-notification
-                // (with no following death to ride) is still recovered within RECONCILE_SECS.
-                if ctx.datetime().epoch_secs().wrapping_sub(last_reconcile) >= RECONCILE_SECS {
-                    reconcile(&ctx, &mut name_map);
-                    last_reconcile = ctx.datetime().epoch_secs();
-                }
-                continue;
-            }
-        };
+        let msg = ctx.recv();
         let name = core::str::from_utf8(msg.payload_bytes()).unwrap_or("");
         // Restartable services (§6.1): fs + block-driver (Phase D). Phase 3c/4 (docs/naming-design.md):
         // respawn WIRED FROM THE MAP - same peers as at boot - and the spawn refreshes the map with
@@ -513,12 +556,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
             _ => {}
         }
-        // Reconcile backstop after a handled death (fast path). The timer wake above additionally covers
-        // a dropped notification with NO following death to ride - e.g. the `kill all-services`
-        // shell-orphan (the shell's notify was lost in the supervisor-respawn window, and nothing else
-        // died afterward to trigger this). Cheap when nothing is dead.
+        // Reconcile backstop: catch any managed service whose death notification was DROPPED under the
+        // storm (our 16-deep endpoint overflowed, or a flood clogged it) - it would otherwise stay dead
+        // forever (the "fs gone from observe after a storm" bug). A storm always has a next death to
+        // ride, so a dropped one is recovered on the following notification. Cheap when nothing is dead.
         reconcile(&ctx, &mut name_map);
-        last_reconcile = ctx.datetime().epoch_secs();
     }
 }
 
