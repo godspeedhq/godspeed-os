@@ -236,3 +236,36 @@ Stage 1: in the kernel console layer, split the framebuffer mirror off the log
 path and give the shell/observe a console-output path to the framebuffer; verify
 the TV shows a clean session while serial keeps the full logs (shell-test + a
 framebuffer screendump). Then Stage 2.
+
+---
+
+## 8. Input under a starved timer ISR - drain-on-read (2026-07-09)
+
+> **Built 2026-07-09.** Not a design question - a robustness fix to the *input mechanism* of §2,
+> surfaced by the same T630 storm that produced `docs/persistence.md` §6.16 (a rapid double
+> `kill all-services`). No new syscall, no format change, no amendment.
+
+The keyboard/serial input path of §2 depends on the **timer ISR** to poll the UART RX line and push
+bytes into the console ring. Under a storm - the timer starved by long `IF=0` console writes and
+IPI/shootdown pressure - that ISR fires late or not at all, so typed bytes pile up in the UART's 16-byte
+RX FIFO and never reach the ring. The console *looks* dead even though the hardware already holds the
+input.
+
+**Fix: drain on read, not only on tick.** The console read syscalls (`ConsoleRead` / `TryConsoleRead`)
+now call `uart_rx_drain_now` **before** consulting the ring: with interrupts disabled (`cli`), drain the
+UART RX FIFO into the console ring, then restore the prior IF. A task blocked in `ConsoleRead` therefore
+pulls its own input straight off the hardware the instant it asks for it, independent of whether the
+timer ISR is keeping up. The tick-driven poll stays (it is what *wakes* a blocked reader), but
+correctness no longer **hinges** on it. This is the input-side echo of the storage stack's Commandment
+VIII fix (§6.16): don't wait on a proxy (the tick) for a truth (a keystroke) you can observe directly.
+The drain is bounded (16-byte FIFO into a fixed ring) and IF-guarded (it never re-enters and never leaves
+interrupts unexpectedly enabled); no new `unsafe` beyond the existing `arch` UART accessors.
+
+**Companion: lazy, bounded shell history.** The shell persists its command history to `/.gsh_history`
+(the §15 monotonic-counter pattern). It used to **read that file back at startup** - an `fs` round-trip
+fired during the shell's own re-init, which is exactly when the storage stack may be mid-recovery (a
+contributing masked race in the §6.16 wedge). The read is now **lazy**: the shell loads `/.gsh_history`
+on the **first up-arrow**, not at spawn. A fresh prompt never blocks on `fs` coming up, and the shell's
+re-init path touches no disk. In-memory history stays bounded (a fixed ring); saving remains best-effort
+(§15). Two small changes, one theme: the interactive path must stay responsive precisely when the rest of
+the system is busy recovering.

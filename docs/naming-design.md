@@ -382,6 +382,22 @@ To be drafted into `CLAUDE.md` at adoption (each with a commit rationale, §21):
     PENDING/IN-PROGRESS handshake (no double-respawn), and no new `unsafe` (it lives inside
     `yield_current`'s existing block). Confirmed on hardware: a 5000-round max-carnage soak sustains
     the live set instead of draining to 0.
+11. **Death handling must be idempotent - the supervisor is a fixed point (Phase 6, hardware-found).** A
+    rapid *second* `kill all-services` (the whole restartable set killed twice within seconds) can deliver
+    a death notice for a service the supervisor has **already recovered** - either it adopted a
+    still-running instance on its own respawn (§3.7.3), or a duplicate/stale notice arrives after the
+    respawn already completed. Reacting to that notice naively re-spawns a *second* instance (the
+    singleton guard then rejects it, and the churn feeds the storm). Fix: the supervisor treats recovery
+    as **convergence to a target set**, not a per-event reflex. Each death notice reconciles the live-task
+    list against the compiled-in manifest (risks #6/#7) and acts only on the *difference* - a service
+    already running (adopted or freshly respawned) is a no-op it logs as *already recovered*; a service
+    genuinely absent is respawned, exactly once. The supervisor thus behaves as a **fixed point**: from
+    any perturbation - one kill, a storm, its own death mid-storm - it reconverges to "every manifest
+    service alive, exactly one instance each," and a redundant notice is *absorbed*, never *amplified*.
+    This is the supervisor-side complement to Invariant 11 (identity is stable; the instance is not): the
+    supervisor restores the *identity set*, indifferent to how many notices announce the same gap.
+    Confirmed on hardware: a rapid double `kill all-services` on the T630 recovers the full set with no
+    duplicate spawns and no wedge (the storage-stack half of the same run is `docs/persistence.md` §6.16).
 
 ---
 

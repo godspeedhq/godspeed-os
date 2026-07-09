@@ -78,9 +78,19 @@ once read/write/fs/reboot are verified on it. Test: `osdev test blockdev-ahci`.
   captured and clears `PxTFD.BSY`, AHCI 10.1.2), pulse `PxSCTL.DET` 1 -> hold -> 0, wait for the PHY
   (`PxSSTS.DET == 3`), clear `PxSERR`/`PxIS`, restart the engine. `init_port` runs it on every
   (re)start; `recover_port` (the Phase H per-I/O retry path) escalates to it when a soft recovery leaves
-  `BSY` set, so a running driver self-heals a wedged port with no restart. This is what lets `fs`'s
+  the port wedged, so a running driver self-heals a wedged port with no restart. This is what lets `fs`'s
   mount-on-truth get a truthful answer: `block-driver`'s reply reflects a settled controller, never a
   wedged-`BSY` false 0 (Commandment VIII).
+- **Step G - CI-stuck escalation. ✅ done** (`2026-07-09`, hardware-found on the T630 by a rapid double
+  `kill all-services`). Step F escalated to COMRESET only on a stuck `PxTFD.BSY`. But a command against a
+  **nonsense LBA** (an `fs` mount that derived a backup-superblock LBA from a garbage capacity - see
+  `docs/persistence.md` §6.16) can wedge the controller with the **command-issue bit `PxCI` stuck set and
+  `BSY` clear**. A soft recovery (clearing `PxSERR`/`PxIS`) cannot clear an owned `PxCI` - only a port
+  COMRESET does - so the BSY-only gate never fired and the driver retried into the same stuck state
+  forever. `recover_port` now escalates on `PxTFD.BSY != 0 || PxCI != 0`, covering both wedge shapes. The
+  fs-side half of the fix (rejecting the mis-shaped capacity reply, and a bounded failure-truth exit from
+  the mount loop) is `docs/persistence.md` §6.16; together they complete Commandment VIII in the storage
+  stack. The live CI-stuck condition is T630-only - QEMU's emulated AHCI never raises it.
 
 ## 5. Register cheat-sheet
 

@@ -313,3 +313,40 @@ When a phase ships and an identity test pins it, the load-bearing decision is am
 6. **One `net-stack` service** owning IP + all protocols, vs splitting (e.g. a separate `udp` service)?
    Recommendation: one `net-stack` for now (whiteboard-simple); split only if a real reason appears
    (§26.2).
+
+---
+
+## 15. Chaos and link resilience (hardware-proven, 2026-07-07..09)
+
+> **Exercised on the T630 bench** (real RTL8111/8168, live LAN). Once the stack ran end to end on
+> hardware - a real DHCP lease, gateway, and `ping` - the question stopped being *"does it work"* and
+> became *"does it survive the two failures a real NIC actually sees"*: the **cable** moving, and the
+> **services dying**. Both are now chaos-covered, held to the same discipline `block-driver`/`fs` got.
+
+**Link flap - the cable is location, not identity (invariant 11).** A NIC's carrier goes up and down
+independently of anything the OS does (someone unplugs the cable, the switch reboots). The stack treats a
+link transition as a first-class, *observable* event, never a silent error (§26.7):
+
+- **Self-configure on link-up.** When the driver observes carrier (the RTL8168 PHY reports link a few
+  seconds after cable-in), `net-stack` runs its configuration dance automatically - ARP announce, then
+  DHCP DISCOVER/REQUEST to a lease. No command, no reboot; plugging in the cable *is* the trigger.
+- **`ping` rides an unplug/replug.** A running `ping` does not die when the cable is pulled - it reports
+  the link down and **resumes** when the cable returns and the lease re-acquires, with an instant `q`
+  abort throughout (the utility never blocks un-abortably on a dead link - Commandment VIII, and the
+  "press q to abort" utility convention).
+- **`net` reflects the *live* link.** `net` reads carrier + lease state at call time, so it never shows a
+  stale "up" for a cable that is out.
+- **`net renew` recovers in place.** A link that came up mis-configured, or a lease that expired, is
+  repaired by re-running the configuration dance **inside the running `net-stack`** - no service restart,
+  no reboot. Recovery is a re-configuration, not a re-spawn.
+
+**Multi-target max-carnage.** The `chaos` utility (a userspace program) storms the networking services
+exactly as it storms storage. `chaos max-carnage nic-driver,net-stack N` takes a **comma-separated target
+list** and kills **every** named service each round, for N rounds (rounds uncapped - a count is not a
+resource, §6.2/§26.6). Killing the NIC driver *and* the stack together, repeatedly, exercises the full
+recovery order: the supervisor respawns `nic-driver` first, then `net-stack` reacquires it by name
+(§14.3) and re-configures on the freshly-initialised link. The random-target variant picks its victims
+from the live set, so no single kill-ordering is special-cased. Result on hardware: the link comes back
+and `ping` resumes after every round, with no kernel panic - *"not even a blip."* This is the networking
+half of the same restartability story the storage stack tells (`docs/persistence.md` §6.16,
+`docs/naming-design.md` §8 risk #11): the system reconverges from any perturbation.
