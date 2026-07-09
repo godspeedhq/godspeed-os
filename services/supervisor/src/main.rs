@@ -188,6 +188,19 @@ fn managed_alive(ctx: &ServiceContext) -> [bool; MANAGED_N] {
     alive
 }
 
+/// Single-service liveness for the death-loop's race guard: is a LIVE task with exactly this name up
+/// right now? Same `task_stat` discipline as `managed_alive` (valid AND not Dead=4), for one arbitrary
+/// name - covers non-MANAGED names like `counter` too - so the death-loop and the convergence agree on
+/// what "alive" means. Early-exits on the first match.
+fn name_alive(ctx: &ServiceContext, name: &str) -> bool {
+    for slot in 0..256u32 {
+        let st = ctx.task_stat(slot);
+        if !st.valid || st.state == 4 { continue; } // 4 = Dead
+        if st.name_str() == name { return true; }
+    }
+    false
+}
+
 /// Respawn one managed service WIRED to its peers (block-driver before fs before shell; nic before net).
 fn respawn_managed(ctx: &ServiceContext, map: &mut NameCapMap, name: &str) -> bool {
     match name {
@@ -487,6 +500,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     loop {
         let msg = ctx.recv();
         let name = core::str::from_utf8(msg.payload_bytes()).unwrap_or("");
+        // Two recovery paths race after a mass-kill: the convergence (converge()/reconcile()) may have
+        // ALREADY respawned this service before its queued death notification reached us. If it is
+        // already alive, a restart here hits the kernel singleton guard ("already running") and logs a
+        // FALSE "restart FAILED" - a loud non-failure that erodes trust in the signal (§26.4). Skip the
+        // doomed restart quietly (log "already recovered"); still run the reconcile backstop below so a
+        // genuinely-dropped OTHER death is caught this iteration. Same `task_stat` liveness the
+        // convergence uses, so the two paths agree on "alive".
+        if !name.is_empty() && name_alive(&ctx, name) {
+            ctx.log_fmt(format_args!("supervisor: {} already recovered (reconcile won the race)", name));
+            reconcile(&ctx, &mut name_map);
+            continue;
+        }
         // Restartable services (§6.1): fs + block-driver (Phase D). Phase 3c/4 (docs/naming-design.md):
         // respawn WIRED FROM THE MAP - same peers as at boot - and the spawn refreshes the map with
         // the new instance's cap (record updates in place, so a kill-storm can't grow the map). The
