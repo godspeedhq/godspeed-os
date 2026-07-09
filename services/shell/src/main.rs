@@ -9458,6 +9458,18 @@ fn read_confirm(ctx: &ServiceContext) -> bool {
                     if let Ok(s) = core::str::from_utf8(&[b]) { ctx.console_write(s); }
                 }
             }
+            0x1b => match read_escape_byte(ctx) {
+                // Bare ESC (the Escape key) CANCELS - back to the prompt, like the main line editor's ESC.
+                // read_escape_byte does not hang on a bare ESC (it times the wait off the TSC).
+                None => { ctx.console_writeln(""); return false; }
+                // A nav key (arrow / Home: ESC [ ... or ESC O ...) - a confirm does not navigate, so drain
+                // the rest of the sequence (to its final byte, 0x40..=0x7e) and ignore it, so no stray bytes
+                // leak into the answer. The sequence's bytes are already queued (atomic keyboard push).
+                Some(b'[') | Some(b'O') => {
+                    for _ in 0..8 { let c = ctx.console_read(); if (0x40..=0x7e).contains(&c) { break; } }
+                }
+                Some(_) => {} // ESC + a lone byte: ignore both, keep waiting for y/n
+            }
             _ => {}
         }
     }
