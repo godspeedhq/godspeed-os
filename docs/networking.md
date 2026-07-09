@@ -66,7 +66,7 @@ authority, §3.10 whiteboard rule):
 - It is **too big to fully understand.** The value here is a stack a contributor can explain on a
   whiteboard, where every byte on the wire traces to a capability operation.
 
-We write a **minimal, capability-native** stack: ARP + IPv4 + ICMP + UDP first; TCP far-future. `smoltcp`
+We write a **minimal, capability-native** stack: ARP + IPv4 + ICMP + UDP (all **built + HW-proven** on the T630, §11); TCP is the committed next phase, not deferred (the owner's decision at the head of this doc). `smoltcp`
 (Rust, `no_std`) is a fine *reference* for wire formats and the TCP state machine - we may borrow its
 parsing shape - but the **socket layer is ours** (caps, not fds) and the scope is "understandable,"
 not "feature-complete."
@@ -79,7 +79,7 @@ not "feature-complete."
   ┌─────────────────────────────────────────────┐
   │  Services (hold socket capabilities)         │   e.g. a future `timeserver`, `httpd`, the shell
   ├─────────────────────────────────────────────┤
-  │  net-stack   (service)                       │   ARP / IPv4 / ICMP / UDP  [TCP far-future]
+  │  net-stack   (service)                       │   ARP / IPv4 / ICMP / UDP (built)  [TCP next]
   │   - owns the host IP + ports (a resource)    │   mints + revokes SOCKET caps (§7.10)
   │   - routes datagrams <-> sockets             │
   ├─────────────────────────────────────────────┤
@@ -182,7 +182,8 @@ construction.
 ## 7. Addressing and identity
 
 - **The host IP.** `net-stack` owns it. **Static config first** (an IP/mask/gateway baked into the
-  stack's contract or a tiny config); **DHCP is far-future** (itself just a UDP client of `net-stack`).
+  stack's contract or a tiny config); **DHCP is built** (itself just a UDP client of `net-stack` - a
+  real lease + gateway is HW-proven on the T630, §11 Phase 3), with static config still the fallback.
 - **Ports are resources** `net-stack` allocates. A UDP socket cap is authority over a `(proto, local
   port)` (and optionally a fixed remote); a future TCP socket cap is authority over one connection.
 - **Identity over location (invariant 11).** A socket cap is stable identity; the NIC it egresses, the
@@ -208,9 +209,10 @@ Each layer is small and testable; the milestone for each is a concrete wire even
   of v1's ping/pong: proof the whole NIC -> ARP -> IP -> ICMP -> back path works on real wire.
 - **UDP** - stateless datagrams. **The first socket-cap milestone:** a service opens a UDP socket cap,
   `send`s a datagram, `recv`s a reply. Stateless, so it survives a `net-stack` restart trivially.
-- **TCP** - **far-future.** The state machine, retransmission, windows, and ordered teardown are the
-  bulk of a real stack. Stateful, so a `net-stack` restart **drops** live connections (see §9). Worth
-  doing only after UDP + the cap model are solid and there is a real consumer.
+- **TCP** - **the committed next phase (§11 Phase 5), not far-future.** The state machine,
+  retransmission, windows, and ordered teardown are the bulk of a real stack. Stateful, so a
+  `net-stack` restart **drops** live connections (see §9). It builds on the now-solid UDP + socket-cap
+  foundation.
 
 ---
 
@@ -245,21 +247,21 @@ Each layer is small and testable; the milestone for each is a concrete wire even
 | ARP resolution fails | send fails loudly after a bounded retry; never an indefinite hang (§26.6 bounded) |
 | `net-stack` / `nic-driver` death | endpoint generation bumped; holders reacquire by name (§14.3) |
 
-No silent fallbacks at any boundary. TCP's own ack/retransmit (far-future) is the *protocol* providing
+No silent fallbacks at any boundary. TCP's own ack/retransmit (Phase 5, next) is the *protocol* providing
 reliability on top of this best-effort substrate - not the kernel, not magic.
 
 ---
 
 ## 11. Phased plan (mirrors persistence: ahci -> gsfs -> file-cap)
 
-| Phase | Deliverable | Milestone / test |
-|-------|-------------|------------------|
-| **0** | PCI-enumerate + print the NIC (`vendor:device`, BARs, IRQ) | We learn the T630's chipset from one boot line |
-| **1** | `nic-driver` (e1000): raw Ethernet TX/RX via DMA rings + RX IRQ, IOMMU-confined | Send a raw frame; receive a raw frame (host-side listener / loopback) in QEMU |
-| **2** | ARP + IPv4 + ICMP in `net-stack` | **`ping` the host** end to end - the networking ping/pong |
-| **3** | UDP + **socket-as-capability** (`resource_mint`/badge/revoke); a `net` shell utility | A service opens a UDP socket cap, send/recv a datagram; non-escalation + revoke pinned (a §22 "socket is a capability" test, mirroring Test 14) |
-| **4** | The **Realtek RTL8168 driver** (`10ec:8168`, the T630's NIC), same frame interface - HW-only, no QEMU model | `ping` from bare metal on the T630 |
-| **5** | (far-future) TCP | A TCP echo against a real peer |
+| Phase | Deliverable | Milestone / test | Status |
+|-------|-------------|------------------|--------|
+| **0** | PCI-enumerate + print the NIC (`vendor:device`, BARs, IRQ) | We learn the T630's chipset from one boot line | ✅ done |
+| **1** | `nic-driver` (e1000): raw Ethernet TX/RX via DMA rings + RX IRQ, IOMMU-confined | Send a raw frame; receive a raw frame (host-side listener / loopback) in QEMU | ✅ done |
+| **2** | ARP + IPv4 + ICMP in `net-stack` | **`ping` the host** end to end - the networking ping/pong | ✅ done + HW-proven |
+| **3** | UDP + **socket-as-capability** (`resource_mint`/badge/revoke); a `net` shell utility | A service opens a UDP socket cap, send/recv a datagram; non-escalation + revoke pinned (a §22 "socket is a capability" test, mirroring Test 14) | ✅ done (DHCP + DNS ride UDP) |
+| **4** | The **Realtek RTL8168 driver** (`10ec:8168`, the T630's NIC), same frame interface - HW-only, no QEMU model | `ping` from bare metal on the T630 | ✅ done + HW-proven |
+| **5** | TCP - committed next (§8, no longer far-future) | A TCP echo against a real peer | next |
 
 Each phase gets a design beat in this doc plus QEMU + (where it applies) T630 verification, exactly like
 the AHCI/GSFS/file-cap ladder.
@@ -304,12 +306,14 @@ When a phase ships and an identity test pins it, the load-bearing decision is am
 
 1. **The T630's NIC chipset** - **RESOLVED (2026-06-24): Realtek RTL8111/8168 (`10ec:8168`).** QEMU has
    no RTL8168 model, so dev is e1000 and the Realtek driver is Phase 4 (HW-only). See §5 Phase 0.
-2. **Static IP first** (baked config), DHCP deferred - agreed? (DHCP is later, as a UDP client.)
+2. **Static IP first** (baked config), DHCP deferred - **RESOLVED: DHCP is built** (a UDP client of
+   `net-stack`, HW-proven on the T630); static config remains the fallback.
 3. **e1000 as the QEMU dev driver** - agreed? Note this is purely the dev NIC: the T630 is Realtek, so
    e1000 does NOT run on it (vs virtio-net, which can't run on bare metal at all). The HW driver is the
    Phase-4 RTL8168.
 4. **IPv4 only** to start, IPv6 far-future - agreed?
-5. **UDP + the cap model is the v2 milestone**; TCP is explicitly far-future - agreed on that boundary?
+5. **UDP + the cap model is the v2 milestone** - **RESOLVED: done + HW-proven.** TCP was subsequently
+   **committed as the next phase** (owner's decision, 2026-07-04, at the head of this doc), no longer far-future.
 6. **One `net-stack` service** owning IP + all protocols, vs splitting (e.g. a separate `udp` service)?
    Recommendation: one `net-stack` for now (whiteboard-simple); split only if a real reason appears
    (§26.2).
