@@ -3686,7 +3686,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("chaos flood-storm <svc> [rounds]", "saturate a service's IPC queue with try_send; verify it drains + stays alive (the other axis: 'overwhelmed', not 'gone')", "chaos flood-storm fs 5"),
             ("chaos mem-pressure [rounds]", "spawn a mem-pressure that allocs to its limit, kill it, confirm the memory is reclaimed (alloc-to-limit + no leak, S7)", "chaos mem-pressure 5"),
             ("chaos spawn-storm [count]", "spawn mem-pressure tasks until the task-pool/memory ceiling REFUSES one (loud Err, no panic), then kill all + confirm full reclaim", "chaos spawn-storm"),
-            ("chaos max-carnage [<all-services|svc|svc,svc>] [n]", "the chaos monkey: NO target = a RANDOM subset of the restartable set each round (supervisor included, nothing protected-last); or aim at all-services / one / a comma-list. Under system-wide mem-pressure + spawn-storm; proves the system RECOVERS from any kill order. 'q' aborts (via SERIAL if it storms the USB keyboard drivers)", "chaos max-carnage 50"),
+            ("chaos max-carnage <all-services|svc|svc,svc> [n]", "the chaos monkey: 'all-services' = RANDOM carnage over the whole restartable set each round (supervisor a normal victim, nothing protected-last); or aim at one / a comma-list. A TARGET IS REQUIRED (a bare max-carnage is refused). Under system-wide mem-pressure + spawn-storm; proves the system RECOVERS from any kill order. 'q' aborts (via SERIAL if it storms the USB keyboard drivers)", "chaos max-carnage all-services 50"),
             ("chaos link-flap [n]", "networking-specific: simulate a cable unplug/replug n times (a report override, no hardware touch); net-stack notices the loss and self-configures on the up edge. tests LINK recovery, not process death. 'q' aborts", "chaos link-flap 3"),
         ], true),
         "drives" => help_block(ctx, "drives", "manage attached disks (records when piped)", &[
@@ -6397,7 +6397,7 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
         ctx.console_writeln("  flood-storm <svc> [n]   saturate its queue; verify it drains");
         ctx.console_writeln("  mem-pressure      [n]   a mem-pressure allocs to its limit, then reclaim");
         ctx.console_writeln("  spawn-storm       [n]   spawn mem-pressure tasks to the ceiling; loud refusal");
-        ctx.console_writeln("  max-carnage [<all-services|svc|svc,svc,...>] [n]  no target = RANDOM storm; or aim/list");
+        ctx.console_writeln("  max-carnage <all-services|svc|svc,svc,...> [n]  all-services = RANDOM storm; or aim/list (target REQUIRED)");
         ctx.console_writeln("                          ('q' aborts; SERIAL only if the run kills the keyboard)");
         ctx.console_writeln("  link-flap         [n]   simulate a cable unplug/replug; net-stack self-configures (net only)");
         ctx.console_writeln("  svc: supervisor | block-driver | fs | logger | xhci | ehci | shell | nic-driver | net-stack");
@@ -6414,18 +6414,22 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
             // number = random for N rounds. `help` = usage. A named target / all-services / comma-list aims
             // it (kept). tok[1] = target-or-rounds-or-help, tok[2] = rounds.
             if ntok >= 2 && tok[1] == "help" {
-                ctx.console_writeln("usage: chaos max-carnage [<all-services | svc | svc,svc,...>] [rounds]");
-                ctx.console_writeln("  (no target)    RANDOM: a random subset of the restartable set each round (the honest storm)");
-                ctx.console_writeln("  all-services   a full even sweep of EVERY live service each round");
+                ctx.console_writeln("usage: chaos max-carnage <all-services | svc | svc,svc,...> [rounds]");
+                ctx.console_writeln("  all-services   RANDOM carnage over the whole restartable set each round (the honest");
+                ctx.console_writeln("                 chaos-monkey: supervisor a normal victim, nothing protected-last)");
                 ctx.console_writeln("  <service>      aim every round at one service (e.g. fs, logger)");
                 ctx.console_writeln("  svc,svc,...    a comma-separated list: kill EVERY listed service each round (cascade stress)");
-                ctx.console_writeln("  all run system-wide mem-pressure + spawn-storm. 'q' aborts (SERIAL if kbd dies).");
+                ctx.console_writeln("  a TARGET IS REQUIRED - max-carnage aims at one, many, or all, so a bare call is refused.");
+                ctx.console_writeln("  all run system-wide mem-pressure + spawn-storm. 'q' aborts (SERIAL if the run kills the kbd).");
                 Ok(())
-            } else if ntok < 2 || (!tok[1].is_empty() && tok[1].bytes().all(|b| b.is_ascii_digit())) {
-                // No target, or a bare number = the RANDOM storm (the number is ROUNDS, not a target). "" ->
-                // the chaos service defaults to random. 0 rounds = run until q.
-                let rounds = if ntok >= 2 { parse_u32(tok[1]).unwrap_or(0) } else { 0 };
-                chaos_launch(ctx, "", rounds)
+            } else if ntok < 2 || tok[1].bytes().all(|b| b.is_ascii_digit()) {
+                // NO TARGET (bare, empty, or ONLY a rounds number) - refuse LOUDLY (invariant 12). max-carnage
+                // can aim at one, many, or all services, so a bare invocation is ambiguous and must name a
+                // target rather than silently storm everything. 'all-services' is the explicit whole-system storm.
+                ctx.console_writeln("max-carnage: a target is required.");
+                ctx.console_writeln("usage: chaos max-carnage <all-services | svc | svc,svc,...> [rounds]");
+                ctx.console_writeln("  'all-services' storms everything (random each round); or aim at one service / a comma-list.");
+                Ok(())
             } else {
                 // A named target. Validate it before launching (a bad name would storm nothing), loudly
                 // (invariant 12). The syntax is <target> [rounds].
@@ -6542,7 +6546,8 @@ fn chaos_launch(ctx: &ServiceContext, target: &str, rounds: u32) -> Result<(), S
     // keyboard ONLY if it is the controller yours is on - we cannot know which, so we state the proviso.
     // Anything else leaves the keyboard alive. The keyboard works HERE, pre-storm, so the confirm lands.
     let target_all = target == "all-services";
-    let target_usb = target == "xhci" || target == "ehci";
+    // USB in a comma-list kills the keyboard too, so warn serial for it as well (not just a bare xhci/ehci).
+    let target_usb = target.split(',').any(|s| s == "xhci" || s == "ehci");
     ctx.console_writeln("");
     ctx.console_writeln("============ MAXIMUM CARNAGE - READ THIS ============");
     if target_all {

@@ -1468,6 +1468,9 @@ fn handle_console_read(cap_slot: u64) -> i64 {
         // This closes the race where the shell's loop gate passed is-foreground, then it blocked here
         // just as the app claimed. We are woken by the RX IRQ (a byte) OR by release/owner-death.
         if crate::arch::x86_64::console_foreground_allows(my_slot as u32) {
+            // Drain the UART FIFO ourselves (a starved timer ISR under chaos max-carnage would otherwise
+            // leave the serial byte stranded in the FIFO). See uart_rx_drain_now.
+            crate::arch::x86_64::uart_rx_drain_now();
             if let Some(b) = crate::arch::x86_64::uart_rx_pop() {
                 crate::arch::x86_64::CONSOLE_READ_WAITER.store(u32::MAX, Ordering::Release);
                 return b as i64;
@@ -1513,6 +1516,10 @@ fn handle_try_console_read(cap_slot: u64) -> i64 {
     if !crate::arch::x86_64::console_foreground_allows(scheduler::current_task_slot() as u32) {
         return NO_CONSOLE_BYTE;
     }
+    // Drain the UART FIFO ourselves before popping: `chaos max-carnage` starves the timer-ISR poll
+    // (the normal FIFO->ring drain), so without this the serial `q`-to-abort sits stranded in the FIFO
+    // and the storm cannot be stopped. This makes the chaos runner's q-poll independent of the ISR.
+    crate::arch::x86_64::uart_rx_drain_now();
     match crate::arch::x86_64::uart_rx_pop() {
         Some(b) => b as i64,
         None    => NO_CONSOLE_BYTE,

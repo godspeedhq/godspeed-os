@@ -746,6 +746,27 @@ pub fn uart_rx_poll() {
     }
 }
 
+/// Drain the COM1 UART FIFO into the input ring RIGHT NOW, independent of the timer-ISR poll.
+/// `chaos max-carnage` starves the core-0 timer ISR (long IF=0 kernel work + slow tick), so
+/// `uart_rx_poll` stops running and the serial `q`-to-abort sits undrained in the UART FIFO -
+/// leaving the operator no way to stop the storm (the USB `q` path is dead too: its drivers are
+/// storm victims). A console reader (the chaos `q`-poll, syscall 24) calls this before popping the
+/// ring, so input capture never hinges on the ISR. IF-guarded: `cli` around the drain so it does
+/// not race the timer ISR on the single-producer ring tail; IF is restored to its prior value
+/// (the syscall path is IF=1, but restore exactly rather than assume). Safe to call from a syscall.
+pub fn uart_rx_drain_now() {
+    // SAFETY: pushfq reads RFLAGS to restore IF exactly; cli makes uart_rx_drain_fifo (the documented
+    // FIFO->ring drain, normally ISR-only) atomic vs the timer ISR's own drain of the same ring.
+    unsafe {
+        let flags: u64;
+        core::arch::asm!("pushfq; pop {f}; cli", f = out(reg) flags);
+        uart_rx_drain_fifo();
+        if flags & 0x200 != 0 {
+            enable_interrupts();
+        }
+    }
+}
+
 /// Inject one byte into the console input ring from a userspace input driver
 /// (the USB keyboard, §12), then wake any blocked ConsoleRead. Mirrors the COM1
 /// poll path's push + wake, so USB keystrokes reach the shell exactly like

@@ -160,8 +160,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // a full even sweep of every live service each round; a service name = aim every round at THAT one; a
     // comma-list = kill every listed one each round. mem-pressure + spawn-storm are system-wide in all modes.
     let target: &str = if tlen == 0 { "random" } else { str_of(&tbuf[..tlen]) };
-    let target_random = tlen == 0;                 // no explicit target = the RANDOM full-set storm
-    let target_all = target == "all-services";
+    // all-services = the RANDOM whole-set storm (a random subset each round). The shell now REQUIRES a target
+    // (a bare max-carnage is refused there), so tlen==0 should not occur; keep it -> random defensively.
+    let target_random = tlen == 0 || target == "all-services";
+    let target_all = target == "all-services";     // kept for the serial-only abort warning messages
     // A comma-separated target ("nic-driver,net-stack") is a MULTI-TARGET run: EVERY listed service is
     // killed each round (semantics B - the cascade stress). Parse it once into a bounded fixed array.
     const MAX_TLIST: usize = 8;
@@ -180,7 +182,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // only). A single USB host driver (xhci/ehci) kills the keyboard ONLY if it is the controller yours is
     // on - we cannot know which (two controllers + hot-plug make detection unreliable), so we state the
     // proviso honestly rather than guess. Anything else leaves the keyboard alive (plain keyboard `q`).
-    let target_usb = target == "xhci" || target == "ehci";
+    let target_usb = target.split(',').any(|s| s == "xhci" || s == "ehci");
 
     // Take the keyboard so a resurrected shell cannot steal our `q`. This is the moment the shell goes
     // "muted" for the duration of the run (unclaimed is the normal state, so this changes nothing else).
@@ -240,17 +242,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 let pick = (rng.next() as usize) % RESTARTABLE.len();
                 let b = RESTARTABLE[pick].as_bytes(); let l = b.len().min(24);
                 cand[0].0[..l].copy_from_slice(&b[..l]); cand[0].1 = l; ncand = 1;
-            }
-        } else if target_all {
-            for slot in 0..256u32 {
-                let st = ctx.task_stat(slot);
-                if !st.valid || st.state == 4 { continue; }
-                let nm = st.name_str();
-                if nm.is_empty() || nm == "chaos" || nm == "mem-pressure" || nm.starts_with("observe") { continue; }
-                if ncand < MAX_CAND {
-                    let b = nm.as_bytes(); let l = b.len().min(24);
-                    cand[ncand].0[..l].copy_from_slice(&b[..l]); cand[ncand].1 = l; ncand += 1;
-                }
             }
         } else if target_list {
             // Multi-target: every listed service is a candidate this round (all killed below).
