@@ -275,11 +275,15 @@ impl<'a> Ahci<'a> {
             let cmd2 = self.pread(PX_CMD);
             self.pwrite(PX_CMD, cmd2 | CMD_ST);
         }
-        // ESCALATE: if the port is STILL stuck BSY after the soft recovery above, the controller
-        // is wedged in a way only a real port reset clears (the `chaos max-carnage` failure mode:
-        // a COMRESET is what a cold boot does). Do it so a RUNNING driver self-heals a wedged port
-        // without waiting for a restart.
-        if self.pread(PX_TFD) & TFD_BSY != 0 {
+        // ESCALATE: if the port is STILL stuck after the soft recovery above - either BSY, or a
+        // command still latched in PxCI (a "command timeout (CI stuck)" that never set BSY - the
+        // wedge a garbage/out-of-range LBA read leaves) - the controller is wedged in a way only a
+        // real port reset clears. A soft recovery cannot clear a hardware-owned PxCI bit; a COMRESET
+        // (what a cold boot does) resets the port and frees it. Gating this on BSY alone let a
+        // CI-stuck-without-BSY wedge retry into the identical stuck state forever (Bug 2). Do it so a
+        // RUNNING driver self-heals a wedged port without waiting for a restart - Commandment VIII in
+        // the driver: a persistent stuck command is a failure-truth we must act on, not spin on.
+        if self.pread(PX_TFD) & TFD_BSY != 0 || self.pread(PX_CI) != 0 {
             self.port_comreset(ctx);
         }
     }
