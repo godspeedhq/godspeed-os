@@ -416,7 +416,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         ctx.yield_cpu(); k += 1;
         if k % POLL_EVERY == 0 && ctx.datetime().epoch_secs() - t0 >= RECOVER_SECS { break; }
     }
-    for _ in 0..SHELL_SETTLE_YIELDS { ctx.yield_cpu(); } // let the fresh shell settle
+    // Cosmetic hand-off pacing, NOT a completion wait (Commandment VIII): the live-shell TRUTH is
+    // already established by the bounded slot_of loop above. This fixed pad only smooths the console
+    // hand-back so our "done" line and the shell's redrawn prompt do not interleave; skipping it risks
+    // at worst a momentary cosmetic glitch, never incorrectness. Deliberately time-based, not a truth-wait.
+    for _ in 0..SHELL_SETTLE_YIELDS { ctx.yield_cpu(); }
     // Print our last line FIRST, then release. The muted shell only draws its prompt once it regains the
     // foreground, so releasing BEFORE this printed "done" made the shell's `gsh>` land before the text
     // (the "switches screen, press Enter to see the prompt" glitch). done -> release -> the shell draws a

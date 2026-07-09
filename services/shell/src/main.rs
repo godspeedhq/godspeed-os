@@ -6970,8 +6970,9 @@ fn count_named(ctx: &ServiceContext, name: &str) -> u32 {
 fn chaos_spawn_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
     const SPAWN_STORM_DEFAULT: u32 = 256;  // aim past most machines' ceilings; the loop stops at the wall
     const SPAWN_STORM_MAX:     u32 = 512;
-    const SPAWN_SETTLE:        u32 = 300;  // yields after each spawn so the hog runs + grabs its 32 MiB
-    const KILL_SETTLE:         u32 = 80;   // yields after each kill so reclaim drains
+    const SPAWN_DROP_MIN:      u64 = 4096; // >= 16 MiB dropped = the hog's alloc landed (truth, not a timer)
+    const SPAWN_SETTLE_SECS:   i64 = 2;    // per-spawn RTC bound; the drop-poll breaks early on success
+    const KILL_SETTLE_SECS:    i64 = 2;    // per-kill RTC bound; waits on the hog COUNT dropping, not a pad
     const RECLAIM_SECS:        i64 = 12;   // RTC bound for the final reclaim wait
     const RECLAIM_SLACK:       u64 = 2048; // 8 MiB tolerance for "back to baseline" (absorbs noise)
 
@@ -6993,24 +6994,39 @@ fn chaos_spawn_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
     let mut aborted   = false;
     for n in 0..count {
         if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { aborted = true; break; } }
+        let before = ctx.inspect_kernel_free_frames();   // free frames before this hog allocates
         if ctx.spawn("mem-pressure").is_err() {
             refused_at = n + 1;   // the ceiling held - graceful refusal, no panic
             break;
         }
         spawned += 1;
-        for _ in 0..SPAWN_SETTLE { ctx.yield_cpu(); }   // let the hog grab its 32 MiB before the next spawn
+        // Wait on TRUTH - the hog's allocation landing (free frames drop by its request) - not a fixed
+        // pad. RTC-bounded so a hog that cannot alloc near the ceiling times out instead of hanging us.
+        let t = ctx.datetime().epoch_secs();
+        loop {
+            ctx.yield_cpu();
+            if before.saturating_sub(ctx.inspect_kernel_free_frames()) >= SPAWN_DROP_MIN { break; }
+            if ctx.datetime().epoch_secs() - t >= SPAWN_SETTLE_SECS { break; }
+        }
     }
 
     let low       = ctx.inspect_kernel_free_frames();   // memory floor under the swarm
     let live_peak = count_live(ctx);
     let hogs_peak = count_named(ctx, "mem-pressure");
 
-    // 2. Kill every hog (loop until none remain). Bounded by a safety cap.
+    // 2. Kill every hog (loop until none remain, confirmed by the task table). Bounded by a safety cap.
     let mut killed = 0u32;
     while slot_of(ctx, "mem-pressure").is_some() && killed < SPAWN_STORM_MAX + 16 {
+        let remaining = count_named(ctx, "mem-pressure");
         let _ = ctx.kill("mem-pressure");
         killed += 1;
-        for _ in 0..KILL_SETTLE { ctx.yield_cpu(); }
+        // Wait on TRUTH - the hog COUNT dropping (this kill was reaped to Dead) - not a fixed pad. Bounded.
+        let t = ctx.datetime().epoch_secs();
+        loop {
+            ctx.yield_cpu();
+            if count_named(ctx, "mem-pressure") < remaining { break; }
+            if ctx.datetime().epoch_secs() - t >= KILL_SETTLE_SECS { break; }
+        }
     }
 
     // 3. Wait for reclaim - free frames return to ~baseline (deferred kstacks drain on timer ticks).
