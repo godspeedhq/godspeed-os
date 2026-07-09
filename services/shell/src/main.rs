@@ -239,13 +239,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut cwd = Cwd::root();
     // Command history for up/down-arrow recall. `nav == hist.len()` means the live line.
     let mut hist = History::new();
-    // Reconstruct history from the fs so a `kill shell` respawn recovers it (§15). Best-effort: a
-    // missing file or a not-yet-ready fs (e.g. cold boot) just leaves the ring empty - no error, no wait.
-    hist.load(&ctx);
-    // Start at the live line ABOVE the loaded ring (nav == hist.len()), so the FIRST up-arrow recalls the
-    // most-recent recovered command right away - not only after an Enter resets nav. (The "history only
-    // works after pressing enter" bug on a `kill shell` respawn: nav was 0, so `if nav > 0` no-oped on a
-    // freshly loaded ring until the first Enter set nav = hist.len().)
+    // History is loaded LAZILY, not here. Touching fs on the startup path would stall the prompt whenever
+    // fs is slow/wedged (the shell must come up instantly - history is an enhancement, never a requirement,
+    // §26.7), and the only signal the user wants prior history is the up-arrow. So the FIRST up-arrow loads
+    // /.gsh_history (bounded, best-effort) and merges it behind the session; startup touches fs zero times.
+    // See `History::load` + the up-arrow arm in `handle_csi`. nav starts at 0 (empty ring = live line).
     let mut nav = hist.len();
     // The previous command's result (the Ok/Err model), reported by `result`. Threaded as
     // local session state - no global (services hold no global mutable state, §3.9).
@@ -376,7 +374,7 @@ fn read_escape_byte(ctx: &ServiceContext) -> Option<u8> {
 /// PageUp/PageDown) and function keys an extended keyboard sends. Unknown sequences are
 /// consumed and ignored - never smeared onto the line. Bounded: a final byte must arrive
 /// within `CSI_MAX` bytes or we stop (defensive against a malformed serial stream).
-fn handle_csi(ctx: &ServiceContext, line: &mut Line, hist: &History, nav: &mut usize) {
+fn handle_csi(ctx: &ServiceContext, line: &mut Line, hist: &mut History, nav: &mut usize) {
     const CSI_MAX: usize = 8;
     let mut param: u16 = 0;
     let mut have_param = false;
@@ -396,7 +394,24 @@ fn handle_csi(ctx: &ServiceContext, line: &mut Line, hist: &History, nav: &mut u
     }
     match final_byte {
         b'A' => { // Up - older command
-            if *nav > 0 { *nav -= 1; line.set(ctx, hist.get(*nav)); }
+            if *nav > 0 {
+                // There is an older IN-MEMORY entry: just step to it. Memory only - fs is NOT touched
+                // while the user is still walking their own session commands.
+                *nav -= 1;
+                line.set(ctx, hist.get(*nav));
+            } else if !hist.loaded && hist.len() < HIST_MAX {
+                // At the OLDEST in-memory entry, with room for more: only NOW - the user has run out of
+                // session history - do the bounded disk load (at most once, the `loaded` gate). It merges
+                // /.gsh_history BEHIND the session, so `added` older lines land at the front; step into the
+                // newest of them and continue the up-nav. A wedged/absent/empty file adds nothing -> stay put.
+                // Consequence: startup never touches fs; a session that already fills HIST_MAX never loads
+                // (this arm's guard is false); the disk is read at most once, only on running out of history.
+                let before = hist.len();
+                hist.load(ctx);
+                let added = hist.len() - before;
+                if added > 0 { *nav = added - 1; line.set(ctx, hist.get(*nav)); }
+            }
+            // else: at the top and either already loaded or the ring is full - nothing older to show.
         }
         b'B' => { // Down - newer command (past the end → blank live line)
             if *nav < hist.len() {
@@ -760,10 +775,15 @@ struct History {
     lines: [[u8; MAX_LINE]; HIST_MAX],
     lens: [usize; HIST_MAX],
     n: usize,
+    /// One-shot lazy-load gate: the disk history is NOT read at startup (that would touch fs on the
+    /// prompt's critical path); it is loaded on the FIRST up-arrow and merged behind the session, and
+    /// this flag ensures that happens exactly once - success OR bounded-miss - so every later up-arrow
+    /// is instant and never re-touches fs.
+    loaded: bool,
 }
 impl History {
     fn new() -> Self {
-        History { lines: [[0u8; MAX_LINE]; HIST_MAX], lens: [0; HIST_MAX], n: 0 }
+        History { lines: [[0u8; MAX_LINE]; HIST_MAX], lens: [0; HIST_MAX], n: 0, loaded: false }
     }
     fn len(&self) -> usize { self.n }
     fn get(&self, i: usize) -> &[u8] { &self.lines[i][..self.lens[i]] }
@@ -782,26 +802,54 @@ impl History {
         self.n += 1;
     }
     /// Best-effort persistence to `/.gsh_history` (§15: history is shell-OWNED state, externalized to the
-    /// fs so a `kill shell` respawn reconstructs it - the same reload-or-empty + write-through shape as
-    /// `examples/counter`). Both paths are SILENT on any failure: a missing file or a down/slow fs is not
-    /// an error (§26.7), and the write must never stall the prompt. Bounded by construction (the file is
-    /// just the <=16-line ring serialized), so no unbounded growth and one OP_WRITE_FILE per command.
+    /// fs so a `kill shell` respawn reconstructs it). History is an ENHANCEMENT, never a requirement, so
+    /// neither path may hang the prompt on a slow/down fs (§26.7): the LOAD is lazy (only when the user
+    /// runs out of session history) and bounded, the SAVE is deadline-bounded (a true fire-and-forget save
+    /// is blocked by fs's single-endpoint block-driver multiplexing - see `save`). A rug-pulled fs is then a
+    /// non-event - no recall this session, shell fully usable - and both resume when fs heals.
+    ///
+    /// LAZY + one-shot + merge-behind. Not called at startup, and not merely on the first up-arrow - only
+    /// when the user navigates PAST their last session command (up-arrow at the oldest in-memory entry) AND
+    /// there is room (len < HIST_MAX), so a session that already fills the ring never touches fs at all. Runs
+    /// at most once (the `loaded` gate, set even on a bounded miss so later up-arrows never re-touch fs).
+    /// Bounded: a wedged/absent fs just leaves the session's own commands. The file's lines are OLDER than
+    /// anything typed this session, so they merge BEHIND the session commands (newest, kept); `push` drops
+    /// the oldest - a file line - if the merge exceeds HIST_MAX. `#[inline(never)]` keeps its ~4 KiB frame
+    /// off the interactive key path (the shell's user stack is tight).
+    #[inline(never)]
     fn load(&mut self, ctx: &ServiceContext) {
-        // BOUNDED (§26.7): this runs before the input loop, so it must never hang the prompt. A fs that is
-        // alive-but-not-serving (respawned, still re-mounting) would block an unbounded request forever and
-        // the shell would come up with a visible prompt but a dead keyboard. Cap each fs call at
-        // HIST_LOAD_SECS; on any timeout/miss just return with empty history and let console_read proceed.
+        if self.loaded { return; }
+        self.loaded = true;
         let path = b"/.gsh_history";
         let sz = match fs_stat_bounded(ctx, path, HIST_LOAD_SECS) { Some((s, false)) if s > 0 => s as usize, _ => return };
         let sz = sz.min(HIST_MAX * (MAX_LINE + 1));
         let mut buf = [0u8; HIST_MAX * (MAX_LINE + 1)];
         if !read_file_exact_bounded(ctx, path, 0, &mut buf[..sz], HIST_LOAD_SECS) { return; }
-        for line in buf[..sz].split(|&b| b == b'\n') {
-            if !line.is_empty() { self.push(line); }
+        // Snapshot the session lines (newest, must survive), rebuild the ring as [file lines..., session
+        // lines], so up-arrow walks the session first and the file underneath, oldest dropped first.
+        let mut sess = [[0u8; MAX_LINE]; HIST_MAX];
+        let mut sess_len = [0usize; HIST_MAX];
+        let sn = self.n;
+        for i in 0..sn { let l = self.get(i); sess[i][..l.len()].copy_from_slice(l); sess_len[i] = l.len(); }
+        self.n = 0;
+        for l in buf[..sz].split(|&b| b == b'\n') {
+            if !l.is_empty() { self.push(l); }
         }
+        for i in 0..sn { self.push(&sess[i][..sess_len[i]]); }
     }
+    /// Deadline-bounded write-through of the <=16-line ring to `/.gsh_history`. Bounded (HIST_SAVE_SECS)
+    /// so a mid-restart / slow fs cannot hang the prompt forever, but NOT fire-and-forget: a true
+    /// no-reply async write is blocked by an fs-architecture constraint - fs multiplexes client requests
+    /// and its block-driver replies on ONE endpoint and relies on clients being synchronous (one in-flight),
+    /// so a second client message queued during an fs transaction gets consumed by fs's `block_rpc` as a
+    /// stray block reply, breaking the transaction and the queued command. Making the save fire-and-forget
+    /// needs fs to separate its block-driver reply channel first (see the fork report / follow-up). Until
+    /// then this stays synchronous: instant on a healthy fs, a bounded (<=HIST_SAVE_SECS) shrug on a wedged
+    /// one - best-effort either way, never an error surfaced to the user (§26.7). `#[inline(never)]` keeps
+    /// its buffer off the Enter path (tight user stack).
+    #[inline(never)]
     fn save(&self, ctx: &ServiceContext) {
-        let path = b"/.gsh_history";
+        let path: &[u8] = b"/.gsh_history";
         let mut buf = [0u8; HIST_MAX * (MAX_LINE + 1)];
         let mut pos = 0usize;
         for i in 0..self.n {
