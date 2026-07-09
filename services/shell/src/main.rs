@@ -3686,7 +3686,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("chaos flood-storm <svc> [rounds]", "saturate a service's IPC queue with try_send; verify it drains + stays alive (the other axis: 'overwhelmed', not 'gone')", "chaos flood-storm fs 5"),
             ("chaos mem-pressure [rounds]", "spawn a mem-pressure that allocs to its limit, kill it, confirm the memory is reclaimed (alloc-to-limit + no leak, S7)", "chaos mem-pressure 5"),
             ("chaos spawn-storm [count]", "spawn mem-pressure tasks until the task-pool/memory ceiling REFUSES one (loud Err, no panic), then kill all + confirm full reclaim", "chaos spawn-storm"),
-            ("chaos max-carnage <all-services|svc|svc,svc> [n]", "the chaos monkey: 'all-services' = RANDOM carnage over the whole restartable set each round (supervisor a normal victim, nothing protected-last); or aim at one / a comma-list. A TARGET IS REQUIRED (a bare max-carnage is refused). Under system-wide mem-pressure + spawn-storm; proves the system RECOVERS from any kill order. 'q' aborts (via SERIAL if it storms the USB keyboard drivers)", "chaos max-carnage all-services 50"),
+            ("chaos max-carnage <all-services|svc|svc,svc> <n>", "the chaos monkey: 'all-services' = RANDOM carnage over the whole restartable set each round (supervisor a normal victim, nothing protected-last); or aim at one / a comma-list. A TARGET AND A ROUNDS COUNT ARE REQUIRED - there is no uncapped default (a firehose is a big N; q aborts early). Under system-wide mem-pressure + spawn-storm; proves the system RECOVERS from any kill order. 'q' aborts (via SERIAL if it storms the USB keyboard drivers)", "chaos max-carnage all-services 5000"),
             ("chaos link-flap [n]", "networking-specific: simulate a cable unplug/replug n times (a report override, no hardware touch); net-stack notices the loss and self-configures on the up edge. tests LINK recovery, not process death. 'q' aborts", "chaos link-flap 3"),
         ], true),
         "drives" => help_block(ctx, "drives", "manage attached disks (records when piped)", &[
@@ -6397,7 +6397,7 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
         ctx.console_writeln("  flood-storm <svc> [n]   saturate its queue; verify it drains");
         ctx.console_writeln("  mem-pressure      [n]   a mem-pressure allocs to its limit, then reclaim");
         ctx.console_writeln("  spawn-storm       [n]   spawn mem-pressure tasks to the ceiling; loud refusal");
-        ctx.console_writeln("  max-carnage <all-services|svc|svc,svc,...> [n]  all-services = RANDOM storm; or aim/list (target REQUIRED)");
+        ctx.console_writeln("  max-carnage <all-services|svc|svc,svc,...> <n>  all-services = RANDOM storm, or aim/list; TARGET + ROUNDS required");
         ctx.console_writeln("                          ('q' aborts; SERIAL only if the run kills the keyboard)");
         ctx.console_writeln("  link-flap         [n]   simulate a cable unplug/replug; net-stack self-configures (net only)");
         ctx.console_writeln("  svc: supervisor | block-driver | fs | logger | xhci | ehci | shell | nic-driver | net-stack");
@@ -6409,30 +6409,33 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
         "mem-pressure" => chaos_mem_pressure(ctx, cwd, &tok, ntok),
         "spawn-storm"  => chaos_spawn_storm(ctx, cwd, &tok, ntok),
         "max-carnage"  => {
-            // DEFAULT (no target) = the RANDOM full-set storm: a random subset of the restartable set each
-            // round (the honest chaos-monkey, supervisor a normal victim, nothing protected-last). A bare
-            // number = random for N rounds. `help` = usage. A named target / all-services / comma-list aims
-            // it (kept). tok[1] = target-or-rounds-or-help, tok[2] = rounds.
+            // EVERY run needs a TARGET and a positive ROUNDS count. There is NO uncapped default - a
+            // firehose is just a big N (`all-services 5000`) and `q` aborts a long run early. `help` = usage.
+            // tok[1] = target, tok[2] = rounds.
             if ntok >= 2 && tok[1] == "help" {
-                ctx.console_writeln("usage: chaos max-carnage <all-services | svc | svc,svc,...> [rounds]");
+                ctx.console_writeln("usage: chaos max-carnage <all-services | svc | svc,svc,...> <rounds>");
                 ctx.console_writeln("  all-services   RANDOM carnage over the whole restartable set each round (the honest");
                 ctx.console_writeln("                 chaos-monkey: supervisor a normal victim, nothing protected-last)");
                 ctx.console_writeln("  <service>      aim every round at one service (e.g. fs, logger)");
                 ctx.console_writeln("  svc,svc,...    a comma-separated list: kill EVERY listed service each round (cascade stress)");
-                ctx.console_writeln("  a TARGET IS REQUIRED - max-carnage aims at one, many, or all, so a bare call is refused.");
+                ctx.console_writeln("  <rounds>       REQUIRED for every form - the run is bounded (a firehose is a big N; q aborts early)");
                 ctx.console_writeln("  all run system-wide mem-pressure + spawn-storm. 'q' aborts (SERIAL if the run kills the kbd).");
-                Ok(())
-            } else if ntok < 2 || tok[1].bytes().all(|b| b.is_ascii_digit()) {
-                // NO TARGET (bare, empty, or ONLY a rounds number) - refuse LOUDLY (invariant 12). max-carnage
-                // can aim at one, many, or all services, so a bare invocation is ambiguous and must name a
-                // target rather than silently storm everything. 'all-services' is the explicit whole-system storm.
-                ctx.console_writeln("max-carnage: a target is required.");
-                ctx.console_writeln("usage: chaos max-carnage <all-services | svc | svc,svc,...> [rounds]");
-                ctx.console_writeln("  'all-services' storms everything (random each round); or aim at one service / a comma-list.");
+                ctx.console_writeln("  e.g. chaos max-carnage all-services 5000 | chaos max-carnage fs 50 | chaos max-carnage fs,logger 100");
                 Ok(())
             } else {
-                // A named target. Validate it before launching (a bad name would storm nothing), loudly
-                // (invariant 12). The syntax is <target> [rounds].
+                // A run needs a TARGET (all-services / a service / a comma-list) AND a positive ROUNDS count.
+                // No target (bare, or only a number), or a missing / zero rounds -> refuse LOUDLY (invariant 12).
+                let no_target = ntok < 2 || tok[1].bytes().all(|b| b.is_ascii_digit());
+                let rounds = if ntok >= 3 { parse_u32(tok[2]).unwrap_or(0) } else { 0 };
+                if no_target || rounds == 0 {
+                    ctx.console_writeln("usage: chaos max-carnage <all-services | svc | svc,svc,...> <rounds>");
+                    ctx.console_writeln("  every run needs a target AND a rounds count - there is no uncapped default.");
+                    ctx.console_writeln("  e.g. chaos max-carnage all-services 5000   (the firehose - a big N; q aborts early)");
+                    ctx.console_writeln("       chaos max-carnage fs 50");
+                    ctx.console_writeln("       chaos max-carnage fs,logger 100");
+                    return Ok(());
+                }
+                // Validate the target(s) before launching (a bad name would storm nothing), loudly (invariant 12).
                 let target = tok[1];
                 if target.contains(',') {
                     // A comma-list (e.g. "nic-driver,net-stack") is a MULTI-TARGET run: EVERY listed service
@@ -6448,12 +6451,11 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
                     }
                 } else if target != "all-services" && slot_of(ctx, target).is_none() {
                     ctx.console_writeln_fmt(format_args!("max-carnage: no live service '{}'.", target));
-                    ctx.console_writeln("  target: (none)=random, all-services, one service, or a comma-separated list");
+                    ctx.console_writeln("  target: all-services, one service, or a comma-separated list");
                     ctx.console_writeln("  (block-driver | fs | logger | xhci | ehci | shell | supervisor | nic-driver | net-stack)");
                     return Ok(());
                 }
-                let rounds = if ntok >= 3 { parse_u32(tok[2]).unwrap_or(0) } else { 0 };
-                chaos_launch(ctx, tok[1], rounds)
+                chaos_launch(ctx, target, rounds)
             }
         }
         "link-flap"    => chaos_link_flap(ctx, &tok, ntok),
@@ -6572,16 +6574,9 @@ fn chaos_launch(ctx: &ServiceContext, target: &str, rounds: u32) -> Result<(), S
     ctx.console_writeln("");
     ctx.console_writeln("=====================================================");
     ctx.console_write(" Start maximum carnage? [y/N]: ");
-    let c = ctx.console_read();
-    // Echo the keypress (console_read does not echo) so the operator sees what they typed - but do NOT
-    // print the newline yet. Wait for ENTER first, THEN newline. Printing the newline right after the
-    // keypress made it look like the choice had registered when it had not (you still had to press Enter).
-    if let Ok(s) = core::str::from_utf8(&[c]) { ctx.console_write(s); }
-    // Drain the rest of the line up to Enter (a stray key after the first won't bleed into the next
-    // prompt). A bare Enter (the default = N = cancel) has nothing to drain.
-    if c != b'\r' && c != b'\n' { loop { let n = ctx.console_read(); if n == b'\r' || n == b'\n' { break; } } }
-    ctx.console_writeln("");
-    if c != b'y' && c != b'Y' {
+    // Line-edited confirm (read_confirm): the operator can BACKSPACE a typo before Enter, and the
+    // decision is the FINAL line - a mistyped `y` corrected to `n` cancels, not proceeds.
+    if !read_confirm(ctx) {
         ctx.console_writeln("max-carnage: cancelled.");
         return Ok(());
     }
@@ -6590,8 +6585,9 @@ fn chaos_launch(ctx: &ServiceContext, target: &str, rounds: u32) -> Result<(), S
         ctx.console_writeln("chaos: failed to spawn the chaos service");
         return Err(ShellError::Unknown);
     }
-    // Send the round count (0 = run until q) AND the target (all | service name). Best-effort: chaos waits
-    // briefly for it, defaults to all / run-until-q if it doesn't arrive. Reclaim the cap (no leak).
+    // Send the round count (always > 0 - the shell requires it) AND the target (all-services | service |
+    // comma-list). Best-effort: chaos waits briefly for it; if it never arrives chaos runs a safe no-op
+    // (0 rounds). Reclaim the cap (no leak).
     if let Some(cap) = ctx.acquire_send_cap("chaos") {
         // rounds(4) + target string. The target may be a comma-separated list (e.g. "nic-driver,net-stack"),
         // so the buffer is sized for a bounded list, not one name.
@@ -9445,16 +9441,27 @@ fn drives_label(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
 /// Read one line from the console and return true iff it begins with y/Y. The kernel
 /// echoes keystrokes, so the user sees their answer; default (empty / anything else) is No.
 fn read_confirm(ctx: &ServiceContext) -> bool {
-    let mut first = 0u8;
+    // Line-edited y/N: accept characters with BACKSPACE editing and decide on the FINAL line at Enter,
+    // so a mistyped answer can be corrected - `y` then backspace then `n` reads as N, not the committed
+    // `y`. console_read does not echo, so we echo each printable char and a destructive backspace erase
+    // ourselves. Bounded, no heap (a confirm answer is tiny).
+    let mut buf = [0u8; 8];
+    let mut len = 0usize;
     loop {
         let b = ctx.console_read();
         match b {
-            b'\r' | b'\n' => break,
-            _ if first == 0 && b >= 0x20 && b < 0x7f => first = b,
+            b'\r' | b'\n' => { ctx.console_writeln(""); break; }
+            0x08 | 0x7f => { if len > 0 { len -= 1; ctx.console_write("\x08 \x08"); } }
+            0x20..=0x7e => {
+                if len < buf.len() {
+                    buf[len] = b; len += 1;
+                    if let Ok(s) = core::str::from_utf8(&[b]) { ctx.console_write(s); }
+                }
+            }
             _ => {}
         }
     }
-    first == b'y' || first == b'Y'
+    len > 0 && (buf[0] == b'y' || buf[0] == b'Y')
 }
 
 fn u64_le(b: &[u8]) -> u64 {

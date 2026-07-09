@@ -136,9 +136,10 @@ fn flood(ctx: &ServiceContext, name: &str, cache: &mut Option<CapHandle>) -> Opt
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
-    // The shell launcher sends the round count right after spawning us (0 = run until q). Wait briefly
-    // (RTC-bounded) for it BEFORE claiming the foreground - the shell is still live to send it. Default
-    // to run-until-q if it never arrives (e.g. the launcher's send failed), so we never block forever.
+    // The shell launcher sends the round count (always > 0 - the shell requires an explicit count) right
+    // after spawning us. Wait briefly (RTC-bounded) for it BEFORE claiming the foreground - the shell is
+    // still live to send it. If it never arrives (e.g. the launcher's send failed) rounds stays 0 and the
+    // run is a safe no-op (there is no uncapped default), so we never storm unconfigured.
     let mut rounds: u64 = 0;
     let mut tbuf = [0u8; 128];   // target string; may be a comma-separated list, so sized for a bounded list
     let mut tlen = 0usize;
@@ -214,9 +215,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         ^ ((start_dt.minute as u64) << 24) ^ ((start_dt.second as u64) << 40));
 
     'carnage: loop {
-        // `q` aborts. The kernel buffers the keypress across input-driver churn, so it is caught here.
+        // `q` aborts (round boundary; also polled between each kill/flood in the sweep below, so one q
+        // press aborts within a sub-step rather than lagging a whole round). The kernel buffers the
+        // keypress across input-driver churn, so it is caught here.
         if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { break; } }
-        if rounds > 0 && round >= rounds { break; } // a bounded `max-carnage N` run is complete
+        if round >= rounds { break; } // the bounded run is complete (rounds is always > 0 - the shell requires it)
 
         round += 1;
 
@@ -264,6 +267,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let kill_pick = if ncand > 0 { ((round - 1) % ncand as u64) as usize } else { usize::MAX };
         let (mut sweep_killed, mut sweep_flooded) = (0u64, 0u64);
         for c in 0..ncand {
+            // Poll q between each kill/flood: a round can take seconds (services respawn), so checking
+            // only at the round top made one q press lag a whole round. Now one press aborts within a
+            // sub-step. (`break 'carnage` exits the round loop; the kernel buffers the key across churn.)
+            if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { break 'carnage; } }
             let nl = cand[c].1;
             let mut nbuf = [0u8; 24]; nbuf[..nl].copy_from_slice(&cand[c].0[..nl]);
             let name = str_of(&nbuf[..nl]);
@@ -324,12 +331,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let _ = write!(f, "\x1b[H");
         let _ = write!(f, "  C H A O S   max-carnage    target: {}    ({})\x1b[K\r\n",
             target, if target_all || target_random { "'q' to quit via SERIAL" } else { "'q' to quit" });
-        if rounds > 0 {
-            let pct = round * 100 / rounds; // round <= rounds, so 1..=100; rounds>0 guards the divide
-            let _ = write!(f, "  round {} / {} ({}%)\x1b[K\r\n", round, rounds, pct);
-        } else {
-            let _ = write!(f, "  round {}  (until q)\x1b[K\r\n", round);
-        }
+        // rounds is always > 0 - the shell requires an explicit count; there is no uncapped run.
+        let pct = round * 100 / rounds; // round is 1..=rounds, so pct is 1..=100
+        let _ = write!(f, "  round {} / {} ({}%)\x1b[K\r\n", round, rounds, pct);
         // Wall-clock status line: when it began, how long it has run, and a linear ETA (no outside truth -
         // a pure extrapolation of elapsed over round progress). until-q has no total, so remains is n/a.
         let elapsed = (ctx.datetime().epoch_secs() - start_epoch).max(0) as u64;
