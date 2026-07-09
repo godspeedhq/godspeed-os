@@ -38,6 +38,28 @@ const PACE_YIELDS: u32 = 3000;      // a beat between rounds so the panel/log st
 const MEMP_CHUNK: usize = 64 * 1024; // one mem-pressure round allocs this (held; chaos's limit bounds it)
 const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]; // matches the `date` utility
 
+// The full restartable target set for the DEFAULT (no-target) RANDOM storm - every service the system
+// can bring back (the supervisor via the kernel, everything else via the supervisor). NOTHING is
+// protected-last: the supervisor is a normal victim at any point, because the fixed-point robustness must
+// recover from ANY kill order. Forcing supervisor-last would contrive the recovery (Test 15 / Cmd II -
+// let Chaos try its hardest); random destruction is the honest stress.
+const RESTARTABLE: [&str; 9] = [
+    "supervisor", "shell", "block-driver", "fs", "xhci", "ehci", "logger", "nic-driver", "net-stack",
+];
+
+// A tiny xorshift64 PRNG - there is no std rng in no_std. Seeded from the RTC start time (varies run to
+// run; the TSC is broken on the T630 so we do NOT seed from it) and advanced every round, so the random
+// subset differs both run-to-run and round-to-round. Bounded, no heap.
+struct Rng(u64);
+impl Rng {
+    fn new(seed: u64) -> Self { Rng(if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed }) }
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        self.0 = x; x
+    }
+}
+
 fn str_of(b: &[u8]) -> &str { core::str::from_utf8(b).unwrap_or("?") }
 
 /// Slot of the live task named `name`, or None.
@@ -133,10 +155,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             ctx.yield_cpu();
         }
     }
-    // The TARGET: "all-services" = aim kill/flood at random live services; a service name = aim them at
-    // THAT service every round. mem-pressure + spawn-storm are system-wide in both modes. Default
-    // "all-services" (named so it can never clash with a real service that someone calls "all").
-    let target: &str = if tlen == 0 { "all-services" } else { str_of(&tbuf[..tlen]) };
+    // The TARGET: DEFAULT (no target) = "random" - a RANDOM subset of the restartable set each round (the
+    // honest chaos-monkey storm; supervisor is a normal victim, nothing protected-last). "all-services" =
+    // a full even sweep of every live service each round; a service name = aim every round at THAT one; a
+    // comma-list = kill every listed one each round. mem-pressure + spawn-storm are system-wide in all modes.
+    let target: &str = if tlen == 0 { "random" } else { str_of(&tbuf[..tlen]) };
+    let target_random = tlen == 0;                 // no explicit target = the RANDOM full-set storm
     let target_all = target == "all-services";
     // A comma-separated target ("nic-driver,net-stack") is a MULTI-TARGET run: EVERY listed service is
     // killed each round (semantics B - the cascade stress). Parse it once into a bounded fixed array.
@@ -182,6 +206,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // for elapsed + the linear ETA (a pure extrapolation of elapsed over round progress, no outside truth).
     let start_dt = ctx.datetime();
     let start_epoch = start_dt.epoch_secs();
+    // Seed the random-storm PRNG from the RTC start time (varies per run); advanced each round so the
+    // subset differs round-to-round. Only read in the `target_random` branch.
+    let mut rng = Rng::new((start_epoch as u64)
+        ^ ((start_dt.minute as u64) << 24) ^ ((start_dt.second as u64) << 40));
 
     'carnage: loop {
         // `q` aborts. The kernel buffers the keypress across input-driver churn, so it is caught here.
@@ -197,7 +225,23 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // specific target, just that one service.
         let mut cand: [([u8; 24], usize); MAX_CAND] = [([0u8; 24], 0usize); MAX_CAND];
         let mut ncand = 0usize;
-        if target_all {
+        if target_random {
+            // RANDOM subset of the restartable set this round - vary WHICH and HOW MANY. Each service is in
+            // with ~50% probability (a fresh PRNG draw); if none were picked, take one random victim so a
+            // round is never a no-op. Only LIVE ones actually die (a kill of a dead/absent name is a no-op),
+            // so a build without a service just skips it. Supervisor included at any point - no protected-last.
+            for &svc in RESTARTABLE.iter() {
+                if (rng.next() & 1) == 1 && ncand < MAX_CAND {
+                    let b = svc.as_bytes(); let l = b.len().min(24);
+                    cand[ncand].0[..l].copy_from_slice(&b[..l]); cand[ncand].1 = l; ncand += 1;
+                }
+            }
+            if ncand == 0 {
+                let pick = (rng.next() as usize) % RESTARTABLE.len();
+                let b = RESTARTABLE[pick].as_bytes(); let l = b.len().min(24);
+                cand[0].0[..l].copy_from_slice(&b[..l]); cand[0].1 = l; ncand = 1;
+            }
+        } else if target_all {
             for slot in 0..256u32 {
                 let st = ctx.task_stat(slot);
                 if !st.valid || st.state == 4 { continue; }
@@ -259,8 +303,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     None    => { if sv_flood_na[s] == 0 { sv_flood_na[s] = 2; } } // no endpoint right now
                 }
                 // ...and KILL it: when the rotor lands here (all-services / single target), OR always in a
-                // multi-target list run (semantics B: every listed service goes down EVERY round).
-                if c == kill_pick || target_list {
+                // multi-target list run (semantics B) or the RANDOM storm (every service the round PICKED
+                // goes down this round).
+                if c == kill_pick || target_list || target_random {
                     let _ = ctx.kill(name);
                     killed += 1; sv_killed[s] += 1; sweep_killed += 1;
                     if let Some(h) = sv_floodcap[s].take() { ctx.remove_cap(h); }
@@ -287,7 +332,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut f = FrameBuf::new();
         let _ = write!(f, "\x1b[H");
         let _ = write!(f, "  C H A O S   max-carnage    target: {}    ({})\x1b[K\r\n",
-            target, if target_all { "'q' to quit via SERIAL" } else { "'q' to quit" });
+            target, if target_all || target_random { "'q' to quit via SERIAL" } else { "'q' to quit" });
         if rounds > 0 {
             let pct = round * 100 / rounds; // round <= rounds, so 1..=100; rounds>0 guards the divide
             let _ = write!(f, "  round {} / {} ({}%)\x1b[K\r\n", round, rounds, pct);
@@ -323,7 +368,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let _ = write!(f, "  ----------------------------------------------------\x1b[K\r\n");
         let _ = write!(f, "  flood N/A: reply = killed instead (reply-style); no-ep = no send endpoint\x1b[K\r\n");
         let _ = write!(f, "  system:  mem-pressure {}   spawn-storm {}\x1b[K\r\n", mempr, spawns);
-        if target_all {
+        if target_all || target_random {
             let _ = write!(f, "  kernel: ALIVE   abort: 'q' in the SERIAL console (keyboard dead)\x1b[K\r\n");
         } else if target_usb {
             let _ = write!(f, "  kernel: ALIVE   abort: 'q' on the keyboard, or SERIAL if it's on {}\x1b[K\r\n", target);

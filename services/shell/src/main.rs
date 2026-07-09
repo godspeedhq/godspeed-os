@@ -468,7 +468,7 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("date",    &["epoch"]),
     ("net",     &["dns", "stats", "arp", "scan", "renew", "version", "help"]),
     ("drives",  &["flash", "label", "reset", "check", "scrub"]),
-    ("chaos",   &["kill-storm", "flood-storm", "mem-pressure", "spawn-storm", "max-carnage"]),
+    ("chaos",   &["kill-storm", "flood-storm", "mem-pressure", "spawn-storm", "max-carnage", "link-flap"]),
     ("write",   &["append", "prepend"]),
     ("sort",    &["reverse"]),
     ("match",   &["except"]),
@@ -3686,7 +3686,8 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("chaos flood-storm <svc> [rounds]", "saturate a service's IPC queue with try_send; verify it drains + stays alive (the other axis: 'overwhelmed', not 'gone')", "chaos flood-storm fs 5"),
             ("chaos mem-pressure [rounds]", "spawn a mem-pressure that allocs to its limit, kill it, confirm the memory is reclaimed (alloc-to-limit + no leak, S7)", "chaos mem-pressure 5"),
             ("chaos spawn-storm [count]", "spawn mem-pressure tasks until the task-pool/memory ceiling REFUSES one (loud Err, no panic), then kill all + confirm full reclaim", "chaos spawn-storm"),
-            ("chaos max-carnage <all-services|svc> [n]", "the chaos monkey: storm RANDOM services (all-services) or aim every round at ONE (e.g. fs), under system-wide mem-pressure + spawn-storm; proves the KERNEL survives. 'q' aborts (via SERIAL if it storms the USB keyboard drivers)", "chaos max-carnage all-services 50"),
+            ("chaos max-carnage [<all-services|svc|svc,svc>] [n]", "the chaos monkey: NO target = a RANDOM subset of the restartable set each round (supervisor included, nothing protected-last); or aim at all-services / one / a comma-list. Under system-wide mem-pressure + spawn-storm; proves the system RECOVERS from any kill order. 'q' aborts (via SERIAL if it storms the USB keyboard drivers)", "chaos max-carnage 50"),
+            ("chaos link-flap [n]", "networking-specific: simulate a cable unplug/replug n times (a report override, no hardware touch); net-stack notices the loss and self-configures on the up edge. tests LINK recovery, not process death. 'q' aborts", "chaos link-flap 3"),
         ], true),
         "drives" => help_block(ctx, "drives", "manage attached disks (records when piped)", &[
             ("drives", "list attached drive(s)", "drives"),
@@ -6396,8 +6397,9 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
         ctx.console_writeln("  flood-storm <svc> [n]   saturate its queue; verify it drains");
         ctx.console_writeln("  mem-pressure      [n]   a mem-pressure allocs to its limit, then reclaim");
         ctx.console_writeln("  spawn-storm       [n]   spawn mem-pressure tasks to the ceiling; loud refusal");
-        ctx.console_writeln("  max-carnage <all-services|svc|svc,svc,...> [n]  random / aim at one / kill a list each round");
+        ctx.console_writeln("  max-carnage [<all-services|svc|svc,svc,...>] [n]  no target = RANDOM storm; or aim/list");
         ctx.console_writeln("                          ('q' aborts; SERIAL only if the run kills the keyboard)");
+        ctx.console_writeln("  link-flap         [n]   simulate a cable unplug/replug; net-stack self-configures (net only)");
         ctx.console_writeln("  svc: supervisor | block-driver | fs | logger | xhci | ehci | shell | nic-driver | net-stack");
         return Ok(());
     }
@@ -6407,25 +6409,30 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
         "mem-pressure" => chaos_mem_pressure(ctx, cwd, &tok, ntok),
         "spawn-storm"  => chaos_spawn_storm(ctx, cwd, &tok, ntok),
         "max-carnage"  => {
-            // The target is required now: <all-services|service>. tok[1] = target, tok[2] = rounds.
-            // No target, or an explicit `help`, prints the usage + the two modes.
-            if ntok < 2 || tok[1] == "help" {
-                ctx.console_writeln("usage: chaos max-carnage <all-services | svc | svc,svc,...> [rounds]");
-                ctx.console_writeln("  all-services   storm a RANDOM live service each round");
+            // DEFAULT (no target) = the RANDOM full-set storm: a random subset of the restartable set each
+            // round (the honest chaos-monkey, supervisor a normal victim, nothing protected-last). A bare
+            // number = random for N rounds. `help` = usage. A named target / all-services / comma-list aims
+            // it (kept). tok[1] = target-or-rounds-or-help, tok[2] = rounds.
+            if ntok >= 2 && tok[1] == "help" {
+                ctx.console_writeln("usage: chaos max-carnage [<all-services | svc | svc,svc,...>] [rounds]");
+                ctx.console_writeln("  (no target)    RANDOM: a random subset of the restartable set each round (the honest storm)");
+                ctx.console_writeln("  all-services   a full even sweep of EVERY live service each round");
                 ctx.console_writeln("  <service>      aim every round at one service (e.g. fs, logger)");
                 ctx.console_writeln("  svc,svc,...    a comma-separated list: kill EVERY listed service each round (cascade stress)");
                 ctx.console_writeln("  all run system-wide mem-pressure + spawn-storm. 'q' aborts (SERIAL if kbd dies).");
                 Ok(())
+            } else if ntok < 2 || (!tok[1].is_empty() && tok[1].bytes().all(|b| b.is_ascii_digit())) {
+                // No target, or a bare number = the RANDOM storm (the number is ROUNDS, not a target). "" ->
+                // the chaos service defaults to random. 0 rounds = run until q.
+                let rounds = if ntok >= 2 { parse_u32(tok[1]).unwrap_or(0) } else { 0 };
+                chaos_launch(ctx, "", rounds)
             } else {
-                // Validate the TARGET before launching. The syntax is <target> [rounds], so a bare number
-                // like `max-carnage 1000` parses 1000 as the TARGET - without this it silently storms a
-                // service "1000" that does not exist. Reject anything that is neither "all-services" nor a
-                // live service, loudly (invariant 12), with a SPECIFIC hint for the numeric mix-up.
+                // A named target. Validate it before launching (a bad name would storm nothing), loudly
+                // (invariant 12). The syntax is <target> [rounds].
                 let target = tok[1];
                 if target.contains(',') {
-                    // A comma-separated list (e.g. "nic-driver,net-stack") is a MULTI-TARGET run: EVERY
-                    // listed service is killed each round (semantics B - the cascade stress). Each segment
-                    // must be a live service; reject an unknown one loudly (invariant 12).
+                    // A comma-list (e.g. "nic-driver,net-stack") is a MULTI-TARGET run: EVERY listed service
+                    // is killed each round (semantics B). Each segment must be a live service.
                     for seg in target.split(',') {
                         if seg.is_empty() { continue; }
                         if slot_of(ctx, seg).is_none() {
@@ -6436,27 +6443,93 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
                         }
                     }
                 } else if target != "all-services" && slot_of(ctx, target).is_none() {
-                    if !target.is_empty() && target.bytes().all(|b| b.is_ascii_digit()) {
-                        ctx.console_writeln_fmt(format_args!(
-                            "max-carnage: '{}' is not a service. For {} rounds of EVERYTHING, run:", target, target));
-                        ctx.console_writeln_fmt(format_args!("  chaos max-carnage all-services {}", target));
-                    } else {
-                        ctx.console_writeln_fmt(format_args!("max-carnage: no live service '{}'.", target));
-                        ctx.console_writeln("  target: all-services, one service, or a comma-separated list");
-                        ctx.console_writeln("  (block-driver | fs | logger | xhci | ehci | shell | supervisor | nic-driver | net-stack)");
-                    }
+                    ctx.console_writeln_fmt(format_args!("max-carnage: no live service '{}'.", target));
+                    ctx.console_writeln("  target: (none)=random, all-services, one service, or a comma-separated list");
+                    ctx.console_writeln("  (block-driver | fs | logger | xhci | ehci | shell | supervisor | nic-driver | net-stack)");
                     return Ok(());
                 }
                 let rounds = if ntok >= 3 { parse_u32(tok[2]).unwrap_or(0) } else { 0 };
                 chaos_launch(ctx, tok[1], rounds)
             }
         }
+        "link-flap"    => chaos_link_flap(ctx, &tok, ntok),
         other => {
             ctx.console_writeln_fmt(format_args!(
                 "chaos: unknown mode '{}' (try: chaos kill-storm <service> [rounds])", other));
             Err(ShellError::Unknown)
         }
     }
+}
+
+/// Yield for up to `secs` of RTC wall-clock, returning true the instant q/Q/ESC is pressed (abort).
+/// Bounded + portable (RTC, not the T630-broken TSC).
+fn hold_or_abort(ctx: &ServiceContext, secs: i64) -> bool {
+    let t0 = ctx.datetime().epoch_secs();
+    while ctx.datetime().epoch_secs() - t0 < secs {
+        while let Some(b) = ctx.try_console_read() {
+            if b == b'q' || b == b'Q' || b == 0x1b { return true; }
+        }
+        ctx.yield_cpu();
+    }
+    false
+}
+
+/// `chaos link-flap [N]` - a networking-SPECIFIC chaos: simulate a cable unplug/replug N times (default 1)
+/// WITHOUT physical access, exercising net-stack's LINK-recovery path (a different failure surface than the
+/// process-death that kill-storm / max-carnage test). It forces the nic-driver's REPORTED link DOWN (a
+/// report override, ops [6]/[7]/[8] - no hardware touch, no SLU/reset), holds a beat so net-stack's ~1s link
+/// poll catches the loss and stalls ping, forces it UP so net-stack self-configures on the up edge (re-runs
+/// its DHCP/ARP dance), then CLEARS the override so a real later unplug is never masked. net-stack reacts
+/// autonomously (its reaction is in the serial log + a subsequent `net`/`ping`); this drives the physical-
+/// layer event and paces it. q-abortable, and an abort always clears the override. This is the FIRST
+/// service-specific chaos - standard chaos (kill/flood/storm) is universal; a service's own failure surface
+/// (net-stack's link) is its own scenario (do not build a speculative framework, §26.2).
+fn chaos_link_flap(ctx: &ServiceContext, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
+    if ntok >= 2 && tok[1] == "help" {
+        ctx.console_writeln("chaos link-flap [N] - simulate a cable unplug/replug N times (default 1)");
+        ctx.console_writeln("  forces the NIC link DOWN then UP (a report override, no hardware touch) so net-stack");
+        ctx.console_writeln("  notices the loss and self-configures on the up edge. tests LINK recovery, not process death.");
+        ctx.console_writeln("  (press q to abort; an abort clears the override)");
+        return Ok(());
+    }
+    let cycles = if ntok >= 2 { parse_u32(tok[1]).unwrap_or(1).max(1) } else { 1 };
+    if slot_of(ctx, "nic-driver").is_none() {
+        ctx.console_writeln("chaos link-flap: no live nic-driver (is the NIC up?)");
+        return Ok(());
+    }
+    // Hold each edge long enough for net-stack's ~1s link poll to catch it - this simulates the duration of
+    // a real cable event (whose PHY settle is itself seconds on hardware). net-stack self-configures on its
+    // own; the log shows it. q-abortable throughout, and any exit clears the override.
+    const HOLD_SECS: i64 = 3;
+    let down = Message::from_bytes(&[6]);
+    let up   = Message::from_bytes(&[7]);
+    let clr  = Message::from_bytes(&[8]);
+    for cycle in 1..=cycles {
+        ctx.console_writeln_fmt(format_args!(
+            "chaos link-flap: cycle {}/{} - forcing link DOWN (press q to abort)", cycle, cycles));
+        if let NetQ::Aborted = net_query(ctx, "nic-driver", &down, 3) {
+            let _ = net_query(ctx, "nic-driver", &clr, 2);
+            ctx.console_writeln("chaos link-flap: aborted (link override cleared)");
+            return Ok(());
+        }
+        if hold_or_abort(ctx, HOLD_SECS) {
+            let _ = net_query(ctx, "nic-driver", &clr, 2);
+            ctx.console_writeln("chaos link-flap: aborted (link override cleared)");
+            return Ok(());
+        }
+        ctx.console_writeln("chaos link-flap: forcing link UP - net-stack should self-configure");
+        let _ = net_query(ctx, "nic-driver", &up, 3);
+        if hold_or_abort(ctx, HOLD_SECS) {
+            let _ = net_query(ctx, "nic-driver", &clr, 2);
+            ctx.console_writeln("chaos link-flap: aborted (link override cleared)");
+            return Ok(());
+        }
+    }
+    // Clear the override so the REAL link state is reported again (a real unplug must not stay masked).
+    let _ = net_query(ctx, "nic-driver", &clr, 2);
+    ctx.console_writeln_fmt(format_args!(
+        "chaos link-flap: done ({} cycle(s)); override cleared - net now reflects the real link", cycles));
+    Ok(())
 }
 
 /// `chaos max-carnage` - launch the `chaos` service, which takes over the console (the foreground

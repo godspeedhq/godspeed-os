@@ -226,6 +226,11 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
     let mut last_rx_len  = 0u16;
     let mut tx_count     = 0u16;
     let mut rx_count     = 0u16;
+    // chaos link-flap: an operator-forced link state that OVERRIDES the live PHYSTATUS read, so
+    // `chaos link-flap` can simulate a cable unplug/replug with no physical access - net-stack reads the
+    // same [3] link byte and self-configures on the up edge. None = report the real PHY (default); Some(b)
+    // = report the forced state. Cleared ([8]) after a flap so a REAL later unplug is never masked.
+    let mut force_link: Option<bool> = None;
     loop {
         let req = ctx.recv();
         let reply_cap = match ctx.take_pending_cap() { Some(c) => c, None => continue };
@@ -253,7 +258,8 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
             // of net-stack): [16..20] RxOk, [20..24] TxOk, [24..28] RxBroadcast, [28..30] RxErr,
             // [30..32] MissedPkt.
             let phy = mmio.read8(RTL_PHYSTATUS);
-            let link_up = phy & 0x02 != 0;
+            // Report the operator-forced link state if a `chaos link-flap` set one; else the live PHY.
+            let link_up = force_link.unwrap_or(phy & 0x02 != 0);
             // PHYSTATUS speed bits: 0x10=1000M, 0x08=100M, 0x04=10M; 0x01=FullDuplex.
             let speed = if phy & 0x10 != 0 { 3u8 } else if phy & 0x08 != 0 { 2 }
                         else if phy & 0x04 != 0 { 1 } else { 0 };
@@ -337,6 +343,20 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
                 s[o..o + 4].copy_from_slice(&opts1.to_le_bytes());
             }
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&s));
+            ctx.remove_cap(reply_cap);
+            continue;
+        }
+
+        // [6]/[7]/[8] FORCE-LINK (chaos link-flap): override the REPORTED link so an operator can simulate
+        // a cable unplug/replug with no physical access. [6] = force DOWN, [7] = force UP, [8] = CLEAR (back
+        // to the live PHY, so a real later unplug is not masked). A 1-byte ack. net-stack reads the [3] link
+        // byte and reacts (down = ping stalls; up edge = self-configure). This is a report override only - it
+        // does NOT touch the hardware (no SLU/reset), so the real link is unaffected.
+        if { let p = req.payload_bytes(); p.len() == 1 && (p[0] == 6 || p[0] == 7 || p[0] == 8) } {
+            force_link = match req.payload_bytes()[0] { 6 => Some(false), 7 => Some(true), _ => None };
+            ctx.log_fmt(format_args!("nic-driver: force-link {} (chaos link-flap)",
+                match force_link { Some(false) => "DOWN", Some(true) => "UP", None => "CLEAR (live)" }));
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[1]));
             ctx.remove_cap(reply_cap);
             continue;
         }
