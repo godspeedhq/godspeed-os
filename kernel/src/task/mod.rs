@@ -184,13 +184,15 @@ pub static XHCI_DMA_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::At
 pub static EHCI_DMA_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static AHCI_DMA_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static NIC_DMA_PHYS:  core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// Pages of contiguous DMA memory for the **xHCI** driver. The first 16 pages
-/// hold the control structures (command/event rings, DCBAA, ERST, per-device
-/// slices, plus the scratchpad buffer array at page 15); the remaining 256 pages
-/// are the scratchpad buffers the controller DMAs into (real AMD xHCI reports
-/// MaxScratchpadBufs=256 - 1 MiB - and malfunctions without them). Confined
-/// identity-mapped, so the device reaches all of it (§12, H1).
-const XHCI_DMA_PAGES:      u64 = 16 + 256;
+/// Pages of contiguous DMA memory for the **xHCI** driver. The first 32 pages
+/// hold the control structures (command/event rings, DCBAA, ERST) and the six
+/// per-device 4-page slices, plus the scratchpad buffer array at page 31; the
+/// remaining 256 pages are the scratchpad buffers the controller DMAs into (real
+/// AMD xHCI reports MaxScratchpadBufs=256 - 1 MiB - and malfunctions without
+/// them). Six slices (up from two) so hub enumeration can address the hub AND its
+/// downstream devices at once (docs/usb-hub.md). Confined identity-mapped, so the
+/// device reaches all of it (§12, H1).
+const XHCI_DMA_PAGES:      u64 = 32 + 256;
 /// Pages of contiguous DMA memory for the **EHCI** driver - 64 KiB, as on main.
 /// EHCI has no scratchpad concept, and its driver zeroes the whole arena on every
 /// control transfer; giving it the xHCI-sized 1 MiB arena (a leftover of sharing

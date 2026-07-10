@@ -59,9 +59,14 @@ const CONFIG_BUF_OFF: usize = 0x6000; // transient: config descriptor during enu
 // 256 of them and malfunctions (devices drop, re-enumerate) without them. The SBA
 // lives at arena page 15; the buffers occupy pages 16.. (the arena's tail, sized
 // for this in the kernel's XHCI_DMA_PAGES).
-const SCRATCHPAD_SBA_OFF: usize = 0xF000;
-const SCRATCHPAD_BUF_BASE: usize = 0x10000;
-const MAX_SCRATCHPAD: usize = 256; // arena room = XHCI_DMA_PAGES (272) - 16
+// Device slices sit first (DEV_BASE .. DEV_BASE + MAX_SLICES*DEV_STRIDE), then the SBA + scratchpad.
+// Hub enumeration needs several slices live at once - the hub's own slice plus each downstream
+// device's - so MAX_SLICES is larger than MAX_HID (docs/usb-hub.md). Keep these offsets in step with
+// the kernel's XHCI_DMA_PAGES (32 + 256): control(7) + 6 slices*4 pages(24) + SBA(1) = 32, then 256.
+const MAX_SLICES: usize = 6;                // per-device DMA slices (bound HIDs + transient hub/enum)
+const SCRATCHPAD_SBA_OFF: usize = 0x1F000;  // = DEV_BASE + MAX_SLICES*DEV_STRIDE (0x7000 + 6*0x4000)
+const SCRATCHPAD_BUF_BASE: usize = 0x20000; // = SCRATCHPAD_SBA_OFF + 0x1000
+const MAX_SCRATCHPAD: usize = 256; // arena room = XHCI_DMA_PAGES (288) - 32
 
 /// Maximum HID devices bound on one controller at once (keyboard + mouse).
 const MAX_HID: usize = 2;
