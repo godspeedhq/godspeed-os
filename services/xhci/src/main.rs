@@ -311,6 +311,51 @@ fn control(
     false
 }
 
+/// Configure an already-addressed device AS A HUB so the controller will route downstream traffic
+/// through it: a Configure Endpoint command that sets the slot-context Hub bit, Number of Ports, MTT
+/// (multi-TT), and TT Think Time (xHCI 4.6.5 / 6.2.2). Runs after the hub is Address'd +
+/// Set_Configuration'd. `route` is 0 for a hub on a root port (recursion passes the parent's route).
+#[allow(clippy::too_many_arguments)]
+fn configure_as_hub(
+    ctx: &ServiceContext, dma: &Dma, mmio: &Mmio, dboff: usize, ir0: usize, ctx_size: usize,
+    slot: u32, dev_idx: usize, speed: u32, route: u32, root_port: u32, nports: u8, mtt: bool, ttt: u32,
+    ev_idx: &mut usize, ev_cycle: &mut u32, cmd_idx: &mut usize,
+) -> bool {
+    let islot = INPUT_CTX_OFF + ctx_size;
+    let iep0 = INPUT_CTX_OFF + 2 * ctx_size;
+    dma.write32(INPUT_CTX_OFF, 0);        // Drop flags
+    dma.write32(INPUT_CTX_OFF + 4, 0b11); // Add: slot + EP0
+    // Slot dword0: Context Entries=1, Hub=1 (bit 26), MTT (bit 25), Speed (bits 23:20), Route (19:0).
+    dma.write32(islot, (1 << 27) | (1 << 26) | (if mtt { 1 << 25 } else { 0 }) | (speed << 20) | (route & 0xFFFFF));
+    // Slot dword1: Number of Ports [31:24], Root Hub Port Number [23:16].
+    dma.write32(islot + 4, ((nports as u32) << 24) | (root_port << 16));
+    // Slot dword2: TT Think Time [17:16].
+    dma.write32(islot + 8, (ttt & 0x3) << 16);
+    // Re-specify EP0 (Add A1 set) so the command carries a valid endpoint-0 context.
+    let ep0_tr = dma.phys_at(ep0_tr_off(dev_idx));
+    let max_packet = match speed { 2 => 8, 4 => 512, _ => 64 };
+    dma.write32(iep0 + 4, (3 << 1) | (4 << 3) | (max_packet << 16));
+    dma.write32(iep0 + 8, (ep0_tr as u32 & !0xF) | 1);
+    dma.write32(iep0 + 12, (ep0_tr >> 32) as u32);
+    dma.write32(iep0 + 16, 8);
+    let in_phys = dma.phys_at(INPUT_CTX_OFF);
+    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+    *cmd_idx += 1;
+    let ce = run_command(
+        ctx, dma, mmio, dboff, ir0, cmd_off,
+        in_phys as u32, (in_phys >> 32) as u32, 0,
+        (TRB_CONFIGURE_ENDPOINT << 10) | (slot << 24) | 1,
+        ev_idx, ev_cycle,
+    )
+    .map(|(c, _)| c)
+    .unwrap_or(0);
+    ctx.log_fmt(format_args!(
+        "xhci: hub configure (Hub bit, {} ports, mtt={}, ttt={}) completion={}",
+        nports, mtt, ttt, ce
+    ));
+    ce == 1
+}
+
 /// Fully enumerate the device on root-hub `port` into per-device DMA slice
 /// `dev_idx`: enable the port, Enable Slot, Address Device, read the device and
 /// configuration descriptors, find a boot-protocol HID interrupt-IN endpoint,
@@ -458,6 +503,7 @@ fn enumerate_one(
     let d0 = dma.read32(DATA_BUF_OFF);
     let ids = dma.read32(DATA_BUF_OFF + 8);
     let dclass = dma.read8(DATA_BUF_OFF + 4); // bDeviceClass: 0x09 = Hub
+    let dproto = dma.read8(DATA_BUF_OFF + 6); // bDeviceProtocol: on a hub, 2 = multi-TT
     ctx.log_fmt(format_args!(
         "xhci: DEVICE DESCRIPTOR bLength={} type={} class={:#04x} VID={:#06x} PID={:#06x}",
         d0 & 0xFF, (d0 >> 8) & 0xFF, dclass, ids & 0xFFFF, (ids >> 16) & 0xFFFF
@@ -558,10 +604,41 @@ fn enumerate_one(
                 ev_idx, ev_cycle, 0xA0, 6, 0x29 << 8, 0, 8, DATA_BUF_OFF,
             );
             let nports = if hub_ok { dma.read8(DATA_BUF_OFF + 2) } else { 0 };
+            let whubchar = dma.read16(DATA_BUF_OFF + 3); // wHubCharacteristics
+            let ttt = ((whubchar >> 5) & 0x3) as u32;    // TT Think Time [6:5]
+            let mtt = dproto == 2;                        // bDeviceProtocol 2 = multi-TT hub
             ctx.log_fmt(format_args!(
-                "xhci: USB hub on port {} (slot {}, {} downstream ports) - downstream enumeration not yet implemented (docs/usb-hub.md)",
-                port, slot, nports
+                "xhci: USB hub on port {} (slot {}, {} downstream ports, mtt={}, ttt={})",
+                port, slot, nports, mtt, ttt
             ));
+            // Configure the device AS a hub so the controller routes downstream traffic through it.
+            configure_as_hub(
+                ctx, dma, mmio, dboff, ir0, ctx_size, slot, dev_idx, speed, 0, port, nports, mtt, ttt,
+                ev_idx, ev_cycle, cmd_idx,
+            );
+            // Increment 2b step 1: POWER the downstream ports and read each one's connection status.
+            // Proves the hub CONFIGURE (Hub bit) + hub class requests (Set_Feature PORT_POWER,
+            // Get_Status) work over the hub's EP0. Reset + route-string Address Device + binding are
+            // step 2/3 (docs/usb-hub.md). The EP0 cursor stays contiguous (the hub descriptor ended at
+            // ~176); bounded so a many-port hub cannot overrun the one-page ring.
+            let mut hoff = 176usize;
+            for dp in 1..=nports {
+                if hoff + 32 > 0xF00 { break; }
+                let _ = control(dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle,
+                    0x23, 3, 8, dp as u32, 0, 0); // Set_Feature(PORT_POWER = 8)
+                hoff += 32;
+            }
+            for dp in 1..=nports {
+                if hoff + 48 > 0xF00 { break; }
+                let ok = control(dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle,
+                    0xA3, 0, 0, dp as u32, 4, DATA_BUF_OFF); // Get_Status(port), 4 bytes
+                hoff += 48;
+                let st = if ok { dma.read16(DATA_BUF_OFF) } else { 0 };
+                ctx.log_fmt(format_args!(
+                    "xhci: hub port {} status={:#06x} connected={} (step 1: configure + power + status)",
+                    dp, st, st & 1
+                ));
+            }
         } else {
             ctx.log_fmt(format_args!(
                 "xhci: port {} device has no interrupt-IN endpoint (not a keyboard/mouse)",
