@@ -33,6 +33,16 @@ const RASTER_HEIGHT: RasterHeight = RasterHeight::Size20;
 const CELL_W: usize = get_raster_width(FONT_WEIGHT, RASTER_HEIGHT);
 const CELL_H: usize = RASTER_HEIGHT.val();
 
+/// Integer font-scale factor for the current framebuffer. The glyph raster is a fixed CELL_W x CELL_H
+/// pixels; on a dense panel (the Dell Wyse 5070's native mode) that renders as a wall of tiny text, so
+/// each glyph pixel is upscaled to a `scale x scale` block. Chosen to target ~30 text rows: 1x on a
+/// T630-class panel, ~2x around 1080p, 3x on a very high resolution. Larger cells also mean fewer
+/// rows/cols, so a `scroll` (which repaints every cell) touches fewer cells and boot renders faster.
+#[inline]
+fn cell_scale(s: &Fb) -> usize {
+    ((s.height + 300) / 600).clamp(1, 3)
+}
+
 /// Reserved cell bytes for the **box-drawing** glyphs (`tree`). The grid stores these
 /// high bytes; `draw_box_glyph` renders them with procedural strokes. The UTF-8 decoder
 /// maps `U+2500..U+253C` to them via `cell_for_codepoint`.
@@ -179,8 +189,9 @@ pub fn fb_init(fb: &Framebuffer) {
     // Inset the text area by SAFE_PCT on each edge (0 = edge-to-edge full screen).
     s.org_x = s.width * SAFE_PCT / 100;
     s.org_y = s.height * SAFE_PCT / 100;
-    s.cols = (s.width - 2 * s.org_x) / CELL_W;
-    s.rows = (s.height - 2 * s.org_y) / CELL_H;
+    let sc = ((s.height + 300) / 600).clamp(1, 3); // integer font scale (see cell_scale)
+    s.cols = (s.width - 2 * s.org_x) / (CELL_W * sc);
+    s.rows = (s.height - 2 * s.org_y) / (CELL_H * sc);
     // Clamp the text area to the char-grid shadow bounds (only matters above ~4K).
     s.cols = s.cols.min(MAX_COLS);
     s.rows = s.rows.min(MAX_ROWS);
@@ -197,6 +208,15 @@ pub fn fb_init(fb: &Framebuffer) {
     s.cursor_visible = true;
     s.ready = true;
     clear(&mut s);
+    // Report the panel geometry + the chosen font scale (drop the FB lock first: kprintln renders to
+    // this same console, so logging while holding it would re-enter the lock). Confirms the resolution
+    // that drives the scale - the Wyse boots a much denser mode than the T630.
+    let (w, h, bpp, cols, rows) = (s.width, s.height, s.bpp, s.cols, s.rows);
+    drop(s);
+    crate::kprintln!(
+        "fb: {}x{} {}bpp, font-scale {}x -> {} cols x {} rows",
+        w, h, bpp * 8, sc, cols, rows
+    );
 }
 
 /// Framebuffer text geometry packed as `(rows << 16) | cols`, or 0 if the
@@ -483,11 +503,13 @@ fn draw_cursor(s: &mut Fb) {
     let ch = if r < MAX_ROWS && c < MAX_COLS { s.grid[r][c] } else { b' ' };
     draw_glyph(s, ch, c, r);
     // Underline: the bottom ~2 px of the cell, in the foreground colour.
-    let x0 = s.org_x + c * CELL_W;
-    let y0 = s.org_y + r * CELL_H;
-    let th = 2usize.min(CELL_H);
-    for gy in (CELL_H - th)..CELL_H {
-        for gx in 0..CELL_W {
+    let sc = cell_scale(s);
+    let (cellw, cellh) = (CELL_W * sc, CELL_H * sc);
+    let x0 = s.org_x + c * cellw;
+    let y0 = s.org_y + r * cellh;
+    let th = (2 * sc).min(cellh);
+    for gy in (cellh - th)..cellh {
+        for gx in 0..cellw {
             put_pixel(s, x0 + gx, y0 + gy, s.fg);
         }
     }
@@ -581,20 +603,28 @@ fn blend(s: &Fb, intensity: u8) -> u32 {
 /// background, so the cell is fully repainted with no stale pixels). The reserved
 /// high bytes render as procedural box-drawing strokes.
 fn draw_glyph(s: &Fb, ch: u8, col: usize, row: usize) {
-    let x0 = s.org_x + col * CELL_W;
-    let y0 = s.org_y + row * CELL_H;
+    let sc = cell_scale(s);
+    let x0 = s.org_x + col * CELL_W * sc;
+    let y0 = s.org_y + row * CELL_H * sc;
     if ch >= BOX_FIRST && box_arms(ch) != (false, false, false, false) {
         draw_box_glyph(s, ch, x0, y0);
         return;
     }
     // Noto raster: `raster()` is `height` rows of `width` intensity bytes; the crate
-    // guarantees those dims equal CELL_H × CELL_W for this weight/size, so iterating the
-    // raster covers the whole cell. An unknown char falls back to a blank cell.
+    // guarantees those dims equal CELL_H x CELL_W for this weight/size, so iterating the
+    // raster covers the whole cell. An unknown char falls back to a blank cell. Each raster
+    // pixel is upscaled to an `sc x sc` device-pixel block so the fixed-size glyph stays
+    // readable on a dense panel (cell_scale); sc == 1 is the original 1:1 path.
     match get_raster(ch as char, FONT_WEIGHT, RASTER_HEIGHT) {
         Some(rc) => {
             for (gy, rowpix) in rc.raster().iter().enumerate() {
                 for (gx, &intensity) in rowpix.iter().enumerate() {
-                    put_pixel(s, x0 + gx, y0 + gy, blend(s, intensity));
+                    let px = blend(s, intensity);
+                    for sy in 0..sc {
+                        for sx in 0..sc {
+                            put_pixel(s, x0 + gx * sc + sx, y0 + gy * sc + sy, px);
+                        }
+                    }
                 }
             }
         }
@@ -604,8 +634,9 @@ fn draw_glyph(s: &Fb, ch: u8, col: usize, row: usize) {
 
 /// Paint a whole cell to the background colour (used when a char has no raster).
 fn clear_cell(s: &Fb, x0: usize, y0: usize) {
-    for gy in 0..CELL_H {
-        for gx in 0..CELL_W {
+    let sc = cell_scale(s);
+    for gy in 0..CELL_H * sc {
+        for gx in 0..CELL_W * sc {
             put_pixel(s, x0 + gx, y0 + gy, s.bg);
         }
     }
@@ -616,13 +647,15 @@ fn clear_cell(s: &Fb, x0: usize, y0: usize) {
 /// connect into continuous lines. Stroke thickness is ~2 px, centred on the cell axes.
 fn draw_box_glyph(s: &Fb, ch: u8, x0: usize, y0: usize) {
     clear_cell(s, x0, y0);
+    let sc = cell_scale(s);
+    let (cellw, cellh) = (CELL_W * sc, CELL_H * sc);
     let (up, down, left, right) = box_arms(ch);
-    let th = (CELL_W / 5).max(2); // stroke thickness in px (~2 at Size20)
-    let vx = CELL_W.saturating_sub(th) / 2; // left edge of the vertical stroke band
-    let hy = CELL_H.saturating_sub(th) / 2; // top edge of the horizontal stroke band
+    let th = (cellw / 5).max(2); // stroke thickness in px (~2*sc)
+    let vx = cellw.saturating_sub(th) / 2; // left edge of the vertical stroke band
+    let hy = cellh.saturating_sub(th) / 2; // top edge of the horizontal stroke band
     let fill = |xs: usize, xe: usize, ys: usize, ye: usize| {
-        for y in ys..ye.min(CELL_H) {
-            for x in xs..xe.min(CELL_W) {
+        for y in ys..ye.min(cellh) {
+            for x in xs..xe.min(cellw) {
                 put_pixel(s, x0 + x, y0 + y, s.fg);
             }
         }
@@ -633,14 +666,14 @@ fn draw_box_glyph(s: &Fb, ch: u8, x0: usize, y0: usize) {
         fill(vx, vx + th, 0, hy + th);
     }
     if down {
-        fill(vx, vx + th, hy, CELL_H);
+        fill(vx, vx + th, hy, cellh);
     }
     // Horizontal arms span the stroke rows [hy, hy+th).
     if left {
         fill(0, vx + th, hy, hy + th);
     }
     if right {
-        fill(vx, CELL_W, hy, hy + th);
+        fill(vx, cellw, hy, hy + th);
     }
 }
 
