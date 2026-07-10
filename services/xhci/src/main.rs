@@ -84,6 +84,44 @@ fn ep0_tr_off(i: usize) -> usize { DEV_BASE + i * DEV_STRIDE + 0x1000 }
 fn int_tr_off(i: usize) -> usize { DEV_BASE + i * DEV_STRIDE + 0x2000 }
 fn report_off(i: usize) -> usize { DEV_BASE + i * DEV_STRIDE + 0x3000 }
 
+/// Fixed pool of the MAX_SLICES per-device DMA slices (§26.6, no heap - a bitmap). A bound HID and an
+/// in-use hub HOLD their slice for the enumeration pass (a downstream device's routing depends on its
+/// hub's device context staying put); a transient probe - a non-HID device - frees it. Each hot-plug
+/// pass re-inits the controller and starts a fresh allocator, so nothing leaks across passes.
+#[allow(dead_code)] // wired in step 3 (the enumerate_one slice-allocator refactor)
+struct SliceAlloc {
+    used: [bool; MAX_SLICES],
+}
+impl SliceAlloc {
+    fn new() -> Self {
+        Self { used: [false; MAX_SLICES] }
+    }
+    fn alloc(&mut self) -> Option<usize> {
+        (0..MAX_SLICES).find(|&i| !self.used[i]).inspect(|&i| self.used[i] = true)
+    }
+    fn free(&mut self, i: usize) {
+        if i < MAX_SLICES {
+            self.used[i] = false;
+        }
+    }
+}
+
+/// Free a slot back to the controller (Disable Slot) for a probed device we do not keep - a non-HID
+/// downstream device - so controller slots do not leak across a hot-plug re-scan.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // wired in step 3 (frees a probed non-HID device's slot)
+fn disable_slot(
+    ctx: &ServiceContext, dma: &Dma, mmio: &Mmio, dboff: usize, ir0: usize, slot: u32,
+    ev_idx: &mut usize, ev_cycle: &mut u32, cmd_idx: &mut usize,
+) {
+    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+    *cmd_idx += 1;
+    let _ = run_command(
+        ctx, dma, mmio, dboff, ir0, cmd_off, 0, 0, 0,
+        (TRB_DISABLE_SLOT << 10) | (slot << 24) | 1, ev_idx, ev_cycle,
+    );
+}
+
 /// A bound HID device: its slot, interrupt-endpoint DCI, root-hub port (for
 /// disconnect detection), per-device DMA slice index, and whether it's a mouse.
 #[derive(Clone, Copy)]
@@ -98,6 +136,7 @@ const TRB_DATA_STAGE: u32 = 3;
 const TRB_STATUS_STAGE: u32 = 4;
 const TRB_LINK: u32 = 6;
 const TRB_ENABLE_SLOT: u32 = 9;
+const TRB_DISABLE_SLOT: u32 = 10;
 const TRB_ADDRESS_DEVICE: u32 = 11;
 const TRB_CONFIGURE_ENDPOINT: u32 = 12;
 const TRB_TRANSFER_EVENT: u32 = 32;
