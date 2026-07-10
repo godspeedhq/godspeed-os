@@ -539,12 +539,17 @@ fn enumerate_one(
         // path (Set_Configuration + Get_Descriptor(Hub 0x29)) works over the shared control() helper.
         if dclass == 0x09 {
             // Set_Configuration, then Get_Descriptor(Hub, type 0x29) - 8 bytes is enough for nports.
+            // The EP0 ring must be CONTIGUOUS: the controller stops at the first unwritten TRB (cycle=0),
+            // so each transfer starts exactly where the previous ended. Config-descriptor read ended at
+            // offset 96; Set_Configuration (no-data: Setup+Status = 2 TRBs) ends at 128; the hub
+            // descriptor starts at 128. (Putting it at 144 left a dead TRB at 128 that halted the ring,
+            // so the read never ran and nports read back 0 - the "0 downstream ports" first-boot bug.)
             let _ = control(
                 dma, mmio, dboff, ir0, slot, dev_idx, 96,
                 ev_idx, ev_cycle, 0x00, 9, cfg_val as u32, 0, 0, 0,
             );
             let hub_ok = control(
-                dma, mmio, dboff, ir0, slot, dev_idx, 144,
+                dma, mmio, dboff, ir0, slot, dev_idx, 128,
                 ev_idx, ev_cycle, 0xA0, 6, 0x29 << 8, 0, 8, DATA_BUF_OFF,
             );
             let nports = if hub_ok { dma.read8(DATA_BUF_OFF + 2) } else { 0 };
