@@ -8,6 +8,14 @@ unless this file is updated in the same commit with a written SAFETY argument.**
 
 ---
 
+## 2026-07-10 - fast fbcon blits for the 4K Wyse 5070 + drift reconcile
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/x86_64/fb.rs` | 3 → 5 (+2) | Fast blit path for a dense (4K) panel. `fill_rect` writes a solid rectangle as contiguous per-row runs; `draw_glyph`'s fast 32bpp path writes each glyph output row as one contiguous run of aligned `u32` stores. The old per-pixel byte loop crawled repainting ~6.6M pixels/scroll on the Wyse's 3840x2160 panel. Both bounds-check the whole rect/cell ONCE against the reported geometry (cols/rows are sized so cells fit) then write the run unchecked, so write-combining coalesces the stores - the same raw-framebuffer-write pattern as the existing `put_pixel`/`clear`, in the permitted arch layer, each with a `// SAFETY:` comment. There is no safe route: writing Limine's linear framebuffer is a raw-pointer store, and a bounds-checked `&mut [u32]` would defeat the purpose (a compare per pixel is the very overhead removed). |
+| `arch/x86_64/boot.rs` | 80 → 84 (+4) | **Reconcile only:** pre-existing drift accumulated since 2026-06-08 by the feat/networking bring-up (H1 IOMMU / NIC / PCI / AHCI, merged to main) that did not update this audit. All in the permitted arch layer; count corrected here, per-block detail is a backfill owed by that work. |
+| `arch/x86_64/mod.rs` | 34 → 35 (+1) | **Reconcile only:** pre-existing drift from feat/networking (merged to main); permitted arch layer, count corrected, per-block detail backfill pending. |
+
 ## 2026-06-08 - fbcon scroll without VRAM read-back
 
 | File | Change | Why |
@@ -131,13 +139,13 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
 | arch/x86_64/ap_boot.rs | 2 | permitted |
-| arch/x86_64/boot.rs | 80 | permitted |
+| arch/x86_64/boot.rs | 84 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |
-| arch/x86_64/fb.rs | 3 | permitted |
+| arch/x86_64/fb.rs | 5 | permitted |
 | arch/x86_64/interrupts.rs | 21 | permitted |
 | arch/x86_64/ioapic.rs | 8 | permitted |
 | arch/x86_64/iommu.rs | 74 | permitted |
-| arch/x86_64/mod.rs | 34 | permitted |
+| arch/x86_64/mod.rs | 35 | permitted |
 | arch/x86_64/page_tables.rs | 41 | permitted |
 | arch/x86_64/pci.rs | 19 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |
@@ -275,10 +283,18 @@ and not yet visible to the scheduler.
 
 ### arch/x86_64/fb.rs
 
-Framebuffer text console (Phase 1 boot output, §11.4). Three blocks; two write
+Framebuffer text console (Phase 1 boot output, §11.4). Five blocks; four write
 to Limine's linear framebuffer at `base + y*pitch + x*bpp`:
 - `clear`: `write_bytes(base, 0, height*pitch)` - fills the whole buffer.
-- `put_pixel`: writes `bpp` bytes at a bounds-checked offset (`x<width`, `y<height`).
+- `put_pixel`: writes `bpp` bytes (one aligned `u32` store on the 32bpp fast path) at a
+  bounds-checked offset (`x<width`, `y<height`).
+- `fill_rect`: fills a `w x h` rectangle clamped to `width`/`height`, writing each row as a
+  contiguous run (aligned `u32` stores on the 32bpp path). Sound: the clamped rect stays inside the
+  mapped `height*pitch` region; `x*bpp`/`pitch` are 4-aligned on the 32bpp path.
+- `draw_glyph` (fast 32bpp path): writes each glyph output row as one contiguous run of `cw` aligned
+  `u32` stores. Sound: it first checks the whole cell `[x0,x0+cw) x [y0,y0+chh)` lies inside the
+  framebuffer (cols/rows are sized so cells fit; otherwise it falls back to the checked `fill_rect`),
+  so the unchecked run stays within `height*pitch`, and `x0*4`/`pitch` are 4-aligned.
 
 Sound because the framebuffer is the region Limine mapped and sized
 (`height*pitch` bytes), it lives in the higher half (PML4 256-511) that every

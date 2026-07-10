@@ -656,16 +656,46 @@ fn draw_glyph(s: &Fb, ch: u8, col: usize, row: usize) {
     // raster covers the whole cell. An unknown char falls back to a blank cell. Each raster
     // pixel is upscaled to an `sc x sc` device-pixel block so the fixed-size glyph stays
     // readable on a dense panel (cell_scale); sc == 1 is the original 1:1 path.
-    match get_raster(ch as char, FONT_WEIGHT, RASTER_HEIGHT) {
-        Some(rc) => {
-            for (gy, rowpix) in rc.raster().iter().enumerate() {
-                for (gx, &intensity) in rowpix.iter().enumerate() {
-                    // The sc x sc upscale block is a solid colour - blit it as one small rect.
-                    fill_rect(s, x0 + gx * sc, y0 + gy * sc, sc, sc, blend(s, intensity));
+    let rc = match get_raster(ch as char, FONT_WEIGHT, RASTER_HEIGHT) {
+        Some(rc) => rc,
+        None => {
+            clear_cell(s, x0, y0);
+            return;
+        }
+    };
+    let raster = rc.raster();
+    let (cw, chh) = (CELL_W * sc, CELL_H * sc);
+    // The cell lies fully inside the framebuffer (cols/rows are sized to fit) - but guard, so the
+    // unchecked contiguous run below can never write past the mapping (fall back to the safe blit).
+    if s.bpp != 4 || x0 + cw > s.width || y0 + chh > s.height {
+        for (gy, rowpix) in raster.iter().enumerate() {
+            for (gx, &intensity) in rowpix.iter().enumerate() {
+                fill_rect(s, x0 + gx * sc, y0 + gy * sc, sc, sc, blend(s, intensity));
+            }
+        }
+        return;
+    }
+    // Fast 32bpp path: write each output row as ONE contiguous run of `cw` aligned u32 stores (best
+    // write-combining, no per-pixel fill_rect call). Each raster pixel's colour is blended once and
+    // replicated `sc` times horizontally; the raster row is replicated `sc` times vertically.
+    let base = s.base as *mut u8;
+    for (gy, rowpix) in raster.iter().enumerate() {
+        for sy in 0..sc {
+            let yy = y0 + gy * sc + sy;
+            // SAFETY: the whole [x0, x0+cw) x [y0, y0+chh) cell is in-bounds (checked above); this
+            // writes exactly `cw` pixels of row `yy`, and yy < height, x0+cw <= width. bpp == 4 so
+            // `x0*4` and `pitch` are multiples of 4 - the u32 stores are aligned. Mapped for life.
+            unsafe {
+                let mut p = base.add(yy * s.pitch + x0 * 4) as *mut u32;
+                for &intensity in rowpix.iter() {
+                    let color = blend(s, intensity);
+                    for _ in 0..sc {
+                        *p = color;
+                        p = p.add(1);
+                    }
                 }
             }
         }
-        None => clear_cell(s, x0, y0),
     }
 }
 
