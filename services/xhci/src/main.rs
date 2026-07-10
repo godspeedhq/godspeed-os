@@ -356,6 +356,77 @@ fn configure_as_hub(
     ce == 1
 }
 
+/// Address a device that sits BEHIND a hub, into per-device slice `dev_idx`, via a **route string**
+/// (the path of hub-port numbers) and - for a low/full-speed device behind a high-speed hub - the
+/// **parent-TT** fields (the hub's slot + port), so the controller runs split transactions for it
+/// (xHCI 6.2.2). Enable Slot -> build the input slot context (route, speed, root port, TT) -> Address
+/// Device -> read the device descriptor. Returns `(slot, vid, pid, class)` on success. This is the
+/// downstream analogue of `enumerate_one`'s root-port addressing; the hard, fiddly part of hub support.
+#[allow(clippy::too_many_arguments)]
+fn address_downstream(
+    ctx: &ServiceContext, dma: &Dma, mmio: &Mmio, dboff: usize, ir0: usize, ctx_size: usize,
+    dev_idx: usize, route: u32, root_port: u32, speed: u32, parent_slot: u32, parent_port: u32, ttt: u32,
+    ev_idx: &mut usize, ev_cycle: &mut u32, cmd_idx: &mut usize,
+) -> Option<(u32, u16, u16, u8)> {
+    // Enable Slot.
+    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+    *cmd_idx += 1;
+    let (comp, slot) = run_command(
+        ctx, dma, mmio, dboff, ir0, cmd_off, 0, 0, 0, (TRB_ENABLE_SLOT << 10) | 1, ev_idx, ev_cycle,
+    )?;
+    if comp != 1 {
+        return None;
+    }
+    // Input context: Add slot + EP0.
+    let islot = INPUT_CTX_OFF + ctx_size;
+    let iep0 = INPUT_CTX_OFF + 2 * ctx_size;
+    dma.write32(INPUT_CTX_OFF, 0);
+    dma.write32(INPUT_CTX_OFF + 4, 0b11);
+    // Slot dword0: Context Entries=1, Speed [23:20], Route String [19:0]. (Not a hub, no MTT.)
+    dma.write32(islot, (1 << 27) | (speed << 20) | (route & 0xFFFFF));
+    // Slot dword1: Root Hub Port Number [23:16] (the root port the whole chain hangs off).
+    dma.write32(islot + 4, root_port << 16);
+    // Slot dword2: TT fields for a low/full-speed device (speed 1 or 2) behind a high-speed hub -
+    // TT Hub Slot ID [7:0], TT Port Number [15:8], TT Think Time [17:16].
+    let tt = if speed == 1 || speed == 2 {
+        (parent_slot & 0xFF) | ((parent_port & 0xFF) << 8) | ((ttt & 0x3) << 16)
+    } else {
+        0
+    };
+    dma.write32(islot + 8, tt);
+    // EP0 context.
+    let ep0_tr = dma.phys_at(ep0_tr_off(dev_idx));
+    let max_packet = match speed { 2 => 8, 4 => 512, _ => 8 };
+    dma.write32(iep0 + 4, (3 << 1) | (4 << 3) | (max_packet << 16));
+    dma.write32(iep0 + 8, (ep0_tr as u32 & !0xF) | 1);
+    dma.write32(iep0 + 12, (ep0_tr >> 32) as u32);
+    dma.write32(iep0 + 16, 8);
+    dma.write64(DCBAA_OFF + slot as usize * 8, dma.phys_at(device_ctx_off(dev_idx)));
+    // Address Device.
+    let in_phys = dma.phys_at(INPUT_CTX_OFF);
+    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+    *cmd_idx += 1;
+    let (comp, _) = run_command(
+        ctx, dma, mmio, dboff, ir0, cmd_off, in_phys as u32, (in_phys >> 32) as u32, 0,
+        (TRB_ADDRESS_DEVICE << 10) | (slot << 24) | 1, ev_idx, ev_cycle,
+    )?;
+    if comp != 1 {
+        ctx.log_fmt(format_args!(
+            "xhci: downstream Address Device failed (completion={}, route={:#x})", comp, route
+        ));
+        return None;
+    }
+    // Read the device descriptor over the downstream slice's EP0 ring (offset 0).
+    if !control(
+        dma, mmio, dboff, ir0, slot, dev_idx, 0, ev_idx, ev_cycle, 0x80, 6, 0x0100, 0, 18, DATA_BUF_OFF,
+    ) {
+        return None;
+    }
+    let ids = dma.read32(DATA_BUF_OFF + 8);
+    let class = dma.read8(DATA_BUF_OFF + 4);
+    Some((slot, (ids & 0xFFFF) as u16, (ids >> 16) as u16, class))
+}
+
 /// Fully enumerate the device on root-hub `port` into per-device DMA slice
 /// `dev_idx`: enable the port, Enable Slot, Address Device, read the device and
 /// configuration descriptors, find a boot-protocol HID interrupt-IN endpoint,
@@ -611,6 +682,14 @@ fn enumerate_one(
                 "xhci: USB hub on port {} (slot {}, {} downstream ports, mtt={}, ttt={})",
                 port, slot, nports, mtt, ttt
             ));
+            // A SuperSpeed hub (the USB3 side of the Realtek hubs, 0x0411/0x0415) uses hub descriptor
+            // type 0x2A, so the 0x29 read above returns 0 ports - skip it (the low-speed keyboard is on
+            // the USB2 hub). Not walking a 0-port hub also avoids a failed Configure Endpoint and the
+            // enumeration cascade it caused.
+            if nports == 0 {
+                ctx.log("xhci: hub reports 0 ports (SuperSpeed hub? needs descriptor 0x2A) - not walking");
+                return None;
+            }
             // Configure the device AS a hub so the controller routes downstream traffic through it.
             configure_as_hub(
                 ctx, dma, mmio, dboff, ir0, ctx_size, slot, dev_idx, speed, 0, port, nports, mtt, ttt,
@@ -628,16 +707,47 @@ fn enumerate_one(
                     0x23, 3, 8, dp as u32, 0, 0); // Set_Feature(PORT_POWER = 8)
                 hoff += 32;
             }
+            // Step 2: for each CONNECTED downstream port, reset it and Address Device it with a route
+            // string (this hub port, tier 1) + parent-TT, then read its device descriptor. Proves we
+            // reach the device behind the hub (the keyboard on port 4). Binding is step 3.
             for dp in 1..=nports {
-                if hoff + 48 > 0xF00 { break; }
+                if hoff + 48 > 0xE00 { break; }
                 let ok = control(dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle,
-                    0xA3, 0, 0, dp as u32, 4, DATA_BUF_OFF); // Get_Status(port), 4 bytes
+                    0xA3, 0, 0, dp as u32, 4, DATA_BUF_OFF); // Get_Status(port)
                 hoff += 48;
                 let st = if ok { dma.read16(DATA_BUF_OFF) } else { 0 };
-                ctx.log_fmt(format_args!(
-                    "xhci: hub port {} status={:#06x} connected={} (step 1: configure + power + status)",
-                    dp, st, st & 1
-                ));
+                if st & 1 == 0 {
+                    continue; // nothing connected on this downstream port
+                }
+                // Reset the port, hold, clear the reset-change, re-read status for the device speed.
+                let _ = control(dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle,
+                    0x23, 3, 4, dp as u32, 0, 0); // Set_Feature(PORT_RESET = 4)
+                hoff += 32;
+                let t0 = ctx.read_tsc();
+                while ctx.read_tsc().wrapping_sub(t0) < 100_000_000 {} // ~50-65 ms reset hold (bounded)
+                let _ = control(dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle,
+                    0x23, 1, 0x14, dp as u32, 0, 0); // Clear_Feature(C_PORT_RESET = 20)
+                hoff += 32;
+                let _ = control(dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle,
+                    0xA3, 0, 0, dp as u32, 4, DATA_BUF_OFF); // Get_Status again (post-reset, for speed)
+                hoff += 48;
+                let pst = dma.read16(DATA_BUF_OFF);
+                // Port-status speed bits: bit 9 = low-speed, bit 10 = high-speed; neither = full-speed.
+                // Map to the xHCI slot-context speed value (1=Full, 2=Low, 3=High).
+                let dspeed = if pst & (1 << 9) != 0 { 2 } else if pst & (1 << 10) != 0 { 3 } else { 1 };
+                // Probe slice MAX_HID (first non-bound-HID slice); route = this hub port (tier 1).
+                match address_downstream(
+                    ctx, dma, mmio, dboff, ir0, ctx_size, MAX_HID, dp as u32 & 0xF, port, dspeed, slot,
+                    dp as u32, ttt, ev_idx, ev_cycle, cmd_idx,
+                ) {
+                    Some((dslot, vid, pid, cls)) => ctx.log_fmt(format_args!(
+                        "xhci: hub port {} DEVICE: VID={:#06x} PID={:#06x} class={:#04x} speed={} - route-string addressing OK (slot {})",
+                        dp, vid, pid, cls, dspeed, dslot
+                    )),
+                    None => ctx.log_fmt(format_args!(
+                        "xhci: hub port {} connected but downstream Address Device FAILED (route/TT)", dp
+                    )),
+                }
             }
         } else {
             ctx.log_fmt(format_args!(
