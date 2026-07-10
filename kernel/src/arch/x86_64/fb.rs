@@ -508,11 +508,7 @@ fn draw_cursor(s: &mut Fb) {
     let x0 = s.org_x + c * cellw;
     let y0 = s.org_y + r * cellh;
     let th = (2 * sc).min(cellh);
-    for gy in (cellh - th)..cellh {
-        for gx in 0..cellw {
-            put_pixel(s, x0 + gx, y0 + gy, s.fg);
-        }
-    }
+    fill_rect(s, x0, y0 + cellh - th, cellw, th, s.fg);
     s.cur_col = c;
     s.cur_row = r;
 }
@@ -570,10 +566,55 @@ fn put_pixel(s: &Fb, x: usize, y: usize, color: u32) {
     // SAFETY: off < height*pitch (x,y bounds-checked; bpp ≤ pitch/width); the
     // framebuffer is mapped for the system lifetime.
     unsafe {
-        let mut i = 0;
-        while i < s.bpp {
-            *base.add(off + i) = (color >> (i * 8)) as u8;
-            i += 1;
+        // 32bpp is the near-universal case: one aligned 32-bit store (off is 4-aligned - pitch and
+        // x*bpp are multiples of 4 for a 32bpp framebuffer) instead of a per-byte loop.
+        if s.bpp == 4 {
+            *(base.add(off) as *mut u32) = color;
+        } else {
+            let mut i = 0;
+            while i < s.bpp {
+                *base.add(off + i) = (color >> (i * 8)) as u8;
+                i += 1;
+            }
+        }
+    }
+}
+
+/// Fill a solid `w x h` pixel rectangle at (x, y). Writes each row as a contiguous run - one aligned
+/// 32-bit store per pixel on the 32bpp path, not a per-byte loop - so glyph upscale-blocks and cell
+/// clears blit fast (write-combining coalesces the sequential stores into bursts). The boot scroll
+/// repaints the whole text area, and on the Wyse's 4K panel a per-pixel byte loop there is exactly
+/// what made it crawl.
+#[inline]
+fn fill_rect(s: &Fb, x: usize, y: usize, w: usize, h: usize, color: u32) {
+    if x >= s.width || y >= s.height {
+        return;
+    }
+    let xw = (x + w).min(s.width);
+    let yh = (y + h).min(s.height);
+    let base = s.base as *mut u8;
+    for yy in y..yh {
+        let row = yy * s.pitch + x * s.bpp;
+        // SAFETY: [row, row + (xw-x)*bpp) is within the mapped framebuffer (x,y,xw,yh clamped to
+        // width/height; bpp*width <= pitch); row is 4-aligned on the 32bpp path. Mapped for life.
+        unsafe {
+            if s.bpp == 4 {
+                let mut p = base.add(row) as *mut u32;
+                for _ in x..xw {
+                    *p = color;
+                    p = p.add(1);
+                }
+            } else {
+                let mut off = row;
+                for _ in x..xw {
+                    let mut i = 0;
+                    while i < s.bpp {
+                        *base.add(off + i) = (color >> (i * 8)) as u8;
+                        i += 1;
+                    }
+                    off += s.bpp;
+                }
+            }
         }
     }
 }
@@ -619,12 +660,8 @@ fn draw_glyph(s: &Fb, ch: u8, col: usize, row: usize) {
         Some(rc) => {
             for (gy, rowpix) in rc.raster().iter().enumerate() {
                 for (gx, &intensity) in rowpix.iter().enumerate() {
-                    let px = blend(s, intensity);
-                    for sy in 0..sc {
-                        for sx in 0..sc {
-                            put_pixel(s, x0 + gx * sc + sx, y0 + gy * sc + sy, px);
-                        }
-                    }
+                    // The sc x sc upscale block is a solid colour - blit it as one small rect.
+                    fill_rect(s, x0 + gx * sc, y0 + gy * sc, sc, sc, blend(s, intensity));
                 }
             }
         }
@@ -635,11 +672,7 @@ fn draw_glyph(s: &Fb, ch: u8, col: usize, row: usize) {
 /// Paint a whole cell to the background colour (used when a char has no raster).
 fn clear_cell(s: &Fb, x0: usize, y0: usize) {
     let sc = cell_scale(s);
-    for gy in 0..CELL_H * sc {
-        for gx in 0..CELL_W * sc {
-            put_pixel(s, x0 + gx, y0 + gy, s.bg);
-        }
-    }
+    fill_rect(s, x0, y0, CELL_W * sc, CELL_H * sc, s.bg);
 }
 
 /// Draw a procedural box-drawing glyph at pixel origin (x0, y0). Each present arm is a
