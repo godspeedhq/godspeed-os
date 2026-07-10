@@ -88,7 +88,6 @@ fn report_off(i: usize) -> usize { DEV_BASE + i * DEV_STRIDE + 0x3000 }
 /// in-use hub HOLD their slice for the enumeration pass (a downstream device's routing depends on its
 /// hub's device context staying put); a transient probe - a non-HID device - frees it. Each hot-plug
 /// pass re-inits the controller and starts a fresh allocator, so nothing leaks across passes.
-#[allow(dead_code)] // wired in step 3 (the enumerate_one slice-allocator refactor)
 struct SliceAlloc {
     used: [bool; MAX_SLICES],
 }
@@ -109,7 +108,6 @@ impl SliceAlloc {
 /// Free a slot back to the controller (Disable Slot) for a probed device we do not keep - a non-HID
 /// downstream device - so controller slots do not leak across a hot-plug re-scan.
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)] // wired in step 3 (frees a probed non-HID device's slot)
 fn disable_slot(
     ctx: &ServiceContext, dma: &Dma, mmio: &Mmio, dboff: usize, ir0: usize, slot: u32,
     ev_idx: &mut usize, ev_cycle: &mut u32, cmd_idx: &mut usize,
@@ -467,160 +465,28 @@ fn address_downstream(
 }
 
 /// Fully enumerate the device on root-hub `port` into per-device DMA slice
-/// `dev_idx`: enable the port, Enable Slot, Address Device, read the device and
-/// configuration descriptors, find a boot-protocol HID interrupt-IN endpoint,
-/// Configure Endpoint, Set Configuration, Set Protocol(boot), and arm the
-/// interrupt transfer ring. Returns `Some(Hid)` if the device is a boot keyboard
-/// or mouse and is now ready to poll; `None` for any non-HID device (e.g. the
-/// mass-storage boot drive) or on any enumeration failure. Shares the command and
-/// event rings via the mutable bookkeeping refs.
+/// Given a device that already has an addressed slot and a working EP0 - either a root-port device
+/// addressed by `enumerate_one` or a downstream device addressed by `address_downstream` - read its
+/// configuration descriptor and, if it exposes a boot-protocol HID interrupt-IN endpoint, Configure
+/// Endpoint + Set Configuration + Set Protocol(boot) + arm the interrupt ring. Returns
+/// `(Some(Hid), cfg_val)` when a keyboard/mouse was bound, `(None, cfg_val)` when the device has no
+/// boot-HID endpoint (a hub - the caller reuses `cfg_val` for its own Set_Configuration), or
+/// `(None, 0)` if the config descriptor could not be read.
+///
+/// The slot-context fields (`route`, `root_port`, `parent_slot`, `parent_port`, `ttt`) are threaded
+/// through because Configure Endpoint re-supplies the slot context (its Context Entries grows to cover
+/// the new endpoint), and a downstream device's routing depends on that context still carrying its
+/// route string + parent-TT. A root-port device passes route=0, root_port=port, parent_*=0, ttt=0, so
+/// this reduces to the plain (no-route, no-TT) form.
 #[allow(clippy::too_many_arguments)]
-fn enumerate_one(
-    ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
-    dboff: usize,
-    ir0: usize,
-    op: usize,
-    ctx_size: usize,
-    port: u32,
-    dev_idx: usize,
-    ev_idx: &mut usize,
-    ev_cycle: &mut u32,
-    cmd_idx: &mut usize,
-) -> Option<Hid> {
-    let portsc_off = op + OP_PORTSC_BASE + (port as usize - 1) * 0x10;
-    let psc = mmio.read32(portsc_off);
-    if psc & PORT_CCS == 0 {
-        return None; // nothing connected on this port
-    }
-    ctx.log_fmt(format_args!(
-        "xhci: enumerating port {} PORTSC={:#010x} into dev slice {}",
-        port, psc, dev_idx
-    ));
-
-    // Enable the port. USB3 (SuperSpeed) ports auto-train and are already enabled
-    // (PED=1) - issuing the USB2 port-reset (PR) bit *disables* them. So only reset
-    // a not-yet-enabled (USB2) port; an already-enabled port is used as-is.
-    if psc & PORT_PED == 0 {
-        mmio.write32(portsc_off, (psc & !PORT_RW1C) | PORT_PR);
-        spin(|| mmio.read32(portsc_off) & PORT_PED != 0);
-    }
-    let psc = mmio.read32(portsc_off);
-    let speed = (psc >> 10) & 0xF;
-    let max_packet = match speed {
-        2 => 8,   // low-speed
-        4 => 512, // super-speed
-        _ => 64,  // full / high-speed
-    };
-    ctx.log_fmt(format_args!(
-        "xhci: port {} ready; PORTSC={:#010x} speed={} max_packet={}",
-        port, psc, speed, max_packet
-    ));
-
-    // Enable Slot.
-    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
-    *cmd_idx += 1;
-    let (comp, slot) = match run_command(
-        ctx, dma, mmio, dboff, ir0, cmd_off,
-        0, 0, 0, (TRB_ENABLE_SLOT << 10) | 1,
-        ev_idx, ev_cycle,
-    ) {
-        Some(r) => r,
-        None => {
-            ctx.log("xhci: Enable Slot - no completion");
-            return None;
-        }
-    };
-    if comp != 1 {
-        ctx.log_fmt(format_args!("xhci: Enable Slot failed (completion={})", comp));
-        return None;
-    }
-    ctx.log_fmt(format_args!("xhci: slot {} enabled", slot));
-
-    // Build the Input Context for Address Device.
-    //   +0:            Input Control Context - Add flags A0(slot)|A1(ep0)
-    //   +ctx_size:     Slot Context
-    //   +2*ctx_size:   Endpoint 0 Context
-    let islot = INPUT_CTX_OFF + ctx_size;
-    let iep0 = INPUT_CTX_OFF + 2 * ctx_size;
-    dma.write32(INPUT_CTX_OFF + 4, 0b11); // Add Context flags: slot + EP0
-    dma.write32(islot, (1 << 27) | (speed << 20));
-    dma.write32(islot + 4, port << 16);
-    let ep0_tr = dma.phys_at(ep0_tr_off(dev_idx));
-    dma.write32(iep0 + 4, (3 << 1) | (4 << 3) | (max_packet << 16));
-    dma.write32(iep0 + 8, (ep0_tr as u32 & !0xF) | 1);
-    dma.write32(iep0 + 12, (ep0_tr >> 32) as u32);
-    dma.write32(iep0 + 16, 8);
-
-    // DCBAA[slot] = device context physical base.
-    dma.write64(DCBAA_OFF + slot as usize * 8, dma.phys_at(device_ctx_off(dev_idx)));
-
-    // Address Device command (input context ptr, slot id).
-    let in_phys = dma.phys_at(INPUT_CTX_OFF);
-    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
-    *cmd_idx += 1;
-    let (comp, _) = match run_command(
-        ctx, dma, mmio, dboff, ir0, cmd_off,
-        in_phys as u32, (in_phys >> 32) as u32, 0,
-        (TRB_ADDRESS_DEVICE << 10) | (slot << 24) | 1,
-        ev_idx, ev_cycle,
-    ) {
-        Some(r) => r,
-        None => {
-            ctx.log("xhci: Address Device - no completion");
-            return None;
-        }
-    };
-    if comp != 1 {
-        ctx.log_fmt(format_args!("xhci: Address Device failed (completion={})", comp));
-        return None;
-    }
-    ctx.log_fmt(format_args!(
-        "xhci: Address Device OK - device on port {} addressed (slot {})",
-        port, slot
-    ));
-
-    // Get Device Descriptor over EP0 (control transfer): Setup (immediate
-    // GET_DESCRIPTOR), Data (IN, 18 bytes), Status (OUT, IOC).
-    let data_phys = dma.phys_at(DATA_BUF_OFF);
-    let tr0 = ep0_tr_off(dev_idx);
-    dma.write32(tr0, 0x80 | (6 << 8) | (0x0100 << 16));
-    dma.write32(tr0 + 4, 18 << 16);
-    dma.write32(tr0 + 8, 8);
-    dma.write32(tr0 + 12, 1 | (1 << 6) | (TRB_SETUP_STAGE << 10) | (3 << 16));
-    dma.write32(tr0 + 16, data_phys as u32);
-    dma.write32(tr0 + 20, (data_phys >> 32) as u32);
-    dma.write32(tr0 + 24, 18);
-    dma.write32(tr0 + 28, 1 | (TRB_DATA_STAGE << 10) | (1 << 16));
-    dma.write32(tr0 + 32, 0);
-    dma.write32(tr0 + 36, 0);
-    dma.write32(tr0 + 40, 0);
-    dma.write32(tr0 + 44, 1 | (1 << 5) | (TRB_STATUS_STAGE << 10));
-    mmio.write32(dboff + slot as usize * 4, 1);
-    let mut ok = false;
-    for _ in 0..8 {
-        match next_event(dma, mmio, ir0, ev_idx, ev_cycle, 10_000_000) {
-            Some((TRB_TRANSFER_EVENT, c, _)) => { ok = c == 1 || c == 13; break; }
-            Some(_) => {}
-            None => break,
-        }
-    }
-    if !ok {
-        ctx.log("xhci: Get Device Descriptor failed");
-        return None;
-    }
-    let d0 = dma.read32(DATA_BUF_OFF);
-    let ids = dma.read32(DATA_BUF_OFF + 8);
-    let dclass = dma.read8(DATA_BUF_OFF + 4); // bDeviceClass: 0x09 = Hub
-    let dproto = dma.read8(DATA_BUF_OFF + 6); // bDeviceProtocol: on a hub, 2 = multi-TT
-    ctx.log_fmt(format_args!(
-        "xhci: DEVICE DESCRIPTOR bLength={} type={} class={:#04x} VID={:#06x} PID={:#06x}",
-        d0 & 0xFF, (d0 >> 8) & 0xFF, dclass, ids & 0xFFFF, (ids >> 16) & 0xFFFF
-    ));
-
-    // Get Configuration Descriptor (64 bytes); walk it for the boot-HID
-    // interrupt-IN endpoint.
+fn read_config_and_bind(
+    ctx: &ServiceContext, dma: &Dma, mmio: &Mmio, dboff: usize, ir0: usize, ctx_size: usize,
+    slot: u32, dev_idx: usize, speed: u32, port: u32,
+    route: u32, root_port: u32, parent_slot: u32, parent_port: u32, ttt: u32,
+    ev_idx: &mut usize, ev_cycle: &mut u32, cmd_idx: &mut usize,
+) -> (Option<Hid>, u8) {
+    // Get Configuration Descriptor (64 bytes) at EP0 ring offset 48 - contiguous after the 3-TRB
+    // device-descriptor read at offset 0 - then walk it for the boot-HID interrupt-IN endpoint.
     let cfg_phys = dma.phys_at(CONFIG_BUF_OFF);
     let tr = ep0_tr_off(dev_idx) + 48;
     dma.write32(tr, 0x80 | (6 << 8) | (0x0200 << 16));
@@ -646,14 +512,10 @@ fn enumerate_one(
     }
     if !cfg_ok {
         ctx.log("xhci: Get Config Descriptor failed");
-        return None;
+        return (None, 0);
     }
-
-    // Walk the descriptors: config (bConfigurationValue), interface (HID protocol),
-    // endpoint (the interrupt-IN endpoint we'll poll for reports). A composite
-    // device may expose extra interfaces with their own interrupt-IN endpoints -
-    // bind the boot keyboard (class 3, proto 1) or mouse (proto 2) interface, not
-    // whichever endpoint happens to come last.
+    // Walk config -> interface -> endpoint; bind the boot keyboard (class 3, proto 1) or mouse
+    // (proto 2) interface's interrupt-IN endpoint, not whichever endpoint comes last.
     let total = ((dma.read32(CONFIG_BUF_OFF) >> 16) & 0xFFFF) as usize;
     let mut i = 0usize;
     let mut ep_addr = 0u8;
@@ -692,109 +554,8 @@ fn enumerate_one(
         i += blen;
     }
     if ep_addr == 0 {
-        // A USB hub (bDeviceClass 0x09) is not a HID, but it is not junk either: the Wyse 5070
-        // routes its BACK ports through internal Realtek hubs, so a keyboard behind one is only
-        // reachable by walking the hub (docs/usb-hub.md). Full downstream enumeration (route-string
-        // addressing + a larger DMA arena for the extra device slices) is staged; for now we IDENTIFY
-        // the hub loudly and read its downstream-port count, which also proves the hub class-request
-        // path (Set_Configuration + Get_Descriptor(Hub 0x29)) works over the shared control() helper.
-        if dclass == 0x09 {
-            // Set_Configuration, then Get_Descriptor(Hub, type 0x29) - 8 bytes is enough for nports.
-            // The EP0 ring must be CONTIGUOUS: the controller stops at the first unwritten TRB (cycle=0),
-            // so each transfer starts exactly where the previous ended. Config-descriptor read ended at
-            // offset 96; Set_Configuration (no-data: Setup+Status = 2 TRBs) ends at 128; the hub
-            // descriptor starts at 128. (Putting it at 144 left a dead TRB at 128 that halted the ring,
-            // so the read never ran and nports read back 0 - the "0 downstream ports" first-boot bug.)
-            let _ = control(
-                dma, mmio, dboff, ir0, slot, dev_idx, 96,
-                ev_idx, ev_cycle, 0x00, 9, cfg_val as u32, 0, 0, 0,
-            );
-            let hub_ok = control(
-                dma, mmio, dboff, ir0, slot, dev_idx, 128,
-                ev_idx, ev_cycle, 0xA0, 6, 0x29 << 8, 0, 8, DATA_BUF_OFF,
-            );
-            let nports = if hub_ok { dma.read8(DATA_BUF_OFF + 2) } else { 0 };
-            let whubchar = dma.read16(DATA_BUF_OFF + 3); // wHubCharacteristics
-            let ttt = ((whubchar >> 5) & 0x3) as u32;    // TT Think Time [6:5]
-            let mtt = dproto == 2;                        // bDeviceProtocol 2 = multi-TT hub
-            ctx.log_fmt(format_args!(
-                "xhci: USB hub on port {} (slot {}, {} downstream ports, mtt={}, ttt={})",
-                port, slot, nports, mtt, ttt
-            ));
-            // A SuperSpeed hub (the USB3 side of the Realtek hubs, 0x0411/0x0415) uses hub descriptor
-            // type 0x2A, so the 0x29 read above returns 0 ports - skip it (the low-speed keyboard is on
-            // the USB2 hub). Not walking a 0-port hub also avoids a failed Configure Endpoint and the
-            // enumeration cascade it caused.
-            if nports == 0 {
-                ctx.log("xhci: hub reports 0 ports (SuperSpeed hub? needs descriptor 0x2A) - not walking");
-                return None;
-            }
-            // Configure the device AS a hub so the controller routes downstream traffic through it.
-            configure_as_hub(
-                ctx, dma, mmio, dboff, ir0, ctx_size, slot, dev_idx, speed, 0, port, nports, mtt, ttt,
-                ev_idx, ev_cycle, cmd_idx,
-            );
-            // Increment 2b step 1: POWER the downstream ports and read each one's connection status.
-            // Proves the hub CONFIGURE (Hub bit) + hub class requests (Set_Feature PORT_POWER,
-            // Get_Status) work over the hub's EP0. Reset + route-string Address Device + binding are
-            // step 2/3 (docs/usb-hub.md). The EP0 cursor stays contiguous (the hub descriptor ended at
-            // ~176); bounded so a many-port hub cannot overrun the one-page ring.
-            let mut hoff = 176usize;
-            for dp in 1..=nports {
-                if hoff + 32 > 0xF00 { break; }
-                let _ = control(dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle,
-                    0x23, 3, 8, dp as u32, 0, 0); // Set_Feature(PORT_POWER = 8)
-                hoff += 32;
-            }
-            // Step 2: for each CONNECTED downstream port, reset it and Address Device it with a route
-            // string (this hub port, tier 1) + parent-TT, then read its device descriptor. Proves we
-            // reach the device behind the hub (the keyboard on port 4). Binding is step 3.
-            for dp in 1..=nports {
-                if hoff + 48 > 0xE00 { break; }
-                let ok = control(dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle,
-                    0xA3, 0, 0, dp as u32, 4, DATA_BUF_OFF); // Get_Status(port)
-                hoff += 48;
-                let st = if ok { dma.read16(DATA_BUF_OFF) } else { 0 };
-                if st & 1 == 0 {
-                    continue; // nothing connected on this downstream port
-                }
-                // Reset the port, hold, clear the reset-change, re-read status for the device speed.
-                let _ = control(dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle,
-                    0x23, 3, 4, dp as u32, 0, 0); // Set_Feature(PORT_RESET = 4)
-                hoff += 32;
-                let t0 = ctx.read_tsc();
-                while ctx.read_tsc().wrapping_sub(t0) < 100_000_000 {} // ~50-65 ms reset hold (bounded)
-                let _ = control(dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle,
-                    0x23, 1, 0x14, dp as u32, 0, 0); // Clear_Feature(C_PORT_RESET = 20)
-                hoff += 32;
-                let _ = control(dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle,
-                    0xA3, 0, 0, dp as u32, 4, DATA_BUF_OFF); // Get_Status again (post-reset, for speed)
-                hoff += 48;
-                let pst = dma.read16(DATA_BUF_OFF);
-                // Port-status speed bits: bit 9 = low-speed, bit 10 = high-speed; neither = full-speed.
-                // Map to the xHCI slot-context speed value (1=Full, 2=Low, 3=High).
-                let dspeed = if pst & (1 << 9) != 0 { 2 } else if pst & (1 << 10) != 0 { 3 } else { 1 };
-                // Probe slice MAX_HID (first non-bound-HID slice); route = this hub port (tier 1).
-                match address_downstream(
-                    ctx, dma, mmio, dboff, ir0, ctx_size, MAX_HID, dp as u32 & 0xF, port, dspeed, slot,
-                    dp as u32, ttt, ev_idx, ev_cycle, cmd_idx,
-                ) {
-                    Some((dslot, vid, pid, cls)) => ctx.log_fmt(format_args!(
-                        "xhci: hub port {} DEVICE: VID={:#06x} PID={:#06x} class={:#04x} speed={} - route-string addressing OK (slot {})",
-                        dp, vid, pid, cls, dspeed, dslot
-                    )),
-                    None => ctx.log_fmt(format_args!(
-                        "xhci: hub port {} connected but downstream Address Device FAILED (route/TT)", dp
-                    )),
-                }
-            }
-        } else {
-            ctx.log_fmt(format_args!(
-                "xhci: port {} device has no interrupt-IN endpoint (not a keyboard/mouse)",
-                port
-            ));
-        }
-        return None;
+        // No boot-HID interrupt-IN endpoint: a hub (caller walks it with cfg_val) or a non-HID device.
+        return (None, cfg_val);
     }
     let is_mouse = hid_proto == 2;
     let ep_num = (ep_addr & 0x0F) as u32;
@@ -805,14 +566,23 @@ fn enumerate_one(
         port, slot, dci, ep_mps, ep_interval, cfg_val
     ));
 
-    // Configure Endpoint (add the interrupt-IN endpoint).
+    // Configure Endpoint (add the interrupt-IN endpoint). The slot context is re-supplied with the
+    // updated Context Entries AND this device's route/speed/root-port/TT, so a downstream device keeps
+    // routing (a root-port device passes route=0 / parent_*=0, reducing to the plain form).
     let int_tr = dma.phys_at(int_tr_off(dev_idx));
+    let islot = INPUT_CTX_OFF + ctx_size;
     dma.write32(INPUT_CTX_OFF, 0); // Drop flags
     dma.write32(INPUT_CTX_OFF + 4, 1 | (1 << dci)); // Add: slot + interrupt endpoint
-    dma.write32(islot, (dci << 27) | (speed << 20)); // Context Entries = dci
-    dma.write32(islot + 4, port << 16);
+    dma.write32(islot, (dci << 27) | (speed << 20) | (route & 0xFFFFF)); // Context Entries=dci, speed, route
+    dma.write32(islot + 4, root_port << 16);
+    let tt = if speed == 1 || speed == 2 {
+        (parent_slot & 0xFF) | ((parent_port & 0xFF) << 8) | ((ttt & 0x3) << 16)
+    } else {
+        0
+    };
+    dma.write32(islot + 8, tt);
     let iep = INPUT_CTX_OFF + (1 + dci as usize) * ctx_size;
-    // xHCI Endpoint Context Interval encoding is speed-dependent (xHCI §6.2.3.6).
+    // xHCI Endpoint Context Interval encoding is speed-dependent (xHCI 6.2.3.6).
     let xhci_interval = match speed {
         1 | 2 => {
             let bi = if ep_interval == 0 { 1 } else { ep_interval as u32 };
@@ -840,7 +610,8 @@ fn enumerate_one(
     .unwrap_or(0);
     ctx.log_fmt(format_args!("xhci: Configure Endpoint completion={}", ce));
 
-    // Set Configuration, then Set Protocol (boot) on EP0.
+    // Set Configuration, then Set Protocol (boot) on EP0 (offsets 96, 128 - contiguous after the
+    // config-descriptor read that ended at 96).
     if control(
         dma, mmio, dboff, ir0, slot, dev_idx, 96,
         ev_idx, ev_cycle, 0x00, 9, cfg_val as u32, 0, 0, 0,
@@ -851,7 +622,7 @@ fn enumerate_one(
     }
     // SET_PROTOCOL: boot (wValue=0) on the HID interface. Best-effort (most keyboards default to boot
     // mode), but log the outcome - a keyboard that needs it and didn't get it is otherwise an
-    // undiagnosable dead keyboard (§26.7).
+    // undiagnosable dead keyboard.
     if control(
         dma, mmio, dboff, ir0, slot, dev_idx, 128,
         ev_idx, ev_cycle, 0x21, 0x0B, 0, kbd_iface as u32, 0, 0,
@@ -869,7 +640,334 @@ fn enumerate_one(
     dma.write32(link + 8, 0);
     dma.write32(link + 12, (TRB_LINK << 10) | (1 << 1) | 1);
 
-    Some(Hid { slot, dci, port, idx: dev_idx, is_mouse })
+    (Some(Hid { slot, dci, port, idx: dev_idx, is_mouse }), cfg_val)
+}
+
+/// Enumerate whatever is attached to root-hub `port`, binding every boot HID it finds - directly on
+/// the port, or behind a hub on the port - into `devs` (up to MAX_HID). A DMA slice is allocated per
+/// device from `sa`; a bound HID and an active (HID-bearing) hub keep their slice for the pass, while a
+/// transient probe - a non-HID device, or a hub with nothing usable behind it - frees its slice and
+/// Disable-Slots its controller slot so neither leaks. A hub is configured AS a hub and its downstream
+/// ports walked with route-string addressing + parent-TT, so a keyboard on a BACK port (behind the Wyse
+/// 5070's internal Realtek hub) is reached and bound (docs/usb-hub.md). Shares the command and event
+/// rings via the mutable bookkeeping refs.
+#[allow(clippy::too_many_arguments)]
+fn enumerate_one(
+    ctx: &ServiceContext,
+    dma: &Dma,
+    mmio: &Mmio,
+    dboff: usize,
+    ir0: usize,
+    op: usize,
+    ctx_size: usize,
+    port: u32,
+    sa: &mut SliceAlloc,
+    devs: &mut [Hid; MAX_HID],
+    ndev: &mut usize,
+    ev_idx: &mut usize,
+    ev_cycle: &mut u32,
+    cmd_idx: &mut usize,
+) {
+    let portsc_off = op + OP_PORTSC_BASE + (port as usize - 1) * 0x10;
+    let psc = mmio.read32(portsc_off);
+    if psc & PORT_CCS == 0 {
+        return; // nothing connected on this port
+    }
+    // A per-device DMA slice for this root-port device (freed below unless it's a kept HID or a hub
+    // with a HID behind it). Out of slices = stop cleanly (bounded arena, no heap - Commandment on
+    // bounded behaviour, CLAUDE.md 26.6).
+    let dev_idx = match sa.alloc() {
+        Some(i) => i,
+        None => {
+            ctx.log("xhci: out of DMA slices - cannot enumerate more devices");
+            return;
+        }
+    };
+    ctx.log_fmt(format_args!(
+        "xhci: enumerating port {} PORTSC={:#010x} into dev slice {}",
+        port, psc, dev_idx
+    ));
+
+    // Enable the port. USB3 (SuperSpeed) ports auto-train and are already enabled (PED=1); issuing the
+    // USB2 port-reset (PR) bit *disables* them. So only reset a not-yet-enabled (USB2) port.
+    if psc & PORT_PED == 0 {
+        mmio.write32(portsc_off, (psc & !PORT_RW1C) | PORT_PR);
+        spin(|| mmio.read32(portsc_off) & PORT_PED != 0);
+    }
+    let psc = mmio.read32(portsc_off);
+    let speed = (psc >> 10) & 0xF;
+    let max_packet = match speed {
+        2 => 8,   // low-speed
+        4 => 512, // super-speed
+        _ => 64,  // full / high-speed
+    };
+    ctx.log_fmt(format_args!(
+        "xhci: port {} ready; PORTSC={:#010x} speed={} max_packet={}",
+        port, psc, speed, max_packet
+    ));
+
+    // Enable Slot.
+    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+    *cmd_idx += 1;
+    let (comp, slot) = match run_command(
+        ctx, dma, mmio, dboff, ir0, cmd_off,
+        0, 0, 0, (TRB_ENABLE_SLOT << 10) | 1,
+        ev_idx, ev_cycle,
+    ) {
+        Some(r) => r,
+        None => {
+            ctx.log("xhci: Enable Slot - no completion");
+            sa.free(dev_idx);
+            return;
+        }
+    };
+    if comp != 1 {
+        ctx.log_fmt(format_args!("xhci: Enable Slot failed (completion={})", comp));
+        sa.free(dev_idx);
+        return;
+    }
+    ctx.log_fmt(format_args!("xhci: slot {} enabled", slot));
+
+    // Build the Input Context and Address Device (root port, no route string).
+    let islot = INPUT_CTX_OFF + ctx_size;
+    let iep0 = INPUT_CTX_OFF + 2 * ctx_size;
+    dma.write32(INPUT_CTX_OFF + 4, 0b11); // Add Context flags: slot + EP0
+    dma.write32(islot, (1 << 27) | (speed << 20));
+    dma.write32(islot + 4, port << 16);
+    let ep0_tr = dma.phys_at(ep0_tr_off(dev_idx));
+    dma.write32(iep0 + 4, (3 << 1) | (4 << 3) | (max_packet << 16));
+    dma.write32(iep0 + 8, (ep0_tr as u32 & !0xF) | 1);
+    dma.write32(iep0 + 12, (ep0_tr >> 32) as u32);
+    dma.write32(iep0 + 16, 8);
+    dma.write64(DCBAA_OFF + slot as usize * 8, dma.phys_at(device_ctx_off(dev_idx)));
+    let in_phys = dma.phys_at(INPUT_CTX_OFF);
+    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+    *cmd_idx += 1;
+    let (comp, _) = match run_command(
+        ctx, dma, mmio, dboff, ir0, cmd_off,
+        in_phys as u32, (in_phys >> 32) as u32, 0,
+        (TRB_ADDRESS_DEVICE << 10) | (slot << 24) | 1,
+        ev_idx, ev_cycle,
+    ) {
+        Some(r) => r,
+        None => {
+            ctx.log("xhci: Address Device - no completion");
+            sa.free(dev_idx);
+            disable_slot(ctx, dma, mmio, dboff, ir0, slot, ev_idx, ev_cycle, cmd_idx);
+            return;
+        }
+    };
+    if comp != 1 {
+        ctx.log_fmt(format_args!("xhci: Address Device failed (completion={})", comp));
+        sa.free(dev_idx);
+        disable_slot(ctx, dma, mmio, dboff, ir0, slot, ev_idx, ev_cycle, cmd_idx);
+        return;
+    }
+    ctx.log_fmt(format_args!(
+        "xhci: Address Device OK - device on port {} addressed (slot {})",
+        port, slot
+    ));
+
+    // Get Device Descriptor (18 bytes) over EP0 at ring offset 0 - for the device class (0x09 = hub).
+    let data_phys = dma.phys_at(DATA_BUF_OFF);
+    let tr0 = ep0_tr_off(dev_idx);
+    dma.write32(tr0, 0x80 | (6 << 8) | (0x0100 << 16));
+    dma.write32(tr0 + 4, 18 << 16);
+    dma.write32(tr0 + 8, 8);
+    dma.write32(tr0 + 12, 1 | (1 << 6) | (TRB_SETUP_STAGE << 10) | (3 << 16));
+    dma.write32(tr0 + 16, data_phys as u32);
+    dma.write32(tr0 + 20, (data_phys >> 32) as u32);
+    dma.write32(tr0 + 24, 18);
+    dma.write32(tr0 + 28, 1 | (TRB_DATA_STAGE << 10) | (1 << 16));
+    dma.write32(tr0 + 32, 0);
+    dma.write32(tr0 + 36, 0);
+    dma.write32(tr0 + 40, 0);
+    dma.write32(tr0 + 44, 1 | (1 << 5) | (TRB_STATUS_STAGE << 10));
+    mmio.write32(dboff + slot as usize * 4, 1);
+    let mut ok = false;
+    for _ in 0..8 {
+        match next_event(dma, mmio, ir0, ev_idx, ev_cycle, 10_000_000) {
+            Some((TRB_TRANSFER_EVENT, c, _)) => { ok = c == 1 || c == 13; break; }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    if !ok {
+        ctx.log("xhci: Get Device Descriptor failed");
+        sa.free(dev_idx);
+        disable_slot(ctx, dma, mmio, dboff, ir0, slot, ev_idx, ev_cycle, cmd_idx);
+        return;
+    }
+    let ids = dma.read32(DATA_BUF_OFF + 8);
+    let dclass = dma.read8(DATA_BUF_OFF + 4); // bDeviceClass: 0x09 = Hub
+    let dproto = dma.read8(DATA_BUF_OFF + 6); // bDeviceProtocol: on a hub, 2 = multi-TT
+    ctx.log_fmt(format_args!(
+        "xhci: DEVICE DESCRIPTOR class={:#04x} VID={:#06x} PID={:#06x}",
+        dclass, ids & 0xFFFF, (ids >> 16) & 0xFFFF
+    ));
+
+    // Read the config descriptor and bind if it's a boot HID (root device: route=0, parent_*=0).
+    let (bound, cfg_val) = read_config_and_bind(
+        ctx, dma, mmio, dboff, ir0, ctx_size, slot, dev_idx, speed, port,
+        0, port, 0, 0, 0, ev_idx, ev_cycle, cmd_idx,
+    );
+    if let Some(hid) = bound {
+        if *ndev < MAX_HID {
+            devs[*ndev] = hid;
+            *ndev += 1;
+        } else {
+            sa.free(dev_idx);
+            disable_slot(ctx, dma, mmio, dboff, ir0, slot, ev_idx, ev_cycle, cmd_idx);
+        }
+        return;
+    }
+    if dclass != 0x09 {
+        // Not a HID and not a hub (e.g. the mass-storage boot drive) - release the slice + slot.
+        ctx.log_fmt(format_args!(
+            "xhci: port {} device has no interrupt-IN endpoint (not a keyboard/mouse)",
+            port
+        ));
+        sa.free(dev_idx);
+        disable_slot(ctx, dma, mmio, dboff, ir0, slot, ev_idx, ev_cycle, cmd_idx);
+        return;
+    }
+
+    // --- It's a USB hub. Read the hub descriptor, configure the device AS a hub, then walk its
+    // downstream ports. Its slice is KEPT while we walk (downstream routing depends on the hub's
+    // device context staying put); it is released at the end only if nothing usable was found behind
+    // it. The Wyse 5070 routes its BACK ports through such a hub - this is how the back-port keyboard
+    // is reached (docs/usb-hub.md). The EP0 ring must stay CONTIGUOUS: each transfer starts where the
+    // previous ended. Config read ended at 96; Set_Configuration (no-data, 2 TRBs) ends at 128; the
+    // hub descriptor starts at 128.
+    let _ = control(
+        dma, mmio, dboff, ir0, slot, dev_idx, 96,
+        ev_idx, ev_cycle, 0x00, 9, cfg_val as u32, 0, 0, 0,
+    );
+    let hub_ok = control(
+        dma, mmio, dboff, ir0, slot, dev_idx, 128,
+        ev_idx, ev_cycle, 0xA0, 6, 0x29 << 8, 0, 8, DATA_BUF_OFF,
+    );
+    let nports = if hub_ok { dma.read8(DATA_BUF_OFF + 2) } else { 0 };
+    let whubchar = dma.read16(DATA_BUF_OFF + 3); // wHubCharacteristics
+    let ttt = ((whubchar >> 5) & 0x3) as u32;    // TT Think Time [6:5]
+    let mtt = dproto == 2;                        // bDeviceProtocol 2 = multi-TT hub
+    ctx.log_fmt(format_args!(
+        "xhci: USB hub on port {} (slot {}, {} downstream ports, mtt={}, ttt={})",
+        port, slot, nports, mtt, ttt
+    ));
+    // A SuperSpeed hub (the USB3 side of the Realtek hubs, 0x0411/0x0415) uses hub descriptor type
+    // 0x2A, so the 0x29 read returns 0 ports - skip it (the low-speed keyboard is on the USB2 hub).
+    if nports == 0 {
+        ctx.log("xhci: hub reports 0 ports (SuperSpeed hub? needs descriptor 0x2A) - not walking");
+        sa.free(dev_idx);
+        disable_slot(ctx, dma, mmio, dboff, ir0, slot, ev_idx, ev_cycle, cmd_idx);
+        return;
+    }
+    // Configure the device AS a hub so the controller routes downstream traffic through it.
+    configure_as_hub(
+        ctx, dma, mmio, dboff, ir0, ctx_size, slot, dev_idx, speed, 0, port, nports, mtt, ttt,
+        ev_idx, ev_cycle, cmd_idx,
+    );
+    // POWER every downstream port. The EP0 cursor stays contiguous (hub descriptor ended at ~176);
+    // bounded so a many-port hub cannot overrun the one-page ring.
+    let mut hoff = 176usize;
+    for dp in 1..=nports {
+        if hoff + 32 > 0xF00 { break; }
+        let _ = control(dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle,
+            0x23, 3, 8, dp as u32, 0, 0); // Set_Feature(PORT_POWER = 8)
+        hoff += 32;
+    }
+    // For each CONNECTED downstream port: reset it, read its speed, Address Device it with a route
+    // string (this hub port, tier 1) + parent-TT into its OWN slice, then read its config and bind it
+    // if it's a boot HID - exactly like a root-port device (read_config_and_bind). This is what makes
+    // the back-port keyboard work.
+    let ndev_before = *ndev;
+    for dp in 1..=nports {
+        if *ndev >= MAX_HID { break; }
+        if hoff + 48 > 0xD00 { break; }
+        let ok = control(dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle,
+            0xA3, 0, 0, dp as u32, 4, DATA_BUF_OFF); // Get_Status(port)
+        hoff += 48;
+        let st = if ok { dma.read16(DATA_BUF_OFF) } else { 0 };
+        if st & 1 == 0 {
+            continue; // nothing connected on this downstream port
+        }
+        // Reset the port, hold, clear the reset-change, re-read status for the device speed.
+        let _ = control(dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle,
+            0x23, 3, 4, dp as u32, 0, 0); // Set_Feature(PORT_RESET = 4)
+        hoff += 32;
+        let t0 = ctx.read_tsc();
+        while ctx.read_tsc().wrapping_sub(t0) < 100_000_000 {} // ~50-65 ms reset hold (bounded)
+        let _ = control(dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle,
+            0x23, 1, 0x14, dp as u32, 0, 0); // Clear_Feature(C_PORT_RESET = 20)
+        hoff += 32;
+        let _ = control(dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle,
+            0xA3, 0, 0, dp as u32, 4, DATA_BUF_OFF); // Get_Status again (post-reset, for speed)
+        hoff += 48;
+        let pst = dma.read16(DATA_BUF_OFF);
+        // Port-status speed bits: bit 9 = low-speed, bit 10 = high-speed; neither = full-speed.
+        // Map to the xHCI slot-context speed value (1=Full, 2=Low, 3=High).
+        let dspeed = if pst & (1 << 9) != 0 { 2 } else if pst & (1 << 10) != 0 { 3 } else { 1 };
+        // The downstream device gets its OWN slice.
+        let d_idx = match sa.alloc() {
+            Some(i) => i,
+            None => {
+                ctx.log("xhci: out of DMA slices for a downstream device - stopping hub walk");
+                break;
+            }
+        };
+        match address_downstream(
+            ctx, dma, mmio, dboff, ir0, ctx_size, d_idx, dp as u32 & 0xF, port, dspeed, slot,
+            dp as u32, ttt, ev_idx, ev_cycle, cmd_idx,
+        ) {
+            Some((dslot, vid, pid, cls)) => {
+                ctx.log_fmt(format_args!(
+                    "xhci: hub port {} DEVICE: VID={:#06x} PID={:#06x} class={:#04x} speed={} (slot {})",
+                    dp, vid, pid, cls, dspeed, dslot
+                ));
+                if cls == 0x09 {
+                    // A hub behind a hub (tier 2). Single-tier support for now - release it loudly.
+                    ctx.log("xhci: downstream device is a hub (tier 2) - not recursing");
+                    sa.free(d_idx);
+                    disable_slot(ctx, dma, mmio, dboff, ir0, dslot, ev_idx, ev_cycle, cmd_idx);
+                    continue;
+                }
+                // Bind it exactly like a root-port HID, but with the route string + parent-TT so its
+                // slot context keeps routing through the hub.
+                let (dbound, _) = read_config_and_bind(
+                    ctx, dma, mmio, dboff, ir0, ctx_size, dslot, d_idx, dspeed, port,
+                    dp as u32 & 0xF, port, slot, dp as u32, ttt, ev_idx, ev_cycle, cmd_idx,
+                );
+                match dbound {
+                    Some(hid) => {
+                        ctx.log_fmt(format_args!(
+                            "xhci: hub port {} HID bound (slot {}) - back-port device now live", dp, dslot
+                        ));
+                        devs[*ndev] = hid; // room checked at loop top
+                        *ndev += 1;
+                    }
+                    None => {
+                        // Connected but not a boot HID (or bind failed) - release its slice + slot.
+                        sa.free(d_idx);
+                        disable_slot(ctx, dma, mmio, dboff, ir0, dslot, ev_idx, ev_cycle, cmd_idx);
+                    }
+                }
+            }
+            None => {
+                ctx.log_fmt(format_args!(
+                    "xhci: hub port {} connected but downstream Address Device FAILED (route/TT)", dp
+                ));
+                sa.free(d_idx);
+            }
+        }
+    }
+    // If nothing usable was found behind this hub, it does not need to stay configured - free its
+    // slice + slot so a later hub/device can use them (bounded slice pool).
+    if *ndev == ndev_before {
+        ctx.log_fmt(format_args!("xhci: hub on port {} had no bound HID behind it - releasing", port));
+        sa.free(dev_idx);
+        disable_slot(ctx, dma, mmio, dboff, ir0, slot, ev_idx, ev_cycle, cmd_idx);
+    }
 }
 
 #[no_mangle]
@@ -990,20 +1088,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         }
 
         // Enumerate EVERY connected port, binding up to MAX_HID boot HID devices
-        // (keyboard + mouse) into successive per-device DMA slices. Non-HID devices
-        // (the mass-storage boot drive) return None and are skipped, so the HID
-        // devices are found wherever they sit.
+        // (keyboard + mouse) into per-device DMA slices from a fresh allocator. Each
+        // port's device is bound directly, or - if it is a hub - its downstream ports
+        // are walked and any keyboard/mouse behind it bound (the Wyse back-port path).
+        // Non-HID devices (the mass-storage boot drive) and empty hubs release their
+        // slice + slot, so nothing leaks across this pass.
         let mut devs = [Hid { slot: 0, dci: 0, port: 0, idx: 0, is_mouse: false }; MAX_HID];
         let mut ndev = 0usize;
+        let mut sa = SliceAlloc::new();
         for p in 1..=max_ports {
             if ndev >= MAX_HID { break; }
-            if let Some(hid) = enumerate_one(
+            enumerate_one(
                 &ctx, &dma, &mmio, dboff, ir0, op, ctx_size,
-                p, ndev, &mut ev_idx, &mut ev_cycle, &mut cmd_idx,
-            ) {
-                devs[ndev] = hid;
-                ndev += 1;
-            }
+                p, &mut sa, &mut devs, &mut ndev, &mut ev_idx, &mut ev_cycle, &mut cmd_idx,
+            );
         }
 
         if ndev == 0 {

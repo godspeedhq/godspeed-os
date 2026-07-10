@@ -146,6 +146,22 @@ it and reads the hub descriptor (`Get_Descriptor(Hub 0x29)`) to log the downstre
 proves the hub class-request path works over the shared `control()` helper and stages the walk; downstream
 enumeration is the next increment (needs 5.5 item 1).
 
+### 5.7 Increment 2b step 3 (landed, HW-pending): bind the downstream device
+
+The full walk is now wired. `enumerate_one` no longer takes a fixed `dev_idx` and returns a single
+`Option<Hid>`; it takes a `&mut SliceAlloc` + the `devs`/`ndev` output and **appends every HID it finds**,
+directly on the port or behind a hub. The bind path (read config descriptor, find the boot-HID
+interrupt-IN endpoint, Configure Endpoint, Set Configuration, Set Protocol(boot), arm the interrupt ring)
+was extracted into a shared `read_config_and_bind(...)` that both the root-port device and each downstream
+device call - the downstream device passing its **route string + parent-TT** so Configure Endpoint
+re-supplies a slot context that keeps routing through the hub (the earlier bug: Configure Endpoint wrote a
+slot context with only speed + root-port, dropping route/TT). Slice discipline (5.3): each device allocates
+a slice from the pool; a bound HID and a hub-with-a-HID-behind-it keep theirs, while a non-HID probe and an
+**empty hub** free their slice and `Disable_Slot` their controller slot - so the fixed `MAX_SLICES` pool
+never leaks and the step-2 completion=4 cascade (two hubs reusing slice 0) is gone. A tier-2 hub (hub behind
+a hub) is logged and skipped for now (single-tier support). Compiles; awaits the Wyse back-port keyboard
+test.
+
 ### 5.4 Hot-plug
 
 The xHCI main loop already re-initialises the controller and re-scans every port on every pass. A
