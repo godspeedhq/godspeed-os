@@ -477,6 +477,47 @@ impl<'a> Ahci<'a> {
     }
 }
 
+/// Wait (bounded) for a port's SATA PHY to establish communication (`PxSSTS.DET == 3`), COMRESET-ing
+/// the port to re-run the OOB sequence if it has not. Returns `true` iff a device established.
+///
+/// **Why this exists.** The disk-detection loop in `run` used to read `PxSSTS.DET` exactly once, with
+/// no reset and no wait, and idle forever on `DET != 3`. But the SATA PHY does not always have
+/// communication established at the instant block-driver first probes - a warm reboot (no power cycle
+/// to re-run OOB), or a `chaos max-carnage` soak that re-inits the HBA through rapid block-driver
+/// respawns, both leave the link mid-establishment. A one-shot read then mis-declared "no SATA disk
+/// found" on a disk that was physically present, `fs` never mounted, and every fs-dependent command
+/// hung. This gives the link a bounded window to come up on its own, and if it still has not, forces a
+/// COMRESET (pulse `PxSCTL.DET` 1 -> hold -> 0, the same OOB kick a cold boot does) and waits again.
+///
+/// This is bounded hardware-truth waiting (the `port_comreset` idiom, §26.6): every spin proceeds
+/// after its bound, so a genuinely empty port still returns `false` **loudly** rather than wedging
+/// boot. It touches only `PxSCTL`/`PxSSTS`/`PxSERR` (detection state) - the command engine and CLB/FB
+/// are left to `init_port`, which runs a full `port_comreset` on the chosen port afterwards.
+fn wait_port_ready(ctx: &ServiceContext, hba: &Mmio, base: usize) -> bool {
+    // 1. Fast path + slow-establish: a healthy, already-up link returns on the first read (zero added
+    //    latency); a slow one gets a bounded window (read-count poll, the port_comreset DET idiom).
+    for _ in 0..2_000_000u32 {
+        if hba.read32(base + PX_SSTS) & 0xF == 3 {
+            return true;
+        }
+    }
+    // 2. Still not up - force a COMRESET to re-run OOB: assert PxSCTL.DET = 1, hold >= 1 ms, de-assert.
+    let sctl = hba.read32(base + PX_SCTL);
+    hba.write32(base + PX_SCTL, (sctl & !0xF) | 0x1);
+    let start = ctx.read_tsc();
+    while ctx.read_tsc().wrapping_sub(start) < COMRESET_HOLD_CYCLES {}
+    let sctl = hba.read32(base + PX_SCTL);
+    hba.write32(base + PX_SCTL, sctl & !0xF);
+    // 3. Wait (bounded) for the PHY to (re)establish, then clear the error bits the reset latched.
+    for _ in 0..2_000_000u32 {
+        if hba.read32(base + PX_SSTS) & 0xF == 3 {
+            hba.write32(base + PX_SERR, 0xFFFF_FFFF); // W1C - init_port's COMRESET clears again
+            return true;
+        }
+    }
+    false
+}
+
 /// Steps A+B: detect the HBA + disk, init the port, IDENTIFY. Idles afterwards.
 pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
     let cap = hba.read32(HBA_CAP);
@@ -498,15 +539,19 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
             continue;
         }
         let base = PORT_BASE + (p as usize) * PORT_STRIDE;
-        if hba.read32(base + PX_SSTS) & 0xF == 3 {
-            let sig = hba.read32(base + PX_SIG);
-            ctx.log_fmt(format_args!(
-                "block-driver: AHCI port {}: device present (DET=3) sig={:#010x}{}",
-                p, sig, if sig == SIG_SATA { " - SATA disk" } else { "" }
-            ));
-            if sig == SIG_SATA && disk_port.is_none() {
-                disk_port = Some(p);
-            }
+        // Wait (bounded) for the SATA PHY to establish, COMRESET-ing the port if a bare read finds it
+        // not up yet. A one-shot PxSSTS.DET read misses a slow-to-establish link (warm reboot, or a
+        // chaos soak that re-inits the HBA repeatedly) and mis-declared "no disk" -> idle forever.
+        if !wait_port_ready(ctx, hba, base) {
+            continue;
+        }
+        let sig = hba.read32(base + PX_SIG);
+        ctx.log_fmt(format_args!(
+            "block-driver: AHCI port {}: device present (DET=3) sig={:#010x}{}",
+            p, sig, if sig == SIG_SATA { " - SATA disk" } else { "" }
+        ));
+        if sig == SIG_SATA && disk_port.is_none() {
+            disk_port = Some(p);
         }
     }
 
