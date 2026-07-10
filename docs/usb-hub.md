@@ -118,6 +118,34 @@ When `classify` returns `Hub`:
   the driver's existing **per-pass full controller re-init** frees everything each hot-plug pass, so any
   leak is bounded to one pass.
 
+### 5.5 Constraints found while mapping the driver (refine 5.1-5.3)
+
+Three facts the initial plan glossed, discovered reading `services/xhci/src/main.rs`:
+
+1. **Only two device slices exist today.** The DMA arena lays out device slices as
+   `DEV_BASE (0x7000) + i*DEV_STRIDE (0x4000)` up to the scratchpad at `0x10000` - that is exactly
+   `MAX_HID = 2` slices. A hub walk needs the hub's slice **plus** each downstream device's slice at the
+   same time (hub + up to MAX_HID bound HIDs + one transient = ~4). So the full walk requires **growing
+   the xhci DMA arena** (a spawn-time page count) and a small **slice allocator** (fixed pool, §26.6),
+   not just reusing the two.
+2. **EP0 ring uses fixed linear offsets, no wrap.** Control transfers are placed at hand-picked EP0-ring
+   offsets (0, 48, 96, 128) and the ring never wraps. A hub's per-port power/reset/status transfers add
+   up, but a normal 4-8 port hub still fits under the 256-TRB (one-page) ring, so the walk uses a
+   **bounded linear cursor** (advance per transfer, log-and-skip if a hub is absurdly large) rather than
+   full ring-wrap + cycle-bit machinery.
+3. **`enumerate_one` returns one `Hid`, a hub yields several.** The main loop calls `enumerate_one` per
+   root port and appends its single result. The hub walk instead **appends multiple** bound HIDs into
+   the loop's `devs[]`/`ndev`, so the shared enumerate path takes the device list by mutable ref rather
+   than returning one device.
+
+### 5.6 Increment 1 (landed): identify the hub
+
+Before the arena/slice work, the driver now **identifies** a hub rather than dismissing it: it captures
+`bDeviceClass`, and when a device has no interrupt-IN endpoint but is class `0x09`, it `Set_Configuration`s
+it and reads the hub descriptor (`Get_Descriptor(Hub 0x29)`) to log the downstream-port count. This
+proves the hub class-request path works over the shared `control()` helper and stages the walk; downstream
+enumeration is the next increment (needs 5.5 item 1).
+
 ### 5.4 Hot-plug
 
 The xHCI main loop already re-initialises the controller and re-scans every port on every pass. A

@@ -452,9 +452,10 @@ fn enumerate_one(
     }
     let d0 = dma.read32(DATA_BUF_OFF);
     let ids = dma.read32(DATA_BUF_OFF + 8);
+    let dclass = dma.read8(DATA_BUF_OFF + 4); // bDeviceClass: 0x09 = Hub
     ctx.log_fmt(format_args!(
-        "xhci: DEVICE DESCRIPTOR bLength={} type={} VID={:#06x} PID={:#06x}",
-        d0 & 0xFF, (d0 >> 8) & 0xFF, ids & 0xFFFF, (ids >> 16) & 0xFFFF
+        "xhci: DEVICE DESCRIPTOR bLength={} type={} class={:#04x} VID={:#06x} PID={:#06x}",
+        d0 & 0xFF, (d0 >> 8) & 0xFF, dclass, ids & 0xFFFF, (ids >> 16) & 0xFFFF
     ));
 
     // Get Configuration Descriptor (64 bytes); walk it for the boot-HID
@@ -530,10 +531,33 @@ fn enumerate_one(
         i += blen;
     }
     if ep_addr == 0 {
-        ctx.log_fmt(format_args!(
-            "xhci: port {} device has no interrupt-IN endpoint (not a keyboard/mouse)",
-            port
-        ));
+        // A USB hub (bDeviceClass 0x09) is not a HID, but it is not junk either: the Wyse 5070
+        // routes its BACK ports through internal Realtek hubs, so a keyboard behind one is only
+        // reachable by walking the hub (docs/usb-hub.md). Full downstream enumeration (route-string
+        // addressing + a larger DMA arena for the extra device slices) is staged; for now we IDENTIFY
+        // the hub loudly and read its downstream-port count, which also proves the hub class-request
+        // path (Set_Configuration + Get_Descriptor(Hub 0x29)) works over the shared control() helper.
+        if dclass == 0x09 {
+            // Set_Configuration, then Get_Descriptor(Hub, type 0x29) - 8 bytes is enough for nports.
+            let _ = control(
+                dma, mmio, dboff, ir0, slot, dev_idx, 96,
+                ev_idx, ev_cycle, 0x00, 9, cfg_val as u32, 0, 0, 0,
+            );
+            let hub_ok = control(
+                dma, mmio, dboff, ir0, slot, dev_idx, 144,
+                ev_idx, ev_cycle, 0xA0, 6, 0x29 << 8, 0, 8, DATA_BUF_OFF,
+            );
+            let nports = if hub_ok { dma.read8(DATA_BUF_OFF + 2) } else { 0 };
+            ctx.log_fmt(format_args!(
+                "xhci: USB hub on port {} (slot {}, {} downstream ports) - downstream enumeration not yet implemented (docs/usb-hub.md)",
+                port, slot, nports
+            ));
+        } else {
+            ctx.log_fmt(format_args!(
+                "xhci: port {} device has no interrupt-IN endpoint (not a keyboard/mouse)",
+                port
+            ));
+        }
         return None;
     }
     let is_mouse = hid_proto == 2;
