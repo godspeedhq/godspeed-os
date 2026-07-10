@@ -1231,6 +1231,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // Nothing usable attached. Still report input-ready once so the shell's
             // boot-screen clear fires (the keyboard may be on the other controller).
             if !signaled { ctx.signal_input_ready(); signaled = true; }
+            // Nothing is bound, so forget the previous pass's bound ports: whatever binds next is a
+            // genuine new plug and must announce. Without this, a device BEHIND a hub keeps the hub's
+            // (unchanging) root-port bit in prev_ports across its own unplug, so a replug re-binding on
+            // that same root port looked "already present" and the "keyboard connected" notice was
+            // suppressed (the root-port key can't tell one back-port device from another).
+            prev_ports = 0;
             if saw_hub {
                 // A hub is present but empty. A device (re)plugged BEHIND a hub changes no root PORTSC,
                 // so a root-port wait would never see it - re-walk the hub after a bounded pause so a
