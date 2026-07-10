@@ -1277,7 +1277,7 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     // boot/RTC reads (10, 11). Every other query discloses another task's or
     // system-wide state and requires the INTROSPECT capability with READ (§3.1;
     // docs/introspection-capability.md).
-    if !matches!(query_id, 0 | 3 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17)
+    if !matches!(query_id, 0 | 3 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18)
         && !scheduler::current_task_holds_resource(
             crate::capability::INTROSPECT_RESOURCE, Rights::READ)
     {
@@ -1321,6 +1321,22 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // (request_with_reply_deadline) and pacing, where a raw RTC glitch (the "4383d" misread) would
         // expire a deadline instantly. Ungated task-neutral timing, like the raw RTC (query 11).
         17 => crate::arch::x86_64::rtc::now_epoch_monotonic(),
+        // Hardware-driver presence from the PCI scan, packed: bit0 = xHCI, bit1 = EHCI, bit2 = a NIC
+        // this build can actually drive (found AND an e1000 or RTL8168). Ungated task-neutral hardware
+        // fact (like the NIC identity, query 14). The supervisor reads it to skip spawning a driver
+        // whose hardware is absent (e.g. the Wyse 5070 has no EHCI; a diskless/NIC-less box), so an idle
+        // driver does not busy-hold a whole core.
+        18 => {
+            use core::sync::atomic::Ordering::Relaxed;
+            use crate::arch::x86_64::pci;
+            let x = pci::XHCI_FOUND.load(Relaxed) as i64;
+            let e = pci::EHCI_FOUND.load(Relaxed) as i64;
+            // Only a NIC nic-driver can actually drive counts - an unsupported NIC leaves it idling
+            // exactly like an absent one (matches the MMIO-grant gate).
+            let nic = (pci::NIC_FOUND.load(Relaxed)
+                && matches!(pci::NIC_VENDOR_DEVICE.load(Relaxed), 0x100E_8086 | 0x8168_10EC)) as i64;
+            x | (e << 1) | (nic << 2)
+        }
         4 => crate::memory::allocator::free_frame_count() as i64,
         5 => crate::memory::allocator::total_frame_count() as i64,
         6 => scheduler::core_active_ticks(arg1 as usize) as i64,

@@ -220,7 +220,11 @@ fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap) -> u32 {
     let alive = managed_alive(ctx);
     let mut n = 0;
     for i in 0..MANAGED_N {
-        if alive[i] { continue; }
+        // Skip a service this build never spawned (absent from the map) - e.g. a driver whose hardware
+        // the PCI scan did not find (ehci/nic-driver/net-stack, below). Without this, reconcile would
+        // "resurrect" a deliberately-skipped driver on the first death notification, undoing the skip.
+        // Mirrors converge's `map.get(...).is_none()` guard.
+        if alive[i] || map.get(MANAGED[i]).is_none() { continue; }
         if respawn_managed(ctx, map, MANAGED[i]) {
             n += 1;
             ctx.log_fmt(format_args!("supervisor: reconcile respawned {} (missed death notification)", MANAGED[i]));
@@ -432,8 +436,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         ensure_wired(&ctx, &mut name_map, "resource-server", &["holder"]);
     }
 
-    // xhci: USB host-controller driver (§12). Spawned in bare-metal + full
-    // builds; the kernel maps its controller's MMIO BAR at spawn (Stage 2).
+    // xhci: USB host-controller driver (§12). Spawned in bare-metal + full builds; the kernel maps its
+    // controller's MMIO BAR at spawn (Stage 2). ALWAYS spawned (unlike ehci/nic-driver below): xhci is
+    // the near-universal primary USB controller, and even with no controller its idle path signals
+    // input-ready - the boot-screen clear that lets the shell show `gsh>`. Skipping it would leave the
+    // serial shell waiting for a prompt forever, so the idle-core cost on a (rare) xHCI-less machine is
+    // the right trade.
     #[cfg(not(any(feature = "identity-only", feature = "perf-only",
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
@@ -441,17 +449,28 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     spawn_mapped(&ctx, &mut name_map, "xhci", 0xFFFF);
 
     // ehci: USB 2.0 host-controller driver (§12) for the back ports. Same builds
-    // as xhci; the kernel grants its MMIO/DMA at spawn (E1b+).
+    // as xhci; the kernel grants its MMIO/DMA at spawn (E1b+). Skipped if the PCI
+    // scan found no EHCI controller (e.g. the Wyse 5070 has none), freeing the core
+    // an idle ehci would busy-hold.
     #[cfg(not(any(feature = "identity-only", feature = "perf-only",
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
-    spawn_mapped(&ctx, &mut name_map, "ehci", 0xFFFF);
+    if ctx.ehci_present() {
+        spawn_mapped(&ctx, &mut name_map, "ehci", 0xFFFF);
+    } else {
+        ctx.log("supervisor: no EHCI controller (PCI scan) - not starting ehci (frees a core)");
+    }
 
     // nic-driver: the userspace NIC driver (§12, docs/networking.md, Phase 1). Same builds as the
     // USB drivers; the kernel maps the Intel e1000's BAR0 by name at spawn. On a non-e1000 NIC
     // (the T630's Realtek) it gets no mapping and idles. Restart-on-death wiring (the MANAGED set)
     // lands with the DMA/IRQ phase, when it holds device state worth recovering.
+    //
+    // ALWAYS spawned (unlike ehci above): a NIC exists on nearly all hardware, so a presence-gated skip
+    // (`ctx.nic_present()`, query 18 bit2) was parked as low-value. The SDK accessor stays for an easy
+    // resume. On a NIC-less / unsupported-NIC box nic-driver + net-stack come up and idle gracefully
+    // (nic-driver serves empty replies; net-stack degrades, no hang).
     #[cfg(not(any(feature = "identity-only", feature = "perf-only",
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",

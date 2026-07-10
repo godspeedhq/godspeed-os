@@ -777,6 +777,39 @@ impl ServiceContext {
         if ret < 0 { 0 } else { ret as u32 }
     }
 
+    /// Whether the PCI scan found an xHCI USB host controller (InspectKernel query 18, ungated
+    /// task-neutral hardware fact). The supervisor reads it to skip spawning the `xhci` driver on a
+    /// machine that has no xHCI controller (an idle driver would busy-hold a core). Falls back to
+    /// `true` if the query is unavailable, preserving the always-spawn behaviour.
+    pub fn xhci_present(&self) -> bool {
+        // SAFETY: syscall(13) = InspectKernel; query_id=18 = USB controller presence bitmask.
+        let ret = unsafe { raw_syscall(13, 18, 0, 0) };
+        if ret < 0 { return true; } // query unavailable - spawn as before
+        (ret & 0b01) != 0
+    }
+
+    /// Whether the PCI scan found an EHCI (USB 2.0) host controller (InspectKernel query 18, ungated).
+    /// The supervisor reads it to skip spawning the `ehci` driver on a machine with no EHCI at all
+    /// (e.g. the Wyse 5070), so an idle driver does not busy-hold a core. Falls back to `true` if the
+    /// query is unavailable, preserving the always-spawn behaviour.
+    pub fn ehci_present(&self) -> bool {
+        // SAFETY: syscall(13) = InspectKernel; query_id=18 = USB controller presence bitmask.
+        let ret = unsafe { raw_syscall(13, 18, 0, 0) };
+        if ret < 0 { return true; } // query unavailable - spawn as before
+        (ret & 0b10) != 0
+    }
+
+    /// Whether the PCI scan found a NIC this build can actually drive (present AND an e1000 or RTL8168),
+    /// via InspectKernel query 18 (ungated). The supervisor reads it to skip spawning `nic-driver` (and
+    /// its dependent `net-stack`) on a machine with no usable NIC, so they do not busy-hold cores.
+    /// Falls back to `true` if the query is unavailable, preserving the always-spawn behaviour.
+    pub fn nic_present(&self) -> bool {
+        // SAFETY: syscall(13) = InspectKernel; query_id=18 = hardware-driver presence bitmask.
+        let ret = unsafe { raw_syscall(13, 18, 0, 0) };
+        if ret < 0 { return true; } // query unavailable - spawn as before
+        (ret & 0b100) != 0
+    }
+
     /// The NIC's register-space MMIO base (the BAR the PCI scan chose), 0 if none. InspectKernel query
     /// 15, ungated. A diagnostic - a driver reads it to confirm which BAR it was handed.
     pub fn nic_mmio_base(&self) -> u64 {
