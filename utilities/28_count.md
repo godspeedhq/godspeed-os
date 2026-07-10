@@ -62,3 +62,8 @@ buffer. The pipe form consumes the previous stage's buffer (`write_count` in
 
 Conforms to `0_conventions.md`: its own `count help` (usage with a real example per row) and
 `count version` (number + creator credit), via the shared `help_block` helper.
+
+Also conforms to **rule 10** (`0_conventions.md` §1.10): when reading a file, the `fs` request is
+**q-abortable** via `fs_request_q` - a wait past ~2s prints `(q to quit)` and `q`/`Q`/ESC returns to
+the prompt (a fast reply prints nothing). This replaced a bare `request_with_reply`, which rule 10
+forbids for an interactive command.

@@ -51,7 +51,10 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     that can wedge the shell with no way out is forbidden (§26.7: loud + escapable over silent +
     stuck). The primitive is `ServiceContext::request_with_reply_abortable` (send once, poll `q`
     while waiting); never block an interactive command on a bare `request_with_reply` to a peer
-    that can be slow.
+    that can be slow. The **fs-backed** interactive commands (`ls`/`cd`/`read`/`find`/`tree` and the
+    file-reading filters `match`/`count`/`sort`) use the delayed-hint variant `fs_request_q` (SDK
+    `request_with_reply_qhint`): silent on a fast reply, it advertises `(q to quit)` only once the wait
+    lingers past ~2s - the just-in-time form of the advertisement above, so a snappy op stays quiet.
 11. **Quitting stops the TASK, not just the shell.** When a utility is escaped (rule 10), the
     escape must abort the actual WORK the utility set in motion - not merely stop the shell from
     *waiting* on it. If the utility handed a long job to a peer service and the escape only stops
