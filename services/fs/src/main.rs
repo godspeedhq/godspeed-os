@@ -161,6 +161,8 @@ const FS_OK: u8 = 0;
 const FS_ERR: u8 = 1;
 const FS_NOTFOUND: u8 = 2;
 const FS_NOFS: u8 = 3;
+const FS_UNAVAIL: u8 = 4;   // present-but-unreadable storage: do NOT flash (data may be intact),
+                            // distinct from FS_NOFS (a blank/raw disk that SHOULD be flashed to format)
 const FS_DENIED: u8 = 4;     // op requires a right the file cap lacks (non-escalation, §7.3)
 
 // File-cap operations - the FIRST payload byte of a badged `ResourceInvoke` (§7.10). The kernel
@@ -310,6 +312,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // retries, so the failure is authoritative - we serve raw, honestly, and NEVER invite a reformat
     // (§3.12, the data is intact). A genuine bad-magic / blank superblock is a legitimately raw
     // (never-formatted) disk and serves raw at once - no spin.
+    // Distinguish the two degraded states so the shell can advise correctly: a present-but-unreadable
+    // disk (I/O error - data may be intact, do NOT flash) vs a blank/raw disk (flash to format). Set on
+    // the I/O-failure break paths below; left false for a genuinely blank disk (the FS_NOFS case).
+    let mut storage_unreadable = false;
     let mut fs: Option<Fs> = {
         let mut mounted: Option<Fs> = None;
         let mut io_attempts = 0u32;
@@ -333,6 +339,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         None => {
                             io_attempts += 1;
                             if io_attempts >= MOUNT_MAX_ATTEMPTS {
+                                storage_unreadable = true;
                                 ctx.log("fs: storage unreadable after bounded mount attempts - serving storage-unavailable (data intact; do NOT run 'drives flash', awaiting block-driver recovery)");
                                 break;
                             }
@@ -342,6 +349,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // authoritative. Serve raw, honestly - never invite a data-destroying flash.
                         Some(cap) => {
                             capacity = cap;
+                            storage_unreadable = true;
                             ctx.log("fs: storage unreadable (I/O error) - not serving a filesystem; do NOT run 'drives flash' (data is intact, awaiting storage recovery)");
                             break;
                         }
@@ -398,8 +406,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             None => continue,
         };
         match badge {
-            Some((rid, right)) => serve_filecap(&ctx, &mut fs, rid, right, msg.payload_bytes(), reply),
-            None => serve(&ctx, &mut fs, capacity, msg.payload_bytes(), reply),
+            Some((rid, right)) => serve_filecap(&ctx, &mut fs, rid, right, storage_unreadable, msg.payload_bytes(), reply),
+            None => serve(&ctx, &mut fs, capacity, storage_unreadable, msg.payload_bytes(), reply),
         }
         ctx.remove_cap(reply);
     }
@@ -678,8 +686,11 @@ fn data_journal_test(ctx: &ServiceContext, fs: &mut Fs) {
 }
 
 /// Dispatch one request and reply through the client's `reply` cap.
-fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], reply: CapHandle) {
+fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: bool, p: &[u8], reply: CapHandle) {
     let send = |bytes: &[u8]| { let _ = ctx.send_by_handle(reply, &Message::from_bytes(bytes)); };
+    // When degraded (no mounted volume), which "no filesystem" code to return: FS_UNAVAIL if the disk
+    // is present but unreadable (do NOT flash - data may be intact), else FS_NOFS (blank - flash to format).
+    let nofs: u8 = if unreadable { FS_UNAVAIL } else { FS_NOFS };
     if p.is_empty() {
         send(&[FS_ERR]);
         return;
@@ -730,7 +741,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
                     let r = f.relabel(ctx, label);
                     send(&[match f.end_txn(ctx, r) { Ok(()) => FS_OK, Err(_) => FS_ERR }]);
                 }
-                None => send(&[FS_NOFS]),
+                None => send(&[nofs]),
             }
             return;
         }
@@ -765,7 +776,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
                     }
                     Err(_) => send(&[FS_ERR]),
                 },
-                None => send(&[FS_NOFS]),
+                None => send(&[nofs]),
             }
             return;
         }
@@ -786,7 +797,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
                     }
                     Err(_) => send(&[FS_ERR]),
                 },
-                None => send(&[FS_NOFS]),
+                None => send(&[nofs]),
             }
             return;
         }
@@ -797,7 +808,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
     if p.len() < 2 { send(&[FS_ERR]); return; }
     let fs = match vol {
         Some(f) => f,
-        None => { send(&[FS_NOFS]); return; }
+        None => { send(&[nofs]); return; }
     };
     let op = p[0];
     // Read-only mount (unknown ro_compat feature, §6.15): refuse every mutating op LOUDLY rather
@@ -916,9 +927,10 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
 /// after the cap check), so reaching here means the caller holds a real, live cap. We resolve the
 /// resource id → the open file's path, enforce that the operation needs **≤ the validated right**
 /// (the load-bearing non-escalation check, §7.3 - a READ cap can never write), and act.
-fn serve_filecap(ctx: &ServiceContext, vol: &mut Option<Fs>, rid: u64, right: u8, p: &[u8], reply: CapHandle) {
+fn serve_filecap(ctx: &ServiceContext, vol: &mut Option<Fs>, rid: u64, right: u8, unreadable: bool, p: &[u8], reply: CapHandle) {
     let send = |bytes: &[u8]| { let _ = ctx.send_by_handle(reply, &Message::from_bytes(bytes)); };
-    let fs = match vol { Some(f) => f, None => { send(&[FS_NOFS]); return; } };
+    let nofs: u8 = if unreadable { FS_UNAVAIL } else { FS_NOFS };
+    let fs = match vol { Some(f) => f, None => { send(&[nofs]); return; } };
     if p.is_empty() { send(&[FS_ERR]); return; }
     let fop = p[0];
 

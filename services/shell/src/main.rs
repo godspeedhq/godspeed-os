@@ -38,6 +38,7 @@ const IO_CHUNK: usize = 7 * 508; // 3556
 const FS_OK: u8 = 0;
 const FS_NOTFOUND: u8 = 2;
 const FS_NOFS: u8 = 3;
+const FS_UNAVAIL: u8 = 4;   // present-but-unreadable storage: do NOT flash (data may be intact)
 const FS_DENIED: u8 = 4; // file-cap op needs a right the cap lacks (non-escalation, §7.3)
 // File-as-capability (§7.10, P2): Open mints a file cap; the holder invokes it (FOP_*).
 const OP_OPEN: u8 = 30;  // [op, plen, path, rights:u8] → [FS_OK] + embedded FILE CAP
@@ -7331,11 +7332,18 @@ fn fs_write_at(ctx: &ServiceContext, path: &[u8], offset: u64, chunk: &[u8]) -> 
 
 /// True if `fs` replied "no filesystem" - print the standard hint and consume it.
 fn no_fs(ctx: &ServiceContext, p: &[u8]) -> bool {
-    if p.first() == Some(&FS_NOFS) {
-        ctx.console_writeln("no filesystem - run 'drives flash' first");
-        true
-    } else {
-        false
+    match p.first() {
+        Some(&FS_NOFS) => {
+            ctx.console_writeln("no filesystem - run 'drives flash' first");
+            true
+        }
+        Some(&FS_UNAVAIL) => {
+            // Present-but-unreadable disk: the data may still be intact, so flashing would DESTROY it.
+            // Deliberately does NOT advise 'drives flash' (the whole point of the FS_UNAVAIL distinction).
+            ctx.console_writeln("storage unavailable - do NOT run 'drives flash' (data may be intact; awaiting storage recovery)");
+            true
+        }
+        _ => false,
     }
 }
 
