@@ -165,13 +165,14 @@ static FB: SpinLock<Fb> = SpinLock::new(Fb {
     blend_lut: [0; 256],
 });
 
-/// Safe-area inset per edge, as a percentage of each dimension. TVs overscan (crop ~3-5%
-/// off every edge), which clips the outermost characters at `0`. `5` insets the text by 5%
-/// per edge so it all stays visible without depending on the TV's "Just Scan" / "1:1"
-/// picture mode (which most sets bury or don't offer). Set this to `0` only on a display
-/// known not to overscan, or when the TV is in a 1:1 pixel-mapping mode, for true
-/// edge-to-edge. Harmless on a monitor - just a small border.
-const SAFE_PCT: usize = 5;
+/// Safe-area inset per edge, as a percentage of each dimension. TVs overscan (crop off every
+/// edge), which clips the outermost characters at `0`. This insets the text so it stays visible
+/// without depending on the TV's "Just Scan" / "1:1" picture mode (which most sets bury or don't
+/// offer). `2` is a light guard: on panels that overscan little (the Wyse's TV) `5` left large
+/// unused borders in all four corners, so `2` reclaims most of that while still keeping the
+/// outermost glyphs off a modestly-overscanning edge. Set to `0` for true edge-to-edge on a
+/// display known not to overscan (or in 1:1 mode). Harmless on a monitor - just a thin border.
+const SAFE_PCT: usize = 2;
 
 /// Initialise the console from Limine's framebuffer descriptor. Called once in
 /// `_start`, right after `serial_init`, before the first `kprintln`.
