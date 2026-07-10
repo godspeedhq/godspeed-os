@@ -149,6 +149,10 @@ struct Fb {
     // shifts this in RAM and redraws the screen from it, so it never reads the
     // (uncached) framebuffer back.
     grid: [[u8; MAX_COLS]; MAX_ROWS],
+    // Precomputed foreground-blend LUT: blend_lut[intensity] = the glyph-pixel colour for that
+    // antialiasing intensity, composed in the device layout. Lets an antialiased glyph edge blit as a
+    // table read instead of a per-pixel multiply/divide - the last bit of scroll smoothness at 4K.
+    blend_lut: [u32; 256],
 }
 
 static FB: SpinLock<Fb> = SpinLock::new(Fb {
@@ -158,6 +162,7 @@ static FB: SpinLock<Fb> = SpinLock::new(Fb {
     esc: 0, csi_priv: false, csi_params: [0; 3], csi_nparam: 0, utf8_cp: 0, utf8_remaining: 0,
     cursor_visible: true, cur_col: 0, cur_row: 0,
     grid: [[b' '; MAX_COLS]; MAX_ROWS],
+    blend_lut: [0; 256],
 });
 
 /// Safe-area inset per edge, as a percentage of each dimension. TVs overscan (crop ~3-5%
@@ -203,6 +208,13 @@ pub fn fb_init(fb: &Framebuffer) {
     s.r_shift = rs; s.g_shift = gs; s.b_shift = bs;
     s.fg = make(s.fg_r, s.fg_g, s.fg_b);
     s.bg = make(0x00, 0x00, 0x00);
+    // Precompute the blend LUT (see `blend`): foreground scaled by each 0-255 antialiasing intensity,
+    // composed in the device channel layout. Background is black, so blend_lut[0] == bg (0) and
+    // blend_lut[255] == fg. Turns every glyph-edge pixel into a table read instead of a multiply/divide.
+    for i in 0..256u32 {
+        let (r, g, b) = (s.fg_r * i / 255, s.fg_g * i / 255, s.fg_b * i / 255);
+        s.blend_lut[i as usize] = (r << rs) | (g << gs) | (b << bs);
+    }
     s.esc = 0;
     s.csi_nparam = 0;
     s.cursor_visible = true;
@@ -619,24 +631,16 @@ fn fill_rect(s: &Fb, x: usize, y: usize, w: usize, h: usize, color: u32) {
     }
 }
 
-/// Blend the foreground toward the background by an antialiasing `intensity` (0-255)
-/// and compose the result into the device's channel layout. 0 ⇒ background, 255 ⇒ full
-/// foreground; in between gives the smooth edges. Because the background is black, this
-/// is just the foreground scaled per channel - but written explicitly so a non-black
-/// background would still compose correctly.
+/// The glyph-pixel colour for an antialiasing `intensity` (0-255): 0 gives the (black)
+/// background, 255 gives full foreground, and in between gives the smooth edges. Reads
+/// the value straight from `blend_lut`, which `fb_init` precomputes once (foreground
+/// scaled per channel, composed into the device's channel layout).
 #[inline]
 fn blend(s: &Fb, intensity: u8) -> u32 {
-    if intensity == 0 {
-        return s.bg;
-    }
-    if intensity == 255 {
-        return s.fg;
-    }
-    let i = intensity as u32;
-    let r = s.fg_r * i / 255;
-    let g = s.fg_g * i / 255;
-    let b = s.fg_b * i / 255;
-    (r << s.r_shift) | (g << s.g_shift) | (b << s.b_shift)
+    // Table lookup (fb_init precomputed blend_lut[intensity] = fg scaled by intensity, composed in the
+    // device layout), so an antialiased glyph edge is one read instead of three multiplies + three
+    // divides per pixel - the last bit of scroll smoothness on a dense 4K panel.
+    s.blend_lut[intensity as usize]
 }
 
 /// Render one glyph at text cell (col, row). ASCII (`< 0x80`) renders via the
