@@ -4922,9 +4922,10 @@ fn is_record_producer(name: &str) -> bool {
 fn build_ls_table(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Option<Table> {
     let mut buf = [0u8; PATH_MAX];
     let path = resolve_or_err(ctx, cwd, arg, &mut buf)?;
-    let reply = match fs_request(ctx, OP_LIST_DIR, path, &[]) {
-        Some(r) => r,
-        None => { ctx.console_writeln("ls: storage unavailable"); return None; }
+    let reply = match fs_request_q(ctx, OP_LIST_DIR, path, &[]) {
+        ReqOutcome::Reply(r) => r,
+        ReqOutcome::Aborted => return None,
+        ReqOutcome::Timeout => { ctx.console_writeln("ls: storage unavailable"); return None; }
     };
     let p = reply.payload_bytes();
     if no_fs(ctx, p) { return None; }
@@ -5060,9 +5061,10 @@ fn build_find_table(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Option<Table>
     let mut t = Table::new(&["name", "type", "path"]);
     let mut dir = [0u8; PATH_MAX];
     while let Some(dlen) = stack.pop(&mut dir) {
-        let reply = match fs_request(ctx, OP_LIST_DIR, &dir[..dlen], &[]) {
-            Some(r) => r,
-            None => { ctx.console_writeln("find: storage unavailable"); return None; }
+        let reply = match fs_request_q(ctx, OP_LIST_DIR, &dir[..dlen], &[]) {
+            ReqOutcome::Reply(r) => r,
+            ReqOutcome::Aborted => return None,
+            ReqOutcome::Timeout => { ctx.console_writeln("find: storage unavailable"); return None; }
         };
         let p = reply.payload_bytes();
         if no_fs(ctx, p) { return None; }
@@ -7221,6 +7223,32 @@ fn fs_request_bounded(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8], ma
     None
 }
 
+/// `fs_request` for INTERACTIVE commands (`ls`, `cd`, `read`, `find`, ...): q-abortable, and after a
+/// short lingering threshold it prints a "(q to quit)" hint so the user can bail on a slow op instead
+/// of waiting blind. A fast reply prints NOTHING (no nag on a snappy op). Mirrors the net commands'
+/// abort convention (`ReqOutcome`): `Reply(r)` = answered, `Aborted` = user pressed q (hint already
+/// shown), `Timeout` = fs unreachable. On a Timeout (send failed - `fs` restarted, cached cap went
+/// EndpointDead, Phase D §14.3) it reacquires `fs` by name and retries once. The plain blocking
+/// `fs_request` stays for internal/cleanup ops (deletes, tests) the user never waits on interactively.
+fn fs_request_q(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> ReqOutcome {
+    const HINT_SECS: i64 = 2;    // print "(q to quit)" only if the wait lingers past this
+    const MAX_SECS:  i64 = 3600; // effectively unbounded - fs replies fast now; q is the real exit
+    let pl = path.len().min(255);
+    let mut req = [0u8; 4096];
+    req[0] = op;
+    req[1] = pl as u8;
+    req[2..2 + pl].copy_from_slice(&path[..pl]);
+    let dn = data.len().min(req.len() - 2 - pl);
+    req[2 + pl..2 + pl + dn].copy_from_slice(&data[..dn]);
+    let msg = Message::from_bytes(&req[..2 + pl + dn]);
+    match ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)")) {
+        // Send failed (stale cap after an fs restart): reacquire by name and retry once, still hinted.
+        ReqOutcome::Timeout if ctx.reacquire_by_name("fs") =>
+            ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)")),
+        other => other,
+    }
+}
+
 /// Stat a path: `Some((size, is_dir))` if it exists, `None` otherwise. Used by the streaming
 /// read/copy paths to learn a file's size before chunking through it.
 fn fs_stat(ctx: &ServiceContext, path: &[u8]) -> Option<(u64, bool)> {
@@ -7315,9 +7343,10 @@ fn no_fs(ctx: &ServiceContext, p: &[u8]) -> bool {
 fn cmd_ls(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    let reply = match fs_request(ctx, OP_LIST_DIR, path, &[]) {
-        Some(r) => r,
-        None => { ctx.console_writeln("ls: storage unavailable"); return Err(ShellError::Unknown); }
+    let reply = match fs_request_q(ctx, OP_LIST_DIR, path, &[]) {
+        ReqOutcome::Reply(r) => r,
+        ReqOutcome::Aborted => return Ok(()),
+        ReqOutcome::Timeout => { ctx.console_writeln("ls: storage unavailable"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
     if no_fs(ctx, p) { return Err(ShellError::Unknown); }
@@ -8060,9 +8089,10 @@ fn cmd_read(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result
     // Stat first (one message) to learn the size, then STREAM the content in IO_CHUNK pieces
     // via read_at - so a file far larger than one IPC message reads back correctly without a
     // big buffer here.
-    let stat = match fs_request(ctx, OP_STAT_FILE, path, &[]) {
-        Some(r) => r,
-        None => { ctx.console_writeln("read: storage unavailable"); return Err(ShellError::Unknown); }
+    let stat = match fs_request_q(ctx, OP_STAT_FILE, path, &[]) {
+        ReqOutcome::Reply(r) => r,
+        ReqOutcome::Aborted => return Ok(()),
+        ReqOutcome::Timeout => { ctx.console_writeln("read: storage unavailable"); return Err(ShellError::Unknown); }
     };
     let sp = stat.payload_bytes();
     if no_fs(ctx, sp) { return Err(ShellError::Unknown); }
@@ -8328,9 +8358,10 @@ fn cmd_cd(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str) -> Result<(), ShellErr
         ctx.console_writeln("/");
         return Ok(());
     }
-    let reply = match fs_request(ctx, OP_STAT_FILE, path, &[]) {
-        Some(r) => r,
-        None => { ctx.console_writeln("cd: storage unavailable"); return Err(ShellError::Unknown); }
+    let reply = match fs_request_q(ctx, OP_STAT_FILE, path, &[]) {
+        ReqOutcome::Reply(r) => r,
+        ReqOutcome::Aborted => return Ok(()),
+        ReqOutcome::Timeout => { ctx.console_writeln("cd: storage unavailable"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
     if no_fs(ctx, p) { return Err(ShellError::Unknown); }
@@ -8630,9 +8661,10 @@ fn cmd_find(ctx: &ServiceContext, cwd: &Cwd, target: &str, start: &str, out: &mu
     let mut matches = 0u32;
     let mut dir = [0u8; PATH_MAX];
     while let Some(dlen) = stack.pop(&mut dir) {
-        let reply = match fs_request(ctx, OP_LIST_DIR, &dir[..dlen], &[]) {
-            Some(r) => r,
-            None => { ctx.console_writeln("find: storage unavailable"); return Err(ShellError::Unknown); }
+        let reply = match fs_request_q(ctx, OP_LIST_DIR, &dir[..dlen], &[]) {
+            ReqOutcome::Reply(r) => r,
+            ReqOutcome::Aborted => return Ok(()),
+            ReqOutcome::Timeout => { ctx.console_writeln("find: storage unavailable"); return Err(ShellError::Unknown); }
         };
         let p = reply.payload_bytes();
         if no_fs(ctx, p) { return Err(ShellError::Unknown); }
@@ -8721,9 +8753,10 @@ fn cmd_tree(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result
         if !is_dir { files += 1; continue; }
         if d > 0 { dirs += 1; }
 
-        let reply = match fs_request(ctx, OP_LIST_DIR, &buf[..plen], &[]) {
-            Some(r) => r,
-            None => { ctx.console_writeln("tree: storage unavailable"); return Err(ShellError::Unknown); }
+        let reply = match fs_request_q(ctx, OP_LIST_DIR, &buf[..plen], &[]) {
+            ReqOutcome::Reply(r) => r,
+            ReqOutcome::Aborted => return Ok(()),
+            ReqOutcome::Timeout => { ctx.console_writeln("tree: storage unavailable"); return Err(ShellError::Unknown); }
         };
         let p = reply.payload_bytes();
         if no_fs(ctx, p) { return Err(ShellError::Unknown); }
@@ -8918,9 +8951,10 @@ fn cmd_match(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) -> Res
     }
     let mut buf = [0u8; PATH_MAX];
     let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    let reply = match fs_request(ctx, OP_READ_FILE, abspath, &[]) {
-        Some(r) => r,
-        None => { ctx.console_writeln("match: storage unavailable"); return Err(ShellError::Unknown); }
+    let reply = match fs_request_q(ctx, OP_READ_FILE, abspath, &[]) {
+        ReqOutcome::Reply(r) => r,
+        ReqOutcome::Aborted => return Ok(()),
+        ReqOutcome::Timeout => { ctx.console_writeln("match: storage unavailable"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
     if no_fs(ctx, p) { return Err(ShellError::Unknown); }
@@ -9006,9 +9040,10 @@ fn cmd_count(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) -> Res
     }
     let mut buf = [0u8; PATH_MAX];
     let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    let reply = match fs_request(ctx, OP_READ_FILE, abspath, &[]) {
-        Some(r) => r,
-        None => { ctx.console_writeln("count: storage unavailable"); return Err(ShellError::Unknown); }
+    let reply = match fs_request_q(ctx, OP_READ_FILE, abspath, &[]) {
+        ReqOutcome::Reply(r) => r,
+        ReqOutcome::Aborted => return Ok(()),
+        ReqOutcome::Timeout => { ctx.console_writeln("count: storage unavailable"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
     if no_fs(ctx, p) { return Err(ShellError::Unknown); }
@@ -9085,9 +9120,10 @@ fn cmd_sort(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) -> Resu
     }
     let mut buf = [0u8; PATH_MAX];
     let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    let reply = match fs_request(ctx, OP_READ_FILE, abspath, &[]) {
-        Some(r) => r,
-        None => { ctx.console_writeln("sort: storage unavailable"); return Err(ShellError::Unknown); }
+    let reply = match fs_request_q(ctx, OP_READ_FILE, abspath, &[]) {
+        ReqOutcome::Reply(r) => r,
+        ReqOutcome::Aborted => return Ok(()),
+        ReqOutcome::Timeout => { ctx.console_writeln("sort: storage unavailable"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
     if no_fs(ctx, p) { return Err(ShellError::Unknown); }
@@ -9171,9 +9207,10 @@ fn cmd_take(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize, last: b
     }
     let mut buf = [0u8; PATH_MAX];
     let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    let reply = match fs_request(ctx, OP_READ_FILE, abspath, &[]) {
-        Some(r) => r,
-        None => { ctx.console_writeln_fmt(format_args!("{}: storage unavailable", name)); return Err(ShellError::Unknown); }
+    let reply = match fs_request_q(ctx, OP_READ_FILE, abspath, &[]) {
+        ReqOutcome::Reply(r) => r,
+        ReqOutcome::Aborted => return Ok(()),
+        ReqOutcome::Timeout => { ctx.console_writeln_fmt(format_args!("{}: storage unavailable", name)); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
     if no_fs(ctx, p) { return Err(ShellError::Unknown); }

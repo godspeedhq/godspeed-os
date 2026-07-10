@@ -593,6 +593,49 @@ impl ServiceContext {
         }
     }
 
+    /// Like [`Self::request_with_reply_abortable`], but if no reply has arrived after
+    /// `hint_after_secs` it invokes `on_linger` ONCE (e.g. to print a "(q to quit)" hint) and keeps
+    /// waiting/aborting. A snappy reply never fires the hint, so a fast request stays silent and only
+    /// a genuinely lingering wait tells the user they can bail. Abort semantics are identical to
+    /// `request_with_reply_abortable` (q/Q/ESC -> `Aborted` immediately; the request is sent once and
+    /// a late reply is drained atop the next abortable/qhint request). The hint text lives in the
+    /// caller's closure, so this stays mechanism - the SDK provides the *timing*, the caller the UX.
+    pub fn request_with_reply_qhint(
+        &self,
+        peer: &str,
+        msg:  &crate::ipc::Message,
+        hint_after_secs: i64,
+        max_secs: i64,
+        on_linger: impl FnOnce(),
+    ) -> ReqOutcome {
+        // Drain any stale reply a prior INSTANT-abort left in our endpoint (see the abortable variant).
+        while self.try_recv().is_some() {}
+        let target = match self.find_send_slot(peer) { Some(s) => CapHandle(s), None => return ReqOutcome::Timeout };
+        let self_grant = match self.self_grant_handle() { Some(g) => g, None => return ReqOutcome::Timeout };
+        let reply_cap = match self.derive_cap(self_grant) { Some(c) => c, None => return ReqOutcome::Timeout };
+        if self.send_with_cap_by_handle(target, reply_cap, msg).is_err() {
+            self.remove_cap(reply_cap);
+            return ReqOutcome::Timeout;
+        }
+        let t0 = self.epoch_secs_monotonic();
+        let mut on_linger = Some(on_linger);   // FnOnce, fired at most once when the wait lingers
+        loop {
+            if let Some(r) = self.try_recv() { self.remove_cap(reply_cap); return ReqOutcome::Reply(r); }
+            while let Some(b) = self.try_console_read() {
+                if b == b'q' || b == b'Q' || b == 0x1b { self.remove_cap(reply_cap); return ReqOutcome::Aborted; }
+            }
+            let elapsed = self.epoch_secs_monotonic() - t0;
+            if elapsed >= hint_after_secs {
+                if let Some(f) = on_linger.take() { f(); }
+            }
+            if elapsed >= max_secs {
+                self.remove_cap(reply_cap);
+                return ReqOutcome::Timeout;
+            }
+            self.yield_cpu();
+        }
+    }
+
     /// Reacquire a fresh SEND cap to `peer` and point the named-peer cache at it, so subsequent
     /// `try_send(peer)` / `send(peer)` use the new cap. Returns `false` if `peer` cannot currently
     /// be resolved (e.g. it has not finished respawning) - the caller should retry on a later tick.
