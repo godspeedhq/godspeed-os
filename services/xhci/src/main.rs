@@ -77,6 +77,16 @@ const MAX_HID: usize = 2;
 /// per-machine calibration needed. read_tsc is hardware-proven to advance (perf §22).
 const REPEAT_INITIAL_CYCLES: u64 = 600_000_000;
 const REPEAT_INTERVAL_CYCLES: u64 = 100_000_000;
+/// How often the poll loop GET_STATUSes a hub's downstream port to notice a device unplugged from
+/// behind it (no root PORTSC reflects that). ~0.5 s at ~1.5-2 GHz - responsive enough for a "keyboard
+/// disconnected" notice, infrequent enough not to load the hub or eat keystrokes off the shared event
+/// ring (the check runs a control transfer; between checks the keyboard endpoint has the ring to
+/// itself).
+const HUB_POLL_CYCLES: u64 = 1_000_000_000;
+/// How long the "a hub is present but nothing usable is behind it" wait sleeps before re-walking the
+/// hub. A device replugged BEHIND a hub changes no root PORTSC, so the root-port wait would miss it;
+/// re-walking every ~1.5 s catches a back-port (re)connect. Only runs while NO HID is bound.
+const HUB_RESCAN_CYCLES: u64 = 3_000_000_000;
 const DEV_BASE: usize = 0x7000;
 const DEV_STRIDE: usize = 0x4000; // 4 pages: device ctx, EP0 ring, int ring, report
 fn device_ctx_off(i: usize) -> usize { DEV_BASE + i * DEV_STRIDE }
@@ -122,8 +132,25 @@ fn disable_slot(
 
 /// A bound HID device: its slot, interrupt-endpoint DCI, root-hub port (for
 /// disconnect detection), per-device DMA slice index, and whether it's a mouse.
+///
+/// For a device BEHIND a hub, `port` is the hub's root port (which never changes on the device's own
+/// unplug), so the root-PORTSC disconnect check cannot see it leave. The `hub_*` fields carry the
+/// parent hub's coordinates so the poll loop can instead GET_STATUS the hub's downstream port to notice
+/// the unplug: `hub_slot` = the hub's xHC slot (0 = the device is on a root port, not behind a hub),
+/// `hub_dev` = the hub's DMA slice (its EP0 ring), `hub_port` = the downstream port on the hub, and
+/// `hub_off` = the EP0-ring byte offset just past enumeration where those status polls resume.
 #[derive(Clone, Copy)]
-struct Hid { slot: u32, dci: u32, port: u32, idx: usize, is_mouse: bool }
+struct Hid {
+    slot: u32,
+    dci: u32,
+    port: u32,
+    idx: usize,
+    is_mouse: bool,
+    hub_slot: u32,
+    hub_dev: u32,
+    hub_port: u32,
+    hub_off: usize,
+}
 
 const EVENT_RING_TRBS: usize = 16;
 const TRB_SIZE: usize = 16;
@@ -346,6 +373,77 @@ fn control(
         }
     }
     false
+}
+
+/// GET_STATUS a hub's downstream port over the hub's EP0, to notice a device unplugged from behind the
+/// hub (which changes no root PORTSC). Returns `Some(connected_bit)` (wPortStatus bit 0), or `None` on
+/// a transfer failure (treated as "unknown", not a disconnect). The hub's EP0 ring is managed with a
+/// persistent producer cursor `cur` + cycle `pcs` and a Link TRB at the ring tail, so the check can run
+/// indefinitely without overrunning the one-page ring. Only the hub's own completion (slot_id ==
+/// hub_slot) is accepted; a stray keyboard event landing in the tiny check window is skipped (a rare
+/// dropped keystroke, not a misread status).
+#[allow(clippy::too_many_arguments)]
+fn hub_port_status(
+    dma: &Dma, mmio: &Mmio, dboff: usize, ir0: usize,
+    hub_slot: u32, hub_dev: usize, hub_port: u32,
+    cur: &mut usize, pcs: &mut u32,
+    ev_idx: &mut usize, ev_cycle: &mut u32,
+    eaten: &mut u32,
+) -> Option<bool> {
+    const RING: usize = 0x1000;
+    let base = ep0_tr_off(hub_dev);
+    // If the 3-TRB GET_STATUS would not fit before the ring end, wrap: write a Link TRB AT the current
+    // cursor (which is where the controller's dequeue sits - so no stale gap for it to stop on),
+    // pointing back to base with Toggle Cycle, then reset the cursor + flip the producer cycle. The
+    // `>=` keeps the cursor strictly below RING, so the Link (16 bytes) always fits at the tail.
+    if *cur + 3 * 0x10 >= RING {
+        let bp = dma.phys_at(base);
+        dma.write32(base + *cur, bp as u32);
+        dma.write32(base + *cur + 4, (bp >> 32) as u32);
+        dma.write32(base + *cur + 8, 0);
+        dma.write32(base + *cur + 12, (TRB_LINK << 10) | (1 << 1) | *pcs);
+        *cur = 0;
+        *pcs ^= 1;
+    }
+    let tr = base + *cur;
+    let c = *pcs;
+    // Setup: GET_STATUS(port) - bmRequestType 0xA3 (class, other, IN), bRequest 0, wValue 0,
+    // wIndex = port, wLength 4.
+    dma.write32(tr, 0xA3);
+    dma.write32(tr + 4, hub_port | (4 << 16));
+    dma.write32(tr + 8, 8);
+    dma.write32(tr + 12, c | (1 << 6) | (TRB_SETUP_STAGE << 10) | (3 << 16)); // IDT, TRT=IN
+    // Data: 4 bytes IN into DATA_BUF_OFF (unused by the poll loop, so safe to reuse here).
+    let dp = dma.phys_at(DATA_BUF_OFF);
+    dma.write32(tr + 16, dp as u32);
+    dma.write32(tr + 20, (dp >> 32) as u32);
+    dma.write32(tr + 24, 4);
+    dma.write32(tr + 28, c | (TRB_DATA_STAGE << 10) | (1 << 16)); // DIR=IN
+    // Status: OUT (opposite of the IN data stage), IOC.
+    dma.write32(tr + 32, 0);
+    dma.write32(tr + 36, 0);
+    dma.write32(tr + 40, 0);
+    dma.write32(tr + 44, c | (1 << 5) | (TRB_STATUS_STAGE << 10));
+    *cur += 3 * 0x10;
+    mmio.write32(dboff + hub_slot as usize * 4, 1); // ring the hub's EP0 doorbell (DCI 1)
+    for _ in 0..8 {
+        match next_event(dma, mmio, ir0, ev_idx, ev_cycle, 5_000_000) {
+            Some((TRB_TRANSFER_EVENT, cc, sid)) if sid == hub_slot => {
+                return if cc == 1 || cc == 13 {
+                    Some(dma.read16(DATA_BUF_OFF) & 1 != 0) // wPortStatus bit0 = current connect
+                } else {
+                    None
+                };
+            }
+            // A stray HID transfer event (a keystroke landing in this check window) - record its slot
+            // so the caller re-arms that endpoint (its in-flight TRB is now spent). The report itself
+            // is lost, a rare dropped keystroke, but the endpoint does not stall. Keep waiting for ours.
+            Some((TRB_TRANSFER_EVENT, _, sid)) => { if sid < 32 { *eaten |= 1 << sid; } }
+            Some(_) => {} // a non-transfer event (port change, command) - ignore; keep waiting
+            None => return None,
+        }
+    }
+    None
 }
 
 /// Configure an already-addressed device AS A HUB so the controller will route downstream traffic
@@ -640,7 +738,8 @@ fn read_config_and_bind(
     dma.write32(link + 8, 0);
     dma.write32(link + 12, (TRB_LINK << 10) | (1 << 1) | 1);
 
-    (Some(Hid { slot, dci, port, idx: dev_idx, is_mouse }), cfg_val)
+    // hub_* default to 0/direct; the downstream caller patches them for a device behind a hub.
+    (Some(Hid { slot, dci, port, idx: dev_idx, is_mouse, hub_slot: 0, hub_dev: 0, hub_port: 0, hub_off: 0 }), cfg_val)
 }
 
 /// Enumerate whatever is attached to root-hub `port`, binding every boot HID it finds - directly on
@@ -664,6 +763,7 @@ fn enumerate_one(
     sa: &mut SliceAlloc,
     devs: &mut [Hid; MAX_HID],
     ndev: &mut usize,
+    saw_hub: &mut bool,
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
     cmd_idx: &mut usize,
@@ -863,6 +963,9 @@ fn enumerate_one(
         disable_slot(ctx, dma, mmio, dboff, ir0, slot, ev_idx, ev_cycle, cmd_idx);
         return;
     }
+    // A real hub is present. Record it so the "no HID bound" wait re-walks periodically (a device
+    // replugged behind a hub changes no root PORTSC - see the reenum loop).
+    *saw_hub = true;
     // Configure the device AS a hub so the controller routes downstream traffic through it.
     configure_as_hub(
         ctx, dma, mmio, dboff, ir0, ctx_size, slot, dev_idx, speed, 0, port, nports, mtt, ttt,
@@ -939,10 +1042,15 @@ fn enumerate_one(
                     dp as u32 & 0xF, port, slot, dp as u32, ttt, ev_idx, ev_cycle, cmd_idx,
                 );
                 match dbound {
-                    Some(hid) => {
+                    Some(mut hid) => {
                         ctx.log_fmt(format_args!(
                             "xhci: hub port {} HID bound (slot {}) - back-port device now live", dp, dslot
                         ));
+                        // Record the parent hub so the poll loop can GET_STATUS this hub port to notice
+                        // the device unplugged (no root PORTSC reflects a device leaving behind a hub).
+                        hid.hub_slot = slot;
+                        hid.hub_dev = dev_idx as u32;
+                        hid.hub_port = dp as u32;
                         devs[*ndev] = hid; // room checked at loop top
                         *ndev += 1;
                     }
@@ -961,12 +1069,21 @@ fn enumerate_one(
             }
         }
     }
-    // If nothing usable was found behind this hub, it does not need to stay configured - free its
-    // slice + slot so a later hub/device can use them (bounded slice pool).
     if *ndev == ndev_before {
+        // Nothing usable behind this hub - it need not stay configured. Free its slice + slot so a
+        // later hub/device can use them (bounded slice pool).
         ctx.log_fmt(format_args!("xhci: hub on port {} had no bound HID behind it - releasing", port));
         sa.free(dev_idx);
         disable_slot(ctx, dma, mmio, dboff, ir0, slot, ev_idx, ev_cycle, cmd_idx);
+    } else {
+        // A device was bound behind this hub; the hub's slice is KEPT. Seed each such device's poll
+        // cursor to just past all the enumeration TRBs we wrote on the hub's EP0 ring (`hoff`), so the
+        // poll loop's downstream-port GET_STATUS resumes exactly where the controller's dequeue sits.
+        for d in 0..*ndev {
+            if devs[d].hub_slot == slot {
+                devs[d].hub_off = hoff;
+            }
+        }
     }
 }
 
@@ -1017,6 +1134,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut announce = false;    // suppress the connect line for the boot device
     let mut signaled = false;    // signal_input_ready (boot-screen clear) exactly once
     let mut prev_ports = 0u32;   // root-hub ports bound on the previous pass
+    let mut rescan_noted = false; // "periodic back-port re-scan" logged once per idle spell
 
     // Hot-plug loop. Each pass FULLY re-initializes the controller (stop, reset,
     // rebuild the command/event rings + DCBAA, run) so every (re)enumeration starts
@@ -1093,27 +1211,65 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // are walked and any keyboard/mouse behind it bound (the Wyse back-port path).
         // Non-HID devices (the mass-storage boot drive) and empty hubs release their
         // slice + slot, so nothing leaks across this pass.
-        let mut devs = [Hid { slot: 0, dci: 0, port: 0, idx: 0, is_mouse: false }; MAX_HID];
+        let mut devs = [Hid {
+            slot: 0, dci: 0, port: 0, idx: 0, is_mouse: false,
+            hub_slot: 0, hub_dev: 0, hub_port: 0, hub_off: 0,
+        }; MAX_HID];
         let mut ndev = 0usize;
         let mut sa = SliceAlloc::new();
+        let mut saw_hub = false;
         for p in 1..=max_ports {
             if ndev >= MAX_HID { break; }
             enumerate_one(
                 &ctx, &dma, &mmio, dboff, ir0, op, ctx_size,
-                p, &mut sa, &mut devs, &mut ndev, &mut ev_idx, &mut ev_cycle, &mut cmd_idx,
+                p, &mut sa, &mut devs, &mut ndev, &mut saw_hub,
+                &mut ev_idx, &mut ev_cycle, &mut cmd_idx,
             );
         }
 
         if ndev == 0 {
             // Nothing usable attached. Still report input-ready once so the shell's
-            // boot-screen clear fires (the keyboard may be on the other controller),
-            // then wait for a port connection and re-scan.
+            // boot-screen clear fires (the keyboard may be on the other controller).
             if !signaled { ctx.signal_input_ready(); signaled = true; }
+            if saw_hub {
+                // A hub is present but empty. A device (re)plugged BEHIND a hub changes no root PORTSC,
+                // so a root-port wait would never see it - re-walk the hub after a bounded pause so a
+                // back-port keyboard connect/reconnect is caught. But still break EARLY on a fresh
+                // root-port device, so a FRONT-port plug is instant (the Wyse's internal hubs are always
+                // present, so this branch is where the driver idles with no keyboard). Logged once so an
+                // always-present hub does not spam while idle.
+                if !rescan_noted {
+                    ctx.log("xhci: hub present but no HID behind it - periodic back-port re-scan");
+                    rescan_noted = true;
+                }
+                let mut base_ports = 0u32;
+                for p in 1..=max_ports {
+                    if mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10) & PORT_CCS != 0 {
+                        base_ports |= 1 << p;
+                    }
+                }
+                let t0 = ctx.read_tsc();
+                loop {
+                    while ctx.try_recv().is_some() {}
+                    let mut new_root = false;
+                    for p in 1..=max_ports {
+                        let c = mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10) & PORT_CCS != 0;
+                        if c && base_ports & (1 << p) == 0 { new_root = true; break; }
+                        if !c { base_ports &= !(1 << p); }
+                    }
+                    if new_root { break; } // a front/root-port device appeared - re-walk now
+                    if ctx.read_tsc().wrapping_sub(t0) >= HUB_RESCAN_CYCLES { break; } // periodic re-walk
+                    ctx.yield_cpu();
+                }
+                announce = true; // whatever we bind on the re-walk is a real plug event
+                continue 'reenum;
+            }
             ctx.log("xhci: no HID keyboard/mouse on any port - waiting for a connection");
             wait_for_port(&ctx, &mmio, op, max_ports);
             announce = true; // whatever connects now is a real plug event
             continue 'reenum;
         }
+        rescan_noted = false; // a device is bound; re-arm the once-only re-scan log for next time
 
         ctx.log_fmt(format_args!("xhci: {} HID device(s) bound", ndev));
         if !signaled { ctx.signal_input_ready(); signaled = true; } // boot-screen clear, once
@@ -1146,6 +1302,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut int_idx = [0usize; MAX_HID];
         let mut int_cycle = [1u32; MAX_HID];
         let mut need_queue = [true; MAX_HID];
+        // Per-device producer cursor into its parent HUB's EP0 ring, for the throttled downstream-port
+        // GET_STATUS that detects a device unplugged behind a hub. Seeded past the enumeration TRBs
+        // (hub_off); pcs starts at 1 (enumeration never wrapped the ring). Unused for root devices.
+        let mut hub_cur = [0usize; MAX_HID];
+        let mut hub_pcs = [1u32; MAX_HID];
+        for d in 0..ndev { hub_cur[d] = devs[d].hub_off; }
+        let mut last_hub_poll = ctx.read_tsc();
+        let mut hub_probe_logged = false; // log the first downstream-status probe per session (diagnostic)
         let mut kb_last = [[0u8; 6]; MAX_HID];
         let mut kb_rep = [
             godspeed_sdk::hid::KeyRepeat::new(REPEAT_INITIAL_CYCLES, REPEAT_INTERVAL_CYCLES),
@@ -1260,11 +1424,39 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 }
             }
 
-            // Unplug detection: if ANY bound device's root-port CCS drops, break and
-            // fully re-initialize - re-binding whatever remains on the next pass.
+            // Unplug detection. A device DIRECTLY on a root port is gone when its root-port CCS drops
+            // (cheap MMIO read, every pass). A device BEHIND a hub changes no root PORTSC when it
+            // leaves - its root port is the hub's, and the hub stays put - so it is instead detected by
+            // GET_STATUSing the hub's downstream port, throttled (a control transfer, not free). Either
+            // way: notify and break to fully re-initialize, re-binding whatever remains next pass.
+            let hub_due = ctx.read_tsc().wrapping_sub(last_hub_poll) > HUB_POLL_CYCLES;
+            let mut eaten = 0u32; // HID slots whose events a hub check consumed (re-arm them below)
             for d in 0..ndev {
-                let portsc_off = op + OP_PORTSC_BASE + (devs[d].port as usize - 1) * 0x10;
-                if mmio.read32(portsc_off) & PORT_CCS == 0 {
+                let gone = if devs[d].hub_slot == 0 {
+                    let portsc_off = op + OP_PORTSC_BASE + (devs[d].port as usize - 1) * 0x10;
+                    mmio.read32(portsc_off) & PORT_CCS == 0
+                } else if hub_due {
+                    // Some(false) = the hub says its port is empty now; Some(true)/None = still there
+                    // or an inconclusive read (do not false-notify on a transient control failure).
+                    let st = hub_port_status(
+                        &dma, &mmio, dboff, ir0,
+                        devs[d].hub_slot, devs[d].hub_dev as usize, devs[d].hub_port,
+                        &mut hub_cur[d], &mut hub_pcs[d], &mut ev_idx, &mut ev_cycle, &mut eaten,
+                    );
+                    // Log the first probe of the session (and any inconclusive None, which would
+                    // silently disable this detection) so the hub-poll path is diagnosable on hardware.
+                    if !hub_probe_logged || st.is_none() {
+                        ctx.log_fmt(format_args!(
+                            "xhci: hub slot {} port {} status probe -> {:?}",
+                            devs[d].hub_slot, devs[d].hub_port, st
+                        ));
+                        hub_probe_logged = true;
+                    }
+                    matches!(st, Some(false))
+                } else {
+                    false
+                };
+                if gone {
                     notify(&ctx, if devs[d].is_mouse {
                         "mouse disconnected (xhci)"
                     } else {
@@ -1272,6 +1464,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     });
                     announce = true;
                     break 'poll;
+                }
+            }
+            if hub_due { last_hub_poll = ctx.read_tsc(); }
+            // Re-arm any HID endpoint whose in-flight report a hub check just consumed, so it does not
+            // stall (the report is discarded; the next keystroke lands on the fresh TRB).
+            if eaten != 0 {
+                for k in 0..ndev {
+                    if devs[k].slot < 32 && eaten & (1 << devs[k].slot) != 0 {
+                        need_queue[k] = true;
+                    }
                 }
             }
             // New-device detection: while we still have a free device slice, a port
