@@ -518,6 +518,38 @@ fn wait_port_ready(ctx: &ServiceContext, hba: &Mmio, base: usize) -> bool {
     false
 }
 
+/// No disk (or no DMA arena): serve block IPC with a bounded, LOUD answer instead of idling silently.
+///
+/// The old no-disk path was `loop { ctx.yield_cpu(); }` - it never called `recv`, so a client's
+/// request sat unanswered in our queue forever. `fs`'s mount reads block on `request_with_reply`,
+/// which wakes on peer *death* but not on an alive-but-silent peer, so fs blocked on the first mount
+/// read, never reached its "storage-unavailable" degraded path, and every fs-dependent shell command
+/// (`ls`, `cd`, history) hung. Answering loudly here fixes that at the root: we reply to `OP_CAPACITY`
+/// with a true 0 sectors (fs reads `Some(0)` = genuinely no disk, its designed degraded trigger) and
+/// to every read/write with `STATUS_ERR`. fs then mounts *degraded* and serves clients `FS_NOFS` - a
+/// loud failure that returns to the prompt, never a hang. If a disk later appears, block-driver is
+/// restarted (Phase D) and re-runs full detection from the top.
+fn serve_no_disk(ctx: &ServiceContext) -> ! {
+    use super::{OP_CAPACITY, STATUS_ERR, STATUS_OK};
+    loop {
+        let msg = ctx.recv();
+        let reply = match ctx.take_pending_cap() {
+            Some(c) => c,
+            None => continue,
+        };
+        let p = msg.payload_bytes();
+        if !p.is_empty() && p[0] == OP_CAPACITY {
+            // Capacity reply is [STATUS_OK, sectors:u64 LE]; sectors = 0 = "genuinely no disk".
+            let mut out = [0u8; 9];
+            out[0] = STATUS_OK;
+            let _ = ctx.send_by_handle(reply, &Message::from_bytes(&out));
+        } else {
+            let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR]));
+        }
+        ctx.remove_cap(reply);
+    }
+}
+
 /// Steps A+B: detect the HBA + disk, init the port, IDENTIFY. Idles afterwards.
 pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
     let cap = hba.read32(HBA_CAP);
@@ -558,16 +590,16 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
     let port = match disk_port {
         Some(p) => p,
         None => {
-            ctx.log("block-driver: AHCI - no SATA disk found on any implemented port");
-            loop { ctx.yield_cpu(); }
+            ctx.log("block-driver: AHCI - no SATA disk found; serving I/O errors so fs degrades loudly (not a hang)");
+            serve_no_disk(ctx);
         }
     };
 
     let arena = match ctx.dma_region() {
         Some(d) => d,
         None => {
-            ctx.log("block-driver: AHCI - no DMA arena granted");
-            loop { ctx.yield_cpu(); }
+            ctx.log("block-driver: AHCI - no DMA arena granted; serving I/O errors so fs degrades loudly (not a hang)");
+            serve_no_disk(ctx);
         }
     };
     arena.zero();
