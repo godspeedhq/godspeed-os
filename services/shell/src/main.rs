@@ -2,7 +2,7 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, CapInfo, CapHandle, Message, IpcError};
+use godspeed_sdk::{ServiceContext, CapInfo, CapHandle, Message, IpcError, ReqOutcome};
 use godspeed_sdk::record::{Table, Value, RecordSink, parse_predicate, AggOp, AggErr, REC_MAX_ROWS, REC_ARENA};
 
 const MAX_LINE: usize = 128;
@@ -38,6 +38,7 @@ const IO_CHUNK: usize = 7 * 508; // 3556
 const FS_OK: u8 = 0;
 const FS_NOTFOUND: u8 = 2;
 const FS_NOFS: u8 = 3;
+const FS_UNAVAIL: u8 = 4;   // present-but-unreadable storage: do NOT flash (data may be intact)
 const FS_DENIED: u8 = 4; // file-cap op needs a right the cap lacks (non-escalation, §7.3)
 // File-as-capability (§7.10, P2): Open mints a file cap; the holder invokes it (FOP_*).
 const OP_OPEN: u8 = 30;  // [op, plen, path, rights:u8] → [FS_OK] + embedded FILE CAP
@@ -239,7 +240,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut cwd = Cwd::root();
     // Command history for up/down-arrow recall. `nav == hist.len()` means the live line.
     let mut hist = History::new();
-    let mut nav = 0usize;
+    // History is loaded LAZILY, not here. Touching fs on the startup path would stall the prompt whenever
+    // fs is slow/wedged (the shell must come up instantly - history is an enhancement, never a requirement,
+    // §26.7), and the only signal the user wants prior history is the up-arrow. So the FIRST up-arrow loads
+    // /.gsh_history (bounded, best-effort) and merges it behind the session; startup touches fs zero times.
+    // See `History::load` + the up-arrow arm in `handle_csi`. nav starts at 0 (empty ring = live line).
+    let mut nav = hist.len();
     // The previous command's result (the Ok/Err model), reported by `result`. Threaded as
     // local session state - no global (services hold no global mutable state, §3.9).
     let mut last_result: Result<(), ShellError> = Ok(());
@@ -268,7 +274,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // to echo the Enter as "\r\n").
                 ctx.console_write("\r\n");
                 if line.len > 0 {
-                    hist.push(line.bytes());
+                    // A line that READS a secret (`input secret ...`) never enters the recall ring or
+                    // /.gsh_history (§8 secret taint): a password recovered on up-arrow would defeat the
+                    // whole point of invisible entry. It still EXECUTES below; it just isn't remembered.
+                    if !line_reads_secret(line.bytes()) {
+                        hist.push(line.bytes());
+                        hist.save(&ctx); // write-through to the fs (best-effort; never stalls the prompt)
+                    }
                     last_result = execute(&ctx, line.bytes(), &mut cwd, last_result, 0, &mut Out::Console);
                     line.len = 0;
                     line.cur = 0;
@@ -363,7 +375,7 @@ fn read_escape_byte(ctx: &ServiceContext) -> Option<u8> {
 /// PageUp/PageDown) and function keys an extended keyboard sends. Unknown sequences are
 /// consumed and ignored - never smeared onto the line. Bounded: a final byte must arrive
 /// within `CSI_MAX` bytes or we stop (defensive against a malformed serial stream).
-fn handle_csi(ctx: &ServiceContext, line: &mut Line, hist: &History, nav: &mut usize) {
+fn handle_csi(ctx: &ServiceContext, line: &mut Line, hist: &mut History, nav: &mut usize) {
     const CSI_MAX: usize = 8;
     let mut param: u16 = 0;
     let mut have_param = false;
@@ -383,7 +395,24 @@ fn handle_csi(ctx: &ServiceContext, line: &mut Line, hist: &History, nav: &mut u
     }
     match final_byte {
         b'A' => { // Up - older command
-            if *nav > 0 { *nav -= 1; line.set(ctx, hist.get(*nav)); }
+            if *nav > 0 {
+                // There is an older IN-MEMORY entry: just step to it. Memory only - fs is NOT touched
+                // while the user is still walking their own session commands.
+                *nav -= 1;
+                line.set(ctx, hist.get(*nav));
+            } else if !hist.loaded && hist.len() < HIST_MAX {
+                // At the OLDEST in-memory entry, with room for more: only NOW - the user has run out of
+                // session history - do the bounded disk load (at most once, the `loaded` gate). It merges
+                // /.gsh_history BEHIND the session, so `added` older lines land at the front; step into the
+                // newest of them and continue the up-nav. A wedged/absent/empty file adds nothing -> stay put.
+                // Consequence: startup never touches fs; a session that already fills HIST_MAX never loads
+                // (this arm's guard is false); the disk is read at most once, only on running out of history.
+                let before = hist.len();
+                hist.load(ctx);
+                let added = hist.len() - before;
+                if added > 0 { *nav = added - 1; line.set(ctx, hist.get(*nav)); }
+            }
+            // else: at the top and either already loaded or the ring is full - nothing older to show.
         }
         b'B' => { // Down - newer command (past the end → blank live line)
             if *nav < hist.len() {
@@ -438,8 +467,9 @@ fn complete_tab(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd) {
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
     ("date",    &["epoch"]),
+    ("net",     &["dns", "stats", "arp", "scan", "renew", "version", "help"]),
     ("drives",  &["flash", "label", "reset", "check", "scrub"]),
-    ("chaos",   &["kill-storm", "flood-storm", "mem-pressure", "spawn-storm", "max-carnage"]),
+    ("chaos",   &["kill-storm", "flood-storm", "mem-pressure", "spawn-storm", "max-carnage", "link-flap"]),
     ("write",   &["append", "prepend"]),
     ("sort",    &["reverse"]),
     ("match",   &["except"]),
@@ -468,10 +498,52 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
     let prior = words.clone().count();                        // args typed before the current token
 
     // `chaos max-carnage <target>`: complete the 2nd arg as the target (all-services + the service names).
+    // The target may be a comma-separated list, so complete the segment after the LAST comma - so
+    // `nic-driver,net-<tab>` finishes `net-stack` while the earlier listed targets are preserved verbatim.
     if "chaos".as_bytes() == cmd && prior == 1 && words.clone().next() == Some("max-carnage".as_bytes()) {
         const TARGETS: &[&str] =
-            &["all-services", "supervisor", "block-driver", "fs", "logger", "xhci", "ehci", "shell"];
-        return complete_from_list(ctx, line, tok_start, TARGETS);
+            &["all-services", "supervisor", "block-driver", "fs", "logger", "xhci", "ehci", "shell", "nic-driver", "net-stack"];
+        let seg_start = {
+            let tok = &line.bytes()[tok_start..];
+            tok.iter().rposition(|&b| b == b',').map(|i| tok_start + i + 1).unwrap_or(tok_start)
+        };
+        return complete_from_list(ctx, line, seg_start, TARGETS);
+    }
+
+    // `kill <svc>[,svc,...]`: complete a service name plus the `all-services` keyword. kill takes a
+    // comma-separated list, so complete the segment after the LAST comma (like chaos max-carnage) - so
+    // `ehci,xh<tab>` finishes `ehci,xhci` while the earlier listed targets are preserved verbatim.
+    if "kill".as_bytes() == cmd && prior == 0 {
+        const KILL_TARGETS: &[&str] =
+            &["all-services", "supervisor", "block-driver", "fs", "logger", "xhci", "ehci", "shell", "nic-driver", "net-stack"];
+        let seg_start = {
+            let tok = &line.bytes()[tok_start..];
+            tok.iter().rposition(|&b| b == b',').map(|i| tok_start + i + 1).unwrap_or(tok_start)
+        };
+        return complete_from_list(ctx, line, seg_start, KILL_TARGETS);
+    }
+
+    // `spawn <svc>[,svc,...]`: complete the demo/app services, comma-list aware (segment after last comma).
+    if "spawn".as_bytes() == cmd && prior == 0 {
+        const SPAWN_TARGETS: &[&str] = &["ping", "pong"];
+        let seg_start = {
+            let tok = &line.bytes()[tok_start..];
+            tok.iter().rposition(|&b| b == b',').map(|i| tok_start + i + 1).unwrap_or(tok_start)
+        };
+        return complete_from_list(ctx, line, seg_start, SPAWN_TARGETS);
+    }
+
+    // `ping [count N] [bytes N] <ip>`: the option keywords may appear in either order before the IP, so
+    // complete them at ANY position where the token prefix-matches one not already used (not just first).
+    if "ping".as_bytes() == cmd {
+        const PING_OPTS: &[&str] = &["count", "bytes", "version", "help"];
+        let mut avail = [""; 2];
+        let mut a = 0usize;
+        for &k in PING_OPTS {
+            let used = head.split(|&b| b == b' ').any(|w| w == k.as_bytes());
+            if !used && a < avail.len() { avail[a] = k; a += 1; }
+        }
+        return complete_from_list(ctx, line, tok_start, &avail[..a]);
     }
 
     if let Some((_, cands)) = SUBCMD_FIRST.iter().find(|(c, _)| c.as_bytes() == cmd) {
@@ -704,10 +776,15 @@ struct History {
     lines: [[u8; MAX_LINE]; HIST_MAX],
     lens: [usize; HIST_MAX],
     n: usize,
+    /// One-shot lazy-load gate: the disk history is NOT read at startup (that would touch fs on the
+    /// prompt's critical path); it is loaded on the FIRST up-arrow and merged behind the session, and
+    /// this flag ensures that happens exactly once - success OR bounded-miss - so every later up-arrow
+    /// is instant and never re-touches fs.
+    loaded: bool,
 }
 impl History {
     fn new() -> Self {
-        History { lines: [[0u8; MAX_LINE]; HIST_MAX], lens: [0; HIST_MAX], n: 0 }
+        History { lines: [[0u8; MAX_LINE]; HIST_MAX], lens: [0; HIST_MAX], n: 0, loaded: false }
     }
     fn len(&self) -> usize { self.n }
     fn get(&self, i: usize) -> &[u8] { &self.lines[i][..self.lens[i]] }
@@ -724,6 +801,64 @@ impl History {
         self.lines[self.n][..l].copy_from_slice(&line[..l]);
         self.lens[self.n] = l;
         self.n += 1;
+    }
+    /// Best-effort persistence to `/.gsh_history` (§15: history is shell-OWNED state, externalized to the
+    /// fs so a `kill shell` respawn reconstructs it). History is an ENHANCEMENT, never a requirement, so
+    /// neither path may hang the prompt on a slow/down fs (§26.7): the LOAD is lazy (only when the user
+    /// runs out of session history) and bounded, the SAVE is deadline-bounded (a true fire-and-forget save
+    /// is blocked by fs's single-endpoint block-driver multiplexing - see `save`). A rug-pulled fs is then a
+    /// non-event - no recall this session, shell fully usable - and both resume when fs heals.
+    ///
+    /// LAZY + one-shot + merge-behind. Not called at startup, and not merely on the first up-arrow - only
+    /// when the user navigates PAST their last session command (up-arrow at the oldest in-memory entry) AND
+    /// there is room (len < HIST_MAX), so a session that already fills the ring never touches fs at all. Runs
+    /// at most once (the `loaded` gate, set even on a bounded miss so later up-arrows never re-touch fs).
+    /// Bounded: a wedged/absent fs just leaves the session's own commands. The file's lines are OLDER than
+    /// anything typed this session, so they merge BEHIND the session commands (newest, kept); `push` drops
+    /// the oldest - a file line - if the merge exceeds HIST_MAX. `#[inline(never)]` keeps its ~4 KiB frame
+    /// off the interactive key path (the shell's user stack is tight).
+    #[inline(never)]
+    fn load(&mut self, ctx: &ServiceContext) {
+        if self.loaded { return; }
+        self.loaded = true;
+        let path = b"/.gsh_history";
+        let sz = match fs_stat_bounded(ctx, path, HIST_LOAD_SECS) { Some((s, false)) if s > 0 => s as usize, _ => return };
+        let sz = sz.min(HIST_MAX * (MAX_LINE + 1));
+        let mut buf = [0u8; HIST_MAX * (MAX_LINE + 1)];
+        if !read_file_exact_bounded(ctx, path, 0, &mut buf[..sz], HIST_LOAD_SECS) { return; }
+        // Snapshot the session lines (newest, must survive), rebuild the ring as [file lines..., session
+        // lines], so up-arrow walks the session first and the file underneath, oldest dropped first.
+        let mut sess = [[0u8; MAX_LINE]; HIST_MAX];
+        let mut sess_len = [0usize; HIST_MAX];
+        let sn = self.n;
+        for i in 0..sn { let l = self.get(i); sess[i][..l.len()].copy_from_slice(l); sess_len[i] = l.len(); }
+        self.n = 0;
+        for l in buf[..sz].split(|&b| b == b'\n') {
+            if !l.is_empty() { self.push(l); }
+        }
+        for i in 0..sn { self.push(&sess[i][..sess_len[i]]); }
+    }
+    /// Deadline-bounded write-through of the <=16-line ring to `/.gsh_history`. Bounded (HIST_SAVE_SECS)
+    /// so a mid-restart / slow fs cannot hang the prompt forever, but NOT fire-and-forget: a true
+    /// no-reply async write is blocked by an fs-architecture constraint - fs multiplexes client requests
+    /// and its block-driver replies on ONE endpoint and relies on clients being synchronous (one in-flight),
+    /// so a second client message queued during an fs transaction gets consumed by fs's `block_rpc` as a
+    /// stray block reply, breaking the transaction and the queued command. Making the save fire-and-forget
+    /// needs fs to separate its block-driver reply channel first (see the fork report / follow-up). Until
+    /// then this stays synchronous: instant on a healthy fs, a bounded (<=HIST_SAVE_SECS) shrug on a wedged
+    /// one - best-effort either way, never an error surfaced to the user (§26.7). `#[inline(never)]` keeps
+    /// its buffer off the Enter path (tight user stack).
+    #[inline(never)]
+    fn save(&self, ctx: &ServiceContext) {
+        let path: &[u8] = b"/.gsh_history";
+        let mut buf = [0u8; HIST_MAX * (MAX_LINE + 1)];
+        let mut pos = 0usize;
+        for i in 0..self.n {
+            let l = self.get(i);
+            buf[pos..pos + l.len()].copy_from_slice(l); pos += l.len();
+            buf[pos] = b'\n'; pos += 1;
+        }
+        let _ = fs_request_bounded(ctx, OP_WRITE_FILE, path, &buf[..pos], HIST_SAVE_SECS);
     }
 }
 
@@ -1002,6 +1137,9 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         "mem"     => cmd_mem(ctx, out),
         "cores"   => cmd_cores(ctx, out),
         "date"    => cmd_date(ctx, if argc >= 2 { args[1] } else { "" }, out),
+        "net"     => cmd_net(ctx, s["net".len()..].trim(), out),
+        "ping"    => cmd_ping(ctx, s["ping".len()..].trim(), out),
+        "sock"    => cmd_sock(ctx, out),
         "uptime"  => cmd_uptime(ctx),
         "status"  => cmd_status(ctx),
         "observe" => if argc >= 2 && args[1] == "now" { cmd_observe_now(ctx) } else { cmd_observe_live(ctx) },
@@ -1013,7 +1151,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         // service-control - on the Result model: `assert fails spawn supervisor` holds (a
         // protected core service is `Err(Denied)`); a missing arg is a usage `Err`.
         "spawn"   => {
-            if argc < 2 { ctx.console_writeln("usage: spawn <name>"); Err(ShellError::Unknown) }
+            if argc < 2 { ctx.console_writeln("usage: spawn <svc> | <svc>,<svc>,...   (e.g. spawn ping,pong)"); Err(ShellError::Unknown) }
             else { cmd_spawn(ctx, args[1]) }
         }
         // Phase-0 naming-migration diagnostics (docs/naming-design.md).
@@ -1023,7 +1161,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         }
         "spawnwired" => cmd_spawnwired(ctx),
         "kill"    => {
-            if argc < 2 { ctx.console_writeln("usage: kill <name>"); Err(ShellError::Unknown) }
+            if argc < 2 { ctx.console_writeln("usage: kill <svc> | <svc>,<svc>,... | all-services   ('help kill' for detail)"); Err(ShellError::Unknown) }
             else { cmd_kill(ctx, args[1]) }
         }
         "restart" => {
@@ -3287,7 +3425,7 @@ fn save_report(ctx: &ServiceContext, path: &[u8], data: &[u8]) -> bool {
     // fs, so the write must time out gracefully rather than hang the shell (the max-carnage aggregate
     // report is small → this single-message path).
     if data.len() <= IO_CHUNK {
-        return matches!(fs_request_bounded(ctx, OP_WRITE_FILE, path, data)
+        return matches!(fs_request_bounded(ctx, OP_WRITE_FILE, path, data, SAVE_FS_MAX_SECS)
             .as_ref().map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK)));
     }
     if !fs_write_new(ctx, path, data.len() as u64) { return false; }
@@ -3393,7 +3531,7 @@ const UTIL_VERSION: &str = "0.1.0";
 /// Utilities that self-document (gates the `help`/`version` intercept in `execute`).
 const UTILS: &[&str] = &[
     "help", "result", "run", "assert", "selfcheck",
-    "echo", "input", "clear", "about", "mem", "cores", "date", "uptime", "status", "observe", "caps", "roster",
+    "echo", "input", "clear", "about", "mem", "cores", "date", "net", "ping", "sock", "uptime", "status", "observe", "caps", "roster",
     "spawn", "kill", "restart", "reboot", "chaos", "drives", "ls", "cd", "read", "write", "edit", "fcap",
     "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count", "sort",
     "first", "last",
@@ -3447,6 +3585,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "fmt" => help_block(ctx, "fmt", "format a .gsh script to the GodspeedOS standard (in place)", &[
             ("fmt <path>", "format the script IN PLACE - one canonical layout, no options", "fmt /script.gsh"),
             ("fmt check <path>", "Ok if already canonical, else loud + Err; never writes", "fmt check /script.gsh"),
+            ("fmt <a>,<b>,...", "format (or check) several files - comma-separated, done one at a time", "fmt /x.gsh,/y.gsh"),
         ], true),
         "selfcheck" => help_block(ctx, "selfcheck", "run the built-in self-check suite (needs a flashed drive)", &[
             ("selfcheck", "run the embedded suite in memory; reports ran N, failed M", "selfcheck"),
@@ -3487,6 +3626,24 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("date", "full timestamp (weekday date time)", "date"),
             ("date epoch", "seconds since 1970-01-01", "date epoch"),
         ], true),
+        "net" => help_block(ctx, "net", "network status, DNS, and ARP host discovery", &[
+            ("net", "IP, gateway (+MAC), and whether the gateway pings", "net"),
+            ("net dns <host>", "resolve a hostname to an IPv4 address", "net dns example.com"),
+            ("net stats", "dump the NIC's raw registers (chip state: RE/RCR/RX ring)", "net stats"),
+            ("net arp <ip>", "resolve one host's MAC by ARP", "net arp 192.168.4.1"),
+            ("net scan", "ARP-sweep the local /24 for live hosts", "net scan"),
+            ("net renew", "re-run DHCP/ARP after plugging in a cable (recover without a reboot)", "net renew"),
+            ("net | write <path>", "snapshot the status to a file", "net | write /netstat.txt"),
+        ], true),
+        "ping" => help_block(ctx, "ping", "continuous ICMP echo to a raw IPv4 address (no DNS)", &[
+            ("ping <ip>", "ping continuously (round-trip time + TTL per reply); q quits, then stats", "ping 192.168.4.1"),
+            ("ping count <N> <ip>", "send N echoes then stop and print statistics", "ping count 4 8.8.8.8"),
+            ("ping bytes <N> <ip>", "set the ICMP data size (default 32, max 1024)", "ping bytes 64 8.8.8.8"),
+            ("ping count <N> <ip> | write <path>", "capture a bounded run to a file", "ping count 4 8.8.8.8 | write /ping.txt"),
+        ], true),
+        "sock" => help_block(ctx, "sock", "a UDP socket as a capability (demo)", &[
+            ("sock", "open a socket cap, send a datagram through it, report the round-trip", "sock"),
+        ], true),
         "uptime" => help_block(ctx, "uptime", "how long the system has been up", &[
             ("uptime", "uptime (Nd HH:MM:SS) + seconds since boot", "uptime"),
             ("uptime | to json|yaml", "piped: a record with 'uptime' + 'seconds'", "uptime | to yaml"),
@@ -3506,14 +3663,19 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("caps [service] | <verb>", "piped: records resource/rights", "caps logger | where rights~send"),
         ], true),
         "spawn" => help_block(ctx, "spawn", "start a service", &[
-            ("spawn <name>", "start the service <name>", "spawn pong"),
+            ("spawn <svc>", "start the service <svc>", "spawn pong"),
+            ("spawn <svc>,<svc>,...", "start several at once (comma-separated, NO spaces)", "spawn ping,pong"),
         ], true),
-        "kill" => help_block(ctx, "kill", "stop a service", &[
-            ("kill <name>", "stop the running service <name>", "kill pong"),
+        "kill" => help_block(ctx, "kill", "stop a service (it self-heals - the supervisor respawns it)", &[
+            ("kill <svc>", "kill one service; it recovers (only the kernel never dies)", "kill pong"),
+            ("kill <svc>,<svc>,...", "kill several at once (comma-separated, NO spaces)", "kill ehci,xhci,fs"),
+            ("kill all-services", "nuke EVERY service - drivers, storage, net, logger, supervisor, and this shell last; each self-heals", "kill all-services"),
+            ("(per-service rules still apply)", "supervisor is killable + kernel-respawned; spawn/restart of it stay refused", "kill supervisor"),
         ], true),
         "restart" => help_block(ctx, "restart", "restart a service", &[
             ("restart <name>", "restart (re-placed per contract)", "restart pong"),
             ("restart <name> <core>", "restart on core <core>", "restart pong 2"),
+            ("restart <a>,<b>,...", "restart several, each per its own contract (no core override)", "restart fs,logger"),
         ], true),
         "reboot" => help_block(ctx, "reboot", "hardware reset", &[
             ("reboot", "reset the machine", "reboot"),
@@ -3525,7 +3687,8 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("chaos flood-storm <svc> [rounds]", "saturate a service's IPC queue with try_send; verify it drains + stays alive (the other axis: 'overwhelmed', not 'gone')", "chaos flood-storm fs 5"),
             ("chaos mem-pressure [rounds]", "spawn a mem-pressure that allocs to its limit, kill it, confirm the memory is reclaimed (alloc-to-limit + no leak, S7)", "chaos mem-pressure 5"),
             ("chaos spawn-storm [count]", "spawn mem-pressure tasks until the task-pool/memory ceiling REFUSES one (loud Err, no panic), then kill all + confirm full reclaim", "chaos spawn-storm"),
-            ("chaos max-carnage <all-services|svc> [n]", "the chaos monkey: storm RANDOM services (all-services) or aim every round at ONE (e.g. fs), under system-wide mem-pressure + spawn-storm; proves the KERNEL survives. 'q' aborts (via SERIAL if it storms the USB keyboard drivers)", "chaos max-carnage all-services 50"),
+            ("chaos max-carnage <all-services|svc|svc,svc> <n>", "the chaos monkey: 'all-services' = RANDOM carnage over the whole restartable set each round (supervisor a normal victim, nothing protected-last); or aim at one / a comma-list. A TARGET AND A ROUNDS COUNT ARE REQUIRED - there is no uncapped default (a firehose is a big N; q aborts early). Under system-wide mem-pressure + spawn-storm; proves the system RECOVERS from any kill order. 'q' aborts (via SERIAL if it storms the USB keyboard drivers)", "chaos max-carnage all-services 5000"),
+            ("chaos link-flap [n]", "networking-specific: simulate a cable unplug/replug n times (a report override, no hardware touch); net-stack notices the loss and self-configures on the up edge. tests LINK recovery, not process death. 'q' aborts", "chaos link-flap 3"),
         ], true),
         "drives" => help_block(ctx, "drives", "manage attached disks (records when piped)", &[
             ("drives", "list attached drive(s)", "drives"),
@@ -3562,6 +3725,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "mkdir" => help_block(ctx, "mkdir", "create a directory", &[
             ("mkdir <path>", "create the directory <path>", "mkdir /docs"),
             ("mkdir <path> parents", "create missing parent dirs too", "mkdir /a/b/c parents"),
+            ("mkdir <a>,<b>,...", "create several directories (comma-separated)", "mkdir /docs,/tmp"),
         ], true),
         "copy" => help_block(ctx, "copy", "copy a file or a whole subtree", &[
             ("copy <src> <dst>", "copy file <src> to <dst>", "copy /docs/a.txt /docs/b.txt"),
@@ -3576,6 +3740,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "delete" => help_block(ctx, "delete", "remove a file, empty directory, or whole subtree", &[
             ("delete <path>", "remove the file/empty dir <path>", "delete /docs/old.txt"),
             ("delete <path> recursive", "remove directory <path> and everything under it", "delete /docs recursive"),
+            ("delete <a>,<b>,...", "remove several (comma-separated; recursive applies to all)", "delete /a.txt,/b.txt"),
         ], true),
         "find" => help_block(ctx, "find", "search the tree by name (substring/glob; records when piped)", &[
             ("find <name>", "matches names containing <name>", "find report"),
@@ -3639,6 +3804,18 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
     match (util, sub) {
         ("date", "epoch") => help_block(ctx, "date epoch", "seconds since 1970-01-01", &[
             ("date epoch", "print epoch seconds (not POSIX 'unix')", "date epoch"),
+        ], false),
+        ("net", "dns") => help_block(ctx, "net dns", "resolve a hostname to an IPv4 address", &[
+            ("net dns <host>", "DNS A-record lookup via net-stack (slirp resolver)", "net dns example.com"),
+        ], false),
+        ("net", "arp") => help_block(ctx, "net arp", "resolve one host's MAC by ARP", &[
+            ("net arp <ip>", "broadcast a who-has and print the responder's MAC", "net arp 192.168.4.1"),
+        ], false),
+        ("net", "scan") => help_block(ctx, "net scan", "ARP-sweep the local /24 for live hosts", &[
+            ("net scan", "list every host on your /24 that answers ARP", "net scan"),
+        ], false),
+        ("net", "renew") => help_block(ctx, "net renew", "reconfigure the network without a reboot", &[
+            ("net renew", "re-run DHCP + ARP (recover a link that came up after boot)", "net renew"),
         ], false),
         ("observe", "now") => help_block(ctx, "observe now", "one-shot metrics frame", &[
             ("observe now", "print a single metrics frame and return", "observe now"),
@@ -3711,15 +3888,17 @@ static HELP: &[HelpRow] = &[
     Row("mem", "physical memory usage"),
     Row("date [epoch]", "date + time; 'epoch' = secs since 1970"),
     Row("uptime", "how long the system has been up (records when piped)"),
+    Row("net", "network status: IP, gateway, ping"),
+    Row("ping", "continuous ICMP echo (q quits): ping 8.8.8.8"),
     Gap,
     Sec("Services"),
     Row("status", "list all live tasks"),
     Row("observe [now]", "live view (q to quit) / one-shot frame"),
     Row("caps [service]", "capabilities (default: this shell)"),
     Row("roster", "example record service (a typed table; try roster | where role=core)"),
-    Row("spawn <name>", "start a service"),
-    Row("kill <name>", "stop a service"),
-    Row("restart <name> [core]", "restart a service"),
+    Row("spawn <svc>[,svc,...]", "start a service or a comma-list"),
+    Row("kill <svc>[,svc,...] | all-services", "stop a service, a comma-list, or every service"),
+    Row("restart <name>[,name,...] [core]", "restart a service or a comma-list"),
     Gap,
     Sec("Storage"),
     Row("drives [flash|label|reset|check]", "manage attached disks (drives help)"),
@@ -3728,11 +3907,11 @@ static HELP: &[HelpRow] = &[
     Row("read <path>", "print a file"),
     Row("write [append|prepend] <path>", "create/overwrite/append/prepend (also: <prod> | write …)"),
     Row("edit <path>", "full-screen text editor (^S save, ^Q quit)"),
-    Row("mkdir <path> [parents]", "create a directory"),
+    Row("mkdir <path>[,path,...] [parents]", "create a directory or a comma-list"),
     Row("copy <src> <dst> [recursive]", "copy a file or subtree"),
     Row("move <src> <dst>", "relocate a file/dir"),
     Row("rename <path> <name>", "rename an entry in place"),
-    Row("delete <path> [recursive]", "remove a file/dir/subtree"),
+    Row("delete <path>[,path,...] [recursive]", "remove a file/dir/subtree or a comma-list"),
     Row("find <pattern> [path]", "search by name (substring or *? glob)"),
     Row("tree [path]", "print the directory hierarchy"),
     Row("match <pattern> [path]", "keep lines matching (also: <prod> | match)"),
@@ -4059,6 +4238,576 @@ fn cmd_date(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
     Ok(())
 }
 
+/// `net` - network status + DNS, brokered from the `net-stack` service (utilities/40_net.md). Dispatches
+/// `net` (status) vs `net dns <host>` (resolve a hostname). A pipe PRODUCER: `net | write /f`.
+/// Parse "a.b.c.d" into 4 octets (no_std, no allocation). None if not a well-formed IPv4 literal.
+fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+    let mut out = [0u8; 4];
+    let mut n = 0usize;
+    for part in s.split('.') {
+        if n >= 4 || part.is_empty() || part.len() > 3 { return None; }
+        let mut v: u32 = 0;
+        for b in part.bytes() {
+            if !b.is_ascii_digit() { return None; }
+            v = v * 10 + (b - b'0') as u32;
+        }
+        if v > 255 { return None; }
+        out[n] = v as u8;
+        n += 1;
+    }
+    if n == 4 { Some(out) } else { None }
+}
+
+/// Pace continuous `ping` ~1 s by the WALL CLOCK (RTC seconds), returning early with `true` on q/Q/ESC.
+/// The TSC is unreliable for this on some hardware: the AMD T630's CPUID-based TSC calibration is wrong,
+/// so a TSC interval collapsed to ~0 and the ping FLOODED (200 lines in a blink). The RTC second is
+/// portable and never floods - it just waits for the wall-clock second to tick over.
+fn ping_wait_or_quit(ctx: &ServiceContext) -> bool {
+    // Deglitched monotonic seconds, not the raw RTC: a single CMOS misread (the T630's "4383d" glitch)
+    // would otherwise skip or stall a pace interval.
+    let start = ctx.epoch_secs_monotonic();
+    loop {
+        if let Some(b) = ctx.try_console_read() {
+            if b == b'q' || b == b'Q' || b == 0x1b { return true; }
+        }
+        if ctx.epoch_secs_monotonic() != start { return false; }   // wall-clock second ticked (~1 s)
+        ctx.yield_cpu();
+    }
+}
+
+/// `ping [bytes N] [count N] <ip>` - a Windows-style continuous ICMP echo to a raw IPv4, via net-stack.
+/// One `Reply from ...` line per echo (round-trip time + TTL), `q` quits, then a statistics summary.
+/// `count N` sends N and stops; `bytes N` sets the ICMP data size (default 32). No DNS - raw IP only.
+fn cmd_ping(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+    let usage = "usage: ping [bytes N] [count N] <ip>   e.g. ping 8.8.8.8   ping bytes 64 192.168.4.1   (q quits)";
+    let mut bytes: usize = 32;
+    let mut count: Option<u32> = None;
+    let mut ip_str: &str = "";
+    let mut toks = arg.split_whitespace();
+    while let Some(t) = toks.next() {
+        match t {
+            "bytes" | "size" => match toks.next().and_then(|s| s.parse::<usize>().ok()) {
+                Some(v) => bytes = v,
+                None => { ctx.console_writeln(usage); return Ok(()); }
+            },
+            "count" | "n" => match toks.next().and_then(|s| s.parse::<u32>().ok()) {
+                Some(v) => count = Some(v),
+                None => { ctx.console_writeln(usage); return Ok(()); }
+            },
+            other => ip_str = other,
+        }
+    }
+    if ip_str.is_empty() { ctx.console_writeln(usage); return Ok(()); }
+    let ip = match parse_ipv4(ip_str) {
+        Some(ip) => ip,
+        None => { out.line_fmt(ctx, format_args!("ping: '{}' is not an IPv4 address - try a raw IP like 8.8.8.8 (names need DNS)", ip_str)); return Ok(()); }
+    };
+    let b = bytes.min(1024);                          // matches net-stack's PING_MAX_PAYLOAD
+    let bl = (b as u16).to_le_bytes();
+    let msg = Message::from_bytes(&[3, ip[0], ip[1], ip[2], ip[3], bl[0], bl[1]]);
+    // Continuous mode shows the q hint up front so it is obvious BEFORE the replies start scrolling.
+    if count.is_none() {
+        out.line_fmt(ctx, format_args!("Pinging {}.{}.{}.{} with {} bytes of data (press q to quit):", ip[0], ip[1], ip[2], ip[3], b));
+    } else {
+        out.line_fmt(ctx, format_args!("Pinging {}.{}.{}.{} with {} bytes of data:", ip[0], ip[1], ip[2], ip[3], b));
+    }
+
+    let mut sent = 0u32; let mut recv = 0u32;
+    let mut rmin = u16::MAX; let mut rmax = 0u16; let mut rsum = 0u64; let mut vcount = 0u32;
+    while count.map_or(true, |c| sent < c) {
+        sent += 1;
+        // ABORTABLE per echo, so q quits DURING the wait for a reply, not only in the pace between echoes
+        // (a blocking request_with_reply here left q feeling unresponsive). Reacquire once on a timeout.
+        let outcome = match ctx.request_with_reply_abortable("net-stack", &msg, 5) {
+            ReqOutcome::Timeout if ctx.reacquire_by_name("net-stack") => ctx.request_with_reply_abortable("net-stack", &msg, 5),
+            other => other,
+        };
+        match outcome {
+            ReqOutcome::Reply(r) => {
+                let p = r.payload_bytes();
+                if p.first() == Some(&1) && p.len() >= 4 {
+                    let rtt = u16::from_le_bytes([p[1], p[2]]);   // MICROSECONDS (net-stack reports us now)
+                    let ttl = p[3];
+                    recv += 1;
+                    // us under a millisecond (LAN), ms.d above it (WAN). 0 = below the clock's resolution.
+                    if rtt == 0 {
+                        out.line_fmt(ctx, format_args!("Reply from {}.{}.{}.{}: bytes={} time<1us TTL={}", ip[0], ip[1], ip[2], ip[3], b, ttl));
+                    } else if rtt < 1000 {
+                        out.line_fmt(ctx, format_args!("Reply from {}.{}.{}.{}: bytes={} time={}us TTL={}", ip[0], ip[1], ip[2], ip[3], b, rtt, ttl));
+                    } else {
+                        out.line_fmt(ctx, format_args!("Reply from {}.{}.{}.{}: bytes={} time={}ms TTL={}", ip[0], ip[1], ip[2], ip[3], b, (rtt as u32 + 500) / 1000, ttl));
+                    }
+                    if rtt < rmin { rmin = rtt; }
+                    if rtt > rmax { rmax = rtt; }
+                    rsum += rtt as u64; vcount += 1;
+                } else if p.first() == Some(&2) {
+                    // net-stack reports the NIC link is down - keep pinging at the same cadence so it is
+                    // clearly still trying, and it resumes the moment the cable is back.
+                    out.line_fmt(ctx, format_args!("No reply from {}.{}.{}.{}: no link (cable unplugged?)", ip[0], ip[1], ip[2], ip[3]));
+                } else {
+                    out.line_fmt(ctx, format_args!("Request timed out."));
+                }
+            }
+            ReqOutcome::Aborted => { sent = sent.saturating_sub(1); break; }   // q pressed mid-echo
+            // Do NOT quit on a slow/unavailable net-stack - a continuous ping has no end. Print and keep
+            // going; the user quits with q. (With the shorter ping budget this is now rare.)
+            ReqOutcome::Timeout => { out.line_fmt(ctx, format_args!("No reply from {}.{}.{}.{}: net-stack not responding", ip[0], ip[1], ip[2], ip[3])); }
+        }
+        if count.map_or(false, |c| sent >= c) { break; }   // last echo done: no trailing interval
+        if ping_wait_or_quit(ctx) { break; }                // ~1 s pace (RTC), q/ESC quits
+    }
+
+    let lost = sent.saturating_sub(recv);
+    let loss = if sent > 0 { lost * 100 / sent } else { 0 };
+    out.line_fmt(ctx, format_args!(""));
+    out.line_fmt(ctx, format_args!("Ping statistics for {}.{}.{}.{}:", ip[0], ip[1], ip[2], ip[3]));
+    out.line_fmt(ctx, format_args!("    Packets: Sent = {}, Received = {}, Lost = {} ({}% loss)", sent, recv, lost, loss));
+    if vcount > 0 {
+        let avg = rsum / vcount as u64;
+        // Same unit for the whole summary, chosen by the average (a session's replies cluster together):
+        // us for a LAN-scale ping, integer ms for a WAN-scale one.
+        if avg < 1000 {
+            out.line_fmt(ctx, format_args!("Approximate round trip times in microseconds:"));
+            out.line_fmt(ctx, format_args!("    Minimum = {}us, Maximum = {}us, Average = {}us", rmin, rmax, avg));
+        } else {
+            out.line_fmt(ctx, format_args!("Approximate round trip times in milliseconds:"));
+            out.line_fmt(ctx, format_args!("    Minimum = {}ms, Maximum = {}ms, Average = {}ms",
+                (rmin as u64 + 500) / 1000, (rmax as u64 + 500) / 1000, (avg + 500) / 1000));
+        }
+    } else if recv > 0 {
+        out.line_fmt(ctx, format_args!("    (round-trip time unavailable - this host's TSC clock is uncalibrated)"));
+    }
+    Ok(())
+}
+
+/// `net stats` - dump the NIC's raw registers (chip state) to the console. Queries nic-driver ([5]);
+/// the reply is chip-tagged (0 = RTL8168, 1 = e1000). Reads only - shows CR (RE/TE), config, ring
+/// bases, and each RX descriptor's OWN/len, so you can see whether the receiver is even enabled and
+/// whether frames are sitting in the ring.
+fn net_stats_dump(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
+    let req = Message::from_bytes(&[5u8]);
+    let reply = match net_query(ctx, "nic-driver", &req, 3) {
+        NetQ::Reply(r) => r,
+        NetQ::Aborted => { ctx.console_writeln("net: aborted"); return Ok(()); }
+        NetQ::Timeout => { ctx.console_writeln("net: nic-driver did not answer the register dump"); return Ok(()); }
+    };
+    let p = reply.payload_bytes();
+    if p.first() == Some(&0) && p.len() >= 43 {
+        let cr = p[1]; let c9346 = p[2]; let phy = p[3]; let rx_idx = p[4];
+        let imr = u16::from_le_bytes([p[5], p[6]]);
+        let isr = u16::from_le_bytes([p[7], p[8]]);
+        let rms = u16::from_le_bytes([p[9], p[10]]);
+        let rcr = u32::from_le_bytes([p[11], p[12], p[13], p[14]]);
+        let tcr = u32::from_le_bytes([p[15], p[16], p[17], p[18]]);
+        let tnpds = u32::from_le_bytes([p[19], p[20], p[21], p[22]]);
+        let rdsar = u32::from_le_bytes([p[23], p[24], p[25], p[26]]);
+        let spd = if phy & 0x10 != 0 { "1000M" } else if phy & 0x08 != 0 { "100M" }
+                  else if phy & 0x04 != 0 { "10M" } else { "?" };
+        out.line(ctx, "NIC registers (RTL8168):");
+        out.line_fmt(ctx, format_args!("  CR        0x{:02x}   RE={} TE={} RST={}", cr, (cr>>3)&1, (cr>>2)&1, (cr>>4)&1));
+        out.line_fmt(ctx, format_args!("  9346CR    0x{:02x}   {}", c9346, if c9346 == 0xC0 { "unlocked" } else { "locked" }));
+        out.line_fmt(ctx, format_args!("  PHYSTATUS 0x{:02x}   link={} spd={} dup={}", phy, (phy>>1)&1, spd, if phy&1!=0 {"full"} else {"half"}));
+        out.line_fmt(ctx, format_args!("  IMR       0x{:04x}", imr));
+        out.line_fmt(ctx, format_args!("  ISR       0x{:04x}", isr));
+        out.line_fmt(ctx, format_args!("  RMS       0x{:04x}   ({} bytes)", rms, rms));
+        out.line_fmt(ctx, format_args!("  RCR       0x{:08x}   AAP={} APM={} AM={} AB={}", rcr, rcr&1, (rcr>>1)&1, (rcr>>2)&1, (rcr>>3)&1));
+        out.line_fmt(ctx, format_args!("  TCR       0x{:08x}", tcr));
+        out.line_fmt(ctx, format_args!("  TNPDS.lo  0x{:08x}   TX ring base", tnpds));
+        out.line_fmt(ctx, format_args!("  RDSAR.lo  0x{:08x}   RX ring base", rdsar));
+        out.line_fmt(ctx, format_args!("  RX ring (rx_idx={}):", rx_idx));
+        for i in 0..4 {
+            let o = 27 + i * 4;
+            let d = u32::from_le_bytes([p[o], p[o+1], p[o+2], p[o+3]]);
+            out.line_fmt(ctx, format_args!("    [{}] opts1=0x{:08x}  OWN={} len={}", i, d, (d>>31)&1, d & 0x3FFF));
+        }
+    } else if p.first() == Some(&1) && p.len() >= 25 {
+        let g = |o: usize| u32::from_le_bytes([p[o], p[o+1], p[o+2], p[o+3]]);
+        out.line(ctx, "NIC registers (Intel e1000):");
+        out.line_fmt(ctx, format_args!("  CTRL   0x{:08x}", g(1)));
+        out.line_fmt(ctx, format_args!("  STATUS 0x{:08x}   LU={}", g(5), (g(5)>>1)&1));
+        out.line_fmt(ctx, format_args!("  RCTL   0x{:08x}   EN={}", g(9), (g(9)>>1)&1));
+        out.line_fmt(ctx, format_args!("  TCTL   0x{:08x}", g(13)));
+        out.line_fmt(ctx, format_args!("  RDH    0x{:08x}", g(17)));
+        out.line_fmt(ctx, format_args!("  RDT    0x{:08x}", g(21)));
+    } else {
+        ctx.console_writeln("net: no register dump available for this NIC");
+    }
+    Ok(())
+}
+
+fn cmd_net(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+    let arg = arg.trim();
+    if arg == "dns" {
+        ctx.console_writeln("net: usage: net dns <hostname>  (e.g. net dns example.com)");
+        return Err(ShellError::Unknown);
+    }
+    if let Some(host) = arg.strip_prefix("dns ") {
+        let host = host.trim();
+        if host.is_empty() {
+            ctx.console_writeln("net: usage: net dns <hostname>  (e.g. net dns example.com)");
+            return Err(ShellError::Unknown);
+        }
+        return net_dns(ctx, host, out);
+    }
+    if arg == "stats" {
+        return net_stats_dump(ctx, out);
+    }
+    if arg == "arp" {
+        ctx.console_writeln("net: usage: net arp <ip>   (e.g. net arp 192.168.4.1)");
+        return Err(ShellError::Unknown);
+    }
+    if let Some(ips) = arg.strip_prefix("arp ") {
+        return net_arp(ctx, ips.trim(), out);
+    }
+    if arg == "scan" {
+        return net_scan(ctx, out);
+    }
+    if arg == "renew" {
+        return net_renew(ctx, out);
+    }
+    if !arg.is_empty() {
+        ctx.console_writeln("net: unknown subcommand - try net, net dns <host>, net stats, net arp <ip>, net scan, net renew, or net help");
+        return Err(ShellError::Unknown);
+    }
+    net_status(ctx, out)
+}
+
+/// `net renew` - re-run net-stack's DHCP/ARP/ICMP dance (op 8) so a link that came up AFTER boot (a
+/// cable plugged in later) reconfigures the stack without a reboot. Bounded + abortable with q.
+fn net_renew(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
+    out.line_fmt(ctx, format_args!("renewing (DHCP + ARP + ping the gateway, press q to abort)"));
+    let req = Message::from_bytes(&[8u8]);
+    let outcome = match ctx.request_with_reply_abortable("net-stack", &req, 30) {
+        ReqOutcome::Timeout if ctx.reacquire_by_name("net-stack") => ctx.request_with_reply_abortable("net-stack", &req, 30),
+        other => other,
+    };
+    match outcome {
+        ReqOutcome::Reply(r) => {
+            let p = r.payload_bytes();
+            // status: our_ip(4) gateway(4) gw_mac(6) flags(1) dns(4); flags bit 0 = gateway resolved.
+            if p.len() >= 15 && (p[14] & 1) != 0 {
+                out.line_fmt(ctx, format_args!("network up - {}.{}.{}.{}, gateway {}.{}.{}.{}{}",
+                    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
+                    if p[14] & 2 != 0 { " (ping ok)" } else { "" }));
+            } else if p.len() >= 15 {
+                out.line_fmt(ctx, format_args!("still no gateway - is the cable in and the link up?"));
+            } else {
+                out.line_fmt(ctx, format_args!("net: net-stack gave a short reply"));
+            }
+        }
+        ReqOutcome::Aborted => out.line_fmt(ctx, format_args!("net renew: aborted")),
+        ReqOutcome::Timeout => out.line_fmt(ctx, format_args!("net: net-stack unavailable")),
+    }
+    Ok(())
+}
+
+/// `net arp <ip>` - resolve one host's hardware address by ARP (net-stack op 6).
+fn net_arp(ctx: &ServiceContext, ip_str: &str, out: &mut Out) -> Result<(), ShellError> {
+    let ip = match parse_ipv4(ip_str) {
+        Some(ip) => ip,
+        None => { out.line_fmt(ctx, format_args!("net arp: '{}' is not an IPv4 address", ip_str)); return Ok(()); }
+    };
+    out.line_fmt(ctx, format_args!("resolving {}.{}.{}.{} (press q to abort)", ip[0], ip[1], ip[2], ip[3]));
+    let req = Message::from_bytes(&[6, ip[0], ip[1], ip[2], ip[3]]);
+    // ABORTABLE (q). Reacquire once on a clean timeout (net-stack may have restarted).
+    let outcome = match ctx.request_with_reply_abortable("net-stack", &req, 8) {
+        ReqOutcome::Timeout if ctx.reacquire_by_name("net-stack") => ctx.request_with_reply_abortable("net-stack", &req, 8),
+        other => other,
+    };
+    match outcome {
+        ReqOutcome::Reply(r) => {
+            let p = r.payload_bytes();
+            if p.first() == Some(&1) && p.len() >= 7 {
+                out.line_fmt(ctx, format_args!("{}.{}.{}.{} is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    ip[0], ip[1], ip[2], ip[3], p[1], p[2], p[3], p[4], p[5], p[6]));
+            } else {
+                out.line_fmt(ctx, format_args!("{}.{}.{}.{}: no ARP reply (not on this subnet, or down)", ip[0], ip[1], ip[2], ip[3]));
+            }
+        }
+        ReqOutcome::Aborted => out.line_fmt(ctx, format_args!("net arp: aborted")),
+        ReqOutcome::Timeout => out.line_fmt(ctx, format_args!("net: net-stack did not answer the ARP query")),
+    }
+    Ok(())
+}
+
+/// `net scan` - ARP-sweep the local /24 (derived from our own IP) and list the hosts that answer.
+/// ARP-based, so it is fast and LAN-reliable. net-stack does the whole sweep in one op (op 7) and
+/// returns a 32-byte up-bitmap - one round trip per host, not a per-host poll from the shell.
+fn net_scan(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
+    // Reacquire net-stack by name on a clean miss/timeout - it may have come up late (its boot dance
+    // stalls ~26s on a dead link) and not be in our cap cache yet, exactly as net_arp does. Without this,
+    // running `net scan` before any other net command reported a bogus "net-stack unavailable".
+    let status0 = Message::from_bytes(&[0u8]);
+    let our0 = match ctx.request_with_reply_abortable("net-stack", &status0, 5) {
+        ReqOutcome::Timeout if ctx.reacquire_by_name("net-stack") => ctx.request_with_reply_abortable("net-stack", &status0, 5),
+        other => other,
+    };
+    let our = match our0 {
+        ReqOutcome::Reply(r) => { let p = r.payload_bytes(); if p.len() >= 4 { [p[0], p[1], p[2], p[3]] } else { [0u8; 4] } }
+        ReqOutcome::Aborted  => { out.line_fmt(ctx, format_args!("net scan: aborted")); return Ok(()); }
+        ReqOutcome::Timeout  => { out.line_fmt(ctx, format_args!("net: net-stack unavailable")); return Ok(()); }
+    };
+    out.line_fmt(ctx, format_args!("Scanning {}.{}.{}.0/24 for live hosts (press q to abort):", our[0], our[1], our[2]));
+    // Walk the /24 host-by-host (net-stack op 6 = one ARP resolve), driven FROM THE SHELL so an abort
+    // actually STOPS the work: q ends the loop and net-stack is only ever mid-ONE resolve (fast), never
+    // wedged finishing a 254-host sweep (which is why a batch op 7 left the NEXT command stuck). Each
+    // host's wait is itself abortable, so q lands instantly, and responders print as they are found.
+    let mut found = 0u32;
+    for x in 1..=254u16 {
+        let req = Message::from_bytes(&[6, our[0], our[1], our[2], x as u8]);
+        match ctx.request_with_reply_abortable("net-stack", &req, 3) {
+            ReqOutcome::Reply(r) => {
+                let p = r.payload_bytes();
+                if p.first() == Some(&1) && p.len() >= 7 {
+                    out.line_fmt(ctx, format_args!("  {}.{}.{}.{}", our[0], our[1], our[2], x));
+                    found += 1;
+                }
+            }
+            ReqOutcome::Aborted => { out.line_fmt(ctx, format_args!("net scan: aborted ({} found)", found)); return Ok(()); }
+            ReqOutcome::Timeout => {}   // this host did not answer in time; move on
+        }
+    }
+    out.line_fmt(ctx, format_args!("{} host(s) responded.", found));
+    Ok(())
+}
+
+/// `net dns <host>` - resolve a hostname to an IPv4 address. net-stack sends the DNS query to slirp's
+/// resolver; DNS depends on the host's own resolver, so "no answer" is a legitimate result, not a bug.
+fn net_dns(ctx: &ServiceContext, host: &str, out: &mut Out) -> Result<(), ShellError> {
+    // Request byte 0 = 1 (DNS), then the hostname. net-stack replies 5 bytes: [ok, ip0, ip1, ip2, ip3].
+    let hb = host.as_bytes();
+    if hb.len() > 255 {
+        ctx.console_writeln("net: hostname too long");
+        return Err(ShellError::Unknown);
+    }
+    let mut req = [0u8; 256];
+    req[0] = 1;
+    req[1..1 + hb.len()].copy_from_slice(hb);
+    let msg = Message::from_bytes(&req[..1 + hb.len()]);
+    // A DNS resolve waits on the server, which can take a moment. Route it through net_query (not a
+    // blocking send) so it is ABORTABLE: net_query polls q each round and advertises "press q to abort"
+    // if the reply does not come in the first second - so a slow or wedged resolve is escapable, not a
+    // silent hang.
+    ctx.console_writeln("net: resolving ...");
+    let reply = match net_query(ctx, "net-stack", &msg, 8) {
+        NetQ::Reply(r)   => r,
+        NetQ::Aborted    => { ctx.console_writeln("net: aborted"); return Ok(()); }
+        NetQ::Timeout    => { ctx.console_writeln("net: net-stack did not answer the resolve"); return Err(ShellError::Unknown); }
+    };
+    let p = reply.payload_bytes();
+    if p.len() >= 5 && p[0] == 1 {
+        out.line_fmt(ctx, format_args!("{} is {}.{}.{}.{}", host, p[1], p[2], p[3], p[4]));
+    } else if p.first() == Some(&2) {
+        out.line_fmt(ctx, format_args!("{}: the DNS server replied but returned no A record", host));
+    } else {
+        // Diagnostic: how many frames net-stack collected while waiting, and how many were UDP. Tells
+        // us "no reply arrived" (0 UDP) from "a reply arrived but did not match our port" (UDP > 0).
+        let (fr, ud) = if p.len() >= 7 { (p[5], p[6]) } else { (0, 0) };
+        let to = if p.len() >= 8 { p[7] } else { 0 };
+        out.line_fmt(ctx, format_args!("{}: no reply from the DNS server ({} frames, {} UDP, {} timeouts)", host, fr, ud, to));
+    }
+    Ok(())
+}
+
+/// `net` (bare) - the network status: IP, gateway (+MAC), and whether the gateway pings. Raw facts,
+/// no verdict (utilities/0_conventions.md rule 7).
+/// The outcome of a `net` query that a keypress can interrupt.
+enum NetQ { Reply(Message), Timeout, Aborted }
+
+/// A bounded request to `peer` that a `q`/`Q`/ESC keypress ABORTS - so a slow or stuck `net` can always
+/// be escaped back to the prompt. Sends the (idempotent) query once per second, checking the console for
+/// an abort key between tries, up to `max_secs`. Returns the reply, a timeout, or Aborted. (Safe under
+/// the piped shell-test: it waits for the prompt between commands, so no input is pending during `net`.)
+fn net_query(ctx: &ServiceContext, peer: &str, msg: &Message, max_secs: i64) -> NetQ {
+    for i in 0..=max_secs {
+        while let Some(b) = ctx.try_console_read() {
+            if b == b'q' || b == b'Q' || b == 0x1b { return NetQ::Aborted; }
+        }
+        if let Some(r) = ctx.request_with_reply_deadline(peer, msg, 1) { return NetQ::Reply(r); }
+        // Only tell the user about q if the reply DIDN'T come in the first second (a stall) - so a fast
+        // query stays clean, but a wedged one advertises how to escape it.
+        if i == 0 { ctx.console_writeln("net: waiting for a reply - press q to abort"); }
+        ctx.reacquire_by_name(peer);
+    }
+    NetQ::Timeout
+}
+
+fn net_status(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
+    // Diagnostic FIRST (independent of net-stack, so it shows even if net-stack is down): the NIC the
+    // KERNEL discovered - vendor:device and which register BAR it mapped. This is which chip nic-driver
+    // should be driving (Phase 4).
+    let vd = ctx.nic_vendor_device();
+    let chip = if vd == 0x8168_10EC { "RTL8168" } else if vd == 0x100E_8086 { "e1000" }
+               else if vd == 0 { "none" } else { "unknown" };
+    out.line_fmt(ctx, format_args!(
+        "nic      {:04x}:{:04x}  mmio {:#x}  ({})", vd & 0xFFFF, vd >> 16, ctx.nic_mmio_base(), chip));
+
+    // Query nic-driver directly (the shell holds ACQUIRE_ANY) for its MAC + link/TX/RX - proves whether
+    // MMIO reaches the NIC (Phase 4). Abortable: press q if it stalls.
+    let mut nic_link_up = true;   // the LIVE link (p[7]); ties net-stack's gateway/ping lines to reality
+    let nreq = Message::from_bytes(&[3u8]);
+    match net_query(ctx, "nic-driver", &nreq, 3) {
+        NetQ::Aborted => { ctx.console_writeln("net: aborted"); return Ok(()); }
+        NetQ::Timeout => {} // no nic diagnostic this time - fall through to the net-stack status
+        NetQ::Reply(r) => {
+            let p = r.payload_bytes();
+            if p.len() >= 7 {
+                out.line_fmt(ctx, format_args!(
+                    "nic-mac  {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}  reset {}",
+                    p[1], p[2], p[3], p[4], p[5], p[6],
+                    if p[0] == 1 { "ok" } else { "TIMEOUT (MMIO not reaching the chip)" }));
+            }
+            // Extended status (RTL8168 Stage B, 15 bytes): live link + TX/RX counts, so the TV shows the
+            // whole bring-up story without the serial log.
+            if p.len() >= 15 {
+                nic_link_up = p[7] != 0;   // remember the live link for the net-stack lines below
+                let rx_len = u16::from_le_bytes([p[9], p[10]]);
+                let tx_cnt = u16::from_le_bytes([p[11], p[12]]);
+                let rx_cnt = u16::from_le_bytes([p[13], p[14]]);
+                // Speed/duplex from the 32-byte hardware status; a 15-byte (e1000/older) reply omits it.
+                let (spd, dup) = if p.len() >= 32 {
+                    (match p[15] & 0x03 { 3 => "1000M", 2 => "100M", 1 => "10M", _ => "?" },
+                     if p[15] & 0x04 != 0 { "full" } else { "half" })
+                } else { ("", "") };
+                out.line_fmt(ctx, format_args!(
+                    "nic-link {} {} {}  |  tx {} ({} sent)  |  rx {}B ({} recv)",
+                    if p[7] != 0 { "UP" } else { "down (no cable/PHY)" }, spd, dup,
+                    if p[8] != 0 { "ok" } else { "TIMEOUT" }, tx_cnt, rx_len, rx_cnt));
+            }
+            // Chip hardware tally counters (RTL8168 DTCCR dump) - Layer-1 GROUND TRUTH: the NIC's OWN
+            // cumulative counts, read off silicon regardless of net-stack. RxOk climbing between two
+            // `net`s => the receiver is alive; flat => the NIC is not receiving (a Layer-1 fault, not
+            // a scheduling one). RxBcast answers "do we receive broadcasts?" directly.
+            if p.len() >= 32 {
+                let rx_ok  = u32::from_le_bytes([p[16], p[17], p[18], p[19]]);
+                let tx_ok  = u32::from_le_bytes([p[20], p[21], p[22], p[23]]);
+                let rx_brd = u32::from_le_bytes([p[24], p[25], p[26], p[27]]);
+                let rx_er  = u16::from_le_bytes([p[28], p[29]]);
+                let miss   = u16::from_le_bytes([p[30], p[31]]);
+                out.line_fmt(ctx, format_args!(
+                    "nic-hw   RxOk={} TxOk={} RxBcast={} RxErr={} Miss={}",
+                    rx_ok, tx_ok, rx_brd, rx_er, miss));
+            }
+        }
+    }
+
+    // net-stack is NOT a wired send-peer, so the first request can miss the cap cache. The shell holds
+    // ACQUIRE_ANY, so reacquire by name and retry, then give up loudly (Commandment VIII / IX). The
+    // request body is ignored by net-stack - the embedded reply cap IS the ask (§8.2).
+    // Abortable, bounded (3s): net-stack can wedge (e.g. on a degraded NIC); press q to escape a stall.
+    let req = Message::from_bytes(&[0u8]);
+    let reply = match net_query(ctx, "net-stack", &req, 3) {
+        NetQ::Reply(r) => r,
+        NetQ::Aborted => { ctx.console_writeln("net: aborted"); return Ok(()); }
+        NetQ::Timeout => {
+            ctx.console_writeln("net: net-stack unavailable (no reply within 3s)");
+            return Err(ShellError::Unknown);
+        }
+    };
+    let p = reply.payload_bytes();
+    if p.len() < 15 {
+        ctx.console_writeln("net: net-stack gave a short reply");
+        return Err(ShellError::Unknown);
+    }
+    // 15-byte record: ip[0..4], gateway ip[4..8], gateway mac[8..14], flags[14] (bit0 gw resolved,
+    // bit1 ping ok). Formatting is the shell's job; net-stack reports raw facts.
+    // Reflect the LIVE link, not the frozen record. If the cable is out, EVERY net-stack line is degraded -
+    // showing the stale (often fallback, e.g. 10.0.2.x) IP/gateway/DNS as if current is the "stale info" bug.
+    if nic_link_up {
+        let flags = p[14];
+        out.line_fmt(ctx, format_args!("ip       {}.{}.{}.{}", p[0], p[1], p[2], p[3]));
+        if flags & 1 != 0 {
+            out.line_fmt(ctx, format_args!(
+                "gateway  {}.{}.{}.{} at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13]));
+        } else {
+            out.line(ctx, "gateway  unresolved");
+        }
+        out.line(ctx, if flags & 2 != 0 { "ping     ok" } else { "ping     no" });
+        if p.len() >= 19 {
+            out.line_fmt(ctx, format_args!("dns      {}.{}.{}.{}", p[15], p[16], p[17], p[18]));
+        }
+    } else {
+        out.line(ctx, "ip       unassigned (link down - cable unplugged?)");
+        out.line(ctx, "gateway  unresolved");
+        out.line(ctx, "ping     no");
+        out.line(ctx, "dns      unresolved");
+    }
+    Ok(())
+}
+
+/// A name-addressed request to net-stack, with the reacquire-on-miss prime (net-stack is not a wired
+/// send-peer; the shell holds ACQUIRE_ANY). Mirrors `fs_request`.
+fn netstack_request(ctx: &ServiceContext, payload: &[u8]) -> Option<Message> {
+    let msg = Message::from_bytes(payload);
+    match ctx.request_with_reply("net-stack", &msg) {
+        Some(r) => Some(r),
+        None => if ctx.reacquire_by_name("net-stack") { ctx.request_with_reply("net-stack", &msg) } else { None },
+    }
+}
+
+/// Open a UDP socket: net-stack mints a socket cap and grants it to us (mirrors `fc_open`).
+fn sock_open(ctx: &ServiceContext) -> Option<CapHandle> {
+    let r = netstack_request(ctx, &[2])?;
+    if r.payload_bytes().first() == Some(&1) { ctx.take_pending_cap() } else { None }
+}
+
+/// Invoke a socket cap - send a datagram through it and receive the response (mirrors `fc_invoke`).
+fn sock_invoke(ctx: &ServiceContext, sock: CapHandle, right: u8, payload: &[u8]) -> Option<Message> {
+    let self_grant = ctx.self_grant_handle()?;
+    let reply = ctx.derive_cap(self_grant)?;
+    if ctx.resource_invoke(sock, right, reply, &Message::from_bytes(payload)).is_err() {
+        ctx.remove_cap(reply);
+        return None;
+    }
+    Some(ctx.recv())
+}
+
+/// Build a minimal DNS A-query for `host` into `buf`; returns the length. Just enough to elicit a UDP
+/// response - the `sock` demo reports the round-trip, it does not parse DNS.
+fn dns_query_bytes(host: &str, buf: &mut [u8]) -> usize {
+    buf[0] = 0x13; buf[1] = 0x37;           // id
+    buf[2] = 0x01; buf[3] = 0x00;           // recursion desired
+    buf[4] = 0x00; buf[5] = 0x01;           // qdcount = 1
+    for b in buf[6..12].iter_mut() { *b = 0; }
+    let mut pos = 12;
+    for label in host.as_bytes().split(|&b| b == b'.') {
+        if label.is_empty() || pos + 1 + label.len() >= buf.len() - 5 { break; }
+        buf[pos] = label.len() as u8; pos += 1;
+        buf[pos..pos + label.len()].copy_from_slice(label); pos += label.len();
+    }
+    buf[pos] = 0; pos += 1;                  // qname terminator
+    buf[pos] = 0x00; buf[pos + 1] = 0x01;    // QTYPE A
+    buf[pos + 2] = 0x00; buf[pos + 3] = 0x01; // QCLASS IN
+    pos + 4
+}
+
+/// `sock` - demonstrate a UDP socket as a CAPABILITY (utilities/41_sock.md). Opens a socket cap from
+/// net-stack, sends a datagram through it, and reports the round-trip - proving a socket is a real
+/// kernel capability the client holds and invokes (§7.10), not an ambient channel. A pipe producer.
+fn cmd_sock(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
+    let sock = match sock_open(ctx) {
+        Some(c) => c,
+        None => { ctx.console_writeln("sock: net-stack would not open a socket (no NIC?)"); return Err(ShellError::Unknown); }
+    };
+    // Send a datagram through the socket cap to the DNS server (a DNS query is just data that gets a
+    // reply); we report the round-trip, which proves the cap does real UDP I/O.
+    let mut query = [0u8; 64];
+    let qlen = dns_query_bytes("example.com", &mut query);
+    let mut payload = [0u8; 96];
+    payload[0] = 10; payload[1] = 0; payload[2] = 2; payload[3] = 3;   // dest ip 10.0.2.3
+    payload[4] = 0; payload[5] = 53;                                    // dest port 53
+    payload[6..6 + qlen].copy_from_slice(&query[..qlen]);
+    match sock_invoke(ctx, sock, RIGHT_WRITE, &payload[..6 + qlen]) {
+        Some(resp) => out.line_fmt(ctx, format_args!(
+            "sock: UDP socket cap - sent {} bytes to 10.0.2.3:53, received {} bytes back (a round-trip through a capability)",
+            qlen, resp.payload_bytes().len())),
+        None => out.line(ctx, "sock: socket cap invocation returned nothing (no NIC, or nothing answered)"),
+    }
+    ctx.remove_cap(sock);
+    Ok(())
+}
+
 // ════════════════════════════════════════════════════════════════════════════════
 // Structured records - the typed `Table` model now lives in the SDK (`godspeed_sdk::record`,
 // docs/records.md) so any service can build/filter/render records, not just the shell. Imported
@@ -4174,9 +4923,10 @@ fn is_record_producer(name: &str) -> bool {
 fn build_ls_table(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Option<Table> {
     let mut buf = [0u8; PATH_MAX];
     let path = resolve_or_err(ctx, cwd, arg, &mut buf)?;
-    let reply = match fs_request(ctx, OP_LIST_DIR, path, &[]) {
-        Some(r) => r,
-        None => { ctx.console_writeln("ls: storage unavailable"); return None; }
+    let reply = match fs_request_q(ctx, OP_LIST_DIR, path, &[]) {
+        ReqOutcome::Reply(r) => r,
+        ReqOutcome::Aborted => return None,
+        ReqOutcome::Timeout => { ctx.console_writeln("ls: storage unavailable"); return None; }
     };
     let p = reply.payload_bytes();
     if no_fs(ctx, p) { return None; }
@@ -4312,9 +5062,10 @@ fn build_find_table(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Option<Table>
     let mut t = Table::new(&["name", "type", "path"]);
     let mut dir = [0u8; PATH_MAX];
     while let Some(dlen) = stack.pop(&mut dir) {
-        let reply = match fs_request(ctx, OP_LIST_DIR, &dir[..dlen], &[]) {
-            Some(r) => r,
-            None => { ctx.console_writeln("find: storage unavailable"); return None; }
+        let reply = match fs_request_q(ctx, OP_LIST_DIR, &dir[..dlen], &[]) {
+            ReqOutcome::Reply(r) => r,
+            ReqOutcome::Aborted => return None,
+            ReqOutcome::Timeout => { ctx.console_writeln("find: storage unavailable"); return None; }
         };
         let p = reply.payload_bytes();
         if no_fs(ctx, p) { return None; }
@@ -4864,12 +5615,12 @@ fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
         // Own `q` while the child paints. The bound is a paranoid safety net so a hung child can
         // never wedge the shell forever; normally we break on `q` (or if the child dies).
         for _ in 0..u32::MAX {
-            // Sleep (don't busy-yield) so the core still halts between polls. The tick-based sleep
-            // floors at one 10 ms scheduler quantum, so a sub-quantum value gives the minimum ~1-tick
-            // (~10 ms) `q` latency - down from ~50 ms - while keeping the idle-between-polls (not a spin).
-            ctx.sleep(5_000_000);
-            // Drain the console; quit on `q`/`Q` (other keys are discarded - observe takes no
-            // other input). Echo is off (the child disabled it), so nothing smears the frame.
+            // Poll `q` by YIELDING, not ctx.sleep. The tick-based sleep converts through the TSC
+            // calibration, which is WRONG on the AMD T630 (CPUID exposes no usable TSC frequency) - a
+            // ctx.sleep there can stretch to many seconds, so `q` appeared dead and the user had to
+            // reboot. yield_cpu polls every scheduler round on ANY hardware; the painter is on another
+            // core, so this does not starve it. Drain the console; quit on q/Q. Echo is off (child owns it).
+            ctx.yield_cpu();
             let mut quit = false;
             while let Some(b) = ctx.try_console_read() {
                 if b == b'q' || b == b'Q' { quit = true; }
@@ -4878,12 +5629,25 @@ fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
             if !ctx.task_stat(slot).valid { break; } // child died unexpectedly
         }
     }
-    let _ = ctx.kill("observe-live"); // reap the child (it never exits on its own)
-    // Restore the console the child left in raw mode: show the cursor and drop below the last
-    // frame so the prompt lands cleanly. Echo stays OFF - the shell, not the kernel, owns echo.
+    let _ = ctx.kill("observe-live"); // reap the live painter (it never exits on its own)
+    // The painter is usually killed MID-repaint (each frame is ~100 ms of serial paint), leaving a
+    // PARTIAL frame and the cursor mid-screen - that was the smear, and why it regressed: on a busier
+    // core the paint takes longer, so a q lands mid-frame more often. `observe now` paints from the
+    // CURSOR (not home) and does not clear, so it must be aimed: HOME first, repaint one complete static
+    // frame OVER the partial one, then erase any rows left below. The cursor ends on a fresh line below
+    // the whole frame, so the prompt lands cleanly under the snapshot - every time, the way you liked it.
+    // Echo stays OFF - the shell, not the kernel, owns echo.
     ctx.console_echo(false);
-    ctx.console_write("\x1b[?25h\r\n");
-    Ok(())
+    ctx.console_write("\x1b[H");
+    // `observe now` paints only the body; reprint the live view's title bar above it so the exit
+    // snapshot is the WHOLE frame - top not cut off, a faithful freeze of what you were watching. These
+    // two strings are byte-for-byte the painter's (services/observe title bar); \x1b[K clears whatever
+    // the partial frame left on these two rows.
+    ctx.console_write("observe - live                                      (q to quit)\x1b[K\r\n");
+    ctx.console_write("================================================================\x1b[K\r\n");
+    let r = cmd_observe_now(ctx);
+    ctx.console_write("\x1b[J\x1b[?25h");
+    r
 }
 
 /// Slot of a just-spawned, still-live service by name (not a killed/dead one),
@@ -4908,11 +5672,11 @@ fn find_running_slot(ctx: &ServiceContext, name: &str) -> Option<u32> {
 /// restartable services (block-driver, fs, ...) are freely killable - the supervisor respawns them.
 const CORE_SERVICES: [&str; 1] = ["supervisor"];
 
-/// Shown when spawn/kill/restart targets a core service - "Not applicable" makes
-/// it clear the command is refused *because* the target is protected, not failed.
-/// Lists exactly `CORE_SERVICES` (just `supervisor`).
+/// Shown when `spawn`/`restart` targets the supervisor - "Not applicable" makes it clear the command is
+/// refused *because* of what the target is, not because it failed. (`kill supervisor` is ALLOWED now -
+/// the kernel respawns it; only spawning a duplicate or restarting the restart authority are refused.)
 const PROTECTED_MSG: &str =
-    "Not applicable. The supervisor is protected (the recovery authority); storm it deliberately via 'chaos kill-storm supervisor'";
+    "Not applicable. The supervisor is the restart authority - it cannot be spawned or restarted directly. To recycle it: 'kill supervisor' (the kernel respawns it) or 'chaos kill-storm supervisor'";
 
 /// Shown when spawn/kill/restart targets an observe variant - they are brokered by
 /// the `observe` / `observe now` commands, not raw service operations.
@@ -4930,16 +5694,14 @@ fn is_observe_variant(name: &str) -> bool {
     matches!(name, "observe" | "observe-now" | "observe-live")
 }
 
-/// Services the live console session depends on for I/O. Killing/restarting them
-/// from the shell would brick the very session issuing the command - a USB host
-/// driver (`xhci`/`ehci`, which carry whatever input devices are attached) or the
-/// shell itself. Returns the reason to show, or `None` if `name` is safe to
-/// operate on. (Not a §6.2 trusted-root guard - these are restartable in
-/// principle, just not from the session that needs them.)
+/// The one thing the shell refuses to operate on from within itself: the shell task
+/// issuing the command. `xhci`/`ehci` USED to be guarded here too, but they respawn and
+/// re-enumerate their devices on death - proven across millions of `chaos max-carnage`
+/// rounds with the session intact - so killing a USB host driver only blips input for
+/// ~a second, it does not brick the session. They are killable now (the operator's call).
+/// Returns the reason to show, or `None` if `name` is safe to operate on.
 fn session_critical_msg(name: &str) -> Option<&'static str> {
     match name {
-        "xhci"  => Some("Not applicable. xhci is a USB host driver - killing it disables any input device attached to it"),
-        "ehci"  => Some("Not applicable. ehci is a USB host driver - killing it disables any input device attached to it"),
         "shell" => Some("Not applicable. that is this shell - the session you are typing in"),
         _       => None,
     }
@@ -4955,6 +5717,23 @@ fn report(ctx: &ServiceContext, prefix: &str, name: &str) {
 }
 
 fn cmd_spawn(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
+    // `spawn a,b,c` is a comma list; a single name behaves EXACTLY as before. (No `all-services` for
+    // spawn - system services are supervisor-owned; this is for demo/app services like `ping,pong`.)
+    if name.contains(',') {
+        let mut n = 0usize;
+        for s in name.split(',') {
+            if s.is_empty() || n >= 16 { continue; }
+            n += 1;
+            let _ = spawn_one(ctx, s);   // report each; a failure/duplicate does NOT abort the rest
+        }
+        return Ok(());
+    }
+    spawn_one(ctx, name)
+}
+
+/// Start ONE service, with the observe / core-service / already-running guards. Used directly for a bare
+/// `spawn <svc>` and per-segment by the comma-list path in cmd_spawn.
+fn spawn_one(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     if is_observe_variant(name) {
         ctx.console_writeln(OBSERVE_HINT);
         return Err(ShellError::Unknown);
@@ -5109,7 +5888,7 @@ fn is_producer_builtin(name: &str) -> bool {
     // loudly as non-producers instead. To capture a big file for `edit`, append a simple producer
     // a few times: `help | write /big.txt; help | write append /big.txt; …`.
     matches!(name, "read" | "echo" | "tree" | "input"
-                 | "about" | "mem" | "cores" | "date" | "help")
+                 | "about" | "mem" | "cores" | "date" | "net" | "ping" | "sock" | "help")
 }
 
 /// Producer SERVICES that emit without needing input, so they can start a pipe (and follow the
@@ -5139,6 +5918,9 @@ fn run_producer(ctx: &ServiceContext, cwd: &Cwd, cmdline: &str, out: &mut Out) {
         "mem"          => { let _ = cmd_mem(ctx, out); }
         "cores"        => { let _ = cmd_cores(ctx, out); }
         "date"         => { let _ = cmd_date(ctx, arg, out); }
+        "net"          => { let _ = cmd_net(ctx, arg, out); }
+        "ping"         => { let _ = cmd_ping(ctx, arg, out); }
+        "sock"         => { let _ = cmd_sock(ctx, out); }
         "help"         => help_to_out(ctx, out),
         "input"        => run_input(ctx, arg, out),
         _ => {}
@@ -5247,6 +6029,26 @@ fn read_file_exact(ctx: &ServiceContext, path: &[u8], off: usize, out: &mut [u8]
     let mut tmp = [0u8; IO_CHUNK];
     while done < out.len() {
         match fs_read_at(ctx, path, (off + done) as u64, &mut tmp) {
+            Some(n) if n > 0 => {
+                let take = n.min(out.len() - done);
+                out[done..done + take].copy_from_slice(&tmp[..take]);
+                done += take;
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Deadline-bounded twin of `read_file_exact` for the startup history load: each chunk read is capped at
+/// `max_secs` (RTC) via `fs_read_at_bounded`, so a wedged/slow fs times out per chunk instead of blocking
+/// the shell before its input loop. False on short read, timeout, or any miss - the caller treats that as
+/// "no history" (§26.7). Only the startup load uses this; ordinary file commands keep the unbounded path.
+fn read_file_exact_bounded(ctx: &ServiceContext, path: &[u8], off: usize, out: &mut [u8], max_secs: i64) -> bool {
+    let mut done = 0usize;
+    let mut tmp = [0u8; IO_CHUNK];
+    while done < out.len() {
+        match fs_read_at_bounded(ctx, path, (off + done) as u64, &mut tmp, max_secs) {
             Some(n) if n > 0 => {
                 let take = n.min(out.len() - done);
                 out[done..done + take].copy_from_slice(&tmp[..take]);
@@ -5387,8 +6189,52 @@ fn lookup_sink(ctx: &ServiceContext, sink: &str) -> Option<CapHandle> {
 /// (~1 s) on the T630 under selfcheck load, with margin.
 const FILTER_WAIT_SECS: i64 = 5;
 
+/// Does this line READ a secret (`input secret ...`, incl. `$(input secret ...)`)? Such a line is never
+/// saved to the recall ring or /.gsh_history (§8 secret taint) - a password recovered on up-arrow would
+/// defeat invisible entry. Erring toward not-saving is safe: a false positive drops one recall entry.
+fn line_reads_secret(line: &[u8]) -> bool {
+    line.windows(12).any(|w| w == b"input secret")
+}
+
 fn cmd_kill(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
-    if is_core_service(name) {
+    // `kill all-services` (nuke every service but this shell) or `kill a,b,c` (a comma list) are
+    // multi-target; a single name behaves EXACTLY as before. Per-service guards live in kill_one.
+    if name == "all-services" || name.contains(',') {
+        return kill_list(ctx, name);
+    }
+    kill_one(ctx, name)
+}
+
+/// Kill a bounded set: the `all-services` keyword (-> CHAOS_RESTARTABLE + the shell: a complete system
+/// reset where everything dies and recovers, only the kernel never dies) or a comma-separated list. Each
+/// segment runs the full kill_one guard path; a denied / dead / absent one does NOT abort the rest. ORDER:
+/// everything except supervisor and shell first, then supervisor (so the kernel-respawned supervisor
+/// reconciles AFTER the nuke and respawns the fresh prompt, not mid-storm), then the shell LAST via its
+/// self-kill (it never returns), so every per-service report has printed before the session re-inits.
+fn kill_list(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
+    let mut segs: [&str; 16] = [""; 16];
+    let mut n = 0usize;
+    if name == "all-services" {
+        ctx.console_writeln("kill all-services: nuking every service - including this shell (a fresh prompt returns)");
+        for &s in CHAOS_RESTARTABLE.iter() { if n < segs.len() { segs[n] = s; n += 1; } }
+        if n < segs.len() { segs[n] = "shell"; n += 1; }   // shell dies LAST (the third pass below)
+    } else {
+        for s in name.split(',') { if !s.is_empty() && n < segs.len() { segs[n] = s; n += 1; } }
+    }
+    for &s in segs[..n].iter() { if s != "supervisor" && s != "shell" { let _ = kill_one(ctx, s); } }
+    for &s in segs[..n].iter() { if s == "supervisor" { let _ = kill_one(ctx, s); } }
+    for &s in segs[..n].iter() { if s == "shell" { let _ = kill_one(ctx, s); } } // never returns if present
+    Ok(())
+}
+
+/// Kill ONE service, with all the session / authority guards. Used directly for a bare `kill <svc>` and
+/// per-segment by kill_list.
+fn kill_one(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
+    // The supervisor is killable from the shell now (the operator's call): the KERNEL respawns it
+    // (Phase 6) and it reconciles - adopts the running services by name, respawns any that died. Only
+    // `spawn`/`restart` of the supervisor stay refused (a duplicate or a self-restart of the restart
+    // authority is nonsensical); a bare `kill` is the clean recycle path.
+    if is_core_service(name) && name != "supervisor" {
         ctx.console_writeln(PROTECTED_MSG);
         return Err(ShellError::Denied);
     }
@@ -5416,6 +6262,9 @@ fn cmd_kill(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
         report(ctx, "not running: ", name);
         return Err(ShellError::Unknown);
     }
+    if name == "supervisor" {
+        ctx.console_writeln("kill supervisor: the kernel respawns it (Phase 6); it reconciles - adopts the running services, respawns any that died");
+    }
     match ctx.kill(name) {
         Ok(())  => { report(ctx, "killed: ", name); Ok(()) }
         Err(_)  => { report(ctx, "kill failed: ", name); Err(ShellError::Unknown) }
@@ -5423,6 +6272,23 @@ fn cmd_kill(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
 }
 
 fn cmd_restart(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<(), ShellError> {
+    // `restart a,b,c` restarts each per its OWN contract placement. A single `[core]` override is
+    // SINGLE-service only - a list plus one core is ambiguous, so the core arg is ignored for a list.
+    if name.contains(',') {
+        let mut n = 0usize;
+        for s in name.split(',') {
+            if s.is_empty() || n >= 16 { continue; }
+            n += 1;
+            let _ = restart_one(ctx, s, None);   // report each; a failure does NOT abort the rest
+        }
+        return Ok(());
+    }
+    restart_one(ctx, name, core)
+}
+
+/// Restart ONE service. Used directly for a bare `restart <svc> [core]` and per-segment by the comma-list
+/// path in cmd_restart (which passes core=None, since a list + one core is ambiguous).
+fn restart_one(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<(), ShellError> {
     if is_core_service(name) {
         ctx.console_writeln(PROTECTED_MSG);
         return Err(ShellError::Denied);
@@ -5456,7 +6322,7 @@ fn cmd_restart(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<()
 // round + labels them "recovered"; kill-storm may target them. The only unkillable thing is the
 // kernel; the shell is excluded only because chaos runs *inside* it. (xhci/ehci/logger are
 // directly-restartable so max-carnage can't leave them dead.)
-const CHAOS_RESTARTABLE: [&str; 6] = ["supervisor", "block-driver", "fs", "xhci", "ehci", "logger"];
+const CHAOS_RESTARTABLE: [&str; 8] = ["supervisor", "block-driver", "fs", "xhci", "ehci", "logger", "nic-driver", "net-stack"];
 const CHAOS_DEFAULT_ROUNDS: u32 = 20;
 const CHAOS_MAX_ROUNDS: u32 = 100;        // bounded (§26.6) - a deliberate cap, not a firehose
 // Per-round recovery wait is bounded by REAL wall-clock time (RTC seconds), not a yield count. A
@@ -5534,9 +6400,10 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
         ctx.console_writeln("  flood-storm <svc> [n]   saturate its queue; verify it drains");
         ctx.console_writeln("  mem-pressure      [n]   a mem-pressure allocs to its limit, then reclaim");
         ctx.console_writeln("  spawn-storm       [n]   spawn mem-pressure tasks to the ceiling; loud refusal");
-        ctx.console_writeln("  max-carnage <all-services|svc> [n]  all-services (random) or aim at one");
+        ctx.console_writeln("  max-carnage <all-services|svc|svc,svc,...> <n>  all-services = RANDOM storm, or aim/list; TARGET + ROUNDS required");
         ctx.console_writeln("                          ('q' aborts; SERIAL only if the run kills the keyboard)");
-        ctx.console_writeln("  svc: supervisor | block-driver | fs | logger | xhci | ehci | shell");
+        ctx.console_writeln("  link-flap         [n]   simulate a cable unplug/replug; net-stack self-configures (net only)");
+        ctx.console_writeln("  svc: supervisor | block-driver | fs | logger | xhci | ehci | shell | nic-driver | net-stack");
         return Ok(());
     }
     match tok[0] {
@@ -5545,42 +6412,133 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
         "mem-pressure" => chaos_mem_pressure(ctx, cwd, &tok, ntok),
         "spawn-storm"  => chaos_spawn_storm(ctx, cwd, &tok, ntok),
         "max-carnage"  => {
-            // The target is required now: <all-services|service>. tok[1] = target, tok[2] = rounds.
-            // No target, or an explicit `help`, prints the usage + the two modes.
-            if ntok < 2 || tok[1] == "help" {
-                ctx.console_writeln("usage: chaos max-carnage <all-services|service> [rounds]");
-                ctx.console_writeln("  all-services   storm a RANDOM live service each round");
+            // EVERY run needs a TARGET and a positive ROUNDS count. There is NO uncapped default - a
+            // firehose is just a big N (`all-services 5000`) and `q` aborts a long run early. `help` = usage.
+            // tok[1] = target, tok[2] = rounds.
+            if ntok >= 2 && tok[1] == "help" {
+                ctx.console_writeln("usage: chaos max-carnage <all-services | svc | svc,svc,...> <rounds>");
+                ctx.console_writeln("  all-services   RANDOM carnage over the whole restartable set each round (the honest");
+                ctx.console_writeln("                 chaos-monkey: supervisor a normal victim, nothing protected-last)");
                 ctx.console_writeln("  <service>      aim every round at one service (e.g. fs, logger)");
-                ctx.console_writeln("  both run system-wide mem-pressure + spawn-storm. 'q' aborts (SERIAL if kbd dies).");
+                ctx.console_writeln("  svc,svc,...    a comma-separated list: kill EVERY listed service each round (cascade stress)");
+                ctx.console_writeln("  <rounds>       REQUIRED for every form - the run is bounded (a firehose is a big N; q aborts early)");
+                ctx.console_writeln("  all run system-wide mem-pressure + spawn-storm. 'q' aborts (SERIAL if the run kills the kbd).");
+                ctx.console_writeln("  e.g. chaos max-carnage all-services 5000 | chaos max-carnage fs 50 | chaos max-carnage fs,logger 100");
                 Ok(())
             } else {
-                // Validate the TARGET before launching. The syntax is <target> [rounds], so a bare number
-                // like `max-carnage 1000` parses 1000 as the TARGET - without this it silently storms a
-                // service "1000" that does not exist. Reject anything that is neither "all-services" nor a
-                // live service, loudly (invariant 12), with a SPECIFIC hint for the numeric mix-up.
-                let target = tok[1];
-                if target != "all-services" && slot_of(ctx, target).is_none() {
-                    if !target.is_empty() && target.bytes().all(|b| b.is_ascii_digit()) {
-                        ctx.console_writeln_fmt(format_args!(
-                            "max-carnage: '{}' is not a service. For {} rounds of EVERYTHING, run:", target, target));
-                        ctx.console_writeln_fmt(format_args!("  chaos max-carnage all-services {}", target));
-                    } else {
-                        ctx.console_writeln_fmt(format_args!("max-carnage: no live service '{}'.", target));
-                        ctx.console_writeln("  target: all-services, or a live service");
-                        ctx.console_writeln("  (block-driver | fs | logger | xhci | ehci | shell | supervisor)");
-                    }
+                // A run needs a TARGET (all-services / a service / a comma-list) AND a positive ROUNDS count.
+                // No target (bare, or only a number), or a missing / zero rounds -> refuse LOUDLY (invariant 12).
+                let no_target = ntok < 2 || tok[1].bytes().all(|b| b.is_ascii_digit());
+                let rounds = if ntok >= 3 { parse_u32(tok[2]).unwrap_or(0) } else { 0 };
+                if no_target || rounds == 0 {
+                    ctx.console_writeln("usage: chaos max-carnage <all-services | svc | svc,svc,...> <rounds>");
+                    ctx.console_writeln("  every run needs a target AND a rounds count - there is no uncapped default.");
+                    ctx.console_writeln("  e.g. chaos max-carnage all-services 5000   (the firehose - a big N; q aborts early)");
+                    ctx.console_writeln("       chaos max-carnage fs 50");
+                    ctx.console_writeln("       chaos max-carnage fs,logger 100");
                     return Ok(());
                 }
-                let rounds = if ntok >= 3 { parse_u32(tok[2]).unwrap_or(0) } else { 0 };
-                chaos_launch(ctx, tok[1], rounds)
+                // Validate the target(s) before launching (a bad name would storm nothing), loudly (invariant 12).
+                let target = tok[1];
+                if target.contains(',') {
+                    // A comma-list (e.g. "nic-driver,net-stack") is a MULTI-TARGET run: EVERY listed service
+                    // is killed each round (semantics B). Each segment must be a live service.
+                    for seg in target.split(',') {
+                        if seg.is_empty() { continue; }
+                        if slot_of(ctx, seg).is_none() {
+                            ctx.console_writeln_fmt(format_args!("max-carnage: no live service '{}' in the list", seg));
+                            ctx.console_writeln("  every comma-separated target must be a live service");
+                            ctx.console_writeln("  (block-driver | fs | logger | xhci | ehci | shell | supervisor | nic-driver | net-stack)");
+                            return Ok(());
+                        }
+                    }
+                } else if target != "all-services" && slot_of(ctx, target).is_none() {
+                    ctx.console_writeln_fmt(format_args!("max-carnage: no live service '{}'.", target));
+                    ctx.console_writeln("  target: all-services, one service, or a comma-separated list");
+                    ctx.console_writeln("  (block-driver | fs | logger | xhci | ehci | shell | supervisor | nic-driver | net-stack)");
+                    return Ok(());
+                }
+                chaos_launch(ctx, target, rounds)
             }
         }
+        "link-flap"    => chaos_link_flap(ctx, &tok, ntok),
         other => {
             ctx.console_writeln_fmt(format_args!(
                 "chaos: unknown mode '{}' (try: chaos kill-storm <service> [rounds])", other));
             Err(ShellError::Unknown)
         }
     }
+}
+
+/// Yield for up to `secs` of RTC wall-clock, returning true the instant q/Q/ESC is pressed (abort).
+/// Bounded + portable (RTC, not the T630-broken TSC).
+fn hold_or_abort(ctx: &ServiceContext, secs: i64) -> bool {
+    let t0 = ctx.datetime().epoch_secs();
+    while ctx.datetime().epoch_secs() - t0 < secs {
+        while let Some(b) = ctx.try_console_read() {
+            if b == b'q' || b == b'Q' || b == 0x1b { return true; }
+        }
+        ctx.yield_cpu();
+    }
+    false
+}
+
+/// `chaos link-flap [N]` - a networking-SPECIFIC chaos: simulate a cable unplug/replug N times (default 1)
+/// WITHOUT physical access, exercising net-stack's LINK-recovery path (a different failure surface than the
+/// process-death that kill-storm / max-carnage test). It forces the nic-driver's REPORTED link DOWN (a
+/// report override, ops [6]/[7]/[8] - no hardware touch, no SLU/reset), holds a beat so net-stack's ~1s link
+/// poll catches the loss and stalls ping, forces it UP so net-stack self-configures on the up edge (re-runs
+/// its DHCP/ARP dance), then CLEARS the override so a real later unplug is never masked. net-stack reacts
+/// autonomously (its reaction is in the serial log + a subsequent `net`/`ping`); this drives the physical-
+/// layer event and paces it. q-abortable, and an abort always clears the override. This is the FIRST
+/// service-specific chaos - standard chaos (kill/flood/storm) is universal; a service's own failure surface
+/// (net-stack's link) is its own scenario (do not build a speculative framework, §26.2).
+fn chaos_link_flap(ctx: &ServiceContext, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
+    if ntok >= 2 && tok[1] == "help" {
+        ctx.console_writeln("chaos link-flap [N] - simulate a cable unplug/replug N times (default 1)");
+        ctx.console_writeln("  forces the NIC link DOWN then UP (a report override, no hardware touch) so net-stack");
+        ctx.console_writeln("  notices the loss and self-configures on the up edge. tests LINK recovery, not process death.");
+        ctx.console_writeln("  (press q to abort; an abort clears the override)");
+        return Ok(());
+    }
+    let cycles = if ntok >= 2 { parse_u32(tok[1]).unwrap_or(1).max(1) } else { 1 };
+    if slot_of(ctx, "nic-driver").is_none() {
+        ctx.console_writeln("chaos link-flap: no live nic-driver (is the NIC up?)");
+        return Ok(());
+    }
+    // Hold each edge long enough for net-stack's ~1s link poll to catch it - this simulates the duration of
+    // a real cable event (whose PHY settle is itself seconds on hardware). net-stack self-configures on its
+    // own; the log shows it. q-abortable throughout, and any exit clears the override.
+    const HOLD_SECS: i64 = 3;
+    let down = Message::from_bytes(&[6]);
+    let up   = Message::from_bytes(&[7]);
+    let clr  = Message::from_bytes(&[8]);
+    for cycle in 1..=cycles {
+        ctx.console_writeln_fmt(format_args!(
+            "chaos link-flap: cycle {}/{} - forcing link DOWN (press q to abort)", cycle, cycles));
+        if let NetQ::Aborted = net_query(ctx, "nic-driver", &down, 3) {
+            let _ = net_query(ctx, "nic-driver", &clr, 2);
+            ctx.console_writeln("chaos link-flap: aborted (link override cleared)");
+            return Ok(());
+        }
+        if hold_or_abort(ctx, HOLD_SECS) {
+            let _ = net_query(ctx, "nic-driver", &clr, 2);
+            ctx.console_writeln("chaos link-flap: aborted (link override cleared)");
+            return Ok(());
+        }
+        ctx.console_writeln("chaos link-flap: forcing link UP - net-stack should self-configure");
+        let _ = net_query(ctx, "nic-driver", &up, 3);
+        if hold_or_abort(ctx, HOLD_SECS) {
+            let _ = net_query(ctx, "nic-driver", &clr, 2);
+            ctx.console_writeln("chaos link-flap: aborted (link override cleared)");
+            return Ok(());
+        }
+    }
+    // Clear the override so the REAL link state is reported again (a real unplug must not stay masked).
+    let _ = net_query(ctx, "nic-driver", &clr, 2);
+    ctx.console_writeln_fmt(format_args!(
+        "chaos link-flap: done ({} cycle(s)); override cleared - net now reflects the real link", cycles));
+    Ok(())
 }
 
 /// `chaos max-carnage` - launch the `chaos` service, which takes over the console (the foreground
@@ -5593,7 +6551,8 @@ fn chaos_launch(ctx: &ServiceContext, target: &str, rounds: u32) -> Result<(), S
     // keyboard ONLY if it is the controller yours is on - we cannot know which, so we state the proviso.
     // Anything else leaves the keyboard alive. The keyboard works HERE, pre-storm, so the confirm lands.
     let target_all = target == "all-services";
-    let target_usb = target == "xhci" || target == "ehci";
+    // USB in a comma-list kills the keyboard too, so warn serial for it as well (not just a bare xhci/ehci).
+    let target_usb = target.split(',').any(|s| s == "xhci" || s == "ehci");
     ctx.console_writeln("");
     ctx.console_writeln("============ MAXIMUM CARNAGE - READ THIS ============");
     if target_all {
@@ -5618,16 +6577,9 @@ fn chaos_launch(ctx: &ServiceContext, target: &str, rounds: u32) -> Result<(), S
     ctx.console_writeln("");
     ctx.console_writeln("=====================================================");
     ctx.console_write(" Start maximum carnage? [y/N]: ");
-    let c = ctx.console_read();
-    // Echo the keypress (console_read does not echo) so the operator sees what they typed - but do NOT
-    // print the newline yet. Wait for ENTER first, THEN newline. Printing the newline right after the
-    // keypress made it look like the choice had registered when it had not (you still had to press Enter).
-    if let Ok(s) = core::str::from_utf8(&[c]) { ctx.console_write(s); }
-    // Drain the rest of the line up to Enter (a stray key after the first won't bleed into the next
-    // prompt). A bare Enter (the default = N = cancel) has nothing to drain.
-    if c != b'\r' && c != b'\n' { loop { let n = ctx.console_read(); if n == b'\r' || n == b'\n' { break; } } }
-    ctx.console_writeln("");
-    if c != b'y' && c != b'Y' {
+    // Line-edited confirm (read_confirm): the operator can BACKSPACE a typo before Enter, and the
+    // decision is the FINAL line - a mistyped `y` corrected to `n` cancels, not proceeds.
+    if !read_confirm(ctx) {
         ctx.console_writeln("max-carnage: cancelled.");
         return Ok(());
     }
@@ -5636,12 +6588,15 @@ fn chaos_launch(ctx: &ServiceContext, target: &str, rounds: u32) -> Result<(), S
         ctx.console_writeln("chaos: failed to spawn the chaos service");
         return Err(ShellError::Unknown);
     }
-    // Send the round count (0 = run until q) AND the target (all | service name). Best-effort: chaos waits
-    // briefly for it, defaults to all / run-until-q if it doesn't arrive. Reclaim the cap (no leak).
+    // Send the round count (always > 0 - the shell requires it) AND the target (all-services | service |
+    // comma-list). Best-effort: chaos waits briefly for it; if it never arrives chaos runs a safe no-op
+    // (0 rounds). Reclaim the cap (no leak).
     if let Some(cap) = ctx.acquire_send_cap("chaos") {
-        let mut buf = [0u8; 4 + 24];
+        // rounds(4) + target string. The target may be a comma-separated list (e.g. "nic-driver,net-stack"),
+        // so the buffer is sized for a bounded list, not one name.
+        let mut buf = [0u8; 4 + 128];
         buf[..4].copy_from_slice(&rounds.to_le_bytes());
-        let tb = target.as_bytes(); let n = tb.len().min(24);
+        let tb = target.as_bytes(); let n = tb.len().min(128);
         buf[4..4 + n].copy_from_slice(&tb[..n]);
         let _ = ctx.send_by_handle(cap, &Message::from_bytes(&buf[..4 + n]));
         ctx.remove_cap(cap);
@@ -6018,8 +6973,9 @@ fn count_named(ctx: &ServiceContext, name: &str) -> u32 {
 fn chaos_spawn_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
     const SPAWN_STORM_DEFAULT: u32 = 256;  // aim past most machines' ceilings; the loop stops at the wall
     const SPAWN_STORM_MAX:     u32 = 512;
-    const SPAWN_SETTLE:        u32 = 300;  // yields after each spawn so the hog runs + grabs its 32 MiB
-    const KILL_SETTLE:         u32 = 80;   // yields after each kill so reclaim drains
+    const SPAWN_DROP_MIN:      u64 = 4096; // >= 16 MiB dropped = the hog's alloc landed (truth, not a timer)
+    const SPAWN_SETTLE_SECS:   i64 = 2;    // per-spawn RTC bound; the drop-poll breaks early on success
+    const KILL_SETTLE_SECS:    i64 = 2;    // per-kill RTC bound; waits on the hog COUNT dropping, not a pad
     const RECLAIM_SECS:        i64 = 12;   // RTC bound for the final reclaim wait
     const RECLAIM_SLACK:       u64 = 2048; // 8 MiB tolerance for "back to baseline" (absorbs noise)
 
@@ -6041,24 +6997,39 @@ fn chaos_spawn_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
     let mut aborted   = false;
     for n in 0..count {
         if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { aborted = true; break; } }
+        let before = ctx.inspect_kernel_free_frames();   // free frames before this hog allocates
         if ctx.spawn("mem-pressure").is_err() {
             refused_at = n + 1;   // the ceiling held - graceful refusal, no panic
             break;
         }
         spawned += 1;
-        for _ in 0..SPAWN_SETTLE { ctx.yield_cpu(); }   // let the hog grab its 32 MiB before the next spawn
+        // Wait on TRUTH - the hog's allocation landing (free frames drop by its request) - not a fixed
+        // pad. RTC-bounded so a hog that cannot alloc near the ceiling times out instead of hanging us.
+        let t = ctx.datetime().epoch_secs();
+        loop {
+            ctx.yield_cpu();
+            if before.saturating_sub(ctx.inspect_kernel_free_frames()) >= SPAWN_DROP_MIN { break; }
+            if ctx.datetime().epoch_secs() - t >= SPAWN_SETTLE_SECS { break; }
+        }
     }
 
     let low       = ctx.inspect_kernel_free_frames();   // memory floor under the swarm
     let live_peak = count_live(ctx);
     let hogs_peak = count_named(ctx, "mem-pressure");
 
-    // 2. Kill every hog (loop until none remain). Bounded by a safety cap.
+    // 2. Kill every hog (loop until none remain, confirmed by the task table). Bounded by a safety cap.
     let mut killed = 0u32;
     while slot_of(ctx, "mem-pressure").is_some() && killed < SPAWN_STORM_MAX + 16 {
+        let remaining = count_named(ctx, "mem-pressure");
         let _ = ctx.kill("mem-pressure");
         killed += 1;
-        for _ in 0..KILL_SETTLE { ctx.yield_cpu(); }
+        // Wait on TRUTH - the hog COUNT dropping (this kill was reaped to Dead) - not a fixed pad. Bounded.
+        let t = ctx.datetime().epoch_secs();
+        loop {
+            ctx.yield_cpu();
+            if count_named(ctx, "mem-pressure") < remaining { break; }
+            if ctx.datetime().epoch_secs() - t >= KILL_SETTLE_SECS { break; }
+        }
     }
 
     // 3. Wait for reclaim - free frames return to ~baseline (deferred kstacks drain on timer ticks).
@@ -6223,11 +7194,19 @@ fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<
 /// chaos storm that may have hammered `fs` + its `block-driver`, so the reply could be slow or never
 /// come; this bounds it so the save can fail gracefully (console report stands) instead of hanging.
 const SAVE_FS_MAX_SECS: i64 = 8;
+/// Short deadline for the best-effort history write-through (§26.7): a quick try, then shrug. A slow or
+/// mid-restart fs must never freeze the prompt, so this is far shorter than the report save's 8 s.
+const HIST_SAVE_SECS: i64 = 2;
+/// Short deadline for the best-effort history *load* at startup (§26.7). The load runs before the input
+/// loop, so a fs that is alive-but-not-serving (respawned but still re-mounting) would otherwise hang the
+/// prompt forever on an unbounded request - the whole shell wedges and the keyboard looks dead. Bound it:
+/// a quick try, then "no history", so the prompt + `console_read` always come up regardless of fs health.
+const HIST_LOAD_SECS: i64 = 2;
 
 /// `fs_request` for the report save: the reply wait is bounded by `SAVE_FS_MAX_SECS` of wall-clock
 /// time (RTC), so a still-restarting `fs` can't block the shell forever (the bug behind `chaos
 /// max-carnage … save` hanging). Reacquire + retry once on a miss, then give up.
-fn fs_request_bounded(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<Message> {
+fn fs_request_bounded(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8], max_secs: i64) -> Option<Message> {
     let pl = path.len().min(255);
     let mut req = [0u8; 4096];
     req[0] = op;
@@ -6236,13 +7215,39 @@ fn fs_request_bounded(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) ->
     let dn = data.len().min(req.len() - 2 - pl);
     req[2 + pl..2 + pl + dn].copy_from_slice(&data[..dn]);
     let msg = Message::from_bytes(&req[..2 + pl + dn]);
-    if let Some(r) = ctx.request_with_reply_deadline("fs", &msg, SAVE_FS_MAX_SECS) {
+    if let Some(r) = ctx.request_with_reply_deadline("fs", &msg, max_secs) {
         return Some(r);
     }
     if ctx.reacquire_by_name("fs") {
-        return ctx.request_with_reply_deadline("fs", &msg, SAVE_FS_MAX_SECS);
+        return ctx.request_with_reply_deadline("fs", &msg, max_secs);
     }
     None
+}
+
+/// `fs_request` for INTERACTIVE commands (`ls`, `cd`, `read`, `find`, ...): q-abortable, and after a
+/// short lingering threshold it prints a "(q to quit)" hint so the user can bail on a slow op instead
+/// of waiting blind. A fast reply prints NOTHING (no nag on a snappy op). Mirrors the net commands'
+/// abort convention (`ReqOutcome`): `Reply(r)` = answered, `Aborted` = user pressed q (hint already
+/// shown), `Timeout` = fs unreachable. On a Timeout (send failed - `fs` restarted, cached cap went
+/// EndpointDead, Phase D §14.3) it reacquires `fs` by name and retries once. The plain blocking
+/// `fs_request` stays for internal/cleanup ops (deletes, tests) the user never waits on interactively.
+fn fs_request_q(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> ReqOutcome {
+    const HINT_SECS: i64 = 2;    // print "(q to quit)" only if the wait lingers past this
+    const MAX_SECS:  i64 = 3600; // effectively unbounded - fs replies fast now; q is the real exit
+    let pl = path.len().min(255);
+    let mut req = [0u8; 4096];
+    req[0] = op;
+    req[1] = pl as u8;
+    req[2..2 + pl].copy_from_slice(&path[..pl]);
+    let dn = data.len().min(req.len() - 2 - pl);
+    req[2 + pl..2 + pl + dn].copy_from_slice(&data[..dn]);
+    let msg = Message::from_bytes(&req[..2 + pl + dn]);
+    match ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)")) {
+        // Send failed (stale cap after an fs restart): reacquire by name and retry once, still hinted.
+        ReqOutcome::Timeout if ctx.reacquire_by_name("fs") =>
+            ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)")),
+        other => other,
+    }
 }
 
 /// Stat a path: `Some((size, is_dir))` if it exists, `None` otherwise. Used by the streaming
@@ -6276,6 +7281,38 @@ fn fs_read_at(ctx: &ServiceContext, path: &[u8], offset: u64, out: &mut [u8]) ->
     }
 }
 
+/// Deadline-bounded twin of `fs_stat` for the startup history load: the reply wait is capped at
+/// `max_secs` (RTC) via `fs_request_bounded`, so an alive-but-not-serving fs (respawned, still
+/// re-mounting) cannot hang the prompt. `None` on timeout/miss/absent, treated as "no file".
+fn fs_stat_bounded(ctx: &ServiceContext, path: &[u8], max_secs: i64) -> Option<(u64, bool)> {
+    let reply = fs_request_bounded(ctx, OP_STAT_FILE, path, &[], max_secs)?;
+    let p = reply.payload_bytes();
+    if p.first() == Some(&FS_OK) && p.len() >= 11 && p[1] == 1 {
+        Some((u64::from_le_bytes([p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9]]), p[10] == 1))
+    } else {
+        None
+    }
+}
+
+/// Deadline-bounded twin of `fs_read_at` for the startup history load - same per-chunk deadline
+/// discipline as `fs_stat_bounded`, so a stalled fs times out instead of blocking the shell.
+fn fs_read_at_bounded(ctx: &ServiceContext, path: &[u8], offset: u64, out: &mut [u8], max_secs: i64) -> Option<usize> {
+    let mut tail = [0u8; 12];
+    tail[..8].copy_from_slice(&offset.to_le_bytes());
+    tail[8..12].copy_from_slice(&(IO_CHUNK as u32).to_le_bytes());
+    let reply = fs_request_bounded(ctx, OP_READ_AT, path, &tail, max_secs)?;
+    let p = reply.payload_bytes();
+    if p.first() == Some(&FS_OK) && p.len() >= 5 {
+        let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
+        let end = (5 + n).min(p.len());
+        let n = end - 5;
+        out[..n].copy_from_slice(&p[5..end]);
+        Some(n)
+    } else {
+        None
+    }
+}
+
 /// Create/truncate `path` to hold `total` bytes (allocates the whole extent). Pairs with
 /// `fs_write_at` to stream a large file.
 fn fs_write_new(ctx: &ServiceContext, path: &[u8], total: u64) -> bool {
@@ -6295,11 +7332,18 @@ fn fs_write_at(ctx: &ServiceContext, path: &[u8], offset: u64, chunk: &[u8]) -> 
 
 /// True if `fs` replied "no filesystem" - print the standard hint and consume it.
 fn no_fs(ctx: &ServiceContext, p: &[u8]) -> bool {
-    if p.first() == Some(&FS_NOFS) {
-        ctx.console_writeln("no filesystem - run 'drives flash' first");
-        true
-    } else {
-        false
+    match p.first() {
+        Some(&FS_NOFS) => {
+            ctx.console_writeln("no filesystem - run 'drives flash' first");
+            true
+        }
+        Some(&FS_UNAVAIL) => {
+            // Present-but-unreadable disk: the data may still be intact, so flashing would DESTROY it.
+            // Deliberately does NOT advise 'drives flash' (the whole point of the FS_UNAVAIL distinction).
+            ctx.console_writeln("storage unavailable - do NOT run 'drives flash' (data may be intact; awaiting storage recovery)");
+            true
+        }
+        _ => false,
     }
 }
 
@@ -6307,9 +7351,10 @@ fn no_fs(ctx: &ServiceContext, p: &[u8]) -> bool {
 fn cmd_ls(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    let reply = match fs_request(ctx, OP_LIST_DIR, path, &[]) {
-        Some(r) => r,
-        None => { ctx.console_writeln("ls: storage unavailable"); return Err(ShellError::Unknown); }
+    let reply = match fs_request_q(ctx, OP_LIST_DIR, path, &[]) {
+        ReqOutcome::Reply(r) => r,
+        ReqOutcome::Aborted => return Ok(()),
+        ReqOutcome::Timeout => { ctx.console_writeln("ls: storage unavailable"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
     if no_fs(ctx, p) { return Err(ShellError::Unknown); }
@@ -7052,9 +8097,10 @@ fn cmd_read(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result
     // Stat first (one message) to learn the size, then STREAM the content in IO_CHUNK pieces
     // via read_at - so a file far larger than one IPC message reads back correctly without a
     // big buffer here.
-    let stat = match fs_request(ctx, OP_STAT_FILE, path, &[]) {
-        Some(r) => r,
-        None => { ctx.console_writeln("read: storage unavailable"); return Err(ShellError::Unknown); }
+    let stat = match fs_request_q(ctx, OP_STAT_FILE, path, &[]) {
+        ReqOutcome::Reply(r) => r,
+        ReqOutcome::Aborted => return Ok(()),
+        ReqOutcome::Timeout => { ctx.console_writeln("read: storage unavailable"); return Err(ShellError::Unknown); }
     };
     let sp = stat.payload_bytes();
     if no_fs(ctx, sp) { return Err(ShellError::Unknown); }
@@ -7205,6 +8251,22 @@ fn cmd_fmt(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellError
         ctx.console_writeln("usage: fmt <path>   |   fmt check <path>   (see: fmt help)");
         return Err(ShellError::Unknown);
     }
+    // `fmt a,b` / `fmt check a,b`: process each file SEQUENTIALLY (never concurrently - a concurrent
+    // same-file read once hung the shell). Report each, continue past a failure.
+    if pathstr.contains(',') {
+        let mut n = 0usize;
+        for s in pathstr.split(',') {
+            if s.is_empty() || n >= 16 { continue; }
+            n += 1;
+            let _ = fmt_one(ctx, cwd, check, s);
+        }
+        return Ok(());
+    }
+    fmt_one(ctx, cwd, check, pathstr)
+}
+
+/// Format or check ONE file. Bare `fmt [check] <path>`, and per-file (sequentially) for a comma-list.
+fn fmt_one(ctx: &ServiceContext, cwd: &Cwd, check: bool, pathstr: &str) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, pathstr, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let mut pcopy = [0u8; PATH_MAX];
@@ -7250,6 +8312,21 @@ fn cmd_fmt(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellError
 
 /// `mkdir <path> [parents]` - create a directory (with `parents`, create missing parents).
 fn cmd_mkdir(ctx: &ServiceContext, cwd: &Cwd, arg: &str, parents: bool) -> Result<(), ShellError> {
+    // `mkdir a,b,c` creates each; `parents` applies to every segment. Report each, continue past a failure.
+    if arg.contains(',') {
+        let mut n = 0usize;
+        for s in arg.split(',') {
+            if s.is_empty() || n >= 16 { continue; }
+            n += 1;
+            let _ = mkdir_one(ctx, cwd, s, parents);
+        }
+        return Ok(());
+    }
+    mkdir_one(ctx, cwd, arg, parents)
+}
+
+/// Create ONE directory. Bare `mkdir <path> [parents]`, and per-segment for a comma-list.
+fn mkdir_one(ctx: &ServiceContext, cwd: &Cwd, arg: &str, parents: bool) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let op = if parents { OP_MKDIR_P } else { OP_MKDIR };
@@ -7289,9 +8366,10 @@ fn cmd_cd(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str) -> Result<(), ShellErr
         ctx.console_writeln("/");
         return Ok(());
     }
-    let reply = match fs_request(ctx, OP_STAT_FILE, path, &[]) {
-        Some(r) => r,
-        None => { ctx.console_writeln("cd: storage unavailable"); return Err(ShellError::Unknown); }
+    let reply = match fs_request_q(ctx, OP_STAT_FILE, path, &[]) {
+        ReqOutcome::Reply(r) => r,
+        ReqOutcome::Aborted => return Ok(()),
+        ReqOutcome::Timeout => { ctx.console_writeln("cd: storage unavailable"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
     if no_fs(ctx, p) { return Err(ShellError::Unknown); }
@@ -7503,6 +8581,22 @@ fn cmd_rename(ctx: &ServiceContext, cwd: &Cwd, path: &str, newname: &str) -> Res
 /// whole subtree. fs does the work either way (plain = `OP_DELETE`, recursive =
 /// `OP_DELETE_TREE`, a depth-bounded subtree free); it frees the blocks and reclaims them.
 fn cmd_delete(ctx: &ServiceContext, cwd: &Cwd, arg: &str, recursive: bool) -> Result<(), ShellError> {
+    // `delete /a,/b` deletes each; `recursive` applies to every segment. Report each, continue past one
+    // that is missing / fails.
+    if arg.contains(',') {
+        let mut n = 0usize;
+        for s in arg.split(',') {
+            if s.is_empty() || n >= 16 { continue; }
+            n += 1;
+            let _ = delete_one(ctx, cwd, s, recursive);
+        }
+        return Ok(());
+    }
+    delete_one(ctx, cwd, arg, recursive)
+}
+
+/// Delete ONE path. Bare `delete <path> [recursive]`, and per-segment for a comma-list.
+fn delete_one(ctx: &ServiceContext, cwd: &Cwd, arg: &str, recursive: bool) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     if path == b"/" {
@@ -7575,9 +8669,10 @@ fn cmd_find(ctx: &ServiceContext, cwd: &Cwd, target: &str, start: &str, out: &mu
     let mut matches = 0u32;
     let mut dir = [0u8; PATH_MAX];
     while let Some(dlen) = stack.pop(&mut dir) {
-        let reply = match fs_request(ctx, OP_LIST_DIR, &dir[..dlen], &[]) {
-            Some(r) => r,
-            None => { ctx.console_writeln("find: storage unavailable"); return Err(ShellError::Unknown); }
+        let reply = match fs_request_q(ctx, OP_LIST_DIR, &dir[..dlen], &[]) {
+            ReqOutcome::Reply(r) => r,
+            ReqOutcome::Aborted => return Ok(()),
+            ReqOutcome::Timeout => { ctx.console_writeln("find: storage unavailable"); return Err(ShellError::Unknown); }
         };
         let p = reply.payload_bytes();
         if no_fs(ctx, p) { return Err(ShellError::Unknown); }
@@ -7666,9 +8761,10 @@ fn cmd_tree(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result
         if !is_dir { files += 1; continue; }
         if d > 0 { dirs += 1; }
 
-        let reply = match fs_request(ctx, OP_LIST_DIR, &buf[..plen], &[]) {
-            Some(r) => r,
-            None => { ctx.console_writeln("tree: storage unavailable"); return Err(ShellError::Unknown); }
+        let reply = match fs_request_q(ctx, OP_LIST_DIR, &buf[..plen], &[]) {
+            ReqOutcome::Reply(r) => r,
+            ReqOutcome::Aborted => return Ok(()),
+            ReqOutcome::Timeout => { ctx.console_writeln("tree: storage unavailable"); return Err(ShellError::Unknown); }
         };
         let p = reply.payload_bytes();
         if no_fs(ctx, p) { return Err(ShellError::Unknown); }
@@ -7863,9 +8959,10 @@ fn cmd_match(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) -> Res
     }
     let mut buf = [0u8; PATH_MAX];
     let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    let reply = match fs_request(ctx, OP_READ_FILE, abspath, &[]) {
-        Some(r) => r,
-        None => { ctx.console_writeln("match: storage unavailable"); return Err(ShellError::Unknown); }
+    let reply = match fs_request_q(ctx, OP_READ_FILE, abspath, &[]) {
+        ReqOutcome::Reply(r) => r,
+        ReqOutcome::Aborted => return Ok(()),
+        ReqOutcome::Timeout => { ctx.console_writeln("match: storage unavailable"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
     if no_fs(ctx, p) { return Err(ShellError::Unknown); }
@@ -7951,9 +9048,10 @@ fn cmd_count(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) -> Res
     }
     let mut buf = [0u8; PATH_MAX];
     let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    let reply = match fs_request(ctx, OP_READ_FILE, abspath, &[]) {
-        Some(r) => r,
-        None => { ctx.console_writeln("count: storage unavailable"); return Err(ShellError::Unknown); }
+    let reply = match fs_request_q(ctx, OP_READ_FILE, abspath, &[]) {
+        ReqOutcome::Reply(r) => r,
+        ReqOutcome::Aborted => return Ok(()),
+        ReqOutcome::Timeout => { ctx.console_writeln("count: storage unavailable"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
     if no_fs(ctx, p) { return Err(ShellError::Unknown); }
@@ -8030,9 +9128,10 @@ fn cmd_sort(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) -> Resu
     }
     let mut buf = [0u8; PATH_MAX];
     let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    let reply = match fs_request(ctx, OP_READ_FILE, abspath, &[]) {
-        Some(r) => r,
-        None => { ctx.console_writeln("sort: storage unavailable"); return Err(ShellError::Unknown); }
+    let reply = match fs_request_q(ctx, OP_READ_FILE, abspath, &[]) {
+        ReqOutcome::Reply(r) => r,
+        ReqOutcome::Aborted => return Ok(()),
+        ReqOutcome::Timeout => { ctx.console_writeln("sort: storage unavailable"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
     if no_fs(ctx, p) { return Err(ShellError::Unknown); }
@@ -8116,9 +9215,10 @@ fn cmd_take(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize, last: b
     }
     let mut buf = [0u8; PATH_MAX];
     let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    let reply = match fs_request(ctx, OP_READ_FILE, abspath, &[]) {
-        Some(r) => r,
-        None => { ctx.console_writeln_fmt(format_args!("{}: storage unavailable", name)); return Err(ShellError::Unknown); }
+    let reply = match fs_request_q(ctx, OP_READ_FILE, abspath, &[]) {
+        ReqOutcome::Reply(r) => r,
+        ReqOutcome::Aborted => return Ok(()),
+        ReqOutcome::Timeout => { ctx.console_writeln_fmt(format_args!("{}: storage unavailable", name)); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
     if no_fs(ctx, p) { return Err(ShellError::Unknown); }
@@ -8402,16 +9502,39 @@ fn drives_label(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
 /// Read one line from the console and return true iff it begins with y/Y. The kernel
 /// echoes keystrokes, so the user sees their answer; default (empty / anything else) is No.
 fn read_confirm(ctx: &ServiceContext) -> bool {
-    let mut first = 0u8;
+    // Line-edited y/N: accept characters with BACKSPACE editing and decide on the FINAL line at Enter,
+    // so a mistyped answer can be corrected - `y` then backspace then `n` reads as N, not the committed
+    // `y`. console_read does not echo, so we echo each printable char and a destructive backspace erase
+    // ourselves. Bounded, no heap (a confirm answer is tiny).
+    let mut buf = [0u8; 8];
+    let mut len = 0usize;
     loop {
         let b = ctx.console_read();
         match b {
-            b'\r' | b'\n' => break,
-            _ if first == 0 && b >= 0x20 && b < 0x7f => first = b,
+            b'\r' | b'\n' => { ctx.console_writeln(""); break; }
+            0x08 | 0x7f => { if len > 0 { len -= 1; ctx.console_write("\x08 \x08"); } }
+            0x20..=0x7e => {
+                if len < buf.len() {
+                    buf[len] = b; len += 1;
+                    if let Ok(s) = core::str::from_utf8(&[b]) { ctx.console_write(s); }
+                }
+            }
+            0x1b => match read_escape_byte(ctx) {
+                // Bare ESC (the Escape key) CANCELS - back to the prompt, like the main line editor's ESC.
+                // read_escape_byte does not hang on a bare ESC (it times the wait off the TSC).
+                None => { ctx.console_writeln(""); return false; }
+                // A nav key (arrow / Home: ESC [ ... or ESC O ...) - a confirm does not navigate, so drain
+                // the rest of the sequence (to its final byte, 0x40..=0x7e) and ignore it, so no stray bytes
+                // leak into the answer. The sequence's bytes are already queued (atomic keyboard push).
+                Some(b'[') | Some(b'O') => {
+                    for _ in 0..8 { let c = ctx.console_read(); if (0x40..=0x7e).contains(&c) { break; } }
+                }
+                Some(_) => {} // ESC + a lone byte: ignore both, keep waiting for y/n
+            }
             _ => {}
         }
     }
-    first == b'y' || first == b'Y'
+    len > 0 && (buf[0] == b'y' || buf[0] == b'Y')
 }
 
 fn u64_le(b: &[u8]) -> u64 {

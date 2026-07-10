@@ -123,6 +123,7 @@ fn collect_boot_info() -> BootInfo {
                 limine::memmap::MEMMAP_USABLE             => MemoryKind::Usable,
                 limine::memmap::MEMMAP_ACPI_RECLAIMABLE   => MemoryKind::AcpiReclaimable,
                 limine::memmap::MEMMAP_EXECUTABLE_AND_MODULES => MemoryKind::KernelImage,
+                limine::memmap::MEMMAP_BOOTLOADER_RECLAIMABLE => MemoryKind::BootloaderReclaimable,
                 _ => MemoryKind::Reserved,
             };
             // SAFETY: single-threaded boot path; no concurrent access.
@@ -245,6 +246,10 @@ pub enum MemoryKind {
     Reserved        = 2,
     AcpiReclaimable = 3,
     KernelImage     = 4,
+    /// RAM the bootloader used (Limine's own structures + the kernel's INITIAL page tables).
+    /// Reclaimable, but it IS RAM the HHDM covers, and it sits ABOVE usable RAM - so a legit
+    /// page table can live here and `phys_in_ram` must accept it (else the walk guard floods).
+    BootloaderReclaimable = 5,
 }
 
 // ---------------------------------------------------------------------------
@@ -741,6 +746,27 @@ pub fn uart_rx_poll() {
     }
 }
 
+/// Drain the COM1 UART FIFO into the input ring RIGHT NOW, independent of the timer-ISR poll.
+/// `chaos max-carnage` starves the core-0 timer ISR (long IF=0 kernel work + slow tick), so
+/// `uart_rx_poll` stops running and the serial `q`-to-abort sits undrained in the UART FIFO -
+/// leaving the operator no way to stop the storm (the USB `q` path is dead too: its drivers are
+/// storm victims). A console reader (the chaos `q`-poll, syscall 24) calls this before popping the
+/// ring, so input capture never hinges on the ISR. IF-guarded: `cli` around the drain so it does
+/// not race the timer ISR on the single-producer ring tail; IF is restored to its prior value
+/// (the syscall path is IF=1, but restore exactly rather than assume). Safe to call from a syscall.
+pub fn uart_rx_drain_now() {
+    // SAFETY: pushfq reads RFLAGS to restore IF exactly; cli makes uart_rx_drain_fifo (the documented
+    // FIFO->ring drain, normally ISR-only) atomic vs the timer ISR's own drain of the same ring.
+    unsafe {
+        let flags: u64;
+        core::arch::asm!("pushfq; pop {f}; cli", f = out(reg) flags);
+        uart_rx_drain_fifo();
+        if flags & 0x200 != 0 {
+            enable_interrupts();
+        }
+    }
+}
+
 /// Inject one byte into the console input ring from a userspace input driver
 /// (the USB keyboard, §12), then wake any blocked ConsoleRead. Mirrors the COM1
 /// poll path's push + wake, so USB keystrokes reach the shell exactly like
@@ -749,31 +775,34 @@ pub fn uart_rx_poll() {
 /// tail - acceptable while COM1 input is unused (a per-ring lock is future work).
 pub fn console_push_byte(b: u8) {
     use core::sync::atomic::Ordering;
-    // Echo the keystroke to the console (serial + framebuffer) so the user sees
-    // their input inline - the framebuffer has no terminal-side local echo, so
-    // without this typing is invisible on a display. (On a serial terminal, turn
-    // local echo OFF so characters are not doubled.) Enter advances a line;
-    // backspace erases the last glyph.
-    // Echo via the CONSOLE path (serial + framebuffer) - keystrokes are part of
-    // the interactive session, not the log stream, so they belong on the TV.
-    // Suppressed while a foreground full-screen app owns the screen (it paints the
-    // display itself; its raw key polls must not smear its frame).
-    if CONSOLE_ECHO_ENABLED.load(Ordering::Acquire) {
-        match b {
-            b'\n' | b'\r' => console_write_bytes(b"\r\n"),
-            // Backspace is NOT echoed here: a destructive erase (BS, space, BS)
-            // would chew past the prompt when the line is empty. Line editing is
-            // the reader's policy - the shell echoes the erase only when it has a
-            // character to delete (it knows the line length; the kernel does not).
-            0x20..=0x7e   => console_write_byte(b),
-            _             => {}
-        }
-    }
+    // Capture the byte into the input ring + wake any reader FIRST, before the echo.
+    // The echo writes to the framebuffer (a slow, locked scroll); if a foreground
+    // command is ALSO scrolling heavily (e.g. `ping` printing a line a second), the
+    // echo stalls on that contention - and with the ring push AFTER it, the keystroke
+    // would never become readable, so `q` could not quit the command. Ring-first makes
+    // input capture independent of the display: the byte is readable immediately and
+    // the echo (display only) happens after and may block harmlessly.
     // SAFETY: single-producer ring push in practice (see note above).
     unsafe { uart_rx_push(b) };
     let waiter = CONSOLE_READ_WAITER.load(Ordering::Acquire);
     if waiter != u32::MAX {
         crate::task::scheduler::wake_by_slot(waiter as usize, 0);
+    }
+    // Echo the keystroke to the console (serial + framebuffer) so the user sees their
+    // input inline - the framebuffer has no terminal-side local echo, so without this
+    // typing is invisible on a display. (On a serial terminal, turn local echo OFF so
+    // characters are not doubled.) Enter advances a line. Suppressed while a foreground
+    // full-screen app owns the screen (it paints the display itself; its raw key polls
+    // must not smear its frame).
+    if CONSOLE_ECHO_ENABLED.load(Ordering::Acquire) {
+        match b {
+            b'\n' | b'\r' => console_write_bytes(b"\r\n"),
+            // Backspace is NOT echoed here: a destructive erase (BS, space, BS) would
+            // chew past the prompt when the line is empty. Line editing is the reader's
+            // policy - the shell echoes the erase only when it has a character to delete.
+            0x20..=0x7e   => console_write_byte(b),
+            _             => {}
+        }
     }
 }
 

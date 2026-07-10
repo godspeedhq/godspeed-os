@@ -95,6 +95,15 @@ Only the changed service restarts; the kernel and other services keep running.
 
 Creates a UEFI-bootable disk image at `build/os.img` for writing to a USB drive.
 
+> **⚠️ Deliver a CLEAN image, copied BEFORE any boot.** `osdev run` and `osdev test` rebuild
+> `build/os.img` incrementally as a side effect (`cmd_run` -> `cmd_build()` + `disk_image::create()`),
+> and an incrementally-built kernel can boot under QEMU yet be **rejected by real UEFI firmware** - the
+> machine will not pick up the USB. To hand hardware a reliable image: `cargo clean --target
+> x86_64-unknown-none`, then `osdev image`, then `cp build/os.img build/<name>.img` **immediately,
+> before any `osdev run` / `osdev test`** (either would rebuild `os.img` underneath you, so a copy taken
+> afterwards is the incremental build). **Booting in QEMU is not proof the on-hardware image is good; a
+> clean build is.** See README "Flashing to real hardware".
+
 **Build mode:** Uses `supervisor/bare-metal` feature - spawns only TCB services + ping + pong. Probe services are excluded because they require the QEMU control port (COM2/TCP:5555) to complete and would stall indefinitely on real hardware.
 
 **Image layout:**

@@ -1,0 +1,16 @@
+name    = "nic-driver"
+version = "0.1.0"
+
+[resources.memory]
+request = "8MiB"
+limit   = "16MiB"
+
+[capabilities]
+# The NIC's MMIO BAR is granted by the kernel BY NAME at spawn (kernel/src/task/mod.rs),
+# gated on the discovered NIC being a real Intel e1000 - the same mechanism xhci/ehci/
+# block-driver use. Reach it via ctx.mmio(). Phase 1 step 2 is reset + MAC only; a full
+# driver adds hw_interrupt (the RX IRQ) and a DMA arena (TX/RX rings) in later steps.
+log_write = true
+
+[placement]
+core = 1   # a driver pins to the core its IRQ will route to (interrupt locality, §12.2)

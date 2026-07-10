@@ -38,6 +38,28 @@ const PACE_YIELDS: u32 = 3000;      // a beat between rounds so the panel/log st
 const MEMP_CHUNK: usize = 64 * 1024; // one mem-pressure round allocs this (held; chaos's limit bounds it)
 const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]; // matches the `date` utility
 
+// The full restartable target set for the DEFAULT (no-target) RANDOM storm - every service the system
+// can bring back (the supervisor via the kernel, everything else via the supervisor). NOTHING is
+// protected-last: the supervisor is a normal victim at any point, because the fixed-point robustness must
+// recover from ANY kill order. Forcing supervisor-last would contrive the recovery (Test 15 / Cmd II -
+// let Chaos try its hardest); random destruction is the honest stress.
+const RESTARTABLE: [&str; 9] = [
+    "supervisor", "shell", "block-driver", "fs", "xhci", "ehci", "logger", "nic-driver", "net-stack",
+];
+
+// A tiny xorshift64 PRNG - there is no std rng in no_std. Seeded from the RTC start time (varies run to
+// run; the TSC is broken on the T630 so we do NOT seed from it) and advanced every round, so the random
+// subset differs both run-to-run and round-to-round. Bounded, no heap.
+struct Rng(u64);
+impl Rng {
+    fn new(seed: u64) -> Self { Rng(if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed }) }
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        self.0 = x; x
+    }
+}
+
 fn str_of(b: &[u8]) -> &str { core::str::from_utf8(b).unwrap_or("?") }
 
 /// Slot of the live task named `name`, or None.
@@ -114,11 +136,12 @@ fn flood(ctx: &ServiceContext, name: &str, cache: &mut Option<CapHandle>) -> Opt
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
-    // The shell launcher sends the round count right after spawning us (0 = run until q). Wait briefly
-    // (RTC-bounded) for it BEFORE claiming the foreground - the shell is still live to send it. Default
-    // to run-until-q if it never arrives (e.g. the launcher's send failed), so we never block forever.
+    // The shell launcher sends the round count (always > 0 - the shell requires an explicit count) right
+    // after spawning us. Wait briefly (RTC-bounded) for it BEFORE claiming the foreground - the shell is
+    // still live to send it. If it never arrives (e.g. the launcher's send failed) rounds stays 0 and the
+    // run is a safe no-op (there is no uncapped default), so we never storm unconfigured.
     let mut rounds: u64 = 0;
-    let mut tbuf = [0u8; 24];
+    let mut tbuf = [0u8; 128];   // target string; may be a comma-separated list, so sized for a bounded list
     let mut tlen = 0usize;
     {
         let t0 = ctx.datetime().epoch_secs();
@@ -126,23 +149,41 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             if let Some(msg) = ctx.try_recv() {
                 let b = msg.payload_bytes();
                 if b.len() >= 4 { rounds = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64; }
-                if b.len() > 4 { let n = (b.len() - 4).min(24); tbuf[..n].copy_from_slice(&b[4..4 + n]); tlen = n; }
+                if b.len() > 4 { let n = (b.len() - 4).min(128); tbuf[..n].copy_from_slice(&b[4..4 + n]); tlen = n; }
                 break;
             }
             if ctx.datetime().epoch_secs() - t0 >= 2 { break; }
             ctx.yield_cpu();
         }
     }
-    // The TARGET: "all-services" = aim kill/flood at random live services; a service name = aim them at
-    // THAT service every round. mem-pressure + spawn-storm are system-wide in both modes. Default
-    // "all-services" (named so it can never clash with a real service that someone calls "all").
-    let target: &str = if tlen == 0 { "all-services" } else { str_of(&tbuf[..tlen]) };
-    let target_all = target == "all-services";
+    // The TARGET: DEFAULT (no target) = "random" - a RANDOM subset of the restartable set each round (the
+    // honest chaos-monkey storm; supervisor is a normal victim, nothing protected-last). "all-services" =
+    // a full even sweep of every live service each round; a service name = aim every round at THAT one; a
+    // comma-list = kill every listed one each round. mem-pressure + spawn-storm are system-wide in all modes.
+    let target: &str = if tlen == 0 { "random" } else { str_of(&tbuf[..tlen]) };
+    // all-services = the RANDOM whole-set storm (a random subset each round). The shell now REQUIRES a target
+    // (a bare max-carnage is refused there), so tlen==0 should not occur; keep it -> random defensively.
+    let target_random = tlen == 0 || target == "all-services";
+    let target_all = target == "all-services";     // kept for the serial-only abort warning messages
+    // A comma-separated target ("nic-driver,net-stack") is a MULTI-TARGET run: EVERY listed service is
+    // killed each round (semantics B - the cascade stress). Parse it once into a bounded fixed array.
+    const MAX_TLIST: usize = 8;
+    let mut tlist: [[u8; 24]; MAX_TLIST] = [[0u8; 24]; MAX_TLIST];
+    let mut tlist_len: [usize; MAX_TLIST] = [0usize; MAX_TLIST];
+    let mut ntlist = 0usize;
+    let target_list = target.contains(',');
+    if target_list {
+        for seg in target.split(',') {
+            if seg.is_empty() || ntlist >= MAX_TLIST { continue; }
+            let sb = seg.as_bytes(); let l = sb.len().min(24);
+            tlist[ntlist][..l].copy_from_slice(&sb[..l]); tlist_len[ntlist] = l; ntlist += 1;
+        }
+    }
     // Three keyboard-abort cases. all-services storms EVERY driver, so the keyboard dies for sure (serial
     // only). A single USB host driver (xhci/ehci) kills the keyboard ONLY if it is the controller yours is
     // on - we cannot know which (two controllers + hot-plug make detection unreliable), so we state the
     // proviso honestly rather than guess. Anything else leaves the keyboard alive (plain keyboard `q`).
-    let target_usb = target == "xhci" || target == "ehci";
+    let target_usb = target.split(',').any(|s| s == "xhci" || s == "ehci");
 
     // Take the keyboard so a resurrected shell cannot steal our `q`. This is the moment the shell goes
     // "muted" for the duration of the run (unclaimed is the normal state, so this changes nothing else).
@@ -168,11 +209,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // for elapsed + the linear ETA (a pure extrapolation of elapsed over round progress, no outside truth).
     let start_dt = ctx.datetime();
     let start_epoch = start_dt.epoch_secs();
+    // Seed the random-storm PRNG from the RTC start time (varies per run); advanced each round so the
+    // subset differs round-to-round. Only read in the `target_random` branch.
+    let mut rng = Rng::new((start_epoch as u64)
+        ^ ((start_dt.minute as u64) << 24) ^ ((start_dt.second as u64) << 40));
 
     'carnage: loop {
-        // `q` aborts. The kernel buffers the keypress across input-driver churn, so it is caught here.
+        // `q` aborts (round boundary; also polled between each kill/flood in the sweep below, so one q
+        // press aborts within a sub-step rather than lagging a whole round). The kernel buffers the
+        // keypress across input-driver churn, so it is caught here.
         if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { break; } }
-        if rounds > 0 && round >= rounds { break; } // a bounded `max-carnage N` run is complete
+        if round >= rounds { break; } // the bounded run is complete (rounds is always > 0 - the shell requires it)
 
         round += 1;
 
@@ -183,15 +230,28 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // specific target, just that one service.
         let mut cand: [([u8; 24], usize); MAX_CAND] = [([0u8; 24], 0usize); MAX_CAND];
         let mut ncand = 0usize;
-        if target_all {
-            for slot in 0..256u32 {
-                let st = ctx.task_stat(slot);
-                if !st.valid || st.state == 4 { continue; }
-                let nm = st.name_str();
-                if nm.is_empty() || nm == "chaos" || nm == "mem-pressure" || nm.starts_with("observe") { continue; }
-                if ncand < MAX_CAND {
-                    let b = nm.as_bytes(); let l = b.len().min(24);
+        if target_random {
+            // RANDOM subset of the restartable set this round - vary WHICH and HOW MANY. Each service is in
+            // with ~50% probability (a fresh PRNG draw); if none were picked, take one random victim so a
+            // round is never a no-op. Only LIVE ones actually die (a kill of a dead/absent name is a no-op),
+            // so a build without a service just skips it. Supervisor included at any point - no protected-last.
+            for &svc in RESTARTABLE.iter() {
+                if (rng.next() & 1) == 1 && ncand < MAX_CAND {
+                    let b = svc.as_bytes(); let l = b.len().min(24);
                     cand[ncand].0[..l].copy_from_slice(&b[..l]); cand[ncand].1 = l; ncand += 1;
+                }
+            }
+            if ncand == 0 {
+                let pick = (rng.next() as usize) % RESTARTABLE.len();
+                let b = RESTARTABLE[pick].as_bytes(); let l = b.len().min(24);
+                cand[0].0[..l].copy_from_slice(&b[..l]); cand[0].1 = l; ncand = 1;
+            }
+        } else if target_list {
+            // Multi-target: every listed service is a candidate this round (all killed below).
+            for t in 0..ntlist {
+                if ncand < MAX_CAND {
+                    let l = tlist_len[t];
+                    cand[ncand].0[..l].copy_from_slice(&tlist[t][..l]); cand[ncand].1 = l; ncand += 1;
                 }
             }
         } else {
@@ -207,6 +267,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let kill_pick = if ncand > 0 { ((round - 1) % ncand as u64) as usize } else { usize::MAX };
         let (mut sweep_killed, mut sweep_flooded) = (0u64, 0u64);
         for c in 0..ncand {
+            // Poll q between each kill/flood: a round can take seconds (services respawn), so checking
+            // only at the round top made one q press lag a whole round. Now one press aborts within a
+            // sub-step. (`break 'carnage` exits the round loop; the kernel buffers the key across churn.)
+            if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { break 'carnage; } }
             let nl = cand[c].1;
             let mut nbuf = [0u8; 24]; nbuf[..nl].copy_from_slice(&cand[c].0[..nl]);
             let name = str_of(&nbuf[..nl]);
@@ -236,8 +300,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     Some(_) => { flooded += 1; sv_flooded[s] += 1; sweep_flooded += 1; sv_flood_na[s] = 0; }
                     None    => { if sv_flood_na[s] == 0 { sv_flood_na[s] = 2; } } // no endpoint right now
                 }
-                // ...and, when the rotor lands here, KILL it too (restart-test the floodable set).
-                if c == kill_pick {
+                // ...and KILL it: when the rotor lands here (all-services / single target), OR always in a
+                // multi-target list run (semantics B) or the RANDOM storm (every service the round PICKED
+                // goes down this round).
+                if c == kill_pick || target_list || target_random {
                     let _ = ctx.kill(name);
                     killed += 1; sv_killed[s] += 1; sweep_killed += 1;
                     if let Some(h) = sv_floodcap[s].take() { ctx.remove_cap(h); }
@@ -264,13 +330,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut f = FrameBuf::new();
         let _ = write!(f, "\x1b[H");
         let _ = write!(f, "  C H A O S   max-carnage    target: {}    ({})\x1b[K\r\n",
-            target, if target_all { "'q' to quit via SERIAL" } else { "'q' to quit" });
-        if rounds > 0 {
-            let pct = round * 100 / rounds; // round <= rounds, so 1..=100; rounds>0 guards the divide
-            let _ = write!(f, "  round {} / {} ({}%)\x1b[K\r\n", round, rounds, pct);
-        } else {
-            let _ = write!(f, "  round {}  (until q)\x1b[K\r\n", round);
-        }
+            target, if target_all || target_random { "'q' to quit via SERIAL" } else { "'q' to quit" });
+        // rounds is always > 0 - the shell requires an explicit count; there is no uncapped run.
+        let pct = round * 100 / rounds; // round is 1..=rounds, so pct is 1..=100
+        let _ = write!(f, "  round {} / {} ({}%)\x1b[K\r\n", round, rounds, pct);
         // Wall-clock status line: when it began, how long it has run, and a linear ETA (no outside truth -
         // a pure extrapolation of elapsed over round progress). until-q has no total, so remains is n/a.
         let elapsed = (ctx.datetime().epoch_secs() - start_epoch).max(0) as u64;
@@ -300,7 +363,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let _ = write!(f, "  ----------------------------------------------------\x1b[K\r\n");
         let _ = write!(f, "  flood N/A: reply = killed instead (reply-style); no-ep = no send endpoint\x1b[K\r\n");
         let _ = write!(f, "  system:  mem-pressure {}   spawn-storm {}\x1b[K\r\n", mempr, spawns);
-        if target_all {
+        if target_all || target_random {
             let _ = write!(f, "  kernel: ALIVE   abort: 'q' in the SERIAL console (keyboard dead)\x1b[K\r\n");
         } else if target_usb {
             let _ = write!(f, "  kernel: ALIVE   abort: 'q' on the keyboard, or SERIAL if it's on {}\x1b[K\r\n", target);
@@ -353,7 +416,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         ctx.yield_cpu(); k += 1;
         if k % POLL_EVERY == 0 && ctx.datetime().epoch_secs() - t0 >= RECOVER_SECS { break; }
     }
-    for _ in 0..SHELL_SETTLE_YIELDS { ctx.yield_cpu(); } // let the fresh shell settle
+    // Cosmetic hand-off pacing, NOT a completion wait (Commandment VIII): the live-shell TRUTH is
+    // already established by the bounded slot_of loop above. This fixed pad only smooths the console
+    // hand-back so our "done" line and the shell's redrawn prompt do not interleave; skipping it risks
+    // at worst a momentary cosmetic glitch, never incorrectness. Deliberately time-based, not a truth-wait.
+    for _ in 0..SHELL_SETTLE_YIELDS { ctx.yield_cpu(); }
     // Print our last line FIRST, then release. The muted shell only draws its prompt once it regains the
     // foreground, so releasing BEFORE this printed "done" made the shell's `gsh>` land before the text
     // (the "switches screen, press Enter to see the prompt" glitch). done -> release -> the shell draws a

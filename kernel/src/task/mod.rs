@@ -183,6 +183,7 @@ pub const XHCI_DMA_VA:     u64 = 0x2_0000_0000;
 pub static XHCI_DMA_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static EHCI_DMA_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static AHCI_DMA_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static NIC_DMA_PHYS:  core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Pages of contiguous DMA memory for the **xHCI** driver. The first 16 pages
 /// hold the control structures (command/event rings, DCBAA, ERST, per-device
 /// slices, plus the scratchpad buffer array at page 15); the remaining 256 pages
@@ -462,8 +463,13 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
-            // Pin to core 1: keep the driver off core 0 where the shell + TCB live (§9.2).
-            preferred_core:    1,
+            // Core 2: the USB drivers busy-poll their controllers at ~100% CPU, so co-locating both
+            // on core 1 (with nic-driver + net-stack + fs + block-driver) SATURATED it - starving the
+            // networking (net-stack's frame requests to nic-driver timed out) and the keyboard itself
+            // (input garbled then died on the T630). Spreading the two busy-pollers onto the idle cores
+            // (xhci=2, ehci=3) leaves core 1 for the request-driven services. Falls back to round-robin
+            // if core 2 is not ready.
+            preferred_core:    2,
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
             // Route the xHCI MSI (interrupts::XHCI_MSI_VECTOR = 0x28) to this driver's recv
@@ -484,7 +490,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
-            preferred_core:    1,
+            preferred_core:    3,   // core 3: the other busy-poller, off the saturated core 1 (see xhci)
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
             // Route the EHCI INTx (interrupts::EHCI_MSI_VECTOR = 0x29, IOAPIC-routed) to this
@@ -500,6 +506,36 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             elf:               include_bytes!(env!("SVC_BLOCK_DRIVER_ELF")),
             has_recv_endpoint: true, // serves block read/write requests from fs (§4)
             send_peers:        &[], // Path C: recorded in the kernel directory at spawn; no peers
+            send_peers_grant:  false,
+            preferred_core:    1,
+            probe_mode:        0,
+            memory_limit:      16 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
+        // `nic-driver` - userspace NIC driver (networking, v2; docs/networking.md, Phase 1).
+        // The kernel maps the Intel e1000's BAR0 by name at spawn (gated on the discovered NIC
+        // actually being an e1000), like the USB/AHCI controllers. Phase 1 step 2 is reset +
+        // read the MAC; TX/RX rings, the RX IRQ, and the frame interface to net-stack follow.
+        "nic-driver" => Some(("nic-driver", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_NIC_DRIVER_ELF")),
+            has_recv_endpoint: true, // will serve the frame interface to net-stack (§12)
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    1,
+            probe_mode:        0,
+            memory_limit:      16 * 1024 * 1024,
+            hw_irqs:           &[], // Phase 1 step 2: reset + MAC only; RX IRQ wired later
+            has_console_read:  false,
+        })),
+        // net-stack (services/net-stack): the model-AGNOSTIC half of networking (docs/networking.md).
+        // Owns its endpoint (nic-driver replies frames there via the per-request reply cap) and sends
+        // to nic-driver (the frame interface). Spawned AFTER nic-driver so its send-peer cap wires from
+        // the kernel name table at spawn. Core 1. No hardware - it speaks ARP/IP over raw frames.
+        "net-stack" => Some(("net-stack", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_NET_STACK_ELF")),
+            has_recv_endpoint: true,               // nic-driver replies frames here (per-request reply cap)
+            send_peers:        &["nic-driver"],    // the frame interface; reacquired by name on death
             send_peers_grant:  false,
             preferred_core:    1,
             probe_mode:        0,
@@ -3252,7 +3288,9 @@ fn spawn_service_with_config(
     // into the real, QEMU-proven `osdev test resource-server`. It only takes effect in the
     // resource-test build, the only build that spawns `resource-server` - in every other build it
     // is never spawned, so the grant never fires.
-    if name == "fs" || name == "resource-server" {
+    // `net-stack` mints SOCKET capabilities (a socket is a delegated resource cap, §7.10, the same
+    // mechanism `fs` uses for files) - so it needs the same minting authority.
+    if name == "fs" || name == "resource-server" || name == "net-stack" {
         let rm_cap = mint_cap(RESOURCE_MINT_RESOURCE, Rights::WRITE);
         caps.insert(rm_cap)
             .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
@@ -3374,13 +3412,13 @@ fn spawn_service_with_config(
             pci::EHCI_MMIO_BASE.load(Relaxed)
         } else if name == "block-driver" && pci::AHCI_FOUND.load(Relaxed) {
             pci::AHCI_ABAR.load(Relaxed) // AHCI HBA registers (docs/ahci.md)
-        } else if name == "e1000" && pci::NIC_FOUND.load(Relaxed)
-            && pci::NIC_VENDOR_DEVICE.load(Relaxed) == 0x100E_8086 {
-            // Intel 82540EM e1000 BAR0, mapped ONLY for the `e1000` example driver and
-            // ONLY when the discovered NIC is actually an Intel e1000. On any other NIC
-            // (e.g. the T630's chipset) this is false, so the driver gets no mapping and
-            // idles - it never touches foreign hardware (examples/e1000; Commandment VII:
-            // a hardware capability is granted explicitly, for exactly the device asked for).
+        } else if (name == "nic-driver" || name == "e1000") && pci::NIC_FOUND.load(Relaxed)
+            && matches!(pci::NIC_VENDOR_DEVICE.load(Relaxed), 0x100E_8086 | 0x8168_10EC) {
+            // The NIC's first memory BAR (its register space), mapped for `nic-driver` (or the `e1000`
+            // example) and ONLY when the discovered NIC is one nic-driver can drive: an Intel e1000
+            // (0x100E:8086) or a Realtek RTL8168 (0x8168:10EC, the T630). On any other NIC this is
+            // false, so the driver gets no mapping and idles - it never touches foreign hardware
+            // (Commandment VII: a hardware capability is granted explicitly, for the device asked for).
             pci::NIC_MMIO_BASE.load(Relaxed)
         } else {
             0
@@ -3417,11 +3455,12 @@ fn spawn_service_with_config(
         (name == "xhci" && pci::XHCI_FOUND.load(Relaxed))
             || (name == "ehci" && pci::EHCI_FOUND.load(Relaxed))
             || (name == "block-driver" && pci::AHCI_FOUND.load(Relaxed)) // AHCI (docs/ahci.md)
+            || (name == "nic-driver" && pci::NIC_FOUND.load(Relaxed)) // e1000 TX/RX rings (docs/networking.md)
     };
     // Per-driver arena size: xHCI needs room for its 256 scratchpad buffers;
     // EHCI gets the small 64 KiB arena it had on main; the AHCI block driver needs
     // only its command list/FIS/command table + a data buffer - 64 KiB is plenty.
-    let dma_pages = if name == "ehci" || name == "block-driver" {
+    let dma_pages = if name == "ehci" || name == "block-driver" || name == "nic-driver" {
         EHCI_DMA_PAGES
     } else {
         XHCI_DMA_PAGES
@@ -3436,7 +3475,8 @@ fn spawn_service_with_config(
             "xhci"         => &XHCI_DMA_PHYS,
             "ehci"         => &EHCI_DMA_PHYS,
             "block-driver" => &AHCI_DMA_PHYS,
-            _              => &XHCI_DMA_PHYS, // unreachable: dma_for_driver gates these three names
+            "nic-driver"   => &NIC_DMA_PHYS,
+            _              => &XHCI_DMA_PHYS, // unreachable: dma_for_driver gates these names
         };
         let arena = match kept.load(core::sync::atomic::Ordering::Relaxed) {
             0 => {
@@ -3505,8 +3545,10 @@ fn spawn_service_with_config(
                         "xhci"         => pci::XHCI_BDF.load(Relaxed),
                         "ehci"         => pci::EHCI_BDF.load(Relaxed),
                         "block-driver" => pci::AHCI_BDF.load(Relaxed),
+                        "nic-driver"   => pci::NIC_BDF.load(Relaxed),
                         _              => 0xFFFF,
                     };
+                    pci::set_power_d0(bdf);  // bring the device to D0 first - firmware may park a non-boot NIC in D3
                     pci::set_bus_master(bdf);
                 }
                 (XHCI_DMA_VA, phys, len)

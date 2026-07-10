@@ -1277,7 +1277,7 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     // boot/RTC reads (10, 11). Every other query discloses another task's or
     // system-wide state and requires the INTROSPECT capability with READ (§3.1;
     // docs/introspection-capability.md).
-    if !matches!(query_id, 0 | 3 | 9 | 10 | 11 | 12 | 13)
+    if !matches!(query_id, 0 | 3 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17)
         && !scheduler::current_task_holds_resource(
             crate::capability::INTROSPECT_RESOURCE, Rights::READ)
     {
@@ -1306,6 +1306,21 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // Caller-specific, so ungated (like query 0). The muted shell polls this to stay quiet + redraw
         // its prompt only when it regains the keyboard.
         13 => crate::arch::x86_64::console_foreground_allows(scheduler::current_task_slot() as u32) as i64,
+        // NIC vendor | device<<16 from the PCI scan (0 if no NIC). Task-neutral hardware info, ungated:
+        // nic-driver reads it to know which chip it drives (e1000 vs RTL8168). Networking Phase 4.
+        14 => crate::arch::x86_64::pci::NIC_VENDOR_DEVICE.load(core::sync::atomic::Ordering::Relaxed) as i64,
+        // NIC MMIO base (the register-space BAR the PCI scan chose), 0 if none. Ungated hardware fact;
+        // a diagnostic for the driver (which BAR did the memory-BAR scan pick). Networking Phase 4.
+        15 => crate::arch::x86_64::pci::NIC_MMIO_BASE.load(core::sync::atomic::Ordering::Relaxed) as i64,
+        // TSC ticks per 10 ms quantum, from the boot-time CPUID calibration (boot.rs). Ungated,
+        // task-neutral timing (like the raw TSC, query 3): userspace turns a TSC delta into milliseconds
+        // as `delta * 10 / this`. `ping` uses it for round-trip time. 0 if the TSC was not calibrated.
+        16 => crate::arch::x86_64::boot::tsc_ticks_per_quantum() as i64,
+        // Deglitched monotonic "now" in epoch seconds (rtc.rs now_epoch_monotonic): the wall clock with
+        // backward / huge-forward CMOS misreads dropped. For time-DELTA deadlines
+        // (request_with_reply_deadline) and pacing, where a raw RTC glitch (the "4383d" misread) would
+        // expire a deadline instantly. Ungated task-neutral timing, like the raw RTC (query 11).
+        17 => crate::arch::x86_64::rtc::now_epoch_monotonic(),
         4 => crate::memory::allocator::free_frame_count() as i64,
         5 => crate::memory::allocator::total_frame_count() as i64,
         6 => scheduler::core_active_ticks(arg1 as usize) as i64,
@@ -1453,6 +1468,9 @@ fn handle_console_read(cap_slot: u64) -> i64 {
         // This closes the race where the shell's loop gate passed is-foreground, then it blocked here
         // just as the app claimed. We are woken by the RX IRQ (a byte) OR by release/owner-death.
         if crate::arch::x86_64::console_foreground_allows(my_slot as u32) {
+            // Drain the UART FIFO ourselves (a starved timer ISR under chaos max-carnage would otherwise
+            // leave the serial byte stranded in the FIFO). See uart_rx_drain_now.
+            crate::arch::x86_64::uart_rx_drain_now();
             if let Some(b) = crate::arch::x86_64::uart_rx_pop() {
                 crate::arch::x86_64::CONSOLE_READ_WAITER.store(u32::MAX, Ordering::Release);
                 return b as i64;
@@ -1498,6 +1516,10 @@ fn handle_try_console_read(cap_slot: u64) -> i64 {
     if !crate::arch::x86_64::console_foreground_allows(scheduler::current_task_slot() as u32) {
         return NO_CONSOLE_BYTE;
     }
+    // Drain the UART FIFO ourselves before popping: `chaos max-carnage` starves the timer-ISR poll
+    // (the normal FIFO->ring drain), so without this the serial `q`-to-abort sits stranded in the FIFO
+    // and the storm cannot be stopped. This makes the chaos runner's q-poll independent of the ISR.
+    crate::arch::x86_64::uart_rx_drain_now();
     match crate::arch::x86_64::uart_rx_pop() {
         Some(b) => b as i64,
         None    => NO_CONSOLE_BYTE,

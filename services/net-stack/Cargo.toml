@@ -1,0 +1,11 @@
+[package]
+name = "net-stack"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "net-stack"
+path = "src/main.rs"
+
+[dependencies]
+godspeed-sdk = { path = "../../sdk/rust" }

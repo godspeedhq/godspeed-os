@@ -77,3 +77,8 @@ storage.
 ## 6. Conformance
 
 Conforms: own `tree help` / `tree version` (with a real example, per `0_conventions.md`).
+
+Also conforms to **rule 10** (`0_conventions.md` §1.10): each `LIST_DIR` step is **q-abortable** via
+`fs_request_q` - a wait past ~2s prints `(q to quit)` and `q`/`Q`/ESC returns to the prompt (a fast
+reply prints nothing). This replaced a bare `request_with_reply`, which rule 10 forbids for an
+interactive command.

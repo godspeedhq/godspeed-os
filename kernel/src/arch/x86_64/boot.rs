@@ -340,48 +340,44 @@ pub unsafe fn init_local_apic() {
     let arat = unsafe { cpuid_arat_supported() };
     super::interrupts::set_idle_can_halt(tsc_deadline_supported || arat);
 
+    // Calibrate TSC ticks/10ms ONLY where TSC-Deadline mode uses it (the AMD T630). The BSP measures via
+    // the PIT (portable ground truth - CPUID 0x15/0x16 give a garbage frequency on AMD, which stored a
+    // ~1000x-too-small quantum: a ~10 us deadline interrupt storm PLUS ctx.sleep stretched to seconds and
+    // ping RTT inflated ~1000x); APs read the stored value. QEMU has no TSC-Deadline, so it stays periodic
+    // with the quantum uncalibrated (0) and cycles_to_ticks uses its 1-tick fallback exactly as before -
+    // deliberately NOT calibrated on QEMU: its tick clock runs ~10 Hz, so an accurate quantum would make
+    // recv_timeout deadlines ~10x too long. The wrong value only ever existed in the TSC-Deadline path.
     let tsc_ticks = if tsc_deadline_supported {
-        // Compute from CPUID.0x15; returns 0 if frequency cannot be determined.
-        unsafe { compute_tsc_ticks_per_10ms(lapic_id) }
+        let existing = TSC_TICKS_PER_QUANTUM.load(Ordering::Relaxed);
+        // SAFETY: ring-0; interrupts are disabled during early per-core init.
+        if existing > 0 { existing } else { unsafe { calibrate_tsc_ticks_per_10ms(lapic_id) } }
     } else {
         0
     };
 
-    if tsc_ticks > 0 {
-        // TSC-Deadline mode: LVT bits[18:17] = 10b (mode 2), vector 0x20.
-        // No DIVIDE or INIT registers used in this mode.
+    if tsc_deadline_supported && tsc_ticks > 0 {
+        // TSC-Deadline mode: LVT bits[18:17] = 10b (mode 2), vector 0x20. No DIVIDE/INIT in this mode.
+        // First deadline arm is deferred to scheduler::run() (after CORE_SCHED_CTX[cid].cr3 is seeded)
+        // to avoid the timer firing with cr3=0 and triple-faulting silently.
         write_apic(apic_virt, APIC_LVT_TIMER, (1 << 18) | 0x20);
-
-        // Store per-quantum tick count for re-arm in the timer ISR.
-        // Relaxed is fine: written once before APs start, read after.
+        // Store per-quantum tick count for re-arm in the timer ISR. Written once on the BSP before APs
+        // start, read after - so Relaxed is fine.
         TSC_TICKS_PER_QUANTUM.store(tsc_ticks, Ordering::Relaxed);
         TSC_DEADLINE_MODE.store(true, Ordering::Relaxed);
-
-        // First deadline arm is deferred to scheduler::run(), after
-        // CORE_SCHED_CTX[cid].cr3 is seeded.  Arming here would risk the
-        // timer firing before the scheduler context is initialised, causing
-        // switch_context to load cr3=0 and triple-fault silently.
         crate::kprintln!("apic: core {} TSC-Deadline timer ({} ticks/quantum)", lapic_id, tsc_ticks);
-
-        // TSC-Deadline mode still needs the package C-state limit.
-        // Without it the firmware can promote the package to PC6+ between
-        // timer deadlines, power-gating the APIC and silently dropping the
-        // next TSC-Deadline interrupt.  Limiting to PC1 keeps the APIC
-        // powered across all C-states the OS sees.
+        // Package C-state limit keeps the APIC powered so a deadline interrupt is never dropped.
         // SAFETY: ring-0; APIC initialised above.
         unsafe { limit_package_cstates(lapic_id) };
     } else {
-        // Periodic mode: fires every ~10 ms regardless of C-states on supported HW.
-        // On QEMU (no TSC-Deadline in default cpu model) this is the normal path.
+        // Periodic mode: fires every ~10 ms regardless of C-states. QEMU's normal path (no TSC-Deadline).
         write_apic(apic_virt, APIC_LVT_TIMER, (1 << 17) | 0x20);
         write_apic(apic_virt, APIC_TIMER_DIVIDE, 0x03);
-        // ~100 ms at 1 GHz APIC bus / 16 divider (QEMU).
-        // ~50 ms on AMD GX-420GI (Jaguar): APIC timer ≈ CPU_CLOCK/16 ≈ 125 MHz.
-        // Increased 10× from 625_000 to break the timer-ISR cascade on AMD hardware
-        // where verbose diagnostic output (~18 ms) exceeded the prior 5 ms period.
+        // ~100 ms at 1 GHz APIC bus / 16 divider (QEMU); ~50 ms on AMD GX-420GI (Jaguar). 10x from
+        // 625_000 broke the timer-ISR cascade on AMD where verbose diagnostics (~18 ms) exceeded the
+        // prior 5 ms period.
         write_apic(apic_virt, APIC_TIMER_INIT, 6_250_000);
         if tsc_deadline_supported {
-            crate::kprintln!("apic: core {} periodic timer (TSC freq unknown)", lapic_id);
+            crate::kprintln!("apic: core {} periodic timer (TSC calibration unavailable)", lapic_id);
         }
         // SAFETY: ring-0; APIC initialised above.
         unsafe { limit_package_cstates(lapic_id) };
@@ -460,6 +456,80 @@ unsafe fn compute_tsc_ticks_per_10ms(lapic_id: u32) -> u64 {
 
     crate::kprintln!("apic: core {} TSC frequency unknown (CPUID.0x15 and 0x16 both zero)", lapic_id);
     0
+}
+
+/// Calibrate TSC ticks per 10 ms. The PIT is the portable ground truth and is tried first; CPUID's
+/// Intel-only leaves are a fallback. Each candidate is sanity-bounded (a real CPU is 100 MHz .. 10 GHz,
+/// i.e. 1e6 .. 1e8 ticks per 10 ms), so a garbage value (the AMD T630's CPUID reports ~1000x too small)
+/// is rejected rather than trusted. Returns 0 if neither is plausible - the caller then runs periodic
+/// mode and `cycles_to_ticks` uses its 1-tick fallback.
+///
+/// # Safety
+/// Ring-0 only. Interrupts must be disabled (early per-core init). Touches PIT ports 0x42/0x43/0x61.
+unsafe fn calibrate_tsc_ticks_per_10ms(lapic_id: u32) -> u64 {
+    const SANE_LO: u64 = 1_000_000;    // 100 MHz
+    const SANE_HI: u64 = 100_000_000;  // 10 GHz
+
+    let pit = pit_calibrate_tsc_ticks_per_10ms();
+    if (SANE_LO..=SANE_HI).contains(&pit) {
+        crate::kprintln!(
+            "apic: core {} PIT-calibrated tsc_hz={} ticks/10ms={}",
+            lapic_id, pit.saturating_mul(100), pit
+        );
+        return pit;
+    }
+
+    // PIT implausible or absent: fall back to CPUID's Intel leaves (correct on Intel).
+    let cpuid = compute_tsc_ticks_per_10ms(lapic_id);
+    if (SANE_LO..=SANE_HI).contains(&cpuid) {
+        return cpuid;
+    }
+
+    crate::kprintln!(
+        "apic: core {} TSC calibration failed (pit={} cpuid={}); periodic 1-tick fallback",
+        lapic_id, pit, cpuid
+    );
+    0
+}
+
+/// Measure TSC ticks per 10 ms by gating PIT channel 2 for a known 50 ms interval and counting TSC
+/// cycles across it. Portable - correct on AMD (which exposes no usable CPUID TSC frequency) and Intel
+/// alike. Returns 0 if the PIT never reaches terminal count, so the caller can fall back.
+///
+/// # Safety
+/// Ring-0 only. Interrupts disabled. Uses PIT channel 2 (data 0x42, command 0x43) and control port 0x61;
+/// channel 0 (the legacy tick) is untouched. Saves and restores 0x61.
+unsafe fn pit_calibrate_tsc_ticks_per_10ms() -> u64 {
+    const PIT_HZ: u64 = 1_193_182;      // i8254 input clock
+    const CAL_MS: u64 = 50;             // 50 ms window = 59_659 counts, well under the 16-bit max
+    let count: u16 = ((PIT_HZ * CAL_MS) / 1000) as u16;
+
+    // Channel 2: speaker off (bit1=0), gate on (bit0=1). Save 0x61 to restore afterwards.
+    let saved_61 = inb(0x61);
+    outb(0x61, (saved_61 & 0xFC) | 0x01);
+
+    // Channel 2, access lo+hi byte, mode 0 (interrupt on terminal count), binary.
+    outb(0x43, 0b1011_0000);
+    outb(0x42, (count & 0xFF) as u8);
+    outb(0x42, (count >> 8) as u8);      // writing the high byte starts the countdown (gate is high)
+
+    let t0 = core::arch::x86_64::_rdtsc();
+    // Wait for channel-2 output (0x61 bit5) to go high at terminal count. Bail on a stuck PIT via a TSC
+    // guard ~1000x the expected window, so boot never hangs - the caller then uses CPUID.
+    loop {
+        if inb(0x61) & 0x20 != 0 { break; }
+        if core::arch::x86_64::_rdtsc().wrapping_sub(t0) > 100_000_000_000 {
+            outb(0x61, saved_61);
+            return 0;
+        }
+    }
+    let t1 = core::arch::x86_64::_rdtsc();
+    outb(0x61, saved_61);                // restore the control port
+
+    let elapsed = t1.wrapping_sub(t0);   // TSC cycles across CAL_MS of PIT time
+    // tsc_hz = elapsed * PIT_HZ / count ; ticks per 10 ms = tsc_hz / 100
+    let tsc_hz = elapsed.saturating_mul(PIT_HZ) / (count as u64);
+    tsc_hz / 100
 }
 
 /// Write the TSC-Deadline MSR to fire `ticks` TSC counts from now.
@@ -694,6 +764,24 @@ unsafe fn outb(port: u16, val: u8) {
             options(nostack, nomem),
         );
     }
+}
+
+/// Read a byte from an I/O port.
+///
+/// # Safety
+/// Ring-0 only. Caller selects ports that are safe to read (PIT status, diagnostic).
+unsafe fn inb(port: u16) -> u8 {
+    let val: u8;
+    // SAFETY: `in al, dx` reads the selected port; no memory touched.
+    unsafe {
+        core::arch::asm!(
+            "in al, dx",
+            out("al") val,
+            in("dx") port,
+            options(nostack, nomem),
+        );
+    }
+    val
 }
 
 /// Remap the legacy 8259 PIC to vectors 0x20-0x2F then mask all IRQs.

@@ -98,3 +98,8 @@ same `find` command (lazy, version-invalidated, rebuilt-from-truth - §6.5). Unt
 A shell built-in (like the other file commands) sending `LIST_DIR` to `fs`; `fs` holds all
 disk authority. Conforms: `find help` (usage with a real example per row) and
 `find version` (number + creator credit) per `0_conventions.md`.
+
+Also conforms to **rule 10** (`0_conventions.md` §1.10): each `LIST_DIR` step is **q-abortable** via
+`fs_request_q` - a wait past ~2s prints `(q to quit)` and `q`/`Q`/ESC returns to the prompt (a fast
+reply prints nothing). This replaced a bare `request_with_reply`, which rule 10 forbids for an
+interactive command; the shell already walks the tree step-by-step, so `q` ends the walk (rule 11).

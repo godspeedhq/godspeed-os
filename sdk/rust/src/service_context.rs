@@ -9,6 +9,14 @@ use crate::capability::{CapError, CapHandle};
 use crate::ipc::{IpcError, Message};
 use crate::syscall::raw_syscall;
 
+/// Outcome of an abortable request/reply ([`ServiceContext::request_with_reply_abortable`]): the reply
+/// arrived, the user pressed `q`/`Q`/ESC to abort the wait, or the deadline expired with no reply.
+pub enum ReqOutcome {
+    Reply(Message),
+    Aborted,
+    Timeout,
+}
+
 /// Wall-clock date/time read from the hardware RTC, fully decoded (binary,
 /// 24-hour). See [`ServiceContext::datetime`].
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -530,12 +538,99 @@ impl ServiceContext {
             self.remove_cap(reply_cap);   // send failed: reclaim the untransferred reply cap (no leak)
             return None;
         }
-        let t0 = self.datetime().epoch_secs();
+        // Deglitched monotonic clock, not the raw RTC: a single CMOS misread (the "4383d" glitch on the
+        // T630) would otherwise make `now - t0` read huge and expire the deadline instantly.
+        let t0 = self.epoch_secs_monotonic();
         loop {
             if let Some(r) = self.try_recv() { return Some(r); }
-            if self.datetime().epoch_secs() - t0 >= max_secs {
+            if self.epoch_secs_monotonic() - t0 >= max_secs {
                 self.remove_cap(reply_cap);   // reply never consumed - reclaim its slot
                 return None;
+            }
+            self.yield_cpu();
+        }
+    }
+
+    /// Like [`Self::request_with_reply_deadline`] but ABORTABLE: while waiting it also drains the console
+    /// and, on q/Q/ESC, returns [`ReqOutcome::Aborted`] IMMEDIATELY - it does NOT wait for the in-flight
+    /// reply (that wait felt like "it pauses instead of quitting"). The request is already sent, so the
+    /// peer replies into our endpoint whether we listen or not; that late reply is cleared by the DRAIN at
+    /// the top of the *next* abortable request, so it never pollutes a later command (the `net scan` ->
+    /// `net` "0.0.0.0 / 00:00 MAC" bug that drain closes). Sends the request ONCE (no re-trigger). Use for
+    /// any interactive command that blocks on a peer (the "q to quit" rule, `utilities/0_conventions.md`).
+    /// A service with no console foreground never sees input, so this degrades to the plain deadline wait.
+    pub fn request_with_reply_abortable(
+        &self,
+        peer: &str,
+        msg:  &crate::ipc::Message,
+        max_secs: i64,
+    ) -> ReqOutcome {
+        // Drain any stale reply a prior INSTANT-abort left in our endpoint (the peer replied after we
+        // stopped listening), so this request cannot read it as its own. Safe for the shell - a client
+        // whose endpoint only holds replies; between commands it is otherwise empty.
+        while self.try_recv().is_some() {}
+        let target = match self.find_send_slot(peer) { Some(s) => CapHandle(s), None => return ReqOutcome::Timeout };
+        let self_grant = match self.self_grant_handle() { Some(g) => g, None => return ReqOutcome::Timeout };
+        let reply_cap = match self.derive_cap(self_grant) { Some(c) => c, None => return ReqOutcome::Timeout };
+        if self.send_with_cap_by_handle(target, reply_cap, msg).is_err() {
+            self.remove_cap(reply_cap);
+            return ReqOutcome::Timeout;
+        }
+        let t0 = self.epoch_secs_monotonic();
+        loop {
+            if let Some(r) = self.try_recv() { self.remove_cap(reply_cap); return ReqOutcome::Reply(r); }
+            while let Some(b) = self.try_console_read() {
+                // q/Q/ESC aborts IMMEDIATELY - never wait for the in-flight reply (that wait was the
+                // "it pauses instead of quitting" complaint). The peer's late reply lands in our endpoint
+                // and the drain atop the NEXT abortable request clears it, so it pollutes nothing.
+                if b == b'q' || b == b'Q' || b == 0x1b { self.remove_cap(reply_cap); return ReqOutcome::Aborted; }
+            }
+            if self.epoch_secs_monotonic() - t0 >= max_secs {
+                self.remove_cap(reply_cap);
+                return ReqOutcome::Timeout;
+            }
+            self.yield_cpu();
+        }
+    }
+
+    /// Like [`Self::request_with_reply_abortable`], but if no reply has arrived after
+    /// `hint_after_secs` it invokes `on_linger` ONCE (e.g. to print a "(q to quit)" hint) and keeps
+    /// waiting/aborting. A snappy reply never fires the hint, so a fast request stays silent and only
+    /// a genuinely lingering wait tells the user they can bail. Abort semantics are identical to
+    /// `request_with_reply_abortable` (q/Q/ESC -> `Aborted` immediately; the request is sent once and
+    /// a late reply is drained atop the next abortable/qhint request). The hint text lives in the
+    /// caller's closure, so this stays mechanism - the SDK provides the *timing*, the caller the UX.
+    pub fn request_with_reply_qhint(
+        &self,
+        peer: &str,
+        msg:  &crate::ipc::Message,
+        hint_after_secs: i64,
+        max_secs: i64,
+        on_linger: impl FnOnce(),
+    ) -> ReqOutcome {
+        // Drain any stale reply a prior INSTANT-abort left in our endpoint (see the abortable variant).
+        while self.try_recv().is_some() {}
+        let target = match self.find_send_slot(peer) { Some(s) => CapHandle(s), None => return ReqOutcome::Timeout };
+        let self_grant = match self.self_grant_handle() { Some(g) => g, None => return ReqOutcome::Timeout };
+        let reply_cap = match self.derive_cap(self_grant) { Some(c) => c, None => return ReqOutcome::Timeout };
+        if self.send_with_cap_by_handle(target, reply_cap, msg).is_err() {
+            self.remove_cap(reply_cap);
+            return ReqOutcome::Timeout;
+        }
+        let t0 = self.epoch_secs_monotonic();
+        let mut on_linger = Some(on_linger);   // FnOnce, fired at most once when the wait lingers
+        loop {
+            if let Some(r) = self.try_recv() { self.remove_cap(reply_cap); return ReqOutcome::Reply(r); }
+            while let Some(b) = self.try_console_read() {
+                if b == b'q' || b == b'Q' || b == 0x1b { self.remove_cap(reply_cap); return ReqOutcome::Aborted; }
+            }
+            let elapsed = self.epoch_secs_monotonic() - t0;
+            if elapsed >= hint_after_secs {
+                if let Some(f) = on_linger.take() { f(); }
+            }
+            if elapsed >= max_secs {
+                self.remove_cap(reply_cap);
+                return ReqOutcome::Timeout;
             }
             self.yield_cpu();
         }
@@ -673,6 +768,23 @@ impl ServiceContext {
         if ret < 0 { 0 } else { ret as u32 }
     }
 
+    /// The discovered NIC's PCI identity as `vendor | device<<16` (0 if no NIC), via InspectKernel
+    /// query 14. A NIC driver reads it to know which chip it is driving (e.g. Intel e1000 =
+    /// 0x100E_8086 vs Realtek RTL8168 = 0x8168_10EC). Ungated - task-neutral hardware info.
+    pub fn nic_vendor_device(&self) -> u32 {
+        // SAFETY: syscall(13) = InspectKernel; query_id=14 = NIC vendor|device.
+        let ret = unsafe { raw_syscall(13, 14, 0, 0) };
+        if ret < 0 { 0 } else { ret as u32 }
+    }
+
+    /// The NIC's register-space MMIO base (the BAR the PCI scan chose), 0 if none. InspectKernel query
+    /// 15, ungated. A diagnostic - a driver reads it to confirm which BAR it was handed.
+    pub fn nic_mmio_base(&self) -> u64 {
+        // SAFETY: syscall(13) = InspectKernel; query_id=15 = NIC MMIO base.
+        let ret = unsafe { raw_syscall(13, 15, 0, 0) };
+        if ret < 0 { 0 } else { ret as u64 }
+    }
+
     /// Return the number of free physical frames.
     ///
     /// Wraps InspectKernel query 4.
@@ -779,6 +891,16 @@ impl ServiceContext {
         if ret < 0 { 0 } else { ret as u64 }
     }
 
+    /// TSC ticks per 10 ms, from the kernel's boot-time CPUID calibration (InspectKernel query 16).
+    /// Convert a TSC delta to milliseconds with `delta_cycles * 10 / tsc_ticks_per_10ms()`. Returns 0
+    /// if the TSC was not calibrated (callers should then skip the millisecond conversion). `ping` uses
+    /// it to report round-trip time.
+    pub fn tsc_ticks_per_10ms(&self) -> u64 {
+        // SAFETY: syscall(13) = InspectKernel; query_id=16 = TSC ticks per 10 ms quantum.
+        let ret = unsafe { raw_syscall(13, 16, 0, 0) };
+        if ret < 0 { 0 } else { ret as u64 }
+    }
+
     /// Read the hardware real-time clock (wall-clock date/time) via the kernel.
     ///
     /// Ambient - the time of day is task-neutral hardware info, like the TSC.
@@ -788,6 +910,14 @@ impl ServiceContext {
         // SAFETY: syscall(13) = InspectKernel; query_id=11 = packed RTC datetime.
         let p = unsafe { raw_syscall(13, 11, 0, 0) } as u64;
         Self::unpack_datetime(p)
+    }
+
+    /// Deglitched monotonic "now" in epoch seconds (kernel query 17). Unlike `datetime().epoch_secs()`
+    /// (the raw RTC, query 11 - a CMOS misread on an in-range year slips through and reads years off), this
+    /// drops backward / huge-forward glitches. Use it for time-DELTA deadlines and pacing, NOT for display.
+    pub fn epoch_secs_monotonic(&self) -> i64 {
+        // SAFETY: syscall(13) = InspectKernel; query 17 = deglitched monotonic epoch seconds.
+        unsafe { raw_syscall(13, 17, 0, 0) }
     }
 
     /// Decode the packed RTC `u64` (the layout shared by query 11 / 12) into a `Datetime`.

@@ -40,6 +40,9 @@
 - [2026-07-04 - The day gsh was finished, and never once reached for a heap](#2026-07-04---the-day-gsh-was-finished-and-never-once-reached-for-a-heap)
 - [2026-07-04 - The day a private discipline became a public one](#2026-07-04---the-day-a-private-discipline-became-a-public-one)
 - [2026-07-04 - The day it shipped, and called itself 0.1](#2026-07-04---the-day-it-shipped-and-called-itself-01)
+- [2026-07-07 to 2026-07-08 - The day the wire became location](#2026-07-07-to-2026-07-08---the-day-the-wire-became-location)
+- [2026-07-09 - The day half a truth came back for the mount loop](#2026-07-09---the-day-half-a-truth-came-back-for-the-mount-loop)
+- [2026-07-09 - The day recovery became a fixed point](#2026-07-09---the-day-recovery-became-a-fixed-point)
 - [The Days I Was Wrong](#the-days-i-was-wrong)
   - [~2026-06-21 - The day the constitution rejected its author](#2026-06-21---the-day-the-constitution-rejected-its-author)
   - [~2026-06-27 - The day I reached for a heap](#2026-06-27---the-day-i-reached-for-a-heap)
@@ -497,6 +500,86 @@ about its size, too.)
 
 ---
 
+## 2026-07-07 to 2026-07-08 - The day the wire became location
+
+The networking stack, already carrying a real DHCP lease and a `ping` on the T630's Realtek NIC, was
+taught to survive the two things a real network interface actually does: the cable moves, and the
+services die. A running `ping` now rides an unplug and a replug - it reports the link down, and when the
+cable returns and the lease re-acquires, it simply resumes, `q`-abortable the whole time. `net-stack`
+configures itself the moment the driver sees carrier; `net renew` repairs a bad lease *inside* the
+running service, no restart; and `chaos max-carnage nic-driver,net-stack` storms both networking services
+together, round after uncapped round, while the link keeps coming back.
+
+**What I came to understand:** the cable is *location*, and the socket is *identity* - the same
+separation SMP drew between a service and its core, now drawn at the edge of the physical world. A link
+that goes down is not an error to fail on; it is a location changing, exactly what Invariant 11 was
+written to make survivable. The stack does not own the cable's state any more than a service owns its
+core; it observes carrier as a fact and reconverges when the fact changes. Plugging in a cable is not a
+command to handle - it is a truth to notice.
+
+**What it produced:** Invariant 11 (identity is stable; location is not) reaching all the way to the
+RJ45 - and the networking half of the restartability story the storage stack had been telling. A socket
+cap outlives the cable, the lease, the driver, and the stack; every one of those is location, and the
+system reconverges to the identity from any of them moving. "Not even a blip" is what
+identity-over-location feels like when you finally pull the plug and watch it come back.
+
+---
+
+## 2026-07-09 - The day half a truth came back for the mount loop
+
+A rapid *second* `kill all-services` on the T630 - the whole restartable set killed twice within seconds
+- wedged the storage stack for good. Not a crash: a permanent thrash. `fs` had read a garbage disk
+capacity from a stale reply, derived a backup-superblock LBA far past the end of the disk, and asked for
+it; the AHCI controller stuck its command-issue bit without ever setting BSY, so the port recovery that
+watched only BSY never fired; and the mount loop retried the impossible read forever. The keyboard looked
+dead because the whole machine was buried under an infinite storage retry.
+
+**What I came to understand:** this was the *same lesson* as the million-round soak that deepened
+Commandment VIII (the 2026-06-30 entry above) - and that is exactly the point. That day I taught `fs` and
+the kernel that a peer's *death* is a truth a wait must be able to see. But "wait on truth, and the truth
+must include failure" is not a fix you apply once and retire; it is a lens you re-apply at every wait you
+write. The mount loop was a *new* wait, written to spin until success, and it had quietly inherited the
+original sin: it could observe success forever and failure never. A persistently unreadable disk was a
+truth it had no way to conclude. The principle had not failed; I had simply found one more place I had
+not yet held it to.
+
+**What it produced:** the three fixes that finish Commandment VIII in the storage stack - a port COMRESET
+that escalates on a stuck command-issue bit and not only on BSY (so the controller self-heals the wedge
+instead of retrying into it); a capacity reply `fs` accepts only in its exact, bounded shape (so a stale
+reply is never misread as a truth); and a mount loop with a *failure-truth exit* - bounded real attempts,
+after which `fs` comes up degraded and loud, "storage unavailable, data intact," rather than spinning on
+a disk that will never answer. And the input path learned the same shape from the other side: the console
+now drains the UART on *read*, not only on the timer tick, so a keystroke - a truth you can observe
+directly - is never held hostage to a proxy the storm can starve. One lesson, three surfaces, re-applied
+where I had not yet applied it.
+
+---
+
+## 2026-07-09 - The day recovery became a fixed point
+
+The same double-kill storm exposed a second, quieter fault. When the supervisor came back and adopted the
+still-running services, a death notice could still arrive for a service it had *already* recovered - a
+duplicate, or one in flight when the respawn completed. Reacting to that notice the obvious way spawned a
+second instance of a service that was already alive, and the churn fed the very storm it was trying to
+survive.
+
+**What I came to understand:** recovery cannot be a reflex fired per event; it has to be *convergence to
+a target set*. The supervisor's job is not "handle each death" but "make the world match the manifest" -
+every notice reconciles the live tasks against the set that should be running and acts only on the
+difference. A service already present is a no-op it logs as *already recovered*; a service genuinely
+absent is respawned, exactly once. Framed that way, the supervisor becomes a **fixed point**: from any
+perturbation - one kill, a storm, its own death mid-storm - it settles to "every service alive, one
+instance each," and a redundant notice is *absorbed*, never *amplified*. It is Invariant 11 seen from the
+restarter's side: the supervisor restores an identity *set*, indifferent to how many messages announce
+the same gap, exactly as a client is indifferent to which core the name now lives on.
+
+**What it produced:** the supervisor's death handling made idempotent - the recovery-side complement to
+identity-over-location, and the property that lets `chaos max-carnage` kill everything, twice, in a tight
+loop without the recovery path becoming its own denial-of-service. A system that reconverges is one you
+can hit as hard as you like: it does not matter in what order, or how many times, the bad news arrives.
+
+---
+
 ## The Days I Was Wrong
 
 The entries above are mostly victories - the days understanding clicked into place. But the days
@@ -590,6 +673,12 @@ that means. These are not listed because they were bugs. They are here because t
 - **The Four-Thousand-Year Uptime** (2026-06-28) - uptime briefly reported ~4,987 days because the
   clock was derived from a momentarily-glitched source. *Taught:* a derived view is only as honest as
   its source; deglitch at the source, never paper over the symptom.
+- **The Mount That Only Knew Success** (2026-07-09) - a rapid double kill-storm fed `fs` a garbage disk
+  capacity; it chased a backup superblock past the end of the disk, the AHCI port stuck its command-issue
+  bit without ever setting BSY so recovery never fired, and the mount loop retried the impossible read
+  forever. *Taught:* a wait that can observe only success is an infinite wait on failure - the same
+  Commandment VIII lesson, re-learned at a new loop. Hold the principle at every wait, not once. (The
+  2026-06-30 teaching, come back for the mount loop.)
 
 *Add to this list as the project earns new names. A bug that taught something deserves to be
 remembered by name.*

@@ -231,16 +231,21 @@ caps shell | select resource | assert contains introspect
 assert fails caps nosuchservice
 assert fails-with FileNotFound caps nosuchservice
 
-# ===== lifecycle guardrails (negative only - safe, deterministic) =====
+# ===== lifecycle guardrails + supervisor recovery (safe, deterministic) =====
 echo ''
-echo '===== lifecycle guardrails (negative only - safe, deterministic) ====='
-# The shell COMMAND guards spawn/kill of the supervisor (the recovery authority) - a command-layer
-# hygiene check, not "can't recover" (the supervisor is kernel-restartable, Phase 6). `kill shell` is
-# NOT tested here: the shell is restartable now, so it succeeds (self-restart) and would kill this run.
+echo '===== lifecycle guardrails + supervisor recovery (safe, deterministic) ====='
+# The shell COMMAND refuses spawn/restart of the supervisor (the recovery authority) - a command-layer
+# hygiene check (no duplicate or self-restart of the restart authority), NOT "can't recover". `kill
+# supervisor` is NOT refused: the supervisor is kernel-restartable (Phase 6), so a kill SUCCEEDS and it
+# revives - asserted positively just below. `kill shell` is NOT tested: the shell is restartable now, so
+# it would kill this run.
 assert fails spawn supervisor
 assert fails-with Denied spawn supervisor
-assert fails kill supervisor
-assert fails-with Denied kill supervisor
+# POSITIVE (Test 15 / Commandment V): kill the supervisor and assert it comes back to LIFE. `chaos
+# kill-storm supervisor 1` captures its generation, kills it, waits on the generation BUMP (the truth,
+# bounded - never a fixed sleep), and returns Ok only if a HIGHER generation appears; it prints
+# "killed gen N -> recovered gen M". A no-show returns Err, so `assert ok` fails LOUDLY.
+assert ok chaos kill-storm supervisor 1
 assert fails spawn nosuchservice
 assert fails-with Unknown spawn nosuchservice
 assert fails kill nosuchservice

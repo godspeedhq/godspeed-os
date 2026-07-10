@@ -79,6 +79,21 @@ impl Dma {
         unsafe { core::ptr::write_volatile(self.base.add(off) as *mut u32, val) }
     }
 
+    /// Write an 8-bit value at byte offset `off` (`off < len`). For byte-granular
+    /// device structures (e.g. an e1000 TX descriptor's command byte, or frame bytes).
+    #[inline]
+    pub fn write8(&self, off: usize, val: u8) {
+        // SAFETY: as read8; volatile so the device observes ordered writes.
+        unsafe { core::ptr::write_volatile(self.base.add(off), val) }
+    }
+
+    /// Write a 16-bit value at byte offset `off` (2-byte aligned, `off < len`).
+    #[inline]
+    pub fn write16(&self, off: usize, val: u16) {
+        // SAFETY: as read16; volatile 16-bit write in range.
+        unsafe { core::ptr::write_volatile(self.base.add(off) as *mut u16, val) }
+    }
+
     /// Read a 64-bit value at byte offset `off` (8-byte aligned, `off < len`).
     #[inline]
     pub fn read64(&self, off: usize) -> u64 {

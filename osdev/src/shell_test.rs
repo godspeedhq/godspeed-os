@@ -41,6 +41,9 @@ pub fn run(image_path: &Path, smp: u32) {
         // Confirms the detection works in QEMU + that the NIC doesn't disturb boot (the rest of the suite).
         "-device",  "e1000,netdev=n0",
         "-netdev",  "user,id=n0",
+        // Phase 1 step 3: dump every frame on the NIC backend to a pcap, so we can confirm
+        // nic-driver's TX frame actually left the card, not just that the NIC set DD.
+        "-object",  "filter-dump,id=nicdump,netdev=n0,file=build/net-tx.pcap",
         "-display", "none",
         "-no-reboot",
         "-no-shutdown",
@@ -105,10 +108,10 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(boot_out) => {
             check!(boot_out.contains("shell: ready"), "boot: shell ready message");
             // Naming migration (docs/naming-design.md): the supervisor builds a name→cap map as it
-            // spawns the real services, then wires dependents from it. Bare-metal maps 5 services
-            // (block-driver, fs, shell, xhci, ehci); names resolve via the kernel directory, with no
-            // separate name service spawned.
-            check!(boot_out.contains("name-cap map holds 5 service(s)"),
+            // spawns the real services, then wires dependents from it. Bare-metal maps 6 services
+            // (block-driver, fs, shell, xhci, ehci, nic-driver); names resolve via the kernel
+            // directory, with no separate name service spawned.
+            check!(boot_out.contains("name-cap map holds 7 service(s)"),
                    "naming: supervisor holds an endpoint cap for every real service");
             check!(!boot_out.contains("spawning registry") && !boot_out.contains("name-map + registry"),
                    "naming: no separate name service is spawned (the kernel directory resolves names)");
@@ -123,6 +126,19 @@ pub fn run(image_path: &Path, smp: u32) {
             // print names whatever chipset it has.
             check!(boot_out.contains("pci: NIC") && boot_out.contains("vendor=0x8086"),
                    "phase0: e1000 NIC detected + printed at boot (vendor=0x8086)");
+            // Networking Phase 1 step 2 (docs/networking.md): nic-driver receives the e1000's BAR by
+            // name, RESETS the controller, and reads the MAC it reloaded from EEPROM. QEMU's default
+            // e1000 MAC is 52:54:00:12:34:56. This proves PCI -> MMIO cap -> register R/W -> reset,
+            // end to end - the foundation the whole stack (ARP/IP/ICMP/UDP/TCP) builds on.
+            check!(boot_out.contains("nic-driver: e1000 up") && boot_out.contains("MAC 52:54:00"),
+                   "phase1 step2: nic-driver brought the e1000 up (reset + read the MAC)");
+            // Networking Phase 1 step 5 (docs/networking.md): nic-driver reached its serve loop - it
+            // offers the FRAME INTERFACE (a request/reply where a request payload is a frame to
+            // transmit and the reply is the frame that came back). ARP/IP now live in net-stack, not
+            // here; nic-driver is pure mechanism (Commandment X). The full TX+RX round-trip is proven
+            // end to end by net-stack's ARP resolution below.
+            check!(boot_out.contains("nic-driver: serving the frame interface"),
+                   "phase1 step5: nic-driver serves the frame interface (mechanism, not protocol)");
         }
         None => {
             // Print what we did receive to help diagnose failures.
@@ -137,6 +153,111 @@ pub fn run(image_path: &Path, smp: u32) {
             std::process::exit(1);
         }
     }
+
+    // These land just past the shell prompt (the protocol dance completes as boot finishes), so they
+    // are checked here, in the order net-stack now runs them: DHCP first (self-config), then ARP, then
+    // ICMP. collect_until advances the cursor, so the check order MUST match the log order.
+
+    // Networking Phase 3 (docs/networking.md): net-stack now SELF-CONFIGURES - it does DHCP FIRST, so
+    // the IP it learns is the one ARP + ICMP then use. A DHCP DISCOVER goes out over the frame
+    // interface and slirp's OFFER comes back; a pass proves the UDP round-trip both ways, in net-stack.
+    let dhcp_ok = collect_until(&buf, &mut cursor, b"net-stack: DHCP - offered", Duration::from_secs(12)).is_some();
+    check!(dhcp_ok, "phase3 udp: net-stack got a DHCP offer (UDP; self-configures its IP)");
+
+    // Networking Phase 2 (docs/networking.md): net-stack resolves the gateway (10.0.2.2) by ARP - the
+    // proof of the frame interface END TO END. It builds the request, sends it THROUGH nic-driver
+    // (request/reply), the gateway answers, nic-driver hands the reply frame back, and net-stack parses
+    // the gateway's MAC. A pass means net-stack -> nic-driver -> TX -> reply -> RX -> net-stack, all
+    // over the capability-mediated frame interface (ARP is policy in net-stack; the driver is mechanism).
+    let arp_ok = collect_until(&buf, &mut cursor, b"net-stack: ARP - 10.0.2.2 is at", Duration::from_secs(12)).is_some();
+    check!(arp_ok, "phase2 arp: net-stack resolved the gateway by ARP over the frame interface");
+
+    // Networking Phase 2 step 2 (docs/networking.md): net-stack PINGS the gateway - the networking
+    // analogue of v1's ping/pong. It builds an ICMP echo request (ICMP inside IPv4 inside Ethernet) to
+    // the MAC ARP resolved, sends it THROUGH nic-driver, and reads back the echo REPLY. A pass proves
+    // three protocol layers on the wire, both ways, all in net-stack over the frame interface.
+    let icmp_ok = collect_until(&buf, &mut cursor, b"net-stack: ICMP - 10.0.2.2 echo reply", Duration::from_secs(12)).is_some();
+    check!(icmp_ok, "phase2 icmp: net-stack pinged the gateway (ICMP echo reply received)");
+
+    // The `net` utility (utilities/40_net.md): the shell queries net-stack BY NAME (it holds
+    // ACQUIRE_ANY) and prints its status - the user-facing window onto the whole stack, and a pipe
+    // producer. It runs after the boot dance, so net-stack is serving its frozen 15-byte record by now.
+    send(&mut write_half, b"net\r");
+    let net_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    check!(net_out.contains("ip       10.0.2.15"), "net: reports the DHCP-learned IP (10.0.2.15)");
+    check!(net_out.contains("gateway  10.0.2.2 at 52:55:"), "net: reports the ARP-resolved gateway + MAC");
+    check!(net_out.contains("ping     ok"), "net: reports the gateway ping OK");
+
+    // net is a pipe PRODUCER (utilities/40_net.md §4): its three lines flow onward. `net | count`
+    // proves it (count is an in-process filter, no disk needed).
+    send(&mut write_half, b"net | count\r");
+    let netcount = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    check!(netcount.contains("6 lines"), "net: is a pipe producer (net | count = 6 lines)");
+
+    // net version (utilities/0_conventions.md rule 5).
+    send(&mut write_half, b"net version\r");
+    let netver = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    check!(netver.contains("net 0.1.0"), "net: version reports net 0.1.0");
+
+    // net dns <host> (utilities/40_net.md): resolve a hostname via slirp's DNS. This is external-
+    // dependent - slirp forwards to the HOST's resolver - so the check is LENIENT: it verifies the
+    // command ran end to end and produced a well-formed line, EITHER a resolved IP ("example.com is
+    // a.b.c.d") OR a clean "no answer", never a hang or crash. A real resolution is a bonus, not required.
+    send(&mut write_half, b"net dns example.com\r");
+    let dns_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)).unwrap_or_default();
+    check!(dns_out.contains("example.com is ") || dns_out.contains("example.com: no answer"),
+           "net dns: resolves a hostname or reports no-answer cleanly (DNS via slirp)");
+
+    // ping is a full utility (mirrors net): version/help self-documentation.
+    send(&mut write_half, b"ping version\r");
+    let pingver = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    check!(pingver.contains("ping 0.1.0"), "ping: version reports ping 0.1.0");
+
+    // ping [count N] <ip>: continuous Windows-style ICMP echo, no DNS. `count` bounds it (bare `ping`
+    // runs until `q`). Runs through net-stack's serve loop (unlike the boot dance), so it doubles as a
+    // check that the post-boot request path works. 10.0.2.2 is slirp's gateway (it answered ICMP during
+    // the dance). Lenient on Reply-vs-timeout, but must print the header + the statistics summary.
+    send(&mut write_half, b"ping count 3 10.0.2.2\r");
+    let ping_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)).unwrap_or_default();
+    check!(ping_out.contains("Pinging 10.0.2.2 with 32 bytes of data")
+           && ping_out.contains("Ping statistics for 10.0.2.2")
+           && (ping_out.contains("Reply from 10.0.2.2") || ping_out.contains("Request timed out")),
+           "ping: continuous ICMP echo (count-limited) prints Windows-style output + stats (ping <gateway>)");
+
+    // net stats: raw NIC register dump (chip state). On QEMU the e1000 path answers with CTRL/STATUS/etc.
+    send(&mut write_half, b"net stats\r");
+    let statsout = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)).unwrap_or_default();
+    check!(statsout.contains("NIC registers"), "net stats: dumps raw NIC registers (chip state)");
+
+    // net arp <ip>: resolve one host's MAC by ARP (op 6). slirp answers for its gateway (10.0.2.2). This
+    // form HUNG in the serve loop on the pre-robustness base; verify it now returns cleanly.
+    send(&mut write_half, b"net arp 10.0.2.2\r");
+    let arp_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)).unwrap_or_default();
+    check!(arp_out.contains("10.0.2.2 is at") || arp_out.contains("10.0.2.2: no ARP reply"),
+           "net arp: resolves a host MAC by ARP (op 6 no longer hangs)");
+
+    // net renew (op 8): re-run the DHCP/ARP/ICMP dance IN PLACE - the recovery path for a link that came
+    // up after boot (Commandment IX: recovery must be testable). On QEMU slirp the link is up, so a renew
+    // reconfigures and reports "network up"; the point is that the dance is re-runnable (not boot-once) and
+    // returns without hanging. The link-down -> up transition itself is HW-verified on the T630.
+    send(&mut write_half, b"net renew\r");
+    let renew_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)).unwrap_or_default();
+    check!(renew_out.contains("network up") || renew_out.contains("still no gateway"),
+           "net renew: re-runs the dance in place and reports (recover a link, no reboot - op 8)");
+
+    // net scan (op 7) is deliberately NOT tested here: it broadcasts an ARP to all 254 /24 hosts, and on
+    // QEMU's quiet slirp (only the gateway answers, no broadcast chatter) each non-responding host burns
+    // nic-driver's full RX_POLL_MAX wait, so the sweep runs ~100s - unfair to gate on. It is fast on a
+    // real LAN (broadcasts land in the poll) and is HW-verified on the T630.
+
+    // sock (utilities/41_sock.md): a UDP socket as a CAPABILITY. The shell opens a socket cap from
+    // net-stack and sends a datagram THROUGH it - proving a socket is a real kernel cap (§7.10) the
+    // client holds and invokes, not an ambient channel. Lenient on the UDP response (external), but
+    // the open + invoke (the cap mechanism itself) must succeed - "would not open" would be a failure.
+    send(&mut write_half, b"sock\r");
+    let sock_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)).unwrap_or_default();
+    check!(sock_out.contains("sock: UDP socket cap - sent") || sock_out.contains("socket cap invocation returned nothing"),
+           "sock: opened + invoked a UDP socket capability (socket = capability, §7.10)");
 
     // -----------------------------------------------------------------------
     // help
@@ -171,6 +292,13 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(r) => check!(r.contains("observe now"), "tab: 'observe n' completes to 'observe now'"),
         None    => { println!("shell-test: FAIL - tab keyword completion timed out"); fail += 1; }
     }
+    // net subcommand completion: 'net a' -> 'net arp' (single match). Pins that the new net tools
+    // (arp/scan) autocomplete alongside dns/stats.
+    send(&mut write_half, b"net a\t\x03");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("net arp"), "tab: 'net a' completes to 'net arp'"),
+        None    => { println!("shell-test: FAIL - tab net-arp completion timed out"); fail += 1; }
+    }
     // The menu reprints the prompt ("gsh> write "), so collect that frame first…
     send(&mut write_half, b"write \t");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
@@ -189,10 +317,12 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(r) => check!(r.contains("sort reverse"), "tab: pipe-stage 'sort r' completes to 'sort reverse'"),
         None    => { println!("shell-test: FAIL - tab pipe-stage keyword timed out"); fail += 1; }
     }
-    // command-name completion AFTER a pipe (the segment's first word). `status | so` → `status | sort`.
-    send(&mut write_half, b"status | so\t\x03");
+    // command-name completion AFTER a pipe (the segment's first word). `status | sor` → `status | sort`.
+    // ("so" is now ambiguous - `sock` (the socket utility) and `sort` both start with it - so this uses
+    // the unique prefix "sor" instead.)
+    send(&mut write_half, b"status | sor\t\x03");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("status | sort"), "tab: command name completes after a pipe (so -> sort)"),
+        Some(r) => check!(r.contains("status | sort"), "tab: command name completes after a pipe (sor -> sort)"),
         None    => { println!("shell-test: FAIL - tab pipe command completion timed out"); fail += 1; }
     }
     // trailing modifier keyword (after the path arg). `mkdir /x p` → `mkdir /x parents`.

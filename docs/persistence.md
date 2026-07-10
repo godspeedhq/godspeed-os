@@ -875,6 +875,52 @@ mask (CRC re-stamped so they still validate) - the unknown `incompat` disk is re
 `ro_compat` disk mounts read-only (reads work, writes refused), the unknown `compat` disk mounts
 normally read-write. No regression across the whole suite.
 
+### 6.16 Commandment VIII, completed in the fs - the mount loop's failure-truth exit + AHCI self-heal
+
+> **Built 2026-07-09.** Robustness surfaced by a real T630 run: a rapid *second* `kill all-services`
+> (the whole restartable set killed twice within ~6 s) wedged the storage stack for good - not a crash,
+> a permanent thrash. Three defects compounded, and fixing them completes Commandment VIII (*wait for
+> truth, not time; and the truth must include failure*) in the fs. No on-disk format change, no amendment.
+
+**The wedge.** After the second respawn, `fs`'s read of the superblock (LBA 0) returned an I/O error and
+`fs` proceeded with a **garbage capacity**: it accepted a stale block-driver reply as the disk's sector
+count (a nonsense value near 2^62), computed a **backup-superblock LBA far past the end of the disk**, and
+asked `block-driver` to read it. The AHCI controller could not read a nonsense LBA - its command-issue bit
+(`PxCI`) stuck **without** setting `BSY`, so `recover_port`'s BSY-only recovery never escalated - and the
+mount loop retried the impossible read *forever*. The keyboard looked dead because the whole system was
+buried under an infinite storage thrash. (The trigger only reached because the shell's *startup* history
+read - since made lazy, see `docs/console-service.md` - fired into the re-init; but a masked race is still
+a race, so the storage stack itself is hardened here.)
+
+**The three fixes:**
+
+1. **AHCI self-heals a CI-stuck controller.** `recover_port` now escalates its COMRESET on
+   `PxTFD.BSY != 0 || PxCI != 0`, not on `BSY` alone. A stuck `PxCI` is hardware-owned - a soft recovery
+   (clearing `PxSERR`/`PxIS`) cannot clear it; **only a port COMRESET** does. So a command that wedges the
+   controller *without* setting BSY (exactly the garbage-LBA case) now self-heals instead of retrying into
+   the identical stuck state. This extends the §6.11 Phase-H recovery (`issue_io`'s bounded retry) to the
+   one failure mode it did not cover.
+2. **`fs` rejects a mis-shaped capacity reply.** `block_capacity` now accepts the block-driver's answer
+   **only if it is exactly `[BLK_OK, sectors:u64]`** (a bounded, precise shape) with a sane count. A stale
+   or malformed reply - one whose leading byte merely happens to be `BLK_OK` - is rejected (returns
+   "unknown"), never misread as a capacity; `read_superblock` then bounds-checks the capacity before
+   deriving the backup-superblock LBA from it. The *false success* that fed the garbage read is gone: `fs`
+   waits on the **right** reply, not merely on *a* reply. (This scopes out the specific wedge; full
+   request-id correlation of the fs↔block-driver channel is a later fs-IPC follow-on, deferred by §26.2.)
+3. **The mount loop has a failure-truth exit.** Both mount waits - the capacity fetch and the read/`E_IO`
+   retry - were unbounded success-only loops: they waited for the truth of *success* forever and never
+   treated a **persistent** read failure as terminal. They now cap at `MOUNT_MAX_ATTEMPTS` real
+   block-driver round-trips, after which `fs` comes up **degraded** - it logs loudly and serves
+   *storage-unavailable* to clients (**"data intact; do NOT run 'drives flash'"**) instead of spinning
+   forever on an unreadable disk. A persistent read failure is now a first-class terminal truth.
+
+This is the executable form of Commandment VIII's second half - *"a wait that cannot observe failure has
+quietly become an infinite wait on time."* The mount loop already *waited on truth, not time* (it never
+timed out; see the loop's own note) - but only on the truth of *success*. Teaching it that failure is also
+a truth is what closes the wedge. Verified: `osdev test identity` 24/0 (Test 13 fs-restart and the whole
+file suite stay green); the live CI-stuck self-heal is T630-only (QEMU's emulated AHCI never raises the
+CI-stuck condition).
+
 ## 7. File = capability (the north star)
 
 The spine that makes this filesystem *ours* rather than a generic store: a file is named

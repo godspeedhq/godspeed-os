@@ -118,6 +118,22 @@ cargo run -p osdev -- test property
 
 The build is pure Cargo plus the `osdev` CLI - identical on every platform. The full `osdev` CLI reference is in `CLAUDE.md §17` and `osdev/CLAUDE.md`.
 
+### Flashing to real hardware
+
+`osdev image` builds a UEFI-bootable `build/os.img` for a USB stick. Two things make a boot on real hardware reliable:
+
+1. **Build clean, and copy the image *before* you boot it.** `osdev run` and `osdev test` rebuild `build/os.img` incrementally as a side effect, and an incrementally-built kernel can boot under QEMU yet be **rejected by real UEFI firmware** (it boots in emulation but the machine won't pick up the USB). So build the image clean and grab it immediately, before anything reboots it:
+
+   ```bash
+   cargo clean --target x86_64-unknown-none   # discard any incremental artifacts
+   cargo run -p osdev -- image                 # writes a clean build/os.img
+   cp build/os.img build/my-hw.img             # copy NOW, before any `osdev run` / `osdev test`
+   ```
+
+   **Booting in QEMU is not proof the on-hardware image is good - a clean build is.** If a copy is taken *after* an `osdev run`/`osdev test` (both rebuild `os.img`), you may hand hardware an incremental image that only works under QEMU.
+
+2. **Flash the copy** with Rufus (DD Image mode) or `dd if=build/my-hw.img of=/dev/sdX bs=4M`, let the write fully finish, and boot the stick in **UEFI** mode. Serial console is 115200 8N1; a healthy boot prints `kernel: N cores ready` then `supervisor: ready`.
+
 ---
 
 ## Repository layout

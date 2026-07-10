@@ -161,6 +161,8 @@ const FS_OK: u8 = 0;
 const FS_ERR: u8 = 1;
 const FS_NOTFOUND: u8 = 2;
 const FS_NOFS: u8 = 3;
+const FS_UNAVAIL: u8 = 4;   // present-but-unreadable storage: do NOT flash (data may be intact),
+                            // distinct from FS_NOFS (a blank/raw disk that SHOULD be flashed to format)
 const FS_DENIED: u8 = 4;     // op requires a right the file cap lacks (non-escalation, §7.3)
 
 // File-cap operations - the FIRST payload byte of a badged `ResourceInvoke` (§7.10). The kernel
@@ -258,6 +260,15 @@ struct Loc {
 /// `drives flash` would destroy it (§3.12, data-loss footgun). Matched by value in the retry loop.
 const E_IO: &str = "storage unreadable (I/O error)";
 
+/// Bounded mount/capacity retry (Bug 2 / Commandment VIII's SECOND half - "the truth must include
+/// failure"). block-driver's truth is what we wait on, but a wait that can never observe failure is
+/// an infinite wait on time in disguise - which is exactly how a wedged disk hung fs forever. So the
+/// no-answer retries are CAPPED. A running block-driver self-heals a wedged port (its recover_port
+/// COMRESET) well within this, so it only ever fires as a safety floor against a genuinely dead
+/// device - after which fs comes up DEGRADED (serving storage-unavailable), never wedged. Bounded
+/// (§26.6); each attempt is a real block-driver IPC round-trip, so this is a meaningful interval.
+const MOUNT_MAX_ATTEMPTS: u32 = 1000;
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("fs: starting");
@@ -268,14 +279,26 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // is its authoritative reply: a real sector count, or a true 0 = genuinely no disk. block-driver
     // serves requests only AFTER its own init (the AHCI COMRESET + IDENTIFY), so a `Some` reflects a
     // settled controller, never a phantom 0. Reacquire and retry until it answers - no timeout.
-    let mut capacity = loop {
-        match block_capacity(&ctx) {
-            Some(cap) => break cap,
-            None => {
-                let _ = ctx.reacquire_by_name("block-driver");
-                ctx.yield_cpu();
+    // BOUNDED wait on block-driver's truth (Commandment VIII, and its second half). None means it is
+    // still coming up OR our cached cap went stale (a chaos storm can restart it alongside us) OR the
+    // reply mis-validated; we reacquire and retry. But we cap the retries: a persistent no-answer is
+    // a failure-truth, not an infinite wait. After the bound, come up DEGRADED (capacity 0 -> the
+    // mount below fails cleanly and we serve storage-unavailable) instead of spinning forever.
+    let mut capacity = {
+        let mut got = 0u64;
+        for attempt in 1..=MOUNT_MAX_ATTEMPTS {
+            match block_capacity(&ctx) {
+                Some(cap) => { got = cap; break; }
+                None => {
+                    let _ = ctx.reacquire_by_name("block-driver");
+                    if attempt == MOUNT_MAX_ATTEMPTS {
+                        ctx.log("fs: block-driver did not report capacity after bounded attempts - coming up storage-unavailable (data intact; do NOT run 'drives flash')");
+                    }
+                    ctx.yield_cpu();
+                }
             }
         }
+        got
     };
     ctx.log_fmt(format_args!("fs: disk capacity = {} sectors ({} MiB)", capacity, capacity / 2048));
 
@@ -289,35 +312,57 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // retries, so the failure is authoritative - we serve raw, honestly, and NEVER invite a reformat
     // (§3.12, the data is intact). A genuine bad-magic / blank superblock is a legitimately raw
     // (never-formatted) disk and serves raw at once - no spin.
-    let mut fs: Option<Fs> = loop {
-        match Fs::mount(&ctx) {
-            Ok(f) => {
-                ctx.log_fmt(format_args!(
-                    "fs: mounted GSFS0008 ({} blocks, bitmap {}..{}, root@{}, {} free)",
-                    f.total_blocks, f.bitmap_start, f.data_start, f.root_first_block, f.free_blocks
-                ));
-                break Some(f);
-            }
-            Err(e) if e == E_IO => {
-                let _ = ctx.reacquire_by_name("block-driver");
-                match block_capacity(&ctx) {
-                    // block-driver is not answering: it is restarting. Wait on its truth, retry.
-                    None => ctx.yield_cpu(),
-                    // block-driver answered yet the read still failed (after its COMRESET + retries):
-                    // authoritative. Serve raw, honestly - never invite a data-destroying flash.
-                    Some(cap) => {
-                        capacity = cap;
-                        ctx.log("fs: storage unreadable (I/O error) - not serving a filesystem; do NOT run 'drives flash' (data is intact, awaiting storage recovery)");
-                        break None;
+    // Distinguish the two degraded states so the shell can advise correctly: a present-but-unreadable
+    // disk (I/O error - data may be intact, do NOT flash) vs a blank/raw disk (flash to format). Set on
+    // the I/O-failure break paths below; left false for a genuinely blank disk (the FS_NOFS case).
+    let mut storage_unreadable = false;
+    let mut fs: Option<Fs> = {
+        let mut mounted: Option<Fs> = None;
+        let mut io_attempts = 0u32;
+        loop {
+            match Fs::mount(&ctx) {
+                Ok(f) => {
+                    ctx.log_fmt(format_args!(
+                        "fs: mounted GSFS0008 ({} blocks, bitmap {}..{}, root@{}, {} free)",
+                        f.total_blocks, f.bitmap_start, f.data_start, f.root_first_block, f.free_blocks
+                    ));
+                    mounted = Some(f);
+                    break;
+                }
+                Err(e) if e == E_IO => {
+                    let _ = ctx.reacquire_by_name("block-driver");
+                    match block_capacity(&ctx) {
+                        // block-driver is not answering: it is restarting. Wait on its truth, retry -
+                        // but BOUNDED (Commandment VIII's second half): a persistent I/O failure is a
+                        // terminal truth, not an infinite wait. After the bound, come up degraded
+                        // (serve storage-unavailable) rather than spinning forever on an unreadable disk.
+                        None => {
+                            io_attempts += 1;
+                            if io_attempts >= MOUNT_MAX_ATTEMPTS {
+                                storage_unreadable = true;
+                                ctx.log("fs: storage unreadable after bounded mount attempts - serving storage-unavailable (data intact; do NOT run 'drives flash', awaiting block-driver recovery)");
+                                break;
+                            }
+                            ctx.yield_cpu();
+                        }
+                        // block-driver answered yet the read still failed (after its COMRESET + retries):
+                        // authoritative. Serve raw, honestly - never invite a data-destroying flash.
+                        Some(cap) => {
+                            capacity = cap;
+                            storage_unreadable = true;
+                            ctx.log("fs: storage unreadable (I/O error) - not serving a filesystem; do NOT run 'drives flash' (data is intact, awaiting storage recovery)");
+                            break;
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                // A genuinely raw/blank or corrupt disk - the normal state of a never-flashed drive.
-                ctx.log_fmt(format_args!("fs: no filesystem ({}) - awaiting drives flash", e));
-                break None;
+                Err(e) => {
+                    // A genuinely raw/blank or corrupt disk - the normal state of a never-flashed drive.
+                    ctx.log_fmt(format_args!("fs: no filesystem ({}) - awaiting drives flash", e));
+                    break;
+                }
             }
         }
+        mounted
     };
 
     // TEST builds only (`--features selftest`): exercises the tree + reboot survival by
@@ -361,8 +406,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             None => continue,
         };
         match badge {
-            Some((rid, right)) => serve_filecap(&ctx, &mut fs, rid, right, msg.payload_bytes(), reply),
-            None => serve(&ctx, &mut fs, capacity, msg.payload_bytes(), reply),
+            Some((rid, right)) => serve_filecap(&ctx, &mut fs, rid, right, storage_unreadable, msg.payload_bytes(), reply),
+            None => serve(&ctx, &mut fs, capacity, storage_unreadable, msg.payload_bytes(), reply),
         }
         ctx.remove_cap(reply);
     }
@@ -641,8 +686,11 @@ fn data_journal_test(ctx: &ServiceContext, fs: &mut Fs) {
 }
 
 /// Dispatch one request and reply through the client's `reply` cap.
-fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], reply: CapHandle) {
+fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: bool, p: &[u8], reply: CapHandle) {
     let send = |bytes: &[u8]| { let _ = ctx.send_by_handle(reply, &Message::from_bytes(bytes)); };
+    // When degraded (no mounted volume), which "no filesystem" code to return: FS_UNAVAIL if the disk
+    // is present but unreadable (do NOT flash - data may be intact), else FS_NOFS (blank - flash to format).
+    let nofs: u8 = if unreadable { FS_UNAVAIL } else { FS_NOFS };
     if p.is_empty() {
         send(&[FS_ERR]);
         return;
@@ -693,7 +741,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
                     let r = f.relabel(ctx, label);
                     send(&[match f.end_txn(ctx, r) { Ok(()) => FS_OK, Err(_) => FS_ERR }]);
                 }
-                None => send(&[FS_NOFS]),
+                None => send(&[nofs]),
             }
             return;
         }
@@ -728,7 +776,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
                     }
                     Err(_) => send(&[FS_ERR]),
                 },
-                None => send(&[FS_NOFS]),
+                None => send(&[nofs]),
             }
             return;
         }
@@ -749,7 +797,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
                     }
                     Err(_) => send(&[FS_ERR]),
                 },
-                None => send(&[FS_NOFS]),
+                None => send(&[nofs]),
             }
             return;
         }
@@ -760,7 +808,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
     if p.len() < 2 { send(&[FS_ERR]); return; }
     let fs = match vol {
         Some(f) => f,
-        None => { send(&[FS_NOFS]); return; }
+        None => { send(&[nofs]); return; }
     };
     let op = p[0];
     // Read-only mount (unknown ro_compat feature, §6.15): refuse every mutating op LOUDLY rather
@@ -879,9 +927,10 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, p: &[u8], re
 /// after the cap check), so reaching here means the caller holds a real, live cap. We resolve the
 /// resource id → the open file's path, enforce that the operation needs **≤ the validated right**
 /// (the load-bearing non-escalation check, §7.3 - a READ cap can never write), and act.
-fn serve_filecap(ctx: &ServiceContext, vol: &mut Option<Fs>, rid: u64, right: u8, p: &[u8], reply: CapHandle) {
+fn serve_filecap(ctx: &ServiceContext, vol: &mut Option<Fs>, rid: u64, right: u8, unreadable: bool, p: &[u8], reply: CapHandle) {
     let send = |bytes: &[u8]| { let _ = ctx.send_by_handle(reply, &Message::from_bytes(bytes)); };
-    let fs = match vol { Some(f) => f, None => { send(&[FS_NOFS]); return; } };
+    let nofs: u8 = if unreadable { FS_UNAVAIL } else { FS_NOFS };
+    let fs = match vol { Some(f) => f, None => { send(&[nofs]); return; } };
     if p.is_empty() { send(&[FS_ERR]); return; }
     let fop = p[0];
 
@@ -959,9 +1008,12 @@ impl Fs {
         if let Some(ref b) = primary {
             if Self::sb_valid(b) { return Ok(*b); }
         }
-        // Primary missing/corrupt - try the backup at capacity-1.
+        // Primary missing/corrupt - try the backup at capacity-1. `block_capacity` already rejects a
+        // mis-read/absurd value (returns None -> 0 here), so `cap` is a sane sector count or 0; the
+        // `2..=MAX_SANE_SECTORS` guard is belt-and-suspenders - a bad capacity must never compute a
+        // garbage backup LBA that wedges the controller (Bug 2).
         let cap = block_capacity(ctx).unwrap_or(0);
-        if cap >= 2 {
+        if cap >= 2 && cap <= MAX_SANE_SECTORS {
             if let Some(bk) = block_read(ctx, cap - 1) {
                 if Self::sb_valid(&bk) {
                     ctx.log("fs: primary superblock bad - recovered from backup superblock");
@@ -2337,11 +2389,27 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
     None
 }
 
+/// Largest sector count any real disk can report: the ATA LBA48 ceiling (2^48 sectors, ~128 PiB).
+/// A reported capacity above this is not a disk - it is a mis-correlated/garbage reply. The Bug-2
+/// wedge read the GSFS magic bytes "GSFS0008" as a ~4-exabyte sector count; bounding it here means a
+/// mis-read can never survive to compute a garbage backup-superblock LBA.
+const MAX_SANE_SECTORS: u64 = 1 << 48;
+
 /// Ask `block-driver` for the disk's sector count (OP_CAPACITY → [BLK_OK, sectors:u64]).
+///
+/// VALIDATES the reply, not just its first byte (Bug 2 / Commandment VIII - wait on the RIGHT truth):
+/// a capacity reply is EXACTLY `[BLK_OK, sectors:u64]` = 9 bytes. A reply of any other length is a
+/// mis-correlation - e.g. a 513-byte OP_READ_BLOCK reply carrying a superblock, whose leading bytes
+/// would otherwise be read as a bogus sector count (the Bug-2 false success) - and MUST be rejected
+/// (returns None -> the caller retries), never accepted. The value is sanity-bounded for the same
+/// reason: an absurd count is a mis-read, not a disk.
 fn block_capacity(ctx: &ServiceContext) -> Option<u64> {
     let reply = block_rpc(ctx, &[OP_CAPACITY])?;
     let p = reply.payload_bytes();
-    if p.first() == Some(&BLK_OK) && p.len() >= 9 { Some(u64_at(p, 1)) } else { None }
+    if p.first() != Some(&BLK_OK) || p.len() != 9 { return None; }
+    let sectors = u64_at(p, 1);
+    if sectors > MAX_SANE_SECTORS { return None; }
+    Some(sectors)
 }
 
 /// Read one 512-byte block at `lba` from `block-driver` over IPC (u64 LBA, §6.3).

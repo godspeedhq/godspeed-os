@@ -39,6 +39,50 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
    Concretely: the clock's epoch subcommand is `date epoch` ("seconds since 1970"),
    not `date unix`; there is no `time` clock (in Unix `time` measures command
    duration). Pick words that say what the thing *is* in this system.
+9. **Every utility and subcommand tab-completes.** The name completes from the command
+   list; each subcommand keyword completes at its position (`net a` -> `net arp`, `net ver`
+   -> `net version`, `ping c` -> `count`). Rule 4 makes words the vocabulary; completion is
+   what makes typing words as cheap as flags. A subcommand that does not complete is one the
+   user cannot discover without reading the source. Wire it in the shell's completion tables
+   (`SUBCMD_FIRST` / the per-command case) the same commit that adds the subcommand.
+10. **Anything that blocks or waits is escapable with `q`.** If a utility can sit waiting - on
+    a peer service, on the network, on a long sweep - then `q`/`Q`/ESC MUST abort it and return
+    to the prompt, and a wait of more than a moment advertises `(press q to abort)`. A command
+    that can wedge the shell with no way out is forbidden (§26.7: loud + escapable over silent +
+    stuck). The primitive is `ServiceContext::request_with_reply_abortable` (send once, poll `q`
+    while waiting); never block an interactive command on a bare `request_with_reply` to a peer
+    that can be slow. The **fs-backed** interactive commands (`ls`/`cd`/`read`/`find`/`tree` and the
+    file-reading filters `match`/`count`/`sort`) use the delayed-hint variant `fs_request_q` (SDK
+    `request_with_reply_qhint`): silent on a fast reply, it advertises `(q to quit)` only once the wait
+    lingers past ~2s - the just-in-time form of the advertisement above, so a snappy op stays quiet.
+11. **Quitting stops the TASK, not just the shell.** When a utility is escaped (rule 10), the
+    escape must abort the actual WORK the utility set in motion - not merely stop the shell from
+    *waiting* on it. If the utility handed a long job to a peer service and the escape only stops
+    the shell listening, the peer keeps grinding and the very *next* command blocks behind it: the
+    shell looks free but is not. So a command that drives a multi-step peer operation (a sweep, a
+    batch) drives it **step-by-step from the shell**, so `q` ends the loop and the peer is only
+    ever mid-ONE step. Worked example: `net scan` began as one batch `net-stack` op (sweep all 254
+    hosts); pressing `q` unblocked the shell, but net-stack kept sweeping, so a *second* `net scan`
+    hung waiting for it. The fix made the shell drive the sweep one host at a time (op 7 -> per-host
+    op 6). Escaping the wait is not enough; escape the work.
+12. **Output is a pipeable structure.** A utility's result is data, not decoration: a producer
+    emits either a typed record `Table` (`docs/records.md`, so `| where` / `| select` /
+    `| to json` compose) or plain labelled lines (so `| match` / `| count` compose). Piping is
+    the composition model; output that cannot flow onward is a dead end.
+13. **If it does not fit the common pipes, `write` still captures it.** Any producer's output
+    snapshots to a file with `| write <path>` (redirection is `| write`; there is no `>`, see
+    `19_write.md`). So even a utility that is not a record source is never trapped on screen -
+    its bytes always have somewhere to go.
+14. **Multiple same-type targets are a COMMA-separated list, never spaced.** `kill ehci,xhci,fs`,
+    `spawn ping,pong`, `restart fs,logger`, `delete /a,/b`, `mkdir docs,tmp`, `fmt a.gsh,b.gsh`,
+    `chaos max-carnage nic-driver,net-stack` - one argument, comma-delimited. NOT spaced
+    (`kill ehci xhci fs`): the shell tokenizes a line to a small fixed arg count (`MAX_ARGS = 4`), so a
+    spaced list silently caps at ~3 targets, while a comma-list is a SINGLE token and is therefore
+    unbounded. Comma is also the one uniform rule - the same separator on every command - so the user
+    never has to guess which verb wants which shape. Each target runs the command's normal
+    single-target path (same guards, same per-target report); a failure on one does not abort the
+    rest; the set is bounded. A single target with no comma behaves exactly as before. The keyword
+    `all-services` (kill only) is the whole system set expressed as one target.
 
 ### Help output shape (normative)
 

@@ -275,11 +275,15 @@ impl<'a> Ahci<'a> {
             let cmd2 = self.pread(PX_CMD);
             self.pwrite(PX_CMD, cmd2 | CMD_ST);
         }
-        // ESCALATE: if the port is STILL stuck BSY after the soft recovery above, the controller
-        // is wedged in a way only a real port reset clears (the `chaos max-carnage` failure mode:
-        // a COMRESET is what a cold boot does). Do it so a RUNNING driver self-heals a wedged port
-        // without waiting for a restart.
-        if self.pread(PX_TFD) & TFD_BSY != 0 {
+        // ESCALATE: if the port is STILL stuck after the soft recovery above - either BSY, or a
+        // command still latched in PxCI (a "command timeout (CI stuck)" that never set BSY - the
+        // wedge a garbage/out-of-range LBA read leaves) - the controller is wedged in a way only a
+        // real port reset clears. A soft recovery cannot clear a hardware-owned PxCI bit; a COMRESET
+        // (what a cold boot does) resets the port and frees it. Gating this on BSY alone let a
+        // CI-stuck-without-BSY wedge retry into the identical stuck state forever (Bug 2). Do it so a
+        // RUNNING driver self-heals a wedged port without waiting for a restart - Commandment VIII in
+        // the driver: a persistent stuck command is a failure-truth we must act on, not spin on.
+        if self.pread(PX_TFD) & TFD_BSY != 0 || self.pread(PX_CI) != 0 {
             self.port_comreset(ctx);
         }
     }
@@ -473,6 +477,79 @@ impl<'a> Ahci<'a> {
     }
 }
 
+/// Wait (bounded) for a port's SATA PHY to establish communication (`PxSSTS.DET == 3`), COMRESET-ing
+/// the port to re-run the OOB sequence if it has not. Returns `true` iff a device established.
+///
+/// **Why this exists.** The disk-detection loop in `run` used to read `PxSSTS.DET` exactly once, with
+/// no reset and no wait, and idle forever on `DET != 3`. But the SATA PHY does not always have
+/// communication established at the instant block-driver first probes - a warm reboot (no power cycle
+/// to re-run OOB), or a `chaos max-carnage` soak that re-inits the HBA through rapid block-driver
+/// respawns, both leave the link mid-establishment. A one-shot read then mis-declared "no SATA disk
+/// found" on a disk that was physically present, `fs` never mounted, and every fs-dependent command
+/// hung. This gives the link a bounded window to come up on its own, and if it still has not, forces a
+/// COMRESET (pulse `PxSCTL.DET` 1 -> hold -> 0, the same OOB kick a cold boot does) and waits again.
+///
+/// This is bounded hardware-truth waiting (the `port_comreset` idiom, §26.6): every spin proceeds
+/// after its bound, so a genuinely empty port still returns `false` **loudly** rather than wedging
+/// boot. It touches only `PxSCTL`/`PxSSTS`/`PxSERR` (detection state) - the command engine and CLB/FB
+/// are left to `init_port`, which runs a full `port_comreset` on the chosen port afterwards.
+fn wait_port_ready(ctx: &ServiceContext, hba: &Mmio, base: usize) -> bool {
+    // 1. Fast path + slow-establish: a healthy, already-up link returns on the first read (zero added
+    //    latency); a slow one gets a bounded window (read-count poll, the port_comreset DET idiom).
+    for _ in 0..2_000_000u32 {
+        if hba.read32(base + PX_SSTS) & 0xF == 3 {
+            return true;
+        }
+    }
+    // 2. Still not up - force a COMRESET to re-run OOB: assert PxSCTL.DET = 1, hold >= 1 ms, de-assert.
+    let sctl = hba.read32(base + PX_SCTL);
+    hba.write32(base + PX_SCTL, (sctl & !0xF) | 0x1);
+    let start = ctx.read_tsc();
+    while ctx.read_tsc().wrapping_sub(start) < COMRESET_HOLD_CYCLES {}
+    let sctl = hba.read32(base + PX_SCTL);
+    hba.write32(base + PX_SCTL, sctl & !0xF);
+    // 3. Wait (bounded) for the PHY to (re)establish, then clear the error bits the reset latched.
+    for _ in 0..2_000_000u32 {
+        if hba.read32(base + PX_SSTS) & 0xF == 3 {
+            hba.write32(base + PX_SERR, 0xFFFF_FFFF); // W1C - init_port's COMRESET clears again
+            return true;
+        }
+    }
+    false
+}
+
+/// No disk (or no DMA arena): serve block IPC with a bounded, LOUD answer instead of idling silently.
+///
+/// The old no-disk path was `loop { ctx.yield_cpu(); }` - it never called `recv`, so a client's
+/// request sat unanswered in our queue forever. `fs`'s mount reads block on `request_with_reply`,
+/// which wakes on peer *death* but not on an alive-but-silent peer, so fs blocked on the first mount
+/// read, never reached its "storage-unavailable" degraded path, and every fs-dependent shell command
+/// (`ls`, `cd`, history) hung. Answering loudly here fixes that at the root: we reply to `OP_CAPACITY`
+/// with a true 0 sectors (fs reads `Some(0)` = genuinely no disk, its designed degraded trigger) and
+/// to every read/write with `STATUS_ERR`. fs then mounts *degraded* and serves clients `FS_NOFS` - a
+/// loud failure that returns to the prompt, never a hang. If a disk later appears, block-driver is
+/// restarted (Phase D) and re-runs full detection from the top.
+fn serve_no_disk(ctx: &ServiceContext) -> ! {
+    use super::{OP_CAPACITY, STATUS_ERR, STATUS_OK};
+    loop {
+        let msg = ctx.recv();
+        let reply = match ctx.take_pending_cap() {
+            Some(c) => c,
+            None => continue,
+        };
+        let p = msg.payload_bytes();
+        if !p.is_empty() && p[0] == OP_CAPACITY {
+            // Capacity reply is [STATUS_OK, sectors:u64 LE]; sectors = 0 = "genuinely no disk".
+            let mut out = [0u8; 9];
+            out[0] = STATUS_OK;
+            let _ = ctx.send_by_handle(reply, &Message::from_bytes(&out));
+        } else {
+            let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR]));
+        }
+        ctx.remove_cap(reply);
+    }
+}
+
 /// Steps A+B: detect the HBA + disk, init the port, IDENTIFY. Idles afterwards.
 pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
     let cap = hba.read32(HBA_CAP);
@@ -494,31 +571,35 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
             continue;
         }
         let base = PORT_BASE + (p as usize) * PORT_STRIDE;
-        if hba.read32(base + PX_SSTS) & 0xF == 3 {
-            let sig = hba.read32(base + PX_SIG);
-            ctx.log_fmt(format_args!(
-                "block-driver: AHCI port {}: device present (DET=3) sig={:#010x}{}",
-                p, sig, if sig == SIG_SATA { " - SATA disk" } else { "" }
-            ));
-            if sig == SIG_SATA && disk_port.is_none() {
-                disk_port = Some(p);
-            }
+        // Wait (bounded) for the SATA PHY to establish, COMRESET-ing the port if a bare read finds it
+        // not up yet. A one-shot PxSSTS.DET read misses a slow-to-establish link (warm reboot, or a
+        // chaos soak that re-inits the HBA repeatedly) and mis-declared "no disk" -> idle forever.
+        if !wait_port_ready(ctx, hba, base) {
+            continue;
+        }
+        let sig = hba.read32(base + PX_SIG);
+        ctx.log_fmt(format_args!(
+            "block-driver: AHCI port {}: device present (DET=3) sig={:#010x}{}",
+            p, sig, if sig == SIG_SATA { " - SATA disk" } else { "" }
+        ));
+        if sig == SIG_SATA && disk_port.is_none() {
+            disk_port = Some(p);
         }
     }
 
     let port = match disk_port {
         Some(p) => p,
         None => {
-            ctx.log("block-driver: AHCI - no SATA disk found on any implemented port");
-            loop { ctx.yield_cpu(); }
+            ctx.log("block-driver: AHCI - no SATA disk found; serving I/O errors so fs degrades loudly (not a hang)");
+            serve_no_disk(ctx);
         }
     };
 
     let arena = match ctx.dma_region() {
         Some(d) => d,
         None => {
-            ctx.log("block-driver: AHCI - no DMA arena granted");
-            loop { ctx.yield_cpu(); }
+            ctx.log("block-driver: AHCI - no DMA arena granted; serving I/O errors so fs degrades loudly (not a hang)");
+            serve_no_disk(ctx);
         }
     };
     arena.zero();

@@ -43,6 +43,13 @@ pub fn run(image_path: &Path, smp: u32) {
         "none",
         "-monitor",
         "telnet::4444,server,nowait",
+        // Networking (docs/networking.md): an Intel e1000 NIC on a user-mode backend so
+        // nic-driver can discover + drive it. A frame-dump for wire visibility arrives with
+        // TX (Phase 1 step 3).
+        "-device",
+        "e1000,netdev=n0",
+        "-netdev",
+        "user,id=n0",
         "-no-reboot",
         "-no-shutdown",
         "-d",

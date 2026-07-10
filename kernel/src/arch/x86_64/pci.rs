@@ -201,7 +201,11 @@ pub fn set_bus_master(bdf: u32) {
         unsafe {
             outl(CONFIG_ADDRESS, addr);
             let cmd = inl(CONFIG_DATA);
-            let new = cmd | (1u32 << 2); // set Bus Master Enable (bit 2)
+            // Enable Memory Space (bit 1) AND Bus Master (bit 2). A real chipset IGNORES MMIO to a
+            // device's memory BAR unless Memory Space is set - QEMU is lenient (so the e1000 worked
+            // without it), but on the T630 the RTL8168 returned 0xff for every register read, so its
+            // reset bit looked permanently set and the driver spun forever. Setting bit 1 fixes it.
+            let new = cmd | (1u32 << 2) | (1u32 << 1);
             if new != cmd {
                 outl(CONFIG_ADDRESS, addr);
                 outl(CONFIG_DATA, new);
@@ -212,7 +216,36 @@ pub fn set_bus_master(bdf: u32) {
         }
     };
     if changed {
-        crate::kprintln!("pci: BDF {:#06x} bus-master ENABLED for DMA driver spawn", bdf & 0xFFFF);
+        crate::kprintln!("pci: BDF {:#06x} bus-master + memory-space ENABLED for DMA driver spawn", bdf & 0xFFFF);
+    }
+}
+
+/// Bring a device to power state D0 (fully on). Firmware may leave a non-boot device (e.g. the T630's
+/// RTL8168) in D3hot, where its memory-mapped registers are INACCESSIBLE - MMIO reads return 0xff and a
+/// driver hangs (its reset bit looks permanently set). Walk the PCI capability list for the Power
+/// Management cap (ID 0x01) and clear PMCSR's PowerState field to D0. Idempotent. `bdf == 0xFFFF` = no-op.
+pub fn set_power_d0(bdf: u32) {
+    if bdf == 0xFFFF { return; }
+    let bus  = ((bdf >> 8) & 0xFF) as u8;
+    let dev  = ((bdf >> 3) & 0x1F) as u8;
+    let func = (bdf & 0x07) as u8;
+    // Status register bit 4 (= bit 20 of the 0x04 dword) = capability list present.
+    if config_read32(bus, dev, func, 0x04) & (1 << 20) == 0 { return; }
+    let mut cap = (config_read32(bus, dev, func, 0x34) & 0xFC) as u8;
+    let mut guard = 0;
+    while cap != 0 && guard < 48 {
+        let dw = config_read32(bus, dev, func, cap);
+        if (dw & 0xFF) as u8 == 0x01 {
+            // Power Management cap: PMCSR is at cap+4, PowerState = bits 1:0.
+            let pm = config_read32(bus, dev, func, cap + 4);
+            if pm & 0x3 != 0 {
+                config_write32(bus, dev, func, cap + 4, pm & !0x3); // -> D0
+                crate::kprintln!("pci: BDF {:#06x} power D{} -> D0", bdf & 0xFFFF, pm & 0x3);
+            }
+            return;
+        }
+        cap = ((dw >> 8) & 0xFC) as u8; // next cap pointer
+        guard += 1;
     }
 }
 
@@ -810,14 +843,26 @@ pub fn init() {
                 // Network controller (PCI class 0x02) - networking Phase 0 (docs/networking.md):
                 // identify what NIC is present. Log EVERY one; record the first for the future nic-driver.
                 if class == CLASS_NETWORK {
-                    // BAR0 (offset 0x10): the register space. 64-bit memory BAR if bits[2:1]=10.
-                    let bar0 = config_read32(bus as u8, dev, func, 0x10);
-                    let mmio_base = if bar0 & 0x6 == 0x4 {
-                        let bar1 = config_read32(bus as u8, dev, func, 0x14);
-                        ((bar1 as u64) << 32) | ((bar0 & 0xFFFF_FFF0) as u64)
-                    } else {
-                        (bar0 & 0xFFFF_FFF0) as u64
-                    };
+                    // The NIC's register space = its first MEMORY BAR. The e1000's is BAR0; the
+                    // RTL8168's BAR0 is an I/O port and its MMIO lives in BAR2 - so SCAN the BARs for
+                    // the first mapped memory BAR rather than assuming BAR0 (networking Phase 4).
+                    let mut mmio_base = 0u64;
+                    let mut off = 0x10u8;
+                    while off <= 0x24 {
+                        let bar = config_read32(bus as u8, dev, func, off);
+                        let is_64 = bar & 0x6 == 0x4;
+                        if bar & 0x1 == 0 && bar & 0xFFFF_FFF0 != 0 {
+                            // a mapped 32- or 64-bit memory BAR
+                            mmio_base = if is_64 {
+                                let hi = config_read32(bus as u8, dev, func, off + 4);
+                                ((hi as u64) << 32) | ((bar & 0xFFFF_FFF0) as u64)
+                            } else {
+                                (bar & 0xFFFF_FFF0) as u64
+                            };
+                            break;
+                        }
+                        off += if is_64 { 8 } else { 4 };
+                    }
                     let irq    = (config_read32(bus as u8, dev, func, 0x3C) & 0xFF) as u8;
                     let vd     = config_read32(bus as u8, dev, func, 0x00);
                     let device = (vd >> 16) as u16;

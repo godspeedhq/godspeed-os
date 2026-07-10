@@ -1,0 +1,18 @@
+name    = "net-stack"
+version = "0.1.0"
+
+[resources.memory]
+request = "8MiB"
+limit   = "16MiB"
+
+[capabilities]
+# net-stack is the model-AGNOSTIC half of networking (docs/networking.md): ARP/IPv4/ICMP/... over
+# RAW FRAMES, talking to nic-driver through the frame interface. It touches NO hardware - it only
+# sends frames to nic-driver and reads back what arrived (request/reply, §8.2), so its authority is
+# just: log, a SEND cap to nic-driver, and its own endpoint for the reply.
+log_write   = true
+ipc_send    = ["nic-driver"]
+ipc_receive = ["net-stack"]
+
+[placement]
+core = 1   # co-located with nic-driver (the two exchange frames constantly)
