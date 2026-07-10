@@ -110,7 +110,7 @@ fn spawn_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &[
             // from its directory and the new service reacquires any down peer on EndpointDead (§14.3).
             // This is what makes fs/shell recover after a storm instead of staying dead on a stale cap.
             ctx.log_fmt(format_args!(
-                "supervisor: {} wired spawn FAILED (stale peer cap) - retrying name-wired", name));
+                "supervisor: {} cached peer cap stale (peer restarted) - name-wiring instead", name));
             spawn_mapped(ctx, map, name, 0xFFFF)
         }
     }
