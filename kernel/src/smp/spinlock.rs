@@ -8,6 +8,24 @@ use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
+/// Watchdog bound for a `lock()`/`lock_irq()` spin. A kernel critical section is short (microseconds);
+/// even heavy cross-core contention drains in well under this. Spinning past ~10^9 iterations (a few
+/// seconds at GHz) means the holder is NEVER releasing - a preempted/un-reschedulable holder, or an
+/// AB-BA lock-ordering deadlock. That used to be a SILENT system-wide freeze (a `chaos max-carnage`
+/// wedge only true multi-core concurrency exposes). Now it PANICS loudly with the lock's address so the
+/// deadlocked lock is identifiable (invariant 12 / §26.7). The bound has a huge margin over any real
+/// hold, so it cannot false-fire on legitimate contention.
+const LOCK_WATCHDOG_SPINS: u64 = 1_000_000_000;
+
+/// Out-of-line, non-generic panic for the lock watchdog - keeps the hot `lock()` path lean (the fast,
+/// uncontended acquire pays nothing; only a wedged spinner ever reaches here). `addr` identifies WHICH
+/// static lock deadlocked (match it against the kernel symbol map / the static addresses in the boot log).
+#[cold]
+#[inline(never)]
+fn lock_wedge(addr: usize, spins: u64) -> ! {
+    panic!("SpinLock WEDGE: spun {} iters waiting lock@{:#x} - holder never released (deadlock)", spins, addr);
+}
+
 pub struct SpinLock<T> {
     locked: AtomicBool,
     data:   UnsafeCell<T>,
@@ -47,10 +65,15 @@ impl<T> SpinLock<T> {
 
     #[inline]
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
+        let mut spins: u64 = 0;
         while self.locked
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
+            spins += 1;
+            if spins >= LOCK_WATCHDOG_SPINS {
+                lock_wedge(self as *const _ as usize, spins);
+            }
             core::hint::spin_loop();
         }
         SpinLockGuard { lock: self, irq_restore: false }
@@ -72,10 +95,15 @@ impl<T> SpinLock<T> {
             core::arch::asm!("cli", options(nomem, nostack));
             (rflags & (1 << 9)) != 0
         };
+        let mut spins: u64 = 0;
         while self.locked
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
+            spins += 1;
+            if spins >= LOCK_WATCHDOG_SPINS {
+                lock_wedge(self as *const _ as usize, spins);
+            }
             core::hint::spin_loop();
         }
         SpinLockGuard { lock: self, irq_restore: was_enabled }
