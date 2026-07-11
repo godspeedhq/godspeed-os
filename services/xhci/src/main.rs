@@ -33,8 +33,14 @@ const CMD_INTE: u32 = 1 << 2; // USBCMD: global interrupter enable
 const IMAN_IE: u32 = 1 << 1;  // Interrupter 0 Management: Interrupt Enable
 const IMAN_IP: u32 = 1 << 0;  // Interrupter 0 Management: Interrupt Pending (write 1 to clear)
 const CMD_HCRST: u32 = 1 << 1;
-const STS_HCH: u32 = 1 << 0;
+const STS_HCH: u32 = 1 << 0;    // USBSTS: Host Controller Halted
+const STS_HSE: u32 = 1 << 2;    // USBSTS: Host System Error (a DMA/system error halted the HC)
 const STS_CNR: u32 = 1 << 11;
+const STS_HCE: u32 = 1 << 12;   // USBSTS: Host Controller Error (internal fatal error)
+/// USBSTS bits that mean the controller has stopped executing and only a reset recovers it. A
+/// command that leaves any of these set has WEDGED the HC - and a halted HC also stops an
+/// already-bound keyboard's transfers, so we must re-init rather than limp on (Item 3, Fix 1).
+const STS_WEDGED: u32 = STS_HCH | STS_HSE | STS_HCE;
 
 const PORT_CCS: u32 = 1 << 0;
 const PORT_PED: u32 = 1 << 1;
@@ -751,6 +757,27 @@ fn read_config_and_bind(
 /// 5070's internal Realtek hub) is reached and bound (docs/usb-hub.md). Shares the command and event
 /// rings via the mutable bookkeeping refs.
 #[allow(clippy::too_many_arguments)]
+/// After a command failed or got no completion, read USBSTS and log it (HCH/HSE/HCE/CNR), returning
+/// `true` if the controller has WEDGED (Item 3, Fix 1). A wedged HC does not just fail this one command
+/// - it stops executing entirely, including an already-bound keyboard's interrupt transfers, so the
+/// caller must poison the offending port and re-initialise the controller rather than issue more doomed
+/// commands. Pure diagnosis when it returns false (e.g. a device-level Transaction Error with the HC
+/// still running); the log is the breadcrumb that tells us, on the Wyse, which case a port hit.
+fn hc_wedged_now(ctx: &ServiceContext, mmio: &Mmio, op: usize) -> bool {
+    let sts = mmio.read32(op + OP_USBSTS);
+    let wedged = sts & STS_WEDGED != 0;
+    ctx.log_fmt(format_args!(
+        "xhci: post-command USBSTS={:#010x} (HCH={} HSE={} HCE={} CNR={}){}",
+        sts,
+        (sts & STS_HCH != 0) as u8,
+        (sts & STS_HSE != 0) as u8,
+        (sts & STS_HCE != 0) as u8,
+        (sts & STS_CNR != 0) as u8,
+        if wedged { " - HC WEDGED, re-initialising" } else { "" },
+    ));
+    wedged
+}
+
 fn enumerate_one(
     ctx: &ServiceContext,
     dma: &Dma,
@@ -767,7 +794,9 @@ fn enumerate_one(
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
     cmd_idx: &mut usize,
+    hc_wedged: &mut bool,
 ) {
+    *hc_wedged = false;
     let portsc_off = op + OP_PORTSC_BASE + (port as usize - 1) * 0x10;
     let psc = mmio.read32(portsc_off);
     if psc & PORT_CCS == 0 {
@@ -817,12 +846,14 @@ fn enumerate_one(
         Some(r) => r,
         None => {
             ctx.log("xhci: Enable Slot - no completion");
+            *hc_wedged = hc_wedged_now(ctx, mmio, op);
             sa.free(dev_idx);
             return;
         }
     };
     if comp != 1 {
         ctx.log_fmt(format_args!("xhci: Enable Slot failed (completion={})", comp));
+        *hc_wedged = hc_wedged_now(ctx, mmio, op);
         sa.free(dev_idx);
         return;
     }
@@ -852,15 +883,25 @@ fn enumerate_one(
         Some(r) => r,
         None => {
             ctx.log("xhci: Address Device - no completion");
+            let wedged = hc_wedged_now(ctx, mmio, op);
             sa.free(dev_idx);
-            disable_slot(ctx, dma, mmio, dboff, ir0, slot, ev_idx, ev_cycle, cmd_idx);
+            // Only try to disable the slot if the HC is still executing; on a wedged HC the command
+            // would just be another doomed "no completion". The re-init reclaims the slot anyway.
+            if !wedged {
+                disable_slot(ctx, dma, mmio, dboff, ir0, slot, ev_idx, ev_cycle, cmd_idx);
+            }
+            *hc_wedged = wedged;
             return;
         }
     };
     if comp != 1 {
         ctx.log_fmt(format_args!("xhci: Address Device failed (completion={})", comp));
+        let wedged = hc_wedged_now(ctx, mmio, op);
         sa.free(dev_idx);
-        disable_slot(ctx, dma, mmio, dboff, ir0, slot, ev_idx, ev_cycle, cmd_idx);
+        if !wedged {
+            disable_slot(ctx, dma, mmio, dboff, ir0, slot, ev_idx, ev_cycle, cmd_idx);
+        }
+        *hc_wedged = wedged;
         return;
     }
     ctx.log_fmt(format_args!(
@@ -1144,6 +1185,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // them is unplugged (root-port CCS drops); on a drop it announces and loops,
     // re-binding whatever remains. Per-pass re-init is heavy, but hot-plug is
     // infrequent and it keeps the ring bookkeeping trivially correct (§26.12).
+    //
+    // Ports that WEDGE the HC during enumeration (Item 3, Fix 1) are recorded here, OUTSIDE the loop so
+    // the record survives the re-init: a wedged port is poisoned and skipped on every subsequent pass,
+    // so one bad port (e.g. an unenumerable SuperSpeed companion) can neither halt the controller under
+    // an already-bound keyboard nor livelock the re-init. One bit per root port (max_ports <= 63 on real
+    // HW; a port >= 64 simply is not poison-tracked, never poison-halted).
+    let mut poisoned: u64 = 0;
     'reenum: loop {
         // Stop + reset the controller. The Wyse `chaos max-carnage` all-core freeze lands
         // DETERMINISTICALLY in this sequence (the log dies right after the "v..." line above), so bracket
@@ -1247,13 +1295,26 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut ndev = 0usize;
         let mut sa = SliceAlloc::new();
         let mut saw_hub = false;
+        let mut hc_wedged = false;
         for p in 1..=max_ports {
             if ndev >= MAX_HID { break; }
+            // Skip a port that WEDGED the HC on a previous pass (Item 3, Fix 1). Enumerating it again
+            // would just re-halt the controller and take the keyboard down with it; the working devices
+            // (e.g. the keyboard's hub on a lower port) enumerate first and stay bound. Bounded: at most
+            // one re-init per poisoning port, then the pass runs to completion with them skipped.
+            if p < 64 && poisoned & (1u64 << p) != 0 { continue; }
             enumerate_one(
                 &ctx, &dma, &mmio, dboff, ir0, op, ctx_size,
                 p, &mut sa, &mut devs, &mut ndev, &mut saw_hub,
-                &mut ev_idx, &mut ev_cycle, &mut cmd_idx,
+                &mut ev_idx, &mut ev_cycle, &mut cmd_idx, &mut hc_wedged,
             );
+            if hc_wedged {
+                ctx.log_fmt(format_args!(
+                    "xhci: port {} wedged the HC - poisoning it and re-initialising the controller", p
+                ));
+                if p < 64 { poisoned |= 1u64 << p; }
+                continue 'reenum;
+            }
         }
 
         if ndev == 0 {
