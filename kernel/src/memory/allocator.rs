@@ -258,10 +258,18 @@ impl BitmapAllocator {
         // re-animated dead task) is walked and freed.  Setting a bit for an
         // out-of-range frame would allow alloc to return a phantom address,
         // which would then fault the kernel on its next HHDM access.
-        if idx >= self.max_valid_frame {
+        // Reject phantom frames above usable RAM, AND any frame at/above the bitmap's capacity
+        // (MAX_FRAMES = 8 GiB). `max_valid_frame` is taken from the memory map UNCLAMPED (init_from_map),
+        // so on a machine with > 8 GiB RAM a corrupt/stale PTE whose index lands in
+        // [MAX_FRAMES, max_valid_frame) would otherwise pass the first bound and OOB-index the
+        // MAX_FRAMES-sized BITMAP / KERNEL_PT_PROTECTED (the release build compiles out the debug_assert
+        // below). The alloc path never returns idx >= MAX_FRAMES (scan is bounded to BITMAP_BYTES;
+        // alloc_contiguous clamps with .min(MAX_FRAMES)), so no legitimate free is rejected here
+        // (kernel-audit-2 B-note).
+        if idx >= self.max_valid_frame || idx >= MAX_FRAMES {
             crate::kprintln!(
-                "free_frame: IGNORED phantom frame idx={} (max_valid={})",
-                idx, self.max_valid_frame
+                "free_frame: IGNORED phantom frame idx={} (max_valid={}, cap={})",
+                idx, self.max_valid_frame, MAX_FRAMES
             );
             return;
         }
