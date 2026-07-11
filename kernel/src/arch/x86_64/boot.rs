@@ -338,7 +338,8 @@ pub unsafe fn init_local_apic() {
     // ARAT is its signal. Without either, halting would drop ticks (Goldmont
     // APIC power-gate) - keep the sti-only spin. Idempotent across cores.
     let arat = unsafe { cpuid_arat_supported() };
-    super::interrupts::set_idle_can_halt(tsc_deadline_supported || arat);
+    // (The halt decision is deferred to AFTER the C-state limit is attempted below - it depends on
+    // whether the APIC can be power-gated, which we only learn from limit_package_cstates.)
 
     // Calibrate TSC ticks/10ms ONLY where TSC-Deadline mode uses it (the AMD T630). The BSP measures via
     // the PIT (portable ground truth - CPUID 0x15/0x16 give a garbage frequency on AMD, which stored a
@@ -365,9 +366,6 @@ pub unsafe fn init_local_apic() {
         TSC_TICKS_PER_QUANTUM.store(tsc_ticks, Ordering::Relaxed);
         TSC_DEADLINE_MODE.store(true, Ordering::Relaxed);
         crate::kprintln!("apic: core {} TSC-Deadline timer ({} ticks/quantum)", lapic_id, tsc_ticks);
-        // Package C-state limit keeps the APIC powered so a deadline interrupt is never dropped.
-        // SAFETY: ring-0; APIC initialised above.
-        unsafe { limit_package_cstates(lapic_id) };
     } else {
         // Periodic mode: fires every ~10 ms regardless of C-states. QEMU's normal path (no TSC-Deadline).
         write_apic(apic_virt, APIC_LVT_TIMER, (1 << 17) | 0x20);
@@ -379,9 +377,20 @@ pub unsafe fn init_local_apic() {
         if tsc_deadline_supported {
             crate::kprintln!("apic: core {} periodic timer (TSC calibration unavailable)", lapic_id);
         }
-        // SAFETY: ring-0; APIC initialised above.
-        unsafe { limit_package_cstates(lapic_id) };
     }
+
+    // Apply the package C-state limit (keeps the APIC powered on Intel), and THEN decide whether idle
+    // cores may HALT. A halted core only wakes on interrupt delivery, so halting is safe ONLY if a wake
+    // is guaranteed: either the C-state limit was applied so the APIC never power-gates, OR ARAT keeps
+    // the periodic LAPIC timer ticking (meaningful only in periodic mode - not for TSC-Deadline). On the
+    // Wyse 5070 (Goldmont+) the C-state MSR is BIOS-LOCKED so the limit can't be applied AND it runs
+    // TSC-Deadline, so NEITHER holds - there we must NOT halt. Halting let the firmware power-gate the
+    // APIC and DROP the wake IPI/deadline, freezing the core silently (the chaos max-carnage wedge that
+    // no lock/shootdown watchdog caught, because nothing was spinning). The sti-only spin (correct, just
+    // hotter) is selected instead.
+    // SAFETY: ring-0; APIC initialised above.
+    let cstate_ok = unsafe { limit_package_cstates(lapic_id) };
+    super::interrupts::set_idle_can_halt(cstate_ok || (arat && !tsc_deadline_supported));
 }
 
 /// Check CPUID leaf 1, ECX bit 24 for TSC-Deadline timer support.
@@ -614,11 +623,16 @@ fn is_intel_cpu() -> bool {
 ///
 /// # Safety
 /// Ring-0 only.  Called once per core from `init_local_apic` after APIC setup.
-unsafe fn limit_package_cstates(core_id: u32) {
+/// Returns whether a halted core's wake is safe from the Goldmont+ APIC power-gate: `true` if the APIC
+/// will not be power-gated (AMD has no such gate, or the Intel C-state limit was applied), `false` if it
+/// could not be applied (Intel BIOS-locked the MSR) - in which case idle cores must NOT halt (see
+/// `init_apic_timer`), or a power-gated APIC drops the wake and freezes the core.
+unsafe fn limit_package_cstates(core_id: u32) -> bool {
     // MSR 0xE2 (MSR_PKG_CST_CONFIG_CONTROL) is Intel-specific.
-    // On AMD processors this MSR does not exist; RDMSR/WRMSR cause #GP(0).
+    // On AMD processors this MSR does not exist; RDMSR/WRMSR cause #GP(0). AMD has no Goldmont+ APIC
+    // power-gate, so halting there is governed by ARAT elsewhere - report "no gate concern".
     if !is_intel_cpu() {
-        return;
+        return true;
     }
 
     const MSR_PKG_CST_CONFIG_CONTROL: u32 = 0xE2;
@@ -645,7 +659,7 @@ unsafe fn limit_package_cstates(core_id: u32) {
         // BIOS locked the MSR - cannot write; APIC timer may still be gated in
         // deep package C-states.  A TSC-Deadline timer does not require this MSR.
         crate::kprintln!("cstate: core {} MSR 0xE2 locked - C-state limit cannot be set via MSR", core_id);
-        return;
+        return false;
     }
 
     let new_val = (current & !0x7u64) | PC1_LIMIT;
@@ -660,6 +674,7 @@ unsafe fn limit_package_cstates(core_id: u32) {
         );
     }
     crate::kprintln!("cstate: core {} limited to PC1 (MSR 0xE2 = {:#018x})", core_id, new_val);
+    true
 }
 
 /// Send an End-Of-Interrupt signal to the local APIC.
