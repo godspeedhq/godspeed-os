@@ -1121,14 +1121,9 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                 }
             }
         }
-        // Heartbeat (progress visibility): core 0 prints all cores' tick counts every ~2 s.
-        if cid == 0 {
-            let t0 = CORE_TOTAL_TICKS.get(0).0.load(Ordering::Relaxed);
-            if t0 % 200 == 0 {
-                let rd = |c: usize| if c < ncores { CORE_TOTAL_TICKS.get(c).0.load(Ordering::Relaxed) } else { 0 };
-                crate::kprintln!("hb: c0={} c1={} c2={} c3={}", t0, rd(1), rd(2), rd(3));
-            }
-        }
+        // (The per-core "hb:" tick heartbeat that lived here was a diagnostic for the Wyse wedge hunt;
+        // removed now that the wedge is fixed and the cross-core LIVENESS WATCHDOG above is the permanent
+        // progress defense. It printed every ~2 s forever - idle console spam with no remaining purpose.)
         if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) {
             CORE_ACTIVE_TICKS.get(cid).0.fetch_add(1, Ordering::Relaxed);
             // Credit the running task this quantum - the per-task CPU% source for `observe`
