@@ -359,14 +359,37 @@ fn frame_align_down(addr: u64) -> u64 {
 
 static ALLOC_LOCKED: AtomicBool = AtomicBool::new(false);
 
+/// Watchdog bound for the ALLOC_LOCKED spin. The frame allocator's critical sections are microseconds
+/// (a bitmap scan/flip); spinning past ~10^9 iterations (a few seconds at GHz) means the holder is never
+/// releasing - a task preempted mid-alloc that can't be rescheduled, or a lock-ordering deadlock. This
+/// is the single most-contended lock in the spawn/kill path, and it is HAND-ROLLED (not `SpinLock<T>`),
+/// so the SpinLock watchdog does not cover it. Panic loudly instead of freezing the machine silently
+/// (invariant 12 / §26.7). Huge margin over any real hold, so it cannot false-fire.
+const ALLOC_WATCHDOG_SPINS: u64 = 1_000_000_000;
+
 #[inline]
 fn alloc_lock() {
+    let mut spins: u64 = 0;
     while ALLOC_LOCKED
         .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
+        spins += 1;
+        if spins >= ALLOC_WATCHDOG_SPINS {
+            alloc_lock_wedge(spins);
+        }
         core::hint::spin_loop();
     }
+}
+
+/// Out-of-line loud panic for the frame-allocator lock watchdog (keeps `alloc_lock` lean).
+#[cold]
+#[inline(never)]
+fn alloc_lock_wedge(spins: u64) -> ! {
+    panic!(
+        "frame-allocator (ALLOC_LOCKED) WEDGE: spun {} iters - holder never released (preempted holder / deadlock)",
+        spins
+    );
 }
 
 #[inline]
