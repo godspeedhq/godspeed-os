@@ -277,6 +277,13 @@ struct CachePaddedU64(AtomicU64);
 static CORE_ACTIVE_TICKS: PerCore<CachePaddedU64> = PerCore::new();
 /// Total timer ticks seen on each core.
 static CORE_TOTAL_TICKS: PerCore<CachePaddedU64> = PerCore::new();
+/// TSC at each core's last scheduler tick - the cross-core LIVENESS heartbeat. A core stamps this every
+/// tick; every OTHER core checks it each tick and, if a core has made no progress for far longer than a
+/// quantum (a stuck IF=0 loop, or a lost/never-re-armed TSC-Deadline when the Goldmont+ APIC
+/// power-gates), PANICS loudly instead of letting the machine freeze silently (invariant 12 / §26.7).
+/// The kernel is the last-resort recovery anchor (§6.3); if IT stalls silently nothing recovers it, so
+/// it must at minimum fail LOUD. `0` = that core has not ticked yet (still booting) - not a stall.
+static CORE_LAST_TICK_TSC: PerCore<CachePaddedU64> = PerCore::new();
 
 /// Sticky round-robin scan pointer per core (§9.1, §9.3).
 ///
@@ -368,6 +375,7 @@ pub fn init_arenas(n: usize) {
     CORE_CURRENT.init_with(n, |_| AtomicUsize::new(IDLE));
     CORE_ACTIVE_TICKS.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
     CORE_TOTAL_TICKS.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
+    CORE_LAST_TICK_TSC.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
     CORE_RR_SLOT.init_with(n, |_| AtomicUsize::new(0));
     CORE_WAKE_HINT.init_with(n, |_| AtomicUsize::new(MAX_TASKS));
     CORE_PENDING_KSTACK_LEN.init_with(n, |_| AtomicUsize::new(0));
@@ -1052,15 +1060,44 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
 
         // Accumulate CPU utilisation counters.
         CORE_TOTAL_TICKS.get(cid).0.fetch_add(1, Ordering::Relaxed);
-        // DIAGNOSTIC HEARTBEAT (temporary, for the Wyse max-carnage wedge hunt): core 0 prints every
-        // core's total-tick count every ~2 s. A wedge log's tail then shows which core STOPPED ticking
-        // (a lost/never-re-armed TSC-Deadline when the Goldmont+ APIC power-gates) versus all cores still
-        // ticking but no forward progress (a logic hang). Remove once the root is found.
+
+        // LIVENESS WATCHDOG (invariant 12 / §26.7 - the constitutionally-complete answer to the silent
+        // Wyse wedge). Stamp this core's progress, then check every OTHER core: a core that has made no
+        // forward progress for far longer than a quantum has STOPPED - for ANY reason (a stuck IF=0
+        // loop, a lost/never-re-armed TSC-Deadline when the Goldmont+ APIC power-gates, a wait nothing
+        // wakes). Rather than let the machine freeze silently, the first core to notice PANICS LOUDLY,
+        // naming the stalled core, how long it has been dark, and what it was running. The kernel is the
+        // last-resort recovery anchor (§6.3): if it stalls silently nothing recovers it, so it must at
+        // minimum fail loud. Armed only once the TSC quantum is calibrated (real hardware, TSC-Deadline
+        // mode); QEMU's periodic tick has no calibrated rate (0), so it is skipped - and a normal
+        // shootdown/critical-section is milliseconds, so the ~3 s deadline cannot false-fire.
+        let now = crate::arch::x86_64::read_cycle_counter();
+        CORE_LAST_TICK_TSC.get(cid).0.store(now, Ordering::Relaxed);
+        let tpq = crate::arch::x86_64::boot::tsc_ticks_per_quantum();
+        let ncores = crate::smp::core::ready_count() as usize;
+        if tpq > 0 {
+            let deadline = tpq.saturating_mul(300); // ~3 s (300 * 10 ms quanta) with no forward progress
+            for other in 0..ncores {
+                if other == cid { continue; }
+                let last = CORE_LAST_TICK_TSC.get(other).0.load(Ordering::Relaxed);
+                // saturating_sub: if now < last (small cross-core TSC skew, or it stamped a hair ago)
+                // this reads 0, never a spurious huge delta - so skew cannot false-fire the panic.
+                let dark = now.saturating_sub(last);
+                if last != 0 && dark > deadline {
+                    let stuck_task = CORE_CURRENT.get(other).load(Ordering::Relaxed);
+                    panic!(
+                        "LIVENESS WEDGE: core {} made NO progress for {} TSC (~{} quanta, >3s); last \
+                         running task slot {}; detected by core {}. No forward progress = loud stop.",
+                        other, dark, dark / tpq, stuck_task, cid
+                    );
+                }
+            }
+        }
+        // Heartbeat (progress visibility): core 0 prints all cores' tick counts every ~2 s.
         if cid == 0 {
             let t0 = CORE_TOTAL_TICKS.get(0).0.load(Ordering::Relaxed);
             if t0 % 200 == 0 {
-                let n = crate::smp::core::ready_count() as usize;
-                let rd = |c: usize| if c < n { CORE_TOTAL_TICKS.get(c).0.load(Ordering::Relaxed) } else { 0 };
+                let rd = |c: usize| if c < ncores { CORE_TOTAL_TICKS.get(c).0.load(Ordering::Relaxed) } else { 0 };
                 crate::kprintln!("hb: c0={} c1={} c2={} c3={}", t0, rd(1), rd(2), rd(3));
             }
         }
@@ -1249,6 +1286,10 @@ pub fn yield_current() {
 
         // Count each scheduler quantum (yield or timer) for CPU utilisation.
         CORE_TOTAL_TICKS.get(cid).0.fetch_add(1, Ordering::Relaxed);
+        // A yield IS forward progress - stamp the liveness heartbeat too, so the cross-core watchdog
+        // (timer_tick_from_irq) never mistakes a heavily-yielding core (one making progress via syscalls
+        // rather than timer preemption) for a stalled one.
+        CORE_LAST_TICK_TSC.get(cid).0.store(crate::arch::x86_64::read_cycle_counter(), Ordering::Relaxed);
         if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) {
             CORE_ACTIVE_TICKS.get(cid).0.fetch_add(1, Ordering::Relaxed);
             // Credit the running task this quantum - the per-task CPU% source for `observe`
