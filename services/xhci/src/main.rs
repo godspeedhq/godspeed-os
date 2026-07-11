@@ -1476,8 +1476,27 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut hub_cur = [0usize; MAX_HID];
         let mut hub_pcs = [1u32; MAX_HID];
         for d in 0..ndev { hub_cur[d] = devs[d].hub_off; }
+        // Two HIDs behind the SAME hub (a keyboard AND a mouse on one back-port hub) share that hub's
+        // ONE EP0 control ring, so their downstream GET_STATUS polls MUST advance ONE monotonic cursor -
+        // not a per-device cursor each. The controller has a single dequeue pointer per ring; two
+        // independent cursors desync it, and the second device's polls never complete -> None (the mouse
+        // "port 4 status probe -> None" spam). cursor_owner[d] = the first device on d's hub; devices on
+        // the same hub share its cursor, seeded to the FURTHEST enumeration point (the last device to
+        // enumerate on that shared ring advanced it most). Root devices (hub_slot == 0) own their own.
+        let mut cursor_owner = [0usize; MAX_HID];
+        for d in 0..ndev {
+            cursor_owner[d] = d;
+            for e in 0..d {
+                if devs[d].hub_slot != 0 && devs[e].hub_slot == devs[d].hub_slot {
+                    cursor_owner[d] = e;
+                    if hub_cur[d] > hub_cur[e] { hub_cur[e] = hub_cur[d]; hub_pcs[e] = hub_pcs[d]; }
+                    break;
+                }
+            }
+        }
         let mut last_hub_poll = ctx.read_tsc();
         let mut hub_probe_logged = false; // log the first downstream-status probe per session (diagnostic)
+        let mut hub_none_logged = [false; MAX_HID]; // an inconclusive None logs at most ONCE per device (no spam)
         let mut kb_last = [[0u8; 6]; MAX_HID];
         let mut kb_rep = [
             godspeed_sdk::hid::KeyRepeat::new(REPEAT_INITIAL_CYCLES, REPEAT_INTERVAL_CYCLES),
@@ -1606,19 +1625,24 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 } else if hub_due {
                     // Some(false) = the hub says its port is empty now; Some(true)/None = still there
                     // or an inconclusive read (do not false-notify on a transient control failure).
+                    let owner = cursor_owner[d];
+                    let (mut cur, mut pcs) = (hub_cur[owner], hub_pcs[owner]);
                     let st = hub_port_status(
                         &dma, &mmio, dboff, ir0,
                         devs[d].hub_slot, devs[d].hub_dev as usize, devs[d].hub_port,
-                        &mut hub_cur[d], &mut hub_pcs[d], &mut ev_idx, &mut ev_cycle, &mut eaten,
+                        &mut cur, &mut pcs, &mut ev_idx, &mut ev_cycle, &mut eaten,
                     );
-                    // Log the first probe of the session (and any inconclusive None, which would
-                    // silently disable this detection) so the hub-poll path is diagnosable on hardware.
-                    if !hub_probe_logged || st.is_none() {
+                    hub_cur[owner] = cur;
+                    hub_pcs[owner] = pcs;
+                    // Log the first probe of the session, and an inconclusive None at most ONCE per device
+                    // (a None would silently disable this detection, so surface it - but never spam it).
+                    if !hub_probe_logged || (st.is_none() && !hub_none_logged[d]) {
                         ctx.log_fmt(format_args!(
                             "xhci: hub slot {} port {} status probe -> {:?}",
                             devs[d].hub_slot, devs[d].hub_port, st
                         ));
                         hub_probe_logged = true;
+                        if st.is_none() { hub_none_logged[d] = true; }
                     }
                     matches!(st, Some(false))
                 } else {
