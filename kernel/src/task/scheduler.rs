@@ -989,16 +989,44 @@ pub fn run(core_id: u32) -> ! {
                 // SAFETY: IF disabled around the switch to prevent preemption.
                 unsafe {
                     core::arch::asm!("cli", options(nostack, nomem));
-                    TASK_STATE[next].store(TaskState::Running as u8, Ordering::Relaxed);
-                    CORE_CURRENT.get(cid).store(next, Ordering::Relaxed);
-                    if TASK_IS_USER[next] {
-                        prepare_ring3_switch(cid, next);
+                    // V3 (kernel-audit-2): claim `next` with a CAS, not an
+                    // unconditional store, so a cross-core kill that stored Dead
+                    // between pick_next and here is not overwritten (mirrors the
+                    // next==prev timer path). Then complete the Dekker handshake
+                    // with kill_task_by_slot, which does: store Dead; SeqCst fence;
+                    // load CORE_CURRENT. Here we publish CORE_CURRENT, fence, and
+                    // re-read STATE: if a concurrent kill won the pick->publish race
+                    // - and may have missed our publish and already freed `next`'s
+                    // page tables - `abort` skips the switch rather than load a freed
+                    // CR3. All accesses are SeqCst so the two sides cannot both miss
+                    // each other's store (store-buffer / Dekker), so at least one of
+                    // {kill waits for us, we observe Dead} holds; both are safe.
+                    let mut abort = TASK_STATE[next]
+                        .compare_exchange(
+                            TaskState::Ready as u8,
+                            TaskState::Running as u8,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        )
+                        .is_err();
+                    if !abort {
+                        CORE_CURRENT.get(cid).store(next, Ordering::SeqCst);
+                        core::sync::atomic::fence(Ordering::SeqCst);
+                        abort = TASK_STATE[next].load(Ordering::SeqCst)
+                            != TaskState::Running as u8;
                     }
-                    let sched    = CORE_SCHED_CTX.as_mut_ptr(cid);
-                    let next_ctx = TASK_CTX[next].assume_init_ref() as *const TaskContext;
-                    switch_context(sched, next_ctx);
-                    // Execution returns here after the task is preempted and
-                    // the scheduler loop is re-entered.
+                    if !abort {
+                        if TASK_IS_USER[next] {
+                            prepare_ring3_switch(cid, next);
+                        }
+                        let sched    = CORE_SCHED_CTX.as_mut_ptr(cid);
+                        let next_ctx = TASK_CTX[next].assume_init_ref() as *const TaskContext;
+                        switch_context(sched, next_ctx);
+                        // Execution returns here after the task is preempted and
+                        // the scheduler loop is re-entered.
+                    }
+                    // Shared tail (switched, or aborted): leave CORE_CURRENT off
+                    // `next` so a racing kill's spin-wait proceeds, then re-loop.
                     CORE_CURRENT.get(cid).store(IDLE, Ordering::Relaxed);
                     core::arch::asm!("sti", options(nostack, nomem));
                 }
@@ -1241,8 +1269,38 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             return;
         }
 
-        TASK_STATE[next].store(TaskState::Running as u8, Ordering::Relaxed);
-        CORE_CURRENT.get(cid).store(next, Ordering::Relaxed);
+        // V3 (kernel-audit-2): claim `next` with a CAS (mirror the next==prev path
+        // above) so a cross-core kill's Dead is not overwritten; then complete the
+        // Dekker handshake with kill_task_by_slot (store Dead; SeqCst fence; load
+        // CORE_CURRENT) by publishing CORE_CURRENT, fencing, and re-reading STATE.
+        // If a kill won the pick->publish race it may have already freed `next`'s
+        // page tables, so `abort_to_sched` re-routes prev to the scheduler context
+        // rather than let switch_context load a freed CR3. All accesses SeqCst so
+        // the two sides cannot both miss each other's store.
+        let mut abort_to_sched = TASK_STATE[next]
+            .compare_exchange(
+                TaskState::Ready as u8,
+                TaskState::Running as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err();
+        if !abort_to_sched {
+            CORE_CURRENT.get(cid).store(next, Ordering::SeqCst);
+            core::sync::atomic::fence(Ordering::SeqCst);
+            abort_to_sched =
+                TASK_STATE[next].load(Ordering::SeqCst) != TaskState::Running as u8;
+        }
+        if abort_to_sched {
+            // Leave CORE_CURRENT off `next` so the racing kill's spin-wait proceeds.
+            CORE_CURRENT.get(cid).store(IDLE, Ordering::SeqCst);
+            if prev >= MAX_TASKS {
+                // Core was idle (in run()'s loop) - nothing to switch out; return to it.
+                return;
+            }
+            // else: fall through and switch `prev` (set Ready by the CAS at the top
+            // of the tick) to the scheduler context via the shared switch below.
+        }
 
         // Save BEFORE prepare_ring3_switch so we capture the value from the last
         // SYSCALL entry for `prev`, not the value prepare_ring3_switch writes for `next`.
@@ -1251,7 +1309,9 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                 crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[cid].user_rsp;
         }
 
-        if TASK_IS_USER[next] {
+        // On abort we do not enter `next`; only prepare the ring-3 switch when we
+        // are actually switching to it.
+        if !abort_to_sched && TASK_IS_USER[next] {
             prepare_ring3_switch(cid, next);
         }
 
@@ -1266,8 +1326,16 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             TASK_CTX[prev].assume_init_mut() as *mut TaskContext
         };
 
-        let next_ctx: *const TaskContext =
-            TASK_CTX[next].assume_init_ref() as *const TaskContext;
+        // Normal path: switch into `next`. Abort path (kill won the race): switch
+        // `prev` to the scheduler context instead, where it is rescheduled - never
+        // loading `next`'s possibly-freed page table. (prev >= MAX_TASKS already
+        // returned above, so current_ctx here is a real task ctx, distinct from the
+        // scheduler ctx - never the same-pointer switch the contract forbids.)
+        let next_ctx: *const TaskContext = if abort_to_sched {
+            CORE_SCHED_CTX.as_ptr(cid)
+        } else {
+            TASK_CTX[next].assume_init_ref() as *const TaskContext
+        };
 
         switch_context(current_ctx, next_ctx);
     }
@@ -1611,7 +1679,14 @@ pub fn kill_task_by_slot(slot: usize) {
         }
         // Atomically claim this kill: set Dead under the lock so no concurrent
         // call can also proceed past this point for the same slot.
-        TASK_STATE[slot].store(TaskState::Dead as u8, Ordering::Release);
+        // SeqCst (not Release): this store is one half of the Dekker handshake with
+        // the scheduler's pick-then-commit (V3, kernel-audit-2). The scheduler does
+        // store(CORE_CURRENT=next, SeqCst); fence; load(STATE, SeqCst); this side
+        // does store(STATE=Dead, SeqCst); load(CORE_CURRENT, SeqCst) in the spin
+        // below. With all four accesses in the single SeqCst total order, the two
+        // sides cannot both miss each other, so a kill can never free a task's page
+        // tables while a core is committing a switch into it.
+        TASK_STATE[slot].store(TaskState::Dead as u8, Ordering::SeqCst);
         false
     };
     task_slot_unlock();
@@ -1814,8 +1889,12 @@ pub fn kill_task_by_slot(slot: usize) {
                 loop {
                     // Compiler + hardware barrier: reload CORE_CURRENT[cid] from
                     // memory on every iteration; do not use a cached register value.
+                    // SeqCst load (V3): the other half of the Dekker handshake with
+                    // the scheduler's store(CORE_CURRENT=next, SeqCst) - all four
+                    // conflicting accesses are SeqCst so the two sides cannot both
+                    // miss each other. (The fence is now redundant but harmless.)
                     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-                    if CORE_CURRENT.get(cid).load(Ordering::Relaxed) != slot { break; }
+                    if CORE_CURRENT.get(cid).load(Ordering::SeqCst) != slot { break; }
                     core::hint::spin_loop();
                 }
             }
