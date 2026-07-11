@@ -3722,7 +3722,26 @@ pub fn poll_supervisor_respawn() {
     }
     let n = SUPERVISOR_RESPAWN_COUNT.fetch_add(1, Ordering::AcqRel) + 1;
     crate::kprintln!("kernel: supervisor died - respawning (#{}) (Path C / Phase 6)", n);
-    spawn_supervisor();
+    // A RUNTIME respawn must NEVER panic (kernel audit C3). spawn_supervisor() panics on any SpawnError,
+    // but the reachable ones here - NoMemory / MapFailed / CapTableFull - are TRANSIENT resource pressure
+    // (a `mem-pressure` + `kill supervisor` storm can win the reclaim-vs-alloc race for an instant), not
+    // corrupted kernel state, so §6.2 does not sanction a panic. Panicking would force the very reboot
+    // Phase 6 exists to eliminate - a userspace-reachable DoS reboot. So call the non-panicking spawn
+    // directly; on a transient failure, log LOUD (§26.7) and RE-ARM PENDING so the next Core-0 tick
+    // retries. The supervisor's footprint is constant and just-reclaimed, so a retry succeeds the moment
+    // the pressure eases. (Only the BOOT-time spawn_supervisor keeps its fatal panic - §22 Test 1B.)
+    match spawn_service_with_config(
+        "supervisor", SUPERVISOR_ELF, 0, true, &[], 0, false, 64 * 1024 * 1024, &[], false, None,
+    ) {
+        Ok(_) => crate::kprintln!("task: supervisor spawned on core 0"),
+        Err(e) => {
+            crate::kprintln!(
+                "kernel: supervisor respawn #{} FAILED ({:?}) - re-arming, retry next tick (transient resource pressure, NOT a reboot)",
+                n, e
+            );
+            SUPERVISOR_RESPAWN_PENDING.store(true, Ordering::Release);
+        }
+    }
     SUPERVISOR_RESPAWN_IN_PROGRESS.store(false, Ordering::Release);
 }
 

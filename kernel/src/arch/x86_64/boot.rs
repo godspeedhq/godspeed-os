@@ -1131,6 +1131,17 @@ pub(super) unsafe fn init_idt() {
         for entry in idt.iter_mut() {
             *entry = IdtEntry::new(halt);
         }
+        // CPU-exception vectors (0-31): route to the CPL-discriminating stubs so a RING-3 exception
+        // KILLS the task instead of wedging the kernel (invariant 12). 6/13/14 keep their dedicated
+        // handlers (set below); 8/10/11/12/17/21 push an error code (different CS offset -> the _ec
+        // stub). Interrupt vectors (32+) stay at `exception_halt` - a spurious IRQ is not a task fault.
+        const EC_VECTORS: [usize; 6] = [8, 10, 11, 12, 17, 21];
+        let exc_noec = exc_stub_noec as *const () as u64;
+        let exc_ec   = exc_stub_ec   as *const () as u64;
+        for v in 0..32usize {
+            if v == 6 || v == 13 || v == 14 { continue; } // dedicated handlers below
+            idt[v] = IdtEntry::new(if EC_VECTORS.contains(&v) { exc_ec } else { exc_noec });
+        }
         // IDT[6] = #UD handler: used as the syscall entry on AMD GX-420GI where
         // both SYSCALL and int $0x80 silently stall from ring-3.  DPL=0 is
         // correct - CPU exceptions bypass the DPL check, so ud2 from ring-3
@@ -1272,8 +1283,17 @@ unsafe extern "C" fn gpf_stub() -> ! {
         "mov al, 0x47",   // 'G'
         "out dx, al",
         "mov byte ptr [{gp_flag}], 1",
+        // #GP pushes an error code, so the saved CS is at [rsp+16] (bits 1:0 = CPL). A ring-3 #GP
+        // (a service ran a privileged instruction or made a non-canonical access) must KILL THE TASK,
+        // not the kernel - so swapgs to the kernel GS first, exactly like pf_stub, so kill_current and
+        // the scheduler can reach per-core data. A kernel (CPL=0) #GP leaves GS alone and will halt.
+        "test byte ptr [rsp + 16], 3", // CPL: non-zero = ring-3
+        "jz 1f",                       // kernel #GP → skip swapgs
+        "swapgs",                      // ring-3 #GP → install kernel GS
+        "1:",
         "mov rdi, [rsp]",      // error_code → first arg
         "mov rsi, [rsp + 8]",  // saved RIP  → second arg
+        "mov rdx, [rsp + 16]", // saved CS   → third arg (CPL for kill-vs-halt)
         "call gpf_handler",
         "2: hlt",
         "jmp 2b",
@@ -1339,13 +1359,31 @@ unsafe extern "C" fn pf_stub() -> ! {
     )
 }
 
-/// Print GPF info and halt all cores.
+/// Handle a #GP: a RING-3 #GP kills the offending task (the system continues, invariant 12 / §10.3);
+/// a RING-0 #GP is genuine kernel-state corruption and halts loudly (§6.2). `saved_cs` bits 1:0 are the
+/// CPL. Uses lock-free serial (the fault may have interrupted a kprintln holding LOG_LOCK), mirroring
+/// pf_handler.
 #[no_mangle]
-unsafe extern "C" fn gpf_handler(error_code: u64, fault_rip: u64) -> ! {
-    crate::kprintln!(
-        "KERNEL GPF: error_code={:#x} rip={:#x}",
-        error_code, fault_rip
-    );
+unsafe extern "C" fn gpf_handler(error_code: u64, fault_rip: u64, saved_cs: u64) -> ! {
+    // SAFETY: raw fault context, IF=0, kernel GS installed (swapgs in gpf_stub for ring-3).
+    unsafe {
+        if saved_cs & 3 != 0 {
+            serial_puts_nolck(b"USER GPF (killing task): error_code=");
+        } else {
+            serial_puts_nolck(b"KERNEL GPF: error_code=");
+        }
+        serial_hex64_nolck(error_code);
+        serial_puts_nolck(b" rip=");
+        serial_hex64_nolck(fault_rip);
+        serial_puts_nolck(b" cs=");
+        serial_hex64_nolck(saved_cs);
+        serial_puts_nolck(b"\n");
+    }
+    // Ring-3 #GP: the service misbehaved, not the kernel - kill it and reschedule (kill_current does
+    // not return for a ring-3 fault). Only a ring-0 #GP (or a defensive fall-through) halts all cores.
+    if saved_cs & 3 != 0 {
+        crate::task::kill_current();
+    }
     crate::arch::x86_64::halt_all_cores()
 }
 
@@ -1492,4 +1530,111 @@ unsafe extern "C" fn exception_halt_handler(w0: u64, w1: u64, w2: u64, w3: u64) 
         }
         serial_puts_nolck(b"\n");
     }
+}
+
+// ---------------------------------------------------------------------------
+// CPU-EXCEPTION stubs for vectors 0-31 (invariant 12: a ring-3 exception KILLS
+// the task, it does NOT wedge the kernel).
+//
+// The old catch-all `exception_halt` above halted the whole machine for EVERY
+// unhandled vector, so a single ring-3 instruction (`cli` -> #GP; `div` by 0 ->
+// #DE; an unmasked FP fault -> #MF/#XM; ...) took down the kernel - the class the
+// commandment audit flagged. These stubs mirror pf_stub: check the saved-CS CPL,
+// swapgs to the kernel GS for a ring-3 fault, and let exc_dispatch KILL the task
+// (system continues); a ring-0 exception is genuine kernel corruption and halts.
+//
+// Two variants because the CS slot differs: an error-code exception pushes err
+// first (CS at [rsp+16]); a no-error-code exception has CS at [rsp+8]. Interrupt
+// vectors (32+) are NOT routed here - a spurious IRQ is not the task's fault and
+// keeps the `exception_halt` behaviour.
+// ---------------------------------------------------------------------------
+
+/// No-error-code exception frame: [rsp+0]=RIP [rsp+8]=CS [rsp+16]=RFLAGS [rsp+24]=RSP.
+#[unsafe(naked)]
+unsafe extern "C" fn exc_stub_noec() -> ! {
+    core::arch::naked_asm!(
+        // Raw '?' to COM1, then set the reached-flag BEFORE cli (so other cores can observe it).
+        "mov dx, 0x3fd",
+        "88: in al, dx",
+        "test al, 0x20",
+        "jz 88b",
+        "mov dx, 0x3f8",
+        "mov al, 0x3f",   // '?'
+        "out dx, al",
+        "mov byte ptr [{flag}], 1",
+        "cli",
+        // CPL from saved CS at [rsp+8]; swapgs for a ring-3 fault so kill_current reaches per-core GS.
+        "test byte ptr [rsp + 8], 3",
+        "jz 1f",
+        "swapgs",
+        "1:",
+        "mov rdi, [rsp]",       // w0 = RIP
+        "mov rsi, [rsp + 8]",   // w1 = CS
+        "mov rdx, [rsp + 16]",  // w2 = RFLAGS
+        "mov rcx, [rsp + 24]",  // w3 = RSP
+        "mov r8,  [rsp + 8]",   // cs (5th arg) for the kill-vs-halt decision
+        "call exc_dispatch",
+        "2: hlt",
+        "jmp 2b",
+        flag = sym EXCEPTION_HALT_REACHED,
+    )
+}
+
+/// Error-code exception frame: [rsp+0]=err [rsp+8]=RIP [rsp+16]=CS [rsp+24]=RFLAGS.
+#[unsafe(naked)]
+unsafe extern "C" fn exc_stub_ec() -> ! {
+    core::arch::naked_asm!(
+        "mov dx, 0x3fd",
+        "88: in al, dx",
+        "test al, 0x20",
+        "jz 88b",
+        "mov dx, 0x3f8",
+        "mov al, 0x3f",   // '?'
+        "out dx, al",
+        "mov byte ptr [{flag}], 1",
+        "cli",
+        // CPL from saved CS at [rsp+16] (error code pushed first); swapgs for a ring-3 fault.
+        "test byte ptr [rsp + 16], 3",
+        "jz 1f",
+        "swapgs",
+        "1:",
+        "mov rdi, [rsp]",       // w0 = error code
+        "mov rsi, [rsp + 8]",   // w1 = RIP
+        "mov rdx, [rsp + 16]",  // w2 = CS
+        "mov rcx, [rsp + 24]",  // w3 = RFLAGS
+        "mov r8,  [rsp + 16]",  // cs (5th arg)
+        "call exc_dispatch",
+        "2: hlt",
+        "jmp 2b",
+        flag = sym EXCEPTION_HALT_REACHED,
+    )
+}
+
+/// A ring-3 CPU exception (`cs & 3 != 0`) kills the offending task and the system continues
+/// (invariant 12 / §10.3); a ring-0 exception is genuine kernel-state corruption and halts all cores
+/// (§6.2). Lock-free serial: the fault may have interrupted a kprintln holding LOG_LOCK.
+#[no_mangle]
+unsafe extern "C" fn exc_dispatch(w0: u64, w1: u64, w2: u64, w3: u64, cs: u64) -> ! {
+    // SAFETY: raw fault context, IF=0, kernel GS installed (swapgs in the stub for ring-3).
+    unsafe {
+        if cs & 3 != 0 {
+            serial_puts_nolck(b"\nUSER EXCEPTION (killing task): [");
+        } else {
+            serial_puts_nolck(b"\nKERNEL EXCEPTION: [");
+        }
+        serial_hex64_nolck(w0);
+        serial_puts_nolck(b"] [");
+        serial_hex64_nolck(w1);
+        serial_puts_nolck(b"] [");
+        serial_hex64_nolck(w2);
+        serial_puts_nolck(b"] [");
+        serial_hex64_nolck(w3);
+        serial_puts_nolck(b"] cs=");
+        serial_hex64_nolck(cs);
+        serial_puts_nolck(b"\n");
+    }
+    if cs & 3 != 0 {
+        crate::task::kill_current(); // ring-3: task dies, reschedule (does not return for a ring-3 fault)
+    }
+    crate::arch::x86_64::halt_all_cores() // ring-0, or a defensive fall-through
 }

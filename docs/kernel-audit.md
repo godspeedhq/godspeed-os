@@ -28,6 +28,14 @@ reachable (default: not-a-bug unless a concrete trigger exists). Result: **3 con
 
 ### Confirmed violations (fix these)
 
+> **Status (2026-07-11): all 3 FIXED on `feat/dell-wyse-5070-goldmont-plus`.** C1+C2: the CPU-exception
+> vectors 0-31 now discriminate the saved-CS CPL like `pf_handler` - a ring-3 exception (#GP, #DE, #MF,
+> #AC, #XM, ...) calls `kill_current()`; only a ring-0 exception halts (`gpf_stub`/`gpf_handler` +
+> `exc_stub_noec`/`exc_stub_ec`/`exc_dispatch`, wired in `init_idt`). C3: the runtime supervisor respawn
+> calls the non-panicking spawn and re-arms `PENDING` on a transient error instead of `panic!`.
+> Boot-verified no regression; a dedicated adversarial regression test (ring-3 `cli`/`div0` -> task
+> killed, kernel alive) is the follow-up validation.
+
 #### C1. [HIGH] `kernel/src/arch/x86_64/boot.rs:1344` - arch-cpu (hardware-death)
 
 **What.** A #GP raised by ring-3 code dispatches to gpf_stub -> gpf_handler, which UNCONDITIONALLY calls halt_all_cores() - a whole-machine kernel wedge triggered by userspace. Unlike pf_handler (which checks the user/supervisor bit and calls kill_current for ring-3 faults), the #GP path never inspects the saved CS CPL and never kills the offending task.
