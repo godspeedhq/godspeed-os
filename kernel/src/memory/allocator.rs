@@ -46,8 +46,16 @@ fn guard_bugcheck(phys: u64) {
 // ---------------------------------------------------------------------------
 
 const FRAME_SIZE_USIZE: usize = FRAME_SIZE as usize;
-const MAX_FRAMES: usize = (8 * 1024 * 1024 * 1024_usize) / FRAME_SIZE_USIZE;
-const BITMAP_BYTES: usize = MAX_FRAMES / 8; // 256 KiB
+/// The frame allocator manages the first `MAX_FRAMES` physical frames via a fixed static bitmap (no
+/// heap - bounded, visible footprint, §26.6). This is the ceiling on physical RAM the allocator will
+/// USE: a machine with more RAM boots and runs, but frames above this are ignored; a machine with less
+/// works fine (surplus bitmap stays "used"). Raising it is a deliberate knob - the bitmap grows
+/// linearly (RAM / 32 KiB per bitmap, and there are two: BITMAP + KERNEL_PT_PROTECTED). Set to 256 GiB
+/// (8 MiB per bitmap, 16 MiB total .bss - the same order as the 14 MiB kstack pool), covering any real
+/// machine this runs on. Unlike Linux, which sizes per-frame metadata dynamically from detected RAM
+/// (so its cap is architectural, tens of TiB), GodspeedOS keeps the max a single compile-time constant.
+const MAX_FRAMES: usize = (256 * 1024 * 1024 * 1024_usize) / FRAME_SIZE_USIZE;
+const BITMAP_BYTES: usize = MAX_FRAMES / 8; // 8 MiB (256 GiB / 4 KiB / 8)
 
 // 0 = used, 1 = free; zero-init means all used at startup.
 static mut BITMAP: [u8; BITMAP_BYTES] = [0u8; BITMAP_BYTES];
@@ -259,8 +267,8 @@ impl BitmapAllocator {
         // out-of-range frame would allow alloc to return a phantom address,
         // which would then fault the kernel on its next HHDM access.
         // Reject phantom frames above usable RAM, AND any frame at/above the bitmap's capacity
-        // (MAX_FRAMES = 8 GiB). `max_valid_frame` is taken from the memory map UNCLAMPED (init_from_map),
-        // so on a machine with > 8 GiB RAM a corrupt/stale PTE whose index lands in
+        // (MAX_FRAMES). `max_valid_frame` is taken from the memory map UNCLAMPED (init_from_map), so on a
+        // machine with more RAM than MAX_FRAMES covers a corrupt/stale PTE whose index lands in
         // [MAX_FRAMES, max_valid_frame) would otherwise pass the first bound and OOB-index the
         // MAX_FRAMES-sized BITMAP / KERNEL_PT_PROTECTED (the release build compiles out the debug_assert
         // below). The alloc path never returns idx >= MAX_FRAMES (scan is bounded to BITMAP_BYTES;
