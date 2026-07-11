@@ -918,12 +918,13 @@ unsafe fn prepare_ring3_switch(core_id: usize, slot: usize) {
     // 4 KiB Message) still fits comfortably in the 64 KiB kstack below K0T-2048.
     let syscall_rsp = ksp - 2048;
 
-    // SAFETY: PER_CORE_SYSCALL lives in .data; single writer (this core).
+    // SAFETY: syscall_slot(core_id) points at this core's arena slot (or the BSP bootstrap pre-arena);
+    // single writer (this core), per the per-core single-owner invariant.
     unsafe {
-        crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[core_id].kernel_rsp = syscall_rsp;
+        (*crate::arch::x86_64::syscall_entry::syscall_slot(core_id)).kernel_rsp = syscall_rsp;
         // Restore per-task user RSP so SYSRETQ loads the correct stack pointer for
         // this task, not the value left by the last task that ran on this core.
-        crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[core_id].user_rsp =
+        (*crate::arch::x86_64::syscall_entry::syscall_slot(core_id)).user_rsp =
             TASK_USER_RSP[slot];
     }
     // TSS.rsp0 stays at K0T so hardware interrupts (timer ISR) still enter at the top.
@@ -1164,7 +1165,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             // Capture prev's user RSP now (other tasks run before prev is rescheduled, overwriting it).
             if TASK_VALID[prev].load(Ordering::Relaxed) && TASK_IS_USER[prev] {
                 TASK_USER_RSP[prev] =
-                    crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[cid].user_rsp;
+                    (*crate::arch::x86_64::syscall_entry::syscall_slot(cid)).user_rsp;
             }
             let current_ctx: *mut TaskContext = if !TASK_VALID[prev].load(Ordering::Relaxed) {
                 // prev self-killed - discard into CORE_DEAD_CTX (never resumed).
@@ -1236,7 +1237,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             // rescheduled, overwriting PER_CORE_SYSCALL.user_rsp, so capture it now.
             if TASK_VALID[prev].load(Ordering::Relaxed) && TASK_IS_USER[prev] {
                 TASK_USER_RSP[prev] =
-                    crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[cid].user_rsp;
+                    (*crate::arch::x86_64::syscall_entry::syscall_slot(cid)).user_rsp;
             }
             let current_ctx: *mut TaskContext = if !TASK_VALID[prev].load(Ordering::Relaxed) {
                 // prev self-killed (e.g. the supervisor itself) - discard into CORE_DEAD_CTX.
@@ -1301,7 +1302,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         // SYSCALL entry for `prev`, not the value prepare_ring3_switch writes for `next`.
         if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) && TASK_IS_USER[prev] {
             TASK_USER_RSP[prev] =
-                crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[cid].user_rsp;
+                (*crate::arch::x86_64::syscall_entry::syscall_slot(cid)).user_rsp;
         }
 
         // On abort we do not enter `next`; only prepare the ring-3 switch when we
@@ -1423,7 +1424,7 @@ pub fn yield_current() {
         if cid == 0 && prev < MAX_TASKS && crate::task::supervisor_respawn_pending() {
             if TASK_VALID[prev].load(Ordering::Relaxed) && TASK_IS_USER[prev] {
                 TASK_USER_RSP[prev] =
-                    crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[cid].user_rsp;
+                    (*crate::arch::x86_64::syscall_entry::syscall_slot(cid)).user_rsp;
             }
             let current_ctx: *mut TaskContext = if !TASK_VALID[prev].load(Ordering::Relaxed) {
                 CORE_DEAD_CTX.as_mut_ptr(cid)   // prev self-killed - discard (never resumed)
@@ -1456,7 +1457,7 @@ pub fn yield_current() {
         // entry, not the value prepare_ring3_switch is about to write for `next`.
         if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) && TASK_IS_USER[prev] {
             TASK_USER_RSP[prev] =
-                crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[cid].user_rsp;
+                (*crate::arch::x86_64::syscall_entry::syscall_slot(cid)).user_rsp;
         }
 
         if TASK_IS_USER[next] {
@@ -2095,7 +2096,7 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
         // load this task's RSP, not the value another task wrote to PER_CORE_SYSCALL.
         if TASK_IS_USER[slot] {
             TASK_USER_RSP[slot] =
-                crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[cid].user_rsp;
+                (*crate::arch::x86_64::syscall_entry::syscall_slot(cid)).user_rsp;
         }
 
         match pick_next(cid) {

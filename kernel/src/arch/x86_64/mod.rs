@@ -147,37 +147,12 @@ fn collect_boot_info() -> BootInfo {
         .map(|r| r.address as u64)
         .unwrap_or(0);
 
-    // Collect non-BSP LAPIC IDs from the SMP response.
-    // The AP-id buffer holds up to the MAX_CORES sanity ceiling worth of APs (BSP excluded). A machine
-    // with more cores is capped here - loudly (§26.7), never silently.
-    const MAX_AP_IDS: usize = crate::smp::core::MAX_CORES - 1;
-    static mut AP_ID_BUF: [u32; MAX_AP_IDS] = [0u32; MAX_AP_IDS];
-    let mut ap_count = 0usize;
-    let mut dropped = 0usize;
-
+    // Record the BSP local-APIC id so legacy-INTx (EHCI) routes target the right LAPIC. The AP list
+    // itself is NOT staged into a fixed buffer here (that used to cap cores at a compile-time ceiling):
+    // `start_all_aps` walks Limine's live `cpus()` slice directly, and `ap_count()` counts it on demand,
+    // so the machine's real core count - whatever it is - is the only bound (§26.6.1; no MAX_CORES).
     if let Some(mp) = SMP_REQUEST.response() {
-        let bsp_lapic = mp.bsp_lapic_id;
-        // Record the BSP local-APIC id so legacy-INTx (EHCI) routes target the right LAPIC.
-        crate::arch::x86_64::ioapic::set_bsp_lapic_id(bsp_lapic as u8);
-        for cpu in mp.cpus() {
-            if cpu.lapic_id != bsp_lapic {
-                if ap_count < MAX_AP_IDS {
-                    // SAFETY: single-threaded boot path.
-                    unsafe { AP_ID_BUF[ap_count] = cpu.lapic_id; }
-                    ap_count += 1;
-                } else {
-                    dropped += 1;
-                }
-            }
-        }
-    }
-    if dropped > 0 {
-        crate::kprintln!(
-            "smp: machine has {} cores; this build handles {} (MAX_CORES) - {} unused",
-            ap_count + 1 + dropped,
-            crate::smp::core::MAX_CORES,
-            dropped
-        );
+        crate::arch::x86_64::ioapic::set_bsp_lapic_id(mp.bsp_lapic_id as u8);
     }
 
     // Compute the physical range of the kernel image so the frame allocator
@@ -203,8 +178,6 @@ fn collect_boot_info() -> BootInfo {
     BootInfo {
         // SAFETY: MAP_BUF written above in single-threaded boot; slice is valid for kernel lifetime.
         memory_map: unsafe { &MAP_BUF[..count] },
-        // SAFETY: AP_ID_BUF written above in single-threaded boot; slice is valid for kernel lifetime.
-        ap_ids: unsafe { &AP_ID_BUF[..ap_count] },
         kernel_phys_start,
         kernel_phys_end,
         hhdm_offset,
@@ -217,10 +190,35 @@ fn collect_boot_info() -> BootInfo {
 // ---------------------------------------------------------------------------
 
 /// Boot information passed from the bootloader to `kernel_main`.
+/// The highest local-APIC ID the kernel's **xAPIC** IPI path can address: the ICR destination field is
+/// 8 bits (`(lapic_id & 0xFF) << 24`). A core whose Limine LAPIC id exceeds this cannot receive a
+/// TARGETED IPI (cross-core wake, scheduler tick), so it is excluded - loudly (§26.7) - rather than
+/// silently mis-addressed. This is a genuine hardware-addressing limit (lifted only by x2APIC's 32-bit
+/// addressing, a future arch change), NOT a software array bound: the per-core arenas are themselves
+/// unbounded and size to whatever count survives this filter (§26.6.1).
+pub const XAPIC_MAX_LAPIC_ID: u32 = 0xFF;
+
+/// The number of Application Processors (non-BSP cores) Limine reports that the kernel can actually
+/// address, counted live from its `cpus()` slice - no fixed ceiling beyond the xAPIC addressing limit
+/// above. Valid for the kernel lifetime (Limine's SMP response lives in bootloader-reclaimable RAM,
+/// which the allocator never opens). `start_all_aps` applies the SAME filter, so `num_cores` and the
+/// cores actually started agree.
+pub fn ap_count() -> usize {
+    match SMP_REQUEST.response() {
+        Some(mp) => {
+            let bsp = mp.bsp_lapic_id;
+            mp.cpus()
+                .iter()
+                .filter(|c| c.lapic_id != bsp && c.lapic_id <= XAPIC_MAX_LAPIC_ID)
+                .count()
+        }
+        None => 0,
+    }
+}
+
 #[repr(C)]
 pub struct BootInfo {
     pub memory_map: &'static [MemoryRegion],
-    pub ap_ids: &'static [u32],
     pub kernel_phys_start: u64,
     pub kernel_phys_end: u64,
     /// Base virtual address of Limine's higher-half direct map (HHDM).

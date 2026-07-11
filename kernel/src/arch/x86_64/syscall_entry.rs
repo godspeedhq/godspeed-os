@@ -5,8 +5,6 @@
 //! loads the per-task kernel RSP, then calls `syscall_handler`. On return
 //! the inverse happens and SYSRETQ re-enters ring-3.
 
-const MAX_CORES: usize = crate::smp::core::MAX_CORES;
-
 /// Per-core data accessed via the GS base register in the SYSCALL stub.
 ///
 /// Layout is fixed: offset 0 = user_rsp, offset 8 = kernel_rsp.
@@ -17,10 +15,44 @@ pub struct PerCoreSyscallData {
     pub kernel_rsp: u64,   // offset 8 - pre-loaded kernel stack top for current task
 }
 
-// Lives in .data (writable) - the stub writes user_rsp on every SYSCALL entry.
+/// Per-core SYSCALL GS data, sized to the cores Limine reported (`init_percore_syscall_arena`), NOT a
+/// fixed `[_; MAX_CORES]`. Each core's GS.base points at ITS slot (set in `init_per_core_syscall`), so
+/// the stub only ever touches its own via `gs:[0]`/`gs:[8]` - the arena is indexed by core id only when
+/// (re)pointing GS. Dynamic so a machine with any number of cores gets a slot each (§26.6.1).
+static PER_CORE_SYSCALL: crate::smp::percpu::PerCoreMut<PerCoreSyscallData> =
+    crate::smp::percpu::PerCoreMut::new();
+
+// BSP bootstrap slot. `init_bsp` sets the BSP's syscall GS *before* the frame allocator exists (so
+// before the arena), but no ring-3 task - hence no SYSCALL, hence no write to this slot - runs until
+// long after `percpu_init` has allocated the arena and re-pointed the BSP's GS to `arena[0]`. So this
+// slot is only ever the BSP's, only in that pre-arena boot window, and is never actually written.
+// In .data (writable) because the SYSCALL stub would write user_rsp through GS.
 #[link_section = ".data"]
-pub static mut PER_CORE_SYSCALL: [PerCoreSyscallData; MAX_CORES] =
-    [const { PerCoreSyscallData { user_rsp: 0, kernel_rsp: 0 } }; MAX_CORES];
+static mut BSP_SYSCALL: PerCoreSyscallData = PerCoreSyscallData { user_rsp: 0, kernel_rsp: 0 };
+
+/// Raw pointer to core `core_id`'s syscall slot: the arena once it exists, else the BSP bootstrap slot
+/// (core 0 only, pre-`percpu_init`). Safe to CALL (forms no reference); callers deref under the per-core
+/// single-owner invariant (a core only ever touches its own slot).
+#[inline]
+pub fn syscall_slot(core_id: usize) -> *mut PerCoreSyscallData {
+    if PER_CORE_SYSCALL.initialised() {
+        PER_CORE_SYSCALL.as_mut_ptr(core_id)
+    } else {
+        debug_assert!(core_id == 0, "pre-arena syscall slot is BSP-only");
+        core::ptr::addr_of_mut!(BSP_SYSCALL)
+    }
+}
+
+/// Allocate the per-core syscall GS arena for `n` cores and re-point the BSP's GS from the bootstrap
+/// slot to `arena[0]`. Call ONCE at boot (`smp::percpu_init`), after the frame allocator is up and
+/// before any ring-3 task (hence any SYSCALL) runs. APs point their GS at `arena[core_id]` later, in
+/// `init_per_core_syscall` from `ap_init`.
+pub fn init_percore_syscall_arena(n: usize) {
+    PER_CORE_SYSCALL.init_with(n, |_| PerCoreSyscallData { user_rsp: 0, kernel_rsp: 0 });
+    // SAFETY: boot-time, BSP only, before any ring-3/syscall; the arena is now initialised so
+    // `syscall_slot(0)` returns `arena[0]`. Re-points MSR_GS_BASE + KERNEL_GS_BASE to it.
+    unsafe { init_per_core_syscall(0); }
+}
 
 /// Initialise per-core GS MSRs for the SYSCALL stub.
 ///
@@ -42,7 +74,7 @@ pub static mut PER_CORE_SYSCALL: [PerCoreSyscallData; MAX_CORES] =
 pub unsafe fn init_per_core_syscall(core_id: usize) {
     // SAFETY: WRMSR in ring-0 is always valid.
     unsafe {
-        let ptr = &raw const PER_CORE_SYSCALL[core_id] as u64;
+        let ptr = syscall_slot(core_id) as u64;
 
         // MSR_GS_BASE = kernel ptr - establishes the ring-0 GS invariant.
         core::arch::asm!(

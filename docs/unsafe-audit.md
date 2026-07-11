@@ -8,6 +8,26 @@ unless this file is updated in the same commit with a written SAFETY argument.**
 
 ---
 
+## 2026-07-11 - core count fully dynamic (MAX_CORES ceiling removed)
+
+Every remaining fixed `[_; MAX_CORES]` per-core structure became a boot arena sized to the machine's
+real core count, and the `MAX_CORES` sanity ceiling was deleted. All changes are in the permitted
+`arch/`/`smp/` layers, each block carrying a `// SAFETY:` comment.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/x86_64/mod.rs` | 35 → 33 (-2) | The fixed `AP_ID_BUF: [u32; MAX_CORES-1]` staging buffer (2 single-threaded-boot `unsafe` writes) is gone: `start_all_aps` already walks Limine's live `cpus()` slice directly, and the new `ap_count()` counts it on demand, so no AP list is staged. Net -2. |
+| `arch/x86_64/syscall_entry.rs` | 14 → 15 (+1) | `PER_CORE_SYSCALL` moved from a `[_; MAX_CORES]` `.data` array to a `PerCoreMut` boot arena, with a `BSP_SYSCALL` bootstrap slot for the pre-arena window (the BSP sets its syscall GS in `init_bsp`, before the allocator). The +1 is `syscall_slot`'s `addr_of_mut!(BSP_SYSCALL)` fallback; the arena's own `unsafe` lives in `smp/percpu.rs`. |
+| `smp/ipi.rs` | 23 → 25 (+2) | The TLB-shootdown ack bitmask was a fixed `PerCore<[AtomicU64; MAX_WORDS]>` (`MAX_WORDS = ceil(MAX_CORES/64)`); it is now two FLAT `num_cores * ceil(num_cores/64)` `AtomicU64` arenas (ACK + EXPECTED), so the per-initiator mask WIDTH scales with the real core count. The +2 is the `ack_word`/`exp_word` accessors (`&*base.add(initiator*wpc + word)`); the arenas are carved by `percpu::alloc_atomic_u64_slice`. |
+| `smp/percpu.rs` | 6 → 8 (+2) | New `alloc_atomic_u64_slice(n, init)` - carves a flat `[AtomicU64; n]` from the frame allocator (2 blocks: `ptr::write` init loop + `from_raw_parts`) for the dynamic-width shootdown masks, which no fixed `PerCore<[_; K]>` can size. Plus `PerCoreMut::initialised()` (safe). |
+
+Net across the four: +3. `MAX_CORES` is deleted entirely - nothing is a fixed per-core array. The only
+ceiling left is a genuine hardware one: the xAPIC IPI destination field is 8-bit, so a core with LAPIC
+id > 255 is excluded LOUDLY (§26.7) until the APIC layer gains x2APIC. Validated: identity 24/24, adv
+15/15, QEMU boot 1..128 cores + a 72-core 2-word-shootdown restart, arenas carve for 260 cores.
+
+---
+
 ## 2026-07-11 - per-core user-copy arenas (RAM-sized, not [_; MAX_CORES])
 
 | File | Change | Why |
@@ -170,19 +190,19 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/interrupts.rs | 21 | permitted |
 | arch/x86_64/ioapic.rs | 8 | permitted |
 | arch/x86_64/iommu.rs | 74 | permitted |
-| arch/x86_64/mod.rs | 35 | permitted |
+| arch/x86_64/mod.rs | 33 | permitted |
 | arch/x86_64/page_tables.rs | 41 | permitted |
 | arch/x86_64/pci.rs | 19 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |
-| arch/x86_64/syscall_entry.rs | 14 | permitted |
+| arch/x86_64/syscall_entry.rs | 15 | permitted |
 | capability/table.rs | 7 | permitted |
 | memory/allocator.rs | 44 | permitted |
 | memory/frame.rs | 1 | permitted |
 | memory/mod.rs | 1 | permitted |
 | memory/page.rs | 1 | permitted |
-| smp/ipi.rs | 23 | permitted |
+| smp/ipi.rs | 25 | permitted |
 | smp/mod.rs | 1 | permitted |
-| smp/percpu.rs | 6 | permitted |
+| smp/percpu.rs | 8 | permitted |
 | smp/placement.rs | 1 | permitted |
 | smp/spinlock.rs | 9 | permitted |
 | interrupt/route.rs | 1 | grandfathered |

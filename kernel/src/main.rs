@@ -208,8 +208,8 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     memory::init(boot_info);
 
     // Size the per-core arenas (§26.6.1) to the cores Limine reported, now that the frame allocator
-    // is up - before anything per-core (the supervisor spawn, the APs) can touch them. Replaces the
-    // fixed `[_; MAX_CORES]` statics with boot-sized arenas; MAX_CORES stays a loud sanity ceiling.
+    // is up - before anything per-core (the supervisor spawn, the APs) can touch them. Every per-core
+    // structure is a boot arena sized to the machine's real core count; there is no fixed ceiling.
     smp::percpu_init(boot_info);
     // Task-layer per-core arenas (scheduler contexts + the deferred kstack-free list), sized to the
     // same N. Kept here (not inside percpu_init) so smp/ does not up-call into task/.
