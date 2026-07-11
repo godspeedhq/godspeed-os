@@ -150,7 +150,14 @@ that was an open follow-up (`project_kernel_pf_reclaim_guard`).
 
 ### Confirmed violations (fix these)
 
-> **Status (2026-07-11): recorded; fixes staged next.**
+> **Status (2026-07-11): ALL 3 FIXED on `feat/dell-wyse-5070-goldmont-plus`.** V3 scheduler UAF
+> (`2c402ec`): CAS-claim + Dekker re-check (all four handshake accesses SeqCst) so a cross-core kill
+> can never free a task mid-switch. V2 spawn leak (`e907e43`): `cleanup_partial_spawn` unwinds the
+> endpoint registrations on every post-reservation error path. V1 user-copy halt (`6a0cbb9`): a per-core
+> `USER_COPY_ACTIVE` guard + a `pf_handler` branch kill the caller on a bad user pointer instead of
+> halting. Identity 24/24 after each. V3's race needs real multi-core HW to exercise, so its final
+> validation is a Wyse/T630 chaos storm; V1/V2 are QEMU-testable (a dedicated A15 regression is a
+> follow-up, like A14).
 
 #### V1. [HIGH] `kernel/src/arch/x86_64/syscall_entry.rs:105` + `:114` - user-copy fault halts the machine (unsafe-reverify)
 
