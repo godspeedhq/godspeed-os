@@ -1580,15 +1580,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 continue;
                             }
                             if devs[d].is_mouse {
-                                mouse[d].feed(
-                                    &rep,
-                                    |mask, down| ctx.log_fmt(format_args!(
-                                        "xhci: mouse {} {}",
-                                        godspeed_sdk::hid::button_name(mask),
-                                        if down { "down" } else { "up" })),
-                                    |dx, dy| ctx.log_fmt(format_args!(
-                                        "xhci: mouse moved dx={} dy={}", dx, dy)),
-                                );
+                                // Drain the mouse report (keeps the endpoint moving) but do NOT log every
+                                // button/move: GodspeedOS has no cursor or mouse consumer yet, so those
+                                // callbacks were pure bring-up diagnostics that FLOOD the console on every
+                                // movement (looks like a freeze under a scrolling framebuffer). When a real
+                                // mouse consumer exists, wire it into these callbacks instead of logging.
+                                mouse[d].feed(&rep, |_mask, _down| {}, |_dx, _dy| {});
                             } else {
                                 // Ctrl+Alt+Del = secure-attention reboot, from any context. Checked
                                 // only for keyboard reports (a mouse button byte can alias the
