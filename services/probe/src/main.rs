@@ -163,6 +163,8 @@ const MODE_CHAOS_C2_MON:    u32 = 92; // 1,000 yields then log pass (C2 witness)
 const MODE_ADV_FAULT_GP:    u32 = 210; // ring-3 #GP (non-canonical read) → kernel kills service
 const MODE_ADV_FAULT_DE:    u32 = 211; // ring-3 #DE (inline-asm div0)    → kernel kills service
 const MODE_ADV_FAULT_MON:   u32 = 212; // witness: yields then logs pass (system survived both faults)
+const MODE_ADV_FAULT_UC:    u32 = 213; // A15/V1: bad user pointer to `log` → kernel kills caller (USER-COPY PF)
+const MODE_ADV_FAULT_UC_MON: u32 = 214; // A15 witness: yields then logs pass (system survived the user-copy fault)
 const MODE_CHAOS_C3:        u32 = 93; // 500 alloc-deny cycles without panic
 const MODE_CHAOS_C5:        u32 = 94; // 100-level recursive yield_cpu(); stack depth probe
 const MODE_CHAOS_C6_MON:    u32 = 95; // 200 yields then log pass on core 0 (C6 witness)
@@ -409,6 +411,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         MODE_ADV_FAULT_GP    => mode_adv_fault_gp(&ctx),
         MODE_ADV_FAULT_DE    => mode_adv_fault_de(&ctx),
         MODE_ADV_FAULT_MON   => mode_adv_fault_mon(&ctx),
+        MODE_ADV_FAULT_UC    => mode_adv_fault_usercopy(&ctx),
+        MODE_ADV_FAULT_UC_MON => mode_adv_fault_usercopy_mon(&ctx),
         _                    => idle(&ctx),
     }
 }
@@ -2073,6 +2077,27 @@ fn mode_adv_fault_mon(ctx: &ServiceContext) -> ! {
     // line would never print (the test times out / trips its KERNEL-fault fail_on).
     for _ in 0..1000u32 { ctx.yield_cpu(); }
     ctx.log("adv: A14 pass - ring-3 #GP + #DE killed the task, kernel alive");
+    idle(ctx)
+}
+
+fn mode_adv_fault_usercopy(_ctx: &ServiceContext) -> ! {
+    // A15 - V1 (kernel-audit-2): pass an in-range but UNMAPPED user pointer to a syscall that copies it.
+    // log (syscall 5) = handle_log(cap_slot, msg_ptr, msg_len): cap_slot 0 is the log_write cap every
+    // service holds; msg_ptr 0x1000 is < USER_END so validate_user_ptr accepts the RANGE, but the page is
+    // unmapped; len 16. read_user_bytes then copies from 0x1000 into the kernel scratch and faults at
+    // CPL0. The kernel must attribute it to THIS caller ("USER-COPY PF (killing caller)") and KILL us -
+    // never treat it as a KERNEL PF and halt_all_cores (the whole-machine DoS any bad pointer used to be).
+    // SAFETY: intentional bad-pointer syscall for regression test A15; the kernel kills the task mid-copy.
+    unsafe { let _ = probe_raw_syscall(5, 0, 0x1000, 16); }
+    loop { core::hint::spin_loop(); }
+}
+
+fn mode_adv_fault_usercopy_mon(ctx: &ServiceContext) -> ! {
+    // A15 witness: the faulter passes a bad pointer to `log` on another core; yield long enough for it to
+    // fault and be killed, then log pass - proving the kernel killed the CALLER at the user-copy rather
+    // than halting (invariant 12; kernel-audit V1). A wrong fix halts every core and this never prints.
+    for _ in 0..1000u32 { ctx.yield_cpu(); }
+    ctx.log("adv: A15 pass - bad user pointer killed the caller, kernel alive");
     idle(ctx)
 }
 

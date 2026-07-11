@@ -749,6 +749,10 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("adv-fault-gp");
     let _ = ctx.spawn("adv-fault-de");
     let _ = ctx.spawn("adv-fault-mon");
+    // A15 (kernel-audit V1 regression): a bad user pointer to a syscall must kill the CALLER, not halt
+    // the machine. A faulter (bad ptr to `log`) + a monitor that witnesses the system surviving.
+    let _ = ctx.spawn("adv-fault-usercopy");
+    let _ = ctx.spawn("adv-fault-usercopy-mon");
 }
 
 // fuzz-only: spawn only the §22 fuzz probe services (F1/F2/F5/F6/F7/F8 + brutal

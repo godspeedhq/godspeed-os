@@ -2470,6 +2470,30 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
+        // A15 (kernel-audit V1 regression): a bad user pointer to a syscall must kill the CALLER, not
+        // halt the machine. A faulter (bad ptr to `log`) + a monitor that witnesses the system surviving.
+        "adv-fault-usercopy" => Some(("adv-fault-usercopy", ServiceConfig {
+            elf:               PROBE_ELF,
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        213, // ADV_FAULT_UC: bad user pointer to log → killed via USER-COPY PF
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
+        "adv-fault-usercopy-mon" => Some(("adv-fault-usercopy-mon", ServiceConfig {
+            elf:               PROBE_ELF,
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        214, // ADV_FAULT_UC_MON: yields then logs the A15 pass
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
         // C3: alloc saturation. Tight 4 MiB limit so impossible requests are denied quickly.
         "chaos-c3" => Some(("chaos-c3", ServiceConfig {
             elf:               PROBE_ELF,
