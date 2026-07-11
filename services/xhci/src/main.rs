@@ -83,6 +83,12 @@ const MAX_HID: usize = 2;
 /// per-machine calibration needed. read_tsc is hardware-proven to advance (perf §22).
 const REPEAT_INITIAL_CYCLES: u64 = 600_000_000;
 const REPEAT_INTERVAL_CYCLES: u64 = 100_000_000;
+/// Recovery hold after a root-port reset before addressing the device (Item 3, Fix 3). USB 2.0 requires
+/// a reset-recovery interval (TRSTRCY >= 10 ms) before a device can accept transactions; without it a
+/// high-speed root-port device (the Wyse's port 6) NAKs/times out on the Address Device SET_ADDRESS and
+/// returns a Transaction Error (completion=4). ~50-65 ms at ~1.5-2 GHz, matching the behind-a-hub reset
+/// hold; TSC-paced (always runs) and bounded (no heap, no spin on a device register).
+const RESET_RECOVERY_CYCLES: u64 = 100_000_000;
 /// How often the poll loop GET_STATUSes a hub's downstream port to notice a device unplugged from
 /// behind it (no root PORTSC reflects that). ~0.5 s at ~1.5-2 GHz - responsive enough for a "keyboard
 /// disconnected" notice, infrequent enough not to load the hub or eat keystrokes off the shared event
@@ -866,6 +872,12 @@ fn enumerate_one(
     if psc & PORT_PED == 0 {
         mmio.write32(portsc_off, (psc & !PORT_RW1C) | PORT_PR);
         spin(|| mmio.read32(portsc_off) & PORT_PED != 0);
+        // Reset-recovery hold before we address the device (Fix 3): PED asserting does not mean the
+        // device is ready for the SET_ADDRESS of Address Device. A high-speed root-port device (the
+        // Wyse's port 6) returns a Transaction Error (completion=4) without this; the behind-a-hub path
+        // already holds here. Bounded, TSC-paced.
+        let t0 = ctx.read_tsc();
+        while ctx.read_tsc().wrapping_sub(t0) < RESET_RECOVERY_CYCLES {}
     }
     let psc = mmio.read32(portsc_off);
     let speed = (psc >> 10) & 0xF;
