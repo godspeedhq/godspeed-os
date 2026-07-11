@@ -1165,9 +1165,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         spin(|| mmio.read32(op + OP_USBSTS) & STS_HCH != 0);
         ctx.log_fmt(format_args!("xhci: reset: halted (USBSTS={:#010x})", mmio.read32(op + OP_USBSTS)));
         mmio.write32(op + OP_USBCMD, CMD_HCRST);
-        spin(|| {
-            mmio.read32(op + OP_USBCMD) & CMD_HCRST == 0 && mmio.read32(op + OP_USBSTS) & STS_CNR == 0
-        });
+        // xHCI 5.4.1/5.4.2: after HCRST the controller asserts CNR (Controller Not Ready) and software
+        // must NOT access any Operational register - INCLUDING USBCMD - until CNR clears; only USBSTS is
+        // safe to read while the HC is not ready. The old poll read USBCMD FIRST each iteration (an
+        // Operational-register access mid-reset), which on the Wyse's Goldmont+ HC intermittently WEDGED
+        // THE PCI BUS - freezing every core (the `chaos max-carnage` all-core hang, pinpointed to exactly
+        // here: the log died between "halted" and "done"). A userspace driver must never be able to lock
+        // the platform; touching a register the HC forbids mid-reset was ours to fix. So: settle briefly
+        // (let CNR assert), wait for CNR to clear reading ONLY USBSTS, THEN read USBCMD to confirm HCRST
+        // cleared - USBCMD is never touched while the controller is not ready.
+        let t0 = ctx.read_tsc();
+        while ctx.read_tsc().wrapping_sub(t0) < 2_000_000 {} // ~1-2 ms settle (bounded; TSC always runs)
+        spin(|| mmio.read32(op + OP_USBSTS) & STS_CNR == 0);
+        spin(|| mmio.read32(op + OP_USBCMD) & CMD_HCRST == 0);
         ctx.log_fmt(format_args!(
             "xhci: reset: done (USBCMD={:#010x} USBSTS={:#010x})",
             mmio.read32(op + OP_USBCMD), mmio.read32(op + OP_USBSTS)
