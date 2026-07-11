@@ -38,14 +38,18 @@ const PACE_YIELDS: u32 = 3000;      // a beat between rounds so the panel/log st
 const MEMP_CHUNK: usize = 64 * 1024; // one mem-pressure round allocs this (held; chaos's limit bounds it)
 const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]; // matches the `date` utility
 
-// The full restartable target set for the DEFAULT (no-target) RANDOM storm - every service the system
-// can bring back (the supervisor via the kernel, everything else via the supervisor). NOTHING is
-// protected-last: the supervisor is a normal victim at any point, because the fixed-point robustness must
-// recover from ANY kill order. Forcing supervisor-last would contrive the recovery (Test 15 / Cmd II -
-// let Chaos try its hardest); random destruction is the honest stress.
-const RESTARTABLE: [&str; 9] = [
-    "supervisor", "shell", "block-driver", "fs", "xhci", "ehci", "logger", "nic-driver", "net-stack",
-];
+// Chaos DISCOVERS its victims by scanning the live task table each round - it never hardcodes a service
+// list. A hardcoded set goes stale the moment the running set changes (a driver the hardware lacks, like
+// `ehci` on a box with no EHCI controller; or a newly added service), producing phantom "kills" of a
+// service that was never alive. The only names the scan skips are chaos's OWN untouchables: `chaos`
+// itself (a self-kill would end the run) and the transient tasks it spawns as attacks (`mem-pressure`,
+// including the spawn-storm) or that are ephemeral (`observe-*`). Everything else that is live is fair
+// game - and NOTHING is protected-last: the supervisor is a normal victim at any point, because the
+// fixed-point robustness must recover from ANY kill order (Test 15 / Cmd II - let Chaos try its
+// hardest); random destruction is the honest stress.
+fn is_transient(name: &str) -> bool {
+    name == "chaos" || name == "mem-pressure" || name.starts_with("observe")
+}
 
 // A tiny xorshift64 PRNG - there is no std rng in no_std. Seeded from the RTC start time (varies run to
 // run; the TSC is broken on the T630 so we do NOT seed from it) and advanced every round, so the random
@@ -231,20 +235,32 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut cand: [([u8; 24], usize); MAX_CAND] = [([0u8; 24], 0usize); MAX_CAND];
         let mut ncand = 0usize;
         if target_random {
-            // RANDOM subset of the restartable set this round - vary WHICH and HOW MANY. Each service is in
-            // with ~50% probability (a fresh PRNG draw); if none were picked, take one random victim so a
-            // round is never a no-op. Only LIVE ones actually die (a kill of a dead/absent name is a no-op),
-            // so a build without a service just skips it. Supervisor included at any point - no protected-last.
-            for &svc in RESTARTABLE.iter() {
-                if (rng.next() & 1) == 1 && ncand < MAX_CAND {
-                    let b = svc.as_bytes(); let l = b.len().min(24);
+            // DYNAMIC victim set: SCAN the live task table (no hardcoded service list - a driver the
+            // hardware lacks simply isn't found, so it can't be phantom-killed) and take a RANDOM subset
+            // this round - vary WHICH and HOW MANY, each live non-transient service in with ~50%
+            // probability (a fresh PRNG draw). Supervisor included at any point - no protected-last.
+            for slot in 0..256u32 {
+                if ncand >= MAX_CAND { break; }
+                let st = ctx.task_stat(slot);
+                if !st.valid || st.state == 4 /* Dead */ { continue; }
+                let nm = st.name_str();
+                if is_transient(nm) { continue; }
+                if (rng.next() & 1) == 1 {
+                    let b = nm.as_bytes(); let l = b.len().min(24);
                     cand[ncand].0[..l].copy_from_slice(&b[..l]); cand[ncand].1 = l; ncand += 1;
                 }
             }
+            // If the coin flips picked nothing, take the first live victim so a round is never a no-op.
             if ncand == 0 {
-                let pick = (rng.next() as usize) % RESTARTABLE.len();
-                let b = RESTARTABLE[pick].as_bytes(); let l = b.len().min(24);
-                cand[0].0[..l].copy_from_slice(&b[..l]); cand[0].1 = l; ncand = 1;
+                for slot in 0..256u32 {
+                    let st = ctx.task_stat(slot);
+                    if !st.valid || st.state == 4 { continue; }
+                    let nm = st.name_str();
+                    if is_transient(nm) { continue; }
+                    let b = nm.as_bytes(); let l = b.len().min(24);
+                    cand[0].0[..l].copy_from_slice(&b[..l]); cand[0].1 = l; ncand = 1;
+                    break;
+                }
             }
         } else if target_list {
             // Multi-target: every listed service is a candidate this round (all killed below).
