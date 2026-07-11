@@ -34,6 +34,17 @@ pub fn registered_endpoint(irq: u8) -> Option<EndpointId> {
     IRQ_TABLE.lock()[irq as usize]
 }
 
+/// Remove the driver endpoint registered for `irq` (driver-death quiesce, §12).
+///
+/// Called on driver death so a route to the dead driver's endpoint is cleared before the
+/// endpoint id is freed and REUSED. `IRQ_TABLE` stores a bare `EndpointId` (no generation),
+/// so a reused id would otherwise inherit the dead driver's interrupts;
+/// `enqueue_from_interrupt`'s liveness check only covers the still-Dead window, not a reused
+/// id. Safe no-op if nothing was registered; the respawned driver re-registers.
+pub fn unregister(irq: u8) {
+    IRQ_TABLE.lock()[irq as usize] = None;
+}
+
 /// Deliver IRQ `irq` to the registered driver as an IPC message.
 ///
 /// # Safety

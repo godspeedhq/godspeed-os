@@ -1763,6 +1763,26 @@ pub fn kill_task_by_slot(slot: usize) {
             // re-registers on respawn; clients briefly see a lookup miss and retry.
             crate::ipc::names::unregister_endpoint(task_name, ep_id);
 
+            // Driver-death IRQ-route teardown (Item 2, driver-death quiesce), BEFORE freeing the id.
+            // A driver that registered a hw_interrupt line left a route in IRQ_TABLE; the id is about to
+            // be freed and REUSED, and IRQ_TABLE keys on a bare endpoint id, so a reused id could inherit
+            // the dead driver's interrupts. Clear the route and mask the line now (while the id is still
+            // ours); the respawned driver re-registers and re-opens its gate. The vectors mirror the
+            // ServiceConfig hw_irqs (task/mod.rs) - the same by-name device coupling the DMA-quiesce block
+            // below already uses; block-driver + nic-driver currently declare no hw_irq.
+            let dead_irq: u8 = match task_name {
+                "xhci" => 0x28,
+                "ehci" => 0x29,
+                _ => 0xFF,
+            };
+            if dead_irq != 0xFF {
+                crate::interrupt::route::unregister(dead_irq);
+                // Mask the source: effective for a level/INTx line (the ehci); a no-op for edge/MSI (the
+                // xhci), whose stray MSI is already harmless once the route is None (deliver finds no
+                // endpoint) and stops at the respawned driver's HCRST.
+                crate::arch::x86_64::ioapic::mask_vector(dead_irq);
+            }
+
             // Reclaim the endpoint id itself for reuse (§14.2). Its routing entry is Dead and its
             // resource generation is bumped, so handing the id out again is safe: the next endpoint to
             // take it is seeded at a strictly higher generation (task::spawn), so a stale cap to this
@@ -1833,18 +1853,22 @@ pub fn kill_task_by_slot(slot: usize) {
         // remaining work + the spin-wait); the respawned driver re-enables bus-mastering during init.
         // block-driver (AHCI) is included; xhci is confined (its stray DMA would fault, not corrupt) but
         // quiescing it too is harmless + correct on a no-IOMMU machine where it is passthrough as well.
-        if task_name == "xhci" || task_name == "ehci" || task_name == "block-driver" {
+        if task_name == "xhci" || task_name == "ehci" || task_name == "block-driver"
+            || task_name == "nic-driver"
+        {
             use core::sync::atomic::Ordering::Relaxed;
             use crate::arch::x86_64::pci;
             let bdf = match task_name {
-                "xhci" => pci::XHCI_BDF.load(Relaxed),
-                "ehci" => pci::EHCI_BDF.load(Relaxed),
-                _      => pci::AHCI_BDF.load(Relaxed), // block-driver
+                "xhci"       => pci::XHCI_BDF.load(Relaxed),
+                "ehci"       => pci::EHCI_BDF.load(Relaxed),
+                "nic-driver" => pci::NIC_BDF.load(Relaxed),
+                _            => pci::AHCI_BDF.load(Relaxed), // block-driver
             };
             pci::clear_bus_master(bdf);
             // H1: revert the IOMMU DTE to passthrough + free the I/O page table so a restart re-confines
-            // cleanly (no-op if the device wasn't confined). xhci/ehci only; AHCI has no IOMMU domain yet.
-            if task_name != "block-driver" {
+            // cleanly (no-op if the device wasn't confined). Confined USB drivers (xhci/ehci) only; AHCI
+            // + nic-driver run in IOMMU passthrough, so there is no DTE to revert.
+            if task_name == "xhci" || task_name == "ehci" {
                 crate::arch::x86_64::iommu::release_device(bdf);
             }
         }
