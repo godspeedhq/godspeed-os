@@ -8,6 +8,15 @@ unless this file is updated in the same commit with a written SAFETY argument.**
 
 ---
 
+## 2026-07-11 - kernel-audit fixes: user-copy fault guard (V1) + exception-handler backfill
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/x86_64/syscall_entry.rs` | 13 → 15 (+2) | **V1 (kernel-audit-2): user-copy fault guard.** `read_user_bytes` no longer returns a borrowed raw-user slice; it copies the user bytes into a per-core kernel scratch under a `USER_COPY_ACTIVE` guard and returns a slice into the SCRATCH (so no caller ever dereferences raw user memory). The net +2 is: `read_user_bytes` now has 3 blocks (`addr_of_mut!` on the per-core scratch, `copy_nonoverlapping` for the guarded copy, `from_raw_parts` for the returned slice) vs 1 before; `write_user_bytes` keeps its 1 `copy_nonoverlapping` block. Each has a `// SAFETY:` comment. The guard makes a fault on a range-valid-but-unmapped user pointer recoverable (pf_handler kills the caller) instead of a whole-machine halt. Permitted arch layer. |
+| `arch/x86_64/boot.rs` | 84 → 90 (+6) | **Backfill (not this change):** reconciles the C1/C2 exception-kill handlers added earlier this session by `af74086` (`gpf_stub` / `gpf_handler` / `exc_stub_noec` / `exc_stub_ec` / `exc_dispatch` - the ring-3 CPU-exception discriminator), which did not bump this table. All in the permitted arch layer, each block carries a `// SAFETY:` comment. **V1's own pf_handler change adds 0 here** - its user-copy-fault branch is safe code (calls to `current_core_id` / `user_copy_active` / `clear_user_copy_active`) inside the existing print `unsafe` block. |
+
+---
+
 ## 2026-07-10 - fast fbcon blits for the 4K Wyse 5070 + drift reconcile
 
 | File | Change | Why |
@@ -139,7 +148,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
 | arch/x86_64/ap_boot.rs | 2 | permitted |
-| arch/x86_64/boot.rs | 84 | permitted |
+| arch/x86_64/boot.rs | 90 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |
 | arch/x86_64/fb.rs | 5 | permitted |
 | arch/x86_64/interrupts.rs | 21 | permitted |
@@ -149,7 +158,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/page_tables.rs | 41 | permitted |
 | arch/x86_64/pci.rs | 19 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |
-| arch/x86_64/syscall_entry.rs | 13 | permitted |
+| arch/x86_64/syscall_entry.rs | 15 | permitted |
 | capability/table.rs | 7 | permitted |
 | memory/allocator.rs | 37 | permitted |
 | memory/frame.rs | 1 | permitted |

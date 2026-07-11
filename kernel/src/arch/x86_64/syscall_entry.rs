@@ -78,10 +78,15 @@ pub unsafe fn init_per_core_syscall(core_id: usize) {
 // ---------------------------------------------------------------------------
 
 /// The highest valid user virtual address (exclusive) - top of the lower half.
-const USER_END: u64 = 0x0000_8000_0000_0000;
+pub const USER_END: u64 = 0x0000_8000_0000_0000;
 
 /// Return `true` iff the byte range `[ptr, ptr+len)` lies entirely within the
 /// user address space and does not wrap.
+///
+/// NOTE: this is a RANGE check only - it does NOT verify the pages are mapped or
+/// writable. A range-valid-but-unmapped pointer still faults when the kernel copies
+/// it; that fault is made recoverable by the `USER_COPY_ACTIVE` guard below (V1,
+/// kernel-audit-2), so it kills the caller instead of halting the machine.
 #[inline]
 pub fn validate_user_ptr(ptr: u64, len: usize) -> bool {
     if ptr == 0 || len == 0 { return false; }
@@ -92,26 +97,94 @@ pub fn validate_user_ptr(ptr: u64, len: usize) -> bool {
     }
 }
 
-/// Borrow a user-space byte slice.  Returns `None` if the range is invalid.
+// ---------------------------------------------------------------------------
+// User-copy fault guard (V1, kernel-audit-2).
+//
+// validate_user_ptr only range-checks; it cannot know whether a page is actually
+// mapped/writable. When the kernel copies to/from a range-valid-but-unmapped (or
+// read-only) user pointer, the copy faults - and because the copy runs at CPL0 the
+// #PF error-code U/S bit is 0, so a naive pf_handler reads it as "KERNEL PF" and
+// halts every core. That is a whole-machine DoS reachable by any service passing a
+// bad pointer to a syscall.
+//
+// Fix: the copy helpers below set a per-core "user-copy in progress" flag around the
+// ONLY instruction that touches user memory. pf_handler consults it: a CPL0 fault at
+// a user VA while the flag is set is a bad USER pointer, so it kills the caller (like
+// a ring-3 fault) and the system continues. The flag is set NARROWLY (never for a
+// whole syscall), so a genuine kernel bug that faults elsewhere still halts loudly.
+// IF=0 in syscall context => no same-core nesting; per-core => cross-core copies are
+// independent.
+// ---------------------------------------------------------------------------
+
+use core::sync::atomic::{AtomicBool, Ordering};
+
+static USER_COPY_ACTIVE: [AtomicBool; MAX_CORES] =
+    [const { AtomicBool::new(false) }; MAX_CORES];
+
+/// Per-core scratch for `read_user_bytes`: user bytes are copied here under the guard
+/// and a slice into this KERNEL buffer is returned, so no caller ever dereferences
+/// raw user memory - the guarded copy is the only touch. Sized to one message page
+/// (the largest user read); larger reads are rejected (no legitimate caller exceeds
+/// it - `build_message` caps at `MAX_MESSAGE_SIZE` before calling).
+#[link_section = ".bss"]
+static mut USER_READ_SCRATCH: [[u8; crate::ipc::message::MAX_MESSAGE_SIZE]; MAX_CORES] =
+    [[0u8; crate::ipc::message::MAX_MESSAGE_SIZE]; MAX_CORES];
+
+/// True iff `core` is mid user-copy - consulted by `pf_handler` to attribute a CPL0
+/// user-VA fault to a bad user pointer (kill the caller) rather than kernel corruption.
+#[inline]
+pub fn user_copy_active(core: usize) -> bool {
+    core < MAX_CORES && USER_COPY_ACTIVE[core].load(Ordering::SeqCst)
+}
+
+/// Clear the guard for `core`. Called by `pf_handler` after it attributes a fault to a
+/// user-copy and kills the caller: the copy faulted and never returned, so the helper's
+/// own clear was skipped and the flag must not leak to the next task on this core.
+#[inline]
+pub fn clear_user_copy_active(core: usize) {
+    if core < MAX_CORES { USER_COPY_ACTIVE[core].store(false, Ordering::SeqCst); }
+}
+
+/// Read a user-space byte range into this core's kernel scratch and return a slice into
+/// the SCRATCH (never raw user memory).  Returns `None` if the range is invalid or
+/// larger than one message page.
 ///
-/// The returned slice is valid for the current syscall frame lifetime; the
-/// caller must not retain it across a reschedule point.
+/// The returned slice is valid until the next `read_user_bytes` on this core; callers
+/// must consume it before the next read / any reschedule (the prior borrowed-user-slice
+/// return required the same).
 #[inline]
 pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> {
     if !validate_user_ptr(ptr, len) { return None; }
-    // SAFETY: range validated above; lies in user-space VA (below USER_END),
-    // which is disjoint from all kernel mappings.  Caller is in syscall
-    // context (IF=0); no task migration can occur.
-    Some(unsafe { core::slice::from_raw_parts(ptr as *const u8, len) })
+    if len > crate::ipc::message::MAX_MESSAGE_SIZE { return None; }
+    let core = crate::task::scheduler::current_core_id();
+    if core >= MAX_CORES { return None; }
+    // SAFETY: `core < MAX_CORES`; the scratch is this core's 'static buffer, only ever
+    // accessed by this core inside an IF=0 syscall (no same-core nesting).
+    let base = unsafe { core::ptr::addr_of_mut!(USER_READ_SCRATCH[core]) } as *mut u8;
+    USER_COPY_ACTIVE[core].store(true, Ordering::SeqCst);
+    // SAFETY: `[ptr, ptr+len)` is a validated user range; `base` is this core's scratch
+    // of MAX_MESSAGE_SIZE >= len bytes. If a source page is unmapped the CPL0 #PF is
+    // caught by pf_handler (USER_COPY_ACTIVE set -> the caller is killed), so this copy
+    // never faults the kernel and never returns from the fault.
+    unsafe { core::ptr::copy_nonoverlapping(ptr as *const u8, base, len) };
+    USER_COPY_ACTIVE[core].store(false, Ordering::SeqCst);
+    // SAFETY: `base` points to `len` bytes just initialised in 'static scratch.
+    Some(unsafe { core::slice::from_raw_parts(base as *const u8, len) })
 }
 
-/// Copy `src` into the user-space address `dst`.  Returns `false` if the
-/// destination range is invalid; the copy is a no-op in that case.
+/// Copy `src` into the user-space address `dst`.  Returns `false` if the destination
+/// range is invalid; the copy is a no-op in that case.
 #[inline]
 pub fn write_user_bytes(dst: u64, src: &[u8]) -> bool {
     if !validate_user_ptr(dst, src.len()) { return false; }
-    // SAFETY: range validated above; user-space VA disjoint from kernel.
+    let core = crate::task::scheduler::current_core_id();
+    if core >= MAX_CORES { return false; }
+    USER_COPY_ACTIVE[core].store(true, Ordering::SeqCst);
+    // SAFETY: range validated; user-space VA disjoint from kernel. If `dst` is unmapped
+    // or read-only the CPL0 #PF is caught by pf_handler (USER_COPY_ACTIVE set -> the
+    // caller is killed), so this copy never halts the kernel.
     unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst as *mut u8, src.len()) };
+    USER_COPY_ACTIVE[core].store(false, Ordering::SeqCst);
     true
 }
 

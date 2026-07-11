@@ -1435,14 +1435,32 @@ unsafe extern "C" fn pf_handler(error_code: u64, fault_rip: u64, hw_user_rsp: u6
             options(nostack, nomem),
         );
     }
+    // V1 (kernel-audit-2): a CPL0 fault (error-code bit 2 clear) at a USER virtual
+    // address while a guarded user-copy is in progress on this core is a BAD USER
+    // POINTER passed to a syscall (read_user_bytes / write_user_bytes copying an
+    // unmapped/read-only user page), not kernel-state corruption. Attribute it to the
+    // caller and kill that task (like a ring-3 fault), instead of halting all cores.
+    // Narrowly gated on the per-core user-copy flag AND cr2 < USER_END, so a genuine
+    // kernel bug faulting elsewhere still halts loudly (§6.2 / invariant 12).
+    let uc_core = crate::task::scheduler::current_core_id();
+    let user_copy_fault = (error_code & (1 << 2) == 0)
+        && cr2 < crate::arch::x86_64::syscall_entry::USER_END
+        && crate::arch::x86_64::syscall_entry::user_copy_active(uc_core);
+    if user_copy_fault {
+        // The faulting copy never returns to clear its own flag; clear it here so it
+        // does not leak to the next task scheduled on this core.
+        crate::arch::x86_64::syscall_entry::clear_user_copy_active(uc_core);
+    }
     // Use lock-free serial to avoid a deadlock if LOG_LOCK is already held
     // by the kprintln that was interrupted (interrupt gate: IF=0).
     // Bit 2 of error_code is the user/supervisor flag: 1 = fault from ring 3.
-    // Use different prefixes so monitors can distinguish: USER PF is graceful
-    // (service killed, system continues); KERNEL PF is a fatal crash.
+    // Use different prefixes so monitors can distinguish: USER PF and USER-COPY PF are
+    // graceful (offending task killed, system continues); KERNEL PF is a fatal crash.
     unsafe {
         if error_code & (1 << 2) != 0 {
             serial_puts_nolck(b"USER PF: fault_addr=");
+        } else if user_copy_fault {
+            serial_puts_nolck(b"USER-COPY PF (killing caller): fault_addr=");
         } else {
             serial_puts_nolck(b"KERNEL PF: fault_addr=");
         }
@@ -1462,10 +1480,12 @@ unsafe extern "C" fn pf_handler(error_code: u64, fault_rip: u64, hw_user_rsp: u6
         serial_puts_nolck(b"\n");
     }
     // Ring-3 #PF (error_code bit 2 = U/S set): the service touched unmapped memory, not the kernel -
-    // kill it and reschedule (§10.3; kill_current does not return for a ring-3 fault). Only a ring-0
-    // #PF (or a defensive fall-through, should kill_current ever return) halts all cores - halt is the
-    // fail-safe outcome, never a resume of a killed task. Mirrors gpf_handler / exc_dispatch.
-    if error_code & (1 << 2) != 0 {
+    // kill it and reschedule (§10.3; kill_current does not return for a ring-3 fault). A user-copy
+    // fault (CPL0 fault on a user pointer the kernel was copying for a syscall, V1) likewise kills the
+    // CALLER, not the kernel. Only a genuine ring-0 #PF (or a defensive fall-through, should kill_current
+    // ever return) halts all cores - halt is the fail-safe outcome, never a resume of a killed task.
+    // Mirrors gpf_handler / exc_dispatch.
+    if error_code & (1 << 2) != 0 || user_copy_fault {
         crate::task::kill_current();
     }
     crate::arch::x86_64::halt_all_cores()
