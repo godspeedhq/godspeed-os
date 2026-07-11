@@ -164,6 +164,16 @@ struct Hid {
     hub_off: usize,
 }
 
+/// A position signature unique per PHYSICAL device location, for telling a genuinely new plug from a
+/// survivor the re-init merely re-bound. A root device keys on its root port; a device behind a hub also
+/// keys on (hub slot, hub downstream port), so two devices behind the SAME hub (a keyboard on hub port 3,
+/// a mouse on hub port 4) are DISTINCT - and a replug of one is "new" even though the other keeps the
+/// shared root port bound. Keying on the root port alone (the old prev_ports bitmask) suppressed the
+/// "connected" notice for every behind-hub replug, since the hub's root port never leaves.
+fn dev_sig(d: &Hid) -> u32 {
+    ((d.hub_slot & 0xFF) << 16) | ((d.hub_port & 0xFF) << 8) | (d.port & 0xFF)
+}
+
 const EVENT_RING_TRBS: usize = 16;
 const TRB_SIZE: usize = 16;
 
@@ -1242,7 +1252,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Hot-plug state that persists across passes.
     let mut announce = false;    // suppress the connect line for the boot device
     let mut signaled = false;    // signal_input_ready (boot-screen clear) exactly once
-    let mut prev_ports = 0u32;   // root-hub ports bound on the previous pass
+    let mut prev_sigs: [u32; MAX_HID] = [u32::MAX; MAX_HID]; // per-device position sigs bound last pass (u32::MAX = empty)
     let mut rescan_noted = false; // "periodic back-port re-scan" logged once per idle spell
 
     // Hot-plug loop. Each pass FULLY re-initializes the controller (stop, reset,
@@ -1393,12 +1403,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // Nothing usable attached. Still report input-ready once so the shell's
             // boot-screen clear fires (the keyboard may be on the other controller).
             if !signaled { ctx.signal_input_ready(); signaled = true; }
-            // Nothing is bound, so forget the previous pass's bound ports: whatever binds next is a
-            // genuine new plug and must announce. Without this, a device BEHIND a hub keeps the hub's
-            // (unchanging) root-port bit in prev_ports across its own unplug, so a replug re-binding on
-            // that same root port looked "already present" and the "keyboard connected" notice was
-            // suppressed (the root-port key can't tell one back-port device from another).
-            prev_ports = 0;
+            // Nothing is bound, so forget the previous pass's bound devices: whatever binds next is a
+            // genuine new plug and must announce.
+            prev_sigs = [u32::MAX; MAX_HID];
             if saw_hub {
                 // A hub is present but empty. A device (re)plugged BEHIND a hub changes no root PORTSC,
                 // so a root-port wait would never see it - re-walk the hub after a bounded pause so a
@@ -1449,7 +1456,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // pass, so the initial devices are silent regardless.
         if announce {
             for d in &devs[..ndev] {
-                if prev_ports & (1 << d.port) == 0 {
+                if !prev_sigs.contains(&dev_sig(d)) {
                     notify(&ctx, if d.is_mouse {
                         "mouse connected (xhci)"
                     } else {
@@ -1460,8 +1467,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         }
         // Remember which ports are bound so the next pass can tell a genuinely new
         // plug from a survivor the re-init merely re-bound.
-        prev_ports = 0;
-        for d in &devs[..ndev] { prev_ports |= 1 << d.port; }
+        prev_sigs = [u32::MAX; MAX_HID];
+        for (i, d) in devs[..ndev].iter().enumerate() { prev_sigs[i] = dev_sig(d); }
 
         // --- Poll every bound device's interrupt endpoint from one loop ---
         // The event ring is shared; transfer events are demultiplexed by slot id.
