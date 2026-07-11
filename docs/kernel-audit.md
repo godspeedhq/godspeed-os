@@ -132,3 +132,111 @@ Path verification (all confirmed): dispatch.rs:1280 whitelists query_id 11 and 1
 - **`kernel/src/invariants/assertions.rs:59`** (misc/panic) - assert_tcb_alive panics when a TCB service is Dead. Called from handle_kill success path (dispatch.rs:792), but the TCB slice is now empty (&[]) since the supervisor became restartable (Path C/Phase 6), so the loop body 
 - **`kernel/src/invariants/assertions.rs:86`** (misc/panic) - assert_cap_table_consistent panics if any active cap carries generation > its resource's current generation ('future' cap). Called from handle_kill success path (dispatch.rs:793). Caps are unforgeable kernel structures; 
 
+
+## Audit 2 - 2026-07-11 (cross-cutting-concern sweep)
+
+Method: a fresh Workflow decomposed **by cross-cutting concern** (not by subsystem, as Audit 1 did) -
+8 parallel auditors, one each for: integer arithmetic on user values, array/slice/pointer indexing,
+loop/wait boundedness, lock discipline / deadlock, error-path resource cleanup, `unsafe` SAFETY-claim
+re-verification, TOCTOU / cross-core races, and syscall input-validation completeness. Each finding was
+then adversarially refuted (default not-a-bug unless a concrete userspace trigger exists), same bar as
+Audit 1. This lens finds what a subsystem-local auditor misses: defects whose two ends live in
+different files (a cause in `syscall_entry.rs`, a fatal consequence in `boot.rs`).
+
+Result: **13 findings -> 5 CONFIRMED violations (all HIGH), 4 refuted C, 4 B-notes.** (One verify agent
+hit the structured-output retry cap and dropped its finding unverified; not among the confirmed set.)
+The confirmed set includes the precise root cause of the long-standing intermittent chaos-storm UAF
+that was an open follow-up (`project_kernel_pf_reclaim_guard`).
+
+### Confirmed violations (fix these)
+
+> **Status (2026-07-11): recorded; fixes staged next.**
+
+#### V1. [HIGH] `kernel/src/arch/x86_64/syscall_entry.rs:105` + `:114` - user-copy fault halts the machine (unsafe-reverify)
+
+**What.** `read_user_bytes` / `write_user_bytes` rely on `validate_user_ptr`, which only **range-checks**
+(nonzero, `< USER_END`, no wrap) - it never verifies the pages are present/writable. The kernel then
+reads/writes the slice at CPL0. A range-valid-but-**unmapped** (or read-only, for writes) user pointer
+faults inside the kernel copy; because the fault is CPL0 the `#PF` error-code U/S bit is 0, so
+`pf_handler` prints "KERNEL PF" and calls `halt_all_cores()`. There is no copy-to/from-user fault fixup
+(no extable, no per-CPU user-access flag), so the fault is unrecoverable.
+
+**Trigger.** Trivially reachable by **any** service: `log`/`send` with `msg_ptr` = an in-range but
+unmapped VA (e.g. `0x1000`) reads the unmapped page at CPL0 (read side, :105); `recv`/`task_stat`/
+`inspect_kernel` with an unmapped/read-only `out_buf` faults on the write (write side, :114). One bad
+pointer from one service halts every core. This is the most reachable finding in either audit.
+
+**Fix.** Give the user-copy helpers a page-fault fixup: a per-CPU user-access-in-progress flag with a
+resume point, and in `pf_handler`, on a CPL0 fault at a user VA while the flag is set, clear it and
+resume to the fixup returning `EFAULT` (kill the caller) instead of reaching the U/S-only halt triage.
+Range validity is not a mapping guarantee.
+
+#### V2. [HIGH] `kernel/src/task/mod.rs:3604` (and the other post-endpoint `?` sites) - partial-spawn resource leak (errpath-cleanup)
+
+**What.** The recv-endpoint block (mod.rs:3222-3264) allocates an endpoint id, registers the resource,
+routing entry, name, recv+grant caps, and per-IRQ routes. Every fallible step **after** it - driver
+MMIO map (:3474), DMA-arena map (:3536), ctx-frame alloc (:3604), ctx-page map (:3638), kstack alloc
+(:3645) - returns `Err` via `?` **without unwinding** those registrations. The leaked routing entry
+stays `valid + Alive`, so `routing::register` can never recycle it and panics at `MAX_ENDPOINTS=96`
+(~26 leaks); independently the leaked endpoint id never returns to the free list, marching
+`alloc_endpoint_id` into its panic at `DELEGATED_BASE=4096`.
+
+**Trigger.** A sustained `chaos max-carnage` + `chaos mem-pressure` storm: a driver/service respawn that
+loses the frame-allocator race fails at one of the post-endpoint maps, permanently leaking one Alive
+routing entry + endpoint id per failure. ~26 accumulated leaks panic `routing::register`; the kstack
+pool (224 slots) gives a tighter deterministic variant.
+
+**Fix.** Unwind the partial spawn on any post-endpoint error: free the endpoint id, unregister the
+routing / name / resource entries and IRQ routes, release the task slot, then return the error.
+
+#### V3. [HIGH] `kernel/src/task/scheduler.rs:992` (`run`) + `:1244` (timer ISR) - pick-then-commit cross-core UAF (concurrency-races)
+
+**What.** The scheduler publishes a just-picked task (`STATE=Running`, `CORE_CURRENT[cid]=next`, then
+load its CR3/kstack and `switch_context`) with **no re-check that a concurrent cross-core kill set the
+slot Dead**, and it publishes `CORE_CURRENT` only **after** `pick_next` read `STATE=Ready`.
+`kill_task_by_slot`'s spin-wait breaks the instant `CORE_CURRENT[peer] != slot`, so in the pick->publish
+window it frees the victim's PML4 / user frames / kstack; `switch_context` then loads a freed
+(possibly re-alloced-and-zeroed) CR3 -> kernel `#PF` / UAF. The handshake is one-sided (kill does
+store-Dead-then-load-CORE_CURRENT; the scheduler does store-CORE_CURRENT-then-use-CR3 with no matching
+load of STATE - an incomplete Dekker pattern). The `next != prev` timer path (:1244) is worse: it stores
+Running/CORE_CURRENT **unconditionally**, unlike the Dead-preserving CAS used for `prev` and the
+`next == prev` path.
+
+**Trigger.** Real multi-core hardware only (TCG serializes cores, cannot repro). A userspace cross-core
+kill (`chaos max-carnage`, shell `kill`, supervisor `restart`) of a service pinned to another core,
+racing that core's `pick_next` / timer ISR. **This is the precise root cause of the known intermittent
+chaos-storm UAF** (b9dbc4c only catches the downstream corrupt-PTE walk; it does not close this window).
+
+**Fix.** After `cli` + publishing `CORE_CURRENT`, re-load `TASK_STATE[next]` (and `TASK_VALID`) and
+abort the switch (set `CORE_CURRENT=IDLE`, re-pick) if it is Dead - completing the Dekker handshake with
+the kill's store-Dead-then-load-CORE_CURRENT spin-wait. Apply to both `run` and the `next != prev` timer
+path.
+
+### Refuted (investigated, not violations)
+
+- **scheduler.rs:1814** kill-path CORE_CURRENT spin has no *iteration* cap - REFUTED: covered by the
+  cross-core LIVENESS WATCHDOG (~3s loud panic naming the stalled core) on real HW; the mutual-wait ring
+  needed to hang it is not constructible from the serialized kill triggers.
+- **scheduler.rs:413** `TASK_SLOT_LOCKED` hand-rolled CAS has no watchdog - REFUTED: every critical
+  section is a bounded `MAX_TASKS` scan under `without_interrupts`, no holder can fail to release without
+  the kernel already being wedged (a B scenario). Consistency-hardening only.
+- **capability/delegated.rs:172** `BAND` uses `lock()` not `lock_irq()` - REFUTED: every acquirer runs
+  IF=0 today (syscall interrupt-gate, IF=0 kill path), so no preemptible holder exists. Latent
+  future-code hazard, not live.
+- **interrupt/route.rs:59** `IRQ_TABLE` uses `lock()` not `lock_irq()` - REFUTED: same, all acquirers
+  IF=0; single-array critical sections drain in ns. `lock_irq`-convention hygiene, not a live deadlock.
+
+### B-notes (correctly-loud, do NOT remove) + latent hardening
+
+- **generation.rs:31 / :59** - `bump()` `checked_add.expect` and `next_generation()` wrap-to-0 panic:
+  correct H7 defenses (a silent wrap resurrects stale authority). ~4.2e9 bumps/spawns to reach; keep.
+- **ipc/mod.rs:55** - `alloc_endpoint_id` panic at `DELEGATED_BASE`: correct backstop against an endpoint
+  id aliasing the delegated/file-cap band; kept unreachable by id reuse bounding the live range to <=96.
+- **allocator.rs:261** - `free_frame` phantom-frame guard checks `idx >= max_valid_frame` but
+  `max_valid_frame` is set from region extents **unclamped**, while the bitmap is sized `MAX_FRAMES`
+  (8 GiB / 4 KiB). On a machine with **> 8 GiB RAM**, a corrupt/stale PTE whose index lands in
+  `[MAX_FRAMES, max_valid_frame)` passes the guard and OOB-indexes the bitmap. Not userspace-reachable
+  (only a pre-corrupted PTE reaches it - a B), and the T630/Wyse test boxes have 8 GiB (band empty), but
+  a **genuine latent hardening gap**: clamp `max_valid_frame` to `MAX_FRAMES` at init, or add an explicit
+  `idx >= MAX_FRAMES` early-return in `free_frame` (mirrors the `.min(MAX_FRAMES)` the alloc path already
+  has). Worth doing when convenient; not on the critical path.
