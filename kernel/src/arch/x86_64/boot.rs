@@ -716,10 +716,19 @@ pub unsafe fn get_lapic_id() -> u32 {
 // already be held (nested kprintln → deadlock with IF=0).
 // ---------------------------------------------------------------------------
 
+/// Iteration cap for the lock-free fault-path THRE poll. An absent or wedged COM1
+/// (transmit-holding-register-empty never asserts) must not hang a fault handler
+/// forever - a silent kernel freeze, which invariant 12 forbids. After the cap we
+/// proceed best-effort exactly like the bounded `serial_thre_wait`; the worst case
+/// is one possibly-dropped diagnostic byte, never a wedge. A live UART empties its
+/// holding register in microseconds, so the cap is never reached in practice.
+const SERIAL_THRE_NOLCK_CAP: u32 = 1_000_000;
+
 #[inline]
 unsafe fn serial_poll_thre() {
     // SAFETY: port I/O in ring-0; 0x3FD is COM1 LSR.
     unsafe {
+        let mut spins: u32 = 0;
         loop {
             let lsr: u8;
             core::arch::asm!(
@@ -729,6 +738,9 @@ unsafe fn serial_poll_thre() {
                 options(nostack, nomem),
             );
             if lsr & 0x20 != 0 { break; }
+            spins += 1;
+            if spins >= SERIAL_THRE_NOLCK_CAP { break; }
+            core::hint::spin_loop();
         }
     }
 }
@@ -1449,7 +1461,10 @@ unsafe extern "C" fn pf_handler(error_code: u64, fault_rip: u64, hw_user_rsp: u6
         serial_hex64_nolck(kgs_base);
         serial_puts_nolck(b"\n");
     }
-    // User-mode faults kill the task (§10.3); kernel faults are fatal panics.
+    // Ring-3 #PF (error_code bit 2 = U/S set): the service touched unmapped memory, not the kernel -
+    // kill it and reschedule (§10.3; kill_current does not return for a ring-3 fault). Only a ring-0
+    // #PF (or a defensive fall-through, should kill_current ever return) halts all cores - halt is the
+    // fail-safe outcome, never a resume of a killed task. Mirrors gpf_handler / exc_dispatch.
     if error_code & (1 << 2) != 0 {
         crate::task::kill_current();
     }

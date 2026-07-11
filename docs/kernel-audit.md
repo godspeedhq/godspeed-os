@@ -60,6 +60,36 @@ reachable (default: not-a-bug unless a concrete trigger exists). Result: **3 con
 
 **Fix.** Split boot-time (fatal) from runtime respawn. In poll_supervisor_respawn, call the non-panicking spawn_service_with_config directly; on Err, log loudly and re-set SUPERVISOR_RESPAWN_PENDING (and clear IN_PROGRESS) so the next Core-0 tick retries, instead of panicking. Only the boot-path spawn_supervisor should remain fatal (Test 1B).
 
+### Backlog hardening pass - 2026-07-11 (post-A14)
+
+The two genuinely-unbounded fault/hardware spins below were *cleared* in Audit 1 (their wedge trigger
+is not userspace-controllable) but each is still a latent silent-freeze on absent/wedged hardware -
+an invariant-12 / §26.6 gap, and directly relevant to new-hardware bring-up (Wyse 5070). Both are now
+**bounded** (committed on `feat/dell-wyse-5070-goldmont-plus`). Behaviour is unchanged on healthy
+hardware: a live RTC clears UIP in ~microseconds and a live UART empties its holding register in
+microseconds, so the caps are never reached in practice; they only convert a dead-hardware infinite
+hang into a bounded, best-effort read/proceed.
+
+- **`kernel/src/arch/x86_64/rtc.rs:125`** - FIXED. `read_datetime_raw` bare `while update_in_progress()
+  {}` (x2) replaced with bounded `wait_update_clear()` (`RTC_UIP_SPIN_CAP = 1_000_000`); the
+  two-reads-agree retry loop capped at `RTC_CONSISTENCY_TRIES = 128`. On a dead RTC (reads 0xFF, UIP
+  bit stuck) the read now returns garbage that `year_plausible` / `deglitch_epoch` already reject,
+  keeping the last known-good time - loud-degrade, not a freeze.
+- **`kernel/src/arch/x86_64/boot.rs:723`** - FIXED. `serial_poll_thre` (lock-free fault-path THRE poll)
+  bare `loop` capped at `SERIAL_THRE_NOLCK_CAP = 1_000_000`; on timeout it proceeds best-effort exactly
+  like the already-bounded `serial_thre_wait` (worst case: one dropped diagnostic byte, never a wedge).
+- **`kernel/src/arch/x86_64/boot.rs:1452`** (pf_handler fall-through, cleared-fragile) - CLARIFIED. The
+  fall-through to `halt_all_cores()` after a ring-3 kill is intentional and fail-safe (halt is the safe
+  outcome should `kill_current` ever return; it does not for a ring-3 fault). Comment aligned to the
+  sibling `gpf_handler` / `exc_dispatch` idiom introduced by the C1/C2 fix, so the non-return contract
+  is explicit rather than implicit. No behaviour change.
+
+Still open (its own effort, not a quick backlog fix):
+- **`kernel/src/task/scheduler.rs:1761`** driver-death controller quiesce - see below. Deep H1/xhci
+  architectural item (halt/reset the controller + tear down the IRQ route on driver death), not a
+  kernel panic/wedge; bounded today by BME-clear + the reserved DMA arena. Tracked for the H1/driver
+  hardening line, not this pass.
+
 ### Investigated and cleared (not violations, but recorded)
 
 - **`kernel/src/task/scheduler.rs:1761`** (task/hardware-death, claimed medium) - MARQUEE: on driver death the kill path only clears PCI bus-master-enable and (for level IRQs) leaves masking to deliver(); it never HALTS/RESETS the controller and never tears down the IRQ route. A co
