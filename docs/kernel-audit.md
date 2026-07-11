@@ -84,11 +84,15 @@ hang into a bounded, best-effort read/proceed.
   sibling `gpf_handler` / `exc_dispatch` idiom introduced by the C1/C2 fix, so the non-return contract
   is explicit rather than implicit. No behaviour change.
 
-Still open (its own effort, not a quick backlog fix):
-- **`kernel/src/task/scheduler.rs:1761`** driver-death controller quiesce - see below. Deep H1/xhci
-  architectural item (halt/reset the controller + tear down the IRQ route on driver death), not a
-  kernel panic/wedge; bounded today by BME-clear + the reserved DMA arena. Tracked for the H1/driver
-  hardening line, not this pass.
+Done in a later pass (Item 2, committed `cb24515`):
+- **`kernel/src/task/scheduler.rs` driver-death quiesce** - DONE generically, respecting §4.4. Added
+  `nic-driver` to the DMA-quiesce (bus-master-clear) set (it was missing - a passthrough NIC DMAing
+  into reused frames on death), and added `interrupt::route::unregister` + an IOAPIC line-mask on
+  driver death (before the endpoint id is freed) to close the reused-endpoint-id stale-IRQ-route gap.
+  Deliberately NOT kernel-side HC reset: that embeds per-device MMIO maps in ring 0 (a §4.4 violation)
+  and is redundant - every driver resets its controller on init, so a respawn re-inerts it. A
+  bus-master-disabled controller with its route removed + line masked is provably inert with zero
+  device knowledge in the kernel. Identity 24/24.
 
 ### Investigated and cleared (not violations, but recorded)
 
