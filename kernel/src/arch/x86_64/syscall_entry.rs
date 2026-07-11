@@ -117,24 +117,32 @@ pub fn validate_user_ptr(ptr: u64, len: usize) -> bool {
 // ---------------------------------------------------------------------------
 
 use core::sync::atomic::{AtomicBool, Ordering};
+use crate::smp::percpu::{num_cores, PerCore, PerCoreMut};
 
-static USER_COPY_ACTIVE: [AtomicBool; MAX_CORES] =
-    [const { AtomicBool::new(false) }; MAX_CORES];
+/// Per-core "user-copy in progress" flag - a boot-sized arena (§26.6.1), one slot per core Limine
+/// reported, NOT a fixed `[_; MAX_CORES]`. `pf_handler` consults it to attribute a CPL0 user-VA fault to
+/// a bad user pointer (kill the caller) rather than kernel corruption.
+static USER_COPY_ACTIVE: PerCore<AtomicBool> = PerCore::new();
 
-/// Per-core scratch for `read_user_bytes`: user bytes are copied here under the guard
-/// and a slice into this KERNEL buffer is returned, so no caller ever dereferences
-/// raw user memory - the guarded copy is the only touch. Sized to one message page
-/// (the largest user read); larger reads are rejected (no legitimate caller exceeds
-/// it - `build_message` caps at `MAX_MESSAGE_SIZE` before calling).
-#[link_section = ".bss"]
-static mut USER_READ_SCRATCH: [[u8; crate::ipc::message::MAX_MESSAGE_SIZE]; MAX_CORES] =
-    [[0u8; crate::ipc::message::MAX_MESSAGE_SIZE]; MAX_CORES];
+/// Per-core scratch for `read_user_bytes` - a boot-sized arena (one message page per core). User bytes
+/// are copied here under the guard and a slice into this KERNEL buffer is returned, so no caller ever
+/// dereferences raw user memory. Larger reads are rejected (`build_message` caps at `MAX_MESSAGE_SIZE`).
+/// This was a 1 MiB fixed `[[u8; 4096]; MAX_CORES]`; as an arena it costs `num_cores * 4 KiB`.
+static USER_READ_SCRATCH: PerCoreMut<[u8; crate::ipc::message::MAX_MESSAGE_SIZE]> = PerCoreMut::new();
 
-/// True iff `core` is mid user-copy - consulted by `pf_handler` to attribute a CPL0
-/// user-VA fault to a bad user pointer (kill the caller) rather than kernel corruption.
+/// Allocate the per-core user-copy arenas. Called once at boot (`smp::percpu_init`), after the frame
+/// allocator is up and before any syscall (the only caller of the copy helpers) or ring-3 fault.
+pub fn init_percore_arenas(n: usize) {
+    USER_COPY_ACTIVE.init_with(n, |_| AtomicBool::new(false));
+    USER_READ_SCRATCH.init_with(n, |_| [0u8; crate::ipc::message::MAX_MESSAGE_SIZE]);
+}
+
+/// True iff `core` is mid user-copy - consulted by `pf_handler` to attribute a CPL0 user-VA fault to a
+/// bad user pointer (kill the caller) rather than kernel corruption. Returns false before the arena is
+/// initialised (an early kernel fault, before `percpu_init`) - such a fault is genuine and must halt.
 #[inline]
 pub fn user_copy_active(core: usize) -> bool {
-    core < MAX_CORES && USER_COPY_ACTIVE[core].load(Ordering::SeqCst)
+    USER_COPY_ACTIVE.initialised() && core < num_cores() && USER_COPY_ACTIVE.get(core).load(Ordering::SeqCst)
 }
 
 /// Clear the guard for `core`. Called by `pf_handler` after it attributes a fault to a
@@ -142,7 +150,9 @@ pub fn user_copy_active(core: usize) -> bool {
 /// own clear was skipped and the flag must not leak to the next task on this core.
 #[inline]
 pub fn clear_user_copy_active(core: usize) {
-    if core < MAX_CORES { USER_COPY_ACTIVE[core].store(false, Ordering::SeqCst); }
+    if USER_COPY_ACTIVE.initialised() && core < num_cores() {
+        USER_COPY_ACTIVE.get(core).store(false, Ordering::SeqCst);
+    }
 }
 
 /// Read a user-space byte range into this core's kernel scratch and return a slice into
@@ -157,18 +167,18 @@ pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> {
     if !validate_user_ptr(ptr, len) { return None; }
     if len > crate::ipc::message::MAX_MESSAGE_SIZE { return None; }
     let core = crate::task::scheduler::current_core_id();
-    if core >= MAX_CORES { return None; }
-    // SAFETY: `core < MAX_CORES`; the scratch is this core's 'static buffer, only ever
-    // accessed by this core inside an IF=0 syscall (no same-core nesting).
-    let base = unsafe { core::ptr::addr_of_mut!(USER_READ_SCRATCH[core]) } as *mut u8;
-    USER_COPY_ACTIVE[core].store(true, Ordering::SeqCst);
+    if core >= num_cores() { return None; }
+    // Base of this core's scratch arena slot (single-owner: only this core, inside an IF=0 syscall,
+    // touches its slot - no aliasing, no same-core nesting).
+    let base = USER_READ_SCRATCH.as_mut_ptr(core).cast::<u8>();
+    USER_COPY_ACTIVE.get(core).store(true, Ordering::SeqCst);
     // SAFETY: `[ptr, ptr+len)` is a validated user range; `base` is this core's scratch
     // of MAX_MESSAGE_SIZE >= len bytes. If a source page is unmapped the CPL0 #PF is
     // caught by pf_handler (USER_COPY_ACTIVE set -> the caller is killed), so this copy
     // never faults the kernel and never returns from the fault.
     unsafe { core::ptr::copy_nonoverlapping(ptr as *const u8, base, len) };
-    USER_COPY_ACTIVE[core].store(false, Ordering::SeqCst);
-    // SAFETY: `base` points to `len` bytes just initialised in 'static scratch.
+    USER_COPY_ACTIVE.get(core).store(false, Ordering::SeqCst);
+    // SAFETY: `base` points to `len` bytes just initialised in the arena scratch slot.
     Some(unsafe { core::slice::from_raw_parts(base as *const u8, len) })
 }
 
@@ -178,13 +188,13 @@ pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> {
 pub fn write_user_bytes(dst: u64, src: &[u8]) -> bool {
     if !validate_user_ptr(dst, src.len()) { return false; }
     let core = crate::task::scheduler::current_core_id();
-    if core >= MAX_CORES { return false; }
-    USER_COPY_ACTIVE[core].store(true, Ordering::SeqCst);
+    if core >= num_cores() { return false; }
+    USER_COPY_ACTIVE.get(core).store(true, Ordering::SeqCst);
     // SAFETY: range validated; user-space VA disjoint from kernel. If `dst` is unmapped
     // or read-only the CPL0 #PF is caught by pf_handler (USER_COPY_ACTIVE set -> the
     // caller is killed), so this copy never halts the kernel.
     unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst as *mut u8, src.len()) };
-    USER_COPY_ACTIVE[core].store(false, Ordering::SeqCst);
+    USER_COPY_ACTIVE.get(core).store(false, Ordering::SeqCst);
     true
 }
 

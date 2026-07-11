@@ -8,6 +8,14 @@ unless this file is updated in the same commit with a written SAFETY argument.**
 
 ---
 
+## 2026-07-11 - per-core user-copy arenas (RAM-sized, not [_; MAX_CORES])
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/x86_64/syscall_entry.rs` | 15 → 14 (-1) | The V1 per-core user-copy state (`USER_COPY_ACTIVE`, and the 1 MiB `USER_READ_SCRATCH` = `[[u8; 4096]; MAX_CORES]`) moved from fixed `[_; MAX_CORES]` statics to boot-sized `PerCore`/`PerCoreMut` arenas (sized to the cores Limine reported, §26.6.1) - so per-core memory scales to the machine, not a 256-core ceiling. The count DROPS by one: `read_user_bytes`'s `addr_of_mut!` on the static scratch became the safe `PerCoreMut::as_mut_ptr` accessor (all the arena's `unsafe` lives in `smp/percpu.rs`). The two `copy_nonoverlapping` + one `from_raw_parts` blocks are unchanged. Removes ~1 MiB of fixed `.bss`. Boot-validated across QEMU -smp 1..16 + identity 24/24 + adv 15/15. |
+
+---
+
 ## 2026-07-11 - dynamic (RAM-sized) frame bitmap
 
 | File | Change | Why |
@@ -166,7 +174,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/page_tables.rs | 41 | permitted |
 | arch/x86_64/pci.rs | 19 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |
-| arch/x86_64/syscall_entry.rs | 15 | permitted |
+| arch/x86_64/syscall_entry.rs | 14 | permitted |
 | capability/table.rs | 7 | permitted |
 | memory/allocator.rs | 44 | permitted |
 | memory/frame.rs | 1 | permitted |

@@ -93,6 +93,14 @@ impl<T: Sync + 'static> PerCore<T> {
         // by the caller's contract; `T: Sync` makes the shared `&T` sound across cores.
         unsafe { &*base.add(core) }
     }
+
+    /// True once `init_with` has run (the arena is allocated). Lets a caller that might run BEFORE boot
+    /// finishes - e.g. `pf_handler` on an early kernel fault, before `percpu_init` - avoid touching an
+    /// unallocated arena.
+    #[inline]
+    pub fn initialised(&self) -> bool {
+        !self.base.load(Ordering::Acquire).is_null()
+    }
 }
 
 /// A boot-allocated array of one `T` per core, accessed by OWNER-MUTABLE raw pointer

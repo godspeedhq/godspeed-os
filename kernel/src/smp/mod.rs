@@ -34,6 +34,9 @@ pub fn percpu_init(boot_info: &BootInfo) {
     percpu::set_num_cores(n);
     ipi::init_arenas(n);
     core::init_arenas(n);
+    // Per-core user-copy arenas (the V1 read-scratch + copy-in-progress flag), sized to N instead of a
+    // fixed [_; MAX_CORES] - the read scratch alone was 1 MiB fixed, now num_cores * 4 KiB.
+    crate::arch::x86_64::syscall_entry::init_percore_arenas(n);
 }
 
 pub fn init(boot_info: &BootInfo) {
