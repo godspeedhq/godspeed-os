@@ -243,11 +243,18 @@ path.
   correct H7 defenses (a silent wrap resurrects stale authority). ~4.2e9 bumps/spawns to reach; keep.
 - **ipc/mod.rs:55** - `alloc_endpoint_id` panic at `DELEGATED_BASE`: correct backstop against an endpoint
   id aliasing the delegated/file-cap band; kept unreachable by id reuse bounding the live range to <=96.
-- **allocator.rs:261** - `free_frame` phantom-frame guard checks `idx >= max_valid_frame` but
+- **allocator.rs:261** - `free_frame` phantom-frame guard checked only `idx >= max_valid_frame` but
   `max_valid_frame` is set from region extents **unclamped**, while the bitmap is sized `MAX_FRAMES`
   (8 GiB / 4 KiB). On a machine with **> 8 GiB RAM**, a corrupt/stale PTE whose index lands in
-  `[MAX_FRAMES, max_valid_frame)` passes the guard and OOB-indexes the bitmap. Not userspace-reachable
+  `[MAX_FRAMES, max_valid_frame)` passed the guard and OOB-indexed the bitmap. Not userspace-reachable
   (only a pre-corrupted PTE reaches it - a B), and the T630/Wyse test boxes have 8 GiB (band empty), but
-  a **genuine latent hardening gap**: clamp `max_valid_frame` to `MAX_FRAMES` at init, or add an explicit
-  `idx >= MAX_FRAMES` early-return in `free_frame` (mirrors the `.min(MAX_FRAMES)` the alloc path already
-  has). Worth doing when convenient; not on the critical path.
+  a genuine latent hardening gap. **FIXED (`f276f61`):** the guard is now
+  `idx >= max_valid_frame || idx >= MAX_FRAMES`; the alloc path never returns `idx >= MAX_FRAMES`, so no
+  legitimate free is rejected.
+
+### Regression tests
+
+- **A14** (`b97c23d`) pins C1/C2: a ring-3 CPU exception (#GP, #DE) kills the task, not the kernel.
+- **A15** (`90d520a`) pins V1: a bad user pointer to a syscall (`raw_syscall(log, cap 0, 0x1000, 16)`)
+  faults in the kernel copy at CPL0 and the kernel logs `USER-COPY PF (killing caller)` + kills the
+  caller instead of `halt_all_cores()`. `osdev test adv` 15/15.
