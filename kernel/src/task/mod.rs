@@ -2435,6 +2435,41 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
+        // A14 (kernel-audit C1/C2 regression): a ring-3 CPU exception must KILL the task, not halt the
+        // kernel. Two faulters (#GP, #DE) + a monitor that witnesses the system continuing.
+        "adv-fault-gp" => Some(("adv-fault-gp", ServiceConfig {
+            elf:               PROBE_ELF,
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        210, // ADV_FAULT_GP: non-canonical read → #GP → killed
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
+        "adv-fault-de" => Some(("adv-fault-de", ServiceConfig {
+            elf:               PROBE_ELF,
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        211, // ADV_FAULT_DE: div-by-zero → #DE → killed
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
+        "adv-fault-mon" => Some(("adv-fault-mon", ServiceConfig {
+            elf:               PROBE_ELF,
+            has_recv_endpoint: false,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        212, // ADV_FAULT_MON: yields then logs the A14 pass
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
         // C3: alloc saturation. Tight 4 MiB limit so impossible requests are denied quickly.
         "chaos-c3" => Some(("chaos-c3", ServiceConfig {
             elf:               PROBE_ELF,

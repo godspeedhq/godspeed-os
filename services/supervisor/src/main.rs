@@ -744,6 +744,11 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("adv-a8-witness");
     let _ = ctx.spawn("adv-a9");
     let _ = ctx.spawn("adv-a10");
+    // A14 (kernel-audit C1/C2 regression): two ring-3 faulters (#GP, #DE) that must be KILLED by the
+    // kernel, and a monitor that witnesses the system surviving both. Self-contained, no peers.
+    let _ = ctx.spawn("adv-fault-gp");
+    let _ = ctx.spawn("adv-fault-de");
+    let _ = ctx.spawn("adv-fault-mon");
 }
 
 // fuzz-only: spawn only the §22 fuzz probe services (F1/F2/F5/F6/F7/F8 + brutal

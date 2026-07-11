@@ -159,6 +159,10 @@ const MODE_ADV_A10:         u32 = 90; // kernel addresses as syscall args → re
 // Chaos-test modes - Milestone 14.
 const MODE_CHAOS_C2:        u32 = 91; // null-deref → page fault → kernel kills service
 const MODE_CHAOS_C2_MON:    u32 = 92; // 1,000 yields then log pass (C2 witness)
+// A14 (kernel-audit regression): a ring-3 CPU exception must KILL the task, never halt the kernel.
+const MODE_ADV_FAULT_GP:    u32 = 210; // ring-3 #GP (non-canonical read) → kernel kills service
+const MODE_ADV_FAULT_DE:    u32 = 211; // ring-3 #DE (inline-asm div0)    → kernel kills service
+const MODE_ADV_FAULT_MON:   u32 = 212; // witness: yields then logs pass (system survived both faults)
 const MODE_CHAOS_C3:        u32 = 93; // 500 alloc-deny cycles without panic
 const MODE_CHAOS_C5:        u32 = 94; // 100-level recursive yield_cpu(); stack depth probe
 const MODE_CHAOS_C6_MON:    u32 = 95; // 200 yields then log pass on core 0 (C6 witness)
@@ -402,6 +406,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         MODE_XSEND_RECV      => mode_xsend_recv(&ctx),
         MODE_XLIFE           => mode_xlife(&ctx),
         MODE_XLIFE_VICTIM    => idle(&ctx),
+        MODE_ADV_FAULT_GP    => mode_adv_fault_gp(&ctx),
+        MODE_ADV_FAULT_DE    => mode_adv_fault_de(&ctx),
+        MODE_ADV_FAULT_MON   => mode_adv_fault_mon(&ctx),
         _                    => idle(&ctx),
     }
 }
@@ -2029,6 +2036,43 @@ fn mode_chaos_c2_monitor(ctx: &ServiceContext) -> ! {
     // chaos-c2 was killed by the kernel's page-fault handler (§22 Chaos C2).
     for _ in 0..100u32 { ctx.yield_cpu(); }
     ctx.log("chaos: C2 pass - system continued after non-TCB page fault");
+    idle(ctx)
+}
+
+fn mode_adv_fault_gp(_ctx: &ServiceContext) -> ! {
+    // A14 - ring-3 #GP: a non-canonical memory access (bit 47 != bit 63) raises #GP(0) at CPL3. The
+    // kernel must KILL this service (log "USER GPF (killing task)"), NOT halt the machine - the class the
+    // commandment audit (C1) fixed. adv-fault-mon witnesses the system continuing.
+    // SAFETY: intentional fault for regression test A14; the kernel kills the task before any further use.
+    unsafe { let _ = core::ptr::read_volatile(0x8000_0000_0000_0000 as *const u8); }
+    loop { core::hint::spin_loop(); }
+}
+
+fn mode_adv_fault_de(_ctx: &ServiceContext) -> ! {
+    // A14 - ring-3 #DE: an integer divide-by-zero raises #DE (vector 0) at CPL3. Raw inline asm because
+    // Rust inserts a divide guard (it would panic, not fault); the threat model includes adversarial/asm
+    // services. The kernel must KILL this service (log "USER EXCEPTION (killing task)"), NOT halt.
+    // SAFETY: intentional fault for regression test A14; the kernel kills the task before any further use.
+    unsafe {
+        core::arch::asm!(
+            "xor eax, eax",
+            "xor edx, edx",
+            "xor ecx, ecx",
+            "div ecx",   // (EDX:EAX)=0 / ECX=0 -> #DE (divide error)
+            out("eax") _, out("edx") _, out("ecx") _,
+            options(nostack, nomem),
+        );
+    }
+    loop { core::hint::spin_loop(); }
+}
+
+fn mode_adv_fault_mon(ctx: &ServiceContext) -> ! {
+    // A14 witness: the two faulters run on other cores; yield long enough for both to fault and be killed,
+    // then log pass - proving the kernel KILLED the ring-3 faulters and the system continued rather than
+    // wedging (invariant 12; kernel-audit C1/C2). If the fix were wrong the kernel would halt and this
+    // line would never print (the test times out / trips its KERNEL-fault fail_on).
+    for _ in 0..1000u32 { ctx.yield_cpu(); }
+    ctx.log("adv: A14 pass - ring-3 #GP + #DE killed the task, kernel alive");
     idle(ctx)
 }
 
