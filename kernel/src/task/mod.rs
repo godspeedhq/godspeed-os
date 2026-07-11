@@ -3126,6 +3126,35 @@ pub fn spawn_service_by_name_with_installs(
 /// line are kept (legitimate lifecycle output, one line each).
 const SPAWN_TRACE: bool = false;
 
+/// Undo a partially-built spawn on any error path (V2, kernel-audit-2).
+///
+/// A spawn that fails AFTER the recv-endpoint block (a later driver MMIO/DMA map, or the
+/// ctx-frame / kstack allocation) must not leak what that block registered. In particular a
+/// leaked routing entry stays `valid + Alive`, so `routing::register` can never recycle its
+/// slot and eventually panics at `MAX_ENDPOINTS`; independently a leaked endpoint id never
+/// returns to the free list and marches `alloc_endpoint_id` into its `DELEGATED_BASE` panic.
+/// Under a `chaos max-carnage` + `mem-pressure` storm those failures accumulate into a kernel
+/// panic. This unwinds the endpoint registrations (mirroring the endpoint-teardown half of
+/// `kill_task_by_slot` for a task that never ran - so no blocked waiters / delegated resources
+/// to handle) and releases the reserved task slot.
+///
+/// `own_endpoint` is `None` for a service with no recv endpoint (and at the pre-endpoint cap
+/// inserts), in which case only the task slot is released - identical to the prior behaviour.
+fn cleanup_partial_spawn(task_slot: usize, name: &str, own_endpoint: Option<EndpointId>) {
+    if let Some(ep_id) = own_endpoint {
+        // Mark the routing entry Dead (recyclable) + drain its queue + bump generation.
+        let _ = crate::ipc::routing::kill_endpoint(ep_id);
+        // Invalidate the resource so any cap already handed out fails its generation check.
+        crate::capability::table::mark_dead_resource(
+            crate::capability::cap::ResourceId::from(ep_id));
+        // Clear the name mapping while the id is still ours, THEN free the id (the same
+        // load-bearing order as the kill path: free is the barrier against id reuse).
+        crate::ipc::names::unregister_endpoint(name, ep_id);
+        crate::ipc::free_endpoint_id(ep_id);
+    }
+    scheduler::release_task_slot(task_slot);
+}
+
 /// Low-level spawn: load ELF, wire caps, enqueue on `core_id`. Returns the new task's recv
 /// `EndpointId` (`None` if it has no endpoint) - the caller (via the spawn syscall) can mint a
 /// cap to it. This is the Phase-0 seam for moving naming out of the kernel (`docs/naming-design.md`):
@@ -3184,6 +3213,11 @@ fn spawn_service_with_config(
     if SPAWN_TRACE { crate::kprintln!("spawn[slot]: '{}'", name); }
 
     // 3. Reserve a task slot and initialise its CapTable directly in BSS.
+    // Declared before the slot is reserved so every error path below can route through
+    // cleanup_partial_spawn(task_slot, name, own_endpoint) (V2, kernel-audit-2): None until
+    // the recv-endpoint block registers an endpoint, Some(ep_id) after - so a failure before
+    // the block releases only the slot, and one after also unwinds the endpoint registrations.
+    let mut own_endpoint: Option<EndpointId> = None;
     let task_slot = scheduler::reserve_task_slot(core_id).ok_or(SpawnError::NoMemory)?;
     if SPAWN_TRACE { crate::kprintln!("spawn[caps]: '{}' slot={}", name, task_slot); }
     // SAFETY: task_slot was just reserved; IF=0 in syscall context.
@@ -3210,14 +3244,13 @@ fn spawn_service_with_config(
         || core::ptr::eq(elf_bytes.as_ptr(), PROBE_ELF.as_ptr())
     {
         let sp_slot = caps.insert(mint_cap(SPAWN_RESOURCE, Rights::WRITE))
-            .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
         spawn_slot_u32 = sp_slot as u32;
     }
 
     // 4. Optional recv endpoint.
     let mut recv_slot_u32 = u32::MAX;
     let mut self_grant_slot_u32 = u32::MAX;
-    let mut own_endpoint:  Option<EndpointId> = None;
 
     if has_recv_endpoint {
         let ep_id       = crate::ipc::alloc_endpoint_id();
@@ -3242,12 +3275,15 @@ fn spawn_service_with_config(
         // Publish name → endpoint mapping for peer cap resolution.
         crate::ipc::names::register(name, ep_id);
 
+        // Record the endpoint NOW (before the cap inserts below), so any error from here on
+        // unwinds these three registrations via cleanup_partial_spawn (V2, kernel-audit-2).
+        own_endpoint  = Some(ep_id);
+
         // Mint RECV cap → first free slot (= slot 2).
         let recv_cap = mint_cap(resource_id, Rights::RECV);
         let cap_slot = caps.insert(recv_cap)
-            .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
         recv_slot_u32 = cap_slot as u32;
-        own_endpoint  = Some(ep_id);
 
         // Self-grant cap: a SEND|GRANT cap to this service's OWN endpoint, so it can
         // announce its name to the kernel directory by granting a derived copy. GRANT is
@@ -3268,7 +3304,7 @@ fn spawn_service_with_config(
     if has_console_read {
         let cr_cap = mint_cap(CONSOLE_READ_RESOURCE, Rights::READ);
         let cap_slot = caps.insert(cr_cap)
-            .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
         console_read_slot_u32 = cap_slot as u32;
     }
 
@@ -3279,7 +3315,7 @@ fn spawn_service_with_config(
     if name == "xhci" || name == "ehci" {
         let cp_cap = mint_cap(CONSOLE_PUSH_RESOURCE, Rights::WRITE);
         let cap_slot = caps.insert(cp_cap)
-            .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
         console_push_slot_u32 = cap_slot as u32;
     }
 
@@ -3299,7 +3335,7 @@ fn spawn_service_with_config(
     {
         let in_cap = mint_cap(INTROSPECT_RESOURCE, Rights::READ);
         caps.insert(in_cap)
-            .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 
     // Services that kill other services hold the service_control cap (§3.1/§14.4;
@@ -3314,7 +3350,7 @@ fn spawn_service_with_config(
     {
         let sc_cap = mint_cap(SERVICE_CONTROL_RESOURCE, Rights::WRITE);
         caps.insert(sc_cap)
-            .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 
     // The resource-mint authority (§7.10, P2 file-as-capability): held only by services that
@@ -3330,7 +3366,7 @@ fn spawn_service_with_config(
     if name == "fs" || name == "resource-server" || name == "net-stack" {
         let rm_cap = mint_cap(RESOURCE_MINT_RESOURCE, Rights::WRITE);
         caps.insert(rm_cap)
-            .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 
     // The reboot authority (§3.1): the `shell` (its `reboot` command) and the USB drivers `xhci`/`ehci`
@@ -3339,7 +3375,7 @@ fn spawn_service_with_config(
     if name == "shell" || name == "xhci" || name == "ehci" {
         let rb_cap = mint_cap(REBOOT_RESOURCE, Rights::WRITE);
         caps.insert(rb_cap)
-            .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 
     // The broad-acquire authority (§3.1): the operator/test instruments that legitimately reach
@@ -3354,7 +3390,7 @@ fn spawn_service_with_config(
     {
         let aa_cap = mint_cap(ACQUIRE_ANY_RESOURCE, Rights::WRITE);
         caps.insert(aa_cap)
-            .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 
     // 5. Send-peer SEND caps (wired at spawn from the name directory).
@@ -3471,7 +3507,7 @@ fn spawn_service_with_config(
                 let off = i * PAGE_SIZE as u64;
                 page_table
                     .map(VirtAddr(XHCI_MMIO_VA + off), PhysAddr(bar + off), mmio_flags)
-                    .map_err(|_| SpawnError::MapFailed)?;
+                    .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::MapFailed })?;
             }
             crate::kprintln!("spawn[mmio]: '{}' BAR {:#x} -> VA {:#x}", name, bar, XHCI_MMIO_VA);
             XHCI_MMIO_VA
@@ -3533,7 +3569,7 @@ fn spawn_service_with_config(
                     let off = i * PAGE_SIZE as u64;
                     page_table
                         .map(VirtAddr(XHCI_DMA_VA + off), PhysAddr(phys + off), flags)
-                        .map_err(|_| SpawnError::MapFailed)?;
+                        .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::MapFailed })?;
                 }
                 let len = dma_pages * PAGE_SIZE as u64;
                 crate::kprintln!(
@@ -3601,7 +3637,8 @@ fn spawn_service_with_config(
 
     // 6. Allocate and map the ServiceContextData page.
     {
-        let ctx_frame = alloc_frame().ok_or(SpawnError::NoMemory)?;
+        let ctx_frame = alloc_frame()
+            .ok_or_else(|| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::NoMemory })?;
         let ctx_phys  = ctx_frame.phys_addr().0;
         // SAFETY: phys from allocator; task hasn't started yet; HHDM covers it.
         unsafe {
@@ -3635,14 +3672,15 @@ fn spawn_service_with_config(
         let ctx_flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::NO_EXEC;
         page_table
             .map(VirtAddr(SERVICE_CTX_VA), PhysAddr(ctx_phys), ctx_flags)
-            .map_err(|_| SpawnError::MapFailed)?;
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::MapFailed })?;
         // ctx_frame owned by the page table now; Frame is Copy/no-Drop (no release).
     }
 
     if SPAWN_TRACE { crate::kprintln!("spawn[kstack]: '{}'", name); }
 
     // 7. Kernel stack.
-    let kstack_top = alloc_kstack().ok_or(SpawnError::NoMemory)?;
+    let kstack_top = alloc_kstack()
+        .ok_or_else(|| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::NoMemory })?;
     if SPAWN_TRACE { crate::kprintln!("spawn[commit]: '{}' kstack ok", name); }
 
     // 8. Initial ring-3 context.
