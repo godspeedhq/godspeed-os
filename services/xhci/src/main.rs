@@ -1145,14 +1145,33 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // re-binding whatever remains. Per-pass re-init is heavy, but hot-plug is
     // infrequent and it keeps the ring bookkeeping trivially correct (§26.12).
     'reenum: loop {
-        // Stop + reset the controller.
+        // Stop + reset the controller. The Wyse `chaos max-carnage` all-core freeze lands
+        // DETERMINISTICALLY in this sequence (the log dies right after the "v..." line above), so bracket
+        // every step with a log: the last line printed before a freeze is then the exact MMIO that hung.
+        // A controller left running by the kill (the kernel only clears bus-master, it does not halt the
+        // HC) may be in a state where a register access stalls the PCI bus.
         let cmd = mmio.read32(op + OP_USBCMD);
+        let sts0 = mmio.read32(op + OP_USBSTS);
+        // A read of all-1s means the controller is not answering MMIO at all (master-abort / dead BAR) -
+        // proceeding would only poke a dead device. Report it LOUD instead of silently spinning (§26.7).
+        if cmd == 0xFFFF_FFFF || sts0 == 0xFFFF_FFFF {
+            ctx.log_fmt(format_args!(
+                "xhci: reset: CONTROLLER NOT RESPONDING (USBCMD={:#010x} USBSTS={:#010x}, all-1s = dead BAR)",
+                cmd, sts0
+            ));
+        }
+        ctx.log_fmt(format_args!("xhci: reset: entering (USBCMD={:#010x} USBSTS={:#010x})", cmd, sts0));
         mmio.write32(op + OP_USBCMD, cmd & !CMD_RS);
         spin(|| mmio.read32(op + OP_USBSTS) & STS_HCH != 0);
+        ctx.log_fmt(format_args!("xhci: reset: halted (USBSTS={:#010x})", mmio.read32(op + OP_USBSTS)));
         mmio.write32(op + OP_USBCMD, CMD_HCRST);
         spin(|| {
             mmio.read32(op + OP_USBCMD) & CMD_HCRST == 0 && mmio.read32(op + OP_USBSTS) & STS_CNR == 0
         });
+        ctx.log_fmt(format_args!(
+            "xhci: reset: done (USBCMD={:#010x} USBSTS={:#010x})",
+            mmio.read32(op + OP_USBCMD), mmio.read32(op + OP_USBSTS)
+        ));
         // Rebuild DMA structures + run.
         dma.zero();
         // Scratchpad: build the SBA (N pointers to page-aligned buffers) and point
