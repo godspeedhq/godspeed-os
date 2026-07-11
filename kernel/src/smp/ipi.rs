@@ -44,6 +44,12 @@ const APIC_ICR_LOW:  u64 = 0x300;
 /// ceiling: `ceil(MAX_CORES / 64)`.
 const MAX_WORDS: usize = crate::smp::core::MAX_CORES.div_ceil(64);
 
+/// Watchdog bound for the shootdown ack-wait spin (see `request_and_wait`). A real shootdown completes
+/// in a few thousand iterations even under contention; ~5x10^8 is thousands of times that, so it fires
+/// ONLY on a true wedge (a core that will never ack) and turns a silent freeze into a loud, pinpointed
+/// panic. At ~1.5-2 GHz this is on the order of a few seconds of spin before the panic.
+const SHOOTDOWN_WATCHDOG_SPINS: u64 = 500_000_000;
+
 static SHOOTDOWN_ADDR:     PerCore<AtomicU64>              = PerCore::new();
 static SHOOTDOWN_ACK_MASK: PerCore<[AtomicU64; MAX_WORDS]> = PerCore::new();
 
@@ -194,6 +200,16 @@ unsafe fn request_and_wait(addr: u64) {
 
     // Wait until every expected core (across all words) has set its bit, servicing theirs meanwhile so
     // two cores shooting down at once ack each other instead of deadlocking.
+    //
+    // WATCHDOG (invariant 12 / §26.7): the wait is BOUNDED. A real shootdown - even under heavy
+    // concurrent-kill contention with the deadlock-breaker serializing - completes in well under a
+    // millisecond (a few thousand iterations). If we spin far past that, an expected core is NEVER going
+    // to ack: its IPI was lost (the bounded ICR-busy spin above gave up mid-broadcast), or it is wedged
+    // IF=0 in a path that never services pending. That used to be a SILENT system-wide freeze (the
+    // `chaos max-carnage` wedge on the Wyse's 4 real cores). Now it PANICS loudly, naming the core still
+    // waiting and the bitmask of cores that failed to ack - a pinpointed report instead of a dead
+    // machine. The bound is ~5000x a normal shootdown, so it cannot false-fire on legitimate load.
+    let mut spins: u64 = 0;
     loop {
         service_pending(me);
         let done = (0..MAX_WORDS).all(|w| {
@@ -202,6 +218,16 @@ unsafe fn request_and_wait(addr: u64) {
         });
         if done {
             break;
+        }
+        spins += 1;
+        if spins >= SHOOTDOWN_WATCHDOG_SPINS {
+            let acked0 = SHOOTDOWN_ACK_MASK.get(me)[0].load(Ordering::SeqCst);
+            let missing0 = expected[0] & !acked0;
+            panic!(
+                "TLB shootdown WEDGE: core {} spun {} iters waiting acks (addr={:#x}); \
+                 expected(w0)={:#x} acked(w0)={:#x} MISSING-ACK cores(w0)={:#x}",
+                me, spins, addr, expected[0], acked0, missing0
+            );
         }
         core::hint::spin_loop();
     }
