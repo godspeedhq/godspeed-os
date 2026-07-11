@@ -162,6 +162,7 @@ struct Hid {
     hub_dev: u32,
     hub_port: u32,
     hub_off: usize,
+    hub_nports: u32, // parent hub's downstream port count (0 = root device); for the new-device re-scan
 }
 
 /// A position signature unique per PHYSICAL device location, for telling a genuinely new plug from a
@@ -761,7 +762,7 @@ fn read_config_and_bind(
     dma.write32(link + 12, (TRB_LINK << 10) | (1 << 1) | 1);
 
     // hub_* default to 0/direct; the downstream caller patches them for a device behind a hub.
-    (Some(Hid { slot, dci, port, idx: dev_idx, is_mouse, hub_slot: 0, hub_dev: 0, hub_port: 0, hub_off: 0 }), cfg_val)
+    (Some(Hid { slot, dci, port, idx: dev_idx, is_mouse, hub_slot: 0, hub_dev: 0, hub_port: 0, hub_off: 0, hub_nports: 0 }), cfg_val)
 }
 
 /// Enumerate whatever is attached to root-hub `port`, binding every boot HID it finds - directly on
@@ -1158,6 +1159,7 @@ fn enumerate_one(
                         hid.hub_slot = slot;
                         hid.hub_dev = dev_idx as u32;
                         hid.hub_port = dp as u32;
+                        hid.hub_nports = nports as u32; // for the poll loop's new-device re-scan
                         devs[*ndev] = hid; // room checked at loop top
                         *ndev += 1;
                     }
@@ -1368,7 +1370,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // slice + slot, so nothing leaks across this pass.
         let mut devs = [Hid {
             slot: 0, dci: 0, port: 0, idx: 0, is_mouse: false,
-            hub_slot: 0, hub_dev: 0, hub_port: 0, hub_off: 0,
+            hub_slot: 0, hub_dev: 0, hub_port: 0, hub_off: 0, hub_nports: 0,
         }; MAX_HID];
         let mut ndev = 0usize;
         let mut sa = SliceAlloc::new();
@@ -1660,6 +1662,41 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     });
                     announce = true;
                     break 'poll;
+                }
+            }
+            // New device BEHIND A HUB. A device (re)plugged into a hub's downstream port changes no root
+            // PORTSC, so the root-port scan below misses it - it was only picked up on the next unrelated
+            // disconnect (the "keyboard came back after a while" latency). While there is room and on the
+            // throttled hub-poll tick, GET_STATUS the hub's UNBOUND downstream ports; a connected one is a
+            // fresh plug, so break to re-enumerate and bind it alongside the survivor(s). Same shared
+            // per-hub EP0 cursor as the disconnect check; any report it consumes is re-armed just below.
+            if hub_due && ndev < MAX_HID {
+                let mut scanned_hubs = 0u32; // hub slots already scanned this tick (scan each hub once)
+                for d in 0..ndev {
+                    let hub_slot = devs[d].hub_slot;
+                    if hub_slot == 0 || scanned_hubs & (1 << (hub_slot & 31)) != 0 { continue; }
+                    scanned_hubs |= 1 << (hub_slot & 31);
+                    let hub_dev = devs[d].hub_dev as usize;
+                    let nports = devs[d].hub_nports;
+                    let owner = cursor_owner[d];
+                    for hp in 1..=nports {
+                        if devs[..ndev].iter().any(|h| h.hub_slot == hub_slot && h.hub_port == hp) {
+                            continue; // already bound on this hub port
+                        }
+                        let (mut cur, mut pcs) = (hub_cur[owner], hub_pcs[owner]);
+                        let st = hub_port_status(
+                            &dma, &mmio, dboff, ir0, hub_slot, hub_dev, hp,
+                            &mut cur, &mut pcs, &mut ev_idx, &mut ev_cycle, &mut eaten,
+                        );
+                        hub_cur[owner] = cur;
+                        hub_pcs[owner] = pcs;
+                        if st == Some(true) {
+                            ctx.log_fmt(format_args!(
+                                "xhci: new device on hub slot {} port {} - re-enumerating", hub_slot, hp));
+                            announce = true;
+                            break 'poll;
+                        }
+                    }
                 }
             }
             if hub_due { last_hub_poll = ctx.read_tsc(); }
