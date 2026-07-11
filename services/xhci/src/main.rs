@@ -778,6 +778,50 @@ fn hc_wedged_now(ctx: &ServiceContext, mmio: &Mmio, op: usize) -> bool {
     wedged
 }
 
+/// Walk the xHCI Extended Capabilities (xECP pointer in HCCPARAMS1[31:16]) and return a bitmask of the
+/// root ports that belong to a USB 3.x (SuperSpeed) Supported Protocol Capability (Item 3, Fix 2).
+///
+/// On xHCI each physical USB3 connector is exposed as TWO logical root ports: a USB2 port and a USB3
+/// (SuperSpeed) companion. Boot HID devices (keyboard/mouse) are always reached through the USB2 ports;
+/// the SuperSpeed companions carry nothing the boot path needs, and the driver's SuperSpeed Address
+/// Device path does not yet complete on the Wyse (it returns "no completion" while the HC stays healthy,
+/// HCH=0 - see Fix 1's USBSTS log). Enumerating them only issues doomed commands and churns the shared
+/// event ring, so the caller skips the ports this returns. Bit `p` = root port `p` (1-based, matching the
+/// enumerate loop's `1..=max_ports`). Bounded walk: a malformed Next-pointer chain can neither loop
+/// forever nor read far outside the cap region (§26.6). Returns 0 if there is no xECP list (all ports
+/// enumerated as before).
+fn usb3_port_mask(mmio: &Mmio, hcc1: u32, max_ports: u32) -> u64 {
+    let mut mask = 0u64;
+    let mut ptr = ((hcc1 >> 16) & 0xFFFF) as usize; // xECP, in dwords from the MMIO base (0 = none)
+    let mut guard = 0u32;
+    while ptr != 0 && guard < 64 && ptr * 4 + 8 < 0x1_0000 {
+        guard += 1;
+        let d0 = mmio.read32(ptr * 4);
+        // Extended Capability: [7:0]=Cap ID, [15:8]=Next Cap Pointer (dwords, relative; 0 = end).
+        if d0 & 0xFF == 2 {
+            // Supported Protocol Capability: [31:24] of d0 = Major Revision (2 = USB2, 3 = USB3).
+            // dword 2 (+8): [7:0]=Compatible Port Offset (1-based), [15:8]=Compatible Port Count.
+            let major = (d0 >> 24) & 0xFF;
+            let d2 = mmio.read32(ptr * 4 + 8);
+            let port_off = d2 & 0xFF;
+            let port_cnt = (d2 >> 8) & 0xFF;
+            if major >= 3 {
+                let mut p = port_off;
+                while p < port_off.saturating_add(port_cnt) {
+                    if p >= 1 && p <= max_ports && p < 64 {
+                        mask |= 1u64 << p;
+                    }
+                    p += 1;
+                }
+            }
+        }
+        let next = (d0 >> 8) & 0xFF;
+        if next == 0 { break; }
+        ptr += next as usize;
+    }
+    mask
+}
+
 fn enumerate_one(
     ctx: &ServiceContext,
     dma: &Dma,
@@ -1171,6 +1215,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         version, max_slots, max_ports, ctx_size, dboff, rtsoff, max_scratch
     ));
 
+    // Fix 2 (Item 3): learn which root ports are USB3 (SuperSpeed) companions from the Supported Protocol
+    // Capability, and skip them during enumeration. Boot HID (keyboard/mouse) is reached through the USB2
+    // ports; the SuperSpeed companions carry nothing the boot path needs and the SS Address Device path
+    // does not yet complete (Fix 1's log showed "no completion" with the HC still healthy). Skipping them
+    // removes those doomed commands and the event-ring churn around them. 0 = no xECP -> enumerate all
+    // ports as before (e.g. an old controller or QEMU without a USB3 protocol range).
+    let usb3_ports = usb3_port_mask(&mmio, hcc1, max_ports);
+    ctx.log_fmt(format_args!(
+        "xhci: USB3 (SuperSpeed) companion root-port mask={:#x} - enumerating USB2 ports only (boot HID is USB2)",
+        usb3_ports
+    ));
+
     // Hot-plug state that persists across passes.
     let mut announce = false;    // suppress the connect line for the boot device
     let mut signaled = false;    // signal_input_ready (boot-screen clear) exactly once
@@ -1298,6 +1354,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut hc_wedged = false;
         for p in 1..=max_ports {
             if ndev >= MAX_HID { break; }
+            // Skip USB3 (SuperSpeed) companion ports (Item 3, Fix 2): boot HID is reached through the USB2
+            // ports, and the SS Address Device path does not yet complete - enumerating them only issues
+            // doomed commands and churns the shared event ring.
+            if p < 64 && usb3_ports & (1u64 << p) != 0 { continue; }
             // Skip a port that WEDGED the HC on a previous pass (Item 3, Fix 1). Enumerating it again
             // would just re-halt the controller and take the keyboard down with it; the working devices
             // (e.g. the keyboard's hub on a lower port) enumerate first and stay bound. Bounded: at most
