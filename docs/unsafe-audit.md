@@ -8,6 +8,14 @@ unless this file is updated in the same commit with a written SAFETY argument.**
 
 ---
 
+## 2026-07-11 - dynamic (RAM-sized) frame bitmap
+
+| File | Change | Why |
+|------|--------|-----|
+| `memory/allocator.rs` | 37 → 44 (+7) | The frame bitmaps are no longer fixed static `[u8; N]` arrays; they are sized to the machine's actual RAM at boot and carved from RAM, reached via the HHDM. The +7 is the raw-pointer machinery that replaces the (safe-indexed) static arrays: the `bitmap()` / `kpt()` slice accessors (`slice::from_raw_parts_mut` over `BITMAP_PTR`/`KPT_PTR`, 2 blocks), and in `init_from_map` the pointer publish + `KPT_PTR = BITMAP_PTR.add(bitmap_len)` + `write_bytes` zeroing of the carved region + the `hhdm==0` guard. Each carries a `// SAFETY:` note; the region is HHDM-mapped RAM reserved before any alloc and only ever touched under `ALLOC_LOCKED`. Permitted memory layer. Net effect: 64 MiB of fixed `.bss` (at the 1 TiB static cap) replaced by a bitmap of `RAM / 16 KiB` (e.g. 14 KiB on a 256 MiB box, 4 MiB on 64 GiB), sized dynamically - validated across 256 MiB..64 GiB in QEMU + identity 24/24. |
+
+---
+
 ## 2026-07-11 - kernel-audit fixes: user-copy fault guard (V1) + exception-handler backfill
 
 | File | Change | Why |
@@ -160,7 +168,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/rtc.rs | 1 | permitted |
 | arch/x86_64/syscall_entry.rs | 15 | permitted |
 | capability/table.rs | 7 | permitted |
-| memory/allocator.rs | 37 | permitted |
+| memory/allocator.rs | 44 | permitted |
 | memory/frame.rs | 1 | permitted |
 | memory/mod.rs | 1 | permitted |
 | memory/page.rs | 1 | permitted |
