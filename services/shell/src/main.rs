@@ -4620,6 +4620,12 @@ enum NetQ { Reply(Message), Timeout, Aborted }
 /// an abort key between tries, up to `max_secs`. Returns the reply, a timeout, or Aborted. (Safe under
 /// the piped shell-test: it waits for the prompt between commands, so no input is pending during `net`.)
 fn net_query(ctx: &ServiceContext, peer: &str, msg: &Message, max_secs: i64) -> NetQ {
+    // Drain any STALE reply left in our endpoint by a PRIOR command before we send ours - otherwise the
+    // request_with_reply below reads that leftover as if it were our answer. A q-aborted continuous `ping`
+    // leaves its last net-stack reply (a 4-byte [alive,rtt,ttl]) here; without this drain the next `net`
+    // reads it and prints a bogus DNS / "gave a short reply". Same class as the `net scan -> 0.0.0.0` bug;
+    // the abortable request variants already drain, but net_query (a deadline loop) did not.
+    while ctx.try_recv().is_some() {}
     for i in 0..=max_secs {
         while let Some(b) = ctx.try_console_read() {
             if b == b'q' || b == b'Q' || b == 0x1b { return NetQ::Aborted; }

@@ -107,7 +107,16 @@ const RTL_PHYSTATUS: usize = 0x6C; // PHY status: LinkSts = 0x02
 const RTL_RMS:       usize = 0xDA; // RX Max packet Size (16-bit)
 const RTL_RDSAR:     usize = 0xE4; // RX Descriptor Start Address (64-bit phys, 256B aligned)
 const RTL_DTCCR:     usize = 0x10; // Dump Tally Counter Command Register (64-bit): buf phys | bit3 (Dump)
-const TALLY_POLL_MAX: u32  = 100_000; // the NIC dumps the counters in ~us; bound the wait loudly
+// The DTCCR counter dump is a DIAGNOSTIC (the chip's cumulative RxOk/TxOk tallies for `net stats`), and
+// it is DMA-driven: on a healthy NIC it completes in ~us (the first few poll iterations). But it must
+// NEVER delay the [3] status reply, because net-stack's `link_is_up` waits only ~1s (LINK_SECS) for that
+// reply and reads the LINK byte from it - the essential truth. A NIC whose DMA is wedged (e.g. after a
+// `chaos max-carnage nic-driver` reset-storm) would never finish the dump; at the old 100_000-yield bound
+// (~1s of scheduler round-trips) that timed out net-stack's [3] request, so a plugged cable read as "no
+// link" and `ping` froze. So the bound is TIGHT: the link byte is read from PHYSTATUS BEFORE the dump, so
+// a dump that does not complete just yields ZERO counters (a degraded stat, not a slow link), reported
+// loudly once (VIII - wait on truth incl. failure; X - the diagnostic must not block the essential fact).
+const TALLY_POLL_MAX: u32  = 2_000;
 
 const RTL_CR_RE:  u8 = 0x08;
 const RTL_CR_TE:  u8 = 0x04;
@@ -231,6 +240,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
     // same [3] link byte and self-configures on the up edge. None = report the real PHY (default); Some(b)
     // = report the forced state. Cleared ([8]) after a flap so a REAL later unplug is never masked.
     let mut force_link: Option<bool> = None;
+    let mut tally_wedged_logged = false;   // one-shot loud note if the DMA counter dump ever times out
     loop {
         let req = ctx.recv();
         let reply_cap = match ctx.take_pending_cap() { Some(c) => c, None => continue };
@@ -270,6 +280,13 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
             mmio.write32(RTL_DTCCR, ((tbuf as u32) & !0x3F) | 0x08);   // 64B-aligned addr | Dump
             let mut td = 0u32;
             while td < TALLY_POLL_MAX && mmio.read32(RTL_DTCCR) & 0x08 != 0 { ctx.yield_cpu(); td += 1; }
+            if td >= TALLY_POLL_MAX && !tally_wedged_logged {
+                // The counter dump did not complete - the NIC's DMA is slow/wedged. Report it ONCE (not
+                // per query - that would spam) and carry on: the counters read zero (a degraded `net stats`),
+                // but the link byte below is truthful and the reply is fast, so `net`/`ping` keep working.
+                ctx.log("nic-driver: RTL8168 counter dump timed out (DMA slow/wedged) - stats degraded, link still served");
+                tally_wedged_logged = true;
+            }
             let rx_ok  = arena.read32(TALLY_OFF + 0x08);
             let tx_ok  = arena.read32(TALLY_OFF + 0x00);
             let rx_brd = arena.read32(TALLY_OFF + 0x30);
