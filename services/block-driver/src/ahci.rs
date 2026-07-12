@@ -584,6 +584,15 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
         ));
         if sig == SIG_SATA && disk_port.is_none() {
             disk_port = Some(p);
+            // block-driver uses exactly ONE disk, so stop at the first SATA port. Probing further is
+            // pure waste - and on an empty port `wait_port_ready` spends its full slow-establish budget
+            // (2M reads -> COMRESET -> 2M reads) before returning false. That budget exists to catch a
+            // *disk* whose PHY is slow to come up (warm reboot / chaos soak); an empty port has no
+            // device to wait for. On real hardware an MMIO read is ~ns so the waste is invisible, but
+            // under QEMU TCG each read is a VM exit: an HBA that implements 6 ports (PI=0x3f) would burn
+            // ~4M reads x 5 empty ports and blow the boot window, so `fs` never mounts. Breaking here
+            // keeps the full slow-establish robustness for the disk's own port and skips the rest.
+            break;
         }
     }
 
