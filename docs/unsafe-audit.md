@@ -6,7 +6,30 @@ containing the `unsafe` keyword per file and compares to the baseline table belo
 **A PR that increases any file's count, or adds unsafe to a new file, fails CI
 unless this file is updated in the same commit with a written SAFETY argument.**
 
+`unsafe_check.py` scans `kernel/src/` (tracked against the inventory below) **and `services/`** (where
+it fails on ANY `unsafe` line - §18.2 forbids service `unsafe`). The SDK's permitted-layer `unsafe`
+(`syscall`, `mmio`, `dma`, `adversarial` - §18.1) is not inventoried here; each block carries a SAFETY
+comment.
+
 ---
+
+## 2026-07-12 - userspace audit M8: probe made `unsafe`-free; `unsafe_check.py` now scans `services/`
+
+`probe` (the §22 adversarial/fuzz/chaos test harness) held raw-SYSCALL `asm!` plus deliberate ring-3
+faults (null read, non-canonical read, divide-by-zero) - `unsafe` in a userspace service, forbidden by
+§18.2, and INVISIBLE because `unsafe_check.py` scanned only `kernel/src/`. Both gaps closed:
+
+- The `unsafe` moved to a new **audited SDK module `sdk/rust/src/adversarial.rs`** (§18.1 amendment):
+  safe `fuzz_syscall` (wraps the ABI `raw_syscall`; the kernel validates every fuzzed call) and safe
+  `fault_null_read` / `fault_noncanonical_read` / `fault_divide_by_zero` (the deliberate faults, each
+  SAFETY-commented). `probe` calls these safe wrappers and is now `unsafe`-free.
+- `scripts/unsafe_check.py` now also scans **`services/`** and FAILS on any service `unsafe` line -
+  mechanically enforcing §18.2 and catching any future regression (the M8 blind spot). As a bonus,
+  `fuzz_syscall` uses the SDK's `ud2` trap, removing probe's old raw `syscall` instruction (a latent
+  AMD-GX-420GI stall hazard).
+
+Verified: `osdev test adv` 15/0 (A10 fuzz, A14 faults, A15 bad-ptr all pass through the SDK wrappers);
+`unsafe_check.py` passes with `services/` scanned. Kernel inventory unchanged (471 lines).
 
 ## 2026-07-11 - core count fully dynamic (MAX_CORES ceiling removed)
 

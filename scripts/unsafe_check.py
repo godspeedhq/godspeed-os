@@ -19,6 +19,7 @@ from pathlib import Path
 
 REPO_ROOT   = Path(__file__).parent.parent
 KERNEL_SRC  = REPO_ROOT / "kernel" / "src"
+SERVICES    = REPO_ROOT / "services"
 AUDIT_FILE  = REPO_ROOT / "docs" / "unsafe-audit.md"
 
 INVENTORY_START = "<!-- unsafe-inventory-start -->"
@@ -99,6 +100,21 @@ def main() -> int:
             infos.append(
                 f"  INFO  {rel}: unsafe count shrank {audit[rel]} → {actual} "
                 f"(update audit to lock in the reduction)"
+            )
+
+    # §18.2: NO userspace service may contain `unsafe`. probe (the adversarial/fuzz/chaos test harness)
+    # was the one violator; its raw-syscall fuzzing + deliberate ring-3 faults moved to the SDK's audited
+    # `adversarial` module (§18.1), so probe is now unsafe-free. This scan enforces that it stays gone AND
+    # that no other service regresses - a service that needs `unsafe` needs the kernel or a safe SDK
+    # wrapper instead (§18.2). This is the blind spot the userspace audit (M8) found: the check used to
+    # scan only kernel/src.
+    for rs_file in sorted(SERVICES.rglob("*.rs")):
+        n = count_unsafe(rs_file)
+        if n > 0:
+            rel = rs_file.relative_to(REPO_ROOT).as_posix()
+            failures.append(
+                f"  FAIL  {rel}: {n} unsafe line(s) - §18.2 forbids `unsafe` in a userspace service; "
+                f"move it behind a safe SDK wrapper (§18.1, e.g. sdk `adversarial`/`mmio`/`dma`)"
             )
 
     if infos:
