@@ -232,8 +232,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
         if link_up { "UP" } else { "down (no cable?)" }));
 
     let mut rxbuf = [0u8; FRAME_MAX];
-    let mut tx_idx = 0usize;
-    let mut rx_idx = 0usize;
+    let mut rx_idx = 0usize;   // the single TX descriptor (slot 0) is used directly, no tx index needed
     // Live stats surfaced through the [3] status query so `net` shows link/TX/RX on the TV (no serial).
     let mut last_tx_done = false;
     let mut last_rx_len  = 0u16;
@@ -397,34 +396,37 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
         mmio.write8(RTL_CR, RTL_CR_RE | RTL_CR_TE);         // RX back on, from descriptor 0
         rx_idx = 0;
 
-        // --- Transmit: copy the frame in, point descriptor tx_idx at it, kick TPPoll, wait on OWN
-        // clearing (Commandment VIII, bounded + loud). ---
+        // --- Transmit: copy the frame in, point THE SINGLE TX descriptor (slot 0) at it, kick TPPoll,
+        // wait on OWN clearing (Commandment VIII, bounded + loud). ---
+        //
+        // A SINGLE descriptor (EOR always set, so the NIC's TX ring is one entry that wraps 0->0) is
+        // used deliberately. The frame path is strictly one-at-a-time - net-stack sends a frame, waits
+        // for the reply, then sends the next - so an 8-deep ring buys no parallelism and only lets the
+        // NIC's internal TX head DESYNC from the driver's index. That desync is the CONFIRMED cause of
+        // the RTL8168 TX timeout on the Wyse: the diagnostic showed `desc=0xb000004a isr=0x0091` -
+        // the descriptor still OWN-set + FS/LS (untouched by the NIC) while ISR latched TDU (Tx
+        // Descriptor Unavailable), i.e. the NIC's head was NOT at the descriptor we wrote, so it saw
+        // "no work" and skipped ours. With exactly one descriptor the head cannot drift from it.
         let frame = req.payload_bytes();
         let flen = frame.len().min(RX_BUF_SIZE);
         for i in 0..flen { arena.write8(TX_BUF_OFF + i, frame[i]); }
-        let td = TX_RING_OFF + tx_idx * 16;
+        let td = TX_RING_OFF;                       // the single TX descriptor (slot 0)
         let tx_buf = arena.phys_at(TX_BUF_OFF);
         arena.write32(td + 8, (tx_buf & 0xffff_ffff) as u32);
         arena.write32(td + 12, (tx_buf >> 32) as u32);
         arena.write32(td + 4, 0);
-        let mut o1 = RTL_DESC_OWN | RTL_DESC_FS | RTL_DESC_LS | (flen as u32 & 0x3FFF);
-        if tx_idx == TX_RING_COUNT - 1 { o1 |= RTL_DESC_EOR; }
-        arena.write32(td, o1);                  // OWN set LAST (the NIC may read the descriptor at once)
+        // OWN + EOR (single-entry ring) + FS + LS + length. OWN set LAST (the NIC may read at once).
+        let o1 = RTL_DESC_OWN | RTL_DESC_EOR | RTL_DESC_FS | RTL_DESC_LS | (flen as u32 & 0x3FFF);
+        arena.write32(td, o1);
         mmio.write8(RTL_TPPOLL, RTL_TPPOLL_NPQ);
         let mut ts = 0u32;
         while ts < TX_POLL_MAX && arena.read32(td) & RTL_DESC_OWN != 0 { ctx.yield_cpu(); ts += 1; }
         let tx_done = ts < TX_POLL_MAX;
-        if tx_done {
-            tx_idx = (tx_idx + 1) % TX_RING_COUNT;
-        } else {
-            // TX did not complete: the NIC never cleared the descriptor's OWN bit. On the Wyse RTL8168 this
-            // happens intermittently even on a healthy 1000M link (the T630 is more forgiving) and is the
-            // real cause of the `ping` flap - a lost TX means no echo goes out. Two things to contain
-            // (VIII bounded+loud, IX recover): a stuck TX must fail FAST (the tight bound above), and a
-            // stuck descriptor must NOT cascade into every later send. DIAGNOSE the NIC state (first few,
-            // to guide the root-cause fix on the next hardware pass) then RECOVER the TX engine: toggle TE
-            // off/on so it re-reads the ring from TNPDS, clear latched status, drop the stuck descriptor's
-            // OWN, and restart at descriptor 0. RE stays on throughout, so RX is undisturbed.
+        if !tx_done {
+            // With a single descriptor a ring desync is impossible, so a timeout here is a genuine NIC
+            // hiccup, not a cascade. Fail FAST (the tight bound above), DIAGNOSE (first few, to confirm
+            // the desync is gone), and RECOVER the engine: TE off/on to reset it, clear latched status,
+            // drop the stuck OWN. RE stays on, so RX is undisturbed (VIII bounded+loud, IX recover).
             let isr = mmio.read16(RTL_ISR);
             let cr  = mmio.read8(RTL_CR);
             if tx_fail_logged < 6 {
@@ -433,14 +435,13 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
                     arena.read32(td), isr, cr, flen));
                 tx_fail_logged += 1;
             }
-            mmio.write8(RTL_CR, RTL_CR_RE);             // TE off: stop + reset the TX engine (RX stays up)
+            mmio.write8(RTL_CR, RTL_CR_RE);             // TE off: reset the TX engine (RX stays up)
             mmio.write16(RTL_ISR, 0xFFFF);             // clear any latched TX error/status
             arena.write32(td, 0);                       // drop the stuck descriptor's OWN
             let tx_ring = arena.phys_at(TX_RING_OFF);
             mmio.write32(RTL_TNPDS, (tx_ring & 0xffff_ffff) as u32);
             mmio.write32(RTL_TNPDS + 4, (tx_ring >> 32) as u32);
-            mmio.write8(RTL_CR, RTL_CR_RE | RTL_CR_TE);  // TE back on - re-reads TNPDS, ring re-synced
-            tx_idx = 0;
+            mmio.write8(RTL_CR, RTL_CR_RE | RTL_CR_TE);  // TE back on - re-reads TNPDS
         }
 
         // --- Receive a reply: poll the current RX descriptor's OWN bit (bounded), copy it out, re-arm. ---
