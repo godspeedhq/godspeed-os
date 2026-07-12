@@ -64,14 +64,15 @@ const DANCE_TRIES: u32 = 6;
 // DNS collects frames after ONE query TX (the [4] RX-only path): up to this many frames pulled without
 // re-transmitting, so a reply behind stray broadcasts is caught (a re-TX would drain+discard it).
 const DNS_RX_TRIES: u32 = 12;
-/// ICMP echo RX budget: how many frames the echo reply is looked for behind. On a BUSY LAN the frame
-/// that returns right after the echo TX is often a stray BROADCAST (mDNS/ARP/etc.), not our reply, so a
-/// budget of 1 (check only that first frame) times out even though the reply is the very next frame -
-/// the "Request timed out while connected" seen on a real network. Each extra try is a fast RX-only poll
-/// (nic-driver bounds it, a frame is already waiting on a busy LAN), so 4 catches the reply behind up to
-/// 3 strays for negligible cadence cost - still far tighter than DNS's 12, and the link is re-checked on
-/// a real timeout so a mid-poll cable drop still reports "no link" fast, not a stalled "Request timed out".
-const PING_RX_TRIES: u32 = 4;
+/// ICMP echo RX budget (loop iterations AFTER the initial send-and-wait). Kept at 1 deliberately. Bumping
+/// it to catch an echo reply that arrives BEHIND a stray broadcast (the minor "Request timed out while
+/// connected" on a busy LAN) BACKFIRED: each extra try is a separate RX-only request to nic-driver, and
+/// when the ring is momentarily empty nic-driver polls its full RX budget (~hundreds of ms on the Wyse),
+/// so 4 tries pushed net-stack's ping handler past the shell's ~5s deadline -> the shell declared
+/// "net-stack not responding" (a WORSE regression than the nitpick). A proper fix must collect several
+/// frames within ONE bounded nic-driver poll, not N slow round-trips - future work. So the value stays 1:
+/// a live reply lands in the initial wait; a lost/behind-broadcast echo just retries on the next ping.
+const PING_RX_TRIES: u32 = 1;
 /// Max ICMP echo DATA bytes `ping` will send (the Windows default is 32). Bounds the frame buffer.
 const PING_MAX_PAYLOAD: usize = 1024;
 
