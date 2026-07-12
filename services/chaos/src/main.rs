@@ -218,6 +218,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut rng = Rng::new((start_epoch as u64)
         ^ ((start_dt.minute as u64) << 24) ^ ((start_dt.second as u64) << 40));
 
+    // Reap ORPHANED mem-pressure tasks left by a PRIOR chaos run that was itself killed mid-run before
+    // its end-of-run cleanup (below) could reap them (audit L5). chaos cannot clean up after its own
+    // death (a dead task runs nothing), so the next run adopts the orphans and frees them + their held
+    // memory here, at the start - the run-boundary reap that the killed run's end-boundary reap missed.
+    // Bounded (a kill racing a respawn cannot spin forever); a no-op when there are none.
+    {
+        let mut g = 0u32;
+        while slot_of(&ctx, "mem-pressure").is_some() && g < 512 {
+            let _ = ctx.kill("mem-pressure"); g += 1;
+        }
+        if g > 0 { ctx.log_fmt(format_args!("chaos: reaped {} orphaned mem-pressure task(s) from a prior killed run", g)); }
+    }
+
     'carnage: loop {
         // `q` aborts (round boundary; also polled between each kill/flood in the sweep below, so one q
         // press aborts within a sub-step rather than lagging a whole round). The kernel buffers the

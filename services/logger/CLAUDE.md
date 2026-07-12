@@ -2,30 +2,40 @@
 
 Structured log sink (§11.4). **Restartable.** Not a TCB member.
 
-## Startup sequence
+## Current behaviour (what the code actually does)
 
-1. Call `ctx.drain_kernel_ring_buffer()` - read all bytes from the 16 KiB kernel ring buffer accumulated before logger started (§11.4).
-2. Register its name in the kernel directory.
-3. Print `"logger: ready"`.
-4. Enter recv loop.
+The logger is a **minimal placeholder** today (`src/main.rs`): it prints `"logger: ready"` and then
+**drains its recv endpoint, dropping each message**. It does that draining deliberately - a registered
+service whose endpoint just parked (never `recv`s) would let a flood or a stray send fill its 16-deep
+queue and sit at 16/16 forever (the flood-endpoint disease). `recv` parks the task between messages, so
+the core still idles.
 
-## Input format
+**How services actually log today:** `ctx.log()` is a **syscall** that writes the kernel's 16 KiB ring
+buffer **and** the serial console **directly** - it does NOT send IPC to this service. So logging does
+not depend on the logger being up: when the logger is dead, `ctx.log()` still works (it never blocks on
+the logger and never returns `EndpointDead` from it), and a chaos storm that kills the logger loses no
+log output. The logger service exists to own its name + endpoint and to be a restartable home for the
+richer sink described next.
 
-Each log message is an IPC message from a service holding `log_write`. The payload encodes: service name (tag), log level, text.
+## Future work (not yet implemented)
 
-## Output
-
-v1: serial console only. Future: append to a log file via `fs`.
+The `src/main.rs` header lists what a real sink would add - none of it is wired yet:
+1. `ctx.drain_kernel_ring_buffer()` on startup - read bytes accumulated before the logger started.
+2. A recv loop that DECODES an IPC log protocol from services holding `log_write` (payload = service
+   tag + level + text) instead of dropping.
+3. Formatted output to serial, and later appended to a log file via `fs`.
 
 ## Restartability
 
-Logger is stateless. On restart it drains the ring buffer again (which may have buffered messages from the outage window) and resumes. Log history before the restart window is lost; the ring buffer preserves the most recent 16 KiB.
-
-When logger is down, services that call `ctx.log()` block on a full queue or get `EndpointDead`. They must handle this gracefully - logging failure should never kill a service.
+Logger is stateless, so it restarts trivially: the supervisor respawns it on death (§6.2) and it prints
+`"logger: ready"` again. There is no state to reconstruct. (Once the drain-and-decode sink above lands,
+a restart would re-drain the ring buffer for the outage window; today there is nothing to recover.)
 
 ## Supervisor retry (§11.3)
 
-If logger fails to spawn at boot, init logs to the kernel ring buffer and retries. Logger is not TCB so its spawn failure does not cause a kernel panic.
+The **supervisor** spawns the logger (init was removed, Phase 5) and retries once on failure; its output
+falls back to the kernel ring buffer meanwhile. Logger is not TCB, so its spawn failure does not cause a
+kernel panic.
 
 ## TODO: per-core kernel log buffers (post-v1 / post-BP2)
 

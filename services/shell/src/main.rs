@@ -39,7 +39,8 @@ const FS_OK: u8 = 0;
 const FS_NOTFOUND: u8 = 2;
 const FS_NOFS: u8 = 3;
 const FS_UNAVAIL: u8 = 4;   // present-but-unreadable storage: do NOT flash (data may be intact)
-const FS_DENIED: u8 = 4; // file-cap op needs a right the cap lacks (non-escalation, §7.3)
+const FS_DENIED: u8 = 5; // file-cap op needs a right the cap lacks (non-escalation, §7.3); DISTINCT
+                         // from FS_UNAVAIL(4) so a client can tell "denied" from "storage down" (audit L2)
 // File-as-capability (§7.10, P2): Open mints a file cap; the holder invokes it (FOP_*).
 const OP_OPEN: u8 = 30;  // [op, plen, path, rights:u8] → [FS_OK] + embedded FILE CAP
 const FOP_READ: u8 = 1;  // [FOP_READ, offset:u64, len:u32]  (needs READ)
@@ -4852,6 +4853,9 @@ fn build_status_table(ctx: &ServiceContext) -> Table {
 /// (total seconds since boot). Bare `uptime` renders the grid; `uptime | to json|yaml` renders the
 /// row; `uptime | select seconds` etc. work like any record stream. The clock is a wall-clock RTC
 /// delta (now − boot, InspectKernel queries 11/12), so it's correct on any APIC timer mode.
+#[inline(never)] // keep this builder's frame out of pipe_run's 64 KiB Stream frame, like every sibling
+                 // record-builder (build_ls/caps/drives/find/observe/status); a byte pipe overflows the
+                 // user stack otherwise (the PUSER-PF lesson). Audit L7 - it was the lone omission.
 fn build_uptime_table(ctx: &ServiceContext) -> Table {
     let secs = ctx.uptime_secs() as u64;
     let (d, h, m, s) = (secs / 86_400, (secs % 86_400) / 3_600, (secs % 3_600) / 60, secs % 60);
