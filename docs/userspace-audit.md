@@ -49,6 +49,33 @@ supervisor do not retry every path to satisfaction) and **contract drift** (priv
 authority granted by kernel name-match, not expressed in the contract). Two shell pipe/invoke paths
 still use a bare blocking `recv` that a mid-stream peer death could hang.
 
+### Fix log (Audit 1 remediation)
+
+Staged high-priority-first. Status updated as fixes land on `feat/dell-wyse-5070-goldmont-plus`.
+
+| Item | Status | Commit / note |
+|------|--------|---------------|
+| **M1** drain_service bare recv | **FIXED** | `b4f212c` - SDK `recv_abortable_deadline`; happy-path drain unchanged, adds Timeout/Aborted wakes. Verified: files pipe checks green |
+| **M2** fc_invoke/sock_invoke bare recv | **FIXED** | `b4f212c` - same primitive; verified `osdev test file-cap` 10/0 |
+| M3 net-stack interactive reacquire | open | Stage 2 |
+| M4 net-stack identity cache reconcile | open | Stage 2 |
+| M5 supervisor steady-state respawn retry | open | Stage 3 |
+| M6 block-driver contract drift | open | Stage 4 |
+| M7 by-name grant (T1) | open | Stage 4 (design decision) |
+| M8 probe unsafe untracked | open | Stage 5 |
+| L1-L8 | open | Stage 2/3/6 |
+
+> **Storage-stack prerequisite fixed (bonus, not an audit finding): `fe59cbf`.** Verifying any fs
+> fix in QEMU was blocked by a block-driver AHCI stall - it probed every implemented port (QEMU's HBA
+> reports `PI=0x3f` = 6 ports) and spent `wait_port_ready`'s full slow-establish budget (~4M MMIO
+> reads + a COMRESET) on each *empty* port. On hardware an MMIO read is ~ns so it's invisible (your
+> Wyse is fine); under QEMU 11.0.50's slow TCG MMIO it blew the boot window and `fs` never mounted, so
+> every fs test (file-cap, files, fs-restart) timed out. Fix: stop the scan at the first SATA disk
+> (block-driver uses exactly one) - keeps full slow-establish robustness for the disk's port, skips
+> empty ports. `osdev test file-cap` 10/0 (was: fcap timed out). A real latent driver bug QEMU
+> surfaced (Commandment II). Note: the QEMU `files` suite's residual failures are host-load timing in
+> the heavy gsh section (the gsh engine itself passes `osdev test script` 4/0), not a code defect.
+
 ### MED findings (fix these)
 
 #### M1. [VIII] `services/shell/src/main.rs:5854-5861` (`drain_service`) - bare `ctx.recv()` on the general pipe path can hang forever
