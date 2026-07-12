@@ -7,8 +7,10 @@ limit   = "8MiB"
 
 [capabilities]
 ipc_receive = ["logger"]
-# logger needs hw access to write to the serial port.
-hw_mmio     = ["0x3F8+0x8"]
+# No hw_mmio: the logger does NOT drive the serial port itself. Services log via the `ctx.log()` SYSCALL,
+# which writes the kernel ring buffer + serial DIRECTLY (§11.4); the logger only owns its recv endpoint
+# (a placeholder sink today - services/logger/CLAUDE.md). The old `hw_mmio = ["0x3F8+0x8"]` here was
+# never granted by the kernel - a contract stating authority the service never held (audit T1 reconcile).
 
 [placement]
 core = 0

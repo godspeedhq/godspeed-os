@@ -355,7 +355,8 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
+            memory_limit:      8 * 1024 * 1024,   // matches logger.toml (a stub sink needs ~none); the
+                                                 // contract is the source of truth (audit T1 reconcile)
             hw_irqs:           &[],
             has_console_read:  false,
         })),
