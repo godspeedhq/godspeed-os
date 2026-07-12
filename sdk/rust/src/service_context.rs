@@ -17,6 +17,19 @@ pub enum ReqOutcome {
     Timeout,
 }
 
+/// Outcome of [`ServiceContext::request_with_reply_deadline_outcome`], which distinguishes the two
+/// ways a deadline request fails - so a caller can self-heal a *restarted* peer without penalising a
+/// *silent* one. `SendFailed`: the send never left (the peer's cap is stale or its name is currently
+/// unresolvable - it was killed and respawned, generation bumped), so reacquiring it by name and
+/// retrying will reach the fresh instance. `Timeout`: the peer received the request but did not reply
+/// within the deadline (a genuinely silent/absent host) - retrying only doubles the wait.
+/// `request_with_reply_deadline` collapses both to `None`; use this when the difference matters.
+pub enum DeadlineOutcome {
+    Reply(Message),
+    SendFailed,
+    Timeout,
+}
+
 /// Wall-clock date/time read from the hardware RTC, fully decoded (binary,
 /// 24-hour). See [`ServiceContext::datetime`].
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -531,21 +544,38 @@ impl ServiceContext {
         msg:  &crate::ipc::Message,
         max_secs: i64,
     ) -> Option<crate::ipc::Message> {
-        let target = CapHandle(self.find_send_slot(peer)?);
-        let self_grant = self.self_grant_handle()?;
-        let reply_cap = self.derive_cap(self_grant)?;
+        match self.request_with_reply_deadline_outcome(peer, msg, max_secs) {
+            DeadlineOutcome::Reply(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// Like [`Self::request_with_reply_deadline`] but returns the DISTINCTION between a send that never
+    /// left (stale/unresolvable peer cap) and a peer that received the request but stayed silent past
+    /// the deadline (see [`DeadlineOutcome`]). Same bounded, RTC-deadline wait; use this when a caller
+    /// must reacquire+retry a *restarted* peer (`SendFailed`) but must NOT double the wait on a merely
+    /// *silent* one (`Timeout`).
+    pub fn request_with_reply_deadline_outcome(
+        &self,
+        peer: &str,
+        msg:  &crate::ipc::Message,
+        max_secs: i64,
+    ) -> DeadlineOutcome {
+        let target = match self.find_send_slot(peer) { Some(s) => CapHandle(s), None => return DeadlineOutcome::SendFailed };
+        let self_grant = match self.self_grant_handle() { Some(g) => g, None => return DeadlineOutcome::SendFailed };
+        let reply_cap = match self.derive_cap(self_grant) { Some(c) => c, None => return DeadlineOutcome::SendFailed };
         if self.send_with_cap_by_handle(target, reply_cap, msg).is_err() {
             self.remove_cap(reply_cap);   // send failed: reclaim the untransferred reply cap (no leak)
-            return None;
+            return DeadlineOutcome::SendFailed;
         }
         // Deglitched monotonic clock, not the raw RTC: a single CMOS misread (the "4383d" glitch on the
         // T630) would otherwise make `now - t0` read huge and expire the deadline instantly.
         let t0 = self.epoch_secs_monotonic();
         loop {
-            if let Some(r) = self.try_recv() { return Some(r); }
+            if let Some(r) = self.try_recv() { return DeadlineOutcome::Reply(r); }
             if self.epoch_secs_monotonic() - t0 >= max_secs {
                 self.remove_cap(reply_cap);   // reply never consumed - reclaim its slot
-                return None;
+                return DeadlineOutcome::Timeout;
             }
             self.yield_cpu();
         }

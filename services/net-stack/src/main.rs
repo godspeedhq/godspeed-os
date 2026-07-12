@@ -19,7 +19,7 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, Message};
+use godspeed_sdk::{ServiceContext, Message, DeadlineOutcome};
 
 // The NIC's MAC. In QEMU the e1000 default is 52:54:00:12:34:56; a real net-stack learns this from
 // nic-driver at init (a small refinement), but nic-driver runs the NIC promiscuous, so a reply is
@@ -72,6 +72,31 @@ const DNS_RX_TRIES: u32 = 12;
 const PING_RX_TRIES: u32 = 1;
 /// Max ICMP echo DATA bytes `ping` will send (the Windows default is 32). Bounds the frame buffer.
 const PING_MAX_PAYLOAD: usize = 1024;
+
+/// Send a request to nic-driver and await the reply, RECOVERING from a nic-driver restart (audit M3).
+/// If the cached send cap has gone stale - nic-driver was killed and respawned (a real event:
+/// `chaos max-carnage nic-driver`), so its endpoint generation bumped - the first send fails and the
+/// deadline wait returns `None`. We then reacquire the driver by name from the kernel directory
+/// (§14.3, the same recovery `dhcp_discover`/`udp_roundtrip` already do in their loops) and retry once.
+/// Returns `None` only if the driver is genuinely absent or silent past the deadline. Use this for the
+/// FIRST request of each interactive path (`link_is_up`/`ping`/`dns`/`arp`); the poll-loop requests
+/// that follow reuse the now-reacquired cached cap. Without it a configured stack never self-heals
+/// after a driver restart on the ping/net/dns/arp surface - it needs a manual `net renew`. Because the
+/// reply is `request_with_reply` under the hood, a driver that dies mid-request wakes us with
+/// `ReplyDead` (never a hang), and the reacquire fixes a *stale* cap the fast-fail send exposes.
+fn nic_req(ctx: &ServiceContext, msg: &Message, secs: i64) -> Option<Message> {
+    match ctx.request_with_reply_deadline_outcome("nic-driver", msg, secs) {
+        DeadlineOutcome::Reply(r) => Some(r),
+        // The send never left - nic-driver's cap is stale (it was killed + respawned). Reacquire it by
+        // name from the kernel directory and retry once against the fresh instance.
+        DeadlineOutcome::SendFailed if ctx.reacquire_by_name("nic-driver") =>
+            ctx.request_with_reply_deadline("nic-driver", msg, secs),
+        // A genuine timeout (the driver got it but the host was silent), or a reacquire that still
+        // could not resolve the driver: return failure WITHOUT retrying - retrying a silent host would
+        // just double every no-answer wait (net arp/dns to a host that does not answer).
+        _ => None,
+    }
+}
 
 /// Phase 3: a DHCP DISCOVER over UDP - ask QEMU slirp's built-in DHCP server for our IP and read the
 /// OFFER. This proves the UDP transport (the layer the socket capability sits on) over the frame
@@ -224,7 +249,7 @@ fn dns_resolve(ctx: &ServiceContext, hostname: &[u8], gw_mac: &[u8; 6], our_ip: 
     let req     = Message::from_bytes(&frame[..frame_len]);
     let rx_only = Message::from_bytes(&[4u8]);
     let mut arp_out = [0u8; 42];
-    let mut reply = ctx.request_with_reply_deadline("nic-driver", &req, DANCE_SECS);
+    let mut reply = nic_req(ctx, &req, DANCE_SECS);
     for _ in 0..DNS_RX_TRIES {
         let (matched, answer_arp) = {
             let f: &[u8] = match &reply { Some(r) => r.payload_bytes(), None => { *timeouts += 1; &[] } };
@@ -387,7 +412,7 @@ fn arp_resolve(ctx: &ServiceContext, our_ip: &[u8; 4], target: &[u8; 4]) -> Opti
     let req     = Message::from_bytes(&arp);
     let rx_only = Message::from_bytes(&[4u8]);
     let mut arp_out = [0u8; 42];
-    let mut reply = ctx.request_with_reply_deadline("nic-driver", &req, DANCE_SECS);
+    let mut reply = nic_req(ctx, &req, DANCE_SECS);
     for _ in 0..DNS_RX_TRIES {
         let (mac, answer_arp) = {
             let f: &[u8] = match &reply { Some(r) => r.payload_bytes(), None => &[] };
@@ -458,7 +483,7 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8;
     let req     = Message::from_bytes(&frame[..flen]);
     let rx_only = Message::from_bytes(&[4u8]);
     let mut arp_out = [0u8; 42];
-    let mut reply = ctx.request_with_reply_deadline("nic-driver", &req, LINK_SECS);
+    let mut reply = nic_req(ctx, &req, LINK_SECS);
     for _ in 0..PING_RX_TRIES {
         let (matched, ttl, answer_arp) = {
             let f: &[u8] = match &reply { Some(r) => r.payload_bytes(), None => { *timeouts += 1; &[] } };
@@ -583,7 +608,7 @@ fn run_dance(ctx: &ServiceContext) -> NetState {
 /// path the reply is short (no link byte) - a non-empty reply means "up" (slirp's virtual link is always
 /// up). Cheap; lets net-stack notice a cable plugged in after boot and self-configure without `net renew`.
 fn link_is_up(ctx: &ServiceContext) -> bool {
-    match ctx.request_with_reply_deadline("nic-driver", &Message::from_bytes(&[3u8]), LINK_SECS) {
+    match nic_req(ctx, &Message::from_bytes(&[3u8]), LINK_SECS) {
         Some(r) => { let p = r.payload_bytes(); if p.len() > 7 { p[7] != 0 } else { !p.is_empty() } }
         None    => false,
     }
