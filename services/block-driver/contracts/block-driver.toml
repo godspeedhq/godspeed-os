@@ -6,10 +6,14 @@ request = "8MiB"
 limit   = "16MiB"
 
 [capabilities]
-# ATA secondary channel via kernel-mediated port I/O (docs/persistence.md §5):
-# command block 0x170-0x177 (+0x8) and the 0x376 control port (+0x1). No DMA,
-# no MMIO - a PIO driver is least-privilege by construction (§5.1).
-hw_pio    = ["0x170+0x8", "0x376+0x1"]
+# block-driver is an AHCI (SATA) driver: it holds the HBA's MMIO window (ABAR) and a
+# physically-contiguous DMA arena. Those hardware caps are NOT declared here - the kernel grants them
+# at spawn, gated on the PCI scan finding the AHCI controller (kernel `task::mod`,
+# `name == "block-driver" && AHCI_FOUND`), because the BAR address is runtime-DISCOVERED and cannot be
+# a static contract value. This by-name grant of a runtime-discovered hardware cap is the sanctioned
+# mechanism for hardware drivers (docs/userspace-audit.md T1); the authority is still an explicit held
+# cap, never ambient-at-use. (The retired ATA-PIO bring-up backend declared `hw_pio` here; AHCI needs
+# no port I/O, so it is removed - the contract no longer mis-states the driver's privilege.)
 log_write = true
 
 [placement]
