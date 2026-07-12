@@ -63,9 +63,14 @@ Staged high-priority-first. Status updated as fixes land on `feat/dell-wyse-5070
 | M5 supervisor steady-state respawn retry | open | Stage 3 |
 | **M6** block-driver contract drift | **FIXED** | `1cf...` - removed the dead `hw_pio` lie (read by nothing; kernel grants AHCI MMIO/DMA by name); contract now tells the truth |
 | M7 by-name grant (T1) | **DECIDED, deferred** | Resolution chosen: reconcile + drive-grants-from-declaration (see T1 below). Scheduled AFTER the small items |
-| M8 probe unsafe untracked | open | Stage 5 (next) |
+| **M8** probe unsafe untracked | **FIXED** | `4428c92` - probe made unsafe-free (fuzz + faults -> audited SDK `adversarial` module, §18.1 amendment); `unsafe_check.py` now scans `services/`. adv 15/0, fuzz 8/0 |
 | **L4** 256-slot scan | **NOT A BUG** | kernel `MAX_TASKS=224` (fixed) < 256; scan over-covers |
-| L2/L3/L5/L6/L7 | open | Stage 6 |
+| **L2** FS_UNAVAIL/FS_DENIED collide | **FIXED** | `cf8fb08` - FS_DENIED now 5 (distinct); file-cap 10/0 |
+| **L3** logger stub vs docs | **FIXED** | `cf8fb08` - logger/CLAUDE.md now honest about current vs future behaviour |
+| **L5** chaos orphans mem-pressure | **FIXED** | `cf8fb08` - a run reaps prior-run orphans at start |
+| **L6** probe BA6 weak test | **FIXED** | `3a748ff` - BA6 drains caps between cycles (all 5 real) |
+| **L7** build_uptime_table inline | **FIXED** | `cf8fb08` - `#[inline(never)]` added |
+| **T1/M7** contract = source of truth | **IN PROGRESS** | The final piece: shrink the kernel to the supervisor-only config, drive everything else from contracts. See T1 below |
 
 > **Storage-stack prerequisite fixed (bonus, not an audit finding): `fe59cbf`.** Verifying any fs
 > fix in QEMU was blocked by a block-driver AHCI stall - it probed every implemented port (QEMU's HBA
