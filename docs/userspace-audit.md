@@ -70,7 +70,7 @@ Staged high-priority-first. Status updated as fixes land on `feat/dell-wyse-5070
 | **L5** chaos orphans mem-pressure | **FIXED** | `cf8fb08` - a run reaps prior-run orphans at start |
 | **L6** probe BA6 weak test | **FIXED** | `3a748ff` - BA6 drains caps between cycles (all 5 real) |
 | **L7** build_uptime_table inline | **FIXED** | `cf8fb08` - `#[inline(never)]` added |
-| **T1/M7** contract = source of truth | **IN PROGRESS** | The final piece: shrink the kernel to the supervisor-only config, drive everything else from contracts. See T1 below |
+| **T1/M7** contract = source of truth | **Phase A DONE, Phase B open** | Scope corrected: 217 kernel configs but only 6 have contracts, so this reconciles the 6 (not a full kernel-shrink). **Phase A `334502c`**: `scripts/contract_check.py` (CI-wired) reconciles each of the 6 `.tomls` against the kernel `service_config` (memory/placement/ipc_send) - drift now IMPOSSIBLE; fixed 4 live divergences (logger+supervisor memory, logger serial-MMIO lie, supervisor ipc_send lie). **Phase B (open)**: drive the by-name hardware/mint grants (`name == "block-driver" && AHCI_FOUND` scatter, kernel `task/mod.rs` ~8 sites) from a declared `hw_device`/`mint` `ServiceConfig` field + reconcile it |
 
 > **Storage-stack prerequisite fixed (bonus, not an audit finding): `fe59cbf`.** Verifying any fs
 > fix in QEMU was blocked by a block-driver AHCI stall - it probed every implemented port (QEMU's HBA
