@@ -4754,13 +4754,18 @@ fn sock_open(ctx: &ServiceContext) -> Option<CapHandle> {
 
 /// Invoke a socket cap - send a datagram through it and receive the response (mirrors `fc_invoke`).
 fn sock_invoke(ctx: &ServiceContext, sock: CapHandle, right: u8, payload: &[u8]) -> Option<Message> {
+    while ctx.try_recv().is_some() {}   // clear any stale late-reply a prior aborted invoke left behind
     let self_grant = ctx.self_grant_handle()?;
     let reply = ctx.derive_cap(self_grant)?;
     if ctx.resource_invoke(sock, right, reply, &Message::from_bytes(payload)).is_err() {
         ctx.remove_cap(reply);
         return None;
     }
-    Some(ctx.recv())
+    // Await the reply FAILURE-AWARE (Commandment VIII): a bare `recv` would hang forever if net-stack
+    // died after receiving the invocation but before replying. Reclaim the reply slot on every outcome.
+    let outcome = ctx.recv_abortable_deadline(FILTER_WAIT_SECS);
+    ctx.remove_cap(reply);
+    match outcome { ReqOutcome::Reply(m) => Some(m), _ => None }
 }
 
 /// Build a minimal DNS A-query for `host` into `buf`; returns the length. Just enough to elicit a UDP
@@ -5851,13 +5856,27 @@ fn drain_service(ctx: &ServiceContext, svc: &str, input: Option<&[u8]>, out: &mu
             }
         }
     }
-    // Drain the service's output until EOT (bounded - a conforming service always sends it).
+    // Drain the service's output until EOT, FAILURE-AWARE (Commandment VIII): the `512` bounds the
+    // message COUNT, but each wait is a per-message deadline + q-abort, not a bare blocking `recv` -
+    // a filter that registers its endpoint then wedges or page-faults BEFORE sending EOT (or any
+    // output) must not hang the prompt forever with the keyboard dead. Timeout => it died mid-stream;
+    // Aborted => the user pressed q. Both stop the drain loudly (§26.7) rather than blocking.
     for _ in 0..512 {
-        let msg = ctx.recv();
-        let p = msg.payload_bytes();
-        if p == [PIPE_EOT] { break; }
-        out.push(p);
-        if out.overflow { break; }
+        match ctx.recv_abortable_deadline(FILTER_WAIT_SECS) {
+            ReqOutcome::Reply(msg) => {
+                let p = msg.payload_bytes();
+                if p == [PIPE_EOT] { break; }
+                out.push(p);
+                if out.overflow { break; }
+            }
+            ReqOutcome::Aborted => { ctx.console_writeln("pipe: aborted"); break; }
+            ReqOutcome::Timeout => {
+                ctx.console_writeln_fmt(format_args!(
+                    "pipe: '{}' stopped sending without EOT (waited ~{}s) - it may have failed mid-stream",
+                    svc, FILTER_WAIT_SECS));
+                break;
+            }
+        }
     }
     let _ = ctx.kill(svc);
     if out.overflow { ctx.console_writeln("pipe: pipe output exceeded the buffer (truncated)"); }
@@ -7399,13 +7418,19 @@ fn fc_open(ctx: &ServiceContext, path: &[u8], rights: u8) -> Option<CapHandle> {
 /// routes it to fs; fs replies on our endpoint. `None` means the kernel rejected the invocation
 /// (the cap lacks `right` - non-escalation - or is stale/revoked), so no reply comes back.
 fn fc_invoke(ctx: &ServiceContext, file: CapHandle, right: u8, payload: &[u8]) -> Option<Message> {
+    while ctx.try_recv().is_some() {}   // clear any stale late-reply a prior aborted invoke left behind
     let self_grant = ctx.self_grant_handle()?;
     let reply = ctx.derive_cap(self_grant)?;
     if ctx.resource_invoke(file, right, reply, &Message::from_bytes(payload)).is_err() {
         ctx.remove_cap(reply); // kernel didn't consume it (validation failed) - don't leak the slot
         return None;
     }
-    Some(ctx.recv())
+    // Await the reply FAILURE-AWARE (Commandment VIII): a bare `recv` here would hang forever if fs
+    // died after receiving the badged invocation but before replying. Reclaim the reply slot on every
+    // outcome (the reply cap is one-shot; Aborted/Timeout means it was never consumed).
+    let outcome = ctx.recv_abortable_deadline(FILTER_WAIT_SECS);
+    ctx.remove_cap(reply);
+    match outcome { ReqOutcome::Reply(m) => Some(m), _ => None }
 }
 
 /// `fcap` - self-contained demonstration AND self-check of file-as-capability (§7.10). It is a

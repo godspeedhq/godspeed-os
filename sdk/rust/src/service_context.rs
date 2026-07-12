@@ -636,6 +636,33 @@ impl ServiceContext {
         }
     }
 
+    /// Wait for the next message on our own recv endpoint, ABORTABLE (q/Q/ESC) and bounded by an RTC
+    /// deadline, WITHOUT sending anything. The failure-aware twin of [`Self::recv`]: where `recv`
+    /// blocks forever (and loops on error), this returns [`ReqOutcome::Timeout`] if no message
+    /// arrives within `max_secs` and [`ReqOutcome::Aborted`] the instant the user presses q. Use it to
+    /// await a reply we already sent by some path OTHER than a named-peer request - a badged
+    /// `resource_invoke` (a file/socket capability), or draining a pipe filter's stream - where
+    /// [`Self::request_with_reply_abortable`] (which does its own send) does not fit. This is the wait
+    /// half of the abortable request, factored out: a peer that received our invocation but died before
+    /// replying, or a filter that wedges mid-stream, can no longer hang us (Commandment VIII - wait on
+    /// truth *including failure*). The caller owns any reply cap it derived and reclaims it on every
+    /// outcome. A service with no console foreground never sees input, so this degrades to a plain
+    /// deadline wait. Does NOT drain a stale reply first - a caller that can be re-entered after an
+    /// abort should `while self.try_recv().is_some() {}` before it sends (as the request variants do).
+    pub fn recv_abortable_deadline(&self, max_secs: i64) -> ReqOutcome {
+        let t0 = self.epoch_secs_monotonic();
+        loop {
+            if let Some(r) = self.try_recv() { return ReqOutcome::Reply(r); }
+            while let Some(b) = self.try_console_read() {
+                if b == b'q' || b == b'Q' || b == 0x1b { return ReqOutcome::Aborted; }
+            }
+            if self.epoch_secs_monotonic() - t0 >= max_secs {
+                return ReqOutcome::Timeout;
+            }
+            self.yield_cpu();
+        }
+    }
+
     /// Reacquire a fresh SEND cap to `peer` and point the named-peer cache at it, so subsequent
     /// `try_send(peer)` / `send(peer)` use the new cap. Returns `false` if `peer` cannot currently
     /// be resolved (e.g. it has not finished respawning) - the caller should retry on a later tick.
