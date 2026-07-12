@@ -83,7 +83,11 @@ const TALLY_OFF:     usize = 0x5000;
 // Bounded hardware/protocol-timing polls (the exempt category, like AHCI/USB spins - NOT the
 // correctness-by-time Commandment VIII forbids): wait on the TRUTH of a bit, give up LOUDLY.
 const RESET_POLL_MAX: u32 = 1_000_000;
-const TX_POLL_MAX:    u32 = 1_000_000;
+// A healthy RTL8168 clears the TX descriptor's OWN bit in ~us (the first few poll iterations). The old
+// 1_000_000-yield bound meant a NIC that FAILED to complete a transmit froze the whole ping for ~1s per
+// send. Bound it TIGHT so a stuck TX fails FAST and is recovered (§26.6 bounded, §26.7 loud), instead of
+// stalling the box. 30_000 is ~30x headroom over a us-scale success but ~ms, not seconds, on failure.
+const TX_POLL_MAX:    u32 = 30_000;
 const RX_POLL_MAX:    u32 = 8_000;     // a reply arrives in ms (caught in the first hundreds of iterations).
                                        // A MISS must give up FAST: on the T630, 50k iterations took >2s -
                                        // LONGER than net-stack's per-request deadline, so every DNS request
@@ -241,6 +245,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
     // = report the forced state. Cleared ([8]) after a flap so a REAL later unplug is never masked.
     let mut force_link: Option<bool> = None;
     let mut tally_wedged_logged = false;   // one-shot loud note if the DMA counter dump ever times out
+    let mut tx_fail_logged = 0u32;         // diagnose the first few TX timeouts to guide the root-cause fix
     loop {
         let req = ctx.recv();
         let reply_cap = match ctx.take_pending_cap() { Some(c) => c, None => continue };
@@ -409,7 +414,34 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
         let mut ts = 0u32;
         while ts < TX_POLL_MAX && arena.read32(td) & RTL_DESC_OWN != 0 { ctx.yield_cpu(); ts += 1; }
         let tx_done = ts < TX_POLL_MAX;
-        tx_idx = (tx_idx + 1) % TX_RING_COUNT;
+        if tx_done {
+            tx_idx = (tx_idx + 1) % TX_RING_COUNT;
+        } else {
+            // TX did not complete: the NIC never cleared the descriptor's OWN bit. On the Wyse RTL8168 this
+            // happens intermittently even on a healthy 1000M link (the T630 is more forgiving) and is the
+            // real cause of the `ping` flap - a lost TX means no echo goes out. Two things to contain
+            // (VIII bounded+loud, IX recover): a stuck TX must fail FAST (the tight bound above), and a
+            // stuck descriptor must NOT cascade into every later send. DIAGNOSE the NIC state (first few,
+            // to guide the root-cause fix on the next hardware pass) then RECOVER the TX engine: toggle TE
+            // off/on so it re-reads the ring from TNPDS, clear latched status, drop the stuck descriptor's
+            // OWN, and restart at descriptor 0. RE stays on throughout, so RX is undisturbed.
+            let isr = mmio.read16(RTL_ISR);
+            let cr  = mmio.read8(RTL_CR);
+            if tx_fail_logged < 6 {
+                ctx.log_fmt(format_args!(
+                    "nic-driver: RTL8168 TX timeout - desc={:#010x} isr={:#06x} cr={:#04x} len={} - recovering",
+                    arena.read32(td), isr, cr, flen));
+                tx_fail_logged += 1;
+            }
+            mmio.write8(RTL_CR, RTL_CR_RE);             // TE off: stop + reset the TX engine (RX stays up)
+            mmio.write16(RTL_ISR, 0xFFFF);             // clear any latched TX error/status
+            arena.write32(td, 0);                       // drop the stuck descriptor's OWN
+            let tx_ring = arena.phys_at(TX_RING_OFF);
+            mmio.write32(RTL_TNPDS, (tx_ring & 0xffff_ffff) as u32);
+            mmio.write32(RTL_TNPDS + 4, (tx_ring >> 32) as u32);
+            mmio.write8(RTL_CR, RTL_CR_RE | RTL_CR_TE);  // TE back on - re-reads TNPDS, ring re-synced
+            tx_idx = 0;
+        }
 
         // --- Receive a reply: poll the current RX descriptor's OWN bit (bounded), copy it out, re-arm. ---
         let mut n = 0usize;
