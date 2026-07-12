@@ -57,8 +57,9 @@ Staged high-priority-first. Status updated as fixes land on `feat/dell-wyse-5070
 |------|--------|---------------|
 | **M1** drain_service bare recv | **FIXED** | `b4f212c` - SDK `recv_abortable_deadline`; happy-path drain unchanged, adds Timeout/Aborted wakes. Verified: files pipe checks green |
 | **M2** fc_invoke/sock_invoke bare recv | **FIXED** | `b4f212c` - same primitive; verified `osdev test file-cap` 10/0 |
-| M3 net-stack interactive reacquire | open | Stage 2 |
-| M4 net-stack identity cache reconcile | open | Stage 2 |
+| **M3** net-stack interactive reacquire | **FIXED** | `c54b5dc` - `nic_req` reacquires on `SendFailed` only (SDK `DeadlineOutcome`); no-regression proven vs baseline shell-test; recovery mirrors the proven dhcp/udp reacquire pattern (live demo blocked by QEMU-11 ICMP flakiness) |
+| **L1** driver-death mislabeled "no link" | **FIXED** | `c54b5dc` - subsumed by M3 (reacquire returns real link status) |
+| M4 net-stack identity cache reconcile | **DEFERRED** | Trades against the deliberate instant-replug design; needs a real multi-subnet network to validate - not doable away from hardware |
 | M5 supervisor steady-state respawn retry | open | Stage 3 |
 | M6 block-driver contract drift | open | Stage 4 |
 | M7 by-name grant (T1) | open | Stage 4 (design decision) |
