@@ -97,6 +97,16 @@ const RX_POLL_MAX:    u32 = 8_000;     // a reply arrives in ms (caught in the f
 
 const FRAME_MAX: usize = 1600; // one Ethernet frame (<= 1518) with headroom
 
+// [9] BATCH RX DRAIN (the frame interface, net-stack <-> nic-driver): pull up to BATCH_MAX frames off the
+// RX ring in ONE bounded poll and return them length-prefixed - [count:u8] then [len:u16 LE, bytes] per
+// frame. net-stack scans the batch for its reply (its ICMP echo / DNS answer) PAST any stray broadcasts,
+// in a SINGLE round-trip. This replaces the old "one [4] request per look-ahead frame" approach, whose N
+// slow round-trips (each polling the full RX budget when the ring was momentarily empty) pushed net-stack
+// past the shell's deadline. Mechanism only: the driver hands back RAW frames, it never learns what a
+// "reply" is (Commandment X). Bounded by BATCH_MAX, BATCH_MSG_MAX (< the 4 KiB IPC cap), and RX_POLL_MAX.
+const BATCH_MAX:     usize = 8;
+const BATCH_MSG_MAX: usize = 3072;
+
 // --- Realtek RTL8168 C+ mode: register offsets into the MMIO BAR + 16-byte descriptor bits (Phase 4,
 // Stage B). The RTL8168 has no e1000-style head/tail registers - the NIC walks the ring by the OWN bit.
 const RTL_TNPDS:     usize = 0x20; // TX Normal Priority Descriptor Start Address (64-bit phys, 256B aligned)
@@ -337,6 +347,41 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
             }
             if n > 0 { last_rx_len = n as u16; rx_count = rx_count.saturating_add(1); }
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n]));
+            ctx.remove_cap(reply_cap);
+            continue;
+        }
+
+        // [9] BATCH RX DRAIN (see BATCH_MAX doc): drain up to BATCH_MAX frames off the ring in ONE bounded
+        // poll, length-prefixed, so net-stack scans past stray broadcasts for its reply in a single
+        // round-trip. Ready descriptors are drained back-to-back (no yield); when the ring is empty we
+        // poll (RX_POLL_MAX total) for more to arrive - so the whole call is ONE bounded poll, not N.
+        if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 9 } {
+            let mut out = [0u8; BATCH_MSG_MAX];
+            let mut opos = 1usize;   // out[0] = frame count, filled at the end
+            let mut nfr = 0u8;
+            let mut rs = 0u32;
+            while rs < RX_POLL_MAX && (nfr as usize) < BATCH_MAX {
+                let rd = RX_RING_OFF + rx_idx * 16;
+                let o1 = arena.read32(rd);
+                if o1 & RTL_DESC_OWN == 0 {
+                    let flen = ((o1 & 0x3FFF) as usize).min(FRAME_MAX);
+                    if opos + 2 + flen > out.len() { break; }   // reply full - stop cleanly
+                    out[opos..opos + 2].copy_from_slice(&(flen as u16).to_le_bytes());
+                    opos += 2;
+                    for i in 0..flen { out[opos + i] = arena.read8(RX_BUF_OFF + rx_idx * RX_BUF_SIZE + i); }
+                    opos += flen;
+                    nfr += 1;
+                    last_rx_len = flen as u16;
+                    rtl_arm_rx(arena, rx_idx);                  // give the descriptor back to the NIC
+                    rx_idx = (rx_idx + 1) % RX_RING_COUNT;
+                } else {
+                    ctx.yield_cpu();
+                    rs += 1;
+                }
+            }
+            out[0] = nfr;
+            if nfr > 0 { rx_count = rx_count.saturating_add(nfr as u16); }
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos]));
             ctx.remove_cap(reply_cap);
             continue;
         }
@@ -605,6 +650,43 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 m.write32(REG_RCTL, 0);
             }
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n]));
+            ctx.remove_cap(reply_cap);
+            continue;
+        }
+
+        // [9] BATCH RX DRAIN (e1000): QEMU's slirp is quiet, so this yields at most the single frame the
+        // reset-and-read model gives, formatted as the batch [count:u8][len:u16 LE, bytes] - enough to
+        // exercise net-stack's batch scan. The multi-frame drain that matters is the RTL8168 path (a
+        // busy physical LAN).
+        if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 9 } {
+            let mut out = [0u8; BATCH_MSG_MAX];
+            let mut opos = 1usize;   // out[0] = frame count
+            let mut nfr = 0u8;
+            if active {
+                let m = mmio.as_ref().unwrap();
+                let a = arena.as_ref().unwrap();
+                for i in 0..RX_RING_COUNT { a.write8(RX_RING_OFF + i * 16 + 12, 0); }
+                m.write32(REG_RDH, 0);
+                m.write32(REG_RDT, (RX_RING_COUNT - 1) as u32);
+                m.write32(REG_RCTL, RCTL_VALUE);
+                let mut s = 0u32;
+                while s < RX_POLL_MAX {
+                    if a.read8(RX_RING_OFF + 12) & RXD_STA_DD != 0 {
+                        let len = (a.read16(RX_RING_OFF + 8) as usize).min(FRAME_MAX);
+                        out[opos..opos + 2].copy_from_slice(&(len as u16).to_le_bytes());
+                        opos += 2;
+                        for i in 0..len { out[opos + i] = a.read8(RX_BUF_OFF + i); }
+                        opos += len;
+                        nfr = 1;
+                        break;
+                    }
+                    ctx.yield_cpu();
+                    s += 1;
+                }
+                m.write32(REG_RCTL, 0);
+            }
+            out[0] = nfr;
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos]));
             ctx.remove_cap(reply_cap);
             continue;
         }
