@@ -322,6 +322,90 @@ struct ServiceConfig {
     has_console_read:  bool,
 }
 
+/// The discovered-PCI-device class a driver service is granted (audit M7 / T1 Phase B). This is the
+/// single DECLARED hardware fact the spawn path drives every MMIO / DMA / IOMMU / bus-master grant off
+/// - replacing the old scatter of `name == "block-driver" && pci::AHCI_FOUND` checks repeated across the
+/// spawn path. The BAR *address* is still runtime-discovered by the PCI scan (a hardware location is a
+/// different irreducible fact from the authorization); only the driver's *class* is declared here.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HwClass { None, Ahci, Nic, Xhci, Ehci }
+
+impl HwClass {
+    /// Did the PCI scan find this class of controller?
+    fn found(self) -> bool {
+        use crate::arch::x86_64::pci;
+        use core::sync::atomic::Ordering::Relaxed;
+        match self {
+            HwClass::Xhci => pci::XHCI_FOUND.load(Relaxed),
+            HwClass::Ehci => pci::EHCI_FOUND.load(Relaxed),
+            HwClass::Ahci => pci::AHCI_FOUND.load(Relaxed),
+            HwClass::Nic  => pci::NIC_FOUND.load(Relaxed),
+            HwClass::None => false,
+        }
+    }
+    /// The controller's first MMIO BAR base, or 0 if absent (or, for a NIC, not a model we can drive -
+    /// an Intel e1000 or a Realtek RTL8168; on any other NIC the driver gets no mapping and idles).
+    fn mmio_bar(self) -> u64 {
+        use crate::arch::x86_64::pci;
+        use core::sync::atomic::Ordering::Relaxed;
+        if !self.found() { return 0; }
+        match self {
+            HwClass::Xhci => pci::XHCI_MMIO_BASE.load(Relaxed),
+            HwClass::Ehci => pci::EHCI_MMIO_BASE.load(Relaxed),
+            HwClass::Ahci => pci::AHCI_ABAR.load(Relaxed),
+            HwClass::Nic if matches!(pci::NIC_VENDOR_DEVICE.load(Relaxed), 0x100E_8086 | 0x8168_10EC)
+                => pci::NIC_MMIO_BASE.load(Relaxed),
+            _ => 0,
+        }
+    }
+    /// A discovered DMA-capable controller needs a physically-contiguous DMA arena.
+    fn needs_dma(self) -> bool { self != HwClass::None && self.found() }
+    /// Arena size: xHCI needs room for its 256-buffer scratchpad; every other driver gets 64 KiB.
+    fn dma_pages(self) -> u64 { if self == HwClass::Xhci { XHCI_DMA_PAGES } else { EHCI_DMA_PAGES } }
+    /// The permanent per-class DMA phys reservation, reused across respawns (§12 DMA permanent-reserve).
+    fn dma_phys_slot(self) -> &'static core::sync::atomic::AtomicU64 {
+        match self {
+            HwClass::Xhci => &XHCI_DMA_PHYS,
+            HwClass::Ehci => &EHCI_DMA_PHYS,
+            HwClass::Ahci => &AHCI_DMA_PHYS,
+            HwClass::Nic  => &NIC_DMA_PHYS,
+            HwClass::None => &XHCI_DMA_PHYS, // unreachable: needs_dma() gates callers
+        }
+    }
+    /// Confine this DMA-capable driver via the IOMMU? Only xHCI qualifies today (§6.4; ehci + block-driver
+    /// keep a stale firmware DMA pointer that confinement would fault, so they stay in passthrough).
+    fn iommu_confine(self) -> bool { self == HwClass::Xhci }
+    /// The device's PCI BDF (bus/device/function) for the bus-master + D0 enable, or 0xFFFF if none.
+    fn bdf(self) -> u32 {
+        use crate::arch::x86_64::pci;
+        use core::sync::atomic::Ordering::Relaxed;
+        match self {
+            HwClass::Xhci => pci::XHCI_BDF.load(Relaxed),
+            HwClass::Ehci => pci::EHCI_BDF.load(Relaxed),
+            HwClass::Ahci => pci::AHCI_BDF.load(Relaxed),
+            HwClass::Nic  => pci::NIC_BDF.load(Relaxed),
+            HwClass::None => 0xFFFF,
+        }
+    }
+}
+
+/// The hardware class + resource-mint authority a service is granted, keyed by name. This is the ONE
+/// place the kernel declares which driver drives which discovered device and which service may mint
+/// delegated resource caps (§7.10) - the spawn path reads it, never a scattered `name ==` check (audit
+/// M7 / T1 Phase B). For the services that ship a `.toml`, `scripts/contract_check.py` reconciles this
+/// against the contract's `hw_device` / `resource_mint`, so the kernel and the contract cannot diverge
+/// (Commandment III). `xhci` / `ehci` / `resource-server` have no contract and are declared here only.
+fn service_hw(name: &str) -> (HwClass, bool) {
+    match name {
+        "xhci"                                 => (HwClass::Xhci, false),
+        "ehci"                                 => (HwClass::Ehci, false),
+        "block-driver"                         => (HwClass::Ahci, false),
+        "nic-driver" | "e1000"                 => (HwClass::Nic,  false),
+        "fs" | "net-stack" | "resource-server" => (HwClass::None, true),
+        _                                      => (HwClass::None, false),
+    }
+}
+
 /// True if the calling task's contract declares `peer` as a send-peer (§13) - so reacquiring a SEND
 /// cap to it (`AcquireSendCap`) is contract-authorized recovery (§14.2), not ambient authority (§3.1).
 /// The caller's name comes from the existing `task_stat` snapshot and its declared peers from the
@@ -3202,6 +3286,11 @@ fn spawn_service_with_config(
     // `None` = the old name-resolution path (unchanged).
     installs:          Option<&[InstallCap]>,
 ) -> Result<Option<EndpointId>, SpawnError> {
+    // The declared hardware class + mint authority for this service (audit M7 / T1 Phase B). Every
+    // MMIO / DMA / IOMMU / bus-master / RESOURCE_MINT grant below is driven off these, not a `name ==`
+    // check - one declaration (`service_hw`), reconciled against the .toml for contracted services.
+    let (hw, resource_mint) = service_hw(name);
+
     // DIAG step markers (gated by SPAWN_TRACE; off by default - see its doc).
     if SPAWN_TRACE { crate::kprintln!("spawn[elf]: '{}'", name); }
 
@@ -3388,7 +3477,7 @@ fn spawn_service_with_config(
     // is never spawned, so the grant never fires.
     // `net-stack` mints SOCKET capabilities (a socket is a delegated resource cap, §7.10, the same
     // mechanism `fs` uses for files) - so it needs the same minting authority.
-    if name == "fs" || name == "resource-server" || name == "net-stack" {
+    if resource_mint {
         let rm_cap = mint_cap(RESOURCE_MINT_RESOURCE, Rights::WRITE);
         caps.insert(rm_cap)
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
@@ -3502,25 +3591,10 @@ fn spawn_service_with_config(
     // the shared VA + ctx field (`xhci_mmio_va`, read by `ctx.xhci_mmio()` /
     // `ctx.ehci_mmio()`) is unambiguous (§12).
     let xhci_mmio_va = {
-        use core::sync::atomic::Ordering::Relaxed;
-        use crate::arch::x86_64::pci;
-        let bar = if name == "xhci" && pci::XHCI_FOUND.load(Relaxed) {
-            pci::XHCI_MMIO_BASE.load(Relaxed)
-        } else if name == "ehci" && pci::EHCI_FOUND.load(Relaxed) {
-            pci::EHCI_MMIO_BASE.load(Relaxed)
-        } else if name == "block-driver" && pci::AHCI_FOUND.load(Relaxed) {
-            pci::AHCI_ABAR.load(Relaxed) // AHCI HBA registers (docs/ahci.md)
-        } else if (name == "nic-driver" || name == "e1000") && pci::NIC_FOUND.load(Relaxed)
-            && matches!(pci::NIC_VENDOR_DEVICE.load(Relaxed), 0x100E_8086 | 0x8168_10EC) {
-            // The NIC's first memory BAR (its register space), mapped for `nic-driver` (or the `e1000`
-            // example) and ONLY when the discovered NIC is one nic-driver can drive: an Intel e1000
-            // (0x100E:8086) or a Realtek RTL8168 (0x8168:10EC, the T630). On any other NIC this is
-            // false, so the driver gets no mapping and idles - it never touches foreign hardware
-            // (Commandment VII: a hardware capability is granted explicitly, for the device asked for).
-            pci::NIC_MMIO_BASE.load(Relaxed)
-        } else {
-            0
-        };
+        // The controller BAR for this driver's declared class (audit M7): xHCI/EHCI/AHCI use their
+        // register base; a NIC only when it is a model we drive (e1000 / RTL8168) - otherwise 0, so the
+        // driver gets no mapping and idles, never touching foreign hardware (Commandment VII).
+        let bar = hw.mmio_bar();
         if bar != 0 {
             let mmio_flags = PageFlags::PRESENT
                 | PageFlags::WRITABLE
@@ -3547,35 +3621,18 @@ fn spawn_service_with_config(
     // the controller). Normal cacheable mapping - x86 DMA is cache-coherent.
     // Grant a physically-contiguous DMA arena to a USB driver (xhci or ehci) for
     // its queue structures. Shared VA/fields, separate address spaces (§12).
-    let dma_for_driver = {
-        use core::sync::atomic::Ordering::Relaxed;
-        use crate::arch::x86_64::pci;
-        (name == "xhci" && pci::XHCI_FOUND.load(Relaxed))
-            || (name == "ehci" && pci::EHCI_FOUND.load(Relaxed))
-            || (name == "block-driver" && pci::AHCI_FOUND.load(Relaxed)) // AHCI (docs/ahci.md)
-            || (name == "nic-driver" && pci::NIC_FOUND.load(Relaxed)) // e1000 TX/RX rings (docs/networking.md)
-    };
+    let dma_for_driver = hw.needs_dma();
     // Per-driver arena size: xHCI needs room for its 256 scratchpad buffers;
     // EHCI gets the small 64 KiB arena it had on main; the AHCI block driver needs
     // only its command list/FIS/command table + a data buffer - 64 KiB is plenty.
-    let dma_pages = if name == "ehci" || name == "block-driver" || name == "nic-driver" {
-        EHCI_DMA_PAGES
-    } else {
-        XHCI_DMA_PAGES
-    };
+    let dma_pages = hw.dma_pages();
     let (xhci_dma_va, xhci_dma_phys, xhci_dma_len) = if dma_for_driver {
         // DMA permanent-reserve (§12): allocate this driver's arena ONCE, then reuse the same physical
         // frames across every respawn. `alloc_dma_arena` reserves the run out of the general pool (so it
         // is never recycled into a page table); keeping the phys keeps the reservation bounded - one
         // arena per driver, not one per spawn. So a stray DMA (if the kill-path bus-master quiesce ever
         // fails) always lands in DMA-reserved memory, never a PTE or kernel struct.
-        let kept = match name {
-            "xhci"         => &XHCI_DMA_PHYS,
-            "ehci"         => &EHCI_DMA_PHYS,
-            "block-driver" => &AHCI_DMA_PHYS,
-            "nic-driver"   => &NIC_DMA_PHYS,
-            _              => &XHCI_DMA_PHYS, // unreachable: dma_for_driver gates these names
-        };
+        let kept = hw.dma_phys_slot();
         let arena = match kept.load(core::sync::atomic::Ordering::Relaxed) {
             0 => {
                 let p = crate::memory::allocator::alloc_dma_arena(dma_pages as usize);
@@ -3619,7 +3676,7 @@ fn spawn_service_with_config(
                 {
                     use core::sync::atomic::Ordering::Relaxed;
                     use crate::arch::x86_64::pci;
-                    if CONFINE_USB_DRIVERS && name == "xhci" {
+                    if CONFINE_USB_DRIVERS && hw.iommu_confine() {
                         crate::arch::x86_64::iommu::confine_device(
                             pci::XHCI_BDF.load(Relaxed), phys, len);
                     } else {
@@ -3639,13 +3696,7 @@ fn spawn_service_with_config(
                     // controller before the frame reclaim (the max-carnage corruption fix), and firmware sets
                     // it only once at boot - so a RESPAWN must re-enable it or the new instance's DMA silently
                     // never starts. Idempotent (no-op if already set). Per-driver BDF.
-                    let bdf = match name {
-                        "xhci"         => pci::XHCI_BDF.load(Relaxed),
-                        "ehci"         => pci::EHCI_BDF.load(Relaxed),
-                        "block-driver" => pci::AHCI_BDF.load(Relaxed),
-                        "nic-driver"   => pci::NIC_BDF.load(Relaxed),
-                        _              => 0xFFFF,
-                    };
+                    let bdf = hw.bdf();
                     pci::set_power_d0(bdf);  // bring the device to D0 first - firmware may park a non-boot NIC in D3
                     pci::set_bus_master(bdf);
                 }

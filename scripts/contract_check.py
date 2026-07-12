@@ -49,7 +49,32 @@ def parse_toml(path: Path) -> dict:
     if m:
         send = [s.strip().strip('"') for s in m.group(1).split(",") if s.strip()]
 
-    return {"limit": limit, "core": core, "send": send}
+    hw_device = None
+    m = re.search(r'hw_device\s*=\s*"(\w+)"', text)
+    if m:
+        hw_device = m.group(1)
+
+    resource_mint = bool(re.search(r'resource_mint\s*=\s*true', text))
+
+    return {"limit": limit, "core": core, "send": send,
+            "hw_device": hw_device, "resource_mint": resource_mint}
+
+
+def parse_service_hw(source: str) -> dict:
+    """Map each name -> (hw_device str|None, resource_mint bool) from the kernel `service_hw` match."""
+    m = re.search(r'fn service_hw\(name: &str\)\s*->\s*\(HwClass, bool\)\s*\{(.*?)\n\}', source, re.DOTALL)
+    if not m:
+        return {}
+    body = m.group(1)
+    cls = {"Ahci": "ahci", "Nic": "nic", "Xhci": "xhci", "Ehci": "ehci", "None": None}
+    out: dict = {}
+    for arm in re.finditer(r'((?:"[^"]+"\s*\|?\s*)+)=>\s*\(\s*HwClass::(\w+)\s*,\s*(true|false)\s*\)', body):
+        names = re.findall(r'"([^"]+)"', arm.group(1))
+        hw = cls.get(arm.group(2))
+        mint = arm.group(3) == "true"
+        for nm in names:
+            out[nm] = (hw, mint)
+    return out
 
 
 def parse_kernel(name: str, source: str) -> dict | None:
@@ -82,6 +107,7 @@ def parse_kernel(name: str, source: str) -> dict | None:
 
 def main() -> int:
     source = KERNEL_CFG.read_text(encoding="utf-8")
+    kernel_hw = parse_service_hw(source)
     failures: list[str] = []
 
     for name in CONTRACTED:
@@ -105,6 +131,14 @@ def main() -> int:
         if sorted(t["send"]) != sorted(k["send"]):
             failures.append(
                 f"  FAIL  {name}: ipc_send {t['send']} (.toml) != send_peers {k['send']} (kernel)")
+
+        khw, kmint = kernel_hw.get(name, (None, False))
+        if t["hw_device"] != khw:
+            failures.append(
+                f"  FAIL  {name}: hw_device {t['hw_device']!r} (.toml) != {khw!r} (kernel service_hw)")
+        if t["resource_mint"] != kmint:
+            failures.append(
+                f"  FAIL  {name}: resource_mint {t['resource_mint']} (.toml) != {kmint} (kernel service_hw)")
 
     if failures:
         print("Contract reconcile - FAILURES (a .toml disagrees with the kernel service_config):")

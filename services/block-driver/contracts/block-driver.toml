@@ -6,14 +6,13 @@ request = "8MiB"
 limit   = "16MiB"
 
 [capabilities]
-# block-driver is an AHCI (SATA) driver: it holds the HBA's MMIO window (ABAR) and a
-# physically-contiguous DMA arena. Those hardware caps are NOT declared here - the kernel grants them
-# at spawn, gated on the PCI scan finding the AHCI controller (kernel `task::mod`,
-# `name == "block-driver" && AHCI_FOUND`), because the BAR address is runtime-DISCOVERED and cannot be
-# a static contract value. This by-name grant of a runtime-discovered hardware cap is the sanctioned
-# mechanism for hardware drivers (docs/userspace-audit.md T1); the authority is still an explicit held
-# cap, never ambient-at-use. (The retired ATA-PIO bring-up backend declared `hw_pio` here; AHCI needs
-# no port I/O, so it is removed - the contract no longer mis-states the driver's privilege.)
+# block-driver is an AHCI (SATA) driver: it holds the HBA's MMIO window (ABAR) + a DMA arena. It
+# DECLARES the device CLASS here; the kernel resolves the runtime-discovered BAR address by the PCI
+# scan and grants MMIO/DMA accordingly (kernel `service_hw` / `HwClass::Ahci`, audit T1 Phase B). The
+# class is reconciled against the kernel by scripts/contract_check.py, so contract and kernel cannot
+# diverge (Commandment III); the BAR address stays the one runtime fact. (The retired ATA-PIO backend's
+# `hw_pio` was removed - the contract no longer mis-states the driver's privilege.)
+hw_device = "ahci"
 log_write = true
 
 [placement]

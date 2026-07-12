@@ -74,6 +74,15 @@
           "type": "array",
           "items": { "type": "string", "pattern": "^0x[0-9a-fA-F]+\\+0x[0-9a-fA-F]+$" },
           "description": "I/O port ranges: base+length in hex (e.g. 0x170+0x8). Port I/O is kernel-mediated and validated per access (docs/persistence.md §5)."
+        },
+        "hw_device": {
+          "type": "string",
+          "enum": ["ahci", "nic", "xhci", "ehci"],
+          "description": "The discovered PCI device CLASS this driver is granted (its MMIO BAR + a DMA arena + bus-master). The kernel resolves the runtime BAR address by the PCI scan (kernel service_hw / HwClass); this class is reconciled against the kernel by scripts/contract_check.py (audit T1 Phase B)."
+        },
+        "resource_mint": {
+          "type": "boolean",
+          "description": "Authority to mint delegated resource capabilities - a file for fs, a socket for net-stack (§7.10, file-as-capability). Gated: granted only to services that legitimately issue resources."
         }
       }
     },

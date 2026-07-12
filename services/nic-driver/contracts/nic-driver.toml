@@ -6,10 +6,11 @@ request = "8MiB"
 limit   = "16MiB"
 
 [capabilities]
-# The NIC's MMIO BAR is granted by the kernel BY NAME at spawn (kernel/src/task/mod.rs),
-# gated on the discovered NIC being a real Intel e1000 - the same mechanism xhci/ehci/
-# block-driver use. Reach it via ctx.mmio(). Phase 1 step 2 is reset + MAC only; a full
-# driver adds hw_interrupt (the RX IRQ) and a DMA arena (TX/RX rings) in later steps.
+# nic-driver declares its device CLASS (a NIC); the kernel resolves the runtime-discovered BAR by the
+# PCI scan and grants MMIO/DMA/bus-master ONLY for a NIC it can drive - an Intel e1000 or a Realtek
+# RTL8168 (kernel `service_hw` / `HwClass::Nic`, audit T1 Phase B; reconciled by contract_check.py).
+# Reach the BAR via ctx.mmio().
+hw_device = "nic"
 log_write = true
 
 [placement]
