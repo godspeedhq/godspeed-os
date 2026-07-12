@@ -1946,18 +1946,26 @@ fn mode_adv_ba5(ctx: &ServiceContext) -> ! {
 }
 
 fn mode_adv_ba6(ctx: &ServiceContext) -> ! {
-    // BA6: Fill cap table × 5 cycles - each fill hits exhaustion, None returned (§22 Brutal Adv BA6).
+    // BA6: fill the cap table to exhaustion, DRAIN it, and repeat 5x - each cycle must genuinely hit
+    // exhaustion and recover (§22 Brutal Adv BA6). Draining between cycles is what makes all 5 real:
+    // without the remove_cap below, cycle 0 filled the table and cycles 1-4 saw it ALREADY full and did
+    // nothing (filled=0) - a trivially-passing test proves nothing (audit L6). CAP_MAX exceeds the
+    // kernel per-task cap-table size, so every acquired handle is tracked and returned.
+    const CAP_MAX: usize = 128;
+    let mut held = [CapHandle(0); CAP_MAX];
     for cycle in 0..5u32 {
-        let mut count = 0u32;
+        let mut count = 0usize;
         loop {
             match ctx.acquire_send_cap("adv-ba6") {
-                Some(_) => count += 1,
+                Some(h) => { if count < CAP_MAX { held[count] = h; } count += 1; }
                 None    => break,
             }
         }
+        // Drain every cap we took so the NEXT cycle fills from EMPTY - a real exhaustion again, not a no-op.
+        for h in held.iter().take(count.min(CAP_MAX)) { ctx.remove_cap(*h); }
         ctx.log_fmt(format_args!("adv: BA6 cycle={cycle} filled={count}"));
     }
-    ctx.log("adv: BA6 pass - 5× cap-table fill returned None without panic");
+    ctx.log("adv: BA6 pass - 5x fill-to-exhaustion + drain, each cycle real, no panic");
     idle(ctx)
 }
 
