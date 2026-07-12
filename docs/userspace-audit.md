@@ -61,10 +61,11 @@ Staged high-priority-first. Status updated as fixes land on `feat/dell-wyse-5070
 | **L1** driver-death mislabeled "no link" | **FIXED** | `c54b5dc` - subsumed by M3 (reacquire returns real link status) |
 | M4 net-stack identity cache reconcile | **DEFERRED** | Trades against the deliberate instant-replug design; needs a real multi-subnet network to validate - not doable away from hardware |
 | M5 supervisor steady-state respawn retry | open | Stage 3 |
-| M6 block-driver contract drift | open | Stage 4 |
-| M7 by-name grant (T1) | open | Stage 4 (design decision) |
-| M8 probe unsafe untracked | open | Stage 5 |
-| L1-L8 | open | Stage 2/3/6 |
+| **M6** block-driver contract drift | **FIXED** | `1cf...` - removed the dead `hw_pio` lie (read by nothing; kernel grants AHCI MMIO/DMA by name); contract now tells the truth |
+| M7 by-name grant (T1) | **DECIDED, deferred** | Resolution chosen: reconcile + drive-grants-from-declaration (see T1 below). Scheduled AFTER the small items |
+| M8 probe unsafe untracked | open | Stage 5 (next) |
+| **L4** 256-slot scan | **NOT A BUG** | kernel `MAX_TASKS=224` (fixed) < 256; scan over-covers |
+| L2/L3/L5/L6/L7 | open | Stage 6 |
 
 > **Storage-stack prerequisite fixed (bonus, not an audit finding): `fe59cbf`.** Verifying any fs
 > fix in QEMU was blocked by a block-driver AHCI stall - it probed every implemented port (QEMU's HBA
@@ -234,7 +235,16 @@ and the auditors split on whether this violates IV: the xhci/ehci and nic-driver
 accepted "by-name kernel grant" pattern (consistent across all bare-metal drivers); the block-driver/fs
 auditor flagged it MED because the **contract stops being the authority's source of truth** (§13.6:
 caps are "populated *from the contract* at spawn"). This is one **design decision** to settle, not five
-per-service bugs: either (a) extend the contract schema to express hardware/mint grants so the contract
-is again authoritative, or (b) amend §13.6/CLAUDE.md to document by-name kernel grants as the
-sanctioned mechanism for hardware-discovered/privileged services. Until settled, M6 (block-driver's
-contract actively *contradicting* its real access) is a fix regardless of which way T1 lands.
+per-service bugs. **RESOLVED (2026-07-12): reconcile + drive-grants-from-declaration.** The deeper
+finding is structural: the kernel's hand-written `service_config(name)` match (`kernel/src/task/mod.rs`)
+is a SECOND source of truth alongside the `.toml` contracts (the kernel is `no_std` and cannot parse
+TOML at spawn, so a compiled-in table is unavoidable), and the hardware grants are a THIRD scatter
+(hardcoded `name == "block-driver" && AHCI_FOUND` in the spawn path). The fix (Commandment III - one
+authored source, a reconciled derived view, §26.4): (1) add honest hardware-need declarations to the
+driver `.tomls` + schema; (2) drive the spawn-path hardware grants from the *declared* need (keyed by
+the name in both), removing the ad-hoc name scatter; (3) an osdev CI check that every `.toml` matches
+its kernel `service_config`, so drift is impossible - what runs cannot differ from what is declared.
+The runtime BAR *address* stays PCI-scan-resolved (a hardware *location* is a different irreducible fact
+from the *authorization*, so no truth is duplicated). Scheduled after the remaining small items (M8 +
+LOW). M6 (block-driver's contract *contradicting* its real access) was fixed immediately, independent
+of this.
