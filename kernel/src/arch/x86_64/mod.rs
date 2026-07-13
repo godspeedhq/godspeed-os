@@ -292,33 +292,69 @@ pub fn halt_all_cores() -> ! {
     }
 }
 
-/// Issue an x86 hardware reset via the keyboard controller CPU reset line.
+/// Issue an x86 hardware reset. Used by the Reboot syscall (18). Does not return.
 ///
-/// Writes 0xFE to I/O port 0x64, asserting CPURST# and causing an unconditional
-/// hardware reset. Used by the Reboot syscall (18). Does not return.
+/// Tries, in order, the reset methods that between them cover modern and legacy x86:
+///  1. the PCH/FCH **reset control register** at I/O port `0xCF9` - the method that
+///     works on USB-only machines with no PS/2 8042 (the Goldmont+ Wyse). Writing
+///     `0xFE` to `0x64` alone was a *no-op* there, so the reset never fired and the
+///     calling core spun in `cli`+`hlt` until the liveness watchdog panicked;
+///  2. the legacy 8042 keyboard-controller CPU reset line (`0x64 <- 0xFE`) for older
+///     boxes (the T630), kept so nothing regresses where it already worked;
+///  3. a **triple fault** - a zero-length IDT plus an exception - which resets the
+///     platform unconditionally if both port writes were ignored. This makes reboot
+///     always terminate in a reset, never in a wedge (invariant 12: loud, and here,
+///     final).
+/// Each method resets the whole platform, so no need to stop the other cores first.
 pub fn hardware_reset() -> ! {
-    // SAFETY: CLI before touching the KBC so no ISR reads port 0x60 between
-    // our status poll and the reset command.
+    // A short, self-contained I/O settle between port writes (no dependence on port 0x80).
+    #[inline(always)]
+    fn io_delay() {
+        for _ in 0..10_000 {
+            core::hint::spin_loop();
+        }
+    }
+
+    // SAFETY: CLI so no ISR interferes with the reset port writes on this core.
     unsafe { core::arch::asm!("cli", options(nostack, nomem)) };
 
-    // Wait for KBC input buffer empty (status bit 1 = 0).
-    // SAFETY: port 0x64 is the standard keyboard controller status/command port.
+    // SAFETY: all of these are architectural reset mechanisms; each either resets the
+    // platform (ending execution) or is harmless if the platform ignores it.
     unsafe {
-        // Bounded: if the KBC is wedged and never clears its input buffer, pulse the reset ANYWAY -
-        // the reset is the goal, and a stuck controller must never turn a reboot into a hang
-        // (§26.6 bounded behaviour; the hlt-spin below backstops a reset that doesn't fire).
+        // 1) 0xCF9 reset control register. bit1 SYS_RST (reset type), bit2 RST_CPU
+        //    (trigger), bit3 FULL_RST (cold vs warm). Arm the type, then trigger.
+        outb(0xCF9, 0x02); // select reset type
+        io_delay();
+        outb(0xCF9, 0x06); // RST_CPU | SYS_RST -> warm reset
+        io_delay();
+        outb(0xCF9, 0x0E); // + FULL_RST -> cold reset, if warm was ignored
+        io_delay();
+
+        // 2) Legacy 8042 KBC pulse. Bounded wait for the input buffer, then pulse
+        //    CPURST# via 0xFE; if the KBC is absent/wedged this is simply a no-op.
         let mut spins = 0u32;
         while inb(0x64) & 0x02 != 0 {
             core::hint::spin_loop();
             spins += 1;
             if spins >= 1_000_000 { break; }
         }
-        // 0xFE on port 0x64 pulses the CPURST# line - unconditional CPU reset.
-        // SAFETY: keyboard controller command; universally supported on x86.
         outb(0x64, 0xFE);
+        io_delay();
+
+        // 3) Triple fault: load a zero-length IDT (limit 0, base 0), then raise an
+        //    exception. With no valid handler - and none for the resulting #GP/#DF -
+        //    the CPU shuts down and the platform resets. Guaranteed on real x86.
+        let idtr: [u8; 10] = [0; 10]; // 2-byte limit (0) + 8-byte base (0)
+        core::arch::asm!(
+            "lidt [{ptr}]",
+            "int3",
+            ptr = in(reg) &idtr,
+            options(nostack),
+        );
     }
 
-    // Reset propagates in a few µs. Spin in case it doesn't fire immediately.
+    // Unreachable in practice (one method above resets the platform); the hlt-spin is
+    // the type-level backstop for the `-> !` return.
     loop {
         unsafe { core::arch::asm!("hlt", options(nostack, nomem)) };
     }
