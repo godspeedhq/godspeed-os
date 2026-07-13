@@ -283,10 +283,12 @@ pub fn decode_keyboard(
             if emit_key(k, mods, *caps, &mut emit) {
                 // Newest printable/cursor key held becomes the repeat key - except the
                 // one-shot control keys: Escape (0x29), whose repeat would make the shell
-                // re-disambiguate a bare ESC every tick, and the function keys F1-F12
+                // re-disambiguate a bare ESC every tick; the function keys F1-F12
                 // (0x3A-0x45), which are actions, not characters (holding F1 should not
-                // re-open help over and over).
-                if k != 0x29 && !(0x3A..=0x45).contains(&k) {
+                // re-open help over and over); and Enter/Return (0x28) + keypad Enter
+                // (0x58), commit keys whose repeat spams blank prompts and re-fires a
+                // confirmation's answer (the Wyse `y/N` "multiple gsh>" bug).
+                if k != 0x29 && k != 0x28 && k != 0x58 && !(0x3A..=0x45).contains(&k) {
                     rep.arm(k, mods, *caps, now);
                 }
             } else if is_typable_code(k) {
