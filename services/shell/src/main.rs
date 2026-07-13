@@ -472,6 +472,9 @@ fn complete_tab(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd) {
 /// keyword/target arguments are completed in `complete_keyword`; anything past that has no completion,
 /// rather than falling through to path completion. (Path-taking commands - ls/read/write/mkdir/... -
 /// are absent, so they still path-complete.)
+///
+/// CONVENTION (`utilities/0_conventions.md` rule 9): a new non-path utility must be added here in the
+/// same commit; a path-taking utility is left out. Opting out of path completion is explicit + per-command.
 const NO_PATH_CMDS: &[&str] = &[
     "chaos", "kill", "spawn", "restart", "ping", "net", "drives", "observe", "date", "uptime",
 ];
