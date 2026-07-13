@@ -6,7 +6,7 @@
 //!   2. TLB shootdown after a page is unmapped (§10.5).
 //!   3. Cross-core scheduler preemption (timer overflow).
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use crate::smp::percpu::{PerCore, num_cores};
 
 /// Vector numbers for each IPI purpose.
@@ -28,31 +28,71 @@ const APIC_ICR_LOW:  u64 = 0x300;
 // (`service_pending`), so concurrent shootdowns serialize cleanly instead of deadlocking. This was the
 // max-carnage wedge at 71K rounds: heavy concurrent reclaims across cores (§10.5).
 //
-// Both arrays are boot-allocated per-core arenas (`PerCore`, §26.6.1) sized to the cores Limine
-// actually reported, NOT a fixed `[_; MAX_CORES]` - a 4-core box reserves 4 slots, not MAX_CORES.
+// All three are boot-allocated arenas (§26.6.1) sized to the cores Limine actually reported - NO fixed
+// ceiling, so the machine's real core count is the only bound (RAM caps it: the carve panics loudly if
+// it cannot be backed). A 4-core box reserves 4 slots; a 512-core box reserves 512.
 //
-//   SHOOTDOWN_ADDR.get(x)     - the VA core x is invalidating (`!0` = full CR3 flush).
-//   SHOOTDOWN_ACK_MASK.get(x) - a MAX_WORDS-word bitmask: bit y (word y/64, bit y%64) set = core y has
-//                               serviced x's CURRENT request. The initiator CLEARS all words to
-//                               publish (a clear bit = "service me"); each servicer sets its own bit;
-//                               the initiator waits until every expected bit is set. Initialised
-//                               all-set (!0) so a never-requested slot is not spuriously serviced.
-//                               MAX_WORDS = ceil(MAX_CORES/64) covers the whole sanity ceiling, so up
-//                               to MAX_CORES cores - one bit per (initiator, receiver) pair.
+//   SHOOTDOWN_ADDR.get(x)  - the VA core x is invalidating (`!0` = full CR3 flush).
+//   ack_word(x, w) / exp_word(x, w) - two FLAT `num_cores * words_per_core` bitmask arenas (one bit per
+//                            (initiator, receiver) pair, `words_per_core = ceil(num_cores/64)`), indexed
+//                            `[x * words_per_core + w]`. In ACK, bit y set = core y has serviced x's
+//                            CURRENT request; the initiator CLEARS its words to publish (a clear bit =
+//                            "service me"), each servicer sets its own bit, and the initiator waits
+//                            until every EXPECTED bit is set. ACK starts all-set (!0) so a never-
+//                            requested slot is not spuriously serviced; EXPECTED is (re)computed per
+//                            request. Flat arenas because the per-initiator WIDTH scales with the core
+//                            count - no fixed `[_; K]` can size it dynamically.
 
-/// u64 words a per-initiator ack bitmask needs to hold one bit per core up to the `MAX_CORES` sanity
-/// ceiling: `ceil(MAX_CORES / 64)`.
-const MAX_WORDS: usize = crate::smp::core::MAX_CORES.div_ceil(64);
+/// Watchdog bound for the shootdown ack-wait spin (see `request_and_wait`). A real shootdown completes
+/// in a few thousand iterations even under contention; ~5x10^8 is thousands of times that, so it fires
+/// ONLY on a true wedge (a core that will never ack) and turns a silent freeze into a loud, pinpointed
+/// panic. At ~1.5-2 GHz this is on the order of a few seconds of spin before the panic.
+const SHOOTDOWN_WATCHDOG_SPINS: u64 = 500_000_000;
 
-static SHOOTDOWN_ADDR:     PerCore<AtomicU64>              = PerCore::new();
-static SHOOTDOWN_ACK_MASK: PerCore<[AtomicU64; MAX_WORDS]> = PerCore::new();
+static SHOOTDOWN_ADDR: PerCore<AtomicU64> = PerCore::new();
 
-/// Allocate the per-core shootdown arenas for `n` cores. Called once at boot (`smp::percpu_init`),
-/// after the frame allocator is up and before any shootdown can run (before APs / spawn). ADDR starts
-/// 0; every ack-mask word starts all-set so a never-requested slot reads "already acked by everyone".
+/// u64 words per initiator: `ceil(num_cores/64)`. Set once at boot in `init_arenas`.
+static WORDS_PER_CORE: AtomicUsize = AtomicUsize::new(1);
+/// Base of the flat `num_cores * words_per_core` ACK bitmask arena (each element an `AtomicU64`).
+static ACK_MASK: AtomicPtr<AtomicU64> = AtomicPtr::new(core::ptr::null_mut());
+/// Base of the flat `num_cores * words_per_core` EXPECTED bitmask arena (the acks each initiator awaits).
+static EXPECTED: AtomicPtr<AtomicU64> = AtomicPtr::new(core::ptr::null_mut());
+
+#[inline]
+fn words_per_core() -> usize {
+    WORDS_PER_CORE.load(Ordering::Acquire)
+}
+
+/// The ACK bitmask word `(initiator, word)` in the flat arena.
+#[inline]
+fn ack_word(initiator: usize, word: usize) -> &'static AtomicU64 {
+    let base = ACK_MASK.load(Ordering::Acquire);
+    // SAFETY: base points to `num_cores * words_per_core` initialised, never-freed `AtomicU64`s
+    // (init_arenas); `initiator < num_cores()` and `word < words_per_core()` by every caller's loop
+    // bounds, so the index is in range. `AtomicU64: Sync` makes the shared ref sound across cores.
+    unsafe { &*base.add(initiator * words_per_core() + word) }
+}
+
+/// The EXPECTED bitmask word `(initiator, word)` in the flat arena.
+#[inline]
+fn exp_word(initiator: usize, word: usize) -> &'static AtomicU64 {
+    let base = EXPECTED.load(Ordering::Acquire);
+    // SAFETY: as `ack_word` - in-range index into the EXPECTED flat arena of the same shape.
+    unsafe { &*base.add(initiator * words_per_core() + word) }
+}
+
+/// Allocate the shootdown arenas for `n` cores. Called once at boot (`smp::percpu_init`), after the
+/// frame allocator is up and before any shootdown can run (before APs / spawn). ADDR starts 0; every
+/// ACK word starts all-set so a never-requested slot reads "already acked by everyone"; EXPECTED starts
+/// 0 (recomputed per request).
 pub fn init_arenas(n: usize) {
+    let wpc = n.div_ceil(64);
+    WORDS_PER_CORE.store(wpc, Ordering::Release);
     SHOOTDOWN_ADDR.init_with(n, |_| AtomicU64::new(0));
-    SHOOTDOWN_ACK_MASK.init_with(n, |_| [const { AtomicU64::new(!0) }; MAX_WORDS]);
+    let ack = crate::smp::percpu::alloc_atomic_u64_slice(n * wpc, !0);
+    let exp = crate::smp::percpu::alloc_atomic_u64_slice(n * wpc, 0);
+    ACK_MASK.store(ack.as_ptr() as *mut AtomicU64, Ordering::Release);
+    EXPECTED.store(exp.as_ptr() as *mut AtomicU64, Ordering::Release);
 }
 
 /// `(word index, bit mask within that word)` for core `c` in a multi-word ack bitmask.
@@ -85,16 +125,22 @@ fn invalidate(addr: u64) {
     }
 }
 
-/// Bitmask of every ready core except `me` - the set of acks an initiator must collect.
-fn ready_mask_excluding(me: usize) -> [u64; MAX_WORDS] {
-    let mut mask = [0u64; MAX_WORDS];
+/// Publish, into `me`'s EXPECTED words, the set of acks it must collect: a bit for every ready core
+/// except `me`. Returns nothing - the spin reads the EXPECTED arena directly (its width is dynamic, so
+/// it cannot be a fixed stack array). Call after clearing `me`'s EXPECTED words is not needed: each word
+/// is overwritten wholesale here.
+fn publish_expected(me: usize) {
+    let wpc = words_per_core();
+    // Zero every word first (a core that became not-ready since last time must not linger set).
+    for w in 0..wpc {
+        exp_word(me, w).store(0, Ordering::SeqCst);
+    }
     for x in 0..num_cores() {
         if x != me && crate::smp::core::is_ready(x as u32) {
             let (w, b) = word_bit(x);
-            mask[w] |= b;
+            exp_word(me, w).fetch_or(b, Ordering::SeqCst);
         }
     }
-    mask
 }
 
 /// Service every OTHER ready core's pending shootdown request once: invalidate its VA and ack it.
@@ -106,9 +152,9 @@ fn service_pending(me: usize) {
     let (mw, mb) = word_bit(me);
     for x in 0..num_cores() {
         if x == me || !crate::smp::core::is_ready(x as u32) { continue; }
-        if SHOOTDOWN_ACK_MASK.get(x)[mw].load(Ordering::SeqCst) & mb == 0 {
+        if ack_word(x, mw).load(Ordering::SeqCst) & mb == 0 {
             invalidate(SHOOTDOWN_ADDR.get(x).load(Ordering::SeqCst));
-            SHOOTDOWN_ACK_MASK.get(x)[mw].fetch_or(mb, Ordering::SeqCst);
+            ack_word(x, mw).fetch_or(mb, Ordering::SeqCst);
         }
     }
 }
@@ -178,15 +224,16 @@ unsafe fn request_and_wait(addr: u64) {
         return; // single-core; no remote TLBs to invalidate
     }
     let me = this_core();
-    // The acks we must collect: a bit for every OTHER ready core.
-    let expected = ready_mask_excluding(me);
+    let wpc = words_per_core();
+    // The acks we must collect: a bit for every OTHER ready core, published into me's EXPECTED words.
+    publish_expected(me);
 
     // Publish: set the address, THEN clear every ack-mask word. The clear IS the "new request" signal
     // (a servicer acts on a clear bit), so the address must land first - a servicer seeing its bit
     // clear then reads the new address.
     SHOOTDOWN_ADDR.get(me).store(addr, Ordering::SeqCst);
-    for w in 0..MAX_WORDS {
-        SHOOTDOWN_ACK_MASK.get(me)[w].store(0, Ordering::SeqCst);
+    for w in 0..wpc {
+        ack_word(me, w).store(0, Ordering::SeqCst);
     }
 
     // SAFETY: APIC mapped; IF=0.
@@ -194,14 +241,36 @@ unsafe fn request_and_wait(addr: u64) {
 
     // Wait until every expected core (across all words) has set its bit, servicing theirs meanwhile so
     // two cores shooting down at once ack each other instead of deadlocking.
+    //
+    // WATCHDOG (invariant 12 / §26.7): the wait is BOUNDED. A real shootdown - even under heavy
+    // concurrent-kill contention with the deadlock-breaker serializing - completes in well under a
+    // millisecond (a few thousand iterations). If we spin far past that, an expected core is NEVER going
+    // to ack: its IPI was lost (the bounded ICR-busy spin above gave up mid-broadcast), or it is wedged
+    // IF=0 in a path that never services pending. That used to be a SILENT system-wide freeze (the
+    // `chaos max-carnage` wedge on the Wyse's 4 real cores). Now it PANICS loudly, naming the core still
+    // waiting and the bitmask of cores that failed to ack - a pinpointed report instead of a dead
+    // machine. The bound is ~5000x a normal shootdown, so it cannot false-fire on legitimate load.
+    let mut spins: u64 = 0;
     loop {
         service_pending(me);
-        let done = (0..MAX_WORDS).all(|w| {
-            let acked = SHOOTDOWN_ACK_MASK.get(me)[w].load(Ordering::SeqCst);
-            acked & expected[w] == expected[w]
+        let done = (0..wpc).all(|w| {
+            let acked = ack_word(me, w).load(Ordering::SeqCst);
+            let exp = exp_word(me, w).load(Ordering::SeqCst);
+            acked & exp == exp
         });
         if done {
             break;
+        }
+        spins += 1;
+        if spins >= SHOOTDOWN_WATCHDOG_SPINS {
+            let exp0 = exp_word(me, 0).load(Ordering::SeqCst);
+            let acked0 = ack_word(me, 0).load(Ordering::SeqCst);
+            let missing0 = exp0 & !acked0;
+            panic!(
+                "TLB shootdown WEDGE: core {} spun {} iters waiting acks (addr={:#x}); \
+                 expected(w0)={:#x} acked(w0)={:#x} MISSING-ACK cores(w0)={:#x}",
+                me, spins, addr, exp0, acked0, missing0
+            );
         }
         core::hint::spin_loop();
     }

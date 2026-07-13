@@ -147,37 +147,12 @@ fn collect_boot_info() -> BootInfo {
         .map(|r| r.address as u64)
         .unwrap_or(0);
 
-    // Collect non-BSP LAPIC IDs from the SMP response.
-    // The AP-id buffer holds up to the MAX_CORES sanity ceiling worth of APs (BSP excluded). A machine
-    // with more cores is capped here - loudly (§26.7), never silently.
-    const MAX_AP_IDS: usize = crate::smp::core::MAX_CORES - 1;
-    static mut AP_ID_BUF: [u32; MAX_AP_IDS] = [0u32; MAX_AP_IDS];
-    let mut ap_count = 0usize;
-    let mut dropped = 0usize;
-
+    // Record the BSP local-APIC id so legacy-INTx (EHCI) routes target the right LAPIC. The AP list
+    // itself is NOT staged into a fixed buffer here (that used to cap cores at a compile-time ceiling):
+    // `start_all_aps` walks Limine's live `cpus()` slice directly, and `ap_count()` counts it on demand,
+    // so the machine's real core count - whatever it is - is the only bound (§26.6.1; no MAX_CORES).
     if let Some(mp) = SMP_REQUEST.response() {
-        let bsp_lapic = mp.bsp_lapic_id;
-        // Record the BSP local-APIC id so legacy-INTx (EHCI) routes target the right LAPIC.
-        crate::arch::x86_64::ioapic::set_bsp_lapic_id(bsp_lapic as u8);
-        for cpu in mp.cpus() {
-            if cpu.lapic_id != bsp_lapic {
-                if ap_count < MAX_AP_IDS {
-                    // SAFETY: single-threaded boot path.
-                    unsafe { AP_ID_BUF[ap_count] = cpu.lapic_id; }
-                    ap_count += 1;
-                } else {
-                    dropped += 1;
-                }
-            }
-        }
-    }
-    if dropped > 0 {
-        crate::kprintln!(
-            "smp: machine has {} cores; this build handles {} (MAX_CORES) - {} unused",
-            ap_count + 1 + dropped,
-            crate::smp::core::MAX_CORES,
-            dropped
-        );
+        crate::arch::x86_64::ioapic::set_bsp_lapic_id(mp.bsp_lapic_id as u8);
     }
 
     // Compute the physical range of the kernel image so the frame allocator
@@ -203,8 +178,6 @@ fn collect_boot_info() -> BootInfo {
     BootInfo {
         // SAFETY: MAP_BUF written above in single-threaded boot; slice is valid for kernel lifetime.
         memory_map: unsafe { &MAP_BUF[..count] },
-        // SAFETY: AP_ID_BUF written above in single-threaded boot; slice is valid for kernel lifetime.
-        ap_ids: unsafe { &AP_ID_BUF[..ap_count] },
         kernel_phys_start,
         kernel_phys_end,
         hhdm_offset,
@@ -217,10 +190,35 @@ fn collect_boot_info() -> BootInfo {
 // ---------------------------------------------------------------------------
 
 /// Boot information passed from the bootloader to `kernel_main`.
+/// The highest local-APIC ID the kernel's **xAPIC** IPI path can address: the ICR destination field is
+/// 8 bits (`(lapic_id & 0xFF) << 24`). A core whose Limine LAPIC id exceeds this cannot receive a
+/// TARGETED IPI (cross-core wake, scheduler tick), so it is excluded - loudly (§26.7) - rather than
+/// silently mis-addressed. This is a genuine hardware-addressing limit (lifted only by x2APIC's 32-bit
+/// addressing, a future arch change), NOT a software array bound: the per-core arenas are themselves
+/// unbounded and size to whatever count survives this filter (§26.6.1).
+pub const XAPIC_MAX_LAPIC_ID: u32 = 0xFF;
+
+/// The number of Application Processors (non-BSP cores) Limine reports that the kernel can actually
+/// address, counted live from its `cpus()` slice - no fixed ceiling beyond the xAPIC addressing limit
+/// above. Valid for the kernel lifetime (Limine's SMP response lives in bootloader-reclaimable RAM,
+/// which the allocator never opens). `start_all_aps` applies the SAME filter, so `num_cores` and the
+/// cores actually started agree.
+pub fn ap_count() -> usize {
+    match SMP_REQUEST.response() {
+        Some(mp) => {
+            let bsp = mp.bsp_lapic_id;
+            mp.cpus()
+                .iter()
+                .filter(|c| c.lapic_id != bsp && c.lapic_id <= XAPIC_MAX_LAPIC_ID)
+                .count()
+        }
+        None => 0,
+    }
+}
+
 #[repr(C)]
 pub struct BootInfo {
     pub memory_map: &'static [MemoryRegion],
-    pub ap_ids: &'static [u32],
     pub kernel_phys_start: u64,
     pub kernel_phys_end: u64,
     /// Base virtual address of Limine's higher-half direct map (HHDM).
@@ -294,33 +292,69 @@ pub fn halt_all_cores() -> ! {
     }
 }
 
-/// Issue an x86 hardware reset via the keyboard controller CPU reset line.
+/// Issue an x86 hardware reset. Used by the Reboot syscall (18). Does not return.
 ///
-/// Writes 0xFE to I/O port 0x64, asserting CPURST# and causing an unconditional
-/// hardware reset. Used by the Reboot syscall (18). Does not return.
+/// Tries, in order, the reset methods that between them cover modern and legacy x86:
+///  1. the PCH/FCH **reset control register** at I/O port `0xCF9` - the method that
+///     works on USB-only machines with no PS/2 8042 (the Goldmont+ Wyse). Writing
+///     `0xFE` to `0x64` alone was a *no-op* there, so the reset never fired and the
+///     calling core spun in `cli`+`hlt` until the liveness watchdog panicked;
+///  2. the legacy 8042 keyboard-controller CPU reset line (`0x64 <- 0xFE`) for older
+///     boxes (the T630), kept so nothing regresses where it already worked;
+///  3. a **triple fault** - a zero-length IDT plus an exception - which resets the
+///     platform unconditionally if both port writes were ignored. This makes reboot
+///     always terminate in a reset, never in a wedge (invariant 12: loud, and here,
+///     final).
+/// Each method resets the whole platform, so no need to stop the other cores first.
 pub fn hardware_reset() -> ! {
-    // SAFETY: CLI before touching the KBC so no ISR reads port 0x60 between
-    // our status poll and the reset command.
+    // A short, self-contained I/O settle between port writes (no dependence on port 0x80).
+    #[inline(always)]
+    fn io_delay() {
+        for _ in 0..10_000 {
+            core::hint::spin_loop();
+        }
+    }
+
+    // SAFETY: CLI so no ISR interferes with the reset port writes on this core.
     unsafe { core::arch::asm!("cli", options(nostack, nomem)) };
 
-    // Wait for KBC input buffer empty (status bit 1 = 0).
-    // SAFETY: port 0x64 is the standard keyboard controller status/command port.
+    // SAFETY: all of these are architectural reset mechanisms; each either resets the
+    // platform (ending execution) or is harmless if the platform ignores it.
     unsafe {
-        // Bounded: if the KBC is wedged and never clears its input buffer, pulse the reset ANYWAY -
-        // the reset is the goal, and a stuck controller must never turn a reboot into a hang
-        // (§26.6 bounded behaviour; the hlt-spin below backstops a reset that doesn't fire).
+        // 1) 0xCF9 reset control register. bit1 SYS_RST (reset type), bit2 RST_CPU
+        //    (trigger), bit3 FULL_RST (cold vs warm). Arm the type, then trigger.
+        outb(0xCF9, 0x02); // select reset type
+        io_delay();
+        outb(0xCF9, 0x06); // RST_CPU | SYS_RST -> warm reset
+        io_delay();
+        outb(0xCF9, 0x0E); // + FULL_RST -> cold reset, if warm was ignored
+        io_delay();
+
+        // 2) Legacy 8042 KBC pulse. Bounded wait for the input buffer, then pulse
+        //    CPURST# via 0xFE; if the KBC is absent/wedged this is simply a no-op.
         let mut spins = 0u32;
         while inb(0x64) & 0x02 != 0 {
             core::hint::spin_loop();
             spins += 1;
             if spins >= 1_000_000 { break; }
         }
-        // 0xFE on port 0x64 pulses the CPURST# line - unconditional CPU reset.
-        // SAFETY: keyboard controller command; universally supported on x86.
         outb(0x64, 0xFE);
+        io_delay();
+
+        // 3) Triple fault: load a zero-length IDT (limit 0, base 0), then raise an
+        //    exception. With no valid handler - and none for the resulting #GP/#DF -
+        //    the CPU shuts down and the platform resets. Guaranteed on real x86.
+        let idtr: [u8; 10] = [0; 10]; // 2-byte limit (0) + 8-byte base (0)
+        core::arch::asm!(
+            "lidt [{ptr}]",
+            "int3",
+            ptr = in(reg) &idtr,
+            options(nostack),
+        );
     }
 
-    // Reset propagates in a few µs. Spin in case it doesn't fire immediately.
+    // Unreachable in practice (one method above resets the platform); the hlt-spin is
+    // the type-level backstop for the `-> !` return.
     loop {
         unsafe { core::arch::asm!("hlt", options(nostack, nomem)) };
     }

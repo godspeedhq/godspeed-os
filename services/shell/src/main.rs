@@ -39,7 +39,8 @@ const FS_OK: u8 = 0;
 const FS_NOTFOUND: u8 = 2;
 const FS_NOFS: u8 = 3;
 const FS_UNAVAIL: u8 = 4;   // present-but-unreadable storage: do NOT flash (data may be intact)
-const FS_DENIED: u8 = 4; // file-cap op needs a right the cap lacks (non-escalation, §7.3)
+const FS_DENIED: u8 = 5; // file-cap op needs a right the cap lacks (non-escalation, §7.3); DISTINCT
+                         // from FS_UNAVAIL(4) so a client can tell "denied" from "storage down" (audit L2)
 // File-as-capability (§7.10, P2): Open mints a file cap; the holder invokes it (FOP_*).
 const OP_OPEN: u8 = 30;  // [op, plen, path, rights:u8] → [FS_OK] + embedded FILE CAP
 const FOP_READ: u8 = 1;  // [FOP_READ, offset:u64, len:u32]  (needs READ)
@@ -452,13 +453,31 @@ fn complete_tab(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd) {
     let seg_start = bytes[..tok_start].iter().rposition(|&b| b == b'|').map(|i| i + 1).unwrap_or(0);
     // The token is the segment's COMMAND if only spaces sit between the segment start and it.
     let is_command = bytes[seg_start..tok_start].iter().all(|&b| b == b' ');
+    // Does this segment's command take FILE PATHS as arguments? A service-name / number / keyword
+    // command (chaos, kill, ping, ...) never does, so Tab past its keyword must NOT list the
+    // filesystem (which wrongly surfaced /.gsh_history, e.g. `chaos max-carnage all-services <tab>`
+    // landing on the rounds arg). Computed here while `bytes` is borrowed, before any mutating call.
+    let seg_cmd = bytes[seg_start..].split(|&b| b == b' ').find(|w| !w.is_empty());
+    let is_no_path = seg_cmd.map(|c| NO_PATH_CMDS.iter().any(|k| k.as_bytes() == c)).unwrap_or(false);
 
     if is_command {
         complete_from_list(ctx, line, tok_start, UTILS);          // command name (after a `|` too)
-    } else if !complete_keyword(ctx, line, seg_start, tok_start) {
-        complete_path(ctx, line, cwd, tok_start);                 // not a keyword → file path
+    } else if !complete_keyword(ctx, line, seg_start, tok_start) && !is_no_path {
+        complete_path(ctx, line, cwd, tok_start);                 // not a keyword and takes paths → file path
     }
 }
+
+/// Commands whose arguments are service names, numbers, or fixed keywords - NEVER file paths. Tab at
+/// an argument position for these must not list the filesystem (which surfaced /.gsh_history). Their
+/// keyword/target arguments are completed in `complete_keyword`; anything past that has no completion,
+/// rather than falling through to path completion. (Path-taking commands - ls/read/write/mkdir/... -
+/// are absent, so they still path-complete.)
+///
+/// CONVENTION (`utilities/0_conventions.md` rule 9): a new non-path utility must be added here in the
+/// same commit; a path-taking utility is left out. Opting out of path completion is explicit + per-command.
+const NO_PATH_CMDS: &[&str] = &[
+    "chaos", "kill", "spawn", "restart", "ping", "net", "drives", "observe", "date", "uptime",
+];
 
 /// Commands whose FIRST argument (the token right after the command, within its pipe segment) is a
 /// fixed keyword - completed only at that position. Pipe-stage verbs (`to`/`from`/`sort`/`match`) are
@@ -3526,7 +3545,7 @@ fn cmd_assert(ctx: &ServiceContext, cwd: &mut Cwd, rest: &str, depth: u8) -> Res
 // render identically and a tweak updates every one at once.
 // ---------------------------------------------------------------------------
 
-const UTIL_VERSION: &str = "0.2.0";
+const UTIL_VERSION: &str = "0.3.0";
 
 /// Utilities that self-document (gates the `help`/`version` intercept in `execute`).
 const UTILS: &[&str] = &[
@@ -4188,8 +4207,9 @@ fn cmd_echo(ctx: &ServiceContext, text: &str, out: &mut Out) -> Result<(), Shell
 /// One-line identity for the system. A pipe source (`about | write /about.txt`): renders through
 /// `Out`, so it captures to a file as readily as it prints.
 fn cmd_about(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
-    out.line(ctx, "GodspeedOS: a capability-based microkernel (v1 milestone)");
-    out.line_fmt(ctx, format_args!("  running on {} core(s)", ctx.inspect_core_count()));
+    out.line(ctx, "GodspeedOS: a capability-based microkernel");
+    out.line(ctx, "  Small enough to understand. Rigorous enough to trust.");
+    out.line_fmt(ctx, format_args!("  Running on {} core(s).", ctx.inspect_core_count()));
     out.line(ctx, "  Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors.");
     Ok(())
 }
@@ -4619,6 +4639,12 @@ enum NetQ { Reply(Message), Timeout, Aborted }
 /// an abort key between tries, up to `max_secs`. Returns the reply, a timeout, or Aborted. (Safe under
 /// the piped shell-test: it waits for the prompt between commands, so no input is pending during `net`.)
 fn net_query(ctx: &ServiceContext, peer: &str, msg: &Message, max_secs: i64) -> NetQ {
+    // Drain any STALE reply left in our endpoint by a PRIOR command before we send ours - otherwise the
+    // request_with_reply below reads that leftover as if it were our answer. A q-aborted continuous `ping`
+    // leaves its last net-stack reply (a 4-byte [alive,rtt,ttl]) here; without this drain the next `net`
+    // reads it and prints a bogus DNS / "gave a short reply". Same class as the `net scan -> 0.0.0.0` bug;
+    // the abortable request variants already drain, but net_query (a deadline loop) did not.
+    while ctx.try_recv().is_some() {}
     for i in 0..=max_secs {
         while let Some(b) = ctx.try_console_read() {
             if b == b'q' || b == b'Q' || b == 0x1b { return NetQ::Aborted; }
@@ -4754,13 +4780,18 @@ fn sock_open(ctx: &ServiceContext) -> Option<CapHandle> {
 
 /// Invoke a socket cap - send a datagram through it and receive the response (mirrors `fc_invoke`).
 fn sock_invoke(ctx: &ServiceContext, sock: CapHandle, right: u8, payload: &[u8]) -> Option<Message> {
+    while ctx.try_recv().is_some() {}   // clear any stale late-reply a prior aborted invoke left behind
     let self_grant = ctx.self_grant_handle()?;
     let reply = ctx.derive_cap(self_grant)?;
     if ctx.resource_invoke(sock, right, reply, &Message::from_bytes(payload)).is_err() {
         ctx.remove_cap(reply);
         return None;
     }
-    Some(ctx.recv())
+    // Await the reply FAILURE-AWARE (Commandment VIII): a bare `recv` would hang forever if net-stack
+    // died after receiving the invocation but before replying. Reclaim the reply slot on every outcome.
+    let outcome = ctx.recv_abortable_deadline(FILTER_WAIT_SECS);
+    ctx.remove_cap(reply);
+    match outcome { ReqOutcome::Reply(m) => Some(m), _ => None }
 }
 
 /// Build a minimal DNS A-query for `host` into `buf`; returns the length. Just enough to elicit a UDP
@@ -4847,6 +4878,9 @@ fn build_status_table(ctx: &ServiceContext) -> Table {
 /// (total seconds since boot). Bare `uptime` renders the grid; `uptime | to json|yaml` renders the
 /// row; `uptime | select seconds` etc. work like any record stream. The clock is a wall-clock RTC
 /// delta (now − boot, InspectKernel queries 11/12), so it's correct on any APIC timer mode.
+#[inline(never)] // keep this builder's frame out of pipe_run's 64 KiB Stream frame, like every sibling
+                 // record-builder (build_ls/caps/drives/find/observe/status); a byte pipe overflows the
+                 // user stack otherwise (the PUSER-PF lesson). Audit L7 - it was the lone omission.
 fn build_uptime_table(ctx: &ServiceContext) -> Table {
     let secs = ctx.uptime_secs() as u64;
     let (d, h, m, s) = (secs / 86_400, (secs % 86_400) / 3_600, (secs % 3_600) / 60, secs % 60);
@@ -5851,13 +5885,27 @@ fn drain_service(ctx: &ServiceContext, svc: &str, input: Option<&[u8]>, out: &mu
             }
         }
     }
-    // Drain the service's output until EOT (bounded - a conforming service always sends it).
+    // Drain the service's output until EOT, FAILURE-AWARE (Commandment VIII): the `512` bounds the
+    // message COUNT, but each wait is a per-message deadline + q-abort, not a bare blocking `recv` -
+    // a filter that registers its endpoint then wedges or page-faults BEFORE sending EOT (or any
+    // output) must not hang the prompt forever with the keyboard dead. Timeout => it died mid-stream;
+    // Aborted => the user pressed q. Both stop the drain loudly (§26.7) rather than blocking.
     for _ in 0..512 {
-        let msg = ctx.recv();
-        let p = msg.payload_bytes();
-        if p == [PIPE_EOT] { break; }
-        out.push(p);
-        if out.overflow { break; }
+        match ctx.recv_abortable_deadline(FILTER_WAIT_SECS) {
+            ReqOutcome::Reply(msg) => {
+                let p = msg.payload_bytes();
+                if p == [PIPE_EOT] { break; }
+                out.push(p);
+                if out.overflow { break; }
+            }
+            ReqOutcome::Aborted => { ctx.console_writeln("pipe: aborted"); break; }
+            ReqOutcome::Timeout => {
+                ctx.console_writeln_fmt(format_args!(
+                    "pipe: '{}' stopped sending without EOT (waited ~{}s) - it may have failed mid-stream",
+                    svc, FILTER_WAIT_SECS));
+                break;
+            }
+        }
     }
     let _ = ctx.kill(svc);
     if out.overflow { ctx.console_writeln("pipe: pipe output exceeded the buffer (truncated)"); }
@@ -7399,13 +7447,19 @@ fn fc_open(ctx: &ServiceContext, path: &[u8], rights: u8) -> Option<CapHandle> {
 /// routes it to fs; fs replies on our endpoint. `None` means the kernel rejected the invocation
 /// (the cap lacks `right` - non-escalation - or is stale/revoked), so no reply comes back.
 fn fc_invoke(ctx: &ServiceContext, file: CapHandle, right: u8, payload: &[u8]) -> Option<Message> {
+    while ctx.try_recv().is_some() {}   // clear any stale late-reply a prior aborted invoke left behind
     let self_grant = ctx.self_grant_handle()?;
     let reply = ctx.derive_cap(self_grant)?;
     if ctx.resource_invoke(file, right, reply, &Message::from_bytes(payload)).is_err() {
         ctx.remove_cap(reply); // kernel didn't consume it (validation failed) - don't leak the slot
         return None;
     }
-    Some(ctx.recv())
+    // Await the reply FAILURE-AWARE (Commandment VIII): a bare `recv` here would hang forever if fs
+    // died after receiving the badged invocation but before replying. Reclaim the reply slot on every
+    // outcome (the reply cap is one-shot; Aborted/Timeout means it was never consumed).
+    let outcome = ctx.recv_abortable_deadline(FILTER_WAIT_SECS);
+    ctx.remove_cap(reply);
+    match outcome { ReqOutcome::Reply(m) => Some(m), _ => None }
 }
 
 /// `fcap` - self-contained demonstration AND self-check of file-as-capability (§7.10). It is a

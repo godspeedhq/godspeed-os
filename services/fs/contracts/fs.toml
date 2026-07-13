@@ -9,6 +9,9 @@ limit   = "32MiB"
 ipc_receive = ["fs"]
 ipc_send    = ["block-driver"]
 log_write   = true
+# fs mints a delegated FILE capability per open file (§7.10, file-as-capability). resource_mint is the
+# authority to mint those; the kernel grants it from this declaration (service_hw, audit T1 Phase B).
+resource_mint = true
 
 [placement]
 core = 1

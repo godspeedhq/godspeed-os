@@ -19,7 +19,7 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, Message};
+use godspeed_sdk::{ServiceContext, Message, DeadlineOutcome};
 
 // The NIC's MAC. In QEMU the e1000 default is 52:54:00:12:34:56; a real net-stack learns this from
 // nic-driver at init (a small refinement), but nic-driver runs the NIC promiscuous, so a reply is
@@ -64,14 +64,36 @@ const DANCE_TRIES: u32 = 6;
 // DNS collects frames after ONE query TX (the [4] RX-only path): up to this many frames pulled without
 // re-transmitting, so a reply behind stray broadcasts is caught (a re-TX would drain+discard it).
 const DNS_RX_TRIES: u32 = 12;
-/// ICMP echo RX budget (loop iterations AFTER the initial send-and-wait). Kept tight so an interactive
-/// `ping` pauses as little as possible on a lost echo: a live reply lands in the initial wait or the first
-/// extra try, so the total no-reply wait is ~1.5s (initial + 1), not ~2.25s (initial + 2) or ~9s. The link
-/// is checked BEFORE the ICMP and AGAIN on a timeout, so a mid-poll drop reports "no link", not a stalled
-/// "Request timed out", and recovers to the ~1s cadence immediately.
-const PING_RX_TRIES: u32 = 1;
+// (PING_RX_TRIES removed: the "look past a stray broadcast" retry loop is replaced by nic-driver's [9]
+// BATCH RX drain - one bounded round-trip that returns several frames for `ping` to scan, instead of N
+// slow per-frame re-queries. See `ping` and the BATCH_MAX doc in services/nic-driver.)
 /// Max ICMP echo DATA bytes `ping` will send (the Windows default is 32). Bounds the frame buffer.
 const PING_MAX_PAYLOAD: usize = 1024;
+
+/// Send a request to nic-driver and await the reply, RECOVERING from a nic-driver restart (audit M3).
+/// If the cached send cap has gone stale - nic-driver was killed and respawned (a real event:
+/// `chaos max-carnage nic-driver`), so its endpoint generation bumped - the first send fails and the
+/// deadline wait returns `None`. We then reacquire the driver by name from the kernel directory
+/// (§14.3, the same recovery `dhcp_discover`/`udp_roundtrip` already do in their loops) and retry once.
+/// Returns `None` only if the driver is genuinely absent or silent past the deadline. Use this for the
+/// FIRST request of each interactive path (`link_is_up`/`ping`/`dns`/`arp`); the poll-loop requests
+/// that follow reuse the now-reacquired cached cap. Without it a configured stack never self-heals
+/// after a driver restart on the ping/net/dns/arp surface - it needs a manual `net renew`. Because the
+/// reply is `request_with_reply` under the hood, a driver that dies mid-request wakes us with
+/// `ReplyDead` (never a hang), and the reacquire fixes a *stale* cap the fast-fail send exposes.
+fn nic_req(ctx: &ServiceContext, msg: &Message, secs: i64) -> Option<Message> {
+    match ctx.request_with_reply_deadline_outcome("nic-driver", msg, secs) {
+        DeadlineOutcome::Reply(r) => Some(r),
+        // The send never left - nic-driver's cap is stale (it was killed + respawned). Reacquire it by
+        // name from the kernel directory and retry once against the fresh instance.
+        DeadlineOutcome::SendFailed if ctx.reacquire_by_name("nic-driver") =>
+            ctx.request_with_reply_deadline("nic-driver", msg, secs),
+        // A genuine timeout (the driver got it but the host was silent), or a reacquire that still
+        // could not resolve the driver: return failure WITHOUT retrying - retrying a silent host would
+        // just double every no-answer wait (net arp/dns to a host that does not answer).
+        _ => None,
+    }
+}
 
 /// Phase 3: a DHCP DISCOVER over UDP - ask QEMU slirp's built-in DHCP server for our IP and read the
 /// OFFER. This proves the UDP transport (the layer the socket capability sits on) over the frame
@@ -224,7 +246,7 @@ fn dns_resolve(ctx: &ServiceContext, hostname: &[u8], gw_mac: &[u8; 6], our_ip: 
     let req     = Message::from_bytes(&frame[..frame_len]);
     let rx_only = Message::from_bytes(&[4u8]);
     let mut arp_out = [0u8; 42];
-    let mut reply = ctx.request_with_reply_deadline("nic-driver", &req, DANCE_SECS);
+    let mut reply = nic_req(ctx, &req, DANCE_SECS);
     for _ in 0..DNS_RX_TRIES {
         let (matched, answer_arp) = {
             let f: &[u8] = match &reply { Some(r) => r.payload_bytes(), None => { *timeouts += 1; &[] } };
@@ -387,7 +409,7 @@ fn arp_resolve(ctx: &ServiceContext, our_ip: &[u8; 4], target: &[u8; 4]) -> Opti
     let req     = Message::from_bytes(&arp);
     let rx_only = Message::from_bytes(&[4u8]);
     let mut arp_out = [0u8; 42];
-    let mut reply = ctx.request_with_reply_deadline("nic-driver", &req, DANCE_SECS);
+    let mut reply = nic_req(ctx, &req, DANCE_SECS);
     for _ in 0..DNS_RX_TRIES {
         let (mac, answer_arp) = {
             let f: &[u8] = match &reply { Some(r) => r.payload_bytes(), None => &[] };
@@ -426,7 +448,9 @@ fn calibrate_tsc_hz(ctx: &ServiceContext) -> u64 {
 /// Send one ICMP echo of `payload_len` data bytes to `dest_ip` and wait for the reply. Returns
 /// `Some((rtt_us, reply_ttl))` on an echo reply, `None` on timeout. The round trip is timed with the TSC
 /// and converted to microseconds via `tsc_hz` (RTC-calibrated; 0 -> reported as 0).
-/// Sends ONCE then RX-only polls ([4]) so a reply behind stray broadcasts is caught without re-TX.
+/// Sends ONCE (the reply arrives with it), then, if the first frame back was a stray broadcast, drains a
+/// BATCH of frames in ONE bounded [9] round-trip and scans it - so a reply behind broadcasts on a busy
+/// LAN is caught without N slow re-queries (which pushed net-stack past the shell's deadline).
 fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8; 4],
         payload_len: usize, seq: u16, tsc_hz: u64, frames: &mut u16, timeouts: &mut u16) -> Option<(u16, u8)> {
     let plen = payload_len.min(PING_MAX_PAYLOAD);
@@ -455,41 +479,60 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8;
     frame[36] = (icmp_ck >> 8) as u8; frame[37] = icmp_ck as u8;
 
     let t1 = ctx.read_tsc();
-    let req     = Message::from_bytes(&frame[..flen]);
-    let rx_only = Message::from_bytes(&[4u8]);
+    let req = Message::from_bytes(&frame[..flen]);
     let mut arp_out = [0u8; 42];
-    let mut reply = ctx.request_with_reply_deadline("nic-driver", &req, LINK_SECS);
-    for _ in 0..PING_RX_TRIES {
-        let (matched, ttl, answer_arp) = {
-            let f: &[u8] = match &reply { Some(r) => r.payload_bytes(), None => { *timeouts += 1; &[] } };
-            if !f.is_empty() { *frames += 1; }
-            // Echo REPLY (type 0) from dest_ip. Match the source so a gateway ping and an internet ping
-            // cannot be confused, and skip stray frames.
-            let m = f.len() >= 42 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45
-                && f[23] == 1 && f[34] == 0
-                && f[26] == dest_ip[0] && f[27] == dest_ip[1] && f[28] == dest_ip[2] && f[29] == dest_ip[3]
-                && f[40] == (seq >> 8) as u8 && f[41] == seq as u8;  // reply must echo THIS ping's seq
-            let ttl = if m { f[22] } else { 0 };     // the reply's TTL (the pinged host's)
-            // Otherwise: is this the gateway ARPing for US? Answer it so it can address the echo reply.
-            let a = !m && build_arp_reply(f, our_ip, &mut arp_out);
-            (m, ttl, a)
-        };
-        if matched {
-            let dt = ctx.read_tsc().wrapping_sub(t1);
-            // MICROSECONDS: dt cycles * 10000 / cycles-per-10ms. Finer than ms so a sub-millisecond LAN RTT
-            // is visible and distinguishable from a WAN one; capped at 65 ms (u16).
-            // us = cycles * 1e6 / tsc_hz. tsc_hz is calibrated against the RTC (the kernel's CPUID/PIT
-            // calibration yields 0 on the AMD T630), so this holds when q16 does not.
-            let rtt_us = if tsc_hz > 0 { (dt.saturating_mul(1_000_000) / tsc_hz).min(65535) as u16 } else { 0 };
-            return Some((rtt_us, ttl));
+
+    // Is `f` OUR echo reply? IPv4 / ICMP echo-reply (type 0) from dest_ip, echoing THIS ping's seq - so a
+    // gateway ping and an internet ping cannot be confused, and a stale reply from a prior ping cannot
+    // match. (`build_arp_reply` handles the other interesting frame: a gateway ARPing for us.)
+    let is_echo = |f: &[u8]| -> bool {
+        f.len() >= 42 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45
+            && f[23] == 1 && f[34] == 0
+            && f[26] == dest_ip[0] && f[27] == dest_ip[1] && f[28] == dest_ip[2] && f[29] == dest_ip[3]
+            && f[40] == (seq >> 8) as u8 && f[41] == seq as u8
+    };
+    // us = cycles * 1e6 / tsc_hz (RTC-calibrated; the kernel's CPUID/PIT calib yields 0 on the AMD T630).
+    // Finer than ms so a sub-ms LAN RTT is distinguishable from a WAN one; capped at 65 ms (u16).
+    let rtt_us = || -> u16 {
+        let dt = ctx.read_tsc().wrapping_sub(t1);
+        if tsc_hz > 0 { (dt.saturating_mul(1_000_000) / tsc_hz).min(65535) as u16 } else { 0 }
+    };
+
+    // 1. Send the echo; the frame that returns with it is the first candidate.
+    match nic_req(ctx, &req, LINK_SECS) {
+        Some(r) => {
+            let f = r.payload_bytes();
+            *frames += 1;
+            if is_echo(f) { return Some((rtt_us(), f[22])); }
+            if build_arp_reply(f, our_ip, &mut arp_out) {   // gateway ARPing for us - answer it
+                let _ = nic_req(ctx, &Message::from_bytes(&arp_out), LINK_SECS);
+            }
         }
-        // Owe an ARP reply? Send it (its request also returns the next frame). Else just poll RX-only.
-        // Both at the SHORT LINK_SECS deadline so a link-down ping gives up fast (~1 s), not the 2 s dance.
-        reply = if answer_arp {
-            ctx.request_with_reply_deadline("nic-driver", &Message::from_bytes(&arp_out), LINK_SECS)
-        } else {
-            ctx.request_with_reply_deadline("nic-driver", &rx_only, LINK_SECS)
-        };
+        None => *timeouts += 1,
+    }
+
+    // 2. On a busy LAN the reply can be a frame or two BEHIND a stray broadcast. Drain a BATCH of frames
+    //    in ONE bounded round-trip ([9]) and scan it for our reply - NOT N slow re-queries (each polling
+    //    the full RX budget when the ring was momentarily empty; that pushed net-stack past the shell's
+    //    deadline). The batch is [count:u8] then [len:u16 LE, bytes] per frame; nic-driver stays pure
+    //    mechanism (raw frames), the ICMP match lives here (Commandment X).
+    if let Some(b) = nic_req(ctx, &Message::from_bytes(&[9u8]), LINK_SECS) {
+        let p = b.payload_bytes();
+        let n = if p.is_empty() { 0 } else { p[0] as usize };
+        let mut pos = 1usize;
+        for _ in 0..n {
+            if pos + 2 > p.len() { break; }
+            let fl = u16::from_le_bytes([p[pos], p[pos + 1]]) as usize;
+            pos += 2;
+            if pos + fl > p.len() { break; }
+            let f = &p[pos..pos + fl];
+            pos += fl;
+            *frames += 1;
+            if is_echo(f) { return Some((rtt_us(), f[22])); }
+            if build_arp_reply(f, our_ip, &mut arp_out) {
+                let _ = nic_req(ctx, &Message::from_bytes(&arp_out), LINK_SECS);
+            }
+        }
     }
     None
 }
@@ -583,7 +626,7 @@ fn run_dance(ctx: &ServiceContext) -> NetState {
 /// path the reply is short (no link byte) - a non-empty reply means "up" (slirp's virtual link is always
 /// up). Cheap; lets net-stack notice a cable plugged in after boot and self-configure without `net renew`.
 fn link_is_up(ctx: &ServiceContext) -> bool {
-    match ctx.request_with_reply_deadline("nic-driver", &Message::from_bytes(&[3u8]), LINK_SECS) {
+    match nic_req(ctx, &Message::from_bytes(&[3u8]), LINK_SECS) {
         Some(r) => { let p = r.payload_bytes(); if p.len() > 7 { p[7] != 0 } else { !p.is_empty() } }
         None    => false,
     }

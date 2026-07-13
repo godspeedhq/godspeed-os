@@ -45,6 +45,21 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
    what makes typing words as cheap as flags. A subcommand that does not complete is one the
    user cannot discover without reading the source. Wire it in the shell's completion tables
    (`SUBCMD_FIRST` / the per-command case) the same commit that adds the subcommand.
+
+   **Declare whether your arguments are file paths (same commit).** When a token is *not* a
+   recognized keyword, Tab falls through to **file-path** completion - it lists the current
+   directory (`ls /x<tab>`, `read /doc<tab>`). That is correct only for utilities whose
+   arguments *are* paths. A utility whose arguments are **service names, numbers, or fixed
+   keywords - never paths** (`chaos`, `kill`, `spawn`, `restart`, `ping`, `net`, `drives`,
+   `observe`, `date`, `uptime`, ...) must be added to **`NO_PATH_CMDS`** in the shell
+   (`services/shell/src/main.rs`, beside `complete_tab`), so Tab at one of its argument
+   positions does *nothing* instead of offering unrelated files. (The bug this prevents:
+   `chaos max-carnage all-services <tab>`, landing on the rounds argument, listed the root
+   directory and offered `/.gsh_history`.) The default is path completion; **opting out is
+   explicit and per-command** - a path-taking utility (`ls`, `read`, `write`, `mkdir`, `find`,
+   `tree`, `copy`, ...) is simply absent from `NO_PATH_CMDS` and keeps its file completion. So
+   when you add a utility: if its args are paths, do nothing; if they are not, add it to
+   `NO_PATH_CMDS`.
 10. **Anything that blocks or waits is escapable with `q`.** If a utility can sit waiting - on
     a peer service, on the network, on a long sweep - then `q`/`Q`/ESC MUST abort it and return
     to the prompt, and a wait of more than a moment advertises `(press q to abort)`. A command

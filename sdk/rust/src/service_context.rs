@@ -17,6 +17,19 @@ pub enum ReqOutcome {
     Timeout,
 }
 
+/// Outcome of [`ServiceContext::request_with_reply_deadline_outcome`], which distinguishes the two
+/// ways a deadline request fails - so a caller can self-heal a *restarted* peer without penalising a
+/// *silent* one. `SendFailed`: the send never left (the peer's cap is stale or its name is currently
+/// unresolvable - it was killed and respawned, generation bumped), so reacquiring it by name and
+/// retrying will reach the fresh instance. `Timeout`: the peer received the request but did not reply
+/// within the deadline (a genuinely silent/absent host) - retrying only doubles the wait.
+/// `request_with_reply_deadline` collapses both to `None`; use this when the difference matters.
+pub enum DeadlineOutcome {
+    Reply(Message),
+    SendFailed,
+    Timeout,
+}
+
 /// Wall-clock date/time read from the hardware RTC, fully decoded (binary,
 /// 24-hour). See [`ServiceContext::datetime`].
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -531,21 +544,38 @@ impl ServiceContext {
         msg:  &crate::ipc::Message,
         max_secs: i64,
     ) -> Option<crate::ipc::Message> {
-        let target = CapHandle(self.find_send_slot(peer)?);
-        let self_grant = self.self_grant_handle()?;
-        let reply_cap = self.derive_cap(self_grant)?;
+        match self.request_with_reply_deadline_outcome(peer, msg, max_secs) {
+            DeadlineOutcome::Reply(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// Like [`Self::request_with_reply_deadline`] but returns the DISTINCTION between a send that never
+    /// left (stale/unresolvable peer cap) and a peer that received the request but stayed silent past
+    /// the deadline (see [`DeadlineOutcome`]). Same bounded, RTC-deadline wait; use this when a caller
+    /// must reacquire+retry a *restarted* peer (`SendFailed`) but must NOT double the wait on a merely
+    /// *silent* one (`Timeout`).
+    pub fn request_with_reply_deadline_outcome(
+        &self,
+        peer: &str,
+        msg:  &crate::ipc::Message,
+        max_secs: i64,
+    ) -> DeadlineOutcome {
+        let target = match self.find_send_slot(peer) { Some(s) => CapHandle(s), None => return DeadlineOutcome::SendFailed };
+        let self_grant = match self.self_grant_handle() { Some(g) => g, None => return DeadlineOutcome::SendFailed };
+        let reply_cap = match self.derive_cap(self_grant) { Some(c) => c, None => return DeadlineOutcome::SendFailed };
         if self.send_with_cap_by_handle(target, reply_cap, msg).is_err() {
             self.remove_cap(reply_cap);   // send failed: reclaim the untransferred reply cap (no leak)
-            return None;
+            return DeadlineOutcome::SendFailed;
         }
         // Deglitched monotonic clock, not the raw RTC: a single CMOS misread (the "4383d" glitch on the
         // T630) would otherwise make `now - t0` read huge and expire the deadline instantly.
         let t0 = self.epoch_secs_monotonic();
         loop {
-            if let Some(r) = self.try_recv() { return Some(r); }
+            if let Some(r) = self.try_recv() { return DeadlineOutcome::Reply(r); }
             if self.epoch_secs_monotonic() - t0 >= max_secs {
                 self.remove_cap(reply_cap);   // reply never consumed - reclaim its slot
-                return None;
+                return DeadlineOutcome::Timeout;
             }
             self.yield_cpu();
         }
@@ -630,6 +660,33 @@ impl ServiceContext {
             }
             if elapsed >= max_secs {
                 self.remove_cap(reply_cap);
+                return ReqOutcome::Timeout;
+            }
+            self.yield_cpu();
+        }
+    }
+
+    /// Wait for the next message on our own recv endpoint, ABORTABLE (q/Q/ESC) and bounded by an RTC
+    /// deadline, WITHOUT sending anything. The failure-aware twin of [`Self::recv`]: where `recv`
+    /// blocks forever (and loops on error), this returns [`ReqOutcome::Timeout`] if no message
+    /// arrives within `max_secs` and [`ReqOutcome::Aborted`] the instant the user presses q. Use it to
+    /// await a reply we already sent by some path OTHER than a named-peer request - a badged
+    /// `resource_invoke` (a file/socket capability), or draining a pipe filter's stream - where
+    /// [`Self::request_with_reply_abortable`] (which does its own send) does not fit. This is the wait
+    /// half of the abortable request, factored out: a peer that received our invocation but died before
+    /// replying, or a filter that wedges mid-stream, can no longer hang us (Commandment VIII - wait on
+    /// truth *including failure*). The caller owns any reply cap it derived and reclaims it on every
+    /// outcome. A service with no console foreground never sees input, so this degrades to a plain
+    /// deadline wait. Does NOT drain a stale reply first - a caller that can be re-entered after an
+    /// abort should `while self.try_recv().is_some() {}` before it sends (as the request variants do).
+    pub fn recv_abortable_deadline(&self, max_secs: i64) -> ReqOutcome {
+        let t0 = self.epoch_secs_monotonic();
+        loop {
+            if let Some(r) = self.try_recv() { return ReqOutcome::Reply(r); }
+            while let Some(b) = self.try_console_read() {
+                if b == b'q' || b == b'Q' || b == 0x1b { return ReqOutcome::Aborted; }
+            }
+            if self.epoch_secs_monotonic() - t0 >= max_secs {
                 return ReqOutcome::Timeout;
             }
             self.yield_cpu();
@@ -775,6 +832,39 @@ impl ServiceContext {
         // SAFETY: syscall(13) = InspectKernel; query_id=14 = NIC vendor|device.
         let ret = unsafe { raw_syscall(13, 14, 0, 0) };
         if ret < 0 { 0 } else { ret as u32 }
+    }
+
+    /// Whether the PCI scan found an xHCI USB host controller (InspectKernel query 18, ungated
+    /// task-neutral hardware fact). The supervisor reads it to skip spawning the `xhci` driver on a
+    /// machine that has no xHCI controller (an idle driver would busy-hold a core). Falls back to
+    /// `true` if the query is unavailable, preserving the always-spawn behaviour.
+    pub fn xhci_present(&self) -> bool {
+        // SAFETY: syscall(13) = InspectKernel; query_id=18 = USB controller presence bitmask.
+        let ret = unsafe { raw_syscall(13, 18, 0, 0) };
+        if ret < 0 { return true; } // query unavailable - spawn as before
+        (ret & 0b01) != 0
+    }
+
+    /// Whether the PCI scan found an EHCI (USB 2.0) host controller (InspectKernel query 18, ungated).
+    /// The supervisor reads it to skip spawning the `ehci` driver on a machine with no EHCI at all
+    /// (e.g. the Wyse 5070), so an idle driver does not busy-hold a core. Falls back to `true` if the
+    /// query is unavailable, preserving the always-spawn behaviour.
+    pub fn ehci_present(&self) -> bool {
+        // SAFETY: syscall(13) = InspectKernel; query_id=18 = USB controller presence bitmask.
+        let ret = unsafe { raw_syscall(13, 18, 0, 0) };
+        if ret < 0 { return true; } // query unavailable - spawn as before
+        (ret & 0b10) != 0
+    }
+
+    /// Whether the PCI scan found a NIC this build can actually drive (present AND an e1000 or RTL8168),
+    /// via InspectKernel query 18 (ungated). The supervisor reads it to skip spawning `nic-driver` (and
+    /// its dependent `net-stack`) on a machine with no usable NIC, so they do not busy-hold cores.
+    /// Falls back to `true` if the query is unavailable, preserving the always-spawn behaviour.
+    pub fn nic_present(&self) -> bool {
+        // SAFETY: syscall(13) = InspectKernel; query_id=18 = hardware-driver presence bitmask.
+        let ret = unsafe { raw_syscall(13, 18, 0, 0) };
+        if ret < 0 { return true; } // query unavailable - spawn as before
+        (ret & 0b100) != 0
     }
 
     /// The NIC's register-space MMIO base (the BAR the PCI scan chose), 0 if none. InspectKernel query

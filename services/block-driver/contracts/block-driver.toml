@@ -6,10 +6,13 @@ request = "8MiB"
 limit   = "16MiB"
 
 [capabilities]
-# ATA secondary channel via kernel-mediated port I/O (docs/persistence.md §5):
-# command block 0x170-0x177 (+0x8) and the 0x376 control port (+0x1). No DMA,
-# no MMIO - a PIO driver is least-privilege by construction (§5.1).
-hw_pio    = ["0x170+0x8", "0x376+0x1"]
+# block-driver is an AHCI (SATA) driver: it holds the HBA's MMIO window (ABAR) + a DMA arena. It
+# DECLARES the device CLASS here; the kernel resolves the runtime-discovered BAR address by the PCI
+# scan and grants MMIO/DMA accordingly (kernel `service_hw` / `HwClass::Ahci`, audit T1 Phase B). The
+# class is reconciled against the kernel by scripts/contract_check.py, so contract and kernel cannot
+# diverge (Commandment III); the BAR address stays the one runtime fact. (The retired ATA-PIO backend's
+# `hw_pio` was removed - the contract no longer mis-states the driver's privilege.)
+hw_device = "ahci"
 log_write = true
 
 [placement]

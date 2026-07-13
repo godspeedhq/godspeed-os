@@ -8,6 +8,7 @@
 // `std` so the pure-logic modules (e.g. `hid`) can have unit tests.
 #![cfg_attr(not(test), no_std)]
 
+pub mod adversarial;
 pub mod capability;
 pub mod dma;
 pub mod hid;
@@ -22,7 +23,7 @@ pub use dma::Dma;
 pub use ipc::{Message, IpcError};
 pub use mmio::Mmio;
 pub use record::{Table, Value, RecordSink, parse_predicate};
-pub use service_context::{ServiceContext, TaskStat, CapInfo, Datetime, ReqOutcome};
+pub use service_context::{ServiceContext, TaskStat, CapInfo, Datetime, ReqOutcome, DeadlineOutcome};
 
 pub type Result<T> = core::result::Result<T, Error>;
 

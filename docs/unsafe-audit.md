@@ -6,7 +6,83 @@ containing the `unsafe` keyword per file and compares to the baseline table belo
 **A PR that increases any file's count, or adds unsafe to a new file, fails CI
 unless this file is updated in the same commit with a written SAFETY argument.**
 
+`unsafe_check.py` scans `kernel/src/` (tracked against the inventory below) **and `services/`** (where
+it fails on ANY `unsafe` line - §18.2 forbids service `unsafe`). The SDK's permitted-layer `unsafe`
+(`syscall`, `mmio`, `dma`, `adversarial` - §18.1) is not inventoried here; each block carries a SAFETY
+comment.
+
 ---
+
+## 2026-07-12 - userspace audit M8: probe made `unsafe`-free; `unsafe_check.py` now scans `services/`
+
+`probe` (the §22 adversarial/fuzz/chaos test harness) held raw-SYSCALL `asm!` plus deliberate ring-3
+faults (null read, non-canonical read, divide-by-zero) - `unsafe` in a userspace service, forbidden by
+§18.2, and INVISIBLE because `unsafe_check.py` scanned only `kernel/src/`. Both gaps closed:
+
+- The `unsafe` moved to a new **audited SDK module `sdk/rust/src/adversarial.rs`** (§18.1 amendment):
+  safe `fuzz_syscall` (wraps the ABI `raw_syscall`; the kernel validates every fuzzed call) and safe
+  `fault_null_read` / `fault_noncanonical_read` / `fault_divide_by_zero` (the deliberate faults, each
+  SAFETY-commented). `probe` calls these safe wrappers and is now `unsafe`-free.
+- `scripts/unsafe_check.py` now also scans **`services/`** and FAILS on any service `unsafe` line -
+  mechanically enforcing §18.2 and catching any future regression (the M8 blind spot). As a bonus,
+  `fuzz_syscall` uses the SDK's `ud2` trap, removing probe's old raw `syscall` instruction (a latent
+  AMD-GX-420GI stall hazard).
+
+Verified: `osdev test adv` 15/0 (A10 fuzz, A14 faults, A15 bad-ptr all pass through the SDK wrappers);
+`unsafe_check.py` passes with `services/` scanned. Kernel inventory unchanged (471 lines).
+
+## 2026-07-11 - core count fully dynamic (MAX_CORES ceiling removed)
+
+Every remaining fixed `[_; MAX_CORES]` per-core structure became a boot arena sized to the machine's
+real core count, and the `MAX_CORES` sanity ceiling was deleted. All changes are in the permitted
+`arch/`/`smp/` layers, each block carrying a `// SAFETY:` comment.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/x86_64/mod.rs` | 35 → 33 (-2) | The fixed `AP_ID_BUF: [u32; MAX_CORES-1]` staging buffer (2 single-threaded-boot `unsafe` writes) is gone: `start_all_aps` already walks Limine's live `cpus()` slice directly, and the new `ap_count()` counts it on demand, so no AP list is staged. Net -2. |
+| `arch/x86_64/syscall_entry.rs` | 14 → 15 (+1) | `PER_CORE_SYSCALL` moved from a `[_; MAX_CORES]` `.data` array to a `PerCoreMut` boot arena, with a `BSP_SYSCALL` bootstrap slot for the pre-arena window (the BSP sets its syscall GS in `init_bsp`, before the allocator). The +1 is `syscall_slot`'s `addr_of_mut!(BSP_SYSCALL)` fallback; the arena's own `unsafe` lives in `smp/percpu.rs`. |
+| `smp/ipi.rs` | 23 → 25 (+2) | The TLB-shootdown ack bitmask was a fixed `PerCore<[AtomicU64; MAX_WORDS]>` (`MAX_WORDS = ceil(MAX_CORES/64)`); it is now two FLAT `num_cores * ceil(num_cores/64)` `AtomicU64` arenas (ACK + EXPECTED), so the per-initiator mask WIDTH scales with the real core count. The +2 is the `ack_word`/`exp_word` accessors (`&*base.add(initiator*wpc + word)`); the arenas are carved by `percpu::alloc_atomic_u64_slice`. |
+| `smp/percpu.rs` | 6 → 8 (+2) | New `alloc_atomic_u64_slice(n, init)` - carves a flat `[AtomicU64; n]` from the frame allocator (2 blocks: `ptr::write` init loop + `from_raw_parts`) for the dynamic-width shootdown masks, which no fixed `PerCore<[_; K]>` can size. Plus `PerCoreMut::initialised()` (safe). |
+
+Net across the four: +3. `MAX_CORES` is deleted entirely - nothing is a fixed per-core array. The only
+ceiling left is a genuine hardware one: the xAPIC IPI destination field is 8-bit, so a core with LAPIC
+id > 255 is excluded LOUDLY (§26.7) until the APIC layer gains x2APIC. Validated: identity 24/24, adv
+15/15, QEMU boot 1..128 cores + a 72-core 2-word-shootdown restart, arenas carve for 260 cores.
+
+---
+
+## 2026-07-11 - per-core user-copy arenas (RAM-sized, not [_; MAX_CORES])
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/x86_64/syscall_entry.rs` | 15 → 14 (-1) | The V1 per-core user-copy state (`USER_COPY_ACTIVE`, and the 1 MiB `USER_READ_SCRATCH` = `[[u8; 4096]; MAX_CORES]`) moved from fixed `[_; MAX_CORES]` statics to boot-sized `PerCore`/`PerCoreMut` arenas (sized to the cores Limine reported, §26.6.1) - so per-core memory scales to the machine, not a 256-core ceiling. The count DROPS by one: `read_user_bytes`'s `addr_of_mut!` on the static scratch became the safe `PerCoreMut::as_mut_ptr` accessor (all the arena's `unsafe` lives in `smp/percpu.rs`). The two `copy_nonoverlapping` + one `from_raw_parts` blocks are unchanged. Removes ~1 MiB of fixed `.bss`. Boot-validated across QEMU -smp 1..16 + identity 24/24 + adv 15/15. |
+
+---
+
+## 2026-07-11 - dynamic (RAM-sized) frame bitmap
+
+| File | Change | Why |
+|------|--------|-----|
+| `memory/allocator.rs` | 37 → 44 (+7) | The frame bitmaps are no longer fixed static `[u8; N]` arrays; they are sized to the machine's actual RAM at boot and carved from RAM, reached via the HHDM. The +7 is the raw-pointer machinery that replaces the (safe-indexed) static arrays: the `bitmap()` / `kpt()` slice accessors (`slice::from_raw_parts_mut` over `BITMAP_PTR`/`KPT_PTR`, 2 blocks), and in `init_from_map` the pointer publish + `KPT_PTR = BITMAP_PTR.add(bitmap_len)` + `write_bytes` zeroing of the carved region + the `hhdm==0` guard. Each carries a `// SAFETY:` note; the region is HHDM-mapped RAM reserved before any alloc and only ever touched under `ALLOC_LOCKED`. Permitted memory layer. Net effect: 64 MiB of fixed `.bss` (at the 1 TiB static cap) replaced by a bitmap of `RAM / 16 KiB` (e.g. 14 KiB on a 256 MiB box, 4 MiB on 64 GiB), sized dynamically - validated across 256 MiB..64 GiB in QEMU + identity 24/24. |
+
+---
+
+## 2026-07-11 - kernel-audit fixes: user-copy fault guard (V1) + exception-handler backfill
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/x86_64/syscall_entry.rs` | 13 → 15 (+2) | **V1 (kernel-audit-2): user-copy fault guard.** `read_user_bytes` no longer returns a borrowed raw-user slice; it copies the user bytes into a per-core kernel scratch under a `USER_COPY_ACTIVE` guard and returns a slice into the SCRATCH (so no caller ever dereferences raw user memory). The net +2 is: `read_user_bytes` now has 3 blocks (`addr_of_mut!` on the per-core scratch, `copy_nonoverlapping` for the guarded copy, `from_raw_parts` for the returned slice) vs 1 before; `write_user_bytes` keeps its 1 `copy_nonoverlapping` block. Each has a `// SAFETY:` comment. The guard makes a fault on a range-valid-but-unmapped user pointer recoverable (pf_handler kills the caller) instead of a whole-machine halt. Permitted arch layer. |
+| `arch/x86_64/boot.rs` | 84 → 90 (+6) | **Backfill (not this change):** reconciles the C1/C2 exception-kill handlers added earlier this session by `af74086` (`gpf_stub` / `gpf_handler` / `exc_stub_noec` / `exc_stub_ec` / `exc_dispatch` - the ring-3 CPU-exception discriminator), which did not bump this table. All in the permitted arch layer, each block carries a `// SAFETY:` comment. **V1's own pf_handler change adds 0 here** - its user-copy-fault branch is safe code (calls to `current_core_id` / `user_copy_active` / `clear_user_copy_active`) inside the existing print `unsafe` block. |
+
+---
+
+## 2026-07-10 - fast fbcon blits for the 4K Wyse 5070 + drift reconcile
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/x86_64/fb.rs` | 3 → 5 (+2) | Fast blit path for a dense (4K) panel. `fill_rect` writes a solid rectangle as contiguous per-row runs; `draw_glyph`'s fast 32bpp path writes each glyph output row as one contiguous run of aligned `u32` stores. The old per-pixel byte loop crawled repainting ~6.6M pixels/scroll on the Wyse's 3840x2160 panel. Both bounds-check the whole rect/cell ONCE against the reported geometry (cols/rows are sized so cells fit) then write the run unchecked, so write-combining coalesces the stores - the same raw-framebuffer-write pattern as the existing `put_pixel`/`clear`, in the permitted arch layer, each with a `// SAFETY:` comment. There is no safe route: writing Limine's linear framebuffer is a raw-pointer store, and a bounds-checked `&mut [u32]` would defeat the purpose (a compare per pixel is the very overhead removed). |
+| `arch/x86_64/boot.rs` | 80 → 84 (+4) | **Reconcile only:** pre-existing drift accumulated since 2026-06-08 by the feat/networking bring-up (H1 IOMMU / NIC / PCI / AHCI, merged to main) that did not update this audit. All in the permitted arch layer; count corrected here, per-block detail is a backfill owed by that work. |
+| `arch/x86_64/mod.rs` | 34 → 35 (+1) | **Reconcile only:** pre-existing drift from feat/networking (merged to main); permitted arch layer, count corrected, per-block detail backfill pending. |
 
 ## 2026-06-08 - fbcon scroll without VRAM read-back
 
@@ -131,25 +207,25 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
 | arch/x86_64/ap_boot.rs | 2 | permitted |
-| arch/x86_64/boot.rs | 80 | permitted |
+| arch/x86_64/boot.rs | 90 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |
-| arch/x86_64/fb.rs | 3 | permitted |
+| arch/x86_64/fb.rs | 5 | permitted |
 | arch/x86_64/interrupts.rs | 21 | permitted |
 | arch/x86_64/ioapic.rs | 8 | permitted |
 | arch/x86_64/iommu.rs | 74 | permitted |
-| arch/x86_64/mod.rs | 34 | permitted |
+| arch/x86_64/mod.rs | 33 | permitted |
 | arch/x86_64/page_tables.rs | 41 | permitted |
 | arch/x86_64/pci.rs | 19 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |
-| arch/x86_64/syscall_entry.rs | 13 | permitted |
+| arch/x86_64/syscall_entry.rs | 15 | permitted |
 | capability/table.rs | 7 | permitted |
-| memory/allocator.rs | 37 | permitted |
+| memory/allocator.rs | 44 | permitted |
 | memory/frame.rs | 1 | permitted |
 | memory/mod.rs | 1 | permitted |
 | memory/page.rs | 1 | permitted |
-| smp/ipi.rs | 23 | permitted |
+| smp/ipi.rs | 25 | permitted |
 | smp/mod.rs | 1 | permitted |
-| smp/percpu.rs | 6 | permitted |
+| smp/percpu.rs | 8 | permitted |
 | smp/placement.rs | 1 | permitted |
 | smp/spinlock.rs | 9 | permitted |
 | interrupt/route.rs | 1 | grandfathered |
@@ -275,10 +351,18 @@ and not yet visible to the scheduler.
 
 ### arch/x86_64/fb.rs
 
-Framebuffer text console (Phase 1 boot output, §11.4). Three blocks; two write
+Framebuffer text console (Phase 1 boot output, §11.4). Five blocks; four write
 to Limine's linear framebuffer at `base + y*pitch + x*bpp`:
 - `clear`: `write_bytes(base, 0, height*pitch)` - fills the whole buffer.
-- `put_pixel`: writes `bpp` bytes at a bounds-checked offset (`x<width`, `y<height`).
+- `put_pixel`: writes `bpp` bytes (one aligned `u32` store on the 32bpp fast path) at a
+  bounds-checked offset (`x<width`, `y<height`).
+- `fill_rect`: fills a `w x h` rectangle clamped to `width`/`height`, writing each row as a
+  contiguous run (aligned `u32` stores on the 32bpp path). Sound: the clamped rect stays inside the
+  mapped `height*pitch` region; `x*bpp`/`pitch` are 4-aligned on the 32bpp path.
+- `draw_glyph` (fast 32bpp path): writes each glyph output row as one contiguous run of `cw` aligned
+  `u32` stores. Sound: it first checks the whole cell `[x0,x0+cw) x [y0,y0+chh)` lies inside the
+  framebuffer (cols/rows are sized so cells fit; otherwise it falls back to the checked `fill_rect`),
+  so the unchecked run stays within `height*pitch`, and `x0*4`/`pitch` are 4-aligned.
 
 Sound because the framebuffer is the region Limine mapped and sized
 (`height*pitch` bytes), it lives in the higher half (PML4 256-511) that every

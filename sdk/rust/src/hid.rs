@@ -164,6 +164,29 @@ impl KeyRepeat {
         KeyRepeat { key: 0, mods: 0, caps: false, next_at: 0, initial, interval }
     }
 
+    /// Construct a repeat CALIBRATED to this machine's real TSC rate. `ticks_per_10ms` is
+    /// `ServiceContext::tsc_ticks_per_10ms()` (TSC cycles in 10 ms, PIT-calibrated by the kernel);
+    /// it is 0 only when the TSC was not calibrated (QEMU / the T630's periodic-timer path, which
+    /// has no calibrated quantum), where we fall back to ~2 GHz cycle counts (~300 ms / ~50 ms).
+    ///
+    /// The CALIBRATED path uses a deliberately CONSERVATIVE ~600 ms initial delay (not 300 ms). The
+    /// math for 300 ms is provably correct (30 * ticks_per_10ms), yet the Goldmont+ Wyse still
+    /// over-repeated at that threshold - its RDTSC appears to advance a little faster under load than
+    /// the boot-time PIT calibration captured, so a 300 ms cycle budget elapsed in less than 300 ms of
+    /// wall-clock and normal typing tripped the repeat. A 600 ms budget requires a clearly deliberate
+    /// hold, absorbing that drift with margin. The interval (~50 ms) is unchanged; only the trigger
+    /// threshold moved. The fallback (T630) is left at its known-good ~300 ms - the drift is specific
+    /// to the calibrated part.
+    pub fn new_calibrated(ticks_per_10ms: u64) -> Self {
+        if ticks_per_10ms == 0 {
+            // Uncalibrated (QEMU / T630 periodic): ~2 GHz. 600M cycles ~= 300 ms, 100M ~= 50 ms.
+            KeyRepeat::new(600_000_000, 100_000_000)
+        } else {
+            // ~600 ms initial = 60 * (cycles in 10 ms); ~50 ms interval = 5 * (cycles in 10 ms).
+            KeyRepeat::new(ticks_per_10ms.saturating_mul(60), ticks_per_10ms.saturating_mul(5))
+        }
+    }
+
     fn arm(&mut self, key: u8, mods: u8, caps: bool, now: u64) {
         self.key = key;
         self.mods = mods;
@@ -267,10 +290,12 @@ pub fn decode_keyboard(
             if emit_key(k, mods, *caps, &mut emit) {
                 // Newest printable/cursor key held becomes the repeat key - except the
                 // one-shot control keys: Escape (0x29), whose repeat would make the shell
-                // re-disambiguate a bare ESC every tick, and the function keys F1-F12
+                // re-disambiguate a bare ESC every tick; the function keys F1-F12
                 // (0x3A-0x45), which are actions, not characters (holding F1 should not
-                // re-open help over and over).
-                if k != 0x29 && !(0x3A..=0x45).contains(&k) {
+                // re-open help over and over); and Enter/Return (0x28) + keypad Enter
+                // (0x58), commit keys whose repeat spams blank prompts and re-fires a
+                // confirmation's answer (the Wyse `y/N` "multiple gsh>" bug).
+                if k != 0x29 && k != 0x28 && k != 0x58 && !(0x3A..=0x45).contains(&k) {
                     rep.arm(k, mods, *caps, now);
                 }
             } else if is_typable_code(k) {

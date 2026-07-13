@@ -4,11 +4,12 @@
 //! [`PerCore<T>`] / [`PerCoreMut<T>`] are arrays of one element per core - N = the cores Limine
 //! actually reported - allocated ONCE at boot from the frame allocator and never freed. They replace
 //! the fixed `[T; MAX_CORES]` statics so per-core memory is sized to the *machine* (a 4-core box
-//! reserves 4 slots, not `MAX_CORES`) instead of to a compile-time constant.
+//! reserves 4 slots, a 512-core box reserves 512) instead of to a compile-time constant.
 //!
 //! This is a **bounded arena, not a heap** (§26.6.1): a single carve at boot, size = `N * sizeof(T)`,
-//! no runtime alloc/free. `MAX_CORES` remains as a generous **sanity ceiling** - boot clamps N to it
-//! (loudly) - exactly as Linux keeps `NR_CPUS` above its boot-sized per-CPU areas.
+//! no runtime alloc/free. There is **no fixed core ceiling** any more - N is sized directly to the
+//! machine's real core count, and the only bound is RAM (a carve panics loudly, §26.7, if it cannot be
+//! backed). Nothing is a `[_; MAX_CORES]` array.
 //!
 //! Two flavours by access pattern:
 //!   - [`PerCore<T>`] hands out a shared `&T` (`get`); `T: Sync`, mutation via atomics. Read-mostly
@@ -22,8 +23,8 @@
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-/// Total cores the per-core arenas were sized for (Limine's count, clamped to `MAX_CORES`). Set once
-/// at boot, before any AP starts; read everywhere a per-core loop needs the live width.
+/// Total cores the per-core arenas were sized for (Limine's live count, no ceiling). Set once at boot,
+/// before any AP starts; read everywhere a per-core loop needs the live width.
 static NUM_CORES: AtomicUsize = AtomicUsize::new(1);
 
 /// Record the per-core arena width. Call ONCE at boot (after the core count is known, before APs run).
@@ -93,6 +94,14 @@ impl<T: Sync + 'static> PerCore<T> {
         // by the caller's contract; `T: Sync` makes the shared `&T` sound across cores.
         unsafe { &*base.add(core) }
     }
+
+    /// True once `init_with` has run (the arena is allocated). Lets a caller that might run BEFORE boot
+    /// finishes - e.g. `pf_handler` on an early kernel fault, before `percpu_init` - avoid touching an
+    /// unallocated arena.
+    #[inline]
+    pub fn initialised(&self) -> bool {
+        !self.base.load(Ordering::Acquire).is_null()
+    }
 }
 
 /// A boot-allocated array of one `T` per core, accessed by OWNER-MUTABLE raw pointer
@@ -146,4 +155,30 @@ impl<T: 'static> PerCoreMut<T> {
     pub fn as_ptr(&self, core: usize) -> *const T {
         self.as_mut_ptr(core) as *const T
     }
+
+    /// True once `init_with` has run. Lets a caller that might run BEFORE the arena is allocated fall
+    /// back to a bootstrap slot (e.g. the BSP's syscall GS data, set in `init_bsp` before `percpu_init`).
+    #[inline]
+    pub fn initialised(&self) -> bool {
+        !self.base.load(Ordering::Acquire).is_null()
+    }
+}
+
+/// Carve a flat `[AtomicU64; n]` from the frame allocator (in the HHDM), every element initialised to
+/// `init`, and return it as a `'static` slice. For per-core state whose *width scales with the core
+/// count* - the TLB-shootdown ack bitmask is `num_cores * ceil(num_cores/64)` words, which no fixed
+/// `PerCore<[_; K]>` can size dynamically. A bounded arena (§26.6.1): one boot carve, never freed.
+/// Panics (loud halt, §26.7) if the allocator cannot back it.
+pub fn alloc_atomic_u64_slice(n: usize, init: u64) -> &'static [core::sync::atomic::AtomicU64] {
+    use core::sync::atomic::AtomicU64;
+    let base = alloc_arena::<AtomicU64>(n.max(1));
+    // SAFETY: `base` covers `n` freshly-allocated, page-aligned slots (alloc_arena rounds up); each is
+    // written exactly once here before any reader can reach the slice, so no concurrent access and no
+    // read of uninitialised memory.
+    for i in 0..n {
+        unsafe { ptr::write(base.add(i), AtomicU64::new(init)); }
+    }
+    // SAFETY: `base..base+n` is initialised, never freed, and `AtomicU64: Sync`, so a shared `'static`
+    // slice is sound across cores.
+    unsafe { core::slice::from_raw_parts(base, n) }
 }

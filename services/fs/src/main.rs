@@ -163,7 +163,10 @@ const FS_NOTFOUND: u8 = 2;
 const FS_NOFS: u8 = 3;
 const FS_UNAVAIL: u8 = 4;   // present-but-unreadable storage: do NOT flash (data may be intact),
                             // distinct from FS_NOFS (a blank/raw disk that SHOULD be flashed to format)
-const FS_DENIED: u8 = 4;     // op requires a right the file cap lacks (non-escalation, §7.3)
+const FS_DENIED: u8 = 5;     // op requires a right the file cap lacks (non-escalation, §7.3) - a
+                             // DISTINCT value from FS_UNAVAIL(4): a file-cap client must tell "storage
+                             // unavailable" apart from "permission denied" (they never shared a code
+                             // path, but a shared value invited a future confusion; audit L2)
 
 // File-cap operations - the FIRST payload byte of a badged `ResourceInvoke` (§7.10). The kernel
 // has already validated the cap holds the invoked right; fs enforces that the op needs ≤ that right.

@@ -83,7 +83,11 @@ const TALLY_OFF:     usize = 0x5000;
 // Bounded hardware/protocol-timing polls (the exempt category, like AHCI/USB spins - NOT the
 // correctness-by-time Commandment VIII forbids): wait on the TRUTH of a bit, give up LOUDLY.
 const RESET_POLL_MAX: u32 = 1_000_000;
-const TX_POLL_MAX:    u32 = 1_000_000;
+// A healthy RTL8168 clears the TX descriptor's OWN bit in ~us (the first few poll iterations). The old
+// 1_000_000-yield bound meant a NIC that FAILED to complete a transmit froze the whole ping for ~1s per
+// send. Bound it TIGHT so a stuck TX fails FAST and is recovered (§26.6 bounded, §26.7 loud), instead of
+// stalling the box. 30_000 is ~30x headroom over a us-scale success but ~ms, not seconds, on failure.
+const TX_POLL_MAX:    u32 = 30_000;
 const RX_POLL_MAX:    u32 = 8_000;     // a reply arrives in ms (caught in the first hundreds of iterations).
                                        // A MISS must give up FAST: on the T630, 50k iterations took >2s -
                                        // LONGER than net-stack's per-request deadline, so every DNS request
@@ -92,6 +96,16 @@ const RX_POLL_MAX:    u32 = 8_000;     // a reply arrives in ms (caught in the f
                                        // ([4] collect) rather than give up (the "24 timeouts" diagnosis).
 
 const FRAME_MAX: usize = 1600; // one Ethernet frame (<= 1518) with headroom
+
+// [9] BATCH RX DRAIN (the frame interface, net-stack <-> nic-driver): pull up to BATCH_MAX frames off the
+// RX ring in ONE bounded poll and return them length-prefixed - [count:u8] then [len:u16 LE, bytes] per
+// frame. net-stack scans the batch for its reply (its ICMP echo / DNS answer) PAST any stray broadcasts,
+// in a SINGLE round-trip. This replaces the old "one [4] request per look-ahead frame" approach, whose N
+// slow round-trips (each polling the full RX budget when the ring was momentarily empty) pushed net-stack
+// past the shell's deadline. Mechanism only: the driver hands back RAW frames, it never learns what a
+// "reply" is (Commandment X). Bounded by BATCH_MAX, BATCH_MSG_MAX (< the 4 KiB IPC cap), and RX_POLL_MAX.
+const BATCH_MAX:     usize = 8;
+const BATCH_MSG_MAX: usize = 3072;
 
 // --- Realtek RTL8168 C+ mode: register offsets into the MMIO BAR + 16-byte descriptor bits (Phase 4,
 // Stage B). The RTL8168 has no e1000-style head/tail registers - the NIC walks the ring by the OWN bit.
@@ -107,7 +121,16 @@ const RTL_PHYSTATUS: usize = 0x6C; // PHY status: LinkSts = 0x02
 const RTL_RMS:       usize = 0xDA; // RX Max packet Size (16-bit)
 const RTL_RDSAR:     usize = 0xE4; // RX Descriptor Start Address (64-bit phys, 256B aligned)
 const RTL_DTCCR:     usize = 0x10; // Dump Tally Counter Command Register (64-bit): buf phys | bit3 (Dump)
-const TALLY_POLL_MAX: u32  = 100_000; // the NIC dumps the counters in ~us; bound the wait loudly
+// The DTCCR counter dump is a DIAGNOSTIC (the chip's cumulative RxOk/TxOk tallies for `net stats`), and
+// it is DMA-driven: on a healthy NIC it completes in ~us (the first few poll iterations). But it must
+// NEVER delay the [3] status reply, because net-stack's `link_is_up` waits only ~1s (LINK_SECS) for that
+// reply and reads the LINK byte from it - the essential truth. A NIC whose DMA is wedged (e.g. after a
+// `chaos max-carnage nic-driver` reset-storm) would never finish the dump; at the old 100_000-yield bound
+// (~1s of scheduler round-trips) that timed out net-stack's [3] request, so a plugged cable read as "no
+// link" and `ping` froze. So the bound is TIGHT: the link byte is read from PHYSTATUS BEFORE the dump, so
+// a dump that does not complete just yields ZERO counters (a degraded stat, not a slow link), reported
+// loudly once (VIII - wait on truth incl. failure; X - the diagnostic must not block the essential fact).
+const TALLY_POLL_MAX: u32  = 2_000;
 
 const RTL_CR_RE:  u8 = 0x08;
 const RTL_CR_TE:  u8 = 0x04;
@@ -219,8 +242,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
         if link_up { "UP" } else { "down (no cable?)" }));
 
     let mut rxbuf = [0u8; FRAME_MAX];
-    let mut tx_idx = 0usize;
-    let mut rx_idx = 0usize;
+    let mut rx_idx = 0usize;   // the single TX descriptor (slot 0) is used directly, no tx index needed
     // Live stats surfaced through the [3] status query so `net` shows link/TX/RX on the TV (no serial).
     let mut last_tx_done = false;
     let mut last_rx_len  = 0u16;
@@ -231,6 +253,8 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
     // same [3] link byte and self-configures on the up edge. None = report the real PHY (default); Some(b)
     // = report the forced state. Cleared ([8]) after a flap so a REAL later unplug is never masked.
     let mut force_link: Option<bool> = None;
+    let mut tally_wedged_logged = false;   // one-shot loud note if the DMA counter dump ever times out
+    let mut tx_fail_logged = 0u32;         // diagnose the first few TX timeouts to guide the root-cause fix
     loop {
         let req = ctx.recv();
         let reply_cap = match ctx.take_pending_cap() { Some(c) => c, None => continue };
@@ -270,6 +294,13 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
             mmio.write32(RTL_DTCCR, ((tbuf as u32) & !0x3F) | 0x08);   // 64B-aligned addr | Dump
             let mut td = 0u32;
             while td < TALLY_POLL_MAX && mmio.read32(RTL_DTCCR) & 0x08 != 0 { ctx.yield_cpu(); td += 1; }
+            if td >= TALLY_POLL_MAX && !tally_wedged_logged {
+                // The counter dump did not complete - the NIC's DMA is slow/wedged. Report it ONCE (not
+                // per query - that would spam) and carry on: the counters read zero (a degraded `net stats`),
+                // but the link byte below is truthful and the reply is fast, so `net`/`ping` keep working.
+                ctx.log("nic-driver: RTL8168 counter dump timed out (DMA slow/wedged) - stats degraded, link still served");
+                tally_wedged_logged = true;
+            }
             let rx_ok  = arena.read32(TALLY_OFF + 0x08);
             let tx_ok  = arena.read32(TALLY_OFF + 0x00);
             let rx_brd = arena.read32(TALLY_OFF + 0x30);
@@ -316,6 +347,41 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
             }
             if n > 0 { last_rx_len = n as u16; rx_count = rx_count.saturating_add(1); }
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n]));
+            ctx.remove_cap(reply_cap);
+            continue;
+        }
+
+        // [9] BATCH RX DRAIN (see BATCH_MAX doc): drain up to BATCH_MAX frames off the ring in ONE bounded
+        // poll, length-prefixed, so net-stack scans past stray broadcasts for its reply in a single
+        // round-trip. Ready descriptors are drained back-to-back (no yield); when the ring is empty we
+        // poll (RX_POLL_MAX total) for more to arrive - so the whole call is ONE bounded poll, not N.
+        if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 9 } {
+            let mut out = [0u8; BATCH_MSG_MAX];
+            let mut opos = 1usize;   // out[0] = frame count, filled at the end
+            let mut nfr = 0u8;
+            let mut rs = 0u32;
+            while rs < RX_POLL_MAX && (nfr as usize) < BATCH_MAX {
+                let rd = RX_RING_OFF + rx_idx * 16;
+                let o1 = arena.read32(rd);
+                if o1 & RTL_DESC_OWN == 0 {
+                    let flen = ((o1 & 0x3FFF) as usize).min(FRAME_MAX);
+                    if opos + 2 + flen > out.len() { break; }   // reply full - stop cleanly
+                    out[opos..opos + 2].copy_from_slice(&(flen as u16).to_le_bytes());
+                    opos += 2;
+                    for i in 0..flen { out[opos + i] = arena.read8(RX_BUF_OFF + rx_idx * RX_BUF_SIZE + i); }
+                    opos += flen;
+                    nfr += 1;
+                    last_rx_len = flen as u16;
+                    rtl_arm_rx(arena, rx_idx);                  // give the descriptor back to the NIC
+                    rx_idx = (rx_idx + 1) % RX_RING_COUNT;
+                } else {
+                    ctx.yield_cpu();
+                    rs += 1;
+                }
+            }
+            out[0] = nfr;
+            if nfr > 0 { rx_count = rx_count.saturating_add(nfr as u16); }
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos]));
             ctx.remove_cap(reply_cap);
             continue;
         }
@@ -375,24 +441,53 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
         mmio.write8(RTL_CR, RTL_CR_RE | RTL_CR_TE);         // RX back on, from descriptor 0
         rx_idx = 0;
 
-        // --- Transmit: copy the frame in, point descriptor tx_idx at it, kick TPPoll, wait on OWN
-        // clearing (Commandment VIII, bounded + loud). ---
+        // --- Transmit: copy the frame in, point THE SINGLE TX descriptor (slot 0) at it, kick TPPoll,
+        // wait on OWN clearing (Commandment VIII, bounded + loud). ---
+        //
+        // A SINGLE descriptor (EOR always set, so the NIC's TX ring is one entry that wraps 0->0) is
+        // used deliberately. The frame path is strictly one-at-a-time - net-stack sends a frame, waits
+        // for the reply, then sends the next - so an 8-deep ring buys no parallelism and only lets the
+        // NIC's internal TX head DESYNC from the driver's index. That desync is the CONFIRMED cause of
+        // the RTL8168 TX timeout on the Wyse: the diagnostic showed `desc=0xb000004a isr=0x0091` -
+        // the descriptor still OWN-set + FS/LS (untouched by the NIC) while ISR latched TDU (Tx
+        // Descriptor Unavailable), i.e. the NIC's head was NOT at the descriptor we wrote, so it saw
+        // "no work" and skipped ours. With exactly one descriptor the head cannot drift from it.
         let frame = req.payload_bytes();
         let flen = frame.len().min(RX_BUF_SIZE);
         for i in 0..flen { arena.write8(TX_BUF_OFF + i, frame[i]); }
-        let td = TX_RING_OFF + tx_idx * 16;
+        let td = TX_RING_OFF;                       // the single TX descriptor (slot 0)
         let tx_buf = arena.phys_at(TX_BUF_OFF);
         arena.write32(td + 8, (tx_buf & 0xffff_ffff) as u32);
         arena.write32(td + 12, (tx_buf >> 32) as u32);
         arena.write32(td + 4, 0);
-        let mut o1 = RTL_DESC_OWN | RTL_DESC_FS | RTL_DESC_LS | (flen as u32 & 0x3FFF);
-        if tx_idx == TX_RING_COUNT - 1 { o1 |= RTL_DESC_EOR; }
-        arena.write32(td, o1);                  // OWN set LAST (the NIC may read the descriptor at once)
+        // OWN + EOR (single-entry ring) + FS + LS + length. OWN set LAST (the NIC may read at once).
+        let o1 = RTL_DESC_OWN | RTL_DESC_EOR | RTL_DESC_FS | RTL_DESC_LS | (flen as u32 & 0x3FFF);
+        arena.write32(td, o1);
         mmio.write8(RTL_TPPOLL, RTL_TPPOLL_NPQ);
         let mut ts = 0u32;
         while ts < TX_POLL_MAX && arena.read32(td) & RTL_DESC_OWN != 0 { ctx.yield_cpu(); ts += 1; }
         let tx_done = ts < TX_POLL_MAX;
-        tx_idx = (tx_idx + 1) % TX_RING_COUNT;
+        if !tx_done {
+            // With a single descriptor a ring desync is impossible, so a timeout here is a genuine NIC
+            // hiccup, not a cascade. Fail FAST (the tight bound above), DIAGNOSE (first few, to confirm
+            // the desync is gone), and RECOVER the engine: TE off/on to reset it, clear latched status,
+            // drop the stuck OWN. RE stays on, so RX is undisturbed (VIII bounded+loud, IX recover).
+            let isr = mmio.read16(RTL_ISR);
+            let cr  = mmio.read8(RTL_CR);
+            if tx_fail_logged < 6 {
+                ctx.log_fmt(format_args!(
+                    "nic-driver: RTL8168 TX timeout - desc={:#010x} isr={:#06x} cr={:#04x} len={} - recovering",
+                    arena.read32(td), isr, cr, flen));
+                tx_fail_logged += 1;
+            }
+            mmio.write8(RTL_CR, RTL_CR_RE);             // TE off: reset the TX engine (RX stays up)
+            mmio.write16(RTL_ISR, 0xFFFF);             // clear any latched TX error/status
+            arena.write32(td, 0);                       // drop the stuck descriptor's OWN
+            let tx_ring = arena.phys_at(TX_RING_OFF);
+            mmio.write32(RTL_TNPDS, (tx_ring & 0xffff_ffff) as u32);
+            mmio.write32(RTL_TNPDS + 4, (tx_ring >> 32) as u32);
+            mmio.write8(RTL_CR, RTL_CR_RE | RTL_CR_TE);  // TE back on - re-reads TNPDS
+        }
 
         // --- Receive a reply: poll the current RX descriptor's OWN bit (bounded), copy it out, re-arm. ---
         let mut n = 0usize;
@@ -555,6 +650,43 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 m.write32(REG_RCTL, 0);
             }
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n]));
+            ctx.remove_cap(reply_cap);
+            continue;
+        }
+
+        // [9] BATCH RX DRAIN (e1000): QEMU's slirp is quiet, so this yields at most the single frame the
+        // reset-and-read model gives, formatted as the batch [count:u8][len:u16 LE, bytes] - enough to
+        // exercise net-stack's batch scan. The multi-frame drain that matters is the RTL8168 path (a
+        // busy physical LAN).
+        if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 9 } {
+            let mut out = [0u8; BATCH_MSG_MAX];
+            let mut opos = 1usize;   // out[0] = frame count
+            let mut nfr = 0u8;
+            if active {
+                let m = mmio.as_ref().unwrap();
+                let a = arena.as_ref().unwrap();
+                for i in 0..RX_RING_COUNT { a.write8(RX_RING_OFF + i * 16 + 12, 0); }
+                m.write32(REG_RDH, 0);
+                m.write32(REG_RDT, (RX_RING_COUNT - 1) as u32);
+                m.write32(REG_RCTL, RCTL_VALUE);
+                let mut s = 0u32;
+                while s < RX_POLL_MAX {
+                    if a.read8(RX_RING_OFF + 12) & RXD_STA_DD != 0 {
+                        let len = (a.read16(RX_RING_OFF + 8) as usize).min(FRAME_MAX);
+                        out[opos..opos + 2].copy_from_slice(&(len as u16).to_le_bytes());
+                        opos += 2;
+                        for i in 0..len { out[opos + i] = a.read8(RX_BUF_OFF + i); }
+                        opos += len;
+                        nfr = 1;
+                        break;
+                    }
+                    ctx.yield_cpu();
+                    s += 1;
+                }
+                m.write32(REG_RCTL, 0);
+            }
+            out[0] = nfr;
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos]));
             ctx.remove_cap(reply_cap);
             continue;
         }

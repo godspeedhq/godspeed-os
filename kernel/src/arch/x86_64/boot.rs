@@ -338,7 +338,8 @@ pub unsafe fn init_local_apic() {
     // ARAT is its signal. Without either, halting would drop ticks (Goldmont
     // APIC power-gate) - keep the sti-only spin. Idempotent across cores.
     let arat = unsafe { cpuid_arat_supported() };
-    super::interrupts::set_idle_can_halt(tsc_deadline_supported || arat);
+    // (The halt decision is deferred to AFTER the C-state limit is attempted below - it depends on
+    // whether the APIC can be power-gated, which we only learn from limit_package_cstates.)
 
     // Calibrate TSC ticks/10ms ONLY where TSC-Deadline mode uses it (the AMD T630). The BSP measures via
     // the PIT (portable ground truth - CPUID 0x15/0x16 give a garbage frequency on AMD, which stored a
@@ -365,9 +366,6 @@ pub unsafe fn init_local_apic() {
         TSC_TICKS_PER_QUANTUM.store(tsc_ticks, Ordering::Relaxed);
         TSC_DEADLINE_MODE.store(true, Ordering::Relaxed);
         crate::kprintln!("apic: core {} TSC-Deadline timer ({} ticks/quantum)", lapic_id, tsc_ticks);
-        // Package C-state limit keeps the APIC powered so a deadline interrupt is never dropped.
-        // SAFETY: ring-0; APIC initialised above.
-        unsafe { limit_package_cstates(lapic_id) };
     } else {
         // Periodic mode: fires every ~10 ms regardless of C-states. QEMU's normal path (no TSC-Deadline).
         write_apic(apic_virt, APIC_LVT_TIMER, (1 << 17) | 0x20);
@@ -379,9 +377,20 @@ pub unsafe fn init_local_apic() {
         if tsc_deadline_supported {
             crate::kprintln!("apic: core {} periodic timer (TSC calibration unavailable)", lapic_id);
         }
-        // SAFETY: ring-0; APIC initialised above.
-        unsafe { limit_package_cstates(lapic_id) };
     }
+
+    // Apply the package C-state limit (keeps the APIC powered on Intel), and THEN decide whether idle
+    // cores may HALT. A halted core only wakes on interrupt delivery, so halting is safe ONLY if a wake
+    // is guaranteed: either the C-state limit was applied so the APIC never power-gates, OR ARAT keeps
+    // the periodic LAPIC timer ticking (meaningful only in periodic mode - not for TSC-Deadline). On the
+    // Wyse 5070 (Goldmont+) the C-state MSR is BIOS-LOCKED so the limit can't be applied AND it runs
+    // TSC-Deadline, so NEITHER holds - there we must NOT halt. Halting let the firmware power-gate the
+    // APIC and DROP the wake IPI/deadline, freezing the core silently (the chaos max-carnage wedge that
+    // no lock/shootdown watchdog caught, because nothing was spinning). The sti-only spin (correct, just
+    // hotter) is selected instead.
+    // SAFETY: ring-0; APIC initialised above.
+    let cstate_ok = unsafe { limit_package_cstates(lapic_id) };
+    super::interrupts::set_idle_can_halt(cstate_ok || (arat && !tsc_deadline_supported));
 }
 
 /// Check CPUID leaf 1, ECX bit 24 for TSC-Deadline timer support.
@@ -614,11 +623,16 @@ fn is_intel_cpu() -> bool {
 ///
 /// # Safety
 /// Ring-0 only.  Called once per core from `init_local_apic` after APIC setup.
-unsafe fn limit_package_cstates(core_id: u32) {
+/// Returns whether a halted core's wake is safe from the Goldmont+ APIC power-gate: `true` if the APIC
+/// will not be power-gated (AMD has no such gate, or the Intel C-state limit was applied), `false` if it
+/// could not be applied (Intel BIOS-locked the MSR) - in which case idle cores must NOT halt (see
+/// `init_apic_timer`), or a power-gated APIC drops the wake and freezes the core.
+unsafe fn limit_package_cstates(core_id: u32) -> bool {
     // MSR 0xE2 (MSR_PKG_CST_CONFIG_CONTROL) is Intel-specific.
-    // On AMD processors this MSR does not exist; RDMSR/WRMSR cause #GP(0).
+    // On AMD processors this MSR does not exist; RDMSR/WRMSR cause #GP(0). AMD has no Goldmont+ APIC
+    // power-gate, so halting there is governed by ARAT elsewhere - report "no gate concern".
     if !is_intel_cpu() {
-        return;
+        return true;
     }
 
     const MSR_PKG_CST_CONFIG_CONTROL: u32 = 0xE2;
@@ -645,7 +659,7 @@ unsafe fn limit_package_cstates(core_id: u32) {
         // BIOS locked the MSR - cannot write; APIC timer may still be gated in
         // deep package C-states.  A TSC-Deadline timer does not require this MSR.
         crate::kprintln!("cstate: core {} MSR 0xE2 locked - C-state limit cannot be set via MSR", core_id);
-        return;
+        return false;
     }
 
     let new_val = (current & !0x7u64) | PC1_LIMIT;
@@ -660,6 +674,7 @@ unsafe fn limit_package_cstates(core_id: u32) {
         );
     }
     crate::kprintln!("cstate: core {} limited to PC1 (MSR 0xE2 = {:#018x})", core_id, new_val);
+    true
 }
 
 /// Send an End-Of-Interrupt signal to the local APIC.
@@ -701,10 +716,19 @@ pub unsafe fn get_lapic_id() -> u32 {
 // already be held (nested kprintln → deadlock with IF=0).
 // ---------------------------------------------------------------------------
 
+/// Iteration cap for the lock-free fault-path THRE poll. An absent or wedged COM1
+/// (transmit-holding-register-empty never asserts) must not hang a fault handler
+/// forever - a silent kernel freeze, which invariant 12 forbids. After the cap we
+/// proceed best-effort exactly like the bounded `serial_thre_wait`; the worst case
+/// is one possibly-dropped diagnostic byte, never a wedge. A live UART empties its
+/// holding register in microseconds, so the cap is never reached in practice.
+const SERIAL_THRE_NOLCK_CAP: u32 = 1_000_000;
+
 #[inline]
 unsafe fn serial_poll_thre() {
     // SAFETY: port I/O in ring-0; 0x3FD is COM1 LSR.
     unsafe {
+        let mut spins: u32 = 0;
         loop {
             let lsr: u8;
             core::arch::asm!(
@@ -714,6 +738,9 @@ unsafe fn serial_poll_thre() {
                 options(nostack, nomem),
             );
             if lsr & 0x20 != 0 { break; }
+            spins += 1;
+            if spins >= SERIAL_THRE_NOLCK_CAP { break; }
+            core::hint::spin_loop();
         }
     }
 }
@@ -1116,6 +1143,17 @@ pub(super) unsafe fn init_idt() {
         for entry in idt.iter_mut() {
             *entry = IdtEntry::new(halt);
         }
+        // CPU-exception vectors (0-31): route to the CPL-discriminating stubs so a RING-3 exception
+        // KILLS the task instead of wedging the kernel (invariant 12). 6/13/14 keep their dedicated
+        // handlers (set below); 8/10/11/12/17/21 push an error code (different CS offset -> the _ec
+        // stub). Interrupt vectors (32+) stay at `exception_halt` - a spurious IRQ is not a task fault.
+        const EC_VECTORS: [usize; 6] = [8, 10, 11, 12, 17, 21];
+        let exc_noec = exc_stub_noec as *const () as u64;
+        let exc_ec   = exc_stub_ec   as *const () as u64;
+        for v in 0..32usize {
+            if v == 6 || v == 13 || v == 14 { continue; } // dedicated handlers below
+            idt[v] = IdtEntry::new(if EC_VECTORS.contains(&v) { exc_ec } else { exc_noec });
+        }
         // IDT[6] = #UD handler: used as the syscall entry on AMD GX-420GI where
         // both SYSCALL and int $0x80 silently stall from ring-3.  DPL=0 is
         // correct - CPU exceptions bypass the DPL check, so ud2 from ring-3
@@ -1257,8 +1295,17 @@ unsafe extern "C" fn gpf_stub() -> ! {
         "mov al, 0x47",   // 'G'
         "out dx, al",
         "mov byte ptr [{gp_flag}], 1",
+        // #GP pushes an error code, so the saved CS is at [rsp+16] (bits 1:0 = CPL). A ring-3 #GP
+        // (a service ran a privileged instruction or made a non-canonical access) must KILL THE TASK,
+        // not the kernel - so swapgs to the kernel GS first, exactly like pf_stub, so kill_current and
+        // the scheduler can reach per-core data. A kernel (CPL=0) #GP leaves GS alone and will halt.
+        "test byte ptr [rsp + 16], 3", // CPL: non-zero = ring-3
+        "jz 1f",                       // kernel #GP → skip swapgs
+        "swapgs",                      // ring-3 #GP → install kernel GS
+        "1:",
         "mov rdi, [rsp]",      // error_code → first arg
         "mov rsi, [rsp + 8]",  // saved RIP  → second arg
+        "mov rdx, [rsp + 16]", // saved CS   → third arg (CPL for kill-vs-halt)
         "call gpf_handler",
         "2: hlt",
         "jmp 2b",
@@ -1324,13 +1371,31 @@ unsafe extern "C" fn pf_stub() -> ! {
     )
 }
 
-/// Print GPF info and halt all cores.
+/// Handle a #GP: a RING-3 #GP kills the offending task (the system continues, invariant 12 / §10.3);
+/// a RING-0 #GP is genuine kernel-state corruption and halts loudly (§6.2). `saved_cs` bits 1:0 are the
+/// CPL. Uses lock-free serial (the fault may have interrupted a kprintln holding LOG_LOCK), mirroring
+/// pf_handler.
 #[no_mangle]
-unsafe extern "C" fn gpf_handler(error_code: u64, fault_rip: u64) -> ! {
-    crate::kprintln!(
-        "KERNEL GPF: error_code={:#x} rip={:#x}",
-        error_code, fault_rip
-    );
+unsafe extern "C" fn gpf_handler(error_code: u64, fault_rip: u64, saved_cs: u64) -> ! {
+    // SAFETY: raw fault context, IF=0, kernel GS installed (swapgs in gpf_stub for ring-3).
+    unsafe {
+        if saved_cs & 3 != 0 {
+            serial_puts_nolck(b"USER GPF (killing task): error_code=");
+        } else {
+            serial_puts_nolck(b"KERNEL GPF: error_code=");
+        }
+        serial_hex64_nolck(error_code);
+        serial_puts_nolck(b" rip=");
+        serial_hex64_nolck(fault_rip);
+        serial_puts_nolck(b" cs=");
+        serial_hex64_nolck(saved_cs);
+        serial_puts_nolck(b"\n");
+    }
+    // Ring-3 #GP: the service misbehaved, not the kernel - kill it and reschedule (kill_current does
+    // not return for a ring-3 fault). Only a ring-0 #GP (or a defensive fall-through) halts all cores.
+    if saved_cs & 3 != 0 {
+        crate::task::kill_current();
+    }
     crate::arch::x86_64::halt_all_cores()
 }
 
@@ -1370,14 +1435,32 @@ unsafe extern "C" fn pf_handler(error_code: u64, fault_rip: u64, hw_user_rsp: u6
             options(nostack, nomem),
         );
     }
+    // V1 (kernel-audit-2): a CPL0 fault (error-code bit 2 clear) at a USER virtual
+    // address while a guarded user-copy is in progress on this core is a BAD USER
+    // POINTER passed to a syscall (read_user_bytes / write_user_bytes copying an
+    // unmapped/read-only user page), not kernel-state corruption. Attribute it to the
+    // caller and kill that task (like a ring-3 fault), instead of halting all cores.
+    // Narrowly gated on the per-core user-copy flag AND cr2 < USER_END, so a genuine
+    // kernel bug faulting elsewhere still halts loudly (§6.2 / invariant 12).
+    let uc_core = crate::task::scheduler::current_core_id();
+    let user_copy_fault = (error_code & (1 << 2) == 0)
+        && cr2 < crate::arch::x86_64::syscall_entry::USER_END
+        && crate::arch::x86_64::syscall_entry::user_copy_active(uc_core);
+    if user_copy_fault {
+        // The faulting copy never returns to clear its own flag; clear it here so it
+        // does not leak to the next task scheduled on this core.
+        crate::arch::x86_64::syscall_entry::clear_user_copy_active(uc_core);
+    }
     // Use lock-free serial to avoid a deadlock if LOG_LOCK is already held
     // by the kprintln that was interrupted (interrupt gate: IF=0).
     // Bit 2 of error_code is the user/supervisor flag: 1 = fault from ring 3.
-    // Use different prefixes so monitors can distinguish: USER PF is graceful
-    // (service killed, system continues); KERNEL PF is a fatal crash.
+    // Use different prefixes so monitors can distinguish: USER PF and USER-COPY PF are
+    // graceful (offending task killed, system continues); KERNEL PF is a fatal crash.
     unsafe {
         if error_code & (1 << 2) != 0 {
             serial_puts_nolck(b"USER PF: fault_addr=");
+        } else if user_copy_fault {
+            serial_puts_nolck(b"USER-COPY PF (killing caller): fault_addr=");
         } else {
             serial_puts_nolck(b"KERNEL PF: fault_addr=");
         }
@@ -1396,8 +1479,13 @@ unsafe extern "C" fn pf_handler(error_code: u64, fault_rip: u64, hw_user_rsp: u6
         serial_hex64_nolck(kgs_base);
         serial_puts_nolck(b"\n");
     }
-    // User-mode faults kill the task (§10.3); kernel faults are fatal panics.
-    if error_code & (1 << 2) != 0 {
+    // Ring-3 #PF (error_code bit 2 = U/S set): the service touched unmapped memory, not the kernel -
+    // kill it and reschedule (§10.3; kill_current does not return for a ring-3 fault). A user-copy
+    // fault (CPL0 fault on a user pointer the kernel was copying for a syscall, V1) likewise kills the
+    // CALLER, not the kernel. Only a genuine ring-0 #PF (or a defensive fall-through, should kill_current
+    // ever return) halts all cores - halt is the fail-safe outcome, never a resume of a killed task.
+    // Mirrors gpf_handler / exc_dispatch.
+    if error_code & (1 << 2) != 0 || user_copy_fault {
         crate::task::kill_current();
     }
     crate::arch::x86_64::halt_all_cores()
@@ -1477,4 +1565,111 @@ unsafe extern "C" fn exception_halt_handler(w0: u64, w1: u64, w2: u64, w3: u64) 
         }
         serial_puts_nolck(b"\n");
     }
+}
+
+// ---------------------------------------------------------------------------
+// CPU-EXCEPTION stubs for vectors 0-31 (invariant 12: a ring-3 exception KILLS
+// the task, it does NOT wedge the kernel).
+//
+// The old catch-all `exception_halt` above halted the whole machine for EVERY
+// unhandled vector, so a single ring-3 instruction (`cli` -> #GP; `div` by 0 ->
+// #DE; an unmasked FP fault -> #MF/#XM; ...) took down the kernel - the class the
+// commandment audit flagged. These stubs mirror pf_stub: check the saved-CS CPL,
+// swapgs to the kernel GS for a ring-3 fault, and let exc_dispatch KILL the task
+// (system continues); a ring-0 exception is genuine kernel corruption and halts.
+//
+// Two variants because the CS slot differs: an error-code exception pushes err
+// first (CS at [rsp+16]); a no-error-code exception has CS at [rsp+8]. Interrupt
+// vectors (32+) are NOT routed here - a spurious IRQ is not the task's fault and
+// keeps the `exception_halt` behaviour.
+// ---------------------------------------------------------------------------
+
+/// No-error-code exception frame: [rsp+0]=RIP [rsp+8]=CS [rsp+16]=RFLAGS [rsp+24]=RSP.
+#[unsafe(naked)]
+unsafe extern "C" fn exc_stub_noec() -> ! {
+    core::arch::naked_asm!(
+        // Raw '?' to COM1, then set the reached-flag BEFORE cli (so other cores can observe it).
+        "mov dx, 0x3fd",
+        "88: in al, dx",
+        "test al, 0x20",
+        "jz 88b",
+        "mov dx, 0x3f8",
+        "mov al, 0x3f",   // '?'
+        "out dx, al",
+        "mov byte ptr [{flag}], 1",
+        "cli",
+        // CPL from saved CS at [rsp+8]; swapgs for a ring-3 fault so kill_current reaches per-core GS.
+        "test byte ptr [rsp + 8], 3",
+        "jz 1f",
+        "swapgs",
+        "1:",
+        "mov rdi, [rsp]",       // w0 = RIP
+        "mov rsi, [rsp + 8]",   // w1 = CS
+        "mov rdx, [rsp + 16]",  // w2 = RFLAGS
+        "mov rcx, [rsp + 24]",  // w3 = RSP
+        "mov r8,  [rsp + 8]",   // cs (5th arg) for the kill-vs-halt decision
+        "call exc_dispatch",
+        "2: hlt",
+        "jmp 2b",
+        flag = sym EXCEPTION_HALT_REACHED,
+    )
+}
+
+/// Error-code exception frame: [rsp+0]=err [rsp+8]=RIP [rsp+16]=CS [rsp+24]=RFLAGS.
+#[unsafe(naked)]
+unsafe extern "C" fn exc_stub_ec() -> ! {
+    core::arch::naked_asm!(
+        "mov dx, 0x3fd",
+        "88: in al, dx",
+        "test al, 0x20",
+        "jz 88b",
+        "mov dx, 0x3f8",
+        "mov al, 0x3f",   // '?'
+        "out dx, al",
+        "mov byte ptr [{flag}], 1",
+        "cli",
+        // CPL from saved CS at [rsp+16] (error code pushed first); swapgs for a ring-3 fault.
+        "test byte ptr [rsp + 16], 3",
+        "jz 1f",
+        "swapgs",
+        "1:",
+        "mov rdi, [rsp]",       // w0 = error code
+        "mov rsi, [rsp + 8]",   // w1 = RIP
+        "mov rdx, [rsp + 16]",  // w2 = CS
+        "mov rcx, [rsp + 24]",  // w3 = RFLAGS
+        "mov r8,  [rsp + 16]",  // cs (5th arg)
+        "call exc_dispatch",
+        "2: hlt",
+        "jmp 2b",
+        flag = sym EXCEPTION_HALT_REACHED,
+    )
+}
+
+/// A ring-3 CPU exception (`cs & 3 != 0`) kills the offending task and the system continues
+/// (invariant 12 / §10.3); a ring-0 exception is genuine kernel-state corruption and halts all cores
+/// (§6.2). Lock-free serial: the fault may have interrupted a kprintln holding LOG_LOCK.
+#[no_mangle]
+unsafe extern "C" fn exc_dispatch(w0: u64, w1: u64, w2: u64, w3: u64, cs: u64) -> ! {
+    // SAFETY: raw fault context, IF=0, kernel GS installed (swapgs in the stub for ring-3).
+    unsafe {
+        if cs & 3 != 0 {
+            serial_puts_nolck(b"\nUSER EXCEPTION (killing task): [");
+        } else {
+            serial_puts_nolck(b"\nKERNEL EXCEPTION: [");
+        }
+        serial_hex64_nolck(w0);
+        serial_puts_nolck(b"] [");
+        serial_hex64_nolck(w1);
+        serial_puts_nolck(b"] [");
+        serial_hex64_nolck(w2);
+        serial_puts_nolck(b"] [");
+        serial_hex64_nolck(w3);
+        serial_puts_nolck(b"] cs=");
+        serial_hex64_nolck(cs);
+        serial_puts_nolck(b"\n");
+    }
+    if cs & 3 != 0 {
+        crate::task::kill_current(); // ring-3: task dies, reschedule (does not return for a ring-3 fault)
+    }
+    crate::arch::x86_64::halt_all_cores() // ring-0, or a defensive fall-through
 }

@@ -287,11 +287,14 @@ pub fn disable_interrupts() {
 /// and prevents C-state entry entirely.  The outer scheduler loop's
 /// `compiler_fence(SeqCst)` ensures every iteration re-reads TASK_STATE,
 /// so wakeups written by other cores are not missed.
-/// True when idle cores may safely `hlt` - set once at boot from the ARAT CPUID
-/// bit (CPUID.06H:EAX[2], "Always Running APIC Timer"). ARAT is the hardware's
-/// guarantee that the LAPIC timer keeps ticking through C-states, so a halted
-/// core still receives its scheduler tick (and IPIs/IRQs wake it). When ARAT is
-/// absent (e.g. some Goldmont parts) we keep the legacy sti-only spin.
+/// True when idle cores may safely `hlt` - set once per core at boot (see `init_apic_timer`). Halting is
+/// safe only if a halted core is GUARANTEED to wake, i.e. the APIC will not be power-gated: either the
+/// package C-state limit was applied (Intel; or AMD, which has no such gate), OR ARAT
+/// (CPUID.06H:EAX[2], "Always Running APIC Timer") keeps the periodic LAPIC timer ticking through
+/// C-states - and that only helps in periodic mode, not TSC-Deadline. On the Wyse 5070 (Goldmont+) the
+/// C-state MSR is BIOS-locked (limit can't be applied) and it runs TSC-Deadline, so neither holds and we
+/// keep the sti-only spin - halting there let the firmware power-gate the APIC and drop the wake,
+/// freezing the core silently under load.
 static IDLE_CAN_HALT: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 

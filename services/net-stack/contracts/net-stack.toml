@@ -13,6 +13,9 @@ limit   = "16MiB"
 log_write   = true
 ipc_send    = ["nic-driver"]
 ipc_receive = ["net-stack"]
+# net-stack mints a delegated SOCKET capability per open socket (§7.10, the same mechanism fs uses for
+# files). resource_mint is that authority; the kernel grants it from this declaration (service_hw, T1 B).
+resource_mint = true
 
 [placement]
 core = 1   # co-located with nic-driver (the two exchange frames constantly)

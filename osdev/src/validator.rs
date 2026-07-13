@@ -596,6 +596,24 @@ static ADV_TESTS: &[TestSpec] = &[
             timeout_secs: 30,
         },
     },
+    TestSpec {
+        id: "A14", name: "ring3_cpu_exception_kills_task_not_kernel",
+        spec_ref: "docs/kernel-audit.md C1/C2 - arch/x86_64/boot.rs exc_dispatch/gpf_handler",
+        kind: TestKind::WatchSerial {
+            expect:       &["adv: A14 pass"],
+            fail_on:      &["KERNEL PANIC", "KERNEL GPF", "KERNEL EXCEPTION", "adv: A14 FAIL"],
+            timeout_secs: 30,
+        },
+    },
+    TestSpec {
+        id: "A15", name: "bad_user_pointer_kills_caller_not_kernel",
+        spec_ref: "docs/kernel-audit.md V1 - arch/x86_64/syscall_entry.rs user-copy guard + pf_handler",
+        kind: TestKind::WatchSerial {
+            expect:       &["adv: A15 pass"],
+            fail_on:      &["KERNEL PANIC", "KERNEL PF", "adv: A15 FAIL"],
+            timeout_secs: 30,
+        },
+    },
 ];
 
 // ---------------------------------------------------------------------------

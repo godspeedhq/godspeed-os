@@ -61,6 +61,34 @@ fn update_in_progress() -> bool {
     cmos_read(0x0A) & 0x80 != 0
 }
 
+/// Iteration cap for the update-in-progress wait. An absent or wedged RTC reads
+/// 0xFF on every port, so status-A bit 7 is permanently set and a bare
+/// `while update_in_progress() {}` would spin forever - a silent kernel freeze,
+/// which invariant 12 forbids. A live RTC clears UIP within ~2 ms, so a cap this
+/// size is never hit in practice; it exists purely so a dead RTC degrades to a
+/// bounded read instead of a hang.
+const RTC_UIP_SPIN_CAP: u32 = 1_000_000;
+
+/// Cap on the two-consecutive-reads-agree retry loop, so a pathological RTC whose
+/// fields never settle cannot spin forever either.
+const RTC_CONSISTENCY_TRIES: u32 = 128;
+
+/// Wait for an in-progress RTC update to finish, bounded by `RTC_UIP_SPIN_CAP`.
+/// After the cap we return anyway and let the caller read; the resulting fields
+/// (0xFF on a dead RTC) are rejected downstream by `year_plausible` /
+/// `deglitch_epoch`, which keep the last known-good time. Bounded, never silent.
+#[inline]
+fn wait_update_clear() {
+    let mut spins: u32 = 0;
+    while update_in_progress() {
+        spins += 1;
+        if spins >= RTC_UIP_SPIN_CAP {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 #[inline]
 fn bcd_to_bin(v: u8) -> u8 {
     (v & 0x0F) + ((v >> 4) * 10)
@@ -122,13 +150,14 @@ fn year_plausible(packed: u64) -> bool {
 /// no need to disable interrupts). Decodes BCD and 12-hour mode per status
 /// register B, so the returned fields are always binary and 24-hour.
 fn read_datetime_raw() -> u64 {
-    while update_in_progress() {}
+    wait_update_clear();
     let (mut sec, mut min, mut hour) = (cmos_read(0), cmos_read(2), cmos_read(4));
     let (mut day, mut month, mut year, mut century) =
         (cmos_read(7), cmos_read(8), cmos_read(9), cmos_read(0x32));
+    let mut tries: u32 = 0;
     loop {
         let prev = (sec, min, hour, day, month, year, century);
-        while update_in_progress() {}
+        wait_update_clear();
         sec = cmos_read(0);
         min = cmos_read(2);
         hour = cmos_read(4);
@@ -136,7 +165,8 @@ fn read_datetime_raw() -> u64 {
         month = cmos_read(8);
         year = cmos_read(9);
         century = cmos_read(0x32);
-        if prev == (sec, min, hour, day, month, year, century) {
+        tries += 1;
+        if prev == (sec, min, hour, day, month, year, century) || tries >= RTC_CONSISTENCY_TRIES {
             break;
         }
     }

@@ -9,11 +9,6 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use crate::arch::x86_64::BootInfo;
 use crate::smp::percpu::{num_cores, PerCore};
 
-/// Generous compile-time **sanity ceiling** on the core count (Linux's `NR_CPUS`). Per-core state is
-/// *not* allocated to this size - it is boot-sized to the cores Limine actually reports (`percpu`,
-/// §26.6.1); this only bounds the maximum, with a loud message at boot if a machine exceeds it.
-pub const MAX_CORES: usize = 256;
-
 static READY_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Per-core data, one slot per core in a boot-sized arena. `ready` is atomic so a core flips its own

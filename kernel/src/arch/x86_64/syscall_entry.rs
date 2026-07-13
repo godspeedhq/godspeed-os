@@ -5,8 +5,6 @@
 //! loads the per-task kernel RSP, then calls `syscall_handler`. On return
 //! the inverse happens and SYSRETQ re-enters ring-3.
 
-const MAX_CORES: usize = crate::smp::core::MAX_CORES;
-
 /// Per-core data accessed via the GS base register in the SYSCALL stub.
 ///
 /// Layout is fixed: offset 0 = user_rsp, offset 8 = kernel_rsp.
@@ -17,10 +15,44 @@ pub struct PerCoreSyscallData {
     pub kernel_rsp: u64,   // offset 8 - pre-loaded kernel stack top for current task
 }
 
-// Lives in .data (writable) - the stub writes user_rsp on every SYSCALL entry.
+/// Per-core SYSCALL GS data, sized to the cores Limine reported (`init_percore_syscall_arena`), NOT a
+/// fixed `[_; MAX_CORES]`. Each core's GS.base points at ITS slot (set in `init_per_core_syscall`), so
+/// the stub only ever touches its own via `gs:[0]`/`gs:[8]` - the arena is indexed by core id only when
+/// (re)pointing GS. Dynamic so a machine with any number of cores gets a slot each (§26.6.1).
+static PER_CORE_SYSCALL: crate::smp::percpu::PerCoreMut<PerCoreSyscallData> =
+    crate::smp::percpu::PerCoreMut::new();
+
+// BSP bootstrap slot. `init_bsp` sets the BSP's syscall GS *before* the frame allocator exists (so
+// before the arena), but no ring-3 task - hence no SYSCALL, hence no write to this slot - runs until
+// long after `percpu_init` has allocated the arena and re-pointed the BSP's GS to `arena[0]`. So this
+// slot is only ever the BSP's, only in that pre-arena boot window, and is never actually written.
+// In .data (writable) because the SYSCALL stub would write user_rsp through GS.
 #[link_section = ".data"]
-pub static mut PER_CORE_SYSCALL: [PerCoreSyscallData; MAX_CORES] =
-    [const { PerCoreSyscallData { user_rsp: 0, kernel_rsp: 0 } }; MAX_CORES];
+static mut BSP_SYSCALL: PerCoreSyscallData = PerCoreSyscallData { user_rsp: 0, kernel_rsp: 0 };
+
+/// Raw pointer to core `core_id`'s syscall slot: the arena once it exists, else the BSP bootstrap slot
+/// (core 0 only, pre-`percpu_init`). Safe to CALL (forms no reference); callers deref under the per-core
+/// single-owner invariant (a core only ever touches its own slot).
+#[inline]
+pub fn syscall_slot(core_id: usize) -> *mut PerCoreSyscallData {
+    if PER_CORE_SYSCALL.initialised() {
+        PER_CORE_SYSCALL.as_mut_ptr(core_id)
+    } else {
+        debug_assert!(core_id == 0, "pre-arena syscall slot is BSP-only");
+        core::ptr::addr_of_mut!(BSP_SYSCALL)
+    }
+}
+
+/// Allocate the per-core syscall GS arena for `n` cores and re-point the BSP's GS from the bootstrap
+/// slot to `arena[0]`. Call ONCE at boot (`smp::percpu_init`), after the frame allocator is up and
+/// before any ring-3 task (hence any SYSCALL) runs. APs point their GS at `arena[core_id]` later, in
+/// `init_per_core_syscall` from `ap_init`.
+pub fn init_percore_syscall_arena(n: usize) {
+    PER_CORE_SYSCALL.init_with(n, |_| PerCoreSyscallData { user_rsp: 0, kernel_rsp: 0 });
+    // SAFETY: boot-time, BSP only, before any ring-3/syscall; the arena is now initialised so
+    // `syscall_slot(0)` returns `arena[0]`. Re-points MSR_GS_BASE + KERNEL_GS_BASE to it.
+    unsafe { init_per_core_syscall(0); }
+}
 
 /// Initialise per-core GS MSRs for the SYSCALL stub.
 ///
@@ -42,7 +74,7 @@ pub static mut PER_CORE_SYSCALL: [PerCoreSyscallData; MAX_CORES] =
 pub unsafe fn init_per_core_syscall(core_id: usize) {
     // SAFETY: WRMSR in ring-0 is always valid.
     unsafe {
-        let ptr = &raw const PER_CORE_SYSCALL[core_id] as u64;
+        let ptr = syscall_slot(core_id) as u64;
 
         // MSR_GS_BASE = kernel ptr - establishes the ring-0 GS invariant.
         core::arch::asm!(
@@ -78,10 +110,15 @@ pub unsafe fn init_per_core_syscall(core_id: usize) {
 // ---------------------------------------------------------------------------
 
 /// The highest valid user virtual address (exclusive) - top of the lower half.
-const USER_END: u64 = 0x0000_8000_0000_0000;
+pub const USER_END: u64 = 0x0000_8000_0000_0000;
 
 /// Return `true` iff the byte range `[ptr, ptr+len)` lies entirely within the
 /// user address space and does not wrap.
+///
+/// NOTE: this is a RANGE check only - it does NOT verify the pages are mapped or
+/// writable. A range-valid-but-unmapped pointer still faults when the kernel copies
+/// it; that fault is made recoverable by the `USER_COPY_ACTIVE` guard below (V1,
+/// kernel-audit-2), so it kills the caller instead of halting the machine.
 #[inline]
 pub fn validate_user_ptr(ptr: u64, len: usize) -> bool {
     if ptr == 0 || len == 0 { return false; }
@@ -92,26 +129,104 @@ pub fn validate_user_ptr(ptr: u64, len: usize) -> bool {
     }
 }
 
-/// Borrow a user-space byte slice.  Returns `None` if the range is invalid.
+// ---------------------------------------------------------------------------
+// User-copy fault guard (V1, kernel-audit-2).
+//
+// validate_user_ptr only range-checks; it cannot know whether a page is actually
+// mapped/writable. When the kernel copies to/from a range-valid-but-unmapped (or
+// read-only) user pointer, the copy faults - and because the copy runs at CPL0 the
+// #PF error-code U/S bit is 0, so a naive pf_handler reads it as "KERNEL PF" and
+// halts every core. That is a whole-machine DoS reachable by any service passing a
+// bad pointer to a syscall.
+//
+// Fix: the copy helpers below set a per-core "user-copy in progress" flag around the
+// ONLY instruction that touches user memory. pf_handler consults it: a CPL0 fault at
+// a user VA while the flag is set is a bad USER pointer, so it kills the caller (like
+// a ring-3 fault) and the system continues. The flag is set NARROWLY (never for a
+// whole syscall), so a genuine kernel bug that faults elsewhere still halts loudly.
+// IF=0 in syscall context => no same-core nesting; per-core => cross-core copies are
+// independent.
+// ---------------------------------------------------------------------------
+
+use core::sync::atomic::{AtomicBool, Ordering};
+use crate::smp::percpu::{num_cores, PerCore, PerCoreMut};
+
+/// Per-core "user-copy in progress" flag - a boot-sized arena (§26.6.1), one slot per core Limine
+/// reported, NOT a fixed `[_; MAX_CORES]`. `pf_handler` consults it to attribute a CPL0 user-VA fault to
+/// a bad user pointer (kill the caller) rather than kernel corruption.
+static USER_COPY_ACTIVE: PerCore<AtomicBool> = PerCore::new();
+
+/// Per-core scratch for `read_user_bytes` - a boot-sized arena (one message page per core). User bytes
+/// are copied here under the guard and a slice into this KERNEL buffer is returned, so no caller ever
+/// dereferences raw user memory. Larger reads are rejected (`build_message` caps at `MAX_MESSAGE_SIZE`).
+/// This was a 1 MiB fixed `[[u8; 4096]; MAX_CORES]`; as an arena it costs `num_cores * 4 KiB`.
+static USER_READ_SCRATCH: PerCoreMut<[u8; crate::ipc::message::MAX_MESSAGE_SIZE]> = PerCoreMut::new();
+
+/// Allocate the per-core user-copy arenas. Called once at boot (`smp::percpu_init`), after the frame
+/// allocator is up and before any syscall (the only caller of the copy helpers) or ring-3 fault.
+pub fn init_percore_arenas(n: usize) {
+    USER_COPY_ACTIVE.init_with(n, |_| AtomicBool::new(false));
+    USER_READ_SCRATCH.init_with(n, |_| [0u8; crate::ipc::message::MAX_MESSAGE_SIZE]);
+}
+
+/// True iff `core` is mid user-copy - consulted by `pf_handler` to attribute a CPL0 user-VA fault to a
+/// bad user pointer (kill the caller) rather than kernel corruption. Returns false before the arena is
+/// initialised (an early kernel fault, before `percpu_init`) - such a fault is genuine and must halt.
+#[inline]
+pub fn user_copy_active(core: usize) -> bool {
+    USER_COPY_ACTIVE.initialised() && core < num_cores() && USER_COPY_ACTIVE.get(core).load(Ordering::SeqCst)
+}
+
+/// Clear the guard for `core`. Called by `pf_handler` after it attributes a fault to a
+/// user-copy and kills the caller: the copy faulted and never returned, so the helper's
+/// own clear was skipped and the flag must not leak to the next task on this core.
+#[inline]
+pub fn clear_user_copy_active(core: usize) {
+    if USER_COPY_ACTIVE.initialised() && core < num_cores() {
+        USER_COPY_ACTIVE.get(core).store(false, Ordering::SeqCst);
+    }
+}
+
+/// Read a user-space byte range into this core's kernel scratch and return a slice into
+/// the SCRATCH (never raw user memory).  Returns `None` if the range is invalid or
+/// larger than one message page.
 ///
-/// The returned slice is valid for the current syscall frame lifetime; the
-/// caller must not retain it across a reschedule point.
+/// The returned slice is valid until the next `read_user_bytes` on this core; callers
+/// must consume it before the next read / any reschedule (the prior borrowed-user-slice
+/// return required the same).
 #[inline]
 pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> {
     if !validate_user_ptr(ptr, len) { return None; }
-    // SAFETY: range validated above; lies in user-space VA (below USER_END),
-    // which is disjoint from all kernel mappings.  Caller is in syscall
-    // context (IF=0); no task migration can occur.
-    Some(unsafe { core::slice::from_raw_parts(ptr as *const u8, len) })
+    if len > crate::ipc::message::MAX_MESSAGE_SIZE { return None; }
+    let core = crate::task::scheduler::current_core_id();
+    if core >= num_cores() { return None; }
+    // Base of this core's scratch arena slot (single-owner: only this core, inside an IF=0 syscall,
+    // touches its slot - no aliasing, no same-core nesting).
+    let base = USER_READ_SCRATCH.as_mut_ptr(core).cast::<u8>();
+    USER_COPY_ACTIVE.get(core).store(true, Ordering::SeqCst);
+    // SAFETY: `[ptr, ptr+len)` is a validated user range; `base` is this core's scratch
+    // of MAX_MESSAGE_SIZE >= len bytes. If a source page is unmapped the CPL0 #PF is
+    // caught by pf_handler (USER_COPY_ACTIVE set -> the caller is killed), so this copy
+    // never faults the kernel and never returns from the fault.
+    unsafe { core::ptr::copy_nonoverlapping(ptr as *const u8, base, len) };
+    USER_COPY_ACTIVE.get(core).store(false, Ordering::SeqCst);
+    // SAFETY: `base` points to `len` bytes just initialised in the arena scratch slot.
+    Some(unsafe { core::slice::from_raw_parts(base as *const u8, len) })
 }
 
-/// Copy `src` into the user-space address `dst`.  Returns `false` if the
-/// destination range is invalid; the copy is a no-op in that case.
+/// Copy `src` into the user-space address `dst`.  Returns `false` if the destination
+/// range is invalid; the copy is a no-op in that case.
 #[inline]
 pub fn write_user_bytes(dst: u64, src: &[u8]) -> bool {
     if !validate_user_ptr(dst, src.len()) { return false; }
-    // SAFETY: range validated above; user-space VA disjoint from kernel.
+    let core = crate::task::scheduler::current_core_id();
+    if core >= num_cores() { return false; }
+    USER_COPY_ACTIVE.get(core).store(true, Ordering::SeqCst);
+    // SAFETY: range validated; user-space VA disjoint from kernel. If `dst` is unmapped
+    // or read-only the CPL0 #PF is caught by pf_handler (USER_COPY_ACTIVE set -> the
+    // caller is killed), so this copy never halts the kernel.
     unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst as *mut u8, src.len()) };
+    USER_COPY_ACTIVE.get(core).store(false, Ordering::SeqCst);
     true
 }
 

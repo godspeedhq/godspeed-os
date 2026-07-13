@@ -754,10 +754,11 @@ fn poll_devices(
     let mut err = [0u32; MAX_HID];                        // consecutive errored completions
     let mut kb_last = [0u8; 6];                           // keyboard edge-detection state
     let mut sts_logged = false;                          // log when USBSTS first shows USBINT
-    // Typematic auto-repeat, timed in TSC cycles (read_tsc is hardware-proven to advance,
-    // unlike the coarse kernel tick): ~300 ms before the first repeat, then ~50 ms apart
-    // at ~2 GHz. The spread across 1.5-3 GHz CPUs just shifts the feel slightly.
-    let mut kb_rep = godspeed_sdk::hid::KeyRepeat::new(REPEAT_INITIAL_CYCLES, REPEAT_INTERVAL_CYCLES);
+    // Typematic auto-repeat, timed in TSC cycles (read_tsc is hardware-proven to advance, unlike
+    // the coarse kernel tick), CALIBRATED to this machine's TSC rate so ~300 ms initial / ~50 ms
+    // interval holds on any CPU - hardcoding ~2 GHz made one keypress repeat into `qqqqq` on the
+    // Goldmont+ Wyse. 0 (QEMU, no USB HID) falls back to the ~2 GHz cycle counts.
+    let mut kb_rep = godspeed_sdk::hid::KeyRepeat::new_calibrated(ctx.tsc_ticks_per_10ms());
     let mut kb_caps = false; // Caps Lock latch (host-tracked toggle)
     let mut mouse = godspeed_sdk::hid::MouseTracker::new(); // mouse button/motion state
     loop {
@@ -891,11 +892,10 @@ const INT_PCD:        u32 = 1 << 2; // Port Change Detect (hot-plug)
 const STS_INT_BITS:   u32 = 0x3F;   // the six W1C interrupt-status bits (0..5)
 const EHCI_INT_VECTOR: u8 = 0x29;   // matches kernel interrupts::EHCI_MSI_VECTOR
 
-// Typematic auto-repeat timings, in TSC cycles (~2 GHz on the T630). The driver busy-polls, so
-// these only pace the synthesised key-repeat (a held key sends no further reports); kb_rep emits
-// a repeat off its own read_tsc clock. ~300 ms to first repeat, then ~50 ms apart.
-const REPEAT_INITIAL_CYCLES:  u64 = 600_000_000;   // ~300 ms before the first repeat
-const REPEAT_INTERVAL_CYCLES: u64 = 100_000_000;   // ~50 ms between repeats
+// Typematic auto-repeat is CALIBRATED per-machine from the TSC rate at keyboard-poll setup
+// (`KeyRepeat::new_calibrated(ctx.tsc_ticks_per_10ms())`); a held key sends no further reports, so
+// kb_rep synthesises the repeat off its own read_tsc clock. Hardcoding ~2 GHz repeated too fast on
+// the Goldmont+ Wyse (one keypress -> `qqqqq`).
 const OP_PORTSC0:    usize = 0x44; // PORTSC[0]; +4 bytes per additional port
 
 const CMD_RS:        u32 = 1 << 0;  // Run/Stop

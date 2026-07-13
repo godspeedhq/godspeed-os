@@ -1115,6 +1115,19 @@ block carrying a `// SAFETY:` comment - keeps the *driver services themselves*
 as the kernel isolates its `unsafe` to the four layers above. This is a recognition
 of what the syscall ABI already required, extended to the hardware access §12 needs.
 
+**Plus the SDK's audited adversarial test module (`sdk/rust/src/adversarial.rs`).** The §22 red-team /
+fuzz / chaos suite must reach the raw ABI with *fuzzed* syscall numbers and arguments, and must execute
+*deliberate ring-3 faults* (a null read, a non-canonical read, a divide-by-zero) to prove the kernel
+kills the faulting task rather than wedging the machine (invariant 12; A14 / A15 / C2) - things no safe
+wrapper can otherwise express. Isolating that `unsafe` to this one designated, SAFETY-commented module
+(`fuzz_syscall`, `fault_null_read`, `fault_noncanonical_read`, `fault_divide_by_zero`) keeps the *test
+services themselves* (`probe`) `unsafe`-free, exactly as the hardware/ABI layer keeps the driver
+services `unsafe`-free. This is a recognition of what adversarial testing already required: `probe` used
+to hold this `unsafe` directly - an untracked §18.2 violation the userspace audit (M8) closed. The
+module is test-only; no production service calls it (a fault primitive just kills the caller, which the
+kernel handles). `scripts/unsafe_check.py` now scans `services/` and fails on any service `unsafe`,
+mechanically enforcing the isolation.
+
 ### 18.2 Forbidden
 
 All userspace services, `osdev/`, and all of `sdk/` **except** the audited

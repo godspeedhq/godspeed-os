@@ -277,6 +277,13 @@ struct CachePaddedU64(AtomicU64);
 static CORE_ACTIVE_TICKS: PerCore<CachePaddedU64> = PerCore::new();
 /// Total timer ticks seen on each core.
 static CORE_TOTAL_TICKS: PerCore<CachePaddedU64> = PerCore::new();
+/// TSC at each core's last scheduler tick - the cross-core LIVENESS heartbeat. A core stamps this every
+/// tick; every OTHER core checks it each tick and, if a core has made no progress for far longer than a
+/// quantum (a stuck IF=0 loop, or a lost/never-re-armed TSC-Deadline when the Goldmont+ APIC
+/// power-gates), PANICS loudly instead of letting the machine freeze silently (invariant 12 / §26.7).
+/// The kernel is the last-resort recovery anchor (§6.3); if IT stalls silently nothing recovers it, so
+/// it must at minimum fail LOUD. `0` = that core has not ticked yet (still booting) - not a stall.
+static CORE_LAST_TICK_TSC: PerCore<CachePaddedU64> = PerCore::new();
 
 /// Sticky round-robin scan pointer per core (§9.1, §9.3).
 ///
@@ -368,6 +375,7 @@ pub fn init_arenas(n: usize) {
     CORE_CURRENT.init_with(n, |_| AtomicUsize::new(IDLE));
     CORE_ACTIVE_TICKS.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
     CORE_TOTAL_TICKS.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
+    CORE_LAST_TICK_TSC.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
     CORE_RR_SLOT.init_with(n, |_| AtomicUsize::new(0));
     CORE_WAKE_HINT.init_with(n, |_| AtomicUsize::new(MAX_TASKS));
     CORE_PENDING_KSTACK_LEN.init_with(n, |_| AtomicUsize::new(0));
@@ -910,12 +918,13 @@ unsafe fn prepare_ring3_switch(core_id: usize, slot: usize) {
     // 4 KiB Message) still fits comfortably in the 64 KiB kstack below K0T-2048.
     let syscall_rsp = ksp - 2048;
 
-    // SAFETY: PER_CORE_SYSCALL lives in .data; single writer (this core).
+    // SAFETY: syscall_slot(core_id) points at this core's arena slot (or the BSP bootstrap pre-arena);
+    // single writer (this core), per the per-core single-owner invariant.
     unsafe {
-        crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[core_id].kernel_rsp = syscall_rsp;
+        (*crate::arch::x86_64::syscall_entry::syscall_slot(core_id)).kernel_rsp = syscall_rsp;
         // Restore per-task user RSP so SYSRETQ loads the correct stack pointer for
         // this task, not the value left by the last task that ran on this core.
-        crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[core_id].user_rsp =
+        (*crate::arch::x86_64::syscall_entry::syscall_slot(core_id)).user_rsp =
             TASK_USER_RSP[slot];
     }
     // TSS.rsp0 stays at K0T so hardware interrupts (timer ISR) still enter at the top.
@@ -981,16 +990,44 @@ pub fn run(core_id: u32) -> ! {
                 // SAFETY: IF disabled around the switch to prevent preemption.
                 unsafe {
                     core::arch::asm!("cli", options(nostack, nomem));
-                    TASK_STATE[next].store(TaskState::Running as u8, Ordering::Relaxed);
-                    CORE_CURRENT.get(cid).store(next, Ordering::Relaxed);
-                    if TASK_IS_USER[next] {
-                        prepare_ring3_switch(cid, next);
+                    // V3 (kernel-audit-2): claim `next` with a CAS, not an
+                    // unconditional store, so a cross-core kill that stored Dead
+                    // between pick_next and here is not overwritten (mirrors the
+                    // next==prev timer path). Then complete the Dekker handshake
+                    // with kill_task_by_slot, which does: store Dead; SeqCst fence;
+                    // load CORE_CURRENT. Here we publish CORE_CURRENT, fence, and
+                    // re-read STATE: if a concurrent kill won the pick->publish race
+                    // - and may have missed our publish and already freed `next`'s
+                    // page tables - `abort` skips the switch rather than load a freed
+                    // CR3. All accesses are SeqCst so the two sides cannot both miss
+                    // each other's store (store-buffer / Dekker), so at least one of
+                    // {kill waits for us, we observe Dead} holds; both are safe.
+                    let mut abort = TASK_STATE[next]
+                        .compare_exchange(
+                            TaskState::Ready as u8,
+                            TaskState::Running as u8,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        )
+                        .is_err();
+                    if !abort {
+                        CORE_CURRENT.get(cid).store(next, Ordering::SeqCst);
+                        core::sync::atomic::fence(Ordering::SeqCst);
+                        abort = TASK_STATE[next].load(Ordering::SeqCst)
+                            != TaskState::Running as u8;
                     }
-                    let sched    = CORE_SCHED_CTX.as_mut_ptr(cid);
-                    let next_ctx = TASK_CTX[next].assume_init_ref() as *const TaskContext;
-                    switch_context(sched, next_ctx);
-                    // Execution returns here after the task is preempted and
-                    // the scheduler loop is re-entered.
+                    if !abort {
+                        if TASK_IS_USER[next] {
+                            prepare_ring3_switch(cid, next);
+                        }
+                        let sched    = CORE_SCHED_CTX.as_mut_ptr(cid);
+                        let next_ctx = TASK_CTX[next].assume_init_ref() as *const TaskContext;
+                        switch_context(sched, next_ctx);
+                        // Execution returns here after the task is preempted and
+                        // the scheduler loop is re-entered.
+                    }
+                    // Shared tail (switched, or aborted): leave CORE_CURRENT off
+                    // `next` so a racing kill's spin-wait proceeds, then re-loop.
                     CORE_CURRENT.get(cid).store(IDLE, Ordering::Relaxed);
                     core::arch::asm!("sti", options(nostack, nomem));
                 }
@@ -1052,6 +1089,42 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
 
         // Accumulate CPU utilisation counters.
         CORE_TOTAL_TICKS.get(cid).0.fetch_add(1, Ordering::Relaxed);
+
+        // LIVENESS WATCHDOG (invariant 12 / §26.7 - the constitutionally-complete answer to the silent
+        // Wyse wedge). Stamp this core's progress, then check every OTHER core: a core that has made no
+        // forward progress for far longer than a quantum has STOPPED - for ANY reason (a stuck IF=0
+        // loop, a lost/never-re-armed TSC-Deadline when the Goldmont+ APIC power-gates, a wait nothing
+        // wakes). Rather than let the machine freeze silently, the first core to notice PANICS LOUDLY,
+        // naming the stalled core, how long it has been dark, and what it was running. The kernel is the
+        // last-resort recovery anchor (§6.3): if it stalls silently nothing recovers it, so it must at
+        // minimum fail loud. Armed only once the TSC quantum is calibrated (real hardware, TSC-Deadline
+        // mode); QEMU's periodic tick has no calibrated rate (0), so it is skipped - and a normal
+        // shootdown/critical-section is milliseconds, so the ~3 s deadline cannot false-fire.
+        let now = crate::arch::x86_64::read_cycle_counter();
+        CORE_LAST_TICK_TSC.get(cid).0.store(now, Ordering::Relaxed);
+        let tpq = crate::arch::x86_64::boot::tsc_ticks_per_quantum();
+        let ncores = crate::smp::core::ready_count() as usize;
+        if tpq > 0 {
+            let deadline = tpq.saturating_mul(300); // ~3 s (300 * 10 ms quanta) with no forward progress
+            for other in 0..ncores {
+                if other == cid { continue; }
+                let last = CORE_LAST_TICK_TSC.get(other).0.load(Ordering::Relaxed);
+                // saturating_sub: if now < last (small cross-core TSC skew, or it stamped a hair ago)
+                // this reads 0, never a spurious huge delta - so skew cannot false-fire the panic.
+                let dark = now.saturating_sub(last);
+                if last != 0 && dark > deadline {
+                    let stuck_task = CORE_CURRENT.get(other).load(Ordering::Relaxed);
+                    panic!(
+                        "LIVENESS WEDGE: core {} made NO progress for {} TSC (~{} quanta, >3s); last \
+                         running task slot {}; detected by core {}. No forward progress = loud stop.",
+                        other, dark, dark / tpq, stuck_task, cid
+                    );
+                }
+            }
+        }
+        // (The per-core "hb:" tick heartbeat that lived here was a diagnostic for the Wyse wedge hunt;
+        // removed now that the wedge is fixed and the cross-core LIVENESS WATCHDOG above is the permanent
+        // progress defense. It printed every ~2 s forever - idle console spam with no remaining purpose.)
         if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) {
             CORE_ACTIVE_TICKS.get(cid).0.fetch_add(1, Ordering::Relaxed);
             // Credit the running task this quantum - the per-task CPU% source for `observe`
@@ -1092,7 +1165,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             // Capture prev's user RSP now (other tasks run before prev is rescheduled, overwriting it).
             if TASK_VALID[prev].load(Ordering::Relaxed) && TASK_IS_USER[prev] {
                 TASK_USER_RSP[prev] =
-                    crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[cid].user_rsp;
+                    (*crate::arch::x86_64::syscall_entry::syscall_slot(cid)).user_rsp;
             }
             let current_ctx: *mut TaskContext = if !TASK_VALID[prev].load(Ordering::Relaxed) {
                 // prev self-killed - discard into CORE_DEAD_CTX (never resumed).
@@ -1164,7 +1237,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             // rescheduled, overwriting PER_CORE_SYSCALL.user_rsp, so capture it now.
             if TASK_VALID[prev].load(Ordering::Relaxed) && TASK_IS_USER[prev] {
                 TASK_USER_RSP[prev] =
-                    crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[cid].user_rsp;
+                    (*crate::arch::x86_64::syscall_entry::syscall_slot(cid)).user_rsp;
             }
             let current_ctx: *mut TaskContext = if !TASK_VALID[prev].load(Ordering::Relaxed) {
                 // prev self-killed (e.g. the supervisor itself) - discard into CORE_DEAD_CTX.
@@ -1192,17 +1265,49 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             return;
         }
 
-        TASK_STATE[next].store(TaskState::Running as u8, Ordering::Relaxed);
-        CORE_CURRENT.get(cid).store(next, Ordering::Relaxed);
+        // V3 (kernel-audit-2): claim `next` with a CAS (mirror the next==prev path
+        // above) so a cross-core kill's Dead is not overwritten; then complete the
+        // Dekker handshake with kill_task_by_slot (store Dead; SeqCst fence; load
+        // CORE_CURRENT) by publishing CORE_CURRENT, fencing, and re-reading STATE.
+        // If a kill won the pick->publish race it may have already freed `next`'s
+        // page tables, so `abort_to_sched` re-routes prev to the scheduler context
+        // rather than let switch_context load a freed CR3. All accesses SeqCst so
+        // the two sides cannot both miss each other's store.
+        let mut abort_to_sched = TASK_STATE[next]
+            .compare_exchange(
+                TaskState::Ready as u8,
+                TaskState::Running as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err();
+        if !abort_to_sched {
+            CORE_CURRENT.get(cid).store(next, Ordering::SeqCst);
+            core::sync::atomic::fence(Ordering::SeqCst);
+            abort_to_sched =
+                TASK_STATE[next].load(Ordering::SeqCst) != TaskState::Running as u8;
+        }
+        if abort_to_sched {
+            // Leave CORE_CURRENT off `next` so the racing kill's spin-wait proceeds.
+            CORE_CURRENT.get(cid).store(IDLE, Ordering::SeqCst);
+            if prev >= MAX_TASKS {
+                // Core was idle (in run()'s loop) - nothing to switch out; return to it.
+                return;
+            }
+            // else: fall through and switch `prev` (set Ready by the CAS at the top
+            // of the tick) to the scheduler context via the shared switch below.
+        }
 
         // Save BEFORE prepare_ring3_switch so we capture the value from the last
         // SYSCALL entry for `prev`, not the value prepare_ring3_switch writes for `next`.
         if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) && TASK_IS_USER[prev] {
             TASK_USER_RSP[prev] =
-                crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[cid].user_rsp;
+                (*crate::arch::x86_64::syscall_entry::syscall_slot(cid)).user_rsp;
         }
 
-        if TASK_IS_USER[next] {
+        // On abort we do not enter `next`; only prepare the ring-3 switch when we
+        // are actually switching to it.
+        if !abort_to_sched && TASK_IS_USER[next] {
             prepare_ring3_switch(cid, next);
         }
 
@@ -1217,8 +1322,16 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             TASK_CTX[prev].assume_init_mut() as *mut TaskContext
         };
 
-        let next_ctx: *const TaskContext =
-            TASK_CTX[next].assume_init_ref() as *const TaskContext;
+        // Normal path: switch into `next`. Abort path (kill won the race): switch
+        // `prev` to the scheduler context instead, where it is rescheduled - never
+        // loading `next`'s possibly-freed page table. (prev >= MAX_TASKS already
+        // returned above, so current_ctx here is a real task ctx, distinct from the
+        // scheduler ctx - never the same-pointer switch the contract forbids.)
+        let next_ctx: *const TaskContext = if abort_to_sched {
+            CORE_SCHED_CTX.as_ptr(cid)
+        } else {
+            TASK_CTX[next].assume_init_ref() as *const TaskContext
+        };
 
         switch_context(current_ctx, next_ctx);
     }
@@ -1237,6 +1350,10 @@ pub fn yield_current() {
 
         // Count each scheduler quantum (yield or timer) for CPU utilisation.
         CORE_TOTAL_TICKS.get(cid).0.fetch_add(1, Ordering::Relaxed);
+        // A yield IS forward progress - stamp the liveness heartbeat too, so the cross-core watchdog
+        // (timer_tick_from_irq) never mistakes a heavily-yielding core (one making progress via syscalls
+        // rather than timer preemption) for a stalled one.
+        CORE_LAST_TICK_TSC.get(cid).0.store(crate::arch::x86_64::read_cycle_counter(), Ordering::Relaxed);
         if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) {
             CORE_ACTIVE_TICKS.get(cid).0.fetch_add(1, Ordering::Relaxed);
             // Credit the running task this quantum - the per-task CPU% source for `observe`
@@ -1307,7 +1424,7 @@ pub fn yield_current() {
         if cid == 0 && prev < MAX_TASKS && crate::task::supervisor_respawn_pending() {
             if TASK_VALID[prev].load(Ordering::Relaxed) && TASK_IS_USER[prev] {
                 TASK_USER_RSP[prev] =
-                    crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[cid].user_rsp;
+                    (*crate::arch::x86_64::syscall_entry::syscall_slot(cid)).user_rsp;
             }
             let current_ctx: *mut TaskContext = if !TASK_VALID[prev].load(Ordering::Relaxed) {
                 CORE_DEAD_CTX.as_mut_ptr(cid)   // prev self-killed - discard (never resumed)
@@ -1340,7 +1457,7 @@ pub fn yield_current() {
         // entry, not the value prepare_ring3_switch is about to write for `next`.
         if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) && TASK_IS_USER[prev] {
             TASK_USER_RSP[prev] =
-                crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[cid].user_rsp;
+                (*crate::arch::x86_64::syscall_entry::syscall_slot(cid)).user_rsp;
         }
 
         if TASK_IS_USER[next] {
@@ -1558,7 +1675,14 @@ pub fn kill_task_by_slot(slot: usize) {
         }
         // Atomically claim this kill: set Dead under the lock so no concurrent
         // call can also proceed past this point for the same slot.
-        TASK_STATE[slot].store(TaskState::Dead as u8, Ordering::Release);
+        // SeqCst (not Release): this store is one half of the Dekker handshake with
+        // the scheduler's pick-then-commit (V3, kernel-audit-2). The scheduler does
+        // store(CORE_CURRENT=next, SeqCst); fence; load(STATE, SeqCst); this side
+        // does store(STATE=Dead, SeqCst); load(CORE_CURRENT, SeqCst) in the spin
+        // below. With all four accesses in the single SeqCst total order, the two
+        // sides cannot both miss each other, so a kill can never free a task's page
+        // tables while a core is committing a switch into it.
+        TASK_STATE[slot].store(TaskState::Dead as u8, Ordering::SeqCst);
         false
     };
     task_slot_unlock();
@@ -1635,6 +1759,26 @@ pub fn kill_task_by_slot(slot: usize) {
             // re-registers on respawn; clients briefly see a lookup miss and retry.
             crate::ipc::names::unregister_endpoint(task_name, ep_id);
 
+            // Driver-death IRQ-route teardown (Item 2, driver-death quiesce), BEFORE freeing the id.
+            // A driver that registered a hw_interrupt line left a route in IRQ_TABLE; the id is about to
+            // be freed and REUSED, and IRQ_TABLE keys on a bare endpoint id, so a reused id could inherit
+            // the dead driver's interrupts. Clear the route and mask the line now (while the id is still
+            // ours); the respawned driver re-registers and re-opens its gate. The vectors mirror the
+            // ServiceConfig hw_irqs (task/mod.rs) - the same by-name device coupling the DMA-quiesce block
+            // below already uses; block-driver + nic-driver currently declare no hw_irq.
+            let dead_irq: u8 = match task_name {
+                "xhci" => 0x28,
+                "ehci" => 0x29,
+                _ => 0xFF,
+            };
+            if dead_irq != 0xFF {
+                crate::interrupt::route::unregister(dead_irq);
+                // Mask the source: effective for a level/INTx line (the ehci); a no-op for edge/MSI (the
+                // xhci), whose stray MSI is already harmless once the route is None (deliver finds no
+                // endpoint) and stops at the respawned driver's HCRST.
+                crate::arch::x86_64::ioapic::mask_vector(dead_irq);
+            }
+
             // Reclaim the endpoint id itself for reuse (§14.2). Its routing entry is Dead and its
             // resource generation is bumped, so handing the id out again is safe: the next endpoint to
             // take it is seeded at a strictly higher generation (task::spawn), so a stale cap to this
@@ -1705,18 +1849,22 @@ pub fn kill_task_by_slot(slot: usize) {
         // remaining work + the spin-wait); the respawned driver re-enables bus-mastering during init.
         // block-driver (AHCI) is included; xhci is confined (its stray DMA would fault, not corrupt) but
         // quiescing it too is harmless + correct on a no-IOMMU machine where it is passthrough as well.
-        if task_name == "xhci" || task_name == "ehci" || task_name == "block-driver" {
+        if task_name == "xhci" || task_name == "ehci" || task_name == "block-driver"
+            || task_name == "nic-driver"
+        {
             use core::sync::atomic::Ordering::Relaxed;
             use crate::arch::x86_64::pci;
             let bdf = match task_name {
-                "xhci" => pci::XHCI_BDF.load(Relaxed),
-                "ehci" => pci::EHCI_BDF.load(Relaxed),
-                _      => pci::AHCI_BDF.load(Relaxed), // block-driver
+                "xhci"       => pci::XHCI_BDF.load(Relaxed),
+                "ehci"       => pci::EHCI_BDF.load(Relaxed),
+                "nic-driver" => pci::NIC_BDF.load(Relaxed),
+                _            => pci::AHCI_BDF.load(Relaxed), // block-driver
             };
             pci::clear_bus_master(bdf);
             // H1: revert the IOMMU DTE to passthrough + free the I/O page table so a restart re-confines
-            // cleanly (no-op if the device wasn't confined). xhci/ehci only; AHCI has no IOMMU domain yet.
-            if task_name != "block-driver" {
+            // cleanly (no-op if the device wasn't confined). Confined USB drivers (xhci/ehci) only; AHCI
+            // + nic-driver run in IOMMU passthrough, so there is no DTE to revert.
+            if task_name == "xhci" || task_name == "ehci" {
                 crate::arch::x86_64::iommu::release_device(bdf);
             }
         }
@@ -1761,8 +1909,12 @@ pub fn kill_task_by_slot(slot: usize) {
                 loop {
                     // Compiler + hardware barrier: reload CORE_CURRENT[cid] from
                     // memory on every iteration; do not use a cached register value.
+                    // SeqCst load (V3): the other half of the Dekker handshake with
+                    // the scheduler's store(CORE_CURRENT=next, SeqCst) - all four
+                    // conflicting accesses are SeqCst so the two sides cannot both
+                    // miss each other. (The fence is now redundant but harmless.)
                     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-                    if CORE_CURRENT.get(cid).load(Ordering::Relaxed) != slot { break; }
+                    if CORE_CURRENT.get(cid).load(Ordering::SeqCst) != slot { break; }
                     core::hint::spin_loop();
                 }
             }
@@ -1944,7 +2096,7 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
         // load this task's RSP, not the value another task wrote to PER_CORE_SYSCALL.
         if TASK_IS_USER[slot] {
             TASK_USER_RSP[slot] =
-                crate::arch::x86_64::syscall_entry::PER_CORE_SYSCALL[cid].user_rsp;
+                (*crate::arch::x86_64::syscall_entry::syscall_slot(cid)).user_rsp;
         }
 
         match pick_next(cid) {

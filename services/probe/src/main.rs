@@ -71,7 +71,7 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{service_context::AllocError, CapError, CapHandle, IpcError, Message, ServiceContext};
+use godspeed_sdk::{adversarial, service_context::AllocError, CapError, CapHandle, IpcError, Message, ServiceContext};
 
 #[allow(dead_code)]
 const MODE_PASSIVE:         u32 = 0;
@@ -159,6 +159,12 @@ const MODE_ADV_A10:         u32 = 90; // kernel addresses as syscall args → re
 // Chaos-test modes - Milestone 14.
 const MODE_CHAOS_C2:        u32 = 91; // null-deref → page fault → kernel kills service
 const MODE_CHAOS_C2_MON:    u32 = 92; // 1,000 yields then log pass (C2 witness)
+// A14 (kernel-audit regression): a ring-3 CPU exception must KILL the task, never halt the kernel.
+const MODE_ADV_FAULT_GP:    u32 = 210; // ring-3 #GP (non-canonical read) → kernel kills service
+const MODE_ADV_FAULT_DE:    u32 = 211; // ring-3 #DE (inline-asm div0)    → kernel kills service
+const MODE_ADV_FAULT_MON:   u32 = 212; // witness: yields then logs pass (system survived both faults)
+const MODE_ADV_FAULT_UC:    u32 = 213; // A15/V1: bad user pointer to `log` → kernel kills caller (USER-COPY PF)
+const MODE_ADV_FAULT_UC_MON: u32 = 214; // A15 witness: yields then logs pass (system survived the user-copy fault)
 const MODE_CHAOS_C3:        u32 = 93; // 500 alloc-deny cycles without panic
 const MODE_CHAOS_C5:        u32 = 94; // 100-level recursive yield_cpu(); stack depth probe
 const MODE_CHAOS_C6_MON:    u32 = 95; // 200 yields then log pass on core 0 (C6 witness)
@@ -402,6 +408,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         MODE_XSEND_RECV      => mode_xsend_recv(&ctx),
         MODE_XLIFE           => mode_xlife(&ctx),
         MODE_XLIFE_VICTIM    => idle(&ctx),
+        MODE_ADV_FAULT_GP    => mode_adv_fault_gp(&ctx),
+        MODE_ADV_FAULT_DE    => mode_adv_fault_de(&ctx),
+        MODE_ADV_FAULT_MON   => mode_adv_fault_mon(&ctx),
+        MODE_ADV_FAULT_UC    => mode_adv_fault_usercopy(&ctx),
+        MODE_ADV_FAULT_UC_MON => mode_adv_fault_usercopy_mon(&ctx),
         _                    => idle(&ctx),
     }
 }
@@ -887,31 +898,11 @@ fn mode_prop_p7(ctx: &ServiceContext) -> ! {
 // Fuzz-test modes - Milestone 10 Phase 1.
 // ---------------------------------------------------------------------------
 
-/// Issue a raw SYSCALL instruction - used ONLY by fuzz modes.
-///
-/// # Safety
-/// Must NOT be called with nr=9 (Abort) - that syscall intentionally panics.
-/// Pointer args (a1, a2) must be null or kernel-space addresses so that
-/// validate_user_slice rejects them before user memory is touched.
-#[cfg(target_arch = "x86_64")]
-unsafe fn probe_raw_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
-    let ret: i64;
-    // SAFETY: SYSCALL from ring-3 is always safe; see safety doc on nr above.
-    core::arch::asm!(
-        "syscall",
-        inout("rax") nr => ret,
-        inout("rdi") a0 => _,
-        inout("rsi") a1 => _,
-        inout("rdx") a2 => _,
-        lateout("rcx") _,
-        lateout("r11") _,
-        lateout("r8")  _,
-        lateout("r9")  _,
-        lateout("r10") _,
-        options(nostack),
-    );
-    ret
-}
+// probe's raw-SYSCALL asm wrapper and its deliberate ring-3 faults moved to the SDK's audited
+// `adversarial` module (fuzz_syscall + fault_*), so this test service is now `unsafe`-free (§18.2),
+// exactly as the driver services are (§18.1). fuzz_syscall uses the SDK's `ud2` trap - which, unlike the
+// raw SYSCALL instruction this used, does not stall from ring-3 on the AMD GX-420GI (a latent hazard
+// removed as well; probe is test-only, but the inconsistency is gone).
 
 fn mode_fuzz_f1(ctx: &ServiceContext) -> ! {
     // F1 - Random syscall args (§22 Fuzz F1).
@@ -965,7 +956,7 @@ fn mode_fuzz_f1(ctx: &ServiceContext) -> ! {
             let a1 = A1S[(iter as usize) % A1S.len()];
             let a2 = A2S[(iter as usize) % A2S.len()];
             // SAFETY: nr != 9 (Abort); a1/a2 fail validate_user_slice.
-            unsafe { probe_raw_syscall(nr, a0, a1, a2); }
+            adversarial::fuzz_syscall(nr, a0, a1, a2);
         }
     }
     ctx.log("fuzz: F1 pass (100/10)");
@@ -986,7 +977,7 @@ fn mode_fuzz_f2(ctx: &ServiceContext) -> ! {
         // Add 100 to push it into the unknown range.
         let nr = if raw <= 15 { raw + 100 } else { raw };
         // SAFETY: nr is not in 1-15 → falls through dispatch to _ => -1; no panic.
-        let ret = unsafe { probe_raw_syscall(nr, 0, 0, 0) };
+        let ret = adversarial::fuzz_syscall(nr, 0, 0, 0);
         // Unknown syscalls must return -1 (UnknownSyscall).
         if ret != -1 { bad += 1; }
     }
@@ -1794,11 +1785,9 @@ fn mode_adv_a10(ctx: &ServiceContext) -> ! {
     ];
     for &addr in KERN_ADDRS {
         // SAFETY: addr fails validate_user_slice before any kernel-mode dereference.
-        unsafe {
-            probe_raw_syscall(2, 0, addr, 4096); // Send with kernel-addr msg_ptr
-            probe_raw_syscall(2, 0, addr, 0);    // Send with kernel-addr, len=0
-            probe_raw_syscall(3, 0, addr, 4096); // Recv with kernel-addr buf_ptr
-        }
+        adversarial::fuzz_syscall(2, 0, addr, 4096); // Send with kernel-addr msg_ptr
+        adversarial::fuzz_syscall(2, 0, addr, 0);    // Send with kernel-addr, len=0
+        adversarial::fuzz_syscall(3, 0, addr, 4096); // Recv with kernel-addr buf_ptr
     }
     ctx.log("adv: A10 pass - kernel addrs as syscall args rejected without panic");
     idle(ctx)
@@ -1935,18 +1924,26 @@ fn mode_adv_ba5(ctx: &ServiceContext) -> ! {
 }
 
 fn mode_adv_ba6(ctx: &ServiceContext) -> ! {
-    // BA6: Fill cap table × 5 cycles - each fill hits exhaustion, None returned (§22 Brutal Adv BA6).
+    // BA6: fill the cap table to exhaustion, DRAIN it, and repeat 5x - each cycle must genuinely hit
+    // exhaustion and recover (§22 Brutal Adv BA6). Draining between cycles is what makes all 5 real:
+    // without the remove_cap below, cycle 0 filled the table and cycles 1-4 saw it ALREADY full and did
+    // nothing (filled=0) - a trivially-passing test proves nothing (audit L6). CAP_MAX exceeds the
+    // kernel per-task cap-table size, so every acquired handle is tracked and returned.
+    const CAP_MAX: usize = 128;
+    let mut held = [CapHandle(0); CAP_MAX];
     for cycle in 0..5u32 {
-        let mut count = 0u32;
+        let mut count = 0usize;
         loop {
             match ctx.acquire_send_cap("adv-ba6") {
-                Some(_) => count += 1,
+                Some(h) => { if count < CAP_MAX { held[count] = h; } count += 1; }
                 None    => break,
             }
         }
+        // Drain every cap we took so the NEXT cycle fills from EMPTY - a real exhaustion again, not a no-op.
+        for h in held.iter().take(count.min(CAP_MAX)) { ctx.remove_cap(*h); }
         ctx.log_fmt(format_args!("adv: BA6 cycle={cycle} filled={count}"));
     }
-    ctx.log("adv: BA6 pass - 5× cap-table fill returned None without panic");
+    ctx.log("adv: BA6 pass - 5x fill-to-exhaustion + drain, each cycle real, no panic");
     idle(ctx)
 }
 
@@ -2002,10 +1999,8 @@ fn mode_adv_ba10(ctx: &ServiceContext) -> ! {
     ];
     for &addr in ADDRS {
         // SAFETY: addr fails validate_user_slice before any kernel-mode dereference.
-        unsafe {
-            probe_raw_syscall(2, 0, addr, 4096);
-            probe_raw_syscall(3, 0, addr, 4096);
-        }
+        adversarial::fuzz_syscall(2, 0, addr, 4096);
+        adversarial::fuzz_syscall(3, 0, addr, 4096);
     }
     ctx.log("adv: BA10 pass - 20 kernel addr patterns rejected without panic");
     idle(ctx)
@@ -2020,7 +2015,7 @@ fn mode_chaos_c2(_ctx: &ServiceContext) -> ! {
     // The kernel delivers a page fault and kills this service without panicking.
     // chaos-c2-monitor witnesses the system continuing.
     // SAFETY: intentional fault for chaos test C2; kernel kills before any further use.
-    unsafe { core::ptr::read_volatile(core::ptr::null::<u8>()); }
+    adversarial::fault_null_read();
     loop { core::hint::spin_loop(); }
 }
 
@@ -2029,6 +2024,55 @@ fn mode_chaos_c2_monitor(ctx: &ServiceContext) -> ! {
     // chaos-c2 was killed by the kernel's page-fault handler (§22 Chaos C2).
     for _ in 0..100u32 { ctx.yield_cpu(); }
     ctx.log("chaos: C2 pass - system continued after non-TCB page fault");
+    idle(ctx)
+}
+
+fn mode_adv_fault_gp(_ctx: &ServiceContext) -> ! {
+    // A14 - ring-3 #GP: a non-canonical memory access (bit 47 != bit 63) raises #GP(0) at CPL3. The
+    // kernel must KILL this service (log "USER GPF (killing task)"), NOT halt the machine - the class the
+    // commandment audit (C1) fixed. adv-fault-mon witnesses the system continuing.
+    // SAFETY: intentional fault for regression test A14; the kernel kills the task before any further use.
+    adversarial::fault_noncanonical_read();
+    loop { core::hint::spin_loop(); }
+}
+
+fn mode_adv_fault_de(_ctx: &ServiceContext) -> ! {
+    // A14 - ring-3 #DE: an integer divide-by-zero raises #DE (vector 0) at CPL3. Raw inline asm because
+    // Rust inserts a divide guard (it would panic, not fault); the threat model includes adversarial/asm
+    // services. The kernel must KILL this service (log "USER EXCEPTION (killing task)"), NOT halt.
+    // SAFETY: intentional fault for regression test A14; the kernel kills the task before any further use.
+    adversarial::fault_divide_by_zero();
+    loop { core::hint::spin_loop(); }
+}
+
+fn mode_adv_fault_mon(ctx: &ServiceContext) -> ! {
+    // A14 witness: the two faulters run on other cores; yield long enough for both to fault and be killed,
+    // then log pass - proving the kernel KILLED the ring-3 faulters and the system continued rather than
+    // wedging (invariant 12; kernel-audit C1/C2). If the fix were wrong the kernel would halt and this
+    // line would never print (the test times out / trips its KERNEL-fault fail_on).
+    for _ in 0..1000u32 { ctx.yield_cpu(); }
+    ctx.log("adv: A14 pass - ring-3 #GP + #DE killed the task, kernel alive");
+    idle(ctx)
+}
+
+fn mode_adv_fault_usercopy(_ctx: &ServiceContext) -> ! {
+    // A15 - V1 (kernel-audit-2): pass an in-range but UNMAPPED user pointer to a syscall that copies it.
+    // log (syscall 5) = handle_log(cap_slot, msg_ptr, msg_len): cap_slot 0 is the log_write cap every
+    // service holds; msg_ptr 0x1000 is < USER_END so validate_user_ptr accepts the RANGE, but the page is
+    // unmapped; len 16. read_user_bytes then copies from 0x1000 into the kernel scratch and faults at
+    // CPL0. The kernel must attribute it to THIS caller ("USER-COPY PF (killing caller)") and KILL us -
+    // never treat it as a KERNEL PF and halt_all_cores (the whole-machine DoS any bad pointer used to be).
+    // SAFETY: intentional bad-pointer syscall for regression test A15; the kernel kills the task mid-copy.
+    let _ = adversarial::fuzz_syscall(5, 0, 0x1000, 16);
+    loop { core::hint::spin_loop(); }
+}
+
+fn mode_adv_fault_usercopy_mon(ctx: &ServiceContext) -> ! {
+    // A15 witness: the faulter passes a bad pointer to `log` on another core; yield long enough for it to
+    // fault and be killed, then log pass - proving the kernel killed the CALLER at the user-copy rather
+    // than halting (invariant 12; kernel-audit V1). A wrong fix halts every core and this never prints.
+    for _ in 0..1000u32 { ctx.yield_cpu(); }
+    ctx.log("adv: A15 pass - bad user pointer killed the caller, kernel alive");
     idle(ctx)
 }
 
@@ -2518,7 +2562,7 @@ fn mode_fuzz_bf1(ctx: &ServiceContext) -> ! {
             let a1 = A1S[(iter as usize) % A1S.len()];
             let a2 = A2S[(iter as usize) % A2S.len()];
             // SAFETY: nr != 9 (Abort); a1/a2 fail validate_user_slice.
-            unsafe { probe_raw_syscall(nr, a0, a1, a2); }
+            adversarial::fuzz_syscall(nr, a0, a1, a2);
         }
     }
     ctx.log("fuzz: BF1 pass (500/10)");
@@ -2533,7 +2577,7 @@ fn mode_fuzz_bf2(ctx: &ServiceContext) -> ! {
         let raw = xorshift64(&mut rng);
         let nr = if raw <= 15 { raw + 100 } else { raw };
         // SAFETY: nr > 15 → dispatch _ arm → returns -1; no panic.
-        let ret = unsafe { probe_raw_syscall(nr, 0, 0, 0) };
+        let ret = adversarial::fuzz_syscall(nr, 0, 0, 0);
         if ret != -1 { bad += 1; }
     }
     if bad > 0 {

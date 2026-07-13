@@ -2,7 +2,8 @@
 //! Physical frame allocator - §10.
 //!
 //! Bitmap allocator: one bit per 4 KiB frame.  0 = used, 1 = free.
-//! Covers up to 4 GiB of physical address space (128 KiB of bitmap in .bss).
+//! The bitmap is sized to the machine's ACTUAL RAM at boot and carved from RAM (reached via the HHDM) -
+//! no fixed compile-time cap and no wasted .bss; a bounded arena, not a heap (§26.6.1). See `init_from_map`.
 //! All frames start marked used; `init_from_map` opens the usable regions.
 //!
 //! SMP-safe: ALLOC_LOCKED spinlock serialises alloc_frame / free_frame across
@@ -42,19 +43,41 @@ fn guard_bugcheck(phys: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// Bitmap - lives in .bss (zero-init = every frame starts as "used").
+// Frame bitmaps - carved from RAM at boot, sized to the machine's ACTUAL RAM.
+//
+// No fixed compile-time cap and no waste (§26.6.1: a bounded ARENA sized once to the natural bound - all
+// of physical memory - not a heap; it is reserved once at init and never resized). `init_from_map` reads
+// the memory map, sizes the two bitmaps to the highest RAM frame present, carves one contiguous region
+// for them out of the top of the largest usable region (well above the kernel's low-memory page-table
+// frames), and reaches them through the HHDM. `BITMAP` = the free map (0 = used, 1 = free); `KPT` = the
+// kernel-PT-protected map `free_frame` must never release. Both are set once and read via the slices
+// below. Unlike a fixed static bitmap (which reserved GiB of .bss to cover RAM a machine may not have),
+// this costs exactly `RAM / 16 KiB` (both bitmaps) and scales to any RAM.
 // ---------------------------------------------------------------------------
 
 const FRAME_SIZE_USIZE: usize = FRAME_SIZE as usize;
-const MAX_FRAMES: usize = (8 * 1024 * 1024 * 1024_usize) / FRAME_SIZE_USIZE;
-const BITMAP_BYTES: usize = MAX_FRAMES / 8; // 256 KiB
 
-// 0 = used, 1 = free; zero-init means all used at startup.
-static mut BITMAP: [u8; BITMAP_BYTES] = [0u8; BITMAP_BYTES];
+static mut BITMAP_PTR: *mut u8 = core::ptr::null_mut(); // free bitmap, at an HHDM virtual address
+static mut KPT_PTR:    *mut u8 = core::ptr::null_mut(); // kernel-PT-protected bitmap
+static mut BITMAP_LEN: usize = 0; // bytes per bitmap = ceil(max_ram_frame / 8); the frame cap is ALLOCATOR.max_ram_frame
 
-// 1 = permanently protected kernel PT frame; free_frame will refuse to free these.
-// Set by protect_kernel_page_table_frames(); never cleared.
-static mut KERNEL_PT_PROTECTED: [u8; BITMAP_BYTES] = [0u8; BITMAP_BYTES];
+/// The free bitmap as a slice (HHDM-backed).
+/// # Safety
+/// `BITMAP_PTR`/`BITMAP_LEN` are set once by `init_from_map` before any alloc/free; the caller holds
+/// `ALLOC_LOCKED` (single writer across cores), so the returned `&mut` is not aliased.
+#[inline]
+unsafe fn bitmap() -> &'static mut [u8] {
+    // SAFETY: ptr+len are a valid, uniquely-owned (under ALLOC_LOCKED) RAM region set at init.
+    unsafe { core::slice::from_raw_parts_mut(BITMAP_PTR, BITMAP_LEN) }
+}
+/// The kernel-PT-protected bitmap as a slice.
+/// # Safety
+/// As [`bitmap`].
+#[inline]
+unsafe fn kpt() -> &'static mut [u8] {
+    // SAFETY: as bitmap(); KPT_PTR is a disjoint region (BITMAP_PTR + BITMAP_LEN).
+    unsafe { core::slice::from_raw_parts_mut(KPT_PTR, BITMAP_LEN) }
+}
 
 // ---------------------------------------------------------------------------
 // Allocator.
@@ -100,50 +123,88 @@ impl BitmapAllocator {
         }
     }
 
-    // SAFETY: caller must guarantee single-threaded access; called once by BSP during memory::init.
+    // SAFETY: caller must guarantee single-threaded access; called once by BSP during memory::init,
+    // AFTER set_hhdm_offset (the bitmaps live at HHDM virtual addresses).
     unsafe fn init_from_map(&mut self, boot_info: &BootInfo) {
         let kstart = boot_info.kernel_phys_start;
         let kend   = boot_info.kernel_phys_end;
+        let hhdm   = boot_info.hhdm_offset;
+        if hhdm == 0 {
+            panic!("allocator: HHDM offset not set before init - bitmaps live in the HHDM");
+        }
 
+        // Pass 1: measure RAM and find where to put the bitmaps.
+        //  - max_ram_frame: highest frame across ALL RAM-backed regions (usable + reclaimable + kernel).
+        //    The bitmaps must cover THIS, because protect_kernel_page_table_frames marks kernel PT frames
+        //    Limine placed in bootloader-reclaimable RAM ABOVE usable RAM. (Same extent phys_in_ram uses.)
+        //  - max_valid_frame: highest USABLE frame (the frames actually handed out / freed).
+        //  - largest usable region: where the bitmaps get carved from (its top).
+        let mut largest_start = 0u64;
+        let mut largest_len   = 0u64;
         for region in boot_info.memory_map {
-            // Track the RAM extent for `phys_in_ram` (the page-table walk guard): include ALL
-            // RAM-backed regions the HHDM covers, not just usable, so a legit page table Limine
-            // placed in bootloader-reclaimable / kernel RAM (above usable RAM) is not flagged as
-            // out-of-RAM. A truly corrupt entry (phys far beyond total RAM) is still caught.
             if matches!(region.kind, MemoryKind::Usable | MemoryKind::AcpiReclaimable
                                    | MemoryKind::KernelImage | MemoryKind::BootloaderReclaimable) {
                 let ram_last = ((region.base + region.len + FRAME_SIZE - 1) / FRAME_SIZE) as usize;
                 if ram_last > self.max_ram_frame { self.max_ram_frame = ram_last; }
             }
-            if !matches!(region.kind, MemoryKind::Usable) {
-                continue;
-            }
-            // Align inward so we only hand out fully-contained frames.
+            if !matches!(region.kind, MemoryKind::Usable) { continue; }
+            let start = frame_align_up(region.base);
+            let end   = frame_align_down(region.base + region.len);
+            if end <= start { continue; }
+            let last = (end / FRAME_SIZE) as usize;
+            if last > self.max_valid_frame { self.max_valid_frame = last; }
+            if end - start > largest_len { largest_len = end - start; largest_start = start; }
+        }
+
+        // Size the two bitmaps to cover every frame the allocator can touch (0..max_ram_frame).
+        let frame_cap   = self.max_ram_frame;
+        let bitmap_len  = (frame_cap + 7) / 8;                              // bytes per bitmap
+        let need        = 2 * bitmap_len;                                   // both bitmaps, contiguous
+        let need_frames = (need + FRAME_SIZE_USIZE - 1) / FRAME_SIZE_USIZE;
+
+        // Carve the bitmap region from the TOP of the largest usable region. High memory is well clear of
+        // the kernel's page-table frames, which Limine places in LOW usable RAM at/below [kstart, kend)
+        // (the exact frames protect_kernel_page_table_frames guards), so the carve cannot clobber a live
+        // PT. Loud panic (invariant 12) if - impossibly - no region can hold the bitmap.
+        if (largest_len / FRAME_SIZE) < need_frames as u64 {
+            panic!("allocator: largest usable region ({} KiB) too small for the {} KiB frame bitmap",
+                   largest_len / 1024, need / 1024);
+        }
+        let carve_last_f  = (largest_start + largest_len) / FRAME_SIZE;     // exclusive, top of the region
+        let carve_first_f = carve_last_f - need_frames as u64;
+        let carve_phys    = carve_first_f * FRAME_SIZE;
+        let carve_first   = carve_first_f as usize;
+        let carve_last    = carve_last_f as usize;
+
+        // Publish the bitmap pointers (HHDM-backed) + geometry, then zero both (all frames start "used").
+        BITMAP_PTR = (hhdm + carve_phys) as *mut u8;
+        // SAFETY: BITMAP_PTR + bitmap_len is inside the just-reserved 2*bitmap_len region.
+        KPT_PTR    = unsafe { BITMAP_PTR.add(bitmap_len) };
+        BITMAP_LEN = bitmap_len;
+        // SAFETY: the carve region is RAM the HHDM maps read/write; reserved, not yet handed out.
+        unsafe { core::ptr::write_bytes(BITMAP_PTR, 0, need) };
+        crate::kprintln!(
+            "allocator: frame bitmap {} KiB x2 covers {} frames ({} MiB), carved at phys {:#x} (top of largest region)",
+            bitmap_len / 1024, frame_cap, (frame_cap * FRAME_SIZE_USIZE) / (1024 * 1024), carve_phys
+        );
+
+        // Pass 2: open the usable frames, skipping the kernel image AND the bitmaps' own frames.
+        for region in boot_info.memory_map {
+            if !matches!(region.kind, MemoryKind::Usable) { continue; }
             let start = frame_align_up(region.base);
             let end   = frame_align_down(region.base + region.len);
             if start >= end { continue; }
-
             let first = (start / FRAME_SIZE) as usize;
             let last  = (end   / FRAME_SIZE) as usize; // exclusive
-
-            // Track the highest valid frame so free_frame can reject phantom
-            // addresses (page-table entries from corrupted/reanimated tasks).
-            if last > self.max_valid_frame {
-                self.max_valid_frame = last;
-            }
-
             for idx in first..last {
-                if idx >= MAX_FRAMES { break; }
-                // Skip frames that back the kernel image (text, data, BSS).
-                // Kernel stacks (KSTACK_STORAGE) live in BSS; handing those
-                // frames to a service loader would zero live kernel stacks.
-                if kend > kstart {
-                    let frame_phys = idx as u64 * FRAME_SIZE;
-                    if frame_phys >= kstart && frame_phys < kend {
-                        continue;
-                    }
-                }
-                // SAFETY: idx within BITMAP bounds; single-threaded init.
+                if idx >= frame_cap { break; }
+                let frame_phys = idx as u64 * FRAME_SIZE;
+                // Skip frames that back the kernel image (text, data, BSS); kernel stacks live in BSS,
+                // handing those out would zero live kernel stacks.
+                if kend > kstart && frame_phys >= kstart && frame_phys < kend { continue; }
+                // Skip the bitmaps' own storage (carved above) so alloc never hands it out.
+                if idx >= carve_first && idx < carve_last { continue; }
+                // SAFETY: idx < frame_cap == FRAME_CAP → within BITMAP_LEN; single-threaded init.
                 unsafe { bitmap_set_free(idx) };
                 self.free_frames += 1;
             }
@@ -153,17 +214,18 @@ impl BitmapAllocator {
 
     // SAFETY: caller must hold ALLOC_LOCKED; BITMAP and ALLOCATOR are exclusively accessible under the lock.
     unsafe fn alloc(&mut self) -> Option<Frame> {
-        // SAFETY: exclusive access guaranteed by single-core invariant (v1).
-        let bitmap = unsafe { &mut *core::ptr::addr_of_mut!(BITMAP) };
+        // SAFETY: lock held; bitmap() is the HHDM-backed free map, uniquely owned under ALLOC_LOCKED.
+        let bitmap = unsafe { bitmap() };
+        let len = bitmap.len();
 
         // Scan from hint, wrap if not found.
-        let idx = scan_free(bitmap, self.next_byte, BITMAP_BYTES)
+        let idx = scan_free(bitmap, self.next_byte, len)
             .or_else(|| scan_free(bitmap, 0, self.next_byte))?;
 
         // Mark used.
         bitmap[idx / 8] &= !(1u8 << (idx % 8));
         self.free_frames -= 1;
-        self.next_byte = (idx / 8 + 1).min(BITMAP_BYTES - 1);
+        self.next_byte = (idx / 8 + 1).min(len - 1);
 
         let phys_addr = idx as u64 * FRAME_SIZE;
         // Guard: panic if we're about to hand out a kernel-image frame.
@@ -189,9 +251,9 @@ impl BitmapAllocator {
         if n == 0 {
             return None;
         }
-        // SAFETY: exclusive access guaranteed by the lock.
-        let bitmap = unsafe { &mut *core::ptr::addr_of_mut!(BITMAP) };
-        let max = (self.max_valid_frame + 1).min(MAX_FRAMES);
+        // SAFETY: lock held; bitmap() is uniquely owned under ALLOC_LOCKED.
+        let bitmap = unsafe { bitmap() };
+        let max = (self.max_valid_frame + 1).min(self.max_ram_frame);
         let mut run = 0usize;
         let mut start = 0usize;
         let mut found = None;
@@ -258,23 +320,28 @@ impl BitmapAllocator {
         // re-animated dead task) is walked and freed.  Setting a bit for an
         // out-of-range frame would allow alloc to return a phantom address,
         // which would then fault the kernel on its next HHDM access.
-        if idx >= self.max_valid_frame {
+        // Reject phantom frames above usable RAM, AND any frame at/above the bitmap's capacity
+        // (max_ram_frame - the highest RAM frame the bitmaps were sized to cover). max_valid_frame <=
+        // max_ram_frame by construction, so the second bound is defensive: it guarantees `byte = idx/8`
+        // is within the bitmaps regardless, so a corrupt/stale PTE (from a re-animated dead task) can
+        // never OOB-index BITMAP / KPT (the release build compiles out the debug_assert below).
+        if idx >= self.max_valid_frame || idx >= self.max_ram_frame {
             crate::kprintln!(
-                "free_frame: IGNORED phantom frame idx={} (max_valid={})",
-                idx, self.max_valid_frame
+                "free_frame: IGNORED phantom frame idx={} (max_valid={}, cap={})",
+                idx, self.max_valid_frame, self.max_ram_frame
             );
             return;
         }
-        debug_assert!(idx < MAX_FRAMES, "free_frame: address out of range");
+        debug_assert!(idx < self.max_ram_frame, "free_frame: address out of range");
         // Defense-in-depth: refuse to free a frame that was marked as a kernel
         // intermediate page-table frame by protect_kernel_page_table_frames().
         // If such a frame ever appears in a reclaim buffer, freeing it would
         // re-open it for alloc → walk_or_alloc zeros it → KERNEL PF on the
         // next access to the kernel virtual region it was mapping.
-        // SAFETY: KERNEL_PT_PROTECTED is written once at init; read-only here.
+        // SAFETY: KPT is written under the lock; read-only here (lock held by free_frame).
         let byte = idx / 8;
         let bit  = idx % 8;
-        if unsafe { KERNEL_PT_PROTECTED[byte] } & (1u8 << bit) != 0 {
+        if unsafe { kpt() }[byte] & (1u8 << bit) != 0 {
             crate::kprintln!(
                 "free_frame: REFUSED to free kernel PT frame idx={} phys={:#x}",
                 idx, idx as u64 * FRAME_SIZE
@@ -337,10 +404,11 @@ fn scan_free(bitmap: &[u8], start: usize, end: usize) -> Option<usize> {
 unsafe fn bitmap_set_free(idx: usize) -> bool {
     let byte = idx / 8;
     let bit  = 1u8 << (idx % 8);
-    // SAFETY: idx < MAX_FRAMES (caller-checked); BITMAP is the frame bitmap, mutated under ALLOC_LOCKED.
+    // SAFETY: idx < max_ram_frame (caller-checked) => byte < BITMAP_LEN; mutated under ALLOC_LOCKED.
     unsafe {
-        let was_free = BITMAP[byte] & bit != 0;
-        BITMAP[byte] |= bit;
+        let bm = bitmap();
+        let was_free = bm[byte] & bit != 0;
+        bm[byte] |= bit;
         was_free
     }
 }
@@ -359,14 +427,37 @@ fn frame_align_down(addr: u64) -> u64 {
 
 static ALLOC_LOCKED: AtomicBool = AtomicBool::new(false);
 
+/// Watchdog bound for the ALLOC_LOCKED spin. The frame allocator's critical sections are microseconds
+/// (a bitmap scan/flip); spinning past ~10^9 iterations (a few seconds at GHz) means the holder is never
+/// releasing - a task preempted mid-alloc that can't be rescheduled, or a lock-ordering deadlock. This
+/// is the single most-contended lock in the spawn/kill path, and it is HAND-ROLLED (not `SpinLock<T>`),
+/// so the SpinLock watchdog does not cover it. Panic loudly instead of freezing the machine silently
+/// (invariant 12 / §26.7). Huge margin over any real hold, so it cannot false-fire.
+const ALLOC_WATCHDOG_SPINS: u64 = 1_000_000_000;
+
 #[inline]
 fn alloc_lock() {
+    let mut spins: u64 = 0;
     while ALLOC_LOCKED
         .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
+        spins += 1;
+        if spins >= ALLOC_WATCHDOG_SPINS {
+            alloc_lock_wedge(spins);
+        }
         core::hint::spin_loop();
     }
+}
+
+/// Out-of-line loud panic for the frame-allocator lock watchdog (keeps `alloc_lock` lean).
+#[cold]
+#[inline(never)]
+fn alloc_lock_wedge(spins: u64) -> ! {
+    panic!(
+        "frame-allocator (ALLOC_LOCKED) WEDGE: spun {} iters - holder never released (preempted holder / deadlock)",
+        spins
+    );
 }
 
 #[inline]
@@ -556,20 +647,21 @@ unsafe fn pt_read(hhdm: u64, table_phys: u64, idx: usize) -> u64 {
 #[inline]
 unsafe fn mark_pt_frame_used(phys: u64) {
     let idx = (phys / FRAME_SIZE) as usize;
-    if idx >= MAX_FRAMES {
+    // SAFETY: max_ram_frame is set once at init, read-only here.
+    if idx >= unsafe { ALLOCATOR.max_ram_frame } {
         return;
     }
     let byte = idx / 8;
     let bit  = idx % 8;
-    // SAFETY: idx < MAX_FRAMES; lock held.
-    let currently_free = unsafe { BITMAP[byte] } & (1u8 << bit) != 0;
+    // SAFETY: idx < max_ram_frame => byte < BITMAP_LEN; lock held.
+    let currently_free = unsafe { bitmap() }[byte] & (1u8 << bit) != 0;
     if currently_free {
-        unsafe { BITMAP[byte] &= !(1u8 << bit) };
+        unsafe { bitmap()[byte] &= !(1u8 << bit) };
         // SAFETY: free_frames was > 0 because the bit was set.
         unsafe { ALLOCATOR.free_frames -= 1 };
     }
     // Mark as permanently protected: free_frame will refuse to release this
     // frame regardless of how it ends up in a caller's reclaim buffer.
-    // SAFETY: idx < MAX_FRAMES; lock held.
-    unsafe { KERNEL_PT_PROTECTED[byte] |= 1u8 << bit };
+    // SAFETY: idx < max_ram_frame; lock held.
+    unsafe { kpt()[byte] |= 1u8 << bit };
 }

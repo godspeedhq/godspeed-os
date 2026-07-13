@@ -3,14 +3,18 @@ version = "0.1.0"
 
 [resources.memory]
 request = "8MiB"
-limit   = "16MiB"
+limit   = "64MiB"   # the kernel's tested grant (audit T1 reconcile); the supervisor is TCB - keep its
+                    # proven headroom rather than risk a tighter limit on the one service the kernel
+                    # respawns forever (§6.2)
 
 [capabilities]
 # service_control is the exclusive restart/kill capability (§14.4).
 service_control = true
 log_write       = true
-# supervisor reads service binaries and contracts from the filesystem.
-ipc_send        = ["fs"]
+# No ipc_send: the supervisor holds no contract SEND peer. It ADOPTS/wires services by name via
+# `acquire_send_grant_cap` (the kernel directory, §14.3), not a static contract peer, so the kernel
+# grants it send_peers = []. The old `ipc_send = ["fs"]` declared a cap the service never held
+# (audit T1 reconcile).
 ipc_receive     = ["supervisor"]
 
 [placement]

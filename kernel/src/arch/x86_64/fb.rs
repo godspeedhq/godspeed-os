@@ -33,6 +33,16 @@ const RASTER_HEIGHT: RasterHeight = RasterHeight::Size20;
 const CELL_W: usize = get_raster_width(FONT_WEIGHT, RASTER_HEIGHT);
 const CELL_H: usize = RASTER_HEIGHT.val();
 
+/// Integer font-scale factor for the current framebuffer. The glyph raster is a fixed CELL_W x CELL_H
+/// pixels; on a dense panel (the Dell Wyse 5070's native mode) that renders as a wall of tiny text, so
+/// each glyph pixel is upscaled to a `scale x scale` block. Chosen to target ~30 text rows: 1x on a
+/// T630-class panel, ~2x around 1080p, 3x on a very high resolution. Larger cells also mean fewer
+/// rows/cols, so a `scroll` (which repaints every cell) touches fewer cells and boot renders faster.
+#[inline]
+fn cell_scale(s: &Fb) -> usize {
+    ((s.height + 300) / 600).clamp(1, 3)
+}
+
 /// Reserved cell bytes for the **box-drawing** glyphs (`tree`). The grid stores these
 /// high bytes; `draw_box_glyph` renders them with procedural strokes. The UTF-8 decoder
 /// maps `U+2500..U+253C` to them via `cell_for_codepoint`.
@@ -139,6 +149,10 @@ struct Fb {
     // shifts this in RAM and redraws the screen from it, so it never reads the
     // (uncached) framebuffer back.
     grid: [[u8; MAX_COLS]; MAX_ROWS],
+    // Precomputed foreground-blend LUT: blend_lut[intensity] = the glyph-pixel colour for that
+    // antialiasing intensity, composed in the device layout. Lets an antialiased glyph edge blit as a
+    // table read instead of a per-pixel multiply/divide - the last bit of scroll smoothness at 4K.
+    blend_lut: [u32; 256],
 }
 
 static FB: SpinLock<Fb> = SpinLock::new(Fb {
@@ -148,14 +162,18 @@ static FB: SpinLock<Fb> = SpinLock::new(Fb {
     esc: 0, csi_priv: false, csi_params: [0; 3], csi_nparam: 0, utf8_cp: 0, utf8_remaining: 0,
     cursor_visible: true, cur_col: 0, cur_row: 0,
     grid: [[b' '; MAX_COLS]; MAX_ROWS],
+    blend_lut: [0; 256],
 });
 
-/// Safe-area inset per edge, as a percentage of each dimension. TVs overscan (crop ~3-5%
-/// off every edge), which clips the outermost characters at `0`. `5` insets the text by 5%
-/// per edge so it all stays visible without depending on the TV's "Just Scan" / "1:1"
-/// picture mode (which most sets bury or don't offer). Set this to `0` only on a display
-/// known not to overscan, or when the TV is in a 1:1 pixel-mapping mode, for true
-/// edge-to-edge. Harmless on a monitor - just a small border.
+/// Safe-area inset per edge, as a percentage of each dimension. TVs overscan (crop off every
+/// edge), which clips the outermost characters at `0`. This insets the text so it stays visible
+/// without depending on the TV's "Just Scan" / "1:1" picture mode (which most sets bury or don't
+/// offer). `5` is the standard "title-safe" margin (10% total per axis): clipping LOSES text
+/// (functionally bad), a border is merely cosmetic (harmless), so we bias toward the larger inset.
+/// `2` overscanned little on the Wyse's TV but CLIPPED text on the T630's display (lost off the top,
+/// glyphs hard against the side edges), so `5` is the safe default that clears typical consumer
+/// overscan on both. Set to `0` for true edge-to-edge on a display known not to overscan (or in 1:1
+/// mode). On a low-overscan panel this just leaves a thin border - never lose a character to save one.
 const SAFE_PCT: usize = 5;
 
 /// Initialise the console from Limine's framebuffer descriptor. Called once in
@@ -179,8 +197,9 @@ pub fn fb_init(fb: &Framebuffer) {
     // Inset the text area by SAFE_PCT on each edge (0 = edge-to-edge full screen).
     s.org_x = s.width * SAFE_PCT / 100;
     s.org_y = s.height * SAFE_PCT / 100;
-    s.cols = (s.width - 2 * s.org_x) / CELL_W;
-    s.rows = (s.height - 2 * s.org_y) / CELL_H;
+    let sc = ((s.height + 300) / 600).clamp(1, 3); // integer font scale (see cell_scale)
+    s.cols = (s.width - 2 * s.org_x) / (CELL_W * sc);
+    s.rows = (s.height - 2 * s.org_y) / (CELL_H * sc);
     // Clamp the text area to the char-grid shadow bounds (only matters above ~4K).
     s.cols = s.cols.min(MAX_COLS);
     s.rows = s.rows.min(MAX_ROWS);
@@ -192,11 +211,27 @@ pub fn fb_init(fb: &Framebuffer) {
     s.r_shift = rs; s.g_shift = gs; s.b_shift = bs;
     s.fg = make(s.fg_r, s.fg_g, s.fg_b);
     s.bg = make(0x00, 0x00, 0x00);
+    // Precompute the blend LUT (see `blend`): foreground scaled by each 0-255 antialiasing intensity,
+    // composed in the device channel layout. Background is black, so blend_lut[0] == bg (0) and
+    // blend_lut[255] == fg. Turns every glyph-edge pixel into a table read instead of a multiply/divide.
+    for i in 0..256u32 {
+        let (r, g, b) = (s.fg_r * i / 255, s.fg_g * i / 255, s.fg_b * i / 255);
+        s.blend_lut[i as usize] = (r << rs) | (g << gs) | (b << bs);
+    }
     s.esc = 0;
     s.csi_nparam = 0;
     s.cursor_visible = true;
     s.ready = true;
     clear(&mut s);
+    // Report the panel geometry + the chosen font scale (drop the FB lock first: kprintln renders to
+    // this same console, so logging while holding it would re-enter the lock). Confirms the resolution
+    // that drives the scale - the Wyse boots a much denser mode than the T630.
+    let (w, h, bpp, cols, rows) = (s.width, s.height, s.bpp, s.cols, s.rows);
+    drop(s);
+    crate::kprintln!(
+        "fb: {}x{} {}bpp, font-scale {}x -> {} cols x {} rows",
+        w, h, bpp * 8, sc, cols, rows
+    );
 }
 
 /// Framebuffer text geometry packed as `(rows << 16) | cols`, or 0 if the
@@ -483,14 +518,12 @@ fn draw_cursor(s: &mut Fb) {
     let ch = if r < MAX_ROWS && c < MAX_COLS { s.grid[r][c] } else { b' ' };
     draw_glyph(s, ch, c, r);
     // Underline: the bottom ~2 px of the cell, in the foreground colour.
-    let x0 = s.org_x + c * CELL_W;
-    let y0 = s.org_y + r * CELL_H;
-    let th = 2usize.min(CELL_H);
-    for gy in (CELL_H - th)..CELL_H {
-        for gx in 0..CELL_W {
-            put_pixel(s, x0 + gx, y0 + gy, s.fg);
-        }
-    }
+    let sc = cell_scale(s);
+    let (cellw, cellh) = (CELL_W * sc, CELL_H * sc);
+    let x0 = s.org_x + c * cellw;
+    let y0 = s.org_y + r * cellh;
+    let th = (2 * sc).min(cellh);
+    fill_rect(s, x0, y0 + cellh - th, cellw, th, s.fg);
     s.cur_col = c;
     s.cur_row = r;
 }
@@ -548,32 +581,69 @@ fn put_pixel(s: &Fb, x: usize, y: usize, color: u32) {
     // SAFETY: off < height*pitch (x,y bounds-checked; bpp ≤ pitch/width); the
     // framebuffer is mapped for the system lifetime.
     unsafe {
-        let mut i = 0;
-        while i < s.bpp {
-            *base.add(off + i) = (color >> (i * 8)) as u8;
-            i += 1;
+        // 32bpp is the near-universal case: one aligned 32-bit store (off is 4-aligned - pitch and
+        // x*bpp are multiples of 4 for a 32bpp framebuffer) instead of a per-byte loop.
+        if s.bpp == 4 {
+            *(base.add(off) as *mut u32) = color;
+        } else {
+            let mut i = 0;
+            while i < s.bpp {
+                *base.add(off + i) = (color >> (i * 8)) as u8;
+                i += 1;
+            }
         }
     }
 }
 
-/// Blend the foreground toward the background by an antialiasing `intensity` (0-255)
-/// and compose the result into the device's channel layout. 0 ⇒ background, 255 ⇒ full
-/// foreground; in between gives the smooth edges. Because the background is black, this
-/// is just the foreground scaled per channel - but written explicitly so a non-black
-/// background would still compose correctly.
+/// Fill a solid `w x h` pixel rectangle at (x, y). Writes each row as a contiguous run - one aligned
+/// 32-bit store per pixel on the 32bpp path, not a per-byte loop - so glyph upscale-blocks and cell
+/// clears blit fast (write-combining coalesces the sequential stores into bursts). The boot scroll
+/// repaints the whole text area, and on the Wyse's 4K panel a per-pixel byte loop there is exactly
+/// what made it crawl.
+#[inline]
+fn fill_rect(s: &Fb, x: usize, y: usize, w: usize, h: usize, color: u32) {
+    if x >= s.width || y >= s.height {
+        return;
+    }
+    let xw = (x + w).min(s.width);
+    let yh = (y + h).min(s.height);
+    let base = s.base as *mut u8;
+    for yy in y..yh {
+        let row = yy * s.pitch + x * s.bpp;
+        // SAFETY: [row, row + (xw-x)*bpp) is within the mapped framebuffer (x,y,xw,yh clamped to
+        // width/height; bpp*width <= pitch); row is 4-aligned on the 32bpp path. Mapped for life.
+        unsafe {
+            if s.bpp == 4 {
+                let mut p = base.add(row) as *mut u32;
+                for _ in x..xw {
+                    *p = color;
+                    p = p.add(1);
+                }
+            } else {
+                let mut off = row;
+                for _ in x..xw {
+                    let mut i = 0;
+                    while i < s.bpp {
+                        *base.add(off + i) = (color >> (i * 8)) as u8;
+                        i += 1;
+                    }
+                    off += s.bpp;
+                }
+            }
+        }
+    }
+}
+
+/// The glyph-pixel colour for an antialiasing `intensity` (0-255): 0 gives the (black)
+/// background, 255 gives full foreground, and in between gives the smooth edges. Reads
+/// the value straight from `blend_lut`, which `fb_init` precomputes once (foreground
+/// scaled per channel, composed into the device's channel layout).
 #[inline]
 fn blend(s: &Fb, intensity: u8) -> u32 {
-    if intensity == 0 {
-        return s.bg;
-    }
-    if intensity == 255 {
-        return s.fg;
-    }
-    let i = intensity as u32;
-    let r = s.fg_r * i / 255;
-    let g = s.fg_g * i / 255;
-    let b = s.fg_b * i / 255;
-    (r << s.r_shift) | (g << s.g_shift) | (b << s.b_shift)
+    // Table lookup (fb_init precomputed blend_lut[intensity] = fg scaled by intensity, composed in the
+    // device layout), so an antialiased glyph edge is one read instead of three multiplies + three
+    // divides per pixel - the last bit of scroll smoothness on a dense 4K panel.
+    s.blend_lut[intensity as usize]
 }
 
 /// Render one glyph at text cell (col, row). ASCII (`< 0x80`) renders via the
@@ -581,34 +651,65 @@ fn blend(s: &Fb, intensity: u8) -> u32 {
 /// background, so the cell is fully repainted with no stale pixels). The reserved
 /// high bytes render as procedural box-drawing strokes.
 fn draw_glyph(s: &Fb, ch: u8, col: usize, row: usize) {
-    let x0 = s.org_x + col * CELL_W;
-    let y0 = s.org_y + row * CELL_H;
+    let sc = cell_scale(s);
+    let x0 = s.org_x + col * CELL_W * sc;
+    let y0 = s.org_y + row * CELL_H * sc;
     if ch >= BOX_FIRST && box_arms(ch) != (false, false, false, false) {
         draw_box_glyph(s, ch, x0, y0);
         return;
     }
     // Noto raster: `raster()` is `height` rows of `width` intensity bytes; the crate
-    // guarantees those dims equal CELL_H × CELL_W for this weight/size, so iterating the
-    // raster covers the whole cell. An unknown char falls back to a blank cell.
-    match get_raster(ch as char, FONT_WEIGHT, RASTER_HEIGHT) {
-        Some(rc) => {
-            for (gy, rowpix) in rc.raster().iter().enumerate() {
-                for (gx, &intensity) in rowpix.iter().enumerate() {
-                    put_pixel(s, x0 + gx, y0 + gy, blend(s, intensity));
+    // guarantees those dims equal CELL_H x CELL_W for this weight/size, so iterating the
+    // raster covers the whole cell. An unknown char falls back to a blank cell. Each raster
+    // pixel is upscaled to an `sc x sc` device-pixel block so the fixed-size glyph stays
+    // readable on a dense panel (cell_scale); sc == 1 is the original 1:1 path.
+    let rc = match get_raster(ch as char, FONT_WEIGHT, RASTER_HEIGHT) {
+        Some(rc) => rc,
+        None => {
+            clear_cell(s, x0, y0);
+            return;
+        }
+    };
+    let raster = rc.raster();
+    let (cw, chh) = (CELL_W * sc, CELL_H * sc);
+    // The cell lies fully inside the framebuffer (cols/rows are sized to fit) - but guard, so the
+    // unchecked contiguous run below can never write past the mapping (fall back to the safe blit).
+    if s.bpp != 4 || x0 + cw > s.width || y0 + chh > s.height {
+        for (gy, rowpix) in raster.iter().enumerate() {
+            for (gx, &intensity) in rowpix.iter().enumerate() {
+                fill_rect(s, x0 + gx * sc, y0 + gy * sc, sc, sc, blend(s, intensity));
+            }
+        }
+        return;
+    }
+    // Fast 32bpp path: write each output row as ONE contiguous run of `cw` aligned u32 stores (best
+    // write-combining, no per-pixel fill_rect call). Each raster pixel's colour is blended once and
+    // replicated `sc` times horizontally; the raster row is replicated `sc` times vertically.
+    let base = s.base as *mut u8;
+    for (gy, rowpix) in raster.iter().enumerate() {
+        for sy in 0..sc {
+            let yy = y0 + gy * sc + sy;
+            // SAFETY: the whole [x0, x0+cw) x [y0, y0+chh) cell is in-bounds (checked above); this
+            // writes exactly `cw` pixels of row `yy`, and yy < height, x0+cw <= width. bpp == 4 so
+            // `x0*4` and `pitch` are multiples of 4 - the u32 stores are aligned. Mapped for life.
+            unsafe {
+                let mut p = base.add(yy * s.pitch + x0 * 4) as *mut u32;
+                for &intensity in rowpix.iter() {
+                    let color = blend(s, intensity);
+                    for _ in 0..sc {
+                        *p = color;
+                        p = p.add(1);
+                    }
                 }
             }
         }
-        None => clear_cell(s, x0, y0),
     }
 }
 
 /// Paint a whole cell to the background colour (used when a char has no raster).
 fn clear_cell(s: &Fb, x0: usize, y0: usize) {
-    for gy in 0..CELL_H {
-        for gx in 0..CELL_W {
-            put_pixel(s, x0 + gx, y0 + gy, s.bg);
-        }
-    }
+    let sc = cell_scale(s);
+    fill_rect(s, x0, y0, CELL_W * sc, CELL_H * sc, s.bg);
 }
 
 /// Draw a procedural box-drawing glyph at pixel origin (x0, y0). Each present arm is a
@@ -616,13 +717,15 @@ fn clear_cell(s: &Fb, x0: usize, y0: usize) {
 /// connect into continuous lines. Stroke thickness is ~2 px, centred on the cell axes.
 fn draw_box_glyph(s: &Fb, ch: u8, x0: usize, y0: usize) {
     clear_cell(s, x0, y0);
+    let sc = cell_scale(s);
+    let (cellw, cellh) = (CELL_W * sc, CELL_H * sc);
     let (up, down, left, right) = box_arms(ch);
-    let th = (CELL_W / 5).max(2); // stroke thickness in px (~2 at Size20)
-    let vx = CELL_W.saturating_sub(th) / 2; // left edge of the vertical stroke band
-    let hy = CELL_H.saturating_sub(th) / 2; // top edge of the horizontal stroke band
+    let th = (cellw / 5).max(2); // stroke thickness in px (~2*sc)
+    let vx = cellw.saturating_sub(th) / 2; // left edge of the vertical stroke band
+    let hy = cellh.saturating_sub(th) / 2; // top edge of the horizontal stroke band
     let fill = |xs: usize, xe: usize, ys: usize, ye: usize| {
-        for y in ys..ye.min(CELL_H) {
-            for x in xs..xe.min(CELL_W) {
+        for y in ys..ye.min(cellh) {
+            for x in xs..xe.min(cellw) {
                 put_pixel(s, x0 + x, y0 + y, s.fg);
             }
         }
@@ -633,14 +736,14 @@ fn draw_box_glyph(s: &Fb, ch: u8, x0: usize, y0: usize) {
         fill(vx, vx + th, 0, hy + th);
     }
     if down {
-        fill(vx, vx + th, hy, CELL_H);
+        fill(vx, vx + th, hy, cellh);
     }
     // Horizontal arms span the stroke rows [hy, hy+th).
     if left {
         fill(0, vx + th, hy, hy + th);
     }
     if right {
-        fill(vx, CELL_W, hy, hy + th);
+        fill(vx, cellw, hy, hy + th);
     }
 }
 

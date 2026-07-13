@@ -207,8 +207,26 @@ fn respawn_managed(ctx: &ServiceContext, map: &mut NameCapMap, name: &str) -> bo
         "fs"        => spawn_wired(ctx, map, "fs", &["block-driver"]),
         "shell"     => spawn_wired(ctx, map, "shell", &["fs"]),
         "net-stack" => spawn_wired(ctx, map, "net-stack", &["nic-driver"]),
+        "counter"   => spawn_wired(ctx, map, "counter", &["fs"]),
         other       => spawn_mapped(ctx, map, other, 0xFFFF),
     }
+}
+
+/// Respawn `name` with a small BOUNDED retry (audit M5). A steady-state respawn can hit a TRANSIENT
+/// failure - NoMemory / CapTableFull the instant another service is mid-reclaim (frames/kstack/caps not
+/// yet returned). A single attempt then logs "restart FAILED" and strands the service until the NEXT
+/// death notification, which for an ISOLATED death may never arrive. Retry a few times with a yield
+/// between - letting the transient shortage clear - before giving up loudly. Bounded (invariant 12): it
+/// can never hang; a persistently-failing service still returns false and is reported by the caller. In
+/// the common case the first attempt succeeds, so this costs exactly one try. (A STORM is separately
+/// covered by the `reconcile` backstop riding the next notification; this closes the isolated case.)
+fn respawn_retry(ctx: &ServiceContext, map: &mut NameCapMap, name: &str) -> bool {
+    const TRIES: u32 = 5;
+    for _ in 0..TRIES {
+        if respawn_managed(ctx, map, name) { return true; }
+        ctx.yield_cpu();   // let a transient resource shortage (mid-reclaim) clear before retrying
+    }
+    false
 }
 
 /// Reconcile to desired state: respawn any managed restartable service that is NOT actually alive. A
@@ -220,7 +238,11 @@ fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap) -> u32 {
     let alive = managed_alive(ctx);
     let mut n = 0;
     for i in 0..MANAGED_N {
-        if alive[i] { continue; }
+        // Skip a service this build never spawned (absent from the map) - e.g. a driver whose hardware
+        // the PCI scan did not find (ehci/nic-driver/net-stack, below). Without this, reconcile would
+        // "resurrect" a deliberately-skipped driver on the first death notification, undoing the skip.
+        // Mirrors converge's `map.get(...).is_none()` guard.
+        if alive[i] || map.get(MANAGED[i]).is_none() { continue; }
         if respawn_managed(ctx, map, MANAGED[i]) {
             n += 1;
             ctx.log_fmt(format_args!("supervisor: reconcile respawned {} (missed death notification)", MANAGED[i]));
@@ -432,8 +454,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         ensure_wired(&ctx, &mut name_map, "resource-server", &["holder"]);
     }
 
-    // xhci: USB host-controller driver (§12). Spawned in bare-metal + full
-    // builds; the kernel maps its controller's MMIO BAR at spawn (Stage 2).
+    // xhci: USB host-controller driver (§12). Spawned in bare-metal + full builds; the kernel maps its
+    // controller's MMIO BAR at spawn (Stage 2). ALWAYS spawned (unlike ehci/nic-driver below): xhci is
+    // the near-universal primary USB controller, and even with no controller its idle path signals
+    // input-ready - the boot-screen clear that lets the shell show `gsh>`. Skipping it would leave the
+    // serial shell waiting for a prompt forever, so the idle-core cost on a (rare) xHCI-less machine is
+    // the right trade.
     #[cfg(not(any(feature = "identity-only", feature = "perf-only",
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
@@ -441,17 +467,28 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     spawn_mapped(&ctx, &mut name_map, "xhci", 0xFFFF);
 
     // ehci: USB 2.0 host-controller driver (§12) for the back ports. Same builds
-    // as xhci; the kernel grants its MMIO/DMA at spawn (E1b+).
+    // as xhci; the kernel grants its MMIO/DMA at spawn (E1b+). Skipped if the PCI
+    // scan found no EHCI controller (e.g. the Wyse 5070 has none), freeing the core
+    // an idle ehci would busy-hold.
     #[cfg(not(any(feature = "identity-only", feature = "perf-only",
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
-    spawn_mapped(&ctx, &mut name_map, "ehci", 0xFFFF);
+    if ctx.ehci_present() {
+        spawn_mapped(&ctx, &mut name_map, "ehci", 0xFFFF);
+    } else {
+        ctx.log("supervisor: no EHCI controller (PCI scan) - not starting ehci (frees a core)");
+    }
 
     // nic-driver: the userspace NIC driver (§12, docs/networking.md, Phase 1). Same builds as the
     // USB drivers; the kernel maps the Intel e1000's BAR0 by name at spawn. On a non-e1000 NIC
     // (the T630's Realtek) it gets no mapping and idles. Restart-on-death wiring (the MANAGED set)
     // lands with the DMA/IRQ phase, when it holds device state worth recovering.
+    //
+    // ALWAYS spawned (unlike ehci above): a NIC exists on nearly all hardware, so a presence-gated skip
+    // (`ctx.nic_present()`, query 18 bit2) was parked as low-value. The SDK accessor stays for an easy
+    // resume. On a NIC-less / unsupported-NIC box nic-driver + net-stack come up and idle gracefully
+    // (nic-driver serves empty replies; net-stack degrades, no hang).
     #[cfg(not(any(feature = "identity-only", feature = "perf-only",
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
@@ -520,12 +557,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         match name {
             "block-driver" => {
                 ctx.log("supervisor: block-driver died, restarting");
-                if spawn_mapped(&ctx, &mut name_map, "block-driver", 0xFFFF) { ctx.log("supervisor: block-driver restarted"); }
+                if respawn_retry(&ctx, &mut name_map, "block-driver") { ctx.log("supervisor: block-driver restarted"); }
                 else { ctx.log("supervisor: block-driver restart FAILED"); }
             }
             "fs" => {
                 ctx.log("supervisor: fs died, restarting");
-                if spawn_wired(&ctx, &mut name_map, "fs", &["block-driver"]) { ctx.log("supervisor: fs restarted"); }
+                if respawn_retry(&ctx, &mut name_map, "fs") { ctx.log("supervisor: fs restarted"); }
                 else { ctx.log("supervisor: fs restart FAILED"); }
             }
             "shell" => {
@@ -535,7 +572,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // service_control caps and wiring its `fs` peer from the map. The in-flight command
                 // is lost (state is not resumed, §14.2/§25) but the session recovers.
                 ctx.log("supervisor: shell died, restarting");
-                if spawn_wired(&ctx, &mut name_map, "shell", &["fs"]) { ctx.log("supervisor: shell restarted"); }
+                if respawn_retry(&ctx, &mut name_map, "shell") { ctx.log("supervisor: shell restarted"); }
                 else { ctx.log("supervisor: shell restart FAILED"); }
             }
             // The USB host drivers + logger are directly restartable now: their OWN death respawns
@@ -544,17 +581,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // max-carnage` that kills `xhci`/`ehci` in its last rounds from leaving the keyboard dead.
             "xhci" => {
                 ctx.log("supervisor: xhci died, restarting");
-                if spawn_mapped(&ctx, &mut name_map, "xhci", 0xFFFF) { ctx.log("supervisor: xhci restarted"); }
+                if respawn_retry(&ctx, &mut name_map, "xhci") { ctx.log("supervisor: xhci restarted"); }
                 else { ctx.log("supervisor: xhci restart FAILED"); }
             }
             "ehci" => {
                 ctx.log("supervisor: ehci died, restarting");
-                if spawn_mapped(&ctx, &mut name_map, "ehci", 0xFFFF) { ctx.log("supervisor: ehci restarted"); }
+                if respawn_retry(&ctx, &mut name_map, "ehci") { ctx.log("supervisor: ehci restarted"); }
                 else { ctx.log("supervisor: ehci restart FAILED"); }
             }
             "logger" => {
                 ctx.log("supervisor: logger died, restarting");
-                if spawn_mapped(&ctx, &mut name_map, "logger", 0xFFFF) { ctx.log("supervisor: logger restarted"); }
+                if respawn_retry(&ctx, &mut name_map, "logger") { ctx.log("supervisor: logger restarted"); }
                 else { ctx.log("supervisor: logger restart FAILED"); }
             }
             // counter (examples/counter, counter-test build): respawn it wired to `fs` - the fresh
@@ -562,7 +599,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // are what `osdev test counter` gates on. (Only ever sent when counter is actually live.)
             "counter" => {
                 ctx.log("supervisor: counter died, restarting");
-                if spawn_wired(&ctx, &mut name_map, "counter", &["fs"]) { ctx.log("supervisor: counter restarted"); }
+                if respawn_retry(&ctx, &mut name_map, "counter") { ctx.log("supervisor: counter restarted"); }
                 else { ctx.log("supervisor: counter restart FAILED"); }
             }
             // The NIC stack is restartable too: nic-driver re-grants its MMIO/DMA/IRQ (its DMA arena is
@@ -571,12 +608,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // name (§14.3). net-stack also reacquires nic-driver by name, so either death order recovers.
             "nic-driver" => {
                 ctx.log("supervisor: nic-driver died, restarting");
-                if spawn_mapped(&ctx, &mut name_map, "nic-driver", 0xFFFF) { ctx.log("supervisor: nic-driver restarted"); }
+                if respawn_retry(&ctx, &mut name_map, "nic-driver") { ctx.log("supervisor: nic-driver restarted"); }
                 else { ctx.log("supervisor: nic-driver restart FAILED"); }
             }
             "net-stack" => {
                 ctx.log("supervisor: net-stack died, restarting");
-                if spawn_wired(&ctx, &mut name_map, "net-stack", &["nic-driver"]) { ctx.log("supervisor: net-stack restarted"); }
+                if respawn_retry(&ctx, &mut name_map, "net-stack") { ctx.log("supervisor: net-stack restarted"); }
                 else { ctx.log("supervisor: net-stack restart FAILED"); }
             }
             _ => {}
@@ -725,6 +762,15 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = ctx.spawn("adv-a8-witness");
     let _ = ctx.spawn("adv-a9");
     let _ = ctx.spawn("adv-a10");
+    // A14 (kernel-audit C1/C2 regression): two ring-3 faulters (#GP, #DE) that must be KILLED by the
+    // kernel, and a monitor that witnesses the system surviving both. Self-contained, no peers.
+    let _ = ctx.spawn("adv-fault-gp");
+    let _ = ctx.spawn("adv-fault-de");
+    let _ = ctx.spawn("adv-fault-mon");
+    // A15 (kernel-audit V1 regression): a bad user pointer to a syscall must kill the CALLER, not halt
+    // the machine. A faulter (bad ptr to `log`) + a monitor that witnesses the system surviving.
+    let _ = ctx.spawn("adv-fault-usercopy");
+    let _ = ctx.spawn("adv-fault-usercopy-mon");
 }
 
 // fuzz-only: spawn only the §22 fuzz probe services (F1/F2/F5/F6/F7/F8 + brutal

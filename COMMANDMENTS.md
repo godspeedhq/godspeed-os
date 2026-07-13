@@ -22,8 +22,34 @@ new CPU architectures, and bug fixes are welcome. New *responsibilities* are not
 Before proposing a kernel change, ask: **"Why isn't this a service?"** If the answer is "because it
 is more convenient," it belongs outside the kernel.
 
+**Why the kernel stays tiny - and why that boundary is a reward, not a restriction.**
+
+The kernel is audited regularly and exhaustively against these Commandments (the living record is
+`docs/kernel-audit.md`).
+
+The cost of that audit does not grow linearly with the kernel - it grows with the interactions between
+its responsibilities. A real audit never examines each responsibility in isolation; it cross-checks
+every responsibility against every other, looking for shared state, lock ordering, fault propagation,
+hidden assumptions, and the cracks between subsystems where the most dangerous bugs emerge.
+
+Every new responsibility therefore creates more than additional code. It creates additional
+interactions that must be understood, verified, and trusted. In practice, N responsibilities produce
+roughly N² relationships to reason about.
+
+A tiny kernel can be audited end-to-end. Its guiding promise - that nothing above it may panic or wedge
+it - can be continuously verified rather than merely hoped for. Add one more responsibility, and the
+increase in trust required is far greater than the increase in code.
+
+A bounded kernel is therefore not a limitation imposed on the architecture. It is the property that
+makes the architecture continuously auditable, and therefore trustworthy. Every responsibility refused
+permanently reduces future audit effort, shrinks the privileged attack and failure surface, and keeps
+the kernel's guarantees affordable to verify.
+
+**Refuse responsibility, and be rewarded.**
+
 > *Grounded in:* §4.3-§4.4 (kernel scope and anti-scope), §26.10 (the kernel is mechanism, not
-> policy), Invariant 4 (the kernel remains tiny).
+> policy), §26.11 (understandability is a hard requirement - the 30-minute whiteboard rule), §22 (the
+> identity/audit suites that keep the guarantee executable), Invariant 4 (the kernel remains tiny).
 
 ---
 
