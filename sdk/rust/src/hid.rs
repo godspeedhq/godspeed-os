@@ -164,6 +164,22 @@ impl KeyRepeat {
         KeyRepeat { key: 0, mods: 0, caps: false, next_at: 0, initial, interval }
     }
 
+    /// Construct a repeat CALIBRATED to this machine's real TSC rate, so the feel is ~300 ms
+    /// initial / ~50 ms interval on ANY CPU - not just a ~2 GHz one. `ticks_per_10ms` is
+    /// `ServiceContext::tsc_ticks_per_10ms()` (TSC cycles in 10 ms, PIT-calibrated by the kernel).
+    /// It is 0 only when the TSC was not calibrated (QEMU, which has no USB HID keyboard anyway);
+    /// there we fall back to ~2 GHz cycle counts. This removes the hidden "assume 2 GHz" that made a
+    /// single keypress repeat into `qqqqq` on a differently-clocked part (the Goldmont+ Wyse).
+    pub fn new_calibrated(ticks_per_10ms: u64) -> Self {
+        if ticks_per_10ms == 0 {
+            // Uncalibrated (QEMU): assume ~2 GHz. 600M cycles ~= 300 ms, 100M ~= 50 ms.
+            KeyRepeat::new(600_000_000, 100_000_000)
+        } else {
+            // 300 ms = 30 * (cycles in 10 ms); 50 ms = 5 * (cycles in 10 ms).
+            KeyRepeat::new(ticks_per_10ms.saturating_mul(30), ticks_per_10ms.saturating_mul(5))
+        }
+    }
+
     fn arm(&mut self, key: u8, mods: u8, caps: bool, now: u64) {
         self.key = key;
         self.mods = mods;

@@ -453,13 +453,28 @@ fn complete_tab(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd) {
     let seg_start = bytes[..tok_start].iter().rposition(|&b| b == b'|').map(|i| i + 1).unwrap_or(0);
     // The token is the segment's COMMAND if only spaces sit between the segment start and it.
     let is_command = bytes[seg_start..tok_start].iter().all(|&b| b == b' ');
+    // Does this segment's command take FILE PATHS as arguments? A service-name / number / keyword
+    // command (chaos, kill, ping, ...) never does, so Tab past its keyword must NOT list the
+    // filesystem (which wrongly surfaced /.gsh_history, e.g. `chaos max-carnage all-services <tab>`
+    // landing on the rounds arg). Computed here while `bytes` is borrowed, before any mutating call.
+    let seg_cmd = bytes[seg_start..].split(|&b| b == b' ').find(|w| !w.is_empty());
+    let is_no_path = seg_cmd.map(|c| NO_PATH_CMDS.iter().any(|k| k.as_bytes() == c)).unwrap_or(false);
 
     if is_command {
         complete_from_list(ctx, line, tok_start, UTILS);          // command name (after a `|` too)
-    } else if !complete_keyword(ctx, line, seg_start, tok_start) {
-        complete_path(ctx, line, cwd, tok_start);                 // not a keyword → file path
+    } else if !complete_keyword(ctx, line, seg_start, tok_start) && !is_no_path {
+        complete_path(ctx, line, cwd, tok_start);                 // not a keyword and takes paths → file path
     }
 }
+
+/// Commands whose arguments are service names, numbers, or fixed keywords - NEVER file paths. Tab at
+/// an argument position for these must not list the filesystem (which surfaced /.gsh_history). Their
+/// keyword/target arguments are completed in `complete_keyword`; anything past that has no completion,
+/// rather than falling through to path completion. (Path-taking commands - ls/read/write/mkdir/... -
+/// are absent, so they still path-complete.)
+const NO_PATH_CMDS: &[&str] = &[
+    "chaos", "kill", "spawn", "restart", "ping", "net", "drives", "observe", "date", "uptime",
+];
 
 /// Commands whose FIRST argument (the token right after the command, within its pipe segment) is a
 /// fixed keyword - completed only at that position. Pipe-stage verbs (`to`/`from`/`sort`/`match`) are

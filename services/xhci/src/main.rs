@@ -77,12 +77,10 @@ const MAX_SCRATCHPAD: usize = 256; // arena room = XHCI_DMA_PAGES (288) - 32
 /// Maximum HID devices bound on one controller at once (keyboard + mouse).
 const MAX_HID: usize = 2;
 
-/// Typematic auto-repeat delays, in TSC cycles (`ctx.read_tsc()` units). Sized for a
-/// ~2 GHz CPU (the T630): ~300 ms before the first repeat, then ~50 ms apart (~20/s).
-/// Auto-repeat is forgiving, so a 1.5-3 GHz spread just shifts the feel a little; no
-/// per-machine calibration needed. read_tsc is hardware-proven to advance (perf §22).
-const REPEAT_INITIAL_CYCLES: u64 = 600_000_000;
-const REPEAT_INTERVAL_CYCLES: u64 = 100_000_000;
+// Typematic auto-repeat delays are CALIBRATED per-machine from the TSC rate at the keyboard-poll
+// setup (`KeyRepeat::new_calibrated(ctx.tsc_ticks_per_10ms())`), not hardcoded here: assuming ~2 GHz
+// made one keypress repeat into `qqqqq` on the differently-clocked Goldmont+ Wyse. read_tsc is
+// hardware-proven to advance (perf §22); tsc_ticks_per_10ms is the kernel's PIT-calibrated rate.
 /// Recovery hold after a root-port reset before addressing the device (Item 3, Fix 3). USB 2.0 requires
 /// a reset-recovery interval (TRSTRCY >= 10 ms) before a device can accept transactions; without it a
 /// high-speed root-port device (the Wyse's port 6) NAKs/times out on the Address Device SET_ADDRESS and
@@ -1507,9 +1505,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut hub_probe_logged = false; // log the first downstream-status probe per session (diagnostic)
         let mut hub_none_logged = [false; MAX_HID]; // an inconclusive None logs at most ONCE per device (no spam)
         let mut kb_last = [[0u8; 6]; MAX_HID];
+        // Auto-repeat delays calibrated to THIS machine's TSC rate (0 under QEMU -> ~2 GHz fallback),
+        // so the repeat feels the same on any CPU instead of assuming ~2 GHz (the Goldmont+ Wyse ran
+        // the old hardcoded delays too fast - one keypress became `qqqqq`).
+        let rep_ticks = ctx.tsc_ticks_per_10ms();
         let mut kb_rep = [
-            godspeed_sdk::hid::KeyRepeat::new(REPEAT_INITIAL_CYCLES, REPEAT_INTERVAL_CYCLES),
-            godspeed_sdk::hid::KeyRepeat::new(REPEAT_INITIAL_CYCLES, REPEAT_INTERVAL_CYCLES),
+            godspeed_sdk::hid::KeyRepeat::new_calibrated(rep_ticks),
+            godspeed_sdk::hid::KeyRepeat::new_calibrated(rep_ticks),
         ];
         let mut kb_caps = [false; MAX_HID]; // Caps Lock latch per keyboard (host-tracked toggle)
         let mut mouse = [
