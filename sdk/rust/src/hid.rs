@@ -164,19 +164,26 @@ impl KeyRepeat {
         KeyRepeat { key: 0, mods: 0, caps: false, next_at: 0, initial, interval }
     }
 
-    /// Construct a repeat CALIBRATED to this machine's real TSC rate, so the feel is ~300 ms
-    /// initial / ~50 ms interval on ANY CPU - not just a ~2 GHz one. `ticks_per_10ms` is
-    /// `ServiceContext::tsc_ticks_per_10ms()` (TSC cycles in 10 ms, PIT-calibrated by the kernel).
-    /// It is 0 only when the TSC was not calibrated (QEMU, which has no USB HID keyboard anyway);
-    /// there we fall back to ~2 GHz cycle counts. This removes the hidden "assume 2 GHz" that made a
-    /// single keypress repeat into `qqqqq` on a differently-clocked part (the Goldmont+ Wyse).
+    /// Construct a repeat CALIBRATED to this machine's real TSC rate. `ticks_per_10ms` is
+    /// `ServiceContext::tsc_ticks_per_10ms()` (TSC cycles in 10 ms, PIT-calibrated by the kernel);
+    /// it is 0 only when the TSC was not calibrated (QEMU / the T630's periodic-timer path, which
+    /// has no calibrated quantum), where we fall back to ~2 GHz cycle counts (~300 ms / ~50 ms).
+    ///
+    /// The CALIBRATED path uses a deliberately CONSERVATIVE ~600 ms initial delay (not 300 ms). The
+    /// math for 300 ms is provably correct (30 * ticks_per_10ms), yet the Goldmont+ Wyse still
+    /// over-repeated at that threshold - its RDTSC appears to advance a little faster under load than
+    /// the boot-time PIT calibration captured, so a 300 ms cycle budget elapsed in less than 300 ms of
+    /// wall-clock and normal typing tripped the repeat. A 600 ms budget requires a clearly deliberate
+    /// hold, absorbing that drift with margin. The interval (~50 ms) is unchanged; only the trigger
+    /// threshold moved. The fallback (T630) is left at its known-good ~300 ms - the drift is specific
+    /// to the calibrated part.
     pub fn new_calibrated(ticks_per_10ms: u64) -> Self {
         if ticks_per_10ms == 0 {
-            // Uncalibrated (QEMU): assume ~2 GHz. 600M cycles ~= 300 ms, 100M ~= 50 ms.
+            // Uncalibrated (QEMU / T630 periodic): ~2 GHz. 600M cycles ~= 300 ms, 100M ~= 50 ms.
             KeyRepeat::new(600_000_000, 100_000_000)
         } else {
-            // 300 ms = 30 * (cycles in 10 ms); 50 ms = 5 * (cycles in 10 ms).
-            KeyRepeat::new(ticks_per_10ms.saturating_mul(30), ticks_per_10ms.saturating_mul(5))
+            // ~600 ms initial = 60 * (cycles in 10 ms); ~50 ms interval = 5 * (cycles in 10 ms).
+            KeyRepeat::new(ticks_per_10ms.saturating_mul(60), ticks_per_10ms.saturating_mul(5))
         }
     }
 
