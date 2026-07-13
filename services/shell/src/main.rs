@@ -3583,7 +3583,7 @@ fn cmd_assert(ctx: &ServiceContext, cwd: &mut Cwd, rest: &str, depth: u8) -> Res
 // render identically and a tweak updates every one at once.
 // ---------------------------------------------------------------------------
 
-const UTIL_VERSION: &str = "0.3.0";
+const UTIL_VERSION: &str = "0.3.1";
 
 /// Utilities that self-document (gates the `help`/`version` intercept in `execute`).
 const UTILS: &[&str] = &[
