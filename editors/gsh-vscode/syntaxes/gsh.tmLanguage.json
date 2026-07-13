@@ -94,8 +94,8 @@
     },
     "variable": {
       "patterns": [
-        { "match": "\\$[A-Za-z_][A-Za-z0-9_]*", "name": "variable.other.gsh" },
-        { "match": "\\$([0-9]|@|#)", "name": "variable.parameter.gsh" }
+        { "match": "\\$(arg[1-9]|args|argcount|self)\\b", "name": "variable.parameter.gsh" },
+        { "match": "\\$[A-Za-z_][A-Za-z0-9_]*", "name": "variable.other.gsh" }
       ]
     },
     "number": {

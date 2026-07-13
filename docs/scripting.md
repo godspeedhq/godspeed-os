@@ -5,7 +5,7 @@
 > overflow (a 10 MB script truncates at ~7 KiB and runs, never OOMs - `osdev test big-script` 6/6). The
 > output-capture cluster (`for line in (producer)`, `if myfn`, `$(fn)`) closed the set. Tier 1 (Slices
 > 1-3): `let`/`let mut` + reassignment, `$`-expansion
-> (`$name`, `"..."`) + params (`$1..$9`, `$@`, `$#`, `$0`), `fail` (§3, §8); `if`/`else if`/`else`
+> (`$name`, `"..."`) + params (`$arg1..$arg9`, `$args`, `$argcount`, `$self`), `fail` (§3, §8); `if`/`else if`/`else`
 > with comparisons (`== != < > <= >=`), `in`, `!`, and `result` as a comparable value (§4); and
 > `switch` with multiple values per arm + `_` default, including `switch result` (§6). Pinned by
 > `osdev test files` (a greet-shape param+if+in+switch script runs end to end, both paths).
@@ -22,7 +22,7 @@
 > `from <path> import <name> [as <alias>] …` (selective, aliased) - resolved at LOAD time (each lib is
 > minified + its requested functions appended to the buffer so the pre-scan indexes them), explicit
 > paths, flat namespace, loud on a name collision (`as` resolves it). **Loops** are BUILT too (§5):
-> `for <var> in <words | range N | range A B | $@ | (producer)> { … }`, unbounded `loop { … }` (100k-iteration
+> `for <var> in <words | range N | range A B | $args | (producer)> { … }`, unbounded `loop { … }` (100k-iteration
 > backstop), and `break`/`continue`; a mutable loop counter lives in a fixed slot (overwritten in
 > place - no arena growth over a long loop), and each pass resets the body's locals so a `let` inside
 > is fresh. The byte-line stream form (`for line in (producer)`) is BUILT too; the record-row form
@@ -158,16 +158,16 @@ declaration - and that `let` / `let mut` line is exactly the scope boundary func
 Script parameters - `run greet.gsh Matthew core` (params are immutable, like a function's):
 
 ```
-echo "name=$1 role=$2"         # name=Matthew role=core
-echo "got $# args: $@"          # got 2 args: Matthew core
-echo "script: $0"               # script: greet.gsh
+echo "name=$arg1 role=$arg2"         # name=Matthew role=core
+echo "got $argcount args: $args"          # got 2 args: Matthew core
+echo "script: $self"               # script: greet.gsh
 ```
 
 - `let x = <value>` declares an immutable binding; `let mut x = <value>` a mutable one; `x = …`
   reassigns a mutable binding (loud error on an immutable or undeclared name).
 - A value is a literal word, a `"string"`, a capture `$( … )`, or an **arithmetic expression** (below).
 - `$x` expands; **undefined `$x` is a loud error** (never a silent empty string).
-- `$1 $2 …` positional, `$#` count, `$@` all, `$0` script name.
+- `$arg1 $arg2 …` positional, `$argcount` count, `$args` all, `$self` script name.
 
 **Arithmetic.** Integer expressions, evaluated wherever a **value** is expected - the right of a
 `let`/`let mut`/reassignment, and the operands of a comparison. Operators are `+ - * / %`, with bare
@@ -322,7 +322,7 @@ for row in (status | where state=Running) {   # the ROWS of a record stream
 Iterate params or a literal word list:
 
 ```
-for arg in $@ {
+for arg in $args {
     echo "arg: $arg"
 }
 
@@ -369,7 +369,7 @@ loop {
 - **Not `$( )` here.** `for … in` is command position - the live stream goes in directly (the
   parens are optional readability). `$( )` would *flatten* the command to text and lose `$row.col`;
   `for … in` keeps the stream so it can iterate rows. (`$( )` = "the text"; `for … in` = "the stream".)
-- `for x in a b c` iterates literal words; `for x in $@` iterates the script's params.
+- `for x in a b c` iterates literal words; `for x in $args` iterates the script's params.
 - `for i in range N` / `range A B` counts.
 - `loop { … }` repeats until `break`. There is no `while` - a conditional loop is
   `loop { if !cond { break } … }`, which keeps the exit explicit and visible.
@@ -389,11 +389,11 @@ switch $role {
 ```
 
 ```
-switch $1 {
+switch $arg1 {
     start  { echo "starting" }
     stop   { echo "stopping" }
     status { echo "ok" }
-    _      { fail "unknown command: $1" }
+    _      { fail "unknown command: $arg1" }
 }
 ```
 
@@ -436,8 +436,8 @@ echo $(double 5)                # 10
 
 A function is **just a command** - that's what keeps it coherent with the rest of the language:
 
-- `fn <name> <param…> { … }` - named positional params, bound as `$name` in the body (`$1 … $@
-  $#` also available).
+- `fn <name> <param…> { … }` - named positional params, bound as `$name` in the body (`$arg1 … $args
+  $argcount` also available).
 - **Output is the value, result is the control.** `$(f …)` captures what the function printed;
   its `Ok`/`Err` works in conditions like any command. `return <cond>` ends early with that
   result; falling off the end returns the **last statement's** result (so a helper ending in an
@@ -716,12 +716,12 @@ echo "workspace ready"
 
 ```
 # run greet.gsh <name> <role>
-if $# < 2 {
+if $argcount < 2 {
     fail "usage: run greet.gsh <name> <role>"
 }
 
-let name = $1
-let role = $2
+let name = $arg1
+let role = $arg2
 
 if $role in core worker courier {
     switch $role {
