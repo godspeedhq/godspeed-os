@@ -5,7 +5,9 @@
 # each file row carrying its byte size), `where type=file` keeps the files, `sum size`
 # reduces to the total. Pure composition of the record model - no new walking code
 # (26.2; docs/records.md). Bare `size` sums the whole disk from /.
-if $arg1 == version {
+if $argcount == 0 {
+    find * | where type=file | sum size
+} else if $arg1 == version {
     echo 'size 0.1.0'
     echo 'Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors.'
 } else if $arg1 == help {

@@ -8,7 +8,16 @@
 #
 # Library scripts self-document THROUGH THEIR PARAMS (the user's convention): `$arg1` is
 # checked for the universal `version` / `help` words before the body runs, in gsh itself.
-if $arg1 == version {
+if $argcount == 0 {
+    echo '== GodspeedOS health =='
+    date
+    cores
+    uptime
+    mem
+    net
+    drives
+    echo '== end of health =='
+} else if $arg1 == version {
     echo 'health 0.1.0'
     echo 'Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors.'
 } else if $arg1 == help {
@@ -20,12 +29,5 @@ if $arg1 == version {
     echo '  health version              print the version'
     echo '  health help                 print this message'
 } else {
-    echo '== GodspeedOS health =='
-    date
-    cores
-    uptime
-    mem
-    net
-    drives
-    echo '== end of health =='
+    fail "unknown: health $arg1   (health help for usage)"
 }

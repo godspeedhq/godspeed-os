@@ -8,7 +8,9 @@
 #
 # Built on the `wait` utility (a q-abortable pause): `if !wait 2 { break }` ends the loop
 # the moment q arrives. Pure composition - no new kernel or service surface (26.2).
-if $arg1 == version {
+if $argcount == 0 {
+    fail 'usage: watch <command ...>   (e.g. watch mem; q quits)'
+} else if $arg1 == version {
     echo 'watch 0.1.0'
     echo 'Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors.'
 } else if $arg1 == help {
@@ -20,8 +22,6 @@ if $arg1 == version {
     echo '      e.g. watch net'
     echo '  watch version               print the version'
     echo '  watch help                  print this message'
-} else if $argcount == 0 {
-    fail 'usage: watch <command ...>   (e.g. watch mem; q quits)'
 } else {
     loop {
         clear

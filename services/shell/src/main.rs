@@ -482,7 +482,7 @@ fn complete_tab(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd) {
 /// same commit; a path-taking utility is left out. Opting out of path completion is explicit + per-command.
 const NO_PATH_CMDS: &[&str] = &[
     "chaos", "kill", "spawn", "restart", "ping", "net", "drives", "observe", "date", "uptime",
-    "wait", "watch", "whatis",
+    "wait", "watch", "whatis", "busiest",
 ];
 
 /// Commands whose FIRST argument (the token right after the command, within its pipe segment) is a
@@ -493,6 +493,7 @@ const NO_PATH_CMDS: &[&str] = &[
 /// `<util> version` / `<util> help`), so they are NOT listed here.
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
+    ("busiest", &["mem", "restarts", "queue"]),
     ("date",    &["epoch"]),
     ("net",     &["dns", "stats", "arp", "scan", "renew"]),
     ("drives",  &["flash", "label", "reset", "check", "scrub"]),
@@ -513,8 +514,8 @@ const INFO_CMDS: &[&str] = &[
     "result", "selfcheck", "caps", "help",
     // Library scripts whose only first-arg subcommands are the universal version/help ("size" is
     // absent on purpose - its argument is a path, so it keeps path completion; "watch" has its own
-    // command-name completion case).
-    "health",
+    // command-name completion case; "busiest" completes its column keywords via SUBCMD_FIRST).
+    "health", "online",
 ];
 
 /// Commands with a TRAILING modifier keyword that follows the variable argument(s) - completed at any
@@ -3572,9 +3573,11 @@ const SELFCHECK_GS: &str = include_str!("../../../scripts/selfcheck.gsh");
 /// command runs ONE script layer via `run_lines`, so it is prompt-level only (refused inside another
 /// script - two nested interpreter frames would blow the bounded user stack, [[project-shell-stack-pipe]]).
 const LIBRARY: &[(&str, &str)] = &[
-    ("health", include_str!("../../../scripts/lib/health.gsh")),
-    ("watch",  include_str!("../../../scripts/lib/watch.gsh")),
-    ("size",   include_str!("../../../scripts/lib/size.gsh")),
+    ("health",  include_str!("../../../scripts/lib/health.gsh")),
+    ("watch",   include_str!("../../../scripts/lib/watch.gsh")),
+    ("size",    include_str!("../../../scripts/lib/size.gsh")),
+    ("online",  include_str!("../../../scripts/lib/online.gsh")),
+    ("busiest", include_str!("../../../scripts/lib/busiest.gsh")),
 ];
 
 /// The baked source of library command `name`, or `None` if `name` is not a library command.
@@ -4090,6 +4093,8 @@ static HELP: &[HelpRow] = &[
     Row("health", "one-shot health dashboard (cores, mem, uptime, net, drives)"),
     Row("watch <command>", "re-run a command every 2s until q (watch mem)"),
     Row("size [path]", "total bytes of the files under a tree (size /docs)"),
+    Row("online", "probe the network live: DNS + internet, ok/FAIL per layer"),
+    Row("busiest [column]", "service table ranked by mem (or restarts / queue)"),
     Gap,
     Text("Type '<command> help' for usage + examples, '<command> version' for the version."),
 ];
@@ -4629,7 +4634,10 @@ fn cmd_ping(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
     } else if recv > 0 {
         out.line_fmt(ctx, format_args!("    (round-trip time unavailable - this host's TSC clock is uncalibrated)"));
     }
-    Ok(())
+    // Result model: a ping that sent echoes and received NOTHING back is a failed probe - Err, so
+    // `if ping count 2 8.8.8.8 { ... }` (the library's `online`) and `assert fails ping ...` see the
+    // truth. Any reply at all = Ok (the path works); the stats above stay the human diagnosis.
+    if sent > 0 && recv == 0 { Err(ShellError::Unknown) } else { Ok(()) }
 }
 
 /// `net stats` - dump the NIC's raw registers (chip state) to the console. Queries nic-driver ([5]);
@@ -4849,16 +4857,22 @@ fn net_dns(ctx: &ServiceContext, host: &str, out: &mut Out) -> Result<(), ShellE
     let p = reply.payload_bytes();
     if p.len() >= 5 && p[0] == 1 {
         out.line_fmt(ctx, format_args!("{} is {}.{}.{}.{}", host, p[1], p[2], p[3], p[4]));
+        Ok(())
     } else if p.first() == Some(&2) {
         out.line_fmt(ctx, format_args!("{}: the DNS server replied but returned no A record", host));
+        // A resolve that did not resolve is an Err OUTCOME (the printed line stays the diagnosis).
+        // "No answer" is still a legitimate result, not a bug - but on the Result model it is a
+        // failed probe, so `if net dns example.com { ... }` and `assert fails ...` can see the truth
+        // (the library's `online` verdicts ride on exactly this).
+        Err(ShellError::Unknown)
     } else {
         // Diagnostic: how many frames net-stack collected while waiting, and how many were UDP. Tells
         // us "no reply arrived" (0 UDP) from "a reply arrived but did not match our port" (UDP > 0).
         let (fr, ud) = if p.len() >= 7 { (p[5], p[6]) } else { (0, 0) };
         let to = if p.len() >= 8 { p[7] } else { 0 };
         out.line_fmt(ctx, format_args!("{}: no reply from the DNS server ({} frames, {} UDP, {} timeouts)", host, fr, ud, to));
+        Err(ShellError::Unknown)
     }
-    Ok(())
 }
 
 /// `net` (bare) - the network status: IP, gateway (+MAC), and whether the gateway pings. Raw facts,
