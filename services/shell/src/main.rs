@@ -461,7 +461,12 @@ fn complete_tab(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd) {
     let is_no_path = seg_cmd.map(|c| NO_PATH_CMDS.iter().any(|k| k.as_bytes() == c)).unwrap_or(false);
 
     if is_command {
-        complete_from_list(ctx, line, tok_start, UTILS);          // command name (after a `|` too)
+        // Command names = built-in utilities + system-library scripts (both are typed by name).
+        let mut names: [&str; 96] = [""; 96];
+        let mut n = 0usize;
+        for &u in UTILS { if n < names.len() { names[n] = u; n += 1; } }
+        for &(lib, _) in LIBRARY { if n < names.len() { names[n] = lib; n += 1; } }
+        complete_from_list(ctx, line, tok_start, &names[..n]);     // command name (after a `|` too)
     } else if !complete_keyword(ctx, line, seg_start, tok_start) && !is_no_path {
         complete_path(ctx, line, cwd, tok_start);                 // not a keyword and takes paths → file path
     }
@@ -1275,6 +1280,18 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         "first"   => cmd_take(ctx, cwd, &args, argc, false),
         "last"    => cmd_take(ctx, cwd, &args, argc, true),
         other => {
+            // PATH-like system library: a name that is not a built-in but matches a baked-in library
+            // script runs that script (a fresh, self-contained run; any args become $1..). Like
+            // run/selfcheck it is one interpreter layer, so it is refused inside another script
+            // (depth > 0) to keep the bounded user stack safe.
+            if let Some(src) = library_script(other) {
+                if depth > 0 {
+                    ctx.console_writeln_fmt(format_args!(
+                        "{}: a library command runs a script - not available inside another script", other));
+                    return Err(ShellError::Unknown);
+                }
+                return run_lines(ctx, cwd, src.as_bytes(), depth + 1, out, &parse_params(s, other, 1));
+            }
             // Build "unknown: <cmd>" in a stack buffer to avoid two ctx.log calls
             let mut buf = [0u8; 64];
             let mut pos = 0usize;
@@ -3504,6 +3521,21 @@ const RUN_MAX_CMDS: usize = 256;
 /// on-disk file (`MAX_FILE_BYTES` - a file is one ≤4 KiB IPC message; rodata is not).
 const SELFCHECK_GS: &str = include_str!("../../../scripts/selfcheck.gsh");
 
+/// The system library: gsh scripts baked into the image (rodata) and resolved PATH-like - typing a
+/// library name runs its script. This is the OS's "coreutils in gsh": features that grow by userspace
+/// COMPOSITION of the existing utilities, not new kernel or service surface (§26.2). Add a script to
+/// `scripts/lib/`, `include_str!` it here, and it becomes a command. Like `run`/`selfcheck`, a library
+/// command runs ONE script layer via `run_lines`, so it is prompt-level only (refused inside another
+/// script - two nested interpreter frames would blow the bounded user stack, [[project-shell-stack-pipe]]).
+const LIBRARY: &[(&str, &str)] = &[
+    ("health", include_str!("../../../scripts/lib/health.gsh")),
+];
+
+/// The baked source of library command `name`, or `None` if `name` is not a library command.
+fn library_script(name: &str) -> Option<&'static str> {
+    LIBRARY.iter().find(|(n, _)| *n == name).map(|&(_, src)| src)
+}
+
 /// `selfcheck` - run the embedded self-check suite IN MEMORY (straight from rodata via
 /// `run_lines`; no file write, so it is not capped by `MAX_FILE_BYTES`). The one-USB hardware
 /// checkpoint - flash the boot image, (`drives flash` a drive if it's raw, so the file-command
@@ -3995,6 +4027,9 @@ static HELP: &[HelpRow] = &[
     Sec("Power"),
     Row("reboot", "hardware reset"),
     Row("chaos kill-storm <svc> [n]", "bounded resilience test: kill a service N times, verify it recovers"),
+    Gap,
+    Sec("Library (gsh scripts, baked in - type the name to run)"),
+    Row("health", "one-shot health dashboard (cores, mem, uptime, net, drives)"),
     Gap,
     Text("Type '<command> help' for usage + examples, '<command> version' for the version."),
 ];

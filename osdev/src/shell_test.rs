@@ -208,6 +208,14 @@ pub fn run(image_path: &Path, smp: u32) {
     check!(dns_out.contains("example.com is ") || dns_out.contains("example.com: no answer"),
            "net dns: resolves a hostname or reports no-answer cleanly (DNS via slirp)");
 
+    // System library: `health` is a gsh script baked into the image and resolved PATH-like - typing
+    // the name runs the baked script (a fresh, self-contained run). Proves the library model end to
+    // end: a name unknown to the command dispatch falls through to the library and runs its dashboard.
+    send(&mut write_half, b"health\r");
+    let health_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)).unwrap_or_default();
+    check!(health_out.contains("GodspeedOS health") && health_out.contains("end of health"),
+           "library: `health` runs the baked-in dashboard (PATH-like resolution)");
+
     // ping is a full utility (mirrors net): version/help self-documentation.
     send(&mut write_half, b"ping version\r");
     let pingver = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
