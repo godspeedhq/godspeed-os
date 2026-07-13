@@ -21,7 +21,8 @@ how many cores it is running on, and who made it.
 
 ```
 gsh> about
-GodspeedOS: a capability-based microkernel (v1 milestone)
+GodspeedOS: a capability-based microkernel
+  Small enough to understand. Rigorous enough to trust.
   running on 4 core(s)
   Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors.
 ```

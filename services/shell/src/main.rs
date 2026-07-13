@@ -4207,7 +4207,8 @@ fn cmd_echo(ctx: &ServiceContext, text: &str, out: &mut Out) -> Result<(), Shell
 /// One-line identity for the system. A pipe source (`about | write /about.txt`): renders through
 /// `Out`, so it captures to a file as readily as it prints.
 fn cmd_about(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
-    out.line(ctx, "GodspeedOS: a capability-based microkernel (v1 milestone)");
+    out.line(ctx, "GodspeedOS: a capability-based microkernel");
+    out.line(ctx, "  Small enough to understand. Rigorous enough to trust.");
     out.line_fmt(ctx, format_args!("  running on {} core(s)", ctx.inspect_core_count()));
     out.line(ctx, "  Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors.");
     Ok(())
