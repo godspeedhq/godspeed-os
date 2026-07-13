@@ -482,7 +482,7 @@ fn complete_tab(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd) {
 /// same commit; a path-taking utility is left out. Opting out of path completion is explicit + per-command.
 const NO_PATH_CMDS: &[&str] = &[
     "chaos", "kill", "spawn", "restart", "ping", "net", "drives", "observe", "date", "uptime",
-    "wait", "watch",
+    "wait", "watch", "whatis",
 ];
 
 /// Commands whose FIRST argument (the token right after the command, within its pipe segment) is a
@@ -573,9 +573,9 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
         return complete_from_list(ctx, line, seg_start, SPAWN_TARGETS);
     }
 
-    // `watch <command ...>`: the first argument IS a command name, so complete it from the same
-    // set the command position uses (built-ins + library scripts).
-    if "watch".as_bytes() == cmd && prior == 0 {
+    // `watch <command ...>` / `whatis <name>`: the first argument IS a command name, so complete
+    // it from the same set the command position uses (built-ins + library scripts).
+    if ("watch".as_bytes() == cmd || "whatis".as_bytes() == cmd) && prior == 0 {
         let mut names: [&str; 96] = [""; 96];
         let mut n = 0usize;
         for &u in UTILS { if n < names.len() { names[n] = u; n += 1; } }
@@ -1219,6 +1219,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         "sock"    => cmd_sock(ctx, out),
         "uptime"  => cmd_uptime(ctx),
         "wait"    => cmd_wait(ctx, if argc >= 2 { args[1] } else { "" }),
+        "whatis"  => cmd_whatis(ctx, if argc >= 2 { args[1] } else { "" }, out),
         "status"  => cmd_status(ctx),
         "observe" => if argc >= 2 && args[1] == "now" { cmd_observe_now(ctx) } else { cmd_observe_live(ctx) },
         // The example record SERVICE, callable bare (renders its table) as well as piped.
@@ -3665,7 +3666,7 @@ const UTIL_VERSION: &str = "0.3.1";
 /// Utilities that self-document (gates the `help`/`version` intercept in `execute`).
 const UTILS: &[&str] = &[
     "help", "result", "run", "assert", "selfcheck",
-    "echo", "input", "clear", "about", "version", "mem", "cores", "date", "net", "ping", "sock", "uptime", "wait", "status", "observe", "caps", "roster",
+    "echo", "input", "clear", "about", "version", "mem", "cores", "date", "net", "ping", "sock", "uptime", "wait", "whatis", "status", "observe", "caps", "roster",
     "spawn", "kill", "restart", "reboot", "chaos", "drives", "ls", "cd", "read", "write", "edit", "fcap",
     "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count", "sort",
     "first", "last",
@@ -3755,6 +3756,9 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         ], true),
         "wait" => help_block(ctx, "wait", "do nothing for N seconds (q aborts)", &[
             ("wait <seconds>", "pause for N wall-clock seconds; q/Esc aborts with Err", "wait 2"),
+        ], true),
+        "whatis" => help_block(ctx, "whatis", "what runs when a name is typed (kind + origin)", &[
+            ("whatis <name>", "built-in / library script / pipe stage / service (live task+core)", "whatis ls"),
         ], true),
         "mem" => help_block(ctx, "mem", "physical memory usage", &[
             ("mem", "used / total / free physical memory", "mem"),
@@ -4030,6 +4034,7 @@ static HELP: &[HelpRow] = &[
     Row("date [epoch]", "date + time; 'epoch' = secs since 1970"),
     Row("uptime", "how long the system has been up (records when piped)"),
     Row("wait <seconds>", "pause N seconds, q aborts (paces scripts - watch is built on it)"),
+    Row("whatis <name>", "what a name is: built-in / library script / pipe stage / service"),
     Row("net", "network status: IP, gateway, ping"),
     Row("ping", "continuous ICMP echo (q quits): ping 8.8.8.8"),
     Gap,
@@ -4349,6 +4354,61 @@ fn cmd_about(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
 fn cmd_version_os(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
     out.line_fmt(ctx, format_args!("GodspeedOS {} ({})", UTIL_VERSION, env!("GODSPEED_GIT_SHA")));
     Ok(())
+}
+
+/// The record-pipe-ONLY stage verbs: names that run inside a pipe and nowhere else. `whatis` reports
+/// them as their own kind ("why does typing `where` bare fail?" is a real confusion this dissolves).
+/// The dual commands (sort/match/count/first/last run bare on files too) are NOT here - bare, they
+/// are built-ins. Keep in sync with pipe_run's stage dispatch.
+const PIPE_ONLY_VERBS: &[&str] = &["where", "select", "to", "from", "sum", "min", "max", "avg"];
+
+/// Service names `whatis` recognises when no live task bears the name: the managed set plus the
+/// demo/on-demand services. Purely descriptive (a lookup miss here means "unknown", not an error in
+/// anything) - keep roughly in sync with the supervisor's managed set + the shell's spawn targets.
+const KNOWN_SERVICES: &[&str] = &[
+    "supervisor", "block-driver", "fs", "logger", "shell", "xhci", "ehci", "nic-driver", "net-stack",
+    "ping", "pong", "greet", "roster", "chaos", "observe", "mem-pressure",
+];
+
+/// `whatis <name>` - what runs when this name is typed at the prompt: a shell built-in, a library
+/// script (gsh, baked into the image), a record-pipe stage, or a standalone service (with live
+/// task/core when running - identity is the name; the task/core is just where it lives right now).
+/// An unknown name is a loud `Err` (so `assert fails whatis banana` holds). This is the honest
+/// replacement for POSIX `which`: there is no $PATH and no executable path to return - a name's
+/// truth here is its KIND and ORIGIN, which is also an authority answer (26.9: a built-in runs in
+/// the shell's domain, a service in its own). One line, pipeable (rule 12).
+///
+/// Lens: the answer is about the NAME AT THE PROMPT. `ping` is both a built-in command and a demo
+/// service; typing `ping` runs the built-in, so that is the answer. (`whatis version`/`whatis help`
+/// cannot be asked: the universal `<util> version|help` intercept answers for whatis itself.)
+fn cmd_whatis(ctx: &ServiceContext, name: &str, out: &mut Out) -> Result<(), ShellError> {
+    if name.is_empty() {
+        ctx.console_writeln("usage: whatis <name>   e.g. whatis ls");
+        return Err(ShellError::Unknown);
+    }
+    if PIPE_ONLY_VERBS.contains(&name) {
+        out.line_fmt(ctx, format_args!("{}: record-pipe stage (runs only inside a pipe)", name));
+        return Ok(());
+    }
+    if is_util(name) {
+        out.line_fmt(ctx, format_args!("{}: shell built-in", name));
+        return Ok(());
+    }
+    if library_script(name).is_some() {
+        out.line_fmt(ctx, format_args!("{}: library script (gsh, baked into the image)", name));
+        return Ok(());
+    }
+    if let Some(slot) = slot_of(ctx, name) {
+        let st = ctx.task_stat(slot);
+        out.line_fmt(ctx, format_args!("{}: standalone service (running - task {}, core {})", name, slot, st.core));
+        return Ok(());
+    }
+    if KNOWN_SERVICES.contains(&name) {
+        out.line_fmt(ctx, format_args!("{}: standalone service (not running)", name));
+        return Ok(());
+    }
+    out.line_fmt(ctx, format_args!("{}: unknown", name));
+    Err(ShellError::Unknown)
 }
 
 /// Physical-memory usage, straight from the kernel's frame allocator (held via
@@ -6108,7 +6168,7 @@ fn is_producer_builtin(name: &str) -> bool {
     // loudly as non-producers instead. To capture a big file for `edit`, append a simple producer
     // a few times: `help | write /big.txt; help | write append /big.txt; …`.
     matches!(name, "read" | "echo" | "tree" | "input"
-                 | "about" | "version" | "mem" | "cores" | "date" | "net" | "ping" | "sock" | "help")
+                 | "about" | "version" | "whatis" | "mem" | "cores" | "date" | "net" | "ping" | "sock" | "help")
 }
 
 /// Producer SERVICES that emit without needing input, so they can start a pipe (and follow the
@@ -6136,6 +6196,7 @@ fn run_producer(ctx: &ServiceContext, cwd: &Cwd, cmdline: &str, out: &mut Out) {
         // Info/display commands - text emitters, capturable to a file.
         "about"        => { let _ = cmd_about(ctx, out); }
         "version"      => { let _ = cmd_version_os(ctx, out); }
+        "whatis"       => { let _ = cmd_whatis(ctx, arg, out); }
         "mem"          => { let _ = cmd_mem(ctx, out); }
         "cores"        => { let _ = cmd_cores(ctx, out); }
         "date"         => { let _ = cmd_date(ctx, arg, out); }
