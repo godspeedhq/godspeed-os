@@ -436,11 +436,18 @@ fn arp_resolve(ctx: &ServiceContext, our_ip: &[u8; 4], target: &[u8; 4]) -> Opti
 /// the TSC, wait one more second, sample again - the delta is one second of TSC. Uses the DEGLITCHED epoch
 /// so a CMOS misread cannot shorten the window; returns 0 (RTT then shows 0) if the result is implausible.
 fn calibrate_tsc_hz(ctx: &ServiceContext) -> u64 {
+    // Bound each wait (audit U11): if the RTC clock is frozen (never advances) this must NOT spin
+    // forever and hang net-stack boot. A second is a few thousand yields even under load; ~50M is a
+    // generous ceiling. Exceeding it means the clock is dead - return 0 (RTT then reports 0, the same
+    // fallback as an out-of-range result) rather than block the whole service on a broken clock.
+    const SPIN_MAX: u64 = 50_000_000;
     let s0 = ctx.epoch_secs_monotonic();
-    while ctx.epoch_secs_monotonic() == s0 { ctx.yield_cpu(); }   // align to a second boundary
+    let mut n = 0u64;
+    while ctx.epoch_secs_monotonic() == s0 { ctx.yield_cpu(); n += 1; if n > SPIN_MAX { return 0; } }
     let t0 = ctx.read_tsc();
     let s1 = ctx.epoch_secs_monotonic();
-    while ctx.epoch_secs_monotonic() == s1 { ctx.yield_cpu(); }   // exactly one second later
+    n = 0;
+    while ctx.epoch_secs_monotonic() == s1 { ctx.yield_cpu(); n += 1; if n > SPIN_MAX { return 0; } }
     let hz = ctx.read_tsc().wrapping_sub(t0);
     if (100_000_000..=10_000_000_000).contains(&hz) { hz } else { 0 }   // 100 MHz .. 10 GHz is sane
 }
@@ -659,12 +666,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         };
         let pl = req.payload_bytes();
         // AUTO-CONFIGURE: while UNCONFIGURED (no gateway - booted with no cable, or a boot dance that met a
-        // dead link), a `net` (op 0) or `ping` (op 3) request first checks the NIC link; if it has come up
+        // dead link), a request that needs the network first checks the NIC link; if it has come up
         // (cable plugged in), re-run the dance IN PLACE so the network self-configures - no `net renew`.
+        // That is EVERY network-using op, not just `net`/`ping` (audit U12): DNS (op 1) and ARP (op 6)
+        // equally need `our_ip`/`have_mac`, so a `net dns`/`net arp` on a freshly-plugged cable must
+        // trigger the same self-configure. (op 8 `renew` forces a dance already; op 2 `open` only mints.)
         // Gated on !have_mac so a configured stack pays nothing, and retried per request so the PHY's
         // few-second post-cable auto-negotiation eventually catches. Once configured the gateway MAC
         // persists, so a later unplug/replug just resumes (the ICMP flows again) without re-dancing.
-        if badge.is_none() && !have_mac && matches!(pl.first(), Some(&0) | Some(&3)) && link_is_up(&ctx) {
+        if badge.is_none() && !have_mac
+            && matches!(pl.first(), Some(&0) | Some(&1) | Some(&3) | Some(&6))
+            && link_is_up(&ctx)
+        {
             ctx.log("net-stack: link up while unconfigured - auto-configuring");
             let d = run_dance(&ctx);
             our_ip = d.our_ip; gw_mac = d.gw_mac; have_mac = d.have_mac; dns_server = d.dns_server; status = d.status;
@@ -697,7 +710,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         .map(|c| ctx.send_with_cap_by_handle(reply_cap, c, &Message::from_bytes(&[1])).is_ok())
                         .unwrap_or(false);
                     ctx.remove_cap(cap);        // net-stack drops its own copy; the client holds it now
-                    if !granted { sockets[sl].rid = 0; let _ = ctx.resource_revoke(rid); }
+                    if !granted {
+                        sockets[sl].rid = 0;
+                        let _ = ctx.resource_revoke(rid);
+                        // The cap did not reach the client, so the success reply above didn't either.
+                        // Tell the caller loudly (audit U10) instead of leaving it blocked on a reply
+                        // that will never come (inv12 / VIII). A failed [0] send is fine - the caller's
+                        // own reply-cap death wakes it as ReplyDead if net-stack itself then dies.
+                        let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0]));
+                    }
                 }
                 None => { let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0])); }
             }

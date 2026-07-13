@@ -67,6 +67,14 @@ id > 255 is excluded LOUDLY (§26.7) until the APIC layer gains x2APIC. Validate
 
 ---
 
+## 2026-07-13 - kernel-audit-3 fix: spurious-interrupt stub (K3)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/x86_64/boot.rs` | 90 → 92 (+2) | **K3 (kernel-audit-3): dedicated APIC spurious-interrupt handler.** The LAPIC spurious vector 0xFF was routed to the default `exception_halt`, so a spurious IRQ (a normal, rare hardware event the SDM says to ignore-and-return) would wedge the whole machine. New `spurious_stub` (`#[unsafe(naked)] unsafe extern "C" fn` + `naked_asm!("iretq")`) gives 0xFF a return-without-EOI handler - the exact naked-stub pattern of the sibling `ipi_wake_stub`, no register save / no swapgs needed because it touches nothing. The +2 is the `#[unsafe(naked)]` attribute + the `unsafe extern "C" fn`. Permitted arch layer; carries a doc comment explaining soundness. |
+
+---
+
 ## 2026-07-11 - kernel-audit fixes: user-copy fault guard (V1) + exception-handler backfill
 
 | File | Change | Why |
@@ -207,7 +215,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
 | arch/x86_64/ap_boot.rs | 2 | permitted |
-| arch/x86_64/boot.rs | 90 | permitted |
+| arch/x86_64/boot.rs | 92 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |
 | arch/x86_64/fb.rs | 5 | permitted |
 | arch/x86_64/interrupts.rs | 21 | permitted |

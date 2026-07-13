@@ -1195,7 +1195,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
             // file - direct, not a pipe; see cmd_selfcheck / docs/pipes.md). Otherwise the tokens
             // after the path are the script's params ($arg1.., $args, $argcount); $self is the path.
             let save = if argc >= 4 && args[2] == "save" { Some(args[3]) } else { None };
-            let params = if save.is_some() { Params::empty(args[1]) } else { parse_params(s, args[1], 2) };
+            let params = if save.is_some() { Params::empty(args[1]) } else { parse_params(ctx, s, args[1], 2) };
             return cmd_run(ctx, cwd, args[1], depth, save, &params);
         }
         // `selfcheck [save <path>]` - run the embedded suite; `save` streams its report to a file.
@@ -1308,7 +1308,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
                         "{}: a library command runs a script - not available inside another script", other));
                     return Err(ShellError::Unknown);
                 }
-                return run_lines(ctx, cwd, src.as_bytes(), depth + 1, out, &parse_params(s, other, 1), true);
+                return run_lines(ctx, cwd, src.as_bytes(), depth + 1, out, &parse_params(ctx, s, other, 1), true);
             }
             // Build "unknown: <cmd>" in a stack buffer to avoid two ctx.log calls
             let mut buf = [0u8; 64];
@@ -1834,7 +1834,7 @@ fn scan_word(b: &[u8], mut i: usize) -> (usize, usize, usize) {
 
 /// Parse script params from a raw `run` line: skip `skip` leading words (the `run` verb + the path),
 /// then collect up to `PARAM_MAX` quote-aware tokens. `name` becomes `$self`.
-fn parse_params<'a>(line: &'a str, name: &'a str, skip: usize) -> Params<'a> {
+fn parse_params<'a>(ctx: &ServiceContext, line: &'a str, name: &'a str, skip: usize) -> Params<'a> {
     let b = line.as_bytes();
     let mut i = 0usize;
     let mut p = Params::empty(name);
@@ -1848,6 +1848,13 @@ fn parse_params<'a>(line: &'a str, name: &'a str, skip: usize) -> Params<'a> {
         if i >= b.len() { break; }
         let (s, e, next) = scan_word(b, i);
         p.argv[p.argc] = &line[s..e]; p.argc += 1; i = next;
+    }
+    // Loud on the ceiling (§26.6, audit U5): arguments past PARAM_MAX are unreachable via
+    // $args/$argcount - say so rather than silently swallowing them.
+    while i < b.len() && b[i].is_ascii_whitespace() { i += 1; }
+    if i < b.len() {
+        ctx.console_writeln_fmt(format_args!(
+            "gsh: only the first {} arguments are available ($arg1..$arg{}); the rest were dropped", PARAM_MAX, PARAM_MAX));
     }
     p
 }
@@ -3595,6 +3602,17 @@ const LIBRARY: &[(&str, &str)] = &[
     ("busiest", include_str!("../../../scripts/lib/busiest.gsh")),
 ];
 
+// audit U6: baked scripts must stay under the u16 offset ceiling `prescan_fns` uses (64 KiB), or the
+// fn/summary offsets wrap silently and dispatch the wrong bodies. Fail the build, not at runtime.
+const _: () = assert!(SELFCHECK_GS.len() < 65536, "selfcheck.gsh exceeds the 64 KiB baked-script ceiling");
+const _: () = {
+    let mut i = 0;
+    while i < LIBRARY.len() {
+        assert!(LIBRARY[i].1.len() < 65536, "a library script exceeds the 64 KiB baked-script ceiling");
+        i += 1;
+    }
+};
+
 /// The baked source of library command `name`, or `None` if `name` is not a library command.
 fn library_script(name: &str) -> Option<&'static str> {
     LIBRARY.iter().find(|(n, _)| *n == name).map(|&(_, src)| src)
@@ -4649,10 +4667,11 @@ fn cmd_ping(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
     } else if recv > 0 {
         out.line_fmt(ctx, format_args!("    (round-trip time unavailable - this host's TSC clock is uncalibrated)"));
     }
-    // Result model: a ping that sent echoes and received NOTHING back is a failed probe - Err, so
-    // `if ping count 2 8.8.8.8 { ... }` (the library's `online`) and `assert fails ping ...` see the
-    // truth. Any reply at all = Ok (the path works); the stats above stay the human diagnosis.
-    if sent > 0 && recv == 0 { Err(ShellError::Unknown) } else { Ok(()) }
+    // Result model: any reply proves the path works (Ok); NO reply - whether all echoes were lost or
+    // the probe was q-aborted before one arrived - is a failed probe (Err), so `if ping count 2 ...`
+    // (the library's `online`) and `assert fails ping ...` see the truth and an aborted probe never
+    // reads as a false success (audit U4). The stats above stay the human diagnosis.
+    if recv == 0 { Err(ShellError::Unknown) } else { Ok(()) }
 }
 
 /// `net stats` - dump the NIC's raw registers (chip state) to the console. Queries nic-driver ([5]);
@@ -4866,7 +4885,9 @@ fn net_dns(ctx: &ServiceContext, host: &str, out: &mut Out) -> Result<(), ShellE
     ctx.console_writeln("net: resolving ...");
     let reply = match net_query(ctx, "net-stack", &msg, 8) {
         NetQ::Reply(r)   => r,
-        NetQ::Aborted    => { ctx.console_writeln("net: aborted"); return Ok(()); }
+        // A q-aborted resolve did NOT succeed, so it is Err (not Ok): a probe's Result is its verdict,
+        // and `online`'s `if net dns ...` must not print a false "dns ok" for an aborted probe (audit U4).
+        NetQ::Aborted    => { ctx.console_writeln("net: aborted"); return Err(ShellError::Unknown); }
         NetQ::Timeout    => { ctx.console_writeln("net: net-stack did not answer the resolve"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
@@ -5933,7 +5954,10 @@ fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
                 if b == b'q' || b == b'Q' { quit = true; }
             }
             if quit { break; }
-            if !ctx.task_stat(slot).valid { break; } // child died unexpectedly
+            // Break if the painter died OR its slot was reused by another spawn (name mismatch),
+            // not just on `!valid` - else a reused slot would freeze the frame (audit U8).
+            let st = ctx.task_stat(slot);
+            if !st.valid || st.state == 4 || st.name_str() != "observe-live" { break; }
         }
     }
     let _ = ctx.kill("observe-live"); // reap the live painter (it never exits on its own)

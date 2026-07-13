@@ -1209,9 +1209,17 @@ impl ServiceContext {
     /// `has_console_read` in their kernel config (currently: shell only).
     pub fn console_read(&self) -> u8 {
         let data = Self::ctx();
+        // A wrong magic means the kernel handed us a corrupt ServiceContext - `self.log()` reads the
+        // same corrupt ctx, so it cannot be trusted to report; parking is the service-level analog of
+        // the kernel's halt-on-corrupt-state (§6.2). The slot guard below CAN speak (audit L8).
         if data.magic != SERVICE_CTX_MAGIC { loop {} }
         let slot = data.console_read_slot;
-        if slot == u32::MAX { loop {} }
+        if slot == u32::MAX {
+            // No CONSOLE_READ cap: a caller that isn't the shell reached a shell-only syscall. Say so
+            // LOUDLY (inv12) rather than wedge silently, then park - the caller's contract is wrong.
+            self.log("sdk: console_read called without a CONSOLE_READ cap - parking (contract error)");
+            loop {}
+        }
         // SAFETY: syscall(17) = ConsoleRead; slot is kernel-written cap index.
         let ret = unsafe { raw_syscall(17, slot as u64, 0, 0) };
         if ret >= 0 { ret as u8 } else { 0 }

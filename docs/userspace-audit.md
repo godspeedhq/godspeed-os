@@ -284,19 +284,19 @@ utility conventions.
 | **U2** reserved words shadowable as for-var/fn-param | **FIXED** | III/§26.4 - reserved check moved to the `define` funnel (`VarErr::Reserved`) so `let`/loop-var/fn-param all refuse loudly; QEMU-verified (`fn f self`/`for args` refused, no stale read) |
 | **U3** supervisor `reconcile()` backstop single-shot | **FIXED** | IX - `reconcile` now calls `respawn_retry` (the M5 backstop gap closed) |
 | **M4** net identity-cache reconcile | STILL DEFERRED | trades against instant-replug; needs a real multi-subnet net |
-| U4 probe q-abort returns Ok | open | VIII/truth - `Aborted -> Err` in net_dns/ping so `online` doesn't false-pass |
-| U5 args past 9 silently dropped | open | §26.6 - one loud line |
-| U6 no compile guard baked-script < 64 KiB | open | hygiene - `const _: () = assert!(len < 65536)` |
-| U7 shell-test dead DNS assertion | open | test-drift (same class as the fixed stale-version greps) |
-| U8 observe q-loop break checks `.valid` not name | open | rare slot-reuse; add `name_str()` check |
-| U9 OUR_MAC hardcoded, not reconciled | open | III - learn from nic-driver `[3]` status |
-| U10 open-socket grant-fail replies nothing | open | inv12 - `try_send [0]` on the `!granted` arm |
-| U11 net-stack calibrate_tsc_hz unbounded RTC spin | open | VIII-edge - bound by yield count |
-| U12 auto-config gate covers only net/ping | open | IX - add ops 1/6 to the gate |
-| U13 contract_check CONTRACTED hand-list | open | III - glob-derive from `services/*/contracts/*.toml` |
-| U14 example tomls stale pre-T1 doctrine | open | III/IV - declare hw_device/resource_mint or annotate kernel-only |
-| U15 six privileged grants still name-keyed | open (T1 residue) | VII/IV - promote SPAWN/CONSOLE_PUSH/INTROSPECT/SERVICE_CONTROL/REBOOT/ACQUIRE_ANY to ServiceConfig fields |
-| L8 SDK recv()/console_read() `loop{}` on error | open (carried) | inv12 - log-once+park or migrate to `recv_result` |
+| **U4** probe q-abort returns Ok | **FIXED** | VIII/truth - `Aborted -> Err(ShellError::Unknown)` in `net_dns`; ping tail `recv == 0 -> Err` so `online` doesn't false-pass |
+| **U5** args past 9 silently dropped | **FIXED** | §26.6 - `parse_params` now takes `ctx` + emits a loud "only the first 9 arguments are available" line when a 10th remains |
+| **U6** no compile guard baked-script < 64 KiB | **FIXED** | hygiene - `const _: () = assert!(SELFCHECK_GS.len() < 65536)` + a `while` const-loop over every LIBRARY entry |
+| **U7** shell-test dead DNS assertion | **FIXED** | test-drift - `shell_test.rs:214` now matches the live "returned no A record" / "no reply from the DNS server" / "did not answer the resolve" lines |
+| **U8** observe q-loop break checks `.valid` not name | **FIXED** | rare slot-reuse - break also on `state == Dead` OR a `name_str() != "observe-live"` mismatch |
+| U9 OUR_MAC hardcoded, not reconciled | DEFERRED | III - learn from nic-driver `[3]` status; needs T630 HW re-validation (the hardcoded MAC is part of the HW-proven DHCP path) - defer with the same discipline as M4 |
+| **U10** open-socket grant-fail replies nothing | **FIXED** | inv12 - the `!granted` arm now `try_send [0]` so the caller wakes instead of blocking on a reply that never comes |
+| **U11** net-stack calibrate_tsc_hz unbounded RTC spin | **FIXED** | VIII-edge - each wait bounded by a `SPIN_MAX` yield count; a frozen clock returns 0 (the existing RTT fallback) instead of hanging boot |
+| **U12** auto-config gate covers only net/ping | **FIXED** | IX - gate now covers ops 0/1/3/6 (net/dns/ping/arp), every network-using op; op 8 renew already forces a dance, op 2 open only mints |
+| **U13** contract_check CONTRACTED hand-list | **FIXED** | III - now glob-derived from `services/*/contracts/*.toml`; a new service's contract is reconciled automatically |
+| **U14** example tomls stale pre-T1 doctrine | **FIXED** | III/IV - e1000 + resource-server tomls/CLAUDE.md now describe the current `service_hw` table (and sibling `service_privileges`), not the scattered `if name ==` branch |
+| **U15** six privileged grants still name-keyed | **FIXED** | VII/IV - all six (SPAWN/CONSOLE_PUSH/INTROSPECT/SERVICE_CONTROL/REBOOT/ACQUIRE_ANY) centralized into ONE `service_privileges(name, is_probe)` table (the `service_hw` doctrine); ServiceConfig field-promotion rejected (218 all-false rows, §26.13). adv A11/A12/A13 green |
+| **L8** SDK recv()/console_read() `loop{}` on error | **FIXED (partial, by design)** | inv12 - the reachable `console_read` slot-guard now logs loudly then parks; the magic-mismatch guards park with a comment (a corrupt ctx can't be logged through - the service-level analog of kernel halt-on-corruption, §6.2) |
 
 ### MED findings (fix these)
 

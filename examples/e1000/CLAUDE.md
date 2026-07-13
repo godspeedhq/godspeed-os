@@ -28,10 +28,13 @@ so the driver contains **no `unsafe`**.
 ## Why it is built this way (the Commandments)
 
 - **Commandment I + X (a driver is a service, not a kernel change).** The only kernel change this
-  example needs is a single branch in `kernel/src/task/mod.rs` that maps the NIC's BAR for a service
-  named `e1000`. That is the kernel doing its one job - granting a hardware capability - and nothing
-  more. All device logic lives here, in userspace, and the volatile-register `unsafe` stays isolated
-  in the SDK `Mmio` layer (§18.1). *(COMMANDMENTS.md I, X; CLAUDE.md §4.3, §12, §18.1, §26.10.)*
+  example needs is one entry in the `service_hw` table in `kernel/src/task/mod.rs`
+  (`"nic-driver" | "e1000" => HwClass::Nic`) - the single, centralized place a driver's device class is
+  named, not a scattered `if name ==` branch (audit M7/T1 moved it there; the non-hardware privileges
+  live in the sibling `service_privileges` table, audit U15). That is the kernel doing its one job -
+  granting a hardware capability - and nothing more. All device logic lives here, in userspace, and the
+  volatile-register `unsafe` stays isolated in the SDK `Mmio` layer (§18.1). *(COMMANDMENTS.md I, X;
+  CLAUDE.md §4.3, §12, §18.1, §26.10.)*
 - **Commandment VII (no ambient authority, made concrete).** The kernel maps the BAR
   `if name == "e1000" && the discovered NIC is actually an Intel e1000 (vendor/device 0x100E8086)`.
   That one gate IS the no-ambient-authority discipline: the driver reaches the NIC's registers only
@@ -60,10 +63,11 @@ so the driver contains **no `unsafe`**.
 ```toml
 [capabilities]
 log_write = true
-# The NIC's MMIO BAR is granted by the kernel BY NAME at spawn - the same mechanism the
-# xhci/ehci/block-driver controllers use (kernel/src/task/mod.rs), gated on the discovered NIC being
-# a real Intel e1000. Reach it via ctx.mmio(). A read-only driver needs no DMA arena and no
-# hw_interrupt; a full NIC driver would add both (see examples/driver-skeleton for that shape).
+# The NIC's MMIO BAR is granted by the kernel BY NAME at spawn - declared in the `service_hw` table
+# (kernel/src/task/mod.rs), the one centralized place a driver's device class is named (the same table
+# xhci/ehci/block-driver use), gated on the discovered NIC being a real Intel e1000. Reach it via
+# ctx.mmio(). A read-only driver needs no DMA arena and no hw_interrupt; a full NIC driver would add
+# both (see examples/driver-skeleton for that shape).
 
 [placement]
 core = 1
@@ -107,11 +111,11 @@ of it on every restart (Commandments V + IX). `docs/networking.md` sketches that
 
 ## How to adapt this
 
-To drive a different PCI device: have the kernel record it in the PCI scan (`pci.rs`), add a branch in
-the `task/mod.rs` BAR-mapping block for your driver's name (gated on the device actually being yours),
-write the service against `ctx.mmio()` (and `ctx.dma_region()` / `ctx.irq_unmask()` if it needs DMA or
-interrupts), and add it to the workspace + a supervisor spawn. `examples/driver-skeleton` is the full
-template for the device-bringup shape.
+To drive a different PCI device: have the kernel record it in the PCI scan (`pci.rs`), add a
+`HwClass` variant and a `service_hw` table entry in `task/mod.rs` for your driver's name (gated on the
+device actually being yours), write the service against `ctx.mmio()` (and `ctx.dma_region()` /
+`ctx.irq_unmask()` if it needs DMA or interrupts), and add it to the workspace + a supervisor spawn.
+`examples/driver-skeleton` is the full template for the device-bringup shape.
 
 ## See also
 

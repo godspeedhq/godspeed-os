@@ -211,7 +211,10 @@ pub fn run(image_path: &Path, smp: u32) {
     // a.b.c.d") OR a clean "no answer", never a hang or crash. A real resolution is a bonus, not required.
     send(&mut write_half, b"net dns example.com\r");
     let dns_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)).unwrap_or_default();
-    check!(dns_out.contains("example.com is ") || dns_out.contains("example.com: no answer"),
+    check!(dns_out.contains("example.com is ")
+            || dns_out.contains("returned no A record")
+            || dns_out.contains("no reply from the DNS server")
+            || dns_out.contains("did not answer the resolve"),
            "net dns: resolves a hostname or reports no-answer cleanly (DNS via slirp)");
 
     // System library: `health` is a gsh script baked into the image and resolved PATH-like - typing

@@ -406,6 +406,46 @@ fn service_hw(name: &str) -> (HwClass, bool) {
     }
 }
 
+/// The non-hardware system capabilities a service is granted at spawn (audit U15). Like `service_hw`,
+/// this is the ONE place the kernel declares who holds each privileged authority - previously six
+/// separate `name == "shell" || name == "supervisor" || ...` blocks scattered down the spawn path, each
+/// its own drift risk. Centralizing them here mirrors the `service_hw` doctrine (§26.4 no scattered
+/// authority; IV honor contracts declaratively): the spawn path reads these booleans, never a re-derived
+/// `name ==` check. `is_probe` (the caller's ELF is `PROBE_ELF`) covers the whole test-probe family by
+/// identity, so no probe is missed by name.
+struct Privileges {
+    spawn:           bool, // SPAWN: create tasks (supervisor, the shell, chaos' spawn-burst, probes)
+    console_push:    bool, // CONSOLE_PUSH: inject keystrokes into the input ring (USB keyboard drivers)
+    introspect:      bool, // INTROSPECT: read another task's / system-wide kernel state (§3.1)
+    service_control: bool, // SERVICE_CONTROL: kill/restart other services (§14.4)
+    reboot:          bool, // REBOOT: hardware-reset the machine (shell `reboot`, USB Ctrl+Alt+Del)
+    acquire_any:     bool, // ACQUIRE_ANY: reach ARBITRARY services by name via AcquireSendCap (§3.1)
+}
+
+fn service_privileges(name: &str, is_probe: bool) -> Privileges {
+    Privileges {
+        // supervisor is the spawner (init removed, Phase 5); the shell brokers spawns; chaos spawns
+        // mem-pressure tasks for max-carnage's spawn-burst dimension; probes spawn victims.
+        spawn: is_probe || matches!(name, "supervisor" | "shell" | "chaos"),
+        // Both USB host drivers push decoded keystrokes: xhci (front ports), ehci (USB 2.0 back ports).
+        console_push: matches!(name, "xhci" | "ehci"),
+        // shell + observe use TaskStat/InspectKernel; supervisor's reconcile loop scans real liveness;
+        // chaos does victim selection; the prop-/stress- probes query victim generations.
+        introspect: matches!(name, "shell" | "supervisor" | "chaos")
+            || name.starts_with("observe") || name.starts_with("prop-") || name.starts_with("stress-"),
+        // shell (interactive broker), supervisor (restart authority), chaos (the point of max-carnage),
+        // and every probe (they kill victims to exercise kill/revocation).
+        service_control: is_probe || matches!(name, "shell" | "supervisor" | "chaos"),
+        // shell `reboot` + the USB drivers' Ctrl+Alt+Del secure-attention reboot are the only rebooters.
+        reboot: matches!(name, "shell" | "xhci" | "ehci"),
+        // Operator/test instruments that legitimately reach arbitrary services by name: shell (chaos
+        // flooding, pipe sinks), supervisor (reconcile-by-name), probes. `adv-a13` is the §22 Test A13
+        // NEGATIVE pin - deliberately excluded so it holds no ACQUIRE_ANY (proves AcquireSendCap denies
+        // a non-holder). Ordinary services get none; their AcquireSendCap is limited to declared peers.
+        acquire_any: (is_probe && name != "adv-a13") || matches!(name, "shell" | "supervisor" | "chaos"),
+    }
+}
+
 /// True if the calling task's contract declares `peer` as a send-peer (§13) - so reacquiring a SEND
 /// cap to it (`AcquireSendCap`) is contract-authorized recovery (§14.2), not ambient authority (§3.1).
 /// The caller's name comes from the existing `task_stat` snapshot and its declared peers from the
@@ -3351,12 +3391,14 @@ fn spawn_service_with_config(
     // Previously every service got this unconditionally ("spawn authority, every
     // service in v1") - a system-wide blast-radius widening this closes. Capture the
     // slot (u32::MAX when not granted); the SDK already treats MAX as "not held".
+    // All six non-hardware authorities below come from the ONE `service_privileges` table (audit U15),
+    // not a re-derived `name ==` check per grant. `is_probe` covers the whole test-probe family by ELF
+    // identity so no probe is missed by name.
+    let is_probe = core::ptr::eq(elf_bytes.as_ptr(), PROBE_ELF.as_ptr());
+    let privs = service_privileges(name, is_probe);
+
     let mut spawn_slot_u32 = u32::MAX;
-    if name == "supervisor"            // init removed (Path C / Phase 5) - supervisor is the spawner
-        || name == "shell"
-        || name == "chaos"             // spawns mem-pressure tasks for the spawn-burst dimension of max-carnage
-        || core::ptr::eq(elf_bytes.as_ptr(), PROBE_ELF.as_ptr())
-    {
+    if privs.spawn {
         let sp_slot = caps.insert(mint_cap(SPAWN_RESOURCE, Rights::WRITE))
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
         spawn_slot_u32 = sp_slot as u32;
@@ -3422,46 +3464,28 @@ fn spawn_service_with_config(
         console_read_slot_u32 = cap_slot as u32;
     }
 
-    // The USB keyboard driver gets a CONSOLE_PUSH cap so it can inject decoded
-    // keystrokes into the console input ring (§12). Both USB drivers hold it -
-    // `xhci` for front-port keyboards, `ehci` for the back-port (USB 2.0) ones.
+    // CONSOLE_PUSH: inject decoded keystrokes into the console input ring (§12). WHO holds it is in
+    // `service_privileges` (the single authority table); here we only mint it.
     let mut console_push_slot_u32 = u32::MAX;
-    if name == "xhci" || name == "ehci" {
+    if privs.console_push {
         let cp_cap = mint_cap(CONSOLE_PUSH_RESOURCE, Rights::WRITE);
         let cap_slot = caps.insert(cp_cap)
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
         console_push_slot_u32 = cap_slot as u32;
     }
 
-    // Services that read another task's or system-wide kernel state hold the
-    // INTROSPECT cap (§3.1; docs/introspection-capability.md). The shell and the
-    // observe utility use TaskStat + the aggregate InspectKernel queries; the
-    // prop-*/stress-* test-harness probes query victim generations (InspectKernel
-    // query 2). Self-state (own alloc bytes) and the TSC stay ungated, so every
-    // other service needs nothing. No slot is stored - the gate scans holdings.
-    if name == "shell"
-        || name == "supervisor"        // task_stat: the reconcile loop scans real liveness to respawn a
-                                       //   service whose death notification was dropped under a storm
-        || name == "chaos"             // task_stat: victim selection + recovery checks in max-carnage
-        || name.starts_with("observe") // observe + observe-now (and future modes)
-        || name.starts_with("prop-")
-        || name.starts_with("stress-")
-    {
+    // INTROSPECT: read another task's / system-wide kernel state via TaskStat + InspectKernel (§3.1;
+    // docs/introspection-capability.md). Self-state (own alloc bytes) and the TSC stay ungated, so a
+    // service not in `service_privileges` needs nothing. No slot is stored - the gate scans holdings.
+    if privs.introspect {
         let in_cap = mint_cap(INTROSPECT_RESOURCE, Rights::READ);
         caps.insert(in_cap)
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 
-    // Services that kill other services hold the service_control cap (§3.1/§14.4;
-    // docs/service-control-cap.md): the shell (interactive broker), the supervisor
-    // (restart authority), and every test-driver probe (they kill victim services
-    // to exercise kill/revocation). Probes are identified by ELF identity
-    // (elf_bytes == PROBE_ELF) so no probe family is missed by name.
-    if name == "shell"
-        || name == "supervisor"
-        || name == "chaos"             // kills victim services (the whole point of max-carnage)
-        || core::ptr::eq(elf_bytes.as_ptr(), PROBE_ELF.as_ptr())
-    {
+    // SERVICE_CONTROL: kill/restart other services (§3.1/§14.4; docs/service-control-cap.md). WHO holds
+    // it is in `service_privileges`; here we only mint it.
+    if privs.service_control {
         let sc_cap = mint_cap(SERVICE_CONTROL_RESOURCE, Rights::WRITE);
         caps.insert(sc_cap)
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
@@ -3483,25 +3507,18 @@ fn spawn_service_with_config(
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 
-    // The reboot authority (§3.1): the `shell` (its `reboot` command) and the USB drivers `xhci`/`ehci`
-    // (the Ctrl+Alt+Del secure-attention reboot) are the only legitimate rebooters - no other service
-    // can hardware-reset the machine. Closes the last ambient-authority gap (`Reboot`/18 was ungated).
-    if name == "shell" || name == "xhci" || name == "ehci" {
+    // REBOOT (§3.1): hardware-reset the machine (`Reboot`/18). WHO holds it is in `service_privileges`;
+    // here we only mint it. No other service can hardware-reset the machine.
+    if privs.reboot {
         let rb_cap = mint_cap(REBOOT_RESOURCE, Rights::WRITE);
         caps.insert(rb_cap)
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 
-    // The broad-acquire authority (§3.1): the operator/test instruments that legitimately reach
-    // ARBITRARY services by name via `AcquireSendCap` - the `shell` (chaos flooding, pipe sinks), the
-    // `supervisor` (reconcile-by-name), and test probes. Ordinary services get NONE: their
-    // `AcquireSendCap` is restricted to their contract-declared send-peers (recovery), so they hold no
-    // ambient send authority. Probes are matched by ELF identity so no probe family is missed.
-    // `adv-a13` is the §22 Test A13 negative pin: it is deliberately EXCLUDED so it holds no
-    // ACQUIRE_ANY (and declares no send-peers), proving AcquireSendCap denies a non-holder.
-    if name == "shell" || name == "supervisor" || name == "chaos"  // chaos floods arbitrary services by name
-        || (core::ptr::eq(elf_bytes.as_ptr(), PROBE_ELF.as_ptr()) && name != "adv-a13")
-    {
+    // ACQUIRE_ANY (§3.1): reach ARBITRARY services by name via `AcquireSendCap`. WHO holds it is in
+    // `service_privileges`; here we only mint it. Ordinary services get NONE - their AcquireSendCap is
+    // restricted to their contract-declared send-peers (recovery), so they hold no ambient send authority.
+    if privs.acquire_any {
         let aa_cap = mint_cap(ACQUIRE_ANY_RESOURCE, Rights::WRITE);
         caps.insert(aa_cap)
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;

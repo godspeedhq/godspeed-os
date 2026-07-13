@@ -29,6 +29,17 @@ pub unsafe fn start_all_aps(_boot_info: &super::BootInfo) -> u32 {
 
     let bsp_lapic = resp.bsp_lapic_id;
 
+    // The APs are filtered against XAPIC_MAX_LAPIC_ID below; the BSP must be held to the same ceiling
+    // (audit K2). If the BSP's own LAPIC id exceeds 8 bits, `lapic_id & 0xFF` in a targeted IPI would
+    // silently mis-address it, so an AP->BSP wake (cross-core recv) would land on the wrong core. Say
+    // so LOUDLY (§26.7) rather than let cross-core IPC fail invisibly - the honest ceiling until x2APIC.
+    if bsp_lapic > super::XAPIC_MAX_LAPIC_ID {
+        crate::kprintln!(
+            "smp: WARNING - BSP LAPIC id {} > {}: AP->BSP IPIs will mis-address (needs x2APIC)",
+            bsp_lapic, super::XAPIC_MAX_LAPIC_ID
+        );
+    }
+
     // Store BSP's LAPIC ID for core 0.
     crate::smp::core::set_core_lapic_id(0, bsp_lapic);
 

@@ -275,11 +275,14 @@ present-and-correct.** The core kernel came back clean; the one real finding is 
 
 ### Confirmed violation (fix this)
 
-> **Status (2026-07-13): K1 FIXED on `feat/audit-kernel-and-userspace`.** All five exception stubs now
-> bound the asm THRE poll with an `ecx` spin counter (~1M, mirroring `SERIAL_THRE_NOLCK_CAP`), falling
-> through to the breadcrumb write best-effort on timeout - so a ring-3 fault on a wedged UART kills the
-> task instead of spinning the core forever. `ecx` is safe scratch there (the stubs that need `rcx`
-> reload it from the stack after the poll). Kernel + image build clean.
+> **Status (2026-07-13): K1 + K2 + K3 ALL FIXED on `feat/audit-kernel-and-userspace`.** K1: all five
+> exception stubs now bound the asm THRE poll with an `ecx` spin counter (~1M, mirroring
+> `SERIAL_THRE_NOLCK_CAP`), falling through to the breadcrumb write best-effort on timeout - so a ring-3
+> fault on a wedged UART kills the task instead of spinning the core forever. `ecx` is safe scratch there
+> (the stubs that need `rcx` reload it from the stack after the poll). K2: the BSP LAPIC id now gets the
+> same loud xAPIC-ceiling check the APs have. K3: the APIC spurious vector 0xFF now routes to a dedicated
+> `spurious_stub` (bare `iretq`) instead of `exception_halt`, so a spurious IRQ is a no-op not a wedge.
+> Kernel + image build clean; identity 24/0, adversarial 15/0 (incl. A11/A12/A13 cap-gating).
 
 #### K1. [MED] `kernel/src/arch/x86_64/boot.rs:1291,1336,1514,1592,1622` - arch-cpu (unbounded-loop / invariant 12)
 
@@ -303,17 +306,20 @@ falling through to the breadcrumb write best-effort on timeout - exactly as the 
 
 ### Latent hardening notes (LOW - real but no current trigger)
 
-- **K2. [LOW] `kernel/src/arch/x86_64/mod.rs:155` (+ `smp/ipi.rs` `send_ipi` `& 0xFF`).** The BSP is
-  exempt from the loud xAPIC 8-bit LAPIC-id ceiling the APs get: `set_bsp_lapic_id(... as u8)` truncates
-  silently, and every IPI to core 0 masks `& 0xFF`. A BSP with LAPIC id > 255 (x2APIC-scale machine)
-  would silently mis-route. APs above 0xFF are excluded *loudly* (ap_boot.rs:46-64); the BSP corner is
-  the one silent wrap. **Fix:** one loud boot check (`bsp_lapic_id > XAPIC_MAX -> panic/log "needs
-  x2APIC"`), matching the AP path. Exotic trigger; consistency with the loud-failure discipline.
-- **K3. [LOW/note] `kernel/src/arch/x86_64/boot.rs:323` (SVR=0x1FF) + `:1143` (IDT[0xFF]=exception_halt).**
-  The kernel programs LAPIC spurious vector 0xFF but routes that vector to `exception_halt` (hlt-loops the
-  core). A spurious-vector delivery - which SDM says to ignore-and-return - would wedge the core. The
-  arch auditor itself flagged the trigger as speculative (no deterministic post-boot cause found), so this
-  is a **hardening note**, not a confirmed bug: give 0xFF a dedicated return-without-EOI stub per SDM.
+- **K2. [LOW] `kernel/src/arch/x86_64/ap_boot.rs:33`.** **FIXED (`feat/audit-kernel-and-userspace`).**
+  The BSP was exempt from the loud xAPIC 8-bit LAPIC-id ceiling the APs get: it was stored without a
+  range check while APs above 0xFF are excluded *loudly* (ap_boot.rs:46-64). A BSP with LAPIC id > 255
+  (x2APIC-scale machine) would silently mis-route AP->BSP IPIs (`lapic_id & 0xFF` in `send_ipi`). The
+  fix adds the matching loud check before storing the BSP LAPIC id (`bsp_lapic > XAPIC_MAX_LAPIC_ID ->
+  loud "needs x2APIC" warning`). Exotic trigger; now consistent with the AP path and the loud-failure
+  discipline (§26.7).
+- **K3. [LOW] `kernel/src/arch/x86_64/boot.rs:323` (SVR=0x1FF) + `:1173` (IDT[0xFF]).** **FIXED
+  (`feat/audit-kernel-and-userspace`).** The kernel programs LAPIC spurious vector 0xFF but routed that
+  vector to the default `exception_halt` (hlt-loops the core). A spurious-vector delivery - which the SDM
+  says to ignore-and-return - would wedge the whole machine. The fix gives 0xFF a dedicated `spurious_stub`
+  (a bare `iretq`: no EOI, no register save, no swapgs - correct from either ring), wired in `init_idt`.
+  A spurious IRQ is now a no-op, not a wedge (north-star: a non-fatal hardware event must never wedge the
+  kernel, inv12). Identity 24/0 + adversarial 15/0 after the change.
 
 ### Verified present-and-correct (Audit 1/2 fixes + new code)
 

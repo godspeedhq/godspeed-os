@@ -1173,6 +1173,11 @@ pub(super) unsafe fn init_idt() {
         idt[0xF0] = IdtEntry::new(ipi_wake_stub   as *const () as u64);
         idt[0xF1] = IdtEntry::new(ipi_tlb_stub    as *const () as u64);
         idt[0xF2] = IdtEntry::new(ipi_tick_stub   as *const () as u64);
+        // IDT[0xFF] = the APIC spurious-interrupt vector (SVR = 0x1FF, above). A spurious IRQ is a normal
+        // hardware event (an IRQ de-asserted between CPU-ack and vector-read); the architecturally-correct
+        // response is to IRET WITHOUT an EOI - NOT to hit the default `exception_halt` and wedge the whole
+        // machine (audit K3; north-star: a non-fatal hardware event must never wedge the kernel, inv12).
+        idt[0xFF] = IdtEntry::new(spurious_stub    as *const () as u64);
 
         let desc = TableDescriptor {
             limit: (core::mem::size_of_val(idt) - 1) as u16,
@@ -1198,6 +1203,15 @@ pub(super) unsafe fn init_idt() {
 unsafe extern "C" fn ipi_dispatch(vector: u64) {
     // SAFETY: called from raw ISR with IF=0; ipi_handler is safe to call here.
     unsafe { crate::smp::ipi::ipi_handler(vector as u8) }
+}
+
+/// Spurious-interrupt ISR stub (APIC vector 0xFF). A spurious interrupt carries no work and must NOT
+/// be acknowledged with an EOI, so this touches nothing and simply returns. It clobbers no registers
+/// and no GS-relative state, so a bare `iretq` (no register save, no swapgs) is correct from either
+/// ring. This replaces the default `exception_halt` for 0xFF so a spurious IRQ is a no-op, not a wedge.
+#[unsafe(naked)]
+unsafe extern "C" fn spurious_stub() {
+    core::arch::naked_asm!("iretq")
 }
 
 /// WAKE_RECEIVER ISR stub (vector 0xF0) - cross-core task wakeup (§9.4).

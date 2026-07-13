@@ -24,8 +24,12 @@ REPO_ROOT = Path(__file__).parent.parent
 KERNEL_CFG = REPO_ROOT / "kernel" / "src" / "task" / "mod.rs"
 SERVICES   = REPO_ROOT / "services"
 
-# Every service that ships a contract. (Test/probe fixtures deliberately have none.)
-CONTRACTED = ["block-driver", "fs", "logger", "net-stack", "nic-driver", "supervisor"]
+# Every service that ships a contract, derived from the tree (audit U13): a NEW service that adds a
+# `contracts/<name>.toml` is reconciled automatically - it cannot ship a contract that silently
+# disagrees with the kernel just because a hand-list forgot it. (Test/probe fixtures deliberately have
+# no `.toml`, so they are not in this set.)
+CONTRACTED = sorted(d.name for d in SERVICES.iterdir()
+                    if (d / "contracts" / f"{d.name}.toml").exists())
 
 
 def parse_toml(path: Path) -> dict:

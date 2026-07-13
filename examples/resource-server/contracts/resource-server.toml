@@ -23,10 +23,12 @@ log_write   = true                 # may write to the logger
 
 # IMPORTANT: the authority to MINT resources (RESOURCE_MINT) is NOT a contract capability field -
 # it is not in the schema and cannot be requested here. Like a driver's MMIO BAR, it is granted BY
-# NAME inside the kernel, only to authorized minters (today: `fs`); see examples/e1000 for that same
-# by-name kernel-grant mechanism. Without that grant `ctx.resource_mint` returns None and this
-# example idles (graceful degrade, §7.10 / §3.12). Enabling this example for real means adding that
-# kernel grant for the name "resource-server" - exactly as the e1000 example adds its BAR hook.
+# NAME inside the kernel, declared in the `service_hw` table (kernel/src/task/mod.rs: the resource-mint
+# flag on `"fs" | "net-stack" | "resource-server" => (HwClass::None, true)`), the ONE place minting
+# authority is named - only authorized minters get it. Without that grant `ctx.resource_mint` returns
+# None and this example idles (graceful degrade, §7.10 / §3.12). This example is already listed there,
+# so `osdev test resource-server` runs it for real; every other build never spawns it, so the flag
+# never fires. (For non-hardware privileges the sibling table is `service_privileges`; audit U15.)
 
 # No [placement] section - omit it (as here) and the supervisor ROUND-ROBINS this service across the
 # ready cores: the right default for almost every service. (Omitting does NOT mean "core 0".) Pin a
