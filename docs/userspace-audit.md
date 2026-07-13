@@ -289,7 +289,7 @@ utility conventions.
 | **U6** no compile guard baked-script < 64 KiB | **FIXED** | hygiene - `const _: () = assert!(SELFCHECK_GS.len() < 65536)` + a `while` const-loop over every LIBRARY entry |
 | **U7** shell-test dead DNS assertion | **FIXED** | test-drift - `shell_test.rs:214` now matches the live "returned no A record" / "no reply from the DNS server" / "did not answer the resolve" lines |
 | **U8** observe q-loop break checks `.valid` not name | **FIXED** | rare slot-reuse - break also on `state == Dead` OR a `name_str() != "observe-live"` mismatch |
-| **U9** OUR_MAC hardcoded, not reconciled | **FIXED (code); HW run pending** | III - net-stack now LEARNS its MAC from nic-driver's `[3]` reply (`learn_our_mac`, bytes 1..7) and threads it as `our_mac` through every frame builder (mirroring `our_ip`, no globals); the hardcoded const is deleted. Zero MAC (no NIC) -> stay unconfigured. QEMU: DHCP + ARP complete with the learned MAC (byte-identical to the old const there, so no regression). The real-MAC-vs-promiscuous distinction only shows on the T630 (real RTL8168 MAC != 52:54); T630 run is the sign-off - see the U9 note below |
+| **U9** OUR_MAC hardcoded, not reconciled | **FIXED + HW-SIGNED-OFF (T630)** | III - net-stack now LEARNS its MAC from nic-driver's `[3]` reply (`learn_our_mac`, bytes 1..7) and threads it as `our_mac` through every frame builder (mirroring `our_ip`, no globals); the hardcoded const is deleted. Zero MAC (no NIC) -> stay unconfigured. **T630 (2026-07-13): the RTL8168's real MAC `7c:d3:0a:2b:b0:e3` (not 52:54) drove the full dance - DHCP leased `192.168.4.98`, ARP resolved the gateway, ICMP ping OK, an interactive `ping` ran 14/16 replies @ ~707us avg, no panic.** ICMP even works on HW where slirp cannot. See the U9 note below |
 | **U10** open-socket grant-fail replies nothing | **FIXED** | inv12 - the `!granted` arm now `try_send [0]` so the caller wakes instead of blocking on a reply that never comes |
 | **U11** net-stack calibrate_tsc_hz unbounded RTC spin | **FIXED** | VIII-edge - each wait bounded by a `SPIN_MAX` yield count; a frozen clock returns 0 (the existing RTT fallback) instead of hanging boot |
 | **U12** auto-config gate covers only net/ping | **FIXED** | IX - gate now covers ops 0/1/3/6 (net/dns/ping/arp), every network-using op; op 8 renew already forces a dance, op 2 open only mints |
@@ -383,9 +383,15 @@ and needs a real multi-subnet network to validate.
   runs the NIC promiscuous (a spoofed source was forgiven), and switching to the real MAC changes the
   DHCP lease identity - a live-network behavior change worth confirming on the actual network, not
   assuming. QEMU can't settle it (its e1000 MAC *is* `52:54:...`, so learned == old const, byte-identical
-  - DHCP + ARP verified green, no regression, but no new information). The user has a T630 to test it on
-  real hardware, which is exactly what the deferral was waiting on; that T630 boot is the sign-off (the
-  RTL8168's real burned-in MAC != 52:54, so it exercises the advertise-real-MAC path QEMU cannot).
+  - DHCP + ARP verified green, no regression, but no new information). The deferral was waiting on a
+  real-hardware boot, which the T630 provided.
+  **T630 sign-off (2026-07-13, `build/serial_output.log`):** nic-driver read the RTL8168's real MAC
+  `7c:d3:0a:2b:b0:e3` (Realtek OUI, NOT the old 52:54 const); advertising it, net-stack completed the
+  full dance on the live network - `DHCP - offered 192.168.4.98, gw 192.168.4.1`, `ARP - 192.168.4.1 is
+  at 00:ab:48:da:1b:0d`, `ICMP - 192.168.4.1 echo reply (ping OK)`; `net nic-mac` reported the same real
+  MAC; an interactive `ping` ran 14/16 replies @ ~707us avg. No panic. The router leased to the real MAC
+  with no reservation/port-security snag, and ICMP completed where QEMU slirp never does - a *stronger*
+  result than the promiscuous-forgiveness path it replaced. U9 closed.
 - **U10. [inv12]** `net-stack` open-socket (op 2) grant-failure path (:694) replies nothing on a
   `derive_cap`/grant failure; the client eats its full deadline instead of a loud fast `[0]` (the
   slot-exhausted arm does reply). `try_send_by_handle(reply_cap, &[0])`.
