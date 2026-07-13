@@ -275,6 +275,12 @@ present-and-correct.** The core kernel came back clean; the one real finding is 
 
 ### Confirmed violation (fix this)
 
+> **Status (2026-07-13): K1 FIXED on `feat/audit-kernel-and-userspace`.** All five exception stubs now
+> bound the asm THRE poll with an `ecx` spin counter (~1M, mirroring `SERIAL_THRE_NOLCK_CAP`), falling
+> through to the breadcrumb write best-effort on timeout - so a ring-3 fault on a wedged UART kills the
+> task instead of spinning the core forever. `ecx` is safe scratch there (the stubs that need `rcx`
+> reload it from the stack after the poll). Kernel + image build clean.
+
 #### K1. [MED] `kernel/src/arch/x86_64/boot.rs:1291,1336,1514,1592,1622` - arch-cpu (unbounded-loop / invariant 12)
 
 **What.** The five naked exception stubs (`gpf_stub`, `pf_stub`, `exception_halt`, `exc_stub_noec`,

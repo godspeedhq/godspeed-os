@@ -1288,9 +1288,17 @@ unsafe extern "C" fn gpf_stub() -> ! {
     core::arch::naked_asm!(
         // Raw 'G' to COM1 as absolute first instruction.
         "mov dx, 0x3fd",
+        // Bounded THRE poll (mirrors SERIAL_THRE_NOLCK_CAP): a present-but-wedged COM1 (THRE stuck
+        // clear) must NOT hang a fault handler forever - a ring-3 fault would otherwise spin this core
+        // with IF=0 (invariant 12, audit K1). ecx is a safe scratch here (the stubs that need rcx
+        // reload it from the stack after this poll). On timeout, emit the breadcrumb best-effort.
+        "mov ecx, 1000000",
         "88: in al, dx",
         "test al, 0x20",
-        "jz 88b",
+        "jnz 89f",
+        "dec ecx",
+        "jnz 88b",
+        "89:",
         "mov dx, 0x3f8",
         "mov al, 0x47",   // 'G'
         "out dx, al",
@@ -1334,9 +1342,17 @@ unsafe extern "C" fn pf_stub() -> ! {
         // flood independent of all other handler logic.  dx/al are scratch;
         // this handler never returns to the interrupted context.
         "mov dx, 0x3fd",
+        // Bounded THRE poll (mirrors SERIAL_THRE_NOLCK_CAP): a present-but-wedged COM1 (THRE stuck
+        // clear) must NOT hang a fault handler forever - a ring-3 fault would otherwise spin this core
+        // with IF=0 (invariant 12, audit K1). ecx is a safe scratch here (the stubs that need rcx
+        // reload it from the stack after this poll). On timeout, emit the breadcrumb best-effort.
+        "mov ecx, 1000000",
         "88: in al, dx",
         "test al, 0x20",
-        "jz 88b",
+        "jnz 89f",
+        "dec ecx",
+        "jnz 88b",
+        "89:",
         "mov dx, 0x3f8",
         "mov al, 0x50",   // 'P'
         "out dx, al",
@@ -1512,9 +1528,17 @@ unsafe extern "C" fn exception_halt() -> ! {
         // Raw '?' to COM1 as absolute first instruction - fires for every
         // unhandled exception vector before cli or flag-set.
         "mov dx, 0x3fd",
+        // Bounded THRE poll (mirrors SERIAL_THRE_NOLCK_CAP): a present-but-wedged COM1 (THRE stuck
+        // clear) must NOT hang a fault handler forever - a ring-3 fault would otherwise spin this core
+        // with IF=0 (invariant 12, audit K1). ecx is a safe scratch here (the stubs that need rcx
+        // reload it from the stack after this poll). On timeout, emit the breadcrumb best-effort.
+        "mov ecx, 1000000",
         "88: in al, dx",
         "test al, 0x20",
-        "jz 88b",
+        "jnz 89f",
+        "dec ecx",
+        "jnz 88b",
+        "89:",
         "mov dx, 0x3f8",
         "mov al, 0x3f",   // '?'
         "out dx, al",
@@ -1590,9 +1614,17 @@ unsafe extern "C" fn exc_stub_noec() -> ! {
     core::arch::naked_asm!(
         // Raw '?' to COM1, then set the reached-flag BEFORE cli (so other cores can observe it).
         "mov dx, 0x3fd",
+        // Bounded THRE poll (mirrors SERIAL_THRE_NOLCK_CAP): a present-but-wedged COM1 (THRE stuck
+        // clear) must NOT hang a fault handler forever - a ring-3 fault would otherwise spin this core
+        // with IF=0 (invariant 12, audit K1). ecx is a safe scratch here (the stubs that need rcx
+        // reload it from the stack after this poll). On timeout, emit the breadcrumb best-effort.
+        "mov ecx, 1000000",
         "88: in al, dx",
         "test al, 0x20",
-        "jz 88b",
+        "jnz 89f",
+        "dec ecx",
+        "jnz 88b",
+        "89:",
         "mov dx, 0x3f8",
         "mov al, 0x3f",   // '?'
         "out dx, al",
@@ -1620,9 +1652,17 @@ unsafe extern "C" fn exc_stub_noec() -> ! {
 unsafe extern "C" fn exc_stub_ec() -> ! {
     core::arch::naked_asm!(
         "mov dx, 0x3fd",
+        // Bounded THRE poll (mirrors SERIAL_THRE_NOLCK_CAP): a present-but-wedged COM1 (THRE stuck
+        // clear) must NOT hang a fault handler forever - a ring-3 fault would otherwise spin this core
+        // with IF=0 (invariant 12, audit K1). ecx is a safe scratch here (the stubs that need rcx
+        // reload it from the stack after this poll). On timeout, emit the breadcrumb best-effort.
+        "mov ecx, 1000000",
         "88: in al, dx",
         "test al, 0x20",
-        "jz 88b",
+        "jnz 89f",
+        "dec ecx",
+        "jnz 88b",
+        "89:",
         "mov dx, 0x3f8",
         "mov al, 0x3f",   // '?'
         "out dx, al",

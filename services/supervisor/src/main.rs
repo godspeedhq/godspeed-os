@@ -243,7 +243,11 @@ fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap) -> u32 {
         // "resurrect" a deliberately-skipped driver on the first death notification, undoing the skip.
         // Mirrors converge's `map.get(...).is_none()` guard.
         if alive[i] || map.get(MANAGED[i]).is_none() { continue; }
-        if respawn_managed(ctx, map, MANAGED[i]) {
+        // respawn_RETRY, not a single respawn_managed: the reconcile backstop recovers a service whose
+        // death NOTIFICATION was dropped (endpoint overflow under a storm), so a transient respawn
+        // failure here has no later death to ride - it must retry to satisfaction like the death arms
+        // do (§IX, audit U3; the M5 fix reached the arms but not this backstop).
+        if respawn_retry(ctx, map, MANAGED[i]) {
             n += 1;
             ctx.log_fmt(format_args!("supervisor: reconcile respawned {} (missed death notification)", MANAGED[i]));
         }

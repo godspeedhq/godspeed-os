@@ -280,9 +280,9 @@ utility conventions.
 
 | Item | Status | Note |
 |------|--------|------|
-| **U1** eval_cond unbounded native recursion | open | §26.6.1 - iterative parity count of leading `!` |
-| **U2** reserved words shadowable as for-var/fn-param | open | III/§26.4 - apply `valid_var_name` in `set_loop_var` + `dispatch_call` |
-| **U3** supervisor `reconcile()` backstop single-shot | open | IX - swap `respawn_managed` -> `respawn_retry` (1 line) |
+| **U1** eval_cond unbounded native recursion | **FIXED** | §26.6.1 - `eval_cond` strips `!` iteratively (parity) + `eval_cond_bare`; selfcheck `!!`/`!!!` parity asserts |
+| **U2** reserved words shadowable as for-var/fn-param | **FIXED** | III/§26.4 - reserved check moved to the `define` funnel (`VarErr::Reserved`) so `let`/loop-var/fn-param all refuse loudly; QEMU-verified (`fn f self`/`for args` refused, no stale read) |
+| **U3** supervisor `reconcile()` backstop single-shot | **FIXED** | IX - `reconcile` now calls `respawn_retry` (the M5 backstop gap closed) |
 | **M4** net identity-cache reconcile | STILL DEFERRED | trades against instant-replug; needs a real multi-subnet net |
 | U4 probe q-abort returns Ok | open | VIII/truth - `Aborted -> Err` in net_dns/ping so `online` doesn't false-pass |
 | U5 args past 9 silently dropped | open | §26.6 - one loud line |

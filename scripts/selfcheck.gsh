@@ -124,6 +124,13 @@ countdown 3                              # -> t-3, t-2, t-1, liftoff
 fn is_ready { echo yes }                 # a function used AS an `if` condition: if myfn (branch on result)
 if is_ready { echo iffn-then | assert contains iffn-then } else { fail "if myfn: Ok must take then" }
 if !is_ready { fail "if !myfn must take else" } else { echo iffn-neg | assert contains iffn-neg }
+# audit U1: multi-`!` negation is ITERATIVE (no native recursion / stack overflow). Parity must hold.
+if !!5 > 3 { echo neg-even | assert contains neg-even } else { fail "!! should be identity (true)" }
+if !!!5 > 3 { fail "!!! of true should be false" } else { echo neg-odd | assert contains neg-odd }
+# audit U2: reserved parameter words cannot be bound - as a let, a loop var, or a fn param.
+assert fails let self = x
+assert fails let args = x
+assert fails let arg1 = x
 
 echo ''
 echo '===== 9. DEFER - cleanup on scope exit, LIFO, even on fail ====='

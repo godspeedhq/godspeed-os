@@ -1674,7 +1674,7 @@ struct Vars {
 
 /// Why a variable operation failed (each maps to a loud console line).
 #[derive(Clone, Copy)]
-enum VarErr { TableFull, ArenaFull, NameTooLong, Redeclare, Undeclared, Immutable, ValueTooLong }
+enum VarErr { TableFull, ArenaFull, NameTooLong, Redeclare, Undeclared, Immutable, ValueTooLong, Reserved }
 
 impl Vars {
     fn new() -> Self {
@@ -1743,6 +1743,10 @@ impl Vars {
     }
     fn define(&mut self, name: &[u8], val: &[u8], mutable: bool) -> Result<(), VarErr> {
         if name.len() > VAR_NAME_MAX { return Err(VarErr::NameTooLong); }
+        // Reserved parameter words resolve before variables (`push_ref`), so a binding that shadows
+        // one is unreadable - refuse it loudly at THE binding funnel (covers `let`, for-loop vars, and
+        // fn params alike; §26.4, audit U2). `let` also pre-checks via `valid_var_name`.
+        if is_reserved_param_name(name) { return Err(VarErr::Reserved); }
         // Redeclare is scope-LOCAL: a function's local may shadow a global of the same name.
         let base = self.base();
         for i in base..self.count { if self.name_eq(i, name) { return Err(VarErr::Redeclare); } }
@@ -1799,6 +1803,7 @@ fn var_err_msg(ctx: &ServiceContext, name: &str, e: VarErr) {
         VarErr::Undeclared => ctx.console_writeln_fmt(format_args!("gsh: cannot reassign undeclared '{}'", name)),
         VarErr::Immutable => ctx.console_writeln_fmt(format_args!("gsh: cannot reassign immutable '{}' (declare it 'let mut')", name)),
         VarErr::ValueTooLong => ctx.console_writeln_fmt(format_args!("gsh: value for mutable '{}' too long (max {} bytes)", name, MUT_SLOT)),
+        VarErr::Reserved => ctx.console_writeln_fmt(format_args!("gsh: '{}' is a reserved parameter word ($arg1..$arg9/$args/$argcount/$self) - cannot be a variable, loop var, or fn param", name)),
     }
 }
 
@@ -1958,16 +1963,19 @@ fn expand_val(ctx: &ServiceContext, s: &str, vars: &Vars, params: &Params, out: 
 }
 
 /// A gsh identifier: starts with a letter or `_`, then letters/digits/`_`, bounded length.
+/// A reserved parameter WORD ($args/$argcount/$self/$arg1..$arg9). These resolve before variables in
+/// `push_ref`, so a binding that shadows one could never be read back - every binding path refuses them.
+fn is_reserved_param_name(b: &[u8]) -> bool {
+    matches!(b, b"args" | b"argcount" | b"self")
+        || (b.len() == 4 && &b[..3] == b"arg" && (b'1'..=b'9').contains(&b[3]))
+}
+
 fn valid_var_name(name: &str) -> bool {
     let b = name.as_bytes();
     if b.is_empty() || b.len() > VAR_NAME_MAX { return false; }
     if !(b[0] == b'_' || b[0].is_ascii_alphabetic()) { return false; }
     if !b.iter().all(|&c| c == b'_' || c.is_ascii_alphanumeric()) { return false; }
-    // The reserved parameter words ($args/$argcount/$self/$arg1..$arg9) resolve before variables
-    // in `push_ref`, so a binding with one of these names could never be read back - refuse it
-    // loudly here instead of letting it shadow silently (§26.4).
-    if matches!(b, b"args" | b"argcount" | b"self") { return false; }
-    if b.len() == 4 && &b[..3] == b"arg" && (b'1'..=b'9').contains(&b[3]) { return false; }
+    if is_reserved_param_name(b) { return false; } // never let a binding shadow a reserved param (§26.4)
     true
 }
 
@@ -2248,11 +2256,18 @@ fn eval_arith(ctx: &ServiceContext, expr: &str, vars: &Vars, params: &Params) ->
 /// (membership), `<lhs> <op> <rhs>` (comparison; `result` compares by kind), or a command (true iff
 /// it returns `Ok`). A command condition does NOT update `result` - only real statements do.
 fn eval_cond(ctx: &ServiceContext, cwd: &mut Cwd, cond: &str, vars: &Vars, params: &Params, prev: Result<(), ShellError>, depth: u8) -> bool {
-    let cond = cond.trim();
+    // Strip leading `!` ITERATIVELY (a parity flag), never by native recursion: a long `!!!...` run
+    // would otherwise recurse once per `!` and overflow the bounded user stack (§26.6.1 - the
+    // no-native-recursion rule every other gsh construct obeys). Then evaluate the bare condition once.
+    let mut c = cond.trim();
+    let mut negate = false;
+    while let Some(rest) = c.strip_prefix('!') { negate = !negate; c = rest.trim(); }
+    eval_cond_bare(ctx, cwd, c, vars, params, prev, depth) ^ negate
+}
+
+/// Evaluate a condition that has had any leading `!` already stripped (see `eval_cond`). `cond` is trimmed.
+fn eval_cond_bare(ctx: &ServiceContext, cwd: &mut Cwd, cond: &str, vars: &Vars, params: &Params, prev: Result<(), ShellError>, depth: u8) -> bool {
     if cond.is_empty() { ctx.console_writeln("gsh: empty condition"); return false; }
-    if let Some(rest) = cond.strip_prefix('!') {
-        return !eval_cond(ctx, cwd, rest.trim(), vars, params, prev, depth);
-    }
     // Scan tokens for `in` (membership) or a comparison operator, so either side may be a multi-token
     // arithmetic expression (`$i + 1 > $max`), not just a single token (docs/scripting.md §3-§4).
     let cb = cond.as_bytes();
