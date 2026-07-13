@@ -357,3 +357,30 @@ falling through to the breadcrumb write best-effort on timeout - exactly as the 
   *death*, which already unregisters - Audit-1 Item 2.)
 - The B-set of correctly-loud panics (generation overflow, endpoint-id/routing exhaustion, liveness/
   shootdown watchdogs, W^X asserts) is unchanged from Audit 1/2 and re-confirmed as the defense.
+
+### Hardware sign-off - 2026-07-13 (HP T630, AMD GX-420GI)
+
+The Audit-3 fixes are validated on real silicon, not just QEMU. Built a clean `--mode identity` image
+from `feat/audit-kernel-and-userspace` (`cargo clean` + `osdev image --mode identity`, copied before any
+rebuild), pre-flighted it under QEMU/OVMF (UEFI path, green), then flashed and booted it on the T630
+(serial `build/serial_output.log`, 22:02-22:05).
+
+- **Boot + bring-up clean:** 4 cores ready; syscall init on every core (LSTAR/EFER/GS correct); **W^X
+  audit ok** (kernel-text W=0/NX=0, kernel-data W=1/NX=1); `supervisor: ready`, `logger: ready`.
+- **Real AMD-Vi IOMMU** (which QEMU cannot faithfully exercise) came up end to end: IVRS found, device
+  table + rings programmed, **translation ON, zero fault events**, block-driver in passthrough
+  (`CONFINE_USB_DRIVERS=true`). No IO_PAGE_FAULT.
+- **Self-run identity checks all pass:** cap-test 2A/2B/2C + revoke + endpoint-dead + grant; ipc-test
+  routing; probe 3A/3B/4A/5A/5B/9B/7A/7B; **8A yielder ticked** (preemption); 11A ready.
+- **Steady state healthy:** cross-core ping/pong climbing one/sec with no gaps (`pong: received "127"`
+  ~2 min in). **No panic, no exception, no spurious-vector/LAPIC anomaly.**
+
+Bearing on the Audit-3 fixes specifically: **K1** (bounded THRE poll) and **K3** (spurious-vector
+`iretq` stub) exercise the arch fault/interrupt path that only fully lights up on real hardware - the
+machine ran the fault-touching self-checks and idled/serviced interrupts for minutes with no wedge;
+**K2** (BSP LAPIC ceiling) is on the AP-bring-up path that printed all 4 cores ready with no
+`unaddressable`/mis-route line; **U15** (`service_privileges`) is proven live because every service
+that needs a privileged cap (supervisor spawn, probe kill/introspect for the self-run tests) got it and
+the negative pins (A11/A12/A13, verified in QEMU) hold. On-silicon sign-off: the audited kernel boots,
+self-checks, and runs clean on the AMD GX-420GI. (The host-driven 24-case suite - Tests 1B/6/10/12/13/15,
+which need the control channel - remains the QEMU gate, 24/0 on this branch.)

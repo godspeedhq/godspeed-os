@@ -298,6 +298,16 @@ utility conventions.
 | **U15** six privileged grants still name-keyed | **FIXED** | VII/IV - all six (SPAWN/CONSOLE_PUSH/INTROSPECT/SERVICE_CONTROL/REBOOT/ACQUIRE_ANY) centralized into ONE `service_privileges(name, is_probe)` table (the `service_hw` doctrine); ServiceConfig field-promotion rejected (218 all-false rows, §26.13). adv A11/A12/A13 green |
 | **L8** SDK recv()/console_read() `loop{}` on error | **FIXED (partial, by design)** | inv12 - the reachable `console_read` slot-guard now logs loudly then parks; the magic-mismatch guards park with a comment (a corrupt ctx can't be logged through - the service-level analog of kernel halt-on-corruption, §6.2) |
 
+> **Hardware sign-off - 2026-07-13 (HP T630, AMD GX-420GI).** The audit branch was flashed and booted
+> on real silicon (clean `--mode identity` image; serial `build/serial_output.log`). Relevant to this
+> doc's **U15** (`service_privileges` centralization): the T630 boot exercised it live - every service
+> that needs a privileged cap got it (supervisor spawn, probe kill/introspect for the self-run identity
+> checks), all self-run tests passed, and the negative cap-gating pins (A11/A12/A13) hold in QEMU. No
+> panic/exception; cross-core ping/pong ran clean for minutes. Full on-silicon detail is in
+> `docs/kernel-audit.md` "Hardware sign-off". The shell/net-stack userspace fixes (U4-U14) were verified
+> in QEMU (script + selfcheck 4/0); the `--mode identity` hardware image does not run the shell, so their
+> hardware exercise rides the general v0.4.0 selfcheck soak, not this identity boot.
+
 ### MED findings (fix these)
 
 #### U1. [§26.6.1] `services/shell/src/main.rs:2253` (`eval_cond`) - unbounded native recursion on leading `!`
