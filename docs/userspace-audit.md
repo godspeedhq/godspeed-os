@@ -289,7 +289,7 @@ utility conventions.
 | **U6** no compile guard baked-script < 64 KiB | **FIXED** | hygiene - `const _: () = assert!(SELFCHECK_GS.len() < 65536)` + a `while` const-loop over every LIBRARY entry |
 | **U7** shell-test dead DNS assertion | **FIXED** | test-drift - `shell_test.rs:214` now matches the live "returned no A record" / "no reply from the DNS server" / "did not answer the resolve" lines |
 | **U8** observe q-loop break checks `.valid` not name | **FIXED** | rare slot-reuse - break also on `state == Dead` OR a `name_str() != "observe-live"` mismatch |
-| U9 OUR_MAC hardcoded, not reconciled | DEFERRED | III - learn from nic-driver `[3]` status; needs T630 HW re-validation (the hardcoded MAC is part of the HW-proven DHCP path) - defer with the same discipline as M4 |
+| **U9** OUR_MAC hardcoded, not reconciled | **FIXED (code); HW run pending** | III - net-stack now LEARNS its MAC from nic-driver's `[3]` reply (`learn_our_mac`, bytes 1..7) and threads it as `our_mac` through every frame builder (mirroring `our_ip`, no globals); the hardcoded const is deleted. Zero MAC (no NIC) -> stay unconfigured. QEMU: DHCP + ARP complete with the learned MAC (byte-identical to the old const there, so no regression). The real-MAC-vs-promiscuous distinction only shows on the T630 (real RTL8168 MAC != 52:54); T630 run is the sign-off - see the U9 note below |
 | **U10** open-socket grant-fail replies nothing | **FIXED** | inv12 - the `!granted` arm now `try_send [0]` so the caller wakes instead of blocking on a reply that never comes |
 | **U11** net-stack calibrate_tsc_hz unbounded RTC spin | **FIXED** | VIII-edge - each wait bounded by a `SPIN_MAX` yield count; a frozen clock returns 0 (the existing RTT fallback) instead of hanging boot |
 | **U12** auto-config gate covers only net/ping | **FIXED** | IX - gate now covers ops 0/1/3/6 (net/dns/ping/arp), every network-using op; op 8 renew already forces a dance, op 2 open only mints |
@@ -373,6 +373,19 @@ and needs a real multi-subnet network to validate.
 - **U9. [III]** `net-stack` `OUR_MAC` (:27) is a hardcoded constant, never reconciled with the NIC's
   real MAC (which nic-driver reports as truth in its `[3]` status). Two GodspeedOS boxes on one LAN
   mutually ARP-poison. Learn `our_mac` from the first `[3]` at `run_dance` start.
+  **FIXED (2026-07-13).** `run_dance` now calls `learn_our_mac` FIRST (queries `[3]`, takes bytes 1..7);
+  a zero/short reply (no NIC / driver not up) returns an unconfigured `NetState` and the
+  auto-config-on-link path retries. The learned `[u8;6]` is added to `NetState.our_mac` and threaded as
+  a parameter through every frame builder (`dhcp_discover` / `dns_resolve` / `udp_roundtrip` /
+  `build_arp_reply` / `arp_resolve` / `ping`) and the main-loop mutable set - the same no-globals pattern
+  as `our_ip` (Commandment VI). The `OUR_MAC` const is deleted; nothing hardcodes a MAC. **Why it was
+  deferred and how the deferral was cleared:** the const only "worked" on the T630 because nic-driver
+  runs the NIC promiscuous (a spoofed source was forgiven), and switching to the real MAC changes the
+  DHCP lease identity - a live-network behavior change worth confirming on the actual network, not
+  assuming. QEMU can't settle it (its e1000 MAC *is* `52:54:...`, so learned == old const, byte-identical
+  - DHCP + ARP verified green, no regression, but no new information). The user has a T630 to test it on
+  real hardware, which is exactly what the deferral was waiting on; that T630 boot is the sign-off (the
+  RTL8168's real burned-in MAC != 52:54, so it exercises the advertise-real-MAC path QEMU cannot).
 - **U10. [inv12]** `net-stack` open-socket (op 2) grant-failure path (:694) replies nothing on a
   `derive_cap`/grant failure; the client eats its full deadline instead of a loud fast `[0]` (the
   slot-exhausted arm does reply). `try_send_by_handle(reply_cap, &[0])`.

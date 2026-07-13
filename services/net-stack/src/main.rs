@@ -21,10 +21,12 @@
 
 use godspeed_sdk::{ServiceContext, Message, DeadlineOutcome};
 
-// The NIC's MAC. In QEMU the e1000 default is 52:54:00:12:34:56; a real net-stack learns this from
-// nic-driver at init (a small refinement), but nic-driver runs the NIC promiscuous, so a reply is
-// received whatever sender MAC we advertise - this keeps the focus on the protocols.
-const OUR_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+// Our MAC is LEARNED from the NIC, never hardcoded (audit U9 / Commandment III). The controller's
+// burned-in MAC is the one source of truth for our hardware identity; nic-driver reads it (RTL8168
+// IDR0-5 / e1000 RAL0-RAH0) and returns it in the `[3]` status reply, and `learn_our_mac` threads it
+// through the frame builders as `our_mac`. Previously a hardcoded QEMU default (52:54:00:12:34:56) rode
+// on the driver's promiscuous RX forgiving a spoofed source; advertising the real MAC is what every
+// real stack does and drops the second source of truth. A zero MAC (no NIC) => stay unconfigured.
 // QEMU user-net: the guest is 10.0.2.15, the virtual gateway (which answers ARP + ICMP) is 10.0.2.2.
 const FALLBACK_IP: [u8; 4] = [10, 0, 2, 15]; // used ONLY if DHCP returns no offer (no NIC)
 const GATEWAY_IP:  [u8; 4] = [10, 0, 2, 2];
@@ -99,11 +101,11 @@ fn nic_req(ctx: &ServiceContext, msg: &Message, secs: i64) -> Option<Message> {
 /// OFFER. This proves the UDP transport (the layer the socket capability sits on) over the frame
 /// interface. Returns the offered IP, or None (no NIC / nothing answered). A real net-stack would use
 /// this to LEARN its own IP instead of hardcoding it; here it demonstrates the round-trip.
-fn dhcp_discover(ctx: &ServiceContext) -> Option<([u8; 4], [u8; 4], [u8; 4])> {
+fn dhcp_discover(ctx: &ServiceContext, our_mac: &[u8; 6]) -> Option<([u8; 4], [u8; 4], [u8; 4])> {
     // Ethernet(14) + IPv4(20) + UDP(8) + DHCP/BOOTP(244) = 286 bytes.
     let mut frame = [0u8; 286];
     for b in frame[0..6].iter_mut() { *b = 0xff; }       // eth dest = broadcast
-    frame[6..12].copy_from_slice(&OUR_MAC);              // eth src
+    frame[6..12].copy_from_slice(our_mac);               // eth src
     frame[12] = 0x08; frame[13] = 0x00;                  // ethertype = IPv4
     // IPv4 header.
     frame[14] = 0x45; frame[15] = 0x00;
@@ -125,7 +127,7 @@ fn dhcp_discover(ctx: &ServiceContext) -> Option<([u8; 4], [u8; 4], [u8; 4])> {
     frame[44] = 6;                                       // hlen
     frame[46] = 0x39; frame[47] = 0x03; frame[48] = 0xf3; frame[49] = 0x26; // xid (arbitrary)
     frame[52] = 0x80;                                    // flags = broadcast (OFFER comes back broadcast)
-    frame[70..76].copy_from_slice(&OUR_MAC);             // chaddr (client hardware address)
+    frame[70..76].copy_from_slice(our_mac);              // chaddr (client hardware address)
     frame[278] = 0x63; frame[279] = 0x82; frame[280] = 0x53; frame[281] = 0x63; // DHCP magic cookie
     frame[282] = 53; frame[283] = 1; frame[284] = 1;     // option 53 (message type) = DISCOVER
     frame[285] = 255;                                    // option end
@@ -185,7 +187,7 @@ fn dhcp_discover(ctx: &ServiceContext) -> Option<([u8; 4], [u8; 4], [u8; 4])> {
 /// IP, or None (no gateway, malformed name, or no answer - DNS depends on the host's resolver, which
 /// slirp forwards to, so a failure here is a real "no answer", not a bug).
 fn dns_resolve(ctx: &ServiceContext, hostname: &[u8], gw_mac: &[u8; 6], our_ip: &[u8; 4],
-               dns_server: &[u8; 4], got_reply: &mut bool,
+               our_mac: &[u8; 6], dns_server: &[u8; 4], got_reply: &mut bool,
                frames: &mut u16, udp: &mut u16, timeouts: &mut u16) -> Option<[u8; 4]> {
     // frames/udp/timeouts accumulate a DIAGNOSTIC: non-empty frames collected, how many were UDP, and how
     // many nic-driver requests TIMED OUT (net-stack's deadline fired before nic-driver replied). Timeouts
@@ -195,7 +197,7 @@ fn dns_resolve(ctx: &ServiceContext, hostname: &[u8], gw_mac: &[u8; 6], our_ip: 
     let mut frame = [0u8; 512];
     // Ethernet: to the gateway; slirp routes the datagram to its DNS at 10.0.2.3.
     frame[0..6].copy_from_slice(gw_mac);
-    frame[6..12].copy_from_slice(&OUR_MAC);
+    frame[6..12].copy_from_slice(our_mac);
     frame[12] = 0x08; frame[13] = 0x00;              // IPv4
     // --- DNS message at offset 42 (14 Ethernet + 20 IPv4 + 8 UDP). Build it first to size the rest.
     const D: usize = 42;
@@ -258,7 +260,7 @@ fn dns_resolve(ctx: &ServiceContext, hostname: &[u8], gw_mac: &[u8; 6], our_ip: 
             let m = f.len() >= D + 12 && f[12] == 0x08 && f[13] == 0x00 && f[23] == 17
                 && f[36] == 0xc0 && f[37] == 0x01;
             // Otherwise: is this someone (the gateway) ARPing for US? Answer so it can address the reply.
-            let a = !m && build_arp_reply(f, our_ip, &mut arp_out);
+            let a = !m && build_arp_reply(f, our_ip, our_mac, &mut arp_out);
             (m, a)
         };
         if matched {
@@ -318,12 +320,12 @@ struct Socket { rid: u64, port: u16 }
 
 /// Send a UDP datagram (src_port -> dest_ip:dest_port carrying `data`) THROUGH nic-driver and copy the
 /// response's UDP payload into `out`. Returns the payload length, or None (no gateway / no reply).
-fn udp_roundtrip(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], src_port: u16,
-                 dest_ip: &[u8; 4], dest_port: u16, data: &[u8], out: &mut [u8]) -> Option<usize> {
+fn udp_roundtrip(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8; 6],
+                 src_port: u16, dest_ip: &[u8; 4], dest_port: u16, data: &[u8], out: &mut [u8]) -> Option<usize> {
     let mut frame = [0u8; 1600];
     let dlen = data.len().min(frame.len() - 42);
     frame[0..6].copy_from_slice(gw_mac);
-    frame[6..12].copy_from_slice(&OUR_MAC);
+    frame[6..12].copy_from_slice(our_mac);
     frame[12] = 0x08; frame[13] = 0x00;                  // IPv4
     frame[14] = 0x45;
     let total = (20 + 8 + dlen) as u16;
@@ -368,7 +370,7 @@ fn udp_roundtrip(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], src_p
 /// frames collected, all broadcast, no reply). This fires ONLY when someone is actively asking for us,
 /// so on QEMU (slirp already learned us from our own query) it emits nothing - which is why it is safe
 /// where a blind gratuitous ARP before every query was not.
-fn build_arp_reply(f: &[u8], our_ip: &[u8; 4], out: &mut [u8; 42]) -> bool {
+fn build_arp_reply(f: &[u8], our_ip: &[u8; 4], our_mac: &[u8; 6], out: &mut [u8; 42]) -> bool {
     if f.len() < 42 { return false; }
     if f[12] != 0x08 || f[13] != 0x06 { return false; }              // not ARP
     if f[20] != 0x00 || f[21] != 0x01 { return false; }              // not a REQUEST (oper 1)
@@ -376,13 +378,13 @@ fn build_arp_reply(f: &[u8], our_ip: &[u8; 4], out: &mut [u8; 42]) -> bool {
         || f[40] != our_ip[2] || f[41] != our_ip[3] { return false; } // not asking for us
     for b in out.iter_mut() { *b = 0; }
     out[0..6].copy_from_slice(&f[22..28]);   // eth dst = the asker (its sender MAC)
-    out[6..12].copy_from_slice(&OUR_MAC);    // eth src = us
+    out[6..12].copy_from_slice(our_mac);     // eth src = us
     out[12] = 0x08; out[13] = 0x06;          // ethertype = ARP
     out[14] = 0x00; out[15] = 0x01;          // htype = Ethernet
     out[16] = 0x08; out[17] = 0x00;          // ptype = IPv4
     out[18] = 0x06; out[19] = 0x04;          // hlen 6, plen 4
     out[20] = 0x00; out[21] = 0x02;          // oper = reply
-    out[22..28].copy_from_slice(&OUR_MAC);   // sender hw = us
+    out[22..28].copy_from_slice(our_mac);    // sender hw = us
     out[28..32].copy_from_slice(our_ip);     // sender ip = us
     out[32..38].copy_from_slice(&f[22..28]); // target hw = the asker
     out[38..42].copy_from_slice(&f[28..32]); // target ip = the asker's ip
@@ -394,16 +396,16 @@ fn build_arp_reply(f: &[u8], our_ip: &[u8; 4], out: &mut [u8; 42]) -> bool {
 /// reply within the budget. Used by `net arp` (any host) and `net scan` (across the subnet). Same frame
 /// path and bound as `ping`/`dns_resolve`, which is why it is reliable now that the receiver no longer
 /// stalls (RTL8168 RDU recovery) and the deadline no longer glitches (deglitched RTC).
-fn arp_resolve(ctx: &ServiceContext, our_ip: &[u8; 4], target: &[u8; 4]) -> Option<[u8; 6]> {
+fn arp_resolve(ctx: &ServiceContext, our_ip: &[u8; 4], our_mac: &[u8; 6], target: &[u8; 4]) -> Option<[u8; 6]> {
     let mut arp = [0u8; 42];
     for b in arp.iter_mut().take(6) { *b = 0xff; }   // eth dst = broadcast
-    arp[6..12].copy_from_slice(&OUR_MAC);
+    arp[6..12].copy_from_slice(our_mac);
     arp[12] = 0x08; arp[13] = 0x06;                  // ARP
     arp[14] = 0x00; arp[15] = 0x01;                  // htype Ethernet
     arp[16] = 0x08; arp[17] = 0x00;                  // ptype IPv4
     arp[18] = 0x06; arp[19] = 0x04;                  // hlen 6, plen 4
     arp[20] = 0x00; arp[21] = 0x01;                  // oper = request
-    arp[22..28].copy_from_slice(&OUR_MAC);
+    arp[22..28].copy_from_slice(our_mac);
     arp[28..32].copy_from_slice(our_ip);
     arp[38..42].copy_from_slice(target);             // target ip = who we ask for
     let req     = Message::from_bytes(&arp);
@@ -417,7 +419,7 @@ fn arp_resolve(ctx: &ServiceContext, our_ip: &[u8; 4], target: &[u8; 4]) -> Opti
             let hit = f.len() >= 42 && f[12] == 0x08 && f[13] == 0x06 && f[20] == 0x00 && f[21] == 0x02
                 && f[28] == target[0] && f[29] == target[1] && f[30] == target[2] && f[31] == target[3];
             let mac = if hit { let mut m = [0u8; 6]; m.copy_from_slice(&f[22..28]); Some(m) } else { None };
-            let a = mac.is_none() && build_arp_reply(f, our_ip, &mut arp_out);
+            let a = mac.is_none() && build_arp_reply(f, our_ip, our_mac, &mut arp_out);
             (mac, a)
         };
         if let Some(m) = mac { return Some(m); }
@@ -458,13 +460,13 @@ fn calibrate_tsc_hz(ctx: &ServiceContext) -> u64 {
 /// Sends ONCE (the reply arrives with it), then, if the first frame back was a stray broadcast, drains a
 /// BATCH of frames in ONE bounded [9] round-trip and scans it - so a reply behind broadcasts on a busy
 /// LAN is caught without N slow re-queries (which pushed net-stack past the shell's deadline).
-fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8; 4],
+fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8; 6], dest_ip: &[u8; 4],
         payload_len: usize, seq: u16, tsc_hz: u64, frames: &mut u16, timeouts: &mut u16) -> Option<(u16, u8)> {
     let plen = payload_len.min(PING_MAX_PAYLOAD);
     let flen = 42 + plen;
     let mut frame = [0u8; 42 + PING_MAX_PAYLOAD];
     frame[0..6].copy_from_slice(gw_mac);
-    frame[6..12].copy_from_slice(&OUR_MAC);
+    frame[6..12].copy_from_slice(our_mac);
     frame[12] = 0x08; frame[13] = 0x00;              // IPv4
     frame[14] = 0x45;
     let total_len = (20 + 8 + plen) as u16;
@@ -511,7 +513,7 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8;
             let f = r.payload_bytes();
             *frames += 1;
             if is_echo(f) { return Some((rtt_us(), f[22])); }
-            if build_arp_reply(f, our_ip, &mut arp_out) {   // gateway ARPing for us - answer it
+            if build_arp_reply(f, our_ip, our_mac, &mut arp_out) {   // gateway ARPing for us - answer it
                 let _ = nic_req(ctx, &Message::from_bytes(&arp_out), LINK_SECS);
             }
         }
@@ -536,7 +538,7 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8;
             pos += fl;
             *frames += 1;
             if is_echo(f) { return Some((rtt_us(), f[22])); }
-            if build_arp_reply(f, our_ip, &mut arp_out) {
+            if build_arp_reply(f, our_ip, our_mac, &mut arp_out) {
                 let _ = nic_req(ctx, &Message::from_bytes(&arp_out), LINK_SECS);
             }
         }
@@ -550,31 +552,57 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], dest_ip: &[u8;
 /// recovered without a reboot - nothing is special; the LINK recovers like any restartable thing.
 struct NetState {
     our_ip: [u8; 4],
+    our_mac: [u8; 6],   // learned from the NIC (audit U9); [0;6] while unconfigured
     gw_mac: [u8; 6],
     have_mac: bool,
     dns_server: [u8; 4],
     status: [u8; 19],
 }
 
+/// Learn our own MAC from nic-driver's `[3]` status reply (bytes 1..7). This is the one source of truth
+/// for our hardware identity (Commandment III, audit U9): the controller burned it in, nic-driver read
+/// it, and every frame we build advertises it. `None` on a short/zero reply = no NIC (or driver not up
+/// yet) -> the caller stays unconfigured and retries via the auto-config-on-link path.
+fn learn_our_mac(ctx: &ServiceContext) -> Option<[u8; 6]> {
+    let r = nic_req(ctx, &Message::from_bytes(&[3u8]), LINK_SECS)?;
+    let p = r.payload_bytes();
+    if p.len() < 7 { return None; }
+    let mut mac = [0u8; 6];
+    mac.copy_from_slice(&p[1..7]);
+    if mac == [0u8; 6] { None } else { Some(mac) }
+}
+
 /// Run the DHCP -> ARP -> ICMP dance once and freeze the 19-byte status. Called at boot, and again by the
 /// `net renew` op so a cable plugged in after boot (or a link that came up late) reconfigures the stack in
 /// place. Bounded (DHCP/ARP each have their own budget) and loud on each degrade, like the boot path.
 fn run_dance(ctx: &ServiceContext) -> NetState {
+    // ---- Learn our MAC FIRST (audit U9 / Commandment III): every frame below advertises it as the eth
+    // source. Without a NIC identity there is nothing to configure - degrade to unconfigured (same state
+    // as no link); the auto-config-on-link path retries run_dance once the driver reports a MAC.
+    let our_mac = match learn_our_mac(ctx) {
+        Some(m) => m,
+        None => {
+            ctx.log("net-stack: no NIC MAC yet (driver absent/not ready) - staying unconfigured");
+            return NetState { our_ip: FALLBACK_IP, our_mac: [0u8; 6], gw_mac: [0u8; 6],
+                              have_mac: false, dns_server: GATEWAY_IP, status: [0u8; 19] };
+        }
+    };
+
     // ---- Phase 3: DHCP FIRST, so net-stack LEARNS its own IP (self-configuring). Falls back to a default
     // only if there is no NIC / no offer (nic-driver serves empty replies). The IP it returns is the one
     // ARP + ICMP use below.
-    let (our_ip, gateway, dns_server) = dhcp_discover(ctx).unwrap_or((FALLBACK_IP, GATEWAY_IP, GATEWAY_IP));
+    let (our_ip, gateway, dns_server) = dhcp_discover(ctx, &our_mac).unwrap_or((FALLBACK_IP, GATEWAY_IP, GATEWAY_IP));
 
     // ---- Phase 2 step 1: ARP - who-has GATEWAY_IP, tell our_ip (a broadcast request).
     let mut arp = [0u8; 42];
     for b in arp.iter_mut().take(6) { *b = 0xff; }   // eth dest = broadcast
-    arp[6..12].copy_from_slice(&OUR_MAC);            // eth src
+    arp[6..12].copy_from_slice(&our_mac);           // eth src
     arp[12] = 0x08; arp[13] = 0x06;                  // ethertype = ARP
     arp[14] = 0x00; arp[15] = 0x01;                  // htype = Ethernet
     arp[16] = 0x08; arp[17] = 0x00;                  // ptype = IPv4
     arp[18] = 0x06; arp[19] = 0x04;                  // hlen 6, plen 4
     arp[20] = 0x00; arp[21] = 0x01;                  // oper = request
-    arp[22..28].copy_from_slice(&OUR_MAC);           // sender hw
+    arp[22..28].copy_from_slice(&our_mac);           // sender hw
     arp[28..32].copy_from_slice(&our_ip);           // sender ip (learned via DHCP)
     arp[38..42].copy_from_slice(&gateway);           // target ip = DHCP-learned gateway (0 hw = the question)
 
@@ -609,7 +637,7 @@ fn run_dance(ctx: &ServiceContext) -> NetState {
 
     // ---- Phase 2 step 2: ICMP - ping the gateway to confirm it answers. Only once ARP gave us its MAC.
     let (mut _pf, mut _pt) = (0u16, 0u16);
-    let ping_ok = have_mac && ping(ctx, &gw_mac, &our_ip, &gateway, 32, 0, 0, &mut _pf, &mut _pt).is_some();
+    let ping_ok = have_mac && ping(ctx, &gw_mac, &our_ip, &our_mac, &gateway, 32, 0, 0, &mut _pf, &mut _pt).is_some();
     if ping_ok {
         ctx.log_fmt(format_args!("net-stack: ICMP - {}.{}.{}.{} echo reply (ping OK)",
             gateway[0], gateway[1], gateway[2], gateway[3]));
@@ -626,7 +654,7 @@ fn run_dance(ctx: &ServiceContext) -> NetState {
     status[8..14].copy_from_slice(&gw_mac);
     status[14] = (have_mac as u8) | ((ping_ok as u8) << 1);
     status[15..19].copy_from_slice(&dns_server);
-    NetState { our_ip, gw_mac, have_mac, dns_server, status }
+    NetState { our_ip, our_mac, gw_mac, have_mac, dns_server, status }
 }
 
 /// Read the NIC link state from nic-driver's `[3]` status. RTL8168: byte 7 = link up. On the QEMU e1000
@@ -647,6 +675,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // dance in place - a link that comes up after boot recovers without a reboot.
     let d = run_dance(&ctx);
     let mut our_ip = d.our_ip;
+    let mut our_mac = d.our_mac;                   // learned from the NIC (audit U9), re-learned on each dance
     let mut gw_mac = d.gw_mac;
     let mut have_mac = d.have_mac;
     let mut dns_server = d.dns_server;
@@ -680,7 +709,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         {
             ctx.log("net-stack: link up while unconfigured - auto-configuring");
             let d = run_dance(&ctx);
-            our_ip = d.our_ip; gw_mac = d.gw_mac; have_mac = d.have_mac; dns_server = d.dns_server; status = d.status;
+            our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac; have_mac = d.have_mac; dns_server = d.dns_server; status = d.status;
         }
         if let Some((rid, right)) = badge {
             // Socket-cap invocation - SOP_SEND: transmit a UDP datagram through this socket. Payload =
@@ -691,7 +720,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 if let Some(s) = sockets.iter().find(|s| s.rid == rid && s.rid != 0) {
                     let dip = [pl[0], pl[1], pl[2], pl[3]];
                     let dport = ((pl[4] as u16) << 8) | pl[5] as u16;
-                    udp_roundtrip(&ctx, &gw_mac, &our_ip, s.port, &dip, dport, &pl[6..], &mut resp)
+                    udp_roundtrip(&ctx, &gw_mac, &our_ip, &our_mac, s.port, &dip, dport, &pl[6..], &mut resp)
                 } else { None }
             } else { None };
             match n {
@@ -735,7 +764,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             if have_mac {
                 for server in [dns_server, [8, 8, 8, 8]] {
                     let mut got = false;
-                    ip = dns_resolve(&ctx, &pl[1..], &gw_mac, &our_ip, &server, &mut got,
+                    ip = dns_resolve(&ctx, &pl[1..], &gw_mac, &our_ip, &our_mac, &server, &mut got,
                                      &mut frames, &mut udp, &mut timeouts);
                     any_reply |= got;
                     if ip.is_some() { break; }
@@ -765,7 +794,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 let mut frames = 0u16;
                 let mut timeouts = 0u16;
                 ping_seq = ping_seq.wrapping_add(1);   // distinct per echo so a stale reply can't match
-                match if have_mac { ping(&ctx, &gw_mac, &our_ip, &dip, bytes, ping_seq, tsc_hz, &mut frames, &mut timeouts) } else { None } {
+                match if have_mac { ping(&ctx, &gw_mac, &our_ip, &our_mac, &dip, bytes, ping_seq, tsc_hz, &mut frames, &mut timeouts) } else { None } {
                     Some((rtt, ttl)) => { let r = rtt.to_le_bytes(); [1u8, r[0], r[1], ttl] }
                     // No reply: re-check the link. If it dropped DURING the poll it is "no link" (fast
                     // recovery to the 1s cadence), not a real "Request timed out" on a live link.
@@ -777,7 +806,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // ARP (op 6, then 4 IP bytes): resolve one host's MAC. Reply [found, mac(6)]. `net arp` uses
             // it directly; `net scan` calls it across the subnet.
             let target = [pl[1], pl[2], pl[3], pl[4]];
-            let rb = match arp_resolve(&ctx, &our_ip, &target) {
+            let rb = match arp_resolve(&ctx, &our_ip, &our_mac, &target) {
                 Some(m) => [1u8, m[0], m[1], m[2], m[3], m[4], m[5]],
                 None    => [0u8; 7],
             };
@@ -789,6 +818,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             ctx.log("net-stack: renew - re-running DHCP/ARP/ICMP");
             let d = run_dance(&ctx);
             our_ip = d.our_ip;
+            our_mac = d.our_mac;
             gw_mac = d.gw_mac;
             have_mac = d.have_mac;
             dns_server = d.dns_server;
