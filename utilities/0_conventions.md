@@ -60,6 +60,17 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
    `tree`, `copy`, ...) is simply absent from `NO_PATH_CMDS` and keeps its file completion. So
    when you add a utility: if its args are paths, do nothing; if they are not, add it to
    `NO_PATH_CMDS`.
+
+   **`version` and `help` complete for free - do not list them.** Every utility answers
+   `<util> version` and `<util> help` (rules 5-6), so `complete_keyword` appends them to every
+   command's first-argument completion automatically. Do **not** add `version`/`help` to a
+   `SUBCMD_FIRST` entry (they are deduped in). A utility that takes **no positional first
+   argument** (an info command: `about`, `version`, `mem`, `cores`, `uptime`, `status`, ...) has
+   the universal `version`/`help` as its *only* first-arg subcommands - add it to **`INFO_CMDS`**
+   (beside `NO_PATH_CMDS`) so those two complete and Tab never falls through to a filesystem
+   listing. So a new utility is exactly one of: a **path** command (in neither list), a **keyword**
+   command with specific subcommands (`SUBCMD_FIRST` + `NO_PATH_CMDS`), or an **info** command
+   (`INFO_CMDS`). Pick one; `version`/`help` come along in every case.
 10. **Anything that blocks or waits is escapable with `q`.** If a utility can sit waiting - on
     a peer service, on the network, on a long sweep - then `q`/`Q`/ESC MUST abort it and return
     to the prompt, and a wait of more than a moment advertises `(press q to abort)`. A command

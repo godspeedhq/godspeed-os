@@ -482,11 +482,13 @@ const NO_PATH_CMDS: &[&str] = &[
 /// Commands whose FIRST argument (the token right after the command, within its pipe segment) is a
 /// fixed keyword - completed only at that position. Pipe-stage verbs (`to`/`from`/`sort`/`match`) are
 /// here too, so `… | to j⇥` → `json` and `… | sort r⇥` → `reverse`. Keep in sync with each command's
-/// argument parsing (verified against utilities/*.md + the `cmd_*` parsers).
+/// argument parsing (verified against utilities/*.md + the `cmd_*` parsers). The universal `version`
+/// and `help` subcommands are appended automatically in `complete_keyword` (every utility answers
+/// `<util> version` / `<util> help`), so they are NOT listed here.
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
     ("date",    &["epoch"]),
-    ("net",     &["dns", "stats", "arp", "scan", "renew", "version", "help"]),
+    ("net",     &["dns", "stats", "arp", "scan", "renew"]),
     ("drives",  &["flash", "label", "reset", "check", "scrub"]),
     ("chaos",   &["kill-storm", "flood-storm", "mem-pressure", "spawn-storm", "max-carnage", "link-flap"]),
     ("write",   &["append", "prepend"]),
@@ -494,6 +496,15 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("match",   &["except"]),
     ("to",      &["json", "yaml"]),
     ("from",    &["json"]),
+];
+
+/// Info / no-argument utilities: their only first-argument subcommands are the universal `version`
+/// and `help`. Tab at their first-arg position completes those (and NEVER falls through to a
+/// filesystem listing - they take no path). This is the info-command analogue of `NO_PATH_CMDS`:
+/// every one of these is a keyword command, so a new one belongs here (conventions rule 9).
+const INFO_CMDS: &[&str] = &[
+    "about", "version", "mem", "cores", "sock", "uptime", "status", "roster", "clear", "reboot",
+    "result", "selfcheck", "caps", "help",
 ];
 
 /// Commands with a TRAILING modifier keyword that follows the variable argument(s) - completed at any
@@ -534,7 +545,7 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
     // `ehci,xh<tab>` finishes `ehci,xhci` while the earlier listed targets are preserved verbatim.
     if "kill".as_bytes() == cmd && prior == 0 {
         const KILL_TARGETS: &[&str] =
-            &["all-services", "supervisor", "block-driver", "fs", "logger", "xhci", "ehci", "shell", "nic-driver", "net-stack"];
+            &["all-services", "supervisor", "block-driver", "fs", "logger", "xhci", "ehci", "shell", "nic-driver", "net-stack", "version", "help"];
         let seg_start = {
             let tok = &line.bytes()[tok_start..];
             tok.iter().rposition(|&b| b == b',').map(|i| tok_start + i + 1).unwrap_or(tok_start)
@@ -544,12 +555,19 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
 
     // `spawn <svc>[,svc,...]`: complete the demo/app services, comma-list aware (segment after last comma).
     if "spawn".as_bytes() == cmd && prior == 0 {
-        const SPAWN_TARGETS: &[&str] = &["ping", "pong"];
+        const SPAWN_TARGETS: &[&str] = &["ping", "pong", "version", "help"];
         let seg_start = {
             let tok = &line.bytes()[tok_start..];
             tok.iter().rposition(|&b| b == b',').map(|i| tok_start + i + 1).unwrap_or(tok_start)
         };
         return complete_from_list(ctx, line, seg_start, SPAWN_TARGETS);
+    }
+
+    // `restart <name> [core]`: complete the restartable services (single target, not a comma-list).
+    if "restart".as_bytes() == cmd && prior == 0 {
+        const RESTART_TARGETS: &[&str] = &["supervisor", "block-driver", "fs", "logger", "xhci",
+            "ehci", "shell", "nic-driver", "net-stack", "ping", "pong", "version", "help"];
+        return complete_from_list(ctx, line, tok_start, RESTART_TARGETS);
     }
 
     // `ping [count N] [bytes N] <ip>`: the option keywords may appear in either order before the IP, so
@@ -565,9 +583,28 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
         return complete_from_list(ctx, line, tok_start, &avail[..a]);
     }
 
+    // Info / no-argument utilities: the only first-arg subcommands are the universal version + help
+    // (every utility answers `<util> version` / `<util> help`). Offer them and stop - these take no
+    // path, so `about <tab>` must never list the filesystem. Return true even on no match so it does
+    // not fall through to path completion.
+    if prior == 0 && INFO_CMDS.iter().any(|c| c.as_bytes() == cmd) {
+        complete_from_list(ctx, line, tok_start, &["version", "help"]);
+        return true;
+    }
+
     if let Some((_, cands)) = SUBCMD_FIRST.iter().find(|(c, _)| c.as_bytes() == cmd) {
         // First-argument keyword only: a later arg is a path/value (e.g. `write append /f`), not a key.
-        return prior == 0 && complete_from_list(ctx, line, tok_start, cands);
+        if prior != 0 { return false; }
+        // Append the universal `version` + `help` subcommands (deduped) so every utility completes
+        // them, not just its specific keywords. A dual command (write/sort/match) whose token matches
+        // no keyword returns false here and falls through to path completion.
+        let mut all: [&str; 16] = [""; 16];
+        let mut n = 0usize;
+        for &c in *cands { if n < all.len() { all[n] = c; n += 1; } }
+        for &c in ["version", "help"].iter() {
+            if !cands.contains(&c) && n < all.len() { all[n] = c; n += 1; }
+        }
+        return complete_from_list(ctx, line, tok_start, &all[..n]);
     }
     if let Some((_, cands)) = SUBCMD_TRAILING.iter().find(|(c, _)| c.as_bytes() == cmd) {
         if prior == 0 { return false; }                       // first arg is the path, not the modifier
@@ -1153,6 +1190,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         "echo"    => cmd_echo(ctx, strip_quotes(s["echo".len()..].trim()), out),
         "input"   => { run_input(ctx, s["input".len()..].trim(), out); Ok(()) }
         "about"   => cmd_about(ctx, out),
+        "version" => cmd_version_os(ctx, out),
         "mem"     => cmd_mem(ctx, out),
         "cores"   => cmd_cores(ctx, out),
         "date"    => cmd_date(ctx, if argc >= 2 { args[1] } else { "" }, out),
@@ -3545,12 +3583,12 @@ fn cmd_assert(ctx: &ServiceContext, cwd: &mut Cwd, rest: &str, depth: u8) -> Res
 // render identically and a tweak updates every one at once.
 // ---------------------------------------------------------------------------
 
-const UTIL_VERSION: &str = "0.3.0";
+const UTIL_VERSION: &str = "0.3.1";
 
 /// Utilities that self-document (gates the `help`/`version` intercept in `execute`).
 const UTILS: &[&str] = &[
     "help", "result", "run", "assert", "selfcheck",
-    "echo", "input", "clear", "about", "mem", "cores", "date", "net", "ping", "sock", "uptime", "status", "observe", "caps", "roster",
+    "echo", "input", "clear", "about", "version", "mem", "cores", "date", "net", "ping", "sock", "uptime", "status", "observe", "caps", "roster",
     "spawn", "kill", "restart", "reboot", "chaos", "drives", "ls", "cd", "read", "write", "edit", "fcap",
     "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count", "sort",
     "first", "last",
@@ -3634,6 +3672,9 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         ], true),
         "about" => help_block(ctx, "about", "system identity + credits", &[
             ("about", "name, core count, creator", "about"),
+        ], true),
+        "version" => help_block(ctx, "version", "the GodspeedOS version + build stamp", &[
+            ("version", "GodspeedOS <version> (<git-sha>)", "version"),
         ], true),
         "mem" => help_block(ctx, "mem", "physical memory usage", &[
             ("mem", "used / total / free physical memory", "mem"),
@@ -3903,6 +3944,7 @@ static HELP: &[HelpRow] = &[
     Gap,
     Sec("System"),
     Row("about", "identity + credits"),
+    Row("version", "GodspeedOS version + build stamp"),
     Row("cores", "CPU core count"),
     Row("mem", "physical memory usage"),
     Row("date [epoch]", "date + time; 'epoch' = secs since 1970"),
@@ -4211,6 +4253,15 @@ fn cmd_about(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
     out.line(ctx, "  Small enough to understand. Rigorous enough to trust.");
     out.line_fmt(ctx, format_args!("  Running on {} core(s).", ctx.inspect_core_count()));
     out.line(ctx, "  Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors.");
+    Ok(())
+}
+
+/// `version` - the GodspeedOS version and build stamp: `GodspeedOS <ver> (<git-sha>)`. Distinct from
+/// `<util> version` (which reports a single utility's version); this is the whole system's version
+/// fact (conventions rule 7 - a raw fact). Pipeable like `about` (`version | write /ver.txt`). The SHA
+/// is stamped at build time by `build.rs`; a build with no git reports `unknown`.
+fn cmd_version_os(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
+    out.line_fmt(ctx, format_args!("GodspeedOS {} ({})", UTIL_VERSION, env!("GODSPEED_GIT_SHA")));
     Ok(())
 }
 
@@ -5936,7 +5987,7 @@ fn is_producer_builtin(name: &str) -> bool {
     // loudly as non-producers instead. To capture a big file for `edit`, append a simple producer
     // a few times: `help | write /big.txt; help | write append /big.txt; …`.
     matches!(name, "read" | "echo" | "tree" | "input"
-                 | "about" | "mem" | "cores" | "date" | "net" | "ping" | "sock" | "help")
+                 | "about" | "version" | "mem" | "cores" | "date" | "net" | "ping" | "sock" | "help")
 }
 
 /// Producer SERVICES that emit without needing input, so they can start a pipe (and follow the
@@ -5963,6 +6014,7 @@ fn run_producer(ctx: &ServiceContext, cwd: &Cwd, cmdline: &str, out: &mut Out) {
         "tree"         => { let _ = cmd_tree(ctx, cwd, arg, out); }
         // Info/display commands - text emitters, capturable to a file.
         "about"        => { let _ = cmd_about(ctx, out); }
+        "version"      => { let _ = cmd_version_os(ctx, out); }
         "mem"          => { let _ = cmd_mem(ctx, out); }
         "cores"        => { let _ = cmd_cores(ctx, out); }
         "date"         => { let _ = cmd_date(ctx, arg, out); }
