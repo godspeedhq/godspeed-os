@@ -92,6 +92,17 @@ contributors` - and the phrase "and the GodspeedOS contributors" already include
 project's licensing (the Linux model: no copyright assignment) you keep the copyright to what you
 write; the collective notice is the project's shared face, not a transfer of your ownership.
 
+**The year is the creation year, hardcoded on purpose - never read from the clock.** A copyright year
+denotes when the work was authored (2026), a fixed fact; it is *not* the current year. The RTC is
+available (the `date` command reads it), so wiring the notice to it would be easy - and wrong: a
+machine booted in 2030 would then print "Copyright (C) 2030," which is false and changes with the
+viewer's clock. Leave it a literal. When a later year sees substantial development, bump it to a
+**range** - `Copyright (C) 2026-2027 ...` - as a deliberate edit (the end year is the last year of
+real change, a build-time authorship fact, still not a clock read). Because the notice is one shared
+string, change **every** copy together: `about` and `version` output (`services/shell/src/main.rs`),
+`NOTICE`, `LICENSE` / `sdk/LICENSE`, and the canonical credit line in `utilities/0_conventions.md`
+(rule 5/6); a shell test pins the exact string, so a partial bump fails loudly.
+
 ## License
 
 By contributing, you agree your contributions are licensed under the project's terms: the OS is
