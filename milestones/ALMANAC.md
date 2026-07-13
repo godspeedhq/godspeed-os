@@ -43,6 +43,8 @@
 - [2026-07-07 to 2026-07-08 - The day the wire became location](#2026-07-07-to-2026-07-08---the-day-the-wire-became-location)
 - [2026-07-09 - The day half a truth came back for the mount loop](#2026-07-09---the-day-half-a-truth-came-back-for-the-mount-loop)
 - [2026-07-09 - The day recovery became a fixed point](#2026-07-09---the-day-recovery-became-a-fixed-point)
+- [2026-07-10 - The day the kernel met a second architecture, and fit the machine it found](#2026-07-10---the-day-the-kernel-met-a-second-architecture-and-fit-the-machine-it-found)
+- [2026-07-11 to 2026-07-13 - The days the whole system stood for audit](#2026-07-11-to-2026-07-13---the-days-the-whole-system-stood-for-audit)
 - [The Days I Was Wrong](#the-days-i-was-wrong)
   - [~2026-06-21 - The day the constitution rejected its author](#2026-06-21---the-day-the-constitution-rejected-its-author)
   - [~2026-06-27 - The day I reached for a heap](#2026-06-27---the-day-i-reached-for-a-heap)
@@ -580,6 +582,73 @@ can hit as hard as you like: it does not matter in what order, or how many times
 
 ---
 
+## 2026-07-10 - The day the kernel met a second architecture, and fit the machine it found
+
+Two things landed the same day. The kernel stopped guessing how big the machine is: the `MAX_CORES`
+ceiling was deleted, and every per-core structure became a boot arena sized to the core count Limine
+actually reports, while the frame bitmap became sized from the RAM that is actually present - no cap,
+no waste (this branch, through `cfb0a88`). And then the hardened image booted on a **second CPU
+architecture**: a **Dell Wyse 5070, Intel Goldmont+**, came up first try - SMP, the AHCI flash, the
+Realtek NIC pulling a real DHCP lease and answering a ping, the shell - all of it, on silicon from a
+different vendor than the **AMD GX-420GI (the HP T630)** that every wedge in this almanac had been
+caught on.
+
+There was a wound in that. The very first bare-metal boot, back on 2026-05-21, had been on a Goldmont+
+part too, and within the week it stalled hard under load (**The Sleeper on Core Zero**, the first IF=0
+bug) and sent development to the AMD T630 for good - the workhorse on which the shootdown deadlock, the
+respawn wedge, the DMA-after-death, and the million-round soak were all found and fixed. Two months and
+a hardened kernel later, Goldmont+ got its second chance and took it cleanly, first boot. Even the one
+thing known to be AMD-specific - TSC calibration, broken on the GX-420GI because it exposes no CPUID
+frequency leaf - simply worked on the Intel part, because the fallback calibrates against the PIT: a
+machine-specific truth read at boot, never hardcoded.
+
+**What I came to understand:** portability is not a feature you write; it is the absence of assumptions
+you should never have made. Nothing in the boot path had to be *told* about the Wyse. The kernel counts
+its cores from Limine, sizes its bitmap from the memory map, and calibrates its clock against whatever
+timer answers - so a machine it has never seen configures the machine, not a constant in the source. A
+kernel that fits the machine it finds has nothing left to port. And the two CPUs it has truly lived on -
+AMD first, as the workhorse; Intel Goldmont+ second, as the proof - are now one image, unchanged between
+them.
+
+**What it produced:** the dynamic-topology work (no `MAX_CORES`, RAM-sized bitmap) as the executable
+form of "identity over location" pushed all the way down to the hardware census - the machine's size is
+location, discovered, never identity, assumed. The only ceiling left is the xAPIC's 8-bit LAPIC id, and
+even that is now *loud* rather than silent: past 255 cores the kernel says so and names x2APIC as the
+next step, instead of quietly wrapping. Two CPUs, two vendors, one image, booting to the same steady
+state.
+
+## 2026-07-11 to 2026-07-13 - The days the whole system stood for audit
+
+For the first time the system was read the way a constitution asks to be read - not "does it work?"
+but "does it still *obey*?" A **kernel audit** (2026-07-11, `docs/kernel-audit.md`), run as a parallel
+sweep of independent readers over every subsystem, checked the code against the Ten Commandments and
+the invariants and surfaced three real things: two paths where a non-page-fault CPU exception - a stray
+`#GP`, a `div0` in a service - halted the *whole machine* instead of killing just the offending ring-3
+task (a single bad instruction in userspace could wedge the kernel), and one where a transient
+allocation failure on the supervisor-respawn path could `panic!` into a reboot, defeating the very
+Phase-6 recovery it lived inside. Then a **userspace audit** (2026-07-12 to 2026-07-13,
+`docs/userspace-audit.md`), the first of its kind, graded every service - the coupled pairs first,
+`block-driver`/`fs` and `nic-driver`/`net-stack`, then the rest - against the same law: 0 high, 8
+medium, 8 low, each finding logged with a fix or a recorded deferral.
+
+**What I came to understand:** the audit is affordable *because the kernel is small*. The 30-minute
+whiteboard rule (§26.11) and Commandment I (the kernel is complete; keep it small) had always been
+framed as correctness and understandability properties - but they were quietly an **audit budget** all
+along. A 2,700-line constitution enforced against a kernel one engineer can hold in their head can be
+walked end to end in an afternoon; the same audit against a monolith is a standing team that never
+finishes. Tininess is not only what makes the kernel correct or secure - it is what makes the
+*recurring act of checking* correctness and security cheap enough to actually do, release after
+release. The kernel stayed small so that auditing it could stay routine.
+
+**What it produced:** `docs/kernel-audit.md` and `docs/userspace-audit.md` as **living** artifacts - a
+standing, repeatable practice rather than a one-time pass - and the recognition that the north star of
+an audit is that *nothing above the kernel may panic or wedge it*: a service's worst instruction should
+cost that service its life and no more. The findings became the next increment of work; the discipline
+became a habit. A model you can re-verify in an afternoon is a model that stays honest between the days
+someone thinks to check.
+
+---
+
 ## The Days I Was Wrong
 
 The entries above are mostly victories - the days understanding clicked into place. But the days
@@ -679,6 +748,14 @@ that means. These are not listed because they were bugs. They are here because t
   forever. *Taught:* a wait that can observe only success is an infinite wait on failure - the same
   Commandment VIII lesson, re-learned at a new loop. Hold the principle at every wait, not once. (The
   2026-06-30 teaching, come back for the mount loop.)
+- **The Realtek Head Desync** (2026-07-12) - on the Wyse's RTL8168, transmit was driven through a
+  multi-slot C+ descriptor ring, but the controller's `TPPoll` advanced its own head independently of
+  the ring index the driver tracked; the two drifted, `OWN` bits stranded, and TX wedged with a
+  telltale `desc=0xb000004a isr=0x0091`. The fix was to stop pretending the ring was deeper than the
+  driver could keep coherent: a **single** transmit descriptor, always end-of-ring, poked once per
+  frame. *Taught:* match the driver's ring discipline to what the controller's poll actually advances -
+  a phantom ring you cannot keep in sync is worse than one honest slot. (This bug is invisible in QEMU,
+  which emulates an e1000, not a Realtek - it existed only on hardware and was only ever found there.)
 
 *Add to this list as the project earns new names. A bug that taught something deserves to be
 remembered by name.*
