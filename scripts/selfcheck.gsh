@@ -187,17 +187,21 @@ assert ok run help
 assert ok roster help
 assert ok find version
 assert ok read version
+assert ok version help
+assert ok version version
 assert ok clear help
 
 # ===== system info - now PIPE PRODUCERS (text emitters captured via Out), bare + piped =====
 echo ''
 echo '===== system info - now PIPE PRODUCERS (text emitters captured via Out), bare + piped ====='
 assert ok about
+assert ok version
 assert ok cores
 assert ok mem
 assert ok date
 assert ok date epoch
 about | assert contains GodspeedOS
+version | assert contains GodspeedOS
 cores | assert contains cores
 mem | assert contains used
 date | assert contains :
