@@ -258,3 +258,90 @@ path.
 - **A15** (`90d520a`) pins V1: a bad user pointer to a syscall (`raw_syscall(log, cap 0, 0x1000, 16)`)
   faults in the kernel copy at CPL0 and the kernel logs `USER-COPY PF (killing caller)` + kills the
   caller instead of `halt_all_cores()`. `osdev test adv` 15/15.
+
+
+## Audit 3 - 2026-07-13 (post-v0.4.0 re-audit)
+
+Method: 2 parallel auditors (arch layer; core syscall/ipc/cap/task/memory/smp), each triaging A/B/C
+against the north-star, then the lead **re-verified every confirmed finding against source** before
+recording it (a subagent's "confirmed" is a lead, not a verdict - the "day my own test lied" discipline).
+Motivation: a large surface landed since Audit 1/2 (dynamic core count / `MAX_CORES` removal, the
+multi-method `hardware_reset`, the auto-repeat calibration, fbcon safe-area) plus the whole v0.4.0
+userspace release - the audit's job is to prove the *new* code did not open a north-star gap and that
+the Audit 1/2 fixes are still intact.
+
+Result: **1 confirmed violation (MED), 2 latent hardening notes (LOW), all Audit-1/2 fixes verified
+present-and-correct.** The core kernel came back clean; the one real finding is in the arch fault path.
+
+### Confirmed violation (fix this)
+
+#### K1. [MED] `kernel/src/arch/x86_64/boot.rs:1291,1336,1514,1592,1622` - arch-cpu (unbounded-loop / invariant 12)
+
+**What.** The five naked exception stubs (`gpf_stub`, `pf_stub`, `exception_halt`, `exc_stub_noec`,
+`exc_stub_ec`) each *open* with a raw-asm COM1 THRE poll as their absolute first instructions -
+`mov dx,0x3fd; 88: in al,dx; test al,0x20; jz 88b` - which is **unbounded**. This is the exact scenario
+`SERIAL_THRE_NOLCK_CAP` (boot.rs:719-725, "an absent or wedged COM1 must not hang a fault handler
+forever") was added for, but that Audit-1 fix bounded only the *Rust* `serial_poll_thre`; the inline
+asm polls at the front of each stub escaped it. **Verified** in source: `gpf_stub` (:1288-1296) loops
+on `jz 88b` before writing its 'G' breadcrumb, and the sibling stubs match.
+
+**Trigger.** Any ring-3 fault a service can raise at will (`div` by zero -> #DE, `cli`/`hlt` -> #GP, a
+null deref -> #PF) on a machine whose COM1 LSR reads with THRE (bit 5) *persistently clear* - a
+present-but-clock-gated/wedged UART. (An *absent* port reads 0xFF, bit 5 set, exits immediately, so this
+needs present-but-wedged, the same hardware state the existing cap targets.) The faulting core then
+spins forever with IF=0 - a silent single-core wedge from a ring-3 instruction, instead of killing the
+task. Latent on the T630/Wyse (COM1 healthy), but a genuine invariant-12 gap.
+
+**Fix.** Add a bounded spin counter to the asm poll in all five stubs (mirror `SERIAL_THRE_NOLCK_CAP`),
+falling through to the breadcrumb write best-effort on timeout - exactly as the Rust helper already does.
+
+### Latent hardening notes (LOW - real but no current trigger)
+
+- **K2. [LOW] `kernel/src/arch/x86_64/mod.rs:155` (+ `smp/ipi.rs` `send_ipi` `& 0xFF`).** The BSP is
+  exempt from the loud xAPIC 8-bit LAPIC-id ceiling the APs get: `set_bsp_lapic_id(... as u8)` truncates
+  silently, and every IPI to core 0 masks `& 0xFF`. A BSP with LAPIC id > 255 (x2APIC-scale machine)
+  would silently mis-route. APs above 0xFF are excluded *loudly* (ap_boot.rs:46-64); the BSP corner is
+  the one silent wrap. **Fix:** one loud boot check (`bsp_lapic_id > XAPIC_MAX -> panic/log "needs
+  x2APIC"`), matching the AP path. Exotic trigger; consistency with the loud-failure discipline.
+- **K3. [LOW/note] `kernel/src/arch/x86_64/boot.rs:323` (SVR=0x1FF) + `:1143` (IDT[0xFF]=exception_halt).**
+  The kernel programs LAPIC spurious vector 0xFF but routes that vector to `exception_halt` (hlt-loops the
+  core). A spurious-vector delivery - which SDM says to ignore-and-return - would wedge the core. The
+  arch auditor itself flagged the trigger as speculative (no deterministic post-boot cause found), so this
+  is a **hardening note**, not a confirmed bug: give 0xFF a dedicated return-without-EOI stub per SDM.
+
+### Verified present-and-correct (Audit 1/2 fixes + new code)
+
+- **C1/C2** (ring-3 CPU-exception CPL discrimination): PRESENT. `init_idt` routes vectors 0-31 to
+  CPL-discriminating stubs; `exc_dispatch`/`gpf_handler`/`pf_handler` kill the ring-3 task, halt only on
+  ring-0. All gates DPL=0 except 0x80 (no ring-3 `int N` bypass).
+- **V1** (user-copy fault fixup): PRESENT. Per-core `USER_COPY_ACTIVE`, set narrowly around the single
+  `copy_nonoverlapping`; `pf_handler` clears it and `kill_current()`s on a CPL0 fault at a user VA.
+- **V2** (partial-spawn cleanup): PRESENT. `own_endpoint` set right after registration; every post-endpoint
+  error path routes through `cleanup_partial_spawn` (no leak toward the routing / endpoint-id panics).
+- **V3** (scheduler Dekker re-check): PRESENT. `run()` and the timer `next!=prev` path CAS-claim `next`
+  (Ready->Running, SeqCst), publish CORE_CURRENT, fence, re-load STATE, abort if Dead; kill completes the
+  handshake. No mid-switch UAF.
+- **C3** (runtime supervisor respawn): PRESENT. `poll_supervisor_respawn` re-arms PENDING on a transient
+  Err instead of panicking; only boot-time `spawn_supervisor` is fatal.
+- **`hardware_reset`** (new, multi-method): SAFE + TERMINAL. `io_delay` (10k) and 8042 wait (1M) bounded;
+  the triple-fault fallback (zero-limit IDT + `int3` -> #DF -> shutdown) is unconditionally terminal; the
+  trailing hlt-loop is an unreachable type-level backstop. Reboot is cap-gated (`REBOOT_RESOURCE`, granted
+  only to shell/xhci/ehci) - no ambient reset authority.
+- **Dynamic core count** (new, `MAX_CORES` removed): OOB-FREE. Arena width == cores started (identical
+  `lapic_id <= 0xFF && != bsp` filter in `ap_count`/`start_all_aps`); AP exclusion is loud; every runtime
+  per-core index guards `core < num_cores()` or uses a kernel-assigned id. No core-id OOB introduced.
+- **New-syscall user-value paths**: all bounded before use - resource_mint/invoke/revoke (delegated-band
+  range-checked, rights masked, id released on cap-table-full, badge kernel-set-only/unforgeable),
+  LastRecvBadge (no user arg), AcquireSendCap (name len <=64, ACQUIRE_ANY-or-declared-peer gated),
+  inspect_kernel core-id (guarded `>= num_cores() -> 0`), task_stat/task_caps slot (`>= MAX_TASKS`).
+- **fbcon SAFE_PCT, rtc, serial (Rust helpers), iommu, pci, page_tables**: all arithmetic/loops bounded.
+
+### Notes for record (not bugs)
+
+- `cleanup_partial_spawn` does not `interrupt::route::unregister` a *failed driver spawn*'s IRQ lines
+  (only driver spawns register IRQs, only a post-IRQ map failure leaves a stale entry). Bounded and
+  self-correcting: `IRQ_TABLE` is a fixed `[Option; 256]`, a stale route delivers to a now-dead endpoint
+  (harmless `None`), and a respawned driver overwrites it. No trigger to a fault. (Contrast driver
+  *death*, which already unregisters - Audit-1 Item 2.)
+- The B-set of correctly-loud panics (generation overflow, endpoint-id/routing exhaustion, liveness/
+  shootdown watchdogs, W^X asserts) is unchanged from Audit 1/2 and re-confirmed as the defense.

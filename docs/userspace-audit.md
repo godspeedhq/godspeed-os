@@ -253,3 +253,171 @@ The runtime BAR *address* stays PCI-scan-resolved (a hardware *location* is a di
 from the *authorization*, so no truth is duplicated). Scheduled after the remaining small items (M8 +
 LOW). M6 (block-driver's contract *contradicting* its real access) was fixed immediately, independent
 of this.
+
+---
+
+## Audit 2 - 2026-07-13 (post-v0.4.0 re-audit)
+
+Method: 4 parallel auditors grouped by coupling - **shell interpreter/library**, **shell
+pipes/net/observe**, **net-stack+nic-driver+supervisor recovery**, **library scripts+contracts+fs+SDK**
+- each triaging its crates against the Ten Commandments, then the lead **re-verified every confirmed
+finding against source** before recording it. Motivation: the entire v0.4.0 release is new
+userspace - the gsh system library (5 baked PATH-like scripts), the `whatis`/`wait` utilities, the
+**POSIX parameter-cipher retirement** (`$arg1..$arg9`/`$args`/`$argcount`/`$self`), the observe q-poll
+change, and `net dns`/`ping` returning `Err` on a failed probe. The audit's job is to prove the new
+surface opened no wedge/hang/authority gap and that Audit-1's fixes hold.
+
+**Result: 0 HIGH, 4 MED, ~11 LOW.** No hang, corruption, shared-state, or ambient-authority violation on
+any critical path. The MED cluster is instructive: **two of the four are direct consequences of the
+param-cipher retirement itself** (the reserved words leak through the two binding sites the `let` guard
+did not cover; and an unrelated but adjacent unbounded native recursion in `eval_cond`), one is a
+**residual of the Audit-1 M5 fix** (the retry the fix added everywhere was not wired into the
+dropped-notification backstop), and one is **M4 still deferred**. Audit-1's M1/M2/M3/M5 and T1 all
+verified intact; the storage stack (fs/block-driver) VIII+III still clean; the library scripts obey the
+utility conventions.
+
+### Fix log (Audit 2 remediation)
+
+| Item | Status | Note |
+|------|--------|------|
+| **U1** eval_cond unbounded native recursion | open | §26.6.1 - iterative parity count of leading `!` |
+| **U2** reserved words shadowable as for-var/fn-param | open | III/§26.4 - apply `valid_var_name` in `set_loop_var` + `dispatch_call` |
+| **U3** supervisor `reconcile()` backstop single-shot | open | IX - swap `respawn_managed` -> `respawn_retry` (1 line) |
+| **M4** net identity-cache reconcile | STILL DEFERRED | trades against instant-replug; needs a real multi-subnet net |
+| U4 probe q-abort returns Ok | open | VIII/truth - `Aborted -> Err` in net_dns/ping so `online` doesn't false-pass |
+| U5 args past 9 silently dropped | open | §26.6 - one loud line |
+| U6 no compile guard baked-script < 64 KiB | open | hygiene - `const _: () = assert!(len < 65536)` |
+| U7 shell-test dead DNS assertion | open | test-drift (same class as the fixed stale-version greps) |
+| U8 observe q-loop break checks `.valid` not name | open | rare slot-reuse; add `name_str()` check |
+| U9 OUR_MAC hardcoded, not reconciled | open | III - learn from nic-driver `[3]` status |
+| U10 open-socket grant-fail replies nothing | open | inv12 - `try_send [0]` on the `!granted` arm |
+| U11 net-stack calibrate_tsc_hz unbounded RTC spin | open | VIII-edge - bound by yield count |
+| U12 auto-config gate covers only net/ping | open | IX - add ops 1/6 to the gate |
+| U13 contract_check CONTRACTED hand-list | open | III - glob-derive from `services/*/contracts/*.toml` |
+| U14 example tomls stale pre-T1 doctrine | open | III/IV - declare hw_device/resource_mint or annotate kernel-only |
+| U15 six privileged grants still name-keyed | open (T1 residue) | VII/IV - promote SPAWN/CONSOLE_PUSH/INTROSPECT/SERVICE_CONTROL/REBOOT/ACQUIRE_ANY to ServiceConfig fields |
+| L8 SDK recv()/console_read() `loop{}` on error | open (carried) | inv12 - log-once+park or migrate to `recv_result` |
+
+### MED findings (fix these)
+
+#### U1. [§26.6.1] `services/shell/src/main.rs:2253` (`eval_cond`) - unbounded native recursion on leading `!`
+
+**Verified.** `eval_cond` handles a negated condition with `return !eval_cond(ctx, cwd, rest.trim(),
+...)` - genuine native recursion once per leading `!`, with `depth` (the *script* nesting level, not a
+recursion bound) passed unchanged. Every other gsh construct uses an explicit bounded stack (the "no
+native recursion §9" rule); this is the one that breaks it. The frame carries up to 3x1 KiB `ExpBuf`.
+**Trigger:** `edit` a script `if ` + ~500 x `!` + ` 1 == 1 { echo x }` (SCRIPT_MAX=7112 admits ~7000
+`!`), `run` it -> the ~256 KiB user stack overflows -> PUSER PF -> shell crash + respawn (the
+`[[project-shell-stack-pipe]]` failure class). **Fix:** count leading `!` iteratively (parity), one
+non-recursive evaluation.
+
+#### U2. [III / §26.4] `services/shell/src/main.rs:3246` (`set_loop_var`) + `:3282` (`dispatch_call` param bind) - reserved parameter words can be silently shadowed
+
+**Verified.** `valid_var_name` (:1961) correctly refuses `args`/`argcount`/`self`/`arg1..arg9` for
+`let` - but `set_loop_var` (`self.define(name, ...)`, no validation) and `dispatch_call`'s param loop
+(`vars.define(pname, av, false)`, no validation) bypass it. Since `push_ref` resolves reserved words
+*before* variables (:1893), the binding is accepted and then **unreadable**: the body reads the outer
+script's params instead. **Trigger:** `run /s.gsh one two` with `s.gsh` = `fn greet self { echo $self }`
++ `greet world` prints `/s.gsh`, not `world`; `for args in range 3 { echo $args }` prints the script's
+args each pass. A direct consequence of the cipher retirement - the guard covered `let` but not the two
+other binding doors. **Fix:** apply `valid_var_name` in both sites, refusing loudly like `stmt_let`.
+
+#### U3. [IX] `services/supervisor/src/main.rs:246` (`reconcile`) - the dropped-notification backstop was not given the M5 retry
+
+**Verified.** The Audit-1 **M5** fix added `respawn_retry` (5 attempts, :223) and wired it into every
+steady-state death arm (:560-616). But `reconcile()` - the backstop that recovers a service whose death
+*notification was dropped* (16-deep endpoint overflow under a storm) - still calls single-shot
+`respawn_managed` (:246). **Trigger:** a `chaos max-carnage` storm drops fs's death notification; the
+backstop `reconcile()` respawn of fs hits a transient NoMemory (storm reclaim in flight); fs stays dead
+forever (no further death arrives to re-trigger; `converge` runs only at supervisor boot). Loud but not
+recovered - the exact IX gap M5 closed on the *other* path. **Fix:** `reconcile` calls `respawn_retry`
+(one line, same bound).
+
+#### M4. [III] `services/net-stack/src/main.rs:667` - cached IP/gateway/DNS identity still never auto-reconciled (STILL DEFERRED)
+
+Unchanged from Audit 1. The auto-configure gate is byte-for-byte `badge.is_none() && !have_mac && ...`;
+once configured, `have_mac` stays true and the cached `our_ip`/`gw_mac`/`dns_server` are never
+auto-reconciled against live DHCP/ARP truth. Trigger: configure on subnet A, link down, re-attach on
+subnet B -> stale identity used verbatim until a manual `net renew`. Later work improved what `net`
+*displays* (link-state clearing) but did not touch the reconcile gate. Remains deferred: the fix
+(re-dance on a link-up *edge*, not only `!have_mac`) trades against the deliberate instant-replug design
+and needs a real multi-subnet network to validate.
+
+### LOW findings
+
+- **U4. [VIII/truth]** `net_dns` `Aborted => Ok(())` (:4854) and `cmd_ping` q-abort-on-first-echo
+  (`sent=0 -> Ok`, :4608/:4640): a **q-aborted probe reads as a passed probe**, so `online` + q during
+  "resolving..." prints `dns ok` for a probe that never completed. v0.4.0's own "probes return Err on
+  failure" rule wants `Aborted -> Err` (matches `cmd_wait`). *(Flagged independently by two auditors.)*
+- **U5. [§26.6]** `parse_params` (:1841) silently drops arguments past `PARAM_MAX=9` from `$args`/`$argcount`.
+  One loud line when tokens remain.
+- **U6. [hygiene]** No compile-time guard that a baked script (`SELFCHECK_GS` 21 KB, `LIBRARY` entries)
+  stays < 64 KiB; past 65535 the `u16` fn/summary offsets (`prescan_fns` :2950) wrap silently. `const _`
+  assert per embedded script.
+- **U7. [test]** `osdev/src/shell_test.rs:214` asserts a DNS fallback line (`"...: no answer"`) the shell
+  no longer prints (split into "returned no A record" / "no reply from the DNS server" at `7197250`).
+  Dead assertion - same class as the stale-version greps fixed on the library branch.
+- **U8. [VIII/stale]** `cmd_observe_live`'s child-death break (:5921) checks `task_stat(slot).valid` but
+  not the name (unlike `find_running_slot`); a painter fault + slot reuse in the poll window leaves the
+  frame frozen. Not a wedge (q is child-independent). Add the `name_str()` check.
+- **U9. [III]** `net-stack` `OUR_MAC` (:27) is a hardcoded constant, never reconciled with the NIC's
+  real MAC (which nic-driver reports as truth in its `[3]` status). Two GodspeedOS boxes on one LAN
+  mutually ARP-poison. Learn `our_mac` from the first `[3]` at `run_dance` start.
+- **U10. [inv12]** `net-stack` open-socket (op 2) grant-failure path (:694) replies nothing on a
+  `derive_cap`/grant failure; the client eats its full deadline instead of a loud fast `[0]` (the
+  slot-exhausted arm does reply). `try_send_by_handle(reply_cap, &[0])`.
+- **U11. [VIII-edge]** `net-stack` `calibrate_tsc_hz` (:440) spins unbounded on the RTC second edge at
+  boot before the serve loop - RTC timing is exempt-class, but unlike every other wait it has no bounded
+  give-up. Bound by a yield count, return 0 loudly.
+- **U12. [IX]** `net-stack` auto-configure fires only for ops 0/3 (`net`/`ping`); `net dns` (op 1) and
+  `net arp` (op 6) issued first while unconfigured neither auto-configure nor benefit. Add ops 1/6.
+- **U13. [III]** `scripts/contract_check.py:28` `CONTRACTED` is a hand-maintained list; a new service
+  whose `.toml` disagrees with its kernel arm stays green because it is not in the list - defeating
+  "drift is impossible" for exactly the case the tool exists for. Glob `services/*/contracts/*.toml`.
+- **U14. [III/IV]** `examples/resource-server` + `examples/e1000` tomls/CLAUDE.md carry stale pre-T1
+  doctrine ("RESOURCE_MINT/BAR is NOT a contract field") - false since T1 Phase B added both to the
+  schema - and under-declare grants `service_hw` gives them (M6 class, example/test-build only). Declare
+  or annotate kernel-only.
+- **U15. [VII/IV, T1 residue]** Six privileged grants (SPAWN, CONSOLE_PUSH, INTROSPECT, SERVICE_CONTROL,
+  REBOOT, ACQUIRE_ANY) are still keyed on literal service *name* in the spawn path, not a declaration -
+  the T1 fix covered only `hw_device`/`resource_mint` + the ServiceConfig fields. No trigger today
+  (holders ship no `.toml`, so the kernel is the single source and III holds), but if any gains a
+  contract an M6-class understatement becomes possible. Promote to ServiceConfig bool fields.
+- **L8 (carried).** SDK `recv()`/`console_read()` `loop {}` on error - a silent-hang shape; practically
+  unreachable (own endpoint dies only with the task) so still LOW, but `fs`'s serve loop rides it.
+  Log-once+park, or migrate servers to the loud `recv_result` twin.
+
+### Verified present-and-correct (Audit 1 fixes + new code)
+
+- **M1** (`drain_service`): PRESENT - `recv_abortable_deadline`, 512-bounded, loud Aborted/Timeout.
+- **M2** (`fc_invoke`/`sock_invoke`): PRESENT - `recv_abortable_deadline`, reply cap reclaimed, late-reply
+  drained. The remaining deadline-less shell waits ride `request_with_reply` -> the CALL syscall ->
+  `ReplyDead`/`EndpointDead` on peer death (failure-observable, not the bare-recv wedge class).
+- **M3** (net-stack interactive reacquire): PRESENT - `nic_req` (:84) reacquires-by-name on `SendFailed`
+  and is the first request of *every* interactive path (link_is_up/ping/arp/dns).
+- **M5** (supervisor steady-state retry): CLOSED on the death arms (`respawn_retry` wired everywhere) -
+  the one residual is U3 (the reconcile backstop).
+- **T1** (contract = source of truth): INTACT - `contract_check.py` passes live 6/6; the spawn path is
+  field-driven from `service_hw(name)` (the old `name=="block-driver" && AHCI_FOUND` scatter is gone);
+  no contract lies among the six contracted services. Residue = U13/U14/U15.
+- **fs/block-driver VIII+III**: still CLEAN - `block_rpc` rides `ipc::call` (ReplyDead wake); mount
+  bounded-then-degrade to FS_UNAVAIL; capacity replies length+sanity validated; tree is irreducible,
+  `check()` rebuilds bitmap+count.
+- **The v0.4.0 changes cleared:** `net dns`/`ping` Err is **blast-safe** (all 8 caller classes traced:
+  interactive/pipe-producer/`$()`-capture/command-as-condition/assert/script/selfcheck/shell-test - the
+  Err never corrupts a captured stream; `online` rides it correctly); the observe `ctx.sleep` change is
+  **safe** (the kernel PIT-calibrates the quantum with sane bounds, so `handle_sleep` can only
+  under-sleep, never stretch - the old T630 dead-q root cause is genuinely gone); the `find` size column
+  is **bounds-safe** (guarded `i+nl+9 <= len`, dirs Empty, layout == ls); the library **depth-guard is
+  airtight** (every `execute` call site + every bypass - `health | ...`, `... | health`, `$(health)`,
+  `for line in (health)`, `defer/if/return health`, a `fn health` - enumerated and refused loudly);
+  `hid::new_calibrated` div/overflow-safe; unsafe clean (`unsafe_check.py` 28 files, no additions).
+
+### Clean per commandment (this pass)
+
+| Service group | verdict |
+|---|---|
+| **shell interpreter/library** | depth-guard airtight; ciphers resolve-before-vars + retired-form loud error; wait/whatis bounded; M1/M2 present; stack-frame `#[inline(never)]` discipline complete (L7 fixed). Defects: U1/U2/U5/U6 |
+| **shell pipes/net/observe** | net_dns/ping Err blast-safe; observe ctx.sleep safe; find size bounds-safe; pipe dispatch loud on type mismatch. Defects: U4/U7/U8 |
+| **net-stack/nic-driver/supervisor** | M3 fixed, M5 closed (death arms); every recv is an own-endpoint server loop, every reply non-blocking; dns/ping Err always replies. Defects: U3/M4/U9-U12 |
+| **library/contracts/fs/SDK** | T1 intact; fs/block-driver VIII+III clean; library scripts convention-compliant (argcount-first, help/version, raw-facts); unsafe clean. Defects: U13/U14/U15/L8 |
