@@ -5858,6 +5858,11 @@ fn observe_shell_core(ctx: &ServiceContext) -> u32 {
 /// here (one reader, no race), and both we and the child SLEEP between polls so core 0 halts
 /// while `observe` is up - otherwise a busy wait would peg the core and make every task on it
 /// read as ~100% in observe's own display. Then we restore the screen and our read loop resumes.
+/// Per-poll sleep for the live view's `q` loop, in TSC cycles (~30 ms at 2 GHz; QEMU's 1-tick
+/// fallback makes it ~one quantum). The same idea as the painter's POLL_SLEEP_CYCLES: sleep, do
+/// not spin, so the observer never becomes the load it is displaying.
+const OBSERVE_QPOLL_SLEEP_CYCLES: u64 = 60_000_000;
+
 fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
     let _ = ctx.kill("observe-live"); // clear any stale instance
     // Pin the painter to a DIFFERENT core than this shell. Its framebuffer-heavy repaint must not
@@ -5881,12 +5886,15 @@ fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
         // Own `q` while the child paints. The bound is a paranoid safety net so a hung child can
         // never wedge the shell forever; normally we break on `q` (or if the child dies).
         for _ in 0..u32::MAX {
-            // Poll `q` by YIELDING, not ctx.sleep. The tick-based sleep converts through the TSC
-            // calibration, which is WRONG on the AMD T630 (CPUID exposes no usable TSC frequency) - a
-            // ctx.sleep there can stretch to many seconds, so `q` appeared dead and the user had to
-            // reboot. yield_cpu polls every scheduler round on ANY hardware; the painter is on another
-            // core, so this does not starve it. Drain the console; quit on q/Q. Echo is off (child owns it).
-            ctx.yield_cpu();
+            // Poll `q` on a short SLEEP, so this core IDLES between polls. This used to be a
+            // yield_cpu busy-loop - a workaround for the AMD T630's garbage CPUID TSC calibration,
+            // under which ctx.sleep stretched to seconds and `q` looked dead - but that root cause
+            // is fixed (the kernel PIT-calibrates tsc_ticks_per_quantum on TSC-Deadline hardware;
+            // QEMU uses the 1-tick fallback). The busy-yield PEGGED this core, so observe reported
+            // its own observer: the shell's core sat at ~99-100% for as long as you watched - the
+            // very artifact the painter's own sleep exists to avoid. ~30 ms per poll keeps `q`
+            // latency imperceptible while the core halts between polls.
+            ctx.sleep(OBSERVE_QPOLL_SLEEP_CYCLES);
             let mut quit = false;
             while let Some(b) = ctx.try_console_read() {
                 if b == b'q' || b == b'Q' { quit = true; }
