@@ -3759,6 +3759,10 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         ], true),
         "whatis" => help_block(ctx, "whatis", "what runs when a name is typed (kind + origin)", &[
             ("whatis <name>", "built-in / library script / pipe stage / service (live task+core)", "whatis ls"),
+            // The one collision in the vocabulary: whatis's argument domain CONTAINS the words
+            // `help` and `version`, and the universal `<util> help|version` rule answers first -
+            // so this help text itself carries the answer you were asking for.
+            ("whatis help|version", "answer for whatis itself (as every utility does); both names are shell built-ins", "whatis help"),
         ], true),
         "mem" => help_block(ctx, "mem", "physical memory usage", &[
             ("mem", "used / total / free physical memory", "mem"),

@@ -60,7 +60,9 @@ The answer is about **the name at the prompt**. `ping` is both a built-in comman
 service; typing `ping` runs the built-in, so `whatis ping` says built-in. Similarly
 `whatis version` and `whatis help` cannot be asked - the universal `<util> version|help`
 subcommand intercept answers about `whatis` itself first (consistency across every utility
-beats the edge case).
+beats the edge case). whatis is the one utility whose *argument domain contains those two
+words*, so its own help output carries the answer at the point of collision: a usage row
+noting that `help`/`version` answer for whatis itself and that both names are shell built-ins.
 
 ## 5. Data source
 
