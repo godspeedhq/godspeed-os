@@ -19,6 +19,12 @@ use std::time::{Duration, Instant};
 pub fn run(image_path: &Path, smp: u32) {
     println!("shell-test: booting OS (smp={smp}) - scripted mode");
 
+    // The expected utility version. The shell's UTIL_VERSION is bumped in lockstep with the crate
+    // versions by the release convention (see CONTRIBUTING.md), so osdev's own version IS the
+    // version every utility reports. Derived, not hardcoded: the old "0.1.0" literals went stale
+    // at the 0.2.0 bump and silently broke this suite.
+    let ver = env!("CARGO_PKG_VERSION");
+
     let qemu      = crate::qemu::qemu_binary();
     let image_str = image_path.to_string_lossy().replace('\\', "/");
 
@@ -197,7 +203,7 @@ pub fn run(image_path: &Path, smp: u32) {
     // net version (utilities/0_conventions.md rule 5).
     send(&mut write_half, b"net version\r");
     let netver = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
-    check!(netver.contains("net 0.1.0"), "net: version reports net 0.1.0");
+    check!(netver.contains(&format!("net {ver}")), "net: version reports the current version");
 
     // net dns <host> (utilities/40_net.md): resolve a hostname via slirp's DNS. This is external-
     // dependent - slirp forwards to the HOST's resolver - so the check is LENIENT: it verifies the
@@ -208,10 +214,39 @@ pub fn run(image_path: &Path, smp: u32) {
     check!(dns_out.contains("example.com is ") || dns_out.contains("example.com: no answer"),
            "net dns: resolves a hostname or reports no-answer cleanly (DNS via slirp)");
 
+    // System library: `health` is a gsh script baked into the image and resolved PATH-like - typing
+    // the name runs the baked script (a fresh, self-contained run). Proves the library model end to
+    // end: a name unknown to the command dispatch falls through to the library and runs its dashboard.
+    // 30 s: health's `net` section rides net-stack's abortable-wait path, which crawls when the
+    // boot dance degraded under a slow TCG QEMU - the dashboard is still correct, just slow.
+    send(&mut write_half, b"health\r");
+    let health_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)).unwrap_or_default();
+    check!(health_out.contains("GodspeedOS health") && health_out.contains("end of health"),
+           "library: `health` runs the baked-in dashboard (PATH-like resolution)");
+
+    // Library self-documentation THROUGH PARAMS: `<lib> version` / `<lib> help` are handled by the
+    // script itself ($arg1), per the library convention - not the shell's is_util intercept.
+    send(&mut write_half, b"health version\r");
+    let hv = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    check!(hv.contains("health 0.1.0") && hv.contains("Copyright"),
+           "library: `health version` self-reports via script params");
+
+    // `size` = one record pipe (find * | where type=file | sum size). No disk in this QEMU, so the
+    // bar is a clean loud outcome (a sum or "storage unavailable"), never a hang.
+    send(&mut write_half, b"size /\r");
+    let sz = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)).unwrap_or_default();
+    check!(sz.contains("size") || sz.contains("storage unavailable") || sz.contains("sum"),
+           "library: `size /` completes loudly (sum or clean no-disk report)");
+
+    // `wait` aborts on q: send the command and the q together - the q lands while wait is pacing.
+    send(&mut write_half, b"wait 30\rq");
+    let wq = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)).unwrap_or_default();
+    check!(!wq.is_empty(), "wait: `wait 30` aborted by q (prompt returned, no 30s stall)");
+
     // ping is a full utility (mirrors net): version/help self-documentation.
     send(&mut write_half, b"ping version\r");
     let pingver = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
-    check!(pingver.contains("ping 0.1.0"), "ping: version reports ping 0.1.0");
+    check!(pingver.contains(&format!("ping {ver}")), "ping: version reports the current version");
 
     // ping [count N] <ip>: continuous Windows-style ICMP echo, no DNS. `count` bounds it (bare `ping`
     // runs until `q`). Runs through net-stack's serve loop (unlike the boot dance), so it doubles as a
@@ -420,7 +455,7 @@ pub fn run(image_path: &Path, smp: u32) {
     }
     send(&mut write_half, b"uptime version\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("uptime 0.1.0"), "uptime version: number"),
+        Some(r) => check!(r.contains(&format!("uptime {ver}")), "uptime version: number"),
         None    => { println!("shell-test: FAIL - uptime version timeout"); fail += 1; }
     }
     send(&mut write_half, b"uptime help\r");
@@ -682,14 +717,14 @@ pub fn run(image_path: &Path, smp: u32) {
     send(&mut write_half, b"write help\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => {
-            check!(r.contains("write 0.1.0") && r.contains("overwrite"), "write help: header + version");
+            check!(r.contains(&format!("write {ver}")) && r.contains("overwrite"), "write help: header + version");
             check!(r.contains("<path>") && r.contains("e.g.") && r.contains("buy milk"), "write help: placeholder + real example");
         }
         None => { println!("shell-test: FAIL - timed out after `write help`  [×2]"); fail += 2; }
     }
     send(&mut write_half, b"ls version\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("ls 0.1.0") && r.contains("Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors"), "ls version: number + creator credit"),
+        Some(r) => check!(r.contains(&format!("ls {ver}")) && r.contains("Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors"), "ls version: number + creator credit"),
         None    => { println!("shell-test: FAIL - timed out after `ls version`"); fail += 1; }
     }
     send(&mut write_half, b"drives flash help\r");
@@ -701,22 +736,22 @@ pub fn run(image_path: &Path, smp: u32) {
     // stages, but `<verb> help` / `<verb> version` still resolve via the UTILS intercept.
     send(&mut write_half, b"where help\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("where 0.1.0") && r.contains("status | where mem>0"), "where help: header + real example"),
+        Some(r) => check!(r.contains(&format!("where {ver}")) && r.contains("status | where mem>0"), "where help: header + real example"),
         None    => { println!("shell-test: FAIL - timed out after `where help`"); fail += 1; }
     }
     send(&mut write_half, b"to help\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("to 0.1.0") && r.contains("to json") && r.contains("to yaml"), "to help: header + json/yaml rows"),
+        Some(r) => check!(r.contains(&format!("to {ver}")) && r.contains("to json") && r.contains("to yaml"), "to help: header + json/yaml rows"),
         None    => { println!("shell-test: FAIL - timed out after `to help`"); fail += 1; }
     }
     send(&mut write_half, b"from version\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("from 0.1.0") && r.contains("Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors"), "from version: number + creator credit"),
+        Some(r) => check!(r.contains(&format!("from {ver}")) && r.contains("Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors"), "from version: number + creator credit"),
         None    => { println!("shell-test: FAIL - timed out after `from version`"); fail += 1; }
     }
     send(&mut write_half, b"select help\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("select 0.1.0") && r.contains("status | select name core state"), "select help: header + real example"),
+        Some(r) => check!(r.contains(&format!("select {ver}")) && r.contains("status | select name core state"), "select help: header + real example"),
         None    => { println!("shell-test: FAIL - timed out after `select help`"); fail += 1; }
     }
     // The top-level `help` command itself conforms now (0_conventions.md §3, last open item):
@@ -724,12 +759,12 @@ pub fn run(image_path: &Path, smp: u32) {
     // resolve like any other utility.
     send(&mut write_half, b"help version\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("help 0.1.0") && r.contains("Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors"), "help version: number + creator credit"),
+        Some(r) => check!(r.contains(&format!("help {ver}")) && r.contains("Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors"), "help version: number + creator credit"),
         None    => { println!("shell-test: FAIL - timed out after `help version`"); fail += 1; }
     }
     send(&mut write_half, b"help help\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("help 0.1.0") && r.contains("<command> help"), "help help: header + per-command hint"),
+        Some(r) => check!(r.contains(&format!("help {ver}")) && r.contains("<command> help"), "help help: header + per-command hint"),
         None    => { println!("shell-test: FAIL - timed out after `help help`"); fail += 1; }
     }
 
@@ -1892,11 +1927,11 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
                           "gsh: reassigning an immutable binding is loud"),
         None => { println!("files-test: FAIL - gsh immutable timeout"); fail += 1; }
     }
-    // let mut + reassignment + params: `run … alpha beta` → $1/$2; who=alpha then who=beta.
-    let _ = run!(b"write /gsh_m.gsh let mut who = $1 ; who = $2 ; echo picked-$who\r", 10);
+    // let mut + reassignment + params: `run … alpha beta` → $arg1/$arg2; who=alpha then who=beta.
+    let _ = run!(b"write /gsh_m.gsh let mut who = $arg1 ; who = $arg2 ; echo picked-$who\r", 10);
     match run!(b"run /gsh_m.gsh alpha beta\r", 14) {
         Some(r) => check!(r.contains("picked-beta") && r.contains("run: ran 3, failed 0"),
-                          "gsh: let mut reassigns; $1/$2 params expand"),
+                          "gsh: let mut reassigns; $arg1/$arg2 params expand"),
         None => { println!("files-test: FAIL - gsh mut/params timeout"); fail += 1; }
     }
     // fail stops the run: the statement after `fail` does not execute.
@@ -1998,7 +2033,7 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     }
     // Tier 1 complete: a greet-shape script (param + if + in + switch + else/fail) runs end to end.
     // Kept short so the `write` line fits the 128-char interactive input buffer (MAX_LINE).
-    let _ = run!(b"write /g.gsh let r = $1 ; if $r in a b { switch $r { a { echo gotA } b { echo gotB } } } else { fail nomatch }\r", 12);
+    let _ = run!(b"write /g.gsh let r = $arg1 ; if $r in a b { switch $r { a { echo gotA } b { echo gotB } } } else { fail nomatch }\r", 12);
     match run!(b"run /g.gsh a\r", 16) {
         Some(r) => check!(r.contains("gotA") && !r.contains("gotB") && r.contains("failed 0"),
                           "gsh: Tier-1 greet-shape script (param+if+in+switch) runs"),
@@ -2200,7 +2235,7 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None => { println!("files-test: FAIL - gsh import-as-resolve timeout"); fail += 1; }
     }
 
-    // ── gsh Slice 8 (Tier 2): loops - `for … in words|range|$@`, unbounded `loop`, break/continue.
+    // ── gsh Slice 8 (Tier 2): loops - `for … in words|range|$args`, unbounded `loop`, break/continue.
     let _ = run!(b"write /fl1.gsh for x in a b c { echo w-$x }\r", 10);
     match run!(b"run /fl1.gsh\r", 14) {
         Some(r) => check!(r.contains("w-a") && r.contains("w-b") && r.contains("w-c"), "gsh: for … in <words>"),

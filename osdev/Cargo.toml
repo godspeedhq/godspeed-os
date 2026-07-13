@@ -1,6 +1,6 @@
 [package]
 name = "osdev"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 
 # osdev is a HOST tool - it builds for the developer's machine, not the kernel target.

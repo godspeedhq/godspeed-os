@@ -461,7 +461,12 @@ fn complete_tab(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd) {
     let is_no_path = seg_cmd.map(|c| NO_PATH_CMDS.iter().any(|k| k.as_bytes() == c)).unwrap_or(false);
 
     if is_command {
-        complete_from_list(ctx, line, tok_start, UTILS);          // command name (after a `|` too)
+        // Command names = built-in utilities + system-library scripts (both are typed by name).
+        let mut names: [&str; 96] = [""; 96];
+        let mut n = 0usize;
+        for &u in UTILS { if n < names.len() { names[n] = u; n += 1; } }
+        for &(lib, _) in LIBRARY { if n < names.len() { names[n] = lib; n += 1; } }
+        complete_from_list(ctx, line, tok_start, &names[..n]);     // command name (after a `|` too)
     } else if !complete_keyword(ctx, line, seg_start, tok_start) && !is_no_path {
         complete_path(ctx, line, cwd, tok_start);                 // not a keyword and takes paths → file path
     }
@@ -477,6 +482,7 @@ fn complete_tab(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd) {
 /// same commit; a path-taking utility is left out. Opting out of path completion is explicit + per-command.
 const NO_PATH_CMDS: &[&str] = &[
     "chaos", "kill", "spawn", "restart", "ping", "net", "drives", "observe", "date", "uptime",
+    "wait", "watch", "whatis", "busiest",
 ];
 
 /// Commands whose FIRST argument (the token right after the command, within its pipe segment) is a
@@ -487,6 +493,7 @@ const NO_PATH_CMDS: &[&str] = &[
 /// `<util> version` / `<util> help`), so they are NOT listed here.
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
+    ("busiest", &["mem", "restarts", "queue"]),
     ("date",    &["epoch"]),
     ("net",     &["dns", "stats", "arp", "scan", "renew"]),
     ("drives",  &["flash", "label", "reset", "check", "scrub"]),
@@ -505,6 +512,10 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
 const INFO_CMDS: &[&str] = &[
     "about", "version", "mem", "cores", "sock", "uptime", "status", "roster", "clear", "reboot",
     "result", "selfcheck", "caps", "help",
+    // Library scripts whose only first-arg subcommands are the universal version/help ("size" is
+    // absent on purpose - its argument is a path, so it keeps path completion; "watch" has its own
+    // command-name completion case; "busiest" completes its column keywords via SUBCMD_FIRST).
+    "health", "online",
 ];
 
 /// Commands with a TRAILING modifier keyword that follows the variable argument(s) - completed at any
@@ -561,6 +572,16 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
             tok.iter().rposition(|&b| b == b',').map(|i| tok_start + i + 1).unwrap_or(tok_start)
         };
         return complete_from_list(ctx, line, seg_start, SPAWN_TARGETS);
+    }
+
+    // `watch <command ...>` / `whatis <name>`: the first argument IS a command name, so complete
+    // it from the same set the command position uses (built-ins + library scripts).
+    if ("watch".as_bytes() == cmd || "whatis".as_bytes() == cmd) && prior == 0 {
+        let mut names: [&str; 96] = [""; 96];
+        let mut n = 0usize;
+        for &u in UTILS { if n < names.len() { names[n] = u; n += 1; } }
+        for &(lib, _) in LIBRARY { if n < names.len() { names[n] = lib; n += 1; } }
+        return complete_from_list(ctx, line, tok_start, &names[..n]);
     }
 
     // `restart <name> [core]`: complete the restartable services (single target, not a comma-list).
@@ -1172,7 +1193,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
             }
             // Optional `save <path>` streams the run REPORT to a file (the utility writes its own
             // file - direct, not a pipe; see cmd_selfcheck / docs/pipes.md). Otherwise the tokens
-            // after the path are the script's params ($1.., $@, $#); $0 is the path.
+            // after the path are the script's params ($arg1.., $args, $argcount); $self is the path.
             let save = if argc >= 4 && args[2] == "save" { Some(args[3]) } else { None };
             let params = if save.is_some() { Params::empty(args[1]) } else { parse_params(s, args[1], 2) };
             return cmd_run(ctx, cwd, args[1], depth, save, &params);
@@ -1198,6 +1219,8 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         "ping"    => cmd_ping(ctx, s["ping".len()..].trim(), out),
         "sock"    => cmd_sock(ctx, out),
         "uptime"  => cmd_uptime(ctx),
+        "wait"    => cmd_wait(ctx, if argc >= 2 { args[1] } else { "" }),
+        "whatis"  => cmd_whatis(ctx, if argc >= 2 { args[1] } else { "" }, out),
         "status"  => cmd_status(ctx),
         "observe" => if argc >= 2 && args[1] == "now" { cmd_observe_now(ctx) } else { cmd_observe_live(ctx) },
         // The example record SERVICE, callable bare (renders its table) as well as piped.
@@ -1275,6 +1298,18 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         "first"   => cmd_take(ctx, cwd, &args, argc, false),
         "last"    => cmd_take(ctx, cwd, &args, argc, true),
         other => {
+            // PATH-like system library: a name that is not a built-in but matches a baked-in library
+            // script runs that script (a fresh, self-contained run; any args become $arg1..). Like
+            // run/selfcheck it is one interpreter layer, so it is refused inside another script
+            // (depth > 0) to keep the bounded user stack safe.
+            if let Some(src) = library_script(other) {
+                if depth > 0 {
+                    ctx.console_writeln_fmt(format_args!(
+                        "{}: a library command runs a script - not available inside another script", other));
+                    return Err(ShellError::Unknown);
+                }
+                return run_lines(ctx, cwd, src.as_bytes(), depth + 1, out, &parse_params(s, other, 1), true);
+            }
             // Build "unknown: <cmd>" in a stack buffer to avoid two ctx.log calls
             let mut buf = [0u8; 64];
             let mut pos = 0usize;
@@ -1767,7 +1802,7 @@ fn var_err_msg(ctx: &ServiceContext, name: &str, e: VarErr) {
     }
 }
 
-/// A gsh run's parameters: `$0` (script name), `$1..$9`, `$@` (all), `$#` (count). Zero-copy - the
+/// A gsh run's parameters: `$self` (invoked name), `$arg1..$arg9`, `$args` (all), `$argcount`. Zero-copy - the
 /// slices borrow the `run` line.
 struct Params<'a> {
     argv: [&'a str; PARAM_MAX],
@@ -1793,7 +1828,7 @@ fn scan_word(b: &[u8], mut i: usize) -> (usize, usize, usize) {
 }
 
 /// Parse script params from a raw `run` line: skip `skip` leading words (the `run` verb + the path),
-/// then collect up to `PARAM_MAX` quote-aware tokens. `name` becomes `$0`.
+/// then collect up to `PARAM_MAX` quote-aware tokens. `name` becomes `$self`.
 fn parse_params<'a>(line: &'a str, name: &'a str, skip: usize) -> Params<'a> {
     let b = line.as_bytes();
     let mut i = 0usize;
@@ -1841,25 +1876,35 @@ fn push_ref(ctx: &ServiceContext, b: &[u8], i: usize, vars: &Vars, params: &Para
     let j = i + 1; // past '$'
     if j >= b.len() { ctx.console_writeln("gsh: lone '$'"); return Err(()); }
     if b[j] == b'(' { ctx.console_writeln("gsh: $( ) capture works as a whole value (let x = $(cmd)), not embedded"); return Err(()); }
-    match b[j] {
-        b'@' => { for k in 0..params.argc { if k > 0 { out.push(b' '); } out.push_bytes(params.argv[k].as_bytes()); } return Ok(j + 1); }
-        b'#' => { out.push_u32(params.argc as u32); return Ok(j + 1); }
-        b'0' => { out.push_bytes(params.name.as_bytes()); return Ok(j + 1); }
-        b'1'..=b'9' => {
-            let idx = (b[j] - b'1') as usize;
-            if idx >= params.argc {
-                ctx.console_writeln_fmt(format_args!("gsh: ${} not provided ($# = {})", (b[j] - b'0') as u32, params.argc));
-                return Err(());
-            }
-            out.push_bytes(params.argv[idx].as_bytes()); return Ok(j + 1);
-        }
-        _ => {}
+    // The POSIX cipher forms are RETIRED (they said nothing about their purpose); the error
+    // teaches the words that replaced them rather than reporting a puzzling "undefined variable".
+    if matches!(b[j], b'@' | b'#') || b[j].is_ascii_digit() {
+        ctx.console_writeln("gsh: $1/$@/$#/$0 are retired - use $arg1..$arg9, $args, $argcount, $self");
+        return Err(());
     }
     let start = j;
     let mut k = j;
     while k < b.len() && (b[k] == b'_' || b[k].is_ascii_alphanumeric()) { k += 1; }
-    if k == start { ctx.console_writeln("gsh: '$' must be followed by a name, digit, @ or #"); return Err(()); }
+    if k == start { ctx.console_writeln("gsh: '$' must be followed by a name"); return Err(()); }
     let name = &b[start..k];
+    // Reserved parameter words resolve BEFORE variables, so they can never be shadowed
+    // (`let` refuses these names outright): $args (all arguments, space-joined),
+    // $argcount (how many), $self (the invoked name), $arg1..$arg9 (positional).
+    match name {
+        b"args" => { for a in 0..params.argc { if a > 0 { out.push(b' '); } out.push_bytes(params.argv[a].as_bytes()); } return Ok(k); }
+        b"argcount" => { out.push_u32(params.argc as u32); return Ok(k); }
+        b"self" => { out.push_bytes(params.name.as_bytes()); return Ok(k); }
+        _ => {}
+    }
+    if name.len() == 4 && &name[..3] == b"arg" && (b'1'..=b'9').contains(&name[3]) {
+        let idx = (name[3] - b'1') as usize;
+        if idx >= params.argc {
+            ctx.console_writeln_fmt(format_args!("gsh: $arg{} not provided ($argcount = {})", (name[3] - b'0') as u32, params.argc));
+            return Err(());
+        }
+        out.push_bytes(params.argv[idx].as_bytes());
+        return Ok(k);
+    }
     match vars.lookup(name) {
         Some(vi) => { out.push_bytes(vars.value(vi)); Ok(k) }
         None => { ctx.console_writeln_fmt(format_args!("gsh: undefined variable '${}'", str_of(name))); Err(()) }
@@ -1917,7 +1962,13 @@ fn valid_var_name(name: &str) -> bool {
     let b = name.as_bytes();
     if b.is_empty() || b.len() > VAR_NAME_MAX { return false; }
     if !(b[0] == b'_' || b[0].is_ascii_alphabetic()) { return false; }
-    b.iter().all(|&c| c == b'_' || c.is_ascii_alphanumeric())
+    if !b.iter().all(|&c| c == b'_' || c.is_ascii_alphanumeric()) { return false; }
+    // The reserved parameter words ($args/$argcount/$self/$arg1..$arg9) resolve before variables
+    // in `push_ref`, so a binding with one of these names could never be read back - refuse it
+    // loudly here instead of letting it shadow silently (§26.4).
+    if matches!(b, b"args" | b"argcount" | b"self") { return false; }
+    if b.len() == 4 && &b[..3] == b"arg" && (b'1'..=b'9').contains(&b[3]) { return false; }
+    true
 }
 
 /// `let [mut] <name> = <value>` - declare a binding.
@@ -2321,7 +2372,7 @@ fn skip_else_chain(b: &[u8], mut pos: usize) -> usize {
 }
 
 /// What a `for` loop iterates: literal/`$var` WORDS in the buffer, an integer RANGE, or the script's
-/// PARAMS (`$@`). The advancing state lives in the frame - no materialized list (a big `range` never
+/// PARAMS (`$args`). The advancing state lives in the frame - no materialized list (a big `range` never
 /// becomes text).
 #[derive(Clone, Copy)]
 enum ForIter {
@@ -2706,10 +2757,10 @@ fn fmt_stream_pass(ctx: &ServiceContext, path: &[u8], emit: &mut dyn FnMut(&[u8]
     Ok(())
 }
 
-// ── Loops (§5): `for <var> in <words|range|$@> { … }` and unbounded `loop { … }`. ──
+// ── Loops (§5): `for <var> in <words|range|$args> { … }` and unbounded `loop { … }`. ──
 
 /// Parse the source of a `for` (the text between `in` and `{`) into an iterator: `range N` / `range A
-/// B` counts; `$@` alone walks the params; anything else is a whitespace-separated word list (each
+/// B` counts; `$args` alone walks the params; anything else is a whitespace-separated word list (each
 /// word `$`-expanded per step).
 fn parse_for_iter(b: &[u8], rest_start: usize, rest_end: usize) -> ForIter {
     let s = skip_ws(b, rest_start);
@@ -2729,7 +2780,7 @@ fn parse_for_iter(b: &[u8], rest_start: usize, rest_end: usize) -> ForIter {
             2 => ForIter::Range { cur: nums[0], end: nums[1] },
             _ => ForIter::Range { cur: 0, end: 0 }, // malformed -> empty
         }
-    } else if trim_bytes(&b[rest_start..rest_end]) == b"$@" {
+    } else if trim_bytes(&b[rest_start..rest_end]) == b"$args" {
         ForIter::Params { idx: 0 }
     } else {
         ForIter::Words { pos: rest_start, end: rest_end }
@@ -3007,7 +3058,11 @@ fn let_capture_form(s: &str) -> Option<(&str, bool, &str)> {
     Some((name, mutable, inner))
 }
 
-fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out, params: &Params) -> Result<(), ShellError> {
+/// `quiet` suppresses the per-statement `> stmt` transcript and the end-of-run summary block - for
+/// a LIBRARY command (`health`), whose user asked for a dashboard, not a test report. Errors still
+/// print (each failing statement reports itself) and the Result still carries failure (§26.7 loud).
+/// `run`/`selfcheck` pass `false`: an orchestrated script run IS a report.
+fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out, params: &Params, quiet: bool) -> Result<(), ShellError> {
     // Per-run interpreter state: a bounded variable table, allocated once HERE (above `execute`) and
     // threaded by &mut into `run_stmt` - it never reaches `execute`/`pipe_run`'s frame. No heap (§26.6).
     let mut vars = Vars::new();
@@ -3173,7 +3228,7 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
             process_step!(step);
             continue;
         }
-        // a `for` loop: for <var> in <words | range N | range A B | $@> { body }
+        // a `for` loop: for <var> in <words | range N | range A B | $args> { body }
         if matches_kw(b, pos, b"for") {
             let vs = skip_ws(b, pos + 3);
             let mut ve = vs;
@@ -3196,7 +3251,7 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
             let abase = vars.alen;
             // `for line in (producer) { … }` - capture the producer's output to a temp file, iterate
             // its lines (docs/scripting.md). A parenthesized iter is the producer form; anything else
-            // is the existing range / $@ / word-list.
+            // is the existing range / $args / word-list.
             let rest = trim_bytes(&b[rest_start..open]);
             let it0 = if rest.len() >= 2 && rest[0] == b'(' && rest[rest.len() - 1] == b')' {
                 let inner = trim_bytes(&rest[1..rest.len() - 1]);
@@ -3396,9 +3451,12 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
                 continue;
             }
         }
-        // Echo the statement so the transcript shows what produced each result.
-        out.put(ctx, "> ");
-        out.line(ctx, s);
+        // Echo the statement so the transcript shows what produced each result (not in quiet
+        // mode: a library command's user wants the output, not a transcript of the script).
+        if !quiet {
+            out.put(ctx, "> ");
+            out.line(ctx, s);
+        }
         let (res, stop) = {
             // While a $(fn) capture is active, the command's OUTPUT goes to the capture buffer, not
             // the console (the transcript `> stmt` above still goes to `out`).
@@ -3419,13 +3477,17 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
     run_defers(ctx, cwd, b, &mut defers, &mut ndefer, 0, &mut vars, params, out, sdepth);
     // End-of-run summary: PASS/FAIL per EXECUTED statement, from the recorded spans.
     // "FAIL  " is deliberately not the word "FAILED" the harness greens on absence of.
-    out.line(ctx, "--- summary ---");
-    let shown = nrec.min(RUN_MAX_CMDS);
-    for j in 0..shown {
-        out.put(ctx, if !verdict[j] { "FAIL  " } else { "PASS  " });
-        out.line(ctx, str_of(&b[soff[j] as usize..soff[j] as usize + slng[j] as usize]));
+    // Quiet (library command): no report - each failing section already printed its own error,
+    // and the Err below still surfaces in `result`.
+    if !quiet {
+        out.line(ctx, "--- summary ---");
+        let shown = nrec.min(RUN_MAX_CMDS);
+        for j in 0..shown {
+            out.put(ctx, if !verdict[j] { "FAIL  " } else { "PASS  " });
+            out.line(ctx, str_of(&b[soff[j] as usize..soff[j] as usize + slng[j] as usize]));
+        }
+        out.line_fmt(ctx, format_args!("run: ran {}, failed {}", ran, failed));
     }
-    out.line_fmt(ctx, format_args!("run: ran {}, failed {}", ran, failed));
     if failed == 0 { Ok(()) } else { Err(ShellError::Unknown) }
 }
 
@@ -3438,7 +3500,7 @@ fn run_with_optional_save(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth
     -> Result<(), ShellError>
 {
     match save {
-        None => run_lines(ctx, cwd, src, depth, &mut Out::Console, params),
+        None => run_lines(ctx, cwd, src, depth, &mut Out::Console, params, false),
         Some(spath) => run_and_save(ctx, cwd, src, depth, spath, params),
     }
 }
@@ -3460,7 +3522,7 @@ fn run_and_save(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, spat
     let mut rb = ReportBuf::new();
     let result = {
         let mut out = Out::File(&mut rb);
-        run_lines(ctx, cwd, src, depth, &mut out, params)
+        run_lines(ctx, cwd, src, depth, &mut out, params, false)
     }; // `out` (the &mut rb borrow) ends here, so `rb` is readable below
     if rb.overflow {
         ctx.console_writeln_fmt(format_args!(
@@ -3503,6 +3565,25 @@ const RUN_MAX_CMDS: usize = 256;
 /// host-side `dd` of a data disk). Run straight from rodata, so it can be far larger than an
 /// on-disk file (`MAX_FILE_BYTES` - a file is one ≤4 KiB IPC message; rodata is not).
 const SELFCHECK_GS: &str = include_str!("../../../scripts/selfcheck.gsh");
+
+/// The system library: gsh scripts baked into the image (rodata) and resolved PATH-like - typing a
+/// library name runs its script. This is the OS's "coreutils in gsh": features that grow by userspace
+/// COMPOSITION of the existing utilities, not new kernel or service surface (§26.2). Add a script to
+/// `scripts/lib/`, `include_str!` it here, and it becomes a command. Like `run`/`selfcheck`, a library
+/// command runs ONE script layer via `run_lines`, so it is prompt-level only (refused inside another
+/// script - two nested interpreter frames would blow the bounded user stack, [[project-shell-stack-pipe]]).
+const LIBRARY: &[(&str, &str)] = &[
+    ("health",  include_str!("../../../scripts/lib/health.gsh")),
+    ("watch",   include_str!("../../../scripts/lib/watch.gsh")),
+    ("size",    include_str!("../../../scripts/lib/size.gsh")),
+    ("online",  include_str!("../../../scripts/lib/online.gsh")),
+    ("busiest", include_str!("../../../scripts/lib/busiest.gsh")),
+];
+
+/// The baked source of library command `name`, or `None` if `name` is not a library command.
+fn library_script(name: &str) -> Option<&'static str> {
+    LIBRARY.iter().find(|(n, _)| *n == name).map(|&(_, src)| src)
+}
 
 /// `selfcheck` - run the embedded self-check suite IN MEMORY (straight from rodata via
 /// `run_lines`; no file write, so it is not capped by `MAX_FILE_BYTES`). The one-USB hardware
@@ -3583,12 +3664,12 @@ fn cmd_assert(ctx: &ServiceContext, cwd: &mut Cwd, rest: &str, depth: u8) -> Res
 // render identically and a tweak updates every one at once.
 // ---------------------------------------------------------------------------
 
-const UTIL_VERSION: &str = "0.3.1";
+const UTIL_VERSION: &str = "0.4.0";
 
 /// Utilities that self-document (gates the `help`/`version` intercept in `execute`).
 const UTILS: &[&str] = &[
     "help", "result", "run", "assert", "selfcheck",
-    "echo", "input", "clear", "about", "version", "mem", "cores", "date", "net", "ping", "sock", "uptime", "status", "observe", "caps", "roster",
+    "echo", "input", "clear", "about", "version", "mem", "cores", "date", "net", "ping", "sock", "uptime", "wait", "whatis", "status", "observe", "caps", "roster",
     "spawn", "kill", "restart", "reboot", "chaos", "drives", "ls", "cd", "read", "write", "edit", "fcap",
     "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count", "sort",
     "first", "last",
@@ -3675,6 +3756,16 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         ], true),
         "version" => help_block(ctx, "version", "the GodspeedOS version + build stamp", &[
             ("version", "GodspeedOS <version> (<git-sha>)", "version"),
+        ], true),
+        "wait" => help_block(ctx, "wait", "do nothing for N seconds (q aborts)", &[
+            ("wait <seconds>", "pause for N wall-clock seconds; q/Esc aborts with Err", "wait 2"),
+        ], true),
+        "whatis" => help_block(ctx, "whatis", "what runs when a name is typed (kind + origin)", &[
+            ("whatis <name>", "built-in / library script / pipe stage / service (live task+core)", "whatis ls"),
+            // The one collision in the vocabulary: whatis's argument domain CONTAINS the words
+            // `help` and `version`, and the universal `<util> help|version` rule answers first -
+            // so this help text itself carries the answer you were asking for.
+            ("whatis help|version", "answer for whatis itself (as every utility does); both names are shell built-ins", "whatis help"),
         ], true),
         "mem" => help_block(ctx, "mem", "physical memory usage", &[
             ("mem", "used / total / free physical memory", "mem"),
@@ -3949,6 +4040,8 @@ static HELP: &[HelpRow] = &[
     Row("mem", "physical memory usage"),
     Row("date [epoch]", "date + time; 'epoch' = secs since 1970"),
     Row("uptime", "how long the system has been up (records when piped)"),
+    Row("wait <seconds>", "pause N seconds, q aborts (paces scripts - watch is built on it)"),
+    Row("whatis <name>", "what a name is: built-in / library script / pipe stage / service"),
     Row("net", "network status: IP, gateway, ping"),
     Row("ping", "continuous ICMP echo (q quits): ping 8.8.8.8"),
     Gap,
@@ -3995,6 +4088,13 @@ static HELP: &[HelpRow] = &[
     Sec("Power"),
     Row("reboot", "hardware reset"),
     Row("chaos kill-storm <svc> [n]", "bounded resilience test: kill a service N times, verify it recovers"),
+    Gap,
+    Sec("Library (gsh scripts, baked in - type the name to run)"),
+    Row("health", "one-shot health dashboard (cores, mem, uptime, net, drives)"),
+    Row("watch <command>", "re-run a command every 2s until q (watch mem)"),
+    Row("size [path]", "total bytes of the files under a tree (size /docs)"),
+    Row("online", "probe the network live: DNS + internet, ok/FAIL per layer"),
+    Row("busiest [column]", "service table ranked by mem (or restarts / queue)"),
     Gap,
     Text("Type '<command> help' for usage + examples, '<command> version' for the version."),
 ];
@@ -4265,6 +4365,61 @@ fn cmd_version_os(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError>
     Ok(())
 }
 
+/// The record-pipe-ONLY stage verbs: names that run inside a pipe and nowhere else. `whatis` reports
+/// them as their own kind ("why does typing `where` bare fail?" is a real confusion this dissolves).
+/// The dual commands (sort/match/count/first/last run bare on files too) are NOT here - bare, they
+/// are built-ins. Keep in sync with pipe_run's stage dispatch.
+const PIPE_ONLY_VERBS: &[&str] = &["where", "select", "to", "from", "sum", "min", "max", "avg"];
+
+/// Service names `whatis` recognises when no live task bears the name: the managed set plus the
+/// demo/on-demand services. Purely descriptive (a lookup miss here means "unknown", not an error in
+/// anything) - keep roughly in sync with the supervisor's managed set + the shell's spawn targets.
+const KNOWN_SERVICES: &[&str] = &[
+    "supervisor", "block-driver", "fs", "logger", "shell", "xhci", "ehci", "nic-driver", "net-stack",
+    "ping", "pong", "greet", "roster", "chaos", "observe", "mem-pressure",
+];
+
+/// `whatis <name>` - what runs when this name is typed at the prompt: a shell built-in, a library
+/// script (gsh, baked into the image), a record-pipe stage, or a standalone service (with live
+/// task/core when running - identity is the name; the task/core is just where it lives right now).
+/// An unknown name is a loud `Err` (so `assert fails whatis banana` holds). This is the honest
+/// replacement for POSIX `which`: there is no $PATH and no executable path to return - a name's
+/// truth here is its KIND and ORIGIN, which is also an authority answer (26.9: a built-in runs in
+/// the shell's domain, a service in its own). One line, pipeable (rule 12).
+///
+/// Lens: the answer is about the NAME AT THE PROMPT. `ping` is both a built-in command and a demo
+/// service; typing `ping` runs the built-in, so that is the answer. (`whatis version`/`whatis help`
+/// cannot be asked: the universal `<util> version|help` intercept answers for whatis itself.)
+fn cmd_whatis(ctx: &ServiceContext, name: &str, out: &mut Out) -> Result<(), ShellError> {
+    if name.is_empty() {
+        ctx.console_writeln("usage: whatis <name>   e.g. whatis ls");
+        return Err(ShellError::Unknown);
+    }
+    if PIPE_ONLY_VERBS.contains(&name) {
+        out.line_fmt(ctx, format_args!("{}: record-pipe stage (runs only inside a pipe)", name));
+        return Ok(());
+    }
+    if is_util(name) {
+        out.line_fmt(ctx, format_args!("{}: shell built-in", name));
+        return Ok(());
+    }
+    if library_script(name).is_some() {
+        out.line_fmt(ctx, format_args!("{}: library script (gsh, baked into the image)", name));
+        return Ok(());
+    }
+    if let Some(slot) = slot_of(ctx, name) {
+        let st = ctx.task_stat(slot);
+        out.line_fmt(ctx, format_args!("{}: standalone service (running - task {}, core {})", name, slot, st.core));
+        return Ok(());
+    }
+    if KNOWN_SERVICES.contains(&name) {
+        out.line_fmt(ctx, format_args!("{}: standalone service (not running)", name));
+        return Ok(());
+    }
+    out.line_fmt(ctx, format_args!("{}: unknown", name));
+    Err(ShellError::Unknown)
+}
+
 /// Physical-memory usage, straight from the kernel's frame allocator (held via
 /// the INTROSPECT cap). Frames are 4 KiB pages: KiB = frames*4, MiB = frames/256.
 /// The percentage is computed in hundredths (two decimals, integer math) so the
@@ -4342,6 +4497,37 @@ fn ping_wait_or_quit(ctx: &ServiceContext) -> bool {
             if b == b'q' || b == b'Q' || b == 0x1b { return true; }
         }
         if ctx.epoch_secs_monotonic() != start { return false; }   // wall-clock second ticked (~1 s)
+        ctx.yield_cpu();
+    }
+}
+
+/// Longest `wait` accepted, in seconds. Refused loudly past this (bounded behaviour, §26.6) - a
+/// pacing pause is seconds-to-minutes; an hour-plus wait at the prompt is almost certainly a typo.
+const WAIT_MAX_SECS: u32 = 3600;
+
+/// `wait <seconds>` - do nothing for N wall-clock seconds; `q`/`Q`/`Esc` aborts (returns `Err`, so a
+/// script can `if !wait 2 { break }`). The pacing primitive the library's `watch` loop is built on
+/// (generalising `ping_wait_or_quit` above): RTC-monotonic seconds, never the TSC (miscalibrated for
+/// wall-time on the T630). This is a USER-COMMANDED delay - the user (or their script) chose the
+/// cadence and holds the q escape - not a service coordinating with a peer, so Commandment VIII
+/// (wait on truth, not time) is not in play; services must still never pace dependencies this way.
+fn cmd_wait(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
+    let secs = match parse_u32(arg) {
+        Some(s) if (1..=WAIT_MAX_SECS).contains(&s) => s as i64,
+        Some(_) => {
+            ctx.console_writeln_fmt(format_args!("wait: 1..{} seconds (a longer wait is a typo, not a plan)", WAIT_MAX_SECS));
+            return Err(ShellError::Unknown);
+        }
+        None => { ctx.console_writeln("usage: wait <seconds>   (q aborts)   e.g. wait 2"); return Err(ShellError::Unknown); }
+    };
+    // Whole-second granularity: waits until the monotonic epoch has advanced by `secs` (so `wait 1`
+    // ends at the next second boundary - up to a second early, never late).
+    let start = ctx.epoch_secs_monotonic();
+    loop {
+        if let Some(b) = ctx.try_console_read() {
+            if b == b'q' || b == b'Q' || b == 0x1b { return Err(ShellError::Unknown); } // aborted
+        }
+        if ctx.epoch_secs_monotonic() - start >= secs { return Ok(()); }
         ctx.yield_cpu();
     }
 }
@@ -4448,7 +4634,10 @@ fn cmd_ping(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
     } else if recv > 0 {
         out.line_fmt(ctx, format_args!("    (round-trip time unavailable - this host's TSC clock is uncalibrated)"));
     }
-    Ok(())
+    // Result model: a ping that sent echoes and received NOTHING back is a failed probe - Err, so
+    // `if ping count 2 8.8.8.8 { ... }` (the library's `online`) and `assert fails ping ...` see the
+    // truth. Any reply at all = Ok (the path works); the stats above stay the human diagnosis.
+    if sent > 0 && recv == 0 { Err(ShellError::Unknown) } else { Ok(()) }
 }
 
 /// `net stats` - dump the NIC's raw registers (chip state) to the console. Queries nic-driver ([5]);
@@ -4668,16 +4857,22 @@ fn net_dns(ctx: &ServiceContext, host: &str, out: &mut Out) -> Result<(), ShellE
     let p = reply.payload_bytes();
     if p.len() >= 5 && p[0] == 1 {
         out.line_fmt(ctx, format_args!("{} is {}.{}.{}.{}", host, p[1], p[2], p[3], p[4]));
+        Ok(())
     } else if p.first() == Some(&2) {
         out.line_fmt(ctx, format_args!("{}: the DNS server replied but returned no A record", host));
+        // A resolve that did not resolve is an Err OUTCOME (the printed line stays the diagnosis).
+        // "No answer" is still a legitimate result, not a bug - but on the Result model it is a
+        // failed probe, so `if net dns example.com { ... }` and `assert fails ...` can see the truth
+        // (the library's `online` verdicts ride on exactly this).
+        Err(ShellError::Unknown)
     } else {
         // Diagnostic: how many frames net-stack collected while waiting, and how many were UDP. Tells
         // us "no reply arrived" (0 UDP) from "a reply arrived but did not match our port" (UDP > 0).
         let (fr, ud) = if p.len() >= 7 { (p[5], p[6]) } else { (0, 0) };
         let to = if p.len() >= 8 { p[7] } else { 0 };
         out.line_fmt(ctx, format_args!("{}: no reply from the DNS server ({} frames, {} UDP, {} timeouts)", host, fr, ud, to));
+        Err(ShellError::Unknown)
     }
-    Ok(())
 }
 
 /// `net` (bare) - the network status: IP, gateway (+MAC), and whether the gateway pings. Raw facts,
@@ -5144,7 +5339,7 @@ fn build_find_table(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Option<Table>
     stack.push(start_abs);
     let tb = target.as_bytes();
     let is_glob = tb.iter().any(|&b| b == b'*' || b == b'?');
-    let mut t = Table::new(&["name", "type", "path"]);
+    let mut t = Table::new(&["name", "type", "path", "size"]);
     let mut dir = [0u8; PATH_MAX];
     while let Some(dlen) = stack.pop(&mut dir) {
         let reply = match fs_request_q(ctx, OP_LIST_DIR, &dir[..dlen], &[]) {
@@ -5164,6 +5359,7 @@ fn build_find_table(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Option<Table>
             if i + nl + 1 + 8 > p.len() { break; }
             let name = &p[i..i + nl];
             let is_dir = p[i + nl] != 0;
+            let size = u64_le(&p[i + nl + 1..i + nl + 9]);   // per-entry size, same layout ls reads
             i += nl + 1 + 8;
             let mut child = [0u8; PATH_MAX];
             if let Some(clen) = join_path(&dir[..dlen], name, &mut child) {
@@ -5172,7 +5368,10 @@ fn build_find_table(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Option<Table>
                     let nv = t.intern(name);
                     let tv = t.intern(if is_dir { b"dir" } else { b"file" });
                     let pv = t.intern(&child[..clen]);
-                    t.add_row(&[nv, tv, pv]);
+                    // Files carry their byte size (`find * | where size>1000`, the library's `size`
+                    // sum); a dir's row leaves it Empty, exactly as ls's records do.
+                    let sz = if is_dir { Value::Empty } else { Value::Int(size) };
+                    t.add_row(&[nv, tv, pv, sz]);
                 }
                 if is_dir { stack.push(&child[..clen]); }
             }
@@ -5677,6 +5876,11 @@ fn observe_shell_core(ctx: &ServiceContext) -> u32 {
 /// here (one reader, no race), and both we and the child SLEEP between polls so core 0 halts
 /// while `observe` is up - otherwise a busy wait would peg the core and make every task on it
 /// read as ~100% in observe's own display. Then we restore the screen and our read loop resumes.
+/// Per-poll sleep for the live view's `q` loop, in TSC cycles (~30 ms at 2 GHz; QEMU's 1-tick
+/// fallback makes it ~one quantum). The same idea as the painter's POLL_SLEEP_CYCLES: sleep, do
+/// not spin, so the observer never becomes the load it is displaying.
+const OBSERVE_QPOLL_SLEEP_CYCLES: u64 = 60_000_000;
+
 fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
     let _ = ctx.kill("observe-live"); // clear any stale instance
     // Pin the painter to a DIFFERENT core than this shell. Its framebuffer-heavy repaint must not
@@ -5700,12 +5904,15 @@ fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
         // Own `q` while the child paints. The bound is a paranoid safety net so a hung child can
         // never wedge the shell forever; normally we break on `q` (or if the child dies).
         for _ in 0..u32::MAX {
-            // Poll `q` by YIELDING, not ctx.sleep. The tick-based sleep converts through the TSC
-            // calibration, which is WRONG on the AMD T630 (CPUID exposes no usable TSC frequency) - a
-            // ctx.sleep there can stretch to many seconds, so `q` appeared dead and the user had to
-            // reboot. yield_cpu polls every scheduler round on ANY hardware; the painter is on another
-            // core, so this does not starve it. Drain the console; quit on q/Q. Echo is off (child owns it).
-            ctx.yield_cpu();
+            // Poll `q` on a short SLEEP, so this core IDLES between polls. This used to be a
+            // yield_cpu busy-loop - a workaround for the AMD T630's garbage CPUID TSC calibration,
+            // under which ctx.sleep stretched to seconds and `q` looked dead - but that root cause
+            // is fixed (the kernel PIT-calibrates tsc_ticks_per_quantum on TSC-Deadline hardware;
+            // QEMU uses the 1-tick fallback). The busy-yield PEGGED this core, so observe reported
+            // its own observer: the shell's core sat at ~99-100% for as long as you watched - the
+            // very artifact the painter's own sleep exists to avoid. ~30 ms per poll keeps `q`
+            // latency imperceptible while the core halts between polls.
+            ctx.sleep(OBSERVE_QPOLL_SLEEP_CYCLES);
             let mut quit = false;
             while let Some(b) = ctx.try_console_read() {
                 if b == b'q' || b == b'Q' { quit = true; }
@@ -5987,7 +6194,7 @@ fn is_producer_builtin(name: &str) -> bool {
     // loudly as non-producers instead. To capture a big file for `edit`, append a simple producer
     // a few times: `help | write /big.txt; help | write append /big.txt; …`.
     matches!(name, "read" | "echo" | "tree" | "input"
-                 | "about" | "version" | "mem" | "cores" | "date" | "net" | "ping" | "sock" | "help")
+                 | "about" | "version" | "whatis" | "mem" | "cores" | "date" | "net" | "ping" | "sock" | "help")
 }
 
 /// Producer SERVICES that emit without needing input, so they can start a pipe (and follow the
@@ -6015,6 +6222,7 @@ fn run_producer(ctx: &ServiceContext, cwd: &Cwd, cmdline: &str, out: &mut Out) {
         // Info/display commands - text emitters, capturable to a file.
         "about"        => { let _ = cmd_about(ctx, out); }
         "version"      => { let _ = cmd_version_os(ctx, out); }
+        "whatis"       => { let _ = cmd_whatis(ctx, arg, out); }
         "mem"          => { let _ = cmd_mem(ctx, out); }
         "cores"        => { let _ = cmd_cores(ctx, out); }
         "date"         => { let _ = cmd_date(ctx, arg, out); }
