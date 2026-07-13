@@ -200,6 +200,13 @@ assert ok cores
 assert ok mem
 assert ok date
 assert ok date epoch
+# wait: the q-abortable pacing pause (the library watch loop is built on it)
+assert ok wait 1
+assert fails wait
+assert fails wait 0
+assert fails wait 99999
+assert ok wait help
+assert ok wait version
 about | assert contains GodspeedOS
 version | assert contains GodspeedOS
 cores | assert contains cores

@@ -482,6 +482,7 @@ fn complete_tab(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd) {
 /// same commit; a path-taking utility is left out. Opting out of path completion is explicit + per-command.
 const NO_PATH_CMDS: &[&str] = &[
     "chaos", "kill", "spawn", "restart", "ping", "net", "drives", "observe", "date", "uptime",
+    "wait", "watch",
 ];
 
 /// Commands whose FIRST argument (the token right after the command, within its pipe segment) is a
@@ -510,6 +511,10 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
 const INFO_CMDS: &[&str] = &[
     "about", "version", "mem", "cores", "sock", "uptime", "status", "roster", "clear", "reboot",
     "result", "selfcheck", "caps", "help",
+    // Library scripts whose only first-arg subcommands are the universal version/help ("size" is
+    // absent on purpose - its argument is a path, so it keeps path completion; "watch" has its own
+    // command-name completion case).
+    "health",
 ];
 
 /// Commands with a TRAILING modifier keyword that follows the variable argument(s) - completed at any
@@ -566,6 +571,16 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
             tok.iter().rposition(|&b| b == b',').map(|i| tok_start + i + 1).unwrap_or(tok_start)
         };
         return complete_from_list(ctx, line, seg_start, SPAWN_TARGETS);
+    }
+
+    // `watch <command ...>`: the first argument IS a command name, so complete it from the same
+    // set the command position uses (built-ins + library scripts).
+    if "watch".as_bytes() == cmd && prior == 0 {
+        let mut names: [&str; 96] = [""; 96];
+        let mut n = 0usize;
+        for &u in UTILS { if n < names.len() { names[n] = u; n += 1; } }
+        for &(lib, _) in LIBRARY { if n < names.len() { names[n] = lib; n += 1; } }
+        return complete_from_list(ctx, line, tok_start, &names[..n]);
     }
 
     // `restart <name> [core]`: complete the restartable services (single target, not a comma-list).
@@ -1177,7 +1192,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
             }
             // Optional `save <path>` streams the run REPORT to a file (the utility writes its own
             // file - direct, not a pipe; see cmd_selfcheck / docs/pipes.md). Otherwise the tokens
-            // after the path are the script's params ($1.., $@, $#); $0 is the path.
+            // after the path are the script's params ($arg1.., $args, $argcount); $self is the path.
             let save = if argc >= 4 && args[2] == "save" { Some(args[3]) } else { None };
             let params = if save.is_some() { Params::empty(args[1]) } else { parse_params(s, args[1], 2) };
             return cmd_run(ctx, cwd, args[1], depth, save, &params);
@@ -1203,6 +1218,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         "ping"    => cmd_ping(ctx, s["ping".len()..].trim(), out),
         "sock"    => cmd_sock(ctx, out),
         "uptime"  => cmd_uptime(ctx),
+        "wait"    => cmd_wait(ctx, if argc >= 2 { args[1] } else { "" }),
         "status"  => cmd_status(ctx),
         "observe" => if argc >= 2 && args[1] == "now" { cmd_observe_now(ctx) } else { cmd_observe_live(ctx) },
         // The example record SERVICE, callable bare (renders its table) as well as piped.
@@ -1281,7 +1297,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         "last"    => cmd_take(ctx, cwd, &args, argc, true),
         other => {
             // PATH-like system library: a name that is not a built-in but matches a baked-in library
-            // script runs that script (a fresh, self-contained run; any args become $1..). Like
+            // script runs that script (a fresh, self-contained run; any args become $arg1..). Like
             // run/selfcheck it is one interpreter layer, so it is refused inside another script
             // (depth > 0) to keep the bounded user stack safe.
             if let Some(src) = library_script(other) {
@@ -1784,7 +1800,7 @@ fn var_err_msg(ctx: &ServiceContext, name: &str, e: VarErr) {
     }
 }
 
-/// A gsh run's parameters: `$0` (script name), `$1..$9`, `$@` (all), `$#` (count). Zero-copy - the
+/// A gsh run's parameters: `$self` (invoked name), `$arg1..$arg9`, `$args` (all), `$argcount`. Zero-copy - the
 /// slices borrow the `run` line.
 struct Params<'a> {
     argv: [&'a str; PARAM_MAX],
@@ -1810,7 +1826,7 @@ fn scan_word(b: &[u8], mut i: usize) -> (usize, usize, usize) {
 }
 
 /// Parse script params from a raw `run` line: skip `skip` leading words (the `run` verb + the path),
-/// then collect up to `PARAM_MAX` quote-aware tokens. `name` becomes `$0`.
+/// then collect up to `PARAM_MAX` quote-aware tokens. `name` becomes `$self`.
 fn parse_params<'a>(line: &'a str, name: &'a str, skip: usize) -> Params<'a> {
     let b = line.as_bytes();
     let mut i = 0usize;
@@ -1858,25 +1874,35 @@ fn push_ref(ctx: &ServiceContext, b: &[u8], i: usize, vars: &Vars, params: &Para
     let j = i + 1; // past '$'
     if j >= b.len() { ctx.console_writeln("gsh: lone '$'"); return Err(()); }
     if b[j] == b'(' { ctx.console_writeln("gsh: $( ) capture works as a whole value (let x = $(cmd)), not embedded"); return Err(()); }
-    match b[j] {
-        b'@' => { for k in 0..params.argc { if k > 0 { out.push(b' '); } out.push_bytes(params.argv[k].as_bytes()); } return Ok(j + 1); }
-        b'#' => { out.push_u32(params.argc as u32); return Ok(j + 1); }
-        b'0' => { out.push_bytes(params.name.as_bytes()); return Ok(j + 1); }
-        b'1'..=b'9' => {
-            let idx = (b[j] - b'1') as usize;
-            if idx >= params.argc {
-                ctx.console_writeln_fmt(format_args!("gsh: ${} not provided ($# = {})", (b[j] - b'0') as u32, params.argc));
-                return Err(());
-            }
-            out.push_bytes(params.argv[idx].as_bytes()); return Ok(j + 1);
-        }
-        _ => {}
+    // The POSIX cipher forms are RETIRED (they said nothing about their purpose); the error
+    // teaches the words that replaced them rather than reporting a puzzling "undefined variable".
+    if matches!(b[j], b'@' | b'#') || b[j].is_ascii_digit() {
+        ctx.console_writeln("gsh: $1/$@/$#/$0 are retired - use $arg1..$arg9, $args, $argcount, $self");
+        return Err(());
     }
     let start = j;
     let mut k = j;
     while k < b.len() && (b[k] == b'_' || b[k].is_ascii_alphanumeric()) { k += 1; }
-    if k == start { ctx.console_writeln("gsh: '$' must be followed by a name, digit, @ or #"); return Err(()); }
+    if k == start { ctx.console_writeln("gsh: '$' must be followed by a name"); return Err(()); }
     let name = &b[start..k];
+    // Reserved parameter words resolve BEFORE variables, so they can never be shadowed
+    // (`let` refuses these names outright): $args (all arguments, space-joined),
+    // $argcount (how many), $self (the invoked name), $arg1..$arg9 (positional).
+    match name {
+        b"args" => { for a in 0..params.argc { if a > 0 { out.push(b' '); } out.push_bytes(params.argv[a].as_bytes()); } return Ok(k); }
+        b"argcount" => { out.push_u32(params.argc as u32); return Ok(k); }
+        b"self" => { out.push_bytes(params.name.as_bytes()); return Ok(k); }
+        _ => {}
+    }
+    if name.len() == 4 && &name[..3] == b"arg" && (b'1'..=b'9').contains(&name[3]) {
+        let idx = (name[3] - b'1') as usize;
+        if idx >= params.argc {
+            ctx.console_writeln_fmt(format_args!("gsh: $arg{} not provided ($argcount = {})", (name[3] - b'0') as u32, params.argc));
+            return Err(());
+        }
+        out.push_bytes(params.argv[idx].as_bytes());
+        return Ok(k);
+    }
     match vars.lookup(name) {
         Some(vi) => { out.push_bytes(vars.value(vi)); Ok(k) }
         None => { ctx.console_writeln_fmt(format_args!("gsh: undefined variable '${}'", str_of(name))); Err(()) }
@@ -1934,7 +1960,13 @@ fn valid_var_name(name: &str) -> bool {
     let b = name.as_bytes();
     if b.is_empty() || b.len() > VAR_NAME_MAX { return false; }
     if !(b[0] == b'_' || b[0].is_ascii_alphabetic()) { return false; }
-    b.iter().all(|&c| c == b'_' || c.is_ascii_alphanumeric())
+    if !b.iter().all(|&c| c == b'_' || c.is_ascii_alphanumeric()) { return false; }
+    // The reserved parameter words ($args/$argcount/$self/$arg1..$arg9) resolve before variables
+    // in `push_ref`, so a binding with one of these names could never be read back - refuse it
+    // loudly here instead of letting it shadow silently (§26.4).
+    if matches!(b, b"args" | b"argcount" | b"self") { return false; }
+    if b.len() == 4 && &b[..3] == b"arg" && (b'1'..=b'9').contains(&b[3]) { return false; }
+    true
 }
 
 /// `let [mut] <name> = <value>` - declare a binding.
@@ -2338,7 +2370,7 @@ fn skip_else_chain(b: &[u8], mut pos: usize) -> usize {
 }
 
 /// What a `for` loop iterates: literal/`$var` WORDS in the buffer, an integer RANGE, or the script's
-/// PARAMS (`$@`). The advancing state lives in the frame - no materialized list (a big `range` never
+/// PARAMS (`$args`). The advancing state lives in the frame - no materialized list (a big `range` never
 /// becomes text).
 #[derive(Clone, Copy)]
 enum ForIter {
@@ -2723,10 +2755,10 @@ fn fmt_stream_pass(ctx: &ServiceContext, path: &[u8], emit: &mut dyn FnMut(&[u8]
     Ok(())
 }
 
-// ── Loops (§5): `for <var> in <words|range|$@> { … }` and unbounded `loop { … }`. ──
+// ── Loops (§5): `for <var> in <words|range|$args> { … }` and unbounded `loop { … }`. ──
 
 /// Parse the source of a `for` (the text between `in` and `{`) into an iterator: `range N` / `range A
-/// B` counts; `$@` alone walks the params; anything else is a whitespace-separated word list (each
+/// B` counts; `$args` alone walks the params; anything else is a whitespace-separated word list (each
 /// word `$`-expanded per step).
 fn parse_for_iter(b: &[u8], rest_start: usize, rest_end: usize) -> ForIter {
     let s = skip_ws(b, rest_start);
@@ -2746,7 +2778,7 @@ fn parse_for_iter(b: &[u8], rest_start: usize, rest_end: usize) -> ForIter {
             2 => ForIter::Range { cur: nums[0], end: nums[1] },
             _ => ForIter::Range { cur: 0, end: 0 }, // malformed -> empty
         }
-    } else if trim_bytes(&b[rest_start..rest_end]) == b"$@" {
+    } else if trim_bytes(&b[rest_start..rest_end]) == b"$args" {
         ForIter::Params { idx: 0 }
     } else {
         ForIter::Words { pos: rest_start, end: rest_end }
@@ -3194,7 +3226,7 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
             process_step!(step);
             continue;
         }
-        // a `for` loop: for <var> in <words | range N | range A B | $@> { body }
+        // a `for` loop: for <var> in <words | range N | range A B | $args> { body }
         if matches_kw(b, pos, b"for") {
             let vs = skip_ws(b, pos + 3);
             let mut ve = vs;
@@ -3217,7 +3249,7 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
             let abase = vars.alen;
             // `for line in (producer) { … }` - capture the producer's output to a temp file, iterate
             // its lines (docs/scripting.md). A parenthesized iter is the producer form; anything else
-            // is the existing range / $@ / word-list.
+            // is the existing range / $args / word-list.
             let rest = trim_bytes(&b[rest_start..open]);
             let it0 = if rest.len() >= 2 && rest[0] == b'(' && rest[rest.len() - 1] == b')' {
                 let inner = trim_bytes(&rest[1..rest.len() - 1]);
@@ -3540,6 +3572,8 @@ const SELFCHECK_GS: &str = include_str!("../../../scripts/selfcheck.gsh");
 /// script - two nested interpreter frames would blow the bounded user stack, [[project-shell-stack-pipe]]).
 const LIBRARY: &[(&str, &str)] = &[
     ("health", include_str!("../../../scripts/lib/health.gsh")),
+    ("watch",  include_str!("../../../scripts/lib/watch.gsh")),
+    ("size",   include_str!("../../../scripts/lib/size.gsh")),
 ];
 
 /// The baked source of library command `name`, or `None` if `name` is not a library command.
@@ -3631,7 +3665,7 @@ const UTIL_VERSION: &str = "0.3.1";
 /// Utilities that self-document (gates the `help`/`version` intercept in `execute`).
 const UTILS: &[&str] = &[
     "help", "result", "run", "assert", "selfcheck",
-    "echo", "input", "clear", "about", "version", "mem", "cores", "date", "net", "ping", "sock", "uptime", "status", "observe", "caps", "roster",
+    "echo", "input", "clear", "about", "version", "mem", "cores", "date", "net", "ping", "sock", "uptime", "wait", "status", "observe", "caps", "roster",
     "spawn", "kill", "restart", "reboot", "chaos", "drives", "ls", "cd", "read", "write", "edit", "fcap",
     "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count", "sort",
     "first", "last",
@@ -3718,6 +3752,9 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         ], true),
         "version" => help_block(ctx, "version", "the GodspeedOS version + build stamp", &[
             ("version", "GodspeedOS <version> (<git-sha>)", "version"),
+        ], true),
+        "wait" => help_block(ctx, "wait", "do nothing for N seconds (q aborts)", &[
+            ("wait <seconds>", "pause for N wall-clock seconds; q/Esc aborts with Err", "wait 2"),
         ], true),
         "mem" => help_block(ctx, "mem", "physical memory usage", &[
             ("mem", "used / total / free physical memory", "mem"),
@@ -3992,6 +4029,7 @@ static HELP: &[HelpRow] = &[
     Row("mem", "physical memory usage"),
     Row("date [epoch]", "date + time; 'epoch' = secs since 1970"),
     Row("uptime", "how long the system has been up (records when piped)"),
+    Row("wait <seconds>", "pause N seconds, q aborts (paces scripts - watch is built on it)"),
     Row("net", "network status: IP, gateway, ping"),
     Row("ping", "continuous ICMP echo (q quits): ping 8.8.8.8"),
     Gap,
@@ -4041,6 +4079,8 @@ static HELP: &[HelpRow] = &[
     Gap,
     Sec("Library (gsh scripts, baked in - type the name to run)"),
     Row("health", "one-shot health dashboard (cores, mem, uptime, net, drives)"),
+    Row("watch <command>", "re-run a command every 2s until q (watch mem)"),
+    Row("size [path]", "total bytes of the files under a tree (size /docs)"),
     Gap,
     Text("Type '<command> help' for usage + examples, '<command> version' for the version."),
 ];
@@ -4388,6 +4428,37 @@ fn ping_wait_or_quit(ctx: &ServiceContext) -> bool {
             if b == b'q' || b == b'Q' || b == 0x1b { return true; }
         }
         if ctx.epoch_secs_monotonic() != start { return false; }   // wall-clock second ticked (~1 s)
+        ctx.yield_cpu();
+    }
+}
+
+/// Longest `wait` accepted, in seconds. Refused loudly past this (bounded behaviour, §26.6) - a
+/// pacing pause is seconds-to-minutes; an hour-plus wait at the prompt is almost certainly a typo.
+const WAIT_MAX_SECS: u32 = 3600;
+
+/// `wait <seconds>` - do nothing for N wall-clock seconds; `q`/`Q`/`Esc` aborts (returns `Err`, so a
+/// script can `if !wait 2 { break }`). The pacing primitive the library's `watch` loop is built on
+/// (generalising `ping_wait_or_quit` above): RTC-monotonic seconds, never the TSC (miscalibrated for
+/// wall-time on the T630). This is a USER-COMMANDED delay - the user (or their script) chose the
+/// cadence and holds the q escape - not a service coordinating with a peer, so Commandment VIII
+/// (wait on truth, not time) is not in play; services must still never pace dependencies this way.
+fn cmd_wait(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
+    let secs = match parse_u32(arg) {
+        Some(s) if (1..=WAIT_MAX_SECS).contains(&s) => s as i64,
+        Some(_) => {
+            ctx.console_writeln_fmt(format_args!("wait: 1..{} seconds (a longer wait is a typo, not a plan)", WAIT_MAX_SECS));
+            return Err(ShellError::Unknown);
+        }
+        None => { ctx.console_writeln("usage: wait <seconds>   (q aborts)   e.g. wait 2"); return Err(ShellError::Unknown); }
+    };
+    // Whole-second granularity: waits until the monotonic epoch has advanced by `secs` (so `wait 1`
+    // ends at the next second boundary - up to a second early, never late).
+    let start = ctx.epoch_secs_monotonic();
+    loop {
+        if let Some(b) = ctx.try_console_read() {
+            if b == b'q' || b == b'Q' || b == 0x1b { return Err(ShellError::Unknown); } // aborted
+        }
+        if ctx.epoch_secs_monotonic() - start >= secs { return Ok(()); }
         ctx.yield_cpu();
     }
 }
@@ -5190,7 +5261,7 @@ fn build_find_table(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Option<Table>
     stack.push(start_abs);
     let tb = target.as_bytes();
     let is_glob = tb.iter().any(|&b| b == b'*' || b == b'?');
-    let mut t = Table::new(&["name", "type", "path"]);
+    let mut t = Table::new(&["name", "type", "path", "size"]);
     let mut dir = [0u8; PATH_MAX];
     while let Some(dlen) = stack.pop(&mut dir) {
         let reply = match fs_request_q(ctx, OP_LIST_DIR, &dir[..dlen], &[]) {
@@ -5210,6 +5281,7 @@ fn build_find_table(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Option<Table>
             if i + nl + 1 + 8 > p.len() { break; }
             let name = &p[i..i + nl];
             let is_dir = p[i + nl] != 0;
+            let size = u64_le(&p[i + nl + 1..i + nl + 9]);   // per-entry size, same layout ls reads
             i += nl + 1 + 8;
             let mut child = [0u8; PATH_MAX];
             if let Some(clen) = join_path(&dir[..dlen], name, &mut child) {
@@ -5218,7 +5290,10 @@ fn build_find_table(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Option<Table>
                     let nv = t.intern(name);
                     let tv = t.intern(if is_dir { b"dir" } else { b"file" });
                     let pv = t.intern(&child[..clen]);
-                    t.add_row(&[nv, tv, pv]);
+                    // Files carry their byte size (`find * | where size>1000`, the library's `size`
+                    // sum); a dir's row leaves it Empty, exactly as ls's records do.
+                    let sz = if is_dir { Value::Empty } else { Value::Int(size) };
+                    t.add_row(&[nv, tv, pv, sz]);
                 }
                 if is_dir { stack.push(&child[..clen]); }
             }

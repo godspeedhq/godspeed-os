@@ -224,6 +224,25 @@ pub fn run(image_path: &Path, smp: u32) {
     check!(health_out.contains("GodspeedOS health") && health_out.contains("end of health"),
            "library: `health` runs the baked-in dashboard (PATH-like resolution)");
 
+    // Library self-documentation THROUGH PARAMS: `<lib> version` / `<lib> help` are handled by the
+    // script itself ($arg1), per the library convention - not the shell's is_util intercept.
+    send(&mut write_half, b"health version\r");
+    let hv = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    check!(hv.contains("health 0.1.0") && hv.contains("Copyright"),
+           "library: `health version` self-reports via script params");
+
+    // `size` = one record pipe (find * | where type=file | sum size). No disk in this QEMU, so the
+    // bar is a clean loud outcome (a sum or "storage unavailable"), never a hang.
+    send(&mut write_half, b"size /\r");
+    let sz = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)).unwrap_or_default();
+    check!(sz.contains("size") || sz.contains("storage unavailable") || sz.contains("sum"),
+           "library: `size /` completes loudly (sum or clean no-disk report)");
+
+    // `wait` aborts on q: send the command and the q together - the q lands while wait is pacing.
+    send(&mut write_half, b"wait 30\rq");
+    let wq = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)).unwrap_or_default();
+    check!(!wq.is_empty(), "wait: `wait 30` aborted by q (prompt returned, no 30s stall)");
+
     // ping is a full utility (mirrors net): version/help self-documentation.
     send(&mut write_half, b"ping version\r");
     let pingver = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
@@ -1908,11 +1927,11 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
                           "gsh: reassigning an immutable binding is loud"),
         None => { println!("files-test: FAIL - gsh immutable timeout"); fail += 1; }
     }
-    // let mut + reassignment + params: `run … alpha beta` → $1/$2; who=alpha then who=beta.
-    let _ = run!(b"write /gsh_m.gsh let mut who = $1 ; who = $2 ; echo picked-$who\r", 10);
+    // let mut + reassignment + params: `run … alpha beta` → $arg1/$arg2; who=alpha then who=beta.
+    let _ = run!(b"write /gsh_m.gsh let mut who = $arg1 ; who = $arg2 ; echo picked-$who\r", 10);
     match run!(b"run /gsh_m.gsh alpha beta\r", 14) {
         Some(r) => check!(r.contains("picked-beta") && r.contains("run: ran 3, failed 0"),
-                          "gsh: let mut reassigns; $1/$2 params expand"),
+                          "gsh: let mut reassigns; $arg1/$arg2 params expand"),
         None => { println!("files-test: FAIL - gsh mut/params timeout"); fail += 1; }
     }
     // fail stops the run: the statement after `fail` does not execute.
@@ -2014,7 +2033,7 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     }
     // Tier 1 complete: a greet-shape script (param + if + in + switch + else/fail) runs end to end.
     // Kept short so the `write` line fits the 128-char interactive input buffer (MAX_LINE).
-    let _ = run!(b"write /g.gsh let r = $1 ; if $r in a b { switch $r { a { echo gotA } b { echo gotB } } } else { fail nomatch }\r", 12);
+    let _ = run!(b"write /g.gsh let r = $arg1 ; if $r in a b { switch $r { a { echo gotA } b { echo gotB } } } else { fail nomatch }\r", 12);
     match run!(b"run /g.gsh a\r", 16) {
         Some(r) => check!(r.contains("gotA") && !r.contains("gotB") && r.contains("failed 0"),
                           "gsh: Tier-1 greet-shape script (param+if+in+switch) runs"),
@@ -2216,7 +2235,7 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None => { println!("files-test: FAIL - gsh import-as-resolve timeout"); fail += 1; }
     }
 
-    // ── gsh Slice 8 (Tier 2): loops - `for … in words|range|$@`, unbounded `loop`, break/continue.
+    // ── gsh Slice 8 (Tier 2): loops - `for … in words|range|$args`, unbounded `loop`, break/continue.
     let _ = run!(b"write /fl1.gsh for x in a b c { echo w-$x }\r", 10);
     match run!(b"run /fl1.gsh\r", 14) {
         Some(r) => check!(r.contains("w-a") && r.contains("w-b") && r.contains("w-c"), "gsh: for … in <words>"),
