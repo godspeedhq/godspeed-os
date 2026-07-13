@@ -168,11 +168,13 @@ static FB: SpinLock<Fb> = SpinLock::new(Fb {
 /// Safe-area inset per edge, as a percentage of each dimension. TVs overscan (crop off every
 /// edge), which clips the outermost characters at `0`. This insets the text so it stays visible
 /// without depending on the TV's "Just Scan" / "1:1" picture mode (which most sets bury or don't
-/// offer). `2` is a light guard: on panels that overscan little (the Wyse's TV) `5` left large
-/// unused borders in all four corners, so `2` reclaims most of that while still keeping the
-/// outermost glyphs off a modestly-overscanning edge. Set to `0` for true edge-to-edge on a
-/// display known not to overscan (or in 1:1 mode). Harmless on a monitor - just a thin border.
-const SAFE_PCT: usize = 2;
+/// offer). `5` is the standard "title-safe" margin (10% total per axis): clipping LOSES text
+/// (functionally bad), a border is merely cosmetic (harmless), so we bias toward the larger inset.
+/// `2` overscanned little on the Wyse's TV but CLIPPED text on the T630's display (lost off the top,
+/// glyphs hard against the side edges), so `5` is the safe default that clears typical consumer
+/// overscan on both. Set to `0` for true edge-to-edge on a display known not to overscan (or in 1:1
+/// mode). On a low-overscan panel this just leaves a thin border - never lose a character to save one.
+const SAFE_PCT: usize = 5;
 
 /// Initialise the console from Limine's framebuffer descriptor. Called once in
 /// `_start`, right after `serial_init`, before the first `kprintln`.
