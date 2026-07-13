@@ -1290,7 +1290,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
                         "{}: a library command runs a script - not available inside another script", other));
                     return Err(ShellError::Unknown);
                 }
-                return run_lines(ctx, cwd, src.as_bytes(), depth + 1, out, &parse_params(s, other, 1));
+                return run_lines(ctx, cwd, src.as_bytes(), depth + 1, out, &parse_params(s, other, 1), true);
             }
             // Build "unknown: <cmd>" in a stack buffer to avoid two ctx.log calls
             let mut buf = [0u8; 64];
@@ -3024,7 +3024,11 @@ fn let_capture_form(s: &str) -> Option<(&str, bool, &str)> {
     Some((name, mutable, inner))
 }
 
-fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out, params: &Params) -> Result<(), ShellError> {
+/// `quiet` suppresses the per-statement `> stmt` transcript and the end-of-run summary block - for
+/// a LIBRARY command (`health`), whose user asked for a dashboard, not a test report. Errors still
+/// print (each failing statement reports itself) and the Result still carries failure (§26.7 loud).
+/// `run`/`selfcheck` pass `false`: an orchestrated script run IS a report.
+fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out, params: &Params, quiet: bool) -> Result<(), ShellError> {
     // Per-run interpreter state: a bounded variable table, allocated once HERE (above `execute`) and
     // threaded by &mut into `run_stmt` - it never reaches `execute`/`pipe_run`'s frame. No heap (§26.6).
     let mut vars = Vars::new();
@@ -3413,9 +3417,12 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
                 continue;
             }
         }
-        // Echo the statement so the transcript shows what produced each result.
-        out.put(ctx, "> ");
-        out.line(ctx, s);
+        // Echo the statement so the transcript shows what produced each result (not in quiet
+        // mode: a library command's user wants the output, not a transcript of the script).
+        if !quiet {
+            out.put(ctx, "> ");
+            out.line(ctx, s);
+        }
         let (res, stop) = {
             // While a $(fn) capture is active, the command's OUTPUT goes to the capture buffer, not
             // the console (the transcript `> stmt` above still goes to `out`).
@@ -3436,13 +3443,17 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
     run_defers(ctx, cwd, b, &mut defers, &mut ndefer, 0, &mut vars, params, out, sdepth);
     // End-of-run summary: PASS/FAIL per EXECUTED statement, from the recorded spans.
     // "FAIL  " is deliberately not the word "FAILED" the harness greens on absence of.
-    out.line(ctx, "--- summary ---");
-    let shown = nrec.min(RUN_MAX_CMDS);
-    for j in 0..shown {
-        out.put(ctx, if !verdict[j] { "FAIL  " } else { "PASS  " });
-        out.line(ctx, str_of(&b[soff[j] as usize..soff[j] as usize + slng[j] as usize]));
+    // Quiet (library command): no report - each failing section already printed its own error,
+    // and the Err below still surfaces in `result`.
+    if !quiet {
+        out.line(ctx, "--- summary ---");
+        let shown = nrec.min(RUN_MAX_CMDS);
+        for j in 0..shown {
+            out.put(ctx, if !verdict[j] { "FAIL  " } else { "PASS  " });
+            out.line(ctx, str_of(&b[soff[j] as usize..soff[j] as usize + slng[j] as usize]));
+        }
+        out.line_fmt(ctx, format_args!("run: ran {}, failed {}", ran, failed));
     }
-    out.line_fmt(ctx, format_args!("run: ran {}, failed {}", ran, failed));
     if failed == 0 { Ok(()) } else { Err(ShellError::Unknown) }
 }
 
@@ -3455,7 +3466,7 @@ fn run_with_optional_save(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth
     -> Result<(), ShellError>
 {
     match save {
-        None => run_lines(ctx, cwd, src, depth, &mut Out::Console, params),
+        None => run_lines(ctx, cwd, src, depth, &mut Out::Console, params, false),
         Some(spath) => run_and_save(ctx, cwd, src, depth, spath, params),
     }
 }
@@ -3477,7 +3488,7 @@ fn run_and_save(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, spat
     let mut rb = ReportBuf::new();
     let result = {
         let mut out = Out::File(&mut rb);
-        run_lines(ctx, cwd, src, depth, &mut out, params)
+        run_lines(ctx, cwd, src, depth, &mut out, params, false)
     }; // `out` (the &mut rb borrow) ends here, so `rb` is readable below
     if rb.overflow {
         ctx.console_writeln_fmt(format_args!(
