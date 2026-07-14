@@ -14,6 +14,7 @@
 | **AArch64** | `aarch64-unknown-none` | `-M virt -cpu cortex-a53` | direct `-kernel` (EL1) | PL011 @ `0x0900_0000` | **Boots + prints** to UART; neutral kernel linked | `qemu-system-aarch64` |
 | **RISC-V** | `riscv64imac-unknown-none-elf` | `-M virt` | OpenSBI → S-mode @ `0x8020_0000` | NS16550 @ `0x1000_0000` | **Boots + prints** to UART; neutral kernel linked | `qemu-system-riscv64` |
 | **LoongArch64** | `loongarch64-unknown-none-softfloat` | `-M virt` | direct `-kernel` (DA mode) @ `0x20_0000` | NS16550 @ `0x1fe0_01e0` | **Boots + prints** to UART; neutral kernel linked | `qemu-system-loongarch64` |
+| **s390x** (IBM Z) | `s390x-unknown-none-softfloat` (tier-3, `-Zbuild-std`) | `s390-ccw-virtio` | IPL | SCLP console | **Compiles - BIG-ENDIAN**; boot pending the SCLP console (a protocol, not a register) | `qemu-system-s390x` |
 
 The boot lines actually observed:
 

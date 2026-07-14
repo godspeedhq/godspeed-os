@@ -28,3 +28,8 @@ pub use riscv64 as imp;
 pub mod loongarch64;
 #[cfg(target_arch = "loongarch64")]
 pub use loongarch64 as imp;
+
+#[cfg(target_arch = "s390x")]
+pub mod s390x;
+#[cfg(target_arch = "s390x")]
+pub use s390x as imp;

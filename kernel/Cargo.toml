@@ -16,12 +16,17 @@ path = "src/lib.rs"
 
 [dependencies]
 bitflags = { version = "2", default-features = false }
-limine = "0.6"
 # Antialiased Noto Sans Mono raster glyphs for the framebuffer console (fb.rs).
 # no_std, pure const data (no alloc, no float). Only the Regular weight, one size,
 # and Basic-Latin are compiled in to keep the rodata small. Box-drawing glyphs are
 # drawn procedurally in fb.rs (the font's Basic-Latin range has no U+2500 block).
 noto-sans-mono-bitmap = { version = "0.3", default-features = false, features = ["regular", "size_20", "unicode-basic-latin"] }
+
+# Limine is the x86 boot protocol, used only by arch/x86_64/. Gate it to x86 so the kernel builds for
+# the non-x86 arches (aarch64 / riscv64 / loongarch64 / s390x), where Limine does not apply and its
+# crate does not even compile (it rejects unsupported target architectures at build time).
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+limine = "0.6"
 
 [dev-dependencies]
 # Only used by the lib target (host-compiled, std available).

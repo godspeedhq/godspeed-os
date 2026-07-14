@@ -32,3 +32,10 @@ rustflags = [
 rustflags = [
     "-C", "relocation-model=static",
 ]
+
+# s390x variant (QEMU s390-ccw) - the FIFTH arch, and the first BIG-ENDIAN one.
+# Build: cargo build -p kernel --target s390x-unknown-none-softfloat
+[target.s390x-unknown-none-softfloat]
+rustflags = [
+    "-C", "relocation-model=static",
+]
